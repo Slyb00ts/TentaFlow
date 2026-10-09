@@ -162,7 +162,10 @@ use std::sync::Arc;
 use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Number, Value};
 
-use super::{Compatibility, CompiledSchema, SchemaError, SchemaKindOps, MAX_SCHEMA_TEXT_BYTES};
+use super::{
+    Compatibility, CompiledSchema, SchemaError, SchemaKindOps, ValidationBudget,
+    MAX_SCHEMA_TEXT_BYTES,
+};
 
 /// Combined structural-nesting / `$ref`-chain-depth cap. Bounds both
 /// pathologically deep schema trees and long (non-cyclic) `$ref` chains so
@@ -1966,7 +1969,12 @@ impl SchemaKindOps for JsonSchemaOps {
         Ok(CompiledSchema::JsonSchema(Compiled { schema: out.schema }))
     }
 
-    fn validate(&self, compiled: &CompiledSchema, payload: &[u8]) -> Result<(), SchemaError> {
+    fn validate_metered(
+        &self,
+        compiled: &CompiledSchema,
+        payload: &[u8],
+        _budget: &mut ValidationBudget,
+    ) -> Result<(), SchemaError> {
         let CompiledSchema::JsonSchema(c) = compiled else {
             return Err(SchemaError::Invalid(
                 "validate called with a non-json_schema compiled schema".to_string(),

@@ -2402,7 +2402,7 @@ struct ResolvedSchema {
     generation: AtomicU64,
     schema_type: schema_registry::SchemaType,
     compiled: schema_registry::CompiledSchema,
-    /// Estimated resident bytes (`SCHEMA_CACHE_MAX_BYTES` accounting).
+    /// Estimated resident bytes (`SCHEMA_CACHE_LIMITS` accounting).
     weight: usize,
     /// `BusService::schema_cache_clock` at the last lookup; the oldest entry
     /// is evicted first.
@@ -2411,9 +2411,25 @@ struct ResolvedSchema {
 
 /// `schema_cache` bounds: entries, and estimated resident bytes of the
 /// compiled schemas. A registry may hold far more subjects than a node ever
-/// publishes to, and one XSD alone can carry up to its 4 MiB pattern budget.
-const SCHEMA_CACHE_MAX_ENTRIES: usize = 1024;
-const SCHEMA_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+/// publishes to, and one XSD alone can carry up to its 16 MiB pattern budget.
+///
+/// The cache is shared by every org, so each org also has a share of it: an
+/// org over its share evicts its own oldest entries, and when the whole cache
+/// is over its bounds the org using the most evicts first, so one tenant
+/// registering many large schemas cannot push the others out.
+struct SchemaCacheLimits {
+    entries: usize,
+    bytes: usize,
+    org_entries: usize,
+    org_bytes: usize,
+}
+
+const SCHEMA_CACHE_LIMITS: SchemaCacheLimits = SchemaCacheLimits {
+    entries: 1024,
+    bytes: 256 * 1024 * 1024,
+    org_entries: 128,
+    org_bytes: 64 * 1024 * 1024,
+};
 
 pub struct BusService {
     /// plan-app-platform §7 W4: the TentaBus instance every table this
@@ -2523,12 +2539,16 @@ pub struct BusService {
     /// and recompiles only when that subject's effective version or content
     /// actually changed, so a compile never happens on the publish hot path
     /// for a topic whose schema hasn't changed. Bounded by
-    /// `SCHEMA_CACHE_MAX_ENTRIES` and `SCHEMA_CACHE_MAX_BYTES`, least
-    /// recently used first. Purged for an org by `purge_org`, same as
+    /// `SCHEMA_CACHE_LIMITS` (overall and per org), least recently used
+    /// first. Purged for an org by `purge_org`, same as
     /// `topic_config_cache`.
     schema_cache: DashMap<TopicKey, Arc<ResolvedSchema>>,
     /// Source of `ResolvedSchema::last_used` stamps.
     schema_cache_clock: AtomicU64,
+    /// One lock per subject being compiled, so concurrent misses on the same
+    /// subject wait for one compile instead of each running their own.
+    schema_flights: DashMap<TopicKey, Arc<std::sync::Mutex<()>>>,
+    schema_compiles_total: AtomicU64,
     /// PLAN-F3 §4.3: total records that failed schema validation across
     /// every mode (`warn` counts and keeps the record; `dlq` counts and
     /// quarantines it) — the schema-registry counterpart to
@@ -3026,6 +3046,8 @@ impl BusService {
             topic_config_cache: DashMap::new(),
             schema_cache: DashMap::new(),
             schema_cache_clock: AtomicU64::new(0),
+            schema_flights: DashMap::new(),
+            schema_compiles_total: AtomicU64::new(0),
             schema_violations_total: AtomicU64::new(0),
             schema_check_too_complex_total: AtomicU64::new(0),
             schema_dlq_write_failures_total: AtomicU64::new(0),
@@ -3654,6 +3676,11 @@ impl BusService {
 
     /// Records the schema check gave up on since this service started; not
     /// part of `schema_violations_total`.
+    /// Schema compiles the validator cache ran (misses that paid for one).
+    pub fn schema_compiles_total(&self) -> u64 {
+        self.schema_compiles_total.load(Ordering::Relaxed)
+    }
+
     pub fn schema_check_too_complex_total(&self) -> u64 {
         self.schema_check_too_complex_total.load(Ordering::Relaxed)
     }
@@ -4192,21 +4219,55 @@ impl BusService {
         // The generation is process-global, so it also moves for an
         // unrelated subject or org. Re-reading this subject's row is cheap;
         // recompiling every subject after each registry write is not.
-        if let Some(entry) = self.schema_cache.get(&key) {
-            if entry.version == effective.version
+        let unchanged = |entry: &ResolvedSchema| {
+            entry.version == effective.version
                 && entry.schema_ref_id == effective.schema_ref_id
                 && entry.schema_type == effective.schema_type
                 && entry.content_hash == content_hash
-            {
-                entry
-                    .generation
-                    .store(current_generation, Ordering::Release);
-                self.touch_schema(&entry);
-                return Ok(Some(entry.clone()));
+        };
+        let confirm = |entry: &Arc<ResolvedSchema>| {
+            entry
+                .generation
+                .store(current_generation, Ordering::Release);
+            self.touch_schema(entry);
+            entry.clone()
+        };
+        if let Some(entry) = self.schema_cache.get(&key) {
+            if unchanged(&entry) {
+                return Ok(Some(confirm(&entry)));
             }
         }
-        // Every schema that reached storage already compiled once at
-        // registration; a failure here means a corrupt row.
+        // Concurrent misses on one subject wait here: the first compiles, the
+        // rest find its entry. The map entry is created and cloned under the
+        // shard lock, so removing an unused flight below cannot race a joiner.
+        let flight = self.schema_flights.entry(key.clone()).or_default().clone();
+        let outcome = {
+            let _compiling = flight.lock().unwrap_or_else(|e| e.into_inner());
+            match self.schema_cache.get(&key).filter(|e| unchanged(e)) {
+                Some(entry) => Ok(confirm(&entry)),
+                None => {
+                    self.compile_schema(&key, subject, effective, content_hash, current_generation)
+                }
+            }
+        };
+        drop(flight);
+        self.schema_flights
+            .remove_if(&key, |_, f| Arc::strong_count(f) == 1);
+        outcome.map(Some)
+    }
+
+    /// Compiles `effective` and caches it. Every schema that reached storage
+    /// already compiled once at registration; a failure here means a corrupt
+    /// row.
+    fn compile_schema(
+        &self,
+        key: &TopicKey,
+        subject: &str,
+        effective: schema_registry::registry::EffectiveSchema,
+        content_hash: String,
+        current_generation: u64,
+    ) -> Result<Arc<ResolvedSchema>, BusServiceError> {
+        self.schema_compiles_total.fetch_add(1, Ordering::Relaxed);
         let compiled = effective
             .schema_type
             .ops()
@@ -4233,8 +4294,8 @@ impl BusService {
             last_used: AtomicU64::new(self.schema_cache_clock.fetch_add(1, Ordering::Relaxed)),
         });
         self.schema_cache.insert(key.clone(), resolved.clone());
-        self.evict_schema_cache(&key, SCHEMA_CACHE_MAX_ENTRIES, SCHEMA_CACHE_MAX_BYTES);
-        Ok(Some(resolved))
+        self.evict_schema_cache(key, &SCHEMA_CACHE_LIMITS);
+        Ok(resolved)
     }
 
     fn touch_schema(&self, entry: &ResolvedSchema) {
@@ -4244,30 +4305,65 @@ impl BusService {
         );
     }
 
-    /// Drops the least recently used entries (never `keep`, the one just
-    /// inserted) until the cache fits its entry and byte bounds. Runs only on
-    /// a miss, which already paid for a compile, so a scan is affordable.
-    fn evict_schema_cache(&self, keep: &TopicKey, max_entries: usize, max_bytes: usize) {
+    /// Drops entries until the cache fits `limits`, never `keep` (the one
+    /// just inserted). An org over its own share loses its least recently
+    /// used entry first; when only the overall bounds are exceeded, the org
+    /// holding the most loses its oldest entry. Runs only on a miss, which
+    /// already paid for a compile, so a scan is affordable.
+    fn evict_schema_cache(&self, keep: &TopicKey, limits: &SchemaCacheLimits) {
         loop {
-            let mut bytes = 0usize;
-            let mut oldest: Option<(u64, TopicKey)> = None;
+            let mut total = (0usize, 0usize);
+            let mut per_org: std::collections::HashMap<String, (usize, usize)> =
+                std::collections::HashMap::new();
+            let mut oldest: std::collections::HashMap<String, (u64, TopicKey)> =
+                std::collections::HashMap::new();
             for entry in self.schema_cache.iter() {
-                bytes = bytes.saturating_add(entry.value().weight);
+                let weight = entry.value().weight;
+                total = (total.0 + 1, total.1.saturating_add(weight));
+                let used = per_org.entry(entry.key().0.clone()).or_default();
+                *used = (used.0 + 1, used.1.saturating_add(weight));
                 if entry.key() == keep {
                     continue;
                 }
                 let stamp = entry.value().last_used.load(Ordering::Relaxed);
-                if oldest.as_ref().is_none_or(|(s, _)| stamp < *s) {
-                    oldest = Some((stamp, entry.key().clone()));
+                let slot = oldest.entry(entry.key().0.clone());
+                match slot {
+                    std::collections::hash_map::Entry::Occupied(mut o) if stamp < o.get().0 => {
+                        o.insert((stamp, entry.key().clone()));
+                    }
+                    std::collections::hash_map::Entry::Vacant(v) => {
+                        v.insert((stamp, entry.key().clone()));
+                    }
+                    std::collections::hash_map::Entry::Occupied(_) => {}
                 }
             }
-            if self.schema_cache.len() <= max_entries && bytes <= max_bytes {
-                return;
-            }
-            let Some((_, victim)) = oldest else {
-                return;
+            let over_share = per_org
+                .iter()
+                .filter(|(org, (n, b))| {
+                    oldest.contains_key(*org) && (*n > limits.org_entries || *b > limits.org_bytes)
+                })
+                .map(|(org, _)| org)
+                .next();
+            let victim_org = match over_share {
+                Some(org) => org.clone(),
+                None if total.0 > limits.entries || total.1 > limits.bytes => {
+                    let by_bytes = total.1 > limits.bytes;
+                    let heaviest = per_org
+                        .iter()
+                        .filter(|(org, _)| oldest.contains_key(*org))
+                        .max_by_key(|(org, (n, b))| {
+                            (if by_bytes { *b } else { *n }, (*org).clone())
+                        });
+                    match heaviest {
+                        Some((org, _)) => org.clone(),
+                        None => return,
+                    }
+                }
+                None => return,
             };
-            self.schema_cache.remove(&victim);
+            if let Some((_, victim)) = oldest.remove(&victim_org) {
+                self.schema_cache.remove(&victim);
+            }
         }
     }
 
@@ -5372,11 +5468,16 @@ impl BusService {
             let compiled = &resolved.compiled;
             let mut kept: Vec<PublishRecord> = Vec::with_capacity(batch.records.len());
             let mut violations: Vec<PublishRecord> = Vec::new();
+            // One allowance for the whole batch: per-record budgets would let
+            // N hostile records cost N times the per-document cap.
+            let mut work = schema_registry::ValidationBudget::for_batch(
+                batch.records.iter().map(|r| r.payload.len()).sum(),
+            );
             for mut r in std::mem::take(&mut batch.records) {
                 // A document the check gave up on is quarantined or warned
                 // about like a violation, but under its own reason: it is
                 // not known to be invalid.
-                let verdict = match ops.validate(compiled, &r.payload) {
+                let verdict = match ops.validate_metered(compiled, &r.payload, &mut work) {
                     Ok(()) => Ok(()),
                     Err(schema_registry::SchemaError::Violation(detail)) => {
                         Err((dlq::DlqReason::SchemaViolation, detail))
@@ -19773,10 +19874,14 @@ mod tests {
     }
 
     fn register_json_subject(svc: &BusService, subject: &str) {
+        register_json_subject_in(svc, "org-1", subject);
+    }
+
+    fn register_json_subject_in(svc: &BusService, org_id: &str, subject: &str) {
         schema_registry::registry::register(
             &svc.db,
             svc.instance_id(),
-            "org-1",
+            org_id,
             subject,
             schema_registry::SchemaType::JsonSchema,
             r#"{"type":"object"}"#,
@@ -19833,14 +19938,161 @@ mod tests {
         svc.resolve_validator("org-1", "s1").unwrap().unwrap();
         svc.resolve_validator("org-1", "s4").unwrap().unwrap();
         let keep: TopicKey = ("org-1".to_string(), "s4".to_string());
-        svc.evict_schema_cache(&keep, 3, usize::MAX);
+        let entries_only = |entries| SchemaCacheLimits {
+            entries,
+            bytes: usize::MAX,
+            org_entries: usize::MAX,
+            org_bytes: usize::MAX,
+        };
+        svc.evict_schema_cache(&keep, &entries_only(3));
         let mut left: Vec<String> = svc.schema_cache.iter().map(|e| e.key().1.clone()).collect();
         left.sort();
         assert_eq!(left, ["s1", "s3", "s4"]);
         // A byte bound evicts too, but never the entry just inserted.
-        svc.evict_schema_cache(&keep, usize::MAX, 0);
+        svc.evict_schema_cache(
+            &keep,
+            &SchemaCacheLimits {
+                bytes: 0,
+                ..entries_only(usize::MAX)
+            },
+        );
         let left: Vec<String> = svc.schema_cache.iter().map(|e| e.key().1.clone()).collect();
         assert_eq!(left, ["s4"]);
+    }
+
+    #[test]
+    fn one_org_cannot_evict_another_orgs_compiled_schemas() {
+        let (_tmp, svc) = test_service();
+        register_json_subject_in(&svc, "org-2", "quiet");
+        for name in ["b1", "b2", "b3", "b4"] {
+            register_json_subject_in(&svc, "org-1", name);
+        }
+        // org-2's entry is the globally oldest: plain LRU would drop it first.
+        svc.resolve_validator("org-2", "quiet").unwrap().unwrap();
+        for name in ["b1", "b2", "b3", "b4"] {
+            svc.resolve_validator("org-1", name).unwrap().unwrap();
+        }
+        let keep: TopicKey = ("org-1".to_string(), "b4".to_string());
+        let roomy = SchemaCacheLimits {
+            entries: 3,
+            bytes: usize::MAX,
+            org_entries: usize::MAX,
+            org_bytes: usize::MAX,
+        };
+        svc.evict_schema_cache(&keep, &roomy);
+        let mut left: Vec<TopicKey> = svc.schema_cache.iter().map(|e| e.key().clone()).collect();
+        left.sort();
+        assert_eq!(
+            left.iter().map(|k| k.1.as_str()).collect::<Vec<_>>(),
+            ["b3", "b4", "quiet"],
+            "the org holding the most gives up its oldest entries"
+        );
+
+        // An org over its own share evicts from itself, whatever the total.
+        let share = SchemaCacheLimits {
+            entries: usize::MAX,
+            bytes: usize::MAX,
+            org_entries: 1,
+            org_bytes: usize::MAX,
+        };
+        svc.evict_schema_cache(&keep, &share);
+        let mut left: Vec<String> = svc.schema_cache.iter().map(|e| e.key().1.clone()).collect();
+        left.sort();
+        assert_eq!(left, ["b4", "quiet"]);
+    }
+
+    /// An XSD with `patterns` distinct patterns: slow enough to compile that
+    /// concurrent callers overlap.
+    fn many_pattern_xsd(patterns: usize) -> String {
+        let facets: String = (0..patterns)
+            .map(|i| format!(r#"<xs:pattern value="P{i}\d{{26}}"/>"#))
+            .collect();
+        format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:simpleType name="T"><xs:restriction base="xs:string">{facets}</xs:restriction></xs:simpleType><xs:element name="r" type="T"/></xs:schema>"#
+        )
+    }
+
+    #[test]
+    fn concurrent_misses_on_one_subject_share_one_compile() {
+        let (_tmp, svc) = test_service();
+        schema_registry::registry::register(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "slow",
+            schema_registry::SchemaType::Xsd,
+            &many_pattern_xsd(40),
+            None,
+            None,
+        )
+        .unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        let resolved: Vec<Arc<ResolvedSchema>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        svc.resolve_validator("org-1", "slow").unwrap().unwrap()
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+        assert_eq!(svc.schema_compiles_total(), 1);
+        assert!(resolved.iter().all(|r| Arc::ptr_eq(r, &resolved[0])));
+        assert!(
+            svc.schema_flights.is_empty(),
+            "a finished compile leaves no flight behind"
+        );
+    }
+
+    fn wide_choice_xsd(alternatives: usize) -> String {
+        let alts: String = (0..alternatives)
+            .map(|i| format!(r#"<xs:element name="a{i}" type="xs:string"/>"#))
+            .collect();
+        format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:complexType name="X"><xs:choice minOccurs="0">{alts}</xs:choice></xs:complexType><xs:element name="r"><xs:complexType><xs:sequence><xs:element name="x" type="X" minOccurs="0" maxOccurs="unbounded"/></xs:sequence></xs:complexType></xs:element></xs:schema>"#
+        )
+    }
+
+    #[test]
+    fn a_cached_xsd_is_weighed_with_its_content_model_automata() {
+        let (_tmp, svc) = test_service();
+        let text = wide_choice_xsd(4990);
+        schema_registry::registry::register(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "wide",
+            schema_registry::SchemaType::Xsd,
+            &text,
+            None,
+            None,
+        )
+        .unwrap();
+        let entry = svc.resolve_validator("org-1", "wide").unwrap().unwrap();
+        assert!(
+            entry.weight >= text.len() * 4 + 400_000,
+            "weight {} must include ~10k automaton states",
+            entry.weight
+        );
+    }
+
+    #[test]
+    fn a_publish_batch_shares_one_validation_allowance() {
+        // Each document costs ~30M work units, under the per-document cap of
+        // 50M; five of them together are more than the batch may spend.
+        let doc = format!("<r>{}</r>", "<x/>".repeat(6_000));
+        let (_tmp, svc, _ctx, result) = publish_validated(
+            schema_registry::SchemaType::Xsd,
+            &wide_choice_xsd(4990),
+            "application/xml",
+            topics::ValidationMode::Dlq,
+            &[doc.as_str(); 5],
+        );
+        assert_eq!((result.accepted, result.schema_rejected), (1, 4));
+        assert_eq!(svc.schema_check_too_complex_total(), 4);
+        assert_eq!(svc.schema_violations_total(), 0);
     }
 
     const TREE_XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:complexType name="node"><xs:sequence><xs:element name="child" type="node" minOccurs="0"/></xs:sequence></xs:complexType><xs:element name="tree" type="node"/></xs:schema>"#;

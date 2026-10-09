@@ -33417,6 +33417,32 @@ pub fn bus_schema_version_list(
     Ok(rows)
 }
 
+/// Every version of a subject in version order, WITHOUT the schema text
+/// (`schema_text` is empty): choosing the effective version needs only the
+/// number and content hash, and a subject may hold many versions of up to
+/// 256 KiB each.
+pub fn bus_schema_version_heads(
+    pool: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    subject: &str,
+) -> Result<Vec<DbBusSchemaVersion>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT instance_id, org_id, subject, version, '' AS schema_text, \
+         content_hash, schema_ref_id, created_by, created_at_ms, subject_generation \
+         FROM bus_schema_versions \
+         WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3 ORDER BY version ASC",
+    )?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![instance_id, org_id, subject],
+            map_bus_schema_version_row,
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 pub fn bus_schema_version_get(
     pool: &DbPool,
     instance_id: &str,

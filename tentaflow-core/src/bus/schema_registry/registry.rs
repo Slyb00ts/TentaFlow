@@ -1073,10 +1073,13 @@ pub fn resolve_effective(
     let chosen = if deprecated.is_empty() {
         repository::bus_schema_version_latest(db, instance_id, org_id, subject)?
     } else {
-        let mut versions = repository::bus_schema_version_list(db, instance_id, org_id, subject)?;
-        let effective = effective_version(&row, &deprecated, &versions).map(|v| v.version);
-        versions.retain(|v| Some(v.version) == effective);
-        versions.pop()
+        let heads = repository::bus_schema_version_heads(db, instance_id, org_id, subject)?;
+        match effective_version(&row, &deprecated, &heads).map(|v| v.version) {
+            Some(version) => {
+                repository::bus_schema_version_get(db, instance_id, org_id, subject, version)?
+            }
+            None => None,
+        }
     };
     let Some(chosen) = chosen else {
         return Ok(None);
@@ -2204,6 +2207,27 @@ mod tests {
         assert_eq!(subject.deprecated_at_ms, None, "only the version is deprecated");
         let versions = repository::bus_schema_version_list(&db, INST, "org-1", "orders").unwrap();
         assert_eq!(versions.len(), 3, "version rows are never touched");
+    }
+
+    #[test]
+    fn choosing_the_effective_version_reads_no_schema_text_but_the_chosen_one() {
+        let db = three_versions();
+        delete(&db, INST, "org-1", "orders", Some(3), true).unwrap();
+        let heads = repository::bus_schema_version_heads(&db, INST, "org-1", "orders").unwrap();
+        assert_eq!(
+            heads.iter().map(|h| h.version).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert!(heads
+            .iter()
+            .all(|h| h.schema_text.is_empty() && !h.content_hash.is_empty()));
+        let effective = resolve_effective(&db, INST, "org-1", "orders")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (effective.version, effective.schema_text.as_str()),
+            (2, V2_ADD_OPTIONAL)
+        );
     }
 
     #[test]

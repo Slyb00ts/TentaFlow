@@ -11378,7 +11378,7 @@
         "xsd_help_title": "Which XSD patterns will work",
         "xsd_help_works": "An ordinary pattern written in one file will work: which elements and attributes the document has, how many times they may occur, a choice of one of several possibilities and simple restrictions, e.g. the length of a text or a list of allowed values.",
         "xsd_help_fails": "A pattern that includes other files or uses more advanced parts of XSD will not — when you add it, you will see what is missing.",
-        "xsd_help_limits": "A pattern also has size limits: a value in a list of allowed values up to 1 KB (the lists together up to 128 KB and 4096 entries), a pattern restriction up to 512 characters, at most 1024 attributes in one type, and all patterns together must fit in 8 MB of memory."
+        "xsd_help_limits": "A pattern also has size limits: a value in a list of allowed values up to 1 KB (the lists together up to 128 KB and 4096 entries), a pattern restriction up to 512 characters, at most 1024 attributes in one type, and all patterns together must fit in 16 MB of memory."
       },
       "added_existing_title": "Pattern {name} already existed",
       "added_existing_version": "Someone added it meanwhile, so the text went into it as version {version}.",

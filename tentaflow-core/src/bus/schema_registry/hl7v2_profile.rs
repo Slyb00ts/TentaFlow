@@ -36,7 +36,10 @@ use serde_json::{Map, Value};
 
 use crate::bus::payload_format::{hl7v2, FormatError, PayloadFormat};
 
-use super::{Compatibility, CompiledSchema, SchemaError, SchemaKindOps, MAX_SCHEMA_TEXT_BYTES};
+use super::{
+    Compatibility, CompiledSchema, SchemaError, SchemaKindOps, ValidationBudget,
+    MAX_SCHEMA_TEXT_BYTES,
+};
 
 const MAX_LIST_ENTRIES: usize = 512;
 const MAX_DESCRIPTION_CHARS: usize = 1000;
@@ -241,7 +244,12 @@ impl SchemaKindOps for Hl7v2ProfileOps {
         }))
     }
 
-    fn validate(&self, compiled: &CompiledSchema, payload: &[u8]) -> Result<(), SchemaError> {
+    fn validate_metered(
+        &self,
+        compiled: &CompiledSchema,
+        payload: &[u8],
+        _budget: &mut ValidationBudget,
+    ) -> Result<(), SchemaError> {
         let CompiledSchema::Hl7v2Profile(c) = compiled else {
             return Err(invalid(
                 "validate called with a non-hl7v2_profile compiled schema",

@@ -281,6 +281,7 @@ getrandom = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true, default-features = true }
 regex = { workspace = true }
+regex-automata = { workspace = true }
 semver = { workspace = true }
 
 # Multipart form data parsing

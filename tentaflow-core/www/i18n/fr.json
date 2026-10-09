@@ -10143,7 +10143,7 @@
         "xsd_help_title": "Quels modèles XSD fonctionnent",
         "xsd_help_works": "Un modèle ordinaire écrit dans un seul fichier fonctionne : quels éléments et attributs le document a, combien de fois ils peuvent apparaître, le choix d’une possibilité parmi plusieurs et des restrictions simples, par ex. la longueur d’un texte ou une liste de valeurs autorisées.",
         "xsd_help_fails": "Un modèle qui inclut d’autres fichiers ou utilise des parties plus avancées de XSD ne fonctionne pas : à l’ajout, vous verrez ce qui manque.",
-        "xsd_help_limits": "Un modèle a aussi des limites de taille : une valeur d’une liste de valeurs autorisées jusqu’à 1 Ko (les listes ensemble jusqu’à 128 Ko et 4096 entrées), une restriction pattern jusqu’à 512 caractères, au plus 1024 attributs dans un type, et tous les motifs ensemble doivent tenir dans 8 Mo de mémoire."
+        "xsd_help_limits": "Un modèle a aussi des limites de taille : une valeur d’une liste de valeurs autorisées jusqu’à 1 Ko (les listes ensemble jusqu’à 128 Ko et 4096 entrées), une restriction pattern jusqu’à 512 caractères, au plus 1024 attributs dans un type, et tous les motifs ensemble doivent tenir dans 16 Mo de mémoire."
       },
       "added_existing_title": "Le modèle {name} existait déjà",
       "added_existing_version": "Quelqu’un l’a ajouté entre-temps, le texte y est donc entré en version {version}.",

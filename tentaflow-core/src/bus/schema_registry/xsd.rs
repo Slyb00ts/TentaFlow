@@ -48,26 +48,29 @@
 // numbers and booleans (`01` equals `1`, `1` equals `true`), the literal text
 // for everything else.
 //
-// `pattern` is translated from the XSD regex dialect to the Rust `regex`
-// crate and wrapped in `\A(?:…)\z` (XSD patterns are implicitly anchored, and
+// `pattern` is translated from the XSD regex dialect to the Rust regex syntax
+// (`regex-automata`) and wrapped in `\A(?:…)\z` (XSD patterns are implicitly anchored, and
 // `^`/`$` are ordinary characters in XSD, so they are escaped). Differences
 // that remain: `.` excludes `\n` and `\r` (as in XSD); `\d` is `\p{Nd}` and
 // `\s` is `[ \t\n\r]` (as in XSD); constructs that mean something different
 // or do not exist in XSD (`\i \I \c \C \w \W`, character-class subtraction,
 // `\p{IsBlock}`, `(?…)` groups, lazy quantifiers, `\b`) are rejected at
-// compile time. The `regex` crate matches in linear time, so a hostile
-// pattern cannot cause catastrophic backtracking.
+// compile time. Every group is non-capturing (XSD has no captures or
+// backreferences), and matching is linear time: a lazy DFA (`hybrid`) scans a
+// value at one budget unit per byte and, when its cache thrashes and it gives
+// up, a Pike VM takes over at `states x length` units charged first, so a
+// hostile pattern cannot cause catastrophic backtracking or unmetered work.
 //
 // Resource bounds are structural. One meter (`Budget`) is charged by every
-// expensive primitive BEFORE it runs — `SimpleType::check` (value length x
-// pattern weight, enumeration lookup), enumeration intersection, NFA
+// expensive primitive BEFORE it runs — `SimpleType::check` (value length per
+// pattern, enumeration lookup), enumeration intersection, NFA
 // closure/step, attribute processing, compile work — and `check` cannot be
 // called without one. Validation (`MAX_VALIDATION_STEPS`), comparison
 // (`MAX_COMPAT_WORK`) and compilation (`MAX_COMPILE_WORK`) each own a budget;
 // running out is `LimitExceeded`, never a verdict. On top of that, static caps
 // refuse a schema at compile time: enumeration value and total bytes,
-// pattern length and count, a per-pattern program size tier (whose weight
-// prices matching) with a per-schema memory proxy, and attributes per type.
+// pattern length, count and compiled size, a per-schema memory proxy
+// (`pattern_memory`), and attributes per type.
 //
 // Content models compile to an NFA (Thompson construction; counted
 // occurrences are expanded, bounded by a state budget) and are simulated with
@@ -98,14 +101,23 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::{BytesRef, BytesStart, Event};
 use quick_xml::{Decoder, Reader, XmlVersion};
-use regex::{Regex, RegexBuilder};
+use regex_automata::hybrid::dfa::{
+    Builder as DfaBuilder, Cache as DfaCache, Config as DfaConfig, DFA,
+};
+use regex_automata::nfa::thompson::pikevm::PikeVM;
+use regex_automata::nfa::thompson::{self, WhichCaptures};
+use regex_automata::util::syntax;
+use regex_automata::{Anchored, Input};
 
-use super::{Compatibility, CompiledSchema, SchemaError, SchemaKindOps, MAX_SCHEMA_TEXT_BYTES};
+use super::{
+    Compatibility, CompiledSchema, SchemaError, SchemaKindOps, ValidationBudget,
+    MAX_SCHEMA_TEXT_BYTES,
+};
 
 const XSD_NS: &str = "http://www.w3.org/2001/XMLSchema";
 const XSI_PREFIX: &str = "xsi:";
@@ -130,30 +142,26 @@ const MAX_ENUM_TOTAL_BYTES: usize = 128 * 1024;
 /// FHIR-like records) carry a few dozen.
 const MAX_ATTRIBUTES_PER_TYPE: usize = 1024;
 const MAX_NAME_CHARS: usize = 128;
-/// Compiled-program size limits a pattern may use, smallest first, with the
-/// per-input-byte cost weight of matching it. A pattern is built at the
-/// smallest tier that holds it, so the tier is a measurable upper bound of
-/// its size and of how many NFA states one input byte can touch when the
-/// lazy DFA gives up (measured: ~0.64 us/byte at 16 KiB, ~1.6 us/byte at
-/// 64 KiB; a unit is about 10 ns, so the weight is 4 per KiB of tier).
-/// Unicode makes the range wide: `\d` is `\p{Nd}` and costs ~7 KiB, so a
-/// PESEL (`\d{11}`) needs 64 KiB and a 26-digit IBAN body 192 KiB; the top
-/// tier admits those while `\p{L}{60}` (4 MiB) is refused outright.
-const PATTERN_TIERS: [PatternTier; 7] = [
-    PatternTier::kib(4),
-    PatternTier::kib(8),
-    PatternTier::kib(16),
-    PatternTier::kib(32),
-    PatternTier::kib(64),
-    PatternTier::kib(128),
-    PatternTier::kib(256),
-];
-/// Memory proxy per schema: every pattern holds its program plus a lazy-DFA
-/// cache, each at most its tier limit, so a pattern costs twice its tier.
-/// 8 MiB covers 256 patterns of the smallest tier, 64 PESEL-sized ones or
-/// 16 of the largest; a schema of a few dozen identifier and date patterns
-/// uses a small fraction.
-const MAX_PATTERN_MEMORY: usize = 8 * 1024 * 1024;
+/// Size limit of one pattern's compiled program. Unicode makes the range wide:
+/// `\d` is `\p{Nd}` and costs ~7 KiB, so a PESEL (`\d{11}`) needs ~64 KiB and a
+/// 26-digit IBAN body ~192 KiB; this admits those while `\p{L}{60}` (4 MiB) is
+/// refused outright.
+const PATTERN_NFA_LIMIT: usize = 256 * 1024;
+/// Lazy-DFA cache of a pattern: twice the smallest capacity its automaton
+/// builds with (1 KiB for `q1x`, 32 KiB for an IBAN), at least
+/// `PATTERN_CACHE_FLOOR` and refused above `PATTERN_CACHE_MAX`.
+const PATTERN_CACHE_FLOOR: usize = 16 * 1024;
+const PATTERN_CACHE_MAX: usize = 1024 * 1024;
+/// A pattern keeps at most this many idle lazy-DFA caches for reuse; further
+/// concurrent matches build a cache and drop it.
+const RETAINED_CACHES: usize = 2;
+/// Memory proxy per schema, charged per pattern as
+/// `nfa.memory_usage() + RETAINED_CACHES x cache_capacity`: the forward
+/// program (shared with the Pike VM fallback; no reverse program is built,
+/// matching is anchored and forward-only) plus the lazy-DFA caches the pattern
+/// may keep. A Pike VM cache (~64 bytes per NFA state) exists only during a
+/// charged fallback and is dropped afterwards, so it is not retained memory.
+const MAX_PATTERN_MEMORY: usize = 16 * 1024 * 1024;
 const PATTERN_NEST_LIMIT: u32 = 32;
 const MAX_DOC_DEPTH: usize = 128;
 /// One unit is roughly 10 ns of work; 50M units bound a document to about
@@ -601,7 +609,7 @@ fn translate_pattern(pattern: &str) -> Result<String, String> {
                 if chars.get(i + 1) == Some(&'?') {
                     return Err("'(?' groups are not part of the XSD regex dialect".to_string());
                 }
-                out.push('(');
+                out.push_str("(?:");
                 depth += 1;
                 prev_quantifier = false;
             }
@@ -646,50 +654,114 @@ fn translate_pattern(pattern: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// One compiled pattern: an anchored full-match test over a string.
 #[derive(Debug)]
-struct PatternTier {
-    size_limit: usize,
-    /// Cost units per input byte a match charges for this pattern.
-    weight: u64,
+struct Matcher {
+    dfa: DFA,
+    pike: PikeVM,
+    cache_capacity: usize,
+    caches: Mutex<Vec<DfaCache>>,
+    memory: usize,
 }
 
-impl PatternTier {
-    const fn kib(kib: usize) -> PatternTier {
-        PatternTier {
-            size_limit: kib * 1024,
-            weight: 4 * kib as u64,
-        }
-    }
-}
-
-/// The regex and the smallest tier whose size limit holds it.
-fn build_pattern(source: &str) -> Result<(Regex, &'static PatternTier), String> {
+/// A pattern longer than `MAX_PATTERN_CHARS`, malformed, or too large to
+/// compile is an error naming the pattern's problem, not its text.
+fn build_pattern(source: &str) -> Result<Matcher, String> {
     if source.chars().count() > MAX_PATTERN_CHARS {
         return Err(format!("pattern exceeds {MAX_PATTERN_CHARS} characters"));
     }
     let translated = translate_pattern(source)?;
-    let mut last = None;
-    for tier in &PATTERN_TIERS {
-        match RegexBuilder::new(&translated)
-            .size_limit(tier.size_limit)
-            .dfa_size_limit(tier.size_limit)
-            .nest_limit(PATTERN_NEST_LIMIT)
-            .build()
-        {
-            Ok(regex) => return Ok((regex, tier)),
-            Err(regex::Error::CompiledTooBig(_)) => {}
-            Err(e) => {
-                last = Some(e);
-                break;
+    let too_large = || {
+        "pattern is not a valid or supported regular expression: the compiled pattern is too \
+         large"
+            .to_string()
+    };
+    let nfa = thompson::Compiler::new()
+        .configure(
+            thompson::Config::new()
+                .nfa_size_limit(Some(PATTERN_NFA_LIMIT))
+                .which_captures(WhichCaptures::Implicit),
+        )
+        .syntax(syntax::Config::new().nest_limit(PATTERN_NEST_LIMIT))
+        .build(&translated)
+        .map_err(|e| {
+            if e.size_limit().is_some() {
+                too_large()
+            } else {
+                format!("pattern is not a valid or supported regular expression: {e}")
+            }
+        })?;
+    let build_dfa = |cache_capacity: usize| {
+        // Building a state costs about one step per NFA state, so the lazy
+        // DFA may clear its cache only while it has searched enough bytes
+        // per cached state to keep that cost below the byte's own charge.
+        let config = DfaConfig::new()
+            .cache_capacity(cache_capacity)
+            .minimum_cache_clear_count(Some(0))
+            .minimum_bytes_per_state(Some((nfa.states().len() / 2).max(10)));
+        DfaBuilder::new()
+            .configure(config)
+            .build_from_nfa(nfa.clone())
+            .ok()
+    };
+    let mut smallest = 1024;
+    while build_dfa(smallest).is_none() {
+        smallest *= 2;
+        if smallest * 2 > PATTERN_CACHE_MAX {
+            return Err(too_large());
+        }
+    }
+    let cache_capacity = (2 * smallest).max(PATTERN_CACHE_FLOOR);
+    let dfa = build_dfa(cache_capacity).ok_or_else(too_large)?;
+    let pike = PikeVM::new_from_nfa(nfa.clone())
+        .map_err(|e| format!("pattern is not a valid or supported regular expression: {e}"))?;
+    Ok(Matcher {
+        memory: nfa.memory_usage() + RETAINED_CACHES * cache_capacity,
+        dfa,
+        pike,
+        cache_capacity,
+        caches: Mutex::new(Vec::new()),
+    })
+}
+
+impl Matcher {
+    /// Resident bytes this pattern may hold; see `MAX_PATTERN_MEMORY`.
+    fn memory_bytes(&self) -> usize {
+        self.memory
+    }
+
+    /// Whether the whole of `value` matches. Costs one unit per byte of the
+    /// lazy-DFA scan; when the lazy DFA gives up (its cache thrashed on a
+    /// pattern whose state space explodes), the cache it burned and the Pike
+    /// VM's `states x length` are charged BEFORE the Pike VM runs.
+    fn is_match(&self, value: &str, budget: &mut Budget) -> Result<bool, LimitExceeded> {
+        let len = value.len() as u64;
+        budget.charge(1 + len)?;
+        let input = Input::new(value).anchored(Anchored::Yes).earliest(true);
+        let mut cache = self
+            .caches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop()
+            .unwrap_or_else(|| self.dfa.create_cache());
+        match self.dfa.try_search_fwd(&mut cache, &input) {
+            Ok(found) => {
+                let mut idle = self.caches.lock().unwrap_or_else(PoisonError::into_inner);
+                if idle.len() < RETAINED_CACHES {
+                    idle.push(cache);
+                }
+                Ok(found.is_some())
+            }
+            Err(_) => {
+                let states = self.dfa.get_nfa().states().len() as u64;
+                budget.charge(
+                    (self.cache_capacity as u64).saturating_add(len.saturating_mul(states)),
+                )?;
+                let mut cache = self.pike.create_cache();
+                Ok(self.pike.is_match(&mut cache, input))
             }
         }
     }
-    Err(match last {
-        Some(e) => format!("pattern is not a valid or supported regular expression: {e}"),
-        None => "pattern is not a valid or supported regular expression: the compiled pattern \
-                 is too large"
-            .to_string(),
-    })
 }
 
 // =============================================================================
@@ -1534,9 +1606,7 @@ fn parse_doc(schema_text: &str) -> Result<Doc, SchemaError> {
 #[derive(Clone, Debug)]
 struct Pattern {
     source: String,
-    regex: Regex,
-    /// Cost units per input byte, from the size tier the pattern compiled at.
-    weight: u64,
+    matcher: Arc<Matcher>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1554,11 +1624,6 @@ impl Facets {
             && self.max_length.is_none()
             && self.patterns.is_empty()
             && self.enumeration.is_empty()
-    }
-
-    /// Cost units one input byte takes to run through every pattern.
-    fn pattern_weight(&self) -> u64 {
-        self.patterns.iter().map(|p| p.weight).sum()
     }
 }
 
@@ -1632,8 +1697,14 @@ impl SimpleType {
                 }
             }
             if !step.patterns.is_empty() {
-                budget.charge(len.saturating_mul(step.pattern_weight()))?;
-                if !step.patterns.iter().any(|p| p.regex.is_match(value)) {
+                let mut matched = false;
+                for p in &step.patterns {
+                    if p.matcher.is_match(value, budget)? {
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
                     return Err(violated("does not match the pattern"));
                 }
             }
@@ -1719,10 +1790,14 @@ struct NfaState {
     edge: Option<(u32, u32)>,
 }
 
+/// The accepting state of every [`Nfa`]. It is state 0 and a state set keeps it
+/// first (the closure moves it there and the sorted sets of a comparison start
+/// with the smallest id), so "does this set accept" reads one element.
+const NFA_ACCEPT: u32 = 0;
+
 #[derive(Debug)]
 struct Nfa {
     states: Vec<NfaState>,
-    accept: u32,
     start_set: Vec<u32>,
 }
 
@@ -1737,6 +1812,8 @@ struct NfaModel {
 struct AllModel {
     children: Vec<ChildDecl>,
     required: Vec<bool>,
+    /// Whether any child is required, so an empty group is judged in O(1).
+    any_required: bool,
     by_name: HashMap<String, u32>,
     /// `minOccurs="0"` on the group: the whole group may be absent.
     optional: bool,
@@ -1744,7 +1821,7 @@ struct AllModel {
 
 impl AllModel {
     fn accepts_empty(&self) -> bool {
-        self.optional || !self.required.iter().any(|r| *r)
+        self.optional || !self.any_required
     }
 }
 
@@ -1809,16 +1886,20 @@ pub struct Compiled {
     types: Vec<TypeDef>,
     roots: HashMap<String, usize>,
     max_nfa_states: usize,
-    /// Pattern memory proxy and enumeration bytes, for cache accounting.
+    /// Pattern memory proxy, enumeration bytes and the content models'
+    /// automata, for cache accounting.
     pattern_memory: usize,
     enum_bytes: usize,
+    model_bytes: usize,
 }
 
 impl Compiled {
-    /// Resident bytes the schema text does not show: the regex programs and
-    /// lazy-DFA caches, and the enumeration sets.
+    /// Resident bytes the schema text does not show: the pattern programs and
+    /// lazy-DFA caches, the enumeration sets (members are held once in the
+    /// set and once as hash-table slack, hence the factor), and the content
+    /// model automata and declaration tables.
     pub(super) fn extra_bytes(&self) -> usize {
-        self.pattern_memory + 2 * self.enum_bytes
+        self.pattern_memory + 2 * self.enum_bytes + self.model_bytes
     }
 
     fn simple(&self, idx: usize) -> &SimpleType {
@@ -1979,9 +2060,10 @@ impl Marks {
 }
 
 impl Nfa {
-    /// Adds to `out` every state reachable from `seeds` through epsilon
-    /// edges that matters for matching (it has an edge or is the accept
-    /// state). Every visited state is charged to `budget`.
+    /// Fills the empty `out` with every state reachable from `seeds` through
+    /// epsilon edges that matters for matching (it has an edge or is the
+    /// accept state, which comes first). Every visited state is charged to
+    /// `budget`.
     fn closure(
         &self,
         seeds: &[u32],
@@ -1989,6 +2071,7 @@ impl Nfa {
         marks: &mut Marks,
         budget: &mut Budget,
     ) -> Result<(), LimitExceeded> {
+        debug_assert!(out.is_empty());
         budget.charge(1 + seeds.len() as u64)?;
         let stamp = marks.next_stamp();
         marks.work.clear();
@@ -2001,7 +2084,11 @@ impl Nfa {
         while let Some(s) = marks.work.pop() {
             let state = &self.states[s as usize];
             budget.charge(1 + state.eps.len() as u64)?;
-            if state.edge.is_some() || s == self.accept {
+            if s == NFA_ACCEPT {
+                out.push(s);
+                let last = out.len() - 1;
+                out.swap(0, last);
+            } else if state.edge.is_some() {
                 out.push(s);
             }
             for &t in &state.eps {
@@ -2035,7 +2122,7 @@ impl Nfa {
     }
 
     fn accepts(&self, active: &[u32]) -> bool {
-        active.contains(&self.accept)
+        active.first() == Some(&NFA_ACCEPT)
     }
 
     fn labels_from(&self, active: &[u32]) -> BTreeSet<u32> {
@@ -2069,6 +2156,7 @@ struct Compiler<'d> {
     pattern_memory: usize,
     enum_values: usize,
     enum_bytes: usize,
+    model_bytes: usize,
     nfa_states: usize,
     max_nfa_states: usize,
     work: Budget,
@@ -2090,6 +2178,7 @@ impl<'d> Compiler<'d> {
             pattern_memory: 0,
             enum_values: 0,
             enum_bytes: 0,
+            model_bytes: 0,
             nfa_states: 0,
             max_nfa_states: 1,
             work: Budget::new(MAX_COMPILE_WORK),
@@ -2150,12 +2239,15 @@ impl<'d> Compiler<'d> {
             roots.insert(e.name.clone(), idx);
         }
         Ok(Compiled {
-            elements: self.elements,
-            types: self.types,
             roots,
             max_nfa_states: self.max_nfa_states,
             pattern_memory: self.pattern_memory,
             enum_bytes: self.enum_bytes,
+            model_bytes: self.model_bytes
+                + self.types.len() * std::mem::size_of::<TypeDef>()
+                + self.elements.len() * std::mem::size_of::<ElementDecl>(),
+            types: self.types,
+            elements: self.elements,
         })
     }
 
@@ -2261,10 +2353,9 @@ impl<'d> Compiler<'d> {
         let mut patterns = Vec::new();
         for source in &f.patterns {
             self.charge(1 + source.len() as u64)?;
-            let (regex, tier) =
+            let matcher =
                 build_pattern(source).map_err(|e| invalid(format!("type '{what}': {e}")))?;
-            // Program and lazy-DFA cache are each bounded by the tier limit.
-            self.pattern_memory += 2 * tier.size_limit;
+            self.pattern_memory += matcher.memory_bytes();
             if self.pattern_memory > MAX_PATTERN_MEMORY {
                 return Err(invalid(format!(
                     "the patterns of the schema need more than {} KiB of memory in total",
@@ -2273,8 +2364,7 @@ impl<'d> Compiler<'d> {
             }
             patterns.push(Pattern {
                 source: source.clone(),
-                regex,
-                weight: tier.weight,
+                matcher: Arc::new(matcher),
             });
         }
         self.enum_values += f.enumeration.len();
@@ -2420,8 +2510,10 @@ impl<'d> Compiler<'d> {
                 self.label(e, &mut labels)?;
                 required.push(e.min >= 1);
             }
+            self.model_bytes += labels_bytes(&labels) + required.len();
             return Ok(Model::All(AllModel {
                 children: labels.children,
+                any_required: required.iter().any(|r| *r),
                 required,
                 by_name: labels.by_name,
                 optional: g.min == 0,
@@ -2430,15 +2522,18 @@ impl<'d> Compiler<'d> {
         let particle = self.particle(g, &mut labels)?;
         let mut builder = NfaBuilder {
             states: Vec::new(),
-            limit: MAX_NFA_STATES,
+            // The accept state is bookkeeping, not part of the content model.
+            limit: MAX_NFA_STATES + 1,
             total: &mut self.nfa_states,
         };
+        let accept = builder.state()?;
+        debug_assert_eq!(accept, NFA_ACCEPT);
         let frag = builder.particle(&particle)?;
+        builder.link(frag.end, accept);
         let states = builder.states;
         self.max_nfa_states = self.max_nfa_states.max(states.len());
         let mut nfa = Nfa {
             states,
-            accept: frag.end,
             start_set: Vec::new(),
         };
         self.charge(nfa.states.len() as u64)?;
@@ -2448,6 +2543,7 @@ impl<'d> Compiler<'d> {
             .map_err(|_| invalid(COMPILE_WORK_REFUSAL))?;
         start_set.sort_unstable();
         nfa.start_set = start_set;
+        self.model_bytes += nfa_bytes(&nfa) + labels_bytes(&labels);
         Ok(Model::Nfa(NfaModel {
             children: labels.children,
             by_name: labels.by_name,
@@ -2497,6 +2593,28 @@ impl<'d> Compiler<'d> {
             max: g.max,
         })
     }
+}
+
+/// Resident bytes of a content model's automaton: the state array, each
+/// state's epsilon list on the heap, and the start set.
+fn nfa_bytes(nfa: &Nfa) -> usize {
+    nfa.states.len() * std::mem::size_of::<NfaState>()
+        + nfa
+            .states
+            .iter()
+            .map(|s| s.eps.capacity() * std::mem::size_of::<u32>())
+            .sum::<usize>()
+        + nfa.start_set.capacity() * std::mem::size_of::<u32>()
+}
+
+/// Resident bytes of a content model's child table: each name is held in the
+/// list and as a map key, plus the entry overhead of both.
+fn labels_bytes(labels: &Labels) -> usize {
+    labels
+        .children
+        .iter()
+        .map(|c| 2 * c.name.len() + std::mem::size_of::<ChildDecl>() + 48)
+        .sum()
 }
 
 fn compile_doc(doc: &Doc) -> Result<Compiled, SchemaError> {
@@ -2589,16 +2707,24 @@ fn path_of(stack: &[Frame], extra: Option<&str>) -> String {
     p
 }
 
-fn initial_state(c: &Compiled, ty: usize) -> State {
-    match &c.types[ty] {
+/// The state of a freshly entered element. The start set and the seen-flags
+/// are copied per element, so their length is charged.
+fn initial_state(c: &Compiled, ty: usize, budget: &mut Budget) -> Result<State, LimitExceeded> {
+    Ok(match &c.types[ty] {
         TypeDef::Simple(_) => State::Text(ty, String::new()),
         TypeDef::Complex(ct) => match &ct.content {
             Content::Empty => State::None,
             Content::Text(simple) => State::Text(*simple, String::new()),
-            Content::Model(Model::Nfa(m)) => State::Nfa(m.nfa.start_set.clone()),
-            Content::Model(Model::All(m)) => State::All(vec![false; m.children.len()], false),
+            Content::Model(Model::Nfa(m)) => {
+                budget.charge(m.nfa.start_set.len() as u64)?;
+                State::Nfa(m.nfa.start_set.clone())
+            }
+            Content::Model(Model::All(m)) => {
+                budget.charge(m.children.len() as u64)?;
+                State::All(vec![false; m.children.len()], false)
+            }
         },
-    }
+    })
 }
 
 const VALIDATION_BUDGET_MSG: &str = "document exceeds the validation work budget";
@@ -2618,8 +2744,9 @@ fn check_attributes(
     };
     let required_total = declared.map_or(0, |a| a.required);
     let mut required_seen = 0;
-    // quick-xml's own duplicate check compares every pair of attributes;
-    // this one is linear and charged per attribute.
+    // quick-xml's duplicate check is a linear scan of the earlier keys up to
+    // 32 attributes and a hash set beyond, and none of that work reaches the
+    // budget; this one is one hash insert per attribute, charged per attribute.
     let mut present: HashSet<&[u8]> = HashSet::new();
     for attr in e.attributes().with_checks(false) {
         budget.charge(COST_ATTRIBUTE).map_err(|_| too_complex())?;
@@ -2783,6 +2910,9 @@ fn close_frame(
             }),
         ) => {
             if *any {
+                budget
+                    .charge(seen.len() as u64)
+                    .map_err(|_| limit(&path_of(stack, None), VALIDATION_BUDGET_MSG))?;
                 if let Some(i) = (0..seen.len()).find(|&i| m.required[i] && !seen[i]) {
                     return Err(fail(&format!(
                         "required child element '{}' is missing",
@@ -2819,17 +2949,12 @@ fn on_text(stack: &mut [Frame], text: &str) -> Result<(), SchemaError> {
     Err(violation(&path_of(stack, None), what))
 }
 
-fn validate_document(c: &Compiled, payload: &[u8]) -> Result<(), SchemaError> {
-    validate_within(c, payload, MAX_VALIDATION_STEPS)
-}
-
-fn validate_within(c: &Compiled, payload: &[u8], work_limit: u64) -> Result<(), SchemaError> {
+fn validate_with(c: &Compiled, payload: &[u8], budget: &mut Budget) -> Result<(), SchemaError> {
     let mut reader = Reader::from_reader(payload);
     let decoder = reader.decoder();
     let mut stack: Vec<Frame> = Vec::new();
     let mut root_closed = false;
     let mut marks = Marks::new(c.max_nfa_states);
-    let mut budget = Budget::new(work_limit);
 
     loop {
         let event = reader
@@ -2859,18 +2984,14 @@ fn validate_within(c: &Compiled, payload: &[u8], work_limit: u64) -> Result<(), 
                 budget
                     .charge(COST_ELEMENT + name.len() as u64)
                     .map_err(|_| limit(&path_of(&stack, Some(&name)), VALIDATION_BUDGET_MSG))?;
-                let element = enter_child(c, &mut stack, &name, &mut marks, &mut budget)?;
+                let element = enter_child(c, &mut stack, &name, &mut marks, budget)?;
                 let ty = c.elements[element].ty;
-                check_attributes(c, ty, e, decoder, &mut budget, &|| {
-                    path_of(&stack, Some(&name))
-                })?;
-                stack.push(Frame {
-                    name,
-                    ty,
-                    state: initial_state(c, ty),
-                });
+                check_attributes(c, ty, e, decoder, budget, &|| path_of(&stack, Some(&name)))?;
+                let state = initial_state(c, ty, budget)
+                    .map_err(|_| limit(&path_of(&stack, Some(&name)), VALIDATION_BUDGET_MSG))?;
+                stack.push(Frame { name, ty, state });
                 if matches!(event, Event::Empty(_)) {
-                    close_frame(c, &mut stack, &mut budget)?;
+                    close_frame(c, &mut stack, budget)?;
                     root_closed = stack.is_empty();
                 }
             }
@@ -2878,7 +2999,7 @@ fn validate_within(c: &Compiled, payload: &[u8], work_limit: u64) -> Result<(), 
                 if stack.is_empty() {
                     return Err(violation("<root>", "unmatched end tag"));
                 }
-                close_frame(c, &mut stack, &mut budget)?;
+                close_frame(c, &mut stack, budget)?;
                 root_closed = stack.is_empty();
             }
             Event::Text(ref t) => {
@@ -2930,30 +3051,46 @@ fn validate_within(c: &Compiled, payload: &[u8], work_limit: u64) -> Result<(), 
 /// therefore guaranteed to survive projection only when the policy names it
 /// unprefixed and the instance does too; `filter_group` relaxes requiredness
 /// of every child for which that cannot be promised.
-fn keeps(allowed: &BTreeSet<String>, name: &str) -> bool {
-    allowed.contains(name)
-        || allowed
-            .iter()
-            .any(|a| a.rsplit_once(':').is_some_and(|(_, local)| local == name))
+struct Kept<'a> {
+    allowed: &'a BTreeSet<String>,
+    /// Local part of every prefixed policy entry, built once so a lookup does
+    /// not scan the whole policy for every child of every group.
+    locals: HashSet<&'a str>,
+}
+
+impl<'a> Kept<'a> {
+    fn new(allowed: &'a BTreeSet<String>) -> Kept<'a> {
+        Kept {
+            allowed,
+            locals: allowed
+                .iter()
+                .filter_map(|a| a.rsplit_once(':').map(|(_, local)| local))
+                .collect(),
+        }
+    }
+
+    fn keeps(&self, name: &str) -> bool {
+        self.allowed.contains(name) || self.locals.contains(name)
+    }
 }
 
 /// The group restricted to allowed child elements, or `None` when nothing
 /// is left. A `choice` that lost a whole alternative becomes optional: a
 /// document that picked the dropped alternative projects to no element.
-fn filter_group(g: &GroupDef, allowed: &BTreeSet<String>, namespaced: bool) -> Option<GroupDef> {
+fn filter_group(g: &GroupDef, kept: &Kept, namespaced: bool) -> Option<GroupDef> {
     let mut items = Vec::new();
     let mut lost = false;
     for item in &g.items {
         match item {
-            Item::Element(e) if keeps(allowed, &e.name) => {
-                let mut kept = e.clone();
-                if namespaced || !allowed.contains(&e.name) {
-                    kept.min = 0;
+            Item::Element(e) if kept.keeps(&e.name) => {
+                let mut element = e.clone();
+                if namespaced || !kept.allowed.contains(&e.name) {
+                    element.min = 0;
                 }
-                items.push(Item::Element(kept));
+                items.push(Item::Element(element));
             }
             Item::Element(_) => lost = true,
-            Item::Group(sub) => match filter_group(sub, allowed, namespaced) {
+            Item::Group(sub) => match filter_group(sub, kept, namespaced) {
                 Some(f) => items.push(Item::Group(f)),
                 None => lost = true,
             },
@@ -2976,10 +3113,11 @@ fn filter_group(g: &GroupDef, allowed: &BTreeSet<String>, namespaced: bool) -> O
     })
 }
 
-fn project_complex(def: ComplexDef, allowed: &BTreeSet<String>, namespaced: bool) -> ComplexDef {
+fn project_complex(def: ComplexDef, kept: &Kept, namespaced: bool) -> ComplexDef {
     let content = match def.content {
-        ComplexContent::Group(g) => filter_group(&g, allowed, namespaced)
-            .map_or(ComplexContent::Empty, ComplexContent::Group),
+        ComplexContent::Group(g) => {
+            filter_group(&g, kept, namespaced).map_or(ComplexContent::Empty, ComplexContent::Group)
+        }
         // The projection drops the root's own character data, so whatever
         // the text type demanded can no longer be promised.
         ComplexContent::Text(_) => ComplexContent::Text(SimpleBase::Builtin(Builtin::String)),
@@ -3050,6 +3188,7 @@ fn prune_unreachable(doc: &mut Doc) {
 }
 
 fn derive_doc(doc: &Doc, allowed: &BTreeSet<String>) -> Doc {
+    let kept = Kept::new(allowed);
     let mut out = doc.clone();
     for element in &mut out.elements {
         let def = match &element.ty {
@@ -3064,7 +3203,7 @@ fn derive_doc(doc: &Doc, allowed: &BTreeSet<String>) -> Doc {
         if let Some(def) = def {
             // A named type is inlined for the root only: other uses of it
             // (deeper in the tree) keep their full shape.
-            element.ty = TypeUse::Complex(Box::new(project_complex(def, allowed, doc.namespaced)));
+            element.ty = TypeUse::Complex(Box::new(project_complex(def, &kept, doc.namespaced)));
         } else {
             // A root of a simple type is all text, which the projection drops.
             element.ty = TypeUse::Builtin(Builtin::String);
@@ -3809,11 +3948,19 @@ impl SchemaKindOps for XsdOps {
         compile_text(schema_text).map(CompiledSchema::Xsd)
     }
 
-    fn validate(&self, compiled: &CompiledSchema, payload: &[u8]) -> Result<(), SchemaError> {
+    fn validate_metered(
+        &self,
+        compiled: &CompiledSchema,
+        payload: &[u8],
+        shared: &mut ValidationBudget,
+    ) -> Result<(), SchemaError> {
         let CompiledSchema::Xsd(c) = compiled else {
             return Err(invalid("validate called with a non-xsd compiled schema"));
         };
-        validate_document(c, payload)
+        let mut budget = Budget::new(shared.allowance(MAX_VALIDATION_STEPS));
+        let verdict = validate_with(c, payload, &mut budget);
+        shared.spend(budget.used);
+        verdict
     }
 
     fn derive_subschema(
@@ -4340,7 +4487,10 @@ mod tests {
     // ---- pattern dialect ----------------------------------------------------
 
     fn matches_pattern(pattern: &str, value: &str) -> bool {
-        build_pattern(pattern).expect(pattern).0.is_match(value)
+        build_pattern(pattern)
+            .expect(pattern)
+            .is_match(value, &mut Budget::new(u64::MAX))
+            .expect("unlimited budget")
     }
 
     #[test]
@@ -5808,13 +5958,33 @@ mod tests {
         within(started, 10);
     }
 
+    /// Deterministic pseudo-random 0/1 text (xorshift), `len` bytes.
+    fn random_bits(len: usize) -> String {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                if x & 1 == 1 {
+                    '1'
+                } else {
+                    '0'
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn a_value_that_cannot_be_matched_within_the_budget_is_limited_not_scanned() {
         let heavy = r#"<xs:pattern value="[01]*1[01]{200}"/>"#;
         let many = string_type(&heavy.repeat(MAX_PATTERNS));
         let s = schema(&format!(r#"{many}<xs:element name="r" type="T"/>"#));
         let c = compiled(&s);
-        let value = "01".repeat(4 * 1024 * 1024);
+        // Bits that never repeat a window keep the lazy DFA building new
+        // states until it gives up; a periodic string would run in a few
+        // hundred cached states.
+        let value = random_bits(4 * 1024 * 1024);
         let started = std::time::Instant::now();
         let got = XSD_OPS.validate(&c, format!("<r>{value}</r>").as_bytes());
         assert!(
@@ -5823,8 +5993,9 @@ mod tests {
         );
         within(started, 5);
 
-        // One such pattern over a megabyte is bounded as well: its worst case
-        // is the automaton width per byte, which the tier weight stands for.
+        // One such pattern over a megabyte is bounded as well: once the lazy
+        // DFA gives up, the Pike VM costs the automaton width per byte, which
+        // is charged before it runs.
         let one = schema(&format!(
             r#"{}<xs:element name="r" type="T"/>"#,
             string_type(heavy)
@@ -5832,7 +6003,7 @@ mod tests {
         let started = std::time::Instant::now();
         let got = XSD_OPS.validate(
             &compiled(&one),
-            format!("<r>{}</r>", "01".repeat(512 * 1024)).as_bytes(),
+            format!("<r>{}</r>", random_bits(1024 * 1024)).as_bytes(),
         );
         assert!(
             matches!(&got, Err(SchemaError::LimitExceeded(_))),
@@ -5870,7 +6041,7 @@ mod tests {
         let CompiledSchema::Xsd(inner) = &c else {
             panic!("expected an xsd schema");
         };
-        let got = validate_within(inner, doc.as_bytes(), 1_000_000);
+        let got = validate_with(inner, doc.as_bytes(), &mut Budget::new(1_000_000));
         assert!(
             matches!(&got, Err(SchemaError::LimitExceeded(m)) if m.contains("validation work budget")),
             "{got:?}"
@@ -5911,7 +6082,7 @@ mod tests {
         ));
         let msg = refusal_of(&many);
         assert!(
-            msg.contains("the patterns of the schema need more than 8192 KiB of memory"),
+            msg.contains("the patterns of the schema need more than 16384 KiB of memory"),
             "{msg}"
         );
         // One automaton past the largest tier is refused on its own.
@@ -5974,21 +6145,29 @@ mod tests {
             string_type(&members)
         ));
         let c = compiled(&s);
-        let doc = format!(
-            "<r>{}</r>",
-            (0..60_000)
-                .map(|i| format!("<v>c{}</v>", i % MAX_ENUMERATION_VALUES))
-                .collect::<String>()
-        );
+        let doc_of = |count: usize| {
+            format!(
+                "<r>{}</r>",
+                (0..count)
+                    .map(|i| format!("<v>c{}</v>", i % MAX_ENUMERATION_VALUES))
+                    .collect::<String>()
+            )
+        };
+        // A realistic count is accepted within the budget ...
         let started = std::time::Instant::now();
-        let got = XSD_OPS.validate(&c, doc.as_bytes());
+        let got = XSD_OPS.validate(&c, doc_of(60_000).as_bytes());
+        assert_eq!(got, Ok(()));
+        within(started, 10);
+        // ... and an adversarial one is limited, not scanned to the end.
+        let started = std::time::Instant::now();
+        let got = XSD_OPS.validate(&c, doc_of(1_200_000).as_bytes());
         assert!(
-            matches!(&got, Ok(()) | Err(SchemaError::LimitExceeded(_))),
+            matches!(&got, Err(SchemaError::LimitExceeded(m)) if m.contains("validation work budget")),
             "{got:?}"
         );
-        within(started, 10);
-        let bad = format!("<r><v>c1</v><v>nope</v></r>");
-        assert!(violation_of(&s, &bad).contains("is not one of the enumerated values"));
+        within(started, 20);
+        let bad = "<r><v>c1</v><v>nope</v></r>";
+        assert!(violation_of(&s, bad).contains("is not one of the enumerated values"));
     }
 
     #[test]
@@ -6035,5 +6214,428 @@ mod tests {
         let mut b = Budget::new(10);
         assert_eq!(b.charge(u64::MAX), Err(LimitExceeded));
         assert_eq!(b.charge(u64::MAX), Err(LimitExceeded), "saturating");
+    }
+
+    // ---- accurate pattern charging, non-capturing groups, accounting --------
+
+    fn oracle(pattern: &str) -> regex::Regex {
+        regex::Regex::new(&translate_pattern(pattern).expect(pattern)).expect(pattern)
+    }
+
+    #[test]
+    fn xsd_groups_never_capture() {
+        for pattern in ["(ab)", "((a)(b))+", "(a|b)(c|d)", "()", &"()".repeat(255)] {
+            let translated = translate_pattern(pattern).unwrap();
+            assert_eq!(
+                regex::Regex::new(&translated).unwrap().captures_len(),
+                1,
+                "{pattern}: every group must be (?:...)"
+            );
+            let matcher = build_pattern(pattern).unwrap();
+            assert_eq!(
+                matcher
+                    .dfa
+                    .get_nfa()
+                    .group_info()
+                    .group_len(regex_automata::PatternID::ZERO),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn the_automata_engine_agrees_with_the_regex_crate_on_the_xsd_dialect() {
+        let cases: [(&str, &[&str]); 12] = [
+            ("[a-c]+", &["", "abc", "abcd", "xabc"]),
+            (r"\d{3}", &["123", "12", "1234", "١٢٣", "a23"]),
+            (r"\p{Lu}\p{L}*", &["Ábc", "ábc", "A", ""]),
+            ("a.c", &["abc", "a\nc", "a\rc", "ac", "aéc"]),
+            ("a|b", &["a", "b", "ab", ""]),
+            ("(ab){2,3}", &["ab", "abab", "ababab", "abababab"]),
+            ("^a$", &["^a$", "a"]),
+            (r"[a\-z]", &["-", "a", "z", "b"]),
+            ("[^a-c]", &["d", "a", "é", ""]),
+            (
+                r"PL\d{26}",
+                &[
+                    "PL61109010140000071219812874",
+                    "PL6110901014000007121981287",
+                ],
+            ),
+            (r"\d{2}-\d{3}", &["00-950", "00950", "0-9500"]),
+            (r"\s+x?", &[" ", "\t\n", " x", "x"]),
+        ];
+        for (pattern, values) in cases {
+            let matcher = build_pattern(pattern).unwrap();
+            let expected = oracle(pattern);
+            for value in values {
+                assert_eq!(
+                    matcher.is_match(value, &mut Budget::new(u64::MAX)).unwrap(),
+                    expected.is_match(value),
+                    "{pattern} on {value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pattern_that_keeps_the_lazy_dfa_cached_costs_one_unit_per_byte() {
+        let matcher = build_pattern(r"\d+").unwrap();
+        let value = "7".repeat(1_000_000);
+        let mut budget = Budget::new(u64::MAX);
+        assert!(matcher.is_match(&value, &mut budget).unwrap());
+        assert_eq!(budget.used, 1 + value.len() as u64);
+    }
+
+    #[test]
+    fn a_thrashing_lazy_dfa_falls_back_to_a_pike_vm_charged_by_automaton_width() {
+        let pattern = "[01]*1[01]{200}";
+        let matcher = build_pattern(pattern).unwrap();
+        let value = random_bits(100_000);
+        let mut unlimited = Budget::new(u64::MAX);
+        assert_eq!(
+            matcher.is_match(&value, &mut unlimited).unwrap(),
+            oracle(pattern).is_match(&value),
+            "the fallback decides like the regex crate"
+        );
+        let states = matcher.dfa.get_nfa().states().len() as u64;
+        assert!(
+            unlimited.used >= value.len() as u64 * states,
+            "the Pike VM costs states x length ({} vs {})",
+            unlimited.used,
+            value.len() as u64 * states
+        );
+        let mut tight = Budget::new(10_000_000);
+        assert_eq!(matcher.is_match(&value, &mut tight), Err(LimitExceeded));
+    }
+
+    /// 10k records of a realistic national-identifier shape.
+    fn identifier_schema() -> String {
+        let pattern = |name: &str, p: &str| {
+            format!(
+                r#"<xs:simpleType name="{name}"><xs:restriction base="xs:string"><xs:pattern value="{p}"/></xs:restriction></xs:simpleType>"#
+            )
+        };
+        let types = [
+            pattern("Pesel", r"\d{11}"),
+            pattern("Nip", r"\d{10}"),
+            pattern("Postcode", r"\d{2}-\d{3}"),
+            pattern("Iban", r"PL\d{26}"),
+        ]
+        .concat();
+        schema(&format!(
+            r#"{types}<xs:element name="batch"><xs:complexType><xs:sequence>
+                 <xs:element name="rec" minOccurs="0" maxOccurs="unbounded"><xs:complexType><xs:sequence>
+                   <xs:element name="pesel" type="Pesel"/><xs:element name="nip" type="Nip"/>
+                   <xs:element name="postcode" type="Postcode"/><xs:element name="iban" type="Iban"/>
+                 </xs:sequence></xs:complexType></xs:element>
+               </xs:sequence></xs:complexType></xs:element>"#
+        ))
+    }
+
+    fn identifier_batch(records: usize) -> String {
+        let body: String =
+            (0..records)
+                .map(|i| {
+                    format!(
+                    "<rec><pesel>{:011}</pesel><nip>{:010}</nip><postcode>{:02}-{:03}</postcode>\
+                     <iban>PL{:026}</iban></rec>",
+                    i, i * 7, i % 100, i % 1000, i * 13
+                )
+                })
+                .collect();
+        format!("<batch>{body}</batch>")
+    }
+
+    #[test]
+    fn a_realistic_batch_of_identifiers_validates_within_the_work_budget() {
+        let c = compiled(&identifier_schema());
+        let CompiledSchema::Xsd(inner) = &c else {
+            panic!("expected an xsd schema");
+        };
+        let doc = identifier_batch(10_000);
+        let started = std::time::Instant::now();
+        let mut budget = Budget::new(MAX_VALIDATION_STEPS);
+        validate_with(inner, doc.as_bytes(), &mut budget).unwrap();
+        eprintln!(
+            "10k identifier records ({} KiB): {:?}, {} units",
+            doc.len() / 1024,
+            started.elapsed(),
+            budget.used
+        );
+        assert!(
+            budget.used < MAX_VALIDATION_STEPS / 4,
+            "a realistic batch must leave most of the budget: {}",
+            budget.used
+        );
+        within(started, 30);
+        // The same schema still tells a bad record from a good one.
+        let bad = identifier_batch(3).replace("PL0000000000000000000000000", "PLx");
+        assert!(violation_of(&identifier_schema(), &bad).contains("does not match the pattern"));
+    }
+
+    #[test]
+    fn thousands_of_ibans_in_one_document_validate() {
+        let s = schema(&format!(
+            r#"{}<xs:element name="r"><xs:complexType><xs:sequence>
+                 <xs:element name="iban" type="T" minOccurs="0" maxOccurs="unbounded"/>
+               </xs:sequence></xs:complexType></xs:element>"#,
+            string_type(r#"<xs:pattern value="PL\d{26}"/>"#)
+        ));
+        let c = compiled(&s);
+        let doc = format!(
+            "<r>{}</r>",
+            (0..20_000)
+                .map(|i| format!("<iban>PL{:026}</iban>", i * 31))
+                .collect::<String>()
+        );
+        let started = std::time::Instant::now();
+        XSD_OPS.validate(&c, doc.as_bytes()).unwrap();
+        eprintln!("20k IBANs: {:?}", started.elapsed());
+        within(started, 30);
+    }
+
+    #[test]
+    fn pattern_memory_covers_the_program_and_the_retained_caches() {
+        let matcher = build_pattern(r"\d{11}").unwrap();
+        assert!(
+            matcher.memory_bytes()
+                >= matcher.dfa.get_nfa().memory_usage() + RETAINED_CACHES * PATTERN_CACHE_FLOOR
+        );
+        let one = schema(&format!(
+            r#"{}<xs:element name="r" type="T"/>"#,
+            string_type(r#"<xs:pattern value="\d{11}"/>"#)
+        ));
+        let CompiledSchema::Xsd(inner) = compiled(&one) else {
+            panic!("expected an xsd schema");
+        };
+        assert!(inner.extra_bytes() >= matcher.memory_bytes());
+    }
+
+    /// A type whose content is a `minOccurs="0"` choice of `alternatives`
+    /// elements, inside a root that repeats it.
+    fn wide_choice_schema(alternatives: usize) -> String {
+        let alts: String = (0..alternatives)
+            .map(|i| format!(r#"<xs:element name="a{i}" type="xs:string"/>"#))
+            .collect();
+        schema(&format!(
+            r#"<xs:complexType name="X"><xs:choice minOccurs="0">{alts}</xs:choice></xs:complexType>
+               <xs:element name="r"><xs:complexType><xs:sequence>
+                 <xs:element name="x" type="X" minOccurs="0" maxOccurs="unbounded"/>
+               </xs:sequence></xs:complexType></xs:element>"#
+        ))
+    }
+
+    #[test]
+    fn the_automaton_of_a_content_model_counts_into_the_cache_weight() {
+        let CompiledSchema::Xsd(inner) = compiled(&wide_choice_schema(4990)) else {
+            panic!("expected an xsd schema");
+        };
+        assert!(
+            inner.extra_bytes() >= 4990 * 2 * std::mem::size_of::<NfaState>(),
+            "{}",
+            inner.extra_bytes()
+        );
+    }
+
+    #[test]
+    fn entering_an_element_with_a_wide_start_set_is_charged_per_element() {
+        let s = wide_choice_schema(4990);
+        let c = compiled(&s);
+        let started = std::time::Instant::now();
+        let doc = format!("<r>{}</r>", "<x/>".repeat(20_000));
+        let got = XSD_OPS.validate(&c, doc.as_bytes());
+        assert!(
+            matches!(&got, Err(SchemaError::LimitExceeded(m)) if m.contains("validation work budget")),
+            "{got:?}"
+        );
+        within(started, 10);
+        // A handful of the same elements is fine, and a real child still works.
+        assert!(accepts(&s, "<r><x/><x><a17>v</a17></x><x/></r>"));
+    }
+
+    #[test]
+    fn entering_an_all_group_element_is_charged_per_declared_child() {
+        let children: String = (0..1000)
+            .map(|i| format!(r#"<xs:element name="c{i}" type="xs:string" minOccurs="0"/>"#))
+            .collect();
+        let s = schema(&format!(
+            r#"<xs:complexType name="X"><xs:all>{children}</xs:all></xs:complexType>
+               <xs:element name="r"><xs:complexType><xs:sequence>
+                 <xs:element name="x" type="X" minOccurs="0" maxOccurs="unbounded"/>
+               </xs:sequence></xs:complexType></xs:element>"#
+        ));
+        let c = compiled(&s);
+        let doc = format!("<r>{}</r>", "<x/>".repeat(70_000));
+        let got = XSD_OPS.validate(&c, doc.as_bytes());
+        assert!(
+            matches!(&got, Err(SchemaError::LimitExceeded(m)) if m.contains("validation work budget")),
+            "{got:?}"
+        );
+        assert!(accepts(&s, "<r><x/><x><c3>v</c3></x></r>"));
+    }
+
+    #[test]
+    fn a_shared_budget_is_spent_across_documents() {
+        let c = compiled(&wide_choice_schema(4990));
+        // About 30M units per document, below the per-document cap.
+        let doc = format!("<r>{}</r>", "<x/>".repeat(6_000));
+        XSD_OPS.validate(&c, doc.as_bytes()).unwrap();
+        let mut shared = ValidationBudget {
+            remaining: 40_000_000,
+        };
+        XSD_OPS
+            .validate_metered(&c, doc.as_bytes(), &mut shared)
+            .unwrap();
+        assert!(shared.remaining < 15_000_000, "{}", shared.remaining);
+        let second = XSD_OPS.validate_metered(&c, doc.as_bytes(), &mut shared);
+        assert!(
+            matches!(&second, Err(SchemaError::LimitExceeded(_))),
+            "{second:?}"
+        );
+        assert_eq!(shared.remaining, 0);
+        let third = XSD_OPS.validate_metered(&c, b"<r/>", &mut shared);
+        assert!(
+            matches!(&third, Err(SchemaError::LimitExceeded(_))),
+            "{third:?}"
+        );
+    }
+
+    #[test]
+    fn a_policy_matches_prefixed_entries_by_their_local_name() {
+        let allowed: BTreeSet<String> = ["ns:a", "b"].iter().map(|s| s.to_string()).collect();
+        let kept = Kept::new(&allowed);
+        assert!(kept.keeps("a") && kept.keeps("ns:a") && kept.keeps("b"));
+        assert!(!kept.keeps("c") && !kept.keeps("ns"));
+    }
+
+    #[test]
+    fn nfa_state_sets_keep_the_accept_state_first() {
+        let CompiledSchema::Xsd(c) = compiled(&schema(
+            r#"<xs:element name="r"><xs:complexType><xs:sequence>
+                 <xs:element name="a" type="xs:string" minOccurs="0"/>
+                 <xs:element name="b" type="xs:string" minOccurs="0"/>
+               </xs:sequence></xs:complexType></xs:element>"#,
+        )) else {
+            panic!("expected an xsd schema");
+        };
+        let TypeDef::Complex(ComplexType {
+            content: Content::Model(Model::Nfa(m)),
+            ..
+        }) = &c.types[c.elements[c.roots["r"]].ty]
+        else {
+            panic!("expected an automaton model");
+        };
+        let nfa = &m.nfa;
+        assert_eq!(nfa.start_set[0], NFA_ACCEPT, "both children are optional");
+        assert!(nfa.accepts(&nfa.start_set));
+        let mut marks = Marks::new(nfa.states.len());
+        let mut budget = Budget::new(u64::MAX);
+        let after_a = nfa
+            .step(&nfa.start_set, m.by_name["a"], &mut marks, &mut budget)
+            .unwrap();
+        assert_eq!(after_a.iter().filter(|&&s| s == NFA_ACCEPT).count(), 1);
+        assert_eq!(after_a[0], NFA_ACCEPT);
+        let after_ab = nfa
+            .step(&after_a, m.by_name["b"], &mut marks, &mut budget)
+            .unwrap();
+        assert!(nfa.accepts(&after_ab));
+        let after_aa = nfa
+            .step(&after_a, m.by_name["a"], &mut marks, &mut budget)
+            .unwrap();
+        assert!(after_aa.is_empty(), "a second a is not allowed");
+
+        // Whatever order the walk finds it in, the accept state ends up first.
+        let hand_built = Nfa {
+            states: vec![
+                NfaState::default(),
+                NfaState {
+                    eps: Vec::new(),
+                    edge: Some((0, 0)),
+                },
+                NfaState {
+                    eps: vec![NFA_ACCEPT],
+                    edge: None,
+                },
+            ],
+            start_set: Vec::new(),
+        };
+        let mut out = Vec::new();
+        hand_built
+            .closure(&[2, 1], &mut out, &mut Marks::new(3), &mut Budget::new(100))
+            .unwrap();
+        assert_eq!(out, [NFA_ACCEPT, 1]);
+        assert!(hand_built.accepts(&out));
+    }
+
+    /// The largest `[01]*1[01]{n}` the compiler admits: an exploding automaton
+    /// at the top of the program size limit.
+    fn largest_exploding_pattern() -> (String, Matcher) {
+        let mut best = None;
+        let mut n = 1000;
+        while n <= 12_000 {
+            let source = format!("[01]*1[01]{{{n}}}");
+            match build_pattern(&source) {
+                Ok(matcher) => best = Some((source, matcher)),
+                Err(_) => break,
+            }
+            n += 1000;
+        }
+        best.expect("a thousand-state pattern compiles")
+    }
+
+    #[test]
+    fn a_top_size_exploding_pattern_is_refused_quickly_over_a_quarter_megabyte() {
+        let (source, matcher) = largest_exploding_pattern();
+        let states = matcher.dfa.get_nfa().states().len();
+        let schema_text = schema(&format!(
+            r#"{}<xs:element name="r" type="T"/>"#,
+            string_type(&format!(r#"<xs:pattern value="{source}"/>"#))
+        ));
+        let c = compiled(&schema_text);
+        let doc = format!("<r>{}</r>", random_bits(256 * 1024));
+        let started = std::time::Instant::now();
+        let got = XSD_OPS.validate(&c, doc.as_bytes());
+        eprintln!(
+            "{source}: {states} NFA states, {} bytes of program, 256 KiB random value refused in {:?}",
+            matcher.dfa.get_nfa().memory_usage(),
+            started.elapsed()
+        );
+        assert!(
+            matches!(&got, Err(SchemaError::LimitExceeded(m)) if m.contains("validation work budget")),
+            "{got:?}"
+        );
+        within(started, 5);
+
+        // The same pattern over many values that each fit the budget alone
+        // (and match) is limited by their total, not by their count.
+        let n: usize = source
+            .trim_start_matches("[01]*1[01]{")
+            .trim_end_matches('}')
+            .parse()
+            .unwrap();
+        let values = format!(
+            "<r>{}</r>",
+            (0..40)
+                .map(|_| format!("<v>1{}</v>", random_bits(n)))
+                .collect::<String>()
+        );
+        let many = schema(&format!(
+            r#"{}<xs:element name="r"><xs:complexType><xs:sequence>
+                 <xs:element name="v" type="T" minOccurs="0" maxOccurs="unbounded"/>
+               </xs:sequence></xs:complexType></xs:element>"#,
+            string_type(&format!(r#"<xs:pattern value="{source}"/>"#))
+        ));
+        let started = std::time::Instant::now();
+        let got = XSD_OPS.validate(&compiled(&many), values.as_bytes());
+        eprintln!(
+            "40 matching values of {n} bytes: {got:?} in {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(&got, Err(SchemaError::LimitExceeded(_))),
+            "{got:?}"
+        );
+        within(started, 5);
     }
 }

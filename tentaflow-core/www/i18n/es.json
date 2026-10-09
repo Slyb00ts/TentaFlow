@@ -10143,7 +10143,7 @@
         "xsd_help_title": "Qué patrones XSD funcionan",
         "xsd_help_works": "Funciona un patrón corriente escrito en un solo archivo: qué elementos y atributos tiene el documento, cuántas veces pueden aparecer, la elección de una entre varias posibilidades y restricciones sencillas, p. ej. la longitud de un texto o una lista de valores permitidos.",
         "xsd_help_fails": "No funciona un patrón que incluya otros archivos o use partes más avanzadas de XSD: al añadirlo verás qué falta.",
-        "xsd_help_limits": "Un patrón también tiene límites de tamaño: un valor de una lista de valores permitidos de hasta 1 KB (las listas juntas hasta 128 KB y 4096 entradas), una restricción pattern de hasta 512 caracteres, como máximo 1024 atributos en un tipo, y todos los patrones juntos deben caber en 8 MB de memoria."
+        "xsd_help_limits": "Un patrón también tiene límites de tamaño: un valor de una lista de valores permitidos de hasta 1 KB (las listas juntas hasta 128 KB y 4096 entradas), una restricción pattern de hasta 512 caracteres, como máximo 1024 atributos en un tipo, y todos los patrones juntos deben caber en 16 MB de memoria."
       },
       "added_existing_title": "El patrón {name} ya existía",
       "added_existing_version": "Alguien lo añadió mientras tanto, así que el texto entró como versión {version}.",

@@ -13,7 +13,9 @@
 
 use std::collections::BTreeSet;
 
-use super::{Compatibility, CompiledSchema, SchemaError, SchemaKindOps, SchemaType};
+use super::{
+    Compatibility, CompiledSchema, SchemaError, SchemaKindOps, SchemaType, ValidationBudget,
+};
 
 pub struct StoredOnlyOps(pub SchemaType);
 
@@ -31,7 +33,12 @@ impl SchemaKindOps for StoredOnlyOps {
         Ok(CompiledSchema::StoredOnly(self.0))
     }
 
-    fn validate(&self, _compiled: &CompiledSchema, _payload: &[u8]) -> Result<(), SchemaError> {
+    fn validate_metered(
+        &self,
+        _compiled: &CompiledSchema,
+        _payload: &[u8],
+        _budget: &mut ValidationBudget,
+    ) -> Result<(), SchemaError> {
         Err(SchemaError::Unsupported {
             schema_type: self.0,
             operation: "validate",

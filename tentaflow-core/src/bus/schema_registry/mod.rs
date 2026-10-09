@@ -238,6 +238,46 @@ impl CompiledSchema {
     }
 }
 
+/// Work units a publish batch may spend validating all of its records, shared
+/// so a batch of many hostile documents costs what its bytes justify, not
+/// the per-document cap times its record count. One unit is about 10 ns.
+#[derive(Debug)]
+pub struct ValidationBudget {
+    remaining: u64,
+}
+
+impl ValidationBudget {
+    /// A batch may spend one maximal document's worth of work plus this many
+    /// units per payload byte. Realistic documents use about 10 units per
+    /// byte, so the allowance is generous for them and tight for payloads
+    /// that are all expensive structure.
+    pub const BATCH_BASE_UNITS: u64 = 50_000_000;
+    pub const BATCH_UNITS_PER_BYTE: u64 = 64;
+
+    pub fn for_batch(payload_bytes: usize) -> ValidationBudget {
+        ValidationBudget {
+            remaining: Self::BATCH_BASE_UNITS
+                .saturating_add(Self::BATCH_UNITS_PER_BYTE.saturating_mul(payload_bytes as u64)),
+        }
+    }
+
+    /// No shared limit: the kind's own per-document cap decides.
+    pub fn unshared() -> ValidationBudget {
+        ValidationBudget {
+            remaining: u64::MAX,
+        }
+    }
+
+    /// Units the next document may spend, at most `per_document_cap`.
+    pub fn allowance(&self, per_document_cap: u64) -> u64 {
+        self.remaining.min(per_document_cap)
+    }
+
+    pub fn spend(&mut self, units: u64) {
+        self.remaining = self.remaining.saturating_sub(units);
+    }
+}
+
 /// Implemented once per `SchemaType`. See the module header for the split
 /// between registration-time (`compile`, `check_compatibility`,
 /// `derive_subschema`) and publish-time (`validate`) responsibilities.
@@ -248,8 +288,21 @@ pub trait SchemaKindOps: Send + Sync {
 
     /// Publish-path check: bounded work, no schema re-parsing. A document
     /// the check cannot decide within its budget is `LimitExceeded`, never
-    /// a `Violation`.
-    fn validate(&self, compiled: &CompiledSchema, payload: &[u8]) -> Result<(), SchemaError>;
+    /// a `Violation`. The work it does is taken from `budget`, which a
+    /// publish batch shares across its records; a kind whose cost is linear
+    /// in the payload (already capped by `max_inline_bytes`) may leave it
+    /// untouched.
+    fn validate_metered(
+        &self,
+        compiled: &CompiledSchema,
+        payload: &[u8],
+        budget: &mut ValidationBudget,
+    ) -> Result<(), SchemaError>;
+
+    /// One document against a budget of its own.
+    fn validate(&self, compiled: &CompiledSchema, payload: &[u8]) -> Result<(), SchemaError> {
+        self.validate_metered(compiled, payload, &mut ValidationBudget::unshared())
+    }
 
     /// Owner decision 1: the schema describing EXACTLY the projection a
     /// field policy's `allowed` top-level field set produces (F4's binary
