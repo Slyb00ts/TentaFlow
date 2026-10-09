@@ -462,6 +462,18 @@ const XSD_CONSTRUCT_KINDS = [
   [/notations are not supported/, 'notation'],
   [/not part of the supported XSD subset/, 'other'],
 ];
+// The static caps of xsd.rs (compile refusals); the captured number is the limit.
+const XSD_LIMIT_REFUSALS = [
+  [/an enumeration value is longer than (\d+) bytes/, 'enum_value'],
+  [/^the enumeration values of the schema hold more than (\d+) KiB in total/, 'enum_total'],
+  [/^the schema lists more than (\d+) enumeration values/, 'enum_count'],
+  [/pattern exceeds (\d+) characters/, 'pattern_len'],
+  [/^the schema uses more than (\d+) patterns/, 'patterns'],
+  [/^the patterns of the schema need more than (\d+) KiB of memory/, 'pattern_memory'],
+  [/the compiled pattern is too large/, 'pattern_big'],
+  [/^a type declares more than (\d+) attributes/, 'attributes'],
+  [/^the schema exceeds the compile work limit/, 'compile'],
+];
 const NUMBER_TYPE_ADVICE = { float: 'decimal', double: 'decimal', long: 'integer', short: 'int', byte: 'int', unsignedInt: 'integer', unsignedLong: 'integer', nonNegativeInteger: 'integer', positiveInteger: 'integer', negativeInteger: 'integer' };
 
 /**
@@ -496,6 +508,10 @@ export function textRefusalReason(schemaType, serverText) {
     }
     m = /^facet xs:(\w+) is not supported/.exec(text);
     if (m) return T('schemas.refused.xsd_facet', { facet: m[1] });
+    for (const [re, key] of XSD_LIMIT_REFUSALS) {
+      m = re.exec(text);
+      if (m) return T(`schemas.refused.xsd_limit_${key}`, { limit: m[1] });
+    }
     if (/^the schema declares no global element/.test(text)) return T('schemas.refused.xsd_no_root');
     if (/^mixed content/.test(text)) return T('schemas.refused.xsd_mixed');
     if (/ ref= is not supported/.test(text)) return T('schemas.refused.xsd_ref');

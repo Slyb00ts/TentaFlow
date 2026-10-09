@@ -248,7 +248,7 @@ function pageHtml(name) {
           </div>
           <div class="section-card" data-role="xsd-help" hidden>
             <div class="section-card-head"><div class="title">${sprite('info')} ${escapeHtml(T('schemas.detail.xsd_help_title'))}</div></div>
-            <div class="section-sub">${escapeHtml(T('schemas.detail.xsd_help_works'))} ${escapeHtml(T('schemas.detail.xsd_help_fails'))}</div>
+            <div class="section-sub">${escapeHtml(T('schemas.detail.xsd_help_works'))} ${escapeHtml(T('schemas.detail.xsd_help_fails'))} ${escapeHtml(T('schemas.detail.xsd_help_limits'))}</div>
           </div>
           <div class="section-card" data-role="compat-card"></div>
         </div>

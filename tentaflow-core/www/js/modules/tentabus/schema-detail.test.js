@@ -330,7 +330,7 @@ test('an XSD\'s page says which XSD patterns work; no other format shows that ca
   const { body } = mount({ name: 'faktura', info: { ...wizyta, subject: 'faktura', schemaType: 'xsd' }, shown: { version: 3, text: xsd, error: null } });
   const card = body.querySelector('[data-role="xsd-help"]');
   assert.equal(card.hidden, false);
-  assert.match(norm(card.textContent), /^Jakie wzory XSD zadziałają Zadziała zwykły wzór zapisany w jednym pliku: .* Nie zadziała wzór, który dołącza inne pliki albo używa bardziej zaawansowanych części XSD — przy dodawaniu zobaczysz, czego brakuje\.$/);
+  assert.match(norm(card.textContent), /^Jakie wzory XSD zadziałają Zadziała zwykły wzór zapisany w jednym pliku: .* Nie zadziała wzór, który dołącza inne pliki albo używa bardziej zaawansowanych części XSD — przy dodawaniu zobaczysz, czego brakuje\. Wzór ma też granice rozmiaru: .* 8 MB pamięci\.$/);
   assert.equal(mount({}).body.querySelector('[data-role="xsd-help"]').hidden, true);
 });
 

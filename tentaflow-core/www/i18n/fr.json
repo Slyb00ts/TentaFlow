@@ -10142,7 +10142,8 @@
         "versions_sub_reader": "Les versions ne peuvent pas être modifiées.",
         "xsd_help_title": "Quels modèles XSD fonctionnent",
         "xsd_help_works": "Un modèle ordinaire écrit dans un seul fichier fonctionne : quels éléments et attributs le document a, combien de fois ils peuvent apparaître, le choix d’une possibilité parmi plusieurs et des restrictions simples, par ex. la longueur d’un texte ou une liste de valeurs autorisées.",
-        "xsd_help_fails": "Un modèle qui inclut d’autres fichiers ou utilise des parties plus avancées de XSD ne fonctionne pas : à l’ajout, vous verrez ce qui manque."
+        "xsd_help_fails": "Un modèle qui inclut d’autres fichiers ou utilise des parties plus avancées de XSD ne fonctionne pas : à l’ajout, vous verrez ce qui manque.",
+        "xsd_help_limits": "Un modèle a aussi des limites de taille : une valeur d’une liste de valeurs autorisées jusqu’à 1 Ko (les listes ensemble jusqu’à 128 Ko et 4096 entrées), une restriction pattern jusqu’à 512 caractères, au plus 1024 attributs dans un type, et tous les motifs ensemble doivent tenir dans 8 Mo de mémoire."
       },
       "added_existing_title": "Le modèle {name} existait déjà",
       "added_existing_version": "Quelqu’un l’a ajouté entre-temps, le texte y est donc entré en version {version}.",
@@ -10180,7 +10181,16 @@
         "xsd_hint_list_union": "Utilisez un type simple ordinaire.",
         "xsd_hint_global_attribute": "Déclarez l’attribut dans l’élément auquel il appartient.",
         "xsd_hint_notation": "Retirez-la.",
-        "xsd_hint_other": "Retirez-la ou remplacez-la par quelque chose de plus simple."
+        "xsd_hint_other": "Retirez-la ou remplacez-la par quelque chose de plus simple.",
+        "xsd_limit_enum_value": "Une des valeurs autorisées est trop longue (au plus {limit} {limit|octet|octets}). Raccourcissez-la ou décrivez les valeurs avec une restriction pattern.",
+        "xsd_limit_enum_total": "Les listes de valeurs autorisées sont trop volumineuses ensemble (au plus {limit} Ko). Raccourcissez-les ou décrivez les valeurs avec une restriction pattern.",
+        "xsd_limit_enum_count": "Les listes de valeurs autorisées ont trop d’entrées (au plus {limit}). Raccourcissez-les ou décrivez les valeurs avec une restriction pattern.",
+        "xsd_limit_pattern_len": "Une des restrictions pattern est trop longue (au plus {limit} {limit|caractère|caractères}). Raccourcissez-la ou scindez-la en restrictions plus simples.",
+        "xsd_limit_patterns": "Le modèle a trop de restrictions pattern (au plus {limit}). Fusionnez-les ou retirez les inutiles.",
+        "xsd_limit_pattern_memory": "Les restrictions pattern sont ensemble trop complexes : elles demandent plus de {limit} Ko de mémoire. Simplifiez-les ou retirez les inutiles.",
+        "xsd_limit_pattern_big": "Une des restrictions pattern est trop complexe, par ex. elle répète de nombreuses fois une classe de caractères. Simplifiez-la.",
+        "xsd_limit_attributes": "Un des types a trop d’attributs (au plus {limit}). Scindez-le en types plus petits.",
+        "xsd_limit_compile": "Ce modèle est trop complexe pour être accepté. Simplifiez-le : moins de types, d’attributs et de répétitions."
       }
     },
     "topics": {

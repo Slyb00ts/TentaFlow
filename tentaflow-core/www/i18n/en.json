@@ -11377,7 +11377,8 @@
         "versions_sub_reader": "Versions cannot be changed.",
         "xsd_help_title": "Which XSD patterns will work",
         "xsd_help_works": "An ordinary pattern written in one file will work: which elements and attributes the document has, how many times they may occur, a choice of one of several possibilities and simple restrictions, e.g. the length of a text or a list of allowed values.",
-        "xsd_help_fails": "A pattern that includes other files or uses more advanced parts of XSD will not — when you add it, you will see what is missing."
+        "xsd_help_fails": "A pattern that includes other files or uses more advanced parts of XSD will not — when you add it, you will see what is missing.",
+        "xsd_help_limits": "A pattern also has size limits: a value in a list of allowed values up to 1 KB (the lists together up to 128 KB and 4096 entries), a pattern restriction up to 512 characters, at most 1024 attributes in one type, and all patterns together must fit in 8 MB of memory."
       },
       "added_existing_title": "Pattern {name} already existed",
       "added_existing_version": "Someone added it meanwhile, so the text went into it as version {version}.",
@@ -11415,7 +11416,16 @@
         "xsd_hint_list_union": "Use a plain simple type.",
         "xsd_hint_global_attribute": "Declare the attribute inside the element it belongs to.",
         "xsd_hint_notation": "Remove it.",
-        "xsd_hint_other": "Remove it or replace it with something simpler."
+        "xsd_hint_other": "Remove it or replace it with something simpler.",
+        "xsd_limit_enum_value": "One of the allowed values is too long (at most {limit} {limit|byte|bytes}). Shorten it or describe the values with a pattern restriction.",
+        "xsd_limit_enum_total": "The lists of allowed values are too large together (at most {limit} KB). Shorten them or describe the values with a pattern restriction.",
+        "xsd_limit_enum_count": "The lists of allowed values have too many entries (at most {limit}). Shorten them or describe the values with a pattern restriction.",
+        "xsd_limit_pattern_len": "One of the pattern restrictions is too long (at most {limit} {limit|character|characters}). Shorten it or split it into simpler ones.",
+        "xsd_limit_patterns": "The schema has too many pattern restrictions (at most {limit}). Merge them or remove the unneeded ones.",
+        "xsd_limit_pattern_memory": "The pattern restrictions together are too elaborate: they need more than {limit} KB of memory. Simplify them or remove the unneeded ones.",
+        "xsd_limit_pattern_big": "One of the pattern restrictions is too elaborate, e.g. it repeats a character class many times. Simplify it.",
+        "xsd_limit_attributes": "One of the types has too many attributes (at most {limit}). Split it into smaller ones.",
+        "xsd_limit_compile": "This schema is too complex to accept. Simplify it: fewer types, attributes and repetitions."
       }
     },
     "topics": {

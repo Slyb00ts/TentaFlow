@@ -56,8 +56,18 @@
 // or do not exist in XSD (`\i \I \c \C \w \W`, character-class subtraction,
 // `\p{IsBlock}`, `(?…)` groups, lazy quantifiers, `\b`) are rejected at
 // compile time. The `regex` crate matches in linear time, so a hostile
-// pattern cannot cause catastrophic backtracking; compile size is bounded by
-// a 256 KiB program limit, a nesting limit and a pattern count cap.
+// pattern cannot cause catastrophic backtracking.
+//
+// Resource bounds are structural. One meter (`Budget`) is charged by every
+// expensive primitive BEFORE it runs — `SimpleType::check` (value length x
+// pattern weight, enumeration lookup), enumeration intersection, NFA
+// closure/step, attribute processing, compile work — and `check` cannot be
+// called without one. Validation (`MAX_VALIDATION_STEPS`), comparison
+// (`MAX_COMPAT_WORK`) and compilation (`MAX_COMPILE_WORK`) each own a budget;
+// running out is `LimitExceeded`, never a verdict. On top of that, static caps
+// refuse a schema at compile time: enumeration value and total bytes,
+// pattern length and count, a per-pattern program size tier (whose weight
+// prices matching) with a per-schema memory proxy, and attributes per type.
 //
 // Content models compile to an NFA (Thompson construction; counted
 // occurrences are expanded, bounded by a state budget) and are simulated with
@@ -105,17 +115,88 @@ const MAX_OCCURS: u32 = 100_000;
 const MAX_NFA_STATES: usize = 10_000;
 const MAX_TOTAL_NFA_STATES: usize = 50_000;
 const MAX_PATTERNS: usize = 256;
-const MAX_PATTERN_CHARS: usize = 1024;
+/// A real-world pattern (identifier, date, code list shape) is a few dozen
+/// characters; 512 leaves room for long alternations without letting one
+/// facet carry a whole data set.
+const MAX_PATTERN_CHARS: usize = 512;
 const MAX_ENUMERATION_VALUES: usize = 4096;
+/// Code values in healthcare and finance schemas (ICD, LOINC, ISO currency,
+/// country, status) are well under 100 bytes; 1 KiB is generous.
+const MAX_ENUM_VALUE_BYTES: usize = 1024;
+/// Half of the schema text limit: 4096 values at 32 bytes fit with room to
+/// spare, while a schema cannot spend its whole text on one enumeration.
+const MAX_ENUM_TOTAL_BYTES: usize = 128 * 1024;
+/// Declared attributes of one complex type; the widest real types (CDA,
+/// FHIR-like records) carry a few dozen.
+const MAX_ATTRIBUTES_PER_TYPE: usize = 1024;
 const MAX_NAME_CHARS: usize = 128;
-const PATTERN_SIZE_LIMIT: usize = 256 * 1024;
+/// Compiled-program size limits a pattern may use, smallest first, with the
+/// per-input-byte cost weight of matching it. A pattern is built at the
+/// smallest tier that holds it, so the tier is a measurable upper bound of
+/// its size and of how many NFA states one input byte can touch when the
+/// lazy DFA gives up (measured: ~0.64 us/byte at 16 KiB, ~1.6 us/byte at
+/// 64 KiB; a unit is about 10 ns, so the weight is 4 per KiB of tier).
+/// Unicode makes the range wide: `\d` is `\p{Nd}` and costs ~7 KiB, so a
+/// PESEL (`\d{11}`) needs 64 KiB and a 26-digit IBAN body 192 KiB; the top
+/// tier admits those while `\p{L}{60}` (4 MiB) is refused outright.
+const PATTERN_TIERS: [PatternTier; 7] = [
+    PatternTier::kib(4),
+    PatternTier::kib(8),
+    PatternTier::kib(16),
+    PatternTier::kib(32),
+    PatternTier::kib(64),
+    PatternTier::kib(128),
+    PatternTier::kib(256),
+];
+/// Memory proxy per schema: every pattern holds its program plus a lazy-DFA
+/// cache, each at most its tier limit, so a pattern costs twice its tier.
+/// 8 MiB covers 256 patterns of the smallest tier, 64 PESEL-sized ones or
+/// 16 of the largest; a schema of a few dozen identifier and date patterns
+/// uses a small fraction.
+const MAX_PATTERN_MEMORY: usize = 8 * 1024 * 1024;
 const PATTERN_NEST_LIMIT: u32 = 32;
 const MAX_DOC_DEPTH: usize = 128;
-const MAX_VALIDATION_STEPS: u64 = 20_000_000;
+/// One unit is roughly 10 ns of work; 50M units bound a document to about
+/// half a second in the worst case.
+const MAX_VALIDATION_STEPS: u64 = 50_000_000;
+const COST_EVENT: u64 = 8;
+const COST_ELEMENT: u64 = 16;
+const COST_ATTRIBUTE: u64 = 16;
 const MAX_COMPAT_PAIRS: usize = 50_000;
 const MAX_COMPAT_WORK: u64 = 20_000_000;
+/// Work of compiling one schema: declarations, attributes, pattern and
+/// enumeration bytes, NFA states. A schema is at most 256 KiB, so this is
+/// far above anything legitimate and only stops a shape that multiplies.
+const MAX_COMPILE_WORK: u64 = 5_000_000;
+const COMPILE_WORK_REFUSAL: &str = "the schema exceeds the compile work limit; simplify it";
 
 const SUPPORTED_BUILTINS: &str = "string, int, integer, decimal, boolean, date, dateTime";
+
+/// The single meter every expensive primitive charges. Saturating, so an
+/// absurd charge (value length x pattern count) cannot wrap around.
+#[derive(Debug)]
+struct Budget {
+    used: u64,
+    limit: u64,
+}
+
+/// A [`Budget`] ran out: the check stopped before it could decide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LimitExceeded;
+
+impl Budget {
+    fn new(limit: u64) -> Budget {
+        Budget { used: 0, limit }
+    }
+
+    fn charge(&mut self, units: u64) -> Result<(), LimitExceeded> {
+        self.used = self.used.saturating_add(units);
+        if self.used > self.limit {
+            return Err(LimitExceeded);
+        }
+        Ok(())
+    }
+}
 
 fn invalid(msg: impl Into<String>) -> SchemaError {
     SchemaError::Invalid(msg.into())
@@ -565,17 +646,50 @@ fn translate_pattern(pattern: &str) -> Result<String, String> {
     Ok(out)
 }
 
-fn build_pattern(source: &str) -> Result<Regex, String> {
+#[derive(Debug)]
+struct PatternTier {
+    size_limit: usize,
+    /// Cost units per input byte a match charges for this pattern.
+    weight: u64,
+}
+
+impl PatternTier {
+    const fn kib(kib: usize) -> PatternTier {
+        PatternTier {
+            size_limit: kib * 1024,
+            weight: 4 * kib as u64,
+        }
+    }
+}
+
+/// The regex and the smallest tier whose size limit holds it.
+fn build_pattern(source: &str) -> Result<(Regex, &'static PatternTier), String> {
     if source.chars().count() > MAX_PATTERN_CHARS {
         return Err(format!("pattern exceeds {MAX_PATTERN_CHARS} characters"));
     }
     let translated = translate_pattern(source)?;
-    RegexBuilder::new(&translated)
-        .size_limit(PATTERN_SIZE_LIMIT)
-        .dfa_size_limit(PATTERN_SIZE_LIMIT)
-        .nest_limit(PATTERN_NEST_LIMIT)
-        .build()
-        .map_err(|e| format!("pattern is not a valid or supported regular expression: {e}"))
+    let mut last = None;
+    for tier in &PATTERN_TIERS {
+        match RegexBuilder::new(&translated)
+            .size_limit(tier.size_limit)
+            .dfa_size_limit(tier.size_limit)
+            .nest_limit(PATTERN_NEST_LIMIT)
+            .build()
+        {
+            Ok(regex) => return Ok((regex, tier)),
+            Err(regex::Error::CompiledTooBig(_)) => {}
+            Err(e) => {
+                last = Some(e);
+                break;
+            }
+        }
+    }
+    Err(match last {
+        Some(e) => format!("pattern is not a valid or supported regular expression: {e}"),
+        None => "pattern is not a valid or supported regular expression: the compiled pattern \
+                 is too large"
+            .to_string(),
+    })
 }
 
 // =============================================================================
@@ -1421,6 +1535,8 @@ fn parse_doc(schema_text: &str) -> Result<Doc, SchemaError> {
 struct Pattern {
     source: String,
     regex: Regex,
+    /// Cost units per input byte, from the size tier the pattern compiled at.
+    weight: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1429,7 +1545,7 @@ struct Facets {
     max_length: Option<u32>,
     patterns: Vec<Pattern>,
     /// Canonical members; empty means "no enumeration".
-    enumeration: Vec<String>,
+    enumeration: HashSet<String>,
 }
 
 impl Facets {
@@ -1439,6 +1555,30 @@ impl Facets {
             && self.patterns.is_empty()
             && self.enumeration.is_empty()
     }
+
+    /// Cost units one input byte takes to run through every pattern.
+    fn pattern_weight(&self) -> u64 {
+        self.patterns.iter().map(|p| p.weight).sum()
+    }
+}
+
+/// Why [`SimpleType::check`] stopped.
+#[derive(Debug, PartialEq, Eq)]
+enum CheckFailure {
+    /// The value breaks the named constraint.
+    Violated(String),
+    /// The budget ran out; the value is not known to be valid or invalid.
+    TooComplex,
+}
+
+impl From<LimitExceeded> for CheckFailure {
+    fn from(_: LimitExceeded) -> CheckFailure {
+        CheckFailure::TooComplex
+    }
+}
+
+fn violated(msg: impl Into<String>) -> CheckFailure {
+    CheckFailure::Violated(msg.into())
 }
 
 #[derive(Clone, Debug)]
@@ -1448,35 +1588,63 @@ struct SimpleType {
     steps: Vec<Arc<Facets>>,
 }
 
+/// Each restriction step's pattern sources, sorted, so two steps compare as
+/// sets.
+fn sorted_sources(t: &SimpleType) -> Vec<Vec<&str>> {
+    t.steps
+        .iter()
+        .map(|s| {
+            let mut list: Vec<&str> = s.patterns.iter().map(|p| p.source.as_str()).collect();
+            list.sort_unstable();
+            list
+        })
+        .collect()
+}
+
 impl SimpleType {
-    /// `Err` names the violated constraint, never the value.
-    fn check(&self, raw: &str) -> Result<(), String> {
+    /// `Violated` names the broken constraint, never the value. Every scan of
+    /// the value is charged to `budget` BEFORE it runs.
+    fn check(&self, raw: &str, budget: &mut Budget) -> Result<(), CheckFailure> {
         let value = if self.builtin.is_string() {
             raw
         } else {
             raw.trim_matches(is_xml_ws)
         };
+        let len = value.len() as u64;
+        // A string has no lexical form to scan.
+        budget.charge(if self.builtin.is_string() { 1 } else { 1 + len })?;
         if !valid_lexical(self.builtin, value) {
-            return Err(format!("is not a valid xs:{}", self.builtin.name()));
+            return Err(violated(format!(
+                "is not a valid xs:{}",
+                self.builtin.name()
+            )));
         }
         let mut canonical_value: Option<String> = None;
         for step in &self.steps {
             if step.min_length.is_some() || step.max_length.is_some() {
-                let len = value.chars().count();
-                if step.min_length.is_some_and(|m| len < m as usize) {
-                    return Err("is shorter than minLength".to_string());
+                budget.charge(len)?;
+                let count = value.chars().count();
+                if step.min_length.is_some_and(|m| count < m as usize) {
+                    return Err(violated("is shorter than minLength"));
                 }
-                if step.max_length.is_some_and(|m| len > m as usize) {
-                    return Err("is longer than maxLength".to_string());
+                if step.max_length.is_some_and(|m| count > m as usize) {
+                    return Err(violated("is longer than maxLength"));
                 }
             }
-            if !step.patterns.is_empty() && !step.patterns.iter().any(|p| p.regex.is_match(value)) {
-                return Err("does not match the pattern".to_string());
+            if !step.patterns.is_empty() {
+                budget.charge(len.saturating_mul(step.pattern_weight()))?;
+                if !step.patterns.iter().any(|p| p.regex.is_match(value)) {
+                    return Err(violated("does not match the pattern"));
+                }
             }
             if !step.enumeration.is_empty() {
+                if canonical_value.is_none() {
+                    budget.charge(len)?;
+                }
                 let c = canonical_value.get_or_insert_with(|| canonical(self.builtin, value));
-                if !step.enumeration.iter().any(|m| m == c) {
-                    return Err("is not one of the enumerated values".to_string());
+                budget.charge(1 + len)?;
+                if !step.enumeration.contains(c.as_str()) {
+                    return Err(violated("is not one of the enumerated values"));
                 }
             }
         }
@@ -1484,19 +1652,34 @@ impl SimpleType {
     }
 
     /// Enumeration every value must come from: the intersection of every
-    /// step's enumeration, or `None` when no step has one.
-    fn effective_enumeration(&self) -> Option<Vec<&String>> {
+    /// step's enumeration, or `None` when no step has one. Sorted, so a
+    /// message naming a member is deterministic. Each intersection is charged
+    /// before it is computed.
+    fn effective_enumeration(
+        &self,
+        budget: &mut Budget,
+    ) -> Result<Option<Vec<&String>>, LimitExceeded> {
         let mut result: Option<Vec<&String>> = None;
         for step in self.steps.iter().filter(|s| !s.enumeration.is_empty()) {
             result = Some(match result {
-                None => step.enumeration.iter().collect(),
-                Some(prev) => prev
-                    .into_iter()
-                    .filter(|m| step.enumeration.contains(m))
-                    .collect(),
+                None => {
+                    budget.charge(step.enumeration.len() as u64)?;
+                    step.enumeration.iter().collect()
+                }
+                Some(prev) => {
+                    budget.charge((prev.len() + step.enumeration.len()) as u64)?;
+                    prev.into_iter()
+                        .filter(|m| step.enumeration.contains(m.as_str()))
+                        .collect()
+                }
             });
         }
-        result
+        if let Some(members) = result.as_mut() {
+            let n = members.len() as u64;
+            budget.charge(n.saturating_mul(u64::from(u64::BITS - n.leading_zeros())))?;
+            members.sort_unstable();
+        }
+        Ok(result)
     }
 
     fn effective_length(&self) -> (u32, Option<u32>) {
@@ -1579,9 +1762,38 @@ enum Content {
     Model(Model),
 }
 
+/// The attributes of one complex type with the lookups validation and
+/// comparison need, built once at compile.
+#[derive(Debug, Default)]
+struct Attrs {
+    decls: Vec<AttrDecl>,
+    index: HashMap<String, usize>,
+    required: usize,
+}
+
+impl Attrs {
+    fn new(decls: Vec<AttrDecl>) -> Attrs {
+        let index = decls
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (a.name.clone(), i))
+            .collect();
+        let required = decls.iter().filter(|a| a.required).count();
+        Attrs {
+            decls,
+            index,
+            required,
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<&AttrDecl> {
+        self.index.get(name).map(|&i| &self.decls[i])
+    }
+}
+
 #[derive(Debug)]
 struct ComplexType {
-    attributes: Vec<AttrDecl>,
+    attributes: Attrs,
     content: Content,
 }
 
@@ -1597,9 +1809,18 @@ pub struct Compiled {
     types: Vec<TypeDef>,
     roots: HashMap<String, usize>,
     max_nfa_states: usize,
+    /// Pattern memory proxy and enumeration bytes, for cache accounting.
+    pattern_memory: usize,
+    enum_bytes: usize,
 }
 
 impl Compiled {
+    /// Resident bytes the schema text does not show: the regex programs and
+    /// lazy-DFA caches, and the enumeration sets.
+    pub(super) fn extra_bytes(&self) -> usize {
+        self.pattern_memory + 2 * self.enum_bytes
+    }
+
     fn simple(&self, idx: usize) -> &SimpleType {
         match &self.types[idx] {
             TypeDef::Simple(s) => s,
@@ -1760,8 +1981,15 @@ impl Marks {
 impl Nfa {
     /// Adds to `out` every state reachable from `seeds` through epsilon
     /// edges that matters for matching (it has an edge or is the accept
-    /// state). `steps` counts visited states against the validation budget.
-    fn closure(&self, seeds: &[u32], out: &mut Vec<u32>, marks: &mut Marks, steps: &mut u64) {
+    /// state). Every visited state is charged to `budget`.
+    fn closure(
+        &self,
+        seeds: &[u32],
+        out: &mut Vec<u32>,
+        marks: &mut Marks,
+        budget: &mut Budget,
+    ) -> Result<(), LimitExceeded> {
+        budget.charge(1 + seeds.len() as u64)?;
         let stamp = marks.next_stamp();
         marks.work.clear();
         for &s in seeds {
@@ -1771,8 +1999,8 @@ impl Nfa {
             }
         }
         while let Some(s) = marks.work.pop() {
-            *steps += 1;
             let state = &self.states[s as usize];
+            budget.charge(1 + state.eps.len() as u64)?;
             if state.edge.is_some() || s == self.accept {
                 out.push(s);
             }
@@ -1783,10 +2011,17 @@ impl Nfa {
                 }
             }
         }
+        Ok(())
     }
 
-    fn step(&self, active: &[u32], label: u32, marks: &mut Marks, steps: &mut u64) -> Vec<u32> {
-        *steps += active.len() as u64;
+    fn step(
+        &self,
+        active: &[u32],
+        label: u32,
+        marks: &mut Marks,
+        budget: &mut Budget,
+    ) -> Result<Vec<u32>, LimitExceeded> {
+        budget.charge(active.len() as u64)?;
         let seeds: Vec<u32> = active
             .iter()
             .filter_map(|&s| match self.states[s as usize].edge {
@@ -1795,8 +2030,8 @@ impl Nfa {
             })
             .collect();
         let mut out = Vec::new();
-        self.closure(&seeds, &mut out, marks, steps);
-        out
+        self.closure(&seeds, &mut out, marks, budget)?;
+        Ok(out)
     }
 
     fn accepts(&self, active: &[u32]) -> bool {
@@ -1826,10 +2061,17 @@ struct Compiler<'d> {
     simple_idx: HashMap<String, usize>,
     complex_idx: HashMap<String, usize>,
     simple_pending: HashSet<String>,
+    /// Declarations by name, so a reference resolves in O(1) instead of a
+    /// scan of every declaration.
+    simple_decl: HashMap<&'d str, &'d SimpleDef>,
+    complex_decl: HashSet<&'d str>,
     patterns: usize,
+    pattern_memory: usize,
     enum_values: usize,
+    enum_bytes: usize,
     nfa_states: usize,
     max_nfa_states: usize,
+    work: Budget,
 }
 
 impl<'d> Compiler<'d> {
@@ -1842,25 +2084,38 @@ impl<'d> Compiler<'d> {
             simple_idx: HashMap::new(),
             complex_idx: HashMap::new(),
             simple_pending: HashSet::new(),
+            simple_decl: HashMap::new(),
+            complex_decl: HashSet::new(),
             patterns: 0,
+            pattern_memory: 0,
             enum_values: 0,
+            enum_bytes: 0,
             nfa_states: 0,
             max_nfa_states: 1,
+            work: Budget::new(MAX_COMPILE_WORK),
         }
+    }
+
+    fn charge(&mut self, units: u64) -> Result<(), SchemaError> {
+        self.work
+            .charge(units)
+            .map_err(|_| invalid(COMPILE_WORK_REFUSAL))
     }
 
     fn run(mut self) -> Result<Compiled, SchemaError> {
         let doc = self.doc;
         let mut names = HashSet::new();
-        for name in doc
-            .simple_types
-            .iter()
-            .map(|(n, _)| n)
-            .chain(doc.complex_types.iter().map(|(n, _)| n))
-        {
+        for (name, def) in &doc.simple_types {
             if !names.insert(name.as_str()) {
                 return Err(invalid(format!("type '{name}' is declared twice")));
             }
+            self.simple_decl.insert(name.as_str(), def);
+        }
+        for (name, _) in &doc.complex_types {
+            if !names.insert(name.as_str()) {
+                return Err(invalid(format!("type '{name}' is declared twice")));
+            }
+            self.complex_decl.insert(name.as_str());
         }
         let mut roots_seen = HashSet::new();
         for e in &doc.elements {
@@ -1879,7 +2134,7 @@ impl<'d> Compiler<'d> {
         }
         for (name, _) in &doc.complex_types {
             self.types.push(TypeDef::Complex(ComplexType {
-                attributes: Vec::new(),
+                attributes: Attrs::default(),
                 content: Content::Empty,
             }));
             self.complex_idx.insert(name.clone(), self.types.len() - 1);
@@ -1899,6 +2154,8 @@ impl<'d> Compiler<'d> {
             types: self.types,
             roots,
             max_nfa_states: self.max_nfa_states,
+            pattern_memory: self.pattern_memory,
+            enum_bytes: self.enum_bytes,
         })
     }
 
@@ -1934,13 +2191,10 @@ impl<'d> Compiler<'d> {
                  {MAX_SCHEMA_DEPTH} named types"
             )));
         }
-        let doc = self.doc;
-        let def = &doc
-            .simple_types
-            .iter()
-            .find(|(n, _)| n == name)
-            .ok_or_else(|| invalid(format!("simple type '{name}' is not declared")))?
-            .1;
+        let def = *self
+            .simple_decl
+            .get(name)
+            .ok_or_else(|| invalid(format!("simple type '{name}' is not declared")))?;
         let compiled = self.simple_def(def, name)?;
         self.simple_pending.remove(name);
         let idx = self.push_type(TypeDef::Simple(compiled));
@@ -1971,9 +2225,9 @@ impl<'d> Compiler<'d> {
     /// Index of the named SIMPLE type `n`; a complex or unknown name is an
     /// error naming the problem.
     fn simple_type_idx(&mut self, n: &str) -> Result<usize, SchemaError> {
-        if self.doc.simple_types.iter().any(|(name, _)| name == n) {
+        if self.simple_decl.contains_key(n) {
             self.named_simple(n)
-        } else if self.doc.complex_types.iter().any(|(name, _)| name == n) {
+        } else if self.complex_decl.contains(n) {
             Err(invalid(format!(
                 "'{n}' is a complex type; a simple type is required here"
             )))
@@ -2006,11 +2260,21 @@ impl<'d> Compiler<'d> {
         }
         let mut patterns = Vec::new();
         for source in &f.patterns {
-            let regex =
+            self.charge(1 + source.len() as u64)?;
+            let (regex, tier) =
                 build_pattern(source).map_err(|e| invalid(format!("type '{what}': {e}")))?;
+            // Program and lazy-DFA cache are each bounded by the tier limit.
+            self.pattern_memory += 2 * tier.size_limit;
+            if self.pattern_memory > MAX_PATTERN_MEMORY {
+                return Err(invalid(format!(
+                    "the patterns of the schema need more than {} KiB of memory in total",
+                    MAX_PATTERN_MEMORY / 1024
+                )));
+            }
             patterns.push(Pattern {
                 source: source.clone(),
                 regex,
+                weight: tier.weight,
             });
         }
         self.enum_values += f.enumeration.len();
@@ -2019,8 +2283,21 @@ impl<'d> Compiler<'d> {
                 "the schema lists more than {MAX_ENUMERATION_VALUES} enumeration values"
             )));
         }
-        let mut enumeration = Vec::new();
+        let mut enumeration = HashSet::new();
         for member in &f.enumeration {
+            if member.len() > MAX_ENUM_VALUE_BYTES {
+                return Err(invalid(format!(
+                    "type '{what}': an enumeration value is longer than {MAX_ENUM_VALUE_BYTES} bytes"
+                )));
+            }
+            self.enum_bytes += member.len();
+            if self.enum_bytes > MAX_ENUM_TOTAL_BYTES {
+                return Err(invalid(format!(
+                    "the enumeration values of the schema hold more than {} KiB in total",
+                    MAX_ENUM_TOTAL_BYTES / 1024
+                )));
+            }
+            self.charge(1 + member.len() as u64)?;
             let value = if st.builtin.is_string() {
                 member.as_str()
             } else {
@@ -2032,7 +2309,7 @@ impl<'d> Compiler<'d> {
                     st.builtin.name()
                 )));
             }
-            enumeration.push(canonical(st.builtin, value));
+            enumeration.insert(canonical(st.builtin, value));
         }
         let step = Facets {
             min_length: f.min_length,
@@ -2058,7 +2335,7 @@ impl<'d> Compiler<'d> {
         match t {
             TypeUse::Builtin(b) => Ok(self.builtin(*b)),
             TypeUse::Named(n) => {
-                if self.doc.simple_types.iter().any(|(name, _)| name == n) {
+                if self.simple_decl.contains_key(n.as_str()) {
                     self.named_simple(n)
                 } else if let Some(&i) = self.complex_idx.get(n) {
                     Ok(i)
@@ -2093,12 +2370,19 @@ impl<'d> Compiler<'d> {
     }
 
     fn element(&mut self, e: &ElementDef) -> Result<usize, SchemaError> {
+        self.charge(1)?;
         let ty = self.type_use(&e.ty, &format!("element '{}'", e.name))?;
         self.elements.push(ElementDecl { ty });
         Ok(self.elements.len() - 1)
     }
 
     fn complex_def(&mut self, def: &ComplexDef) -> Result<ComplexType, SchemaError> {
+        if def.attributes.len() > MAX_ATTRIBUTES_PER_TYPE {
+            return Err(invalid(format!(
+                "a type declares more than {MAX_ATTRIBUTES_PER_TYPE} attributes"
+            )));
+        }
+        self.charge(1 + def.attributes.len() as u64)?;
         let mut attributes = Vec::new();
         for a in &def.attributes {
             let ty = self.simple_use(&a.ty, &format!("attribute '{}'", a.name))?;
@@ -2114,7 +2398,7 @@ impl<'d> Compiler<'d> {
             ComplexContent::Group(g) => Content::Model(self.model(g)?),
         };
         Ok(ComplexType {
-            attributes,
+            attributes: Attrs::new(attributes),
             content,
         })
     }
@@ -2157,9 +2441,11 @@ impl<'d> Compiler<'d> {
             accept: frag.end,
             start_set: Vec::new(),
         };
+        self.charge(nfa.states.len() as u64)?;
         let mut marks = Marks::new(nfa.states.len());
         let mut start_set = Vec::new();
-        nfa.closure(&[frag.start], &mut start_set, &mut marks, &mut 0);
+        nfa.closure(&[frag.start], &mut start_set, &mut marks, &mut self.work)
+            .map_err(|_| invalid(COMPILE_WORK_REFUSAL))?;
         start_set.sort_unstable();
         nfa.start_set = start_set;
         Ok(Model::Nfa(NfaModel {
@@ -2315,23 +2601,34 @@ fn initial_state(c: &Compiled, ty: usize) -> State {
     }
 }
 
+const VALIDATION_BUDGET_MSG: &str = "document exceeds the validation work budget";
+
 fn check_attributes(
     c: &Compiled,
     ty: usize,
     e: &BytesStart,
     decoder: Decoder,
+    budget: &mut Budget,
     path: &dyn Fn() -> String,
 ) -> Result<(), SchemaError> {
-    let declared: &[AttrDecl] = match &c.types[ty] {
-        TypeDef::Simple(_) => &[],
-        TypeDef::Complex(ct) => &ct.attributes,
+    let too_complex = || limit(&path(), VALIDATION_BUDGET_MSG);
+    let declared: Option<&Attrs> = match &c.types[ty] {
+        TypeDef::Simple(_) => None,
+        TypeDef::Complex(ct) => Some(&ct.attributes),
     };
-    let required_total = declared.iter().filter(|a| a.required).count();
+    let required_total = declared.map_or(0, |a| a.required);
     let mut required_seen = 0;
-    for attr in e.attributes() {
+    // quick-xml's own duplicate check compares every pair of attributes;
+    // this one is linear and charged per attribute.
+    let mut present: HashSet<&[u8]> = HashSet::new();
+    for attr in e.attributes().with_checks(false) {
+        budget.charge(COST_ATTRIBUTE).map_err(|_| too_complex())?;
         let attr = attr.map_err(|_| violation(&path(), "malformed attribute"))?;
         let key = std::str::from_utf8(attr.key.as_ref())
             .map_err(|_| violation(&path(), "attribute name is not valid UTF-8"))?;
+        if !present.insert(attr.key.into_inner()) {
+            return Err(violation(&path(), "malformed attribute"));
+        }
         if key == "xmlns" || key.starts_with("xmlns:") {
             continue;
         }
@@ -2347,7 +2644,7 @@ fn check_attributes(
                 ),
             ));
         }
-        let Some(decl) = declared.iter().find(|a| a.name == key) else {
+        let Some(decl) = declared.and_then(|a| a.get(key)) else {
             return Err(violation(
                 &path(),
                 &format!("attribute '{}' is not declared", shorten_name(key)),
@@ -2356,26 +2653,28 @@ fn check_attributes(
         let value = attr
             .decoded_and_normalized_value(XmlVersion::Implicit1_0, decoder)
             .map_err(|_| violation(&path(), "malformed attribute value"))?;
-        if let Err(why) = c.simple(decl.ty).check(&value) {
-            return Err(violation(
-                &path(),
-                &format!("attribute '{}' {why}", shorten_name(key)),
-            ));
+        match c.simple(decl.ty).check(&value, budget) {
+            Ok(()) => {}
+            Err(CheckFailure::Violated(why)) => {
+                return Err(violation(
+                    &path(),
+                    &format!("attribute '{}' {why}", shorten_name(key)),
+                ));
+            }
+            Err(CheckFailure::TooComplex) => return Err(too_complex()),
         }
         if decl.required {
             required_seen += 1;
         }
     }
     if required_seen < required_total {
-        let present: HashSet<String> = e
-            .attributes()
-            .filter_map(|a| a.ok())
-            .map(|a| String::from_utf8_lossy(a.key.as_ref()).into_owned())
-            .collect();
         let missing = declared
-            .iter()
-            .find(|a| a.required && !present.contains(&a.name))
-            .map_or("?", |a| a.name.as_str());
+            .and_then(|a| {
+                a.decls
+                    .iter()
+                    .find(|d| d.required && !present.contains(d.name.as_bytes()))
+            })
+            .map_or("?", |d| d.name.as_str());
         return Err(violation(
             &path(),
             &format!("required attribute '{missing}' is missing"),
@@ -2387,6 +2686,7 @@ fn check_attributes(
 enum Refusal {
     NotAllowed,
     Repeated,
+    TooComplex,
 }
 
 /// Resolves the element `name` entered under the current top frame (or as
@@ -2397,7 +2697,7 @@ fn enter_child(
     stack: &mut [Frame],
     name: &str,
     marks: &mut Marks,
-    steps: &mut u64,
+    budget: &mut Budget,
 ) -> Result<usize, SchemaError> {
     let Some(parent_idx) = stack.len().checked_sub(1) else {
         return c.roots.get(name).copied().ok_or_else(|| {
@@ -2415,15 +2715,14 @@ fn enter_child(
         }) => match (model, &mut parent.state) {
             (Model::Nfa(m), State::Nfa(active)) => match m.by_name.get(name) {
                 None => Err(Refusal::NotAllowed),
-                Some(&label) => {
-                    let next = m.nfa.step(active, label, marks, steps);
-                    if next.is_empty() {
-                        Err(Refusal::NotAllowed)
-                    } else {
+                Some(&label) => match m.nfa.step(active, label, marks, budget) {
+                    Err(LimitExceeded) => Err(Refusal::TooComplex),
+                    Ok(next) if next.is_empty() => Err(Refusal::NotAllowed),
+                    Ok(next) => {
                         *active = next;
                         Ok(m.children[label as usize].element)
                     }
-                }
+                },
             },
             (Model::All(m), State::All(seen, any)) => match m.by_name.get(name) {
                 None => Err(Refusal::NotAllowed),
@@ -2443,21 +2742,28 @@ fn enter_child(
         match refusal {
             Refusal::NotAllowed => violation(&path, "element is not allowed here"),
             Refusal::Repeated => violation(&path, "element occurs more than once"),
+            Refusal::TooComplex => limit(&path, VALIDATION_BUDGET_MSG),
         }
     })
 }
 
-fn close_frame(c: &Compiled, stack: &mut Vec<Frame>) -> Result<(), SchemaError> {
+fn close_frame(
+    c: &Compiled,
+    stack: &mut Vec<Frame>,
+    budget: &mut Budget,
+) -> Result<(), SchemaError> {
     let Some(frame) = stack.last() else {
         return Err(violation("<root>", "unmatched end tag"));
     };
     let fail = |msg: &str| violation(&path_of(stack, None), msg);
     match (&frame.state, &c.types[frame.ty]) {
-        (State::Text(simple, text), _) => {
-            if let Err(why) = c.simple(*simple).check(text) {
-                return Err(fail(&format!("value {why}")));
+        (State::Text(simple, text), _) => match c.simple(*simple).check(text, budget) {
+            Ok(()) => {}
+            Err(CheckFailure::Violated(why)) => return Err(fail(&format!("value {why}"))),
+            Err(CheckFailure::TooComplex) => {
+                return Err(limit(&path_of(stack, None), VALIDATION_BUDGET_MSG));
             }
-        }
+        },
         (
             State::Nfa(active),
             TypeDef::Complex(ComplexType {
@@ -2514,23 +2820,24 @@ fn on_text(stack: &mut [Frame], text: &str) -> Result<(), SchemaError> {
 }
 
 fn validate_document(c: &Compiled, payload: &[u8]) -> Result<(), SchemaError> {
+    validate_within(c, payload, MAX_VALIDATION_STEPS)
+}
+
+fn validate_within(c: &Compiled, payload: &[u8], work_limit: u64) -> Result<(), SchemaError> {
     let mut reader = Reader::from_reader(payload);
     let decoder = reader.decoder();
     let mut stack: Vec<Frame> = Vec::new();
     let mut root_closed = false;
     let mut marks = Marks::new(c.max_nfa_states);
-    let mut steps: u64 = 0;
+    let mut budget = Budget::new(work_limit);
 
     loop {
-        if steps > MAX_VALIDATION_STEPS {
-            return Err(limit(
-                &path_of(&stack, None),
-                "document exceeds the validation work budget",
-            ));
-        }
         let event = reader
             .read_event()
             .map_err(|_| violation(&path_of(&stack, None), "not well-formed XML"))?;
+        budget
+            .charge(COST_EVENT)
+            .map_err(|_| limit(&path_of(&stack, None), VALIDATION_BUDGET_MSG))?;
         match event {
             Event::Start(ref e) | Event::Empty(ref e) => {
                 if root_closed {
@@ -2549,16 +2856,21 @@ fn validate_document(c: &Compiled, payload: &[u8]) -> Result<(), SchemaError> {
                         violation(&path_of(&stack, None), "element name is not valid UTF-8")
                     })?
                     .to_string();
-                let element = enter_child(c, &mut stack, &name, &mut marks, &mut steps)?;
+                budget
+                    .charge(COST_ELEMENT + name.len() as u64)
+                    .map_err(|_| limit(&path_of(&stack, Some(&name)), VALIDATION_BUDGET_MSG))?;
+                let element = enter_child(c, &mut stack, &name, &mut marks, &mut budget)?;
                 let ty = c.elements[element].ty;
-                check_attributes(c, ty, e, decoder, &|| path_of(&stack, Some(&name)))?;
+                check_attributes(c, ty, e, decoder, &mut budget, &|| {
+                    path_of(&stack, Some(&name))
+                })?;
                 stack.push(Frame {
                     name,
                     ty,
                     state: initial_state(c, ty),
                 });
                 if matches!(event, Event::Empty(_)) {
-                    close_frame(c, &mut stack)?;
+                    close_frame(c, &mut stack, &mut budget)?;
                     root_closed = stack.is_empty();
                 }
             }
@@ -2566,7 +2878,7 @@ fn validate_document(c: &Compiled, payload: &[u8]) -> Result<(), SchemaError> {
                 if stack.is_empty() {
                     return Err(violation("<root>", "unmatched end tag"));
                 }
-                close_frame(c, &mut stack)?;
+                close_frame(c, &mut stack, &mut budget)?;
                 root_closed = stack.is_empty();
             }
             Event::Text(ref t) => {
@@ -2996,11 +3308,11 @@ enum ContentView<'a> {
     Model(&'a Model),
 }
 
-fn view(c: &Compiled, ty: usize) -> (&[AttrDecl], ContentView<'_>) {
+fn view(c: &Compiled, ty: usize) -> (Option<&Attrs>, ContentView<'_>) {
     match &c.types[ty] {
-        TypeDef::Simple(s) => (&[], ContentView::Text(s)),
+        TypeDef::Simple(s) => (None, ContentView::Text(s)),
         TypeDef::Complex(ct) => (
-            &ct.attributes,
+            Some(&ct.attributes),
             match &ct.content {
                 Content::Empty => ContentView::Empty,
                 Content::Text(i) => ContentView::Text(c.simple(*i)),
@@ -3021,9 +3333,10 @@ struct Inclusion<'a> {
     visited: HashSet<(usize, usize)>,
     pairs: usize,
     max_pairs: usize,
-    /// NFA states touched by all product constructions so far, counted as
-    /// they happen so the budget holds across nested comparisons.
-    work: u64,
+    /// Everything expensive any comparison does (NFA states, pattern and
+    /// enumeration scans, attribute pairs), charged as it happens so the
+    /// limit holds across nested comparisons.
+    budget: Budget,
     /// Nesting of `types` calls; named complex types can chain far deeper
     /// than the inline nesting limit.
     depth: usize,
@@ -3033,19 +3346,18 @@ const MAX_COMPAT_DEPTH: usize = 64;
 
 const TOO_COMPLEX: &str = "the schemas are too complex to compare; compatibility cannot be proven";
 
+impl From<LimitExceeded> for String {
+    fn from(_: LimitExceeded) -> String {
+        TOO_COMPLEX.to_string()
+    }
+}
+
 impl<'a> Inclusion<'a> {
     fn fail(&self, path: &[String], msg: &str) -> String {
         format!("/{}: {msg}", path.join("/"))
     }
 
-    fn work_limit(&self) -> Result<(), String> {
-        if self.work > MAX_COMPAT_WORK {
-            return Err(TOO_COMPLEX.to_string());
-        }
-        Ok(())
-    }
-
-    fn budget(&mut self) -> Result<(), String> {
+    fn pair(&mut self) -> Result<(), String> {
         self.pairs += 1;
         if self.pairs > self.max_pairs {
             return Err(TOO_COMPLEX.to_string());
@@ -3054,6 +3366,7 @@ impl<'a> Inclusion<'a> {
     }
 
     fn roots(&mut self) -> Result<(), String> {
+        self.budget.charge(self.sub.roots.len() as u64)?;
         let mut names: Vec<&String> = self.sub.roots.keys().collect();
         names.sort();
         for name in names {
@@ -3098,17 +3411,16 @@ impl<'a> Inclusion<'a> {
         sub_ty: usize,
         path: &mut Vec<String>,
     ) -> Result<(), String> {
-        self.budget()?;
+        self.pair()?;
         let (sup_attrs, sup_content) = view(self.sup, sup_ty);
         let (sub_attrs, sub_content) = view(self.sub, sub_ty);
-        self.work += (sup_attrs.len() + sub_attrs.len()) as u64;
-        self.work_limit()?;
-        let sup_by_name: HashMap<&str, &AttrDecl> =
-            sup_attrs.iter().map(|a| (a.name.as_str(), a)).collect();
-        let sub_names: HashSet<&str> = sub_attrs.iter().map(|b| b.name.as_str()).collect();
+        let sup_decls: &[AttrDecl] = sup_attrs.map_or(&[], |a| &a.decls);
+        let sub_decls: &[AttrDecl] = sub_attrs.map_or(&[], |a| &a.decls);
+        self.budget
+            .charge(1 + (sup_decls.len() + sub_decls.len()) as u64)?;
         let (sup_c, sub_c) = (self.sup, self.sub);
-        for b in sub_attrs {
-            let Some(a) = sup_by_name.get(b.name.as_str()) else {
+        for b in sub_decls {
+            let Some(a) = sup_attrs.and_then(|x| x.get(&b.name)) else {
                 return Err(self.fail(
                     path,
                     &format!(
@@ -3135,8 +3447,8 @@ impl<'a> Inclusion<'a> {
                 ));
             }
         }
-        for a in sup_attrs.iter().filter(|a| a.required) {
-            if !sub_names.contains(a.name.as_str()) {
+        for a in sup_decls.iter().filter(|a| a.required) {
+            if sub_attrs.and_then(|x| x.get(&a.name)).is_none() {
                 return Err(self.fail(
                     path,
                     &format!(
@@ -3199,8 +3511,8 @@ impl<'a> Inclusion<'a> {
 
     fn simple(&mut self, sup: &SimpleType, sub: &SimpleType) -> Result<(), String> {
         let patterns = |t: &SimpleType| t.steps.iter().map(|s| s.patterns.len()).sum::<usize>();
-        self.work += (1 + patterns(sup) + patterns(sub)) as u64;
-        self.work_limit()?;
+        self.budget
+            .charge((1 + patterns(sup) + patterns(sub)) as u64)?;
         if !sub.builtin.widens_to(sup.builtin) {
             return Err(format!(
                 "type xs:{} ({}) is not contained in xs:{} ({})",
@@ -3213,7 +3525,7 @@ impl<'a> Inclusion<'a> {
         if sup.steps.is_empty() {
             return Ok(());
         }
-        if let Some(members) = sub.effective_enumeration() {
+        if let Some(members) = sub.effective_enumeration(&mut self.budget)? {
             // A member is the canonical value for numbers and booleans, but
             // the instance may spell it many ways (`01`, `+1`, ` 1 `, `1` for
             // true), and `sup.check` on the canonical form says nothing about
@@ -3231,25 +3543,18 @@ impl<'a> Inclusion<'a> {
                         .to_string(),
                 );
             }
-            // Each member runs every step of `sup`, which tries up to all of
-            // its patterns; the intersection above is quadratic in the sizes.
-            let widest = sub
-                .steps
-                .iter()
-                .map(|s| s.enumeration.len())
-                .max()
-                .unwrap_or(0);
-            let total: usize = sub.steps.iter().map(|s| s.enumeration.len()).sum();
-            let per_member = (1 + sup.steps.len() + patterns(sup)) as u64;
-            self.work += (widest * total) as u64 + members.len() as u64 * per_member;
-            self.work_limit()?;
+            // `check` charges the scans of each member itself.
             for member in members {
-                if sup.check(member).is_err() {
-                    return Err(format!(
-                        "enumerated value '{member}' of the {} schema is not accepted by the {} \
-                         schema",
-                        self.sub_label, self.sup_label
-                    ));
+                match sup.check(member, &mut self.budget) {
+                    Ok(()) => {}
+                    Err(CheckFailure::Violated(_)) => {
+                        return Err(format!(
+                            "enumerated value '{member}' of the {} schema is not accepted by \
+                             the {} schema",
+                            self.sub_label, self.sup_label
+                        ));
+                    }
+                    Err(CheckFailure::TooComplex) => return Err(TOO_COMPLEX.to_string()),
                 }
             }
             return Ok(());
@@ -3275,15 +3580,23 @@ impl<'a> Inclusion<'a> {
                 self.sub_label, self.sup_label
             ));
         }
-        for step in sup.steps.iter().filter(|s| !s.patterns.is_empty()) {
-            let mut want: Vec<&str> = step.patterns.iter().map(|p| p.source.as_str()).collect();
-            want.sort_unstable();
-            let found = sub.steps.iter().any(|b| {
-                let mut have: Vec<&str> = b.patterns.iter().map(|p| p.source.as_str()).collect();
-                have.sort_unstable();
-                have == want
-            });
-            if !found {
+        let bytes = |t: &SimpleType| -> u64 {
+            t.steps
+                .iter()
+                .flat_map(|s| s.patterns.iter())
+                .map(|p| p.source.len() as u64)
+                .sum()
+        };
+        // Sorting both sides and comparing each want against each have.
+        self.budget.charge(
+            (bytes(sup) + bytes(sub))
+                .saturating_mul(8)
+                .saturating_add((sup.steps.len() * sub.steps.len()) as u64),
+        )?;
+        let wants = sorted_sources(sup);
+        let haves = sorted_sources(sub);
+        for want in wants.iter().filter(|w| !w.is_empty()) {
+            if !haves.iter().any(|have| have == want) {
                 return Err(format!(
                     "the {} schema applies a pattern that the {} schema does not guarantee",
                     self.sup_label, self.sub_label
@@ -3363,6 +3676,8 @@ impl<'a> Inclusion<'a> {
         sub: &NfaModel,
         path: &mut Vec<String>,
     ) -> Result<(), String> {
+        self.budget
+            .charge((sup.nfa.states.len() + sub.nfa.states.len()) as u64)?;
         let mut sup_marks = Marks::new(sup.nfa.states.len());
         let mut sub_marks = Marks::new(sub.nfa.states.len());
         let start = (sub.nfa.start_set.clone(), sup.nfa.start_set.clone());
@@ -3371,10 +3686,8 @@ impl<'a> Inclusion<'a> {
         let mut queue = VecDeque::from([start]);
         let mut typed: HashSet<u32> = HashSet::new();
         while let Some((s1, s2)) = queue.pop_front() {
-            self.budget()?;
-            if self.work > MAX_COMPAT_WORK {
-                return Err(TOO_COMPLEX.to_string());
-            }
+            self.pair()?;
+            self.budget.charge((s1.len() + s2.len()) as u64)?;
             if sub.nfa.accepts(&s1) && !sup.nfa.accepts(&s2) {
                 return Err(self.fail(
                     path,
@@ -3387,11 +3700,7 @@ impl<'a> Inclusion<'a> {
                     ),
                 ));
             }
-            self.work += (s1.len() + s2.len()) as u64;
             for label in sub.nfa.labels_from(&s1) {
-                if self.work > MAX_COMPAT_WORK {
-                    return Err(TOO_COMPLEX.to_string());
-                }
                 let child = &sub.children[label as usize];
                 let Some(&sup_label) = sup.by_name.get(&child.name) else {
                     return Err(self.fail(
@@ -3402,8 +3711,12 @@ impl<'a> Inclusion<'a> {
                         ),
                     ));
                 };
-                let mut next_sub = sub.nfa.step(&s1, label, &mut sub_marks, &mut self.work);
-                let mut next_sup = sup.nfa.step(&s2, sup_label, &mut sup_marks, &mut self.work);
+                let mut next_sub = sub.nfa.step(&s1, label, &mut sub_marks, &mut self.budget)?;
+                let mut next_sup =
+                    sup.nfa
+                        .step(&s2, sup_label, &mut sup_marks, &mut self.budget)?;
+                self.budget
+                    .charge((next_sub.len() + next_sup.len()) as u64)?;
                 next_sub.sort_unstable();
                 next_sup.sort_unstable();
                 if next_sup.is_empty() {
@@ -3475,7 +3788,7 @@ fn included(
         visited: HashSet::new(),
         pairs: 0,
         max_pairs: MAX_COMPAT_PAIRS,
-        work: 0,
+        budget: Budget::new(MAX_COMPAT_WORK),
         depth: 0,
     }
     .roots()
@@ -4027,7 +4340,7 @@ mod tests {
     // ---- pattern dialect ----------------------------------------------------
 
     fn matches_pattern(pattern: &str, value: &str) -> bool {
-        build_pattern(pattern).expect(pattern).is_match(value)
+        build_pattern(pattern).expect(pattern).0.is_match(value)
     }
 
     #[test]
@@ -5031,7 +5344,7 @@ mod tests {
             visited: HashSet::new(),
             pairs: 0,
             max_pairs: 1,
-            work: 0,
+            budget: Budget::new(MAX_COMPAT_WORK),
             depth: 0,
         };
         let err = tight.roots().unwrap_err();
@@ -5119,13 +5432,16 @@ mod tests {
             visited: HashSet::new(),
             pairs: 0,
             max_pairs: MAX_COMPAT_PAIRS,
-            work: MAX_COMPAT_WORK,
+            budget: Budget {
+                used: MAX_COMPAT_WORK,
+                limit: MAX_COMPAT_WORK,
+            },
             depth: 0,
         };
         let err = spent.roots().unwrap_err();
         assert!(err.contains("too complex to compare"), "{err}");
         assert!(
-            spent.work > MAX_COMPAT_WORK,
+            spent.budget.used > MAX_COMPAT_WORK,
             "the steps of a product construction count into the shared budget as they happen"
         );
     }
@@ -5407,5 +5723,317 @@ mod tests {
         let typed = element_with(r#"<xs:sequence/><xs:attribute name="x" type="xs:int"/>"#);
         let msg = violation_of(&typed, &format!(r#"<r {long}="1"/>"#));
         assert!(msg.chars().count() < 600);
+    }
+
+    // ---- structural resource bounds -------------------------------------------
+
+    fn within(started: std::time::Instant, secs: u64) {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(secs),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    fn refusal_of(text: &str) -> String {
+        match ops_compile(text) {
+            Err(SchemaError::Invalid(m)) => m,
+            other => panic!("expected a compile refusal, got {other:?}"),
+        }
+    }
+
+    fn string_type(facets: &str) -> String {
+        format!(
+            r#"<xs:simpleType name="T"><xs:restriction base="xs:string">{facets}</xs:restriction></xs:simpleType>"#
+        )
+    }
+
+    fn attributes_of(count: usize) -> String {
+        (0..count)
+            .map(|i| format!(r#"<xs:attribute name="a{i}" type="T"/>"#))
+            .collect()
+    }
+
+    fn root_with_attributes(types: &str, count: usize) -> String {
+        schema(&format!(
+            r#"{types}<xs:element name="r"><xs:complexType>{}</xs:complexType></xs:element>"#,
+            attributes_of(count)
+        ))
+    }
+
+    #[test]
+    fn a_huge_enumeration_member_is_refused_at_compile_before_any_comparison() {
+        let member = format!("v{}", "0".repeat(128 * 1024));
+        let old = root_with_attributes(
+            &string_type(&format!(r#"<xs:enumeration value="{member}"/>"#)),
+            2500,
+        );
+        let decoys: String = (0..255)
+            .map(|i| format!(r#"<xs:pattern value="q{i}x"/>"#))
+            .collect();
+        let new = root_with_attributes(&string_type(&decoys), 2500);
+        assert!(old.len() < MAX_SCHEMA_TEXT_BYTES && new.len() < MAX_SCHEMA_TEXT_BYTES);
+        let started = std::time::Instant::now();
+        for mode in [Compatibility::Backward, Compatibility::Full] {
+            let got = XSD_OPS.check_compatibility(&old, &new, mode);
+            assert!(
+                matches!(&got, Err(SchemaError::Invalid(m)) if m.contains("an enumeration value is longer than 1024 bytes")),
+                "{got:?}"
+            );
+        }
+        within(started, 10);
+    }
+
+    #[test]
+    fn compatibility_of_maximal_enumerations_against_many_patterns_is_limited() {
+        // Everything at its cap: 1024 attributes, 1 KiB members, 255 patterns
+        // of which only the last one accepts.
+        let members: String = (0..4)
+            .map(|i| format!(r#"<xs:enumeration value="v{i}{}"/>"#, "0".repeat(1000)))
+            .collect();
+        let decoys: String = (0..254)
+            .map(|i| format!(r#"<xs:pattern value="q{i}x"/>"#))
+            .chain(std::iter::once(
+                r#"<xs:pattern value="v[0-9]+"/>"#.to_string(),
+            ))
+            .collect();
+        let old = root_with_attributes(&string_type(&members), MAX_ATTRIBUTES_PER_TYPE);
+        let new = root_with_attributes(&string_type(&decoys), MAX_ATTRIBUTES_PER_TYPE);
+        let started = std::time::Instant::now();
+        let got = XSD_OPS.check_compatibility(&old, &new, Compatibility::Backward);
+        assert!(
+            matches!(&got, Err(SchemaError::LimitExceeded(m)) if m.contains("too complex to compare")),
+            "{got:?}"
+        );
+        within(started, 10);
+    }
+
+    #[test]
+    fn a_value_that_cannot_be_matched_within_the_budget_is_limited_not_scanned() {
+        let heavy = r#"<xs:pattern value="[01]*1[01]{200}"/>"#;
+        let many = string_type(&heavy.repeat(MAX_PATTERNS));
+        let s = schema(&format!(r#"{many}<xs:element name="r" type="T"/>"#));
+        let c = compiled(&s);
+        let value = "01".repeat(4 * 1024 * 1024);
+        let started = std::time::Instant::now();
+        let got = XSD_OPS.validate(&c, format!("<r>{value}</r>").as_bytes());
+        assert!(
+            matches!(&got, Err(SchemaError::LimitExceeded(m)) if m.contains("validation work budget")),
+            "{got:?}"
+        );
+        within(started, 5);
+
+        // One such pattern over a megabyte is bounded as well: its worst case
+        // is the automaton width per byte, which the tier weight stands for.
+        let one = schema(&format!(
+            r#"{}<xs:element name="r" type="T"/>"#,
+            string_type(heavy)
+        ));
+        let started = std::time::Instant::now();
+        let got = XSD_OPS.validate(
+            &compiled(&one),
+            format!("<r>{}</r>", "01".repeat(512 * 1024)).as_bytes(),
+        );
+        assert!(
+            matches!(&got, Err(SchemaError::LimitExceeded(_))),
+            "{got:?}"
+        );
+        within(started, 5);
+
+        // A value that fits the budget is still checked for real.
+        let got = XSD_OPS.validate(&compiled(&one), b"<r>0101</r>");
+        assert!(matches!(got, Err(SchemaError::Violation(_))), "{got:?}");
+        let mut ok = String::from("1");
+        ok.push_str(&"0".repeat(200));
+        assert!(accepts(&one, &format!("<r>{ok}</r>")));
+    }
+
+    #[test]
+    fn many_attributes_on_repeated_elements_validate_in_linear_time() {
+        let types = string_type("");
+        let s = schema(&format!(
+            r#"{types}<xs:element name="r"><xs:complexType><xs:sequence>
+                 <xs:element name="e" minOccurs="0" maxOccurs="unbounded"><xs:complexType>{}</xs:complexType></xs:element>
+               </xs:sequence></xs:complexType></xs:element>"#,
+            attributes_of(MAX_ATTRIBUTES_PER_TYPE)
+        ));
+        let c = compiled(&s);
+        let one: String = (0..MAX_ATTRIBUTES_PER_TYPE)
+            .map(|i| format!(r#" a{i}="1""#))
+            .collect();
+        let doc = format!("<r>{}</r>", format!("<e{one}/>").repeat(500));
+        let started = std::time::Instant::now();
+        XSD_OPS.validate(&c, doc.as_bytes()).unwrap();
+        within(started, 10);
+
+        // The same document against a tight budget is limited, not ignored.
+        let CompiledSchema::Xsd(inner) = &c else {
+            panic!("expected an xsd schema");
+        };
+        let got = validate_within(inner, doc.as_bytes(), 1_000_000);
+        assert!(
+            matches!(&got, Err(SchemaError::LimitExceeded(m)) if m.contains("validation work budget")),
+            "{got:?}"
+        );
+
+        // 5700 attributes the type never declared stop at the first one, and a
+        // repeated one is malformed however many there are.
+        let wide: String = (0..5700).map(|i| format!(r#" b{i}="1""#)).collect();
+        let started = std::time::Instant::now();
+        assert!(violation_of(&s, &format!("<r><e{wide}/></r>")).contains("is not declared"));
+        let dup: String = (0..5700).map(|i| format!(r#" a{}="1""#, i % 900)).collect();
+        assert!(violation_of(&s, &format!("<r><e{dup}/></r>")).contains("malformed attribute"));
+        within(started, 5);
+    }
+
+    #[test]
+    fn a_type_with_more_attributes_than_the_cap_is_refused() {
+        let ok = root_with_attributes(&string_type(""), MAX_ATTRIBUTES_PER_TYPE);
+        assert!(ops_compile(&ok).is_ok());
+        let too_many = root_with_attributes(&string_type(""), MAX_ATTRIBUTES_PER_TYPE + 1);
+        assert!(refusal_of(&too_many).contains("a type declares more than 1024 attributes"));
+    }
+
+    #[test]
+    fn patterns_that_need_too_much_memory_are_refused_at_compile() {
+        // Each PESEL-sized pattern is fine alone ...
+        let pesel = r#"<xs:pattern value="\d{11}"/>"#;
+        let one = schema(&format!(
+            r#"{}<xs:element name="r" type="T"/>"#,
+            string_type(pesel)
+        ));
+        assert!(ops_compile(&one).is_ok());
+        // ... but a schema full of them is not.
+        let started = std::time::Instant::now();
+        let many = schema(&format!(
+            r#"{}<xs:element name="r" type="T"/>"#,
+            string_type(&pesel.repeat(MAX_PATTERNS))
+        ));
+        let msg = refusal_of(&many);
+        assert!(
+            msg.contains("the patterns of the schema need more than 8192 KiB of memory"),
+            "{msg}"
+        );
+        // One automaton past the largest tier is refused on its own.
+        let big = schema(&format!(
+            r#"{}<xs:element name="r" type="T"/>"#,
+            string_type(r#"<xs:pattern value="\p{L}{60}"/>"#)
+        ));
+        assert!(refusal_of(&big).contains("the compiled pattern is too large"));
+        within(started, 10);
+    }
+
+    #[test]
+    fn enumeration_caps_are_refused_with_pinned_phrases() {
+        let value = |n: usize| format!(r#"<xs:enumeration value="{}"/>"#, "x".repeat(n));
+        let at_cap = schema(&format!(
+            r#"{}<xs:element name="r" type="T"/>"#,
+            string_type(&value(MAX_ENUM_VALUE_BYTES))
+        ));
+        assert!(ops_compile(&at_cap).is_ok());
+        let long = schema(&format!(
+            r#"{}<xs:element name="r" type="T"/>"#,
+            string_type(&value(MAX_ENUM_VALUE_BYTES + 1))
+        ));
+        assert!(refusal_of(&long).contains("an enumeration value is longer than 1024 bytes"));
+
+        let total: String = (0..MAX_ENUM_TOTAL_BYTES / 512 + 1)
+            .map(|i| format!(r#"<xs:enumeration value="{i:0>512}"/>"#))
+            .collect();
+        let heavy = schema(&format!(
+            r#"{}<xs:element name="r" type="T"/>"#,
+            string_type(&total)
+        ));
+        assert!(heavy.len() < MAX_SCHEMA_TEXT_BYTES + 64 * 1024);
+        let msg = refusal_of(&heavy);
+        assert!(
+            msg.contains("the enumeration values of the schema hold more than 128 KiB in total")
+                || msg.contains("byte limit"),
+            "{msg}"
+        );
+
+        let count: String = (0..=MAX_ENUMERATION_VALUES)
+            .map(|i| format!(r#"<xs:enumeration value="{i}"/>"#))
+            .collect();
+        let many = schema(&format!(
+            r#"{}<xs:element name="r" type="T"/>"#,
+            string_type(&count)
+        ));
+        assert!(refusal_of(&many).contains("the schema lists more than 4096 enumeration values"));
+    }
+
+    #[test]
+    fn a_full_enumeration_checks_many_short_values_in_bounded_time() {
+        let members: String = (0..MAX_ENUMERATION_VALUES)
+            .map(|i| format!(r#"<xs:enumeration value="c{i}"/>"#))
+            .collect();
+        let s = schema(&format!(
+            r#"{}<xs:element name="r"><xs:complexType><xs:sequence>
+                 <xs:element name="v" type="T" minOccurs="0" maxOccurs="unbounded"/>
+               </xs:sequence></xs:complexType></xs:element>"#,
+            string_type(&members)
+        ));
+        let c = compiled(&s);
+        let doc = format!(
+            "<r>{}</r>",
+            (0..60_000)
+                .map(|i| format!("<v>c{}</v>", i % MAX_ENUMERATION_VALUES))
+                .collect::<String>()
+        );
+        let started = std::time::Instant::now();
+        let got = XSD_OPS.validate(&c, doc.as_bytes());
+        assert!(
+            matches!(&got, Ok(()) | Err(SchemaError::LimitExceeded(_))),
+            "{got:?}"
+        );
+        within(started, 10);
+        let bad = format!("<r><v>c1</v><v>nope</v></r>");
+        assert!(violation_of(&s, &bad).contains("is not one of the enumerated values"));
+    }
+
+    #[test]
+    fn enumeration_intersection_is_charged_before_it_is_computed() {
+        let step = |names: std::ops::Range<usize>| {
+            Arc::new(Facets {
+                enumeration: names.map(|i| format!("v{i}")).collect(),
+                ..Facets::default()
+            })
+        };
+        let ty = SimpleType {
+            builtin: Builtin::String,
+            steps: vec![step(0..2048), step(0..2048)],
+        };
+        // Charging the second step alone (4096) overruns this budget, so the
+        // intersection never runs.
+        let mut tight = Budget::new(5000);
+        assert_eq!(ty.effective_enumeration(&mut tight), Err(LimitExceeded));
+        assert!(tight.used > tight.limit);
+        let mut roomy = Budget::new(1_000_000);
+        let members = ty.effective_enumeration(&mut roomy).unwrap().unwrap();
+        assert_eq!(members.len(), 2048);
+        assert!(members.windows(2).all(|w| w[0] <= w[1]), "sorted");
+    }
+
+    #[test]
+    fn check_cannot_run_without_a_budget_and_stops_when_it_is_spent() {
+        let CompiledSchema::Xsd(c) = compiled(&schema(&format!(
+            r#"{}<xs:element name="r" type="T"/>"#,
+            string_type(r#"<xs:pattern value="a+"/><xs:maxLength value="10"/>"#)
+        ))) else {
+            panic!("expected an xsd schema");
+        };
+        let ty = c.simple(c.elements[c.roots["r"]].ty);
+        assert_eq!(ty.check("aaa", &mut Budget::new(1_000)), Ok(()));
+        assert_eq!(
+            ty.check("aaa", &mut Budget::new(0)),
+            Err(CheckFailure::TooComplex)
+        );
+        assert_eq!(
+            ty.check("bbb", &mut Budget::new(1_000)),
+            Err(violated("does not match the pattern"))
+        );
+        let mut b = Budget::new(10);
+        assert_eq!(b.charge(u64::MAX), Err(LimitExceeded));
+        assert_eq!(b.charge(u64::MAX), Err(LimitExceeded), "saturating");
     }
 }

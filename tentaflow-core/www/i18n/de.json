@@ -10142,7 +10142,8 @@
         "versions_sub_reader": "Versionen lassen sich nicht ändern.",
         "xsd_help_title": "Welche XSD-Muster funktionieren",
         "xsd_help_works": "Ein gewöhnliches Muster in einer einzigen Datei funktioniert: welche Elemente und Attribute das Dokument hat, wie oft sie vorkommen dürfen, die Auswahl einer von mehreren Möglichkeiten und einfache Einschränkungen, z. B. die Länge eines Textes oder eine Liste erlaubter Werte.",
-        "xsd_help_fails": "Ein Muster, das andere Dateien einbindet oder fortgeschrittenere Teile von XSD nutzt, funktioniert nicht – beim Hinzufügen sehen Sie, was fehlt."
+        "xsd_help_fails": "Ein Muster, das andere Dateien einbindet oder fortgeschrittenere Teile von XSD nutzt, funktioniert nicht – beim Hinzufügen sehen Sie, was fehlt.",
+        "xsd_help_limits": "Ein Muster hat auch Größengrenzen: ein Wert in einer Liste erlaubter Werte bis 1 KB (die Listen zusammen bis 128 KB und 4096 Einträge), eine pattern-Einschränkung bis 512 Zeichen, höchstens 1024 Attribute in einem Typ, und alle Muster zusammen müssen in 8 MB Speicher passen."
       },
       "added_existing_title": "Muster {name} gab es bereits",
       "added_existing_version": "Jemand hat es inzwischen hinzugefügt, daher ging der Text als Version {version} hinein.",
@@ -10180,7 +10181,16 @@
         "xsd_hint_list_union": "Verwenden Sie einen einfachen Typ.",
         "xsd_hint_global_attribute": "Deklarieren Sie das Attribut im Element, zu dem es gehört.",
         "xsd_hint_notation": "Entfernen Sie sie.",
-        "xsd_hint_other": "Entfernen Sie sie oder ersetzen Sie sie durch etwas Einfacheres."
+        "xsd_hint_other": "Entfernen Sie sie oder ersetzen Sie sie durch etwas Einfacheres.",
+        "xsd_limit_enum_value": "Einer der erlaubten Werte ist zu lang (höchstens {limit} {limit|Byte|Bytes}). Kürzen Sie ihn oder beschreiben Sie die Werte mit einer pattern-Einschränkung.",
+        "xsd_limit_enum_total": "Die Listen erlaubter Werte sind zusammen zu groß (höchstens {limit} KB). Kürzen Sie sie oder beschreiben Sie die Werte mit einer pattern-Einschränkung.",
+        "xsd_limit_enum_count": "Die Listen erlaubter Werte haben zu viele Einträge (höchstens {limit}). Kürzen Sie sie oder beschreiben Sie die Werte mit einer pattern-Einschränkung.",
+        "xsd_limit_pattern_len": "Eine der pattern-Einschränkungen ist zu lang (höchstens {limit} {limit|Zeichen|Zeichen}). Kürzen Sie sie oder teilen Sie sie in einfachere auf.",
+        "xsd_limit_patterns": "Das Muster hat zu viele pattern-Einschränkungen (höchstens {limit}). Fassen Sie sie zusammen oder entfernen Sie überflüssige.",
+        "xsd_limit_pattern_memory": "Die pattern-Einschränkungen sind zusammen zu aufwendig: Sie brauchen mehr als {limit} KB Speicher. Vereinfachen Sie sie oder entfernen Sie überflüssige.",
+        "xsd_limit_pattern_big": "Eine der pattern-Einschränkungen ist zu aufwendig, z. B. wiederholt sie eine Zeichenklasse sehr oft. Vereinfachen Sie sie.",
+        "xsd_limit_attributes": "Einer der Typen hat zu viele Attribute (höchstens {limit}). Teilen Sie ihn in kleinere auf.",
+        "xsd_limit_compile": "Dieses Muster ist zu komplex, um es anzunehmen. Vereinfachen Sie es: weniger Typen, Attribute und Wiederholungen."
       }
     },
     "topics": {

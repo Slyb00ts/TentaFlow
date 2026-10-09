@@ -11377,7 +11377,8 @@
         "versions_sub_reader": "Wersji nie da się zmienić.",
         "xsd_help_title": "Jakie wzory XSD zadziałają",
         "xsd_help_works": "Zadziała zwykły wzór zapisany w jednym pliku: jakie elementy i atrybuty ma dokument, ile razy mogą wystąpić, wybór jednej z kilku możliwości i proste ograniczenia, np. długość tekstu albo lista dozwolonych wartości.",
-        "xsd_help_fails": "Nie zadziała wzór, który dołącza inne pliki albo używa bardziej zaawansowanych części XSD — przy dodawaniu zobaczysz, czego brakuje."
+        "xsd_help_fails": "Nie zadziała wzór, który dołącza inne pliki albo używa bardziej zaawansowanych części XSD — przy dodawaniu zobaczysz, czego brakuje.",
+        "xsd_help_limits": "Wzór ma też granice rozmiaru: wartość na liście dozwolonych wartości do 1 KB (listy razem do 128 KB i 4096 pozycji), ograniczenie typu pattern do 512 znaków, najwyżej 1024 atrybuty w jednym typie, a wszystkie wzorce razem muszą zmieścić się w 8 MB pamięci."
       },
       "added_existing_title": "Wzór {name} już istniał",
       "added_existing_version": "Ktoś dodał go w międzyczasie, więc tekst trafił do niego jako wersja {version}.",
@@ -11415,7 +11416,16 @@
         "xsd_hint_list_union": "Użyj zwykłego typu prostego.",
         "xsd_hint_global_attribute": "Zadeklaruj atrybut wewnątrz elementu, do którego należy.",
         "xsd_hint_notation": "Usuń ją.",
-        "xsd_hint_other": "Usuń ją albo zastąp prostszą."
+        "xsd_hint_other": "Usuń ją albo zastąp prostszą.",
+        "xsd_limit_enum_value": "Jedna z dozwolonych wartości jest za długa (najwyżej {limit} {limit|bajt|bajty|bajtów}). Skróć ją albo opisz wartości wzorcem pattern.",
+        "xsd_limit_enum_total": "Listy dozwolonych wartości są razem za duże (najwyżej {limit} KB). Skróć je albo opisz wartości wzorcem pattern.",
+        "xsd_limit_enum_count": "Na listach dozwolonych wartości jest za dużo pozycji (najwyżej {limit}). Skróć je albo opisz wartości wzorcem pattern.",
+        "xsd_limit_pattern_len": "Jeden ze wzorców pattern jest za długi (najwyżej {limit} {limit|znak|znaki|znaków}). Skróć go albo podziel na prostsze.",
+        "xsd_limit_patterns": "We wzorze jest za dużo ograniczeń typu pattern (najwyżej {limit}). Połącz je albo usuń zbędne.",
+        "xsd_limit_pattern_memory": "Wzorce pattern są razem zbyt rozbudowane: potrzebują ponad {limit} KB pamięci. Uprość je albo usuń zbędne.",
+        "xsd_limit_pattern_big": "Jeden ze wzorców pattern jest zbyt rozbudowany, np. powtarza wiele razy klasę znaków. Uprość go.",
+        "xsd_limit_attributes": "Jeden z typów ma za dużo atrybutów (najwyżej {limit}). Podziel go na mniejsze.",
+        "xsd_limit_compile": "Ten wzór jest zbyt złożony, żeby go przyjąć. Uprość go: mniej typów, atrybutów i powtórzeń."
       }
     },
     "topics": {

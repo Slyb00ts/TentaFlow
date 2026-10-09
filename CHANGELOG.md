@@ -154,6 +154,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   Profil HL7 musi być obiektem JSON (tablica była czytana pozycyjnie i dawała
   profil bez wymagań), a element `xs:all` z `maxOccurs="0"` nadal jest sprawdzany
   przy rejestracji.
+- Koszt sprawdzania wzorów XSD jest liczony jednym licznikiem (`Budget`), który
+  przechodzi przez każdą kosztowną operację: sprawdzenie wartości (długość
+  wartości razy waga wzorców), przecięcie wyliczeń (naliczane przed
+  obliczeniem), automaty modeli treści, atrybuty i rejestrację wzoru. Walidacja
+  dokumentu ma limit 50 mln jednostek (`schema_check_too_complex`), porównanie
+  wersji 20 mln (`bus.schema_compare_too_complex`), a kompilacja 5 mln.
+  Wyliczenia są zbiorami haszowanymi, atrybuty typu mają indeks, a duplikaty
+  atrybutów w dokumencie wykrywa walidator w czasie liniowym. Przy dodawaniu
+  wzoru obowiązują twarde limity (zmieniają się razem z kartą „Jakie wzory XSD
+  zadziałają”): wartość wyliczenia do 1 KB, wszystkie wyliczenia razem do
+  128 KB i 4096 wartości, wzorzec `pattern` do 512 znaków, do 256 wzorców,
+  program jednego wzorca do 256 KB (cyfry `\d` są Unicode, więc PESEL `\d{11}`
+  potrzebuje 64 KB, a `\p{L}{60}` jest odrzucany) oraz 8 MB pamięci wszystkich
+  wzorców razem, najwyżej 1024 atrybuty w typie. Wzór przekraczający limit jest
+  odrzucany z opisem po polsku. Pamięć podręczna skompilowanych wzorów magistrali
+  ma granicę 1024 wpisów i 256 MB (najdawniej użyty wypada pierwszy), a zmiana
+  wzoru innego tematu nie wymusza już ponownej kompilacji niezmienionych.
 
 - Katalog podmiotów dla okien „Nadaj dostęp” i „Ukrywanie danych”:
   `SubjectDirectoryRequest { kind, query }` zwraca do 50 osób, grup albo

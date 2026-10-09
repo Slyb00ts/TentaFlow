@@ -227,6 +227,17 @@ pub enum CompiledSchema {
     StoredOnly(SchemaType),
 }
 
+impl CompiledSchema {
+    /// Resident bytes beyond what the schema text suggests (compiled
+    /// regexes and their caches), for cache accounting.
+    pub fn extra_bytes(&self) -> usize {
+        match self {
+            CompiledSchema::Xsd(c) => c.extra_bytes(),
+            _ => 0,
+        }
+    }
+}
+
 /// Implemented once per `SchemaType`. See the module header for the split
 /// between registration-time (`compile`, `check_compatibility`,
 /// `derive_subschema`) and publish-time (`validate`) responsibilities.

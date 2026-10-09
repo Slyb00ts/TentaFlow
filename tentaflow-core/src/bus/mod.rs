@@ -2392,12 +2392,28 @@ impl ConsumerCursor {
 struct ResolvedSchema {
     version: u32,
     schema_ref_id: u32,
-    /// `schema_registry::generation()` at the moment this was resolved —
-    /// still valid iff it matches the CURRENT value when looked up.
-    generation: u64,
+    /// Hash of the stored text this was compiled from; with `version`,
+    /// `schema_ref_id` and `schema_type` it is the identity of the compile.
+    content_hash: String,
+    /// `schema_registry::generation()` at the moment this was resolved (or
+    /// last confirmed unchanged) — still valid iff it matches the CURRENT
+    /// value when looked up. Re-stamped in place when a global bump proves
+    /// this subject's effective schema did not change.
+    generation: AtomicU64,
     schema_type: schema_registry::SchemaType,
     compiled: schema_registry::CompiledSchema,
+    /// Estimated resident bytes (`SCHEMA_CACHE_MAX_BYTES` accounting).
+    weight: usize,
+    /// `BusService::schema_cache_clock` at the last lookup; the oldest entry
+    /// is evicted first.
+    last_used: AtomicU64,
 }
+
+/// `schema_cache` bounds: entries, and estimated resident bytes of the
+/// compiled schemas. A registry may hold far more subjects than a node ever
+/// publishes to, and one XSD alone can carry up to its 4 MiB pattern budget.
+const SCHEMA_CACHE_MAX_ENTRIES: usize = 1024;
+const SCHEMA_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 pub struct BusService {
     /// plan-app-platform §7 W4: the TentaBus instance every table this
@@ -2500,14 +2516,19 @@ pub struct BusService {
     /// counter and retires every entry at once.
     topic_config_cache: DashMap<TopicKey, (u64, Arc<topics::TopicConfig>)>,
     /// PLAN-F3 §4.2: compiled-validator cache, keyed `(org_id, subject)`.
-    /// `resolve_validator` treats an entry as stale (and recompiles) as soon
-    /// as its captured `ResolvedSchema::generation` no longer matches
+    /// `resolve_validator` re-reads the subject as soon as its captured
+    /// `ResolvedSchema::generation` no longer matches
     /// `schema_registry::generation()` — bumped by every local registry
-    /// write AND by `sync::core_materializer` applying a replicated one, so
-    /// a compile only ever happens at registration time, never on the
-    /// publish hot path for a topic whose schema hasn't changed. Purged for
-    /// an org by `purge_org`, same as `topic_config_cache`.
+    /// write AND by `sync::core_materializer` applying a replicated one —
+    /// and recompiles only when that subject's effective version or content
+    /// actually changed, so a compile never happens on the publish hot path
+    /// for a topic whose schema hasn't changed. Bounded by
+    /// `SCHEMA_CACHE_MAX_ENTRIES` and `SCHEMA_CACHE_MAX_BYTES`, least
+    /// recently used first. Purged for an org by `purge_org`, same as
+    /// `topic_config_cache`.
     schema_cache: DashMap<TopicKey, Arc<ResolvedSchema>>,
+    /// Source of `ResolvedSchema::last_used` stamps.
+    schema_cache_clock: AtomicU64,
     /// PLAN-F3 §4.3: total records that failed schema validation across
     /// every mode (`warn` counts and keeps the record; `dlq` counts and
     /// quarantines it) — the schema-registry counterpart to
@@ -3004,6 +3025,7 @@ impl BusService {
             org_stored_bytes: DashMap::new(),
             topic_config_cache: DashMap::new(),
             schema_cache: DashMap::new(),
+            schema_cache_clock: AtomicU64::new(0),
             schema_violations_total: AtomicU64::new(0),
             schema_check_too_complex_total: AtomicU64::new(0),
             schema_dlq_write_failures_total: AtomicU64::new(0),
@@ -4151,7 +4173,8 @@ impl BusService {
         let key: TopicKey = (org_id.to_string(), subject.to_string());
         let current_generation = schema_registry::generation();
         if let Some(entry) = self.schema_cache.get(&key) {
-            if entry.generation == current_generation {
+            if entry.generation.load(Ordering::Acquire) == current_generation {
+                self.touch_schema(&entry);
                 return Ok(Some(entry.clone()));
             }
         }
@@ -4165,6 +4188,23 @@ impl BusService {
             self.schema_cache.remove(&key);
             return Ok(None);
         };
+        let content_hash = schema_registry::content_hash(&effective.schema_text);
+        // The generation is process-global, so it also moves for an
+        // unrelated subject or org. Re-reading this subject's row is cheap;
+        // recompiling every subject after each registry write is not.
+        if let Some(entry) = self.schema_cache.get(&key) {
+            if entry.version == effective.version
+                && entry.schema_ref_id == effective.schema_ref_id
+                && entry.schema_type == effective.schema_type
+                && entry.content_hash == content_hash
+            {
+                entry
+                    .generation
+                    .store(current_generation, Ordering::Release);
+                self.touch_schema(&entry);
+                return Ok(Some(entry.clone()));
+            }
+        }
         // Every schema that reached storage already compiled once at
         // registration; a failure here means a corrupt row.
         let compiled = effective
@@ -4177,15 +4217,58 @@ impl BusService {
                     effective.version
                 ))
             })?;
+        let weight = effective
+            .schema_text
+            .len()
+            .saturating_mul(4)
+            .saturating_add(compiled.extra_bytes());
         let resolved = Arc::new(ResolvedSchema {
             version: effective.version,
             schema_ref_id: effective.schema_ref_id,
-            generation: current_generation,
+            content_hash,
+            generation: AtomicU64::new(current_generation),
             schema_type: effective.schema_type,
             compiled,
+            weight,
+            last_used: AtomicU64::new(self.schema_cache_clock.fetch_add(1, Ordering::Relaxed)),
         });
-        self.schema_cache.insert(key, resolved.clone());
+        self.schema_cache.insert(key.clone(), resolved.clone());
+        self.evict_schema_cache(&key, SCHEMA_CACHE_MAX_ENTRIES, SCHEMA_CACHE_MAX_BYTES);
         Ok(Some(resolved))
+    }
+
+    fn touch_schema(&self, entry: &ResolvedSchema) {
+        entry.last_used.store(
+            self.schema_cache_clock.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Drops the least recently used entries (never `keep`, the one just
+    /// inserted) until the cache fits its entry and byte bounds. Runs only on
+    /// a miss, which already paid for a compile, so a scan is affordable.
+    fn evict_schema_cache(&self, keep: &TopicKey, max_entries: usize, max_bytes: usize) {
+        loop {
+            let mut bytes = 0usize;
+            let mut oldest: Option<(u64, TopicKey)> = None;
+            for entry in self.schema_cache.iter() {
+                bytes = bytes.saturating_add(entry.value().weight);
+                if entry.key() == keep {
+                    continue;
+                }
+                let stamp = entry.value().last_used.load(Ordering::Relaxed);
+                if oldest.as_ref().is_none_or(|(s, _)| stamp < *s) {
+                    oldest = Some((stamp, entry.key().clone()));
+                }
+            }
+            if self.schema_cache.len() <= max_entries && bytes <= max_bytes {
+                return;
+            }
+            let Some((_, victim)) = oldest else {
+                return;
+            };
+            self.schema_cache.remove(&victim);
+        }
     }
 
     /// PLAN-F3 §5.4: derives the sub-schema `subject`/`version` (`None` =
@@ -19687,6 +19770,77 @@ mod tests {
             records[1].schema_id, 0,
             "a validated record carries the schema id"
         );
+    }
+
+    fn register_json_subject(svc: &BusService, subject: &str) {
+        schema_registry::registry::register(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            subject,
+            schema_registry::SchemaType::JsonSchema,
+            r#"{"type":"object"}"#,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_registry_write_elsewhere_does_not_recompile_an_unchanged_subject() {
+        let (_tmp, svc) = test_service();
+        register_json_subject(&svc, "alpha");
+        let first = svc.resolve_validator("org-1", "alpha").unwrap().unwrap();
+        // Another subject's registration bumps the process-global generation.
+        register_json_subject(&svc, "beta");
+        let again = svc.resolve_validator("org-1", "alpha").unwrap().unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "an unchanged subject keeps its compiled schema across a global bump"
+        );
+        assert_eq!(
+            again.generation.load(Ordering::Acquire),
+            schema_registry::generation(),
+            "the entry is re-stamped, so the next lookup needs no database read"
+        );
+        // A new version of the subject itself does recompile.
+        schema_registry::registry::register(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "alpha",
+            schema_registry::SchemaType::JsonSchema,
+            r#"{"type":"object","description":"second"}"#,
+            None,
+            None,
+        )
+        .unwrap();
+        let changed = svc.resolve_validator("org-1", "alpha").unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(changed.version, 2);
+    }
+
+    #[test]
+    fn the_compiled_schema_cache_evicts_the_least_recently_used_entries() {
+        let (_tmp, svc) = test_service();
+        for name in ["s1", "s2", "s3", "s4"] {
+            register_json_subject(&svc, name);
+        }
+        for name in ["s1", "s2", "s3"] {
+            svc.resolve_validator("org-1", name).unwrap().unwrap();
+        }
+        // s1 is the oldest; touching it makes s2 the oldest.
+        svc.resolve_validator("org-1", "s1").unwrap().unwrap();
+        svc.resolve_validator("org-1", "s4").unwrap().unwrap();
+        let keep: TopicKey = ("org-1".to_string(), "s4".to_string());
+        svc.evict_schema_cache(&keep, 3, usize::MAX);
+        let mut left: Vec<String> = svc.schema_cache.iter().map(|e| e.key().1.clone()).collect();
+        left.sort();
+        assert_eq!(left, ["s1", "s3", "s4"]);
+        // A byte bound evicts too, but never the entry just inserted.
+        svc.evict_schema_cache(&keep, usize::MAX, 0);
+        let left: Vec<String> = svc.schema_cache.iter().map(|e| e.key().1.clone()).collect();
+        assert_eq!(left, ["s4"]);
     }
 
     const TREE_XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:complexType name="node"><xs:sequence><xs:element name="child" type="node" minOccurs="0"/></xs:sequence></xs:complexType><xs:element name="tree" type="node"/></xs:schema>"#;
