@@ -1023,7 +1023,7 @@ pub enum BusServiceError {
     /// `SchemaError::Unsupported` surfaced to a caller: the requested
     /// operation has no implementation for this schema type in this build
     /// (every operation but `compile`'s shape smoke-check, for
-    /// `avro`/`protobuf`/`thrift` until F4).
+    /// `protobuf`/`thrift` until F4).
     #[error("{operation} is not supported for {} schemas in this build", schema_type.as_str())]
     SchemaTypeUnsupported {
         schema_type: schema_registry::SchemaType,
@@ -19399,9 +19399,9 @@ mod tests {
             &svc.db,
             svc.instance_id(),
             "org-1",
-            "events.avro",
-            schema_registry::SchemaType::Avro,
-            r#"{"type":"record","name":"X","fields":[]}"#,
+            "events.proto",
+            schema_registry::SchemaType::Protobuf,
+            "syntax = \"proto3\"; message X {}",
             Some(schema_registry::Compatibility::None),
             None,
         )
@@ -19417,7 +19417,7 @@ mod tests {
                 &ctx,
                 "orders.events",
                 topics::TopicOptions {
-                    schema_id: Some("events.avro".to_string()),
+                    schema_id: Some("events.proto".to_string()),
                     ..Default::default()
                 },
             )
@@ -19437,9 +19437,9 @@ mod tests {
             &svc.db,
             svc.instance_id(),
             "org-1",
-            "events.avro",
-            schema_registry::SchemaType::Avro,
-            r#"{"type":"record","name":"X","fields":[]}"#,
+            "events.proto",
+            schema_registry::SchemaType::Protobuf,
+            "syntax = \"proto3\"; message X {}",
             Some(schema_registry::Compatibility::None),
             None,
         )
@@ -19456,7 +19456,7 @@ mod tests {
                 &ctx,
                 "orders.events",
                 topics::TopicOptions {
-                    schema_id: Some("events.avro".to_string()),
+                    schema_id: Some("events.proto".to_string()),
                     validation: Some(topics::ValidationMode::Warn),
                     ..Default::default()
                 },
@@ -19596,10 +19596,15 @@ mod tests {
     }
 
     #[test]
-    fn enabling_validation_is_accepted_for_xsd_and_profile_subjects_and_refused_for_binary_kinds() {
-        use schema_registry::SchemaType::{Avro, Hl7v2Profile, Xsd};
+    fn enabling_validation_is_accepted_for_validating_kinds_and_refused_for_the_rest() {
+        use schema_registry::SchemaType::{Avro, Hl7v2Profile, Protobuf, Xsd};
         for (kind, text, ct) in [
             (Xsd, PATIENT_XSD, "application/xml"),
+            (
+                Avro,
+                r#"{"type":"record","name":"X","fields":[]}"#,
+                "application/octet-stream",
+            ),
             (
                 Hl7v2Profile,
                 r#"{"required_segments":[]}"#,
@@ -19615,8 +19620,8 @@ mod tests {
             }
         }
         let err = bind_stored_subject_at_create(
-            Avro,
-            r#"{"type":"record","name":"X","fields":[]}"#,
+            Protobuf,
+            "syntax = \"proto3\"; message X {}",
             "application/octet-stream",
             Some(topics::ValidationMode::Warn),
         )
@@ -19736,6 +19741,17 @@ mod tests {
         mode: topics::ValidationMode,
         payloads: &[&str],
     ) -> (tempfile::TempDir, BusService, BusCallContext, PublishResult) {
+        let payloads: Vec<&[u8]> = payloads.iter().map(|p| p.as_bytes()).collect();
+        publish_validated_bytes(kind, schema_text, content_type, mode, &payloads)
+    }
+
+    fn publish_validated_bytes(
+        kind: schema_registry::SchemaType,
+        schema_text: &str,
+        content_type: &str,
+        mode: topics::ValidationMode,
+        payloads: &[&[u8]],
+    ) -> (tempfile::TempDir, BusService, BusCallContext, PublishResult) {
         let (tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
         schema_registry::registry::register(
@@ -19767,7 +19783,13 @@ mod tests {
                 PublishBatch {
                     partition: None,
                     producer: None,
-                    records: payloads.iter().map(|p| record(p)).collect(),
+                    records: payloads
+                        .iter()
+                        .map(|p| PublishRecord {
+                            payload: Bytes::copy_from_slice(p),
+                            ..record("")
+                        })
+                        .collect(),
                 },
             )
             .unwrap();
@@ -19871,6 +19893,192 @@ mod tests {
         assert_ne!(
             records[1].schema_id, 0,
             "a validated record carries the schema id"
+        );
+    }
+
+    const ORDER_AVRO: &str = r#"{"type":"record","name":"Order","fields":[{"name":"id","type":"long"},{"name":"customer","type":"string"}]}"#;
+
+    /// An `Order` datum: id (zigzag varint, small values only) and customer.
+    fn order_datum(id: u8, customer: &str) -> Vec<u8> {
+        let mut out = vec![id << 1, (customer.len() as u8) << 1];
+        out.extend_from_slice(customer.as_bytes());
+        out
+    }
+
+    fn dlq_headers(
+        svc: &BusService,
+        ctx: &BusCallContext,
+        topic: &str,
+    ) -> Vec<Vec<(String, String)>> {
+        svc.open_consumer(
+            ctx,
+            "dlq-headers",
+            &[topic.to_string()],
+            ConsumerConfig {
+                commit_mode: groups::CommitMode::Explicit,
+            },
+        )
+        .unwrap()
+        .fetch(1024, 20)
+        .unwrap()
+        .records
+        .iter()
+        .map(|r| {
+            r.headers
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        String::from_utf8_lossy(k).into_owned(),
+                        String::from_utf8_lossy(v).into_owned(),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+    }
+
+    #[test]
+    fn avro_dlq_mode_diverts_only_the_invalid_datum_and_never_leaks_the_payload() {
+        let good = order_datum(7, "Ala");
+        let truncated = order_datum(8, "SECRETVALUE")[..6].to_vec();
+        let mut trailing = order_datum(9, "SECRETVALUE");
+        trailing.push(0);
+        // `application/octet-stream` and any other content type bind alike.
+        for content_type in ["application/octet-stream", "avro/binary"] {
+            let (_tmp, svc, ctx, result) = publish_validated_bytes(
+                schema_registry::SchemaType::Avro,
+                ORDER_AVRO,
+                content_type,
+                topics::ValidationMode::Dlq,
+                &[&good, &truncated, &trailing],
+            );
+            assert_eq!(
+                (result.accepted, result.schema_rejected),
+                (1, 2),
+                "{content_type}"
+            );
+            assert_eq!(
+                fetch_all(&svc, &ctx, "validated.events"),
+                vec![good.clone()]
+            );
+            assert_eq!(
+                fetch_all(&svc, &ctx, "__dlq.validated.events"),
+                vec![truncated.clone(), trailing.clone()]
+            );
+            assert_eq!(svc.schema_violations_total(), 2);
+            let headers = dlq_headers(&svc, &ctx, "__dlq.validated.events");
+            let message = |i: usize| {
+                headers[i]
+                    .iter()
+                    .find(|(k, _)| k == "dlq.error_message")
+                    .map(|(_, v)| v.clone())
+                    .unwrap()
+            };
+            assert!(
+                message(0).contains("/customer: declared length exceeds the remaining payload"),
+                "{}",
+                message(0)
+            );
+            assert!(
+                message(1).contains("<root>: bytes remain after the value"),
+                "{}",
+                message(1)
+            );
+            for record in &headers {
+                for (name, value) in record {
+                    assert!(
+                        !value.contains("SECRETVALUE"),
+                        "header {name} leaks the payload"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn avro_validation_stamps_only_the_datum_that_passed_in_warn_mode() {
+        let (_tmp, svc, ctx, result) = publish_validated_bytes(
+            schema_registry::SchemaType::Avro,
+            ORDER_AVRO,
+            "application/octet-stream",
+            topics::ValidationMode::Warn,
+            &[&[0xff, 0xff], &order_datum(1, "x")],
+        );
+        assert_eq!(result.accepted, 2);
+        let records = svc
+            .open_consumer(
+                &ctx,
+                "warn-reader",
+                &["validated.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap()
+            .fetch(1024, 20)
+            .unwrap()
+            .records;
+        assert_eq!(records[0].schema_id, 0);
+        assert_ne!(records[1].schema_id, 0);
+    }
+
+    #[test]
+    fn an_avro_datum_the_check_gave_up_on_is_diverted_under_its_own_reason() {
+        let nulls = r#"{"type":"record","name":"R","fields":[{"name":"a","type":{"type":"array","items":"null"}}]}"#;
+        // Two billion nulls fit in five bytes of payload: not provably wrong, not checkable.
+        let bomb: Vec<u8> = vec![0x80, 0x88, 0xde, 0xbc, 0x0e, 0x00];
+        let (_tmp, svc, ctx, result) = publish_validated_bytes(
+            schema_registry::SchemaType::Avro,
+            nulls,
+            "application/octet-stream",
+            topics::ValidationMode::Dlq,
+            &[&[0x00], &bomb],
+        );
+        assert_eq!((result.accepted, result.schema_rejected), (1, 1));
+        let headers = dlq_headers(&svc, &ctx, "__dlq.validated.events");
+        assert!(headers[0].contains(&(
+            "dlq.reason".to_string(),
+            "schema_check_too_complex".to_string()
+        )));
+        assert_eq!(svc.schema_check_too_complex_total(), 1);
+        assert_eq!(svc.schema_violations_total(), 0);
+    }
+
+    #[test]
+    fn avro_versions_register_under_the_default_backward_check() {
+        let (_tmp, svc) = test_service();
+        let register = |text: &str| {
+            schema_registry::registry::register(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                "orders",
+                schema_registry::SchemaType::Avro,
+                text,
+                None,
+                None,
+            )
+        };
+        assert_eq!(register(ORDER_AVRO).unwrap().version, 1);
+        let required = ORDER_AVRO.replace(
+            r#"{"name":"customer","type":"string"}"#,
+            r#"{"name":"customer","type":"string"},{"name":"region","type":"string"}"#,
+        );
+        let err = register(&required).unwrap_err();
+        assert!(
+            matches!(&err, BusServiceError::SchemaIncompatible { mode: "backward", detail, .. }
+                if detail.contains("requires field 'region'")),
+            "{err:?}"
+        );
+        let optional = required.replace(
+            r#"{"name":"region","type":"string"}"#,
+            r#"{"name":"region","type":"string","default":"eu"}"#,
+        );
+        assert_eq!(register(&optional).unwrap().version, 2);
+        let err = register("not json").unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::InvalidArgument(_)),
+            "{err:?}"
         );
     }
 

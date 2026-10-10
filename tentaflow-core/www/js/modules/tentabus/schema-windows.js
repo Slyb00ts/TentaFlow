@@ -48,6 +48,9 @@ const JSON_TEXT_TYPES = new Set(['json_schema', 'avro', 'hl7v2_profile']);
 /** The shape of an HL7 v2 profile, shown in the add window (its keys are the server's, not translated). */
 export const HL7_PROFILE_EXAMPLE = '{"description": "Przyjęcie pacjenta", "required_segments": ["PID"], "required_fields": ["PID-3", "PID-5"]}';
 
+/** The shape of an Avro schema, shown in the add window (its keys are Avro's, not translated). */
+export const AVRO_SCHEMA_EXAMPLE = '{"type": "record", "name": "Order", "fields": [{"name": "id", "type": "long"}, {"name": "customer", "type": "string"}]}';
+
 const byteLength = (text) => new TextEncoder().encode(String(text)).length;
 
 // ---------------------------------------------------------------------------
@@ -359,6 +362,12 @@ const sameTypes = (a, b) => a !== undefined && JSON.stringify(a) === JSON.string
 // The XSD checker names the element one side still requires (xsd.rs `required_names`).
 const XSD_REQUIRES = /the (new|old) schema (?:still )?requires (?:element ('[^']*')|one of the elements ((?:'[^']*'(?:, )?)+))/;
 
+// The Avro checker's sentences (avro.rs `Why::render`): a field one side still requires without a
+// default, a type the other side cannot read, an enum symbol that disappeared.
+const AVRO_REQUIRES = /the (new|old) schema requires field '([^']*)' of record '[^']*', which has no default/;
+const AVRO_TYPE = /(<root>|\/\S*): (.+?) written by the (?:old|new) schema cannot be read as (.+?) by the (?:old|new) schema/;
+const AVRO_ENUM = /enum '([^']*)': symbol '([^']*)' of the (?:old|new) schema is unknown/;
+
 const quotedList = (items) => listText(items.map((item) => T('schemas.incompat.quoted', { item })));
 
 /**
@@ -414,6 +423,18 @@ export function incompatibilityReason({ mode, detail, newText }) {
     const elements = [...(xsd[2] || xsd[3]).matchAll(/'([^']*)'/g)].map((x) => x[1]);
     return requirementReason(xsd[1], { segments: [], fields: [], elements }, elements.length);
   }
+  // An Avro schema: `… the new schema requires field 'b' of record 'R', which has no default …`.
+  const avroRequires = AVRO_REQUIRES.exec(detail);
+  if (avroRequires) {
+    const [, side, name] = avroRequires;
+    return side === 'new'
+      ? { reason: T('schemas.incompat.required_new', { field: name }), fix: T('schemas.incompat.avro_fix_required_new', { field: name }) }
+      : { reason: T('schemas.incompat.required_old', { field: name }), fix: T('schemas.incompat.fix_required_old', { field: name }) };
+  }
+  const avroType = AVRO_TYPE.exec(detail);
+  if (avroType) return { reason: T('schemas.incompat.avro_type', { path: avroType[1] === '<root>' ? '/' : avroType[1], from: avroType[2], to: avroType[3] }), fix: generic };
+  const avroEnum = AVRO_ENUM.exec(detail);
+  if (avroEnum) return { reason: T('schemas.incompat.avro_enum', { name: avroEnum[1], symbol: avroEnum[2] }), fix: generic };
   let field = quoted(/^property '([^']+)' is required by the reader schema but not guaranteed present by the writer schema/);
   if (field != null) {
     // The reader is the new version under "backward", the old one under "forward".
@@ -479,6 +500,16 @@ const XSD_LIMIT_REFUSALS = [
   [/^a type declares more than (\d+) attributes/, 'attributes'],
   [/^the schema exceeds the compile work limit/, 'compile'],
 ];
+// The static caps of avro.rs (compile refusals); the captured number is the limit.
+const AVRO_LIMIT_REFUSALS = [
+  [/^the schema has more than (\d+) types/, 'types'],
+  [/ has more than (\d+) fields$/, 'fields'],
+  [/^a union has more than (\d+) branches/, 'union'],
+  [/ has more than (\d+) symbols$/, 'symbols'],
+  [/ is larger than (\d+) bytes$/, 'fixed'],
+  [/^the schema is nested deeper than (\d+) levels/, 'depth'],
+  [/^a (?:doc|custom attribute) is longer than (\d+) bytes$/, 'text'],
+];
 const NUMBER_TYPE_ADVICE = { float: 'decimal', double: 'decimal', long: 'integer', short: 'int', byte: 'int', unsignedInt: 'integer', unsignedLong: 'integer', nonNegativeInteger: 'integer', positiveInteger: 'integer', negativeInteger: 'integer' };
 
 /**
@@ -503,6 +534,19 @@ export function textRefusalReason(schemaType, serverText) {
     if (/entries, exceeding the \d+-entry limit/.test(text)) return T('schemas.refused.hl7_too_many');
     if (/^description exceeds/.test(text)) return T('schemas.refused.hl7_description');
     if (/^not a valid HL7 v2 profile/.test(text)) return T('schemas.refused.hl7_shape');
+    return null;
+  }
+  if (schemaType === 'avro') {
+    if (/^the schema is not valid JSON/.test(text)) return T('schemas.text_not_json');
+    if (/^not a valid Avro schema/.test(text)) return T('schemas.refused.avro_invalid');
+    if (/^the schema can never produce a value/.test(text)) return T('schemas.refused.avro_no_value');
+    if (/does not fit the first branch of its union/.test(text)) return T('schemas.refused.avro_default');
+    if (/^the default of field '[^']*' does not fit its type/.test(text)) return T('schemas.refused.avro_default_type');
+    if (/^a record lists (?:a field that is not an object|its fields in something that is not an array)/.test(text)) return T('schemas.refused.avro_fields_shape');
+    for (const [re, key] of AVRO_LIMIT_REFUSALS) {
+      const m = re.exec(text);
+      if (m) return T(`schemas.refused.avro_limit_${key}`, { limit: m[1] });
+    }
     return null;
   }
   if (schemaType === 'xsd') {
@@ -707,6 +751,7 @@ function wireTextField(win, sync, formatOf) {
 export function addTextHint(schemaType) {
   if (schemaType === 'hl7v2_profile') return T('schemas.add.text_hint_hl7v2_profile', { example: HL7_PROFILE_EXAMPLE });
   if (schemaType === 'xsd') return T('schemas.add.text_hint_xsd');
+  if (schemaType === 'avro') return T('schemas.add.text_hint_avro', { example: AVRO_SCHEMA_EXAMPLE });
   return T('schemas.add.text_hint');
 }
 

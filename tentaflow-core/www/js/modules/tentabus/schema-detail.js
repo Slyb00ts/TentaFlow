@@ -7,7 +7,8 @@
 // one version, read-only in tf-code-editor with "Kopiuj" and "Pobierz" and
 // the pattern's own description (`description` of a JSON Schema or an HL7
 // profile, `doc` of an Avro record, `xs:annotation/xs:documentation` of an
-// XSD), an HL7 profile spelled out as required segments and fields, the
+// XSD), an HL7 profile spelled out as required segments and fields, an Avro
+// record as a table of its fields, the
 // versions with "Wycofaj" per row, and the compatibility card with "Zmień".
 // Every change goes through a window (schema-windows.js) and comes back as a
 // note over the page.
@@ -128,6 +129,39 @@ export function hl7ProfileView(text) {
   return { segments: orderSegments(segments), fields: fields.map((address) => ({ address, label: hl7FieldLabel(address) })) };
 }
 
+/** A field type of an Avro schema as one short phrase: `array<string>`, `null | long`, `record Line`. */
+function avroTypeLabel(type) {
+  if (typeof type === 'string') return type;
+  if (Array.isArray(type)) return type.map(avroTypeLabel).join(' | ');
+  if (!type || typeof type !== 'object') return '?';
+  if (type.logicalType && typeof type.type === 'string') return `${type.type} (${type.logicalType})`;
+  if (type.type === 'array') return `array<${avroTypeLabel(type.items)}>`;
+  if (type.type === 'map') return `map<${avroTypeLabel(type.values)}>`;
+  if (['record', 'enum', 'fixed'].includes(type.type)) return `${type.type} ${type.name}`;
+  return avroTypeLabel(type.type);
+}
+
+const avroAllowsNull = (type) => type === 'null' || (Array.isArray(type) && type.some(avroAllowsNull));
+
+/**
+ * The fields of an Avro record schema, spelled out: `[{ name, type, optional }]`
+ * where a field is optional when it has a default or its type allows `null`
+ * (the server asks for a default when a new version adds a field). `null` when
+ * the text is not a record schema.
+ */
+export function avroFieldsView(text) {
+  let root;
+  try {
+    root = JSON.parse(String(text || ''));
+  } catch {
+    return null;
+  }
+  if (!root || typeof root !== 'object' || Array.isArray(root) || root.type !== 'record' || !Array.isArray(root.fields)) return null;
+  return root.fields
+    .filter((f) => f && typeof f === 'object' && typeof f.name === 'string')
+    .map((f) => ({ name: f.name, type: avroTypeLabel(f.type), optional: 'default' in f || avroAllowsNull(f.type) }));
+}
+
 /**
  * The text as the page shows it: a pattern written in JSON is laid out with
  * indentation (patterns sent over REST often arrive on one line); "Kopiuj"
@@ -232,6 +266,14 @@ function pageHtml(name) {
                 </tf-table>
               </div>
             </div>
+          </div>
+          <div class="tb-profile" data-role="avro" hidden>
+            <label class="tb-profile-label">${escapeHtml(T('schemas.detail.avro_fields'))}</label>
+            <tf-table data-role="avro-fields">
+              <tf-column key="field" label="${escapeAttr(T('schemas.detail.profile_field'))}" renderer="html"></tf-column>
+              <tf-column key="type" label="${escapeAttr(T('schemas.detail.avro_type'))}" renderer="html" fill></tf-column>
+              <tf-column key="presence" label="${escapeAttr(T('schemas.detail.avro_presence'))}" renderer="html"></tf-column>
+            </tf-table>
           </div>
           <div class="muted" data-role="text-note"></div>
           <tf-code-editor data-role="code" readonly aria-label="${escapeAttr(T('schemas.detail.text_label'))}"></tf-code-editor>
@@ -442,6 +484,7 @@ function paintText(body, view, effective) {
   setText(aboutEl, about);
   aboutEl.hidden = !about;
   paintProfile(body, ready && info.schemaType === 'hl7v2_profile' ? hl7ProfileView(shown.text) : null);
+  paintAvroFields(body, ready && info.schemaType === 'avro' ? avroFieldsView(shown.text) : null);
   if (ready && editor.__tbText !== `${info.schemaType}\u0000${shown.text}`) {
     editor.__tbText = `${info.schemaType}\u0000${shown.text}`;
     editor.setAttribute('language', editorLanguage(info.schemaType));
@@ -464,6 +507,18 @@ function paintProfile(body, profile) {
     field: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(f.address)}</span></span>`,
     contains: f.label ? escapeHtml(f.label) : '<span class="tf-table__cell-sub">—</span>',
     _key: f.address,
+  })));
+}
+
+function paintAvroFields(body, fields) {
+  const el = body.querySelector('[data-role="avro"]');
+  el.hidden = !fields?.length;
+  if (!fields?.length) return;
+  setRowsIfChanged(body.querySelector('[data-role="avro-fields"]'), fields.map((f) => ({
+    field: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(f.name)}</span></span>`,
+    type: `<span class="tf-table__cell--mono">${escapeHtml(f.type)}</span>`,
+    presence: escapeHtml(T(f.optional ? 'schemas.detail.avro_optional' : 'schemas.detail.avro_required')),
+    _key: f.name,
   })));
 }
 

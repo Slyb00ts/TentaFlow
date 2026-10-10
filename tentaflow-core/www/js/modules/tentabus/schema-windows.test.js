@@ -20,7 +20,7 @@ if (typeof globalThis.DOMParser === 'undefined' && window.DOMParser) globalThis.
 
 const {
   subjectNameProblem, schemaTextProblem, buildRegisterRequest, buildDeleteRequest, jsonSchemaChanges, parseIncompatible,
-  profileChanges, xsdChanges, hl7DropOffer, dropRequired, HL7_PROFILE_EXAMPLE,
+  profileChanges, xsdChanges, hl7DropOffer, dropRequired, HL7_PROFILE_EXAMPLE, AVRO_SCHEMA_EXAMPLE, addTextHint,
   addedNotice, incompatibilityReason, refusalHtml, boundTopics, effectiveVersion, versionImpact, versionDeprecateImpact, subjectDeprecateImpact,
   openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete,
 } = await import('./schema-windows.js');
@@ -846,4 +846,64 @@ test('a comparison that gave up is told as too complex, not as an incompatibilit
   const el = document.createElement('div');
   el.innerHTML = refusalHtml({ err, title: 'Nie dodano wersji 3.', compatibility: 'backward', schemaType: 'xsd', newText: '', describeError: String });
   assert.equal(norm(el.textContent), 'Nie dodano wersji 3. Wzory są zbyt złożone do porównania, więc nie da się sprawdzić zgodności nowej wersji z poprzednią. Uprość wzór albo zmień zgodność wzoru.');
+});
+
+test('an Avro text: JSON is enough on this side, the add window shows the shape, and the server\'s refusals are put in words', () => {
+  assert.equal(schemaTextProblem('{"type":"record","name":"A","fields":[]}', 'avro'), null);
+  assert.equal(schemaTextProblem('"string"', 'avro'), null);
+  assert.equal(schemaTextProblem('record A {}', 'avro'), 'not_json');
+  assert.equal(AVRO_SCHEMA_EXAMPLE.includes('"type": "record"'), true);
+  assert.match(norm(addTextHint('avro')), /^Wzór Avro to schemat zapisany jako JSON, np\. \{"type": "record".*bez nagłówka pliku Avro i bez nagłówka Confluent\./);
+  const cases = [
+    ['the schema is not valid JSON: expected value at line 1 column 1', /To nie jest poprawny JSON/],
+    ['not a valid Avro schema: Unknown primitive type: foo', /^Nie dodano wzoru x\. Avro nie przyjęło tego wzoru: sprawdź nazwy i typy/],
+    ['the schema can never produce a value: a record contains itself without an optional branch (a union with null, an array or a map)', /rekord zawiera sam siebie bez możliwości zakończenia\. Dopuść brak wartości \(unia z null\)/],
+    ['a record lists a field that is not an object', /Pola rekordu muszą być listą obiektów/],
+    ["the default of field 'note' does not fit the first branch of its union", /Wartość domyślna pola nie pasuje do pierwszego wariantu jego unii/],
+    ["the default of field 'note' does not fit its type", /Wartość domyślna pola nie pasuje do typu tego pola/],
+    ['a doc is longer than 4096 bytes', /Opis \(doc\) albo własny atrybut ma więcej niż 4096 bajtów/],
+    ['a custom attribute is longer than 4096 bytes', /Opis \(doc\) albo własny atrybut ma więcej niż 4096 bajtów/],
+    ['the schema has more than 4096 types', /ma więcej niż 4096 typów/],
+    ["record 'R' has more than 1024 fields", /Rekord ma więcej niż 1024 pól/],
+    ['a union has more than 64 branches', /Unia ma więcej niż 64 wariantów/],
+    ["enum 'E' has more than 1024 symbols", /Typ wyliczeniowy ma więcej niż 1024 symboli/],
+    ["fixed 'F' is larger than 16777216 bytes", /Typ fixed jest większy niż 16777216 bajtów/],
+    ['the schema is nested deeper than 64 levels', /głębiej niż 64 poziomów/],
+  ];
+  for (const [server, expected] of cases) {
+    const got = refused('avro', server);
+    assert.match(got.text, expected, server);
+    assert.ok(got.technical.includes(server));
+  }
+});
+
+test('a refused Avro version names the field, the type or the enum symbol that breaks the old data or the old programs', () => {
+  const reason = (mode, detail) => {
+    const el = document.createElement('div');
+    el.innerHTML = refusalHtml({ err: incompatible(mode, detail), title: 'Nie dodano wersji 2.', compatibility: mode, schemaType: 'avro', newText: '', describeError: String });
+    return norm(el.querySelector('div').textContent);
+  };
+  const backwardLead = 'backward: data written under the old schema may not be readable with the new one - ';
+  const forwardLead = 'forward: data written under the new schema may not be readable with the old one - ';
+  assert.match(
+    reason('backward', `${backwardLead}/region: the new schema requires field 'region' of record 'Order', which has no default and is missing from the old schema`),
+    /nowa wersja wymaga pola „region”, którego stare wiadomości mogą nie mieć\. Nadaj „region” wartość domyślną \("default"\)/,
+  );
+  assert.match(
+    reason('forward', `${forwardLead}/region: the old schema requires field 'region' of record 'Order', which has no default and is missing from the new schema`),
+    /nowa wersja nie gwarantuje pola „region”, którego wymagają stare programy\. Zostaw „region” wśród pól wymaganych/,
+  );
+  assert.match(
+    reason('backward', `${backwardLead}/inner/n: long written by the old schema cannot be read as int by the new schema`),
+    /typ „\/inner\/n” się zmienia: long nie da się odczytać jako int/,
+  );
+  assert.match(
+    reason('backward', `${backwardLead}/status: enum 'Status': symbol 'DONE' of the old schema is unknown to the new schema, which has no default symbol`),
+    /typ wyliczeniowy „Status” traci symbol „DONE”/,
+  );
+  // A sentence this screen does not know falls back to the generic one with the server's text folded.
+  assert.match(
+    reason('backward', `${backwardLead}/u: no branch of the new union can read a union written by the old schema`),
+    /Nowa wersja nie spełnia zgodności/,
+  );
 });

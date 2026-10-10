@@ -774,8 +774,8 @@ pub struct TopicConfig {
     /// `schema_id` subject's compiled validator (`bus::schema_registry`,
     /// `publish`'s schema-validation block). `Off` (the default, and every
     /// pre-F3 row's value) is not evaluated at all — zero cost beyond the
-    /// enum comparison. Binding a binary schema type (`avro`/`protobuf`/
-    /// `thrift`, no validator until F4) depends on what this call asked for
+    /// enum comparison. Binding a binary schema type (`protobuf`/`thrift`,
+    /// no validator until F4) depends on what this call asked for
     /// (`apply_schema_binding_guard`): if the call EXPLICITLY requested a
     /// non-`Off` mode, the bind is REJECTED outright (enforcement that can
     /// never fire is refused, not silently downgraded); if `validation` was
@@ -1344,7 +1344,7 @@ fn apply_schema_binding_guard(
         }
     }
     if !schema_type.has_validator() {
-        // avro/protobuf/thrift: binding is allowed,
+        // protobuf/thrift (until F4): binding is allowed,
         // validation is not — but whether that is a silent downgrade or a hard rejection depends on
         // WHAT this call actually asked for (review finding #5):
         //   - the call explicitly turned validation ON (or to any non-`Off`

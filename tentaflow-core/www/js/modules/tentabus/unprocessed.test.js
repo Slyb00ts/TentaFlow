@@ -437,6 +437,25 @@ test('every HL7 and XSD sentence a message can be refused with is told in Polish
     ['/faktura: document exceeds the validation work budget', '/faktura: dokument jest zbyt duży, żeby sprawdzić go wzorem w rozsądnym czasie.'],
   ];
   for (const [server, expected] of xsd) assert.equal(plainCheckError(server), expected, server);
+  // The exact messages of the Avro checker (avro.rs `Walker`).
+  const avro = [
+    ['/customer: payload ends before the value is complete', '/customer: wiadomość kończy się przed końcem wartości.'],
+    ['<root>: bytes remain after the value', 'Po wartości zostały dodatkowe bajty (to nie jest pojedyncza wiadomość Avro bez nagłówka).'],
+    ['/id: integer encoding is longer than 10 bytes or overflows 64 bits', '/id: liczba jest zapisana niepoprawnie (za długo).'],
+    ['/id: int encoding is longer than 5 bytes', '/id: liczba jest zapisana niepoprawnie (za długo).'],
+    ['/lines/[]/qty: value does not fit the int type', '/lines/[]/qty: liczba nie mieści się w typie int.'],
+    ['/paid: boolean is neither 0 nor 1', '/paid: wartość logiczna musi być równa 0 albo 1.'],
+    ['/customer: length is negative', '/customer: długość jest ujemna.'],
+    ['/customer: declared length exceeds the remaining payload', '/customer: zapisana długość jest większa niż reszta wiadomości.'],
+    ['/customer: string is not valid UTF-8', '/customer: tekst nie jest poprawnym UTF-8.'],
+    ['/status: enum index is out of range', '/status: numer wartości wyliczenia jest poza listą.'],
+    ['/note: union branch index is out of range', '/note: numer wariantu unii jest poza listą.'],
+    ['/lines/[]: block declares more items than the remaining payload can hold', '/lines/[]: tablica lub mapa deklaruje więcej elementów, niż mieści reszta wiadomości.'],
+    ['/lines/[]: block byte size does not match its items', '/lines/[]: rozmiar bloku tablicy lub mapy nie zgadza się z jego elementami.'],
+    ['/next/next: value is nested too deeply to check', '/next/next: wiadomość jest zagnieżdżona za głęboko, żeby ją sprawdzić.'],
+    ['/a/[]: document exceeds the validation work budget', '/a/[]: dokument jest zbyt duży, żeby sprawdzić go wzorem w rozsądnym czasie.'],
+  ];
+  for (const [server, expected] of avro) assert.equal(plainCheckError(server), expected, server);
   assert.equal(plainCheckError('/pacjent: a sentence nobody mapped'), '');
 });
 

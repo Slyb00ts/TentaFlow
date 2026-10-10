@@ -1,0 +1,79 @@
+{
+  "type": "record",
+  "name": "Order",
+  "namespace": "shop",
+  "doc": "A shop order",
+  "fields": [
+    {
+      "name": "id",
+      "type": "long"
+    },
+    {
+      "name": "customer",
+      "type": "string"
+    },
+    {
+      "name": "paid",
+      "type": "boolean"
+    },
+    {
+      "name": "status",
+      "type": {
+        "type": "enum",
+        "name": "Status",
+        "symbols": [
+          "NEW",
+          "SHIPPED",
+          "DONE"
+        ]
+      }
+    },
+    {
+      "name": "note",
+      "type": [
+        "null",
+        "string"
+      ],
+      "default": null
+    },
+    {
+      "name": "lines",
+      "type": {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "Line",
+          "fields": [
+            {
+              "name": "sku",
+              "type": "string"
+            },
+            {
+              "name": "qty",
+              "type": "int"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "attrs",
+      "type": {
+        "type": "map",
+        "values": "string"
+      }
+    },
+    {
+      "name": "checksum",
+      "type": {
+        "type": "fixed",
+        "name": "Sum",
+        "size": 4
+      }
+    },
+    {
+      "name": "price",
+      "type": "double"
+    }
+  ]
+}

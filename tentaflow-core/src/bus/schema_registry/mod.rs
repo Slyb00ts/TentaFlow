@@ -16,7 +16,7 @@
 //     outside the supported subset is REJECTED at registration time
 //     (`compile`), never silently ignored — a partial validator that skips
 //     keywords would be worse than none for a compliance-facing feature.
-//   - `avro` / `protobuf` / `thrift` are storage-only until F4
+//   - `protobuf` / `thrift` are storage-only until F4
 //     (`stored_only`): `compile` is a shape smoke-check, every other
 //     operation returns `SchemaError::Unsupported`.
 //   - `xsd` (F4 B4) and `hl7v2_profile` (F4 B5) are a hand-written XSD subset
@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bus::payload_format::PayloadFormat;
 
+mod avro;
 mod hl7v2_profile;
 mod json_schema;
 pub mod registry;
@@ -110,14 +111,14 @@ impl SchemaType {
     pub fn has_validator(self) -> bool {
         matches!(
             self,
-            SchemaType::JsonSchema | SchemaType::Xsd | SchemaType::Hl7v2Profile
+            SchemaType::JsonSchema | SchemaType::Avro | SchemaType::Xsd | SchemaType::Hl7v2Profile
         )
     }
 
     pub fn ops(self) -> &'static dyn SchemaKindOps {
         match self {
             SchemaType::JsonSchema => &json_schema::JSON_SCHEMA_OPS,
-            SchemaType::Avro => &stored_only::AVRO_OPS,
+            SchemaType::Avro => &avro::AVRO_OPS,
             SchemaType::Protobuf => &stored_only::PROTOBUF_OPS,
             SchemaType::Thrift => &stored_only::THRIFT_OPS,
             SchemaType::Xsd => &xsd::XSD_OPS,
@@ -219,6 +220,7 @@ impl std::fmt::Display for SchemaError {
 #[derive(Debug)]
 pub enum CompiledSchema {
     JsonSchema(json_schema::Compiled),
+    Avro(avro::Compiled),
     Xsd(xsd::Compiled),
     Hl7v2Profile(hl7v2_profile::Compiled),
     /// Kinds without a validator yet carry no compiled form — the variant exists so
@@ -285,6 +287,73 @@ impl ValidationBudget {
     pub fn spend(&mut self, units: u64) {
         self.remaining = self.remaining.saturating_sub(units);
     }
+}
+
+/// The single meter every expensive primitive charges. An absurd charge
+/// (value length x pattern count) cannot wrap around: it simply does not fit.
+#[derive(Debug)]
+struct Budget {
+    used: u64,
+    limit: u64,
+}
+
+/// A [`Budget`] ran out: the check stopped before it could decide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LimitExceeded;
+
+impl Budget {
+    fn new(limit: u64) -> Budget {
+        Budget { used: 0, limit }
+    }
+
+    /// Check before commit: a charge that does not fit is refused WITHOUT
+    /// being added, so `used` never exceeds `limit` and a shared batch is
+    /// debited only for work that was actually allowed to run.
+    fn charge(&mut self, units: u64) -> Result<(), LimitExceeded> {
+        match self.used.checked_add(units) {
+            Some(total) if total <= self.limit => {
+                self.used = total;
+                Ok(())
+            }
+            _ => Err(LimitExceeded),
+        }
+    }
+
+    /// Units still available.
+    fn remaining(&self) -> u64 {
+        self.limit - self.used
+    }
+}
+
+/// Longest element path a violation message carries. A document nested up to
+/// `MAX_DOC_DEPTH` levels with long names would otherwise put kilobytes into
+/// audit rows and DLQ headers.
+pub(super) const MAX_PATH_CHARS: usize = 256;
+
+/// `path` unchanged when short; otherwise its first two and last two
+/// segments around `…`, bounded in characters whatever the names are.
+pub(super) fn shorten_path(path: &str) -> String {
+    if path.chars().count() <= MAX_PATH_CHARS {
+        return path.to_string();
+    }
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let joined = if segments.len() > 4 {
+        format!(
+            "/{}/{}/…/{}/{}",
+            segments[0],
+            segments[1],
+            segments[segments.len() - 2],
+            segments[segments.len() - 1]
+        )
+    } else {
+        path.to_string()
+    };
+    if joined.chars().count() <= MAX_PATH_CHARS {
+        return joined;
+    }
+    let mut cut: String = joined.chars().take(MAX_PATH_CHARS).collect();
+    cut.push('…');
+    cut
 }
 
 /// Implemented once per `SchemaType`. See the module header for the split
@@ -489,11 +558,11 @@ mod tests {
     }
 
     #[test]
-    fn text_kinds_have_a_validator_and_binary_kinds_do_not_yet() {
+    fn avro_has_a_validator_and_the_other_binary_kinds_do_not_yet() {
         assert!(SchemaType::JsonSchema.has_validator());
         assert!(SchemaType::Xsd.has_validator());
         assert!(SchemaType::Hl7v2Profile.has_validator());
-        assert!(!SchemaType::Avro.has_validator());
+        assert!(SchemaType::Avro.has_validator());
         assert!(!SchemaType::Protobuf.has_validator());
         assert!(!SchemaType::Thrift.has_validator());
     }
@@ -840,6 +909,198 @@ mod tests {
             hl7_ops.validate(&msh_only, b"\xff\xfe"),
             Err(SchemaError::Violation(m)) if m.starts_with("hl7: not valid utf-8")
         ));
+
+        // The Avro refusals and violations the dashboard translates
+        // (`schema-windows.js` `textRefusalReason` / `incompatibilityReason`,
+        // `unprocessed.js` `AVRO_PHRASES`).
+        let record =
+            |fields: &str| format!(r#"{{"type":"record","name":"R","fields":[{fields}]}}"#);
+        let fields = |n: usize| {
+            (0..n)
+                .map(|i| format!(r#"{{"name":"f{i}","type":"int"}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let enums = |n: usize| {
+            (0..n)
+                .map(|i| format!(r#"{{"type":"enum","name":"E{i}","symbols":["A"]}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let symbols = (0..=1024)
+            .map(|i| format!("\"S{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let five_wide = (0..5)
+            .map(|k| {
+                format!(
+                    r#"{{"name":"g{k}","type":{{"type":"record","name":"G{k}","fields":[{}]}}}}"#,
+                    fields(1024)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut too_deep = String::from("\"int\"");
+        for _ in 0..65 {
+            too_deep = format!(r#"{{"type":"array","items":{too_deep}}}"#);
+        }
+        for (text, phrase) in [
+            ("not json".to_string(), "the schema is not valid JSON"),
+            ("   ".to_string(), "schema text is empty"),
+            (r#"{"type":"nonsense"}"#.to_string(), "not a valid Avro schema"),
+            (
+                r#"{"type":"record","name":"R","fields":[1]}"#.to_string(),
+                "a record lists a field that is not an object",
+            ),
+            (
+                r#"{"type":"record","name":"R","fields":{}}"#.to_string(),
+                "a record lists its fields in something that is not an array",
+            ),
+            (
+                r#"{"type":"record","name":"A","fields":[{"name":"a","type":"A"}]}"#.to_string(),
+                "the schema can never produce a value: a record contains itself without an optional branch",
+            ),
+            (record(&fields(1025)), "record 'R' has more than 1024 fields"),
+            (
+                record(&format!(r#"{{"name":"u","type":[{}]}}"#, enums(65))),
+                "a union has more than 64 branches",
+            ),
+            (
+                format!(r#"{{"type":"enum","name":"E","symbols":[{symbols}]}}"#),
+                "enum 'E' has more than 1024 symbols",
+            ),
+            (
+                r#"{"type":"fixed","name":"F","size":99999999}"#.to_string(),
+                "fixed 'F' is larger than 16777216 bytes",
+            ),
+            (record(&five_wide), "the schema has more than 4096 types"),
+            (
+                record(r#"{"name":"a","type":["null","string"],"default":"x"}"#),
+                "the default of field 'a' does not fit the first branch of its union",
+            ),
+            (
+                record(r#"{"name":"a","type":"int","default":"x"}"#),
+                "the default of field 'a' does not fit its type",
+            ),
+            (
+                record(&format!(r#"{{"name":"a","type":"int","doc":"{}"}}"#, "d".repeat(4097))),
+                "a doc is longer than 4096 bytes",
+            ),
+            (
+                record(&format!(r#"{{"name":"a","type":"int","note":"{}"}}"#, "n".repeat(4097))),
+                "a custom attribute is longer than 4096 bytes",
+            ),
+            (
+                record(r#"{"name":"a","type":"int","x-tentaflow-stashed-default":1}"#),
+                "a field may not use the key 'x-tentaflow-stashed-default'",
+            ),
+            (too_deep, "the schema is nested deeper than 64 levels"),
+            (
+                record(
+                    r#"{"name":"a","type":{"type":"enum","name":"E","symbols":["X"]}},
+                       {"name":"b","type":{"type":"enum","name":"E","symbols":["Y"]}}"#,
+                ),
+                "type 'E' is defined more than once",
+            ),
+        ] {
+            invalid_with(SchemaType::Avro, &text, phrase);
+        }
+        let avro_ops = SchemaType::Avro.ops();
+        let order = avro_ops
+            .compile(&record(
+                r#"{"name":"id","type":"int"},
+                   {"name":"lines","type":{"type":"array","items":"string"}},
+                   {"name":"status","type":{"type":"enum","name":"S","symbols":["A"]}},
+                   {"name":"note","type":["null","int"]}"#,
+            ))
+            .unwrap();
+        for (payload, expected) in [
+            (&b""[..], "/id: payload ends before the value is complete"),
+            (&[0, 0, 0, 0, 0][..], "<root>: bytes remain after the value"),
+            (&[0xff; 11][..], "/id: int encoding is longer than 5 bytes"),
+            (
+                &[0x80, 0x80, 0x80, 0x80, 0x10][..],
+                "/id: value does not fit the int type",
+            ),
+            (
+                &[0, 1, 10][..],
+                "/lines/[]: block byte size does not match its items",
+            ),
+            (
+                &[0, 10, 0][..],
+                "/lines/[]: block declares more items than the remaining payload can hold",
+            ),
+            (&[0, 0, 2][..], "/status: enum index is out of range"),
+            (
+                &[0, 0, 0, 6][..],
+                "/note: union branch index is out of range",
+            ),
+            (
+                &[0, 2, 100, 0][..],
+                "/lines/[]: declared length exceeds the remaining payload",
+            ),
+            (&[0, 2, 1, 0][..], "/lines/[]: length is negative"),
+            (
+                &[0, 2, 4, 0xff, 0xfe, 0][..],
+                "/lines/[]: string is not valid UTF-8",
+            ),
+        ] {
+            let got = avro_ops.validate(&order, payload);
+            assert!(
+                matches!(&got, Err(SchemaError::Violation(m)) if m == expected),
+                "{payload:?}: expected {expected:?}, got {got:?}"
+            );
+        }
+        let boolean = avro_ops
+            .compile(&record(r#"{"name":"b","type":"boolean"}"#))
+            .unwrap();
+        assert!(matches!(
+            avro_ops.validate(&boolean, &[2]),
+            Err(SchemaError::Violation(m)) if m == "/b: boolean is neither 0 nor 1"
+        ));
+        let list = avro_ops
+            .compile(
+                r#"{"type":"record","name":"L","fields":[{"name":"next","type":["null","L"]}]}"#,
+            )
+            .unwrap();
+        let deep = [2u8; 100].iter().copied().chain([0]).collect::<Vec<u8>>();
+        assert!(matches!(
+            avro_ops.validate(&list, &deep),
+            Err(SchemaError::LimitExceeded(m)) if m.ends_with(": value is nested too deeply to check")
+        ));
+        let nulls = avro_ops
+            .compile(&record(
+                r#"{"name":"a","type":{"type":"array","items":"null"}}"#,
+            ))
+            .unwrap();
+        assert!(matches!(
+            avro_ops.validate(&nulls, &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 0]),
+            Err(SchemaError::LimitExceeded(m)) if m.ends_with(": document exceeds the validation work budget")
+        ));
+        // Compatibility reasons the dashboard names a field, type or symbol from.
+        let old = record(
+            r#"{"name":"a","type":"long"},{"name":"e","type":{"type":"enum","name":"S","symbols":["A","B"]}}"#,
+        );
+        let new = record(
+            r#"{"name":"a","type":"int"},{"name":"e","type":{"type":"enum","name":"S","symbols":["A"]}}"#,
+        );
+        for (writer, reader, mode, phrase) in [
+            (&old, &new, Compatibility::Backward, "/a: long written by the old schema cannot be read as int by the new schema"),
+            (&record(r#"{"name":"a","type":"int"},{"name":"b","type":"string"}"#), &record(r#"{"name":"a","type":"int"}"#), Compatibility::Forward, "/b: the old schema requires field 'b' of record 'R', which has no default and is missing from the new schema"),
+            (&old, &record(r#"{"name":"a","type":"long"},{"name":"b","type":"int"}"#), Compatibility::Backward, "/b: the new schema requires field 'b' of record 'R', which has no default and is missing from the old schema"),
+            (
+                &record(r#"{"name":"e","type":{"type":"enum","name":"S","symbols":["A","B"]}}"#),
+                &record(r#"{"name":"e","type":{"type":"enum","name":"S","symbols":["A"]}}"#),
+                Compatibility::Backward,
+                "/e: enum 'S': symbol 'B' of the old schema is unknown to the new schema, which has no default symbol",
+            ),
+        ] {
+            let got = avro_ops.check_compatibility(writer, reader, mode);
+            assert!(
+                matches!(&got, Err(SchemaError::Incompatible(m)) if m.contains(phrase)),
+                "{mode:?}: expected {phrase:?}, got {got:?}"
+            );
+        }
 
         // Instance-side phrases the dashboard translates for an HL7 message.
         let compiled = SchemaType::Hl7v2Profile
