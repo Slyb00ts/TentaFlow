@@ -18,7 +18,7 @@ use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
 
 use super::{
     clear_set, db_error, done, fmt, op_error, opt_day, opt_day_write, publish, read_error,
-    require_admin, require_member, tri, Applied, PERM_ADMIN,
+    require_admin, require_admin_for_past_day, require_member, tri, Applied, PERM_ADMIN,
 };
 use crate::dispatch::HandlerContext;
 use crate::services::org_structure as svc;
@@ -245,12 +245,14 @@ fn escalation_chain(
         Some(raw) => DeputyScope::parse(raw).map_err(read_error)?,
         None => DeputyScope::Escalations,
     };
+    let at = opt_day(at)?;
+    require_admin_for_past_day(ctx, org, at, Some(user_id))?;
     let (snap, avail, _) = privacy::limited_availability(
         &ctx.state.db,
         &org.org_id,
         &org.user_id,
         org.has(PERM_ADMIN),
-        opt_day(at)?,
+        at,
     )
     .map_err(read_error)?;
     let chain = escalation::escalation_chain(&snap, &avail, user_id, &scope);
@@ -371,6 +373,7 @@ fn can_view(
     let (org, viewer) = require_self_or_admin(ctx, viewer)?;
     let kind = PersonDataKind::parse(kind)
         .ok_or_else(|| ProtocolError::bad_request(format!("unknown person data kind '{kind}'")))?;
+    require_admin_for_past_day(ctx, org, opt_day(at)?, None)?;
     let admin = is_admin_of(ctx, org, &viewer)?;
     let (snap, _) = load(ctx, org, at)?;
     let decision = privacy::can_view_person_data(&snap, &viewer, subject, kind, admin);
@@ -386,6 +389,7 @@ fn visibility(
     at: Option<&str>,
 ) -> Result<P, ProtocolError> {
     let (org, user) = require_self_or_admin(ctx, user_id)?;
+    require_admin_for_past_day(ctx, org, opt_day(at)?, None)?;
     let admin = is_admin_of(ctx, org, &user)?;
     let (snap, _) = load(ctx, org, at)?;
     let view = privacy::visibility_of(&snap, &user, admin);
@@ -420,6 +424,7 @@ fn who_sees(
     at: Option<&str>,
 ) -> Result<P, ProtocolError> {
     let (org, subject) = require_self_or_admin(ctx, subject)?;
+    require_admin_for_past_day(ctx, org, opt_day(at)?, None)?;
     let (snap, _) = load(ctx, org, at)?;
     // The administrators are people with the permission, whoever the structure says they are.
     let members: Vec<String> = {
@@ -662,11 +667,10 @@ fn write(ctx: &HandlerContext, org: &OrgContext, payload: &P) -> Result<Applied,
                     kind: kind_from_wire(*kind),
                 },
             )?;
-            // Ids and dates only: the kind does not go on the bus.
-            let event = json!({
-                "id": w.value.id, "user_id": w.value.user_id,
-                "valid_from": fmt(w.value.valid_from), "valid_to": w.value.valid_to.map(fmt),
-            });
+            // Ids only: any addon holding the generic `events` right receives this, and the dates
+            // and the kind of an absence are private (docs §6.3); a subscriber that needs them asks
+            // through the directory calls, which filter by the acting principal.
+            let event = json!({ "id": w.value.id, "user_id": w.value.user_id });
             Ok(done(w, |a| OrgWriteResult::Absence(absence_to_wire(a)))
                 .event("org.absence_added", event))
         }
@@ -692,10 +696,7 @@ fn write(ctx: &HandlerContext, org: &OrgContext, payload: &P) -> Result<Applied,
                     kind: kind.map(kind_from_wire),
                 },
             )?;
-            let event = json!({
-                "id": w.value.id, "user_id": w.value.user_id,
-                "valid_from": fmt(w.value.valid_from), "valid_to": w.value.valid_to.map(fmt),
-            });
+            let event = json!({ "id": w.value.id, "user_id": w.value.user_id });
             Ok(done(w, |a| OrgWriteResult::Absence(absence_to_wire(a)))
                 .event("org.absence_updated", event))
         }

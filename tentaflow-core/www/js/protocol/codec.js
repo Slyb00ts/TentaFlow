@@ -10532,7 +10532,7 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** Changes an absence; `clear` may list valid_to and reason. */
+  /** Changes an absence; `clear` may list valid_to. */
   // wire: OrgStructureBody::AbsenceUpdateRequest
   orgAbsenceUpdateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();

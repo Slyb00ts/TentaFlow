@@ -215,6 +215,9 @@ fn update_deputy_in(
         });
     }
     let interval = Interval::new(from, to)?;
+    if scope != before.scope {
+        s.ensure_history_editable(before.valid_from, is_admin)?;
+    }
     if from != before.valid_from {
         s.ensure_not_backdated_by(from.min(before.valid_from), is_admin)?;
     }
@@ -387,6 +390,9 @@ fn update_absence_in(
     let to = patch.valid_to.unwrap_or(before.valid_to);
     Interval::new(from, to)?;
     let kind = patch.kind.unwrap_or(before.kind);
+    if kind != before.kind {
+        s.ensure_history_editable(before.valid_from, who.is_admin)?;
+    }
     if from != before.valid_from {
         s.ensure_not_backdated_by(from.min(before.valid_from), who.is_admin)?;
     }

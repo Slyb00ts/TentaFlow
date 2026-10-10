@@ -11,6 +11,14 @@ use super::*;
 use crate::db::repository as repo_db;
 use crate::db::DbPool;
 
+/// The manager as the dispatch layer answers it: the snapshot and the presence of one day.
+fn effective_manager_on(pool: &DbPool, user: &str, offset: i64) -> Option<query::Manager> {
+    let conn = pool.read().unwrap();
+    let snap = query::Snapshot::load(&conn, ORG, day(offset)).unwrap();
+    let avail = availability::Availability::load(&conn, ORG, day(offset)).unwrap();
+    escalation::effective_manager(&snap, &avail, user)
+}
+
 /// A member who is not an organization admin, so the permission checks have to
 /// decide from the structure alone.
 fn person(f: &Fixture, name: &str) -> String {
@@ -330,10 +338,7 @@ fn a_vacant_manager_position_projects_no_manager() {
     // The CFO seat is empty: nobody to name (deputies arrive with WP9).
     assert_eq!(profile_of(&f.pool, &erin).unwrap().1, None);
     assert_eq!(profile_of(&f.pool, &c.carol).unwrap().1, None);
-    assert_eq!(
-        query::get_manager(&f.pool, ORG, &erin, Some(day(1))).unwrap(),
-        None
-    );
+    assert_eq!(effective_manager_on(&f.pool, &erin, 1), None);
 }
 
 #[test]
@@ -433,9 +438,7 @@ fn a_person_holding_two_seats_in_one_chain_reports_past_themselves() {
 
     // Primary seat is Junior, its parent is the CFO seat, held by bob himself:
     // the manager is the next one up, never bob.
-    let manager = query::get_manager(&f.pool, ORG, &c.bob, None)
-        .unwrap()
-        .unwrap();
+    let manager = effective_manager_on(&f.pool, &c.bob, 0).unwrap();
     assert_eq!(manager.user_id, c.alice);
     assert_eq!(manager.position_id, c.ceo.position_id);
     assert_eq!(

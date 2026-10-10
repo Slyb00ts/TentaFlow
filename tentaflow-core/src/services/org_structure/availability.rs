@@ -4,7 +4,7 @@
 //! An `Availability` is loaded next to a `Snapshot` for the same day. Kept
 //! apart from it on purpose: the projection into `sync_user_org_profiles`
 //! (permissions) reads only the structure, so an absence never moves a
-//! permission; the escalation chain and `get_manager` read both.
+//! permission; the escalation chain and the effective manager read both.
 //!
 //! A person is AVAILABLE on a day when their account is an active member of
 //! the organization and no absence covers the day. An absence has no reason

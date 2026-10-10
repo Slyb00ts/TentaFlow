@@ -3103,3 +3103,99 @@ async fn presence_on_another_day_does_not_give_away_the_dates_of_a_person_the_as
         other => panic!("{other:?}"),
     }
 }
+
+#[tokio::test]
+async fn a_past_day_of_the_chain_the_visibility_and_the_view_rules_is_the_administrators() {
+    let w = world();
+    let t = team(&w).await;
+    let member = member_ctx(&w);
+    let admin = admin_ctx(&w);
+    let past = day(-3);
+
+    let reads = [
+        P::EscalationChainRequest {
+            user_id: t.boss.clone(),
+            scope: None,
+            at: Some(past.clone()),
+        },
+        P::VisibilityRequest {
+            user_id: None,
+            at: Some(past.clone()),
+        },
+        P::CanViewPersonDataRequest {
+            viewer_user_id: None,
+            subject_user_id: t.boss.clone(),
+            kind: "absence_dates".into(),
+            at: Some(past.clone()),
+        },
+        P::WhoSeesRequest {
+            subject_user_id: None,
+            at: Some(past.clone()),
+        },
+    ];
+    for read in reads {
+        let label = format!("{read:?}");
+        expect_code(
+            run(&member, read.clone()).await,
+            ProtocolErrorCode::PolicyDenied,
+            &label,
+        );
+        run(&admin, read)
+            .await
+            .unwrap_or_else(|e| panic!("{label} refused to the administrator: {e:?}"));
+    }
+    // Today and the future stay open to the member.
+    run(
+        &member,
+        P::VisibilityRequest {
+            user_id: None,
+            at: Some(day(2)),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn an_absence_event_on_the_bus_carries_ids_and_no_dates() {
+    let w = world();
+    let t = team(&w).await;
+    let bus = event_bus();
+    let (added, _) = write_ok(
+        &member_ctx(&w),
+        absence_add(None, day(1), Some(day(4)), None),
+    )
+    .await;
+    let id = match added {
+        OrgWriteResult::Absence(a) => a.id,
+        other => panic!("expected an absence, got {other:?}"),
+    };
+    write_ok(
+        &member_ctx(&w),
+        P::AbsenceUpdateRequest {
+            id: id.clone(),
+            valid_from: None,
+            valid_to: Some(day(5)),
+            kind: None,
+            reason: None,
+            clear: vec![],
+            confirm_backdated: false,
+        },
+    )
+    .await;
+    let events = bus.recent_events(4096);
+    for name in ["org.absence_added", "org.absence_updated"] {
+        let payload = &events
+            .iter()
+            .find(|e| e.event_type == name && e.payload["id"] == id.as_str())
+            .unwrap_or_else(|| panic!("{name} was not published"))
+            .payload;
+        assert_eq!(payload["user_id"], t.worker.as_str());
+        for private in ["valid_from", "valid_to", "kind", "reason"] {
+            assert!(
+                payload.get(private).is_none(),
+                "{name} leaks {private}: {payload}"
+            );
+        }
+    }
+}

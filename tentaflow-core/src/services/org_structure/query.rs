@@ -597,19 +597,6 @@ pub fn is_subordinate_of(
     Ok(snapshot(pool, org_id, at)?.is_subordinate_of(user_id, manager_id, scope))
 }
 
-pub fn get_manager(
-    pool: &DbPool,
-    org_id: &str,
-    user_id: &str,
-    at: Option<NaiveDate>,
-) -> Result<Option<Manager>> {
-    let conn = pool.read().map_err(|e| E::Db(e.to_string()))?;
-    let day = day_or_today(&conn, org_id, at)?;
-    let snap = Snapshot::load(&conn, org_id, day)?;
-    let avail = super::availability::Availability::load(&conn, org_id, day)?;
-    Ok(super::escalation::effective_manager(&snap, &avail, user_id))
-}
-
 // ---------------------------------------------------------------------------
 // Whole structure
 // ---------------------------------------------------------------------------

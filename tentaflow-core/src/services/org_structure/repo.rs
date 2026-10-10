@@ -216,6 +216,19 @@ impl Session<'_> {
         self.ensure_not_backdated(date)
     }
 
+    /// Changing what a row means (an absence's kind, a deputy's scope) rewrites the
+    /// days it already covered, so a row that began before today is the
+    /// administrator's to edit, whatever the dates of the edit.
+    fn ensure_history_editable(&self, row_start: NaiveDate, is_admin: bool) -> Result<()> {
+        if row_start < self.today && !is_admin {
+            return Err(E::BackdatingAdminOnly {
+                date: fmt(row_start),
+                today: fmt(self.today),
+            });
+        }
+        Ok(())
+    }
+
     fn ensure_not_backdated(&mut self, date: NaiveDate) -> Result<()> {
         if date < self.today {
             if !self.confirm_backdated {

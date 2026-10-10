@@ -333,22 +333,77 @@ fn hide_cover_dates(deputy: &mut Deputy, today: NaiveDate) {
     deputy.valid_to = None;
 }
 
-/// Who may see the absence dates of whom, for one viewer on one day.
+/// Who may see the absence dates of whom, for one viewer. The right is judged on
+/// the day asked about AND on today: a former manager (past day) or a manager
+/// only in a plan (future day) must not read dates through the structure of a
+/// day on which they are not the manager now.
 fn dates_visible<'a>(
     snap: &'a Snapshot,
+    today_snap: Option<&'a Snapshot>,
     viewer: &'a str,
     viewer_is_admin: bool,
 ) -> impl Fn(&str) -> bool + 'a {
     move |subject| {
-        can_view_person_data(
-            snap,
-            viewer,
-            subject,
-            PersonDataKind::AbsenceDates,
-            viewer_is_admin,
-        )
-        .allowed
+        [Some(snap), today_snap].into_iter().flatten().all(|s| {
+            can_view_person_data(
+                s,
+                viewer,
+                subject,
+                PersonDataKind::AbsenceDates,
+                viewer_is_admin,
+            )
+            .allowed
+        })
     }
+}
+
+/// The structure of today when `day` is another day, the one the dates right is
+/// also judged on.
+fn today_structure(
+    conn: &rusqlite::Connection,
+    org_id: &str,
+    day: NaiveDate,
+    real_today: NaiveDate,
+) -> Result<Option<Snapshot>> {
+    if day == real_today {
+        return Ok(None);
+    }
+    Snapshot::load(conn, org_id, real_today).map(Some)
+}
+
+struct LimitedDay {
+    snap: Snapshot,
+    today_snap: Option<Snapshot>,
+    avail: Availability,
+    real_today: NaiveDate,
+}
+
+fn limit_day(
+    pool: &DbPool,
+    org_id: &str,
+    viewer: &str,
+    viewer_is_admin: bool,
+    at: Option<NaiveDate>,
+) -> Result<LimitedDay> {
+    let conn = pool.read().map_err(|e| E::Db(e.to_string()))?;
+    let real_today = validate::today_in_zone(&timezone_of(&conn, org_id)?)?;
+    let day = at.unwrap_or(real_today);
+    let snap = Snapshot::load(&conn, org_id, day)?;
+    let today_snap = today_structure(&conn, org_id, day, real_today)?;
+    let mut avail = Availability::load(&conn, org_id, day)?;
+    if day != real_today {
+        let today = Availability::load(&conn, org_id, real_today)?;
+        avail = avail.limited_to_today(
+            &today,
+            dates_visible(&snap, today_snap.as_ref(), viewer, viewer_is_admin),
+        );
+    }
+    Ok(LimitedDay {
+        snap,
+        today_snap,
+        avail,
+        real_today,
+    })
 }
 
 /// The presence picture of a day for one viewer, see `VisibleAvailability`.
@@ -359,16 +414,8 @@ pub fn limited_availability(
     viewer_is_admin: bool,
     at: Option<NaiveDate>,
 ) -> Result<(Snapshot, Availability, NaiveDate)> {
-    let conn = pool.read().map_err(|e| E::Db(e.to_string()))?;
-    let real_today = validate::today_in_zone(&timezone_of(&conn, org_id)?)?;
-    let day = at.unwrap_or(real_today);
-    let snap = Snapshot::load(&conn, org_id, day)?;
-    let mut avail = Availability::load(&conn, org_id, day)?;
-    if day != real_today {
-        let today = Availability::load(&conn, org_id, real_today)?;
-        avail = avail.limited_to_today(&today, dates_visible(&snap, viewer, viewer_is_admin));
-    }
-    Ok((snap, avail, real_today))
+    let d = limit_day(pool, org_id, viewer, viewer_is_admin, at)?;
+    Ok((d.snap, d.avail, d.real_today))
 }
 
 pub fn visible_availability(
@@ -378,9 +425,13 @@ pub fn visible_availability(
     viewer_is_admin: bool,
     at: Option<NaiveDate>,
 ) -> Result<VisibleAvailability> {
-    let (snap, avail, real_today) =
-        limited_availability(pool, org_id, viewer, viewer_is_admin, at)?;
-    let may_see = dates_visible(&snap, viewer, viewer_is_admin);
+    let LimitedDay {
+        snap,
+        today_snap,
+        avail,
+        real_today,
+    } = limit_day(pool, org_id, viewer, viewer_is_admin, at)?;
+    let may_see = dates_visible(&snap, today_snap.as_ref(), viewer, viewer_is_admin);
     let mut deputies = avail.deputies.clone();
     for deputy in &mut deputies {
         if !may_see(&deputy.user_id) && deputy.deputy_user_id != viewer {
@@ -438,12 +489,15 @@ pub fn person_cover(
     }
     let real_today = day_or_today(pool, org_id, None)?;
     let day = at.unwrap_or(real_today);
-    let snap = {
+    let (snap, today_snap) = {
         let conn = pool.read().map_err(|e| E::Db(e.to_string()))?;
-        Snapshot::load(&conn, org_id, day)?
+        (
+            Snapshot::load(&conn, org_id, day)?,
+            today_structure(&conn, org_id, day, real_today)?,
+        )
     };
-    let decide = |kind| can_view_person_data(&snap, viewer, subject, kind, viewer_is_admin).allowed;
-    let can_see_absences = decide(PersonDataKind::AbsenceDates);
+    let may_see = dates_visible(&snap, today_snap.as_ref(), viewer, viewer_is_admin);
+    let can_see_absences = may_see(subject);
     // Presence on another day is the dates of an absence in disguise: whoever may not see the dates
     // is told about today only.
     let today = if can_see_absences { day } else { real_today };
@@ -460,7 +514,6 @@ pub fn person_cover(
         availability::deputies_around(pool, org_id, subject, today)?;
     // A cover's dates are an absence's in disguise: of a person whose dates the viewer may not see,
     // only the cover in force today is listed, without its dates.
-    let may_see = dates_visible(&snap, viewer, viewer_is_admin);
     // The deputy knows the dates of the cover they were given.
     let knows = |d: &Deputy| may_see(&d.user_id) || d.deputy_user_id == viewer;
     let limit = |list: &mut Vec<Deputy>| {

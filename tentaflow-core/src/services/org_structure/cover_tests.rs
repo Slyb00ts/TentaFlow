@@ -522,11 +522,7 @@ fn the_manager_is_the_structural_one_unless_absent_and_then_the_cover() {
         (c.tom.as_str(), ManagerSource::Deputy)
     );
 
-    // The pool-level query agrees, and the projection's structural manager does not move.
-    let via_pool = query::get_manager(&c.f.pool, ORG, &c.carol, None)
-        .unwrap()
-        .unwrap();
-    assert_eq!(via_pool.user_id, c.tom);
+    // The projection's structural manager does not move.
     let conn = c.f.pool.read().unwrap();
     let snap = Snapshot::load(&conn, ORG, day(0)).unwrap();
     assert_eq!(snap.manager_of(&c.carol).unwrap().user_id, c.bob);
@@ -566,9 +562,12 @@ fn a_vacant_head_is_answered_by_the_deputy_head_in_the_projection_but_leave_move
             .unwrap();
     end_assignment(&c.f.pool, &c.f.confirmed(), &assignment_id, day(0)).unwrap();
     assert_eq!(profile(&c.bob).as_deref(), Some(c.dora.as_str()));
-    let manager = query::get_manager(&c.f.pool, ORG, &c.bob, None)
-        .unwrap()
-        .unwrap();
+    let manager = {
+        let conn = c.f.pool.read().unwrap();
+        let snap = Snapshot::load(&conn, ORG, day(0)).unwrap();
+        let avail = Availability::load(&conn, ORG, day(0)).unwrap();
+        effective_manager(&snap, &avail, &c.bob).unwrap()
+    };
     assert_eq!(manager.source, ManagerSource::DeputyHead);
 
     // A deputy head does not get the other deputy head as manager.
@@ -1339,6 +1338,195 @@ fn a_cover_shows_no_dates_of_a_person_whose_absence_dates_are_private() {
     assert!(!seen.deputies.iter().any(|d| d.deputy_user_id == c.erin));
 }
 
+/// A boss seat held by `former` until the day before yesterday, by `current` today and by
+/// `future` from day 3; `worker` reports to it all along and is away on days -5..-4 and 5..8.
+struct Seats {
+    f: Fixture,
+    former: String,
+    future: String,
+    worker: String,
+}
+
+fn seats() -> Seats {
+    let f = Fixture::new();
+    let (former, current, future, worker) = (
+        add_user(&f.pool, ORG, "former"),
+        add_user(&f.pool, ORG, "current"),
+        add_user(&f.pool, ORG, "future"),
+        add_user(&f.pool, ORG, "worker"),
+    );
+    let unit = create_unit(
+        &f.pool,
+        &f.confirmed(),
+        &NewUnit {
+            name: "Ops".into(),
+            code: None,
+            type_id: None,
+            parent_unit_id: None,
+            color: None,
+            valid_from: day(-10),
+            valid_to: None,
+        },
+    )
+    .unwrap()
+    .value;
+    let seat = |name: &str, parent: Option<&Position>| {
+        create_position(
+            &f.pool,
+            &f.confirmed(),
+            &NewPosition {
+                unit_id: unit.unit_id.clone(),
+                name: name.into(),
+                code: None,
+                role_id: None,
+                is_manager: None,
+                is_staff: false,
+                parent_position_id: parent.map(|p| p.position_id.clone()),
+                valid_from: day(-10),
+                valid_to: None,
+            },
+        )
+        .unwrap()
+        .value
+    };
+    let boss = seat("Boss", None);
+    let desk = seat("Desk", Some(&boss));
+    let hold = |position: &Position, who: &str, from: i64, to: Option<i64>| {
+        assign(
+            &f.pool,
+            &f.confirmed(),
+            &NewAssignment {
+                position_id: position.position_id.clone(),
+                subject: Subject::User(who.to_string()),
+                kind: AssignmentType::Permanent,
+                share: 1.0,
+                is_primary: None,
+                valid_from: day(from),
+                valid_to: to.map(day),
+            },
+        )
+        .unwrap();
+    };
+    hold(&boss, &former, -10, Some(-2));
+    hold(&boss, &current, -2, Some(3));
+    hold(&boss, &future, 3, None);
+    hold(&desk, &worker, -10, None);
+    for (from, to) in [(-5, -4), (5, 8)] {
+        add_absence(
+            &f.pool,
+            &f.confirmed(),
+            Actor { is_admin: true },
+            &NewAbsence {
+                user_id: worker.clone(),
+                valid_from: day(from),
+                valid_to: Some(day(to)),
+                kind: AbsenceKind::Leave,
+            },
+        )
+        .unwrap();
+    }
+    Seats {
+        f,
+        former,
+        future,
+        worker,
+    }
+}
+
+fn manager_on(s: &Seats, viewer: &str, offset: i64) -> bool {
+    let conn = s.f.pool.read().unwrap();
+    let snap = Snapshot::load(&conn, ORG, day(offset)).unwrap();
+    can_view_person_data(
+        &snap,
+        viewer,
+        &s.worker,
+        PersonDataKind::AbsenceDates,
+        false,
+    )
+    .allowed
+}
+
+#[test]
+fn a_former_manager_reads_no_absence_through_a_past_day() {
+    let s = seats();
+    // The structure of the past day does make them the manager; the day of the read does not.
+    assert!(manager_on(&s, &s.former, -5));
+    assert!(!manager_on(&s, &s.former, 0));
+
+    let cover = privacy::person_cover(
+        &s.f.pool,
+        ORG,
+        &s.former,
+        false,
+        &s.worker,
+        Some(day(-5)),
+        true,
+    )
+    .unwrap();
+    assert!(!cover.can_see_absences);
+    assert!(cover.absences.is_empty(), "{:?}", cover.absences);
+    assert_eq!(cover.today, day(0), "told about today only");
+
+    // The presence picture of that day does not give the dates away either.
+    assert!(
+        privacy::is_available_for(&s.f.pool, ORG, &s.former, false, &s.worker, Some(day(-5)))
+            .unwrap()
+    );
+}
+
+#[test]
+fn a_manager_only_in_a_plan_reads_no_absence_through_a_future_day() {
+    let s = seats();
+    assert!(manager_on(&s, &s.future, 6));
+    assert!(!manager_on(&s, &s.future, 0));
+
+    let cover = privacy::person_cover(
+        &s.f.pool,
+        ORG,
+        &s.future,
+        false,
+        &s.worker,
+        Some(day(6)),
+        true,
+    )
+    .unwrap();
+    assert!(!cover.can_see_absences);
+    assert!(cover.absences.is_empty(), "{:?}", cover.absences);
+    assert!(
+        privacy::is_available_for(&s.f.pool, ORG, &s.future, false, &s.worker, Some(day(6)))
+            .unwrap()
+    );
+    assert!(
+        !privacy::visible_availability(&s.f.pool, ORG, &s.future, false, Some(day(6)))
+            .unwrap()
+            .absent
+            .contains(&s.worker)
+    );
+}
+
+#[test]
+fn a_manager_today_still_reads_the_absences_of_other_days() {
+    let s = seats();
+    // `current` holds the seat today: both days agree, nothing is hidden from them.
+    let current = {
+        let conn = s.f.pool.read().unwrap();
+        let snap = Snapshot::load(&conn, ORG, day(0)).unwrap();
+        snap.manager_of(&s.worker).unwrap().user_id.clone()
+    };
+    let cover = privacy::person_cover(
+        &s.f.pool,
+        ORG,
+        &current,
+        false,
+        &s.worker,
+        Some(day(0)),
+        true,
+    )
+    .unwrap();
+    assert!(cover.can_see_absences);
+    assert_eq!(cover.absences.len(), 2);
+}
+
 // ---------------------------------------------------------------------------
 // Backdating is the administrator's
 // ---------------------------------------------------------------------------
@@ -1441,6 +1629,85 @@ fn only_an_administrator_dates_an_absence_before_today_and_confirming_does_not_h
         "backdated_confirmation_required"
     );
     add_absence(&c.f.pool, &c.f.confirmed(), ADMIN, &past).unwrap();
+}
+
+#[test]
+fn what_an_absence_or_a_cover_that_has_begun_means_is_changed_by_an_administrator_only() {
+    let c = co();
+    plain_carol_admin_actor(&c);
+    let begun = add_absence(
+        &c.f.pool,
+        &c.f.confirmed(),
+        ADMIN,
+        &new_absence(&c.carol, -2, Some(3)),
+    )
+    .unwrap()
+    .value;
+    let retype = AbsencePatch {
+        kind: Some(AbsenceKind::Training),
+        ..Default::default()
+    };
+    for confirmed in [false, true] {
+        let refused = update_absence(
+            &c.f.pool,
+            &ctx_of(&c.carol, confirmed),
+            PERSON,
+            &begun.id,
+            &retype,
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused.code(),
+            "backdating_admin_only",
+            "confirmed={confirmed}"
+        );
+    }
+    // An absence that has not begun is the person's to retype, and the administrator may change any.
+    let ahead = add_absence(
+        &c.f.pool,
+        &ctx_of(&c.carol, false),
+        PERSON,
+        &new_absence(&c.carol, 5, Some(7)),
+    )
+    .unwrap()
+    .value;
+    update_absence(
+        &c.f.pool,
+        &ctx_of(&c.carol, false),
+        PERSON,
+        &ahead.id,
+        &retype,
+    )
+    .unwrap();
+    update_absence(&c.f.pool, &c.f.confirmed(), ADMIN, &begun.id, &retype).unwrap();
+
+    let cover = set_deputy(
+        &c.f.pool,
+        &c.f.confirmed(),
+        &NewDeputy {
+            user_id: c.carol.clone(),
+            deputy_user_id: c.ian.clone(),
+            scope: DeputyScope::All,
+            valid_from: day(-2),
+            valid_to: None,
+        },
+    )
+    .unwrap()
+    .value;
+    let rescope = DeputyPatch {
+        scope: Some(DeputyScope::Approvals),
+        ..Default::default()
+    };
+    for confirmed in [false, true] {
+        let refused = update_deputy(&c.f.pool, &ctx_of(&c.carol, confirmed), &cover.id, &rescope)
+            .unwrap_err();
+        assert_eq!(
+            refused.code(),
+            "backdating_admin_only",
+            "confirmed={confirmed}"
+        );
+    }
+    update_deputy(&c.f.pool, &c.f.confirmed(), &cover.id, &rescope).unwrap();
 }
 
 #[test]
