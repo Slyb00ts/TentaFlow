@@ -20189,7 +20189,13 @@ mod tests {
         // A hundred nested messages: not provably wrong, deeper than a check goes.
         let mut deep = Vec::new();
         for _ in 0..100 {
-            let mut outer = vec![0x0a, deep.len() as u8];
+            let mut outer = vec![0x0a];
+            let mut length = deep.len();
+            while length >= 0x80 {
+                outer.push((length & 0x7f) as u8 | 0x80);
+                length >>= 7;
+            }
+            outer.push(length as u8);
             outer.append(&mut deep);
             deep = outer;
         }
