@@ -14,6 +14,10 @@
 //   - its work grows with the square of the declarations: resolving a type
 //     name scans every sibling declaration and allocates a vector per scope
 //     (20 000 messages: 0.86 s; 2 000 messages with 8 references each: 1.8 s);
+//   - two messages or enums of one name and different members make an
+//     `unwrap` in its option resolver panic (the pre-scan refuses them first;
+//     the call is still wrapped in `catch_unwind`, which also covers a map
+//     field next to a type named like its entry);
 //   - it resolves `import` against embedded copies of the well-known types,
 //     keeps `service`, `extend`, groups and extension ranges, and accepts
 //     what `protoc` refuses (a proto3 enum that does not start at zero, a
@@ -21,9 +25,15 @@
 //   - it reads files, so the text is staged in a private temporary directory
 //     (the in-memory resolver is not exported), and its error text names
 //     that path;
-//   - the dynamic decoder (`protobuf::reflect`) allocates what a payload
-//     declares (`Vec::with_capacity` of a declared length) and recurses per
-//     nested message, so payloads are walked by our own decoder instead.
+//   - the dynamic decoder (`protobuf::reflect`) is bounded by its input (a
+//     declared length is checked against the bytes left before the vector
+//     is filled, with at most 10 MB reserved ahead) but it builds the whole
+//     message in memory (an allocation per field and per nested message), has
+//     no work meter to share across a publish batch, recurses on the native
+//     stack to its limit of 100, accepts a `bool` of 2, a closed-enum value
+//     nobody declared and the numbers 19000-19999, and says "Unexpected wire
+//     type" without naming a field. It stays in the tests as an oracle (what
+//     it refuses, we must refuse), and payloads are walked by our own decoder.
 //
 // Schema text accepted: ONE `.proto` file, `syntax = "proto3"` or `"proto2"`
 // (no `syntax` line means proto2, as in protoc; `edition` is refused).
@@ -39,6 +49,9 @@
 // named by the comment `// tentabus:message <Name>`. This needs no wire change
 // to the register request, and it survives the derived projection (the
 // designated message is written first).
+//
+// Field defaults (proto2 `default`), `json_name`, `packed` and the codegen file
+// options are read and ignored: none of them changes what is on the wire.
 //
 // Resource bounds are structural, as in `avro.rs` and `xsd.rs`:
 //   - `prescan` runs on the TEXT before the library sees it: it tokenizes with
@@ -1994,6 +2007,7 @@ mod tests {
         // `textRefusalReason`): rewording one turns a plain-language
         // refusal back into a generic one.
         let imports = "syntax = \"proto3\"; import \"google/protobuf/any.proto\"; message M {}";
+        let mut misses = Vec::new();
         for (text, phrase) in [
             ("   ".to_string(), "schema text is empty"),
             ("syntax = \"proto3\";".to_string(), "the schema declares no message"),
@@ -2124,13 +2138,48 @@ mod tests {
                 "the limit is 262144",
             ),
         ] {
-            let got = refusal(&text);
-            assert!(got.contains(phrase), "{got:?} should contain {phrase:?}");
+            let got = match PROTOBUF_OPS.compile(&text) {
+                Err(SchemaError::Invalid(m)) => m,
+                other => format!("accepted: {}", format!("{other:?}").chars().take(40).collect::<String>()),
+            };
+            if !got.contains(phrase) {
+                misses.push(format!("{got:?} should contain {phrase:?}"));
+            }
         }
+        assert_eq!(misses, Vec::<String>::new());
         // A field may be called like a keyword.
         compile(&proto3(
             "string import = 1; string service = 2; string message = 3; string extend = 4;",
         ));
+    }
+
+    #[test]
+    fn the_staging_path_is_scrubbed_from_any_parser_message() {
+        let staged = "/var/folders/xx/T/tf-proto-AbC123";
+        let error =
+            anyhow::anyhow!("protobuf path `x.proto` is not found in import path [\"{staged}\"]")
+                .context("error in `schema.proto`");
+        let got = parser_failure(&error, staged);
+        assert_eq!(
+            got,
+            SchemaError::Invalid(
+                "not a valid Protobuf schema: protobuf path `x.proto` is not found in import path [\"<schema>\"]"
+                    .to_string()
+            )
+        );
+        // The line comes from the located message in the chain, and a long message is cut.
+        let located = anyhow::anyhow!("x".repeat(1000)).context("at 12:5: boom");
+        let SchemaError::Invalid(text) = parser_failure(&located, staged) else {
+            panic!()
+        };
+        assert!(
+            text.starts_with("not a valid Protobuf schema (line 12): "),
+            "{text}"
+        );
+        assert_eq!(
+            text.chars().count(),
+            "not a valid Protobuf schema (line 12): ".len() + MAX_PARSER_MESSAGE
+        );
     }
 
     #[test]
@@ -3378,6 +3427,8 @@ mod tests {
             "syntax = \"proto3\"; message M { oneof o { oneof p { int32 a = 1; } } }".to_string(),
             "syntax = \"proto3\"; enum E { }".to_string(),
             "syntax = \"proto3\"; message M { message M {} M m = 1; }".to_string(),
+            "syntax = \"proto3\"; message M { map<string, int32> a = 1; message AEntry { int32 x = 1; } }".to_string(),
+            "syntax = \"proto3\"; message M { map<string, int32> a = 1; map<string, int32> a = 2; }".to_string(),
             "syntax = \"proto3\"; message M { int32 a = 1 [default = 5]; }".to_string(),
             "syntax = \"proto3\"; message M { int32 a = 1; } message N { M.Missing m = 1; }".to_string(),
             "syntax = \"proto3\"; message M { .M m = 1; M.M n = 2; }".to_string(),

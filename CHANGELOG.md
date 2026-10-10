@@ -75,6 +75,95 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ### TentaBus
 
+- Rejestr wzorców waliduje Protobuf (F4 B2; bez nowego crate'a w lockfile:
+  `protobuf` i `protobuf-parse` 3.7.2 były w nim już (przez `onnx-ir` z Burn),
+  teraz są też bezpośrednimi zależnościami `tentaflow-core`; parser w trybie
+  czysto-Rustowym, bez `protoc`, służy tylko do czytania schematu). Wzór to **jeden plik
+  `.proto`** (proto3 lub proto2; plik bez `syntax` jest proto2, jak w
+  `protoc`), a wiadomością wzorca jest **pierwsza wiadomość najwyższego
+  poziomu** albo ta, którą wskaże komentarz `// tentabus:message Nazwa` —
+  bez zmian w protokole i bez migracji. Temat o dowolnym typie treści wiąże
+  się z wzorcem `protobuf` i może mieć `validation = warn | dlq`: ładunek to
+  jedna zserializowana wiadomość (pusty ładunek jest poprawną wiadomością, o
+  ile wzór nie ma pola `required`).
+- Odrzucane przy rejestracji z jasnym komunikatem: `import` (także typy
+  dobrze znane, np. `Any`), `service`, `extend`, `extensions`, grupy, opcje
+  własne (`option (x) = ...`), `message_set_wire_format`, `edition`, wzór
+  bez wiadomości, komentarz wskazujący wiadomość, której nie ma wśród
+  wiadomości najwyższego poziomu, a także to, co parser przepuszcza, a
+  `protoc` odrzuca: numer pola poza 1…536870911 lub w 19000–19999, numer w
+  zakresie `reserved`, pierwsza wartość wyliczenia proto3 inna niż zero, dwie
+  wartości o tym samym numerze bez `allow_alias`, klucz mapy `float`/`double`/
+  `bytes`. Dozwolone: zagnieżdżone wiadomości i wyliczenia, `oneof`, `map`,
+  `optional`, `repeated`, `reserved`, `package` i opcje, które nie zmieniają
+  zapisu na drucie (`deprecated`, `packed`, `json_name`, `java_package`...).
+- Parser `protobuf-parse` 3.7.2 jest nieodporny na złośliwy tekst, więc
+  poprzedza go kontrola tekstu (przegląd na podstawie pomiarów): parser jest
+  rekurencyjny bez limitu głębokości — kilka tysięcy zagnieżdżonych wiadomości,
+  agregatów opcji (`{a{a{...`) albo list (`[[[...`) przepełnia stos 2 MiB i
+  **przerywa proces**; praca rośnie kwadratowo z liczbą deklaracji (20 000
+  wiadomości: 0,86 s; 2 000 wiadomości po 8 odwołań: 1,8 s); dwie wiadomości o
+  tej samej nazwie i różnej treści wywołują panikę (`unwrap`) w jego module
+  opcji; pozwala na `import` wbudowanych plików; nie zna plików w pamięci, więc
+  tekst jest zapisywany do prywatnego katalogu tymczasowego, a jego komunikaty
+  błędów zawierają ścieżkę tego katalogu. Odrzucane są: nawiasy `{` i `[`
+  zagnieżdżone głębiej niż 32, wiadomości zagnieżdżone głębiej niż 16, ponad
+  256 wiadomości (mapa też jest wiadomością), 128 wyliczeń, 1024 pola w
+  wiadomości i 4096 w całym wzorze, 1024 wartości wyliczenia i 4096 łącznie,
+  1024 zakresy `reserved`, 64 pola `required` w wiadomości, 12 288 przypisań
+  (`=`), napisy ponad 256 bajtów, nazwy ponad 128 znaków, `(` (opcje własne),
+  znaki spoza ASCII poza napisami i komentarzami oraz powtórzona nazwa typu w
+  jednym zakresie. Wywołanie parsera jest dodatkowo osłonięte
+  `catch_unwind`, a jego komunikaty pozbawione ścieżki i skrócone do 200
+  znaków (z numerem wiersza).
+- Wiadomości są sprawdzane własnym iteracyjnym przejściem, a nie dekoderem
+  dynamicznym `protobuf` (ten jest ograniczony długością wejścia, ale buduje
+  całą wiadomość w pamięci, nie ma miernika pracy do podziału na paczkę,
+  schodzi rekurencyjnie do limitu 100, przyjmuje `bool` równy 2, wartość spoza
+  zamkniętego wyliczenia i numery 19000–19999, a o błędzie mówi „Unexpected
+  wire type” bez nazwy pola; zostaje wyrocznią w testach: czego odmawia, tego
+  musimy odmówić): jawny stos co najwyżej 64 ramek (bez rekurencji, więc
+  działa na małym stosie), bez alokacji na wartość; każda
+  długość jest sprawdzana względem bajtów pozostałych w wiadomości, zanim cokolwiek
+  zostanie przeczytane lub pominięte; zapakowana lista jest obciążana liczbą
+  bajtów przed iteracją; każde pole kosztuje jednostkę budżetu (20 mln na
+  dokument, wspólne dla paczki), a przekroczenie budżetu albo głębokości to
+  `schema_check_too_complex`, nigdy „niepoprawne”. Naruszeniem są: numer pola 0
+  lub ponad 2^29-1, numer 19000–19999, typy zapisu grup (3, 4) i niepoprawne
+  (6, 7), liczba zapisana na ponad 10 bajtach, typ zapisu niezgodny z typem
+  pola (lista zapakowana jest przyjmowana dla powtarzanych pól liczbowych w
+  proto2 i proto3), `int32`/`uint32`/`sint32`/wyliczenie poza zakresem, `bool` inny niż 0 i
+  1, `string` niebędący UTF-8, wartość spoza **zamkniętego** wyliczenia (proto2),
+  brak pola `required`. Przyjmowane są, jak w Protobuf: numery pól
+  nieznane wzorowi (są pomijane, z kontrolą ramek), kilka wystąpień pola
+  pojedynczego, kilka członków jednego `oneof` i dowolny `int32` w otwartym
+  wyliczeniu proto3. Ścieżka w komunikacie to nazwy pól od wiadomości wzorca,
+  nigdy wartość.
+- Zgodność wersji Protobuf: tożsamością pola jest jego **numer**; nazwy nie mają
+  znaczenia na drucie. Pole obecne po obu stronach zachowuje typ (każdy typ prosty
+  jest osobnym typem: `int32` → `int64`, `string` → `bytes`, pole pojedyncze →
+  `repeated` i wiadomość → mapa są niezgodne), wiadomości są porównywane
+  rekurencyjnie po numerach pól, mapa zachowuje typ klucza i wartości. Pole
+  tylko po jednej stronie jest pomijane przez czytelnika (dodanie i usunięcie
+  pola jest zgodne), z wyjątkiem pola `required` czytelnika, które pisarz musi
+  też deklarować jako `required`. Zamknięte wyliczenie czytelnika (proto2)
+  musi znać każdą wartość wyliczenia pisarza. Niezależnie od kierunku numer
+  zastrzeżony (`reserved`) w starej wersji nie może wrócić w nowej. backward =
+  nowy czyta dane starego, forward = stary czyta dane nowego, full = oba;
+  porównanie, które nie mieści się w limicie pracy (1 mln jednostek, głębokość
+  64), to `bus.schema_compare_too_complex`.
+- Wzór pochodny (`derive_subschema`) zostawia dozwolone pola wiadomości wzorca
+  (po nazwie) i każdy typ, do którego prowadzą, w tym samym zagnieżdżeniu;
+  wiadomość wzorca jest zapisywana pierwsza, więc wynik jest poprawnym wzorcem
+  bez komentarza, a jego treść jest deterministyczna. Rzutowanie odczytu dla
+  formatów binarnych (polityki pól) to osobny pakiet B6.
+- Dashboard: kafel Protobuf w „Dodaj wzór” z podpowiedzią, jak nazwać
+  wiadomość wzorca, odmowy po polsku (import i nieobsługiwane elementy,
+  numery i nazwy pól, wyliczenia proto3, klucz mapy, limity), powód odmowy
+  wersji nazywa pole, oba typy, wartość wyliczenia albo zastrzeżony numer,
+  karta „Pola wiadomości” na stronie wzoru (numer, nazwa, typ, obecność) i
+  przetłumaczone powody w Nieprzetworzonych (pięć języków).
+
 - Rejestr wzorców waliduje Avro (F4 B1, biblioteka `apache-avro` 0.22 z ASF,
   bez kodeków kompresji; tylko do czytania schematów i serializacji
   podschematu). Temat `avro/binary`, `application/octet-stream` lub dowolny
