@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use rusqlite::Connection;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Migracje moga byc:
 /// - `Sql` — zwykly batch SQL wykonany przez `execute_batch`
@@ -277,6 +277,16 @@ pub fn run(conn: &Connection) -> Result<()> {
         }
     }
 
+    if crossing_absence_reason_purge {
+        // The purge runs inside the migration's transaction, where a checkpoint cannot; this is
+        // the first point outside it. It folds the zeroed pages into the main file and truncates
+        // the WAL, which otherwise still holds the pre-purge page images until the next checkpoint.
+        // A reader holding the WAL open only delays that, so it is not an error here.
+        if let Err(e) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())) {
+            warn!("WAL checkpoint after the absence reason purge failed: {e}");
+        }
+    }
+
     if crossing_identity_flip || crossing_ledger_secret_purge || crossing_absence_reason_purge {
         conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, '1')",
@@ -299,19 +309,31 @@ pub const ABSENCE_REASON_PURGE_VERSION: i64 = 200;
 
 /// Whether an absence was ever minted or materialized here: `core_resource_versions`
 /// is stamped for both, so a row means the local ledger may hold an operation body
-/// that carries the reason.
+/// that carries the reason. An absence capture that was never drained into the ledger
+/// carries it too and becomes an operation body later, so it counts as well (v200
+/// deletes those rows, so this must be asked before the ladder runs).
 fn ledger_may_hold_absences(conn: &Connection) -> Result<bool> {
-    let versions_exist: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master \
-         WHERE type = 'table' AND name = 'core_resource_versions')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !versions_exist {
+    let table_exists = |name: &str| -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |row| row.get(0),
+        )?)
+    };
+    if table_exists("core_resource_versions")?
+        && conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM core_resource_versions WHERE resource_type = 'core.org_absence')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?
+    {
+        return Ok(true);
+    }
+    if !table_exists("__tentaflow_core_sync_captures")? {
         return Ok(false);
     }
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM core_resource_versions WHERE resource_type = 'core.org_absence')",
+        "SELECT EXISTS(SELECT 1 FROM __tentaflow_core_sync_captures WHERE resource_type = 'core.org_absence')",
         [],
         |row| row.get(0),
     )?)
@@ -1272,8 +1294,10 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
 /// reason, drops the column and removes the capture journal rows of absences,
 /// which hold the reason inside an opaque blob. With `secure_delete` the freed
 /// pages are zeroed. The ledger half lives in Fjall and is not reachable from a
-/// migration; `run` arms the baseline reset for it. Pages freed earlier, backups
-/// and operations already on peers that have not upgraded still hold the values.
+/// migration; `run` arms the baseline reset for it. In WAL mode the pre-purge page
+/// images stay in the WAL until it is checkpointed, which cannot happen inside this
+/// transaction; `run` truncates the WAL right after the ladder. Pages freed earlier,
+/// backups and operations already on peers that have not upgraded still hold the values.
 fn org_absences_drop_reason(conn: &Connection) -> Result<()> {
     let secure_delete: i64 = conn.query_row("PRAGMA secure_delete", [], |row| row.get(0))?;
     conn.query_row("PRAGMA secure_delete = ON", [], |_| Ok(()))?;
@@ -16607,6 +16631,32 @@ mod tests {
         assert_eq!(pending(&conn).as_deref(), Some("1"));
 
         assert_eq!(pending(&seeded(false)), None, "a node that never saw an absence pays no reset");
+    }
+
+    /// An absence capture still waiting in the journal becomes a ledger operation body that carries
+    /// the reason, so a node holding one pays the reset even when no version row was stamped yet.
+    #[test]
+    fn an_undrained_absence_capture_arms_the_reset_on_v200() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 199);
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO __tentaflow_core_sync_captures (capture_id, org_id, table_name, resource_type, \
+                resource_id, primary_key, action, changed_fields_blob, created_at_ms) \
+             VALUES ('c-1', ?1, 'org_absences', 'core.org_absence', 'a-1', 'id', 'insert', x'6465', 1)",
+            [crate::services::org::DEFAULT_ORG_ID],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        run(&conn).unwrap();
+        let pending: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                [CORE_BASELINE_RESET_PENDING_KEY],
+                |r| r.get(0),
+            )
+            .ok();
+        assert_eq!(pending.as_deref(), Some("1"));
     }
 
     /// v179 on a database at v178: subjects (deprecations, generation) and

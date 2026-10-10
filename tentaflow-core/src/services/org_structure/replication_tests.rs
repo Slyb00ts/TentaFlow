@@ -178,3 +178,108 @@ fn an_absence_operation_from_an_older_node_cannot_bring_a_reason_back() {
         .unwrap();
     assert_eq!(stored, member);
 }
+
+fn versions_of(pool: &crate::db::DbPool, resource_id: &str) -> i64 {
+    pool.read()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM core_resource_versions WHERE resource_id = ?1",
+            [resource_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn a_write_the_organization_check_skipped_earns_no_place_in_the_lww_order() {
+    let f = Fixture::new();
+    f.unit("Board", None);
+    let capture = captures_of(&f.pool, "core.org_unit").remove(0);
+    let peer = peer();
+    apply_in(&peer.pool, &operation_from(&capture)).unwrap();
+    assert_eq!(versions_of(&peer.pool, &capture.resource_id), 0);
+
+    // The other organization's envelope names the same row id: the upsert changes nothing.
+    let mut hijack = operation_from(&capture);
+    hijack.body.org_id = peer.other_org.clone();
+    hijack.body.changed_fields.insert(
+        "org_id".to_string(),
+        FieldValue::String(peer.other_org.clone()),
+    );
+    assert_eq!(
+        crate::sync::core_materializer::apply_core_operation(&peer.pool, &hijack).unwrap(),
+        0
+    );
+    assert_eq!(
+        versions_of(&peer.pool, &capture.resource_id),
+        0,
+        "a version stamped here would let the hijacker outrank the row's own organization"
+    );
+    assert_eq!(units_named(&peer.pool, ORG), ["Board"]);
+
+    // The row's own organization still replicates it and is ordered normally.
+    assert_eq!(
+        crate::sync::core_materializer::apply_core_operation(&peer.pool, &operation_from(&capture))
+            .unwrap(),
+        1
+    );
+    assert_eq!(versions_of(&peer.pool, &capture.resource_id), 1);
+}
+
+#[test]
+fn a_row_that_references_something_of_another_organization_only_is_refused() {
+    let f = Fixture::new();
+    let member = super::tests::add_user(&f.pool, ORG, "anna");
+    add_absence(
+        &f.pool,
+        &f.confirmed(),
+        Actor { is_admin: true },
+        &NewAbsence {
+            user_id: member,
+            valid_from: super::tests::day(1),
+            valid_to: Some(super::tests::day(3)),
+            kind: AbsenceKind::Leave,
+        },
+    )
+    .unwrap();
+    let capture = captures_of(&f.pool, "core.org_absence").remove(0);
+    let peer = peer();
+    let stranger = super::tests::add_user(&peer.pool, &peer.other_org, "stranger");
+
+    let apply_absence = |user: &str| {
+        let mut operation = operation_from(&capture);
+        operation
+            .body
+            .changed_fields
+            .insert("user_id".to_string(), FieldValue::String(user.to_string()));
+        let mut conn = peer.pool.write().unwrap();
+        let tx = conn.transaction().unwrap();
+        repl::apply(&tx, Kind::OrgAbsence, &operation)
+    };
+    let refused = apply_absence(&stranger);
+    assert!(refused.is_err(), "{refused:?}");
+    // A user the peer has not heard of yet is not refused: tables arrive in no fixed order.
+    assert_eq!(apply_absence("not-yet-replicated").unwrap(), 1);
+
+    // The same holds for the structure's own references.
+    {
+        let conn = peer.pool.write().unwrap();
+        conn.execute(
+            "INSERT INTO org_unit_types (id, org_id, name) VALUES ('type-foreign', ?1, 'Foreign')",
+            [&peer.other_org],
+        )
+        .unwrap();
+    }
+    let unit = {
+        f.unit("Board", None);
+        captures_of(&f.pool, "core.org_unit").remove(0)
+    };
+    let mut operation = operation_from(&unit);
+    operation.body.changed_fields.insert(
+        "type_id".to_string(),
+        FieldValue::String("type-foreign".to_string()),
+    );
+    let refused = apply_in(&peer.pool, &operation);
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(units_named(&peer.pool, ORG).is_empty());
+}

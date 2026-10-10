@@ -292,13 +292,97 @@ fn to_sql_value(value: Option<&FieldValue>) -> LedgerResult<Value> {
     })
 }
 
+/// What a column of a replicated row points at.
+enum Target {
+    /// A column of another structure table (the stable id, not the version row's key).
+    Column(&'static str, &'static str),
+    /// A user, through `org_memberships`.
+    Member,
+}
+
+/// The columns of `table` that name rows owned by an organization.
+fn references_of(table: &str) -> &'static [(&'static str, Target)] {
+    use Target::{Column, Member};
+    match table {
+        "org_units" => &[
+            ("type_id", Column("org_unit_types", "id")),
+            ("parent_unit_id", Column("org_units", "unit_id")),
+            ("head_position_id", Column("org_positions", "position_id")),
+        ],
+        "org_positions" => &[("unit_id", Column("org_units", "unit_id"))],
+        "org_unit_deputy_heads" => &[
+            ("unit_id", Column("org_units", "unit_id")),
+            ("position_id", Column("org_positions", "position_id")),
+        ],
+        "org_reporting_lines" => &[
+            ("position_id", Column("org_positions", "position_id")),
+            ("parent_position_id", Column("org_positions", "position_id")),
+        ],
+        "org_assignments" => &[
+            ("position_id", Column("org_positions", "position_id")),
+            ("user_id", Member),
+            ("external_person_id", Column("org_external_persons", "id")),
+        ],
+        "org_change_sets" => &[("author_user_id", Member), ("approver_user_id", Member)],
+        "org_deputies" => &[
+            ("user_id", Member),
+            ("deputy_user_id", Member),
+            ("created_by", Member),
+        ],
+        "org_absences" => &[("user_id", Member), ("created_by", Member)],
+        _ => &[],
+    }
+}
+
+/// True when the referenced row exists only in other organizations. A row that has
+/// not arrived yet is not refused: operations of different tables are not ordered.
+fn names_foreign_row(
+    tx: &Transaction<'_>,
+    target: &Target,
+    value: &str,
+    org_id: &str,
+) -> rusqlite::Result<bool> {
+    let (table, column) = match target {
+        Target::Column(table, column) => (*table, *column),
+        Target::Member => ("org_memberships", "user_id"),
+    };
+    tx.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM {table} WHERE {column} = ?1 AND org_id <> ?2) \
+             AND NOT EXISTS(SELECT 1 FROM {table} WHERE {column} = ?1 AND org_id = ?2)"
+        ),
+        [value, org_id],
+        |r| r.get(0),
+    )
+}
+
+/// True when the operation's row key exists, but in another organization: such an
+/// operation changed nothing and must not earn a place in the LWW order of the row.
+pub fn row_is_owned_elsewhere(
+    tx: &Transaction<'_>,
+    kind: Kind,
+    operation: &SyncOperation,
+) -> LedgerResult<bool> {
+    let spec = spec_for(kind);
+    tx.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM {} WHERE {} = ?1 AND org_id <> ?2)",
+            spec.table, spec.pk
+        ),
+        [&operation.body.resource_id, &operation.body.org_id],
+        |r| r.get(0),
+    )
+    .map_err(|e| SyncLedgerError::Runtime(e.to_string()))
+}
+
 /// Applies one replicated operation. The whole row travels on every write, so
 /// an upsert is a full replace of the non-key columns.
 ///
 /// The organization comes from the signed envelope (`body.org_id`), never from
 /// the row a peer sends: a row that names another organization is refused, an
 /// upsert never replaces a row that belongs to another organization, and a
-/// delete reaches only the organization's own row.
+/// delete reaches only the organization's own row. A row whose references name rows
+/// of another organization only is refused as well.
 pub fn apply(tx: &Transaction<'_>, kind: Kind, operation: &SyncOperation) -> LedgerResult<usize> {
     let spec = spec_for(kind);
     let id = &operation.body.resource_id;
@@ -325,6 +409,18 @@ pub fn apply(tx: &Transaction<'_>, kind: Kind, operation: &SyncOperation) -> Led
                     "{} row names a different organization than its operation",
                     spec.table
                 )));
+            }
+            for (column, target) in references_of(spec.table) {
+                let Some(FieldValue::String(value)) = operation.body.changed_fields.get(*column)
+                else {
+                    continue;
+                };
+                if names_foreign_row(tx, target, value, org_id).map_err(sql_error)? {
+                    return Err(SyncLedgerError::Runtime(format!(
+                        "{} row references {column} of another organization",
+                        spec.table
+                    )));
+                }
             }
             let placeholders: Vec<String> =
                 (1..=spec.columns.len()).map(|n| format!("?{n}")).collect();

@@ -337,7 +337,13 @@ pub fn apply_core_operation(pool: &DbPool, operation: &SyncOperation) -> LedgerR
         | CoreSyncResourceKind::OrgChangeSet
         | CoreSyncResourceKind::OrgDeputy
         | CoreSyncResourceKind::OrgAbsence => {
-            crate::services::org_structure::replication::apply(&tx, descriptor.kind, operation)?
+            use crate::services::org_structure::replication as org_repl;
+            let rows = org_repl::apply(&tx, descriptor.kind, operation)?;
+            // A write that touched nothing because the row belongs to another organization is
+            // not the author's to order.
+            authorized =
+                rows > 0 || !org_repl::row_is_owned_elsewhere(&tx, descriptor.kind, operation)?;
+            rows
         }
     };
 
