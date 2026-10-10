@@ -15,9 +15,14 @@
 //     name scans every sibling declaration and allocates a vector per scope
 //     (20 000 messages: 0.86 s; 2 000 messages with 8 references each: 1.8 s);
 //   - two messages or enums of one name and different members make an
-//     `unwrap` in its option resolver panic (the pre-scan refuses them first;
-//     the call is still wrapped in `catch_unwind`, which also covers a map
-//     field next to a type named like its entry);
+//     `unwrap` in its option resolver panic, and so does a `map<K, V> a` next
+//     to a type named `AEntry` (or two maps whose names camel-case alike, or a
+//     group next to a type of its name): the release profile is
+//     `panic = "abort"`, so a panic there ends the process and `catch_unwind`
+//     around the call only helps dev and test builds. The pre-scan therefore
+//     refuses every one of those collisions BEFORE the parser runs, and a
+//     mutation fuzz (900 000 mutated schemas, structural and lexical) found
+//     no panic past it;
 //   - it resolves `import` against embedded copies of the well-known types,
 //     keeps `service`, `extend`, groups and extension ranges, and accepts
 //     what `protoc` refuses (a proto3 enum that does not start at zero, a
@@ -61,8 +66,10 @@
 //     `MAX_ASSIGNMENTS` `=`, `MAX_MESSAGES` messages (map fields count, they
 //     become messages), `MAX_ENUMS` enums, identifiers over `MAX_NAME_LEN`,
 //     strings over `MAX_STRING_LITERAL`, `(` anywhere (custom options),
-//     non-ASCII outside strings and comments, and `import` / `service` /
-//     `extend` / `extensions` used as the keyword that starts a statement.
+//     non-ASCII outside strings and comments, a type name (message, enum or
+//     the entry of a `map`) declared twice in one scope, and `import` /
+//     `service` / `extend` / `extensions` / `group` used as the keyword that
+//     starts a statement or a field.
 //   - after parsing, the descriptor is checked against the same caps exactly
 //     (messages, nesting, fields per message and in total, enum values), and
 //     against what protoc validates and the parser does not.
@@ -178,6 +185,9 @@ const PACKED_SIZE: &str = "packed field does not hold a whole number of elements
 const VALUE_RANGE: &str = "value does not fit the declared type";
 const ENUM_UNDECLARED: &str = "enum value is not declared in the closed enum";
 const REQUIRED_MISSING: &str = "required field is missing";
+/// What a refusal says when the parser panicked anyway; nothing the pre-scan lets
+/// through may produce it (`mutated_schema_texts_never_panic_and_stay_fast`).
+const PARSER_PANIC: &str = "not a valid Protobuf schema: the parser could not read the text";
 const TOO_COMPLEX: &str = "the schemas are too complex to compare; compatibility cannot be proven";
 
 fn invalid(msg: impl Into<String>) -> SchemaError {
@@ -399,6 +409,33 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// The name of the message the parser makes for the `map<K, V> name` whose `<`
+/// is at `open`: the field name in upper camel case plus `Entry`.
+fn map_entry_name(text: &str, open: usize) -> Option<String> {
+    let rest = &text[open + 1..];
+    let close = rest.as_bytes().iter().take(1024).position(|&b| b == b'>')?;
+    let after = rest[close + 1..].trim_start();
+    let end = after.bytes().take_while(|b| is_ident_byte(*b)).count();
+    let field = &after[..end];
+    if field.is_empty() || field.as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
+    let mut name = String::with_capacity(field.len() + 5);
+    let mut capitalize = true;
+    for c in field.chars() {
+        if c == '_' {
+            capitalize = true;
+        } else if capitalize {
+            name.push(c.to_ascii_uppercase());
+            capitalize = false;
+        } else {
+            name.push(c);
+        }
+    }
+    name.push_str("Entry");
+    Some(name)
+}
+
 /// Walks the text with the lexer's own rules and refuses what would overflow
 /// the parser's stack or what it handles in quadratic time (see the header).
 fn prescan(text: &str) -> Result<Prescan, SchemaError> {
@@ -416,7 +453,7 @@ fn prescan(text: &str) -> Result<Prescan, SchemaError> {
     // Type names declared in each open `{`: the parser panics (an `unwrap` in
     // its option resolver) on two messages or enums of one name, so a repeat
     // is refused here with its own sentence.
-    let mut scopes: Vec<HashSet<&str>> = vec![HashSet::new()];
+    let mut scopes: Vec<HashSet<String>> = vec![HashSet::new()];
     while i < b.len() {
         let c = b[i];
         match c {
@@ -500,6 +537,9 @@ fn prescan(text: &str) -> Result<Prescan, SchemaError> {
                     let starts_name =
                         next.is_some_and(|c| c.is_ascii_alphabetic() || c == b'_' || c == b'.');
                     match word {
+                        "group" if next.is_some_and(|c| c.is_ascii_uppercase()) => {
+                            return Err(invalid("groups are not supported"))
+                        }
                         "import"
                             if depth == 0
                                 && (starts_name || matches!(next, Some(b'"' | b'\''))) =>
@@ -532,7 +572,7 @@ fn prescan(text: &str) -> Result<Prescan, SchemaError> {
                             let name = &text[name_start..name_start + name_len];
                             if !name.is_empty()
                                 && !name.as_bytes()[0].is_ascii_digit()
-                                && !scopes.last_mut().expect("a scope").insert(name)
+                                && !scopes.last_mut().expect("a scope").insert(name.to_string())
                             {
                                 return Err(invalid(format!(
                                     "type '{name}' is defined more than once"
@@ -541,6 +581,11 @@ fn prescan(text: &str) -> Result<Prescan, SchemaError> {
                         }
                         _ => {}
                     }
+                }
+                if word == "group"
+                    && matches!(previous_ident, Some("optional" | "required" | "repeated"))
+                {
+                    return Err(invalid("groups are not supported"));
                 }
                 statement_start = false;
                 previous_ident = Some(word);
@@ -597,6 +642,15 @@ fn prescan(text: &str) -> Result<Prescan, SchemaError> {
             b'<' => {
                 if previous_ident == Some("map") {
                     messages += 1;
+                    // The parser declares `<CamelName>Entry` next to the other
+                    // types of the scope, and panics when that name is taken.
+                    if let Some(entry) = map_entry_name(text, i) {
+                        if !scopes.last_mut().expect("a scope").insert(entry.clone()) {
+                            return Err(invalid(format!(
+                                "type '{entry}' is defined more than once"
+                            )));
+                        }
+                    }
                 }
                 statement_start = false;
                 previous_ident = None;
@@ -672,11 +726,7 @@ fn run_parser(text: &str) -> Result<FileDescriptorProto, SchemaError> {
             .parse_and_typecheck()
     }));
     let parsed = match parsed {
-        Err(_) => {
-            return Err(invalid(
-                "not a valid Protobuf schema: the parser could not read the text",
-            ))
-        }
+        Err(_) => return Err(invalid(PARSER_PANIC)),
         Ok(Err(e)) => return Err(parser_failure(&e, &staged)),
         Ok(Ok(parsed)) => parsed,
     };
@@ -3458,15 +3508,34 @@ mod tests {
         }
     }
 
-    #[test]
-    fn mutated_schema_texts_never_panic_and_stay_fast() {
-        let seed = fixtures::read("protobuf", "order.proto");
-        let vocabulary = [
+    /// Seeds for the schema fuzz: the fixtures and two files that use every
+    /// construct the parser has a name table for.
+    fn fuzz_seeds() -> Vec<String> {
+        vec![
+            fixtures::read("protobuf", "order.proto"),
+            fixtures::read("protobuf/proto2", "legacy.proto"),
+            "syntax = \"proto3\"; package p.q;\n\
+             message A { message B { enum E { Z = 0; Y = 1; } E e = 1; map<string, B> m = 2; repeated C c = 3;\n\
+               oneof o { int32 x = 4; string y = 5; } reserved 9, 11 to 13; reserved \"q\"; }\n\
+               B b = 1; optional C c = 2; }\n\
+             message C { A.B b = 1; A a = 2; map<int32, C> cs = 3; map<string, int32> foo_bar = 4; }\n\
+             enum Top { T0 = 0; T1 = 1; }"
+                .to_string(),
+            "syntax = \"proto2\"; message M { required int32 a = 1; optional M child = 2; repeated N n = 3;\n\
+               optional string s = 5 [default = \"x\"]; message N { optional int32 z = 1; } enum K { A = 1; } }"
+                .to_string(),
+        ]
+    }
+
+    /// One structural or lexical mutation of a schema text, chosen by `rng`.
+    fn mutate_schema(text: &mut String, rng: &mut Xorshift) {
+        const VOCABULARY: [&str; 40] = [
             "message ",
             "enum ",
             "oneof ",
             "map<",
-            ">",
+            "string,",
+            "int32>",
             "{",
             "}",
             "[",
@@ -3485,6 +3554,7 @@ mod tests {
             "reserved ",
             "extend ",
             "group ",
+            "option ",
             "\"",
             "'",
             "/*",
@@ -3493,43 +3563,195 @@ mod tests {
             "\n",
             ".",
             "-",
+            "A.B",
+            "Entry",
+            "AEntry",
+            "MEntry",
+            "_",
+            "max",
+            "to ",
         ];
+        let boundary_before = |text: &String, at: usize| {
+            (0..=at.min(text.len()))
+                .rev()
+                .find(|i| text.is_char_boundary(*i))
+                .unwrap()
+        };
+        let lines = |text: &String| text.lines().map(str::to_string).collect::<Vec<_>>();
+        match rng.below(8) {
+            0 => {
+                let mut v = lines(text);
+                if !v.is_empty() {
+                    let i = rng.below(v.len());
+                    v.insert(i, v[i].clone());
+                    *text = v.join("\n");
+                }
+            }
+            1 => {
+                let mut v = lines(text);
+                if v.len() > 2 {
+                    let (i, j) = (rng.below(v.len()), rng.below(v.len()));
+                    v.swap(i, j);
+                    *text = v.join("\n");
+                }
+            }
+            2 => {
+                let mut v = lines(text);
+                if v.len() > 2 {
+                    v.remove(rng.below(v.len()));
+                    *text = v.join("\n");
+                }
+            }
+            3 => {
+                // Make two names the same: the collisions the parser trips on.
+                let bytes = text.as_bytes();
+                let (mut idents, mut i) = (Vec::new(), 0);
+                while i < bytes.len() {
+                    if bytes[i].is_ascii_alphabetic() {
+                        let start = i;
+                        while i < bytes.len()
+                            && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
+                        {
+                            i += 1;
+                        }
+                        idents.push((start, i));
+                    } else {
+                        i += 1;
+                    }
+                }
+                if idents.len() > 2 {
+                    let (from, to) = (
+                        idents[rng.below(idents.len())],
+                        idents[rng.below(idents.len())],
+                    );
+                    let word = text[to.0..to.1].to_string();
+                    text.replace_range(from.0..from.1, &word);
+                }
+            }
+            4 => {
+                let at = boundary_before(text, rng.below(text.len() + 1));
+                text.insert_str(at, VOCABULARY[rng.below(VOCABULARY.len())]);
+            }
+            5 => {
+                let at = boundary_before(text, rng.below(text.len().max(1)));
+                let end = (at + 1 + rng.below(6)).min(text.len());
+                if text.is_char_boundary(end) {
+                    text.replace_range(at..end, "");
+                }
+            }
+            6 => {
+                let digits: Vec<usize> = text
+                    .bytes()
+                    .enumerate()
+                    .filter(|(_, b)| b.is_ascii_digit())
+                    .map(|(i, _)| i)
+                    .collect();
+                if !digits.is_empty() {
+                    let at = digits[rng.below(digits.len())];
+                    let number = [
+                        "0",
+                        "1",
+                        "2",
+                        "3",
+                        "19000",
+                        "536870911",
+                        "536870912",
+                        "99999999999",
+                    ][rng.below(8)];
+                    text.replace_range(at..at + 1, number);
+                }
+            }
+            _ => {
+                let at = boundary_before(text, rng.below(text.len() + 1));
+                let mut end = (at + 1 + rng.below(60)).min(text.len());
+                while !text.is_char_boundary(end) {
+                    end += 1;
+                }
+                let chunk = text[at..end].to_string();
+                let to = boundary_before(text, rng.below(text.len() + 1));
+                text.insert_str(to, &chunk);
+            }
+        }
+    }
+
+    #[test]
+    fn mutated_schema_texts_never_panic_and_stay_fast() {
+        // A release build aborts on a panic (`panic = "abort"`), so the
+        // `catch_unwind` around the parser cannot save it there: no mutation
+        // may reach a panic at all, which is what `PARSER_PANIC` would say.
+        let seeds = fuzz_seeds();
         let mut rng = Xorshift(0x9e37_79b9_7f4a_7c15);
         let started = Instant::now();
         let mut accepted = 0;
-        for _ in 0..300 {
-            let mut text = seed.clone().into_bytes();
+        let iterations = 4000;
+        for _ in 0..iterations {
+            let mut text = seeds[rng.below(seeds.len())].clone();
             for _ in 0..1 + rng.below(4) {
-                let at = rng.below(text.len());
-                match rng.below(3) {
-                    0 => {
-                        text.remove(at);
-                    }
-                    1 => {
-                        let word = vocabulary[rng.below(vocabulary.len())];
-                        text.splice(at..at, word.bytes());
-                    }
-                    _ => text[at] = b' ' + (rng.next() % 94) as u8,
-                }
+                mutate_schema(&mut text, &mut rng);
             }
-            let text = String::from_utf8(text).unwrap();
             let one = Instant::now();
-            let verdict = on_stack(512, move || PROTOBUF_OPS.compile(&text).is_ok());
+            let shown = text.clone();
+            let verdict = on_stack(512, move || PROTOBUF_OPS.compile(&text).map(|_| ()));
             assert!(
                 one.elapsed() < Duration::from_secs(2),
-                "one mutation took {:?}",
+                "one mutation took {:?}: {shown}",
                 one.elapsed()
             );
-            accepted += usize::from(verdict);
+            match verdict {
+                Ok(()) => accepted += 1,
+                Err(SchemaError::Invalid(m)) => {
+                    assert_ne!(m, PARSER_PANIC, "the parser panicked on: {shown}")
+                }
+                Err(other) => panic!("{other:?}"),
+            }
         }
         eprintln!(
-            "timing: 300 mutated schemas: {:?}, {accepted} accepted",
+            "timing: {iterations} mutated schemas: {:?}, {accepted} accepted",
             started.elapsed()
         );
         assert!(
-            accepted > 0 && accepted < 300,
+            accepted > iterations / 50 && accepted < iterations,
             "the mutations should hit both outcomes: {accepted}"
         );
+    }
+
+    #[test]
+    fn a_map_entry_and_a_group_cannot_collide_with_a_type_of_the_scope() {
+        // Each of these makes protobuf-parse panic (option_resolver.rs, an
+        // `unwrap`), which a release build cannot catch.
+        for (text, phrase) in [
+            (
+                "syntax = \"proto3\"; message M { map<string, int32> a = 1; message AEntry { int32 x = 1; } }",
+                "type 'AEntry' is defined more than once",
+            ),
+            (
+                "syntax = \"proto3\"; message M { message AEntry { int32 x = 1; } map<string, int32> a = 1; }",
+                "type 'AEntry' is defined more than once",
+            ),
+            (
+                "syntax = \"proto3\"; message M { map<string, int32> foo_bar = 1; map<int32, string> fooBar = 2; }",
+                "type 'FooBarEntry' is defined more than once",
+            ),
+            (
+                "syntax = \"proto3\"; message M { map<string, int32> a = 1; enum AEntry { Z = 0; } }",
+                "type 'AEntry' is defined more than once",
+            ),
+            (
+                "syntax = \"proto2\"; message M { optional group G = 1 { optional int32 z = 1; } message G { optional int32 y = 1; } }",
+                "groups are not supported",
+            ),
+            (
+                "syntax = \"proto2\"; message M { oneof o { group G = 1 { optional int32 z = 1; } } }",
+                "groups are not supported",
+            ),
+        ] {
+            let got = refusal(text);
+            assert!(got.contains(phrase), "{text}: {got}");
+            assert_ne!(got, PARSER_PANIC, "{text}");
+        }
+        // The same names in different scopes, and a field called `group`, are fine.
+        compile("syntax = \"proto3\"; message M { map<string, int32> a = 1; } message N { message AEntry { int32 x = 1; } }");
+        compile("syntax = \"proto3\"; message M { string group = 1; map<string, int32> a = 2; map<string, int32> b = 3; }");
     }
 
     #[test]

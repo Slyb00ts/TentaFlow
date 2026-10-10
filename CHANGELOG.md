@@ -104,16 +104,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   **przerywa proces**; praca rośnie kwadratowo z liczbą deklaracji (20 000
   wiadomości: 0,86 s; 2 000 wiadomości po 8 odwołań: 1,8 s); dwie wiadomości o
   tej samej nazwie i różnej treści wywołują panikę (`unwrap`) w jego module
-  opcji; pozwala na `import` wbudowanych plików; nie zna plików w pamięci, więc
-  tekst jest zapisywany do prywatnego katalogu tymczasowego, a jego komunikaty
-  błędów zawierają ścieżkę tego katalogu. Odrzucane są: nawiasy `{` i `[`
+  opcji, podobnie jak pole `map<K, V> a` obok typu `AEntry` (wpis mapy), dwie
+  mapy o nazwach dających ten sam wpis i grupa obok typu o jej nazwie —
+  profil `release` ma `panic = "abort"`, więc taka panika kończy proces, a
+  `catch_unwind` pomaga tylko w buildach dev i testowych (dlatego kolizje
+  odrzuca kontrola tekstu przed parserem; fuzz 900 000 zmutowanych wzorów nie
+  znalazł już paniki); pozwala na `import` wbudowanych plików; nie zna plików
+  w pamięci, więc tekst jest zapisywany do prywatnego katalogu tymczasowego, a
+  jego komunikaty błędów zawierają ścieżkę tego katalogu. Odrzucane są: nawiasy `{` i `[`
   zagnieżdżone głębiej niż 32, wiadomości zagnieżdżone głębiej niż 16, ponad
   256 wiadomości (mapa też jest wiadomością), 128 wyliczeń, 1024 pola w
   wiadomości i 4096 w całym wzorze, 1024 wartości wyliczenia i 4096 łącznie,
   1024 zakresy `reserved`, 64 pola `required` w wiadomości, 12 288 przypisań
   (`=`), napisy ponad 256 bajtów, nazwy ponad 128 znaków, `(` (opcje własne),
-  znaki spoza ASCII poza napisami i komentarzami oraz powtórzona nazwa typu w
-  jednym zakresie. Wywołanie parsera jest dodatkowo osłonięte
+  znaki spoza ASCII poza napisami i komentarzami, grupy oraz powtórzona nazwa
+  typu (także wpisu mapy) w jednym zakresie. Wywołanie parsera jest dodatkowo osłonięte
   `catch_unwind`, a jego komunikaty pozbawione ścieżki i skrócone do 200
   znaków (z numerem wiersza).
 - Wiadomości są sprawdzane własnym iteracyjnym przejściem, a nie dekoderem
