@@ -2156,7 +2156,7 @@ mod tests {
                 "type 'A' is defined more than once",
             ),
             (
-                format!("syntax = \"proto3\"; message M {{ {} }}", "}".repeat(1)),
+                "syntax = \"proto3\"; message M { } }".to_string(),
                 "a closing bracket has no opening one",
             ),
             (
