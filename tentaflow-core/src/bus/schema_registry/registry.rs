@@ -511,7 +511,7 @@ mod test_hooks {
 ///     compatibility mode (skipped for a brand-new subject, which has
 ///     nothing to be compatible WITH yet);
 ///   - a NEW subject defaults to `Backward`; a non-`None` compatibility on a
-///     type with no validator (`protobuf`/`thrift`) is rejected
+///     type with no validator (`thrift`) is rejected
 ///     UNLESS the caller explicitly passes `Some(Compatibility::None)`.
 #[allow(clippy::too_many_arguments)]
 pub fn register(
@@ -1372,16 +1372,16 @@ mod tests {
     }
 
     #[test]
-    fn register_protobuf_requires_explicit_compatibility_none() {
+    fn register_thrift_requires_explicit_compatibility_none() {
         let db = fresh_db();
-        let proto_text = "syntax = \"proto3\"; message X {}";
+        let thrift_text = "struct X {}";
         let err = register(
             &db,
             "tentabus-00000001",
             "org-1",
             "events",
-            SchemaType::Protobuf,
-            proto_text,
+            SchemaType::Thrift,
+            thrift_text,
             None,
             None,
         )
@@ -1393,8 +1393,8 @@ mod tests {
             "tentabus-00000001",
             "org-1",
             "events",
-            SchemaType::Protobuf,
-            proto_text,
+            SchemaType::Thrift,
+            thrift_text,
             Some(Compatibility::None),
             None,
         )

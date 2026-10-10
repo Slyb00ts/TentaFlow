@@ -456,6 +456,22 @@ test('every HL7 and XSD sentence a message can be refused with is told in Polish
     ['/a/[]: document exceeds the validation work budget', '/a/[]: dokument jest zbyt duży, żeby sprawdzić go wzorem w rozsądnym czasie.'],
   ];
   for (const [server, expected] of avro) assert.equal(plainCheckError(server), expected, server);
+  // The Protobuf checker's own sentences (protobuf.rs `Walker`); framing errors share the Avro ones.
+  const protobuf = [
+    ['<root>: field number is out of range', 'Numer pola jest poza dozwolonym zakresem.'],
+    ['<root>: field number is in the range reserved for the protobuf implementation', 'Numer pola leży w zakresie 19000–19999, zarezerwowanym dla biblioteki Protobuf.'],
+    ['/id: wire type does not match the type declared for the field', '/id: sposób zapisu pola nie zgadza się z typem pola we wzorze.'],
+    ['<root>: group wire types are not supported', 'Wiadomość używa starych grup Protobuf, których rejestr nie obsługuje.'],
+    ['<root>: wire type is not valid', 'Pole ma niepoprawny sposób zapisu.'],
+    ['/hashes: packed field does not hold a whole number of elements', '/hashes: lista zapisana w jednym kawałku nie składa się z całej liczby elementów.'],
+    ['/lines/qty: value does not fit the declared type', '/lines/qty: liczba nie mieści się w typie pola.'],
+    ['/kind: enum value is not declared in the closed enum', '/kind: ta wartość nie należy do typu wyliczeniowego (proto2 przyjmuje tylko zadeklarowane wartości).'],
+    ['/id: required field is missing', '/id: brakuje pola wymaganego (required).'],
+    ['/customer: declared length exceeds the remaining payload', '/customer: zapisana długość jest większa niż reszta wiadomości.'],
+    ['/customer: string is not valid UTF-8', '/customer: tekst nie jest poprawnym UTF-8.'],
+    ['/xs: document exceeds the validation work budget', '/xs: dokument jest zbyt duży, żeby sprawdzić go wzorem w rozsądnym czasie.'],
+  ];
+  for (const [server, expected] of protobuf) assert.equal(plainCheckError(server), expected, server);
   assert.equal(plainCheckError('/pacjent: a sentence nobody mapped'), '');
 });
 

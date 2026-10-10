@@ -8,7 +8,7 @@
 // the pattern's own description (`description` of a JSON Schema or an HL7
 // profile, `doc` of an Avro record, `xs:annotation/xs:documentation` of an
 // XSD), an HL7 profile spelled out as required segments and fields, an Avro
-// record as a table of its fields, the
+// record or a Protobuf message as a table of its fields, the
 // versions with "Wycofaj" per row, and the compatibility card with "Zmień".
 // Every change goes through a window (schema-windows.js) and comes back as a
 // note over the page.
@@ -162,6 +162,146 @@ export function avroFieldsView(text) {
     .map((f) => ({ name: f.name, type: avroTypeLabel(f.type), optional: 'default' in f || avroAllowsNull(f.type) }));
 }
 
+const PROTO_KEYWORD_BLOCKS = new Set(['message', 'enum', 'extend', 'service']);
+
+/** The tokens of a .proto text without comments (`i` name, `n` number, `s` string, `p` one symbol), or `null` for an unfinished comment or string. */
+function protoTokens(source) {
+  const s = String(source || '');
+  const out = [];
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (/\s/.test(c)) { i += 1; continue; }
+    if (c === '/' && s[i + 1] === '/') { while (i < s.length && s[i] !== '\n') i += 1; continue; }
+    if (c === '/' && s[i + 1] === '*') {
+      const end = s.indexOf('*/', i + 2);
+      if (end < 0) return null;
+      i = end + 2;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      let j = i + 1;
+      while (j < s.length && s[j] !== c) j += s[j] === '\\' ? 2 : 1;
+      if (j >= s.length) return null;
+      out.push({ t: 's', v: s.slice(i, j + 1) });
+      i = j + 1;
+      continue;
+    }
+    if (/[A-Za-z_]/.test(c)) {
+      let j = i;
+      while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) j += 1;
+      out.push({ t: 'i', v: s.slice(i, j) });
+      i = j;
+      continue;
+    }
+    if (/[0-9]/.test(c)) {
+      let j = i;
+      while (j < s.length && /[A-Za-z0-9_.]/.test(s[j])) j += 1;
+      out.push({ t: 'n', v: s.slice(i, j) });
+      i = j;
+      continue;
+    }
+    out.push({ t: 'p', v: c });
+    i += 1;
+  }
+  return out;
+}
+
+/** Index of the `}` that closes the `{` at `open`, or -1. */
+function protoBlockEnd(tokens, open) {
+  let depth = 0;
+  for (let i = open; i < tokens.length; i += 1) {
+    if (tokens[i].t !== 'p') continue;
+    if (tokens[i].v === '{') depth += 1;
+    else if (tokens[i].v === '}') {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+const protoSymbol = (tokens, i, v) => tokens[i]?.t === 'p' && tokens[i].v === v;
+
+/** The fields of one message body (`from` to `to`, exclusive), those of a `oneof` marked with its name. */
+function protoBodyFields(tokens, from, to, oneof) {
+  const fields = [];
+  let i = from;
+  while (i < to) {
+    const tok = tokens[i];
+    if (tok.t === 'p' && tok.v === ';') { i += 1; continue; }
+    if (tok.t === 'i' && PROTO_KEYWORD_BLOCKS.has(tok.v)) {
+      const open = tokens.findIndex((x, k) => k > i && x.t === 'p' && x.v === '{');
+      const end = open < 0 ? -1 : protoBlockEnd(tokens, open);
+      if (end < 0) return fields;
+      i = end + 1;
+      continue;
+    }
+    if (tok.t === 'i' && tok.v === 'oneof' && tokens[i + 1]?.t === 'i' && protoSymbol(tokens, i + 2, '{')) {
+      const end = protoBlockEnd(tokens, i + 2);
+      if (end < 0) return fields;
+      fields.push(...protoBodyFields(tokens, i + 3, end, tokens[i + 1].v));
+      i = end + 1;
+      continue;
+    }
+    // A statement: up to its `;`, or the end of a block it opens (a group).
+    let end = i;
+    let depth = 0;
+    while (end < to && !(depth === 0 && tokens[end].t === 'p' && (tokens[end].v === ';' || tokens[end].v === '{'))) {
+      if (tokens[end].t === 'p' && tokens[end].v === '[') depth += 1;
+      if (tokens[end].t === 'p' && tokens[end].v === ']') depth -= 1;
+      end += 1;
+    }
+    const statement = tokens.slice(i, end);
+    if (protoSymbol(tokens, end, '{')) {
+      const close = protoBlockEnd(tokens, end);
+      i = (close < 0 ? to : close) + 1;
+      continue;
+    }
+    i = end + 1;
+    if (['option', 'reserved', 'extensions'].includes(statement[0]?.v)) continue;
+    const eq = statement.findIndex((x) => x.t === 'p' && x.v === '=');
+    if (eq < 2 || statement[eq + 1]?.t !== 'n') continue;
+    const head = statement.slice(0, eq);
+    const name = head[head.length - 1];
+    let label = 'optional';
+    let typeTokens = head.slice(0, -1);
+    if (['optional', 'required', 'repeated'].includes(typeTokens[0]?.v) && typeTokens.length > 1) {
+      label = typeTokens[0].v;
+      typeTokens = typeTokens.slice(1);
+    }
+    if (!typeTokens.length || name.t !== 'i') continue;
+    const type = typeTokens.map((x) => (x.v === ',' ? ', ' : x.v)).join('');
+    fields.push({ number: Number(statement[eq + 1].v), name: name.v, type, label: oneof ? `oneof:${oneof}` : label });
+  }
+  return fields;
+}
+
+/**
+ * The fields of the message a .proto text designates (the one named by the
+ * comment `// tentabus:message Name`, else the first top-level message),
+ * spelled out: `[{ number, name, type, label }]` with `label` one of
+ * `required`, `optional`, `repeated` or `oneof:<name>`. `null` when the text
+ * has no such message or cannot be read.
+ */
+export function protobufFieldsView(text) {
+  const tokens = protoTokens(text);
+  if (!tokens) return null;
+  const named = /^[ \t]*\/\/[ \t]*tentabus:message[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*\r?$/m.exec(String(text || ''))?.[1];
+  let depth = 0;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const tok = tokens[i];
+    if (tok.t === 'p' && tok.v === '{') depth += 1;
+    else if (tok.t === 'p' && tok.v === '}') depth -= 1;
+    else if (depth === 0 && tok.t === 'i' && tok.v === 'message' && tokens[i + 1]?.t === 'i' && protoSymbol(tokens, i + 2, '{')
+      && (!named || tokens[i + 1].v === named)) {
+      const end = protoBlockEnd(tokens, i + 2);
+      return end < 0 ? null : protoBodyFields(tokens, i + 3, end, null);
+    }
+  }
+  return null;
+}
+
 /**
  * The text as the page shows it: a pattern written in JSON is laid out with
  * indentation (patterns sent over REST often arrive on one line); "Kopiuj"
@@ -273,6 +413,15 @@ function pageHtml(name) {
               <tf-column key="field" label="${escapeAttr(T('schemas.detail.profile_field'))}" renderer="html"></tf-column>
               <tf-column key="type" label="${escapeAttr(T('schemas.detail.avro_type'))}" renderer="html" fill></tf-column>
               <tf-column key="presence" label="${escapeAttr(T('schemas.detail.avro_presence'))}" renderer="html"></tf-column>
+            </tf-table>
+          </div>
+          <div class="tb-profile" data-role="protobuf" hidden>
+            <label class="tb-profile-label">${escapeHtml(T('schemas.detail.protobuf_fields'))}</label>
+            <tf-table data-role="protobuf-fields">
+              <tf-column key="number" label="${escapeAttr(T('schemas.detail.protobuf_number'))}" renderer="html"></tf-column>
+              <tf-column key="field" label="${escapeAttr(T('schemas.detail.profile_field'))}" renderer="html"></tf-column>
+              <tf-column key="type" label="${escapeAttr(T('schemas.detail.protobuf_type'))}" renderer="html" fill></tf-column>
+              <tf-column key="presence" label="${escapeAttr(T('schemas.detail.protobuf_presence'))}" renderer="html"></tf-column>
             </tf-table>
           </div>
           <div class="muted" data-role="text-note"></div>
@@ -485,6 +634,7 @@ function paintText(body, view, effective) {
   aboutEl.hidden = !about;
   paintProfile(body, ready && info.schemaType === 'hl7v2_profile' ? hl7ProfileView(shown.text) : null);
   paintAvroFields(body, ready && info.schemaType === 'avro' ? avroFieldsView(shown.text) : null);
+  paintProtobufFields(body, ready && info.schemaType === 'protobuf' ? protobufFieldsView(shown.text) : null);
   if (ready && editor.__tbText !== `${info.schemaType}\u0000${shown.text}`) {
     editor.__tbText = `${info.schemaType}\u0000${shown.text}`;
     editor.setAttribute('language', editorLanguage(info.schemaType));
@@ -519,6 +669,24 @@ function paintAvroFields(body, fields) {
     type: `<span class="tf-table__cell--mono">${escapeHtml(f.type)}</span>`,
     presence: escapeHtml(T(f.optional ? 'schemas.detail.avro_optional' : 'schemas.detail.avro_required')),
     _key: f.name,
+  })));
+}
+
+function protobufPresence(label) {
+  if (label.startsWith('oneof:')) return T('schemas.detail.protobuf_oneof', { name: label.slice(6) });
+  return T(`schemas.detail.protobuf_${label}`);
+}
+
+function paintProtobufFields(body, fields) {
+  const el = body.querySelector('[data-role="protobuf"]');
+  el.hidden = !fields?.length;
+  if (!fields?.length) return;
+  setRowsIfChanged(body.querySelector('[data-role="protobuf-fields"]'), fields.map((f) => ({
+    number: `<span class="tf-table__cell--mono">${escapeHtml(String(f.number))}</span>`,
+    field: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(f.name)}</span></span>`,
+    type: `<span class="tf-table__cell--mono">${escapeHtml(f.type)}</span>`,
+    presence: escapeHtml(protobufPresence(f.label)),
+    _key: String(f.number),
   })));
 }
 

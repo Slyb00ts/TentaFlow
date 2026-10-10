@@ -1,7 +1,7 @@
 // =============================================================================
 // File: bus/schema_registry/stored_only.rs — kinds without a validator yet
 // =============================================================================
-// `protobuf` / `thrift` subjects can be
+// `thrift` subjects can be
 // registered and versioned so integrators can stage schemas ahead of F4, but
 // nothing in this build can evaluate a payload against them. `compile` is a
 // shape smoke-check only; every other operation returns
@@ -66,7 +66,6 @@ impl SchemaKindOps for StoredOnlyOps {
     }
 }
 
-pub(super) static PROTOBUF_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Protobuf);
 pub(super) static THRIFT_OPS: StoredOnlyOps = StoredOnlyOps(SchemaType::Thrift);
 
 #[cfg(test)]
@@ -75,22 +74,20 @@ mod tests {
 
     #[test]
     fn compile_is_a_shape_smoke_check() {
-        assert!(PROTOBUF_OPS
-            .compile("syntax = \"proto3\"; message X {}")
-            .is_ok());
+        assert!(THRIFT_OPS.compile("struct X {}").is_ok());
         assert!(THRIFT_OPS.compile("   ").is_err());
     }
 
     #[test]
     fn every_other_operation_is_unsupported_until_f4() {
-        let ops = &PROTOBUF_OPS;
-        let compiled = ops.compile("message X {}").unwrap();
+        let ops = &THRIFT_OPS;
+        let compiled = ops.compile("struct X {}").unwrap();
         assert!(matches!(
             ops.validate(&compiled, b"{}"),
             Err(SchemaError::Unsupported { .. })
         ));
         assert!(matches!(
-            ops.derive_subschema("message X {}", &BTreeSet::new()),
+            ops.derive_subschema("struct X {}", &BTreeSet::new()),
             Err(SchemaError::Unsupported { .. })
         ));
         assert!(ops

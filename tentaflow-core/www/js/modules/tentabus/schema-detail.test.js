@@ -18,7 +18,7 @@ if (typeof globalThis.DOMParser === 'undefined' && window.DOMParser) globalThis.
 
 const {
   schemaDescription, displayText, versionState, downloadName, editorLanguage, headerLine, withdrawnText, versionRows,
-  drawSchemaDetail, shareShownText, hl7ProfileView, avroFieldsView,
+  drawSchemaDetail, shareShownText, hl7ProfileView, avroFieldsView, protobufFieldsView,
 } = await import('./schema-detail.js');
 
 const norm = (s) => String(s).replace(/[  ]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -388,4 +388,74 @@ test('an Avro pattern\'s page lists the fields of the record above the text; oth
   assert.equal(json.body.querySelector('[data-role="avro"]').hidden, true);
   const broken = mount({ info: avro, shown: { version: 3, text: 'not json', error: null } });
   assert.equal(broken.body.querySelector('[data-role="avro"]').hidden, true);
+});
+
+const ORDER_PROTO = `syntax = "proto3";
+package shop;
+
+// tentabus:message Order
+message Helper { int32 h = 1; }
+
+/* a block comment with message Fake { int32 z = 1; } inside */
+message Order {
+  // The id; "message Nope { }" in a comment is not a block.
+  int64 id = 1;
+  optional string note = 2 [deprecated = true];
+  repeated Line lines = 3;
+  map<string, int32> attrs = 4;
+  .shop.Order.Status status = 5;
+  oneof contact {
+    string email = 6;
+    int32 phone_code = 7;
+  }
+  reserved 8, 10 to 12;
+  option deprecated = false;
+  extensions 100 to 199;
+  message Line { string sku = 1; int32 qty = 2; }
+  enum Status { UNKNOWN = 0; NEW = 1; }
+}
+`;
+
+test('a Protobuf message spelled out: each field with its number, type and presence, those of a oneof marked, nested types and options skipped', () => {
+  assert.deepEqual(protobufFieldsView(ORDER_PROTO), [
+    { number: 1, name: 'id', type: 'int64', label: 'optional' },
+    { number: 2, name: 'note', type: 'string', label: 'optional' },
+    { number: 3, name: 'lines', type: 'Line', label: 'repeated' },
+    { number: 4, name: 'attrs', type: 'map<string, int32>', label: 'optional' },
+    { number: 5, name: 'status', type: '.shop.Order.Status', label: 'optional' },
+    { number: 6, name: 'email', type: 'string', label: 'oneof:contact' },
+    { number: 7, name: 'phone_code', type: 'int32', label: 'oneof:contact' },
+  ]);
+  // Without the comment the first top-level message is the one.
+  const first = protobufFieldsView(ORDER_PROTO.replace('// tentabus:message Order', '// nothing here'));
+  assert.deepEqual(first, [{ number: 1, name: 'h', type: 'int32', label: 'optional' }]);
+  assert.deepEqual(protobufFieldsView('syntax = "proto2"; message M { required int32 a = 1; optional string b = 2 [default = "x;y"]; optional group G = 3 { optional int32 z = 1; } repeated int32 c = 4; }'), [
+    { number: 1, name: 'a', type: 'int32', label: 'required' },
+    { number: 2, name: 'b', type: 'string', label: 'optional' },
+    { number: 4, name: 'c', type: 'int32', label: 'repeated' },
+  ]);
+  assert.equal(protobufFieldsView('not a schema'), null);
+  assert.equal(protobufFieldsView('message M { int32 a = 1; /* never closed'), null);
+  assert.equal(protobufFieldsView('// tentabus:message Nope\nmessage M { int32 a = 1; }'), null);
+  assert.deepEqual(protobufFieldsView('message M { }'), []);
+});
+
+test('a Protobuf pattern\'s page lists the fields of the message above the text; other formats do not show the table', () => {
+  const proto = { ...wizyta, subject: 'zamowienie', schemaType: 'protobuf' };
+  const { body } = mount({ name: 'zamowienie', info: proto, shown: { version: 3, text: ORDER_PROTO, error: null } });
+  assert.equal(body.querySelector('[data-role="protobuf"]').hidden, false);
+  assert.equal(body.querySelector('[data-role="avro"]').hidden, true);
+  const table = body.querySelector('[data-role="protobuf-fields"]');
+  assert.equal(table.rows.length, 7);
+  assert.match(table.rows[0].number, />1</);
+  assert.match(table.rows[0].field, />id</);
+  assert.match(table.rows[2].type, />Line</);
+  assert.equal(norm(table.rows[2].presence), 'powtarzane');
+  assert.equal(norm(table.rows[0].presence), 'opcjonalne');
+  assert.equal(norm(table.rows[5].presence), 'jedno z: contact');
+  assert.equal(downloadName('zamowienie', 3, 'protobuf'), 'zamowienie-v3.proto');
+  const json = mount({ shown: { version: 3, text: TEXT, error: null } });
+  assert.equal(json.body.querySelector('[data-role="protobuf"]').hidden, true);
+  const broken = mount({ info: proto, shown: { version: 3, text: 'nothing', error: null } });
+  assert.equal(broken.body.querySelector('[data-role="protobuf"]').hidden, true);
 });

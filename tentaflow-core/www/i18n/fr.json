@@ -10350,7 +10350,8 @@
         "refused": "Le modèle {name} n’a pas été ajouté.",
         "text_hint_hl7v2_profile": "Un profil est un texte JSON avec des listes de segments et de champs obligatoires, par ex. {example}. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1.",
         "text_hint_xsd": "Un modèle XSD ordinaire écrit dans un seul fichier fonctionne, sans fichiers inclus et sans les parties plus avancées de XSD. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1.",
-        "text_hint_avro": "Un modèle Avro est un schéma écrit en JSON, p. ex. {example}. Il vérifie un seul message écrit dans l’encodage binaire Avro, sans en-tête de fichier Avro ni en-tête Confluent. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1."
+        "text_hint_avro": "Un modèle Avro est un schéma écrit en JSON, p. ex. {example}. Il vérifie un seul message écrit dans l’encodage binaire Avro, sans en-tête de fichier Avro ni en-tête Confluent. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1.",
+        "text_hint_protobuf": "Un modèle Protobuf est un fichier .proto (proto3 ou proto2) écrit d’un seul tenant, sans « import ». Il décrit un message : le premier du fichier ou celui que nomme un commentaire comme « // tentabus:message Order ». Exemple : {example}. Il vérifie un seul message écrit dans l’encodage binaire Protobuf. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1."
       },
       "version": {
         "title": "Nouvelle version du modèle {name}",
@@ -10423,7 +10424,11 @@
         "fix_element_old": "Laissez {list} parmi les éléments obligatoires ou changez la compatibilité du modèle.",
         "avro_fix_required_new": "Donnez à « {field} » une valeur par défaut (\"default\") ou changez la compatibilité du modèle.",
         "avro_type": "le type de « {path} » change : {from} ne peut pas être lu comme {to}",
-        "avro_enum": "l’enum « {name} » perd le symbole « {symbol} », que les messages peuvent encore contenir"
+        "avro_enum": "l’enum « {name} » perd le symbole « {symbol} », que les messages peuvent encore contenir",
+        "proto_fix_required_new": "Laissez « {field} » optionnel (sans « required ») ou changez la compatibilité du modèle.",
+        "proto_enum": "l’enum « {name} » perd la valeur {value}, que des messages peuvent encore contenir",
+        "proto_enum_open": "l’enum « {name} » accepte n’importe quel nombre, mais l’autre version a un enum fermé (proto2) qui ne connaît que ses propres valeurs",
+        "proto_reserved": "le numéro de champ {number} était réservé (« reserved ») dans la version précédente et ne peut pas être réutilisé"
       },
       "compat_window": {
         "title": "Changer la compatibilité — {name}",
@@ -10525,7 +10530,15 @@
         "avro_type": "Type",
         "avro_presence": "Présence",
         "avro_required": "obligatoire",
-        "avro_optional": "facultatif"
+        "avro_optional": "facultatif",
+        "protobuf_fields": "Champs du message",
+        "protobuf_number": "Numéro",
+        "protobuf_type": "Type",
+        "protobuf_presence": "Présence",
+        "protobuf_required": "obligatoire",
+        "protobuf_optional": "facultatif",
+        "protobuf_repeated": "répété",
+        "protobuf_oneof": "un parmi : {name}"
       },
       "added_existing_title": "Le modèle {name} existait déjà",
       "added_existing_version": "Quelqu’un l’a ajouté entre-temps, le texte y est donc entré en version {version}.",
@@ -10589,7 +10602,36 @@
         "avro_limit_depth": "Les types sont imbriqués sur plus de {limit} niveaux.",
         "avro_default": "La valeur par défaut d’un champ ne correspond pas à la première branche de son union. Dans une union Avro, la valeur par défaut doit être du type de la première branche (par exemple null si null vient en premier).",
         "avro_default_type": "La valeur par défaut d’un champ ne correspond pas au type de ce champ. Elle doit être écrite comme une valeur de ce type (par exemple un nombre pour int, du texte pour string, l’un des symboles pour un enum).",
-        "avro_limit_text": "Une description (doc) ou un attribut personnalisé dépasse {limit} octets. Raccourcis le texte."
+        "avro_limit_text": "Une description (doc) ou un attribut personnalisé dépasse {limit} octets. Raccourcis le texte.",
+        "proto_invalid": "Protobuf n’a pas accepté ce fichier : vérifiez la syntaxe (points-virgules, accolades), les noms de types et que chaque type utilisé est défini dans le même fichier. Les détails sont plus bas.",
+        "proto_import": "Un modèle Protobuf doit être un seul fichier autonome : « import » n’est pas pris en charge. Collez les messages nécessaires dans le même fichier.",
+        "proto_unsupported": "Ce modèle contient un élément que le registre ne prend pas en charge : {what}. Les messages (message), les enums, oneof et les maps suffisent pour vérifier des messages.",
+        "proto_what_service": "service (services)",
+        "proto_what_extend": "extend (extensions)",
+        "proto_what_extensions": "extensions (plages d’extension)",
+        "proto_what_group": "group (groupes)",
+        "proto_what_custom": "options personnalisées, p. ex. option (x) = …",
+        "proto_what_message_set": "message_set_wire_format",
+        "proto_no_message": "Ce fichier ne contient aucun message (message). Le modèle doit décrire un message.",
+        "proto_designated": "Le commentaire « // tentabus:message Nom » désigne un message qui ne fait pas partie des messages de premier niveau du fichier. Utilisez le nom d’un message écrit en dehors des autres messages.",
+        "proto_designation": "Le commentaire « // tentabus:message » doit être suivi du nom d’un message et ne peut apparaître qu’une fois.",
+        "proto_numbers": "Dans un message, les numéros et les noms de champs doivent être uniques. Un numéro de champ doit être compris entre 1 et 536870911, hors de 19000–19999 et hors des numéros réservés (reserved).",
+        "proto_type_missing": "Le modèle utilise un type qui n’y est pas défini. Définissez chaque type dans le même fichier.",
+        "proto_defined_twice": "Deux types portent le même nom au même endroit. Donnez-leur des noms différents.",
+        "proto_enum_zero": "En proto3, la première valeur d’un enum doit être zéro, et deux valeurs ne peuvent partager un numéro qu’avec l’option allow_alias.",
+        "proto_map_key": "La clé d’une map peut être un entier, un bool ou un string (pas float, double, bytes ni un message), et la valeur d’une map ne peut pas être une autre map.",
+        "proto_limit_depth": "Le modèle a des accolades imbriquées sur plus de {limit} niveaux.",
+        "proto_limit_nesting": "Les messages sont imbriqués sur plus de {limit} niveaux.",
+        "proto_limit_messages": "Le modèle a plus de {limit} messages (une map compte aussi comme un message). Simplifiez-le.",
+        "proto_limit_enums": "Le modèle a plus de {limit} enums.",
+        "proto_limit_fields": "Un message, ou tout le modèle, a plus de {limit} champs. Divisez-le en messages plus petits.",
+        "proto_limit_values": "Un enum, ou tous ensemble, ont plus de {limit} valeurs.",
+        "proto_limit_reserved": "Un message réserve plus de {limit} plages de numéros (reserved).",
+        "proto_limit_required": "Un message a plus de {limit} champs obligatoires (required).",
+        "proto_limit_assignments": "Le modèle a plus de {limit} affectations (numéros de champs, valeurs d’enum et options). Simplifiez-le.",
+        "proto_limit_string": "Un texte entre guillemets dépasse {limit} octets.",
+        "proto_limit_name": "Un nom dépasse {limit} caractères.",
+        "proto_lexical": "Le modèle a un commentaire, un texte entre guillemets ou une accolade non fermés, ou un caractère qu’un fichier .proto ne peut pas contenir."
       }
     },
     "topics": {
@@ -11377,7 +11419,16 @@
         "avro_union": "le numéro de la branche de l’union est hors de la liste.",
         "avro_block_count": "un tableau ou une map déclare plus d’éléments que le reste du message ne peut en contenir.",
         "avro_block_size": "la taille d’un bloc de tableau ou de map ne correspond pas à ses éléments.",
-        "avro_too_deep": "le message est imbriqué trop profondément pour être vérifié."
+        "avro_too_deep": "le message est imbriqué trop profondément pour être vérifié.",
+        "proto_field_number": "le numéro de champ est hors de la plage autorisée.",
+        "proto_field_reserved": "le numéro de champ est dans la plage 19000–19999, réservée à la bibliothèque Protobuf.",
+        "proto_wire": "la façon dont le champ est écrit ne correspond pas au type du champ dans le modèle.",
+        "proto_group": "le message utilise d’anciens groupes Protobuf, que le registre ne prend pas en charge.",
+        "proto_wire_invalid": "un champ a une manière d’être écrit non valide.",
+        "proto_packed": "une liste écrite d’un seul tenant ne contient pas un nombre entier d’éléments.",
+        "proto_range": "le nombre ne tient pas dans le type du champ.",
+        "proto_enum_closed": "cette valeur n’appartient pas à l’enum (proto2 n’accepte que les valeurs déclarées).",
+        "proto_required": "un champ obligatoire (required) est absent."
       }
     },
     "access": {

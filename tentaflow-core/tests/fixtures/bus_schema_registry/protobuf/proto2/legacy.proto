@@ -1,0 +1,16 @@
+syntax = "proto2";
+
+package shop;
+
+message Legacy {
+  required int32 id = 1;
+  optional string name = 2 [default = "anonymous"];
+  optional Kind kind = 3;
+  repeated int32 counts = 4 [packed = true];
+  repeated int32 loose = 5;
+
+  enum Kind {
+    PERSON = 1;
+    COMPANY = 2;
+  }
+}

@@ -51,6 +51,9 @@ export const HL7_PROFILE_EXAMPLE = '{"description": "Przyjęcie pacjenta", "requ
 /** The shape of an Avro schema, shown in the add window (its keys are Avro's, not translated). */
 export const AVRO_SCHEMA_EXAMPLE = '{"type": "record", "name": "Order", "fields": [{"name": "id", "type": "long"}, {"name": "customer", "type": "string"}]}';
 
+/** The shape of a Protobuf schema, shown in the add window (its words are Protobuf's, not translated). */
+export const PROTOBUF_SCHEMA_EXAMPLE = 'syntax = "proto3"; message Order { int64 id = 1; string customer = 2; }';
+
 const byteLength = (text) => new TextEncoder().encode(String(text)).length;
 
 // ---------------------------------------------------------------------------
@@ -368,6 +371,14 @@ const AVRO_REQUIRES = /the (new|old) schema requires field '([^']*)' of record '
 const AVRO_TYPE = /(<root>|\/\S*): (.+?) written by the (?:old|new) schema cannot be read as (.+?) by the (?:old|new) schema/;
 const AVRO_ENUM = /enum '([^']*)': symbol '([^']*)' of the (?:old|new) schema is unknown/;
 
+// The Protobuf checker's sentences (protobuf.rs `Compat::messages`): a field one side requires without the
+// other always writing it, a closed enum missing a value, a number the old version reserved. A changed
+// type uses the Avro sentence (`AVRO_TYPE`).
+const PROTO_REQUIRES = /the (new|old) schema requires field '([^']*)' \(number \d+\) of message '[^']*', which the (?:new|old) schema does not always write/;
+const PROTO_ENUM = /enum '([^']*)': value (-?\d+) of the (?:old|new) schema is unknown to the (?:old|new) schema, whose enum is closed/;
+const PROTO_ENUM_OPEN = /enum '([^']*)' of the (?:old|new) schema accepts any number, but the enum of the (?:old|new) schema is closed/;
+const PROTO_RESERVED = /field number (\d+) is reserved by the old schema and cannot be used by the new one/;
+
 const quotedList = (items) => listText(items.map((item) => T('schemas.incompat.quoted', { item })));
 
 /**
@@ -431,6 +442,19 @@ export function incompatibilityReason({ mode, detail, newText }) {
       ? { reason: T('schemas.incompat.required_new', { field: name }), fix: T('schemas.incompat.avro_fix_required_new', { field: name }) }
       : { reason: T('schemas.incompat.required_old', { field: name }), fix: T('schemas.incompat.fix_required_old', { field: name }) };
   }
+  const protoRequires = PROTO_REQUIRES.exec(detail);
+  if (protoRequires) {
+    const [, side, name] = protoRequires;
+    return side === 'new'
+      ? { reason: T('schemas.incompat.required_new', { field: name }), fix: T('schemas.incompat.proto_fix_required_new', { field: name }) }
+      : { reason: T('schemas.incompat.required_old', { field: name }), fix: T('schemas.incompat.fix_required_old', { field: name }) };
+  }
+  const protoEnum = PROTO_ENUM.exec(detail);
+  if (protoEnum) return { reason: T('schemas.incompat.proto_enum', { name: protoEnum[1], value: protoEnum[2] }), fix: generic };
+  const protoEnumOpen = PROTO_ENUM_OPEN.exec(detail);
+  if (protoEnumOpen) return { reason: T('schemas.incompat.proto_enum_open', { name: protoEnumOpen[1] }), fix: generic };
+  const protoReserved = PROTO_RESERVED.exec(detail);
+  if (protoReserved) return { reason: T('schemas.incompat.proto_reserved', { number: protoReserved[1] }), fix: generic };
   const avroType = AVRO_TYPE.exec(detail);
   if (avroType) return { reason: T('schemas.incompat.avro_type', { path: avroType[1] === '<root>' ? '/' : avroType[1], from: avroType[2], to: avroType[3] }), fix: generic };
   const avroEnum = AVRO_ENUM.exec(detail);
@@ -510,6 +534,30 @@ const AVRO_LIMIT_REFUSALS = [
   [/^the schema is nested deeper than (\d+) levels/, 'depth'],
   [/^a (?:doc|custom attribute) is longer than (\d+) bytes$/, 'text'],
 ];
+// The static caps of protobuf.rs (compile refusals); the captured number is the limit.
+const PROTOBUF_LIMIT_REFUSALS = [
+  [/^the schema is nested deeper than (\d+) levels/, 'depth'],
+  [/^messages are nested deeper than (\d+) levels/, 'nesting'],
+  [/^the schema has more than (\d+) messages/, 'messages'],
+  [/^the schema has more than (\d+) enums/, 'enums'],
+  [/^(?:message '[^']*'|the schema) has more than (\d+) fields/, 'fields'],
+  [/^enum '[^']*' has more than (\d+) values/, 'values'],
+  [/^the schema has more than (\d+) enum values/, 'values'],
+  [/^message '[^']*' reserves more than (\d+) ranges/, 'reserved'],
+  [/^message '[^']*' has more than (\d+) required fields/, 'required'],
+  [/^the schema has more than (\d+) assignments/, 'assignments'],
+  [/^a string is longer than (\d+) bytes/, 'string'],
+  [/^a name is longer than (\d+) characters/, 'name'],
+];
+// Constructs the registry does not take (protobuf.rs `prescan` / `lower`), by the word the schema author wrote.
+const PROTOBUF_UNSUPPORTED = [
+  [/^service is not supported/, 'service'],
+  [/^extend is not supported/, 'extend'],
+  [/^extension ranges are not supported/, 'extensions'],
+  [/^groups are not supported/, 'group'],
+  [/^custom options are not supported/, 'custom'],
+  [/^message_set_wire_format is not supported/, 'message_set'],
+];
 const NUMBER_TYPE_ADVICE = { float: 'decimal', double: 'decimal', long: 'integer', short: 'int', byte: 'int', unsignedInt: 'integer', unsignedLong: 'integer', nonNegativeInteger: 'integer', positiveInteger: 'integer', negativeInteger: 'integer' };
 
 /**
@@ -547,6 +595,31 @@ export function textRefusalReason(schemaType, serverText) {
       const m = re.exec(text);
       if (m) return T(`schemas.refused.avro_limit_${key}`, { limit: m[1] });
     }
+    return null;
+  }
+  if (schemaType === 'protobuf') {
+    if (/^not a valid Protobuf schema/.test(text)) {
+      // The parser words two fields with one number like two with one name.
+      if (/Non-unique field name/.test(text)) return T('schemas.refused.proto_numbers');
+      if (/object is not found by path/.test(text)) return T('schemas.refused.proto_type_missing');
+      return T('schemas.refused.proto_invalid');
+    }
+    if (/^import is not supported/.test(text)) return T('schemas.refused.proto_import');
+    const unsupported = PROTOBUF_UNSUPPORTED.find(([re]) => re.test(text));
+    if (unsupported) return T('schemas.refused.proto_unsupported', { what: T(`schemas.refused.proto_what_${unsupported[1]}`) });
+    if (/^the schema declares no message/.test(text)) return T('schemas.refused.proto_no_message');
+    if (/^the designated message '[^']*' is not a top-level message/.test(text)) return T('schemas.refused.proto_designated');
+    if (/^the comment '\/\/ tentabus:message'/.test(text)) return T('schemas.refused.proto_designation');
+    if (/has two fields (?:numbered|named)|uses a reserved number or name|which is not in 1 to \d+ outside/.test(text)) return T('schemas.refused.proto_numbers');
+    if (/is not defined in the schema$/.test(text)) return T('schemas.refused.proto_type_missing');
+    if (/is defined more than once$/.test(text)) return T('schemas.refused.proto_defined_twice');
+    if (/^the first value of the proto3 enum|without allow_alias$/.test(text)) return T('schemas.refused.proto_enum_zero');
+    if (/has a key that is not an integer, bool or string/.test(text)) return T('schemas.refused.proto_map_key');
+    for (const [re, key] of PROTOBUF_LIMIT_REFUSALS) {
+      const m = re.exec(text);
+      if (m) return T(`schemas.refused.proto_limit_${key}`, { limit: m[1] });
+    }
+    if (/^(?:a comment is never closed|a string is never closed|a bracket is never closed|a closing bracket has no|the schema contains a character)/.test(text)) return T('schemas.refused.proto_lexical');
     return null;
   }
   if (schemaType === 'xsd') {
@@ -752,6 +825,7 @@ export function addTextHint(schemaType) {
   if (schemaType === 'hl7v2_profile') return T('schemas.add.text_hint_hl7v2_profile', { example: HL7_PROFILE_EXAMPLE });
   if (schemaType === 'xsd') return T('schemas.add.text_hint_xsd');
   if (schemaType === 'avro') return T('schemas.add.text_hint_avro', { example: AVRO_SCHEMA_EXAMPLE });
+  if (schemaType === 'protobuf') return T('schemas.add.text_hint_protobuf', { example: PROTOBUF_SCHEMA_EXAMPLE });
   return T('schemas.add.text_hint');
 }
 

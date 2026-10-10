@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package shop;
+
+// A shop order. The first message of the file is the one every payload of the
+// subject is an instance of.
+message Order {
+  int64 id = 1;
+  string customer = 2;
+  bool paid = 3;
+  Status status = 4;
+  repeated Line lines = 5;
+  repeated string tags = 6;
+  repeated sint32 scores = 7;
+  map<string, int32> attrs = 8;
+  oneof contact {
+    string email = 9;
+    int32 phone_code = 10;
+  }
+  fixed64 created = 11;
+  optional double discount = 12;
+  bytes blob = 13;
+  repeated fixed32 hashes = 14;
+
+  enum Status {
+    UNKNOWN = 0;
+    NEW = 1;
+    SHIPPED = 2;
+  }
+
+  message Line {
+    string sku = 1;
+    int32 qty = 2;
+    double price = 3;
+  }
+}

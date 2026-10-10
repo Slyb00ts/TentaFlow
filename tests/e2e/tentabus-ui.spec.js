@@ -2228,6 +2228,7 @@ test('U5 Dodaj wzór, then a new version refused in plain words, the compatibili
     ['avro', 'Avro'],
     ['hl7v2_profile', 'profil HL7 v2'],
     ['json_schema', 'JSON Schema'],
+    ['protobuf', 'Protobuf'],
     ['xsd', 'XSD'],
   ]);
   await expect(win.locator('tf-choice-card[value="xsd"]')).toHaveAttribute('heading', 'XSD');
@@ -2648,6 +2649,88 @@ test('F4 an HL7 profile and an XSD: added from "Dodaj wzór", spelled out on the
     }
   } finally {
     await cleanup();
+  }
+  expect(errors.filter((e) => !/schema_incompatible|BadRequest|invalid_argument/.test(e)), errors.join('\n')).toEqual([]);
+});
+
+const PROTO_NAME = `zamowienie-proto-${RUN}`;
+const PROTO_V1 = `// tentabus:message Order
+syntax = "proto3";
+message Header { string trace = 1; }
+message Order {
+  int64 id = 1;
+  repeated Line lines = 2;
+  map<string, int32> attrs = 3;
+  oneof contact {
+    string email = 4;
+    int32 phone_code = 5;
+  }
+  message Line { string sku = 1; int32 qty = 2; }
+}
+`;
+
+test('F4 a Protobuf pattern: the hint names the message, a refused import is told in words, the page lists the fields, a retyped field is refused naming the field and both types', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openSchemas(page);
+  const instance = hashParams(page).instance;
+  const win = schemaWindow(page);
+  const p = schemaSlot(page);
+  try {
+    await schemasSlot(page).locator('[data-go="add"]').first().click();
+    await expect(win.locator('[slot="body"]')).toBeVisible();
+    await win.locator('tf-choice-card[value="protobuf"]').click();
+    await expect(win.locator('[data-role="text"]')).toHaveAttribute('hint', /Wzór Protobuf to plik \.proto.*bez „import”.*tentabus:message Order/);
+    await win.locator('[data-role="name"] input').fill(PROTO_NAME);
+    await win.locator('[data-role="text"] textarea').fill('syntax = "proto3"; import "google/protobuf/any.proto"; message M {}');
+    await win.locator('[data-act="save"]').click();
+    const error = win.locator('[data-role="error"]');
+    await expect(error).toContainText('Wzór Protobuf musi być jednym samodzielnym plikiem: „import” nie jest obsługiwany.', { timeout: 15000 });
+    await expect(error.locator('details pre')).toContainText('import is not supported');
+    await page.screenshot({ path: path.join(SHOTS, 'f4-protobuf-odmowa-import.png') });
+    // The refusal belongs to the text that was refused.
+    await win.locator('[data-role="text"] textarea').fill(PROTO_V1);
+    await expect(error).toBeHidden();
+    await expect(win.locator('[data-role="impact"]')).toContainText(`powstanie wzór ${PROTO_NAME} (Protobuf), wersja 1`);
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0, { timeout: 15000 });
+    await expect(schemasSlot(page).locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', `Dodano wzór ${PROTO_NAME}`);
+    await expect(schemaRow(page, PROTO_NAME)).toContainText('Protobuf');
+
+    // The page lists the fields of the message the comment names, not of the first message.
+    await schemaRow(page, PROTO_NAME).locator('td').first().click();
+    await expect(p.locator('.tb-title')).toHaveText(PROTO_NAME, { timeout: 15000 });
+    const fields = p.locator('[data-role="protobuf-fields"] tbody tr');
+    await expect(fields).toHaveCount(5);
+    await expect(fields.nth(0)).toContainText('id');
+    await expect(fields.nth(1)).toContainText('Line');
+    await expect(fields.nth(1)).toContainText('powtarzane');
+    await expect(fields.nth(2)).toContainText('map<string, int32>');
+    await expect(fields.nth(3)).toContainText('jedno z: contact');
+    await expect(p.locator('[data-role="protobuf-fields"]')).not.toContainText('trace');
+    await expect.poll(() => editorText(page)).toContain('message Order');
+    await page.screenshot({ path: path.join(SHOTS, 'f4-protobuf-pola.png'), fullPage: true });
+
+    // A field that changes its type breaks both directions; the refusal names the field and the types.
+    await p.locator('[data-role="new-version"]').click();
+    await win.locator('[data-role="text"] textarea').fill(PROTO_V1.replace('int64 id = 1;', 'string id = 1;'));
+    await win.locator('[data-act="save"]').click();
+    const refusal = win.locator('[data-role="error"]');
+    await expect(refusal).toBeVisible({ timeout: 15000 });
+    await expect(refusal).toContainText('Nie dodano wersji 2.');
+    await expect(refusal).toContainText('typ „/id” się zmienia: int64 nie da się odczytać jako string');
+    await page.screenshot({ path: path.join(SHOTS, 'f4-protobuf-odmowa-typ.png') });
+    // A new field is compatible.
+    await win.locator('[data-role="text"] textarea').fill(PROTO_V1.replace('int64 id = 1;', 'int64 id = 1;\n  string region = 6;'));
+    await expect(refusal).toBeHidden();
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0, { timeout: 15000 });
+    await expect(p.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Dodano wersję 2');
+    await expect(p.locator('[data-role="protobuf-fields"] tbody tr')).toHaveCount(6, { timeout: 15000 });
+    expect((await busCall(page, 'busSchemaVersionListRequest', { instanceId: instance, subject: PROTO_NAME })).versions.map((v) => v.version)).toEqual([1, 2]);
+  } finally {
+    await busCall(page, 'busSchemaDeleteRequest', { instanceId: instance, subject: PROTO_NAME, deprecateOnly: false }).catch(() => {});
   }
   expect(errors.filter((e) => !/schema_incompatible|BadRequest|invalid_argument/.test(e)), errors.join('\n')).toEqual([]);
 });

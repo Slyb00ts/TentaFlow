@@ -14985,6 +14985,8 @@ dependencies = [
  "pdfium-render",
  "pin-project-lite",
  "plist",
+ "protobuf",
+ "protobuf-parse",
  "quick-xml 0.41.0",
  "r2d2",
  "r2d2_sqlite",

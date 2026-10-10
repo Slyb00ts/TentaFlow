@@ -11585,7 +11585,8 @@
         "refused": "Nie dodano wzoru {name}.",
         "text_hint_hl7v2_profile": "Profil to tekst JSON z listami wymaganych segmentów i pól, np. {example}. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1.",
         "text_hint_xsd": "Zadziała zwykły wzór XSD zapisany w jednym pliku, bez dołączania innych plików i bez bardziej zaawansowanych części XSD. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1.",
-        "text_hint_avro": "Wzór Avro to schemat zapisany jako JSON, np. {example}. Sprawdza on pojedynczą wiadomość zapisaną binarnie w formacie Avro — bez nagłówka pliku Avro i bez nagłówka Confluent. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1."
+        "text_hint_avro": "Wzór Avro to schemat zapisany jako JSON, np. {example}. Sprawdza on pojedynczą wiadomość zapisaną binarnie w formacie Avro — bez nagłówka pliku Avro i bez nagłówka Confluent. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1.",
+        "text_hint_protobuf": "Wzór Protobuf to plik .proto (proto3 albo proto2) w jednym kawałku, bez „import”. Opisuje jedną wiadomość: pierwszą z pliku albo tę, którą wskaże komentarz, np. „// tentabus:message Order”. Przykład: {example}. Sprawdza pojedynczą wiadomość zapisaną binarnie w formacie Protobuf. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1."
       },
       "version": {
         "title": "Nowa wersja wzoru {name}",
@@ -11658,7 +11659,11 @@
         "fix_element_old": "Zostaw {list} wśród wymaganych elementów albo zmień zgodność wzoru.",
         "avro_fix_required_new": "Nadaj „{field}” wartość domyślną (\"default\") albo zmień zgodność wzoru.",
         "avro_type": "typ „{path}” się zmienia: {from} nie da się odczytać jako {to}",
-        "avro_enum": "typ wyliczeniowy „{name}” traci symbol „{symbol}”, który wiadomości mogą jeszcze zawierać"
+        "avro_enum": "typ wyliczeniowy „{name}” traci symbol „{symbol}”, który wiadomości mogą jeszcze zawierać",
+        "proto_fix_required_new": "Zostaw pole „{field}” jako opcjonalne (bez „required”) albo zmień zgodność wzoru.",
+        "proto_enum": "typ wyliczeniowy „{name}” traci wartość {value}, którą wiadomości mogą jeszcze zawierać",
+        "proto_enum_open": "typ wyliczeniowy „{name}” przyjmuje dowolny numer, a druga wersja ma typ zamknięty (proto2), który zna tylko swoje wartości",
+        "proto_reserved": "numer pola {number} był zastrzeżony („reserved”) w poprzedniej wersji i nie może zostać użyty ponownie"
       },
       "compat_window": {
         "title": "Zmień zgodność — {name}",
@@ -11760,7 +11765,15 @@
         "avro_type": "Typ",
         "avro_presence": "Obecność",
         "avro_required": "wymagane",
-        "avro_optional": "opcjonalne"
+        "avro_optional": "opcjonalne",
+        "protobuf_fields": "Pola wiadomości",
+        "protobuf_number": "Numer",
+        "protobuf_type": "Typ",
+        "protobuf_presence": "Obecność",
+        "protobuf_required": "wymagane",
+        "protobuf_optional": "opcjonalne",
+        "protobuf_repeated": "powtarzane",
+        "protobuf_oneof": "jedno z: {name}"
       },
       "added_existing_title": "Wzór {name} już istniał",
       "added_existing_version": "Ktoś dodał go w międzyczasie, więc tekst trafił do niego jako wersja {version}.",
@@ -11824,7 +11837,36 @@
         "avro_limit_depth": "Typy są zagnieżdżone głębiej niż {limit} poziomów.",
         "avro_default": "Wartość domyślna pola nie pasuje do pierwszego wariantu jego unii. W unii Avro wartość domyślna musi być typu pierwszego wariantu (np. null, gdy null jest pierwszy).",
         "avro_default_type": "Wartość domyślna pola nie pasuje do typu tego pola. Wartość domyślna musi być zapisana tak, jak wartość tego typu (np. liczba dla int, tekst dla string, jeden z symboli dla typu wyliczeniowego).",
-        "avro_limit_text": "Opis (doc) albo własny atrybut ma więcej niż {limit} bajtów. Skróć tekst."
+        "avro_limit_text": "Opis (doc) albo własny atrybut ma więcej niż {limit} bajtów. Skróć tekst.",
+        "proto_invalid": "Protobuf nie przyjął tego pliku: sprawdź składnię (średniki, nawiasy), nazwy typów i to, czy każdy użyty typ jest zdefiniowany w tym samym pliku. Szczegóły są niżej.",
+        "proto_import": "Wzór Protobuf musi być jednym samodzielnym plikiem: „import” nie jest obsługiwany. Wklej potrzebne komunikaty do tego samego pliku.",
+        "proto_unsupported": "Ten wzór zawiera element, którego rejestr nie obsługuje: {what}. Do sprawdzania wiadomości wystarczą komunikaty (message), typy wyliczeniowe (enum), oneof i mapy.",
+        "proto_what_service": "service (usługi)",
+        "proto_what_extend": "extend (rozszerzenia)",
+        "proto_what_extensions": "extensions (zakresy rozszerzeń)",
+        "proto_what_group": "group (grupy)",
+        "proto_what_custom": "opcje własne, np. option (x) = …",
+        "proto_what_message_set": "message_set_wire_format",
+        "proto_no_message": "W tym pliku nie ma żadnego komunikatu (message). Wzór musi opisywać jeden komunikat.",
+        "proto_designated": "Komentarz „// tentabus:message Nazwa” wskazuje komunikat, którego nie ma wśród komunikatów najwyższego poziomu pliku. Wpisz nazwę komunikatu zapisanego poza innymi komunikatami.",
+        "proto_designation": "Komentarz „// tentabus:message” musi mieć po sobie nazwę komunikatu i może wystąpić tylko raz.",
+        "proto_numbers": "W komunikacie numery i nazwy pól muszą być niepowtarzalne. Numer pola ma być z zakresu od 1 do 536870911, poza 19000–19999 i poza numerami zastrzeżonymi (reserved).",
+        "proto_type_missing": "Wzór używa typu, którego w nim nie ma. Zdefiniuj każdy typ w tym samym pliku.",
+        "proto_defined_twice": "Dwa typy mają tę samą nazwę w tym samym miejscu. Nadaj im różne nazwy.",
+        "proto_enum_zero": "W proto3 pierwszą wartością typu wyliczeniowego musi być zero, a dwie wartości mogą mieć ten sam numer tylko z opcją allow_alias.",
+        "proto_map_key": "Kluczem mapy może być liczba całkowita, bool albo string (nie float, double, bytes ani komunikat), a wartością nie może być inna mapa.",
+        "proto_limit_depth": "Wzór ma nawiasy zagnieżdżone głębiej niż {limit} poziomów.",
+        "proto_limit_nesting": "Komunikaty są zagnieżdżone głębiej niż {limit} poziomów.",
+        "proto_limit_messages": "Wzór ma więcej niż {limit} komunikatów (mapa też liczy się jako komunikat). Uprość go.",
+        "proto_limit_enums": "Wzór ma więcej niż {limit} typów wyliczeniowych.",
+        "proto_limit_fields": "Komunikat albo cały wzór ma więcej niż {limit} pól. Podziel go na mniejsze komunikaty.",
+        "proto_limit_values": "Typ wyliczeniowy albo wszystkie razem mają więcej niż {limit} wartości.",
+        "proto_limit_reserved": "Komunikat zastrzega więcej niż {limit} zakresów numerów (reserved).",
+        "proto_limit_required": "Komunikat ma więcej niż {limit} pól wymaganych (required).",
+        "proto_limit_assignments": "Wzór ma więcej niż {limit} przypisań (numery pól, wartości typów wyliczeniowych i opcje). Uprość go.",
+        "proto_limit_string": "Tekst w cudzysłowie jest dłuższy niż {limit} bajtów.",
+        "proto_limit_name": "Nazwa jest dłuższa niż {limit} znaków.",
+        "proto_lexical": "Wzór ma niedomknięty komentarz, tekst w cudzysłowie lub nawias albo znak, którego plik .proto nie może zawierać."
       }
     },
     "topics": {
@@ -12612,7 +12654,16 @@
         "avro_union": "numer wariantu unii jest poza listą.",
         "avro_block_count": "tablica lub mapa deklaruje więcej elementów, niż mieści reszta wiadomości.",
         "avro_block_size": "rozmiar bloku tablicy lub mapy nie zgadza się z jego elementami.",
-        "avro_too_deep": "wiadomość jest zagnieżdżona za głęboko, żeby ją sprawdzić."
+        "avro_too_deep": "wiadomość jest zagnieżdżona za głęboko, żeby ją sprawdzić.",
+        "proto_field_number": "numer pola jest poza dozwolonym zakresem.",
+        "proto_field_reserved": "numer pola leży w zakresie 19000–19999, zarezerwowanym dla biblioteki Protobuf.",
+        "proto_wire": "sposób zapisu pola nie zgadza się z typem pola we wzorze.",
+        "proto_group": "wiadomość używa starych grup Protobuf, których rejestr nie obsługuje.",
+        "proto_wire_invalid": "pole ma niepoprawny sposób zapisu.",
+        "proto_packed": "lista zapisana w jednym kawałku nie składa się z całej liczby elementów.",
+        "proto_range": "liczba nie mieści się w typie pola.",
+        "proto_enum_closed": "ta wartość nie należy do typu wyliczeniowego (proto2 przyjmuje tylko zadeklarowane wartości).",
+        "proto_required": "brakuje pola wymaganego (required)."
       }
     },
     "access": {

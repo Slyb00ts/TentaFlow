@@ -11585,7 +11585,8 @@
         "refused": "Pattern {name} was not added.",
         "text_hint_hl7v2_profile": "A profile is JSON text with lists of required segments and fields, e.g. {example}. You can also load a file. The pattern is checked when it is added; this will be version 1.",
         "text_hint_xsd": "An ordinary XSD pattern written in one file will work, with no included files and none of the more advanced parts of XSD. You can also load a file. The pattern is checked when it is added; this will be version 1.",
-        "text_hint_avro": "An Avro pattern is a schema written as JSON, e.g. {example}. It checks a single message written in the binary Avro encoding — without an Avro file header or a Confluent header. You can also load a file. The pattern is checked when it is added; this will be version 1."
+        "text_hint_avro": "An Avro pattern is a schema written as JSON, e.g. {example}. It checks a single message written in the binary Avro encoding — without an Avro file header or a Confluent header. You can also load a file. The pattern is checked when it is added; this will be version 1.",
+        "text_hint_protobuf": "A Protobuf pattern is a .proto file (proto3 or proto2) written in one piece, with no “import”. It describes one message: the first one in the file, or the one named by a comment such as “// tentabus:message Order”. Example: {example}. It checks a single message written in the binary Protobuf encoding. You can also load a file. The pattern is checked when it is added; this will be version 1."
       },
       "version": {
         "title": "New version of pattern {name}",
@@ -11658,7 +11659,11 @@
         "fix_element_old": "Keep {list} among the required elements or change the pattern's compatibility.",
         "avro_fix_required_new": "Give “{field}” a default value (\"default\") or change the pattern's compatibility.",
         "avro_type": "the type of “{path}” changes: {from} cannot be read as {to}",
-        "avro_enum": "enum “{name}” loses symbol “{symbol}”, which messages may still contain"
+        "avro_enum": "enum “{name}” loses symbol “{symbol}”, which messages may still contain",
+        "proto_fix_required_new": "Keep “{field}” optional (without “required”) or change the pattern's compatibility.",
+        "proto_enum": "enum “{name}” loses value {value}, which messages may still contain",
+        "proto_enum_open": "enum “{name}” accepts any number, but the other version has a closed enum (proto2) that knows only its own values",
+        "proto_reserved": "field number {number} was reserved (“reserved”) in the previous version and cannot be used again"
       },
       "compat_window": {
         "title": "Change compatibility — {name}",
@@ -11760,7 +11765,15 @@
         "avro_type": "Type",
         "avro_presence": "Presence",
         "avro_required": "required",
-        "avro_optional": "optional"
+        "avro_optional": "optional",
+        "protobuf_fields": "Message fields",
+        "protobuf_number": "Number",
+        "protobuf_type": "Type",
+        "protobuf_presence": "Presence",
+        "protobuf_required": "required",
+        "protobuf_optional": "optional",
+        "protobuf_repeated": "repeated",
+        "protobuf_oneof": "one of: {name}"
       },
       "added_existing_title": "Pattern {name} already existed",
       "added_existing_version": "Someone added it meanwhile, so the text went into it as version {version}.",
@@ -11824,7 +11837,36 @@
         "avro_limit_depth": "The types are nested deeper than {limit} levels.",
         "avro_default": "A field's default value does not fit the first branch of its union. In an Avro union the default must be of the first branch's type (for example null when null comes first).",
         "avro_default_type": "A field's default value does not fit the type of that field. The default must be written like a value of that type (for example a number for int, text for string, one of the symbols for an enum).",
-        "avro_limit_text": "A description (doc) or a custom attribute is longer than {limit} bytes. Shorten the text."
+        "avro_limit_text": "A description (doc) or a custom attribute is longer than {limit} bytes. Shorten the text.",
+        "proto_invalid": "Protobuf did not accept this file: check the syntax (semicolons, brackets), the type names, and that every type you use is defined in the same file. Details are below.",
+        "proto_import": "A Protobuf pattern must be one self-contained file: “import” is not supported. Paste the messages you need into the same file.",
+        "proto_unsupported": "This pattern contains an element the registry does not support: {what}. Messages, enums, oneof and maps are enough to check messages.",
+        "proto_what_service": "service",
+        "proto_what_extend": "extend",
+        "proto_what_extensions": "extensions (extension ranges)",
+        "proto_what_group": "group",
+        "proto_what_custom": "custom options, e.g. option (x) = …",
+        "proto_what_message_set": "message_set_wire_format",
+        "proto_no_message": "There is no message in this file. The pattern must describe one message.",
+        "proto_designated": "The comment “// tentabus:message Name” names a message that is not among the top-level messages of the file. Use the name of a message written outside other messages.",
+        "proto_designation": "The comment “// tentabus:message” must be followed by the name of a message and may appear only once.",
+        "proto_numbers": "Within a message, field numbers and names must be unique. A field number must be from 1 to 536870911, outside 19000–19999 and outside the reserved numbers.",
+        "proto_type_missing": "The pattern uses a type that is not defined in it. Define every type in the same file.",
+        "proto_defined_twice": "Two types have the same name in the same place. Give them different names.",
+        "proto_enum_zero": "In proto3 the first value of an enum must be zero, and two values may share a number only with the allow_alias option.",
+        "proto_map_key": "A map key can be an integer, bool or string (not float, double, bytes or a message), and a map value cannot be another map.",
+        "proto_limit_depth": "The pattern has brackets nested deeper than {limit} levels.",
+        "proto_limit_nesting": "Messages are nested deeper than {limit} levels.",
+        "proto_limit_messages": "The pattern has more than {limit} messages (a map counts as a message too). Simplify it.",
+        "proto_limit_enums": "The pattern has more than {limit} enums.",
+        "proto_limit_fields": "A message, or the whole pattern, has more than {limit} fields. Split it into smaller messages.",
+        "proto_limit_values": "An enum, or all enums together, have more than {limit} values.",
+        "proto_limit_reserved": "A message reserves more than {limit} number ranges (reserved).",
+        "proto_limit_required": "A message has more than {limit} required fields.",
+        "proto_limit_assignments": "The pattern has more than {limit} assignments (field numbers, enum values and options). Simplify it.",
+        "proto_limit_string": "A quoted text is longer than {limit} bytes.",
+        "proto_limit_name": "A name is longer than {limit} characters.",
+        "proto_lexical": "The pattern has an unclosed comment, quoted text or bracket, or a character a .proto file cannot contain."
       }
     },
     "topics": {
@@ -12612,7 +12654,16 @@
         "avro_union": "the union branch number is outside the list.",
         "avro_block_count": "an array or map declares more items than the rest of the message can hold.",
         "avro_block_size": "the size of an array or map block does not match its items.",
-        "avro_too_deep": "the message is nested too deeply to check."
+        "avro_too_deep": "the message is nested too deeply to check.",
+        "proto_field_number": "the field number is outside the allowed range.",
+        "proto_field_reserved": "the field number is in the range 19000–19999, reserved for the Protobuf library.",
+        "proto_wire": "the way the field is written does not match the field’s type in the pattern.",
+        "proto_group": "the message uses old Protobuf groups, which the registry does not support.",
+        "proto_wire_invalid": "a field has an invalid way of being written.",
+        "proto_packed": "a list written in one piece does not hold a whole number of elements.",
+        "proto_range": "the number does not fit the field’s type.",
+        "proto_enum_closed": "this value is not in the enum (proto2 accepts only declared values).",
+        "proto_required": "a required field is missing."
       }
     },
     "access": {

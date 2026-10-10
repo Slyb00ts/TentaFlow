@@ -16,7 +16,7 @@
 //     outside the supported subset is REJECTED at registration time
 //     (`compile`), never silently ignored — a partial validator that skips
 //     keywords would be worse than none for a compliance-facing feature.
-//   - `protobuf` / `thrift` are storage-only until F4
+//   - `thrift` is storage-only until F4
 //     (`stored_only`): `compile` is a shape smoke-check, every other
 //     operation returns `SchemaError::Unsupported`.
 //   - `xsd` (F4 B4) and `hl7v2_profile` (F4 B5) are a hand-written XSD subset
@@ -39,6 +39,7 @@ use crate::bus::payload_format::PayloadFormat;
 mod avro;
 mod hl7v2_profile;
 mod json_schema;
+mod protobuf;
 pub mod registry;
 mod stored_only;
 mod xsd;
@@ -111,7 +112,11 @@ impl SchemaType {
     pub fn has_validator(self) -> bool {
         matches!(
             self,
-            SchemaType::JsonSchema | SchemaType::Avro | SchemaType::Xsd | SchemaType::Hl7v2Profile
+            SchemaType::JsonSchema
+                | SchemaType::Avro
+                | SchemaType::Protobuf
+                | SchemaType::Xsd
+                | SchemaType::Hl7v2Profile
         )
     }
 
@@ -119,7 +124,7 @@ impl SchemaType {
         match self {
             SchemaType::JsonSchema => &json_schema::JSON_SCHEMA_OPS,
             SchemaType::Avro => &avro::AVRO_OPS,
-            SchemaType::Protobuf => &stored_only::PROTOBUF_OPS,
+            SchemaType::Protobuf => &protobuf::PROTOBUF_OPS,
             SchemaType::Thrift => &stored_only::THRIFT_OPS,
             SchemaType::Xsd => &xsd::XSD_OPS,
             SchemaType::Hl7v2Profile => &hl7v2_profile::HL7V2_PROFILE_OPS,
@@ -221,6 +226,7 @@ impl std::fmt::Display for SchemaError {
 pub enum CompiledSchema {
     JsonSchema(json_schema::Compiled),
     Avro(avro::Compiled),
+    Protobuf(protobuf::Compiled),
     Xsd(xsd::Compiled),
     Hl7v2Profile(hl7v2_profile::Compiled),
     /// Kinds without a validator yet carry no compiled form — the variant exists so
@@ -558,12 +564,12 @@ mod tests {
     }
 
     #[test]
-    fn avro_has_a_validator_and_the_other_binary_kinds_do_not_yet() {
+    fn avro_and_protobuf_have_a_validator_and_thrift_does_not_yet() {
         assert!(SchemaType::JsonSchema.has_validator());
         assert!(SchemaType::Xsd.has_validator());
         assert!(SchemaType::Hl7v2Profile.has_validator());
         assert!(SchemaType::Avro.has_validator());
-        assert!(!SchemaType::Protobuf.has_validator());
+        assert!(SchemaType::Protobuf.has_validator());
         assert!(!SchemaType::Thrift.has_validator());
     }
 
@@ -1096,6 +1102,115 @@ mod tests {
             ),
         ] {
             let got = avro_ops.check_compatibility(writer, reader, mode);
+            assert!(
+                matches!(&got, Err(SchemaError::Incompatible(m)) if m.contains(phrase)),
+                "{mode:?}: expected {phrase:?}, got {got:?}"
+            );
+        }
+
+        // The Protobuf violations and comparison reasons the dashboard translates
+        // (`unprocessed.js` `PROTOBUF_PHRASES`, `schema-windows.js` `PROTO_*`; the
+        // refusals are pinned by `protobuf.rs` `schema_text_refusals_are_stable`).
+        let proto_ops = SchemaType::Protobuf.ops();
+        let proto_schema = proto_ops
+            .compile(
+                "syntax = \"proto3\"; message M { int64 id = 1; string name = 2; repeated sint32 xs = 3; \
+                 repeated fixed32 h = 4; Inner inner = 5; message Inner { int32 qty = 1; } }",
+            )
+            .unwrap();
+        let closed = proto_ops
+            .compile("syntax = \"proto2\"; message M { required int32 id = 1; optional K kind = 2; enum K { A = 1; } }")
+            .unwrap();
+        for (compiled, payload, expected) in [
+            (
+                &proto_schema,
+                &[0x08][..],
+                "/id: payload ends before the value is complete",
+            ),
+            (
+                &proto_schema,
+                &[0x00, 0x01][..],
+                "<root>: field number is out of range",
+            ),
+            (
+                &proto_schema,
+                &[0xe0, 0xc2, 0x09, 0x01][..],
+                "<root>: field number is in the range reserved for the protobuf implementation",
+            ),
+            (
+                &proto_schema,
+                &[0x0d, 0, 0, 0, 0][..],
+                "/id: wire type does not match the type declared for the field",
+            ),
+            (
+                &proto_schema,
+                &[0x0b][..],
+                "<root>: group wire types are not supported",
+            ),
+            (&proto_schema, &[0x0e][..], "<root>: wire type is not valid"),
+            (
+                &proto_schema,
+                &[0x22, 0x03, 0, 0, 0][..],
+                "/h: packed field does not hold a whole number of elements",
+            ),
+            (
+                &proto_schema,
+                &[0x2a, 0x06, 0x08, 0x80, 0x80, 0x80, 0x80, 0x10][..],
+                "/inner/qty: value does not fit the declared type",
+            ),
+            (
+                &proto_schema,
+                &[0x12, 0x05, b'a'][..],
+                "/name: declared length exceeds the remaining payload",
+            ),
+            (
+                &proto_schema,
+                &[0x12, 0x01, 0xff][..],
+                "/name: string is not valid UTF-8",
+            ),
+            (
+                &proto_schema,
+                &[
+                    0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
+                ][..],
+                "/id: integer encoding is longer than 10 bytes or overflows 64 bits",
+            ),
+            (
+                &closed,
+                &[0x08, 0x01, 0x10, 0x09][..],
+                "/kind: enum value is not declared in the closed enum",
+            ),
+            (&closed, &[0x10, 0x01][..], "/id: required field is missing"),
+        ] {
+            let got = proto_ops.validate(compiled, payload);
+            assert!(
+                matches!(&got, Err(SchemaError::Violation(m)) if m == expected),
+                "{payload:?}: expected {expected:?}, got {got:?}"
+            );
+        }
+        let bomb = proto_ops
+            .compile("syntax = \"proto3\"; message M { repeated int32 xs = 1; }")
+            .unwrap();
+        let mut run = vec![0x0a, 120];
+        run.extend(vec![1u8; 120]);
+        let mut shared = ValidationBudget {
+            org: String::new(),
+            remaining: 100,
+        };
+        assert!(matches!(
+            proto_ops.validate_metered(&bomb, &run, &mut shared),
+            Err(SchemaError::LimitExceeded(m)) if m == "/xs: document exceeds the validation work budget"
+        ));
+        let old = "syntax = \"proto3\"; message M { int32 a = 1; E e = 2; enum E { Z = 0; } reserved 7; }";
+        let proto2_old = "syntax = \"proto2\"; message M { optional int32 a = 1; optional E e = 2; enum E { A = 1; B = 2; } }";
+        for (writer, reader, mode, phrase) in [
+            (old, "syntax = \"proto3\"; message M { string a = 1; E e = 2; enum E { Z = 0; } }", Compatibility::Backward, "/a: int32 written by the old schema cannot be read as string by the new schema"),
+            (old, "syntax = \"proto3\"; message M { int32 a = 1; string again = 7; }", Compatibility::Full, "/again: field number 7 is reserved by the old schema and cannot be used by the new one"),
+            (proto2_old, "syntax = \"proto2\"; message M { optional int32 a = 1; required int64 b = 3; optional E e = 2; enum E { A = 1; B = 2; } }", Compatibility::Backward, "/b: the new schema requires field 'b' (number 3) of message 'M', which the old schema does not always write"),
+            (proto2_old, "syntax = \"proto2\"; message M { optional int32 a = 1; optional E e = 2; enum E { A = 1; } }", Compatibility::Backward, "/e: enum 'E': value 2 of the old schema is unknown to the new schema, whose enum is closed"),
+            ("syntax = \"proto3\"; message M { int32 a = 1; E e = 2; enum E { Z = 0; } }", proto2_old, Compatibility::Backward, "enum 'E' of the old schema accepts any number, but the enum of the new schema is closed"),
+        ] {
+            let got = proto_ops.check_compatibility(writer, reader, mode);
             assert!(
                 matches!(&got, Err(SchemaError::Incompatible(m)) if m.contains(phrase)),
                 "{mode:?}: expected {phrase:?}, got {got:?}"

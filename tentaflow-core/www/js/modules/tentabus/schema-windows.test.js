@@ -20,7 +20,7 @@ if (typeof globalThis.DOMParser === 'undefined' && window.DOMParser) globalThis.
 
 const {
   subjectNameProblem, schemaTextProblem, buildRegisterRequest, buildDeleteRequest, jsonSchemaChanges, parseIncompatible,
-  profileChanges, xsdChanges, hl7DropOffer, dropRequired, HL7_PROFILE_EXAMPLE, AVRO_SCHEMA_EXAMPLE, addTextHint,
+  profileChanges, xsdChanges, hl7DropOffer, dropRequired, HL7_PROFILE_EXAMPLE, AVRO_SCHEMA_EXAMPLE, PROTOBUF_SCHEMA_EXAMPLE, addTextHint,
   addedNotice, incompatibilityReason, refusalHtml, boundTopics, effectiveVersion, versionImpact, versionDeprecateImpact, subjectDeprecateImpact,
   openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete,
 } = await import('./schema-windows.js');
@@ -905,5 +905,95 @@ test('a refused Avro version names the field, the type or the enum symbol that b
   assert.match(
     reason('backward', `${backwardLead}/u: no branch of the new union can read a union written by the old schema`),
     /Nowa wersja nie spełnia zgodności/,
+  );
+});
+
+test('a Protobuf text: any text is sent as it is, the add window shows how the message is named, and the server\'s refusals are put in words', () => {
+  assert.equal(schemaTextProblem('syntax = "proto3"; message A {}', 'protobuf'), null);
+  assert.equal(schemaTextProblem('{"not": "checked here"}', 'protobuf'), null);
+  assert.equal(schemaTextProblem('   ', 'protobuf'), 'empty');
+  assert.equal(PROTOBUF_SCHEMA_EXAMPLE.includes('message Order'), true);
+  assert.match(norm(addTextHint('protobuf')), /^Wzór Protobuf to plik \.proto \(proto3 albo proto2\) w jednym kawałku, bez „import”\. Opisuje jedną wiadomość: pierwszą z pliku albo tę, którą wskaże komentarz, np\. „\/\/ tentabus:message Order”\. Przykład: syntax = "proto3"; message Order/);
+  const cases = [
+    ['not a valid Protobuf schema (line 3): label required', /Protobuf nie przyjął tego pliku: sprawdź składnię/],
+    ['import is not supported: a schema must be one self-contained file', /„import” nie jest obsługiwany/],
+    ['service is not supported', /nie obsługuje: service \(usługi\)/],
+    ['extend is not supported', /nie obsługuje: extend \(rozszerzenia\)/],
+    ['extension ranges are not supported', /extensions \(zakresy rozszerzeń\)/],
+    ['groups are not supported', /group \(grupy\)/],
+    ['custom options are not supported', /opcje własne/],
+    ['message_set_wire_format is not supported', /message_set_wire_format/],
+    ['the schema declares no message', /nie ma żadnego komunikatu/],
+    ["the designated message 'X' is not a top-level message of the schema", /Komentarz „\/\/ tentabus:message Nazwa” wskazuje komunikat, którego nie ma/],
+    ["the comment '// tentabus:message' must be followed by the name of a message", /musi mieć po sobie nazwę komunikatu/],
+    ["the comment '// tentabus:message' appears more than once", /może wystąpić tylko raz/],
+    ['not a valid Protobuf schema (line 4): Non-unique field name: `b`', /numery i nazwy pól muszą być niepowtarzalne/],
+    ["message 'M' has two fields named 'a'", /niepowtarzalne/],
+    ['not a valid Protobuf schema (line 3): object is not found by path `Missing` in scope `.M`', /używa typu, którego w nim nie ma/],
+    ["field 'a' of message 'M' uses a reserved number or name", /poza numerami zastrzeżonymi/],
+    ["field 'a' of message 'M' has the number 19000, which is not in 1 to 536870911 outside 19000-19999", /od 1 do 536870911/],
+    ["type 'Missing' is not defined in the schema", /używa typu, którego w nim nie ma/],
+    ["type 'A' is defined more than once", /Dwa typy mają tę samą nazwę/],
+    ["the first value of the proto3 enum 'E' must be zero", /pierwszą wartością typu wyliczeniowego musi być zero/],
+    ["enum 'E' gives two values the number 0 without allow_alias", /allow_alias/],
+    ["map field 'm' has a key that is not an integer, bool or string, or a value that is a map", /Kluczem mapy może być liczba całkowita/],
+    ['the schema is nested deeper than 32 levels', /nawiasy zagnieżdżone głębiej niż 32 poziomów/],
+    ['messages are nested deeper than 16 levels', /Komunikaty są zagnieżdżone głębiej niż 16 poziomów/],
+    ['the schema has more than 256 messages (a map field counts as one)', /więcej niż 256 komunikatów/],
+    ['the schema has more than 128 enums', /więcej niż 128 typów wyliczeniowych/],
+    ["message 'M' has more than 1024 fields", /Komunikat albo cały wzór ma więcej niż 1024 pól/],
+    ['the schema has more than 4096 fields', /więcej niż 4096 pól/],
+    ["enum 'E' has more than 1024 values", /więcej niż 1024 wartości/],
+    ['the schema has more than 4096 enum values', /więcej niż 4096 wartości/],
+    ["message 'M' reserves more than 1024 ranges", /zastrzega więcej niż 1024 zakresów/],
+    ["message 'M' has more than 64 required fields", /więcej niż 64 pól wymaganych/],
+    ['the schema has more than 12288 assignments (field numbers, enum values and options)', /więcej niż 12288 przypisań/],
+    ['a string is longer than 256 bytes', /dłuższy niż 256 bajtów/],
+    ['a name is longer than 128 characters', /Nazwa jest dłuższa niż 128 znaków/],
+    ['a comment is never closed', /niedomknięty komentarz/],
+    ['a bracket is never closed', /niedomknięty komentarz, tekst w cudzysłowie lub nawias/],
+    ['a closing bracket has no opening one', /niedomknięty/],
+    ['the schema contains a character a .proto file cannot', /znak, którego plik \.proto nie może zawierać/],
+  ];
+  for (const [server, expected] of cases) {
+    const got = refused('protobuf', server);
+    assert.match(got.text, expected, server);
+    assert.ok(got.technical.includes(server));
+  }
+  // A sentence this screen does not know falls back to the generic one with the server's text folded.
+  assert.match(refused('protobuf', 'schema text is 300000 bytes; the limit is 262144').text, /Nie dodano wzoru x\./);
+});
+
+test('a refused Protobuf version names the field, the type, the enum value or the number that breaks the old data or the old programs', () => {
+  const reason = (mode, detail) => {
+    const el = document.createElement('div');
+    el.innerHTML = refusalHtml({ err: incompatible(mode, detail), title: 'Nie dodano wersji 2.', compatibility: mode, schemaType: 'protobuf', newText: '', describeError: String });
+    return norm(el.querySelector('div').textContent);
+  };
+  const backwardLead = 'backward: data written under the old schema may not be readable with the new one - ';
+  const forwardLead = 'forward: data written under the new schema may not be readable with the old one - ';
+  assert.match(
+    reason('backward', `${backwardLead}/region: the new schema requires field 'region' (number 4) of message 'Order', which the old schema does not always write`),
+    /nowa wersja wymaga pola „region”, którego stare wiadomości mogą nie mieć\. Zostaw pole „region” jako opcjonalne \(bez „required”\)/,
+  );
+  assert.match(
+    reason('forward', `${forwardLead}/region: the old schema requires field 'region' (number 4) of message 'Order', which the new schema does not always write`),
+    /nowa wersja nie gwarantuje pola „region”, którego wymagają stare programy\. Zostaw „region” wśród pól wymaganych/,
+  );
+  assert.match(
+    reason('backward', `${backwardLead}/inner/n: int32 written by the old schema cannot be read as string by the new schema`),
+    /typ „\/inner\/n” się zmienia: int32 nie da się odczytać jako string/,
+  );
+  assert.match(
+    reason('backward', `${backwardLead}/status: enum 'Status': value 3 of the old schema is unknown to the new schema, whose enum is closed`),
+    /typ wyliczeniowy „Status” traci wartość 3/,
+  );
+  assert.match(
+    reason('backward', `${backwardLead}/status: enum 'Status' of the old schema accepts any number, but the enum of the new schema is closed`),
+    /typ wyliczeniowy „Status” przyjmuje dowolny numer/,
+  );
+  assert.match(
+    reason('forward', `${forwardLead}/again: field number 5 is reserved by the old schema and cannot be used by the new one`),
+    /numer pola 5 był zastrzeżony \(„reserved”\) w poprzedniej wersji/,
   );
 });

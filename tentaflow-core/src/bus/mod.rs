@@ -1023,7 +1023,7 @@ pub enum BusServiceError {
     /// `SchemaError::Unsupported` surfaced to a caller: the requested
     /// operation has no implementation for this schema type in this build
     /// (every operation but `compile`'s shape smoke-check, for
-    /// `protobuf`/`thrift` until F4).
+    /// `thrift` until F4).
     #[error("{operation} is not supported for {} schemas in this build", schema_type.as_str())]
     SchemaTypeUnsupported {
         schema_type: schema_registry::SchemaType,
@@ -19399,9 +19399,9 @@ mod tests {
             &svc.db,
             svc.instance_id(),
             "org-1",
-            "events.proto",
-            schema_registry::SchemaType::Protobuf,
-            "syntax = \"proto3\"; message X {}",
+            "events.thrift",
+            schema_registry::SchemaType::Thrift,
+            "struct X {}",
             Some(schema_registry::Compatibility::None),
             None,
         )
@@ -19417,7 +19417,7 @@ mod tests {
                 &ctx,
                 "orders.events",
                 topics::TopicOptions {
-                    schema_id: Some("events.proto".to_string()),
+                    schema_id: Some("events.thrift".to_string()),
                     ..Default::default()
                 },
             )
@@ -19437,9 +19437,9 @@ mod tests {
             &svc.db,
             svc.instance_id(),
             "org-1",
-            "events.proto",
-            schema_registry::SchemaType::Protobuf,
-            "syntax = \"proto3\"; message X {}",
+            "events.thrift",
+            schema_registry::SchemaType::Thrift,
+            "struct X {}",
             Some(schema_registry::Compatibility::None),
             None,
         )
@@ -19456,7 +19456,7 @@ mod tests {
                 &ctx,
                 "orders.events",
                 topics::TopicOptions {
-                    schema_id: Some("events.proto".to_string()),
+                    schema_id: Some("events.thrift".to_string()),
                     validation: Some(topics::ValidationMode::Warn),
                     ..Default::default()
                 },
@@ -19597,12 +19597,17 @@ mod tests {
 
     #[test]
     fn enabling_validation_is_accepted_for_validating_kinds_and_refused_for_the_rest() {
-        use schema_registry::SchemaType::{Avro, Hl7v2Profile, Protobuf, Xsd};
+        use schema_registry::SchemaType::{Avro, Hl7v2Profile, Protobuf, Thrift, Xsd};
         for (kind, text, ct) in [
             (Xsd, PATIENT_XSD, "application/xml"),
             (
                 Avro,
                 r#"{"type":"record","name":"X","fields":[]}"#,
+                "application/octet-stream",
+            ),
+            (
+                Protobuf,
+                "syntax = \"proto3\"; message X {}",
                 "application/octet-stream",
             ),
             (
@@ -19620,8 +19625,8 @@ mod tests {
             }
         }
         let err = bind_stored_subject_at_create(
-            Protobuf,
-            "syntax = \"proto3\"; message X {}",
+            Thrift,
+            "struct X {}",
             "application/octet-stream",
             Some(topics::ValidationMode::Warn),
         )
@@ -20076,6 +20081,164 @@ mod tests {
         );
         assert_eq!(register(&optional).unwrap().version, 2);
         let err = register("not json").unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::InvalidArgument(_)),
+            "{err:?}"
+        );
+    }
+
+    const ORDER_PROTO: &str =
+        "syntax = \"proto3\"; message Order { int64 id = 1; string customer = 2; }";
+
+    /// An `Order` message: id (small values only) and customer.
+    fn order_message(id: u8, customer: &str) -> Vec<u8> {
+        let mut out = vec![0x08, id, 0x12, customer.len() as u8];
+        out.extend_from_slice(customer.as_bytes());
+        out
+    }
+
+    #[test]
+    fn protobuf_dlq_mode_diverts_only_the_invalid_message_and_never_leaks_the_payload() {
+        let good = order_message(7, "Ala");
+        // The customer declares eleven bytes and four are left.
+        let truncated = order_message(8, "SECRETVALUE")[..6].to_vec();
+        let mut bad_utf8 = vec![0x12, 0x0c];
+        bad_utf8.extend_from_slice(b"SECRETVALUE");
+        bad_utf8.push(0xff);
+        for content_type in ["application/octet-stream", "application/x-protobuf"] {
+            let (_tmp, svc, ctx, result) = publish_validated_bytes(
+                schema_registry::SchemaType::Protobuf,
+                ORDER_PROTO,
+                content_type,
+                topics::ValidationMode::Dlq,
+                &[&good, &truncated, &bad_utf8],
+            );
+            assert_eq!(
+                (result.accepted, result.schema_rejected),
+                (1, 2),
+                "{content_type}"
+            );
+            assert_eq!(
+                fetch_all(&svc, &ctx, "validated.events"),
+                vec![good.clone()]
+            );
+            assert_eq!(
+                fetch_all(&svc, &ctx, "__dlq.validated.events"),
+                vec![truncated.clone(), bad_utf8.clone()]
+            );
+            assert_eq!(svc.schema_violations_total(), 2);
+            let headers = dlq_headers(&svc, &ctx, "__dlq.validated.events");
+            let message = |i: usize| {
+                headers[i]
+                    .iter()
+                    .find(|(k, _)| k == "dlq.error_message")
+                    .map(|(_, v)| v.clone())
+                    .unwrap()
+            };
+            assert!(
+                message(0).contains("/customer: declared length exceeds the remaining payload"),
+                "{}",
+                message(0)
+            );
+            assert!(
+                message(1).contains("/customer: string is not valid UTF-8"),
+                "{}",
+                message(1)
+            );
+            for record in &headers {
+                for (name, value) in record {
+                    assert!(
+                        !value.contains("SECRETVALUE"),
+                        "header {name} leaks the payload"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn protobuf_validation_stamps_only_the_message_that_passed_in_warn_mode() {
+        let (_tmp, svc, ctx, result) = publish_validated_bytes(
+            schema_registry::SchemaType::Protobuf,
+            ORDER_PROTO,
+            "application/octet-stream",
+            topics::ValidationMode::Warn,
+            &[&[0x0f], &order_message(1, "x")],
+        );
+        assert_eq!(result.accepted, 2);
+        let records = svc
+            .open_consumer(
+                &ctx,
+                "warn-reader",
+                &["validated.events".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap()
+            .fetch(1024, 20)
+            .unwrap()
+            .records;
+        assert_eq!(records[0].schema_id, 0);
+        assert_ne!(records[1].schema_id, 0);
+    }
+
+    #[test]
+    fn a_protobuf_message_the_check_gave_up_on_is_diverted_under_its_own_reason() {
+        let linked = "syntax = \"proto3\"; message N { N next = 1; }";
+        // A hundred nested messages: not provably wrong, deeper than a check goes.
+        let mut deep = Vec::new();
+        for _ in 0..100 {
+            let mut outer = vec![0x0a, deep.len() as u8];
+            outer.append(&mut deep);
+            deep = outer;
+        }
+        let (_tmp, svc, ctx, result) = publish_validated_bytes(
+            schema_registry::SchemaType::Protobuf,
+            linked,
+            "application/octet-stream",
+            topics::ValidationMode::Dlq,
+            &[&[], &deep],
+        );
+        assert_eq!((result.accepted, result.schema_rejected), (1, 1));
+        let headers = dlq_headers(&svc, &ctx, "__dlq.validated.events");
+        assert!(headers[0].contains(&(
+            "dlq.reason".to_string(),
+            "schema_check_too_complex".to_string()
+        )));
+        assert_eq!(svc.schema_check_too_complex_total(), 1);
+        assert_eq!(svc.schema_violations_total(), 0);
+    }
+
+    #[test]
+    fn protobuf_versions_register_under_the_default_backward_check() {
+        let (_tmp, svc) = test_service();
+        let register = |text: &str| {
+            schema_registry::registry::register(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                "orders",
+                schema_registry::SchemaType::Protobuf,
+                text,
+                None,
+                None,
+            )
+        };
+        assert_eq!(register(ORDER_PROTO).unwrap().version, 1);
+        let retyped = ORDER_PROTO.replace("int64 id = 1;", "string id = 1;");
+        let err = register(&retyped).unwrap_err();
+        assert!(
+            matches!(&err, BusServiceError::SchemaIncompatible { mode: "backward", detail, .. }
+                if detail.contains("/id: int64 written by the old schema cannot be read as string by the new schema")),
+            "{err:?}"
+        );
+        let extended = ORDER_PROTO.replace(
+            "string customer = 2;",
+            "string customer = 2; string region = 3;",
+        );
+        assert_eq!(register(&extended).unwrap().version, 2);
+        let err = register("message").unwrap_err();
         assert!(
             matches!(err, BusServiceError::InvalidArgument(_)),
             "{err:?}"

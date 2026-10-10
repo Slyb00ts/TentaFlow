@@ -220,6 +220,11 @@ predicates = "3"
 proc-macro2 = "1.0"
 prost = "0.14.4"
 prost-build = "0.14.4"
+# Protobuf schema registry (F4 B2): the pure-Rust .proto parser (no protoc) and the
+# descriptor types it returns. Only schema text is parsed with them; payloads are
+# walked by hand.
+protobuf = "3.7.2"
+protobuf-parse = "3.7.2"
 protobuf-src = "2"
 quick-xml = {version = "0.41", default-features = false}
 quote = "1.0.46"

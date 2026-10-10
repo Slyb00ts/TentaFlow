@@ -133,6 +133,20 @@ const AVRO_PHRASES = [
   [/^value is nested too deeply to check$/, 'avro_too_deep'],
 ];
 
+// The Protobuf checks that have no Avro counterpart (protobuf.rs `Walker`); the framing ones
+// (truncation, length, UTF-8, varint, boolean, depth) share the Avro sentences above.
+const PROTOBUF_PHRASES = [
+  [/^field number is out of range$/, 'proto_field_number'],
+  [/^field number is in the range reserved for the protobuf implementation$/, 'proto_field_reserved'],
+  [/^wire type does not match the type declared for the field$/, 'proto_wire'],
+  [/^group wire types are not supported$/, 'proto_group'],
+  [/^wire type is not valid$/, 'proto_wire_invalid'],
+  [/^packed field does not hold a whole number of elements$/, 'proto_packed'],
+  [/^value does not fit the declared type$/, 'proto_range'],
+  [/^enum value is not declared in the closed enum$/, 'proto_enum_closed'],
+  [/^required field is missing$/, 'proto_required'],
+];
+
 const PATH_MAX = 120;
 
 /**
@@ -179,14 +193,14 @@ function pathSentence(path, message) {
   if (m && valueWhy(m[2])) return withPath(say('xsd_attr_value', { name: m[1], why: valueWhy(m[2]) }));
   m = /^value (is .*|does .*)$/.exec(message);
   if (m && valueWhy(m[1])) return withPath(say('xsd_value', { why: valueWhy(m[1]) }));
-  const known = [...XSD_PHRASES, ...AVRO_PHRASES].find(([re]) => re.test(message));
+  const known = [...XSD_PHRASES, ...AVRO_PHRASES, ...PROTOBUF_PHRASES].find(([re]) => re.test(message));
   return known ? withPath(say(known[1])) : '';
 }
 
 /**
  * The checker's sentence for one message in plain words — the HL7 profile's
  * and message parser's sentences (hl7v2_profile.rs, payload_format/hl7v2.rs)
- * and the XSD checker's (xsd.rs) and Avro checker's (avro.rs), the latter two
+ * and the XSD checker's (xsd.rs) and Avro and Protobuf checkers' (avro.rs, protobuf.rs), the latter three
  * after their element or field path — or `''`
  * for any other text, which the caller then shows as the server wrote it.
  */
