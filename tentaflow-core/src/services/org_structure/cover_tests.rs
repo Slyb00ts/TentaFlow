@@ -488,12 +488,16 @@ fn a_person_is_unavailable_exactly_on_the_days_of_an_absence() {
         },
     )
     .unwrap();
-    let at =
-        |offset| availability::is_available(&c.f.pool, ORG, &c.carol, Some(day(offset))).unwrap();
+    let at = |offset| {
+        privacy::is_available_for(&c.f.pool, ORG, "admin", true, &c.carol, Some(day(offset)))
+            .unwrap()
+    };
     assert!(at(1) && !at(2) && !at(4) && at(5));
-    assert!(!availability::is_available(&c.f.pool, ORG, "no-such-user", None).unwrap());
+    assert!(
+        !privacy::is_available_for(&c.f.pool, ORG, "admin", true, "no-such-user", None).unwrap()
+    );
     c.deactivate(&c.ian);
-    assert!(!availability::is_available(&c.f.pool, ORG, &c.ian, None).unwrap());
+    assert!(!privacy::is_available_for(&c.f.pool, ORG, "admin", true, &c.ian, None).unwrap());
 }
 
 #[test]
@@ -1167,10 +1171,10 @@ fn availability_reads_of_the_pool_agree_with_the_rows() {
     let c = co();
     c.absent(&c.carol, 0, Some(2));
     c.deputy(&c.bob, &c.tom, DeputyScope::All);
-    let (day_read, absent, deputies) = availability::availability_on(&c.f.pool, ORG, None).unwrap();
-    assert_eq!(day_read, day(0));
-    assert_eq!(absent, vec![c.carol.clone()]);
-    assert_eq!(deputies.len(), 1);
+    let read = privacy::visible_availability(&c.f.pool, ORG, "admin", true, None).unwrap();
+    assert_eq!(read.at, day(0));
+    assert_eq!(read.absent, vec![c.carol.clone()]);
+    assert_eq!(read.deputies.len(), 1);
     let (covered_by, covering) =
         availability::deputies_around(&c.f.pool, ORG, &c.bob, day(0)).unwrap();
     assert_eq!((covered_by.len(), covering.len()), (1, 0));

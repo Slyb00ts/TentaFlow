@@ -17,7 +17,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use super::error::{OrgStructureError as E, Result};
-use super::repo::{fmt, timezone_of};
+use super::repo::fmt;
 use super::validate;
 use crate::db::DbPool;
 
@@ -343,43 +343,6 @@ pub(super) fn absences_where<P: rusqlite::Params>(
 // ---------------------------------------------------------------------------
 // Reads over a pool
 // ---------------------------------------------------------------------------
-
-fn day_or_today(conn: &Connection, org_id: &str, at: Option<NaiveDate>) -> Result<NaiveDate> {
-    match at {
-        Some(day) => Ok(day),
-        None => validate::today_in_zone(&timezone_of(conn, org_id)?),
-    }
-}
-
-/// `org.is_available(user, at)`.
-pub fn is_available(
-    pool: &DbPool,
-    org_id: &str,
-    user_id: &str,
-    at: Option<NaiveDate>,
-) -> Result<bool> {
-    let conn = pool.read().map_err(|e| E::Db(e.to_string()))?;
-    let day = day_or_today(&conn, org_id, at)?;
-    Ok(Availability::load(&conn, org_id, day)?.is_available(user_id))
-}
-
-/// The day and the people away on it plus the deputies in force; the tree
-/// reads this to badge "nieobecny" and "zastępstwo". No reason, no kind.
-pub fn availability_on(
-    pool: &DbPool,
-    org_id: &str,
-    at: Option<NaiveDate>,
-) -> Result<(NaiveDate, Vec<String>, Vec<Deputy>)> {
-    let conn = pool.read().map_err(|e| E::Db(e.to_string()))?;
-    let day = day_or_today(&conn, org_id, at)?;
-    let avail = Availability::load(&conn, org_id, day)?;
-    let absent = avail
-        .absent_users()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    Ok((day, absent, avail.deputies))
-}
 
 /// One person's absences, newest first. `include_past = false` leaves out the
 /// ones that ended before `day`.

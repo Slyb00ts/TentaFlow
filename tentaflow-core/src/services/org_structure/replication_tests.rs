@@ -227,7 +227,7 @@ fn a_write_the_organization_check_skipped_earns_no_place_in_the_lww_order() {
 }
 
 #[test]
-fn a_row_that_references_something_of_another_organization_only_is_refused() {
+fn a_row_that_references_a_structure_row_of_another_organization_only_is_refused() {
     let f = Fixture::new();
     let member = super::tests::add_user(&f.pool, ORG, "anna");
     add_absence(
@@ -256,12 +256,12 @@ fn a_row_that_references_something_of_another_organization_only_is_refused() {
         let tx = conn.transaction().unwrap();
         repl::apply(&tx, Kind::OrgAbsence, &operation)
     };
-    let refused = apply_absence(&stranger);
-    assert!(refused.is_err(), "{refused:?}");
-    // A user the peer has not heard of yet is not refused: tables arrive in no fixed order.
+    // A user is never refused, whatever the replica knows of the membership: the member of
+    // another organization only is a former member here, and an unknown one has not arrived yet.
+    assert_eq!(apply_absence(&stranger).unwrap(), 1);
     assert_eq!(apply_absence("not-yet-replicated").unwrap(), 1);
 
-    // The same holds for the structure's own references.
+    // The structure's own references are refused when they name another organization's rows.
     {
         let conn = peer.pool.write().unwrap();
         conn.execute(
@@ -282,4 +282,142 @@ fn a_row_that_references_something_of_another_organization_only_is_refused() {
     let refused = apply_in(&peer.pool, &operation);
     assert!(refused.is_err(), "{refused:?}");
     assert!(units_named(&peer.pool, ORG).is_empty());
+}
+
+fn kind_of(resource_type: &str) -> Option<Kind> {
+    Some(match resource_type {
+        "core.org_unit" => Kind::OrgUnit,
+        "core.org_position" => Kind::OrgPosition,
+        "core.org_assignment" => Kind::OrgAssignment,
+        "core.org_change_set" => Kind::OrgChangeSet,
+        _ => return None,
+    })
+}
+
+/// A user the replica knows only as a member of another organization: the shape of
+/// a person who left this one (or whose membership has not arrived yet).
+fn user_of_the_other_org_only(peer: &Peer) -> String {
+    super::tests::add_user(&peer.pool, &peer.other_org, "former")
+}
+
+/// Applies the structure captures of `source` in journal order on `peer`, naming
+/// `replica_user` wherever the source row names `user`.
+fn replicate_structure(source: &Fixture, peer: &Peer, user: &str, replica_user: &str) {
+    let mut conn = peer.pool.write().unwrap();
+    let mut captures = Vec::new();
+    for resource_type in [
+        "core.org_unit",
+        "core.org_position",
+        "core.org_assignment",
+        "core.org_change_set",
+    ] {
+        captures.extend(captures_of(&source.pool, resource_type));
+    }
+    captures.sort_by_key(|c| (c.hlc.wall_time_ms, c.hlc.logical));
+    for capture in captures {
+        let mut operation = operation_from(&capture);
+        for column in [
+            "user_id",
+            "author_user_id",
+            "approver_user_id",
+            "created_by",
+            "deputy_user_id",
+        ] {
+            if operation.body.changed_fields.get(column) == Some(&FieldValue::String(user.into())) {
+                operation.body.changed_fields.insert(
+                    column.to_string(),
+                    FieldValue::String(replica_user.to_string()),
+                );
+            }
+        }
+        let tx = conn.transaction().unwrap();
+        let kind = kind_of(&capture.resource_type).unwrap();
+        repl::apply(&tx, kind, &operation)
+            .unwrap_or_else(|e| panic!("{} was refused: {e}", capture.resource_type));
+        tx.commit().unwrap();
+    }
+}
+
+fn running_assignments_of(pool: &crate::db::DbPool, user: &str) -> i64 {
+    pool.read()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM org_assignments WHERE user_id = ?1 \
+             AND (valid_to IS NULL OR valid_to > date('now', '+1 day'))",
+            [user],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+#[test]
+fn leaving_the_organization_replicates_even_where_the_member_is_already_gone() {
+    let f = Fixture::new();
+    let unit = f.unit("Board", None);
+    let position = f.position(&unit, "CEO", None);
+    let anna = super::tests::add_user(&f.pool, ORG, "anna");
+    f.assign_user(&position, &anna, 1.0, Some(true)).unwrap();
+    // Membership first, then the assignment end it triggers.
+    org::remove_membership(&f.pool, ORG, &anna).unwrap();
+
+    let peer = peer();
+    let replica_anna = user_of_the_other_org_only(&peer);
+    replicate_structure(&f, &peer, &anna, &replica_anna);
+    assert_eq!(running_assignments_of(&peer.pool, &replica_anna), 0);
+}
+
+#[test]
+fn a_change_set_whose_author_later_left_still_replicates() {
+    let f = Fixture::new();
+    let author = super::tests::add_user(&f.pool, ORG, "author");
+    let saved = super::change_set::save(
+        &f.pool,
+        ORG,
+        &author,
+        None,
+        "Plan",
+        super::tests::day(3),
+        "[]",
+    )
+    .unwrap();
+    org::remove_membership(&f.pool, ORG, &author).unwrap();
+
+    let peer = peer();
+    let replica_author = user_of_the_other_org_only(&peer);
+    replicate_structure(&f, &peer, &author, &replica_author);
+    let stored: String = peer
+        .pool
+        .read()
+        .unwrap()
+        .query_row(
+            "SELECT author_user_id FROM org_change_sets WHERE id = ?1",
+            [&saved.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, replica_author);
+}
+
+#[test]
+fn the_baseline_replay_of_rows_about_a_former_member_applies() {
+    let f = Fixture::new();
+    let unit = f.unit("Board", None);
+    let position = f.position(&unit, "CEO", None);
+    let anna = super::tests::add_user(&f.pool, ORG, "anna");
+    f.assign_user(&position, &anna, 1.0, Some(true)).unwrap();
+    org::remove_membership(&f.pool, ORG, &anna).unwrap();
+    {
+        let mut conn = f.pool.write().unwrap();
+        let tx = conn.transaction().unwrap();
+        for kind in [Kind::OrgUnit, Kind::OrgPosition, Kind::OrgAssignment] {
+            repl::reseed(&tx, kind).unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    let peer = peer();
+    let replica_anna = user_of_the_other_org_only(&peer);
+    replicate_structure(&f, &peer, &anna, &replica_anna);
+    assert_eq!(running_assignments_of(&peer.pool, &replica_anna), 0);
+    assert_eq!(units_named(&peer.pool, ORG), ["Board"]);
 }

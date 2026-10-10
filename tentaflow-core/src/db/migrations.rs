@@ -287,7 +287,7 @@ pub fn run(conn: &Connection) -> Result<()> {
         }
     }
 
-    if crossing_identity_flip || crossing_ledger_secret_purge || crossing_absence_reason_purge {
+    if crossing_identity_flip || crossing_ledger_secret_purge {
         conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, '1')",
             rusqlite::params![CORE_BASELINE_RESET_PENDING_KEY],
@@ -1299,6 +1299,15 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
 /// transaction; `run` truncates the WAL right after the ladder. Pages freed earlier,
 /// backups and operations already on peers that have not upgraded still hold the values.
 fn org_absences_drop_reason(conn: &Connection) -> Result<()> {
+    // Decided here, in the migration's transaction, because the journal rows that prove an
+    // absence reached the ledger are deleted below: a marker written after the ladder could be
+    // lost by a crash between the commit and that write, leaving the ledger bodies in place.
+    if ledger_may_hold_absences(conn)? {
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, '1')",
+            rusqlite::params![CORE_BASELINE_RESET_PENDING_KEY],
+        )?;
+    }
     let secure_delete: i64 = conn.query_row("PRAGMA secure_delete", [], |row| row.get(0))?;
     conn.query_row("PRAGMA secure_delete = ON", [], |_| Ok(()))?;
     let outcome = (|| -> Result<()> {
@@ -16631,6 +16640,32 @@ mod tests {
         assert_eq!(pending(&conn).as_deref(), Some("1"));
 
         assert_eq!(pending(&seeded(false)), None, "a node that never saw an absence pays no reset");
+    }
+
+    /// The reset marker is part of the v200 transaction: it exists once the rung is applied, with
+    /// no post-ladder step involved.
+    #[test]
+    fn the_v200_reset_marker_is_written_by_the_migration_itself() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 199);
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute(
+            "INSERT INTO __tentaflow_core_sync_captures (capture_id, org_id, table_name, resource_type, \
+                resource_id, primary_key, action, changed_fields_blob, created_at_ms) \
+             VALUES ('c-1', ?1, 'org_absences', 'core.org_absence', 'a-1', 'id', 'insert', x'6465', 1)",
+            [crate::services::org::DEFAULT_ORG_ID],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        run_ladder_up_to(&conn, 200);
+        let pending: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                [CORE_BASELINE_RESET_PENDING_KEY],
+                |r| r.get(0),
+            )
+            .ok();
+        assert_eq!(pending.as_deref(), Some("1"));
     }
 
     /// An absence capture still waiting in the journal becomes a ledger operation body that carries

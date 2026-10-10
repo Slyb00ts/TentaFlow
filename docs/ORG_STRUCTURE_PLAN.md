@@ -442,6 +442,16 @@ przyszłego AD/Entra. Zasady:
   synchronizacji, a nie zwolnienie),
 - każde pole pokazuje w inspektorze swoje źródło i czas synchronizacji.
 
+### 5.0 Replikacja między węzłami — znane ograniczenia
+
+- Replikacja sprawdza tylko odwołania do wierszy **struktury** (jednostki, stanowiska, linie,
+  zewnętrzne osoby): ich identyfikatory są unikalne w organizacji. Identyfikatory użytkowników
+  nie są sprawdzane — członkostwo egzekwuje lokalna ścieżka zapisu, a była osoba (lub osoba,
+  której członkostwo jeszcze nie dotarło) jest prawidłowym podmiotem zreplikowanej historii.
+- **Znane ograniczenie (L2):** węzeł pośredniczący może zająć identyfikator wiersza, zanim
+  dotrze on od właściciela (pre-claim); koperta decyduje o organizacji, ale nie o tym, kto
+  pierwszy wprowadził klucz wiersza. Nie jest to obecnie blokowane.
+
 ### 5.1 eDokumenty — addon integracyjny
 
 - **Zakres (decyzja):** addon czyta **tylko urlopy i nieobecności**. Strukturę prowadzą

@@ -292,44 +292,30 @@ fn to_sql_value(value: Option<&FieldValue>) -> LedgerResult<Value> {
     })
 }
 
-/// What a column of a replicated row points at.
-enum Target {
-    /// A column of another structure table (the stable id, not the version row's key).
-    Column(&'static str, &'static str),
-    /// A user, through `org_memberships`.
-    Member,
-}
-
-/// The columns of `table` that name rows owned by an organization.
-fn references_of(table: &str) -> &'static [(&'static str, Target)] {
-    use Target::{Column, Member};
+/// The columns of `table` that name structure rows owned by an organization, as
+/// `(column, referenced table, referenced column)`. User ids are deliberately absent:
+/// membership is enforced on the local write path, and a former member (or one whose
+/// membership has not arrived yet) is a legitimate subject of replicated history.
+fn references_of(table: &str) -> &'static [(&'static str, &'static str, &'static str)] {
     match table {
         "org_units" => &[
-            ("type_id", Column("org_unit_types", "id")),
-            ("parent_unit_id", Column("org_units", "unit_id")),
-            ("head_position_id", Column("org_positions", "position_id")),
+            ("type_id", "org_unit_types", "id"),
+            ("parent_unit_id", "org_units", "unit_id"),
+            ("head_position_id", "org_positions", "position_id"),
         ],
-        "org_positions" => &[("unit_id", Column("org_units", "unit_id"))],
+        "org_positions" => &[("unit_id", "org_units", "unit_id")],
         "org_unit_deputy_heads" => &[
-            ("unit_id", Column("org_units", "unit_id")),
-            ("position_id", Column("org_positions", "position_id")),
+            ("unit_id", "org_units", "unit_id"),
+            ("position_id", "org_positions", "position_id"),
         ],
         "org_reporting_lines" => &[
-            ("position_id", Column("org_positions", "position_id")),
-            ("parent_position_id", Column("org_positions", "position_id")),
+            ("position_id", "org_positions", "position_id"),
+            ("parent_position_id", "org_positions", "position_id"),
         ],
         "org_assignments" => &[
-            ("position_id", Column("org_positions", "position_id")),
-            ("user_id", Member),
-            ("external_person_id", Column("org_external_persons", "id")),
+            ("position_id", "org_positions", "position_id"),
+            ("external_person_id", "org_external_persons", "id"),
         ],
-        "org_change_sets" => &[("author_user_id", Member), ("approver_user_id", Member)],
-        "org_deputies" => &[
-            ("user_id", Member),
-            ("deputy_user_id", Member),
-            ("created_by", Member),
-        ],
-        "org_absences" => &[("user_id", Member), ("created_by", Member)],
         _ => &[],
     }
 }
@@ -338,14 +324,11 @@ fn references_of(table: &str) -> &'static [(&'static str, Target)] {
 /// not arrived yet is not refused: operations of different tables are not ordered.
 fn names_foreign_row(
     tx: &Transaction<'_>,
-    target: &Target,
+    table: &str,
+    column: &str,
     value: &str,
     org_id: &str,
 ) -> rusqlite::Result<bool> {
-    let (table, column) = match target {
-        Target::Column(table, column) => (*table, *column),
-        Target::Member => ("org_memberships", "user_id"),
-    };
     tx.query_row(
         &format!(
             "SELECT EXISTS(SELECT 1 FROM {table} WHERE {column} = ?1 AND org_id <> ?2) \
@@ -410,12 +393,12 @@ pub fn apply(tx: &Transaction<'_>, kind: Kind, operation: &SyncOperation) -> Led
                     spec.table
                 )));
             }
-            for (column, target) in references_of(spec.table) {
+            for (column, table, target_column) in references_of(spec.table) {
                 let Some(FieldValue::String(value)) = operation.body.changed_fields.get(*column)
                 else {
                     continue;
                 };
-                if names_foreign_row(tx, target, value, org_id).map_err(sql_error)? {
+                if names_foreign_row(tx, table, target_column, value, org_id).map_err(sql_error)? {
                     return Err(SyncLedgerError::Runtime(format!(
                         "{} row references {column} of another organization",
                         spec.table
