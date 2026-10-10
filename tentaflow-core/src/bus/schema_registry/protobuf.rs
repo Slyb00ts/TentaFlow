@@ -3719,6 +3719,7 @@ mod tests {
     fn a_map_entry_and_a_group_cannot_collide_with_a_type_of_the_scope() {
         // Each of these makes protobuf-parse panic (option_resolver.rs, an
         // `unwrap`), which a release build cannot catch.
+        let mut misses = Vec::new();
         for (text, phrase) in [
             (
                 "syntax = \"proto3\"; message M { map<string, int32> a = 1; message AEntry { int32 x = 1; } }",
@@ -3744,11 +3745,20 @@ mod tests {
                 "syntax = \"proto2\"; message M { oneof o { group G = 1 { optional int32 z = 1; } } }",
                 "groups are not supported",
             ),
+            (
+                "syntax = \"proto2\"; message M { oneof o { group G = 1 { optional int32 z = 1; } } message G { optional int32 y = 1; } }",
+                "groups are not supported",
+            ),
         ] {
-            let got = refusal(text);
-            assert!(got.contains(phrase), "{text}: {got}");
-            assert_ne!(got, PARSER_PANIC, "{text}");
+            let got = match PROTOBUF_OPS.compile(text) {
+                Err(SchemaError::Invalid(m)) => m,
+                other => format!("accepted: {other:?}").chars().take(40).collect(),
+            };
+            if !got.contains(phrase) {
+                misses.push(format!("{text}: {got}"));
+            }
         }
+        assert_eq!(misses, Vec::<String>::new());
         // The same names in different scopes, and a field called `group`, are fine.
         compile("syntax = \"proto3\"; message M { map<string, int32> a = 1; } message N { message AEntry { int32 x = 1; } }");
         compile("syntax = \"proto3\"; message M { string group = 1; map<string, int32> a = 2; map<string, int32> b = 3; }");
