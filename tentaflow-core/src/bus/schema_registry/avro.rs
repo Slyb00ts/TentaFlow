@@ -38,14 +38,15 @@
 //     a `"type"` that nests another type object; and bounds the clone work
 //     `sum((1 + aliases) x subtree weight)` over named types by
 //     `MAX_CLONE_WORK`, where a weight unit is a JSON value, an object key or
-//     64 bytes of string content (so size, not just count). Worst case: 10^6
-//     units, each at most ~100 bytes resident (an object entry: key, value and
-//     map node; 64 string bytes cost less), i.e. about 100 MB of transient
-//     peak. Record-field defaults are taken out of the document before the
+//     64 bytes of string content (so size, not just count). Worst case: 5 x 10^5
+//     units, each at most ~180 bytes resident (an object entry: key `String`,
+//     `Value` and map node; 64 string bytes cost less), i.e. about 90 MB of
+//     transient peak. Record-field defaults are taken out of the document before the
 //     library parses it (`STASHED_DEFAULT`): the library's own default check
 //     is exponential on a default nested through a recursive union, and its
-//     failed-default path copied every parsed type. Our `default_fits` is
-//     linear and the only check. Type references stay small `Ref` values
+//     failed-default path copied every parsed type. Our `default_fits` takes
+//     time proportional to the size of the default (it walks the default's
+//     entries, not the record's fields) and is the only check. Type references stay small `Ref` values
 //     bounded by MAX_JSON_VALUES. Nothing else in the library parse copies a
 //     schema.
 //   - `compile` then caps types (`MAX_SCHEMA_NODES`) and schema depth, and
@@ -112,7 +113,7 @@ const MAX_ALIASES_PER_TYPE: usize = 64;
 const MAX_ALIASES_TOTAL: usize = 256;
 /// `sum((1 + aliases) x JSON values of the definition)` over named types: the
 /// number of value copies the library makes while registering them.
-const MAX_CLONE_WORK: usize = 1_000_000;
+const MAX_CLONE_WORK: usize = 500_000;
 /// Longest `doc` or custom-attribute string: free text the library copies once
 /// per name and alias of every enclosing definition.
 const MAX_ATTRIBUTE_TEXT: usize = 4096;
@@ -199,6 +200,11 @@ enum Kind {
         name: String,
         aliases: Vec<String>,
         fields: Vec<Field>,
+        /// Field name to position, so a default object is matched entry by
+        /// entry instead of field by default entry.
+        index: HashMap<String, usize>,
+        /// Fields without a default: a record default must supply all of them.
+        required: usize,
     },
 }
 
@@ -408,6 +414,8 @@ impl<'s> Lowerer<'s> {
                     name: r.name.name().to_string(),
                     aliases: alias_names(&r.aliases),
                     fields: Vec::new(),
+                    index: HashMap::new(),
+                    required: 0,
                 })?;
                 self.register(r.name.fullname(None), &r.aliases, id)?;
                 let mut fields = Vec::with_capacity(r.fields.len());
@@ -428,7 +436,19 @@ impl<'s> Lowerer<'s> {
                         node,
                     });
                 }
-                if let Kind::Record { fields: slot, .. } = &mut self.nodes[id].kind {
+                if let Kind::Record {
+                    fields: slot,
+                    index: names,
+                    required: count,
+                    ..
+                } = &mut self.nodes[id].kind
+                {
+                    *names = fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, f)| (f.name.clone(), i))
+                        .collect();
+                    *count = fields.iter().filter(|f| !f.has_default).count();
                     *slot = fields;
                 }
                 Ok(id)
@@ -505,11 +525,27 @@ fn default_fits(nodes: &[Node], id: NodeId, default: &Value, depth: usize) -> bo
         Kind::Union(branches) => branches
             .first()
             .is_some_and(|first| default_fits(nodes, *first, default, depth)),
-        Kind::Record { fields, .. } => default.as_object().is_some_and(|entries| {
-            fields.iter().all(|f| match entries.get(&f.name) {
-                Some(v) => default_fits(nodes, f.node, v, depth + 1),
-                None => f.has_default,
-            })
+        // Walks the default's entries, not the fields: a default is checked in
+        // time proportional to its own size, however many fields the record
+        // has. Keys that name no field are ignored.
+        Kind::Record {
+            fields,
+            index,
+            required,
+            ..
+        } => default.as_object().is_some_and(|entries| {
+            let mut supplied = 0;
+            for (key, value) in entries {
+                let Some(&at) = index.get(key) else { continue };
+                let field = &fields[at];
+                if !default_fits(nodes, field.node, value, depth + 1) {
+                    return false;
+                }
+                if !field.has_default {
+                    supplied += 1;
+                }
+            }
+            supplied == *required
         }),
     }
 }
@@ -646,7 +682,7 @@ fn check_name_len(what: &str, name: &str) -> Result<(), SchemaError> {
 /// the field type, and for a union that resolves the value twice per level, so
 /// a default nested through a recursive union takes 2^depth. The parsed
 /// schema keeps the default as this custom attribute; `default_fits` is the
-/// only check, and a projection writes the key back as `default`.
+/// only check (linear in the default's size), and a projection writes the key back as `default`.
 const STASHED_DEFAULT: &str = "x-tentaflow-stashed-default";
 
 /// Renames the `from` key of every record field in a schema document to `to`
@@ -3647,6 +3683,33 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(reason.contains("does not fit"), "{reason}");
+    }
+
+    #[test]
+    fn a_wide_record_default_is_checked_in_time_proportional_to_the_default() {
+        let fields = (0..1024)
+            .map(|i| format!(r#"{{"name":"f{i}","type":"int","default":{i}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let empties = vec!["{}"; 39_700].join(",");
+        let schema = format!(
+            r#"{{"type":"record","name":"Outer","fields":[{{"name":"rows","type":{{"type":"array","items":{{"type":"record","name":"Wide","fields":[{fields}]}}}},"default":[{empties}]}}]}}"#
+        );
+        assert!(schema.len() < 1_000_000);
+        let started = std::time::Instant::now();
+        let verdict = compiled_within("wide record default", schema);
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        verdict.unwrap();
+
+        // Required fields must be supplied; unknown keys are ignored.
+        let record = |default: &str| {
+            format!(
+                r#"{{"type":"record","name":"O","fields":[{{"name":"r","type":{{"type":"record","name":"R","fields":[{{"name":"a","type":"int"}},{{"name":"b","type":"int","default":1}}]}},"default":{default}}}]}}"#
+            )
+        };
+        compiled_within("required supplied", record(r#"{"a":1,"z":"x"}"#)).unwrap();
+        compiled_within("required missing", record(r#"{"b":2}"#)).unwrap_err();
+        compiled_within("required wrong", record(r#"{"a":"x"}"#)).unwrap_err();
     }
 
     #[test]

@@ -2223,8 +2223,13 @@ test('U5 Dodaj wzór, then a new version refused in plain words, the compatibili
   const win = schemaWindow(page);
   await expect(win.locator('[slot="body"]')).toBeVisible();
   // The formats offered are the ones this server can validate.
-  await expect(win.locator('tf-choice-card')).toHaveCount(3);
-  await expect(win.locator('tf-choice-card').first()).toHaveAttribute('heading', 'JSON Schema');
+  const offered = await win.locator('tf-choice-card').evaluateAll((cards) => cards.map((c) => [c.getAttribute('value'), c.getAttribute('heading')]));
+  expect(offered.sort()).toEqual([
+    ['avro', 'Avro'],
+    ['hl7v2_profile', 'profil HL7 v2'],
+    ['json_schema', 'JSON Schema'],
+    ['xsd', 'XSD'],
+  ]);
   await expect(win.locator('tf-choice-card[value="xsd"]')).toHaveAttribute('heading', 'XSD');
   await expect(win.locator('tf-choice-card[value="hl7v2_profile"]')).toHaveAttribute('heading', 'profil HL7 v2');
   const save = win.locator('[data-act="save"]');

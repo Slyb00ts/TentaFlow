@@ -986,6 +986,14 @@ mod tests {
                 record(&format!(r#"{{"name":"a","type":"int","doc":"{}"}}"#, "d".repeat(4097))),
                 "a doc is longer than 4096 bytes",
             ),
+            (
+                record(&format!(r#"{{"name":"a","type":"int","note":"{}"}}"#, "n".repeat(4097))),
+                "a custom attribute is longer than 4096 bytes",
+            ),
+            (
+                record(r#"{"name":"a","type":"int","x-tentaflow-stashed-default":1}"#),
+                "a field may not use the key 'x-tentaflow-stashed-default'",
+            ),
             (too_deep, "the schema is nested deeper than 64 levels"),
             (
                 record(
