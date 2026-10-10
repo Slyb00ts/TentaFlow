@@ -14850,6 +14850,7 @@
       "reason_project_removal": "Removal from project {project}",
       "note_departure": "The assignment in the structure ends on {date}. Positions pass on for good and project memberships expire on the day of departure.",
       "note_departure_ended": "The assignment in the structure ended on {date}. The remaining work passes on for good and project memberships end once it has been handed over.",
+      "note_skipped_projects": "Not listed: the work in {projects} could not be read right now (the task index did not settle). Try again in a moment.",
       "note_absence": "Temporary handover: the work goes back to the person on {date}, unless the taker closed or changed it. Positions and memberships do not change.",
       "note_project": "You are handing over only the work in project {project}; nothing changes in other projects, the structure or deputies.",
       "f_departure_date": "Date of departure",

@@ -347,6 +347,16 @@ test('a person with nothing to hand over gets an empty state, not an empty table
   assert.equal($('.org-ho-bulk').hidden, true);
 });
 
+test('a project the server left out of the list is named on the screen', async () => {
+  answers.list = listing({ skipped_projects: ['Energetyka', 'NextApp'] });
+  await mount();
+  const message = $('[data-role="ctxnote"]').getAttribute('message');
+  assert.ok(message.includes(ht('note_skipped_projects', { projects: 'Energetyka, NextApp' })), message);
+  answers.list = listing();
+  await mount();
+  assert.ok(!$('[data-role="ctxnote"]').getAttribute('message').includes('Energetyka'));
+});
+
 test('a failed read says so on the screen', async () => {
   failList = true;
   await mount();

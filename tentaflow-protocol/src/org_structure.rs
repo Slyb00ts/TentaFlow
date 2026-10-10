@@ -1422,6 +1422,9 @@ pub enum OrgStructurePayload {
         /// Everyone who may take something: active members but the person.
         #[serde(default)]
         takers: Vec<crate::org_structure_cover::OrgPersonRef>,
+        /// Names of projects left out of `groups` because their task index did not settle.
+        #[serde(default)]
+        skipped_projects: Vec<String>,
     },
     /// Moves the chosen items and records the handover. `note` is required.
     /// Not atomic across stores: see `HandoverApplyResponse`.
@@ -2583,6 +2586,7 @@ mod tests {
                 category: OrgHandoverCategory::Task,
                 items: vec![item],
             }],
+            skipped_projects: vec![s("Alpha")],
             takers: vec![OrgPersonRef {
                 user_id: s("u-2"),
                 display_name: s("Anna"),

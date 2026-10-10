@@ -251,6 +251,7 @@ async fn list(
         return_date: listing.return_date.map(fmt),
         assignment_ended_on: listing.assignment_ended_on.map(fmt),
         project_name: listing.project_name,
+        skipped_projects: listing.skipped_projects,
         groups: listing
             .groups
             .into_iter()

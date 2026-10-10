@@ -203,6 +203,17 @@ impl ProjectDirectory {
         }))
     }
 
+    /// Index sync after the task row has moved. Returns true when the index did not settle.
+    fn sync_index_late(&self, project_id: &str, pool: &crate::db::DbPool) -> bool {
+        match self.sync_index(project_id, pool) {
+            Ok(()) => false,
+            Err(e) => {
+                tracing::warn!(project = %project_id, "task index lags after a handover move: {e}");
+                true
+            }
+        }
+    }
+
     fn sync_index(&self, project_id: &str, pool: &crate::db::DbPool) -> Result<()> {
         let record = repository::get_project(&self.org_id, project_id)?
             .ok_or_else(|| anyhow::anyhow!("project missing"))?;
@@ -344,7 +355,13 @@ impl HandoverProvider for TaskProvider<'_> {
                 }
             }
             let pool = open_pool(&facts.id)?;
-            self.projects.sync_index(&facts.id, &pool)?;
+            // One project whose index never settles must not take the whole listing down: it is
+            // left out and named, so the operator knows its tasks are missing from the picture.
+            if let Err(e) = self.projects.sync_index(&facts.id, &pool) {
+                tracing::warn!(project = %facts.id, "handover listing skips a project: {e}");
+                cx.skipped.borrow_mut().push(facts.name.clone());
+                continue;
+            }
             let eligible = facts.eligible(
                 ProjectArea::Tasks,
                 ProjectPermissionLevel::Write,
@@ -489,9 +506,12 @@ impl WorkProvider for TaskProvider<'_> {
                 },
             );
         }
-        self.projects.sync_index(project_id, &pool)?;
+        // The task is already moved: a lagging index is catch-up work, not a failed item, and
+        // marking it failed would leave it with the taker for good (the return job takes `done`).
+        let index_pending = self.projects.sync_index_late(project_id, &pool);
         Ok(Step::Done(json!({
             "status": before.map(|t| t.status).unwrap_or_default(),
+            "index_pending": index_pending,
         })))
     }
 
@@ -576,7 +596,7 @@ impl WorkProvider for TaskProvider<'_> {
                 },
             );
         }
-        self.projects.sync_index(project_id, &pool)?;
+        self.projects.sync_index_late(project_id, &pool);
         Ok(Returned::Back)
     }
 }
@@ -1208,6 +1228,141 @@ mod tests {
         std::mem::forget(root);
     }
 
+    /// The task row has moved when the index lags: the item must stay `done` (the return job takes
+    /// those) and the way back must not fail on the same lag.
+    #[tokio::test]
+    async fn a_task_that_moved_stays_done_and_returns_when_its_index_does_not_settle() {
+        use crate::project_studio::models::MemberInput;
+        let root = tempfile::tempdir().expect("actual project storage");
+        let _ = ps_db::init(&root.path().join("projects.db"));
+        let state = crate::dispatch::AppState::for_test();
+        let org = crate::services::org::DEFAULT_ORG_ID;
+        let mut users = Vec::new();
+        for name in ["lag-owner", "lag-giver", "lag-taker"] {
+            let id = crate::db::repository::create_user_account(
+                &state.db,
+                name,
+                "hash",
+                name,
+                &format!("{name}@example.test"),
+            )
+            .expect("actual account");
+            crate::services::org::add_membership(&state.db, org, &id, "role-org-viewer", "test")
+                .expect("actual organization member");
+            users.push(id);
+        }
+        let (owner, giver, taker) = (&users[0], &users[1], &users[2]);
+        let grant = |user: &str| MemberInput {
+            user_id: user.into(),
+            functions: vec!["developer".into()],
+            project_admin: false,
+            expires_at: None,
+        };
+        let id = uuid::Uuid::new_v4().to_string();
+        let dir = root.path().join(&id);
+        std::fs::create_dir_all(dir.join("files")).expect("actual project directory");
+        repository::create_project(
+            &id,
+            org,
+            &format!("Lag {id}"),
+            "",
+            "custom",
+            "[\"tasks\"]",
+            owner,
+            &dir.to_string_lossy(),
+            "",
+            None,
+            false,
+            false,
+            false,
+            &[grant(giver), grant(taker)],
+        )
+        .expect("actual project");
+        let pool = project_db::open(&id).expect("content");
+        let task = tasks::create_task(
+            &pool,
+            &tasks::TaskInput {
+                task_type: "technical",
+                title: "Held while the index lags",
+                description_md: "",
+                severity: "",
+                priority: "medium",
+                status: "todo",
+                assigned_to: giver,
+                due_date: "",
+                parent_task_id: None,
+                links_json: "[]",
+                attachments_json: "[]",
+            },
+            owner,
+        )
+        .expect("actual held task");
+        let directory = ProjectDirectory::new(org, &state.db);
+        directory.sync_index(&id, &pool).expect("current location");
+        // A cursor ahead of its source is the "rebuild required" state: no round settles it.
+        ps_db::pool()
+            .expect("registry")
+            .write()
+            .expect("registry writer")
+            .execute(
+                "UPDATE task_index_cursor SET last_revision = 1000000 WHERE project_id = ?1",
+                [&id],
+            )
+            .expect("poison the cursor");
+        assert!(directory.sync_index(&id, &pool).is_err());
+
+        let day = chrono::Utc::now().date_naive();
+        let operation = uuid::Uuid::new_v4().to_string();
+        let cx = ApplyCx {
+            org_id: org,
+            actor: owner,
+            actor_is_admin: false,
+            handover_id: &operation,
+            from_user: giver,
+            reason: Reason::Absence,
+            date: day,
+            today: day,
+            note: "Away",
+            note_digest: "",
+        };
+        let provider = TaskProvider {
+            projects: &directory,
+        };
+        let plan = Planned {
+            key: task_key(&id, &task.task_id),
+            category: Category::Task,
+            title: "Held while the index lags".into(),
+            project_id: Some(id.clone()),
+            taker: Some(taker.clone()),
+        };
+        match provider.apply(&cx, &plan).expect("answered") {
+            Step::Done(detail) => assert_eq!(detail["index_pending"], true),
+            other => panic!(
+                "a moved task was not reported done: {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+        let assignee = || {
+            tasks::get_task(&pool, &task.task_id)
+                .unwrap()
+                .unwrap()
+                .assigned_to
+        };
+        assert_eq!(assignee(), *taker);
+
+        let recorded = Recorded {
+            key: plan.key.clone(),
+            from_user: giver.clone(),
+            taker: Some(taker.clone()),
+        };
+        assert!(matches!(
+            provider.reverse(&cx, &recorded).expect("answered"),
+            Returned::Back
+        ));
+        assert_eq!(assignee(), *giver);
+        std::mem::forget(root);
+    }
+
     #[tokio::test]
     async fn inherited_held_work_respects_private_cuts_surviving_grants_and_moved_uuid() {
         use crate::project_studio::models::MemberInput;
@@ -1325,6 +1480,7 @@ mod tests {
                     advice: &advice,
                     names: &names,
                     members: &members,
+                    skipped: &std::cell::RefCell::new(Vec::new()),
                 })
                 .expect("real provider inventory")
         };

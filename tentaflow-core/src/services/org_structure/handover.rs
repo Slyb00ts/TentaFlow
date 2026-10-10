@@ -29,6 +29,7 @@
 //! taker still holds it, unfinished, goes back to the person; the rest is
 //! `kept`.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use chrono::NaiveDate;
@@ -44,6 +45,7 @@ use super::validate::{self, format_date};
 use super::WriteCtx;
 use crate::db::DbPool;
 use crate::project_studio::notifications;
+use tentaflow_protocol::project_studio::access::ProjectArea;
 
 mod advice;
 mod due;
@@ -200,6 +202,8 @@ pub(super) struct ListCx<'a> {
     pub names: &'a HashMap<String, String>,
     /// Active members of the organization.
     pub members: &'a HashSet<String>,
+    /// Names of projects a provider had to leave out of the listing.
+    pub skipped: &'a RefCell<Vec<String>>,
 }
 
 /// What an item needs to be moved.
@@ -300,6 +304,8 @@ pub struct Listing {
     pub groups: Vec<(Category, Vec<Held>)>,
     /// Active members but the person: who may take something.
     pub takers: Vec<(String, String)>,
+    /// Projects left out because their task index did not settle.
+    pub skipped_projects: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -468,6 +474,7 @@ struct Gathered {
     names: HashMap<String, String>,
     members: HashSet<String>,
     project_name: Option<String>,
+    skipped_projects: Vec<String>,
 }
 
 fn gather(
@@ -491,6 +498,7 @@ fn gather(
     let project = (subject.reason == Reason::ProjectRemoval)
         .then_some(subject.project_id)
         .flatten();
+    let skipped = RefCell::new(Vec::new());
     let cx = ListCx {
         conn: &conn,
         org_id,
@@ -502,6 +510,7 @@ fn gather(
         advice: &advice,
         names: &names,
         members: &members,
+        skipped: &skipped,
     };
     let providers: [Box<dyn HandoverProvider + '_>; 5] = [
         Box::new(TaskProvider {
@@ -551,6 +560,7 @@ fn gather(
         names,
         members,
         project_name,
+        skipped_projects: skipped.into_inner(),
     })
 }
 
@@ -609,6 +619,7 @@ pub fn list(
         project_name: gathered.project_name,
         groups,
         takers,
+        skipped_projects: gathered.skipped_projects,
     })
 }
 
@@ -837,7 +848,71 @@ pub fn apply(
     })
 }
 
-/// Tries the failed and not yet started items of a recorded handover again.
+/// Which items of a record the asker may read: those of projects they have access to and, for an
+/// absence, only of the areas the listing would have shown them (a title is task content).
+struct ItemGate<'a> {
+    projects: &'a ProjectDirectory,
+    actor: &'a str,
+    reason: Reason,
+    known: HashMap<(String, &'static str), bool>,
+}
+
+impl<'a> ItemGate<'a> {
+    fn new(projects: &'a ProjectDirectory, actor: &'a str, reason: Reason) -> Self {
+        Self {
+            projects,
+            actor,
+            reason,
+            known: HashMap::new(),
+        }
+    }
+
+    fn project_visible(&mut self, project: &str) -> Result<bool> {
+        self.area_visible(project, "project", |projects, actor| {
+            Ok(projects
+                .actor_access(project, actor)?
+                .is_some_and(|access| access.has_access))
+        })
+    }
+
+    fn area_visible(
+        &mut self,
+        project: &str,
+        area: &'static str,
+        ask: impl FnOnce(&ProjectDirectory, &str) -> Result<bool>,
+    ) -> Result<bool> {
+        let key = (project.to_string(), area);
+        if let Some(known) = self.known.get(&key) {
+            return Ok(*known);
+        }
+        let allowed = ask(self.projects, self.actor)?;
+        self.known.insert(key, allowed);
+        Ok(allowed)
+    }
+
+    fn item_visible(&mut self, item: &record::Item) -> Result<bool> {
+        let Some(project) = item.project_id.as_deref() else {
+            return Ok(true);
+        };
+        if !self.project_visible(project)? {
+            return Ok(false);
+        }
+        if self.reason != Reason::Absence {
+            return Ok(true);
+        }
+        let (label, areas): (&'static str, &[ProjectArea]) = match item.category {
+            Category::Task => ("tasks", &[ProjectArea::Tasks, ProjectArea::Board]),
+            Category::TestItem => ("tests", &[ProjectArea::Tests]),
+            _ => return Ok(true),
+        };
+        self.area_visible(project, label, |projects, actor| {
+            projects.actor_reads(project, actor, areas)
+        })
+    }
+}
+
+/// Tries the failed and not yet started items of a recorded handover again. Only
+/// the items the caller may read are tried and answered, like in `records`.
 pub fn retry(
     pool: &DbPool,
     org_id: &str,
@@ -865,6 +940,8 @@ pub fn retry(
             reason: "the return day has passed; the work is put back by the return job".into(),
         });
     }
+    let projects = ProjectDirectory::new(org_id, pool);
+    let items = visible_items(&projects, actor, &header, items)?;
     let wanted: HashSet<&str> = keys.iter().map(String::as_str).collect();
     let planned: Vec<Planned> = items
         .iter()
@@ -885,30 +962,54 @@ pub fn retry(
         });
     }
     let names = availability::display_names(pool, org_id)?;
-    let mut results = execute(pool, &header, &planned, actor, today, true)?;
+    let attempted = execute(pool, &header, &planned, actor, today, true)?;
+    audit(
+        pool,
+        actor.user_id,
+        "org.handover.retry",
+        &header,
+        &attempted,
+        planned.len(),
+    );
+    // Takers hear only of what this attempt moved: the items done earlier were announced then.
+    notify_takers(&header, &attempted, &names);
     // What did not need a retry is part of the picture too.
-    let retried: HashSet<String> = results.iter().map(|r| r.key.clone()).collect();
+    let retried: HashSet<String> = attempted.iter().map(|r| r.key.clone()).collect();
     let project_names = project_names_of(org_id, &items);
+    let mut results = attempted;
     results.extend(
         items
             .iter()
             .filter(|i| !retried.contains(&i.key))
             .map(|i| result_of(i, &project_names)),
     );
-    audit(
-        pool,
-        actor.user_id,
-        "org.handover.retry",
-        &header,
-        &results,
-        planned.len(),
-    );
-    notify_takers(&header, &results, &names);
     Ok(Applied {
         handover_id: Some(header.id),
         items: results,
         refused: None,
     })
+}
+
+/// The items of `header` the asker may read. A departure stays whole for the administrator who
+/// made it; every other record shows only the work of projects the asker may see, in the areas
+/// the listing it came from would have shown.
+fn visible_items(
+    projects: &ProjectDirectory,
+    actor: &Actor<'_>,
+    header: &record::Header,
+    items: Vec<record::Item>,
+) -> Result<Vec<record::Item>> {
+    if header.reason == Reason::Departure && actor.is_admin {
+        return Ok(items);
+    }
+    let mut gate = ItemGate::new(projects, actor.user_id, header.reason);
+    let mut kept = Vec::with_capacity(items.len());
+    for item in items {
+        if gate.item_visible(&item)? {
+            kept.push(item);
+        }
+    }
+    Ok(kept)
 }
 
 fn project_names_of(org_id: &str, items: &[record::Item]) -> HashMap<String, String> {
@@ -981,7 +1082,7 @@ fn execute(
             failures.iter().map(|(k, c)| (k.as_str(), *c)).collect();
         for item in &org_items {
             if let Some(code) = failed_keys.get(item.key.as_str()) {
-                {
+                if !refused_on_retry(resumed, code) {
                     let conn = pool.write().map_err(|e| E::Db(e.to_string()))?;
                     record::set_status(&conn, &header.id, &item.key, "failed", Some(code), None)?;
                 }
@@ -1028,7 +1129,7 @@ fn execute(
             Step::Skipped(reason) => ("skipped", Some(reason), None),
             Step::Refused(reason) => ("failed", Some(reason), None),
         };
-        {
+        if !(status == "failed" && reason.is_some_and(|code| refused_on_retry(resumed, code))) {
             let conn = pool.write().map_err(|e| E::Db(e.to_string()))?;
             record::set_status(
                 &conn,
@@ -1042,6 +1143,12 @@ fn execute(
         done.insert(item.key.clone(), outcome(item, status, reason));
     }
     Ok(items.iter().filter_map(|i| done.remove(&i.key)).collect())
+}
+
+/// A retry by somebody who may not move the item says so in its answer, but the record keeps
+/// why the item failed in the first place: the refusal is about the caller, not about the work.
+fn refused_on_retry(resumed: bool, code: &str) -> bool {
+    resumed && code == "not_permitted"
 }
 
 /// All org items in one organization transaction. Returns the items that were
@@ -1258,38 +1365,17 @@ pub fn records(
     };
     authorize(&conn, org_id, actor, &subject, today)?;
     let projects = ProjectDirectory::new(org_id, pool);
-    let mut visible: HashMap<String, bool> = HashMap::new();
     let mut out = Vec::new();
     for header in record::headers_of(&conn, org_id, user_id)? {
-        let mut items = record::items(&conn, &header.id)?;
-        // A departure is the administrator's decision and stays whole for them; every other record
-        // shows only the work of projects the asker may see, like the listing it came from.
+        let all = record::items(&conn, &header.id)?;
+        let before = all.len();
+        let items = visible_items(&projects, actor, &header, all)?;
         if !(header.reason == Reason::Departure && actor.is_admin) {
-            let before = items.len();
-            let mut kept = Vec::with_capacity(before);
-            for item in items {
-                let may_see = match item.project_id.as_deref() {
-                    None => true,
-                    Some(project) => match visible.get(project) {
-                        Some(known) => *known,
-                        None => {
-                            let known = projects
-                                .actor_access(project, actor.user_id)?
-                                .is_some_and(|access| access.has_access);
-                            visible.insert(project.to_string(), known);
-                            known
-                        }
-                    },
-                };
-                if may_see {
-                    kept.push(item);
-                }
-            }
-            items = kept;
-            let hidden_project = header
-                .project_id
-                .as_deref()
-                .is_some_and(|project| visible.get(project) == Some(&false));
+            let hidden_project = match header.project_id.as_deref() {
+                Some(project) => !ItemGate::new(&projects, actor.user_id, header.reason)
+                    .project_visible(project)?,
+                None => false,
+            };
             if hidden_project || (items.is_empty() && before > 0) {
                 continue;
             }

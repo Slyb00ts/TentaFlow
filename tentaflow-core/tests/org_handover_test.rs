@@ -1965,3 +1965,319 @@ async fn handover_requests_are_limited_per_person_and_one_apply_takes_a_bounded_
     let boss = ctx(&w, &w.boss, false);
     assert!(list(&boss, &w.leaver, Reason::Absence, None, None).await.is_ok());
 }
+
+// =============================================================================
+// Retry and listing for somebody who may not read all of the work
+// =============================================================================
+
+fn failing_trigger(project: &str, task: &str) {
+    project_db::open(project)
+        .unwrap()
+        .write()
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TRIGGER refuse_one BEFORE UPDATE OF assigned_to ON tasks \
+             WHEN OLD.task_id = '{task}' BEGIN SELECT RAISE(ABORT, 'disk is full'); END;"
+        ))
+        .unwrap();
+}
+
+fn drop_failing_trigger(project: &str) {
+    project_db::open(project)
+        .unwrap()
+        .write()
+        .unwrap()
+        .execute_batch("DROP TRIGGER refuse_one;")
+        .unwrap();
+}
+
+fn recorded_items(
+    w: &World,
+    viewer: &str,
+    is_admin: bool,
+) -> Vec<(String, String, Option<String>)> {
+    handover::records(
+        &w.state.db,
+        DEFAULT_ORG_ID,
+        &handover::Actor {
+            user_id: viewer,
+            is_admin,
+        },
+        &w.leaver,
+    )
+    .unwrap()
+    .into_iter()
+    .flat_map(|record| record.items)
+    .map(|i| (i.title, i.status, i.reason))
+    .collect()
+}
+
+/// The leaver hands over an absence with one task refused by a full disk; the fault is gone again.
+async fn absence_with_a_failed_task(w: &World, p: &Project) -> String {
+    failing_trigger(&p.id, &p.task_b);
+    let me = ctx(w, &w.leaver, false);
+    let listing = list(&me, &w.leaver, Reason::Absence, None, None)
+        .await
+        .unwrap();
+    let answer = apply(
+        &me,
+        &w.leaver,
+        Reason::Absence,
+        None,
+        None,
+        Some(s(plus(w.today, 7))),
+        "away",
+        vec![
+            choice(listing.titled(Cat::Task, "Import OPC"), Some(&w.peer)),
+            choice(listing.titled(Cat::Task, "Nakladka"), Some(&w.peer)),
+            choice(&listing.items(Cat::TestItem)[0], Some(&w.peer)),
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(!answer.ok);
+    assert_eq!(answer.status_of("Nakladka"), ("failed", Some("internal")));
+    drop_failing_trigger(&p.id);
+    answer.handover_id.expect("recorded")
+}
+
+#[tokio::test]
+async fn a_retry_by_a_manager_outside_the_project_shows_none_of_its_work_and_changes_nothing() {
+    let w = world();
+    let p = project(
+        &w,
+        "retry-outside",
+        &w.peer,
+        &[(&w.peer, "owner"), (&w.leaver, "developer,tester")],
+        &w.leaver,
+    );
+    let id = absence_with_a_failed_task(&w, &p).await;
+
+    // The leaver's manager (boss) is not in the project: nothing of it is theirs to retry or read.
+    let refused = handover::retry(
+        &w.state.db,
+        DEFAULT_ORG_ID,
+        &handover::Actor {
+            user_id: &w.boss,
+            is_admin: false,
+        },
+        &id,
+        &[],
+    );
+    match refused {
+        Err(e) => assert_eq!(e.code(), "invalid_value"),
+        Ok(answer) => panic!(
+            "titles of a closed project were answered: {:?}",
+            answer.items
+        ),
+    }
+    let own = recorded_items(&w, &w.leaver, false);
+    assert!(
+        own.iter()
+            .any(|(title, status, reason)| title.contains("Nakladka")
+                && status == "failed"
+                && reason.as_deref() == Some("internal")),
+        "{own:?}"
+    );
+    assert_eq!(assignee_of(&p.id, &p.task_b), w.leaver);
+}
+
+#[tokio::test]
+async fn a_retry_by_a_reader_who_cannot_move_the_work_keeps_why_it_failed_and_hides_the_tests() {
+    let w = world();
+    let p = project(
+        &w,
+        "retry-observer",
+        &w.peer,
+        &[(&w.peer, "owner"), (&w.leaver, "developer,tester")],
+        &w.leaver,
+    );
+    let id = absence_with_a_failed_task(&w, &p).await;
+    // An observer reads the tasks of the project and has no right in its tests.
+    repository::add_members(
+        &p.id,
+        &[tentaflow_core::project_studio::models::MemberInput {
+            user_id: w.boss.clone(),
+            functions: vec!["observer".to_string()],
+            project_admin: false,
+            expires_at: None,
+        }],
+        &w.peer,
+    )
+    .expect("add observer");
+
+    let answer = handover::retry(
+        &w.state.db,
+        DEFAULT_ORG_ID,
+        &handover::Actor {
+            user_id: &w.boss,
+            is_admin: false,
+        },
+        &id,
+        &[],
+    )
+    .unwrap();
+    let refused = answer
+        .items
+        .iter()
+        .find(|i| i.title.contains("Nakladka"))
+        .expect("the task they may read is answered");
+    assert_eq!(
+        (refused.status.as_str(), refused.reason.as_deref()),
+        ("failed", Some("not_permitted"))
+    );
+    assert!(
+        answer.items.iter().all(|i| !i.title.contains("Logowanie")),
+        "the test item is outside what an observer reads: {:?}",
+        answer.items
+    );
+    assert_eq!(assignee_of(&p.id, &p.task_b), w.leaver);
+
+    // The record still says what went wrong in the first place, and shows the observer no test.
+    let own = recorded_items(&w, &w.leaver, false);
+    assert!(
+        own.iter()
+            .any(|(title, status, reason)| title.contains("Nakladka")
+                && status == "failed"
+                && reason.as_deref() == Some("internal")),
+        "{own:?}"
+    );
+    let seen = recorded_items(&w, &w.boss, false);
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    assert!(seen
+        .iter()
+        .all(|(title, _, _)| !title.contains("Logowanie")));
+}
+
+fn handed_over_counts(user: &str, handover_id: &str) -> Vec<u64> {
+    let (rows, _, _) =
+        tentaflow_core::project_studio::notifications::list(user, false, None, 100, &|_| Ok(true))
+            .unwrap();
+    rows.into_iter()
+        .filter(|n| n.kind == "work_handed_over")
+        .filter_map(|n| serde_json::from_str::<serde_json::Value>(&n.link_json).ok())
+        .filter(|link| link["handover_id"] == handover_id)
+        .filter_map(|link| link["count"].as_u64())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_retry_tells_the_taker_only_about_the_items_it_moved() {
+    let w = world();
+    let p = project(
+        &w,
+        "retry-notify",
+        &w.boss,
+        &[
+            (&w.boss, "owner"),
+            (&w.leaver, "developer,tester"),
+            (&w.peer, "developer,tester"),
+        ],
+        &w.leaver,
+    );
+    failing_trigger(&p.id, &p.task_b);
+    let admin = ctx(&w, &w.admin, true);
+    let listing = list(&admin, &w.leaver, Reason::Departure, None, None)
+        .await
+        .unwrap();
+    let answer = apply(
+        &admin,
+        &w.leaver,
+        Reason::Departure,
+        None,
+        None,
+        None,
+        "leaving",
+        vec![
+            choice(listing.titled(Cat::Task, "Import OPC"), Some(&w.peer)),
+            choice(listing.titled(Cat::Task, "Nakladka"), Some(&w.peer)),
+        ],
+    )
+    .await
+    .unwrap();
+    let id = answer.handover_id.clone().expect("recorded");
+    assert_eq!(handed_over_counts(&w.peer, &id), [1]);
+    drop_failing_trigger(&p.id);
+
+    let retried = handover::retry(
+        &w.state.db,
+        DEFAULT_ORG_ID,
+        &handover::Actor {
+            user_id: &w.admin,
+            is_admin: true,
+        },
+        &id,
+        &[],
+    )
+    .unwrap();
+    assert!(retried.items.iter().all(|i| i.status == "done"));
+    // The one item the retry moved reads like the first announcement, which an unread duplicate
+    // absorbs; counting both tasks would have been a second, larger one.
+    let counts = handed_over_counts(&w.peer, &id);
+    assert!(
+        !counts.is_empty() && counts.iter().all(|count| *count == 1),
+        "the retry announces only what it moved: {counts:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_project_whose_task_index_never_settles_is_left_out_of_the_listing_and_named() {
+    let w = world();
+    let good = project(
+        &w,
+        "index-good",
+        &w.peer,
+        &[(&w.peer, "owner"), (&w.leaver, "developer,tester")],
+        &w.leaver,
+    );
+    let bad = project(
+        &w,
+        "index-bad",
+        &w.peer,
+        &[(&w.peer, "owner"), (&w.leaver, "developer,tester")],
+        &w.leaver,
+    );
+    let actor = handover::Actor {
+        user_id: &w.leaver,
+        is_admin: false,
+    };
+    let target = handover::Target {
+        user_id: &w.leaver,
+        reason: handover::Reason::Absence,
+        project_id: None,
+        date: None,
+        return_date: None,
+    };
+    // The first listing creates the cursor rows; then one project's cursor runs ahead of its source.
+    let first = handover::list(&w.state.db, DEFAULT_ORG_ID, &actor, &target).unwrap();
+    assert!(first.skipped_projects.is_empty());
+    ps_db::pool()
+        .unwrap()
+        .write()
+        .unwrap()
+        .execute(
+            "UPDATE task_index_cursor SET last_revision = 1000000 WHERE project_id = ?1",
+            [&bad.id],
+        )
+        .unwrap();
+
+    let listing = handover::list(&w.state.db, DEFAULT_ORG_ID, &actor, &target).unwrap();
+    let bad_name = repository::get_project(DEFAULT_ORG_ID, &bad.id)
+        .unwrap()
+        .unwrap()
+        .name;
+    assert_eq!(listing.skipped_projects, [bad_name]);
+    let tasks: Vec<_> = listing
+        .groups
+        .iter()
+        .filter(|(category, _)| *category == handover::Category::Task)
+        .flat_map(|(_, items)| items)
+        .collect();
+    assert!(!tasks.is_empty());
+    assert!(
+        tasks
+            .iter()
+            .all(|t| t.project_id.as_deref() == Some(good.id.as_str())),
+        "only the project whose index settled is listed"
+    );
+}

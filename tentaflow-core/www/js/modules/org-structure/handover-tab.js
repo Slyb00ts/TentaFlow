@@ -176,6 +176,10 @@ function renderNote() {
   } else {
     note.setAttribute('message', ht('note_project', { project: listing?.project_name ?? '' }));
   }
+  const skipped = listing?.skipped_projects ?? [];
+  if (skipped.length) {
+    note.setAttribute('message', `${note.getAttribute('message')} ${ht('note_skipped_projects', { projects: skipped.join(', ') })}`);
+  }
 }
 
 /** This screen's sentence for `key`, or `fallback` when the server sent a code this build has none for. */

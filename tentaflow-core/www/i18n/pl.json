@@ -14850,6 +14850,7 @@
       "reason_project_removal": "Usunięcie z projektu {project}",
       "note_departure": "Przypisanie w strukturze kończy się {date}. Pozycje przechodzą na stałe, a członkostwa w projektach wygasają w dniu odejścia.",
       "note_departure_ended": "Przypisanie w strukturze zakończyło się {date}. Pozostała praca przechodzi na stałe, a członkostwa w projektach kończą się po jej przekazaniu.",
+      "note_skipped_projects": "Nie wyświetlono: pracy w {projects} nie udało się teraz odczytać (indeks zadań się nie ustabilizował). Spróbuj ponownie za chwilę.",
       "note_absence": "Przekazanie czasowe: praca wraca do osoby {date}, chyba że przejmujący ją zamknął lub zmienił. Stanowiska i członkostwa się nie zmieniają.",
       "note_project": "Przekazujesz tylko pracę w projekcie {project}; w pozostałych projektach, strukturze i zastępstwach nic się nie zmienia.",
       "f_departure_date": "Data odejścia",

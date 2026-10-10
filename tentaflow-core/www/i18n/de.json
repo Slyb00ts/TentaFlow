@@ -13615,6 +13615,7 @@
       "reason_project_removal": "Entfernung aus dem Projekt {project}",
       "note_departure": "Die Zuordnung in der Struktur endet am {date}. Positionen gehen dauerhaft über, Projektmitgliedschaften laufen am Tag des Ausscheidens ab.",
       "note_departure_ended": "Die Zuordnung in der Struktur endete am {date}. Die verbleibende Arbeit geht dauerhaft über, die Projektmitgliedschaften enden nach der Übergabe.",
+      "note_skipped_projects": "Nicht aufgeführt: Die Arbeit in {projects} konnte gerade nicht gelesen werden (der Aufgabenindex hat sich nicht stabilisiert). Bitte gleich noch einmal versuchen.",
       "note_absence": "Vorübergehende Übergabe: Die Arbeit geht am {date} an die Person zurück, sofern der Übernehmende sie nicht abgeschlossen oder geändert hat. Positionen und Mitgliedschaften bleiben unverändert.",
       "note_project": "Sie übergeben nur die Arbeit im Projekt {project}; in anderen Projekten, in der Struktur und bei Vertretungen ändert sich nichts.",
       "f_departure_date": "Datum des Ausscheidens",

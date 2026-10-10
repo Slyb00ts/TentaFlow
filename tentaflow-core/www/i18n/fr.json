@@ -13615,6 +13615,7 @@
       "reason_project_removal": "Retrait du projet {project}",
       "note_departure": "L'affectation dans la structure prend fin le {date}. Les postes passent définitivement et les appartenances aux projets expirent le jour du départ.",
       "note_departure_ended": "L'affectation dans la structure a pris fin le {date}. Le travail restant passe définitivement et les appartenances aux projets se terminent après sa transmission.",
+      "note_skipped_projects": "Non listé : le travail dans {projects} n'a pas pu être lu pour le moment (l'index des tâches ne s'est pas stabilisé). Réessayez dans un instant.",
       "note_absence": "Transmission temporaire : le travail revient à la personne le {date}, sauf si le repreneur l'a clôturé ou modifié. Les postes et les appartenances ne changent pas.",
       "note_project": "Vous ne transmettez que le travail du projet {project} ; rien ne change dans les autres projets, la structure ni les suppléances.",
       "f_departure_date": "Date de départ",

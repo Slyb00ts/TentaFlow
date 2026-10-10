@@ -13615,6 +13615,7 @@
       "reason_project_removal": "Baja del proyecto {project}",
       "note_departure": "La asignación en la estructura termina el {date}. Los puestos pasan de forma definitiva y las pertenencias a proyectos caducan el día de la salida.",
       "note_departure_ended": "La asignación en la estructura terminó el {date}. El trabajo restante pasa de forma definitiva y las pertenencias a proyectos terminan tras el traspaso.",
+      "note_skipped_projects": "No listado: no se pudo leer ahora el trabajo de {projects} (el índice de tareas no se estabilizó). Inténtalo de nuevo en un momento.",
       "note_absence": "Traspaso temporal: el trabajo vuelve a la persona el {date}, salvo que quien lo recibió lo haya cerrado o cambiado. Los puestos y las pertenencias no cambian.",
       "note_project": "Solo traspasas el trabajo del proyecto {project}; en los demás proyectos, en la estructura y en las sustituciones no cambia nada.",
       "f_departure_date": "Fecha de salida",
