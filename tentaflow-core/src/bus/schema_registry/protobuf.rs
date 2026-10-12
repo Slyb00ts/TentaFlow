@@ -74,7 +74,10 @@
 //     or slow the parser: bracket depth (`{ [ <`) over `MAX_BRACKET_DEPTH`, more
 //     than `MAX_ASSIGNMENTS` `=`, `MAX_MESSAGES` messages (map fields count,
 //     they become messages), `MAX_ENUMS` enums, identifiers over
-//     `MAX_NAME_LEN`, strings over `MAX_STRING_LITERAL`, `(` anywhere (custom
+//     `MAX_NAME_LEN`, a package or dotted type reference over its part and
+//     length caps, a declared type whose full name passes
+//     `MAX_QUALIFIED_NAME_LEN`, strings over `MAX_STRING_LITERAL` or holding
+//     a control or direction-changing character, `(` anywhere (custom
 //     options), non-ASCII outside strings and comments, a type name (message,
 //     enum or the entry of a `map`, spelled as the parser spells it) declared
 //     twice in one scope, a `map` inside a `map`, and `import` / `service` /
@@ -176,10 +179,19 @@ const MAX_REQUIRED_FIELDS: usize = 64;
 /// `=` outside comments and strings: fields, enum values, options and
 /// `[...]` field options all use one, so this bounds the parser's work.
 const MAX_ASSIGNMENTS: usize = 12_288;
-/// Identifiers: messages, fields, enums, packages (a package is dotted, each
-/// part counts). Messages quote them, so the cap bounds every message.
+/// Identifiers: messages, fields, enums and each part of a dotted package or
+/// type reference. Messages quote them, so the cap bounds every message.
 const MAX_NAME_LEN: usize = 128;
 const MAX_STRING_LITERAL: usize = 256;
+/// The package and the dotted type references are names too: a long one is
+/// copied into every fully qualified type name (one per field) and tried
+/// against every enclosing scope by the parser's type resolver.
+const MAX_PACKAGE_PARTS: usize = 8;
+const MAX_PACKAGE_LEN: usize = 256;
+const MAX_TYPE_REF_PARTS: usize = 16;
+const MAX_TYPE_REF_LEN: usize = 512;
+/// Package + enclosing messages + name of one declared type.
+const MAX_QUALIFIED_NAME_LEN: usize = 1024;
 const MAX_PARSER_MESSAGE: usize = 200;
 /// What a derived projection may weigh: its type references are fully qualified.
 const MAX_DERIVED_TEXT_BYTES: usize = 2 * MAX_SCHEMA_TEXT_BYTES;
@@ -457,6 +469,30 @@ fn scrub_staging(text: &str, staged: &str) -> String {
     out
 }
 
+/// The library's cause as a sentence that cannot carry the schema's bytes:
+/// refusals that quote a literal get a fixed phrase, anything else keeps its
+/// wording with every character but printable ASCII replaced and a bounded
+/// length.
+fn parser_cause(cause: &str) -> String {
+    if cause.starts_with("cannot convert value") {
+        return "an option value does not fit the type of that option".to_string();
+    }
+    if cause.starts_with("string literal decode error") {
+        return "a string literal is not valid".to_string();
+    }
+    cause
+        .chars()
+        .take(MAX_PARSER_MESSAGE)
+        .map(|c| {
+            if c == ' ' || c.is_ascii_graphic() {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
 /// The library's text for an error, without the staging path and bounded.
 fn parser_failure(error: &anyhow::Error, staged: &str) -> SchemaError {
     let chain: Vec<String> = error.chain().map(|e| e.to_string()).collect();
@@ -465,8 +501,7 @@ fn parser_failure(error: &anyhow::Error, staged: &str) -> SchemaError {
         let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
         (rest[digits.len()..].starts_with(':')).then_some(digits)
     });
-    let root = scrub_staging(&error.root_cause().to_string(), staged);
-    let root: String = root.chars().take(MAX_PARSER_MESSAGE).collect();
+    let root = parser_cause(&scrub_staging(&error.root_cause().to_string(), staged));
     match line {
         Some(line) if !line.is_empty() && line.len() < 8 => {
             invalid(format!("not a valid Protobuf schema (line {line}): {root}"))
@@ -1678,7 +1713,8 @@ impl SchemaKindOps for ProtobufOps {
         // The projection must itself compile. It writes every type with its
         // full name, so a large valid schema grows past the limit of the text
         // it came from: the check allows twice that, not more, because the
-        // caps on names, fields and assignments bound the parser's work.
+        // caps on names (package, type references, qualified names), fields
+        // and assignments bound both the text built here and the parser's work.
         parse_text_within(&derived, MAX_DERIVED_TEXT_BYTES)?;
         Ok(derived)
     }
@@ -3308,19 +3344,155 @@ mod tests {
             "[".repeat(50_000),
             "]".repeat(50_000)
         );
-        for (label, text) in [
-            ("messages", message_chain(10_000)),
-            ("option aggregate", aggregate),
-            ("list constant", list),
+        for (label, text, expected) in [
+            (
+                "messages",
+                message_chain(10_000),
+                "messages are nested deeper than 16 levels",
+            ),
+            (
+                "option aggregate",
+                aggregate,
+                "the schema is nested deeper than 32 levels",
+            ),
+            (
+                "list constant",
+                list,
+                "the schema is nested deeper than 32 levels",
+            ),
         ] {
             let got = timed(label, Duration::from_secs(2), || {
                 on_stack(512, move || PROTOBUF_OPS.compile(&text))
             });
             assert!(
-                matches!(&got, Err(SchemaError::Invalid(m)) if m == "the schema is nested deeper than 32 levels"),
+                matches!(&got, Err(SchemaError::Invalid(m)) if m == expected),
                 "{label}: {got:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_huge_package_is_refused_fast_before_any_type_is_resolved() {
+        // 128k parts and an unresolved reference made the resolver copy a
+        // prefix per enclosing scope and part (quadratic).
+        let parts = format!(
+            "syntax = \"proto3\"; package {}a; message M {{ Missing x = 1; }}",
+            "a.".repeat(128_000)
+        );
+        let long = format!(
+            "syntax = \"proto3\"; package {}; message M {{ Missing x = 1; }}",
+            vec!["a".repeat(127); 8].join(".")
+        );
+        let got = timed("package parts", Duration::from_millis(500), || {
+            refusal(&parts)
+        });
+        assert_eq!(got, "a name has more than 8 parts");
+        let got = timed("package length", Duration::from_millis(500), || {
+            refusal(&long)
+        });
+        assert!(got.starts_with("a name is longer than "), "{got}");
+        // 128-byte names, 8 parts: over the 256-byte total.
+        let wide = format!(
+            "syntax = \"proto3\"; package {}; message M {{ }}",
+            vec!["a".repeat(100); 3].join(".")
+        );
+        assert_eq!(refusal(&wide), "a name is longer than 256 characters");
+        compile(&format!(
+            "syntax = \"proto3\"; package {}; message M {{ }}",
+            vec!["a"; 8].join(".")
+        ));
+    }
+
+    #[test]
+    fn a_long_package_cannot_be_multiplied_by_the_fields_that_name_a_local_type() {
+        // 200 KB of package times 4096 fields cloned into the descriptor.
+        let fields: String = (1..=4096).map(|i| format!("L f{i} = {i}; ")).collect();
+        let text = format!(
+            "syntax = \"proto3\"; package {}; message L {{ }} message M {{ {fields} }}",
+            vec!["a".repeat(127); 1_500].join(".")
+        );
+        let got = timed(
+            "long package with fields",
+            Duration::from_millis(500),
+            || refusal(&text),
+        );
+        assert_eq!(got, "a name is longer than 256 characters");
+    }
+
+    #[test]
+    fn dotted_type_references_and_qualified_names_are_capped() {
+        let reference = |n: usize| {
+            format!(
+                "syntax = \"proto3\"; message M {{ {}X f = 1; }}",
+                "a.".repeat(n)
+            )
+        };
+        assert_eq!(refusal(&reference(16)), "a name has more than 16 parts");
+        let long = format!(
+            "syntax = \"proto3\"; message M {{ {} f = 1; }}",
+            vec!["a".repeat(100); 6].join(".")
+        );
+        assert_eq!(refusal(&long), "a name is longer than 512 characters");
+        // 8 packages of 31 bytes, then 16 messages of 60 bytes: past 1 KiB in full.
+        let package = vec!["p".repeat(31); 8].join(".");
+        let mut text = format!("syntax = \"proto3\"; package {package}; ");
+        for i in 0..16 {
+            text.push_str(&format!("message {}{i:02} {{ ", "m".repeat(58)));
+        }
+        text.push_str(&"} ".repeat(16));
+        let got = refusal(&text);
+        assert!(
+            got.starts_with("a name is longer than 1024 characters"),
+            "{got}"
+        );
+    }
+
+    #[test]
+    fn a_string_literal_with_control_or_direction_characters_is_refused_without_echoing_it() {
+        for literal in [
+            "\u{1b}]0;x\u{7}\r",
+            "a\u{7f}b",
+            "a\u{85}b",
+            "a\u{202e}b",
+            "a\u{200f}b",
+            "a\u{2066}b",
+        ] {
+            let text = format!(
+                "syntax = \"proto3\"; option java_multiple_files = \"{literal}\"; message M {{ }}"
+            );
+            let got = refusal(&text);
+            assert!(
+                got.contains("a .proto file cannot hold inside a string"),
+                "{got:?}"
+            );
+            assert!(
+                got.chars().all(|c| !c.is_control() && !matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')),
+                "{got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parser_refusals_never_carry_the_bytes_of_a_literal() {
+        // Escapes pass the pre-scan, and the parser decodes them into the value.
+        let text = "syntax = \"proto3\"; option java_multiple_files = \"\\x1b]0;x\\x07\\r\\u202e\"; message M { }";
+        let got = refusal(text);
+        assert!(got.starts_with("not a valid Protobuf schema"), "{got}");
+        assert!(
+            got.chars().all(|c| c == ' ' || c.is_ascii_graphic()),
+            "{got:?}"
+        );
+        assert!(!got.contains("x1b") && !got.contains("]0;x"), "{got:?}");
+        assert_eq!(
+            parser_cause("cannot convert value `\u{1b}[2J` to type `bool`"),
+            "an option value does not fit the type of that option"
+        );
+        assert_eq!(
+            parser_cause("string literal decode error: \u{7}"),
+            "a string literal is not valid"
+        );
+        assert_eq!(parser_cause("a\u{1b}b\u{202e}c é"), "a?b?c ?");
+        assert_eq!(parser_cause(&"x".repeat(500)).len(), MAX_PARSER_MESSAGE);
     }
 
     #[test]

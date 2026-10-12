@@ -10637,6 +10637,7 @@
         "proto_limit_assignments": "Le modèle a plus de {limit} affectations (numéros de champs, valeurs d’enum et options). Simplifiez-le.",
         "proto_limit_string": "Un texte entre guillemets dépasse {limit} octets.",
         "proto_limit_name": "Un nom dépasse {limit} caractères.",
+        "proto_limit_parts": "Un nom compte plus de {limit} parties séparées par des points.",
         "proto_lexical": "Le modèle a un commentaire, un texte entre guillemets ou une accolade non fermés, ou un caractère qu’un fichier .proto ne peut pas contenir."
       }
     },

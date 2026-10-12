@@ -10637,6 +10637,7 @@
         "proto_limit_assignments": "El patrón tiene más de {limit} asignaciones (números de campo, valores de enum y opciones). Simplifícalo.",
         "proto_limit_string": "Un texto entre comillas supera los {limit} bytes.",
         "proto_limit_name": "Un nombre supera los {limit} caracteres.",
+        "proto_limit_parts": "Un nombre tiene más de {limit} partes separadas por puntos.",
         "proto_lexical": "El patrón tiene un comentario, un texto entre comillas o una llave sin cerrar, o un carácter que un archivo .proto no puede contener."
       }
     },

@@ -10637,6 +10637,7 @@
         "proto_limit_assignments": "Das Muster hat mehr als {limit} Zuweisungen (Feldnummern, Enum-Werte und Optionen). Vereinfachen Sie es.",
         "proto_limit_string": "Ein Text in Anführungszeichen ist länger als {limit} Bytes.",
         "proto_limit_name": "Ein Name ist länger als {limit} Zeichen.",
+        "proto_limit_parts": "Ein Name hat mehr als {limit} durch Punkte getrennte Teile.",
         "proto_lexical": "Das Muster hat einen nicht geschlossenen Kommentar, Text in Anführungszeichen oder eine nicht geschlossene Klammer oder ein Zeichen, das eine .proto-Datei nicht enthalten kann."
       }
     },

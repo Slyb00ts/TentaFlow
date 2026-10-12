@@ -11872,6 +11872,7 @@
         "proto_limit_assignments": "The pattern has more than {limit} assignments (field numbers, enum values and options). Simplify it.",
         "proto_limit_string": "A quoted text is longer than {limit} bytes.",
         "proto_limit_name": "A name is longer than {limit} characters.",
+        "proto_limit_parts": "A name has more than {limit} dot-separated parts.",
         "proto_lexical": "The pattern has an unclosed comment, quoted text or bracket, or a character a .proto file cannot contain."
       }
     },

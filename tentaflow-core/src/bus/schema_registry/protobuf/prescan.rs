@@ -36,12 +36,15 @@ use ::protobuf_support::lexer::token::Token;
 
 use super::{
     invalid, SchemaError, DESIGNATION_PREFIX, MAX_ASSIGNMENTS, MAX_BRACKET_DEPTH, MAX_ENUMS,
-    MAX_MESSAGES, MAX_NAME_LEN, MAX_STRING_LITERAL,
+    MAX_MESSAGES, MAX_MESSAGE_NESTING, MAX_NAME_LEN, MAX_PACKAGE_LEN, MAX_PACKAGE_PARTS,
+    MAX_QUALIFIED_NAME_LEN, MAX_STRING_LITERAL, MAX_TYPE_REF_LEN, MAX_TYPE_REF_PARTS,
 };
 
 const BAD_CHARACTER: &str = "the schema contains a character a .proto file cannot";
 const DOTTED_OPTION: &str = "option names with a dot are not supported";
 const COMMENT_OPEN: &str = "a comment is never closed";
+const STRING_CHARACTER: &str =
+    "the schema contains a character a .proto file cannot hold inside a string";
 const STRING_OPEN: &str = "a string is never closed on its line";
 
 pub(super) struct Prescan {
@@ -125,6 +128,20 @@ impl Gaps {
         self.designations.insert(at, name.to_string());
         Ok(())
     }
+}
+
+/// C0, DEL and C1 controls, plus zero-width, bidi and other format characters.
+fn is_unsafe_string_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{61C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -296,10 +313,17 @@ fn lex(text: &str) -> Result<Lexed, SchemaError> {
                     )));
                 }
             }
-            Token::StrLit(literal) if literal.escaped.len() > MAX_STRING_LITERAL => {
-                return Err(invalid(format!(
-                    "a string is longer than {MAX_STRING_LITERAL} bytes"
-                )));
+            Token::StrLit(literal) => {
+                if literal.escaped.len() > MAX_STRING_LITERAL {
+                    return Err(invalid(format!(
+                        "a string is longer than {MAX_STRING_LITERAL} bytes"
+                    )));
+                }
+                // A literal is echoed by some parser refusals: a character
+                // that moves a cursor or reorders text must not get that far.
+                if literal.escaped.chars().any(is_unsafe_string_char) {
+                    return Err(invalid(STRING_CHARACTER));
+                }
             }
             Token::Symbol('=') => {
                 assignments += 1;
@@ -351,6 +375,8 @@ struct Structure<'a> {
     declared: HashSet<String>,
     messages: usize,
     enums: usize,
+    /// Bytes of the package name (0 without one).
+    package_len: usize,
 }
 
 impl<'a> Structure<'a> {
@@ -363,6 +389,7 @@ impl<'a> Structure<'a> {
             declared: HashSet::new(),
             messages: 0,
             enums: 0,
+            package_len: 0,
         }
     }
 
@@ -480,6 +507,11 @@ impl<'a> Structure<'a> {
             full.push('.');
         }
         full.push_str(name);
+        if self.package_len + full.len() > MAX_QUALIFIED_NAME_LEN {
+            return Err(invalid(format!(
+                "a name is longer than {MAX_QUALIFIED_NAME_LEN} characters once its package and enclosing messages are counted"
+            )));
+        }
         if self.declared.insert(full) {
             Ok(())
         } else {
@@ -495,7 +527,13 @@ impl<'a> Structure<'a> {
         self.symbol('{')?;
         self.scope.push(name);
         self.frames.push(Frame::Message);
-        self.check_depth(0)
+        self.check_depth(0)?;
+        if self.scope.len() > MAX_MESSAGE_NESTING {
+            return Err(invalid(format!(
+                "messages are nested deeper than {MAX_MESSAGE_NESTING} levels"
+            )));
+        }
+        Ok(())
     }
 
     fn open_enum(&mut self) -> Result<(), SchemaError> {
@@ -533,10 +571,7 @@ impl<'a> Structure<'a> {
                 "extend" => return Err(invalid("extend is not supported")),
                 "package" => {
                     self.at += 1;
-                    self.ident()?;
-                    while self.eat_symbol('.') {
-                        self.ident()?;
-                    }
+                    self.package_len = self.dotted_name(MAX_PACKAGE_PARTS, MAX_PACKAGE_LEN)?;
                     self.symbol(';')?;
                 }
                 "option" => self.option()?,
@@ -750,11 +785,34 @@ impl<'a> Structure<'a> {
             return Ok(true);
         }
         self.eat_symbol('.');
-        self.ident()?;
-        while self.eat_symbol('.') {
-            self.ident()?;
-        }
+        self.dotted_name(MAX_TYPE_REF_PARTS, MAX_TYPE_REF_LEN)?;
         Ok(false)
+    }
+
+    /// `a.b.c`, refused past `max_parts` parts or `max_len` bytes; returns
+    /// the length. Checked as it grows, so a huge name costs no more than
+    /// its cap.
+    fn dotted_name(&mut self, max_parts: usize, max_len: usize) -> Result<usize, SchemaError> {
+        let mut len = self.ident()?.len();
+        let mut parts = 1usize;
+        while self.eat_symbol('.') {
+            len += 1 + self.ident()?.len();
+            parts += 1;
+            if parts > max_parts {
+                return Err(invalid(format!("a name has more than {max_parts} parts")));
+            }
+            if len > max_len {
+                return Err(invalid(format!(
+                    "a name is longer than {max_len} characters"
+                )));
+            }
+        }
+        if len > max_len {
+            return Err(invalid(format!(
+                "a name is longer than {max_len} characters"
+            )));
+        }
+        Ok(len)
     }
 
     /// Everything up to the `;` that ends the statement (consumed): option

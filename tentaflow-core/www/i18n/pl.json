@@ -11872,6 +11872,7 @@
         "proto_limit_assignments": "Wzór ma więcej niż {limit} przypisań (numery pól, wartości typów wyliczeniowych i opcje). Uprość go.",
         "proto_limit_string": "Tekst w cudzysłowie jest dłuższy niż {limit} bajtów.",
         "proto_limit_name": "Nazwa jest dłuższa niż {limit} znaków.",
+        "proto_limit_parts": "Nazwa ma więcej niż {limit} członów oddzielonych kropką.",
         "proto_lexical": "Wzór ma niedomknięty komentarz, tekst w cudzysłowie lub nawias albo znak, którego plik .proto nie może zawierać."
       }
     },

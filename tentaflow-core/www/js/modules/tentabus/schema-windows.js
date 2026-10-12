@@ -551,6 +551,7 @@ const PROTOBUF_LIMIT_REFUSALS = [
   [/^the schema has more than (\d+) assignments/, 'assignments'],
   [/^a string is longer than (\d+) bytes/, 'string'],
   [/^a name is longer than (\d+) characters/, 'name'],
+  [/^a name has more than (\d+) parts/, 'parts'],
 ];
 // Constructs the registry does not take (protobuf.rs `prescan` / `lower`), by the word the schema author wrote.
 const PROTOBUF_UNSUPPORTED = [
