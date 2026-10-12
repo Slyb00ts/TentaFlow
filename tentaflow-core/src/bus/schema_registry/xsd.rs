@@ -5995,7 +5995,10 @@ mod tests {
 
     #[test]
     fn validate_refuses_a_foreign_compiled_schema() {
-        let other = CompiledSchema::StoredOnly(super::super::SchemaType::Avro);
+        let other = super::super::SchemaType::Protobuf
+            .ops()
+            .compile(r#"syntax = "proto3"; message M {}"#)
+            .unwrap();
         assert!(matches!(
             XSD_OPS.validate(&other, b"<a/>"),
             Err(SchemaError::Invalid(_))

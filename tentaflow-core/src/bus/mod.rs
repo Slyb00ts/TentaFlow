@@ -1020,15 +1020,6 @@ pub enum BusServiceError {
         mode: &'static str,
         detail: String,
     },
-    /// `SchemaError::Unsupported` surfaced to a caller: the requested
-    /// operation has no implementation for this schema type in this build
-    /// (every operation but `compile`'s shape smoke-check, for
-    /// `thrift` until F4).
-    #[error("{operation} is not supported for {} schemas in this build", schema_type.as_str())]
-    SchemaTypeUnsupported {
-        schema_type: schema_registry::SchemaType,
-        operation: &'static str,
-    },
     /// `bus_schema_versions`' `UNIQUE(org_id, schema_ref_id)` index rejected
     /// a registration — the ~1e-9 content-hash collision PLAN-F3 §2.1
     /// documents as a loud failure rather than silent corruption.
@@ -1224,25 +1215,13 @@ fn derived_cache_key(
 /// `SchemaError` (a lower-level, `BusServiceError`-agnostic type —
 /// `bus::schema_registry` sits below this module) surfaced from a
 /// `SchemaKindOps` call this file made directly (`schema_derived_get`'s
-/// `derive_subschema`) — `SchemaError::Unsupported` keeps its own dedicated
-/// `BusServiceError` variant (a caller checking "is this type supported"
-/// needs to tell it apart from a generic bad-input rejection); everything
-/// else collapses to `InvalidArgument` with `subject` folded into the
-/// message for context.
+/// `derive_subschema`): it collapses to `InvalidArgument` with `subject`
+/// folded into the message for context.
 fn schema_error_to_service_error(
     subject: &str,
     e: schema_registry::SchemaError,
 ) -> BusServiceError {
-    match e {
-        schema_registry::SchemaError::Unsupported {
-            schema_type,
-            operation,
-        } => BusServiceError::SchemaTypeUnsupported {
-            schema_type,
-            operation,
-        },
-        other => BusServiceError::InvalidArgument(format!("subject '{subject}': {other}")),
-    }
+    BusServiceError::InvalidArgument(format!("subject '{subject}': {e}"))
 }
 
 fn deny(action: BusAction, topic: &str) -> BusServiceError {
@@ -19391,80 +19370,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn binding_a_binary_subject_forces_validation_off() {
-        let (_tmp, svc) = test_service();
-        let ctx = test_ctx("org-1");
-        schema_registry::registry::register(
-            &svc.db,
-            svc.instance_id(),
-            "org-1",
-            "events.thrift",
-            schema_registry::SchemaType::Thrift,
-            "struct X {}",
-            Some(schema_registry::Compatibility::None),
-            None,
-        )
-        .unwrap();
-        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
-            .unwrap();
-
-        // Only `schema_id` is set here — `validation` is untouched — so the
-        // stale/no-op `Off` default is silently kept, not rejected: this is
-        // the "stage a schema ahead of F4" use case (review finding #5).
-        let cfg = svc
-            .update_topic(
-                &ctx,
-                "orders.events",
-                topics::TopicOptions {
-                    schema_id: Some("events.thrift".to_string()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            cfg.validation,
-            topics::ValidationMode::Off,
-            "a binary schema type has no validator in this build; binding forces validation off"
-        );
-    }
-
-    #[test]
-    fn binding_a_binary_subject_rejects_explicitly_enabled_validation() {
-        let (_tmp, svc) = test_service();
-        let ctx = test_ctx("org-1");
-        schema_registry::registry::register(
-            &svc.db,
-            svc.instance_id(),
-            "org-1",
-            "events.thrift",
-            schema_registry::SchemaType::Thrift,
-            "struct X {}",
-            Some(schema_registry::Compatibility::None),
-            None,
-        )
-        .unwrap();
-        svc.create_topic(&ctx, "orders.events", topics::TopicOptions::default())
-            .unwrap();
-
-        // Unlike the "schema_id only" case above, EXPLICITLY asking for
-        // `Warn`/`Dlq` on a type with no validator in this build must be
-        // rejected rather than silently downgraded to `Off` — the caller
-        // asked for enforcement that can never happen (review finding #5).
-        let err = svc
-            .update_topic(
-                &ctx,
-                "orders.events",
-                topics::TopicOptions {
-                    schema_id: Some("events.thrift".to_string()),
-                    validation: Some(topics::ValidationMode::Warn),
-                    ..Default::default()
-                },
-            )
-            .unwrap_err();
-        assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }));
-    }
-
     const PATIENT_XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
         <xs:element name="patient"><xs:complexType><xs:sequence>
           <xs:element name="mrn" type="xs:string"/>
@@ -19472,7 +19377,7 @@ mod tests {
 
     const ADT_PROFILE: &str = r#"{"required_segments":["PID"],"required_fields":["PID-3"]}"#;
 
-    /// Registers a subject of a kind without a validator and tries to bind it
+    /// Registers a subject and tries to bind it
     /// to a fresh topic of `content_type` through `create_topic`; returns the
     /// resulting validation mode or the refusal.
     fn bind_stored_subject_at_create(
@@ -19596,7 +19501,7 @@ mod tests {
     }
 
     #[test]
-    fn enabling_validation_is_accepted_for_validating_kinds_and_refused_for_the_rest() {
+    fn enabling_validation_is_accepted_for_every_kind() {
         use schema_registry::SchemaType::{Avro, Hl7v2Profile, Protobuf, Thrift, Xsd};
         for (kind, text, ct) in [
             (Xsd, PATIENT_XSD, "application/xml"),
@@ -19610,6 +19515,7 @@ mod tests {
                 "syntax = \"proto3\"; message X {}",
                 "application/octet-stream",
             ),
+            (Thrift, "struct X {}", "application/octet-stream"),
             (
                 Hl7v2Profile,
                 r#"{"required_segments":[]}"#,
@@ -19624,18 +19530,6 @@ mod tests {
                 );
             }
         }
-        let err = bind_stored_subject_at_create(
-            Thrift,
-            "struct X {}",
-            "application/octet-stream",
-            Some(topics::ValidationMode::Warn),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(&err, BusServiceError::InvalidTopicConfig { reason }
-                if reason.contains("no validator")),
-            "{err:?}"
-        );
     }
 
     #[test]
@@ -20245,6 +20139,138 @@ mod tests {
         );
         assert_eq!(register(&extended).unwrap().version, 2);
         let err = register("message").unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::InvalidArgument(_)),
+            "{err:?}"
+        );
+    }
+
+    const ORDER_THRIFT: &str = "struct Order { 1: required i64 id, 2: string customer }";
+
+    /// A binary-protocol `Order`: id and customer.
+    fn thrift_order(id: i64, customer: &[u8]) -> Vec<u8> {
+        let mut out = vec![10, 0, 1];
+        out.extend(id.to_be_bytes());
+        out.extend([11, 0, 2]);
+        out.extend((customer.len() as i32).to_be_bytes());
+        out.extend(customer);
+        out.push(0);
+        out
+    }
+
+    #[test]
+    fn thrift_dlq_mode_diverts_only_the_invalid_message_and_never_leaks_the_payload() {
+        let good = thrift_order(7, b"Ala");
+        // The customer declares eleven bytes and four are left.
+        let mut truncated = thrift_order(8, b"SECRETVALUE");
+        truncated.truncate(truncated.len() - 8);
+        let bad_utf8 = thrift_order(9, b"SECRETVALU\xff");
+        for content_type in ["application/octet-stream", "application/x-thrift"] {
+            let (_tmp, svc, ctx, result) = publish_validated_bytes(
+                schema_registry::SchemaType::Thrift,
+                ORDER_THRIFT,
+                content_type,
+                topics::ValidationMode::Dlq,
+                &[&good, &truncated, &bad_utf8],
+            );
+            assert_eq!(
+                (result.accepted, result.schema_rejected),
+                (1, 2),
+                "{content_type}"
+            );
+            assert_eq!(
+                fetch_all(&svc, &ctx, "validated.events"),
+                vec![good.clone()]
+            );
+            assert_eq!(
+                fetch_all(&svc, &ctx, "__dlq.validated.events"),
+                vec![truncated.clone(), bad_utf8.clone()]
+            );
+            assert_eq!(svc.schema_violations_total(), 2);
+            let headers = dlq_headers(&svc, &ctx, "__dlq.validated.events");
+            let message = |i: usize| {
+                headers[i]
+                    .iter()
+                    .find(|(k, _)| k == "dlq.error_message")
+                    .map(|(_, v)| v.clone())
+                    .unwrap()
+            };
+            assert!(
+                message(0).contains("/customer: declared length exceeds the remaining payload"),
+                "{}",
+                message(0)
+            );
+            assert!(
+                message(1).contains("/customer: string is not valid UTF-8"),
+                "{}",
+                message(1)
+            );
+            for record in &headers {
+                for (name, value) in record {
+                    assert!(
+                        !value.contains("SECRETVALU"),
+                        "header {name} leaks the payload"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_thrift_message_the_check_gave_up_on_is_diverted_under_its_own_reason() {
+        let linked = "struct N { 1: optional N next }";
+        // A hundred nested structs: not provably wrong, deeper than a check goes.
+        let mut deep = vec![0u8];
+        for _ in 0..100 {
+            let mut outer = vec![12, 0, 1];
+            outer.append(&mut deep);
+            outer.push(0);
+            deep = outer;
+        }
+        let (_tmp, svc, ctx, result) = publish_validated_bytes(
+            schema_registry::SchemaType::Thrift,
+            linked,
+            "application/octet-stream",
+            topics::ValidationMode::Dlq,
+            &[&[0], &deep],
+        );
+        assert_eq!((result.accepted, result.schema_rejected), (1, 1));
+        let headers = dlq_headers(&svc, &ctx, "__dlq.validated.events");
+        assert!(headers[0].contains(&(
+            "dlq.reason".to_string(),
+            "schema_check_too_complex".to_string()
+        )));
+        assert_eq!(svc.schema_check_too_complex_total(), 1);
+        assert_eq!(svc.schema_violations_total(), 0);
+    }
+
+    #[test]
+    fn thrift_versions_register_under_the_default_backward_check() {
+        let (_tmp, svc) = test_service();
+        let register = |text: &str| {
+            schema_registry::registry::register(
+                &svc.db,
+                svc.instance_id(),
+                "org-1",
+                "orders",
+                schema_registry::SchemaType::Thrift,
+                text,
+                None,
+                None,
+            )
+        };
+        assert_eq!(register(ORDER_THRIFT).unwrap().version, 1);
+        let retyped = ORDER_THRIFT.replace("1: required i64 id", "1: required string id");
+        let err = register(&retyped).unwrap_err();
+        assert!(
+            matches!(&err, BusServiceError::SchemaIncompatible { mode: "backward", detail, .. }
+                if detail.contains("/id: i64 written by the old schema cannot be read as string by the new schema")),
+            "{err:?}"
+        );
+        let extended =
+            ORDER_THRIFT.replace("2: string customer", "2: string customer, 3: string region");
+        assert_eq!(register(&extended).unwrap().version, 2);
+        let err = register("struct").unwrap_err();
         assert!(
             matches!(err, BusServiceError::InvalidArgument(_)),
             "{err:?}"

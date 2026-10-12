@@ -296,7 +296,6 @@ pub(crate) fn map_bus_error(e: &BusServiceError) -> Response<OpenAIBody> {
         BusServiceError::SchemaViolation { .. }
         | BusServiceError::SchemaIncompatible { .. }
         | BusServiceError::SchemaCompareTooComplex { .. }
-        | BusServiceError::SchemaTypeUnsupported { .. }
         | BusServiceError::SchemaRefIdCollision { .. } => error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",

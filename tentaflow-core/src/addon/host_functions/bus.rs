@@ -378,14 +378,12 @@ fn map_bus_error(e: &BusServiceError) -> AbiError {
         // applied — same "operation blocked by policy" category as the
         // field-policy group above.
         BusServiceError::SchemaViolation { .. } => AbiError::GateNotSatisfied,
-        // Registry-admin-shaped rejections (incompatible change, type with
-        // no validator/derive support in this build, the ~1e-9
+        // Registry-admin-shaped rejections (incompatible change, the ~1e-9
         // `schema_ref_id` collision) — state-conflict class, closest
         // existing code to "this request's inputs disagree with what is
         // already registered".
         BusServiceError::SchemaIncompatible { .. }
         | BusServiceError::SchemaCompareTooComplex { .. }
-        | BusServiceError::SchemaTypeUnsupported { .. }
         | BusServiceError::SchemaRefIdCollision { .. } => AbiError::Conflict,
         _ => AbiError::Operation,
     }

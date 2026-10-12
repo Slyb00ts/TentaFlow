@@ -3838,7 +3838,6 @@ mod tests {
 
     #[test]
     fn avro_is_a_validating_kind_bound_independently_of_content_type() {
-        assert!(SchemaType::Avro.has_validator());
         assert_eq!(SchemaType::Avro.required_payload_format(), None);
         let foreign = AVRO_OPS.validate(&SchemaType::JsonSchema.ops().compile("{}").unwrap(), b"");
         assert!(matches!(foreign, Err(SchemaError::Invalid(_))));

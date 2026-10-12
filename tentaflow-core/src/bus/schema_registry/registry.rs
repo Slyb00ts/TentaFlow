@@ -510,9 +510,7 @@ mod test_hooks {
 ///   - otherwise checked against the latest version under the subject's
 ///     compatibility mode (skipped for a brand-new subject, which has
 ///     nothing to be compatible WITH yet);
-///   - a NEW subject defaults to `Backward`; a non-`None` compatibility on a
-///     type with no validator (`thrift`) is rejected
-///     UNLESS the caller explicitly passes `Some(Compatibility::None)`.
+///   - a NEW subject defaults to `Backward` unless the caller passes a mode.
 #[allow(clippy::too_many_arguments)]
 pub fn register(
     db: &DbPool,
@@ -569,16 +567,7 @@ pub fn register(
     };
     let mut effective_compatibility = match &existing {
         Some(row) => existing_subject_compatibility(row)?,
-        None => {
-            let requested = compatibility.unwrap_or(Compatibility::Backward);
-            if requested != Compatibility::None && !schema_type.has_validator() {
-                return Err(BusServiceError::SchemaTypeUnsupported {
-                    schema_type,
-                    operation: "check_compatibility",
-                });
-            }
-            requested
-        }
+        None => compatibility.unwrap_or(Compatibility::Backward),
     };
 
     let hash = content_hash(schema_text);
@@ -618,13 +607,6 @@ pub fn register(
                     subject: subject.to_string(),
                     mode: effective_compatibility.as_str(),
                     detail,
-                },
-                SchemaError::Unsupported {
-                    schema_type,
-                    operation,
-                } => BusServiceError::SchemaTypeUnsupported {
-                    schema_type,
-                    operation,
                 },
                 other => BusServiceError::InvalidArgument(other.to_string()),
             })
@@ -886,9 +868,7 @@ pub fn register(
     })
 }
 
-/// Changes a subject's compatibility mode. `Compatibility::None` is always
-/// accepted; anything else requires a type with a validator in this build
-/// (`SchemaType::has_validator`). Rejects a deprecated subject (review
+/// Changes a subject's compatibility mode. Rejects a deprecated subject (review
 /// finding #8) — same check `register` already applies; a deprecated
 /// subject accepts no new versions, so changing the mode it would apply
 /// them under is a dangling, pointless write, and `deprecate_only`'s own
@@ -901,13 +881,7 @@ pub fn set_compatibility(
     compatibility: Compatibility,
 ) -> Result<(), BusServiceError> {
     let row = require_subject(db, instance_id, org_id, subject)?;
-    let (schema_type, _existing) = decode_subject(&row)?;
-    if compatibility != Compatibility::None && !schema_type.has_validator() {
-        return Err(BusServiceError::SchemaTypeUnsupported {
-            schema_type,
-            operation: "check_compatibility",
-        });
-    }
+    decode_subject(&row)?;
     // The deprecation check runs on the row the write itself reads, so a
     // deprecation landing in between is never written over.
     let mut deprecated = false;
@@ -1372,34 +1346,35 @@ mod tests {
     }
 
     #[test]
-    fn register_thrift_requires_explicit_compatibility_none() {
+    fn register_thrift_checks_compatibility_by_default_and_refuses_a_text_it_cannot_read() {
         let db = fresh_db();
-        let thrift_text = "struct X {}";
-        let err = register(
-            &db,
-            "tentabus-00000001",
-            "org-1",
-            "events",
-            SchemaType::Thrift,
-            thrift_text,
-            None,
-            None,
-        )
-        .unwrap_err();
-        assert!(matches!(err, BusServiceError::SchemaTypeUnsupported { .. }));
-
-        let out = register(
-            &db,
-            "tentabus-00000001",
-            "org-1",
-            "events",
-            SchemaType::Thrift,
-            thrift_text,
-            Some(Compatibility::None),
-            None,
-        )
-        .unwrap();
-        assert_eq!(out.version, 1);
+        let register_thrift = |text: &str, compat: Option<Compatibility>| {
+            register(
+                &db,
+                "tentabus-00000001",
+                "org-1",
+                "events",
+                SchemaType::Thrift,
+                text,
+                compat,
+                None,
+            )
+        };
+        let v1 = "struct X { 1: i32 a }";
+        assert_eq!(register_thrift(v1, None).unwrap().version, 1);
+        let err = register_thrift("struct X { 1: string a }", None).unwrap_err();
+        assert!(
+            matches!(&err, BusServiceError::SchemaIncompatible { mode: "backward", detail, .. }
+                if detail.contains("/a: i32 written by the old schema cannot be read as string by the new schema")),
+            "{err:?}"
+        );
+        let v2 = "struct X { 1: i32 a, 2: string b }";
+        assert_eq!(register_thrift(v2, None).unwrap().version, 2);
+        let err = register_thrift("struct X { string b }", None).unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::InvalidArgument(_)),
+            "{err:?}"
+        );
     }
 
     #[test]

@@ -820,7 +820,7 @@ pub struct BusCapabilitiesWire {
     #[serde(default)]
     pub content_types: Vec<String>,
     /// `schema_type` values this server can validate payloads against
-    /// (`SchemaType::has_validator`) — "Dodaj wzór" offers exactly these.
+    /// (every `SchemaType`) — "Dodaj wzór" offers exactly these.
     #[serde(default)]
     pub schema_types: Vec<String>,
     /// Read-side field policy actions this server applies ('hide' today;

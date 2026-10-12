@@ -774,14 +774,8 @@ pub struct TopicConfig {
     /// `schema_id` subject's compiled validator (`bus::schema_registry`,
     /// `publish`'s schema-validation block). `Off` (the default, and every
     /// pre-F3 row's value) is not evaluated at all — zero cost beyond the
-    /// enum comparison. Binding a binary schema type (`thrift`,
-    /// no validator until F4) depends on what this call asked for
-    /// (`apply_schema_binding_guard`): if the call EXPLICITLY requested a
-    /// non-`Off` mode, the bind is REJECTED outright (enforcement that can
-    /// never fire is refused, not silently downgraded); if `validation` was
-    /// left untouched (or already `Off`), it is silently forced to `Off`,
-    /// so a stale non-`Off` value from a previous binding cannot linger
-    /// unenforceable.
+    /// enum comparison (`apply_schema_binding_guard` checks that a bound
+    /// subject exists before a non-`Off` mode is accepted).
     pub validation: ValidationMode,
     pub content_type: String,
     /// PLAN §7.1 default is `min(3, healthy nodes in the same environment)`
@@ -1243,13 +1237,9 @@ pub fn partition_dir(
 ///      `PayloadFormat` (`SchemaType::required_payload_format`):
 ///      `json_schema` only on `Json`, `xsd` only on `Xml`,
 ///      `hl7v2_profile` only on `Hl7V2`. `avro`/`protobuf`/`thrift` bind on
-///      ANY format (they carry their own encoding). Every kind without a
-///      validator FORCES `cfg.validation` back to `Off` — silently, not
-///      rejected, so an integrator can stage a schema ahead of its
-///      validator.
-///   3. `validation != Off` requires a bound, non-empty `schema_id` whose
-///      type actually has a validator in this build
-///      (`SchemaType::has_validator`) — rejected otherwise. An explicit
+///      ANY format (they carry their own encoding).
+///   3. `validation != Off` requires a bound, non-empty `schema_id` —
+///      rejected otherwise. An explicit
 ///      clear (`schema_id: Some("")`) instead SILENTLY forces `validation`
 ///      back to `Off` rather than erroring, even if this same call did not
 ///      touch `validation` at all: leaving a stale non-`Off` value with no
@@ -1342,30 +1332,6 @@ fn apply_schema_binding_guard(
                 ),
             });
         }
-    }
-    if !schema_type.has_validator() {
-        // thrift (until F4): binding is allowed,
-        // validation is not — but whether that is a silent downgrade or a hard rejection depends on
-        // WHAT this call actually asked for (review finding #5):
-        //   - the call explicitly turned validation ON (or to any non-`Off`
-        //     mode) for a type with no validator in this build: reject, the
-        //     caller asked for enforcement that can never happen and
-        //     silently ignoring that is a worse trap than an error;
-        //   - only `schema_id` was set (validation untouched, or touched
-        //     but explicitly `Off` already): force `Off` as before — an
-        //     integrator staging a schema ahead of F4 is exactly the
-        //     intended use, and a stale non-`Off` value carried over from a
-        //     previous binding must not linger unenforceable.
-        if validation_touched && cfg.validation != ValidationMode::Off {
-            return Err(BusServiceError::InvalidTopicConfig {
-                reason: format!(
-                    "schema subject '{subject_name}' is {} which has no validator in this \
-                     build; validation cannot be enabled for it",
-                    schema_type.as_str()
-                ),
-            });
-        }
-        cfg.validation = ValidationMode::Off;
     }
     Ok(())
 }

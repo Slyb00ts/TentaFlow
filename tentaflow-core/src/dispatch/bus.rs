@@ -504,11 +504,10 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
             format!("bus.key_needs_topic_wide_rule: topic '{topic}' direction={direction}"),
         ),
         // SUM/tentabus/PLAN-F3.md §4.7/§6 — schema registry errors.
-        // `SchemaViolation`/`SchemaIncompatible`/`SchemaTypeUnsupported`/
-        // `SchemaRefIdCollision` are all caller input problems (a bad
-        // payload, an incompatible new version, an operation this build's
-        // schema kind cannot perform, an astronomically unlikely hash
-        // collision the caller can retry past) — `bad_request`, same shape
+        // `SchemaViolation`/`SchemaIncompatible`/`SchemaRefIdCollision` are
+        // all caller input problems (a bad payload, an incompatible new
+        // version, an astronomically unlikely hash collision the caller can
+        // retry past) — `bad_request`, same shape
         // as the field-policy errors above. `SchemaNotFound`/
         // `SchemaVersionNotFound` name a missing resource, like
         // `TopicNotFound` above.
@@ -539,13 +538,6 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
             detail,
         } => ProtocolError::bad_request(format!(
             "bus.schema_compare_too_complex: '{subject}' mode={mode}: {detail}"
-        )),
-        BusServiceError::SchemaTypeUnsupported {
-            schema_type,
-            operation,
-        } => ProtocolError::bad_request(format!(
-            "bus.schema_type_unsupported: '{}' does not support {operation}",
-            schema_type.as_str()
         )),
         BusServiceError::SchemaRefIdCollision { subject, version } => ProtocolError::bad_request(
             format!("bus.schema_ref_id_collision: '{subject}' version {version}"),
@@ -4382,7 +4374,6 @@ async fn capabilities_v1(
             .collect(),
         schema_types: schema_registry::SchemaType::ALL
             .iter()
-            .filter(|t| t.has_validator())
             .map(|t| t.as_str().to_string())
             .collect(),
         field_actions: vec![FIELD_ACTION_HIDE.to_string()],
@@ -6116,7 +6107,14 @@ mod tests {
                 );
                 assert_eq!(
                     capabilities.schema_types,
-                    vec!["json_schema", "avro", "protobuf", "xsd", "hl7v2_profile"]
+                    vec![
+                        "json_schema",
+                        "avro",
+                        "protobuf",
+                        "thrift",
+                        "xsd",
+                        "hl7v2_profile"
+                    ]
                 );
                 assert_eq!(capabilities.field_actions, vec!["hide"]);
                 // `handler_ctx` always mints an "admin"-role `UserSession`
@@ -8379,30 +8377,6 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn schema_register_thrift_with_non_none_compatibility_is_rejected() {
-        let (_guard, db) = bus_fixture();
-        let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
-        let org_id = seed_membership(&db, &user_id, "org_admin");
-        let org = org_context(&org_id, &user_id, &["org.admin"]);
-        let subject = format!("orders.{}", uuid::Uuid::new_v4().simple());
-        let ctx = handler_ctx(db, org.clone());
-
-        let err = schema_register_v1(
-            &ctx,
-            fixture_instance_id().as_str(),
-            subject,
-            "thrift".to_string(),
-            "struct X {}".to_string(),
-            Some("backward".to_string()),
-        )
-        .await
-        .expect_err(
-            "thrift with a non-none compatibility mode must be rejected until it has a validator",
-        );
-        assert_eq!(err.code, ProtocolErrorCode::BadRequest);
     }
 
     #[tokio::test]

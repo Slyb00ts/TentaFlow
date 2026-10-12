@@ -16,9 +16,11 @@
 //     outside the supported subset is REJECTED at registration time
 //     (`compile`), never silently ignored — a partial validator that skips
 //     keywords would be worse than none for a compliance-facing feature.
-//   - `thrift` is storage-only until F4
-//     (`stored_only`): `compile` is a shape smoke-check, every other
-//     operation returns `SchemaError::Unsupported`.
+//   - `avro` (F4 B1), `protobuf` (F4 B2) and `thrift` (F4 B3) validate
+//     binary payloads and are bound to no payload format (they carry their
+//     own encoding). Avro reads JSON schemas, Protobuf delegates the schema
+//     text to `protobuf-parse` behind a pre-scan, Thrift has its own IDL
+//     parser; all three walk payloads with their own iterative decoder.
 //   - `xsd` (F4 B4) and `hl7v2_profile` (F4 B5) are a hand-written XSD subset
 //     (no pure-Rust validator exists; libxml2 would be a native dependency)
 //     and a JSON profile over the HL7 v2 parser. Unlike the binary kinds they
@@ -41,7 +43,7 @@ mod hl7v2_profile;
 mod json_schema;
 mod protobuf;
 pub mod registry;
-mod stored_only;
+mod thrift;
 mod xsd;
 
 #[cfg(test)]
@@ -106,26 +108,12 @@ impl SchemaType {
         }
     }
 
-    /// Whether this build can actually evaluate payloads against schemas
-    /// of this type — gates `bus_topics.validation != off` (PLAN-F3 §3
-    /// rule 3). F4 flips each kind to `true` by adding its validator.
-    pub fn has_validator(self) -> bool {
-        matches!(
-            self,
-            SchemaType::JsonSchema
-                | SchemaType::Avro
-                | SchemaType::Protobuf
-                | SchemaType::Xsd
-                | SchemaType::Hl7v2Profile
-        )
-    }
-
     pub fn ops(self) -> &'static dyn SchemaKindOps {
         match self {
             SchemaType::JsonSchema => &json_schema::JSON_SCHEMA_OPS,
             SchemaType::Avro => &avro::AVRO_OPS,
             SchemaType::Protobuf => &protobuf::PROTOBUF_OPS,
-            SchemaType::Thrift => &stored_only::THRIFT_OPS,
+            SchemaType::Thrift => &thrift::THRIFT_OPS,
             SchemaType::Xsd => &xsd::XSD_OPS,
             SchemaType::Hl7v2Profile => &hl7v2_profile::HL7V2_PROFILE_OPS,
         }
@@ -191,12 +179,6 @@ pub enum SchemaError {
     LimitExceeded(String),
     /// `old` -> `new` is not compatible under the requested mode.
     Incompatible(String),
-    /// The operation is not implemented for this schema type in this build
-    /// (kinds without a validator).
-    Unsupported {
-        schema_type: SchemaType,
-        operation: &'static str,
-    },
 }
 
 impl std::fmt::Display for SchemaError {
@@ -206,14 +188,6 @@ impl std::fmt::Display for SchemaError {
             SchemaError::Violation(m) => write!(f, "schema violation: {m}"),
             SchemaError::LimitExceeded(m) => write!(f, "schema check limit exceeded: {m}"),
             SchemaError::Incompatible(m) => write!(f, "incompatible schema change: {m}"),
-            SchemaError::Unsupported {
-                schema_type,
-                operation,
-            } => write!(
-                f,
-                "{operation} is not supported for {} schemas in this build",
-                schema_type.as_str()
-            ),
         }
     }
 }
@@ -227,12 +201,9 @@ pub enum CompiledSchema {
     JsonSchema(json_schema::Compiled),
     Avro(avro::Compiled),
     Protobuf(protobuf::Compiled),
+    Thrift(thrift::Compiled),
     Xsd(xsd::Compiled),
     Hl7v2Profile(hl7v2_profile::Compiled),
-    /// Kinds without a validator yet carry no compiled form — the variant exists so
-    /// a stored-only subject still yields a `CompiledSchema` from
-    /// `compile` and can be cached uniformly.
-    StoredOnly(SchemaType),
 }
 
 impl CompiledSchema {
@@ -514,8 +485,7 @@ mod tests {
             assert_eq!(SchemaType::parse(t.as_str()), Some(t));
         }
         // `ALL` must list every variant: `BusCapabilitiesWire.schema_types` is
-        // filtered from it by `has_validator`, so a kind missing here could
-        // never reach that list.
+        // built from it, so a kind missing here could never reach that list.
         for t in SchemaType::ALL {
             match t {
                 SchemaType::JsonSchema
@@ -561,16 +531,6 @@ mod tests {
         for t in [SchemaType::Avro, SchemaType::Protobuf, SchemaType::Thrift] {
             assert_eq!(t.required_payload_format(), None);
         }
-    }
-
-    #[test]
-    fn avro_and_protobuf_have_a_validator_and_thrift_does_not_yet() {
-        assert!(SchemaType::JsonSchema.has_validator());
-        assert!(SchemaType::Xsd.has_validator());
-        assert!(SchemaType::Hl7v2Profile.has_validator());
-        assert!(SchemaType::Avro.has_validator());
-        assert!(SchemaType::Protobuf.has_validator());
-        assert!(!SchemaType::Thrift.has_validator());
     }
 
     /// The dashboard explains a refused XSD or HL7 profile by matching these
@@ -1222,6 +1182,234 @@ mod tests {
             );
         }
 
+        // The Thrift refusals, violations and comparison reasons the dashboard
+        // translates (`schema-windows.js` `textRefusalReason` / `THRIFT_LIMIT_REFUSALS`,
+        // `unprocessed.js` `THRIFT_PHRASES`; the whole refusal table is pinned by
+        // `thrift/tests.rs` `schema_text_refusals_are_stable`).
+        let thrift_ops = SchemaType::Thrift.ops();
+        let many_fields: String = (1..=1025).map(|i| format!("{i}: i32 f{i}, ")).collect();
+        let deep_type = format!(
+            "struct S {{ 1: {}i32{} a }}",
+            "list<".repeat(33),
+            ">".repeat(33)
+        );
+        for (text, phrase) in [
+            (
+                r#"include "x.thrift""#.to_string(),
+                "include is not supported",
+            ),
+            ("service S {}".to_string(), "service is not supported"),
+            ("senum E {}".to_string(), "senum is not supported"),
+            ("struct S { string a }".to_string(), "has no explicit id"),
+            (
+                "struct S { 0: string a }".to_string(),
+                "has an id outside 1 to 32767",
+            ),
+            (
+                "union U { 1: required i32 a }".to_string(),
+                "cannot be required",
+            ),
+            (
+                "struct S { 1: a.B x }".to_string(),
+                "points into an included file",
+            ),
+            ("struct S { 1: i32 list }".to_string(), "is a reserved word"),
+            (
+                "struct S {} struct S {}".to_string(),
+                "is defined more than once",
+            ),
+            (
+                "struct S { 1: i32 a, 1: i32 b }".to_string(),
+                "has two fields with the id 1",
+            ),
+            (
+                "struct S { 1: i32 a, 2: i32 a }".to_string(),
+                "has two fields named 'a'",
+            ),
+            (
+                "enum E { A, A } struct S {}".to_string(),
+                "has two values named 'A'",
+            ),
+            (
+                "struct S { 1: Nope n }".to_string(),
+                "is not defined in the schema",
+            ),
+            (
+                "typedef list<A> A struct S {}".to_string(),
+                "typedef 'A' refers to itself",
+            ),
+            (
+                "struct S { 1: required S s }".to_string(),
+                "the schema can never produce a value",
+            ),
+            (
+                "enum E {}".to_string(),
+                "the schema declares no struct, union or exception",
+            ),
+            (
+                "// tentabus:struct X\nstruct S {}".to_string(),
+                "the designated struct 'X' is not a top-level struct",
+            ),
+            (
+                "// tentabus:protocol x\nstruct S {}".to_string(),
+                "the comment '// tentabus:protocol' must be followed by",
+            ),
+            (
+                "enum E { A = 2147483648 } struct S {}".to_string(),
+                "does not fit a 32-bit integer",
+            ),
+            (
+                format!("struct S {{ {many_fields} }}"),
+                "has more than 1024 fields",
+            ),
+            (deep_type, "types are nested deeper than 32 levels"),
+            ("/* open".to_string(), "a comment is never closed"),
+            (
+                "struct S { 1: i32 a = \"open }".to_string(),
+                "a string is never closed on its line",
+            ),
+            (
+                "struct S { 1: i32 a } \u{e9}".to_string(),
+                "the schema contains a character a Thrift file cannot",
+            ),
+            ("struct S xsd_all {}".to_string(), "expected '{'"),
+            (
+                "stream S {}".to_string(),
+                "is not part of the supported Thrift IDL subset",
+            ),
+        ] {
+            invalid_with(SchemaType::Thrift, &text, phrase);
+        }
+        let thrift_schema = thrift_ops
+            .compile(
+                "enum E { A } union U { 1: i32 a, 2: i32 b } \
+                 // tentabus:struct M\nstruct M { 1: required i64 id, 2: list<string> xs, 3: E e, 4: U u, 5: bool ok }",
+            )
+            .unwrap();
+        let compact = thrift_ops
+            .compile("// tentabus:protocol compact\nstruct M { 1: i32 n, 2: list<i32> xs }")
+            .unwrap();
+        for (compiled, payload, expected) in [
+            (
+                &thrift_schema,
+                &[][..],
+                "<root>: payload ends before the value is complete",
+            ),
+            (
+                &thrift_schema,
+                &[10, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0][..],
+                "<root>: bytes remain after the value",
+            ),
+            (&thrift_schema, &[0][..], "/id: required field is missing"),
+            (
+                &thrift_schema,
+                &[0x09, 0, 7][..],
+                "<root>: wire type is not valid",
+            ),
+            (
+                &thrift_schema,
+                &[3, 0, 1, 0][..],
+                "/id: wire type does not match the type declared for the field",
+            ),
+            (
+                &thrift_schema,
+                &[2, 0, 5, 2, 10, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0][..],
+                "/ok: boolean is not a valid value",
+            ),
+            (
+                &thrift_schema,
+                &[
+                    10, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 15, 0, 2, 11, 0, 0, 0, 9, 0,
+                ][..],
+                "/xs: declared size exceeds the remaining payload",
+            ),
+            (
+                &thrift_schema,
+                &[
+                    10, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 15, 0, 2, 11, 0xff, 0xff, 0xff, 0xff, 0,
+                ][..],
+                "/xs: length or size is negative",
+            ),
+            (
+                &thrift_schema,
+                &[
+                    10, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 15, 0, 2, 8, 0, 0, 0, 1, 0, 0, 0, 1, 0,
+                ][..],
+                "/xs: element wire type does not match the type declared for the field",
+            ),
+            (
+                &thrift_schema,
+                &[10, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 3, 0, 0, 0, 9, 0][..],
+                "/e: enum value is not declared in the enum",
+            ),
+            (
+                &thrift_schema,
+                &[
+                    10, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 12, 0, 4, 8, 0, 1, 0, 0, 0, 1, 8, 0, 2, 0, 0,
+                    0, 1, 0, 0,
+                ][..],
+                "/u/b: more than one member of the union is set",
+            ),
+            (
+                &thrift_schema,
+                &[
+                    10, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 15, 0, 2, 11, 0, 0, 0, 1, 0, 0, 0, 2, 0xff,
+                    0xfe, 0,
+                ][..],
+                "/xs/[]: string is not valid UTF-8",
+            ),
+            (
+                &compact,
+                &[0x15, 0xff, 0xff, 0xff, 0xff, 0x1f, 0][..],
+                "/n: integer encoding is longer than allowed or overflows its type",
+            ),
+        ] {
+            let got = thrift_ops.validate(compiled, payload);
+            assert!(
+                matches!(&got, Err(SchemaError::Violation(m)) if m == expected),
+                "{payload:?}: expected {expected:?}, got {got:?}"
+            );
+        }
+        let mut deep = vec![0u8];
+        let nested = thrift_ops
+            .compile("struct N { 1: optional N next }")
+            .unwrap();
+        for _ in 0..100 {
+            let mut outer = vec![12, 0, 1];
+            outer.append(&mut deep);
+            outer.push(0);
+            deep = outer;
+        }
+        assert!(matches!(
+            thrift_ops.validate(&nested, &deep),
+            Err(SchemaError::LimitExceeded(m)) if m.ends_with(": value is nested too deeply to check")
+        ));
+        let bool_list = thrift_ops.compile("struct S { 1: list<bool> l }").unwrap();
+        let mut run = vec![15, 0, 1, 2, 0, 0, 0, 100];
+        run.extend(vec![1u8; 100]);
+        run.push(0);
+        let mut shared = ValidationBudget {
+            org: String::new(),
+            remaining: 50,
+        };
+        assert!(matches!(
+            thrift_ops.validate_metered(&bool_list, &run, &mut shared),
+            Err(SchemaError::LimitExceeded(m)) if m == "/l: document exceeds the validation work budget"
+        ));
+        let old = "struct S { 1: i32 a, 2: E e } enum E { A, B }";
+        for (writer, reader, mode, phrase) in [
+            (old, "struct S { 1: string a, 2: E e } enum E { A, B }", Compatibility::Backward, "/a: i32 written by the old schema cannot be read as string by the new schema"),
+            (old, "struct S { 1: i32 a, 2: E e, 3: required i32 c } enum E { A, B }", Compatibility::Backward, "/c: the new schema requires field 'c' (id 3) of struct 'S', which the old schema does not always write"),
+            ("struct S { 1: required i32 a }", "struct S { 2: i32 b }", Compatibility::Forward, "/a: the old schema requires field 'a' (id 1) of struct 'S', which the new schema does not always write"),
+            (old, "struct S { 1: i32 a, 2: E e } enum E { A }", Compatibility::Backward, "/e: enum 'E': value 1 of the old schema is unknown to the new schema"),
+            ("struct S { 1: i32 a }", "union S { 1: i32 a }", Compatibility::Backward, "<root>: struct 'S' written by the old schema cannot be read as union 'S' by the new schema"),
+        ] {
+            let got = thrift_ops.check_compatibility(writer, reader, mode);
+            assert!(
+                matches!(&got, Err(SchemaError::Incompatible(m)) if m.contains(phrase)),
+                "{mode:?}: expected {phrase:?}, got {got:?}"
+            );
+        }
         // Instance-side phrases the dashboard translates for an HL7 message.
         let compiled = SchemaType::Hl7v2Profile
             .ops()
