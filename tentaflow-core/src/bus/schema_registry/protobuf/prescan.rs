@@ -36,8 +36,9 @@ use ::protobuf_support::lexer::token::Token;
 
 use super::{
     invalid, SchemaError, DESIGNATION_PREFIX, MAX_ASSIGNMENTS, MAX_BRACKET_DEPTH, MAX_ENUMS,
-    MAX_MESSAGES, MAX_MESSAGE_NESTING, MAX_NAME_LEN, MAX_PACKAGE_LEN, MAX_PACKAGE_PARTS,
-    MAX_QUALIFIED_NAME_LEN, MAX_STRING_LITERAL, MAX_TYPE_REF_LEN, MAX_TYPE_REF_PARTS,
+    MAX_ENUM_VALUES, MAX_ENUM_VALUES_PER_ENUM, MAX_FIELDS, MAX_FIELDS_PER_MESSAGE, MAX_MESSAGES,
+    MAX_MESSAGE_NESTING, MAX_NAME_LEN, MAX_PACKAGE_LEN, MAX_PACKAGE_PARTS, MAX_QUALIFIED_NAME_LEN,
+    MAX_STRING_LITERAL, MAX_TYPE_REF_LEN, MAX_TYPE_REF_PARTS,
 };
 
 const BAD_CHARACTER: &str = "the schema contains a character a .proto file cannot";
@@ -375,6 +376,14 @@ struct Structure<'a> {
     declared: HashSet<String>,
     messages: usize,
     enums: usize,
+    /// Field statements of every open message, parallel to `scope`; a oneof's
+    /// members belong to the message around it.
+    field_counts: Vec<usize>,
+    fields: usize,
+    /// Name and value count of the open enum (an enum holds no other frame).
+    enum_name: &'a str,
+    enum_values: usize,
+    total_enum_values: usize,
     /// Bytes of the package name (0 without one).
     package_len: usize,
 }
@@ -389,6 +398,11 @@ impl<'a> Structure<'a> {
             declared: HashSet::new(),
             messages: 0,
             enums: 0,
+            field_counts: Vec::new(),
+            fields: 0,
+            enum_name: "",
+            enum_values: 0,
+            total_enum_values: 0,
             package_len: 0,
         }
     }
@@ -526,6 +540,7 @@ impl<'a> Structure<'a> {
         self.messages += 1;
         self.symbol('{')?;
         self.scope.push(name);
+        self.field_counts.push(0);
         self.frames.push(Frame::Message);
         self.check_depth(0)?;
         if self.scope.len() > MAX_MESSAGE_NESTING {
@@ -541,6 +556,8 @@ impl<'a> Structure<'a> {
         let name = self.ident()?;
         self.declare(name)?;
         self.enums += 1;
+        self.enum_name = name;
+        self.enum_values = 0;
         self.symbol('{')?;
         self.frames.push(Frame::Enum);
         self.check_depth(0)
@@ -550,6 +567,7 @@ impl<'a> Structure<'a> {
         self.at += 1;
         if self.frames.pop() == Some(Frame::Message) {
             self.scope.pop();
+            self.field_counts.pop();
         }
     }
 
@@ -645,6 +663,19 @@ impl<'a> Structure<'a> {
     /// `NAME = [-]number [ [options] ]`. The parser does not ask for a `;`
     /// after it: the next value may follow at once.
     fn enum_value(&mut self) -> Result<(), SchemaError> {
+        self.enum_values += 1;
+        if self.enum_values > MAX_ENUM_VALUES_PER_ENUM {
+            return Err(invalid(format!(
+                "enum '{}' has more than {MAX_ENUM_VALUES_PER_ENUM} values",
+                self.enum_name
+            )));
+        }
+        self.total_enum_values += 1;
+        if self.total_enum_values > MAX_ENUM_VALUES {
+            return Err(invalid(format!(
+                "the schema has more than {MAX_ENUM_VALUES} enum values"
+            )));
+        }
         self.at += 1;
         self.symbol('=')?;
         self.eat_symbol('-');
@@ -748,6 +779,7 @@ impl<'a> Structure<'a> {
         if self.ident_is("group") {
             return Err(invalid("groups are not supported"));
         }
+        self.count_field()?;
         let is_map = self.field_type(0)?;
         let name = self.ident()?;
         if is_map {
@@ -765,6 +797,29 @@ impl<'a> Structure<'a> {
             }
         }
         self.rest_of_statement()
+    }
+
+    /// Counted before the type is read, so the later quadratic passes of the
+    /// parser never see more fields than `lower` would accept.
+    fn count_field(&mut self) -> Result<(), SchemaError> {
+        if self.field_counts.is_empty() {
+            return Err(self.unexpected());
+        }
+        let in_message = self.field_counts.last_mut().expect("checked above");
+        *in_message += 1;
+        if *in_message > MAX_FIELDS_PER_MESSAGE {
+            let name = self.scope.last().copied().unwrap_or_default();
+            return Err(invalid(format!(
+                "message '{name}' has more than {MAX_FIELDS_PER_MESSAGE} fields"
+            )));
+        }
+        self.fields += 1;
+        if self.fields > MAX_FIELDS {
+            return Err(invalid(format!(
+                "the schema has more than {MAX_FIELDS} fields"
+            )));
+        }
+        Ok(())
     }
 
     /// A field type; true for `map<K, V>`. Maps do not nest (protoc refuses

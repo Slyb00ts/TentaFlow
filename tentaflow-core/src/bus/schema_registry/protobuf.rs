@@ -3420,6 +3420,32 @@ mod tests {
     }
 
     #[test]
+    fn an_enum_past_its_cap_is_refused_before_the_parser_resolves_its_options() {
+        let values: String = (0..12_287).map(|i| format!("V{i:05} = {i}; ")).collect();
+        let text = format!("syntax = \"proto3\"; enum E {{ {values} }}");
+        let got = timed("huge enum", Duration::from_millis(200), || refusal(&text));
+        assert_eq!(got, "enum 'E' has more than 1024 values");
+    }
+
+    #[test]
+    fn deeply_nested_messages_with_many_fields_are_refused_before_type_resolution() {
+        let mut text = String::from("syntax = \"proto3\"; message X { } ");
+        for i in 0..238 {
+            text.push_str(&format!("message F{i} {{ }} "));
+        }
+        for depth in 0..16 {
+            text.push_str(&format!("message N{depth} {{ "));
+        }
+        let fields: String = (1..=12_000).map(|i| format!("X f{i} = {i}; ")).collect();
+        text.push_str(&fields);
+        text.push_str(&"} ".repeat(16));
+        let got = timed("nested fields", Duration::from_millis(200), || {
+            refusal(&text)
+        });
+        assert_eq!(got, "message 'N15' has more than 1024 fields");
+    }
+
+    #[test]
     fn dotted_type_references_and_qualified_names_are_capped() {
         let reference = |n: usize| {
             format!(
