@@ -110,7 +110,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
 
 use super::{
-    Budget, Compatibility, CompiledSchema, LimitExceeded, SchemaError, SchemaKindOps,
+    shorten_path, Budget, Compatibility, CompiledSchema, LimitExceeded, SchemaError, SchemaKindOps,
     ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
 };
 
@@ -320,6 +320,15 @@ pub(super) enum Protocol {
     Compact,
 }
 
+impl Protocol {
+    fn name(self) -> &'static str {
+        match self {
+            Protocol::Binary => "binary",
+            Protocol::Compact => "compact",
+        }
+    }
+}
+
 /// Registration-time form of a schema, consumed by `validate`.
 #[derive(Debug)]
 pub struct Compiled {
@@ -336,6 +345,31 @@ pub struct Compiled {
 }
 
 impl Compiled {
+    /// Resident bytes beyond what the schema text suggests: the expression
+    /// arena, the shapes and the declarations, for cache accounting. 16 384
+    /// expressions of a 256 KiB text weigh far more than four times its size.
+    pub(super) fn extra_bytes(&self) -> usize {
+        let fields: usize = self.structs.iter().map(|s| s.fields.len()).sum();
+        let names: usize = self
+            .structs
+            .iter()
+            .map(|s| s.name.len() + s.fields.iter().map(|f| f.name.len()).sum::<usize>())
+            .chain(
+                self.enums
+                    .iter()
+                    .map(|e| e.name.len() + e.values.iter().map(|(n, _)| n.len()).sum::<usize>()),
+            )
+            .sum();
+        let values: usize = self.enums.iter().map(|e| e.values.len()).sum();
+        self.exprs.len() * std::mem::size_of::<Expr>()
+            + self.shapes.len() * std::mem::size_of::<Shape>()
+            + fields * (std::mem::size_of::<Field>() + std::mem::size_of::<(i16, usize)>())
+            + values * (std::mem::size_of::<(String, i32)>() + std::mem::size_of::<i32>())
+            + (self.structs.len() * std::mem::size_of::<StructDef>())
+            + (self.enums.len() * std::mem::size_of::<EnumDef>())
+            + names
+    }
+
     /// `e` as the author wrote it (typedef names stay), for derived text.
     fn write_expr(&self, e: ExprId, out: &mut String) {
         match &self.exprs[e] {
@@ -450,12 +484,18 @@ struct Compat<'a> {
     seen_types: HashSet<(ExprId, ExprId)>,
 }
 
-fn show(path: &str) -> &str {
+/// A path for a message: `<root>` for the root, bounded in length otherwise
+/// (`MAX_DEPTH` levels of 128-character names would fill an audit row).
+fn show(path: &str) -> String {
     if path.is_empty() {
-        "<root>"
+        "<root>".to_string()
     } else {
-        path
+        shorten_path(path)
     }
+}
+
+fn field_path(path: &str, name: &str) -> String {
+    shorten_path(&format!("{path}/{name}"))
 }
 
 impl Compat<'_> {
@@ -503,8 +543,8 @@ impl Compat<'_> {
             let Some(w_index) = ws.field_by_id(i32::from(*id)) else {
                 if rf.req == Req::Required {
                     return Err(Stop::No(format!(
-                        "{path}/{}: the {rl} schema requires field '{}' (id {id}) of {} '{}', which the {wl} schema does not always write",
-                        rf.name,
+                        "{}: the {rl} schema requires field '{}' (id {id}) of {} '{}', which the {wl} schema does not always write",
+                        field_path(path, &rf.name),
                         rf.name,
                         rs.kind.keyword(),
                         rs.name
@@ -515,8 +555,8 @@ impl Compat<'_> {
             let wf = &ws.fields[w_index];
             if rf.req == Req::Required && wf.req != Req::Required {
                 return Err(Stop::No(format!(
-                    "{path}/{}: the {rl} schema requires field '{}' (id {id}) of {} '{}', which the {wl} schema does not always write",
-                    rf.name,
+                    "{}: the {rl} schema requires field '{}' (id {id}) of {} '{}', which the {wl} schema does not always write",
+                    field_path(path, &rf.name),
                     rf.name,
                     rs.kind.keyword(),
                     rs.name
@@ -786,21 +826,28 @@ impl SchemaKindOps for ThriftOps {
                 Err(Stop::No(why)) => Err(SchemaError::Incompatible(format!("{lead} - {why}"))),
                 Err(Stop::Complex) => Err(SchemaError::LimitExceeded(TOO_COMPLEX.to_string())),
             };
-        let backward = || {
-            check(
-                &old,
-                &new,
-                true,
-                "backward: data written under the old schema may not be readable with the new one",
+        // The protocol is part of the wire format: a payload written in one
+        // cannot be read in the other, whatever the fields say.
+        let protocol_switch = (old.protocol != new.protocol).then(|| {
+            format!(
+                "<root>: the old schema is written in the {} protocol, the new one in the {} protocol",
+                old.protocol.name(),
+                new.protocol.name()
             )
+        });
+        let backward_lead =
+            "backward: data written under the old schema may not be readable with the new one";
+        let forward_lead =
+            "forward: data written under the new schema may not be readable with the old one";
+        let backward = || match &protocol_switch {
+            Some(why) => Err(SchemaError::Incompatible(format!(
+                "{backward_lead} - {why}"
+            ))),
+            None => check(&old, &new, true, backward_lead),
         };
-        let forward = || {
-            check(
-                &new,
-                &old,
-                false,
-                "forward: data written under the new schema may not be readable with the old one",
-            )
+        let forward = || match &protocol_switch {
+            Some(why) => Err(SchemaError::Incompatible(format!("{forward_lead} - {why}"))),
+            None => check(&new, &old, false, forward_lead),
         };
         match mode {
             Compatibility::Backward => backward(),

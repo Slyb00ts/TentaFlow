@@ -4332,6 +4332,9 @@ async fn lag_history_v1(
 /// the policy's allow-list is removed (`field_policies::project_read`).
 const FIELD_ACTION_HIDE: &str = "hide";
 
+/// The content type of a topic that carries Avro, Protobuf or Thrift bytes.
+const BINARY_CONTENT_TYPE: &str = "application/octet-stream";
+
 async fn capabilities_v1(
     ctx: &HandlerContext,
     instance_id: &str,
@@ -4368,9 +4371,14 @@ async fn capabilities_v1(
         is_site_admin: SessionAuthKind::Admin.session_satisfies(&ctx.session),
         default_replication_factor,
         node_count,
+        // The binary kinds (Avro, Protobuf, Thrift) carry their own encoding
+        // and bind to any content type; `application/octet-stream` is the
+        // honest one for them, so the creator offers it beside the formats
+        // the field policies can parse.
         content_types: bus::payload_format::PayloadFormat::ALL
             .iter()
             .map(|f| f.canonical_content_type().to_string())
+            .chain(std::iter::once(BINARY_CONTENT_TYPE.to_string()))
             .collect(),
         schema_types: schema_registry::SchemaType::ALL
             .iter()
@@ -6103,7 +6111,12 @@ mod tests {
                 assert_eq!(capabilities.node_count, 1);
                 assert_eq!(
                     capabilities.content_types,
-                    vec!["application/json", "application/xml", "application/hl7-v2"]
+                    vec![
+                        "application/json",
+                        "application/xml",
+                        "application/hl7-v2",
+                        "application/octet-stream"
+                    ]
                 );
                 assert_eq!(
                     capabilities.schema_types,

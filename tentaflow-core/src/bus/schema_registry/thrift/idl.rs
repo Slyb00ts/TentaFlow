@@ -38,6 +38,8 @@ const STRING_CHARACTER: &str =
     "the schema contains a character a Thrift file cannot hold inside a string";
 const STRING_OPEN: &str = "a string is never closed on its line";
 const COMMENT_OPEN: &str = "a comment is never closed";
+const TENTABUS_MARK: &str = "tentabus:";
+const NOT_A_DIRECTIVE: &str = "the comment '// tentabus:struct' or '// tentabus:protocol' must be a // or # comment that starts with the directive (a block or doc comment, a directive in the middle of a comment or an unknown one is not read)";
 
 /// Words an identifier may not be: the IDL's own, so a derived text always
 /// reads back the way it was written.
@@ -157,6 +159,13 @@ impl<'a> Lexer<'a> {
                         .bytes()
                         .filter(|b| *b == b'\n')
                         .count();
+                    if self
+                        .text
+                        .get(body..end)
+                        .is_some_and(|c| c.contains(TENTABUS_MARK))
+                    {
+                        return self.fail(NOT_A_DIRECTIVE);
+                    }
                     self.line = self.line.saturating_add(lines as u32);
                     self.pos = end;
                 }
@@ -185,6 +194,9 @@ impl<'a> Lexer<'a> {
 
     fn directive(&mut self, comment: &'a str) -> R<()> {
         let comment = comment.trim();
+        if !comment.contains(TENTABUS_MARK) {
+            return Ok(());
+        }
         let rest_of = |prefix: &str| {
             let rest = comment.strip_prefix(prefix)?;
             (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
@@ -204,7 +216,14 @@ impl<'a> Lexer<'a> {
                     "the comment '// {STRUCT_DIRECTIVE}' appears more than once"
                 ));
             }
-        } else if let Some(value) = rest_of(PROTOCOL_DIRECTIVE) {
+        } else if rest_of(PROTOCOL_DIRECTIVE).is_none() {
+            // Mentions the marker without being one: a doc comment, a
+            // directive in the middle of a comment, an unknown directive.
+            // Reading it as nothing would silently fall back to the first
+            // struct and the binary protocol.
+            return self.fail(NOT_A_DIRECTIVE);
+        }
+        if let Some(value) = rest_of(PROTOCOL_DIRECTIVE) {
             let protocol = match value {
                 "binary" => Protocol::Binary,
                 "compact" => Protocol::Compact,
@@ -581,9 +600,14 @@ impl<'a> Parser<'a> {
         while self.tok != Tok::Punct(b')') {
             pairs += 1;
             self.annotation_pairs += 1;
-            if pairs > MAX_ANNOTATION_PAIRS_EACH || self.annotation_pairs > MAX_ANNOTATION_PAIRS {
+            if pairs > MAX_ANNOTATION_PAIRS_EACH {
                 return self.fail(format!(
-                    "an annotation has more than {MAX_ANNOTATION_PAIRS_EACH} entries, or the schema more than {MAX_ANNOTATION_PAIRS}"
+                    "an annotation has more than {MAX_ANNOTATION_PAIRS_EACH} entries"
+                ));
+            }
+            if self.annotation_pairs > MAX_ANNOTATION_PAIRS {
+                return self.fail(format!(
+                    "the schema has more than {MAX_ANNOTATION_PAIRS} annotation entries"
                 ));
             }
             if !matches!(self.tok, Tok::Word(_)) {

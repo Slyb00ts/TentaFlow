@@ -1212,6 +1212,12 @@ fn derived_cache_key(
     )
 }
 
+/// What a publish (or peek) says when the version a topic validates with was
+/// stored under looser rules and no longer compiles: register a corrected
+/// version. Stable text, pinned by a test.
+pub const STORED_SCHEMA_UNREADABLE: &str =
+    "the stored schema cannot be compiled under the current rules of its format; register a corrected version";
+
 /// `SchemaError` (a lower-level, `BusServiceError`-agnostic type —
 /// `bus::schema_registry` sits below this module) surfaced from a
 /// `SchemaKindOps` call this file made directly (`schema_derived_get`'s
@@ -4236,8 +4242,9 @@ impl BusService {
     }
 
     /// Compiles `effective` and caches it. Every schema that reached storage
-    /// already compiled once at registration; a failure here means a corrupt
-    /// row.
+    /// compiled once at registration, but a version stored under looser rules
+    /// (an older parser, or a kind that was only stored) may not compile now:
+    /// that fails with `STORED_SCHEMA_UNREADABLE` instead of a verdict.
     fn compile_schema(
         &self,
         key: &TopicKey,
@@ -4253,7 +4260,7 @@ impl BusService {
             .compile(&effective.schema_text)
             .map_err(|e| {
                 BusServiceError::InvalidArgument(format!(
-                    "subject '{subject}' v{}: stored schema failed to recompile: {e}",
+                    "subject '{subject}' v{}: {STORED_SCHEMA_UNREADABLE}: {e}",
                     effective.version
                 ))
             })?;
@@ -20274,6 +20281,63 @@ mod tests {
         assert!(
             matches!(err, BusServiceError::InvalidArgument(_)),
             "{err:?}"
+        );
+    }
+
+    #[test]
+    fn publishing_to_a_topic_whose_stored_version_no_longer_compiles_says_so() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        schema_registry::registry::register(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "subject",
+            schema_registry::SchemaType::Thrift,
+            ORDER_THRIFT,
+            None,
+            None,
+        )
+        .unwrap();
+        svc.create_topic(
+            &ctx,
+            "validated.events",
+            topics::TopicOptions {
+                content_type: Some("application/octet-stream".to_string()),
+                schema_id: Some("subject".to_string()),
+                validation: Some(topics::ValidationMode::Dlq),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        svc.db
+            .write()
+            .unwrap()
+            .execute(
+                "UPDATE bus_schema_versions SET schema_text = 'struct Order { i64 id }' WHERE subject = 'subject'",
+                [],
+            )
+            .unwrap();
+        let err = svc
+            .publish(
+                &ctx,
+                "validated.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![PublishRecord {
+                        payload: Bytes::from(thrift_order(1, b"x")),
+                        ..record("")
+                    }],
+                },
+            )
+            .unwrap_err();
+        let BusServiceError::InvalidArgument(detail) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            detail.starts_with("subject 'subject' v1: the stored schema cannot be compiled under the current rules of its format; register a corrected version: invalid schema:"),
+            "{detail}"
         );
     }
 

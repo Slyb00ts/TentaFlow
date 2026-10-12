@@ -208,10 +208,12 @@ pub enum CompiledSchema {
 
 impl CompiledSchema {
     /// Resident bytes beyond what the schema text suggests (compiled
-    /// regexes and their caches), for cache accounting.
+    /// regexes and their caches, the expression arena of a Thrift schema),
+    /// for cache accounting.
     pub fn extra_bytes(&self) -> usize {
         match self {
             CompiledSchema::Xsd(c) => c.extra_bytes(),
+            CompiledSchema::Thrift(c) => c.extra_bytes(),
             _ => 0,
         }
     }
@@ -1277,6 +1279,9 @@ mod tests {
                 "stream S {}".to_string(),
                 "is not part of the supported Thrift IDL subset",
             ),
+            ("/// tentabus:struct S\nstruct S {}".to_string(), "the comment '// tentabus:struct' or '// tentabus:protocol' must be a // or # comment that starts with the directive"),
+            ("/* tentabus:protocol compact */\nstruct S {}".to_string(), "must be a // or # comment that starts with the directive"),
+            (format!("struct S {{}} ({} z)", (0..16).map(|i| format!("k{i}, ")).collect::<String>()), "an annotation has more than 16 entries"),
         ] {
             invalid_with(SchemaType::Thrift, &text, phrase);
         }
@@ -1304,7 +1309,7 @@ mod tests {
             (
                 &thrift_schema,
                 &[0x09, 0, 7][..],
-                "<root>: wire type is not valid",
+                "<root>: type code is not a Thrift type",
             ),
             (
                 &thrift_schema,
@@ -1403,6 +1408,7 @@ mod tests {
             ("struct S { 1: required i32 a }", "struct S { 2: i32 b }", Compatibility::Forward, "/a: the old schema requires field 'a' (id 1) of struct 'S', which the new schema does not always write"),
             (old, "struct S { 1: i32 a, 2: E e } enum E { A }", Compatibility::Backward, "/e: enum 'E': value 1 of the old schema is unknown to the new schema"),
             ("struct S { 1: i32 a }", "union S { 1: i32 a }", Compatibility::Backward, "<root>: struct 'S' written by the old schema cannot be read as union 'S' by the new schema"),
+            ("struct S { 1: i32 a }", "// tentabus:protocol compact\nstruct S { 1: i32 a }", Compatibility::Forward, "<root>: the old schema is written in the binary protocol, the new one in the compact protocol"),
         ] {
             let got = thrift_ops.check_compatibility(writer, reader, mode);
             assert!(

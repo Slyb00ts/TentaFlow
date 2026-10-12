@@ -637,11 +637,10 @@ fn the_root_is_the_first_struct_or_the_one_a_directive_names() {
         let named = compile(&format!("{directive}{body}"));
         assert_eq!(check(&named, &bin(&st(vec![(1, s("x"))]))), Ok(()));
     }
-    // A block comment or a differently worded comment is no directive.
-    let ignored = compile(&format!(
-        "/* tentabus:struct Second */\n// tentabus:structs Second\n{body}"
-    ));
-    assert_eq!(check(&ignored, &bin(&st(vec![(1, V::I64(1))]))), Ok(()));
+    // A directive may stand after code on a line.
+    let after_code =
+        compile("struct A { 1: i32 a }  // tentabus:struct B\nstruct B { 1: string b }");
+    assert_eq!(check(&after_code, &bin(&st(vec![(1, s("x"))]))), Ok(()));
     compile("// tentabus:protocol binary\nstruct S {}");
 }
 
@@ -1479,11 +1478,11 @@ fn a_field_may_repeat_and_an_unknown_field_is_skipped_with_its_framing_checked()
     let c = compile(ORDER);
     assert_eq!(
         violation(&c, &[0x09, 0, 50, 0]),
-        "<root>: wire type is not valid"
+        "<root>: type code is not a Thrift type"
     );
     assert_eq!(
         violation(&c, &[0x11, 0, 50, 0]),
-        "<root>: wire type is not valid"
+        "<root>: type code is not a Thrift type"
     );
 }
 
@@ -1545,7 +1544,7 @@ fn the_binary_protocol_checks_booleans_lengths_and_counts() {
     // ... but a non-empty one with a type that is no Thrift type is refused.
     assert_eq!(
         violation(&c, &[15, 0, 3, 0x55, 0, 0, 0, 1, 0]),
-        "/l: wire type is not valid"
+        "/l: type code is not a Thrift type"
     );
 }
 
@@ -1584,9 +1583,18 @@ fn the_compact_protocol_reads_deltas_long_ids_and_bool_nibbles() {
         "<root>: field id is out of range"
     );
     // Type 0 with a delta, and types 14 and 15, are no Thrift types.
-    assert_eq!(violation(&c, &[0x10, 0]), "<root>: wire type is not valid");
-    assert_eq!(violation(&c, &[0x1e, 0]), "<root>: wire type is not valid");
-    assert_eq!(violation(&c, &[0x1f, 0]), "<root>: wire type is not valid");
+    assert_eq!(
+        violation(&c, &[0x10, 0]),
+        "<root>: type code is not a Thrift type"
+    );
+    assert_eq!(
+        violation(&c, &[0x1e, 0]),
+        "<root>: type code is not a Thrift type"
+    );
+    assert_eq!(
+        violation(&c, &[0x1f, 0]),
+        "<root>: type code is not a Thrift type"
+    );
     // The long form carries a zigzag i16: five bytes of it are too many.
     assert_eq!(
         violation(&c, &[0x05, 0x80, 0x80, 0x80, 0x80, 0x01]),
@@ -1682,7 +1690,7 @@ fn compact_collections_carry_a_size_and_an_element_type() {
     );
     assert_eq!(
         violation(&c, &[0x39, 0x1e, 0x02, 0]),
-        "/n: wire type is not valid"
+        "/n: type code is not a Thrift type"
     );
     // A map: the empty form is one zero byte, the other has a size and a type byte.
     assert_eq!(check(&c, &[0x2b, 0x00, 0]), Ok(()));
@@ -2182,4 +2190,154 @@ fn validate_refuses_a_foreign_compiled_schema() {
 fn oversized_schema_text_is_refused() {
     let text = format!("struct S {{}} // {}", "x".repeat(MAX_SCHEMA_TEXT_BYTES));
     assert!(refusal(&text).contains("the limit is"));
+}
+
+#[test]
+fn a_comment_that_mentions_the_marker_without_being_a_directive_is_refused() {
+    let body = "struct A { 1: i32 a } struct B { 1: string b }";
+    for comment in [
+        "/// tentabus:struct B",
+        "//// tentabus:struct B",
+        "/** tentabus:struct B */",
+        "/* tentabus:struct B */",
+        "/* tentabus:protocol compact */",
+        "// see tentabus:struct B",
+        "# note: tentabus:protocol compact",
+        "// tentabus:structs B",
+        "// tentabus:message B",
+        "// tentabus:",
+    ] {
+        for text in [
+            format!("{comment}\n{body}"),
+            format!("{body}\n{comment}\n"),
+            format!("struct S {{ {comment}\n 1: i32 a }}"),
+        ] {
+            let got = refusal(&text);
+            assert!(
+                got.starts_with("the comment '// tentabus:struct' or '// tentabus:protocol' must be a // or # comment that starts with the directive"),
+                "{text:?}: {got}"
+            );
+            assert!(got.contains("(line "), "{got}");
+        }
+    }
+    // Real directives keep working, in both comment styles and after code.
+    for comment in [
+        "// tentabus:protocol compact",
+        "# tentabus:protocol compact",
+        "//   tentabus:protocol   compact  ",
+    ] {
+        let c = compile(&format!("{comment}\n{body}"));
+        assert_eq!(
+            check(&c, &cmp(&st(vec![(1, V::I32(1))]))),
+            Ok(()),
+            "{comment}"
+        );
+    }
+}
+
+#[test]
+fn a_protocol_switch_is_incompatible_in_every_mode_but_none() {
+    use Compatibility::{Backward, Forward, Full, None as Off};
+    let binary = "struct S { 1: i32 a }";
+    let compact = "// tentabus:protocol compact\nstruct S { 1: i32 a }";
+    let explicit = "// tentabus:protocol binary\nstruct S { 1: i32 a }";
+    for (old, new, from, to) in [
+        (binary, compact, "binary", "compact"),
+        (compact, binary, "compact", "binary"),
+    ] {
+        for mode in [Backward, Forward, Full] {
+            let got = incompatible(old, new, mode);
+            assert!(
+                got.ends_with(&format!("<root>: the old schema is written in the {from} protocol, the new one in the {to} protocol")),
+                "{mode:?}: {got}"
+            );
+        }
+        assert_eq!(compat(old, new, Off), Ok(()));
+    }
+    assert!(incompatible(binary, compact, Backward).starts_with("backward: "));
+    assert!(incompatible(binary, compact, Forward).starts_with("forward: "));
+    // An explicit `binary` is the default; the same protocol stays compatible.
+    for mode in [Backward, Forward, Full] {
+        assert_eq!(compat(binary, explicit, mode), Ok(()));
+        assert_eq!(compat(compact, compact, mode), Ok(()));
+    }
+}
+
+#[test]
+fn compatibility_paths_are_shortened_like_the_other_formats() {
+    let name = |i: usize| format!("{}{i}", "n".repeat(120));
+    let chain = |leaf: &str| {
+        let mut text = String::new();
+        for i in 0..5 {
+            text.push_str(&format!("struct S{i} {{ 1: S{} {} }}\n", i + 1, name(i)));
+        }
+        text.push_str(&format!(
+            "struct S5 {{ 1: {leaf} deep, 2: required i32 {} }}\n",
+            name(9)
+        ));
+        text
+    };
+    let old = chain("i32").replace(&format!(", 2: required i32 {}", name(9)), "");
+    let got = incompatible(&old, &chain("string"), Compatibility::Backward);
+    assert!(got.contains('…'), "{got}");
+    let path = got
+        .split(" - ")
+        .nth(1)
+        .and_then(|rest| rest.split(": ").next())
+        .unwrap_or("");
+    assert!(
+        path.chars().count() <= 257,
+        "{} {got}",
+        path.chars().count()
+    );
+    // The required-field message carries a bounded path too.
+    let needs = incompatible(&old, &chain("i32"), Compatibility::Backward);
+    assert!(needs.contains('…') && needs.len() < 700, "{needs}");
+}
+
+#[test]
+fn an_annotation_limit_names_the_limit_that_was_hit() {
+    let pairs = |n: usize| (0..n).map(|i| format!("k{i}, ")).collect::<String>();
+    assert!(refusal(&format!("struct S {{}} ({} z)", pairs(16)))
+        .contains("an annotation has more than 16 entries"));
+    let many = (0..70)
+        .map(|i| format!("struct T{i} {{}} ({} z)\n", pairs(14)))
+        .collect::<String>();
+    let got = refusal(&many);
+    assert!(
+        got.contains("the schema has more than 1024 annotation entries"),
+        "{got}"
+    );
+    assert!(!got.contains("an annotation has more"), "{got}");
+}
+
+#[test]
+fn a_compiled_thrift_schema_weighs_what_its_arena_costs() {
+    let small = match compile("struct S { 1: i32 a }") {
+        CompiledSchema::Thrift(c) => c.extra_bytes(),
+        _ => unreachable!(),
+    };
+    let fields: String = (1..=1024)
+        .map(|i| format!("{i}: list<map<string, list<i32>>> f{i}, "))
+        .collect();
+    let text = format!("struct S {{ {fields} }}");
+    let CompiledSchema::Thrift(c) = compile(&text) else {
+        unreachable!()
+    };
+    assert!(c.exprs.len() >= 4096);
+    assert!(
+        c.extra_bytes() > text.len(),
+        "{} vs {}",
+        c.extra_bytes(),
+        text.len()
+    );
+    assert!(c.extra_bytes() >= c.exprs.len() * std::mem::size_of::<Expr>());
+    assert!(c.extra_bytes() > small * 100);
+    assert_eq!(
+        CompiledSchema::Thrift(c).extra_bytes(),
+        match compile(&text) {
+            CompiledSchema::Thrift(c) => c.extra_bytes(),
+            _ => unreachable!(),
+        }
+    );
 }

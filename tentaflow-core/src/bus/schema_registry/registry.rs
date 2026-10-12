@@ -608,7 +608,17 @@ pub fn register(
                     mode: effective_compatibility.as_str(),
                     detail,
                 },
-                other => BusServiceError::InvalidArgument(other.to_string()),
+                // The new text compiled above. A refusal that is neither a
+                // verdict nor a budget stop therefore means the OLD version no
+                // longer reads under the current rules of its format (it was
+                // stored when a looser parser, or none, was in charge).
+                other => match schema_type.ops().compile(&latest_row.schema_text) {
+                    Err(old) => BusServiceError::InvalidArgument(format!(
+                        "{} (v{}): {old}",
+                        PREVIOUS_VERSION_UNREADABLE, latest_row.version
+                    )),
+                    Ok(_) => BusServiceError::InvalidArgument(other.to_string()),
+                },
             })
     };
 
@@ -867,6 +877,11 @@ pub fn register(
         deduplicated: false,
     })
 }
+
+/// What a refusal says when the newest stored version cannot be read any
+/// more, so the new one cannot be compared with it. The dashboard recognizes
+/// the sentence (`schema-windows.js` `refusalHtml`): reword both together.
+pub const PREVIOUS_VERSION_UNREADABLE: &str = "the previous version of this subject could not be checked under the current rules of its format, so it cannot be compared with the new one";
 
 /// Changes a subject's compatibility mode. Rejects a deprecated subject (review
 /// finding #8) — same check `register` already applies; a deprecated
@@ -1373,6 +1388,47 @@ mod tests {
         let err = register_thrift("struct X { string b }", None).unwrap_err();
         assert!(
             matches!(err, BusServiceError::InvalidArgument(_)),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_previous_version_that_no_longer_compiles_is_named_not_blamed_on_the_new_text() {
+        let db = fresh_db();
+        let register = |text: &str| {
+            register(
+                &db,
+                "tentabus-00000001",
+                "org-1",
+                "events",
+                SchemaType::Thrift,
+                text,
+                None,
+                None,
+            )
+        };
+        assert_eq!(register("struct X { 1: i32 a }").unwrap().version, 1);
+        // Stored while the kind had no parser: a field without an id.
+        db.write()
+            .unwrap()
+            .execute(
+                "UPDATE bus_schema_versions SET schema_text = 'struct X { i32 a }' WHERE subject = 'events'",
+                [],
+            )
+            .unwrap();
+        let err = register("struct X { 1: i32 a, 2: i32 b }").unwrap_err();
+        let BusServiceError::InvalidArgument(detail) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(detail.starts_with(PREVIOUS_VERSION_UNREADABLE), "{detail}");
+        assert!(
+            detail.contains("(v1): invalid schema: field 'a' of struct 'X' has no explicit id"),
+            "{detail}"
+        );
+        // A new text that does not read is still the new text's fault.
+        let err = register("struct X { i32 a }").unwrap_err();
+        assert!(
+            matches!(&err, BusServiceError::InvalidArgument(d) if d.starts_with("schema: invalid schema") ),
             "{err:?}"
         );
     }

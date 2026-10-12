@@ -6,7 +6,7 @@
 // REJECTED AT COMPILE (registration) TIME, never silently ignored — a
 // partial validator that skips keywords would be worse than none for a
 // compliance-facing feature. This module has no shared IR with `payload_format`
-// or `stored_only` — it owns its own compiled representation end to end.
+// — it owns its own compiled representation end to end.
 //
 // Supported subset (validated structurally, applied at `validate` time):
 //   `type` (string or non-empty array), `properties`, `required` (unique
