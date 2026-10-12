@@ -514,7 +514,7 @@ mod tests {
             ("AccountNodeInfo", 6, 0x2d0a_7b9e_3aa3_acb6),
             ("AccountAgentInfo", 3, 0xf485_7274_2ec5_4bef),
             ("MyAccountInfo", 13, 0x8f3a_1ca1_fb6b_a66b),
-            ("RuntimeNodeInfo", 9, 0x2d27_8aee_18b0_391a),
+            ("RuntimeNodeInfo", 10, 0x1f9b_f0e6_d537_a016),
             ("RuntimeEngineInfo", 4, 0x3b72_3d70_7ebd_2541),
             ("EngineSummary", 4, 0x9d7c_c109_f7dd_c510),
             ("AccountUsageNode", 2, 0xa9b4_a56e_70f7_26dd),
