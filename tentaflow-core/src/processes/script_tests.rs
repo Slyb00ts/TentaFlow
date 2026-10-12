@@ -361,7 +361,7 @@ async fn observed_service_result_survives_joined_script_infrastructure_failure_w
     assert_eq!(transition_rows(&fixture), before);
     expr::inject_script_infrastructure_failure("vars.answer + \" b2i-infra-probe\"");
     let pending = repository::recover_jobs(&fixture.db, None,
-        chrono::Utc::now().timestamp_millis()).unwrap_err();
+        chrono::Utc::now().timestamp_millis(), &repository::no_tool_authority).unwrap_err();
     assert!(pending.to_string().contains("durably observed Service result"));
     assert_eq!(transition_rows(&fixture), before);
     let recovered_snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
@@ -394,9 +394,9 @@ async fn observed_service_result_survives_joined_script_infrastructure_failure_w
         || rejected.to_string().contains("result"));
     assert_eq!(transition_rows(&fixture), before);
     assert_eq!(repository::recover_jobs(&fixture.db, None,
-        chrono::Utc::now().timestamp_millis()).unwrap(), 1);
+        chrono::Utc::now().timestamp_millis(), &repository::no_tool_authority).unwrap(), 1);
     assert_eq!(repository::recover_jobs(&fixture.db, None,
-        chrono::Utc::now().timestamp_millis()).unwrap(), 0);
+        chrono::Utc::now().timestamp_millis(), &repository::no_tool_authority).unwrap(), 0);
     let completed = repository::get_instance(&fixture.db, &fixture.owner,
         &started.instance_id, None).unwrap();
     assert_eq!(completed.status, ProcessInstanceStatus::Completed);
@@ -531,7 +531,7 @@ async fn cancelling_recoverable_script_failure_closes_only_its_original_observed
             repository::JobObservationState::Blocked));
         assert_eq!(super::signal_proof_tests::all_transition_rows(&fixture), closed_rows);
         assert_eq!(repository::recover_jobs(&reopened, None,
-            chrono::Utc::now().timestamp_millis()).unwrap(), 0);
+            chrono::Utc::now().timestamp_millis(), &repository::no_tool_authority).unwrap(), 0);
         let final_instance = repository::get_instance(&reopened, &fixture.owner,
             &started.instance_id, None).unwrap();
         assert_eq!(final_instance.status, if interrupting_boundary {

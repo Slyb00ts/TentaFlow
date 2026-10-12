@@ -11235,6 +11235,8 @@
     "origin_mesh": "Mesh",
     "origin_agent": "Agent",
     "origin_system": "System",
+    "origin_bus": "TentaBus",
+    "origin_process": "Process",
     "kind_request_started": "request",
     "kind_first_token": "first token",
     "kind_assistant_message": "response",

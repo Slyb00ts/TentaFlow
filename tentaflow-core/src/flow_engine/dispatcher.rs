@@ -546,6 +546,7 @@ pub struct FlowDispatcher {
     /// Addon tools for BPMN Service tasks; filled together with the resolver.
     process_tool_host:
         parking_lot::RwLock<Option<Arc<dyn crate::processes::tool_host::ProcessToolHost>>>,
+    process_tool_gate: Arc<crate::processes::tool_host::ToolCallGate>,
     /// Harness §3.5.0: AgentServiceSlot — wypełniany z main.rs przez
     /// `set_agent_service` po zbudowaniu AddonManager/AppState. Phase-3 bloki
     /// (`agent_context`, `tool_exec`) trzymają KLON tego slotu (wpięty w
@@ -774,6 +775,7 @@ impl FlowDispatcher {
             ctx_factory,
             addon_flow_blocks: parking_lot::RwLock::new(None),
             process_tool_host: parking_lot::RwLock::new(None),
+            process_tool_gate: Arc::new(crate::processes::tool_host::ToolCallGate::default()),
             agent_service,
             subflow_runner,
             frame_blobs,
@@ -894,6 +896,10 @@ impl FlowDispatcher {
         &self,
     ) -> Option<Arc<dyn crate::processes::tool_host::ProcessToolHost>> {
         self.process_tool_host.read().clone()
+    }
+
+    pub fn process_tool_gate(&self) -> &Arc<crate::processes::tool_host::ToolCallGate> {
+        &self.process_tool_gate
     }
 
     /// Process counterpart of [`authorize_process_flow`] for an addon tool: the

@@ -149,9 +149,12 @@ Paleta BPMN nie ładuje szablonów bloków (`palette.js:101`). `ELEMENTS` w `bpm
   - Argumenty to wynik `input_mapping` (CEL) jako obiekt JSON, walidowany względem schematu narzędzia z manifestu, jeśli istnieje.
   - Wywołanie przez nowe `AddonManager::call_tool_process(addon, tool, params, user, provenance)` w stylu `call_tool_scheduled` (`addon/mod.rs:3206`) z `AddonCallProvenance::process(stable_request_id)`.
   - Uruchamiane w `spawn_blocking` i wyścigowane z `cancel`, timeoutem i odnawianiem dzierżawy.
-- Wynik narzędzia → `ActivityResult{Completed, outputs: {"result": <json>}}`, pochodzenie `Envelope`. Błąd narzędzia → `Error("TOOL_ERROR")`, pochodzenie `Platform`. Jawny wynik kontraktowy tylko przez `result_expression` (jak dla przepływu).
+- Wynik narzędzia → `ActivityResult{Completed, outputs: {"result": <json>}}`, pochodzenie `Envelope`. Błąd narzędzia → `Error("TOOL_ERROR")`, pochodzenie `Platform`: jak każdy błąd platformy omija `result_expression` i **nie jest przechwytywany przez zdarzenia brzegowe błędu ani eskalacji** (kończy się incydentem). Jawny wynik kontraktowy powstaje tylko z udanego wyniku przez `result_expression` (jak dla przepływu).
+- **Zmiana narzędzia po publikacji (B3.1):** używane jest bieżące narzędzie (spójnie z decyzją 2 dla agentów), bez odmowy. Gdy skrót pakietu lub schematu wejścia różni się od przypiętego, zadanie zapisuje w historii zdarzenie `service_tool_drift` (przypięte i bieżące wartości) przed wywołaniem. Argumenty są sprawdzane względem bieżącego schematu. Osobny rodzaj zdarzenia, a nie dopisek do `service_claimed`, bo wyszukiwanie wywołania bierze najnowszy wiersz `service_claimed` danego ogrodzenia.
+- **Addon musi działać (B3.1):** ścieżka procesu nigdy nie uruchamia addonu; zatrzymany lub nieznany addon to `SOURCE_ACCESS_REVOKED` przed wywołaniem. Organizacja instancji jest porównywana przy publikacji, przy claimie i tuż przed wywołaniem; błąd publikacji ma ten sam tekst dla addonu nieistniejącego, zatrzymanego i z innej organizacji.
+- **Limit porzuconych wywołań (B3.1):** liczba wywołań WASM procesu w toku (także porzuconych po przekroczeniu czasu) jest ograniczona per addon (4). Pozwolenie żyje w wątku blokującym do prawdziwego powrotu gościa. Ponad limit zadanie kończy się incydentem `TOOL_BUSY` przed granicą wysyłki (bezpieczne ponowienie ręczne).
 - **Anulowanie i timeout:** wywołanie WASM nie przerywa się. Po timeoutcie job kończy się `SERVICE_TIMEOUT`, a wątek blokujący dobiega końca w tle. Skutek jest już modelowany jako `uncertain`. Udokumentować.
-- Odmowa uprawnień → `NeedsHuman`, patrz §1.4.
+- Odmowa uprawnień → `NeedsHuman`, patrz §1.4. Granica wysyłki i wynik odmowy zapisują się w jednej transakcji, więc awaria nie zostawia granicy dla wywołania, które się nie odbyło.
 - Testy: narzędzie z fałszywego addonu (wzorzec testów `jobs.rs`), cofnięcie uprawnień w trakcie, restart między wysyłką a wynikiem, timeout.
 
 ### 3.2 Blok Flow Buildera

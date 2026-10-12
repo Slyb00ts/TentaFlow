@@ -1360,6 +1360,12 @@ fn validate_body<'a>(
                 match implementation {
                     ServiceImplementation::Flow => {
                         ensure!(!flow_id.is_empty(), "service task {} lacks a flow", node.id);
+                        // `tool:` is the reserved prefix of an addon tool reference.
+                        ensure!(
+                            !flow_id.starts_with("tool:"),
+                            "service task {} names a flow with a reserved tool: prefix",
+                            node.id
+                        );
                     }
                     ServiceImplementation::AddonTool { addon_id, tool_name } => {
                         ensure!(

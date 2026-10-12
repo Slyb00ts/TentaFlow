@@ -24108,6 +24108,58 @@ pub fn claim_job(pool: &DbPool, worker_id: &str, now_ms: i64) -> Result<Option<C
     }))
 }
 
+/// Notes in the instance history that the addon tool a claim is about to run
+/// differs from the one pinned at publication (new bundle or input schema). The
+/// changed tool IS used; this only makes the change visible. It is a separate
+/// event kind because lookups of a claim take the latest `service_claimed` row
+/// of a fence, and a second one would shadow the original.
+pub fn record_tool_drift(
+    pool: &DbPool,
+    claimed: &ClaimedProcessJob,
+    worker_id: &str,
+    drift: Value,
+    at_ms: i64,
+) -> Result<()> {
+    let mut conn = pool.write()?;
+    let tx = conn.transaction()?;
+    let owned: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_jobs WHERE job_id=?1 AND status='running' AND worker_id=?2 AND attempt=?3 AND fence=?4)",
+        params![claimed.job.job_id, worker_id, claimed.job.attempt, sql_integer(claimed.job.fence)?],
+        |row| row.get(0),
+    )?;
+    ensure!(owned, "tool drift can only be recorded by the worker that owns the claim");
+    let next_seq: u64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+        [&claimed.job.instance_id],
+        |row| row_u64(row, 0),
+    )?;
+    let mut data = serde_json::json!({
+        "job_id": claimed.job.job_id,
+        "invocation_id": claimed.invocation_id,
+        "attempt": claimed.job.attempt,
+        "fence": claimed.job.fence,
+    });
+    if let (Some(target), Value::Object(extra)) = (data.as_object_mut(), drift) {
+        target.extend(extra);
+    }
+    insert_event_on(
+        &tx,
+        &claimed.job.instance_id,
+        next_seq,
+        Some(&claimed.actor.user_id),
+        &PlannedEvent {
+            scope_id: claimed.job.scope_id.clone(),
+            kind: "service_tool_drift".into(),
+            node_id: Some(claimed.job.node_id.clone()),
+            data,
+        },
+        at_ms,
+        None,
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 pub fn commit_job_dispatch_boundary(
     pool: &DbPool,
     claimed: &ClaimedProcessJob,
@@ -24116,6 +24168,17 @@ pub fn commit_job_dispatch_boundary(
 ) -> Result<bool> {
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
+    let committed = commit_job_dispatch_boundary_on(&tx, claimed, worker_id, at_ms)?;
+    tx.commit()?;
+    Ok(committed)
+}
+
+fn commit_job_dispatch_boundary_on(
+    tx: &Transaction<'_>,
+    claimed: &ClaimedProcessJob,
+    worker_id: &str,
+    at_ms: i64,
+) -> Result<bool> {
     require_actor(&tx, &claimed.actor)?;
     require_call_control_authority_on(&tx, &claimed.actor, &claimed.job.instance_id)?;
     let flow_id = job_source_ref_on(&tx, &claimed.job.job_id)?;
@@ -24151,7 +24214,6 @@ pub fn commit_job_dispatch_boundary(
         "UPDATE bpmn_service_invocations SET phase='may_have_executed',dispatch_evidence='committed_boundary',dispatch_attempt=?1,dispatch_fence=?2,dispatch_worker_id=?3,dispatch_committed_at_ms=?4,phase_revision=phase_revision+1,updated_at_ms=?4 WHERE invocation_id=?5 AND job_id=?6 AND phase='prepared' AND dispatch_evidence='no_boundary' AND stable_request_id=?7 AND EXISTS(SELECT 1 FROM bpmn_jobs j WHERE j.job_id=bpmn_service_invocations.job_id AND j.status='running' AND j.worker_id=?3 AND j.attempt=?1 AND j.fence=?2 AND j.lease_until_ms>=?4)",
         params![claimed.job.attempt,sql_integer(claimed.job.fence)?,worker_id,
             at_ms,claimed.invocation_id,claimed.job.job_id,claimed.request_id])?;
-    tx.commit()?;
     Ok(changed == 1)
 }
 
@@ -24258,13 +24320,47 @@ pub fn record_job_observation(
     observed: &ObservedActivityResult,
     at_ms: i64,
 ) -> Result<JobObservationState> {
+    let mut conn = pool.write()?;
+    let tx = conn.transaction()?;
+    let state = record_job_observation_on(&tx, claimed, worker_id, observed, at_ms)?;
+    tx.commit()?;
+    Ok(state)
+}
+
+/// Dispatch boundary and observation in ONE transaction, for a result the
+/// platform itself produced without calling anything (an addon tool the
+/// initiator may not use). Two steps would leave a window where a crash reads
+/// as "the external effect may have happened". `None`: the boundary was not
+/// committed (activation closed); nothing was written.
+pub fn commit_boundary_and_observe(
+    pool: &DbPool,
+    claimed: &ClaimedProcessJob,
+    worker_id: &str,
+    observed: &ObservedActivityResult,
+    at_ms: i64,
+) -> Result<Option<JobObservationState>> {
+    let mut conn = pool.write()?;
+    let tx = conn.transaction()?;
+    if !commit_job_dispatch_boundary_on(&tx, claimed, worker_id, at_ms)? {
+        return Ok(None);
+    }
+    let state = record_job_observation_on(&tx, claimed, worker_id, observed, at_ms)?;
+    tx.commit()?;
+    Ok(Some(state))
+}
+
+fn record_job_observation_on(
+    tx: &Transaction<'_>,
+    claimed: &ClaimedProcessJob,
+    worker_id: &str,
+    observed: &ObservedActivityResult,
+    at_ms: i64,
+) -> Result<JobObservationState> {
     validate_output(&observed.result.outputs)?;
     let bytes = json(observed)?;
     ensure!(u64::try_from(bytes.len())? <= super::runtime::MAX_OBSERVED_SERVICE_RESULT_BYTES,
         "observed Service result exceeds its history budget");
     let result_hash = hex::encode(Sha256::digest(bytes.as_bytes()));
-    let mut conn = pool.write()?;
-    let tx = conn.transaction()?;
     let (phase, evidence, attempt, fence, original_worker, request_id,
         stored_result, stored_hash, incident_id, instance_id, scope_id, node_id,
         reserved_event_id):
@@ -24349,7 +24445,6 @@ pub fn record_job_observation(
         params![instance_id,claimed.job.job_id], |row| row.get::<_, String>(0)).optional()? {
         refresh_repetition_retained_bytes_on(&tx, &instance_id, &group_id)?;
     }
-    tx.commit()?;
     Ok(if blocked_reason.is_some() { JobObservationState::Blocked }
         else { JobObservationState::Observed })
 }
@@ -26489,7 +26584,21 @@ pub fn retry_job(
     Ok(result)
 }
 
-pub fn recover_jobs(pool: &DbPool, worker_id: Option<&str>, now_ms: i64) -> Result<u32> {
+/// Decides whether the initiator may still call an addon tool. Recovery cannot
+/// read that from the database, so the caller supplies it; without a decision
+/// (`no_tool_authority`) an observed tool result is blocked, never applied.
+pub type ToolAuthority<'a> = &'a (dyn Fn(&ProcessActor, &str, &str) -> bool + Send + Sync);
+
+pub fn no_tool_authority(_: &ProcessActor, _: &str, _: &str) -> bool {
+    false
+}
+
+pub fn recover_jobs(
+    pool: &DbPool,
+    worker_id: Option<&str>,
+    now_ms: i64,
+    tool_authority: ToolAuthority<'_>,
+) -> Result<u32> {
     let conn = pool.read()?;
     let mut statement = conn.prepare(
         "SELECT j.job_id,j.attempt,j.fence,COALESCE(v.dispatch_worker_id,j.worker_id),v.phase,j.instance_id,i.org_id,i.initiator_user_id,v.observed_result_json FROM bpmn_jobs j JOIN bpmn_service_invocations v ON v.job_id=j.job_id JOIN bpmn_instances i ON i.instance_id=j.instance_id WHERE ((j.status='running' AND v.phase IN ('prepared','may_have_executed')) OR v.phase='observed') AND (?1 IS NULL OR v.dispatch_worker_id=?1 OR v.phase='prepared' AND j.worker_id=?1) ORDER BY j.created_at_ms,j.job_id")?;
@@ -26512,6 +26621,27 @@ pub fn recover_jobs(pool: &DbPool, worker_id: Option<&str>, now_ms: i64) -> Resu
             let observed: ObservedActivityResult = parse(observed_json
                 .context("observed invocation lost its immutable result bytes")?)?;
             let actor = ProcessActor { org_id, user_id };
+            let source_ref = {
+                let conn = pool.read()?;
+                job_source_ref_on(&conn, &job_id)?
+            };
+            if let Some((addon_id, tool_name)) =
+                tentaflow_protocol::processes::parse_tool_source_ref(&source_ref)
+            {
+                // A denial result is the platform's own report that nothing ran;
+                // the missing permission it names must not block its delivery.
+                let reports_denial = observed.origin == ActivityResultOrigin::Platform
+                    && observed.result.code.as_deref() == Some("TOOL_PERMISSION_DENIED");
+                if !reports_denial && !tool_authority(&actor, addon_id, tool_name) {
+                    if fail_job_with_authority(pool, &job_id, attempt, fence, &original_worker,
+                        "SOURCE_ACCESS_REVOKED",
+                        "the initiator may no longer call the addon tool that produced this result",
+                        now_ms, Some(&observed), true)? {
+                        recovered += 1;
+                    }
+                    continue;
+                }
+            }
             let controller_id = Uuid::new_v4().to_string();
             for _ in 0..8 {
                 let snapshot = runtime_snapshot(pool, &actor, &instance_id)?;
@@ -26650,6 +26780,26 @@ pub fn fail_job(
     now_ms: i64,
     observed: Option<&ObservedActivityResult>,
 ) -> Result<bool> {
+    fail_job_with_authority(pool, job_id, attempt, fence, worker_id, code, message, now_ms,
+        observed, false)
+}
+
+/// `authority_revoked` carries a revocation the caller established but the
+/// database cannot see (an addon tool permission lives in the addon runtime).
+/// An observed result is then blocked instead of being left for recovery to
+/// accept later.
+pub fn fail_job_with_authority(
+    pool: &DbPool,
+    job_id: &str,
+    attempt: u32,
+    fence: u64,
+    worker_id: &str,
+    code: &str,
+    message: &str,
+    now_ms: i64,
+    observed: Option<&ObservedActivityResult>,
+    authority_revoked: bool,
+) -> Result<bool> {
     ensure!(!code.is_empty() && code.len() <= 128,
         "invalid process job failure");
     let message = bounded_failure_message(message);
@@ -26736,7 +26886,7 @@ pub fn fail_job(
                 .and_then(|flow| require_source_current(&tx, &actor, &flow, None))
         } else { Ok(()) };
         let reason = if !live { Some("activation_closed") }
-            else if authority.is_err() { Some("execution_authority_revoked") }
+            else if authority.is_err() || authority_revoked { Some("execution_authority_revoked") }
             else { None };
         if let Some(reason) = reason {
             block_observed_invocation_on(&tx, &invocation_id, job_id, &instance_id,

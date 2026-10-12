@@ -1323,7 +1323,9 @@ fn bpmn_service_invocation_implementation_kind(conn: &Connection) -> Result<()> 
     );
     conn.execute_batch(&format!(
         "ALTER TABLE bpmn_service_invocations
-             ADD COLUMN implementation_kind TEXT NOT NULL DEFAULT 'flow';
+             ADD COLUMN implementation_kind TEXT NOT NULL DEFAULT 'flow'
+             CHECK (implementation_kind IN ('flow','addon_tool') AND
+                    (implementation_kind='addon_tool') = (flow_id GLOB 'tool:*'));
          DROP TRIGGER {TRIGGER};
          {widened};"
     ))?;
@@ -19377,7 +19379,7 @@ mod tests {
         assert!(snapshot.incidents.iter().any(|incident|
             incident.job_id.as_deref() == Some("failed-job")
                 && incident.code == "EXTERNAL_OUTCOME_UNCERTAIN" && !incident.can_retry));
-        assert_eq!(crate::processes::repository::recover_jobs(&pool, None, i64::MAX / 2).unwrap(), 0,
+        assert_eq!(crate::processes::repository::recover_jobs(&pool, None, i64::MAX / 2, &crate::processes::repository::no_tool_authority).unwrap(), 0,
             "a migrated job must not be picked up as a running lease");
     }
 

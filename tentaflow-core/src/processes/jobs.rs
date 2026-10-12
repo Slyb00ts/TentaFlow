@@ -24,6 +24,11 @@ use crate::flow_engine::expr::{flow_value_to_json, InfrastructureExprError};
 
 pub const LEASE_RENEWAL: Duration = Duration::from_secs(10);
 
+#[cfg(test)]
+pub(super) fn failure_for_test(code: &str, message: String) -> ActivityResult {
+    failure(code, message)
+}
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -32,7 +37,8 @@ fn failure(code: &str, message: impl Into<String>) -> ActivityResult {
     let message = message.into();
     let summary = repository::bounded_failure_message(&message);
     if summary != message {
-        tracing::error!(code, reason = %message, "full process service failure exceeds its history summary budget");
+        // The text may come from an addon or flow; only its size is logged.
+        tracing::error!(code, message_len = message.len(), "full process service failure exceeds its history summary budget");
     }
     ActivityResult {
         outcome: ActivityOutcome::Error,
@@ -98,9 +104,11 @@ fn output_limit_result(error: anyhow::Error) -> ObservedActivityResult {
 }
 
 /// The result of an addon tool call. A returned value is the activity output
-/// under `result`; a failed call is a platform `TOOL_ERROR` result, so the
-/// process decides what a failure means. As for a Flow, only a
-/// `result_expression` can turn the output into a business result.
+/// under `result`. A failed call is a platform-origin `TOOL_ERROR` result: like
+/// every platform error it skips `result_expression` and cannot be caught by an
+/// error or escalation boundary event, so it ends in an incident. Only a
+/// successful output can become a business (`Contract`) result, and only
+/// through a `result_expression`.
 fn observed_tool_result(
     outcome: std::result::Result<Value, String>,
     tool_ref: &str,
@@ -216,7 +224,9 @@ fn fail_claim(
 ) -> Result<()> {
     let message = error.to_string();
     tracing::error!(job_id = %claimed.job.job_id, code, reason = %message, "process service claim failed");
-    repository::fail_job(
+    // A revocation found by the caller must hold even where the database cannot
+    // see it (an addon tool permission), so an observed result is blocked.
+    repository::fail_job_with_authority(
         pool,
         &claimed.job.job_id,
         claimed.job.attempt,
@@ -226,6 +236,7 @@ fn fail_claim(
         &message,
         now_ms(),
         observed,
+        code == "SOURCE_ACCESS_REVOKED",
     )?;
     Ok(())
 }
@@ -350,7 +361,7 @@ pub async fn execute_claimed(
     match implementation {
         ServiceImplementation::Flow => execute_flow(&job, snapshot, flow_id).await,
         ServiceImplementation::AddonTool { addon_id, tool_name } => {
-            execute_tool(&job, addon_id, tool_name, input_mapping).await
+            execute_tool(&job, snapshot, addon_id, tool_name, input_mapping).await
         }
     }
 }
@@ -456,9 +467,16 @@ async fn execute_flow(
 /// The WASM call blocks a thread and cannot be interrupted: cancellation, a
 /// timeout or a lost lease abandon the wait, not the call. After a timeout the
 /// tool may therefore still complete its effect, which is the `uncertain`
-/// outcome the dispatch boundary already records.
+/// outcome the dispatch boundary already records. The per-addon call gate keeps
+/// such abandoned calls bounded: its permit lives inside the blocking closure.
+///
+/// The tool that runs is the CURRENT one. If its bundle or input schema differs
+/// from the publication pin the change is recorded in the instance history and
+/// the call goes ahead (like a changed agent, a changed tool is not a reason
+/// to stop a process); the arguments are checked against the current schema.
 async fn execute_tool(
     job: &ServiceJob<'_>,
+    snapshot: &repository::PinnedServiceSnapshot,
     addon_id: &str,
     tool_name: &str,
     input_mapping: &BTreeMap<String, String>,
@@ -475,57 +493,38 @@ async fn execute_tool(
             return fail_claim(pool, worker_id, claimed, "SOURCE_ACCESS_REVOKED", error, None)
         }
     };
-    let host = dispatcher.process_tool_host();
-    let arguments = match &descriptor {
-        Some(descriptor) => {
-            let checked = tool_arguments(&claimed.job.input, input_mapping)
-                .and_then(|arguments| {
-                    check_tool_arguments(&descriptor.input_schema, &arguments)?;
-                    Ok(arguments)
-                });
-            match checked {
-                Ok(arguments) => arguments,
-                Err(error) => {
-                    return fail_claim(
-                        pool,
-                        worker_id,
-                        claimed,
-                        "TOOL_ARGUMENTS_INVALID",
-                        error,
-                        None,
-                    )
-                }
-            }
+    let Some(descriptor) = descriptor else {
+        return report_denied_tool(job, &authorize_tool);
+    };
+    let arguments = match tool_arguments(&claimed.job.input, input_mapping).and_then(|arguments| {
+        check_tool_arguments(&descriptor.input_schema, &arguments)?;
+        Ok(arguments)
+    }) {
+        Ok(arguments) => arguments,
+        Err(error) => {
+            return fail_claim(pool, worker_id, claimed, "TOOL_ARGUMENTS_INVALID", error, None)
         }
-        None => Value::Null,
+    };
+    if let Some(drift) = tool_drift(&snapshot.graph_json, &descriptor)? {
+        repository::record_tool_drift(pool, claimed, worker_id, drift, now_ms())?;
+    }
+    let host = dispatcher
+        .process_tool_host()
+        .context("addon tool host disappeared after authorization")?;
+    let Some(permit) = dispatcher.process_tool_gate().try_acquire(addon_id) else {
+        return fail_claim(
+            pool,
+            worker_id,
+            claimed,
+            "TOOL_BUSY",
+            "the addon already has the maximum number of process tool calls in flight; retry later",
+            None,
+        );
     };
 
     if !begin_dispatch(job)? {
         return Ok(());
     }
-    let Some(_) = descriptor else {
-        // A permission is something a person can grant, so the task becomes
-        // human work instead of an incident. Nothing was called.
-        let result = ObservedActivityResult {
-            result: ActivityResult {
-                outcome: ActivityOutcome::NeedsHuman,
-                code: Some("TOOL_PERMISSION_DENIED".into()),
-                summary: "The process initiator may not call this addon tool".into(),
-                outputs: json!({}),
-                evidence: Vec::new(),
-            },
-            origin: ActivityResultOrigin::Platform,
-            expression_observation: None,
-        };
-        // The denial is the very thing being reported, so publishing it must
-        // not be blocked by it; every other loss of access still blocks.
-        let authorize_reporting_denial = || match authorize_tool() {
-            Err(ToolAccessError::PermissionDenied) => Ok(()),
-            other => other.map(|_| ()).map_err(|error| error.to_string()),
-        };
-        return finish_observed(job, &authorize_reporting_denial, result);
-    };
-    let host = host.context("addon tool host disappeared after authorization")?;
     let execution = async {
         let call = {
             let (addon, tool, user, org, request) = (
@@ -535,7 +534,11 @@ async fn execute_tool(
                 org_id.clone(),
                 claimed.request_id.clone(),
             );
-            tokio::task::spawn_blocking(move || host.call(&addon, &tool, arguments, &user, &org, &request))
+            tokio::task::spawn_blocking(move || {
+                // Held until the guest really returns, even if nobody waits any more.
+                let _permit = permit;
+                host.call(&addon, &tool, arguments, &user, &org, &request)
+            })
         };
         let outcome = match call.await {
             Ok(outcome) => outcome.map_err(|error| format!("{error:#}")),
@@ -559,10 +562,66 @@ async fn execute_tool(
     finish_observed(job, &authorize, result)
 }
 
-/// Cancellation check, lease confirmation and the committed dispatch boundary,
-/// which precedes the first poll of any external effect. `false` means the job
-/// was failed or lost and the caller must stop.
-fn begin_dispatch(job: &ServiceJob<'_>) -> Result<bool> {
+/// Compares the pinned tool with the one about to run.
+fn tool_drift(
+    pin_json: &str,
+    current: &super::tool_host::ProcessToolDescriptor,
+) -> Result<Option<Value>> {
+    let pin: Value = serde_json::from_str(pin_json).context("tool pin is not valid JSON")?;
+    let current_digest = super::tool_host::tool_schema_digest(&current.input_schema)?;
+    if pin["bundle_hash"] == current.bundle_hash.as_str()
+        && pin["input_schema_digest"] == current_digest.as_str()
+    {
+        return Ok(None);
+    }
+    Ok(Some(json!({
+        "pinned_bundle_hash": pin["bundle_hash"],
+        "current_bundle_hash": current.bundle_hash,
+        "pinned_input_schema_digest": pin["input_schema_digest"],
+        "current_input_schema_digest": current_digest,
+    })))
+}
+
+/// A permission is something a person can grant, so a denial becomes human work
+/// instead of an incident. Nothing is called, and the dispatch boundary and the
+/// result are written together: a crash can never leave a boundary behind for a
+/// call that did not happen.
+fn report_denied_tool(
+    job: &ServiceJob<'_>,
+    authorize_tool: &(dyn Fn() -> std::result::Result<super::tool_host::ProcessToolDescriptor, ToolAccessError> + Send + Sync),
+) -> Result<()> {
+    let ServiceJob { pool, worker_id, claimed, .. } = *job;
+    if !precheck_dispatch(job)? {
+        return Ok(());
+    }
+    let result = ObservedActivityResult {
+        result: ActivityResult {
+            outcome: ActivityOutcome::NeedsHuman,
+            code: Some("TOOL_PERMISSION_DENIED".into()),
+            summary: "The process initiator may not call this addon tool".into(),
+            outputs: json!({}),
+            evidence: Vec::new(),
+        },
+        origin: ActivityResultOrigin::Platform,
+        expression_observation: None,
+    };
+    if repository::commit_boundary_and_observe(pool, claimed, worker_id, &result, now_ms())?
+        .is_none()
+    {
+        return Ok(());
+    }
+    // The denial is the very thing being reported, so publishing it must not be
+    // blocked by it; every other loss of access still blocks.
+    let authorize_reporting_denial = || match authorize_tool() {
+        Err(ToolAccessError::PermissionDenied) => Ok(()),
+        other => other.map(|_| ()).map_err(|error| error.to_string()),
+    };
+    finish_observed(job, &authorize_reporting_denial, result)
+}
+
+/// Cancellation check and lease confirmation. `false` means the job was failed
+/// or lost and the caller must stop.
+fn precheck_dispatch(job: &ServiceJob<'_>) -> Result<bool> {
     let ServiceJob { pool, worker_id, claimed, cancel, .. } = *job;
     // Cancellation may commit between the claim and running-handle registration.
     // Check the durable claim after registration, before polling the executor.
@@ -577,10 +636,16 @@ fn begin_dispatch(job: &ServiceJob<'_>) -> Result<bool> {
         )?;
         return Ok(false);
     }
-    if !renew_lease(job)? {
+    renew_lease(job)
+}
+
+/// The precheck plus the committed dispatch boundary, which precedes the first
+/// poll of any external effect.
+fn begin_dispatch(job: &ServiceJob<'_>) -> Result<bool> {
+    if !precheck_dispatch(job)? {
         return Ok(false);
     }
-    repository::commit_job_dispatch_boundary(pool, claimed, worker_id, now_ms())
+    repository::commit_job_dispatch_boundary(job.pool, job.claimed, job.worker_id, now_ms())
 }
 
 /// Extends the lease. On a lost lease or a repository error the worker is
@@ -1473,8 +1538,8 @@ mod tests {
         drop(router);
         drop(db);
         let db = crate::db::init(&path).unwrap();
-        assert_eq!(repository::recover_jobs(&db, None, now_ms()).unwrap(), 1);
-        assert_eq!(repository::recover_jobs(&db, None, now_ms()).unwrap(), 0);
+        assert_eq!(repository::recover_jobs(&db, None, now_ms(), &repository::no_tool_authority).unwrap(), 1);
+        assert_eq!(repository::recover_jobs(&db, None, now_ms(), &repository::no_tool_authority).unwrap(), 0);
         assert!(repository::claim_job(&db, "replacement", now_ms())
             .unwrap()
             .is_none());
@@ -1551,7 +1616,7 @@ mod tests {
             &stamp("cancel after external effect"), &started.instance_id,
             before_cancel.revision).unwrap();
         if observed_before_cancel {
-            assert_eq!(repository::recover_jobs(&fixture.db, None, now_ms()).unwrap(), 0);
+            assert_eq!(repository::recover_jobs(&fixture.db, None, now_ms(), &repository::no_tool_authority).unwrap(), 0);
         } else {
             assert!(matches!(repository::record_job_observation(&fixture.db, &claim,
                 "original-worker", &observed, now_ms()).unwrap(),
@@ -1560,7 +1625,7 @@ mod tests {
         assert!(matches!(repository::record_job_observation(&fixture.db, &claim,
             "original-worker", &observed, now_ms()).unwrap(),
             repository::JobObservationState::Blocked));
-        assert_eq!(repository::recover_jobs(&fixture.db, None, now_ms()).unwrap(), 0);
+        assert_eq!(repository::recover_jobs(&fixture.db, None, now_ms(), &repository::no_tool_authority).unwrap(), 0);
         let conn = fixture.db.read().unwrap();
         let (phase, reason): (String, String) = conn.query_row(
             "SELECT phase,blocked_reason FROM bpmn_service_invocations WHERE job_id=?1",
@@ -1634,8 +1699,8 @@ mod tests {
         conflicting.result.outputs = json!({"payload":"different"});
         assert!(repository::record_job_observation(&fixture.db, &claim,
             "original-worker", &conflicting, now_ms()).is_err());
-        assert_eq!(repository::recover_jobs(&fixture.db, None, now_ms()).unwrap(), 1);
-        assert_eq!(repository::recover_jobs(&fixture.db, None, now_ms()).unwrap(), 0);
+        assert_eq!(repository::recover_jobs(&fixture.db, None, now_ms(), &repository::no_tool_authority).unwrap(), 1);
+        assert_eq!(repository::recover_jobs(&fixture.db, None, now_ms(), &repository::no_tool_authority).unwrap(), 0);
         let accepted = repository::get_instance(&fixture.db, &fixture.owner,
             &started.instance_id, None).unwrap();
         assert_eq!(accepted.status, ProcessInstanceStatus::Completed);
@@ -2403,7 +2468,7 @@ mod tests {
             &started.instance_id, None).unwrap();
         assert_eq!(reopened.status, ProcessInstanceStatus::Incident);
         assert!(!reopened.can_retry);
-        assert_eq!(repository::recover_jobs(&reopened_db, None, now_ms()).unwrap(), 0);
+        assert_eq!(repository::recover_jobs(&reopened_db, None, now_ms(), &repository::no_tool_authority).unwrap(), 0);
         assert_eq!(super::super::call_tests::transition_rows(&fixture), retained_rows);
         assert_eq!(crate::db::repository::list_flow_executions_for_flow(
             &reopened_db, &flow_id, 10).unwrap().len(), 1);
@@ -2508,8 +2573,8 @@ mod tests {
             claim.job.attempt, claim.job.fence, worker, "LEASE_LOST",
             "the original worker lease expired after observation", now_ms(),
             Some(&observed)).unwrap());
-        assert_eq!(repository::recover_jobs(&fixture.db, None, now_ms()).unwrap(), 1);
-        assert_eq!(repository::recover_jobs(&fixture.db, None, now_ms()).unwrap(), 0);
+        assert_eq!(repository::recover_jobs(&fixture.db, None, now_ms(), &repository::no_tool_authority).unwrap(), 1);
+        assert_eq!(repository::recover_jobs(&fixture.db, None, now_ms(), &repository::no_tool_authority).unwrap(), 0);
         let reopened = crate::db::init(&fixture.directory.path().join("processes.db")).unwrap();
         let actual = repository::runtime_snapshot(&reopened, &fixture.owner,
             &started.instance_id).unwrap();
@@ -4945,7 +5010,7 @@ mod tests {
         assert!(format!("{forged_error:#}").contains(
             "mapped variable effect differs from its pinned expression"));
         assert_eq!(super::super::call_tests::transition_rows(&fixture), before);
-        assert_eq!(repository::recover_jobs(&fixture.db, None, now_ms()).unwrap(), 1);
+        assert_eq!(repository::recover_jobs(&fixture.db, None, now_ms(), &repository::no_tool_authority).unwrap(), 1);
         let actual =
             repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
                 .unwrap();

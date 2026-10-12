@@ -743,6 +743,25 @@ impl AddonCallProvenance {
     }
 }
 
+/// The request a tool receives. Only a process-driven call carries
+/// `idempotency_key`, so every other caller keeps sending the bytes it always sent.
+fn tool_request_json(
+    tool_name: &str,
+    params: &serde_json::Value,
+    user_id: &str,
+    idempotency_key: Option<&str>,
+) -> serde_json::Value {
+    let mut request = serde_json::json!({
+        "tool": tool_name,
+        "params": params,
+        "user_id": user_id,
+    });
+    if let Some(key) = idempotency_key {
+        request["idempotency_key"] = serde_json::Value::from(key);
+    }
+    request
+}
+
 /// Stan addonu przechowywany w WASM Store — dostepny z host functions
 pub struct AddonState {
     pub addon_id: String,
@@ -3244,11 +3263,12 @@ impl AddonManager {
     /// Invokes a tool for a BPMN Service task, as the instance initiator and
     /// under the per-user `"llm"` permission check.
     ///
-    /// `stable_request_id` identifies the invocation across retries and is
-    /// passed to the guest as `idempotency_key`: the platform never repeats a
-    /// call after the dispatch boundary, but a tool with side effects can use
-    /// the key to recognise a repeat that an operator triggers. The call blocks
-    /// inside wasmtime and cannot be interrupted from outside; callers race it
+    /// `stable_request_id` identifies ONE dispatch and is passed to the guest as
+    /// `idempotency_key`. A direct retry of the same task is a new invocation
+    /// with a fresh key, so the key lets a tool recognise a duplicate delivery
+    /// of this dispatch, not a repeat of the task. The platform itself never
+    /// repeats a call after the dispatch boundary. The call blocks inside
+    /// wasmtime and cannot be interrupted from outside; callers race it
     /// against their own timeout and let the thread run out.
     pub fn call_tool_process(
         &self,
@@ -3330,16 +3350,7 @@ impl AddonManager {
         }
 
         // Przygotuj dane wejsciowe jako JSON
-        let mut request_json = serde_json::json!({
-            "tool": tool_name,
-            "params": params,
-            "user_id": audit_user,
-        });
-        // Only a process-driven call carries a key, so every other caller keeps
-        // sending the request bytes it always sent.
-        if let Some(key) = idempotency_key {
-            request_json["idempotency_key"] = serde_json::Value::from(key);
-        }
+        let request_json = tool_request_json(tool_name, &params, audit_user, idempotency_key);
         let request_bytes = serde_json::to_vec(&request_json)?;
 
         // Wykonaj WASM poza lockiem
@@ -4024,6 +4035,11 @@ impl AddonManager {
             .map(|t| t.package_id.clone())
     }
 
+    #[cfg(test)]
+    pub(crate) fn register_tool_for_test(&self, tool: ToolDefinition) {
+        self.registered_tools.write().push(tool);
+    }
+
     /// Hash of the bundle the operator approved for `addon_id`; empty when the
     /// instance has none recorded.
     pub fn installed_bundle_hash(&self, addon_id: &str) -> Result<String> {
@@ -4435,6 +4451,22 @@ mod tests {
         assert_eq!(w.resources.http_requests_per_minute, Some(300));
         assert_eq!(w.resources.memory_mb, Some(512));
         assert_eq!(w.resources.fuel_limit, Some(20_000_000));
+    }
+
+    #[test]
+    fn process_tool_request_carries_the_key_only_when_given_and_process_provenance() {
+        let params = serde_json::json!({"query": "cats"});
+        let plain = tool_request_json("search", &params, "u1", None);
+        assert!(plain.get("idempotency_key").is_none());
+        assert_eq!(plain, serde_json::json!({"tool": "search", "params": params, "user_id": "u1"}));
+        let keyed = tool_request_json("search", &params, "u1", Some("req-7"));
+        assert_eq!(keyed["idempotency_key"], "req-7");
+        let provenance = AddonCallProvenance::process("req-7");
+        assert_eq!(provenance.origin, crate::flow_engine::dispatcher::FlowOrigin::Process);
+        assert_eq!(
+            provenance.actor_for("any-addon"),
+            crate::flow_engine::dispatcher::FlowActor::system_component("req-7")
+        );
     }
 
     #[test]

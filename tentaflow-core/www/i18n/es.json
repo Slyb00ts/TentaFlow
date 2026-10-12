@@ -10000,6 +10000,8 @@
     "origin_mesh": "Mesh",
     "origin_agent": "Agente",
     "origin_system": "Sistema",
+    "origin_bus": "TentaBus",
+    "origin_process": "Proceso",
     "kind_request_started": "solicitud",
     "kind_first_token": "primer token",
     "kind_assistant_message": "respuesta",

@@ -40,7 +40,7 @@ const LOAD_MORE_PX = 600;
 // origin has been seen.
 const ORIGINS = [
   'chat', 'dashboard', 'project', 'code_studio', 'api', 'addon',
-  'camera', 'meeting', 'scheduler', 'mesh', 'agent', 'system',
+  'camera', 'meeting', 'scheduler', 'mesh', 'agent', 'system', 'bus', 'process',
 ];
 
 // Origin → colour class in events.css. Two slugs are abbreviated there
@@ -58,6 +58,8 @@ const ORIGIN_CLASS = {
   mesh: 'o-mesh',
   agent: 'o-agent',
   system: 'o-system',
+  bus: 'o-bus',
+  process: 'o-process',
 };
 
 // Time windows offered by the range control; `all` sends no lower bound.

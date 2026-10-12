@@ -206,6 +206,58 @@ fn options(ctx: &HandlerContext, actor: &ProcessActor) -> Result<P, ProtocolErro
     })
 }
 
+/// Mints the server-side pin of every Service task for publication. This is the
+/// one place a publication gets its snapshots, so tests exercise the same code
+/// the handler runs.
+pub(crate) fn pin_service_snapshots(
+    executor: &FlowDispatcher,
+    actor: &repository::ProcessActor,
+    model: &tentaflow_protocol::processes::ProcessModel,
+) -> Result<Vec<PinnedServiceSnapshot>, ProtocolError> {
+    let mut snapshots = Vec::new();
+    for node in crate::processes::model::all_nodes(model) {
+        let ProcessNodeKind::ServiceTask {
+            flow_id,
+            implementation,
+            ..
+        } = &node.kind
+        else {
+            continue;
+        };
+        let pinned = match implementation {
+            ServiceImplementation::Flow => {
+                let meta = executor
+                    .authorize_process_flow(flow_id, &actor.user_id, &actor.org_id)
+                    .map_err(|error| {
+                        ProtocolError::new(ProtocolErrorCode::PolicyDenied, error.to_string())
+                    })?;
+                executor
+                    .snapshot_flow(flow_id, &meta)
+                    .map_err(|error| ProtocolError::bad_request(error.to_string()))?
+            }
+            // The denial text is the same whether the addon is missing, stopped
+            // or belongs to another organization.
+            ServiceImplementation::AddonTool { addon_id, tool_name } => executor
+                .snapshot_process_tool(addon_id, tool_name, &actor.user_id, &actor.org_id)
+                .map_err(|error| {
+                    ProtocolError::new(ProtocolErrorCode::PolicyDenied, error.to_string())
+                })?,
+        };
+        snapshots.push(PinnedServiceSnapshot {
+            info: PinnedFlowInfo {
+                node_id: node.id.clone(),
+                flow_id: pinned.flow_id,
+                source_version: pinned.source_version,
+                graph_sha256: pinned.graph_sha256,
+            },
+            graph_json: pinned.graph_json,
+            role: Default::default(),
+            implementation_kind: implementation.kind(),
+        });
+    }
+    Ok(snapshots)
+}
+
 #[handler(variant = "ProcessBody", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
@@ -282,51 +334,7 @@ pub fn process_dispatch(
             let (definition, _) =
                 repository::get_definition(pool, &actor, definition_id).map_err(error)?;
             crate::processes::model::validate_model(&definition.model).map_err(error)?;
-            let mut snapshots = Vec::new();
-            for node in crate::processes::model::all_nodes(&definition.model) {
-                if let ProcessNodeKind::ServiceTask {
-                    flow_id,
-                    implementation,
-                    ..
-                } = &node.kind
-                {
-                    let executor = dispatcher(ctx)?;
-                    let pinned = match implementation {
-                        ServiceImplementation::Flow => {
-                            let meta = executor
-                                .authorize_process_flow(flow_id, &actor.user_id, &actor.org_id)
-                                .map_err(|error| {
-                                    ProtocolError::new(
-                                        ProtocolErrorCode::PolicyDenied,
-                                        error.to_string(),
-                                    )
-                                })?;
-                            executor
-                                .snapshot_flow(flow_id, &meta)
-                                .map_err(|error| ProtocolError::bad_request(error.to_string()))?
-                        }
-                        ServiceImplementation::AddonTool { addon_id, tool_name } => executor
-                            .snapshot_process_tool(addon_id, tool_name, &actor.user_id, &actor.org_id)
-                            .map_err(|error| {
-                                ProtocolError::new(
-                                    ProtocolErrorCode::PolicyDenied,
-                                    error.to_string(),
-                                )
-                            })?,
-                    };
-                    snapshots.push(PinnedServiceSnapshot {
-                        info: PinnedFlowInfo {
-                            node_id: node.id.clone(),
-                            flow_id: pinned.flow_id,
-                            source_version: pinned.source_version,
-                            graph_sha256: pinned.graph_sha256,
-                        },
-                        graph_json: pinned.graph_json,
-                        role: Default::default(),
-                        implementation_kind: implementation.kind(),
-                    });
-                }
-            }
+            let snapshots = pin_service_snapshots(dispatcher(ctx)?, &actor, &definition.model)?;
             let (definition, version) = repository::publish_definition(
                 pool,
                 &actor,

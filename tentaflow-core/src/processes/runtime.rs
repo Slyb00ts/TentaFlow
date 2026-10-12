@@ -8200,6 +8200,17 @@ pub struct ProcessRuntime {
     handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
 }
 
+/// Recovery's view of addon tool permissions: the same check a claim makes.
+pub(crate) fn tool_authority(
+    dispatcher: &Arc<FlowDispatcher>,
+) -> impl Fn(&super::repository::ProcessActor, &str, &str) -> bool + Send + Sync + '_ {
+    move |actor, addon_id, tool_name| {
+        dispatcher
+            .authorize_process_tool(addon_id, tool_name, &actor.user_id, &actor.org_id)
+            .is_ok()
+    }
+}
+
 pub fn start(db: &DbPool, dispatcher: &Arc<FlowDispatcher>) -> Result<Arc<ProcessRuntime>> {
     ensure!(
         Arc::ptr_eq(db, dispatcher.process_database()),
@@ -8215,7 +8226,12 @@ pub fn start(db: &DbPool, dispatcher: &Arc<FlowDispatcher>) -> Result<Arc<Proces
         );
         return Ok(runtime.clone());
     }
-    super::repository::recover_jobs(db, None, chrono::Utc::now().timestamp_millis())?;
+    super::repository::recover_jobs(
+        db,
+        None,
+        chrono::Utc::now().timestamp_millis(),
+        &tool_authority(dispatcher),
+    )?;
     let runtime = Arc::new(ProcessRuntime {
         db: db.clone(),
         dispatcher: Arc::downgrade(dispatcher),
@@ -8376,11 +8392,22 @@ impl ProcessRuntime {
             jobs.abort_all();
             while jobs.join_next().await.is_some() {}
         }
-        super::repository::recover_jobs(
-            &self.db,
-            Some(&self.worker_id),
-            chrono::Utc::now().timestamp_millis(),
-        )?;
+        match self.dispatcher.upgrade() {
+            Some(dispatcher) => super::repository::recover_jobs(
+                &self.db,
+                Some(&self.worker_id),
+                chrono::Utc::now().timestamp_millis(),
+                &tool_authority(&dispatcher),
+            )?,
+            // Without a dispatcher nothing can vouch for a tool permission, so
+            // an observed tool result is blocked rather than applied.
+            None => super::repository::recover_jobs(
+                &self.db,
+                Some(&self.worker_id),
+                chrono::Utc::now().timestamp_millis(),
+                &super::repository::no_tool_authority,
+            )?,
+        };
         Ok(())
     }
 
@@ -8740,39 +8767,12 @@ pub(crate) mod test_support {
             model,
         )
         .expect("save real process definition");
-        let mut snapshots = Vec::new();
-        for node in super::super::model::all_nodes(model) {
-            if let ProcessNodeKind::ServiceTask { flow_id, implementation, .. } = &node.kind {
-                let dispatcher = fixture.dispatcher();
-                let pinned = match implementation {
-                    tentaflow_protocol::processes::ServiceImplementation::Flow => {
-                        let meta = dispatcher
-                            .authorize_process_flow(flow_id, &actor.user_id, &actor.org_id)
-                            .expect("current source authorization");
-                        dispatcher
-                            .snapshot_flow(flow_id, &meta)
-                            .expect("validate real service graph")
-                    }
-                    tentaflow_protocol::processes::ServiceImplementation::AddonTool {
-                        addon_id,
-                        tool_name,
-                    } => dispatcher
-                        .snapshot_process_tool(addon_id, tool_name, &actor.user_id, &actor.org_id)
-                        .expect("pin the scripted addon tool"),
-                };
-                snapshots.push(super::super::repository::PinnedServiceSnapshot {
-                    info: PinnedFlowInfo {
-                        node_id: node.id.clone(),
-                        flow_id: pinned.flow_id,
-                        source_version: pinned.source_version,
-                        graph_sha256: pinned.graph_sha256,
-                    },
-                    graph_json: pinned.graph_json,
-                    role: Default::default(),
-                    implementation_kind: implementation.kind(),
-                });
-            }
-        }
+        let snapshots = crate::dispatch::processes::pin_service_snapshots(
+            fixture.dispatcher(),
+            actor,
+            model,
+        )
+        .expect("pin the Service tasks exactly as the publication handler does");
         super::super::repository::publish_definition(
             &fixture.db,
             actor,
@@ -10023,7 +10023,7 @@ mod tests {
         drop(db);
         let reopened = crate::db::init(&path).expect("reopen durable process DB");
         assert_eq!(
-            repository::recover_jobs(&reopened, None, chrono::Utc::now().timestamp_millis())
+            repository::recover_jobs(&reopened, None, chrono::Utc::now().timestamp_millis(), &repository::no_tool_authority)
                 .unwrap(),
             0
         );

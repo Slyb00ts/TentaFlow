@@ -232,9 +232,28 @@ async fn permission_revoked_during_the_call_never_publishes_the_result() {
     let current =
         repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
     assert!(current.variables.get("answer").is_none());
-    // The result stays recorded but unapplied; recovery decides later.
-    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "observed");
+    // The revocation is honoured at once: the observed result is blocked, so a
+    // later recovery has nothing left to apply.
+    assert_eq!(
+        invocation(&fixture, &claimed.job.job_id).2,
+        "observed_blocked"
+    );
     assert_ne!(current.status, ProcessInstanceStatus::Completed);
+    repository::recover_jobs(
+        &fixture.db,
+        None,
+        now_ms(),
+        &super::runtime::tool_authority(fixture.dispatcher()),
+    )
+    .unwrap();
+    let after =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert!(after.variables.get("answer").is_none());
+    assert_ne!(after.status, ProcessInstanceStatus::Completed);
+    assert_eq!(
+        invocation(&fixture, &claimed.job.job_id).2,
+        "observed_blocked"
+    );
 }
 
 #[tokio::test]
@@ -328,7 +347,8 @@ async fn restart_between_dispatch_and_result_never_calls_the_tool_again() {
     )
     .unwrap());
     assert_eq!(
-        repository::recover_jobs(&fixture.db, None, now_ms()).unwrap(),
+        repository::recover_jobs(&fixture.db, None, now_ms(), &repository::no_tool_authority)
+            .unwrap(),
         1
     );
     assert!(repository::claim_job(&fixture.db, "next-worker", now_ms())
@@ -574,4 +594,371 @@ fn legacy_pin_snapshots_keep_their_bytes() {
     let value = serde_json::to_value(&pinned).unwrap();
     assert_eq!(value["implementation_kind"], "addon_tool");
     assert!(value.get("role").is_none());
+}
+
+/// A tool result durably observed, then the worker dies before accepting it.
+async fn observed_but_unaccepted(
+    fixture: &Fixture,
+    host: &Arc<ScriptedToolHost>,
+) -> (
+    tentaflow_protocol::processes::ProcessInstance,
+    repository::ClaimedProcessJob,
+) {
+    let started = start_model(fixture, &tool_model(10, None));
+    let claimed = repository::claim_job(&fixture.db, "dying-worker", now_ms())
+        .unwrap()
+        .unwrap();
+    assert!(repository::commit_job_dispatch_boundary(
+        &fixture.db,
+        &claimed,
+        "dying-worker",
+        now_ms()
+    )
+    .unwrap());
+    let observed = repository::ObservedActivityResult {
+        result: tentaflow_protocol::processes::ActivityResult {
+            outcome: ActivityOutcome::Completed,
+            code: None,
+            summary: "The addon tool returned a result".into(),
+            outputs: json!({"result": {"hits": 7}}),
+            evidence: Vec::new(),
+        },
+        origin: ActivityResultOrigin::Envelope,
+        expression_observation: None,
+    };
+    assert_eq!(
+        repository::record_job_observation(
+            &fixture.db,
+            &claimed,
+            "dying-worker",
+            &observed,
+            now_ms()
+        )
+        .unwrap(),
+        repository::JobObservationState::Observed
+    );
+    assert!(host.calls.lock().unwrap().is_empty());
+    (started, claimed)
+}
+
+#[tokio::test]
+async fn recovery_applies_an_observed_tool_result_only_while_the_initiator_may_still_call_the_tool()
+{
+    let host = ScriptedToolHost::new(json!(null));
+    let fixture = fixture_with(&host);
+    let (started, claimed) = observed_but_unaccepted(&fixture, &host).await;
+    *host.allow.lock().unwrap() = Err(ToolAccessError::PermissionDenied);
+    let authority = super::runtime::tool_authority(fixture.dispatcher());
+    assert_eq!(
+        repository::recover_jobs(&fixture.db, None, now_ms(), &authority).unwrap(),
+        1
+    );
+    assert_eq!(
+        invocation(&fixture, &claimed.job.job_id).2,
+        "observed_blocked"
+    );
+    let blocked =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert_ne!(blocked.status, ProcessInstanceStatus::Completed);
+    assert!(blocked.variables.get("answer").is_none());
+
+    let allowed = ScriptedToolHost::new(json!(null));
+    let fixture = fixture_with(&allowed);
+    let (started, claimed) = observed_but_unaccepted(&fixture, &allowed).await;
+    let authority = super::runtime::tool_authority(fixture.dispatcher());
+    assert_eq!(
+        repository::recover_jobs(&fixture.db, None, now_ms(), &authority).unwrap(),
+        1
+    );
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "accepted");
+    let done =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert_eq!(done.status, ProcessInstanceStatus::Completed);
+    assert_eq!(done.variables["answer"], 7);
+}
+
+#[tokio::test]
+async fn recovery_without_any_tool_authority_blocks_instead_of_applying() {
+    let host = ScriptedToolHost::new(json!(null));
+    let fixture = fixture_with(&host);
+    let (_, claimed) = observed_but_unaccepted(&fixture, &host).await;
+    assert_eq!(
+        repository::recover_jobs(&fixture.db, None, now_ms(), &repository::no_tool_authority)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        invocation(&fixture, &claimed.job.job_id).2,
+        "observed_blocked"
+    );
+}
+
+#[tokio::test]
+async fn publication_and_claim_deny_other_organizations_without_revealing_the_addon() {
+    let host = ScriptedToolHost::new(json!(null));
+    let fixture = fixture_with(&host);
+    let org_b = crate::services::org::repo::create_organization(
+        &fixture.db,
+        "Org B",
+        "org-b",
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    crate::services::org::repo::add_membership(
+        &fixture.db,
+        &org_b.org_id,
+        &fixture.participant.user_id,
+        "role-org-viewer",
+        &fixture.participant.user_id,
+    )
+    .unwrap();
+    let member_of_b = repository::ProcessActor {
+        org_id: org_b.org_id.clone(),
+        user_id: fixture.participant.user_id.clone(),
+    };
+    // The addon runs in the default organization (org A); an org B member names it.
+    let denied = fixture
+        .dispatcher()
+        .snapshot_process_tool(ADDON, TOOL, &member_of_b.user_id, &member_of_b.org_id)
+        .unwrap_err();
+    assert_eq!(denied, ToolAccessError::OtherOrganization);
+    // The publication text is the same as for an addon that does not exist.
+    let mut gone = ScriptedToolHost::new(json!(null));
+    {
+        let gone = Arc::get_mut(&mut gone).unwrap();
+        gone.org = org_b.org_id.clone();
+        *gone.allow.get_mut().unwrap() = Err(ToolAccessError::Unavailable);
+    }
+    fixture.dispatcher().set_process_tool_host(gone);
+    let missing = fixture
+        .dispatcher()
+        .snapshot_process_tool(ADDON, TOOL, &member_of_b.user_id, &member_of_b.org_id)
+        .unwrap_err();
+    assert_eq!(missing, ToolAccessError::Unavailable);
+    assert_eq!(denied.to_string(), missing.to_string());
+    fixture.dispatcher().set_process_tool_host(host);
+    // And through the real handler function: a PolicyDenied with that text.
+    let model = tool_model(10, None);
+    let error = crate::dispatch::processes::pin_service_snapshots(
+        fixture.dispatcher(),
+        &member_of_b,
+        &model,
+    )
+    .unwrap_err();
+    assert_eq!(error.message, ToolAccessError::Unavailable.to_string());
+}
+
+#[tokio::test]
+async fn abandoned_calls_hold_the_gate_until_the_guest_returns_and_refuse_new_ones() {
+    let host = ScriptedToolHost::new(json!({"hits": 1}));
+    *host.delay.lock().unwrap() = Duration::from_millis(5000);
+    let fixture = fixture_with(&host);
+    fixture.dispatcher().process_tool_gate().set_limit(2);
+    let model = tool_model(1, None);
+    let mut jobs = Vec::new();
+    for _ in 0..3 {
+        start_model(&fixture, &model);
+    }
+    for round in 0..3 {
+        let claimed = run(&fixture, &format!("gate-worker-{round}")).await;
+        jobs.push(claimed.job.job_id);
+    }
+    // Two calls were dispatched and abandoned by their timeout; the third was refused.
+    assert_eq!(host.calls.lock().unwrap().len(), 2);
+    assert_eq!(invocation(&fixture, &jobs[0]).2, "uncertain");
+    assert_eq!(invocation(&fixture, &jobs[1]).2, "uncertain");
+    assert_eq!(invocation(&fixture, &jobs[2]).2, "proved_no_effect");
+    assert_eq!(fixture.dispatcher().process_tool_gate().in_flight(ADDON), 2);
+    let refused = fixture
+        .db
+        .read()
+        .unwrap()
+        .query_row(
+            "SELECT code FROM bpmn_incidents WHERE job_id=?1",
+            [&jobs[2]],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    assert_eq!(refused, "TOOL_BUSY");
+    // The permits come back only when the guest really returns.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while fixture.dispatcher().process_tool_gate().in_flight(ADDON) > 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("permits are released when the abandoned calls finish");
+}
+
+#[tokio::test]
+async fn a_changed_tool_is_used_and_the_drift_is_recorded() {
+    let host = ScriptedToolHost::new(json!({"hits": 4}));
+    let fixture = fixture_with(&host);
+    let started = start_model(&fixture, &tool_model(10, None));
+    *host.bundle.lock().unwrap() = "c".repeat(64);
+    let claimed = run(&fixture, "drift-worker").await;
+    assert_eq!(
+        host.calls.lock().unwrap().len(),
+        1,
+        "the changed tool still runs"
+    );
+    let history =
+        repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 100)
+            .unwrap()
+            .0;
+    let drift = history
+        .iter()
+        .find(|event| event.kind == "service_tool_drift")
+        .expect("drift event");
+    assert_eq!(drift.data["pinned_bundle_hash"], "b".repeat(64));
+    assert_eq!(drift.data["current_bundle_hash"], "c".repeat(64));
+    assert_eq!(drift.data["job_id"], claimed.job.job_id);
+    assert_eq!(drift.data["fence"], claimed.job.fence);
+    // Same schema, so its digest did not change.
+    assert_eq!(
+        drift.data["pinned_input_schema_digest"],
+        drift.data["current_input_schema_digest"]
+    );
+    let finished =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert_eq!(finished.status, ProcessInstanceStatus::Completed);
+}
+
+#[tokio::test]
+async fn an_unchanged_tool_records_no_drift_and_a_changed_schema_is_the_one_checked() {
+    let host = ScriptedToolHost::new(json!({"hits": 4}));
+    let fixture = fixture_with(&host);
+    let started = start_model(&fixture, &tool_model(10, None));
+    run(&fixture, "plain-worker").await;
+    let history =
+        repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 100)
+            .unwrap()
+            .0;
+    assert!(history
+        .iter()
+        .all(|event| event.kind != "service_tool_drift"));
+
+    // A schema that gained a required argument after publication is enforced.
+    let published_with = ScriptedToolHost::new(json!({"hits": 4}));
+    let fixture = fixture_with(&published_with);
+    let started = start_model(&fixture, &tool_model(10, None));
+    let mut stricter = ScriptedToolHost::new(json!({"hits": 4}));
+    Arc::get_mut(&mut stricter).unwrap().schema =
+        json!({"type": "object", "required": ["query", "limit"]});
+    fixture.dispatcher().set_process_tool_host(stricter.clone());
+    run(&fixture, "strict-worker").await;
+    assert!(stricter.calls.lock().unwrap().is_empty());
+    let current =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert_eq!(current.incidents[0].code, "TOOL_ARGUMENTS_INVALID");
+}
+
+#[tokio::test]
+async fn a_denial_is_recorded_atomically_with_its_boundary() {
+    let host = ScriptedToolHost::new(json!({"hits": 1}));
+    let fixture = fixture_with(&host);
+    let started = start_model(&fixture, &tool_model(10, None));
+    *host.allow.lock().unwrap() = Err(ToolAccessError::PermissionDenied);
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_observation BEFORE UPDATE ON bpmn_service_invocations \
+             WHEN NEW.phase='observed' BEGIN SELECT RAISE(ABORT,'observation refused'); END;",
+        )
+        .unwrap();
+    let claimed = repository::claim_job(&fixture.db, "atomic-worker", now_ms())
+        .unwrap()
+        .unwrap();
+    let error = super::jobs::execute_claimed(
+        &fixture.db,
+        fixture.dispatcher(),
+        "atomic-worker",
+        claimed.clone(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("observation refused"),
+        "{error:#}"
+    );
+    // The boundary was rolled back with the failed observation: a crash here
+    // would leave a plain prepared job, not an "uncertain" external effect.
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "prepared");
+    assert!(host.calls.lock().unwrap().is_empty());
+    let _ = started;
+}
+
+#[test]
+fn model_validation_reserves_the_tool_prefix_for_tools() {
+    let error = super::model::validate_model(&with_implementation(
+        "tool:notes-1/search",
+        ServiceImplementation::Flow,
+    ))
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("reserved tool: prefix"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn invocation_rows_cannot_pair_a_kind_with_the_wrong_reference() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::db::migrations::run(&conn).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+    let digest = "a".repeat(64);
+    let insert = |id: &str, flow_id: &str, kind: &str| {
+        conn.execute(
+            "INSERT INTO bpmn_service_invocations(invocation_id,job_id,instance_id,scope_id,\
+             node_id,token_id,definition_id,version,selected_process_id,whole_document_sha256,\
+             flow_id,pinned_flow_digest,input_sha256,stable_request_id,phase,dispatch_evidence,\
+             created_at_ms,updated_at_ms,implementation_kind) \
+             VALUES(?1,?1,'i','s','n','t','d',1,'p',?4,?2,?4,?4,?1,'prepared','no_boundary',1,1,?3)",
+            rusqlite::params![id, flow_id, kind, digest],
+        )
+    };
+    insert("a", "flow-1", "flow").unwrap();
+    insert("b", "tool:notes-1/search", "addon_tool").unwrap();
+    assert!(insert("c", "flow-1", "addon_tool").is_err());
+    assert!(insert("d", "tool:notes-1/search", "flow").is_err());
+    assert!(insert("e", "flow-1", "agent").is_err());
+}
+
+#[test]
+fn oversized_failure_text_is_logged_by_length_only() {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let sink = Sink::default();
+    let writer = sink.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let secret = format!("customer-secret-{}", "x".repeat(200_000));
+    tracing::subscriber::with_default(subscriber, || {
+        super::jobs::failure_for_test("TOOL_ERROR", secret.clone());
+    });
+    let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains("message_len"), "{logged}");
+    assert!(
+        !logged.contains("customer-secret"),
+        "addon text must not be logged"
+    );
 }

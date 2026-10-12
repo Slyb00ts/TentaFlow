@@ -31,6 +31,8 @@
   --ev-o-meeting: #fb923c;
   --ev-o-agent: #a3e635;
   --ev-o-system: #64748b;
+  --ev-o-bus: #a78bfa;
+  --ev-o-process: #34d399;
 
   --ev-tool: #0e7490;
   --ev-wait-a: #4b5563;
@@ -90,6 +92,8 @@
 .ev-shell .o-meeting { color: var(--ev-o-meeting); }
 .ev-shell .o-agent { color: var(--ev-o-agent); }
 .ev-shell .o-system { color: var(--ev-o-system); }
+.ev-shell .o-bus { color: var(--ev-o-bus); }
+.ev-shell .o-process { color: var(--ev-o-process); }
 .ev-shell .dot {
   width: 7px; height: 7px; border-radius: 50%;
   background: currentColor; flex: 0 0 auto;
