@@ -21,6 +21,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   administrator; pozostali dostają odmowę `backdating_admin_only` także z
   `confirm_backdated`.
 
+### Procesy (BPMN)
+
+- Zadanie usługi może uruchamiać narzędzie addonu (B3.1): obok dotychczasowego
+  przepływu model niesie `implementation` (`Flow` albo `AddonTool`). Zadanie z
+  przepływem serializuje się bajt w bajt jak dotąd, więc opublikowane modele
+  zachowują swoje sumy SHA-256. Narzędzie działa jako osoba, która uruchomiła
+  instancję, wymaga uprawnienia „llm” do addonu i addonu z tej samej organizacji;
+  odmowa przy starcie zadania otwiera zadanie dla człowieka
+  (`TOOL_PERMISSION_DENIED`), a cofnięcie dostępu w trakcie kończy się
+  `SOURCE_ACCESS_REVOKED`. Wywołanie WASM nie daje się przerwać: po przekroczeniu
+  czasu wynik jest niepewny (`SERVICE_TIMEOUT`), a narzędzie dostaje klucz
+  idempotencji `idempotency_key`. Publikacja przypina identyfikator addonu,
+  narzędzia, skrót pakietu i schematu. Migracja 201 dopisuje do wywołań usług
+  kolumnę `implementation_kind`. Eksport XML: `<tentaflow:service
+  implementation="tool" addonId toolName>`; inspektor ma wybór implementacji
+  (przepływ albo narzędzie addonu).
+
 ### TentaNas
 
 - Lista dozwolonych targetu iSCSI/NVMe-oF jest zapamiętywana w bazie
@@ -189,6 +206,121 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   wersji nazywa pole, oba typy, wartość wyliczenia albo zastrzeżony numer,
   karta „Pola wiadomości” na stronie wzoru (numer, nazwa, typ, obecność) i
   przetłumaczone powody w Nieprzetworzonych (pięć języków).
+
+- Rejestr wzorców waliduje Thrift (F4 B3; bez nowej zależności: crate `thrift`
+  to środowisko uruchomieniowe pod kod generowany i nie czyta IDL, więc parser
+  podzbioru IDL oraz dekodery obu protokołów są własne). Wzór to **jeden
+  plik IDL**, a typem wzorca jest **pierwszy `struct`, `union` albo
+  `exception` najwyższego poziomu** albo ten, który wskaże komentarz
+  `// tentabus:struct Nazwa` (także `#`). Protokół to TBinaryProtocol albo, po
+  komentarzu `// tentabus:protocol compact`, TCompactProtocol (`binary` też
+  można napisać wprost; inna wartość jest odrzucana). Temat o dowolnym typie
+  treści wiąże się z wzorcem `thrift` i może mieć `validation = warn | dlq`:
+  ładunek to **jedna zserializowana struktura** — bez nagłówka `TMessage`, bez
+  ramkowania i bez bajtów po niej. Bez migracji i bez zmian w protokole.
+- Przyjmowane w IDL: `struct`, `union`, `exception`, `enum` (wartości jawne i
+  domyślne, także ujemne i szesnastkowe), `typedef`, `namespace` (czytany i
+  pomijany), typy proste `bool byte i8 i16 i32 i64 double string binary uuid`,
+  `list<T>` `set<T>` `map<K, V>` zagnieżdżone do 32 poziomów, odwołania do
+  typów zapisanych dalej w pliku, jawne numery pól, `required` / `optional` /
+  wymagalność domyślna, komentarze `//` `#` `/* */`, adnotacje
+  `( klucz = "wartość" )` oraz `const` i wartości domyślne pól — te trzy są
+  czytane pod kątem składni w granicach limitów, nie są sprawdzane co do typu
+  i nie trafiają do wzoru pochodnego, bo nie zmieniają ani bajtu na drucie.
+  Odrzucane z komunikatem nazywającym konstrukcję: `include`, `cpp_include`,
+  `service` (z `extends`, `oneway`, `throws`, `void`), `senum`, `slist`,
+  `xsd_*`, `cpp_type`, każda inna instrukcja, pole bez jawnego numeru
+  (numery domyślne, ujemne, to konwencja kompilatora, której rejestr nie
+  odtwarza), numer poza 1…32767, `required` w `union`, nazwa typu z kropką
+  (wskazuje plik dołączony), słowo zastrzeżone jako nazwa, powtórzona nazwa
+  typu, numer pola, nazwa pola i nazwa wartości wyliczenia, `typedef`
+  odwołujący się do samego siebie (także przez kontener), łańcuch `typedef`
+  dłuższy niż 32, korzeń, który wymaga samego siebie (wzór bez żadnej
+  poprawnej wartości), komentarz wskazujący typ, którego nie ma wśród typów
+  najwyższego poziomu. Każdy komunikat z parsera ma numer wiersza i nigdy nie
+  zawiera treści napisu.
+- Limity (parser jest całkowity — bez `unwrap` i indeksowania bez sprawdzenia,
+  a profil `release` ma `panic = "abort"` — i liczy wszystko, zanim cokolwiek
+  zaalokuje): tekst do 256 KiB, 200 000 tokenów, 256 typów, 16 384 wyrażeń
+  typów, 1024 pola w strukturze i 4096 łącznie, 1024 wartości wyliczenia i
+  4096 łącznie, 64 pola `required` w strukturze, nazwy do 128 znaków i 8
+  członów, napisy do 256 bajtów bez znaków sterujących, zerowej szerokości i
+  zmieniających kierunek tekstu (komentarze są dowolne), stałe zagnieżdżone do
+  16 poziomów i do 16 384 części łącznie, 256 stałych, 64 `namespace`, adnotacje
+  do 16 wpisów (1024 łącznie). `typedef` jest nazwą w arenie wyrażeń, nigdy
+  kopią, więc łańcuch podwajający mapę w każdym kroku (200 poziomów) kompiluje
+  się liniowo (1,2 ms), a jego porównanie kończy się w 2,7 ms.
+- Wiadomości są sprawdzane własnym iteracyjnym przejściem (jeden dla obu
+  protokołów): jawny stos co najwyżej 64 ramek (struktura, lista lub zbiór,
+  mapa — bez rekurencji, więc działa na małym stosie), bez alokacji na
+  wartość; każda długość i liczba elementów jest porównywana z bajtami, które
+  zostały (liczba także z najmniejszym rozmiarem elementu), zanim cokolwiek
+  zostanie pominięte lub przeiterowane; każde pole i element kosztuje
+  jednostkę budżetu (20 mln na dokument, wspólne dla paczki), ciągi bajtów
+  1/32 jednostki na bajt, ciągi stałych rozmiarów są pomijane w jednym kroku,
+  ale obciążone. Przekroczenie budżetu albo głębokości to
+  `schema_check_too_complex`, nigdy „niepoprawne”. Pomiary w buildzie
+  testowym (bez optymalizacji): bomby długości i liczby elementów odrzucone w
+  mniej niż 3 µs, 5000 zagnieżdżonych struktur na stosie 256 KiB w 0,2 ms,
+  milion wartości `bool` w 60–120 ms, milion pustych struktur w 220–270 ms,
+  20 mln elementów ponad budżet w 1,3 s (`schema_check_too_complex`), napis
+  5 MB w 0,2 ms; teksty patologiczne (60 000 zagnieżdżonych `list<`, `[`, `{`,
+  200 000 tokenów) odrzucone w mniej niż 4 ms. Fuzz: 1 mln zmutowanych
+  wzorów i 4 mln zmutowanych ładunków obu protokołów bez paniki i bez wywołania
+  dłuższego niż limit testu; krótkie przebiegi działają w każdym `cargo test`,
+  długie (`--ignored`, `TF_THRIFT_FUZZ_ITERATIONS`) na żądanie. Walidator jest
+  też sprawdzony dokumentami zapisanymi przez bibliotekę Apache Thrift 0.25
+  (Python, oba protokoły), a przyjmowany IDL — ręcznie kompilatorem `thrift`
+  0.25.
+- Naruszeniem (nie błędem rejestru) są: pole znane wzorowi zapisane innym
+  typem zapisu (komunikat nazywa pole), brak pola `required`, `union` z więcej
+  niż jednym członkiem (pusty `union` jest poprawny), wartość wyliczenia spoza
+  zadeklarowanych (**świadome zaostrzenie**: biblioteki Thrift zachowują
+  nieznane numery, rejestr je zgłasza), `string` niebędący UTF-8 (`binary` nie
+  jest sprawdzany), `bool` w protokole binarnym inny niż 0 i 1, element `bool`
+  w liście zwartego protokołu inny niż 1 i 2, ujemna długość lub rozmiar,
+  rozmiar większy niż reszta ładunku, typ zapisu niebędący typem Thrift
+  (także w polu nieznanym wzorowi), zmienna długości ponad 3 / 5 / 10 bajtów
+  dla `i16` / `i32` / `i64` albo przekraczająca swój typ, numer pola poza
+  `i16` w zwartym protokole, bajty po strukturze. Przyjmowane są, jak w
+  Thrift: pola o nieznanych numerach (pomijane z kontrolą ramek i głębokości),
+  powtórzone pole (ostatnie wygrywa), typy elementów **pustego** kontenera
+  nie są porównywane ze wzorem. Ścieżka w komunikacie to nazwy pól od typu
+  wzorca (`[]` element, `<key>` / `<value>` wpis mapy, `<unknown>` pole
+  nieznane), nigdy wartość ani numer z ładunku.
+- Zgodność wersji Thrift: tożsamością pola jest jego **numer**; nazwy nie mają
+  znaczenia na drucie. Pole obecne po obu stronach zachowuje typ (typy proste
+  muszą być równe — jedyny wyjątek to `string` czytany jako `binary`, nigdy
+  odwrotnie, bo `string` jest sprawdzany jako UTF-8; `list` ≠ `set`; kontenery
+  są porównywane element po elemencie), `struct`, `union` i `exception` się
+  nie mieszają, a czytelnik musi znać każdy numer wyliczenia pisarza. Pole
+  tylko po jednej stronie jest pomijane przez czytelnika, z wyjątkiem pola
+  `required` czytelnika, które pisarz musi też deklarować jako `required` —
+  dodanie pola `required` łamie backward, usunięcie go łamie forward.
+  Porównanie, które nie mieści się w limicie pracy (1 mln jednostek,
+  głębokość 64), to `bus.schema_compare_too_complex`.
+- Wzór pochodny (`derive_subschema`) zostawia dozwolone pola typu wzorca (po
+  nazwie) i każdy typ, do którego prowadzą; usunięte pole `required` po prostu
+  znika z listy, dozwolone zostaje `required`. Wynik to kanoniczny IDL
+  (typ wzorca pierwszy, potem pozostałe w kolejności z pliku, numery pól i
+  wartości wyliczeń zapisane wprost, `byte` jako `i8`, komentarz
+  `// tentabus:protocol compact` zachowany), bez wartości domyślnych, stałych
+  i adnotacji; jest sprawdzany ponownym skompilowaniem (do 512 KiB).
+  Rzutowanie odczytu dla formatów binarnych (polityki pól) to osobny pakiet B6.
+- Wszystkie sześć rodzajów wzorców ma teraz walidator, więc znika kod dla
+  rodzaju „tylko przechowywany”: `stored_only`, `SchemaType::has_validator`,
+  `SchemaError::Unsupported`, `BusServiceError::SchemaTypeUnsupported` (kod
+  `bus.schema_type_unsupported` i jego tłumaczenie), blokada
+  `validation != off` i zgodności dla takiego rodzaju oraz zrzut `Capabilities`
+  filtrowany po walidatorze — `schema_types` zawiera teraz wszystkie rodzaje,
+  także `thrift`.
+- Dashboard: kafel Thrift w „Dodaj wzór” z podpowiedzią (jak nazwać typ
+  wzorca i wybrać protokół zwarty), odmowy po polsku (include, service,
+  brakujące numery pól, duplikaty, typy bez definicji, cykle `typedef`,
+  dyrektywy, limity), powód odmowy wersji nazywa pole, oba typy, numer
+  wyliczenia albo zmieniony rodzaj struktury, karta „Pola typu” na stronie
+  wzoru (numer, nazwa, typ, obecność) i przetłumaczone powody w
+  Nieprzetworzonych (pięć języków).
 
 - Rejestr wzorców waliduje Avro (F4 B1, biblioteka `apache-avro` 0.22 z ASF,
   bez kodeków kompresji; tylko do czytania schematów i serializacji
