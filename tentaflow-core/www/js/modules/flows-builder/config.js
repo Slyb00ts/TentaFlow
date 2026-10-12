@@ -631,7 +631,16 @@ export class FlowConfig {
       const flows = this.opts.processOptions.serviceFlows;
       const options = `<option value="">${escapeHtml(I18n.t('bpmn.choose_flow'))}</option>` + flows.map((flow) => `<option value="${escapeAttr(flow.flowId)}">${escapeHtml(flow.name)}</option>`).join('');
       const unavailable = config.flowId && !flows.some((flow) => flow.flowId === config.flowId);
-      fields += `<tf-select data-process="flowId" wrap-selected label="${escapeAttr(I18n.t('bpmn.service_flow'))}" value="${escapeAttr(config.flowId)}" ${disabled}>${options}${unavailable ? `<option value="${escapeAttr(config.flowId)}" disabled>${escapeHtml(I18n.t('bpmn.flow_unavailable'))}</option>` : ''}</tf-select>
+      const tool = config.implementation?.AddonTool;
+      const source = tool
+        ? `${input('addonId', 'tool_addon_id', tool.addonId)}${input('toolName', 'tool_name', tool.toolName)}
+        <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.tool_hint'))}</p>`
+        : `<tf-select data-process="flowId" wrap-selected label="${escapeAttr(I18n.t('bpmn.service_flow'))}" value="${escapeAttr(config.flowId)}" ${disabled}>${options}${unavailable ? `<option value="${escapeAttr(config.flowId)}" disabled>${escapeHtml(I18n.t('bpmn.flow_unavailable'))}</option>` : ''}</tf-select>`;
+      fields += `<tf-select data-process="implementation" label="${escapeAttr(I18n.t('bpmn.service_implementation'))}" value="${tool ? 'tool' : 'flow'}" ${disabled}>
+          <option value="flow">${escapeHtml(I18n.t('bpmn.implementation_flow'))}</option>
+          <option value="tool">${escapeHtml(I18n.t('bpmn.implementation_tool'))}</option>
+        </tf-select>
+        ${source}
         ${mapping('inputMapping', 'input_mapping')}${mapping('outputMapping', 'output_mapping')}
         ${textarea('resultExpression', 'result_expression', config.resultExpression || '', 4)}
         <tf-select data-process="verification" label="${escapeAttr(I18n.t('bpmn.verification'))}" value="${typeof config.verification === 'string' ? 'Human' : 'Condition'}" ${disabled}>
@@ -1124,6 +1133,15 @@ export class FlowConfig {
         this.opts.onConfigChange(node.id, { target: { [targetKind]: updated } });
       } else if (key === 'targetDefinitionChoice' || key === 'targetStartChoice') {
         return;
+      } else if (key === 'implementation') {
+        // A Flow task never carries the field on the wire; 'Flow' is how the form says "back to default".
+        this.opts.onConfigChange(node.id, control.value === 'tool'
+          ? { flowId: '', implementation: { AddonTool: { addonId: '', toolName: '' } } }
+          : { implementation: 'Flow' });
+        this._renderProcess();
+      } else if (key === 'addonId' || key === 'toolName') {
+        this.opts.onConfigChange(node.id, { implementation: { AddonTool: {
+          ...node.config.implementation.AddonTool, [key]: control.value } } });
       } else if (key === 'resultExpression' || key === 'errorRef' || key === 'escalationRef') this.opts.onConfigChange(node.id, { [key]: control.value || null });
       else if (key !== 'elementId') {
         if (key === 'defaultFlowId' && kind === 'InclusiveGateway' && control.value) this.opts.onEdgeChange(control.value, { condition: null });

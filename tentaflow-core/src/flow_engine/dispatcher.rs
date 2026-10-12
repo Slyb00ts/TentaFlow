@@ -225,6 +225,10 @@ pub enum FlowOrigin {
     /// acts under `FlowActor::system()`; this origin is what distinguishes it
     /// in the event log from `System`'s other internal-work callers.
     Bus,
+    /// BPMN process engine — a Service task running an addon tool (and later
+    /// other implementations) as the instance initiator. The actor names the
+    /// invocation, so an operator can find the process step behind the call.
+    Process,
 }
 
 impl FlowOrigin {
@@ -244,6 +248,7 @@ impl FlowOrigin {
             FlowOrigin::Agent => "agent",
             FlowOrigin::System => "system",
             FlowOrigin::Bus => "bus",
+            FlowOrigin::Process => "process",
         }
     }
 
@@ -266,6 +271,7 @@ impl FlowOrigin {
             "agent" => FlowOrigin::Agent,
             "system" => FlowOrigin::System,
             "bus" => FlowOrigin::Bus,
+            "process" => FlowOrigin::Process,
             _ => return None,
         })
     }
@@ -537,6 +543,9 @@ pub struct FlowDispatcher {
     /// razem z resolverem dla AdapterRegistry — single touchpoint w main.rs.
     addon_flow_blocks:
         parking_lot::RwLock<Option<Arc<crate::addon::flow_blocks::AddonFlowRegistry>>>,
+    /// Addon tools for BPMN Service tasks; filled together with the resolver.
+    process_tool_host:
+        parking_lot::RwLock<Option<Arc<dyn crate::processes::tool_host::ProcessToolHost>>>,
     /// Harness §3.5.0: AgentServiceSlot — wypełniany z main.rs przez
     /// `set_agent_service` po zbudowaniu AddonManager/AppState. Phase-3 bloki
     /// (`agent_context`, `tool_exec`) trzymają KLON tego slotu (wpięty w
@@ -764,6 +773,7 @@ impl FlowDispatcher {
             registry,
             ctx_factory,
             addon_flow_blocks: parking_lot::RwLock::new(None),
+            process_tool_host: parking_lot::RwLock::new(None),
             agent_service,
             subflow_runner,
             frame_blobs,
@@ -857,6 +867,7 @@ impl FlowDispatcher {
         // Zachowaj referencję do registry zeby handlery GUI mogly listowac
         // addon blocks (Flow Builder palette).
         *self.addon_flow_blocks.write() = Some(blocks_registry.clone());
+        self.set_process_tool_host(manager.clone());
         let resolver: crate::flow_engine::node_adapter::DynamicAdapterResolver =
             Arc::new(move |node_type: &str| -> Option<Arc<dyn NodeAdapter>> {
                 // Tylko prefiks "addon." idzie do registry — szybki bail
@@ -870,6 +881,68 @@ impl FlowDispatcher {
                 Some(Arc::new(adapter) as Arc<dyn NodeAdapter>)
             });
         self.registry.set_dynamic_resolver(resolver);
+    }
+
+    pub fn set_process_tool_host(
+        &self,
+        host: Arc<dyn crate::processes::tool_host::ProcessToolHost>,
+    ) {
+        *self.process_tool_host.write() = Some(host);
+    }
+
+    pub fn process_tool_host(
+        &self,
+    ) -> Option<Arc<dyn crate::processes::tool_host::ProcessToolHost>> {
+        self.process_tool_host.read().clone()
+    }
+
+    /// Process counterpart of [`authorize_process_flow`] for an addon tool: the
+    /// initiator must be an active member of the organization, and the addon
+    /// runtime must still offer the tool to them.
+    pub fn authorize_process_tool(
+        &self,
+        addon_id: &str,
+        tool_name: &str,
+        user_id: &str,
+        org_id: &str,
+    ) -> std::result::Result<
+        crate::processes::tool_host::ProcessToolDescriptor,
+        crate::processes::tool_host::ToolAccessError,
+    > {
+        use crate::processes::tool_host::ToolAccessError;
+        repository::get_user_account_by_id(&self.db, user_id)
+            .ok()
+            .flatten()
+            .filter(|user| user.is_active)
+            .ok_or(ToolAccessError::Initiator)?;
+        crate::services::rbac::resolve_org_context(&self.db, user_id, Some(org_id))
+            .map_err(|_| ToolAccessError::Initiator)?;
+        self.process_tool_host()
+            .ok_or(ToolAccessError::Unavailable)?
+            .authorize(addon_id, tool_name, user_id, org_id)
+    }
+
+    /// Pin of an addon tool for publication, shaped like a Flow snapshot: the
+    /// reference stands in for the flow id and the canonical pin JSON for the
+    /// graph.
+    pub fn snapshot_process_tool(
+        &self,
+        addon_id: &str,
+        tool_name: &str,
+        user_id: &str,
+        org_id: &str,
+    ) -> std::result::Result<PinnedFlowSnapshot, crate::processes::tool_host::ToolAccessError>
+    {
+        let descriptor = self.authorize_process_tool(addon_id, tool_name, user_id, org_id)?;
+        let (graph_json, graph_sha256) =
+            crate::processes::tool_host::tool_pin(addon_id, tool_name, &descriptor)
+                .map_err(|_| crate::processes::tool_host::ToolAccessError::Unavailable)?;
+        Ok(PinnedFlowSnapshot {
+            flow_id: tentaflow_protocol::processes::tool_source_ref(addon_id, tool_name),
+            source_version: 0,
+            graph_json,
+            graph_sha256,
+        })
     }
 
     /// Zwraca `AddonFlowRegistry` jesli `set_addon_resolver` zostalo wolane.
@@ -2013,7 +2086,8 @@ pub(crate) fn all_flow_origins() -> Vec<FlowOrigin> {
             FlowOrigin::Mesh => FlowOrigin::Agent,
             FlowOrigin::Agent => FlowOrigin::System,
             FlowOrigin::System => FlowOrigin::Bus,
-            FlowOrigin::Bus => FlowOrigin::Chat,
+            FlowOrigin::Bus => FlowOrigin::Process,
+            FlowOrigin::Process => FlowOrigin::Chat,
         }
     }
     walk_variant_cycle(FlowOrigin::Chat, after, |origin| origin as usize)
@@ -2382,6 +2456,7 @@ mod tests {
                 FlowOrigin::Agent => "agent",
                 FlowOrigin::System => "system",
                 FlowOrigin::Bus => "bus",
+                FlowOrigin::Process => "process",
             };
             assert_eq!(origin.as_str(), slug);
         }

@@ -635,6 +635,8 @@ pub enum ProcessNodeKind {
         timeout_seconds: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result_expression: Option<String>,
+        #[serde(default, skip_serializing_if = "ServiceImplementation::is_flow")]
+        implementation: ServiceImplementation,
     },
     ExclusiveGateway {
         default_flow_id: Option<String>,
@@ -814,6 +816,79 @@ pub struct ProcessWorkingTimeSummary {
     pub tzdb_release_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_offset_seconds: Option<i32>,
+}
+
+/// What a Service task runs. `Flow` is the original behaviour and is never
+/// serialized, so every model published before other implementations existed
+/// keeps its exact bytes (and therefore its pinned SHA-256). New variants are
+/// appended; the tag is the variant NAME.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub enum ServiceImplementation {
+    #[default]
+    Flow,
+    AddonTool {
+        addon_id: String,
+        tool_name: String,
+    },
+}
+
+impl ServiceImplementation {
+    pub fn is_flow(&self) -> bool {
+        matches!(self, Self::Flow)
+    }
+
+    pub fn kind(&self) -> ServiceImplementationKind {
+        match self {
+            Self::Flow => ServiceImplementationKind::Flow,
+            Self::AddonTool { .. } => ServiceImplementationKind::AddonTool,
+        }
+    }
+
+    /// Stable reference to the implementation, stored in the immutable
+    /// invocation row and in the publication pin: the Flow id itself for a
+    /// Flow, `tool:<addon>/<tool>` for an addon tool. Flow ids are UUIDs and
+    /// tool identifiers cannot contain `/` or `:`, so the forms never collide.
+    pub fn source_ref(&self, flow_id: &str) -> String {
+        match self {
+            Self::Flow => flow_id.to_owned(),
+            Self::AddonTool { addon_id, tool_name } => tool_source_ref(addon_id, tool_name),
+        }
+    }
+}
+
+/// `tool:<addon>/<tool>` — see [`ServiceImplementation::source_ref`].
+pub fn tool_source_ref(addon_id: &str, tool_name: &str) -> String {
+    format!("tool:{addon_id}/{tool_name}")
+}
+
+/// Splits a `tool:<addon>/<tool>` reference; `None` for a Flow id.
+pub fn parse_tool_source_ref(source_ref: &str) -> Option<(&str, &str)> {
+    source_ref.strip_prefix("tool:")?.split_once('/')
+}
+
+/// Persisted discriminator of [`ServiceImplementation`] (pins and invocation
+/// rows). `Flow` is the default so rows written before it existed read back
+/// unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceImplementationKind {
+    #[default]
+    Flow,
+    AddonTool,
+}
+
+impl ServiceImplementationKind {
+    pub fn is_flow(&self) -> bool {
+        matches!(self, Self::Flow)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Flow => "flow",
+            Self::AddonTool => "addon_tool",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -2833,5 +2908,106 @@ mod tests {
         let json = serde_json::to_value(empty).unwrap();
         assert_eq!(json["calls"], serde_json::json!([]));
         assert!(json.get("terminal_error").is_none());
+    }
+
+    /// The shape every published model had before `implementation` existed.
+    /// Published models are pinned by the SHA-256 of their serialized bytes, so
+    /// a Flow task must keep producing exactly these bytes.
+    #[derive(Serialize)]
+    enum LegacyNodeKind {
+        ServiceTask {
+            flow_id: String,
+            input_mapping: BTreeMap<String, String>,
+            output_mapping: BTreeMap<String, String>,
+            verification: ActivityVerification,
+            timeout_seconds: u32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            result_expression: Option<String>,
+        },
+    }
+
+    fn flow_service_task(result_expression: Option<&str>) -> (ProcessNodeKind, LegacyNodeKind) {
+        let input: BTreeMap<String, String> = [("a".to_owned(), "vars.a".to_owned())].into();
+        let output: BTreeMap<String, String> = [("b".to_owned(), "outputs.payload".to_owned())].into();
+        (
+            ProcessNodeKind::ServiceTask {
+                flow_id: "flow-1".into(),
+                input_mapping: input.clone(),
+                output_mapping: output.clone(),
+                verification: ActivityVerification::Condition { expression: "true".into() },
+                timeout_seconds: 30,
+                result_expression: result_expression.map(str::to_owned),
+                implementation: ServiceImplementation::Flow,
+            },
+            LegacyNodeKind::ServiceTask {
+                flow_id: "flow-1".into(),
+                input_mapping: input,
+                output_mapping: output,
+                verification: ActivityVerification::Condition { expression: "true".into() },
+                timeout_seconds: 30,
+                result_expression: result_expression.map(str::to_owned),
+            },
+        )
+    }
+
+    #[test]
+    fn flow_service_task_keeps_its_pre_implementation_bytes() {
+        for expression in [None, Some("outputs.payload")] {
+            let (current, legacy) = flow_service_task(expression);
+            assert_eq!(serde_json::to_string(&current).unwrap(), serde_json::to_string(&legacy).unwrap());
+            assert_eq!(crate::cbor::encode(&current).unwrap(), crate::cbor::encode(&legacy).unwrap());
+            let old_json = serde_json::to_string(&legacy).unwrap();
+            assert!(!old_json.contains("implementation"));
+            let decoded: ProcessNodeKind = serde_json::from_str(&old_json).unwrap();
+            assert_eq!(decoded, current);
+            let decoded: ProcessNodeKind =
+                crate::cbor::decode(&crate::cbor::encode(&legacy).unwrap()).unwrap();
+            assert_eq!(decoded, current);
+        }
+        assert_eq!(
+            serde_json::to_string(&flow_service_task(None).0).unwrap(),
+            r#"{"ServiceTask":{"flow_id":"flow-1","input_mapping":{"a":"vars.a"},"output_mapping":{"b":"outputs.payload"},"verification":{"Condition":{"expression":"true"}},"timeout_seconds":30}}"#
+        );
+    }
+
+    #[test]
+    fn addon_tool_service_task_round_trips_and_rejects_unknown_fields() {
+        let (flow, _) = flow_service_task(None);
+        let ProcessNodeKind::ServiceTask {
+            input_mapping, output_mapping, verification, timeout_seconds, ..
+        } = flow else { unreachable!() };
+        let tool = ProcessNodeKind::ServiceTask {
+            flow_id: String::new(),
+            input_mapping,
+            output_mapping,
+            verification,
+            timeout_seconds,
+            result_expression: None,
+            implementation: ServiceImplementation::AddonTool {
+                addon_id: "notes-1a2b3c4d".into(),
+                tool_name: "search".into(),
+            },
+        };
+        let json = serde_json::to_value(&tool).unwrap();
+        assert_eq!(json["ServiceTask"]["implementation"],
+            serde_json::json!({"AddonTool":{"addon_id":"notes-1a2b3c4d","tool_name":"search"}}));
+        assert_eq!(serde_json::from_value::<ProcessNodeKind>(json).unwrap(), tool);
+        assert_eq!(crate::cbor::decode::<ProcessNodeKind>(&crate::cbor::encode(&tool).unwrap()).unwrap(), tool);
+        assert!(serde_json::from_value::<ServiceImplementation>(serde_json::json!(
+            {"AddonTool":{"addon_id":"a","tool_name":"t","extra":1}})).is_err());
+    }
+
+    #[test]
+    fn implementation_source_ref_separates_flows_from_tools() {
+        assert_eq!(ServiceImplementation::Flow.source_ref("f-1"), "f-1");
+        assert_eq!(
+            ServiceImplementation::AddonTool { addon_id: "a-1".into(), tool_name: "t".into() }
+                .source_ref(""),
+            "tool:a-1/t"
+        );
+        assert_eq!(parse_tool_source_ref("tool:a-1/t"), Some(("a-1", "t")));
+        assert_eq!(parse_tool_source_ref("2f0c8f64-0000"), None);
+        assert_eq!(ServiceImplementationKind::AddonTool.as_str(), "addon_tool");
+        assert_eq!(ServiceImplementationKind::default().as_str(), "flow");
     }
 }

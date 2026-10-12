@@ -211,6 +211,30 @@ test('BPMN typed save retains mapping and variable business keys', { skip }, () 
   assert.equal(Object.hasOwn(body.model.nodes[1].kind.ServiceTask, 'timeout_seconds'), false);
 });
 
+test('service task implementation is sent only for tools and a Flow task keeps its bytes', { skip }, () => {
+  const task = (extra) => ({ id: 'Service_1', name: 'Service', kind: { ServiceTask: {
+    flowId: 'f1', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60, ...extra } } });
+  const save = (node) => request('processDefinitionSaveRequest', { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Tool', description: '', model: { schemaVersion: 1, processId: 'P_1',
+      variables: {}, nodes: [node], sequenceFlows: [], diagram: { shapes: [], edges: [] } } });
+  const encode = (node) => codec.encode.processDefinitionSaveRequest(17, { commandId: 'cmd', definitionId: null,
+    expectedRevision: 0, name: 'Tool', description: '', model: { schemaVersion: 1, processId: 'P_1',
+      variables: {}, nodes: [node], sequenceFlows: [], diagram: { shapes: [], edges: [] } } });
+  const plain = encode(task({}));
+  assert.deepEqual(encode(task({ implementation: 'Flow' })), plain);
+  assert.deepEqual(encode(task({ implementation: null })), plain);
+  assert.equal(Object.hasOwn(save(task({})).model.nodes[0].kind.ServiceTask, 'implementation'), false);
+  const tool = save(task({ flowId: '', implementation: { AddonTool: { addonId: 'notes-1', toolName: 'search' } } }));
+  assert.deepEqual(tool.model.nodes[0].kind.ServiceTask.implementation,
+    { AddonTool: { addonId: 'notes-1', toolName: 'search' } });
+  assert.equal(tool.model.nodes[0].kind.ServiceTask.flowId, '');
+  assert.throws(() => encode(task({ implementation: { Agent: {} } })), /unsupported service implementation/);
+  assert.throws(() => encode(task({ implementation: { AddonTool: { addonId: 'a', toolName: 't', extra: 1 } } })),
+    /unsupported addon tool field/);
+  assert.throws(() => encode(task({ implementation: { AddonTool: { addonId: 'a' } } })),
+    /requires an addon id and a tool name/);
+});
+
 test('embedded subprocess wire preserves nested graph and opaque local variable keys', { skip }, () => {
   const body = { nodes: [
     { id: 'Child_Start', name: 'Enter', kind: 'Start' },

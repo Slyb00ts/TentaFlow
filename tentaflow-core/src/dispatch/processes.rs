@@ -4,7 +4,7 @@ use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::processes::{
     PinnedFlowInfo, ProcessNodeKind, ProcessOptionFlow, ProcessOptionUser, ProcessPayload as P,
     ProcessSimulationClock, ProcessSimulationEvent, ProcessSimulationSource,
-    ProcessSimulationTraceStep, ProcessSimulationView,
+    ProcessSimulationTraceStep, ProcessSimulationView, ServiceImplementation,
 };
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth};
 
@@ -284,16 +284,36 @@ pub fn process_dispatch(
             crate::processes::model::validate_model(&definition.model).map_err(error)?;
             let mut snapshots = Vec::new();
             for node in crate::processes::model::all_nodes(&definition.model) {
-                if let ProcessNodeKind::ServiceTask { flow_id, .. } = &node.kind {
+                if let ProcessNodeKind::ServiceTask {
+                    flow_id,
+                    implementation,
+                    ..
+                } = &node.kind
+                {
                     let executor = dispatcher(ctx)?;
-                    let meta = executor
-                        .authorize_process_flow(flow_id, &actor.user_id, &actor.org_id)
-                        .map_err(|error| {
-                            ProtocolError::new(ProtocolErrorCode::PolicyDenied, error.to_string())
-                        })?;
-                    let pinned = executor
-                        .snapshot_flow(flow_id, &meta)
-                        .map_err(|error| ProtocolError::bad_request(error.to_string()))?;
+                    let pinned = match implementation {
+                        ServiceImplementation::Flow => {
+                            let meta = executor
+                                .authorize_process_flow(flow_id, &actor.user_id, &actor.org_id)
+                                .map_err(|error| {
+                                    ProtocolError::new(
+                                        ProtocolErrorCode::PolicyDenied,
+                                        error.to_string(),
+                                    )
+                                })?;
+                            executor
+                                .snapshot_flow(flow_id, &meta)
+                                .map_err(|error| ProtocolError::bad_request(error.to_string()))?
+                        }
+                        ServiceImplementation::AddonTool { addon_id, tool_name } => executor
+                            .snapshot_process_tool(addon_id, tool_name, &actor.user_id, &actor.org_id)
+                            .map_err(|error| {
+                                ProtocolError::new(
+                                    ProtocolErrorCode::PolicyDenied,
+                                    error.to_string(),
+                                )
+                            })?,
+                    };
                     snapshots.push(PinnedServiceSnapshot {
                         info: PinnedFlowInfo {
                             node_id: node.id.clone(),
@@ -302,6 +322,8 @@ pub fn process_dispatch(
                             graph_sha256: pinned.graph_sha256,
                         },
                         graph_json: pinned.graph_json,
+                        role: Default::default(),
+                        implementation_kind: implementation.kind(),
                     });
                 }
             }

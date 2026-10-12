@@ -20,6 +20,7 @@ use tentaflow_protocol::processes::{
     ProcessOutputAssociation, ProcessParticipant, ProcessPoint, ProcessRepeatSpec,
     ProcessSequenceFlow, ProcessShape, ProcessSignalDeclaration, ProcessSubProcess,
     ProcessTextAnnotation, ProcessTimerSpec, ProcessWorkCalendar,
+    ServiceImplementation,
 };
 
 use super::model::{
@@ -2503,7 +2504,14 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
             let service = ext
                 .child(TF, "service")?
                 .expect("validated service extension");
-            service.attrs_only(&["flowId", "timeoutSeconds", "verification"])?;
+            service.attrs_only(&[
+                "flowId",
+                "implementation",
+                "addonId",
+                "toolName",
+                "timeoutSeconds",
+                "verification",
+            ])?;
             service.children_only(&[
                 (TF, "inputMapping"),
                 (TF, "outputMapping"),
@@ -2544,8 +2552,34 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                     "human verification cannot have condition"
                 );
             }
+            let (flow_id, implementation) = match service.attr("implementation").unwrap_or("flow") {
+                "flow" => {
+                    ensure!(
+                        service.attr("addonId").is_none() && service.attr("toolName").is_none(),
+                        "flow service cannot name an addon tool"
+                    );
+                    (service.required("flowId")?, ServiceImplementation::Flow)
+                }
+                "tool" => {
+                    ensure!(
+                        service.attr("flowId").is_none(),
+                        "tool service cannot name a flow"
+                    );
+                    (
+                        String::new(),
+                        ServiceImplementation::AddonTool {
+                            addon_id: service.required("addonId")?,
+                            tool_name: service.required("toolName")?,
+                        },
+                    )
+                }
+                other => bail!(
+                    "unsupported service implementation {other} at byte {}",
+                    service.offset
+                ),
+            };
             ProcessNodeKind::ServiceTask {
-                flow_id: service.required("flowId")?,
+                flow_id,
                 input_mapping: mapping(service, "inputMapping")?,
                 output_mapping: mapping(service, "outputMapping")?,
                 verification,
@@ -2554,6 +2588,7 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                     .parse()
                     .context("invalid service timeout")?,
                 result_expression,
+                implementation,
             }
         }
         "subProcess" => {
@@ -4611,13 +4646,22 @@ fn write_graph(
                 verification,
                 timeout_seconds,
                 result_expression,
+                implementation,
             } => {
                 let verify = if matches!(verification, ActivityVerification::Human) {
                     "human"
                 } else {
                     "condition"
                 };
-                xml.push_str(&format!("><bpmn:extensionElements><tentaflow:service flowId=\"{}\" timeoutSeconds=\"{timeout_seconds}\" verification=\"{verify}\">",escaped(flow_id)));
+                let source = match implementation {
+                    ServiceImplementation::Flow => format!("flowId=\"{}\"", escaped(flow_id)),
+                    ServiceImplementation::AddonTool { addon_id, tool_name } => format!(
+                        "implementation=\"tool\" addonId=\"{}\" toolName=\"{}\"",
+                        escaped(addon_id),
+                        escaped(tool_name)
+                    ),
+                };
+                xml.push_str(&format!("><bpmn:extensionElements><tentaflow:service {source} timeoutSeconds=\"{timeout_seconds}\" verification=\"{verify}\">"));
                 if !input_mapping.is_empty() {
                     xml.push_str(&format!(
                         "<tentaflow:inputMapping>{}</tentaflow:inputMapping>",
@@ -5451,6 +5495,7 @@ mod tests {
                 verification: ActivityVerification::Human,
                 timeout_seconds: 60,
                 result_expression: Some("vars.business_result".into()),
+                implementation: Default::default(),
             },
         });
         model.nodes.push(ProcessNode {
@@ -5630,6 +5675,7 @@ mod tests {
                     verification: ActivityVerification::Human,
                     timeout_seconds: 60,
                     result_expression: Some("outputs.result".into()),
+                    implementation: Default::default(),
                 },
             },
             ProcessNode {
@@ -5857,6 +5903,7 @@ mod tests {
                     verification: ActivityVerification::Human,
                     timeout_seconds: 60,
                     result_expression: None,
+                    implementation: Default::default(),
                 },
             },
             ProcessNode {
@@ -6285,6 +6332,7 @@ mod tests {
                 },
                 timeout_seconds: 60,
                 result_expression: None,
+                implementation: Default::default(),
             },
         });
         model.sequence_flows[0].target_id = "Review_1".into();
@@ -6427,6 +6475,7 @@ mod tests {
                 },
                 timeout_seconds: 60,
                 result_expression: None,
+                implementation: Default::default(),
             },
         });
         model.sequence_flows[0].target_id = "Service_1".into();
@@ -7007,6 +7056,7 @@ mod tests {
             verification: ActivityVerification::Human,
             timeout_seconds: 60,
             result_expression: None,
+            implementation: Default::default(),
         };
         model.nodes[1].repeat = Some(ProcessRepeatSpec::MultiInstance {
             mode: ProcessMultiInstanceMode::Sequential,
@@ -7035,6 +7085,7 @@ mod tests {
                 verification: ActivityVerification::Human,
                 timeout_seconds: 60,
                 result_expression: None,
+                implementation: Default::default(),
             },
             ProcessNodeKind::ManualTask {
                 assignee_user_id: None,

@@ -6,13 +6,17 @@ use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
-use tentaflow_protocol::processes::{ActivityOutcome, ActivityResult, ProcessNodeKind};
+use tentaflow_protocol::processes::{
+    ActivityOutcome, ActivityResult, ProcessNodeKind, ServiceImplementation,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::repository::{
     self, ActivityResultOrigin, ClaimedProcessJob, ExpressionObservation, ObservedActivityResult,
+    PinnedServiceRole,
 };
 use super::runtime::{plan_job_result, validate_output};
+use super::tool_host::{check_tool_arguments, tool_arguments, ToolAccessError};
 use crate::db::DbPool;
 use crate::flow_engine::dispatcher::{DispatchError, FlowDispatcher, PinnedFlowSnapshot};
 use crate::flow_engine::envelope::{FlowEnvelope, FlowExecutionOutcome, FlowValue};
@@ -80,42 +84,89 @@ fn observed_result(
 ) -> ObservedActivityResult {
     let platform_error = outcome.error.is_some();
     match normalize_outcome(outcome) {
-        Err(error) => ObservedActivityResult {
-            result: failure("OUTPUT_LIMIT", error.to_string()),
-            origin: ActivityResultOrigin::Platform,
-            expression_observation: None,
-        },
-        Ok(result) if platform_error => ObservedActivityResult {
+        Err(error) => output_limit_result(error),
+        Ok(result) => classify_result(result, platform_error, expression, variables, extra),
+    }
+}
+
+fn output_limit_result(error: anyhow::Error) -> ObservedActivityResult {
+    ObservedActivityResult {
+        result: failure("OUTPUT_LIMIT", error.to_string()),
+        origin: ActivityResultOrigin::Platform,
+        expression_observation: None,
+    }
+}
+
+/// The result of an addon tool call. A returned value is the activity output
+/// under `result`; a failed call is a platform `TOOL_ERROR` result, so the
+/// process decides what a failure means. As for a Flow, only a
+/// `result_expression` can turn the output into a business result.
+fn observed_tool_result(
+    outcome: std::result::Result<Value, String>,
+    tool_ref: &str,
+    expression: Option<&str>,
+    variables: &Value,
+    extra: &[(String, Value)],
+) -> ObservedActivityResult {
+    match outcome {
+        Err(message) => classify_result(failure("TOOL_ERROR", message), true, expression, variables, extra),
+        Ok(value) => {
+            let outputs = json!({ "result": value });
+            if let Err(error) = validate_output(&outputs) {
+                return output_limit_result(error);
+            }
+            let result = ActivityResult {
+                outcome: ActivityOutcome::Completed,
+                code: None,
+                summary: "The addon tool returned a result".into(),
+                outputs,
+                evidence: vec![format!("addon_tool:{tool_ref}")],
+            };
+            classify_result(result, false, expression, variables, extra)
+        }
+    }
+}
+
+/// Decides the origin of a normalized result: anything the platform produced
+/// is `Platform`, an unexpressed success is `Envelope`, and only a
+/// `result_expression` can yield a `Contract` result.
+fn classify_result(
+    result: ActivityResult,
+    platform_error: bool,
+    expression: Option<&str>,
+    variables: &Value,
+    extra: &[(String, Value)],
+) -> ObservedActivityResult {
+    if platform_error {
+        return ObservedActivityResult {
             result,
             origin: ActivityResultOrigin::Platform,
             expression_observation: None,
+        };
+    }
+    let Some(expression) = expression else {
+        return ObservedActivityResult {
+            result,
+            origin: ActivityResultOrigin::Envelope,
+            expression_observation: None,
+        };
+    };
+    let expression_observation = ExpressionObservation {
+        normalized_outputs: result.outputs.clone(),
+        evaluation_variables: variables.clone(),
+    };
+    match super::runtime::evaluate(expression, variables, &result.outputs, extra)
+        .and_then(parse_contract_result)
+    {
+        Ok(result) => ObservedActivityResult {
+            result,
+            origin: ActivityResultOrigin::Contract,
+            expression_observation: Some(expression_observation),
         },
-        Ok(result) => match expression {
-            None => ObservedActivityResult {
-                result,
-                origin: ActivityResultOrigin::Envelope,
-                expression_observation: None,
-            },
-            Some(expression) => {
-                let expression_observation = ExpressionObservation {
-                    normalized_outputs: result.outputs.clone(),
-                    evaluation_variables: variables.clone(),
-                };
-                match super::runtime::evaluate(expression, variables, &result.outputs, extra)
-                    .and_then(parse_contract_result)
-                {
-                    Ok(result) => ObservedActivityResult {
-                        result,
-                        origin: ActivityResultOrigin::Contract,
-                        expression_observation: Some(expression_observation),
-                    },
-                    Err(error) => ObservedActivityResult {
-                        result: failure("RESULT_EXPRESSION_ERROR", format!("{error:#}")),
-                        origin: ActivityResultOrigin::Platform,
-                        expression_observation: None,
-                    },
-                }
-            }
+        Err(error) => ObservedActivityResult {
+            result: failure("RESULT_EXPRESSION_ERROR", format!("{error:#}")),
+            origin: ActivityResultOrigin::Platform,
+            expression_observation: None,
         },
     }
 }
@@ -183,6 +234,39 @@ fn script_infrastructure(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<InfrastructureExprError>())
 }
 
+/// Everything the shared claim/dispatch/observation machinery needs, whatever
+/// the Service task runs.
+struct ServiceJob<'a> {
+    pool: &'a DbPool,
+    dispatcher: &'a Arc<FlowDispatcher>,
+    worker_id: &'a str,
+    claimed: &'a ClaimedProcessJob,
+    cancel: &'a CancellationToken,
+    timeout: Duration,
+    result_expression: Option<&'a str>,
+    effective: &'a Value,
+    repeat_extra: &'a [(String, Value)],
+}
+
+/// Re-checks, before and during execution, that the initiator may still use
+/// the task's source. The message is only ever stored with the failure.
+type Authorize<'a> = &'a (dyn Fn() -> Result<(), String> + Send + Sync);
+
+/// How an executor's work ended, before the shared machinery decides what the
+/// job does with it.
+enum ExecutionEnd {
+    /// The source produced a result. `recheck` asks for the initiator's access
+    /// to be confirmed first, for results that may be a symptom of a revocation.
+    Observed {
+        result: Box<ObservedActivityResult>,
+        recheck: bool,
+    },
+    /// No result: the job fails with `code` unless access was revoked.
+    Failed { code: &'static str, message: String },
+    /// The source refused the initiator.
+    Revoked(String),
+}
+
 pub async fn execute_claimed(
     pool: &DbPool,
     dispatcher: &Arc<FlowDispatcher>,
@@ -224,8 +308,10 @@ pub async fn execute_claimed(
     };
     let ProcessNodeKind::ServiceTask {
         flow_id,
+        input_mapping,
         timeout_seconds,
         result_expression,
+        implementation,
         ..
     } = &node.kind
     else {
@@ -238,12 +324,43 @@ pub async fn execute_claimed(
             None,
         );
     };
+    let source_ref = implementation.source_ref(flow_id);
     let snapshot = claimed
         .snapshot
         .service_snapshots
         .iter()
-        .find(|snapshot| snapshot.info.node_id == node.id && snapshot.info.flow_id == *flow_id)
+        .find(|snapshot| {
+            snapshot.info.node_id == node.id
+                && snapshot.role == PinnedServiceRole::Implementation
+                && snapshot.implementation_kind == implementation.kind()
+                && snapshot.info.flow_id == source_ref
+        })
         .context("pinned service graph missing")?;
+    let job = ServiceJob {
+        pool,
+        dispatcher,
+        worker_id,
+        claimed: &claimed,
+        cancel: &cancel,
+        timeout: Duration::from_secs(u64::from(*timeout_seconds)),
+        result_expression: result_expression.as_deref(),
+        effective: &effective,
+        repeat_extra: &repeat_extra,
+    };
+    match implementation {
+        ServiceImplementation::Flow => execute_flow(&job, snapshot, flow_id).await,
+        ServiceImplementation::AddonTool { addon_id, tool_name } => {
+            execute_tool(&job, addon_id, tool_name, input_mapping).await
+        }
+    }
+}
+
+async fn execute_flow(
+    job: &ServiceJob<'_>,
+    snapshot: &repository::PinnedServiceSnapshot,
+    flow_id: &str,
+) -> Result<()> {
+    let ServiceJob { pool, dispatcher, worker_id, claimed, cancel, .. } = *job;
     let pinned = PinnedFlowSnapshot {
         flow_id: snapshot.info.flow_id.clone(),
         source_version: snapshot.info.source_version,
@@ -251,10 +368,16 @@ pub async fn execute_claimed(
         graph_sha256: snapshot.info.graph_sha256.clone(),
     };
     if let Err(error) = crate::flow_engine::node_adapters::activity_result::validate_process_result_binding(
-        &pinned.graph_json, result_expression.as_deref())
+        &pinned.graph_json, job.result_expression)
     {
-        return fail_claim(pool, worker_id, &claimed, "INVALID_SERVICE_JOB", error, None);
+        return fail_claim(pool, worker_id, claimed, "INVALID_SERVICE_JOB", error, None);
     }
+    let authorize = || {
+        dispatcher
+            .authorize_process_flow(flow_id, &claimed.actor.user_id, &claimed.actor.org_id)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    };
     let mut meta = match dispatcher.authorize_process_flow(
         flow_id,
         &claimed.actor.user_id,
@@ -265,7 +388,7 @@ pub async fn execute_claimed(
             return fail_claim(
                 pool,
                 worker_id,
-                &claimed,
+                claimed,
                 "SOURCE_ACCESS_REVOKED",
                 error,
                 None,
@@ -275,7 +398,7 @@ pub async fn execute_claimed(
     meta.request_id = claimed.request_id.clone();
     meta.correlation_id = Some(claimed.job.instance_id.clone());
     meta.cancel_token = cancel.clone();
-    meta.deadline = Some(Instant::now() + Duration::from_secs(u64::from(*timeout_seconds)));
+    meta.deadline = Some(Instant::now() + job.timeout);
     let mut envelope = FlowEnvelope::empty();
     envelope.payload = FlowValue::Json(
         claimed
@@ -295,18 +418,175 @@ pub async fn execute_claimed(
         .map(|(key, value)| (key.clone(), FlowValue::Json(value.clone())))
         .collect();
 
+    if !begin_dispatch(job)? {
+        return Ok(());
+    }
+    let execution = async {
+        match dispatcher.dispatch_pinned_flow(&pinned, envelope, meta).await {
+            Ok(outcome) if outcome.error.is_none() => ExecutionEnd::Observed {
+                result: Box::new(observed_result(
+                    outcome,
+                    job.result_expression,
+                    job.effective,
+                    job.repeat_extra,
+                )),
+                recheck: false,
+            },
+            Ok(outcome) => ExecutionEnd::Failed {
+                code: "FLOW_ERROR",
+                message: outcome
+                    .error
+                    .unwrap_or_else(|| "external effect unconfirmed".to_owned()),
+            },
+            Err(error @ DispatchError::Denied { .. }) => ExecutionEnd::Revoked(error.to_string()),
+            Err(error) => ExecutionEnd::Failed {
+                code: "FLOW_ERROR",
+                message: error.to_string(),
+            },
+        }
+    };
+    let Some(result) = drive_dispatch(job, &authorize, execution).await? else {
+        return Ok(());
+    };
+    finish_observed(job, &authorize, result)
+}
+
+/// Runs an addon tool on the instance initiator's behalf.
+///
+/// The WASM call blocks a thread and cannot be interrupted: cancellation, a
+/// timeout or a lost lease abandon the wait, not the call. After a timeout the
+/// tool may therefore still complete its effect, which is the `uncertain`
+/// outcome the dispatch boundary already records.
+async fn execute_tool(
+    job: &ServiceJob<'_>,
+    addon_id: &str,
+    tool_name: &str,
+    input_mapping: &BTreeMap<String, String>,
+) -> Result<()> {
+    let ServiceJob { pool, dispatcher, worker_id, claimed, .. } = *job;
+    let (user_id, org_id) = (&claimed.actor.user_id, &claimed.actor.org_id);
+    let authorize_tool =
+        || dispatcher.authorize_process_tool(addon_id, tool_name, user_id, org_id);
+    let authorize = || authorize_tool().map(|_| ()).map_err(|error| error.to_string());
+    let descriptor = match authorize_tool() {
+        Ok(descriptor) => Some(descriptor),
+        Err(ToolAccessError::PermissionDenied) => None,
+        Err(error) => {
+            return fail_claim(pool, worker_id, claimed, "SOURCE_ACCESS_REVOKED", error, None)
+        }
+    };
+    let host = dispatcher.process_tool_host();
+    let arguments = match &descriptor {
+        Some(descriptor) => {
+            let checked = tool_arguments(&claimed.job.input, input_mapping)
+                .and_then(|arguments| {
+                    check_tool_arguments(&descriptor.input_schema, &arguments)?;
+                    Ok(arguments)
+                });
+            match checked {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    return fail_claim(
+                        pool,
+                        worker_id,
+                        claimed,
+                        "TOOL_ARGUMENTS_INVALID",
+                        error,
+                        None,
+                    )
+                }
+            }
+        }
+        None => Value::Null,
+    };
+
+    if !begin_dispatch(job)? {
+        return Ok(());
+    }
+    let Some(_) = descriptor else {
+        // A permission is something a person can grant, so the task becomes
+        // human work instead of an incident. Nothing was called.
+        let result = ObservedActivityResult {
+            result: ActivityResult {
+                outcome: ActivityOutcome::NeedsHuman,
+                code: Some("TOOL_PERMISSION_DENIED".into()),
+                summary: "The process initiator may not call this addon tool".into(),
+                outputs: json!({}),
+                evidence: Vec::new(),
+            },
+            origin: ActivityResultOrigin::Platform,
+            expression_observation: None,
+        };
+        // The denial is the very thing being reported, so publishing it must
+        // not be blocked by it; every other loss of access still blocks.
+        let authorize_reporting_denial = || match authorize_tool() {
+            Err(ToolAccessError::PermissionDenied) => Ok(()),
+            other => other.map(|_| ()).map_err(|error| error.to_string()),
+        };
+        return finish_observed(job, &authorize_reporting_denial, result);
+    };
+    let host = host.context("addon tool host disappeared after authorization")?;
+    let execution = async {
+        let call = {
+            let (addon, tool, user, org, request) = (
+                addon_id.to_owned(),
+                tool_name.to_owned(),
+                user_id.clone(),
+                org_id.clone(),
+                claimed.request_id.clone(),
+            );
+            tokio::task::spawn_blocking(move || host.call(&addon, &tool, arguments, &user, &org, &request))
+        };
+        let outcome = match call.await {
+            Ok(outcome) => outcome.map_err(|error| format!("{error:#}")),
+            Err(join) => Err(format!("addon tool call did not finish: {join}")),
+        };
+        let recheck = outcome.is_err();
+        ExecutionEnd::Observed {
+            result: Box::new(observed_tool_result(
+                outcome,
+                &tentaflow_protocol::processes::tool_source_ref(addon_id, tool_name),
+                job.result_expression,
+                job.effective,
+                job.repeat_extra,
+            )),
+            recheck,
+        }
+    };
+    let Some(result) = drive_dispatch(job, &authorize, execution).await? else {
+        return Ok(());
+    };
+    finish_observed(job, &authorize, result)
+}
+
+/// Cancellation check, lease confirmation and the committed dispatch boundary,
+/// which precedes the first poll of any external effect. `false` means the job
+/// was failed or lost and the caller must stop.
+fn begin_dispatch(job: &ServiceJob<'_>) -> Result<bool> {
+    let ServiceJob { pool, worker_id, claimed, cancel, .. } = *job;
     // Cancellation may commit between the claim and running-handle registration.
     // Check the durable claim after registration, before polling the executor.
     if cancel.is_cancelled() {
-        return fail_claim(
+        fail_claim(
             pool,
             worker_id,
-            &claimed,
+            claimed,
             "INTERRUPTED",
             "the worker was cancelled before executing the service task",
             None,
-        );
+        )?;
+        return Ok(false);
     }
+    if !renew_lease(job)? {
+        return Ok(false);
+    }
+    repository::commit_job_dispatch_boundary(pool, claimed, worker_id, now_ms())
+}
+
+/// Extends the lease. On a lost lease or a repository error the worker is
+/// cancelled and the claim failed; `false` then means "stop".
+fn renew_lease(job: &ServiceJob<'_>) -> Result<bool> {
+    let ServiceJob { pool, worker_id, claimed, cancel, .. } = *job;
     match repository::renew_job_lease(
         pool,
         &claimed.job.job_id,
@@ -315,102 +595,103 @@ pub async fn execute_claimed(
         worker_id,
         now_ms(),
     ) {
-        Ok(true) => {}
+        Ok(true) => Ok(true),
         Ok(false) => {
             cancel.cancel();
-            return fail_claim(
+            fail_claim(
                 pool,
                 worker_id,
-                &claimed,
+                claimed,
                 "LEASE_LOST",
                 "service job no longer owns its execution lease",
                 None,
-            );
+            )?;
+            Ok(false)
         }
         Err(error) => {
             cancel.cancel();
-            return fail_claim(
-                pool,
-                worker_id,
-                &claimed,
-                "SOURCE_ACCESS_REVOKED",
-                error,
-                None,
-            );
+            fail_claim(pool, worker_id, claimed, "SOURCE_ACCESS_REVOKED", error, None)?;
+            Ok(false)
         }
     }
+}
 
-    // The committed boundary precedes the first poll of the external adapter.
-    if !repository::commit_job_dispatch_boundary(pool, &claimed, worker_id, now_ms())? {
-        return Ok(());
-    }
+/// Waits for the execution while renewing the lease, re-checking access and
+/// honouring cancellation and the timeout. `None` means the claim was failed.
+async fn drive_dispatch(
+    job: &ServiceJob<'_>,
+    authorize: Authorize<'_>,
+    execution: impl std::future::Future<Output = ExecutionEnd>,
+) -> Result<Option<ObservedActivityResult>> {
+    let ServiceJob { pool, worker_id, claimed, cancel, .. } = *job;
     let mut renewal =
         tokio::time::interval_at(tokio::time::Instant::now() + LEASE_RENEWAL, LEASE_RENEWAL);
     renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let execution = dispatcher.dispatch_pinned_flow(&pinned, envelope, meta);
     tokio::pin!(execution);
-    let timeout = tokio::time::sleep(Duration::from_secs(u64::from(*timeout_seconds)));
+    let timeout = tokio::time::sleep(job.timeout);
     tokio::pin!(timeout);
-    let result = loop {
+    loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                return fail_claim(pool, worker_id, &claimed, "INTERRUPTED", "the worker was cancelled before its external effect was confirmed", None);
+                fail_claim(pool, worker_id, claimed, "INTERRUPTED", "the worker was cancelled before its external effect was confirmed", None)?;
+                return Ok(None);
             }
             _ = renewal.tick() => {
-                if let Err(error) = dispatcher.authorize_process_flow(flow_id, &claimed.actor.user_id, &claimed.actor.org_id) {
+                if let Err(error) = authorize() {
                     cancel.cancel();
-                    return fail_claim(pool, worker_id, &claimed, "SOURCE_ACCESS_REVOKED", error, None);
+                    fail_claim(pool, worker_id, claimed, "SOURCE_ACCESS_REVOKED", error, None)?;
+                    return Ok(None);
                 }
-                match repository::renew_job_lease(pool, &claimed.job.job_id, claimed.job.attempt, claimed.job.fence, worker_id, now_ms()) {
-                    Ok(true) => {},
-                    Ok(false) => {
-                        cancel.cancel();
-                        return fail_claim(pool, worker_id, &claimed, "LEASE_LOST", "service job no longer owns its execution lease", None);
-                    }
-                    Err(error) => {
-                        cancel.cancel();
-                        return fail_claim(pool, worker_id, &claimed, "SOURCE_ACCESS_REVOKED", error, None);
-                    }
+                if !renew_lease(job)? {
+                    return Ok(None);
                 }
             }
             _ = &mut timeout => {
                 cancel.cancel();
-                return fail_claim(pool, worker_id, &claimed, "SERVICE_TIMEOUT",
-                    "the service task exceeded its configured timeout after dispatch", None);
+                fail_claim(pool, worker_id, claimed, "SERVICE_TIMEOUT",
+                    "the service task exceeded its configured timeout after dispatch", None)?;
+                return Ok(None);
             }
-            outcome = &mut execution => {
-                break match outcome {
-                    Ok(outcome) if outcome.error.is_none() =>
-                        observed_result(outcome,result_expression.as_deref(),&effective,&repeat_extra),
-                    Ok(outcome) => {
-                        if let Err(error) = dispatcher.authorize_process_flow(
-                            flow_id, &claimed.actor.user_id, &claimed.actor.org_id,
-                        ) {
-                            return fail_claim(pool, worker_id, &claimed,
-                                "SOURCE_ACCESS_REVOKED", error, None);
+            end = &mut execution => {
+                match end {
+                    ExecutionEnd::Observed { result, recheck } => {
+                        if recheck {
+                            if let Err(error) = authorize() {
+                                fail_claim(pool, worker_id, claimed, "SOURCE_ACCESS_REVOKED", error, None)?;
+                                return Ok(None);
+                            }
                         }
-                        return fail_claim(pool, worker_id, &claimed,
-                            "FLOW_ERROR", outcome.error.as_deref().unwrap_or("external effect unconfirmed"), None);
+                        return Ok(Some(*result));
                     }
-                    Err(error @ DispatchError::Denied { .. }) => return fail_claim(pool, worker_id,
-                        &claimed, "SOURCE_ACCESS_REVOKED", error, None),
-                    Err(error) => {
-                        if let Err(denial) = dispatcher.authorize_process_flow(
-                            flow_id, &claimed.actor.user_id, &claimed.actor.org_id,
-                        ) {
-                            return fail_claim(pool, worker_id, &claimed,
-                                "SOURCE_ACCESS_REVOKED", denial, None);
+                    ExecutionEnd::Failed { code, message } => {
+                        match authorize() {
+                            Err(denial) => fail_claim(pool, worker_id, claimed,
+                                "SOURCE_ACCESS_REVOKED", denial, None)?,
+                            Ok(()) => fail_claim(pool, worker_id, claimed, code, message, None)?,
                         }
-                        return fail_claim(pool, worker_id, &claimed,
-                            "FLOW_ERROR", error, None);
+                        return Ok(None);
                     }
-                };
+                    ExecutionEnd::Revoked(message) => {
+                        fail_claim(pool, worker_id, claimed, "SOURCE_ACCESS_REVOKED", message, None)?;
+                        return Ok(None);
+                    }
+                }
             }
         }
-    };
+    }
+}
 
-    match repository::record_job_observation(pool, &claimed, worker_id, &result, now_ms())? {
+/// Records the observed result and publishes it. A revision conflict only
+/// recalculates the transition from the already observed result; it never
+/// repeats the external execution.
+fn finish_observed(
+    job: &ServiceJob<'_>,
+    authorize: Authorize<'_>,
+    result: ObservedActivityResult,
+) -> Result<()> {
+    let ServiceJob { pool, dispatcher, worker_id, claimed, .. } = *job;
+    match repository::record_job_observation(pool, claimed, worker_id, &result, now_ms())? {
         repository::JobObservationState::Observed => {}
         repository::JobObservationState::Blocked | repository::JobObservationState::Accepted => {
             return Ok(());
@@ -427,7 +708,7 @@ pub async fn execute_claimed(
                     return fail_claim(
                         pool,
                         worker_id,
-                        &claimed,
+                        claimed,
                         "SOURCE_ACCESS_REVOKED",
                         error,
                         Some(&result),
@@ -447,15 +728,11 @@ pub async fn execute_claimed(
         {
             return Ok(());
         }
-        if let Err(error) = dispatcher.authorize_process_flow(
-            flow_id,
-            &claimed.actor.user_id,
-            &claimed.actor.org_id,
-        ) {
+        if let Err(error) = authorize() {
             return fail_claim(
                 pool,
                 worker_id,
-                &claimed,
+                claimed,
                 "SOURCE_ACCESS_REVOKED",
                 error,
                 Some(&result),
@@ -483,7 +760,7 @@ pub async fn execute_claimed(
             Ok(plan) => (plan, false),
             Err(error) if script_infrastructure(&error) => {
                 repository::record_observed_script_infrastructure_failure(
-                    pool, &claimed, worker_id, &result, &error, now_ms())?;
+                    pool, claimed, worker_id, &result, &error, now_ms())?;
                 return Ok(());
             }
             Err(error) if escalation_boundary.is_some() => {
@@ -502,7 +779,7 @@ pub async fn execute_claimed(
                 return fail_claim(
                     pool,
                     worker_id,
-                    &claimed,
+                    claimed,
                     "TRANSITION_ERROR",
                     error,
                     Some(&result),
@@ -532,7 +809,7 @@ pub async fn execute_claimed(
             Err(error) if error.to_string().contains("revision conflict") => continue,
             Err(error) if script_infrastructure(&error) => {
                 repository::record_observed_script_infrastructure_failure(
-                    pool, &claimed, worker_id, &result, &error, now_ms())?;
+                    pool, claimed, worker_id, &result, &error, now_ms())?;
                 return Ok(());
             }
             Err(error)
@@ -574,14 +851,14 @@ pub async fn execute_claimed(
                     Err(conflict) if conflict.to_string().contains("revision conflict") => continue,
                     Err(failure) if script_infrastructure(&failure) => {
                         repository::record_observed_script_infrastructure_failure(
-                            pool, &claimed, worker_id, &result, &failure, now_ms())?;
+                            pool, claimed, worker_id, &result, &failure, now_ms())?;
                         return Ok(());
                     }
                     Err(failure) => {
                         return fail_claim(
                             pool,
                             worker_id,
-                            &claimed,
+                            claimed,
                             "RESULT_REJECTED",
                             failure,
                             Some(&result),
@@ -593,7 +870,7 @@ pub async fn execute_claimed(
                 return fail_claim(
                     pool,
                     worker_id,
-                    &claimed,
+                    claimed,
                     "RESULT_REJECTED",
                     error,
                     Some(&result),
@@ -604,7 +881,7 @@ pub async fn execute_claimed(
     fail_claim(
         pool,
         worker_id,
-        &claimed,
+        claimed,
         "REVISION_CONFLICT",
         "concurrent process transitions prevented result publication",
         Some(&result),
@@ -3357,6 +3634,7 @@ mod tests {
                 "service" => ProcessNodeKind::ServiceTask { flow_id: flow_id.clone(),
                     input_mapping: BTreeMap::from([("payload".into(), "vars.accepted_customer_id".into())]),
                     output_mapping: BTreeMap::new(), verification: ActivityVerification::Human,
+                    implementation: Default::default(),
                     timeout_seconds: 30, result_expression: None },
                 "timer" => ProcessNodeKind::TimerCatch { timer: ProcessTimerSpec::Duration { seconds: 30 } },
                 "message" => ProcessNodeKind::MessageCatch { message_ref: "ReviewMessage".into(),

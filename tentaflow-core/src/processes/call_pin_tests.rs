@@ -562,6 +562,8 @@ fn legacy_database() -> (tempfile::TempDir, Connection, String, String) {
             graph_sha256: hex::encode(Sha256::digest(retained_graph.as_bytes())),
         },
         graph_json: retained_graph,
+        role: Default::default(),
+        implementation_kind: Default::default(),
     };
     conn.execute(
         "UPDATE bpmn_versions SET service_snapshots_json=?1 WHERE definition_id='boundary-process' AND version=1",
@@ -629,7 +631,7 @@ fn migration_preserves_populated_legacy_call_free_rows_and_foreign_keys() {
         conn.query_row("SELECT MAX(version) FROM _migrations", [], |row| row
             .get::<_, i64>(0))
             .unwrap(),
-        200
+        201
     );
     let migrated_messages = table_rows(&conn, "bpmn_messages", "message_id");
     assert!(migrated_messages.iter().all(|row| {

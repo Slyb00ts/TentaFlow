@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tentaflow_protocol::processes::{
-    ActivityOutcome, ActivityResult, PinnedFlowInfo, ProcessCallPinInfo, ProcessCallStatus, ProcessCallSummary,
+    ActivityOutcome, ActivityResult, PinnedFlowInfo, ServiceImplementationKind, ProcessCallPinInfo, ProcessCallStatus, ProcessCallSummary,
     ProcessCallActivity, ProcessCallTarget, ProcessDefinition, ProcessDefinitionSummary, ProcessEvent, ProcessEventRaceStatus,
     ProcessEventRaceSummary, ProcessIncident, ProcessIncidentSelection, ProcessInstance,
     ProcessInstancePageInfo, ProcessInstancePageRequest, ProcessInstanceStatus,
@@ -91,6 +91,25 @@ impl std::error::Error for MessageClosed {}
 pub struct PinnedServiceSnapshot {
     pub info: PinnedFlowInfo,
     pub graph_json: String,
+    /// A node may carry several pins; the role tells the executor which one
+    /// it needs. Defaults (and is omitted) for pins that predate roles.
+    #[serde(default, skip_serializing_if = "PinnedServiceRole::is_implementation")]
+    pub role: PinnedServiceRole,
+    #[serde(default, skip_serializing_if = "ServiceImplementationKind::is_flow")]
+    pub implementation_kind: ServiceImplementationKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PinnedServiceRole {
+    #[default]
+    Implementation,
+}
+
+impl PinnedServiceRole {
+    fn is_implementation(&self) -> bool {
+        matches!(self, Self::Implementation)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1776,7 +1795,7 @@ fn timer_current_authority_on(
         |row| row.get(0),
     )?;
     for snapshot in parse::<Vec<PinnedServiceSnapshot>>(snapshots_json)? {
-        if let Err(error) = require_flow_current(conn, &actor, &snapshot.info.flow_id, None) {
+        if let Err(error) = require_source_current(conn, &actor, &snapshot.info.flow_id, None) {
             if error.downcast_ref::<ProcessAuthorityDenied>().is_some() {
                 return Ok(false);
             }
@@ -2762,7 +2781,7 @@ pub(crate) fn fire_timer_on(
             |row| row.get(0),
         )?;
         for snapshot in parse::<Vec<PinnedServiceSnapshot>>(snapshots_json)? {
-            require_flow_current(tx, actor, &snapshot.info.flow_id, None)?;
+            require_source_current(tx, actor, &snapshot.info.flow_id, None)?;
         }
         let entry = AcceptedInputRef::Timer { timer_id: timer.timer_id.clone(),
             expected_timer_revision: timer.revision,
@@ -2933,7 +2952,11 @@ fn require_owner(conn: &Connection, actor: &ProcessActor, definition_id: &str) -
     Ok(())
 }
 
-fn require_flow_current(
+/// Database-side check that the source behind a Service task still exists and
+/// the actor is still active: the Flow for a Flow task, the enabled addon for
+/// a `tool:` reference. Whether the actor may call that addon tool lives in the
+/// addon runtime and is decided by the executor.
+fn require_source_current(
     conn: &Connection,
     actor: &ProcessActor,
     flow_id: &str,
@@ -2947,6 +2970,26 @@ fn require_flow_current(
         )
         .optional()?
         .ok_or(ProcessAuthorityDenied("process actor is inactive"))?;
+    if let Some((addon_id, tool_name)) = tentaflow_protocol::processes::parse_tool_source_ref(flow_id) {
+        let bundle_hash: String = conn
+            .query_row(
+                "SELECT installed_bundle_hash FROM addons WHERE addon_id=?1 AND is_enabled=1",
+                [addon_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(ProcessAuthorityDenied("source addon is no longer enabled"))?;
+        if let Some(snapshot) = expected {
+            let pin: Value = serde_json::from_str(&snapshot.graph_json)?;
+            ensure!(
+                pin["addon_id"] == addon_id
+                    && pin["tool_name"] == tool_name
+                    && pin["bundle_hash"] == bundle_hash.as_str(),
+                "source addon tool changed before publication"
+            );
+        }
+        return Ok(());
+    }
     let (version, graph): (u32, String) = conn
         .query_row(
             "SELECT version,flow_json FROM flows WHERE id=?1 AND status='active'",
@@ -4226,10 +4269,17 @@ pub fn publish_definition(
     );
     let mut service_nodes = HashSet::new();
     for node in super::model::all_nodes(&prepared_model) {
-        if let tentaflow_protocol::processes::ProcessNodeKind::ServiceTask { flow_id, .. } =
-            &node.kind
+        if let tentaflow_protocol::processes::ProcessNodeKind::ServiceTask {
+            flow_id,
+            implementation,
+            ..
+        } = &node.kind
         {
-            service_nodes.insert((node.id.as_str(), flow_id.as_str()));
+            service_nodes.insert((
+                node.id.as_str(),
+                implementation.source_ref(flow_id),
+                implementation.kind(),
+            ));
         }
     }
     ensure!(
@@ -4239,10 +4289,12 @@ pub fn publish_definition(
     let mut covered = HashSet::new();
     for snapshot in snapshots {
         ensure!(
-            service_nodes.contains(&(
-                snapshot.info.node_id.as_str(),
-                snapshot.info.flow_id.as_str()
-            )),
+            snapshot.role == PinnedServiceRole::Implementation
+                && service_nodes.contains(&(
+                    snapshot.info.node_id.as_str(),
+                    snapshot.info.flow_id.clone(),
+                    snapshot.implementation_kind
+                )),
             "flow snapshot does not match service task"
         );
         ensure!(
@@ -4258,14 +4310,16 @@ pub fn publish_definition(
                 == hex::encode(Sha256::digest(snapshot.graph_json.as_bytes())),
             "flow snapshot hash mismatch"
         );
-        require_flow_current(&tx, actor, &snapshot.info.flow_id, Some(snapshot))?;
+        require_source_current(&tx, actor, &snapshot.info.flow_id, Some(snapshot))?;
         let service_node = super::model::all_nodes(&prepared_model).into_iter()
             .find(|node| node.id == snapshot.info.node_id)
             .context("pinned service task missing")?;
         let tentaflow_protocol::processes::ProcessNodeKind::ServiceTask { result_expression, .. } = &service_node.kind
         else { bail!("pinned node is not a service task"); };
-        crate::flow_engine::node_adapters::activity_result::validate_process_result_binding(
-            &snapshot.graph_json, result_expression.as_deref())?;
+        if snapshot.implementation_kind.is_flow() {
+            crate::flow_engine::node_adapters::activity_result::validate_process_result_binding(
+                &snapshot.graph_json, result_expression.as_deref())?;
+        }
     }
     let version = definition
         .published_version
@@ -21105,16 +21159,17 @@ fn apply_plan_on(
             &job.scope_id,
             &job.node_id,
         )?;
-        let ProcessNodeKind::ServiceTask { flow_id, .. } = &node.kind else {
+        let ProcessNodeKind::ServiceTask { flow_id, implementation, .. } = &node.kind else {
             bail!("queued job node is not a service in its scope body")
         };
-        require_flow_current(
+        let source_ref = implementation.source_ref(flow_id);
+        require_source_current(
             tx,
             &ProcessActor {
                 org_id: org_id.clone(),
                 user_id: initiator.clone(),
             },
-            flow_id,
+            &source_ref,
             None,
         )?;
         validate_output(&job.input)?;
@@ -21131,7 +21186,9 @@ fn apply_plan_on(
             [instance_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
         let snapshots: Vec<PinnedServiceSnapshot> = parse(snapshots_json)?;
         let pins = snapshots.iter().filter(|snapshot| snapshot.info.node_id == job.node_id
-            && snapshot.info.flow_id == *flow_id).collect::<Vec<_>>();
+            && snapshot.role == PinnedServiceRole::Implementation
+            && snapshot.implementation_kind == implementation.kind()
+            && snapshot.info.flow_id == source_ref).collect::<Vec<_>>();
         ensure!(pins.len() == 1
             && pins[0].info.graph_sha256 == hex::encode(Sha256::digest(pins[0].graph_json.as_bytes())),
             "new Service job has no unique immutable flow snapshot");
@@ -21139,11 +21196,12 @@ fn apply_plan_on(
             .context("queued Service job has no reserved invocation identity")?;
         ensure!(invocation_id != &job.job_id,
             "Service invocation identity must differ from its job identity");
-        tx.execute("INSERT INTO bpmn_service_invocations(invocation_id,job_id,instance_id,scope_id,node_id,token_id,definition_id,version,selected_process_id,whole_document_sha256,flow_id,pinned_flow_digest,input_sha256,stable_request_id,phase,dispatch_evidence,phase_revision,acceptance_revision,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?1,'prepared','no_boundary',1,0,?14,?14)",
+        tx.execute("INSERT INTO bpmn_service_invocations(invocation_id,job_id,instance_id,scope_id,node_id,token_id,definition_id,version,selected_process_id,whole_document_sha256,flow_id,pinned_flow_digest,input_sha256,stable_request_id,phase,dispatch_evidence,phase_revision,acceptance_revision,created_at_ms,updated_at_ms,implementation_kind) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?1,'prepared','no_boundary',1,0,?14,?14,?15)",
             params![invocation_id,job.job_id,instance_id,job.scope_id,
                 job.node_id,job.token_id,definition_id,version,selected_process_id,
-                model_sha256,flow_id,pins[0].info.graph_sha256,
-                hex::encode(Sha256::digest(input_json.as_bytes())),at_ms])?;
+                model_sha256,source_ref,pins[0].info.graph_sha256,
+                hex::encode(Sha256::digest(input_json.as_bytes())),at_ms,
+                implementation.kind().as_str()])?;
     }
     for token_id in &plan.consume_token_ids {
         let mut statement=tx.prepare("SELECT user_task_id FROM bpmn_user_tasks WHERE instance_id=?1 AND token_id=?2 AND status='open'")?;
@@ -22946,7 +23004,7 @@ fn start_instance_on(
     )?;
     let snapshots: Vec<PinnedServiceSnapshot> = parse(snapshots_json)?;
     for snapshot in &snapshots {
-        require_flow_current(tx, actor, &snapshot.info.flow_id, None)?;
+        require_source_current(tx, actor, &snapshot.info.flow_id, None)?;
     }
     tx.execute("INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms,start_timer_id,start_occurrence,selected_process_id,start_node_id) VALUES(?1,?2,?3,?4,?5,1,'running',?6,?7,?7,?8,?9,?10,?11)",params![instance_id,definition_id,version,actor.org_id,actor.user_id,json(&vars)?,at_ms,start_identity.map(|(id,_)|id),start_identity.map(|(_,slot)|sql_integer(slot)).transpose()?,selected_process_id,start.id])?;
     tx.execute(
@@ -22986,7 +23044,7 @@ pub fn apply_transition(
     )?;
     let snapshots: Vec<PinnedServiceSnapshot> = parse(snapshots_json)?;
     for snapshot in &snapshots {
-        require_flow_current(&tx, actor, &snapshot.info.flow_id, None)?;
+        require_source_current(&tx, actor, &snapshot.info.flow_id, None)?;
     }
     let canonical;
     let plan = if let Some(composite) = composite.as_ref() {
@@ -23839,13 +23897,15 @@ pub(crate) fn cancel_instance_on(
     Ok(cancelled_claims)
 }
 
-fn job_flow_id_on(conn: &Connection, job_id: &str) -> Result<String> {
+fn job_source_ref_on(conn: &Connection, job_id: &str) -> Result<String> {
     let (instance,scope,definition,version,node):(String,String,String,u32,String)=conn.query_row(
         "SELECT j.instance_id,j.scope_id,i.definition_id,i.version,j.node_id FROM bpmn_jobs j JOIN bpmn_instances i ON i.instance_id=j.instance_id WHERE j.job_id=?1",[job_id],
         |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
     let model = current_version_model_on(conn, &definition, version)?;
     match &scoped_node_on(conn, &instance, &scope, &model, &node)?.kind {
-        ProcessNodeKind::ServiceTask { flow_id, .. } => Ok(flow_id.clone()),
+        ProcessNodeKind::ServiceTask { flow_id, implementation, .. } => {
+            Ok(implementation.source_ref(flow_id))
+        }
         _ => bail!("service job references a non-service node in its exact scope"),
     }
 }
@@ -23888,10 +23948,10 @@ pub fn claim_job(pool: &DbPool, worker_id: &str, now_ms: i64) -> Result<Option<C
     };
     selected_process_id_on(&tx, &instance_id)?;
     let actor = ProcessActor { org_id, user_id };
-    let flow_id = job_flow_id_on(&tx, &job_id)?;
+    let flow_id = job_source_ref_on(&tx, &job_id)?;
     if let Err(error) = require_actor(&tx, &actor)
         .and_then(|_| require_call_control_authority_on(&tx, &actor, &instance_id))
-        .and_then(|_| require_flow_current(&tx, &actor, &flow_id, None))
+        .and_then(|_| require_source_current(&tx, &actor, &flow_id, None))
     {
         let reason = bounded_failure_message(&error.to_string());
         let closed = tx.execute("UPDATE bpmn_service_invocations SET phase='proved_no_effect',phase_revision=phase_revision+1,updated_at_ms=?1 WHERE job_id=?2 AND instance_id=?3 AND phase='prepared' AND dispatch_evidence='no_boundary'", params![now_ms,job_id,instance_id])?;
@@ -24058,8 +24118,8 @@ pub fn commit_job_dispatch_boundary(
     let tx = conn.transaction()?;
     require_actor(&tx, &claimed.actor)?;
     require_call_control_authority_on(&tx, &claimed.actor, &claimed.job.instance_id)?;
-    let flow_id = job_flow_id_on(&tx, &claimed.job.job_id)?;
-    require_flow_current(&tx, &claimed.actor, &flow_id, None)?;
+    let flow_id = job_source_ref_on(&tx, &claimed.job.job_id)?;
+    require_source_current(&tx, &claimed.actor, &flow_id, None)?;
     if !job_activation_live_on(&tx, &claimed.job.job_id)? {
         return Ok(false);
     }
@@ -24157,8 +24217,8 @@ fn block_closed_observed_job(pool: &DbPool, job_id: &str, at_ms: i64) -> Result<
     let actor = ProcessActor { org_id, user_id };
     let authority = if live {
         require_call_control_authority_on(&tx, &actor, &instance_id)
-            .and_then(|_| job_flow_id_on(&tx, job_id))
-            .and_then(|flow| require_flow_current(&tx, &actor, &flow, None))
+            .and_then(|_| job_source_ref_on(&tx, job_id))
+            .and_then(|flow| require_source_current(&tx, &actor, &flow, None))
     } else { Ok(()) };
     let reason = if !live { Some("activation_closed") }
         else if authority.is_err() { Some("execution_authority_revoked") }
@@ -24240,8 +24300,8 @@ pub fn record_job_observation(
     let live = job_activation_live_on(&tx, &claimed.job.job_id)?;
     let authority = if live {
         require_call_control_authority_on(&tx, &claimed.actor, &instance_id)
-            .and_then(|_| job_flow_id_on(&tx, &claimed.job.job_id))
-            .and_then(|flow| require_flow_current(&tx, &claimed.actor, &flow, None))
+            .and_then(|_| job_source_ref_on(&tx, &claimed.job.job_id))
+            .and_then(|flow| require_source_current(&tx, &claimed.actor, &flow, None))
     } else { Ok(()) };
     let blocked_reason = if !live { Some("activation_closed") }
         else if authority.is_err() { Some("execution_authority_revoked") }
@@ -24319,8 +24379,8 @@ pub fn renew_job_lease(
         |row| row.get(0),
     )?;
     require_call_control_authority_on(&tx, &actor, &instance_id)?;
-    let flow_id = job_flow_id_on(&tx, &job_id)?;
-    require_flow_current(&tx, &actor, &flow_id, None)?;
+    let flow_id = job_source_ref_on(&tx, &job_id)?;
+    require_source_current(&tx, &actor, &flow_id, None)?;
     let changed=tx.execute("UPDATE bpmn_jobs SET lease_until_ms=?1,updated_at_ms=?2 WHERE job_id=?3 AND worker_id=?4 AND attempt=?5 AND fence=?6 AND status='running' AND lease_until_ms>=?2",params![now_ms+30_000,now_ms,job_id,worker_id,attempt,sql_integer(fence)?])?;
     tx.commit()?;
     Ok(changed == 1)
@@ -26302,8 +26362,8 @@ pub fn accept_job_result(
             "terminating service input differs from its accepted job generation");
     }
     require_call_control_authority_on(&tx, actor, &instance_id)?;
-    let flow_id = job_flow_id_on(&tx, job_id)?;
-    require_flow_current(&tx, actor, &flow_id, None)?;
+    let flow_id = job_source_ref_on(&tx, job_id)?;
+    require_source_current(&tx, actor, &flow_id, None)?;
     ensure!(
         composite.complete_job_ids.iter().any(|id| id == job_id),
         "result plan does not consume service job"
@@ -26385,8 +26445,8 @@ pub fn retry_job(
     ensure!(job_direct_retryable_on(&tx, job_id, instance_id)?,
         "Service direct retry requires one proved-no-effect invocation before dispatch");
     require_call_control_authority_on(&tx, actor, instance_id)?;
-    let flow_id = job_flow_id_on(&tx, job_id)?;
-    require_flow_current(&tx, actor, &flow_id, None)?;
+    let flow_id = job_source_ref_on(&tx, job_id)?;
+    require_source_current(&tx, actor, &flow_id, None)?;
     let mut selected_stmt = tx.prepare(
         "SELECT v.invocation_id,j.token_id,j.scope_id,x.incident_id \
          FROM bpmn_jobs j \
@@ -26529,8 +26589,8 @@ pub(super) fn record_observed_script_infrastructure_failure(
     let actor = ProcessActor { org_id, user_id };
     require_actor(&tx, &actor)?;
     require_call_control_authority_on(&tx, &actor, &instance_id)?;
-    let flow_id = job_flow_id_on(&tx, &claimed.job.job_id)?;
-    require_flow_current(&tx, &actor, &flow_id, None)?;
+    let flow_id = job_source_ref_on(&tx, &claimed.job.job_id)?;
+    require_source_current(&tx, &actor, &flow_id, None)?;
     let existing = tx.query_row(
         r#"SELECT incident_id FROM bpmn_incidents WHERE instance_id=?1 AND scope_id=?2
             AND job_id=?3 AND code='SCRIPT_INFRASTRUCTURE_FAILED'
@@ -26672,8 +26732,8 @@ pub fn fail_job(
         let live = job_activation_live_on(&tx, job_id)?;
         let authority = if live {
             require_call_control_authority_on(&tx, &actor, &instance_id)
-                .and_then(|_| job_flow_id_on(&tx, job_id))
-                .and_then(|flow| require_flow_current(&tx, &actor, &flow, None))
+                .and_then(|_| job_source_ref_on(&tx, job_id))
+                .and_then(|flow| require_source_current(&tx, &actor, &flow, None))
         } else { Ok(()) };
         let reason = if !live { Some("activation_closed") }
             else if authority.is_err() { Some("execution_authority_revoked") }
@@ -27791,7 +27851,7 @@ fn require_version_execution_on(
     require_actor(conn, actor)?;
     let v = version_on(conn, definition_id, version)?;
     for pin in v.service_flows {
-        require_flow_current(conn, actor, &pin.flow_id, None)?;
+        require_source_current(conn, actor, &pin.flow_id, None)?;
     }
     for node in super::model::all_nodes(&v.model) {
         if let ProcessNodeKind::UserTask {

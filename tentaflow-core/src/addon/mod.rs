@@ -722,6 +722,18 @@ impl AddonCallProvenance {
         }
     }
 
+    /// A BPMN Service task running an addon tool. The actor is the invocation
+    /// (`stable_request_id`), which an operator can look up in the process
+    /// history; the addon is already named by `addon_id`.
+    pub fn process(request_id: impl Into<String>) -> Self {
+        Self {
+            origin: crate::flow_engine::dispatcher::FlowOrigin::Process,
+            actor: Some(crate::flow_engine::dispatcher::FlowActor::system_component(
+                request_id,
+            )),
+        }
+    }
+
     /// The actor host functions stamp: the named component when there is one,
     /// otherwise the addon instance itself.
     pub fn actor_for(&self, addon_id: &str) -> crate::flow_engine::dispatcher::FlowActor {
@@ -3144,6 +3156,7 @@ impl AddonManager {
             CallIdentity::User(user_id),
             false,
             AddonCallProvenance::addon(),
+            None,
         )
     }
 
@@ -3167,6 +3180,7 @@ impl AddonManager {
             CallIdentity::User(user_id),
             true,
             AddonCallProvenance::addon(),
+            None,
         )
     }
 
@@ -3192,6 +3206,7 @@ impl AddonManager {
             CallIdentity::System,
             true,
             AddonCallProvenance::addon(),
+            None,
         )
     }
 
@@ -3222,6 +3237,35 @@ impl AddonManager {
             identity,
             skip_permission_check,
             AddonCallProvenance::scheduler(job_id),
+            None,
+        )
+    }
+
+    /// Invokes a tool for a BPMN Service task, as the instance initiator and
+    /// under the per-user `"llm"` permission check.
+    ///
+    /// `stable_request_id` identifies the invocation across retries and is
+    /// passed to the guest as `idempotency_key`: the platform never repeats a
+    /// call after the dispatch boundary, but a tool with side effects can use
+    /// the key to recognise a repeat that an operator triggers. The call blocks
+    /// inside wasmtime and cannot be interrupted from outside; callers race it
+    /// against their own timeout and let the thread run out.
+    pub fn call_tool_process(
+        &self,
+        addon_id: &str,
+        tool_name: &str,
+        params: serde_json::Value,
+        user_id: &str,
+        stable_request_id: &str,
+    ) -> Result<serde_json::Value> {
+        self.call_tool_inner(
+            addon_id,
+            tool_name,
+            params,
+            CallIdentity::User(user_id),
+            false,
+            AddonCallProvenance::process(stable_request_id),
+            Some(stable_request_id),
         )
     }
 
@@ -3234,6 +3278,7 @@ impl AddonManager {
         identity: CallIdentity<'_>,
         skip_permission_check: bool,
         call_provenance: AddonCallProvenance,
+        idempotency_key: Option<&str>,
     ) -> Result<serde_json::Value> {
         // System calls carry no principal; user calls carry their user_id.
         let acquire_user = match identity {
@@ -3285,11 +3330,16 @@ impl AddonManager {
         }
 
         // Przygotuj dane wejsciowe jako JSON
-        let request_json = serde_json::json!({
+        let mut request_json = serde_json::json!({
             "tool": tool_name,
             "params": params,
             "user_id": audit_user,
         });
+        // Only a process-driven call carries a key, so every other caller keeps
+        // sending the request bytes it always sent.
+        if let Some(key) = idempotency_key {
+            request_json["idempotency_key"] = serde_json::Value::from(key);
+        }
         let request_bytes = serde_json::to_vec(&request_json)?;
 
         // Wykonaj WASM poza lockiem
@@ -3972,6 +4022,12 @@ impl AddonManager {
             .iter()
             .find(|t| t.addon_id == addon_id && t.tool_name == tool_name)
             .map(|t| t.package_id.clone())
+    }
+
+    /// Hash of the bundle the operator approved for `addon_id`; empty when the
+    /// instance has none recorded.
+    pub fn installed_bundle_hash(&self, addon_id: &str) -> Result<String> {
+        crate::db::repository::get_instance_installed_bundle_hash(&self.db, addon_id)
     }
 
     /// Zwraca referencje do event bus

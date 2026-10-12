@@ -303,6 +303,21 @@ function processField(value, camel) {
   return value?.[camel];
 }
 
+// Flow is the default and is never sent, so a Flow task keeps its original bytes.
+function processServiceImplementation(implementation) {
+  if (implementation == null || implementation === 'Flow') return {};
+  if (typeof implementation !== 'object' || Array.isArray(implementation)
+      || Object.keys(implementation).length !== 1 || !implementation.AddonTool) {
+    throw new TypeError('unsupported service implementation');
+  }
+  const tool = implementation.AddonTool;
+  processKnownFields(tool, ['addonId', 'toolName'], 'addon tool');
+  if (typeof tool.addonId !== 'string' || typeof tool.toolName !== 'string') {
+    throw new TypeError('addon tool requires an addon id and a tool name');
+  }
+  return { implementation: { AddonTool: { addon_id: tool.addonId, tool_name: tool.toolName } } };
+}
+
 function processKnownFields(value, names, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value) ||
       Object.keys(value).some((key) => !names.includes(key))) {
@@ -674,7 +689,8 @@ function processModel(model, bodyType = 'primary') {
         output_mapping: processField(body, 'outputMapping') ?? {},
         verification: verified ?? 'Human',
         timeout_seconds: Number(processField(body, 'timeoutSeconds') ?? 60),
-        ...(body.resultExpression == null ? {} : { result_expression: body.resultExpression }) };
+        ...(body.resultExpression == null ? {} : { result_expression: body.resultExpression }),
+        ...processServiceImplementation(body.implementation) };
     } else if (tag === 'ScriptTask') {
       processKnownFields(body, ['script', 'outputMapping'], 'script task');
       if (typeof body.script !== 'string' || !body.outputMapping || typeof body.outputMapping !== 'object'

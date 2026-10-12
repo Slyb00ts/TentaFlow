@@ -124,6 +124,8 @@ fn publication_refuses_missing_result_binding_without_writing_process_rows() {
             graph_sha256: pinned.graph_sha256,
         },
         graph_json: pinned.graph_json,
+        role: Default::default(),
+        implementation_kind: Default::default(),
     }];
     let before = super::call_tests::transition_rows(&fixture);
     let error = repository::publish_definition(

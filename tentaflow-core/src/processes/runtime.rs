@@ -8567,6 +8567,7 @@ pub(crate) mod test_support {
                     timeout_seconds: 10,
 
                     result_expression: None,
+                    implementation: Default::default(),
                 },
                 repeat: None,
                 activity_io: None,
@@ -8741,14 +8742,24 @@ pub(crate) mod test_support {
         .expect("save real process definition");
         let mut snapshots = Vec::new();
         for node in super::super::model::all_nodes(model) {
-            if let ProcessNodeKind::ServiceTask { flow_id, .. } = &node.kind {
+            if let ProcessNodeKind::ServiceTask { flow_id, implementation, .. } = &node.kind {
                 let dispatcher = fixture.dispatcher();
-                let meta = dispatcher
-                    .authorize_process_flow(flow_id, &actor.user_id, &actor.org_id)
-                    .expect("current source authorization");
-                let pinned = dispatcher
-                    .snapshot_flow(flow_id, &meta)
-                    .expect("validate real service graph");
+                let pinned = match implementation {
+                    tentaflow_protocol::processes::ServiceImplementation::Flow => {
+                        let meta = dispatcher
+                            .authorize_process_flow(flow_id, &actor.user_id, &actor.org_id)
+                            .expect("current source authorization");
+                        dispatcher
+                            .snapshot_flow(flow_id, &meta)
+                            .expect("validate real service graph")
+                    }
+                    tentaflow_protocol::processes::ServiceImplementation::AddonTool {
+                        addon_id,
+                        tool_name,
+                    } => dispatcher
+                        .snapshot_process_tool(addon_id, tool_name, &actor.user_id, &actor.org_id)
+                        .expect("pin the scripted addon tool"),
+                };
                 snapshots.push(super::super::repository::PinnedServiceSnapshot {
                     info: PinnedFlowInfo {
                         node_id: node.id.clone(),
@@ -8757,6 +8768,8 @@ pub(crate) mod test_support {
                         graph_sha256: pinned.graph_sha256,
                     },
                     graph_json: pinned.graph_json,
+                    role: Default::default(),
+                    implementation_kind: implementation.kind(),
                 });
             }
         }

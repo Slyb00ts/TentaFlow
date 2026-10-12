@@ -1287,7 +1287,47 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "org_absences_drop_reason",
             MigrationStep::Rust(org_absences_drop_reason),
         ),
+        (
+            201,
+            "bpmn_service_invocation_implementation_kind",
+            MigrationStep::Rust(bpmn_service_invocation_implementation_kind),
+        ),
     ]
+}
+
+/// A Service invocation now records WHAT it ran. `flow_id` stays the stable
+/// reference of the implementation (`tool:<addon>/<tool>` for an addon tool),
+/// so existing rows keep meaning and read back as `flow`. The immutability
+/// trigger lists every identity column, so it is recreated with the new one;
+/// its text is read from the schema rather than repeated here, which keeps the
+/// rung exact for any database that already ran 198.
+fn bpmn_service_invocation_implementation_kind(conn: &Connection) -> Result<()> {
+    use anyhow::{ensure, Context};
+
+    const TRIGGER: &str = "bpmn_service_invocations_immutable";
+    const ANCHOR: &str = "NEW.flow_id IS NOT OLD.flow_id OR";
+    let trigger_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [TRIGGER],
+            |row| row.get(0),
+        )
+        .context("bpmn_service_invocations_immutable trigger is missing")?;
+    ensure!(
+        trigger_sql.matches(ANCHOR).count() == 1,
+        "bpmn_service_invocations_immutable has an unexpected identity clause"
+    );
+    let widened = trigger_sql.replace(
+        ANCHOR,
+        &format!("{ANCHOR}\n        NEW.implementation_kind IS NOT OLD.implementation_kind OR"),
+    );
+    conn.execute_batch(&format!(
+        "ALTER TABLE bpmn_service_invocations
+             ADD COLUMN implementation_kind TEXT NOT NULL DEFAULT 'flow';
+         DROP TRIGGER {TRIGGER};
+         {widened};"
+    ))?;
+    Ok(())
 }
 
 /// An absence has no reason (owner decision 2026-10-09): clears every stored
@@ -12855,6 +12895,7 @@ pub(crate) fn bpmn_boundary_migration_fixture(conn: &Connection) -> (String, Str
             output_mapping: Default::default(), verification: ActivityVerification::Human,
             timeout_seconds: 60,
             result_expression: None,
+            implementation: Default::default(),
         },
     });
     model.nodes.push(ProcessNode { activity_io: None, repeat: None,
@@ -16539,7 +16580,7 @@ mod tests {
             assert_eq!(*version, index as i64 + 1, "the ladder must stay contiguous");
         }
         let head = ladder.last().unwrap().0;
-        assert_eq!(head, 200);
+        assert_eq!(head, 201);
 
         let fresh = Connection::open_in_memory().unwrap();
         run(&fresh).unwrap();
@@ -16558,10 +16599,14 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(applied_after_179.len(), 21);
+        assert_eq!(applied_after_179.len(), 22);
         assert_eq!(applied_after_179[0], "org_structure");
         assert_eq!(applied_after_179[19], "bpmn_activity_io_witnesses");
         assert_eq!(applied_after_179[20], "org_absences_drop_reason");
+        assert_eq!(
+            applied_after_179[21],
+            "bpmn_service_invocation_implementation_kind"
+        );
         let tables = |conn: &Connection| -> Vec<String> {
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap()
@@ -16692,6 +16737,52 @@ mod tests {
             )
             .ok();
         assert_eq!(pending.as_deref(), Some("1"));
+    }
+
+    /// v201: existing invocations read back as `flow`, the new column is part of
+    /// the identity the immutability trigger freezes, and ordinary phase
+    /// transitions still pass through the recreated trigger.
+    #[test]
+    fn migration_201_marks_existing_invocations_as_flow_and_freezes_the_kind() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 200);
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        let digest = "a".repeat(64);
+        conn.execute(
+            "INSERT INTO bpmn_service_invocations(invocation_id,job_id,instance_id,scope_id,\
+             node_id,token_id,definition_id,version,selected_process_id,whole_document_sha256,\
+             flow_id,pinned_flow_digest,input_sha256,stable_request_id,phase,dispatch_evidence,\
+             created_at_ms,updated_at_ms) \
+             VALUES('inv','job','i','s','n','t','d',1,'p',?1,'flow-1',?1,?1,'inv','prepared',\
+             'no_boundary',1,1)",
+            [&digest],
+        )
+        .unwrap();
+        assert!(conn
+            .prepare("SELECT implementation_kind FROM bpmn_service_invocations")
+            .is_err());
+        run_ladder_up_to(&conn, 201);
+        let kind: String = conn
+            .query_row(
+                "SELECT implementation_kind FROM bpmn_service_invocations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "flow");
+        let error = conn
+            .execute(
+                "UPDATE bpmn_service_invocations SET implementation_kind='addon_tool'",
+                [],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("invocation identity changed"));
+        conn.execute(
+            "UPDATE bpmn_service_invocations SET phase='proved_no_effect',phase_revision=2,\
+             updated_at_ms=2",
+            [],
+        )
+        .unwrap();
     }
 
     /// v179 on a database at v178: subjects (deprecations, generation) and
@@ -18484,6 +18575,7 @@ mod tests {
                 flow_id: "historical-flow".into(), input_mapping: Default::default(),
                 output_mapping: Default::default(), verification: ActivityVerification::Human,
                 timeout_seconds: 30, result_expression: None,
+                implementation: Default::default(),
             },
             repeat: None, activity_io: None,
         });
@@ -18551,7 +18643,7 @@ mod tests {
             .collect::<rusqlite::Result<_>>().unwrap();
         run(&conn).unwrap();
         assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
-            |row| row.get::<_,i64>(0)).unwrap(), 200);
+            |row| row.get::<_,i64>(0)).unwrap(), migration_ladder_head());
         let rows: Vec<(String,String,String,Option<String>)> = conn.prepare(
             "SELECT job_id,phase,dispatch_evidence,stable_request_id FROM bpmn_service_invocations ORDER BY job_id").unwrap()
             .query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap()
@@ -18860,7 +18952,7 @@ mod tests {
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents WHERE code='REPETITION_LIMIT'", [],
             |row| row.get::<_,i64>(0)).unwrap(), 0);
         assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
-            |row| row.get::<_,i64>(0)).unwrap(), 200);
+            |row| row.get::<_,i64>(0)).unwrap(), migration_ladder_head());
         assert!(foreign_key_check(&conn).unwrap().is_empty());
     }
 
@@ -19002,7 +19094,7 @@ mod tests {
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents WHERE instance_id='selected-instance' AND resolved_at_ms IS NULL AND incident_id<>?1", [group.2.as_deref().unwrap()],
             |row| row.get::<_,i64>(0)).unwrap(), 0, "only the terminal capacity incident stays open");
         assert_eq!(conn.query_row("SELECT MAX(version) FROM _migrations", [],
-            |row| row.get::<_, i64>(0)).unwrap(), 200);
+            |row| row.get::<_, i64>(0)).unwrap(), migration_ladder_head());
         assert!(foreign_key_check(&conn).unwrap().is_empty());
         assert_eq!(conn.query_row("PRAGMA integrity_check", [],
             |row| row.get::<_,String>(0)).unwrap(), "ok");

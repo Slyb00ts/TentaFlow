@@ -10,6 +10,7 @@ pub mod runtime;
 pub mod simulation;
 pub mod simulation_schema;
 pub mod timers;
+pub mod tool_host;
 
 #[cfg(test)]
 mod activity_result_tests;
@@ -64,3 +65,5 @@ mod repetition_boundary_tests;
 
 #[cfg(test)]
 mod simulation_tests;
+#[cfg(test)]
+mod tool_task_tests;

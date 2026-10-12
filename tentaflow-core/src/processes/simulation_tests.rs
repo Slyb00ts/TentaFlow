@@ -143,6 +143,7 @@ fn service_model() -> tentaflow_protocol::processes::ProcessModel {
         verification: ActivityVerification::Human,
         timeout_seconds: 30,
         result_expression: None,
+        implementation: Default::default(),
     })
 }
 

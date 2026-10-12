@@ -8,6 +8,7 @@ use tentaflow_protocol::processes::{
     ProcessBodyModeling, ProcessCallTarget, ProcessDiagram, ProcessEscalationPathReason,
     ProcessMessageTargetSpec, ProcessModel, ProcessMultiInstanceInput, ProcessNode,
     ProcessNodeKind, ProcessRepeatSpec, ProcessSequenceFlow, ProcessTimerSpec,
+    ServiceImplementation,
 };
 
 use crate::flow_engine::expr;
@@ -1354,8 +1355,22 @@ fn validate_body<'a>(
                 verification,
                 timeout_seconds,
                 result_expression,
+                implementation,
             } => {
-                ensure!(!flow_id.is_empty(), "service task {} lacks a flow", node.id);
+                match implementation {
+                    ServiceImplementation::Flow => {
+                        ensure!(!flow_id.is_empty(), "service task {} lacks a flow", node.id);
+                    }
+                    ServiceImplementation::AddonTool { addon_id, tool_name } => {
+                        ensure!(
+                            flow_id.is_empty(),
+                            "service task {} runs an addon tool and must not name a flow",
+                            node.id
+                        );
+                        validate_tool_identifier(addon_id, "addon id", &node.id)?;
+                        validate_tool_identifier(tool_name, "tool name", &node.id)?;
+                    }
+                }
                 ensure!(
                     (1..=600).contains(timeout_seconds),
                     "service task {} timeout is outside 1..=600 seconds",
@@ -2491,6 +2506,20 @@ fn validate_event_gateway_regions<'a>(
     Ok(())
 }
 
+/// Addon and tool identifiers end up inside the `tool:<addon>/<tool>` source
+/// reference, so they must not contain its separators.
+pub(crate) fn validate_tool_identifier(value: &str, what: &str, node_id: &str) -> Result<()> {
+    ensure!(
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)),
+        "service task {node_id} has an invalid {what}"
+    );
+    Ok(())
+}
+
 fn validate_mapping(
     mapping: &std::collections::BTreeMap<String, String>,
     script_profile: bool,
@@ -3529,6 +3558,7 @@ mod tests {
                     verification: ActivityVerification::Human,
                     timeout_seconds: 60,
                     result_expression: Some("outputs.result".into()),
+                    implementation: Default::default(),
                 },
             },
             ProcessNode {
@@ -5401,6 +5431,7 @@ mod tests {
                     verification: ActivityVerification::Human,
                     timeout_seconds: 60,
                     result_expression: None,
+                    implementation: Default::default(),
                 },
                 repeat: Some(ProcessRepeatSpec::MultiInstance {
                     mode: ProcessMultiInstanceMode::Sequential,
@@ -5821,6 +5852,7 @@ mod tests {
                 verification: ActivityVerification::Human,
                 timeout_seconds: 60,
                 result_expression: None,
+                implementation: Default::default(),
             },
             ProcessNodeKind::ManualTask {
                 assignee_user_id: None,

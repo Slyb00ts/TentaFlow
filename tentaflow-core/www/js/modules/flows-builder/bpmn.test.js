@@ -1915,6 +1915,34 @@ test('service inspector edits actual flow, Human/Condition, mappings and timeout
   graph.destroy(); config.destroy(); readonly.destroy();
 });
 
+test('service inspector configures an addon tool and switches back to a flow', async () => {
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
+  const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
+  await flush(2);
+  assert.equal(config.root.querySelector('[data-process="implementation"]').value, 'flow');
+  assert.equal(Object.hasOwn(node.config, 'implementation'), false);
+  change(config.root.querySelector('[data-process="flowId"]'), 'flow-one');
+  change(config.root.querySelector('[data-process="implementation"]'), 'tool');
+  await flush(2);
+  assert.deepEqual(node.config.implementation, { AddonTool: { addonId: '', toolName: '' } });
+  assert.equal(node.config.flowId, '');
+  assert.equal(config.root.querySelector('[data-process="flowId"]'), null);
+  change(config.root.querySelector('[data-process="addonId"]'), 'notes-1a2b3c4d');
+  change(config.root.querySelector('[data-process="toolName"]'), 'search');
+  assert.deepEqual(node.config.implementation, { AddonTool: { addonId: 'notes-1a2b3c4d', toolName: 'search' } });
+  const saved = canvasToProcess(graph.processModel, graph.nodes, graph.edges, () => []);
+  assert.deepEqual(saved.nodes.find((row) => row.id === node.id).kind.ServiceTask.implementation,
+    { AddonTool: { addonId: 'notes-1a2b3c4d', toolName: 'search' } });
+  const readonly = inspector(graph, true); readonly.show(node, graph.templates.get(node.type));
+  assert.ok(readonly.root.querySelector('[data-process="addonId"]').hasAttribute('disabled'));
+  change(config.root.querySelector('[data-process="implementation"]'), 'flow');
+  await flush(2);
+  assert.equal(node.config.implementation, 'Flow');
+  assert.ok(config.root.querySelector('[data-process="flowId"]'));
+  assert.equal(config.root.querySelector('[data-process="addonId"]'), null);
+  graph.destroy(); config.destroy(); readonly.destroy();
+});
+
 test('activity IO inspector authors ordered inputs, outputs, associations and repetition coordinator', () => {
   const model = emptyProcessModel();
   model.variables = { mapped: null };
