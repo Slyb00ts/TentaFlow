@@ -378,6 +378,7 @@ const PROTO_REQUIRES = /the (new|old) schema requires field '([^']*)' \(number \
 const PROTO_ENUM = /enum '([^']*)': value (-?\d+) of the (?:old|new) schema is unknown to the (?:old|new) schema, whose enum is closed/;
 const PROTO_ENUM_OPEN = /enum '([^']*)' of the (?:old|new) schema accepts any number, but the enum of the (?:old|new) schema is closed/;
 const PROTO_RESERVED = /field number (\d+) is reserved by the old schema and cannot be used by the new one/;
+const PROTO_ONEOF = /fields '([^']*)' and '([^']*)' share the oneof '([^']*)' of the (?:old|new) schema, but the (?:old|new) schema can write both/;
 
 const quotedList = (items) => listText(items.map((item) => T('schemas.incompat.quoted', { item })));
 
@@ -453,6 +454,8 @@ export function incompatibilityReason({ mode, detail, newText }) {
   if (protoEnum) return { reason: T('schemas.incompat.proto_enum', { name: protoEnum[1], value: protoEnum[2] }), fix: generic };
   const protoEnumOpen = PROTO_ENUM_OPEN.exec(detail);
   if (protoEnumOpen) return { reason: T('schemas.incompat.proto_enum_open', { name: protoEnumOpen[1] }), fix: generic };
+  const protoOneof = PROTO_ONEOF.exec(detail);
+  if (protoOneof) return { reason: T('schemas.incompat.proto_oneof', { first: protoOneof[1], second: protoOneof[2], oneof: protoOneof[3] }), fix: generic };
   const protoReserved = PROTO_RESERVED.exec(detail);
   if (protoReserved) return { reason: T('schemas.incompat.proto_reserved', { number: protoReserved[1] }), fix: generic };
   const avroType = AVRO_TYPE.exec(detail);
@@ -614,7 +617,11 @@ export function textRefusalReason(schemaType, serverText) {
     if (/is not defined in the schema$/.test(text)) return T('schemas.refused.proto_type_missing');
     if (/is defined more than once$/.test(text)) return T('schemas.refused.proto_defined_twice');
     if (/^the first value of the proto3 enum|without allow_alias$/.test(text)) return T('schemas.refused.proto_enum_zero');
-    if (/has a key that is not an integer, bool or string/.test(text)) return T('schemas.refused.proto_map_key');
+    if (/has a key that is not an integer, bool or string|^a map key or value cannot be a map/.test(text)) return T('schemas.refused.proto_map_key');
+    if (/^required fields do not exist in proto3/.test(text)) return T('schemas.refused.proto_required_proto3');
+    if (/^enum '[^']*' has no values/.test(text)) return T('schemas.refused.proto_enum_empty');
+    if (/^syntax must be/.test(text)) return T('schemas.refused.proto_syntax');
+    if (/uses a map entry type as a plain field$/.test(text)) return T('schemas.refused.proto_map_entry_field');
     for (const [re, key] of PROTOBUF_LIMIT_REFUSALS) {
       const m = re.exec(text);
       if (m) return T(`schemas.refused.proto_limit_${key}`, { limit: m[1] });

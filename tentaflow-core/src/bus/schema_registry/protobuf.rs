@@ -20,16 +20,18 @@
 //     group next to a type of its name): the release profile is
 //     `panic = "abort"`, so a panic there ends the process and `catch_unwind`
 //     around the call only helps dev and test builds. The pre-scan therefore
-//     refuses every one of those collisions BEFORE the parser runs, and a
-//     mutation fuzz (900 000 mutated schemas, structural and lexical) found
-//     no panic past it;
+//     refuses every one of those collisions BEFORE the parser runs. A mutation
+//     fuzz (structural and lexical, seeded with a comment between every two
+//     tokens of its seeds and with the known bypasses) found no panic past it
+//     and checks every text the scan calls ungrammatical against the parser;
+//     the in-repo run is short, `TF_PROTO_FUZZ_ITERATIONS` lengthens it;
 //   - it resolves `import` against embedded copies of the well-known types,
 //     keeps `service`, `extend`, groups and extension ranges, and accepts
 //     what `protoc` refuses (a proto3 enum that does not start at zero, a
 //     float map key, numbers outside 1..2^29-1);
 //   - it reads files, so the text is staged in a private temporary directory
-//     (the in-memory resolver is not exported), and its error text names
-//     that path;
+//     (the in-memory resolver is not exported) under a random name, and its
+//     error text names that path (scrubbed, whatever its spelling);
 //   - the dynamic decoder (`protobuf::reflect`) is bounded by its input (a
 //     declared length is checked against the bytes left before the vector
 //     is filled, with at most 10 MB reserved ahead) but it builds the whole
@@ -59,17 +61,24 @@
 // options are read and ignored: none of them changes what is on the wire.
 //
 // Resource bounds are structural, as in `avro.rs` and `xsd.rs`:
-//   - `prescan` runs on the TEXT before the library sees it: it tokenizes with
-//     the lexer's own rules (comments end at `\n`, `/* */` does not nest,
-//     strings do not span lines) and refuses what would overflow or slow the
-//     parser: bracket depth over `MAX_BRACKET_DEPTH`, more than
-//     `MAX_ASSIGNMENTS` `=`, `MAX_MESSAGES` messages (map fields count, they
-//     become messages), `MAX_ENUMS` enums, identifiers over `MAX_NAME_LEN`,
-//     strings over `MAX_STRING_LITERAL`, `(` anywhere (custom options),
-//     non-ASCII outside strings and comments, a type name (message, enum or
-//     the entry of a `map`) declared twice in one scope, and `import` /
-//     `service` / `extend` / `extensions` / `group` used as the keyword that
-//     starts a statement or a field.
+//   - `prescan` runs on the TEXT before the library sees it, on the parser's
+//     OWN token stream (`protobuf-support`'s lexer, see `prescan.rs`): comments
+//     (`//`, `/* */` which does not nest), joined string literals and numbers
+//     are cut where the parser cuts them, so a comment between two tokens
+//     cannot hide a keyword or a name (a byte-level scan did exactly that:
+//     `import /**/ "schema.proto";` recursed without bound, `message /**/ A`
+//     repeated made the option resolver panic). It refuses what would overflow
+//     or slow the parser: bracket depth (`{ [ <`) over `MAX_BRACKET_DEPTH`, more
+//     than `MAX_ASSIGNMENTS` `=`, `MAX_MESSAGES` messages (map fields count,
+//     they become messages), `MAX_ENUMS` enums, identifiers over
+//     `MAX_NAME_LEN`, strings over `MAX_STRING_LITERAL`, `(` anywhere (custom
+//     options), non-ASCII outside strings and comments, a type name (message,
+//     enum or the entry of a `map`, spelled as the parser spells it) declared
+//     twice in one scope, a `map` inside a `map`, and `import` / `service` /
+//     `extend` / `extensions` / `group` where a statement starts. It walks
+//     the file, message, oneof and enum bodies the way the parser's statement
+//     loops do and refuses a statement it cannot classify, so a disagreement
+//     with the parser fails closed.
 //   - after parsing, the descriptor is checked against the same caps exactly
 //     (messages, nesting, fields per message and in total, enum values), and
 //     against what protoc validates and the parser does not.
@@ -96,8 +105,13 @@
 // walk still checks its framing), a singular field may repeat (the last wins),
 // several members of one `oneof` may arrive, an open (proto3) enum accepts
 // any int32. Always refused: field number 0 or above 2^29-1, the range
-// 19000-19999 the implementation reserves, the deprecated group wire types
-// (3, 4) and the invalid ones (6, 7), a varint over ten bytes.
+// 19000-19999 the implementation reserves (also for a number the schema does
+// not declare), the deprecated group wire types (3, 4) and the invalid ones
+// (6, 7), a varint over ten bytes. Stricter than the libraries, which
+// truncate: a negative `int32` written in five bytes, a `uint32`/`sint32`
+// above 2^32-1 and a `bool` above 1 are violations. A `required` field of a
+// sub-message that arrives in two occurrences is checked per occurrence
+// (protobuf would merge them first): see `Walker::close`.
 //
 // Compatibility (`reads(writer, reader)`: every message written under `writer`
 // can be read under `reader`; BACKWARD = `reads(old, new)`, FORWARD =
@@ -112,18 +126,24 @@
 // declare `required`. A closed reader enum (proto2) needs every value the
 // writer enum declares. Independently of direction, a field number the OLD
 // schema lists in `reserved` may not appear in the NEW one. Removing a field
-// without reserving its number is allowed (the reader skips it).
+// without reserving its number is allowed (the reader skips it). A oneof keeps
+// only the last member a reader sees, so two fields the writer can set
+// together may not share a oneof of the reader: moving an EXISTING field into
+// an existing oneof is refused (adding a member the writer never had, or
+// moving one field alone, is not).
 //
 // `derive_subschema` keeps the designated message's allowed top-level fields
 // (by name) and every message and enum type they reach, nested where they were
-// nested, and writes a `.proto` file that is checked to compile again.
+// nested, and writes a `.proto` file that is checked to compile again. Types
+// are written with their full names, so the text may outgrow the source: the
+// check allows `MAX_DERIVED_TEXT_BYTES`.
 //
 // Violation messages are PATH + CONSTRAINT only (path = field names from the
 // designated message, `<root>` for the message itself) — never a payload
 // value; they reach audit rows, warn logs and DLQ headers.
 // =============================================================================
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
 use ::protobuf::descriptor::field_descriptor_proto::{Label, Type};
@@ -133,6 +153,9 @@ use super::{
     shorten_path, Budget, Compatibility, CompiledSchema, LimitExceeded, SchemaError, SchemaKindOps,
     ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
 };
+
+mod prescan;
+use prescan::prescan;
 
 /// `{` and `[` open together: the parser recurses through message bodies,
 /// option aggregates and list constants alike.
@@ -155,6 +178,8 @@ const MAX_ASSIGNMENTS: usize = 12_288;
 const MAX_NAME_LEN: usize = 128;
 const MAX_STRING_LITERAL: usize = 256;
 const MAX_PARSER_MESSAGE: usize = 200;
+/// What a derived projection may weigh: its type references are fully qualified.
+const MAX_DERIVED_TEXT_BYTES: usize = 2 * MAX_SCHEMA_TEXT_BYTES;
 
 const MAX_FIELD_NUMBER: u32 = 536_870_911;
 const RESERVED_NUMBERS: std::ops::RangeInclusive<u32> = 19_000..=19_999;
@@ -398,298 +423,36 @@ impl Compiled {
 }
 
 // =============================================================================
-// Text pre-scan
-// =============================================================================
-
-struct Prescan {
-    designated: Option<String>,
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
-/// The name of the message the parser makes for the `map<K, V> name` whose `<`
-/// is at `open`: the field name in upper camel case plus `Entry`.
-fn map_entry_name(text: &str, open: usize) -> Option<String> {
-    let rest = &text[open + 1..];
-    let close = rest.as_bytes().iter().take(1024).position(|&b| b == b'>')?;
-    let after = rest[close + 1..].trim_start();
-    let end = after.bytes().take_while(|b| is_ident_byte(*b)).count();
-    let field = &after[..end];
-    if field.is_empty() || field.as_bytes()[0].is_ascii_digit() {
-        return None;
-    }
-    let mut name = String::with_capacity(field.len() + 5);
-    let mut capitalize = true;
-    for c in field.chars() {
-        if c == '_' {
-            capitalize = true;
-        } else if capitalize {
-            name.push(c.to_ascii_uppercase());
-            capitalize = false;
-        } else {
-            name.push(c);
-        }
-    }
-    name.push_str("Entry");
-    Some(name)
-}
-
-/// Walks the text with the lexer's own rules and refuses what would overflow
-/// the parser's stack or what it handles in quadratic time (see the header).
-fn prescan(text: &str) -> Result<Prescan, SchemaError> {
-    let b = text.as_bytes();
-    let mut i = 0;
-    let mut depth = 0usize;
-    let mut assignments = 0usize;
-    let mut messages = 0usize;
-    let mut enums = 0usize;
-    // True at the start of a statement: only there are `message`, `import` &
-    // co. keywords for the parser.
-    let mut statement_start = true;
-    let mut previous_ident: Option<&str> = None;
-    let mut designated: Option<String> = None;
-    // Type names declared in each open `{`: the parser panics (an `unwrap` in
-    // its option resolver) on two messages or enums of one name, so a repeat
-    // is refused here with its own sentence.
-    let mut scopes: Vec<HashSet<String>> = vec![HashSet::new()];
-    while i < b.len() {
-        let c = b[i];
-        match c {
-            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
-            b'/' if b.get(i + 1) == Some(&b'/') => {
-                let end = b[i..]
-                    .iter()
-                    .position(|&x| x == b'\n')
-                    .map_or(b.len(), |p| i + p);
-                let comment = text[i + 2..end].trim();
-                if let Some(rest) = comment.strip_prefix(DESIGNATION_PREFIX) {
-                    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-                        let name = rest.trim();
-                        if name.is_empty()
-                            || !name.bytes().all(is_ident_byte)
-                            || name.as_bytes()[0].is_ascii_digit()
-                            || name.len() > MAX_NAME_LEN
-                        {
-                            return Err(invalid(
-                                "the comment '// tentabus:message' must be followed by the name of a message",
-                            ));
-                        }
-                        if designated.replace(name.to_string()).is_some() {
-                            return Err(invalid(
-                                "the comment '// tentabus:message' appears more than once",
-                            ));
-                        }
-                    }
-                }
-                i = end;
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                let Some(close) = text[i + 2..].find("*/") else {
-                    return Err(invalid("a comment is never closed"));
-                };
-                i += 2 + close + 2;
-            }
-            b'"' | b'\'' => {
-                let quote = c;
-                let start = i + 1;
-                i += 1;
-                loop {
-                    match b.get(i) {
-                        None | Some(b'\n') | Some(0) => {
-                            return Err(invalid("a string is never closed on its line"))
-                        }
-                        Some(b'\\') => {
-                            if matches!(b.get(i + 1), None | Some(b'\n')) {
-                                return Err(invalid("a string is never closed on its line"));
-                            }
-                            i += 2;
-                        }
-                        Some(&q) if q == quote => break,
-                        Some(_) => i += 1,
-                    }
-                }
-                if i - start > MAX_STRING_LITERAL {
-                    return Err(invalid(format!(
-                        "a string is longer than {MAX_STRING_LITERAL} bytes"
-                    )));
-                }
-                i += 1;
-                statement_start = false;
-                previous_ident = None;
-            }
-            c if c.is_ascii_alphabetic() || c == b'_' => {
-                let start = i;
-                while i < b.len() && is_ident_byte(b[i]) {
-                    i += 1;
-                }
-                if i - start > MAX_NAME_LEN {
-                    return Err(invalid(format!(
-                        "a name is longer than {MAX_NAME_LEN} characters"
-                    )));
-                }
-                let word = &text[start..i];
-                if statement_start {
-                    // The keyword is told from an enum value or a type that
-                    // happens to share its spelling by what follows it.
-                    let next = b[i..].iter().find(|c| !c.is_ascii_whitespace()).copied();
-                    let starts_name =
-                        next.is_some_and(|c| c.is_ascii_alphabetic() || c == b'_' || c == b'.');
-                    match word {
-                        "group" if next.is_some_and(|c| c.is_ascii_uppercase()) => {
-                            return Err(invalid("groups are not supported"))
-                        }
-                        "import"
-                            if depth == 0
-                                && (starts_name || matches!(next, Some(b'"' | b'\''))) =>
-                        {
-                            return Err(invalid(
-                                "import is not supported: a schema must be one self-contained file",
-                            ))
-                        }
-                        "service" if depth == 0 && starts_name => {
-                            return Err(invalid("service is not supported"))
-                        }
-                        "extend" if starts_name => return Err(invalid("extend is not supported")),
-                        "extensions" if next.is_some_and(|c| c.is_ascii_digit()) => {
-                            return Err(invalid("extension ranges are not supported"))
-                        }
-                        "message" | "enum" => {
-                            if word == "message" {
-                                messages += 1;
-                            } else {
-                                enums += 1;
-                            }
-                            let name_start = i + b[i..]
-                                .iter()
-                                .take_while(|c| c.is_ascii_whitespace())
-                                .count();
-                            let name_len = b[name_start..]
-                                .iter()
-                                .take_while(|c| is_ident_byte(**c))
-                                .count();
-                            let name = &text[name_start..name_start + name_len];
-                            if !name.is_empty()
-                                && !name.as_bytes()[0].is_ascii_digit()
-                                && !scopes.last_mut().expect("a scope").insert(name.to_string())
-                            {
-                                return Err(invalid(format!(
-                                    "type '{name}' is defined more than once"
-                                )));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if word == "group"
-                    && matches!(previous_ident, Some("optional" | "required" | "repeated"))
-                {
-                    return Err(invalid("groups are not supported"));
-                }
-                statement_start = false;
-                previous_ident = Some(word);
-            }
-            c if c.is_ascii_digit() => {
-                while i < b.len() && (is_ident_byte(b[i]) || b[i] == b'.') {
-                    i += 1;
-                }
-                statement_start = false;
-                previous_ident = None;
-            }
-            b'{' | b'[' => {
-                depth += 1;
-                if depth > MAX_BRACKET_DEPTH {
-                    return Err(invalid(format!(
-                        "the schema is nested deeper than {MAX_BRACKET_DEPTH} levels"
-                    )));
-                }
-                statement_start = c == b'{';
-                if c == b'{' {
-                    scopes.push(HashSet::new());
-                }
-                previous_ident = None;
-                i += 1;
-            }
-            b'}' | b']' => {
-                if depth == 0 {
-                    return Err(invalid("a closing bracket has no opening one"));
-                }
-                depth -= 1;
-                if c == b'}' && scopes.len() > 1 {
-                    scopes.pop();
-                }
-                statement_start = c == b'}';
-                previous_ident = None;
-                i += 1;
-            }
-            b';' => {
-                statement_start = true;
-                previous_ident = None;
-                i += 1;
-            }
-            b'=' => {
-                assignments += 1;
-                if assignments > MAX_ASSIGNMENTS {
-                    return Err(invalid(format!(
-                        "the schema has more than {MAX_ASSIGNMENTS} assignments (field numbers, enum values and options)"
-                    )));
-                }
-                statement_start = false;
-                previous_ident = None;
-                i += 1;
-            }
-            b'<' => {
-                if previous_ident == Some("map") {
-                    messages += 1;
-                    // The parser declares `<CamelName>Entry` next to the other
-                    // types of the scope, and panics when that name is taken.
-                    if let Some(entry) = map_entry_name(text, i) {
-                        if !scopes.last_mut().expect("a scope").insert(entry.clone()) {
-                            return Err(invalid(format!(
-                                "type '{entry}' is defined more than once"
-                            )));
-                        }
-                    }
-                }
-                statement_start = false;
-                previous_ident = None;
-                i += 1;
-            }
-            b'(' => {
-                return Err(invalid("custom options are not supported"));
-            }
-            b'>' | b',' | b'.' | b':' | b'-' | b'+' | b'/' => {
-                statement_start = false;
-                previous_ident = None;
-                i += 1;
-            }
-            _ => {
-                return Err(invalid(
-                    "the schema contains a character a .proto file cannot",
-                ))
-            }
-        }
-        if messages > MAX_MESSAGES {
-            return Err(invalid(format!(
-                "the schema has more than {MAX_MESSAGES} messages (a map field counts as one)"
-            )));
-        }
-        if enums > MAX_ENUMS {
-            return Err(invalid(format!(
-                "the schema has more than {MAX_ENUMS} enums"
-            )));
-        }
-    }
-    if depth != 0 {
-        return Err(invalid("a bracket is never closed"));
-    }
-    Ok(Prescan { designated })
-}
-
-// =============================================================================
 // Parsing and lowering
 // =============================================================================
+
+/// Prefix of the random staging directory; the staged file carries the
+/// directory's own name, so it is the one marker to look for.
+const STAGING_PREFIX: &str = "tf-proto-";
+
+/// Removes the staging location from a library message. The path may come
+/// back quoted the way `{:?}` writes it (a Windows path then has doubled
+/// backslashes), so the exact path is not enough: whatever token still holds
+/// the staging prefix is replaced whole, file name included.
+fn scrub_staging(text: &str, staged: &str) -> String {
+    let mut out = text.replace(staged, "<schema>");
+    out = out.replace(&staged.replace('\\', "\\\\"), "<schema>");
+    let in_path = |c: char| {
+        !c.is_whitespace() && !matches!(c, '"' | '\'' | '`' | ',' | '[' | ']' | '(' | ')')
+    };
+    while let Some(hit) = out.find(STAGING_PREFIX) {
+        let start = out[..hit]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !in_path(*c))
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let end = out[hit..]
+            .find(|c: char| !in_path(c))
+            .map_or(out.len(), |i| hit + i);
+        out.replace_range(start..end, "<schema>");
+    }
+    out
+}
 
 /// The library's text for an error, without the staging path and bounded.
 fn parser_failure(error: &anyhow::Error, staged: &str) -> SchemaError {
@@ -699,7 +462,7 @@ fn parser_failure(error: &anyhow::Error, staged: &str) -> SchemaError {
         let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
         (rest[digits.len()..].starts_with(':')).then_some(digits)
     });
-    let root = error.root_cause().to_string().replace(staged, "<schema>");
+    let root = scrub_staging(&error.root_cause().to_string(), staged);
     let root: String = root.chars().take(MAX_PARSER_MESSAGE).collect();
     match line {
         Some(line) if !line.is_empty() && line.len() < 8 => {
@@ -711,10 +474,16 @@ fn parser_failure(error: &anyhow::Error, staged: &str) -> SchemaError {
 
 fn run_parser(text: &str) -> Result<FileDescriptorProto, SchemaError> {
     let dir = tempfile::Builder::new()
-        .prefix("tf-proto-")
+        .prefix(STAGING_PREFIX)
         .tempdir()
         .map_err(|_| invalid("the schema could not be staged for parsing"))?;
-    let file = dir.path().join("schema.proto");
+    // The file is named like its random directory: a schema cannot import
+    // the staged copy of itself by a name it can guess.
+    let name = dir.path().file_name().map_or_else(
+        || STAGING_PREFIX.to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let file = dir.path().join(format!("{name}.proto"));
     std::fs::write(&file, text)
         .map_err(|_| invalid("the schema could not be staged for parsing"))?;
     let staged = dir.path().display().to_string();
@@ -1145,12 +914,16 @@ fn lower(file: &FileDescriptorProto, designated: Option<&str>) -> Result<Compile
 }
 
 fn parse_text(schema_text: &str) -> Result<Compiled, SchemaError> {
+    parse_text_within(schema_text, MAX_SCHEMA_TEXT_BYTES)
+}
+
+fn parse_text_within(schema_text: &str, limit: usize) -> Result<Compiled, SchemaError> {
     if schema_text.trim().is_empty() {
         return Err(invalid("schema text is empty"));
     }
-    if schema_text.len() > MAX_SCHEMA_TEXT_BYTES {
+    if schema_text.len() > limit {
         return Err(invalid(format!(
-            "schema text is {} bytes; the limit is {MAX_SCHEMA_TEXT_BYTES}",
+            "schema text is {} bytes; the limit is {limit}",
             schema_text.len()
         )));
     }
@@ -1234,6 +1007,10 @@ impl Walker<'_> {
         Ok(len as usize)
     }
 
+    /// Deliberately stricter than the libraries, which truncate: a negative
+    /// `int32` must be sign-extended to ten bytes (the five-byte form some
+    /// writers emit does not fit), `uint32`/`sint32` must not exceed
+    /// 2^32 - 1, `bool` is 0 or 1, and a closed enum value must be declared.
     fn check_varint(&self, ty: Ty, v: u64) -> Walk<()> {
         let fits = match ty {
             Ty::Scalar(Scalar::Int32) => i32::try_from(v as i64).is_ok(),
@@ -1321,6 +1098,14 @@ impl Walker<'_> {
     }
 
     /// Ends the innermost message: its `required` fields must all have come.
+    ///
+    /// Known strictness: protobuf MERGES a singular message field that arrives
+    /// twice, so a `required` field of the sub-message may be satisfied by the
+    /// two occurrences together. Every occurrence is walked on its own here, so
+    /// one that lacks a `required` field is a violation even if another
+    /// occurrence supplies it. Merging would need the walk to remember the
+    /// fields of an earlier occurrence; no real writer splits a message this
+    /// way, and refusing is the safe side for a registry.
     fn close(&mut self) -> Walk<()> {
         let frame = self.stack.last().expect("a frame to close");
         let msg = &self.c.msgs[frame.msg];
@@ -1512,6 +1297,9 @@ impl Compat<'_> {
                 )));
             }
         }
+        // First reader field met in each oneof of the reader, with the oneof
+        // (if any) the writer keeps it in.
+        let mut oneof_members: BTreeMap<usize, (&str, Option<usize>)> = BTreeMap::new();
         for (number, r_index) in &rm.by_number {
             self.budget.charge(1)?;
             let rf = &rm.fields[*r_index];
@@ -1525,6 +1313,24 @@ impl Compat<'_> {
                 continue;
             };
             let wf = &wm.fields[w_index];
+            // A oneof keeps only the last member a reader sees. Two fields the
+            // writer can set together (they are not members of one of ITS
+            // oneofs) must not share a oneof of the reader: that is how moving
+            // an existing field into an existing oneof silently drops data.
+            if let Some(oneof) = rf.oneof {
+                match oneof_members.get(&oneof) {
+                    None => {
+                        oneof_members.insert(oneof, (&rf.name, wf.oneof));
+                    }
+                    Some((_, first_home)) if first_home.is_some() && *first_home == wf.oneof => {}
+                    Some((first, _)) => {
+                        return Err(Stop::No(format!(
+                            "{path}/{}: fields '{first}' and '{}' share the oneof '{}' of the {rl} schema, but the {wl} schema can write both, and a oneof keeps only one of them",
+                            rf.name, rf.name, rm.oneofs[oneof]
+                        )));
+                    }
+                }
+            }
             if rf.cardinality == Cardinality::Required && wf.cardinality != Cardinality::Required {
                 return Err(Stop::No(format!(
                     "{path}/{}: the {rl} schema requires field '{}' (number {number}) of message '{}', which the {wl} schema does not always write",
@@ -1840,8 +1646,11 @@ impl SchemaKindOps for ProtobufOps {
     ) -> Result<String, SchemaError> {
         let compiled = parse_text(schema_text)?;
         let derived = derive(&compiled, allowed);
-        // The projection must itself be a registrable schema.
-        parse_text(&derived)?;
+        // The projection must itself compile. It writes every type with its
+        // full name, so a large valid schema grows past the limit of the text
+        // it came from: the check allows twice that, not more, because the
+        // caps on names, fields and assignments bound the parser's work.
+        parse_text_within(&derived, MAX_DERIVED_TEXT_BYTES)?;
         Ok(derived)
     }
 
@@ -2148,6 +1957,14 @@ mod tests {
                 "not a valid Protobuf schema",
             ),
             (
+                "syntax = \"proto3\"; enum E { } message M { E e = 1; }".to_string(),
+                "enum 'E' has no values",
+            ),
+            (
+                proto3("map<string, map<string, int32>> a = 1;"),
+                "a map key or value cannot be a map",
+            ),
+            (
                 proto3("option message_set_wire_format = true;"),
                 "message_set_wire_format is not supported",
             ),
@@ -2204,6 +2021,36 @@ mod tests {
     }
 
     #[test]
+    fn what_the_parser_lets_through_but_lowering_refuses_keeps_its_phrase() {
+        // The parser itself refuses `required` in proto3, an unknown syntax and
+        // a type name that is a map entry, so these are reached only through a
+        // descriptor: the dashboard translates their phrases all the same.
+        let mut file = run_parser(&proto2("required int32 a = 1;")).unwrap();
+        file.set_syntax("proto3".to_string());
+        assert_eq!(
+            lower(&file, None).unwrap_err(),
+            invalid("required fields do not exist in proto3")
+        );
+        let mut file = run_parser(&proto3("map<string, int32> a = 1; int32 e = 2;")).unwrap();
+        let plain = file.message_type[0]
+            .field
+            .iter_mut()
+            .find(|f| f.name() == "e")
+            .unwrap();
+        plain.set_type(Type::TYPE_MESSAGE);
+        plain.set_type_name(".M.AEntry".to_string());
+        assert_eq!(
+            lower(&file, None).unwrap_err(),
+            invalid("field 'e' of message 'M' uses a map entry type as a plain field")
+        );
+        file.set_syntax("proto4".to_string());
+        assert_eq!(
+            lower(&file, None).unwrap_err(),
+            invalid("syntax must be \"proto2\" or \"proto3\"")
+        );
+    }
+
+    #[test]
     fn the_staging_path_is_scrubbed_from_any_parser_message() {
         let staged = "/var/folders/xx/T/tf-proto-AbC123";
         let error =
@@ -2229,6 +2076,34 @@ mod tests {
         assert_eq!(
             text.chars().count(),
             "not a valid Protobuf schema (line 12): ".len() + MAX_PARSER_MESSAGE
+        );
+    }
+
+    #[test]
+    fn the_staging_path_is_scrubbed_from_debug_formatted_text_too() {
+        // `{:?}` writes a Windows path with doubled backslashes, which is not
+        // the path the scrub looks for; the staging prefix still gives it away.
+        let staged = r"C:\Users\someone\AppData\Local\Temp\tf-proto-AbC123";
+        let file = format!(r"{staged}\tf-proto-AbC123.proto");
+        let error = anyhow::anyhow!("cannot open {file:?}: {staged:?} is gone and so is {staged}")
+            .context("error in the parser");
+        let SchemaError::Invalid(text) = parser_failure(&error, staged) else {
+            panic!()
+        };
+        assert_eq!(
+            text,
+            "not a valid Protobuf schema: cannot open \"<schema>\": \"<schema>\" is gone and so is <schema>"
+        );
+        // A path in another spelling, or only the staged file name, goes too.
+        let other = anyhow::anyhow!(
+            "no such file `tf-proto-Zz9.proto` under /private/var/T/tf-proto-Zz9/x"
+        );
+        let SchemaError::Invalid(text) = parser_failure(&other, staged) else {
+            panic!()
+        };
+        assert!(
+            !text.contains("tf-proto-") && !text.contains("/private"),
+            "{text}"
         );
     }
 
@@ -3020,6 +2895,33 @@ mod tests {
     }
 
     #[test]
+    fn an_existing_field_cannot_join_an_existing_oneof() {
+        use Compatibility::{Backward, Forward, Full};
+        let plain = proto3("int32 a = 1; string b = 2; int64 c = 3;");
+        let paired = proto3("oneof o { int32 a = 1; string b = 2; } int64 c = 3;");
+        let joined = proto3("oneof o { int32 a = 1; string b = 2; int64 c = 3; }");
+        // Written with all of a, b, c set, read through a oneof: all but one are dropped.
+        assert_eq!(
+            incompatible(&plain, &paired, Backward),
+            "backward: data written under the old schema may not be readable with the new one - /b: fields 'a' and 'b' share the oneof 'o' of the new schema, but the old schema can write both, and a oneof keeps only one of them"
+        );
+        assert!(incompatible(&paired, &joined, Backward).ends_with(
+            "/c: fields 'a' and 'c' share the oneof 'o' of the new schema, but the old schema can write both, and a oneof keeps only one of them"
+        ));
+        // The other direction reads a oneof-written document with plain fields: nothing is lost.
+        assert_eq!(compat(&plain, &paired, Forward), Ok(()));
+        assert_eq!(compat(&paired, &joined, Forward), Ok(()));
+        // Fields the writer already keeps in ONE oneof may be regrouped, and a
+        // member the writer never had may join, or one field alone may move in.
+        let regrouped = proto3("oneof p { int32 a = 1; string b = 2; } int64 c = 3;");
+        let grown = proto3("oneof o { int32 a = 1; string b = 2; bool d = 4; } int64 c = 3;");
+        let alone = proto3("oneof o { int32 a = 1; } string b = 2; int64 c = 3;");
+        for (old, new) in [(&paired, &regrouped), (&paired, &grown), (&plain, &alone)] {
+            assert_eq!(compat(old, new, Full), Ok(()));
+        }
+    }
+
+    #[test]
     fn maps_keep_their_key_and_value_types() {
         use Compatibility::Backward;
         let old = proto3(
@@ -3205,6 +3107,25 @@ mod tests {
             violation(&projected, &ld(5, &ld(1, &[0xff]))),
             "/lines/sku: string is not valid UTF-8"
         );
+    }
+
+    #[test]
+    fn a_large_schema_derives_although_its_projection_is_longer_than_its_source() {
+        // The projection writes every type with its full name: with a long
+        // package that outgrows the limit of the text it was made from.
+        let package = format!("{}.{}", "p".repeat(120), "q".repeat(120));
+        let fields: String = (0..1000)
+            .map(|n| format!("Leaf f{n:0>122}x = {}; ", n + 1))
+            .collect();
+        let text = format!(
+            "syntax = \"proto3\"; package {package}; message Root {{ {fields} }} message Leaf {{ int32 v = 1; }}"
+        );
+        assert!(text.len() < MAX_SCHEMA_TEXT_BYTES, "{}", text.len());
+        let allowed: BTreeSet<String> = (0..1000).map(|n| format!("f{n:0>122}x")).collect();
+        let derived = PROTOBUF_OPS.derive_subschema(&text, &allowed).unwrap();
+        assert!(derived.len() > MAX_SCHEMA_TEXT_BYTES, "{}", derived.len());
+        // Registering that text as a schema is still bound by the source limit.
+        assert!(refusal(&derived).contains("the limit is 262144"));
     }
 
     #[test]
@@ -3524,12 +3445,20 @@ mod tests {
             "syntax = \"proto2\"; message M { required int32 a = 1; optional M child = 2; repeated N n = 3;\n\
                optional string s = 5 [default = \"x\"]; message N { optional int32 z = 1; } enum K { A = 1; } }"
                 .to_string(),
+            // The inputs a comment once hid from the pre-scan, so the mutations
+            // start next to them: a self-import, a repeated message, a repeated
+            // enum, a map entry and a group that collide with a type.
+            "syntax = \"proto3\"; import /**/ \"schema.proto\"; message M {}".to_string(),
+            "syntax = \"proto3\"; message /**/ A { int32 a = 1; } message A { int32 b = 1; }".to_string(),
+            "syntax = \"proto3\"; enum /**/ E { Z = 0; } enum E { Z = 0; Y = 1; }".to_string(),
+            "syntax = \"proto3\"; message M { map<string,int32> /**/ a = 1; message AEntry { int32 x = 1; } }".to_string(),
+            "syntax = \"proto2\"; message M { group /**/ G = 1 { optional int32 z = 1; } } message G { optional int32 y = 1; }".to_string(),
         ]
     }
 
     /// One structural or lexical mutation of a schema text, chosen by `rng`.
     fn mutate_schema(text: &mut String, rng: &mut Xorshift) {
-        const VOCABULARY: [&str; 40] = [
+        const VOCABULARY: &[&str] = &[
             "message ",
             "enum ",
             "oneof ",
@@ -3570,6 +3499,13 @@ mod tests {
             "_",
             "max",
             "to ",
+            "/**/ ",
+            "/* x */",
+            "// x\n",
+            "import /**/ ",
+            "message /**/ ",
+            "group /**/ ",
+            "map<string,int32> /**/ ",
         ];
         let boundary_before = |text: &String, at: usize| {
             (0..=at.min(text.len()))
@@ -3679,13 +3615,30 @@ mod tests {
         // A release build aborts on a panic (`panic = "abort"`), so the
         // `catch_unwind` around the parser cannot save it there: no mutation
         // may reach a panic at all, which is what `PARSER_PANIC` would say.
-        let seeds = fuzz_seeds();
+        let mut seeds = fuzz_seeds();
+        // A comment at every token boundary of every seed, each tried once as
+        // a start of a mutation: the lexical shape the parser is least
+        // forgiving about.
+        let bases = seeds.len();
+        for at in 0..bases {
+            seeds.extend(commented_variants(&seeds[at].clone()));
+        }
         let mut rng = Xorshift(0x9e37_79b9_7f4a_7c15);
         let started = Instant::now();
-        let mut accepted = 0;
-        let iterations = 4000;
-        for _ in 0..iterations {
-            let mut text = seeds[rng.below(seeds.len())].clone();
+        let (mut accepted, mut grammar_refusals) = (0, 0);
+        // `TF_PROTO_FUZZ_ITERATIONS` runs a long campaign by hand.
+        let iterations: usize = std::env::var("TF_PROTO_FUZZ_ITERATIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6000);
+        for round in 0..iterations {
+            // Every other round starts from a base seed, the rest from any.
+            let pick = if round % 2 == 0 {
+                rng.below(bases)
+            } else {
+                rng.below(seeds.len())
+            };
+            let mut text = seeds[pick].clone();
             for _ in 0..1 + rng.below(4) {
                 mutate_schema(&mut text, &mut rng);
             }
@@ -3700,15 +3653,27 @@ mod tests {
             match verdict {
                 Ok(()) => accepted += 1,
                 Err(SchemaError::Invalid(m)) => {
-                    assert_ne!(m, PARSER_PANIC, "the parser panicked on: {shown}")
+                    assert_ne!(m, PARSER_PANIC, "the parser panicked on: {shown}");
+                    // A statement the pre-scan calls ungrammatical must be one
+                    // the parser refuses too: the scan stops there, so a text it
+                    // wrongly refused is a valid schema lost, and a text it
+                    // wrongly read is one whose rest nobody looked at.
+                    if m.contains("does not follow the .proto grammar") {
+                        grammar_refusals += 1;
+                        assert!(
+                            run_parser(&shown).is_err(),
+                            "the pre-scan refused a text the parser accepts: {shown}"
+                        );
+                    }
                 }
                 Err(other) => panic!("{other:?}"),
             }
         }
         eprintln!(
-            "timing: {iterations} mutated schemas: {:?}, {accepted} accepted",
+            "timing: {iterations} mutated schemas: {:?}, {accepted} accepted, {grammar_refusals} grammar refusals checked against the parser",
             started.elapsed()
         );
+        assert!(grammar_refusals > 0);
         assert!(
             accepted > iterations / 50 && accepted < iterations,
             "the mutations should hit both outcomes: {accepted}"
@@ -3762,6 +3727,233 @@ mod tests {
         // The same names in different scopes, and a field called `group`, are fine.
         compile("syntax = \"proto3\"; message M { map<string, int32> a = 1; } message N { message AEntry { int32 x = 1; } }");
         compile("syntax = \"proto3\"; message M { string group = 1; map<string, int32> a = 2; map<string, int32> b = 3; }");
+    }
+
+    /// The pieces of a schema text a comment may stand between: names and
+    /// numbers, string literals and single symbols. Comments of the original
+    /// are dropped.
+    fn pieces(text: &str) -> Vec<String> {
+        let b = text.as_bytes();
+        let (mut out, mut i) = (Vec::new(), 0);
+        while i < b.len() {
+            let c = b[i];
+            if c.is_ascii_whitespace() {
+                i += 1;
+            } else if text[i..].starts_with("//") {
+                i += text[i..].find('\n').map_or(b.len() - i, |p| p + 1);
+            } else if text[i..].starts_with("/*") {
+                i += text[i + 2..].find("*/").map_or(b.len() - i, |p| p + 4);
+            } else if c == b'"' || c == b'\'' {
+                let mut j = i + 1;
+                while j < b.len() && b[j] != c {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                out.push(text[i..(j + 1).min(b.len())].to_string());
+                i = j + 1;
+            } else if c.is_ascii_alphanumeric() || c == b'_' {
+                let j = i + b[i..]
+                    .iter()
+                    .take_while(|x| x.is_ascii_alphanumeric() || **x == b'_')
+                    .count();
+                out.push(text[i..j].to_string());
+                i = j;
+            } else {
+                out.push(text[i..i + 1].to_string());
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// A comment of each style at every boundary between two tokens, one
+    /// boundary per text, then the same comment at all of them at once.
+    fn commented_variants(text: &str) -> Vec<String> {
+        let tokens = pieces(text);
+        let mut variants = Vec::new();
+        for comment in ["/**/", "/* a * / b */", "// c\n", "/* // */", "// /* \n"] {
+            for at in 0..=tokens.len() {
+                let mut v = String::new();
+                for (i, token) in tokens.iter().enumerate() {
+                    v.push_str(if i == at { comment } else { " " });
+                    v.push_str(token);
+                }
+                v.push_str(if at == tokens.len() { comment } else { " " });
+                variants.push(v);
+            }
+            let mut all = String::new();
+            for token in &tokens {
+                all.push_str(comment);
+                all.push_str(token);
+            }
+            all.push_str(comment);
+            variants.push(all);
+        }
+        variants
+    }
+
+    fn verdict(text: &str) -> String {
+        match PROTOBUF_OPS.compile(text) {
+            Ok(_) => "accepted".to_string(),
+            Err(SchemaError::Invalid(m)) => m,
+            Err(other) => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_comment_between_any_two_tokens_changes_no_verdict() {
+        // The pre-scan reads the parser's own token stream, so a comment
+        // cannot move a keyword or a name out of its sight. Each of these
+        // used to get past a byte-level scan and then end the process in the
+        // parser: the self-import recursed without bound (a stack overflow
+        // aborts even a debug build, so this is the case that takes the test
+        // process down when the pre-scan regresses), the others hit an
+        // `unwrap` in its option resolver (a panic only `catch_unwind` in a
+        // test build absorbs, and `PARSER_PANIC` would be the verdict).
+        let refused = [
+            (
+                r#"syntax = "proto3" ; message A { int32 a = 1 ; } message A { int32 b = 1 ; }"#,
+                "type 'A' is defined more than once",
+            ),
+            (
+                r#"syntax = "proto3" ; enum E { Z = 0 ; } enum E { Z = 0 ; Y = 1 ; }"#,
+                "type 'E' is defined more than once",
+            ),
+            (
+                r#"syntax = "proto3" ; message M { map < string , int32 > a = 1 ; message AEntry { int32 x = 1 ; } }"#,
+                "type 'AEntry' is defined more than once",
+            ),
+            (
+                r#"syntax = "proto3" ; message M { map < string , int32 > foo_bar = 1 ; map < int32 , string > fooBar = 2 ; }"#,
+                "type 'FooBarEntry' is defined more than once",
+            ),
+            (
+                r#"syntax = "proto2" ; message M { optional group G = 1 { optional int32 z = 1 ; } } message G { optional int32 y = 1 ; }"#,
+                "groups are not supported",
+            ),
+            (
+                r#"syntax = "proto3" ; message M { group G = 1 { int32 z = 1 ; } message G { int32 y = 1 ; } }"#,
+                "groups are not supported",
+            ),
+            (
+                r#"syntax = "proto3" ; message M { } service S { rpc A ( M ) returns ( M ) ; }"#,
+                "service is not supported",
+            ),
+            (
+                r#"syntax = "proto2" ; message A { } extend A { optional int32 x = 100 ; }"#,
+                "extend is not supported",
+            ),
+            (
+                r#"syntax = "proto2" ; message M { optional int32 a = 1 ; extensions 100 to 199 ; }"#,
+                "extension ranges are not supported",
+            ),
+            (
+                r#"syntax = "proto3" ; message M { int32 a = 1 [ ( my.opt ) = 1 ] ; }"#,
+                "custom options are not supported",
+            ),
+            (
+                r#"syntax = "proto3" ; import "schema.proto" ; message M { }"#,
+                "import is not supported",
+            ),
+        ];
+        // One base at a time, the self-import last: a regression then fails
+        // on the cheap cases before the one that aborts the process.
+        for (base, phrase) in refused {
+            let mut misses = Vec::new();
+            for variant in commented_variants(base) {
+                let got = on_stack(512, {
+                    let variant = variant.clone();
+                    move || verdict(&variant)
+                });
+                if !got.contains(phrase) {
+                    misses.push(format!("{variant:?}: {got}"));
+                }
+            }
+            assert_eq!(misses, Vec::<String>::new(), "{base}");
+        }
+        // And a valid schema stays valid wherever a comment goes.
+        let valid = [
+            fixtures::read("protobuf", "order.proto"),
+            fixtures::read("protobuf/proto2", "legacy.proto"),
+            r#"syntax = "proto3"; package p.q; message A { message B { enum E { Z = 0; } E e = 1; map<string, B> m = 2; oneof o { int32 x = 4; string y = 5; } reserved 9, 11 to 13; reserved "q"; } B b = 1; optional A.B c = 2 [deprecated = true]; } option java_package = "a" "b";"#.to_string(),
+        ];
+        for base in valid {
+            assert_eq!(verdict(&base), "accepted");
+            for variant in commented_variants(&base) {
+                assert_eq!(verdict(&variant), "accepted", "{variant:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_known_bypasses_are_refused_with_their_own_phrase() {
+        for (text, phrase) in [
+            (
+                "syntax = \"proto3\"; message /**/ A { int32 a = 1; } message A { int32 b = 1; }",
+                "type 'A' is defined more than once",
+            ),
+            (
+                "syntax = \"proto3\"; enum /**/ E { Z = 0; } enum E { Z = 0; Y = 1; }",
+                "type 'E' is defined more than once",
+            ),
+            (
+                "syntax = \"proto3\"; message M { map<string,int32> /**/ a = 1; message AEntry { int32 x = 1; } }",
+                "type 'AEntry' is defined more than once",
+            ),
+            (
+                "syntax = \"proto2\"; message M { group /**/ G = 1 { optional int32 z = 1; } } message G { optional int32 y = 1; }",
+                "groups are not supported",
+            ),
+            (
+                "syntax = \"proto3\"; import /**/ \"schema.proto\"; message M {}",
+                "import is not supported",
+            ),
+        ] {
+            let got = on_stack(512, move || verdict(text));
+            assert!(got.contains(phrase), "{text}: {got}");
+        }
+    }
+
+    #[test]
+    fn adjacent_string_literals_and_the_comments_between_them_are_one_token() {
+        // The lexer joins `"a" /* c */ "b"`; a designation comment between
+        // the pieces is still a comment, and a string with `//` in it is not.
+        compile("syntax = \"proto3\"; option java_package = \"a\" /* c */ \"b\" 'c'; message M {}");
+        let named = compile(
+            "syntax = \"proto3\"; option java_package = \"a\" // tentabus:message B\n \"b\"; \
+             message A { int32 a = 1; } message B { string b = 1; }",
+        );
+        assert_eq!(check(&named, &ld(1, b"x")), Ok(()));
+        let inside = compile(
+            "syntax = \"proto3\"; option java_package = \"// tentabus:message B\"; \
+             message A { int32 a = 1; } message B { string b = 1; }",
+        );
+        assert_eq!(check(&inside, &vf(1, 5)), Ok(()));
+        let long = format!(
+            "syntax = \"proto3\"; option java_package = \"{}\" \"{}\"; message M {{}}",
+            "a".repeat(200),
+            "b".repeat(100)
+        );
+        assert!(refusal(&long).contains("a string is longer than 256 bytes"));
+    }
+
+    #[test]
+    fn a_map_cannot_be_nested_in_a_map_however_deep() {
+        // The parser recurses through the types of a map; the scan refuses the
+        // first nested `map` instead of counting levels. Run on a small stack,
+        // as a deep chain would overflow the parser's.
+        let deep = format!(
+            "syntax = \"proto3\"; message M {{ {}int32{} m = 1; }}",
+            "map<string, ".repeat(3000),
+            ">".repeat(3000)
+        );
+        for text in [
+            "syntax = \"proto3\"; message M { map<string, map<string, int32>> m = 1; }".to_string(),
+            "syntax = \"proto3\"; message M { map<map<string, int32>, int32> m = 1; }".to_string(),
+            deep,
+        ] {
+            let got = on_stack(512, move || verdict(&text));
+            assert_eq!(got, "a map key or value cannot be a map");
+        }
     }
 
     #[test]

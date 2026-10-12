@@ -11586,7 +11586,7 @@
         "text_hint_hl7v2_profile": "Profil to tekst JSON z listami wymaganych segmentów i pól, np. {example}. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1.",
         "text_hint_xsd": "Zadziała zwykły wzór XSD zapisany w jednym pliku, bez dołączania innych plików i bez bardziej zaawansowanych części XSD. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1.",
         "text_hint_avro": "Wzór Avro to schemat zapisany jako JSON, np. {example}. Sprawdza on pojedynczą wiadomość zapisaną binarnie w formacie Avro — bez nagłówka pliku Avro i bez nagłówka Confluent. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1.",
-        "text_hint_protobuf": "Wzór Protobuf to plik .proto (proto3 albo proto2) w jednym kawałku, bez „import”. Opisuje jedną wiadomość: pierwszą z pliku albo tę, którą wskaże komentarz, np. „// tentabus:message Order”. Przykład: {example}. Sprawdza pojedynczą wiadomość zapisaną binarnie w formacie Protobuf. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1."
+        "text_hint_protobuf": "Wzór Protobuf to plik .proto (proto3 albo proto2) w jednym kawałku, bez „import”. Opisuje jedną wiadomość: pierwszą z pliku albo tę, którą wskaże komentarz, np. „// tentabus:message Order”. Przykład: {example}. Sprawdza pojedynczą wiadomość zapisaną binarnie w formacie Protobuf. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1. Walidacja jest ścisła: ujemny int32 musi mieć pełny zapis na 10 bajtach (zapis 5-bajtowy jest odrzucany), uint32 i sint32 nie mogą przekraczać 2^32−1, bool to tylko 0 albo 1, a numery pól 19000–19999 są odrzucane, także gdy wzór ich nie zna."
       },
       "version": {
         "title": "Nowa wersja wzoru {name}",
@@ -11663,6 +11663,7 @@
         "proto_fix_required_new": "Zostaw pole „{field}” jako opcjonalne (bez „required”) albo zmień zgodność wzoru.",
         "proto_enum": "typ wyliczeniowy „{name}” traci wartość {value}, którą wiadomości mogą jeszcze zawierać",
         "proto_enum_open": "typ wyliczeniowy „{name}” przyjmuje dowolny numer, a druga wersja ma typ zamknięty (proto2), który zna tylko swoje wartości",
+        "proto_oneof": "pola „{first}” i „{second}” trafiłyby do jednego oneof „{oneof}”, a druga wersja potrafi zapisać oba naraz — oneof zachowuje tylko jedno z nich i dane drugiego przepadłyby",
         "proto_reserved": "numer pola {number} był zastrzeżony („reserved”) w poprzedniej wersji i nie może zostać użyty ponownie"
       },
       "compat_window": {
@@ -11855,6 +11856,10 @@
         "proto_defined_twice": "Dwa typy mają tę samą nazwę w tym samym miejscu. Nadaj im różne nazwy.",
         "proto_enum_zero": "W proto3 pierwszą wartością typu wyliczeniowego musi być zero, a dwie wartości mogą mieć ten sam numer tylko z opcją allow_alias.",
         "proto_map_key": "Kluczem mapy może być liczba całkowita, bool albo string (nie float, double, bytes ani komunikat), a wartością nie może być inna mapa.",
+        "proto_required_proto3": "W proto3 nie ma pól wymaganych („required”). Zrób pole opcjonalnym albo zapisz plik jako „syntax = \"proto2\";”.",
+        "proto_enum_empty": "Typ wyliczeniowy (enum) nie ma żadnej wartości. Dodaj co najmniej jedną.",
+        "proto_syntax": "Linia składni musi brzmieć syntax = \"proto2\"; albo syntax = \"proto3\"; (edycje, „edition”, nie są obsługiwane).",
+        "proto_map_entry_field": "Pole ma jako zwykły typ ukryty wpis mapy (nazwa kończąca się na „Entry”). Mapę zapisz jako map<K, V>.",
         "proto_limit_depth": "Wzór ma nawiasy zagnieżdżone głębiej niż {limit} poziomów.",
         "proto_limit_nesting": "Komunikaty są zagnieżdżone głębiej niż {limit} poziomów.",
         "proto_limit_messages": "Wzór ma więcej niż {limit} komunikatów (mapa też liczy się jako komunikat). Uprość go.",

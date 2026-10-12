@@ -10351,7 +10351,7 @@
         "text_hint_hl7v2_profile": "Ein Profil ist JSON-Text mit Listen der verlangten Segmente und Felder, z. B. {example}. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; es wird Version 1.",
         "text_hint_xsd": "Ein gewöhnliches XSD-Muster in einer einzigen Datei funktioniert, ohne eingebundene Dateien und ohne die fortgeschrittenen Teile von XSD. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; es wird Version 1.",
         "text_hint_avro": "Ein Avro-Muster ist ein als JSON geschriebenes Schema, z. B. {example}. Es prüft eine einzelne Nachricht in der binären Avro-Kodierung – ohne Avro-Dateikopf und ohne Confluent-Kopf. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; das wird Version 1.",
-        "text_hint_protobuf": "Ein Protobuf-Muster ist eine .proto-Datei (proto3 oder proto2) in einem Stück, ohne „import“. Es beschreibt eine Nachricht: die erste der Datei oder die, die ein Kommentar wie „// tentabus:message Order“ benennt. Beispiel: {example}. Es prüft eine einzelne Nachricht in der binären Protobuf-Kodierung. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; das wird Version 1."
+        "text_hint_protobuf": "Ein Protobuf-Muster ist eine .proto-Datei (proto3 oder proto2) in einem Stück, ohne „import“. Es beschreibt eine Nachricht: die erste der Datei oder die, die ein Kommentar wie „// tentabus:message Order“ benennt. Beispiel: {example}. Es prüft eine einzelne Nachricht in der binären Protobuf-Kodierung. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; das wird Version 1. Die Prüfung ist streng: ein negatives int32 braucht die volle 10-Byte-Kodierung (die 5-Byte-Form wird abgelehnt), uint32 und sint32 dürfen 2^32−1 nicht überschreiten, bool ist nur 0 oder 1, und die Feldnummern 19000–19999 werden abgelehnt, auch wenn das Muster sie nicht deklariert."
       },
       "version": {
         "title": "Neue Version des Musters {name}",
@@ -10428,6 +10428,7 @@
         "proto_fix_required_new": "Lassen Sie „{field}“ optional (ohne „required“) oder ändern Sie die Kompatibilität des Musters.",
         "proto_enum": "Enum „{name}“ verliert den Wert {value}, den Nachrichten noch enthalten können",
         "proto_enum_open": "Enum „{name}“ akzeptiert jede Zahl, die andere Version hat aber ein geschlossenes Enum (proto2), das nur seine eigenen Werte kennt",
+        "proto_oneof": "die Felder „{first}“ und „{second}“ würden sich das oneof „{oneof}“ teilen, die andere Version kann aber beide gleichzeitig schreiben — ein oneof behält nur eines davon, die Daten des anderen gingen verloren",
         "proto_reserved": "Die Feldnummer {number} war in der vorherigen Version reserviert („reserved“) und darf nicht erneut verwendet werden"
       },
       "compat_window": {
@@ -10620,6 +10621,10 @@
         "proto_defined_twice": "Zwei Typen haben am selben Ort denselben Namen. Geben Sie ihnen verschiedene Namen.",
         "proto_enum_zero": "In proto3 muss der erste Wert eines Enums null sein, und zwei Werte dürfen nur mit der Option allow_alias dieselbe Nummer haben.",
         "proto_map_key": "Ein Map-Schlüssel kann eine Ganzzahl, bool oder string sein (nicht float, double, bytes oder eine Nachricht), und ein Map-Wert darf keine andere Map sein.",
+        "proto_required_proto3": "In proto3 gibt es keine Pflichtfelder („required“). Machen Sie das Feld optional oder schreiben Sie die Datei als syntax = \"proto2\";.",
+        "proto_enum_empty": "Ein Enum hat keine Werte. Fügen Sie mindestens einen hinzu.",
+        "proto_syntax": "Die Syntaxzeile muss syntax = \"proto2\"; oder syntax = \"proto3\"; lauten (Editionen werden nicht unterstützt).",
+        "proto_map_entry_field": "Ein Feld verwendet den versteckten Eintragstyp einer Map (ein Name auf „Entry“) als gewöhnlichen Typ. Schreiben Sie eine Map stattdessen als map<K, V>.",
         "proto_limit_depth": "Das Muster hat Klammern, die tiefer als {limit} Ebenen verschachtelt sind.",
         "proto_limit_nesting": "Nachrichten sind tiefer als {limit} Ebenen verschachtelt.",
         "proto_limit_messages": "Das Muster hat mehr als {limit} Nachrichten (auch eine Map zählt als Nachricht). Vereinfachen Sie es.",

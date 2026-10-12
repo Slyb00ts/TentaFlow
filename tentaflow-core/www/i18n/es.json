@@ -10351,7 +10351,7 @@
         "text_hint_hl7v2_profile": "Un perfil es texto JSON con listas de segmentos y campos obligatorios, p. ej. {example}. También puedes cargar un archivo. El patrón se comprueba al añadirlo; será la versión 1.",
         "text_hint_xsd": "Funcionará un patrón XSD corriente escrito en un solo archivo, sin archivos incluidos y sin las partes más avanzadas de XSD. También puedes cargar un archivo. El patrón se comprueba al añadirlo; será la versión 1.",
         "text_hint_avro": "Un patrón Avro es un esquema escrito como JSON, p. ej. {example}. Comprueba un solo mensaje escrito en la codificación binaria de Avro, sin cabecera de archivo Avro ni cabecera de Confluent. También puedes cargar un archivo. El patrón se comprueba al añadirlo; será la versión 1.",
-        "text_hint_protobuf": "Un patrón Protobuf es un archivo .proto (proto3 o proto2) escrito de una pieza, sin «import». Describe un mensaje: el primero del archivo o el que nombre un comentario como «// tentabus:message Order». Ejemplo: {example}. Comprueba un solo mensaje escrito en la codificación binaria de Protobuf. También puedes cargar un archivo. El patrón se comprueba al añadirlo; será la versión 1."
+        "text_hint_protobuf": "Un patrón Protobuf es un archivo .proto (proto3 o proto2) escrito de una pieza, sin «import». Describe un mensaje: el primero del archivo o el que nombre un comentario como «// tentabus:message Order». Ejemplo: {example}. Comprueba un solo mensaje escrito en la codificación binaria de Protobuf. También puedes cargar un archivo. El patrón se comprueba al añadirlo; será la versión 1. La validación es estricta: un int32 negativo debe usar la codificación completa de 10 bytes (la de 5 bytes se rechaza), uint32 y sint32 no pueden superar 2^32−1, bool solo es 0 o 1, y los números de campo 19000–19999 se rechazan aunque el patrón no los declare."
       },
       "version": {
         "title": "Nueva versión del patrón {name}",
@@ -10428,6 +10428,7 @@
         "proto_fix_required_new": "Deja «{field}» como opcional (sin «required») o cambia la compatibilidad del patrón.",
         "proto_enum": "el enum «{name}» pierde el valor {value}, que los mensajes aún pueden contener",
         "proto_enum_open": "el enum «{name}» acepta cualquier número, pero la otra versión tiene un enum cerrado (proto2) que solo conoce sus propios valores",
+        "proto_oneof": "los campos «{first}» y «{second}» compartirían el oneof «{oneof}», pero la otra versión puede escribir ambos a la vez: un oneof conserva solo uno y los datos del otro se perderían",
         "proto_reserved": "el número de campo {number} estaba reservado («reserved») en la versión anterior y no puede volver a usarse"
       },
       "compat_window": {
@@ -10620,6 +10621,10 @@
         "proto_defined_twice": "Dos tipos tienen el mismo nombre en el mismo lugar. Dales nombres distintos.",
         "proto_enum_zero": "En proto3 el primer valor de un enum debe ser cero, y dos valores solo pueden compartir número con la opción allow_alias.",
         "proto_map_key": "La clave de un mapa puede ser un entero, bool o string (no float, double, bytes ni un mensaje), y el valor de un mapa no puede ser otro mapa.",
+        "proto_required_proto3": "En proto3 no existen campos obligatorios («required»). Haz el campo opcional o escribe el archivo como syntax = \"proto2\";.",
+        "proto_enum_empty": "Un enum no tiene valores. Añade al menos uno.",
+        "proto_syntax": "La línea de sintaxis debe ser syntax = \"proto2\"; o syntax = \"proto3\"; (las ediciones no se admiten).",
+        "proto_map_entry_field": "Un campo usa el tipo de entrada oculto de un mapa (un nombre que termina en «Entry») como tipo normal. Escribe el mapa como map<K, V>.",
         "proto_limit_depth": "El patrón tiene llaves anidadas a más de {limit} niveles.",
         "proto_limit_nesting": "Los mensajes están anidados a más de {limit} niveles.",
         "proto_limit_messages": "El patrón tiene más de {limit} mensajes (un mapa también cuenta como mensaje). Simplifícalo.",

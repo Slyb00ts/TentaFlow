@@ -10351,7 +10351,7 @@
         "text_hint_hl7v2_profile": "Un profil est un texte JSON avec des listes de segments et de champs obligatoires, par ex. {example}. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1.",
         "text_hint_xsd": "Un modèle XSD ordinaire écrit dans un seul fichier fonctionne, sans fichiers inclus et sans les parties plus avancées de XSD. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1.",
         "text_hint_avro": "Un modèle Avro est un schéma écrit en JSON, p. ex. {example}. Il vérifie un seul message écrit dans l’encodage binaire Avro, sans en-tête de fichier Avro ni en-tête Confluent. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1.",
-        "text_hint_protobuf": "Un modèle Protobuf est un fichier .proto (proto3 ou proto2) écrit d’un seul tenant, sans « import ». Il décrit un message : le premier du fichier ou celui que nomme un commentaire comme « // tentabus:message Order ». Exemple : {example}. Il vérifie un seul message écrit dans l’encodage binaire Protobuf. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1."
+        "text_hint_protobuf": "Un modèle Protobuf est un fichier .proto (proto3 ou proto2) écrit d’un seul tenant, sans « import ». Il décrit un message : le premier du fichier ou celui que nomme un commentaire comme « // tentabus:message Order ». Exemple : {example}. Il vérifie un seul message écrit dans l’encodage binaire Protobuf. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1. La validation est stricte : un int32 négatif doit utiliser l’encodage complet sur 10 octets (la forme sur 5 octets est refusée), uint32 et sint32 ne peuvent pas dépasser 2^32−1, bool vaut seulement 0 ou 1, et les numéros de champ 19000–19999 sont refusés même si le modèle ne les déclare pas."
       },
       "version": {
         "title": "Nouvelle version du modèle {name}",
@@ -10428,6 +10428,7 @@
         "proto_fix_required_new": "Laissez « {field} » optionnel (sans « required ») ou changez la compatibilité du modèle.",
         "proto_enum": "l’enum « {name} » perd la valeur {value}, que des messages peuvent encore contenir",
         "proto_enum_open": "l’enum « {name} » accepte n’importe quel nombre, mais l’autre version a un enum fermé (proto2) qui ne connaît que ses propres valeurs",
+        "proto_oneof": "les champs « {first} » et « {second} » partageraient le oneof « {oneof} », mais l’autre version peut écrire les deux à la fois : un oneof n’en garde qu’un seul et les données de l’autre seraient perdues",
         "proto_reserved": "le numéro de champ {number} était réservé (« reserved ») dans la version précédente et ne peut pas être réutilisé"
       },
       "compat_window": {
@@ -10620,6 +10621,10 @@
         "proto_defined_twice": "Deux types portent le même nom au même endroit. Donnez-leur des noms différents.",
         "proto_enum_zero": "En proto3, la première valeur d’un enum doit être zéro, et deux valeurs ne peuvent partager un numéro qu’avec l’option allow_alias.",
         "proto_map_key": "La clé d’une map peut être un entier, un bool ou un string (pas float, double, bytes ni un message), et la valeur d’une map ne peut pas être une autre map.",
+        "proto_required_proto3": "En proto3, il n’existe pas de champs obligatoires (« required »). Rendez le champ optionnel ou écrivez le fichier avec syntax = \"proto2\";.",
+        "proto_enum_empty": "Une énumération (enum) n’a aucune valeur. Ajoutez-en au moins une.",
+        "proto_syntax": "La ligne de syntaxe doit être syntax = \"proto2\"; ou syntax = \"proto3\"; (les éditions ne sont pas prises en charge).",
+        "proto_map_entry_field": "Un champ utilise le type d’entrée caché d’une map (un nom finissant par « Entry ») comme type ordinaire. Écrivez plutôt la map sous la forme map<K, V>.",
         "proto_limit_depth": "Le modèle a des accolades imbriquées sur plus de {limit} niveaux.",
         "proto_limit_nesting": "Les messages sont imbriqués sur plus de {limit} niveaux.",
         "proto_limit_messages": "Le modèle a plus de {limit} messages (une map compte aussi comme un message). Simplifiez-le.",

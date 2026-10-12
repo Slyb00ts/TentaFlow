@@ -914,6 +914,7 @@ test('a Protobuf text: any text is sent as it is, the add window shows how the m
   assert.equal(schemaTextProblem('   ', 'protobuf'), 'empty');
   assert.equal(PROTOBUF_SCHEMA_EXAMPLE.includes('message Order'), true);
   assert.match(norm(addTextHint('protobuf')), /^Wzór Protobuf to plik \.proto \(proto3 albo proto2\) w jednym kawałku, bez „import”\. Opisuje jedną wiadomość: pierwszą z pliku albo tę, którą wskaże komentarz, np\. „\/\/ tentabus:message Order”\. Przykład: syntax = "proto3"; message Order/);
+  assert.match(norm(addTextHint('protobuf')), /Walidacja jest ścisła: ujemny int32 musi mieć pełny zapis na 10 bajtach.*uint32 i sint32 nie mogą przekraczać 2\^32−1, bool to tylko 0 albo 1, a numery pól 19000–19999 są odrzucane/);
   const cases = [
     ['not a valid Protobuf schema (line 3): label required', /Protobuf nie przyjął tego pliku: sprawdź składnię/],
     ['import is not supported: a schema must be one self-contained file', /„import” nie jest obsługiwany/],
@@ -937,6 +938,12 @@ test('a Protobuf text: any text is sent as it is, the add window shows how the m
     ["the first value of the proto3 enum 'E' must be zero", /pierwszą wartością typu wyliczeniowego musi być zero/],
     ["enum 'E' gives two values the number 0 without allow_alias", /allow_alias/],
     ["map field 'm' has a key that is not an integer, bool or string, or a value that is a map", /Kluczem mapy może być liczba całkowita/],
+    ['a map key or value cannot be a map', /wartością nie może być inna mapa/],
+    ['required fields do not exist in proto3', /W proto3 nie ma pól wymaganych/],
+    ["enum 'E' has no values", /Typ wyliczeniowy \(enum\) nie ma żadnej wartości/],
+    ['syntax must be "proto2" or "proto3"', /Linia składni musi brzmieć/],
+    ["field 'e' of message 'M' uses a map entry type as a plain field", /ukryty wpis mapy/],
+    ['not a valid Protobuf schema (line 7): the text does not follow the .proto grammar here', /Protobuf nie przyjął tego pliku/],
     ['the schema is nested deeper than 32 levels', /nawiasy zagnieżdżone głębiej niż 32 poziomów/],
     ['messages are nested deeper than 16 levels', /Komunikaty są zagnieżdżone głębiej niż 16 poziomów/],
     ['the schema has more than 256 messages (a map field counts as one)', /więcej niż 256 komunikatów/],
@@ -991,6 +998,10 @@ test('a refused Protobuf version names the field, the type, the enum value or th
   assert.match(
     reason('backward', `${backwardLead}/status: enum 'Status' of the old schema accepts any number, but the enum of the new schema is closed`),
     /typ wyliczeniowy „Status” przyjmuje dowolny numer/,
+  );
+  assert.match(
+    reason('backward', `${backwardLead}/b: fields 'a' and 'b' share the oneof 'o' of the new schema, but the old schema can write both, and a oneof keeps only one of them`),
+    /pola „a” i „b” trafiłyby do jednego oneof „o”, a druga wersja potrafi zapisać oba naraz/,
   );
   assert.match(
     reason('forward', `${forwardLead}/again: field number 5 is reserved by the old schema and cannot be used by the new one`),

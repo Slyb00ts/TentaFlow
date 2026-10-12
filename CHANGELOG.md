@@ -121,6 +121,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   typu (także wpisu mapy) w jednym zakresie. Wywołanie parsera jest dodatkowo osłonięte
   `catch_unwind`, a jego komunikaty pozbawione ścieżki i skrócone do 200
   znaków (z numerem wiersza).
+- Kontrola tekstu Protobuf czyta teraz **ten sam strumień tokenów co parser**
+  (leksykalny moduł `protobuf-support` 3.7.2, dodany jako zależność
+  korzenia workspace w tej samej wersji, co już była w lockfile). Poprzednia,
+  bajtowa, nie widziała komentarza między tokenami: `import /**/ "schema.proto";`
+  (rekurencja bez końca), `message /**/ A` powtórzone, `map<…> /**/ a` obok
+  `AEntry` i `group /**/ G` obok `message G` omijały ją i kończyły proces.
+  Kontrola przechodzi po tokenach z jawnym stosem (plik, wiadomość, oneof,
+  wyliczenie), zapisuje nazwy typów z pełnym zakresem, liczy nazwę wpisu mapy
+  tak jak parser i odmawia instrukcji, której nie umie sklasyfikować. Mapa w
+  mapie jest odrzucana (`a map key or value cannot be a map`). Plik tymczasowy
+  ma losową nazwę, a komunikaty parsera tracą ścieżkę także wtedy, gdy jest
+  zapisana z podwojonymi ukośnikami (`{:?}` na Windows).
+- Znane zaostrzenia walidacji wiadomości Protobuf (świadome): ujemny `int32`
+  zapisany na 5 bajtach jest odrzucany (poprawny zapis ma 10), `uint32`/`sint32`
+  powyżej 2^32−1 i `bool` powyżej 1 są naruszeniem, numery 19000–19999 są
+  odrzucane także nieznane wzorowi, a pole `required` pod-wiadomości, której
+  dwa wystąpienia dopiero razem je dostarczają (Protobuf scala je przed
+  sprawdzeniem), jest naruszeniem w pojedynczym wystąpieniu. W zgodności
+  przeniesienie istniejącego pola do istniejącego `oneof` jest odrzucane
+  (oneof zachowuje tylko jedno pole, więc dane drugiego by przepadły), a wzór
+  pochodny może mieć do 512 KiB (nazwy typów są w nim pełne).
 - Wiadomości są sprawdzane własnym iteracyjnym przejściem, a nie dekoderem
   dynamicznym `protobuf` (ten jest ograniczony długością wejścia, ale buduje
   całą wiadomość w pamięci, nie ma miernika pracy do podziału na paczkę,

@@ -222,9 +222,11 @@ prost = "0.14.4"
 prost-build = "0.14.4"
 # Protobuf schema registry (F4 B2): the pure-Rust .proto parser (no protoc) and the
 # descriptor types it returns. Only schema text is parsed with them; payloads are
-# walked by hand.
+# walked by hand. protobuf-support is the parser's own lexer: the text pre-scan
+# must see exactly the tokens (and comments) the parser sees.
 protobuf = "3.7.2"
 protobuf-parse = "3.7.2"
+protobuf-support = "3.7.2"
 protobuf-src = "2"
 quick-xml = {version = "0.41", default-features = false}
 quote = "1.0.46"

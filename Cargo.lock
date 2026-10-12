@@ -14987,6 +14987,7 @@ dependencies = [
  "plist",
  "protobuf",
  "protobuf-parse",
+ "protobuf-support",
  "quick-xml 0.41.0",
  "r2d2",
  "r2d2_sqlite",

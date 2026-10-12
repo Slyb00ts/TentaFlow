@@ -274,6 +274,7 @@ apache-avro = { workspace = true }
 # Protobuf schema registry: .proto parsing only (bus/schema_registry/protobuf.rs).
 protobuf = { workspace = true }
 protobuf-parse = { workspace = true }
+protobuf-support = { workspace = true }
 arc-swap = { workspace = true }
 smallvec = { workspace = true }
 rustc-hash = { workspace = true }

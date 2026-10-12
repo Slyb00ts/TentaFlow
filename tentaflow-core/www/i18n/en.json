@@ -11586,7 +11586,7 @@
         "text_hint_hl7v2_profile": "A profile is JSON text with lists of required segments and fields, e.g. {example}. You can also load a file. The pattern is checked when it is added; this will be version 1.",
         "text_hint_xsd": "An ordinary XSD pattern written in one file will work, with no included files and none of the more advanced parts of XSD. You can also load a file. The pattern is checked when it is added; this will be version 1.",
         "text_hint_avro": "An Avro pattern is a schema written as JSON, e.g. {example}. It checks a single message written in the binary Avro encoding — without an Avro file header or a Confluent header. You can also load a file. The pattern is checked when it is added; this will be version 1.",
-        "text_hint_protobuf": "A Protobuf pattern is a .proto file (proto3 or proto2) written in one piece, with no “import”. It describes one message: the first one in the file, or the one named by a comment such as “// tentabus:message Order”. Example: {example}. It checks a single message written in the binary Protobuf encoding. You can also load a file. The pattern is checked when it is added; this will be version 1."
+        "text_hint_protobuf": "A Protobuf pattern is a .proto file (proto3 or proto2) written in one piece, with no “import”. It describes one message: the first one in the file, or the one named by a comment such as “// tentabus:message Order”. Example: {example}. It checks a single message written in the binary Protobuf encoding. You can also load a file. The pattern is checked when it is added; this will be version 1. Validation is strict: a negative int32 must use the full 10-byte encoding (the 5-byte form is refused), uint32 and sint32 cannot exceed 2^32−1, bool is only 0 or 1, and field numbers 19000–19999 are refused even when the pattern does not declare them."
       },
       "version": {
         "title": "New version of pattern {name}",
@@ -11663,6 +11663,7 @@
         "proto_fix_required_new": "Keep “{field}” optional (without “required”) or change the pattern's compatibility.",
         "proto_enum": "enum “{name}” loses value {value}, which messages may still contain",
         "proto_enum_open": "enum “{name}” accepts any number, but the other version has a closed enum (proto2) that knows only its own values",
+        "proto_oneof": "fields “{first}” and “{second}” would share the oneof “{oneof}”, but the other version can write both at once — a oneof keeps only one of them, so the other’s data would be lost",
         "proto_reserved": "field number {number} was reserved (“reserved”) in the previous version and cannot be used again"
       },
       "compat_window": {
@@ -11855,6 +11856,10 @@
         "proto_defined_twice": "Two types have the same name in the same place. Give them different names.",
         "proto_enum_zero": "In proto3 the first value of an enum must be zero, and two values may share a number only with the allow_alias option.",
         "proto_map_key": "A map key can be an integer, bool or string (not float, double, bytes or a message), and a map value cannot be another map.",
+        "proto_required_proto3": "Protobuf 3 has no required fields. Make the field optional, or write the file as syntax = \"proto2\";.",
+        "proto_enum_empty": "An enum has no values. Add at least one.",
+        "proto_syntax": "The syntax line must be syntax = \"proto2\"; or syntax = \"proto3\"; (editions are not supported).",
+        "proto_map_entry_field": "A field uses the hidden entry type of a map (a name ending in “Entry”) as an ordinary type. Write a map as map<K, V> instead.",
         "proto_limit_depth": "The pattern has brackets nested deeper than {limit} levels.",
         "proto_limit_nesting": "Messages are nested deeper than {limit} levels.",
         "proto_limit_messages": "The pattern has more than {limit} messages (a map counts as a message too). Simplify it.",
