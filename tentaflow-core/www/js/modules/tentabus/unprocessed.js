@@ -119,7 +119,7 @@ const XSD_PHRASES = [
 const AVRO_PHRASES = [
   [/^payload ends before the value is complete$/, 'avro_truncated'],
   [/^bytes remain after the value$/, 'avro_trailing'],
-  [/^integer encoding is longer than 10 bytes or overflows 64 bits$/, 'avro_int_long'],
+  [/^integer encoding is longer than (?:10 bytes or overflows 64 bits|allowed or overflows its type)$/, 'avro_int_long'],
   [/^int encoding is longer than 5 bytes$/, 'avro_int_long'],
   [/^value does not fit the int type$/, 'avro_int_range'],
   [/^boolean is neither 0 nor 1$/, 'avro_boolean'],
@@ -145,6 +145,18 @@ const PROTOBUF_PHRASES = [
   [/^value does not fit the declared type$/, 'proto_range'],
   [/^enum value is not declared in the closed enum$/, 'proto_enum_closed'],
   [/^required field is missing$/, 'proto_required'],
+];
+
+// The Thrift checks that have no counterpart above (thrift/walker.rs); the framing ones share the Avro
+// and Protobuf sentences ("wire type does not match", "wire type is not valid", "required field is missing").
+const THRIFT_PHRASES = [
+  [/^boolean is not a valid value$/, 'thrift_bool'],
+  [/^length or size is negative$/, 'avro_negative'],
+  [/^declared size exceeds the remaining payload$/, 'thrift_size'],
+  [/^field id is out of range$/, 'thrift_field_id'],
+  [/^element wire type does not match the type declared for the field$/, 'thrift_element'],
+  [/^enum value is not declared in the enum$/, 'thrift_enum'],
+  [/^more than one member of the union is set$/, 'thrift_union'],
 ];
 
 const PATH_MAX = 120;
@@ -193,14 +205,14 @@ function pathSentence(path, message) {
   if (m && valueWhy(m[2])) return withPath(say('xsd_attr_value', { name: m[1], why: valueWhy(m[2]) }));
   m = /^value (is .*|does .*)$/.exec(message);
   if (m && valueWhy(m[1])) return withPath(say('xsd_value', { why: valueWhy(m[1]) }));
-  const known = [...XSD_PHRASES, ...AVRO_PHRASES, ...PROTOBUF_PHRASES].find(([re]) => re.test(message));
+  const known = [...XSD_PHRASES, ...AVRO_PHRASES, ...PROTOBUF_PHRASES, ...THRIFT_PHRASES].find(([re]) => re.test(message));
   return known ? withPath(say(known[1])) : '';
 }
 
 /**
  * The checker's sentence for one message in plain words — the HL7 profile's
  * and message parser's sentences (hl7v2_profile.rs, payload_format/hl7v2.rs)
- * and the XSD checker's (xsd.rs) and Avro and Protobuf checkers' (avro.rs, protobuf.rs), the latter three
+ * and the XSD checker's (xsd.rs) and Avro, Protobuf and Thrift checkers' (avro.rs, protobuf.rs, thrift/walker.rs), the latter four
  * after their element or field path — or `''`
  * for any other text, which the caller then shows as the server wrote it.
  */

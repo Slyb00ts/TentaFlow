@@ -11363,7 +11363,6 @@
       "schema_not_found": "Nie znaleziono wzoru wiadomości.",
       "schema_version_not_found": "Nie ma tej wersji wzoru wiadomości.",
       "schema_incompatible": "Nowa wersja wzoru nie spełnia jego zgodności.",
-      "schema_type_unsupported": "Ten format wzoru nie obsługuje tej operacji.",
       "schema_ref_id_collision": "Kolizja identyfikatora wzoru wiadomości — dodaj wzór ponownie.",
       "instance_mismatch": "Żądanie było zaadresowane do innej instancji TentaBus niż ta, która je obsłużyła — błąd konfiguracji po stronie serwera.",
       "authorizer_instance_mismatch": "Kontrola uprawnień jest podpięta do innej instancji TentaBus niż silnik — błąd konfiguracji po stronie serwera.",
@@ -11586,7 +11585,8 @@
         "text_hint_hl7v2_profile": "Profil to tekst JSON z listami wymaganych segmentów i pól, np. {example}. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1.",
         "text_hint_xsd": "Zadziała zwykły wzór XSD zapisany w jednym pliku, bez dołączania innych plików i bez bardziej zaawansowanych części XSD. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1.",
         "text_hint_avro": "Wzór Avro to schemat zapisany jako JSON, np. {example}. Sprawdza on pojedynczą wiadomość zapisaną binarnie w formacie Avro — bez nagłówka pliku Avro i bez nagłówka Confluent. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1.",
-        "text_hint_protobuf": "Wzór Protobuf to plik .proto (proto3 albo proto2) w jednym kawałku, bez „import”. Opisuje jedną wiadomość: pierwszą z pliku albo tę, którą wskaże komentarz, np. „// tentabus:message Order”. Przykład: {example}. Sprawdza pojedynczą wiadomość zapisaną binarnie w formacie Protobuf. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1. Walidacja jest ścisła: ujemny int32 musi mieć pełny zapis na 10 bajtach (zapis 5-bajtowy jest odrzucany), uint32 i sint32 nie mogą przekraczać 2^32−1, bool to tylko 0 albo 1, a numery pól 19000–19999 są odrzucane, także gdy wzór ich nie zna."
+        "text_hint_protobuf": "Wzór Protobuf to plik .proto (proto3 albo proto2) w jednym kawałku, bez „import”. Opisuje jedną wiadomość: pierwszą z pliku albo tę, którą wskaże komentarz, np. „// tentabus:message Order”. Przykład: {example}. Sprawdza pojedynczą wiadomość zapisaną binarnie w formacie Protobuf. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1. Walidacja jest ścisła: ujemny int32 musi mieć pełny zapis na 10 bajtach (zapis 5-bajtowy jest odrzucany), uint32 i sint32 nie mogą przekraczać 2^32−1, bool to tylko 0 albo 1, a numery pól 19000–19999 są odrzucane, także gdy wzór ich nie zna.",
+        "text_hint_thrift": "Wzór Thrift to plik IDL w jednym kawałku, bez „include”. Opisuje jeden typ: pierwszy struct, union albo exception z pliku, albo ten, który wskaże komentarz, np. „// tentabus:struct Order”. Przykład: {example}. Sprawdza pojedynczy obiekt zapisany binarnie w formacie Thrift (TBinaryProtocol) albo w zwartym (TCompactProtocol), gdy plik zawiera komentarz „// tentabus:protocol compact” — bez nagłówka wiadomości i ramkowania. Przyjmowane są: struct, union, exception, enum, typedef, namespace, list, set i map, stałe oraz wartości domyślne (są czytane, ale nie wpływają na sprawdzanie). Nieobsługiwane: include i service. Możesz też wczytać plik. Wzór jest sprawdzany przy dodawaniu; to będzie wersja 1. Walidacja jest ścisła: każde pole musi mieć numer („1: string name”), wartość typu wyliczeniowego musi być jedną z zadeklarowanych, string musi być UTF-8, a union niesie najwyżej jednego członka."
       },
       "version": {
         "title": "Nowa wersja wzoru {name}",
@@ -11774,7 +11774,14 @@
         "protobuf_required": "wymagane",
         "protobuf_optional": "opcjonalne",
         "protobuf_repeated": "powtarzane",
-        "protobuf_oneof": "jedno z: {name}"
+        "protobuf_oneof": "jedno z: {name}",
+        "thrift_fields": "Pola typu",
+        "thrift_id": "Numer",
+        "thrift_type": "Typ",
+        "thrift_presence": "Obecność",
+        "thrift_required": "wymagane",
+        "thrift_optional": "opcjonalne",
+        "thrift_default": "domyślne"
       },
       "added_existing_title": "Wzór {name} już istniał",
       "added_existing_version": "Ktoś dodał go w międzyczasie, więc tekst trafił do niego jako wersja {version}.",
@@ -11873,7 +11880,35 @@
         "proto_limit_string": "Tekst w cudzysłowie jest dłuższy niż {limit} bajtów.",
         "proto_limit_name": "Nazwa jest dłuższa niż {limit} znaków.",
         "proto_limit_parts": "Nazwa ma więcej niż {limit} członów oddzielonych kropką.",
-        "proto_lexical": "Wzór ma niedomknięty komentarz, tekst w cudzysłowie lub nawias albo znak, którego plik .proto nie może zawierać."
+        "proto_lexical": "Wzór ma niedomknięty komentarz, tekst w cudzysłowie lub nawias albo znak, którego plik .proto nie może zawierać.",
+        "thrift_invalid": "Thrift nie przyjął tego pliku: sprawdź składnię (dwukropki, nawiasy, przecinki) i nazwy typów. Szczegóły są niżej.",
+        "thrift_include": "Wzór Thrift musi być jednym samodzielnym plikiem: „include” i „cpp_include” nie są obsługiwane. Wklej potrzebne typy do tego samego pliku.",
+        "thrift_unsupported": "Ten wzór zawiera element, którego rejestr nie obsługuje: {what}. Do sprawdzania obiektów wystarczą struct, union, exception, enum i typedef.",
+        "thrift_what_service": "service (usługi)",
+        "thrift_what_string_types": "senum i slist (przestarzałe typy tekstowe)",
+        "thrift_id_missing": "Każde pole musi mieć numer zapisany wprost, np. „1: string name”. Numery domyślne nie są obsługiwane.",
+        "thrift_id_range": "Numer pola musi być z zakresu od 1 do 32767.",
+        "thrift_union_required": "Członek unii (union) nie może być „required”: union niesie najwyżej jednego członka.",
+        "thrift_included_type": "Nazwa typu z kropką wskazuje na dołączony plik, co nie jest obsługiwane. Zdefiniuj typ w tym samym pliku.",
+        "thrift_reserved": "Nazwa jest słowem zastrzeżonym języka Thrift (np. list, required albo string). Wybierz inną nazwę.",
+        "thrift_duplicate": "Dwa typy, dwa pola (po nazwie lub numerze) albo dwie wartości typu wyliczeniowego mają tę samą nazwę lub numer w tym samym miejscu. Zmień je tak, by się różniły.",
+        "thrift_type_missing": "Wzór używa typu, którego w nim nie ma. Zdefiniuj każdy typ w tym samym pliku.",
+        "thrift_typedef": "Typedef odwołuje się do samego siebie albo łańcuch typedefów jest za długi. Przerwij cykl lub skróć łańcuch.",
+        "thrift_no_value": "Ten wzór nie ma żadnej poprawnej wartości: pierwszy typ wymaga samego siebie (albo typu wyliczeniowego bez wartości). Zrób jedno z tych pól opcjonalnym.",
+        "thrift_no_struct": "W tym pliku nie ma żadnego struct, union ani exception. Wzór musi opisywać jeden z nich.",
+        "thrift_designated": "Komentarz „// tentabus:struct Nazwa” wskazuje typ, który nie jest struct, union ani exception z pliku. Wpisz nazwę typu zapisanego w pliku.",
+        "thrift_directive": "Po komentarzu „// tentabus:struct” musi stać nazwa typu, a po „// tentabus:protocol” słowo „binary” albo „compact”; każdy może wystąpić tylko raz.",
+        "thrift_enum_range": "Wartość typu wyliczeniowego nie mieści się w 32-bitowej liczbie całkowitej.",
+        "thrift_limit_types": "Wzór ma więcej niż {limit} typów. Uprość go.",
+        "thrift_limit_fields": "Typ albo cały wzór ma więcej niż {limit} pól. Podziel go na mniejsze typy.",
+        "thrift_limit_values": "Typ wyliczeniowy albo wszystkie razem mają więcej niż {limit} wartości.",
+        "thrift_limit_required": "Typ ma więcej niż {limit} pól wymaganych (required).",
+        "thrift_limit_depth": "Typy albo stałe są zagnieżdżone głębiej niż {limit} poziomów.",
+        "thrift_limit_string": "Tekst w cudzysłowie jest dłuższy niż {limit} bajtów.",
+        "thrift_limit_name": "Nazwa jest dłuższa niż {limit} znaków.",
+        "thrift_limit_parts": "Nazwa ma więcej niż {limit} członów oddzielonych kropką.",
+        "thrift_limit_size": "Wzór jest za duży dla rejestru (ponad {limit} elementów jednego rodzaju: tokenów, wyrażeń typów, stałych, przestrzeni nazw albo adnotacji). Uprość go.",
+        "thrift_lexical": "Wzór ma niedomknięty komentarz lub tekst w cudzysłowie, źle zapisaną liczbę, nieznaną sekwencję ucieczki w tekście albo znak, którego plik Thrift nie może zawierać."
       }
     },
     "topics": {
@@ -12670,7 +12705,13 @@
         "proto_packed": "lista zapisana w jednym kawałku nie składa się z całej liczby elementów.",
         "proto_range": "liczba nie mieści się w typie pola.",
         "proto_enum_closed": "ta wartość nie należy do typu wyliczeniowego (proto2 przyjmuje tylko zadeklarowane wartości).",
-        "proto_required": "brakuje pola wymaganego (required)."
+        "proto_required": "brakuje pola wymaganego (required).",
+        "thrift_bool": "wartość logiczna ma niepoprawną wartość.",
+        "thrift_size": "tablica, zbiór lub mapa deklaruje więcej elementów, niż mieści reszta wiadomości.",
+        "thrift_field_id": "numer pola jest poza dozwolonym zakresem.",
+        "thrift_element": "sposób zapisu elementów listy, zbioru lub mapy nie zgadza się z ich typem we wzorze.",
+        "thrift_enum": "ta wartość nie należy do typu wyliczeniowego.",
+        "thrift_union": "ustawiono więcej niż jednego członka unii."
       }
     },
     "access": {

@@ -18,7 +18,7 @@ if (typeof globalThis.DOMParser === 'undefined' && window.DOMParser) globalThis.
 
 const {
   schemaDescription, displayText, versionState, downloadName, editorLanguage, headerLine, withdrawnText, versionRows,
-  drawSchemaDetail, shareShownText, hl7ProfileView, avroFieldsView, protobufFieldsView,
+  drawSchemaDetail, shareShownText, hl7ProfileView, avroFieldsView, protobufFieldsView, thriftFieldsView,
 } = await import('./schema-detail.js');
 
 const norm = (s) => String(s).replace(/[  ]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -458,4 +458,64 @@ test('a Protobuf pattern\'s page lists the fields of the message above the text;
   assert.equal(json.body.querySelector('[data-role="protobuf"]').hidden, true);
   const broken = mount({ info: proto, shown: { version: 3, text: 'nothing', error: null } });
   assert.equal(broken.body.querySelector('[data-role="protobuf"]').hidden, true);
+});
+
+const ORDER_THRIFT = `namespace java shop
+# a shell comment with struct Fake { 1: i32 z } inside
+/* a block comment with struct Fake2 { 1: i32 z } inside */
+enum Status { NEW = 0, PAID }
+struct Helper { 1: i32 h }
+// tentabus:struct Order
+struct Order {
+  1: required i64 id,
+  2: optional string note = "x,y;z" (deprecated = "yes"),
+  3: list<Line> lines
+  4: map<string, i32> attrs; 5: Status status = Status.NEW
+  6: set<list<i16>> (cpp.type = "x") sets = [[1, 2], [3]],
+  7: map<string, map<string, i8>> deep = {"a": {"b": 1}}
+}
+struct Line { 1: string sku, 2: i32 qty }
+`;
+
+test('a Thrift struct spelled out: each field with its number, type and presence, nested types, defaults and annotations skipped', () => {
+  assert.deepEqual(thriftFieldsView(ORDER_THRIFT), [
+    { id: 1, name: 'id', type: 'i64', label: 'required' },
+    { id: 2, name: 'note', type: 'string', label: 'optional' },
+    { id: 3, name: 'lines', type: 'list<Line>', label: 'default' },
+    { id: 4, name: 'attrs', type: 'map<string, i32>', label: 'default' },
+    { id: 5, name: 'status', type: 'Status', label: 'default' },
+    { id: 6, name: 'sets', type: 'set<list<i16>>', label: 'default' },
+    { id: 7, name: 'deep', type: 'map<string, map<string, i8>>', label: 'default' },
+  ]);
+  // Without the comment the first struct is the one; a union and an exception count too.
+  assert.deepEqual(thriftFieldsView(ORDER_THRIFT.replace('// tentabus:struct Order', '// nothing here')), [{ id: 1, name: 'h', type: 'i32', label: 'default' }]);
+  assert.deepEqual(thriftFieldsView('exception Boom { 1: string why }'), [{ id: 1, name: 'why', type: 'string', label: 'default' }]);
+  assert.deepEqual(thriftFieldsView('enum E { A } union U { 1: i32 a, 2: string b }'), [
+    { id: 1, name: 'a', type: 'i32', label: 'default' },
+    { id: 2, name: 'b', type: 'string', label: 'default' },
+  ]);
+  assert.equal(thriftFieldsView('not a schema'), null);
+  assert.equal(thriftFieldsView('struct S { 1: i32 a } /* never closed'), null);
+  assert.equal(thriftFieldsView('// tentabus:struct Nope\nstruct S { 1: i32 a }'), null);
+  assert.deepEqual(thriftFieldsView('struct S { }'), []);
+});
+
+test('a Thrift pattern\'s page lists the fields of the type above the text; other formats do not show the table', () => {
+  const thrift = { ...wizyta, subject: 'zamowienie', schemaType: 'thrift' };
+  const { body } = mount({ name: 'zamowienie', info: thrift, shown: { version: 3, text: ORDER_THRIFT, error: null } });
+  assert.equal(body.querySelector('[data-role="thrift"]').hidden, false);
+  assert.equal(body.querySelector('[data-role="protobuf"]').hidden, true);
+  const table = body.querySelector('[data-role="thrift-fields"]');
+  assert.equal(table.rows.length, 7);
+  assert.match(table.rows[0].id, />1</);
+  assert.match(table.rows[0].field, />id</);
+  assert.match(table.rows[2].type, />list&lt;Line&gt;</);
+  assert.equal(norm(table.rows[0].presence), 'wymagane');
+  assert.equal(norm(table.rows[1].presence), 'opcjonalne');
+  assert.equal(norm(table.rows[2].presence), 'domyślne');
+  assert.equal(downloadName('zamowienie', 3, 'thrift'), 'zamowienie-v3.thrift');
+  const json = mount({ shown: { version: 3, text: TEXT, error: null } });
+  assert.equal(json.body.querySelector('[data-role="thrift"]').hidden, true);
+  const broken = mount({ info: thrift, shown: { version: 3, text: 'nothing', error: null } });
+  assert.equal(broken.body.querySelector('[data-role="thrift"]').hidden, true);
 });

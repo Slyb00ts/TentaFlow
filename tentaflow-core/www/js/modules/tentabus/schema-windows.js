@@ -54,6 +54,9 @@ export const AVRO_SCHEMA_EXAMPLE = '{"type": "record", "name": "Order", "fields"
 /** The shape of a Protobuf schema, shown in the add window (its words are Protobuf's, not translated). */
 export const PROTOBUF_SCHEMA_EXAMPLE = 'syntax = "proto3"; message Order { int64 id = 1; string customer = 2; }';
 
+/** The shape of a Thrift schema, shown in the add window (its words are Thrift's, not translated). */
+export const THRIFT_SCHEMA_EXAMPLE = 'struct Order { 1: required i64 id, 2: string customer }';
+
 const byteLength = (text) => new TextEncoder().encode(String(text)).length;
 
 // ---------------------------------------------------------------------------
@@ -371,11 +374,11 @@ const AVRO_REQUIRES = /the (new|old) schema requires field '([^']*)' of record '
 const AVRO_TYPE = /(<root>|\/\S*): (.+?) written by the (?:old|new) schema cannot be read as (.+?) by the (?:old|new) schema/;
 const AVRO_ENUM = /enum '([^']*)': symbol '([^']*)' of the (?:old|new) schema is unknown/;
 
-// The Protobuf checker's sentences (protobuf.rs `Compat::messages`): a field one side requires without the
+// The Protobuf and Thrift checkers' sentences (protobuf.rs `Compat::messages`, thrift.rs `Compat::structs`): a field one side requires without the
 // other always writing it, a closed enum missing a value, a number the old version reserved. A changed
 // type uses the Avro sentence (`AVRO_TYPE`).
-const PROTO_REQUIRES = /the (new|old) schema requires field '([^']*)' \(number \d+\) of message '[^']*', which the (?:new|old) schema does not always write/;
-const PROTO_ENUM = /enum '([^']*)': value (-?\d+) of the (?:old|new) schema is unknown to the (?:old|new) schema, whose enum is closed/;
+const PROTO_REQUIRES = /the (new|old) schema requires field '([^']*)' \((?:number|id) \d+\) of (?:message|struct|union|exception) '[^']*', which the (?:new|old) schema does not always write/;
+const PROTO_ENUM = /enum '([^']*)': value (-?\d+) of the (?:old|new) schema is unknown to the (?:old|new) schema/;
 const PROTO_ENUM_OPEN = /enum '([^']*)' of the (?:old|new) schema accepts any number, but the enum of the (?:old|new) schema is closed/;
 const PROTO_RESERVED = /field number (\d+) is reserved by the old schema and cannot be used by the new one/;
 const PROTO_ONEOF = /fields '([^']*)' and '([^']*)' share the oneof '([^']*)' of the (?:old|new) schema, but the (?:old|new) schema can write both/;
@@ -563,6 +566,21 @@ const PROTOBUF_UNSUPPORTED = [
   [/^option names with a dot are not supported/, 'dotted_option'],
   [/^message_set_wire_format is not supported/, 'message_set'],
 ];
+// The static caps of thrift.rs (compile refusals); the captured number is the limit.
+const THRIFT_LIMIT_REFUSALS = [
+  [/^the schema has more than (\d+) types/, 'types'],
+  [/^(?:(?:struct|union|exception) '[^']*'|the schema) has more than (\d+) fields/, 'fields'],
+  [/^enum '[^']*' has more than (\d+) values/, 'values'],
+  [/^the schema has more than (\d+) enum values/, 'values'],
+  [/^(?:struct|union|exception) '[^']*' has more than (\d+) required fields/, 'required'],
+  [/^(?:types are|a constant is) nested deeper than (\d+) levels/, 'depth'],
+  [/^a string is longer than (\d+) bytes/, 'string'],
+  [/^a name is longer than (\d+) characters/, 'name'],
+  [/^a name has more than (\d+) parts/, 'parts'],
+  [/^the schema has more than (\d+) (?:tokens|type expressions|constants|namespaces)/, 'size'],
+  [/^the constants and default values have more than (\d+) parts/, 'size'],
+  [/^an annotation has more than (\d+) entries/, 'size'],
+];
 const NUMBER_TYPE_ADVICE = { float: 'decimal', double: 'decimal', long: 'integer', short: 'int', byte: 'int', unsignedInt: 'integer', unsignedLong: 'integer', nonNegativeInteger: 'integer', positiveInteger: 'integer', negativeInteger: 'integer' };
 
 /**
@@ -629,6 +647,31 @@ export function textRefusalReason(schemaType, serverText) {
       if (m) return T(`schemas.refused.proto_limit_${key}`, { limit: m[1] });
     }
     if (/^(?:a comment is never closed|a string is never closed|a bracket is never closed|a closing bracket has no|the schema contains a character)/.test(text)) return T('schemas.refused.proto_lexical');
+    return null;
+  }
+  if (schemaType === 'thrift') {
+    if (/^(?:include|cpp_include) is not supported/.test(text)) return T('schemas.refused.thrift_include');
+    const unsupported = /^(service|senum|slist) is not supported/.exec(text);
+    if (unsupported) return T('schemas.refused.thrift_unsupported', { what: T(`schemas.refused.thrift_what_${unsupported[1] === 'service' ? 'service' : 'string_types'}`) });
+    if (/has no explicit id/.test(text)) return T('schemas.refused.thrift_id_missing');
+    if (/has an id outside 1 to/.test(text)) return T('schemas.refused.thrift_id_range');
+    if (/cannot be required/.test(text)) return T('schemas.refused.thrift_union_required');
+    if (/points into an included file/.test(text)) return T('schemas.refused.thrift_included_type');
+    if (/is a reserved word/.test(text)) return T('schemas.refused.thrift_reserved');
+    if (/is defined more than once|has two fields|has two values named/.test(text)) return T('schemas.refused.thrift_duplicate');
+    if (/is not defined in the schema/.test(text)) return T('schemas.refused.thrift_type_missing');
+    if (/refers to itself|^a chain of typedefs is longer/.test(text)) return T('schemas.refused.thrift_typedef');
+    if (/^the schema can never produce a value/.test(text)) return T('schemas.refused.thrift_no_value');
+    if (/^the schema declares no struct/.test(text)) return T('schemas.refused.thrift_no_struct');
+    if (/^the designated struct/.test(text)) return T('schemas.refused.thrift_designated');
+    if (/^the comment '\/\/ tentabus:(?:struct|protocol)'/.test(text)) return T('schemas.refused.thrift_directive');
+    if (/does not fit a 32-bit integer/.test(text)) return T('schemas.refused.thrift_enum_range');
+    for (const [re, key] of THRIFT_LIMIT_REFUSALS) {
+      const m = re.exec(text);
+      if (m) return T(`schemas.refused.thrift_limit_${key}`, { limit: m[1] });
+    }
+    if (/^(?:a comment is never closed|a string is never closed|a string holds an escape|the schema contains a character|an integer literal|a number is)/.test(text)) return T('schemas.refused.thrift_lexical');
+    if (/^expected |is not part of the supported Thrift IDL subset|^a name has an empty part/.test(text)) return T('schemas.refused.thrift_invalid');
     return null;
   }
   if (schemaType === 'xsd') {
@@ -835,6 +878,7 @@ export function addTextHint(schemaType) {
   if (schemaType === 'xsd') return T('schemas.add.text_hint_xsd');
   if (schemaType === 'avro') return T('schemas.add.text_hint_avro', { example: AVRO_SCHEMA_EXAMPLE });
   if (schemaType === 'protobuf') return T('schemas.add.text_hint_protobuf', { example: PROTOBUF_SCHEMA_EXAMPLE });
+  if (schemaType === 'thrift') return T('schemas.add.text_hint_thrift', { example: THRIFT_SCHEMA_EXAMPLE });
   return T('schemas.add.text_hint');
 }
 

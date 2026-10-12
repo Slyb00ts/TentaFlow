@@ -2229,6 +2229,7 @@ test('U5 Dodaj wzór, then a new version refused in plain words, the compatibili
     ['hl7v2_profile', 'profil HL7 v2'],
     ['json_schema', 'JSON Schema'],
     ['protobuf', 'Protobuf'],
+    ['thrift', 'Thrift'],
     ['xsd', 'XSD'],
   ]);
   await expect(win.locator('tf-choice-card[value="xsd"]')).toHaveAttribute('heading', 'XSD');
@@ -2731,6 +2732,83 @@ test('F4 a Protobuf pattern: the hint names the message, a refused import is tol
     expect((await busCall(page, 'busSchemaVersionListRequest', { instanceId: instance, subject: PROTO_NAME })).versions.map((v) => v.version)).toEqual([1, 2]);
   } finally {
     await busCall(page, 'busSchemaDeleteRequest', { instanceId: instance, subject: PROTO_NAME, deprecateOnly: false }).catch(() => {});
+  }
+  expect(errors.filter((e) => !/schema_incompatible|BadRequest|invalid_argument/.test(e)), errors.join('\n')).toEqual([]);
+});
+
+const THRIFT_NAME = `zamowienie-thrift-${RUN}`;
+const THRIFT_V1 = `// tentabus:struct Order
+struct Header { 1: string trace }
+struct Order {
+  1: required i64 id,
+  2: list<Line> lines,
+  3: map<string, i32> attrs = {"a": 1},
+  4: optional string note
+}
+struct Line { 1: string sku, 2: i32 qty }
+`;
+
+test('F4 a Thrift pattern: the hint names the type, a refused include is told in words, the page lists the fields, a retyped field is refused naming the field and both types', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openSchemas(page);
+  const instance = hashParams(page).instance;
+  const win = schemaWindow(page);
+  const p = schemaSlot(page);
+  try {
+    await schemasSlot(page).locator('[data-go="add"]').first().click();
+    await expect(win.locator('[slot="body"]')).toBeVisible();
+    await win.locator('tf-choice-card[value="thrift"]').click();
+    await expect(win.locator('[data-role="text"]')).toHaveAttribute('hint', /Wzór Thrift to plik IDL.*bez „include”.*tentabus:struct Order.*tentabus:protocol compact/);
+    await win.locator('[data-role="name"] input').fill(THRIFT_NAME);
+    await win.locator('[data-role="text"] textarea').fill('include "shared.thrift"\nstruct M { 1: i32 a }');
+    await win.locator('[data-act="save"]').click();
+    const error = win.locator('[data-role="error"]');
+    await expect(error).toContainText('Wzór Thrift musi być jednym samodzielnym plikiem: „include” i „cpp_include” nie są obsługiwane.', { timeout: 15000 });
+    await expect(error.locator('details pre')).toContainText('include is not supported');
+    await page.screenshot({ path: path.join(SHOTS, 'f4-thrift-odmowa-include.png') });
+    // The refusal belongs to the text that was refused.
+    await win.locator('[data-role="text"] textarea').fill(THRIFT_V1);
+    await expect(error).toBeHidden();
+    await expect(win.locator('[data-role="impact"]')).toContainText(`powstanie wzór ${THRIFT_NAME} (Thrift), wersja 1`);
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0, { timeout: 15000 });
+    await expect(schemasSlot(page).locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', `Dodano wzór ${THRIFT_NAME}`);
+    await expect(schemaRow(page, THRIFT_NAME)).toContainText('Thrift');
+
+    // The page lists the fields of the type the comment names, not of the first struct.
+    await schemaRow(page, THRIFT_NAME).locator('td').first().click();
+    await expect(p.locator('.tb-title')).toHaveText(THRIFT_NAME, { timeout: 15000 });
+    const fields = p.locator('[data-role="thrift-fields"] tbody tr');
+    await expect(fields).toHaveCount(4);
+    await expect(fields.nth(0)).toContainText('wymagane');
+    await expect(fields.nth(1)).toContainText('list<Line>');
+    await expect(fields.nth(2)).toContainText('map<string, i32>');
+    await expect(fields.nth(3)).toContainText('opcjonalne');
+    await expect(p.locator('[data-role="thrift-fields"]')).not.toContainText('trace');
+    await expect.poll(() => editorText(page)).toContain('struct Order');
+    await page.screenshot({ path: path.join(SHOTS, 'f4-thrift-pola.png'), fullPage: true });
+
+    // A field that changes its type breaks both directions; the refusal names the field and the types.
+    await p.locator('[data-role="new-version"]').click();
+    await win.locator('[data-role="text"] textarea').fill(THRIFT_V1.replace('1: required i64 id', '1: required string id'));
+    await win.locator('[data-act="save"]').click();
+    const refusal = win.locator('[data-role="error"]');
+    await expect(refusal).toBeVisible({ timeout: 15000 });
+    await expect(refusal).toContainText('Nie dodano wersji 2.');
+    await expect(refusal).toContainText('typ „/id” się zmienia: i64 nie da się odczytać jako string');
+    await page.screenshot({ path: path.join(SHOTS, 'f4-thrift-odmowa-typ.png') });
+    // A new optional field is compatible.
+    await win.locator('[data-role="text"] textarea').fill(THRIFT_V1.replace('4: optional string note', '4: optional string note,\n  5: string region'));
+    await expect(refusal).toBeHidden();
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0, { timeout: 15000 });
+    await expect(p.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Dodano wersję 2');
+    await expect(p.locator('[data-role="thrift-fields"] tbody tr')).toHaveCount(5, { timeout: 15000 });
+    expect((await busCall(page, 'busSchemaVersionListRequest', { instanceId: instance, subject: THRIFT_NAME })).versions.map((v) => v.version)).toEqual([1, 2]);
+  } finally {
+    await busCall(page, 'busSchemaDeleteRequest', { instanceId: instance, subject: THRIFT_NAME, deprecateOnly: false }).catch(() => {});
   }
   expect(errors.filter((e) => !/schema_incompatible|BadRequest|invalid_argument/.test(e)), errors.join('\n')).toEqual([]);
 });

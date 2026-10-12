@@ -11363,7 +11363,6 @@
       "schema_not_found": "Schema not found in the registry.",
       "schema_version_not_found": "This schema version is not in the registry.",
       "schema_incompatible": "The new schema version violates the registered compatibility mode.",
-      "schema_type_unsupported": "This schema type does not support the requested operation.",
       "schema_ref_id_collision": "Schema reference id collision — register the schema again.",
       "instance_mismatch": "The request was addressed to a different TentaBus instance than the one that served it — a server-side configuration error.",
       "authorizer_instance_mismatch": "The permission check is wired to a different TentaBus instance than the engine — a server-side configuration error.",
@@ -11586,7 +11585,8 @@
         "text_hint_hl7v2_profile": "A profile is JSON text with lists of required segments and fields, e.g. {example}. You can also load a file. The pattern is checked when it is added; this will be version 1.",
         "text_hint_xsd": "An ordinary XSD pattern written in one file will work, with no included files and none of the more advanced parts of XSD. You can also load a file. The pattern is checked when it is added; this will be version 1.",
         "text_hint_avro": "An Avro pattern is a schema written as JSON, e.g. {example}. It checks a single message written in the binary Avro encoding — without an Avro file header or a Confluent header. You can also load a file. The pattern is checked when it is added; this will be version 1.",
-        "text_hint_protobuf": "A Protobuf pattern is a .proto file (proto3 or proto2) written in one piece, with no “import”. It describes one message: the first one in the file, or the one named by a comment such as “// tentabus:message Order”. Example: {example}. It checks a single message written in the binary Protobuf encoding. You can also load a file. The pattern is checked when it is added; this will be version 1. Validation is strict: a negative int32 must use the full 10-byte encoding (the 5-byte form is refused), uint32 and sint32 cannot exceed 2^32−1, bool is only 0 or 1, and field numbers 19000–19999 are refused even when the pattern does not declare them."
+        "text_hint_protobuf": "A Protobuf pattern is a .proto file (proto3 or proto2) written in one piece, with no “import”. It describes one message: the first one in the file, or the one named by a comment such as “// tentabus:message Order”. Example: {example}. It checks a single message written in the binary Protobuf encoding. You can also load a file. The pattern is checked when it is added; this will be version 1. Validation is strict: a negative int32 must use the full 10-byte encoding (the 5-byte form is refused), uint32 and sint32 cannot exceed 2^32−1, bool is only 0 or 1, and field numbers 19000–19999 are refused even when the pattern does not declare them.",
+        "text_hint_thrift": "A Thrift pattern is an IDL file written in one piece, with no “include”. It describes one type: the first struct, union or exception in the file, or the one named by a comment such as “// tentabus:struct Order”. Example: {example}. It checks a single object written in the binary Thrift encoding (TBinaryProtocol), or in the compact one (TCompactProtocol) when the file contains the comment “// tentabus:protocol compact” — without a message header or framing. Accepted: struct, union, exception, enum, typedef, namespace, list, set and map, constants and default values (they are read but do not affect the check). Not accepted: include and service. You can also load a file. The pattern is checked when it is added; this will be version 1. Validation is strict: every field needs its number (“1: string name”), an enum value must be one of the declared ones, a string must be UTF-8, and a union carries at most one member."
       },
       "version": {
         "title": "New version of pattern {name}",
@@ -11774,7 +11774,14 @@
         "protobuf_required": "required",
         "protobuf_optional": "optional",
         "protobuf_repeated": "repeated",
-        "protobuf_oneof": "one of: {name}"
+        "protobuf_oneof": "one of: {name}",
+        "thrift_fields": "Fields of the type",
+        "thrift_id": "Number",
+        "thrift_type": "Type",
+        "thrift_presence": "Presence",
+        "thrift_required": "required",
+        "thrift_optional": "optional",
+        "thrift_default": "default"
       },
       "added_existing_title": "Pattern {name} already existed",
       "added_existing_version": "Someone added it meanwhile, so the text went into it as version {version}.",
@@ -11873,7 +11880,35 @@
         "proto_limit_string": "A quoted text is longer than {limit} bytes.",
         "proto_limit_name": "A name is longer than {limit} characters.",
         "proto_limit_parts": "A name has more than {limit} dot-separated parts.",
-        "proto_lexical": "The pattern has an unclosed comment, quoted text or bracket, or a character a .proto file cannot contain."
+        "proto_lexical": "The pattern has an unclosed comment, quoted text or bracket, or a character a .proto file cannot contain.",
+        "thrift_invalid": "Thrift did not accept this file: check the syntax (colons, brackets, commas) and the type names. Details are below.",
+        "thrift_include": "A Thrift pattern must be one self-contained file: “include” and “cpp_include” are not supported. Paste the types you need into the same file.",
+        "thrift_unsupported": "This pattern contains an element the registry does not support: {what}. Structs, unions, exceptions, enums and typedefs are enough to check objects.",
+        "thrift_what_service": "service (services)",
+        "thrift_what_string_types": "senum and slist (obsolete string types)",
+        "thrift_id_missing": "Every field needs its number written out, e.g. “1: string name”. Implicit numbers are not supported.",
+        "thrift_id_range": "A field number must be from 1 to 32767.",
+        "thrift_union_required": "A union member cannot be “required”: a union carries one member at most.",
+        "thrift_included_type": "A type name with a dot points into an included file, which is not supported. Define the type in the same file.",
+        "thrift_reserved": "A name is a reserved word of the Thrift language (for example list, required or string). Choose another name.",
+        "thrift_duplicate": "Two types, two fields (by name or number) or two enum values have the same name or number in the same place. Make them different.",
+        "thrift_type_missing": "The pattern uses a type that is not defined in it. Define every type in the same file.",
+        "thrift_typedef": "A typedef refers to itself, or a chain of typedefs is too long. Break the cycle or shorten the chain.",
+        "thrift_no_value": "This schema has no valid value: the first type requires itself (or an enum without values). Make one of those fields optional.",
+        "thrift_no_struct": "There is no struct, union or exception in this file. The pattern must describe one.",
+        "thrift_designated": "The comment “// tentabus:struct Name” names a type that is not a struct, union or exception of the file. Use the name of one that is written in the file.",
+        "thrift_directive": "The comment “// tentabus:struct” must be followed by the name of a type, and “// tentabus:protocol” by “binary” or “compact”; each may appear only once.",
+        "thrift_enum_range": "An enum value does not fit a 32-bit integer.",
+        "thrift_limit_types": "The pattern has more than {limit} types. Simplify it.",
+        "thrift_limit_fields": "A type, or the whole pattern, has more than {limit} fields. Split it into smaller types.",
+        "thrift_limit_values": "An enum, or all enums together, have more than {limit} values.",
+        "thrift_limit_required": "A type has more than {limit} required fields.",
+        "thrift_limit_depth": "Types or constants are nested deeper than {limit} levels.",
+        "thrift_limit_string": "A quoted text is longer than {limit} bytes.",
+        "thrift_limit_name": "A name is longer than {limit} characters.",
+        "thrift_limit_parts": "A name has more than {limit} dot-separated parts.",
+        "thrift_limit_size": "The pattern is too large for the registry (more than {limit} of one kind of element: tokens, type expressions, constants, namespaces or annotations). Simplify it.",
+        "thrift_lexical": "The pattern has an unclosed comment or quoted text, a malformed number, an unknown escape sequence in a text, or a character a Thrift file cannot contain."
       }
     },
     "topics": {
@@ -12670,7 +12705,13 @@
         "proto_packed": "a list written in one piece does not hold a whole number of elements.",
         "proto_range": "the number does not fit the field’s type.",
         "proto_enum_closed": "this value is not in the enum (proto2 accepts only declared values).",
-        "proto_required": "a required field is missing."
+        "proto_required": "a required field is missing.",
+        "thrift_bool": "a boolean has an invalid value.",
+        "thrift_size": "an array, set or map declares more items than the rest of the message can hold.",
+        "thrift_field_id": "a field number is outside the allowed range.",
+        "thrift_element": "the way the items of a list, set or map are written does not match their type in the pattern.",
+        "thrift_enum": "this value is not in the enum.",
+        "thrift_union": "more than one member of a union is set."
       }
     },
     "access": {

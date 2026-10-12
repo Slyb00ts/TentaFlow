@@ -8,7 +8,7 @@
 // the pattern's own description (`description` of a JSON Schema or an HL7
 // profile, `doc` of an Avro record, `xs:annotation/xs:documentation` of an
 // XSD), an HL7 profile spelled out as required segments and fields, an Avro
-// record or a Protobuf message as a table of its fields, the
+// record, a Protobuf message or a Thrift struct as a table of its fields, the
 // versions with "Wycofaj" per row, and the compatibility card with "Zmień".
 // Every change goes through a window (schema-windows.js) and comes back as a
 // note over the page.
@@ -302,6 +302,144 @@ export function protobufFieldsView(text) {
   return null;
 }
 
+/** The tokens of a Thrift IDL text without comments (`i` name, `n` number, `s` string, `p` one symbol), or `null` for an unfinished comment or string. */
+function thriftTokens(source) {
+  const s = String(source || '');
+  const out = [];
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (/\s/.test(c)) { i += 1; continue; }
+    if (c === '#' || (c === '/' && s[i + 1] === '/')) { while (i < s.length && s[i] !== '\n') i += 1; continue; }
+    if (c === '/' && s[i + 1] === '*') {
+      const end = s.indexOf('*/', i + 2);
+      if (end < 0) return null;
+      i = end + 2;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      let j = i + 1;
+      while (j < s.length && s[j] !== c && s[j] !== '\n') j += s[j] === '\\' ? 2 : 1;
+      if (j >= s.length || s[j] !== c) return null;
+      out.push({ t: 's', v: s.slice(i, j + 1) });
+      i = j + 1;
+      continue;
+    }
+    if (/[A-Za-z_]/.test(c)) {
+      let j = i;
+      while (j < s.length && /[A-Za-z0-9_.]/.test(s[j])) j += 1;
+      out.push({ t: 'i', v: s.slice(i, j) });
+      i = j;
+      continue;
+    }
+    if (/[0-9+-]/.test(c)) {
+      let j = i + 1;
+      while (j < s.length && /[A-Za-z0-9_.]/.test(s[j])) j += 1;
+      out.push({ t: 'n', v: s.slice(i, j) });
+      i = j;
+      continue;
+    }
+    out.push({ t: 'p', v: c });
+    i += 1;
+  }
+  return out;
+}
+
+const thriftSymbol = (tok, v) => tok?.t === 'p' && tok.v === v;
+const THRIFT_OPENERS = { '<': '>', '(': ')', '[': ']', '{': '}' };
+
+/** Index just past the bracket pair that opens at `open`, or -1. */
+function thriftSkipPair(tokens, open) {
+  const stack = [];
+  for (let i = open; i < tokens.length; i += 1) {
+    const tok = tokens[i];
+    if (tok.t !== 'p') continue;
+    if (THRIFT_OPENERS[tok.v]) stack.push(THRIFT_OPENERS[tok.v]);
+    else if (Object.values(THRIFT_OPENERS).includes(tok.v)) {
+      if (stack.pop() !== tok.v) return -1;
+      if (!stack.length) return i + 1;
+    }
+  }
+  return -1;
+}
+
+/** The fields of one struct body (`from` to `to`, exclusive). */
+function thriftBodyFields(tokens, from, to) {
+  const fields = [];
+  let i = from;
+  while (i < to) {
+    if (thriftSymbol(tokens[i], ',') || thriftSymbol(tokens[i], ';')) { i += 1; continue; }
+    let id = null;
+    if (tokens[i].t === 'n' && thriftSymbol(tokens[i + 1], ':')) { id = Number(tokens[i].v); i += 2; }
+    let label = 'default';
+    if (tokens[i]?.t === 'i' && (tokens[i].v === 'required' || tokens[i].v === 'optional')) { label = tokens[i].v; i += 1; }
+    // The type: a word, or list/set/map with its brackets.
+    const typeStart = i;
+    if (tokens[i]?.t !== 'i') return fields;
+    i += 1;
+    if (thriftSymbol(tokens[i], '<')) {
+      i = thriftSkipPair(tokens, i);
+      if (i < 0) return fields;
+    }
+    const type = tokens.slice(typeStart, i).map((x) => (x.v === ',' ? ', ' : x.v)).join('');
+    if (thriftSymbol(tokens[i], '(')) {
+      i = thriftSkipPair(tokens, i);
+      if (i < 0) return fields;
+    }
+    const name = tokens[i];
+    if (name?.t !== 'i' || id === null) return fields;
+    i += 1;
+    // A default value and annotation up to the separator.
+    while (i < to && !thriftSymbol(tokens[i], ',') && !thriftSymbol(tokens[i], ';')) {
+      if (tokens[i].t === 'p' && THRIFT_OPENERS[tokens[i].v]) {
+        i = thriftSkipPair(tokens, i);
+        if (i < 0) return fields;
+      } else if (tokens[i].t === 'n' && thriftSymbol(tokens[i + 1], ':')) {
+        break;
+      } else {
+        i += 1;
+      }
+    }
+    fields.push({ id, name: name.v, type, label });
+  }
+  return fields;
+}
+
+/**
+ * The fields of the struct, union or exception a Thrift text designates (the
+ * one named by the comment `// tentabus:struct Name`, else the first one),
+ * spelled out: `[{ id, name, type, label }]` with `label` one of `required`,
+ * `optional` or `default`. `null` when the text has no such type or cannot be
+ * read.
+ */
+export function thriftFieldsView(text) {
+  const tokens = thriftTokens(text);
+  if (!tokens) return null;
+  const named = /^[ \t]*(?:\/\/|#)[ \t]*tentabus:struct[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*\r?$/m.exec(String(text || ''))?.[1];
+  for (let i = 0; i < tokens.length; i += 1) {
+    const tok = tokens[i];
+    if (tok.t === 'i' && ['struct', 'union', 'exception'].includes(tok.v) && tokens[i + 1]?.t === 'i' && thriftSymbol(tokens[i + 2], '{')
+      && (!named || tokens[i + 1].v === named)) {
+      let end = i + 3;
+      let depth = 1;
+      for (; end < tokens.length && depth > 0; end += 1) {
+        if (thriftSymbol(tokens[end], '{')) depth += 1;
+        else if (thriftSymbol(tokens[end], '}')) depth -= 1;
+      }
+      return depth === 0 ? thriftBodyFields(tokens, i + 3, end - 1) : null;
+    }
+    // Skip the body of any other declaration.
+    if (tok.t === 'i' && ['struct', 'union', 'exception', 'enum', 'service'].includes(tok.v)) {
+      const open = tokens.findIndex((x, k) => k > i && thriftSymbol(x, '{'));
+      if (open < 0) return null;
+      const end = thriftSkipPair(tokens, open);
+      if (end < 0) return null;
+      i = end - 1;
+    }
+  }
+  return null;
+}
+
 /**
  * The text as the page shows it: a pattern written in JSON is laid out with
  * indentation (patterns sent over REST often arrive on one line); "Kopiuj"
@@ -422,6 +560,15 @@ function pageHtml(name) {
               <tf-column key="field" label="${escapeAttr(T('schemas.detail.profile_field'))}" renderer="html"></tf-column>
               <tf-column key="type" label="${escapeAttr(T('schemas.detail.protobuf_type'))}" renderer="html" fill></tf-column>
               <tf-column key="presence" label="${escapeAttr(T('schemas.detail.protobuf_presence'))}" renderer="html"></tf-column>
+            </tf-table>
+          </div>
+          <div class="tb-profile" data-role="thrift" hidden>
+            <label class="tb-profile-label">${escapeHtml(T('schemas.detail.thrift_fields'))}</label>
+            <tf-table data-role="thrift-fields">
+              <tf-column key="id" label="${escapeAttr(T('schemas.detail.thrift_id'))}" renderer="html"></tf-column>
+              <tf-column key="field" label="${escapeAttr(T('schemas.detail.profile_field'))}" renderer="html"></tf-column>
+              <tf-column key="type" label="${escapeAttr(T('schemas.detail.thrift_type'))}" renderer="html" fill></tf-column>
+              <tf-column key="presence" label="${escapeAttr(T('schemas.detail.thrift_presence'))}" renderer="html"></tf-column>
             </tf-table>
           </div>
           <div class="muted" data-role="text-note"></div>
@@ -635,6 +782,7 @@ function paintText(body, view, effective) {
   paintProfile(body, ready && info.schemaType === 'hl7v2_profile' ? hl7ProfileView(shown.text) : null);
   paintAvroFields(body, ready && info.schemaType === 'avro' ? avroFieldsView(shown.text) : null);
   paintProtobufFields(body, ready && info.schemaType === 'protobuf' ? protobufFieldsView(shown.text) : null);
+  paintThriftFields(body, ready && info.schemaType === 'thrift' ? thriftFieldsView(shown.text) : null);
   if (ready && editor.__tbText !== `${info.schemaType}\u0000${shown.text}`) {
     editor.__tbText = `${info.schemaType}\u0000${shown.text}`;
     editor.setAttribute('language', editorLanguage(info.schemaType));
@@ -687,6 +835,19 @@ function paintProtobufFields(body, fields) {
     type: `<span class="tf-table__cell--mono">${escapeHtml(f.type)}</span>`,
     presence: escapeHtml(protobufPresence(f.label)),
     _key: String(f.number),
+  })));
+}
+
+function paintThriftFields(body, fields) {
+  const el = body.querySelector('[data-role="thrift"]');
+  el.hidden = !fields?.length;
+  if (!fields?.length) return;
+  setRowsIfChanged(body.querySelector('[data-role="thrift-fields"]'), fields.map((f) => ({
+    id: `<span class="tf-table__cell--mono">${escapeHtml(String(f.id))}</span>`,
+    field: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(f.name)}</span></span>`,
+    type: `<span class="tf-table__cell--mono">${escapeHtml(f.type)}</span>`,
+    presence: escapeHtml(T(`schemas.detail.thrift_${f.label}`)),
+    _key: String(f.id),
   })));
 }
 

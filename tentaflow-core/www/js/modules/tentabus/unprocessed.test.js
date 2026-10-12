@@ -472,6 +472,19 @@ test('every HL7 and XSD sentence a message can be refused with is told in Polish
     ['/xs: document exceeds the validation work budget', '/xs: dokument jest zbyt duży, żeby sprawdzić go wzorem w rozsądnym czasie.'],
   ];
   for (const [server, expected] of protobuf) assert.equal(plainCheckError(server), expected, server);
+  // The Thrift checker's own sentences (thrift/walker.rs); the framing ones share the Avro and Protobuf ones.
+  const thrift = [
+    ['/b: boolean is not a valid value', '/b: wartość logiczna ma niepoprawną wartość.'],
+    ['/xs: length or size is negative', '/xs: długość jest ujemna.'],
+    ['/xs: declared size exceeds the remaining payload', '/xs: tablica, zbiór lub mapa deklaruje więcej elementów, niż mieści reszta wiadomości.'],
+    ['<root>: field id is out of range', 'Numer pola jest poza dozwolonym zakresem.'],
+    ['/lines: element wire type does not match the type declared for the field', '/lines: sposób zapisu elementów listy, zbioru lub mapy nie zgadza się z ich typem we wzorze.'],
+    ['/status: enum value is not declared in the enum', '/status: ta wartość nie należy do typu wyliczeniowego.'],
+    ['/payment/voucher: more than one member of the union is set', '/payment/voucher: ustawiono więcej niż jednego członka unii.'],
+    ['/n: integer encoding is longer than allowed or overflows its type', '/n: liczba jest zapisana niepoprawnie (za długo).'],
+    ['/id: required field is missing', '/id: brakuje pola wymaganego (required).'],
+  ];
+  for (const [server, expected] of thrift) assert.equal(plainCheckError(server), expected, server);
   assert.equal(plainCheckError('/pacjent: a sentence nobody mapped'), '');
 });
 

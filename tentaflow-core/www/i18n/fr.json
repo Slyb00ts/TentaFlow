@@ -10128,7 +10128,6 @@
       "schema_not_found": "Schéma introuvable dans le registre.",
       "schema_version_not_found": "Cette version du schéma n'est pas dans le registre.",
       "schema_incompatible": "La nouvelle version du schéma enfreint le mode de compatibilité enregistré.",
-      "schema_type_unsupported": "Ce type de schéma ne prend pas en charge l'opération demandée.",
       "schema_ref_id_collision": "Collision d'identifiant de référence de schéma — enregistrez à nouveau le schéma.",
       "instance_mismatch": "La requête visait une autre instance TentaBus que celle qui l'a traitée — erreur de configuration côté serveur.",
       "authorizer_instance_mismatch": "La vérification des droits est rattachée à une autre instance TentaBus que le moteur — erreur de configuration côté serveur.",
@@ -10351,7 +10350,8 @@
         "text_hint_hl7v2_profile": "Un profil est un texte JSON avec des listes de segments et de champs obligatoires, par ex. {example}. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1.",
         "text_hint_xsd": "Un modèle XSD ordinaire écrit dans un seul fichier fonctionne, sans fichiers inclus et sans les parties plus avancées de XSD. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1.",
         "text_hint_avro": "Un modèle Avro est un schéma écrit en JSON, p. ex. {example}. Il vérifie un seul message écrit dans l’encodage binaire Avro, sans en-tête de fichier Avro ni en-tête Confluent. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1.",
-        "text_hint_protobuf": "Un modèle Protobuf est un fichier .proto (proto3 ou proto2) écrit d’un seul tenant, sans « import ». Il décrit un message : le premier du fichier ou celui que nomme un commentaire comme « // tentabus:message Order ». Exemple : {example}. Il vérifie un seul message écrit dans l’encodage binaire Protobuf. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1. La validation est stricte : un int32 négatif doit utiliser l’encodage complet sur 10 octets (la forme sur 5 octets est refusée), uint32 et sint32 ne peuvent pas dépasser 2^32−1, bool vaut seulement 0 ou 1, et les numéros de champ 19000–19999 sont refusés même si le modèle ne les déclare pas."
+        "text_hint_protobuf": "Un modèle Protobuf est un fichier .proto (proto3 ou proto2) écrit d’un seul tenant, sans « import ». Il décrit un message : le premier du fichier ou celui que nomme un commentaire comme « // tentabus:message Order ». Exemple : {example}. Il vérifie un seul message écrit dans l’encodage binaire Protobuf. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1. La validation est stricte : un int32 négatif doit utiliser l’encodage complet sur 10 octets (la forme sur 5 octets est refusée), uint32 et sint32 ne peuvent pas dépasser 2^32−1, bool vaut seulement 0 ou 1, et les numéros de champ 19000–19999 sont refusés même si le modèle ne les déclare pas.",
+        "text_hint_thrift": "Un modèle Thrift est un fichier IDL d’un seul tenant, sans « include ». Il décrit un type : le premier struct, union ou exception du fichier, ou celui que désigne un commentaire tel que « // tentabus:struct Order ». Exemple : {example}. Il vérifie un seul objet écrit dans l’encodage binaire de Thrift (TBinaryProtocol), ou dans l’encodage compact (TCompactProtocol) lorsque le fichier contient le commentaire « // tentabus:protocol compact » — sans en-tête de message ni découpage en trames. Sont acceptés : struct, union, exception, enum, typedef, namespace, list, set et map, constantes et valeurs par défaut (elles sont lues mais n’influencent pas la vérification). Non pris en charge : include et service. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version 1. La validation est stricte : chaque champ a besoin de son numéro (« 1: string name »), une valeur d’enum doit être l’une des valeurs déclarées, un string doit être en UTF-8 et une union porte au plus un membre."
       },
       "version": {
         "title": "Nouvelle version du modèle {name}",
@@ -10539,7 +10539,14 @@
         "protobuf_required": "obligatoire",
         "protobuf_optional": "facultatif",
         "protobuf_repeated": "répété",
-        "protobuf_oneof": "un parmi : {name}"
+        "protobuf_oneof": "un parmi : {name}",
+        "thrift_fields": "Champs du type",
+        "thrift_id": "Numéro",
+        "thrift_type": "Type",
+        "thrift_presence": "Présence",
+        "thrift_required": "obligatoire",
+        "thrift_optional": "optionnel",
+        "thrift_default": "par défaut"
       },
       "added_existing_title": "Le modèle {name} existait déjà",
       "added_existing_version": "Quelqu’un l’a ajouté entre-temps, le texte y est donc entré en version {version}.",
@@ -10638,7 +10645,35 @@
         "proto_limit_string": "Un texte entre guillemets dépasse {limit} octets.",
         "proto_limit_name": "Un nom dépasse {limit} caractères.",
         "proto_limit_parts": "Un nom compte plus de {limit} parties séparées par des points.",
-        "proto_lexical": "Le modèle a un commentaire, un texte entre guillemets ou une accolade non fermés, ou un caractère qu’un fichier .proto ne peut pas contenir."
+        "proto_lexical": "Le modèle a un commentaire, un texte entre guillemets ou une accolade non fermés, ou un caractère qu’un fichier .proto ne peut pas contenir.",
+        "thrift_invalid": "Thrift n’a pas accepté ce fichier : vérifiez la syntaxe (deux-points, crochets, virgules) et les noms de types. Les détails sont ci-dessous.",
+        "thrift_include": "Un modèle Thrift doit être un seul fichier autonome : « include » et « cpp_include » ne sont pas pris en charge. Collez les types nécessaires dans le même fichier.",
+        "thrift_unsupported": "Ce modèle contient un élément que le registre ne prend pas en charge : {what}. Pour vérifier des objets, struct, union, exception, enum et typedef suffisent.",
+        "thrift_what_service": "service (services)",
+        "thrift_what_string_types": "senum et slist (types texte obsolètes)",
+        "thrift_id_missing": "Chaque champ a besoin de son numéro écrit explicitement, p. ex. « 1: string name ». Les numéros implicites ne sont pas pris en charge.",
+        "thrift_id_range": "Le numéro d’un champ doit être compris entre 1 et 32767.",
+        "thrift_union_required": "Un membre d’une union ne peut pas être « required » : une union porte au plus un membre.",
+        "thrift_included_type": "Un nom de type contenant un point désigne un fichier inclus, ce qui n’est pas pris en charge. Définissez le type dans le même fichier.",
+        "thrift_reserved": "Un nom est un mot réservé du langage Thrift (par exemple list, required ou string). Choisissez un autre nom.",
+        "thrift_duplicate": "Deux types, deux champs (par nom ou numéro) ou deux valeurs d’enum ont le même nom ou numéro au même endroit. Rendez-les différents.",
+        "thrift_type_missing": "Le modèle utilise un type qui n’y est pas défini. Définissez chaque type dans le même fichier.",
+        "thrift_typedef": "Un typedef se désigne lui-même, ou une chaîne de typedefs est trop longue. Rompez le cycle ou raccourcissez la chaîne.",
+        "thrift_no_value": "Ce modèle n’a aucune valeur valide : le premier type s’exige lui-même (ou un enum sans valeurs). Rendez l’un de ces champs optionnel.",
+        "thrift_no_struct": "Ce fichier ne contient aucun struct, union ni exception. Le modèle doit en décrire un.",
+        "thrift_designated": "Le commentaire « // tentabus:struct Nom » désigne un type qui n’est pas un struct, union ou exception du fichier. Utilisez le nom d’un type écrit dans le fichier.",
+        "thrift_directive": "Le commentaire « // tentabus:struct » doit être suivi du nom d’un type, et « // tentabus:protocol » de « binary » ou « compact » ; chacun ne peut apparaître qu’une fois.",
+        "thrift_enum_range": "Une valeur d’enum ne tient pas dans un entier de 32 bits.",
+        "thrift_limit_types": "Le modèle a plus de {limit} types. Simplifiez-le.",
+        "thrift_limit_fields": "Un type, ou tout le modèle, a plus de {limit} champs. Découpez-le en types plus petits.",
+        "thrift_limit_values": "Un enum, ou tous ensemble, ont plus de {limit} valeurs.",
+        "thrift_limit_required": "Un type a plus de {limit} champs obligatoires (required).",
+        "thrift_limit_depth": "Les types ou les constantes sont imbriqués sur plus de {limit} niveaux.",
+        "thrift_limit_string": "Un texte entre guillemets dépasse {limit} octets.",
+        "thrift_limit_name": "Un nom dépasse {limit} caractères.",
+        "thrift_limit_parts": "Un nom a plus de {limit} parties séparées par des points.",
+        "thrift_limit_size": "Le modèle est trop grand pour le registre (plus de {limit} éléments d’un même genre : jetons, expressions de type, constantes, espaces de noms ou annotations). Simplifiez-le.",
+        "thrift_lexical": "Le modèle contient un commentaire ou un texte entre guillemets non fermé, un nombre mal écrit, une séquence d’échappement inconnue dans un texte ou un caractère qu’un fichier Thrift ne peut pas contenir."
       }
     },
     "topics": {
@@ -11435,7 +11470,13 @@
         "proto_packed": "une liste écrite d’un seul tenant ne contient pas un nombre entier d’éléments.",
         "proto_range": "le nombre ne tient pas dans le type du champ.",
         "proto_enum_closed": "cette valeur n’appartient pas à l’enum (proto2 n’accepte que les valeurs déclarées).",
-        "proto_required": "un champ obligatoire (required) est absent."
+        "proto_required": "un champ obligatoire (required) est absent.",
+        "thrift_bool": "une valeur booléenne n’est pas valide.",
+        "thrift_size": "un tableau, un ensemble ou une table déclare plus d’éléments que le reste du message ne peut en contenir.",
+        "thrift_field_id": "le numéro d’un champ est hors de la plage autorisée.",
+        "thrift_element": "la façon dont les éléments d’une liste, d’un ensemble ou d’une table sont écrits ne correspond pas à leur type dans le modèle.",
+        "thrift_enum": "cette valeur n’appartient pas à l’enum.",
+        "thrift_union": "plus d’un membre d’une union est défini."
       }
     },
     "access": {
