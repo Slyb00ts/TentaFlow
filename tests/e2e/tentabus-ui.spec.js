@@ -667,7 +667,8 @@ test('T04 creator: name checks, three steps, pattern for the chosen content, the
   await creator(page).locator('[data-act="cancel"]').click();
   await expect(creator(page).locator('[data-role="discard"]')).toBeVisible();
   await expect(creator(page)).toHaveCount(1);
-  await expect(creator(page).locator('#tb-cr-kind tf-choice-card')).toHaveCount(3);
+  await expect(creator(page).locator('#tb-cr-kind tf-choice-card')).toHaveCount(4);
+  await expect(creator(page).locator('#tb-cr-kind tf-choice-card[value="application/octet-stream"]')).toHaveAttribute('description', 'Wiadomości Avro, Protobuf lub Thrift w zapisie binarnym');
   await creator(page).locator('#tb-cr-kind tf-choice-card[value="application/json"]').click();
   await creator(page).locator('#tb-cr-partitions .tf-input-step--inc').click();
   await expect(creator(page).locator('#tb-cr-partitions input')).toHaveValue('4');
@@ -2720,7 +2721,7 @@ test('F4 a Protobuf pattern: the hint names the message, a refused import is tol
     const refusal = win.locator('[data-role="error"]');
     await expect(refusal).toBeVisible({ timeout: 15000 });
     await expect(refusal).toContainText('Nie dodano wersji 2.');
-    await expect(refusal).toContainText('typ „/id” się zmienia: int64 nie da się odczytać jako string');
+    await expect(refusal).toContainText('typ „id” się zmienia: int64 nie da się odczytać jako string');
     await page.screenshot({ path: path.join(SHOTS, 'f4-protobuf-odmowa-typ.png') });
     // A new field is compatible.
     await win.locator('[data-role="text"] textarea').fill(PROTO_V1.replace('int64 id = 1;', 'int64 id = 1;\n  string region = 6;'));
@@ -2737,6 +2738,7 @@ test('F4 a Protobuf pattern: the hint names the message, a refused import is tol
 });
 
 const THRIFT_NAME = `zamowienie-thrift-${RUN}`;
+const THRIFT_TOPIC = `zamowienia-thrift-${RUN}`;
 const THRIFT_V1 = `// tentabus:struct Order
 struct Header { 1: string trace }
 struct Order {
@@ -2760,7 +2762,17 @@ test('F4 a Thrift pattern: the hint names the type, a refused include is told in
     await schemasSlot(page).locator('[data-go="add"]').first().click();
     await expect(win.locator('[slot="body"]')).toBeVisible();
     await win.locator('tf-choice-card[value="thrift"]').click();
-    await expect(win.locator('[data-role="text"]')).toHaveAttribute('hint', /Wzór Thrift to plik IDL.*bez „include”.*tentabus:struct Order.*tentabus:protocol compact/);
+    await expect(win.locator('[data-role="text"]')).toHaveAttribute('hint', /Wzór Thrift to plik IDL.*bez „include”.*tentabus:struct Order.*to będzie wersja 1\.$/);
+    // The long part is behind "Więcej", closed until asked for.
+    const more = win.locator('details[data-role="more"]');
+    await expect(more).toBeVisible();
+    await expect(more.locator('[data-role="more-text"]')).toBeHidden();
+    await more.locator('summary').click();
+    await expect(more.locator('[data-role="more-text"]')).toContainText('tentabus:protocol compact');
+    await win.locator('tf-choice-card[value="avro"]').click();
+    await expect(more).toBeHidden();
+    await win.locator('tf-choice-card[value="thrift"]').click();
+    await expect(more).toBeVisible();
     await win.locator('[data-role="name"] input').fill(THRIFT_NAME);
     await win.locator('[data-role="text"] textarea').fill('include "shared.thrift"\nstruct M { 1: i32 a }');
     await win.locator('[data-act="save"]').click();
@@ -2797,8 +2809,14 @@ test('F4 a Thrift pattern: the hint names the type, a refused include is told in
     const refusal = win.locator('[data-role="error"]');
     await expect(refusal).toBeVisible({ timeout: 15000 });
     await expect(refusal).toContainText('Nie dodano wersji 2.');
-    await expect(refusal).toContainText('typ „/id” się zmienia: i64 nie da się odczytać jako string');
+    await expect(refusal).toContainText('typ „id” się zmienia: i64 nie da się odczytać jako string');
     await page.screenshot({ path: path.join(SHOTS, 'f4-thrift-odmowa-typ.png') });
+    // The window for a new version shows the same hint as "Dodaj wzór", for the version it adds.
+    await expect(win.locator('[data-role="text"]')).toHaveAttribute('hint', /Wzór Thrift to plik IDL.*to będzie wersja 2\.$/);
+    // A protocol switch is refused in words, in both directions.
+    await win.locator('[data-role="text"] textarea').fill(`// tentabus:protocol compact\n${THRIFT_V1}`);
+    await win.locator('[data-act="save"]').click();
+    await expect(refusal).toContainText('stary wzór jest zapisany w protokole binary, a nowy w protokole compact', { timeout: 15000 });
     // A new optional field is compatible.
     await win.locator('[data-role="text"] textarea').fill(THRIFT_V1.replace('4: optional string note', '4: optional string note,\n  5: string region'));
     await expect(refusal).toBeHidden();
@@ -2807,7 +2825,25 @@ test('F4 a Thrift pattern: the hint names the type, a refused include is told in
     await expect(p.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Dodano wersję 2');
     await expect(p.locator('[data-role="thrift-fields"] tbody tr')).toHaveCount(5, { timeout: 15000 });
     expect((await busCall(page, 'busSchemaVersionListRequest', { instanceId: instance, subject: THRIFT_NAME })).versions.map((v) => v.version)).toEqual([1, 2]);
+
+    // A binary topic is created in the dashboard and checked with the pattern, end to end.
+    await openTopics(page);
+    await topicsSlot(page).locator('tf-button[data-go="create"]').click();
+    await expect(creator(page).locator('.install-header')).toBeVisible();
+    await creator(page).locator('#tb-cr-name input').fill(THRIFT_TOPIC);
+    await creator(page).locator('#tb-cr-kind tf-choice-card[value="application/octet-stream"]').click();
+    await nextButton(page).click();
+    await nextButton(page).click();
+    const options = await creator(page).locator('#tb-cr-schema select option').allTextContents();
+    expect(options.map(norm)).toEqual([`${THRIFT_NAME} · Thrift`]);
+    await nextButton(page).click();
+    await expect(creator(page)).toHaveCount(0, { timeout: 15000 });
+    await expect(topicRow(page, THRIFT_TOPIC)).toContainText(`Binarna · wzór ${THRIFT_NAME}`, { timeout: 15000 });
+    const topic = await busCall(page, 'busTopicDetailRequest', { instanceId: instance, name: THRIFT_TOPIC });
+    expect(topic.topic).toMatchObject({ contentType: 'application/octet-stream', schemaId: THRIFT_NAME });
+    expect(topic.topic.validation).not.toBe('off');
   } finally {
+    await busCall(page, 'busTopicDeleteRequest', { instanceId: instance, name: THRIFT_TOPIC }).catch(() => {});
     await busCall(page, 'busSchemaDeleteRequest', { instanceId: instance, subject: THRIFT_NAME, deprecateOnly: false }).catch(() => {});
   }
   expect(errors.filter((e) => !/schema_incompatible|BadRequest|invalid_argument/.test(e)), errors.join('\n')).toEqual([]);

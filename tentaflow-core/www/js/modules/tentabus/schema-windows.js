@@ -23,7 +23,7 @@
 // is shown as the server wrote it, under a line that still says what happened.
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
-import { T, fmtCount } from '/js/modules/tentabus/format.js';
+import { T, fmtCount, shownPath } from '/js/modules/tentabus/format.js';
 import { COMPATIBILITIES, compatLabel, schemaFormatLabel, schemaKind, listText } from '/js/modules/tentabus/schemas.js';
 import { openChangeWindow, openConfirmWindow } from '/js/modules/tentabus/windows.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
@@ -383,6 +383,9 @@ const PROTO_ENUM_OPEN = /enum '([^']*)' of the (?:old|new) schema accepts any nu
 const PROTO_RESERVED = /field number (\d+) is reserved by the old schema and cannot be used by the new one/;
 const PROTO_ONEOF = /fields '([^']*)' and '([^']*)' share the oneof '([^']*)' of the (?:old|new) schema, but the (?:old|new) schema can write both/;
 
+// thrift.rs `check_compatibility`: the protocol is part of the wire format.
+const THRIFT_PROTOCOL = /<root>: the old schema is written in the (binary|compact) protocol, the new one in the (binary|compact) protocol/;
+
 const quotedList = (items) => listText(items.map((item) => T('schemas.incompat.quoted', { item })));
 
 /**
@@ -461,8 +464,10 @@ export function incompatibilityReason({ mode, detail, newText }) {
   if (protoOneof) return { reason: T('schemas.incompat.proto_oneof', { first: protoOneof[1], second: protoOneof[2], oneof: protoOneof[3] }), fix: generic };
   const protoReserved = PROTO_RESERVED.exec(detail);
   if (protoReserved) return { reason: T('schemas.incompat.proto_reserved', { number: protoReserved[1] }), fix: generic };
+  const thriftProtocol = THRIFT_PROTOCOL.exec(detail);
+  if (thriftProtocol) return { reason: T('schemas.incompat.thrift_protocol', { from: thriftProtocol[1], to: thriftProtocol[2] }), fix: T('schemas.incompat.thrift_protocol_fix') };
   const avroType = AVRO_TYPE.exec(detail);
-  if (avroType) return { reason: T('schemas.incompat.avro_type', { path: avroType[1] === '<root>' ? '/' : avroType[1], from: avroType[2], to: avroType[3] }), fix: generic };
+  if (avroType) return { reason: T('schemas.incompat.avro_type', { path: avroType[1] === '<root>' ? '/' : shownPath(avroType[1]), from: avroType[2], to: avroType[3] }), fix: generic };
   const avroEnum = AVRO_ENUM.exec(detail);
   if (avroEnum) return { reason: T('schemas.incompat.avro_enum', { name: avroEnum[1], symbol: avroEnum[2] }), fix: generic };
   let field = quoted(/^property '([^']+)' is required by the reader schema but not guaranteed present by the writer schema/);
@@ -580,6 +585,7 @@ const THRIFT_LIMIT_REFUSALS = [
   [/^the schema has more than (\d+) (?:tokens|type expressions|constants|namespaces)/, 'size'],
   [/^the constants and default values have more than (\d+) parts/, 'size'],
   [/^an annotation has more than (\d+) entries/, 'size'],
+  [/^the schema has more than (\d+) annotation entries/, 'size'],
 ];
 const NUMBER_TYPE_ADVICE = { float: 'decimal', double: 'decimal', long: 'integer', short: 'int', byte: 'int', unsignedInt: 'integer', unsignedLong: 'integer', nonNegativeInteger: 'integer', positiveInteger: 'integer', negativeInteger: 'integer' };
 
@@ -589,6 +595,13 @@ const NUMBER_TYPE_ADVICE = { float: 'decimal', double: 'decimal', long: 'integer
  * the text was not accepted and folds the server's sentence away).
  */
 export function textRefusalReason(schemaType, serverText) {
+  const reason = refusalReasonOf(schemaType, serverText);
+  // The parsers that count lines write "(line N)" into their sentence; the folded details are English, the line is said here.
+  const line = /\(line (\d+)\)/.exec(String(serverText || ''));
+  return reason && line ? `${reason} ${T('schemas.refused.at_line', { line: line[1] })}` : reason;
+}
+
+function refusalReasonOf(schemaType, serverText) {
   const text = String(serverText || '').replace(/^invalid schema:\s*/, '');
   if (schemaType === 'hl7v2_profile') {
     let m = /'(MSH-[12])' is the message's own field-separator/.exec(text);
@@ -658,7 +671,12 @@ export function textRefusalReason(schemaType, serverText) {
     if (/cannot be required/.test(text)) return T('schemas.refused.thrift_union_required');
     if (/points into an included file/.test(text)) return T('schemas.refused.thrift_included_type');
     if (/is a reserved word/.test(text)) return T('schemas.refused.thrift_reserved');
-    if (/is defined more than once|has two fields|has two values named/.test(text)) return T('schemas.refused.thrift_duplicate');
+    if (/^type '[^']*' is defined more than once/.test(text)) return T('schemas.refused.thrift_duplicate_type');
+    if (/^constant '[^']*' is defined more than once/.test(text)) return T('schemas.refused.thrift_duplicate_const');
+    if (/has two fields with the id/.test(text)) return T('schemas.refused.thrift_duplicate_id');
+    if (/has two fields named/.test(text)) return T('schemas.refused.thrift_duplicate_field');
+    if (/has two values named/.test(text)) return T('schemas.refused.thrift_duplicate_value');
+    if (/^the name of an? .* cannot contain a dot/.test(text)) return T('schemas.refused.thrift_dotted_name');
     if (/is not defined in the schema/.test(text)) return T('schemas.refused.thrift_type_missing');
     if (/refers to itself|^a chain of typedefs is longer/.test(text)) return T('schemas.refused.thrift_typedef');
     if (/^the schema can never produce a value/.test(text)) return T('schemas.refused.thrift_no_value');
@@ -747,6 +765,10 @@ export function refusalHtml({ err, title, compatibility, schemaType, newText, de
   // The comparison gave up: neither proven compatible nor incompatible.
   if (/\bbus\.schema_compare_too_complex: /.test(message)) {
     return `<div>${head} ${escapeHtml(T('schemas.refused.compare_too_complex'))}</div>`;
+  }
+  const previous = /\bbus\.invalid_argument: the previous version of this subject could not be checked under the current rules of its format, so it cannot be compared with the new one \(v(\d+)\): ([\s\S]*)$/.exec(message);
+  if (previous) {
+    return `<div>${head} ${escapeHtml(T('schemas.refused.previous_unreadable', { version: previous[1] }))}</div>${technical(previous[2].trim())}`;
   }
   const invalid = /\bbus\.invalid_argument: schema: ([\s\S]*)$/.exec(message);
   if (invalid) {
@@ -841,9 +863,10 @@ export function addedNotice({ subject, schemaType, version, deduplicated }) {
 const TEXT_ERRORS = { empty: 'schemas.text_empty', too_big: 'schemas.text_too_big', not_json: 'schemas.text_not_json', not_xml: 'schemas.text_not_xml', not_object: 'schemas.refused.hl7_shape', not_xsd: 'schemas.refused.xsd_root' };
 const NAME_ERRORS = { empty: 'schemas.add.name_empty', invalid: 'schemas.add.name_invalid', taken: 'schemas.add.name_taken' };
 
-function textField(label, hint, value = '') {
+function textField(label, hint, value = '', more = '') {
   return `
     <tf-textarea class="tb-mono-input" data-role="text" rows="10" label="${escapeAttr(label)}" hint="${escapeAttr(hint)}" value="${escapeAttr(value)}" spellcheck="false"></tf-textarea>
+    <details class="tb-tech" data-role="more"${more ? '' : ' hidden'}><summary>${escapeHtml(T('schemas.add.more'))}</summary><div data-role="more-text">${escapeHtml(more)}</div></details>
     <tf-file-input data-role="file" label="${escapeAttr(T('schemas.file_label'))}"></tf-file-input>`;
 }
 
@@ -873,13 +896,18 @@ function wireTextField(win, sync, formatOf) {
 }
 
 /** What the text field of "Dodaj wzór" says about the chosen format: what to write and, for the two text formats, what works. */
-export function addTextHint(schemaType) {
-  if (schemaType === 'hl7v2_profile') return T('schemas.add.text_hint_hl7v2_profile', { example: HL7_PROFILE_EXAMPLE });
-  if (schemaType === 'xsd') return T('schemas.add.text_hint_xsd');
-  if (schemaType === 'avro') return T('schemas.add.text_hint_avro', { example: AVRO_SCHEMA_EXAMPLE });
-  if (schemaType === 'protobuf') return T('schemas.add.text_hint_protobuf', { example: PROTOBUF_SCHEMA_EXAMPLE });
-  if (schemaType === 'thrift') return T('schemas.add.text_hint_thrift', { example: THRIFT_SCHEMA_EXAMPLE });
-  return T('schemas.add.text_hint');
+export function addTextHint(schemaType, version = 1) {
+  if (schemaType === 'hl7v2_profile') return T('schemas.add.text_hint_hl7v2_profile', { example: HL7_PROFILE_EXAMPLE, version });
+  if (schemaType === 'xsd') return T('schemas.add.text_hint_xsd', { version });
+  if (schemaType === 'avro') return T('schemas.add.text_hint_avro', { example: AVRO_SCHEMA_EXAMPLE, version });
+  if (schemaType === 'protobuf') return T('schemas.add.text_hint_protobuf', { example: PROTOBUF_SCHEMA_EXAMPLE, version });
+  if (schemaType === 'thrift') return T('schemas.add.text_hint_thrift', { example: THRIFT_SCHEMA_EXAMPLE, version });
+  return T('schemas.add.text_hint', { version });
+}
+
+/** The long part of a format's text hint, behind "Więcej" so the short hint stays short on a phone; `''` when there is none. */
+export function addTextMore(schemaType) {
+  return schemaType === 'thrift' ? T('schemas.add.text_more_thrift') : '';
 }
 
 // The option names are sentences themselves, so the list gets the whole row
@@ -919,7 +947,7 @@ export function openSchemaAdd(ctx) {
           ? `<tf-choice-group data-role="format" columns="3" value="${escapeAttr(initialType)}" aria-label="${escapeAttr(T('schemas.col_format'))}">${tiles}</tf-choice-group>`
           : `<div class="tb-explain-box">${escapeHtml(T('schemas.add.no_formats'))}</div>`}
       </div>
-      ${textField(T('schemas.text_label'), addTextHint(initialType))}`,
+      ${textField(T('schemas.text_label'), addTextHint(initialType), '', addTextMore(initialType))}`,
     wire: (win, sync) => {
       const name = win.querySelector('[data-role="name"]');
       name.addEventListener('input', () => {
@@ -935,6 +963,9 @@ export function openSchemaAdd(ctx) {
       check = wireTextField(win, sync, () => format?.value || '');
       format?.addEventListener('change', () => {
         win.querySelector('[data-role="text"]').setAttribute('hint', addTextHint(format.value));
+        const more = addTextMore(format.value);
+        win.querySelector('[data-role="more-text"]').textContent = more;
+        win.querySelector('[data-role="more"]').hidden = !more;
         check();
         sync();
       });
@@ -987,7 +1018,7 @@ export function openSchemaVersion(ctx) {
     discardText: T('schemas.version.discard_kept'),
     fields: () => `
       ${ctx.draftText != null ? `<div class="tb-explain-box">${escapeHtml(T('schemas.version.draft_kept'))}</div>` : ''}
-      ${textField(T('schemas.version.text_label', { version: fmtCount(next) }), '', start)}
+      ${textField(T('schemas.version.text_label', { version: fmtCount(next) }), addTextHint(info.schemaType, next), start, addTextMore(info.schemaType))}
       <div class="tb-vr-hint" data-role="diff"></div>`,
     wire: (win, sync) => {
       const diff = win.querySelector('[data-role="diff"]');

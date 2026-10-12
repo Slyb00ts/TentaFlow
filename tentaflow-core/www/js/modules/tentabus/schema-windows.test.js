@@ -20,7 +20,7 @@ if (typeof globalThis.DOMParser === 'undefined' && window.DOMParser) globalThis.
 
 const {
   subjectNameProblem, schemaTextProblem, buildRegisterRequest, buildDeleteRequest, jsonSchemaChanges, parseIncompatible,
-  profileChanges, xsdChanges, hl7DropOffer, dropRequired, HL7_PROFILE_EXAMPLE, AVRO_SCHEMA_EXAMPLE, PROTOBUF_SCHEMA_EXAMPLE, THRIFT_SCHEMA_EXAMPLE, addTextHint,
+  profileChanges, xsdChanges, hl7DropOffer, dropRequired, HL7_PROFILE_EXAMPLE, AVRO_SCHEMA_EXAMPLE, PROTOBUF_SCHEMA_EXAMPLE, THRIFT_SCHEMA_EXAMPLE, addTextHint, addTextMore,
   addedNotice, incompatibilityReason, refusalHtml, boundTopics, effectiveVersion, versionImpact, versionDeprecateImpact, subjectDeprecateImpact,
   openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete,
 } = await import('./schema-windows.js');
@@ -1019,7 +1019,13 @@ test('a Thrift text: any text is sent as it is, the add window shows how the typ
   assert.equal(schemaTextProblem('   ', 'thrift'), 'empty');
   assert.equal(THRIFT_SCHEMA_EXAMPLE.includes('struct Order'), true);
   assert.match(norm(addTextHint('thrift')), /^Wzór Thrift to plik IDL w jednym kawałku, bez „include”\. Opisuje jeden typ: pierwszy struct, union albo exception z pliku, albo ten, który wskaże komentarz, np\. „\/\/ tentabus:struct Order”\. Przykład: struct Order/);
-  assert.match(norm(addTextHint('thrift')), /„\/\/ tentabus:protocol compact”.*Walidacja jest ścisła: każde pole musi mieć numer/);
+  // Short on a phone: the two sentences, the example and the closing one; the rest is behind "Więcej".
+  assert.ok(norm(addTextHint('thrift')).length < 450, norm(addTextHint('thrift')));
+  assert.match(norm(addTextHint('thrift')), /Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 1\.$/);
+  assert.match(norm(addTextHint('thrift', 3)), /to będzie wersja 3\.$/);
+  assert.match(norm(addTextHint('avro', 4)), /to będzie wersja 4\.$/);
+  assert.match(norm(addTextMore('thrift')), /„\/\/ tentabus:protocol compact”.*Nieobsługiwane: include i service.*Walidacja jest ścisła: każde pole musi mieć numer/);
+  assert.equal(addTextMore('avro'), '');
   const cases = [
     ['include is not supported: the pattern must be one self-contained file (line 1)', /„include” i „cpp_include” nie są obsługiwane/],
     ['cpp_include is not supported: the pattern must be one self-contained file (line 1)', /„include” i „cpp_include”/],
@@ -1031,27 +1037,33 @@ test('a Thrift text: any text is sent as it is, the add window shows how the typ
     ["a member of union 'U' cannot be required (line 3)", /nie może być „required”/],
     ['a type name with a dot points into an included file, which is not supported (line 3)', /wskazuje na dołączony plik/],
     ["'list' is a reserved word and cannot be the name of a field (line 3)", /słowem zastrzeżonym języka Thrift/],
-    ["type 'S' is defined more than once (line 3)", /Dwa typy, dwa pola/],
-    ["struct 'S' has two fields with the id 1 (line 3)", /Dwa typy, dwa pola/],
-    ["struct 'S' has two fields named 'a' (line 3)", /Dwa typy, dwa pola/],
-    ["enum 'E' has two values named 'A' (line 3)", /dwie wartości typu wyliczeniowego/],
+    ["type 'S' is defined more than once (line 3)", /Dwa typy \(struct, union, exception, enum albo typedef\) mają tę samą nazwę/],
+    ["constant 'C' is defined more than once (line 3)", /Dwie stałe \(const\) mają tę samą nazwę/],
+    ["struct 'S' has two fields with the id 1 (line 3)", /Dwa pola tego samego typu mają ten sam numer/],
+    ["struct 'S' has two fields named 'a' (line 3)", /Dwa pola tego samego typu mają tę samą nazwę/],
+    ["enum 'E' has two values named 'A' (line 3)", /Dwie wartości tego samego typu wyliczeniowego/],
+    ['the name of a struct cannot contain a dot (line 3)', /Nazwa wprowadzana przez deklarację nie może zawierać kropki/],
     ["type 'Nope' is not defined in the schema", /używa typu, którego w nim nie ma/],
     ["typedef 'A' refers to itself", /Typedef odwołuje się do samego siebie/],
     ['a chain of typedefs is longer than 32', /łańcuch typedefów jest za długi/],
     ['the schema can never produce a value: the root type requires itself or an enum without values', /nie ma żadnej poprawnej wartości/],
     ['the schema declares no struct, union or exception', /nie ma żadnego struct, union ani exception/],
     ["the designated struct 'X' is not a top-level struct, union or exception of the schema", /Komentarz „\/\/ tentabus:struct Nazwa” wskazuje typ/],
-    ["the comment '// tentabus:struct' must be followed by the name of a struct, union or exception (line 1)", /Po komentarzu „\/\/ tentabus:struct”/],
-    ["the comment '// tentabus:protocol' must be followed by 'binary' or 'compact' (line 1)", /„binary” albo „compact”/],
-    ["the comment '// tentabus:protocol' appears more than once (line 2)", /tylko raz/],
+    ["the comment '// tentabus:struct' must be followed by the name of a struct, union or exception (line 1)", /Komentarz, w którym jest „tentabus:”, musi być komentarzem \/\/ albo #/],
+    ["the comment '// tentabus:protocol' must be followed by 'binary' or 'compact' (line 1)", /binary\|compact/],
+    ["the comment '// tentabus:protocol' appears more than once (line 2)", /najwyżej raz/],
+    ["the comment '// tentabus:struct' or '// tentabus:protocol' must be a // or # comment that starts with the directive (a block or doc comment, a directive in the middle of a comment or an unknown one is not read) (line 1)", /w komentarzu \/\* \*\/ lub \/\/\/, albo w środku komentarza, nie jest czytane/],
     ["value 'A' of enum 'E' does not fit a 32-bit integer (line 2)", /32-bitowej liczbie całkowitej/],
     ['the schema has more than 256 types (line 9)', /więcej niż 256 typów/],
-    ["struct 'S' has more than 1024 fields (line 9)", /Typ albo cały wzór ma więcej niż 1024 pól/],
+    ["struct 'S' has more than 1024 fields (line 9)", /Typ albo cały wzór ma więcej niż 1024 pola\. /],
     ['the schema has more than 4096 fields (line 9)', /więcej niż 4096 pól/],
     ["enum 'E' has more than 1024 values (line 9)", /więcej niż 1024 wartości/],
+    ["struct 'S' has more than 1024 fields (line 9)", /więcej niż 1024 pola/],
+    ['the schema has more than 22 types (line 9)', /więcej niż 22 typy\./],
+    ['a name has more than 3 parts (line 1)', /więcej niż 3 człony/],
     ['the schema has more than 4096 enum values (line 9)', /więcej niż 4096 wartości/],
-    ["struct 'S' has more than 64 required fields (line 9)", /więcej niż 64 pól wymaganych/],
-    ['types are nested deeper than 32 levels (line 1)', /zagnieżdżone głębiej niż 32 poziomów/],
+    ["struct 'S' has more than 64 required fields (line 9)", /więcej niż 64 pola wymagane/],
+    ['types are nested deeper than 32 levels (line 1)', /zagnieżdżone głębiej niż 32 poziomy\./],
     ['a constant is nested deeper than 16 levels (line 1)', /głębiej niż 16 poziomów/],
     ['a string is longer than 256 bytes (line 1)', /dłuższy niż 256 bajtów/],
     ['a name is longer than 128 characters (line 1)', /Nazwa jest dłuższa niż 128 znaków/],
@@ -1059,22 +1071,28 @@ test('a Thrift text: any text is sent as it is, the add window shows how the typ
     ['the schema has more than 200000 tokens (line 1)', /za duży dla rejestru \(ponad 200000/],
     ['the schema has more than 16384 type expressions (line 1)', /ponad 16384/],
     ['the constants and default values have more than 16384 parts (line 1)', /ponad 16384/],
-    ['an annotation has more than 16 entries, or the schema more than 1024 (line 1)', /ponad 16 elementów/],
+    ['an annotation has more than 16 entries (line 1)', /ponad 16 elementów/],
+    ['the schema has more than 1024 annotation entries (line 1)', /ponad 1024 elementy/ ],
     ['a comment is never closed (line 4)', /niedomknięty komentarz lub tekst w cudzysłowie/],
     ['a string is never closed on its line (line 4)', /niedomknięty komentarz/],
     ['a string holds an escape sequence Thrift does not define (line 4)', /sekwencję ucieczki/],
     ['the schema contains a character a Thrift file cannot (line 4)', /znak, którego plik Thrift nie może zawierać/],
     ['the schema contains a character a Thrift file cannot hold inside a string (line 4)', /znak, którego plik Thrift nie może zawierać/],
     ['an integer literal is out of range (line 4)', /źle zapisaną liczbę/],
-    ["expected '{', found the word 'xsd_all' (line 2)", /Thrift nie przyjął tego pliku/],
-    ["'stream' is not part of the supported Thrift IDL subset (line 2)", /Thrift nie przyjął tego pliku/],
-    ['a name has an empty part (line 2)', /Thrift nie przyjął tego pliku/],
+    ["expected '{', found the word 'xsd_all' (line 2)", /Rejestr nie przyjął tego pliku/],
+    ["'stream' is not part of the supported Thrift IDL subset (line 2)", /Rejestr nie przyjął tego pliku/],
+    ['a name has an empty part (line 2)', /Rejestr nie przyjął tego pliku/],
   ];
   for (const [server, expected] of cases) {
     const got = refused('thrift', server);
     assert.match(got.text, expected, server);
     assert.ok(got.technical.includes(server));
+    // The line the parser counted is said in the sentence, not only in the folded English details.
+    const line = /\(line (\d+)\)$/.exec(server);
+    if (line) assert.match(got.text, new RegExp(`W wierszu ${line[1]}\\.`), server);
   }
+  // A text format that counts lines says the line too.
+  assert.match(refused('protobuf', 'not a valid Protobuf schema (line 3): label required').text, /W wierszu 3\./);
   assert.match(refused('thrift', 'schema text is 300000 bytes; the limit is 262144').text, /Nie dodano wzoru x\./);
 });
 
@@ -1100,10 +1118,29 @@ test('a refused Thrift version names the field, the type, the enum value or the 
   );
   assert.match(
     reason('backward', `${backwardLead}/x: struct 'In' written by the old schema cannot be read as union 'In' by the new schema`),
-    /typ „\/x” się zmienia: struct 'In' nie da się odczytać jako union 'In'/,
+    /typ „x” się zmienia: struct 'In' nie da się odczytać jako union 'In'/,
+  );
+  assert.match(
+    reason('backward', `${backwardLead}<root>: the old schema is written in the binary protocol, the new one in the compact protocol`),
+    /stary wzór jest zapisany w protokole binary, a nowy w protokole compact.*Zostaw protokół poprzedniej wersji/,
+  );
+  assert.match(
+    reason('forward', `${forwardLead}<root>: the old schema is written in the compact protocol, the new one in the binary protocol`),
+    /w protokole compact, a nowy w protokole binary/,
   );
   assert.match(
     reason('forward', `${forwardLead}/status: enum 'Status': value 3 of the new schema is unknown to the old schema`),
     /typ wyliczeniowy „Status” traci wartość 3/,
   );
+});
+
+test('a version that cannot be compared because the previous one no longer reads is told so, with the older version named, and is not blamed on the new text', () => {
+  const el = document.createElement('div');
+  const err = new Error("protocol error BadRequest: bus.invalid_argument: the previous version of this subject could not be checked under the current rules of its format, so it cannot be compared with the new one (v2): invalid schema: field 'a' of struct 'X' has no explicit id (line 1)");
+  el.innerHTML = refusalHtml({ err, title: 'Nie dodano wersji 3.', compatibility: 'backward', schemaType: 'thrift', newText: '', describeError: String });
+  const text = norm(el.querySelector('div').textContent);
+  assert.match(text, /Nie dodano wersji 3\. Nowa wersja nie została porównana: poprzednia wersja 2 została zapisana według luźniejszych zasad/);
+  assert.match(text, /zgodność „brak”/);
+  assert.doesNotMatch(text, /nie przyjął/);
+  assert.match(el.querySelector('details pre').textContent, /has no explicit id/);
 });

@@ -302,15 +302,28 @@ export function protobufFieldsView(text) {
   return null;
 }
 
-/** The tokens of a Thrift IDL text without comments (`i` name, `n` number, `s` string, `p` one symbol), or `null` for an unfinished comment or string. */
+/**
+ * The tokens of a Thrift IDL text without comments (`i` name, `n` number, `s`
+ * string, `p` one symbol) and the type a `// tentabus:struct Name` directive
+ * names, or `null` for an unfinished comment or string. A directive is read
+ * the way the server reads it: a `//` or `#` comment that starts with it,
+ * anywhere on a line, never inside a block comment.
+ */
 function thriftTokens(source) {
   const s = String(source || '');
   const out = [];
+  let named = null;
   let i = 0;
   while (i < s.length) {
     const c = s[i];
     if (/\s/.test(c)) { i += 1; continue; }
-    if (c === '#' || (c === '/' && s[i + 1] === '/')) { while (i < s.length && s[i] !== '\n') i += 1; continue; }
+    if (c === '#' || (c === '/' && s[i + 1] === '/')) {
+      const from = i + (c === '#' ? 1 : 2);
+      while (i < s.length && s[i] !== '\n') i += 1;
+      const directive = /^\s*tentabus:struct(?:\s+(\S+))?\s*$/.exec(s.slice(from, i));
+      if (directive && named === null) named = directive[1] || '';
+      continue;
+    }
     if (c === '/' && s[i + 1] === '*') {
       const end = s.indexOf('*/', i + 2);
       if (end < 0) return null;
@@ -342,7 +355,7 @@ function thriftTokens(source) {
     out.push({ t: 'p', v: c });
     i += 1;
   }
-  return out;
+  return { tokens: out, named };
 }
 
 const thriftSymbol = (tok, v) => tok?.t === 'p' && tok.v === v;
@@ -413,9 +426,9 @@ function thriftBodyFields(tokens, from, to) {
  * read.
  */
 export function thriftFieldsView(text) {
-  const tokens = thriftTokens(text);
-  if (!tokens) return null;
-  const named = /^[ \t]*(?:\/\/|#)[ \t]*tentabus:struct[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*\r?$/m.exec(String(text || ''))?.[1];
+  const lexed = thriftTokens(text);
+  if (!lexed) return null;
+  const { tokens, named } = lexed;
   for (let i = 0; i < tokens.length; i += 1) {
     const tok = tokens[i];
     if (tok.t === 'i' && ['struct', 'union', 'exception'].includes(tok.v) && tokens[i + 1]?.t === 'i' && thriftSymbol(tokens[i + 2], '{')

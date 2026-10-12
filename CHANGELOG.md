@@ -237,8 +237,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   odwołujący się do samego siebie (także przez kontener), łańcuch `typedef`
   dłuższy niż 32, korzeń, który wymaga samego siebie (wzór bez żadnej
   poprawnej wartości), komentarz wskazujący typ, którego nie ma wśród typów
-  najwyższego poziomu. Każdy komunikat z parsera ma numer wiersza i nigdy nie
-  zawiera treści napisu.
+  najwyższego poziomu. Komunikaty parsera mają numer wiersza (poza błędami
+  rozstrzygania nazw typów po przeczytaniu całego pliku) i nigdy nie zawierają
+  treści napisu.
 - Limity (parser jest całkowity — bez `unwrap` i indeksowania bez sprawdzenia,
   a profil `release` ma `panic = "abort"` — i liczy wszystko, zanim cokolwiek
   zaalokuje): tekst do 256 KiB, 200 000 tokenów, 256 typów, 16 384 wyrażeń
@@ -321,6 +322,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   wyliczenia albo zmieniony rodzaj struktury, karta „Pola typu” na stronie
   wzoru (numer, nazwa, typ, obecność) i przetłumaczone powody w
   Nieprzetworzonych (pięć języków).
+- Poprawki po przeglądzie Thrift: zmiana protokołu (`binary` ↔ `compact`) między
+  wersjami jest **niezgodna** w każdym trybie poza `none` (komunikat „the old
+  schema is written in the … protocol, the new one in the …”); komentarz
+  zawierający `tentabus:`, który nie jest dokładnie poleceniem w komentarzu
+  `//` lub `#` (komentarz blokowy, dokumentujący `///`, polecenie w środku
+  komentarza, nieznane polecenie), jest odrzucany zamiast po cichu wracać do
+  pierwszej struktury i protokołu binarnego; karta „Pola typu” czyta polecenie
+  tak jak serwer; ścieżki w komunikatach zgodności są skracane jak w Avro; dwa
+  limity adnotacji mają osobne komunikaty; wzór zapisany, gdy rodzaj był tylko
+  przechowywany (lub pod luźniejszym parserem), a dziś się nie kompiluje, jest
+  nazwany w odmowie nowej wersji („poprzednia wersja … nie mogła zostać
+  sprawdzona”) i przy publikacji na temat, który go sprawdza (`the stored
+  schema cannot be compiled under the current rules of its format`), zamiast
+  obwiniać nowy tekst; waga skompilowanego wzoru Thrift w pamięci podręcznej
+  liczy arenę wyrażeń; `Capabilities.content_types` zawiera teraz
+  `application/octet-stream`, więc w kreatorze topiku można założyć topik
+  binarny i przypiąć do niego wzór Avro, Protobuf lub Thrift.
+- Dashboard (po przeglądzie): limity w odmowach odmieniane przez liczbę („1024
+  pola”, „32 poziomy”), skrócona podpowiedź Thrift z resztą pod „Więcej”, okno
+  „Nowa wersja” pokazuje podpowiedź formatu (z właściwym numerem wersji),
+  ścieżka z jednego członu bez ukośnika, numer wiersza błędu składni w zdaniu
+  po polsku, osobne odmowy dla powtórzonego typu, stałej, numeru pola, nazwy
+  pola i wartości wyliczenia, „Rejestr nie przyjął” zamiast „Thrift nie
+  przyjął”, „Wiadomość nie jest zapisem Thrift” dla ładunku, który nie zaczyna
+  się strukturą, i „zwykłe (może nie być)” zamiast „domyślne”.
 
 - Rejestr wzorców waliduje Avro (F4 B1, biblioteka `apache-avro` 0.22 z ASF,
   bez kodeków kompresji; tylko do czytania schematów i serializacji

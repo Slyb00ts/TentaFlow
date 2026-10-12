@@ -10344,16 +10344,18 @@
           "binary": "Binärdaten"
         },
         "no_formats": "Dieser Server prüft Nachrichten noch in keinem Musterformat.",
-        "text_hint": "Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; es wird Version 1.",
+        "text_hint": "Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; es wird Version {version}.",
         "impact": "Muster {name} ({format}) entsteht als Version 1.",
         "impact_unused": "Noch verwendet es kein Topic — Sie wählen es in den Einstellungen eines Topics.",
         "button": "Muster hinzufügen",
         "refused": "Muster {name} wurde nicht hinzugefügt.",
-        "text_hint_hl7v2_profile": "Ein Profil ist JSON-Text mit Listen der verlangten Segmente und Felder, z. B. {example}. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; es wird Version 1.",
-        "text_hint_xsd": "Ein gewöhnliches XSD-Muster in einer einzigen Datei funktioniert, ohne eingebundene Dateien und ohne die fortgeschrittenen Teile von XSD. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; es wird Version 1.",
-        "text_hint_avro": "Ein Avro-Muster ist ein als JSON geschriebenes Schema, z. B. {example}. Es prüft eine einzelne Nachricht in der binären Avro-Kodierung – ohne Avro-Dateikopf und ohne Confluent-Kopf. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; das wird Version 1.",
-        "text_hint_protobuf": "Ein Protobuf-Muster ist eine .proto-Datei (proto3 oder proto2) in einem Stück, ohne „import“. Es beschreibt eine Nachricht: die erste der Datei oder die, die ein Kommentar wie „// tentabus:message Order“ benennt. Beispiel: {example}. Es prüft eine einzelne Nachricht in der binären Protobuf-Kodierung. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; das wird Version 1. Die Prüfung ist streng: ein negatives int32 braucht die volle 10-Byte-Kodierung (die 5-Byte-Form wird abgelehnt), uint32 und sint32 dürfen 2^32−1 nicht überschreiten, bool ist nur 0 oder 1, und die Feldnummern 19000–19999 werden abgelehnt, auch wenn das Muster sie nicht deklariert.",
-        "text_hint_thrift": "Ein Thrift-Muster ist eine IDL-Datei in einem Stück, ohne „include“. Es beschreibt einen Typ: das erste struct, union oder exception der Datei oder das, das ein Kommentar wie „// tentabus:struct Order“ benennt. Beispiel: {example}. Es prüft ein einzelnes Objekt in der binären Thrift-Kodierung (TBinaryProtocol) oder in der kompakten (TCompactProtocol), wenn die Datei den Kommentar „// tentabus:protocol compact“ enthält — ohne Nachrichtenkopf und Rahmung. Akzeptiert werden struct, union, exception, enum, typedef, namespace, list, set und map, Konstanten und Standardwerte (sie werden gelesen, beeinflussen die Prüfung aber nicht). Nicht unterstützt: include und service. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; es wird Version 1. Die Validierung ist streng: Jedes Feld braucht seine Nummer („1: string name“), ein Enum-Wert muss einer der deklarierten sein, ein string muss UTF-8 sein, und eine union trägt höchstens ein Mitglied."
+        "text_hint_hl7v2_profile": "Ein Profil ist JSON-Text mit Listen der verlangten Segmente und Felder, z. B. {example}. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; es wird Version {version}.",
+        "text_hint_xsd": "Ein gewöhnliches XSD-Muster in einer einzigen Datei funktioniert, ohne eingebundene Dateien und ohne die fortgeschrittenen Teile von XSD. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; es wird Version {version}.",
+        "text_hint_avro": "Ein Avro-Muster ist ein als JSON geschriebenes Schema, z. B. {example}. Es prüft eine einzelne Nachricht in der binären Avro-Kodierung – ohne Avro-Dateikopf und ohne Confluent-Kopf. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; das wird Version {version}.",
+        "text_hint_protobuf": "Ein Protobuf-Muster ist eine .proto-Datei (proto3 oder proto2) in einem Stück, ohne „import“. Es beschreibt eine Nachricht: die erste der Datei oder die, die ein Kommentar wie „// tentabus:message Order“ benennt. Beispiel: {example}. Es prüft eine einzelne Nachricht in der binären Protobuf-Kodierung. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; das wird Version {version}. Die Prüfung ist streng: ein negatives int32 braucht die volle 10-Byte-Kodierung (die 5-Byte-Form wird abgelehnt), uint32 und sint32 dürfen 2^32−1 nicht überschreiten, bool ist nur 0 oder 1, und die Feldnummern 19000–19999 werden abgelehnt, auch wenn das Muster sie nicht deklariert.",
+        "text_hint_thrift": "Ein Thrift-Muster ist eine IDL-Datei in einem Stück, ohne „include“. Es beschreibt einen Typ: das erste struct, union oder exception der Datei oder das, das ein Kommentar wie „// tentabus:struct Order“ benennt. Beispiel: {example}. Das Muster wird beim Hinzufügen geprüft; es wird Version {version}.",
+        "text_more_thrift": "Es prüft ein einzelnes Objekt in der binären Thrift-Kodierung (TBinaryProtocol) oder in der kompakten (TCompactProtocol), wenn die Datei den Kommentar „// tentabus:protocol compact“ enthält — ohne Nachrichtenkopf und Rahmung. Akzeptiert werden struct, union, exception, enum, typedef, namespace, list, set und map, Konstanten und Standardwerte (sie werden gelesen, beeinflussen die Prüfung aber nicht). Nicht unterstützt: include und service. Sie können auch eine Datei laden. Die Validierung ist streng: Jedes Feld braucht seine Nummer („1: string name“), ein Enum-Wert muss einer der deklarierten sein, ein string muss UTF-8 sein, und eine union trägt höchstens ein Mitglied.",
+        "more": "Mehr"
       },
       "version": {
         "title": "Neue Version des Musters {name}",
@@ -10431,7 +10433,9 @@
         "proto_enum": "Enum „{name}“ verliert den Wert {value}, den Nachrichten noch enthalten können",
         "proto_enum_open": "Enum „{name}“ akzeptiert jede Zahl, die andere Version hat aber ein geschlossenes Enum (proto2), das nur seine eigenen Werte kennt",
         "proto_oneof": "die Felder „{first}“ und „{second}“ würden sich das oneof „{oneof}“ teilen, die andere Version kann aber beide gleichzeitig schreiben — ein oneof behält nur eines davon, die Daten des anderen gingen verloren",
-        "proto_reserved": "Die Feldnummer {number} war in der vorherigen Version reserviert („reserved“) und darf nicht erneut verwendet werden"
+        "proto_reserved": "Die Feldnummer {number} war in der vorherigen Version reserviert („reserved“) und darf nicht erneut verwendet werden",
+        "thrift_protocol": "das alte Muster ist im Protokoll {from} geschrieben, das neue im Protokoll {to} — in einem geschriebene Daten lassen sich im anderen nicht lesen",
+        "thrift_protocol_fix": "Behalten Sie das Protokoll der vorherigen Version bei (der Kommentar „// tentabus:protocol“) oder fügen Sie das geänderte Muster unter einem neuen Namen hinzu."
       },
       "compat_window": {
         "title": "Kompatibilität ändern — {name}",
@@ -10548,7 +10552,7 @@
         "thrift_presence": "Vorkommen",
         "thrift_required": "erforderlich",
         "thrift_optional": "optional",
-        "thrift_default": "Standard"
+        "thrift_default": "normal (kann fehlen)"
       },
       "added_existing_title": "Muster {name} gab es bereits",
       "added_existing_version": "Jemand hat es inzwischen hinzugefügt, daher ging der Text als Version {version} hinein.",
@@ -10648,7 +10652,7 @@
         "proto_limit_name": "Ein Name ist länger als {limit} Zeichen.",
         "proto_limit_parts": "Ein Name hat mehr als {limit} durch Punkte getrennte Teile.",
         "proto_lexical": "Das Muster hat einen nicht geschlossenen Kommentar, Text in Anführungszeichen oder eine nicht geschlossene Klammer oder ein Zeichen, das eine .proto-Datei nicht enthalten kann.",
-        "thrift_invalid": "Thrift hat diese Datei nicht akzeptiert: Prüfen Sie die Syntax (Doppelpunkte, Klammern, Kommas) und die Typnamen. Einzelheiten stehen unten.",
+        "thrift_invalid": "Die Registry hat diese Datei nicht akzeptiert: Prüfen Sie die Syntax (Doppelpunkte, Klammern, Kommas) und die Typnamen. Einzelheiten stehen unten.",
         "thrift_include": "Ein Thrift-Muster muss eine einzige eigenständige Datei sein: „include“ und „cpp_include“ werden nicht unterstützt. Fügen Sie die benötigten Typen in dieselbe Datei ein.",
         "thrift_unsupported": "Dieses Muster enthält ein Element, das die Registry nicht unterstützt: {what}. Zum Prüfen von Objekten genügen struct, union, exception, enum und typedef.",
         "thrift_what_service": "service (Dienste)",
@@ -10658,24 +10662,31 @@
         "thrift_union_required": "Ein Mitglied einer union kann nicht „required“ sein: Eine union trägt höchstens ein Mitglied.",
         "thrift_included_type": "Ein Typname mit Punkt verweist auf eine eingebundene Datei, was nicht unterstützt wird. Definieren Sie den Typ in derselben Datei.",
         "thrift_reserved": "Ein Name ist ein reserviertes Wort der Sprache Thrift (z. B. list, required oder string). Wählen Sie einen anderen Namen.",
-        "thrift_duplicate": "Zwei Typen, zwei Felder (nach Name oder Nummer) oder zwei Enum-Werte haben am selben Ort denselben Namen oder dieselbe Nummer. Machen Sie sie verschieden.",
+        "thrift_duplicate_type": "Zwei Typen (struct, union, exception, enum oder typedef) haben denselben Namen. Geben Sie ihnen verschiedene Namen.",
+        "thrift_duplicate_const": "Zwei Konstanten haben denselben Namen. Geben Sie ihnen verschiedene Namen.",
+        "thrift_duplicate_id": "Zwei Felder desselben Typs haben dieselbe Nummer. Jedes Feld braucht seine eigene Nummer.",
+        "thrift_duplicate_field": "Zwei Felder desselben Typs haben denselben Namen. Geben Sie ihnen verschiedene Namen.",
+        "thrift_duplicate_value": "Zwei Werte desselben Enums haben denselben Namen. Geben Sie ihnen verschiedene Namen.",
+        "thrift_dotted_name": "Ein Name, den eine Deklaration einführt, darf keinen Punkt enthalten. Punkte dienen nur Verweisen in andere Dateien, die nicht unterstützt werden.",
+        "previous_unreadable": "Die neue Version wurde nicht verglichen: Die vorherige Version {version} wurde nach lockereren Regeln gespeichert und besteht die Prüfung der Registry nicht mehr, daher ließ sie sich nicht prüfen. Fügen Sie den korrigierten Text als neues Muster hinzu oder stellen Sie die Kompatibilität für diese Version auf „none“.",
         "thrift_type_missing": "Das Muster verwendet einen Typ, der darin nicht definiert ist. Definieren Sie jeden Typ in derselben Datei.",
         "thrift_typedef": "Ein typedef verweist auf sich selbst, oder eine Kette von typedefs ist zu lang. Unterbrechen Sie den Zyklus oder kürzen Sie die Kette.",
         "thrift_no_value": "Dieses Muster hat keinen gültigen Wert: Der erste Typ verlangt sich selbst (oder ein Enum ohne Werte). Machen Sie eines dieser Felder optional.",
         "thrift_no_struct": "In dieser Datei gibt es kein struct, union oder exception. Das Muster muss eines davon beschreiben.",
         "thrift_designated": "Der Kommentar „// tentabus:struct Name“ nennt einen Typ, der kein struct, union oder exception der Datei ist. Verwenden Sie den Namen eines in der Datei geschriebenen Typs.",
-        "thrift_directive": "Auf den Kommentar „// tentabus:struct“ muss der Name eines Typs folgen, auf „// tentabus:protocol“ „binary“ oder „compact“; jeder darf nur einmal vorkommen.",
+        "thrift_directive": "Ein Kommentar, der „tentabus:“ erwähnt, muss ein //- oder #-Kommentar sein, der mit der Anweisung beginnt: „// tentabus:struct Name“ (der Name eines Typs) oder „// tentabus:protocol binary|compact“, jede höchstens einmal. Eine Anweisung in einem /* */- oder ///-Kommentar oder mitten in einem Kommentar wird nicht gelesen.",
         "thrift_enum_range": "Ein Enum-Wert passt nicht in eine 32-Bit-Ganzzahl.",
-        "thrift_limit_types": "Das Muster hat mehr als {limit} Typen. Vereinfachen Sie es.",
-        "thrift_limit_fields": "Ein Typ oder das ganze Muster hat mehr als {limit} Felder. Teilen Sie es in kleinere Typen auf.",
-        "thrift_limit_values": "Ein Enum oder alle Enums zusammen haben mehr als {limit} Werte.",
-        "thrift_limit_required": "Ein Typ hat mehr als {limit} erforderliche Felder (required).",
-        "thrift_limit_depth": "Typen oder Konstanten sind tiefer als {limit} Ebenen verschachtelt.",
-        "thrift_limit_string": "Ein Text in Anführungszeichen ist länger als {limit} Bytes.",
-        "thrift_limit_name": "Ein Name ist länger als {limit} Zeichen.",
-        "thrift_limit_parts": "Ein Name hat mehr als {limit} durch Punkte getrennte Teile.",
-        "thrift_limit_size": "Das Muster ist für die Registry zu groß (mehr als {limit} Elemente einer Art: Token, Typausdrücke, Konstanten, Namespaces oder Annotationen). Vereinfachen Sie es.",
-        "thrift_lexical": "Das Muster hat einen nicht geschlossenen Kommentar oder Text in Anführungszeichen, eine fehlerhafte Zahl, eine unbekannte Escape-Sequenz in einem Text oder ein Zeichen, das eine Thrift-Datei nicht enthalten kann."
+        "thrift_limit_types": "Das Muster hat mehr als {limit} {limit|Typ|Typen}. Vereinfachen Sie es.",
+        "thrift_limit_fields": "Ein Typ oder das ganze Muster hat mehr als {limit} {limit|Feld|Felder}. Teilen Sie es in kleinere Typen auf.",
+        "thrift_limit_values": "Ein Enum oder alle Enums zusammen haben mehr als {limit} {limit|Wert|Werte}.",
+        "thrift_limit_required": "Ein Typ hat mehr als {limit} erforderliche {limit|Feld|Felder} (required).",
+        "thrift_limit_depth": "Typen oder Konstanten sind tiefer als {limit} {limit|Ebene|Ebenen} verschachtelt.",
+        "thrift_limit_string": "Ein Text in Anführungszeichen ist länger als {limit} {limit|Byte|Bytes}.",
+        "thrift_limit_name": "Ein Name ist länger als {limit} {limit|Zeichen|Zeichen}.",
+        "thrift_limit_parts": "Ein Name hat mehr als {limit} durch Punkte getrennte {limit|Teil|Teile}.",
+        "thrift_limit_size": "Das Muster ist für die Registry zu groß (mehr als {limit} {limit|Element|Elemente} einer Art: Token, Typausdrücke, Konstanten, Namespaces oder Annotationen). Vereinfachen Sie es.",
+        "thrift_lexical": "Das Muster hat einen nicht geschlossenen Kommentar oder Text in Anführungszeichen, eine fehlerhafte Zahl, eine unbekannte Escape-Sequenz in einem Text oder ein Zeichen, das eine Thrift-Datei nicht enthalten kann.",
+        "at_line": "In Zeile {line}."
       }
     },
     "topics": {
@@ -10743,7 +10754,7 @@
           "json": "Daten aus Anwendungen und Webseiten",
           "xml": "Dokumente, z. B. Rechnungen",
           "hl7v2": "Nachrichten aus medizinischen Systemen",
-          "binary": "Avro, Protobuf oder Thrift"
+          "binary": "Avro-, Protobuf- oder Thrift-Nachrichten in binärer Kodierung"
         },
         "copies_label": "Kopien",
         "copies_count": "{count} {n|Kopie|Kopien|Kopien}",
@@ -11478,7 +11489,9 @@
         "thrift_field_id": "eine Feldnummer liegt außerhalb des erlaubten Bereichs.",
         "thrift_element": "die Schreibweise der Elemente einer Liste, Menge oder Map passt nicht zu ihrem Typ im Muster.",
         "thrift_enum": "dieser Wert gehört nicht zum Enum.",
-        "thrift_union": "mehr als ein Mitglied einer union ist gesetzt."
+        "thrift_union": "mehr als ein Mitglied einer union ist gesetzt.",
+        "thrift_not_thrift": "die Nachricht ist kein Thrift-Datensatz.",
+        "thrift_type_invalid": "ein Feld hat einen Typcode, den Thrift nicht kennt."
       }
     },
     "access": {

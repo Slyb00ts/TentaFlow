@@ -19,7 +19,7 @@
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { patchHtml, patchKeyedList, setAttr, setText, setRowsIfChanged } from '/js/lib/dom-patch.js';
-import { T, fmtCount, fmtDayTime } from '/js/modules/tentabus/format.js';
+import { T, fmtCount, fmtDayTime, shownPath } from '/js/modules/tentabus/format.js';
 import { headerText } from '/js/modules/tentabus/payload.js';
 import { isInternalTopic } from '/js/modules/tentabus/model.js';
 import { loadErrorHtml } from '/js/modules/tentabus/overview.js';
@@ -186,11 +186,13 @@ function valueWhy(why) {
 }
 
 function pathSentence(path, message) {
-  const at = path === '<root>' ? '' : shortPath(path);
+  const at = path === '<root>' ? '' : shownPath(shortPath(path));
   const say = (key, params) => T(`unprocessed.plain.${key}`, params);
   const withPath = (sentence) => (at ? `${at}: ${sentence}` : upperFirst(sentence));
   let m = /^document is nested too deeply(?: \(more than (\d+) levels\))?$/.exec(message);
   if (m) return upperFirst(m[1] ? say('xsd_too_deep', { limit: m[1] }) : say('xsd_too_deep_plain'));
+  // A byte that is no Thrift type at the very start means the whole message is not a Thrift record.
+  if (message === 'type code is not a Thrift type') return path === '<root>' ? upperFirst(say('thrift_not_thrift')) : withPath(say('thrift_type_invalid'));
   m = /^root element '([^']*)' is not declared$/.exec(message);
   if (m) return upperFirst(say('xsd_root_undeclared', { name: m[1] }));
   m = /^required child element '([^']*)' is missing$/.exec(message);

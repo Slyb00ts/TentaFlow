@@ -198,3 +198,9 @@ export function loadErrorKind(err) {
   if (/timed out/i.test(message)) return 'timeout';
   return 'lost';
 }
+
+/** A path of the checker as a person reads it: one element is a name ("wiek"), a deeper path keeps its slashes. */
+export function shownPath(path) {
+  const text = String(path);
+  return /^\/[^/]+$/.test(text) ? text.slice(1) : text;
+}

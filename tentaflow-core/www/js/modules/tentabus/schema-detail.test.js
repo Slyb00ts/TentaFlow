@@ -494,6 +494,12 @@ test('a Thrift struct spelled out: each field with its number, type and presence
     { id: 1, name: 'a', type: 'i32', label: 'default' },
     { id: 2, name: 'b', type: 'string', label: 'default' },
   ]);
+  // The directive is read as the server reads it: a // or # comment, after code too, never a block comment.
+  const two = 'struct A { 1: i32 a } struct B { 1: string b }';
+  assert.deepEqual(thriftFieldsView(`struct A { 1: i32 a }  // tentabus:struct B\nstruct B { 1: string b }`), [{ id: 1, name: 'b', type: 'string', label: 'default' }]);
+  assert.deepEqual(thriftFieldsView(`${two}\n# tentabus:struct B`), [{ id: 1, name: 'b', type: 'string', label: 'default' }]);
+  assert.deepEqual(thriftFieldsView(`/* tentabus:struct B */\n${two}`), [{ id: 1, name: 'a', type: 'i32', label: 'default' }]);
+  assert.deepEqual(thriftFieldsView(`/*\n// tentabus:struct B\n*/\n${two}`), [{ id: 1, name: 'a', type: 'i32', label: 'default' }]);
   assert.equal(thriftFieldsView('not a schema'), null);
   assert.equal(thriftFieldsView('struct S { 1: i32 a } /* never closed'), null);
   assert.equal(thriftFieldsView('// tentabus:struct Nope\nstruct S { 1: i32 a }'), null);
@@ -512,7 +518,7 @@ test('a Thrift pattern\'s page lists the fields of the type above the text; othe
   assert.match(table.rows[2].type, />list&lt;Line&gt;</);
   assert.equal(norm(table.rows[0].presence), 'wymagane');
   assert.equal(norm(table.rows[1].presence), 'opcjonalne');
-  assert.equal(norm(table.rows[2].presence), 'domyślne');
+  assert.equal(norm(table.rows[2].presence), 'zwykłe (może nie być)');
   assert.equal(downloadName('zamowienie', 3, 'thrift'), 'zamowienie-v3.thrift');
   const json = mount({ shown: { version: 3, text: TEXT, error: null } });
   assert.equal(json.body.querySelector('[data-role="thrift"]').hidden, true);
