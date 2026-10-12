@@ -40,6 +40,7 @@ use super::{
 };
 
 const BAD_CHARACTER: &str = "the schema contains a character a .proto file cannot";
+const DOTTED_OPTION: &str = "option names with a dot are not supported";
 const COMMENT_OPEN: &str = "a comment is never closed";
 const STRING_OPEN: &str = "a string is never closed on its line";
 
@@ -617,7 +618,7 @@ impl<'a> Structure<'a> {
         }
         self.at += 1;
         if self.symbol_is('[') {
-            self.balanced()?;
+            self.option_list()?;
         }
         Ok(())
     }
@@ -625,12 +626,57 @@ impl<'a> Structure<'a> {
     /// `option name = constant;`. A name with a `(` is a custom option.
     fn option(&mut self) -> Result<(), SchemaError> {
         self.at += 1;
-        self.ident()?;
-        while self.eat_symbol('.') {
-            self.ident()?;
-        }
+        self.option_name()?;
         self.symbol('=')?;
         self.rest_of_statement()
+    }
+
+    /// The name of an option the parser interprets itself: one word. A dotted
+    /// name makes the parser resolve an extension chain, one recursion step
+    /// per part, and TentaBus has no option it needs that way.
+    fn option_name(&mut self) -> Result<(), SchemaError> {
+        self.ident()?;
+        if self.symbol_is('.') {
+            return Err(invalid(DOTTED_OPTION));
+        }
+        Ok(())
+    }
+
+    /// `[name = value, ...]` after a field number or an enum value number:
+    /// every option name is checked, the values are skipped with the brackets
+    /// matched and counted.
+    fn option_list(&mut self) -> Result<(), SchemaError> {
+        self.symbol('[')?;
+        self.check_depth(1)?;
+        loop {
+            self.option_name()?;
+            self.symbol('=')?;
+            let mut open = 0usize;
+            loop {
+                match self.peek() {
+                    None => return Err(invalid("a bracket is never closed")),
+                    Some(Token::Symbol(',' | ']')) if open == 0 => break,
+                    Some(Token::Symbol('{' | '[')) => {
+                        open += 1;
+                        self.check_depth(open + 1)?;
+                    }
+                    Some(Token::Symbol('}' | ']')) => {
+                        if open == 0 {
+                            return Err(self.unexpected());
+                        }
+                        open -= 1;
+                    }
+                    Some(Token::Symbol('(')) => return Err(self.unexpected()),
+                    Some(Token::Symbol(';')) if open == 0 => return Err(self.unexpected()),
+                    Some(_) => {}
+                }
+                self.at += 1;
+            }
+            if self.eat_symbol(']') {
+                return Ok(());
+            }
+            self.symbol(',')?;
+        }
     }
 
     /// `reserved 1, 3 to 5;` or `reserved "a", "b";`
@@ -677,6 +723,12 @@ impl<'a> Structure<'a> {
             self.declare(&entry)?;
         }
         self.symbol('=')?;
+        if matches!(self.peek(), Some(Token::IntLit(_))) {
+            self.at += 1;
+            if self.symbol_is('[') {
+                self.option_list()?;
+            }
+        }
         self.rest_of_statement()
     }
 
@@ -705,28 +757,16 @@ impl<'a> Structure<'a> {
         Ok(false)
     }
 
-    /// Everything up to the `;` that ends the statement: option values, which
-    /// may hold `{...}` and `[...]` with their own `;`, are skipped with the
-    /// brackets matched and counted.
+    /// Everything up to the `;` that ends the statement (consumed): option
+    /// values, which may hold `{...}` and `[...]` with their own `;`, are
+    /// skipped with the brackets matched and counted.
     fn rest_of_statement(&mut self) -> Result<(), SchemaError> {
-        self.skip_until(true)
-    }
-
-    /// One `[...]` or `{...}` group, brackets matched and counted.
-    fn balanced(&mut self) -> Result<(), SchemaError> {
-        self.skip_until(false)
-    }
-
-    /// Skips tokens with the brackets matched and counted: up to the `;` at
-    /// bracket level zero (consumed) or, without `to_semicolon`, through the
-    /// bracket the first token opens.
-    fn skip_until(&mut self, to_semicolon: bool) -> Result<(), SchemaError> {
         let mut open: Vec<char> = Vec::new();
         loop {
             match self.peek() {
                 None if open.is_empty() && self.frames.is_empty() => return Err(self.unexpected()),
                 None => return Err(invalid("a bracket is never closed")),
-                Some(Token::Symbol(';')) if open.is_empty() && to_semicolon => {
+                Some(Token::Symbol(';')) if open.is_empty() => {
                     self.at += 1;
                     return Ok(());
                 }
@@ -739,13 +779,8 @@ impl<'a> Structure<'a> {
                     if open.pop() != Some(want) {
                         return Err(self.unexpected());
                     }
-                    if open.is_empty() && !to_semicolon {
-                        self.at += 1;
-                        return Ok(());
-                    }
                 }
                 Some(Token::Symbol('(')) => return Err(self.unexpected()),
-                Some(_) if open.is_empty() && !to_semicolon => return Err(self.unexpected()),
                 Some(_) => {}
             }
             self.at += 1;

@@ -10612,6 +10612,7 @@
         "proto_what_extensions": "extensions (rangos de extensión)",
         "proto_what_group": "group (grupos)",
         "proto_what_custom": "opciones propias, p. ej. option (x) = …",
+        "proto_what_dotted_option": "nombres de opción con punto, p. ej. option a.b = …",
         "proto_what_message_set": "message_set_wire_format",
         "proto_no_message": "Este archivo no contiene ningún mensaje (message). El patrón debe describir un mensaje.",
         "proto_designated": "El comentario «// tentabus:message Nombre» nombra un mensaje que no está entre los mensajes de nivel superior del archivo. Usa el nombre de un mensaje escrito fuera de otros mensajes.",

@@ -11847,6 +11847,7 @@
         "proto_what_extensions": "extensions (zakresy rozszerzeń)",
         "proto_what_group": "group (grupy)",
         "proto_what_custom": "opcje własne, np. option (x) = …",
+        "proto_what_dotted_option": "nazwy opcji z kropką, np. option a.b = …",
         "proto_what_message_set": "message_set_wire_format",
         "proto_no_message": "W tym pliku nie ma żadnego komunikatu (message). Wzór musi opisywać jeden komunikat.",
         "proto_designated": "Komentarz „// tentabus:message Nazwa” wskazuje komunikat, którego nie ma wśród komunikatów najwyższego poziomu pliku. Wpisz nazwę komunikatu zapisanego poza innymi komunikatami.",

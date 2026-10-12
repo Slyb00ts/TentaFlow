@@ -10612,6 +10612,7 @@
         "proto_what_extensions": "extensions (plages d’extension)",
         "proto_what_group": "group (groupes)",
         "proto_what_custom": "options personnalisées, p. ex. option (x) = …",
+        "proto_what_dotted_option": "noms d’option avec un point, p. ex. option a.b = …",
         "proto_what_message_set": "message_set_wire_format",
         "proto_no_message": "Ce fichier ne contient aucun message (message). Le modèle doit décrire un message.",
         "proto_designated": "Le commentaire « // tentabus:message Nom » désigne un message qui ne fait pas partie des messages de premier niveau du fichier. Utilisez le nom d’un message écrit en dehors des autres messages.",

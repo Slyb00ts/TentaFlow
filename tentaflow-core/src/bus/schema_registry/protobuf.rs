@@ -45,8 +45,11 @@
 // Schema text accepted: ONE `.proto` file, `syntax = "proto3"` or `"proto2"`
 // (no `syntax` line means proto2, as in protoc; `edition` is refused).
 // Refused with a fixed phrase: `import`, `service`, `extend`, `extensions`,
-// groups, custom options (`option (x) = ...`), `message_set_wire_format`,
-// more than 64 `required` fields in one message. Allowed: nested messages and
+// groups, custom options (`option (x) = ...`; `prescan` refuses them in the
+// text, and the lowering refuses any option value that still reaches a
+// descriptor), option names with a dot (`option a.b = 1`, which the parser
+// resolves as an extension chain), `message_set_wire_format`, more than 64
+// `required` fields in one message. Allowed: nested messages and
 // enums, `oneof`, `map<K, V>`, `optional`, `repeated`, `reserved`, `package`,
 // and the options protoc itself interprets (they do not change the wire).
 // Well-known types need an `import`, so they are refused with it.
@@ -544,8 +547,13 @@ fn join(scope: &str, name: &str) -> String {
     }
 }
 
-fn check_no_custom_options(count: usize) -> Result<(), SchemaError> {
-    if count == 0 {
+/// A custom option value lands in the options message's unknown fields (the
+/// parser leaves `uninterpreted_option` empty), so both are checked.
+fn check_no_custom_options(
+    uninterpreted: usize,
+    special: &::protobuf::SpecialFields,
+) -> Result<(), SchemaError> {
+    if uninterpreted == 0 && special.unknown_fields().iter().next().is_none() {
         Ok(())
     } else {
         Err(invalid("custom options are not supported"))
@@ -590,12 +598,18 @@ impl<'a> Lowering<'a> {
             )));
         }
         let allow_alias = d.options.allow_alias();
-        check_no_custom_options(d.options.uninterpreted_option.len())?;
+        check_no_custom_options(
+            d.options.uninterpreted_option.len(),
+            &d.options.special_fields,
+        )?;
         let mut values = Vec::with_capacity(d.value.len());
         let mut seen_names = HashSet::new();
         let mut numbers = BTreeSet::new();
         for v in &d.value {
-            check_no_custom_options(v.options.uninterpreted_option.len())?;
+            check_no_custom_options(
+                v.options.uninterpreted_option.len(),
+                &v.options.special_fields,
+            )?;
             if !seen_names.insert(v.name().to_string()) {
                 return Err(invalid(format!(
                     "enum '{name}' lists value '{}' more than once",
@@ -652,7 +666,16 @@ impl<'a> Lowering<'a> {
         if d.options.message_set_wire_format() {
             return Err(invalid("message_set_wire_format is not supported"));
         }
-        check_no_custom_options(d.options.uninterpreted_option.len())?;
+        check_no_custom_options(
+            d.options.uninterpreted_option.len(),
+            &d.options.special_fields,
+        )?;
+        for o in &d.oneof_decl {
+            check_no_custom_options(
+                o.options.uninterpreted_option.len(),
+                &o.options.special_fields,
+            )?;
+        }
         let name = d.name().to_string();
         let full_name = join(scope, &name);
         let id = self.msgs.len();
@@ -724,7 +747,10 @@ impl<'a> Lowering<'a> {
         let mut required_bits = 0u32;
         let mut required_mask = 0u64;
         for f in &d.field {
-            check_no_custom_options(f.options.uninterpreted_option.len())?;
+            check_no_custom_options(
+                f.options.uninterpreted_option.len(),
+                &f.options.special_fields,
+            )?;
             if f.type_() == Type::TYPE_GROUP {
                 return Err(invalid("groups are not supported"));
             }
@@ -861,7 +887,10 @@ fn lower(file: &FileDescriptorProto, designated: Option<&str>) -> Result<Compile
     if !file.extension.is_empty() {
         return Err(invalid("extend is not supported"));
     }
-    check_no_custom_options(file.options.uninterpreted_option.len())?;
+    check_no_custom_options(
+        file.options.uninterpreted_option.len(),
+        &file.options.special_fields,
+    )?;
     let proto3 = match file.syntax() {
         "proto3" => true,
         "" | "proto2" => false,
@@ -1844,6 +1873,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dotted_option_names_are_refused_in_every_option_position() {
+        const DOTTED: &str = "option names with a dot are not supported";
+        let cases = [
+            r#"syntax = "proto3"; option a.b.c = 1; message M {}"#,
+            r#"syntax = "proto3"; message M { option a.b = 1; int32 x = 1; }"#,
+            r#"syntax = "proto3"; message M { int32 x = 1 [a.b = 1]; }"#,
+            r#"syntax = "proto3"; message M { int32 x = 1 [deprecated = true, a.b = 1]; }"#,
+            r#"syntax = "proto3"; message M { oneof o { option a.b = 1; int32 x = 1; } }"#,
+            r#"syntax = "proto3"; message M { oneof o { int32 x = 1 [a.b = 1]; } }"#,
+            r#"syntax = "proto3"; message M { map<string, int32> m = 1 [a.b = 1]; }"#,
+            r#"syntax = "proto3"; enum E { option a.b = 1; Z = 0; } message M {}"#,
+            r#"syntax = "proto3"; enum E { Z = 0 [a.b = 1]; } message M {}"#,
+            r#"syntax = "proto3"; enum E { Z = 0 [deprecated = true, a.b = 1]; } message M {}"#,
+            r#"syntax = "proto3" ; message M { int32 x = 1 [ a . b = 1 ] ; }"#,
+        ];
+        for text in cases {
+            let got = refusal(text);
+            assert!(got.contains(DOTTED), "{text}: {got}");
+        }
+    }
+
+    #[test]
+    fn single_word_options_are_still_accepted_in_every_position() {
+        compile(
+            r#"syntax = "proto2"; option java_package = "x"; option optimize_for = SPEED;
+            message M { option deprecated = true; optional int32 a = 1 [default = 5, deprecated = true];
+              repeated int32 b = 2 [packed = true]; optional string c = 3 [json_name = "cc"];
+              oneof o { int32 d = 4; } }
+            enum E { option allow_alias = true; Z = 0 [deprecated = true]; Y = 0; }"#,
+        );
+    }
+
+    #[test]
+    fn option_values_left_in_unknown_fields_are_refused() {
+        use ::protobuf::descriptor::FieldOptions;
+        let mut options = FieldOptions::new();
+        assert!(check_no_custom_options(0, &options.special_fields).is_ok());
+        options
+            .special_fields
+            .mut_unknown_fields()
+            .add_varint(50000, 1);
+        let err = check_no_custom_options(0, &options.special_fields).unwrap_err();
+        assert!(
+            matches!(&err, SchemaError::Invalid(m) if m.contains("custom options are not supported"))
+        );
     }
 
     #[test]

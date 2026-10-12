@@ -676,6 +676,11 @@ mod tests {
         ] {
             invalid_with(SchemaType::Xsd, &xsd(&body), phrase);
         }
+        invalid_with(
+            SchemaType::Protobuf,
+            r#"syntax = "proto3"; option a.b.c = 1; message M {}"#,
+            "option names with a dot are not supported",
+        );
         // A pattern the engine cannot build keeps the engine's reason, in the
         // words the dashboard maps to plain language.
         for (pattern, phrase) in [

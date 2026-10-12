@@ -10612,6 +10612,7 @@
         "proto_what_extensions": "extensions (Erweiterungsbereiche)",
         "proto_what_group": "group (Gruppen)",
         "proto_what_custom": "eigene Optionen, z. B. option (x) = …",
+        "proto_what_dotted_option": "Optionsnamen mit Punkt, z. B. option a.b = …",
         "proto_what_message_set": "message_set_wire_format",
         "proto_no_message": "In dieser Datei gibt es keine Nachricht (message). Das Muster muss eine Nachricht beschreiben.",
         "proto_designated": "Der Kommentar „// tentabus:message Name“ nennt eine Nachricht, die nicht zu den Nachrichten der obersten Ebene der Datei gehört. Verwenden Sie den Namen einer Nachricht, die nicht in einer anderen steht.",

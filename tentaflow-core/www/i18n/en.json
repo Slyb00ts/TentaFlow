@@ -11847,6 +11847,7 @@
         "proto_what_extensions": "extensions (extension ranges)",
         "proto_what_group": "group",
         "proto_what_custom": "custom options, e.g. option (x) = …",
+        "proto_what_dotted_option": "option names with a dot, e.g. option a.b = …",
         "proto_what_message_set": "message_set_wire_format",
         "proto_no_message": "There is no message in this file. The pattern must describe one message.",
         "proto_designated": "The comment “// tentabus:message Name” names a message that is not among the top-level messages of the file. Use the name of a message written outside other messages.",

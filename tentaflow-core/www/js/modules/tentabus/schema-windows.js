@@ -559,6 +559,7 @@ const PROTOBUF_UNSUPPORTED = [
   [/^extension ranges are not supported/, 'extensions'],
   [/^groups are not supported/, 'group'],
   [/^custom options are not supported/, 'custom'],
+  [/^option names with a dot are not supported/, 'dotted_option'],
   [/^message_set_wire_format is not supported/, 'message_set'],
 ];
 const NUMBER_TYPE_ADVICE = { float: 'decimal', double: 'decimal', long: 'integer', short: 'int', byte: 'int', unsignedInt: 'integer', unsignedLong: 'integer', nonNegativeInteger: 'integer', positiveInteger: 'integer', negativeInteger: 'integer' };

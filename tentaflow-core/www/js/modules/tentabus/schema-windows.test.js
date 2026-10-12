@@ -923,6 +923,7 @@ test('a Protobuf text: any text is sent as it is, the add window shows how the m
     ['extension ranges are not supported', /extensions \(zakresy rozszerzeń\)/],
     ['groups are not supported', /group \(grupy\)/],
     ['custom options are not supported', /opcje własne/],
+    ['option names with a dot are not supported', /nazwy opcji z kropką/],
     ['message_set_wire_format is not supported', /message_set_wire_format/],
     ['the schema declares no message', /nie ma żadnego komunikatu/],
     ["the designated message 'X' is not a top-level message of the schema", /Komentarz „\/\/ tentabus:message Nazwa” wskazuje komunikat, którego nie ma/],
