@@ -448,6 +448,12 @@ pub fn set_policy(
         BusFieldPolicyWrite::TopicMissing => Err(BusServiceError::TopicNotFound {
             name: topic.to_string(),
         }),
+        BusFieldPolicyWrite::BinaryPattern {
+            subject,
+            schema_type,
+        } => Err(BusServiceError::InvalidArgument(format!(
+            "{BINARY_TOPIC_NO_POLICY}: topic '{topic}' is checked with the {schema_type} pattern '{subject}'"
+        ))),
         BusFieldPolicyWrite::Changed => Err(BusServiceError::FieldPolicyChanged {
             topic: topic.to_string(),
         }),
@@ -1182,6 +1188,118 @@ mod tests {
         )
         .expect("delete the rule");
         bind().expect("no rules left");
+    }
+
+    /// The two orders are also closed where the write happens: these tests go
+    /// around the early checks of `set_policy` and `update_topic`, the way a
+    /// request that lost a race would reach the repository.
+    #[test]
+    fn the_writer_itself_refuses_a_rule_on_a_topic_bound_to_a_binary_pattern() {
+        use super::super::schema_registry::{registry, Compatibility, SchemaType};
+        let db = test_db();
+        registry::register(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "events.thrift",
+            SchemaType::Thrift,
+            "struct X { 1: i32 a }",
+            Some(Compatibility::None),
+            None,
+        )
+        .expect("register");
+        topics::create_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "bytes.events",
+            topics::TopicOptions {
+                schema_id: Some("events.thrift".to_string()),
+                ..Default::default()
+            },
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create topic");
+        let row = DbBusFieldPolicy {
+            instance_id: TEST_INSTANCE.to_string(),
+            org_id: TEST_ORG.to_string(),
+            topic: "bytes.events".to_string(),
+            subject_type: "any".to_string(),
+            subject_id: SUBJECT_ANY.to_string(),
+            direction: "read".to_string(),
+            fields_json: "[\"a\"]".to_string(),
+            required_fields_json: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        assert_eq!(
+            repository::bus_field_policy_set(&db, &row, BusFieldPolicyExpect::Any).expect("write"),
+            BusFieldPolicyWrite::BinaryPattern {
+                subject: "events.thrift".to_string(),
+                schema_type: "thrift".to_string()
+            }
+        );
+        assert!(list_policies(&db, TEST_INSTANCE, TEST_ORG, "bytes.events")
+            .expect("list")
+            .is_empty());
+    }
+
+    #[test]
+    fn the_writer_itself_refuses_a_binary_pattern_on_a_topic_with_rules_only_when_asked_to() {
+        use super::super::schema_registry::{registry, Compatibility, SchemaType};
+        let db = test_db();
+        registry::register(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "events.thrift",
+            SchemaType::Thrift,
+            "struct X { 1: i32 a }",
+            Some(Compatibility::None),
+            None,
+        )
+        .expect("register");
+        topics::create_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "ruled.events",
+            topics::TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create topic");
+        set_policy(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "ruled.events",
+            "any",
+            SUBJECT_ANY,
+            Direction::Read,
+            &field_set(&["a"]),
+            &BTreeSet::new(),
+            BusFieldPolicyExpect::Any,
+        )
+        .expect("rule");
+        let mut row = repository::bus_topic_get(&db, TEST_INSTANCE, TEST_ORG, "ruled.events")
+            .expect("get")
+            .expect("topic");
+        row.schema_id = Some("events.thrift".to_string());
+        assert_eq!(
+            repository::bus_topic_update_checked(&db, &row, true).expect("update"),
+            repository::BusTopicWrite::BinaryPatternUnderRules
+        );
+        let stored = repository::bus_topic_get(&db, TEST_INSTANCE, TEST_ORG, "ruled.events")
+            .expect("get")
+            .expect("topic");
+        assert_eq!(stored.schema_id, None, "nothing was written");
+        // An update that does not ask (a setting changed on an old topic) goes through.
+        assert_eq!(
+            repository::bus_topic_update_checked(&db, &row, false).expect("update"),
+            repository::BusTopicWrite::Written
+        );
     }
 
     #[test]

@@ -31430,16 +31430,46 @@ fn publish_removed_field_policies(pool: &DbPool, policies: &[DbBusFieldPolicy]) 
     }
 }
 
+/// What a checked `bus_topic_update` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BusTopicWrite {
+    /// Written (or the topic is gone, as an unchecked update always treated it).
+    Written,
+    /// The row binds an Avro, Protobuf or Thrift pattern and the topic has
+    /// field policies: nothing was written.
+    BinaryPatternUnderRules,
+}
+
 pub fn bus_topic_update(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
+    bus_topic_update_checked(pool, row, false).map(|_| ())
+}
+
+/// `bus_topic_update`; with `refuse_binary_under_rules` the statement itself
+/// refuses to leave a topic bound to a binary pattern while field policies
+/// exist for it. The check is part of the `UPDATE`, so a rule added between
+/// the caller's look and this write cannot slip past it (a rule is only
+/// written while the topic is not bound to such a pattern: see
+/// `bus_field_policy_set`).
+pub fn bus_topic_update_checked(
+    pool: &DbPool,
+    row: &DbBusTopic,
+    refuse_binary_under_rules: bool,
+) -> Result<BusTopicWrite> {
     let conn = acquire(pool)?;
-    conn.execute(
+    let changed = conn.execute(
         "UPDATE bus_topics SET partitions=?4, retention_ms=?5, retention_bytes=?6, \
          cleanup_policy=?7, delivery=?8, idempotency_key=?9, dedup_window_ms=?10, \
          max_delivery_attempts=?11, retry_backoff_ms=?12, schema_id=?13, validation=?14, \
          content_type=?15, replication_factor=?16, acks=?17, durability=?18, \
          max_inline_bytes=?19, compression=?20, environment=?21, updated_at_ms=?22, \
          durability_class=?23, description=COALESCE(?24, description) \
-         WHERE instance_id=?1 AND org_id=?2 AND name=?3",
+         WHERE instance_id=?1 AND org_id=?2 AND name=?3 \
+           AND NOT (?25 = 1 \
+             AND EXISTS (SELECT 1 FROM bus_schema_subjects s \
+                         WHERE s.instance_id=?1 AND s.org_id=?2 AND s.subject=?13 \
+                           AND s.schema_type IN ('avro','protobuf','thrift')) \
+             AND EXISTS (SELECT 1 FROM bus_field_policies p \
+                         WHERE p.instance_id=?1 AND p.org_id=?2 AND p.topic=?3))",
         rusqlite::params![
             row.instance_id,
             row.org_id,
@@ -31470,14 +31500,25 @@ pub fn bus_topic_update(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
             row.updated_at_ms,
             row.durability_class,
             row.description,
+            i64::from(refuse_binary_under_rules),
         ],
     )?;
+    if changed == 0 && refuse_binary_under_rules {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bus_topics WHERE instance_id=?1 AND org_id=?2 AND name=?3)",
+            rusqlite::params![row.instance_id, row.org_id, row.name],
+            |r| r.get(0),
+        )?;
+        if exists {
+            return Ok(BusTopicWrite::BinaryPatternUnderRules);
+        }
+    }
     // Released before the publish: `record_core_capture` reads and writes the
     // same pool through the sync runtime, and holding a connection across it
     // would put two borrowers against one pool slot on a small rig.
     drop(conn);
     let _ = publish_bus_topic_capture(pool, row, crate::sync::runtime::SqlWriteAction::Update)?;
-    Ok(())
+    Ok(BusTopicWrite::Written)
 }
 
 pub fn bus_topic_get(
@@ -32341,13 +32382,19 @@ pub enum BusFieldPolicyExpect {
     UpdatedAt(i64),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BusFieldPolicyWrite {
     Written,
     /// The topic does not exist (nothing written).
     TopicMissing,
     /// The stored rule is not what `BusFieldPolicyExpect` named (nothing written).
     Changed,
+    /// The topic is bound to an Avro, Protobuf or Thrift pattern, whose bytes
+    /// a rule cannot read (nothing written). Carries the pattern's name and kind.
+    BinaryPattern {
+        subject: String,
+        schema_type: String,
+    },
 }
 
 /// Upsert — one row per `(instance_id, org_id, topic, subject_type,
@@ -32377,6 +32424,29 @@ pub fn bus_field_policy_set(
         )?;
         if !exists {
             return Ok((BusFieldPolicyWrite::TopicMissing, row.clone()));
+        }
+        // Looked at in the transaction that writes the rule, so a pattern
+        // bound a moment ago cannot be missed (`bus_topic_update_checked`
+        // refuses the opposite order the same way).
+        let binary: Option<(String, String)> = tx
+            .query_row(
+                "SELECT s.subject, s.schema_type FROM bus_topics t \
+                 JOIN bus_schema_subjects s \
+                   ON s.instance_id = t.instance_id AND s.org_id = t.org_id AND s.subject = t.schema_id \
+                 WHERE t.instance_id = ?1 AND t.org_id = ?2 AND t.name = ?3 \
+                   AND s.schema_type IN ('avro','protobuf','thrift')",
+                rusqlite::params![row.instance_id, row.org_id, row.topic],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((subject, schema_type)) = binary {
+            return Ok((
+                BusFieldPolicyWrite::BinaryPattern {
+                    subject,
+                    schema_type,
+                },
+                row.clone(),
+            ));
         }
         let current: Option<i64> = tx
             .query_row(
@@ -32431,7 +32501,7 @@ pub fn bus_field_policy_set(
         )?;
         Ok((BusFieldPolicyWrite::Written, stored))
     })?;
-    if outcome == BusFieldPolicyWrite::Written {
+    if matches!(outcome, BusFieldPolicyWrite::Written) {
         let _ = publish_bus_field_policy_capture(
             pool,
             &stored,

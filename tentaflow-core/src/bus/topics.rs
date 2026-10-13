@@ -1328,15 +1328,11 @@ fn apply_schema_binding_guard(
         && !repository::bus_field_policy_list_for_topic(db, &cfg.instance_id, org_id, &cfg.name)?
             .is_empty()
     {
-        return Err(BusServiceError::InvalidTopicConfig {
-            reason: format!(
-                "{}: cannot bind the {} pattern '{subject_name}' to topic '{}' while field \
-                 policies exist for it; delete its field policies first",
-                super::field_policies::BINARY_TOPIC_NO_POLICY,
-                schema_type.as_str(),
-                cfg.name
-            ),
-        });
+        return Err(binary_under_rules(
+            schema_type.as_str(),
+            subject_name,
+            &cfg.name,
+        ));
     }
     let format = PayloadFormat::from_content_type(&cfg.content_type);
     if let Some(required) = schema_type.required_payload_format() {
@@ -1434,6 +1430,17 @@ pub fn get_topic(
     }
 }
 
+/// The refusal to bind a binary pattern to a topic that has field policies.
+fn binary_under_rules(kind: &str, subject: &str, topic: &str) -> BusServiceError {
+    BusServiceError::InvalidTopicConfig {
+        reason: format!(
+            "{}: cannot bind the {kind} pattern '{subject}' to topic '{topic}' while field \
+             policies exist for it; delete its field policies first",
+            super::field_policies::BINARY_TOPIC_NO_POLICY,
+        ),
+    }
+}
+
 pub fn update_topic(
     db: &DbPool,
     instance_id: &str,
@@ -1511,7 +1518,20 @@ pub fn update_topic(
         old_schema_id.as_deref(),
     )?;
     cfg.updated_at_ms = now_ms;
-    repository::bus_topic_update(db, &DbBusTopic::from(&cfg))?;
+    // The binary-pattern-under-rules refusal is made again inside the UPDATE
+    // when the pattern changes, so a rule written since the check above
+    // cannot be missed.
+    let rebound = cfg.schema_id.as_deref().filter(|s| !s.is_empty()).is_some()
+        && cfg.schema_id != old_schema_id;
+    if repository::bus_topic_update_checked(db, &DbBusTopic::from(&cfg), rebound)?
+        == repository::BusTopicWrite::BinaryPatternUnderRules
+    {
+        let subject = cfg.schema_id.clone().unwrap_or_default();
+        let kind = repository::bus_schema_subject_get(db, instance_id, org_id, &subject)?
+            .map(|row| row.schema_type)
+            .unwrap_or_default();
+        return Err(binary_under_rules(&kind, &subject, name));
+    }
     Ok(cfg)
 }
 
