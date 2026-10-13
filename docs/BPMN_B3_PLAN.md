@@ -321,7 +321,7 @@ Szacunki dotyczą jednej osoby i przeglądu. Każdy pakiet ma być wdrażalny i 
 
 | Pakiet | Zakres | Zależy od | Czas | Migracja |
 |---|---|---|---|---|
-| **B3.1** Fundament + narzędzie addonu | `ServiceImplementation{Flow,AddonTool}`, walidacja, rozszerzenie pinu, rozgałęzienie `execute_claimed`, `call_tool_process`, `FlowOrigin::Process`, kodek JS, XML | brak | 3 dni | 201 |
+| **B3.1** Fundament + narzędzie addonu — **wdrożone 2026-10-13** (`95f3ee727`..`87c462d3b`) | `ServiceImplementation{Flow,AddonTool}`, walidacja, rozszerzenie pinu, rozgałęzienie `execute_claimed`, `call_tool_process`, `FlowOrigin::Process`, kodek JS, XML; odkładanie zajętych/niedostępnych narzędzi, odzyskiwanie wyników per wiersz z incydentami | brak | 3 dni | 201, 202 |
 | **B3.2** Blok Flow Buildera | wariant `Block`, lista dozwolonych, graf syntetyczny, `dispatch_pinned_synthetic` | B3.1 | 2 dni | brak |
 | **B3.3a** Opcje + paleta „Bloki TentaFlow” | rozszerzenie `OptionsResponse`, szablony dynamiczne, drop, i18n, test e2e dla flow/blok/narzędzie | B3.1 (B3.2 dla bloków) | 2 dni | brak |
 | **B3.3b** Inspektor z zakładkami + „Wynik i błędy” | `tf-tabs`, `processResultRouting`, ostrzeżenia, przyciski obsługi, i18n | B3.1 (równolegle z B3.3a) | 2-3 dni | brak |
