@@ -10713,7 +10713,9 @@
         "thrift_limit_parts": "Ein Name hat mehr als {limit} durch Punkte getrennte {limit|Teil|Teile}.",
         "thrift_limit_size": "Das Muster ist für die Registry zu groß (mehr als {limit} {limit|Element|Elemente} einer Art: Token, Typausdrücke, Konstanten, Namespaces oder Annotationen). Vereinfachen Sie es.",
         "thrift_lexical": "Das Muster hat einen nicht geschlossenen Kommentar oder Text in Anführungszeichen, eine fehlerhafte Zahl, eine unbekannte Escape-Sequenz in einem Text oder ein Zeichen, das eine Thrift-Datei nicht enthalten kann.",
-        "at_line": "In Zeile {line}."
+        "at_line": "In Zeile {line}.",
+        "at_line_column": "In Zeile {line}, Spalte {column}.",
+        "hidden_character": "Das Muster enthält ein unsichtbares Zeichen oder eines, das die Textrichtung ändert: {code} ({name}). Ein solches Zeichen lässt das Muster im Editor anders aussehen, als ein Programm es liest („Trojan Source“). Entfernen Sie es und senden Sie das Muster erneut. {atLine}"
       }
     },
     "topics": {

@@ -10713,7 +10713,9 @@
         "thrift_limit_parts": "Un nom a plus de {limit} {limit|partie|parties} séparées par des points.",
         "thrift_limit_size": "Le modèle est trop grand pour le registre (plus de {limit} {limit|élément|éléments} d’un même genre : jetons, expressions de type, constantes, espaces de noms ou annotations). Simplifiez-le.",
         "thrift_lexical": "Le modèle contient un commentaire ou un texte entre guillemets non fermé, un nombre mal écrit, une séquence d’échappement inconnue dans un texte ou un caractère qu’un fichier Thrift ne peut pas contenir.",
-        "at_line": "À la ligne {line}."
+        "at_line": "À la ligne {line}.",
+        "at_line_column": "À la ligne {line}, colonne {column}.",
+        "hidden_character": "Le modèle contient un caractère invisible ou qui change le sens du texte : {code} ({name}). Un tel caractère fait paraître le modèle dans l’éditeur autrement que ce que lit un programme (« Trojan Source »). Supprimez-le et renvoyez le modèle. {atLine}"
       }
     },
     "topics": {

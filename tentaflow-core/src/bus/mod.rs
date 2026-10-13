@@ -20391,6 +20391,65 @@ mod tests {
         assert_eq!(svc.schema_compiles_total(), compiles + 1);
     }
 
+    #[test]
+    fn publishing_to_a_topic_whose_stored_version_hides_a_character_says_so() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        schema_registry::registry::register(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "subject",
+            schema_registry::SchemaType::Thrift,
+            ORDER_THRIFT,
+            None,
+            None,
+        )
+        .unwrap();
+        svc.create_topic(
+            &ctx,
+            "validated.events",
+            topics::TopicOptions {
+                content_type: Some("application/octet-stream".to_string()),
+                schema_id: Some("subject".to_string()),
+                validation: Some(topics::ValidationMode::Dlq),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // A row that reached the table without the registration screen (stored
+        // earlier, or applied from a peer): the comment is valid Thrift.
+        svc.db
+            .write()
+            .unwrap()
+            .execute(
+                "UPDATE bus_schema_versions SET schema_text = ?1 WHERE subject = 'subject'",
+                [format!("// admin\u{202E}\n{ORDER_THRIFT}")],
+            )
+            .unwrap();
+        let err = svc
+            .publish(
+                &ctx,
+                "validated.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![PublishRecord {
+                        payload: Bytes::from(thrift_order(1, b"x")),
+                        ..record("")
+                    }],
+                },
+            )
+            .unwrap_err();
+        let BusServiceError::InvalidArgument(detail) = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(
+            detail,
+            "subject 'subject' v1: the stored schema cannot be compiled under the current rules of its format; register a corrected version: invalid schema: the schema contains an invisible or direction-controlling character U+202E (RIGHT-TO-LEFT OVERRIDE) at line 1, column 9"
+        );
+    }
+
     fn register_json_subject(svc: &BusService, subject: &str) {
         register_json_subject_in(svc, "org-1", subject);
     }

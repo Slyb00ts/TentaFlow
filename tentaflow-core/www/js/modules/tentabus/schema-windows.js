@@ -610,6 +610,15 @@ function lineSentence(serverText) {
 
 function refusalReasonOf(schemaType, serverText) {
   const text = String(serverText || '').replace(/^invalid schema:\s*/, '');
+  // The same screen runs before every format's parser (text_guard.rs), so every kind words it the same.
+  const hidden = /^the schema contains an invisible or direction-controlling character (U\+[0-9A-F]+) \(([^)]*)\) at line (\d+), column (\d+)/.exec(text);
+  if (hidden) {
+    return T('schemas.refused.hidden_character', {
+      code: hidden[1],
+      name: hidden[2],
+      atLine: T('schemas.refused.at_line_column', { line: hidden[3], column: hidden[4] }),
+    });
+  }
   if (schemaType === 'hl7v2_profile') {
     let m = /'(MSH-[12])' is the message's own field-separator/.exec(text);
     if (m) return T('schemas.refused.hl7_msh', { field: m[1] });

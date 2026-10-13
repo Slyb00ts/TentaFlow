@@ -4178,7 +4178,7 @@ fn compile_text(schema_text: &str) -> Result<Compiled, SchemaError> {
 }
 
 impl SchemaKindOps for XsdOps {
-    fn compile(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
+    fn compile_screened(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
         compile_text(schema_text).map(CompiledSchema::Xsd)
     }
 
@@ -4203,7 +4203,7 @@ impl SchemaKindOps for XsdOps {
         verdict
     }
 
-    fn derive_subschema(
+    fn derive_screened(
         &self,
         schema_text: &str,
         allowed: &BTreeSet<String>,

@@ -523,11 +523,11 @@ fn schema_text_refusals_are_stable() {
         ),
         (
             "struct S { 1: i32 a = \"a\u{202e}b\" }".to_string(),
-            "character a Thrift file cannot hold inside a string",
+            "invisible or direction-controlling character",
         ),
         (
             "struct S { 1: i32 a = \"a\u{1}b\" }".to_string(),
-            "character a Thrift file cannot hold inside a string",
+            "invisible or direction-controlling character",
         ),
         (
             format!("struct S {{ 1: i32 a = \"{long_string}\" }}"),

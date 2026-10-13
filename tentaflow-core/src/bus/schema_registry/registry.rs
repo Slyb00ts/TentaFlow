@@ -1730,6 +1730,71 @@ mod tests {
     }
 
     #[test]
+    fn register_refuses_a_hidden_character_for_every_kind_and_stores_nothing() {
+        let db = fresh_db();
+        for kind in SchemaType::ALL {
+            let err = register(
+                &db,
+                "tentabus-00000001",
+                "org-1",
+                "orders",
+                kind,
+                "{\"description\": \"a\u{202E}b\"}",
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, BusServiceError::InvalidArgument(m) if m
+                    == "schema: invalid schema: the schema contains an invisible or \
+                        direction-controlling character U+202E (RIGHT-TO-LEFT OVERRIDE) \
+                        at line 1, column 19"),
+                "{}: {err:?}",
+                kind.as_str()
+            );
+        }
+        assert!(list_subjects(&db, "tentabus-00000001", "org-1")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_stored_version_with_a_hidden_character_does_not_block_a_corrected_one() {
+        let db = fresh_db();
+        register(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+            SchemaType::JsonSchema,
+            V1,
+            None,
+            None,
+        )
+        .unwrap();
+        // A row stored before the screen existed, or applied from a peer.
+        db.write()
+            .unwrap()
+            .execute(
+                "UPDATE bus_schema_versions SET schema_text = ?1 WHERE subject = 'orders'",
+                ["{\"type\":\"object\",\"description\":\"a\u{202E}b\"}"],
+            )
+            .unwrap();
+        let out = register(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+            SchemaType::JsonSchema,
+            r#"{"type":"object","description":"ab"}"#,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.version, 2);
+    }
+
+    #[test]
     fn set_compatibility_rejects_a_deprecated_subject() {
         let db = fresh_db();
         register(

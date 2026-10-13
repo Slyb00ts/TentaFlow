@@ -878,6 +878,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   wzoru mówi przed zamknięciem, że tekst zostanie zachowany (bo tak jest).
   „Nadaj dostęp” nie wybiera za administratora pierwszej grupy z listy, a
   kreator topiku pyta przed porzuceniem wpisanych danych tak jak inne okna.
+- Rejestr wzorców odmawia tekstu z niewidocznym znakiem albo znakiem zmieniającym
+  kierunek tekstu („Trojan Source”), w każdym formacie (JSON Schema, Avro,
+  Protobuf, Thrift, XSD, profil HL7 v2) i w całym tekście, także w komentarzach i
+  literałach. Jedno sprawdzenie (`schema_registry/text_guard.rs`) działa przed
+  parserem formatu, przy rejestracji (protokół binarny, REST, addony) i przy
+  wyprowadzaniu podschematu. Odmawiane są: sterujące C0 poza TAB, LF i CR, DEL i
+  C1, znaki kierunku (U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069),
+  niewidoczne (U+00AD, U+180E, U+200B–U+200D, U+2060–U+2064), U+FEFF także na
+  początku (znacznik BOM; żaden parser go nie przyjmował), reszta kategorii Cf
+  oraz U+2028 i U+2029. Polskie litery i zwykłe emoji przechodzą; emoji sklejone
+  U+200D są odrzucane. Komunikat podaje znak (U+XXXX i nazwę), wiersz i kolumnę,
+  a panel wzorów mówi to po polsku („W wierszu N, w kolumnie M”). Odrzucenie znaku
+  w literale Protobuf i Thrift ma teraz to samo zdanie, co w pozostałych
+  formatach; stare, osobne sprawdzenia usunięto. Wersja zapisana wcześniej (albo
+  przyjęta z synchronizacji) z takim znakiem nie jest przepisywana: przy
+  następnej kompilacji topik odmawia z „zapisany wzór nie daje się skompilować…”
+  i tym samym zdaniem, a poprawioną wersję można zarejestrować normalnie.
 
 ## [0.4.0-beta.1] — 2026-09-29
 

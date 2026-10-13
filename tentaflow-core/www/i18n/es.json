@@ -10713,7 +10713,9 @@
         "thrift_limit_parts": "Un nombre tiene más de {limit} {limit|parte|partes} separadas por puntos.",
         "thrift_limit_size": "El patrón es demasiado grande para el registro (más de {limit} {limit|elemento|elementos} de una clase: tokens, expresiones de tipo, constantes, espacios de nombres o anotaciones). Simplifícalo.",
         "thrift_lexical": "El patrón tiene un comentario o un texto entre comillas sin cerrar, un número mal escrito, una secuencia de escape desconocida en un texto o un carácter que un archivo Thrift no puede contener.",
-        "at_line": "En la línea {line}."
+        "at_line": "En la línea {line}.",
+        "at_line_column": "En la línea {line}, columna {column}.",
+        "hidden_character": "El patrón contiene un carácter invisible o que cambia la dirección del texto: {code} ({name}). Un carácter así hace que el patrón se vea en el editor distinto de lo que lee un programa («Trojan Source»). Elimínelo y envíe el patrón de nuevo. {atLine}"
       }
     },
     "topics": {

@@ -229,7 +229,7 @@ fn is_populated(value: &str) -> bool {
 pub struct Hl7v2ProfileOps;
 
 impl SchemaKindOps for Hl7v2ProfileOps {
-    fn compile(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
+    fn compile_screened(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
         let profile = parse_profile(schema_text)?;
         let mut fields_by_segment: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for field in profile.fields.values() {
@@ -291,7 +291,7 @@ impl SchemaKindOps for Hl7v2ProfileOps {
         Ok(())
     }
 
-    fn derive_subschema(
+    fn derive_screened(
         &self,
         schema_text: &str,
         allowed: &BTreeSet<String>,

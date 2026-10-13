@@ -63,9 +63,9 @@
 //     its size, types (256), type expressions (16 384), fields per struct
 //     (1024) and in total (4096), enum values per enum (1024) and in total
 //     (4096), `required` fields per struct (64), identifiers (128 bytes, 8
-//     dotted parts), string literals (256 bytes, no control, zero-width or
-//     bidi characters), annotations, constants, namespaces, the typedef chain
-//     (32). Comments are free text and may hold anything.
+//     dotted parts), string literals (256 bytes), annotations, constants,
+//     namespaces, the typedef chain (32). Comments are free text, bar the
+//     characters `text_guard` refuses in every text.
 //   - types live in an arena of expressions; a typedef is a NAME in it, never
 //     a copy, so a chain of typedefs that doubles at every step stays linear.
 //   - `validate` is an iterative walk with an explicit stack of at most
@@ -771,7 +771,7 @@ fn derive(c: &Compiled, allowed: &BTreeSet<String>) -> String {
 pub struct ThriftOps;
 
 impl SchemaKindOps for ThriftOps {
-    fn compile(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
+    fn compile_screened(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
         parse_text(schema_text).map(CompiledSchema::Thrift)
     }
 
@@ -790,7 +790,7 @@ impl SchemaKindOps for ThriftOps {
         verdict
     }
 
-    fn derive_subschema(
+    fn derive_screened(
         &self,
         schema_text: &str,
         allowed: &BTreeSet<String>,

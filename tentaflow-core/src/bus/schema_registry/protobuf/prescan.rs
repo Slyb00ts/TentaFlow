@@ -44,8 +44,6 @@ use super::{
 const BAD_CHARACTER: &str = "the schema contains a character a .proto file cannot";
 const DOTTED_OPTION: &str = "option names with a dot are not supported";
 const COMMENT_OPEN: &str = "a comment is never closed";
-const STRING_CHARACTER: &str =
-    "the schema contains a character a .proto file cannot hold inside a string";
 const STRING_OPEN: &str = "a string is never closed on its line";
 
 pub(super) struct Prescan {
@@ -129,20 +127,6 @@ impl Gaps {
         self.designations.insert(at, name.to_string());
         Ok(())
     }
-}
-
-/// C0, DEL and C1 controls, plus zero-width, bidi and other format characters.
-fn is_unsafe_string_char(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{61C}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2060}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{FEFF}'
-        )
 }
 
 fn is_ident_byte(b: u8) -> bool {
@@ -319,11 +303,6 @@ fn lex(text: &str) -> Result<Lexed, SchemaError> {
                     return Err(invalid(format!(
                         "a string is longer than {MAX_STRING_LITERAL} bytes"
                     )));
-                }
-                // A literal is echoed by some parser refusals: a character
-                // that moves a cursor or reorders text must not get that far.
-                if literal.escaped.chars().any(is_unsafe_string_char) {
-                    return Err(invalid(STRING_CHARACTER));
                 }
             }
             Token::Symbol('=') => {

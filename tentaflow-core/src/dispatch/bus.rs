@@ -8349,6 +8349,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schema_register_refuses_a_hidden_character_in_every_kind() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(&db, &user_id, "org_admin");
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
+        let ctx = handler_ctx(db, org);
+        for kind in schema_registry::SchemaType::ALL {
+            let err = schema_register_v1(
+                &ctx,
+                fixture_instance_id().as_str(),
+                format!("hidden.{}", uuid::Uuid::new_v4().simple()),
+                kind.as_str().to_string(),
+                "{\"description\": \"a\u{202E}b\"}".to_string(),
+                None,
+            )
+            .await
+            .expect_err("a hidden character must be refused");
+            assert_eq!(err.code, ProtocolErrorCode::BadRequest, "{}", kind.as_str());
+            assert!(
+                err.message.contains(
+                    "the schema contains an invisible or direction-controlling character \
+                     U+202E (RIGHT-TO-LEFT OVERRIDE) at line 1, column 19"
+                ),
+                "{}: {}",
+                kind.as_str(),
+                err.message
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn schema_register_identical_text_is_deduplicated() {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());

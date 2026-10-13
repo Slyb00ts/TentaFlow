@@ -76,8 +76,7 @@
 //     they become messages), `MAX_ENUMS` enums, identifiers over
 //     `MAX_NAME_LEN`, a package or dotted type reference over its part and
 //     length caps, a declared type whose full name passes
-//     `MAX_QUALIFIED_NAME_LEN`, strings over `MAX_STRING_LITERAL` or holding
-//     a control or direction-changing character, `(` anywhere (custom
+//     `MAX_QUALIFIED_NAME_LEN`, strings over `MAX_STRING_LITERAL`, `(` anywhere (custom
 //     options), non-ASCII outside strings and comments, a type name (message,
 //     enum or the entry of a `map`, spelled as the parser spells it) declared
 //     twice in one scope, a `map` inside a `map`, and `import` / `service` /
@@ -1682,7 +1681,7 @@ fn derive(c: &Compiled, allowed: &BTreeSet<String>) -> String {
 pub struct ProtobufOps;
 
 impl SchemaKindOps for ProtobufOps {
-    fn compile(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
+    fn compile_screened(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
         parse_text(schema_text).map(CompiledSchema::Protobuf)
     }
 
@@ -1703,7 +1702,7 @@ impl SchemaKindOps for ProtobufOps {
         verdict
     }
 
-    fn derive_subschema(
+    fn derive_screened(
         &self,
         schema_text: &str,
         allowed: &BTreeSet<String>,
@@ -3488,7 +3487,7 @@ mod tests {
             );
             let got = refusal(&text);
             assert!(
-                got.contains("a .proto file cannot hold inside a string"),
+                got.contains("invisible or direction-controlling character"),
                 "{got:?}"
             );
             assert!(

@@ -11948,7 +11948,9 @@
         "thrift_limit_parts": "Nazwa ma więcej niż {limit} {limit|człon|człony|członów} oddzielonych kropką.",
         "thrift_limit_size": "Wzór jest za duży dla rejestru (ponad {limit} {limit|element|elementy|elementów} jednego rodzaju: tokenów, wyrażeń typów, stałych, przestrzeni nazw albo adnotacji). Uprość go.",
         "thrift_lexical": "Wzór ma niedomknięty komentarz lub tekst w cudzysłowie, źle zapisaną liczbę, nieznaną sekwencję ucieczki w tekście albo znak, którego plik Thrift nie może zawierać.",
-        "at_line": "W wierszu {line}."
+        "at_line": "W wierszu {line}.",
+        "at_line_column": "W wierszu {line}, w kolumnie {column}.",
+        "hidden_character": "Wzór zawiera niewidoczny znak albo znak zmieniający kierunek tekstu: {code} ({name}). Taki znak sprawia, że wzór wygląda w edytorze inaczej, niż odczyta go program („Trojan Source”). Usuń go i wyślij wzór ponownie. {atLine}"
       }
     },
     "topics": {

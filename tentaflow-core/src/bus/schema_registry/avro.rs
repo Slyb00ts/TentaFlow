@@ -1809,7 +1809,7 @@ fn record_with(record: &RecordSchema, fields: Vec<RecordField>) -> Schema {
 pub struct AvroOps;
 
 impl SchemaKindOps for AvroOps {
-    fn compile(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
+    fn compile_screened(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
         parse_text(schema_text).map(|(_, compiled)| CompiledSchema::Avro(compiled))
     }
 
@@ -1828,7 +1828,7 @@ impl SchemaKindOps for AvroOps {
         verdict
     }
 
-    fn derive_subschema(
+    fn derive_screened(
         &self,
         schema_text: &str,
         allowed: &BTreeSet<String>,

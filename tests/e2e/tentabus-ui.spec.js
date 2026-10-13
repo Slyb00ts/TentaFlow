@@ -3004,6 +3004,57 @@ test('F4 refusals in plain words: a profile and an XSD that cannot be added, a s
   expect(errors.filter((e) => !/schema_incompatible|BadRequest|invalid_argument/.test(e)), errors.join('\n')).toEqual([]);
 });
 
+test('Trojan Source: a pattern text with a hidden or direction-changing character is refused in plain words with its line and column, in two formats, and the clean text is added', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openSchemas(page);
+  const instance = hashParams(page).instance;
+  const win = schemaWindow(page);
+  const name = `ukryty-znak-${RUN}`;
+  const error = win.locator('[data-role="error"]');
+  const openAdd = async (format) => {
+    await schemasSlot(page).locator('[data-go="add"]').first().click();
+    await expect(win.locator('[slot="body"]')).toBeVisible();
+    await win.locator(`tf-choice-card[value="${format}"]`).click();
+    await win.locator('[data-role="name"] input').fill(name);
+  };
+  try {
+    // U+202E inside a string of a JSON Schema: line 1, column 19.
+    await openAdd('json_schema');
+    await win.locator('[data-role="text"] textarea').fill('{"description": "a\u202Eb"}');
+    await win.locator('[data-act="save"]').click();
+    await expect(error).toContainText('Wzór zawiera niewidoczny znak albo znak zmieniający kierunek tekstu: U+202E (RIGHT-TO-LEFT OVERRIDE).', { timeout: 15000 });
+    await expect(error).toContainText('W wierszu 1, w kolumnie 19.');
+    await expect(error).not.toContainText('Rejestr nie przyjął');
+    await expect(error.locator('tf-disclosure pre')).toContainText('the schema contains an invisible or direction-controlling character U+202E (RIGHT-TO-LEFT OVERRIDE) at line 1, column 19');
+    await page.screenshot({ path: path.join(SHOTS, 'trojan-source-json.png') });
+    // The refusal belongs to the text that was refused; cancelling leaves no pattern.
+    await win.locator('[data-role="text"] textarea').fill('{"description": "ab"}');
+    await expect(error).toBeHidden();
+    await cancelOut(win);
+    await expect(win).toHaveCount(0);
+    await expect(schemaRow(page, name)).toHaveCount(0);
+
+    // A zero-width space in an XML comment of an XSD: line 2, column 13.
+    await openAdd('xsd');
+    await win.locator('[data-role="text"] textarea').fill('<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">\n  <!-- uwaga\u200B -->\n  <xs:element name="a" type="xs:string"/>\n</xs:schema>');
+    await win.locator('[data-act="save"]').click();
+    await expect(error).toContainText('U+200B (ZERO WIDTH SPACE)', { timeout: 15000 });
+    await expect(error).toContainText('W wierszu 2, w kolumnie 13.');
+
+    // Polish letters and emoji in the same comment are accepted.
+    await win.locator('[data-role="text"] textarea').fill('<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">\n  <!-- uwaga: zażółć gęślą jaźń 😀 -->\n  <xs:element name="a" type="xs:string"/>\n</xs:schema>');
+    await expect(error).toBeHidden();
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0, { timeout: 15000 });
+    await expect(schemaRow(page, name)).toHaveCount(1);
+  } finally {
+    await busCall(page, 'busSchemaDeleteRequest', { instanceId: instance, subject: name, deprecateOnly: false }).catch(() => {});
+  }
+  expect(errors.filter((e) => !/schema_incompatible|BadRequest|invalid_argument/.test(e)), errors.join('\n')).toEqual([]);
+});
+
 test('U6 Dostęp at 1440: a group gets reading, a person a write ban, a change, the ban removed with its warning, an addon', async ({ page }) => {
   const errors = trackErrors(page);
   await page.setViewportSize(DESKTOP);

@@ -1938,7 +1938,7 @@ impl JsonSchemaOps {
 }
 
 impl SchemaKindOps for JsonSchemaOps {
-    fn compile(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
+    fn compile_screened(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
         let out = compile_schema_text(schema_text)?;
 
         // Reject at REGISTRATION time (never at publish time) a schema whose
@@ -1987,7 +1987,7 @@ impl SchemaKindOps for JsonSchemaOps {
         validate_node(&c.schema, &value, &mut path, &mut steps)
     }
 
-    fn derive_subschema(
+    fn derive_screened(
         &self,
         schema_text: &str,
         allowed: &BTreeSet<String>,

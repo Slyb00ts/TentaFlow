@@ -1577,6 +1577,41 @@ mod tests {
     }
 
     #[test]
+    fn rest_registration_refuses_a_hidden_character_and_stores_nothing() {
+        let fx = fixture("cc00000c");
+        let uid = fx.key(ORG, &["write"]);
+        // The escape is JSON's own: the schema text carries a real U+202E.
+        let body =
+            r#"{"schema_type":"json_schema","schema_text":"{\"description\":\"a\u202eb\"}"}"#;
+        let resp = send(
+            &fx,
+            "POST",
+            &format!("{}?org_id={ORG}", fx.path("/s1/versions")),
+            api_key(&uid),
+            body,
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let reply = body_json(resp).to_string();
+        assert!(
+            reply.contains(
+                "the schema contains an invisible or direction-controlling character U+202E \
+                 (RIGHT-TO-LEFT OVERRIDE) at line 1, column 18"
+            ),
+            "{reply}"
+        );
+        assert!(
+            crate::bus::schema_registry::registry::list_subjects(
+                &fx.state.db,
+                fx.instance.as_str(),
+                ORG
+            )
+            .unwrap()
+            .is_empty(),
+            "nothing may be registered from a refused text"
+        );
+    }
+
+    #[test]
     fn rest_registration_is_visible_to_the_dashboard_registry() {
         let fx = fixture("cc00000e");
         let uid = fx.key(ORG, &["write"]);

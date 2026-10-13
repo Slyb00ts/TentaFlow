@@ -43,6 +43,7 @@ mod hl7v2_profile;
 mod json_schema;
 mod protobuf;
 pub mod registry;
+mod text_guard;
 mod thrift;
 mod xsd;
 
@@ -346,8 +347,17 @@ pub(super) fn shorten_path(path: &str) -> String {
 /// `derive_subschema`) and publish-time (`validate`) responsibilities.
 pub trait SchemaKindOps: Send + Sync {
     /// Parse + compile at registration time. Everything expensive or
-    /// rejectable happens here, never on the publish path.
-    fn compile(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError>;
+    /// rejectable happens here, never on the publish path. The text is
+    /// screened for hidden characters (`text_guard`) before any format
+    /// parser sees it, so every kind refuses the same set the same way.
+    fn compile(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
+        text_guard::reject_hidden_characters(schema_text)?;
+        self.compile_screened(schema_text)
+    }
+
+    /// The kind's own compile, for text `text_guard` has already passed.
+    /// Implementations are reached through [`SchemaKindOps::compile`] only.
+    fn compile_screened(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError>;
 
     /// Publish-path check: bounded work, no schema re-parsing. A document
     /// the check cannot decide within its budget is `LimitExceeded`, never
@@ -371,7 +381,20 @@ pub trait SchemaKindOps: Send + Sync {
     /// field policy's `allowed` top-level field set produces (F4's binary
     /// codecs re-encode a read against it). Output must be deterministic
     /// for the same inputs so it can be memoized by content.
+    /// A stored text is screened like a new one: a version kept from before
+    /// the screening existed fails here instead of passing its hidden
+    /// characters on into the derived text.
     fn derive_subschema(
+        &self,
+        schema_text: &str,
+        allowed: &BTreeSet<String>,
+    ) -> Result<String, SchemaError> {
+        text_guard::reject_hidden_characters(schema_text)?;
+        self.derive_screened(schema_text, allowed)
+    }
+
+    /// The kind's own derivation, for text `text_guard` has already passed.
+    fn derive_screened(
         &self,
         schema_text: &str,
         allowed: &BTreeSet<String>,
@@ -683,6 +706,18 @@ mod tests {
                     r#"<xs:simpleType name="t"><xs:restriction base="xs:string"><xs:pattern value="{pattern}"/></xs:restriction></xs:simpleType><xs:element name="a" type="t"/>"#
                 )),
                 phrase,
+            );
+        }
+        // `schema-windows.js` `refusalReasonOf` parses this sentence whole, for
+        // every kind alike: the phrase, the code point, its name, line and column.
+        for kind in SchemaType::ALL {
+            let err = kind.ops().compile("{\n  \u{202E}}").unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "invalid schema: the schema contains an invisible or direction-controlling \
+                 character U+202E (RIGHT-TO-LEFT OVERRIDE) at line 2, column 3",
+                "{}",
+                kind.as_str()
             );
         }
         // The dashboard anchors these at the start of the sentence, so each

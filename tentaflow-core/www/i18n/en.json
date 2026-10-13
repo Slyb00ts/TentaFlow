@@ -11948,7 +11948,9 @@
         "thrift_limit_parts": "A name has more than {limit} dot-separated {limit|part|parts}.",
         "thrift_limit_size": "The pattern is too large for the registry (more than {limit} {limit|element|elements} of one kind: tokens, type expressions, constants, namespaces or annotations). Simplify it.",
         "thrift_lexical": "The pattern has an unclosed comment or quoted text, a malformed number, an unknown escape sequence in a text, or a character a Thrift file cannot contain.",
-        "at_line": "On line {line}."
+        "at_line": "On line {line}.",
+        "at_line_column": "On line {line}, column {column}.",
+        "hidden_character": "The pattern contains an invisible character or one that changes the direction of text: {code} ({name}). Such a character makes the pattern look different in an editor from what a program reads (\"Trojan Source\"). Remove it and send the pattern again. {atLine}"
       }
     },
     "topics": {

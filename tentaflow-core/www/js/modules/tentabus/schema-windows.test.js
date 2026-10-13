@@ -961,7 +961,6 @@ test('a Protobuf text: any text is sent as it is, the add window shows how the m
     ['a name is longer than 128 characters', /Nazwa jest dłuższa niż 128 znaków/],
     ['a name has more than 8 parts', /Nazwa ma więcej niż 8 członów/],
     ['a name is longer than 1024 characters once its package and enclosing messages are counted', /Nazwa jest dłuższa niż 1024 znaków/],
-    ['the schema contains a character a .proto file cannot hold inside a string', /znak, którego plik \.proto nie może zawierać/],
     ['a comment is never closed', /niedomknięty komentarz/],
     ['a bracket is never closed', /niedomknięty komentarz, tekst w cudzysłowie lub nawias/],
     ['a closing bracket has no opening one', /niedomknięty/],
@@ -1078,7 +1077,6 @@ test('a Thrift text: any text is sent as it is, the add window shows how the typ
     ['a string is never closed on its line (line 4)', /niedomknięty komentarz/],
     ['a string holds an escape sequence Thrift does not define (line 4)', /sekwencję ucieczki/],
     ['the schema contains a character a Thrift file cannot (line 4)', /znak, którego plik Thrift nie może zawierać/],
-    ['the schema contains a character a Thrift file cannot hold inside a string (line 4)', /znak, którego plik Thrift nie może zawierać/],
     ['an integer literal is out of range (line 4)', /źle zapisaną liczbę/],
     ["expected '{', found the word 'xsd_all' (line 2)", /Rejestr nie przyjął tego pliku/],
     ["'stream' is not part of the supported Thrift IDL subset (line 2)", /Rejestr nie przyjął tego pliku/],
@@ -1199,5 +1197,17 @@ test('a syntax refusal says the line before "Szczegóły są niżej", and nothin
 test('no format hint sends the reader to the file box in words: the box itself says it', () => {
   for (const type of ['json_schema', 'avro', 'protobuf', 'thrift', 'xsd', 'hl7v2_profile']) {
     assert.doesNotMatch(addTextHint(type), /wczytać plik/, type);
+  }
+});
+
+// The Rust sentence of text_guard.rs; `schema_error_phrases_are_stable` pins the same string there.
+test('a hidden or direction-changing character is refused in plain words for every format, with its line and column', () => {
+  const server = 'the schema contains an invisible or direction-controlling character U+202E (RIGHT-TO-LEFT OVERRIDE) at line 3, column 14';
+  for (const type of ['json_schema', 'avro', 'protobuf', 'thrift', 'xsd', 'hl7v2_profile']) {
+    const got = refused(type, server);
+    assert.match(got.text, /^Nie dodano wzoru x\. Wzór zawiera niewidoczny znak albo znak zmieniający kierunek tekstu: U\+202E \(RIGHT-TO-LEFT OVERRIDE\)\./, type);
+    assert.match(got.text, /Usuń go i wyślij wzór ponownie\. W wierszu 3, w kolumnie 14\.$/, type);
+    assert.doesNotMatch(got.text, /Rejestr nie przyjął/, 'the generic refusal is not used');
+    assert.ok(got.technical.includes(server), 'the server\'s sentence stays available');
   }
 });

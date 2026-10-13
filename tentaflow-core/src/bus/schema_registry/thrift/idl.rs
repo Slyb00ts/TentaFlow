@@ -34,8 +34,6 @@ use super::{
 type R<T> = Result<T, SchemaError>;
 
 const BAD_CHARACTER: &str = "the schema contains a character a Thrift file cannot";
-const STRING_CHARACTER: &str =
-    "the schema contains a character a Thrift file cannot hold inside a string";
 const STRING_OPEN: &str = "a string is never closed on its line";
 const COMMENT_OPEN: &str = "a comment is never closed";
 const TENTABUS_MARK: &str = "tentabus:";
@@ -75,20 +73,6 @@ fn is_reserved(word: &str) -> bool {
                 | "xsd_nillable"
                 | "xsd_attrs"
                 | "cpp_type"
-        )
-}
-
-/// C0, DEL and C1 controls, plus zero-width, bidi and other format characters.
-fn is_unsafe_string_char(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{61C}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{2028}'..='\u{202E}'
-                | '\u{2060}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{FEFF}'
         )
 }
 
@@ -396,8 +380,6 @@ impl<'a> Lexer<'a> {
                     return self.fail("a string holds an escape sequence Thrift does not define");
                 }
                 size += 1;
-            } else if is_unsafe_string_char(c) {
-                return self.fail(STRING_CHARACTER);
             } else {
                 size += c.len_utf8();
             }
