@@ -91,11 +91,12 @@ export function openChangeWindow({
         : changed(d)
           ? `${sprite('info')}<div><b>${escapeHtml(willHappen)}</b> ${lines.map(escapeHtml).join(' ')}</div>`
           : `${sprite('info')}<div>${escapeHtml(T('settings.nothing_changed'))}</div>`);
-    impactEl.hidden = d == null && !marked;
     if (refusedSig != null && JSON.stringify(d) !== refusedSig) {
       refusedSig = null;
       errEl.hidden = true;
     }
+    // While a refusal stands, the sentence about what adding would do is not the news.
+    impactEl.hidden = (d == null && !marked) || !errEl.hidden;
     discardEl.hidden = true;
     saveBtn.toggleAttribute('disabled', busy || !changed(d) || lacking != null || refusedSig != null);
     cancelBtn.toggleAttribute('disabled', busy);

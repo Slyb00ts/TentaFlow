@@ -125,6 +125,17 @@ export function toast(message, kind = 'info', timeoutMs = 4000) {
   scheduleHide(entry, key, timeoutMs);
 }
 
+/** Takes a toast off the screen at once (the page it spoke about was left). */
+export function dismissToast(message, kind = 'info') {
+  const key = `${kind}|${message}`;
+  const entry = activeToasts.get(key);
+  if (!entry) return;
+  clearTimeout(entry.hideTimer);
+  clearTimeout(entry.removeTimer);
+  entry.el.remove();
+  activeToasts.delete(key);
+}
+
 function scheduleHide(entry, key, timeoutMs) {
   entry.hideTimer = setTimeout(() => {
     entry.el.style.opacity = '0';

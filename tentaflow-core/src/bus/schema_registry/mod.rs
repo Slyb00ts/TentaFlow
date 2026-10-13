@@ -402,10 +402,11 @@ pub trait SchemaKindOps: Send + Sync {
         allowed: &BTreeSet<String>,
     ) -> Result<String, SchemaError>;
 
-    /// `Compatibility::None` is always `Ok`. The NEW text is screened; the OLD
-    /// one is a stored version and is read as it is (a corrected version must
-    /// be registrable over a stored text that holds a hidden character), so
-    /// whatever the comparison says about it is passed through
+    /// `Compatibility::None` is always `Ok`. The NEW text is screened. The OLD
+    /// one is a stored version: when it holds a refused character it is
+    /// compared with those characters removed (that version no longer
+    /// compiles, and removing them is the correction being registered), and
+    /// whatever the comparison says is still passed through
     /// `text_guard::sanitize` before it can reach the UI or the audit trail.
     fn check_compatibility(
         &self,
@@ -413,12 +414,17 @@ pub trait SchemaKindOps: Send + Sync {
         new_schema_text: &str,
         mode: Compatibility,
     ) -> Result<(), SchemaError> {
-        self.compare_screened(
-            old_schema_text,
-            text_guard::screen(new_schema_text, self.allows_leading_bom())?,
-            mode,
-        )
-        .map_err(text_guard::sanitize_error)
+        let bom = self.allows_leading_bom();
+        let new_text = text_guard::screen(new_schema_text, bom)?;
+        let cleaned;
+        let old_text = if text_guard::find_hidden(old_schema_text, bom).is_some() {
+            cleaned = text_guard::strip_hidden(old_schema_text, bom);
+            cleaned.as_str()
+        } else {
+            old_schema_text
+        };
+        self.compare_screened(old_text, new_text, mode)
+            .map_err(text_guard::sanitize_error)
     }
 
     /// The kind's own comparison; see [`Self::compile_screened`].

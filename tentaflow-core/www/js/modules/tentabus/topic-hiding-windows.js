@@ -386,12 +386,12 @@ export function removeLead(row, source) {
   // A rule written elsewhere can leave out every unnamed position of a segment: name the first few, count the rest.
   const names = (list) => `${list.slice(0, LEAD_FIELDS).map((n) => fieldPhrase(source, n)).join(', ')}${list.length > LEAD_FIELDS ? ` ${T('hiding.and_more', { count: fmtCount(list.length - LEAD_FIELDS), n: list.length - LEAD_FIELDS })}` : ''}`;
   if (row.direction === 'read') {
-    if (!facts.known) return facts.visible.length ? T('hiding.remove.lead_read_only', { who, fields: facts.visible.join(', ') }) : T('hiding.remove.lead_read_nothing', { who });
+    if (!facts.known) return facts.visible.length ? T('hiding.remove.lead_read_only', { who, fields: facts.visible.map(showHidden).join(', ') }) : T('hiding.remove.lead_read_nothing', { who });
     return facts.hidden.length ? T('hiding.remove.lead_read', { who, fields: names(facts.hidden) }) : T('hiding.remove.lead_read_none', { who });
   }
   const parts = [];
   if (facts.known && facts.forbidden.length) parts.push(T('hiding.remove.part_forbidden', { fields: names(facts.forbidden) }));
-  if (!facts.known) parts.push(facts.visible.length ? T('hiding.remove.part_only', { fields: facts.visible.join(', ') }) : T('hiding.remove.part_nothing'));
+  if (!facts.known) parts.push(facts.visible.length ? T('hiding.remove.part_only', { fields: facts.visible.map(showHidden).join(', ') }) : T('hiding.remove.part_nothing'));
   if (facts.required.length) parts.push(T('hiding.remove.part_required', { fields: names(facts.required) }));
   return T('hiding.remove.lead_write', { who, parts: parts.length ? parts.join('; ') : T('hiding.remove.part_none') });
 }

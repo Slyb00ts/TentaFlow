@@ -132,6 +132,9 @@ function alertSkeleton(a, canAdmin) {
   if (a.kind === 'lagging' || a.kind === 'paused') {
     go = `data-go="group" data-group="${escapeAttr(a.group)}"`;
     action = T('alerts.act_group');
+  } else if (a.kind === 'schema') {
+    go = `data-go="schema" data-subject="${escapeAttr(a.subject)}"`;
+    action = T('schemas.hidden.stan_button');
   } else if (a.kind === 'dlq') {
     go = 'data-go="dlq"';
     action = T(canAdmin ? 'detail.state.act_dlq_admin' : 'detail.state.act_dlq');
@@ -158,6 +161,8 @@ function alertTexts(a, nowMs) {
         m1: waiting(a.waiting),
         m2: T(a.wording === 'rising' ? 'alerts.rising_since' : 'alerts.waiting_since', { duration: fmtSince(a.risingSinceMs, nowMs) }),
       };
+    case 'schema':
+      return { title: T('schemas.hidden.stan_title', { subject: a.subject }), m1: T('schemas.hidden.stan_text', { version: fmtCount(a.version) }), m2: a.places };
     case 'dlq':
       return {
         title: T('detail.state.alert_dlq_title', { count: fmtCount(a.total), n: a.total }),
@@ -212,6 +217,11 @@ export function paintStateSection(host, view) {
   tiles(host.querySelector('[data-role="kpi"]'), stateKpis({ topicStats, stats, partitions, groups, nowMs }));
 
   const alerts = topicAlerts({ topic: name, stats, replicaLags, lagSeries, nowMs });
+  // A pattern the registry would refuse today makes every write fail, whatever the traffic says.
+  if (view.schemaProblem) {
+    const p = view.schemaProblem;
+    alerts.unshift({ kind: 'schema', key: `schema:${p.subject}:${p.version}`, tone: 'warning', subject: p.subject, version: p.version, places: p.text });
+  }
   const alertsHost = host.querySelector('[data-role="alerts"]');
   const canAdmin = Boolean(access?.canAdmin);
   patchKeyedList(alertsHost, alerts.map((a) => ({ key: `${a.key}:${canAdmin}`, html: alertSkeleton(a, canAdmin) })));

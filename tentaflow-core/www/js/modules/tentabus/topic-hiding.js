@@ -336,7 +336,7 @@ export function ruleWhatHtml(row, source) {
   const plain = (text) => `<span>${escapeHtml(text)}</span>`;
   if (row.direction === 'read') {
     if (!facts.known) {
-      return plain(facts.visible.length ? T('hiding.sees_only', { fields: facts.visible.join(', ') }) : T('hiding.sees_nothing'));
+      return plain(facts.visible.length ? T('hiding.sees_only', { fields: facts.visible.map(showHidden).join(', ') }) : T('hiding.sees_nothing'));
     }
     const hiddenHtml = facts.hidden.length
       ? limitedHtml(source, facts.hidden.map((n) => [n, chipHtml('neutral', T('hiding.action.hide'))]))
@@ -344,7 +344,7 @@ export function ruleWhatHtml(row, source) {
     // Over an incomplete list a reading rule hides every position it does not allow too.
     const hiddenRest = source.complete ? '' : `<div class="tf-table__cell-sub">${escapeHtml(T('hiding.reads_rest'))}</div>`;
     if (!facts.visibleOutside.length) return `${hiddenHtml}${hiddenRest}`;
-    const shown = facts.visibleOutside.slice(0, CELL_FIELDS).join(', ');
+    const shown = facts.visibleOutside.slice(0, CELL_FIELDS).map(showHidden).join(', ');
     const rest = facts.visibleOutside.length - CELL_FIELDS;
     const outside = T('hiding.visible_outside', { fields: rest > 0 ? `${shown} ${T('hiding.and_more', { count: fmtCount(rest), n: rest })}` : shown });
     return `${hiddenHtml}<div class="tf-table__cell-sub">${escapeHtml(outside)}</div>${hiddenRest}`;
@@ -352,7 +352,7 @@ export function ruleWhatHtml(row, source) {
   const requiredItems = facts.required.map((n) => [n, chipHtml('ok', T('hiding.write.require'))]);
   const refused = `<div class="tf-table__cell-sub">${escapeHtml(T('hiding.writes_rest'))}</div>`;
   if (!facts.known) {
-    const only = plain(facts.visible.length ? T('hiding.writes_only', { fields: facts.visible.join(', ') }) : T('hiding.writes_nothing'));
+    const only = plain(facts.visible.length ? T('hiding.writes_only', { fields: facts.visible.map(showHidden).join(', ') }) : T('hiding.writes_nothing'));
     return `${only}${requiredItems.length ? limitedHtml(source, requiredItems) : ''}${refused}`;
   }
   const items = [...requiredItems, ...facts.forbidden.map((n) => [n, chipHtml('err', T('hiding.write.forbid'))])];
@@ -578,7 +578,7 @@ export function ruleImpact({ who, everyone = false, saved = false, direction, fo
     const shownMore = minus(wasAway, nowAway);
     const typedMore = minus(eff.extraShown, was?.extraShown || []);
     const typedLess = minus(was?.extraShown || [], eff.extraShown);
-    if (!names.length) return [t('hiding.impact.read_only', { fields: eff.extraShown.join(', ') })];
+    if (!names.length) return [t('hiding.impact.read_only', { fields: eff.extraShown.map(showHidden).join(', ') })];
     if (hiddenMore.length || typedLess.length) lines.push(t('hiding.impact.read_hidden', { fields: phrases(source, [...hiddenMore, ...typedLess]) }));
     // A new rule hides; the fields it leaves shown were shown before it.
     if (current && (shownMore.length || typedMore.length)) lines.push(t('hiding.impact.read_shown', { fields: phrases(source, [...shownMore, ...typedMore]) }));
@@ -590,7 +590,7 @@ export function ruleImpact({ who, everyone = false, saved = false, direction, fo
   const required = (f) => sortedUnique([...names.filter((n) => f?.actions[n] === 'require'), ...(f?.extraRequired || [])]);
   const typedAllowed = (f) => sortedUnique([...(f?.extraShown || []), ...(f?.extraRequired || [])]);
   if (!names.length) {
-    lines.push(t('hiding.impact.write_only', { fields: typedAllowed(eff).join(', ') }));
+    lines.push(t('hiding.impact.write_only', { fields: typedAllowed(eff).map(showHidden).join(', ') }));
     if (required(eff).length) lines.push(t('hiding.impact.write_required', { fields: phrases(source, required(eff)) }));
     if (lines.length) lines.push(T('hiding.impact.write_rest'));
     return lines;

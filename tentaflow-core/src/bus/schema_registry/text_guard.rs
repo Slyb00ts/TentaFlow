@@ -52,7 +52,11 @@
 // at startup. A corrected version registers as usual: the compatibility check
 // reads the old text without this screen, and a detail it builds from that text
 // is passed through `sanitize`, so a refused character never reaches the UI or
-// the audit trail as itself but as ⟦U+XXXX⟧.
+// the audit trail as itself but as ⟦U+XXXX⟧. The comparison itself reads the old
+// text with the refused characters REMOVED (`strip_hidden`): that version cannot
+// compile any more, and removing them is exactly what the author's correction
+// does, so a field `pac<U+202E>jent` corrected to `pacjent` is the same field
+// and not a rename.
 // =============================================================================
 
 use std::fmt;
@@ -181,6 +185,19 @@ pub(super) fn screen(text: &str, allow_leading_bom: bool) -> Result<Screened<'_>
         Some(found) => Err(SchemaError::Invalid(format!("{HIDDEN_CHARACTER} {found}"))),
         None => Ok(Screened(text)),
     }
+}
+
+/// `text` without any character [`find_hidden`] would refuse. A stored version
+/// that holds one is compared against a new one in this form (see
+/// `SchemaKindOps::check_compatibility`).
+pub(super) fn strip_hidden(text: &str, allow_leading_bom: bool) -> String {
+    text.chars()
+        .enumerate()
+        .filter(|(index, c)| {
+            refused_name(*c).is_none() || (allow_leading_bom && *index == 0 && *c == '\u{FEFF}')
+        })
+        .map(|(_, c)| c)
+        .collect()
 }
 
 /// `detail` with every refused code point written as `⟦U+XXXX⟧` (the marker the
@@ -727,12 +744,16 @@ mod tests {
     }
 
     #[test]
-    fn a_comparison_never_echoes_a_hidden_character_of_the_stored_old_text() {
+    fn a_comparison_reads_the_stored_old_text_without_its_hidden_characters() {
         let err = Echo
             .check_compatibility("na\u{202E}me", "{}", Compatibility::Full)
             .unwrap_err();
+        assert_eq!(err, SchemaError::Incompatible("old says name".to_string()));
+        // A refused character in a detail a kind builds is still written out.
         assert_eq!(
-            err,
+            sanitize_error(SchemaError::Incompatible(
+                "old says na\u{202E}me".to_string()
+            )),
             SchemaError::Incompatible("old says na⟦U+202E⟧me".to_string())
         );
         // The new text is screened before the comparison runs.
@@ -760,5 +781,21 @@ mod tests {
             .ops()
             .check_compatibility(old, new, Compatibility::Full)
             .is_err());
+    }
+
+    #[test]
+    fn strip_hidden_removes_what_find_hidden_finds_and_keeps_an_allowed_bom() {
+        assert_eq!(
+            strip_hidden("a\u{202E}b\u{200B}c\tż😀\r\n", false),
+            "abc\tż😀\r\n"
+        );
+        assert_eq!(strip_hidden("\u{FEFF}a\u{FEFF}", true), "\u{FEFF}a");
+        assert_eq!(strip_hidden("\u{FEFF}a", false), "a");
+        for (text, bom) in [("a\u{2066}\u{E0041}b", false), ("\u{FEFF}x\u{3164}", true)] {
+            assert!(
+                find_hidden(&strip_hidden(text, bom), bom).is_none(),
+                "{text:?}"
+            );
+        }
     }
 }

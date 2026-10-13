@@ -71,6 +71,8 @@ export const HIDDEN_RANGES = [
   [0xE0000, 0xE007F, 'TAG CHARACTER'],
 ];
 
+const hex = (cp) => cp.toString(16).toUpperCase().padStart(4, '0');
+
 /** The name of a refused code point, or `''` for one that is allowed. */
 export function hiddenCharacterName(codePoint) {
   let low = 0;
@@ -85,7 +87,6 @@ export function hiddenCharacterName(codePoint) {
   return '';
 }
 
-const code = (cp) => `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`;
 
 /**
  * `text` with every refused character written as ⟦U+XXXX⟧. An XSD may start
@@ -98,7 +99,46 @@ export function showHidden(text, { leadingBom = false } = {}) {
   for (const ch of value) {
     const cp = ch.codePointAt(0);
     const refused = (cp >= 0x7F || cp < 0x20) && hiddenCharacterName(cp);
-    out += refused && !(leadingBom && index === 0 && cp === 0xFEFF) ? `⟦${code(cp)}⟧` : ch;
+    out += refused && !(leadingBom && index === 0 && cp === 0xFEFF) ? `⟦U+${hex(cp)}⟧` : ch;
+    index += 1;
+  }
+  return out;
+}
+
+/**
+ * Every refused character of `text` with where it stands, in the order it
+ * occurs: `{ codePoint, code: 'U+202E', name, line, column }` — the same
+ * 1-based line (LF ends it) and column (scalar values) the server reports.
+ * An XSD's leading byte-order mark is not one (`leadingBom`).
+ */
+export function findHidden(text, { leadingBom = false } = {}) {
+  const found = [];
+  let line = 1;
+  let column = 1;
+  let index = 0;
+  for (const ch of String(text ?? '')) {
+    const cp = ch.codePointAt(0);
+    const name = (cp >= 0x7F || cp < 0x20) ? hiddenCharacterName(cp) : '';
+    if (name && !(leadingBom && index === 0 && cp === 0xFEFF)) found.push({ codePoint: cp, code: `U+${hex(cp)}`, name, line, column });
+    if (cp === 0x0A) {
+      line += 1;
+      column = 1;
+    } else {
+      column += 1;
+    }
+    index += 1;
+  }
+  return found;
+}
+
+/** `text` without its refused characters (an XSD keeps its leading byte-order mark). */
+export function stripHidden(text, { leadingBom = false } = {}) {
+  let out = '';
+  let index = 0;
+  for (const ch of String(text ?? '')) {
+    const cp = ch.codePointAt(0);
+    const refused = (cp >= 0x7F || cp < 0x20) && hiddenCharacterName(cp);
+    if (!refused || (leadingBom && index === 0 && cp === 0xFEFF)) out += ch;
     index += 1;
   }
   return out;

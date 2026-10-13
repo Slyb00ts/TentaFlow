@@ -20,7 +20,7 @@
 // Changes are the instance administrator's (`gate_admin`); a reader sees the
 // page without the buttons and one line saying who can change it.
 
-import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
+import { escapeHtml, escapeAttr, toast, dismissToast } from '/js/utils.js';
 import { patchHtml, setAttr, setText, setRowsIfChanged } from '/js/lib/dom-patch.js';
 import { T, fmtCount, fmtDate } from '/js/modules/tentabus/format.js';
 import { loadErrorHtml } from '/js/modules/tentabus/overview.js';
@@ -30,6 +30,7 @@ import { hl7FieldLabel, hl7SegmentLabel, orderSegments } from '/js/modules/tenta
 import { downloadText } from '/js/lib/download.js';
 import { valueRow } from '/js/modules/tentabus/topic-settings.js';
 import { showHidden } from '/js/modules/tentabus/hidden-characters.js';
+import { hiddenPlaces } from '/js/modules/tentabus/hidden-notice.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-table.js';
@@ -592,6 +593,7 @@ function pageHtml(name) {
           </div>
           <div class="muted" data-role="text-note"></div>
           <div class="muted" data-role="hidden-hint" hidden></div>
+          <div class="tb-hidden-flag" data-role="hidden-flag" hidden></div>
           <tf-code-editor data-role="code" readonly aria-label="${escapeAttr(T('schemas.detail.text_label'))}"></tf-code-editor>
           <div class="tb-state" data-role="text-state" hidden></div>
         </div>
@@ -807,6 +809,15 @@ function paintText(body, view, effective) {
   const hasHidden = ready && showHidden(shown.text, { leadingBom: info.schemaType === 'xsd' }) !== shown.text;
   setText(hintEl, hasHidden ? T('schemas.detail.hidden_hint') : '');
   hintEl.hidden = !hasHidden;
+  // A version the registry would refuse today: topics bound to it take no message, whatever "w użyciu" says.
+  const flag = body.querySelector('[data-role="hidden-flag"]');
+  const found = ready ? hiddenPlaces(shown.text, { leadingBom: info.schemaType === 'xsd' }) : null;
+  flag.hidden = !found;
+  const canFix = view.canAdmin && !newVersionBlocker(info);
+  patchHtml(flag, found
+    ? `<tf-alert tone="warning" data-role="flag-alert" title="${escapeAttr(T('schemas.hidden.page_title'))}" message="${escapeAttr(T('schemas.hidden.page_text', { places: found.text }))}"></tf-alert>
+       ${canFix ? `<div class="tb-window-actions"><tf-button variant="primary" size="sm" icon="plus" data-go="new-version" data-role="flag-fix">${escapeHtml(T('schemas.hidden.page_button'))}</tf-button></div>` : ''}`
+    : '');
   if (ready && editor.__tbText !== `${info.schemaType}\u0000${shown.text}`) {
     editor.__tbText = `${info.schemaType}\u0000${shown.text}`;
     editor.setAttribute('language', editorLanguage(info.schemaType));
@@ -846,7 +857,7 @@ function paintAvroFields(body, fields) {
 }
 
 function protobufPresence(label) {
-  if (label.startsWith('oneof:')) return T('schemas.detail.protobuf_oneof', { name: label.slice(6) });
+  if (label.startsWith('oneof:')) return T('schemas.detail.protobuf_oneof', { name: showHidden(label.slice(6)) });
   return T(`schemas.detail.protobuf_${label}`);
 }
 
@@ -887,5 +898,16 @@ export async function shareShownText(kind, view) {
     return;
   }
   const done = await copyText(shown.text);
-  toast(done ? T('schemas.detail.copied', { version: fmtCount(shown.version) }) : T('schemas.detail.copy_failed'), done ? 'success' : 'error');
+  lastCopyToast = { message: done ? T('schemas.detail.copied', { version: fmtCount(shown.version) }) : T('schemas.detail.copy_failed'), kind: done ? 'success' : 'error' };
+  toast(lastCopyToast.message, lastCopyToast.kind);
+}
+
+// The toast of "Kopiuj" speaks about the page it was pressed on.
+let lastCopyToast = null;
+
+/** Takes the "Kopiuj" toast off the screen when its page is left. */
+export function dismissCopyToast() {
+  if (!lastCopyToast) return;
+  dismissToast(lastCopyToast.message, lastCopyToast.kind);
+  lastCopyToast = null;
 }

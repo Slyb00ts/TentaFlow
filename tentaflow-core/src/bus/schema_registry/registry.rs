@@ -2091,6 +2091,42 @@ mod tests {
         assert_eq!((scanned, found.len()), (2, 0));
     }
 
+    const PATIENT_V1_HIDDEN: &str = "{\"type\":\"object\",\"properties\":{\"pac\u{202E}jent\":{\"type\":\"string\"}},\"required\":[\"pac\u{202E}jent\"]}";
+    const PATIENT_V2_CLEAN: &str = "{\"type\":\"object\",\"properties\":{\"pacjent\":{\"type\":\"string\"}},\"required\":[\"pacjent\"]}";
+
+    #[test]
+    fn the_correction_of_a_stored_hidden_character_is_not_a_rename_under_backward() {
+        let db = fresh_db();
+        register_text(&db, "patient", SchemaType::JsonSchema, V1).unwrap();
+        plant(&db, "patient", PATIENT_V1_HIDDEN);
+        // The default mode of a new subject is BACKWARD: a field that looked
+        // renamed (new required `pacjent`, old `pac<RLO>jent`) would be refused.
+        let out = register_text(&db, "patient", SchemaType::JsonSchema, PATIENT_V2_CLEAN).unwrap();
+        assert_eq!(out.version, 2);
+        // A real change over the same stored text is still judged, and the
+        // refusal does not carry the stored character.
+        let db = fresh_db();
+        register_text(&db, "patient", SchemaType::JsonSchema, V1).unwrap();
+        plant(&db, "patient", PATIENT_V1_HIDDEN);
+        let extra = PATIENT_V2_CLEAN
+            .replace(
+                "\"required\":[\"pacjent\"]",
+                "\"required\":[\"pacjent\",\"wiek\"]",
+            )
+            .replace(
+                "\"pacjent\":{",
+                "\"wiek\":{\"type\":\"integer\"},\"pacjent\":{",
+            );
+        let err = register_text(&db, "patient", SchemaType::JsonSchema, &extra).unwrap_err();
+        let BusServiceError::SchemaIncompatible { detail, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert!(detail.contains("wiek"), "{detail}");
+        assert!(detail
+            .chars()
+            .all(|c| text_guard::find_hidden(&c.to_string(), false).is_none()));
+    }
+
     #[test]
     fn a_stored_version_with_a_hidden_character_does_not_block_a_corrected_one() {
         let db = fresh_db();

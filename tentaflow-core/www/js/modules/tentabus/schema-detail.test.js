@@ -18,7 +18,7 @@ if (typeof globalThis.DOMParser === 'undefined' && window.DOMParser) globalThis.
 
 const {
   schemaDescription, displayText, versionState, downloadName, editorLanguage, headerLine, withdrawnText, versionRows,
-  drawSchemaDetail, shareShownText, hl7ProfileView, avroFieldsView, protobufFieldsView, thriftFieldsView,
+  drawSchemaDetail, shareShownText, dismissCopyToast, hl7ProfileView, avroFieldsView, protobufFieldsView, thriftFieldsView,
 } = await import('./schema-detail.js');
 
 const norm = (s) => String(s).replace(/[  ]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -568,4 +568,98 @@ test('a segment of an HL7 profile with a hidden character is written out in its 
   assert.ok(chips.some((l) => l.includes('PI⟦U+200B⟧D')), chips.join('|'));
   assert.ok(chips.some((l) => l.includes('OB⟦U+202E⟧X')), chips.join('|'));
   assert.ok(chips.every((l) => !/[\u200B\u202E]/.test(l)));
+});
+
+const RLO_CHAR = String.fromCodePoint(0x202E);
+const ZWSP_CHAR = String.fromCodePoint(0x200B);
+const refusedIn = (text) => [...String(text)].filter((c) => c.codePointAt(0) >= 0x7F || c.codePointAt(0) < 0x20).filter((c) => hiddenCharacterName(c.codePointAt(0)));
+const { hiddenCharacterName } = await import('./hidden-characters.js');
+
+test('a version whose text holds a hidden character is flagged on the page, with where and a button that opens the correction', () => {
+  const stored = JSON.stringify({ type: 'object', properties: { [`pac${RLO_CHAR}jent`]: { type: 'string' } } });
+  const admin = mount({ shown: { version: 3, text: stored, error: null } });
+  const flag = admin.body.querySelector('[data-role="hidden-flag"]');
+  assert.equal(flag.hidden, false);
+  assert.equal(flag.querySelector('[data-role="flag-alert"]').getAttribute('title'), 'Ta wersja zawiera niewidoczny znak');
+  assert.match(flag.querySelector('[data-role="flag-alert"]').getAttribute('message'), /^Topiki z tym wzorem nie przyjmują wiadomości\. Dodaj poprawioną wersję\. Miejsce: U\+202E \(wymuszenie kierunku od prawej do lewej \(RLO\)\) w wierszu 1, kolumnie \d+\.$/);
+  const fix = flag.querySelector('[data-role="flag-fix"]');
+  assert.equal(fix.hidden, false);
+  fix.click();
+  assert.deepEqual(admin.moves.map((m) => m.kind), ['new-version']);
+  // A clean text, a reader and a withdrawn pattern: nothing to flag, or nothing to press.
+  assert.equal(mount({}).body.querySelector('[data-role="hidden-flag"]').hidden, true);
+  assert.equal(mount({ canAdmin: false, shown: { version: 3, text: stored, error: null } }).body.querySelector('[data-role="flag-fix"]'), null);
+  assert.equal(mount({ info: { ...wizyta, deprecatedAtMs: 1 }, shown: { version: 3, text: stored, error: null } }).body.querySelector('[data-role="flag-fix"]'), null);
+  // An XSD's leading byte-order mark is not a hidden character.
+  const bom = mount({ info: { ...wizyta, schemaType: 'xsd' }, shown: { version: 3, text: `${String.fromCodePoint(0xFEFF)}<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"/>`, error: null } });
+  assert.equal(bom.body.querySelector('[data-role="hidden-flag"]').hidden, true);
+});
+
+test('no raw refused character reaches the text of the page, its tables, the diffs or the data-hiding sentences, whatever the name', async () => {
+  const { jsonSchemaChanges, profileChanges, xsdChanges } = await import('./schema-windows.js');
+  const topicHiding = await import('./topic-hiding.js');
+  const { previewResultHtml } = await import('./hiding-preview.js');
+  const name = `pac${RLO_CHAR}j${ZWSP_CHAR}ent`;
+  const seen = [];
+  const take = (label, text) => seen.push([label, String(text)]);
+  const page = (schemaType, text, extra = {}) => {
+    const { body } = mount({ info: { ...wizyta, schemaType }, shown: { version: 3, text, error: null }, ...extra });
+    take(`${schemaType} page`, body.outerHTML);
+    for (const t of body.querySelectorAll('tf-table')) take(`${schemaType} table`, JSON.stringify((t.rows || []).map((row) => Object.fromEntries(Object.entries(row).filter(([k]) => !k.startsWith('_'))))));
+    take(`${schemaType} editor`, body.querySelector('[data-role="code"]')?.value);
+    take(`${schemaType} text`, body.textContent);
+  };
+  page('avro', JSON.stringify({ type: 'record', name: 'R', doc: `opis ${name}`, fields: [{ name, type: 'string' }, { name: 'b', type: [`n${RLO_CHAR}ull`, 'string'] }] }));
+  page('json_schema', JSON.stringify({ description: `opis ${name}`, type: 'object', properties: { [name]: { type: 'string' } } }));
+  page('hl7v2_profile', JSON.stringify({ required_segments: [`P${RLO_CHAR}ID`], required_fields: [`OB${RLO_CHAR}X-5`] }));
+  page('protobuf', `syntax = "proto3"; message M { oneof ${name} { string a = 1; } string ${name}2 = 2; ${name}3 b = 3; }`);
+  page('thrift', `struct ${name}S { 1: string ${name} }`);
+  const xsd = (n) => `<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="r"><xs:complexType><xs:sequence><xs:element name="${n}" type="xs:string"/></xs:sequence></xs:complexType></xs:element></xs:schema>`;
+  take('json diff', jsonSchemaChanges(JSON.stringify({ properties: { [name]: {} }, required: [name] }), JSON.stringify({ properties: { x: {} } }), 1));
+  take('json diff reverse', jsonSchemaChanges(JSON.stringify({ properties: { x: {} } }), JSON.stringify({ properties: { [name]: {} }, required: [name] }), 1));
+  take('profile diff', profileChanges(JSON.stringify({ required_fields: [`A${RLO_CHAR}B-1`] }), JSON.stringify({ required_segments: [`C${RLO_CHAR}D`] }), 1));
+  take('xsd diff', xsdChanges(xsd(name), xsd('x'), 1));
+  take('xsd diff reverse', xsdChanges(xsd('x'), xsd(name), 1));
+  // The rules of a topic.
+  const source = { mode: 'schema', fields: [{ name: 'pacjent', label: `et${RLO_CHAR}ykieta` }], implicit: [], complete: false };
+  const manual = { mode: 'manual', fields: [], implicit: [], complete: false };
+  for (const [kind, src] of [['schema', source], ['manual', manual]]) {
+    for (const direction of ['read', 'write']) {
+      const row = { key: `any:*:${direction}`, subjectType: 'any', subjectId: '*', direction, label: null, fields: [name, 'pacjent'], requiredFields: direction === 'write' ? [name] : [], updatedAtMs: 1 };
+      const tr = topicHiding.ruleTableRow(row, src, 2);
+      take(`${kind} ${direction} rule row`, `${tr.who}${tr.what}${tr.when}${tr.changed}`);
+      take(`${kind} ${direction} phrase`, topicHiding.fieldPhrase(src, name));
+      take(`${kind} ${direction} impact`, JSON.stringify(topicHiding.ruleImpact({ who: 'Grupa', direction, form: topicHiding.formFromRule(row, src), current: topicHiding.formFromRule(row, src), source: src, saved: true })));
+      take(`${kind} ${direction} impact new`, JSON.stringify(topicHiding.ruleImpact({ who: 'Grupa', direction, form: { ...topicHiding.blankForm(direction, src), extraShown: [name] }, current: null, source: src })));
+    }
+  }
+  const { removeLead, removeImpact } = await import('./topic-hiding-windows.js');
+  for (const direction of ['read', 'write']) {
+    for (const src of [source, manual]) {
+      const row = { key: `any:*:${direction}`, subjectType: 'any', subjectId: '*', direction, label: null, fields: [name], requiredFields: direction === 'write' ? [name] : [], updatedAtMs: 1 };
+      take(`remove ${direction} lead`, removeLead(row, src));
+      take(`remove ${direction} impact`, JSON.stringify(removeImpact(row, src, 't', [row])));
+    }
+  }
+  take('preview', previewResultHtml({
+    resp: { record: { offset: 1, partition: 0, timestampMs: 1, payload: new Uint8Array() }, applied: [{ field: name, action: 'hide' }], limitedByCaller: true },
+    subject: { subjectType: 'user', subjectId: 'u', label: 'Anna' },
+    source,
+  }));
+  assert.ok(seen.length > 40);
+  const leaks = seen.filter(([, text]) => refusedIn(text).length).map(([label]) => label);
+  assert.deepEqual(leaks, [], 'these outputs carry a raw refused character');
+  // And the test would notice: the marker is what stands in its place.
+  assert.ok(seen.some(([, text]) => text.includes('⟦U+202E⟧')));
+});
+
+test('the "Kopiuj" toast goes when the page it spoke about is left', async () => {
+  Object.defineProperty(globalThis.navigator, 'clipboard', { configurable: true, value: { writeText: async () => {} } });
+  const { view } = mount({});
+  await shareShownText('copy', view);
+  const shown = () => [...document.querySelectorAll('.toast')].filter((t) => /skopiowan|Skopiowan/.test(t.textContent));
+  assert.equal(shown().length, 1);
+  dismissCopyToast();
+  assert.equal(shown().length, 0, 'taken off the screen at once, not after its timer');
+  dismissCopyToast();
 });

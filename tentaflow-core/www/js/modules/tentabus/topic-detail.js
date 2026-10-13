@@ -198,6 +198,7 @@ function act(ctx, el) {
   if (d.go === 'section') ctx.go({ kind: 'section', section: d.section });
   else if (d.go === 'change') ctx.go({ kind: 'change', card: d.card });
   else if (d.go === 'group') ctx.go({ kind: 'group', group: d.group });
+  else if (d.go === 'schema') ctx.go({ kind: 'schema', subject: d.subject });
   else ctx.go({ kind: d.go });
 }
 

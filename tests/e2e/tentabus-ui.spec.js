@@ -3024,7 +3024,7 @@ test('Trojan Source: a pattern text with a hidden or direction-changing characte
     await openAdd('json_schema');
     await win.locator('[data-role="text"] textarea').fill('{"description": "a\u202Eb"}');
     await win.locator('[data-act="save"]').click();
-    await expect(error).toContainText('Wzór zawiera niewidoczny znak albo znak zmieniający kierunek tekstu: U+202E (RIGHT-TO-LEFT OVERRIDE).', { timeout: 15000 });
+    await expect(error).toContainText('Wzór zawiera niewidoczny znak albo znak zmieniający kierunek tekstu: U+202E (wymuszenie kierunku od prawej do lewej (RLO)).', { timeout: 15000 });
     await expect(error).toContainText('W wierszu 1, w kolumnie 19.');
     await expect(error).not.toContainText('Rejestr nie przyjął');
     await expect(error.locator('tf-disclosure pre')).toContainText('the schema contains an invisible or direction-controlling character U+202E (RIGHT-TO-LEFT OVERRIDE) at line 1, column 19');
@@ -3040,8 +3040,19 @@ test('Trojan Source: a pattern text with a hidden or direction-changing characte
     await openAdd('xsd');
     await win.locator('[data-role="text"] textarea').fill('<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">\n  <!-- uwaga\u200B -->\n  <xs:element name="a" type="xs:string"/>\n</xs:schema>');
     await win.locator('[data-act="save"]').click();
-    await expect(error).toContainText('U+200B (ZERO WIDTH SPACE)', { timeout: 15000 });
+    await expect(error).toContainText('U+200B (spacja o zerowej szerokości)', { timeout: 15000 });
+    await expect(error).toContainText('często pochodzi z tekstu wklejonego z Worda lub strony WWW');
     await expect(error).toContainText('W wierszu 2, w kolumnie 13.');
+    // The box names the place live, and one button takes the character out and says so.
+    await expect(win.locator('[data-role="hidden-places"]')).toContainText('U+200B (spacja o zerowej szerokości) w wierszu 2, kolumnie 13');
+    await expect(win.locator('[data-role="impact"]')).toBeHidden();
+    await win.locator('[data-role="strip-hidden"]').click();
+    await expect(win.locator('[data-role="hidden-done"]')).toContainText('Usunięto 1 niewidoczny znak: U+200B (spacja o zerowej szerokości) w wierszu 2, kolumnie 13.');
+    await expect(error).toBeHidden();
+    await expect(win.locator('[data-role="text"] textarea')).not.toHaveValue(/\u200B/);
+    await win.locator('[data-role="text"] textarea').fill('<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">\n  <!-- uwaga\u200B -->\n  <xs:element name="a" type="xs:string"/>\n</xs:schema>');
+    await win.locator('[data-act="save"]').click();
+    await expect(error).toContainText('U+200B (spacja o zerowej szerokości)', { timeout: 15000 });
 
     // Polish letters and emoji in the same comment are accepted.
     await win.locator('[data-role="text"] textarea').fill('<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">\n  <!-- uwaga: zażółć gęślą jaźń 😀 -->\n  <xs:element name="a" type="xs:string"/>\n</xs:schema>');
@@ -3053,6 +3064,83 @@ test('Trojan Source: a pattern text with a hidden or direction-changing characte
     await busCall(page, 'busSchemaDeleteRequest', { instanceId: instance, subject: name, deprecateOnly: false }).catch(() => {});
   }
   expect(errors.filter((e) => !/schema_incompatible|BadRequest|invalid_argument/.test(e)), errors.join('\n')).toEqual([]);
+});
+
+test('Trojan Source correction: a stored version with a hidden character is flagged on its page and on the topic, "Nowa wersja" starts without it, registers under BACKWARD and renames the data-hiding rule after saying so', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openSchemas(page);
+  const instance = hashParams(page).instance;
+  const subject = `popraw-${RUN}`;
+  const topic = `popraw-topik-${RUN}`;
+  const RLO = String.fromCharCode(0x202E);
+  const text = (field) => JSON.stringify({ type: 'object', required: [field], properties: { [field]: { type: 'string' }, termin: { type: 'string' } } }, null, 2);
+  const sql = (statement) => execFileSync('/usr/bin/sqlite3', ['-cmd', '.timeout 8000', DB, statement], { encoding: 'utf8' });
+  const win = schemaWindow(page);
+  try {
+    await busCall(page, 'busSchemaRegisterRequest', { instanceId: instance, subject, schemaType: 'json_schema', schemaText: text('pacjent') });
+    await busCall(page, 'busTopicCreateRequest', { instanceId: instance, name: topic, options: { partitions: 1, contentType: 'application/json', schemaId: subject, validation: 'dlq' } });
+    await busCall(page, 'busFieldPolicySetRequest', { instanceId: instance, topic, subjectType: 'any', subjectId: '*', direction: 'read', fields: ['pacjent', 'termin'], requiredFields: [] });
+    // What a node upgraded from before the registry refused such characters still holds: the stored bytes.
+    // The hash and the id derive from the stored bytes, so the text with the character gone is new content, not a repeat of this row.
+    sql(`UPDATE bus_schema_versions SET schema_text = replace(schema_text, 'pacjent', 'pac' || char(8238) || 'jent'), content_hash = 'stored-before-' || content_hash, schema_ref_id = (schema_ref_id + 12345) % 4294967291 + 1 WHERE subject = '${subject}';`);
+    sql(`UPDATE bus_field_policies SET fields_json = replace(fields_json, 'pacjent', 'pac' || char(8238) || 'jent') WHERE topic = '${topic}';`);
+
+    // The pattern's page flags the version and shows the character as a marker, not drawn.
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instance}&tab=schemas&subject=${subject}`);
+    await expect(schemaSlot(page).locator('.tb-title')).toHaveText(subject, { timeout: 20000 });
+    const flag = schemaSlot(page).locator('[data-role="hidden-flag"] [data-role="flag-alert"]');
+    await expect(flag).toHaveAttribute('title', 'Ta wersja zawiera niewidoczny znak', { timeout: 15000 });
+    await expect(flag).toHaveAttribute('message', /Topiki z tym wzorem nie przyjmują wiadomości\. Dodaj poprawioną wersję\. Miejsce: U\+202E \(wymuszenie kierunku od prawej do lewej \(RLO\)\) w wierszu 4, kolumnie \d+; U\+202E .* w wierszu 7, kolumnie \d+\./);
+    await expect.poll(() => editorShown(page)).toContain('pac\u27E6U+202E\u27E7jent');
+    expect(await editorText(page)).not.toContain(RLO);
+    await expect(schemaSlot(page).locator('[data-role="hidden-hint"]')).toContainText('ręczne zaznaczenie w polu zawiera te znaczniki');
+    await page.screenshot({ path: path.join(SHOTS, 'trojan-flag-page.png'), fullPage: true });
+
+    // The topic's Stan says it needs attention although traffic is fine.
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instance}&tab=topics&topic=${topic}`);
+    const stan = detailSlot(page).locator('[data-section="state"]');
+    await expect(stan.locator(`[data-alert^="schema:${subject}:"] [data-role="title"]`)).toHaveText(`Wzór „${subject}” zawiera niewidoczny znak`, { timeout: 20000 });
+    await expect(stan.locator('[data-role="alerts-none"]')).toBeHidden();
+    await page.screenshot({ path: path.join(SHOTS, 'trojan-flag-stan.png') });
+    await stan.locator(`[data-alert^="schema:${subject}:"] tf-button`).click();
+    await expect(schemaSlot(page).locator('.tb-title')).toHaveText(subject, { timeout: 15000 });
+
+    // "Dodaj poprawioną wersję": the text starts without the character, with what was removed, and the rule warning.
+    await schemaSlot(page).locator('[data-role="flag-fix"]').click();
+    await expect(win.locator('[slot="body"]')).toBeVisible();
+    await expect(win.locator('[data-role="cleaned"]')).toContainText('Usunięto 2 niewidoczne znaki z poprzedniej wersji: U+202E (wymuszenie kierunku od prawej do lewej (RLO))');
+    await expect(win.locator('[data-role="text"] textarea')).not.toHaveValue(new RegExp(RLO));
+    await expect(win.locator('[data-role="text"] textarea')).toHaveValue(/"pacjent"/);
+    await expect(win.locator('[data-role="diff"]')).toHaveText('Różnica względem wersji 1: tylko usunięte niewidoczne znaki; pola i wymagania bez zmian.');
+    await expect(win.locator('[data-role="diff"]')).not.toContainText('taki sam');
+    await expect(win.locator('[data-act="save"]')).not.toHaveAttribute('disabled', '');
+    await expect(win.locator('[data-role="rules"]')).toContainText(`Zasady ukrywania danych na „${topic}” wymieniają pola, których nowa wersja nie ma: pac\u27E6U+202E\u27E7jent.`, { timeout: 15000 });
+    await expect(win.locator('[data-role="rename-rules"]')).toHaveAttribute('label', /pac\u27E6U\+202E\u27E7jent → pacjent/);
+    await page.screenshot({ path: path.join(SHOTS, 'trojan-newversion-clean.png') });
+
+    // BACKWARD (the pattern's mode) accepts the correction: it is not a rename.
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0, { timeout: 15000 });
+    const notice = schemaSlot(page).locator('[data-role="notice"] tf-alert');
+    await expect(notice).toHaveAttribute('title', 'Dodano wersję 2', { timeout: 15000 });
+    await expect(notice).toHaveAttribute('message', /Zmieniono nazwy pól w 1 zasadzie ukrywania danych\./);
+    await expect(schemaSlot(page).locator('[data-role="hidden-flag"] [data-role="flag-alert"]')).toHaveCount(0);
+
+    // The rule names the field as the new version spells it: nothing was hidden by the correction.
+    const rules = await busCall(page, 'busFieldPolicyListRequest', { instanceId: instance, topic });
+    expect(rules.policies.map((p) => [...p.fields].sort())).toEqual([['pacjent', 'termin']]);
+    const got = await busCall(page, 'busSchemaGetRequest', { instanceId: instance, subject, version: 2 });
+    expect(got.schemaText).not.toContain(RLO);
+    expect(got.schemaText).toContain('"pacjent"');
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instance}&tab=topics&topic=${topic}`);
+    await expect(detailSlot(page).locator('[data-section="state"]').locator(`[data-alert^="schema:${subject}:"]`)).toHaveCount(0, { timeout: 20000 });
+  } finally {
+    await busCall(page, 'busTopicDeleteRequest', { instanceId: instance, name: topic }).catch(() => {});
+    await busCall(page, 'busSchemaDeleteRequest', { instanceId: instance, subject, deprecateOnly: false }).catch(() => {});
+  }
+  expect(errors.filter((e) => !/schema_incompatible|BadRequest|invalid_argument|topic_not_found|NotFound/.test(e)), errors.join('\n')).toEqual([]);
 });
 
 test('U6 Dostęp at 1440: a group gets reading, a person a write ban, a change, the ban removed with its warning, an addon', async ({ page }) => {

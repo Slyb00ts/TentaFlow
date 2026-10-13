@@ -928,6 +928,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   `ERROR` („the scan of stored schemas for hidden characters failed”). Wersja,
   której wzór został usunięty, nie jest zgłaszana z powodu BOM na początku
   (nie wiadomo, czy to XSD).
+- **Poprawianie zapisanego wzoru z niewidocznym znakiem.** Porównanie z poprzednią
+  wersją czyta stary tekst z usuniętymi odrzucanymi znakami (ta wersja i tak się
+  nie kompiluje, a usunięcie znaków jest właśnie poprawką): pole `pac<U+202E>jent`
+  poprawione na `pacjent` to to samo pole, nie zmiana nazwy, więc poprawka
+  rejestruje się także w trybie BACKWARD. Szczegóły porównania nadal zapisują
+  odrzucany znak jako `⟦U+XXXX⟧`. Panel wzorów: strona wzoru ostrzega, że wersja
+  zawiera niewidoczny znak i które topiki przez to nic nie przyjmują, z przyciskiem
+  „Dodaj poprawioną wersję”; Stan topiku pokazuje to jako pozycję wymagającą uwagi,
+  gdy aktualna wersja wzoru jest dotknięta (wykrywane po stronie panelu tą samą
+  listą znaków, jedno odczytanie tekstu na topik i wersję, bez nowego pola w
+  protokole). „Nowa wersja” zaczyna od tekstu BEZ tych znaków, z informacją, co
+  usunięto i gdzie; różnica jest liczona względem oczyszczonego tekstu („tylko
+  usunięte niewidoczne znaki”), a „taki sam jak wersja N” porównuje z bajtami
+  zapisanej wersji, więc poprawka liczy się jako zmiana. Okno ostrzega, gdy zasady
+  ukrywania danych na topikach wzoru wymieniają pola, których nowa wersja nie ma
+  (pole, którego zasada nie wymienia, jest ukryte), i — tylko gdy pole różni się
+  wyłącznie niewidocznym znakiem — proponuje zmianę jego nazwy w tych zasadach
+  (pole wyboru, domyślnie zaznaczone, z nazwami przed i po); wykonanie następuje po
+  dodaniu wersji, a jego wynik (albo błąd) jest podany osobno w komunikacie. Okna
+  „Dodaj wzór” i „Nowa wersja” mają przycisk „Usuń niewidoczne znaki” (zostawia
+  początkowy BOM XSD) z raportem, co usunięto, oraz na żywo podają wiersz i kolumnę
+  (pole tekstowe nie numeruje wierszy; `tf-code-editor` je numeruje, ale zostawiono
+  `tf-textarea`, bo okna są edytowalne). Typowe znaki mają polskie nazwy (miękki
+  łącznik, spacja o zerowej szerokości, RLO, BOM...) z kodem U+XXXX, a U+00AD,
+  U+200B i U+200D podpowiedź przyczyny (tekst z Worda lub WWW; emoji złożone).
+  Nazwy pól w diffach, regułach ukrywania danych, podglądzie i tabelach strony
+  wzoru pokazują odrzucany znak jako `⟦U+XXXX⟧`. XSD wklejony z BOM przechodzi
+  kontrolę XML w oknie. „Co się stanie po dodaniu” znika, gdy widać odmowę, a toast
+  „Kopiuj” znika przy opuszczeniu strony wzoru.
 
 ## [0.4.0-beta.1] — 2026-09-29
 

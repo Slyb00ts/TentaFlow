@@ -53,7 +53,7 @@ const replicaTopics = [{
   ],
 }];
 
-function mount({ access = { canRead: true, canWrite: true, canAdmin: true }, section = 'state', detail, error = null, adminLabels = [], topicOverrides = {}, accessData = null, hidingData = null } = {}) {
+function mount({ access = { canRead: true, canWrite: true, canAdmin: true }, section = 'state', detail, error = null, adminLabels = [], topicOverrides = {}, accessData = null, hidingData = null, schemaProblem = null } = {}) {
   const body = document.createElement('div');
   document.body.appendChild(body);
   const moves = [];
@@ -74,6 +74,7 @@ function mount({ access = { canRead: true, canWrite: true, canAdmin: true }, sec
     justMoved: new Set(),
     accessData,
     hidingData,
+    schemaProblem,
     instanceId: 'tentabus-a1b2c3d4',
     instanceLabel: 'Produkcja',
     nowMs: NOW,
@@ -329,4 +330,23 @@ test('only the newest answer about a topic lands: a poll that left before a save
   pending[2].resolve({ v: 'late' });
   await late;
   assert.deepEqual(applied, ['saved']);
+});
+
+test('Stan: a pattern with a hidden character is an item that needs attention, with where it is and a button that opens the pattern', () => {
+  const clean = mount({});
+  const others = clean.body.querySelectorAll('[data-role="alerts"] .tb-alert').length;
+  assert.equal(clean.body.querySelector('[data-alert^="schema:"]'), null, 'nothing to flag');
+  const problem = { subject: 'pacjenci', version: 3, text: 'U+202E (wymuszenie kierunku od prawej do lewej (RLO)) w wierszu 1, kolumnie 34' };
+  const { body, moves } = mount({ schemaProblem: problem });
+  const item = body.querySelector('[data-alert="schema:pacjenci:3"]');
+  assert.ok(item, 'the pattern is listed among the alerts');
+  assert.equal(item.querySelector('[data-role="title"]').textContent, 'Wzór „pacjenci” zawiera niewidoczny znak');
+  assert.match(item.querySelector('[data-role="m1"]').textContent, /Wersja 3, według której topik sprawdza wiadomości, zawiera niewidoczny znak, więc topik ich nie przyjmuje\./);
+  assert.match(item.querySelector('[data-role="m2"]').textContent, /U\+202E .* w wierszu 1, kolumnie 34/);
+  assert.equal(body.querySelector('[data-role="alerts-none"]').hidden, true, '"Nic nie wymaga uwagi" is not said');
+  assert.equal(body.querySelectorAll('[data-role="alerts"] .tb-alert').length, others + 1);
+  assert.equal(body.querySelector('[data-role="attn-count"] tf-chip').getAttribute('label'), String(others + 1));
+  assert.equal(body.querySelector('[data-role="alerts"] .tb-alert').dataset.alert, 'schema:pacjenci:3', 'it comes first');
+  item.querySelector('tf-button').click();
+  assert.deepEqual(moves, [{ kind: 'schema', subject: 'pacjenci' }]);
 });

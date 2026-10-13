@@ -20,6 +20,7 @@ import { bytesToPreviewText } from '/js/modules/tentabus/payload.js';
 import { pickPartition, newestOffset, rangeText } from '/js/modules/tentabus/message-preview.js';
 import { directoryLoader, pickLabel } from '/js/modules/tentabus/topic-access.js';
 import { SUBJECT_KINDS, ANY_ID, fieldLabel } from '/js/modules/tentabus/topic-hiding.js';
+import { showHidden } from '/js/modules/tentabus/hidden-characters.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-select.js';
@@ -87,19 +88,19 @@ export function previewResultHtml({ resp, subject, source, nowMs = Date.now() })
   const rows = (applied || []).map((a) => {
     const label = source ? fieldLabel(source, a.field) : '';
     return `<div class="tb-right-row" data-field-action="${escapeAttr(a.action)}">
-      <div class="tb-right-name"><b class="mono">${escapeHtml(a.field)}</b>${label ? `<span>${escapeHtml(label)}</span>` : ''}</div>
+      <div class="tb-right-name"><b class="mono">${escapeHtml(showHidden(a.field))}</b>${label ? `<span>${escapeHtml(showHidden(label))}</span>` : ''}</div>
       <span class="tf-chip tf-chip--outline ${a.action === 'hide' ? 'warn' : 'ok'}">${escapeHtml(T(a.action === 'hide' ? 'hiding.preview.hidden' : 'hiding.preview.shown'))}</span>
     </div>`;
   }).join('');
   const missing = resp.limitedByCaller ? missingFields({ resp, source }) : [];
   const limitedText = [
     T('hiding.preview.limited_text', { who: whoPhrase(subject) }),
-    missing.length ? T('hiding.preview.limited_missing', { fields: missing.join(', ') }) : '',
+    missing.length ? T('hiding.preview.limited_missing', { fields: missing.map(showHidden).join(', ') }) : '',
   ].filter(Boolean).join(' ');
   // Fields the administrator's own rule already took out of the record are not in `applied` at all.
   const summary = [
     hidden.length
-      ? T('hiding.preview.summary_hidden', { count: fmtCount(hidden.length), n: hidden.length, fields: hidden.join(', ') })
+      ? T('hiding.preview.summary_hidden', { count: fmtCount(hidden.length), n: hidden.length, fields: hidden.map(showHidden).join(', ') })
       : T('hiding.preview.summary_none'),
     resp.limitedByCaller ? T('hiding.preview.summary_limited') : '',
   ].filter(Boolean).join(' ');

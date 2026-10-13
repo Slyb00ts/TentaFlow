@@ -31,8 +31,9 @@ import { shellCounts, userTopics, userRate } from '/js/modules/tentabus/model.js
 import { laggingReplicas, isLagging, lagSeriesKey } from '/js/modules/tentabus/alerts.js';
 import { drawOverview, pushOverviewSample, CHART_WINDOW_SECS } from '/js/modules/tentabus/overview.js';
 import { drawSchemas, listText, compatLabel, schemaKind, schemaKindMismatchText, busRefusalText, busRefusalDetail } from '/js/modules/tentabus/schemas.js';
-import { drawSchemaDetail, shareShownText } from '/js/modules/tentabus/schema-detail.js';
-import { addedNotice, openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete } from '/js/modules/tentabus/schema-windows.js';
+import { drawSchemaDetail, shareShownText, dismissCopyToast } from '/js/modules/tentabus/schema-detail.js';
+import { hiddenPlaces } from '/js/modules/tentabus/hidden-notice.js';
+import { addedNotice, renamedRuleRequest, openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete } from '/js/modules/tentabus/schema-windows.js';
 import { drawTopics } from '/js/modules/tentabus/topics.js';
 import { openTopicCreator } from '/js/modules/tentabus/topic-creator.js';
 import { openTopicDelete } from '/js/modules/tentabus/topic-delete.js';
@@ -276,6 +277,8 @@ const state = {
   access: freshAccess(),
   // The open topic's Ukrywanie danych — see `freshHiding`.
   hiding: freshHiding(),
+  // Whether the pattern the open topic checks with holds a refused character — see `loadSchemaProblem`.
+  schemaCheck: { topic: null, key: null, problem: null },
   // Partitions whose leadership was moved from this page: marked "zmieniono
   // przed chwilą" and not offered again until the reader refreshes. Numbers
   // on a topic's page, `topic:partition` on Kopie i nody.
@@ -1208,6 +1211,7 @@ function closeTopicDetail() {
   accessTurn += 1;
   state.hiding = freshHiding();
   hidingTurn += 1;
+  state.schemaCheck = { topic: null, key: null, problem: null };
   state.justMoved = new Set();
 }
 
@@ -1223,6 +1227,7 @@ const loadTopicDetail = topicDetailLoader({
       state.detailError = null;
       // The counters of Dostęp and Ukrywanie danych need their entries, whatever section is open.
       if (firstAdmin && state.access.acl == null) loadTopicAccess(state.view.name);
+      loadSchemaProblem(detail?.topic);
       if (detail?.access?.canAdmin === true && (firstAdmin || (state.hiding.schemaSettled && state.hiding.schemaFor !== (detail.topic?.schemaId || '')))) {
         loadTopicHiding(state.view.name);
       }
@@ -1236,6 +1241,29 @@ const loadTopicDetail = topicDetailLoader({
     renderPanel();
   },
 });
+
+// Whether the pattern the topic checks with holds a refused character: such a pattern no longer compiles, so
+// every write to the topic fails while the traffic figures look fine. Judged here from the pattern's text with
+// the dashboard's copy of the list (the server's flag would need a wire field on every pattern row; one read per
+// topic and pattern version is cheap) and asked again only when the pattern or its newest version changes.
+async function loadSchemaProblem(topic) {
+  if (!topic) return;
+  const instanceId = state.instanceId;
+  const info = subjectByName(topic.schemaId);
+  const key = `${instanceId}|${topic.schemaId || ''}|${info?.latestVersion ?? ''}|${info?.deprecatedAtMs ?? ''}`;
+  if (state.schemaCheck.topic === topic.name && state.schemaCheck.key === key) return;
+  state.schemaCheck = { topic: topic.name, key, problem: null };
+  if (!topic.schemaId) return;
+  try {
+    const got = await ApiBinary.one('busSchemaGetRequest', { instanceId: requireInstanceId(instanceId), subject: topic.schemaId });
+    if (state.schemaCheck.key !== key || state.instanceId !== instanceId) return;
+    const found = hiddenPlaces(got?.schemaText, { leadingBom: info?.schemaType === 'xsd' });
+    state.schemaCheck.problem = found ? { subject: topic.schemaId, version: got?.schema?.version ?? null, text: found.text } : null;
+    renderPanel();
+  } catch {
+    // The page needs no more than it had; the next poll asks again only when the pattern changed.
+  }
+}
 
 /** The section the open topic's page shows (a closed one falls back). */
 function currentSection() {
@@ -1267,6 +1295,7 @@ const detailContext = {
       unprocessedShown: state.unprocessed.sectionShown,
       accessData: state.access.topic === state.view.name ? state.access : null,
       hidingData: state.hiding.topic === state.view.name ? state.hiding : null,
+      schemaProblem: state.schemaCheck.topic === state.view.name ? state.schemaCheck.problem : null,
       instanceId: state.instanceId,
       instanceLabel: state.instanceLabel,
       nowMs: Date.now(),
@@ -1276,6 +1305,7 @@ const detailContext = {
     const name = state.view?.name;
     if (!name) return;
     if (action.kind === 'back') { setTab('topics'); return; }
+    if (action.kind === 'schema') { openSchema(action.subject); return; }
     if (action.kind === 'section' || action.kind === 'dlq') {
       const section = action.kind === 'dlq' ? 'dlq' : action.section;
       if (!TOPIC_SECTIONS.includes(section) || section === state.view.section) return;
@@ -2162,7 +2192,10 @@ function subjectByName(name) {
 function openSchema(name) {
   if (state.view?.kind === 'topic-detail') closeTopicDetail();
   else if (state.view?.kind === 'consumer-detail') closeConsumer();
-  if (state.view?.kind !== 'schema-detail' || state.view.subject !== name) state.schema = freshSchemaPage();
+  if (state.view?.kind !== 'schema-detail' || state.view.subject !== name) {
+    state.schema = freshSchemaPage();
+    dismissCopyToast();
+  }
   state.schemasNotice = null;
   state.tab = 'schemas';
   state.view = { kind: 'schema-detail', subject: name };
@@ -2173,6 +2206,7 @@ function openSchema(name) {
 function closeSchema() {
   if (state.view?.kind === 'schema-detail') state.view = null;
   state.schema = freshSchemaPage();
+  dismissCopyToast();
 }
 
 const openSchemaName = () => (state.view?.kind === 'schema-detail' ? state.view.subject : null);
@@ -2307,6 +2341,19 @@ function openSchemaAddWindow() {
   loadSubjects();
 }
 
+// The data-hiding rules of the topics that use a pattern, flat, for "Nowa wersja": a topic whose rules
+// cannot be read (no right to) is left out, since the window only warns.
+async function loadRulesOfTopics(instanceId, topics) {
+  const iid = requireInstanceId(instanceId);
+  const answers = await Promise.allSettled((topics || []).map(async (topic) => {
+    const got = await ApiBinary.one('busFieldPolicyListRequest', { instanceId: iid, topic });
+    return (got?.policies || []).map((p) => ({
+      topic, subjectType: p.subjectType, subjectId: p.subjectId, direction: p.direction, fields: p.fields || [], requiredFields: p.requiredFields || [],
+    }));
+  }));
+  return answers.flatMap((a) => (a.status === 'fulfilled' ? a.value : []));
+}
+
 // Set while "Nowa wersja" reads the newest text: a second click does not open a second window.
 let newVersionOpening = false;
 
@@ -2335,16 +2382,35 @@ async function openNewVersionWindow(name) {
     draftText: state.schemaDrafts.get(name) ?? null,
     register: (request) => ApiBinary.action('busSchemaRegisterRequest', request),
     describeError: describeBusError,
+    loadRules: () => loadRulesOfTopics(instanceId, info.usedByTopics),
+    renameRules: async (renames) => {
+      const iid = requireInstanceId(instanceId);
+      let changed = 0;
+      for (const rule of await loadRulesOfTopics(instanceId, info.usedByTopics)) {
+        const request = renamedRuleRequest(iid, rule, renames);
+        if (!request) continue;
+        await ApiBinary.action('busFieldPolicySetRequest', request);
+        changed += 1;
+      }
+      // The open topic page must read the renamed rules, not the ones it already holds.
+      state.hiding = freshHiding();
+      hidingTurn += 1;
+      return changed;
+    },
     onDraft: (text) => {
       if (text == null) state.schemaDrafts.delete(name);
       else state.schemaDrafts.set(name, text);
     },
-    onAdded: ({ version, deduplicated }) => {
+    onAdded: ({ version, deduplicated, ruleRename }) => {
       state.schemaDrafts.delete(name);
       if (state.instanceId !== instanceId) return;
-      afterSchemaChange(name, deduplicated
+      const notice = deduplicated
         ? { tone: 'info', title: T('schemas.version.same_title'), text: T('schemas.version.same_text', { version: fmtCount(version) }) }
-        : { tone: 'success', title: T('schemas.version.added_title', { version: fmtCount(version) }), text: usedByText(info, 'schemas.version.added_text') });
+        : { tone: 'success', title: T('schemas.version.added_title', { version: fmtCount(version) }), text: usedByText(info, 'schemas.version.added_text') };
+      // A change to what is hidden is never silent: it is said here, and a failure of it is not buried under the success.
+      if (ruleRename?.error) Object.assign(notice, { tone: 'warning', text: `${notice.text} ${T('schemas.hidden.rules_rename_failed', { error: ruleRename.error })}`.trim() });
+      else if (ruleRename?.renamed) notice.text = `${notice.text} ${T('schemas.hidden.rules_renamed', { count: ruleRename.renamed })}`.trim();
+      afterSchemaChange(name, notice);
     },
   });
 }

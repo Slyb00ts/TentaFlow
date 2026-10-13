@@ -27,6 +27,9 @@ import { T, fmtCount, readablePath } from '/js/modules/tentabus/format.js';
 import { COMPATIBILITIES, compatLabel, schemaFormatLabel, schemaKind, listText } from '/js/modules/tentabus/schemas.js';
 import { openChangeWindow, openConfirmWindow } from '/js/modules/tentabus/windows.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
+import { showHidden, findHidden, stripHidden } from '/js/modules/tentabus/hidden-characters.js';
+import { hiddenPlaces, placesText, plainName, causeHint } from '/js/modules/tentabus/hidden-notice.js';
+import { readJsonSchema } from '/js/modules/tentabus/topic-hiding.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-textarea.js';
@@ -34,6 +37,8 @@ import '/js/components/tf-disclosure.js';
 import '/js/components/tf-file-input.js';
 import '/js/components/tf-choice-card.js';
 import '/js/components/tf-radio.js';
+import '/js/components/tf-checkbox.js';
+import '/js/components/tf-button.js';
 
 const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}"/></svg>`;
 
@@ -77,11 +82,14 @@ export function subjectNameProblem(name, existingNames = []) {
   return null;
 }
 
+// XML allows a byte-order mark at the start and the server's XML reader strips it, but DOMParser reads it as text before the root.
+const withoutBom = (text) => String(text ?? '').replace(/^\uFEFF/, '');
+
 /** Whether `text` is a well-formed XML document; assumed so where there is no XML parser to ask. */
 function wellFormedXml(text) {
   if (typeof DOMParser === 'undefined') return true;
   try {
-    return new DOMParser().parseFromString(String(text), 'application/xml').getElementsByTagName('parsererror').length === 0;
+    return new DOMParser().parseFromString(withoutBom(text), 'application/xml').getElementsByTagName('parsererror').length === 0;
   } catch {
     return false;
   }
@@ -93,7 +101,7 @@ const XSD_NAMESPACE = 'http://www.w3.org/2001/XMLSchema';
 function xsdRoot(text) {
   if (typeof DOMParser === 'undefined') return true;
   try {
-    const root = new DOMParser().parseFromString(String(text), 'application/xml').documentElement;
+    const root = new DOMParser().parseFromString(withoutBom(text), 'application/xml').documentElement;
     return Boolean(root) && root.localName === 'schema' && root.namespaceURI === XSD_NAMESPACE;
   } catch {
     return false;
@@ -179,13 +187,13 @@ export function jsonSchemaChanges(oldText, newText, version) {
   const newReq = new Set(requiredFields(after));
   const parts = [];
   for (const f of newFields) {
-    if (!oldFields.has(f)) parts.push(T(newReq.has(f) ? 'schemas.version.diff_added_required' : 'schemas.version.diff_added_optional', { field: f }));
+    if (!oldFields.has(f)) parts.push(T(newReq.has(f) ? 'schemas.version.diff_added_required' : 'schemas.version.diff_added_optional', { field: showHidden(f) }));
   }
-  for (const f of oldFields) if (!newFields.has(f)) parts.push(T('schemas.version.diff_removed', { field: f }));
+  for (const f of oldFields) if (!newFields.has(f)) parts.push(T('schemas.version.diff_removed', { field: showHidden(f) }));
   for (const f of newFields) {
     if (!oldFields.has(f)) continue;
-    if (newReq.has(f) && !oldReq.has(f)) parts.push(T('schemas.version.diff_now_required', { field: f }));
-    if (!newReq.has(f) && oldReq.has(f)) parts.push(T('schemas.version.diff_now_optional', { field: f }));
+    if (newReq.has(f) && !oldReq.has(f)) parts.push(T('schemas.version.diff_now_required', { field: showHidden(f) }));
+    if (!newReq.has(f) && oldReq.has(f)) parts.push(T('schemas.version.diff_now_optional', { field: showHidden(f) }));
   }
   if (!parts.length) return T('schemas.version.diff_other', { version: v });
   return T('schemas.version.diff', { version: v, changes: listText(parts) });
@@ -222,10 +230,10 @@ export function profileChanges(oldText, newText, version) {
   const addedSegments = gained(after.segments, before.segments);
   const removedSegments = gained(before.segments, after.segments);
   const parts = [
-    ...addedSegments.map((segment) => T('schemas.version.diff_segment_added', { segment })),
-    ...removedSegments.map((segment) => T('schemas.version.diff_segment_removed', { segment })),
-    ...addedFields.map((field) => T('schemas.version.diff_added_required', { field })),
-    ...removedFields.map((field) => T('schemas.version.diff_now_optional', { field })),
+    ...addedSegments.map((segment) => T('schemas.version.diff_segment_added', { segment: showHidden(segment) })),
+    ...removedSegments.map((segment) => T('schemas.version.diff_segment_removed', { segment: showHidden(segment) })),
+    ...addedFields.map((field) => T('schemas.version.diff_added_required', { field: showHidden(field) })),
+    ...removedFields.map((field) => T('schemas.version.diff_now_optional', { field: showHidden(field) })),
   ];
   if (!parts.length) {
     return deepEqual(parseObject(oldText), parseObject(newText))
@@ -246,7 +254,7 @@ const XSD_NS = 'http://www.w3.org/2001/XMLSchema';
 function xsdElements(text) {
   if (typeof DOMParser === 'undefined') return null;
   try {
-    const doc = new DOMParser().parseFromString(String(text || ''), 'application/xml');
+    const doc = new DOMParser().parseFromString(withoutBom(text), 'application/xml');
     const root = doc.documentElement;
     if (!root || root.namespaceURI !== XSD_NS || root.localName !== 'schema' || doc.getElementsByTagName('parsererror').length) return null;
     const isXsd = (node, name) => node.namespaceURI === XSD_NS && node.localName === name;
@@ -284,12 +292,12 @@ export function xsdChanges(oldText, newText, version) {
   if (String(oldText).trim() === String(newText).trim()) return T('schemas.version.same_as', { version: v });
   const parts = [];
   for (const [name, required] of after) {
-    if (!before.has(name)) parts.push(T(required ? 'schemas.version.diff_added_required_element' : 'schemas.version.diff_added_optional_element', { field: name }));
+    if (!before.has(name)) parts.push(T(required ? 'schemas.version.diff_added_required_element' : 'schemas.version.diff_added_optional_element', { field: showHidden(name) }));
   }
-  for (const name of before.keys()) if (!after.has(name)) parts.push(T('schemas.version.diff_removed_element', { field: name }));
+  for (const name of before.keys()) if (!after.has(name)) parts.push(T('schemas.version.diff_removed_element', { field: showHidden(name) }));
   for (const [name, required] of after) {
     if (!before.has(name) || before.get(name) === required) continue;
-    parts.push(T(required ? 'schemas.version.diff_now_required_element' : 'schemas.version.diff_now_optional_element', { field: name }));
+    parts.push(T(required ? 'schemas.version.diff_now_required_element' : 'schemas.version.diff_now_optional_element', { field: showHidden(name) }));
   }
   if (!parts.length) return T('schemas.version.diff_other', { version: v });
   return T('schemas.version.diff', { version: v, changes: listText(parts) });
@@ -613,11 +621,13 @@ function refusalReasonOf(schemaType, serverText) {
   // The same screen runs before every format's parser (text_guard.rs), so every kind words it the same.
   const hidden = /^the schema contains an invisible or direction-controlling character (U\+[0-9A-F]+) \(([^)]*)\) at line (\d+), column (\d+)/.exec(text);
   if (hidden) {
+    const cp = parseInt(hidden[1].slice(2), 16);
     return T('schemas.refused.hidden_character', {
       code: hidden[1],
-      name: hidden[2],
+      name: plainName(cp, hidden[2]),
+      cause: causeHint(cp),
       atLine: T('schemas.refused.at_line_column', { line: hidden[3], column: hidden[4] }),
-    });
+    }).replace(/\s{2,}/g, ' ').trim();
   }
   if (schemaType === 'hl7v2_profile') {
     let m = /'(MSH-[12])' is the message's own field-separator/.exec(text);
@@ -774,7 +784,7 @@ export function refusalHtml({ err, title, compatibility, schemaType, newText, de
             + (keepsDescription ? `<div class="tb-vr-hint">${escapeHtml(T('schemas.version.drop_description'))}</div>` : '');
         }
       }
-      return `<div>${head} ${escapeHtml(T('schemas.incompat.lead', { compat, reason: known.reason }))} ${escapeHtml(known.fix)}</div>${extra}`;
+      return `<div>${head} ${escapeHtml(showHidden(T('schemas.incompat.lead', { compat, reason: known.reason })))} ${escapeHtml(showHidden(known.fix))}</div>${extra}`;
     }
     return `<div>${head} ${escapeHtml(T('schemas.incompat.unknown', { compat }))} ${escapeHtml(T('schemas.incompat.fix_generic'))}</div>${technical(incompatible.detail)}`;
   }
@@ -877,11 +887,64 @@ export function addedNotice({ subject, schemaType, version, deduplicated }) {
 // ---------------------------------------------------------------------------
 
 const TEXT_ERRORS = { empty: 'schemas.text_empty', too_big: 'schemas.text_too_big', not_json: 'schemas.text_not_json', not_xml: 'schemas.text_not_xml', not_object: 'schemas.refused.hl7_shape', not_xsd: 'schemas.refused.xsd_root' };
+/**
+ * What a new version of a JSON Schema does to the data-hiding rules of the
+ * topics that use the pattern. A rule stores the fields it ALLOWS, so a field
+ * the rule names but the new version lacks is a field the new version's
+ * readers lose or, when the new version spells it differently, a new field the
+ * rule does not name and therefore hides. `rules` = `[{ topic, subjectType,
+ * subjectId, direction, fields, requiredFields }]`. Returns `null` when there is
+ * nothing to say (another format, no rules, a text that lists no fields);
+ * else `{ gone: [{ name, topics }], renames: [{ from, to }] }` where `renames`
+ * are the gone names whose only difference from a field of the new version is
+ * a refused character — the case a correction of a stored text creates. `gone`
+ * is left empty when the new text is not a closed list of fields (it may still
+ * carry the field some other way); `renames` are certain either way.
+ */
+export function ruleFieldIssues({ rules, newText, schemaType }) {
+  if (schemaType !== 'json_schema' || !rules?.length) return null;
+  const read = readJsonSchema(newText);
+  if (!read.fields.length) return null;
+  const present = new Set(read.fields.map((f) => f.name));
+  const gone = new Map();
+  const renames = new Map();
+  for (const rule of rules) {
+    for (const name of new Set([...(rule.fields || []), ...(rule.requiredFields || [])])) {
+      if (present.has(name)) continue;
+      const clean = stripHidden(name);
+      if (clean !== name && present.has(clean)) renames.set(name, clean);
+      if (!read.complex) gone.set(name, new Set([...(gone.get(name) || []), rule.topic]));
+    }
+  }
+  if (!gone.size && !renames.size) return null;
+  return {
+    gone: [...gone].map(([name, topics]) => ({ name, topics: [...topics].sort() })),
+    renames: [...renames].map(([from, to]) => ({ from, to })),
+  };
+}
+
+/** `FieldPolicySetRequest` of `rule` with the renamed fields swapped in, or `null` when the rule names none of them. */
+export function renamedRuleRequest(instanceId, rule, renames) {
+  const map = new Map(renames.map((x) => [x.from, x.to]));
+  const swap = (list) => [...new Set((list || []).map((n) => map.get(n) ?? n))].sort();
+  const fields = swap(rule.fields);
+  const requiredFields = swap(rule.requiredFields);
+  const touched = (rule.fields || []).some((n) => map.has(n)) || (rule.requiredFields || []).some((n) => map.has(n));
+  return touched
+    ? { instanceId, topic: rule.topic, subjectType: rule.subjectType, subjectId: rule.subjectId, direction: rule.direction, fields, requiredFields }
+    : null;
+}
+
 const NAME_ERRORS = { empty: 'schemas.add.name_empty', invalid: 'schemas.add.name_invalid', taken: 'schemas.add.name_taken' };
 
 function textField(label, hint, value = '', more = '') {
   return `
     <tf-textarea class="tb-mono-input" data-role="text" rows="10" label="${escapeAttr(label)}" hint="${escapeAttr(hint)}" value="${escapeAttr(value)}" spellcheck="false"></tf-textarea>
+    <div class="tb-hidden-row" data-role="hidden-row" hidden>
+      <div class="muted" data-role="hidden-places"></div>
+      <tf-button variant="secondary" size="sm" icon="close" data-role="strip-hidden">${escapeHtml(T('schemas.hidden.strip_button'))}</tf-button>
+    </div>
+    <div class="tb-vr-hint" data-role="hidden-done" hidden></div>
     <tf-disclosure class="tb-tech" data-role="more" label="${escapeAttr(T('schemas.add.more'))}"${more ? '' : ' hidden'}><div data-role="more-text">${escapeHtml(more)}</div></tf-disclosure>
     <tf-file-input data-role="file" label="${escapeAttr(T('schemas.file_label'))}"></tf-file-input>`;
 }
@@ -890,12 +953,29 @@ function textField(label, hint, value = '', more = '') {
 // takes is refused here with the reason instead of being sent.
 function wireTextField(win, sync, formatOf) {
   const text = win.querySelector('[data-role="text"]');
+  const row = win.querySelector('[data-role="hidden-row"]');
+  const placesEl = win.querySelector('[data-role="hidden-places"]');
+  const done = win.querySelector('[data-role="hidden-done"]');
+  // An XSD may start with a byte-order mark; it is not a refused character there.
+  const options = () => ({ leadingBom: formatOf() === 'xsd' });
   const check = () => {
     const problem = text.value.trim() ? schemaTextProblem(text.value, formatOf()) : null;
     if (problem) text.setAttribute('error', T(TEXT_ERRORS[problem]));
     else text.removeAttribute('error');
+    // The refusal names a line and column, which the box does not number: say where they are, live.
+    const found = hiddenPlaces(text.value, options());
+    row.hidden = !found;
+    placesEl.textContent = found ? T('schemas.hidden.places_line', { places: found.text }) : '';
   };
-  text.addEventListener('input', () => { check(); sync(); });
+  text.addEventListener('input', () => { done.hidden = true; check(); sync(); });
+  win.querySelector('[data-role="strip-hidden"]').addEventListener('click', () => {
+    const places = findHidden(text.value, options());
+    if (!places.length) return;
+    text.value = stripHidden(text.value, options());
+    text.dispatchEvent(new Event('input', { bubbles: true }));
+    done.textContent = T('schemas.hidden.stripped', { count: places.length, places: placesText(places) });
+    done.hidden = false;
+  });
   win.querySelector('[data-role="file"]').addEventListener('change', async (e) => {
     const file = e.detail?.files?.[0];
     if (!file) return;
@@ -1011,16 +1091,29 @@ export function openSchemaAdd(ctx) {
 /**
  * "Nowa wersja". `ctx` = `{ instanceId, subject: <list row>, latestText,
  * draftText, register(request), describeError, onAdded({ version,
- * deduplicated }), onDraft(text) }` — `draftText` is a refused text kept from
- * the last attempt (else the newest version's text is the starting point);
- * `onDraft` receives the text whenever the window closes without adding.
+ * deduplicated, ruleRename }), onDraft(text), loadRules(), renameRules(renames) }`
+ * — `draftText` is a refused text kept from the last attempt (else the newest
+ * version's text is the starting point); `onDraft` receives the text whenever
+ * the window closes without adding. A newest text that holds refused characters
+ * (stored before the registry refused them) starts WITHOUT them, with a notice of
+ * what was removed and where; the diff is drawn against that cleaned text, while
+ * "the same as version N" still compares with the stored bytes, so the cleaned
+ * text counts as the change it is. `loadRules()` (optional) answers the
+ * data-hiding rules of the topics that use the pattern; the window says which
+ * of their fields the new text no longer has and offers to rename those that
+ * differ only by a refused character (`renameRules`, run after the version was
+ * added; its outcome comes back in `onAdded`'s `ruleRename`).
  */
 export function openSchemaVersion(ctx) {
   const info = ctx.subject;
   const latest = Number(info.latestVersion) || 0;
   const next = latest + 1;
-  const start = ctx.draftText ?? ctx.latestText ?? '';
+  const bom = { leadingBom: info.schemaType === 'xsd' };
+  const removedFromLatest = hiddenPlaces(ctx.latestText, bom);
+  const cleanLatest = removedFromLatest ? stripHidden(ctx.latestText, bom) : (ctx.latestText ?? '');
+  const start = ctx.draftText ?? cleanLatest;
   let added = false;
+  let rules = null;
   const win = openChangeWindow({
     title: T('schemas.version.title', { name: info.subject }),
     icon: 'plus',
@@ -1034,26 +1127,63 @@ export function openSchemaVersion(ctx) {
     discardText: T('schemas.version.discard_kept'),
     fields: () => `
       ${ctx.draftText != null ? `<div class="tb-explain-box">${escapeHtml(T('schemas.version.draft_kept'))}</div>` : ''}
+      ${ctx.draftText == null && removedFromLatest ? `<div class="tb-explain-box" data-role="cleaned" role="status">${escapeHtml(T('schemas.hidden.cleaned', { count: removedFromLatest.places.length, places: removedFromLatest.text }))}</div>` : ''}
       ${textField(T('schemas.version.text_label', { version: fmtCount(next) }), addTextHint(info.schemaType, next), start, addTextMore(info.schemaType))}
-      <div class="tb-vr-hint" data-role="diff"></div>`,
+      <div class="tb-vr-hint" data-role="diff"></div>
+      <div class="tb-rules-note" data-role="rules" role="status" hidden></div>
+      <div data-role="rename-wrap" hidden><tf-checkbox data-role="rename-rules" checked label=""></tf-checkbox></div>`,
     wire: (win, sync) => {
       const diff = win.querySelector('[data-role="diff"]');
+      const field = win.querySelector('[data-role="text"]');
+      const rulesEl = win.querySelector('[data-role="rules"]');
+      const renameWrap = win.querySelector('[data-role="rename-wrap"]');
+      const renameBox = win.querySelector('[data-role="rename-rules"]');
       const paintDiff = () => {
         const changes = { json_schema: jsonSchemaChanges, hl7v2_profile: profileChanges, xsd: xsdChanges }[info.schemaType];
-        const text = changes ? changes(ctx.latestText, win.querySelector('[data-role="text"]').value, latest) : null;
+        // Removing the characters and nothing else is the correction: say that, not "the same as version N".
+        const text = removedFromLatest && field.value === cleanLatest
+          ? T('schemas.hidden.diff_only_removal', { version: fmtCount(latest) })
+          : (changes ? changes(cleanLatest, field.value, latest) : null);
         diff.textContent = text || '';
         diff.hidden = !text;
       };
-      const check = wireTextField(win, () => { paintDiff(); sync(); }, () => info.schemaType);
+      const paintRules = () => {
+        const issues = ruleFieldIssues({ rules, newText: field.value, schemaType: info.schemaType });
+        const gone = issues?.gone || [];
+        rulesEl.hidden = !gone.length;
+        if (gone.length) {
+          const topics = [...new Set(gone.flatMap((g) => g.topics))].map((t) => `„${t}”`);
+          rulesEl.textContent = T('schemas.hidden.rules_gone', { topics: listText(topics), fields: showHidden(listText(gone.map((g) => g.name))) });
+        }
+        const renames = issues?.renames || [];
+        renameWrap.hidden = !renames.length;
+        if (renames.length) {
+          renameBox.setAttribute('label', T('schemas.hidden.rules_rename', { pairs: renames.map((x) => `${showHidden(x.from)} → ${x.to}`).join(', ') }));
+        }
+      };
+      const check = wireTextField(win, () => { paintDiff(); paintRules(); sync(); }, () => info.schemaType);
       check();
       paintDiff();
+      ctx.loadRules?.().then((loaded) => { rules = loaded; paintRules(); }, () => {});
     },
     draft: (win) => {
       const schemaText = win.querySelector('[data-role="text"]').value;
       return schemaTextProblem(schemaText, info.schemaType) || textMarked(win) ? null : { schemaText };
     },
     impact: () => versionImpact({ nextVersion: next, latestVersion: latest || null, compatibility: info.compatibility, usedByTopics: info.usedByTopics }),
-    save: async (d) => ctx.register(buildRegisterRequest(ctx.instanceId, { subject: info.subject, schemaType: info.schemaType, schemaText: d.schemaText })),
+    save: async (d) => {
+      const renames = win.querySelector('[data-role="rename-rules"]').checked && !win.querySelector('[data-role="rename-wrap"]').hidden
+        ? (ruleFieldIssues({ rules, newText: d.schemaText, schemaType: info.schemaType })?.renames || [])
+        : [];
+      const resp = await ctx.register(buildRegisterRequest(ctx.instanceId, { subject: info.subject, schemaType: info.schemaType, schemaText: d.schemaText }));
+      if (!renames.length || !ctx.renameRules) return resp;
+      // The version is in: a failed rename must not look like a refused version.
+      try {
+        return { ...resp, ruleRename: { renamed: await ctx.renameRules(renames), fields: renames } };
+      } catch (err) {
+        return { ...resp, ruleRename: { error: ctx.describeError(err), fields: renames } };
+      }
+    },
     errorHtml: (err, d) => refusalHtml({
       err,
       title: T('schemas.version.refused', { version: fmtCount(next) }),
@@ -1062,12 +1192,12 @@ export function openSchemaVersion(ctx) {
       newText: d.schemaText,
       describeError: ctx.describeError,
       offerDrop: true,
-      latest: { version: latest, text: ctx.latestText },
+      latest: { version: latest, text: cleanLatest },
     }),
     describeError: ctx.describeError,
     onSaved: (d, resp) => {
       added = true;
-      ctx.onAdded({ version: Number(resp?.version) || next, deduplicated: resp?.deduplicated === true });
+      ctx.onAdded({ version: Number(resp?.version) || next, deduplicated: resp?.deduplicated === true, ...(resp?.ruleRename ? { ruleRename: resp.ruleRename } : {}) });
     },
   });
   win.addEventListener('click', (e) => {
@@ -1089,7 +1219,7 @@ export function openSchemaVersion(ctx) {
   win.addEventListener('closed', () => {
     if (added) return;
     const text = win.querySelector('[data-role="text"]')?.value;
-    ctx.onDraft?.(text != null && text !== (ctx.latestText ?? '') ? text : null);
+    ctx.onDraft?.(text != null && text !== cleanLatest ? text : null);
   });
   return win;
 }

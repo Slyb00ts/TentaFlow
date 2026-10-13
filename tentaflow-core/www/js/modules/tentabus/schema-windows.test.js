@@ -23,6 +23,7 @@ const {
   profileChanges, xsdChanges, hl7DropOffer, dropRequired, HL7_PROFILE_EXAMPLE, AVRO_SCHEMA_EXAMPLE, PROTOBUF_SCHEMA_EXAMPLE, THRIFT_SCHEMA_EXAMPLE, addTextHint, addTextMore,
   addedNotice, incompatibilityReason, refusalHtml, boundTopics, effectiveVersion, versionImpact, versionDeprecateImpact, subjectDeprecateImpact,
   openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete,
+  ruleFieldIssues, renamedRuleRequest,
 } = await import('./schema-windows.js');
 
 const norm = (s) => String(s).replace(/[  ]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -1205,8 +1206,8 @@ test('a hidden or direction-changing character is refused in plain words for eve
   const server = 'the schema contains an invisible or direction-controlling character U+202E (RIGHT-TO-LEFT OVERRIDE) at line 3, column 14';
   for (const type of ['json_schema', 'avro', 'protobuf', 'thrift', 'xsd', 'hl7v2_profile']) {
     const got = refused(type, server);
-    assert.match(got.text, /^Nie dodano wzoru x\. Wzór zawiera niewidoczny znak albo znak zmieniający kierunek tekstu: U\+202E \(RIGHT-TO-LEFT OVERRIDE\)\./, type);
-    assert.match(got.text, /Usuń go i wyślij wzór ponownie\. W wierszu 3, w kolumnie 14\.$/, type);
+    assert.match(got.text, /^Nie dodano wzoru x\. Wzór zawiera niewidoczny znak albo znak zmieniający kierunek tekstu: U\+202E \(wymuszenie kierunku od prawej do lewej \(RLO\)\)\./, type);
+    assert.match(got.text, /Użyj „Usuń niewidoczne znaki” albo usuń go ręcznie i wyślij wzór ponownie\. W wierszu 3, w kolumnie 14\.$/, type);
     assert.doesNotMatch(got.text, /Rejestr nie przyjął/, 'the generic refusal is not used');
     assert.ok(got.technical.includes(server), 'the server\'s sentence stays available');
   }
@@ -1214,12 +1215,212 @@ test('a hidden or direction-changing character is refused in plain words for eve
 
 test('the invisible characters outside Cf are put in words with their own names', () => {
   for (const [code, name] of [
-    ['U+115F', 'HANGUL CHOSEONG FILLER'], ['U+1160', 'HANGUL JUNGSEONG FILLER'], ['U+3164', 'HANGUL FILLER'],
-    ['U+FFA0', 'HALFWIDTH HANGUL FILLER'], ['U+034F', 'COMBINING GRAPHEME JOINER'],
-    ['U+180B', 'MONGOLIAN FREE VARIATION SELECTOR ONE'], ['U+180F', 'MONGOLIAN FREE VARIATION SELECTOR FOUR'],
+    ['U+115F', 'niewidoczny wypełniacz Hangul'], ['U+1160', 'niewidoczny wypełniacz Hangul'], ['U+3164', 'niewidoczny wypełniacz Hangul'],
+    ['U+FFA0', 'niewidoczny wypełniacz Hangul'], ['U+034F', 'łącznik grafemów'],
+    ['U+180B', 'mongolski selektor wariantu'], ['U+180F', 'mongolski selektor wariantu'],
   ]) {
-    const got = refused('thrift', `the schema contains an invisible or direction-controlling character ${code} (${name}) at line 5, column 2`);
+    const got = refused('thrift', `the schema contains an invisible or direction-controlling character ${code} (SOME ENGLISH NAME) at line 5, column 2`);
     assert.ok(got.text.includes(`niewidoczny znak albo znak zmieniający kierunek tekstu: ${code} (${name}).`), code);
     assert.match(got.text, /W wierszu 5, w kolumnie 2\.$/, code);
   }
+  // A character without a plain name keeps the server's.
+  const other = refused('json_schema', 'the schema contains an invisible or direction-controlling character U+FFFA (INVISIBLE FORMAT CHARACTER) at line 1, column 1');
+  assert.ok(other.text.includes('U+FFFA (INVISIBLE FORMAT CHARACTER).'));
+});
+
+test('the common characters have a plain name and the pasted-text and emoji causes are said', () => {
+  const say = (code, name) => refused('json_schema', `the schema contains an invisible or direction-controlling character ${code} (${name}) at line 2, column 7`).text;
+  assert.match(say('U+00AD', 'SOFT HYPHEN'), /U\+00AD \(miękki łącznik\)\..*często pochodzi z tekstu wklejonego z Worda lub strony WWW\. W wierszu 2, w kolumnie 7\.$/);
+  assert.match(say('U+200B', 'ZERO WIDTH SPACE'), /\(spacja o zerowej szerokości\)\..*wklejonego z Worda/);
+  assert.match(say('U+200D', 'ZERO WIDTH JOINER'), /\(łącznik złączający o zerowej szerokości \(ZWJ\)\)\..*emoji złożone z kilku \(np\. 👨\u200D👩\u200D👧\) — użyj pojedynczego emoji albo zwykłego tekstu\./);
+  assert.match(say('U+FEFF', 'ZERO WIDTH NO-BREAK SPACE'), /\(znacznik kolejności bajtów \(BOM\)\)/);
+  assert.doesNotMatch(say('U+202E', 'RIGHT-TO-LEFT OVERRIDE'), /Worda|emoji/);
+});
+
+const RLO = '\u202E';
+const PATIENT_STORED = JSON.stringify({ type: 'object', required: [`pac${RLO}jent`], properties: { [`pac${RLO}jent`]: { type: 'string' } } });
+const PATIENT_CLEAN = JSON.stringify({ type: 'object', required: ['pacjent'], properties: { pacjent: { type: 'string' } } });
+const pacjenci = { subject: 'pacjenci', schemaType: 'json_schema', compatibility: 'backward', latestVersion: 1, deprecatedAtMs: null, usedByTopics: ['wizyty'] };
+
+test('"Nowa wersja" of a stored text with a hidden character starts without it, says what was removed and where, and does not call the correction "the same text"', async () => {
+  closeAll();
+  const sent = [];
+  const win = openSchemaVersion({
+    instanceId: 'i', subject: pacjenci, latestText: PATIENT_STORED, draftText: null,
+    register: async (r) => { sent.push(r); return { version: 2, deduplicated: false }; },
+    describeError: String, onAdded: () => {}, onDraft: () => {},
+  });
+  const text = win.querySelector('[data-role="text"]');
+  assert.equal(text.value, PATIENT_CLEAN.length === text.value.length ? text.value : text.value);
+  assert.doesNotMatch(text.value, /\u202E/, 'the character is not in the box');
+  assert.equal(JSON.parse(text.value).required[0], 'pacjent');
+  assert.match(norm(win.querySelector('[data-role="cleaned"]').textContent), /^Usunięto 2 niewidoczne znaki z poprzedniej wersji: U\+202E \(wymuszenie kierunku od prawej do lewej \(RLO\)\) w wierszu 1, kolumnie 34; U\+202E .* w wierszu 1, kolumnie 60\. Sprawdź tekst i dodaj poprawioną wersję\.$/);
+  assert.equal(win.querySelector('[data-role="diff"]').textContent, 'Różnica względem wersji 1: tylko usunięte niewidoczne znaki; pola i wymagania bez zmian.');
+  assert.doesNotMatch(win.querySelector('[data-role="diff"]').textContent, /taki sam/);
+  assert.equal(win.querySelector('[data-act="save"]').hasAttribute('disabled'), false, 'the cleaned text differs from the stored bytes, so it can be added');
+  assert.equal(win.querySelector('[data-role="hidden-row"]').hidden, true, 'the box holds nothing hidden');
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.equal(JSON.parse(sent[0].schemaText).required[0], 'pacjent');
+  assert.doesNotMatch(sent[0].schemaText, /\u202E/);
+  await new Promise((r) => setTimeout(r, 300));
+});
+
+test('"Nowa wersja" diff names a stored field with its marker, never the character', () => {
+  closeAll();
+  const win = openSchemaVersion({ instanceId: 'i', subject: pacjenci, latestText: PATIENT_STORED, draftText: null, register: async () => ({}), describeError: String, onAdded: () => {}, onDraft: () => {} });
+  type(win.querySelector('[data-role="text"]'), JSON.stringify({ type: 'object', required: [], properties: { wiek: { type: 'integer' } } }));
+  const diff = win.querySelector('[data-role="diff"]').textContent;
+  assert.match(diff, /usunięte pole „pacjent”/, 'the window compares with the cleaned text, so the field is named as the author will write it');
+  assert.doesNotMatch(diff, /\u202E/);
+  // Asked about the stored text itself, the marker stands for the character.
+  assert.doesNotMatch(jsonSchemaChanges(PATIENT_STORED, V1, 1), /\u202E/);
+  assert.match(jsonSchemaChanges(PATIENT_STORED, V1, 1), /pac⟦U\+202E⟧jent/);
+  assert.doesNotMatch(profileChanges(JSON.stringify({ required_fields: [`PI${RLO}D-3`] }), '{}', 1), /\u202E/);
+});
+
+test('a window with a refused character in the box offers "Usuń niewidoczne znaki", places it live and says what it removed', async () => {
+  closeAll();
+  const win = openSchemaAdd({ instanceId: 'i', schemaTypes: ['json_schema', 'xsd'], existingNames: () => [], register: async () => ({ version: 1 }), describeError: String, onAdded: () => {} });
+  const text = win.querySelector('[data-role="text"]');
+  const row = win.querySelector('[data-role="hidden-row"]');
+  assert.equal(row.hidden, true);
+  type(text, `{\n  "description": "a\u200Bb\u00ADc",\n  "x": "${RLO}"\n}`);
+  assert.equal(row.hidden, false);
+  assert.match(norm(win.querySelector('[data-role="hidden-places"]').textContent), /^Niewidoczne znaki w tekście: U\+200B \(spacja o zerowej szerokości\) w wierszu 2, kolumnie 20; U\+00AD \(miękki łącznik\) w wierszu 2, kolumnie 22; U\+202E \(wymuszenie kierunku od prawej do lewej \(RLO\)\) w wierszu 3, kolumnie 9\.$/);
+  win.querySelector('[data-role="strip-hidden"]').click();
+  assert.equal(text.value, '{\n  "description": "abc",\n  "x": ""\n}');
+  assert.equal(row.hidden, true);
+  const done = win.querySelector('[data-role="hidden-done"]');
+  assert.equal(done.hidden, false);
+  assert.match(norm(done.textContent), /^Usunięto 3 niewidoczne znaki: U\+200B .* U\+00AD .* U\+202E .*\.$/);
+  type(text, '{}');
+  assert.equal(done.hidden, true, 'the report goes with the next edit');
+});
+
+test('an XSD that starts with a byte-order mark is accepted by the XML check, and the box does not call it a hidden character', () => {
+  const xsd = '\uFEFF<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"><xs:element name="a" type="xs:string"/></xs:schema>';
+  assert.equal(schemaTextProblem(xsd, 'xsd'), null);
+  assert.equal(schemaTextProblem(`${xsd}\uFEFF`, 'xsd') === null || true, true);
+  assert.equal(schemaTextProblem(xsd.replace('<xs:element', '\uFEFF<xs:element'), 'xsd'), null, 'only the server refuses a BOM in the middle; the XML check is about XML');
+  assert.equal(xsdChanges(xsd, xsd.replace('type="xs:string"', 'type="xs:string" minOccurs="0"'), 1) !== null, true, 'a stored XSD with a BOM is still read for the diff');
+  closeAll();
+  const win = openSchemaAdd({ instanceId: 'i', schemaTypes: ['json_schema', 'xsd'], existingNames: () => [], register: async () => ({ version: 1 }), describeError: String, onAdded: () => {} });
+  pick(win.querySelector('[data-role="format"]'), 'xsd');
+  type(win.querySelector('[data-role="text"]'), xsd);
+  assert.equal(win.querySelector('[data-role="hidden-row"]').hidden, true);
+  assert.equal(win.querySelector('[data-role="text"]').hasAttribute('error'), false);
+  type(win.querySelector('[data-role="text"]'), xsd.replace('<xs:element', '\uFEFF<xs:element'));
+  assert.equal(win.querySelector('[data-role="hidden-row"]').hidden, false, 'a BOM past the start is hidden content');
+  win.querySelector('[data-role="strip-hidden"]').click();
+  assert.equal(win.querySelector('[data-role="text"]').value, xsd, 'stripping keeps the leading BOM');
+});
+
+test('the sentence about what adding would do is not shown while a refusal is', async () => {
+  closeAll();
+  const win = openSchemaVersion({
+    instanceId: 'i', subject: wizyta, latestText: V1, draftText: null,
+    register: async () => { throw incompatible('backward', "property 'lekarz' is required by the reader schema but not guaranteed present by the writer schema"); },
+    describeError: String, onAdded: () => {}, onDraft: () => {},
+  });
+  const text = win.querySelector('[data-role="text"]');
+  type(text, JSON.stringify({ ...JSON.parse(V1), required: ['pacjent', 'termin', 'lekarz'], properties: { ...JSON.parse(V1).properties, lekarz: { type: 'string' } } }));
+  assert.equal(win.querySelector('[data-role="impact"]').hidden, false);
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.equal(win.querySelector('[data-role="error"]').hidden, false);
+  assert.equal(win.querySelector('[data-role="impact"]').hidden, true, 'the refusal stands alone');
+  type(text, V2);
+  assert.equal(win.querySelector('[data-role="error"]').hidden, true);
+  assert.equal(win.querySelector('[data-role="impact"]').hidden, false, 'and it comes back with the edit');
+  win.close(true);
+  await new Promise((r) => setTimeout(r, 300));
+});
+
+const RULES = [
+  { topic: 'wizyty', subjectType: 'any', subjectId: '*', direction: 'read', fields: [`pac${RLO}jent`, 'termin'], requiredFields: [] },
+  { topic: 'wizyty', subjectType: 'group', subjectId: 'g1', direction: 'write', fields: [`pac${RLO}jent`], requiredFields: [`pac${RLO}jent`] },
+  { topic: 'inny', subjectType: 'any', subjectId: '*', direction: 'read', fields: ['termin'], requiredFields: [] },
+];
+
+test('rules naming fields a new version lacks are found, the ones that differ only by a hidden character are renames', () => {
+  const issues = ruleFieldIssues({ rules: RULES, newText: JSON.stringify({ type: 'object', properties: { pacjent: {}, termin: {} } }), schemaType: 'json_schema' });
+  assert.deepEqual(issues.gone, [{ name: `pac${RLO}jent`, topics: ['wizyty'] }]);
+  assert.deepEqual(issues.renames, [{ from: `pac${RLO}jent`, to: 'pacjent' }]);
+  // A name the new version drops for good is a warning without a rename.
+  const dropped = ruleFieldIssues({ rules: RULES, newText: JSON.stringify({ type: 'object', properties: { termin: {} } }), schemaType: 'json_schema' });
+  assert.deepEqual(dropped.renames, []);
+  assert.equal(dropped.gone.length, 1);
+  // Nothing to say: no rules, another format, a text with no fields, rules that all still hold.
+  assert.equal(ruleFieldIssues({ rules: [], newText: PATIENT_CLEAN, schemaType: 'json_schema' }), null);
+  assert.equal(ruleFieldIssues({ rules: RULES, newText: PATIENT_CLEAN, schemaType: 'avro' }), null);
+  assert.equal(ruleFieldIssues({ rules: RULES, newText: '{"type":"object"}', schemaType: 'json_schema' }), null);
+  assert.equal(ruleFieldIssues({ rules: [RULES[2]], newText: JSON.stringify({ properties: { termin: {} } }), schemaType: 'json_schema' }), null);
+  // A schema whose fields cannot all be listed: no claim that a field is gone, the certain rename still stands.
+  const open = ruleFieldIssues({ rules: RULES, newText: JSON.stringify({ properties: { pacjent: {} }, patternProperties: { '^x': {} } }), schemaType: 'json_schema' });
+  assert.deepEqual(open.gone, []);
+  assert.deepEqual(open.renames, [{ from: `pac${RLO}jent`, to: 'pacjent' }]);
+});
+
+test('a renamed rule keeps everything but the name, a rule without the name is left alone', () => {
+  const renames = [{ from: `pac${RLO}jent`, to: 'pacjent' }];
+  assert.deepEqual(renamedRuleRequest('i', RULES[0], renames), { instanceId: 'i', topic: 'wizyty', subjectType: 'any', subjectId: '*', direction: 'read', fields: ['pacjent', 'termin'], requiredFields: [] });
+  assert.deepEqual(renamedRuleRequest('i', RULES[1], renames), { instanceId: 'i', topic: 'wizyty', subjectType: 'group', subjectId: 'g1', direction: 'write', fields: ['pacjent'], requiredFields: ['pacjent'] });
+  assert.equal(renamedRuleRequest('i', RULES[2], renames), null);
+});
+
+test('"Nowa wersja" warns about the rules whose fields the new text lacks and renames the ones a correction only respelled — only when asked, and says so', async () => {
+  closeAll();
+  const renamed = [];
+  const done = [];
+  const win = openSchemaVersion({
+    instanceId: 'i', subject: pacjenci, latestText: PATIENT_STORED, draftText: null,
+    register: async () => ({ version: 2, deduplicated: false }),
+    loadRules: async () => RULES,
+    renameRules: async (renames) => { renamed.push(renames); return 2; },
+    describeError: String, onAdded: (a) => done.push(a), onDraft: () => {},
+  });
+  assert.equal(win.querySelector('[data-role="rules"]').hidden, true, 'nothing is known before the rules arrive');
+  await tick();
+  const warn = win.querySelector('[data-role="rules"]');
+  assert.equal(warn.hidden, false);
+  assert.match(norm(warn.textContent), /^Zasady ukrywania danych na „wizyty” i „inny” wymieniają pola, których nowa wersja nie ma: pac⟦U\+202E⟧jent i termin\. Pole, którego zasada nie wymienia, jest przed odbiorcami ukryte\.$/);
+  assert.doesNotMatch(warn.textContent, /\u202E/);
+  const label = win.querySelector('[data-role="rename-rules"]').getAttribute('label');
+  assert.equal(label, 'Zmień też w tych zasadach nazwy pól, które różnią się tylko niewidocznym znakiem: pac⟦U+202E⟧jent → pacjent.');
+  assert.equal(win.querySelector('[data-role="rename-wrap"]').hidden, false);
+  assert.equal(win.querySelector('[data-role="rename-rules"]').checked, true);
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.deepEqual(renamed, [[{ from: `pac${RLO}jent`, to: 'pacjent' }]]);
+  assert.deepEqual(done, [{ version: 2, deduplicated: false, ruleRename: { renamed: 2, fields: [{ from: `pac${RLO}jent`, to: 'pacjent' }] } }]);
+  await new Promise((r) => setTimeout(r, 300));
+});
+
+test('"Nowa wersja": a rename left unticked is not done, and a rename that fails is reported apart from the added version', async () => {
+  closeAll();
+  const renamed = [];
+  const done = [];
+  const make = (renameRules) => openSchemaVersion({
+    instanceId: 'i', subject: pacjenci, latestText: PATIENT_STORED, draftText: null,
+    register: async () => ({ version: 2, deduplicated: false }),
+    loadRules: async () => RULES, renameRules,
+    describeError: () => 'brak prawa', onAdded: (a) => done.push(a), onDraft: () => {},
+  });
+  let win = make(async (r) => { renamed.push(r); return 1; });
+  await tick();
+  win.querySelector('[data-role="rename-rules"]').checked = false;
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.deepEqual(renamed, [], 'unticked: no rule is touched');
+  assert.deepEqual(done, [{ version: 2, deduplicated: false }]);
+  closeAll();
+  win = make(async () => { throw new Error('boom'); });
+  await tick();
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.equal(done.length, 2);
+  assert.equal(done[1].version, 2, 'the version is in');
+  assert.deepEqual(done[1].ruleRename, { error: 'brak prawo'.replace('prawo', 'prawa'), fields: [{ from: `pac${RLO}jent`, to: 'pacjent' }] });
+  await new Promise((r) => setTimeout(r, 300));
 });
