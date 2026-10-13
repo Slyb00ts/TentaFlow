@@ -2599,7 +2599,7 @@ test('F4 an HL7 profile and an XSD: added from "Dodaj wzór", spelled out on the
     await win.locator('[data-role="text"] textarea').fill(XSD_V1.replace('<xs:element name="zgloszenie">', '<xs:import namespace="urn:x"/><xs:element name="zgloszenie">'));
     await win.locator('[data-act="save"]').click();
     await expect(win.locator('[data-role="error"]')).toContainText('Ten XSD jest poprawny, ale konstrukcja xs:import nie jest obsługiwana. Wklej wszystkie deklaracje do jednego pliku.', { timeout: 15000 });
-    await expect(win.locator('[data-role="error"] details pre')).toContainText('schema composition is not supported');
+    await expect(win.locator('[data-role="error"] tf-disclosure pre')).toContainText('schema composition is not supported');
     await cancelOut(win);
     await expect(win).toHaveCount(0);
 
@@ -2689,7 +2689,7 @@ test('F4 a Protobuf pattern: the hint names the message, a refused import is tol
     await win.locator('[data-act="save"]').click();
     const error = win.locator('[data-role="error"]');
     await expect(error).toContainText('Wzór Protobuf musi być jednym samodzielnym plikiem: „import” nie jest obsługiwany.', { timeout: 15000 });
-    await expect(error.locator('details pre')).toContainText('import is not supported');
+    await expect(error.locator('tf-disclosure pre')).toContainText('import is not supported');
     await page.screenshot({ path: path.join(SHOTS, 'f4-protobuf-odmowa-import.png') });
     // The refusal belongs to the text that was refused.
     await win.locator('[data-role="text"] textarea').fill(PROTO_V1);
@@ -2739,6 +2739,7 @@ test('F4 a Protobuf pattern: the hint names the message, a refused import is tol
 
 const THRIFT_NAME = `zamowienie-thrift-${RUN}`;
 const THRIFT_TOPIC = `zamowienia-thrift-${RUN}`;
+const THRIFT_COMPACT_NAME = `zamowienie-thrift-zwarty-${RUN}`;
 const THRIFT_V1 = `// tentabus:struct Order
 struct Header { 1: string trace }
 struct Order {
@@ -2764,7 +2765,7 @@ test('F4 a Thrift pattern: the hint names the type, a refused include is told in
     await win.locator('tf-choice-card[value="thrift"]').click();
     await expect(win.locator('[data-role="text"]')).toHaveAttribute('hint', /Wzór Thrift to plik IDL.*bez „include”.*tentabus:struct Order.*to będzie wersja 1\.$/);
     // The long part is behind "Więcej", closed until asked for.
-    const more = win.locator('details[data-role="more"]');
+    const more = win.locator('tf-disclosure[data-role="more"]');
     await expect(more).toBeVisible();
     await expect(more.locator('[data-role="more-text"]')).toBeHidden();
     await more.locator('summary').click();
@@ -2778,7 +2779,7 @@ test('F4 a Thrift pattern: the hint names the type, a refused include is told in
     await win.locator('[data-act="save"]').click();
     const error = win.locator('[data-role="error"]');
     await expect(error).toContainText('Wzór Thrift musi być jednym samodzielnym plikiem: „include” i „cpp_include” nie są obsługiwane.', { timeout: 15000 });
-    await expect(error.locator('details pre')).toContainText('include is not supported');
+    await expect(error.locator('tf-disclosure pre')).toContainText('include is not supported');
     await page.screenshot({ path: path.join(SHOTS, 'f4-thrift-odmowa-include.png') });
     // The refusal belongs to the text that was refused.
     await win.locator('[data-role="text"] textarea').fill(THRIFT_V1);
@@ -2799,6 +2800,7 @@ test('F4 a Thrift pattern: the hint names the type, a refused include is told in
     await expect(fields.nth(2)).toContainText('map<string, i32>');
     await expect(fields.nth(3)).toContainText('opcjonalne');
     await expect(p.locator('[data-role="thrift-fields"]')).not.toContainText('trace');
+    await expect(p.locator('[data-role="thrift-title"]')).toHaveText('Pola typu Order');
     await expect.poll(() => editorText(page)).toContain('struct Order');
     await page.screenshot({ path: path.join(SHOTS, 'f4-thrift-pola.png'), fullPage: true });
 
@@ -2816,7 +2818,7 @@ test('F4 a Thrift pattern: the hint names the type, a refused include is told in
     // A protocol switch is refused in words, in both directions.
     await win.locator('[data-role="text"] textarea').fill(`// tentabus:protocol compact\n${THRIFT_V1}`);
     await win.locator('[data-act="save"]').click();
-    await expect(refusal).toContainText('stary wzór jest zapisany w protokole binary, a nowy w protokole compact', { timeout: 15000 });
+    await expect(refusal).toContainText('stary wzór jest zapisany w protokole binary, nowy w protokole compact', { timeout: 15000 });
     // A new optional field is compatible.
     await win.locator('[data-role="text"] textarea').fill(THRIFT_V1.replace('4: optional string note', '4: optional string note,\n  5: string region'));
     await expect(refusal).toBeHidden();
@@ -2825,6 +2827,24 @@ test('F4 a Thrift pattern: the hint names the type, a refused include is told in
     await expect(p.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Dodano wersję 2');
     await expect(p.locator('[data-role="thrift-fields"] tbody tr')).toHaveCount(5, { timeout: 15000 });
     expect((await busCall(page, 'busSchemaVersionListRequest', { instanceId: instance, subject: THRIFT_NAME })).versions.map((v) => v.version)).toEqual([1, 2]);
+
+    // The other direction: a pattern written in the compact protocol, then a version in the binary one.
+    await openSchemas(page);
+    await schemasSlot(page).locator('[data-go="add"]').first().click();
+    await expect(win.locator('[slot="body"]')).toBeVisible();
+    await win.locator('tf-choice-card[value="thrift"]').click();
+    await win.locator('[data-role="name"] input').fill(THRIFT_COMPACT_NAME);
+    await win.locator('[data-role="text"] textarea').fill(`// tentabus:protocol compact\n${THRIFT_V1}`);
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0, { timeout: 15000 });
+    await schemaRow(page, THRIFT_COMPACT_NAME).locator('td').first().click();
+    await expect(p.locator('.tb-title')).toHaveText(THRIFT_COMPACT_NAME, { timeout: 15000 });
+    await p.locator('[data-role="new-version"]').click();
+    await win.locator('[data-role="text"] textarea').fill(THRIFT_V1);
+    await win.locator('[data-act="save"]').click();
+    await expect(win.locator('[data-role="error"]')).toContainText('stary wzór jest zapisany w protokole compact, nowy w protokole binary', { timeout: 15000 });
+    await cancelOut(win);
+    await expect(win).toHaveCount(0, { timeout: 15000 });
 
     // A binary topic is created in the dashboard and checked with the pattern, end to end.
     await openTopics(page);
@@ -2835,7 +2855,8 @@ test('F4 a Thrift pattern: the hint names the type, a refused include is told in
     await nextButton(page).click();
     await nextButton(page).click();
     const options = await creator(page).locator('#tb-cr-schema select option').allTextContents();
-    expect(options.map(norm)).toEqual([`${THRIFT_NAME} · Thrift`]);
+    expect(options.map(norm)).toEqual([`${THRIFT_NAME} · Thrift`, `${THRIFT_COMPACT_NAME} · Thrift`]);
+    await expect(creator(page).locator('#tb-cr-schema')).toHaveAttribute('hint', /pasujące do treści binarnej: .*Thrift/);
     await nextButton(page).click();
     await expect(creator(page)).toHaveCount(0, { timeout: 15000 });
     await expect(topicRow(page, THRIFT_TOPIC)).toContainText(`Binarna · wzór ${THRIFT_NAME}`, { timeout: 15000 });
@@ -2845,6 +2866,7 @@ test('F4 a Thrift pattern: the hint names the type, a refused include is told in
   } finally {
     await busCall(page, 'busTopicDeleteRequest', { instanceId: instance, name: THRIFT_TOPIC }).catch(() => {});
     await busCall(page, 'busSchemaDeleteRequest', { instanceId: instance, subject: THRIFT_NAME, deprecateOnly: false }).catch(() => {});
+    await busCall(page, 'busSchemaDeleteRequest', { instanceId: instance, subject: THRIFT_COMPACT_NAME, deprecateOnly: false }).catch(() => {});
   }
   expect(errors.filter((e) => !/schema_incompatible|BadRequest|invalid_argument/.test(e)), errors.join('\n')).toEqual([]);
 });
@@ -2887,7 +2909,7 @@ test('F4 refusals in plain words: a profile and an XSD that cannot be added, a s
     const error = win.locator('[data-role="error"]');
     await expect(error).toContainText('„MSH-1” opisuje same znaki podziału wiadomości, więc nie może być wymagane. Usuń „MSH-1” z pól wymaganych.', { timeout: 15000 });
     await expect(error).not.toContainText('nie jest poprawny wzór');
-    await expect(error.locator('details pre')).toContainText("'MSH-1' is the message's own field-separator");
+    await expect(error.locator('tf-disclosure pre')).toContainText("'MSH-1' is the message's own field-separator");
     await page.screenshot({ path: path.join(SHOTS, 'f4-fix-odmowa-msh1.png') });
     // The refusal belongs to the text that was refused.
     await win.locator('[data-role="text"] textarea').fill('{"required_fields": ["PID-3"]}');

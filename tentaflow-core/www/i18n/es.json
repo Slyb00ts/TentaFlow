@@ -10145,7 +10145,9 @@
       "org_mismatch": "Un derecho sobre un topic solo se puede conceder desde su propia organización.",
       "record_not_found": "Esta partición no tiene ningún mensaje con ese número.",
       "field_policy_changed": "La regla cambió mientras tanto, así que no se guardó nada. Actualiza la lista de reglas y vuelve a hacer el cambio.",
-      "schema_kind_mismatch": "El patrón {name} es para contenido {schemaKind}, pero este tópico acepta contenido {topicKind}."
+      "schema_kind_mismatch": "El patrón {name} es para contenido {schemaKind}, pero este tópico acepta contenido {topicKind}.",
+      "stored_schema_unreadable": "El patrón {name}, versión {version}, se guardó con reglas más laxas y el registro ya no puede leerlo, así que el tópico no puede comprobar mensajes con él. Añade una versión corregida del patrón.",
+      "field_policy_binary_topic": "El tópico {topic} lleva mensajes binarios (patrón {name}, {format}). Las reglas para ocultar datos funcionan con JSON, XML y HL7 v2, así que este tópico no puede tener ninguna."
     },
     "shell": {
       "instance": "Instancia",
@@ -10190,6 +10192,26 @@
         "hl7v2": "HL7 v2",
         "binary": "Binario"
       },
+      "content_gen": {
+        "json": "JSON",
+        "xml": "XML",
+        "hl7v2": "HL7 v2",
+        "binary": "binario"
+      },
+      "content_acc": {
+        "json": "JSON",
+        "xml": "XML",
+        "hl7v2": "HL7 v2",
+        "binary": "binario"
+      },
+      "path": {
+        "each": "cada elemento",
+        "key": "clave",
+        "value": "valor",
+        "unknown": "un campo fuera del patrón"
+      },
+      "payload_binary": "Contenido binario, {count} {n|byte|bytes}",
+      "payload_cut": "Se muestran los primeros {shown} de {count} {n|byte|bytes}.",
       "days": "{count} {n|día|días|días}",
       "today": "hoy {time}",
       "yesterday": "ayer {time}",
@@ -10354,7 +10376,7 @@
         "text_hint_avro": "Un patrón Avro es un esquema escrito como JSON, p. ej. {example}. Comprueba un solo mensaje escrito en la codificación binaria de Avro, sin cabecera de archivo Avro ni cabecera de Confluent. También puedes cargar un archivo. El patrón se comprueba al añadirlo; será la versión {version}.",
         "text_hint_protobuf": "Un patrón Protobuf es un archivo .proto (proto3 o proto2) escrito de una pieza, sin «import». Describe un mensaje: el primero del archivo o el que nombre un comentario como «// tentabus:message Order». Ejemplo: {example}. Comprueba un solo mensaje escrito en la codificación binaria de Protobuf. También puedes cargar un archivo. El patrón se comprueba al añadirlo; será la versión {version}. La validación es estricta: un int32 negativo debe usar la codificación completa de 10 bytes (la de 5 bytes se rechaza), uint32 y sint32 no pueden superar 2^32−1, bool solo es 0 o 1, y los números de campo 19000–19999 se rechazan aunque el patrón no los declare.",
         "text_hint_thrift": "Un patrón Thrift es un archivo IDL escrito de una sola pieza, sin «include». Describe un tipo: el primer struct, union o exception del archivo, o el que indique un comentario como «// tentabus:struct Order». Ejemplo: {example}. El patrón se comprueba al añadirlo; será la versión {version}.",
-        "text_more_thrift": "Comprueba un único objeto escrito en la codificación binaria de Thrift (TBinaryProtocol), o en la compacta (TCompactProtocol) cuando el archivo contiene el comentario «// tentabus:protocol compact» — sin cabecera de mensaje ni entramado. Se admiten struct, union, exception, enum, typedef, namespace, list, set y map, constantes y valores por defecto (se leen, pero no afectan a la comprobación). No se admiten include ni service. También puedes cargar un archivo. La validación es estricta: cada campo necesita su número («1: string name»), un valor de enum debe ser uno de los declarados, un string debe ser UTF-8 y una union lleva como máximo un miembro.",
+        "text_more_thrift": "Comprueba un único objeto escrito en la codificación binaria de Thrift (TBinaryProtocol), o en la compacta (TCompactProtocol) cuando el archivo contiene el comentario «// tentabus:protocol compact» — sin cabecera de mensaje ni entramado. Se admiten struct, union, exception, enum, typedef, namespace, list, set y map, constantes y valores por defecto (se leen, pero no afectan a la comprobación). No se admiten include ni service. La validación es estricta: cada campo necesita su número («1: string name»), un valor de enum debe ser uno de los declarados, un string debe ser UTF-8 y una union lleva como máximo un miembro.",
         "more": "Más"
       },
       "version": {
@@ -10546,7 +10568,7 @@
         "protobuf_optional": "opcional",
         "protobuf_repeated": "repetido",
         "protobuf_oneof": "uno de: {name}",
-        "thrift_fields": "Campos del tipo",
+        "thrift_fields": "Campos de {name}",
         "thrift_id": "Número",
         "thrift_type": "Tipo",
         "thrift_presence": "Presencia",
@@ -10617,7 +10639,7 @@
         "avro_default": "El valor por defecto de un campo no encaja con la primera rama de su unión. En una unión de Avro el valor por defecto debe ser del tipo de la primera rama (por ejemplo null si null va primero).",
         "avro_default_type": "El valor por defecto de un campo no encaja con el tipo de ese campo. Debe escribirse como un valor de ese tipo (por ejemplo un número para int, texto para string, uno de los símbolos para un enum).",
         "avro_limit_text": "Una descripción (doc) o un atributo propio supera los {limit} bytes. Acorta el texto.",
-        "proto_invalid": "Protobuf no aceptó este archivo: revisa la sintaxis (puntos y coma, llaves), los nombres de tipo y que cada tipo usado esté definido en el mismo archivo. Los detalles están abajo.",
+        "proto_invalid": "Protobuf no aceptó este archivo: revisa la sintaxis (puntos y coma, llaves), los nombres de tipo y que cada tipo usado esté definido en el mismo archivo. {atLine} Los detalles están abajo.",
         "proto_import": "Un patrón Protobuf debe ser un único archivo autónomo: «import» no está admitido. Pega los mensajes que necesites en el mismo archivo.",
         "proto_unsupported": "Este patrón contiene un elemento que el registro no admite: {what}. Para comprobar mensajes bastan los mensajes (message), los enums, oneof y los mapas.",
         "proto_what_service": "service (servicios)",
@@ -10652,7 +10674,7 @@
         "proto_limit_name": "Un nombre supera los {limit} caracteres.",
         "proto_limit_parts": "Un nombre tiene más de {limit} partes separadas por puntos.",
         "proto_lexical": "El patrón tiene un comentario, un texto entre comillas o una llave sin cerrar, o un carácter que un archivo .proto no puede contener.",
-        "thrift_invalid": "El registro no aceptó este archivo: revisa la sintaxis (dos puntos, paréntesis, comas) y los nombres de tipo. Los detalles están abajo.",
+        "thrift_invalid": "El registro no aceptó este archivo: revisa la sintaxis (dos puntos, paréntesis, comas) y los nombres de tipo. {atLine} Los detalles están abajo.",
         "thrift_include": "Un patrón Thrift debe ser un único archivo autónomo: «include» y «cpp_include» no están admitidos. Pega los tipos que necesites en el mismo archivo.",
         "thrift_unsupported": "Este patrón contiene un elemento que el registro no admite: {what}. Para comprobar objetos bastan struct, union, exception, enum y typedef.",
         "thrift_what_service": "service (servicios)",
@@ -10668,7 +10690,7 @@
         "thrift_duplicate_field": "Dos campos de un mismo tipo tienen el mismo nombre. Dales nombres distintos.",
         "thrift_duplicate_value": "Dos valores de un mismo enum tienen el mismo nombre. Dales nombres distintos.",
         "thrift_dotted_name": "Un nombre que introduce una declaración no puede contener un punto. Los puntos son solo para referencias a otros archivos, que no están admitidas.",
-        "previous_unreadable": "La nueva versión no se comparó: la versión anterior {version} se guardó con reglas más laxas y ya no supera la comprobación del registro, así que no se pudo comprobar. Añade el texto corregido como un patrón nuevo o pon la compatibilidad en «none» para esta versión.",
+        "previous_unreadable": "La nueva versión no se comparó: la versión anterior {version} se guardó con reglas más laxas y ya no supera la comprobación del registro, así que no se pudo comprobar. Cambia la compatibilidad de todo el patrón a «none», añade esta versión y restablece la compatibilidad, o añade el texto corregido como un patrón nuevo.",
         "thrift_type_missing": "El patrón usa un tipo que no está definido en él. Define cada tipo en el mismo archivo.",
         "thrift_typedef": "Un typedef se refiere a sí mismo, o una cadena de typedefs es demasiado larga. Rompe el ciclo o acorta la cadena.",
         "thrift_no_value": "Este patrón no tiene ningún valor válido: el primer tipo se exige a sí mismo (o a un enum sin valores). Haz opcional uno de esos campos.",
@@ -11385,6 +11407,8 @@
         "k_rejected": "Rechazado",
         "k_when": "Cuándo",
         "k_body": "Contenido del mensaje",
+        "k_state": "Estado",
+        "state_at_write": "Mensaje rechazado al escribir: no llegó al tópico",
         "no_consumer": "ninguno — el mensaje se comprobó al escribirse",
         "body_empty": "(vacío)",
         "truncated": "se muestra el comienzo del contenido",

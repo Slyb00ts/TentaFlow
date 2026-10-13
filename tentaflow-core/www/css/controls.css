@@ -3436,6 +3436,26 @@ a.tf-breadcrumb-item:hover {
 }
 
 /* =============================================================================
+   tf-disclosure
+   ============================================================================= */
+
+tf-disclosure { display: block; }
+tf-disclosure[hidden] { display: none; }
+
+.tf-disclosure__summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--tf-text-2);
+}
+
+.tf-disclosure__body {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--tf-text-2);
+}
+
+/* =============================================================================
    tf-empty-state
    ============================================================================= */
 

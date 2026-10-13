@@ -11380,7 +11380,9 @@
       "org_mismatch": "Prawo do topiku można nadać tylko z jego własnej organizacji.",
       "record_not_found": "W tej partycji nie ma wiadomości o tym numerze.",
       "field_policy_changed": "Zasada zmieniła się w międzyczasie, więc nic nie zapisano. Odśwież listę zasad i wprowadź zmianę jeszcze raz.",
-      "schema_kind_mismatch": "Wzór {name} jest dla treści {schemaKind}, a ten topik przyjmuje treść {topicKind}."
+      "schema_kind_mismatch": "Wzór {name} jest dla treści {schemaKind}, a ten topik przyjmuje treść {topicKind}.",
+      "stored_schema_unreadable": "Wzór {name} w wersji {version} został zapisany według luźniejszych zasad i rejestr nie może go już odczytać, więc topik nie sprawdzi nim wiadomości. Dodaj poprawioną wersję wzoru.",
+      "field_policy_binary_topic": "Topik {topic} przyjmuje wiadomości binarne (wzór {name}, {format}). Zasady ukrywania danych działają na JSON, XML i HL7 v2, więc na takim topiku ich nie ma."
     },
     "shell": {
       "instance": "Instancja",
@@ -11425,6 +11427,26 @@
         "hl7v2": "HL7 v2",
         "binary": "Binarna"
       },
+      "content_gen": {
+        "json": "JSON",
+        "xml": "XML",
+        "hl7v2": "HL7 v2",
+        "binary": "binarnej"
+      },
+      "content_acc": {
+        "json": "JSON",
+        "xml": "XML",
+        "hl7v2": "HL7 v2",
+        "binary": "binarną"
+      },
+      "path": {
+        "each": "każdy element",
+        "key": "klucz",
+        "value": "wartość",
+        "unknown": "pole spoza wzoru"
+      },
+      "payload_binary": "Treść binarna, {count} {n|bajt|bajty|bajtów}",
+      "payload_cut": "Pokazano pierwsze {shown} z {count} {n|bajtu|bajtów|bajtów}.",
       "days": "{count} {n|dzień|dni|dni}",
       "today": "dziś {time}",
       "yesterday": "wczoraj {time}",
@@ -11589,7 +11611,7 @@
         "text_hint_avro": "Wzór Avro to schemat zapisany jako JSON, np. {example}. Sprawdza on pojedynczą wiadomość zapisaną binarnie w formacie Avro — bez nagłówka pliku Avro i bez nagłówka Confluent. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja {version}.",
         "text_hint_protobuf": "Wzór Protobuf to plik .proto (proto3 albo proto2) w jednym kawałku, bez „import”. Opisuje jedną wiadomość: pierwszą z pliku albo tę, którą wskaże komentarz, np. „// tentabus:message Order”. Przykład: {example}. Sprawdza pojedynczą wiadomość zapisaną binarnie w formacie Protobuf. Możesz też wczytać plik. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja {version}. Walidacja jest ścisła: ujemny int32 musi mieć pełny zapis na 10 bajtach (zapis 5-bajtowy jest odrzucany), uint32 i sint32 nie mogą przekraczać 2^32−1, bool to tylko 0 albo 1, a numery pól 19000–19999 są odrzucane, także gdy wzór ich nie zna.",
         "text_hint_thrift": "Wzór Thrift to plik IDL w jednym kawałku, bez „include”. Opisuje jeden typ: pierwszy struct, union albo exception z pliku, albo ten, który wskaże komentarz, np. „// tentabus:struct Order”. Przykład: {example}. Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja {version}.",
-        "text_more_thrift": "Sprawdza pojedynczy obiekt zapisany binarnie w formacie Thrift (TBinaryProtocol) albo w zwartym (TCompactProtocol), gdy plik zawiera komentarz „// tentabus:protocol compact” — bez nagłówka wiadomości i ramkowania. Przyjmowane są: struct, union, exception, enum, typedef, namespace, list, set i map, stałe oraz wartości domyślne (są czytane, ale nie wpływają na sprawdzanie). Nieobsługiwane: include i service. Możesz też wczytać plik. Walidacja jest ścisła: każde pole musi mieć numer („1: string name”), wartość typu wyliczeniowego musi być jedną z zadeklarowanych, string musi być UTF-8, a union niesie najwyżej jednego członka.",
+        "text_more_thrift": "Sprawdza pojedynczy obiekt zapisany binarnie w formacie Thrift (TBinaryProtocol) albo w zwartym (TCompactProtocol), gdy plik zawiera komentarz „// tentabus:protocol compact” — bez nagłówka wiadomości i ramkowania. Przyjmowane są: struct, union, exception, enum, typedef, namespace, list, set i map, stałe oraz wartości domyślne (są czytane, ale nie wpływają na sprawdzanie). Nieobsługiwane: include i service. Walidacja jest ścisła: każde pole musi mieć numer („1: string name”), wartość typu wyliczeniowego musi być jedną z zadeklarowanych, string musi być UTF-8, a union niesie najwyżej jednego członka.",
         "more": "Więcej"
       },
       "version": {
@@ -11669,7 +11691,7 @@
         "proto_enum_open": "typ wyliczeniowy „{name}” przyjmuje dowolny numer, a druga wersja ma typ zamknięty (proto2), który zna tylko swoje wartości",
         "proto_oneof": "pola „{first}” i „{second}” trafiłyby do jednego oneof „{oneof}”, a druga wersja potrafi zapisać oba naraz — oneof zachowuje tylko jedno z nich i dane drugiego przepadłyby",
         "proto_reserved": "numer pola {number} był zastrzeżony („reserved”) w poprzedniej wersji i nie może zostać użyty ponownie",
-        "thrift_protocol": "stary wzór jest zapisany w protokole {from}, a nowy w protokole {to} — dane zapisane jednym nie da się odczytać drugim",
+        "thrift_protocol": "stary wzór jest zapisany w protokole {from}, nowy w protokole {to} — danych zapisanych jednym nie da się odczytać drugim",
         "thrift_protocol_fix": "Zostaw protokół poprzedniej wersji (komentarz „// tentabus:protocol”) albo dodaj zmieniony wzór pod nową nazwą."
       },
       "compat_window": {
@@ -11781,13 +11803,13 @@
         "protobuf_optional": "opcjonalne",
         "protobuf_repeated": "powtarzane",
         "protobuf_oneof": "jedno z: {name}",
-        "thrift_fields": "Pola typu",
+        "thrift_fields": "Pola typu {name}",
         "thrift_id": "Numer",
         "thrift_type": "Typ",
         "thrift_presence": "Obecność",
         "thrift_required": "wymagane",
         "thrift_optional": "opcjonalne",
-        "thrift_default": "zwykłe (może nie być)"
+        "thrift_default": "zwykłe (może go nie być)"
       },
       "added_existing_title": "Wzór {name} już istniał",
       "added_existing_version": "Ktoś dodał go w międzyczasie, więc tekst trafił do niego jako wersja {version}.",
@@ -11852,7 +11874,7 @@
         "avro_default": "Wartość domyślna pola nie pasuje do pierwszego wariantu jego unii. W unii Avro wartość domyślna musi być typu pierwszego wariantu (np. null, gdy null jest pierwszy).",
         "avro_default_type": "Wartość domyślna pola nie pasuje do typu tego pola. Wartość domyślna musi być zapisana tak, jak wartość tego typu (np. liczba dla int, tekst dla string, jeden z symboli dla typu wyliczeniowego).",
         "avro_limit_text": "Opis (doc) albo własny atrybut ma więcej niż {limit} bajtów. Skróć tekst.",
-        "proto_invalid": "Protobuf nie przyjął tego pliku: sprawdź składnię (średniki, nawiasy), nazwy typów i to, czy każdy użyty typ jest zdefiniowany w tym samym pliku. Szczegóły są niżej.",
+        "proto_invalid": "Protobuf nie przyjął tego pliku: sprawdź składnię (średniki, nawiasy), nazwy typów i to, czy każdy użyty typ jest zdefiniowany w tym samym pliku. {atLine} Szczegóły są niżej.",
         "proto_import": "Wzór Protobuf musi być jednym samodzielnym plikiem: „import” nie jest obsługiwany. Wklej potrzebne komunikaty do tego samego pliku.",
         "proto_unsupported": "Ten wzór zawiera element, którego rejestr nie obsługuje: {what}. Do sprawdzania wiadomości wystarczą komunikaty (message), typy wyliczeniowe (enum), oneof i mapy.",
         "proto_what_service": "service (usługi)",
@@ -11887,7 +11909,7 @@
         "proto_limit_name": "Nazwa jest dłuższa niż {limit} znaków.",
         "proto_limit_parts": "Nazwa ma więcej niż {limit} członów oddzielonych kropką.",
         "proto_lexical": "Wzór ma niedomknięty komentarz, tekst w cudzysłowie lub nawias albo znak, którego plik .proto nie może zawierać.",
-        "thrift_invalid": "Rejestr nie przyjął tego pliku: sprawdź składnię (dwukropki, nawiasy, przecinki) i nazwy typów. Szczegóły są niżej.",
+        "thrift_invalid": "Rejestr nie przyjął tego pliku: sprawdź składnię (dwukropki, nawiasy, przecinki) i nazwy typów. {atLine} Szczegóły są niżej.",
         "thrift_include": "Wzór Thrift musi być jednym samodzielnym plikiem: „include” i „cpp_include” nie są obsługiwane. Wklej potrzebne typy do tego samego pliku.",
         "thrift_unsupported": "Ten wzór zawiera element, którego rejestr nie obsługuje: {what}. Do sprawdzania obiektów wystarczą struct, union, exception, enum i typedef.",
         "thrift_what_service": "service (usługi)",
@@ -11903,7 +11925,7 @@
         "thrift_duplicate_field": "Dwa pola tego samego typu mają tę samą nazwę. Nadaj im różne nazwy.",
         "thrift_duplicate_value": "Dwie wartości tego samego typu wyliczeniowego mają tę samą nazwę. Nadaj im różne nazwy.",
         "thrift_dotted_name": "Nazwa wprowadzana przez deklarację nie może zawierać kropki. Kropka służy do odwołań do innych plików, a te nie są obsługiwane.",
-        "previous_unreadable": "Nowa wersja nie została porównana: poprzednia wersja {version} została zapisana według luźniejszych zasad i nie przechodzi już sprawdzenia rejestru, więc nie dało się jej sprawdzić. Dodaj poprawiony tekst jako nowy wzór albo ustaw dla tej wersji zgodność „brak”.",
+        "previous_unreadable": "Nowa wersja nie została porównana: poprzednia wersja {version} została zapisana według luźniejszych zasad i nie przechodzi już sprawdzenia rejestru, więc nie dało się jej sprawdzić. Zmień zgodność całego wzoru na „brak”, dodaj tę wersję i przywróć zgodność, albo dodaj poprawiony tekst jako nowy wzór.",
         "thrift_type_missing": "Wzór używa typu, którego w nim nie ma. Zdefiniuj każdy typ w tym samym pliku.",
         "thrift_typedef": "Typedef odwołuje się do samego siebie albo łańcuch typedefów jest za długi. Przerwij cykl lub skróć łańcuch.",
         "thrift_no_value": "Ten wzór nie ma żadnej poprawnej wartości: pierwszy typ wymaga samego siebie (albo typu wyliczeniowego bez wartości). Zrób jedno z tych pól opcjonalnym.",
@@ -12620,6 +12642,8 @@
         "k_rejected": "Odrzucona",
         "k_when": "Kiedy",
         "k_body": "Treść wiadomości",
+        "k_state": "Stan",
+        "state_at_write": "Wiadomość odrzucona przy zapisie — nie trafiła do topiku",
         "no_consumer": "żaden — wiadomość sprawdzono przy zapisie",
         "body_empty": "(pusta)",
         "truncated": "pokazano początek treści",

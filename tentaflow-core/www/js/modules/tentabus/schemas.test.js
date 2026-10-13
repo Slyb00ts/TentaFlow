@@ -13,7 +13,7 @@ import './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { filterSchemas, schemaState, schemaFormatLabel, drawSchemas, deleteBlocker, schemaKind, schemaKindMismatchText } = await import('./schemas.js');
+const { filterSchemas, schemaState, schemaFormatLabel, drawSchemas, deleteBlocker, schemaKind, schemaKindMismatchText, busRefusalText } = await import('./schemas.js');
 
 const subjects = [
   { subject: 'wizyta', schemaType: 'json_schema', compatibility: 'backward', latestVersion: 5, deprecatedAtMs: null, usedByTopics: ['wizyty'] },
@@ -129,4 +129,20 @@ test('binding a pattern to a topic of another payload kind is refused in plain w
   );
   assert.equal(schemaKindMismatchText('bus.invalid_topic_config: partitions must be 1-256, got 999'), '');
   assert.equal(schemaKindMismatchText(undefined), '');
+});
+
+test('the stable server sentences about a stored pattern and a rule on a binary topic are put in plain words', () => {
+  assert.match(
+    busRefusalText("protocol error BadRequest: bus.invalid_argument: subject 'zamowienie' v3: the stored schema cannot be compiled under the current rules of its format; register a corrected version: invalid schema: field 'a' of struct 'X' has no explicit id (line 1)"),
+    /^Wzór zamowienie w wersji 3 został zapisany według luźniejszych zasad i rejestr nie może go już odczytać, więc topik nie sprawdzi nim wiadomości\. Dodaj poprawioną wersję wzoru\.$/,
+  );
+  assert.equal(
+    busRefusalText("bus.invalid_argument: field policies cannot apply to a topic whose messages are binary: topic 'zamowienia' is checked with the thrift pattern 'zamowienie'"),
+    'Topik zamowienia przyjmuje wiadomości binarne (wzór zamowienie, Thrift). Zasady ukrywania danych działają na JSON, XML i HL7 v2, więc na takim topiku ich nie ma.',
+  );
+  assert.equal(busRefusalText('bus.invalid_argument: something else'), '');
+  assert.equal(
+    schemaKindMismatchText("bus.invalid_topic_config: schema subject 'wynik' is thrift but this topic's content_type resolves to xml"),
+    'Wzór wynik jest dla treści binarnej, a ten topik przyjmuje treść XML.',
+  );
 });

@@ -55,7 +55,21 @@ export function schemaKindMismatchText(message) {
   const m = /schema subject '([^']*)' is (\w+) but this topic's content_type resolves to (\w+)/.exec(String(message || ''));
   const kind = m ? schemaKind(m[2]) : '';
   if (!kind) return '';
-  return T('errors.schema_kind_mismatch', { name: m[1], schemaKind: T(`fmt.content.${kind}`), topicKind: T(`fmt.content.${m[3]}`) });
+  return T('errors.schema_kind_mismatch', { name: m[1], schemaKind: T(`fmt.content_gen.${kind}`), topicKind: T(`fmt.content_acc.${m[3]}`) });
+}
+
+/**
+ * Refusals the server words with a stable sentence (`bus/mod.rs`
+ * `STORED_SCHEMA_UNREADABLE`, `field_policies.rs` `BINARY_TOPIC_NO_POLICY`),
+ * in plain words; `''` for any other message.
+ */
+export function busRefusalText(message) {
+  const text = String(message || '');
+  const stored = /subject '([^']*)' v(\d+): the stored schema cannot be compiled under the current rules of its format; register a corrected version/.exec(text);
+  if (stored) return T('errors.stored_schema_unreadable', { name: stored[1], version: stored[2] });
+  const binary = /field policies cannot apply to a topic whose messages are binary: topic '([^']*)' is checked with the (\w+) pattern '([^']*)'/.exec(text);
+  if (binary) return T('errors.field_policy_binary_topic', { topic: binary[1], format: schemaFormatLabel(binary[2]), name: binary[3] });
+  return '';
 }
 
 const isDeprecated = (s) => s.deprecatedAtMs != null;

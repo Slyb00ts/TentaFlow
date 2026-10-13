@@ -10,6 +10,7 @@
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { T, fmtCount, fmtBytes, fmtWhen } from '/js/modules/tentabus/format.js';
 import { bytesToPreviewText, headerText, parseBlobRefJson } from '/js/modules/tentabus/payload.js';
+import { payloadHtml } from '/js/modules/tentabus/payload-view.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
@@ -157,7 +158,7 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
         <div class="tb-preview-record-head"><span>${escapeHtml(title)}</span>${chips}</div>
         ${blob
           ? `<div class="tb-kv-grid"><div class="k">${escapeHtml(T('topics.preview.blob_title'))}</div><div class="v">${escapeHtml(T('topics.preview.blob_text', { size: fmtBytes(blob.size_bytes), mime: blob.mime }))}</div></div>`
-          : `<pre class="tb-payload">${escapeHtml(bytesToPreviewText(r.payloadPreview, PAYLOAD_PREVIEW_BYTES)) || escapeHtml(T('topics.preview.payload_empty'))}</pre>`}
+          : payloadHtml(r.payloadPreview, { textBytes: PAYLOAD_PREVIEW_BYTES, emptyText: T('topics.preview.payload_empty') })}
       </div>`;
   };
 

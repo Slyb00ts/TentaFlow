@@ -52,3 +52,38 @@ export function parseBlobRefJson(bytes) {
   }
   return null;
 }
+
+/**
+ * Whether the bytes are something other than text a person can read: not
+ * valid UTF-8, or text holding control characters (a Thrift or Protobuf
+ * message that happens to be valid UTF-8 still is not text).
+ */
+export function isBinaryPayload(bytes) {
+  if (!bytes || bytes.length === 0) return false;
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let text;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(arr);
+  } catch {
+    return true;
+  }
+  // eslint-disable-next-line no-control-regex
+  return /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text);
+}
+
+/** A hex view of the first `maxBytes` bytes: rows of 16 as `{ offset, hex, ascii }` (offset in hex, `.` for a byte that is not printable ASCII). */
+export function hexRows(bytes, maxBytes = 512) {
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  const slice = arr.subarray(0, maxBytes);
+  const rows = [];
+  for (let at = 0; at < slice.length; at += 16) {
+    const chunk = slice.subarray(at, at + 16);
+    const hex = Array.from(chunk, (b) => b.toString(16).padStart(2, '0'));
+    rows.push({
+      offset: at.toString(16).padStart(4, '0'),
+      hex: `${hex.slice(0, 8).join(' ')}  ${hex.slice(8).join(' ')}`.trimEnd(),
+      ascii: Array.from(chunk, (b) => (b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : '.')).join(''),
+    });
+  }
+  return rows;
+}

@@ -361,3 +361,18 @@ test('patterns that could not be read are said to be missing, not absent, and ca
   await tick();
   assert.equal(sent[0].options.schemaId, 'ankieta');
 });
+
+test('a binary topic: the card says what it is for, and the pattern list names the kind in the right form', () => {
+  const { win } = open({
+    capabilities: { contentTypes: [...CONTENT, 'application/octet-stream'], schemaTypes: ['json_schema', 'protobuf', 'thrift'], defaultReplicationFactor: 1, nodeCount: 1 },
+    subjects: [...subjects, { subject: 'zamowienie', schemaType: 'thrift', latestVersion: 2, deprecatedAtMs: null }],
+  });
+  const card = win.querySelector('#tb-cr-kind tf-choice-card[value="application/octet-stream"]');
+  assert.equal(card.getAttribute('heading'), 'Binarna');
+  assert.equal(card.getAttribute('description'), 'Wiadomości Avro, Protobuf lub Thrift w zapisie binarnym');
+  typeName(win, 'zamowienia');
+  win.querySelector('#tb-cr-kind').dispatchEvent(new CustomEvent('change', { detail: { value: 'application/octet-stream' } }));
+  nextBtn(win).click();
+  nextBtn(win).click();
+  assert.equal(win.querySelector('#tb-cr-schema').getAttribute('hint'), 'Na liście są tylko wzory pasujące do treści binarnej: Avro, Protobuf, Thrift.');
+});

@@ -10145,7 +10145,9 @@
       "org_mismatch": "Un droit sur un topic ne peut être accordé que depuis sa propre organisation.",
       "record_not_found": "Cette partition n'a aucun message portant ce numéro.",
       "field_policy_changed": "La règle a changé entre-temps, donc rien n’a été enregistré. Actualisez la liste des règles et refaites la modification.",
-      "schema_kind_mismatch": "Le modèle {name} est destiné à un contenu {schemaKind}, mais ce topic accepte un contenu {topicKind}."
+      "schema_kind_mismatch": "Le modèle {name} est destiné à un contenu {schemaKind}, mais ce topic accepte un contenu {topicKind}.",
+      "stored_schema_unreadable": "Le modèle {name}, version {version}, a été enregistré selon des règles plus souples et le registre ne peut plus le lire ; le topic ne peut donc plus vérifier de messages avec lui. Ajoutez une version corrigée du modèle.",
+      "field_policy_binary_topic": "Le topic {topic} contient des messages binaires (modèle {name}, {format}). Les règles de masquage fonctionnent sur JSON, XML et HL7 v2 ; ce topic ne peut donc pas en avoir."
     },
     "shell": {
       "instance": "Instance",
@@ -10190,6 +10192,26 @@
         "hl7v2": "HL7 v2",
         "binary": "Binaire"
       },
+      "content_gen": {
+        "json": "JSON",
+        "xml": "XML",
+        "hl7v2": "HL7 v2",
+        "binary": "binaire"
+      },
+      "content_acc": {
+        "json": "JSON",
+        "xml": "XML",
+        "hl7v2": "HL7 v2",
+        "binary": "binaire"
+      },
+      "path": {
+        "each": "chaque élément",
+        "key": "clé",
+        "value": "valeur",
+        "unknown": "un champ hors du modèle"
+      },
+      "payload_binary": "Contenu binaire, {count} {n|octet|octets}",
+      "payload_cut": "Les {shown} premiers sur {count} {n|octet|octets} sont affichés.",
       "days": "{count} {n|jour|jours|jours}",
       "today": "aujourd’hui {time}",
       "yesterday": "hier {time}",
@@ -10354,7 +10376,7 @@
         "text_hint_avro": "Un modèle Avro est un schéma écrit en JSON, p. ex. {example}. Il vérifie un seul message écrit dans l’encodage binaire Avro, sans en-tête de fichier Avro ni en-tête Confluent. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version {version}.",
         "text_hint_protobuf": "Un modèle Protobuf est un fichier .proto (proto3 ou proto2) écrit d’un seul tenant, sans « import ». Il décrit un message : le premier du fichier ou celui que nomme un commentaire comme « // tentabus:message Order ». Exemple : {example}. Il vérifie un seul message écrit dans l’encodage binaire Protobuf. Vous pouvez aussi charger un fichier. Le modèle est vérifié à l’ajout ; ce sera la version {version}. La validation est stricte : un int32 négatif doit utiliser l’encodage complet sur 10 octets (la forme sur 5 octets est refusée), uint32 et sint32 ne peuvent pas dépasser 2^32−1, bool vaut seulement 0 ou 1, et les numéros de champ 19000–19999 sont refusés même si le modèle ne les déclare pas.",
         "text_hint_thrift": "Un modèle Thrift est un fichier IDL d’un seul tenant, sans « include ». Il décrit un type : le premier struct, union ou exception du fichier, ou celui que désigne un commentaire tel que « // tentabus:struct Order ». Exemple : {example}. Le modèle est vérifié à l’ajout ; ce sera la version {version}.",
-        "text_more_thrift": "Il vérifie un seul objet écrit dans l’encodage binaire de Thrift (TBinaryProtocol), ou dans l’encodage compact (TCompactProtocol) lorsque le fichier contient le commentaire « // tentabus:protocol compact » — sans en-tête de message ni découpage en trames. Sont acceptés : struct, union, exception, enum, typedef, namespace, list, set et map, constantes et valeurs par défaut (elles sont lues mais n’influencent pas la vérification). Non pris en charge : include et service. Vous pouvez aussi charger un fichier. La validation est stricte : chaque champ a besoin de son numéro (« 1: string name »), une valeur d’enum doit être l’une des valeurs déclarées, un string doit être en UTF-8 et une union porte au plus un membre.",
+        "text_more_thrift": "Il vérifie un seul objet écrit dans l’encodage binaire de Thrift (TBinaryProtocol), ou dans l’encodage compact (TCompactProtocol) lorsque le fichier contient le commentaire « // tentabus:protocol compact » — sans en-tête de message ni découpage en trames. Sont acceptés : struct, union, exception, enum, typedef, namespace, list, set et map, constantes et valeurs par défaut (elles sont lues mais n’influencent pas la vérification). Non pris en charge : include et service. La validation est stricte : chaque champ a besoin de son numéro (« 1: string name »), une valeur d’enum doit être l’une des valeurs déclarées, un string doit être en UTF-8 et une union porte au plus un membre.",
         "more": "Plus"
       },
       "version": {
@@ -10434,7 +10456,7 @@
         "proto_enum_open": "l’enum « {name} » accepte n’importe quel nombre, mais l’autre version a un enum fermé (proto2) qui ne connaît que ses propres valeurs",
         "proto_oneof": "les champs « {first} » et « {second} » partageraient le oneof « {oneof} », mais l’autre version peut écrire les deux à la fois : un oneof n’en garde qu’un seul et les données de l’autre seraient perdues",
         "proto_reserved": "le numéro de champ {number} était réservé (« reserved ») dans la version précédente et ne peut pas être réutilisé",
-        "thrift_protocol": "l’ancien modèle est écrit dans le protocole {from} et le nouveau dans le protocole {to} — les données écrites dans l’un ne peuvent pas être lues dans l’autre",
+        "thrift_protocol": "l’ancien modèle est écrit dans le protocole {from}, le nouveau dans le protocole {to} — les données écrites dans l’un ne peuvent pas être lues dans l’autre",
         "thrift_protocol_fix": "Gardez le protocole de la version précédente (le commentaire « // tentabus:protocol ») ou ajoutez le modèle modifié sous un autre nom."
       },
       "compat_window": {
@@ -10546,7 +10568,7 @@
         "protobuf_optional": "facultatif",
         "protobuf_repeated": "répété",
         "protobuf_oneof": "un parmi : {name}",
-        "thrift_fields": "Champs du type",
+        "thrift_fields": "Champs de {name}",
         "thrift_id": "Numéro",
         "thrift_type": "Type",
         "thrift_presence": "Présence",
@@ -10617,7 +10639,7 @@
         "avro_default": "La valeur par défaut d’un champ ne correspond pas à la première branche de son union. Dans une union Avro, la valeur par défaut doit être du type de la première branche (par exemple null si null vient en premier).",
         "avro_default_type": "La valeur par défaut d’un champ ne correspond pas au type de ce champ. Elle doit être écrite comme une valeur de ce type (par exemple un nombre pour int, du texte pour string, l’un des symboles pour un enum).",
         "avro_limit_text": "Une description (doc) ou un attribut personnalisé dépasse {limit} octets. Raccourcis le texte.",
-        "proto_invalid": "Protobuf n’a pas accepté ce fichier : vérifiez la syntaxe (points-virgules, accolades), les noms de types et que chaque type utilisé est défini dans le même fichier. Les détails sont plus bas.",
+        "proto_invalid": "Protobuf n’a pas accepté ce fichier : vérifiez la syntaxe (points-virgules, accolades), les noms de types et que chaque type utilisé est défini dans le même fichier. {atLine} Les détails sont plus bas.",
         "proto_import": "Un modèle Protobuf doit être un seul fichier autonome : « import » n’est pas pris en charge. Collez les messages nécessaires dans le même fichier.",
         "proto_unsupported": "Ce modèle contient un élément que le registre ne prend pas en charge : {what}. Les messages (message), les enums, oneof et les maps suffisent pour vérifier des messages.",
         "proto_what_service": "service (services)",
@@ -10652,7 +10674,7 @@
         "proto_limit_name": "Un nom dépasse {limit} caractères.",
         "proto_limit_parts": "Un nom compte plus de {limit} parties séparées par des points.",
         "proto_lexical": "Le modèle a un commentaire, un texte entre guillemets ou une accolade non fermés, ou un caractère qu’un fichier .proto ne peut pas contenir.",
-        "thrift_invalid": "Le registre n’a pas accepté ce fichier : vérifiez la syntaxe (deux-points, crochets, virgules) et les noms de types. Les détails sont ci-dessous.",
+        "thrift_invalid": "Le registre n’a pas accepté ce fichier : vérifiez la syntaxe (deux-points, crochets, virgules) et les noms de types. {atLine} Les détails sont ci-dessous.",
         "thrift_include": "Un modèle Thrift doit être un seul fichier autonome : « include » et « cpp_include » ne sont pas pris en charge. Collez les types nécessaires dans le même fichier.",
         "thrift_unsupported": "Ce modèle contient un élément que le registre ne prend pas en charge : {what}. Pour vérifier des objets, struct, union, exception, enum et typedef suffisent.",
         "thrift_what_service": "service (services)",
@@ -10668,7 +10690,7 @@
         "thrift_duplicate_field": "Deux champs d’un même type portent le même nom. Donnez-leur des noms différents.",
         "thrift_duplicate_value": "Deux valeurs d’un même enum portent le même nom. Donnez-leur des noms différents.",
         "thrift_dotted_name": "Un nom introduit par une déclaration ne peut pas contenir de point. Les points servent aux références vers d’autres fichiers, qui ne sont pas prises en charge.",
-        "previous_unreadable": "La nouvelle version n’a pas été comparée : la version précédente {version} a été enregistrée selon des règles plus souples et ne passe plus la vérification du registre, elle n’a donc pas pu être vérifiée. Ajoutez le texte corrigé comme nouveau modèle ou réglez la compatibilité sur « none » pour cette version.",
+        "previous_unreadable": "La nouvelle version n’a pas été comparée : la version précédente {version} a été enregistrée selon des règles plus souples et ne passe plus la vérification du registre, elle n’a donc pas pu être vérifiée. Réglez la compatibilité de tout le modèle sur « none », ajoutez cette version puis rétablissez la compatibilité, ou ajoutez le texte corrigé comme nouveau modèle.",
         "thrift_type_missing": "Le modèle utilise un type qui n’y est pas défini. Définissez chaque type dans le même fichier.",
         "thrift_typedef": "Un typedef se désigne lui-même, ou une chaîne de typedefs est trop longue. Rompez le cycle ou raccourcissez la chaîne.",
         "thrift_no_value": "Ce modèle n’a aucune valeur valide : le premier type s’exige lui-même (ou un enum sans valeurs). Rendez l’un de ces champs optionnel.",
@@ -11385,6 +11407,8 @@
         "k_rejected": "Rejeté",
         "k_when": "Quand",
         "k_body": "Contenu du message",
+        "k_state": "État",
+        "state_at_write": "Message refusé à l’écriture — il n’a jamais atteint le topic",
         "no_consumer": "aucun — le message a été vérifié à l'écriture",
         "body_empty": "(vide)",
         "truncated": "le début du contenu est affiché",

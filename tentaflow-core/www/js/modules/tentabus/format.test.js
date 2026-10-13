@@ -11,7 +11,7 @@ import './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { fmtCount, fmtBytes, fmtElapsed, fmtSince, fmtLagSeconds, fmtRetention, fmtWhen, fmtDayTime, contentTypeLabel, contentKind, loadErrorKind } = await import('./format.js');
+const { fmtCount, fmtBytes, fmtElapsed, fmtSince, fmtLagSeconds, fmtRetention, fmtWhen, fmtDayTime, contentTypeLabel, contentKind, loadErrorKind, readablePath, contentTypeNoun } = await import('./format.js');
 
 // Intl groups with a no-break space; the screen prints exactly that.
 const sp = (s) => s.replace(/\u00a0|\u202f/g, ' ');
@@ -99,4 +99,21 @@ test('a list\'s "Zmieniono": today and yesterday with the time, older days as a 
   assert.equal(fmtDayTime(new Date(2026, 8, 22, 9, 5, 0).getTime(), now), 'wczoraj 09:05');
   assert.equal(fmtDayTime(new Date(2026, 8, 18, 9, 5, 0).getTime(), now), '18.09.2026');
   assert.equal(fmtDayTime(null, now), '—');
+});
+
+test('a path is read without the leading slash, the steps joined with ›, the markers in words', () => {
+  assert.equal(readablePath('/wiek'), 'wiek');
+  assert.equal(readablePath('/lines/[]/sku'), 'lines › każdy element › sku');
+  assert.equal(readablePath('/tags/<key>'), 'tags › klucz');
+  assert.equal(readablePath('/tags/<value>/x'), 'tags › wartość › x');
+  assert.equal(readablePath('/a/<unknown>'), 'a › pole spoza wzoru');
+  assert.equal(readablePath('/a/b/…/c/d'), 'a › b › … › c › d');
+  assert.equal(readablePath('<root>'), '<root>');
+});
+
+test('a content kind after "treści" and after a verb has its own form', () => {
+  assert.equal(contentTypeNoun('application/octet-stream'), 'binarnej');
+  assert.equal(contentTypeNoun('application/octet-stream', 'acc'), 'binarną');
+  assert.equal(contentTypeNoun('application/json'), 'JSON');
+  assert.equal(contentTypeNoun('application/x-unknown'), '');
 });

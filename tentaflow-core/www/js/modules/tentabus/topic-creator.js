@@ -13,7 +13,7 @@
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, fmtCount, fmtRetention, contentKind, contentTypeLabel } from '/js/modules/tentabus/format.js';
+import { T, fmtCount, fmtRetention, contentKind, contentTypeLabel, contentTypeNoun } from '/js/modules/tentabus/format.js';
 import { schemaFormatLabel, SCHEMA_TYPES_BY_KIND } from '/js/modules/tentabus/schemas.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
@@ -320,7 +320,7 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
         </div>`;
     } else if (!available.length) {
       const key = state.subjects.length ? 'no_schema_for_kind' : 'no_schema_at_all';
-      body = `<div class="tb-explain-box">${escapeHtml(T(`topics.creator.${key}`, { instance: instanceLabel, kind: contentTypeLabel(draft.contentType) || T('topics.creator.summary_kind_default') }))}</div>`;
+      body = `<div class="tb-explain-box">${escapeHtml(T(`topics.creator.${key}`, { instance: instanceLabel, kind: contentTypeNoun(draft.contentType) || T('topics.creator.summary_kind_default') }))}</div>`;
     } else {
       body = `
         <div class="tb-toggle-card">
@@ -328,7 +328,7 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
           <div class="tc-text"><div class="tc-name">${escapeHtml(T('topics.creator.validate_label'))}</div><div class="tc-sub">${escapeHtml(T('topics.creator.validate_sub'))}</div></div>
         </div>
         <div class="form-grid-2 mt-md" ${draft.validate ? '' : 'hidden'}>
-          <tf-select id="tb-cr-schema" label="${escapeAttr(T('topics.creator.schema_label'))}" hint="${escapeAttr(T('topics.creator.schema_hint', { formats: compatibleFormatsLabel(draft.contentType), kind: contentTypeLabel(draft.contentType) }))}"></tf-select>
+          <tf-select id="tb-cr-schema" label="${escapeAttr(T('topics.creator.schema_label'))}" hint="${escapeAttr(T('topics.creator.schema_hint', { formats: compatibleFormatsLabel(draft.contentType), kind: contentTypeNoun(draft.contentType) }))}"></tf-select>
           <tf-select id="tb-cr-mismatch" label="${escapeAttr(T('topics.creator.mismatch_label'))}"></tf-select>
         </div>`;
     }

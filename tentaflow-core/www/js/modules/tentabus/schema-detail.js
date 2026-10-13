@@ -426,6 +426,11 @@ function thriftBodyFields(tokens, from, to) {
  * read.
  */
 export function thriftFieldsView(text) {
+  return thriftView(text)?.fields ?? null;
+}
+
+/** `{ name, fields }` of the type `thriftFieldsView` lists, or `null`. */
+export function thriftView(text) {
   const lexed = thriftTokens(text);
   if (!lexed) return null;
   const { tokens, named } = lexed;
@@ -439,7 +444,7 @@ export function thriftFieldsView(text) {
         if (thriftSymbol(tokens[end], '{')) depth += 1;
         else if (thriftSymbol(tokens[end], '}')) depth -= 1;
       }
-      return depth === 0 ? thriftBodyFields(tokens, i + 3, end - 1) : null;
+      return depth === 0 ? { name: tokens[i + 1].v, fields: thriftBodyFields(tokens, i + 3, end - 1) } : null;
     }
     // Skip the body of any other declaration.
     if (tok.t === 'i' && ['struct', 'union', 'exception', 'enum', 'service'].includes(tok.v)) {
@@ -576,7 +581,7 @@ function pageHtml(name) {
             </tf-table>
           </div>
           <div class="tb-profile" data-role="thrift" hidden>
-            <label class="tb-profile-label">${escapeHtml(T('schemas.detail.thrift_fields'))}</label>
+            <label class="tb-profile-label" data-role="thrift-title">${escapeHtml(T('schemas.detail.thrift_fields', { name: '' }))}</label>
             <tf-table data-role="thrift-fields">
               <tf-column key="id" label="${escapeAttr(T('schemas.detail.thrift_id'))}" renderer="html"></tf-column>
               <tf-column key="field" label="${escapeAttr(T('schemas.detail.profile_field'))}" renderer="html"></tf-column>
@@ -795,7 +800,7 @@ function paintText(body, view, effective) {
   paintProfile(body, ready && info.schemaType === 'hl7v2_profile' ? hl7ProfileView(shown.text) : null);
   paintAvroFields(body, ready && info.schemaType === 'avro' ? avroFieldsView(shown.text) : null);
   paintProtobufFields(body, ready && info.schemaType === 'protobuf' ? protobufFieldsView(shown.text) : null);
-  paintThriftFields(body, ready && info.schemaType === 'thrift' ? thriftFieldsView(shown.text) : null);
+  paintThriftFields(body, ready && info.schemaType === 'thrift' ? thriftView(shown.text) : null);
   if (ready && editor.__tbText !== `${info.schemaType}\u0000${shown.text}`) {
     editor.__tbText = `${info.schemaType}\u0000${shown.text}`;
     editor.setAttribute('language', editorLanguage(info.schemaType));
@@ -851,10 +856,12 @@ function paintProtobufFields(body, fields) {
   })));
 }
 
-function paintThriftFields(body, fields) {
+function paintThriftFields(body, view) {
   const el = body.querySelector('[data-role="thrift"]');
+  const fields = view?.fields;
   el.hidden = !fields?.length;
   if (!fields?.length) return;
+  body.querySelector('[data-role="thrift-title"]').textContent = T('schemas.detail.thrift_fields', { name: view.name });
   setRowsIfChanged(body.querySelector('[data-role="thrift-fields"]'), fields.map((f) => ({
     id: `<span class="tf-table__cell--mono">${escapeHtml(String(f.id))}</span>`,
     field: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(f.name)}</span></span>`,

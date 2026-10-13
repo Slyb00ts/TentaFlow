@@ -127,14 +127,14 @@ test('the refusal box: known reasons in words, an unknown one with the server\'s
   };
   const known = box(incompatible('backward', "property 'termin' is required by the reader schema but not guaranteed present by the writer schema"));
   assert.equal(norm(known.textContent), 'Nie dodano wersji 3. Ten wzór ma zgodność „nowe programy przeczytają stare wiadomości”, a nowa wersja wymaga pola „termin”, którego stare wiadomości mogą nie mieć. Usuń „termin” z pól wymaganych albo zmień zgodność wzoru.');
-  assert.equal(known.querySelector('details'), null);
+  assert.equal(known.querySelector('tf-disclosure'), null);
   const unknown = box(incompatible('full', 'a sentence nobody mapped'));
   assert.match(norm(unknown.textContent), /^Nie dodano wersji 3\. Nowa wersja nie spełnia zgodności „w obie strony” z poprzednią wersją\. Popraw tekst albo zmień zgodność wzoru\./);
-  assert.equal(unknown.querySelector('details summary').textContent, 'Szczegóły techniczne');
-  assert.equal(unknown.querySelector('details pre').textContent, 'a sentence nobody mapped');
+  assert.equal(unknown.querySelector('tf-disclosure').getAttribute('label'), 'Szczegóły techniczne');
+  assert.equal(unknown.querySelector('tf-disclosure pre').textContent, 'a sentence nobody mapped');
   const invalid = box(new Error("protocol error BadRequest: bus.invalid_argument: schema: invalid schema: /properties: unknown type 'strin'"));
   assert.match(norm(invalid.textContent), /Serwer nie przyjął tekstu jako wzoru w formacie JSON Schema/);
-  assert.match(invalid.querySelector('details pre').textContent, /unknown type 'strin'/);
+  assert.match(invalid.querySelector('tf-disclosure pre').textContent, /unknown type 'strin'/);
   const withdrawn = box(new Error("protocol error BadRequest: bus.invalid_argument: subject 'wizyta' is deprecated; cannot register a new version"));
   assert.match(norm(withdrawn.textContent), /Wzór został wycofany/);
   assert.match(norm(box(new Error('socket closed')).textContent), /Odmowa serwera\.$/);
@@ -625,7 +625,7 @@ test('an XSD new version refusal names the element that is newly required', () =
   const el = document.createElement('div');
   el.innerHTML = refusalHtml({ err: incompatible('backward', backward), title: 'Nie dodano wersji 3.', compatibility: 'backward', schemaType: 'xsd', newText: '', describeError: String });
   assert.equal(norm(el.textContent), 'Nie dodano wersji 3. Ten wzór ma zgodność „nowe programy przeczytają stare wiadomości”, a nowa wersja wymaga elementu „termin”, którego stare wiadomości mogą nie mieć. Dodaj minOccurs="0" do elementu „termin” albo zmień zgodność wzoru.');
-  assert.equal(el.querySelector('details'), null);
+  assert.equal(el.querySelector('tf-disclosure'), null);
 });
 
 // The exact messages of the Rust parsers (hl7v2_profile.rs, payload_format/hl7v2.rs, xsd.rs);
@@ -633,7 +633,7 @@ test('an XSD new version refusal names the element that is newly required', () =
 const refused = (schemaType, serverText) => {
   const el = document.createElement('div');
   el.innerHTML = refusalHtml({ err: new Error(`protocol error BadRequest: bus.invalid_argument: schema: invalid schema: ${serverText}`), title: 'Nie dodano wzoru x.', compatibility: 'backward', schemaType, newText: '', describeError: String });
-  return { text: norm(el.querySelector('div').textContent), technical: el.querySelector('details pre')?.textContent };
+  return { text: norm(el.querySelector('div').textContent), technical: el.querySelector('tf-disclosure pre')?.textContent };
 };
 
 test('a refused HL7 profile text says in plain words what is wrong, the server\'s sentence folded below', () => {
@@ -895,7 +895,7 @@ test('a refused Avro version names the field, the type or the enum symbol that b
   );
   assert.match(
     reason('backward', `${backwardLead}/inner/n: long written by the old schema cannot be read as int by the new schema`),
-    /typ „\/inner\/n” się zmienia: long nie da się odczytać jako int/,
+    /typ „inner › n” się zmienia: long nie da się odczytać jako int/,
   );
   assert.match(
     reason('backward', `${backwardLead}/status: enum 'Status': symbol 'DONE' of the old schema is unknown to the new schema, which has no default symbol`),
@@ -993,7 +993,7 @@ test('a refused Protobuf version names the field, the type, the enum value or th
   );
   assert.match(
     reason('backward', `${backwardLead}/inner/n: int32 written by the old schema cannot be read as string by the new schema`),
-    /typ „\/inner\/n” się zmienia: int32 nie da się odczytać jako string/,
+    /typ „inner › n” się zmienia: int32 nie da się odczytać jako string/,
   );
   assert.match(
     reason('backward', `${backwardLead}/status: enum 'Status': value 3 of the old schema is unknown to the new schema, whose enum is closed`),
@@ -1114,7 +1114,7 @@ test('a refused Thrift version names the field, the type, the enum value or the 
   );
   assert.match(
     reason('backward', `${backwardLead}/lines/[]: i32 written by the old schema cannot be read as string by the new schema`),
-    /typ „\/lines\/\[\]” się zmienia: i32 nie da się odczytać jako string/,
+    /typ „lines › każdy element” się zmienia: i32 nie da się odczytać jako string/,
   );
   assert.match(
     reason('backward', `${backwardLead}/x: struct 'In' written by the old schema cannot be read as union 'In' by the new schema`),
@@ -1122,11 +1122,11 @@ test('a refused Thrift version names the field, the type, the enum value or the 
   );
   assert.match(
     reason('backward', `${backwardLead}<root>: the old schema is written in the binary protocol, the new one in the compact protocol`),
-    /stary wzór jest zapisany w protokole binary, a nowy w protokole compact.*Zostaw protokół poprzedniej wersji/,
+    /stary wzór jest zapisany w protokole binary, nowy w protokole compact — danych zapisanych jednym nie da się odczytać drugim\..*Zostaw protokół poprzedniej wersji/,
   );
   assert.match(
     reason('forward', `${forwardLead}<root>: the old schema is written in the compact protocol, the new one in the binary protocol`),
-    /w protokole compact, a nowy w protokole binary/,
+    /w protokole compact, nowy w protokole binary/,
   );
   assert.match(
     reason('forward', `${forwardLead}/status: enum 'Status': value 3 of the new schema is unknown to the old schema`),
@@ -1140,7 +1140,53 @@ test('a version that cannot be compared because the previous one no longer reads
   el.innerHTML = refusalHtml({ err, title: 'Nie dodano wersji 3.', compatibility: 'backward', schemaType: 'thrift', newText: '', describeError: String });
   const text = norm(el.querySelector('div').textContent);
   assert.match(text, /Nie dodano wersji 3\. Nowa wersja nie została porównana: poprzednia wersja 2 została zapisana według luźniejszych zasad/);
-  assert.match(text, /zgodność „brak”/);
+  assert.match(text, /Zmień zgodność całego wzoru na „brak”/);
   assert.doesNotMatch(text, /nie przyjął/);
-  assert.match(el.querySelector('details pre').textContent, /has no explicit id/);
+  assert.match(el.querySelector('tf-disclosure pre').textContent, /has no explicit id/);
+});
+
+test('"Dodaj wzór": the long part of the Thrift hint sits in a folded "Więcej", not where the file is loaded; "Nowa wersja" shows the hint too', () => {
+  closeAll();
+  const win = openSchemaAdd({
+    instanceId: 'tentabus-1a2b3c4d',
+    schemaTypes: ['json_schema', 'avro', 'thrift'],
+    existingNames: () => [],
+    register: async () => ({ version: 1 }),
+    describeError: String,
+    onAdded: () => {},
+  });
+  const more = win.querySelector('tf-disclosure[data-role="more"]');
+  assert.equal(more.hasAttribute('hidden'), true, 'JSON Schema has nothing more to say');
+  pick(win.querySelector('[data-role="format"]'), 'thrift');
+  assert.equal(more.hasAttribute('hidden'), false);
+  assert.equal(more.getAttribute('label'), 'Więcej');
+  assert.match(more.querySelector('[data-role="more-text"]').textContent, /Przyjmowane są: struct, union/);
+  assert.doesNotMatch(more.textContent, /wczytać plik/, 'the file box is visible and says it itself');
+  assert.match(win.querySelector('[data-role="file"]').getAttribute('label'), /Wczytaj plik/);
+  assert.doesNotMatch(win.querySelector('[data-role="text"]').getAttribute('hint'), /Przyjmowane są/);
+  pick(win.querySelector('[data-role="format"]'), 'avro');
+  assert.equal(more.hasAttribute('hidden'), true);
+  win.close(true);
+
+  const version = openSchemaVersion({
+    instanceId: 'tentabus-1a2b3c4d',
+    subject: { subject: 'zamowienie', schemaType: 'thrift', latestVersion: 2, compatibility: 'backward' },
+    latestText: 'struct Order { 1: i64 id }',
+    register: async () => ({ version: 3 }),
+    describeError: String,
+    onAdded: () => {},
+  });
+  assert.match(version.querySelector('[data-role="text"]').getAttribute('hint'), /Wzór Thrift to plik IDL.*Wzór zostanie sprawdzony przy dodawaniu; to będzie wersja 3\.$/);
+  assert.equal(version.querySelector('tf-disclosure[data-role="more"]').hasAttribute('hidden'), false);
+  version.close(true);
+});
+
+test('a syntax refusal says the line before "Szczegóły są niżej", and nothing doubled when there is no line', () => {
+  const thrift = refused('thrift', "expected '{', found the word 'xsd_all' (line 2)");
+  assert.match(thrift.text, /nazwy typów\. W wierszu 2\. Szczegóły są niżej\.$/);
+  const proto = refused('protobuf', 'not a valid Protobuf schema (line 3): label required');
+  assert.match(proto.text, /W wierszu 3\. Szczegóły są niżej\.$/);
+  const none = refused('protobuf', 'not a valid Protobuf schema: label required');
+  assert.match(none.text, /zdefiniowany w tym samym pliku\. Szczegóły są niżej\.$/);
+  assert.doesNotMatch(none.text, / {2}/);
 });

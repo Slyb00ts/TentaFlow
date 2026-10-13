@@ -16,7 +16,8 @@
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { T, fmtCount, fmtBytes, fmtWhen } from '/js/modules/tentabus/format.js';
-import { bytesToPreviewText, parseBlobRefJson } from '/js/modules/tentabus/payload.js';
+import { parseBlobRefJson } from '/js/modules/tentabus/payload.js';
+import { payloadHtml } from '/js/modules/tentabus/payload-view.js';
 import { reasonLabel, sourceText, attemptsText, receiversText, plainCheckError, RETRY_ALL_MAX } from '/js/modules/tentabus/unprocessed.js';
 import { windowEl, openConfirmWindow } from '/js/modules/tentabus/windows.js';
 import '/js/components/tf-button.js';
@@ -45,8 +46,11 @@ export function recordTitle(rec, nowMs = Date.now()) {
 /** The "label — value" lines of "Pokaż". */
 export function recordFacts(rec, maxAttempts, nowMs = Date.now()) {
   const when = (ms) => (ms == null ? '—' : escapeHtml(fmtWhen(ms, nowMs)));
+  // A message refused on write never reached the topic: there is no partition, number or attempt to name.
   const facts = [
-    [T('unprocessed.view.k_source'), escapeHtml(sourceText(rec))],
+    rec.atWrite
+      ? [T('unprocessed.view.k_state'), escapeHtml(T('unprocessed.view.state_at_write'))]
+      : [T('unprocessed.view.k_source'), escapeHtml(sourceText(rec))],
     [T('unprocessed.view.k_consumer'), consumerHtml(rec)],
     [T('unprocessed.view.k_reason'), reasonHtml(rec)],
   ];
@@ -57,7 +61,7 @@ export function recordFacts(rec, maxAttempts, nowMs = Date.now()) {
     const plain = plainCheckError(rec.errorMessage);
     facts.push([T(errorKey), plain ? `<span title="${escapeAttr(rec.errorMessage)}">${escapeHtml(plain)}</span>` : escapeHtml(rec.errorMessage)]);
   }
-  facts.push([T('unprocessed.view.k_attempts'), escapeHtml(attemptsText(rec, maxAttempts))]);
+  if (!rec.atWrite) facts.push([T('unprocessed.view.k_attempts'), escapeHtml(attemptsText(rec, maxAttempts))]);
   if (rec.atWrite) {
     facts.push([T('unprocessed.view.k_rejected'), when(rec.rejectedMs)]);
   } else {
@@ -68,11 +72,10 @@ export function recordFacts(rec, maxAttempts, nowMs = Date.now()) {
   return facts;
 }
 
-function payloadHtml(rec) {
+function recordPayloadHtml(rec) {
   const blob = rec.isBlobRef ? parseBlobRefJson(rec.payload) : null;
   if (blob) return `<div class="tb-explain-box">${escapeHtml(T('unprocessed.view.blob', { size: fmtBytes(blob.size_bytes), mime: blob.mime }))}</div>`;
-  const text = bytesToPreviewText(rec.payload, PAYLOAD_PREVIEW_BYTES);
-  return `<pre class="tb-payload" data-role="payload">${escapeHtml(text || T('unprocessed.view.body_empty'))}</pre>`;
+  return payloadHtml(rec.payload, { textBytes: PAYLOAD_PREVIEW_BYTES, emptyText: T('unprocessed.view.body_empty'), role: 'payload' });
 }
 
 /**
@@ -86,7 +89,7 @@ export function openUnprocessedView({ rec, maxAttempts, onRetry = null, onDiscar
     <div slot="body" class="stack">
       ${kv(recordFacts(rec, maxAttempts, nowMs))}
       <div class="tb-unp-body-head"><b>${escapeHtml(T('unprocessed.view.k_body'))}</b>${rec.truncated ? ` <tf-chip size="sm" variant="outline" status="warn" label="${escapeAttr(T('unprocessed.view.truncated'))}"></tf-chip>` : ''}</div>
-      ${payloadHtml(rec)}
+      ${recordPayloadHtml(rec)}
       <div class="tb-audit-banner">${sprite('shield')}<span>${escapeHtml(T('unprocessed.view.rules'))} ${escapeHtml(T('unprocessed.view.audit'))}</span></div>
     </div>
     <div slot="footer">

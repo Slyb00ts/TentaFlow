@@ -199,8 +199,25 @@ export function loadErrorKind(err) {
   return 'lost';
 }
 
-/** A path of the checker as a person reads it: one element is a name ("wiek"), a deeper path keeps its slashes. */
-export function shownPath(path) {
+const PATH_WORDS = { '[]': 'fmt.path.each', '<key>': 'fmt.path.key', '<value>': 'fmt.path.value', '<unknown>': 'fmt.path.unknown' };
+
+/**
+ * A path of the checker as a person reads it, in every format alike: no
+ * leading slash, the steps joined with "›", and the checker's markers in
+ * words ("lines › każdy element › sku"). A path of one name is that name.
+ */
+export function readablePath(path) {
   const text = String(path);
-  return /^\/[^/]+$/.test(text) ? text.slice(1) : text;
+  if (text === '<root>') return text;
+  return text
+    .split('/')
+    .filter(Boolean)
+    .map((step) => (PATH_WORDS[step] ? T(PATH_WORDS[step]) : step))
+    .join(' › ');
+}
+
+/** The name of a content kind as it stands after "treści" / "content" (`form` `gen`) or after a verb (`acc`); `''` for an unknown content type. */
+export function contentTypeNoun(contentType, form = 'gen') {
+  const key = contentKind(contentType);
+  return key ? T(`fmt.content_${form}.${key}`) : '';
 }

@@ -518,10 +518,19 @@ test('a Thrift pattern\'s page lists the fields of the type above the text; othe
   assert.match(table.rows[2].type, />list&lt;Line&gt;</);
   assert.equal(norm(table.rows[0].presence), 'wymagane');
   assert.equal(norm(table.rows[1].presence), 'opcjonalne');
-  assert.equal(norm(table.rows[2].presence), 'zwykłe (może nie być)');
+  assert.equal(norm(table.rows[2].presence), 'zwykłe (może go nie być)');
+  assert.equal(norm(body.querySelector('[data-role="thrift-title"]').textContent), 'Pola typu Order');
   assert.equal(downloadName('zamowienie', 3, 'thrift'), 'zamowienie-v3.thrift');
   const json = mount({ shown: { version: 3, text: TEXT, error: null } });
   assert.equal(json.body.querySelector('[data-role="thrift"]').hidden, true);
   const broken = mount({ info: thrift, shown: { version: 3, text: 'nothing', error: null } });
   assert.equal(broken.body.querySelector('[data-role="thrift"]').hidden, true);
+});
+
+test('the Thrift card reads a directive as the server does: CRLF, a block comment that ends at its first */, a // inside a string', () => {
+  const b = [{ id: 1, name: 'b', type: 'string', label: 'default' }];
+  assert.deepEqual(thriftFieldsView('struct A { 1: i32 a }\r\n// tentabus:struct B\r\nstruct B { 1: string b }\r\n'), b);
+  assert.deepEqual(thriftFieldsView('struct A { 1: i32 a }\nstruct B { 1: string b }\n/* /* */ // tentabus:struct B\n'), b);
+  assert.deepEqual(thriftFieldsView('struct A { 1: i32 a = 1 }\nstruct B { 1: string b = "http://x" } // tentabus:struct B\n'), b);
+  assert.deepEqual(thriftFieldsView('struct A { 1: i32 a }\nstruct B { 1: string b = "// tentabus:struct B" }\n'), [{ id: 1, name: 'a', type: 'i32', label: 'default' }]);
 });

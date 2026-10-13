@@ -23,13 +23,14 @@
 // is shown as the server wrote it, under a line that still says what happened.
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
-import { T, fmtCount, shownPath } from '/js/modules/tentabus/format.js';
+import { T, fmtCount, readablePath } from '/js/modules/tentabus/format.js';
 import { COMPATIBILITIES, compatLabel, schemaFormatLabel, schemaKind, listText } from '/js/modules/tentabus/schemas.js';
 import { openChangeWindow, openConfirmWindow } from '/js/modules/tentabus/windows.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-textarea.js';
+import '/js/components/tf-disclosure.js';
 import '/js/components/tf-file-input.js';
 import '/js/components/tf-choice-card.js';
 import '/js/components/tf-radio.js';
@@ -467,7 +468,7 @@ export function incompatibilityReason({ mode, detail, newText }) {
   const thriftProtocol = THRIFT_PROTOCOL.exec(detail);
   if (thriftProtocol) return { reason: T('schemas.incompat.thrift_protocol', { from: thriftProtocol[1], to: thriftProtocol[2] }), fix: T('schemas.incompat.thrift_protocol_fix') };
   const avroType = AVRO_TYPE.exec(detail);
-  if (avroType) return { reason: T('schemas.incompat.avro_type', { path: avroType[1] === '<root>' ? '/' : shownPath(avroType[1]), from: avroType[2], to: avroType[3] }), fix: generic };
+  if (avroType) return { reason: T('schemas.incompat.avro_type', { path: avroType[1] === '<root>' ? '/' : readablePath(avroType[1]), from: avroType[2], to: avroType[3] }), fix: generic };
   const avroEnum = AVRO_ENUM.exec(detail);
   if (avroEnum) return { reason: T('schemas.incompat.avro_enum', { name: avroEnum[1], symbol: avroEnum[2] }), fix: generic };
   let field = quoted(/^property '([^']+)' is required by the reader schema but not guaranteed present by the writer schema/);
@@ -596,9 +597,15 @@ const NUMBER_TYPE_ADVICE = { float: 'decimal', double: 'decimal', long: 'integer
  */
 export function textRefusalReason(schemaType, serverText) {
   const reason = refusalReasonOf(schemaType, serverText);
-  // The parsers that count lines write "(line N)" into their sentence; the folded details are English, the line is said here.
-  const line = /\(line (\d+)\)/.exec(String(serverText || ''));
-  return reason && line ? `${reason} ${T('schemas.refused.at_line', { line: line[1] })}` : reason;
+  // The parsers that count lines write "(line N)" into their sentence; the folded details are English, the line is said here
+  // (inside the sentence where it has a place for it, so "Szczegóły są niżej" stays last).
+  const line = lineSentence(serverText);
+  return reason && line && !reason.includes(line) ? `${reason} ${line}` : reason;
+}
+
+function lineSentence(serverText) {
+  const m = /\(line (\d+)\)/.exec(String(serverText || ''));
+  return m ? T('schemas.refused.at_line', { line: m[1] }) : '';
 }
 
 function refusalReasonOf(schemaType, serverText) {
@@ -638,7 +645,7 @@ function refusalReasonOf(schemaType, serverText) {
       // The parser words two fields with one number like two with one name.
       if (/Non-unique field name/.test(text)) return T('schemas.refused.proto_numbers');
       if (/object is not found by path/.test(text)) return T('schemas.refused.proto_type_missing');
-      return T('schemas.refused.proto_invalid');
+      return T('schemas.refused.proto_invalid', { atLine: lineSentence(text) }).replace(/\s{2,}/g, ' ');
     }
     if (/^import is not supported/.test(text)) return T('schemas.refused.proto_import');
     const unsupported = PROTOBUF_UNSUPPORTED.find(([re]) => re.test(text));
@@ -689,7 +696,7 @@ function refusalReasonOf(schemaType, serverText) {
       if (m) return T(`schemas.refused.thrift_limit_${key}`, { limit: m[1] });
     }
     if (/^(?:a comment is never closed|a string is never closed|a string holds an escape|the schema contains a character|an integer literal|a number is)/.test(text)) return T('schemas.refused.thrift_lexical');
-    if (/^expected |is not part of the supported Thrift IDL subset|^a name has an empty part/.test(text)) return T('schemas.refused.thrift_invalid');
+    if (/^expected |is not part of the supported Thrift IDL subset|^a name has an empty part/.test(text)) return T('schemas.refused.thrift_invalid', { atLine: lineSentence(text) }).replace(/\s{2,}/g, ' ');
     return null;
   }
   if (schemaType === 'xsd') {
@@ -731,7 +738,7 @@ function refusalReasonOf(schemaType, serverText) {
  */
 export function refusalHtml({ err, title, compatibility, schemaType, newText, describeError, offerDrop = false, latest = null }) {
   const message = String(err?.message || err || '');
-  const technical = (text) => `<details class="tb-tech"><summary>${escapeHtml(T('schemas.incompat.technical'))}</summary><pre>${escapeHtml(text)}</pre></details>`;
+  const technical = (text) => `<tf-disclosure class="tb-tech" label="${escapeAttr(T('schemas.incompat.technical'))}"><pre>${escapeHtml(text)}</pre></tf-disclosure>`;
   const head = `<b>${escapeHtml(title)}</b>`;
   const incompatible = parseIncompatible(message);
   if (incompatible) {
@@ -866,7 +873,7 @@ const NAME_ERRORS = { empty: 'schemas.add.name_empty', invalid: 'schemas.add.nam
 function textField(label, hint, value = '', more = '') {
   return `
     <tf-textarea class="tb-mono-input" data-role="text" rows="10" label="${escapeAttr(label)}" hint="${escapeAttr(hint)}" value="${escapeAttr(value)}" spellcheck="false"></tf-textarea>
-    <details class="tb-tech" data-role="more"${more ? '' : ' hidden'}><summary>${escapeHtml(T('schemas.add.more'))}</summary><div data-role="more-text">${escapeHtml(more)}</div></details>
+    <tf-disclosure class="tb-tech" data-role="more" label="${escapeAttr(T('schemas.add.more'))}"${more ? '' : ' hidden'}><div data-role="more-text">${escapeHtml(more)}</div></tf-disclosure>
     <tf-file-input data-role="file" label="${escapeAttr(T('schemas.file_label'))}"></tf-file-input>`;
 }
 

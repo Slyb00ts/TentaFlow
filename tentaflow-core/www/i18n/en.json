@@ -11380,7 +11380,9 @@
       "org_mismatch": "A right to a topic can only be granted from the topic's own organisation.",
       "record_not_found": "This partition has no message with that number.",
       "field_policy_changed": "The rule changed in the meantime, so nothing was saved. Refresh the list of rules and make the change again.",
-      "schema_kind_mismatch": "Pattern {name} is for {schemaKind} content, but this topic takes {topicKind} content."
+      "schema_kind_mismatch": "Pattern {name} is for {schemaKind} content, but this topic takes {topicKind} content.",
+      "stored_schema_unreadable": "Pattern {name}, version {version}, was stored under looser rules and the registry can no longer read it, so the topic cannot check messages with it. Add a corrected version of the pattern.",
+      "field_policy_binary_topic": "Topic {topic} carries binary messages (pattern {name}, {format}). Data-hiding rules work on JSON, XML and HL7 v2, so this topic cannot have one."
     },
     "shell": {
       "instance": "Instance",
@@ -11425,6 +11427,26 @@
         "hl7v2": "HL7 v2",
         "binary": "Binary"
       },
+      "content_gen": {
+        "json": "JSON",
+        "xml": "XML",
+        "hl7v2": "HL7 v2",
+        "binary": "binary"
+      },
+      "content_acc": {
+        "json": "JSON",
+        "xml": "XML",
+        "hl7v2": "HL7 v2",
+        "binary": "binary"
+      },
+      "path": {
+        "each": "each item",
+        "key": "key",
+        "value": "value",
+        "unknown": "a field outside the pattern"
+      },
+      "payload_binary": "Binary content, {count} {n|byte|bytes}",
+      "payload_cut": "The first {shown} of {count} {n|byte|bytes} are shown.",
       "days": "{count} {n|day|days|days}",
       "today": "today {time}",
       "yesterday": "yesterday {time}",
@@ -11589,7 +11611,7 @@
         "text_hint_avro": "An Avro pattern is a schema written as JSON, e.g. {example}. It checks a single message written in the binary Avro encoding — without an Avro file header or a Confluent header. You can also load a file. The pattern is checked when it is added; this will be version {version}.",
         "text_hint_protobuf": "A Protobuf pattern is a .proto file (proto3 or proto2) written in one piece, with no “import”. It describes one message: the first one in the file, or the one named by a comment such as “// tentabus:message Order”. Example: {example}. It checks a single message written in the binary Protobuf encoding. You can also load a file. The pattern is checked when it is added; this will be version {version}. Validation is strict: a negative int32 must use the full 10-byte encoding (the 5-byte form is refused), uint32 and sint32 cannot exceed 2^32−1, bool is only 0 or 1, and field numbers 19000–19999 are refused even when the pattern does not declare them.",
         "text_hint_thrift": "A Thrift pattern is an IDL file written in one piece, with no “include”. It describes one type: the first struct, union or exception in the file, or the one named by a comment such as “// tentabus:struct Order”. Example: {example}. The pattern is checked when it is added; this will be version {version}.",
-        "text_more_thrift": "It checks a single object written in the binary Thrift encoding (TBinaryProtocol), or in the compact one (TCompactProtocol) when the file contains the comment “// tentabus:protocol compact” — without a message header or framing. Accepted: struct, union, exception, enum, typedef, namespace, list, set and map, constants and default values (they are read but do not affect the check). Not accepted: include and service. You can also load a file. Validation is strict: every field needs its number (“1: string name”), an enum value must be one of the declared ones, a string must be UTF-8, and a union carries at most one member.",
+        "text_more_thrift": "It checks a single object written in the binary Thrift encoding (TBinaryProtocol), or in the compact one (TCompactProtocol) when the file contains the comment “// tentabus:protocol compact” — without a message header or framing. Accepted: struct, union, exception, enum, typedef, namespace, list, set and map, constants and default values (they are read but do not affect the check). Not accepted: include and service. Validation is strict: every field needs its number (“1: string name”), an enum value must be one of the declared ones, a string must be UTF-8, and a union carries at most one member.",
         "more": "More"
       },
       "version": {
@@ -11669,7 +11691,7 @@
         "proto_enum_open": "enum “{name}” accepts any number, but the other version has a closed enum (proto2) that knows only its own values",
         "proto_oneof": "fields “{first}” and “{second}” would share the oneof “{oneof}”, but the other version can write both at once — a oneof keeps only one of them, so the other’s data would be lost",
         "proto_reserved": "field number {number} was reserved (“reserved”) in the previous version and cannot be used again",
-        "thrift_protocol": "the old pattern is written in the {from} protocol and the new one in the {to} protocol — data written in one cannot be read in the other",
+        "thrift_protocol": "the old pattern is written in the {from} protocol, the new one in the {to} protocol — data written in one cannot be read in the other",
         "thrift_protocol_fix": "Keep the protocol of the previous version (the comment “// tentabus:protocol”), or add the changed pattern under a new name."
       },
       "compat_window": {
@@ -11781,7 +11803,7 @@
         "protobuf_optional": "optional",
         "protobuf_repeated": "repeated",
         "protobuf_oneof": "one of: {name}",
-        "thrift_fields": "Fields of the type",
+        "thrift_fields": "Fields of {name}",
         "thrift_id": "Number",
         "thrift_type": "Type",
         "thrift_presence": "Presence",
@@ -11852,7 +11874,7 @@
         "avro_default": "A field's default value does not fit the first branch of its union. In an Avro union the default must be of the first branch's type (for example null when null comes first).",
         "avro_default_type": "A field's default value does not fit the type of that field. The default must be written like a value of that type (for example a number for int, text for string, one of the symbols for an enum).",
         "avro_limit_text": "A description (doc) or a custom attribute is longer than {limit} bytes. Shorten the text.",
-        "proto_invalid": "Protobuf did not accept this file: check the syntax (semicolons, brackets), the type names, and that every type you use is defined in the same file. Details are below.",
+        "proto_invalid": "Protobuf did not accept this file: check the syntax (semicolons, brackets), the type names, and that every type you use is defined in the same file. {atLine} Details are below.",
         "proto_import": "A Protobuf pattern must be one self-contained file: “import” is not supported. Paste the messages you need into the same file.",
         "proto_unsupported": "This pattern contains an element the registry does not support: {what}. Messages, enums, oneof and maps are enough to check messages.",
         "proto_what_service": "service",
@@ -11887,7 +11909,7 @@
         "proto_limit_name": "A name is longer than {limit} characters.",
         "proto_limit_parts": "A name has more than {limit} dot-separated parts.",
         "proto_lexical": "The pattern has an unclosed comment, quoted text or bracket, or a character a .proto file cannot contain.",
-        "thrift_invalid": "The registry did not accept this file: check the syntax (colons, brackets, commas) and the type names. Details are below.",
+        "thrift_invalid": "The registry did not accept this file: check the syntax (colons, brackets, commas) and the type names. {atLine} Details are below.",
         "thrift_include": "A Thrift pattern must be one self-contained file: “include” and “cpp_include” are not supported. Paste the types you need into the same file.",
         "thrift_unsupported": "This pattern contains an element the registry does not support: {what}. Structs, unions, exceptions, enums and typedefs are enough to check objects.",
         "thrift_what_service": "service (services)",
@@ -11903,7 +11925,7 @@
         "thrift_duplicate_field": "Two fields of one type have the same name. Give them different names.",
         "thrift_duplicate_value": "Two values of one enum have the same name. Give them different names.",
         "thrift_dotted_name": "A name that a declaration introduces cannot contain a dot. Dots are only for references into other files, which are not supported.",
-        "previous_unreadable": "The new version was not compared: the previous version {version} was stored under looser rules and no longer passes the registry's check, so it could not be checked. Add the corrected text as a new pattern, or switch the compatibility to “none” for this version.",
+        "previous_unreadable": "The new version was not compared: the previous version {version} was stored under looser rules and no longer passes the registry's check, so it could not be checked. Change the compatibility of the whole pattern to “none”, add this version and restore the compatibility, or add the corrected text as a new pattern.",
         "thrift_type_missing": "The pattern uses a type that is not defined in it. Define every type in the same file.",
         "thrift_typedef": "A typedef refers to itself, or a chain of typedefs is too long. Break the cycle or shorten the chain.",
         "thrift_no_value": "This schema has no valid value: the first type requires itself (or an enum without values). Make one of those fields optional.",
@@ -12620,6 +12642,8 @@
         "k_rejected": "Rejected",
         "k_when": "When",
         "k_body": "Message body",
+        "k_state": "State",
+        "state_at_write": "Message refused on write — it never reached the topic",
         "no_consumer": "none — the message was checked at write",
         "body_empty": "(empty)",
         "truncated": "the beginning of the body is shown",

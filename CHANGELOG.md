@@ -347,6 +347,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   pola i wartości wyliczenia, „Rejestr nie przyjął” zamiast „Thrift nie
   przyjął”, „Wiadomość nie jest zapisem Thrift” dla ładunku, który nie zaczyna
   się strukturą, i „zwykłe (może nie być)” zamiast „domyślne”.
+- Druga runda po przeglądzie Thrift: zasada ukrywania danych na topiku, który
+  sprawdza wzór Avro, Protobuf lub Thrift, jest odrzucana przez serwer
+  („field policies cannot apply to a topic whose messages are binary”) — zapis
+  zawsze kończyłby się błędem, a odczyt dawał pusty wynik; topik z domyślnym
+  `application/octet-stream` bez takiego wzoru (stary topik JSON) nadal może mieć
+  zasadę. Odmowa zapisanej wersji, której już nie da się skompilować, jest
+  pamiętana dla danej treści i generacji rejestru, więc kolejne publikacje nie
+  parsują znów do 256 KiB tekstu. Okno „Pokaż” i podgląd wiadomości pokazują
+  treść binarną jako „Treść binarna, N bajtów” z widokiem szesnastkowym
+  (przesunięcie, bajty, ASCII; pierwsze 512 bajtów); wiadomość odrzucona przy
+  zapisie ma jeden wiersz stanu zamiast „Partycja i numer” i „Próby”; ścieżki w
+  komunikatach są czytelne („lines › każdy element › sku”) we wszystkich
+  formatach; numer wiersza błędu składni stoi w zdaniu przed „Szczegóły są
+  niżej”; „Więcej” w oknie dodawania wzoru to nowy komponent `tf-disclosure`
+  (używają go też szczegóły techniczne odmów); kreator topiku mówi „treści
+  binarnej”; karta „Pola typu Order” nazywa typ; nowe zdania serwera o
+  nieczytelnym zapisanym wzorze i o zasadzie na topiku binarnym mają polskie
+  odpowiedniki w pięciu językach.
 
 - Rejestr wzorców waliduje Avro (F4 B1, biblioteka `apache-avro` 0.22 z ASF,
   bez kodeków kompresji; tylko do czytania schematów i serializacji

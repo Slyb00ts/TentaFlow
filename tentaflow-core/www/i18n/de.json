@@ -10145,7 +10145,9 @@
       "org_mismatch": "Ein Recht an einem Topic kann nur aus seiner eigenen Organisation gewährt werden.",
       "record_not_found": "Diese Partition enthält keine Nachricht mit dieser Nummer.",
       "field_policy_changed": "Die Regel hat sich in der Zwischenzeit geändert, daher wurde nichts gespeichert. Aktualisieren Sie die Regelliste und nehmen Sie die Änderung noch einmal vor.",
-      "schema_kind_mismatch": "Das Muster {name} ist für {schemaKind}-Inhalt, dieses Topic nimmt aber {topicKind}-Inhalt an."
+      "schema_kind_mismatch": "Das Muster {name} ist für {schemaKind}-Inhalt, dieses Topic nimmt aber {topicKind}-Inhalt an.",
+      "stored_schema_unreadable": "Das Muster {name}, Version {version}, wurde nach lockereren Regeln gespeichert und die Registry kann es nicht mehr lesen, daher kann das Topic damit keine Nachrichten prüfen. Fügen Sie eine korrigierte Version des Musters hinzu.",
+      "field_policy_binary_topic": "Das Topic {topic} enthält binäre Nachrichten (Muster {name}, {format}). Regeln zum Ausblenden von Daten arbeiten mit JSON, XML und HL7 v2, daher kann dieses Topic keine haben."
     },
     "shell": {
       "instance": "Instanz",
@@ -10190,6 +10192,26 @@
         "hl7v2": "HL7 v2",
         "binary": "Binär"
       },
+      "content_gen": {
+        "json": "JSON",
+        "xml": "XML",
+        "hl7v2": "HL7 v2",
+        "binary": "Binär"
+      },
+      "content_acc": {
+        "json": "JSON",
+        "xml": "XML",
+        "hl7v2": "HL7 v2",
+        "binary": "Binär"
+      },
+      "path": {
+        "each": "jedes Element",
+        "key": "Schlüssel",
+        "value": "Wert",
+        "unknown": "ein Feld außerhalb des Musters"
+      },
+      "payload_binary": "Binärer Inhalt, {count} {n|Byte|Bytes}",
+      "payload_cut": "Angezeigt werden die ersten {shown} von {count} {n|Byte|Bytes}.",
       "days": "{count} {n|Tag|Tage|Tage}",
       "today": "heute {time}",
       "yesterday": "gestern {time}",
@@ -10354,7 +10376,7 @@
         "text_hint_avro": "Ein Avro-Muster ist ein als JSON geschriebenes Schema, z. B. {example}. Es prüft eine einzelne Nachricht in der binären Avro-Kodierung – ohne Avro-Dateikopf und ohne Confluent-Kopf. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; das wird Version {version}.",
         "text_hint_protobuf": "Ein Protobuf-Muster ist eine .proto-Datei (proto3 oder proto2) in einem Stück, ohne „import“. Es beschreibt eine Nachricht: die erste der Datei oder die, die ein Kommentar wie „// tentabus:message Order“ benennt. Beispiel: {example}. Es prüft eine einzelne Nachricht in der binären Protobuf-Kodierung. Sie können auch eine Datei laden. Das Muster wird beim Hinzufügen geprüft; das wird Version {version}. Die Prüfung ist streng: ein negatives int32 braucht die volle 10-Byte-Kodierung (die 5-Byte-Form wird abgelehnt), uint32 und sint32 dürfen 2^32−1 nicht überschreiten, bool ist nur 0 oder 1, und die Feldnummern 19000–19999 werden abgelehnt, auch wenn das Muster sie nicht deklariert.",
         "text_hint_thrift": "Ein Thrift-Muster ist eine IDL-Datei in einem Stück, ohne „include“. Es beschreibt einen Typ: das erste struct, union oder exception der Datei oder das, das ein Kommentar wie „// tentabus:struct Order“ benennt. Beispiel: {example}. Das Muster wird beim Hinzufügen geprüft; es wird Version {version}.",
-        "text_more_thrift": "Es prüft ein einzelnes Objekt in der binären Thrift-Kodierung (TBinaryProtocol) oder in der kompakten (TCompactProtocol), wenn die Datei den Kommentar „// tentabus:protocol compact“ enthält — ohne Nachrichtenkopf und Rahmung. Akzeptiert werden struct, union, exception, enum, typedef, namespace, list, set und map, Konstanten und Standardwerte (sie werden gelesen, beeinflussen die Prüfung aber nicht). Nicht unterstützt: include und service. Sie können auch eine Datei laden. Die Validierung ist streng: Jedes Feld braucht seine Nummer („1: string name“), ein Enum-Wert muss einer der deklarierten sein, ein string muss UTF-8 sein, und eine union trägt höchstens ein Mitglied.",
+        "text_more_thrift": "Es prüft ein einzelnes Objekt in der binären Thrift-Kodierung (TBinaryProtocol) oder in der kompakten (TCompactProtocol), wenn die Datei den Kommentar „// tentabus:protocol compact“ enthält — ohne Nachrichtenkopf und Rahmung. Akzeptiert werden struct, union, exception, enum, typedef, namespace, list, set und map, Konstanten und Standardwerte (sie werden gelesen, beeinflussen die Prüfung aber nicht). Nicht unterstützt: include und service. Die Validierung ist streng: Jedes Feld braucht seine Nummer („1: string name“), ein Enum-Wert muss einer der deklarierten sein, ein string muss UTF-8 sein, und eine union trägt höchstens ein Mitglied.",
         "more": "Mehr"
       },
       "version": {
@@ -10434,7 +10456,7 @@
         "proto_enum_open": "Enum „{name}“ akzeptiert jede Zahl, die andere Version hat aber ein geschlossenes Enum (proto2), das nur seine eigenen Werte kennt",
         "proto_oneof": "die Felder „{first}“ und „{second}“ würden sich das oneof „{oneof}“ teilen, die andere Version kann aber beide gleichzeitig schreiben — ein oneof behält nur eines davon, die Daten des anderen gingen verloren",
         "proto_reserved": "Die Feldnummer {number} war in der vorherigen Version reserviert („reserved“) und darf nicht erneut verwendet werden",
-        "thrift_protocol": "das alte Muster ist im Protokoll {from} geschrieben, das neue im Protokoll {to} — in einem geschriebene Daten lassen sich im anderen nicht lesen",
+        "thrift_protocol": "das alte Muster ist im Protokoll {from} geschrieben, das neue im Protokoll {to} — Daten, die mit dem einen geschrieben wurden, lassen sich mit dem anderen nicht lesen",
         "thrift_protocol_fix": "Behalten Sie das Protokoll der vorherigen Version bei (der Kommentar „// tentabus:protocol“) oder fügen Sie das geänderte Muster unter einem neuen Namen hinzu."
       },
       "compat_window": {
@@ -10546,7 +10568,7 @@
         "protobuf_optional": "optional",
         "protobuf_repeated": "wiederholt",
         "protobuf_oneof": "eines von: {name}",
-        "thrift_fields": "Felder des Typs",
+        "thrift_fields": "Felder von {name}",
         "thrift_id": "Nummer",
         "thrift_type": "Typ",
         "thrift_presence": "Vorkommen",
@@ -10617,7 +10639,7 @@
         "avro_default": "Der Standardwert eines Feldes passt nicht zum ersten Zweig seiner Union. In einer Avro-Union muss der Standardwert den Typ des ersten Zweigs haben (z. B. null, wenn null zuerst steht).",
         "avro_default_type": "Der Standardwert eines Feldes passt nicht zum Typ dieses Feldes. Der Standardwert muss wie ein Wert dieses Typs geschrieben sein (z. B. eine Zahl für int, Text für string, eines der Symbole bei einem Enum).",
         "avro_limit_text": "Eine Beschreibung (doc) oder ein eigenes Attribut ist länger als {limit} Bytes. Kürze den Text.",
-        "proto_invalid": "Protobuf hat diese Datei nicht akzeptiert: Prüfen Sie die Syntax (Semikolons, Klammern), die Typnamen und ob jeder verwendete Typ in derselben Datei definiert ist. Einzelheiten stehen unten.",
+        "proto_invalid": "Protobuf hat diese Datei nicht akzeptiert: Prüfen Sie die Syntax (Semikolons, Klammern), die Typnamen und ob jeder verwendete Typ in derselben Datei definiert ist. {atLine} Einzelheiten stehen unten.",
         "proto_import": "Ein Protobuf-Muster muss eine einzige eigenständige Datei sein: „import“ wird nicht unterstützt. Fügen Sie die benötigten Nachrichten in dieselbe Datei ein.",
         "proto_unsupported": "Dieses Muster enthält ein Element, das die Registry nicht unterstützt: {what}. Zum Prüfen von Nachrichten genügen Nachrichten (message), Enums, oneof und Maps.",
         "proto_what_service": "service (Dienste)",
@@ -10652,7 +10674,7 @@
         "proto_limit_name": "Ein Name ist länger als {limit} Zeichen.",
         "proto_limit_parts": "Ein Name hat mehr als {limit} durch Punkte getrennte Teile.",
         "proto_lexical": "Das Muster hat einen nicht geschlossenen Kommentar, Text in Anführungszeichen oder eine nicht geschlossene Klammer oder ein Zeichen, das eine .proto-Datei nicht enthalten kann.",
-        "thrift_invalid": "Die Registry hat diese Datei nicht akzeptiert: Prüfen Sie die Syntax (Doppelpunkte, Klammern, Kommas) und die Typnamen. Einzelheiten stehen unten.",
+        "thrift_invalid": "Die Registry hat diese Datei nicht akzeptiert: Prüfen Sie die Syntax (Doppelpunkte, Klammern, Kommas) und die Typnamen. {atLine} Einzelheiten stehen unten.",
         "thrift_include": "Ein Thrift-Muster muss eine einzige eigenständige Datei sein: „include“ und „cpp_include“ werden nicht unterstützt. Fügen Sie die benötigten Typen in dieselbe Datei ein.",
         "thrift_unsupported": "Dieses Muster enthält ein Element, das die Registry nicht unterstützt: {what}. Zum Prüfen von Objekten genügen struct, union, exception, enum und typedef.",
         "thrift_what_service": "service (Dienste)",
@@ -10668,7 +10690,7 @@
         "thrift_duplicate_field": "Zwei Felder desselben Typs haben denselben Namen. Geben Sie ihnen verschiedene Namen.",
         "thrift_duplicate_value": "Zwei Werte desselben Enums haben denselben Namen. Geben Sie ihnen verschiedene Namen.",
         "thrift_dotted_name": "Ein Name, den eine Deklaration einführt, darf keinen Punkt enthalten. Punkte dienen nur Verweisen in andere Dateien, die nicht unterstützt werden.",
-        "previous_unreadable": "Die neue Version wurde nicht verglichen: Die vorherige Version {version} wurde nach lockereren Regeln gespeichert und besteht die Prüfung der Registry nicht mehr, daher ließ sie sich nicht prüfen. Fügen Sie den korrigierten Text als neues Muster hinzu oder stellen Sie die Kompatibilität für diese Version auf „none“.",
+        "previous_unreadable": "Die neue Version wurde nicht verglichen: Die vorherige Version {version} wurde nach lockereren Regeln gespeichert und besteht die Prüfung der Registry nicht mehr, daher ließ sie sich nicht prüfen. Stellen Sie die Kompatibilität des ganzen Musters auf „none“, fügen Sie diese Version hinzu und stellen Sie die Kompatibilität wieder her, oder fügen Sie den korrigierten Text als neues Muster hinzu.",
         "thrift_type_missing": "Das Muster verwendet einen Typ, der darin nicht definiert ist. Definieren Sie jeden Typ in derselben Datei.",
         "thrift_typedef": "Ein typedef verweist auf sich selbst, oder eine Kette von typedefs ist zu lang. Unterbrechen Sie den Zyklus oder kürzen Sie die Kette.",
         "thrift_no_value": "Dieses Muster hat keinen gültigen Wert: Der erste Typ verlangt sich selbst (oder ein Enum ohne Werte). Machen Sie eines dieser Felder optional.",
@@ -11385,6 +11407,8 @@
         "k_rejected": "Abgelehnt",
         "k_when": "Wann",
         "k_body": "Inhalt der Nachricht",
+        "k_state": "Zustand",
+        "state_at_write": "Beim Schreiben abgelehnt — die Nachricht hat das Topic nie erreicht",
         "no_consumer": "keiner — die Nachricht wurde beim Schreiben geprüft",
         "body_empty": "(leer)",
         "truncated": "der Anfang des Inhalts wird angezeigt",

@@ -25,7 +25,7 @@
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, fmtCount, fmtBytes, fmtRetention, fmtDuration, contentTypeLabel } from '/js/modules/tentabus/format.js';
+import { T, fmtCount, fmtBytes, fmtRetention, fmtDuration, contentTypeLabel, contentTypeNoun } from '/js/modules/tentabus/format.js';
 import { compatibleSchemas, compatibleFormatsLabel, descriptionFits, DESCRIPTION_MAX } from '/js/modules/tentabus/topic-creator.js';
 import { schemaFormatLabel } from '/js/modules/tentabus/schemas.js';
 import { openChangeWindow } from '/js/modules/tentabus/windows.js';
@@ -541,7 +541,7 @@ export function openSettingsWindow(cardKey, ctx) {
     validation: topic.schemaId ? (VALIDATION_MODES.includes(topic.validation) ? topic.validation : 'off') : 'off',
   };
   const versionOf = (name) => Number(subjects.find((s) => s.subject === name)?.latestVersion) || 0;
-  const kind = contentTypeLabel(topic.contentType) || topic.contentType;
+  const kind = contentTypeNoun(topic.contentType) || topic.contentType;
   return openChangeWindow({
     ...common,
     title: titleOf('pattern'),

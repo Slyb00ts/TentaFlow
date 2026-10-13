@@ -545,3 +545,9 @@ test('loadTopicHiding: a failed reload keeps the rules the section showed; a fir
   assert.equal(world.state.hiding.policies, null);
   assert.equal(world.state.hiding.policiesError, 'błąd: Unavailable');
 });
+
+test('every failure the screen words goes through the plain-word refusals first (stored pattern, rule on a binary topic, pattern kind)', () => {
+  const line = source.split('\n').find((l) => l.startsWith('const describeBusError'));
+  assert.ok(line, 'describeBusError is defined');
+  assert.match(line, /schemaKindMismatchText\(err\?\.message\) \|\| busRefusalText\(err\?\.message\) \|\| mapBusErrorMessage/);
+});

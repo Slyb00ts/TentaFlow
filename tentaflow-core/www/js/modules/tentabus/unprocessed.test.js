@@ -283,6 +283,38 @@ test('"Pokaż": the failure, the times and the body as the reader may see it; th
   assert.deepEqual(led, ['retry']);
 });
 
+test('"Pokaż" of a binary body says so and shows a hex view, cut at 512 bytes with a note; a text body stays text', () => {
+  const rec = unprocessedRecord('wyniki-badan', consumerFailure({ offset: 7, atMs: NOW - 5 * MIN }));
+  rec.payload = new Uint8Array([0x0a, 0x00, 0x01, 0x4f, 0x72, 0x64, 0x00, 0xff]);
+  const win = openUnprocessedView({ rec, maxAttempts: 5, nowMs: NOW });
+  assert.equal(norm(win.querySelector('[data-role="payload-binary"]').textContent), 'Treść binarna, 8 bajtów');
+  assert.match(win.querySelector('[data-role="payload"]').textContent, /^0000 {2}0a 00 01 4f 72 64 00 ff {2,}\|\.\.\.Ord\.\.\|$/);
+  assert.equal(win.querySelector('[data-role="payload-cut"]'), null);
+  win.close(true);
+  rec.payload = new Uint8Array(600).fill(0xfe);
+  const big = openUnprocessedView({ rec, maxAttempts: 5, nowMs: NOW });
+  assert.equal(norm(big.querySelector('[data-role="payload-binary"]').textContent), 'Treść binarna, 600 bajtów');
+  assert.equal(norm(big.querySelector('[data-role="payload-cut"]').textContent), 'Pokazano pierwsze 512 z 600 bajtów.');
+  assert.equal(big.querySelector('[data-role="payload"]').textContent.split('\n').length, 32);
+  big.close(true);
+  rec.payload = enc('{"ok":true}');
+  const text = openUnprocessedView({ rec, maxAttempts: 5, nowMs: NOW });
+  assert.equal(text.querySelector('[data-role="payload-binary"]'), null);
+  assert.equal(text.querySelector('[data-role="payload"]').textContent, '{"ok":true}');
+  text.close(true);
+});
+
+test('"Pokaż" of a message refused on write has one state row, no partition, number or attempts', () => {
+  const rec = unprocessedRecord('wizyty', writeRejection({ offset: 3, atMs: NOW - MIN }));
+  const win = openUnprocessedView({ rec, maxAttempts: 5, nowMs: NOW });
+  const text = norm(win.textContent);
+  assert.match(text, /StanWiadomość odrzucona przy zapisie — nie trafiła do topiku/);
+  assert.doesNotMatch(text, /Partycja i numer/);
+  assert.doesNotMatch(text, /Próby/);
+  assert.doesNotMatch(text, /nie trafiła do topiku.*nie trafiła do topiku/);
+  win.close(true);
+});
+
 test('"Pokaż" says the error text is hidden when the topic\'s data-hiding rules blank it for the reader', () => {
   const r = consumerFailure({ offset: 7, atMs: NOW - 5 * MIN });
   r.headers = r.headers
@@ -411,8 +443,8 @@ test('every HL7 and XSD sentence a message can be refused with is told in Polish
   ];
   for (const [server, expected] of hl7) assert.equal(plainCheckError(server), expected, server);
   const xsd = [
-    ['/drzewo/dziecko: element is not allowed here', '/drzewo/dziecko: ten element nie może tu wystąpić.'],
-    ['/faktura/numer: element occurs more than once', '/faktura/numer: ten element występuje częściej, niż wolno.'],
+    ['/drzewo/dziecko: element is not allowed here', 'drzewo › dziecko: ten element nie może tu wystąpić.'],
+    ['/faktura/numer: element occurs more than once', 'faktura › numer: ten element występuje częściej, niż wolno.'],
     ['/faktura: required child elements are missing', 'faktura: brakuje wymaganych elementów w środku.'],
     ["/faktura: required child element 'termin' is missing", 'faktura: brakuje wymaganego elementu „termin”.'],
     ['/faktura: character data is not allowed in element-only content', 'faktura: ten element zawiera tylko inne elementy, więc nie może mieć tekstu.'],
@@ -424,11 +456,11 @@ test('every HL7 and XSD sentence a message can be refused with is told in Polish
     ['/faktura: document ends inside an open element', 'faktura: dokument kończy się wewnątrz otwartego elementu.'],
     ['/faktura: not well-formed XML', 'faktura: dokument nie jest poprawnym XML-em.'],
     ['/faktura: entity references other than the five predefined ones are not supported', 'faktura: odwołania do encji innych niż pięć wbudowanych nie są obsługiwane.'],
-    ['/faktura/kwota: value is not a valid xs:decimal', '/faktura/kwota: wartość nie jest poprawną wartością typu xs:decimal.'],
-    ['/faktura/numer: value is shorter than minLength', '/faktura/numer: wartość jest krótsza niż minLength.'],
-    ['/faktura/numer: value is longer than maxLength', '/faktura/numer: wartość jest dłuższa niż maxLength.'],
-    ['/faktura/numer: value does not match the pattern', '/faktura/numer: wartość nie pasuje do wzorca pattern.'],
-    ['/faktura/typ: value is not one of the enumerated values', '/faktura/typ: wartość nie jest jedną z dozwolonych wartości.'],
+    ['/faktura/kwota: value is not a valid xs:decimal', 'faktura › kwota: wartość nie jest poprawną wartością typu xs:decimal.'],
+    ['/faktura/numer: value is shorter than minLength', 'faktura › numer: wartość jest krótsza niż minLength.'],
+    ['/faktura/numer: value is longer than maxLength', 'faktura › numer: wartość jest dłuższa niż maxLength.'],
+    ['/faktura/numer: value does not match the pattern', 'faktura › numer: wartość nie pasuje do wzorca pattern.'],
+    ['/faktura/typ: value is not one of the enumerated values', 'faktura › typ: wartość nie jest jedną z dozwolonych wartości.'],
     ["/faktura: attribute 'id' is not declared", 'faktura: atrybut „id” nie jest opisany we wzorze.'],
     ["/faktura: required attribute 'id' is missing", 'faktura: brakuje wymaganego atrybutu „id”.'],
     ["/faktura: attribute 'xsi:type' is not supported (xsi:type and xsi:nil are not honoured)", 'faktura: atrybut „xsi:type” nie jest obsługiwany (xsi:type i xsi:nil nie są uwzględniane).'],
@@ -443,17 +475,17 @@ test('every HL7 and XSD sentence a message can be refused with is told in Polish
     ['<root>: bytes remain after the value', 'Po wartości zostały dodatkowe bajty (to nie jest pojedyncza wiadomość Avro bez nagłówka).'],
     ['/id: integer encoding is longer than 10 bytes or overflows 64 bits', 'id: liczba jest zapisana niepoprawnie (za długo).'],
     ['/id: int encoding is longer than 5 bytes', 'id: liczba jest zapisana niepoprawnie (za długo).'],
-    ['/lines/[]/qty: value does not fit the int type', '/lines/[]/qty: liczba nie mieści się w typie int.'],
+    ['/lines/[]/qty: value does not fit the int type', 'lines › każdy element › qty: liczba nie mieści się w typie int.'],
     ['/paid: boolean is neither 0 nor 1', 'paid: wartość logiczna musi być równa 0 albo 1.'],
     ['/customer: length is negative', 'customer: długość jest ujemna.'],
     ['/customer: declared length exceeds the remaining payload', 'customer: zapisana długość jest większa niż reszta wiadomości.'],
     ['/customer: string is not valid UTF-8', 'customer: tekst nie jest poprawnym UTF-8.'],
     ['/status: enum index is out of range', 'status: numer wartości wyliczenia jest poza listą.'],
     ['/note: union branch index is out of range', 'note: numer wariantu unii jest poza listą.'],
-    ['/lines/[]: block declares more items than the remaining payload can hold', '/lines/[]: tablica lub mapa deklaruje więcej elementów, niż mieści reszta wiadomości.'],
-    ['/lines/[]: block byte size does not match its items', '/lines/[]: rozmiar bloku tablicy lub mapy nie zgadza się z jego elementami.'],
-    ['/next/next: value is nested too deeply to check', '/next/next: wiadomość jest zagnieżdżona za głęboko, żeby ją sprawdzić.'],
-    ['/a/[]: document exceeds the validation work budget', '/a/[]: dokument jest zbyt duży, żeby sprawdzić go wzorem w rozsądnym czasie.'],
+    ['/lines/[]: block declares more items than the remaining payload can hold', 'lines › każdy element: tablica lub mapa deklaruje więcej elementów, niż mieści reszta wiadomości.'],
+    ['/lines/[]: block byte size does not match its items', 'lines › każdy element: rozmiar bloku tablicy lub mapy nie zgadza się z jego elementami.'],
+    ['/next/next: value is nested too deeply to check', 'next › next: wiadomość jest zagnieżdżona za głęboko, żeby ją sprawdzić.'],
+    ['/a/[]: document exceeds the validation work budget', 'a › każdy element: dokument jest zbyt duży, żeby sprawdzić go wzorem w rozsądnym czasie.'],
   ];
   for (const [server, expected] of avro) assert.equal(plainCheckError(server), expected, server);
   // The Protobuf checker's own sentences (protobuf.rs `Walker`); framing errors share the Avro ones.
@@ -464,7 +496,7 @@ test('every HL7 and XSD sentence a message can be refused with is told in Polish
     ['<root>: group wire types are not supported', 'Wiadomość używa starych grup Protobuf, których rejestr nie obsługuje.'],
     ['<root>: wire type is not valid', 'Pole ma niepoprawny sposób zapisu.'],
     ['/hashes: packed field does not hold a whole number of elements', 'hashes: lista zapisana w jednym kawałku nie składa się z całej liczby elementów.'],
-    ['/lines/qty: value does not fit the declared type', '/lines/qty: liczba nie mieści się w typie pola.'],
+    ['/lines/qty: value does not fit the declared type', 'lines › qty: liczba nie mieści się w typie pola.'],
     ['/kind: enum value is not declared in the closed enum', 'kind: ta wartość nie należy do typu wyliczeniowego (proto2 przyjmuje tylko zadeklarowane wartości).'],
     ['/id: required field is missing', 'id: brakuje pola wymaganego (required).'],
     ['/customer: declared length exceeds the remaining payload', 'customer: zapisana długość jest większa niż reszta wiadomości.'],
@@ -480,12 +512,12 @@ test('every HL7 and XSD sentence a message can be refused with is told in Polish
     ['<root>: field id is out of range', 'Numer pola jest poza dozwolonym zakresem.'],
     ['/lines: element wire type does not match the type declared for the field', 'lines: sposób zapisu elementów listy, zbioru lub mapy nie zgadza się z ich typem we wzorze.'],
     ['/status: enum value is not declared in the enum', 'status: ta wartość nie należy do typu wyliczeniowego.'],
-    ['/payment/voucher: more than one member of the union is set', '/payment/voucher: ustawiono więcej niż jednego członka unii.'],
+    ['/payment/voucher: more than one member of the union is set', 'payment › voucher: ustawiono więcej niż jednego członka unii.'],
     ['/n: integer encoding is longer than allowed or overflows its type', 'n: liczba jest zapisana niepoprawnie (za długo).'],
     ['/id: required field is missing', 'id: brakuje pola wymaganego (required).'],
       ['<root>: type code is not a Thrift type', 'Wiadomość nie jest zapisem Thrift.'],
     ['/xs: type code is not a Thrift type', 'xs: pole ma kod typu, którego Thrift nie zna.'],
-    ['/a/b: type code is not a Thrift type', '/a/b: pole ma kod typu, którego Thrift nie zna.'],
+    ['/a/b: type code is not a Thrift type', 'a › b: pole ma kod typu, którego Thrift nie zna.'],
   ];
   for (const [server, expected] of thrift) assert.equal(plainCheckError(server), expected, server);
   assert.equal(plainCheckError('/pacjent: a sentence nobody mapped'), '');
@@ -500,7 +532,7 @@ test('a very deep path is shown as its first and last elements, the full text st
   assert.equal(emoji, `/${'😀'.repeat(119)}…`, 'the cut counts code points, not UTF-16 units');
   assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/.test(emoji), 'no surrogate pair is split');
   const deep = `/drzewo${'/dziecko'.repeat(128)}: element is not allowed here`;
-  assert.equal(plainCheckError(deep), '/drzewo/dziecko/…/dziecko/dziecko: ten element nie może tu wystąpić.');
+  assert.equal(plainCheckError(deep), 'drzewo › dziecko › … › dziecko › dziecko: ten element nie może tu wystąpić.');
   const rec = unprocessedRecord('drzewa', {
     ...writeRejection({ offset: 4, atMs: NOW - MIN }),
     headers: headers({ 'dlq.source_topic': 'drzewa', 'dlq.reason': 'schema_violation', 'dlq.error_message': deep, 'dlq.rejected_at_ms': NOW - MIN }),
