@@ -1320,6 +1320,24 @@ fn apply_schema_binding_guard(
                 row.schema_type
             ),
         })?;
+    // The same reason as `field_policies::set_policy`, from the other side: a
+    // rule reads fields of JSON, XML or HL7 v2, so a binary pattern bound
+    // under existing rules would make every write fail and every read empty.
+    if binding_changed
+        && schema_type.is_binary()
+        && !repository::bus_field_policy_list_for_topic(db, &cfg.instance_id, org_id, &cfg.name)?
+            .is_empty()
+    {
+        return Err(BusServiceError::InvalidTopicConfig {
+            reason: format!(
+                "{}: cannot bind the {} pattern '{subject_name}' to topic '{}' while field \
+                 policies exist for it; delete its field policies first",
+                super::field_policies::BINARY_TOPIC_NO_POLICY,
+                schema_type.as_str(),
+                cfg.name
+            ),
+        });
+    }
     let format = PayloadFormat::from_content_type(&cfg.content_type);
     if let Some(required) = schema_type.required_payload_format() {
         if format != required {

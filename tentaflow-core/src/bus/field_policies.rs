@@ -1113,6 +1113,78 @@ mod tests {
     }
 
     #[test]
+    fn a_binary_pattern_cannot_be_bound_under_existing_rules_but_can_once_they_are_gone() {
+        use super::super::schema_registry::{registry, Compatibility, SchemaType};
+        let db = test_db();
+        registry::register(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "events.thrift",
+            SchemaType::Thrift,
+            "struct X { 1: i32 a }",
+            Some(Compatibility::None),
+            None,
+        )
+        .expect("register");
+        topics::create_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "ruled.events",
+            topics::TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create topic");
+        set_policy(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "ruled.events",
+            "any",
+            SUBJECT_ANY,
+            Direction::Read,
+            &field_set(&["a"]),
+            &BTreeSet::new(),
+            BusFieldPolicyExpect::Any,
+        )
+        .expect("a default topic takes a rule");
+        let bind = || {
+            topics::update_topic(
+                &db,
+                TEST_INSTANCE,
+                TEST_ORG,
+                "ruled.events",
+                topics::TopicOptions {
+                    schema_id: Some("events.thrift".to_string()),
+                    ..Default::default()
+                },
+                2_000,
+            )
+        };
+        let err = bind().expect_err("a binary pattern under existing rules");
+        assert!(
+            matches!(&err, BusServiceError::InvalidTopicConfig { reason }
+                if reason == "field policies cannot apply to a topic whose messages are binary: cannot bind the thrift pattern 'events.thrift' to topic 'ruled.events' while field policies exist for it; delete its field policies first"),
+            "{err:?}"
+        );
+        // A text pattern is no problem, and neither is the binary one once the rules are gone.
+        delete_policy(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "ruled.events",
+            "any",
+            SUBJECT_ANY,
+            Direction::Read,
+            None,
+        )
+        .expect("delete the rule");
+        bind().expect("no rules left");
+    }
+
+    #[test]
     fn set_policy_still_accepts_a_topic_with_a_text_pattern_and_the_default_content_type() {
         use super::super::schema_registry::{registry, Compatibility, SchemaType};
         let db = test_db();
