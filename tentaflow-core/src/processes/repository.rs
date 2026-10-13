@@ -20562,6 +20562,9 @@ fn close_cancelled_service_dispatch_on(
             "cancelled Service dispatch has no closable original phase");
         "EXTERNAL_OUTCOME_UNCERTAIN"
     };
+    // A recovery incident raised while this result waited ends with the activity
+    // (a boundary timer, an interrupting message, a terminate end).
+    resolve_recovery_incident_on(tx, &source.job_id, at_ms, false)?;
     let resolved = tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE incident_id=?2 AND instance_id=?3 AND scope_id=?4 AND job_id=?5 AND code=?6 AND resolved_at_ms IS NULL",
         params![at_ms,incident_id,instance_id,source.scope_id,source.job_id,expected_code])?;
     ensure!(resolved == 1, "cancelled Service history incident changed before resolution");
@@ -26653,6 +26656,12 @@ pub fn accept_job_result(
     // instance revision is left alone because the caller's expected revision
     // guards the plan.
     resolve_recovery_incident_on(&tx, job_id, at_ms, false)?;
+    // Both the canonical and the supplied plan are made from here on, and neither
+    // may meet a recovery incident that is still open.
+    let still_open: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_incidents WHERE job_id=?1 AND resolved_at_ms IS NULL AND code IN ('TOOL_RESULT_UNDECIDED','RESULT_RECOVERY_FAILED'))",
+        [job_id], |row| row.get(0))?;
+    ensure!(!still_open, "a recovery incident stayed open across Service acceptance");
     let (mut composite, retained_failure, result_index) = if let Some(prepared) = precomposed {
         prepared
     } else {
@@ -27167,7 +27176,7 @@ fn record_undecided_row(pool: &DbPool, job_id: &str, gone: bool, now_ms: i64) ->
         None => (now_ms, false, None),
     };
     tx.execute(
-        "INSERT INTO bpmn_result_recovery(invocation_id,first_undecided_at_ms,last_checked_ms,deferred_event_written) VALUES(?1,?2,?2,1) ON CONFLICT(invocation_id) DO UPDATE SET first_undecided_at_ms=COALESCE(first_undecided_at_ms,?2),deferred_event_written=1,last_checked_ms=?2,failed_passes=0",
+        "INSERT INTO bpmn_result_recovery(invocation_id,first_undecided_at_ms,last_checked_ms,deferred_event_written) VALUES(?1,?2,?2,1) ON CONFLICT(invocation_id) DO UPDATE SET first_undecided_at_ms=COALESCE(first_undecided_at_ms,?2),deferred_event_written=1,last_checked_ms=?2",
         params![row.invocation_id, now_ms])?;
     if !announced {
         let next_seq: u64 = tx.query_row(
@@ -27180,7 +27189,10 @@ fn record_undecided_row(pool: &DbPool, job_id: &str, gone: bool, now_ms: i64) ->
                 "tool_missing":gone,"deadline_ms":first + UNDECIDED_DEADLINE_MS}),
         }, now_ms, None)?;
     }
-    if incident.is_none() && (gone || now_ms - first >= UNDECIDED_DEADLINE_MS) {
+    let already_visible: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_incidents WHERE job_id=?1 AND resolved_at_ms IS NULL)",
+        [job_id], |r| r.get(0))?;
+    if incident.is_none() && !already_visible && (gone || now_ms - first >= UNDECIDED_DEADLINE_MS) {
         raise_recovery_incident_on(&tx, &row, "TOOL_RESULT_UNDECIDED",
             if gone { "the addon tool that produced this result no longer exists; the result stays recorded" }
             else { "the result of an addon tool could not be applied because its addon stayed unavailable" },
@@ -27195,7 +27207,7 @@ fn record_undecided_row(pool: &DbPool, job_id: &str, gone: bool, now_ms: i64) ->
 /// fails leaves the incident open instead of churning a new one, and the history
 /// says the incident ended.
 fn resolve_recovery_incident_on(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     job_id: &str,
     now_ms: i64,
     bump_instance_revision: bool,
@@ -27394,6 +27406,9 @@ pub fn fail_job_with_authority(
     if phase == "may_have_executed" {
         ensure!(observed.is_none(),
             "observed Service result must be persisted before failure handling");
+        // This failure carries its own incident; a recovery incident raised for
+        // the same row earlier must not stay open next to it.
+        resolve_recovery_incident_on(&tx, job_id, now_ms, false)?;
         let incident_id = Uuid::new_v4().to_string();
         let uncertain_code = "EXTERNAL_OUTCOME_UNCERTAIN";
         let uncertain_message = "The external effect may have occurred; direct retry is unavailable";
@@ -27417,6 +27432,7 @@ pub fn fail_job_with_authority(
     } else if phase == "prepared" {
         ensure!(observed.is_none(),
             "pre-dispatch Service failure cannot contain an external result");
+        resolve_recovery_incident_on(&tx, job_id, now_ms, false)?;
         let changed = tx.execute("UPDATE bpmn_service_invocations SET phase='proved_no_effect',phase_revision=phase_revision+1,updated_at_ms=?1 WHERE invocation_id=?2 AND phase='prepared' AND dispatch_evidence='no_boundary'",
             params![now_ms,invocation_id])?;
         ensure!(changed == 1, "pre-dispatch Service boundary changed");

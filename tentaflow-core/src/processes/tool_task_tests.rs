@@ -604,7 +604,18 @@ async fn observed_but_unaccepted(
     tentaflow_protocol::processes::ProcessInstance,
     repository::ClaimedProcessJob,
 ) {
-    let started = start_model(fixture, &tool_model(10, None));
+    observed_but_unaccepted_in(fixture, host, &tool_model(10, None)).await
+}
+
+async fn observed_but_unaccepted_in(
+    fixture: &Fixture,
+    host: &Arc<ScriptedToolHost>,
+    model: &ProcessModel,
+) -> (
+    tentaflow_protocol::processes::ProcessInstance,
+    repository::ClaimedProcessJob,
+) {
+    let started = start_model(fixture, model);
     let claimed = repository::claim_job(&fixture.db, "dying-worker", now_ms())
         .unwrap()
         .unwrap();
@@ -1856,8 +1867,244 @@ async fn the_deferral_state_is_cleared_once_the_job_is_dispatched() {
     let claimed = repository::claim_job(&fixture.db, "w", start + 60_000)
         .unwrap()
         .unwrap();
+    // A claim alone does not clear the state: a fallback deferral after it must
+    // still count towards the same deadline.
+    let after_claim = state(&fixture.db);
+    assert_eq!(after_claim.0, 2);
+    assert_eq!(after_claim.1, Some(start));
+    assert_eq!(after_claim.2.as_deref(), Some("TOOL_BUSY"));
     assert!(
         repository::commit_job_dispatch_boundary(&fixture.db, &claimed, "w", now_ms()).unwrap()
     );
     assert_eq!(state(&fixture.db), (0, None, None, None));
+}
+
+#[tokio::test]
+async fn a_boundary_timer_closing_the_activity_ends_the_recovery_incident_too() {
+    let host = ScriptedToolHost::new(json!(null));
+    let fixture = fixture_with(&host);
+    let model = super::runtime::test_support::with_boundaries(
+        tool_model(10, None),
+        "Service",
+        &[("Timer_1", true, 5)],
+    );
+    let started = start_model(&fixture, &model);
+    // A dispatched call whose worker died, and whose failure cannot be recorded:
+    // the start shows a recovery incident.
+    let claimed = repository::claim_job(&fixture.db, "dead", now_ms())
+        .unwrap()
+        .unwrap();
+    assert!(
+        repository::commit_job_dispatch_boundary(&fixture.db, &claimed, "dead", now_ms()).unwrap()
+    );
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_uncertainty BEFORE INSERT ON bpmn_incidents \
+         WHEN NEW.code='EXTERNAL_OUTCOME_UNCERTAIN' BEGIN SELECT RAISE(ABORT,'refused'); END;",
+        )
+        .unwrap();
+    repository::recover_jobs(&fixture.db, None, now_ms(), &repository::no_tool_authority).unwrap();
+    assert_eq!(
+        incident_rows(&fixture, &started.instance_id),
+        vec![("RESULT_RECOVERY_FAILED".to_owned(), false)]
+    );
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute_batch("DROP TRIGGER refuse_uncertainty;")
+        .unwrap();
+    // The boundary timer closes the activity: its dispatch is closed in history and the
+    // recovery incident goes with it.
+    let drained = super::timers::drain_due(&fixture.db, now_ms() + 60_000);
+    assert!(drained.completion.is_ok(), "{:?}", drained.completion);
+    assert_eq!(drained.fired, 1);
+    let rows = incident_rows(&fixture, &started.instance_id);
+    assert!(rows.iter().all(|(_, resolved)| *resolved), "{rows:?}");
+    let done =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert_ne!(done.status, ProcessInstanceStatus::Incident);
+    assert!(done.incidents.is_empty());
+}
+
+#[tokio::test]
+async fn a_start_time_failure_incident_does_not_block_the_retry_of_the_next_start() {
+    let host = ScriptedToolHost::new(json!({"hits": 1}));
+    let fixture = fixture_with(&host);
+    let started = start_model(&fixture, &tool_model(10, None));
+    let claimed = repository::claim_job(&fixture.db, "dead", now_ms())
+        .unwrap()
+        .unwrap();
+    fixture.db.write().unwrap().execute_batch(
+        "CREATE TRIGGER refuse_failure BEFORE INSERT ON bpmn_events WHEN NEW.kind='job_failed' \
+         BEGIN SELECT RAISE(ABORT,'failure refused'); END;").unwrap();
+    // First start: the interrupted job cannot be failed; that is shown at once.
+    assert_eq!(
+        repository::recover_jobs(&fixture.db, None, now_ms(), &repository::no_tool_authority)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        incident_rows(&fixture, &started.instance_id),
+        vec![("RESULT_RECOVERY_FAILED".to_owned(), false)]
+    );
+    // Next start succeeds: the job fails with its own incident and the earlier one closes.
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute_batch("DROP TRIGGER refuse_failure;")
+        .unwrap();
+    assert_eq!(
+        repository::recover_jobs(
+            &fixture.db,
+            None,
+            now_ms() + 1,
+            &repository::no_tool_authority
+        )
+        .unwrap(),
+        1
+    );
+    let rows = incident_rows(&fixture, &started.instance_id);
+    assert_eq!(
+        rows.iter().filter(|(_, resolved)| !*resolved).count(),
+        1,
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&("RESULT_RECOVERY_FAILED".to_owned(), true)),
+        "{rows:?}"
+    );
+    let current =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    repository::retry_job(
+        &fixture.db,
+        &fixture.owner,
+        &stamp("retry"),
+        &started.instance_id,
+        &claimed.job.job_id,
+        current.revision,
+    )
+    .expect("exactly one open incident, so the retry is allowed");
+}
+
+#[tokio::test]
+async fn a_failed_read_leaves_the_result_observed_and_a_missing_initiator_blocks_it() {
+    let host = ScriptedToolHost::new(json!(null));
+    let fixture = fixture_with(&host);
+    let (_, claimed) = observed_but_unaccepted(&fixture, &host).await;
+    let authority = super::runtime::tool_authority(fixture.dispatcher());
+    let nobody = |_: &str| false;
+    // The account table cannot be read right now: that is no verdict.
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute_batch(
+            "PRAGMA legacy_alter_table=ON; ALTER TABLE user_accounts RENAME TO user_accounts_held;",
+        )
+        .unwrap();
+    assert_eq!(
+        repository::recover_deferred_tool_results(
+            &fixture.db,
+            now_ms(),
+            &authority,
+            &nobody,
+            repository::RECOVERY_PAGE
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "observed");
+    fixture.db.write().unwrap().execute_batch(
+        "ALTER TABLE user_accounts_held RENAME TO user_accounts; PRAGMA legacy_alter_table=OFF;").unwrap();
+    // An initiator who is really gone is.
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute(
+            "UPDATE user_accounts SET is_active=0 WHERE id=?1",
+            [&fixture.owner.user_id],
+        )
+        .unwrap();
+    assert_eq!(
+        repository::recover_deferred_tool_results(
+            &fixture.db,
+            now_ms() + 1,
+            &authority,
+            &nobody,
+            repository::RECOVERY_PAGE
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        invocation(&fixture, &claimed.job.job_id).2,
+        "observed_blocked"
+    );
+}
+
+#[tokio::test]
+async fn an_undecided_pass_adds_no_incident_to_a_row_that_already_shows_one_and_keeps_its_failures()
+{
+    let host = ScriptedToolHost::new(json!(null));
+    let fixture = fixture_with(&host);
+    let (started, claimed) = observed_but_unaccepted(&fixture, &host).await;
+    *host.allow.lock().unwrap() = Err(ToolAccessError::Missing);
+    let authority = super::runtime::tool_authority(fixture.dispatcher());
+    let nobody = |_: &str| false;
+    // One failed pass is counted ...
+    fixture.db.write().unwrap().execute_batch(
+        "CREATE TRIGGER refuse_note BEFORE INSERT ON bpmn_events WHEN NEW.kind='service_result_deferred' \
+         BEGIN SELECT RAISE(ABORT,'note refused'); END;").unwrap();
+    repository::recover_deferred_tool_results(
+        &fixture.db,
+        now_ms(),
+        &authority,
+        &nobody,
+        repository::RECOVERY_PAGE,
+    )
+    .unwrap();
+    let failures = |fixture: &Fixture| -> i64 {
+        fixture
+            .db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT failed_passes FROM bpmn_result_recovery",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(failures(&fixture), 1);
+    // ... and a pass that then records fine does not forget it.
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute_batch("DROP TRIGGER refuse_note;")
+        .unwrap();
+    // The row already shows an incident of its own: no second one is added.
+    fixture.db.write().unwrap().execute(
+        "INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) \
+         SELECT 'own-incident',instance_id,scope_id,node_id,job_id,'SOMETHING_ELSE','m',1 FROM bpmn_service_invocations WHERE job_id=?1",
+        [&claimed.job.job_id]).unwrap();
+    repository::recover_deferred_tool_results(
+        &fixture.db,
+        now_ms() + 1,
+        &authority,
+        &nobody,
+        repository::RECOVERY_PAGE,
+    )
+    .unwrap();
+    assert_eq!(failures(&fixture), 1);
+    assert_eq!(
+        incident_rows(&fixture, &started.instance_id),
+        vec![("SOMETHING_ELSE".to_owned(), false)]
+    );
 }

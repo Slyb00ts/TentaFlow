@@ -916,13 +916,18 @@ impl FlowDispatcher {
         crate::processes::tool_host::ToolAccessError,
     > {
         use crate::processes::tool_host::ToolAccessError;
+        // A failed read is "cannot tell now", never a verdict on the initiator: only
+        // a user who is missing, inactive or outside the organization is lost.
         repository::get_user_account_by_id(&self.db, user_id)
-            .ok()
-            .flatten()
+            .map_err(|_| ToolAccessError::Unavailable)?
             .filter(|user| user.is_active)
             .ok_or(ToolAccessError::Initiator)?;
-        crate::services::rbac::resolve_org_context(&self.db, user_id, Some(org_id))
-            .map_err(|_| ToolAccessError::Initiator)?;
+        crate::services::rbac::resolve_org_context(&self.db, user_id, Some(org_id)).map_err(
+            |error| match error {
+                crate::services::rbac::OrgContextError::Db(_) => ToolAccessError::Unavailable,
+                _ => ToolAccessError::Initiator,
+            },
+        )?;
         self.process_tool_host()
             .ok_or(ToolAccessError::Unavailable)?
             .authorize(addon_id, tool_name, user_id, org_id)
