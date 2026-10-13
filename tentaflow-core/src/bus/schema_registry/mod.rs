@@ -44,6 +44,7 @@ mod json_schema;
 mod protobuf;
 pub mod registry;
 mod text_guard;
+pub use text_guard::Screened;
 mod thrift;
 mod xsd;
 
@@ -346,25 +347,25 @@ pub(super) fn shorten_path(path: &str) -> String {
 /// between registration-time (`compile`, `check_compatibility`,
 /// `derive_subschema`) and publish-time (`validate`) responsibilities.
 pub trait SchemaKindOps: Send + Sync {
+    /// Whether a U+FEFF at the very start of the text is part of the format
+    /// (XML allows a byte-order mark, and its reader strips it). Every other
+    /// kind, and every other position, treats it as hidden content.
+    fn allows_leading_bom(&self) -> bool {
+        false
+    }
+
     /// Parse + compile at registration time. Everything expensive or
     /// rejectable happens here, never on the publish path. The text is
     /// screened for hidden characters (`text_guard`) before any format
     /// parser sees it, so every kind refuses the same set the same way.
     fn compile(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
-        text_guard::reject_hidden_characters(schema_text)?;
-        self.compile_screened(schema_text)
+        self.compile_screened(text_guard::screen(schema_text, self.allows_leading_bom())?)
     }
 
-    /// The kind's own compile, for text `text_guard` has already passed.
-    /// Implementations are reached through [`SchemaKindOps::compile`] only.
-    fn compile_screened(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError>;
+    /// The kind's own compile. It takes [`Screened`] text, which only
+    /// `text_guard` can make, so it is reached through [`Self::compile`] alone.
+    fn compile_screened(&self, schema_text: Screened<'_>) -> Result<CompiledSchema, SchemaError>;
 
-    /// Publish-path check: bounded work, no schema re-parsing. A document
-    /// the check cannot decide within its budget is `LimitExceeded`, never
-    /// a `Violation`. The work it does is taken from `budget`, which a
-    /// publish batch shares across its records; a kind whose cost is linear
-    /// in the payload (already capped by `max_inline_bytes`) may leave it
-    /// untouched.
     fn validate_metered(
         &self,
         compiled: &CompiledSchema,
@@ -380,31 +381,51 @@ pub trait SchemaKindOps: Send + Sync {
     /// Owner decision 1: the schema describing EXACTLY the projection a
     /// field policy's `allowed` top-level field set produces (F4's binary
     /// codecs re-encode a read against it). Output must be deterministic
-    /// for the same inputs so it can be memoized by content.
-    /// A stored text is screened like a new one: a version kept from before
-    /// the screening existed fails here instead of passing its hidden
-    /// characters on into the derived text.
+    /// for the same inputs so it can be memoized by content. A stored text is
+    /// screened like a new one: a version kept from before the screening
+    /// existed fails here instead of passing its hidden characters on.
     fn derive_subschema(
         &self,
         schema_text: &str,
         allowed: &BTreeSet<String>,
     ) -> Result<String, SchemaError> {
-        text_guard::reject_hidden_characters(schema_text)?;
-        self.derive_screened(schema_text, allowed)
+        self.derive_screened(
+            text_guard::screen(schema_text, self.allows_leading_bom())?,
+            allowed,
+        )
     }
 
-    /// The kind's own derivation, for text `text_guard` has already passed.
+    /// The kind's own derivation; see [`Self::compile_screened`].
     fn derive_screened(
         &self,
-        schema_text: &str,
+        schema_text: Screened<'_>,
         allowed: &BTreeSet<String>,
     ) -> Result<String, SchemaError>;
 
-    /// `Compatibility::None` is always `Ok`.
+    /// `Compatibility::None` is always `Ok`. The NEW text is screened; the OLD
+    /// one is a stored version and is read as it is (a corrected version must
+    /// be registrable over a stored text that holds a hidden character), so
+    /// whatever the comparison says about it is passed through
+    /// `text_guard::sanitize` before it can reach the UI or the audit trail.
     fn check_compatibility(
         &self,
         old_schema_text: &str,
         new_schema_text: &str,
+        mode: Compatibility,
+    ) -> Result<(), SchemaError> {
+        self.compare_screened(
+            old_schema_text,
+            text_guard::screen(new_schema_text, self.allows_leading_bom())?,
+            mode,
+        )
+        .map_err(text_guard::sanitize_error)
+    }
+
+    /// The kind's own comparison; see [`Self::compile_screened`].
+    fn compare_screened(
+        &self,
+        old_schema_text: &str,
+        new_schema_text: Screened<'_>,
         mode: Compatibility,
     ) -> Result<(), SchemaError>;
 }

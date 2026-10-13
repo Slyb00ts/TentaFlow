@@ -29,6 +29,7 @@ import { effectiveVersion } from '/js/modules/tentabus/schema-windows.js';
 import { hl7FieldLabel, hl7SegmentLabel, orderSegments } from '/js/modules/tentabus/hl7-fields.js';
 import { downloadText } from '/js/lib/download.js';
 import { valueRow } from '/js/modules/tentabus/topic-settings.js';
+import { showHidden } from '/js/modules/tentabus/hidden-characters.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-table.js';
@@ -795,7 +796,7 @@ function paintText(body, view, effective) {
   setAttr(body.querySelector('[data-role="download"]'), 'disabled', !ready);
   const about = ready ? schemaDescription(info.schemaType, shown.text) : '';
   const aboutEl = body.querySelector('[data-role="about"]');
-  setText(aboutEl, about);
+  setText(aboutEl, showHidden(about));
   aboutEl.hidden = !about;
   paintProfile(body, ready && info.schemaType === 'hl7v2_profile' ? hl7ProfileView(shown.text) : null);
   paintAvroFields(body, ready && info.schemaType === 'avro' ? avroFieldsView(shown.text) : null);
@@ -804,7 +805,7 @@ function paintText(body, view, effective) {
   if (ready && editor.__tbText !== `${info.schemaType}\u0000${shown.text}`) {
     editor.__tbText = `${info.schemaType}\u0000${shown.text}`;
     editor.setAttribute('language', editorLanguage(info.schemaType));
-    editor.value = displayText(info.schemaType, shown.text);
+    editor.value = showHidden(displayText(info.schemaType, shown.text), { leadingBom: info.schemaType === 'xsd' });
   }
 }
 
@@ -820,7 +821,7 @@ function paintProfile(body, profile) {
     : `<span class="muted">${escapeHtml(T('schemas.detail.profile_none'))}</span>`);
   body.querySelector('[data-role="profile-fields-wrap"]').hidden = !profile.fields.length;
   setRowsIfChanged(body.querySelector('[data-role="profile-fields"]'), profile.fields.map((f) => ({
-    field: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(f.address)}</span></span>`,
+    field: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(showHidden(f.address))}</span></span>`,
     contains: f.label ? escapeHtml(f.label) : '<span class="tf-table__cell-sub">—</span>',
     _key: f.address,
   })));
@@ -831,8 +832,8 @@ function paintAvroFields(body, fields) {
   el.hidden = !fields?.length;
   if (!fields?.length) return;
   setRowsIfChanged(body.querySelector('[data-role="avro-fields"]'), fields.map((f) => ({
-    field: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(f.name)}</span></span>`,
-    type: `<span class="tf-table__cell--mono">${escapeHtml(f.type)}</span>`,
+    field: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(showHidden(f.name))}</span></span>`,
+    type: `<span class="tf-table__cell--mono">${escapeHtml(showHidden(f.type))}</span>`,
     presence: escapeHtml(T(f.optional ? 'schemas.detail.avro_optional' : 'schemas.detail.avro_required')),
     _key: f.name,
   })));
@@ -849,8 +850,8 @@ function paintProtobufFields(body, fields) {
   if (!fields?.length) return;
   setRowsIfChanged(body.querySelector('[data-role="protobuf-fields"]'), fields.map((f) => ({
     number: `<span class="tf-table__cell--mono">${escapeHtml(String(f.number))}</span>`,
-    field: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(f.name)}</span></span>`,
-    type: `<span class="tf-table__cell--mono">${escapeHtml(f.type)}</span>`,
+    field: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(showHidden(f.name))}</span></span>`,
+    type: `<span class="tf-table__cell--mono">${escapeHtml(showHidden(f.type))}</span>`,
     presence: escapeHtml(protobufPresence(f.label)),
     _key: String(f.number),
   })));
@@ -861,11 +862,11 @@ function paintThriftFields(body, view) {
   const fields = view?.fields;
   el.hidden = !fields?.length;
   if (!fields?.length) return;
-  body.querySelector('[data-role="thrift-title"]').textContent = T('schemas.detail.thrift_fields', { name: view.name });
+  body.querySelector('[data-role="thrift-title"]').textContent = T('schemas.detail.thrift_fields', { name: showHidden(view.name) });
   setRowsIfChanged(body.querySelector('[data-role="thrift-fields"]'), fields.map((f) => ({
     id: `<span class="tf-table__cell--mono">${escapeHtml(String(f.id))}</span>`,
-    field: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(f.name)}</span></span>`,
-    type: `<span class="tf-table__cell--mono">${escapeHtml(f.type)}</span>`,
+    field: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(showHidden(f.name))}</span></span>`,
+    type: `<span class="tf-table__cell--mono">${escapeHtml(showHidden(f.type))}</span>`,
     presence: escapeHtml(T(`schemas.detail.thrift_${f.label}`)),
     _key: String(f.id),
   })));

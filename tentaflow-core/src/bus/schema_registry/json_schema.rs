@@ -163,7 +163,7 @@ use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Number, Value};
 
 use super::{
-    Compatibility, CompiledSchema, SchemaError, SchemaKindOps, ValidationBudget,
+    Compatibility, CompiledSchema, SchemaError, SchemaKindOps, Screened, ValidationBudget,
     MAX_SCHEMA_TEXT_BYTES,
 };
 
@@ -1938,7 +1938,8 @@ impl JsonSchemaOps {
 }
 
 impl SchemaKindOps for JsonSchemaOps {
-    fn compile_screened(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
+    fn compile_screened(&self, schema_text: Screened<'_>) -> Result<CompiledSchema, SchemaError> {
+        let schema_text = schema_text.as_str();
         let out = compile_schema_text(schema_text)?;
 
         // Reject at REGISTRATION time (never at publish time) a schema whose
@@ -1989,9 +1990,10 @@ impl SchemaKindOps for JsonSchemaOps {
 
     fn derive_screened(
         &self,
-        schema_text: &str,
+        schema_text: Screened<'_>,
         allowed: &BTreeSet<String>,
     ) -> Result<String, SchemaError> {
+        let schema_text = schema_text.as_str();
         let root = self.compiled_root(schema_text)?;
         let Value::Object(mut map) = root else {
             return Err(SchemaError::Invalid(
@@ -2112,12 +2114,13 @@ impl SchemaKindOps for JsonSchemaOps {
             .expect("serializing a serde_json::Value never fails"))
     }
 
-    fn check_compatibility(
+    fn compare_screened(
         &self,
         old_schema_text: &str,
-        new_schema_text: &str,
+        new_schema_text: Screened<'_>,
         mode: Compatibility,
     ) -> Result<(), SchemaError> {
+        let new_schema_text = new_schema_text.as_str();
         if mode == Compatibility::None {
             return Ok(());
         }

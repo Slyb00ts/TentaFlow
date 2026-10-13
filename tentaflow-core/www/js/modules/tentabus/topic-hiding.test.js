@@ -206,6 +206,8 @@ test('where the known fields come from: the pattern, the HL7 dictionary, or nowh
   assert.equal(fieldLabel(hl7, 'PID-7'), 'Data urodzenia');
   assert.equal(fieldPhrase(json, 'pacjent'), 'dane pacjenta (pacjent)');
   assert.equal(fieldPhrase(json, 'termin'), 'termin');
+  assert.equal(fieldPhrase(json, 'na\u202Ame'), 'na⟦U+202A⟧me', 'a stored name with a hidden character is written out');
+  assert.equal(fieldLabel({ fields: [{ name: 'x', label: 'etykieta\u200B' }] }, 'x'), 'etykieta⟦U+200B⟧');
 });
 
 test('an address the server would refuse is refused before the request: HL7 SEGMENT-n, an XML name, nothing empty', () => {

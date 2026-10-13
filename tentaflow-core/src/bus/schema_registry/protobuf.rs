@@ -156,7 +156,7 @@ use ::protobuf::descriptor::{DescriptorProto, EnumDescriptorProto, FileDescripto
 
 use super::{
     shorten_path, Budget, Compatibility, CompiledSchema, LimitExceeded, SchemaError, SchemaKindOps,
-    ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
+    Screened, ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
 };
 
 mod prescan;
@@ -1681,7 +1681,8 @@ fn derive(c: &Compiled, allowed: &BTreeSet<String>) -> String {
 pub struct ProtobufOps;
 
 impl SchemaKindOps for ProtobufOps {
-    fn compile_screened(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
+    fn compile_screened(&self, schema_text: Screened<'_>) -> Result<CompiledSchema, SchemaError> {
+        let schema_text = schema_text.as_str();
         parse_text(schema_text).map(CompiledSchema::Protobuf)
     }
 
@@ -1704,9 +1705,10 @@ impl SchemaKindOps for ProtobufOps {
 
     fn derive_screened(
         &self,
-        schema_text: &str,
+        schema_text: Screened<'_>,
         allowed: &BTreeSet<String>,
     ) -> Result<String, SchemaError> {
+        let schema_text = schema_text.as_str();
         let compiled = parse_text(schema_text)?;
         let derived = derive(&compiled, allowed);
         // The projection must itself compile. It writes every type with its
@@ -1718,12 +1720,13 @@ impl SchemaKindOps for ProtobufOps {
         Ok(derived)
     }
 
-    fn check_compatibility(
+    fn compare_screened(
         &self,
         old_schema_text: &str,
-        new_schema_text: &str,
+        new_schema_text: Screened<'_>,
         mode: Compatibility,
     ) -> Result<(), SchemaError> {
+        let new_schema_text = new_schema_text.as_str();
         if mode == Compatibility::None {
             return Ok(());
         }
@@ -3473,7 +3476,7 @@ mod tests {
     }
 
     #[test]
-    fn a_string_literal_with_control_or_direction_characters_is_refused_without_echoing_it() {
+    fn a_hidden_character_in_a_string_literal_is_refused_by_the_shared_screen_without_echoing_it() {
         for literal in [
             "\u{1b}]0;x\u{7}\r",
             "a\u{7f}b",

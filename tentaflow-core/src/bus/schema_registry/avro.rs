@@ -95,7 +95,7 @@ use serde_json::Value;
 
 use super::{
     shorten_path, Budget, Compatibility, CompiledSchema, LimitExceeded, SchemaError, SchemaKindOps,
-    ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
+    Screened, ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
 };
 
 const MAX_SCHEMA_NODES: usize = 4096;
@@ -1809,7 +1809,8 @@ fn record_with(record: &RecordSchema, fields: Vec<RecordField>) -> Schema {
 pub struct AvroOps;
 
 impl SchemaKindOps for AvroOps {
-    fn compile_screened(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
+    fn compile_screened(&self, schema_text: Screened<'_>) -> Result<CompiledSchema, SchemaError> {
+        let schema_text = schema_text.as_str();
         parse_text(schema_text).map(|(_, compiled)| CompiledSchema::Avro(compiled))
     }
 
@@ -1830,9 +1831,10 @@ impl SchemaKindOps for AvroOps {
 
     fn derive_screened(
         &self,
-        schema_text: &str,
+        schema_text: Screened<'_>,
         allowed: &BTreeSet<String>,
     ) -> Result<String, SchemaError> {
+        let schema_text = schema_text.as_str();
         let (schema, _) = parse_text(schema_text)?;
         let Schema::Record(root) = &schema else {
             return Err(invalid(
@@ -1859,12 +1861,13 @@ impl SchemaKindOps for AvroOps {
         Ok(derived)
     }
 
-    fn check_compatibility(
+    fn compare_screened(
         &self,
         old_schema_text: &str,
-        new_schema_text: &str,
+        new_schema_text: Screened<'_>,
         mode: Compatibility,
     ) -> Result<(), SchemaError> {
+        let new_schema_text = new_schema_text.as_str();
         if mode == Compatibility::None {
             return Ok(());
         }

@@ -37,7 +37,7 @@ use serde_json::{Map, Value};
 use crate::bus::payload_format::{hl7v2, FormatError, PayloadFormat};
 
 use super::{
-    Compatibility, CompiledSchema, SchemaError, SchemaKindOps, ValidationBudget,
+    Compatibility, CompiledSchema, SchemaError, SchemaKindOps, Screened, ValidationBudget,
     MAX_SCHEMA_TEXT_BYTES,
 };
 
@@ -229,7 +229,8 @@ fn is_populated(value: &str) -> bool {
 pub struct Hl7v2ProfileOps;
 
 impl SchemaKindOps for Hl7v2ProfileOps {
-    fn compile_screened(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
+    fn compile_screened(&self, schema_text: Screened<'_>) -> Result<CompiledSchema, SchemaError> {
+        let schema_text = schema_text.as_str();
         let profile = parse_profile(schema_text)?;
         let mut fields_by_segment: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         for field in profile.fields.values() {
@@ -293,9 +294,10 @@ impl SchemaKindOps for Hl7v2ProfileOps {
 
     fn derive_screened(
         &self,
-        schema_text: &str,
+        schema_text: Screened<'_>,
         allowed: &BTreeSet<String>,
     ) -> Result<String, SchemaError> {
+        let schema_text = schema_text.as_str();
         let mut profile = parse_profile(schema_text)?;
         // A projected message keeps every segment and blanks the fields a
         // policy hides, so only field requirements can stop holding.
@@ -303,12 +305,13 @@ impl SchemaKindOps for Hl7v2ProfileOps {
         Ok(render(&profile))
     }
 
-    fn check_compatibility(
+    fn compare_screened(
         &self,
         old_schema_text: &str,
-        new_schema_text: &str,
+        new_schema_text: Screened<'_>,
         mode: Compatibility,
     ) -> Result<(), SchemaError> {
+        let new_schema_text = new_schema_text.as_str();
         if mode == Compatibility::None {
             return Ok(());
         }

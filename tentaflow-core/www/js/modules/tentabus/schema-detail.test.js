@@ -534,3 +534,15 @@ test('the Thrift card reads a directive as the server does: CRLF, a block commen
   assert.deepEqual(thriftFieldsView('struct A { 1: i32 a = 1 }\nstruct B { 1: string b = "http://x" } // tentabus:struct B\n'), b);
   assert.deepEqual(thriftFieldsView('struct A { 1: i32 a }\nstruct B { 1: string b = "// tentabus:struct B" }\n'), [{ id: 1, name: 'a', type: 'i32', label: 'default' }]);
 });
+
+test('a stored text with a hidden character is shown with the character written out, in the text, the description and the field tables', () => {
+  const legacy = '{"type":"record","name":"R","doc":"opis\u202E","fields":[{"name":"po\u200Ble","type":"string"}]}';
+  const avro = { ...wizyta, subject: 'stary', schemaType: 'avro' };
+  const { body } = mount({ name: 'stary', info: avro, shown: { version: 1, text: legacy, error: null } });
+  assert.equal(body.querySelector('[data-role="about"]').textContent, 'opis⟦U+202E⟧');
+  assert.match(body.querySelector('[data-role="avro-fields"]').rows[0].field, />po⟦U\+200B⟧le</);
+  assert.match(body.querySelector('[data-role="code"]').value, /"po⟦U\+200B⟧le"/);
+  assert.doesNotMatch(body.querySelector('[data-role="code"]').value, /[\u200B\u202E]/);
+  // "Kopiuj" and "Pobierz" still hand out the stored bytes.
+});
+

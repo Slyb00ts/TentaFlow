@@ -33611,6 +33611,45 @@ pub fn bus_schema_version_latest(
     .map_err(Into::into)
 }
 
+/// One stored schema version as the startup scan sees it.
+pub struct BusSchemaVersionText<'a> {
+    pub instance_id: &'a str,
+    pub org_id: &'a str,
+    pub subject: &'a str,
+    pub version: i64,
+    /// `None` when the subject row is gone (a version outlived it).
+    pub schema_type: Option<&'a str>,
+    pub schema_text: &'a str,
+}
+
+/// Every stored version, once, in table order, handed to `visit` without
+/// copying its text — the startup scan for hidden characters
+/// (`schema_registry::registry::warn_about_stored_hidden_characters`).
+pub fn bus_schema_versions_for_each_text(
+    pool: &DbPool,
+    mut visit: impl FnMut(BusSchemaVersionText<'_>),
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(
+        "SELECT v.instance_id, v.org_id, v.subject, v.version, s.schema_type, v.schema_text \
+         FROM bus_schema_versions v \
+         LEFT JOIN bus_schema_subjects s \
+           ON s.instance_id = v.instance_id AND s.org_id = v.org_id AND s.subject = v.subject",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        visit(BusSchemaVersionText {
+            instance_id: row.get_ref(0)?.as_str()?,
+            org_id: row.get_ref(1)?.as_str()?,
+            subject: row.get_ref(2)?.as_str()?,
+            version: row.get(3)?,
+            schema_type: row.get_ref(4)?.as_str_or_null()?,
+            schema_text: row.get_ref(5)?.as_str()?,
+        });
+    }
+    Ok(())
+}
+
 /// Content-addressed dedup lookup: registration returns the existing version
 /// instead of inserting a duplicate when this finds a hit (PLAN-F3 §2.1).
 pub fn bus_schema_version_by_content_hash(

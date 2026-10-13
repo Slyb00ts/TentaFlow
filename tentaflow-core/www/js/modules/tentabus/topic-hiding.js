@@ -35,6 +35,7 @@ import { I18n } from '/js/i18n.js';
 import { patchHtml, setAttr, setRowsIfChanged } from '/js/lib/dom-patch.js';
 import { T, fmtCount, fmtDayTime, contentKind } from '/js/modules/tentabus/format.js';
 import { schemaKind } from '/js/modules/tentabus/schemas.js';
+import { showHidden } from '/js/modules/tentabus/hidden-characters.js';
 import { subjectTitle, subjectSub } from '/js/modules/tentabus/topic-access.js';
 import { HL7_FIELDS, HL7_IMPLICIT_FIELDS, hl7FieldLabel } from '/js/modules/tentabus/hl7-fields.js';
 import '/js/components/tf-button.js';
@@ -235,13 +236,13 @@ export function fieldSource({ format, schema }) {
 
 /** The plain name of a field in `source`, '' when the source has none. */
 export function fieldLabel(source, name) {
-  return source.fields.find((f) => f.name === name)?.label || hl7FieldLabel(name) || '';
+  return showHidden(source.fields.find((f) => f.name === name)?.label || hl7FieldLabel(name) || '');
 }
 
 /** "PESEL pacjenta (pacjent.pesel)", or the bare address when the field has no name. */
 export function fieldPhrase(source, name) {
   const label = fieldLabel(source, name);
-  return label ? `${label} (${name})` : name;
+  return label ? `${label} (${showHidden(name)})` : showHidden(name);
 }
 
 const HL7_ADDRESS = /^[A-Z0-9]{3}-[1-9][0-9]*$/;
@@ -318,7 +319,7 @@ const chipHtml = (tone, text) => `<span class="tf-chip tf-chip--outline ${tone}"
 
 function fieldLineHtml(source, name, chip) {
   const label = fieldLabel(source, name);
-  return `<div><span class="tf-table__cell--mono">${escapeHtml(name)}</span> ${chip}</div>${label ? `<div class="tf-table__cell-sub">${escapeHtml(label)}</div>` : ''}`;
+  return `<div><span class="tf-table__cell--mono">${escapeHtml(showHidden(name))}</span> ${chip}</div>${label ? `<div class="tf-table__cell-sub">${escapeHtml(label)}</div>` : ''}`;
 }
 
 function limitedHtml(source, items) {

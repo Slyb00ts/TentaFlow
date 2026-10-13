@@ -117,7 +117,7 @@ use regex_automata::{Anchored, Input};
 
 use super::{
     shorten_path, Budget, Compatibility, CompiledSchema, LimitExceeded, SchemaError, SchemaKindOps,
-    ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
+    Screened, ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
 };
 
 const XSD_NS: &str = "http://www.w3.org/2001/XMLSchema";
@@ -4178,7 +4178,12 @@ fn compile_text(schema_text: &str) -> Result<Compiled, SchemaError> {
 }
 
 impl SchemaKindOps for XsdOps {
-    fn compile_screened(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
+    fn allows_leading_bom(&self) -> bool {
+        true
+    }
+
+    fn compile_screened(&self, schema_text: Screened<'_>) -> Result<CompiledSchema, SchemaError> {
+        let schema_text = schema_text.as_str();
         compile_text(schema_text).map(CompiledSchema::Xsd)
     }
 
@@ -4205,21 +4210,23 @@ impl SchemaKindOps for XsdOps {
 
     fn derive_screened(
         &self,
-        schema_text: &str,
+        schema_text: Screened<'_>,
         allowed: &BTreeSet<String>,
     ) -> Result<String, SchemaError> {
+        let schema_text = schema_text.as_str();
         let derived = derive_doc(&parse_doc(schema_text)?, allowed);
         // The projection must itself be a registrable schema.
         compile_doc(&derived)?;
         Ok(render(&derived))
     }
 
-    fn check_compatibility(
+    fn compare_screened(
         &self,
         old_schema_text: &str,
-        new_schema_text: &str,
+        new_schema_text: Screened<'_>,
         mode: Compatibility,
     ) -> Result<(), SchemaError> {
+        let new_schema_text = new_schema_text.as_str();
         if mode == Compatibility::None {
             return Ok(());
         }

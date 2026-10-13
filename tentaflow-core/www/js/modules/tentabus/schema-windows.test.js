@@ -1211,3 +1211,15 @@ test('a hidden or direction-changing character is refused in plain words for eve
     assert.ok(got.technical.includes(server), 'the server\'s sentence stays available');
   }
 });
+
+test('the invisible characters outside Cf are put in words with their own names', () => {
+  for (const [code, name] of [
+    ['U+115F', 'HANGUL CHOSEONG FILLER'], ['U+1160', 'HANGUL JUNGSEONG FILLER'], ['U+3164', 'HANGUL FILLER'],
+    ['U+FFA0', 'HALFWIDTH HANGUL FILLER'], ['U+034F', 'COMBINING GRAPHEME JOINER'],
+    ['U+180B', 'MONGOLIAN FREE VARIATION SELECTOR ONE'], ['U+180F', 'MONGOLIAN FREE VARIATION SELECTOR FOUR'],
+  ]) {
+    const got = refused('thrift', `the schema contains an invisible or direction-controlling character ${code} (${name}) at line 5, column 2`);
+    assert.ok(got.text.includes(`niewidoczny znak albo znak zmieniający kierunek tekstu: ${code} (${name}).`), code);
+    assert.match(got.text, /W wierszu 5, w kolumnie 2\.$/, code);
+  }
+});

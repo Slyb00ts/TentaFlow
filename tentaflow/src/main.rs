@@ -407,6 +407,7 @@ async fn run_server(args: Args) -> Result<()> {
         Err(e) => error!("Sync Ledger nie zasiał domyślnych polityk core: {}", e),
         _ => {}
     }
+    tentaflow_core::bus::schema_registry::registry::warn_about_stored_hidden_characters(&db);
     match tentaflow_core::db::repository::ensure_trusted_nodes_in_sync_identity(&db) {
         Ok(n) if n > 0 => info!("Sync Ledger zarejestrował {} zaufanych nodów mesh", n),
         Err(e) => error!("Sync Ledger nie zarejestrował zaufanych nodów mesh: {}", e),

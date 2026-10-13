@@ -27,8 +27,8 @@ use crate::db::repository::{
 use crate::db::DbPool;
 
 use super::{
-    bump_generation, content_hash, schema_ref_id_for, Compatibility, SchemaError, SchemaType,
-    MAX_SCHEMA_TEXT_BYTES,
+    bump_generation, content_hash, schema_ref_id_for, text_guard, Compatibility, SchemaError,
+    SchemaType, MAX_SCHEMA_TEXT_BYTES,
 };
 
 /// Longest a subject name may be — mirrors `bus::topics::MAX_TOPIC_NAME_LEN`
@@ -882,6 +882,93 @@ pub fn register(
 /// more, so the new one cannot be compared with it. The dashboard recognizes
 /// the sentence (`schema-windows.js` `refusalHtml`): reword both together.
 pub const PREVIOUS_VERSION_UNREADABLE: &str = "the previous version of this subject could not be checked under the current rules of its format, so it cannot be compared with the new one";
+
+/// A stored schema version that holds a character the registration screen
+/// refuses (`text_guard`): it was stored before the screen existed, or arrived
+/// by sync. Carries where it stands and never the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredHiddenCharacter {
+    pub instance_id: String,
+    pub org_id: String,
+    pub subject: String,
+    pub version: i64,
+    pub code_point: String,
+    pub name: &'static str,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl StoredHiddenCharacter {
+    /// The line the startup scan logs for this version.
+    pub fn log_line(&self) -> String {
+        format!(
+            "TentaBus: stored schema version has a hidden character and will not compile; \
+             register a corrected version: instance={} org={} subject={} version={} \
+             character={} ({}) line={} column={}",
+            self.instance_id,
+            self.org_id,
+            self.subject,
+            self.version,
+            self.code_point,
+            self.name,
+            self.line,
+            self.column
+        )
+    }
+}
+
+/// One pass over every stored version, no parsing: the versions the screen
+/// would refuse today, and how many versions were looked at. An XSD may start
+/// with a byte-order mark, as on registration.
+pub fn scan_stored_hidden_characters(
+    db: &DbPool,
+) -> Result<(usize, Vec<StoredHiddenCharacter>), BusServiceError> {
+    let mut scanned = 0usize;
+    let mut found = Vec::new();
+    repository::bus_schema_versions_for_each_text(db, |row| {
+        scanned += 1;
+        let allow_bom = row
+            .schema_type
+            .and_then(SchemaType::parse)
+            .is_some_and(|kind| kind.ops().allows_leading_bom());
+        if let Some(hit) = text_guard::find_hidden(row.schema_text, allow_bom) {
+            found.push(StoredHiddenCharacter {
+                instance_id: row.instance_id.to_string(),
+                org_id: row.org_id.to_string(),
+                subject: row.subject.to_string(),
+                version: row.version,
+                code_point: hit.code_point(),
+                name: hit.name,
+                line: hit.line,
+                column: hit.column,
+            });
+        }
+    })?;
+    Ok((scanned, found))
+}
+
+/// Startup note (after migrations, before serving): one warning per affected
+/// version and one summary count. Nothing is changed or refused here; a topic
+/// bound to such a version says so on its next publish.
+pub fn warn_about_stored_hidden_characters(db: &DbPool) {
+    match scan_stored_hidden_characters(db) {
+        Ok((scanned, found)) if found.is_empty() => {
+            tracing::info!("TentaBus: {scanned} stored schema versions checked for hidden characters, none found");
+        }
+        Ok((scanned, found)) => {
+            for hit in &found {
+                tracing::warn!("{}", hit.log_line());
+            }
+            tracing::warn!(
+                "TentaBus: {} of {scanned} stored schema versions hold a hidden character and no longer compile",
+                found.len()
+            );
+        }
+        Err(e) => tracing::error!(
+            "TentaBus: the scan of stored schemas for hidden characters failed: {e}"
+        ),
+    }
+}
 
 /// Changes a subject's compatibility mode. Rejects a deprecated subject (review
 /// finding #8) — same check `register` already applies; a deprecated
@@ -1756,6 +1843,195 @@ mod tests {
         assert!(list_subjects(&db, "tentabus-00000001", "org-1")
             .unwrap()
             .is_empty());
+    }
+
+    const XSD_WITH_BOM: &str = "\u{FEFF}<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:element name=\"a\" type=\"xs:string\"/></xs:schema>";
+
+    fn register_text(
+        db: &DbPool,
+        subject: &str,
+        kind: SchemaType,
+        text: &str,
+    ) -> Result<RegisterOutcome, BusServiceError> {
+        register(
+            db,
+            "tentabus-00000001",
+            "org-1",
+            subject,
+            kind,
+            text,
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn an_xsd_with_a_leading_byte_order_mark_registers_and_no_other_kind_takes_one() {
+        let db = fresh_db();
+        assert_eq!(
+            register_text(&db, "invoice", SchemaType::Xsd, XSD_WITH_BOM)
+                .unwrap()
+                .version,
+            1
+        );
+        // A BOM anywhere else in an XSD is hidden content.
+        let mid = XSD_WITH_BOM.replacen("<xs:element", "\u{FEFF}<xs:element", 1);
+        let err = register_text(&db, "invoice2", SchemaType::Xsd, &mid).unwrap_err();
+        assert!(
+            matches!(&err, BusServiceError::InvalidArgument(m) if m.contains("U+FEFF")),
+            "{err:?}"
+        );
+        for (subject, kind) in [
+            ("json", SchemaType::JsonSchema),
+            ("profile", SchemaType::Hl7v2Profile),
+        ] {
+            let err = register_text(&db, subject, kind, "\u{FEFF}{}").unwrap_err();
+            assert!(
+                matches!(&err, BusServiceError::InvalidArgument(m) if m.contains("U+FEFF") && m.contains("line 1, column 1")),
+                "{err:?}"
+            );
+        }
+    }
+
+    fn plant(db: &DbPool, subject: &str, text: &str) {
+        db.write()
+            .unwrap()
+            .execute(
+                "UPDATE bus_schema_versions SET schema_text = ?1 WHERE subject = ?2",
+                [text, subject],
+            )
+            .unwrap();
+    }
+
+    fn seeded_for_the_scan() -> DbPool {
+        let db = fresh_db();
+        register_text(&db, "clean", SchemaType::JsonSchema, V1).unwrap();
+        register_text(&db, "invoice", SchemaType::Xsd, XSD_WITH_BOM).unwrap();
+        register_text(&db, "legacy", SchemaType::JsonSchema, V1).unwrap();
+        register_text(
+            &db,
+            "legacy-proto",
+            SchemaType::Protobuf,
+            "syntax = \"proto3\"; message M { int32 a = 1; }",
+        )
+        .unwrap();
+        plant(
+            &db,
+            "legacy",
+            "{\"type\":\"object\",\n \"description\":\"SECRETWORD \u{202E}tail\"}",
+        );
+        // A BOM on a kind that never took one, and a mid-text BOM in an XSD.
+        plant(
+            &db,
+            "legacy-proto",
+            "\u{FEFF}syntax = \"proto3\"; message SECRETWORD {}",
+        );
+        db.write()
+            .unwrap()
+            .execute(
+                "UPDATE bus_schema_versions SET schema_text = replace(schema_text, '<xs:element', char(65279) || '<xs:element') WHERE subject = 'invoice'",
+                [],
+            )
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn the_startup_scan_lists_each_affected_version_without_its_text() {
+        let db = seeded_for_the_scan();
+        let (scanned, mut found) = scan_stored_hidden_characters(&db).unwrap();
+        found.sort_by(|a, b| a.subject.cmp(&b.subject));
+        assert_eq!(scanned, 4);
+        // Columns count characters, and the BOM is one.
+        let at = XSD_WITH_BOM[..XSD_WITH_BOM.find("<xs:element").unwrap()]
+            .chars()
+            .count();
+        let expected = [
+            ("invoice", "U+FEFF", "ZERO WIDTH NO-BREAK SPACE", 1, at + 1),
+            ("legacy", "U+202E", "RIGHT-TO-LEFT OVERRIDE", 2, 28),
+            ("legacy-proto", "U+FEFF", "ZERO WIDTH NO-BREAK SPACE", 1, 1),
+        ];
+        assert_eq!(found.len(), expected.len(), "{found:?}");
+        for (hit, (subject, code, name, line, column)) in found.iter().zip(expected) {
+            assert_eq!(hit.instance_id, "tentabus-00000001");
+            assert_eq!(hit.org_id, "org-1");
+            assert_eq!(hit.subject, subject);
+            assert_eq!(hit.version, 1);
+            assert_eq!((hit.code_point.as_str(), hit.name), (code, name));
+            assert_eq!((hit.line, hit.column), (line, column), "{subject}");
+            let line_text = hit.log_line();
+            assert!(
+                line_text.contains(&format!("subject={subject} version=1")),
+                "{line_text}"
+            );
+            assert!(
+                line_text.contains(&format!(
+                    "character={code} ({name}) line={line} column={column}"
+                )),
+                "{line_text}"
+            );
+            assert!(line_text.contains("org=org-1"), "{line_text}");
+            assert!(
+                !line_text.contains("SECRETWORD"),
+                "the text must never be logged"
+            );
+            assert!(line_text
+                .chars()
+                .all(|c| text_guard::find_hidden(&c.to_string(), false).is_none()));
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_startup_warning_logs_one_line_per_version_and_one_summary() {
+        let db = seeded_for_the_scan();
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || warn_about_stored_hidden_characters(&db));
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 4, "{log}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.contains("WARN") && l.contains("subject="))
+                .count(),
+            3
+        );
+        assert!(
+            lines[3].contains("3 of 4 stored schema versions hold a hidden character"),
+            "{log}"
+        );
+        assert!(!log.contains("SECRETWORD"));
+        assert!(log
+            .chars()
+            .all(|c| text_guard::find_hidden(&c.to_string(), false).is_none()));
+    }
+
+    #[test]
+    fn the_startup_scan_of_a_clean_database_says_so_in_one_line() {
+        let db = fresh_db();
+        register_text(&db, "clean", SchemaType::JsonSchema, V1).unwrap();
+        register_text(&db, "invoice", SchemaType::Xsd, XSD_WITH_BOM).unwrap();
+        let (scanned, found) = scan_stored_hidden_characters(&db).unwrap();
+        assert_eq!((scanned, found.len()), (2, 0));
     }
 
     #[test]

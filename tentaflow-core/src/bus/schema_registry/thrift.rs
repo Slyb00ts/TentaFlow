@@ -111,7 +111,7 @@ use std::fmt::Write as _;
 
 use super::{
     shorten_path, Budget, Compatibility, CompiledSchema, LimitExceeded, SchemaError, SchemaKindOps,
-    ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
+    Screened, ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
 };
 
 mod idl;
@@ -771,7 +771,8 @@ fn derive(c: &Compiled, allowed: &BTreeSet<String>) -> String {
 pub struct ThriftOps;
 
 impl SchemaKindOps for ThriftOps {
-    fn compile_screened(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
+    fn compile_screened(&self, schema_text: Screened<'_>) -> Result<CompiledSchema, SchemaError> {
+        let schema_text = schema_text.as_str();
         parse_text(schema_text).map(CompiledSchema::Thrift)
     }
 
@@ -792,9 +793,10 @@ impl SchemaKindOps for ThriftOps {
 
     fn derive_screened(
         &self,
-        schema_text: &str,
+        schema_text: Screened<'_>,
         allowed: &BTreeSet<String>,
     ) -> Result<String, SchemaError> {
+        let schema_text = schema_text.as_str();
         let compiled = parse_text(schema_text)?;
         let derived = derive(&compiled, allowed);
         // The projection must itself compile. Enum values grow when
@@ -804,12 +806,13 @@ impl SchemaKindOps for ThriftOps {
         Ok(derived)
     }
 
-    fn check_compatibility(
+    fn compare_screened(
         &self,
         old_schema_text: &str,
-        new_schema_text: &str,
+        new_schema_text: Screened<'_>,
         mode: Compatibility,
     ) -> Result<(), SchemaError> {
+        let new_schema_text = new_schema_text.as_str();
         if mode == Compatibility::None {
             return Ok(());
         }

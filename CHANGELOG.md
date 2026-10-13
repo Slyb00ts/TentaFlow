@@ -881,20 +881,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 - Rejestr wzorców odmawia tekstu z niewidocznym znakiem albo znakiem zmieniającym
   kierunek tekstu („Trojan Source”), w każdym formacie (JSON Schema, Avro,
   Protobuf, Thrift, XSD, profil HL7 v2) i w całym tekście, także w komentarzach i
-  literałach. Jedno sprawdzenie (`schema_registry/text_guard.rs`) działa przed
-  parserem formatu, przy rejestracji (protokół binarny, REST, addony) i przy
-  wyprowadzaniu podschematu. Odmawiane są: sterujące C0 poza TAB, LF i CR, DEL i
-  C1, znaki kierunku (U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069),
-  niewidoczne (U+00AD, U+180E, U+200B–U+200D, U+2060–U+2064), U+FEFF także na
-  początku (znacznik BOM; żaden parser go nie przyjmował), reszta kategorii Cf
-  oraz U+2028 i U+2029. Polskie litery i zwykłe emoji przechodzą; emoji sklejone
-  U+200D są odrzucane. Komunikat podaje znak (U+XXXX i nazwę), wiersz i kolumnę,
-  a panel wzorów mówi to po polsku („W wierszu N, w kolumnie M”). Odrzucenie znaku
-  w literale Protobuf i Thrift ma teraz to samo zdanie, co w pozostałych
-  formatach; stare, osobne sprawdzenia usunięto. Wersja zapisana wcześniej (albo
-  przyjęta z synchronizacji) z takim znakiem nie jest przepisywana: przy
-  następnej kompilacji topik odmawia z „zapisany wzór nie daje się skompilować…”
-  i tym samym zdaniem, a poprawioną wersję można zarejestrować normalnie.
+  literałach. Jedno sprawdzenie (`schema_registry/text_guard.rs`, lista w
+  `hidden_characters.json`) działa przed parserem formatu, przy rejestracji
+  (protokół binarny i REST), przy porównaniu z poprzednią wersją (sprawdzany jest
+  nowy tekst) i przy wyprowadzaniu podschematu. Odmawiane są: sterujące C0 poza
+  TAB, LF i CR, DEL i C1, znaki kierunku (U+061C, U+200E, U+200F,
+  U+202A–U+202E, U+2066–U+2069), niewidoczne (U+00AD, U+180E, U+200B–U+200D,
+  U+2060–U+2064), cała kategoria Cf (sprawdzona względem Unicode 16, najnowszego
+  dostępnego tu), U+2028 i U+2029, oraz niewidoczne znaki spoza Cf: wypełniacze
+  Hangul (U+115F, U+1160, U+3164, U+FFA0), U+034F i mongolskie wybieraki
+  U+180B–U+180D, U+180F. Celowo przechodzą wybieraki wariantów U+FE00–U+FE0F i
+  U+E0100–U+E01EF (emoji i glify CJK). U+FEFF jest odrzucany wszędzie poza
+  pierwszym znakiem XSD: czytnik XML go zdejmuje, a XML dopuszcza BOM, więc
+  plik z edytora nadal się rejestruje; w pozostałych formatach i w dalszej
+  części XSD jest odrzucany. Polskie litery i zwykłe emoji przechodzą; emoji
+  sklejone U+200D są odrzucane. Komunikat podaje znak (U+XXXX i nazwę), wiersz i
+  kolumnę (liczone w znakach Unicode), a panel wzorów mówi to po polsku („W
+  wierszu N, w kolumnie M”). Odrzucenie znaku w literale Protobuf i Thrift ma
+  teraz to samo zdanie, co w pozostałych formatach; stare, osobne sprawdzenia
+  usunięto. Szczegóły porównania budowane ze starego tekstu zapisują taki znak
+  jako `U+XXXX`, a panel wzorów pokazuje go w zapisanym tekście jako `⟦U+202E⟧`.
+- **Aktualizacja: wzorce zapisane wcześniej.** Wersja zapisana przed tą zmianą
+  (albo przyjęta z synchronizacji) z odrzucanym znakiem nie jest przepisywana,
+  ale przestaje się kompilować. Topik, który sprawdza wiadomości takim wzorcem,
+  odmawia publikacji zdaniem „zapisany wzór nie daje się skompilować…” z nazwą
+  znaku, wierszem i kolumną. Przy starcie (po migracjach, przed obsługą ruchu)
+  węzeł skanuje wszystkie zapisane wersje i dla każdej dotkniętej pisze w logu
+  jedną linię `WARN` zaczynającą się od `TentaBus: stored schema version has a
+  hidden character` (instancja, organizacja, nazwa wzoru, wersja, znak, wiersz,
+  kolumna; nigdy tekst), a na końcu jedną linię z liczbą („N of M stored schema
+  versions hold a hidden character”). Jak naprawić: zarejestruj poprawioną
+  wersję tego wzoru (porównanie czyta stary tekst bez tego sprawdzenia, więc
+  rejestracja działa); jeśli wzór jest wycofany, podepnij topik pod inny wzór.
+  Brak linii `WARN` oznacza, że nic nie wymaga uwagi.
 
 ## [0.4.0-beta.1] — 2026-09-29
 

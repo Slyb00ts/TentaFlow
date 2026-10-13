@@ -21,6 +21,7 @@
 // of a topic nobody listed are typed in as "the ones that stay visible".
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
+import { showHidden } from '/js/modules/tentabus/hidden-characters.js';
 import { T, fmtCount } from '/js/modules/tentabus/format.js';
 import { openChangeWindow, openConfirmWindow } from '/js/modules/tentabus/windows.js';
 import { directoryLoader, pickLabel } from '/js/modules/tentabus/topic-access.js';
@@ -52,8 +53,8 @@ function sourceNote(source) {
 function rowHtml(field) {
   return `
     <div class="tb-right-row" data-search="${escapeAttr(`${field.name} ${field.label || ''}`.toLocaleLowerCase())}">
-      <div class="tb-right-name"><b class="mono">${escapeHtml(field.name)}</b>${field.label ? `<span>${escapeHtml(field.label)}</span>` : ''}</div>
-      <tf-segmented size="md" data-field="${escapeAttr(field.name)}" aria-label="${escapeAttr(field.name)}"></tf-segmented>
+      <div class="tb-right-name"><b class="mono">${escapeHtml(showHidden(field.name))}</b>${field.label ? `<span>${escapeHtml(showHidden(field.label))}</span>` : ''}</div>
+      <tf-segmented size="md" data-field="${escapeAttr(field.name)}" aria-label="${escapeAttr(showHidden(field.name))}"></tf-segmented>
     </div>`;
 }
 
