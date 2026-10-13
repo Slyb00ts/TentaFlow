@@ -8354,22 +8354,33 @@ impl ProcessRuntime {
         let mut jobs = tokio::task::JoinSet::new();
         let mut send_cursor = super::messages::SendCursor::default();
         let mut last_deferred_recovery = tokio::time::Instant::now();
+        let mut deferred_pass: Option<tokio::task::JoinHandle<()>> = None;
         loop {
             if self.stop.is_cancelled() {
                 break;
             }
-            if last_deferred_recovery.elapsed() >= DEFERRED_RECOVERY_EVERY {
+            if last_deferred_recovery.elapsed() >= DEFERRED_RECOVERY_EVERY
+                && deferred_pass.as_ref().is_none_or(|pass| pass.is_finished())
+            {
                 last_deferred_recovery = tokio::time::Instant::now();
                 if let Some(dispatcher) = self.dispatcher.upgrade() {
-                    if let Err(error) = super::repository::recover_deferred_tool_results(
-                        &self.db,
-                        chrono::Utc::now().timestamp_millis(),
-                        &tool_authority(&dispatcher),
-                        &|job_id| self.running.contains_key(job_id),
-                        super::repository::RECOVERY_PAGE,
-                    ) {
-                        tracing::error!(error_len = error.to_string().len(), "deferred tool result recovery failed");
-                    }
+                    // Database and addon-registry work: off the async worker, and
+                    // never two passes at once.
+                    let worker = self.clone();
+                    deferred_pass = Some(tokio::task::spawn_blocking(move || {
+                        if let Err(error) = super::repository::recover_deferred_tool_results(
+                            &worker.db,
+                            chrono::Utc::now().timestamp_millis(),
+                            &tool_authority(&dispatcher),
+                            &|job_id| worker.running.contains_key(job_id),
+                            super::repository::RECOVERY_PAGE,
+                        ) {
+                            tracing::error!(
+                                error_len = error.to_string().len(),
+                                "deferred tool result recovery failed"
+                            );
+                        }
+                    }));
                 }
             }
             let drained = super::timers::drain_due(&self.db, chrono::Utc::now().timestamp_millis());
@@ -8453,6 +8464,9 @@ impl ProcessRuntime {
                     if self.dispatcher.upgrade().is_none() { break; }
                 }
             }
+        }
+        if let Some(pass) = deferred_pass.take() {
+            let _ = pass.await;
         }
         self.stop.cancel();
         for job in self.running.iter() {

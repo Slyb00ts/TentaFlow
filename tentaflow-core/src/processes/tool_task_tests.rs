@@ -1554,20 +1554,310 @@ async fn a_recovery_pass_is_paged_and_takes_the_rows_checked_longest_ago_first()
 }
 
 #[test]
-fn the_scan_and_claim_queries_have_indexes() {
+fn the_production_claim_and_scan_queries_use_their_indexes() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     crate::db::migrations::run(&conn).unwrap();
     let plan = |sql: &str| -> String {
         conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
             .unwrap()
-            .query_map([], |row| row.get::<_, String>(3))
+            .query_map([5_i64], |row| row.get::<_, String>(3))
             .unwrap()
             .map(|row| row.unwrap())
             .collect::<Vec<_>>()
             .join(" | ")
     };
-    assert!(plan("SELECT job_id FROM bpmn_service_invocations WHERE phase='observed' AND implementation_kind='addon_tool'")
-        .contains("idx_bpmn_invocations_observed_tool"));
-    assert!(plan("SELECT job_id FROM bpmn_jobs WHERE status='queued' AND (not_before_ms IS NULL OR not_before_ms<=5) ORDER BY created_at_ms")
-        .contains("idx_bpmn_jobs"));
+    let claim = plan(repository::CLAIM_CANDIDATES_SQL);
+    assert!(claim.contains("USING INDEX idx_bpmn_jobs_ready"), "{claim}");
+    // The index also delivers the rows in claim order: no sort of the queue.
+    assert!(!claim.contains("TEMP B-TREE"), "{claim}");
+    let scan = plan(repository::DEFERRED_SCAN_SQL);
+    assert!(
+        scan.contains("idx_bpmn_invocations_observed_tool"),
+        "{scan}"
+    );
+}
+
+fn incident_rows(fixture: &Fixture, instance_id: &str) -> Vec<(String, bool)> {
+    let conn = fixture.db.read().unwrap();
+    let mut statement = conn
+        .prepare("SELECT code,resolved_at_ms IS NOT NULL FROM bpmn_incidents WHERE instance_id=?1 ORDER BY at_ms,rowid")
+        .unwrap();
+    let rows = statement
+        .query_map([instance_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    rows
+}
+
+#[tokio::test]
+async fn a_failing_acceptance_keeps_one_incident_open_and_closes_it_with_the_result() {
+    let host = ScriptedToolHost::new(json!(null));
+    let fixture = fixture_with(&host);
+    let (started, claimed) = observed_but_unaccepted(&fixture, &host).await;
+    let authority = super::runtime::tool_authority(fixture.dispatcher());
+    let nobody = |_: &str| false;
+    // The authority check passes; the acceptance itself fails every time.
+    fixture.db.write().unwrap().execute_batch(
+        "CREATE TRIGGER refuse_acceptance BEFORE INSERT ON bpmn_events WHEN NEW.kind='service_result' \
+         BEGIN SELECT RAISE(ABORT,'acceptance refused'); END;").unwrap();
+    for pass in 0..9 {
+        repository::recover_deferred_tool_results(
+            &fixture.db,
+            now_ms() + pass,
+            &authority,
+            &nobody,
+            repository::RECOVERY_PAGE,
+        )
+        .unwrap();
+    }
+    // However many passes failed, there is exactly ONE incident row, still open.
+    assert_eq!(
+        incident_rows(&fixture, &started.instance_id),
+        vec![("RESULT_RECOVERY_FAILED".to_owned(), false)]
+    );
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "observed");
+    // Once the acceptance works, the same incident closes with the result.
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute_batch("DROP TRIGGER refuse_acceptance;")
+        .unwrap();
+    assert_eq!(
+        repository::recover_deferred_tool_results(
+            &fixture.db,
+            now_ms() + 100,
+            &authority,
+            &nobody,
+            repository::RECOVERY_PAGE
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        incident_rows(&fixture, &started.instance_id),
+        vec![("RESULT_RECOVERY_FAILED".to_owned(), true)]
+    );
+    assert_eq!(
+        events_of(&fixture, &started.instance_id, "incident_resolved"),
+        1
+    );
+    let done =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert_eq!(done.status, ProcessInstanceStatus::Completed);
+}
+
+#[tokio::test]
+async fn one_undecided_row_that_cannot_be_recorded_does_not_cost_the_rest_of_the_page() {
+    let host = ScriptedToolHost::new(json!(null));
+    let fixture = fixture_with(&host);
+    let (first, _) = observed_but_unaccepted(&fixture, &host).await;
+    let (second, _) = observed_but_unaccepted(&fixture, &host).await;
+    *host.allow.lock().unwrap() = Err(ToolAccessError::Unavailable);
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TRIGGER refuse_note BEFORE INSERT ON bpmn_events \
+         WHEN NEW.kind='service_result_deferred' AND NEW.instance_id='{}' \
+         BEGIN SELECT RAISE(ABORT,'note refused'); END;",
+            first.instance_id
+        ))
+        .unwrap();
+    let authority = super::runtime::tool_authority(fixture.dispatcher());
+    let nobody = |_: &str| false;
+    repository::recover_deferred_tool_results(
+        &fixture.db,
+        now_ms(),
+        &authority,
+        &nobody,
+        repository::RECOVERY_PAGE,
+    )
+    .unwrap();
+    assert_eq!(
+        events_of(&fixture, &second.instance_id, "service_result_deferred"),
+        1
+    );
+    assert_eq!(
+        events_of(&fixture, &first.instance_id, "service_result_deferred"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_flow_result_that_cannot_be_recovered_shows_up_on_the_first_start() {
+    let fixture = Fixture::new();
+    let flow_id = flow(&fixture.db, &fixture.owner, &graph("recover", None));
+    let started = start_model(
+        &fixture,
+        &service_model(
+            &flow_id,
+            ActivityVerification::Condition {
+                expression: "true".into(),
+            },
+        ),
+    );
+    let claimed = repository::claim_job(&fixture.db, "flow-worker", now_ms())
+        .unwrap()
+        .unwrap();
+    assert!(repository::commit_job_dispatch_boundary(
+        &fixture.db,
+        &claimed,
+        "flow-worker",
+        now_ms()
+    )
+    .unwrap());
+    let observed = repository::ObservedActivityResult {
+        result: tentaflow_protocol::processes::ActivityResult {
+            outcome: ActivityOutcome::Completed,
+            code: None,
+            summary: "done".into(),
+            outputs: json!({"payload": null, "variables": {}, "artifacts": {}}),
+            evidence: Vec::new(),
+        },
+        origin: ActivityResultOrigin::Envelope,
+        expression_observation: None,
+    };
+    repository::record_job_observation(&fixture.db, &claimed, "flow-worker", &observed, now_ms())
+        .unwrap();
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute_batch(&format!(
+            "DROP TRIGGER bpmn_service_invocations_immutable;
+         UPDATE bpmn_service_invocations SET observed_result_json='{{}}' WHERE job_id='{}';",
+            claimed.job.job_id
+        ))
+        .unwrap();
+    assert_eq!(
+        repository::recover_jobs(&fixture.db, None, now_ms(), &repository::no_tool_authority)
+            .unwrap(),
+        0
+    );
+    // Nothing revisits a flow result, so waiting for five restarts would hide it.
+    assert_eq!(
+        incident_rows(&fixture, &started.instance_id),
+        vec![("RESULT_RECOVERY_FAILED".to_owned(), false)]
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_queued_job_fails_alone_and_the_next_one_is_claimed() {
+    let host = ScriptedToolHost::new(json!({"hits": 1}));
+    let fixture = fixture_with(&host);
+    let bad = start_model(&fixture, &tool_model(10, None));
+    let good = start_model(&fixture, &tool_model(10, None));
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute_batch(&format!(
+            "PRAGMA foreign_keys=OFF; \
+             UPDATE bpmn_instances SET version=99 WHERE instance_id='{}'; \
+             UPDATE bpmn_jobs SET created_at_ms=created_at_ms-1000 WHERE instance_id='{}'; \
+             PRAGMA foreign_keys=ON;",
+            bad.instance_id, bad.instance_id
+        ))
+        .unwrap();
+    let claimed = repository::claim_job(&fixture.db, "w", now_ms())
+        .unwrap()
+        .expect("the healthy job behind the broken one is claimed");
+    assert_eq!(claimed.job.instance_id, good.instance_id);
+    assert_eq!(
+        incident_rows(&fixture, &bad.instance_id),
+        vec![("SERVICE_SOURCE_UNREADABLE".to_owned(), false)]
+    );
+}
+
+#[tokio::test]
+async fn a_denial_closes_the_incident_raised_while_the_result_waited() {
+    let host = ScriptedToolHost::new(json!(null));
+    let fixture = fixture_with(&host);
+    let (started, claimed) = observed_but_unaccepted(&fixture, &host).await;
+    *host.allow.lock().unwrap() = Err(ToolAccessError::Missing);
+    let authority = super::runtime::tool_authority(fixture.dispatcher());
+    let nobody = |_: &str| false;
+    repository::recover_deferred_tool_results(
+        &fixture.db,
+        now_ms(),
+        &authority,
+        &nobody,
+        repository::RECOVERY_PAGE,
+    )
+    .unwrap();
+    assert_eq!(
+        incident_rows(&fixture, &started.instance_id),
+        vec![("TOOL_RESULT_UNDECIDED".to_owned(), false)]
+    );
+    *host.allow.lock().unwrap() = Err(ToolAccessError::PermissionDenied);
+    repository::recover_deferred_tool_results(
+        &fixture.db,
+        now_ms() + 1,
+        &authority,
+        &nobody,
+        repository::RECOVERY_PAGE,
+    )
+    .unwrap();
+    assert_eq!(
+        invocation(&fixture, &claimed.job.job_id).2,
+        "observed_blocked"
+    );
+    assert_eq!(
+        incident_rows(&fixture, &started.instance_id),
+        vec![
+            ("TOOL_RESULT_UNDECIDED".to_owned(), true),
+            ("EXTERNAL_RESULT_NOT_APPLIED".to_owned(), false)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn deferring_a_claim_that_is_no_longer_ours_is_a_no_op_not_an_error() {
+    let host = ScriptedToolHost::new(json!({"hits": 1}));
+    let fixture = fixture_with(&host);
+    start_model(&fixture, &tool_model(10, None));
+    let claimed = repository::claim_job(&fixture.db, "owner", now_ms())
+        .unwrap()
+        .unwrap();
+    assert!(
+        repository::commit_job_dispatch_boundary(&fixture.db, &claimed, "owner", now_ms()).unwrap()
+    );
+    // Another worker, and the job is already dispatched: stale, so nothing happens.
+    assert_eq!(
+        repository::defer_job(&fixture.db, &claimed, "stale-worker", "TOOL_BUSY", now_ms())
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        invocation(&fixture, &claimed.job.job_id).2,
+        "may_have_executed"
+    );
+}
+
+#[tokio::test]
+async fn the_deferral_state_is_cleared_once_the_job_is_dispatched() {
+    let host = ScriptedToolHost::new(json!({"hits": 1}));
+    let fixture = fixture_with(&host);
+    start_model(&fixture, &tool_model(10, None));
+    let busy =
+        |_: &repository::ProcessActor, _: &str| repository::ClaimAdmission::Defer("TOOL_BUSY");
+    let start = now_ms();
+    repository::claim_job_where(&fixture.db, "w", start, &busy).unwrap();
+    repository::claim_job_where(&fixture.db, "w", start + 5_000, &busy).unwrap();
+    let state = |db: &crate::db::DbPool| -> (i64, Option<i64>, Option<String>, Option<i64>) {
+        db.read().unwrap().query_row(
+            "SELECT defer_count,first_deferred_at_ms,last_defer_code,not_before_ms FROM bpmn_jobs",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap()
+    };
+    assert_eq!(state(&fixture.db).0, 2);
+    let claimed = repository::claim_job(&fixture.db, "w", start + 60_000)
+        .unwrap()
+        .unwrap();
+    assert!(
+        repository::commit_job_dispatch_boundary(&fixture.db, &claimed, "w", now_ms()).unwrap()
+    );
+    assert_eq!(state(&fixture.db), (0, None, None, None));
 }

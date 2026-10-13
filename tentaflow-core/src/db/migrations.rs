@@ -1321,7 +1321,7 @@ fn bpmn_deferred_jobs_and_result_recovery(conn: &Connection) -> Result<()> {
              CHECK (typeof(defer_count)='integer' AND defer_count>=0);
          ALTER TABLE bpmn_jobs ADD COLUMN first_deferred_at_ms INTEGER;
          ALTER TABLE bpmn_jobs ADD COLUMN last_defer_code TEXT;
-         CREATE INDEX idx_bpmn_jobs_ready ON bpmn_jobs(status, not_before_ms, created_at_ms);
+         CREATE INDEX idx_bpmn_jobs_ready ON bpmn_jobs(status, created_at_ms, job_id);
          CREATE INDEX idx_bpmn_invocations_observed_tool
              ON bpmn_service_invocations(job_id)
              WHERE phase='observed' AND implementation_kind='addon_tool';

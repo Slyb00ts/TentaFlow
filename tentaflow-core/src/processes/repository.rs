@@ -23932,6 +23932,10 @@ fn job_activation_live_on(conn: &Connection, job_id: &str) -> Result<bool> {
     )?)
 }
 
+/// The queued jobs a claim looks at, oldest first. A constant so a test can ask
+/// the planner about the very query the worker runs.
+pub const CLAIM_CANDIDATES_SQL: &str = "SELECT j.job_id,j.instance_id,j.scope_id,j.node_id,i.org_id,i.initiator_user_id FROM bpmn_jobs j JOIN bpmn_service_invocations v ON v.job_id=j.job_id AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id AND v.phase='prepared' AND v.dispatch_evidence='no_boundary' JOIN bpmn_instances i ON i.instance_id=j.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id AND t.node_id=j.node_id JOIN bpmn_scopes s ON s.instance_id=j.instance_id AND s.scope_id=j.scope_id WHERE j.status='queued' AND (j.not_before_ms IS NULL OR j.not_before_ms<=?1) AND i.status IN ('running','waiting','incident') AND t.status='waiting' AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled','error')) ORDER BY j.created_at_ms,j.job_id LIMIT 16";
+
 /// How long a queued tool task may keep being put off (addon busy, not running
 /// yet) before it raises an incident for a person. Nothing has run in that time.
 pub const DEFER_DEADLINE_MS: i64 = 10 * 60 * 1000;
@@ -23975,18 +23979,26 @@ pub fn claim_job_where(
     // asks the addon runtime and the account tables, which must not happen while
     // this connection holds the write lock.
     type Candidate = (String, String, String, String, String, String);
-    let (candidates, deferred, chosen): (Vec<Candidate>, Vec<(Candidate, &'static str)>, Option<Candidate>) = {
+    let (candidates, deferred, broken, chosen): (Vec<Candidate>, Vec<(Candidate, &'static str)>, Vec<(Candidate, String)>, Option<Candidate>) = {
         let conn = pool.read()?;
-        let mut statement = conn.prepare(
-            "SELECT j.job_id,j.instance_id,j.scope_id,j.node_id,i.org_id,i.initiator_user_id FROM bpmn_jobs j JOIN bpmn_service_invocations v ON v.job_id=j.job_id AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id AND v.phase='prepared' AND v.dispatch_evidence='no_boundary' JOIN bpmn_instances i ON i.instance_id=j.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id AND t.node_id=j.node_id JOIN bpmn_scopes s ON s.instance_id=j.instance_id AND s.scope_id=j.scope_id WHERE j.status='queued' AND (j.not_before_ms IS NULL OR j.not_before_ms<=?1) AND i.status IN ('running','waiting','incident') AND t.status='waiting' AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled','error')) ORDER BY j.created_at_ms,j.job_id LIMIT 16")?;
+        let mut statement = conn.prepare(CLAIM_CANDIDATES_SQL)?;
         let candidates = statement
             .query_map([now_ms], |row| -> rusqlite::Result<Candidate> { Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, String>(3)?,row.get::<_, String>(4)?,row.get::<_, String>(5)?)) })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         let mut deferred = Vec::new();
+        let mut broken = Vec::new();
         let mut chosen = None;
         for candidate in &candidates {
-            let source_ref = job_source_ref_on(&conn, &candidate.0)?;
+            // A job whose source cannot even be read is failed on its own below;
+            // it must not keep every job behind it from being claimed.
+            let source_ref = match job_source_ref_on(&conn, &candidate.0) {
+                Ok(source_ref) => source_ref,
+                Err(error) => {
+                    broken.push((candidate.clone(), bounded_failure_message(&format!("{error:#}"))));
+                    continue;
+                }
+            };
             let actor = ProcessActor { org_id: candidate.4.clone(), user_id: candidate.5.clone() };
             match admit(&actor, &source_ref) {
                 ClaimAdmission::Admit => {
@@ -23996,7 +24008,7 @@ pub fn claim_job_where(
                 ClaimAdmission::Defer(code) => deferred.push((candidate.clone(), code)),
             }
         }
-        (candidates, deferred, chosen)
+        (candidates, deferred, broken, chosen)
     };
     if candidates.is_empty() {
         return Ok(None);
@@ -24008,6 +24020,14 @@ pub fn claim_job_where(
             "SELECT status='queued' FROM bpmn_jobs WHERE job_id=?1", [job_id], |row| row.get(0))?;
         if still_queued {
             defer_queued_on(&tx, job_id, instance_id, scope_id, node_id, code, now_ms)?;
+        }
+    }
+    for ((job_id, instance_id, scope_id, node_id, _, _), reason) in &broken {
+        let still_queued: bool = tx.query_row(
+            "SELECT status='queued' FROM bpmn_jobs WHERE job_id=?1", [job_id], |row| row.get(0))?;
+        if still_queued {
+            fail_queued_job_on(&tx, job_id, instance_id, scope_id, node_id,
+                "SERVICE_SOURCE_UNREADABLE", reason, now_ms)?;
         }
     }
     let queued = chosen;
@@ -24278,12 +24298,9 @@ pub fn defer_job(
 ) -> Result<Option<DeferOutcome>> {
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
-    let on_hold: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM bpmn_service_invocations WHERE invocation_id=?1 AND job_id=?2 AND phase='prepared' AND dispatch_evidence='no_boundary')",
-        params![claimed.invocation_id, claimed.job.job_id],
-        |row| row.get(0),
-    )?;
-    ensure!(on_hold, "only a job that has not been dispatched can be deferred");
+    // The fenced update comes first: a claim that is no longer ours is simply
+    // not deferred (Ok(None)), and only a claim that still is must also be
+    // undispatched.
     let changed = tx.execute(
         "UPDATE bpmn_jobs SET status='queued',worker_id=NULL,lease_until_ms=NULL,updated_at_ms=?1 WHERE job_id=?2 AND status='running' AND worker_id=?3 AND attempt=?4 AND fence=?5",
         params![now_ms, claimed.job.job_id, worker_id, claimed.job.attempt,
@@ -24292,6 +24309,12 @@ pub fn defer_job(
     if changed != 1 {
         return Ok(None);
     }
+    let on_hold: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_service_invocations WHERE invocation_id=?1 AND job_id=?2 AND phase='prepared' AND dispatch_evidence='no_boundary')",
+        params![claimed.invocation_id, claimed.job.job_id],
+        |row| row.get(0),
+    )?;
+    ensure!(on_hold, "only a job that has not been dispatched can be deferred");
     let outcome = defer_queued_on(&tx, &claimed.job.job_id, &claimed.job.instance_id,
         &claimed.job.scope_id, &claimed.job.node_id, code, now_ms)?;
     tx.commit()?;
@@ -24401,6 +24424,11 @@ fn commit_job_dispatch_boundary_on(
         "UPDATE bpmn_service_invocations SET phase='may_have_executed',dispatch_evidence='committed_boundary',dispatch_attempt=?1,dispatch_fence=?2,dispatch_worker_id=?3,dispatch_committed_at_ms=?4,phase_revision=phase_revision+1,updated_at_ms=?4 WHERE invocation_id=?5 AND job_id=?6 AND phase='prepared' AND dispatch_evidence='no_boundary' AND stable_request_id=?7 AND EXISTS(SELECT 1 FROM bpmn_jobs j WHERE j.job_id=bpmn_service_invocations.job_id AND j.status='running' AND j.worker_id=?3 AND j.attempt=?1 AND j.fence=?2 AND j.lease_until_ms>=?4)",
         params![claimed.job.attempt,sql_integer(claimed.job.fence)?,worker_id,
             at_ms,claimed.invocation_id,claimed.job.job_id,claimed.request_id])?;
+    if changed == 1 {
+        // Dispatched jobs are never deferred again; a later retry starts clean.
+        tx.execute("UPDATE bpmn_jobs SET not_before_ms=NULL,defer_count=0,first_deferred_at_ms=NULL,last_defer_code=NULL WHERE job_id=?1",
+            [&claimed.job.job_id])?;
+    }
     Ok(changed == 1)
 }
 
@@ -24446,6 +24474,8 @@ fn block_observed_invocation_on(
     if reason != "activation_closed" {
         mark_service_incident_status_on(tx, instance_id, scope_id, job_id, at_ms)?;
     }
+    // A wait or recovery incident of this result ends with it.
+    resolve_recovery_incident_on(tx, job_id, at_ms, true)?;
     Ok(())
 }
 
@@ -26617,6 +26647,12 @@ pub fn accept_job_result(
             attempt,sql_integer(fence)?,observed_bytes,reserved_result_event_id])?;
     ensure!(acquired == 1,
         "Service acceptance owner or durable observation changed");
+    // The incident raised while this result waited or failed to recover closes in
+    // THIS transaction, before the plan is made: the plan then sees a healthy
+    // instance, and an acceptance that fails rolls the close back with it. The
+    // instance revision is left alone because the caller's expected revision
+    // guards the plan.
+    resolve_recovery_incident_on(&tx, job_id, at_ms, false)?;
     let (mut composite, retained_failure, result_index) = if let Some(prepared) = precomposed {
         prepared
     } else {
@@ -26802,6 +26838,9 @@ pub const UNDECIDED_DEADLINE_MS: i64 = 60 * 60 * 1000;
 /// Consecutive failed recovery passes over one row before it raises an incident.
 pub const RECOVERY_FAILURES_BEFORE_INCIDENT: i64 = 5;
 
+/// The periodic scan over observed addon tool results (`?1` is the page size).
+pub const DEFERRED_SCAN_SQL: &str = "SELECT j.job_id,j.attempt,j.fence,COALESCE(v.dispatch_worker_id,j.worker_id),j.instance_id,i.org_id,i.initiator_user_id,v.observed_result_json FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id JOIN bpmn_instances i ON i.instance_id=j.instance_id LEFT JOIN bpmn_result_recovery r ON r.invocation_id=v.invocation_id WHERE v.phase='observed' AND v.implementation_kind='addon_tool' ORDER BY COALESCE(r.last_checked_ms,0),j.created_at_ms,j.job_id LIMIT ?1";
+
 /// Rows one periodic recovery pass examines.
 pub const RECOVERY_PAGE: i64 = 64;
 
@@ -26811,8 +26850,19 @@ type ObservedRecoveryRow = (String, u32, u64, String, String, String, String, Op
 enum RecoveryStep {
     /// The result left the `observed` phase (applied or blocked).
     Resolved,
-    /// Left observed on purpose; `gone` marks a tool that no longer exists.
-    Waiting { gone: bool },
+    /// Left observed on purpose, for the reason given.
+    Waiting(WaitReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitReason {
+    /// The addon cannot answer yet.
+    Undecided,
+    /// The tool no longer exists.
+    ToolGone,
+    /// Concurrent transitions kept winning; nothing is wrong with the addon, so
+    /// nothing is recorded about it: the next pass simply tries again.
+    Conflict,
 }
 
 pub fn recover_jobs(
@@ -26846,13 +26896,28 @@ pub fn recover_jobs(
             fail_job(pool, &job_id, attempt, fence, &original_worker,
                 "INTERRUPTED", "the worker stopped before its Service result was observed",
                 now_ms, None).map(|failed| if failed { RecoveryStep::Resolved }
-                    else { RecoveryStep::Waiting { gone: false } })
+                    else { RecoveryStep::Waiting(WaitReason::Conflict) })
         };
         match outcome {
             Ok(RecoveryStep::Resolved) => recovered += 1,
-            Ok(RecoveryStep::Waiting { gone }) if phase == "observed" => waiting.push((job_id, gone)),
-            Ok(RecoveryStep::Waiting { .. }) => {}
-            Err(error) => report_recovery_failure(pool, &job_id, &error, now_ms),
+            Ok(RecoveryStep::Waiting(WaitReason::Undecided)) if phase == "observed" => {
+                waiting.push((job_id, false))
+            }
+            Ok(RecoveryStep::Waiting(WaitReason::ToolGone)) if phase == "observed" => {
+                waiting.push((job_id, true))
+            }
+            Ok(RecoveryStep::Waiting(_)) => {}
+            // Rows the periodic pass does not revisit (a flow result, a running
+            // job) would otherwise need five restarts to show up: they raise
+            // their incident on the first failure.
+            Err(error) => {
+                let threshold = if recovered_by_periodic_pass(pool, &job_id, &phase) {
+                    RECOVERY_FAILURES_BEFORE_INCIDENT
+                } else {
+                    1
+                };
+                report_recovery_failure(pool, &job_id, &error, now_ms, threshold)
+            }
         }
     }
     record_undecided_batch(pool, &waiting, now_ms);
@@ -26874,8 +26939,7 @@ pub fn recover_deferred_tool_results(
     page: i64,
 ) -> Result<u32> {
     let conn = pool.read()?;
-    let mut statement = conn.prepare(
-        "SELECT j.job_id,j.attempt,j.fence,COALESCE(v.dispatch_worker_id,j.worker_id),j.instance_id,i.org_id,i.initiator_user_id,v.observed_result_json FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id JOIN bpmn_instances i ON i.instance_id=j.instance_id LEFT JOIN bpmn_result_recovery r ON r.invocation_id=v.invocation_id WHERE v.phase='observed' AND v.implementation_kind='addon_tool' ORDER BY COALESCE(r.last_checked_ms,0),j.created_at_ms,j.job_id LIMIT ?1")?;
+    let mut statement = conn.prepare(DEFERRED_SCAN_SQL)?;
     let rows = statement.query_map([page], |row| {
         Ok((row.get::<_, String>(0)?,row.get::<_, u32>(1)?,row_u64(row,2)?,
             row.get::<_, String>(3)?,row.get::<_, String>(4)?,row.get::<_, String>(5)?,
@@ -26892,8 +26956,11 @@ pub fn recover_deferred_tool_results(
         }
         match recover_observed_job(pool, row, now_ms, tool_authority) {
             Ok(RecoveryStep::Resolved) => recovered += 1,
-            Ok(RecoveryStep::Waiting { gone }) => waiting.push((job_id, gone)),
-            Err(error) => report_recovery_failure(pool, &job_id, &error, now_ms),
+            Ok(RecoveryStep::Waiting(WaitReason::Undecided)) => waiting.push((job_id, false)),
+            Ok(RecoveryStep::Waiting(WaitReason::ToolGone)) => waiting.push((job_id, true)),
+            Ok(RecoveryStep::Waiting(WaitReason::Conflict)) => {}
+            Err(error) => report_recovery_failure(
+                pool, &job_id, &error, now_ms, RECOVERY_FAILURES_BEFORE_INCIDENT),
         }
     }
     record_undecided_batch(pool, &waiting, now_ms);
@@ -26932,8 +26999,8 @@ fn recover_observed_job(
         if !reports_denial {
             match tool_authority(&actor, addon_id, tool_name) {
                 ToolDecision::Allowed => {}
-                ToolDecision::Undecided => return Ok(RecoveryStep::Waiting { gone: false }),
-                ToolDecision::Gone => return Ok(RecoveryStep::Waiting { gone: true }),
+                ToolDecision::Undecided => return Ok(RecoveryStep::Waiting(WaitReason::Undecided)),
+                ToolDecision::Gone => return Ok(RecoveryStep::Waiting(WaitReason::ToolGone)),
                 ToolDecision::Denied => {
                     return Ok(if fail_job_with_authority(pool, &job_id, attempt, fence,
                         &original_worker, "SOURCE_ACCESS_REVOKED",
@@ -26941,35 +27008,65 @@ fn recover_observed_job(
                         now_ms, Some(&observed), true)? {
                         RecoveryStep::Resolved
                     } else {
-                        RecoveryStep::Waiting { gone: false }
+                        RecoveryStep::Waiting(WaitReason::Conflict)
                     });
                 }
             }
         }
     }
-    resolve_recovery_incident(pool, &job_id, now_ms)?;
+    // Any recovery incident closes inside the acceptance transaction itself, so
+    // a failed acceptance leaves it open instead of churning a new one.
     let controller_id = Uuid::new_v4().to_string();
-    for _ in 0..8 {
-        let snapshot = runtime_snapshot(pool, &actor, &instance_id)?;
-        match accept_job_result(pool, &actor, &job_id, attempt, fence,
-            &controller_id, &observed, snapshot.instance.revision,
-            ProcessPlanInput::Canonical, now_ms) {
-            Ok(_) => return Ok(RecoveryStep::Resolved),
+    accept_with_retries(
+        RECOVERY_ACCEPT_ATTEMPTS,
+        || {
+            let snapshot = runtime_snapshot(pool, &actor, &instance_id)?;
+            accept_job_result(pool, &actor, &job_id, attempt, fence, &controller_id, &observed,
+                snapshot.instance.revision, ProcessPlanInput::Canonical, now_ms).map(|_| ())
+        },
+        || block_closed_observed_job(pool, &job_id, now_ms),
+    )
+}
+
+const RECOVERY_ACCEPT_ATTEMPTS: usize = 8;
+
+/// Runs the canonical acceptance, retrying a lost race. A race that never lets
+/// go is a wait, not an error and not an addon problem.
+fn accept_with_retries(
+    attempts: usize,
+    mut accept: impl FnMut() -> Result<()>,
+    mut block_closed: impl FnMut() -> Result<bool>,
+) -> Result<RecoveryStep> {
+    for _ in 0..attempts {
+        match accept() {
+            Ok(()) => return Ok(RecoveryStep::Resolved),
             Err(error) if error.to_string().contains("revision conflict") => continue,
-            Err(_) if block_closed_observed_job(pool, &job_id, now_ms)? => {
-                return Ok(RecoveryStep::Resolved)
-            }
+            Err(_) if block_closed()? => return Ok(RecoveryStep::Resolved),
             Err(error) => return Err(error.context(
                 "durably observed Service result could not resume canonical acceptance")),
         }
     }
-    Ok(RecoveryStep::Waiting { gone: false })
+    Ok(RecoveryStep::Waiting(WaitReason::Conflict))
+}
+
+/// Whether the periodic pass revisits this row (an observed addon tool result).
+fn recovered_by_periodic_pass(pool: &DbPool, job_id: &str, phase: &str) -> bool {
+    phase == "observed"
+        && pool.read().ok().and_then(|conn| conn.query_row(
+            "SELECT implementation_kind FROM bpmn_service_invocations WHERE job_id=?1",
+            [job_id], |row| row.get::<_, String>(0)).ok()).as_deref() == Some("addon_tool")
 }
 
 /// Logs a row that recovery could not process (job id and size only) and counts
 /// the failure; after `RECOVERY_FAILURES_BEFORE_INCIDENT` passes in a row the
 /// row raises a visible incident.
-fn report_recovery_failure(pool: &DbPool, job_id: &str, error: &anyhow::Error, now_ms: i64) {
+fn report_recovery_failure(
+    pool: &DbPool,
+    job_id: &str,
+    error: &anyhow::Error,
+    now_ms: i64,
+    incident_after: i64,
+) {
     tracing::error!(job_id, error_len = format!("{error:#}").len(),
         "process result recovery failed for one row; the others continue");
     let outcome = (|| -> Result<()> {
@@ -26983,7 +27080,12 @@ fn report_recovery_failure(pool: &DbPool, job_id: &str, error: &anyhow::Error, n
         let (passes, incident): (i64, Option<String>) = tx.query_row(
             "SELECT failed_passes,incident_id FROM bpmn_result_recovery WHERE invocation_id=?1",
             [&row.invocation_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        if passes >= RECOVERY_FAILURES_BEFORE_INCIDENT && incident.is_none() {
+        // A row that already shows an open incident of its own (the script
+        // infrastructure one, say) is visible; a second would only add noise.
+        let already_visible: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bpmn_incidents WHERE job_id=?1 AND resolved_at_ms IS NULL)",
+            [job_id], |r| r.get(0))?;
+        if passes >= incident_after && incident.is_none() && !already_visible {
             raise_recovery_incident_on(&tx, &row, "RESULT_RECOVERY_FAILED",
                 "the observed Service result could not be recovered; it stays recorded",
                 now_ms)?;
@@ -27040,82 +27142,88 @@ fn raise_recovery_incident_on(
     Ok(())
 }
 
-/// Records, in one transaction, the rows a pass left undecided: a one-time
-/// `service_result_deferred` event the first time, and an incident once the tool
-/// is gone or the wait passes `UNDECIDED_DEADLINE_MS`. The row stays observed.
+/// Records the rows a pass left undecided: a one-time `service_result_deferred`
+/// event the first time, and an incident once the tool is gone or the wait passes
+/// `UNDECIDED_DEADLINE_MS`. The row stays observed. Each row has its own
+/// transaction, so one that cannot be recorded costs only itself.
 fn record_undecided_batch(pool: &DbPool, waiting: &[(String, bool)], now_ms: i64) {
-    if waiting.is_empty() {
-        return;
-    }
-    let outcome = (|| -> Result<()> {
-        let mut conn = pool.write()?;
-        let tx = conn.transaction()?;
-        for (job_id, gone) in waiting {
-            let Some(row) = recovery_row_on(&tx, job_id)? else { continue };
-            let state: Option<(i64, Option<String>)> = tx.query_row(
-                "SELECT first_undecided_at_ms,incident_id FROM bpmn_result_recovery WHERE invocation_id=?1",
-                [&row.invocation_id], |r| Ok((r.get::<_, Option<i64>>(0)?.unwrap_or(now_ms), r.get(1)?)),
-            ).optional()?;
-            let (first, incident) = match state {
-                Some((first, incident)) => {
-                    tx.execute("UPDATE bpmn_result_recovery SET last_checked_ms=?1,failed_passes=0 WHERE invocation_id=?2",
-                        params![now_ms, row.invocation_id])?;
-                    (first, incident)
-                }
-                None => (now_ms, None),
-            };
-            if tx.query_row("SELECT deferred_event_written FROM bpmn_result_recovery WHERE invocation_id=?1",
-                [&row.invocation_id], |r| r.get::<_, i64>(0)).optional()?.unwrap_or(0) == 0 {
-                tx.execute(
-                    "INSERT INTO bpmn_result_recovery(invocation_id,first_undecided_at_ms,last_checked_ms,deferred_event_written) VALUES(?1,?2,?2,1) ON CONFLICT(invocation_id) DO UPDATE SET first_undecided_at_ms=COALESCE(first_undecided_at_ms,?2),deferred_event_written=1,last_checked_ms=?2",
-                    params![row.invocation_id, now_ms])?;
-                let next_seq: u64 = tx.query_row(
-                    "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
-                    [&row.instance_id], |r| row_u64(r, 0))?;
-                insert_event_on(&tx, &row.instance_id, next_seq, None, &PlannedEvent {
-                    scope_id: row.scope_id.clone(), kind: "service_result_deferred".into(),
-                    node_id: Some(row.node_id.clone()),
-                    data: serde_json::json!({"job_id":row.job_id,"invocation_id":row.invocation_id,
-                        "tool_missing":gone,"deadline_ms":first + UNDECIDED_DEADLINE_MS}),
-                }, now_ms, None)?;
-            }
-            if incident.is_none() && (*gone || now_ms - first >= UNDECIDED_DEADLINE_MS) {
-                raise_recovery_incident_on(&tx, &row, "TOOL_RESULT_UNDECIDED",
-                    if *gone { "the addon tool that produced this result no longer exists; the result stays recorded" }
-                    else { "the result of an addon tool could not be applied because its addon stayed unavailable" },
-                    now_ms)?;
-            }
+    for (job_id, gone) in waiting {
+        if let Err(error) = record_undecided_row(pool, job_id, *gone, now_ms) {
+            report_recovery_failure(pool, job_id, &error, now_ms, RECOVERY_FAILURES_BEFORE_INCIDENT);
         }
-        tx.commit()?;
-        Ok(())
-    })();
-    if let Err(error) = outcome {
-        tracing::error!(error_len = error.to_string().len(), "undecided tool results could not be recorded");
     }
 }
 
-/// An observed result about to be applied closes the incident that was raised
-/// while it waited, so the instance is not left marked as broken.
-fn resolve_recovery_incident(pool: &DbPool, job_id: &str, now_ms: i64) -> Result<()> {
-    let pending: Option<String> = {
-        let conn = pool.read()?;
-        conn.query_row(
-            "SELECT r.incident_id FROM bpmn_result_recovery r JOIN bpmn_service_invocations v ON v.invocation_id=r.invocation_id WHERE v.job_id=?1 AND r.incident_id IS NOT NULL",
-            [job_id], |row| row.get(0)).optional()?
-    };
-    let Some(incident_id) = pending else { return Ok(()) };
+fn record_undecided_row(pool: &DbPool, job_id: &str, gone: bool, now_ms: i64) -> Result<()> {
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
-    let row = recovery_row_on(&tx, job_id)?.context("recovery row vanished")?;
-    tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE incident_id=?2 AND resolved_at_ms IS NULL",
+    let Some(row) = recovery_row_on(&tx, job_id)? else { return Ok(()) };
+    let state: Option<(Option<i64>, i64, Option<String>)> = tx.query_row(
+        "SELECT first_undecided_at_ms,deferred_event_written,incident_id FROM bpmn_result_recovery WHERE invocation_id=?1",
+        [&row.invocation_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).optional()?;
+    let (first, announced, incident) = match state {
+        Some((first, announced, incident)) => (first.unwrap_or(now_ms), announced != 0, incident),
+        None => (now_ms, false, None),
+    };
+    tx.execute(
+        "INSERT INTO bpmn_result_recovery(invocation_id,first_undecided_at_ms,last_checked_ms,deferred_event_written) VALUES(?1,?2,?2,1) ON CONFLICT(invocation_id) DO UPDATE SET first_undecided_at_ms=COALESCE(first_undecided_at_ms,?2),deferred_event_written=1,last_checked_ms=?2,failed_passes=0",
+        params![row.invocation_id, now_ms])?;
+    if !announced {
+        let next_seq: u64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+            [&row.instance_id], |r| row_u64(r, 0))?;
+        insert_event_on(&tx, &row.instance_id, next_seq, None, &PlannedEvent {
+            scope_id: row.scope_id.clone(), kind: "service_result_deferred".into(),
+            node_id: Some(row.node_id.clone()),
+            data: serde_json::json!({"job_id":row.job_id,"invocation_id":row.invocation_id,
+                "tool_missing":gone,"deadline_ms":first + UNDECIDED_DEADLINE_MS}),
+        }, now_ms, None)?;
+    }
+    if incident.is_none() && (gone || now_ms - first >= UNDECIDED_DEADLINE_MS) {
+        raise_recovery_incident_on(&tx, &row, "TOOL_RESULT_UNDECIDED",
+            if gone { "the addon tool that produced this result no longer exists; the result stays recorded" }
+            else { "the result of an addon tool could not be applied because its addon stayed unavailable" },
+            now_ms)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Closes the incident raised while a result waited or failed to recover, in
+/// the SAME transaction that applies or blocks the result: an acceptance that
+/// fails leaves the incident open instead of churning a new one, and the history
+/// says the incident ended.
+fn resolve_recovery_incident_on(
+    tx: &Transaction<'_>,
+    job_id: &str,
+    now_ms: i64,
+    bump_instance_revision: bool,
+) -> Result<()> {
+    let Some(row) = recovery_row_on(tx, job_id)? else { return Ok(()) };
+    let incident: Option<String> = tx.query_row(
+        "SELECT incident_id FROM bpmn_result_recovery WHERE invocation_id=?1",
+        [&row.invocation_id], |r| r.get(0)).optional()?.flatten();
+    let Some(incident_id) = incident else { return Ok(()) };
+    let closed = tx.execute("UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE incident_id=?2 AND resolved_at_ms IS NULL",
         params![now_ms, incident_id])?;
-    tx.execute("UPDATE bpmn_scopes SET status=CASE WHEN EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?2 AND scope_id=?3 AND resolved_at_ms IS NULL) THEN 'incident' ELSE 'running' END,revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND scope_id=?3 AND status='incident'",
-        params![now_ms, row.instance_id, row.scope_id])?;
-    tx.execute("UPDATE bpmn_instances SET status=CASE WHEN EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?2 AND resolved_at_ms IS NULL) THEN 'incident' ELSE 'running' END,revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND status='incident'",
-        params![now_ms, row.instance_id])?;
     tx.execute("UPDATE bpmn_result_recovery SET incident_id=NULL WHERE invocation_id=?1",
         [&row.invocation_id])?;
-    tx.commit()?;
+    if closed == 1 {
+        let next_seq: u64 = tx.query_row(
+            "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+            [&row.instance_id], |r| row_u64(r, 0))?;
+        insert_event_on(tx, &row.instance_id, next_seq, None, &PlannedEvent {
+            scope_id: row.scope_id.clone(), kind: "incident_resolved".into(),
+            node_id: Some(row.node_id.clone()),
+            data: serde_json::json!({"incident_id":incident_id,"invocation_id":row.invocation_id,
+                "job_id":row.job_id,"reason":"tool_result_recovered"}),
+        }, now_ms, None)?;
+    }
+    tx.execute("UPDATE bpmn_scopes SET status=CASE WHEN EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?2 AND scope_id=?3 AND resolved_at_ms IS NULL) THEN 'incident' ELSE 'running' END,revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND scope_id=?3 AND status='incident'",
+        params![now_ms, row.instance_id, row.scope_id])?;
+    tx.execute("UPDATE bpmn_instances SET status=CASE WHEN EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?2 AND resolved_at_ms IS NULL) THEN 'incident' ELSE 'running' END,revision=revision+?3,updated_at_ms=?1 WHERE instance_id=?2 AND status='incident'",
+        params![now_ms, row.instance_id, i64::from(bump_instance_revision)])?;
     Ok(())
 }
 
@@ -32839,5 +32947,40 @@ mod calendar_tests {
         let error = cancel_call_children_on(&conn, "instance", None, &[], "user", "instance_cancelled",
             1, None, None, true).unwrap_err();
         assert!(format!("{error:#}").contains("requires a transaction"), "{error:#}");
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn a_race_that_never_lets_go_is_a_conflict_wait_not_an_addon_problem() {
+        let mut tries = 0;
+        let mut closed_checks = 0;
+        let step = accept_with_retries(
+            RECOVERY_ACCEPT_ATTEMPTS,
+            || {
+                tries += 1;
+                Err(anyhow::anyhow!("process revision conflict"))
+            },
+            || {
+                closed_checks += 1;
+                Ok(false)
+            },
+        )
+        .unwrap();
+        assert!(matches!(step, RecoveryStep::Waiting(WaitReason::Conflict)));
+        assert_eq!((tries, closed_checks), (RECOVERY_ACCEPT_ATTEMPTS, 0));
+    }
+
+    #[test]
+    fn other_acceptance_errors_and_closed_activities_are_not_conflicts() {
+        let step = accept_with_retries(8, || Err(anyhow::anyhow!("boom")), || Ok(true)).unwrap();
+        assert!(matches!(step, RecoveryStep::Resolved));
+        let error = accept_with_retries(8, || Err(anyhow::anyhow!("boom")), || Ok(false))
+            .err()
+            .expect("an acceptance error surfaces");
+        assert!(format!("{error:#}").contains("boom"));
     }
 }
