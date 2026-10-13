@@ -26,18 +26,19 @@ export function withoutPartialCharacter(bytes) {
 export function bytesToPreviewText(bytes, maxBytes = 512, cut = false) {
   if (!bytes || bytes.length === 0) return '';
   const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  let slice = arr.subarray(0, maxBytes);
-  if (cut || arr.length > maxBytes) slice = withoutPartialCharacter(slice);
+  const shown = arr.subarray(0, maxBytes);
+  const more = cut || arr.length > maxBytes;
   try {
-    const text = new TextDecoder('utf-8', { fatal: true }).decode(slice);
-    return text + (arr.length > maxBytes || cut ? '…' : '');
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(more ? withoutPartialCharacter(shown) : shown);
+    return text + (more ? '…' : '');
   } catch {
+    // The hex keeps every byte shown, the unfinished character's too: only text drops it.
     let hex = '';
-    for (let i = 0; i < slice.length; i += 1) {
-      hex += slice[i].toString(16).padStart(2, '0');
-      if (i < slice.length - 1) hex += ' ';
+    for (let i = 0; i < shown.length; i += 1) {
+      hex += shown[i].toString(16).padStart(2, '0');
+      if (i < shown.length - 1) hex += ' ';
     }
-    return hex + (arr.length > maxBytes ? ' …' : '');
+    return hex + (more ? ' …' : '');
   }
 }
 

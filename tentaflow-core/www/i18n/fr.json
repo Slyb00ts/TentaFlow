@@ -10323,6 +10323,7 @@
         "avro": "Avro",
         "protobuf": "Protobuf",
         "thrift": "Thrift",
+        "binary": "binaire",
         "xsd": "XSD",
         "hl7v2_profile": "profil HL7 v2"
       },

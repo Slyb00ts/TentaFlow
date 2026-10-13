@@ -3560,13 +3560,17 @@ test('U7 HL7 topic: the dictionary with plain names, a wrong address refused bef
   }
 });
 
-test('U7 a topic with binary content cannot get a rule, and the section says why', async ({ page }) => {
+test('U7 a topic checked with a binary pattern cannot get a rule and the section says why; a default octet-stream topic keeps working rules', async ({ page }) => {
   const errors = trackErrors(page);
   await page.setViewportSize(DESKTOP);
   await login(page);
   const instanceId = await openInstance(page, 'Produkcja');
   const name = `e2e-binarny-${RUN}`;
-  await busCall(page, 'busTopicCreateRequest', { instanceId, name, options: { partitions: 1, contentType: 'application/octet-stream' } });
+  const plain = `e2e-domyslny-${RUN}`;
+  const pattern = `e2e-wzor-binarny-${RUN}`;
+  await busCall(page, 'busSchemaRegisterRequest', { instanceId, subject: pattern, schemaType: 'thrift', schemaText: 'struct M { 1: i32 a }' });
+  await busCall(page, 'busTopicCreateRequest', { instanceId, name, options: { partitions: 1, contentType: 'application/octet-stream', schemaId: pattern, validation: 'dlq' } });
+  await busCall(page, 'busTopicCreateRequest', { instanceId, name: plain, options: { partitions: 1, contentType: 'application/octet-stream' } });
   try {
     await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=${name}&section=hiding`);
     const s = hidingSection(page);
@@ -3574,8 +3578,19 @@ test('U7 a topic with binary content cannot get a rule, and the section says why
     await expect(s.locator('tf-empty-state')).toHaveAttribute('message', /nie edytuje się na tym ekranie/);
     await expect(s.locator('[data-role="add"]')).toHaveAttribute('disabled', '');
     await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-powiadomienia.png'), fullPage: true });
+
+    // No pattern: the server reads the topic as JSON, so a rule is written and edited here.
+    await busCall(page, 'busFieldPolicySetRequest', { instanceId, topic: plain, subjectType: 'any', subjectId: '*', direction: 'read', fields: ['a'], requiredFields: [] });
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=${plain}&section=hiding`);
+    await expect(s.locator('[data-role="rules"] tbody tr')).toHaveCount(1, { timeout: 20000 });
+    await expect(s.locator('[data-role="blocked-note"] tf-alert')).toHaveCount(0);
+    await expect(s.locator('[data-role="add"]')).not.toHaveAttribute('disabled', '');
+    await expect(s.locator('[data-role="rules"] tbody tr tf-button[data-act="change"]')).toHaveCount(1);
   } finally {
-    await busCall(page, 'busTopicDeleteRequest', { instanceId, name });
+    await busCall(page, 'busFieldPolicyDeleteRequest', { instanceId, topic: plain, subjectType: 'any', subjectId: '*', direction: 'read' }).catch(() => {});
+    await busCall(page, 'busTopicDeleteRequest', { instanceId, name }).catch(() => {});
+    await busCall(page, 'busTopicDeleteRequest', { instanceId, name: plain }).catch(() => {});
+    await busCall(page, 'busSchemaDeleteRequest', { instanceId, subject: pattern, deprecateOnly: false }).catch(() => {});
   }
   expect(errors, errors.join('\n')).toEqual([]);
 });

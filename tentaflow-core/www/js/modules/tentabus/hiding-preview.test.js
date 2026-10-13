@@ -291,5 +291,5 @@ test('a text cut inside a character in the data-hiding preview is text, with an 
   assert.ok(shown === `${'a'.repeat(4095)}…`, `rendered as text: ${shown.length} ${shown.slice(0, 12)}`);
   const binary = { record: { ...record, payloadPreview: new Uint8Array([0x0a, 0x00, 0xff]), truncated: true }, applied: [], limitedByCaller: false };
   host.innerHTML = previewResultHtml({ resp: binary, subject: { subjectType: 'any', label: 'Wszyscy' }, source: null, nowMs: NOW });
-  assert.equal(host.querySelector('[data-role="payload"]').textContent, '0a 00 ff');
+  assert.equal(host.querySelector('[data-role="payload"]').textContent, '0a 00 ff …', 'a cut preview that is not text says it goes on');
 });

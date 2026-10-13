@@ -194,10 +194,14 @@ test('where the known fields come from: the pattern, the HL7 dictionary, or nowh
   assert.equal(fieldSource({ format: 'json', schema: null }).mode, 'manual');
   assert.equal(fieldSource({ format: 'json', schema: { failed: true } }).failed, true, 'a pattern that could not be read is said so');
   assert.equal(fieldSource({ format: 'json', schema: { subject: 's', version: 1, text: '{"type":"object"}' } }).mode, 'manual', 'a pattern without properties lists nothing');
-  assert.equal(fieldSource({ format: 'binary', schema: null }).mode, 'blocked');
+  for (const schemaType of ['avro', 'protobuf', 'thrift']) {
+    assert.equal(fieldSource({ format: 'json', schema: { subject: 's', schemaType } }).mode, 'blocked', `${schemaType} pattern: the server refuses rules`);
+  }
+  assert.equal(fieldSource({ format: 'json', schema: { subject: 's', schemaType: 'json_schema', version: 1, text: '{"type":"object","properties":{"a":{"type":"string"}}}' } }).mode, 'schema');
+  assert.equal(fieldSource({ format: 'json', schema: null }).mode, 'manual', 'no pattern, no block: octet-stream alone never closes the screen');
   assert.equal(fieldSource({ format: 'xml', schema: SCHEMA }).mode, 'manual', 'a JSON pattern says nothing about XML');
   assert.deepEqual(['application/json', 'application/xml', 'text/xml', 'application/hl7-v2', 'x-application/hl7-v2+er7', 'application/octet-stream', 'application/fhir+json', ''].map(topicFormat),
-    ['json', 'xml', 'xml', 'hl7v2', 'hl7v2', 'binary', 'json', 'json'], 'a content type the server does not know is read as JSON, as the server does');
+    ['json', 'xml', 'xml', 'hl7v2', 'hl7v2', 'json', 'json', 'json'], 'a content type the server does not know, octet-stream included, is read as JSON, as the server does');
   assert.equal(fieldLabel(json, 'pacjent'), 'dane pacjenta');
   assert.equal(fieldLabel(hl7, 'PID-7'), 'Data urodzenia');
   assert.equal(fieldPhrase(json, 'pacjent'), 'dane pacjenta (pacjent)');
@@ -565,8 +569,10 @@ test('a topic without rules shows the empty state (T11) whose action opens the a
   assert.equal(host.querySelector('[data-role="add"]').hasAttribute('disabled'), false);
 });
 
-test('a binary topic has no fields to name: the section says so and "Dodaj zasadę" is closed', () => {
-  const { host } = paint({ contentType: 'application/octet-stream', hidingData: { policies: [], policiesError: null, schema: null, schemaSettled: true } });
+const THRIFT = { subject: 'zamowienie', schemaType: 'thrift' };
+
+test('a topic checked with a binary pattern has no fields to name: the section says so and "Dodaj zasadę" is closed', () => {
+  const { host } = paint({ contentType: 'application/octet-stream', hidingData: { policies: [], policiesError: null, schema: THRIFT, schemaSettled: true } });
   const empty = host.querySelector('[data-role="state"] tf-empty-state');
   assert.equal(empty.getAttribute('title'), 'Zasady tego topiku nie są tu edytowane');
   assert.match(empty.getAttribute('message'), /nie edytuje się na tym ekranie, bo jego treść jest binarna i nie da się jej odczytać jako pól/);
@@ -619,8 +625,8 @@ test('previewing is closed with its reason to an administrator who may not read 
   assert.equal(host.querySelector('[data-role="add"]').hasAttribute('disabled'), false, 'managing rules needs administration only');
 });
 
-test('a topic shown as binary that already has rules says they will not work and leaves only "Usuń"', () => {
-  const { host } = paint({ contentType: 'application/octet-stream', hidingData: { policies: POLICIES, policiesError: null, schema: null, schemaSettled: true } });
+test('a topic checked with a binary pattern that already has rules says they will not work and leaves only "Usuń"', () => {
+  const { host } = paint({ contentType: 'application/octet-stream', hidingData: { policies: POLICIES, policiesError: null, schema: THRIFT, schemaSettled: true } });
   const note = host.querySelector('[data-role="blocked-note"] tf-alert');
   assert.equal(note.getAttribute('message'), 'Ten topik ma zasady ukrywania danych, ale jego treść jest binarna — zasady nie zadziałają. Usuń je albo utwórz topik JSON/XML/HL7.');
   assert.equal(host.querySelector('[data-role="rules"]').hidden, false, 'the rules are listed');
@@ -636,4 +642,24 @@ test('a topic shown as binary that already has rules says they will not work and
   const jsonTable = json.host.querySelector('[data-role="rules"]');
   const jsonActions = jsonTable.rowActions(jsonTable.rows[0], 0, () => jsonTable.rows[0]);
   assert.deepEqual([...jsonActions.querySelectorAll('tf-button')].map((b) => b.dataset.act || b.getAttribute('data-act')), ['change', 'remove']);
+});
+
+test('the content type alone never closes the screen: an octet-stream topic with no pattern and a rule is edited like a JSON one', () => {
+  const { host } = paint({ contentType: 'application/octet-stream', hidingData: { policies: POLICIES, policiesError: null, schema: null, schemaSettled: true } });
+  assert.equal(host.querySelector('[data-role="blocked-note"]').children.length, 0, 'no warning: the server applies these rules');
+  const add = host.querySelector('[data-role="add"]');
+  assert.equal(add.hasAttribute('disabled'), false);
+  assert.equal(add.getAttribute('title'), null);
+  const table = host.querySelector('[data-role="rules"]');
+  const actions = table.rowActions(table.rows[0], 0, () => table.rows[0]);
+  assert.deepEqual([...actions.querySelectorAll('tf-button')].map((b) => b.dataset.act || b.getAttribute('data-act')), ['change', 'remove']);
+  assert.equal(host.querySelector('[data-role="preview"]').hasAttribute('disabled'), false);
+});
+
+test('a topic with Avro content and an Avro pattern is blocked; the same content type with a JSON pattern is not', () => {
+  const avro = paint({ contentType: 'avro/binary', hidingData: { policies: [], policiesError: null, schema: { subject: 'a', schemaType: 'avro' }, schemaSettled: true } });
+  assert.ok(avro.host.querySelector('[data-role="add"]').hasAttribute('disabled'));
+  assert.match(avro.host.querySelector('[data-role="add"]').getAttribute('title'), /binarna/);
+  const json = paint({ contentType: 'avro/binary', hidingData: { policies: [], policiesError: null, schema: null, schemaSettled: true } });
+  assert.equal(json.host.querySelector('[data-role="add"]').hasAttribute('disabled'), false);
 });

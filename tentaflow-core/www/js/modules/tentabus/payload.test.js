@@ -98,3 +98,9 @@ test('text cut by the server ends with an ellipsis; whole text does not', () => 
   assert.equal(bytesToPreviewText(enc('abc'), 512, false), 'abc');
   assert.equal(bytesToPreviewText(enc('abcdef'), 4, false), 'abcd…');
 });
+
+test('a cut preview that falls back to hex keeps the bytes of the unfinished character and ends with the marker', () => {
+  const bytes = new Uint8Array([0xff, 0x61, 0xc5]);
+  assert.equal(bytesToPreviewText(bytes, 512, true), 'ff 61 c5 …');
+  assert.equal(bytesToPreviewText(bytes, 512, false), 'ff 61 c5');
+});

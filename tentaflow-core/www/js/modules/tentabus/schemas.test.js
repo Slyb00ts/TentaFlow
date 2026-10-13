@@ -156,3 +156,8 @@ test('binding a binary pattern under existing rules and the compile error behind
   assert.equal(busRefusalDetail(stored), "invalid schema: field 'a' has no explicit id (line 1)");
   assert.equal(busRefusalDetail('bus.invalid_argument: nope'), '');
 });
+
+test('the bind refusal without a kind (the pattern vanished meanwhile) still reads in words', () => {
+  const text = busRefusalText("bus.invalid_topic_config: field policies cannot apply to a topic whose messages are binary: cannot bind the binary pattern 'z' to topic 'zamowienia' while field policies exist for it; delete its field policies first");
+  assert.match(text, /\(binarny\)/);
+});

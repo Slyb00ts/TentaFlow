@@ -11558,6 +11558,7 @@
         "avro": "Avro",
         "protobuf": "Protobuf",
         "thrift": "Thrift",
+        "binary": "binary",
         "xsd": "XSD",
         "hl7v2_profile": "HL7 v2 profile"
       },

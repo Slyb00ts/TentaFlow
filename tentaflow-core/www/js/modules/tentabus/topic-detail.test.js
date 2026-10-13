@@ -157,12 +157,12 @@ test('Ukrywanie danych opens for the topic\'s administrator only; its counter is
   assert.equal(empty.body.querySelector('tf-tab#hiding').getAttribute('count'), null, 'a topic without rules has no counter');
 });
 
-test('the failed rules load offers a retry that reaches the shell, and a binary topic offers the settings', () => {
+test('the failed rules load offers a retry that reaches the shell, and a topic checked with a binary pattern offers the settings', () => {
   const failed = mount({ section: 'hiding', hidingData: { policies: null, policiesError: 'Brak uprawnień do tej operacji.', schema: null, schemaSettled: true } });
   const host = failed.body.querySelector('[data-section="hiding"]');
   host.querySelector('[data-go="hiding-reload"]').click();
   assert.deepEqual(failed.moves.at(-1), { kind: 'hiding-reload' }, 'the shell is asked to load the rules again');
-  const binary = mount({ section: 'hiding', topicOverrides: { contentType: 'application/octet-stream' }, hidingData: { policies: [], policiesError: null, schema: null, schemaSettled: true } });
+  const binary = mount({ section: 'hiding', topicOverrides: { contentType: 'application/octet-stream' }, hidingData: { policies: [], policiesError: null, schema: { subject: 'z', schemaType: 'thrift' }, schemaSettled: true } });
   binary.body.querySelector('[data-section="hiding"] [data-go="section"]').click();
   assert.deepEqual(binary.moves.at(-1), { kind: 'section', section: 'settings' });
 });

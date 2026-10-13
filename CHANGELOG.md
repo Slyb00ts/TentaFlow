@@ -381,8 +381,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 - Czwarta runda po przeglądzie Thrift: podgląd ukrywania danych traktuje ucięty
   tekst jak tekst (z „…” na końcu); odmowa przypięcia wzoru binarnego do topiku
   z zasadami (i odwrotnie) zapada w tej samej transakcji co zapis, więc wyścig
-  jej nie ominie; topik binarny, który ma już zasady, pokazuje je z samym
-  „Usuń” i wyjaśnieniem; bajty 0xC0, 0xC1 i 0xF5–0xFF nie są początkiem znaku;
+  jej nie ominie; ekran Ukrywania danych uznaje topik za binarny według
+  przypiętego wzoru (Avro, Protobuf, Thrift), tak jak serwer, a nie według
+  rodzaju treści: topik `application/octet-stream` bez takiego wzoru działa jak
+  JSON i zasady da się na nim zmieniać; gdy wzór binarny jest, a zasady już są,
+  ekran pokazuje je z samym „Usuń” i wyjaśnieniem; bajty 0xC0, 0xC1 i 0xF5–0xFF nie są początkiem znaku;
   nazwy typów JSON są po polsku, wiersz „przy zapisie” nie powtarza się, a
   „Dla programisty” opisuje tylko to, co klucz może; `tf-disclosure` przewija
   tylko po kliknięciu.

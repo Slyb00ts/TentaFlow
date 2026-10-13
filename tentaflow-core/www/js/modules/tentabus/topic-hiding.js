@@ -34,6 +34,7 @@ import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { patchHtml, setAttr, setRowsIfChanged } from '/js/lib/dom-patch.js';
 import { T, fmtCount, fmtDayTime, contentKind } from '/js/modules/tentabus/format.js';
+import { schemaKind } from '/js/modules/tentabus/schemas.js';
 import { subjectTitle, subjectSub } from '/js/modules/tentabus/topic-access.js';
 import { HL7_FIELDS, HL7_IMPLICIT_FIELDS, hl7FieldLabel } from '/js/modules/tentabus/hl7-fields.js';
 import '/js/components/tf-button.js';
@@ -107,9 +108,16 @@ export function hidingCount(data) {
 // The fields a rule can name
 // ---------------------------------------------------------------------------
 
-/** What the payload of a topic is, as the server's field codecs see it: `json`, `xml`, `hl7v2` or `binary`. */
+/**
+ * What the payload of a topic is, as the server's field codecs see it: `json`,
+ * `xml` or `hl7v2`. Anything else, `application/octet-stream` (the default
+ * and the pre-F0 JSON topics) included, is JSON to the server. Whether rules
+ * can work at all depends on the pattern bound to the topic, not on this:
+ * see `fieldSource`.
+ */
 export function topicFormat(contentType) {
-  return contentKind(contentType) || 'json';
+  const kind = contentKind(contentType);
+  return kind === 'xml' || kind === 'hl7v2' ? kind : 'json';
 }
 
 /** How deep the walk follows a pattern before it gives up and calls it complex. */
@@ -202,13 +210,15 @@ export function readJsonSchema(text) {
  *     them like any other field it does not list);
  *   - `manual`: no list — the fields to keep are typed in (`complex` = the
  *     pattern is there but names fields the screen cannot list);
- *   - `blocked`: binary content, which has no fields to name.
+ *   - `blocked`: the topic is checked with an Avro, Protobuf or Thrift pattern
+ *     (`schema.schemaType`), whose bytes a rule cannot read: the server
+ *     refuses rules there (`bus_field_policy_set`), so the screen does too.
  * `complete` says the list is every field a message can carry (a closed
  * pattern): only then can a rule that leaves every listed field alone be a
  * rule that does nothing.
  */
 export function fieldSource({ format, schema }) {
-  if (format === 'binary') return { mode: 'blocked', fields: [], implicit: [], complete: false };
+  if (schemaKind(schema?.schemaType) === 'binary') return { mode: 'blocked', fields: [], implicit: [], complete: false };
   if (format === 'hl7v2') {
     return { mode: 'dictionary', fields: HL7_FIELDS.map((name) => ({ name, label: hl7FieldLabel(name) })), implicit: HL7_IMPLICIT_FIELDS, complete: false };
   }

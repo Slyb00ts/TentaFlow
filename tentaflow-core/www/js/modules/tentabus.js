@@ -30,7 +30,7 @@ import { MAIN_TABS, DEFAULT_TAB, DEFAULT_SECTION, TOPIC_SECTIONS, CONSUMER_SECTI
 import { shellCounts, userTopics, userRate } from '/js/modules/tentabus/model.js';
 import { laggingReplicas, isLagging, lagSeriesKey } from '/js/modules/tentabus/alerts.js';
 import { drawOverview, pushOverviewSample, CHART_WINDOW_SECS } from '/js/modules/tentabus/overview.js';
-import { drawSchemas, listText, compatLabel, schemaKindMismatchText, busRefusalText, busRefusalDetail } from '/js/modules/tentabus/schemas.js';
+import { drawSchemas, listText, compatLabel, schemaKind, schemaKindMismatchText, busRefusalText, busRefusalDetail } from '/js/modules/tentabus/schemas.js';
 import { drawSchemaDetail, shareShownText } from '/js/modules/tentabus/schema-detail.js';
 import { addedNotice, openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete } from '/js/modules/tentabus/schema-windows.js';
 import { drawTopics } from '/js/modules/tentabus/topics.js';
@@ -1449,11 +1449,23 @@ let hidingTurn = 0;
 
 // The pattern a JSON topic checks with, for its field list: the version the
 // topic validates against (`SchemaGet` without a version).
+// The kind of pattern decides whether rules can work at all (a binary pattern
+// refuses them), the content type only which fields they name.
 async function fetchFieldSchema(instanceId, topic) {
-  if (!topic?.schemaId || topicFormat(topic.contentType) !== 'json') return null;
+  if (!topic?.schemaId) return null;
+  let schemaType = null;
+  try {
+    const subjects = state.shell.subjects
+      || await ApiBinary.list('busSchemaSubjectListRequest', { arrayKey: 'subjects', payload: { instanceId } });
+    schemaType = (subjects || []).find((s) => s.subject === topic.schemaId)?.schemaType ?? null;
+  } catch {
+    // The server still refuses a rule it cannot apply.
+  }
+  if (schemaKind(schemaType) === 'binary') return { subject: topic.schemaId, schemaType };
+  if (topicFormat(topic.contentType) !== 'json') return null;
   try {
     const got = await ApiBinary.one('busSchemaGetRequest', { instanceId, subject: topic.schemaId });
-    return { subject: topic.schemaId, version: got?.schema?.version ?? null, text: got?.schemaText ?? '' };
+    return { subject: topic.schemaId, schemaType, version: got?.schema?.version ?? null, text: got?.schemaText ?? '' };
   } catch {
     return { failed: true };
   }

@@ -1432,12 +1432,34 @@ pub fn get_topic(
 
 /// The refusal to bind a binary pattern to a topic that has field policies.
 fn binary_under_rules(kind: &str, subject: &str, topic: &str) -> BusServiceError {
+    // `kind` is read after the statement refused, so a subject deleted in
+    // between leaves it empty: the sentence then says "binary" instead.
+    let kind = if kind.is_empty() { "binary" } else { kind };
     BusServiceError::InvalidTopicConfig {
         reason: format!(
             "{}: cannot bind the {kind} pattern '{subject}' to topic '{topic}' while field \
              policies exist for it; delete its field policies first",
             super::field_policies::BINARY_TOPIC_NO_POLICY,
         ),
+    }
+}
+
+#[cfg(test)]
+mod binary_under_rules_tests {
+    use super::*;
+
+    #[test]
+    fn the_refusal_names_the_kind_and_says_binary_without_it() {
+        let named = binary_under_rules("thrift", "s", "t").to_string();
+        assert!(
+            named.contains("cannot bind the thrift pattern 's' to topic 't'"),
+            "{named}"
+        );
+        let bare = binary_under_rules("", "s", "t").to_string();
+        assert!(
+            bare.contains("cannot bind the binary pattern 's' to topic 't'"),
+            "{bare}"
+        );
     }
 }
 
