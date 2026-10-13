@@ -2341,3 +2341,31 @@ fn a_compiled_thrift_schema_weighs_what_its_arena_costs() {
         }
     );
 }
+
+#[test]
+fn directives_survive_line_endings_nested_looking_comments_and_slashes_in_strings() {
+    let b_root = |text: &str| {
+        let c = compile(text);
+        // B carries a string at id 1, A an i32: only the root B accepts this payload.
+        check(&c, &bin(&st(vec![(1, s("x"))]))) == Ok(())
+    };
+    for text in [
+        "struct A { 1: i32 a }\r\n// tentabus:struct B\r\nstruct B { 1: string b }\r\n",
+        "struct A { 1: i32 a }\r\nstruct B { 1: string b } // tentabus:struct B\r\n",
+        // A block comment does not nest: it ends at the first `*/`, and the rest of the line is a comment of its own.
+        "struct A { 1: i32 a }\nstruct B { 1: string b }\n/* /* */ // tentabus:struct B\n",
+        // `//` inside a string is no comment, and a directive after the string still is one.
+        "struct A { 1: i32 a = 1 }\nstruct B { 1: string b = \"http://x\" } // tentabus:struct B\n",
+        "struct A { 1: i32 a }\nstruct B { 1: string b = \"a#b\" } # tentabus:struct B\n",
+    ] {
+        assert!(b_root(text), "{text:?}");
+    }
+    // The same texts without the directive keep the first struct.
+    assert!(!b_root(
+        "struct A { 1: i32 a }\nstruct B { 1: string b = \"http://x\" }\n"
+    ));
+    // A directive inside the string is no directive.
+    assert!(!b_root(
+        "struct A { 1: i32 a }\nstruct B { 1: string b = \"// tentabus:struct B\" }\n"
+    ));
+}

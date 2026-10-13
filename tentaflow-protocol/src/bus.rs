@@ -815,8 +815,10 @@ pub struct BusCapabilitiesWire {
     /// included. `0` on a peer built before this field existed.
     #[serde(default)]
     pub node_count: u32,
-    /// Canonical `content_type` values this server can parse for field
-    /// policies and validation — the topic creator offers exactly these.
+    /// The `content_type` values the topic creator offers: the text formats
+    /// a field policy can read (JSON, XML, HL7 v2) and
+    /// `application/octet-stream`, the kind of a topic that carries Avro,
+    /// Protobuf or Thrift bytes (a rule on such a topic is refused).
     #[serde(default)]
     pub content_types: Vec<String>,
     /// `schema_type` values this server can validate payloads against

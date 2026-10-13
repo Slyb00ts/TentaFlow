@@ -119,6 +119,12 @@ impl SchemaType {
         }
     }
 
+    /// Whether the kind describes bytes of its own encoding (Avro, Protobuf,
+    /// Thrift) rather than a text format a field policy can read.
+    pub fn is_binary(self) -> bool {
+        self.required_payload_format().is_none()
+    }
+
     /// The one payload format a topic must carry to bind a subject of this
     /// kind; `None` for kinds that describe their own wire encoding
     /// (the binary ones) and so bind independently of `content_type`.
@@ -1416,6 +1422,25 @@ mod tests {
                 "{mode:?}: expected {phrase:?}, got {got:?}"
             );
         }
+        // The sentences of the stable-text refusals the dashboard recognizes
+        // word for word (`schema-windows.js` `refusalHtml`, `tentabus.js`
+        // `describeBusError`): pinned as text, not as the constants they come from.
+        assert_eq!(
+            registry::PREVIOUS_VERSION_UNREADABLE,
+            "the previous version of this subject could not be checked under the current rules of its format, so it cannot be compared with the new one"
+        );
+        let doc_comment = SchemaType::Thrift
+            .ops()
+            .compile("/// tentabus:struct S\nstruct S {}")
+            .unwrap_err();
+        assert_eq!(
+            doc_comment,
+            SchemaError::Invalid(
+                "the comment '// tentabus:struct' or '// tentabus:protocol' must be a // or # comment that starts with the directive (a block or doc comment, a directive in the middle of a comment or an unknown one is not read) (line 1)"
+                    .to_string()
+            )
+        );
+
         // Instance-side phrases the dashboard translates for an HL7 message.
         let compiled = SchemaType::Hl7v2Profile
             .ops()

@@ -1212,6 +1212,13 @@ fn derived_cache_key(
     )
 }
 
+/// A stored schema version that failed to compile, and the sentence for it.
+struct FailedCompile {
+    content_hash: String,
+    generation: u64,
+    error: String,
+}
+
 /// What a publish (or peek) says when the version a topic validates with was
 /// stored under looser rules and no longer compiles: register a corrected
 /// version. Stable text, pinned by a test.
@@ -2533,6 +2540,10 @@ pub struct BusService {
     /// One lock per subject being compiled, so concurrent misses on the same
     /// subject wait for one compile instead of each running their own.
     schema_flights: DashMap<TopicKey, Arc<std::sync::Mutex<()>>>,
+    /// The refusal of a stored version that does not compile, kept for the
+    /// content and registry generation it was produced for: every publish to
+    /// such a topic would otherwise parse up to 256 KiB again just to fail.
+    schema_failures: DashMap<TopicKey, FailedCompile>,
     schema_compiles_total: AtomicU64,
     /// PLAN-F3 §4.3: total records that failed schema validation across
     /// every mode (`warn` counts and keeps the record; `dlq` counts and
@@ -3032,6 +3043,7 @@ impl BusService {
             schema_cache: DashMap::new(),
             schema_cache_clock: AtomicU64::new(0),
             schema_flights: DashMap::new(),
+            schema_failures: DashMap::new(),
             schema_compiles_total: AtomicU64::new(0),
             schema_violations_total: AtomicU64::new(0),
             schema_check_too_complex_total: AtomicU64::new(0),
@@ -3449,6 +3461,7 @@ impl BusService {
         self.round_robin.clear();
         self.topic_config_cache.clear();
         self.schema_cache.clear();
+        self.schema_failures.clear();
     }
 
     pub fn quota(&self) -> &quota::QuotaManager {
@@ -4198,6 +4211,7 @@ impl BusService {
         )?
         else {
             self.schema_cache.remove(&key);
+            self.schema_failures.remove(&key);
             return Ok(None);
         };
         let content_hash = schema_registry::content_hash(&effective.schema_text);
@@ -4230,9 +4244,18 @@ impl BusService {
             let _compiling = flight.lock().unwrap_or_else(|e| e.into_inner());
             match self.schema_cache.get(&key).filter(|e| unchanged(e)) {
                 Some(entry) => Ok(confirm(&entry)),
-                None => {
-                    self.compile_schema(&key, subject, effective, content_hash, current_generation)
-                }
+                None => match self.schema_failures.get(&key).filter(|f| {
+                    f.content_hash == content_hash && f.generation == current_generation
+                }) {
+                    Some(failed) => Err(BusServiceError::InvalidArgument(failed.error.clone())),
+                    None => self.compile_schema(
+                        &key,
+                        subject,
+                        effective,
+                        content_hash,
+                        current_generation,
+                    ),
+                },
             }
         };
         drop(flight);
@@ -4254,16 +4277,27 @@ impl BusService {
         current_generation: u64,
     ) -> Result<Arc<ResolvedSchema>, BusServiceError> {
         self.schema_compiles_total.fetch_add(1, Ordering::Relaxed);
-        let compiled = effective
-            .schema_type
-            .ops()
-            .compile(&effective.schema_text)
-            .map_err(|e| {
-                BusServiceError::InvalidArgument(format!(
+        let compiled = match effective.schema_type.ops().compile(&effective.schema_text) {
+            Ok(compiled) => {
+                self.schema_failures.remove(key);
+                compiled
+            }
+            Err(e) => {
+                let error = format!(
                     "subject '{subject}' v{}: {STORED_SCHEMA_UNREADABLE}: {e}",
                     effective.version
-                ))
-            })?;
+                );
+                self.schema_failures.insert(
+                    key.clone(),
+                    FailedCompile {
+                        content_hash,
+                        generation: current_generation,
+                        error: error.clone(),
+                    },
+                );
+                return Err(BusServiceError::InvalidArgument(error));
+            }
+        };
         let weight = effective
             .schema_text
             .len()
@@ -8317,6 +8351,7 @@ impl BusService {
         // caught by the retain itself; anything after the retain but before
         // this bump is invalidated by the bump.
         self.schema_cache.retain(|k, _| k.0 != org_id);
+        self.schema_failures.retain(|k, _| k.0 != org_id);
         {
             let mut cache = self.derived_schema_cache.lock();
             let stale_keys: Vec<_> = cache
@@ -20318,8 +20353,8 @@ mod tests {
                 [],
             )
             .unwrap();
-        let err = svc
-            .publish(
+        let publish = || {
+            svc.publish(
                 &ctx,
                 "validated.events",
                 PublishBatch {
@@ -20331,7 +20366,9 @@ mod tests {
                     }],
                 },
             )
-            .unwrap_err();
+            .unwrap_err()
+        };
+        let err = publish();
         let BusServiceError::InvalidArgument(detail) = &err else {
             panic!("{err:?}");
         };
@@ -20339,6 +20376,19 @@ mod tests {
             detail.starts_with("subject 'subject' v1: the stored schema cannot be compiled under the current rules of its format; register a corrected version: invalid schema:"),
             "{detail}"
         );
+        // The refusal is kept: the next publishes do not parse the text again ...
+        let compiles = svc.schema_compiles_total();
+        assert_eq!(compiles, 1);
+        for _ in 0..3 {
+            assert_eq!(publish().to_string(), err.to_string());
+        }
+        assert_eq!(svc.schema_compiles_total(), compiles);
+        // ... until the registry changes, when it is looked at once more.
+        schema_registry::bump_generation();
+        assert_eq!(publish().to_string(), err.to_string());
+        assert_eq!(svc.schema_compiles_total(), compiles + 1);
+        assert_eq!(publish().to_string(), err.to_string());
+        assert_eq!(svc.schema_compiles_total(), compiles + 1);
     }
 
     fn register_json_subject(svc: &BusService, subject: &str) {

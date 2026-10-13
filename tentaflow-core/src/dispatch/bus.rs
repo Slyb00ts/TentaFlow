@@ -4321,13 +4321,6 @@ async fn lag_history_v1(
 // toru P task 5)
 // =============================================================================
 
-/// plan-app-platform §4.4: unlike the rest of this table, `read` here is a
-/// HARD gate, not a graceful degrade to "nothing" — the request now names a
-/// concrete `instance_id` (no more `resolve_instance_addon_id` guess), so a
-/// caller with no read grant on THAT instance, or an instance that does not
-/// exist/is disabled, gets the same `PolicyDenied`/`AppUnavailable` every
-/// other `gate_read` caller gets. `can_read` itself is therefore always
-/// `true` in a successful response: reaching this line already proved it.
 /// The one read-side field policy action implemented today: a field outside
 /// the policy's allow-list is removed (`field_policies::project_read`).
 const FIELD_ACTION_HIDE: &str = "hide";
@@ -4335,6 +4328,13 @@ const FIELD_ACTION_HIDE: &str = "hide";
 /// The content type of a topic that carries Avro, Protobuf or Thrift bytes.
 const BINARY_CONTENT_TYPE: &str = "application/octet-stream";
 
+/// plan-app-platform §4.4: unlike the rest of this table, `read` here is a
+/// HARD gate, not a graceful degrade to "nothing" — the request now names a
+/// concrete `instance_id` (no more `resolve_instance_addon_id` guess), so a
+/// caller with no read grant on THAT instance, or an instance that does not
+/// exist/is disabled, gets the same `PolicyDenied`/`AppUnavailable` every
+/// other `gate_read` caller gets. `can_read` itself is therefore always
+/// `true` in a successful response: reaching this line already proved it.
 async fn capabilities_v1(
     ctx: &HandlerContext,
     instance_id: &str,

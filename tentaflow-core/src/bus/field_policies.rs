@@ -315,6 +315,11 @@ pub fn project_read(policy: &FieldPolicy, format: PayloadFormat, payload: &Bytes
     }
 }
 
+/// What a rule on a topic of binary messages is refused with. The dashboard
+/// recognizes the sentence (`schemas.js` `busRefusalText`): reword both together.
+pub const BINARY_TOPIC_NO_POLICY: &str =
+    "field policies cannot apply to a topic whose messages are binary";
+
 /// Creates or replaces the policy row for `(org_id, topic, subject_type,
 /// subject_id, direction)`. `subject_type` must be one of `"user"`,
 /// `"group"`, `"addon"` or `"any"` (mirroring the table's own widened `CHECK`
@@ -379,6 +384,24 @@ pub fn set_policy(
             name: topic.to_string(),
         }
     })?;
+    // A rule reads fields of JSON, XML or HL7 v2 text. A topic checked with an
+    // Avro, Protobuf or Thrift pattern carries bytes of another shape: writes
+    // would fail as malformed and reads would come back empty. (A topic with
+    // the default `application/octet-stream` and no such pattern is the
+    // pre-F0 JSON topic and stays allowed.)
+    if let Some(subject) = cfg.schema_id.as_deref().filter(|s| !s.is_empty()) {
+        let bound = repository::bus_schema_subject_get(pool, instance_id, org_id, subject)?;
+        if let Some(kind) = bound
+            .as_ref()
+            .and_then(|row| super::schema_registry::SchemaType::parse(&row.schema_type))
+            .filter(|kind| kind.is_binary())
+        {
+            return Err(BusServiceError::InvalidArgument(format!(
+                "{BINARY_TOPIC_NO_POLICY}: topic '{topic}' is checked with the {} pattern '{subject}'",
+                kind.as_str()
+            )));
+        }
+    }
     let codec = PayloadFormat::from_content_type(&cfg.content_type).codec();
     for f in fields.iter().chain(required_fields.iter()) {
         codec.validate_field_name(f).map_err(|e| {
@@ -695,7 +718,8 @@ mod tests {
             NodeEnvironment::Prod,
             1_000,
         )
-        .expect("create source topic").0;
+        .expect("create source topic")
+        .0;
         let dlq_topic = dlq::dlq_topic_name(source);
         topics::create_internal_topic(
             &db,
@@ -763,7 +787,8 @@ mod tests {
             NodeEnvironment::Prod,
             1_000,
         )
-        .expect("create source topic").0;
+        .expect("create source topic")
+        .0;
         let dlq_topic = dlq::dlq_topic_name(source);
         topics::create_internal_topic(
             &db,
@@ -1015,6 +1040,120 @@ mod tests {
             field_set(&["patient_id"]),
             "the exact user row must win over the group row"
         );
+    }
+
+    #[test]
+    fn set_policy_refuses_a_topic_checked_with_a_binary_pattern() {
+        use super::super::schema_registry::{registry, Compatibility, SchemaType};
+        let db = test_db();
+        for (kind, subject, text) in [
+            (SchemaType::Thrift, "events.thrift", "struct X { 1: i32 a }"),
+            (
+                SchemaType::Avro,
+                "events.avro",
+                r#"{"type":"record","name":"X","fields":[]}"#,
+            ),
+            (
+                SchemaType::Protobuf,
+                "events.proto",
+                "syntax = \"proto3\"; message X {}",
+            ),
+        ] {
+            registry::register(
+                &db,
+                TEST_INSTANCE,
+                TEST_ORG,
+                subject,
+                kind,
+                text,
+                Some(Compatibility::None),
+                None,
+            )
+            .expect("register");
+            let topic = format!("bytes.{}", kind.as_str());
+            topics::create_topic(
+                &db,
+                TEST_INSTANCE,
+                TEST_ORG,
+                &topic,
+                topics::TopicOptions {
+                    content_type: Some("application/octet-stream".to_string()),
+                    schema_id: Some(subject.to_string()),
+                    ..Default::default()
+                },
+                NodeEnvironment::Prod,
+                1_000,
+            )
+            .expect("create topic");
+            let err = set_policy(
+                &db,
+                TEST_INSTANCE,
+                TEST_ORG,
+                &topic,
+                "any",
+                SUBJECT_ANY,
+                Direction::Read,
+                &field_set(&["a"]),
+                &BTreeSet::new(),
+                BusFieldPolicyExpect::Any,
+            )
+            .expect_err("a binary topic has no fields to hide");
+            assert!(
+                matches!(&err, BusServiceError::InvalidArgument(m)
+                if m == &format!(
+                    "field policies cannot apply to a topic whose messages are binary: topic '{topic}' is checked with the {} pattern '{subject}'",
+                    kind.as_str()
+                )),
+                "{err:?}"
+            );
+            assert!(list_policies(&db, TEST_INSTANCE, TEST_ORG, &topic)
+                .expect("list")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn set_policy_still_accepts_a_topic_with_a_text_pattern_and_the_default_content_type() {
+        use super::super::schema_registry::{registry, Compatibility, SchemaType};
+        let db = test_db();
+        registry::register(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "events.json",
+            SchemaType::JsonSchema,
+            r#"{"type":"object"}"#,
+            Some(Compatibility::None),
+            None,
+        )
+        .expect("register");
+        topics::create_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "json.events",
+            topics::TopicOptions {
+                content_type: Some("application/json".to_string()),
+                schema_id: Some("events.json".to_string()),
+                ..Default::default()
+            },
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create topic");
+        set_policy(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "json.events",
+            "any",
+            SUBJECT_ANY,
+            Direction::Read,
+            &field_set(&["a"]),
+            &BTreeSet::new(),
+            BusFieldPolicyExpect::Any,
+        )
+        .expect("a JSON pattern allows a rule");
     }
 
     #[test]
