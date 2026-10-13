@@ -650,7 +650,7 @@ mod tests {
             ctx.user_id = Some(actor.clone());
             ctx.org_id = Some("org-1".into());
             ctx.vectors = vectors.clone();
-            ctx.embeddings = Arc::new(EmbeddingsDispatcherImpl::new(state.router.executor.clone()));
+            ctx.embeddings = Arc::new(EmbeddingsDispatcherImpl::new(state.router.executor.clone(), None, ""));
             let selected = node(json!({"project_id":project_id,"operation":"search"}));
             let request = input(FlowValue::Text("private project specification".into()));
             let search = tokio::spawn(async move {

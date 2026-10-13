@@ -1943,30 +1943,39 @@ test('service inspector configures an addon tool and switches back to a flow', a
   graph.destroy(); config.destroy(); readonly.destroy();
 });
 
-test('service inspector configures a block, keeps invalid settings out of the model and switches away', async () => {
+test('service inspector configures a block from a valid template and reports invalid settings inline', async () => {
   const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
   const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
   await flush(2);
   change(config.root.querySelector('[data-process="implementation"]'), 'block');
   await flush(2);
-  assert.deepEqual(node.config.implementation, { Block: { nodeType: 'llm', config: {} } });
+  assert.deepEqual(node.config.implementation, { Block: { nodeType: 'llm', config: { model: '' } } });
   assert.equal(node.config.flowId, '');
+  assert.equal(node.config.inputMapping.payload, 'vars.text');
   assert.equal(config.root.querySelector('[data-process="flowId"]'), null);
   assert.equal(config.root.querySelector('[data-process="blockType"]').value, 'llm');
-  change(config.root.querySelector('[data-process="blockType"]'), 'pii_filter');
-  assert.equal(node.config.implementation.Block.nodeType, 'pii_filter');
   change(config.root.querySelector('[data-process="blockConfig"]'), '{"model":"m","max_tokens":64}');
   assert.deepEqual(node.config.implementation.Block.config, { model: 'm', max_tokens: 64 });
-  assert.equal(config.root.querySelector('[data-block-config-error]').hidden, true);
-  // Text that is not a JSON object is reported and never reaches the model.
+  // A type brings its own template: the settings of the previous type do not linger.
+  change(config.root.querySelector('[data-process="blockType"]'), 'pii_filter');
+  await flush(2);
+  assert.deepEqual(node.config.implementation, { Block: { nodeType: 'pii_filter', config: {} } });
+  assert.equal(config.root.querySelector('[data-process="blockConfig"]').value.trim(), '{}');
+  change(config.root.querySelector('[data-process="blockType"]'), 'embeddings');
+  await flush(2);
+  assert.deepEqual(node.config.implementation.Block, { nodeType: 'embeddings', config: { model: '' } });
+  change(config.root.querySelector('[data-process="blockConfig"]'), '{"model":"e"}');
+  // Text that is not a JSON object is reported on the field and never reaches the model.
   for (const invalid of ['{', '[]', '7', 'null']) {
     change(config.root.querySelector('[data-process="blockConfig"]'), invalid);
-    assert.equal(config.root.querySelector('[data-block-config-error]').hidden, false, invalid);
-    assert.deepEqual(node.config.implementation.Block.config, { model: 'm', max_tokens: 64 }, invalid);
+    assert.ok(config.root.querySelector('[data-process="blockConfig"]').getAttribute('error'), invalid);
+    assert.deepEqual(node.config.implementation.Block.config, { model: 'e' }, invalid);
   }
+  change(config.root.querySelector('[data-process="blockConfig"]'), '{"model":"f"}');
+  assert.equal(config.root.querySelector('[data-process="blockConfig"]').getAttribute('error'), null);
   const saved = canvasToProcess(graph.processModel, graph.nodes, graph.edges, () => []);
   assert.deepEqual(saved.nodes.find((row) => row.id === node.id).kind.ServiceTask.implementation,
-    { Block: { nodeType: 'pii_filter', config: { model: 'm', max_tokens: 64 } } });
+    { Block: { nodeType: 'embeddings', config: { model: 'f' } } });
   const readonly = inspector(graph, true); readonly.show(node, graph.templates.get(node.type));
   assert.ok(readonly.root.querySelector('[data-process="blockType"]').hasAttribute('disabled'));
   change(config.root.querySelector('[data-process="implementation"]'), 'flow');
@@ -1974,6 +1983,17 @@ test('service inspector configures a block, keeps invalid settings out of the mo
   assert.equal(node.config.implementation, 'Flow');
   assert.equal(config.root.querySelector('[data-process="blockType"]'), null);
   graph.destroy(); config.destroy(); readonly.destroy();
+});
+
+test('choosing a block keeps a payload mapping the author already wrote', async () => {
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
+  const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
+  await flush(2);
+  change(config.root.querySelector('[data-process="inputMapping"]'), { payload: 'vars.question' });
+  change(config.root.querySelector('[data-process="implementation"]'), 'block');
+  await flush(2);
+  assert.equal(node.config.inputMapping.payload, 'vars.question');
+  graph.destroy(); config.destroy();
 });
 
 test('activity IO inspector authors ordered inputs, outputs, associations and repetition coordinator', () => {

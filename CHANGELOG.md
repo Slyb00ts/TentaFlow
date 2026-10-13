@@ -54,6 +54,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   `flow` z `flow_id = block:<typ>`. Eksport XML: `<tentaflow:service
   implementation="block" nodeType>` z `<tentaflow:blockConfig>`; inspektor
   pozwala wybrać blok i wpisać jego ustawienia jako JSON.
+  Blok z modelem podlega tym samym zasadom co czat: inicjator musi mieć dostęp
+  do modelu (przy publikacji, przy starcie i tuż przed uruchomieniem; odmowa to
+  `SOURCE_ACCESS_REVOKED`), wyczerpany limit tokenów zatrzymuje zadanie przed
+  granicą wysyłki (`TOKEN_QUOTA_EXCEEDED`), a wywołanie trafia do audytu zgodności
+  z organizacją procesu; embeddingi procesu przechodzą teraz przez bramę AI.
+  Pin jest czytany po strukturze, nie porównywany z tym, co zbudowałby dzisiejszy
+  kod, a blok usunięty z listy kończy się odmową dostępu. Własne ponowienia bloku
+  LLM są wyłączone (jedna próba), `stop` ma najwyżej 4 napisy, a
+  `reasoning_effort` jest jedną z wartości `low`, `medium`, `high`, `xhigh`, `max`.
 
 ### TentaNas
 

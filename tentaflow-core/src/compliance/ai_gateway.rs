@@ -124,9 +124,56 @@ impl AiGateway {
         }
     }
 
+    /// Applies the active token quotas to a call that has not been made yet,
+    /// without opening an event. `Err` only for a quota that is really spent.
+    pub fn check_token_quota(
+        &self,
+        model_id: &str,
+        user: Option<&UserContext>,
+        context: Option<&AiGatewayContext>,
+    ) -> Result<()> {
+        let org_id = {
+            let conn = self.db.read().map_err(|_| anyhow!("blokada DB zatruta"))?;
+            resolve_org_id(&conn, user, context)?
+        };
+        let user_id = user
+            .map(|u| u.user_id.to_string())
+            .unwrap_or_else(|| crate::db::repository::TOKEN_USAGE_SYSTEM_USER.to_string());
+        self.enforce_token_quota(&org_id, &user_id, model_id)
+    }
+
     pub fn start_chat_event(
         &self,
         request: &ChatCompletionRequest,
+        user: Option<&UserContext>,
+        context: Option<&AiGatewayContext>,
+    ) -> Result<AiEventHandle> {
+        self.start_event(
+            "chat",
+            &request.model,
+            chat_request_prompt_text(request),
+            user,
+            context,
+        )
+    }
+
+    /// The embeddings counterpart of [`start_chat_event`]: the same quota rule,
+    /// the same audit row (backend `embeddings`), the inputs as the prompt.
+    pub fn start_embeddings_event(
+        &self,
+        model: &str,
+        inputs: &[String],
+        user: Option<&UserContext>,
+        context: Option<&AiGatewayContext>,
+    ) -> Result<AiEventHandle> {
+        self.start_event("embeddings", model, inputs.join("\n"), user, context)
+    }
+
+    fn start_event(
+        &self,
+        backend: &'static str,
+        model: &str,
+        prompt_text: String,
         user: Option<&UserContext>,
         context: Option<&AiGatewayContext>,
     ) -> Result<AiEventHandle> {
@@ -140,7 +187,7 @@ impl AiGateway {
         let user_id_owned = user
             .map(|u| u.user_id.to_string())
             .unwrap_or_else(|| crate::db::repository::TOKEN_USAGE_SYSTEM_USER.to_string());
-        let model_id_owned = request.model.clone();
+        let model_id_owned = model.to_string();
 
         self.enforce_token_quota(&org_id, &user_id_owned, &model_id_owned)?;
 
@@ -154,7 +201,6 @@ impl AiGateway {
             .and_then(|c| c.correlation_id.clone())
             .unwrap_or_else(|| request_id.clone());
         let legal_basis_id = default_ai_legal_basis_id(&org_id);
-        let prompt_text = chat_request_prompt_text(request);
 
         // Owned captures for the write (inline in sync mode, worker in async).
         let db = self.db.clone();
@@ -169,7 +215,7 @@ impl AiGateway {
         let w_flow_node = context.and_then(|c| c.flow_node_id.clone());
         let w_agent = context.and_then(|c| c.agent_id.clone());
         let w_agent_run = context.and_then(|c| c.agent_run_id.clone());
-        let w_model = request.model.clone();
+        let w_model = model.to_string();
         dispatch_write(move || {
             let conn = db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
             start_ai_event(
@@ -188,7 +234,7 @@ impl AiGateway {
                     request_id: &w_request_id,
                     correlation_id: Some(&correlation_id),
                     model_id: &w_model,
-                    backend: "chat",
+                    backend,
                     risk_class: ComplianceRiskClass::High,
                     legal_basis_id: Some(&legal_basis_id),
                 },

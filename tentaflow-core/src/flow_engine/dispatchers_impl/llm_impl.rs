@@ -25,6 +25,7 @@ use crate::auth::acl::UserContext;
 use crate::compliance::ai_gateway::{AiGateway, AiGatewayContext};
 use crate::db::DbPool;
 use crate::flow_engine::blob_store::BlobStore;
+use crate::flow_engine::dispatcher::FlowOrigin;
 use crate::flow_engine::dispatchers::{LlmDispatcher, LlmRequest, LlmResponse, LlmToolSpec};
 use crate::flow_engine::envelope::{
     ChatMessage, ChatMessageContent, ChatRole, FinishReason, LlmStreamChunk, LlmToolCall,
@@ -86,7 +87,27 @@ impl LlmDispatcherImpl {
         req: &LlmRequest,
         api_req: &ChatCompletionRequest,
     ) -> Option<crate::compliance::ai_gateway::AiEventHandle> {
-        let db = self.db.as_ref()?;
+        match self.try_start_audit_event(req, api_req) {
+            Ok(handle) => handle,
+            Err(e) => {
+                tracing::warn!("gateway-aware LLM audit start failed (skipping event): {e}");
+                None
+            }
+        }
+    }
+
+    /// The same event, but a refusal is returned. A BPMN process step must not
+    /// run past a spent token quota or without its audit row, so
+    /// `execute_chat` uses this for `FlowOrigin::Process`; every other origin
+    /// keeps the log-and-continue rule of [`start_audit_event`].
+    fn try_start_audit_event(
+        &self,
+        req: &LlmRequest,
+        api_req: &ChatCompletionRequest,
+    ) -> Result<Option<crate::compliance::ai_gateway::AiEventHandle>> {
+        let Some(db) = self.db.as_ref() else {
+            return Ok(None);
+        };
         let gateway = AiGateway::new(
             db.clone(),
             self.node_id.clone(),
@@ -97,7 +118,8 @@ impl LlmDispatcherImpl {
             role: req.user_role.clone().unwrap_or_else(|| "user".to_string()),
         });
         let context = AiGatewayContext {
-            org_id: None,
+            // The process's own organization, not the first one the user joined.
+            org_id: req.provenance.org_id.clone(),
             addon_id: None,
             instance_id: None,
             flow_id: req.flow_id.clone(),
@@ -109,13 +131,9 @@ impl LlmDispatcherImpl {
         };
         let mut per_call = api_req.clone();
         per_call.user = None;
-        match gateway.start_chat_event(&per_call, user.as_ref(), Some(&context)) {
-            Ok(handle) => Some(handle),
-            Err(e) => {
-                tracing::warn!("gateway-aware LLM audit start failed (skipping event): {e}");
-                None
-            }
-        }
+        gateway
+            .start_chat_event(&per_call, user.as_ref(), Some(&context))
+            .map(Some)
     }
 }
 
@@ -181,7 +199,11 @@ impl LlmDispatcher for LlmDispatcherImpl {
         // Harness §3.4: open one compliance_ai_events row per call BEFORE
         // dispatch so the prompt is recorded even if the backend hangs / the
         // request is cancelled mid-flight (the event then finishes failed).
-        let audit_event = self.start_audit_event(&req, &api_req);
+        let audit_event = if req.provenance.origin == FlowOrigin::Process {
+            self.try_start_audit_event(&req, &api_req)?
+        } else {
+            self.start_audit_event(&req, &api_req)
+        };
         let model = api_req.model.clone();
         let provenance = req.provenance.clone();
         let user = build_user_context(req.user_id, req.user_role.as_deref());
@@ -886,6 +908,101 @@ mod tests {
             .await
             .expect("build");
         assert!(dispatcher.start_audit_event(&req, &api_req).is_none());
+    }
+
+    fn org_with_quota_spent(db: &DbPool) -> String {
+        let org = crate::services::org::repo::create_organization(
+            db, "Process org", "process-org", None, None, None, None,
+        )
+        .expect("organization")
+        .org_id;
+        for org_id in [org.as_str(), crate::services::org::DEFAULT_ORG_ID] {
+            crate::db::repository::create_token_quota(
+                db,
+                &crate::db::models::NewTokenQuota {
+                    org_id,
+                    scope_type: "org",
+                    subject_id: None,
+                    model_id: None,
+                    period: "daily",
+                    max_total_tokens: 0,
+                    is_active: true,
+                },
+            )
+            .expect("quota");
+        }
+        org
+    }
+
+    fn seed_user(db: &DbPool) {
+        db.write()
+            .unwrap()
+            .execute(
+                "INSERT INTO user_accounts (id, username, password_hash) VALUES ('u-proc', 'proc-user', 'x')",
+                [],
+            )
+            .expect("seed user");
+    }
+
+    fn process_request(org: &str) -> LlmRequest {
+        let provenance = CallProvenance::new(
+            FlowOrigin::Process,
+            crate::flow_engine::dispatcher::FlowActor::user("u-proc"),
+        )
+        .with_org(Some(org.to_owned()));
+        let mut req = LlmRequest::new("bielik", provenance);
+        req.messages = vec![ChatMessage::user("hello")];
+        req.user_id = Some("u-proc".into());
+        req
+    }
+
+    /// A process call is audited under the organization the PROCESS runs in, not
+    /// the first one the user happened to join.
+    #[tokio::test]
+    async fn a_process_call_is_audited_under_the_process_organization() {
+        let db = audit_db();
+        seed_user(&db);
+        let org = crate::services::org::repo::create_organization(
+            &db, "Process org", "process-org", None, None, None, None,
+        )
+        .expect("organization")
+        .org_id;
+        let dispatcher = dispatcher_with_db(db.clone());
+        let req = process_request(&org);
+        let api_req = build_chat_request(&req, false, dispatcher.blobs.as_ref()).await.unwrap();
+        let event = dispatcher
+            .try_start_audit_event(&req, &api_req)
+            .unwrap()
+            .expect("event opened");
+        let stored: String = db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT org_id FROM compliance_ai_events WHERE event_id = ?1",
+                [event.event_id()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, org);
+        assert_ne!(stored, crate::services::org::DEFAULT_ORG_ID);
+    }
+
+    /// A spent quota ends a process call before anything is sent; an ordinary
+    /// flow's call keeps its log-and-continue rule (it reaches the runtime).
+    #[tokio::test]
+    async fn a_spent_quota_is_fatal_for_a_process_call_and_only_logged_elsewhere() {
+        let db = audit_db();
+        seed_user(&db);
+        let org = org_with_quota_spent(&db);
+        let dispatcher = dispatcher_with_db(db.clone());
+
+        let error = dispatcher.execute_chat(process_request(&org)).await.unwrap_err();
+        assert!(format!("{error:#}").contains("token quota exceeded"), "{error:#}");
+
+        let mut ordinary = process_request(&org);
+        ordinary.provenance = CallProvenance::system();
+        let error = dispatcher.execute_chat(ordinary).await.unwrap_err();
+        assert!(format!("{error:#}").contains("not wired"), "{error:#}");
     }
 
     #[test]

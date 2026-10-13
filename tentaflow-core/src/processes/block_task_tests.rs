@@ -322,18 +322,18 @@ fn a_failed_read_is_unavailable_and_never_a_verdict_on_the_initiator() {
     let dispatcher = fixture.dispatcher();
     let owner = &fixture.owner;
     assert!(dispatcher
-        .authorize_process_block("pii_filter", &owner.user_id, &owner.org_id)
+        .authorize_process_block("pii_filter", &json!({}), &owner.user_id, &owner.org_id)
         .is_ok());
     assert_eq!(
         dispatcher
-            .authorize_process_block("exec_command", &owner.user_id, &owner.org_id)
+            .authorize_process_block("exec_command", &json!({}), &owner.user_id, &owner.org_id)
             .err()
             .unwrap(),
         BlockAccessError::NotAllowed
     );
     assert_eq!(
         dispatcher
-            .authorize_process_block("pii_filter", "no-such-user", &owner.org_id)
+            .authorize_process_block("pii_filter", &json!({}), "no-such-user", &owner.org_id)
             .err()
             .unwrap(),
         BlockAccessError::Initiator
@@ -341,14 +341,14 @@ fn a_failed_read_is_unavailable_and_never_a_verdict_on_the_initiator() {
     let original = corrupt_accounts(&fixture);
     assert_eq!(
         dispatcher
-            .authorize_process_block("pii_filter", &owner.user_id, &owner.org_id)
+            .authorize_process_block("pii_filter", &json!({}), &owner.user_id, &owner.org_id)
             .err()
             .unwrap(),
         BlockAccessError::Unavailable
     );
     restore_accounts(&fixture, original);
     assert!(dispatcher
-        .authorize_process_block("pii_filter", &owner.user_id, &owner.org_id)
+        .authorize_process_block("pii_filter", &json!({}), &owner.user_id, &owner.org_id)
         .is_ok());
 }
 
@@ -486,7 +486,7 @@ async fn the_dispatcher_runs_only_the_exact_pin_of_an_allowed_block() {
     };
     let meta = || {
         dispatcher
-            .authorize_process_block("pii_filter", &owner.user_id, &owner.org_id)
+            .authorize_process_block("pii_filter", &json!({}), &owner.user_id, &owner.org_id)
             .unwrap()
     };
     let seed = || FlowEnvelope::with_payload(FlowValue::Text("hello".into()));
@@ -510,7 +510,7 @@ async fn the_dispatcher_runs_only_the_exact_pin_of_an_allowed_block() {
         dispatcher
             .dispatch_pinned_synthetic(&forged, seed(), meta())
             .await,
-        Err(DispatchError::CompileFailed { .. })
+        Err(DispatchError::Denied { .. })
     ));
     // A graph that was edited without recomputing its hash.
     let tampered = PinnedFlowSnapshot {
@@ -560,7 +560,7 @@ fn xml_round_trips_a_block_task_and_keeps_the_other_implementations_apart() {
     assert!(xml.contains("implementation=\"block\" nodeType=\"llm\" timeoutSeconds=\"10\""));
     assert!(xml.contains(
         "<tentaflow:blockConfig>{&quot;max_tokens&quot;:64,&quot;model&quot;:&quot;m&quot;,&quot;stop&quot;:[&quot;\\n&quot;]}</tentaflow:blockConfig>"
-    ) || xml.contains("<tentaflow:blockConfig>"));
+    ));
     assert!(!xml.contains("flowId"));
     assert_eq!(import_xml(&xml).0, Some(model));
 
@@ -635,4 +635,149 @@ fn block_pin_snapshots_name_their_kind_and_old_pins_keep_their_bytes() {
         ServiceImplementationKind::AddonTool
     );
     assert_eq!(serde_json::to_value(&parsed).unwrap(), tool);
+}
+
+fn llm_task(model: &str) -> ProcessModel {
+    block_model(block("llm", json!({ "model": model })), "\"hi\"", None)
+}
+
+fn ai_event_rows(fixture: &Fixture) -> i64 {
+    fixture
+        .db
+        .read()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM compliance_ai_events", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+fn deny_model(fixture: &Fixture, model: &str, user_id: &str) {
+    crate::db::repository::resource_permissions::set(
+        &fixture.db,
+        "model",
+        model,
+        "user",
+        user_id,
+        "deny",
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_model_the_initiator_may_not_use_cannot_be_pinned() {
+    let fixture = Fixture::new();
+    deny_model(&fixture, "secret-model", &fixture.owner.user_id);
+    let refused = crate::dispatch::processes::pin_service_snapshots(
+        fixture.dispatcher(),
+        &fixture.owner,
+        &llm_task("secret-model"),
+    )
+    .unwrap_err();
+    assert_eq!(
+        refused.code,
+        tentaflow_protocol::ProtocolErrorCode::PolicyDenied
+    );
+    // The refusal reads like every other one: it does not say the model exists.
+    let missing_org = repository::ProcessActor {
+        org_id: "organization-that-does-not-exist".into(),
+        user_id: fixture.owner.user_id.clone(),
+    };
+    let other = crate::dispatch::processes::pin_service_snapshots(
+        fixture.dispatcher(),
+        &missing_org,
+        &llm_task("anything"),
+    )
+    .unwrap_err();
+    assert_eq!(refused.message, other.message);
+    // Another person, and another model, are not affected.
+    for (actor, model) in [
+        (&fixture.participant, "secret-model"),
+        (&fixture.owner, "open-model"),
+    ] {
+        crate::dispatch::processes::pin_service_snapshots(
+            fixture.dispatcher(),
+            actor,
+            &llm_task(model),
+        )
+        .unwrap_or_else(|error| panic!("{model} must pin: {}", error.message));
+    }
+}
+
+#[tokio::test]
+async fn model_access_withdrawn_after_publication_stops_the_job_before_the_boundary() {
+    let fixture = Fixture::new();
+    let started = start_model(&fixture, &llm_task("secret-model"));
+    deny_model(&fixture, "secret-model", &fixture.owner.user_id);
+    let claimed = run(&fixture, "model-worker").await;
+    let current =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert_eq!(current.incidents[0].code, "SOURCE_ACCESS_REVOKED");
+    assert_eq!(
+        invocation(&fixture, &claimed.job.job_id).2,
+        "proved_no_effect"
+    );
+    assert_eq!(ai_event_rows(&fixture), 0, "no backend call was prepared");
+}
+
+#[tokio::test]
+async fn a_spent_token_quota_stops_the_job_before_the_boundary() {
+    let fixture = Fixture::new();
+    let started = start_model(&fixture, &llm_task("quota-model"));
+    crate::db::repository::create_token_quota(
+        &fixture.db,
+        &crate::db::models::NewTokenQuota {
+            org_id: crate::services::org::DEFAULT_ORG_ID,
+            scope_type: "org",
+            subject_id: None,
+            model_id: None,
+            period: "daily",
+            max_total_tokens: 0,
+            is_active: true,
+        },
+    )
+    .unwrap();
+    let claimed = run(&fixture, "quota-worker").await;
+    let current =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert_eq!(current.incidents[0].code, "TOKEN_QUOTA_EXCEEDED");
+    assert_eq!(
+        invocation(&fixture, &claimed.job.job_id).2,
+        "proved_no_effect"
+    );
+    assert_eq!(ai_event_rows(&fixture), 0);
+}
+
+#[tokio::test]
+async fn an_unreadable_account_does_not_turn_an_authorized_run_into_an_uncertain_one() {
+    use crate::flow_engine::dispatcher::PinnedFlowSnapshot;
+    use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+
+    let fixture = Fixture::new();
+    let dispatcher = fixture.dispatcher();
+    let owner = &fixture.owner;
+    let (graph, sha256) = block_pin("pii_filter", &json!({})).unwrap();
+    let pinned = PinnedFlowSnapshot {
+        flow_id: "block:pii_filter".into(),
+        source_version: 0,
+        graph_json: graph,
+        graph_sha256: sha256,
+    };
+    let meta = dispatcher
+        .authorize_process_block("pii_filter", &json!({}), &owner.user_id, &owner.org_id)
+        .ok()
+        .unwrap();
+    let original = corrupt_accounts(&fixture);
+    let outcome = dispatcher
+        .dispatch_pinned_synthetic(
+            &pinned,
+            FlowEnvelope::with_payload(FlowValue::Text("hi".into())),
+            meta,
+        )
+        .await;
+    restore_accounts(&fixture, original);
+    assert_eq!(
+        outcome.unwrap().final_envelope.payload.as_text(),
+        Some("hi")
+    );
 }

@@ -14568,7 +14568,7 @@
     "block_type": "Bloc",
     "block_config": "Paramètres du bloc (JSON)",
     "block_config_invalid": "Les paramètres doivent être un objet JSON valide.",
-    "block_hint": "Le bloc s'exécute seul au nom de la personne qui a lancé le processus. Associez à « payload » dans le mappage d'entrée le texte à traiter ; le résultat devient la sortie de l'activité.",
+    "block_hint": "Le bloc s'exécute seul au nom de la personne qui a lancé le processus. Le mappage d'entrée doit donner à « payload » le texte à traiter (prérempli avec vars.text) ; llm et embeddings exigent aussi le paramètre « model ». Le résultat devient la sortie de l'activité.",
     "block_llm": "Modèle de langage (LLM)",
     "block_embeddings": "Embeddings",
     "block_pii_filter": "Filtre de données personnelles",

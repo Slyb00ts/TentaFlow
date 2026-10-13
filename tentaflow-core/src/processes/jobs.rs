@@ -388,8 +388,8 @@ pub async fn execute_claimed(
         ServiceImplementation::AddonTool { addon_id, tool_name } => {
             execute_tool(&job, snapshot, addon_id, tool_name, input_mapping).await
         }
-        ServiceImplementation::Block { node_type, .. } => {
-            execute_block(&job, snapshot, node_type).await
+        ServiceImplementation::Block { node_type, config } => {
+            execute_block(&job, snapshot, node_type, config).await
         }
     }
 }
@@ -507,15 +507,19 @@ fn pinned_flow_end(
 ///
 /// What the block is (type and configuration) is fixed by the publication pin;
 /// the code behind the block is whatever the node runs now, which is why the
-/// pin is a graph and not a code hash. Access is the allow-list plus an active
-/// initiator in the organization, checked before the dispatch boundary and again
-/// around the run. A failed read is "cannot tell", never a revocation: before
-/// the boundary it puts the job off, afterwards it leaves the result to the
-/// in-transaction source check that publishing it performs anyway.
+/// pin is a graph and not a code hash. The pin is read by its structure and must
+/// name the block and settings of the service task. Whether the block may still
+/// run is authorization: the allow-list, an active initiator in the organization
+/// and, for a model block, access to that model, all checked before the dispatch
+/// boundary, as is the initiator's token quota. A failed read is "cannot tell",
+/// never a revocation: before the boundary it puts the job off, afterwards it
+/// leaves the result to the in-transaction source check that publishing it
+/// performs anyway.
 async fn execute_block(
     job: &ServiceJob<'_>,
     snapshot: &repository::PinnedServiceSnapshot,
     node_type: &str,
+    config: &Value,
 ) -> Result<()> {
     let ServiceJob { pool, dispatcher, worker_id, claimed, cancel, .. } = *job;
     let (user_id, org_id) = (&claimed.actor.user_id, &claimed.actor.org_id);
@@ -525,22 +529,16 @@ async fn execute_block(
         graph_json: snapshot.graph_json.clone(),
         graph_sha256: snapshot.info.graph_sha256.clone(),
     };
-    let pin_matches = super::blocks::pinned_block_type(&pinned.graph_json)
-        .is_ok_and(|pinned_type| pinned_type == node_type);
-    if !pin_matches {
-        return fail_claim(pool, worker_id, claimed, "INVALID_SERVICE_JOB",
-            "the pinned block graph does not match the service task", None);
-    }
-    if let Err(error) = crate::flow_engine::node_adapters::activity_result::validate_process_result_binding(
-        &pinned.graph_json, job.result_expression)
-    {
+    let pin_matches = super::blocks::parse_pinned_block(&pinned.graph_json)
+        .and_then(|pinned_block| pinned_block.ensure_is(node_type, config));
+    if let Err(error) = pin_matches {
         return fail_claim(pool, worker_id, claimed, "INVALID_SERVICE_JOB", error, None);
     }
-    let authorize = || match dispatcher.authorize_process_block(node_type, user_id, org_id) {
+    let authorize = || match dispatcher.authorize_process_block(node_type, config, user_id, org_id) {
         Ok(_) | Err(BlockAccessError::Unavailable) => AccessCheck::Allowed,
         Err(error) => AccessCheck::Revoked(error.to_string()),
     };
-    let mut meta = match dispatcher.authorize_process_block(node_type, user_id, org_id) {
+    let mut meta = match dispatcher.authorize_process_block(node_type, config, user_id, org_id) {
         Ok(meta) => meta,
         // Nothing ran and nothing is wrong with the process: wait (bounded).
         Err(BlockAccessError::Unavailable) => {
@@ -551,6 +549,10 @@ async fn execute_block(
             return fail_claim(pool, worker_id, claimed, "SOURCE_ACCESS_REVOKED", error, None)
         }
     };
+    if dispatcher.process_block_over_quota(node_type, config, user_id, org_id) {
+        return fail_claim(pool, worker_id, claimed, "TOKEN_QUOTA_EXCEEDED",
+            "the initiator's token quota for the block's model is spent", None);
+    }
     let payload = match super::blocks::block_payload(&claimed.job.input) {
         Ok(payload) => payload,
         Err(error) => {

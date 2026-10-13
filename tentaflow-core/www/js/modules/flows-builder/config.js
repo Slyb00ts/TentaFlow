@@ -24,6 +24,9 @@ import { openProcessCallPreview } from './process-monitor.js';
 // authority (it validates on save and again at publication); this list only
 // decides what the inspector offers until the process options carry it.
 const PROCESS_BLOCK_TYPES = ['llm', 'embeddings', 'pii_filter'];
+// The settings a block starts with: the keys it requires, empty. Choosing a type
+// replaces the settings, so keys of the previous type never linger.
+const processBlockTemplate = (type) => (type === 'pii_filter' ? {} : { model: '' });
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
 // these from `node.config`; an empty value means "use the built-in default".
@@ -641,7 +644,6 @@ export class FlowConfig {
       const source = blockTask
         ? `<tf-select data-process="blockType" label="${escapeAttr(I18n.t('bpmn.block_type'))}" value="${escapeAttr(blockTask.nodeType)}" ${disabled}>${PROCESS_BLOCK_TYPES.map((type) => `<option value="${type}">${escapeHtml(I18n.t(`bpmn.block_${type}`))}</option>`).join('')}${PROCESS_BLOCK_TYPES.includes(blockTask.nodeType) ? '' : `<option value="${escapeAttr(blockTask.nodeType)}" disabled>${escapeHtml(blockTask.nodeType)}</option>`}</tf-select>
         ${textarea('blockConfig', 'block_config', JSON.stringify(blockTask.config, null, 2), 5)}
-        <p class="fb-field-hint" data-block-config-error hidden>${escapeHtml(I18n.t('bpmn.block_config_invalid'))}</p>
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.block_hint'))}</p>`
         : tool
         ? `${input('addonId', 'tool_addon_id', tool.addonId)}${input('toolName', 'tool_name', tool.toolName)}
@@ -1150,17 +1152,20 @@ export class FlowConfig {
         this.opts.onConfigChange(node.id, control.value === 'tool'
           ? { flowId: '', implementation: { AddonTool: { addonId: '', toolName: '' } } }
           : control.value === 'block'
-            ? { flowId: '', implementation: { Block: { nodeType: PROCESS_BLOCK_TYPES[0], config: {} } } }
+            ? { flowId: '', implementation: { Block: { nodeType: PROCESS_BLOCK_TYPES[0], config: processBlockTemplate(PROCESS_BLOCK_TYPES[0]) } },
+              inputMapping: { ...node.config.inputMapping, payload: node.config.inputMapping?.payload ?? 'vars.text' } }
             : { implementation: 'Flow' });
         this._renderProcess();
       } else if (key === 'blockType') {
         this.opts.onConfigChange(node.id, { implementation: { Block: {
-          ...node.config.implementation.Block, nodeType: control.value } } });
+          nodeType: control.value, config: processBlockTemplate(control.value) } } });
+        this._renderProcess();
       } else if (key === 'blockConfig') {
         let parsed = null;
         try { parsed = JSON.parse(control.value); } catch { /* reported below */ }
         const valid = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed);
-        this.root.querySelector('[data-block-config-error]').hidden = valid;
+        if (valid) control.removeAttribute('error');
+        else control.setAttribute('error', I18n.t('bpmn.block_config_invalid'));
         if (valid) {
           this.opts.onConfigChange(node.id, { implementation: { Block: {
             ...node.config.implementation.Block, config: parsed } } });

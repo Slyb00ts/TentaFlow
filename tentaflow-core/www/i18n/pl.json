@@ -15803,7 +15803,7 @@
     "block_type": "Blok",
     "block_config": "Ustawienia bloku (JSON)",
     "block_config_invalid": "Ustawienia muszą być poprawnym obiektem JSON.",
-    "block_hint": "Blok działa samodzielnie jako osoba, która uruchomiła proces. W mapowaniu wejścia przypisz do „payload” tekst do przetworzenia; wynik trafia do wyjścia aktywności.",
+    "block_hint": "Blok działa samodzielnie jako osoba, która uruchomiła proces. Mapowanie wejścia musi przypisać do „payload” tekst do przetworzenia (podpowiedź: vars.text); llm i embeddings wymagają też ustawienia „model”. Wynik trafia do wyjścia aktywności.",
     "block_llm": "Model językowy (LLM)",
     "block_embeddings": "Embeddingi",
     "block_pii_filter": "Filtr danych osobowych",

@@ -15803,7 +15803,7 @@
     "block_type": "Block",
     "block_config": "Block settings (JSON)",
     "block_config_invalid": "The settings must be a valid JSON object.",
-    "block_hint": "The block runs on its own as the person who started the process. Map the text it should process to \"payload\" in the input mapping; the result is the activity output.",
+    "block_hint": "The block runs on its own as the person who started the process. The input mapping must give \"payload\" the text to process (prefilled with vars.text); llm and embeddings also need a \"model\" setting. The result is the activity output.",
     "block_llm": "Language model (LLM)",
     "block_embeddings": "Embeddings",
     "block_pii_filter": "Personal data filter",

@@ -14568,7 +14568,7 @@
     "block_type": "Bloque",
     "block_config": "Ajustes del bloque (JSON)",
     "block_config_invalid": "Los ajustes deben ser un objeto JSON válido.",
-    "block_hint": "El bloque se ejecuta por sí solo como la persona que inició el proceso. Asigna a «payload» en el mapeo de entrada el texto que debe procesar; el resultado es la salida de la actividad.",
+    "block_hint": "El bloque se ejecuta por sí solo como la persona que inició el proceso. El mapeo de entrada debe asignar a «payload» el texto a procesar (rellenado con vars.text); llm y embeddings también necesitan el ajuste «model». El resultado es la salida de la actividad.",
     "block_llm": "Modelo de lenguaje (LLM)",
     "block_embeddings": "Embeddings",
     "block_pii_filter": "Filtro de datos personales",

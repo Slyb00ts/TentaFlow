@@ -22,6 +22,7 @@ enum ConfigValue {
     Number { min: f64, max: f64 },
     Count { min: u64, max: u64 },
     TextList { max_items: usize, max_len: usize },
+    Choice(&'static [&'static str]),
 }
 
 struct ConfigKey {
@@ -106,20 +107,15 @@ const ALLOWED: &[AllowedBlock] = &[
             },
             ConfigKey {
                 name: "reasoning_effort",
-                value: ConfigValue::Text { max_len: 32 },
+                value: ConfigValue::Choice(&["low", "medium", "high", "xhigh", "max"]),
                 required: false,
             },
             ConfigKey {
                 name: "stop",
                 value: ConfigValue::TextList {
-                    max_items: 8,
+                    max_items: 4,
                     max_len: 256,
                 },
-                required: false,
-            },
-            ConfigKey {
-                name: "max_request_attempts",
-                value: ConfigValue::Count { min: 1, max: 5 },
                 required: false,
             },
         ],
@@ -148,6 +144,10 @@ pub fn allowed_block(node_type: &str) -> Option<&'static AllowedBlock> {
 pub enum BlockAccessError {
     #[error("process block is not available")]
     NotAllowed,
+    // Same text as `NotAllowed`: a refused model must not tell the initiator
+    // whether the model exists, as the chat endpoint does not.
+    #[error("process block is not available")]
+    ModelDenied,
     #[error("process initiator is inactive or outside the organization")]
     Initiator,
     #[error("process block access could not be determined")]
@@ -200,6 +200,7 @@ fn validate_value(node_type: &str, key: &ConfigKey, value: &Value) -> Result<()>
                     .iter()
                     .all(|item| item.as_str().is_some_and(|text| text.len() <= max_len))
         }),
+        ConfigValue::Choice(choices) => value.as_str().is_some_and(|text| choices.contains(&text)),
     };
     ensure!(valid, "block {node_type} setting {name} is invalid");
     Ok(())
@@ -257,26 +258,113 @@ pub fn block_pin(node_type: &str, config: &Value) -> Result<(String, String)> {
     Ok((graph_json, sha256))
 }
 
-/// The block a pinned graph runs. The graph must be exactly what [`block_pin`]
-/// builds for its block, so a hand-made or altered pin cannot reach the
-/// executor through the block path.
-pub fn pinned_block_type(graph_json: &str) -> Result<String> {
+/// The model a block calls, for the blocks that call one: what the model-access
+/// check and the quota check are asked about.
+pub fn block_model<'a>(node_type: &str, config: &'a Value) -> Option<&'a str> {
+    let block = allowed_block(node_type)?;
+    block.keys.iter().find(|key| key.name == "model")?;
+    config.get("model")?.as_str()
+}
+
+/// A pinned graph read back by its structure: three nodes (`trigger`, one block,
+/// `output`) joined by two plain edges, nothing else. It is deliberately NOT
+/// compared with what today's code would build, so a later change to the graph
+/// builder or the allow-list cannot make a published process unrunnable: what
+/// is run is the pinned bytes (their SHA-256 is checked by the caller), and
+/// whether the block may still run is an authorization question.
+#[derive(Debug)]
+pub struct PinnedBlock {
+    pub node_type: String,
+    pub config: Value,
+    definition: FlowDefinition,
+}
+
+pub fn parse_pinned_block(graph_json: &str) -> Result<PinnedBlock> {
     let definition: FlowDefinition = serde_json::from_str(graph_json)?;
-    let block = definition
-        .nodes
-        .iter()
-        .find(|node| node.id == BLOCK_NODE_ID)
-        .context("pinned block graph has no block node")?;
+    ensure!(
+        definition.nodes.len() == 3
+            && definition.edges.len() == 2
+            && definition.variables.is_empty(),
+        "pinned block graph is not a one-block graph"
+    );
+    let node = |id: &str, node_type: Option<&str>| -> Result<&FlowNode> {
+        let node = definition
+            .nodes
+            .iter()
+            .find(|node| node.id == id)
+            .with_context(|| format!("pinned block graph has no node {id}"))?;
+        ensure!(
+            node.region.is_none() && node_type.is_none_or(|expected| node.node_type == expected),
+            "pinned block graph node {id} is not what a one-block graph holds"
+        );
+        Ok(node)
+    };
+    let trigger = node(TRIGGER_NODE_ID, Some("trigger"))?;
+    let output = node(OUTPUT_NODE_ID, Some("output"))?;
+    let block = node(BLOCK_NODE_ID, None)?;
+    ensure!(
+        [trigger, output]
+            .iter()
+            .all(|node| node.config.is_null() || node.config == Value::Object(Map::new())),
+        "pinned block graph configures its trigger or output"
+    );
+    let joins = |from: &str, to: &str| {
+        definition
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.from == from
+                    && edge.to == to
+                    && edge.condition.is_none()
+                    && edge.kind.is_none()
+            })
+            .count()
+            == 1
+    };
+    ensure!(
+        joins(TRIGGER_NODE_ID, BLOCK_NODE_ID) && joins(BLOCK_NODE_ID, OUTPUT_NODE_ID),
+        "pinned block graph is not trigger, block, output"
+    );
     let config = match &block.config {
         Value::Null => Value::Object(Map::new()),
         other => other.clone(),
     };
-    let (expected, _) = block_pin(&block.node_type, &config)?;
-    ensure!(
-        graph_json == expected,
-        "pinned block graph differs from the one built for its block"
-    );
-    Ok(block.node_type.clone())
+    Ok(PinnedBlock {
+        node_type: block.node_type.clone(),
+        config,
+        definition,
+    })
+}
+
+impl PinnedBlock {
+    /// The pin is the model's own block: same type, same settings.
+    pub fn ensure_is(&self, node_type: &str, config: &Value) -> Result<()> {
+        ensure!(
+            self.node_type == node_type && &self.config == config,
+            "the pinned block differs from the one the service task names"
+        );
+        Ok(())
+    }
+
+    /// The graph to compile for a run. Limits that must hold for every process
+    /// run apply here, whatever an older pin carries: the platform never repeats
+    /// a request after the dispatch boundary, so the LLM block's own retry loop
+    /// is held to a single attempt.
+    pub fn into_run_definition(mut self) -> FlowDefinition {
+        if let Some(node) = self
+            .definition
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == BLOCK_NODE_ID && node.node_type == "llm")
+        {
+            if let Value::Object(settings) = &mut node.config {
+                settings.insert("max_request_attempts".to_owned(), Value::from(1));
+            } else {
+                node.config = serde_json::json!({ "max_request_attempts": 1 });
+            }
+        }
+        self.definition
+    }
 }
 
 /// The payload a text block takes: the string the `payload` mapping produced.
@@ -360,25 +448,174 @@ mod tests {
             block_pin("llm", &json!({"model": "other"})).unwrap().1
         );
         assert_eq!(first.1, hex::encode(Sha256::digest(first.0.as_bytes())));
-        assert_eq!(pinned_block_type(&first.0).unwrap(), "llm");
+        assert_eq!(parse_pinned_block(&first.0).unwrap().node_type, "llm");
+    }
+
+    /// The literal bytes of what publication has pinned for each allowed block.
+    /// They must stay readable (and the builder must keep producing them for the
+    /// same settings) whatever the graph builder or a node type looks like later.
+    const GOLDEN: [(&str, &str, &str, &str); 3] = [
+        (
+            "llm",
+            r#"{"model":"m"}"#,
+            r#"{"edges":[{"condition":null,"from_node":"t1","from_port":"text","id":null,"label":null,"to_node":"b1"},{"condition":null,"from_node":"b1","id":null,"label":null,"to_node":"o1","to_port":"text"}],"nodes":[{"config":null,"id":"t1","label":null,"position":null,"type":"trigger"},{"config":{"model":"m"},"id":"b1","label":null,"position":null,"type":"llm"},{"config":null,"id":"o1","label":null,"position":null,"type":"output"}]}"#,
+            "9901bd2b8da535637d93fdbe0d400dcda1044e784110bdcf042115cb48787c27",
+        ),
+        (
+            "embeddings",
+            r#"{"model":"e"}"#,
+            r#"{"edges":[{"condition":null,"from_node":"t1","from_port":"text","id":null,"label":null,"to_node":"b1"},{"condition":null,"from_node":"b1","id":null,"label":null,"to_node":"o1","to_port":"embedding"}],"nodes":[{"config":null,"id":"t1","label":null,"position":null,"type":"trigger"},{"config":{"model":"e"},"id":"b1","label":null,"position":null,"type":"embeddings"},{"config":null,"id":"o1","label":null,"position":null,"type":"output"}]}"#,
+            "5f898f9c30438ce6aaf6d76de49c2230f3dbff14c96eb77f9f970fa66be5cf01",
+        ),
+        (
+            "pii_filter",
+            "{}",
+            r#"{"edges":[{"condition":null,"from_node":"t1","from_port":"text","id":null,"label":null,"to_node":"b1"},{"condition":null,"from_node":"b1","id":null,"label":null,"to_node":"o1","to_port":"text"}],"nodes":[{"config":null,"id":"t1","label":null,"position":null,"type":"trigger"},{"config":{},"id":"b1","label":null,"position":null,"type":"pii_filter"},{"config":null,"id":"o1","label":null,"position":null,"type":"output"}]}"#,
+            "4fa2be9dfb5dc62f7c79369f9c90b06e2fa75847aeccee4bef30a0549927d07c",
+        ),
+    ];
+
+    #[test]
+    fn golden_pins_are_built_and_read_byte_for_byte() {
+        assert_eq!(
+            GOLDEN.len(),
+            ALLOWED.len(),
+            "every allowed block has a golden pin"
+        );
+        for (node_type, config, graph, sha256) in GOLDEN {
+            let config: Value = serde_json::from_str(config).unwrap();
+            assert_eq!(
+                block_pin(node_type, &config).unwrap(),
+                (graph.to_owned(), sha256.to_owned())
+            );
+            assert_eq!(hex::encode(Sha256::digest(graph.as_bytes())), sha256);
+            let pinned = parse_pinned_block(graph).unwrap();
+            assert_eq!(
+                (pinned.node_type.as_str(), &pinned.config),
+                (node_type, &config)
+            );
+            pinned.ensure_is(node_type, &config).unwrap();
+        }
     }
 
     #[test]
-    fn an_altered_pin_is_not_a_block_pin() {
-        let (graph, _) = block_pin("pii_filter", &json!({})).unwrap();
-        let mut definition: Value = serde_json::from_str(&graph).unwrap();
-        definition["nodes"][1]["type"] = json!("exec_command");
-        assert!(pinned_block_type(&definition.to_string()).is_err());
-        let mut extra: Value = serde_json::from_str(&graph).unwrap();
+    fn a_pin_is_read_by_structure_not_by_todays_builder() {
+        let golden = GOLDEN[0].2;
+        // A field a later FlowNode grows, another key order, a block narrowed out
+        // of the allow-list: none of them makes a published pin unreadable.
+        let mut grown: Value = serde_json::from_str(golden).unwrap();
+        grown["nodes"][1]["future_field"] = json!(1);
+        assert!(parse_pinned_block(&grown.to_string()).is_ok());
+        let pretty =
+            serde_json::to_string_pretty(&serde_json::from_str::<Value>(golden).unwrap()).unwrap();
+        assert!(parse_pinned_block(&pretty).is_ok());
+        let mut eight_stops: Value = serde_json::from_str(golden).unwrap();
+        eight_stops["nodes"][1]["config"]["stop"] = json!(["1", "2", "3", "4", "5", "6", "7", "8"]);
+        assert!(validate_block("llm", &eight_stops["nodes"][1]["config"]).is_err());
+        assert!(parse_pinned_block(&eight_stops.to_string()).is_ok());
+        let mut removed: Value = serde_json::from_str(golden).unwrap();
+        removed["nodes"][1]["type"] = json!("a_block_no_longer_allowed");
+        assert_eq!(
+            parse_pinned_block(&removed.to_string()).unwrap().node_type,
+            "a_block_no_longer_allowed"
+        );
+    }
+
+    #[test]
+    fn a_graph_that_is_not_trigger_block_output_is_refused() {
+        let golden: Value = serde_json::from_str(GOLDEN[2].2).unwrap();
+        let refused = |graph: Value| parse_pinned_block(&graph.to_string()).is_err();
+        let mut extra = golden.clone();
         extra["nodes"]
             .as_array_mut()
             .unwrap()
             .push(json!({"id": "x", "type": "output"}));
-        assert!(pinned_block_type(&extra.to_string()).is_err());
-        // Equal content in another key order is not the canonical text.
-        let reformatted =
-            serde_json::to_string_pretty(&serde_json::from_str::<Value>(&graph).unwrap()).unwrap();
-        assert!(pinned_block_type(&reformatted).is_err());
+        assert!(refused(extra));
+        let mut extra_edge = golden.clone();
+        let edge = extra_edge["edges"][0].clone();
+        extra_edge["edges"].as_array_mut().unwrap().push(edge);
+        assert!(refused(extra_edge));
+        let mut retargeted = golden.clone();
+        retargeted["edges"][1]["to_node"] = json!("t1");
+        assert!(refused(retargeted));
+        let mut conditional = golden.clone();
+        conditional["edges"][0]["condition"] = json!("true");
+        assert!(refused(conditional));
+        let mut streaming = golden.clone();
+        streaming["nodes"][2]["config"] = json!({"mode": "stream"});
+        assert!(refused(streaming));
+        let mut renamed = golden.clone();
+        renamed["nodes"][0]["type"] = json!("bus_consume");
+        assert!(refused(renamed));
+        let mut regional = golden.clone();
+        regional["nodes"][1]["region"] = json!("r");
+        assert!(refused(regional));
+        let mut with_variables = golden.clone();
+        with_variables["variables"] = json!([{"name": "v"}]);
+        assert!(refused(with_variables));
+    }
+
+    #[test]
+    fn the_pin_must_name_the_block_and_settings_of_the_task() {
+        let pinned = parse_pinned_block(GOLDEN[0].2).unwrap();
+        assert!(pinned.ensure_is("llm", &json!({"model": "m"})).is_ok());
+        assert!(pinned.ensure_is("llm", &json!({"model": "other"})).is_err());
+        assert!(pinned
+            .ensure_is("embeddings", &json!({"model": "m"}))
+            .is_err());
+    }
+
+    #[test]
+    fn a_run_never_repeats_a_request_whatever_an_older_pin_says() {
+        let mut older: Value = serde_json::from_str(GOLDEN[0].2).unwrap();
+        older["nodes"][1]["config"]["max_request_attempts"] = json!(5);
+        let definition = parse_pinned_block(&older.to_string())
+            .unwrap()
+            .into_run_definition();
+        let llm = definition
+            .nodes
+            .iter()
+            .find(|node| node.id == "b1")
+            .unwrap();
+        assert_eq!(llm.config["max_request_attempts"], 1);
+        assert_eq!(llm.config["model"], "m");
+        // The key is not offered for new pins.
+        assert!(validate_block("llm", &json!({"model": "m", "max_request_attempts": 1})).is_err());
+        let embeddings = parse_pinned_block(GOLDEN[1].2)
+            .unwrap()
+            .into_run_definition();
+        assert!(embeddings.nodes[1]
+            .config
+            .get("max_request_attempts")
+            .is_none());
+    }
+
+    #[test]
+    fn stop_and_reasoning_effort_are_bounded() {
+        let llm = |extra: Value| {
+            let mut config = json!({"model": "m"});
+            config
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            validate_block("llm", &config).is_ok()
+        };
+        assert!(llm(json!({"stop": ["a", "b", "c", "d"]})));
+        assert!(!llm(json!({"stop": ["a", "b", "c", "d", "e"]})));
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            assert!(llm(json!({ "reasoning_effort": effort })), "{effort}");
+        }
+        for effort in ["", "HIGH", "extreme", "low "] {
+            assert!(!llm(json!({ "reasoning_effort": effort })), "{effort:?}");
+        }
+    }
+
+    #[test]
+    fn only_model_blocks_name_a_model() {
+        assert_eq!(block_model("llm", &json!({"model": "m"})), Some("m"));
+        assert_eq!(block_model("embeddings", &json!({"model": "e"})), Some("e"));
+        assert_eq!(block_model("pii_filter", &json!({"model": "m"})), None);
+        assert_eq!(block_model("exec_command", &json!({"model": "m"})), None);
     }
 
     #[test]

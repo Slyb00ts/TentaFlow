@@ -298,7 +298,12 @@ impl ExecutionContext {
     /// `envelope.meta` — a node that rewrote meta must not be able to change
     /// where its own calls are reported from.
     pub fn provenance(&self) -> CallProvenance {
-        CallProvenance::new(self.origin, self.actor())
+        let provenance = CallProvenance::new(self.origin, self.actor());
+        if self.origin == FlowOrigin::Process {
+            provenance.with_org(self.org_id.clone())
+        } else {
+            provenance
+        }
     }
 }
 

@@ -2979,7 +2979,7 @@ fn require_source_current(
         }
         if let Some(snapshot) = expected {
             ensure!(
-                super::blocks::pinned_block_type(&snapshot.graph_json)? == node_type,
+                super::blocks::parse_pinned_block(&snapshot.graph_json)?.node_type == node_type,
                 "source block pin does not match its reference"
             );
         }

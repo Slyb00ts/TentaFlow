@@ -2004,7 +2004,7 @@ mod tests {
             ctx.user_id = Some(actor.clone());
             ctx.org_id = Some("org-tool-search".into());
             ctx.vectors = vectors.clone();
-            ctx.embeddings = Arc::new(EmbeddingsDispatcherImpl::new(state.router.executor.clone()));
+            ctx.embeddings = Arc::new(EmbeddingsDispatcherImpl::new(state.router.executor.clone(), None, ""));
             let mut env = FlowEnvelope::empty();
             env.meta.insert("agent_id".into(), json!("search-agent"));
             env.context

@@ -375,11 +375,24 @@ impl FlowActor {
 pub struct CallProvenance {
     pub origin: FlowOrigin,
     pub actor: FlowActor,
+    /// The organization a BPMN process runs in. Set only for
+    /// `FlowOrigin::Process`; every other origin leaves the audit to resolve the
+    /// organization from the caller's membership, as before.
+    pub org_id: Option<String>,
 }
 
 impl CallProvenance {
     pub fn new(origin: FlowOrigin, actor: FlowActor) -> Self {
-        Self { origin, actor }
+        Self {
+            origin,
+            actor,
+            org_id: None,
+        }
+    }
+
+    pub fn with_org(mut self, org_id: Option<String>) -> Self {
+        self.org_id = org_id;
+        self
     }
 
     /// Internal core work with no external caller — a statement, not an
@@ -391,6 +404,7 @@ impl CallProvenance {
         Self {
             origin: FlowOrigin::System,
             actor: FlowActor::system(),
+            org_id: None,
         }
     }
 }
@@ -487,7 +501,9 @@ pub struct FlowRequestMeta {
 /// a definite refusal is `Denied`, "cannot tell" is `Internal`.
 fn process_block_denial(flow_id: &str, error: BlockAccessError) -> DispatchError {
     match error {
-        BlockAccessError::NotAllowed | BlockAccessError::Initiator => DispatchError::Denied {
+        BlockAccessError::NotAllowed
+        | BlockAccessError::ModelDenied
+        | BlockAccessError::Initiator => DispatchError::Denied {
             flow_id: flow_id.to_owned(),
         },
         BlockAccessError::Unavailable => DispatchError::Internal(error.to_string()),
@@ -717,7 +733,11 @@ impl FlowDispatcher {
             audit_node_id,
         ));
         let embeddings: Arc<dyn EmbeddingsDispatcher> =
-            Arc::new(EmbeddingsDispatcherImpl::new(runtime_slot.clone()));
+            Arc::new(EmbeddingsDispatcherImpl::new(
+                runtime_slot.clone(),
+                Some(db.clone()),
+                crate::mesh::node_info_collector::local_hostname(),
+            ));
         let reranker: Arc<dyn RerankDispatcher> =
             Arc::new(RerankDispatcherImpl::new(runtime_slot.clone()));
         let documents: Arc<dyn DocumentsDispatcher> =
@@ -969,12 +989,15 @@ impl FlowDispatcher {
     }
 
     /// Process counterpart of [`authorize_process_flow`] for a block run as a
-    /// Service task. Blocks are global, so there is no per-resource ACL: the
-    /// block must be on the allow-list and the initiator an active member of
-    /// the organization. A failed read is `Unavailable`, never a denial.
+    /// Service task. The block must be on the allow-list, the initiator an
+    /// active member of the organization, and, for a block that calls a model,
+    /// the initiator must have access to THAT model: the same per-model ACL the
+    /// chat and embeddings endpoints apply. A failed read is `Unavailable`,
+    /// never a denial.
     pub fn authorize_process_block(
         &self,
         node_type: &str,
+        config: &serde_json::Value,
         user_id: &str,
         org_id: &str,
     ) -> std::result::Result<FlowRequestMeta, BlockAccessError> {
@@ -991,6 +1014,13 @@ impl FlowDispatcher {
                 _ => BlockAccessError::Initiator,
             },
         )?;
+        if let Some(model) = crate::processes::blocks::block_model(node_type, config) {
+            match acl::check_access(&self.db, "model", model, user_id, &account.role) {
+                Ok(true) => {}
+                Ok(false) => return Err(BlockAccessError::ModelDenied),
+                Err(_) => return Err(BlockAccessError::Unavailable),
+            }
+        }
         let mut meta = FlowRequestMeta::new(
             uuid::Uuid::new_v4().to_string(),
             FlowOrigin::Process,
@@ -1000,6 +1030,38 @@ impl FlowDispatcher {
         meta.user_role = Some(account.role);
         meta.org_id = Some(org_id.to_owned());
         Ok(meta)
+    }
+
+    /// Whether the initiator's token quota for the block's model is already
+    /// spent. Asked before the dispatch boundary, so a refused job never starts;
+    /// the gateway applies the same rule again when the call is made. A quota
+    /// that cannot be read does not refuse (the gateway's own fail-open rule).
+    pub fn process_block_over_quota(
+        &self,
+        node_type: &str,
+        config: &serde_json::Value,
+        user_id: &str,
+        org_id: &str,
+    ) -> bool {
+        let Some(model) = crate::processes::blocks::block_model(node_type, config) else {
+            return false;
+        };
+        let gateway = crate::compliance::ai_gateway::AiGateway::new(
+            self.db.clone(),
+            crate::mesh::node_info_collector::local_hostname(),
+            crate::compliance::ai_gateway::token_quota_enabled(),
+        );
+        let user = crate::auth::acl::UserContext {
+            user_id: user_id.to_owned(),
+            role: String::new(),
+        };
+        let context = crate::compliance::ai_gateway::AiGatewayContext {
+            org_id: Some(org_id.to_owned()),
+            ..Default::default()
+        };
+        gateway
+            .check_token_quota(model, Some(&user), Some(&context))
+            .is_err()
     }
 
     /// Pin of a block for publication: the canonical one-block graph, built
@@ -1018,7 +1080,7 @@ impl FlowDispatcher {
                 flow_id: flow_id.clone(),
                 msg: error.to_string(),
             })?;
-        self.authorize_process_block(node_type, user_id, org_id)
+        self.authorize_process_block(node_type, config, user_id, org_id)
             .map_err(|error| process_block_denial(&flow_id, error))?;
         self.validate_process_snapshot(&flow_id, &graph_json)?;
         CompiledFlow::from_json("", &graph_json, &self.registry).map_err(|error| {
@@ -1037,13 +1099,19 @@ impl FlowDispatcher {
 
     /// Runs a pinned one-block graph without a `flows` row (so no execution
     /// record is written, as for any flow with an empty id). The flow ACL is
-    /// replaced by [`authorize_process_block`]; the hash, the graph rules and
-    /// the exact-pin check are the same as for a pinned flow.
+    /// replaced by [`authorize_process_block`]; the hash and the graph rules are
+    /// the same as for a pinned flow, and the graph must have the structure of a
+    /// one-block graph (it is not compared with what today's code would build).
+    ///
+    /// The caller has just authorized the job and committed nothing yet to run,
+    /// so a definite refusal here stops the run, while a failed read ("cannot
+    /// tell") does not: failing then would turn a run that never started into an
+    /// unconfirmed external effect.
     pub async fn dispatch_pinned_synthetic(
         &self,
         snapshot: &PinnedFlowSnapshot,
         initial: FlowEnvelope,
-        mut meta: FlowRequestMeta,
+        meta: FlowRequestMeta,
     ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
         use sha2::{Digest, Sha256};
 
@@ -1058,39 +1126,42 @@ impl FlowDispatcher {
         {
             return Err(denied());
         }
-        let node_type = crate::processes::blocks::pinned_block_type(&snapshot.graph_json)
-            .map_err(|error| DispatchError::CompileFailed {
+        let pinned = crate::processes::blocks::parse_pinned_block(&snapshot.graph_json).map_err(
+            |error| DispatchError::CompileFailed {
                 flow_id: snapshot.flow_id.clone(),
                 msg: error.to_string(),
-            })?;
-        if snapshot.flow_id != tentaflow_protocol::processes::block_source_ref(&node_type) {
+            },
+        )?;
+        if snapshot.flow_id != tentaflow_protocol::processes::block_source_ref(&pinned.node_type) {
             return Err(denied());
         }
-        let current = self
-            .authorize_process_block(&node_type, &user_id, &org_id)
-            .map_err(|error| process_block_denial(&snapshot.flow_id, error))?;
-        meta.user_role = current.user_role;
+        let (node_type, config) = (pinned.node_type.clone(), pinned.config.clone());
+        let definite = |result: std::result::Result<FlowRequestMeta, BlockAccessError>| match result
+        {
+            Err(
+                error @ (BlockAccessError::NotAllowed
+                | BlockAccessError::Initiator
+                | BlockAccessError::ModelDenied),
+            ) => Err(process_block_denial(&snapshot.flow_id, error)),
+            Ok(_) | Err(BlockAccessError::Unavailable) => Ok(()),
+        };
+        definite(self.authorize_process_block(&node_type, &config, &user_id, &org_id))?;
         self.validate_process_snapshot(&snapshot.flow_id, &snapshot.graph_json)?;
         let compiled = Arc::new(
-            CompiledFlow::from_json("", &snapshot.graph_json, &self.registry).map_err(|error| {
-                DispatchError::CompileFailed {
+            CompiledFlow::compile("", pinned.into_run_definition(), &self.registry).map_err(
+                |error| DispatchError::CompileFailed {
                     flow_id: snapshot.flow_id.clone(),
                     msg: error.to_string(),
-                }
-            })?,
+                },
+            )?,
         );
         let outcome = self
             .run_blocking(compiled, initial, meta, RunDescriptor::default())
             .await
             .map_err(DispatchError::from)?;
-        // Only a definite loss of access discards a result that already exists;
-        // a read that fails now is left to the caller's own re-check.
-        match self.authorize_process_block(&node_type, &user_id, &org_id) {
-            Err(error @ (BlockAccessError::NotAllowed | BlockAccessError::Initiator)) => {
-                Err(process_block_denial(&snapshot.flow_id, error))
-            }
-            Ok(_) | Err(BlockAccessError::Unavailable) => Ok(outcome),
-        }
+        // Only a definite loss of access discards a result that already exists.
+        definite(self.authorize_process_block(&node_type, &config, &user_id, &org_id))?;
+        Ok(outcome)
     }
 
     /// Zwraca `AddonFlowRegistry` jesli `set_addon_resolver` zostalo wolane.

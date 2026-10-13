@@ -14568,7 +14568,7 @@
     "block_type": "Block",
     "block_config": "Block-Einstellungen (JSON)",
     "block_config_invalid": "Die Einstellungen müssen ein gültiges JSON-Objekt sein.",
-    "block_hint": "Der Block läuft eigenständig als die Person, die den Prozess gestartet hat. Ordnen Sie im Eingabe-Mapping den zu verarbeitenden Text „payload“ zu; das Ergebnis ist die Ausgabe der Aktivität.",
+    "block_hint": "Der Block läuft eigenständig als die Person, die den Prozess gestartet hat. Das Eingabe-Mapping muss „payload“ den zu verarbeitenden Text zuweisen (vorbelegt mit vars.text); llm und embeddings benötigen außerdem die Einstellung „model“. Das Ergebnis ist die Ausgabe der Aktivität.",
     "block_llm": "Sprachmodell (LLM)",
     "block_embeddings": "Embeddings",
     "block_pii_filter": "Filter für personenbezogene Daten",
