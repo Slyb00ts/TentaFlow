@@ -261,9 +261,44 @@ pub fn block_pin(node_type: &str, config: &Value) -> Result<(String, String)> {
 /// The model a block calls, for the blocks that call one: what the model-access
 /// check and the quota check are asked about.
 pub fn block_model<'a>(node_type: &str, config: &'a Value) -> Option<&'a str> {
-    let block = allowed_block(node_type)?;
-    block.keys.iter().find(|key| key.name == "model")?;
+    if !needs_model(node_type) {
+        return None;
+    }
     config.get("model")?.as_str()
+}
+
+/// The answer of the quota check made before a block's job starts. `Unavailable`
+/// is "cannot tell" (the check itself could not read what it needs) and, like
+/// every such answer, is never reported as a spent quota.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaCheck {
+    Within,
+    Exceeded,
+    Unavailable,
+}
+
+impl QuotaCheck {
+    /// Only the gateway's own refusal means the quota is spent; any other error
+    /// is infrastructure.
+    pub fn from_gateway(result: Result<()>) -> Self {
+        match result {
+            Ok(()) => Self::Within,
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<crate::error::CoreError>(),
+                    Some(crate::error::CoreError::RateLimitExceeded { .. })
+                ) =>
+            {
+                Self::Exceeded
+            }
+            Err(_) => Self::Unavailable,
+        }
+    }
+}
+
+/// Whether the block calls a model, so that its settings must name one.
+pub fn needs_model(node_type: &str) -> bool {
+    allowed_block(node_type).is_some_and(|block| block.keys.iter().any(|key| key.name == "model"))
 }
 
 /// A pinned graph read back by its structure: three nodes (`trigger`, one block,
@@ -308,7 +343,10 @@ pub fn parse_pinned_block(graph_json: &str) -> Result<PinnedBlock> {
             .all(|node| node.config.is_null() || node.config == Value::Object(Map::new())),
         "pinned block graph configures its trigger or output"
     );
-    let joins = |from: &str, to: &str| {
+    // The ports are those of the canonical graph. A block that has since left
+    // the allow-list has no table entry; it is refused by authorization, not here.
+    let ports = allowed_block(&block.node_type);
+    let joins = |from: &str, to: &str, from_port: Option<&str>, to_port: Option<&str>| {
         definition
             .edges
             .iter()
@@ -317,12 +355,25 @@ pub fn parse_pinned_block(graph_json: &str) -> Result<PinnedBlock> {
                     && edge.to == to
                     && edge.condition.is_none()
                     && edge.kind.is_none()
+                    && edge.data_type == FlowDataType::Any
+                    && from_port.is_none_or(|port| edge.from_port == port)
+                    && to_port.is_none_or(|port| edge.to_port == port)
             })
             .count()
             == 1
     };
     ensure!(
-        joins(TRIGGER_NODE_ID, BLOCK_NODE_ID) && joins(BLOCK_NODE_ID, OUTPUT_NODE_ID),
+        joins(
+            TRIGGER_NODE_ID,
+            BLOCK_NODE_ID,
+            ports.map(|block| block.entry_port),
+            Some("in")
+        ) && joins(
+            BLOCK_NODE_ID,
+            OUTPUT_NODE_ID,
+            Some("full"),
+            ports.map(|block| block.exit_port)
+        ),
         "pinned block graph is not trigger, block, output"
     );
     let config = match &block.config {
@@ -553,6 +604,44 @@ mod tests {
         let mut with_variables = golden.clone();
         with_variables["variables"] = json!([{"name": "v"}]);
         assert!(refused(with_variables));
+    }
+
+    #[test]
+    fn a_rewired_port_or_edge_type_is_refused() {
+        let golden: Value = serde_json::from_str(GOLDEN[0].2).unwrap();
+        let refused = |graph: Value| parse_pinned_block(&graph.to_string()).is_err();
+        for (edge, key, value) in [
+            (0, "from_port", "audio"),
+            (0, "to_port", "image"),
+            (1, "from_port", "stream"),
+            (1, "to_port", "audio"),
+            (1, "data_type", "text"),
+        ] {
+            let mut rewired = golden.clone();
+            rewired["edges"][edge][key] = json!(value);
+            assert!(refused(rewired), "{edge} {key}");
+        }
+        // The canonical ports themselves are accepted.
+        assert!(parse_pinned_block(&golden.to_string()).is_ok());
+    }
+
+    #[test]
+    fn only_the_gateways_refusal_is_a_spent_quota() {
+        let spent = anyhow::anyhow!(crate::error::CoreError::RateLimitExceeded {
+            message: "token quota exceeded".into()
+        });
+        assert_eq!(QuotaCheck::from_gateway(Ok(())), QuotaCheck::Within);
+        assert_eq!(QuotaCheck::from_gateway(Err(spent)), QuotaCheck::Exceeded);
+        assert_eq!(
+            QuotaCheck::from_gateway(Err(anyhow::anyhow!("pool timeout"))),
+            QuotaCheck::Unavailable
+        );
+    }
+
+    #[test]
+    fn only_model_blocks_need_a_model() {
+        assert!(needs_model("llm") && needs_model("embeddings"));
+        assert!(!needs_model("pii_filter") && !needs_model("exec_command"));
     }
 
     #[test]

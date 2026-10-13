@@ -781,3 +781,54 @@ async fn an_unreadable_account_does_not_turn_an_authorized_run_into_an_uncertain
         Some("hi")
     );
 }
+
+#[tokio::test]
+async fn a_model_block_whose_pin_names_no_model_is_refused_not_given_a_fallback() {
+    use crate::flow_engine::dispatcher::{DispatchError, PinnedFlowSnapshot};
+    use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+    use sha2::{Digest, Sha256};
+
+    let fixture = Fixture::new();
+    let dispatcher = fixture.dispatcher();
+    let owner = &fixture.owner;
+    let (graph, _) = block_pin("llm", &json!({"model": "m"})).unwrap();
+    for settings in [
+        r#"{}"#,
+        r#"{"model":""}"#,
+        r#"{"model":"  "}"#,
+        r#"{"model":7}"#,
+    ] {
+        let unnamed = graph.replace(r#"{"model":"m"}"#, settings);
+        assert_ne!(unnamed, graph);
+        let pinned = PinnedFlowSnapshot {
+            flow_id: "block:llm".into(),
+            source_version: 0,
+            graph_sha256: hex::encode(Sha256::digest(unnamed.as_bytes())),
+            graph_json: unnamed,
+        };
+        let config: Value = serde_json::from_str(settings).unwrap();
+        assert_eq!(
+            dispatcher
+                .authorize_process_block("llm", &config, &owner.user_id, &owner.org_id)
+                .err()
+                .unwrap(),
+            BlockAccessError::ModelDenied,
+            "{settings}"
+        );
+        let meta = dispatcher
+            .authorize_process_block("pii_filter", &json!({}), &owner.user_id, &owner.org_id)
+            .ok()
+            .unwrap();
+        let outcome = dispatcher
+            .dispatch_pinned_synthetic(
+                &pinned,
+                FlowEnvelope::with_payload(FlowValue::Text("hi".into())),
+                meta,
+            )
+            .await;
+        assert!(
+            matches!(outcome, Err(DispatchError::Denied { .. })),
+            "{settings}"
+        );
+    }
+}

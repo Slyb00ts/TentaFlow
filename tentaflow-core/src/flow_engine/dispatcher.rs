@@ -1014,7 +1014,14 @@ impl FlowDispatcher {
                 _ => BlockAccessError::Initiator,
             },
         )?;
-        if let Some(model) = crate::processes::blocks::block_model(node_type, config) {
+        if crate::processes::blocks::needs_model(node_type) {
+            // A pin without a usable model must not skip the model check and
+            // fall back to whatever the envelope or node would supply.
+            let Some(model) = crate::processes::blocks::block_model(node_type, config)
+                .filter(|model| !model.trim().is_empty())
+            else {
+                return Err(BlockAccessError::ModelDenied);
+            };
             match acl::check_access(&self.db, "model", model, user_id, &account.role) {
                 Ok(true) => {}
                 Ok(false) => return Err(BlockAccessError::ModelDenied),
@@ -1033,18 +1040,18 @@ impl FlowDispatcher {
     }
 
     /// Whether the initiator's token quota for the block's model is already
-    /// spent. Asked before the dispatch boundary, so a refused job never starts;
-    /// the gateway applies the same rule again when the call is made. A quota
-    /// that cannot be read does not refuse (the gateway's own fail-open rule).
+    /// spent, is not, or cannot be told. Asked before the dispatch boundary, so a refused job never starts;
+    /// the gateway applies the same rule again when the call is made.
     pub fn process_block_over_quota(
         &self,
         node_type: &str,
         config: &serde_json::Value,
         user_id: &str,
         org_id: &str,
-    ) -> bool {
+    ) -> crate::processes::blocks::QuotaCheck {
+        use crate::processes::blocks::QuotaCheck;
         let Some(model) = crate::processes::blocks::block_model(node_type, config) else {
-            return false;
+            return QuotaCheck::Within;
         };
         let gateway = crate::compliance::ai_gateway::AiGateway::new(
             self.db.clone(),
@@ -1059,9 +1066,7 @@ impl FlowDispatcher {
             org_id: Some(org_id.to_owned()),
             ..Default::default()
         };
-        gateway
-            .check_token_quota(model, Some(&user), Some(&context))
-            .is_err()
+        QuotaCheck::from_gateway(gateway.check_token_quota(model, Some(&user), Some(&context)))
     }
 
     /// Pin of a block for publication: the canonical one-block graph, built

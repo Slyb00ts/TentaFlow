@@ -549,9 +549,17 @@ async fn execute_block(
             return fail_claim(pool, worker_id, claimed, "SOURCE_ACCESS_REVOKED", error, None)
         }
     };
-    if dispatcher.process_block_over_quota(node_type, config, user_id, org_id) {
-        return fail_claim(pool, worker_id, claimed, "TOKEN_QUOTA_EXCEEDED",
-            "the initiator's token quota for the block's model is spent", None);
+    match dispatcher.process_block_over_quota(node_type, config, user_id, org_id) {
+        super::blocks::QuotaCheck::Within => {}
+        super::blocks::QuotaCheck::Exceeded => {
+            return fail_claim(pool, worker_id, claimed, "TOKEN_QUOTA_EXCEEDED",
+                "the initiator's token quota for the block's model is spent", None);
+        }
+        // The check could not read what it needs: nothing ran, so wait (bounded).
+        super::blocks::QuotaCheck::Unavailable => {
+            repository::defer_job(pool, claimed, worker_id, "BLOCK_UNAVAILABLE", now_ms())?;
+            return Ok(());
+        }
     }
     let payload = match super::blocks::block_payload(&claimed.job.input) {
         Ok(payload) => payload,
