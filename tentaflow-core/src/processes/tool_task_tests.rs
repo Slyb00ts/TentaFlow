@@ -191,11 +191,11 @@ async fn denied_permission_at_claim_becomes_human_work_without_calling_the_tool(
 }
 
 #[tokio::test]
-async fn a_vanished_tool_fails_the_claim_as_revoked_source() {
+async fn a_lost_initiator_fails_the_claim_as_revoked_source() {
     let host = ScriptedToolHost::new(json!({"hits": 1}));
     let fixture = fixture_with(&host);
     let started = start_model(&fixture, &tool_model(10, None));
-    *host.allow.lock().unwrap() = Err(ToolAccessError::Unavailable);
+    *host.allow.lock().unwrap() = Err(ToolAccessError::Initiator);
     run(&fixture, "gone-worker").await;
     assert!(host.calls.lock().unwrap().is_empty());
     let current =
@@ -708,8 +708,14 @@ async fn recovery_cannot_tell_yet_leaves_the_result_observed_until_authority_is_
     *host.allow.lock().unwrap() = Ok(());
     let live = |_: &str| false;
     assert_eq!(
-        repository::recover_deferred_tool_results(&fixture.db, now_ms(), &authority, &live)
-            .unwrap(),
+        repository::recover_deferred_tool_results(
+            &fixture.db,
+            now_ms(),
+            &authority,
+            &live,
+            repository::RECOVERY_PAGE
+        )
+        .unwrap(),
         1
     );
     assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "accepted");
@@ -729,15 +735,27 @@ async fn the_periodic_pass_blocks_on_a_definite_denial_and_skips_claims_a_worker
     let held = claimed.job.job_id.clone();
     let live = move |job_id: &str| job_id == held;
     assert_eq!(
-        repository::recover_deferred_tool_results(&fixture.db, now_ms(), &authority, &live)
-            .unwrap(),
+        repository::recover_deferred_tool_results(
+            &fixture.db,
+            now_ms(),
+            &authority,
+            &live,
+            repository::RECOVERY_PAGE
+        )
+        .unwrap(),
         0
     );
     assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "observed");
     let nobody = |_: &str| false;
     assert_eq!(
-        repository::recover_deferred_tool_results(&fixture.db, now_ms(), &authority, &nobody)
-            .unwrap(),
+        repository::recover_deferred_tool_results(
+            &fixture.db,
+            now_ms(),
+            &authority,
+            &nobody,
+            repository::RECOVERY_PAGE
+        )
+        .unwrap(),
         1
     );
     assert_eq!(
@@ -804,10 +822,32 @@ async fn publication_and_claim_deny_other_organizations_without_revealing_the_ad
     assert_eq!(error.message, ToolAccessError::Unavailable.to_string());
 }
 
+/// Waits (without relying on any timing) until the abandoned calls have really
+/// returned and given their permits back.
+async fn wait_for_permits(fixture: &Fixture, addon: &str) {
+    for _ in 0..50_000 {
+        if fixture.dispatcher().process_tool_gate().in_flight(addon) == 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+        tokio::task::yield_now().await;
+    }
+    panic!("the abandoned calls never returned their permits");
+}
+
+fn events_of(fixture: &Fixture, instance_id: &str, kind: &str) -> usize {
+    repository::list_events(&fixture.db, &fixture.owner, instance_id, 0, 200)
+        .unwrap()
+        .0
+        .iter()
+        .filter(|event| event.kind == kind)
+        .count()
+}
+
 #[tokio::test]
-async fn abandoned_calls_hold_the_gate_until_the_guest_returns_and_a_busy_task_waits_its_turn() {
-    let host = ScriptedToolHost::new(json!({"hits": 1}));
-    *host.delay.lock().unwrap() = Duration::from_millis(5000);
+async fn abandoned_calls_hold_the_gate_and_a_busy_task_waits_without_claim_noise() {
+    let mut host = ScriptedToolHost::new(json!({"hits": 1}));
+    Arc::get_mut(&mut host).unwrap().hold = true;
     let fixture = fixture_with(&host);
     fixture.dispatcher().process_tool_gate().set_limit(2);
     let model = tool_model(1, None);
@@ -816,78 +856,450 @@ async fn abandoned_calls_hold_the_gate_until_the_guest_returns_and_a_busy_task_w
         instances.push(start_model(&fixture, &model).instance_id);
     }
     let mut jobs = Vec::new();
-    for round in 0..3 {
-        let claimed = run(&fixture, &format!("gate-worker-{round}")).await;
+    for round in 0..2usize {
+        // The call is held inside the addon; cancelling the worker abandons it.
+        let worker = format!("gate-worker-{round}");
+        let claimed = repository::claim_job(&fixture.db, &worker, now_ms())
+            .unwrap()
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let task = {
+            let (db, dispatcher, claim, cancel, worker) = (
+                fixture.db.clone(),
+                fixture.dispatcher().clone(),
+                claimed.clone(),
+                cancel.clone(),
+                worker.clone(),
+            );
+            tokio::spawn(async move {
+                super::jobs::execute_claimed(&db, &dispatcher, &worker, claim, cancel).await
+            })
+        };
+        for _ in 0..100_000 {
+            if host.calls.lock().unwrap().len() > round {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            host.calls.lock().unwrap().len(),
+            round + 1,
+            "the call started"
+        );
+        cancel.cancel();
+        task.await.unwrap().unwrap();
         jobs.push(claimed.job.job_id);
     }
-    // Two calls were dispatched and abandoned by their timeout; the third found
-    // the addon at its cap and went back to the queue, with no incident.
-    assert_eq!(host.calls.lock().unwrap().len(), 2);
     assert_eq!(invocation(&fixture, &jobs[0]).2, "uncertain");
     assert_eq!(invocation(&fixture, &jobs[1]).2, "uncertain");
-    assert_eq!(invocation(&fixture, &jobs[2]).2, "prepared");
-    let (status, not_before): (String, Option<i64>) = fixture
-        .db
-        .read()
-        .unwrap()
-        .query_row(
-            "SELECT status,not_before_ms FROM bpmn_jobs WHERE job_id=?1",
-            [&jobs[2]],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(status, "queued");
-    let not_before = not_before.unwrap();
+    assert_eq!(fixture.dispatcher().process_tool_gate().in_flight(ADDON), 2);
+
+    // The third task meets a full addon BEFORE it is claimed: no attempt, fence
+    // or claim event is spent, and the history notes the deferral once however
+    // many times it is looked at.
+    let admission = super::runtime::claim_admission(fixture.dispatcher());
+    let mut now = now_ms();
+    for _ in 0..6 {
+        assert!(
+            repository::claim_job_where(&fixture.db, "gate-worker-2", now, &admission)
+                .unwrap()
+                .is_none()
+        );
+        let (status, attempt, count, not_before): (String, u32, i64, i64) = fixture.db.read().unwrap()
+            .query_row(
+                "SELECT status,attempt,defer_count,not_before_ms FROM bpmn_jobs WHERE instance_id=?1",
+                [&instances[2]],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), attempt), ("queued", 0));
+        assert!(not_before > now);
+        assert!(count >= 1);
+        now = not_before;
+    }
+    assert_eq!(events_of(&fixture, &instances[2], "service_deferred"), 1);
+    assert_eq!(events_of(&fixture, &instances[2], "service_claimed"), 0);
     let waiting =
         repository::get_instance(&fixture.db, &fixture.owner, &instances[2], None).unwrap();
     assert!(
         waiting.incidents.is_empty(),
         "a busy addon is not an incident"
     );
-    assert_eq!(fixture.dispatcher().process_tool_gate().in_flight(ADDON), 2);
-    let history = repository::list_events(&fixture.db, &fixture.owner, &instances[2], 0, 100)
+
+    // Once the guest really returns, the permits come back and the task runs.
+    host.release();
+    wait_for_permits(&fixture, ADDON).await;
+    let claimed = repository::claim_job_where(&fixture.db, "gate-worker-3", now, &admission)
         .unwrap()
-        .0;
-    let deferred = history
-        .iter()
-        .find(|event| event.kind == "service_deferred")
-        .expect("deferral");
-    assert_eq!(deferred.data["code"], "TOOL_BUSY");
+        .expect("the task is claimable once the addon has room");
+    assert_eq!(claimed.job.instance_id, instances[2]);
+    super::jobs::execute_claimed(
+        &fixture.db,
+        fixture.dispatcher(),
+        "gate-worker-3",
+        claimed,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let done = repository::get_instance(&fixture.db, &fixture.owner, &instances[2], None).unwrap();
+    assert_eq!(done.status, ProcessInstanceStatus::Completed);
+    // The two abandoned calls and this one.
+    assert_eq!(host.calls.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn a_task_deferred_past_the_bound_raises_one_visible_incident() {
+    let host = ScriptedToolHost::new(json!({"hits": 1}));
+    let fixture = fixture_with(&host);
+    let started = start_model(&fixture, &tool_model(10, None));
+    let busy =
+        |_: &repository::ProcessActor, _: &str| repository::ClaimAdmission::Defer("TOOL_BUSY");
+    let start = now_ms();
+    let mut now = start;
+    for _ in 0..5 {
+        assert!(repository::claim_job_where(&fixture.db, "w", now, &busy)
+            .unwrap()
+            .is_none());
+        now += 40_000;
+    }
+    assert_eq!(
+        events_of(&fixture, &started.instance_id, "service_deferred"),
+        1
+    );
+    let before =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert!(before.incidents.is_empty());
+    // Past the bound the wait becomes a visible incident, and the task can be retried by hand.
+    now = start + repository::DEFER_DEADLINE_MS;
+    assert!(repository::claim_job_where(&fixture.db, "w", now, &busy)
+        .unwrap()
+        .is_none());
+    let after =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert_eq!(after.status, ProcessInstanceStatus::Incident);
+    assert_eq!(after.incidents.len(), 1);
+    assert_eq!(after.incidents[0].code, "TOOL_BUSY");
+    assert_eq!(
+        events_of(&fixture, &started.instance_id, "service_deferred"),
+        1
+    );
+    let job: String = fixture
+        .db
+        .read()
+        .unwrap()
+        .query_row(
+            "SELECT job_id FROM bpmn_jobs WHERE instance_id=?1",
+            [&started.instance_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(invocation(&fixture, &job).2, "proved_no_effect");
+}
+
+#[test]
+fn defer_backoff_doubles_from_one_second_and_is_capped_at_thirty() {
+    let waits: Vec<i64> = (0..8).map(repository::defer_backoff_ms).collect();
+    assert_eq!(
+        waits,
+        [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]
+    );
+}
+
+#[tokio::test]
+async fn an_unavailable_addon_defers_the_task_instead_of_raising_an_incident() {
+    let host = ScriptedToolHost::new(json!({"hits": 1}));
+    let fixture = fixture_with(&host);
+    let started = start_model(&fixture, &tool_model(10, None));
+    *host.allow.lock().unwrap() = Err(ToolAccessError::Unavailable);
+    // Before the claim: the admission check puts it off without spending a claim.
+    let admission = super::runtime::claim_admission(fixture.dispatcher());
+    let start = now_ms();
     assert!(
-        repository::claim_job(&fixture.db, "too-early", not_before - 1)
+        repository::claim_job_where(&fixture.db, "early", start, &admission)
             .unwrap()
             .is_none()
     );
-    // Claimable and runnable once the backoff has passed and the gate has room.
-    tokio::time::timeout(Duration::from_secs(12), async {
-        loop {
-            if fixture.dispatcher().process_tool_gate().in_flight(ADDON) < 2 {
-                if let Some(claimed) =
-                    repository::claim_job(&fixture.db, "late-worker", now_ms()).unwrap()
-                {
-                    assert_eq!(claimed.job.job_id, jobs[2]);
-                    assert!(
-                        claimed.job.attempt >= 2,
-                        "a deferral is followed by a fresh attempt"
-                    );
-                    super::jobs::execute_claimed(
-                        &fixture.db,
-                        fixture.dispatcher(),
-                        "late-worker",
-                        claimed,
-                        CancellationToken::new(),
-                    )
-                    .await
-                    .unwrap();
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
+    let waiting =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert!(waiting.incidents.is_empty());
+    assert_eq!(
+        events_of(&fixture, &started.instance_id, "service_deferred"),
+        1
+    );
+    assert_eq!(
+        events_of(&fixture, &started.instance_id, "service_claimed"),
+        0
+    );
+    // A claim that got past the admission (the addon went away in between) defers too.
+    let claimed = repository::claim_job(&fixture.db, "late", start + 60_000)
+        .unwrap()
+        .unwrap();
+    super::jobs::execute_claimed(
+        &fixture.db,
+        fixture.dispatcher(),
+        "late",
+        claimed,
+        CancellationToken::new(),
+    )
     .await
-    .expect("the deferred task runs once the addon has room");
-    assert_eq!(host.calls.lock().unwrap().len(), 3);
+    .unwrap();
+    let still =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert!(still.incidents.is_empty());
+    assert!(host.calls.lock().unwrap().is_empty());
+    // Back up: it runs.
+    *host.allow.lock().unwrap() = Ok(());
+    let claimed =
+        repository::claim_job_where(&fixture.db, "back", start + 10 * 60_000 - 1, &admission)
+            .unwrap();
+    assert!(
+        claimed.is_some(),
+        "claimable again after the backoff once the addon is back"
+    );
+}
+
+#[tokio::test]
+async fn an_addon_stopping_after_the_tool_returned_leaves_the_result_for_the_deferred_pass() {
+    let mut host = ScriptedToolHost::new(json!({"hits": 5}));
+    Arc::get_mut(&mut host).unwrap().unavailable_after_call = true;
+    let fixture = fixture_with(&host);
+    let started = start_model(&fixture, &tool_model(10, None));
+    let claimed = run(&fixture, "stopping-worker").await;
+    // Not a revocation: the result stays recorded, the instance is not broken.
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "observed");
+    let current =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert!(current.incidents.is_empty());
+    assert_ne!(current.status, ProcessInstanceStatus::Completed);
+    *host.allow.lock().unwrap() = Ok(());
+    let authority = super::runtime::tool_authority(fixture.dispatcher());
+    let nobody = |_: &str| false;
+    assert_eq!(
+        repository::recover_deferred_tool_results(
+            &fixture.db,
+            now_ms(),
+            &authority,
+            &nobody,
+            repository::RECOVERY_PAGE
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "accepted");
+    let done =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert_eq!(done.status, ProcessInstanceStatus::Completed);
+    assert_eq!(done.variables["answer"], 5);
+}
+
+#[tokio::test]
+async fn an_undecided_result_is_announced_once_and_escalates_after_the_bound_or_when_the_tool_is_gone(
+) {
+    let host = ScriptedToolHost::new(json!(null));
+    let fixture = fixture_with(&host);
+    let (started, claimed) = observed_but_unaccepted(&fixture, &host).await;
+    *host.allow.lock().unwrap() = Err(ToolAccessError::Unavailable);
+    let authority = super::runtime::tool_authority(fixture.dispatcher());
+    let nobody = |_: &str| false;
+    let start = now_ms();
+    for pass in 0..4 {
+        repository::recover_deferred_tool_results(
+            &fixture.db,
+            start + pass * 5_000,
+            &authority,
+            &nobody,
+            repository::RECOVERY_PAGE,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        events_of(&fixture, &started.instance_id, "service_result_deferred"),
+        1
+    );
+    let waiting =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert!(waiting.incidents.is_empty());
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "observed");
+    // Past the bound: one incident, still observed.
+    for pass in 0..3 {
+        repository::recover_deferred_tool_results(
+            &fixture.db,
+            start + repository::UNDECIDED_DEADLINE_MS + pass,
+            &authority,
+            &nobody,
+            repository::RECOVERY_PAGE,
+        )
+        .unwrap();
+    }
+    let escalated =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert_eq!(escalated.incidents.len(), 1);
+    assert_eq!(escalated.incidents[0].code, "TOOL_RESULT_UNDECIDED");
+    assert_eq!(
+        events_of(&fixture, &started.instance_id, "service_result_deferred"),
+        1
+    );
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "observed");
+    // The addon returns: the result is applied and the incident closes.
+    *host.allow.lock().unwrap() = Ok(());
+    assert_eq!(
+        repository::recover_deferred_tool_results(
+            &fixture.db,
+            start + repository::UNDECIDED_DEADLINE_MS + 10,
+            &authority,
+            &nobody,
+            repository::RECOVERY_PAGE
+        )
+        .unwrap(),
+        1
+    );
+    let done =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert_eq!(done.status, ProcessInstanceStatus::Completed);
+    assert!(
+        done.incidents.is_empty(),
+        "the incident closes when the result is applied"
+    );
+
+    // A tool that no longer exists escalates on the first pass.
+    let gone_host = ScriptedToolHost::new(json!(null));
+    let fixture = fixture_with(&gone_host);
+    let (started, _) = observed_but_unaccepted(&fixture, &gone_host).await;
+    *gone_host.allow.lock().unwrap() = Err(ToolAccessError::Missing);
+    let authority = super::runtime::tool_authority(fixture.dispatcher());
+    repository::recover_deferred_tool_results(
+        &fixture.db,
+        now_ms(),
+        &authority,
+        &nobody,
+        repository::RECOVERY_PAGE,
+    )
+    .unwrap();
+    let gone =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert_eq!(gone.incidents.len(), 1);
+    assert_eq!(gone.incidents[0].code, "TOOL_RESULT_UNDECIDED");
+}
+
+#[tokio::test]
+async fn one_poisoned_row_does_not_stall_newer_rows_or_the_start() {
+    let host = ScriptedToolHost::new(json!(null));
+    let fixture = fixture_with(&host);
+    let (poisoned_instance, poisoned) = observed_but_unaccepted(&fixture, &host).await;
+    let (healthy_instance, healthy) = observed_but_unaccepted(&fixture, &host).await;
+    // Valid JSON that is no longer an observed result: the row cannot be parsed.
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute_batch(&format!(
+            "DROP TRIGGER bpmn_service_invocations_immutable;
+         UPDATE bpmn_service_invocations SET observed_result_json='{{}}' WHERE job_id='{}';",
+            poisoned.job.job_id
+        ))
+        .unwrap();
+    let authority = super::runtime::tool_authority(fixture.dispatcher());
+    // The start-time recovery returns Ok and still applies the healthy row.
+    assert_eq!(
+        repository::recover_jobs(&fixture.db, None, now_ms(), &authority).unwrap(),
+        1
+    );
+    assert_eq!(invocation(&fixture, &healthy.job.job_id).2, "accepted");
+    assert_eq!(invocation(&fixture, &poisoned.job.job_id).2, "observed");
+    let done = repository::get_instance(
+        &fixture.db,
+        &fixture.owner,
+        &healthy_instance.instance_id,
+        None,
+    )
+    .unwrap();
+    assert_eq!(done.status, ProcessInstanceStatus::Completed);
+    // The poisoned row is counted, not retried silently forever: an incident
+    // appears after the configured number of passes in a row.
+    let nobody = |_: &str| false;
+    // The start-time pass above already counted once.
+    for pass in 0..repository::RECOVERY_FAILURES_BEFORE_INCIDENT - 1 {
+        let before = repository::get_instance(
+            &fixture.db,
+            &fixture.owner,
+            &poisoned_instance.instance_id,
+            None,
+        )
+        .unwrap();
+        assert!(
+            before.incidents.is_empty(),
+            "no incident before pass {pass}"
+        );
+        assert_eq!(
+            repository::recover_deferred_tool_results(
+                &fixture.db,
+                now_ms(),
+                &authority,
+                &nobody,
+                repository::RECOVERY_PAGE
+            )
+            .unwrap(),
+            0
+        );
+    }
+    let after = repository::get_instance(
+        &fixture.db,
+        &fixture.owner,
+        &poisoned_instance.instance_id,
+        None,
+    )
+    .unwrap();
+    assert_eq!(after.incidents.len(), 1);
+    assert_eq!(after.incidents[0].code, "RESULT_RECOVERY_FAILED");
+    // Further passes do not pile up incidents.
+    repository::recover_deferred_tool_results(
+        &fixture.db,
+        now_ms(),
+        &authority,
+        &nobody,
+        repository::RECOVERY_PAGE,
+    )
+    .unwrap();
+    let again = repository::get_instance(
+        &fixture.db,
+        &fixture.owner,
+        &poisoned_instance.instance_id,
+        None,
+    )
+    .unwrap();
+    assert_eq!(again.incidents.len(), 1);
+}
+
+#[tokio::test]
+async fn a_drift_note_that_cannot_be_written_leaves_no_boundary_behind() {
+    let host = ScriptedToolHost::new(json!({"hits": 1}));
+    let fixture = fixture_with(&host);
+    start_model(&fixture, &tool_model(10, None));
+    *host.bundle.lock().unwrap() = "c".repeat(64);
+    fixture.db.write().unwrap().execute_batch(
+        "CREATE TRIGGER refuse_drift BEFORE INSERT ON bpmn_events WHEN NEW.kind='service_tool_drift' \
+         BEGIN SELECT RAISE(ABORT,'drift note refused'); END;").unwrap();
+    let claimed = repository::claim_job(&fixture.db, "drift-worker", now_ms())
+        .unwrap()
+        .unwrap();
+    let error = super::jobs::execute_claimed(
+        &fixture.db,
+        fixture.dispatcher(),
+        "drift-worker",
+        claimed.clone(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("drift note refused"),
+        "{error:#}"
+    );
+    // Nothing was called, so nothing is "uncertain": the boundary rolled back.
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "prepared");
+    assert!(host.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1114,4 +1526,48 @@ async fn a_claim_that_never_runs_leaves_no_drift_event_behind() {
     assert!(history
         .iter()
         .all(|event| event.kind != "service_tool_drift"));
+}
+
+#[tokio::test]
+async fn a_recovery_pass_is_paged_and_takes_the_rows_checked_longest_ago_first() {
+    let host = ScriptedToolHost::new(json!(null));
+    let fixture = fixture_with(&host);
+    let (first, _) = observed_but_unaccepted(&fixture, &host).await;
+    let (second, _) = observed_but_unaccepted(&fixture, &host).await;
+    *host.allow.lock().unwrap() = Err(ToolAccessError::Unavailable);
+    let authority = super::runtime::tool_authority(fixture.dispatcher());
+    let nobody = |_: &str| false;
+    let seen = |instance: &str| events_of(&fixture, instance, "service_result_deferred");
+    // One row per pass: the second pass reaches the row the first one left out.
+    repository::recover_deferred_tool_results(&fixture.db, now_ms(), &authority, &nobody, 1)
+        .unwrap();
+    assert_eq!(
+        (seen(&first.instance_id), seen(&second.instance_id)),
+        (1, 0)
+    );
+    repository::recover_deferred_tool_results(&fixture.db, now_ms() + 1, &authority, &nobody, 1)
+        .unwrap();
+    assert_eq!(
+        (seen(&first.instance_id), seen(&second.instance_id)),
+        (1, 1)
+    );
+}
+
+#[test]
+fn the_scan_and_claim_queries_have_indexes() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    crate::db::migrations::run(&conn).unwrap();
+    let plan = |sql: &str| -> String {
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    assert!(plan("SELECT job_id FROM bpmn_service_invocations WHERE phase='observed' AND implementation_kind='addon_tool'")
+        .contains("idx_bpmn_invocations_observed_tool"));
+    assert!(plan("SELECT job_id FROM bpmn_jobs WHERE status='queued' AND (not_before_ms IS NULL OR not_before_ms<=5) ORDER BY created_at_ms")
+        .contains("idx_bpmn_jobs"));
 }

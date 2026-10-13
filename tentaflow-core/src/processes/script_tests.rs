@@ -360,9 +360,14 @@ async fn observed_service_result_survives_joined_script_infrastructure_failure_w
     assert!(denied.to_string().contains("proved-no-effect invocation"));
     assert_eq!(transition_rows(&fixture), before);
     expr::inject_script_infrastructure_failure("vars.answer + \" b2i-infra-probe\"");
+    // A row that cannot be resumed no longer fails the whole recovery (and with it
+    // the node's start); it stays observed and is counted for a later incident.
     let pending = repository::recover_jobs(&fixture.db, None,
-        chrono::Utc::now().timestamp_millis(), &repository::no_tool_authority).unwrap_err();
-    assert!(pending.to_string().contains("durably observed Service result"));
+        chrono::Utc::now().timestamp_millis(), &repository::no_tool_authority).unwrap();
+    assert_eq!(pending, 0);
+    let failed_passes: i64 = fixture.db.read().unwrap().query_row(
+        "SELECT failed_passes FROM bpmn_result_recovery", [], |row| row.get(0)).unwrap();
+    assert_eq!(failed_passes, 1);
     assert_eq!(transition_rows(&fixture), before);
     let recovered_snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
         &started.instance_id).unwrap();

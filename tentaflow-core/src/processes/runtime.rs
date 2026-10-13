@@ -8222,6 +8222,36 @@ pub(crate) fn tool_authority(
             Err(ToolAccessError::Unavailable | ToolAccessError::OtherOrganization) => {
                 ToolDecision::Undecided
             }
+            Err(ToolAccessError::Missing) => ToolDecision::Gone,
+        }
+    }
+}
+
+/// Decides, before a queued job is claimed, whether its addon tool can take it:
+/// an addon at its call cap or not running yet defers the job (no attempt, fence
+/// or claim event is spent) and the history notes the first deferral only.
+pub(crate) fn claim_admission(
+    dispatcher: &Arc<FlowDispatcher>,
+) -> impl Fn(&super::repository::ProcessActor, &str) -> super::repository::ClaimAdmission
+       + Send
+       + Sync
+       + '_ {
+    use super::repository::ClaimAdmission;
+    use super::tool_host::ToolAccessError;
+    move |actor, source_ref| {
+        let Some((addon_id, tool_name)) =
+            tentaflow_protocol::processes::parse_tool_source_ref(source_ref)
+        else {
+            return ClaimAdmission::Admit;
+        };
+        if dispatcher.process_tool_gate().is_full(addon_id) {
+            return ClaimAdmission::Defer("TOOL_BUSY");
+        }
+        match dispatcher.authorize_process_tool(addon_id, tool_name, &actor.user_id, &actor.org_id) {
+            Err(ToolAccessError::Unavailable | ToolAccessError::OtherOrganization
+                | ToolAccessError::Missing) => ClaimAdmission::Defer("TOOL_UNAVAILABLE"),
+            // Allowed, denied or a lost initiator are decided by the executor.
+            _ => ClaimAdmission::Admit,
         }
     }
 }
@@ -8336,6 +8366,7 @@ impl ProcessRuntime {
                         chrono::Utc::now().timestamp_millis(),
                         &tool_authority(&dispatcher),
                         &|job_id| self.running.contains_key(job_id),
+                        super::repository::RECOVERY_PAGE,
                     ) {
                         tracing::error!(error_len = error.to_string().len(), "deferred tool result recovery failed");
                     }
@@ -8358,10 +8389,11 @@ impl ProcessRuntime {
                     self.stop.cancel();
                     break;
                 };
-                let claimed = match super::repository::claim_job(
+                let claimed = match super::repository::claim_job_where(
                     &self.db,
                     &self.worker_id,
                     chrono::Utc::now().timestamp_millis(),
+                    &claim_admission(&dispatcher),
                 ) {
                     Ok(Some(claimed)) => claimed,
                     Ok(None) => break,
@@ -8394,7 +8426,6 @@ impl ProcessRuntime {
                         claimed,
                         cancel,
                     )).catch_unwind().await;
-                    worker.remove_running_claim(&job_id, attempt, fence, &worker.worker_id);
                     let failure = match result {
                         Ok(Ok(())) => None,
                         Ok(Err(error)) => Some(error.to_string()),
@@ -8406,6 +8437,10 @@ impl ProcessRuntime {
                             tracing::error!(job_id, error = %error, "process worker could not persist its incident");
                         }
                     }
+                    // Only now does the claim stop being "live": the deferred
+                    // recovery pass must not see the job between its failure
+                    // and the record of that failure.
+                    worker.remove_running_claim(&job_id, attempt, fence, &worker.worker_id);
                 });
             }
             tokio::select! {

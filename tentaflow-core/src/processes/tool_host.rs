@@ -18,6 +18,10 @@ pub struct ProcessToolDescriptor {
 pub enum ToolAccessError {
     #[error("addon tool is not available")]
     Unavailable,
+    // The tool is not in the addon registry at all (uninstalled, renamed). Same
+    // text as `Unavailable`: the difference is for recovery, not for callers.
+    #[error("addon tool is not available")]
+    Missing,
     // Same text as `Unavailable` on purpose: a caller outside the addon's
     // organization must not learn that the addon exists.
     #[error("addon tool is not available")]
@@ -83,7 +87,7 @@ impl ProcessToolHost for crate::addon::AddonManager {
             .list_tools()
             .into_iter()
             .find(|tool| tool.addon_id == addon_id && tool.tool_name == tool_name)
-            .ok_or(ToolAccessError::Unavailable)?;
+            .ok_or(ToolAccessError::Missing)?;
         check_addon_organization(
             self.has_running_instance(addon_id),
             self.instance_org_id(addon_id).as_deref(),
@@ -159,6 +163,13 @@ impl ToolCallGate {
             gate: self.clone(),
             addon_id: addon_id.to_owned(),
         })
+    }
+
+    /// Whether `addon_id` is at its cap right now (advisory: a claim that gets
+    /// past this still has to win a permit).
+    pub fn is_full(&self, addon_id: &str) -> bool {
+        let limit = self.limit.load(std::sync::atomic::Ordering::SeqCst);
+        self.in_flight.lock().get(addon_id).copied().unwrap_or(0) >= limit
     }
 
     #[cfg(test)]
@@ -273,6 +284,12 @@ pub(crate) mod test_support {
         pub org: String,
         /// Revoke the initiator's permission while the call is running.
         pub revoke_during_call: bool,
+        /// Make the addon unavailable (stopped) once the call has returned.
+        pub unavailable_after_call: bool,
+        /// Calls block until `release` instead of sleeping, so a test controls
+        /// when an abandoned call really returns without depending on timing.
+        pub hold: bool,
+        released: (Mutex<bool>, std::sync::Condvar),
     }
 
     impl ScriptedToolHost {
@@ -286,7 +303,16 @@ pub(crate) mod test_support {
                 bundle: Mutex::new("b".repeat(64)),
                 org: crate::services::org::DEFAULT_ORG_ID.to_owned(),
                 revoke_during_call: false,
+                unavailable_after_call: false,
+                hold: false,
+                released: (Mutex::new(false), std::sync::Condvar::new()),
             })
+        }
+
+        /// Lets every held call (present and future) return.
+        pub fn release(&self) {
+            *self.released.0.lock().unwrap() = true;
+            self.released.1.notify_all();
         }
     }
 
@@ -325,6 +351,22 @@ pub(crate) mod test_support {
                 request_id.to_owned(),
             ));
             std::thread::sleep(*self.delay.lock().unwrap());
+            if self.hold {
+                let (flag, wake) = &self.released;
+                let (released, timed_out) = wake
+                    .wait_timeout_while(
+                        flag.lock().unwrap(),
+                        std::time::Duration::from_secs(60),
+                        |released| !*released,
+                    )
+                    .map(|(guard, result)| (guard, result.timed_out()))
+                    .unwrap();
+                drop(released);
+                anyhow::ensure!(!timed_out, "scripted call was never released");
+            }
+            if self.unavailable_after_call {
+                *self.allow.lock().unwrap() = Err(ToolAccessError::Unavailable);
+            }
             if self.revoke_during_call {
                 *self.allow.lock().unwrap() = Err(ToolAccessError::PermissionDenied);
             }
@@ -412,11 +454,15 @@ mod tests {
             !manager.has_running_instance("notes-1a2b3c4d"),
             "the process path must not start an addon"
         );
-        // An unknown tool answers exactly like a stopped addon.
+        // A tool the registry does not know is told apart from a stopped addon
+        // (recovery escalates it), but reads the same to a caller.
+        let missing = host
+            .authorize("notes-1a2b3c4d", "missing", "u1", "org-default")
+            .unwrap_err();
+        assert_eq!(missing, ToolAccessError::Missing);
         assert_eq!(
-            host.authorize("notes-1a2b3c4d", "missing", "u1", "org-default")
-                .unwrap_err(),
-            ToolAccessError::Unavailable
+            missing.to_string(),
+            ToolAccessError::Unavailable.to_string()
         );
     }
 

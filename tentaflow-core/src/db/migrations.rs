@@ -1294,19 +1294,48 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
         ),
         (
             202,
-            "bpmn_jobs_not_before",
-            MigrationStep::Rust(bpmn_jobs_not_before),
+            "bpmn_deferred_jobs_and_result_recovery",
+            MigrationStep::Rust(bpmn_deferred_jobs_and_result_recovery),
         ),
     ]
 }
 
-/// A queued Service job may now wait: a claim that finds its addon busy puts the
-/// job back with a backoff instead of raising an incident, and the claim query
-/// skips it until `not_before_ms`. NULL (every existing job) means "now".
-fn bpmn_jobs_not_before(conn: &Connection) -> Result<()> {
+/// Deferral and recovery bookkeeping for Service tasks that run addon tools.
+///
+/// A queued job may wait: a claim that finds its addon busy or not running
+/// puts the job off with a backoff instead of failing it. `not_before_ms` is
+/// when it may be claimed again (NULL, every existing job, means "now"),
+/// `defer_count` drives the backoff and `first_deferred_at_ms` the bound after
+/// which the wait becomes an incident; `last_defer_code` lets the history record
+/// only the first deferral and a change of reason.
+///
+/// `bpmn_result_recovery` is the per-result state of the recovery pass over
+/// observed tool results: when it first could not decide, whether that was
+/// announced in the history, how many passes in a row failed, and the incident
+/// raised for it. The partial index serves the periodic scan.
+fn bpmn_deferred_jobs_and_result_recovery(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "ALTER TABLE bpmn_jobs ADD COLUMN not_before_ms INTEGER
-             CHECK (not_before_ms IS NULL OR typeof(not_before_ms)='integer');",
+             CHECK (not_before_ms IS NULL OR typeof(not_before_ms)='integer');
+         ALTER TABLE bpmn_jobs ADD COLUMN defer_count INTEGER NOT NULL DEFAULT 0
+             CHECK (typeof(defer_count)='integer' AND defer_count>=0);
+         ALTER TABLE bpmn_jobs ADD COLUMN first_deferred_at_ms INTEGER;
+         ALTER TABLE bpmn_jobs ADD COLUMN last_defer_code TEXT;
+         CREATE INDEX idx_bpmn_jobs_ready ON bpmn_jobs(status, not_before_ms, created_at_ms);
+         CREATE INDEX idx_bpmn_invocations_observed_tool
+             ON bpmn_service_invocations(job_id)
+             WHERE phase='observed' AND implementation_kind='addon_tool';
+         CREATE TABLE bpmn_result_recovery (
+             invocation_id TEXT PRIMARY KEY
+                 REFERENCES bpmn_service_invocations(invocation_id) ON DELETE CASCADE,
+             first_undecided_at_ms INTEGER,
+             last_checked_ms INTEGER NOT NULL DEFAULT 0,
+             deferred_event_written INTEGER NOT NULL DEFAULT 0
+                 CHECK (deferred_event_written IN (0,1)),
+             failed_passes INTEGER NOT NULL DEFAULT 0 CHECK (failed_passes>=0),
+             last_error_code TEXT,
+             incident_id TEXT
+         );",
     )?;
     Ok(())
 }
@@ -16625,7 +16654,7 @@ mod tests {
             applied_after_179[21],
             "bpmn_service_invocation_implementation_kind"
         );
-        assert_eq!(applied_after_179[22], "bpmn_jobs_not_before");
+        assert_eq!(applied_after_179[22], "bpmn_deferred_jobs_and_result_recovery");
         let tables = |conn: &Connection| -> Vec<String> {
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap()

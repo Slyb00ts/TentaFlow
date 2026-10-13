@@ -260,9 +260,32 @@ struct ServiceJob<'a> {
     repeat_extra: &'a [(String, Value)],
 }
 
+/// The answer of a source access re-check.
+enum AccessCheck {
+    Allowed,
+    /// Access is definitely gone (permission or initiator lost, flow denied).
+    /// The message is only ever stored with the failure.
+    Revoked(String),
+    /// Cannot tell right now (the addon is stopped or restarting). Not a
+    /// revocation: a result already in hand stays recorded and is applied later.
+    Undecided,
+}
+
 /// Re-checks, before and during execution, that the initiator may still use
-/// the task's source. The message is only ever stored with the failure.
-type Authorize<'a> = &'a (dyn Fn() -> Result<(), String> + Send + Sync);
+/// the task's source.
+type Authorize<'a> = &'a (dyn Fn() -> AccessCheck + Send + Sync);
+
+fn tool_access(result: std::result::Result<super::tool_host::ProcessToolDescriptor, ToolAccessError>) -> AccessCheck {
+    match result {
+        Ok(_) => AccessCheck::Allowed,
+        Err(error @ (ToolAccessError::PermissionDenied | ToolAccessError::Initiator)) => {
+            AccessCheck::Revoked(error.to_string())
+        }
+        Err(ToolAccessError::Unavailable
+            | ToolAccessError::OtherOrganization
+            | ToolAccessError::Missing) => AccessCheck::Undecided,
+    }
+}
 
 /// How an executor's work ended, before the shared machinery decides what the
 /// job does with it.
@@ -385,10 +408,10 @@ async fn execute_flow(
         return fail_claim(pool, worker_id, claimed, "INVALID_SERVICE_JOB", error, None);
     }
     let authorize = || {
-        dispatcher
-            .authorize_process_flow(flow_id, &claimed.actor.user_id, &claimed.actor.org_id)
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+        match dispatcher.authorize_process_flow(flow_id, &claimed.actor.user_id, &claimed.actor.org_id) {
+            Ok(_) => AccessCheck::Allowed,
+            Err(error) => AccessCheck::Revoked(error.to_string()),
+        }
     };
     let mut meta = match dispatcher.authorize_process_flow(
         flow_id,
@@ -430,7 +453,7 @@ async fn execute_flow(
         .map(|(key, value)| (key.clone(), FlowValue::Json(value.clone())))
         .collect();
 
-    if !begin_dispatch(job)? {
+    if !begin_dispatch(job, None)? {
         return Ok(());
     }
     let execution = async {
@@ -486,10 +509,17 @@ async fn execute_tool(
     let (user_id, org_id) = (&claimed.actor.user_id, &claimed.actor.org_id);
     let authorize_tool =
         || dispatcher.authorize_process_tool(addon_id, tool_name, user_id, org_id);
-    let authorize = || authorize_tool().map(|_| ()).map_err(|error| error.to_string());
+    let authorize = || tool_access(authorize_tool());
     let descriptor = match authorize_tool() {
         Ok(descriptor) => Some(descriptor),
         Err(ToolAccessError::PermissionDenied) => None,
+        // The addon is stopped, restarting or briefly elsewhere: nothing ran and
+        // nothing is wrong with the process. Wait for it (bounded) like for a
+        // busy addon instead of raising an incident.
+        Err(ToolAccessError::Unavailable | ToolAccessError::OtherOrganization | ToolAccessError::Missing) => {
+            repository::defer_job(pool, claimed, worker_id, "TOOL_UNAVAILABLE", now_ms())?;
+            return Ok(());
+        }
         Err(error) => {
             return fail_claim(pool, worker_id, claimed, "SOURCE_ACCESS_REVOKED", error, None)
         }
@@ -511,20 +541,16 @@ async fn execute_tool(
         .context("addon tool host disappeared after authorization")?;
     let Some(permit) = dispatcher.process_tool_gate().try_acquire(addon_id) else {
         // Nothing ran: the job waits and is claimed again once the backoff has
-        // passed, instead of raising an incident for a person.
-        let now = now_ms();
-        let not_before = now + tool_busy_backoff_ms(claimed.job.attempt);
-        repository::defer_job(pool, claimed, worker_id, "TOOL_BUSY", not_before, now)?;
+        // passed (and raises an incident only after `DEFER_DEADLINE_MS`).
+        repository::defer_job(pool, claimed, worker_id, "TOOL_BUSY", now_ms())?;
         return Ok(());
     };
 
-    if !begin_dispatch(job)? {
+    // The drift note is written in the same transaction as the boundary, so a
+    // claim that never gets to run leaves none behind and a failed note cannot
+    // leave a boundary for a call that never happens.
+    if !begin_dispatch(job, tool_drift(&snapshot.graph_json, &descriptor)?)? {
         return Ok(());
-    }
-    // After the precheck and boundary, so a claim that never gets to run (busy,
-    // cancelled, lease lost) leaves no drift event behind.
-    if let Some(drift) = tool_drift(&snapshot.graph_json, &descriptor)? {
-        repository::record_tool_drift(pool, claimed, worker_id, drift, now_ms())?;
     }
     let execution = async {
         let call = {
@@ -561,12 +587,6 @@ async fn execute_tool(
         return Ok(());
     };
     finish_observed(job, &authorize, result)
-}
-
-/// Wait before a job deferred for a busy addon is claimed again: doubling from
-/// one second, capped at half a minute.
-fn tool_busy_backoff_ms(attempt: u32) -> i64 {
-    1_000_i64 << attempt.saturating_sub(1).min(5)
 }
 
 /// Compares the pinned tool with the one about to run.
@@ -620,8 +640,8 @@ fn report_denied_tool(
     // The denial is the very thing being reported, so publishing it must not be
     // blocked by it; every other loss of access still blocks.
     let authorize_reporting_denial = || match authorize_tool() {
-        Err(ToolAccessError::PermissionDenied) => Ok(()),
-        other => other.map(|_| ()).map_err(|error| error.to_string()),
+        Err(ToolAccessError::PermissionDenied) => AccessCheck::Allowed,
+        other => tool_access(other),
     };
     finish_observed(job, &authorize_reporting_denial, result)
 }
@@ -648,11 +668,17 @@ fn precheck_dispatch(job: &ServiceJob<'_>) -> Result<bool> {
 
 /// The precheck plus the committed dispatch boundary, which precedes the first
 /// poll of any external effect.
-fn begin_dispatch(job: &ServiceJob<'_>) -> Result<bool> {
+fn begin_dispatch(job: &ServiceJob<'_>, drift: Option<Value>) -> Result<bool> {
     if !precheck_dispatch(job)? {
         return Ok(false);
     }
-    repository::commit_job_dispatch_boundary(job.pool, job.claimed, job.worker_id, now_ms())
+    repository::commit_job_dispatch_boundary_noting(
+        job.pool,
+        job.claimed,
+        job.worker_id,
+        now_ms(),
+        drift,
+    )
 }
 
 /// Extends the lease. On a lost lease or a repository error the worker is
@@ -710,7 +736,7 @@ async fn drive_dispatch(
                 return Ok(None);
             }
             _ = renewal.tick() => {
-                if let Err(error) = authorize() {
+                if let AccessCheck::Revoked(error) = authorize() {
                     cancel.cancel();
                     fail_claim(pool, worker_id, claimed, "SOURCE_ACCESS_REVOKED", error, None)?;
                     return Ok(None);
@@ -729,7 +755,7 @@ async fn drive_dispatch(
                 match end {
                     ExecutionEnd::Observed { result, recheck } => {
                         if recheck {
-                            if let Err(error) = authorize() {
+                            if let AccessCheck::Revoked(error) = authorize() {
                                 fail_claim(pool, worker_id, claimed, "SOURCE_ACCESS_REVOKED", error, None)?;
                                 return Ok(None);
                             }
@@ -738,9 +764,10 @@ async fn drive_dispatch(
                     }
                     ExecutionEnd::Failed { code, message } => {
                         match authorize() {
-                            Err(denial) => fail_claim(pool, worker_id, claimed,
+                            AccessCheck::Revoked(denial) => fail_claim(pool, worker_id, claimed,
                                 "SOURCE_ACCESS_REVOKED", denial, None)?,
-                            Ok(()) => fail_claim(pool, worker_id, claimed, code, message, None)?,
+                            AccessCheck::Allowed | AccessCheck::Undecided =>
+                                fail_claim(pool, worker_id, claimed, code, message, None)?,
                         }
                         return Ok(None);
                     }
@@ -800,15 +827,22 @@ fn finish_observed(
         {
             return Ok(());
         }
-        if let Err(error) = authorize() {
-            return fail_claim(
-                pool,
-                worker_id,
-                claimed,
-                "SOURCE_ACCESS_REVOKED",
-                error,
-                Some(&result),
-            );
+        match authorize() {
+            AccessCheck::Allowed => {}
+            AccessCheck::Revoked(error) => {
+                return fail_claim(
+                    pool,
+                    worker_id,
+                    claimed,
+                    "SOURCE_ACCESS_REVOKED",
+                    error,
+                    Some(&result),
+                );
+            }
+            // The result is durably recorded. "Cannot tell yet" must not turn
+            // it into a final block: the deferred recovery pass applies it once
+            // the addon answers again.
+            AccessCheck::Undecided => return Ok(()),
         }
         let at_ms = now_ms();
         let escalation_boundary = if result.origin == ActivityResultOrigin::Contract

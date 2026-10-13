@@ -327,7 +327,7 @@ pub(super) const TRANSITION_TABLES: [&str; 18] = [
 
 /// Process tables that a transition snapshot deliberately leaves out, with the reason.
 /// A table in neither list means a transition test would silently miss its rows.
-const NON_TRANSITION_TABLES: [&str; 6] = [
+const NON_TRANSITION_TABLES: [&str; 7] = [
     // Authoring tables: a transition reads the pinned version but never writes them.
     "bpmn_definitions",
     "bpmn_versions",
@@ -337,6 +337,9 @@ const NON_TRANSITION_TABLES: [&str; 6] = [
     // Signal rows are appended to the snapshot by the signal tests that observe them.
     "bpmn_signal_emissions",
     "bpmn_signal_receipts",
+    // Recovery's own bookkeeping about observed tool results; it never changes
+    // what a transition is.
+    "bpmn_result_recovery",
 ];
 
 #[test]
