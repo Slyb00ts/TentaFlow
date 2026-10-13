@@ -1292,7 +1292,23 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bpmn_service_invocation_implementation_kind",
             MigrationStep::Rust(bpmn_service_invocation_implementation_kind),
         ),
+        (
+            202,
+            "bpmn_jobs_not_before",
+            MigrationStep::Rust(bpmn_jobs_not_before),
+        ),
     ]
+}
+
+/// A queued Service job may now wait: a claim that finds its addon busy puts the
+/// job back with a backoff instead of raising an incident, and the claim query
+/// skips it until `not_before_ms`. NULL (every existing job) means "now".
+fn bpmn_jobs_not_before(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE bpmn_jobs ADD COLUMN not_before_ms INTEGER
+             CHECK (not_before_ms IS NULL OR typeof(not_before_ms)='integer');",
+    )?;
+    Ok(())
 }
 
 /// A Service invocation now records WHAT it ran. `flow_id` stays the stable
@@ -16582,7 +16598,7 @@ mod tests {
             assert_eq!(*version, index as i64 + 1, "the ladder must stay contiguous");
         }
         let head = ladder.last().unwrap().0;
-        assert_eq!(head, 201);
+        assert_eq!(head, 202);
 
         let fresh = Connection::open_in_memory().unwrap();
         run(&fresh).unwrap();
@@ -16601,7 +16617,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(applied_after_179.len(), 22);
+        assert_eq!(applied_after_179.len(), 23);
         assert_eq!(applied_after_179[0], "org_structure");
         assert_eq!(applied_after_179[19], "bpmn_activity_io_witnesses");
         assert_eq!(applied_after_179[20], "org_absences_drop_reason");
@@ -16609,6 +16625,7 @@ mod tests {
             applied_after_179[21],
             "bpmn_service_invocation_implementation_kind"
         );
+        assert_eq!(applied_after_179[22], "bpmn_jobs_not_before");
         let tables = |conn: &Connection| -> Vec<String> {
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap()
@@ -16779,6 +16796,28 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("invocation identity changed"));
+        // The CHECK refuses a kind that disagrees with the `tool:` prefix of the
+        // reference, in both directions, and kinds it does not know.
+        let insert = |id: &str, flow_id: &str, kind: &str| {
+            conn.execute(
+                "INSERT INTO bpmn_service_invocations(invocation_id,job_id,instance_id,scope_id,\
+                 node_id,token_id,definition_id,version,selected_process_id,whole_document_sha256,\
+                 flow_id,pinned_flow_digest,input_sha256,stable_request_id,phase,dispatch_evidence,\
+                 created_at_ms,updated_at_ms,implementation_kind) \
+                 VALUES(?1,?1,'i','s','n','t','d',1,'p',?4,?2,?4,?4,?1,'prepared','no_boundary',1,1,?3)",
+                rusqlite::params![id, flow_id, kind, digest],
+            )
+        };
+        insert("ok-flow", "flow-2", "flow").unwrap();
+        insert("ok-tool", "tool:notes-1/search", "addon_tool").unwrap();
+        for (id, flow_id, kind) in [
+            ("tool-as-flow", "tool:notes-1/search", "flow"),
+            ("flow-as-tool", "flow-2", "addon_tool"),
+            ("unknown-kind", "flow-2", "agent"),
+        ] {
+            let error = insert(id, flow_id, kind).unwrap_err();
+            assert!(error.to_string().contains("CHECK constraint failed"), "{id}: {error}");
+        }
         conn.execute(
             "UPDATE bpmn_service_invocations SET phase='proved_no_effect',phase_revision=2,\
              updated_at_ms=2",

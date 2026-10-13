@@ -214,7 +214,7 @@ pub(crate) fn parse_contract_result(value: Value) -> Result<ActivityResult> {
     Ok(result)
 }
 
-fn fail_claim(
+pub(super) fn fail_claim(
     pool: &DbPool,
     worker_id: &str,
     claimed: &ClaimedProcessJob,
@@ -223,7 +223,8 @@ fn fail_claim(
     observed: Option<&ObservedActivityResult>,
 ) -> Result<()> {
     let message = error.to_string();
-    tracing::error!(job_id = %claimed.job.job_id, code, reason = %message, "process service claim failed");
+    // The text can carry flow, addon or user content; only its size is logged.
+    tracing::error!(job_id = %claimed.job.job_id, code, message_len = message.len(), "process service claim failed");
     // A revocation found by the caller must hold even where the database cannot
     // see it (an addon tool permission), so an observed result is blocked.
     repository::fail_job_with_authority(
@@ -505,25 +506,25 @@ async fn execute_tool(
             return fail_claim(pool, worker_id, claimed, "TOOL_ARGUMENTS_INVALID", error, None)
         }
     };
-    if let Some(drift) = tool_drift(&snapshot.graph_json, &descriptor)? {
-        repository::record_tool_drift(pool, claimed, worker_id, drift, now_ms())?;
-    }
     let host = dispatcher
         .process_tool_host()
         .context("addon tool host disappeared after authorization")?;
     let Some(permit) = dispatcher.process_tool_gate().try_acquire(addon_id) else {
-        return fail_claim(
-            pool,
-            worker_id,
-            claimed,
-            "TOOL_BUSY",
-            "the addon already has the maximum number of process tool calls in flight; retry later",
-            None,
-        );
+        // Nothing ran: the job waits and is claimed again once the backoff has
+        // passed, instead of raising an incident for a person.
+        let now = now_ms();
+        let not_before = now + tool_busy_backoff_ms(claimed.job.attempt);
+        repository::defer_job(pool, claimed, worker_id, "TOOL_BUSY", not_before, now)?;
+        return Ok(());
     };
 
     if !begin_dispatch(job)? {
         return Ok(());
+    }
+    // After the precheck and boundary, so a claim that never gets to run (busy,
+    // cancelled, lease lost) leaves no drift event behind.
+    if let Some(drift) = tool_drift(&snapshot.graph_json, &descriptor)? {
+        repository::record_tool_drift(pool, claimed, worker_id, drift, now_ms())?;
     }
     let execution = async {
         let call = {
@@ -560,6 +561,12 @@ async fn execute_tool(
         return Ok(());
     };
     finish_observed(job, &authorize, result)
+}
+
+/// Wait before a job deferred for a busy addon is claimed again: doubling from
+/// one second, capped at half a minute.
+fn tool_busy_backoff_ms(attempt: u32) -> i64 {
+    1_000_i64 << attempt.saturating_sub(1).min(5)
 }
 
 /// Compares the pinned tool with the one about to run.

@@ -151,8 +151,9 @@ Paleta BPMN nie ładuje szablonów bloków (`palette.js:101`). `ELEMENTS` w `bpm
   - Uruchamiane w `spawn_blocking` i wyścigowane z `cancel`, timeoutem i odnawianiem dzierżawy.
 - Wynik narzędzia → `ActivityResult{Completed, outputs: {"result": <json>}}`, pochodzenie `Envelope`. Błąd narzędzia → `Error("TOOL_ERROR")`, pochodzenie `Platform`: jak każdy błąd platformy omija `result_expression` i **nie jest przechwytywany przez zdarzenia brzegowe błędu ani eskalacji** (kończy się incydentem). Jawny wynik kontraktowy powstaje tylko z udanego wyniku przez `result_expression` (jak dla przepływu).
 - **Zmiana narzędzia po publikacji (B3.1):** używane jest bieżące narzędzie (spójnie z decyzją 2 dla agentów), bez odmowy. Gdy skrót pakietu lub schematu wejścia różni się od przypiętego, zadanie zapisuje w historii zdarzenie `service_tool_drift` (przypięte i bieżące wartości) przed wywołaniem. Argumenty są sprawdzane względem bieżącego schematu. Osobny rodzaj zdarzenia, a nie dopisek do `service_claimed`, bo wyszukiwanie wywołania bierze najnowszy wiersz `service_claimed` danego ogrodzenia.
+- **Odzyskiwanie po restarcie (B3.1):** zaobserwowany wynik narzędzia jest blokowany tylko przy jednoznacznej odmowie (utrata uprawnienia „llm”, utrata inicjatora). Gdy nie da się jeszcze rozstrzygnąć (addon jeszcze nie działa po restarcie, instancja chwilowo w innej organizacji, brak hosta), wynik zostaje w stanie `observed`, a pętla robocza co 5 s ponawia sprawdzenie i go stosuje albo blokuje.
 - **Addon musi działać (B3.1):** ścieżka procesu nigdy nie uruchamia addonu; zatrzymany lub nieznany addon to `SOURCE_ACCESS_REVOKED` przed wywołaniem. Organizacja instancji jest porównywana przy publikacji, przy claimie i tuż przed wywołaniem; błąd publikacji ma ten sam tekst dla addonu nieistniejącego, zatrzymanego i z innej organizacji.
-- **Limit porzuconych wywołań (B3.1):** liczba wywołań WASM procesu w toku (także porzuconych po przekroczeniu czasu) jest ograniczona per addon (4). Pozwolenie żyje w wątku blokującym do prawdziwego powrotu gościa. Ponad limit zadanie kończy się incydentem `TOOL_BUSY` przed granicą wysyłki (bezpieczne ponowienie ręczne).
+- **Limit porzuconych wywołań (B3.1):** liczba wywołań WASM procesu w toku (także porzuconych po przekroczeniu czasu) jest ograniczona per addon (4). Pozwolenie żyje w wątku blokującym do prawdziwego powrotu gościa. Ponad limit zadanie wraca do kolejki z wycofaniem (1 s, podwajane do 30 s; kolumna `bpmn_jobs.not_before_ms`, migracja 202) i zapisuje zdarzenie `service_deferred`; nie powstaje incydent, bo nic się nie wykonało.
 - **Anulowanie i timeout:** wywołanie WASM nie przerywa się. Po timeoutcie job kończy się `SERVICE_TIMEOUT`, a wątek blokujący dobiega końca w tle. Skutek jest już modelowany jako `uncertain`. Udokumentować.
 - Odmowa uprawnień → `NeedsHuman`, patrz §1.4. Granica wysyłki i wynik odmowy zapisują się w jednej transakcji, więc awaria nie zostawia granicy dla wywołania, które się nie odbyło.
 - Testy: narzędzie z fałszywego addonu (wzorzec testów `jobs.rs`), cofnięcie uprawnień w trakcie, restart między wysyłką a wynikiem, timeout.
@@ -174,7 +175,7 @@ Ujście proponuję nazwać **`core.task_complete`** (prefiks `core.` wymusza enu
 - Argumenty: `outcome` (`completed|error|needs_human`), `code`, `summary`, `outputs`, `evidence[]`.
 - Walidacja: limity jak w `parse_contract_result` (`jobs.rs:122-156`), `outputs` względem `output_schema` (podzbiór JSON Schema), kod `[A-Za-z0-9_.:-]{1,64}`.
 - Sprawdzenie na żywo, że faza wywołania to `may_have_executed`, ogrodzenie się zgadza, instancja nie jest zamknięta, a identyfikator przebiegu jest tym utworzonym przez to wywołanie. Dzięki temu agent nie zakończy cudzego zadania ani zadania po anulowaniu.
-- Zapis do nowej tabeli `bpmn_agent_completions` (migracja **202**): `invocation_id PRIMARY KEY`, `run_id`, `result_json`, `created_at_ms`. Pierwsze wywołanie wygrywa, drugie dostaje `[TOOL_ERROR] already completed`. Dzięki temu pętla agenta kończy się deterministycznie.
+- Zapis do nowej tabeli `bpmn_agent_completions` (migracja **203**): `invocation_id PRIMARY KEY`, `run_id`, `result_json`, `created_at_ms`. Pierwsze wywołanie wygrywa, drugie dostaje `[TOOL_ERROR] already completed`. Dzięki temu pętla agenta kończy się deterministycznie.
 - Błąd walidacji jest `[TOOL_ERROR]` do naprawy przez model (jak `core.project_case_save`).
 
 **Wykonawca `execute_agent`:**
@@ -324,7 +325,7 @@ Szacunki dotyczą jednej osoby i przeglądu. Każdy pakiet ma być wdrażalny i 
 | **B3.2** Blok Flow Buildera | wariant `Block`, lista dozwolonych, graf syntetyczny, `dispatch_pinned_synthetic` | B3.1 | 2 dni | brak |
 | **B3.3a** Opcje + paleta „Bloki TentaFlow” | rozszerzenie `OptionsResponse`, szablony dynamiczne, drop, i18n, test e2e dla flow/blok/narzędzie | B3.1 (B3.2 dla bloków) | 2 dni | brak |
 | **B3.3b** Inspektor z zakładkami + „Wynik i błędy” | `tf-tabs`, `processResultRouting`, ostrzeżenia, przyciski obsługi, i18n | B3.1 (równolegle z B3.3a) | 2-3 dni | brak |
-| **B3.4a** Agent: ujście i wiązanie | `core.task_complete`, `bpmn_agent_completions`, zawężenie narzędzi na przebieg, `spawn_with_run_id` publiczny, walidacja | B3.1 | 3 dni | 202 |
+| **B3.4a** Agent: ujście i wiązanie | `core.task_complete`, `bpmn_agent_completions`, zawężenie narzędzi na przebieg, `spawn_with_run_id` publiczny, walidacja | B3.1 | 3 dni | 203 |
 | **B3.4b** Agent: wykonawca i odzyskiwanie | `execute_agent`, klasa slotów, adopcja ujścia po restarcie, `Contract` dla zdarzeń brzegowych, paleta agentów | B3.4a, B3.3a | 3 dni | brak |
 | **B3.5** Weryfikacja „test” i „krytyk” | warianty `ActivityVerification`, etap weryfikacji w jobie, wiązanie `role=verification`, UI trybów | B3.2, B3.4b, B3.3b | 3 dni | brak (do potwierdzenia na prototypie) |
 | **B3.6a** Tłumacz JUEL/FEEL → CEL | `expression_translate.rs`, testy złote i różnicowe | brak (w pełni równolegle) | 2 dni | brak |
@@ -336,7 +337,7 @@ Szacunki dotyczą jednej osoby i przeglądu. Każdy pakiet ma być wdrażalny i 
 
 **Ścieżki równoległe:** (B3.1 → B3.2 → B3.3a/B3.3b → B3.4a → B3.4b → B3.5 → B3.7a) oraz niezależnie B3.6a → B3.6b. Drugi wykonawca może prowadzić ścieżkę importu bez kolizji, jeśli B3.1 jest już scalone (potrzebny `Unbound`).
 
-Numery migracji 201 (B3.1) i 202 (B3.4a) są **rezerwacją na dziś**; drabina jest ciągła, więc numer przydziela się dopiero przy scaleniu. Rezerwacja TentaBus B7 przesunęła się na kolejny wolny numer. Sprawdzić kolizje z `origin/main` w dniu implementacji. Wszystkie testy przypinające numery (`run_ladder_up_to`, asercje `MAX(version)`, `call_pin_tests.rs`) zaktualizować w tym samym pakiecie.
+Numery migracji 201 i 202 (B3.1) oraz 203 (B3.4a) są **rezerwacją na dziś**; drabina jest ciągła, więc numer przydziela się dopiero przy scaleniu. Rezerwacja TentaBus B7 przesunęła się na kolejny wolny numer. Sprawdzić kolizje z `origin/main` w dniu implementacji. Wszystkie testy przypinające numery (`run_ladder_up_to`, asercje `MAX(version)`, `call_pin_tests.rs`) zaktualizować w tym samym pakiecie.
 
 ## 9. Testy: zestawienie przekrojowe
 
@@ -393,7 +394,7 @@ Rozstrzygają pytania z §11 i zastępują ich rekomendacje. Wdrażane są kolej
 4. **Limity agenta:** BRAK dodatkowych limitów (ani kosztu, ani jednoczesności systemowej/na organizację). Zostaje wyłącznie wewnętrzna klasa szeregowania, żeby długie joby agentów nie zajęły wszystkich 4 slotów pętli runtime.
 5. **Import z Camundy:** kroki usługowe bez odpowiednika stają się pustymi krokami „do przypisania” (`ServiceImplementation::Unbound`), a publikacja jest zablokowana do czasu przypisania implementacji. Nazwy zmiennych, w tym `Static_*`, zostają 1:1 bez specjalnej logiki.
 6. **Symulacja a prawdziwe wywołania:** domyślnie symulacja pyta o wynik kroku usługowego albo bierze przygotowaną fixturę. Operator MOŻE opcjonalnie uruchomić dany krok naprawdę, wybierając to osobno dla każdego kroku. Takie wykonanie musi być jawne, w UI oznaczone jako mające skutki uboczne i koszty, a baza produkcyjna procesów pozostaje odizolowana (zapisy symulacji nadal tylko w prywatnej bazie). Zastępuje to zasadę „symulacja nigdy nie wywołuje” z §7 i rekomendację pytania 6.
-7. **Numeracja migracji:** B3.1 = 201, B3.4a = 202; rezerwacja TentaBus B7 przesuwa się na kolejny wolny numer.
+7. **Numeracja migracji:** B3.1 = 201 i 202, B3.4a = 203; rezerwacja TentaBus B7 przesuwa się na kolejny wolny numer.
 
 ## 12. Najważniejsze pliki
 

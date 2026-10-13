@@ -8200,15 +8200,40 @@ pub struct ProcessRuntime {
     handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
 }
 
-/// Recovery's view of addon tool permissions: the same check a claim makes.
+/// Recovery's view of addon tool permissions: the same check a claim makes. Only
+/// a lost permission or a lost initiator is a definite denial. An addon that is
+/// not running yet (tool-only addons start lazily after a restart), one running
+/// under another organization for now, or a missing host is "cannot tell yet":
+/// a blocked result is final, so those wait and are looked at again.
 pub(crate) fn tool_authority(
     dispatcher: &Arc<FlowDispatcher>,
-) -> impl Fn(&super::repository::ProcessActor, &str, &str) -> bool + Send + Sync + '_ {
+) -> impl Fn(&super::repository::ProcessActor, &str, &str) -> super::repository::ToolDecision
+       + Send
+       + Sync
+       + '_ {
+    use super::repository::ToolDecision;
+    use super::tool_host::ToolAccessError;
     move |actor, addon_id, tool_name| {
-        dispatcher
-            .authorize_process_tool(addon_id, tool_name, &actor.user_id, &actor.org_id)
-            .is_ok()
+        match dispatcher.authorize_process_tool(addon_id, tool_name, &actor.user_id, &actor.org_id) {
+            Ok(_) => ToolDecision::Allowed,
+            Err(ToolAccessError::PermissionDenied | ToolAccessError::Initiator) => {
+                ToolDecision::Denied
+            }
+            Err(ToolAccessError::Unavailable | ToolAccessError::OtherOrganization) => {
+                ToolDecision::Undecided
+            }
+        }
     }
+}
+
+/// How often the worker re-examines observed tool results whose authority was
+/// undecided at recovery.
+const DEFERRED_RECOVERY_EVERY: Duration = Duration::from_secs(5);
+
+/// A failed job is logged by code and size only: the text can carry flow, addon
+/// or user content.
+pub(crate) fn log_job_failure(job_id: &str, error: &str) {
+    tracing::error!(job_id, error_len = error.len(), "process job execution failed");
 }
 
 pub fn start(db: &DbPool, dispatcher: &Arc<FlowDispatcher>) -> Result<Arc<ProcessRuntime>> {
@@ -8298,9 +8323,23 @@ impl ProcessRuntime {
     async fn run(self: Arc<Self>) -> Result<()> {
         let mut jobs = tokio::task::JoinSet::new();
         let mut send_cursor = super::messages::SendCursor::default();
+        let mut last_deferred_recovery = tokio::time::Instant::now();
         loop {
             if self.stop.is_cancelled() {
                 break;
+            }
+            if last_deferred_recovery.elapsed() >= DEFERRED_RECOVERY_EVERY {
+                last_deferred_recovery = tokio::time::Instant::now();
+                if let Some(dispatcher) = self.dispatcher.upgrade() {
+                    if let Err(error) = super::repository::recover_deferred_tool_results(
+                        &self.db,
+                        chrono::Utc::now().timestamp_millis(),
+                        &tool_authority(&dispatcher),
+                        &|job_id| self.running.contains_key(job_id),
+                    ) {
+                        tracing::error!(error_len = error.to_string().len(), "deferred tool result recovery failed");
+                    }
+                }
             }
             let drained = super::timers::drain_due(&self.db, chrono::Utc::now().timestamp_millis());
             self.handle_timer_drain(drained);
@@ -8362,7 +8401,7 @@ impl ProcessRuntime {
                         Err(_) => Some("the service executor panicked before confirming its external effect".into()),
                     };
                     if let Some(error) = failure {
-                        tracing::error!(job_id, error, "process job execution failed");
+                        log_job_failure(&job_id, &error);
                         if let Err(error) = super::repository::fail_job(&worker.db, &job_id, attempt, fence, &worker.worker_id, "WORKER_ERROR", &error, chrono::Utc::now().timestamp_millis(), None) {
                             tracing::error!(job_id, error = %error, "process worker could not persist its incident");
                         }
@@ -8400,7 +8439,7 @@ impl ProcessRuntime {
                 &tool_authority(&dispatcher),
             )?,
             // Without a dispatcher nothing can vouch for a tool permission, so
-            // an observed tool result is blocked rather than applied.
+            // an observed tool result stays observed for the next start.
             None => super::repository::recover_jobs(
                 &self.db,
                 Some(&self.worker_id),

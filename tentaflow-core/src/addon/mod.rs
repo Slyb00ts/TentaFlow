@@ -743,6 +743,17 @@ impl AddonCallProvenance {
     }
 }
 
+/// Refuses a worker that belongs to another organization than the caller was
+/// authorized for. A worker without an organization (started at boot) serves the
+/// default one. `None` expected: the caller made no organization claim.
+fn ensure_worker_org(worker_org: Option<&str>, expected_org: Option<&str>) -> Result<()> {
+    let Some(expected) = expected_org else {
+        return Ok(());
+    };
+    crate::processes::tool_host::check_addon_organization(true, worker_org, expected)
+        .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
 /// The request a tool receives. Only a process-driven call carries
 /// `idempotency_key`, so every other caller keeps sending the bytes it always sent.
 fn tool_request_json(
@@ -3176,6 +3187,7 @@ impl AddonManager {
             false,
             AddonCallProvenance::addon(),
             None,
+            None,
         )
     }
 
@@ -3199,6 +3211,7 @@ impl AddonManager {
             CallIdentity::User(user_id),
             true,
             AddonCallProvenance::addon(),
+            None,
             None,
         )
     }
@@ -3225,6 +3238,7 @@ impl AddonManager {
             CallIdentity::System,
             true,
             AddonCallProvenance::addon(),
+            None,
             None,
         )
     }
@@ -3257,6 +3271,7 @@ impl AddonManager {
             skip_permission_check,
             AddonCallProvenance::scheduler(job_id),
             None,
+            None,
         )
     }
 
@@ -3276,6 +3291,7 @@ impl AddonManager {
         tool_name: &str,
         params: serde_json::Value,
         user_id: &str,
+        org_id: &str,
         stable_request_id: &str,
     ) -> Result<serde_json::Value> {
         self.call_tool_inner(
@@ -3286,6 +3302,7 @@ impl AddonManager {
             false,
             AddonCallProvenance::process(stable_request_id),
             Some(stable_request_id),
+            Some(org_id),
         )
     }
 
@@ -3299,6 +3316,7 @@ impl AddonManager {
         skip_permission_check: bool,
         call_provenance: AddonCallProvenance,
         idempotency_key: Option<&str>,
+        expected_org: Option<&str>,
     ) -> Result<serde_json::Value> {
         // System calls carry no principal; user calls carry their user_id.
         let acquire_user = match identity {
@@ -3341,6 +3359,16 @@ impl AddonManager {
         // tego wywołania (mirror dawnej semantyki boot/service instancji).
         let (mut addon_instance, ephemeral) =
             self.acquire_instance(addon_id, acquire_user, system, call_provenance)?;
+
+        // The caller checked the addon's organization some time ago; the worker
+        // just borrowed is what actually runs, and an addon restarted under
+        // another organization in between would touch that organization's data.
+        if let Err(error) =
+            ensure_worker_org(addon_instance.store.data().org_id.as_deref(), expected_org)
+        {
+            self.release_instance(addon_id, addon_instance, ephemeral);
+            return Err(error);
+        }
 
         // Refuel przed wywolaniem — workery są reużywane, więc każde wywołanie
         // dostaje świeży budżet (refuel_store ustawia, nie dodaje).
@@ -4467,6 +4495,16 @@ mod tests {
             provenance.actor_for("any-addon"),
             crate::flow_engine::dispatcher::FlowActor::system_component("req-7")
         );
+    }
+
+    #[test]
+    fn a_worker_of_another_organization_is_refused() {
+        assert!(ensure_worker_org(Some("org-a"), Some("org-a")).is_ok());
+        assert!(ensure_worker_org(None, Some(crate::services::org::DEFAULT_ORG_ID)).is_ok());
+        assert!(ensure_worker_org(Some("org-b"), Some("org-a")).is_err());
+        assert!(ensure_worker_org(None, Some("org-a")).is_err());
+        // Callers that make no organization claim keep their behaviour.
+        assert!(ensure_worker_org(Some("org-b"), None).is_ok());
     }
 
     #[test]

@@ -116,7 +116,7 @@ impl ProcessToolHost for crate::addon::AddonManager {
         // Decided again right before the call: the claim-time check can be
         // minutes old, and this is the last point before WASM runs.
         self.authorize(addon_id, tool_name, user_id, org_id)?;
-        self.call_tool_process(addon_id, tool_name, params, user_id, request_id)
+        self.call_tool_process(addon_id, tool_name, params, user_id, org_id, request_id)
     }
 }
 

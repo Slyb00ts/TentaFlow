@@ -678,12 +678,65 @@ async fn recovery_applies_an_observed_tool_result_only_while_the_initiator_may_s
 }
 
 #[tokio::test]
-async fn recovery_without_any_tool_authority_blocks_instead_of_applying() {
+async fn recovery_cannot_tell_yet_leaves_the_result_observed_until_authority_is_known() {
+    let host = ScriptedToolHost::new(json!(null));
+    let fixture = fixture_with(&host);
+    let (started, claimed) = observed_but_unaccepted(&fixture, &host).await;
+    // No addon runtime to ask: the result waits instead of being blocked for good.
+    assert_eq!(
+        repository::recover_jobs(&fixture.db, None, now_ms(), &repository::no_tool_authority)
+            .unwrap(),
+        0
+    );
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "observed");
+    // The addon is not running yet after a restart (tool-only addons start lazily).
+    *host.allow.lock().unwrap() = Err(ToolAccessError::Unavailable);
+    let authority = super::runtime::tool_authority(fixture.dispatcher());
+    assert_eq!(
+        repository::recover_jobs(&fixture.db, None, now_ms(), &authority).unwrap(),
+        0
+    );
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "observed");
+    // Another organization's instance is not a definite denial either.
+    *host.allow.lock().unwrap() = Err(ToolAccessError::OtherOrganization);
+    assert_eq!(
+        repository::recover_jobs(&fixture.db, None, now_ms(), &authority).unwrap(),
+        0
+    );
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "observed");
+    // The periodic pass applies it once the addon is up and the access confirmed.
+    *host.allow.lock().unwrap() = Ok(());
+    let live = |_: &str| false;
+    assert_eq!(
+        repository::recover_deferred_tool_results(&fixture.db, now_ms(), &authority, &live)
+            .unwrap(),
+        1
+    );
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "accepted");
+    let done =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert_eq!(done.status, ProcessInstanceStatus::Completed);
+    assert_eq!(done.variables["answer"], 7);
+}
+
+#[tokio::test]
+async fn the_periodic_pass_blocks_on_a_definite_denial_and_skips_claims_a_worker_still_holds() {
     let host = ScriptedToolHost::new(json!(null));
     let fixture = fixture_with(&host);
     let (_, claimed) = observed_but_unaccepted(&fixture, &host).await;
+    *host.allow.lock().unwrap() = Err(ToolAccessError::PermissionDenied);
+    let authority = super::runtime::tool_authority(fixture.dispatcher());
+    let held = claimed.job.job_id.clone();
+    let live = move |job_id: &str| job_id == held;
     assert_eq!(
-        repository::recover_jobs(&fixture.db, None, now_ms(), &repository::no_tool_authority)
+        repository::recover_deferred_tool_results(&fixture.db, now_ms(), &authority, &live)
+            .unwrap(),
+        0
+    );
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "observed");
+    let nobody = |_: &str| false;
+    assert_eq!(
+        repository::recover_deferred_tool_results(&fixture.db, now_ms(), &authority, &nobody)
             .unwrap(),
         1
     );
@@ -752,45 +805,89 @@ async fn publication_and_claim_deny_other_organizations_without_revealing_the_ad
 }
 
 #[tokio::test]
-async fn abandoned_calls_hold_the_gate_until_the_guest_returns_and_refuse_new_ones() {
+async fn abandoned_calls_hold_the_gate_until_the_guest_returns_and_a_busy_task_waits_its_turn() {
     let host = ScriptedToolHost::new(json!({"hits": 1}));
     *host.delay.lock().unwrap() = Duration::from_millis(5000);
     let fixture = fixture_with(&host);
     fixture.dispatcher().process_tool_gate().set_limit(2);
     let model = tool_model(1, None);
-    let mut jobs = Vec::new();
+    let mut instances = Vec::new();
     for _ in 0..3 {
-        start_model(&fixture, &model);
+        instances.push(start_model(&fixture, &model).instance_id);
     }
+    let mut jobs = Vec::new();
     for round in 0..3 {
         let claimed = run(&fixture, &format!("gate-worker-{round}")).await;
         jobs.push(claimed.job.job_id);
     }
-    // Two calls were dispatched and abandoned by their timeout; the third was refused.
+    // Two calls were dispatched and abandoned by their timeout; the third found
+    // the addon at its cap and went back to the queue, with no incident.
     assert_eq!(host.calls.lock().unwrap().len(), 2);
     assert_eq!(invocation(&fixture, &jobs[0]).2, "uncertain");
     assert_eq!(invocation(&fixture, &jobs[1]).2, "uncertain");
-    assert_eq!(invocation(&fixture, &jobs[2]).2, "proved_no_effect");
-    assert_eq!(fixture.dispatcher().process_tool_gate().in_flight(ADDON), 2);
-    let refused = fixture
+    assert_eq!(invocation(&fixture, &jobs[2]).2, "prepared");
+    let (status, not_before): (String, Option<i64>) = fixture
         .db
         .read()
         .unwrap()
         .query_row(
-            "SELECT code FROM bpmn_incidents WHERE job_id=?1",
+            "SELECT status,not_before_ms FROM bpmn_jobs WHERE job_id=?1",
             [&jobs[2]],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(refused, "TOOL_BUSY");
-    // The permits come back only when the guest really returns.
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while fixture.dispatcher().process_tool_gate().in_flight(ADDON) > 0 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(status, "queued");
+    let not_before = not_before.unwrap();
+    let waiting =
+        repository::get_instance(&fixture.db, &fixture.owner, &instances[2], None).unwrap();
+    assert!(
+        waiting.incidents.is_empty(),
+        "a busy addon is not an incident"
+    );
+    assert_eq!(fixture.dispatcher().process_tool_gate().in_flight(ADDON), 2);
+    let history = repository::list_events(&fixture.db, &fixture.owner, &instances[2], 0, 100)
+        .unwrap()
+        .0;
+    let deferred = history
+        .iter()
+        .find(|event| event.kind == "service_deferred")
+        .expect("deferral");
+    assert_eq!(deferred.data["code"], "TOOL_BUSY");
+    assert!(
+        repository::claim_job(&fixture.db, "too-early", not_before - 1)
+            .unwrap()
+            .is_none()
+    );
+    // Claimable and runnable once the backoff has passed and the gate has room.
+    tokio::time::timeout(Duration::from_secs(12), async {
+        loop {
+            if fixture.dispatcher().process_tool_gate().in_flight(ADDON) < 2 {
+                if let Some(claimed) =
+                    repository::claim_job(&fixture.db, "late-worker", now_ms()).unwrap()
+                {
+                    assert_eq!(claimed.job.job_id, jobs[2]);
+                    assert!(
+                        claimed.job.attempt >= 2,
+                        "a deferral is followed by a fresh attempt"
+                    );
+                    super::jobs::execute_claimed(
+                        &fixture.db,
+                        fixture.dispatcher(),
+                        "late-worker",
+                        claimed,
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .unwrap();
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("permits are released when the abandoned calls finish");
+    .expect("the deferred task runs once the addon has room");
+    assert_eq!(host.calls.lock().unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -813,6 +910,10 @@ async fn a_changed_tool_is_used_and_the_drift_is_recorded() {
         .iter()
         .find(|event| event.kind == "service_tool_drift")
         .expect("drift event");
+    assert!(
+        drift.actor_user_id.is_none(),
+        "the platform noticed the drift, not the initiator"
+    );
     assert_eq!(drift.data["pinned_bundle_hash"], "b".repeat(64));
     assert_eq!(drift.data["current_bundle_hash"], "c".repeat(64));
     assert_eq!(drift.data["job_id"], claimed.job.job_id);
@@ -930,8 +1031,8 @@ fn invocation_rows_cannot_pair_a_kind_with_the_wrong_reference() {
     assert!(insert("e", "flow-1", "agent").is_err());
 }
 
-#[test]
-fn oversized_failure_text_is_logged_by_length_only() {
+/// Runs `work` and returns what was logged meanwhile.
+fn captured_logs(work: impl FnOnce()) -> String {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
     #[derive(Clone, Default)]
@@ -951,14 +1052,66 @@ fn oversized_failure_text_is_logged_by_length_only() {
         .with_writer(move || writer.clone())
         .with_ansi(false)
         .finish();
+    tracing::subscriber::with_default(subscriber, work);
+    let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    logged
+}
+
+#[test]
+fn oversized_failure_text_is_logged_by_length_only() {
     let secret = format!("customer-secret-{}", "x".repeat(200_000));
-    tracing::subscriber::with_default(subscriber, || {
+    let logged = captured_logs(|| {
         super::jobs::failure_for_test("TOOL_ERROR", secret.clone());
     });
-    let logged = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
     assert!(logged.contains("message_len"), "{logged}");
     assert!(
         !logged.contains("customer-secret"),
         "addon text must not be logged"
     );
+}
+
+#[tokio::test]
+async fn failed_claims_and_worker_errors_are_logged_by_code_and_length_only() {
+    let host = ScriptedToolHost::new(json!({"hits": 1}));
+    let fixture = fixture_with(&host);
+    start_model(&fixture, &tool_model(10, None));
+    let claimed = repository::claim_job(&fixture.db, "log-worker", now_ms())
+        .unwrap()
+        .unwrap();
+    let logged = captured_logs(|| {
+        super::jobs::fail_claim(
+            &fixture.db,
+            "log-worker",
+            &claimed,
+            "FLOW_ERROR",
+            "customer-secret in a flow error",
+            None,
+        )
+        .unwrap();
+        super::runtime::log_job_failure(&claimed.job.job_id, "customer-secret in a worker error");
+    });
+    assert!(
+        logged.contains("FLOW_ERROR") && logged.contains("message_len"),
+        "{logged}"
+    );
+    assert!(logged.contains("error_len"), "{logged}");
+    assert!(!logged.contains("customer-secret"), "{logged}");
+}
+
+#[tokio::test]
+async fn a_claim_that_never_runs_leaves_no_drift_event_behind() {
+    let host = ScriptedToolHost::new(json!({"hits": 1}));
+    let fixture = fixture_with(&host);
+    let started = start_model(&fixture, &tool_model(10, None));
+    *host.bundle.lock().unwrap() = "c".repeat(64);
+    fixture.dispatcher().process_tool_gate().set_limit(0);
+    run(&fixture, "busy-drift-worker").await;
+    let history =
+        repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 100)
+            .unwrap()
+            .0;
+    assert!(history.iter().any(|event| event.kind == "service_deferred"));
+    assert!(history
+        .iter()
+        .all(|event| event.kind != "service_tool_drift"));
 }

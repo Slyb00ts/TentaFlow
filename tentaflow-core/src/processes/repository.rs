@@ -23940,8 +23940,8 @@ pub fn claim_job(pool: &DbPool, worker_id: &str, now_ms: i64) -> Result<Option<C
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
     let queued:Option<(String,String,String,String,String,String)>=tx.query_row(
-        "SELECT j.job_id,j.instance_id,j.scope_id,j.node_id,i.org_id,i.initiator_user_id FROM bpmn_jobs j JOIN bpmn_service_invocations v ON v.job_id=j.job_id AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id AND v.phase='prepared' AND v.dispatch_evidence='no_boundary' JOIN bpmn_instances i ON i.instance_id=j.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id AND t.node_id=j.node_id JOIN bpmn_scopes s ON s.instance_id=j.instance_id AND s.scope_id=j.scope_id WHERE j.status='queued' AND i.status IN ('running','waiting','incident') AND t.status='waiting' AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled','error')) ORDER BY j.created_at_ms,j.job_id LIMIT 1",
-        [],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
+        "SELECT j.job_id,j.instance_id,j.scope_id,j.node_id,i.org_id,i.initiator_user_id FROM bpmn_jobs j JOIN bpmn_service_invocations v ON v.job_id=j.job_id AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id AND v.phase='prepared' AND v.dispatch_evidence='no_boundary' JOIN bpmn_instances i ON i.instance_id=j.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id AND t.node_id=j.node_id JOIN bpmn_scopes s ON s.instance_id=j.instance_id AND s.scope_id=j.scope_id WHERE j.status='queued' AND (j.not_before_ms IS NULL OR j.not_before_ms<=?1) AND i.status IN ('running','waiting','incident') AND t.status='waiting' AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled','error')) ORDER BY j.created_at_ms,j.job_id LIMIT 1",
+        [now_ms],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?)),
     ).optional()?;
     let Some((job_id, instance_id, scope_id, node_id, org_id, user_id)) = queued else {
         return Ok(None);
@@ -24108,6 +24108,65 @@ pub fn claim_job(pool: &DbPool, worker_id: &str, now_ms: i64) -> Result<Option<C
     }))
 }
 
+/// Puts a claimed job back in the queue until `not_before_ms`, for a claim that
+/// could not start through no fault of the process (an addon at its call cap).
+/// Only a job that has not crossed the dispatch boundary can be deferred, so
+/// nothing ran and nothing is lost; the invocation row is untouched and the
+/// next claim takes a fresh attempt and fence. Returns false when the claim is
+/// no longer ours.
+pub fn defer_job(
+    pool: &DbPool,
+    claimed: &ClaimedProcessJob,
+    worker_id: &str,
+    code: &str,
+    not_before_ms: i64,
+    now_ms: i64,
+) -> Result<bool> {
+    let mut conn = pool.write()?;
+    let tx = conn.transaction()?;
+    let on_hold: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_service_invocations WHERE invocation_id=?1 AND job_id=?2 AND phase='prepared' AND dispatch_evidence='no_boundary')",
+        params![claimed.invocation_id, claimed.job.job_id],
+        |row| row.get(0),
+    )?;
+    ensure!(on_hold, "only a job that has not been dispatched can be deferred");
+    let changed = tx.execute(
+        "UPDATE bpmn_jobs SET status='queued',worker_id=NULL,lease_until_ms=NULL,not_before_ms=?1,updated_at_ms=?2 WHERE job_id=?3 AND status='running' AND worker_id=?4 AND attempt=?5 AND fence=?6",
+        params![not_before_ms, now_ms, claimed.job.job_id, worker_id, claimed.job.attempt,
+            sql_integer(claimed.job.fence)?],
+    )?;
+    if changed != 1 {
+        return Ok(false);
+    }
+    let next_seq: u64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+        [&claimed.job.instance_id],
+        |row| row_u64(row, 0),
+    )?;
+    insert_event_on(
+        &tx,
+        &claimed.job.instance_id,
+        next_seq,
+        None,
+        &PlannedEvent {
+            scope_id: claimed.job.scope_id.clone(),
+            kind: "service_deferred".into(),
+            node_id: Some(claimed.job.node_id.clone()),
+            data: serde_json::json!({
+                "job_id": claimed.job.job_id,
+                "attempt": claimed.job.attempt,
+                "fence": claimed.job.fence,
+                "code": code,
+                "not_before_ms": not_before_ms,
+            }),
+        },
+        now_ms,
+        None,
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
 /// Notes in the instance history that the addon tool a claim is about to run
 /// differs from the one pinned at publication (new bundle or input schema). The
 /// changed tool IS used; this only makes the change visible. It is a separate
@@ -24146,7 +24205,8 @@ pub fn record_tool_drift(
         &tx,
         &claimed.job.instance_id,
         next_seq,
-        Some(&claimed.actor.user_id),
+        // The platform noticed the change; no person did anything.
+        None,
         &PlannedEvent {
             scope_id: claimed.job.scope_id.clone(),
             kind: "service_tool_drift".into(),
@@ -26584,14 +26644,28 @@ pub fn retry_job(
     Ok(result)
 }
 
-/// Decides whether the initiator may still call an addon tool. Recovery cannot
-/// read that from the database, so the caller supplies it; without a decision
-/// (`no_tool_authority`) an observed tool result is blocked, never applied.
-pub type ToolAuthority<'a> = &'a (dyn Fn(&ProcessActor, &str, &str) -> bool + Send + Sync);
-
-pub fn no_tool_authority(_: &ProcessActor, _: &str, _: &str) -> bool {
-    false
+/// What recovery knows about the initiator's right to an addon tool.
+/// `Undecided` is "cannot tell yet" (the addon is not running after a restart,
+/// no host is wired in): the result stays observed and is looked at again. Only
+/// a definite `Denied` blocks it, because a blocked result is final.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolDecision {
+    Allowed,
+    Denied,
+    Undecided,
 }
+
+/// Decides whether the initiator may still call an addon tool. Recovery cannot
+/// read that from the database, so the caller supplies it.
+pub type ToolAuthority<'a> =
+    &'a (dyn Fn(&ProcessActor, &str, &str) -> ToolDecision + Send + Sync);
+
+/// For callers with no addon runtime to ask: every tool result stays observed.
+pub fn no_tool_authority(_: &ProcessActor, _: &str, _: &str) -> ToolDecision {
+    ToolDecision::Undecided
+}
+
+type ObservedRecoveryRow = (String, u32, u64, String, String, String, String, Option<String>);
 
 pub fn recover_jobs(
     pool: &DbPool,
@@ -26614,50 +26688,10 @@ pub fn recover_jobs(
     for (job_id, attempt, fence, original_worker, phase, instance_id,
         org_id, user_id, observed_json) in jobs {
         if phase == "observed" {
-            if block_closed_observed_job(pool, &job_id, now_ms)? {
-                recovered += 1;
-                continue;
-            }
-            let observed: ObservedActivityResult = parse(observed_json
-                .context("observed invocation lost its immutable result bytes")?)?;
-            let actor = ProcessActor { org_id, user_id };
-            let source_ref = {
-                let conn = pool.read()?;
-                job_source_ref_on(&conn, &job_id)?
-            };
-            if let Some((addon_id, tool_name)) =
-                tentaflow_protocol::processes::parse_tool_source_ref(&source_ref)
-            {
-                // A denial result is the platform's own report that nothing ran;
-                // the missing permission it names must not block its delivery.
-                let reports_denial = observed.origin == ActivityResultOrigin::Platform
-                    && observed.result.code.as_deref() == Some("TOOL_PERMISSION_DENIED");
-                if !reports_denial && !tool_authority(&actor, addon_id, tool_name) {
-                    if fail_job_with_authority(pool, &job_id, attempt, fence, &original_worker,
-                        "SOURCE_ACCESS_REVOKED",
-                        "the initiator may no longer call the addon tool that produced this result",
-                        now_ms, Some(&observed), true)? {
-                        recovered += 1;
-                    }
-                    continue;
-                }
-            }
-            let controller_id = Uuid::new_v4().to_string();
-            for _ in 0..8 {
-                let snapshot = runtime_snapshot(pool, &actor, &instance_id)?;
-                match accept_job_result(pool, &actor, &job_id, attempt, fence,
-                    &controller_id, &observed, snapshot.instance.revision,
-                    ProcessPlanInput::Canonical, now_ms) {
-                    Ok(_) => { recovered += 1; break; }
-                    Err(error) if error.to_string().contains("revision conflict") => continue,
-                    Err(_) if block_closed_observed_job(pool, &job_id, now_ms)? => {
-                        recovered += 1;
-                        break;
-                    }
-                    Err(error) => return Err(error.context(
-                        "durably observed Service result could not resume canonical acceptance")),
-                }
-            }
+            recovered += recover_observed_job(pool,
+                (job_id, attempt, fence, original_worker, instance_id, org_id, user_id,
+                    observed_json),
+                now_ms, tool_authority)?;
         } else if fail_job(pool, &job_id, attempt, fence, &original_worker,
             "INTERRUPTED", "the worker stopped before its Service result was observed",
             now_ms, None)? {
@@ -26665,6 +26699,96 @@ pub fn recover_jobs(
         }
     }
     Ok(recovered)
+}
+
+/// Looks again at observed addon tool results whose authority could not be
+/// decided at recovery time. Run periodically by the worker: it applies a
+/// result once its addon is running and the initiator's access is confirmed,
+/// and blocks it on a definite denial. Claims `is_live` names are being
+/// accepted by a running worker and are left alone.
+pub fn recover_deferred_tool_results(
+    pool: &DbPool,
+    now_ms: i64,
+    tool_authority: ToolAuthority<'_>,
+    is_live: &dyn Fn(&str) -> bool,
+) -> Result<u32> {
+    let conn = pool.read()?;
+    let mut statement = conn.prepare(
+        "SELECT j.job_id,j.attempt,j.fence,COALESCE(v.dispatch_worker_id,j.worker_id),j.instance_id,i.org_id,i.initiator_user_id,v.observed_result_json FROM bpmn_jobs j JOIN bpmn_service_invocations v ON v.job_id=j.job_id JOIN bpmn_instances i ON i.instance_id=j.instance_id WHERE v.phase='observed' AND v.implementation_kind='addon_tool' ORDER BY j.created_at_ms,j.job_id")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?,row.get::<_, u32>(1)?,row_u64(row,2)?,
+            row.get::<_, String>(3)?,row.get::<_, String>(4)?,row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,row.get::<_, Option<String>>(7)?))
+    })?.collect::<rusqlite::Result<Vec<ObservedRecoveryRow>>>()?;
+    drop(statement);
+    drop(conn);
+    let mut recovered = 0u32;
+    for (job_id, attempt, fence, worker, instance_id, org_id, user_id, observed_json) in rows {
+        if is_live(&job_id) {
+            continue;
+        }
+        recovered += recover_observed_job(pool,
+            (job_id, attempt, fence, worker, instance_id, org_id, user_id, observed_json),
+            now_ms, tool_authority)?;
+    }
+    Ok(recovered)
+}
+
+/// Resumes one durably observed result: blocks it when its activity closed or
+/// its addon tool is definitely denied, leaves it when the tool's authority is
+/// undecided, and otherwise runs the canonical acceptance. Returns 1 when the
+/// result left the `observed` phase.
+fn recover_observed_job(
+    pool: &DbPool,
+    (job_id, attempt, fence, original_worker, instance_id, org_id, user_id, observed_json):
+        ObservedRecoveryRow,
+    now_ms: i64,
+    tool_authority: ToolAuthority<'_>,
+) -> Result<u32> {
+    if block_closed_observed_job(pool, &job_id, now_ms)? {
+        return Ok(1);
+    }
+    let observed: ObservedActivityResult = parse(observed_json
+        .context("observed invocation lost its immutable result bytes")?)?;
+    let actor = ProcessActor { org_id, user_id };
+    let source_ref = {
+        let conn = pool.read()?;
+        job_source_ref_on(&conn, &job_id)?
+    };
+    if let Some((addon_id, tool_name)) =
+        tentaflow_protocol::processes::parse_tool_source_ref(&source_ref)
+    {
+        // A denial result is the platform's own report that nothing ran; the
+        // missing permission it names must not block its delivery.
+        let reports_denial = observed.origin == ActivityResultOrigin::Platform
+            && observed.result.code.as_deref() == Some("TOOL_PERMISSION_DENIED");
+        if !reports_denial {
+            match tool_authority(&actor, addon_id, tool_name) {
+                ToolDecision::Allowed => {}
+                ToolDecision::Undecided => return Ok(0),
+                ToolDecision::Denied => {
+                    return Ok(u32::from(fail_job_with_authority(pool, &job_id, attempt, fence,
+                        &original_worker, "SOURCE_ACCESS_REVOKED",
+                        "the initiator may no longer call the addon tool that produced this result",
+                        now_ms, Some(&observed), true)?));
+                }
+            }
+        }
+    }
+    let controller_id = Uuid::new_v4().to_string();
+    for _ in 0..8 {
+        let snapshot = runtime_snapshot(pool, &actor, &instance_id)?;
+        match accept_job_result(pool, &actor, &job_id, attempt, fence,
+            &controller_id, &observed, snapshot.instance.revision,
+            ProcessPlanInput::Canonical, now_ms) {
+            Ok(_) => return Ok(1),
+            Err(error) if error.to_string().contains("revision conflict") => continue,
+            Err(_) if block_closed_observed_job(pool, &job_id, now_ms)? => return Ok(1),
+            Err(error) => return Err(error.context(
+                "durably observed Service result could not resume canonical acceptance")),
+        }
+    }
+    Ok(0)
 }
 
 pub(super) fn record_observed_script_infrastructure_failure(
