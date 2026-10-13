@@ -10525,6 +10525,7 @@
         "text_title": "Version {version} — texte du modèle",
         "text_label": "Texte du modèle",
         "text_not_checked": "Les topics vérifient les messages selon la version {version}, pas celle-ci.",
+        "hidden_hint": "Le texte contient des caractères invisibles, affichés comme ⟦U+…⟧. « Copier » et « Télécharger » donnent les octets exacts ; une sélection manuelle dans la zone inclut les marqueurs.",
         "text_error": "Impossible de charger le texte de la version {version}.",
         "copy": "Copier",
         "download": "Télécharger",

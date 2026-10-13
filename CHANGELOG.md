@@ -900,7 +900,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   wierszu N, w kolumnie M”). Odrzucenie znaku w literale Protobuf i Thrift ma
   teraz to samo zdanie, co w pozostałych formatach; stare, osobne sprawdzenia
   usunięto. Szczegóły porównania budowane ze starego tekstu zapisują taki znak
-  jako `U+XXXX`, a panel wzorów pokazuje go w zapisanym tekście jako `⟦U+202E⟧`.
+  jako `⟦U+XXXX⟧`, tak samo jak panel wzorów w zapisanym tekście (`⟦U+202E⟧`).
 - **Aktualizacja: wzorce zapisane wcześniej.** Wersja zapisana przed tą zmianą
   (albo przyjęta z synchronizacji) z odrzucanym znakiem nie jest przepisywana,
   ale przestaje się kompilować. Topik, który sprawdza wiadomości takim wzorcem,
@@ -913,7 +913,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   versions hold a hidden character”). Jak naprawić: zarejestruj poprawioną
   wersję tego wzoru (porównanie czyta stary tekst bez tego sprawdzenia, więc
   rejestracja działa); jeśli wzór jest wycofany, podepnij topik pod inny wzór.
-  Brak linii `WARN` oznacza, że nic nie wymaga uwagi.
+  Potwierdzeniem, że nic nie wymaga uwagi, jest linia `INFO` „N stored schema
+  versions checked for hidden characters, none found” (brak linii `WARN` nie
+  wystarcza: skan mógł się nie udać). Błąd skanu jest zapisywany na poziomie
+  `ERROR` („the scan of stored schemas for hidden characters failed”). Wersja,
+  której wzór został usunięty, nie jest zgłaszana z powodu BOM na początku
+  (nie wiadomo, czy to XSD).
 
 ## [0.4.0-beta.1] — 2026-09-29
 

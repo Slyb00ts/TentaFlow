@@ -591,6 +591,7 @@ function pageHtml(name) {
             </tf-table>
           </div>
           <div class="muted" data-role="text-note"></div>
+          <div class="muted" data-role="hidden-hint" hidden></div>
           <tf-code-editor data-role="code" readonly aria-label="${escapeAttr(T('schemas.detail.text_label'))}"></tf-code-editor>
           <div class="tb-state" data-role="text-state" hidden></div>
         </div>
@@ -802,6 +803,10 @@ function paintText(body, view, effective) {
   paintAvroFields(body, ready && info.schemaType === 'avro' ? avroFieldsView(shown.text) : null);
   paintProtobufFields(body, ready && info.schemaType === 'protobuf' ? protobufFieldsView(shown.text) : null);
   paintThriftFields(body, ready && info.schemaType === 'thrift' ? thriftView(shown.text) : null);
+  const hintEl = body.querySelector('[data-role="hidden-hint"]');
+  const hasHidden = ready && showHidden(shown.text, { leadingBom: info.schemaType === 'xsd' }) !== shown.text;
+  setText(hintEl, hasHidden ? T('schemas.detail.hidden_hint') : '');
+  hintEl.hidden = !hasHidden;
   if (ready && editor.__tbText !== `${info.schemaType}\u0000${shown.text}`) {
     editor.__tbText = `${info.schemaType}\u0000${shown.text}`;
     editor.setAttribute('language', editorLanguage(info.schemaType));
@@ -816,7 +821,8 @@ function paintProfile(body, profile) {
   patchHtml(body.querySelector('[data-role="profile-segments"]'), profile.segments.length
     ? profile.segments.map((s) => {
       const name = hl7SegmentLabel(s);
-      return `<tf-chip size="sm" variant="outline" status="neutral" label="${escapeAttr(name ? `${s} · ${name}` : s)}"></tf-chip>`;
+      const shown = showHidden(s);
+      return `<tf-chip size="sm" variant="outline" status="neutral" label="${escapeAttr(name ? `${shown} · ${name}` : shown)}"></tf-chip>`;
     }).join('')
     : `<span class="muted">${escapeHtml(T('schemas.detail.profile_none'))}</span>`);
   body.querySelector('[data-role="profile-fields-wrap"]').hidden = !profile.fields.length;

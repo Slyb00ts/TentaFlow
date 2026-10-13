@@ -11760,6 +11760,7 @@
         "text_title": "Wersja {version} — tekst wzoru",
         "text_label": "Tekst wzoru",
         "text_not_checked": "Topiki sprawdzają wiadomości według wersji {version}, nie tej.",
+        "hidden_hint": "Tekst zawiera niewidoczne znaki, pokazane jako ⟦U+…⟧. „Kopiuj” i „Pobierz” dają dokładne bajty; ręczne zaznaczenie w polu zawiera te znaczniki.",
         "text_error": "Nie udało się wczytać tekstu wersji {version}.",
         "copy": "Kopiuj",
         "download": "Pobierz",

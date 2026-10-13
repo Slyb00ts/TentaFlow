@@ -10525,6 +10525,7 @@
         "text_title": "Versión {version} — texto del patrón",
         "text_label": "Texto del patrón",
         "text_not_checked": "Los topics comprueban los mensajes con la versión {version}, no con esta.",
+        "hidden_hint": "El texto contiene caracteres invisibles, mostrados como ⟦U+…⟧. «Copiar» y «Descargar» dan los bytes exactos; seleccionar a mano en el cuadro incluye los marcadores.",
         "text_error": "No se pudo cargar el texto de la versión {version}.",
         "copy": "Copiar",
         "download": "Descargar",

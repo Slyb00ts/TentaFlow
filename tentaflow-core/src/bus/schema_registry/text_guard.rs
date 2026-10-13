@@ -52,7 +52,7 @@
 // at startup. A corrected version registers as usual: the compatibility check
 // reads the old text without this screen, and a detail it builds from that text
 // is passed through `sanitize`, so a refused character never reaches the UI or
-// the audit trail as itself.
+// the audit trail as itself but as ⟦U+XXXX⟧.
 // =============================================================================
 
 use std::fmt;
@@ -183,14 +183,15 @@ pub(super) fn screen(text: &str, allow_leading_bom: bool) -> Result<Screened<'_>
     }
 }
 
-/// `detail` with every refused code point written as `U+XXXX`, for a message
+/// `detail` with every refused code point written as `⟦U+XXXX⟧` (the marker the
+/// dashboard uses for a stored text too), for a message
 /// built from a text the screen has not seen (the old side of a comparison).
 pub(super) fn sanitize(detail: &str) -> String {
     detail
         .chars()
         .fold(String::with_capacity(detail.len()), |mut out, c| {
             if refused_name(c).is_some() {
-                out.push_str(&format!("U+{:04X}", c as u32));
+                out.push_str(&format!("⟦U+{:04X}⟧", c as u32));
             } else {
                 out.push(c);
             }
@@ -680,12 +681,12 @@ mod tests {
     fn a_refused_character_in_a_detail_is_written_as_its_code_point() {
         assert_eq!(
             sanitize("field 'a\u{202E}b' and \u{200B}zero, żółć 😀"),
-            "field 'aU+202Eb' and U+200Bzero, żółć 😀"
+            "field 'a⟦U+202E⟧b' and ⟦U+200B⟧zero, żółć 😀"
         );
         assert_eq!(sanitize("tab\tstays\r\n"), "tab\tstays\r\n");
         assert_eq!(
             sanitize_error(SchemaError::Incompatible("x\u{2066}".to_string())),
-            SchemaError::Incompatible("xU+2066".to_string())
+            SchemaError::Incompatible("x⟦U+2066⟧".to_string())
         );
     }
 
@@ -732,7 +733,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err,
-            SchemaError::Incompatible("old says naU+202Eme".to_string())
+            SchemaError::Incompatible("old says na⟦U+202E⟧me".to_string())
         );
         // The new text is screened before the comparison runs.
         let err = Echo

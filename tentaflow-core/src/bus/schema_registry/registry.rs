@@ -927,10 +927,13 @@ pub fn scan_stored_hidden_characters(
     let mut found = Vec::new();
     repository::bus_schema_versions_for_each_text(db, |row| {
         scanned += 1;
+        // A version whose subject row is gone (or names a kind this build does
+        // not know) has no format to ask: its leading BOM is not reported,
+        // because only an XSD may start with one and it cannot be told apart.
         let allow_bom = row
             .schema_type
             .and_then(SchemaType::parse)
-            .is_some_and(|kind| kind.ops().allows_leading_bom());
+            .is_none_or(|kind| kind.ops().allows_leading_bom());
         if let Some(hit) = text_guard::find_hidden(row.schema_text, allow_bom) {
             found.push(StoredHiddenCharacter {
                 instance_id: row.instance_id.to_string(),
@@ -1933,6 +1936,37 @@ mod tests {
                 [],
             )
             .unwrap();
+        // Another organisation's stored version is listed under its own org.
+        register(
+            &db,
+            "tentabus-00000001",
+            "org-2",
+            "other-legacy",
+            SchemaType::JsonSchema,
+            V1,
+            None,
+            None,
+        )
+        .unwrap();
+        plant(
+            &db,
+            "other-legacy",
+            "{\"type\":\"object\",\"description\":\"SECRETWORD\u{200B}\"}",
+        );
+        // A version whose subject row is gone has no kind to ask: its leading
+        // BOM is not reported (it might be an XSD), anything else still is.
+        register_text(&db, "orphan-bom", SchemaType::JsonSchema, V1).unwrap();
+        register_text(&db, "orphan-bidi", SchemaType::JsonSchema, V1).unwrap();
+        plant(&db, "orphan-bom", "\u{FEFF}{}");
+        plant(&db, "orphan-bidi", "{\"a\":\"\u{202E}\"}");
+        db.write()
+            .unwrap()
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF; \
+                 DELETE FROM bus_schema_subjects WHERE subject IN ('orphan-bom', 'orphan-bidi'); \
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
         db
     }
 
@@ -1941,20 +1975,43 @@ mod tests {
         let db = seeded_for_the_scan();
         let (scanned, mut found) = scan_stored_hidden_characters(&db).unwrap();
         found.sort_by(|a, b| a.subject.cmp(&b.subject));
-        assert_eq!(scanned, 4);
+        assert_eq!(scanned, 7);
         // Columns count characters, and the BOM is one.
         let at = XSD_WITH_BOM[..XSD_WITH_BOM.find("<xs:element").unwrap()]
             .chars()
             .count();
         let expected = [
-            ("invoice", "U+FEFF", "ZERO WIDTH NO-BREAK SPACE", 1, at + 1),
-            ("legacy", "U+202E", "RIGHT-TO-LEFT OVERRIDE", 2, 28),
-            ("legacy-proto", "U+FEFF", "ZERO WIDTH NO-BREAK SPACE", 1, 1),
+            (
+                "org-1",
+                "invoice",
+                "U+FEFF",
+                "ZERO WIDTH NO-BREAK SPACE",
+                1,
+                at + 1,
+            ),
+            ("org-1", "legacy", "U+202E", "RIGHT-TO-LEFT OVERRIDE", 2, 28),
+            (
+                "org-1",
+                "legacy-proto",
+                "U+FEFF",
+                "ZERO WIDTH NO-BREAK SPACE",
+                1,
+                1,
+            ),
+            (
+                "org-1",
+                "orphan-bidi",
+                "U+202E",
+                "RIGHT-TO-LEFT OVERRIDE",
+                1,
+                7,
+            ),
+            ("org-2", "other-legacy", "U+200B", "ZERO WIDTH SPACE", 1, 43),
         ];
         assert_eq!(found.len(), expected.len(), "{found:?}");
-        for (hit, (subject, code, name, line, column)) in found.iter().zip(expected) {
+        for (hit, (org, subject, code, name, line, column)) in found.iter().zip(expected) {
             assert_eq!(hit.instance_id, "tentabus-00000001");
-            assert_eq!(hit.org_id, "org-1");
+            assert_eq!(hit.org_id, org);
             assert_eq!(hit.subject, subject);
             assert_eq!(hit.version, 1);
             assert_eq!((hit.code_point.as_str(), hit.name), (code, name));
@@ -1970,7 +2027,7 @@ mod tests {
                 )),
                 "{line_text}"
             );
-            assert!(line_text.contains("org=org-1"), "{line_text}");
+            assert!(line_text.contains(&format!("org={org} ")), "{line_text}");
             assert!(
                 !line_text.contains("SECRETWORD"),
                 "the text must never be logged"
@@ -2007,16 +2064,16 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || warn_about_stored_hidden_characters(&db));
         let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 4, "{log}");
+        assert_eq!(lines.len(), 6, "{log}");
         assert_eq!(
             lines
                 .iter()
                 .filter(|l| l.contains("WARN") && l.contains("subject="))
                 .count(),
-            3
+            5
         );
         assert!(
-            lines[3].contains("3 of 4 stored schema versions hold a hidden character"),
+            lines[5].contains("5 of 7 stored schema versions hold a hidden character"),
             "{log}"
         );
         assert!(!log.contains("SECRETWORD"));

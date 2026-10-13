@@ -11760,6 +11760,7 @@
         "text_title": "Version {version} — pattern text",
         "text_label": "Pattern text",
         "text_not_checked": "Topics check messages against version {version}, not this one.",
+        "hidden_hint": "The text contains invisible characters, shown as ⟦U+…⟧. “Copy” and “Download” give the exact bytes; selecting by hand in the box includes the markers.",
         "text_error": "Could not load the text of version {version}.",
         "copy": "Copy",
         "download": "Download",

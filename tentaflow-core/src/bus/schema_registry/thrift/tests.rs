@@ -821,10 +821,8 @@ fn declaration_caps_hold_exactly_at_their_limit() {
                 "list<".repeat(32),
                 ">".repeat(32)
             ))
+            .chain((0..40).map(|i| format!("{}: list<i32> b{i}, ", i + 20)))
             .collect::<String>()
-            + &(0..40)
-                .map(|i| format!("{}: list<i32> b{i}, ", i + 20))
-                .collect::<String>()
     );
     compile(&lists);
     let huge: String = (0..520)

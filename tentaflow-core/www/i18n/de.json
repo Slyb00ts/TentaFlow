@@ -10525,6 +10525,7 @@
         "text_title": "Version {version} — Mustertext",
         "text_label": "Mustertext",
         "text_not_checked": "Topics prüfen Nachrichten nach Version {version}, nicht nach dieser.",
+        "hidden_hint": "Der Text enthält unsichtbare Zeichen, dargestellt als ⟦U+…⟧. „Kopieren“ und „Herunterladen“ liefern die exakten Bytes; eine Markierung von Hand im Feld enthält die Markierungen.",
         "text_error": "Der Text von Version {version} konnte nicht geladen werden.",
         "copy": "Kopieren",
         "download": "Herunterladen",

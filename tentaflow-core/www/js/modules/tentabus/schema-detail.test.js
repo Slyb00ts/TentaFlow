@@ -293,6 +293,7 @@ test('an HL7 profile\'s page shows its segments and fields in plain words above 
   const { body } = mount({ name: 'wynik-badania', info: wynik, shown: { version: 3, text: PROFILE, error: null } });
   assert.deepEqual([...body.querySelectorAll('[data-role="chips"] tf-chip')].map((c) => c.getAttribute('label')).slice(0, 1), ['profil HL7 v2']);
   assert.equal(body.querySelector('[data-role="about"]').textContent, 'Profil HL7 v2: wymagane segmenty i pola wyniku badania.');
+  assert.equal(body.querySelector('[data-role="hidden-hint"]').hidden, true, 'a clean text has no hint about markers');
   const profile = body.querySelector('[data-role="profile"]');
   assert.equal(profile.hidden, false);
   assert.deepEqual([...profile.querySelectorAll('[data-role="profile-segments"] tf-chip')].map((c) => c.getAttribute('label')), ['MSH · nagłówek wiadomości', 'PID · dane pacjenta', 'OBX · wynik', 'ZZZ']);
@@ -546,3 +547,25 @@ test('a stored text with a hidden character is shown with the character written 
   // "Kopiuj" and "Pobierz" still hand out the stored bytes.
 });
 
+test('a hint says that a manual copy includes the markers, only for a text that has a hidden character', () => {
+  const legacy = '{"type":"record","name":"R","fields":[{"name":"po\u200Ble","type":"string"}]}';
+  const avro = { ...wizyta, subject: 'stary', schemaType: 'avro' };
+  const hinted = mount({ name: 'stary', info: avro, shown: { version: 1, text: legacy, error: null } }).body.querySelector('[data-role="hidden-hint"]');
+  assert.equal(hinted.hidden, false);
+  assert.match(hinted.textContent, /„Kopiuj” i „Pobierz” dają dokładne bajty; ręczne zaznaczenie w polu zawiera te znaczniki/);
+  assert.match(hinted.textContent, /⟦U\+…⟧/);
+  const clean = mount({ shown: { version: 3, text: TEXT, error: null } }).body.querySelector('[data-role="hidden-hint"]');
+  assert.equal(clean.hidden, true);
+  // An XSD's own leading byte-order mark is not a hidden character.
+  const xsd = mount({ name: 'faktura', info: { ...wizyta, schemaType: 'xsd' }, shown: { version: 1, text: '\uFEFF<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"/>', error: null } });
+  assert.equal(xsd.body.querySelector('[data-role="hidden-hint"]').hidden, true);
+});
+
+test('a segment of an HL7 profile with a hidden character is written out in its chip', () => {
+  const text = JSON.stringify({ required_segments: ['PI\u200BD'], required_fields: ['OB\u202EX-5'] });
+  const { body } = mount({ name: 'wynik-badania', info: wynik, shown: { version: 3, text, error: null } });
+  const chips = [...body.querySelectorAll('[data-role="profile-segments"] tf-chip')].map((c) => c.getAttribute('label'));
+  assert.ok(chips.some((l) => l.includes('PI⟦U+200B⟧D')), chips.join('|'));
+  assert.ok(chips.some((l) => l.includes('OB⟦U+202E⟧X')), chips.join('|'));
+  assert.ok(chips.every((l) => !/[\u200B\u202E]/.test(l)));
+});
