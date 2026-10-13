@@ -158,7 +158,7 @@ export function openMessagePreview({ instanceId, topic, partitionCount, browse, 
         <div class="tb-preview-record-head"><span>${escapeHtml(title)}</span>${chips}</div>
         ${blob
           ? `<div class="tb-kv-grid"><div class="k">${escapeHtml(T('topics.preview.blob_title'))}</div><div class="v">${escapeHtml(T('topics.preview.blob_text', { size: fmtBytes(blob.size_bytes), mime: blob.mime }))}</div></div>`
-          : payloadHtml(r.payloadPreview, { textBytes: PAYLOAD_PREVIEW_BYTES, emptyText: T('topics.preview.payload_empty') })}
+          : payloadHtml(r.payloadPreview, { textBytes: PAYLOAD_PREVIEW_BYTES, emptyText: T('topics.preview.payload_empty'), truncated: Boolean(r.truncated) })}
       </div>`;
   };
 

@@ -4,11 +4,26 @@
 // list. A payload that is valid UTF-8 is shown as text; anything else as a
 // bounded hex dump, never as replacement-character soup.
 
-/** A record's bytes as text (valid UTF-8) or a hex dump, cut at `maxBytes` with "…". */
-export function bytesToPreviewText(bytes, maxBytes = 512) {
+/**
+ * `bytes` without a UTF-8 sequence left unfinished at its end. A preview the
+ * server (or this screen) cut at a byte count can stop inside a character;
+ * that is a cut, not invalid text.
+ */
+export function withoutPartialCharacter(bytes) {
+  let lead = bytes.length - 1;
+  while (lead >= 0 && lead >= bytes.length - 4 && (bytes[lead] & 0xc0) === 0x80) lead -= 1;
+  if (lead < 0) return bytes;
+  const b = bytes[lead];
+  const need = b >= 0xf0 ? 4 : b >= 0xe0 ? 3 : b >= 0xc0 ? 2 : 1;
+  return bytes.length - lead < need ? bytes.subarray(0, lead) : bytes;
+}
+
+/** A record's bytes as text (valid UTF-8) or a hex dump, cut at `maxBytes` with "…". `cut` = the bytes already are a prefix. */
+export function bytesToPreviewText(bytes, maxBytes = 512, cut = false) {
   if (!bytes || bytes.length === 0) return '';
   const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  const slice = arr.subarray(0, maxBytes);
+  let slice = arr.subarray(0, maxBytes);
+  if (cut || arr.length > maxBytes) slice = withoutPartialCharacter(slice);
   try {
     const text = new TextDecoder('utf-8', { fatal: true }).decode(slice);
     return text + (arr.length > maxBytes ? '…' : '');
@@ -58,9 +73,10 @@ export function parseBlobRefJson(bytes) {
  * valid UTF-8, or text holding control characters (a Thrift or Protobuf
  * message that happens to be valid UTF-8 still is not text).
  */
-export function isBinaryPayload(bytes) {
+export function isBinaryPayload(bytes, cut = false) {
   if (!bytes || bytes.length === 0) return false;
-  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  let arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (cut) arr = withoutPartialCharacter(arr);
   let text;
   try {
     text = new TextDecoder('utf-8', { fatal: true }).decode(arr);
@@ -71,13 +87,13 @@ export function isBinaryPayload(bytes) {
   return /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(text);
 }
 
-/** A hex view of the first `maxBytes` bytes: rows of 16 as `{ offset, hex, ascii }` (offset in hex, `.` for a byte that is not printable ASCII). */
-export function hexRows(bytes, maxBytes = 512) {
+/** A hex view of the first `maxBytes` bytes: rows of `perRow` (16) as `{ offset, hex, ascii }` (offset in hex, `.` for a byte that is not printable ASCII). */
+export function hexRows(bytes, maxBytes = 512, perRow = 16) {
   const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
   const slice = arr.subarray(0, maxBytes);
   const rows = [];
-  for (let at = 0; at < slice.length; at += 16) {
-    const chunk = slice.subarray(at, at + 16);
+  for (let at = 0; at < slice.length; at += perRow) {
+    const chunk = slice.subarray(at, at + perRow);
     const hex = Array.from(chunk, (b) => b.toString(16).padStart(2, '0'));
     rows.push({
       offset: at.toString(16).padStart(4, '0'),

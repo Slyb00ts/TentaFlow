@@ -468,7 +468,7 @@ export function incompatibilityReason({ mode, detail, newText }) {
   const thriftProtocol = THRIFT_PROTOCOL.exec(detail);
   if (thriftProtocol) return { reason: T('schemas.incompat.thrift_protocol', { from: thriftProtocol[1], to: thriftProtocol[2] }), fix: T('schemas.incompat.thrift_protocol_fix') };
   const avroType = AVRO_TYPE.exec(detail);
-  if (avroType) return { reason: T('schemas.incompat.avro_type', { path: avroType[1] === '<root>' ? '/' : readablePath(avroType[1]), from: avroType[2], to: avroType[3] }), fix: generic };
+  if (avroType) return { reason: T('schemas.incompat.avro_type', { path: readablePath(avroType[1]), from: avroType[2], to: avroType[3] }), fix: generic };
   const avroEnum = AVRO_ENUM.exec(detail);
   if (avroEnum) return { reason: T('schemas.incompat.avro_enum', { name: avroEnum[1], symbol: avroEnum[2] }), fix: generic };
   let field = quoted(/^property '([^']+)' is required by the reader schema but not guaranteed present by the writer schema/);

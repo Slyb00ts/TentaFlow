@@ -15,6 +15,7 @@ import { patchHtml } from '/js/lib/dom-patch.js';
 import { T } from '/js/modules/tentabus/format.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
+import '/js/components/tf-disclosure.js';
 
 const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}"/></svg>`;
 
@@ -157,7 +158,7 @@ export function openChangeWindow({
  */
 export function openConfirmWindow({
   title, icon, lead, impactTitle, impact, info = null, audit = null, button, buttonIcon = null,
-  danger = false, width = 600, cls = 'tb-unp-confirm', run, describeError, onDone,
+  danger = false, width = 600, cls = 'tb-unp-confirm', run, describeError, describeDetail = () => '', onDone,
 }) {
   const win = windowEl({ title, icon, width, cls });
   win.innerHTML = `
@@ -197,6 +198,18 @@ export function openConfirmWindow({
       busy = false;
       sync();
       errEl.querySelector('span').textContent = describeError(err);
+      errEl.querySelector('[data-role="error-detail"]')?.remove();
+      const detail = describeDetail(err);
+      if (detail) {
+        const fold = document.createElement('tf-disclosure');
+        fold.className = 'tb-tech';
+        fold.dataset.role = 'error-detail';
+        fold.setAttribute('label', T('schemas.incompat.technical'));
+        const pre = document.createElement('pre');
+        pre.textContent = detail;
+        fold.appendChild(pre);
+        errEl.appendChild(fold);
+      }
       errEl.hidden = false;
       return;
     }

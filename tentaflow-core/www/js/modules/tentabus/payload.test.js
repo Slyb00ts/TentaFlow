@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { bytesToPreviewText, findHeader, headerText, parseBlobRefJson, isBinaryPayload, hexRows } from './payload.js';
+import { bytesToPreviewText, findHeader, headerText, parseBlobRefJson, isBinaryPayload, hexRows, withoutPartialCharacter } from './payload.js';
 
 const enc = (s) => new TextEncoder().encode(s);
 
@@ -52,4 +52,31 @@ test('a hex view is rows of 16: offset, hex in two groups of eight, printable AS
   assert.deepEqual(rows[0], { offset: '0000', hex: '4f 72 64 65 72 23 31 00  01 ff 41 41 41 41 41 41', ascii: 'Order#1...AAAAAA' });
   assert.equal(rows[1].offset, '0010');
   assert.equal(hexRows(new Uint8Array(1000), 512).length, 32, 'cut at 512 bytes');
+});
+
+test('a preview cut inside a character is text, not binary: the unfinished character is dropped only when the bytes are a cut', () => {
+  // 4095 ASCII bytes and "ą" (2 bytes) from offset 4095: the preview of 4096 bytes ends in the middle of it.
+  const text = new TextEncoder().encode(`${'a'.repeat(4095)}ąb`);
+  const preview = text.subarray(0, 4096);
+  assert.equal(isBinaryPayload(preview), true, 'whole, an unfinished character is invalid UTF-8');
+  assert.equal(isBinaryPayload(preview, true), false, 'a cut preview is not');
+  assert.equal(bytesToPreviewText(preview, 8192, true), 'a'.repeat(4095));
+  for (const [char, size] of [['ą', 2], ['€', 3], ['😀', 4]]) {
+    const bytes = new TextEncoder().encode(`xy${char}`);
+    for (let cut = 3; cut < 2 + size; cut += 1) {
+      assert.equal(withoutPartialCharacter(bytes.subarray(0, cut)).length, 2, `${char} cut after ${cut - 2} byte(s)`);
+    }
+    assert.equal(withoutPartialCharacter(bytes).length, 2 + size, `${char} whole`);
+  }
+  // Binary stays binary however it is cut.
+  assert.equal(isBinaryPayload(new Uint8Array([0x0a, 0x00, 0x01, 0x00, 0xc4]), true), true);
+  // The text view of a long text cut by the screen keeps whole characters too.
+  assert.equal(bytesToPreviewText(new TextEncoder().encode('aąb'), 2), 'a…');
+});
+
+test('a hex view can be rows of eight', () => {
+  const rows = hexRows(new Uint8Array(20).fill(0x41), 512, 8);
+  assert.equal(rows.length, 3);
+  assert.deepEqual(rows[0], { offset: '0000', hex: '41 41 41 41 41 41 41 41', ascii: 'AAAAAAAA' });
+  assert.equal(rows[2].offset, '0010');
 });

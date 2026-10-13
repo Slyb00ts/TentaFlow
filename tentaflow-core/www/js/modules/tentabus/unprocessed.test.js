@@ -20,7 +20,7 @@ if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Do
 
 const {
   unprocessedRecord, mergeNewest, commonReason, retryAllPlan, attemptsText, sourceText, whoCanRetry, receiversText,
-  unprocessedTopics, drawUnprocessed, paintUnprocessedSection, LIST_STEP, retryAllDoneNotice, plainCheckError, shortPath, reasonLabel, REASONS,
+  unprocessedTopics, drawUnprocessed, sectionRow, instanceRow, paintUnprocessedSection, LIST_STEP, retryAllDoneNotice, plainCheckError, shortPath, reasonLabel, REASONS,
 } = await import('./unprocessed.js');
 const { openUnprocessedView, openRetryOne, openDiscardOne, openRetryAll, retryImpact, retryAllImpact } = await import('./unprocessed-windows.js');
 
@@ -82,8 +82,8 @@ test('a message rejected at write has no consumer and never reached the topic', 
   assert.equal(rec.group, null);
   assert.equal(rec.reason, 'schema_violation');
   assert.equal(rec.arrivalMs, NOW - MIN);
-  assert.equal(sourceText(rec), 'nie trafiła do topiku');
-  assert.equal(attemptsText(rec, 5), '1 z 1');
+  assert.equal(sourceText(rec), 'odrzucona przy zapisie');
+  assert.equal(attemptsText(rec, 5), '—');
 });
 
 test('an unknown reason is said as such, never as the raw code', () => {
@@ -302,6 +302,89 @@ test('"Pokaż" of a binary body says so and shows a hex view, cut at 512 bytes w
   assert.equal(text.querySelector('[data-role="payload-binary"]'), null);
   assert.equal(text.querySelector('[data-role="payload"]').textContent, '{"ok":true}');
   text.close(true);
+});
+
+test('"Pokaż" of a text cut inside a character is text; of a cut binary message says "co najmniej", with the note first and a narrow view', () => {
+  const rec = unprocessedRecord('wyniki-badan', consumerFailure({ offset: 7, atMs: NOW - 5 * MIN }));
+  rec.truncated = true;
+  rec.payload = new TextEncoder().encode(`${'a'.repeat(4095)}ąb`).subarray(0, 4096);
+  const cutText = openUnprocessedView({ rec, maxAttempts: 5, nowMs: NOW });
+  assert.equal(cutText.querySelector('[data-role="payload-binary"]'), null, 'a cut text stays text');
+  assert.equal(cutText.querySelector('[data-role="payload"]').textContent.length, 4095);
+  cutText.close(true);
+
+  rec.payload = new Uint8Array(4096).fill(0x01);
+  const bin = openUnprocessedView({ rec, maxAttempts: 5, nowMs: NOW });
+  assert.equal(norm(bin.querySelector('[data-role="payload-binary"]').textContent), 'Treść binarna, co najmniej 4 096 bajtów');
+  assert.equal(norm(bin.querySelector('[data-role="payload-cut"]').textContent), 'Pokazano pierwsze 512 bajtów; wiadomość jest dłuższa niż podgląd.');
+  const head = bin.querySelector('[data-role="payload-binary"]');
+  const note = bin.querySelector('[data-role="payload-cut"]');
+  const wide = bin.querySelector('[data-role="payload"]');
+  const narrow = bin.querySelector('[data-role="payload-narrow"]');
+  assert.equal(head.nextElementSibling, note, 'the note comes right under the title, not below the frame');
+  assert.equal(note.nextElementSibling, wide);
+  assert.equal(wide.textContent.split('\n').length, 32, '16 bytes a row');
+  assert.equal(narrow.textContent.split('\n').length, 64, '8 bytes a row');
+  assert.ok(norm(narrow.textContent.split('\n')[0]).length < 40, 'a narrow row fits a phone');
+  bin.close(true);
+
+  rec.truncated = false;
+  rec.payload = new Uint8Array(100).fill(0x01);
+  const whole = openUnprocessedView({ rec, maxAttempts: 5, nowMs: NOW });
+  assert.equal(norm(whole.querySelector('[data-role="payload-binary"]').textContent), 'Treść binarna, 100 bajtów');
+  assert.equal(whole.querySelector('[data-role="payload-cut"]'), null);
+  whole.close(true);
+});
+
+test('the list says "odrzucona przy zapisie" and no attempts for a message refused on write, in both lists', () => {
+  const rec = unprocessedRecord('wizyty', writeRejection({ offset: 3, atMs: NOW - MIN }));
+  assert.equal(sectionRow(rec, 5, NOW).source, 'odrzucona przy zapisie');
+  assert.equal(sectionRow(rec, 5, NOW).attempts, '—');
+  assert.match(instanceRow(rec, 5, NOW).source, /odrzucona przy zapisie/);
+  assert.equal(instanceRow(rec, 5, NOW).attempts, '—');
+  const consumer = unprocessedRecord('wyniki-badan', consumerFailure({ offset: 7, atMs: NOW - 5 * MIN }));
+  assert.equal(sectionRow(consumer, 5, NOW).attempts, '5 z 5');
+});
+
+test('a refusal with a compile error behind it gets a technical fold, only when there is one', async () => {
+  const rec = unprocessedRecord('wyniki-badan', consumerFailure({ offset: 7, atMs: NOW - 5 * MIN }));
+  const win = openRetryOne({
+    rec, topic: 'wyniki-badan', consumers: [], maxAttempts: 5, nowMs: NOW,
+    retry: async () => { throw new Error('boom'); },
+    describeError: () => 'Wzór nie jest czytelny.',
+    describeDetail: () => "invalid schema: field 'a' of struct 'X' has no explicit id (line 1)",
+    onDone: () => {},
+  });
+  win.querySelector('[data-act="go"]').click();
+  await tick();
+  const fold = win.querySelector('[data-role="error"] tf-disclosure');
+  assert.equal(fold.getAttribute('label'), 'Szczegóły techniczne');
+  assert.match(fold.querySelector('pre').textContent, /has no explicit id/);
+  assert.doesNotMatch(norm(win.querySelector('[data-role="error"] span').textContent), /explicit id/);
+  win.close(true);
+  const plain = openRetryOne({
+    rec, topic: 'wyniki-badan', consumers: [], maxAttempts: 5, nowMs: NOW,
+    retry: async () => { throw new Error('boom'); }, describeError: () => 'Błąd.', onDone: () => {},
+  });
+  plain.querySelector('[data-act="go"]').click();
+  await tick();
+  assert.equal(plain.querySelector('[data-role="error"] tf-disclosure'), null);
+  plain.close(true);
+});
+
+test('a JSON Schema violation is told in Polish, with a readable path', () => {
+  for (const [server, expected] of [
+    ["<root>: missing required property 'pacjent'", 'Brakuje wymaganego pola „pacjent”.'],
+    ["/pacjent/pesel: expected string", 'pacjent › pesel: wartość ma zły typ — powinna być: string.'],
+    ['/wiek: expected integer or null', 'wiek: wartość ma zły typ — powinna być: integer / null.'],
+    ['/wiek: below minimum 0', 'wiek: liczba jest mniejsza niż dozwolone minimum (0).'],
+    ["/badania/[]: additional property is not allowed", 'badania › każdy element: pole spoza wzoru nie jest dozwolone.'],
+    ["/a: property 'x' requires property 'y' to also be present", 'a: pole „x” wymaga też pola „y”.'],
+    ["/a: value does not match any branch of 'oneOf'", 'a: wartość nie pasuje do żadnego z wariantów.'],
+    ['/a: shorter than minLength 3', 'a: tekst jest krótszy niż wymagane minimum (3).'],
+    ['<root>: payload is not valid JSON', 'Treść nie jest poprawnym JSON.'],
+    ['/a: validation step budget exhausted (limit 100000 steps)', 'a: dokument jest zbyt duży, żeby sprawdzić go wzorem w rozsądnym czasie.'],
+  ]) assert.equal(plainCheckError(server), expected, server);
 });
 
 test('"Pokaż" of a message refused on write has one state row, no partition, number or attempts', () => {
@@ -543,4 +626,16 @@ test('a very deep path is shown as its first and last elements, the full text st
   assert.ok(norm(span.textContent).length < 100, norm(span.textContent));
   const tooDeep = `/drzewo/dziecko/…/dziecko/dziecko: document is nested too deeply (more than 128 levels)`;
   assert.equal(plainCheckError(tooDeep), 'Dokument jest zagnieżdżony za głęboko (limit: 128 poziomów).', 'no wall of path for a document that is too deep');
+});
+
+test('on a narrow window the 8-byte view replaces the 16-byte one: both are in the markup, the stylesheet picks one', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const css = await readFile(new URL('../../../css/tentabus.css', import.meta.url), 'utf8');
+  assert.match(css, /\.tb-window \.tb-hex--narrow \{ display: none; \}/);
+  assert.match(css, /@media \(max-width: 720px\) \{\s*\.tb-window \.tb-hex--wide \{ display: none; \}\s*\.tb-window \.tb-hex--narrow \{ display: block; \}/);
+  const rec = unprocessedRecord('wyniki-badan', consumerFailure({ offset: 7, atMs: NOW - 5 * MIN }));
+  rec.payload = new Uint8Array(40).fill(0x01);
+  const win = openUnprocessedView({ rec, maxAttempts: 5, nowMs: NOW });
+  assert.equal(win.querySelector('[data-role="payload-narrow"]').hasAttribute('hidden'), false);
+  win.close(true);
 });

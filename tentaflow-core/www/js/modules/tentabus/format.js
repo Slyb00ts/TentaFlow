@@ -208,7 +208,7 @@ const PATH_WORDS = { '[]': 'fmt.path.each', '<key>': 'fmt.path.key', '<value>': 
  */
 export function readablePath(path) {
   const text = String(path);
-  if (text === '<root>') return text;
+  if (text === '<root>') return T('fmt.path.root');
   return text
     .split('/')
     .filter(Boolean)

@@ -82,6 +82,10 @@ tf-searchbox[hidden],
 tf-select[hidden] {
   display: none;
 }
+
+/* Like the controls above, a textarea is a block: inline, it ignores vertical margins. */
+tf-textarea { display: block; }
+tf-textarea[hidden] { display: none; }
 /* Sloty tf-window (footer + actions) — auto-flex z gapem, bez koniecznosci
    inline-style w kazdym uzyciu. Wyrownanie pionowe + 10px gap miedzy
    przyciskami. */
@@ -3443,9 +3447,19 @@ tf-disclosure { display: block; }
 tf-disclosure[hidden] { display: none; }
 
 .tf-disclosure__summary {
+  display: list-item;
+  list-style-position: inside;
+  width: fit-content;
   cursor: pointer;
   font-size: 12px;
   color: var(--tf-text-2);
+  border-radius: 4px;
+}
+
+/* The ring hugs the label and the marker, not the whole row. */
+.tf-disclosure__summary:focus-visible {
+  outline: 2px solid var(--tf-accent-1);
+  outline-offset: 2px;
 }
 
 .tf-disclosure__body {

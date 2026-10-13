@@ -747,7 +747,8 @@ test('"Dodaj wzór" tells how to write an HL7 profile and which XSD work, follow
   });
   const text = win.querySelector('[data-role="text"]');
   const format = win.querySelector('[data-role="format"]');
-  assert.match(text.getAttribute('hint'), /^Możesz też wczytać plik\./);
+  assert.match(text.getAttribute('hint'), /^Wzór zostanie sprawdzony przy dodawaniu/);
+  assert.doesNotMatch(text.getAttribute('hint'), /wczytać plik/, 'the file box says it');
   pick(format, 'hl7v2_profile');
   assert.ok(text.getAttribute('hint').includes(HL7_PROFILE_EXAMPLE), 'the shape of a profile is shown');
   assert.ok(HL7_PROFILE_EXAMPLE.includes('"required_segments"') && HL7_PROFILE_EXAMPLE.includes('"required_fields"'));
@@ -756,7 +757,7 @@ test('"Dodaj wzór" tells how to write an HL7 profile and which XSD work, follow
   pick(format, 'xsd');
   assert.match(text.getAttribute('hint'), /^Zadziała zwykły wzór XSD zapisany w jednym pliku, bez dołączania innych plików/);
   pick(format, 'json_schema');
-  assert.match(text.getAttribute('hint'), /^Możesz też wczytać plik\./);
+  assert.match(text.getAttribute('hint'), /^Wzór zostanie sprawdzony przy dodawaniu/);
   closeAll();
 });
 
@@ -1121,6 +1122,10 @@ test('a refused Thrift version names the field, the type, the enum value or the 
     /typ „x” się zmienia: struct 'In' nie da się odczytać jako union 'In'/,
   );
   assert.match(
+    reason('backward', `${backwardLead}<root>: i32 written by the old schema cannot be read as string by the new schema`),
+    /typ „\(cała wiadomość\)” się zmienia: i32 nie da się odczytać jako string/,
+  );
+  assert.match(
     reason('backward', `${backwardLead}<root>: the old schema is written in the binary protocol, the new one in the compact protocol`),
     /stary wzór jest zapisany w protokole binary, nowy w protokole compact — danych zapisanych jednym nie da się odczytać drugim\..*Zostaw protokół poprzedniej wersji/,
   );
@@ -1189,4 +1194,10 @@ test('a syntax refusal says the line before "Szczegóły są niżej", and nothin
   const none = refused('protobuf', 'not a valid Protobuf schema: label required');
   assert.match(none.text, /zdefiniowany w tym samym pliku\. Szczegóły są niżej\.$/);
   assert.doesNotMatch(none.text, / {2}/);
+});
+
+test('no format hint sends the reader to the file box in words: the box itself says it', () => {
+  for (const type of ['json_schema', 'avro', 'protobuf', 'thrift', 'xsd', 'hl7v2_profile']) {
+    assert.doesNotMatch(addTextHint(type), /wczytać plik/, type);
+  }
 });

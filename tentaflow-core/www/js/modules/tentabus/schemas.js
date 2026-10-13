@@ -69,7 +69,15 @@ export function busRefusalText(message) {
   if (stored) return T('errors.stored_schema_unreadable', { name: stored[1], version: stored[2] });
   const binary = /field policies cannot apply to a topic whose messages are binary: topic '([^']*)' is checked with the (\w+) pattern '([^']*)'/.exec(text);
   if (binary) return T('errors.field_policy_binary_topic', { topic: binary[1], format: schemaFormatLabel(binary[2]), name: binary[3] });
+  const bind = /field policies cannot apply to a topic whose messages are binary: cannot bind the (\w+) pattern '([^']*)' to topic '([^']*)' while field policies exist/.exec(text);
+  if (bind) return T('errors.field_policy_binary_bind', { topic: bind[3], format: schemaFormatLabel(bind[1]), name: bind[2] });
   return '';
+}
+
+/** The compile error behind a stored-pattern refusal (`busRefusalText`), for a technical fold; `''` for any other message. */
+export function busRefusalDetail(message) {
+  const m = /the stored schema cannot be compiled under the current rules of its format; register a corrected version: ([\s\S]*)$/.exec(String(message || ''));
+  return m ? m[1].trim() : '';
 }
 
 const isDeprecated = (s) => s.deprecatedAtMs != null;

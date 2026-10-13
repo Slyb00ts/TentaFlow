@@ -45,3 +45,40 @@ test('toggling the details sets open on the host and tells listeners', () => {
   assert.equal(el.hasAttribute('open'), true);
   assert.deepEqual(seen, [true]);
 });
+
+test('children appended after the first render go inside the fold', async () => {
+  const el = mount();
+  const late = document.createElement('p');
+  late.dataset.role = 'late';
+  el.appendChild(late);
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(late.parentElement.className, 'tf-disclosure__body');
+  assert.equal(el.querySelector('details').contains(late), true);
+  assert.equal(el.children.length, 1, 'the host holds only the details');
+});
+
+test('code that sets open gets the toggle event like a click, once, and opening scrolls the content into view', () => {
+  const el = mount();
+  const seen = [];
+  el.addEventListener('toggle', (e) => seen.push(e.detail.open));
+  const scrolled = [];
+  el.querySelector('.tf-disclosure__body').scrollIntoView = (options) => scrolled.push(options);
+  el.open = true;
+  assert.deepEqual(seen, [true]);
+  assert.deepEqual(scrolled, [{ block: 'nearest' }]);
+  // The details' own toggle event that follows a programmatic change adds nothing.
+  el.querySelector('details').dispatchEvent(new window.Event('toggle'));
+  assert.deepEqual(seen, [true]);
+  el.open = false;
+  assert.deepEqual(seen, [true, false]);
+  assert.equal(scrolled.length, 1, 'closing does not scroll');
+});
+
+test('the focus ring hugs the label and the marker, not the whole row', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const css = await readFile(new URL('../../css/controls.css', import.meta.url), 'utf8');
+  const summary = /\.tf-disclosure__summary \{([^}]*)\}/.exec(css)?.[1] || '';
+  assert.match(summary, /width: fit-content/);
+  assert.match(summary, /list-style-position: inside/);
+  assert.match(css, /\.tf-disclosure__summary:focus-visible \{[^}]*outline: 2px solid/);
+});

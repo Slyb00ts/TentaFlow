@@ -39,6 +39,7 @@ import { T, fmtCount, fmtDayTime } from '/js/modules/tentabus/format.js';
 import { busSchemaScopeId, topicScopeId, BUS_SCHEMA_REGISTRY } from '/js/modules/access-keys-scopes.js';
 import { windowEl, openChangeWindow, openConfirmWindow } from '/js/modules/tentabus/windows.js';
 import '/js/components/tf-button.js';
+import '/js/components/tf-disclosure.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-alert.js';
 import '/js/components/tf-chip.js';
@@ -836,12 +837,11 @@ export function openKeyIssued({ where, instanceLabel, orgName, origin, name, rig
     <div slot="body" class="stack">
       <div class="tb-danger-box">${sprite('alert')}<div>${escapeHtml(T('access.keys.issued.once'))}</div></div>
       <div class="tb-kv-grid">${kv.map(([k, v]) => `<div class="k">${escapeHtml(k)}</div><div class="v">${v}</div>`).join('')}</div>
-      <details class="tb-tech" data-role="developer">
-        <summary>${escapeHtml(T('access.keys.issued.developer'))}</summary>
+      <tf-disclosure class="tb-tech" data-role="developer" label="${escapeAttr(T('access.keys.issued.developer'))}">
         <div class="tb-will-happen">${sprite('info')}<div>${escapeHtml(T('access.keys.issued.how', { group }))}</div></div>
         <div class="tb-key-group"><span class="mono" data-role="group">${escapeHtml(group)}</span>
           <tf-button variant="ghost" size="sm" icon="copy" data-act="copy-group">${escapeHtml(T('access.keys.issued.copy_group'))}</tf-button></div>
-      </details>
+      </tf-disclosure>
       <div class="tb-window-error" role="alert" data-role="discard" hidden>${sprite('alert')}<div>${escapeHtml(T('access.keys.issued.close_confirm'))}</div></div>
       <div class="muted" data-role="copied" aria-live="polite"></div>
     </div>

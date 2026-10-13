@@ -108,7 +108,7 @@ test('a path is read without the leading slash, the steps joined with ›, the m
   assert.equal(readablePath('/tags/<value>/x'), 'tags › wartość › x');
   assert.equal(readablePath('/a/<unknown>'), 'a › pole spoza wzoru');
   assert.equal(readablePath('/a/b/…/c/d'), 'a › b › … › c › d');
-  assert.equal(readablePath('<root>'), '<root>');
+  assert.equal(readablePath('<root>'), '(cała wiadomość)');
 });
 
 test('a content kind after "treści" and after a verb has its own form', () => {

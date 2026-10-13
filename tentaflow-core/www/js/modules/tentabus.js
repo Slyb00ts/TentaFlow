@@ -30,7 +30,7 @@ import { MAIN_TABS, DEFAULT_TAB, DEFAULT_SECTION, TOPIC_SECTIONS, CONSUMER_SECTI
 import { shellCounts, userTopics, userRate } from '/js/modules/tentabus/model.js';
 import { laggingReplicas, isLagging, lagSeriesKey } from '/js/modules/tentabus/alerts.js';
 import { drawOverview, pushOverviewSample, CHART_WINDOW_SECS } from '/js/modules/tentabus/overview.js';
-import { drawSchemas, listText, compatLabel, schemaKindMismatchText, busRefusalText } from '/js/modules/tentabus/schemas.js';
+import { drawSchemas, listText, compatLabel, schemaKindMismatchText, busRefusalText, busRefusalDetail } from '/js/modules/tentabus/schemas.js';
 import { drawSchemaDetail, shareShownText } from '/js/modules/tentabus/schema-detail.js';
 import { addedNotice, openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete } from '/js/modules/tentabus/schema-windows.js';
 import { drawTopics } from '/js/modules/tentabus/topics.js';
@@ -1093,6 +1093,7 @@ const topicsContext = {
   },
 };
 
+const describeBusDetail = (err) => busRefusalDetail(err?.message);
 const describeBusError = (err) => schemaKindMismatchText(err?.message) || busRefusalText(err?.message) || mapBusErrorMessage(err?.message, T);
 
 function topicByName(name) {
@@ -2073,6 +2074,7 @@ function openUnprocessedWindow(kind, topic, key) {
       nowMs,
       retry: async () => Number((await ApiBinary.action('busDlqRetryRequest', coords))?.accepted),
       describeError: describeBusError,
+      describeDetail: describeBusDetail,
       onDone: (accepted) => afterUnprocessedChange(topic, surface, accepted === 0
         ? { tone: 'warning', title: T('unprocessed.retry.rejected_again_title'), text: T('unprocessed.retry.rejected_again_text', { what, topic }) }
         : { tone: 'success', title: T('unprocessed.retry.done_title'), text: `${T('unprocessed.retry.done_text', { what, topic })} ${receiversText(consumers)}` }),
@@ -2105,6 +2107,7 @@ function openUnprocessedRetryAll(topic, from) {
     maxAttempts: unprocessedMaxAttempts(topic),
     retryAll: () => ApiBinary.action('busDlqRetryAllRequest', { instanceId: requireInstanceId(instanceId), sourceTopic: topic, maxRecords: plan.batch }, { timeoutMs: RETRY_ALL_TIMEOUT_MS }),
     describeError: describeBusError,
+    describeDetail: describeBusDetail,
     onDone: (resp) => {
       afterUnprocessedChange(topic, from, retryAllDoneNotice({ topic, resp, consumers }));
     },

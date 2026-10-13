@@ -75,7 +75,7 @@ export function recordFacts(rec, maxAttempts, nowMs = Date.now()) {
 function recordPayloadHtml(rec) {
   const blob = rec.isBlobRef ? parseBlobRefJson(rec.payload) : null;
   if (blob) return `<div class="tb-explain-box">${escapeHtml(T('unprocessed.view.blob', { size: fmtBytes(blob.size_bytes), mime: blob.mime }))}</div>`;
-  return payloadHtml(rec.payload, { textBytes: PAYLOAD_PREVIEW_BYTES, emptyText: T('unprocessed.view.body_empty'), role: 'payload' });
+  return payloadHtml(rec.payload, { textBytes: PAYLOAD_PREVIEW_BYTES, emptyText: T('unprocessed.view.body_empty'), role: 'payload', truncated: Boolean(rec.truncated) });
 }
 
 /**
@@ -131,7 +131,7 @@ export function retryAllImpact({ topic, consumers, plan, maxAttempts }) {
 }
 
 /** "Ponów" of one message. `retry()` answers the server's `accepted`. */
-export function openRetryOne({ rec, topic, consumers, maxAttempts, retry, describeError, onDone, nowMs = Date.now() }) {
+export function openRetryOne({ rec, topic, consumers, maxAttempts, retry, describeError, describeDetail, onDone, nowMs = Date.now() }) {
   return openConfirmWindow({
     title: T('unprocessed.retry.title'),
     icon: 'refresh',
@@ -148,6 +148,7 @@ export function openRetryOne({ rec, topic, consumers, maxAttempts, retry, descri
     danger: false,
     run: retry,
     describeError,
+    describeDetail,
     onDone,
   });
 }
@@ -180,7 +181,7 @@ export function openDiscardOne({ rec, topic, discard, describeError, onDone }) {
  * "Ponów wszystkie" of one topic. `plan` = `retryAllPlan(...)`; `retryAll()`
  * answers `{ retried, failed }`.
  */
-export function openRetryAll({ topic, plan, consumers, maxAttempts, retryAll, describeError, onDone }) {
+export function openRetryAll({ topic, plan, consumers, maxAttempts, retryAll, describeError, describeDetail, onDone }) {
   const leadKey = plan.exact ? 'unprocessed.retry_all.lead' : 'unprocessed.retry_all.lead_estimate';
   const lead = [
     `<div class="tb-explain-box">${T(leadKey, { topic: `<b class="mono">${escapeHtml(topic)}</b>`, count: `<b>${escapeHtml(fmtCount(plan.retryable))}</b>`, n: plan.retryable })}</div>`,
@@ -202,6 +203,7 @@ export function openRetryAll({ topic, plan, consumers, maxAttempts, retryAll, de
     danger: false,
     run: retryAll,
     describeError,
+    describeDetail,
     onDone,
   });
 }

@@ -13,7 +13,7 @@ import './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { filterSchemas, schemaState, schemaFormatLabel, drawSchemas, deleteBlocker, schemaKind, schemaKindMismatchText, busRefusalText } = await import('./schemas.js');
+const { filterSchemas, schemaState, schemaFormatLabel, drawSchemas, deleteBlocker, schemaKind, schemaKindMismatchText, busRefusalText, busRefusalDetail } = await import('./schemas.js');
 
 const subjects = [
   { subject: 'wizyta', schemaType: 'json_schema', compatibility: 'backward', latestVersion: 5, deprecatedAtMs: null, usedByTopics: ['wizyty'] },
@@ -138,11 +138,21 @@ test('the stable server sentences about a stored pattern and a rule on a binary 
   );
   assert.equal(
     busRefusalText("bus.invalid_argument: field policies cannot apply to a topic whose messages are binary: topic 'zamowienia' is checked with the thrift pattern 'zamowienie'"),
-    'Topik zamowienia przyjmuje wiadomości binarne (wzór zamowienie, Thrift). Zasady ukrywania danych działają na JSON, XML i HL7 v2, więc na takim topiku ich nie ma.',
+    'Topik zamowienia przyjmuje wiadomości binarne (wzór zamowienie, Thrift). Zasady ukrywania danych działają na JSON, XML i HL7 v2, więc nie można ich dodać.',
   );
   assert.equal(busRefusalText('bus.invalid_argument: something else'), '');
   assert.equal(
     schemaKindMismatchText("bus.invalid_topic_config: schema subject 'wynik' is thrift but this topic's content_type resolves to xml"),
     'Wzór wynik jest dla treści binarnej, a ten topik przyjmuje treść XML.',
   );
+});
+
+test('binding a binary pattern under existing rules and the compile error behind a stored pattern are told apart', () => {
+  assert.equal(
+    busRefusalText("protocol error BadRequest: bus.invalid_topic_config: field policies cannot apply to a topic whose messages are binary: cannot bind the thrift pattern 'zamowienie' to topic 'zamowienia' while field policies exist for it; delete its field policies first"),
+    'Topik zamowienia ma zasady ukrywania danych, więc nie można do niego przypiąć wzoru binarnego zamowienie (Thrift). Zasady działają na JSON, XML i HL7 v2 — usuń je najpierw.',
+  );
+  const stored = "bus.invalid_argument: subject 'z' v3: the stored schema cannot be compiled under the current rules of its format; register a corrected version: invalid schema: field 'a' has no explicit id (line 1)";
+  assert.equal(busRefusalDetail(stored), "invalid schema: field 'a' has no explicit id (line 1)");
+  assert.equal(busRefusalDetail('bus.invalid_argument: nope'), '');
 });

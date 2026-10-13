@@ -674,6 +674,11 @@ test('T04 creator: name checks, three steps, pattern for the chosen content, the
   await expect(creator(page).locator('#tb-cr-partitions input')).toHaveValue('4');
   // Opis: optional; over 500 characters locks Dalej with the reason.
   const description = creator(page).locator('#tb-cr-description');
+  // The textarea is a block, so its margin counts: a clear gap under the name field and its hint.
+  const boxOf = (locator) => locator.evaluate((el) => { const r = el.getBoundingClientRect(); return { top: r.top, bottom: r.bottom, display: getComputedStyle(el).display }; });
+  const [nameBox, descriptionBox] = [await boxOf(creator(page).locator('#tb-cr-name')), await boxOf(description)];
+  expect(descriptionBox.display).toBe('block');
+  expect(descriptionBox.top - nameBox.bottom).toBeGreaterThanOrEqual(14);
   await description.locator('textarea').fill('x'.repeat(501));
   await expect(description.locator('.tf-error-text')).toContainText('najwyżej 500 znaków');
   await expect(nextButton(page)).toHaveAttribute('disabled', '');
@@ -1779,9 +1784,9 @@ test('U4 Nieprzetworzone at 1440: a tile per topic, one list newest first, a row
   const rows = await rowText(table);
   expect(rows.slice(0, 3).every((r) => r.includes('wizyty'))).toBeTruthy();
   const atWrite = rows.find((r) => r.includes('przy zapisie'));
-  expect(atWrite).toContain('nie trafiła do topiku');
+  expect(atWrite).toContain('odrzucona przy zapisie');
   expect(atWrite).toContain('Nie pasuje do wzoru wiadomości');
-  expect(atWrite).toContain('1 z 1');
+  expect(atWrite).not.toContain('1 z 1');
   expect(rows.filter((r) => r.includes('rejestracja-online')).every((r) => r.includes('5 z 5'))).toBeTruthy();
   await u.locator('[data-role="more"]').click();
   await expect(table.locator('tbody tr')).toHaveCount(17);
@@ -3142,7 +3147,7 @@ test('U6 keys: issued with reading, shown once; the key reads over REST and cann
     await expect(issued).toContainText('Produkcja ·');
     await expect(issued).toContainText('czyta wiadomości · topik wyniki-badan');
     // The technical hint is folded away; Escape before copying asks first.
-    await expect(issued.locator('details[data-role="developer"]')).not.toHaveAttribute('open', '');
+    await expect(issued.locator('tf-disclosure[data-role="developer"]')).not.toHaveAttribute('open', '');
     await page.keyboard.press('Escape');
     await expect(issued.locator('[data-role="discard"]')).toBeVisible();
     await expect(issued).toHaveCount(1);

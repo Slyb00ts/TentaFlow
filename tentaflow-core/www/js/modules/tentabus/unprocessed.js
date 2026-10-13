@@ -159,6 +159,44 @@ const THRIFT_PHRASES = [
   [/^more than one member of the union is set$/, 'thrift_union'],
 ];
 
+// The sentences of the JSON Schema checker (json_schema.rs `validate_node`), with the numbers and names it names.
+const JSON_PHRASES = [
+  [/^payload is not valid JSON$/, 'json_not_json'],
+  [/^expected (.+)$/, 'json_type', (m) => ({ types: m[1].replace(/ or /g, ' / ') })],
+  [/^value is not in 'enum'$/, 'json_enum'],
+  [/^value does not equal 'const'$/, 'json_const'],
+  [/^missing required property '([^']*)'$/, 'json_required', (m) => ({ name: m[1] })],
+  [/^fewer properties than minProperties (\d+)$/, 'json_min_props', (m) => ({ n: m[1] })],
+  [/^more properties than maxProperties (\d+)$/, 'json_max_props', (m) => ({ n: m[1] })],
+  [/^additional property is not allowed$/, 'json_additional'],
+  [/^property '([^']*)' requires property '([^']*)' to also be present$/, 'json_dependent', (m) => ({ a: m[1], b: m[2] })],
+  [/^fewer items than minItems (\d+)$/, 'json_min_items', (m) => ({ n: m[1] })],
+  [/^more items than maxItems (\d+)$/, 'json_max_items', (m) => ({ n: m[1] })],
+  [/^items are not unique$/, 'json_unique'],
+  [/^shorter than minLength (\d+)$/, 'json_min_length', (m) => ({ n: m[1] })],
+  [/^longer than maxLength (\d+)$/, 'json_max_length', (m) => ({ n: m[1] })],
+  [/^does not match pattern$/, 'json_pattern'],
+  [/^below minimum (\S+)$/, 'json_min', (m) => ({ n: m[1] })],
+  [/^above maximum (\S+)$/, 'json_max', (m) => ({ n: m[1] })],
+  [/^at or below exclusiveMinimum (\S+)$/, 'json_ex_min', (m) => ({ n: m[1] })],
+  [/^at or above exclusiveMaximum (\S+)$/, 'json_ex_max', (m) => ({ n: m[1] })],
+  [/^not a multiple of 'multipleOf'$/, 'json_multiple'],
+  [/^value does not match any branch of 'anyOf'$/, 'json_any_of'],
+  [/^value does not match any branch of 'oneOf'$/, 'json_one_of_none'],
+  [/^value matches more than one branch of 'oneOf'$/, 'json_one_of_many'],
+  [/^value must not match the 'not' schema$/, 'json_not'],
+  [/^schema is 'false': no value is valid here$/, 'json_false'],
+  [/^validation step budget exhausted \(limit \d+ steps\)$/, 'xsd_budget'],
+];
+
+function jsonSentence(message) {
+  for (const [re, key, params] of JSON_PHRASES) {
+    const m = re.exec(message);
+    if (m) return [key, params ? params(m) : {}];
+  }
+  return null;
+}
+
 const PATH_MAX = 120;
 
 /**
@@ -186,6 +224,7 @@ function valueWhy(why) {
 }
 
 function pathSentence(path, message) {
+  // A sentence about the whole message needs no name in front of it: it starts with a capital instead.
   const at = path === '<root>' ? '' : readablePath(shortPath(path));
   const say = (key, params) => T(`unprocessed.plain.${key}`, params);
   const withPath = (sentence) => (at ? `${at}: ${sentence}` : upperFirst(sentence));
@@ -193,6 +232,8 @@ function pathSentence(path, message) {
   if (m) return upperFirst(m[1] ? say('xsd_too_deep', { limit: m[1] }) : say('xsd_too_deep_plain'));
   // A byte that is no Thrift type at the very start means the whole message is not a Thrift record.
   if (message === 'type code is not a Thrift type') return path === '<root>' ? upperFirst(say('thrift_not_thrift')) : withPath(say('thrift_type_invalid'));
+  const json = jsonSentence(message);
+  if (json) return withPath(say(json[0], json[1]));
   m = /^root element '([^']*)' is not declared$/.exec(message);
   if (m) return upperFirst(say('xsd_root_undeclared', { name: m[1] }));
   m = /^required child element '([^']*)' is missing$/.exec(message);

@@ -582,7 +582,7 @@ test('the one-time key window asks once before Escape or the close button drop a
   const copied = [];
   const open = () => openKeyIssued({ where, instanceLabel: 'Produkcja', orgName: 'Przychodnia Zdrowie', origin: 'https://tf.local:8090', name: 'X', rights: { readMessages: true }, keyId: 'k-x', token: 'sk-x', copy: async (t) => { copied.push(t); return true; } });
   const win = open();
-  assert.ok(win.querySelector('details[data-role="developer"] summary'), 'the technical hint is folded under "Dla programisty"');
+  assert.ok(win.querySelector('tf-disclosure[data-role="developer"] summary'), 'the technical hint is folded under "Dla programisty"');
   assert.equal(win.querySelector('[data-role="group"]').textContent, 'k:k-x');
   win.querySelector('[data-act="copy-group"]').click();
   await tick();

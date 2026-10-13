@@ -365,6 +365,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   binarnej”; karta „Pola typu Order” nazywa typ; nowe zdania serwera o
   nieczytelnym zapisanym wzorze i o zasadzie na topiku binarnym mają polskie
   odpowiedniki w pięciu językach.
+- Trzecia runda po przeglądzie Thrift: podgląd tekstu uciętego w środku znaku
+  (serwer tnie podgląd na 4096 bajtach) nie jest już „binarny”, a uciętą
+  wiadomość binarną opisuje „co najmniej N bajtów” (prawdziwa długość nie idzie
+  po drucie); wzór Avro, Protobuf lub Thrift nie da się przypiąć do topiku,
+  który ma już zasady ukrywania danych (i odwrotnie), z polskim wyjaśnieniem;
+  naruszenia JSON Schema w Nieprzetworzonych są po polsku, ścieżki czytelnie, a
+  korzeń to „(cała wiadomość)”; wiadomość odrzucona przy zapisie ma w listach
+  „odrzucona przy zapisie” i „—” zamiast „1 z 1”; widok szesnastkowy ma wersję
+  po 8 bajtów na wąskim oknie, a uwaga o ucięciu stoi nad ramką; `tf-textarea`
+  jest blokiem (marginesy działają), `tf-disclosure` przyjmuje elementy
+  dołożone później, zgłasza `toggle` także po zmianie z kodu i przewija
+  otwartą treść w widok, a błąd kompilacji zapisanego wzoru trafia do
+  rozwijanych szczegółów technicznych w oknie ponawiania.
 
 - Rejestr wzorców waliduje Avro (F4 B1, biblioteka `apache-avro` 0.22 z ASF,
   bez kodeków kompresji; tylko do czytania schematów i serializacji
