@@ -29,8 +29,7 @@ const PAYLOAD_PREVIEW_BYTES = 4096;
 const kv = (pairs) => `<div class="tb-kv-grid">${pairs.map(([k, v]) => `<div class="k">${escapeHtml(k)}</div><div class="v">${v}</div>`).join('')}</div>`;
 
 function reasonHtml(rec) {
-  const chip = rec.atWrite ? ` <tf-chip size="sm" variant="outline" status="info" label="${escapeAttr(T('unprocessed.at_write'))}"></tf-chip>` : '';
-  return `${escapeHtml(reasonLabel(rec.reason))}${chip}`;
+  return escapeHtml(reasonLabel(rec.reason));
 }
 
 function consumerHtml(rec) {

@@ -378,6 +378,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   dołożone później, zgłasza `toggle` także po zmianie z kodu i przewija
   otwartą treść w widok, a błąd kompilacji zapisanego wzoru trafia do
   rozwijanych szczegółów technicznych w oknie ponawiania.
+- Czwarta runda po przeglądzie Thrift: podgląd ukrywania danych traktuje ucięty
+  tekst jak tekst (z „…” na końcu); odmowa przypięcia wzoru binarnego do topiku
+  z zasadami (i odwrotnie) zapada w tej samej transakcji co zapis, więc wyścig
+  jej nie ominie; topik binarny, który ma już zasady, pokazuje je z samym
+  „Usuń” i wyjaśnieniem; bajty 0xC0, 0xC1 i 0xF5–0xFF nie są początkiem znaku;
+  nazwy typów JSON są po polsku, wiersz „przy zapisie” nie powtarza się, a
+  „Dla programisty” opisuje tylko to, co klucz może; `tf-disclosure` przewija
+  tylko po kliknięciu.
 
 - Rejestr wzorców waliduje Avro (F4 B1, biblioteka `apache-avro` 0.22 z ASF,
   bez kodeków kompresji; tylko do czytania schematów i serializacji

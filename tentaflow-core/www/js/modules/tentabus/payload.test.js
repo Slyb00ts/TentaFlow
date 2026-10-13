@@ -60,7 +60,7 @@ test('a preview cut inside a character is text, not binary: the unfinished chara
   const preview = text.subarray(0, 4096);
   assert.equal(isBinaryPayload(preview), true, 'whole, an unfinished character is invalid UTF-8');
   assert.equal(isBinaryPayload(preview, true), false, 'a cut preview is not');
-  assert.equal(bytesToPreviewText(preview, 8192, true), 'a'.repeat(4095));
+  assert.equal(bytesToPreviewText(preview, 8192, true), `${'a'.repeat(4095)}…`);
   for (const [char, size] of [['ą', 2], ['€', 3], ['😀', 4]]) {
     const bytes = new TextEncoder().encode(`xy${char}`);
     for (let cut = 3; cut < 2 + size; cut += 1) {
@@ -79,4 +79,22 @@ test('a hex view can be rows of eight', () => {
   assert.equal(rows.length, 3);
   assert.deepEqual(rows[0], { offset: '0000', hex: '41 41 41 41 41 41 41 41', ascii: 'AAAAAAAA' });
   assert.equal(rows[2].offset, '0010');
+});
+
+test('only 0xC2-0xF4 start a character: a stray invalid byte at the cut is left alone, a real unfinished start is dropped', () => {
+  for (const stray of [0xc0, 0xc1, 0xf5, 0xf8, 0xff]) {
+    const bytes = new Uint8Array([0x61, 0x62, stray]);
+    assert.equal(withoutPartialCharacter(bytes).length, 3, `0x${stray.toString(16)} stays`);
+    assert.equal(isBinaryPayload(bytes, true), true, `0x${stray.toString(16)} is not text`);
+  }
+  assert.equal(withoutPartialCharacter(new Uint8Array([0x61, 0xf5, 0x80])).length, 3, 'a continuation after an invalid lead stays too');
+  for (const lead of [0xc2, 0xdf, 0xe0, 0xef, 0xf0, 0xf4]) {
+    assert.equal(withoutPartialCharacter(new Uint8Array([0x61, lead])).length, 1, `0x${lead.toString(16)} alone is an unfinished start`);
+  }
+});
+
+test('text cut by the server ends with an ellipsis; whole text does not', () => {
+  assert.equal(bytesToPreviewText(enc('abc'), 512, true), 'abc…');
+  assert.equal(bytesToPreviewText(enc('abc'), 512, false), 'abc');
+  assert.equal(bytesToPreviewText(enc('abcdef'), 4, false), 'abcd…');
 });

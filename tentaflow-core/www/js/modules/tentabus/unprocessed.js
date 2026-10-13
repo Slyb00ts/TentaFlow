@@ -162,7 +162,7 @@ const THRIFT_PHRASES = [
 // The sentences of the JSON Schema checker (json_schema.rs `validate_node`), with the numbers and names it names.
 const JSON_PHRASES = [
   [/^payload is not valid JSON$/, 'json_not_json'],
-  [/^expected (.+)$/, 'json_type', (m) => ({ types: m[1].replace(/ or /g, ' / ') })],
+  [/^expected (.+)$/, 'json_type', (m) => ({ types: m[1].split(' or ').map(jsonTypeWord).join(' / ') })],
   [/^value is not in 'enum'$/, 'json_enum'],
   [/^value does not equal 'const'$/, 'json_const'],
   [/^missing required property '([^']*)'$/, 'json_required', (m) => ({ name: m[1] })],
@@ -188,6 +188,13 @@ const JSON_PHRASES = [
   [/^schema is 'false': no value is valid here$/, 'json_false'],
   [/^validation step budget exhausted \(limit \d+ steps\)$/, 'xsd_budget'],
 ];
+
+const JSON_TYPES = new Set(['string', 'integer', 'number', 'boolean', 'object', 'array', 'null']);
+
+/** A JSON type name as a person says it; one this screen does not know stays as the checker wrote it. */
+function jsonTypeWord(name) {
+  return JSON_TYPES.has(name) ? T(`unprocessed.plain.json_t_${name}`) : name;
+}
 
 function jsonSentence(message) {
   for (const [re, key, params] of JSON_PHRASES) {
@@ -400,8 +407,8 @@ function whenCell(rec, nowMs) {
 }
 
 function reasonCell(rec) {
-  const chip = rec.atWrite ? ` <span class="tf-chip tf-chip--outline info">${escapeHtml(T('unprocessed.at_write'))}</span>` : '';
-  return `${escapeHtml(reasonLabel(rec.reason))}${chip}`;
+  // A message refused on write says so in the "Skąd" column already.
+  return escapeHtml(reasonLabel(rec.reason));
 }
 
 function consumerCell(rec) {

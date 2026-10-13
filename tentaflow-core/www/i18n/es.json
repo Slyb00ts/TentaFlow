@@ -11344,7 +11344,6 @@
       "col_attempts": "Intentos",
       "source": "partición {partition} · número {number}",
       "source_at_write": "rechazado al escribir",
-      "at_write": "al escribir",
       "attempts": "{count} de {max}",
       "attempts_at_write": "—",
       "shown": "Se muestran {shown} de {total}",
@@ -11544,7 +11543,14 @@
         "json_one_of_none": "el valor no coincide con ninguna de las variantes.",
         "json_one_of_many": "el valor coincide con más de una variante.",
         "json_not": "el patrón prohíbe este valor.",
-        "json_false": "el patrón no admite ningún valor aquí."
+        "json_false": "el patrón no admite ningún valor aquí.",
+        "json_t_string": "texto",
+        "json_t_integer": "número entero",
+        "json_t_number": "número",
+        "json_t_boolean": "valor lógico",
+        "json_t_object": "objeto",
+        "json_t_array": "lista",
+        "json_t_null": "null"
       }
     },
     "access": {
@@ -11702,7 +11708,9 @@
           "k_rights": "Derechos",
           "k_address": "Dirección para el sistema",
           "topic": "topic {topic}",
-          "how": "El sistema envía la clave en la cabecera «Authorization: Bearer …». Envía mensajes con POST a esta dirección y los lee con GET añadiendo el parámetro group={group} (o {group}.nombre si leen varios programas independientes).",
+          "how_key": "El sistema envía la clave en la cabecera «Authorization: Bearer …».",
+          "how_send": "Envía mensajes con POST a esta dirección.",
+          "how_read": "Los lee con GET añadiendo el parámetro group={group} (o {group}.nombre si leen varios programas independientes).",
           "copy_key": "Copiar clave",
           "copy_url": "Copiar dirección para el sistema",
           "done": "Listo",
@@ -11780,6 +11788,7 @@
       "empty_text": "Cualquiera que pueda leer este topic ve los mensajes completos. Añade una regla para ocultar campos concretos.",
       "blocked_title": "Las reglas de este topic no se editan aquí",
       "blocked_text": "Las reglas de este topic no se editan en esta pantalla porque su contenido es binario y no se puede leer como campos. Esta pantalla funciona con mensajes JSON, XML y HL7 v2. El tipo de contenido se fija al crear el topic.",
+      "blocked_with_rules": "Este tópico tiene reglas para ocultar datos, pero su contenido es binario: las reglas no funcionarán. Elimínalas o crea un tópico JSON/XML/HL7.",
       "keys_closed": "Los sistemas externos con clave de API tienen cerrado este topic para {directions}: solo hay reglas para personas, grupos o addons elegidos y ninguna para todos.",
       "sees_only": "Ve solo: {fields}",
       "sees_nothing": "No ve ningún campo",

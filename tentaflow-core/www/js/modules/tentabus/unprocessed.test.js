@@ -172,7 +172,8 @@ test('the tab: a tile per topic with its count, reason and last arrival; one lis
 
   const table = body.querySelector('[data-role="table"]');
   assert.deepEqual(table.rows.map((r) => r._topic), ['wyniki-badan', 'wizyty', 'wyniki-badan', 'wizyty', 'wyniki-badan']);
-  assert.match(table.rows[1].reason, /przy zapisie/);
+  assert.match(table.rows[1].source, /odrzucona przy zapisie/);
+  assert.doesNotMatch(table.rows[1].reason, /przy zapisie/, 'the Skąd column says it, the reason does not repeat it');
   assert.equal(table.rows[1].consumer, '—');
   assert.match(norm(body.querySelector('[data-role="footer"]').textContent), /Pokazano 5 z 5/);
   assert.equal(body.querySelector('[data-role="list-count"] tf-chip').getAttribute('label'), '5', 'the list says the instance total');
@@ -288,14 +289,15 @@ test('"Pokaż" of a binary body says so and shows a hex view, cut at 512 bytes w
   rec.payload = new Uint8Array([0x0a, 0x00, 0x01, 0x4f, 0x72, 0x64, 0x00, 0xff]);
   const win = openUnprocessedView({ rec, maxAttempts: 5, nowMs: NOW });
   assert.equal(norm(win.querySelector('[data-role="payload-binary"]').textContent), 'Treść binarna, 8 bajtów');
-  assert.match(win.querySelector('[data-role="payload"]').textContent, /^0000 {2}0a 00 01 4f 72 64 00 ff {2,}\|\.\.\.Ord\.\.\|$/);
+  assert.match(win.querySelector('[data-role="payload-wide"]').textContent, /^0000 {2}0a 00 01 4f 72 64 00 ff {2,}\|\.\.\.Ord\.\.\|$/);
+  assert.equal(win.querySelector('[data-role="payload"]').querySelectorAll('pre').length, 2, 'the role sits on the wrapper that holds both widths');
   assert.equal(win.querySelector('[data-role="payload-cut"]'), null);
   win.close(true);
   rec.payload = new Uint8Array(600).fill(0xfe);
   const big = openUnprocessedView({ rec, maxAttempts: 5, nowMs: NOW });
   assert.equal(norm(big.querySelector('[data-role="payload-binary"]').textContent), 'Treść binarna, 600 bajtów');
   assert.equal(norm(big.querySelector('[data-role="payload-cut"]').textContent), 'Pokazano pierwsze 512 z 600 bajtów.');
-  assert.equal(big.querySelector('[data-role="payload"]').textContent.split('\n').length, 32);
+  assert.equal(big.querySelector('[data-role="payload-wide"]').textContent.split('\n').length, 32);
   big.close(true);
   rec.payload = enc('{"ok":true}');
   const text = openUnprocessedView({ rec, maxAttempts: 5, nowMs: NOW });
@@ -310,7 +312,8 @@ test('"Pokaż" of a text cut inside a character is text; of a cut binary message
   rec.payload = new TextEncoder().encode(`${'a'.repeat(4095)}ąb`).subarray(0, 4096);
   const cutText = openUnprocessedView({ rec, maxAttempts: 5, nowMs: NOW });
   assert.equal(cutText.querySelector('[data-role="payload-binary"]'), null, 'a cut text stays text');
-  assert.equal(cutText.querySelector('[data-role="payload"]').textContent.length, 4095);
+  const shown = cutText.querySelector('[data-role="payload"]').textContent;
+  assert.ok(shown === `${'a'.repeat(4095)}…`, `a cut text ends with an ellipsis: ${shown.length} ${shown.slice(-3)}`);
   cutText.close(true);
 
   rec.payload = new Uint8Array(4096).fill(0x01);
@@ -319,10 +322,10 @@ test('"Pokaż" of a text cut inside a character is text; of a cut binary message
   assert.equal(norm(bin.querySelector('[data-role="payload-cut"]').textContent), 'Pokazano pierwsze 512 bajtów; wiadomość jest dłuższa niż podgląd.');
   const head = bin.querySelector('[data-role="payload-binary"]');
   const note = bin.querySelector('[data-role="payload-cut"]');
-  const wide = bin.querySelector('[data-role="payload"]');
+  const wide = bin.querySelector('[data-role="payload"]').querySelector('[data-role="payload-wide"]');
   const narrow = bin.querySelector('[data-role="payload-narrow"]');
-  assert.equal(head.nextElementSibling, note, 'the note comes right under the title, not below the frame');
-  assert.equal(note.nextElementSibling, wide);
+  assert.ok(head.nextElementSibling === note, 'the note comes right under the title, not below the frame');
+  assert.ok(note.nextElementSibling === bin.querySelector('[data-role="payload"]'), 'and the frame follows it');
   assert.equal(wide.textContent.split('\n').length, 32, '16 bytes a row');
   assert.equal(narrow.textContent.split('\n').length, 64, '8 bytes a row');
   assert.ok(norm(narrow.textContent.split('\n')[0]).length < 40, 'a narrow row fits a phone');
@@ -375,8 +378,8 @@ test('a refusal with a compile error behind it gets a technical fold, only when 
 test('a JSON Schema violation is told in Polish, with a readable path', () => {
   for (const [server, expected] of [
     ["<root>: missing required property 'pacjent'", 'Brakuje wymaganego pola „pacjent”.'],
-    ["/pacjent/pesel: expected string", 'pacjent › pesel: wartość ma zły typ — powinna być: string.'],
-    ['/wiek: expected integer or null', 'wiek: wartość ma zły typ — powinna być: integer / null.'],
+    ["/pacjent/pesel: expected string", 'pacjent › pesel: wartość ma zły typ — powinna być: tekst.'],
+    ['/wiek: expected integer or null', 'wiek: wartość ma zły typ — powinna być: liczba całkowita / null.'],
     ['/wiek: below minimum 0', 'wiek: liczba jest mniejsza niż dozwolone minimum (0).'],
     ["/badania/[]: additional property is not allowed", 'badania › każdy element: pole spoza wzoru nie jest dozwolone.'],
     ["/a: property 'x' requires property 'y' to also be present", 'a: pole „x” wymaga też pola „y”.'],

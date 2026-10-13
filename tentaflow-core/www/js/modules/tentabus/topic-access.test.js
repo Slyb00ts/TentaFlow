@@ -618,3 +618,26 @@ test('"Zmień" says what the new right lets or stops one doing, as the mockup do
     'Nie będzie można czytać wiadomości, nawet jeśli pozwala na to rola w organizacji.',
   );
 });
+
+test('"Dla programisty" says only what the key can do: a key that only sends has no group to read with', () => {
+  closeAll();
+  const open = (rights) => openKeyIssued({ where, instanceLabel: 'Produkcja', orgName: 'Przychodnia Zdrowie', origin: 'https://tf.local:8090', name: 'X', rights, keyId: 'k-x', token: 'sk-x', copy: async () => true });
+  const text = (win) => norm(win.querySelector('tf-disclosure[data-role="developer"]')?.textContent || '');
+  const send = open({ writeMessages: true });
+  assert.match(text(send), /Authorization: Bearer/);
+  assert.match(text(send), /POST/);
+  assert.doesNotMatch(text(send), /GET|group=/);
+  assert.equal(send.querySelector('[data-role="group"]'), null, 'nothing to copy');
+  send.close(true);
+  const read = open({ readMessages: true });
+  assert.match(text(read), /GET z dodanym parametrem group=k:k-x/);
+  assert.doesNotMatch(text(read), /POST/);
+  assert.equal(read.querySelector('[data-role="group"]').textContent, 'k:k-x');
+  read.close(true);
+  const both = open({ readMessages: true, writeMessages: true });
+  assert.match(text(both), /POST.*GET/);
+  both.close(true);
+  const schemas = open({ readSchemas: true });
+  assert.equal(schemas.querySelector('tf-disclosure[data-role="developer"]'), null, 'a key for patterns only has no topic address to explain');
+  schemas.close(true);
+});

@@ -12579,7 +12579,6 @@
       "col_attempts": "Attempts",
       "source": "partition {partition} · number {number}",
       "source_at_write": "refused on write",
-      "at_write": "at write",
       "attempts": "{count} of {max}",
       "attempts_at_write": "—",
       "shown": "Showing {shown} of {total}",
@@ -12779,7 +12778,14 @@
         "json_one_of_none": "the value matches none of the variants.",
         "json_one_of_many": "the value matches more than one variant.",
         "json_not": "the pattern forbids this value.",
-        "json_false": "the pattern allows no value here."
+        "json_false": "the pattern allows no value here.",
+        "json_t_string": "text",
+        "json_t_integer": "whole number",
+        "json_t_number": "number",
+        "json_t_boolean": "yes/no value",
+        "json_t_object": "object",
+        "json_t_array": "list",
+        "json_t_null": "null"
       }
     },
     "access": {
@@ -12937,7 +12943,9 @@
           "k_rights": "Rights",
           "k_address": "Address for the system",
           "topic": "topic {topic}",
-          "how": "The system sends the key in the “Authorization: Bearer …” header. It sends messages with POST to this address and reads them with GET, adding the parameter group={group} (or {group}.name when several independent programs read).",
+          "how_key": "The system sends the key in the “Authorization: Bearer …” header.",
+          "how_send": "It sends messages with POST to this address.",
+          "how_read": "It reads them with GET, adding the parameter group={group} (or {group}.name when several independent programs read).",
           "copy_key": "Copy key",
           "copy_url": "Copy address for the system",
           "done": "Done",
@@ -13015,6 +13023,7 @@
       "empty_text": "Anyone who can read this topic sees whole messages. Add a rule to hide chosen fields.",
       "blocked_title": "Rules for this topic are not edited here",
       "blocked_text": "Rules for this topic are not edited on this screen because its content is binary and cannot be read as fields. This screen works with JSON, XML and HL7 v2 messages. The kind of content is set when the topic is created.",
+      "blocked_with_rules": "This topic has data-hiding rules, but its content is binary — the rules will not work. Delete them or create a JSON/XML/HL7 topic.",
       "keys_closed": "Outside systems with an API key are shut out of this topic for {directions}: it has rules for chosen people, groups or addons only and none for everyone.",
       "sees_only": "Sees only: {fields}",
       "sees_nothing": "Sees no field",

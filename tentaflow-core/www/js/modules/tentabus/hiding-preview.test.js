@@ -278,3 +278,18 @@ test('an answer that arrives after the subject changed, or after the window clos
   assert.equal(closed.win.isConnected, false);
   assert.equal(closed.win.querySelector('[data-role="result"]').textContent.includes('Tak widzi ją'), false, 'a window that is gone gets no answer');
 });
+
+test('a text cut inside a character in the data-hiding preview is text, with an ellipsis; a binary record is still hex', () => {
+  // "ł" (two bytes) starts at offset 4095 of a 4096-byte preview the server cut.
+  const cut = new TextEncoder().encode(`${'a'.repeat(4095)}łb`).subarray(0, 4096);
+  assert.equal(displayPayload(cut), Array.from(cut, (b) => b.toString(16).padStart(2, '0')).join(' '), 'whole, an unfinished character is not text');
+  assert.ok(displayPayload(cut, true) === `${'a'.repeat(4095)}…`, 'a cut preview is text');
+  const resp = { record: { ...record, payloadPreview: cut, truncated: true }, applied: [], limitedByCaller: false };
+  const host = document.createElement('div');
+  host.innerHTML = previewResultHtml({ resp, subject: { subjectType: 'any', label: 'Wszyscy' }, source: null, nowMs: NOW });
+  const shown = host.querySelector('[data-role="payload"]').textContent;
+  assert.ok(shown === `${'a'.repeat(4095)}…`, `rendered as text: ${shown.length} ${shown.slice(0, 12)}`);
+  const binary = { record: { ...record, payloadPreview: new Uint8Array([0x0a, 0x00, 0xff]), truncated: true }, applied: [], limitedByCaller: false };
+  host.innerHTML = previewResultHtml({ resp: binary, subject: { subjectType: 'any', label: 'Wszyscy' }, source: null, nowMs: NOW });
+  assert.equal(host.querySelector('[data-role="payload"]').textContent, '0a 00 ff');
+});

@@ -623,6 +623,7 @@ function skeleton() {
       <div class="section-sub">${escapeHtml(T('hiding.explain'))}</div>
       <div data-role="state"></div>
       <div data-role="keys-note"></div>
+      <div data-role="blocked-note"></div>
       <tf-table data-role="rules">
         <tf-column key="who" label="${escapeAttr(T('hiding.col_who'))}" renderer="html"></tf-column>
         <tf-column key="what" label="${escapeAttr(T('hiding.col_what'))}" renderer="html" fill></tf-column>
@@ -721,6 +722,11 @@ export function paintHidingSection(host, view, ctx) {
     ? `<div class="tb-who-can">${sprite('lock')}<span>${escapeHtml(T('hiding.keys_closed', { directions: listFormat(closed.map((d) => T(`hiding.direction_of.${d}`))) }))}</span></div>`
     : '');
 
+  // Rules that an older topic already has, on content they cannot read: said plainly, and only "Usuń" is left.
+  patchHtml(host.querySelector('[data-role="blocked-note"]'), blocked && rows.length
+    ? `<tf-alert tone="warning" title="${escapeAttr(T('hiding.blocked_title'))}" message="${escapeAttr(T('hiding.blocked_with_rules'))}"></tf-alert>`
+    : '');
+  host.querySelector('[data-role="rules"]').__tbBlocked = blocked;
   const add = host.querySelector('[data-role="add"]');
   setAttr(add, 'disabled', !ready || blocked);
   setAttr(add, 'title', blocked ? T('hiding.blocked_text') : null);
@@ -736,10 +742,10 @@ export function paintHidingSection(host, view, ctx) {
     table.rowActionsKey = (row) => row._key;
     table.rowActions = (row, idx, currentRow) => {
       const live = () => currentRow?.() ?? row;
-      return rowButtons([
-        ['change', T('hiding.change.button'), () => ctx.go({ kind: 'hiding-change', rule: live()._key })],
-        ['remove', T('hiding.remove.button'), () => ctx.go({ kind: 'hiding-remove', rule: live()._key })],
-      ]);
+      const pairs = [['remove', T('hiding.remove.button'), () => ctx.go({ kind: 'hiding-remove', rule: live()._key })]];
+      // A rule on binary content cannot be changed into anything that works: it can only go.
+      if (!table.__tbBlocked) pairs.unshift(['change', T('hiding.change.button'), () => ctx.go({ kind: 'hiding-change', rule: live()._key })]);
+      return rowButtons(pairs);
     };
   }
   patchHtml(host.querySelector('[data-role="legend"]'), legendHtml());

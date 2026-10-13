@@ -39,9 +39,9 @@ export function whoPhrase(subject) {
 }
 
 /** The top-level names of a JSON record, none for anything else. */
-function recordFields(bytes) {
+function recordFields(bytes, cut) {
   try {
-    const value = JSON.parse(bytesToPreviewText(bytes, PAYLOAD_BYTES));
+    const value = JSON.parse(bytesToPreviewText(bytes, PAYLOAD_BYTES, cut));
     return value && typeof value === 'object' && !Array.isArray(value) ? Object.keys(value) : [];
   } catch {
     return [];
@@ -57,7 +57,7 @@ function recordFields(bytes) {
  */
 export function missingFields({ resp, source }) {
   if (source?.mode !== 'schema') return [];
-  const seen = new Set([...recordFields(resp.record.payloadPreview), ...(resp.applied || []).map((a) => a.field)]);
+  const seen = new Set([...recordFields(resp.record.payloadPreview, Boolean(resp.record.truncated)), ...(resp.applied || []).map((a) => a.field)]);
   return source.fields.map((f) => f.name).filter((n) => !seen.has(n));
 }
 
@@ -65,8 +65,8 @@ export function missingFields({ resp, source }) {
  * The record as text for the window: JSON indented, anything else with its
  * line breaks made plain (an HL7 message separates segments by CR).
  */
-export function displayPayload(bytes) {
-  const text = bytesToPreviewText(bytes, PAYLOAD_BYTES);
+export function displayPayload(bytes, cut = false) {
+  const text = bytesToPreviewText(bytes, PAYLOAD_BYTES, cut);
   try {
     return JSON.stringify(JSON.parse(text), null, 2);
   } catch {
@@ -107,7 +107,7 @@ export function previewResultHtml({ resp, subject, source, nowMs = Date.now() })
     ${resp.limitedByCaller ? `<tf-alert tone="warning" data-role="limited" title="${escapeAttr(T('hiding.preview.limited_title'))}" message="${escapeAttr(limitedText)}"></tf-alert>` : ''}
     <div class="tb-preview-record">
       <div class="tb-preview-record-head"><span>${escapeHtml(T('hiding.preview.sees', { who: whoPhrase(subject) }))}</span> <span class="muted">${escapeHtml(title)}</span></div>
-      <pre class="tb-payload" data-role="payload">${escapeHtml(displayPayload(record.payloadPreview)) || escapeHtml(T('topics.preview.payload_empty'))}</pre>
+      <pre class="tb-payload" data-role="payload">${escapeHtml(displayPayload(record.payloadPreview, Boolean(record.truncated))) || escapeHtml(T('topics.preview.payload_empty'))}</pre>
     </div>
     <div class="field">
       <label>${escapeHtml(T('hiding.preview.rules_title'))}</label>

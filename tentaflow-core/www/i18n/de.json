@@ -11344,7 +11344,6 @@
       "col_attempts": "Versuche",
       "source": "Partition {partition} · Nummer {number}",
       "source_at_write": "beim Schreiben abgelehnt",
-      "at_write": "beim Schreiben",
       "attempts": "{count} von {max}",
       "attempts_at_write": "—",
       "shown": "{shown} von {total} angezeigt",
@@ -11544,7 +11543,14 @@
         "json_one_of_none": "der Wert passt zu keiner der Varianten.",
         "json_one_of_many": "der Wert passt zu mehr als einer Variante.",
         "json_not": "das Muster verbietet diesen Wert.",
-        "json_false": "das Muster erlaubt hier keinen Wert."
+        "json_false": "das Muster erlaubt hier keinen Wert.",
+        "json_t_string": "Text",
+        "json_t_integer": "ganze Zahl",
+        "json_t_number": "Zahl",
+        "json_t_boolean": "Wahrheitswert",
+        "json_t_object": "Objekt",
+        "json_t_array": "Liste",
+        "json_t_null": "null"
       }
     },
     "access": {
@@ -11702,7 +11708,9 @@
           "k_rights": "Rechte",
           "k_address": "Adresse für das System",
           "topic": "Topic {topic}",
-          "how": "Das System sendet den Schlüssel im Header „Authorization: Bearer …“. Nachrichten sendet es per POST an diese Adresse und liest sie per GET mit dem zusätzlichen Parameter group={group} (oder {group}.name, wenn mehrere unabhängige Programme lesen).",
+          "how_key": "Das System sendet den Schlüssel im Header „Authorization: Bearer …“.",
+          "how_send": "Nachrichten sendet es per POST an diese Adresse.",
+          "how_read": "Es liest sie per GET mit dem zusätzlichen Parameter group={group} (oder {group}.name, wenn mehrere unabhängige Programme lesen).",
           "copy_key": "Schlüssel kopieren",
           "copy_url": "Adresse für das System kopieren",
           "done": "Fertig",
@@ -11780,6 +11788,7 @@
       "empty_text": "Wer dieses Topic lesen darf, sieht die vollständigen Nachrichten. Fügen Sie eine Regel hinzu, um bestimmte Felder auszublenden.",
       "blocked_title": "Regeln für dieses Topic werden hier nicht bearbeitet",
       "blocked_text": "Regeln für dieses Topic werden auf diesem Bildschirm nicht bearbeitet, weil sein Inhalt binär ist und sich nicht als Felder lesen lässt. Dieser Bildschirm unterstützt JSON-, XML- und HL7-v2-Nachrichten. Die Art des Inhalts wird beim Erstellen des Topics festgelegt.",
+      "blocked_with_rules": "Dieses Topic hat Regeln zum Ausblenden von Daten, sein Inhalt ist aber binär — die Regeln wirken nicht. Löschen Sie sie oder legen Sie ein JSON-/XML-/HL7-Topic an.",
       "keys_closed": "Externe Systeme mit API-Schlüssel sind für dieses Topic im Bereich {directions} gesperrt: Es gibt nur Regeln für ausgewählte Personen, Gruppen oder Addons und keine Regel für alle.",
       "sees_only": "Sieht nur: {fields}",
       "sees_nothing": "Sieht kein Feld",

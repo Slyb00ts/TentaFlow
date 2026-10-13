@@ -14,7 +14,11 @@ export function withoutPartialCharacter(bytes) {
   while (lead >= 0 && lead >= bytes.length - 4 && (bytes[lead] & 0xc0) === 0x80) lead -= 1;
   if (lead < 0) return bytes;
   const b = bytes[lead];
-  const need = b >= 0xf0 ? 4 : b >= 0xe0 ? 3 : b >= 0xc0 ? 2 : 1;
+  // Only 0xC2-0xF4 start a sequence; 0xC0, 0xC1 and 0xF5-0xFF are invalid anywhere and are left for the decoder to refuse.
+  let need = 1;
+  if (b >= 0xc2 && b <= 0xdf) need = 2;
+  else if (b >= 0xe0 && b <= 0xef) need = 3;
+  else if (b >= 0xf0 && b <= 0xf4) need = 4;
   return bytes.length - lead < need ? bytes.subarray(0, lead) : bytes;
 }
 
@@ -26,7 +30,7 @@ export function bytesToPreviewText(bytes, maxBytes = 512, cut = false) {
   if (cut || arr.length > maxBytes) slice = withoutPartialCharacter(slice);
   try {
     const text = new TextDecoder('utf-8', { fatal: true }).decode(slice);
-    return text + (arr.length > maxBytes ? '…' : '');
+    return text + (arr.length > maxBytes || cut ? '…' : '');
   } catch {
     let hex = '';
     for (let i = 0; i < slice.length; i += 1) {

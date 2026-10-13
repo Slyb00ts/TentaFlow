@@ -818,6 +818,26 @@ export function openKeyIssue(ctx) {
 }
 
 /**
+ * "Dla programisty": only what the key's rights make true. A key that only
+ * sends has no group to read with; a key with neither right has no address to use.
+ */
+function developerHtml({ rights, group }) {
+  const reads = Boolean(rights.readMessages);
+  const writes = Boolean(rights.writeMessages);
+  if (!reads && !writes) return '';
+  const how = [
+    T('access.keys.issued.how_key'),
+    writes ? T('access.keys.issued.how_send') : '',
+    reads ? T('access.keys.issued.how_read', { group }) : '',
+  ].filter(Boolean).join(' ');
+  return `<tf-disclosure class="tb-tech" data-role="developer" label="${escapeAttr(T('access.keys.issued.developer'))}">
+        <div class="tb-will-happen">${sprite('info')}<div>${escapeHtml(how)}</div></div>
+        ${reads ? `<div class="tb-key-group"><span class="mono" data-role="group">${escapeHtml(group)}</span>
+          <tf-button variant="ghost" size="sm" icon="copy" data-act="copy-group">${escapeHtml(T('access.keys.issued.copy_group'))}</tf-button></div>` : ''}
+      </tf-disclosure>`;
+}
+
+/**
  * The one window that shows a new key's secret, with what the system needs
  * to use it: the address and how it reads (`k:<key id>` consumer groups).
  */
@@ -837,11 +857,7 @@ export function openKeyIssued({ where, instanceLabel, orgName, origin, name, rig
     <div slot="body" class="stack">
       <div class="tb-danger-box">${sprite('alert')}<div>${escapeHtml(T('access.keys.issued.once'))}</div></div>
       <div class="tb-kv-grid">${kv.map(([k, v]) => `<div class="k">${escapeHtml(k)}</div><div class="v">${v}</div>`).join('')}</div>
-      <tf-disclosure class="tb-tech" data-role="developer" label="${escapeAttr(T('access.keys.issued.developer'))}">
-        <div class="tb-will-happen">${sprite('info')}<div>${escapeHtml(T('access.keys.issued.how', { group }))}</div></div>
-        <div class="tb-key-group"><span class="mono" data-role="group">${escapeHtml(group)}</span>
-          <tf-button variant="ghost" size="sm" icon="copy" data-act="copy-group">${escapeHtml(T('access.keys.issued.copy_group'))}</tf-button></div>
-      </tf-disclosure>
+      ${developerHtml({ rights, group })}
       <div class="tb-window-error" role="alert" data-role="discard" hidden>${sprite('alert')}<div>${escapeHtml(T('access.keys.issued.close_confirm'))}</div></div>
       <div class="muted" data-role="copied" aria-live="polite"></div>
     </div>

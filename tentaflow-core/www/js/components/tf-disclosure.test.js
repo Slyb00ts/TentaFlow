@@ -57,7 +57,7 @@ test('children appended after the first render go inside the fold', async () => 
   assert.equal(el.children.length, 1, 'the host holds only the details');
 });
 
-test('code that sets open gets the toggle event like a click, once, and opening scrolls the content into view', () => {
+test('code that sets open gets the toggle event like a click, once; only a click scrolls the content into view', () => {
   const el = mount();
   const seen = [];
   el.addEventListener('toggle', (e) => seen.push(e.detail.open));
@@ -65,12 +65,20 @@ test('code that sets open gets the toggle event like a click, once, and opening 
   el.querySelector('.tf-disclosure__body').scrollIntoView = (options) => scrolled.push(options);
   el.open = true;
   assert.deepEqual(seen, [true]);
-  assert.deepEqual(scrolled, [{ block: 'nearest' }]);
+  assert.deepEqual(scrolled, [], 'code that opens it does not move the page');
   // The details' own toggle event that follows a programmatic change adds nothing.
   el.querySelector('details').dispatchEvent(new window.Event('toggle'));
   assert.deepEqual(seen, [true]);
   el.open = false;
   assert.deepEqual(seen, [true, false]);
+  // A click: the details opens by itself and tells the host, which scrolls the content into view.
+  const details = el.querySelector('details');
+  details.open = true;
+  details.dispatchEvent(new window.Event('toggle'));
+  assert.deepEqual(seen, [true, false, true]);
+  assert.deepEqual(scrolled, [{ block: 'nearest' }]);
+  details.open = false;
+  details.dispatchEvent(new window.Event('toggle'));
   assert.equal(scrolled.length, 1, 'closing does not scroll');
 });
 

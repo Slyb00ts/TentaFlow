@@ -618,3 +618,22 @@ test('previewing is closed with its reason to an administrator who may not read 
   assert.match(preview.getAttribute('title'), /Podgląd wiadomości wymaga prawa czytania topiku wizyty\./);
   assert.equal(host.querySelector('[data-role="add"]').hasAttribute('disabled'), false, 'managing rules needs administration only');
 });
+
+test('a topic shown as binary that already has rules says they will not work and leaves only "Usuń"', () => {
+  const { host } = paint({ contentType: 'application/octet-stream', hidingData: { policies: POLICIES, policiesError: null, schema: null, schemaSettled: true } });
+  const note = host.querySelector('[data-role="blocked-note"] tf-alert');
+  assert.equal(note.getAttribute('message'), 'Ten topik ma zasady ukrywania danych, ale jego treść jest binarna — zasady nie zadziałają. Usuń je albo utwórz topik JSON/XML/HL7.');
+  assert.equal(host.querySelector('[data-role="rules"]').hidden, false, 'the rules are listed');
+  const table = host.querySelector('[data-role="rules"]');
+  const actions = table.rowActions(table.rows[0], 0, () => table.rows[0]);
+  assert.deepEqual([...actions.querySelectorAll('tf-button')].map((b) => b.dataset.act || b.getAttribute('data-act')), ['remove']);
+  const add = host.querySelector('[data-role="add"]');
+  assert.ok(add.hasAttribute('disabled'));
+  assert.match(add.getAttribute('title'), /binarna/, 'the disabled button says why');
+  // The same rules on a JSON topic: no note, and both "Zmień" and "Usuń".
+  const json = paint({ hidingData: { policies: POLICIES, policiesError: null, schema: SCHEMA, schemaSettled: true } });
+  assert.equal(json.host.querySelector('[data-role="blocked-note"]').children.length, 0);
+  const jsonTable = json.host.querySelector('[data-role="rules"]');
+  const jsonActions = jsonTable.rowActions(jsonTable.rows[0], 0, () => jsonTable.rows[0]);
+  assert.deepEqual([...jsonActions.querySelectorAll('tf-button')].map((b) => b.dataset.act || b.getAttribute('data-act')), ['change', 'remove']);
+});

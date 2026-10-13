@@ -2634,9 +2634,15 @@ test('F4 an HL7 profile and an XSD: added from "Dodaj wzór", spelled out on the
     await expect(issued).toHaveCount(1);
     const token = (await issued.locator('[data-role="token"]').textContent()).trim();
     const url = (await issued.locator('[data-role="url"]').textContent()).trim();
-    const group = (await issued.locator('[data-role="group"]').textContent()).trim();
+    // A key that only sends has no group to read with, so the id comes from the key list.
+    await expect(issued.locator('[data-role="group"]')).toHaveCount(0);
     await issued.locator('[data-act="done"]').click();
-    const keyId = group.slice(2);
+    const keyId = await page.evaluate(async (name) => {
+      const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+      const keys = await ApiBinary.list('apiKeyListRequest', { arrayKey: 'keys' });
+      return keys.find((k) => k.name === name)?.keyId;
+    }, `Pracownia ${RUN}`);
+    expect(keyId).toBeTruthy();
     try {
       const publish = async (target, text) => {
         const line = JSON.stringify({ payload_b64: Buffer.from(text).toString('base64') });

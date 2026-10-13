@@ -18,7 +18,8 @@ const rowsText = (rows, hexWidth) => rows.map((r) => `${r.offset}  ${r.hex.padEn
  * and ASCII under "Treść binarna, N bajtów". `truncated` = the bytes are only
  * the start of a longer message (the wire does not carry the real length, so
  * the size is "co najmniej"). The hex view comes in two widths, 16 bytes a row
- * and 8, and CSS shows the one that fits the window.
+ * and 8; a media query on the viewport (not on the window) picks the one that
+ * fits, and `data-role="payload"` sits on the wrapper that holds both.
  */
 export function payloadHtml(bytes, { textBytes, emptyText, role = '', truncated = false }) {
   const attr = role ? ` data-role="${role}"` : '';
@@ -34,6 +35,8 @@ export function payloadHtml(bytes, { textBytes, emptyText, role = '', truncated 
   // The note comes first, so a narrow window never leaves it below the fold.
   return `<div class="tb-binary-head" data-role="payload-binary">${escapeHtml(title)}</div>`
     + (note ? `<div class="muted tb-binary-note" data-role="payload-cut">${escapeHtml(note)}</div>` : '')
-    + `<pre class="tb-payload tb-hex tb-hex--wide"${attr}>${escapeHtml(rowsText(hexRows(bytes, HEX_BYTES, 16), 49))}</pre>`
-    + `<pre class="tb-payload tb-hex tb-hex--narrow" data-role="payload-narrow">${escapeHtml(rowsText(hexRows(bytes, HEX_BYTES, 8), 23))}</pre>`;
+    + `<div class="tb-hex-view"${attr}>`
+    + `<pre class="tb-payload tb-hex tb-hex--wide" data-role="payload-wide">${escapeHtml(rowsText(hexRows(bytes, HEX_BYTES, 16), 49))}</pre>`
+    + `<pre class="tb-payload tb-hex tb-hex--narrow" data-role="payload-narrow">${escapeHtml(rowsText(hexRows(bytes, HEX_BYTES, 8), 23))}</pre>`
+    + '</div>';
 }

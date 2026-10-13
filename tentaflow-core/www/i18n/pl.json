@@ -12579,7 +12579,6 @@
       "col_attempts": "Próby",
       "source": "partycja {partition} · numer {number}",
       "source_at_write": "odrzucona przy zapisie",
-      "at_write": "przy zapisie",
       "attempts": "{count} z {max}",
       "attempts_at_write": "—",
       "shown": "Pokazano {shown} z {total}",
@@ -12779,7 +12778,14 @@
         "json_one_of_none": "wartość nie pasuje do żadnego z wariantów.",
         "json_one_of_many": "wartość pasuje do więcej niż jednego wariantu.",
         "json_not": "wzór zabrania tej wartości.",
-        "json_false": "wzór nie dopuszcza tu żadnej wartości."
+        "json_false": "wzór nie dopuszcza tu żadnej wartości.",
+        "json_t_string": "tekst",
+        "json_t_integer": "liczba całkowita",
+        "json_t_number": "liczba",
+        "json_t_boolean": "wartość logiczna",
+        "json_t_object": "obiekt",
+        "json_t_array": "lista",
+        "json_t_null": "null"
       }
     },
     "access": {
@@ -12937,7 +12943,9 @@
           "k_rights": "Prawa",
           "k_address": "Adres dla systemu",
           "topic": "topik {topic}",
-          "how": "System wysyła klucz w nagłówku „Authorization: Bearer …”. Wiadomości wysyła metodą POST na ten adres, a czyta metodą GET z dodanym parametrem group={group} (albo {group}.nazwa, gdy czyta kilka niezależnych programów).",
+          "how_key": "System wysyła klucz w nagłówku „Authorization: Bearer …”.",
+          "how_send": "Wiadomości wysyła metodą POST na ten adres.",
+          "how_read": "Czyta metodą GET z dodanym parametrem group={group} (albo {group}.nazwa, gdy czyta kilka niezależnych programów).",
           "copy_key": "Kopiuj klucz",
           "copy_url": "Kopiuj adres dla systemu",
           "done": "Gotowe",
@@ -13015,6 +13023,7 @@
       "empty_text": "Każdy, kto może czytać ten topik, widzi całe wiadomości. Dodaj zasadę, aby ukryć wybrane pola.",
       "blocked_title": "Zasady tego topiku nie są tu edytowane",
       "blocked_text": "Zasad tego topiku nie edytuje się na tym ekranie, bo jego treść jest binarna i nie da się jej odczytać jako pól. Ten ekran obsługuje wiadomości JSON, XML i HL7 v2. Rodzaj treści ustala się przy tworzeniu topiku.",
+      "blocked_with_rules": "Ten topik ma zasady ukrywania danych, ale jego treść jest binarna — zasady nie zadziałają. Usuń je albo utwórz topik JSON/XML/HL7.",
       "keys_closed": "Systemy zewnętrzne z kluczem API mają zamknięty ten topik w zakresie {directions}: są w nim zasady tylko dla wybranych osób, grup lub addonów, a nie ma zasady dla wszystkich.",
       "sees_only": "Widzi tylko: {fields}",
       "sees_nothing": "Nie widzi żadnego pola",
