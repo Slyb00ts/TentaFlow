@@ -20,6 +20,11 @@ import '/js/components/tf-tabs.js';
 import { processNodeKind, processBoundaryKind, processBody } from './bpmn.js';
 import { openProcessCallPreview } from './process-monitor.js';
 
+// Blocks a BPMN Service task may run on its own. The server allow-list is the
+// authority (it validates on save and again at publication); this list only
+// decides what the inspector offers until the process options carry it.
+const PROCESS_BLOCK_TYPES = ['llm', 'embeddings', 'pii_filter'];
+
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
 // these from `node.config`; an empty value means "use the built-in default".
 // Schema-driven fields (params_schema) still render via `_renderField`; these
@@ -632,13 +637,20 @@ export class FlowConfig {
       const options = `<option value="">${escapeHtml(I18n.t('bpmn.choose_flow'))}</option>` + flows.map((flow) => `<option value="${escapeAttr(flow.flowId)}">${escapeHtml(flow.name)}</option>`).join('');
       const unavailable = config.flowId && !flows.some((flow) => flow.flowId === config.flowId);
       const tool = config.implementation?.AddonTool;
-      const source = tool
+      const blockTask = config.implementation?.Block;
+      const source = blockTask
+        ? `<tf-select data-process="blockType" label="${escapeAttr(I18n.t('bpmn.block_type'))}" value="${escapeAttr(blockTask.nodeType)}" ${disabled}>${PROCESS_BLOCK_TYPES.map((type) => `<option value="${type}">${escapeHtml(I18n.t(`bpmn.block_${type}`))}</option>`).join('')}${PROCESS_BLOCK_TYPES.includes(blockTask.nodeType) ? '' : `<option value="${escapeAttr(blockTask.nodeType)}" disabled>${escapeHtml(blockTask.nodeType)}</option>`}</tf-select>
+        ${textarea('blockConfig', 'block_config', JSON.stringify(blockTask.config, null, 2), 5)}
+        <p class="fb-field-hint" data-block-config-error hidden>${escapeHtml(I18n.t('bpmn.block_config_invalid'))}</p>
+        <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.block_hint'))}</p>`
+        : tool
         ? `${input('addonId', 'tool_addon_id', tool.addonId)}${input('toolName', 'tool_name', tool.toolName)}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.tool_hint'))}</p>`
         : `<tf-select data-process="flowId" wrap-selected label="${escapeAttr(I18n.t('bpmn.service_flow'))}" value="${escapeAttr(config.flowId)}" ${disabled}>${options}${unavailable ? `<option value="${escapeAttr(config.flowId)}" disabled>${escapeHtml(I18n.t('bpmn.flow_unavailable'))}</option>` : ''}</tf-select>`;
-      fields += `<tf-select data-process="implementation" label="${escapeAttr(I18n.t('bpmn.service_implementation'))}" value="${tool ? 'tool' : 'flow'}" ${disabled}>
+      fields += `<tf-select data-process="implementation" label="${escapeAttr(I18n.t('bpmn.service_implementation'))}" value="${blockTask ? 'block' : tool ? 'tool' : 'flow'}" ${disabled}>
           <option value="flow">${escapeHtml(I18n.t('bpmn.implementation_flow'))}</option>
           <option value="tool">${escapeHtml(I18n.t('bpmn.implementation_tool'))}</option>
+          <option value="block">${escapeHtml(I18n.t('bpmn.implementation_block'))}</option>
         </tf-select>
         ${source}
         ${mapping('inputMapping', 'input_mapping')}${mapping('outputMapping', 'output_mapping')}
@@ -1137,8 +1149,22 @@ export class FlowConfig {
         // A Flow task never carries the field on the wire; 'Flow' is how the form says "back to default".
         this.opts.onConfigChange(node.id, control.value === 'tool'
           ? { flowId: '', implementation: { AddonTool: { addonId: '', toolName: '' } } }
-          : { implementation: 'Flow' });
+          : control.value === 'block'
+            ? { flowId: '', implementation: { Block: { nodeType: PROCESS_BLOCK_TYPES[0], config: {} } } }
+            : { implementation: 'Flow' });
         this._renderProcess();
+      } else if (key === 'blockType') {
+        this.opts.onConfigChange(node.id, { implementation: { Block: {
+          ...node.config.implementation.Block, nodeType: control.value } } });
+      } else if (key === 'blockConfig') {
+        let parsed = null;
+        try { parsed = JSON.parse(control.value); } catch { /* reported below */ }
+        const valid = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed);
+        this.root.querySelector('[data-block-config-error]').hidden = valid;
+        if (valid) {
+          this.opts.onConfigChange(node.id, { implementation: { Block: {
+            ...node.config.implementation.Block, config: parsed } } });
+        }
       } else if (key === 'addonId' || key === 'toolName') {
         this.opts.onConfigChange(node.id, { implementation: { AddonTool: {
           ...node.config.implementation.AddonTool, [key]: control.value } } });

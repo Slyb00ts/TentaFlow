@@ -68,6 +68,7 @@ use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
 use crate::flow_engine::types::{FlowDefinition, FlowNode};
 use crate::flow_engine::validation::{self, FlowValidationError};
+use crate::processes::blocks::BlockAccessError;
 use crate::services::runtime::quic_handle::ServiceManager;
 
 /// Globalny cap na CAŁY flow to już TYLKO backstop anty-zawieszeniowy (nie
@@ -480,6 +481,17 @@ pub struct FlowRequestMeta {
     /// by nie narósł (nieograniczona rekurencja). `make_context` seeduje z tego
     /// pola `subflow_depth`.
     pub flow_depth: u8,
+}
+
+/// Maps a refused block access to the dispatch error a caller already handles:
+/// a definite refusal is `Denied`, "cannot tell" is `Internal`.
+fn process_block_denial(flow_id: &str, error: BlockAccessError) -> DispatchError {
+    match error {
+        BlockAccessError::NotAllowed | BlockAccessError::Initiator => DispatchError::Denied {
+            flow_id: flow_id.to_owned(),
+        },
+        BlockAccessError::Unavailable => DispatchError::Internal(error.to_string()),
+    }
 }
 
 impl FlowRequestMeta {
@@ -954,6 +966,131 @@ impl FlowDispatcher {
             graph_json,
             graph_sha256,
         })
+    }
+
+    /// Process counterpart of [`authorize_process_flow`] for a block run as a
+    /// Service task. Blocks are global, so there is no per-resource ACL: the
+    /// block must be on the allow-list and the initiator an active member of
+    /// the organization. A failed read is `Unavailable`, never a denial.
+    pub fn authorize_process_block(
+        &self,
+        node_type: &str,
+        user_id: &str,
+        org_id: &str,
+    ) -> std::result::Result<FlowRequestMeta, BlockAccessError> {
+        if crate::processes::blocks::allowed_block(node_type).is_none() {
+            return Err(BlockAccessError::NotAllowed);
+        }
+        let account = repository::get_user_account_by_id(&self.db, user_id)
+            .map_err(|_| BlockAccessError::Unavailable)?
+            .filter(|user| user.is_active)
+            .ok_or(BlockAccessError::Initiator)?;
+        crate::services::rbac::resolve_org_context(&self.db, user_id, Some(org_id)).map_err(
+            |error| match error {
+                crate::services::rbac::OrgContextError::Db(_) => BlockAccessError::Unavailable,
+                _ => BlockAccessError::Initiator,
+            },
+        )?;
+        let mut meta = FlowRequestMeta::new(
+            uuid::Uuid::new_v4().to_string(),
+            FlowOrigin::Process,
+            FlowActor::user(user_id),
+        );
+        meta.user_id = Some(account.id);
+        meta.user_role = Some(account.role);
+        meta.org_id = Some(org_id.to_owned());
+        Ok(meta)
+    }
+
+    /// Pin of a block for publication: the canonical one-block graph, built
+    /// from the block type and its configuration and proved to compile against
+    /// the live adapter registry. There is no row in `flows` behind it.
+    pub fn snapshot_process_block(
+        &self,
+        node_type: &str,
+        config: &serde_json::Value,
+        user_id: &str,
+        org_id: &str,
+    ) -> std::result::Result<PinnedFlowSnapshot, DispatchError> {
+        let flow_id = tentaflow_protocol::processes::block_source_ref(node_type);
+        let (graph_json, graph_sha256) = crate::processes::blocks::block_pin(node_type, config)
+            .map_err(|error| DispatchError::CompileFailed {
+                flow_id: flow_id.clone(),
+                msg: error.to_string(),
+            })?;
+        self.authorize_process_block(node_type, user_id, org_id)
+            .map_err(|error| process_block_denial(&flow_id, error))?;
+        self.validate_process_snapshot(&flow_id, &graph_json)?;
+        CompiledFlow::from_json("", &graph_json, &self.registry).map_err(|error| {
+            DispatchError::CompileFailed {
+                flow_id: flow_id.clone(),
+                msg: error.to_string(),
+            }
+        })?;
+        Ok(PinnedFlowSnapshot {
+            flow_id,
+            source_version: 0,
+            graph_json,
+            graph_sha256,
+        })
+    }
+
+    /// Runs a pinned one-block graph without a `flows` row (so no execution
+    /// record is written, as for any flow with an empty id). The flow ACL is
+    /// replaced by [`authorize_process_block`]; the hash, the graph rules and
+    /// the exact-pin check are the same as for a pinned flow.
+    pub async fn dispatch_pinned_synthetic(
+        &self,
+        snapshot: &PinnedFlowSnapshot,
+        initial: FlowEnvelope,
+        mut meta: FlowRequestMeta,
+    ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
+        use sha2::{Digest, Sha256};
+
+        let denied = || DispatchError::Denied {
+            flow_id: snapshot.flow_id.clone(),
+        };
+        let (Some(user_id), Some(org_id)) = (meta.user_id.clone(), meta.org_id.clone()) else {
+            return Err(denied());
+        };
+        if meta.actor_user_id.as_deref() != Some(user_id.as_str())
+            || hex::encode(Sha256::digest(snapshot.graph_json.as_bytes())) != snapshot.graph_sha256
+        {
+            return Err(denied());
+        }
+        let node_type = crate::processes::blocks::pinned_block_type(&snapshot.graph_json)
+            .map_err(|error| DispatchError::CompileFailed {
+                flow_id: snapshot.flow_id.clone(),
+                msg: error.to_string(),
+            })?;
+        if snapshot.flow_id != tentaflow_protocol::processes::block_source_ref(&node_type) {
+            return Err(denied());
+        }
+        let current = self
+            .authorize_process_block(&node_type, &user_id, &org_id)
+            .map_err(|error| process_block_denial(&snapshot.flow_id, error))?;
+        meta.user_role = current.user_role;
+        self.validate_process_snapshot(&snapshot.flow_id, &snapshot.graph_json)?;
+        let compiled = Arc::new(
+            CompiledFlow::from_json("", &snapshot.graph_json, &self.registry).map_err(|error| {
+                DispatchError::CompileFailed {
+                    flow_id: snapshot.flow_id.clone(),
+                    msg: error.to_string(),
+                }
+            })?,
+        );
+        let outcome = self
+            .run_blocking(compiled, initial, meta, RunDescriptor::default())
+            .await
+            .map_err(DispatchError::from)?;
+        // Only a definite loss of access discards a result that already exists;
+        // a read that fails now is left to the caller's own re-check.
+        match self.authorize_process_block(&node_type, &user_id, &org_id) {
+            Err(error @ (BlockAccessError::NotAllowed | BlockAccessError::Initiator)) => {
+                Err(process_block_denial(&snapshot.flow_id, error))
+            }
+            Ok(_) | Err(BlockAccessError::Unavailable) => Ok(outcome),
+        }
     }
 
     /// Zwraca `AddonFlowRegistry` jesli `set_addon_resolver` zostalo wolane.

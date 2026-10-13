@@ -306,9 +306,20 @@ function processField(value, camel) {
 // Flow is the default and is never sent, so a Flow task keeps its original bytes.
 function processServiceImplementation(implementation) {
   if (implementation == null || implementation === 'Flow') return {};
-  if (typeof implementation !== 'object' || Array.isArray(implementation)
-      || Object.keys(implementation).length !== 1 || !implementation.AddonTool) {
+  const variants = typeof implementation === 'object' && !Array.isArray(implementation)
+    ? Object.keys(implementation) : [];
+  if (variants.length !== 1 || !(implementation.AddonTool || implementation.Block)) {
     throw new TypeError('unsupported service implementation');
+  }
+  if (implementation.Block) {
+    const block = implementation.Block;
+    processKnownFields(block, ['nodeType', 'config'], 'block');
+    if (typeof block.nodeType !== 'string' || !block.config || typeof block.config !== 'object'
+        || Array.isArray(block.config)) {
+      throw new TypeError('block requires a node type and a configuration object');
+    }
+    // The configuration is the block's own settings: its keys are sent as authored.
+    return { implementation: { Block: { node_type: block.nodeType, config: block.config } } };
   }
   const tool = implementation.AddonTool;
   processKnownFields(tool, ['addonId', 'toolName'], 'addon tool');

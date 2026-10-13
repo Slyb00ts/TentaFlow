@@ -831,6 +831,13 @@ pub enum ServiceImplementation {
         addon_id: String,
         tool_name: String,
     },
+    /// One Flow Builder block on the server allow-list, run on its own. The
+    /// publication pins the one-block graph built from `node_type` and
+    /// `config`, so a later change to the block's code never alters the pin.
+    Block {
+        node_type: String,
+        config: serde_json::Value,
+    },
 }
 
 impl ServiceImplementation {
@@ -842,19 +849,32 @@ impl ServiceImplementation {
         match self {
             Self::Flow => ServiceImplementationKind::Flow,
             Self::AddonTool { .. } => ServiceImplementationKind::AddonTool,
+            Self::Block { .. } => ServiceImplementationKind::Block,
         }
     }
 
     /// Stable reference to the implementation, stored in the immutable
     /// invocation row and in the publication pin: the Flow id itself for a
-    /// Flow, `tool:<addon>/<tool>` for an addon tool. Flow ids are UUIDs and
-    /// tool identifiers cannot contain `/` or `:`, so the forms never collide.
+    /// Flow, `tool:<addon>/<tool>` for an addon tool, `block:<node_type>` for a
+    /// block. Flow ids are UUIDs and tool and block identifiers cannot contain
+    /// `/` or `:`, so the forms never collide.
     pub fn source_ref(&self, flow_id: &str) -> String {
         match self {
             Self::Flow => flow_id.to_owned(),
             Self::AddonTool { addon_id, tool_name } => tool_source_ref(addon_id, tool_name),
+            Self::Block { node_type, .. } => block_source_ref(node_type),
         }
     }
+}
+
+/// `block:<node_type>` — see [`ServiceImplementation::source_ref`].
+pub fn block_source_ref(node_type: &str) -> String {
+    format!("block:{node_type}")
+}
+
+/// Splits a `block:<node_type>` reference; `None` for anything else.
+pub fn parse_block_source_ref(source_ref: &str) -> Option<&str> {
+    source_ref.strip_prefix("block:")
 }
 
 /// `tool:<addon>/<tool>` — see [`ServiceImplementation::source_ref`].
@@ -876,6 +896,7 @@ pub enum ServiceImplementationKind {
     #[default]
     Flow,
     AddonTool,
+    Block,
 }
 
 impl ServiceImplementationKind {
@@ -887,6 +908,19 @@ impl ServiceImplementationKind {
         match self {
             Self::Flow => "flow",
             Self::AddonTool => "addon_tool",
+            Self::Block => "block",
+        }
+    }
+
+    /// Value of `bpmn_service_invocations.implementation_kind`. That column was
+    /// added with a CHECK that admits only `flow` and `addon_tool`, and the
+    /// table cannot be rebuilt cheaply; a block is therefore recorded as `flow`
+    /// and told apart by the `block:` prefix of the row's `flow_id`. Only the
+    /// addon-tool recovery scan reads the column.
+    pub fn invocation_column(self) -> &'static str {
+        match self {
+            Self::AddonTool => "addon_tool",
+            Self::Flow | Self::Block => "flow",
         }
     }
 }
@@ -3009,5 +3043,76 @@ mod tests {
         assert_eq!(parse_tool_source_ref("2f0c8f64-0000"), None);
         assert_eq!(ServiceImplementationKind::AddonTool.as_str(), "addon_tool");
         assert_eq!(ServiceImplementationKind::default().as_str(), "flow");
+    }
+
+    fn block_service_task(config: serde_json::Value) -> ProcessNodeKind {
+        ProcessNodeKind::ServiceTask {
+            flow_id: String::new(),
+            input_mapping: [("payload".to_owned(), "vars.text".to_owned())].into(),
+            output_mapping: BTreeMap::new(),
+            verification: ActivityVerification::Human,
+            timeout_seconds: 30,
+            result_expression: None,
+            implementation: ServiceImplementation::Block {
+                node_type: "llm".into(),
+                config,
+            },
+        }
+    }
+
+    #[test]
+    fn block_service_task_round_trips_through_json_and_cbor() {
+        let task = block_service_task(serde_json::json!({"model": "m", "max_tokens": 64}));
+        let json = serde_json::to_value(&task).unwrap();
+        assert_eq!(
+            json["ServiceTask"]["implementation"],
+            serde_json::json!({"Block": {"node_type": "llm", "config": {"max_tokens": 64, "model": "m"}}})
+        );
+        assert_eq!(serde_json::from_value::<ProcessNodeKind>(json).unwrap(), task);
+        assert_eq!(
+            crate::cbor::decode::<ProcessNodeKind>(&crate::cbor::encode(&task).unwrap()).unwrap(),
+            task
+        );
+        assert!(serde_json::from_value::<ServiceImplementation>(serde_json::json!(
+            {"Block": {"node_type": "llm", "config": {}, "extra": 1}})).is_err());
+    }
+
+    /// Adding the `Block` variant must not move a single byte of the variants
+    /// that were already published: a tool task keeps the exact text it had.
+    #[test]
+    fn addon_tool_service_task_keeps_its_published_bytes() {
+        let task = ProcessNodeKind::ServiceTask {
+            flow_id: String::new(),
+            input_mapping: BTreeMap::new(),
+            output_mapping: BTreeMap::new(),
+            verification: ActivityVerification::Human,
+            timeout_seconds: 30,
+            result_expression: None,
+            implementation: ServiceImplementation::AddonTool {
+                addon_id: "notes-1".into(),
+                tool_name: "search".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&task).unwrap(),
+            r#"{"ServiceTask":{"flow_id":"","input_mapping":{},"output_mapping":{},"verification":"Human","timeout_seconds":30,"implementation":{"AddonTool":{"addon_id":"notes-1","tool_name":"search"}}}}"#
+        );
+    }
+
+    #[test]
+    fn block_reference_is_distinct_and_recorded_as_a_flow_row() {
+        let block = ServiceImplementation::Block {
+            node_type: "llm".into(),
+            config: serde_json::json!({}),
+        };
+        assert_eq!(block.source_ref("ignored"), "block:llm");
+        assert_eq!(parse_block_source_ref("block:llm"), Some("llm"));
+        assert_eq!(parse_block_source_ref("tool:a/t"), None);
+        assert_eq!(parse_tool_source_ref("block:llm"), None);
+        assert_eq!(block.kind(), ServiceImplementationKind::Block);
+        assert_eq!(ServiceImplementationKind::Block.as_str(), "block");
+        assert_eq!(ServiceImplementationKind::Block.invocation_column(), "flow");
+        assert_eq!(ServiceImplementationKind::AddonTool.invocation_column(), "addon_tool");
+        assert_eq!(ServiceImplementationKind::Flow.invocation_column(), "flow");
     }
 }

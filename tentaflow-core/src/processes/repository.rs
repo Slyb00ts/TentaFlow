@@ -2970,6 +2970,21 @@ fn require_source_current(
         )
         .optional()?
         .ok_or(ProcessAuthorityDenied("process actor is inactive"))?;
+    if let Some(node_type) = tentaflow_protocol::processes::parse_block_source_ref(flow_id) {
+        // A block has no row to look up: it is current while it is still on the
+        // allow-list, and (at publication) while the pin is exactly the graph
+        // built for it.
+        if super::blocks::allowed_block(node_type).is_none() {
+            return Err(ProcessAuthorityDenied("source block is no longer allowed").into());
+        }
+        if let Some(snapshot) = expected {
+            ensure!(
+                super::blocks::pinned_block_type(&snapshot.graph_json)? == node_type,
+                "source block pin does not match its reference"
+            );
+        }
+        return Ok(());
+    }
     if let Some((addon_id, tool_name)) = tentaflow_protocol::processes::parse_tool_source_ref(flow_id) {
         let bundle_hash: String = conn
             .query_row(
@@ -4314,8 +4329,15 @@ pub fn publish_definition(
         let service_node = super::model::all_nodes(&prepared_model).into_iter()
             .find(|node| node.id == snapshot.info.node_id)
             .context("pinned service task missing")?;
-        let tentaflow_protocol::processes::ProcessNodeKind::ServiceTask { result_expression, .. } = &service_node.kind
+        let tentaflow_protocol::processes::ProcessNodeKind::ServiceTask { result_expression, implementation, .. } = &service_node.kind
         else { bail!("pinned node is not a service task"); };
+        if let tentaflow_protocol::processes::ServiceImplementation::Block { node_type, config } = implementation {
+            // The pin must be the graph of THIS task's block, not any valid block graph.
+            ensure!(
+                snapshot.graph_json == super::blocks::block_pin(node_type, config)?.0,
+                "block snapshot does not match service task"
+            );
+        }
         if snapshot.implementation_kind.is_flow() {
             crate::flow_engine::node_adapters::activity_result::validate_process_result_binding(
                 &snapshot.graph_json, result_expression.as_deref())?;
@@ -21204,7 +21226,7 @@ fn apply_plan_on(
                 job.node_id,job.token_id,definition_id,version,selected_process_id,
                 model_sha256,source_ref,pins[0].info.graph_sha256,
                 hex::encode(Sha256::digest(input_json.as_bytes())),at_ms,
-                implementation.kind().as_str()])?;
+                implementation.kind().invocation_column()])?;
     }
     for token_id in &plan.consume_token_ids {
         let mut statement=tx.prepare("SELECT user_task_id FROM bpmn_user_tasks WHERE instance_id=?1 AND token_id=?2 AND status='open'")?;
@@ -24250,7 +24272,7 @@ fn defer_queued_on(
     let first_at = first.unwrap_or(now_ms);
     if now_ms - first_at >= DEFER_DEADLINE_MS {
         fail_queued_job_on(tx, job_id, instance_id, scope_id, node_id, code,
-            "the addon tool stayed unavailable for too long before the task could start", now_ms)?;
+            "the task source stayed unavailable for too long before the task could start", now_ms)?;
         return Ok(DeferOutcome::Expired);
     }
     let not_before = now_ms + defer_backoff_ms(count);

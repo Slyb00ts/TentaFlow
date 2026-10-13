@@ -9,7 +9,7 @@ use tentaflow_protocol::processes::{
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth};
 
 use super::HandlerContext;
-use crate::flow_engine::dispatcher::FlowDispatcher;
+use crate::flow_engine::dispatcher::{DispatchError, FlowDispatcher};
 use crate::processes::{bpmn, repository, runtime, simulation};
 use repository::{CommandStamp, PinnedServiceSnapshot, ProcessActor};
 
@@ -241,6 +241,14 @@ pub(crate) fn pin_service_snapshots(
                 .snapshot_process_tool(addon_id, tool_name, &actor.user_id, &actor.org_id)
                 .map_err(|error| {
                     ProtocolError::new(ProtocolErrorCode::PolicyDenied, error.to_string())
+                })?,
+            ServiceImplementation::Block { node_type, config } => executor
+                .snapshot_process_block(node_type, config, &actor.user_id, &actor.org_id)
+                .map_err(|error| match error {
+                    DispatchError::Denied { .. } => {
+                        ProtocolError::new(ProtocolErrorCode::PolicyDenied, error.to_string())
+                    }
+                    other => ProtocolError::bad_request(other.to_string()),
                 })?,
         };
         snapshots.push(PinnedServiceSnapshot {

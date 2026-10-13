@@ -1943,6 +1943,39 @@ test('service inspector configures an addon tool and switches back to a flow', a
   graph.destroy(); config.destroy(); readonly.destroy();
 });
 
+test('service inspector configures a block, keeps invalid settings out of the model and switches away', async () => {
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
+  const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
+  await flush(2);
+  change(config.root.querySelector('[data-process="implementation"]'), 'block');
+  await flush(2);
+  assert.deepEqual(node.config.implementation, { Block: { nodeType: 'llm', config: {} } });
+  assert.equal(node.config.flowId, '');
+  assert.equal(config.root.querySelector('[data-process="flowId"]'), null);
+  assert.equal(config.root.querySelector('[data-process="blockType"]').value, 'llm');
+  change(config.root.querySelector('[data-process="blockType"]'), 'pii_filter');
+  assert.equal(node.config.implementation.Block.nodeType, 'pii_filter');
+  change(config.root.querySelector('[data-process="blockConfig"]'), '{"model":"m","max_tokens":64}');
+  assert.deepEqual(node.config.implementation.Block.config, { model: 'm', max_tokens: 64 });
+  assert.equal(config.root.querySelector('[data-block-config-error]').hidden, true);
+  // Text that is not a JSON object is reported and never reaches the model.
+  for (const invalid of ['{', '[]', '7', 'null']) {
+    change(config.root.querySelector('[data-process="blockConfig"]'), invalid);
+    assert.equal(config.root.querySelector('[data-block-config-error]').hidden, false, invalid);
+    assert.deepEqual(node.config.implementation.Block.config, { model: 'm', max_tokens: 64 }, invalid);
+  }
+  const saved = canvasToProcess(graph.processModel, graph.nodes, graph.edges, () => []);
+  assert.deepEqual(saved.nodes.find((row) => row.id === node.id).kind.ServiceTask.implementation,
+    { Block: { nodeType: 'pii_filter', config: { model: 'm', max_tokens: 64 } } });
+  const readonly = inspector(graph, true); readonly.show(node, graph.templates.get(node.type));
+  assert.ok(readonly.root.querySelector('[data-process="blockType"]').hasAttribute('disabled'));
+  change(config.root.querySelector('[data-process="implementation"]'), 'flow');
+  await flush(2);
+  assert.equal(node.config.implementation, 'Flow');
+  assert.equal(config.root.querySelector('[data-process="blockType"]'), null);
+  graph.destroy(); config.destroy(); readonly.destroy();
+});
+
 test('activity IO inspector authors ordered inputs, outputs, associations and repetition coordinator', () => {
   const model = emptyProcessModel();
   model.variables = { mapped: null };

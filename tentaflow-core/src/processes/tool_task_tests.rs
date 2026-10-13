@@ -19,7 +19,7 @@ use super::tool_host::ToolAccessError;
 const ADDON: &str = "notes-1a2b3c4d";
 const TOOL: &str = "search";
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
@@ -68,7 +68,7 @@ fn fixture_with(host: &Arc<ScriptedToolHost>) -> Fixture {
     fixture
 }
 
-fn job_of(fixture: &Fixture, instance_id: &str, job_id: &str) -> repository::ProcessJob {
+pub(super) fn job_of(fixture: &Fixture, instance_id: &str, job_id: &str) -> repository::ProcessJob {
     repository::runtime_snapshot(&fixture.db, &fixture.owner, instance_id)
         .unwrap()
         .jobs
@@ -77,7 +77,7 @@ fn job_of(fixture: &Fixture, instance_id: &str, job_id: &str) -> repository::Pro
         .expect("job is part of the instance")
 }
 
-async fn run(fixture: &Fixture, worker: &str) -> repository::ClaimedProcessJob {
+pub(super) async fn run(fixture: &Fixture, worker: &str) -> repository::ClaimedProcessJob {
     let claimed = repository::claim_job(&fixture.db, worker, now_ms())
         .unwrap()
         .expect("claim the queued tool task");
@@ -93,7 +93,7 @@ async fn run(fixture: &Fixture, worker: &str) -> repository::ClaimedProcessJob {
     claimed
 }
 
-fn invocation(fixture: &Fixture, job_id: &str) -> (String, String, String) {
+pub(super) fn invocation(fixture: &Fixture, job_id: &str) -> (String, String, String) {
     fixture
         .db
         .read()
@@ -494,7 +494,7 @@ async fn disabling_the_addon_before_the_claim_stops_the_task_before_any_call() {
     assert_eq!(current.incidents[0].code, "SOURCE_ACCESS_REVOKED");
 }
 
-fn with_implementation(flow_id: &str, implementation: ServiceImplementation) -> ProcessModel {
+pub(super) fn with_implementation(flow_id: &str, implementation: ServiceImplementation) -> ProcessModel {
     let mut model = tool_model(10, None);
     let node = model
         .nodes

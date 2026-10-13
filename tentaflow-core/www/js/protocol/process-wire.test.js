@@ -235,6 +235,26 @@ test('service task implementation is sent only for tools and a Flow task keeps i
     /requires an addon id and a tool name/);
 });
 
+test('block service task sends its settings as authored and reads them back unchanged', { skip }, () => {
+  const task = (implementation) => ({ id: 'Service_1', name: 'Block', kind: { ServiceTask: {
+    flowId: '', inputMapping: { payload: 'vars.text' }, outputMapping: {}, verification: 'Human',
+    timeoutSeconds: 60, implementation } } });
+  const payload = (node) => ({ commandId: 'cmd', definitionId: null, expectedRevision: 0, name: 'Block',
+    description: '', model: { schemaVersion: 1, processId: 'P_1', variables: {}, nodes: [node],
+      sequenceFlows: [], diagram: { shapes: [], edges: [] } } });
+  const encode = (node) => codec.encode.processDefinitionSaveRequest(17, payload(node));
+  const config = { model: 'm', max_tokens: 64, system_prompt: 'Be brief', stop: ['x'] };
+  const decoded = request('processDefinitionSaveRequest', payload(task({ Block: { nodeType: 'llm', config } })));
+  // Snake-case keys inside the settings are the block's own and must not be camel-cased on the way back.
+  assert.deepEqual(decoded.model.nodes[0].kind.ServiceTask.implementation,
+    { Block: { nodeType: 'llm', config } });
+  assert.throws(() => encode(task({ Block: { nodeType: 'llm', config, extra: 1 } })), /unsupported block field/);
+  assert.throws(() => encode(task({ Block: { nodeType: 'llm', config: [] } })), /node type and a configuration object/);
+  assert.throws(() => encode(task({ Block: { config } })), /node type and a configuration object/);
+  assert.throws(() => encode(task({ Block: { nodeType: 'llm', config }, AddonTool: { addonId: 'a', toolName: 't' } })),
+    /unsupported service implementation/);
+});
+
 test('embedded subprocess wire preserves nested graph and opaque local variable keys', { skip }, () => {
   const body = { nodes: [
     { id: 'Child_Start', name: 'Enter', kind: 'Start' },

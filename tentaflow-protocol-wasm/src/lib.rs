@@ -13111,7 +13111,16 @@ fn process_json_to_js(value: &serde_json::Value, opaque: bool) -> JsValue {
             for (key, value) in values {
                 let dynamic = matches!(
                     key.as_str(),
-                    "variables" | "outputs" | "data" | "payload" | "value" | "input_mapping" | "output_mapping"
+                    "variables"
+                        | "outputs"
+                        | "data"
+                        | "payload"
+                        | "value"
+                        | "input_mapping"
+                        | "output_mapping"
+                        // A block's own settings (`max_tokens`, ...) are keys of the
+                        // block, not fields of the protocol.
+                        | "config"
                 );
                 let out_key = if opaque {
                     key.clone()
@@ -26365,6 +26374,41 @@ mod process_wire_tests {
             output_mapping: std::collections::BTreeMap::from([("business_key".into(), "outputs".into())]),
         });
         assert_eq!(model.variables["business_key"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn process_request_encoder_keeps_block_settings_as_authored() {
+        use tentaflow_protocol::processes::{
+            ProcessNodeKind, ProcessPayload, ServiceImplementation,
+        };
+
+        let fields = serde_json::json!({
+            "command_id":"cmd","definition_id":null,"expected_revision":0,
+            "name":"Block","description":"",
+            "model":{"schema_version":1,"process_id":"P_1",
+                "nodes":[{"id":"Service_1","name":"Block","kind":{"ServiceTask":{
+                    "flow_id":"","input_mapping":{"payload":"vars.text"},"output_mapping":{},
+                    "verification":"Human","timeout_seconds":30,
+                    "implementation":{"Block":{"node_type":"llm",
+                        "config":{"model":"m","max_tokens":64,"system_prompt":"Be brief"}}}}}}],
+                "sequence_flows":[],"variables":{},
+                "diagram":{"shapes":[],"edges":[]}}
+        });
+        let bytes = encode_process_request("DefinitionSaveRequest".into(), fields.to_string()).unwrap();
+        let body: MessageBody = tentaflow_protocol::cbor::decode(&bytes).unwrap();
+        let MessageBody::ProcessBody(ProcessPayload::DefinitionSaveRequest { model, .. }) = body else {
+            panic!("typed process save request expected");
+        };
+        let ProcessNodeKind::ServiceTask { implementation, .. } = &model.nodes[0].kind else {
+            panic!("service task expected");
+        };
+        assert_eq!(
+            implementation,
+            &ServiceImplementation::Block {
+                node_type: "llm".into(),
+                config: serde_json::json!({"model":"m","max_tokens":64,"system_prompt":"Be brief"}),
+            }
+        );
     }
 
     #[test]

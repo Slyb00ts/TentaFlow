@@ -1,5 +1,6 @@
 // ============ File: processes/mod.rs — BPMN B1 process validation, persistence, XML, and execution ============
 
+pub mod blocks;
 pub mod bpmn;
 pub mod calendar;
 pub mod jobs;
@@ -67,3 +68,5 @@ mod repetition_boundary_tests;
 mod simulation_tests;
 #[cfg(test)]
 mod tool_task_tests;
+#[cfg(test)]
+mod block_task_tests;

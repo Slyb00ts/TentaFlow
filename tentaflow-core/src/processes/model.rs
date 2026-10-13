@@ -1360,10 +1360,16 @@ fn validate_body<'a>(
                 match implementation {
                     ServiceImplementation::Flow => {
                         ensure!(!flow_id.is_empty(), "service task {} lacks a flow", node.id);
-                        // `tool:` is the reserved prefix of an addon tool reference.
+                        // `tool:` and `block:` are the reserved prefixes of the
+                        // other implementations' references.
                         ensure!(
                             !flow_id.starts_with("tool:"),
                             "service task {} names a flow with a reserved tool: prefix",
+                            node.id
+                        );
+                        ensure!(
+                            !flow_id.starts_with("block:"),
+                            "service task {} names a flow with a reserved block: prefix",
                             node.id
                         );
                     }
@@ -1375,6 +1381,20 @@ fn validate_body<'a>(
                         );
                         validate_tool_identifier(addon_id, "addon id", &node.id)?;
                         validate_tool_identifier(tool_name, "tool name", &node.id)?;
+                    }
+                    ServiceImplementation::Block { node_type, config } => {
+                        ensure!(
+                            flow_id.is_empty(),
+                            "service task {} runs a block and must not name a flow",
+                            node.id
+                        );
+                        super::blocks::validate_block(node_type, config)
+                            .map_err(|error| anyhow::anyhow!("service task {}: {error}", node.id))?;
+                        ensure!(
+                            input_mapping.contains_key("payload"),
+                            "service task {} runs a block and must map its payload",
+                            node.id
+                        );
                     }
                 }
                 ensure!(

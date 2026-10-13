@@ -2509,6 +2509,7 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                 "implementation",
                 "addonId",
                 "toolName",
+                "nodeType",
                 "timeoutSeconds",
                 "verification",
             ])?;
@@ -2517,6 +2518,7 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                 (TF, "outputMapping"),
                 (TF, "condition"),
                 (TF, "resultExpression"),
+                (TF, "blockConfig"),
             ])?;
             let result_expression = service
                 .child(TF, "resultExpression")?
@@ -2555,15 +2557,44 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
             let (flow_id, implementation) = match service.attr("implementation").unwrap_or("flow") {
                 "flow" => {
                     ensure!(
-                        service.attr("addonId").is_none() && service.attr("toolName").is_none(),
-                        "flow service cannot name an addon tool"
+                        service.attr("addonId").is_none()
+                            && service.attr("toolName").is_none()
+                            && service.attr("nodeType").is_none()
+                            && service.child(TF, "blockConfig")?.is_none(),
+                        "flow service cannot name an addon tool or a block"
                     );
                     (service.required("flowId")?, ServiceImplementation::Flow)
                 }
+                "block" => {
+                    ensure!(
+                        service.attr("flowId").is_none()
+                            && service.attr("addonId").is_none()
+                            && service.attr("toolName").is_none(),
+                        "block service cannot name a flow or an addon tool"
+                    );
+                    let config = match service.child(TF, "blockConfig")? {
+                        None => serde_json::json!({}),
+                        Some(config) => {
+                            config.attrs_only(&[])?;
+                            ensure!(config.children.is_empty(), "block configuration must be text");
+                            serde_json::from_str(config.text.trim())
+                                .context("block configuration is not valid JSON")?
+                        }
+                    };
+                    (
+                        String::new(),
+                        ServiceImplementation::Block {
+                            node_type: service.required("nodeType")?,
+                            config,
+                        },
+                    )
+                }
                 "tool" => {
                     ensure!(
-                        service.attr("flowId").is_none(),
-                        "tool service cannot name a flow"
+                        service.attr("flowId").is_none()
+                            && service.attr("nodeType").is_none()
+                            && service.child(TF, "blockConfig")?.is_none(),
+                        "tool service cannot name a flow or a block"
                     );
                     (
                         String::new(),
@@ -4660,6 +4691,10 @@ fn write_graph(
                         escaped(addon_id),
                         escaped(tool_name)
                     ),
+                    ServiceImplementation::Block { node_type, .. } => format!(
+                        "implementation=\"block\" nodeType=\"{}\"",
+                        escaped(node_type)
+                    ),
                 };
                 xml.push_str(&format!("><bpmn:extensionElements><tentaflow:service {source} timeoutSeconds=\"{timeout_seconds}\" verification=\"{verify}\">"));
                 if !input_mapping.is_empty() {
@@ -4684,6 +4719,12 @@ fn write_graph(
                     xml.push_str(&format!(
                         "<tentaflow:resultExpression>{}</tentaflow:resultExpression>",
                         escaped(expression)
+                    ));
+                }
+                if let ServiceImplementation::Block { config, .. } = implementation {
+                    xml.push_str(&format!(
+                        "<tentaflow:blockConfig>{}</tentaflow:blockConfig>",
+                        escaped(&serde_json::to_string(&super::repository::canonical_json_value(config))?)
                     ));
                 }
                 xml.push_str("</tentaflow:service>");

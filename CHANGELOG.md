@@ -37,6 +37,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   kolumnę `implementation_kind`. Eksport XML: `<tentaflow:service
   implementation="tool" addonId toolName>`; inspektor ma wybór implementacji
   (przepływ albo narzędzie addonu).
+- Zadanie usługi może uruchomić pojedynczy blok Flow Buildera (B3.2):
+  `implementation` dostaje wariant `Block { node_type, config }`. Serwer ma stałą
+  listę dozwolonych bloków (`llm`, `embeddings`, `pii_filter`) i ścisły zestaw
+  ustawień każdego z nich; `stt`, `tts` i `reranker` nie są na liście, bo ich
+  porty niosą dźwięk albo JSON, którego proces nie ma jak podać ani odczytać.
+  Publikacja przypina deterministyczny graf `trigger → blok → output` (JSON z
+  posortowanymi kluczami i jego SHA-256) bez wiersza w `flows`, więc późniejsza
+  zmiana kodu bloku nie zmienia przypięcia, a przypięcie musi być dokładnie grafem
+  bloku z modelu. Blok działa jako osoba, która uruchomiła instancję (aktywny
+  użytkownik w organizacji), przez `dispatch_pinned_synthetic`; nie zapisuje
+  rekordu wykonania. Do bloku trafia wyłącznie tekst z mapowania `payload`
+  (inny typ kończy się `BLOCK_INPUT_INVALID` przed granicą wysyłki). Błąd odczytu
+  konta nie jest odmową: przed startem odkłada zadanie (`BLOCK_UNAVAILABLE`), a
+  po wyniku nie unieważnia go. Bez migracji: wywołanie bloku zapisuje się jako
+  `flow` z `flow_id = block:<typ>`. Eksport XML: `<tentaflow:service
+  implementation="block" nodeType>` z `<tentaflow:blockConfig>`; inspektor
+  pozwala wybrać blok i wpisać jego ustawienia jako JSON.
 
 ### TentaNas
 

@@ -16,6 +16,7 @@ use super::repository::{
     PinnedServiceRole,
 };
 use super::runtime::{plan_job_result, validate_output};
+use super::blocks::BlockAccessError;
 use super::tool_host::{check_tool_arguments, tool_arguments, ToolAccessError};
 use crate::db::DbPool;
 use crate::flow_engine::dispatcher::{DispatchError, FlowDispatcher, PinnedFlowSnapshot};
@@ -387,6 +388,9 @@ pub async fn execute_claimed(
         ServiceImplementation::AddonTool { addon_id, tool_name } => {
             execute_tool(&job, snapshot, addon_id, tool_name, input_mapping).await
         }
+        ServiceImplementation::Block { node_type, .. } => {
+            execute_block(&job, snapshot, node_type).await
+        }
     }
 }
 
@@ -457,28 +461,126 @@ async fn execute_flow(
         return Ok(());
     }
     let execution = async {
-        match dispatcher.dispatch_pinned_flow(&pinned, envelope, meta).await {
-            Ok(outcome) if outcome.error.is_none() => ExecutionEnd::Observed {
-                result: Box::new(observed_result(
-                    outcome,
-                    job.result_expression,
-                    job.effective,
-                    job.repeat_extra,
-                )),
-                recheck: false,
-            },
-            Ok(outcome) => ExecutionEnd::Failed {
-                code: "FLOW_ERROR",
-                message: outcome
-                    .error
-                    .unwrap_or_else(|| "external effect unconfirmed".to_owned()),
-            },
-            Err(error @ DispatchError::Denied { .. }) => ExecutionEnd::Revoked(error.to_string()),
-            Err(error) => ExecutionEnd::Failed {
-                code: "FLOW_ERROR",
-                message: error.to_string(),
-            },
+        pinned_flow_end(
+            job,
+            dispatcher.dispatch_pinned_flow(&pinned, envelope, meta).await,
+        )
+    };
+    let Some(result) = drive_dispatch(job, &authorize, execution).await? else {
+        return Ok(());
+    };
+    finish_observed(job, &authorize, result)
+}
+
+/// What a pinned graph's dispatch means for the job, whether the graph is a
+/// Flow or a one-block graph.
+fn pinned_flow_end(
+    job: &ServiceJob<'_>,
+    dispatched: std::result::Result<FlowExecutionOutcome, DispatchError>,
+) -> ExecutionEnd {
+    match dispatched {
+        Ok(outcome) if outcome.error.is_none() => ExecutionEnd::Observed {
+            result: Box::new(observed_result(
+                outcome,
+                job.result_expression,
+                job.effective,
+                job.repeat_extra,
+            )),
+            recheck: false,
+        },
+        Ok(outcome) => ExecutionEnd::Failed {
+            code: "FLOW_ERROR",
+            message: outcome
+                .error
+                .unwrap_or_else(|| "external effect unconfirmed".to_owned()),
+        },
+        Err(error @ DispatchError::Denied { .. }) => ExecutionEnd::Revoked(error.to_string()),
+        Err(error) => ExecutionEnd::Failed {
+            code: "FLOW_ERROR",
+            message: error.to_string(),
+        },
+    }
+}
+
+/// Runs one Flow Builder block from the allow-list on the initiator's behalf,
+/// through the pinned one-block graph.
+///
+/// What the block is (type and configuration) is fixed by the publication pin;
+/// the code behind the block is whatever the node runs now, which is why the
+/// pin is a graph and not a code hash. Access is the allow-list plus an active
+/// initiator in the organization, checked before the dispatch boundary and again
+/// around the run. A failed read is "cannot tell", never a revocation: before
+/// the boundary it puts the job off, afterwards it leaves the result to the
+/// in-transaction source check that publishing it performs anyway.
+async fn execute_block(
+    job: &ServiceJob<'_>,
+    snapshot: &repository::PinnedServiceSnapshot,
+    node_type: &str,
+) -> Result<()> {
+    let ServiceJob { pool, dispatcher, worker_id, claimed, cancel, .. } = *job;
+    let (user_id, org_id) = (&claimed.actor.user_id, &claimed.actor.org_id);
+    let pinned = PinnedFlowSnapshot {
+        flow_id: snapshot.info.flow_id.clone(),
+        source_version: snapshot.info.source_version,
+        graph_json: snapshot.graph_json.clone(),
+        graph_sha256: snapshot.info.graph_sha256.clone(),
+    };
+    let pin_matches = super::blocks::pinned_block_type(&pinned.graph_json)
+        .is_ok_and(|pinned_type| pinned_type == node_type);
+    if !pin_matches {
+        return fail_claim(pool, worker_id, claimed, "INVALID_SERVICE_JOB",
+            "the pinned block graph does not match the service task", None);
+    }
+    if let Err(error) = crate::flow_engine::node_adapters::activity_result::validate_process_result_binding(
+        &pinned.graph_json, job.result_expression)
+    {
+        return fail_claim(pool, worker_id, claimed, "INVALID_SERVICE_JOB", error, None);
+    }
+    let authorize = || match dispatcher.authorize_process_block(node_type, user_id, org_id) {
+        Ok(_) | Err(BlockAccessError::Unavailable) => AccessCheck::Allowed,
+        Err(error) => AccessCheck::Revoked(error.to_string()),
+    };
+    let mut meta = match dispatcher.authorize_process_block(node_type, user_id, org_id) {
+        Ok(meta) => meta,
+        // Nothing ran and nothing is wrong with the process: wait (bounded).
+        Err(BlockAccessError::Unavailable) => {
+            repository::defer_job(pool, claimed, worker_id, "BLOCK_UNAVAILABLE", now_ms())?;
+            return Ok(());
         }
+        Err(error) => {
+            return fail_claim(pool, worker_id, claimed, "SOURCE_ACCESS_REVOKED", error, None)
+        }
+    };
+    let payload = match super::blocks::block_payload(&claimed.job.input) {
+        Ok(payload) => payload,
+        Err(error) => {
+            return fail_claim(pool, worker_id, claimed, "BLOCK_INPUT_INVALID", error, None)
+        }
+    };
+    meta.request_id = claimed.request_id.clone();
+    meta.correlation_id = Some(claimed.job.instance_id.clone());
+    meta.cancel_token = cancel.clone();
+    meta.deadline = Some(Instant::now() + job.timeout);
+    let mut envelope = FlowEnvelope::empty();
+    envelope.payload = payload;
+    envelope.variables = claimed
+        .job
+        .input
+        .get("variables")
+        .and_then(Value::as_object)
+        .context("service input variables missing")?
+        .iter()
+        .map(|(key, value)| (key.clone(), FlowValue::Json(value.clone())))
+        .collect();
+
+    if !begin_dispatch(job, None)? {
+        return Ok(());
+    }
+    let execution = async {
+        pinned_flow_end(
+            job,
+            dispatcher.dispatch_pinned_synthetic(&pinned, envelope, meta).await,
+        )
     };
     let Some(result) = drive_dispatch(job, &authorize, execution).await? else {
         return Ok(());
