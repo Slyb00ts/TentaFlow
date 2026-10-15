@@ -706,8 +706,9 @@ async fn run_route(
                             "schema_ref_id": out.schema_ref_id,
                             "deduplicated": out.deduplicated,
                         });
-                        if !out.old_spelling_kept.is_empty() {
-                            body["old_spelling_kept"] = out.old_spelling_kept.into();
+                        if !out.old_spelling_kept.shown.is_empty() {
+                            body["old_spelling_kept"] = out.old_spelling_kept.shown.into();
+                            body["old_spelling_kept_total"] = out.old_spelling_kept.total.into();
                         }
                         body
                     },

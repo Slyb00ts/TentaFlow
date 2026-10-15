@@ -111,7 +111,7 @@ use std::fmt::Write as _;
 
 use super::{
     shorten_path, Budget, Compatibility, CompiledSchema, LimitExceeded, SchemaError, SchemaKindOps,
-    Screened, ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
+    Screened, TextRules, ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
 };
 
 mod idl;
@@ -771,6 +771,10 @@ fn derive(c: &Compiled, allowed: &BTreeSet<String>) -> String {
 pub struct ThriftOps;
 
 impl SchemaKindOps for ThriftOps {
+    fn text_rules(&self) -> TextRules {
+        TextRules::THRIFT
+    }
+
     fn compile_screened(&self, schema_text: Screened<'_>) -> Result<CompiledSchema, SchemaError> {
         let schema_text = schema_text.as_str();
         parse_text(schema_text).map(CompiledSchema::Thrift)

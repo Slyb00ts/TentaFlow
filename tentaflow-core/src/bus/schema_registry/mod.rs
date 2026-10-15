@@ -44,7 +44,7 @@ mod json_schema;
 mod protobuf;
 pub mod registry;
 mod text_guard;
-pub use text_guard::Screened;
+pub use text_guard::{Screened, Spellings, Syntax, TextRules, MAX_LISTED_SPELLINGS};
 mod thrift;
 mod xsd;
 
@@ -347,11 +347,11 @@ pub(super) fn shorten_path(path: &str) -> String {
 /// between registration-time (`compile`, `check_compatibility`,
 /// `derive_subschema`) and publish-time (`validate`) responsibilities.
 pub trait SchemaKindOps: Send + Sync {
-    /// Whether a U+FEFF at the very start of the text is part of the format
-    /// (XML allows a byte-order mark, and its reader strips it). Every other
-    /// kind, and every other position, treats it as hidden content.
-    fn allows_leading_bom(&self) -> bool {
-        false
+    /// How this format's text is screened: whether it may start with a
+    /// byte-order mark and how it writes a character as an escape sequence.
+    /// Text is JSON unless a kind says otherwise.
+    fn text_rules(&self) -> TextRules {
+        TextRules::JSON
     }
 
     /// Parse + compile at registration time. Everything expensive or
@@ -359,7 +359,7 @@ pub trait SchemaKindOps: Send + Sync {
     /// screened for hidden characters (`text_guard`) before any format
     /// parser sees it, so every kind refuses the same set the same way.
     fn compile(&self, schema_text: &str) -> Result<CompiledSchema, SchemaError> {
-        self.compile_screened(text_guard::screen(schema_text, self.allows_leading_bom())?)
+        self.compile_screened(text_guard::screen(schema_text, self.text_rules())?)
     }
 
     /// The kind's own compile. It takes [`Screened`] text, which only
@@ -390,7 +390,7 @@ pub trait SchemaKindOps: Send + Sync {
         allowed: &BTreeSet<String>,
     ) -> Result<String, SchemaError> {
         self.derive_screened(
-            text_guard::screen(schema_text, self.allows_leading_bom())?,
+            text_guard::screen(schema_text, self.text_rules())?,
             allowed,
         )
     }
@@ -420,41 +420,46 @@ pub trait SchemaKindOps: Send + Sync {
 
     /// [`Self::check_compatibility`] that also answers the names and values
     /// (marked as `⟦U+XXXX⟧`) the stored records keep spelled with a refused
-    /// character: empty unless the old text held one AND the comparison with
-    /// it as stored would not have passed. A correction that passes only
-    /// because the characters were removed registers, but data written under
-    /// the old spelling still carries it. A removal that would merge two keys
-    /// of the old text into one is refused: the comparison could not tell them
-    /// apart.
+    /// character: those of the old text, in the positions where data carries a
+    /// name or a value. The compatibility verdict does not decide it: a
+    /// correction that passes because the characters were removed registers,
+    /// but data written under the old spelling still carries it. A removal
+    /// that would merge two keys of the old text into one is refused: the
+    /// comparison could not tell them apart.
     fn check_compatibility_noting(
         &self,
         old_schema_text: &str,
         new_schema_text: &str,
         mode: Compatibility,
-    ) -> Result<Vec<String>, SchemaError> {
-        let bom = self.allows_leading_bom();
-        let new_text = text_guard::screen(new_schema_text, bom)?;
-        if text_guard::find_hidden(old_schema_text, bom).is_none() {
+    ) -> Result<Spellings, SchemaError> {
+        let rules = self.text_rules();
+        let new_text = text_guard::screen(new_schema_text, rules)?;
+        let old = text_guard::reveal(old_schema_text, rules);
+        if text_guard::find_hidden(&old, rules).is_none() {
             self.compare_screened(old_schema_text, new_text, mode)
                 .map_err(text_guard::sanitize_error)?;
-            return Ok(Vec::new());
+            return Ok(Spellings::default());
         }
-        if let Some(key) = text_guard::collapsed_key(old_schema_text, bom) {
+        if let Some(key) = text_guard::collapsed_key(&old, rules) {
             return Err(SchemaError::Incompatible(format!(
                 "the stored previous version has the field '{}' and a field that differs from it only by \
                  invisible characters; they cannot be compared as separate fields",
                 text_guard::sanitize(&key)
             )));
         }
-        let cleaned = text_guard::strip_hidden(old_schema_text, bom);
+        let cleaned = text_guard::strip_hidden(old_schema_text, rules);
         self.compare_screened(&cleaned, new_text, mode)
             .map_err(text_guard::sanitize_error)?;
-        let as_stored = self.compare_screened(old_schema_text, new_text, mode);
-        Ok(if as_stored.is_err() {
-            text_guard::hidden_spellings(old_schema_text, bom)
-        } else {
-            Vec::new()
-        })
+        Ok(text_guard::hidden_spellings(&old, rules))
+    }
+
+    /// The names and values of a stored text that are spelled with a refused
+    /// character, for a registration that compares nothing
+    /// (`Compatibility::None`) but still leaves the records written under them.
+    fn old_spellings(&self, old_schema_text: &str) -> Spellings {
+        let rules = self.text_rules();
+        let old = text_guard::reveal(old_schema_text, rules);
+        text_guard::hidden_spellings(&old, rules)
     }
 
     /// The kind's own comparison; see [`Self::compile_screened`].

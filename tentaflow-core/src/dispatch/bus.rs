@@ -3938,7 +3938,8 @@ async fn schema_register_v1(
         version: outcome.version,
         schema_ref_id: outcome.schema_ref_id,
         deduplicated: outcome.deduplicated,
-        old_spelling_kept: outcome.old_spelling_kept,
+        old_spelling_kept: outcome.old_spelling_kept.shown,
+        old_spelling_kept_total: u32::try_from(outcome.old_spelling_kept.total).unwrap_or(u32::MAX),
     })
 }
 

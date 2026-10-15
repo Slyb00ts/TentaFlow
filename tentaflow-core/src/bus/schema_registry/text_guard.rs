@@ -44,6 +44,20 @@
 // units, not grapheme clusters); a line ends at LF, so in CRLF text the CR is the
 // last column of its line, and a lone CR starts no line.
 //
+// A character can also be named without standing in the text: a string escape
+// (`"pac\u202Ejent"` in JSON, `&#x202E;` in XML, `\xE2\x80\xAE` in a .proto
+// string) reaches the parser's output as the character. The screen therefore also
+// reads the escapes of each format (`Syntax`) and refuses one that decodes to a
+// refused character with the same sentence, pointing at the escape and adding
+// "(written as an escape sequence)". Covered: JSON escapes (JSON Schema, Avro,
+// HL7 profile), numeric character references of an XSD outside comments, CDATA
+// and processing instructions, and byte escapes of a Protobuf string literal
+// decoded as UTF-8. Not covered: Thrift has no escape that can decode to one
+// (its lexer takes only `\\ \" \' \n \r \t`), Protobuf's `\u` is not an escape
+// for its lexer, an entity declared in a DTD (the XSD reader refuses DOCTYPE),
+// and, deliberately, the Avro escapes `\u0000`-`\u00FF`, which are how Avro writes
+// the bytes of a `bytes` or `fixed` default.
+//
 // A text stored before this screen existed (or applied from a peer, which
 // stores the row as it came) is not rewritten. It fails on its next compile
 // with this same refusal, which the bus reports as the "stored schema cannot be
@@ -57,8 +71,14 @@
 // compile any more, and removing them is exactly what the author's correction
 // does, so a field `pac<U+202E>jent` corrected to `pacjent` is the same field
 // and not a rename.
+// Escapes are written out first (`reveal`), so a stored `"pac\u202Ejent"` is
+// treated like the stored character. `hidden_spellings` lists, independent of the
+// compatibility verdict, the names and values (not titles, descriptions or
+// comments) of that old text that still carry one: the stored records keep them.
 // =============================================================================
 
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::OnceLock;
 
@@ -115,12 +135,353 @@ fn refused_name(c: char) -> Option<&'static str> {
     spans.get(at).filter(|s| s.from <= cp).map(|s| s.name)
 }
 
+/// How a format writes one character in another way. A schema can name a
+/// refused character without the character itself being in the text
+/// (`"pac\u202Ejent"` in JSON, `&#x202E;` in XML, `\xE2\x80\xAE` in a .proto
+/// string), and a parser then hands the decoded name or value on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Syntax {
+    /// JSON text: `\uXXXX` (and surrogate pairs) in strings.
+    Json,
+    /// JSON text of an Avro schema. Avro writes the bytes of a `bytes` or `fixed`
+    /// default as `\u00XX` (`"\u0000"`, `"\u00ff"`), so an escape of a code point up
+    /// to U+00FF is the format's own way to write a byte and is not refused; every
+    /// bidirectional, zero-width and other format character lies above it.
+    Avro,
+    /// XML: numeric character references outside comments, CDATA and
+    /// processing instructions.
+    Xml,
+    /// Protobuf: hex and octal byte escapes and the control letters of a string
+    /// literal, decoded as UTF-8 bytes. `\u` is NOT an escape there: the
+    /// parser's lexer reads it as the letter `u`.
+    Proto,
+    /// Thrift: its lexer accepts only `\\ \" \' \n \r \t`, none of which can
+    /// decode to a refused character.
+    Thrift,
+}
+
+/// What a kind needs `text_guard` to know about its text.
+#[derive(Clone, Copy, Debug)]
+pub struct TextRules {
+    /// Whether a U+FEFF at the very start is part of the format (XML allows a
+    /// byte-order mark and its reader strips it). Every other kind, and every
+    /// other position, treats it as hidden content.
+    pub leading_bom: bool,
+    pub syntax: Syntax,
+}
+
+impl Syntax {
+    fn is_json(self) -> bool {
+        matches!(self, Syntax::Json | Syntax::Avro)
+    }
+}
+
+impl TextRules {
+    pub const AVRO: TextRules = TextRules {
+        leading_bom: false,
+        syntax: Syntax::Avro,
+    };
+    pub const JSON: TextRules = TextRules {
+        leading_bom: false,
+        syntax: Syntax::Json,
+    };
+    pub const XML: TextRules = TextRules {
+        leading_bom: true,
+        syntax: Syntax::Xml,
+    };
+    pub const PROTO: TextRules = TextRules {
+        leading_bom: false,
+        syntax: Syntax::Proto,
+    };
+    pub const THRIFT: TextRules = TextRules {
+        leading_bom: false,
+        syntax: Syntax::Thrift,
+    };
+}
+
+/// A refused character a text writes as an escape: where the escape stands (in
+/// bytes) and what it decodes to.
+struct EscapeHit {
+    start: usize,
+    end: usize,
+    character: char,
+    name: &'static str,
+}
+
+fn hex_value(b: &[u8]) -> Option<u32> {
+    b.iter().try_fold(0u32, |acc, d| {
+        char::from(*d).to_digit(16).map(|v| acc * 16 + v)
+    })
+}
+
+fn refused_hit(start: usize, end: usize, cp: u32, out: &mut Vec<EscapeHit>) {
+    if let Some(c) = char::from_u32(cp) {
+        if let Some(name) = refused_name(c) {
+            out.push(EscapeHit {
+                start,
+                end,
+                character: c,
+                name,
+            });
+        }
+    }
+}
+
+fn json_escapes(text: &str, exempt_below: u32, out: &mut Vec<EscapeHit>) {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        if b.get(i + 1) != Some(&b'u') {
+            i += if b.get(i + 1) == Some(&b'\\') { 2 } else { 1 };
+            continue;
+        }
+        let Some(unit) = b.get(i + 2..i + 6).and_then(hex_value) else {
+            i += 2;
+            continue;
+        };
+        let low = (0xD800..0xDC00)
+            .contains(&unit)
+            .then(|| b.get(i + 6..i + 8).filter(|p| *p == b"\\u"))
+            .flatten()
+            .and_then(|_| b.get(i + 8..i + 12).and_then(hex_value))
+            .filter(|l| (0xDC00..0xE000).contains(l));
+        match low {
+            Some(l) => {
+                refused_hit(
+                    i,
+                    i + 12,
+                    0x10000 + ((unit - 0xD800) << 10) + (l - 0xDC00),
+                    out,
+                );
+                i += 12;
+            }
+            None => {
+                if unit >= exempt_below {
+                    refused_hit(i, i + 6, unit, out);
+                }
+                i += 6;
+            }
+        }
+    }
+}
+
+fn xml_escapes(text: &str, out: &mut Vec<EscapeHit>) {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let Some(rest) = text.get(i..) else {
+            i += 1;
+            continue;
+        };
+        let skip_to = [("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>")]
+            .into_iter()
+            .find(|(open, _)| rest.starts_with(open))
+            .map(|(open, close)| {
+                rest[open.len()..]
+                    .find(close)
+                    .map_or(b.len(), |p| i + open.len() + p + close.len())
+            });
+        if let Some(end) = skip_to {
+            i = end;
+            continue;
+        }
+        if rest.starts_with("&#") {
+            let hex = matches!(b.get(i + 2), Some(b'x' | b'X'));
+            let digits = i + if hex { 3 } else { 2 };
+            let len = b[digits..]
+                .iter()
+                .take(8)
+                .take_while(|d| char::from(**d).is_digit(if hex { 16 } else { 10 }))
+                .count();
+            if len > 0 && b.get(digits + len) == Some(&b';') {
+                let value =
+                    u32::from_str_radix(&text[digits..digits + len], if hex { 16 } else { 10 });
+                if let Ok(cp) = value {
+                    refused_hit(i, digits + len + 1, cp, out);
+                }
+                i = digits + len + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+/// One decoded byte of a .proto string literal and where it was written.
+struct SourceByte {
+    value: u8,
+    start: usize,
+    end: usize,
+    escaped: bool,
+}
+
+fn proto_escapes(text: &str, out: &mut Vec<EscapeHit>) {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let Some(rest) = text.get(i..) else {
+            i += 1;
+            continue;
+        };
+        if rest.starts_with("//") {
+            i += rest.find('\n').map_or(rest.len(), |p| p + 1);
+        } else if rest.starts_with("/*") {
+            i += rest[2..].find("*/").map_or(rest.len(), |p| p + 4);
+        } else if b[i] == b'"' || b[i] == b'\'' {
+            i = proto_literal(text, i, out);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Reads one string literal from its opening quote and reports the refused
+/// characters its escapes decode to; returns where the literal ends.
+fn proto_literal(text: &str, open: usize, out: &mut Vec<EscapeHit>) -> usize {
+    let b = text.as_bytes();
+    let quote = b[open];
+    let mut bytes: Vec<SourceByte> = Vec::new();
+    let mut i = open + 1;
+    while i < b.len() && b[i] != quote && b[i] != b'\n' {
+        if b[i] != b'\\' {
+            let len = text[i..].chars().next().map_or(1, char::len_utf8);
+            bytes.extend(
+                text.as_bytes()[i..i + len]
+                    .iter()
+                    .enumerate()
+                    .map(|(k, v)| SourceByte {
+                        value: *v,
+                        start: i + k,
+                        end: i + k + 1,
+                        escaped: false,
+                    }),
+            );
+            i += len;
+            continue;
+        }
+        let Some(next) = b.get(i + 1).copied() else {
+            return b.len();
+        };
+        let (value, len) = match next {
+            b'a' => (Some(7), 2),
+            b'b' => (Some(8), 2),
+            b'f' => (Some(0x0c), 2),
+            b'n' => (Some(b'\n'), 2),
+            b'r' => (Some(b'\r'), 2),
+            b't' => (Some(b'\t'), 2),
+            b'v' => (Some(0x0b), 2),
+            b'x' => match b.get(i + 2..i + 4).and_then(hex_value) {
+                Some(v) => (Some(v as u8), 4),
+                None => (None, 2),
+            },
+            b'0'..=b'7' => {
+                let digits = b[i + 1..]
+                    .iter()
+                    .take(3)
+                    .take_while(|d| (b'0'..=b'7').contains(d))
+                    .count();
+                let v = b[i + 1..i + 1 + digits]
+                    .iter()
+                    .fold(0u8, |acc, d| (acc << 3).wrapping_add(d - b'0'));
+                (Some(v), 1 + digits)
+            }
+            _ => (
+                None,
+                1 + text[i + 1..].chars().next().map_or(1, char::len_utf8),
+            ),
+        };
+        match value {
+            Some(value) => bytes.push(SourceByte {
+                value,
+                start: i,
+                end: i + len,
+                escaped: true,
+            }),
+            // A backslash before any other character leaves that character.
+            None => {
+                for k in i + 1..i + len {
+                    bytes.push(SourceByte {
+                        value: b[k],
+                        start: k,
+                        end: k + 1,
+                        escaped: false,
+                    });
+                }
+            }
+        }
+        i += len;
+    }
+    let mut at = 0;
+    while at < bytes.len() {
+        let lead = bytes[at].value;
+        let want = match lead {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        let chunk: Vec<u8> = bytes.iter().skip(at).take(want).map(|s| s.value).collect();
+        match std::str::from_utf8(&chunk)
+            .ok()
+            .and_then(|s| s.chars().next())
+        {
+            Some(c) if chunk.len() == want => {
+                let group = &bytes[at..at + want];
+                if group.iter().any(|s| s.escaped) {
+                    refused_hit(group[0].start, group[want - 1].end, c as u32, out);
+                }
+                at += want;
+            }
+            _ => at += 1,
+        }
+    }
+    i + 1
+}
+
+/// Every refused character `text` writes as an escape, in order of appearance.
+fn escape_hits(text: &str, syntax: Syntax) -> Vec<EscapeHit> {
+    let mut out = Vec::new();
+    match syntax {
+        Syntax::Json => json_escapes(text, 0, &mut out),
+        Syntax::Avro => json_escapes(text, 0x100, &mut out),
+        Syntax::Xml => xml_escapes(text, &mut out),
+        Syntax::Proto => proto_escapes(text, &mut out),
+        Syntax::Thrift => {}
+    }
+    out
+}
+
+/// `text` with every escape that decodes to a refused character written out as
+/// that character, so the raw rules (`find_hidden`, `strip_hidden`,
+/// `hidden_spellings`) see what a parser would. Borrowed when there is none.
+pub(super) fn reveal(text: &str, rules: TextRules) -> Cow<'_, str> {
+    let hits = escape_hits(text, rules.syntax);
+    if hits.is_empty() {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    for hit in hits {
+        out.push_str(&text[from..hit.start]);
+        out.push(hit.character);
+        from = hit.end;
+    }
+    out.push_str(&text[from..]);
+    Cow::Owned(out)
+}
+
 /// The first refused character of a text and where it stands.
 pub(super) struct Finding {
     pub(super) character: char,
     pub(super) name: &'static str,
     pub(super) line: usize,
     pub(super) column: usize,
+    /// Written as an escape sequence, not as the character itself.
+    pub(super) escape: bool,
 }
 
 impl Finding {
@@ -138,13 +499,27 @@ impl fmt::Display for Finding {
             self.name,
             self.line,
             self.column
-        )
+        )?;
+        if self.escape {
+            f.write_str(WRITTEN_AS_ESCAPE)?;
+        }
+        Ok(())
     }
 }
 
-/// The first refused character of `text`; `allow_leading_bom` lets a U+FEFF at
-/// the very start pass (XSD only, see the module header).
-pub(super) fn find_hidden(text: &str, allow_leading_bom: bool) -> Option<Finding> {
+/// Follows the position of a finding whose character is written as an escape;
+/// the dashboard recognises it (`schema-windows.js`).
+pub(super) const WRITTEN_AS_ESCAPE: &str = " (written as an escape sequence)";
+
+fn position(text: &str, byte: usize) -> (usize, usize) {
+    let before = &text[..byte];
+    let line = before.matches('\n').count() + 1;
+    let column = before.chars().rev().take_while(|c| *c != '\n').count() + 1;
+    (line, column)
+}
+
+/// The first character of `text` that stands there itself and is refused.
+fn find_raw(text: &str, allow_leading_bom: bool) -> Option<Finding> {
     let mut line = 1usize;
     let mut column = 1usize;
     for (index, c) in text.chars().enumerate() {
@@ -155,6 +530,7 @@ pub(super) fn find_hidden(text: &str, allow_leading_bom: bool) -> Option<Finding
                     name,
                     line,
                     column,
+                    escape: false,
                 });
             }
         }
@@ -166,6 +542,26 @@ pub(super) fn find_hidden(text: &str, allow_leading_bom: bool) -> Option<Finding
         }
     }
     None
+}
+
+/// The first refused character of `text`, written as itself or as an escape,
+/// whichever stands first.
+pub(super) fn find_hidden(text: &str, rules: TextRules) -> Option<Finding> {
+    let raw = find_raw(text, rules.leading_bom);
+    let Some(hit) = escape_hits(text, rules.syntax).into_iter().next() else {
+        return raw;
+    };
+    let (line, column) = position(text, hit.start);
+    match raw {
+        Some(r) if (r.line, r.column) <= (line, column) => Some(r),
+        _ => Some(Finding {
+            character: hit.character,
+            name: hit.name,
+            line,
+            column,
+            escape: true,
+        }),
+    }
 }
 
 /// Schema text that passed the screen. Only [`screen`] makes one, and the
@@ -180,124 +576,325 @@ impl<'a> Screened<'a> {
     }
 }
 
-pub(super) fn screen(text: &str, allow_leading_bom: bool) -> Result<Screened<'_>, SchemaError> {
-    match find_hidden(text, allow_leading_bom) {
+pub(super) fn screen(text: &str, rules: TextRules) -> Result<Screened<'_>, SchemaError> {
+    match find_hidden(text, rules) {
         Some(found) => Err(SchemaError::Invalid(format!("{HIDDEN_CHARACTER} {found}"))),
         None => Ok(Screened(text)),
     }
 }
 
-/// `text` without any character [`find_hidden`] would refuse. A stored version
-/// that holds one is compared against a new one in this form (see
-/// `SchemaKindOps::check_compatibility`).
-pub(super) fn strip_hidden(text: &str, allow_leading_bom: bool) -> String {
-    text.chars()
+/// `text` without any character [`find_hidden`] would refuse, written as itself
+/// or as an escape. A stored version that holds one is compared against a new
+/// one in this form (see `SchemaKindOps::check_compatibility`).
+pub(super) fn strip_hidden(text: &str, rules: TextRules) -> String {
+    reveal(text, rules)
+        .chars()
         .enumerate()
         .filter(|(index, c)| {
-            refused_name(*c).is_none() || (allow_leading_bom && *index == 0 && *c == '\u{FEFF}')
+            refused_name(*c).is_none() || (rules.leading_bom && *index == 0 && *c == '\u{FEFF}')
         })
         .map(|(_, c)| c)
         .collect()
 }
 
-/// The first object key that occurs twice in `text` (a JSON document), or
-/// `None` for a text that is not JSON or has none. serde_json would keep the
-/// last of two equal keys without a word.
-fn duplicate_json_key(text: &str) -> Option<String> {
-    use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
-
-    // The key travels inside serde_json's error text between two control
-    // characters, which a JSON key can only hold escaped.
-    const MARK: &str = "duplicate key \u{1}";
-    struct Probe;
-    struct ProbeVisitor;
-    impl<'de> Visitor<'de> for ProbeVisitor {
-        type Value = Probe;
-        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("any JSON value")
-        }
-        fn visit_bool<E>(self, _: bool) -> Result<Probe, E> {
-            Ok(Probe)
-        }
-        fn visit_i64<E>(self, _: i64) -> Result<Probe, E> {
-            Ok(Probe)
-        }
-        fn visit_u64<E>(self, _: u64) -> Result<Probe, E> {
-            Ok(Probe)
-        }
-        fn visit_f64<E>(self, _: f64) -> Result<Probe, E> {
-            Ok(Probe)
-        }
-        fn visit_str<E>(self, _: &str) -> Result<Probe, E> {
-            Ok(Probe)
-        }
-        fn visit_unit<E>(self) -> Result<Probe, E> {
-            Ok(Probe)
-        }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Probe, A::Error> {
-            while seq.next_element::<Probe>()?.is_some() {}
-            Ok(Probe)
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Probe, A::Error> {
-            let mut seen = std::collections::BTreeSet::new();
-            while let Some(key) = map.next_key::<String>()? {
-                if !seen.insert(key.clone()) {
-                    return Err(de::Error::custom(format!("{MARK}{key}\u{1}")));
-                }
-                map.next_value::<Probe>()?;
+/// A JSON text a parser can read although it holds refused characters: outside
+/// a string literal they are blanks between tokens and are dropped; inside one
+/// they stay, written as `⟦U+XXXX⟧`, so two names that differ only by them stay
+/// two names.
+fn lenient_json(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let (mut in_string, mut escaped) = (false, false);
+    for c in text.chars() {
+        let refused = refused_name(c).is_some();
+        if in_string {
+            if refused {
+                out.push_str(&format!("⟦U+{:04X}⟧", c as u32));
+                continue;
             }
-            Ok(Probe)
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_string = false,
+                _ => {}
+            }
+        } else if refused {
+            continue;
+        } else if c == '"' {
+            in_string = true;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `text` without the `⟦U+XXXX⟧` markers.
+fn unmark(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("⟦U+") {
+        out.push_str(&rest[..at]);
+        match rest[at..].find('⟧') {
+            Some(end) => rest = &rest[at + end + '⟧'.len_utf8()..],
+            None => {
+                out.push_str(&rest[at..]);
+                rest = "";
+            }
         }
     }
-    impl<'de> Deserialize<'de> for Probe {
-        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Probe, D::Error> {
-            d.deserialize_any(ProbeVisitor)
+    out.push_str(rest);
+    out
+}
+
+/// A parsed JSON document that keeps every key of an object, repeated ones too
+/// (serde_json's own map would keep the last without a word).
+enum Node {
+    Object(Vec<(String, Node)>),
+    Array(Vec<Node>),
+    Text(String),
+    Other,
+}
+
+impl<'de> serde::Deserialize<'de> for Node {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Node, D::Error> {
+        use serde::de::{MapAccess, SeqAccess, Visitor};
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Node;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Node, E> {
+                Ok(Node::Other)
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Node, E> {
+                Ok(Node::Other)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Node, E> {
+                Ok(Node::Other)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Node, E> {
+                Ok(Node::Other)
+            }
+            fn visit_unit<E>(self) -> Result<Node, E> {
+                Ok(Node::Other)
+            }
+            fn visit_str<E>(self, s: &str) -> Result<Node, E> {
+                Ok(Node::Text(s.to_string()))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Node, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(Node::Array(items))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Node, A::Error> {
+                let mut pairs = Vec::new();
+                while let Some(pair) = map.next_entry::<String, Node>()? {
+                    pairs.push(pair);
+                }
+                Ok(Node::Object(pairs))
+            }
         }
+        d.deserialize_any(V)
     }
-    let message = serde_json::from_str::<Probe>(text).err()?.to_string();
-    let start = message.find(MARK)? + MARK.len();
-    let len = message[start..].find('\u{1}')?;
-    Some(message[start..start + len].to_string())
+}
+
+fn json_tree(revealed: &str) -> Option<Node> {
+    serde_json::from_str(&lenient_json(revealed)).ok()
+}
+
+fn merged_key(node: &Node) -> Option<String> {
+    match node {
+        Node::Object(pairs) => {
+            let mut spellings: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+            for (key, _) in pairs {
+                spellings.entry(unmark(key)).or_default().insert(key);
+            }
+            // The same spelling twice is a duplicate the text already had; two
+            // spellings of one name are what removing the characters merges.
+            spellings
+                .into_iter()
+                .find(|(_, spelled)| spelled.len() > 1)
+                .map(|(name, _)| name)
+                .or_else(|| pairs.iter().find_map(|(_, value)| merged_key(value)))
+        }
+        Node::Array(items) => items.iter().find_map(merged_key),
+        Node::Text(_) | Node::Other => None,
+    }
 }
 
 /// The key that removing the refused characters of a stored old text would
-/// make a duplicate (`pesel` and `pesel<ZWSP>` becoming one), which the
-/// comparison would read as the last of them without a word. A duplicate the
-/// stored text already had on its own is not this kind and is left alone.
-pub(super) fn collapsed_key(text: &str, allow_leading_bom: bool) -> Option<String> {
-    if duplicate_json_key(text).is_some() {
+/// make a duplicate (`pesel` and `pesel<ZWSP>` in one object becoming one),
+/// which the comparison would read as the last of them without a word. A
+/// duplicate the stored text already had on its own is not this kind and is
+/// left alone, and so is a text that is not JSON.
+pub(super) fn collapsed_key(revealed: &str, rules: TextRules) -> Option<String> {
+    if !rules.syntax.is_json() {
         return None;
     }
-    duplicate_json_key(&strip_hidden(text, allow_leading_bom))
+    merged_key(&json_tree(revealed)?)
 }
 
-/// The words of `text` that hold a refused character, written with the
-/// `⟦U+XXXX⟧` markers (`pac⟦U+202E⟧jent`): the names and values a stored
-/// record keeps spelled that way. In order of appearance, without repeats.
-pub(super) fn hidden_spellings(text: &str, allow_leading_bom: bool) -> Vec<String> {
-    const LIMIT: usize = 20;
-    let mut out: Vec<String> = Vec::new();
+/// Keys whose string value is prose for a reader and not a name or a value
+/// that data carries.
+const PROSE_KEYS: [&str; 5] = ["title", "description", "doc", "$comment", "example"];
+
+/// Longest name or value a list shows, in characters.
+const SHOWN_CHARS: usize = 120;
+
+/// Most names a list carries; the true count travels beside it.
+pub const MAX_LISTED_SPELLINGS: usize = 20;
+
+/// The names and values a text spells with a refused character.
+#[derive(Debug, Default)]
+pub struct Spellings {
+    /// The first [`MAX_LISTED_SPELLINGS`], in order of appearance, without
+    /// repeats, with every refused character written as `⟦U+XXXX⟧`.
+    pub shown: Vec<String>,
+    /// How many there are in all.
+    pub total: usize,
+}
+
+fn json_spellings(node: &Node, out: &mut Vec<String>) {
+    match node {
+        Node::Object(pairs) => {
+            for (key, value) in pairs {
+                if key.contains("⟦U+") {
+                    out.push(key.clone());
+                }
+                let prose = match value {
+                    Node::Text(_) => PROSE_KEYS.contains(&unmark(key).as_str()),
+                    Node::Array(_) => unmark(key) == "examples",
+                    _ => false,
+                };
+                if !prose {
+                    json_spellings(value, out);
+                }
+            }
+        }
+        Node::Array(items) => items.iter().for_each(|item| json_spellings(item, out)),
+        Node::Text(s) if s.contains("⟦U+") => out.push(s.clone()),
+        Node::Text(_) | Node::Other => {}
+    }
+}
+
+/// The attribute values of an XML text: where a schema names things. Element
+/// text is documentation.
+fn xml_spellings(text: &str, out: &mut Vec<String>) {
+    let b = text.as_bytes();
+    let mut i = 0;
+    let mut in_tag = false;
+    while i < b.len() {
+        let Some(rest) = text.get(i..) else {
+            i += 1;
+            continue;
+        };
+        let skip = [("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>")]
+            .into_iter()
+            .find(|(open, _)| rest.starts_with(open))
+            .map(|(open, close)| {
+                rest[open.len()..]
+                    .find(close)
+                    .map_or(b.len(), |p| i + open.len() + p + close.len())
+            });
+        if let Some(end) = skip.filter(|_| !in_tag) {
+            i = end;
+            continue;
+        }
+        match b[i] {
+            b'<' => in_tag = true,
+            b'>' => in_tag = false,
+            q @ (b'"' | b'\'') if in_tag => {
+                let end = rest[1..].find(char::from(q)).map_or(b.len(), |p| i + 1 + p);
+                let value = &text[i + 1..end];
+                if find_raw(value, false).is_some() {
+                    out.push(sanitize(value));
+                }
+                i = end;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// The identifiers of a .proto or Thrift text: comments and string literals
+/// hold prose and option values.
+fn idl_spellings(text: &str, hash_comments: bool, out: &mut Vec<String>) {
+    let b = text.as_bytes();
     let mut word = String::new();
     let mut flush = |word: &mut String| {
-        if word.chars().any(char::is_alphanumeric) && find_hidden(word, false).is_some() {
-            let shown = sanitize(word);
-            if !out.contains(&shown) && out.len() < LIMIT {
-                out.push(shown);
-            }
+        if word.chars().any(char::is_alphanumeric) && find_raw(word, false).is_some() {
+            out.push(sanitize(word));
         }
         word.clear();
     };
-    for (index, c) in text.chars().enumerate() {
-        let leading_bom = allow_leading_bom && index == 0 && c == '\u{FEFF}';
-        if !leading_bom && (c.is_alphanumeric() || "_-.:$".contains(c) || refused_name(c).is_some())
-        {
-            word.push(c);
-        } else {
+    let mut i = 0;
+    while i < b.len() {
+        let Some(rest) = text.get(i..) else {
+            i += 1;
+            continue;
+        };
+        if rest.starts_with("//") || (hash_comments && b[i] == b'#') {
             flush(&mut word);
+            i += rest.find('\n').map_or(rest.len(), |p| p + 1);
+        } else if rest.starts_with("/*") {
+            flush(&mut word);
+            i += rest[2..].find("*/").map_or(rest.len(), |p| p + 4);
+        } else if b[i] == b'"' || b[i] == b'\'' {
+            flush(&mut word);
+            let mut j = i + 1;
+            while j < b.len() && b[j] != b[i] && b[j] != b'\n' {
+                j += if b[j] == b'\\' { 2 } else { 1 };
+            }
+            i = j + 1;
+        } else {
+            let c = rest.chars().next().unwrap_or(' ');
+            if c.is_alphanumeric() || c == '_' || c == '.' || refused_name(c).is_some() {
+                word.push(c);
+            } else {
+                flush(&mut word);
+            }
+            i += c.len_utf8();
         }
     }
     flush(&mut word);
-    out
+}
+
+/// The names and values of a text, in the positions where a stored record
+/// carries them (field and property names, enum symbols, constant values,
+/// references), that are spelled with a refused character. Titles,
+/// descriptions, comments and string options are not data and are left out.
+/// `revealed` is the text after [`reveal`].
+pub(super) fn hidden_spellings(revealed: &str, rules: TextRules) -> Spellings {
+    let mut all = Vec::new();
+    match rules.syntax {
+        Syntax::Json | Syntax::Avro => {
+            if let Some(tree) = json_tree(revealed) {
+                json_spellings(&tree, &mut all);
+            }
+        }
+        Syntax::Xml => xml_spellings(revealed, &mut all),
+        Syntax::Proto => idl_spellings(revealed, false, &mut all),
+        Syntax::Thrift => idl_spellings(revealed, true, &mut all),
+    }
+    let mut seen = BTreeSet::new();
+    let unique: Vec<String> = all
+        .into_iter()
+        .map(|s| {
+            if s.chars().count() > SHOWN_CHARS {
+                format!("{}…", s.chars().take(SHOWN_CHARS).collect::<String>())
+            } else {
+                s
+            }
+        })
+        .filter(|s| seen.insert(s.clone()))
+        .collect();
+    Spellings {
+        total: unique.len(),
+        shown: unique.into_iter().take(MAX_LISTED_SPELLINGS).collect(),
+    }
 }
 
 /// `detail` with every refused code point written as `⟦U+XXXX⟧` (the marker the
@@ -471,7 +1068,7 @@ mod tests {
     }
 
     fn reject(text: &str) -> Result<(), SchemaError> {
-        screen(text, false).map(|_| ())
+        screen(text, TextRules::JSON).map(|_| ())
     }
 
     fn compile(kind: SchemaType, text: &str) -> Result<(), SchemaError> {
@@ -780,7 +1377,7 @@ mod tests {
     #[test]
     fn columns_count_scalar_values_and_a_crlf_line_ends_at_its_lf() {
         let at = |text: &str| {
-            let found = find_hidden(text, false).unwrap();
+            let found = find_hidden(text, TextRules::JSON).unwrap();
             (found.line, found.column)
         };
         assert_eq!(at("ab\r\nc\u{202E}"), (2, 2));
@@ -886,36 +1483,310 @@ mod tests {
     #[test]
     fn strip_hidden_removes_what_find_hidden_finds_and_keeps_an_allowed_bom() {
         assert_eq!(
-            strip_hidden("a\u{202E}b\u{200B}c\tż😀\r\n", false),
+            strip_hidden("a\u{202E}b\u{200B}c\tż😀\r\n", TextRules::JSON),
             "abc\tż😀\r\n"
         );
-        assert_eq!(strip_hidden("\u{FEFF}a\u{FEFF}", true), "\u{FEFF}a");
-        assert_eq!(strip_hidden("\u{FEFF}a", false), "a");
-        for (text, bom) in [("a\u{2066}\u{E0041}b", false), ("\u{FEFF}x\u{3164}", true)] {
+        assert_eq!(
+            strip_hidden("\u{FEFF}a\u{FEFF}", TextRules::XML),
+            "\u{FEFF}a"
+        );
+        assert_eq!(strip_hidden("\u{FEFF}a", TextRules::JSON), "a");
+        for (text, rules) in [
+            ("a\u{2066}\u{E0041}b", TextRules::JSON),
+            ("\u{FEFF}x\u{3164}", TextRules::XML),
+        ] {
             assert!(
-                find_hidden(&strip_hidden(text, bom), bom).is_none(),
+                find_hidden(&strip_hidden(text, rules), rules).is_none(),
                 "{text:?}"
             );
         }
     }
 
-    #[test]
-    fn collapsed_key_names_a_key_the_removal_would_duplicate_and_only_that() {
-        let merged = "{\"a\":{\"pesel\":1,\"pesel\u{200B}\":2}}";
-        assert_eq!(collapsed_key(merged, false), Some("pesel".to_string()));
-        assert_eq!(collapsed_key("{\"pesel\":1,\"pe\u{200B}sel\":2,\"x\":3}", false), Some("pesel".to_string()));
-        // Distinct after removal, not JSON, or already duplicated as stored.
-        assert_eq!(collapsed_key("{\"pe\u{200B}sel\":1,\"x\":2}", false), None);
-        assert_eq!(collapsed_key("message M { string a\u{200B}b = 1; }", false), None);
-        assert_eq!(collapsed_key("{\"a\":1,\"a\":2,\"b\u{200B}\":1}", false), None);
+    fn merged(text: &str) -> Option<String> {
+        collapsed_key(&reveal(text, TextRules::JSON), TextRules::JSON)
     }
 
     #[test]
-    fn hidden_spellings_lists_each_word_with_a_refused_character_once() {
+    fn collapsed_key_names_a_key_the_removal_would_duplicate_and_only_that() {
+        let merge = "{\"a\":{\"pesel\":1,\"pesel\u{200B}\":2}}";
+        assert_eq!(merged(merge), Some("pesel".to_string()));
         assert_eq!(
-            hidden_spellings("{\"pac\u{202E}jent\":[\"a\u{200B}b\",\"pac\u{202E}jent\",\"ok\"]}", false),
+            merged("{\"pesel\":1,\"pe\u{200B}sel\":2,\"x\":3}"),
+            Some("pesel".to_string())
+        );
+        // Distinct after removal, not JSON, or already duplicated as stored.
+        assert_eq!(merged("{\"pe\u{200B}sel\":1,\"x\":2}"), None);
+        assert_eq!(merged("message M { string a\u{200B}b = 1; }"), None);
+        assert_eq!(merged("{\"a\":1,\"a\":2,\"b\u{200B}\":1}"), None);
+    }
+
+    #[test]
+    fn an_old_duplicate_does_not_hide_a_new_merge_and_is_not_one() {
+        // A duplicate the text already had, and a real merge next to it.
+        assert_eq!(
+            merged("{\"a\":1,\"a\":2,\"pesel\":1,\"pesel\u{200B}\":2}"),
+            Some("pesel".to_string())
+        );
+        // Three spellings of one name: the repeat is old, the other spelling is the merge.
+        assert_eq!(
+            merged("{\"a\":1,\"a\":2,\"a\u{200B}\":3}"),
+            Some("a".to_string())
+        );
+        // The merge sits deeper than the old duplicate.
+        assert_eq!(
+            merged("{\"x\":{\"k\":1,\"k\":2},\"y\":{\"n\":1,\"n\u{2060}\":2}}"),
+            Some("n".to_string())
+        );
+        // A blank character between tokens is not part of any name and must not stop the read
+        // before a duplicate that stands after it (the old reading called that one new).
+        assert_eq!(
+            merged("{\"a\":1\u{200B},\"b\":1,\"b\":2,\"c\u{200B}\":3}"),
+            None
+        );
+        assert_eq!(
+            merged("{\"a\":1 \u{200B}, \"b\":1, \"b\u{200B}\":2}"),
+            Some("b".to_string())
+        );
+    }
+
+    fn spelled(text: &str, rules: TextRules) -> Vec<String> {
+        hidden_spellings(&reveal(text, rules), rules).shown
+    }
+
+    #[test]
+    fn hidden_spellings_lists_each_name_or_value_with_a_refused_character_once() {
+        assert_eq!(
+            spelled(
+                "{\"pac\u{202E}jent\":[\"a\u{200B}b\",\"pac\u{202E}jent\",\"ok\"]}",
+                TextRules::JSON
+            ),
             vec!["pac⟦U+202E⟧jent".to_string(), "a⟦U+200B⟧b".to_string()]
         );
-        assert!(hidden_spellings("\u{FEFF}<xs:schema/>", true).is_empty());
+        assert!(spelled("\u{FEFF}<xs:schema/>", TextRules::XML).is_empty());
+    }
+
+    #[test]
+    fn hidden_spellings_leave_out_prose_and_keep_names_in_every_format() {
+        // JSON: a title or description is read by people, a property or enum value by data.
+        assert_eq!(
+            spelled(
+                "{\"title\":\"a\u{200B}b\",\"description\":\"c\u{200B}d\",\"properties\":{\"p\u{200B}q\":{\"description\":\"x\u{200B}\"}},\"enum\":[\"e\u{200B}f\"]}",
+                TextRules::JSON
+            ),
+            vec!["p⟦U+200B⟧q".to_string(), "e⟦U+200B⟧f".to_string()]
+        );
+        // A property that happens to be called "description" is still a name.
+        assert_eq!(
+            spelled(
+                "{\"properties\":{\"description\":{\"properties\":{\"n\u{200B}m\":{}}}}}",
+                TextRules::JSON
+            ),
+            vec!["n⟦U+200B⟧m".to_string()]
+        );
+        // XSD: attribute values, not documentation or comments.
+        assert_eq!(
+            spelled(
+                "<xs:schema><!-- c\u{200B} --><xs:element name=\"po\u{200B}x\"><xs:annotation><xs:documentation>d\u{200B}</xs:documentation></xs:annotation></xs:element></xs:schema>",
+                TextRules::XML
+            ),
+            vec!["po⟦U+200B⟧x".to_string()]
+        );
+        // Protobuf and Thrift: identifiers, not comments or string options.
+        assert_eq!(
+            spelled(
+                "// c\u{200B}\nmessage M\u{200B} { string a = 1; } option x = \"s\u{200B}\"; /* b\u{200B} */",
+                TextRules::PROTO
+            ),
+            vec!["M⟦U+200B⟧".to_string()]
+        );
+        assert_eq!(
+            spelled(
+                "# c\u{200B}\nstruct S\u{200B} { 1: i32 a = 1 } const string s = \"v\u{200B}\"",
+                TextRules::THRIFT
+            ),
+            vec!["S⟦U+200B⟧".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_list_is_capped_but_the_total_is_true() {
+        let keys: Vec<String> = (0..25).map(|i| format!("\"k{i}\u{200B}\":1")).collect();
+        let text = format!("{{{}}}", keys.join(","));
+        let found = hidden_spellings(&reveal(&text, TextRules::JSON), TextRules::JSON);
+        assert_eq!(found.shown.len(), MAX_LISTED_SPELLINGS);
+        assert_eq!(found.total, 25);
+        assert_eq!(found.shown[0], "k0⟦U+200B⟧");
+    }
+
+    /// One text per format that names a refused character only through an escape,
+    /// the same text without it, and the code point and place the refusal gives.
+    struct Escaped {
+        kind: SchemaType,
+        bad: &'static str,
+        ok: &'static str,
+        code: &'static str,
+        /// The escape itself; the refusal must point at its first character.
+        needle: &'static str,
+    }
+
+    fn escaped_cases() -> Vec<Escaped> {
+        vec![
+            Escaped {
+                kind: SchemaType::JsonSchema,
+                bad: "{\n  \"type\": \"object\",\n  \"properties\": {\"pac\\u202Ejent\": {\"type\": \"string\"}}\n}",
+                ok: "{\n  \"type\": \"object\",\n  \"properties\": {\"pacjent\": {\"type\": \"string\"}}\n}",
+                code: "U+202E",
+                needle: "\\u202E",
+            },
+            Escaped {
+                kind: SchemaType::JsonSchema,
+                bad: "{\"type\":\"object\",\"description\":\"x\\ud83d\\ude00\\udb40\\udc41\"}",
+                ok: "{\"type\":\"object\",\"description\":\"x\\ud83d\\ude00\"}",
+                code: "U+E0041",
+                needle: "\\udb40\\udc41",
+            },
+            Escaped {
+                kind: SchemaType::Avro,
+                bad: "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":\"string\",\"default\":\"\\u200b\"}]}",
+                ok: "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":\"string\",\"default\":\"x\"}]}",
+                code: "U+200B",
+                needle: "\\u200b",
+            },
+            Escaped {
+                kind: SchemaType::Hl7v2Profile,
+                bad: "{\n  \"required_segments\": [\"P\\u200bD\"]\n}",
+                ok: "{\n  \"required_segments\": [\"PID\"]\n}",
+                code: "U+200B",
+                needle: "\\u200b",
+            },
+            Escaped {
+                kind: SchemaType::Xsd,
+                bad: "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\n  <xs:element name=\"po&#x202E;x\" type=\"xs:string\"/>\n</xs:schema>",
+                ok: "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\n  <xs:element name=\"pox\" type=\"xs:string\"/>\n</xs:schema>",
+                code: "U+202E",
+                needle: "&#x202E;",
+            },
+            Escaped {
+                kind: SchemaType::Xsd,
+                bad: "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\n  <xs:element name=\"a\" type=\"xs:string\"><xs:annotation><xs:documentation>x&#8238;y</xs:documentation></xs:annotation></xs:element>\n</xs:schema>",
+                ok: "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\n  <xs:element name=\"a\" type=\"xs:string\"><xs:annotation><xs:documentation>xy</xs:documentation></xs:annotation></xs:element>\n</xs:schema>",
+                code: "U+202E",
+                needle: "&#8238;",
+            },
+            Escaped {
+                kind: SchemaType::Protobuf,
+                bad: "syntax = \"proto3\";\noption java_package = \"a\\xe2\\x80\\xaeb\";\nmessage M { int32 a = 1; }\n",
+                ok: "syntax = \"proto3\";\noption java_package = \"ab\";\nmessage M { int32 a = 1; }\n",
+                code: "U+202E",
+                needle: "\\xe2\\x80\\xae",
+            },
+            Escaped {
+                kind: SchemaType::Protobuf,
+                bad: "syntax = \"proto3\";\noption java_package = \"a\\342\\200\\256b\";\nmessage M { int32 a = 1; }\n",
+                ok: "syntax = \"proto3\";\noption java_package = \"ab\";\nmessage M { int32 a = 1; }\n",
+                code: "U+202E",
+                needle: "\\342\\200\\256",
+            },
+            Escaped {
+                kind: SchemaType::Protobuf,
+                bad: "syntax = \"proto3\";\noption java_package = \"a\\x07b\";\nmessage M { int32 a = 1; }\n",
+                ok: "syntax = \"proto3\";\noption java_package = \"ab\";\nmessage M { int32 a = 1; }\n",
+                code: "U+0007",
+                needle: "\\x07",
+            },
+        ]
+    }
+
+    #[test]
+    fn an_escape_that_decodes_to_a_refused_character_is_refused_in_every_format_that_has_one() {
+        for c in escaped_cases() {
+            assert!(
+                compile(c.kind, c.ok).is_ok(),
+                "{} control text must compile: {:?}",
+                c.kind.as_str(),
+                compile(c.kind, c.ok)
+            );
+            let err = c.kind.ops().compile(c.bad).unwrap_err();
+            let message = err.to_string();
+            let (line, column) = marker_position(&c.bad.replacen(c.needle, &MARK.to_string(), 1));
+            assert!(
+                message.starts_with(&format!("invalid schema: {HIDDEN_CHARACTER} {} (", c.code))
+                    && message.ends_with(&format!(
+                        ") at line {line}, column {column}{WRITTEN_AS_ESCAPE}"
+                    )),
+                "{} {:?}: {message}",
+                c.kind.as_str(),
+                c.bad
+            );
+        }
+    }
+
+    #[test]
+    fn avro_writes_the_bytes_of_a_default_as_escapes_and_those_are_not_refused() {
+        let bytes = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"b\",\"type\":\"bytes\",\"default\":\"\\u0000\\u00ff\\u0085\"}]}";
+        assert!(
+            compile(SchemaType::Avro, bytes).is_ok(),
+            "{:?}",
+            compile(SchemaType::Avro, bytes)
+        );
+        // The same escapes are refused in a format that has no such use for them, and the raw characters everywhere.
+        let json = "{\"type\":\"string\",\"description\":\"\\u0000\"}";
+        assert!(compile(SchemaType::JsonSchema, json).is_err());
+        let raw = bytes.replace("\\u0000", "\u{0}");
+        assert!(compile(SchemaType::Avro, &raw).is_err());
+        // Above the byte range an escape is a character like any other.
+        let wide = bytes.replace("\\u0085", "\\u2066");
+        assert!(compile(SchemaType::Avro, &wide).is_err());
+    }
+
+    #[test]
+    fn a_backslash_that_is_not_an_escape_of_the_format_is_left_alone() {
+        // An escaped backslash before `u202E` is the letters, not the character.
+        assert!(compile(
+            SchemaType::JsonSchema,
+            "{\"type\":\"string\",\"pattern\":\"\\\\u202E\"}"
+        )
+        .is_ok());
+        // A comment is not decoded by any of these formats.
+        assert!(compile(
+            SchemaType::Xsd,
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><!-- &#x202E; --><xs:element name=\"a\" type=\"xs:string\"/></xs:schema>"
+        )
+        .is_ok());
+        assert!(compile(
+            SchemaType::Protobuf,
+            "syntax = \"proto3\";\n// \"\\x07\"\nmessage M { int32 a = 1; }\n"
+        )
+        .is_ok());
+        // Protobuf's lexer reads `\u` as the letter u, so this is not the character.
+        assert!(compile(
+            SchemaType::Protobuf,
+            "syntax = \"proto3\";\noption java_package = \"a\\u202eb\";\nmessage M { int32 a = 1; }\n"
+        )
+        .is_ok());
+        // Thrift has no escape that can decode to one: `\u` is refused as an escape it does not define.
+        let err = compile(
+            SchemaType::Thrift,
+            "namespace rs t\nstruct S { 1: string a = \"\\u202e\" }\n",
+        )
+        .unwrap_err();
+        assert!(!err.to_string().contains(HIDDEN_CHARACTER), "{err}");
+        // Tab, newline and carriage return stay usable as escapes.
+        assert!(compile(
+            SchemaType::Protobuf,
+            "syntax = \"proto3\";\noption java_package = \"a\\tb\\n\\r\";\nmessage M { int32 a = 1; }\n"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_corrected_stored_escape_is_not_a_rename_and_is_listed() {
+        let old = "{\"type\":\"object\",\"properties\":{\"pac\\u202Ejent\":{\"type\":\"string\"}},\"required\":[\"pac\\u202Ejent\"]}";
+        let new = "{\"type\":\"object\",\"properties\":{\"pacjent\":{\"type\":\"string\"}},\"required\":[\"pacjent\"]}";
+        let kept = SchemaType::JsonSchema
+            .ops()
+            .check_compatibility_noting(old, new, Compatibility::Full)
+            .unwrap();
+        assert_eq!(kept.shown, vec!["pac⟦U+202E⟧jent".to_string()]);
     }
 }

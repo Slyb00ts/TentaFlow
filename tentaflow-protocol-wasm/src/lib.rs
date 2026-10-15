@@ -12641,6 +12641,7 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
             schema_ref_id,
             deduplicated,
             old_spelling_kept,
+            old_spelling_kept_total,
         } => {
             set(obj, "variant", "BusSchemaRegisterResponse".into());
             set(obj, "version", (version as f64).into());
@@ -12653,6 +12654,8 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
             }
             set(obj, "oldSpellingKept", kept.clone().into());
             set(obj, "old_spelling_kept", kept.into());
+            set(obj, "oldSpellingKeptTotal", (old_spelling_kept_total as f64).into());
+            set(obj, "old_spelling_kept_total", (old_spelling_kept_total as f64).into());
         }
         BP::SchemaCompatibilitySetRequest { .. } => {
             set(obj, "variant", "BusSchemaCompatibilitySetRequest".into())

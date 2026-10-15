@@ -971,6 +971,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   (inna wersja dostaje samą notkę), Stan topiku ocenia wersję zwróconą przez
   odczyt i nie rzuca alarmu, gdy rodzaj wzoru jest nieznany, a nieudana zmiana
   nazw w zasadach podaje, ile zasad już zmieniono.
+- **„Trojan Source” przez sekwencje ucieczki, lista starej pisowni i okna.**
+  Sprawdzenie odmawia teraz także znaku zapisanego sekwencją: `\uXXXX` (z parami
+  zastępczymi) w JSON Schema, Avro i profilu HL7, odwołania liczbowe
+  `&#x202E;` i `&#8238;` poza komentarzami, CDATA i instrukcjami w XSD, oraz
+  bajty `\xHH` i ósemkowe oraz `\a \b \f \v` w literale Protobuf, składane w
+  UTF-8 (w Protobuf `\u` nie jest sekwencją, parser czyta je jako literę;
+  Thrift przyjmuje tylko `\\ \" \' \n \r \t`, więc nic nie dekoduje się tam do
+  odrzucanego znaku). Komunikat ma to samo zdanie z miejscem sekwencji i
+  dopiskiem „(written as an escape sequence)”; stary zapisany tekst z takim
+  znakiem jest porównywany po jego usunięciu, jak ten z samym znakiem.
+  Zlanie kluczy po usunięciu znaków jest wykrywane także, gdy stary tekst ma już
+  własny duplikat, a biały znak między tokenami nie przerywa odczytu.
+  `old_spelling_kept` nie zależy od wyniku zgodności ani trybu (także `none`),
+  obejmuje tylko nazwy i wartości (nie tytuły, opisy i komentarze), a
+  `old_spelling_kept_total` (append-only, `serde(default)`) podaje prawdziwą
+  liczbę ponad ograniczoną do 20 listę. Okno odmowy pokazuje wiersze z
+  znakiem jako `⟦U+XXXX⟧`; pole „zmień nazwy w zasadach” opisuje oba wyniki
+  (zaznaczone i nie), a to samo zdanie stoi w „Co się stanie po dodaniu” i w
+  komunikacie po zapisie. Komunikat po zmianie nie ginie, gdy czytelnik jest poza
+  stroną wzoru (toast niesie cały tekst).
 
 ## [0.4.0-beta.1] — 2026-09-29
 

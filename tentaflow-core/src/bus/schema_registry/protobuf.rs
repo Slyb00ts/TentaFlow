@@ -156,7 +156,7 @@ use ::protobuf::descriptor::{DescriptorProto, EnumDescriptorProto, FileDescripto
 
 use super::{
     shorten_path, Budget, Compatibility, CompiledSchema, LimitExceeded, SchemaError, SchemaKindOps,
-    Screened, ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
+    Screened, TextRules, ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
 };
 
 mod prescan;
@@ -1681,6 +1681,10 @@ fn derive(c: &Compiled, allowed: &BTreeSet<String>) -> String {
 pub struct ProtobufOps;
 
 impl SchemaKindOps for ProtobufOps {
+    fn text_rules(&self) -> TextRules {
+        TextRules::PROTO
+    }
+
     fn compile_screened(&self, schema_text: Screened<'_>) -> Result<CompiledSchema, SchemaError> {
         let schema_text = schema_text.as_str();
         parse_text(schema_text).map(CompiledSchema::Protobuf)
@@ -3503,14 +3507,14 @@ mod tests {
     #[test]
     fn parser_refusals_never_carry_the_bytes_of_a_literal() {
         // Escapes pass the pre-scan, and the parser decodes them into the value.
-        let text = "syntax = \"proto3\"; option java_multiple_files = \"\\x1b]0;x\\x07\\r\\u202e\"; message M { }";
+        let text = "syntax = \"proto3\"; option java_multiple_files = \"\\x5d0;x\\r\\u202e\"; message M { }";
         let got = refusal(text);
         assert!(got.starts_with("not a valid Protobuf schema"), "{got}");
         assert!(
             got.chars().all(|c| c == ' ' || c.is_ascii_graphic()),
             "{got:?}"
         );
-        assert!(!got.contains("x1b") && !got.contains("]0;x"), "{got:?}");
+        assert!(!got.contains("x5d") && !got.contains("]0;x"), "{got:?}");
         assert_eq!(
             parser_cause("cannot convert value `\u{1b}[2J` to type `bool`"),
             "an option value does not fit the type of that option"

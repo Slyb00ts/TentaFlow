@@ -28,7 +28,7 @@ use crate::db::DbPool;
 
 use super::{
     bump_generation, content_hash, schema_ref_id_for, text_guard, Compatibility, SchemaError,
-    SchemaType, MAX_SCHEMA_TEXT_BYTES,
+    SchemaType, Spellings, TextRules, MAX_SCHEMA_TEXT_BYTES,
 };
 
 /// Longest a subject name may be — mirrors `bus::topics::MAX_TOPIC_NAME_LEN`
@@ -347,7 +347,7 @@ pub struct RegisterOutcome {
     /// Names and values the previous version spelled with a refused character
     /// and the stored records still do (`pac⟦U+202E⟧jent`); see
     /// `SchemaKindOps::check_compatibility_noting`.
-    pub old_spelling_kept: Vec<String>,
+    pub old_spelling_kept: Spellings,
 }
 
 /// The version a topic's `schema_id` binding currently resolves to — the
@@ -582,19 +582,21 @@ pub fn register(
             version: dup.version,
             schema_ref_id: dup.schema_ref_id,
             deduplicated: true,
-            old_spelling_kept: Vec::new(),
+            old_spelling_kept: Spellings::default(),
         });
     }
 
     // Extracted so the `VersionSlotTaken` retry below can re-run the SAME
     // check against a freshly re-read `latest` (review finding #2) instead
     // of duplicating this logic.
-    let old_spelling_kept = std::cell::RefCell::new(Vec::<String>::new());
+    let old_spelling_kept = std::cell::RefCell::new(Spellings::default());
     let check_compat = |latest_row: &DbBusSchemaVersion,
                         effective_compatibility: Compatibility|
      -> Result<(), BusServiceError> {
-        old_spelling_kept.borrow_mut().clear();
+        old_spelling_kept.take();
         if effective_compatibility == Compatibility::None {
+            *old_spelling_kept.borrow_mut() =
+                schema_type.ops().old_spellings(&latest_row.schema_text);
             return Ok(());
         }
         schema_type
@@ -784,7 +786,7 @@ pub fn register(
                     version: dup.version,
                     schema_ref_id: dup.schema_ref_id,
                     deduplicated: true,
-                    old_spelling_kept: Vec::new(),
+                    old_spelling_kept: Spellings::default(),
                 }),
                 None => Err(BusServiceError::Db(
                     "content_hash collision reported but no matching row found".to_string(),
@@ -847,7 +849,7 @@ pub fn register(
                             version: dup.version,
                             schema_ref_id: dup.schema_ref_id,
                             deduplicated: true,
-                            old_spelling_kept: Vec::new(),
+                            old_spelling_kept: Spellings::default(),
                         }),
                         None => Err(BusServiceError::Db(
                             "content_hash collision reported but no matching row found".to_string(),
@@ -944,11 +946,17 @@ pub fn scan_stored_hidden_characters(
         // A version whose subject row is gone (or names a kind this build does
         // not know) has no format to ask: its leading BOM is not reported,
         // because only an XSD may start with one and it cannot be told apart.
-        let allow_bom = row
+        let rules = row
             .schema_type
             .and_then(SchemaType::parse)
-            .is_none_or(|kind| kind.ops().allows_leading_bom());
-        if let Some(hit) = text_guard::find_hidden(row.schema_text, allow_bom) {
+            .map_or(
+                TextRules {
+                    leading_bom: true,
+                    ..TextRules::JSON
+                },
+                |kind| kind.ops().text_rules(),
+            );
+        if let Some(hit) = text_guard::find_hidden(row.schema_text, rules) {
             found.push(StoredHiddenCharacter {
                 instance_id: row.instance_id.to_string(),
                 org_id: row.org_id.to_string(),
@@ -2048,7 +2056,7 @@ mod tests {
             );
             assert!(line_text
                 .chars()
-                .all(|c| text_guard::find_hidden(&c.to_string(), false).is_none()));
+                .all(|c| text_guard::find_hidden(&c.to_string(), TextRules::JSON).is_none()));
         }
     }
 
@@ -2093,7 +2101,7 @@ mod tests {
         assert!(!log.contains("SECRETWORD"));
         assert!(log
             .chars()
-            .all(|c| text_guard::find_hidden(&c.to_string(), false).is_none()));
+            .all(|c| text_guard::find_hidden(&c.to_string(), TextRules::JSON).is_none()));
     }
 
     #[test]
@@ -2118,7 +2126,7 @@ mod tests {
         let out = register_text(&db, "patient", SchemaType::JsonSchema, PATIENT_V2_CLEAN).unwrap();
         assert_eq!(out.version, 2);
         // Stored records keep the old spelling, and the answer says which.
-        assert_eq!(out.old_spelling_kept, vec!["pac⟦U+202E⟧jent".to_string()]);
+        assert_eq!(out.old_spelling_kept.shown, vec!["pac⟦U+202E⟧jent".to_string()]);
         // A real change over the same stored text is still judged, and the
         // refusal does not carry the stored character.
         let db = fresh_db();
@@ -2140,7 +2148,7 @@ mod tests {
         assert!(detail.contains("wiek"), "{detail}");
         assert!(detail
             .chars()
-            .all(|c| text_guard::find_hidden(&c.to_string(), false).is_none()));
+            .all(|c| text_guard::find_hidden(&c.to_string(), TextRules::JSON).is_none()));
     }
 
     fn status_schema(values: &str, keyword: &str) -> String {
@@ -2162,8 +2170,93 @@ mod tests {
                 register_text(&db, "s", SchemaType::JsonSchema, &status_schema(new, keyword))
                     .unwrap();
             assert_eq!(out.version, 2, "{keyword}");
-            assert_eq!(out.old_spelling_kept, vec!["a⟦U+200B⟧b".to_string()], "{keyword}");
+            assert_eq!(out.old_spelling_kept.shown, vec!["a⟦U+200B⟧b".to_string()], "{keyword}");
         }
+    }
+
+    fn register_with(
+        db: &DbPool,
+        subject: &str,
+        kind: SchemaType,
+        text: &str,
+        mode: Compatibility,
+    ) -> Result<RegisterOutcome, BusServiceError> {
+        register(
+            db,
+            "tentabus-00000001",
+            "org-1",
+            subject,
+            kind,
+            text,
+            Some(mode),
+            None,
+        )
+    }
+
+    const AVRO_OLD: &str = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"id\",\"type\":\"string\"},{\"name\":\"pac\u{202E}jent\",\"type\":\"string\",\"default\":\"\"}]}";
+    const AVRO_NEW: &str = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"id\",\"type\":\"string\"},{\"name\":\"pacjent\",\"type\":\"string\",\"default\":\"\"}]}";
+    const OPTIONAL_OLD: &str = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\"},\"pac\u{202E}jent\":{\"type\":\"string\"}},\"required\":[\"a\"]}";
+    const OPTIONAL_NEW: &str = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\"},\"pacjent\":{\"type\":\"string\"}},\"required\":[\"a\"]}";
+
+    #[test]
+    fn a_respelled_field_that_keeps_the_comparison_passing_is_still_reported() {
+        // An optional Avro field with a default and a property that is not required:
+        // both versions pass the check as stored, and the records still carry the old name.
+        const AVRO_FIRST: &str = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"id\",\"type\":\"string\"}]}";
+        for (kind, first, old, new) in [
+            (SchemaType::Avro, AVRO_FIRST, AVRO_OLD, AVRO_NEW),
+            (SchemaType::JsonSchema, V1, OPTIONAL_OLD, OPTIONAL_NEW),
+        ] {
+            for mode in [Compatibility::Backward, Compatibility::Full] {
+                let db = fresh_db();
+                register_with(&db, "s", kind, first, mode).unwrap();
+                plant(&db, "s", old);
+                let out = register_with(&db, "s", kind, new, mode).unwrap();
+                assert_eq!(
+                    out.old_spelling_kept.shown,
+                    vec!["pac⟦U+202E⟧jent".to_string()],
+                    "{} {mode:?}",
+                    kind.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_old_spelling_is_reported_when_the_subject_checks_nothing() {
+        let db = fresh_db();
+        register_with(&db, "s", SchemaType::JsonSchema, V1, Compatibility::None).unwrap();
+        plant(&db, "s", OPTIONAL_OLD);
+        let out =
+            register_with(&db, "s", SchemaType::JsonSchema, OPTIONAL_NEW, Compatibility::None)
+                .unwrap();
+        assert_eq!(out.version, 2);
+        assert_eq!(out.old_spelling_kept.shown, vec!["pac⟦U+202E⟧jent".to_string()]);
+        assert_eq!(out.old_spelling_kept.total, 1);
+    }
+
+    #[test]
+    fn a_title_with_a_hidden_character_is_not_a_spelling_stored_records_keep() {
+        let db = fresh_db();
+        let first = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"id\",\"type\":\"string\"}]}";
+        register_with(&db, "s", SchemaType::Avro, first, Compatibility::Backward).unwrap();
+        plant(
+            &db,
+            "s",
+            &AVRO_NEW.replace("\"name\":\"R\"", "\"name\":\"R\",\"doc\":\"d\u{200B}x\""),
+        );
+        let out = register_with(&db, "s", SchemaType::Avro, AVRO_NEW, Compatibility::Backward)
+            .unwrap();
+        assert!(out.old_spelling_kept.shown.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn a_duplicate_avro_field_name_never_wins_silently() {
+        let db = fresh_db();
+        let twice = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"a\",\"type\":\"string\"},{\"name\":\"a\",\"type\":\"int\"}]}";
+        let err = register_with(&db, "s", SchemaType::Avro, twice, Compatibility::Backward)
+            .unwrap_err();
+        assert!(err.to_string().contains("Duplicate field name a"), "{err}");
     }
 
     #[test]
@@ -2179,7 +2272,7 @@ mod tests {
             &described.replace('\u{200B}', ""),
         )
         .unwrap();
-        assert!(out.old_spelling_kept.is_empty());
+        assert!(out.old_spelling_kept.shown.is_empty());
     }
 
     #[test]

@@ -117,7 +117,7 @@ use regex_automata::{Anchored, Input};
 
 use super::{
     shorten_path, Budget, Compatibility, CompiledSchema, LimitExceeded, SchemaError, SchemaKindOps,
-    Screened, ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
+    Screened, TextRules, ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
 };
 
 const XSD_NS: &str = "http://www.w3.org/2001/XMLSchema";
@@ -4178,8 +4178,8 @@ fn compile_text(schema_text: &str) -> Result<Compiled, SchemaError> {
 }
 
 impl SchemaKindOps for XsdOps {
-    fn allows_leading_bom(&self) -> bool {
-        true
+    fn text_rules(&self) -> TextRules {
+        TextRules::XML
     }
 
     fn compile_screened(&self, schema_text: Screened<'_>) -> Result<CompiledSchema, SchemaError> {
