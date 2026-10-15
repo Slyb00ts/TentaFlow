@@ -11870,15 +11870,21 @@
         "stan_button": "Open the pattern",
         "rules_gone": "Data-hiding rules on {topics} name fields the new version does not have: {fields}. A field its rule does not name is hidden from the readers.",
         "rules_rename": "Also rename, in those rules, the fields that differ only by an invisible character: {pairs}.",
-        "rules_rename_off": "Left unticked, the data-hiding rules stay as they are, so the readers of those topics stop seeing in new messages: {names}.",
-        "rules_rename_on": "Ticked, the rules start to allow {names}, so the readers of those topics see in new messages data that is hidden from them now.",
+        "rules_rename_off": "Left unticked, the rules stay as they are, so the readers of {topicCount|this topic|these topics} will stop seeing the {count|field|fields} {from} in new messages.",
+        "rules_rename_on": "Ticked, the rules will allow the {count|field|fields} {to} instead of {from}, so the readers of {topicCount|this topic|these topics} will keep seeing them in new messages as before.",
         "rules_renamed": "Renamed fields in {count} data-hiding {count|rule|rules}.",
         "rules_rename_failed": "The version was added, but renaming the fields in the data-hiding rules failed: {error}. Fix them in the “Data hiding” section.",
         "rules_rename_partial": "The version was added and the fields were renamed in {count} data-hiding {count|rule|rules}, then renaming failed: {error}. Fix the rest in the “Data hiding” section.",
         "diff_only_removal": "Difference from version {version}: only the invisible characters are removed; fields and requirements are unchanged.",
         "diff_only_removal_names": "Difference from version {version}: only the invisible characters are removed, but they were inside {count} {count|name or value|names or values}: {pairs}.",
         "old_spelling_kept": "Records already written keep the old spelling of {count} {count|name or value|names or values}: {names}.",
-        "old_spelling_kept_maybe": "Records written earlier (if any) keep the old spelling of {count} {count|name or value|names or values}: {names}."
+        "old_spelling_kept_maybe": "Records written earlier (if any) keep the old spelling of {count} {count|name or value|names or values}: {names}.",
+        "place_escape": "{code} ({name}) written as an escape sequence on line {line}, column {column}",
+        "escape_places_line": "Invisible characters written as escape sequences (“Remove invisible characters” does not remove them): {places}.",
+        "preview_title_escape": "Lines to fix (the escape sequence of an invisible character is highlighted):",
+        "rules_renamed_effect": "The rules now allow the {count|field|fields} {to} instead of {from}, so the readers of {topicCount|topic|topics} {topics} keep seeing them in new messages.",
+        "rules_unchanged": "The data-hiding rules were not changed: the readers of {topicCount|topic|topics} {topics} will not see the {count|field|fields} {from} in new messages. You can change that in the “Data hiding” section.",
+        "rules_open": "Data hiding of topic “{topic}”"
       },
       "refused": {
         "hl7_msh": "“{field}” describes the message's own separators, so it cannot be required. Remove “{field}” from the required fields.",
@@ -12011,7 +12017,8 @@
         "at_line": "On line {line}.",
         "at_line_column": "On line {line}, column {column}.",
         "hidden_character": "The pattern contains an invisible character or one that changes the direction of text: {code} ({name}). Such a character makes the pattern look different in an editor from what a program reads (\"Trojan Source\"). The lines that hold one are shown below with the character written as ⟦U+XXXX⟧, because the text box may not show it. Use “Remove invisible characters” or fix those lines by hand and send the pattern again. {cause} {atLine}",
-        "hidden_escape": "The pattern writes an invisible character or one that changes the direction of text as an escape sequence (for example \\u202E): {code} ({name}). “Remove invisible characters” does not remove such a sequence — fix it by hand on the line shown below and send the pattern again. {atLine}"
+        "hidden_escape": "The pattern writes an invisible character or one that changes the direction of text as an escape sequence (for example {example}): {code} ({name}). “Remove invisible characters” does not remove such a sequence — fix it by hand in the highlighted part of the line shown below and send the pattern again. {atLine}",
+        "hidden_also_escape": "Some of them are written as escape sequences (for example {example}); “Remove invisible characters” does not remove those — fix them by hand in the highlighted part."
       }
     },
     "topics": {

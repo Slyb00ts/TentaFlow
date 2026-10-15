@@ -33,7 +33,7 @@ import { drawOverview, pushOverviewSample, CHART_WINDOW_SECS } from '/js/modules
 import { drawSchemas, listText, compatLabel, schemaKind, schemaKindMismatchText, busRefusalText, busRefusalDetail } from '/js/modules/tentabus/schemas.js';
 import { drawSchemaDetail, shareShownText, dismissCopyToast } from '/js/modules/tentabus/schema-detail.js';
 import { judgedSchema } from '/js/modules/tentabus/hidden-notice.js';
-import { addedNotice, keptSpellingsText, noticeToast, renameConsequence, renamedRuleRequest, openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete } from '/js/modules/tentabus/schema-windows.js';
+import { addedNotice, keptSpellingsText, noticeToast, renameOutcome, renamedRuleRequest, openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete } from '/js/modules/tentabus/schema-windows.js';
 import { drawTopics } from '/js/modules/tentabus/topics.js';
 import { openTopicCreator } from '/js/modules/tentabus/topic-creator.js';
 import { openTopicDelete } from '/js/modules/tentabus/topic-delete.js';
@@ -2286,6 +2286,7 @@ const schemaContext = {
     if (!name) return;
     if (action.kind === 'back') setTab('schemas');
     else if (action.kind === 'new-version') openNewVersionWindow(name);
+    else if (action.kind === 'topic-hiding') { setTab('topics'); openTopicDetail(action.topic, 'hiding'); }
     else if (action.kind === 'withdraw') openSchemaWithdrawWindow(name);
     else if (action.kind === 'withdraw-version') openVersionWithdrawWindow(name, action.version);
     else if (action.kind === 'delete') openSchemaDeleteWindow(name);
@@ -2444,9 +2445,15 @@ async function openNewVersionWindow(name) {
       if (ruleRename?.error) {
         const failed = ruleRename.renamed ? T('schemas.hidden.rules_rename_partial', { count: ruleRename.renamed, error: ruleRename.error }) : T('schemas.hidden.rules_rename_failed', { error: ruleRename.error });
         Object.assign(notice, { tone: 'warning', text: `${notice.text} ${failed}`.trim() });
-      } else if (ruleRename?.renamed) notice.text = `${notice.text} ${T('schemas.hidden.rules_renamed', { count: ruleRename.renamed })} ${renameConsequence(ruleRename.fields, true)}`.trim();
-      // The rules were offered a rename and left as they were: what that does to the readers is said, not implied.
-      if (ruleRenameDeclined?.length) notice.text = `${notice.text} ${renameConsequence(ruleRenameDeclined, false)}`.trim();
+      } else if (ruleRename?.renamed) {
+        notice.text = `${notice.text} ${T('schemas.hidden.rules_renamed', { count: ruleRename.renamed })} ${renameOutcome(ruleRename.fields, true).text}`.trim();
+      }
+      // The rules were offered a rename and left as they were: what that did to the readers is said, with a way to the rules.
+      if (ruleRenameDeclined?.length) {
+        const left = renameOutcome(ruleRenameDeclined, false);
+        notice.text = `${notice.text} ${left.text}`.trim();
+        notice.hidingTopics = left.topics;
+      }
       afterSchemaChange(name, notice);
     },
   });

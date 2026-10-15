@@ -10635,15 +10635,21 @@
         "stan_button": "Ouvrir le modèle",
         "rules_gone": "Les règles de masquage des données sur {topics} nomment des champs que la nouvelle version n’a pas : {fields}. Un champ que sa règle ne nomme pas est masqué pour les lecteurs.",
         "rules_rename": "Renommez aussi dans ces règles les champs qui ne diffèrent que par un caractère invisible : {pairs}.",
-        "rules_rename_off": "Case non cochée, les règles de masquage des données restent inchangées : les lecteurs de ces topics cessent de voir dans les nouveaux messages : {names}.",
-        "rules_rename_on": "Case cochée, les règles autorisent {names} : les lecteurs de ces topics verront dans les nouveaux messages des données qui leur sont masquées aujourd'hui.",
+        "rules_rename_off": "Case non cochée, les règles restent inchangées : les lecteurs de {topicCount|ce topic|ces topics} cesseront de voir {count|le champ|les champs} {from} dans les nouveaux messages.",
+        "rules_rename_on": "Case cochée, les règles autoriseront {count|le champ|les champs} {to} au lieu de {from} : les lecteurs de {topicCount|ce topic|ces topics} continueront de les voir dans les nouveaux messages comme avant.",
         "rules_renamed": "Champs renommés dans {count} {count|règle|règles} de masquage des données.",
         "rules_rename_failed": "La version a été ajoutée, mais le renommage des champs dans les règles de masquage des données a échoué : {error}. Corrigez-les dans la section « Masquage des données ».",
         "rules_rename_partial": "La version a été ajoutée et les champs ont été renommés dans {count} {count|règle|règles} de masquage des données, puis le renommage a échoué : {error}. Corrigez le reste dans la section « Masquage des données ».",
         "diff_only_removal": "Différence avec la version {version} : seuls les caractères invisibles sont supprimés ; champs et exigences inchangés.",
         "diff_only_removal_names": "Différence avec la version {version} : seuls les caractères invisibles sont supprimés, mais ils se trouvaient dans {count} {count|nom ou valeur|noms ou valeurs} : {pairs}.",
         "old_spelling_kept": "Les messages déjà écrits gardent l'ancienne graphie de {count} {count|nom ou valeur|noms ou valeurs} : {names}.",
-        "old_spelling_kept_maybe": "Les messages écrits auparavant (s'il y en a) gardent l'ancienne graphie de {count} {count|nom ou valeur|noms ou valeurs} : {names}."
+        "old_spelling_kept_maybe": "Les messages écrits auparavant (s'il y en a) gardent l'ancienne graphie de {count} {count|nom ou valeur|noms ou valeurs} : {names}.",
+        "place_escape": "{code} ({name}) écrit comme séquence d’échappement à la ligne {line}, colonne {column}",
+        "escape_places_line": "Caractères invisibles écrits sous forme de séquence d’échappement (« Supprimer les caractères invisibles » ne les retire pas) : {places}.",
+        "preview_title_escape": "Lignes à corriger (la séquence d’échappement d’un caractère invisible est surlignée) :",
+        "rules_renamed_effect": "Les règles autorisent maintenant {count|le champ|les champs} {to} au lieu de {from} : les lecteurs de {topicCount|topic|topics} {topics} continuent de les voir dans les nouveaux messages.",
+        "rules_unchanged": "Les règles de masquage des données n’ont pas été modifiées : les lecteurs de {topicCount|topic|topics} {topics} ne verront pas {count|le champ|les champs} {from} dans les nouveaux messages. Vous pouvez le changer dans la section « Dissimulation des données ».",
+        "rules_open": "Dissimulation des données du topic « {topic} »"
       },
       "refused": {
         "hl7_msh": "« {field} » décrit les séparateurs du message lui-même et ne peut donc pas être obligatoire. Retirez « {field} » des champs obligatoires.",
@@ -10776,7 +10782,8 @@
         "at_line": "À la ligne {line}.",
         "at_line_column": "À la ligne {line}, colonne {column}.",
         "hidden_character": "Le modèle contient un caractère invisible ou qui change le sens du texte : {code} ({name}). Un tel caractère fait paraître le modèle dans l’éditeur autrement que ce que lit un programme (« Trojan Source »). Les lignes qui en contiennent sont montrées ci-dessous, le caractère écrit ⟦U+XXXX⟧, car la zone de texte peut ne pas l’afficher. Utilisez « Supprimer les caractères invisibles » ou corrigez ces lignes à la main et renvoyez le modèle. {cause} {atLine}",
-        "hidden_escape": "Le modèle écrit un caractère invisible ou qui change le sens du texte sous forme de séquence d’échappement (par exemple \\u202E) : {code} ({name}). « Supprimer les caractères invisibles » ne retire pas une telle séquence : corrigez-la à la main sur la ligne montrée ci-dessous et renvoyez le modèle. {atLine}"
+        "hidden_escape": "Le modèle écrit un caractère invisible ou qui change le sens du texte sous forme de séquence d’échappement (par exemple {example}) : {code} ({name}). « Supprimer les caractères invisibles » ne retire pas une telle séquence : corrigez-la à la main dans la partie surlignée de la ligne montrée ci-dessous et renvoyez le modèle. {atLine}",
+        "hidden_also_escape": "Certains sont écrits sous forme de séquence d’échappement (par exemple {example}) ; « Supprimer les caractères invisibles » ne les retire pas : corrigez-les à la main dans la partie surlignée."
       }
     },
     "topics": {

@@ -16,6 +16,7 @@ import assert from 'node:assert/strict';
 if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Document = window.Document;
 if (typeof globalThis.DOMParser === 'undefined' && window.DOMParser) globalThis.DOMParser = window.DOMParser;
 
+await import('/js/components/tf-alert.js');
 const {
   schemaDescription, displayText, versionState, downloadName, editorLanguage, headerLine, withdrawnText, versionRows,
   drawSchemaDetail, shareShownText, dismissCopyToast, hl7ProfileView, avroFieldsView, protobufFieldsView, thriftFieldsView,
@@ -605,6 +606,28 @@ test('the "topics accept no messages" flag is only for the version topics check 
   const current = mount({ shown: { version: 3, text: stored, error: null } });
   assert.equal(current.body.querySelector('[data-role="hidden-flag"]').hidden, false);
   assert.equal(current.body.querySelector('[data-role="hidden-hint"]').hidden, true, 'the flag already says it');
+});
+
+test('a stored text that writes a refused character as an escape sequence is judged like one that holds it', async () => {
+  const { judgedSchema } = await import('./hidden-notice.js');
+  const escaped = { schema: { version: 2 }, schemaText: '{"a":"x\\u202Ey"}' };
+  assert.match(judgedSchema('p', escaped, 'json_schema').problem.text, /^U\+202E .*sekwencja specjalna/);
+  assert.equal(judgedSchema('p', { schema: { version: 2 }, schemaText: '{"pattern":"[^\\u0000-\\u001F]"}' }, 'json_schema').problem, null, 'the formats\' own controls are not refused');
+  assert.equal(judgedSchema('p', escaped, 'thrift').problem, null);
+});
+
+test('a notice keeps each name with its marker on one line and links to the data-hiding rules of the topics it speaks of', async () => {
+  const { body, moves: clicked } = mount({
+    notice: { tone: 'warning', title: 'Dodano wersję 2', text: 'Odbiorcy nie zobaczą pola pac⟦U+202E⟧jent w nowych wiadomościach.', hidingTopics: ['wizyty'] },
+  });
+  await tick();
+  const message = body.querySelector('[data-role="notice"] .tf-alert-message');
+  assert.equal(message.querySelector('.tb-hidden-name').textContent, 'pac⟦U+202E⟧jent');
+  assert.equal(message.querySelector('.tb-hidden-name').getAttribute('style'), 'white-space:nowrap');
+  const link = message.querySelector('[data-go="topic-hiding"]');
+  assert.equal(link.dataset.topic, 'wizyty');
+  link.click();
+  assert.deepEqual(clicked, [{ kind: 'topic-hiding', topic: 'wizyty' }]);
 });
 
 test('the read of the pattern behind a topic is judged by the version it returned and the kind the caller knows, and not at all for an unknown kind', async () => {

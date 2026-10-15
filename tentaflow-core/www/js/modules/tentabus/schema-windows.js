@@ -611,28 +611,49 @@ export function textRefusalReason(schemaType, serverText) {
   return reason && line && !reason.includes(line) ? `${reason} ${line}` : reason;
 }
 
-const HIDDEN_REFUSAL = /^the schema contains an invisible or direction-controlling character (U\+[0-9A-F]+) \(([^)]*)\) at line (\d+), column (\d+)( \(written as an escape sequence\))?/;
+const HIDDEN_PREFIX = /^the schema contains an invisible or direction-controlling character /;
+const HIDDEN_PLACE = /(U\+[0-9A-F]+) \(([^)]*)\) at line (\d+), column (\d+)( \(written as an escape sequence\))?/g;
+const HIDDEN_MORE = /; and (\d+) more\s*$/;
 
 /**
- * Where the server found a refused character (`text_guard.rs`): `{ code, codePoint, name, line, column, escape }`,
- * `escape` when the text writes it as an escape sequence and not as the character; `null` for any other refusal.
+ * Where the server found refused characters (`text_guard.rs`): `{ places, more }`, `places` = `[{ code, codePoint,
+ * name, line, column, escape }]` (`escape` when the text writes the character as an escape sequence and not as itself),
+ * `more` = how many it did not list; `null` for any other refusal.
  */
-export function hiddenRefusal(serverText) {
-  const m = HIDDEN_REFUSAL.exec(String(serverText || '').replace(/^invalid schema:\s*/, ''));
-  if (!m) return null;
-  return { code: m[1], codePoint: parseInt(m[1].slice(2), 16), name: m[2], line: Number(m[3]), column: Number(m[4]), escape: Boolean(m[5]) };
+export function hiddenRefusals(serverText) {
+  const text = String(serverText || '').replace(/^invalid schema:\s*/, '');
+  if (!HIDDEN_PREFIX.test(text)) return null;
+  const places = [...text.replace(HIDDEN_PREFIX, '').matchAll(HIDDEN_PLACE)].map((m) => ({
+    code: m[1], codePoint: parseInt(m[1].slice(2), 16), name: m[2], line: Number(m[3]), column: Number(m[4]), escape: Boolean(m[5]),
+  }));
+  return places.length ? { places, more: Number(HIDDEN_MORE.exec(text)?.[1]) || 0 } : null;
 }
 
+/** The first place the server named: `{ code, codePoint, name, line, column, escape }`, or `null` for any other refusal. */
+export function hiddenRefusal(serverText) {
+  return hiddenRefusals(serverText)?.places[0] ?? null;
+}
+
+/** How a pattern of this kind writes a refused character as an escape sequence, for the sentence that explains it. */
+const ESCAPE_EXAMPLES = { xsd: '&#x202E;', protobuf: '\\xe2\\x80\\xae' };
+const escapeExample = (schemaType) => ESCAPE_EXAMPLES[schemaType] || '\\u202E';
+
 /** The lines of the refused text that hold the character, so they can be found in a box that draws it reversed or not at all. */
-function hiddenPreviewHtml(text, schemaType, found) {
-  const options = { leadingBom: schemaType === 'xsd' };
-  const { lines, more } = hiddenLines(text, options, found.escape ? { line: found.line, column: found.column } : null);
+function hiddenPreviewHtml(text, schemaType, refusal) {
+  const options = { leadingBom: schemaType === 'xsd', schemaType };
+  const named = refusal.places.filter((p) => p.escape);
+  const { lines, more } = hiddenLines(text, options, named);
   if (!lines.length) return '';
-  const places = hiddenPlaces(text, options);
+  const found = hiddenPlaces(text, options);
+  const escapeOnly = found ? !found.raw.length : refusal.places.every((p) => p.escape);
+  const placeLines = found
+    ? [found.rawText && T('schemas.hidden.places_line', { places: found.rawText }), found.escapeText && T('schemas.hidden.escape_places_line', { places: found.escapeText })].filter(Boolean)
+    : [];
+  const lineHtml = (l) => l.parts.map((part) => (part.mark ? `<mark class="tb-hidden-escape">${escapeHtml(part.text)}</mark>` : escapeHtml(part.text))).join('');
   return `<div class="tb-hidden-preview">
-    ${places ? `<div>${escapeHtml(T('schemas.hidden.places_line', { places: places.text }))}</div>` : ''}
-    <div class="tb-vr-hint">${escapeHtml(T('schemas.hidden.preview_title'))}</div>
-    <ul class="tb-hidden-lines">${lines.map((l) => `<li><span class="tb-hidden-line-no">${escapeHtml(T('schemas.hidden.line_label', { line: l.line }))}</span><code class="tb-hidden-line-text">${escapeHtml(l.text)}</code></li>`).join('')}</ul>
+    ${placeLines.map((l) => `<div>${escapeHtml(l)}</div>`).join('')}
+    <div class="tb-vr-hint">${escapeHtml(T(escapeOnly ? 'schemas.hidden.preview_title_escape' : 'schemas.hidden.preview_title'))}</div>
+    <ul class="tb-hidden-lines">${lines.map((l) => `<li><span class="tb-hidden-line-no">${escapeHtml(T('schemas.hidden.line_label', { line: l.line }))}</span><code class="tb-hidden-line-text">${lineHtml(l)}</code></li>`).join('')}</ul>
     ${more ? `<div class="tb-vr-hint">${escapeHtml(T('schemas.hidden.more', { count: more }))}</div>` : ''}
   </div>`;
 }
@@ -645,14 +666,20 @@ function lineSentence(serverText) {
 function refusalReasonOf(schemaType, serverText) {
   const text = String(serverText || '').replace(/^invalid schema:\s*/, '');
   // The same screen runs before every format's parser (text_guard.rs), so every kind words it the same.
-  const hidden = hiddenRefusal(text);
-  if (hidden) {
-    return T(hidden.escape ? 'schemas.refused.hidden_escape' : 'schemas.refused.hidden_character', {
+  const refusal = hiddenRefusals(text);
+  if (refusal) {
+    // The first place is named; a text that also holds the character itself gets the sentence about it, and one that
+    // writes some as escape sequences says that those the button does not remove.
+    const hidden = refusal.places.find((p) => !p.escape) || refusal.places[0];
+    const sentence = T(hidden.escape ? 'schemas.refused.hidden_escape' : 'schemas.refused.hidden_character', {
       code: hidden.code,
       name: plainName(hidden.codePoint, hidden.name),
       cause: causeHint(hidden.codePoint),
+      example: escapeExample(schemaType),
       atLine: T('schemas.refused.at_line_column', { line: hidden.line, column: hidden.column }),
-    }).replace(/\s{2,}/g, ' ').trim();
+    });
+    const mixed = !hidden.escape && refusal.places.some((p) => p.escape);
+    return `${sentence} ${mixed ? T('schemas.refused.hidden_also_escape', { example: escapeExample(schemaType) }) : ''}`.replace(/\s{2,}/g, ' ').trim();
   }
   if (schemaType === 'hl7v2_profile') {
     let m = /'(MSH-[12])' is the message's own field-separator/.exec(text);
@@ -825,7 +852,7 @@ export function refusalHtml({ err, title, compatibility, schemaType, newText, de
   if (invalid) {
     const serverText = invalid[1].trim();
     const reason = textRefusalReason(schemaType, serverText);
-    const found = hiddenRefusal(serverText);
+    const found = hiddenRefusals(serverText);
     return `<div>${head} ${escapeHtml(reason || T('schemas.text_refused', { format: schemaFormatLabel(schemaType) }))}</div>${found ? hiddenPreviewHtml(newText, schemaType, found) : ''}${technical(serverText)}`;
   }
   if (/\bbus\.invalid_argument: subject '[^']*' is deprecated/.test(message)) {
@@ -938,18 +965,22 @@ export function ruleFieldIssues({ rules, newText, oldText = '', schemaType }) {
   const inOld = new Set(readJsonSchema(oldText).fields.map((f) => f.name));
   const gone = new Map();
   const renames = new Map();
+  const renameTopics = new Map();
   for (const rule of rules) {
     for (const name of new Set([...(rule.fields || []), ...(rule.requiredFields || [])])) {
       if (present.has(name)) continue;
       const clean = stripHidden(name);
-      if (clean !== name && present.has(clean) && !inOld.has(clean)) renames.set(name, clean);
+      if (clean !== name && present.has(clean) && !inOld.has(clean)) {
+        renames.set(name, clean);
+        renameTopics.set(name, new Set([...(renameTopics.get(name) || []), rule.topic]));
+      }
       if (!read.complex) gone.set(name, new Set([...(gone.get(name) || []), rule.topic]));
     }
   }
   if (!gone.size && !renames.size) return null;
   return {
     gone: [...gone].map(([name, topics]) => ({ name, topics: [...topics].sort() })),
-    renames: [...renames].map(([from, to]) => ({ from, to })),
+    renames: [...renames].map(([from, to]) => ({ from, to, topics: [...renameTopics.get(from)].sort() })),
   };
 }
 
@@ -986,11 +1017,33 @@ export function keptSpellingsText({ names, total, hasRecords }) {
   return T(hasRecords ? 'schemas.hidden.old_spelling_kept' : 'schemas.hidden.old_spelling_kept_maybe', { count, names: list });
 }
 
-/** What ticking, or not ticking, "rename the fields in the data-hiding rules" does to what the readers of those topics see. */
+const renameTopicsOf = (renames) => [...new Set(renames.flatMap((x) => x.topics || []))].sort();
+
+const renameWords = (renames) => ({
+  from: showHidden(listText(renames.map((x) => x.from))),
+  to: listText(renames.map((x) => x.to)),
+  count: renames.length,
+});
+
+/** What ticking, or not ticking, "rename the fields in the data-hiding rules" will do to what the readers of those topics see. */
 export function renameConsequence(renames, chosen) {
   return T(chosen ? 'schemas.hidden.rules_rename_on' : 'schemas.hidden.rules_rename_off', {
-    names: listText(renames.map((x) => x.to)), count: renames.length,
+    ...renameWords(renames), topicCount: renameTopicsOf(renames).length || 1,
   });
+}
+
+/**
+ * What the data-hiding rules came to after the version was added, in the past tense: `chosen` = the fields were renamed
+ * in them. The topics are named, so the person can find the rules; `topics` lists them for a link to each.
+ */
+export function renameOutcome(renames, chosen) {
+  const topics = renameTopicsOf(renames);
+  return {
+    topics,
+    text: T(chosen ? 'schemas.hidden.rules_renamed_effect' : 'schemas.hidden.rules_unchanged', {
+      ...renameWords(renames), topicCount: topics.length || 1, topics: listText(topics.map((t) => `„${t}”`)),
+    }),
+  };
 }
 
 const NAME_ERRORS = { empty: 'schemas.add.name_empty', invalid: 'schemas.add.name_invalid', taken: 'schemas.add.name_taken' };
@@ -1000,7 +1053,7 @@ function textField(label, hint, value = '', more = '') {
     <tf-textarea class="tb-mono-input" data-role="text" rows="10" label="${escapeAttr(label)}" hint="${escapeAttr(hint)}" value="${escapeAttr(value)}" spellcheck="false"></tf-textarea>
     <div class="tb-hidden-row" data-role="hidden-row" hidden>
       <div class="muted" data-role="hidden-places"></div>
-      <tf-button variant="secondary" size="sm" icon="close" data-role="strip-hidden">${escapeHtml(T('schemas.hidden.strip_button'))}</tf-button>
+      <div data-role="strip-wrap"><tf-button variant="secondary" size="sm" icon="close" data-role="strip-hidden">${escapeHtml(T('schemas.hidden.strip_button'))}</tf-button></div>
     </div>
     <div class="tb-vr-hint" data-role="hidden-done" hidden></div>
     <tf-disclosure class="tb-tech" data-role="more" label="${escapeAttr(T('schemas.add.more'))}"${more ? '' : ' hidden'}><div data-role="more-text">${escapeHtml(more)}</div></tf-disclosure>
@@ -1014,8 +1067,11 @@ function wireTextField(win, sync, formatOf) {
   const row = win.querySelector('[data-role="hidden-row"]');
   const placesEl = win.querySelector('[data-role="hidden-places"]');
   const done = win.querySelector('[data-role="hidden-done"]');
-  // An XSD may start with a byte-order mark; it is not a refused character there.
-  const options = () => ({ leadingBom: formatOf() === 'xsd' });
+  const stripWrap = win.querySelector('[data-role="strip-wrap"]');
+  // An XSD may start with a byte-order mark; it is not a refused character there. The kind decides which escape
+  // sequences are read; the button removes only the characters themselves, so it reads without it.
+  const options = () => ({ leadingBom: formatOf() === 'xsd', schemaType: formatOf() });
+  const stripOptions = () => ({ leadingBom: formatOf() === 'xsd' });
   const check = () => {
     const problem = text.value.trim() ? schemaTextProblem(text.value, formatOf()) : null;
     if (problem) text.setAttribute('error', T(TEXT_ERRORS[problem]));
@@ -1023,13 +1079,18 @@ function wireTextField(win, sync, formatOf) {
     // The refusal names a line and column, which the box does not number: say where they are, live.
     const found = hiddenPlaces(text.value, options());
     row.hidden = !found;
-    placesEl.textContent = found ? T('schemas.hidden.places_line', { places: found.text }) : '';
+    const lines = found
+      ? [found.rawText && T('schemas.hidden.places_line', { places: found.rawText }), found.escapeText && T('schemas.hidden.escape_places_line', { places: found.escapeText })].filter(Boolean)
+      : [];
+    placesEl.innerHTML = lines.map((l) => `<div>${escapeHtml(l)}</div>`).join('');
+    // The button cannot remove an escape sequence, so a text that has only those does not get the promise.
+    stripWrap.hidden = !found?.raw.length;
   };
   text.addEventListener('input', () => { done.hidden = true; check(); sync(); });
   win.querySelector('[data-role="strip-hidden"]').addEventListener('click', () => {
-    const places = findHidden(text.value, options());
+    const places = findHidden(text.value, stripOptions());
     if (!places.length) return;
-    text.value = stripHidden(text.value, options());
+    text.value = stripHidden(text.value, stripOptions());
     text.dispatchEvent(new Event('input', { bubbles: true }));
     done.textContent = T('schemas.hidden.stripped', { count: places.length, places: placesText(places) });
     done.hidden = false;
@@ -1198,7 +1259,7 @@ export function openSchemaVersion(ctx) {
       ${textField(T('schemas.version.text_label', { version: fmtCount(next) }), addTextHint(info.schemaType, next), start, addTextMore(info.schemaType))}
       <div class="tb-diff-note" data-role="diff"></div>
       <div class="tb-rules-note" data-role="rules" role="status" hidden></div>
-      <div data-role="rename-wrap" hidden><tf-checkbox data-role="rename-rules" label=""></tf-checkbox><div class="muted" data-role="rename-effect" aria-live="polite"></div></div>`,
+      <div data-role="rename-wrap" hidden><tf-checkbox data-role="rename-rules" label=""></tf-checkbox><div class="tb-rename-effect" data-role="rename-effect" aria-live="polite"></div></div>`,
     wire: (win, sync) => {
       const diff = win.querySelector('[data-role="diff"]');
       const field = win.querySelector('[data-role="text"]');

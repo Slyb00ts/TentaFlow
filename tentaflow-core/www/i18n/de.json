@@ -10635,15 +10635,21 @@
         "stan_button": "Muster öffnen",
         "rules_gone": "Datenausblendungsregeln auf {topics} nennen Felder, die die neue Version nicht hat: {fields}. Ein Feld, das seine Regel nicht nennt, ist vor den Lesern verborgen.",
         "rules_rename": "Benennen Sie in diesen Regeln auch die Felder um, die sich nur durch ein unsichtbares Zeichen unterscheiden: {pairs}.",
-        "rules_rename_off": "Ohne Haken bleiben die Datenausblendungsregeln unverändert, daher sehen die Leser dieser Topics in neuen Nachrichten nicht mehr: {names}.",
-        "rules_rename_on": "Mit Haken lassen die Regeln {names} zu, daher sehen die Leser dieser Topics in neuen Nachrichten Daten, die jetzt vor ihnen verborgen sind.",
+        "rules_rename_off": "Ohne Haken bleiben die Regeln unverändert, daher sehen die Leser {topicCount|dieses Topics|dieser Topics} {count|das Feld|die Felder} {from} in neuen Nachrichten nicht mehr.",
+        "rules_rename_on": "Mit Haken lassen die Regeln {count|das Feld|die Felder} {to} statt {from} zu, daher sehen die Leser {topicCount|dieses Topics|dieser Topics} sie in neuen Nachrichten weiterhin wie bisher.",
         "rules_renamed": "Felder in {count} {count|Datenausblendungsregel|Datenausblendungsregeln} umbenannt.",
         "rules_rename_failed": "Die Version wurde hinzugefügt, aber das Umbenennen der Felder in den Datenausblendungsregeln ist fehlgeschlagen: {error}. Korrigieren Sie sie im Abschnitt „Datenausblendung“.",
         "rules_rename_partial": "Die Version wurde hinzugefügt und die Felder in {count} {count|Regel|Regeln} zur Datenausblendung umbenannt, danach schlug das Umbenennen fehl: {error}. Korrigieren Sie den Rest im Abschnitt „Datenausblendung“.",
         "diff_only_removal": "Unterschied zu Version {version}: nur die unsichtbaren Zeichen sind entfernt; Felder und Anforderungen unverändert.",
-        "diff_only_removal_names": "Unterschied zu Version {version}: nur die unsichtbaren Zeichen sind entfernt, sie standen aber in {count} {count|Name oder Wert|Namen oder Werten}: {pairs}.",
-        "old_spelling_kept": "Bereits gespeicherte Nachrichten behalten die alte Schreibweise von {count} {count|Name oder Wert|Namen oder Werten}: {names}.",
-        "old_spelling_kept_maybe": "Früher gespeicherte Nachrichten (falls vorhanden) behalten die alte Schreibweise von {count} {count|Name oder Wert|Namen oder Werten}: {names}."
+        "diff_only_removal_names": "Unterschied zu Version {version}: nur die unsichtbaren Zeichen sind entfernt, sie standen aber in {count} {count|Namen oder Wert|Namen oder Werten}: {pairs}.",
+        "old_spelling_kept": "Bereits gespeicherte Nachrichten behalten die alte Schreibweise von {count} {count|Namen oder Wert|Namen oder Werten}: {names}.",
+        "old_spelling_kept_maybe": "Früher gespeicherte Nachrichten (falls vorhanden) behalten die alte Schreibweise von {count} {count|Namen oder Wert|Namen oder Werten}: {names}.",
+        "place_escape": "{code} ({name}) als Escape-Sequenz in Zeile {line}, Spalte {column}",
+        "escape_places_line": "Unsichtbare Zeichen als Escape-Sequenz geschrieben („Unsichtbare Zeichen entfernen“ entfernt sie nicht): {places}.",
+        "preview_title_escape": "Zu korrigierende Zeilen (die Escape-Sequenz eines unsichtbaren Zeichens ist hervorgehoben):",
+        "rules_renamed_effect": "Die Regeln lassen jetzt {count|das Feld|die Felder} {to} statt {from} zu, daher sehen die Leser {topicCount|des Topics|der Topics} {topics} sie in neuen Nachrichten weiterhin.",
+        "rules_unchanged": "Die Datenausblendungsregeln wurden nicht geändert: Die Leser {topicCount|des Topics|der Topics} {topics} sehen {count|das Feld|die Felder} {from} in neuen Nachrichten nicht. Das ändern Sie im Abschnitt „Daten ausblenden“.",
+        "rules_open": "Daten ausblenden im Topic „{topic}“"
       },
       "refused": {
         "hl7_msh": "„{field}“ beschreibt die Trennzeichen der Nachricht selbst und kann deshalb nicht verlangt werden. Entfernen Sie „{field}“ aus den Pflichtfeldern.",
@@ -10776,7 +10782,8 @@
         "at_line": "In Zeile {line}.",
         "at_line_column": "In Zeile {line}, Spalte {column}.",
         "hidden_character": "Das Muster enthält ein unsichtbares Zeichen oder eines, das die Textrichtung ändert: {code} ({name}). Ein solches Zeichen lässt das Muster im Editor anders aussehen, als ein Programm es liest („Trojan Source“). Unten stehen die Zeilen mit einem solchen Zeichen, das Zeichen als ⟦U+XXXX⟧ geschrieben, weil das Textfeld es möglicherweise nicht zeigt. Verwenden Sie „Unsichtbare Zeichen entfernen“ oder korrigieren Sie diese Zeilen von Hand und senden Sie das Muster erneut. {cause} {atLine}",
-        "hidden_escape": "Das Muster schreibt ein unsichtbares Zeichen oder eines, das die Textrichtung ändert, als Escape-Sequenz (z. B. \\u202E): {code} ({name}). „Unsichtbare Zeichen entfernen“ entfernt eine solche Sequenz nicht – korrigieren Sie sie von Hand in der unten gezeigten Zeile und senden Sie das Muster erneut. {atLine}"
+        "hidden_escape": "Das Muster schreibt ein unsichtbares Zeichen oder eines, das die Textrichtung ändert, als Escape-Sequenz (z. B. {example}): {code} ({name}). „Unsichtbare Zeichen entfernen“ entfernt eine solche Sequenz nicht – korrigieren Sie sie von Hand im hervorgehobenen Teil der unten gezeigten Zeile und senden Sie das Muster erneut. {atLine}",
+        "hidden_also_escape": "Einige davon sind als Escape-Sequenz geschrieben (z. B. {example}); „Unsichtbare Zeichen entfernen“ entfernt diese nicht – korrigieren Sie sie von Hand im hervorgehobenen Teil."
       }
     },
     "topics": {

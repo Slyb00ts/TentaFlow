@@ -22,10 +22,28 @@ class TfAlert extends HTMLElement {
     super();
     this._root = null;
     this._actionsEl = null;
+    this._messageEl = null;
   }
 
   connectedCallback() {
     if (!this._root) this._build();
+    this._update();
+    // A parser that connects the element before it appends its children (the slotted message arrives after the build).
+    if (typeof MutationObserver === 'function') {
+      this._late ??= new MutationObserver(() => this._adoptLateMessage());
+      this._late.observe(this, { childList: true });
+    }
+  }
+
+  disconnectedCallback() {
+    this._late?.disconnect();
+  }
+
+  _adoptLateMessage() {
+    const late = Array.from(this.children).find((c) => c.getAttribute('slot') === 'message');
+    if (!late) return;
+    late.removeAttribute('slot');
+    this._messageEl = late;
     this._update();
   }
 
@@ -39,6 +57,11 @@ class TfAlert extends HTMLElement {
     const actionsContent = this.querySelector('[slot="actions"]');
     if (actionsContent) actionsContent.removeAttribute('slot');
     this._actionsEl = actionsContent;
+    // A message that needs markup of its own (a name that must not break across lines) arrives as a slotted element;
+    // the `message` attribute stays plain text.
+    const messageContent = this.querySelector('[slot="message"]');
+    if (messageContent) messageContent.removeAttribute('slot');
+    this._messageEl = messageContent;
     // Fallback for the common `<tf-alert>text</tf-alert>` form: capture loose child
     // text (NOT element children like the actions container) before the clear
     // below drops it. Without this the message is silently lost and the alert
@@ -96,10 +119,11 @@ class TfAlert extends HTMLElement {
       titleEl.textContent = title;
       content.appendChild(titleEl);
     }
-    if (message) {
+    if (message || this._messageEl) {
       const msgEl = document.createElement('div');
       msgEl.className = 'tf-alert-message';
-      msgEl.textContent = message;
+      if (message) msgEl.textContent = message;
+      else msgEl.appendChild(this._messageEl);
       content.appendChild(msgEl);
     }
     if (this._actionsEl) content.appendChild(this._actionsEl);

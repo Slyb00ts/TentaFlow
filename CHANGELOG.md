@@ -991,6 +991,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   (zaznaczone i nie), a to samo zdanie stoi w „Co się stanie po dodaniu” i w
   komunikacie po zapisie. Komunikat po zmianie nie ginie, gdy czytelnik jest poza
   stroną wzoru (toast niesie cały tekst).
+- **„Trojan Source”: sekwencje poniżej U+0100, wszystkie miejsca w jednej
+  odmowie, odczyt w przeglądarce.** Sekwencja jest odmawiana tylko wtedy, gdy
+  dekoduje się do U+0100 lub wyżej albo do U+00AD i U+0085; sterujące i bajty,
+  które formaty zapisują tak zwyczajnie (`[^\u0000-\u001F]` we wzorcu JSON,
+  `[^&#x7F;-&#x9F;]` w XSD, `"\x00\x01"` w proto2, bajty `bytes` w Avro), przechodzą,
+  więc zapisane wersje z takimi tekstami nadal się kompilują. Surowy znak jest
+  odmawiany wszędzie jak dotąd. Odwołania XSD czytane są do ostatniej cyfry
+  (zera wiodące nie omijają sprawdzenia), ósemkowe sekwencje Protobuf tak jak jego
+  lekser (po pierwszej cyfrze ósemkowej dowolna dziesiętna, bajt się zawija).
+  Jedna odmowa wymienia każde miejsce (znak i sekwencję razem, do 20 i „; and N
+  more”), by administrator nie był odmawiany dwa razy. Lista starej pisowni
+  pomija `pattern`, `$id`, `$schema`, `format` i literały tekstowe Protobuf/Thrift.
+  Przeglądarka rozpoznaje te same sekwencje (JSON/Avro `\uXXXX` z parami,
+  `&#x…;`/`&#N;`, `\xHH` i ósemkowe), wypisuje je osobno, zaznacza w podglądzie, a
+  przycisk „Usuń niewidoczne znaki” obiecuje tylko dla znaków wpisanych wprost.
+  Skutek pola „zmień nazwy w zasadach” podaje stare i nowe nazwy oraz topiki, a
+  komunikat po zapisie mówi to w czasie przeszłym i prowadzi do ukrywania danych.
 
 ## [0.4.0-beta.1] — 2026-09-29
 

@@ -30,7 +30,7 @@ import { hl7FieldLabel, hl7SegmentLabel, orderSegments } from '/js/modules/tenta
 import { downloadText } from '/js/lib/download.js';
 import { valueRow } from '/js/modules/tentabus/topic-settings.js';
 import { showHidden } from '/js/modules/tentabus/hidden-characters.js';
-import { hiddenPlaces } from '/js/modules/tentabus/hidden-notice.js';
+import { hiddenPlaces, sentenceHtml } from '/js/modules/tentabus/hidden-notice.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-table.js';
@@ -523,6 +523,11 @@ export async function copyText(text) {
 // The page
 // ---------------------------------------------------------------------------
 
+// A way from a notice to the data-hiding rules it speaks of, one for each topic.
+const noticeLinks = (notice) => (notice.hidingTopics?.length
+  ? `<div class="tb-notice-links">${notice.hidingTopics.map((topic) => `<tf-button variant="secondary" size="sm" icon="eye" data-go="topic-hiding" data-topic="${escapeAttr(topic)}">${escapeHtml(T('schemas.hidden.rules_open', { topic }))}</tf-button>`).join('')}</div>`
+  : '');
+
 const backHtml = () => `<div class="tb-back"><tf-button variant="ghost" icon="chevron-left" data-go="back">${escapeHtml(T('schemas.detail.back'))}</tf-button></div>`;
 
 function pageHtml(name) {
@@ -656,7 +661,7 @@ export function drawSchemaDetail(body, ctx) {
       body.addEventListener('click', (e) => {
         const el = e.target.closest('[data-go]');
         if (!el || !body.contains(el) || el.hasAttribute('disabled')) return;
-        ctx.go({ kind: el.dataset.go });
+        ctx.go({ kind: el.dataset.go, ...(el.dataset.topic ? { topic: el.dataset.topic } : {}) });
       });
     }
   }
@@ -750,7 +755,7 @@ function paintPage(body, view) {
 
   const notice = view.notice;
   patchHtml(body.querySelector('[data-role="notice"]'), notice
-    ? `<tf-alert tone="${escapeAttr(notice.tone || 'success')}" title="${escapeAttr(notice.title)}" message="${escapeAttr(notice.text || '')}"></tf-alert>`
+    ? `<tf-alert tone="${escapeAttr(notice.tone || 'success')}" title="${escapeAttr(notice.title)}"><div slot="message">${sentenceHtml(notice.text || '')}${noticeLinks(notice)}</div></tf-alert>`
     : '');
   // The note of the withdrawal itself already says all the warning would.
   patchHtml(body.querySelector('[data-role="warning"]'), subjectDeprecated && !notice?.withdrawn
@@ -810,7 +815,7 @@ function paintText(body, view, effective) {
   // Topics bound to the version they check with take no message while it holds one, whatever "w użyciu" says.
   // Another version only gets the note: the topics do not check with it, and the flag would claim they stop.
   const flag = body.querySelector('[data-role="hidden-flag"]');
-  const found = ready && version === effective ? hiddenPlaces(shown.text, { leadingBom: info.schemaType === 'xsd' }) : null;
+  const found = ready && version === effective ? hiddenPlaces(shown.text, { leadingBom: info.schemaType === 'xsd', schemaType: info.schemaType }) : null;
   setText(hintEl, hasHidden && !found ? T('schemas.detail.hidden_hint') : '');
   hintEl.hidden = !hasHidden || !!found;
   flag.hidden = !found;

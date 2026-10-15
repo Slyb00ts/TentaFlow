@@ -3037,6 +3037,8 @@ test('Trojan Source: a pattern text with a hidden or direction-changing characte
     await win.locator('[data-act="save"]').click();
     await expect(error).toContainText('jako sekwencję specjalną', { timeout: 15000 });
     await expect(error.locator('.tb-hidden-line-text')).toHaveText('{"description": "a\\u202Eb"}');
+    await expect(error.locator('.tb-hidden-line-text mark')).toHaveText('\\u202E');
+    await expect(error).toContainText('(np. \\u202E)');
     await expect(error.locator('tf-disclosure pre')).toContainText('(written as an escape sequence)');
     // The refusal belongs to the text that was refused; cancelling leaves no pattern.
     await win.locator('[data-role="text"] textarea').fill('{"description": "ab"}');
@@ -3131,11 +3133,11 @@ test('Trojan Source correction: a stored version with a hidden character is flag
     // The rename widens what readers see, so it starts unticked and says so; ticking it is a decision.
     await expect(win.locator('[data-role="rename-rules"]')).not.toHaveAttribute('checked', /.*/);
     // Both outcomes are said next to the box and repeated in "Co się stanie po dodaniu".
-    await expect(win.locator('[data-role="rename-effect"]')).toContainText('przestaną widzieć w nowych wiadomościach: pacjent');
-    await expect(win.locator('[data-role="impact"]')).toContainText('przestaną widzieć w nowych wiadomościach: pacjent');
+    await expect(win.locator('[data-role="rename-effect"]')).toContainText('odbiorcy tego topiku przestaną widzieć w nowych wiadomościach pole pac\u27E6U+202E\u27E7jent');
+    await expect(win.locator('[data-role="impact"]')).toContainText('odbiorcy tego topiku przestaną widzieć w nowych wiadomościach pole pac\u27E6U+202E\u27E7jent');
     await win.locator('[data-role="rename-rules"]').click();
-    await expect(win.locator('[data-role="rename-effect"]')).toContainText('zobaczą w nowych wiadomościach dane, które teraz są przed nimi ukryte');
-    await expect(win.locator('[data-role="impact"]')).toContainText('zobaczą w nowych wiadomościach dane, które teraz są przed nimi ukryte');
+    await expect(win.locator('[data-role="rename-effect"]')).toContainText('będą dopuszczać pole pacjent zamiast pac\u27E6U+202E\u27E7jent, więc odbiorcy tego topiku będą je widzieć w nowych wiadomościach tak jak dotąd');
+    await expect(win.locator('[data-role="impact"]')).toContainText('będą dopuszczać pole pacjent zamiast');
     await expect(win.locator('[data-role="impact"]')).not.toContainText('przestaną widzieć');
     // The window opens on the first line, not where the text ends.
     expect(await win.locator('[data-role="text"] textarea').evaluate((t) => [t.selectionStart, t.scrollTop])).toEqual([0, 0]);
@@ -3147,9 +3149,12 @@ test('Trojan Source correction: a stored version with a hidden character is flag
     const notice = schemaSlot(page).locator('[data-role="notice"] tf-alert');
     await expect(notice).toHaveAttribute('title', 'Dodano wersję 2', { timeout: 15000 });
     // No message was ever published to the topic, so the sentence does not claim stored records.
-    await expect(notice).toHaveAttribute('message', /Wiadomości zapisane wcześniej \(jeśli są\) zachowują starą pisownię 1 nazwy lub wartości: pac\u27E6U\+202E\u27E7jent\./);
-    await expect(notice).toHaveAttribute('message', /zobaczą w nowych wiadomościach dane, które teraz są przed nimi ukryte\./);
-    await expect(notice).toHaveAttribute('message', /Zmieniono nazwy pól w 1 zasadzie ukrywania danych\./);
+    const noticeText = notice.locator('.tf-alert-message');
+    await expect(noticeText).toContainText(/Wiadomości zapisane wcześniej \(jeśli są\) zachowują starą pisownię 1 nazwy lub wartości: pac\u27E6U\+202E\u27E7jent\./);
+    await expect(noticeText).toContainText('Zmieniono nazwy pól w 1 zasadzie ukrywania danych.');
+    // Said in the past tense, with the topic named.
+    await expect(noticeText).toContainText(`Zasady dopuszczają teraz pole pacjent zamiast pac\u27E6U+202E\u27E7jent, więc odbiorcy topiku „${topic}” nadal widzą je w nowych wiadomościach.`);
+    await expect(noticeText).not.toContainText('Po zaznaczeniu');
     await expect(schemaSlot(page).locator('[data-role="hidden-flag"] [data-role="flag-alert"]')).toHaveCount(0);
 
     // The rule names the field as the new version spells it: nothing was hidden by the correction.

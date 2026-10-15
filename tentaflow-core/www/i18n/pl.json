@@ -11870,15 +11870,21 @@
         "stan_button": "Otwórz wzór",
         "rules_gone": "Zasady ukrywania danych na {topics} wymieniają pola, których nowa wersja nie ma: {fields}. Pole, którego zasada nie wymienia, jest przed odbiorcami ukryte.",
         "rules_rename": "Zmień też w tych zasadach nazwy pól, które różnią się tylko niewidocznym znakiem: {pairs}.",
-        "rules_rename_off": "Bez zaznaczenia zasady ukrywania danych zostają bez zmian, więc odbiorcy tych topików przestaną widzieć w nowych wiadomościach: {names}.",
-        "rules_rename_on": "Po zaznaczeniu zasady zaczną dopuszczać {names}, więc odbiorcy tych topików zobaczą w nowych wiadomościach dane, które teraz są przed nimi ukryte.",
+        "rules_rename_off": "Bez zaznaczenia zasady zostaną bez zmian, więc odbiorcy {topicCount|tego topiku|tych topików|tych topików} przestaną widzieć w nowych wiadomościach {count|pole|pola|pola} {from}.",
+        "rules_rename_on": "Po zaznaczeniu zasady będą dopuszczać {count|pole|pola|pola} {to} zamiast {from}, więc odbiorcy {topicCount|tego topiku|tych topików|tych topików} będą je widzieć w nowych wiadomościach tak jak dotąd.",
         "rules_renamed": "Zmieniono nazwy pól w {count} {count|zasadzie|zasadach|zasadach} ukrywania danych.",
         "rules_rename_failed": "Wersja została dodana, ale nie udało się zmienić nazw pól w zasadach ukrywania danych: {error}. Popraw je w sekcji „Ukrywanie danych”.",
         "rules_rename_partial": "Wersja została dodana, nazwy pól zmieniono w {count} {count|zasadzie|zasadach|zasadach} ukrywania danych, po czym zmiana się nie powiodła: {error}. Popraw pozostałe w sekcji „Ukrywanie danych”.",
         "diff_only_removal": "Różnica względem wersji {version}: tylko usunięte niewidoczne znaki; pola i wymagania bez zmian.",
         "diff_only_removal_names": "Różnica względem wersji {version}: usunięte są tylko niewidoczne znaki, ale były w {count} {count|nazwie lub wartości|nazwach lub wartościach|nazwach lub wartościach}: {pairs}.",
         "old_spelling_kept": "Zapisane już wiadomości zachowują starą pisownię {count} {count|nazwy lub wartości|nazw lub wartości|nazw lub wartości}: {names}.",
-        "old_spelling_kept_maybe": "Wiadomości zapisane wcześniej (jeśli są) zachowują starą pisownię {count} {count|nazwy lub wartości|nazw lub wartości|nazw lub wartości}: {names}."
+        "old_spelling_kept_maybe": "Wiadomości zapisane wcześniej (jeśli są) zachowują starą pisownię {count} {count|nazwy lub wartości|nazw lub wartości|nazw lub wartości}: {names}.",
+        "place_escape": "{code} ({name}) zapisany jako sekwencja specjalna w wierszu {line}, w kolumnie {column}",
+        "escape_places_line": "Niewidoczne znaki zapisane sekwencjami specjalnymi („Usuń niewidoczne znaki” ich nie usunie): {places}.",
+        "preview_title_escape": "Wiersze do poprawienia (sekwencja specjalna niewidocznego znaku jest tu zaznaczona):",
+        "rules_renamed_effect": "Zasady dopuszczają teraz {count|pole|pola|pola} {to} zamiast {from}, więc odbiorcy {topicCount|topiku|topików|topików} {topics} nadal widzą je w nowych wiadomościach.",
+        "rules_unchanged": "Zasady ukrywania danych nie zostały zmienione: odbiorcy {topicCount|topiku|topików|topików} {topics} nie zobaczą {count|pola|pól|pól} {from} w nowych wiadomościach. Zmienisz to w sekcji „Ukrywanie danych”.",
+        "rules_open": "Ukrywanie danych w topiku „{topic}”"
       },
       "refused": {
         "hl7_msh": "„{field}” opisuje same znaki podziału wiadomości, więc nie może być wymagane. Usuń „{field}” z pól wymaganych.",
@@ -12011,7 +12017,8 @@
         "at_line": "W wierszu {line}.",
         "at_line_column": "W wierszu {line}, w kolumnie {column}.",
         "hidden_character": "Wzór zawiera niewidoczny znak albo znak zmieniający kierunek tekstu: {code} ({name}). Taki znak sprawia, że wzór wygląda w edytorze inaczej, niż odczyta go program („Trojan Source”). Niżej są wiersze z takim znakiem, ze znakiem zapisanym jako ⟦U+XXXX⟧, bo pole tekstowe może go nie pokazywać. Użyj „Usuń niewidoczne znaki” albo popraw te wiersze ręcznie i wyślij wzór ponownie. {cause} {atLine}",
-        "hidden_escape": "Wzór zapisuje niewidoczny znak albo znak zmieniający kierunek tekstu jako sekwencję specjalną (np. \\u202E): {code} ({name}). „Usuń niewidoczne znaki” takiej sekwencji nie usunie — popraw ją ręcznie w wierszu pokazanym niżej i wyślij wzór ponownie. {atLine}"
+        "hidden_escape": "Wzór zapisuje niewidoczny znak albo znak zmieniający kierunek tekstu jako sekwencję specjalną (np. {example}): {code} ({name}). „Usuń niewidoczne znaki” takiej sekwencji nie usunie — popraw ją ręcznie w zaznaczonym fragmencie wiersza pokazanego niżej i wyślij wzór ponownie. {atLine}",
+        "hidden_also_escape": "Część takich znaków jest zapisana jako sekwencja specjalna (np. {example}) — „Usuń niewidoczne znaki” jej nie usunie, popraw ją ręcznie w zaznaczonym fragmencie."
       }
     },
     "topics": {

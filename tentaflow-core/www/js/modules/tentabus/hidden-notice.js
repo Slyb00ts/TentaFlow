@@ -8,7 +8,7 @@
 
 import { escapeHtml } from '/js/utils.js';
 import { T } from '/js/modules/tentabus/format.js';
-import { findHidden, showHidden } from '/js/modules/tentabus/hidden-characters.js';
+import { findAllHidden, hiddenCharacterName } from '/js/modules/tentabus/hidden-characters.js';
 
 const NAME_KEY = new Map([
   [0x00AD, 'shy'], [0x200B, 'zwsp'], [0x200C, 'zwnj'], [0x200D, 'zwj'], [0x200E, 'lrm'], [0x200F, 'rlm'],
@@ -42,19 +42,30 @@ export function causeHint(codePoint) {
 
 const SHOWN_PLACES = 5;
 
+const placeText = (p) => T(p.escape ? 'schemas.hidden.place_escape' : 'schemas.hidden.place', {
+  code: p.code, name: plainName(p.codePoint, p.name), line: p.line, column: p.column,
+});
+
 /** "U+200B (spacja o zerowej szerokości) w wierszu 3, kolumnie 5; …", the first few and a count of the rest. */
 export function placesText(places) {
-  const shown = places.slice(0, SHOWN_PLACES).map((p) => T('schemas.hidden.place', {
-    code: p.code, name: plainName(p.codePoint, p.name), line: p.line, column: p.column,
-  }));
+  const shown = places.slice(0, SHOWN_PLACES).map(placeText);
   const rest = places.length - shown.length;
   return rest > 0 ? `${shown.join('; ')}; ${T('schemas.hidden.more', { count: rest })}` : shown.join('; ');
 }
 
-/** The refused characters of `text` and the sentence that places them, or `null` when it holds none. */
+/**
+ * The refused characters of `text` and the sentences that place them, or `null` when it holds none. `options` =
+ * `{ leadingBom, schemaType }`: with a `schemaType` the characters written as escape sequences of that kind count too.
+ * `raw` and `escapes` are the two groups (the button removes only the first), each with its own sentence.
+ */
 export function hiddenPlaces(text, options) {
-  const places = findHidden(text, options);
-  return places.length ? { places, text: placesText(places) } : null;
+  const places = findAllHidden(text, options);
+  if (!places.length) return null;
+  const raw = places.filter((p) => !p.escape);
+  const escapes = places.filter((p) => p.escape);
+  return {
+    places, raw, escapes, text: placesText(places), rawText: raw.length ? placesText(raw) : '', escapeText: escapes.length ? placesText(escapes) : '',
+  };
 }
 
 const MARKER = '⟦U\\+[0-9A-F]+⟧';
@@ -65,31 +76,61 @@ const MARKED_WORD = new RegExp(`(?:[\\p{L}\\p{N}_.$-]|${MARKER})*${MARKER}(?:[\\
  * a line would otherwise break inside it (`ter⟦U+202E⟧` / `min`).
  */
 export function sentenceHtml(sentence) {
-  return escapeHtml(sentence).replace(MARKED_WORD, (word) => `<span class="tb-hidden-name">${word}</span>`);
+  return escapeHtml(sentence).replace(MARKED_WORD, (word) => `<span class="tb-hidden-name" style="white-space:nowrap">${word}</span>`);
 }
 
 const PREVIEW_LINES = 5;
 const PREVIEW_WIDTH = 120;
 const PREVIEW_LEAD = 40;
 
+/** The display cells of one line: a refused character stands as ⟦U+XXXX⟧, an escape sequence as typed and `mark`ed. */
+function lineCells(source, { leadingBom = false } = {}, firstLine, escapes) {
+  const cells = [];
+  let first = -1;
+  let column = 0;
+  for (const ch of source) {
+    column += 1;
+    const cp = ch.codePointAt(0);
+    const marked = escapes.some((e) => column >= e.column && column < e.column + e.length);
+    const refused = !marked && (cp >= 0x7F || cp < 0x20) && hiddenCharacterName(cp) && !(leadingBom && firstLine && column === 1 && cp === 0xFEFF);
+    if ((marked || refused) && first < 0) first = cells.length;
+    if (refused) {
+      for (const c of `⟦U+${cp.toString(16).toUpperCase().padStart(4, '0')}⟧`) cells.push({ ch: c, mark: false });
+    } else {
+      cells.push({ ch, mark: marked });
+    }
+  }
+  return { cells, first };
+}
+
 /**
- * The lines of `text` that hold a refused character, `{ line, text }` each, in order, at most five and a count of the
- * rest (`more`). The characters are written ⟦U+XXXX⟧ and a long line is cut around the first one, so a person can find
- * the place in a box that draws such a character reversed or not at all. A refused character written as an escape
- * sequence is not in `text` itself: the line the server named (`escape` = `{ line, column }`) is added as it was typed.
+ * The lines of `text` that hold a refused character, `{ line, text, parts }` each, in order, at most five and a count
+ * of the rest (`more`). The characters are written ⟦U+XXXX⟧ and a long line is cut around the first one, so a person can
+ * find the place in a box that draws such a character reversed or not at all; `parts` = `[{ text, mark }]` is the
+ * same line with the escape sequences marked. `options.schemaType` makes the escape sequences count; the line the server
+ * named (`named` = `[{ line, column }]`) is added as it was typed when the scan did not find it.
  */
-export function hiddenLines(text, options, escape = null) {
-  const places = findHidden(text, options);
-  const numbers = [...new Set([...places.map((p) => p.line), ...(escape ? [escape.line] : [])])].sort((a, b) => a - b);
+export function hiddenLines(text, options, named = null) {
+  const places = findAllHidden(text, options);
+  const numbers = [...new Set([...places.map((p) => p.line), ...(named || []).map((n) => n.line)])].sort((a, b) => a - b);
   const lines = String(text ?? '').split('\n');
   const shown = numbers.slice(0, PREVIEW_LINES).map((line) => {
-    const written = showHidden((lines[line - 1] ?? '').replace(/\r$/, ''), options);
-    const cut = [...written];
-    const marked = cut.indexOf('⟦');
-    const centre = marked >= 0 ? marked : Math.max(0, (escape?.column ?? 1) - 1);
-    const from = Math.max(0, centre - PREVIEW_LEAD);
-    const part = cut.slice(from, from + PREVIEW_WIDTH).join('');
-    return { line, text: `${from > 0 ? '…' : ''}${part}${from + PREVIEW_WIDTH < cut.length ? '…' : ''}` };
+    const source = (lines[line - 1] ?? '').replace(/\r$/, '');
+    const { cells, first } = lineCells(source, options, line === 1, places.filter((p) => p.escape && p.line === line));
+    const asked = (named || []).find((n) => n.line === line);
+    const centre = first >= 0 ? first : Math.max(0, (asked ? asked.column : 1) - 1);
+    // A line that fits is shown whole; a longer one is cut so that the first place stays in view.
+    const from = cells.length <= PREVIEW_WIDTH ? 0 : Math.max(0, Math.min(centre - PREVIEW_LEAD, cells.length - PREVIEW_WIDTH));
+    const to = Math.min(cells.length, from + PREVIEW_WIDTH);
+    const parts = [];
+    for (const cell of cells.slice(from, to)) {
+      const last = parts[parts.length - 1];
+      if (last && last.mark === cell.mark) last.text += cell.ch;
+      else parts.push({ text: cell.ch, mark: cell.mark });
+    }
+    if (from > 0) parts.unshift({ text: '…', mark: false });
+    if (to < cells.length) parts.push({ text: '…', mark: false });
+    return { line, text: parts.map((p) => p.text).join(''), parts };
   });
   return { lines: shown, more: numbers.length - shown.length };
 }
@@ -102,6 +143,6 @@ export function hiddenLines(text, options, escape = null) {
  */
 export function judgedSchema(subject, got, schemaType) {
   const version = got?.schema?.version ?? null;
-  const found = schemaType ? hiddenPlaces(got?.schemaText, { leadingBom: schemaType === 'xsd' }) : null;
+  const found = schemaType ? hiddenPlaces(got?.schemaText, { leadingBom: schemaType === 'xsd', schemaType }) : null;
   return { version, problem: found ? { subject, version, text: found.text } : null };
 }

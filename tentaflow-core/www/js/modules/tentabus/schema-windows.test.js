@@ -23,9 +23,9 @@ const {
   profileChanges, xsdChanges, hl7DropOffer, dropRequired, HL7_PROFILE_EXAMPLE, AVRO_SCHEMA_EXAMPLE, PROTOBUF_SCHEMA_EXAMPLE, THRIFT_SCHEMA_EXAMPLE, addTextHint, addTextMore,
   addedNotice, incompatibilityReason, refusalHtml, boundTopics, effectiveVersion, versionImpact, versionDeprecateImpact, subjectDeprecateImpact,
   openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete,
-  ruleFieldIssues, renamedRuleRequest, hiddenRefusal, keptSpellingsText, renameConsequence, noticeToast,
+  ruleFieldIssues, renamedRuleRequest, hiddenRefusal, hiddenRefusals, keptSpellingsText, renameConsequence, renameOutcome, noticeToast,
 } = await import('./schema-windows.js');
-const { sentenceHtml, hiddenLines } = await import('./hidden-notice.js');
+const { sentenceHtml, hiddenLines, hiddenPlaces } = await import('./hidden-notice.js');
 
 const norm = (s) => String(s).replace(/[  ]/g, ' ').replace(/\s+/g, ' ').trim();
 const tick = () => new Promise((r) => setTimeout(r, 20));
@@ -1349,7 +1349,7 @@ const RULES = [
 test('rules naming fields a new version lacks are found, the ones that differ only by a hidden character are renames', () => {
   const issues = ruleFieldIssues({ rules: RULES, newText: JSON.stringify({ type: 'object', properties: { pacjent: {}, termin: {} } }), schemaType: 'json_schema' });
   assert.deepEqual(issues.gone, [{ name: `pac${RLO}jent`, topics: ['wizyty'] }]);
-  assert.deepEqual(issues.renames, [{ from: `pac${RLO}jent`, to: 'pacjent' }]);
+  assert.deepEqual(issues.renames, [{ from: `pac${RLO}jent`, to: 'pacjent', topics: ['wizyty'] }]);
   // A name the new version drops for good is a warning without a rename.
   const dropped = ruleFieldIssues({ rules: RULES, newText: JSON.stringify({ type: 'object', properties: { termin: {} } }), schemaType: 'json_schema' });
   assert.deepEqual(dropped.renames, []);
@@ -1362,7 +1362,7 @@ test('rules naming fields a new version lacks are found, the ones that differ on
   // A schema whose fields cannot all be listed: no claim that a field is gone, the certain rename still stands.
   const open = ruleFieldIssues({ rules: RULES, newText: JSON.stringify({ properties: { pacjent: {} }, patternProperties: { '^x': {} } }), schemaType: 'json_schema' });
   assert.deepEqual(open.gone, []);
-  assert.deepEqual(open.renames, [{ from: `pac${RLO}jent`, to: 'pacjent' }]);
+  assert.deepEqual(open.renames, [{ from: `pac${RLO}jent`, to: 'pacjent', topics: ['wizyty'] }]);
 });
 
 test('a renamed rule keeps everything but the name, a rule without the name is left alone', () => {
@@ -1393,10 +1393,11 @@ test('"Nowa wersja" warns about the rules whose fields the new text lacks and re
   assert.equal(label, 'Zmień też w tych zasadach nazwy pól, które różnią się tylko niewidocznym znakiem: pac⟦U+202E⟧jent → pacjent.');
   assert.equal(win.querySelector('[data-role="rename-wrap"]').hidden, false);
   assert.equal(win.querySelector('[data-role="rename-rules"]').checked, false, 'widening what readers see is never on by itself');
-  const off = 'Bez zaznaczenia zasady ukrywania danych zostają bez zmian, więc odbiorcy tych topików przestaną widzieć w nowych wiadomościach: pacjent.';
-  const on = 'Po zaznaczeniu zasady zaczną dopuszczać pacjent, więc odbiorcy tych topików zobaczą w nowych wiadomościach dane, które teraz są przed nimi ukryte.';
+  const off = 'Bez zaznaczenia zasady zostaną bez zmian, więc odbiorcy tego topiku przestaną widzieć w nowych wiadomościach pole pac⟦U+202E⟧jent.';
+  const on = 'Po zaznaczeniu zasady będą dopuszczać pole pacjent zamiast pac⟦U+202E⟧jent, więc odbiorcy tego topiku będą je widzieć w nowych wiadomościach tak jak dotąd.';
   const impact = () => norm(win.querySelector('[data-role="impact"]').textContent);
   assert.equal(norm(win.querySelector('[data-role="rename-effect"]').textContent), off, 'unticked, the box says what the readers lose');
+  assert.equal(win.querySelector('[data-role="rename-effect"]').classList.contains('muted'), false, 'the consequence is not a faint hint');
   assert.ok(impact().endsWith(off), `the same consequence stands in "Co się stanie po dodaniu": ${impact()}`);
   const box = win.querySelector('[data-role="rename-rules"]');
   box.checked = true;
@@ -1406,8 +1407,8 @@ test('"Nowa wersja" warns about the rules whose fields the new text lacks and re
   assert.ok(!impact().includes(off));
   win.querySelector('[data-act="save"]').click();
   await tick();
-  assert.deepEqual(renamed, [[{ from: `pac${RLO}jent`, to: 'pacjent' }]]);
-  assert.deepEqual(done, [{ version: 2, deduplicated: false, ruleRename: { renamed: 2, fields: [{ from: `pac${RLO}jent`, to: 'pacjent' }] } }]);
+  assert.deepEqual(renamed, [[{ from: `pac${RLO}jent`, to: 'pacjent', topics: ['wizyty'] }]]);
+  assert.deepEqual(done, [{ version: 2, deduplicated: false, ruleRename: { renamed: 2, fields: [{ from: `pac${RLO}jent`, to: 'pacjent', topics: ['wizyty'] }] } }]);
   await new Promise((r) => setTimeout(r, 300));
 });
 
@@ -1432,7 +1433,7 @@ test('"Nowa wersja": a rename left unticked is not done, and a rename that fails
   win.querySelector('[data-act="save"]').click();
   await tick();
   assert.deepEqual(renamed, [], 'unticked, as it starts: no rule is touched');
-  assert.deepEqual(done, [{ version: 2, deduplicated: false, ruleRenameDeclined: [{ from: `pac${RLO}jent`, to: 'pacjent' }] }], 'the unticked offer is handed on, so the notice can say what it left');
+  assert.deepEqual(done, [{ version: 2, deduplicated: false, ruleRenameDeclined: [{ from: `pac${RLO}jent`, to: 'pacjent', topics: ['wizyty'] }] }], 'the unticked offer is handed on, so the notice can say what it left');
   closeAll();
   win = make(async () => { throw new Error('boom'); });
   await tick();
@@ -1441,7 +1442,7 @@ test('"Nowa wersja": a rename left unticked is not done, and a rename that fails
   await tick();
   assert.equal(done.length, 2);
   assert.equal(done[1].version, 2, 'the version is in');
-  assert.deepEqual(done[1].ruleRename, { error: 'brak prawa', renamed: 0, fields: [{ from: `pac${RLO}jent`, to: 'pacjent' }] });
+  assert.deepEqual(done[1].ruleRename, { error: 'brak prawa', renamed: 0, fields: [{ from: `pac${RLO}jent`, to: 'pacjent', topics: ['wizyty'] }] });
   // A failure after some rules were renamed says how many.
   closeAll();
   win = make(async () => { throw Object.assign(new Error('boom'), { renamedRules: 1 }); });
@@ -1476,7 +1477,7 @@ test('a rename is not offered when the cleaned name was a field of its own in th
   assert.deepEqual(widened.renames, [], 'the rule would start to show the field that was hidden from its readers');
   assert.deepEqual(widened.gone, [{ name: `x${ZW}`, topics: ['t'] }], 'the field is still said to be gone');
   const only = JSON.stringify({ type: 'object', properties: { [`x${ZW}`]: {} } });
-  assert.deepEqual(ruleFieldIssues({ rules, newText, oldText: only, schemaType: 'json_schema' }).renames, [{ from: `x${ZW}`, to: 'x' }]);
+  assert.deepEqual(ruleFieldIssues({ rules, newText, oldText: only, schemaType: 'json_schema' }).renames, [{ from: `x${ZW}`, to: 'x', topics: ['t'] }]);
 });
 
 test('the window offers no rename for a name that also existed clean in the stored text', async () => {
@@ -1538,15 +1539,80 @@ test('more lines than fit are counted, not all drawn, and every character is sti
   assert.match(norm(box.querySelector('.tb-hidden-preview').firstElementChild.textContent), /i jeszcze 3\.$/, 'five places and a count of the other three');
 });
 
-test('a character written as an escape sequence is shown on its line as typed, and the button is not promised to remove it', () => {
+test('a character written as an escape sequence is shown on its line as typed with the sequence highlighted, and the button is not promised to remove it', () => {
   const text = '{\n  "a": "x\\u202Ey"\n}';
   const box = refusedBox('json_schema', HIDDEN_SERVER(2, 11, true), text);
   const head = norm(box.firstElementChild.textContent);
-  assert.match(head, /jako sekwencję specjalną/);
+  assert.match(head, /jako sekwencję specjalną \(np\. \\u202E\)/);
   assert.match(head, /nie usunie/);
   assert.match(head, /W wierszu 2, w kolumnie 11\.$/);
   assert.deepEqual([...box.querySelectorAll('.tb-hidden-line-text')].map((e) => e.textContent), ['  "a": "x\\u202Ey"']);
-  assert.equal(box.querySelector('.tb-hidden-preview').firstElementChild.className, 'tb-vr-hint', 'no character of the text itself to list');
+  assert.deepEqual([...box.querySelectorAll('.tb-hidden-line-text mark')].map((e) => e.textContent), ['\\u202E'], 'the sequence is the highlighted part');
+  const preview = [...box.querySelector('.tb-hidden-preview').children].map((e) => norm(e.textContent));
+  assert.match(preview[0], /^Niewidoczne znaki zapisane sekwencjami specjalnymi .* U\+202E .* zapisany jako sekwencja specjalna w wierszu 2, w kolumnie 10\.$/);
+  assert.match(preview[1], /sekwencja specjalna niewidocznego znaku jest tu zaznaczona/, 'a separate heading for escape-only refusals');
+  assert.doesNotMatch(preview.join(' '), /Wiersze do poprawienia \(niewidoczny znak jest tu pokazany/);
+});
+
+test('the example of an escape sequence in the explanation is the one of the pattern\'s own format', () => {
+  const explained = (schemaType, text) => norm(refusedBox(schemaType, HIDDEN_SERVER(1, 1, true), text).firstElementChild.textContent);
+  assert.match(explained('json_schema', ''), /\(np\. \\u202E\)/);
+  assert.match(explained('avro', ''), /\(np\. \\u202E\)/);
+  assert.match(explained('xsd', ''), /\(np\. &#x202E;\)/);
+  assert.match(explained('protobuf', ''), /\(np\. \\xe2\\x80\\xae\)/);
+});
+
+test('the browser reads the escape forms of each format and lists them; the button is promised for the characters themselves only', () => {
+  const at = (schemaType, text) => hiddenPlaces(text, { schemaType })?.escapes.map((p) => [p.code, p.line, p.column]);
+  assert.deepEqual(at('json_schema', '{\n  "a\\u202Eb": "\\ud83d\\ude00\\udb40\\udc41"\n}'), [['U+202E', 2, 5], ['U+E0041', 2, 28]]);
+  assert.deepEqual(at('avro', '{"a":"\\u2066"}'), [['U+2066', 1, 7]]);
+  assert.deepEqual(at('xsd', '<a b="&#x202E;"/>\n<c>&#8238; &#00000000008238; &#x0000000202E;</c>'), [['U+202E', 1, 7], ['U+202E', 2, 4], ['U+202E', 2, 12], ['U+202E', 2, 30]]);
+  assert.deepEqual(at('protobuf', 'option x = "a\\xe2\\x80\\xaeb\\342\\200\\256";'), [['U+202E', 1, 14], ['U+202E', 1, 27]]);
+  assert.deepEqual(at('protobuf', 'option x = "\\342\\200\\248";'), [['U+2028', 1, 13]], 'the lexer reads 8 and 9 after the first octal digit');
+  // What the formats use below U+0100 for their own controls and bytes is not refused, U+00AD and U+0085 are.
+  assert.equal(at('json_schema', '{"pattern":"^[^\\u0000-\\u001F]*$"}'), undefined);
+  assert.equal(at('xsd', '<p v="[^&#x7F;-&#x9F;]*&#10;&#x9;&#13;"/>'), undefined);
+  assert.equal(at('protobuf', 'option x = "\\x00\\x01";'), undefined);
+  assert.deepEqual(at('json_schema', '"\\u00ad\\u0085"'), [['U+00AD', 1, 2], ['U+0085', 1, 8]]);
+  assert.equal(at('thrift', 'const string a = "\\u202e"'), undefined, 'Thrift has no such escape');
+  assert.equal(at('xsd', '<!-- &#x202E; --><![CDATA[&#x202E;]]>'), undefined, 'comments and CDATA are not decoded');
+  const mixed = hiddenPlaces(`a${RLO}b "\\u202E"`, { schemaType: 'json_schema' });
+  assert.equal(mixed.raw.length, 1);
+  assert.equal(mixed.escapes.length, 1);
+  assert.match(mixed.rawText, /^U\+202E/);
+  assert.match(mixed.escapeText, /zapisany jako sekwencja specjalna/);
+  assert.equal(hiddenPlaces('{"a":"\\u202E"}', {}), null, 'without a kind only the characters themselves count');
+});
+
+test('the live row names the escape sequences and leaves the button out when there is nothing it can remove', () => {
+  closeAll();
+  const win = openSchemaAdd({
+    instanceId: 'i', schemaTypes: ['json_schema', 'xsd'], existingNames: () => [], register: async () => ({ version: 1 }), describeError: String, onAdded: () => {},
+  });
+  const text = win.querySelector('[data-role="text"]');
+  type(text, '{"type":"string","description":"x\\u202Ey"}');
+  const row = win.querySelector('[data-role="hidden-row"]');
+  assert.equal(row.hidden, false);
+  assert.match(norm(win.querySelector('[data-role="hidden-places"]').textContent), /^Niewidoczne znaki zapisane sekwencjami specjalnymi/);
+  assert.equal(win.querySelector('[data-role="strip-wrap"]').hidden, true, 'the button cannot remove a sequence, so it is not offered');
+  type(text, `{"type":"string","description":"x\\u202Ey${RLO}"}`);
+  assert.equal(win.querySelector('[data-role="strip-wrap"]').hidden, false);
+  assert.match(norm(win.querySelector('[data-role="hidden-places"]').textContent), /^Niewidoczne znaki w tekście: U\+202E .*Niewidoczne znaki zapisane sekwencjami specjalnymi/);
+  win.close(true);
+});
+
+test('the server lists every refused place and the browser reads them all', () => {
+  const server = `${HIDDEN_SERVER(2, 5)}; U+200B (ZERO WIDTH SPACE) at line 3, column 1 (written as an escape sequence); and 7 more`;
+  const got = hiddenRefusals(`invalid schema: ${server}`);
+  assert.deepEqual(got.places.map((p) => [p.code, p.line, p.column, p.escape]), [['U+202E', 2, 5, false], ['U+200B', 3, 1, true]]);
+  assert.equal(got.more, 7);
+  assert.deepEqual(hiddenRefusal(`invalid schema: ${server}`), got.places[0]);
+  assert.equal(hiddenRefusals('invalid schema: not JSON'), null);
+  // Mixed: the sentence of the character itself, and then the one about the sequence.
+  const box = refusedBox('json_schema', server, `{\n  "a${RLO}": 1,\n"\\u200B": 1\n}`);
+  const head = norm(box.firstElementChild.textContent);
+  assert.match(head, /Użyj „Usuń niewidoczne znaki”/);
+  assert.match(head, /Część takich znaków jest zapisana jako sekwencja specjalna \(np\. \\u202E\)/);
 });
 
 test('a long line is cut around the first marker so that it can be found', () => {
@@ -1556,6 +1622,19 @@ test('a long line is cut around the first marker so that it can be found', () =>
   assert.ok(lines[0].text.startsWith('…') && lines[0].text.endsWith('…'));
   assert.ok(lines[0].text.includes('⟦U+202E⟧'));
   assert.ok([...lines[0].text].length <= 122);
+});
+
+test('a line is cut only when it is longer than the preview, and the cut keeps the whole width', () => {
+  const lineOf = (before, after) => hiddenLines(`${'a'.repeat(before)}${RLO}${'b'.repeat(after)}`, {}, null).lines[0];
+  const short = lineOf(60, 30);
+  assert.equal(short.text, `${'a'.repeat(60)}⟦U+202E⟧${'b'.repeat(30)}`, 'a line that fits is shown whole');
+  // The marker is near the end: the window is moved back so that it is full, not left half empty.
+  const tail = lineOf(200, 5);
+  assert.ok(tail.text.startsWith('…') && !tail.text.endsWith('…'));
+  assert.equal([...tail.text].length, 1 + 120);
+  assert.ok(tail.text.includes('⟦U+202E⟧bbbbb'));
+  const middle = lineOf(200, 200);
+  assert.equal([...middle.text].length, 122);
 });
 
 test('the sentence about stored spellings says "if any" unless a topic holds messages, and counts the names it does not list', () => {
@@ -1568,16 +1647,27 @@ test('the sentence about stored spellings says "if any" unless a topic holds mes
 
 test('a name with a marker stays on one line, and everything else in the sentence is escaped text', () => {
   const html = sentenceHtml('Zostawia: pac⟦U+200B⟧jent, ter⟦U+202E⟧min <b> i tyle.');
-  assert.ok(html.includes('<span class="tb-hidden-name">pac⟦U+200B⟧jent</span>'));
-  assert.ok(html.includes('<span class="tb-hidden-name">ter⟦U+202E⟧min</span>'));
+  assert.ok(html.includes('<span class="tb-hidden-name" style="white-space:nowrap">pac⟦U+200B⟧jent</span>'), 'the no-wrap rule is inline, so a shadow-root table cell has it too');
+  assert.ok(html.includes('<span class="tb-hidden-name" style="white-space:nowrap">ter⟦U+202E⟧min</span>'));
   assert.ok(html.includes('&lt;b&gt;') && !html.includes('<b>'));
   assert.equal(sentenceHtml('bez znaków'), 'bez znaków');
 });
 
-test('the consequence of the rename choice is worded for both outcomes', () => {
-  const renames = [{ from: `pac${RLO}jent`, to: 'pacjent' }, { from: `ter${RLO}min`, to: 'termin' }];
-  assert.match(renameConsequence(renames, false), /^Bez zaznaczenia .* przestaną widzieć w nowych wiadomościach: pacjent i termin\.$/);
-  assert.match(renameConsequence(renames, true), /^Po zaznaczeniu zasady zaczną dopuszczać pacjent i termin, .* zobaczą w nowych wiadomościach dane, które teraz są przed nimi ukryte\.$/);
+test('the consequence of the rename choice is worded for both outcomes, with the old and the new names and the topics', () => {
+  const renames = [{ from: `pac${RLO}jent`, to: 'pacjent', topics: ['wizyty'] }, { from: `ter${RLO}min`, to: 'termin', topics: ['wizyty', 'inny'] }];
+  assert.equal(renameConsequence(renames, false), 'Bez zaznaczenia zasady zostaną bez zmian, więc odbiorcy tych topików przestaną widzieć w nowych wiadomościach pola pac⟦U+202E⟧jent i ter⟦U+202E⟧min.');
+  assert.equal(renameConsequence(renames, true), 'Po zaznaczeniu zasady będą dopuszczać pola pacjent i termin zamiast pac⟦U+202E⟧jent i ter⟦U+202E⟧min, więc odbiorcy tych topików będą je widzieć w nowych wiadomościach tak jak dotąd.');
+  assert.match(renameConsequence(renames.slice(0, 1), true), /odbiorcy tego topiku/);
+});
+
+test('after the version was added the rules are described in the past tense, naming the topics, with no "po zaznaczeniu"', () => {
+  const renames = [{ from: `pac${RLO}jent`, to: 'pacjent', topics: ['wizyty'] }];
+  const left = renameOutcome(renames, false);
+  assert.equal(left.text, 'Zasady ukrywania danych nie zostały zmienione: odbiorcy topiku „wizyty” nie zobaczą pola pac⟦U+202E⟧jent w nowych wiadomościach. Zmienisz to w sekcji „Ukrywanie danych”.');
+  assert.deepEqual(left.topics, ['wizyty']);
+  const done = renameOutcome(renames, true);
+  assert.equal(done.text, 'Zasady dopuszczają teraz pole pacjent zamiast pac⟦U+202E⟧jent, więc odbiorcy topiku „wizyty” nadal widzą je w nowych wiadomościach.');
+  for (const t of [left.text, done.text]) assert.doesNotMatch(t, /zaznaczeni/);
 });
 
 test('a notice shown as a toast carries its text, and a warning stays longer', () => {
