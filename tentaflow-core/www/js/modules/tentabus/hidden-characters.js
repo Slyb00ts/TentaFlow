@@ -150,8 +150,7 @@ const hex4 = (text, at) => {
   return HEX4.test(part) ? parseInt(part, 16) : null;
 };
 
-/** The escapes of one JSON string's content; `base` = where it starts in the text. */
-function jsonStringEscapes(text, base, hit) {
+function jsonEscapes(text, hit) {
   let i = 0;
   while (i < text.length) {
     if (text[i] !== '\\') {
@@ -166,57 +165,12 @@ function jsonStringEscapes(text, base, hit) {
       }
       const low = unit >= 0xD800 && unit < 0xDC00 && text.startsWith('\\u', i + 6) ? hex4(text, i + 8) : null;
       if (low != null && low >= 0xDC00 && low < 0xE000) {
-        hit(base + i, base + i + 12, 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00));
+        hit(i, i + 12, 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00));
         i += 12;
       } else {
-        hit(base + i, base + i + 6, unit);
+        hit(i, i + 6, unit);
         i += 6;
       }
-    }
-  }
-}
-
-/**
- * JSON escapes, except those of a regular expression (a `pattern` value, a `patternProperties` key): a pattern is never
- * shown decoded, and a schema that defends against a zero-width space has to name it there. The reading of where a
- * string stands is the one of `text_guard.rs` `json_escapes`.
- */
-function jsonEscapes(text, hit) {
-  const stack = [];
-  let i = 0;
-  while (i < text.length) {
-    const ch = text[i];
-    const top = stack[stack.length - 1];
-    if (ch === '{' || ch === '[') {
-      const inPatternProperties = Boolean(top && top.object && !top.expectKey && top.key === 'patternProperties');
-      stack.push({ object: ch === '{', expectKey: true, key: '', patternProperties: ch === '{' && inPatternProperties });
-      i += 1;
-    } else if (ch === '}' || ch === ']') {
-      stack.pop();
-      i += 1;
-    } else if (ch === ',') {
-      if (top?.object) top.expectKey = true;
-      i += 1;
-    } else if (ch === ':') {
-      if (top?.object) top.expectKey = false;
-      i += 1;
-    } else if (ch === '"') {
-      const start = i + 1;
-      let end = start;
-      while (end < text.length && text[end] !== '"') end += text[end] === '\\' ? 2 : 1;
-      end = Math.min(end, text.length);
-      const content = text.slice(start, end);
-      let exempt = false;
-      if (top?.object && top.expectKey) {
-        top.key = content;
-        exempt = top.patternProperties;
-      } else if (top?.object) {
-        exempt = top.key === 'pattern';
-      }
-      if (!exempt) jsonStringEscapes(content, start, hit);
-      i = end + 1;
-    } else {
-      i += 1;
     }
   }
 }
@@ -293,7 +247,6 @@ const UTF8 = new TextEncoder();
 const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true });
 const PROTO_CONTROL = { a: 7, b: 8, f: 0x0c, n: 0x0a, r: 0x0d, t: 9, v: 0x0b };
 
-/** The reading of a protobuf string literal from its opening quote; returns where it ends. */
 /** Appends the bytes one string literal decodes to; returns where it ends. */
 function protoLiteralBytes(text, open, bytes) {
   const quote = text[open];
@@ -355,15 +308,6 @@ function skipBlank(text, from) {
   }
 }
 
-/** Whether the statement holding the literal at `at` declares a `bytes` field: its default is bytes, not text. */
-function isBytesDefault(text, at) {
-  const before = text.slice(0, at);
-  const statement = before.slice(Math.max(before.lastIndexOf(';'), before.lastIndexOf('{'), before.lastIndexOf('}')) + 1);
-  if (!statement.includes('=')) return false;
-  const tokens = statement.split('=')[0].split(/[^\p{L}\p{N}_.]/u).filter(Boolean);
-  return tokens.length >= 2 && tokens[tokens.length - 2] === 'bytes';
-}
-
 /** Groups the bytes of a joined run as UTF-8 and reports the refused characters some escape wrote. */
 function decodeProtoBytes(bytes, hit) {
   let at = 0;
@@ -390,8 +334,7 @@ function decodeProtoBytes(bytes, hit) {
 
 /**
  * The run of adjacent string literals that starts at `open`: the protobuf lexer joins them (blanks and comments between
- * them are skipped) before it decodes UTF-8, so `"\xE2" "\x80\xAE"` is one character. The default of a `bytes` field
- * is bytes and is not decoded. Returns where the run ends.
+ * them are skipped) before it decodes UTF-8, so `"\xE2" "\x80\xAE"` is one character. Returns where the run ends.
  */
 function protoRun(text, open, hit) {
   const bytes = [];
@@ -402,7 +345,7 @@ function protoRun(text, open, hit) {
     if (text[next] === '"' || text[next] === "'") at = next;
     else break;
   }
-  if (!isBytesDefault(text, open)) decodeProtoBytes(bytes, hit);
+  decodeProtoBytes(bytes, hit);
   return at;
 }
 

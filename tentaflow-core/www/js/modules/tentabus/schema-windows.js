@@ -636,6 +636,7 @@ export function hiddenRefusal(serverText) {
 
 /** How a pattern of this kind writes a refused character as an escape sequence, for the sentence that explains it. */
 const ESCAPE_EXAMPLES = { xsd: '&#x202E;', protobuf: '\\xe2\\x80\\xae' };
+const JSON_KINDS = new Set(['json_schema', 'avro', 'hl7v2_profile']);
 const escapeExample = (schemaType) => ESCAPE_EXAMPLES[schemaType] || '\\u202E';
 
 /** The lines of the refused text that hold the character, so they can be found in a box that draws it reversed or not at all. */
@@ -679,7 +680,12 @@ function refusalReasonOf(schemaType, serverText) {
       atLine: T('schemas.refused.at_line_column', { line: hidden.line, column: hidden.column }),
     });
     const mixed = !hidden.escape && refusal.places.some((p) => p.escape);
-    return `${sentence} ${mixed ? T('schemas.refused.hidden_also_escape', { example: escapeExample(schemaType) }) : ''}`.replace(/\s{2,}/g, ' ').trim();
+    // A JSON text that needs the character in a regular expression writes the escape twice, so the engine reads it.
+    const regex = refusal.places.find((p) => p.escape && p.codePoint <= 0xFFFF);
+    const regexHint = regex && JSON_KINDS.has(schemaType)
+      ? T('schemas.refused.hidden_escape_regex', { regex: `\\\\u${regex.code.slice(2).padStart(4, '0')}`, example: `\\u${regex.code.slice(2).padStart(4, '0')}` })
+      : '';
+    return `${sentence} ${mixed ? T('schemas.refused.hidden_also_escape', { example: escapeExample(schemaType) }) : ''} ${regexHint}`.replace(/\s{2,}/g, ' ').trim();
   }
   if (schemaType === 'hl7v2_profile') {
     let m = /'(MSH-[12])' is the message's own field-separator/.exec(text);

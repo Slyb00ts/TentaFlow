@@ -1009,13 +1009,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   Skutek pola „zmień nazwy w zasadach” podaje stare i nowe nazwy oraz topiki, a
   komunikat po zapisie mówi to w czasie przeszłym i prowadzi do ukrywania danych.
   Dalsze poprawki: sąsiednie literały Protobuf (`"\xE2" "\x80\xAE"`) są łączone
-  przed dekodowaniem UTF-8 jak w lekserze, a domyślna wartość pola `bytes` nie
-  jest dekodowana jako tekst; w XSD odwołania w wartościach atrybutów są czytane
-  także po `<!--`, `<?` i `<![CDATA[` wpisanym w atrybut; sekwencje w wyrażeniu
-  regularnym (`pattern` w JSON Schema, klucz `patternProperties`, `value`
-  elementu `xs:pattern`) nie są odmawiane, bo wyrażenie nie jest nigdzie
-  pokazywane zdekodowane (surowy znak nadal jest); skan przy starcie nie czyta
-  sekwencji JSON w wierszu nieznanego rodzaju; linki do ukrywania danych są też
+  przed dekodowaniem UTF-8 jak w lekserze (także domyślna wartość pola `bytes`:
+  `"\x00\x01"` przechodzi, bo dekoduje się poniżej U+0100, a bajty tworzące
+  odrzucany znak nie); w XSD odwołania w wartościach atrybutów są czytane także
+  po `<!--`, `<?` i `<![CDATA[` wpisanym w atrybut; jedynym wyjątkiem od odmowy
+  sekwencji jest `value` elementu `xs:pattern` (wyrażenie regularne XSD nie ma
+  `\u`; element jest rozpoznawany po nazwie lokalnej, bez sprawdzania
+  przestrzeni nazw). W JSON, Avro i profilu HL7 nie ma wyjątku: znak w `pattern`
+  zapisany jako `\u200B` jest odmawiany, a odmowa podpowiada zapis `\\u200B`
+  (ukośnik przed sekwencją, który silnik wyrażeń czyta jako znak). Skan przy
+  starcie nie czyta sekwencji JSON w wierszu nieznanego rodzaju i dopisuje „(written
+  as an escape sequence)” do linii o sekwencji; linki do ukrywania danych są też
   po udanej i częściowej zmianie nazw. Znane ograniczenie: sekwencja znaku
   sterującego C0/C1 poniżej U+0100 w kluczu lub nazwie przechodzi po stronie
   serwera (panel ją oznacza).

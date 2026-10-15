@@ -10650,7 +10650,7 @@
         "rules_renamed_effect": "Les règles autorisent maintenant {count|le champ|les champs} {to} au lieu de {from} : les lecteurs de {topicCount|topic|topics} {topics} continuent de les voir dans les nouveaux messages.",
         "rules_unchanged": "Les règles de masquage des données n’ont pas été modifiées : les lecteurs de {topicCount|topic|topics} {topics} ne verront pas {count|le champ|les champs} {from} dans les nouveaux messages. Vous pouvez le changer dans la section « Dissimulation des données ».",
         "rules_open": "Dissimulation des données du topic « {topic} »",
-        "topic_quoted": "« {topic} »"
+        "topic_quoted": "« {topic} »"
       },
       "refused": {
         "hl7_msh": "« {field} » décrit les séparateurs du message lui-même et ne peut donc pas être obligatoire. Retirez « {field} » des champs obligatoires.",
@@ -10784,7 +10784,8 @@
         "at_line_column": "À la ligne {line}, colonne {column}.",
         "hidden_character": "Le modèle contient un caractère invisible ou qui change le sens du texte : {code} ({name}). Un tel caractère fait paraître le modèle dans l’éditeur autrement que ce que lit un programme (« Trojan Source »). Les lignes qui en contiennent sont montrées ci-dessous, le caractère écrit ⟦U+XXXX⟧, car la zone de texte peut ne pas l’afficher. Utilisez « Supprimer les caractères invisibles » ou corrigez ces lignes à la main et renvoyez le modèle. {cause} {atLine}",
         "hidden_escape": "Le modèle écrit un caractère invisible ou qui change le sens du texte sous forme de séquence d’échappement (par exemple {example}) : {code} ({name}). « Supprimer les caractères invisibles » ne retire pas une telle séquence : corrigez-la à la main dans la partie surlignée de la ligne montrée ci-dessous et renvoyez le modèle. {atLine}",
-        "hidden_also_escape": "Certains sont écrits sous forme de séquence d’échappement (par exemple {example}) ; « Supprimer les caractères invisibles » ne les retire pas : corrigez-les à la main dans la partie surlignée."
+        "hidden_also_escape": "Certains sont écrits sous forme de séquence d’échappement (par exemple {example}) ; « Supprimer les caractères invisibles » ne les retire pas : corrigez-les à la main dans la partie surlignée.",
+        "hidden_escape_regex": "Pour reconnaître ce caractère dans une expression régulière, écrivez {regex} (séquence dont l’antislash est échappé) au lieu de {example}."
       }
     },
     "topics": {

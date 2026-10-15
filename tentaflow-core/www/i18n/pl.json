@@ -12019,7 +12019,8 @@
         "at_line_column": "W wierszu {line}, w kolumnie {column}.",
         "hidden_character": "Wzór zawiera niewidoczny znak albo znak zmieniający kierunek tekstu: {code} ({name}). Taki znak sprawia, że wzór wygląda w edytorze inaczej, niż odczyta go program („Trojan Source”). Niżej są wiersze z takim znakiem, ze znakiem zapisanym jako ⟦U+XXXX⟧, bo pole tekstowe może go nie pokazywać. Użyj „Usuń niewidoczne znaki” albo popraw te wiersze ręcznie i wyślij wzór ponownie. {cause} {atLine}",
         "hidden_escape": "Wzór zapisuje niewidoczny znak albo znak zmieniający kierunek tekstu jako sekwencję specjalną (np. {example}): {code} ({name}). „Usuń niewidoczne znaki” takiej sekwencji nie usunie — popraw ją ręcznie w zaznaczonym fragmencie wiersza pokazanego niżej i wyślij wzór ponownie. {atLine}",
-        "hidden_also_escape": "Część takich znaków jest zapisana jako sekwencja specjalna (np. {example}) — „Usuń niewidoczne znaki” jej nie usunie, popraw ją ręcznie w zaznaczonym fragmencie."
+        "hidden_also_escape": "Część takich znaków jest zapisana jako sekwencja specjalna (np. {example}) — „Usuń niewidoczne znaki” jej nie usunie, popraw ją ręcznie w zaznaczonym fragmencie.",
+        "hidden_escape_regex": "Chcesz dopasować ten znak w wyrażeniu regularnym? Napisz {regex} (z dodatkowym ukośnikiem) zamiast {example}."
       }
     },
     "topics": {

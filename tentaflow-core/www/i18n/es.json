@@ -10784,7 +10784,8 @@
         "at_line_column": "En la línea {line}, columna {column}.",
         "hidden_character": "El patrón contiene un carácter invisible o que cambia la dirección del texto: {code} ({name}). Un carácter así hace que el patrón se vea en el editor distinto de lo que lee un programa («Trojan Source»). Abajo se muestran las líneas con un carácter así, escrito como ⟦U+XXXX⟧, porque el cuadro de texto puede no mostrarlo. Use «Quitar caracteres invisibles» o corrija esas líneas a mano y envíe el patrón de nuevo. {cause} {atLine}",
         "hidden_escape": "El patrón escribe un carácter invisible o que cambia la dirección del texto como secuencia de escape (por ejemplo {example}): {code} ({name}). «Quitar caracteres invisibles» no elimina una secuencia así: corríjala a mano en la parte resaltada de la línea que se muestra abajo y envíe el patrón de nuevo. {atLine}",
-        "hidden_also_escape": "Algunos están escritos como secuencia de escape (por ejemplo {example}); «Quitar caracteres invisibles» no los elimina: corríjalos a mano en la parte resaltada."
+        "hidden_also_escape": "Algunos están escritos como secuencia de escape (por ejemplo {example}); «Quitar caracteres invisibles» no los elimina: corríjalos a mano en la parte resaltada.",
+        "hidden_escape_regex": "Para coincidir con este carácter en una expresión regular, escriba {regex} (una secuencia con la barra invertida escapada) en lugar de {example}."
       }
     },
     "topics": {

@@ -12019,7 +12019,8 @@
         "at_line_column": "On line {line}, column {column}.",
         "hidden_character": "The pattern contains an invisible character or one that changes the direction of text: {code} ({name}). Such a character makes the pattern look different in an editor from what a program reads (\"Trojan Source\"). The lines that hold one are shown below with the character written as ⟦U+XXXX⟧, because the text box may not show it. Use “Remove invisible characters” or fix those lines by hand and send the pattern again. {cause} {atLine}",
         "hidden_escape": "The pattern writes an invisible character or one that changes the direction of text as an escape sequence (for example {example}): {code} ({name}). “Remove invisible characters” does not remove such a sequence — fix it by hand in the highlighted part of the line shown below and send the pattern again. {atLine}",
-        "hidden_also_escape": "Some of them are written as escape sequences (for example {example}); “Remove invisible characters” does not remove those — fix them by hand in the highlighted part."
+        "hidden_also_escape": "Some of them are written as escape sequences (for example {example}); “Remove invisible characters” does not remove those — fix them by hand in the highlighted part.",
+        "hidden_escape_regex": "To match this character in a regular expression, write {regex} (a backslash-escaped escape) instead of {example}."
       }
     },
     "topics": {

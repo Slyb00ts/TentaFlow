@@ -1545,13 +1545,19 @@ test('a character written as an escape sequence is shown on its line as typed wi
   const head = norm(box.firstElementChild.textContent);
   assert.match(head, /jako sekwencję specjalną \(np\. \\u202E\)/);
   assert.match(head, /nie usunie/);
-  assert.match(head, /W wierszu 2, w kolumnie 11\.$/);
+  assert.match(head, /W wierszu 2, w kolumnie 11\./);
   assert.deepEqual([...box.querySelectorAll('.tb-hidden-line-text')].map((e) => e.textContent), ['  "a": "x\\u202Ey"']);
   assert.deepEqual([...box.querySelectorAll('.tb-hidden-line-text mark')].map((e) => e.textContent), ['\\u202E'], 'the sequence is the highlighted part');
   const preview = [...box.querySelector('.tb-hidden-preview').children].map((e) => norm(e.textContent));
   assert.match(preview[0], /^Niewidoczne znaki zapisane sekwencjami specjalnymi .* U\+202E .* zapisany jako sekwencja specjalna w wierszu 2, w kolumnie 10\.$/);
   assert.match(preview[1], /sekwencja specjalna niewidocznego znaku jest tu zaznaczona/, 'a separate heading for escape-only refusals');
   assert.doesNotMatch(preview.join(' '), /Wiersze do poprawienia \(niewidoczny znak jest tu pokazany/);
+});
+
+test('a JSON refusal tells how to match the character in a regular expression, the other formats do not', () => {
+  const explained = (schemaType) => norm(refusedBox(schemaType, HIDDEN_SERVER(1, 1, true), '').firstElementChild.textContent);
+  for (const kind of ['json_schema', 'avro', 'hl7v2_profile']) assert.match(explained(kind), /Napisz \\\\u202E \(z dodatkowym ukośnikiem\) zamiast \\u202E\./, kind);
+  for (const kind of ['xsd', 'protobuf', 'thrift']) assert.doesNotMatch(explained(kind), /dodatkowym ukośnikiem/, kind);
 });
 
 test('the example of an escape sequence in the explanation is the one of the pattern\'s own format', () => {
@@ -1579,16 +1585,23 @@ test('the browser reads the escape forms of each format and lists them; the butt
   // Adjacent literals are joined before they are decoded; a bytes default is not text.
   assert.deepEqual(at('protobuf', 'option x = "a\\xE2" \'\\x80\\xAEb\';'), [['U+202E', 1, 14]]);
   assert.deepEqual(at('protobuf', 'optional string a = 1 [default = "\\xE2" /*x*/\n "\\x80\\xAE"];'), [['U+202E', 1, 35]]);
-  assert.equal(at('protobuf', 'optional bytes magic = 1 [default = "\\xEF\\xBB\\xBF"];'), undefined);
+  // The word bytes hides nothing: a default below U+0100 passes, a refused character in text form does not.
+  assert.equal(at('protobuf', 'optional bytes magic = 1 [default = "\\x00\\x01"];'), undefined);
+  for (const text of ['bytes b = 1 [json_name = "\\xE2\\x80\\xAE"];', 'map<string, bytes> m = 1 [json_name = "\\xE2\\x80\\xAE"];', '// bytes\n optional string s = 1 [default = "\\xE2\\x80\\xAE"];', 'optional string s = 1 [default = "a;bytes b="]; optional string t = 2 [default = "\\xE2\\x80\\xAE"];', 'optional bytes b = 1 [default = "\\xE2\\x80\\xAE"];']) {
+    assert.equal(at('protobuf', text)?.length, 1, text);
+  }
   assert.deepEqual(at('protobuf', 'optional string bytes = 1 [default = "\\xE2\\x80\\xAE"];'), [['U+202E', 1, 39]]);
   // A reference in an attribute value is read although the value holds a comment opener; a pattern's value is not decoded.
   assert.deepEqual(at('xsd', '<e v="a<!--"/><e v="&#x202E;x"/><e v="-->"/>'), [['U+202E', 1, 21]]);
   assert.deepEqual(at('xsd', '<e v="a<?"/><e v="&#x202E;x"/><e v="?>"/>'), [['U+202E', 1, 19]]);
   assert.equal(at('xsd', '<xs:pattern value="[^&#x200B;&#xFEFF;]*"/>'), undefined);
   assert.deepEqual(at('xsd', '<xs:pattern id="&#x200B;" value="x"/>'), [['U+200B', 1, 17]]);
-  // A JSON pattern and a patternProperties key are not decoded either, nothing else is exempt.
-  assert.equal(at('json_schema', '{"pattern":"^[^\\u200B\\uFEFF]*$","patternProperties":{"^[^\\u200B]+$":{}}}'), undefined);
-  assert.deepEqual(at('json_schema', '{"pattern":"x","description":"\\u200B","properties":{"a\\u200B":{}}}'), [['U+200B', 1, 31], ['U+200B', 1, 55]]);
+  // JSON has no exemption for a member called pattern; an escape written twice is a regular expression's own.
+  for (const text of ['{"const":{"pattern":"a\\u200B"}}', '{"pattern":"^[^\\u200B]*$"}', '{"patternProperties":{"^[^\\u200B]+$":{}}}']) {
+    assert.equal(at('json_schema', text)?.length, 1, text);
+  }
+  assert.equal(at('avro', '{"name":"pattern","type":"string","default":"a\\u200B"}')?.length, 1);
+  assert.equal(at('json_schema', '{"pattern":"^[^\\\\u200B]*$"}'), undefined);
   const mixed = hiddenPlaces(`a${RLO}b "\\u202E"`, { schemaType: 'json_schema' });
   assert.equal(mixed.raw.length, 1);
   assert.equal(mixed.escapes.length, 1);
