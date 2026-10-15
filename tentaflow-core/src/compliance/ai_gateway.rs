@@ -149,8 +149,10 @@ impl AiGateway {
 
     /// Applies the active token quotas to a call that has not been made yet,
     /// without opening an event. `Err` is either the spent-quota refusal
-    /// (`CoreError::RateLimitExceeded`) or a [`QuotaReadError`] when the quota
-    /// could not be read; the caller decides what an unknown quota means.
+    /// (`CoreError::RateLimitExceeded`) or an infrastructure failure: a
+    /// [`QuotaReadError`] when the quota could not be read, or a poisoned DB lock
+    /// / unresolvable organization. Callers must treat anything other than
+    /// `RateLimitExceeded` as "quota unknown" and decide what that means.
     pub fn check_token_quota(
         &self,
         model_id: &str,

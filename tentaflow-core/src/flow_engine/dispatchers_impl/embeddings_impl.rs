@@ -258,4 +258,29 @@ mod tests {
         assert!(format!("{error:#}").contains("token quota exceeded"), "{error:#}");
         assert!(events(&db).is_empty(), "a refused call opens no event");
     }
+
+    #[tokio::test]
+    async fn an_unreadable_quota_is_fatal_for_a_process_embeddings_call() {
+        let (db, org, dispatcher) = setup();
+        crate::db::repository::create_token_quota(
+            &db,
+            &crate::db::models::NewTokenQuota {
+                org_id: &org,
+                scope_type: "org",
+                subject_id: None,
+                model_id: None,
+                period: "daily",
+                max_total_tokens: 0,
+                is_active: true,
+            },
+        )
+        .unwrap();
+        db.write()
+            .unwrap()
+            .execute("UPDATE token_quota SET max_total_tokens = X'00'", [])
+            .unwrap();
+        let error = dispatcher.embed(request(process(&org))).await.unwrap_err();
+        assert!(format!("{error:#}").contains("quota unreadable"), "{error:#}");
+        assert!(events(&db).is_empty(), "a refused call opens no event");
+    }
 }
