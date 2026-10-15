@@ -11870,7 +11870,11 @@
         "rules_rename": "Zmień też w tych zasadach nazwy pól, które różnią się tylko niewidocznym znakiem: {pairs}.",
         "rules_renamed": "Zmieniono nazwy pól w {count} {count|zasadzie|zasadach|zasadach} ukrywania danych.",
         "rules_rename_failed": "Wersja została dodana, ale nie udało się zmienić nazw pól w zasadach ukrywania danych: {error}. Popraw je w sekcji „Ukrywanie danych”.",
-        "diff_only_removal": "Różnica względem wersji {version}: tylko usunięte niewidoczne znaki; pola i wymagania bez zmian."
+        "rules_rename_partial": "Wersja została dodana, nazwy pól zmieniono w {count} {count|zasadzie|zasadach|zasadach} ukrywania danych, po czym zmiana się nie powiodła: {error}. Popraw pozostałe w sekcji „Ukrywanie danych”.",
+        "diff_only_removal": "Różnica względem wersji {version}: tylko usunięte niewidoczne znaki; pola i wymagania bez zmian.",
+        "diff_only_removal_names": "Różnica względem wersji {version}: usunięte są tylko niewidoczne znaki, ale były w {count} {count|nazwie lub wartości|nazwach lub wartościach|nazwach lub wartościach}: {pairs}.",
+        "rules_rename_effect": "Uwaga: to zmienia, jakie dane widzą odbiorcy tych topików, bo ich zasady zaczną dopuszczać pole pod oczyszczoną nazwą.",
+        "old_spelling_kept": "Zapisane już wiadomości zachowują starą pisownię {count} {count|nazwy lub wartości|nazw lub wartości|nazw lub wartości}: {names}. Wersja przeszła sprawdzenie zgodności dopiero po usunięciu niewidocznych znaków z poprzedniej."
       },
       "refused": {
         "hl7_msh": "„{field}” opisuje same znaki podziału wiadomości, więc nie może być wymagane. Usuń „{field}” z pól wymaganych.",

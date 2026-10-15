@@ -344,6 +344,10 @@ pub struct RegisterOutcome {
     pub version: u32,
     pub schema_ref_id: u32,
     pub deduplicated: bool,
+    /// Names and values the previous version spelled with a refused character
+    /// and the stored records still do (`pac⟦U+202E⟧jent`); see
+    /// `SchemaKindOps::check_compatibility_noting`.
+    pub old_spelling_kept: Vec<String>,
 }
 
 /// The version a topic's `schema_id` binding currently resolves to — the
@@ -578,25 +582,31 @@ pub fn register(
             version: dup.version,
             schema_ref_id: dup.schema_ref_id,
             deduplicated: true,
+            old_spelling_kept: Vec::new(),
         });
     }
 
     // Extracted so the `VersionSlotTaken` retry below can re-run the SAME
     // check against a freshly re-read `latest` (review finding #2) instead
     // of duplicating this logic.
+    let old_spelling_kept = std::cell::RefCell::new(Vec::<String>::new());
     let check_compat = |latest_row: &DbBusSchemaVersion,
                         effective_compatibility: Compatibility|
      -> Result<(), BusServiceError> {
+        old_spelling_kept.borrow_mut().clear();
         if effective_compatibility == Compatibility::None {
             return Ok(());
         }
         schema_type
             .ops()
-            .check_compatibility(
+            .check_compatibility_noting(
                 &latest_row.schema_text,
                 schema_text,
                 effective_compatibility,
             )
+            .map(|kept| {
+                *old_spelling_kept.borrow_mut() = kept;
+            })
             .map_err(|e| match e {
                 SchemaError::Incompatible(detail) => BusServiceError::SchemaIncompatible {
                     subject: subject.to_string(),
@@ -774,6 +784,7 @@ pub fn register(
                     version: dup.version,
                     schema_ref_id: dup.schema_ref_id,
                     deduplicated: true,
+                    old_spelling_kept: Vec::new(),
                 }),
                 None => Err(BusServiceError::Db(
                     "content_hash collision reported but no matching row found".to_string(),
@@ -821,6 +832,7 @@ pub fn register(
                         version: retried_version,
                         schema_ref_id,
                         deduplicated: false,
+                        old_spelling_kept: old_spelling_kept.take(),
                     });
                 }
                 Err(BusSchemaVersionInsertError::ContentHashCollision { .. }) => {
@@ -835,6 +847,7 @@ pub fn register(
                             version: dup.version,
                             schema_ref_id: dup.schema_ref_id,
                             deduplicated: true,
+                            old_spelling_kept: Vec::new(),
                         }),
                         None => Err(BusServiceError::Db(
                             "content_hash collision reported but no matching row found".to_string(),
@@ -875,6 +888,7 @@ pub fn register(
         version: next_version,
         schema_ref_id,
         deduplicated: false,
+        old_spelling_kept: old_spelling_kept.take(),
     })
 }
 
@@ -2103,6 +2117,8 @@ mod tests {
         // renamed (new required `pacjent`, old `pac<RLO>jent`) would be refused.
         let out = register_text(&db, "patient", SchemaType::JsonSchema, PATIENT_V2_CLEAN).unwrap();
         assert_eq!(out.version, 2);
+        // Stored records keep the old spelling, and the answer says which.
+        assert_eq!(out.old_spelling_kept, vec!["pac⟦U+202E⟧jent".to_string()]);
         // A real change over the same stored text is still judged, and the
         // refusal does not carry the stored character.
         let db = fresh_db();
@@ -2125,6 +2141,63 @@ mod tests {
         assert!(detail
             .chars()
             .all(|c| text_guard::find_hidden(&c.to_string(), false).is_none()));
+    }
+
+    fn status_schema(values: &str, keyword: &str) -> String {
+        format!(
+            "{{\"type\":\"object\",\"properties\":{{\"status\":{{\"{keyword}\":{values}}}}}}}"
+        )
+    }
+
+    #[test]
+    fn a_corrected_enum_or_const_value_reports_the_spelling_stored_records_keep() {
+        for (keyword, old, new) in [
+            ("enum", "[\"a\u{200B}b\",\"c\"]", "[\"ab\",\"c\"]"),
+            ("const", "\"a\u{200B}b\"", "\"ab\""),
+        ] {
+            let db = fresh_db();
+            register_text(&db, "s", SchemaType::JsonSchema, V1).unwrap();
+            plant(&db, "s", &status_schema(old, keyword));
+            let out =
+                register_text(&db, "s", SchemaType::JsonSchema, &status_schema(new, keyword))
+                    .unwrap();
+            assert_eq!(out.version, 2, "{keyword}");
+            assert_eq!(out.old_spelling_kept, vec!["a⟦U+200B⟧b".to_string()], "{keyword}");
+        }
+    }
+
+    #[test]
+    fn a_hidden_character_nothing_compares_leaves_no_old_spelling_to_report() {
+        let db = fresh_db();
+        register_text(&db, "s", SchemaType::JsonSchema, V1).unwrap();
+        let described = "{\"title\":\"x\u{200B}y\",\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\"}}}";
+        plant(&db, "s", described);
+        let out = register_text(
+            &db,
+            "s",
+            SchemaType::JsonSchema,
+            &described.replace('\u{200B}', ""),
+        )
+        .unwrap();
+        assert!(out.old_spelling_kept.is_empty());
+    }
+
+    #[test]
+    fn a_removal_that_would_merge_two_stored_keys_is_refused_by_name() {
+        let db = fresh_db();
+        register_text(&db, "s", SchemaType::JsonSchema, V1).unwrap();
+        plant(
+            &db,
+            "s",
+            "{\"type\":\"object\",\"properties\":{\"pesel\":{\"type\":\"string\"},\"pesel\u{200B}\":{\"type\":\"integer\"}}}",
+        );
+        let clean = "{\"type\":\"object\",\"properties\":{\"pesel\":{\"type\":\"string\"}}}";
+        let err = register_text(&db, "s", SchemaType::JsonSchema, clean).unwrap_err();
+        let BusServiceError::SchemaIncompatible { detail, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert!(detail.contains("'pesel'"), "{detail}");
+        assert!(detail.contains("invisible"), "{detail}");
     }
 
     #[test]

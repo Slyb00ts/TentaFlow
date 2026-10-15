@@ -143,3 +143,32 @@ export function stripHidden(text, { leadingBom = false } = {}) {
   }
   return out;
 }
+
+const WORD_PUNCTUATION = '_-.:$';
+const isWordCharacter = (ch) => /[\p{L}\p{N}]/u.test(ch) || WORD_PUNCTUATION.includes(ch);
+
+/**
+ * The words of `text` that hold a refused character, `{ shown, clean }` each
+ * (`pac⟦U+202E⟧jent` → `pacjent`), once and in order of appearance: the names
+ * and values a correction respells. Words are what the server's own list
+ * (`text_guard::hidden_spellings`) splits on.
+ */
+export function hiddenWords(text, { leadingBom = false } = {}) {
+  const out = new Map();
+  let word = '';
+  const flush = () => {
+    const clean = stripHidden(word);
+    if (clean !== word && /[\p{L}\p{N}]/u.test(clean)) out.set(word, { shown: showHidden(word), clean });
+    word = '';
+  };
+  let index = 0;
+  for (const ch of String(text ?? '')) {
+    const cp = ch.codePointAt(0);
+    const bom = leadingBom && index === 0 && cp === 0xFEFF;
+    if (!bom && (isWordCharacter(ch) || ((cp >= 0x7F || cp < 0x20) && hiddenCharacterName(cp)))) word += ch;
+    else flush();
+    index += 1;
+  }
+  flush();
+  return [...out.values()];
+}

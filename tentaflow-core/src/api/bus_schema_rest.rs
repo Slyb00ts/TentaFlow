@@ -699,12 +699,18 @@ async fn run_route(
                 };
                 (
                     status,
-                    serde_json::json!({
-                        "subject": subject,
-                        "version": out.version,
-                        "schema_ref_id": out.schema_ref_id,
-                        "deduplicated": out.deduplicated,
-                    }),
+                    {
+                        let mut body = serde_json::json!({
+                            "subject": subject,
+                            "version": out.version,
+                            "schema_ref_id": out.schema_ref_id,
+                            "deduplicated": out.deduplicated,
+                        });
+                        if !out.old_spelling_kept.is_empty() {
+                            body["old_spelling_kept"] = out.old_spelling_kept.into();
+                        }
+                        body
+                    },
                     Some(summary),
                 )
             }

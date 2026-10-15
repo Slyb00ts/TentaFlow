@@ -11870,7 +11870,11 @@
         "rules_rename": "Also rename, in those rules, the fields that differ only by an invisible character: {pairs}.",
         "rules_renamed": "Renamed fields in {count} data-hiding {count|rule|rules}.",
         "rules_rename_failed": "The version was added, but renaming the fields in the data-hiding rules failed: {error}. Fix them in the “Data hiding” section.",
-        "diff_only_removal": "Difference from version {version}: only the invisible characters are removed; fields and requirements are unchanged."
+        "rules_rename_partial": "The version was added and the fields were renamed in {count} data-hiding {count|rule|rules}, then renaming failed: {error}. Fix the rest in the “Data hiding” section.",
+        "diff_only_removal": "Difference from version {version}: only the invisible characters are removed; fields and requirements are unchanged.",
+        "diff_only_removal_names": "Difference from version {version}: only the invisible characters are removed, but they were inside {count} {count|name or value|names or values}: {pairs}.",
+        "rules_rename_effect": "Careful: this changes which data the readers of those topics see, because their rules will allow the field under its cleaned name.",
+        "old_spelling_kept": "Records already written keep the old spelling of {count} {count|name or value|names or values}: {names}. The version passed the compatibility check only with the invisible characters removed from the previous one."
       },
       "refused": {
         "hl7_msh": "“{field}” describes the message's own separators, so it cannot be required. Remove “{field}” from the required fields.",

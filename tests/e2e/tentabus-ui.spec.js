@@ -3095,7 +3095,8 @@ test('Trojan Source correction: a stored version with a hidden character is flag
     await expect(flag).toHaveAttribute('message', /Topiki z tym wzorem nie przyjmują wiadomości\. Dodaj poprawioną wersję\. Miejsce: U\+202E \(wymuszenie kierunku od prawej do lewej \(RLO\)\) w wierszu 4, kolumnie \d+; U\+202E .* w wierszu 7, kolumnie \d+\./);
     await expect.poll(() => editorShown(page)).toContain('pac\u27E6U+202E\u27E7jent');
     expect(await editorText(page)).not.toContain(RLO);
-    await expect(schemaSlot(page).locator('[data-role="hidden-hint"]')).toContainText('ręczne zaznaczenie w polu zawiera te znaczniki');
+    // The flag already says it: the marker hint is not a second statement of the same fact.
+    await expect(schemaSlot(page).locator('[data-role="hidden-hint"]')).toBeHidden();
     await page.screenshot({ path: path.join(SHOTS, 'trojan-flag-page.png'), fullPage: true });
 
     // The topic's Stan says it needs attention although traffic is fine.
@@ -3113,11 +3114,15 @@ test('Trojan Source correction: a stored version with a hidden character is flag
     await expect(win.locator('[data-role="cleaned"]')).toContainText('Usunięto 2 niewidoczne znaki z poprzedniej wersji: U+202E (wymuszenie kierunku od prawej do lewej (RLO))');
     await expect(win.locator('[data-role="text"] textarea')).not.toHaveValue(new RegExp(RLO));
     await expect(win.locator('[data-role="text"] textarea')).toHaveValue(/"pacjent"/);
-    await expect(win.locator('[data-role="diff"]')).toHaveText('Różnica względem wersji 1: tylko usunięte niewidoczne znaki; pola i wymagania bez zmian.');
+    await expect(win.locator('[data-role="diff"]')).toHaveText('Różnica względem wersji 1: usunięte są tylko niewidoczne znaki, ale były w 1 nazwie lub wartości: pac\u27E6U+202E\u27E7jent → pacjent.');
     await expect(win.locator('[data-role="diff"]')).not.toContainText('taki sam');
     await expect(win.locator('[data-act="save"]')).not.toHaveAttribute('disabled', '');
     await expect(win.locator('[data-role="rules"]')).toContainText(`Zasady ukrywania danych na „${topic}” wymieniają pola, których nowa wersja nie ma: pac\u27E6U+202E\u27E7jent.`, { timeout: 15000 });
     await expect(win.locator('[data-role="rename-rules"]')).toHaveAttribute('label', /pac\u27E6U\+202E\u27E7jent → pacjent/);
+    // The rename widens what readers see, so it starts unticked and says so; ticking it is a decision.
+    await expect(win.locator('[data-role="rename-rules"]')).not.toHaveAttribute('checked', /.*/);
+    await expect(win.locator('[data-role="rename-effect"]')).toContainText('to zmienia, jakie dane widzą odbiorcy tych topików');
+    await win.locator('[data-role="rename-rules"]').click();
     await page.screenshot({ path: path.join(SHOTS, 'trojan-newversion-clean.png') });
 
     // BACKWARD (the pattern's mode) accepts the correction: it is not a rename.
@@ -3125,6 +3130,7 @@ test('Trojan Source correction: a stored version with a hidden character is flag
     await expect(win).toHaveCount(0, { timeout: 15000 });
     const notice = schemaSlot(page).locator('[data-role="notice"] tf-alert');
     await expect(notice).toHaveAttribute('title', 'Dodano wersję 2', { timeout: 15000 });
+    await expect(notice).toHaveAttribute('message', /Zapisane już wiadomości zachowują starą pisownię 1 nazwy lub wartości: pac\u27E6U\+202E\u27E7jent\./);
     await expect(notice).toHaveAttribute('message', /Zmieniono nazwy pól w 1 zasadzie ukrywania danych\./);
     await expect(schemaSlot(page).locator('[data-role="hidden-flag"] [data-role="flag-alert"]')).toHaveCount(0);
 

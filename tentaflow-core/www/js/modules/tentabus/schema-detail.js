@@ -807,11 +807,12 @@ function paintText(body, view, effective) {
   paintThriftFields(body, ready && info.schemaType === 'thrift' ? thriftView(shown.text) : null);
   const hintEl = body.querySelector('[data-role="hidden-hint"]');
   const hasHidden = ready && showHidden(shown.text, { leadingBom: info.schemaType === 'xsd' }) !== shown.text;
-  setText(hintEl, hasHidden ? T('schemas.detail.hidden_hint') : '');
-  hintEl.hidden = !hasHidden;
-  // A version the registry would refuse today: topics bound to it take no message, whatever "w użyciu" says.
+  // Topics bound to the version they check with take no message while it holds one, whatever "w użyciu" says.
+  // Another version only gets the note: the topics do not check with it, and the flag would claim they stop.
   const flag = body.querySelector('[data-role="hidden-flag"]');
-  const found = ready ? hiddenPlaces(shown.text, { leadingBom: info.schemaType === 'xsd' }) : null;
+  const found = ready && version === effective ? hiddenPlaces(shown.text, { leadingBom: info.schemaType === 'xsd' }) : null;
+  setText(hintEl, hasHidden && !found ? T('schemas.detail.hidden_hint') : '');
+  hintEl.hidden = !hasHidden || !!found;
   flag.hidden = !found;
   const canFix = view.canAdmin && !newVersionBlocker(info);
   patchHtml(flag, found

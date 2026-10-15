@@ -945,7 +945,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   ukrywania danych na topikach wzoru wymieniają pola, których nowa wersja nie ma
   (pole, którego zasada nie wymienia, jest ukryte), i — tylko gdy pole różni się
   wyłącznie niewidocznym znakiem — proponuje zmianę jego nazwy w tych zasadach
-  (pole wyboru, domyślnie zaznaczone, z nazwami przed i po); wykonanie następuje po
+  (pole wyboru, domyślnie odznaczone, bo zmienia, jakie dane widzą odbiorcy; z nazwami przed i po, bez propozycji, gdy oczyszczona nazwa była w starym tekście osobnym polem); wykonanie następuje po
   dodaniu wersji, a jego wynik (albo błąd) jest podany osobno w komunikacie. Okna
   „Dodaj wzór” i „Nowa wersja” mają przycisk „Usuń niewidoczne znaki” (zostawia
   początkowy BOM XSD) z raportem, co usunięto, oraz na żywo podają wiersz i kolumnę
@@ -957,6 +957,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   wzoru pokazują odrzucany znak jako `⟦U+XXXX⟧`. XSD wklejony z BOM przechodzi
   kontrolę XML w oknie. „Co się stanie po dodaniu” znika, gdy widać odmowę, a toast
   „Kopiuj” znika przy opuszczeniu strony wzoru.
+- **Poprawka wzoru z niewidocznym znakiem nie udaje, że zapisane wiadomości się
+  zmieniły.** Gdy porównanie przechodzi dopiero po usunięciu znaków ze starego
+  tekstu, wersja się rejestruje, a `SchemaRegisterResponse.old_spelling_kept`
+  (append-only, `serde(default)`; REST: `old_spelling_kept` tylko gdy niepuste)
+  podaje nazwy i wartości, które zapisane rekordy nadal piszą po staremu
+  (`pac⟦U+202E⟧jent`); okno mówi to wprost. Usunięcie znaków, które zlałoby dwa
+  klucze starego tekstu w jeden (`pesel` i `pesel<U+200B>`), jest odmową z nazwą
+  pola — serde_json zachowałby po cichu ostatni. Zdanie „pola i wymagania bez
+  zmian” pada tylko wtedy, gdy usunięte znaki nie leżały w żadnej nazwie ani
+  wartości; w przeciwnym razie okno wylicza zmienione nazwy. Flaga „topiki nie
+  przyjmują wiadomości” jest tylko na wersji, według której topiki sprawdzają
+  (inna wersja dostaje samą notkę), Stan topiku ocenia wersję zwróconą przez
+  odczyt i nie rzuca alarmu, gdy rodzaj wzoru jest nieznany, a nieudana zmiana
+  nazw w zasadach podaje, ile zasad już zmieniono.
 
 ## [0.4.0-beta.1] — 2026-09-29
 

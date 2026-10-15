@@ -10635,7 +10635,11 @@
         "rules_rename": "Renommez aussi dans ces règles les champs qui ne diffèrent que par un caractère invisible : {pairs}.",
         "rules_renamed": "Champs renommés dans {count} {count|règle|règles} de masquage des données.",
         "rules_rename_failed": "La version a été ajoutée, mais le renommage des champs dans les règles de masquage des données a échoué : {error}. Corrigez-les dans la section « Masquage des données ».",
-        "diff_only_removal": "Différence avec la version {version} : seuls les caractères invisibles sont supprimés ; champs et exigences inchangés."
+        "rules_rename_partial": "La version a été ajoutée et les champs ont été renommés dans {count} {count|règle|règles} de masquage des données, puis le renommage a échoué : {error}. Corrigez le reste dans la section « Masquage des données ».",
+        "diff_only_removal": "Différence avec la version {version} : seuls les caractères invisibles sont supprimés ; champs et exigences inchangés.",
+        "diff_only_removal_names": "Différence avec la version {version} : seuls les caractères invisibles sont supprimés, mais ils se trouvaient dans {count} {count|nom ou valeur|noms ou valeurs} : {pairs}.",
+        "rules_rename_effect": "Attention : cela change les données que voient les lecteurs de ces topics, car leurs règles autoriseront le champ sous son nom nettoyé.",
+        "old_spelling_kept": "Les messages déjà écrits gardent l'ancienne graphie de {count} {count|nom ou valeur|noms ou valeurs} : {names}. La version n'a passé le contrôle de compatibilité qu'une fois les caractères invisibles de la précédente supprimés."
       },
       "refused": {
         "hl7_msh": "« {field} » décrit les séparateurs du message lui-même et ne peut donc pas être obligatoire. Retirez « {field} » des champs obligatoires.",

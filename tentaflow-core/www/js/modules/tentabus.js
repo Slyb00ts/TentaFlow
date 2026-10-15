@@ -32,7 +32,7 @@ import { laggingReplicas, isLagging, lagSeriesKey } from '/js/modules/tentabus/a
 import { drawOverview, pushOverviewSample, CHART_WINDOW_SECS } from '/js/modules/tentabus/overview.js';
 import { drawSchemas, listText, compatLabel, schemaKind, schemaKindMismatchText, busRefusalText, busRefusalDetail } from '/js/modules/tentabus/schemas.js';
 import { drawSchemaDetail, shareShownText, dismissCopyToast } from '/js/modules/tentabus/schema-detail.js';
-import { hiddenPlaces } from '/js/modules/tentabus/hidden-notice.js';
+import { judgedSchema } from '/js/modules/tentabus/hidden-notice.js';
 import { addedNotice, renamedRuleRequest, openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete } from '/js/modules/tentabus/schema-windows.js';
 import { drawTopics } from '/js/modules/tentabus/topics.js';
 import { openTopicCreator } from '/js/modules/tentabus/topic-creator.js';
@@ -1249,16 +1249,20 @@ const loadTopicDetail = topicDetailLoader({
 async function loadSchemaProblem(topic) {
   if (!topic) return;
   const instanceId = state.instanceId;
-  const info = subjectByName(topic.schemaId);
-  const key = `${instanceId}|${topic.schemaId || ''}|${info?.latestVersion ?? ''}|${info?.deprecatedAtMs ?? ''}`;
-  if (state.schemaCheck.topic === topic.name && state.schemaCheck.key === key) return;
-  state.schemaCheck = { topic: topic.name, key, problem: null };
+  const keyOf = (version) => `${instanceId}|${topic.schemaId || ''}|${version ?? ''}|${subjectByName(topic.schemaId)?.deprecatedAtMs ?? ''}`;
+  const listed = keyOf(subjectByName(topic.schemaId)?.latestVersion);
+  if (state.schemaCheck.topic === topic.name && state.schemaCheck.key === listed) return;
+  const sameTopic = state.schemaCheck.topic === topic.name;
+  state.schemaCheck = { topic: topic.name, key: sameTopic ? state.schemaCheck.key : null, problem: sameTopic ? state.schemaCheck.problem : null };
   if (!topic.schemaId) return;
   try {
     const got = await ApiBinary.one('busSchemaGetRequest', { instanceId: requireInstanceId(instanceId), subject: topic.schemaId });
-    if (state.schemaCheck.key !== key || state.instanceId !== instanceId) return;
-    const found = hiddenPlaces(got?.schemaText, { leadingBom: info?.schemaType === 'xsd' });
-    state.schemaCheck.problem = found ? { subject: topic.schemaId, version: got?.schema?.version ?? null, text: found.text } : null;
+    if (state.instanceId !== instanceId || state.schemaCheck.topic !== topic.name) return;
+    // The version read, not the one the list promised, names what was judged; the kind comes from the list as it
+    // stands now (the answer carries none).
+    const { version, problem } = judgedSchema(topic.schemaId, got, subjectByName(topic.schemaId)?.schemaType);
+    state.schemaCheck.key = keyOf(version);
+    state.schemaCheck.problem = problem;
     renderPanel();
   } catch {
     // The page needs no more than it had; the next poll asks again only when the pattern changed.
@@ -2386,30 +2390,42 @@ async function openNewVersionWindow(name) {
     renameRules: async (renames) => {
       const iid = requireInstanceId(instanceId);
       let changed = 0;
-      for (const rule of await loadRulesOfTopics(instanceId, info.usedByTopics)) {
-        const request = renamedRuleRequest(iid, rule, renames);
-        if (!request) continue;
-        await ApiBinary.action('busFieldPolicySetRequest', request);
-        changed += 1;
+      try {
+        for (const rule of await loadRulesOfTopics(instanceId, info.usedByTopics)) {
+          const request = renamedRuleRequest(iid, rule, renames);
+          if (!request) continue;
+          await ApiBinary.action('busFieldPolicySetRequest', request);
+          changed += 1;
+        }
+        return changed;
+      } catch (err) {
+        // The rules already renamed stay renamed; the window says how many.
+        throw Object.assign(err, { renamedRules: changed });
+      } finally {
+        // The open topic page must read the renamed rules, not the ones it already holds.
+        if (changed) {
+          state.hiding = freshHiding();
+          hidingTurn += 1;
+        }
       }
-      // The open topic page must read the renamed rules, not the ones it already holds.
-      state.hiding = freshHiding();
-      hidingTurn += 1;
-      return changed;
     },
     onDraft: (text) => {
       if (text == null) state.schemaDrafts.delete(name);
       else state.schemaDrafts.set(name, text);
     },
-    onAdded: ({ version, deduplicated, ruleRename }) => {
+    onAdded: ({ version, deduplicated, oldSpellingKept, ruleRename }) => {
       state.schemaDrafts.delete(name);
       if (state.instanceId !== instanceId) return;
       const notice = deduplicated
         ? { tone: 'info', title: T('schemas.version.same_title'), text: T('schemas.version.same_text', { version: fmtCount(version) }) }
         : { tone: 'success', title: T('schemas.version.added_title', { version: fmtCount(version) }), text: usedByText(info, 'schemas.version.added_text') };
+      // Records written under the old spelling are not rewritten by a correction; that is said, not implied.
+      if (oldSpellingKept?.length) Object.assign(notice, { tone: 'warning', text: `${notice.text} ${T('schemas.hidden.old_spelling_kept', { count: oldSpellingKept.length, names: oldSpellingKept.join(', ') })}`.trim() });
       // A change to what is hidden is never silent: it is said here, and a failure of it is not buried under the success.
-      if (ruleRename?.error) Object.assign(notice, { tone: 'warning', text: `${notice.text} ${T('schemas.hidden.rules_rename_failed', { error: ruleRename.error })}`.trim() });
-      else if (ruleRename?.renamed) notice.text = `${notice.text} ${T('schemas.hidden.rules_renamed', { count: ruleRename.renamed })}`.trim();
+      if (ruleRename?.error) {
+        const failed = ruleRename.renamed ? T('schemas.hidden.rules_rename_partial', { count: ruleRename.renamed, error: ruleRename.error }) : T('schemas.hidden.rules_rename_failed', { error: ruleRename.error });
+        Object.assign(notice, { tone: 'warning', text: `${notice.text} ${failed}`.trim() });
+      } else if (ruleRename?.renamed) notice.text = `${notice.text} ${T('schemas.hidden.rules_renamed', { count: ruleRename.renamed })}`.trim();
       afterSchemaChange(name, notice);
     },
   });

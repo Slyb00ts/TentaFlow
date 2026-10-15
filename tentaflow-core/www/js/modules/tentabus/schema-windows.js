@@ -27,7 +27,7 @@ import { T, fmtCount, readablePath } from '/js/modules/tentabus/format.js';
 import { COMPATIBILITIES, compatLabel, schemaFormatLabel, schemaKind, listText } from '/js/modules/tentabus/schemas.js';
 import { openChangeWindow, openConfirmWindow } from '/js/modules/tentabus/windows.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
-import { showHidden, findHidden, stripHidden } from '/js/modules/tentabus/hidden-characters.js';
+import { showHidden, findHidden, stripHidden, hiddenWords } from '/js/modules/tentabus/hidden-characters.js';
 import { hiddenPlaces, placesText, plainName, causeHint } from '/js/modules/tentabus/hidden-notice.js';
 import { readJsonSchema } from '/js/modules/tentabus/topic-hiding.js';
 import '/js/components/tf-input.js';
@@ -897,22 +897,26 @@ const TEXT_ERRORS = { empty: 'schemas.text_empty', too_big: 'schemas.text_too_bi
  * nothing to say (another format, no rules, a text that lists no fields);
  * else `{ gone: [{ name, topics }], renames: [{ from, to }] }` where `renames`
  * are the gone names whose only difference from a field of the new version is
- * a refused character — the case a correction of a stored text creates. `gone`
+ * a refused character — the case a correction of a stored text creates — unless
+ * `oldText` (the stored version, as it is) also has the cleaned name as a field. `gone`
  * is left empty when the new text is not a closed list of fields (it may still
  * carry the field some other way); `renames` are certain either way.
  */
-export function ruleFieldIssues({ rules, newText, schemaType }) {
+export function ruleFieldIssues({ rules, newText, oldText = '', schemaType }) {
   if (schemaType !== 'json_schema' || !rules?.length) return null;
   const read = readJsonSchema(newText);
   if (!read.fields.length) return null;
   const present = new Set(read.fields.map((f) => f.name));
+  // A cleaned name the old text already had as a field of its own is another field: a rename would hand its
+  // readers the data of the one that was hidden from them.
+  const inOld = new Set(readJsonSchema(oldText).fields.map((f) => f.name));
   const gone = new Map();
   const renames = new Map();
   for (const rule of rules) {
     for (const name of new Set([...(rule.fields || []), ...(rule.requiredFields || [])])) {
       if (present.has(name)) continue;
       const clean = stripHidden(name);
-      if (clean !== name && present.has(clean)) renames.set(name, clean);
+      if (clean !== name && present.has(clean) && !inOld.has(clean)) renames.set(name, clean);
       if (!read.complex) gone.set(name, new Set([...(gone.get(name) || []), rule.topic]));
     }
   }
@@ -1091,7 +1095,7 @@ export function openSchemaAdd(ctx) {
 /**
  * "Nowa wersja". `ctx` = `{ instanceId, subject: <list row>, latestText,
  * draftText, register(request), describeError, onAdded({ version,
- * deduplicated, ruleRename }), onDraft(text), loadRules(), renameRules(renames) }`
+ * deduplicated, oldSpellingKept, ruleRename }), onDraft(text), loadRules(), renameRules(renames) }`
  * — `draftText` is a refused text kept from the last attempt (else the newest
  * version's text is the starting point); `onDraft` receives the text whenever
  * the window closes without adding. A newest text that holds refused characters
@@ -1131,7 +1135,7 @@ export function openSchemaVersion(ctx) {
       ${textField(T('schemas.version.text_label', { version: fmtCount(next) }), addTextHint(info.schemaType, next), start, addTextMore(info.schemaType))}
       <div class="tb-vr-hint" data-role="diff"></div>
       <div class="tb-rules-note" data-role="rules" role="status" hidden></div>
-      <div data-role="rename-wrap" hidden><tf-checkbox data-role="rename-rules" checked label=""></tf-checkbox></div>`,
+      <div data-role="rename-wrap" hidden><tf-checkbox data-role="rename-rules" label=""></tf-checkbox><div class="muted" data-role="rename-effect">${escapeHtml(T('schemas.hidden.rules_rename_effect'))}</div></div>`,
     wire: (win, sync) => {
       const diff = win.querySelector('[data-role="diff"]');
       const field = win.querySelector('[data-role="text"]');
@@ -1141,14 +1145,20 @@ export function openSchemaVersion(ctx) {
       const paintDiff = () => {
         const changes = { json_schema: jsonSchemaChanges, hl7v2_profile: profileChanges, xsd: xsdChanges }[info.schemaType];
         // Removing the characters and nothing else is the correction: say that, not "the same as version N".
+        const respelled = removedFromLatest ? hiddenWords(ctx.latestText, bom) : [];
+        const onlyRemoval = respelled.length
+          ? T('schemas.hidden.diff_only_removal_names', {
+            version: fmtCount(latest), count: respelled.length, pairs: respelled.map((w) => `${w.shown} → ${w.clean}`).join(', '),
+          })
+          : T('schemas.hidden.diff_only_removal', { version: fmtCount(latest) });
         const text = removedFromLatest && field.value === cleanLatest
-          ? T('schemas.hidden.diff_only_removal', { version: fmtCount(latest) })
+          ? onlyRemoval
           : (changes ? changes(cleanLatest, field.value, latest) : null);
         diff.textContent = text || '';
         diff.hidden = !text;
       };
       const paintRules = () => {
-        const issues = ruleFieldIssues({ rules, newText: field.value, schemaType: info.schemaType });
+        const issues = ruleFieldIssues({ rules, newText: field.value, oldText: ctx.latestText, schemaType: info.schemaType });
         const gone = issues?.gone || [];
         rulesEl.hidden = !gone.length;
         if (gone.length) {
@@ -1173,7 +1183,7 @@ export function openSchemaVersion(ctx) {
     impact: () => versionImpact({ nextVersion: next, latestVersion: latest || null, compatibility: info.compatibility, usedByTopics: info.usedByTopics }),
     save: async (d) => {
       const renames = win.querySelector('[data-role="rename-rules"]').checked && !win.querySelector('[data-role="rename-wrap"]').hidden
-        ? (ruleFieldIssues({ rules, newText: d.schemaText, schemaType: info.schemaType })?.renames || [])
+        ? (ruleFieldIssues({ rules, newText: d.schemaText, oldText: ctx.latestText, schemaType: info.schemaType })?.renames || [])
         : [];
       const resp = await ctx.register(buildRegisterRequest(ctx.instanceId, { subject: info.subject, schemaType: info.schemaType, schemaText: d.schemaText }));
       if (!renames.length || !ctx.renameRules) return resp;
@@ -1181,7 +1191,7 @@ export function openSchemaVersion(ctx) {
       try {
         return { ...resp, ruleRename: { renamed: await ctx.renameRules(renames), fields: renames } };
       } catch (err) {
-        return { ...resp, ruleRename: { error: ctx.describeError(err), fields: renames } };
+        return { ...resp, ruleRename: { error: ctx.describeError(err), renamed: err?.renamedRules || 0, fields: renames } };
       }
     },
     errorHtml: (err, d) => refusalHtml({
@@ -1197,7 +1207,7 @@ export function openSchemaVersion(ctx) {
     describeError: ctx.describeError,
     onSaved: (d, resp) => {
       added = true;
-      ctx.onAdded({ version: Number(resp?.version) || next, deduplicated: resp?.deduplicated === true, ...(resp?.ruleRename ? { ruleRename: resp.ruleRename } : {}) });
+      ctx.onAdded({ version: Number(resp?.version) || next, deduplicated: resp?.deduplicated === true, ...(resp?.oldSpellingKept?.length ? { oldSpellingKept: resp.oldSpellingKept } : {}), ...(resp?.ruleRename ? { ruleRename: resp.ruleRename } : {}) });
     },
   });
   win.addEventListener('click', (e) => {

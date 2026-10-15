@@ -55,3 +55,15 @@ export function hiddenPlaces(text, options) {
   const places = findHidden(text, options);
   return places.length ? { places, text: placesText(places) } : null;
 }
+
+/**
+ * What the answer to a read of pattern `subject` (`got`: `{ schema: { version }, schemaText }`) says about the
+ * topic that checks with it: `{ version, problem }`, `problem` = `{ subject, version, text }` when that text holds a
+ * refused character. The kind of the pattern is not in the answer, so the caller passes it; a kind that is not
+ * known means the text cannot be judged (an XSD may start with a byte-order mark), and nothing is claimed.
+ */
+export function judgedSchema(subject, got, schemaType) {
+  const version = got?.schema?.version ?? null;
+  const found = schemaType ? hiddenPlaces(got?.schemaText, { leadingBom: schemaType === 'xsd' }) : null;
+  return { version, problem: found ? { subject, version, text: found.text } : null };
+}

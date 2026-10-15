@@ -10635,7 +10635,11 @@
         "rules_rename": "Cambie también en esas reglas el nombre de los campos que solo difieren en un carácter invisible: {pairs}.",
         "rules_renamed": "Se cambió el nombre de campos en {count} {count|regla|reglas} de ocultación de datos.",
         "rules_rename_failed": "Se añadió la versión, pero falló el cambio de nombre de los campos en las reglas de ocultación de datos: {error}. Corríjalas en la sección «Ocultación de datos».",
-        "diff_only_removal": "Diferencia con la versión {version}: solo se quitan los caracteres invisibles; los campos y requisitos no cambian."
+        "rules_rename_partial": "La versión se añadió y se cambió el nombre de los campos en {count} {count|regla|reglas} de ocultación de datos; después falló el cambio: {error}. Corrija el resto en la sección «Ocultación de datos».",
+        "diff_only_removal": "Diferencia con la versión {version}: solo se quitan los caracteres invisibles; los campos y requisitos no cambian.",
+        "diff_only_removal_names": "Diferencia con la versión {version}: solo se quitan los caracteres invisibles, pero estaban dentro de {count} {count|nombre o valor|nombres o valores}: {pairs}.",
+        "rules_rename_effect": "Atención: esto cambia qué datos ven los lectores de esos topics, porque sus reglas admitirán el campo con el nombre limpio.",
+        "old_spelling_kept": "Los mensajes ya escritos conservan la grafía antigua de {count} {count|nombre o valor|nombres o valores}: {names}. La versión superó la comprobación de compatibilidad solo tras quitar los caracteres invisibles de la anterior."
       },
       "refused": {
         "hl7_msh": "«{field}» describe los separadores del propio mensaje, así que no puede ser obligatorio. Quita «{field}» de los campos obligatorios.",

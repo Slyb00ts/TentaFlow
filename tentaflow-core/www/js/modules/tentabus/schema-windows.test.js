@@ -1238,6 +1238,7 @@ test('the common characters have a plain name and the pasted-text and emoji caus
 });
 
 const RLO = '\u202E';
+const ZW = '\u200B';
 const PATIENT_STORED = JSON.stringify({ type: 'object', required: [`pac${RLO}jent`], properties: { [`pac${RLO}jent`]: { type: 'string' } } });
 const PATIENT_CLEAN = JSON.stringify({ type: 'object', required: ['pacjent'], properties: { pacjent: { type: 'string' } } });
 const pacjenci = { subject: 'pacjenci', schemaType: 'json_schema', compatibility: 'backward', latestVersion: 1, deprecatedAtMs: null, usedByTopics: ['wizyty'] };
@@ -1255,8 +1256,9 @@ test('"Nowa wersja" of a stored text with a hidden character starts without it, 
   assert.doesNotMatch(text.value, /\u202E/, 'the character is not in the box');
   assert.equal(JSON.parse(text.value).required[0], 'pacjent');
   assert.match(norm(win.querySelector('[data-role="cleaned"]').textContent), /^Usunięto 2 niewidoczne znaki z poprzedniej wersji: U\+202E \(wymuszenie kierunku od prawej do lewej \(RLO\)\) w wierszu 1, kolumnie 34; U\+202E .* w wierszu 1, kolumnie 60\. Sprawdź tekst i dodaj poprawioną wersję\.$/);
-  assert.equal(win.querySelector('[data-role="diff"]').textContent, 'Różnica względem wersji 1: tylko usunięte niewidoczne znaki; pola i wymagania bez zmian.');
-  assert.doesNotMatch(win.querySelector('[data-role="diff"]').textContent, /taki sam/);
+  // The characters sat inside a field name, so the field is renamed: "fields unchanged" would be untrue.
+  assert.equal(win.querySelector('[data-role="diff"]').textContent, 'Różnica względem wersji 1: usunięte są tylko niewidoczne znaki, ale były w 1 nazwie lub wartości: pac⟦U+202E⟧jent → pacjent.');
+  assert.doesNotMatch(win.querySelector('[data-role="diff"]').textContent, /taki sam|bez zmian/);
   assert.equal(win.querySelector('[data-act="save"]').hasAttribute('disabled'), false, 'the cleaned text differs from the stored bytes, so it can be added');
   assert.equal(win.querySelector('[data-role="hidden-row"]').hidden, true, 'the box holds nothing hidden');
   win.querySelector('[data-act="save"]').click();
@@ -1389,7 +1391,9 @@ test('"Nowa wersja" warns about the rules whose fields the new text lacks and re
   const label = win.querySelector('[data-role="rename-rules"]').getAttribute('label');
   assert.equal(label, 'Zmień też w tych zasadach nazwy pól, które różnią się tylko niewidocznym znakiem: pac⟦U+202E⟧jent → pacjent.');
   assert.equal(win.querySelector('[data-role="rename-wrap"]').hidden, false);
-  assert.equal(win.querySelector('[data-role="rename-rules"]').checked, true);
+  assert.equal(win.querySelector('[data-role="rename-rules"]').checked, false, 'widening what readers see is never on by itself');
+  assert.equal(norm(win.querySelector('[data-role="rename-effect"]').textContent), 'Uwaga: to zmienia, jakie dane widzą odbiorcy tych topików, bo ich zasady zaczną dopuszczać pole pod oczyszczoną nazwą.');
+  win.querySelector('[data-role="rename-rules"]').checked = true;
   win.querySelector('[data-act="save"]').click();
   await tick();
   assert.deepEqual(renamed, [[{ from: `pac${RLO}jent`, to: 'pacjent' }]]);
@@ -1409,18 +1413,77 @@ test('"Nowa wersja": a rename left unticked is not done, and a rename that fails
   });
   let win = make(async (r) => { renamed.push(r); return 1; });
   await tick();
-  win.querySelector('[data-role="rename-rules"]').checked = false;
   win.querySelector('[data-act="save"]').click();
   await tick();
-  assert.deepEqual(renamed, [], 'unticked: no rule is touched');
+  assert.deepEqual(renamed, [], 'unticked, as it starts: no rule is touched');
   assert.deepEqual(done, [{ version: 2, deduplicated: false }]);
   closeAll();
   win = make(async () => { throw new Error('boom'); });
   await tick();
+  win.querySelector('[data-role="rename-rules"]').checked = true;
   win.querySelector('[data-act="save"]').click();
   await tick();
   assert.equal(done.length, 2);
   assert.equal(done[1].version, 2, 'the version is in');
-  assert.deepEqual(done[1].ruleRename, { error: 'brak prawo'.replace('prawo', 'prawa'), fields: [{ from: `pac${RLO}jent`, to: 'pacjent' }] });
+  assert.deepEqual(done[1].ruleRename, { error: 'brak prawa', renamed: 0, fields: [{ from: `pac${RLO}jent`, to: 'pacjent' }] });
+  // A failure after some rules were renamed says how many.
+  closeAll();
+  win = make(async () => { throw Object.assign(new Error('boom'), { renamedRules: 1 }); });
+  await tick();
+  win.querySelector('[data-role="rename-rules"]').checked = true;
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.equal(done[2].ruleRename.renamed, 1);
   await new Promise((r) => setTimeout(r, 300));
+});
+
+test('"Nowa wersja" reports the spellings that stored records keep, as the server names them', async () => {
+  closeAll();
+  const done = [];
+  const win = openSchemaVersion({
+    instanceId: 'i', subject: pacjenci, latestText: PATIENT_STORED, draftText: null,
+    register: async () => ({ version: 2, deduplicated: false, oldSpellingKept: ['pac⟦U+202E⟧jent'] }),
+    describeError: String, onAdded: (a) => done.push(a), onDraft: () => {},
+  });
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.deepEqual(done[0].oldSpellingKept, ['pac⟦U+202E⟧jent']);
+  await new Promise((r) => setTimeout(r, 300));
+});
+
+test('a rename is not offered when the cleaned name was a field of its own in the stored text, and is when it was not', () => {
+  const newText = JSON.stringify({ type: 'object', properties: { x: {} } });
+  const rules = [{ topic: 't', subjectType: 'any', subjectId: '*', direction: 'read', fields: [`x${ZW}`], requiredFields: [] }];
+  const both = JSON.stringify({ type: 'object', properties: { x: {}, [`x${ZW}`]: {} } });
+  const widened = ruleFieldIssues({ rules, newText, oldText: both, schemaType: 'json_schema' });
+  assert.deepEqual(widened.renames, [], 'the rule would start to show the field that was hidden from its readers');
+  assert.deepEqual(widened.gone, [{ name: `x${ZW}`, topics: ['t'] }], 'the field is still said to be gone');
+  const only = JSON.stringify({ type: 'object', properties: { [`x${ZW}`]: {} } });
+  assert.deepEqual(ruleFieldIssues({ rules, newText, oldText: only, schemaType: 'json_schema' }).renames, [{ from: `x${ZW}`, to: 'x' }]);
+});
+
+test('the window offers no rename for a name that also existed clean in the stored text', async () => {
+  closeAll();
+  const stored = JSON.stringify({ type: 'object', properties: { pacjent: {}, [`pacjent${ZW}`]: {} } });
+  const win = openSchemaVersion({
+    instanceId: 'i', subject: pacjenci, latestText: stored, draftText: null,
+    register: async () => ({ version: 2, deduplicated: false }),
+    loadRules: async () => [{ topic: 'wizyty', subjectType: 'any', subjectId: '*', direction: 'read', fields: [`pacjent${ZW}`], requiredFields: [] }],
+    describeError: String, onAdded: () => {}, onDraft: () => {},
+  });
+  await tick();
+  assert.equal(win.querySelector('[data-role="rename-wrap"]').hidden, true);
+  assert.equal(win.querySelector('[data-role="rules"]').hidden, false);
+  await new Promise((r) => setTimeout(r, 300));
+});
+
+test('"Nowa wersja" says "fields unchanged" only when the removed characters were in no name or value', () => {
+  closeAll();
+  const spaced = `syntax = "proto3"; message M {${ZW} string a = 1; }`;
+  const win = openSchemaVersion({
+    instanceId: 'i', subject: { ...pacjenci, schemaType: 'protobuf' }, latestText: spaced, draftText: null,
+    register: async () => ({ version: 2 }), describeError: String, onAdded: () => {}, onDraft: () => {},
+  });
+  assert.match(win.querySelector('[data-role="diff"]').textContent, /bez zmian/);
+  win.close(true);
 });

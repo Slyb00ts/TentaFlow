@@ -10635,7 +10635,11 @@
         "rules_rename": "Benennen Sie in diesen Regeln auch die Felder um, die sich nur durch ein unsichtbares Zeichen unterscheiden: {pairs}.",
         "rules_renamed": "Felder in {count} {count|Datenausblendungsregel|Datenausblendungsregeln} umbenannt.",
         "rules_rename_failed": "Die Version wurde hinzugefügt, aber das Umbenennen der Felder in den Datenausblendungsregeln ist fehlgeschlagen: {error}. Korrigieren Sie sie im Abschnitt „Datenausblendung“.",
-        "diff_only_removal": "Unterschied zu Version {version}: nur die unsichtbaren Zeichen sind entfernt; Felder und Anforderungen unverändert."
+        "rules_rename_partial": "Die Version wurde hinzugefügt und die Felder in {count} {count|Regel|Regeln} zur Datenausblendung umbenannt, danach schlug das Umbenennen fehl: {error}. Korrigieren Sie den Rest im Abschnitt „Datenausblendung“.",
+        "diff_only_removal": "Unterschied zu Version {version}: nur die unsichtbaren Zeichen sind entfernt; Felder und Anforderungen unverändert.",
+        "diff_only_removal_names": "Unterschied zu Version {version}: nur die unsichtbaren Zeichen sind entfernt, sie standen aber in {count} {count|Name oder Wert|Namen oder Werten}: {pairs}.",
+        "rules_rename_effect": "Achtung: Das ändert, welche Daten die Leser dieser Topics sehen, weil ihre Regeln das Feld unter dem bereinigten Namen zulassen.",
+        "old_spelling_kept": "Bereits gespeicherte Nachrichten behalten die alte Schreibweise von {count} {count|Name oder Wert|Namen oder Werten}: {names}. Die Version hat die Kompatibilitätsprüfung nur bestanden, weil die unsichtbaren Zeichen der vorherigen entfernt wurden."
       },
       "refused": {
         "hl7_msh": "„{field}“ beschreibt die Trennzeichen der Nachricht selbst und kann deshalb nicht verlangt werden. Entfernen Sie „{field}“ aus den Pflichtfeldern.",

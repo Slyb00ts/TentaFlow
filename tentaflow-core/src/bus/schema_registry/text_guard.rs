@@ -200,6 +200,106 @@ pub(super) fn strip_hidden(text: &str, allow_leading_bom: bool) -> String {
         .collect()
 }
 
+/// The first object key that occurs twice in `text` (a JSON document), or
+/// `None` for a text that is not JSON or has none. serde_json would keep the
+/// last of two equal keys without a word.
+fn duplicate_json_key(text: &str) -> Option<String> {
+    use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+
+    // The key travels inside serde_json's error text between two control
+    // characters, which a JSON key can only hold escaped.
+    const MARK: &str = "duplicate key \u{1}";
+    struct Probe;
+    struct ProbeVisitor;
+    impl<'de> Visitor<'de> for ProbeVisitor {
+        type Value = Probe;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("any JSON value")
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Probe, E> {
+            Ok(Probe)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<Probe, E> {
+            Ok(Probe)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<Probe, E> {
+            Ok(Probe)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Probe, E> {
+            Ok(Probe)
+        }
+        fn visit_str<E>(self, _: &str) -> Result<Probe, E> {
+            Ok(Probe)
+        }
+        fn visit_unit<E>(self) -> Result<Probe, E> {
+            Ok(Probe)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Probe, A::Error> {
+            while seq.next_element::<Probe>()?.is_some() {}
+            Ok(Probe)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Probe, A::Error> {
+            let mut seen = std::collections::BTreeSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !seen.insert(key.clone()) {
+                    return Err(de::Error::custom(format!("{MARK}{key}\u{1}")));
+                }
+                map.next_value::<Probe>()?;
+            }
+            Ok(Probe)
+        }
+    }
+    impl<'de> Deserialize<'de> for Probe {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Probe, D::Error> {
+            d.deserialize_any(ProbeVisitor)
+        }
+    }
+    let message = serde_json::from_str::<Probe>(text).err()?.to_string();
+    let start = message.find(MARK)? + MARK.len();
+    let len = message[start..].find('\u{1}')?;
+    Some(message[start..start + len].to_string())
+}
+
+/// The key that removing the refused characters of a stored old text would
+/// make a duplicate (`pesel` and `pesel<ZWSP>` becoming one), which the
+/// comparison would read as the last of them without a word. A duplicate the
+/// stored text already had on its own is not this kind and is left alone.
+pub(super) fn collapsed_key(text: &str, allow_leading_bom: bool) -> Option<String> {
+    if duplicate_json_key(text).is_some() {
+        return None;
+    }
+    duplicate_json_key(&strip_hidden(text, allow_leading_bom))
+}
+
+/// The words of `text` that hold a refused character, written with the
+/// `⟦U+XXXX⟧` markers (`pac⟦U+202E⟧jent`): the names and values a stored
+/// record keeps spelled that way. In order of appearance, without repeats.
+pub(super) fn hidden_spellings(text: &str, allow_leading_bom: bool) -> Vec<String> {
+    const LIMIT: usize = 20;
+    let mut out: Vec<String> = Vec::new();
+    let mut word = String::new();
+    let mut flush = |word: &mut String| {
+        if word.chars().any(char::is_alphanumeric) && find_hidden(word, false).is_some() {
+            let shown = sanitize(word);
+            if !out.contains(&shown) && out.len() < LIMIT {
+                out.push(shown);
+            }
+        }
+        word.clear();
+    };
+    for (index, c) in text.chars().enumerate() {
+        let leading_bom = allow_leading_bom && index == 0 && c == '\u{FEFF}';
+        if !leading_bom && (c.is_alphanumeric() || "_-.:$".contains(c) || refused_name(c).is_some())
+        {
+            word.push(c);
+        } else {
+            flush(&mut word);
+        }
+    }
+    flush(&mut word);
+    out
+}
+
 /// `detail` with every refused code point written as `⟦U+XXXX⟧` (the marker the
 /// dashboard uses for a stored text too), for a message
 /// built from a text the screen has not seen (the old side of a comparison).
@@ -797,5 +897,25 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    #[test]
+    fn collapsed_key_names_a_key_the_removal_would_duplicate_and_only_that() {
+        let merged = "{\"a\":{\"pesel\":1,\"pesel\u{200B}\":2}}";
+        assert_eq!(collapsed_key(merged, false), Some("pesel".to_string()));
+        assert_eq!(collapsed_key("{\"pesel\":1,\"pe\u{200B}sel\":2,\"x\":3}", false), Some("pesel".to_string()));
+        // Distinct after removal, not JSON, or already duplicated as stored.
+        assert_eq!(collapsed_key("{\"pe\u{200B}sel\":1,\"x\":2}", false), None);
+        assert_eq!(collapsed_key("message M { string a\u{200B}b = 1; }", false), None);
+        assert_eq!(collapsed_key("{\"a\":1,\"a\":2,\"b\u{200B}\":1}", false), None);
+    }
+
+    #[test]
+    fn hidden_spellings_lists_each_word_with_a_refused_character_once() {
+        assert_eq!(
+            hidden_spellings("{\"pac\u{202E}jent\":[\"a\u{200B}b\",\"pac\u{202E}jent\",\"ok\"]}", false),
+            vec!["pac⟦U+202E⟧jent".to_string(), "a⟦U+200B⟧b".to_string()]
+        );
+        assert!(hidden_spellings("\u{FEFF}<xs:schema/>", true).is_empty());
     }
 }

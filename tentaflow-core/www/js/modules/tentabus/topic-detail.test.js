@@ -350,3 +350,14 @@ test('Stan: a pattern with a hidden character is an item that needs attention, w
   item.querySelector('tf-button').click();
   assert.deepEqual(moves, [{ kind: 'schema', subject: 'pacjenci' }]);
 });
+
+test('Stan: the alert of a pattern whose text holds hidden characters writes no raw one, from the judgement of the read as it is made', async () => {
+  const { judgedSchema } = await import('./hidden-notice.js');
+  const raw = `a${String.fromCodePoint(0x202E)}b${String.fromCodePoint(0x200B)}c`;
+  const judged = judgedSchema('pacjenci', { schema: { version: 7 }, schemaText: JSON.stringify({ [raw]: 1 }) }, 'json_schema');
+  const { body } = mount({ schemaProblem: judged.problem });
+  const item = body.querySelector('[data-alert^="schema:"]');
+  assert.ok(item.dataset.alert.endsWith(':7'), 'the version that was read');
+  assert.doesNotMatch(`${item.outerHTML}${item.textContent}`, /[\u202E\u200B]/);
+  assert.match(item.querySelector('[data-role="m2"]').textContent, /^U\+202E .*/);
+});

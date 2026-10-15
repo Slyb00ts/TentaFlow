@@ -12640,12 +12640,19 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
             version,
             schema_ref_id,
             deduplicated,
+            old_spelling_kept,
         } => {
             set(obj, "variant", "BusSchemaRegisterResponse".into());
             set(obj, "version", (version as f64).into());
             set(obj, "schemaRefId", (schema_ref_id as f64).into());
             set(obj, "schema_ref_id", (schema_ref_id as f64).into());
             set(obj, "deduplicated", deduplicated.into());
+            let kept = js_sys::Array::new();
+            for name in &old_spelling_kept {
+                kept.push(&name.as_str().into());
+            }
+            set(obj, "oldSpellingKept", kept.clone().into());
+            set(obj, "old_spelling_kept", kept.into());
         }
         BP::SchemaCompatibilitySetRequest { .. } => {
             set(obj, "variant", "BusSchemaCompatibilitySetRequest".into())

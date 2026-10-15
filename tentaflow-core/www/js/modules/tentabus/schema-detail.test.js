@@ -595,6 +595,34 @@ test('a version whose text holds a hidden character is flagged on the page, with
   assert.equal(bom.body.querySelector('[data-role="hidden-flag"]').hidden, true);
 });
 
+test('the "topics accept no messages" flag is only for the version topics check with; another version only gets the note, and the same fact is never said twice', () => {
+  const stored = JSON.stringify({ type: 'object', properties: { [`pac${RLO_CHAR}jent`]: { type: 'string' } } });
+  // Version 3 is the one topics check with (see `versions`); version 2 is an older one.
+  const older = mount({ shown: { version: 2, text: stored, error: null } });
+  assert.equal(older.body.querySelector('[data-role="hidden-flag"]').hidden, true, 'no claim that topics stop');
+  assert.equal(older.body.querySelector('[data-role="flag-fix"]'), null);
+  assert.equal(older.body.querySelector('[data-role="hidden-hint"]').hidden, false, 'it is still said that the text holds an invisible character');
+  const current = mount({ shown: { version: 3, text: stored, error: null } });
+  assert.equal(current.body.querySelector('[data-role="hidden-flag"]').hidden, false);
+  assert.equal(current.body.querySelector('[data-role="hidden-hint"]').hidden, true, 'the flag already says it');
+});
+
+test('the read of the pattern behind a topic is judged by the version it returned and the kind the caller knows, and not at all for an unknown kind', async () => {
+  const { judgedSchema } = await import('./hidden-notice.js');
+  const text = `{"a${RLO_CHAR}b":1}`;
+  const got = { schema: { version: 5 }, schemaText: text };
+  const judged = judgedSchema('pacjenci', got, 'json_schema');
+  assert.equal(judged.version, 5);
+  assert.deepEqual({ ...judged.problem, text: undefined }, { subject: 'pacjenci', version: 5, text: undefined });
+  assert.match(judged.problem.text, /^U\+202E /);
+  assert.equal(judgedSchema('pacjenci', got, undefined).problem, null, 'a kind that is not known is not judged');
+  assert.equal(judgedSchema('pacjenci', got, undefined).version, 5);
+  const bom = { schema: { version: 1 }, schemaText: `${String.fromCodePoint(0xFEFF)}<xs:schema/>` };
+  assert.equal(judgedSchema('faktura', bom, 'xsd').problem, null, 'a leading byte-order mark is not a hidden character in an XSD');
+  assert.notEqual(judgedSchema('faktura', bom, 'json_schema').problem, null);
+  assert.deepEqual(judgedSchema('x', null, 'json_schema'), { version: null, problem: null });
+});
+
 test('no raw refused character reaches the text of the page, its tables, the diffs or the data-hiding sentences, whatever the name', async () => {
   const { jsonSchemaChanges, profileChanges, xsdChanges } = await import('./schema-windows.js');
   const topicHiding = await import('./topic-hiding.js');
@@ -646,6 +674,39 @@ test('no raw refused character reaches the text of the page, its tables, the dif
     subject: { subjectType: 'user', subjectId: 'u', label: 'Anna' },
     source,
   }));
+  // "Nowa wersja" over a stored text with the name in it, with rules that name it: the notice, the diff, the warning and the rename offer.
+  const windows = await import('./schema-windows.js');
+  document.querySelectorAll('tf-window').forEach((w) => w.remove());
+  const stored = JSON.stringify({ type: 'object', required: [name], properties: { [name]: { type: 'string' } } });
+  const win = windows.openSchemaVersion({
+    instanceId: 'i',
+    subject: { subject: 'pacjenci', schemaType: 'json_schema', compatibility: 'backward', latestVersion: 1, deprecatedAtMs: null, usedByTopics: ['wizyty'] },
+    latestText: stored, draftText: null,
+    register: async () => ({ version: 2 }),
+    loadRules: async () => [{ topic: 'wizyty', subjectType: 'any', subjectId: '*', direction: 'read', fields: [name, 'termin'], requiredFields: [] }],
+    describeError: String, onAdded: () => {}, onDraft: () => {},
+  });
+  await tick();
+  const windowText = (w) => `${w.outerHTML}${w.textContent}${w.querySelector('[data-role="rename-rules"]')?.getAttribute('label')}`;
+  take('nowa wersja', windowText(win));
+  assert.equal(win.querySelector('[data-role="cleaned"]').hidden !== true, true);
+  assert.equal(win.querySelector('[data-role="rules"]').hidden, false);
+  assert.equal(win.querySelector('[data-role="rename-wrap"]').hidden, false);
+  assert.match(win.querySelector('[data-role="rename-rules"]').getAttribute('label'), /pac⟦U\+202E⟧j⟦U\+200B⟧ent → pacjent/);
+  win.remove();
+  // The refusal of a version over that name, whose text still carries it.
+  const refusal = document.createElement('div');
+  refusal.innerHTML = windows.refusalHtml({
+    err: new Error("protocol error BadRequest: bus.schema_incompatible: 'pacjenci' mode=backward: backward (the new schema requires more than the old one guarantees): field pac⟦U+202E⟧j⟦U+200B⟧ent is not guaranteed"),
+    title: 'Nie dodano wersji 2.', compatibility: 'backward', schemaType: 'json_schema',
+    newText: JSON.stringify({ properties: { [name]: {} }, required: [name] }), describeError: String, offerDrop: true,
+    latest: { version: 1, text: JSON.stringify({ properties: { x: {} } }) },
+  });
+  take('refusal', `${refusal.innerHTML}${refusal.textContent}`);
+  // What the topic's Stan is given for such a pattern (its alert is drawn in topic-detail.test.js).
+  const { judgedSchema } = await import('./hidden-notice.js');
+  const judged = judgedSchema('pac-s', { schema: { version: 4 }, schemaText: JSON.stringify({ [name]: 1 }) }, 'json_schema');
+  take('stan problem', JSON.stringify(judged.problem));
   assert.ok(seen.length > 40);
   const leaks = seen.filter(([, text]) => refusedIn(text).length).map(([label]) => label);
   assert.deepEqual(leaks, [], 'these outputs carry a raw refused character');

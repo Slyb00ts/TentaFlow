@@ -1365,6 +1365,12 @@ pub enum BusPayload {
         version: u32,
         schema_ref_id: u32,
         deduplicated: bool,
+        /// Names and values (`⟦U+XXXX⟧` for each invisible character) that the
+        /// previous version spelled with one, which the new version only
+        /// passed the compatibility check without: records already written
+        /// keep that spelling. Empty for every other registration.
+        #[serde(default)]
+        old_spelling_kept: Vec<String>,
     },
     SchemaCompatibilitySetRequest {
         subject: String,
@@ -2597,6 +2603,7 @@ mod tests {
             version: 2,
             schema_ref_id: 12345,
             deduplicated: false,
+            old_spelling_kept: vec!["pac⟦U+202E⟧jent".to_string()],
         });
         round_trip(BusPayload::SchemaCompatibilitySetRequest {
             subject: "patients.updated".to_string(),

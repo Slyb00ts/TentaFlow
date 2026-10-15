@@ -3938,6 +3938,7 @@ async fn schema_register_v1(
         version: outcome.version,
         schema_ref_id: outcome.schema_ref_id,
         deduplicated: outcome.deduplicated,
+        old_spelling_kept: outcome.old_spelling_kept,
     })
 }
 
@@ -8285,6 +8286,7 @@ mod tests {
                 version,
                 schema_ref_id,
                 deduplicated,
+                ..
             } => (version, schema_ref_id, deduplicated),
             other => panic!("unexpected response: {other:?}"),
         };

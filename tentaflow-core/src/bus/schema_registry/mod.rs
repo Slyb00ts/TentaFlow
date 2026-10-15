@@ -414,17 +414,47 @@ pub trait SchemaKindOps: Send + Sync {
         new_schema_text: &str,
         mode: Compatibility,
     ) -> Result<(), SchemaError> {
+        self.check_compatibility_noting(old_schema_text, new_schema_text, mode)
+            .map(|_| ())
+    }
+
+    /// [`Self::check_compatibility`] that also answers the names and values
+    /// (marked as `⟦U+XXXX⟧`) the stored records keep spelled with a refused
+    /// character: empty unless the old text held one AND the comparison with
+    /// it as stored would not have passed. A correction that passes only
+    /// because the characters were removed registers, but data written under
+    /// the old spelling still carries it. A removal that would merge two keys
+    /// of the old text into one is refused: the comparison could not tell them
+    /// apart.
+    fn check_compatibility_noting(
+        &self,
+        old_schema_text: &str,
+        new_schema_text: &str,
+        mode: Compatibility,
+    ) -> Result<Vec<String>, SchemaError> {
         let bom = self.allows_leading_bom();
         let new_text = text_guard::screen(new_schema_text, bom)?;
-        let cleaned;
-        let old_text = if text_guard::find_hidden(old_schema_text, bom).is_some() {
-            cleaned = text_guard::strip_hidden(old_schema_text, bom);
-            cleaned.as_str()
+        if text_guard::find_hidden(old_schema_text, bom).is_none() {
+            self.compare_screened(old_schema_text, new_text, mode)
+                .map_err(text_guard::sanitize_error)?;
+            return Ok(Vec::new());
+        }
+        if let Some(key) = text_guard::collapsed_key(old_schema_text, bom) {
+            return Err(SchemaError::Incompatible(format!(
+                "the stored previous version has the field '{}' and a field that differs from it only by \
+                 invisible characters; they cannot be compared as separate fields",
+                text_guard::sanitize(&key)
+            )));
+        }
+        let cleaned = text_guard::strip_hidden(old_schema_text, bom);
+        self.compare_screened(&cleaned, new_text, mode)
+            .map_err(text_guard::sanitize_error)?;
+        let as_stored = self.compare_screened(old_schema_text, new_text, mode);
+        Ok(if as_stored.is_err() {
+            text_guard::hidden_spellings(old_schema_text, bom)
         } else {
-            old_schema_text
-        };
-        self.compare_screened(old_text, new_text, mode)
-            .map_err(text_guard::sanitize_error)
+            Vec::new()
+        })
     }
 
     /// The kind's own comparison; see [`Self::compile_screened`].
