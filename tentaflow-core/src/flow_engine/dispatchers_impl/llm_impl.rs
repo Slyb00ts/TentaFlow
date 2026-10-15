@@ -108,11 +108,15 @@ impl LlmDispatcherImpl {
         let Some(db) = self.db.as_ref() else {
             return Ok(None);
         };
-        let gateway = AiGateway::new(
+        let mut gateway = AiGateway::new(
             db.clone(),
             self.node_id.clone(),
             crate::compliance::ai_gateway::token_quota_enabled(),
         );
+        // A process step must not run on a quota nobody could read.
+        if req.provenance.origin == FlowOrigin::Process {
+            gateway = gateway.with_strict_quota_reads();
+        }
         let user = req.user_id.as_ref().map(|uid| UserContext {
             user_id: uid.clone(),
             role: req.user_role.clone().unwrap_or_else(|| "user".to_string()),
@@ -998,6 +1002,28 @@ mod tests {
 
         let error = dispatcher.execute_chat(process_request(&org)).await.unwrap_err();
         assert!(format!("{error:#}").contains("token quota exceeded"), "{error:#}");
+
+        let mut ordinary = process_request(&org);
+        ordinary.provenance = CallProvenance::system();
+        let error = dispatcher.execute_chat(ordinary).await.unwrap_err();
+        assert!(format!("{error:#}").contains("not wired"), "{error:#}");
+    }
+
+    /// A quota nobody could read ends a process call before anything is sent;
+    /// an ordinary flow's call is not stopped by it.
+    #[tokio::test]
+    async fn an_unreadable_quota_is_fatal_for_a_process_call_and_not_elsewhere() {
+        let db = audit_db();
+        seed_user(&db);
+        let org = org_with_quota_spent(&db);
+        db.write()
+            .unwrap()
+            .execute("UPDATE token_quota SET max_total_tokens = X'00'", [])
+            .unwrap();
+        let dispatcher = dispatcher_with_db(db.clone());
+
+        let error = dispatcher.execute_chat(process_request(&org)).await.unwrap_err();
+        assert!(format!("{error:#}").contains("quota unreadable"), "{error:#}");
 
         let mut ordinary = process_request(&org);
         ordinary.provenance = CallProvenance::system();

@@ -74,6 +74,22 @@ pub struct AiGateway {
     node_id: String,
     /// Czy egzekwowac limity tokenow i zliczac zuzycie (config.token_metrics.enabled).
     quota_enabled: bool,
+    /// When set, a quota that cannot be read refuses the call instead of letting
+    /// it through. Only callers that must not run on an unknown quota (BPMN
+    /// process steps) turn it on; chat and flows stay fail-open.
+    strict_quota_reads: bool,
+}
+
+/// The token quota could not be read, so nobody can tell whether it is spent.
+/// Distinct from [`crate::error::CoreError::RateLimitExceeded`], which means the
+/// quota IS spent.
+#[derive(Debug, thiserror::Error)]
+#[error("token quota unreadable: {0}")]
+pub struct QuotaReadError(String);
+
+enum QuotaFailure {
+    Exceeded(anyhow::Error),
+    Unreadable(QuotaReadError),
 }
 
 #[derive(Debug, Clone)]
@@ -121,11 +137,20 @@ impl AiGateway {
             db,
             node_id: node_id.into(),
             quota_enabled,
+            strict_quota_reads: false,
         }
     }
 
+    /// Makes an unreadable quota refuse the call (see `strict_quota_reads`).
+    pub fn with_strict_quota_reads(mut self) -> Self {
+        self.strict_quota_reads = true;
+        self
+    }
+
     /// Applies the active token quotas to a call that has not been made yet,
-    /// without opening an event. `Err` only for a quota that is really spent.
+    /// without opening an event. `Err` is either the spent-quota refusal
+    /// (`CoreError::RateLimitExceeded`) or a [`QuotaReadError`] when the quota
+    /// could not be read; the caller decides what an unknown quota means.
     pub fn check_token_quota(
         &self,
         model_id: &str,
@@ -139,7 +164,11 @@ impl AiGateway {
         let user_id = user
             .map(|u| u.user_id.to_string())
             .unwrap_or_else(|| crate::db::repository::TOKEN_USAGE_SYSTEM_USER.to_string());
-        self.enforce_token_quota(&org_id, &user_id, model_id)
+        self.read_token_quota(&org_id, &user_id, model_id)
+            .map_err(|failure| match failure {
+                QuotaFailure::Exceeded(error) => error,
+                QuotaFailure::Unreadable(error) => anyhow::Error::new(error),
+            })
     }
 
     pub fn start_chat_event(
@@ -264,11 +293,34 @@ impl AiGateway {
         })
     }
 
-    /// Egzekwuje aktywne limity tokenow przed startem wywolania. Fail-open na
-    /// bledach infrastruktury (DB) — tylko realne przekroczenie limitu blokuje
-    /// request. Wszystkie odczyty repozytorium biora wlasny krotki lock, wiec
+    /// Egzekwuje aktywne limity tokenow przed startem wywolania. Domyslnie
+    /// fail-open na bledach infrastruktury (DB) — tylko realne przekroczenie
+    /// limitu blokuje request; z `strict_quota_reads` nieczytelny limit tez
+    /// odmawia. Wszystkie odczyty repozytorium biora wlasny krotki lock, wiec
     /// helper NIE moze byc wolany z trzymanym write-lockiem.
     fn enforce_token_quota(&self, org_id: &str, user_id: &str, model_id: &str) -> Result<()> {
+        match self.read_token_quota(org_id, user_id, model_id) {
+            Ok(()) => Ok(()),
+            Err(QuotaFailure::Exceeded(error)) => Err(error),
+            Err(QuotaFailure::Unreadable(error)) if self.strict_quota_reads => {
+                Err(anyhow::Error::new(error))
+            }
+            Err(QuotaFailure::Unreadable(error)) => {
+                tracing::warn!(error = %error, "odczyt limitow tokenow nieudany — przepuszczam request");
+                Ok(())
+            }
+        }
+    }
+
+    fn read_token_quota(
+        &self,
+        org_id: &str,
+        user_id: &str,
+        model_id: &str,
+    ) -> std::result::Result<(), QuotaFailure> {
+        fn unreadable(what: &str, error: anyhow::Error) -> QuotaFailure {
+            QuotaFailure::Unreadable(QuotaReadError(format!("{what}: {error:#}")))
+        }
         if !self.quota_enabled {
             return Ok(());
         }
@@ -276,10 +328,7 @@ impl AiGateway {
             &self.db, org_id, user_id, model_id,
         ) {
             Ok(quotas) => quotas,
-            Err(err) => {
-                tracing::warn!(error = %err, "odczyt limitow tokenow nieudany — przepuszczam request");
-                return Ok(());
-            }
+            Err(err) => return Err(unreadable("applicable quotas", err)),
         };
         if quotas.is_empty() {
             return Ok(());
@@ -306,10 +355,7 @@ impl AiGateway {
                 period_key,
             ) {
                 Ok(lease) => lease,
-                Err(err) => {
-                    tracing::warn!(error = %err, "odczyt dzierzawy tokenow nieudany — przepuszczam request");
-                    return Ok(());
-                }
+                Err(err) => return Err(unreadable("token lease", err)),
             };
 
             if let Some(lease) = lease {
@@ -324,29 +370,22 @@ impl AiGateway {
                         period_key,
                     ) {
                         Ok(used) => used,
-                        Err(err) => {
-                            tracing::warn!(error = %err, "odczyt zuzycia wezla nieudany — przepuszczam request");
-                            return Ok(());
-                        }
+                        Err(err) => return Err(unreadable("node usage", err)),
                     };
                     if used >= lease.base_used + lease.granted_tokens {
-                        return Err(quota_exceeded(quota));
+                        return Err(QuotaFailure::Exceeded(quota_exceeded(quota)));
                     }
                     continue;
                 }
             }
 
-            let used = match crate::db::repository::global_usage_for_quota(
-                &self.db, quota, period_key,
-            ) {
-                Ok(used) => used,
-                Err(err) => {
-                    tracing::warn!(error = %err, "odczyt globalnego zuzycia nieudany — przepuszczam request");
-                    return Ok(());
-                }
-            };
+            let used =
+                match crate::db::repository::global_usage_for_quota(&self.db, quota, period_key) {
+                    Ok(used) => used,
+                    Err(err) => return Err(unreadable("global usage", err)),
+                };
             if used >= quota.max_total_tokens {
-                return Err(quota_exceeded(quota));
+                return Err(QuotaFailure::Exceeded(quota_exceeded(quota)));
             }
         }
         Ok(())
@@ -724,7 +763,7 @@ fn insert_ai_audit_row(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::api::openai::types::{Choice, Message, Usage};
     use crate::db::migrations;
@@ -1185,6 +1224,104 @@ mod tests {
         assert_eq!(
             per_call_corr, correlation,
             "per-call event copies the session correlation key"
+        );
+    }
+
+    fn quota_request() -> ChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "bielik",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("minimal chat request")
+    }
+
+    fn make_quota_unreadable(db: &DbPool) {
+        crate::db::repository::create_token_quota(
+            db,
+            &crate::db::models::NewTokenQuota {
+                org_id: crate::services::org::DEFAULT_ORG_ID,
+                scope_type: "org",
+                subject_id: None,
+                model_id: None,
+                period: "daily",
+                max_total_tokens: 1_000,
+                is_active: true,
+            },
+        )
+        .expect("quota");
+        db.write()
+            .unwrap()
+            .execute("UPDATE token_quota SET max_total_tokens = X'00'", [])
+            .expect("corrupt quota");
+    }
+
+    fn quota_context() -> AiGatewayContext {
+        AiGatewayContext {
+            org_id: Some(crate::services::org::DEFAULT_ORG_ID.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn unreadable_quota_error() -> anyhow::Error {
+        let db = db();
+        make_quota_unreadable(&db);
+        AiGateway::new(db, "node-test", true)
+            .check_token_quota("bielik", None, Some(&quota_context()))
+            .expect_err("unreadable quota")
+    }
+
+    #[test]
+    fn an_unreadable_quota_is_a_read_error_not_a_spent_quota() {
+        let error = unreadable_quota_error();
+        assert!(
+            error.downcast_ref::<QuotaReadError>().is_some(),
+            "{error:#}"
+        );
+        assert!(error.downcast_ref::<crate::error::CoreError>().is_none());
+    }
+
+    #[test]
+    fn a_spent_quota_is_still_the_rate_limit_refusal() {
+        let db = db();
+        crate::db::repository::create_token_quota(
+            &db,
+            &crate::db::models::NewTokenQuota {
+                org_id: crate::services::org::DEFAULT_ORG_ID,
+                scope_type: "org",
+                subject_id: None,
+                model_id: None,
+                period: "daily",
+                max_total_tokens: 0,
+                is_active: true,
+            },
+        )
+        .expect("quota");
+        let error = AiGateway::new(db, "node-test", true)
+            .check_token_quota("bielik", None, Some(&quota_context()))
+            .expect_err("spent quota");
+        assert!(matches!(
+            error.downcast_ref::<crate::error::CoreError>(),
+            Some(crate::error::CoreError::RateLimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn the_chat_path_stays_fail_open_on_an_unreadable_quota() {
+        let db = db();
+        make_quota_unreadable(&db);
+        let context = quota_context();
+        AiGateway::new(db.clone(), "node-test", true)
+            .start_chat_event(&quota_request(), None, Some(&context))
+            .expect("an unreadable quota does not stop an ordinary call");
+
+        let strict = AiGateway::new(db, "node-test", true).with_strict_quota_reads();
+        let error = strict
+            .start_chat_event(&quota_request(), None, Some(&context))
+            .err()
+            .expect("a strict gateway refuses");
+        assert!(
+            error.downcast_ref::<QuotaReadError>().is_some(),
+            "{error:#}"
         );
     }
 }

@@ -278,8 +278,8 @@ pub enum QuotaCheck {
 }
 
 impl QuotaCheck {
-    /// Only the gateway's own refusal means the quota is spent; any other error
-    /// is infrastructure.
+    /// Only the gateway's own refusal means the quota is spent; a
+    /// `QuotaReadError` and any other error are infrastructure.
     pub fn from_gateway(result: Result<()>) -> Self {
         match result {
             Ok(()) => Self::Within,
@@ -632,8 +632,9 @@ mod tests {
         });
         assert_eq!(QuotaCheck::from_gateway(Ok(())), QuotaCheck::Within);
         assert_eq!(QuotaCheck::from_gateway(Err(spent)), QuotaCheck::Exceeded);
+        let unreadable = crate::compliance::ai_gateway::tests::unreadable_quota_error();
         assert_eq!(
-            QuotaCheck::from_gateway(Err(anyhow::anyhow!("pool timeout"))),
+            QuotaCheck::from_gateway(Err(unreadable)),
             QuotaCheck::Unavailable
         );
     }

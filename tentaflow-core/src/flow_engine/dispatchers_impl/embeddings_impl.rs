@@ -59,7 +59,8 @@ impl EmbeddingsDispatcherImpl {
             db.clone(),
             self.node_id.clone(),
             crate::compliance::ai_gateway::token_quota_enabled(),
-        );
+        )
+        .with_strict_quota_reads();
         let user = req.user_id.as_ref().map(|uid| UserContext {
             user_id: uid.clone(),
             role: req.user_role.clone().unwrap_or_else(|| "user".to_string()),

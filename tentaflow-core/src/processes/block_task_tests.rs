@@ -749,6 +749,71 @@ async fn a_spent_token_quota_stops_the_job_before_the_boundary() {
 }
 
 #[tokio::test]
+async fn an_unreadable_token_quota_defers_the_job_instead_of_running_it() {
+    let fixture = Fixture::new();
+    let started = start_model(&fixture, &llm_task("quota-model"));
+    crate::db::repository::create_token_quota(
+        &fixture.db,
+        &crate::db::models::NewTokenQuota {
+            org_id: crate::services::org::DEFAULT_ORG_ID,
+            scope_type: "org",
+            subject_id: None,
+            model_id: None,
+            period: "daily",
+            max_total_tokens: 1_000_000,
+            is_active: true,
+        },
+    )
+    .unwrap();
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute("UPDATE token_quota SET max_total_tokens = X'00'", [])
+        .unwrap();
+    let claimed = run(&fixture, "unreadable-quota-worker").await;
+    let job = job_of(&fixture, &started.instance_id, &claimed.job.job_id);
+    assert_eq!(job.status, "queued");
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "prepared");
+    assert_eq!(ai_event_rows(&fixture), 0);
+    let current =
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert!(current.incidents.is_empty());
+    let history =
+        repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
+            .unwrap()
+            .0;
+    let deferred = history
+        .iter()
+        .find(|event| event.kind == "service_deferred")
+        .expect("the job is deferred");
+    assert_eq!(deferred.data["code"], "BLOCK_UNAVAILABLE");
+
+    // Readable again: the same job now passes the quota check and is claimable.
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute("UPDATE token_quota SET max_total_tokens = 1000000", [])
+        .unwrap();
+    let retried = repository::claim_job(&fixture.db, "retry-worker", now_ms() + 60_000)
+        .unwrap()
+        .expect("deferred job is claimable after its backoff");
+    super::jobs::execute_claimed(
+        &fixture.db,
+        fixture.dispatcher(),
+        "retry-worker",
+        retried,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let job = job_of(&fixture, &started.instance_id, &claimed.job.job_id);
+    assert_ne!(job.status, "queued", "the quota is readable, so the job runs");
+    assert_eq!(ai_event_rows(&fixture), 1);
+}
+
+#[tokio::test]
 async fn an_unreadable_account_does_not_turn_an_authorized_run_into_an_uncertain_one() {
     use crate::flow_engine::dispatcher::PinnedFlowSnapshot;
     use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
