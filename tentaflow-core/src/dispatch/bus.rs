@@ -8383,6 +8383,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schema_register_names_every_refused_place_in_one_answer() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(&db, &user_id, "org_admin");
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
+        let ctx = handler_ctx(db, org);
+        let err = schema_register_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            format!("hidden.{}", uuid::Uuid::new_v4().simple()),
+            "json_schema".to_string(),
+            "{\"description\": \"a\u{202E}b\\u200Bc\"}".to_string(),
+            None,
+        )
+        .await
+        .expect_err("a hidden character must be refused");
+        assert!(
+            err.message.contains(
+                "U+202E (RIGHT-TO-LEFT OVERRIDE) at line 1, column 19; \
+                 U+200B (ZERO WIDTH SPACE) at line 1, column 21 (written as an escape sequence)"
+            ),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
     async fn schema_register_identical_text_is_deduplicated() {
         let (_guard, db) = bus_fixture();
         let user_id = format!("u-admin-{}", uuid::Uuid::new_v4());

@@ -2113,6 +2113,20 @@ mod tests {
         assert_eq!((scanned, found.len()), (2, 0));
     }
 
+    const ESCAPED_CONTROLS: &str = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\",\"pattern\":\"^[^\\u0000-\\u001F]*$\"}}}";
+
+    #[test]
+    fn a_stored_text_that_only_uses_escapes_below_u0100_is_not_hidden_and_a_next_version_registers() {
+        let db = fresh_db();
+        register_text(&db, "controls", SchemaType::JsonSchema, ESCAPED_CONTROLS).unwrap();
+        let (scanned, found) = scan_stored_hidden_characters(&db).unwrap();
+        assert_eq!((scanned, found.len()), (1, 0), "{found:?}");
+        let next = ESCAPED_CONTROLS.replace("$\"}}}", "$\"},\"b\":{\"type\":\"integer\"}}}");
+        let out = register_text(&db, "controls", SchemaType::JsonSchema, &next).unwrap();
+        assert_eq!(out.version, 2);
+        assert_eq!(out.old_spelling_kept.total, 0);
+    }
+
     const PATIENT_V1_HIDDEN: &str = "{\"type\":\"object\",\"properties\":{\"pac\u{202E}jent\":{\"type\":\"string\"}},\"required\":[\"pac\u{202E}jent\"]}";
     const PATIENT_V2_CLEAN: &str = "{\"type\":\"object\",\"properties\":{\"pacjent\":{\"type\":\"string\"}},\"required\":[\"pacjent\"]}";
 

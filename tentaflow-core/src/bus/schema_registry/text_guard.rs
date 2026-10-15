@@ -54,9 +54,15 @@
 // and processing instructions, and byte escapes of a Protobuf string literal
 // decoded as UTF-8. Not covered: Thrift has no escape that can decode to one
 // (its lexer takes only `\\ \" \' \n \r \t`), Protobuf's `\u` is not an escape
-// for its lexer, an entity declared in a DTD (the XSD reader refuses DOCTYPE),
-// and, deliberately, the Avro escapes `\u0000`-`\u00FF`, which are how Avro writes
-// the bytes of a `bytes` or `fixed` default.
+// for its lexer, and an entity declared in a DTD (the XSD reader refuses DOCTYPE).
+// An escape is refused only when it decodes to U+0100 or above, or to U+00AD or
+// U+0085: below U+0100 the formats write ordinary controls and bytes that way
+// (`[^\u0000-\u001F]` in a JSON pattern, `[^&#x7F;-&#x9F;]` in an XSD pattern,
+// the bytes of an Avro `bytes` default, `"\x00\x01"` in a proto2 default), none
+// of which can reorder or hide text on screen. A raw character is refused in
+// every position all the same.
+// A refusal lists every place (raw characters and escapes together), at most
+// `MAX_REFUSED_PLACES` and a count of the rest, so one text is never refused twice.
 //
 // A text stored before this screen existed (or applied from a peer, which
 // stores the row as it came) is not rewritten. It fails on its next compile
@@ -143,11 +149,6 @@ fn refused_name(c: char) -> Option<&'static str> {
 pub enum Syntax {
     /// JSON text: `\uXXXX` (and surrogate pairs) in strings.
     Json,
-    /// JSON text of an Avro schema. Avro writes the bytes of a `bytes` or `fixed`
-    /// default as `\u00XX` (`"\u0000"`, `"\u00ff"`), so an escape of a code point up
-    /// to U+00FF is the format's own way to write a byte and is not refused; every
-    /// bidirectional, zero-width and other format character lies above it.
-    Avro,
     /// XML: numeric character references outside comments, CDATA and
     /// processing instructions.
     Xml,
@@ -170,17 +171,7 @@ pub struct TextRules {
     pub syntax: Syntax,
 }
 
-impl Syntax {
-    fn is_json(self) -> bool {
-        matches!(self, Syntax::Json | Syntax::Avro)
-    }
-}
-
 impl TextRules {
-    pub const AVRO: TextRules = TextRules {
-        leading_bom: false,
-        syntax: Syntax::Avro,
-    };
     pub const JSON: TextRules = TextRules {
         leading_bom: false,
         syntax: Syntax::Json,
@@ -214,7 +205,17 @@ fn hex_value(b: &[u8]) -> Option<u32> {
     })
 }
 
+/// Whether an escape that decodes to `cp` is refused. Below U+0100 an escape is
+/// how a format writes an ordinary control or byte; U+00AD and U+0085 stay
+/// refused because they are invisible or end a line on screen.
+fn refused_escape(cp: u32) -> bool {
+    cp >= 0x100 || matches!(cp, 0xAD | 0x85)
+}
+
 fn refused_hit(start: usize, end: usize, cp: u32, out: &mut Vec<EscapeHit>) {
+    if !refused_escape(cp) {
+        return;
+    }
     if let Some(c) = char::from_u32(cp) {
         if let Some(name) = refused_name(c) {
             out.push(EscapeHit {
@@ -227,7 +228,7 @@ fn refused_hit(start: usize, end: usize, cp: u32, out: &mut Vec<EscapeHit>) {
     }
 }
 
-fn json_escapes(text: &str, exempt_below: u32, out: &mut Vec<EscapeHit>) {
+fn json_escapes(text: &str, out: &mut Vec<EscapeHit>) {
     let b = text.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -260,9 +261,7 @@ fn json_escapes(text: &str, exempt_below: u32, out: &mut Vec<EscapeHit>) {
                 i += 12;
             }
             None => {
-                if unit >= exempt_below {
-                    refused_hit(i, i + 6, unit, out);
-                }
+                refused_hit(i, i + 6, unit, out);
                 i += 6;
             }
         }
@@ -294,7 +293,6 @@ fn xml_escapes(text: &str, out: &mut Vec<EscapeHit>) {
             let digits = i + if hex { 3 } else { 2 };
             let len = b[digits..]
                 .iter()
-                .take(8)
                 .take_while(|d| char::from(**d).is_digit(if hex { 16 } else { 10 }))
                 .count();
             if len > 0 && b.get(digits + len) == Some(&b';') {
@@ -378,11 +376,13 @@ fn proto_literal(text: &str, open: usize, out: &mut Vec<EscapeHit>) -> usize {
                 Some(v) => (Some(v as u8), 4),
                 None => (None, 2),
             },
+            // The protobuf lexer takes any decimal digit after the first octal one
+            // and lets the byte wrap, so `\428` is 0x18.
             b'0'..=b'7' => {
-                let digits = b[i + 1..]
+                let digits = 1 + b[i + 2..]
                     .iter()
-                    .take(3)
-                    .take_while(|d| (b'0'..=b'7').contains(d))
+                    .take(2)
+                    .take_while(|d| d.is_ascii_digit())
                     .count();
                 let v = b[i + 1..i + 1 + digits]
                     .iter()
@@ -446,8 +446,7 @@ fn proto_literal(text: &str, open: usize, out: &mut Vec<EscapeHit>) -> usize {
 fn escape_hits(text: &str, syntax: Syntax) -> Vec<EscapeHit> {
     let mut out = Vec::new();
     match syntax {
-        Syntax::Json => json_escapes(text, 0, &mut out),
-        Syntax::Avro => json_escapes(text, 0x100, &mut out),
+        Syntax::Json => json_escapes(text, &mut out),
         Syntax::Xml => xml_escapes(text, &mut out),
         Syntax::Proto => proto_escapes(text, &mut out),
         Syntax::Thrift => {}
@@ -511,57 +510,58 @@ impl fmt::Display for Finding {
 /// the dashboard recognises it (`schema-windows.js`).
 pub(super) const WRITTEN_AS_ESCAPE: &str = " (written as an escape sequence)";
 
-fn position(text: &str, byte: usize) -> (usize, usize) {
-    let before = &text[..byte];
-    let line = before.matches('\n').count() + 1;
-    let column = before.chars().rev().take_while(|c| *c != '\n').count() + 1;
-    (line, column)
+fn has_refused(text: &str) -> bool {
+    text.chars().any(|c| refused_name(c).is_some())
 }
 
-/// The first character of `text` that stands there itself and is refused.
-fn find_raw(text: &str, allow_leading_bom: bool) -> Option<Finding> {
-    let mut line = 1usize;
-    let mut column = 1usize;
-    for (index, c) in text.chars().enumerate() {
+/// Most places one refusal lists; the count of the rest follows them.
+pub(super) const MAX_REFUSED_PLACES: usize = 20;
+
+/// Every refused character of `text`, written as itself or as an escape, in
+/// order of appearance. One pass over the text, however many there are.
+pub(super) fn find_all_hidden(text: &str, rules: TextRules) -> Vec<Finding> {
+    let mut events: Vec<(usize, char, &'static str, bool)> = Vec::new();
+    for (byte, c) in text.char_indices() {
         if let Some(name) = refused_name(c) {
-            if !(allow_leading_bom && index == 0 && c == '\u{FEFF}') {
-                return Some(Finding {
-                    character: c,
-                    name,
-                    line,
-                    column,
-                    escape: false,
-                });
+            if !(rules.leading_bom && byte == 0 && c == '\u{FEFF}') {
+                events.push((byte, c, name, false));
             }
         }
-        if c == '\n' {
-            line += 1;
-            column = 1;
-        } else {
-            column += 1;
-        }
     }
-    None
+    events.extend(
+        escape_hits(text, rules.syntax)
+            .into_iter()
+            .map(|h| (h.start, h.character, h.name, true)),
+    );
+    events.sort_by_key(|e| e.0);
+    let (mut line, mut column, mut cursor) = (1usize, 1usize, 0usize);
+    events
+        .into_iter()
+        .map(|(byte, character, name, escape)| {
+            for c in text[cursor..byte].chars() {
+                if c == '\n' {
+                    line += 1;
+                    column = 1;
+                } else {
+                    column += 1;
+                }
+            }
+            cursor = byte;
+            Finding {
+                character,
+                name,
+                line,
+                column,
+                escape,
+            }
+        })
+        .collect()
 }
 
 /// The first refused character of `text`, written as itself or as an escape,
 /// whichever stands first.
 pub(super) fn find_hidden(text: &str, rules: TextRules) -> Option<Finding> {
-    let raw = find_raw(text, rules.leading_bom);
-    let Some(hit) = escape_hits(text, rules.syntax).into_iter().next() else {
-        return raw;
-    };
-    let (line, column) = position(text, hit.start);
-    match raw {
-        Some(r) if (r.line, r.column) <= (line, column) => Some(r),
-        _ => Some(Finding {
-            character: hit.character,
-            name: hit.name,
-            line,
-            column,
-            escape: true,
-        }),
-    }
+    find_all_hidden(text, rules).into_iter().next()
 }
 
 /// Schema text that passed the screen. Only [`screen`] makes one, and the
@@ -576,11 +576,30 @@ impl<'a> Screened<'a> {
     }
 }
 
-pub(super) fn screen(text: &str, rules: TextRules) -> Result<Screened<'_>, SchemaError> {
-    match find_hidden(text, rules) {
-        Some(found) => Err(SchemaError::Invalid(format!("{HIDDEN_CHARACTER} {found}"))),
-        None => Ok(Screened(text)),
+/// The places of a refusal: `U+202E (NAME) at line 3, column 14` each, joined by
+/// `; `, the first [`MAX_REFUSED_PLACES`] and `; and N more`.
+fn places_sentence(found: &[Finding]) -> String {
+    let mut out = found
+        .iter()
+        .take(MAX_REFUSED_PLACES)
+        .map(Finding::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    if found.len() > MAX_REFUSED_PLACES {
+        out.push_str(&format!("; and {} more", found.len() - MAX_REFUSED_PLACES));
     }
+    out
+}
+
+pub(super) fn screen(text: &str, rules: TextRules) -> Result<Screened<'_>, SchemaError> {
+    let found = find_all_hidden(text, rules);
+    if found.is_empty() {
+        return Ok(Screened(text));
+    }
+    Err(SchemaError::Invalid(format!(
+        "{HIDDEN_CHARACTER} {}",
+        places_sentence(&found)
+    )))
 }
 
 /// `text` without any character [`find_hidden`] would refuse, written as itself
@@ -730,15 +749,25 @@ fn merged_key(node: &Node) -> Option<String> {
 /// duplicate the stored text already had on its own is not this kind and is
 /// left alone, and so is a text that is not JSON.
 pub(super) fn collapsed_key(revealed: &str, rules: TextRules) -> Option<String> {
-    if !rules.syntax.is_json() {
+    if !matches!(rules.syntax, Syntax::Json) {
         return None;
     }
     merged_key(&json_tree(revealed)?)
 }
 
-/// Keys whose string value is prose for a reader and not a name or a value
-/// that data carries.
-const PROSE_KEYS: [&str; 5] = ["title", "description", "doc", "$comment", "example"];
+/// Keys whose string value is prose for a reader, or a pattern, identifier or
+/// format label of the schema itself, and not a name or a value that data carries.
+const NON_DATA_KEYS: [&str; 9] = [
+    "title",
+    "description",
+    "doc",
+    "$comment",
+    "example",
+    "pattern",
+    "$id",
+    "$schema",
+    "format",
+];
 
 /// Longest name or value a list shows, in characters.
 const SHOWN_CHARS: usize = 120;
@@ -764,7 +793,7 @@ fn json_spellings(node: &Node, out: &mut Vec<String>) {
                     out.push(key.clone());
                 }
                 let prose = match value {
-                    Node::Text(_) => PROSE_KEYS.contains(&unmark(key).as_str()),
+                    Node::Text(_) => NON_DATA_KEYS.contains(&unmark(key).as_str()),
                     Node::Array(_) => unmark(key) == "examples",
                     _ => false,
                 };
@@ -790,15 +819,21 @@ fn xml_spellings(text: &str, out: &mut Vec<String>) {
             i += 1;
             continue;
         };
-        let skip = [("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>")]
-            .into_iter()
-            .find(|(open, _)| rest.starts_with(open))
+        // Inside a tag these are plain text of an attribute value, and searching
+        // for their close from every one of them would make the scan quadratic.
+        let skip = (!in_tag)
+            .then(|| {
+                [("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>")]
+                    .into_iter()
+                    .find(|(open, _)| rest.starts_with(open))
+            })
+            .flatten()
             .map(|(open, close)| {
                 rest[open.len()..]
                     .find(close)
                     .map_or(b.len(), |p| i + open.len() + p + close.len())
             });
-        if let Some(end) = skip.filter(|_| !in_tag) {
+        if let Some(end) = skip {
             i = end;
             continue;
         }
@@ -808,7 +843,7 @@ fn xml_spellings(text: &str, out: &mut Vec<String>) {
             q @ (b'"' | b'\'') if in_tag => {
                 let end = rest[1..].find(char::from(q)).map_or(b.len(), |p| i + 1 + p);
                 let value = &text[i + 1..end];
-                if find_raw(value, false).is_some() {
+                if has_refused(value) {
                     out.push(sanitize(value));
                 }
                 i = end;
@@ -825,7 +860,7 @@ fn idl_spellings(text: &str, hash_comments: bool, out: &mut Vec<String>) {
     let b = text.as_bytes();
     let mut word = String::new();
     let mut flush = |word: &mut String| {
-        if word.chars().any(char::is_alphanumeric) && find_raw(word, false).is_some() {
+        if word.chars().any(char::is_alphanumeric) && has_refused(word) {
             out.push(sanitize(word));
         }
         word.clear();
@@ -865,12 +900,14 @@ fn idl_spellings(text: &str, hash_comments: bool, out: &mut Vec<String>) {
 /// The names and values of a text, in the positions where a stored record
 /// carries them (field and property names, enum symbols, constant values,
 /// references), that are spelled with a refused character. Titles,
-/// descriptions, comments and string options are not data and are left out.
+/// descriptions, comments, patterns, `$id`/`$schema`/`format` labels and every
+/// string literal of a .proto or Thrift text (options and defaults alike) are
+/// not names and are left out.
 /// `revealed` is the text after [`reveal`].
 pub(super) fn hidden_spellings(revealed: &str, rules: TextRules) -> Spellings {
     let mut all = Vec::new();
     match rules.syntax {
-        Syntax::Json | Syntax::Avro => {
+        Syntax::Json => {
             if let Some(tree) = json_tree(revealed) {
                 json_spellings(&tree, &mut all);
             }
@@ -1689,10 +1726,10 @@ mod tests {
             },
             Escaped {
                 kind: SchemaType::Protobuf,
-                bad: "syntax = \"proto3\";\noption java_package = \"a\\x07b\";\nmessage M { int32 a = 1; }\n",
+                bad: "syntax = \"proto3\";\noption java_package = \"a\\342\\200\\248b\";\nmessage M { int32 a = 1; }\n",
                 ok: "syntax = \"proto3\";\noption java_package = \"ab\";\nmessage M { int32 a = 1; }\n",
-                code: "U+0007",
-                needle: "\\x07",
+                code: "U+2028",
+                needle: "\\342\\200\\248",
             },
         ]
     }
@@ -1721,22 +1758,119 @@ mod tests {
         }
     }
 
+    const XSD_OPEN: &str = "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">";
+
     #[test]
-    fn avro_writes_the_bytes_of_a_default_as_escapes_and_those_are_not_refused() {
-        let bytes = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"b\",\"type\":\"bytes\",\"default\":\"\\u0000\\u00ff\\u0085\"}]}";
-        assert!(
-            compile(SchemaType::Avro, bytes).is_ok(),
-            "{:?}",
-            compile(SchemaType::Avro, bytes)
+    fn escapes_below_u0100_are_the_formats_own_controls_and_bytes_and_pass() {
+        let avro = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"b\",\"type\":\"bytes\",\"default\":\"\\u0000\\u00ff\\u001f\"}]}";
+        let json = "{\"type\":\"string\",\"pattern\":\"^[^\\u0000-\\u001F]*$\"}";
+        let xsd = |pattern: &str| {
+            format!("{XSD_OPEN}<xs:simpleType name=\"t\"><xs:restriction base=\"xs:string\"><xs:pattern value=\"{pattern}\"/></xs:restriction></xs:simpleType><xs:element name=\"a\" type=\"xs:string\"/></xs:schema>")
+        };
+        let proto2 = "syntax = \"proto2\";\nmessage M { optional bytes a = 1 [default = \"\\x00\\x01\"]; }\n";
+        for (kind, text) in [
+            (SchemaType::Avro, avro.to_string()),
+            (SchemaType::JsonSchema, json.to_string()),
+            (SchemaType::Xsd, xsd("[^&#x7F;-&#x9F;]*")),
+            (SchemaType::Xsd, xsd("[^&#x1;-&#x1F;]")),
+            (SchemaType::Xsd, xsd("a&#10;b&#x9;c&#13;d")),
+            (SchemaType::Protobuf, proto2.to_string()),
+        ] {
+            assert!(compile(kind, &text).is_ok(), "{}: {text}: {:?}", kind.as_str(), compile(kind, &text));
+        }
+    }
+
+    #[test]
+    fn a_stored_text_with_only_such_escapes_still_compares_and_is_not_listed() {
+        let old = "{\"type\":\"string\",\"pattern\":\"^[^\\u0000-\\u001F]*$\"}";
+        let kept = SchemaType::JsonSchema
+            .ops()
+            .check_compatibility_noting(old, old, Compatibility::Full)
+            .unwrap();
+        assert_eq!(kept.total, 0);
+        assert!(find_hidden(old, TextRules::JSON).is_none());
+    }
+
+    #[test]
+    fn u00ad_and_u0085_are_refused_as_escapes_in_every_format() {
+        let xsd = |reference: &str| format!("{XSD_OPEN}<xs:element name=\"a{reference}b\" type=\"xs:string\"/></xs:schema>");
+        for (kind, text, code) in [
+            (SchemaType::JsonSchema, "{\"description\":\"\\u00ad\"}".to_string(), "U+00AD"),
+            (SchemaType::JsonSchema, "{\"description\":\"\\u0085\"}".to_string(), "U+0085"),
+            (SchemaType::Avro, "{\"type\":\"string\",\"doc\":\"\\u0085\"}".to_string(), "U+0085"),
+            (SchemaType::Xsd, xsd("&#xAD;"), "U+00AD"),
+            (SchemaType::Xsd, xsd("&#133;"), "U+0085"),
+            (SchemaType::Protobuf, "syntax = \"proto3\";\noption java_package = \"a\\xc2\\xadb\";\nmessage M { int32 a = 1; }\n".to_string(), "U+00AD"),
+            (SchemaType::Protobuf, "syntax = \"proto3\";\noption java_package = \"a\\302\\205b\";\nmessage M { int32 a = 1; }\n".to_string(), "U+0085"),
+        ] {
+            let message = compile(kind, &text).unwrap_err().to_string();
+            assert!(
+                message.contains(&format!("{code} (")) && message.ends_with(WRITTEN_AS_ESCAPE),
+                "{} {code}: {message}",
+                kind.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn an_avro_escape_above_the_byte_range_is_refused_like_any_other() {
+        let wide = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"b\",\"type\":\"bytes\",\"default\":\"\\u2066\"}]}";
+        assert!(compile(SchemaType::Avro, wide).is_err());
+        let raw = wide.replace("\\u2066", "\u{0}");
+        assert!(compile(SchemaType::Avro, &raw).is_err(), "a raw control stays refused");
+    }
+
+    #[test]
+    fn xml_references_are_read_to_their_last_digit() {
+        let hit = |reference: &str| {
+            find_hidden(&format!("<a>{reference}</a>"), TextRules::XML)
+                .map(|f| (f.code_point(), f.escape))
+        };
+        for reference in ["&#x202E;", "&#x0000000202E;", "&#00000000008238;", "&#X000202e;"] {
+            assert_eq!(hit(reference), Some(("U+202E".to_string(), true)), "{reference}");
+        }
+        // Too large for a code point: not a reference to anything refused, and no panic.
+        for reference in ["&#x110000000000000000;", "&#99999999999999999999;", "&#x110000;"] {
+            assert_eq!(hit(reference), None, "{reference}");
+        }
+    }
+
+    #[test]
+    fn a_protobuf_octal_escape_wraps_and_takes_decimal_digits_like_the_lexer() {
+        // `\248` is 0xA8 for the lexer (2*64+4*8+8 = 168), not `\24` followed by an 8.
+        let text = "option x = \"\\342\\200\\248\";";
+        let found = find_hidden(text, TextRules::PROTO).unwrap();
+        assert_eq!((found.code_point().as_str(), found.escape), ("U+2028", true));
+        // `\428` is 0x18, a control below U+0100, and not an 8 after `\42`.
+        assert!(find_hidden("option x = \"\\428\";", TextRules::PROTO).is_none());
+        assert!(find_hidden("option x = \"\\342\\200\\24\" ;", TextRules::PROTO).is_none());
+    }
+
+    #[test]
+    fn a_refusal_lists_every_place_raw_and_escaped_together() {
+        let text = "{\n  \"a\u{200B}\": \"x\\u202Ey\",\n  \"b\": \"\u{2066}\\u0085\"\n}";
+        let message = compile(SchemaType::JsonSchema, text).unwrap_err().to_string();
+        assert_eq!(
+            message,
+            format!(
+                "invalid schema: {HIDDEN_CHARACTER} U+200B (ZERO WIDTH SPACE) at line 2, column 5; \
+                 U+202E (RIGHT-TO-LEFT OVERRIDE) at line 2, column 11{WRITTEN_AS_ESCAPE}; \
+                 U+2066 (LEFT-TO-RIGHT ISOLATE) at line 3, column 9; \
+                 U+0085 (NEXT LINE) at line 3, column 10{WRITTEN_AS_ESCAPE}"
+            )
         );
-        // The same escapes are refused in a format that has no such use for them, and the raw characters everywhere.
-        let json = "{\"type\":\"string\",\"description\":\"\\u0000\"}";
-        assert!(compile(SchemaType::JsonSchema, json).is_err());
-        let raw = bytes.replace("\\u0000", "\u{0}");
-        assert!(compile(SchemaType::Avro, &raw).is_err());
-        // Above the byte range an escape is a character like any other.
-        let wide = bytes.replace("\\u0085", "\\u2066");
-        assert!(compile(SchemaType::Avro, &wide).is_err());
+        let many = format!("\"{}\"", "\u{200B}".repeat(MAX_REFUSED_PLACES + 7));
+        let message = compile(SchemaType::JsonSchema, &many).unwrap_err().to_string();
+        assert_eq!(message.matches("U+200B").count(), MAX_REFUSED_PLACES, "{message}");
+        assert!(message.ends_with("; and 7 more"), "{message}");
+    }
+
+    #[test]
+    fn the_places_of_a_large_text_are_found_in_one_pass() {
+        let text = "\u{200B}\n".repeat(200_000);
+        let started = std::time::Instant::now();
+        assert_eq!(find_all_hidden(&text, TextRules::JSON).len(), 200_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
@@ -1788,5 +1922,34 @@ mod tests {
             .check_compatibility_noting(old, new, Compatibility::Full)
             .unwrap();
         assert_eq!(kept.shown, vec!["pac⟦U+202E⟧jent".to_string()]);
+    }
+
+    #[test]
+    fn hidden_spellings_leave_out_patterns_labels_and_string_defaults() {
+        assert_eq!(
+            spelled(
+                "{\"$schema\":\"s\u{200B}\",\"$id\":\"i\u{200B}\",\"properties\":{\"p\":{\"pattern\":\"a\u{200B}\",\"format\":\"f\u{200B}\"}}}",
+                TextRules::JSON
+            ),
+            Vec::<String>::new()
+        );
+        assert!(spelled(
+            "message M { optional string a = 1 [default = \"d\u{200B}\"]; }",
+            TextRules::PROTO
+        )
+        .is_empty());
+        assert!(spelled(
+            "struct S { 1: string a = \"d\u{200B}\" }",
+            TextRules::THRIFT
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn xml_spellings_do_not_search_for_a_close_from_every_comment_opener_inside_a_tag() {
+        let text = format!("<a {}", "<!--".repeat(60_000));
+        let started = std::time::Instant::now();
+        assert!(hidden_spellings(&text, TextRules::XML).shown.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 }

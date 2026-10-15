@@ -95,7 +95,7 @@ use serde_json::Value;
 
 use super::{
     shorten_path, Budget, Compatibility, CompiledSchema, LimitExceeded, SchemaError, SchemaKindOps,
-    Screened, TextRules, ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
+    Screened, ValidationBudget, MAX_SCHEMA_TEXT_BYTES,
 };
 
 const MAX_SCHEMA_NODES: usize = 4096;
@@ -1809,10 +1809,6 @@ fn record_with(record: &RecordSchema, fields: Vec<RecordField>) -> Schema {
 pub struct AvroOps;
 
 impl SchemaKindOps for AvroOps {
-    fn text_rules(&self) -> TextRules {
-        TextRules::AVRO
-    }
-
     fn compile_screened(&self, schema_text: Screened<'_>) -> Result<CompiledSchema, SchemaError> {
         let schema_text = schema_text.as_str();
         parse_text(schema_text).map(|(_, compiled)| CompiledSchema::Avro(compiled))
