@@ -995,7 +995,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   odmowie, odczyt w przeglądarce.** Sekwencja jest odmawiana tylko wtedy, gdy
   dekoduje się do U+0100 lub wyżej albo do U+00AD i U+0085; sterujące i bajty,
   które formaty zapisują tak zwyczajnie (`[^\u0000-\u001F]` we wzorcu JSON,
-  `[^&#x7F;-&#x9F;]` w XSD, `"\x00\x01"` w proto2, bajty `bytes` w Avro), przechodzą,
+  `[^&#x7F;-&#x9F;]` w XSD, `"\x00\x01"` w proto2, domyślne `bytes` w Avro oprócz bajtów 0x85 i 0xAD, których `\u0085` i `\u00AD` nadal odmawia), przechodzą,
   więc zapisane wersje z takimi tekstami nadal się kompilują. Surowy znak jest
   odmawiany wszędzie jak dotąd. Odwołania XSD czytane są do ostatniej cyfry
   (zera wiodące nie omijają sprawdzenia), ósemkowe sekwencje Protobuf tak jak jego
@@ -1008,6 +1008,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   przycisk „Usuń niewidoczne znaki” obiecuje tylko dla znaków wpisanych wprost.
   Skutek pola „zmień nazwy w zasadach” podaje stare i nowe nazwy oraz topiki, a
   komunikat po zapisie mówi to w czasie przeszłym i prowadzi do ukrywania danych.
+  Dalsze poprawki: sąsiednie literały Protobuf (`"\xE2" "\x80\xAE"`) są łączone
+  przed dekodowaniem UTF-8 jak w lekserze, a domyślna wartość pola `bytes` nie
+  jest dekodowana jako tekst; w XSD odwołania w wartościach atrybutów są czytane
+  także po `<!--`, `<?` i `<![CDATA[` wpisanym w atrybut; sekwencje w wyrażeniu
+  regularnym (`pattern` w JSON Schema, klucz `patternProperties`, `value`
+  elementu `xs:pattern`) nie są odmawiane, bo wyrażenie nie jest nigdzie
+  pokazywane zdekodowane (surowy znak nadal jest); skan przy starcie nie czyta
+  sekwencji JSON w wierszu nieznanego rodzaju; linki do ukrywania danych są też
+  po udanej i częściowej zmianie nazw. Znane ograniczenie: sekwencja znaku
+  sterującego C0/C1 poniżej U+0100 w kluczu lub nazwie przechodzi po stronie
+  serwera (panel ją oznacza).
 
 ## [0.4.0-beta.1] — 2026-09-29
 

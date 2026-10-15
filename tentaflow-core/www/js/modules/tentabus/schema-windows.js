@@ -1041,7 +1041,7 @@ export function renameOutcome(renames, chosen) {
   return {
     topics,
     text: T(chosen ? 'schemas.hidden.rules_renamed_effect' : 'schemas.hidden.rules_unchanged', {
-      ...renameWords(renames), topicCount: topics.length || 1, topics: listText(topics.map((t) => `„${t}”`)),
+      ...renameWords(renames), topicCount: topics.length || 1, topics: listText(topics.map((t) => T('schemas.hidden.topic_quoted', { topic: t }))),
     }),
   };
 }
@@ -1287,7 +1287,7 @@ export function openSchemaVersion(ctx) {
         const gone = issues?.gone || [];
         rulesEl.hidden = !gone.length;
         if (gone.length) {
-          const topics = [...new Set(gone.flatMap((g) => g.topics))].map((t) => `„${t}”`);
+          const topics = [...new Set(gone.flatMap((g) => g.topics))].map((t) => T('schemas.hidden.topic_quoted', { topic: t }));
           rulesEl.innerHTML = sentenceHtml(T('schemas.hidden.rules_gone', { topics: listText(topics), fields: showHidden(listText(gone.map((g) => g.name))) }));
         }
         const renames = issues?.renames || [];

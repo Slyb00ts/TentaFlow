@@ -2446,8 +2446,12 @@ async function openNewVersionWindow(name) {
         const failed = ruleRename.renamed ? T('schemas.hidden.rules_rename_partial', { count: ruleRename.renamed, error: ruleRename.error }) : T('schemas.hidden.rules_rename_failed', { error: ruleRename.error });
         Object.assign(notice, { tone: 'warning', text: `${notice.text} ${failed}`.trim() });
       } else if (ruleRename?.renamed) {
-        notice.text = `${notice.text} ${T('schemas.hidden.rules_renamed', { count: ruleRename.renamed })} ${renameOutcome(ruleRename.fields, true).text}`.trim();
+        const done = renameOutcome(ruleRename.fields, true);
+        notice.text = `${notice.text} ${T('schemas.hidden.rules_renamed', { count: ruleRename.renamed })} ${done.text}`.trim();
+        notice.hidingTopics = done.topics;
       }
+      // A failed or partial rename leaves rules to correct: the way to them is there too.
+      if (ruleRename?.error && ruleRename.fields) notice.hidingTopics = renameOutcome(ruleRename.fields, false).topics;
       // The rules were offered a rename and left as they were: what that did to the readers is said, with a way to the rules.
       if (ruleRenameDeclined?.length) {
         const left = renameOutcome(ruleRenameDeclined, false);

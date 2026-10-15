@@ -10649,7 +10649,8 @@
         "preview_title_escape": "Líneas por corregir (la secuencia de escape de un carácter invisible está resaltada):",
         "rules_renamed_effect": "Las reglas ahora admiten {count|el campo|los campos} {to} en lugar de {from}, así que los lectores de {topicCount|topic|topics} {topics} siguen viéndolos en los mensajes nuevos.",
         "rules_unchanged": "Las reglas de ocultación de datos no se cambiaron: los lectores de {topicCount|topic|topics} {topics} no verán {count|el campo|los campos} {from} en los mensajes nuevos. Puede cambiarlo en la sección «Ocultar datos».",
-        "rules_open": "Ocultar datos del topic «{topic}»"
+        "rules_open": "Ocultar datos del topic «{topic}»",
+        "topic_quoted": "«{topic}»"
       },
       "refused": {
         "hl7_msh": "«{field}» describe los separadores del propio mensaje, así que no puede ser obligatorio. Quita «{field}» de los campos obligatorios.",

@@ -1576,6 +1576,19 @@ test('the browser reads the escape forms of each format and lists them; the butt
   assert.deepEqual(at('json_schema', '"\\u00ad\\u0085"'), [['U+00AD', 1, 2], ['U+0085', 1, 8]]);
   assert.equal(at('thrift', 'const string a = "\\u202e"'), undefined, 'Thrift has no such escape');
   assert.equal(at('xsd', '<!-- &#x202E; --><![CDATA[&#x202E;]]>'), undefined, 'comments and CDATA are not decoded');
+  // Adjacent literals are joined before they are decoded; a bytes default is not text.
+  assert.deepEqual(at('protobuf', 'option x = "a\\xE2" \'\\x80\\xAEb\';'), [['U+202E', 1, 14]]);
+  assert.deepEqual(at('protobuf', 'optional string a = 1 [default = "\\xE2" /*x*/\n "\\x80\\xAE"];'), [['U+202E', 1, 35]]);
+  assert.equal(at('protobuf', 'optional bytes magic = 1 [default = "\\xEF\\xBB\\xBF"];'), undefined);
+  assert.deepEqual(at('protobuf', 'optional string bytes = 1 [default = "\\xE2\\x80\\xAE"];'), [['U+202E', 1, 39]]);
+  // A reference in an attribute value is read although the value holds a comment opener; a pattern's value is not decoded.
+  assert.deepEqual(at('xsd', '<e v="a<!--"/><e v="&#x202E;x"/><e v="-->"/>'), [['U+202E', 1, 21]]);
+  assert.deepEqual(at('xsd', '<e v="a<?"/><e v="&#x202E;x"/><e v="?>"/>'), [['U+202E', 1, 19]]);
+  assert.equal(at('xsd', '<xs:pattern value="[^&#x200B;&#xFEFF;]*"/>'), undefined);
+  assert.deepEqual(at('xsd', '<xs:pattern id="&#x200B;" value="x"/>'), [['U+200B', 1, 17]]);
+  // A JSON pattern and a patternProperties key are not decoded either, nothing else is exempt.
+  assert.equal(at('json_schema', '{"pattern":"^[^\\u200B\\uFEFF]*$","patternProperties":{"^[^\\u200B]+$":{}}}'), undefined);
+  assert.deepEqual(at('json_schema', '{"pattern":"x","description":"\\u200B","properties":{"a\\u200B":{}}}'), [['U+200B', 1, 31], ['U+200B', 1, 55]]);
   const mixed = hiddenPlaces(`a${RLO}b "\\u202E"`, { schemaType: 'json_schema' });
   assert.equal(mixed.raw.length, 1);
   assert.equal(mixed.escapes.length, 1);
@@ -1599,6 +1612,10 @@ test('the live row names the escape sequences and leaves the button out when the
   assert.equal(win.querySelector('[data-role="strip-wrap"]').hidden, false);
   assert.match(norm(win.querySelector('[data-role="hidden-places"]').textContent), /^Niewidoczne znaki w tekście: U\+202E .*Niewidoczne znaki zapisane sekwencjami specjalnymi/);
   win.close(true);
+});
+
+test('a topic name in a sentence is quoted the way the language does', () => {
+  assert.equal(renameOutcome([{ from: 'a\u200B', to: 'a', topics: ['wizyty'] }], false).text.includes('„wizyty”'), true);
 });
 
 test('the server lists every refused place and the browser reads them all', () => {

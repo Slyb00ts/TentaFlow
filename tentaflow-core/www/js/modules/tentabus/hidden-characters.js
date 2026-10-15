@@ -150,7 +150,8 @@ const hex4 = (text, at) => {
   return HEX4.test(part) ? parseInt(part, 16) : null;
 };
 
-function jsonEscapes(text, hit) {
+/** The escapes of one JSON string's content; `base` = where it starts in the text. */
+function jsonStringEscapes(text, base, hit) {
   let i = 0;
   while (i < text.length) {
     if (text[i] !== '\\') {
@@ -165,40 +166,126 @@ function jsonEscapes(text, hit) {
       }
       const low = unit >= 0xD800 && unit < 0xDC00 && text.startsWith('\\u', i + 6) ? hex4(text, i + 8) : null;
       if (low != null && low >= 0xDC00 && low < 0xE000) {
-        hit(i, i + 12, 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00));
+        hit(base + i, base + i + 12, 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00));
         i += 12;
       } else {
-        hit(i, i + 6, unit);
+        hit(base + i, base + i + 6, unit);
         i += 6;
       }
     }
   }
 }
 
-const XML_SKIPPED = [['<!--', '-->'], ['<![CDATA[', ']]>'], ['<?', '?>']];
-
-function xmlEscapes(text, hit) {
+/**
+ * JSON escapes, except those of a regular expression (a `pattern` value, a `patternProperties` key): a pattern is never
+ * shown decoded, and a schema that defends against a zero-width space has to name it there. The reading of where a
+ * string stands is the one of `text_guard.rs` `json_escapes`.
+ */
+function jsonEscapes(text, hit) {
+  const stack = [];
   let i = 0;
   while (i < text.length) {
+    const ch = text[i];
+    const top = stack[stack.length - 1];
+    if (ch === '{' || ch === '[') {
+      const inPatternProperties = Boolean(top && top.object && !top.expectKey && top.key === 'patternProperties');
+      stack.push({ object: ch === '{', expectKey: true, key: '', patternProperties: ch === '{' && inPatternProperties });
+      i += 1;
+    } else if (ch === '}' || ch === ']') {
+      stack.pop();
+      i += 1;
+    } else if (ch === ',') {
+      if (top?.object) top.expectKey = true;
+      i += 1;
+    } else if (ch === ':') {
+      if (top?.object) top.expectKey = false;
+      i += 1;
+    } else if (ch === '"') {
+      const start = i + 1;
+      let end = start;
+      while (end < text.length && text[end] !== '"') end += text[end] === '\\' ? 2 : 1;
+      end = Math.min(end, text.length);
+      const content = text.slice(start, end);
+      let exempt = false;
+      if (top?.object && top.expectKey) {
+        top.key = content;
+        exempt = top.patternProperties;
+      } else if (top?.object) {
+        exempt = top.key === 'pattern';
+      }
+      if (!exempt) jsonStringEscapes(content, start, hit);
+      i = end + 1;
+    } else {
+      i += 1;
+    }
+  }
+}
+
+const XML_SKIPPED = [['<!--', '-->'], ['<![CDATA[', ']]>'], ['<?', '?>']];
+
+/** A numeric character reference at `i`: where it ends (and `hit` is told what it names), or `null`. */
+function xmlReference(text, i, hit) {
+  if (!text.startsWith('&#', i)) return null;
+  const hex = text[i + 2] === 'x' || text[i + 2] === 'X';
+  const start = i + (hex ? 3 : 2);
+  const digits = (hex ? /^[0-9a-fA-F]+/ : /^[0-9]+/).exec(text.slice(start))?.[0] || '';
+  if (!digits || text[start + digits.length] !== ';') return null;
+  // Every digit counts: leading zeros do not hide a reference, and a value too big for a code point is none.
+  const significant = digits.replace(/^0+/, '');
+  if (significant.length <= 8) hit(i, start + digits.length + 1, significant ? parseInt(significant, hex ? 16 : 10) : 0);
+  return start + digits.length + 1;
+}
+
+/** Whether the tag opened at `open` is an `xs:pattern`, whose `value` is a regular expression. */
+function isPatternTag(text, open) {
+  const name = /^[^\s>/]*/.exec(text.slice(open + 1))[0];
+  return name === 'pattern' || name.endsWith(':pattern');
+}
+
+/** The attribute name written before the `=` that precedes the quote at `quote`. */
+function attributeBefore(text, quote) {
+  return /([^\s<=]*)\s*=?\s*$/.exec(text.slice(0, quote))?.[1] || '';
+}
+
+/**
+ * XML character references: in element text and in attribute values (a `<!--` there is plain text, so it opens no
+ * comment), not in comments, CDATA and processing instructions outside a tag, and not in the `value` of an `xs:pattern`.
+ * The reading is the one of `text_guard.rs` `xml_escapes`.
+ */
+function xmlEscapes(text, hit) {
+  let i = 0;
+  let tag = null;
+  let quote = null;
+  let patternValue = false;
+  while (i < text.length) {
+    if (quote) {
+      if (text[i] === quote) quote = null;
+      else if (!patternValue) {
+        i = xmlReference(text, i, hit) ?? i + 1;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if (tag !== null) {
+      if (text[i] === '>') tag = null;
+      else if (text[i] === '"' || text[i] === "'") {
+        quote = text[i];
+        patternValue = isPatternTag(text, tag) && attributeBefore(text, i) === 'value';
+      }
+      i += 1;
+      continue;
+    }
     const skipped = XML_SKIPPED.find(([open]) => text.startsWith(open, i));
     if (skipped) {
       const close = text.indexOf(skipped[1], i + skipped[0].length);
       i = close < 0 ? text.length : close + skipped[1].length;
-      continue;
+    } else if (text[i] === '<') {
+      tag = i;
+      i += 1;
+    } else {
+      i = xmlReference(text, i, hit) ?? i + 1;
     }
-    if (text.startsWith('&#', i)) {
-      const hex = text[i + 2] === 'x' || text[i + 2] === 'X';
-      const start = i + (hex ? 3 : 2);
-      const digits = (hex ? /^[0-9a-fA-F]+/ : /^[0-9]+/).exec(text.slice(start))?.[0] || '';
-      if (digits && text[start + digits.length] === ';') {
-        // Every digit counts: leading zeros do not hide a reference, and a value too big for a code point is none.
-        const significant = digits.replace(/^0+/, '');
-        if (significant.length <= 8) hit(i, start + digits.length + 1, significant ? parseInt(significant, hex ? 16 : 10) : 0);
-        i = start + digits.length + 1;
-        continue;
-      }
-    }
-    i += 1;
   }
 }
 
@@ -207,9 +294,9 @@ const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true });
 const PROTO_CONTROL = { a: 7, b: 8, f: 0x0c, n: 0x0a, r: 0x0d, t: 9, v: 0x0b };
 
 /** The reading of a protobuf string literal from its opening quote; returns where it ends. */
-function protoLiteral(text, open, hit) {
+/** Appends the bytes one string literal decodes to; returns where it ends. */
+function protoLiteralBytes(text, open, bytes) {
   const quote = text[open];
-  const bytes = [];
   const pushChar = (at, len, escaped) => {
     for (const value of UTF8.encode(text.slice(at, at + len))) bytes.push({ value, start: at, end: at + len, escaped });
   };
@@ -248,6 +335,37 @@ function protoLiteral(text, open, hit) {
     else pushChar(i + 1, len - 1, false);
     i += len;
   }
+  return i + 1;
+}
+
+/** Where the next token starts after whitespace and comments. */
+function skipBlank(text, from) {
+  let i = from;
+  for (;;) {
+    while (i < text.length && /\s/.test(text[i])) i += 1;
+    if (text.startsWith('//', i)) {
+      const end = text.indexOf('\n', i);
+      i = end < 0 ? text.length : end + 1;
+    } else if (text.startsWith('/*', i)) {
+      const end = text.indexOf('*/', i + 2);
+      i = end < 0 ? text.length : end + 2;
+    } else {
+      return i;
+    }
+  }
+}
+
+/** Whether the statement holding the literal at `at` declares a `bytes` field: its default is bytes, not text. */
+function isBytesDefault(text, at) {
+  const before = text.slice(0, at);
+  const statement = before.slice(Math.max(before.lastIndexOf(';'), before.lastIndexOf('{'), before.lastIndexOf('}')) + 1);
+  if (!statement.includes('=')) return false;
+  const tokens = statement.split('=')[0].split(/[^\p{L}\p{N}_.]/u).filter(Boolean);
+  return tokens.length >= 2 && tokens[tokens.length - 2] === 'bytes';
+}
+
+/** Groups the bytes of a joined run as UTF-8 and reports the refused characters some escape wrote. */
+function decodeProtoBytes(bytes, hit) {
   let at = 0;
   while (at < bytes.length) {
     const lead = bytes[at].value;
@@ -268,7 +386,24 @@ function protoLiteral(text, open, hit) {
       at += 1;
     }
   }
-  return i + 1;
+}
+
+/**
+ * The run of adjacent string literals that starts at `open`: the protobuf lexer joins them (blanks and comments between
+ * them are skipped) before it decodes UTF-8, so `"\xE2" "\x80\xAE"` is one character. The default of a `bytes` field
+ * is bytes and is not decoded. Returns where the run ends.
+ */
+function protoRun(text, open, hit) {
+  const bytes = [];
+  let at = open;
+  for (;;) {
+    at = protoLiteralBytes(text, at, bytes);
+    const next = skipBlank(text, Math.min(at, text.length));
+    if (text[next] === '"' || text[next] === "'") at = next;
+    else break;
+  }
+  if (!isBytesDefault(text, open)) decodeProtoBytes(bytes, hit);
+  return at;
 }
 
 function protoEscapes(text, hit) {
@@ -281,7 +416,7 @@ function protoEscapes(text, hit) {
       const end = text.indexOf('*/', i + 2);
       i = end < 0 ? text.length : end + 2;
     } else if (text[i] === '"' || text[i] === "'") {
-      i = protoLiteral(text, i, hit);
+      i = protoRun(text, i, hit);
     } else {
       i += 1;
     }

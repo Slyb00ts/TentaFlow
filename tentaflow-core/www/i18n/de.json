@@ -10649,7 +10649,8 @@
         "preview_title_escape": "Zu korrigierende Zeilen (die Escape-Sequenz eines unsichtbaren Zeichens ist hervorgehoben):",
         "rules_renamed_effect": "Die Regeln lassen jetzt {count|das Feld|die Felder} {to} statt {from} zu, daher sehen die Leser {topicCount|des Topics|der Topics} {topics} sie in neuen Nachrichten weiterhin.",
         "rules_unchanged": "Die Datenausblendungsregeln wurden nicht geändert: Die Leser {topicCount|des Topics|der Topics} {topics} sehen {count|das Feld|die Felder} {from} in neuen Nachrichten nicht. Das ändern Sie im Abschnitt „Daten ausblenden“.",
-        "rules_open": "Daten ausblenden im Topic „{topic}“"
+        "rules_open": "Daten ausblenden im Topic „{topic}“",
+        "topic_quoted": "„{topic}“"
       },
       "refused": {
         "hl7_msh": "„{field}“ beschreibt die Trennzeichen der Nachricht selbst und kann deshalb nicht verlangt werden. Entfernen Sie „{field}“ aus den Pflichtfeldern.",

@@ -11884,7 +11884,8 @@
         "preview_title_escape": "Lines to fix (the escape sequence of an invisible character is highlighted):",
         "rules_renamed_effect": "The rules now allow the {count|field|fields} {to} instead of {from}, so the readers of {topicCount|topic|topics} {topics} keep seeing them in new messages.",
         "rules_unchanged": "The data-hiding rules were not changed: the readers of {topicCount|topic|topics} {topics} will not see the {count|field|fields} {from} in new messages. You can change that in the “Data hiding” section.",
-        "rules_open": "Data hiding of topic “{topic}”"
+        "rules_open": "Data hiding of topic “{topic}”",
+        "topic_quoted": "“{topic}”"
       },
       "refused": {
         "hl7_msh": "“{field}” describes the message's own separators, so it cannot be required. Remove “{field}” from the required fields.",

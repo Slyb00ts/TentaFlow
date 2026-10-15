@@ -11884,7 +11884,8 @@
         "preview_title_escape": "Wiersze do poprawienia (sekwencja specjalna niewidocznego znaku jest tu zaznaczona):",
         "rules_renamed_effect": "Zasady dopuszczają teraz {count|pole|pola|pola} {to} zamiast {from}, więc odbiorcy {topicCount|topiku|topików|topików} {topics} nadal widzą je w nowych wiadomościach.",
         "rules_unchanged": "Zasady ukrywania danych nie zostały zmienione: odbiorcy {topicCount|topiku|topików|topików} {topics} nie zobaczą {count|pola|pól|pól} {from} w nowych wiadomościach. Zmienisz to w sekcji „Ukrywanie danych”.",
-        "rules_open": "Ukrywanie danych w topiku „{topic}”"
+        "rules_open": "Ukrywanie danych w topiku „{topic}”",
+        "topic_quoted": "„{topic}”"
       },
       "refused": {
         "hl7_msh": "„{field}” opisuje same znaki podziału wiadomości, więc nie może być wymagane. Usuń „{field}” z pól wymaganych.",

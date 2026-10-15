@@ -10649,7 +10649,8 @@
         "preview_title_escape": "Lignes à corriger (la séquence d’échappement d’un caractère invisible est surlignée) :",
         "rules_renamed_effect": "Les règles autorisent maintenant {count|le champ|les champs} {to} au lieu de {from} : les lecteurs de {topicCount|topic|topics} {topics} continuent de les voir dans les nouveaux messages.",
         "rules_unchanged": "Les règles de masquage des données n’ont pas été modifiées : les lecteurs de {topicCount|topic|topics} {topics} ne verront pas {count|le champ|les champs} {from} dans les nouveaux messages. Vous pouvez le changer dans la section « Dissimulation des données ».",
-        "rules_open": "Dissimulation des données du topic « {topic} »"
+        "rules_open": "Dissimulation des données du topic « {topic} »",
+        "topic_quoted": "« {topic} »"
       },
       "refused": {
         "hl7_msh": "« {field} » décrit les séparateurs du message lui-même et ne peut donc pas être obligatoire. Retirez « {field} » des champs obligatoires.",

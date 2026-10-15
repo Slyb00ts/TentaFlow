@@ -42,6 +42,11 @@ class TfAlert extends HTMLElement {
   _adoptLateMessage() {
     const late = Array.from(this.children).find((c) => c.getAttribute('slot') === 'message');
     if (!late) return;
+    // The attribute wins; a slotted element beside it would only be a stray child.
+    if (this.getAttribute('message')) {
+      late.remove();
+      return;
+    }
     late.removeAttribute('slot');
     this._messageEl = late;
     this._update();
