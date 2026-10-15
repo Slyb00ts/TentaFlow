@@ -14,6 +14,7 @@ import { processTemplates } from './bpmn.js';
 import '/js/components/tf-searchbox.js';
 import '/js/components/tf-button.js';
 
+const TENTAFLOW_SUBGROUPS = ['flows', 'blocks', 'tools'];
 const CATEGORY_ORDER = ['trigger', 'service', 'memory', 'transform', 'logic', 'filter', 'output', 'other'];
 
 function categoryLabel(cat) {
@@ -98,7 +99,7 @@ export class FlowPalette {
     if (this.mode !== 'bpmn') ModelModalities.load();
 
     try {
-      this.templates = this.mode === 'bpmn' ? processTemplates() : await ApiBinary.list('flowNodeTemplatesListRequest', { arrayKey: 'templates' });
+      this.templates = this.mode === 'bpmn' ? processTemplates(this.opts.processOptions) : await ApiBinary.list('flowNodeTemplatesListRequest', { arrayKey: 'templates' });
     } catch (err) {
       if (this._disposed || !this.root.isConnected) return;
       this.templates = [];
@@ -122,12 +123,12 @@ export class FlowPalette {
 
   /** Nazwa wpisu palety — preset mówi własną etykietą, reszta tłumaczeniem typu. */
   _nameOf(tpl) {
-    if (this.presetTypes.has(tpl.node_type) && tpl.label) return tpl.label;
+    if ((tpl.preset || this.presetTypes.has(tpl.node_type)) && tpl.label) return tpl.label;
     return getNodeName(tpl.node_type, tpl.label);
   }
 
   _descOf(tpl) {
-    if (this.presetTypes.has(tpl.node_type) && tpl.description) return tpl.description;
+    if ((tpl.preset || this.presetTypes.has(tpl.node_type)) && tpl.description) return tpl.description;
     return getNodeDescription(tpl.node_type, tpl.description);
   }
 
@@ -175,9 +176,12 @@ export class FlowPalette {
     }
 
     let html = '';
-    for (const cat of this.mode === 'bpmn' ? ['events', 'tasks', 'gateways'] : CATEGORY_ORDER) {
-      const items = groups[cat];
-      if (!items || items.length === 0) continue;
+    for (const cat of this.mode === 'bpmn' ? ['events', 'tasks', 'tentaflow', 'gateways'] : CATEGORY_ORDER) {
+      const items = groups[cat] || [];
+      // The TentaFlow group stays visible without a filter so an unavailable or
+      // empty catalogue is explained instead of silently missing.
+      const alwaysShown = cat === 'tentaflow' && !this.filter;
+      if (items.length === 0 && !alwaysShown) continue;
       const collapsed = this.collapsedCats.has(cat);
       html += `
         <div class="fb-palette-category ${collapsed ? 'collapsed' : ''}" data-cat="${escapeAttr(cat)}">
@@ -187,7 +191,7 @@ export class FlowPalette {
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
           </tf-button>
           <div class="fb-palette-items">
-            ${items.map((it) => this._renderItem(it.tpl, it.index)).join('')}
+            ${cat === 'tentaflow' ? this._renderTentaflowItems(items) : items.map((it) => this._renderItem(it.tpl, it.index)).join('')}
           </div>
         </div>`;
     }
@@ -209,6 +213,20 @@ export class FlowPalette {
         if (!this.readOnly && ev.detail === 0) this.opts.onAdd?.(this.templates[Number(el.dataset.index)]);
       });
     });
+  }
+
+  _renderTentaflowItems(items) {
+    if (!this.opts.processOptions) {
+      return `<div class="fb-palette-note" data-role="tentaflow-unavailable">${escapeHtml(I18n.t('bpmn.palette_unavailable'))}</div>`;
+    }
+    return TENTAFLOW_SUBGROUPS.map((subgroup) => {
+      const rows = items.filter((it) => it.tpl.subgroup === subgroup);
+      if (rows.length === 0 && this.filter) return '';
+      return `<div class="fb-palette-subgroup" data-subgroup="${subgroup}">${escapeHtml(I18n.t(`bpmn.palette_${subgroup}`))}</div>
+        ${rows.length === 0
+    ? `<div class="fb-palette-note">${escapeHtml(I18n.t('bpmn.palette_group_empty'))}</div>`
+    : rows.map((it) => this._renderItem(it.tpl, it.index)).join('')}`;
+    }).join('');
   }
 
   _renderItem(tpl, index) {

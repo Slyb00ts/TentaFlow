@@ -1012,3 +1012,21 @@ test('simulation view response decodes its private clock, trace, and witnesses',
   assert.equal(decoded.view.eventsOmitted, 7);
   assert.equal(decoded.view.traceStepsOmitted, 3);
 });
+
+test('process options decode the block and tool catalogues and tolerate a server that omits them', { skip }, () => {
+  const decode = (response) => wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: { OptionsResponse: response } })));
+  const full = decode({
+    assignees: [{ user_id: 'u1', display_name: 'Anna' }],
+    service_flows: [{ flow_id: 'f1', name: 'Checker' }],
+    service_blocks: [{ node_type: 'llm', label: 'Language model (LLM)', description: 'Generates text', category: 'service' }],
+    service_tools: [{ addon_id: 'notes-1', tool_name: 'search', description: 'Searches notes' }],
+  });
+  assert.equal(full.variant, 'ProcessOptionsResponse');
+  assert.deepEqual(full.serviceBlocks, [{ nodeType: 'llm', label: 'Language model (LLM)', description: 'Generates text', category: 'service' }]);
+  assert.deepEqual(full.serviceTools, [{ addonId: 'notes-1', toolName: 'search', description: 'Searches notes' }]);
+  assert.deepEqual(full.serviceFlows, [{ flowId: 'f1', name: 'Checker' }]);
+  const old = decode({ assignees: [], service_flows: [] });
+  assert.deepEqual(old.serviceFlows, []);
+  assert.deepEqual(old.serviceBlocks ?? [], []);
+  assert.deepEqual(old.serviceTools ?? [], []);
+});

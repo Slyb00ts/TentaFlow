@@ -62,6 +62,7 @@ const CATEGORY_ICON = {
   filter: 'shield',
   output: 'arrow-out',
   other: 'puzzle',
+  tentaflow: 'chip',
 };
 
 // node_type -> zmienna koloru. Bloki bez wlasnego wpisu biora kolor kategorii,
@@ -109,6 +110,7 @@ const CATEGORY_VAR = {
   filter: '--node-cat-filter',
   output: '--node-cat-output',
   other: '--node-cat-other',
+  tentaflow: '--node-cat-service',
 };
 
 function spriteHas(id) {

@@ -63,6 +63,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   kod, a blok usunięty z listy kończy się odmową dostępu. Własne ponowienia bloku
   LLM są wyłączone (jedna próba), `stop` ma najwyżej 4 napisy, a
   `reasoning_effort` jest jedną z wartości `low`, `medium`, `high`, `xhigh`, `max`.
+- Paleta projektanta BPMN ma grupę „Bloki TentaFlow” (B3.3a): przepływy, bloki
+  Flow Buildera (`llm`, `embeddings`, `pii_filter`) i narzędzia addonów
+  upuszcza się na płótno jako gotowe zadania usługi, z nazwą pozycji i bez pytania
+  o typ implementacji. `ProcessOptionsResponse` dostał pola `service_blocks` i
+  `service_tools` (dopisane z `#[serde(default)]`, więc starsi klienci i serwery
+  się nie rozjeżdżają). Narzędzia są filtrowane tą samą regułą co publikacja
+  (addon działa, jest z organizacji użytkownika, użytkownik ma uprawnienie „llm”),
+  a decyzja o addonie zapada raz na addon, nie raz na narzędzie. Lista narzędzi
+  jest ucięta po 1000 pozycjach (stała kolejność addon, narzędzie); w inspektorze
+  nadal można wpisać dowolne narzędzie. Agenci nie są oferowani (wchodzą w B3.4).
 
 ### TentaNas
 

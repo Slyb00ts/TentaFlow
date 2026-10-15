@@ -2,9 +2,10 @@
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::processes::{
-    PinnedFlowInfo, ProcessNodeKind, ProcessOptionFlow, ProcessOptionUser, ProcessPayload as P,
-    ProcessSimulationClock, ProcessSimulationEvent, ProcessSimulationSource,
-    ProcessSimulationTraceStep, ProcessSimulationView, ServiceImplementation,
+    PinnedFlowInfo, ProcessNodeKind, ProcessOptionBlock, ProcessOptionFlow, ProcessOptionTool,
+    ProcessOptionUser, ProcessPayload as P, ProcessSimulationClock, ProcessSimulationEvent,
+    ProcessSimulationSource, ProcessSimulationTraceStep, ProcessSimulationView,
+    ServiceImplementation,
 };
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth};
 
@@ -203,7 +204,61 @@ fn options(ctx: &HandlerContext, actor: &ProcessActor) -> Result<P, ProtocolErro
     Ok(P::OptionsResponse {
         assignees,
         service_flows,
+        service_blocks: service_block_options(),
+        service_tools: service_tool_options(executor, actor),
     })
+}
+
+/// Largest tool catalogue sent to the designer. Tools beyond it are cut after
+/// the stable addon/tool ordering; the Service task inspector still accepts any
+/// tool by identifier, so a cut hides a shortcut, not a capability.
+const MAX_TOOL_OPTIONS: usize = 1000;
+
+fn service_block_options() -> Vec<ProcessOptionBlock> {
+    crate::processes::blocks::allowed_block_types()
+        .filter_map(|node_type| {
+            let (label, description, category) = match node_type {
+                "llm" => (
+                    "Language model (LLM)",
+                    "Generates text from the activity input with a chosen model.",
+                    "service",
+                ),
+                "embeddings" => (
+                    "Embeddings",
+                    "Turns the activity input text into an embedding vector.",
+                    "service",
+                ),
+                "pii_filter" => (
+                    "Personal data filter",
+                    "Masks personal data in the activity input text.",
+                    "filter",
+                ),
+                _ => return None,
+            };
+            Some(ProcessOptionBlock {
+                node_type: node_type.to_owned(),
+                label: label.to_owned(),
+                description: description.to_owned(),
+                category: category.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn service_tool_options(
+    executor: &FlowDispatcher,
+    actor: &ProcessActor,
+) -> Vec<ProcessOptionTool> {
+    executor
+        .offered_process_tools(&actor.user_id, &actor.org_id)
+        .into_iter()
+        .take(MAX_TOOL_OPTIONS)
+        .map(|tool| ProcessOptionTool {
+            addon_id: tool.addon_id,
+            tool_name: tool.tool_name,
+            description: tool.description,
+        })
+        .collect()
 }
 
 /// Mints the server-side pin of every Service task for publication. This is the
@@ -1847,6 +1902,7 @@ mod tests {
         let P::OptionsResponse {
             assignees,
             service_flows,
+            ..
         } = request(&ctx, P::OptionsRequest {}).await
         else {
             panic!("typed options expected")
@@ -1866,7 +1922,9 @@ mod tests {
             super::super::dispatch(
                 &MessageBody::ProcessBody(P::OptionsResponse {
                     assignees: vec![],
-                    service_flows: vec![]
+                    service_flows: vec![],
+                    service_blocks: vec![],
+                    service_tools: vec![],
                 }),
                 &ctx
             )
@@ -1885,6 +1943,74 @@ mod tests {
                 "nested typed handler {name} must be registered"
             );
         }
+    }
+
+    #[test]
+    fn every_allow_listed_block_is_offered_with_a_label_and_a_category() {
+        let offered = service_block_options();
+        let offered_types: Vec<&str> = offered.iter().map(|b| b.node_type.as_str()).collect();
+        let allowed: Vec<&str> = crate::processes::blocks::allowed_block_types().collect();
+        assert_eq!(offered_types, allowed);
+        assert_eq!(allowed, ["llm", "embeddings", "pii_filter"]);
+        for block in offered {
+            assert!(!block.label.is_empty() && !block.description.is_empty());
+            assert!(!block.category.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn options_offer_only_tools_the_host_authorizes_and_cap_the_list() {
+        use crate::processes::tool_host::{test_support::ScriptedToolHost, OfferedTool};
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "tool-option-author");
+        let ctx = context(&state, &actor);
+        let host = ScriptedToolHost::new(serde_json::json!(null));
+        *host.offered.lock().unwrap() = (0..1005)
+            .map(|index| OfferedTool {
+                addon_id: "notes-1".into(),
+                tool_name: format!("tool-{index:04}"),
+                description: "Searches notes".into(),
+            })
+            .collect();
+        dispatcher(&ctx).unwrap().set_process_tool_host(host.clone());
+        let tools = |response: P| match response {
+            P::OptionsResponse { service_tools, .. } => service_tools,
+            other => panic!("options expected, got {other:?}"),
+        };
+        let listed = tools(request(&ctx, P::OptionsRequest {}).await);
+        assert_eq!(listed.len(), 1000);
+        assert_eq!(listed[0].tool_name, "tool-0000");
+        assert_eq!(listed[0].description, "Searches notes");
+
+        *host.allow.lock().unwrap() =
+            Err(crate::processes::tool_host::ToolAccessError::PermissionDenied);
+        assert!(tools(request(&ctx, P::OptionsRequest {}).await).is_empty());
+    }
+
+    #[tokio::test]
+    async fn options_offer_no_tools_to_an_inactive_initiator() {
+        use crate::processes::tool_host::{test_support::ScriptedToolHost, OfferedTool};
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "inactive-tool-user");
+        let ctx = context(&state, &actor);
+        let host = ScriptedToolHost::new(serde_json::json!(null));
+        *host.offered.lock().unwrap() = vec![OfferedTool {
+            addon_id: "notes-1".into(),
+            tool_name: "search".into(),
+            description: String::new(),
+        }];
+        let executor = dispatcher(&ctx).unwrap();
+        executor.set_process_tool_host(host);
+        assert_eq!(executor.offered_process_tools(&actor.user_id, &actor.org_id).len(), 1);
+        crate::db::repository::update_user_account(
+            &state.db,
+            &actor.user_id,
+            "inactive-tool-user",
+            "inactive-tool@example.test",
+            false,
+        )
+        .unwrap();
+        assert!(executor.offered_process_tools(&actor.user_id, &actor.org_id).is_empty());
     }
 
     #[tokio::test]

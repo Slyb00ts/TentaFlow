@@ -948,8 +948,20 @@ impl FlowDispatcher {
         crate::processes::tool_host::ToolAccessError,
     > {
         use crate::processes::tool_host::ToolAccessError;
-        // A failed read is "cannot tell now", never a verdict on the initiator: only
-        // a user who is missing, inactive or outside the organization is lost.
+        self.check_process_initiator(user_id, org_id)?;
+        self.process_tool_host()
+            .ok_or(ToolAccessError::Unavailable)?
+            .authorize(addon_id, tool_name, user_id, org_id)
+    }
+
+    /// A failed read is "cannot tell now", never a verdict on the initiator: only
+    /// a user who is missing, inactive or outside the organization is lost.
+    fn check_process_initiator(
+        &self,
+        user_id: &str,
+        org_id: &str,
+    ) -> std::result::Result<(), crate::processes::tool_host::ToolAccessError> {
+        use crate::processes::tool_host::ToolAccessError;
         repository::get_user_account_by_id(&self.db, user_id)
             .map_err(|_| ToolAccessError::Unavailable)?
             .filter(|user| user.is_active)
@@ -960,9 +972,23 @@ impl FlowDispatcher {
                 _ => ToolAccessError::Initiator,
             },
         )?;
+        Ok(())
+    }
+
+    /// The addon tools `authorize_process_tool` would accept for this user,
+    /// decided with one initiator check and one addon decision per addon. Empty
+    /// when the initiator is not valid or no tool host is wired.
+    pub fn offered_process_tools(
+        &self,
+        user_id: &str,
+        org_id: &str,
+    ) -> Vec<crate::processes::tool_host::OfferedTool> {
+        if self.check_process_initiator(user_id, org_id).is_err() {
+            return Vec::new();
+        }
         self.process_tool_host()
-            .ok_or(ToolAccessError::Unavailable)?
-            .authorize(addon_id, tool_name, user_id, org_id)
+            .map(|host| host.offered_tools(user_id, org_id))
+            .unwrap_or_default()
     }
 
     /// Pin of an addon tool for publication, shaped like a Flow snapshot: the

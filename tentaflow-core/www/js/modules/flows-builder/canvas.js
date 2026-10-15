@@ -240,6 +240,9 @@ export class FlowCanvas {
     this.templates.clear();
     this.presetTypes.clear();
     for (const t of list || []) {
+      // A drop-in Service task shares its node_type with the plain element and
+      // must not replace how that element is drawn.
+      if (t.preset && this.templates.has(t.node_type)) continue;
       if (this.templates.has(t.node_type)) this.presetTypes.add(t.node_type);
       this.templates.set(t.node_type, t);
     }
@@ -863,7 +866,8 @@ export class FlowCanvas {
       config: defaultConfig,
     };
     if (this.mode === 'bpmn') {
-      node.config = processNodeConfig(processNodeKind(node.type));
+      node.config = { ...processNodeConfig(processNodeKind(node.type)), ...structuredClone(tpl.preset ?? {}) };
+      if (tpl.preset) node.label = String(tpl.label || '');
       node.width = tpl.width;
       node.height = tpl.height;
       node.x = snapGridCoordinate(pt.x - node.width / 2);

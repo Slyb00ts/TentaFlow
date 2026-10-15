@@ -177,6 +177,15 @@ Paleta BPMN nie ładuje szablonów bloków (`palette.js:101`). `ELEMENTS` w `bpm
 - **Interfejs.** `synthetic.rs` w `flow_engine` nie jest modułem kompilowanym, więc graf powstaje w `blocks.rs`. Inspektor dostaje minimalną implementację „Blok Flow Buildera” (typ i ustawienia jako JSON); paleta i zakładki są w B3.3a/b. XML: `<tentaflow:service implementation="block" nodeType>` z `<tentaflow:blockConfig>` (JSON o posortowanych kluczach).
 - **Kodek.** Klucz `config` jest nieprzezroczysty przy dekodowaniu (`process_json_to_js`), żeby `max_tokens` nie stało się `maxTokens`.
 
+**Wdrożone w B3.3a (2026-10-15).** Odstępstwa od §2 są świadome:
+
+- **Bez agentów.** `service_agents` i podgrupa „Agenci” nie powstały, bo wykonawca agenta jest w B3.4; paleta nie oferuje niczego, czego nie da się uruchomić. Dopisać w B3.4b (pole z `#[serde(default)]`, czwarta podgrupa).
+- **Filtr narzędzi.** `FlowDispatcher::offered_process_tools` sprawdza inicjatora raz, a `ProcessToolHost::offered_tools` podejmuje decyzję addonu (działa, ta sama organizacja, uprawnienie „llm”, odczyt skrótu pakietu) raz na addon; ta sama funkcja `process_addon_access` obsługuje `authorize`, więc lista nie rozjedzie się z publikacją. Lista narzędzi jest ucięta po 1000 pozycjach w stałej kolejności (addon, narzędzie) bez błędu, w odróżnieniu od przepływów, które nadal odrzucają katalog większy niż 1000; obcięcie chowa skrót, nie możliwość, bo inspektor przyjmuje dowolny identyfikator narzędzia.
+- **Bloki.** Etykiety i opisy serwer podaje po angielsku jako zapas; klient bierze tłumaczenia `bpmn.block_<typ>` i `bpmn.block_<typ>_hint`. Test pilnuje, by każdy blok z listy dozwolonych miał wpis w opcjach.
+- **Ładowanie.** Opcje są pobierane razem z definicją przy otwarciu projektanta (jedno `Promise.all`, jak dotąd dla przepływów i osób), więc paleta dostaje je synchronicznie i nie ma osobnego asynchronicznego odświeżania; niepowodzenie nadal przerywa otwarcie. Gdy palety nie da się zbudować z opcji, grupa „Bloki TentaFlow” pokazuje komunikat, a pusta podgrupa komunikat „brak pozycji”.
+- **Szablony.** Wpisy dynamiczne dzielą `node_type: bpmn_service_task` ze zwykłym elementem. Płótno zachowuje szablon zwykłego elementu (ikona BPMN, brak etykiety), a upuszczenie wpisu z `preset` scala preset z `processNodeConfig('ServiceTask')` i nadaje węzłowi nazwę pozycji.
+- **Inspektor.** Lista typów bloków w inspektorze nadal jest stałą po stronie klienta (`PROCESS_BLOCK_TYPES`); przejście na `serviceBlocks` należy do B3.3b.
+
 ### 3.3 Agent z ujściem `task.complete`
 Ujście proponuję nazwać **`core.task_complete`** (prefiks `core.` wymusza enum `CoreToolName`, `builtins.rs:24`, a istniejące `core.task_plan/update/list` należą do Code Studio, więc nazwa nie koliduje). Plan nazywa je `task.complete`, więc trzeba zmienić jego brzmienie przy aktualizacji dokumentu.
 
@@ -334,7 +343,7 @@ Szacunki dotyczą jednej osoby i przeglądu. Każdy pakiet ma być wdrażalny i 
 |---|---|---|---|---|
 | **B3.1** Fundament + narzędzie addonu — **wdrożone 2026-10-13** (`95f3ee727`..`87c462d3b`) | `ServiceImplementation{Flow,AddonTool}`, walidacja, rozszerzenie pinu, rozgałęzienie `execute_claimed`, `call_tool_process`, `FlowOrigin::Process`, kodek JS, XML; odkładanie zajętych/niedostępnych narzędzi, odzyskiwanie wyników per wiersz z incydentami | brak | 3 dni | 201, 202 |
 | **B3.2** Blok Flow Buildera — **wdrożone 2026-10-13** (`6308bf3b0`) | wariant `Block`, lista dozwolonych, graf syntetyczny, `dispatch_pinned_synthetic` | B3.1 | 2 dni | brak |
-| **B3.3a** Opcje + paleta „Bloki TentaFlow” | rozszerzenie `OptionsResponse`, szablony dynamiczne, drop, i18n, test e2e dla flow/blok/narzędzie | B3.1 (B3.2 dla bloków) | 2 dni | brak |
+| **B3.3a** Opcje + paleta „Bloki TentaFlow” — **wdrożone 2026-10-15** (bez agentów, patrz „Wdrożone w B3.3a”) | rozszerzenie `OptionsResponse` (`service_blocks`, `service_tools`), szablony dynamiczne, drop, i18n, test e2e dla flow/blok/narzędzie | B3.1 (B3.2 dla bloków) | 2 dni | brak |
 | **B3.3b** Inspektor z zakładkami + „Wynik i błędy” | `tf-tabs`, `processResultRouting`, ostrzeżenia, przyciski obsługi, i18n | B3.1 (równolegle z B3.3a) | 2-3 dni | brak |
 | **B3.4a** Agent: ujście i wiązanie | `core.task_complete`, `bpmn_agent_completions`, zawężenie narzędzi na przebieg, `spawn_with_run_id` publiczny, walidacja | B3.1 | 3 dni | 203 |
 | **B3.4b** Agent: wykonawca i odzyskiwanie | `execute_agent`, klasa slotów, adopcja ujścia po restarcie, `Contract` dla zdarzeń brzegowych, paleta agentów | B3.4a, B3.3a | 3 dni | brak |

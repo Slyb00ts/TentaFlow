@@ -269,6 +269,17 @@
 .fb-palette-cat-header svg { width: 14px; height: 14px; transition: transform 0.22s; }
 .fb-palette-category.collapsed .fb-palette-cat-header svg { transform: rotate(-90deg); }
 .fb-palette-category.collapsed .fb-palette-items { display: none; }
+.fb-palette-subgroup {
+  padding: 6px 10px 2px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--tf-text-3, #6a7196);
+}
+.fb-palette-note {
+  padding: 4px 10px 8px;
+  font-size: 11px;
+  color: var(--tf-text-3, #6a7196);
+}
 
 .fb-palette-items {
   display: flex;

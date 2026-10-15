@@ -34,14 +34,52 @@ const ELEMENTS = [
   ['EventBasedGateway', 'event_based_gateway', 'bpmn-gateway-event-based', 'gateways', 72, 72],
 ];
 
-export function processTemplates() {
-  return ELEMENTS.map(([kind, name, icon, group, width, height]) => ({
+// The settings a block starts with: the keys it requires, empty. Choosing a type
+// replaces the settings, so keys of the previous type never linger.
+export const processBlockTemplate = (type) => (type === 'pii_filter' ? {} : { model: '' });
+
+const SERVICE_TASK_SHAPE = { input_ports: ['in'], output_ports: ['full'], width: 240, height: 96 };
+
+// Block names come from the process options; the locale wins when it knows the
+// block, the server's English text covers a block this client has no key for.
+function localized(key, fallback) {
+  const text = I18n.t(key);
+  return text && text !== key ? text : fallback;
+}
+
+/**
+ * Palette entries that drop a ready-made Service task. `preset` is merged over
+ * the Service task's default configuration, so the entry never asks which
+ * implementation the task has. `subgroup` orders them inside the palette group.
+ */
+function tentaflowTemplates(options) {
+  const entry = (subgroup, icon, label, description, preset) => ({
+    node_type: 'bpmn_service_task', label, description, icon, category: 'tentaflow',
+    subgroup, preset, ...SERVICE_TASK_SHAPE,
+  });
+  return [
+    ...(options.serviceFlows || []).map((flow) =>
+      entry('flows', 'flow', flow.name, I18n.t('bpmn.palette_flow_hint'), { flowId: flow.flowId })),
+    ...(options.serviceBlocks || []).map((block) => entry('blocks', block.nodeType === 'llm' ? 'brain'
+      : block.nodeType === 'pii_filter' ? 'shield' : 'sparkle',
+    localized(`bpmn.block_${block.nodeType}`, block.label),
+    localized(`bpmn.block_${block.nodeType}_hint`, block.description),
+    { implementation: { Block: { nodeType: block.nodeType, config: processBlockTemplate(block.nodeType) } } })),
+    ...(options.serviceTools || []).map((tool) => entry('tools', 'puzzle', tool.toolName,
+      tool.description || tool.addonId,
+      { implementation: { AddonTool: { addonId: tool.addonId, toolName: tool.toolName } } })),
+  ];
+}
+
+export function processTemplates(options = null) {
+  const elements = ELEMENTS.map(([kind, name, icon, group, width, height]) => ({
     node_type: `bpmn_${name}`, label: I18n.t(`bpmn.node_${name}`),
     description: I18n.t(`bpmn.node_${name}_hint`), icon, category: group,
     input_ports: ['Start', 'TimerStart', 'MessageStart', 'LinkCatch', 'BoundaryTimer', 'BoundaryMessage', 'BoundaryError', 'BoundaryEscalation'].includes(kind) ? [] : ['in'],
     output_ports: ['End', 'ErrorEnd', 'TerminateEnd', 'LinkThrow'].includes(kind) ? [] : ['full'],
     width, height,
   }));
+  return options ? [...elements, ...tentaflowTemplates(options)] : elements;
 }
 
 export function processNodeKind(type) {

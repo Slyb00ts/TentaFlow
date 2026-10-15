@@ -192,8 +192,11 @@ const FlowBuilderScreen = {
     state.palette = new FlowPalette(root.querySelector('[data-role="palette"]'), {
       readOnly: state.readOnly,
       mode: state.mode,
+      processOptions: state.processOptions,
       onTemplatesLoaded: (list) => {
-        for (const t of list) state.templatesMap.set(t.node_type, t);
+        for (const t of list) {
+          if (!(t.preset && state.templatesMap.has(t.node_type))) state.templatesMap.set(t.node_type, t);
+        }
         state.canvas?.setTemplates(list);
       },
       onDrop: (tpl, clientX, clientY) => {

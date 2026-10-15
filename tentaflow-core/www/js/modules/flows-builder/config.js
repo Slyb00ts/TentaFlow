@@ -17,16 +17,13 @@ import '/js/components/tf-select.js';
 import '/js/components/tf-keyvalue-editor.js';
 import '/js/components/tf-person-picker.js';
 import '/js/components/tf-tabs.js';
-import { processNodeKind, processBoundaryKind, processBody } from './bpmn.js';
+import { processNodeKind, processBoundaryKind, processBody, processBlockTemplate } from './bpmn.js';
 import { openProcessCallPreview } from './process-monitor.js';
 
 // Blocks a BPMN Service task may run on its own. The server allow-list is the
 // authority (it validates on save and again at publication); this list only
 // decides what the inspector offers until the process options carry it.
 const PROCESS_BLOCK_TYPES = ['llm', 'embeddings', 'pii_filter'];
-// The settings a block starts with: the keys it requires, empty. Choosing a type
-// replaces the settings, so keys of the previous type never linger.
-const processBlockTemplate = (type) => (type === 'pii_filter' ? {} : { model: '' });
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
 // these from `node.config`; an empty value means "use the built-in default".

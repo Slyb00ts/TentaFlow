@@ -134,6 +134,11 @@ const ALLOWED: &[AllowedBlock] = &[
     },
 ];
 
+/// The allow-listed block types in catalogue order, for the designer palette.
+pub fn allowed_block_types() -> impl Iterator<Item = &'static str> {
+    ALLOWED.iter().map(|block| block.node_type)
+}
+
 pub fn allowed_block(node_type: &str) -> Option<&'static AllowedBlock> {
     ALLOWED.iter().find(|block| block.node_type == node_type)
 }

@@ -1809,6 +1809,23 @@ pub struct ProcessOptionFlow {
     pub name: String,
 }
 
+/// A Flow Builder block a Service task may run on its own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessOptionBlock {
+    pub node_type: String,
+    pub label: String,
+    pub description: String,
+    pub category: String,
+}
+
+/// An addon tool the requesting user may publish as a Service task.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessOptionTool {
+    pub addon_id: String,
+    pub tool_name: String,
+    pub description: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessSimulationSource {
@@ -1883,6 +1900,10 @@ pub enum ProcessPayload {
     OptionsResponse {
         assignees: Vec<ProcessOptionUser>,
         service_flows: Vec<ProcessOptionFlow>,
+        #[serde(default)]
+        service_blocks: Vec<ProcessOptionBlock>,
+        #[serde(default)]
+        service_tools: Vec<ProcessOptionTool>,
     },
     DefinitionListRequest {
         offset: u32,
@@ -2156,6 +2177,45 @@ pub enum ProcessPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn options_response_from_an_older_server_decodes_with_empty_service_catalogues() {
+        let old = serde_json::json!({"OptionsResponse": {
+            "assignees": [{"user_id": "u1", "display_name": "Anna"}],
+            "service_flows": [{"flow_id": "f1", "name": "Checker"}]}});
+        let decoded: ProcessPayload =
+            crate::cbor::decode(&crate::cbor::encode(&old).unwrap()).unwrap();
+        let ProcessPayload::OptionsResponse {
+            service_flows,
+            service_blocks,
+            service_tools,
+            ..
+        } = decoded
+        else {
+            panic!("options response expected");
+        };
+        assert_eq!(service_flows.len(), 1);
+        assert!(service_blocks.is_empty() && service_tools.is_empty());
+
+        let current = ProcessPayload::OptionsResponse {
+            assignees: Vec::new(),
+            service_flows: Vec::new(),
+            service_blocks: vec![ProcessOptionBlock {
+                node_type: "llm".into(),
+                label: "Language model (LLM)".into(),
+                description: "Generates text".into(),
+                category: "service".into(),
+            }],
+            service_tools: vec![ProcessOptionTool {
+                addon_id: "notes-1".into(),
+                tool_name: "search".into(),
+                description: "Searches notes".into(),
+            }],
+        };
+        let round_trip: ProcessPayload =
+            crate::cbor::decode(&crate::cbor::encode(&current).unwrap()).unwrap();
+        assert_eq!(round_trip, current);
+    }
 
     #[test]
     fn repeat_model_and_public_summary_round_trip_without_changing_absent_nodes() {

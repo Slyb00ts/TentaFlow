@@ -32,6 +32,14 @@ pub enum ToolAccessError {
     Initiator,
 }
 
+/// A tool the initiator may publish as a Service task right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferedTool {
+    pub addon_id: String,
+    pub tool_name: String,
+    pub description: String,
+}
+
 /// The slice of the addon runtime a Service task needs. A trait so the process
 /// engine is tested against a scripted addon instead of a WASM module.
 pub trait ProcessToolHost: Send + Sync {
@@ -43,6 +51,11 @@ pub trait ProcessToolHost: Send + Sync {
         user_id: &str,
         org_id: &str,
     ) -> Result<ProcessToolDescriptor, ToolAccessError>;
+
+    /// Every tool `authorize` would accept for `user_id`, sorted by addon and
+    /// tool name. The addon-level decision is made once per addon, so the cost
+    /// does not grow with the number of tools.
+    fn offered_tools(&self, user_id: &str, org_id: &str) -> Vec<OfferedTool>;
 
     /// Blocking call. `request_id` is the invocation's stable request id.
     fn call(
@@ -75,6 +88,33 @@ pub fn check_addon_organization(
     Ok(())
 }
 
+impl crate::addon::AddonManager {
+    /// The addon-level part of tool access, shared by `authorize` and
+    /// `offered_tools` so the catalogue can never offer what publication
+    /// refuses. Returns the pinned bundle hash.
+    fn process_addon_access(
+        &self,
+        addon_id: &str,
+        user_id: &str,
+        org_id: &str,
+    ) -> Result<String, ToolAccessError> {
+        check_addon_organization(
+            self.has_running_instance(addon_id),
+            self.instance_org_id(addon_id).as_deref(),
+            org_id,
+        )?;
+        if !self
+            .permission_checker()
+            .check(addon_id, user_id, "llm", None)
+            .is_granted()
+        {
+            return Err(ToolAccessError::PermissionDenied);
+        }
+        self.installed_bundle_hash(addon_id)
+            .map_err(|_| ToolAccessError::Unavailable)
+    }
+}
+
 impl ProcessToolHost for crate::addon::AddonManager {
     fn authorize(
         &self,
@@ -88,24 +128,32 @@ impl ProcessToolHost for crate::addon::AddonManager {
             .into_iter()
             .find(|tool| tool.addon_id == addon_id && tool.tool_name == tool_name)
             .ok_or(ToolAccessError::Missing)?;
-        check_addon_organization(
-            self.has_running_instance(addon_id),
-            self.instance_org_id(addon_id).as_deref(),
-            org_id,
-        )?;
-        if !self
-            .permission_checker()
-            .check(addon_id, user_id, "llm", None)
-            .is_granted()
-        {
-            return Err(ToolAccessError::PermissionDenied);
-        }
+        let bundle_hash = self.process_addon_access(addon_id, user_id, org_id)?;
         Ok(ProcessToolDescriptor {
             input_schema: tool.parameters_schema,
-            bundle_hash: self
-                .installed_bundle_hash(addon_id)
-                .map_err(|_| ToolAccessError::Unavailable)?,
+            bundle_hash,
         })
+    }
+
+    fn offered_tools(&self, user_id: &str, org_id: &str) -> Vec<OfferedTool> {
+        let mut decisions = std::collections::HashMap::<String, bool>::new();
+        let mut offered: Vec<OfferedTool> = self
+            .list_tools()
+            .into_iter()
+            .filter(|tool| {
+                *decisions.entry(tool.addon_id.clone()).or_insert_with(|| {
+                    self.process_addon_access(&tool.addon_id, user_id, org_id)
+                        .is_ok()
+                })
+            })
+            .map(|tool| OfferedTool {
+                addon_id: tool.addon_id,
+                tool_name: tool.tool_name,
+                description: tool.description,
+            })
+            .collect();
+        offered.sort_by(|a, b| (&a.addon_id, &a.tool_name).cmp(&(&b.addon_id, &b.tool_name)));
+        offered
     }
 
     fn call(
@@ -290,11 +338,14 @@ pub(crate) mod test_support {
         /// when an abandoned call really returns without depending on timing.
         pub hold: bool,
         released: (Mutex<bool>, std::sync::Condvar),
+        /// What `offered_tools` lists while access is allowed.
+        pub offered: Mutex<Vec<OfferedTool>>,
     }
 
     impl ScriptedToolHost {
         pub fn new(reply: Value) -> Arc<Self> {
             Arc::new(Self {
+                offered: Mutex::new(Vec::new()),
                 allow: Mutex::new(Ok(())),
                 reply: Mutex::new(Ok(reply)),
                 delay: Mutex::new(std::time::Duration::ZERO),
@@ -332,6 +383,13 @@ pub(crate) mod test_support {
                 input_schema: self.schema.clone(),
                 bundle_hash: self.bundle.lock().unwrap().clone(),
             })
+        }
+
+        fn offered_tools(&self, _user_id: &str, org_id: &str) -> Vec<OfferedTool> {
+            if org_id != self.org || self.allow.lock().unwrap().is_err() {
+                return Vec::new();
+            }
+            self.offered.lock().unwrap().clone()
         }
 
         fn call(
@@ -405,6 +463,26 @@ mod tests {
             read_only: false,
         });
         manager
+    }
+
+    #[tokio::test]
+    async fn registered_tools_of_a_stopped_addon_are_not_offered() {
+        let manager = manager();
+        assert_eq!(manager.list_tools().len(), 1);
+        assert!(manager
+            .offered_tools("user", crate::services::org::DEFAULT_ORG_ID)
+            .is_empty());
+        assert_eq!(
+            manager
+                .authorize(
+                    "notes-1a2b3c4d",
+                    "search",
+                    "user",
+                    crate::services::org::DEFAULT_ORG_ID
+                )
+                .unwrap_err(),
+            ToolAccessError::Unavailable
+        );
     }
 
     #[test]
