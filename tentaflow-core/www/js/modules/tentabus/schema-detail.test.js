@@ -581,7 +581,7 @@ test('a version whose text holds a hidden character is flagged on the page, with
   const flag = admin.body.querySelector('[data-role="hidden-flag"]');
   assert.equal(flag.hidden, false);
   assert.equal(flag.querySelector('[data-role="flag-alert"]').getAttribute('title'), 'Ta wersja zawiera niewidoczny znak');
-  assert.match(flag.querySelector('[data-role="flag-alert"]').getAttribute('message'), /^Topiki z tym wzorem nie przyjmują wiadomości\. Dodaj poprawioną wersję\. Miejsce: U\+202E \(wymuszenie kierunku od prawej do lewej \(RLO\)\) w wierszu 1, kolumnie \d+\.$/);
+  assert.match(flag.querySelector('[data-role="flag-alert"]').getAttribute('message'), /^Topiki z tym wzorem nie przyjmują wiadomości\. Dodaj poprawioną wersję\. Miejsce: U\+202E \(wymuszenie kierunku od prawej do lewej \(RLO\)\) w wierszu 1, w kolumnie \d+\.$/);
   const fix = flag.querySelector('[data-role="flag-fix"]');
   assert.equal(fix.hidden, false);
   fix.click();

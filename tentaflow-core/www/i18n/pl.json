@@ -11854,11 +11854,13 @@
         },
         "cause_paste": "Taki znak często pochodzi z tekstu wklejonego z Worda lub strony WWW.",
         "cause_zwj": "To emoji złożone z kilku (np. 👨\u200d👩\u200d👧) — użyj pojedynczego emoji albo zwykłego tekstu.",
-        "place": "{code} ({name}) w wierszu {line}, kolumnie {column}",
+        "place": "{code} ({name}) w wierszu {line}, w kolumnie {column}",
         "more": "i jeszcze {count}",
         "strip_button": "Usuń niewidoczne znaki",
         "stripped": "Usunięto {count} {count|niewidoczny znak|niewidoczne znaki|niewidocznych znaków}: {places}.",
         "places_line": "Niewidoczne znaki w tekście: {places}.",
+        "preview_title": "Wiersze do poprawienia (niewidoczny znak jest tu pokazany jako ⟦U+XXXX⟧):",
+        "line_label": "wiersz {line}",
         "cleaned": "Usunięto {count} {count|niewidoczny znak|niewidoczne znaki|niewidocznych znaków} z poprzedniej wersji: {places}. Sprawdź tekst i dodaj poprawioną wersję.",
         "page_title": "Ta wersja zawiera niewidoczny znak",
         "page_text": "Topiki z tym wzorem nie przyjmują wiadomości. Dodaj poprawioną wersję. Miejsce: {places}.",
@@ -11868,13 +11870,15 @@
         "stan_button": "Otwórz wzór",
         "rules_gone": "Zasady ukrywania danych na {topics} wymieniają pola, których nowa wersja nie ma: {fields}. Pole, którego zasada nie wymienia, jest przed odbiorcami ukryte.",
         "rules_rename": "Zmień też w tych zasadach nazwy pól, które różnią się tylko niewidocznym znakiem: {pairs}.",
+        "rules_rename_off": "Bez zaznaczenia zasady ukrywania danych zostają bez zmian, więc odbiorcy tych topików przestaną widzieć w nowych wiadomościach: {names}.",
+        "rules_rename_on": "Po zaznaczeniu zasady zaczną dopuszczać {names}, więc odbiorcy tych topików zobaczą w nowych wiadomościach dane, które teraz są przed nimi ukryte.",
         "rules_renamed": "Zmieniono nazwy pól w {count} {count|zasadzie|zasadach|zasadach} ukrywania danych.",
         "rules_rename_failed": "Wersja została dodana, ale nie udało się zmienić nazw pól w zasadach ukrywania danych: {error}. Popraw je w sekcji „Ukrywanie danych”.",
         "rules_rename_partial": "Wersja została dodana, nazwy pól zmieniono w {count} {count|zasadzie|zasadach|zasadach} ukrywania danych, po czym zmiana się nie powiodła: {error}. Popraw pozostałe w sekcji „Ukrywanie danych”.",
         "diff_only_removal": "Różnica względem wersji {version}: tylko usunięte niewidoczne znaki; pola i wymagania bez zmian.",
         "diff_only_removal_names": "Różnica względem wersji {version}: usunięte są tylko niewidoczne znaki, ale były w {count} {count|nazwie lub wartości|nazwach lub wartościach|nazwach lub wartościach}: {pairs}.",
-        "rules_rename_effect": "Uwaga: to zmienia, jakie dane widzą odbiorcy tych topików, bo ich zasady zaczną dopuszczać pole pod oczyszczoną nazwą.",
-        "old_spelling_kept": "Zapisane już wiadomości zachowują starą pisownię {count} {count|nazwy lub wartości|nazw lub wartości|nazw lub wartości}: {names}. Wersja przeszła sprawdzenie zgodności dopiero po usunięciu niewidocznych znaków z poprzedniej."
+        "old_spelling_kept": "Zapisane już wiadomości zachowują starą pisownię {count} {count|nazwy lub wartości|nazw lub wartości|nazw lub wartości}: {names}.",
+        "old_spelling_kept_maybe": "Wiadomości zapisane wcześniej (jeśli są) zachowują starą pisownię {count} {count|nazwy lub wartości|nazw lub wartości|nazw lub wartości}: {names}."
       },
       "refused": {
         "hl7_msh": "„{field}” opisuje same znaki podziału wiadomości, więc nie może być wymagane. Usuń „{field}” z pól wymaganych.",
@@ -12006,7 +12010,8 @@
         "thrift_lexical": "Wzór ma niedomknięty komentarz lub tekst w cudzysłowie, źle zapisaną liczbę, nieznaną sekwencję ucieczki w tekście albo znak, którego plik Thrift nie może zawierać.",
         "at_line": "W wierszu {line}.",
         "at_line_column": "W wierszu {line}, w kolumnie {column}.",
-        "hidden_character": "Wzór zawiera niewidoczny znak albo znak zmieniający kierunek tekstu: {code} ({name}). Taki znak sprawia, że wzór wygląda w edytorze inaczej, niż odczyta go program („Trojan Source”). Użyj „Usuń niewidoczne znaki” albo usuń go ręcznie i wyślij wzór ponownie. {cause} {atLine}"
+        "hidden_character": "Wzór zawiera niewidoczny znak albo znak zmieniający kierunek tekstu: {code} ({name}). Taki znak sprawia, że wzór wygląda w edytorze inaczej, niż odczyta go program („Trojan Source”). Niżej są wiersze z takim znakiem, ze znakiem zapisanym jako ⟦U+XXXX⟧, bo pole tekstowe może go nie pokazywać. Użyj „Usuń niewidoczne znaki” albo popraw te wiersze ręcznie i wyślij wzór ponownie. {cause} {atLine}",
+        "hidden_escape": "Wzór zapisuje niewidoczny znak albo znak zmieniający kierunek tekstu jako sekwencję specjalną (np. \\u202E): {code} ({name}). „Usuń niewidoczne znaki” takiej sekwencji nie usunie — popraw ją ręcznie w wierszu pokazanym niżej i wyślij wzór ponownie. {atLine}"
       }
     },
     "topics": {

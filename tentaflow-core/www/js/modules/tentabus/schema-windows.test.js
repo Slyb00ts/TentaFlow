@@ -23,8 +23,9 @@ const {
   profileChanges, xsdChanges, hl7DropOffer, dropRequired, HL7_PROFILE_EXAMPLE, AVRO_SCHEMA_EXAMPLE, PROTOBUF_SCHEMA_EXAMPLE, THRIFT_SCHEMA_EXAMPLE, addTextHint, addTextMore,
   addedNotice, incompatibilityReason, refusalHtml, boundTopics, effectiveVersion, versionImpact, versionDeprecateImpact, subjectDeprecateImpact,
   openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete,
-  ruleFieldIssues, renamedRuleRequest,
+  ruleFieldIssues, renamedRuleRequest, hiddenRefusal, keptSpellingsText, renameConsequence, noticeToast,
 } = await import('./schema-windows.js');
+const { sentenceHtml, hiddenLines } = await import('./hidden-notice.js');
 
 const norm = (s) => String(s).replace(/[  ]/g, ' ').replace(/\s+/g, ' ').trim();
 const tick = () => new Promise((r) => setTimeout(r, 20));
@@ -1207,7 +1208,7 @@ test('a hidden or direction-changing character is refused in plain words for eve
   for (const type of ['json_schema', 'avro', 'protobuf', 'thrift', 'xsd', 'hl7v2_profile']) {
     const got = refused(type, server);
     assert.match(got.text, /^Nie dodano wzoru x\. Wzór zawiera niewidoczny znak albo znak zmieniający kierunek tekstu: U\+202E \(wymuszenie kierunku od prawej do lewej \(RLO\)\)\./, type);
-    assert.match(got.text, /Użyj „Usuń niewidoczne znaki” albo usuń go ręcznie i wyślij wzór ponownie\. W wierszu 3, w kolumnie 14\.$/, type);
+    assert.match(got.text, /Użyj „Usuń niewidoczne znaki” albo popraw te wiersze ręcznie i wyślij wzór ponownie\. W wierszu 3, w kolumnie 14\.$/, type);
     assert.doesNotMatch(got.text, /Rejestr nie przyjął/, 'the generic refusal is not used');
     assert.ok(got.technical.includes(server), 'the server\'s sentence stays available');
   }
@@ -1255,7 +1256,7 @@ test('"Nowa wersja" of a stored text with a hidden character starts without it, 
   assert.equal(text.value, PATIENT_CLEAN.length === text.value.length ? text.value : text.value);
   assert.doesNotMatch(text.value, /\u202E/, 'the character is not in the box');
   assert.equal(JSON.parse(text.value).required[0], 'pacjent');
-  assert.match(norm(win.querySelector('[data-role="cleaned"]').textContent), /^Usunięto 2 niewidoczne znaki z poprzedniej wersji: U\+202E \(wymuszenie kierunku od prawej do lewej \(RLO\)\) w wierszu 1, kolumnie 34; U\+202E .* w wierszu 1, kolumnie 60\. Sprawdź tekst i dodaj poprawioną wersję\.$/);
+  assert.match(norm(win.querySelector('[data-role="cleaned"]').textContent), /^Usunięto 2 niewidoczne znaki z poprzedniej wersji: U\+202E \(wymuszenie kierunku od prawej do lewej \(RLO\)\) w wierszu 1, w kolumnie 34; U\+202E .* w wierszu 1, w kolumnie 60\. Sprawdź tekst i dodaj poprawioną wersję\.$/);
   // The characters sat inside a field name, so the field is renamed: "fields unchanged" would be untrue.
   assert.equal(win.querySelector('[data-role="diff"]').textContent, 'Różnica względem wersji 1: usunięte są tylko niewidoczne znaki, ale były w 1 nazwie lub wartości: pac⟦U+202E⟧jent → pacjent.');
   assert.doesNotMatch(win.querySelector('[data-role="diff"]').textContent, /taki sam|bez zmian/);
@@ -1289,7 +1290,7 @@ test('a window with a refused character in the box offers "Usuń niewidoczne zna
   assert.equal(row.hidden, true);
   type(text, `{\n  "description": "a\u200Bb\u00ADc",\n  "x": "${RLO}"\n}`);
   assert.equal(row.hidden, false);
-  assert.match(norm(win.querySelector('[data-role="hidden-places"]').textContent), /^Niewidoczne znaki w tekście: U\+200B \(spacja o zerowej szerokości\) w wierszu 2, kolumnie 20; U\+00AD \(miękki łącznik\) w wierszu 2, kolumnie 22; U\+202E \(wymuszenie kierunku od prawej do lewej \(RLO\)\) w wierszu 3, kolumnie 9\.$/);
+  assert.match(norm(win.querySelector('[data-role="hidden-places"]').textContent), /^Niewidoczne znaki w tekście: U\+200B \(spacja o zerowej szerokości\) w wierszu 2, w kolumnie 20; U\+00AD \(miękki łącznik\) w wierszu 2, w kolumnie 22; U\+202E \(wymuszenie kierunku od prawej do lewej \(RLO\)\) w wierszu 3, w kolumnie 9\.$/);
   win.querySelector('[data-role="strip-hidden"]').click();
   assert.equal(text.value, '{\n  "description": "abc",\n  "x": ""\n}');
   assert.equal(row.hidden, true);
@@ -1392,14 +1393,29 @@ test('"Nowa wersja" warns about the rules whose fields the new text lacks and re
   assert.equal(label, 'Zmień też w tych zasadach nazwy pól, które różnią się tylko niewidocznym znakiem: pac⟦U+202E⟧jent → pacjent.');
   assert.equal(win.querySelector('[data-role="rename-wrap"]').hidden, false);
   assert.equal(win.querySelector('[data-role="rename-rules"]').checked, false, 'widening what readers see is never on by itself');
-  assert.equal(norm(win.querySelector('[data-role="rename-effect"]').textContent), 'Uwaga: to zmienia, jakie dane widzą odbiorcy tych topików, bo ich zasady zaczną dopuszczać pole pod oczyszczoną nazwą.');
-  win.querySelector('[data-role="rename-rules"]').checked = true;
+  const off = 'Bez zaznaczenia zasady ukrywania danych zostają bez zmian, więc odbiorcy tych topików przestaną widzieć w nowych wiadomościach: pacjent.';
+  const on = 'Po zaznaczeniu zasady zaczną dopuszczać pacjent, więc odbiorcy tych topików zobaczą w nowych wiadomościach dane, które teraz są przed nimi ukryte.';
+  const impact = () => norm(win.querySelector('[data-role="impact"]').textContent);
+  assert.equal(norm(win.querySelector('[data-role="rename-effect"]').textContent), off, 'unticked, the box says what the readers lose');
+  assert.ok(impact().endsWith(off), `the same consequence stands in "Co się stanie po dodaniu": ${impact()}`);
+  const box = win.querySelector('[data-role="rename-rules"]');
+  box.checked = true;
+  box.dispatchEvent(new window.CustomEvent('change', { bubbles: true, detail: { checked: true } }));
+  assert.equal(norm(win.querySelector('[data-role="rename-effect"]').textContent), on, 'ticked, the box says what the readers gain');
+  assert.ok(impact().endsWith(on), impact());
+  assert.ok(!impact().includes(off));
   win.querySelector('[data-act="save"]').click();
   await tick();
   assert.deepEqual(renamed, [[{ from: `pac${RLO}jent`, to: 'pacjent' }]]);
   assert.deepEqual(done, [{ version: 2, deduplicated: false, ruleRename: { renamed: 2, fields: [{ from: `pac${RLO}jent`, to: 'pacjent' }] } }]);
   await new Promise((r) => setTimeout(r, 300));
 });
+
+const tick_rename = (win) => {
+  const box = win.querySelector('[data-role="rename-rules"]');
+  box.checked = true;
+  box.dispatchEvent(new window.CustomEvent('change', { bubbles: true, detail: { checked: true } }));
+};
 
 test('"Nowa wersja": a rename left unticked is not done, and a rename that fails is reported apart from the added version', async () => {
   closeAll();
@@ -1416,11 +1432,11 @@ test('"Nowa wersja": a rename left unticked is not done, and a rename that fails
   win.querySelector('[data-act="save"]').click();
   await tick();
   assert.deepEqual(renamed, [], 'unticked, as it starts: no rule is touched');
-  assert.deepEqual(done, [{ version: 2, deduplicated: false }]);
+  assert.deepEqual(done, [{ version: 2, deduplicated: false, ruleRenameDeclined: [{ from: `pac${RLO}jent`, to: 'pacjent' }] }], 'the unticked offer is handed on, so the notice can say what it left');
   closeAll();
   win = make(async () => { throw new Error('boom'); });
   await tick();
-  win.querySelector('[data-role="rename-rules"]').checked = true;
+  tick_rename(win);
   win.querySelector('[data-act="save"]').click();
   await tick();
   assert.equal(done.length, 2);
@@ -1430,7 +1446,7 @@ test('"Nowa wersja": a rename left unticked is not done, and a rename that fails
   closeAll();
   win = make(async () => { throw Object.assign(new Error('boom'), { renamedRules: 1 }); });
   await tick();
-  win.querySelector('[data-role="rename-rules"]').checked = true;
+  tick_rename(win);
   win.querySelector('[data-act="save"]').click();
   await tick();
   assert.equal(done[2].ruleRename.renamed, 1);
@@ -1442,12 +1458,13 @@ test('"Nowa wersja" reports the spellings that stored records keep, as the serve
   const done = [];
   const win = openSchemaVersion({
     instanceId: 'i', subject: pacjenci, latestText: PATIENT_STORED, draftText: null,
-    register: async () => ({ version: 2, deduplicated: false, oldSpellingKept: ['pac⟦U+202E⟧jent'] }),
+    register: async () => ({ version: 2, deduplicated: false, oldSpellingKept: ['pac⟦U+202E⟧jent'], oldSpellingKeptTotal: 31 }),
     describeError: String, onAdded: (a) => done.push(a), onDraft: () => {},
   });
   win.querySelector('[data-act="save"]').click();
   await tick();
   assert.deepEqual(done[0].oldSpellingKept, ['pac⟦U+202E⟧jent']);
+  assert.equal(done[0].oldSpellingKeptTotal, 31, 'the true total travels, not the length of the capped list');
   await new Promise((r) => setTimeout(r, 300));
 });
 
@@ -1486,4 +1503,136 @@ test('"Nowa wersja" says "fields unchanged" only when the removed characters wer
   });
   assert.match(win.querySelector('[data-role="diff"]').textContent, /bez zmian/);
   win.close(true);
+});
+
+const HIDDEN_SERVER = (line, column, escape = false) => `the schema contains an invisible or direction-controlling character U+202E (RIGHT-TO-LEFT OVERRIDE) at line ${line}, column ${column}${escape ? ' (written as an escape sequence)' : ''}`;
+
+const refusedBox = (schemaType, serverText, newText) => {
+  const el = document.createElement('div');
+  el.innerHTML = refusalHtml({ err: new Error(`protocol error BadRequest: bus.invalid_argument: schema: invalid schema: ${serverText}`), title: 'Nie dodano wzoru x.', compatibility: 'backward', schemaType, newText, describeError: String });
+  return el;
+};
+
+test('the server\'s hidden-character sentence is read for its place and for how the character is written', () => {
+  assert.deepEqual(hiddenRefusal(`invalid schema: ${HIDDEN_SERVER(3, 14)}`), { code: 'U+202E', codePoint: 0x202E, name: 'RIGHT-TO-LEFT OVERRIDE', line: 3, column: 14, escape: false });
+  assert.equal(hiddenRefusal(HIDDEN_SERVER(1, 9, true)).escape, true);
+  assert.equal(hiddenRefusal('invalid schema: not JSON'), null);
+});
+
+test('a refusal over a hidden character shows each line that holds one, with ⟦U+XXXX⟧ markers, and all the characters', () => {
+  const text = `{\n  "a": "x${RLO}y",\n  "b": "z${ZW}",\n  "c": 1\n}`;
+  const box = refusedBox('json_schema', HIDDEN_SERVER(2, 10), text);
+  assert.deepEqual([...box.querySelectorAll('.tb-hidden-line-no')].map((e) => norm(e.textContent)), ['wiersz 2', 'wiersz 3']);
+  assert.deepEqual([...box.querySelectorAll('.tb-hidden-line-text')].map((e) => e.textContent), ['  "a": "x⟦U+202E⟧y",', '  "b": "z⟦U+200B⟧",']);
+  const listed = norm(box.querySelector('.tb-hidden-preview').firstElementChild.textContent);
+  assert.match(listed, /^Niewidoczne znaki w tekście: U\+202E .* w wierszu 2, w kolumnie 10; U\+200B .* w wierszu 3, w kolumnie 10\.$/);
+  assert.doesNotMatch(box.innerHTML, /[​‮]/, 'the page never draws the character itself');
+  assert.match(norm(box.firstElementChild.textContent), /popraw te wiersze ręcznie/);
+});
+
+test('more lines than fit are counted, not all drawn, and every character is still listed', () => {
+  const text = Array.from({ length: 8 }, (_, i) => `l${i}${ZW}`).join('\n');
+  const box = refusedBox('json_schema', HIDDEN_SERVER(1, 3), text);
+  assert.equal(box.querySelectorAll('.tb-hidden-lines li').length, 5);
+  assert.match(norm(box.querySelector('.tb-hidden-preview').textContent), /i jeszcze 3\s*$/);
+  assert.match(norm(box.querySelector('.tb-hidden-preview').firstElementChild.textContent), /i jeszcze 3\.$/, 'five places and a count of the other three');
+});
+
+test('a character written as an escape sequence is shown on its line as typed, and the button is not promised to remove it', () => {
+  const text = '{\n  "a": "x\\u202Ey"\n}';
+  const box = refusedBox('json_schema', HIDDEN_SERVER(2, 11, true), text);
+  const head = norm(box.firstElementChild.textContent);
+  assert.match(head, /jako sekwencję specjalną/);
+  assert.match(head, /nie usunie/);
+  assert.match(head, /W wierszu 2, w kolumnie 11\.$/);
+  assert.deepEqual([...box.querySelectorAll('.tb-hidden-line-text')].map((e) => e.textContent), ['  "a": "x\\u202Ey"']);
+  assert.equal(box.querySelector('.tb-hidden-preview').firstElementChild.className, 'tb-vr-hint', 'no character of the text itself to list');
+});
+
+test('a long line is cut around the first marker so that it can be found', () => {
+  const long = `${'a'.repeat(200)}${RLO}${'b'.repeat(200)}`;
+  const { lines } = hiddenLines(`x\n${long}`, {}, null);
+  assert.equal(lines[0].line, 2);
+  assert.ok(lines[0].text.startsWith('…') && lines[0].text.endsWith('…'));
+  assert.ok(lines[0].text.includes('⟦U+202E⟧'));
+  assert.ok([...lines[0].text].length <= 122);
+});
+
+test('the sentence about stored spellings says "if any" unless a topic holds messages, and counts the names it does not list', () => {
+  const names = ['a⟦U+200B⟧b'];
+  assert.match(keptSpellingsText({ names, total: 1, hasRecords: true }), /^Zapisane już wiadomości zachowują starą pisownię 1 nazwy lub wartości: a⟦U\+200B⟧b\.$/);
+  assert.match(keptSpellingsText({ names, total: 1, hasRecords: false }), /^Wiadomości zapisane wcześniej \(jeśli są\) zachowują starą pisownię/);
+  const capped = keptSpellingsText({ names, total: 31, hasRecords: true });
+  assert.match(capped, /pisownię 31 nazw lub wartości: a⟦U\+200B⟧b i jeszcze 30\.$/);
+});
+
+test('a name with a marker stays on one line, and everything else in the sentence is escaped text', () => {
+  const html = sentenceHtml('Zostawia: pac⟦U+200B⟧jent, ter⟦U+202E⟧min <b> i tyle.');
+  assert.ok(html.includes('<span class="tb-hidden-name">pac⟦U+200B⟧jent</span>'));
+  assert.ok(html.includes('<span class="tb-hidden-name">ter⟦U+202E⟧min</span>'));
+  assert.ok(html.includes('&lt;b&gt;') && !html.includes('<b>'));
+  assert.equal(sentenceHtml('bez znaków'), 'bez znaków');
+});
+
+test('the consequence of the rename choice is worded for both outcomes', () => {
+  const renames = [{ from: `pac${RLO}jent`, to: 'pacjent' }, { from: `ter${RLO}min`, to: 'termin' }];
+  assert.match(renameConsequence(renames, false), /^Bez zaznaczenia .* przestaną widzieć w nowych wiadomościach: pacjent i termin\.$/);
+  assert.match(renameConsequence(renames, true), /^Po zaznaczeniu zasady zaczną dopuszczać pacjent i termin, .* zobaczą w nowych wiadomościach dane, które teraz są przed nimi ukryte\.$/);
+});
+
+test('a notice shown as a toast carries its text, and a warning stays longer', () => {
+  assert.deepEqual(noticeToast({ tone: 'success', title: 'Dodano wersję 2', text: 'Topik sprawdza.' }), { message: 'Dodano wersję 2 Topik sprawdza.', kind: 'success', timeoutMs: 4000 });
+  const warn = noticeToast({ tone: 'warning', title: 'Dodano wersję 2', text: 'Zapisane już wiadomości zachowują starą pisownię.' });
+  assert.equal(warn.kind, 'warning');
+  assert.ok(warn.message.endsWith('starą pisownię.'));
+  assert.ok(warn.timeoutMs > 4000);
+  assert.equal(noticeToast({ tone: 'info', title: 'T' }).message, 'T');
+});
+
+test('"Dodaj wzór" hands on the spellings that stored records keep when the name was taken meanwhile', async () => {
+  closeAll();
+  const added = [];
+  const win = openSchemaAdd({
+    instanceId: 'i', schemaTypes: ['json_schema'], existingNames: () => [],
+    register: async () => ({ version: 2, deduplicated: false, oldSpellingKept: ['a⟦U+200B⟧b'], oldSpellingKeptTotal: 4 }),
+    describeError: String, onAdded: (a) => added.push(a),
+  });
+  type(win.querySelector('[data-role="name"]'), 'wzor');
+  type(win.querySelector('[data-role="text"]'), '{"type":"object"}');
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.deepEqual(added.map((a) => [a.version, a.oldSpellingKept, a.oldSpellingKeptTotal]), [[2, ['a⟦U+200B⟧b'], 4]]);
+  await new Promise((r) => setTimeout(r, 300));
+});
+
+test('"Nowa wersja" opens with the caret and the scroll at the first line', async () => {
+  closeAll();
+  const proto = window.customElements.get('tf-textarea')?.prototype;
+  assert.ok(proto?.moveToStart, 'tf-textarea can move its caret to the start');
+  const original = proto.moveToStart;
+  let calls = 0;
+  proto.moveToStart = function moveToStart() { calls += 1; return original.call(this); };
+  try {
+    openSchemaVersion({
+      instanceId: 'i', subject: pacjenci, latestText: PATIENT_CLEAN, draftText: null,
+      register: async () => ({ version: 2, deduplicated: false }), describeError: String, onAdded: () => {}, onDraft: () => {},
+    });
+    assert.ok(calls >= 1);
+  } finally {
+    proto.moveToStart = original;
+  }
+});
+
+test('tf-textarea moves its caret and scroll to the start', () => {
+  const el = document.createElement('tf-textarea');
+  document.body.appendChild(el);
+  el.value = 'line one\nline two\nline three';
+  const area = el.querySelector('textarea');
+  area.setSelectionRange(10, 10);
+  area.scrollTop = 40;
+  el.moveToStart();
+  assert.equal(area.selectionStart, 0);
+  assert.equal(area.selectionEnd, 0);
+  assert.equal(area.scrollTop, 0);
+  el.remove();
 });

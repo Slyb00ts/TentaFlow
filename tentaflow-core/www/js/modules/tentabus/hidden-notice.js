@@ -6,8 +6,9 @@
 // characters have a plain Polish name; any other keeps the server's English one.
 // =============================================================================
 
+import { escapeHtml } from '/js/utils.js';
 import { T } from '/js/modules/tentabus/format.js';
-import { findHidden } from '/js/modules/tentabus/hidden-characters.js';
+import { findHidden, showHidden } from '/js/modules/tentabus/hidden-characters.js';
 
 const NAME_KEY = new Map([
   [0x00AD, 'shy'], [0x200B, 'zwsp'], [0x200C, 'zwnj'], [0x200D, 'zwj'], [0x200E, 'lrm'], [0x200F, 'rlm'],
@@ -54,6 +55,43 @@ export function placesText(places) {
 export function hiddenPlaces(text, options) {
   const places = findHidden(text, options);
   return places.length ? { places, text: placesText(places) } : null;
+}
+
+const MARKER = '⟦U\\+[0-9A-F]+⟧';
+const MARKED_WORD = new RegExp(`(?:[\\p{L}\\p{N}_.$-]|${MARKER})*${MARKER}(?:[\\p{L}\\p{N}_.$-]|${MARKER})*`, 'gu');
+
+/**
+ * A sentence as HTML in which every word that holds a ⟦U+XXXX⟧ marker stays on one line: the marker is punctuation, so
+ * a line would otherwise break inside it (`ter⟦U+202E⟧` / `min`).
+ */
+export function sentenceHtml(sentence) {
+  return escapeHtml(sentence).replace(MARKED_WORD, (word) => `<span class="tb-hidden-name">${word}</span>`);
+}
+
+const PREVIEW_LINES = 5;
+const PREVIEW_WIDTH = 120;
+const PREVIEW_LEAD = 40;
+
+/**
+ * The lines of `text` that hold a refused character, `{ line, text }` each, in order, at most five and a count of the
+ * rest (`more`). The characters are written ⟦U+XXXX⟧ and a long line is cut around the first one, so a person can find
+ * the place in a box that draws such a character reversed or not at all. A refused character written as an escape
+ * sequence is not in `text` itself: the line the server named (`escape` = `{ line, column }`) is added as it was typed.
+ */
+export function hiddenLines(text, options, escape = null) {
+  const places = findHidden(text, options);
+  const numbers = [...new Set([...places.map((p) => p.line), ...(escape ? [escape.line] : [])])].sort((a, b) => a - b);
+  const lines = String(text ?? '').split('\n');
+  const shown = numbers.slice(0, PREVIEW_LINES).map((line) => {
+    const written = showHidden((lines[line - 1] ?? '').replace(/\r$/, ''), options);
+    const cut = [...written];
+    const marked = cut.indexOf('⟦');
+    const centre = marked >= 0 ? marked : Math.max(0, (escape?.column ?? 1) - 1);
+    const from = Math.max(0, centre - PREVIEW_LEAD);
+    const part = cut.slice(from, from + PREVIEW_WIDTH).join('');
+    return { line, text: `${from > 0 ? '…' : ''}${part}${from + PREVIEW_WIDTH < cut.length ? '…' : ''}` };
+  });
+  return { lines: shown, more: numbers.length - shown.length };
 }
 
 /**

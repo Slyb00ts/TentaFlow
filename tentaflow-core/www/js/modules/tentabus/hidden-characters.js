@@ -150,8 +150,10 @@ const isWordCharacter = (ch) => /[\p{L}\p{N}]/u.test(ch) || WORD_PUNCTUATION.inc
 /**
  * The words of `text` that hold a refused character, `{ shown, clean }` each
  * (`pac⟦U+202E⟧jent` → `pacjent`), once and in order of appearance: the names
- * and values a correction respells. Words are what the server's own list
- * (`text_guard::hidden_spellings`) splits on.
+ * and values a correction respells. This is a reading of the text the author
+ * is correcting, in every position; the server's list of what stored records keep
+ * (`text_guard::hidden_spellings`) is limited to names and values and leaves out
+ * titles, descriptions and comments.
  */
 export function hiddenWords(text, { leadingBom = false } = {}) {
   const out = new Map();

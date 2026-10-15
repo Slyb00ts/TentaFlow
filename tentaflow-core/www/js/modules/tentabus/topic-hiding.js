@@ -36,6 +36,7 @@ import { patchHtml, setAttr, setRowsIfChanged } from '/js/lib/dom-patch.js';
 import { T, fmtCount, fmtDayTime, contentKind } from '/js/modules/tentabus/format.js';
 import { schemaKind } from '/js/modules/tentabus/schemas.js';
 import { showHidden } from '/js/modules/tentabus/hidden-characters.js';
+import { sentenceHtml } from '/js/modules/tentabus/hidden-notice.js';
 import { subjectTitle, subjectSub } from '/js/modules/tentabus/topic-access.js';
 import { HL7_FIELDS, HL7_IMPLICIT_FIELDS, hl7FieldLabel } from '/js/modules/tentabus/hl7-fields.js';
 import '/js/components/tf-button.js';
@@ -319,7 +320,7 @@ const chipHtml = (tone, text) => `<span class="tf-chip tf-chip--outline ${tone}"
 
 function fieldLineHtml(source, name, chip) {
   const label = fieldLabel(source, name);
-  return `<div><span class="tf-table__cell--mono">${escapeHtml(showHidden(name))}</span> ${chip}</div>${label ? `<div class="tf-table__cell-sub">${escapeHtml(label)}</div>` : ''}`;
+  return `<div><span class="tf-table__cell--mono">${sentenceHtml(showHidden(name))}</span> ${chip}</div>${label ? `<div class="tf-table__cell-sub">${escapeHtml(label)}</div>` : ''}`;
 }
 
 function limitedHtml(source, items) {
@@ -333,7 +334,7 @@ function limitedHtml(source, items) {
 /** The "Co widzi inaczej" cell of a rule: the fields it hides (or refuses, or requires), one line each. */
 export function ruleWhatHtml(row, source) {
   const facts = ruleFacts(row, source);
-  const plain = (text) => `<span>${escapeHtml(text)}</span>`;
+  const plain = (text) => `<span>${sentenceHtml(text)}</span>`;
   if (row.direction === 'read') {
     if (!facts.known) {
       return plain(facts.visible.length ? T('hiding.sees_only', { fields: facts.visible.map(showHidden).join(', ') }) : T('hiding.sees_nothing'));
@@ -347,7 +348,7 @@ export function ruleWhatHtml(row, source) {
     const shown = facts.visibleOutside.slice(0, CELL_FIELDS).map(showHidden).join(', ');
     const rest = facts.visibleOutside.length - CELL_FIELDS;
     const outside = T('hiding.visible_outside', { fields: rest > 0 ? `${shown} ${T('hiding.and_more', { count: fmtCount(rest), n: rest })}` : shown });
-    return `${hiddenHtml}<div class="tf-table__cell-sub">${escapeHtml(outside)}</div>${hiddenRest}`;
+    return `${hiddenHtml}<div class="tf-table__cell-sub">${sentenceHtml(outside)}</div>${hiddenRest}`;
   }
   const requiredItems = facts.required.map((n) => [n, chipHtml('ok', T('hiding.write.require'))]);
   const refused = `<div class="tf-table__cell-sub">${escapeHtml(T('hiding.writes_rest'))}</div>`;

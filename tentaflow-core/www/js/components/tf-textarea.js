@@ -69,6 +69,13 @@ class TfTextarea extends HTMLElement {
 
   focus() { this._textarea?.focus(); }
 
+  /** Caret and scroll back to the first character; a text set from code leaves both at its end. */
+  moveToStart() {
+    if (!this._textarea) return;
+    this._textarea.setSelectionRange(0, 0);
+    this._textarea.scrollTop = 0;
+  }
+
   _build() {
     this.innerHTML = '';
     const group = document.createElement('div');

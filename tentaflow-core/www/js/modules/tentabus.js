@@ -33,7 +33,7 @@ import { drawOverview, pushOverviewSample, CHART_WINDOW_SECS } from '/js/modules
 import { drawSchemas, listText, compatLabel, schemaKind, schemaKindMismatchText, busRefusalText, busRefusalDetail } from '/js/modules/tentabus/schemas.js';
 import { drawSchemaDetail, shareShownText, dismissCopyToast } from '/js/modules/tentabus/schema-detail.js';
 import { judgedSchema } from '/js/modules/tentabus/hidden-notice.js';
-import { addedNotice, renamedRuleRequest, openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete } from '/js/modules/tentabus/schema-windows.js';
+import { addedNotice, keptSpellingsText, noticeToast, renameConsequence, renamedRuleRequest, openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete } from '/js/modules/tentabus/schema-windows.js';
 import { drawTopics } from '/js/modules/tentabus/topics.js';
 import { openTopicCreator } from '/js/modules/tentabus/topic-creator.js';
 import { openTopicDelete } from '/js/modules/tentabus/topic-delete.js';
@@ -2311,11 +2311,26 @@ async function afterSchemaChange(name, notice) {
     state.schema.notice = notice;
     state.schema.selected = null;
   } else {
-    toast(notice.title, notice.tone === 'success' ? 'success' : 'info');
+    // The reader is elsewhere, so the toast is all they get: it carries the whole text, warnings included.
+    const t = noticeToast(notice);
+    toast(t.message, t.kind, t.timeoutMs);
   }
   renderPanel();
   await loadSubjects();
   if (state.instanceId === instanceId && openSchemaName() === name) await loadSchemaPage(name);
+}
+
+// Whether a topic that checks with the pattern holds messages (on disk), from the last stats read; unknown reads as no.
+function topicsHoldRecords(topics) {
+  const stats = state.stats?.topics || [];
+  return (topics || []).some((t) => Number(stats.find((s) => s.topic === t)?.totalBytesOnDisk) > 0);
+}
+
+// The sentence that records written under the old spelling are not rewritten by a correction, added to a notice.
+function withKeptSpellings(notice, added, topics) {
+  if (!added.oldSpellingKept?.length) return;
+  const kept = keptSpellingsText({ names: added.oldSpellingKept, total: added.oldSpellingKeptTotal, hasRecords: topicsHoldRecords(topics) });
+  Object.assign(notice, { tone: 'warning', text: `${notice.text || ''} ${kept}`.trim() });
 }
 
 // "Topik wizyty …" or the sentence for a pattern no topic uses.
@@ -2336,8 +2351,12 @@ function openSchemaAddWindow() {
     onAdded: async (added) => {
       if (state.instanceId !== instanceId) return;
       const notice = addedNotice(added);
+      withKeptSpellings(notice, added, (state.shell.subjects || []).find((x) => x.subject === added.subject)?.usedByTopics);
       if (!state.view && state.tab === 'schemas') state.schemasNotice = notice;
-      else toast(notice.title, notice.tone === 'success' ? 'success' : 'warning');
+      else {
+        const t = noticeToast(notice);
+        toast(t.message, t.kind, t.timeoutMs);
+      }
       await loadSubjects();
     },
   });
@@ -2413,19 +2432,21 @@ async function openNewVersionWindow(name) {
       if (text == null) state.schemaDrafts.delete(name);
       else state.schemaDrafts.set(name, text);
     },
-    onAdded: ({ version, deduplicated, oldSpellingKept, ruleRename }) => {
+    onAdded: ({ version, deduplicated, oldSpellingKept, oldSpellingKeptTotal, ruleRename, ruleRenameDeclined }) => {
       state.schemaDrafts.delete(name);
       if (state.instanceId !== instanceId) return;
       const notice = deduplicated
         ? { tone: 'info', title: T('schemas.version.same_title'), text: T('schemas.version.same_text', { version: fmtCount(version) }) }
         : { tone: 'success', title: T('schemas.version.added_title', { version: fmtCount(version) }), text: usedByText(info, 'schemas.version.added_text') };
       // Records written under the old spelling are not rewritten by a correction; that is said, not implied.
-      if (oldSpellingKept?.length) Object.assign(notice, { tone: 'warning', text: `${notice.text} ${T('schemas.hidden.old_spelling_kept', { count: oldSpellingKept.length, names: oldSpellingKept.join(', ') })}`.trim() });
+      withKeptSpellings(notice, { oldSpellingKept, oldSpellingKeptTotal }, info.usedByTopics);
       // A change to what is hidden is never silent: it is said here, and a failure of it is not buried under the success.
       if (ruleRename?.error) {
         const failed = ruleRename.renamed ? T('schemas.hidden.rules_rename_partial', { count: ruleRename.renamed, error: ruleRename.error }) : T('schemas.hidden.rules_rename_failed', { error: ruleRename.error });
         Object.assign(notice, { tone: 'warning', text: `${notice.text} ${failed}`.trim() });
-      } else if (ruleRename?.renamed) notice.text = `${notice.text} ${T('schemas.hidden.rules_renamed', { count: ruleRename.renamed })}`.trim();
+      } else if (ruleRename?.renamed) notice.text = `${notice.text} ${T('schemas.hidden.rules_renamed', { count: ruleRename.renamed })} ${renameConsequence(ruleRename.fields, true)}`.trim();
+      // The rules were offered a rename and left as they were: what that does to the readers is said, not implied.
+      if (ruleRenameDeclined?.length) notice.text = `${notice.text} ${renameConsequence(ruleRenameDeclined, false)}`.trim();
       afterSchemaChange(name, notice);
     },
   });

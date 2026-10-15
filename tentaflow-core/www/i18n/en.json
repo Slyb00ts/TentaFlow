@@ -11859,6 +11859,8 @@
         "strip_button": "Remove invisible characters",
         "stripped": "Removed {count} {count|invisible character|invisible characters}: {places}.",
         "places_line": "Invisible characters in the text: {places}.",
+        "preview_title": "Lines to fix (an invisible character is shown here as ⟦U+XXXX⟧):",
+        "line_label": "line {line}",
         "cleaned": "Removed {count} {count|invisible character|invisible characters} from the previous version: {places}. Check the text and add the corrected version.",
         "page_title": "This version contains an invisible character",
         "page_text": "Topics that use this pattern accept no messages. Add a corrected version. Where: {places}.",
@@ -11868,13 +11870,15 @@
         "stan_button": "Open the pattern",
         "rules_gone": "Data-hiding rules on {topics} name fields the new version does not have: {fields}. A field its rule does not name is hidden from the readers.",
         "rules_rename": "Also rename, in those rules, the fields that differ only by an invisible character: {pairs}.",
+        "rules_rename_off": "Left unticked, the data-hiding rules stay as they are, so the readers of those topics stop seeing in new messages: {names}.",
+        "rules_rename_on": "Ticked, the rules start to allow {names}, so the readers of those topics see in new messages data that is hidden from them now.",
         "rules_renamed": "Renamed fields in {count} data-hiding {count|rule|rules}.",
         "rules_rename_failed": "The version was added, but renaming the fields in the data-hiding rules failed: {error}. Fix them in the “Data hiding” section.",
         "rules_rename_partial": "The version was added and the fields were renamed in {count} data-hiding {count|rule|rules}, then renaming failed: {error}. Fix the rest in the “Data hiding” section.",
         "diff_only_removal": "Difference from version {version}: only the invisible characters are removed; fields and requirements are unchanged.",
         "diff_only_removal_names": "Difference from version {version}: only the invisible characters are removed, but they were inside {count} {count|name or value|names or values}: {pairs}.",
-        "rules_rename_effect": "Careful: this changes which data the readers of those topics see, because their rules will allow the field under its cleaned name.",
-        "old_spelling_kept": "Records already written keep the old spelling of {count} {count|name or value|names or values}: {names}. The version passed the compatibility check only with the invisible characters removed from the previous one."
+        "old_spelling_kept": "Records already written keep the old spelling of {count} {count|name or value|names or values}: {names}.",
+        "old_spelling_kept_maybe": "Records written earlier (if any) keep the old spelling of {count} {count|name or value|names or values}: {names}."
       },
       "refused": {
         "hl7_msh": "“{field}” describes the message's own separators, so it cannot be required. Remove “{field}” from the required fields.",
@@ -12006,7 +12010,8 @@
         "thrift_lexical": "The pattern has an unclosed comment or quoted text, a malformed number, an unknown escape sequence in a text, or a character a Thrift file cannot contain.",
         "at_line": "On line {line}.",
         "at_line_column": "On line {line}, column {column}.",
-        "hidden_character": "The pattern contains an invisible character or one that changes the direction of text: {code} ({name}). Such a character makes the pattern look different in an editor from what a program reads (\"Trojan Source\"). Use “Remove invisible characters” or remove it by hand and send the pattern again. {cause} {atLine}"
+        "hidden_character": "The pattern contains an invisible character or one that changes the direction of text: {code} ({name}). Such a character makes the pattern look different in an editor from what a program reads (\"Trojan Source\"). The lines that hold one are shown below with the character written as ⟦U+XXXX⟧, because the text box may not show it. Use “Remove invisible characters” or fix those lines by hand and send the pattern again. {cause} {atLine}",
+        "hidden_escape": "The pattern writes an invisible character or one that changes the direction of text as an escape sequence (for example \\u202E): {code} ({name}). “Remove invisible characters” does not remove such a sequence — fix it by hand on the line shown below and send the pattern again. {atLine}"
       }
     },
     "topics": {

@@ -28,7 +28,7 @@ import { COMPATIBILITIES, compatLabel, schemaFormatLabel, schemaKind, listText }
 import { openChangeWindow, openConfirmWindow } from '/js/modules/tentabus/windows.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
 import { showHidden, findHidden, stripHidden, hiddenWords } from '/js/modules/tentabus/hidden-characters.js';
-import { hiddenPlaces, placesText, plainName, causeHint } from '/js/modules/tentabus/hidden-notice.js';
+import { hiddenPlaces, hiddenLines, placesText, plainName, causeHint, sentenceHtml } from '/js/modules/tentabus/hidden-notice.js';
 import { readJsonSchema } from '/js/modules/tentabus/topic-hiding.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-select.js';
@@ -611,6 +611,32 @@ export function textRefusalReason(schemaType, serverText) {
   return reason && line && !reason.includes(line) ? `${reason} ${line}` : reason;
 }
 
+const HIDDEN_REFUSAL = /^the schema contains an invisible or direction-controlling character (U\+[0-9A-F]+) \(([^)]*)\) at line (\d+), column (\d+)( \(written as an escape sequence\))?/;
+
+/**
+ * Where the server found a refused character (`text_guard.rs`): `{ code, codePoint, name, line, column, escape }`,
+ * `escape` when the text writes it as an escape sequence and not as the character; `null` for any other refusal.
+ */
+export function hiddenRefusal(serverText) {
+  const m = HIDDEN_REFUSAL.exec(String(serverText || '').replace(/^invalid schema:\s*/, ''));
+  if (!m) return null;
+  return { code: m[1], codePoint: parseInt(m[1].slice(2), 16), name: m[2], line: Number(m[3]), column: Number(m[4]), escape: Boolean(m[5]) };
+}
+
+/** The lines of the refused text that hold the character, so they can be found in a box that draws it reversed or not at all. */
+function hiddenPreviewHtml(text, schemaType, found) {
+  const options = { leadingBom: schemaType === 'xsd' };
+  const { lines, more } = hiddenLines(text, options, found.escape ? { line: found.line, column: found.column } : null);
+  if (!lines.length) return '';
+  const places = hiddenPlaces(text, options);
+  return `<div class="tb-hidden-preview">
+    ${places ? `<div>${escapeHtml(T('schemas.hidden.places_line', { places: places.text }))}</div>` : ''}
+    <div class="tb-vr-hint">${escapeHtml(T('schemas.hidden.preview_title'))}</div>
+    <ul class="tb-hidden-lines">${lines.map((l) => `<li><span class="tb-hidden-line-no">${escapeHtml(T('schemas.hidden.line_label', { line: l.line }))}</span><code class="tb-hidden-line-text">${escapeHtml(l.text)}</code></li>`).join('')}</ul>
+    ${more ? `<div class="tb-vr-hint">${escapeHtml(T('schemas.hidden.more', { count: more }))}</div>` : ''}
+  </div>`;
+}
+
 function lineSentence(serverText) {
   const m = /\(line (\d+)\)/.exec(String(serverText || ''));
   return m ? T('schemas.refused.at_line', { line: m[1] }) : '';
@@ -619,14 +645,13 @@ function lineSentence(serverText) {
 function refusalReasonOf(schemaType, serverText) {
   const text = String(serverText || '').replace(/^invalid schema:\s*/, '');
   // The same screen runs before every format's parser (text_guard.rs), so every kind words it the same.
-  const hidden = /^the schema contains an invisible or direction-controlling character (U\+[0-9A-F]+) \(([^)]*)\) at line (\d+), column (\d+)/.exec(text);
+  const hidden = hiddenRefusal(text);
   if (hidden) {
-    const cp = parseInt(hidden[1].slice(2), 16);
-    return T('schemas.refused.hidden_character', {
-      code: hidden[1],
-      name: plainName(cp, hidden[2]),
-      cause: causeHint(cp),
-      atLine: T('schemas.refused.at_line_column', { line: hidden[3], column: hidden[4] }),
+    return T(hidden.escape ? 'schemas.refused.hidden_escape' : 'schemas.refused.hidden_character', {
+      code: hidden.code,
+      name: plainName(hidden.codePoint, hidden.name),
+      cause: causeHint(hidden.codePoint),
+      atLine: T('schemas.refused.at_line_column', { line: hidden.line, column: hidden.column }),
     }).replace(/\s{2,}/g, ' ').trim();
   }
   if (schemaType === 'hl7v2_profile') {
@@ -800,7 +825,8 @@ export function refusalHtml({ err, title, compatibility, schemaType, newText, de
   if (invalid) {
     const serverText = invalid[1].trim();
     const reason = textRefusalReason(schemaType, serverText);
-    return `<div>${head} ${escapeHtml(reason || T('schemas.text_refused', { format: schemaFormatLabel(schemaType) }))}</div>${technical(serverText)}`;
+    const found = hiddenRefusal(serverText);
+    return `<div>${head} ${escapeHtml(reason || T('schemas.text_refused', { format: schemaFormatLabel(schemaType) }))}</div>${found ? hiddenPreviewHtml(newText, schemaType, found) : ''}${technical(serverText)}`;
   }
   if (/\bbus\.invalid_argument: subject '[^']*' is deprecated/.test(message)) {
     return `<div>${head} ${escapeHtml(T('schemas.version.refused_withdrawn'))}</div>`;
@@ -937,6 +963,34 @@ export function renamedRuleRequest(instanceId, rule, renames) {
   return touched
     ? { instanceId, topic: rule.topic, subjectType: rule.subjectType, subjectId: rule.subjectId, direction: rule.direction, fields, requiredFields }
     : null;
+}
+
+/**
+ * A notice as a toast, for a reader who is not on the page it belongs to: the whole text goes with the title (a warning
+ * about stored spellings or a failed rename lives in the text) and a warning stays on screen longer.
+ */
+export function noticeToast(notice) {
+  const kind = { success: 'success', warning: 'warning' }[notice.tone] || 'info';
+  return { message: `${notice.title} ${notice.text || ''}`.trim(), kind, timeoutMs: kind === 'warning' ? 12000 : 4000 };
+}
+
+/**
+ * "Zapisane już wiadomości zachowują starą pisownię …": the names and values (`names`, at most as many as the server
+ * lists, of `total`) that stored records keep spelled with a refused character. `hasRecords` = a topic that uses the
+ * pattern holds messages; when that is not known the sentence says "if any".
+ */
+export function keptSpellingsText({ names, total, hasRecords }) {
+  const count = Math.max(Number(total) || 0, names.length);
+  const rest = count - names.length;
+  const list = rest > 0 ? `${names.join(', ')} ${T('schemas.hidden.more', { count: rest })}` : names.join(', ');
+  return T(hasRecords ? 'schemas.hidden.old_spelling_kept' : 'schemas.hidden.old_spelling_kept_maybe', { count, names: list });
+}
+
+/** What ticking, or not ticking, "rename the fields in the data-hiding rules" does to what the readers of those topics see. */
+export function renameConsequence(renames, chosen) {
+  return T(chosen ? 'schemas.hidden.rules_rename_on' : 'schemas.hidden.rules_rename_off', {
+    names: listText(renames.map((x) => x.to)), count: renames.length,
+  });
 }
 
 const NAME_ERRORS = { empty: 'schemas.add.name_empty', invalid: 'schemas.add.name_invalid', taken: 'schemas.add.name_taken' };
@@ -1088,14 +1142,20 @@ export function openSchemaAdd(ctx) {
       describeError: ctx.describeError,
     }),
     describeError: ctx.describeError,
-    onSaved: (d, resp) => ctx.onAdded({ subject: d.subject, schemaType: d.schemaType, version: Number(resp?.version) || 1, deduplicated: resp?.deduplicated === true }),
+    onSaved: (d, resp) => ctx.onAdded({
+      subject: d.subject,
+      schemaType: d.schemaType,
+      version: Number(resp?.version) || 1,
+      deduplicated: resp?.deduplicated === true,
+      ...(resp?.oldSpellingKept?.length ? { oldSpellingKept: resp.oldSpellingKept, oldSpellingKeptTotal: Number(resp.oldSpellingKeptTotal) || resp.oldSpellingKept.length } : {}),
+    }),
   });
 }
 
 /**
  * "Nowa wersja". `ctx` = `{ instanceId, subject: <list row>, latestText,
  * draftText, register(request), describeError, onAdded({ version,
- * deduplicated, oldSpellingKept, ruleRename }), onDraft(text), loadRules(), renameRules(renames) }`
+ * deduplicated, oldSpellingKept, oldSpellingKeptTotal, ruleRename, ruleRenameDeclined }), onDraft(text), loadRules(), renameRules(renames) }`
  * — `draftText` is a refused text kept from the last attempt (else the newest
  * version's text is the starting point); `onDraft` receives the text whenever
  * the window closes without adding. A newest text that holds refused characters
@@ -1118,6 +1178,9 @@ export function openSchemaVersion(ctx) {
   const start = ctx.draftText ?? cleanLatest;
   let added = false;
   let rules = null;
+  // The renames of rule fields the text offers and whether they are ticked: what the "Co się stanie" lines say.
+  let renameOffer = [];
+  let renameChosen = false;
   const win = openChangeWindow({
     title: T('schemas.version.title', { name: info.subject }),
     icon: 'plus',
@@ -1133,15 +1196,16 @@ export function openSchemaVersion(ctx) {
       ${ctx.draftText != null ? `<div class="tb-explain-box">${escapeHtml(T('schemas.version.draft_kept'))}</div>` : ''}
       ${ctx.draftText == null && removedFromLatest ? `<div class="tb-explain-box" data-role="cleaned" role="status">${escapeHtml(T('schemas.hidden.cleaned', { count: removedFromLatest.places.length, places: removedFromLatest.text }))}</div>` : ''}
       ${textField(T('schemas.version.text_label', { version: fmtCount(next) }), addTextHint(info.schemaType, next), start, addTextMore(info.schemaType))}
-      <div class="tb-vr-hint" data-role="diff"></div>
+      <div class="tb-diff-note" data-role="diff"></div>
       <div class="tb-rules-note" data-role="rules" role="status" hidden></div>
-      <div data-role="rename-wrap" hidden><tf-checkbox data-role="rename-rules" label=""></tf-checkbox><div class="muted" data-role="rename-effect">${escapeHtml(T('schemas.hidden.rules_rename_effect'))}</div></div>`,
+      <div data-role="rename-wrap" hidden><tf-checkbox data-role="rename-rules" label=""></tf-checkbox><div class="muted" data-role="rename-effect" aria-live="polite"></div></div>`,
     wire: (win, sync) => {
       const diff = win.querySelector('[data-role="diff"]');
       const field = win.querySelector('[data-role="text"]');
       const rulesEl = win.querySelector('[data-role="rules"]');
       const renameWrap = win.querySelector('[data-role="rename-wrap"]');
       const renameBox = win.querySelector('[data-role="rename-rules"]');
+      const effectEl = win.querySelector('[data-role="rename-effect"]');
       const paintDiff = () => {
         const changes = { json_schema: jsonSchemaChanges, hl7v2_profile: profileChanges, xsd: xsdChanges }[info.schemaType];
         // Removing the characters and nothing else is the correction: say that, not "the same as version N".
@@ -1154,7 +1218,7 @@ export function openSchemaVersion(ctx) {
         const text = removedFromLatest && field.value === cleanLatest
           ? onlyRemoval
           : (changes ? changes(cleanLatest, field.value, latest) : null);
-        diff.textContent = text || '';
+        diff.innerHTML = text ? sentenceHtml(text) : '';
         diff.hidden = !text;
       };
       const paintRules = () => {
@@ -1163,30 +1227,43 @@ export function openSchemaVersion(ctx) {
         rulesEl.hidden = !gone.length;
         if (gone.length) {
           const topics = [...new Set(gone.flatMap((g) => g.topics))].map((t) => `„${t}”`);
-          rulesEl.textContent = T('schemas.hidden.rules_gone', { topics: listText(topics), fields: showHidden(listText(gone.map((g) => g.name))) });
+          rulesEl.innerHTML = sentenceHtml(T('schemas.hidden.rules_gone', { topics: listText(topics), fields: showHidden(listText(gone.map((g) => g.name))) }));
         }
         const renames = issues?.renames || [];
+        renameOffer = renames;
         renameWrap.hidden = !renames.length;
         if (renames.length) {
           renameBox.setAttribute('label', T('schemas.hidden.rules_rename', { pairs: renames.map((x) => `${showHidden(x.from)} → ${x.to}`).join(', ') }));
+          effectEl.innerHTML = sentenceHtml(renameConsequence(renames, renameChosen));
         }
       };
+      renameBox.addEventListener('change', () => {
+        renameChosen = renameBox.checked;
+        paintRules();
+        sync();
+      });
       const check = wireTextField(win, () => { paintDiff(); paintRules(); sync(); }, () => info.schemaType);
       check();
       paintDiff();
-      ctx.loadRules?.().then((loaded) => { rules = loaded; paintRules(); }, () => {});
+      ctx.loadRules?.().then((loaded) => { rules = loaded; paintRules(); sync(); }, () => {});
+      // A text set from code leaves the caret and the scroll at its end; the window opens on the first line.
+      field.moveToStart?.();
+      requestAnimationFrame(() => field.moveToStart?.());
     },
     draft: (win) => {
       const schemaText = win.querySelector('[data-role="text"]').value;
       return schemaTextProblem(schemaText, info.schemaType) || textMarked(win) ? null : { schemaText };
     },
-    impact: () => versionImpact({ nextVersion: next, latestVersion: latest || null, compatibility: info.compatibility, usedByTopics: info.usedByTopics }),
+    impact: () => [
+      ...versionImpact({ nextVersion: next, latestVersion: latest || null, compatibility: info.compatibility, usedByTopics: info.usedByTopics }),
+      ...(renameOffer.length ? [renameConsequence(renameOffer, renameChosen)] : []),
+    ],
     save: async (d) => {
-      const renames = win.querySelector('[data-role="rename-rules"]').checked && !win.querySelector('[data-role="rename-wrap"]').hidden
-        ? (ruleFieldIssues({ rules, newText: d.schemaText, oldText: ctx.latestText, schemaType: info.schemaType })?.renames || [])
-        : [];
+      const offered = ruleFieldIssues({ rules, newText: d.schemaText, oldText: ctx.latestText, schemaType: info.schemaType })?.renames || [];
+      const renames = renameChosen && !win.querySelector('[data-role="rename-wrap"]').hidden ? offered : [];
       const resp = await ctx.register(buildRegisterRequest(ctx.instanceId, { subject: info.subject, schemaType: info.schemaType, schemaText: d.schemaText }));
-      if (!renames.length || !ctx.renameRules) return resp;
+      if (!ctx.renameRules || resp?.deduplicated === true) return resp;
+      if (!renames.length) return offered.length ? { ...resp, ruleRenameDeclined: offered } : resp;
       // The version is in: a failed rename must not look like a refused version.
       try {
         return { ...resp, ruleRename: { renamed: await ctx.renameRules(renames), fields: renames } };
@@ -1207,7 +1284,13 @@ export function openSchemaVersion(ctx) {
     describeError: ctx.describeError,
     onSaved: (d, resp) => {
       added = true;
-      ctx.onAdded({ version: Number(resp?.version) || next, deduplicated: resp?.deduplicated === true, ...(resp?.oldSpellingKept?.length ? { oldSpellingKept: resp.oldSpellingKept } : {}), ...(resp?.ruleRename ? { ruleRename: resp.ruleRename } : {}) });
+      ctx.onAdded({
+        version: Number(resp?.version) || next,
+        deduplicated: resp?.deduplicated === true,
+        ...(resp?.oldSpellingKept?.length ? { oldSpellingKept: resp.oldSpellingKept, oldSpellingKeptTotal: Number(resp.oldSpellingKeptTotal) || resp.oldSpellingKept.length } : {}),
+        ...(resp?.ruleRename ? { ruleRename: resp.ruleRename } : {}),
+        ...(resp?.ruleRenameDeclined ? { ruleRenameDeclined: resp.ruleRenameDeclined } : {}),
+      });
     },
   });
   win.addEventListener('click', (e) => {

@@ -240,6 +240,14 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
 .tb-window .tb-rules-note[hidden] { display: none; }
 .tb-window .tb-hidden-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 12px; }
 .tb-window .tb-hidden-row[hidden] { display: none; }
+.tb-hidden-name { white-space: nowrap; }
+.tb-window .tb-diff-note { font-size: 13px; color: var(--tf-text-2); line-height: 1.5; }
+.tb-window .tb-diff-note[hidden] { display: none; }
+.tb-window .tb-hidden-preview { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; font-size: 12.5px; color: var(--tf-text-2); }
+.tb-window .tb-hidden-lines { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.tb-window .tb-hidden-lines li { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.tb-window .tb-hidden-line-no { flex: none; color: var(--tf-text-3); white-space: nowrap; }
+.tb-window .tb-hidden-line-text { min-width: 0; font-family: var(--tf-font-mono, ui-monospace, monospace); color: var(--tf-text); overflow-wrap: anywhere; }
 .tb-hidden-flag { display: flex; flex-direction: column; gap: 8px; margin-bottom: 8px; }
 .tb-window .tb-explain-box--error {
   display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;

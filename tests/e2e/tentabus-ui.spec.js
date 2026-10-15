@@ -3029,6 +3029,15 @@ test('Trojan Source: a pattern text with a hidden or direction-changing characte
     await expect(error).not.toContainText('Rejestr nie przyjął');
     await expect(error.locator('tf-disclosure pre')).toContainText('the schema contains an invisible or direction-controlling character U+202E (RIGHT-TO-LEFT OVERRIDE) at line 1, column 19');
     await page.screenshot({ path: path.join(SHOTS, 'trojan-source-json.png') });
+    // The lines that hold it are shown with the character as a marker, so it can be found.
+    await expect(error.locator('.tb-hidden-line-text')).toHaveText('{"description": "a\u27E6U+202E\u27E7b"}');
+    await expect(error.locator('.tb-hidden-line-no')).toHaveText('wiersz 1');
+    // The same character written as an escape sequence is refused too, and said to be one.
+    await win.locator('[data-role="text"] textarea').fill('{"description": "a\\u202Eb"}');
+    await win.locator('[data-act="save"]').click();
+    await expect(error).toContainText('jako sekwencję specjalną', { timeout: 15000 });
+    await expect(error.locator('.tb-hidden-line-text')).toHaveText('{"description": "a\\u202Eb"}');
+    await expect(error.locator('tf-disclosure pre')).toContainText('(written as an escape sequence)');
     // The refusal belongs to the text that was refused; cancelling leaves no pattern.
     await win.locator('[data-role="text"] textarea').fill('{"description": "ab"}');
     await expect(error).toBeHidden();
@@ -3044,10 +3053,10 @@ test('Trojan Source: a pattern text with a hidden or direction-changing characte
     await expect(error).toContainText('często pochodzi z tekstu wklejonego z Worda lub strony WWW');
     await expect(error).toContainText('W wierszu 2, w kolumnie 13.');
     // The box names the place live, and one button takes the character out and says so.
-    await expect(win.locator('[data-role="hidden-places"]')).toContainText('U+200B (spacja o zerowej szerokości) w wierszu 2, kolumnie 13');
+    await expect(win.locator('[data-role="hidden-places"]')).toContainText('U+200B (spacja o zerowej szerokości) w wierszu 2, w kolumnie 13');
     await expect(win.locator('[data-role="impact"]')).toBeHidden();
     await win.locator('[data-role="strip-hidden"]').click();
-    await expect(win.locator('[data-role="hidden-done"]')).toContainText('Usunięto 1 niewidoczny znak: U+200B (spacja o zerowej szerokości) w wierszu 2, kolumnie 13.');
+    await expect(win.locator('[data-role="hidden-done"]')).toContainText('Usunięto 1 niewidoczny znak: U+200B (spacja o zerowej szerokości) w wierszu 2, w kolumnie 13.');
     await expect(error).toBeHidden();
     await expect(win.locator('[data-role="text"] textarea')).not.toHaveValue(/\u200B/);
     await win.locator('[data-role="text"] textarea').fill('<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">\n  <!-- uwaga\u200B -->\n  <xs:element name="a" type="xs:string"/>\n</xs:schema>');
@@ -3092,7 +3101,7 @@ test('Trojan Source correction: a stored version with a hidden character is flag
     await expect(schemaSlot(page).locator('.tb-title')).toHaveText(subject, { timeout: 20000 });
     const flag = schemaSlot(page).locator('[data-role="hidden-flag"] [data-role="flag-alert"]');
     await expect(flag).toHaveAttribute('title', 'Ta wersja zawiera niewidoczny znak', { timeout: 15000 });
-    await expect(flag).toHaveAttribute('message', /Topiki z tym wzorem nie przyjmują wiadomości\. Dodaj poprawioną wersję\. Miejsce: U\+202E \(wymuszenie kierunku od prawej do lewej \(RLO\)\) w wierszu 4, kolumnie \d+; U\+202E .* w wierszu 7, kolumnie \d+\./);
+    await expect(flag).toHaveAttribute('message', /Topiki z tym wzorem nie przyjmują wiadomości\. Dodaj poprawioną wersję\. Miejsce: U\+202E \(wymuszenie kierunku od prawej do lewej \(RLO\)\) w wierszu 4, w kolumnie \d+; U\+202E .* w wierszu 7, w kolumnie \d+\./);
     await expect.poll(() => editorShown(page)).toContain('pac\u27E6U+202E\u27E7jent');
     expect(await editorText(page)).not.toContain(RLO);
     // The flag already says it: the marker hint is not a second statement of the same fact.
@@ -3121,8 +3130,15 @@ test('Trojan Source correction: a stored version with a hidden character is flag
     await expect(win.locator('[data-role="rename-rules"]')).toHaveAttribute('label', /pac\u27E6U\+202E\u27E7jent → pacjent/);
     // The rename widens what readers see, so it starts unticked and says so; ticking it is a decision.
     await expect(win.locator('[data-role="rename-rules"]')).not.toHaveAttribute('checked', /.*/);
-    await expect(win.locator('[data-role="rename-effect"]')).toContainText('to zmienia, jakie dane widzą odbiorcy tych topików');
+    // Both outcomes are said next to the box and repeated in "Co się stanie po dodaniu".
+    await expect(win.locator('[data-role="rename-effect"]')).toContainText('przestaną widzieć w nowych wiadomościach: pacjent');
+    await expect(win.locator('[data-role="impact"]')).toContainText('przestaną widzieć w nowych wiadomościach: pacjent');
     await win.locator('[data-role="rename-rules"]').click();
+    await expect(win.locator('[data-role="rename-effect"]')).toContainText('zobaczą w nowych wiadomościach dane, które teraz są przed nimi ukryte');
+    await expect(win.locator('[data-role="impact"]')).toContainText('zobaczą w nowych wiadomościach dane, które teraz są przed nimi ukryte');
+    await expect(win.locator('[data-role="impact"]')).not.toContainText('przestaną widzieć');
+    // The window opens on the first line, not where the text ends.
+    expect(await win.locator('[data-role="text"] textarea').evaluate((t) => [t.selectionStart, t.scrollTop])).toEqual([0, 0]);
     await page.screenshot({ path: path.join(SHOTS, 'trojan-newversion-clean.png') });
 
     // BACKWARD (the pattern's mode) accepts the correction: it is not a rename.
@@ -3130,7 +3146,9 @@ test('Trojan Source correction: a stored version with a hidden character is flag
     await expect(win).toHaveCount(0, { timeout: 15000 });
     const notice = schemaSlot(page).locator('[data-role="notice"] tf-alert');
     await expect(notice).toHaveAttribute('title', 'Dodano wersję 2', { timeout: 15000 });
-    await expect(notice).toHaveAttribute('message', /Zapisane już wiadomości zachowują starą pisownię 1 nazwy lub wartości: pac\u27E6U\+202E\u27E7jent\./);
+    // No message was ever published to the topic, so the sentence does not claim stored records.
+    await expect(notice).toHaveAttribute('message', /Wiadomości zapisane wcześniej \(jeśli są\) zachowują starą pisownię 1 nazwy lub wartości: pac\u27E6U\+202E\u27E7jent\./);
+    await expect(notice).toHaveAttribute('message', /zobaczą w nowych wiadomościach dane, które teraz są przed nimi ukryte\./);
     await expect(notice).toHaveAttribute('message', /Zmieniono nazwy pól w 1 zasadzie ukrywania danych\./);
     await expect(schemaSlot(page).locator('[data-role="hidden-flag"] [data-role="flag-alert"]')).toHaveCount(0);
 
