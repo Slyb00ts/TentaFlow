@@ -178,9 +178,9 @@ export class FlowPalette {
     let html = '';
     for (const cat of this.mode === 'bpmn' ? ['events', 'tasks', 'tentaflow', 'gateways'] : CATEGORY_ORDER) {
       const items = groups[cat] || [];
-      // The TentaFlow group stays visible without a filter so an unavailable or
-      // empty catalogue is explained instead of silently missing.
-      const alwaysShown = cat === 'tentaflow' && !this.filter;
+      // The TentaFlow group stays visible without a filter so an empty catalogue
+      // is explained; the designer opens only once the options are loaded.
+      const alwaysShown = cat === 'tentaflow' && !this.filter && this.opts.processOptions;
       if (items.length === 0 && !alwaysShown) continue;
       const collapsed = this.collapsedCats.has(cat);
       html += `
@@ -216,9 +216,6 @@ export class FlowPalette {
   }
 
   _renderTentaflowItems(items) {
-    if (!this.opts.processOptions) {
-      return `<div class="fb-palette-note" data-role="tentaflow-unavailable">${escapeHtml(I18n.t('bpmn.palette_unavailable'))}</div>`;
-    }
     return TENTAFLOW_SUBGROUPS.map((subgroup) => {
       const rows = items.filter((it) => it.tpl.subgroup === subgroup);
       if (rows.length === 0 && this.filter) return '';

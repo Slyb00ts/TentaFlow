@@ -1824,6 +1824,10 @@ pub struct ProcessOptionTool {
     pub addon_id: String,
     pub tool_name: String,
     pub description: String,
+    /// Installed name of the addon instance, so two instances of one package
+    /// (same tool names) can be told apart in the palette.
+    #[serde(default)]
+    pub addon_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2197,6 +2201,16 @@ mod tests {
         assert_eq!(service_flows.len(), 1);
         assert!(service_blocks.is_empty() && service_tools.is_empty());
 
+        let older_tool = serde_json::json!({"OptionsResponse": {
+            "assignees": [], "service_flows": [],
+            "service_tools": [{"addon_id": "notes-1", "tool_name": "search", "description": "d"}]}});
+        let ProcessPayload::OptionsResponse { service_tools, .. } =
+            crate::cbor::decode(&crate::cbor::encode(&older_tool).unwrap()).unwrap()
+        else {
+            panic!("options response expected");
+        };
+        assert_eq!(service_tools[0].addon_name, "");
+
         let current = ProcessPayload::OptionsResponse {
             assignees: Vec::new(),
             service_flows: Vec::new(),
@@ -2210,6 +2224,7 @@ mod tests {
                 addon_id: "notes-1".into(),
                 tool_name: "search".into(),
                 description: "Searches notes".into(),
+                addon_name: "Notes".into(),
             }],
         };
         let round_trip: ProcessPayload =

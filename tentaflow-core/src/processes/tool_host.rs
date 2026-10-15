@@ -38,6 +38,53 @@ pub struct OfferedTool {
     pub addon_id: String,
     pub tool_name: String,
     pub description: String,
+    pub addon_name: String,
+}
+
+/// Longest description or addon name sent to the designer, in characters. The
+/// full text stays in the addon registry; the palette only needs a hint.
+pub const MAX_OFFERED_TEXT_CHARS: usize = 512;
+/// Worst-case encoded size of one offered tool: two 128-byte identifiers plus
+/// two texts of at most `MAX_OFFERED_TEXT_CHARS` four-byte characters.
+pub const MAX_OFFERED_TOOL_BYTES: usize = 2 * 128 + 2 * MAX_OFFERED_TEXT_CHARS * 4;
+
+fn truncate_chars(text: &str) -> String {
+    text.chars().take(MAX_OFFERED_TEXT_CHARS).collect()
+}
+
+/// Builds the sorted catalogue from the registry. A tool whose identifiers
+/// publication would reject is never offered, `decide` runs once per addon and
+/// the sort happens here so any later cap cuts a stable tail.
+pub fn select_offered_tools(
+    tools: Vec<crate::addon::ToolDefinition>,
+    mut decide: impl FnMut(&str) -> bool,
+    labels: &std::collections::HashMap<String, String>,
+) -> Vec<OfferedTool> {
+    let mut decisions = std::collections::HashMap::<String, bool>::new();
+    let mut offered: Vec<OfferedTool> = tools
+        .into_iter()
+        .filter(|tool| {
+            super::model::validate_tool_identifier(&tool.addon_id, "addon id", "").is_ok()
+                && super::model::validate_tool_identifier(&tool.tool_name, "tool name", "")
+                    .is_ok()
+        })
+        .filter(|tool| {
+            *decisions
+                .entry(tool.addon_id.clone())
+                .or_insert_with(|| decide(&tool.addon_id))
+        })
+        .map(|tool| OfferedTool {
+            addon_name: labels
+                .get(&tool.addon_id)
+                .map(|label| truncate_chars(label))
+                .unwrap_or_default(),
+            description: truncate_chars(&tool.description),
+            addon_id: tool.addon_id,
+            tool_name: tool.tool_name,
+        })
+        .collect();
+    offered.sort_by(|a, b| (&a.addon_id, &a.tool_name).cmp(&(&b.addon_id, &b.tool_name)));
+    offered
 }
 
 /// The slice of the addon runtime a Service task needs. A trait so the process
@@ -136,24 +183,20 @@ impl ProcessToolHost for crate::addon::AddonManager {
     }
 
     fn offered_tools(&self, user_id: &str, org_id: &str) -> Vec<OfferedTool> {
-        let mut decisions = std::collections::HashMap::<String, bool>::new();
-        let mut offered: Vec<OfferedTool> = self
-            .list_tools()
-            .into_iter()
-            .filter(|tool| {
-                *decisions.entry(tool.addon_id.clone()).or_insert_with(|| {
-                    self.process_addon_access(&tool.addon_id, user_id, org_id)
-                        .is_ok()
-                })
-            })
-            .map(|tool| OfferedTool {
-                addon_id: tool.addon_id,
-                tool_name: tool.tool_name,
-                description: tool.description,
-            })
-            .collect();
-        offered.sort_by(|a, b| (&a.addon_id, &a.tool_name).cmp(&(&b.addon_id, &b.tool_name)));
-        offered
+        let tools = self.list_tools();
+        let mut ids: Vec<String> = tools.iter().map(|tool| tool.addon_id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        // A name that cannot be read only costs the palette its subtitle.
+        let labels = self.instance_labels(&ids).unwrap_or_default();
+        select_offered_tools(
+            tools,
+            |addon_id| {
+                self.process_addon_access(addon_id, user_id, org_id)
+                    .is_ok()
+            },
+            &labels,
+        )
     }
 
     fn call(
@@ -463,6 +506,93 @@ mod tests {
             read_only: false,
         });
         manager
+    }
+
+    fn definition(addon_id: &str, tool_name: &str, description: &str) -> ToolDefinition {
+        ToolDefinition {
+            addon_id: addon_id.into(),
+            package_id: "notes".into(),
+            tool_name: tool_name.into(),
+            description: description.into(),
+            parameters_schema: json!({"type": "object"}),
+            return_schema: None,
+            keywords: Vec::new(),
+            read_only: false,
+        }
+    }
+
+    #[test]
+    fn selection_sorts_decides_once_per_addon_and_names_the_instance() {
+        let tools = vec![
+            definition("notes-b", "zeta", "z"),
+            definition("notes-a", "search", "s"),
+            definition("notes-b", "alpha", "a"),
+            definition("blocked-c", "search", "s"),
+        ];
+        let labels = std::collections::HashMap::from([
+            ("notes-a".to_owned(), "Notes A".to_owned()),
+            ("notes-b".to_owned(), "Notes B".to_owned()),
+        ]);
+        let mut decisions = Vec::new();
+        let offered = select_offered_tools(
+            tools,
+            |addon_id| {
+                decisions.push(addon_id.to_owned());
+                addon_id != "blocked-c"
+            },
+            &labels,
+        );
+        let listed: Vec<(&str, &str, &str)> = offered
+            .iter()
+            .map(|t| (t.addon_id.as_str(), t.tool_name.as_str(), t.addon_name.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("notes-a", "search", "Notes A"),
+                ("notes-b", "alpha", "Notes B"),
+                ("notes-b", "zeta", "Notes B"),
+            ]
+        );
+        decisions.sort();
+        assert_eq!(decisions, ["blocked-c", "notes-a", "notes-b"]);
+    }
+
+    #[test]
+    fn selection_drops_identifiers_publication_would_reject() {
+        let tools = vec![
+            definition("notes-a", "search notes", ""),
+            definition("notes/a", "search", ""),
+            definition("notes-a", "", ""),
+            definition("notes-a", &"x".repeat(129), ""),
+            definition("notes-a", "search_notes", ""),
+        ];
+        let mut decided = Vec::new();
+        let offered = select_offered_tools(
+            tools,
+            |addon_id| {
+                decided.push(addon_id.to_owned());
+                true
+            },
+            &Default::default(),
+        );
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].tool_name, "search_notes");
+        assert_eq!(decided, ["notes-a"], "an invalid addon id is never decided");
+    }
+
+    #[test]
+    fn selection_truncates_texts_on_a_character_boundary() {
+        let long = "ż".repeat(MAX_OFFERED_TEXT_CHARS + 10);
+        let labels = std::collections::HashMap::from([("notes-a".to_owned(), long.clone())]);
+        let offered = select_offered_tools(
+            vec![definition("notes-a", "search", &long)],
+            |_| true,
+            &labels,
+        );
+        assert_eq!(offered[0].description.chars().count(), MAX_OFFERED_TEXT_CHARS);
+        assert_eq!(offered[0].addon_name.chars().count(), MAX_OFFERED_TEXT_CHARS);
+        assert!(offered[0].description.len() <= MAX_OFFERED_TEXT_CHARS * 4);
     }
 
     #[tokio::test]

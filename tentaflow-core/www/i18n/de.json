@@ -14532,7 +14532,6 @@
     "palette_blocks": "Blöcke",
     "palette_tools": "Addon-Tools",
     "palette_group_empty": "Keine Einträge zur Auswahl.",
-    "palette_unavailable": "Die TentaFlow-Blöcke konnten nicht geladen werden. Öffnen Sie den Prozess erneut.",
     "palette_flow_hint": "Service-Aufgabe, die diesen Ablauf ausführt.",
     "node_start": "Start",
     "node_start_hint": "Startet eine Prozessinstanz.",

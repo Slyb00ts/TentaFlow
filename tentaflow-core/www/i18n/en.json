@@ -15767,7 +15767,6 @@
     "palette_blocks": "Blocks",
     "palette_tools": "Addon tools",
     "palette_group_empty": "Nothing to choose from.",
-    "palette_unavailable": "TentaFlow blocks could not be loaded. Reopen the process.",
     "palette_flow_hint": "Service task that runs this flow.",
     "node_start": "Start",
     "node_start_hint": "Starts one process instance.",

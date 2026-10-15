@@ -73,6 +73,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   a decyzja o addonie zapada raz na addon, nie raz na narzędzie. Lista narzędzi
   jest ucięta po 1000 pozycjach (stała kolejność addon, narzędzie); w inspektorze
   nadal można wpisać dowolne narzędzie. Agenci nie są oferowani (wchodzą w B3.4).
+  Pozycja narzędzia niesie nazwę zainstalowanego addonu (`addon_name`, dopisane z
+  `#[serde(default)]`), więc dwie instancje jednego pakietu nie są nieodróżnialne
+  („Notes › search_notes”). Katalog pomija narzędzia z identyfikatorami, które
+  odrzuciłaby publikacja, a opisy i nazwy są ucinane do 512 znaków. Nieczytelny
+  stan inicjatora kończy zapytanie o opcje błędem zamiast pustą listą narzędzi.
 
 ### TentaNas
 

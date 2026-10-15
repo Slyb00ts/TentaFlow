@@ -15767,7 +15767,6 @@
     "palette_blocks": "Bloki",
     "palette_tools": "Narzędzia addonów",
     "palette_group_empty": "Brak pozycji do wyboru.",
-    "palette_unavailable": "Nie udało się wczytać bloków TentaFlow. Otwórz proces ponownie.",
     "palette_flow_hint": "Zadanie usługi uruchamiające ten przepływ.",
     "node_start": "Początek",
     "node_start_hint": "Rozpoczyna jedno wykonanie procesu.",

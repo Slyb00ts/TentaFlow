@@ -1019,14 +1019,16 @@ test('process options decode the block and tool catalogues and tolerate a server
     assignees: [{ user_id: 'u1', display_name: 'Anna' }],
     service_flows: [{ flow_id: 'f1', name: 'Checker' }],
     service_blocks: [{ node_type: 'llm', label: 'Language model (LLM)', description: 'Generates text', category: 'service' }],
-    service_tools: [{ addon_id: 'notes-1', tool_name: 'search', description: 'Searches notes' }],
+    service_tools: [{ addon_id: 'notes-1', tool_name: 'search', description: 'Searches notes', addon_name: 'Notes' }],
   });
   assert.equal(full.variant, 'ProcessOptionsResponse');
   assert.deepEqual(full.serviceBlocks, [{ nodeType: 'llm', label: 'Language model (LLM)', description: 'Generates text', category: 'service' }]);
-  assert.deepEqual(full.serviceTools, [{ addonId: 'notes-1', toolName: 'search', description: 'Searches notes' }]);
+  assert.deepEqual(full.serviceTools, [{ addonId: 'notes-1', toolName: 'search', description: 'Searches notes', addonName: 'Notes' }]);
   assert.deepEqual(full.serviceFlows, [{ flowId: 'f1', name: 'Checker' }]);
   const old = decode({ assignees: [], service_flows: [] });
   assert.deepEqual(old.serviceFlows, []);
-  assert.deepEqual(old.serviceBlocks ?? [], []);
-  assert.deepEqual(old.serviceTools ?? [], []);
+  assert.deepEqual(old.serviceBlocks, []);
+  assert.deepEqual(old.serviceTools, []);
+  const olderTool = decode({ assignees: [], service_flows: [], service_tools: [{ addon_id: 'notes-1', tool_name: 'search', description: 'd' }] });
+  assert.equal(olderTool.serviceTools[0].addonName, '');
 });

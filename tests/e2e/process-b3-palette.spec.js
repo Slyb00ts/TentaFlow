@@ -120,11 +120,11 @@ test('a flow, a block and an addon tool dropped from the palette survive save an
   await expect(group.locator('[data-subgroup]')).toHaveCount(3);
   await expect(group.locator('.fb-node-item', { hasText: FLOW_NAME })).toHaveCount(1);
   await expect(group.locator('.fb-node-item', { hasText: 'Language model' })).toHaveCount(1);
-  await expect(group.locator('.fb-node-item', { hasText: 'search_notes' })).toHaveCount(1);
+  await expect(group.locator('.fb-node-item', { hasText: 'Notes B3 › search_notes' })).toHaveCount(1);
 
   await dragToCanvas(page, FLOW_NAME, 120, 150);
   await dragToCanvas(page, 'Language model', 360, 150);
-  await dragToCanvas(page, 'search_notes', 600, 150);
+  await dragToCanvas(page, 'Notes B3 › search_notes', 600, 150);
 
   await page.locator('[data-role="save"]').click();
 
@@ -141,14 +141,14 @@ test('a flow, a block and an addon tool dropped from the palette survive save an
   const byName = Object.fromEntries(tasks.map((entry) => [entry.name, entry.task]));
   expect(byName[FLOW_NAME].flowId).toBeTruthy();
   expect(byName['Language model (LLM)'].implementation.Block.nodeType).toBe('llm');
-  const tool = byName.search_notes.implementation.AddonTool;
+  const tool = byName['Notes B3 › search_notes'].implementation.AddonTool;
   expect(tool.toolName).toBe('search_notes');
   expect(tool.addonId).toMatch(/^notes-/);
 
   await page.reload();
   await expect(page.locator('#sidebar, .sidebar, nav').first()).toBeVisible({ timeout: 15000 });
   await openDesigner(page, { login: false });
-  for (const label of [FLOW_NAME, 'Language model (LLM)', 'search_notes']) {
+  for (const label of [FLOW_NAME, 'Language model (LLM)', 'Notes B3 › search_notes']) {
     await expect(page.locator('.fb-canvas').getByText(label, { exact: true }).first()).toBeVisible({ timeout: 10000 });
   }
   expect(await stored()).toEqual(tasks);

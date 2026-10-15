@@ -4068,6 +4068,12 @@ impl AddonManager {
         self.registered_tools.write().push(tool);
     }
 
+    /// Installed names (`display_name`, else `name`) of the given instances;
+    /// an unknown instance is absent.
+    pub fn instance_labels(&self, addon_ids: &[String]) -> Result<std::collections::HashMap<String, String>> {
+        crate::db::repository::lookup_addon_names(&self.db, addon_ids)
+    }
+
     /// Hash of the bundle the operator approved for `addon_id`; empty when the
     /// instance has none recorded.
     pub fn installed_bundle_hash(&self, addon_id: &str) -> Result<String> {

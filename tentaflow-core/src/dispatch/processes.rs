@@ -205,7 +205,7 @@ fn options(ctx: &HandlerContext, actor: &ProcessActor) -> Result<P, ProtocolErro
         assignees,
         service_flows,
         service_blocks: service_block_options(),
-        service_tools: service_tool_options(executor, actor),
+        service_tools: service_tool_options(executor, actor)?,
     })
 }
 
@@ -213,7 +213,17 @@ fn options(ctx: &HandlerContext, actor: &ProcessActor) -> Result<P, ProtocolErro
 /// the stable addon/tool ordering; the Service task inspector still accepts any
 /// tool by identifier, so a cut hides a shortcut, not a capability.
 const MAX_TOOL_OPTIONS: usize = 1000;
+// Every entry is bounded by `MAX_OFFERED_TOOL_BYTES`, so the cap keeps the
+// catalogue within the share of a transport frame the simulation view also uses.
+const _: () = assert!(
+    MAX_TOOL_OPTIONS * crate::processes::tool_host::MAX_OFFERED_TOOL_BYTES
+        <= tentaflow_transport::MAX_FRAME_SIZE / 4 * 3
+);
 
+/// Blocks are offered without the per-user checks tools get: the requester is
+/// already the authenticated, active member this handler resolved, a block names
+/// no model until it is configured, and publication re-authorizes every block
+/// against the chosen model (`authorize_process_block`).
 fn service_block_options() -> Vec<ProcessOptionBlock> {
     crate::processes::blocks::allowed_block_types()
         .filter_map(|node_type| {
@@ -248,17 +258,20 @@ fn service_block_options() -> Vec<ProcessOptionBlock> {
 fn service_tool_options(
     executor: &FlowDispatcher,
     actor: &ProcessActor,
-) -> Vec<ProcessOptionTool> {
-    executor
+) -> Result<Vec<ProcessOptionTool>, ProtocolError> {
+    let offered = executor
         .offered_process_tools(&actor.user_id, &actor.org_id)
+        .map_err(|_| ProtocolError::internal("the addon tool catalogue is unavailable"))?;
+    Ok(offered
         .into_iter()
         .take(MAX_TOOL_OPTIONS)
         .map(|tool| ProcessOptionTool {
             addon_id: tool.addon_id,
             tool_name: tool.tool_name,
             description: tool.description,
+            addon_name: tool.addon_name,
         })
-        .collect()
+        .collect())
 }
 
 /// Mints the server-side pin of every Service task for publication. This is the
@@ -1959,7 +1972,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn options_offer_only_tools_the_host_authorizes_and_cap_the_list() {
+    async fn options_pass_the_host_catalogue_through_capped_and_empty_when_denied() {
         use crate::processes::tool_host::{test_support::ScriptedToolHost, OfferedTool};
         let state = AppState::for_test();
         let actor = test_support::actor(&state.db, "tool-option-author");
@@ -1970,6 +1983,7 @@ mod tests {
                 addon_id: "notes-1".into(),
                 tool_name: format!("tool-{index:04}"),
                 description: "Searches notes".into(),
+                addon_name: "Notes".into(),
             })
             .collect();
         dispatcher(&ctx).unwrap().set_process_tool_host(host.clone());
@@ -1981,6 +1995,7 @@ mod tests {
         assert_eq!(listed.len(), 1000);
         assert_eq!(listed[0].tool_name, "tool-0000");
         assert_eq!(listed[0].description, "Searches notes");
+        assert_eq!(listed[0].addon_name, "Notes");
 
         *host.allow.lock().unwrap() =
             Err(crate::processes::tool_host::ToolAccessError::PermissionDenied);
@@ -1998,10 +2013,17 @@ mod tests {
             addon_id: "notes-1".into(),
             tool_name: "search".into(),
             description: String::new(),
+            addon_name: String::new(),
         }];
         let executor = dispatcher(&ctx).unwrap();
         executor.set_process_tool_host(host);
-        assert_eq!(executor.offered_process_tools(&actor.user_id, &actor.org_id).len(), 1);
+        assert_eq!(
+            executor
+                .offered_process_tools(&actor.user_id, &actor.org_id)
+                .unwrap()
+                .len(),
+            1
+        );
         crate::db::repository::update_user_account(
             &state.db,
             &actor.user_id,
@@ -2010,7 +2032,35 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(executor.offered_process_tools(&actor.user_id, &actor.org_id).is_empty());
+        assert!(executor
+            .offered_process_tools(&actor.user_id, &actor.org_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_initiator_fails_the_tool_catalogue_instead_of_emptying_it() {
+        use crate::processes::tool_host::{test_support::ScriptedToolHost, ToolAccessError};
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "unreadable-tool-user");
+        let ctx = context(&state, &actor);
+        let executor = dispatcher(&ctx).unwrap();
+        executor.set_process_tool_host(ScriptedToolHost::new(serde_json::json!(null)));
+        assert!(!service_block_options().is_empty());
+        state
+            .db
+            .write()
+            .unwrap()
+            .execute_batch("ALTER TABLE org_memberships RENAME TO org_memberships_gone")
+            .unwrap();
+        assert_eq!(
+            executor
+                .offered_process_tools(&actor.user_id, &actor.org_id)
+                .unwrap_err(),
+            ToolAccessError::Unavailable
+        );
+        let failure = service_tool_options(executor, &actor).unwrap_err();
+        assert!(!failure.message.is_empty());
     }
 
     #[tokio::test]

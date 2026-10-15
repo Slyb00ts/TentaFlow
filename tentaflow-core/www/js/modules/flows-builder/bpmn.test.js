@@ -4695,33 +4695,39 @@ const tentaflowOptions = {
     { nodeType: 'llm', label: 'Language model (LLM)', description: 'Generates text', category: 'service' },
     { nodeType: 'pii_filter', label: 'Personal data filter', description: 'Masks personal data', category: 'filter' },
   ],
-  serviceTools: [{ addonId: 'notes-1a2b3c4d', toolName: 'search', description: 'Searches notes' }],
+  serviceTools: [
+    { addonId: 'notes-1a2b3c4d', toolName: 'search', description: 'Searches notes', addonName: 'Notes <b>A</b>' },
+    { addonId: 'notes-5e6f7a8b', toolName: 'search', description: 'Searches notes', addonName: 'Notes B' },
+  ],
 };
 
 test('TentaFlow palette group lists flows, blocks and addon tools as ready-made Service tasks', async () => {
   const templates = processTemplates(tentaflowOptions);
   assert.equal(processTemplates().length, 29);
-  assert.equal(templates.length, 29 + 1 + 2 + 1);
+  assert.equal(templates.length, 29 + 1 + 2 + 2);
   const dynamic = templates.filter((row) => row.category === 'tentaflow');
-  assert.deepEqual(dynamic.map((row) => row.subgroup), ['flows', 'blocks', 'blocks', 'tools']);
+  assert.deepEqual(dynamic.map((row) => row.subgroup), ['flows', 'blocks', 'blocks', 'tools', 'tools']);
   assert.ok(dynamic.every((row) => row.node_type === 'bpmn_service_task' && row.preset));
-  assert.deepEqual(dynamic.map((row) => row.label), ['Contract checker', 'Language model (LLM)', 'Personal data filter', 'search']);
+  assert.deepEqual(dynamic.map((row) => row.label), ['Contract checker', 'Language model (LLM)', 'Personal data filter', 'Notes <b>A</b> › search', 'Notes B › search']);
 
   const root = document.createElement('aside'); document.body.append(root);
   const palette = new FlowPalette(root, { mode: 'bpmn', processOptions: tentaflowOptions }); await palette.init();
   const group = root.querySelector('[data-cat="tentaflow"]');
   assert.ok(group);
   assert.deepEqual([...group.querySelectorAll('[data-subgroup]')].map((row) => row.dataset.subgroup), ['flows', 'blocks', 'tools']);
-  assert.equal(group.querySelectorAll('[data-node-type="bpmn_service_task"]').length, 4);
-  assert.equal(root.querySelectorAll('[data-node-type="bpmn_service_task"]').length, 5);
-  assert.match(group.textContent, /Searches notes|search/);
+  assert.equal(group.querySelectorAll('[data-node-type="bpmn_service_task"]').length, 5);
+  assert.equal(root.querySelectorAll('[data-node-type="bpmn_service_task"]').length, 6);
+  const toolNames = [...group.querySelectorAll('.fb-node-name')].map((row) => row.textContent).slice(-2);
+  assert.deepEqual(toolNames, ['Notes <b>A</b> › search', 'Notes B › search']);
+  assert.equal(group.querySelector('.fb-node-name b'), null, 'the addon name is escaped');
+  assert.match(group.textContent, /Searches notes/);
   palette.destroy();
 });
 
-test('TentaFlow palette group explains an unavailable or empty catalogue', async () => {
+test('TentaFlow palette group is absent without options and explains an empty catalogue', async () => {
   const unavailable = document.createElement('aside'); document.body.append(unavailable);
   const first = new FlowPalette(unavailable, { mode: 'bpmn' }); await first.init();
-  assert.ok(unavailable.querySelector('[data-role="tentaflow-unavailable"]'));
+  assert.equal(unavailable.querySelector('[data-cat="tentaflow"]'), null);
   assert.equal(unavailable.querySelectorAll('[data-node-type]').length, 29);
   first.destroy();
 
@@ -4729,8 +4735,7 @@ test('TentaFlow palette group explains an unavailable or empty catalogue', async
   const second = new FlowPalette(empty, { mode: 'bpmn', processOptions: { ...options, serviceFlows: [], serviceBlocks: [], serviceTools: [] } });
   await second.init();
   assert.equal(empty.querySelectorAll('[data-cat="tentaflow"] .fb-palette-note').length, 3);
-  assert.equal(empty.querySelector('[data-role="tentaflow-unavailable"]'), null);
-  second.destroy();
+    second.destroy();
 });
 
 test('dropping a TentaFlow entry creates a configured, named Service task without altering the plain element', () => {
@@ -4739,7 +4744,7 @@ test('dropping a TentaFlow entry creates a configured, named Service task withou
   graph.addNodeFromTemplate(find('Contract checker'), 200, 100);
   graph.addNodeFromTemplate(find('Language model (LLM)'), 200, 300);
   graph.addNodeFromTemplate(find('Personal data filter'), 200, 500);
-  graph.addNodeFromTemplate(find('search'), 200, 700);
+  graph.addNodeFromTemplate(find('Notes B › search'), 200, 700);
   graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 600, 100);
   const [flow, llm, pii, tool, plain] = graph.nodes.slice(-5);
   assert.equal(flow.label, 'Contract checker');
@@ -4747,7 +4752,8 @@ test('dropping a TentaFlow entry creates a configured, named Service task withou
   assert.equal(flow.config.implementation, undefined);
   assert.deepEqual(llm.config.implementation, { Block: { nodeType: 'llm', config: { model: '' } } });
   assert.deepEqual(pii.config.implementation, { Block: { nodeType: 'pii_filter', config: {} } });
-  assert.deepEqual(tool.config.implementation, { AddonTool: { addonId: 'notes-1a2b3c4d', toolName: 'search' } });
+  assert.equal(tool.label, 'Notes B › search');
+  assert.deepEqual(tool.config.implementation, { AddonTool: { addonId: 'notes-5e6f7a8b', toolName: 'search' } });
   assert.equal(tool.config.verification, 'Human');
   assert.equal(plain.label, '');
   assert.equal(plain.config.flowId, '');
@@ -4755,6 +4761,6 @@ test('dropping a TentaFlow entry creates a configured, named Service task withou
   assert.equal(graph.templates.get('bpmn_service_task').preset, undefined);
   const saved = graph.getData();
   const kinds = saved.nodes.filter((node) => node.kind.ServiceTask).map((node) => [node.name, node.kind.ServiceTask.implementation]);
-  assert.deepEqual(kinds.slice(-5).map(([name]) => name), ['Contract checker', 'Language model (LLM)', 'Personal data filter', 'search', '']);
+  assert.deepEqual(kinds.slice(-5).map(([name]) => name), ['Contract checker', 'Language model (LLM)', 'Personal data filter', 'Notes B › search', '']);
   graph.destroy();
 });

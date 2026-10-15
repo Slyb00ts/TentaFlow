@@ -65,7 +65,8 @@ function tentaflowTemplates(options) {
     localized(`bpmn.block_${block.nodeType}`, block.label),
     localized(`bpmn.block_${block.nodeType}_hint`, block.description),
     { implementation: { Block: { nodeType: block.nodeType, config: processBlockTemplate(block.nodeType) } } })),
-    ...(options.serviceTools || []).map((tool) => entry('tools', 'puzzle', tool.toolName,
+    ...(options.serviceTools || []).map((tool) => entry('tools', 'puzzle',
+      tool.addonName ? `${tool.addonName} › ${tool.toolName}` : tool.toolName,
       tool.description || tool.addonId,
       { implementation: { AddonTool: { addonId: tool.addonId, toolName: tool.toolName } } })),
   ];

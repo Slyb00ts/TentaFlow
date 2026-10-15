@@ -976,19 +976,28 @@ impl FlowDispatcher {
     }
 
     /// The addon tools `authorize_process_tool` would accept for this user,
-    /// decided with one initiator check and one addon decision per addon. Empty
-    /// when the initiator is not valid or no tool host is wired.
+    /// decided with one initiator check and one addon decision per addon. An
+    /// initiator who is no longer valid is offered nothing; a failed read is
+    /// `Unavailable`, never an empty catalogue, so the caller cannot mistake
+    /// "cannot tell now" for "no tools". No wired tool host means no tools.
     pub fn offered_process_tools(
         &self,
         user_id: &str,
         org_id: &str,
-    ) -> Vec<crate::processes::tool_host::OfferedTool> {
-        if self.check_process_initiator(user_id, org_id).is_err() {
-            return Vec::new();
+    ) -> std::result::Result<
+        Vec<crate::processes::tool_host::OfferedTool>,
+        crate::processes::tool_host::ToolAccessError,
+    > {
+        use crate::processes::tool_host::ToolAccessError;
+        match self.check_process_initiator(user_id, org_id) {
+            Ok(()) => {}
+            Err(ToolAccessError::Unavailable) => return Err(ToolAccessError::Unavailable),
+            Err(_) => return Ok(Vec::new()),
         }
-        self.process_tool_host()
+        Ok(self
+            .process_tool_host()
             .map(|host| host.offered_tools(user_id, org_id))
-            .unwrap_or_default()
+            .unwrap_or_default())
     }
 
     /// Pin of an addon tool for publication, shaped like a Flow snapshot: the
