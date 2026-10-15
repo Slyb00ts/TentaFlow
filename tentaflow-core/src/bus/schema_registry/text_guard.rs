@@ -60,7 +60,16 @@
 // (`[^\u0000-\u001F]` in a JSON pattern, `[^&#x7F;-&#x9F;]` in an XSD pattern,
 // the bytes of an Avro `bytes` default, `"\x00\x01"` in a proto2 default), none
 // of which can reorder or hide text on screen. A raw character is refused in
-// every position all the same.
+// every position all the same. Two kinds of position never show an escape decoded,
+// so an escape there is not refused (a raw character still is): a JSON `pattern`
+// value and `patternProperties` key, and the `value` of an XSD `xs:pattern`;
+// schemas that defend against a zero-width space or a BOM need to name it there.
+// An Avro `bytes` or `fixed` default cannot write the bytes 0x85 and 0xAD as
+// `\u0085` / `\u00AD`: those are refused like in any other JSON text. A Protobuf
+// string literal is decoded as UTF-8 only outside a `bytes` field's default, and
+// adjacent literals (`"\xE2" "\x80\xAE"`) are joined first, as the lexer does.
+// Known residual: an escape of a C0/C1 control below U+0100 passes in a key or a
+// name; the dashboard marks it, the server does not refuse it.
 // A refusal lists every place (raw characters and escapes together), at most
 // `MAX_REFUSED_PLACES` and a count of the rest, so one text is never refused twice.
 //
@@ -159,6 +168,9 @@ pub enum Syntax {
     /// Thrift: its lexer accepts only `\\ \" \' \n \r \t`, none of which can
     /// decode to a refused character.
     Thrift,
+    /// A stored row whose kind is not known: it is not read as any format, so no
+    /// escape is decoded (JSON rules would misread a .proto or XSD text).
+    Unknown,
 }
 
 /// What a kind needs `text_guard` to know about its text.
@@ -228,7 +240,8 @@ fn refused_hit(start: usize, end: usize, cp: u32, out: &mut Vec<EscapeHit>) {
     }
 }
 
-fn json_escapes(text: &str, out: &mut Vec<EscapeHit>) {
+/// The escapes of one JSON string's content (`base` = where it starts in the text).
+fn json_string_escapes(text: &str, base: usize, out: &mut Vec<EscapeHit>) {
     let b = text.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -253,29 +266,169 @@ fn json_escapes(text: &str, out: &mut Vec<EscapeHit>) {
         match low {
             Some(l) => {
                 refused_hit(
-                    i,
-                    i + 12,
+                    base + i,
+                    base + i + 12,
                     0x10000 + ((unit - 0xD800) << 10) + (l - 0xDC00),
                     out,
                 );
                 i += 12;
             }
             None => {
-                refused_hit(i, i + 6, unit, out);
+                refused_hit(base + i, base + i + 6, unit, out);
                 i += 6;
             }
         }
     }
 }
 
+/// Where the reader of a JSON text is inside it: enough to tell a regular
+/// expression (`pattern` value, `patternProperties` key) from a name or a value.
+struct JsonFrame {
+    object: bool,
+    expect_key: bool,
+    key: String,
+    pattern_properties: bool,
+}
+
+fn json_escapes(text: &str, out: &mut Vec<EscapeHit>) {
+    let b = text.as_bytes();
+    let mut stack: Vec<JsonFrame> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'{' | b'[' => {
+                let in_pattern_properties = stack
+                    .last()
+                    .is_some_and(|f| f.object && !f.expect_key && f.key == "patternProperties");
+                stack.push(JsonFrame {
+                    object: b[i] == b'{',
+                    expect_key: true,
+                    key: String::new(),
+                    pattern_properties: b[i] == b'{' && in_pattern_properties,
+                });
+                i += 1;
+            }
+            b'}' | b']' => {
+                stack.pop();
+                i += 1;
+            }
+            b',' => {
+                if let Some(f) = stack.last_mut().filter(|f| f.object) {
+                    f.expect_key = true;
+                }
+                i += 1;
+            }
+            b':' => {
+                if let Some(f) = stack.last_mut().filter(|f| f.object) {
+                    f.expect_key = false;
+                }
+                i += 1;
+            }
+            b'"' => {
+                let start = i + 1;
+                let mut end = start;
+                while end < b.len() && b[end] != b'"' {
+                    end += if b[end] == b'\\' { 2 } else { 1 };
+                }
+                let end = end.min(b.len());
+                let content = text.get(start..end).unwrap_or("");
+                let exempt = match stack.last_mut() {
+                    Some(f) if f.object && f.expect_key => {
+                        f.key = content.to_string();
+                        f.pattern_properties
+                    }
+                    Some(f) if f.object => f.key == "pattern",
+                    _ => false,
+                };
+                if !exempt {
+                    json_string_escapes(content, start, out);
+                }
+                i = end + 1;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+/// A numeric character reference at `i`: where it ends and what it names. Every
+/// digit counts (leading zeros do not hide a reference); a value too big for a
+/// code point names nothing.
+fn xml_reference(text: &str, i: usize, out: &mut Vec<EscapeHit>) -> Option<usize> {
+    let b = text.as_bytes();
+    if !text[i..].starts_with("&#") {
+        return None;
+    }
+    let hex = matches!(b.get(i + 2), Some(b'x' | b'X'));
+    let digits = i + if hex { 3 } else { 2 };
+    let len = b[digits.min(b.len())..]
+        .iter()
+        .take_while(|d| char::from(**d).is_digit(if hex { 16 } else { 10 }))
+        .count();
+    if len == 0 || b.get(digits + len) != Some(&b';') {
+        return None;
+    }
+    if let Ok(cp) = u32::from_str_radix(&text[digits..digits + len], if hex { 16 } else { 10 }) {
+        refused_hit(i, digits + len + 1, cp, out);
+    }
+    Some(digits + len + 1)
+}
+
+/// Whether the tag that starts at `open` (a `<`) is an `xs:pattern`, whose
+/// `value` is a regular expression and never shown decoded.
+fn is_pattern_tag(text: &str, open: usize) -> bool {
+    let name: String = text[open + 1..]
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, '>' | '/'))
+        .collect();
+    name == "pattern" || name.ends_with(":pattern")
+}
+
+/// The attribute name written just before the `=` that precedes the quote at `quote`.
+fn attribute_before(text: &str, quote: usize) -> &str {
+    let before = text[..quote].trim_end();
+    let before = before.strip_suffix('=').unwrap_or(before).trim_end();
+    let start = before
+        .rfind(|c: char| c.is_whitespace() || c == '<')
+        .map_or(0, |p| p + 1);
+    &before[start..]
+}
+
 fn xml_escapes(text: &str, out: &mut Vec<EscapeHit>) {
     let b = text.as_bytes();
     let mut i = 0;
+    let mut tag: Option<usize> = None;
+    let mut quote: Option<u8> = None;
+    let mut pattern_value = false;
     while i < b.len() {
         let Some(rest) = text.get(i..) else {
             i += 1;
             continue;
         };
+        if let Some(q) = quote {
+            if b[i] == q {
+                quote = None;
+                i += 1;
+            } else if !pattern_value {
+                i = xml_reference(text, i, out).unwrap_or(i + 1);
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(open) = tag {
+            match b[i] {
+                b'>' => tag = None,
+                q @ (b'"' | b'\'') => {
+                    quote = Some(q);
+                    pattern_value = is_pattern_tag(text, open) && attribute_before(text, i) == "value";
+                }
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        // Outside a tag a comment, CDATA section and processing instruction are
+        // not decoded; inside one (an attribute value) `<!--` is plain text.
         let skip_to = [("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>")]
             .into_iter()
             .find(|(open, _)| rest.starts_with(open))
@@ -286,26 +439,12 @@ fn xml_escapes(text: &str, out: &mut Vec<EscapeHit>) {
             });
         if let Some(end) = skip_to {
             i = end;
-            continue;
+        } else if b[i] == b'<' {
+            tag = Some(i);
+            i += 1;
+        } else {
+            i = xml_reference(text, i, out).unwrap_or(i + 1);
         }
-        if rest.starts_with("&#") {
-            let hex = matches!(b.get(i + 2), Some(b'x' | b'X'));
-            let digits = i + if hex { 3 } else { 2 };
-            let len = b[digits..]
-                .iter()
-                .take_while(|d| char::from(**d).is_digit(if hex { 16 } else { 10 }))
-                .count();
-            if len > 0 && b.get(digits + len) == Some(&b';') {
-                let value =
-                    u32::from_str_radix(&text[digits..digits + len], if hex { 16 } else { 10 });
-                if let Ok(cp) = value {
-                    refused_hit(i, digits + len + 1, cp, out);
-                }
-                i = digits + len + 1;
-                continue;
-            }
-        }
-        i += 1;
     }
 }
 
@@ -330,19 +469,73 @@ fn proto_escapes(text: &str, out: &mut Vec<EscapeHit>) {
         } else if rest.starts_with("/*") {
             i += rest[2..].find("*/").map_or(rest.len(), |p| p + 4);
         } else if b[i] == b'"' || b[i] == b'\'' {
-            i = proto_literal(text, i, out);
+            i = proto_run(text, i, out);
         } else {
             i += 1;
         }
     }
 }
 
-/// Reads one string literal from its opening quote and reports the refused
-/// characters its escapes decode to; returns where the literal ends.
-fn proto_literal(text: &str, open: usize, out: &mut Vec<EscapeHit>) -> usize {
+/// Where the next token starts after whitespace and comments.
+fn skip_blank(text: &str, mut i: usize) -> usize {
+    loop {
+        let rest = &text[i..];
+        let trimmed = rest.trim_start();
+        i += rest.len() - trimmed.len();
+        if trimmed.starts_with("//") {
+            i += trimmed.find('\n').map_or(trimmed.len(), |p| p + 1);
+        } else if trimmed.starts_with("/*") {
+            i += trimmed[2..].find("*/").map_or(trimmed.len(), |p| p + 4);
+        } else {
+            return i;
+        }
+    }
+}
+
+/// Whether the statement that holds the literal at `at` declares a `bytes`
+/// field (`optional bytes magic = 1 [default = "\xEF\xBB\xBF"]`): the type is the
+/// token before the field name, left of the first `=`. The default of such a
+/// field is bytes, not text, so it is not read as UTF-8.
+fn is_bytes_default(text: &str, at: usize) -> bool {
+    let before = &text[..at];
+    let start = before.rfind([';', '{', '}']).map_or(0, |p| p + 1);
+    let statement = &before[start..];
+    let head = statement.split('=').next().unwrap_or("");
+    let tokens: Vec<&str> = head
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
+        .filter(|t| !t.is_empty())
+        .collect();
+    statement.contains('=')
+        && tokens.len() >= 2
+        && tokens[tokens.len() - 2] == "bytes"
+}
+
+/// Reads the run of adjacent string literals that starts at `open`: the lexer
+/// joins them (blanks and comments between them are skipped) before it decodes
+/// UTF-8, so `"\xE2" "\x80\xAE"` is one character. Reports the refused
+/// characters their escapes decode to; returns where the run ends.
+fn proto_run(text: &str, open: usize, out: &mut Vec<EscapeHit>) -> usize {
+    let mut bytes: Vec<SourceByte> = Vec::new();
+    let mut at = open;
+    loop {
+        at = proto_literal_bytes(text, at, &mut bytes);
+        let next = skip_blank(text, at.min(text.len()));
+        if matches!(text.as_bytes().get(next), Some(b'"' | b'\'')) {
+            at = next;
+        } else {
+            break;
+        }
+    }
+    if !is_bytes_default(text, open) {
+        decode_proto_bytes(&bytes, out);
+    }
+    at
+}
+
+/// Appends the bytes one string literal decodes to; returns where it ends.
+fn proto_literal_bytes(text: &str, open: usize, bytes: &mut Vec<SourceByte>) -> usize {
     let b = text.as_bytes();
     let quote = b[open];
-    let mut bytes: Vec<SourceByte> = Vec::new();
     let mut i = open + 1;
     while i < b.len() && b[i] != quote && b[i] != b'\n' {
         if b[i] != b'\\' {
@@ -415,6 +608,12 @@ fn proto_literal(text: &str, open: usize, out: &mut Vec<EscapeHit>) -> usize {
         }
         i += len;
     }
+    i + 1
+}
+
+/// Groups the bytes of a joined run as UTF-8 and reports the refused characters
+/// some escape wrote. A group that is not valid UTF-8 is not text and passes.
+fn decode_proto_bytes(bytes: &[SourceByte], out: &mut Vec<EscapeHit>) {
     let mut at = 0;
     while at < bytes.len() {
         let lead = bytes[at].value;
@@ -439,7 +638,6 @@ fn proto_literal(text: &str, open: usize, out: &mut Vec<EscapeHit>) -> usize {
             _ => at += 1,
         }
     }
-    i + 1
 }
 
 /// Every refused character `text` writes as an escape, in order of appearance.
@@ -449,7 +647,7 @@ fn escape_hits(text: &str, syntax: Syntax) -> Vec<EscapeHit> {
         Syntax::Json => json_escapes(text, &mut out),
         Syntax::Xml => xml_escapes(text, &mut out),
         Syntax::Proto => proto_escapes(text, &mut out),
-        Syntax::Thrift => {}
+        Syntax::Thrift | Syntax::Unknown => {}
     }
     out
 }
@@ -915,6 +1113,7 @@ pub(super) fn hidden_spellings(revealed: &str, rules: TextRules) -> Spellings {
         Syntax::Xml => xml_spellings(revealed, &mut all),
         Syntax::Proto => idl_spellings(revealed, false, &mut all),
         Syntax::Thrift => idl_spellings(revealed, true, &mut all),
+        Syntax::Unknown => {}
     }
     let mut seen = BTreeSet::new();
     let unique: Vec<String> = all
@@ -1726,6 +1925,41 @@ mod tests {
             },
             Escaped {
                 kind: SchemaType::Protobuf,
+                bad: "syntax = \"proto3\";\noption java_package = \"a\\xE2\" '\\x80\\xAEb';\nmessage M { int32 a = 1; }\n",
+                ok: "syntax = \"proto3\";\noption java_package = \"a\" 'b';\nmessage M { int32 a = 1; }\n",
+                code: "U+202E",
+                needle: "\\xE2\" '\\x80\\xAE",
+            },
+            Escaped {
+                kind: SchemaType::Protobuf,
+                bad: "syntax = \"proto2\";\nmessage M { optional string a = 1 [default = \"\\xE2\" /*x*/ \"\\x80\\xAE\"]; }\n",
+                ok: "syntax = \"proto2\";\nmessage M { optional string a = 1 [default = \"x\" /*x*/ \"y\"]; }\n",
+                code: "U+202E",
+                needle: "\\xE2\" /*x*/ \"\\x80\\xAE",
+            },
+            Escaped {
+                kind: SchemaType::Protobuf,
+                bad: "syntax = \"proto2\";\nmessage M { optional string bytes = 1 [default = \"\\xE2\\x80\\xAE\"]; }\n",
+                ok: "syntax = \"proto2\";\nmessage M { optional string bytes = 1 [default = \"x\"]; }\n",
+                code: "U+202E",
+                needle: "\\xE2\\x80\\xAE",
+            },
+            Escaped {
+                kind: SchemaType::Xsd,
+                bad: "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:simpleType name=\"t\"><xs:restriction base=\"xs:string\"><xs:enumeration value=\"a<!--\"/><xs:enumeration value=\"&#x202E;x\"/><xs:enumeration value=\"-->\"/></xs:restriction></xs:simpleType><xs:element name=\"a\" type=\"t\"/></xs:schema>",
+                ok: "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:simpleType name=\"t\"><xs:restriction base=\"xs:string\"><xs:enumeration value=\"a<!--\"/><xs:enumeration value=\"x\"/><xs:enumeration value=\"-->\"/></xs:restriction></xs:simpleType><xs:element name=\"a\" type=\"t\"/></xs:schema>",
+                code: "U+202E",
+                needle: "&#x202E;",
+            },
+            Escaped {
+                kind: SchemaType::Xsd,
+                bad: "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:simpleType name=\"t\"><xs:restriction base=\"xs:string\"><xs:enumeration value=\"a<?\"/><xs:enumeration value=\"&#x202E;x\"/><xs:enumeration value=\"?>\"/></xs:restriction></xs:simpleType><xs:element name=\"a\" type=\"t\"/></xs:schema>",
+                ok: "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:simpleType name=\"t\"><xs:restriction base=\"xs:string\"><xs:enumeration value=\"a<?\"/><xs:enumeration value=\"x\"/><xs:enumeration value=\"?>\"/></xs:restriction></xs:simpleType><xs:element name=\"a\" type=\"t\"/></xs:schema>",
+                code: "U+202E",
+                needle: "&#x202E;",
+            },
+            Escaped {
+                kind: SchemaType::Protobuf,
                 bad: "syntax = \"proto3\";\noption java_package = \"a\\342\\200\\248b\";\nmessage M { int32 a = 1; }\n",
                 ok: "syntax = \"proto3\";\noption java_package = \"ab\";\nmessage M { int32 a = 1; }\n",
                 code: "U+2028",
@@ -1951,5 +2185,44 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(hidden_spellings(&text, TextRules::XML).shown.is_empty());
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_bytes_default_is_not_text_and_a_regular_expression_is_never_shown_decoded() {
+        let xsd = |element: &str| format!("{XSD_OPEN}<xs:simpleType name=\"t\"><xs:restriction base=\"xs:string\">{element}</xs:restriction></xs:simpleType><xs:element name=\"a\" type=\"t\"/></xs:schema>");
+        let ok = [
+            (SchemaType::Protobuf, "syntax = \"proto2\";\nmessage M { optional bytes magic = 1 [default = \"\\xEF\\xBB\\xBF\"]; }\n".to_string()),
+            (SchemaType::JsonSchema, "{\"type\":\"string\",\"pattern\":\"^[^\\u200B\\uFEFF\\u202E]*$\"}".to_string()),
+            (SchemaType::Xsd, xsd("<xs:pattern value=\"[^&#x200B;&#xFEFF;]*\"/>")),
+        ];
+        for (kind, text) in &ok {
+            assert!(compile(*kind, text).is_ok(), "{}: {text}: {:?}", kind.as_str(), compile(*kind, text));
+            // A stored version like this is compared and listed as clean.
+            let kept = kind.ops().check_compatibility_noting(text, text, Compatibility::Full).unwrap();
+            assert_eq!(kept.total, 0, "{text}");
+        }
+        // The compiler has no `patternProperties`, the screen still reads its keys as expressions.
+        let keys = "{\"patternProperties\":{\"^[^\\u200B]+$\":{}},\"x\":{\"a\\u200B\":1}}";
+        let hits = find_all_hidden(keys, TextRules::JSON);
+        assert_eq!(hits.len(), 1, "only the key outside patternProperties is refused");
+        // Raw characters stay refused there, and an escape anywhere else is refused.
+        let bad = [
+            (SchemaType::JsonSchema, "{\"type\":\"string\",\"pattern\":\"^[^\u{200B}]*$\"}".to_string()),
+            (SchemaType::JsonSchema, "{\"type\":\"string\",\"description\":\"\\u200B\"}".to_string()),
+            (SchemaType::JsonSchema, "{\"type\":\"object\",\"properties\":{\"a\\u200B\":{\"type\":\"string\"}}}".to_string()),
+            (SchemaType::Xsd, xsd("<xs:pattern value=\"[^\u{200B}]*\"/>")),
+            (SchemaType::Xsd, xsd("<xs:enumeration value=\"&#x200B;\"/>")),
+            (SchemaType::Xsd, xsd("<xs:pattern id=\"&#x200B;\" value=\"x\"/>")),
+        ];
+        for (kind, text) in &bad {
+            assert!(compile(*kind, text).is_err(), "{}: {text}", kind.as_str());
+        }
+    }
+
+    #[test]
+    fn an_unknown_kind_reads_no_escape() {
+        let unknown = TextRules { leading_bom: true, syntax: Syntax::Unknown };
+        assert!(find_hidden("option x = \"\\u202e\";", unknown).is_none());
+        assert!(find_hidden("a\u{202E}", unknown).is_some());
     }
 }

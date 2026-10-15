@@ -28,7 +28,7 @@ use crate::db::DbPool;
 
 use super::{
     bump_generation, content_hash, schema_ref_id_for, text_guard, Compatibility, SchemaError,
-    SchemaType, Spellings, TextRules, MAX_SCHEMA_TEXT_BYTES,
+    SchemaType, Spellings, Syntax, TextRules, MAX_SCHEMA_TEXT_BYTES,
 };
 
 /// Longest a subject name may be — mirrors `bus::topics::MAX_TOPIC_NAME_LEN`
@@ -945,14 +945,15 @@ pub fn scan_stored_hidden_characters(
         scanned += 1;
         // A version whose subject row is gone (or names a kind this build does
         // not know) has no format to ask: its leading BOM is not reported,
-        // because only an XSD may start with one and it cannot be told apart.
+        // because only an XSD may start with one, and no escape is read,
+        // because the escapes of one format are plain text in another.
         let rules = row
             .schema_type
             .and_then(SchemaType::parse)
             .map_or(
                 TextRules {
                     leading_bom: true,
-                    ..TextRules::JSON
+                    syntax: Syntax::Unknown,
                 },
                 |kind| kind.ops().text_rules(),
             );
@@ -2111,6 +2112,26 @@ mod tests {
         register_text(&db, "invoice", SchemaType::Xsd, XSD_WITH_BOM).unwrap();
         let (scanned, found) = scan_stored_hidden_characters(&db).unwrap();
         assert_eq!((scanned, found.len()), (2, 0));
+    }
+
+    #[test]
+    fn the_startup_scan_reads_no_escape_in_a_row_of_an_unknown_kind() {
+        let db = fresh_db();
+        register_text(&db, "orphan", SchemaType::JsonSchema, V1).unwrap();
+        plant(&db, "orphan", "message M { string a = 1 [default = \"\\u202e\"]; }");
+        register_text(&db, "orphan-raw", SchemaType::JsonSchema, V1).unwrap();
+        plant(&db, "orphan-raw", "message M { string a\u{202E} = 1; }");
+        db.write()
+            .unwrap()
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF; \
+                 DELETE FROM bus_schema_subjects WHERE subject IN ('orphan', 'orphan-raw'); \
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+        let (scanned, found) = scan_stored_hidden_characters(&db).unwrap();
+        assert_eq!(scanned, 2);
+        assert_eq!(found.iter().map(|f| f.subject.as_str()).collect::<Vec<_>>(), ["orphan-raw"]);
     }
 
     const ESCAPED_CONTROLS: &str = "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\",\"pattern\":\"^[^\\u0000-\\u001F]*$\"}}}";
