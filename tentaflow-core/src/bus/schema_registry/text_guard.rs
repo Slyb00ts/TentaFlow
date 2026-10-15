@@ -60,16 +60,21 @@
 // (`[^\u0000-\u001F]` in a JSON pattern, `[^&#x7F;-&#x9F;]` in an XSD pattern,
 // the bytes of an Avro `bytes` default, `"\x00\x01"` in a proto2 default), none
 // of which can reorder or hide text on screen. A raw character is refused in
-// every position all the same. Two kinds of position never show an escape decoded,
-// so an escape there is not refused (a raw character still is): a JSON `pattern`
-// value and `patternProperties` key, and the `value` of an XSD `xs:pattern`;
-// schemas that defend against a zero-width space or a BOM need to name it there.
+// every position all the same. One position is exempt from escapes (a raw
+// character is still refused there): the `value` of an XSD `xs:pattern`, because
+// XSD regular expressions have no `\u` escape and a schema that defends against a
+// zero-width space or a BOM can only name it as a reference. The element is matched
+// by its local name, whatever namespace its prefix is bound to; that is a known
+// residual. JSON has no such exemption: a schema that relies on a decoded
+// zero-width space in a `pattern` must write `\\u200B` (a backslash-escaped escape,
+// which the regular expression engine reads as the character).
 // An Avro `bytes` or `fixed` default cannot write the bytes 0x85 and 0xAD as
-// `\u0085` / `\u00AD`: those are refused like in any other JSON text. A Protobuf
-// string literal is decoded as UTF-8 only outside a `bytes` field's default, and
-// adjacent literals (`"\xE2" "\x80\xAE"`) are joined first, as the lexer does.
-// Known residual: an escape of a C0/C1 control below U+0100 passes in a key or a
-// name; the dashboard marks it, the server does not refuse it.
+// `\u0085` / `\u00AD`: those are refused like in any other JSON text. Every
+// Protobuf string literal, a `bytes` default included, is decoded as UTF-8 where its
+// bytes form valid text (a `bytes` default of `"\x00\x01"` is below U+0100 and
+// passes), and adjacent literals (`"\xE2" "\x80\xAE"`) are joined first, as the
+// lexer does. Known residual: an escape of a C0/C1 control below U+0100 passes in a
+// key or a name; the dashboard marks it, the server does not refuse it.
 // A refusal lists every place (raw characters and escapes together), at most
 // `MAX_REFUSED_PLACES` and a count of the rest, so one text is never refused twice.
 //
@@ -240,8 +245,7 @@ fn refused_hit(start: usize, end: usize, cp: u32, out: &mut Vec<EscapeHit>) {
     }
 }
 
-/// The escapes of one JSON string's content (`base` = where it starts in the text).
-fn json_string_escapes(text: &str, base: usize, out: &mut Vec<EscapeHit>) {
+fn json_escapes(text: &str, out: &mut Vec<EscapeHit>) {
     let b = text.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -266,86 +270,17 @@ fn json_string_escapes(text: &str, base: usize, out: &mut Vec<EscapeHit>) {
         match low {
             Some(l) => {
                 refused_hit(
-                    base + i,
-                    base + i + 12,
+                    i,
+                    i + 12,
                     0x10000 + ((unit - 0xD800) << 10) + (l - 0xDC00),
                     out,
                 );
                 i += 12;
             }
             None => {
-                refused_hit(base + i, base + i + 6, unit, out);
+                refused_hit(i, i + 6, unit, out);
                 i += 6;
             }
-        }
-    }
-}
-
-/// Where the reader of a JSON text is inside it: enough to tell a regular
-/// expression (`pattern` value, `patternProperties` key) from a name or a value.
-struct JsonFrame {
-    object: bool,
-    expect_key: bool,
-    key: String,
-    pattern_properties: bool,
-}
-
-fn json_escapes(text: &str, out: &mut Vec<EscapeHit>) {
-    let b = text.as_bytes();
-    let mut stack: Vec<JsonFrame> = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'{' | b'[' => {
-                let in_pattern_properties = stack
-                    .last()
-                    .is_some_and(|f| f.object && !f.expect_key && f.key == "patternProperties");
-                stack.push(JsonFrame {
-                    object: b[i] == b'{',
-                    expect_key: true,
-                    key: String::new(),
-                    pattern_properties: b[i] == b'{' && in_pattern_properties,
-                });
-                i += 1;
-            }
-            b'}' | b']' => {
-                stack.pop();
-                i += 1;
-            }
-            b',' => {
-                if let Some(f) = stack.last_mut().filter(|f| f.object) {
-                    f.expect_key = true;
-                }
-                i += 1;
-            }
-            b':' => {
-                if let Some(f) = stack.last_mut().filter(|f| f.object) {
-                    f.expect_key = false;
-                }
-                i += 1;
-            }
-            b'"' => {
-                let start = i + 1;
-                let mut end = start;
-                while end < b.len() && b[end] != b'"' {
-                    end += if b[end] == b'\\' { 2 } else { 1 };
-                }
-                let end = end.min(b.len());
-                let content = text.get(start..end).unwrap_or("");
-                let exempt = match stack.last_mut() {
-                    Some(f) if f.object && f.expect_key => {
-                        f.key = content.to_string();
-                        f.pattern_properties
-                    }
-                    Some(f) if f.object => f.key == "pattern",
-                    _ => false,
-                };
-                if !exempt {
-                    json_string_escapes(content, start, out);
-                }
-                i = end + 1;
-            }
-            _ => i += 1,
         }
     }
 }
@@ -492,24 +427,6 @@ fn skip_blank(text: &str, mut i: usize) -> usize {
     }
 }
 
-/// Whether the statement that holds the literal at `at` declares a `bytes`
-/// field (`optional bytes magic = 1 [default = "\xEF\xBB\xBF"]`): the type is the
-/// token before the field name, left of the first `=`. The default of such a
-/// field is bytes, not text, so it is not read as UTF-8.
-fn is_bytes_default(text: &str, at: usize) -> bool {
-    let before = &text[..at];
-    let start = before.rfind([';', '{', '}']).map_or(0, |p| p + 1);
-    let statement = &before[start..];
-    let head = statement.split('=').next().unwrap_or("");
-    let tokens: Vec<&str> = head
-        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
-        .filter(|t| !t.is_empty())
-        .collect();
-    statement.contains('=')
-        && tokens.len() >= 2
-        && tokens[tokens.len() - 2] == "bytes"
-}
-
 /// Reads the run of adjacent string literals that starts at `open`: the lexer
 /// joins them (blanks and comments between them are skipped) before it decodes
 /// UTF-8, so `"\xE2" "\x80\xAE"` is one character. Reports the refused
@@ -526,9 +443,7 @@ fn proto_run(text: &str, open: usize, out: &mut Vec<EscapeHit>) -> usize {
             break;
         }
     }
-    if !is_bytes_default(text, open) {
-        decode_proto_bytes(&bytes, out);
-    }
+    decode_proto_bytes(&bytes, out);
     at
 }
 
@@ -2188,34 +2103,62 @@ mod tests {
     }
 
     #[test]
-    fn a_bytes_default_is_not_text_and_a_regular_expression_is_never_shown_decoded() {
-        let xsd = |element: &str| format!("{XSD_OPEN}<xs:simpleType name=\"t\"><xs:restriction base=\"xs:string\">{element}</xs:restriction></xs:simpleType><xs:element name=\"a\" type=\"t\"/></xs:schema>");
-        let ok = [
-            (SchemaType::Protobuf, "syntax = \"proto2\";\nmessage M { optional bytes magic = 1 [default = \"\\xEF\\xBB\\xBF\"]; }\n".to_string()),
-            (SchemaType::JsonSchema, "{\"type\":\"string\",\"pattern\":\"^[^\\u200B\\uFEFF\\u202E]*$\"}".to_string()),
-            (SchemaType::Xsd, xsd("<xs:pattern value=\"[^&#x200B;&#xFEFF;]*\"/>")),
-        ];
-        for (kind, text) in &ok {
-            assert!(compile(*kind, text).is_ok(), "{}: {text}: {:?}", kind.as_str(), compile(*kind, text));
-            // A stored version like this is compared and listed as clean.
-            let kept = kind.ops().check_compatibility_noting(text, text, Compatibility::Full).unwrap();
-            assert_eq!(kept.total, 0, "{text}");
+    fn a_protobuf_bytes_default_passes_below_u0100_and_nothing_hides_a_refused_character_behind_the_word_bytes() {
+        let ok = "syntax = \"proto2\";\nmessage M { optional bytes magic = 1 [default = \"\\x00\\x01\"]; }\n";
+        assert!(compile(SchemaType::Protobuf, ok).is_ok(), "{:?}", compile(SchemaType::Protobuf, ok));
+        let rlo = "\\xE2\\x80\\xAE";
+        for statement in [
+            format!("bytes b = 1 [json_name = \"{rlo}\"];"),
+            format!("map<string, bytes> m = 1 [json_name = \"{rlo}\"];"),
+            format!("// bytes\n  optional string s = 1 [default = \"{rlo}\"];"),
+            format!("optional string s = 1 [default = \"a;bytes b=\"]; optional string t = 2 [default = \"{rlo}\"];"),
+            format!("optional bytes b = 1 [default = \"{rlo}\"];"),
+        ] {
+            let text = format!("syntax = \"proto2\";\nmessage M {{ {statement} }}\n");
+            let message = compile(SchemaType::Protobuf, &text).unwrap_err().to_string();
+            assert!(message.contains("U+202E") && message.ends_with(WRITTEN_AS_ESCAPE), "{statement}: {message}");
         }
-        // The compiler has no `patternProperties`, the screen still reads its keys as expressions.
-        let keys = "{\"patternProperties\":{\"^[^\\u200B]+$\":{}},\"x\":{\"a\\u200B\":1}}";
-        let hits = find_all_hidden(keys, TextRules::JSON);
-        assert_eq!(hits.len(), 1, "only the key outside patternProperties is refused");
-        // Raw characters stay refused there, and an escape anywhere else is refused.
-        let bad = [
-            (SchemaType::JsonSchema, "{\"type\":\"string\",\"pattern\":\"^[^\u{200B}]*$\"}".to_string()),
-            (SchemaType::JsonSchema, "{\"type\":\"string\",\"description\":\"\\u200B\"}".to_string()),
-            (SchemaType::JsonSchema, "{\"type\":\"object\",\"properties\":{\"a\\u200B\":{\"type\":\"string\"}}}".to_string()),
-            (SchemaType::Xsd, xsd("<xs:pattern value=\"[^\u{200B}]*\"/>")),
-            (SchemaType::Xsd, xsd("<xs:enumeration value=\"&#x200B;\"/>")),
-            (SchemaType::Xsd, xsd("<xs:pattern id=\"&#x200B;\" value=\"x\"/>")),
-        ];
-        for (kind, text) in &bad {
-            assert!(compile(*kind, text).is_err(), "{}: {text}", kind.as_str());
+    }
+
+    #[test]
+    fn json_has_no_exemption_for_a_member_called_pattern_and_a_regex_level_escape_passes() {
+        let rlo = "\\u202E";
+        for (kind, text) in [
+            (SchemaType::JsonSchema, format!("{{\"const\":{{\"pattern\":\"pac{rlo}jent\"}}}}")),
+            (SchemaType::JsonSchema, format!("{{\"type\":\"string\",\"pattern\":\"^[^{rlo}]*$\"}}")),
+            (SchemaType::JsonSchema, format!("{{\"patternProperties\":{{\"^[^{rlo}]+$\":{{}}}}}}")),
+            (SchemaType::JsonSchema, format!("{{\"type\":\"object\",\"properties\":{{\"patternProperties\":{{\"type\":\"string\",\"description\":\"{rlo}\"}}}}}}")),
+            (SchemaType::Avro, format!("{{\"type\":\"record\",\"name\":\"R\",\"fields\":[{{\"name\":\"pattern\",\"type\":\"string\",\"default\":\"a{rlo}\"}}]}}")),
+        ] {
+            let message = compile(kind, &text).unwrap_err().to_string();
+            assert!(message.contains("U+202E") && message.ends_with(WRITTEN_AS_ESCAPE), "{}: {text}: {message}", kind.as_str());
+        }
+        // A raw character is refused there as before; `\\u200B` is a backslash and four letters to the JSON
+        // reader and the zero-width space to the regular expression engine.
+        let raw = "{\"type\":\"string\",\"pattern\":\"^[^\u{200B}]*$\"}";
+        assert!(compile(SchemaType::JsonSchema, raw).is_err());
+        let regex_level = "{\"type\":\"string\",\"pattern\":\"^[^\\\\u200B]*$\"}";
+        assert!(compile(SchemaType::JsonSchema, regex_level).is_ok(), "{:?}", compile(SchemaType::JsonSchema, regex_level));
+        let kept = SchemaType::JsonSchema
+            .ops()
+            .check_compatibility_noting(regex_level, regex_level, Compatibility::Full)
+            .unwrap();
+        assert_eq!(kept.total, 0);
+    }
+
+    #[test]
+    fn an_xsd_pattern_value_is_not_decoded_and_nothing_else_is() {
+        let xsd = |element: &str| format!("{XSD_OPEN}<xs:simpleType name=\"t\"><xs:restriction base=\"xs:string\">{element}</xs:restriction></xs:simpleType><xs:element name=\"a\" type=\"t\"/></xs:schema>");
+        let ok = xsd("<xs:pattern value=\"[^&#x200B;&#xFEFF;]*\"/>");
+        assert!(compile(SchemaType::Xsd, &ok).is_ok(), "{:?}", compile(SchemaType::Xsd, &ok));
+        let kept = SchemaType::Xsd.ops().check_compatibility_noting(&ok, &ok, Compatibility::Full).unwrap();
+        assert_eq!(kept.total, 0);
+        for text in [
+            xsd("<xs:pattern value=\"[^\u{200B}]*\"/>"),
+            xsd("<xs:enumeration value=\"&#x200B;\"/>"),
+            xsd("<xs:pattern id=\"&#x200B;\" value=\"x\"/>"),
+        ] {
+            assert!(compile(SchemaType::Xsd, &text).is_err(), "{text}");
         }
     }
 

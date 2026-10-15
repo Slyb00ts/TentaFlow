@@ -912,6 +912,8 @@ pub struct StoredHiddenCharacter {
     pub name: &'static str,
     pub line: usize,
     pub column: usize,
+    /// Written as an escape sequence, not as the character itself.
+    pub escape: bool,
 }
 
 impl StoredHiddenCharacter {
@@ -920,7 +922,7 @@ impl StoredHiddenCharacter {
         format!(
             "TentaBus: stored schema version has a hidden character and will not compile; \
              register a corrected version: instance={} org={} subject={} version={} \
-             character={} ({}) line={} column={}",
+             character={} ({}) line={} column={}{}",
             self.instance_id,
             self.org_id,
             self.subject,
@@ -928,7 +930,8 @@ impl StoredHiddenCharacter {
             self.code_point,
             self.name,
             self.line,
-            self.column
+            self.column,
+            if self.escape { text_guard::WRITTEN_AS_ESCAPE } else { "" }
         )
     }
 }
@@ -967,6 +970,7 @@ pub fn scan_stored_hidden_characters(
                 name: hit.name,
                 line: hit.line,
                 column: hit.column,
+                escape: hit.escape,
             });
         }
     })?;
@@ -2112,6 +2116,21 @@ mod tests {
         register_text(&db, "invoice", SchemaType::Xsd, XSD_WITH_BOM).unwrap();
         let (scanned, found) = scan_stored_hidden_characters(&db).unwrap();
         assert_eq!((scanned, found.len()), (2, 0));
+    }
+
+    #[test]
+    fn the_startup_log_says_when_the_character_is_written_as_an_escape() {
+        let db = fresh_db();
+        register_text(&db, "escaped", SchemaType::JsonSchema, V1).unwrap();
+        plant(&db, "escaped", "{\"description\":\"x\\u202Ey\"}");
+        let (_, found) = scan_stored_hidden_characters(&db).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(found[0].escape);
+        assert!(
+            found[0].log_line().ends_with("column=18 (written as an escape sequence)"),
+            "{}",
+            found[0].log_line()
+        );
     }
 
     #[test]
