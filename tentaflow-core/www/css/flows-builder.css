@@ -269,16 +269,17 @@
 .fb-palette-cat-header svg { width: 14px; height: 14px; transition: transform 0.22s; }
 .fb-palette-category.collapsed .fb-palette-cat-header svg { transform: rotate(-90deg); }
 .fb-palette-category.collapsed .fb-palette-items { display: none; }
+/* --tf-text-3 measures 4.0:1 on the palette background; --tf-text-2 is 11:1. */
 .fb-palette-subgroup {
   padding: 6px 10px 2px;
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
-  color: var(--tf-text-3, #6a7196);
+  color: var(--tf-text-2, #c1c5e0);
 }
 .fb-palette-note {
   padding: 4px 10px 8px;
   font-size: 11px;
-  color: var(--tf-text-3, #6a7196);
+  color: var(--tf-text-2, #c1c5e0);
 }
 
 .fb-palette-items {
@@ -337,14 +338,24 @@
   color: var(--tf-text, #f5f6ff);
   line-height: 1.2;
 }
+/* Names and descriptions of dropped-in flows and addon tools are
+   user-authored and unbounded; two lines each, the full text is the row title. */
+.fb-node-name,
+.fb-node-desc {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  overflow-wrap: anywhere;
+}
+.fb-node-name { -webkit-line-clamp: 2; line-clamp: 2; }
 .fb-node-desc {
   font-size: 11px;
   color: var(--tf-text-3, #6a7196);
   line-height: 1.4;
   margin-top: 2px;
-  white-space: normal;
-  overflow: visible;
-  text-overflow: clip;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
 }
 .fb-palette-empty {
   text-align: center;

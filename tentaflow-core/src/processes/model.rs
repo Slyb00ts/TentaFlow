@@ -3375,6 +3375,19 @@ mod tests {
     use tentaflow_protocol::processes::{ProcessLinkEventDefinition, ProcessMultiInstanceMode};
 
     #[test]
+    fn node_names_are_bounded_in_bytes_and_free_of_control_characters() {
+        let named = |name: &str| {
+            let mut model = starter_model();
+            model.nodes[0].name = name.to_owned();
+            validate_model(&model)
+        };
+        // The designer cuts palette labels to this boundary on a character.
+        assert!(named(&"ż".repeat(128)).is_ok());
+        assert!(named(&format!("{}x", "ż".repeat(128))).is_err());
+        assert!(named("Notes\u{0}\u{7f} › search").is_err());
+    }
+
+    #[test]
     fn coordinator_and_ordinal_outputs_cannot_claim_the_same_parent_binding() {
         use tentaflow_protocol::processes::{ProcessActivityIo, ProcessCoordinatorOutputIo,
             ProcessDataObjectReference, ProcessIoDataOutput, ProcessOutputAssociation};

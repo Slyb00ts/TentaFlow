@@ -88,7 +88,7 @@ export class FlowPalette {
       clearTimeout(this._filterTimer);
       this._filterTimer = setTimeout(() => {
         if (this._disposed || !this.root.isConnected) return;
-        this.filter = (e.detail.value || '').toLowerCase();
+        this.filter = (e.detail.value || '').trim().toLowerCase();
         this._render();
       }, 120);
     });
@@ -176,7 +176,7 @@ export class FlowPalette {
     }
 
     let html = '';
-    for (const cat of this.mode === 'bpmn' ? ['events', 'tasks', 'tentaflow', 'gateways'] : CATEGORY_ORDER) {
+    for (const cat of this.mode === 'bpmn' ? ['tentaflow', 'events', 'tasks', 'gateways'] : CATEGORY_ORDER) {
       const items = groups[cat] || [];
       // The TentaFlow group stays visible without a filter so an empty catalogue
       // is explained; the designer opens only once the options are loaded.
@@ -210,16 +210,26 @@ export class FlowPalette {
     this.listEl.querySelectorAll('.fb-node-item').forEach((el) => {
       el.addEventListener('pointerdown', (ev) => this._onPointerDown(ev, el));
       el.addEventListener('click', (ev) => {
-        if (!this.readOnly && ev.detail === 0) this.opts.onAdd?.(this.templates[Number(el.dataset.index)]);
+        if (this.readOnly || ev.detail !== 0) return;
+        const index = el.dataset.index;
+        this.opts.onAdd?.(this.templates[Number(index)]);
+        this._restoreFocus(index);
       });
     });
+  }
+
+  // Adding a node re-renders the palette, which drops the focused row; a
+  // keyboard user would restart from the top of the list for every add.
+  _restoreFocus(index) {
+    if (this._disposed || !this.root.isConnected || this.root.contains(document.activeElement)) return;
+    this.listEl.querySelector(`.fb-node-item[data-index="${index}"] button`)?.focus();
   }
 
   _renderTentaflowItems(items) {
     return TENTAFLOW_SUBGROUPS.map((subgroup) => {
       const rows = items.filter((it) => it.tpl.subgroup === subgroup);
       if (rows.length === 0 && this.filter) return '';
-      return `<div class="fb-palette-subgroup" data-subgroup="${subgroup}">${escapeHtml(I18n.t(`bpmn.palette_${subgroup}`))}</div>
+      return `<div class="fb-palette-subgroup" data-subgroup="${subgroup}" role="heading" aria-level="3">${escapeHtml(I18n.t(`bpmn.palette_${subgroup}`))}</div>
         ${rows.length === 0
     ? `<div class="fb-palette-note">${escapeHtml(I18n.t('bpmn.palette_group_empty'))}</div>`
     : rows.map((it) => this._renderItem(it.tpl, it.index)).join('')}`;
@@ -233,7 +243,7 @@ export class FlowPalette {
     const name = this._nameOf(tpl);
     const desc = this._descOf(tpl);
     return `
-      <tf-button variant="ghost" wrap class="fb-node-item" data-index="${index}" data-node-type="${escapeAttr(tpl.node_type)}" title="${escapeAttr(desc || name)}" ${this.readOnly ? 'disabled' : ''} style="--node-color: var(${varName})">
+      <tf-button variant="ghost" wrap class="fb-node-item" data-index="${index}" data-node-type="${escapeAttr(tpl.node_type)}" title="${escapeAttr(desc ? `${name}\n${desc}` : name)}" ${this.readOnly ? 'disabled' : ''} style="--node-color: var(${varName})">
         <div class="fb-node-icon"><svg><use href="#i-${iconId}"/></svg></div>
         <div class="fb-node-info">
           <div class="fb-node-name">${escapeHtml(name)}</div>

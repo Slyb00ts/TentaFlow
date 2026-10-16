@@ -27,7 +27,7 @@ const { emptyProcessModel, processToCanvas, canvasToProcess, cloneProcessBody, p
 const { FlowCanvas } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
-const { processTemplates } = await import('./bpmn.js');
+const { processTemplates, boundedNodeName } = await import('./bpmn.js');
 const { openProcessCalendar, openProcessInstance, openProcessInstances, openProcessMessageDetail, openProcessMessageSend, openProcessRun, openProcessSchedule, processEventText, processLifecycleReasonText, processTimerText } = await import('./process-monitor.js');
 const { simulationWindow } = await import('./process-simulation.js');
 const { default: builder } = await import('../flows-builder.js');
@@ -4735,7 +4735,7 @@ test('TentaFlow palette group is absent without options and explains an empty ca
   const second = new FlowPalette(empty, { mode: 'bpmn', processOptions: { ...options, serviceFlows: [], serviceBlocks: [], serviceTools: [] } });
   await second.init();
   assert.equal(empty.querySelectorAll('[data-cat="tentaflow"] .fb-palette-note').length, 3);
-    second.destroy();
+  second.destroy();
 });
 
 test('dropping a TentaFlow entry creates a configured, named Service task without altering the plain element', () => {
@@ -4762,5 +4762,104 @@ test('dropping a TentaFlow entry creates a configured, named Service task withou
   const saved = graph.getData();
   const kinds = saved.nodes.filter((node) => node.kind.ServiceTask).map((node) => [node.name, node.kind.ServiceTask.implementation]);
   assert.deepEqual(kinds.slice(-5).map(([name]) => name), ['Contract checker', 'Language model (LLM)', 'Personal data filter', 'Notes B › search', '']);
+  graph.destroy();
+});
+
+const utf8Bytes = (text) => new TextEncoder().encode(text).length;
+const validNodeName = (name) => utf8Bytes(name) <= 256 && !/[\u0000-\u001f\u007f-\u009f]/.test(name);
+
+test('a palette tool label stays a valid node name for a long, multibyte or control-laden addon name', () => {
+  const hostile = `${'Ż'.repeat(400)}\u0000\u0007`;
+  const templates = processTemplates({ ...options, serviceTools: [
+    { addonId: 'notes-1', toolName: 'search', description: '', addonName: hostile },
+    { addonId: 'notes-2', toolName: 't'.repeat(128), description: '', addonName: `😀\n${'x'.repeat(600)}` },
+  ] });
+  const labels = templates.filter((row) => row.subgroup === 'tools').map((row) => row.label);
+  assert.equal(labels.length, 2);
+  for (const label of labels) assert.ok(validNodeName(label), `${label.length} chars, ${utf8Bytes(label)} bytes`);
+  assert.ok(labels[0].endsWith(' › search'), 'the tool name survives the cut');
+  assert.ok(labels[1].endsWith(`› ${'t'.repeat(128)}`));
+  assert.equal(boundedNodeName('ab\u0001cd'), 'ab cd');
+  assert.equal(utf8Bytes(boundedNodeName('ż'.repeat(200))), 256);
+
+  const graph = canvas(); graph.setTemplates(templates);
+  graph.addNodeFromTemplate(templates.find((row) => row.label === labels[0]), 300, 300);
+  const stored = graph.getData().nodes.find((node) => node.kind.ServiceTask?.implementation?.AddonTool);
+  assert.ok(validNodeName(stored.name));
+  graph.destroy();
+});
+
+test('two instances that read the same get their instance id in the label', () => {
+  const templates = processTemplates({ ...options, serviceTools: [
+    { addonId: 'notes-aaaa', toolName: 'search', description: '', addonName: 'Notes' },
+    { addonId: 'notes-bbbb', toolName: 'search', description: '', addonName: 'Notes' },
+    { addonId: 'wiki-cccc', toolName: 'search', description: '', addonName: 'Wiki' },
+  ] });
+  assert.deepEqual(templates.filter((row) => row.subgroup === 'tools').map((row) => row.label),
+    ['Notes › search (notes-aaaa)', 'Notes › search (notes-bbbb)', 'Wiki › search']);
+});
+
+test('a flow row shows the flow description and falls back to the generic hint', () => {
+  const templates = processTemplates({ ...options, serviceFlows: [
+    { flowId: 'a', name: 'Checker', description: 'Checks contracts for missing clauses' },
+    { flowId: 'b', name: 'Plain', description: '' },
+  ] });
+  const [described, plain] = templates.filter((row) => row.subgroup === 'flows');
+  assert.equal(described.description, 'Checks contracts for missing clauses');
+  assert.equal(plain.description, I18n.t('bpmn.palette_flow_hint'));
+});
+
+test('palette lists the TentaFlow group first, labels its subgroups and trims the search', async () => {
+  const root = document.createElement('aside'); document.body.append(root);
+  const palette = new FlowPalette(root, { mode: 'bpmn', processOptions: tentaflowOptions }); await palette.init();
+  assert.equal(root.querySelector('.fb-palette-category').dataset.cat, 'tentaflow');
+  for (const heading of root.querySelectorAll('.fb-palette-subgroup')) {
+    assert.equal(heading.getAttribute('role'), 'heading');
+    assert.ok(Number(heading.getAttribute('aria-level')) > 0);
+  }
+  const shown = () => root.querySelectorAll('.fb-node-item').length;
+  const all = shown();
+  const search = root.querySelector('tf-searchbox');
+  search.dispatchEvent(new window.CustomEvent('search', { detail: { value: ' ' } }));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(shown(), all, 'a lone space filters nothing');
+  search.dispatchEvent(new window.CustomEvent('search', { detail: { value: '  contract  ' } }));
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(shown(), 1);
+  palette.destroy();
+});
+
+test('row title carries the full name and description for clamped rows', async () => {
+  const root = document.createElement('aside'); document.body.append(root);
+  const palette = new FlowPalette(root, { mode: 'bpmn', processOptions: tentaflowOptions }); await palette.init();
+  const row = root.querySelector('.fb-node-item[data-node-type="bpmn_service_task"]');
+  assert.match(row.getAttribute('title'), /Contract checker\n/);
+  palette.destroy();
+});
+
+test('keyboard add keeps focus on the palette row after the palette re-renders', async () => {
+  const root = document.createElement('aside'); document.body.append(root);
+  let palette;
+  palette = new FlowPalette(root, { mode: 'bpmn', processOptions: tentaflowOptions, onAdd: () => palette._render() });
+  await palette.init();
+  const index = root.querySelector('.fb-node-item[data-node-type="bpmn_service_task"]').dataset.index;
+  root.querySelector(`.fb-node-item[data-index="${index}"] button`).focus();
+  root.querySelector(`.fb-node-item[data-index="${index}"]`).dispatchEvent(new window.MouseEvent('click', { bubbles: true, detail: 0 }));
+  assert.equal(document.activeElement, root.querySelector(`.fb-node-item[data-index="${index}"] button`));
+  palette.destroy();
+});
+
+test('successive adds without a position cascade instead of stacking', () => {
+  const graph = canvas();
+  const template = processTemplates().find((row) => row.node_type === 'bpmn_user_task');
+  const spots = [];
+  for (let index = 0; index < 20; index += 1) {
+    const node = graph.addNodeFromTemplate(template, 500, 400, { cascade: true });
+    spots.push(`${node.x},${node.y}`);
+  }
+  assert.equal(new Set(spots).size, 20);
+  const plain = graph.addNodeFromTemplate(template, 900, 400);
+  const dropped = graph.addNodeFromTemplate(template, 900, 400);
+  assert.equal(`${plain.x},${plain.y}`, `${dropped.x},${dropped.y}`, 'a drop keeps the exact position the user chose');
   graph.destroy();
 });

@@ -78,6 +78,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   („Notes › search_notes”). Katalog pomija narzędzia z identyfikatorami, które
   odrzuciłaby publikacja, a opisy i nazwy są ucinane do 512 znaków. Nieczytelny
   stan inicjatora kończy zapytanie o opcje błędem zamiast pustą listą narzędzi.
+- Paleta BPMN (B3.3a, poprawki): grupa „Bloki TentaFlow” jest pierwsza, wiersze mają
+  najwyżej dwie linie nazwy i opisu (pełny tekst w podpowiedzi), a przepływ pokazuje
+  własny opis (`ProcessOptionFlow.description`, `#[serde(default)]`). Etykieta
+  narzędzia addonu jest ucinana do 256 bajtów UTF-8 bez znaków sterujących, bo
+  staje się nazwą węzła, którą serwer odrzuca powyżej tego limitu; dwie instancje o tej
+  samej nazwie dostają id instancji, a instancja bez nazwy jest opisana swoim id.
+  Dodanie z palety klawiszem lub kliknięciem układa kolejne węzły kaskadą zamiast
+  na jednym punkcie, wyszukiwanie ignoruje białe znaki na brzegach, a po Enter fokus
+  zostaje na wierszu. Nagłówki podgrup mają rolę `heading` i kontrast 11:1.
 
 ### TentaNas
 

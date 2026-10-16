@@ -44,11 +44,16 @@ pub struct OfferedTool {
 /// Longest description or addon name sent to the designer, in characters. The
 /// full text stays in the addon registry; the palette only needs a hint.
 pub const MAX_OFFERED_TEXT_CHARS: usize = 512;
+/// CBOR framing of one catalogue entry: the map header, the field names and the
+/// string length prefixes (about 70 bytes for a tool, the rest is margin).
+pub const OFFERED_ENTRY_CBOR_OVERHEAD: usize = 80;
 /// Worst-case encoded size of one offered tool: two 128-byte identifiers plus
-/// two texts of at most `MAX_OFFERED_TEXT_CHARS` four-byte characters.
-pub const MAX_OFFERED_TOOL_BYTES: usize = 2 * 128 + 2 * MAX_OFFERED_TEXT_CHARS * 4;
+/// two texts of at most `MAX_OFFERED_TEXT_CHARS` four-byte characters, plus the
+/// CBOR framing.
+pub const MAX_OFFERED_TOOL_BYTES: usize =
+    2 * 128 + 2 * MAX_OFFERED_TEXT_CHARS * 4 + OFFERED_ENTRY_CBOR_OVERHEAD;
 
-fn truncate_chars(text: &str) -> String {
+pub fn truncate_chars(text: &str) -> String {
     text.chars().take(MAX_OFFERED_TEXT_CHARS).collect()
 }
 
@@ -74,10 +79,12 @@ pub fn select_offered_tools(
                 .or_insert_with(|| decide(&tool.addon_id))
         })
         .map(|tool| OfferedTool {
+            // The instance id tells two instances apart when no name is known.
             addon_name: labels
                 .get(&tool.addon_id)
+                .filter(|label| !label.is_empty())
                 .map(|label| truncate_chars(label))
-                .unwrap_or_default(),
+                .unwrap_or_else(|| tool.addon_id.clone()),
             description: truncate_chars(&tool.description),
             addon_id: tool.addon_id,
             tool_name: tool.tool_name,
@@ -162,6 +169,23 @@ impl crate::addon::AddonManager {
     }
 }
 
+impl crate::addon::AddonManager {
+    /// The registered tools of the addons `accessible` accepts, named after
+    /// their instances. An unreadable name costs the palette only its
+    /// disambiguation (the id stands in), so the failure is logged, not raised.
+    fn offered_tools_where(&self, accessible: impl FnMut(&str) -> bool) -> Vec<OfferedTool> {
+        let tools = self.list_tools();
+        let mut ids: Vec<String> = tools.iter().map(|tool| tool.addon_id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        let labels = self.instance_labels(&ids).unwrap_or_else(|error| {
+            tracing::warn!(%error, "addon instance names unavailable for the process palette");
+            Default::default()
+        });
+        select_offered_tools(tools, accessible, &labels)
+    }
+}
+
 impl ProcessToolHost for crate::addon::AddonManager {
     fn authorize(
         &self,
@@ -183,20 +207,9 @@ impl ProcessToolHost for crate::addon::AddonManager {
     }
 
     fn offered_tools(&self, user_id: &str, org_id: &str) -> Vec<OfferedTool> {
-        let tools = self.list_tools();
-        let mut ids: Vec<String> = tools.iter().map(|tool| tool.addon_id.clone()).collect();
-        ids.sort();
-        ids.dedup();
-        // A name that cannot be read only costs the palette its subtitle.
-        let labels = self.instance_labels(&ids).unwrap_or_default();
-        select_offered_tools(
-            tools,
-            |addon_id| {
-                self.process_addon_access(addon_id, user_id, org_id)
-                    .is_ok()
-            },
-            &labels,
-        )
+        self.offered_tools_where(|addon_id| {
+            self.process_addon_access(addon_id, user_id, org_id).is_ok()
+        })
     }
 
     fn call(
@@ -488,13 +501,17 @@ mod tests {
     use crate::addon::{AddonManager, ToolDefinition};
 
     fn manager() -> Arc<AddonManager> {
+        manager_with_db().0
+    }
+
+    fn manager_with_db() -> (Arc<AddonManager>, crate::db::DbPool) {
         let directory = tempfile::tempdir().unwrap();
         let db = crate::db::init(&directory.path().join("addons.db")).unwrap();
         // The database outlives the directory handle only through the pool; keep
         // the files for the whole test.
         std::mem::forget(directory);
         let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
-        let manager = Arc::new(AddonManager::new(db, cipher).expect("addon manager"));
+        let manager = Arc::new(AddonManager::new(db.clone(), cipher).expect("addon manager"));
         manager.register_tool_for_test(ToolDefinition {
             addon_id: "notes-1a2b3c4d".into(),
             package_id: "notes".into(),
@@ -505,7 +522,7 @@ mod tests {
             keywords: Vec::new(),
             read_only: false,
         });
-        manager
+        (manager, db)
     }
 
     fn definition(addon_id: &str, tool_name: &str, description: &str) -> ToolDefinition {
@@ -593,6 +610,40 @@ mod tests {
         assert_eq!(offered[0].description.chars().count(), MAX_OFFERED_TEXT_CHARS);
         assert_eq!(offered[0].addon_name.chars().count(), MAX_OFFERED_TEXT_CHARS);
         assert!(offered[0].description.len() <= MAX_OFFERED_TEXT_CHARS * 4);
+    }
+
+    #[test]
+    fn an_instance_without_a_name_is_told_apart_by_its_id() {
+        let labels = std::collections::HashMap::from([
+            ("notes-a".to_owned(), String::new()),
+            ("notes-b".to_owned(), "Notes".to_owned()),
+        ]);
+        let offered = select_offered_tools(
+            vec![
+                definition("notes-a", "search", ""),
+                definition("notes-b", "search", ""),
+                definition("notes-c", "search", ""),
+            ],
+            |_| true,
+            &labels,
+        );
+        let names: Vec<&str> = offered.iter().map(|t| t.addon_name.as_str()).collect();
+        assert_eq!(names, ["notes-a", "Notes", "notes-c"]);
+    }
+
+    #[tokio::test]
+    async fn the_registry_lookup_names_the_offered_instances() {
+        let (manager, db) = manager_with_db();
+        db.write()
+            .unwrap()
+            .execute(
+                "INSERT INTO addons(addon_id,name,version,display_name) VALUES('notes-1a2b3c4d','notes','1','Team notes')",
+                [],
+            )
+            .unwrap();
+        let offered = manager.offered_tools_where(|_| true);
+        assert_eq!(offered.len(), 1);
+        assert_eq!(offered[0].addon_name, "Team notes");
     }
 
     #[tokio::test]

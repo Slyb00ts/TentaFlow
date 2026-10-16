@@ -849,7 +849,11 @@ export class FlowCanvas {
     }
   }
 
-  addNodeFromTemplate(tpl, clientX, clientY) {
+  /**
+   * `cascade` is for adds that name no position (palette click or Enter):
+   * every one would otherwise land on the same viewport centre and stack.
+   */
+  addNodeFromTemplate(tpl, clientX, clientY, { cascade = false } = {}) {
     if (this.readOnly) return;
     if (this.mode === 'bpmn' && this.processPath.length > 0
       && ['bpmn_timer_start', 'bpmn_message_start'].includes(tpl.node_type)) return;
@@ -873,12 +877,29 @@ export class FlowCanvas {
       node.x = snapGridCoordinate(pt.x - node.width / 2);
       node.y = snapGridCoordinate(pt.y - node.height / 2);
     }
+    if (cascade) this._moveToFreeSpot(node);
     this.nodes.push(node);
     this._pushHistory();
     this.render();
     this.selectNode(node.id);
     this.onChange();
     return node;
+  }
+
+  // Walks a diagonal cascade (wrapping to a shifted row after eight steps) to
+  // the first spot whose corner is not within two grid cells of another node.
+  _moveToFreeSpot(node) {
+    const step = GRID * 4;
+    const taken = (x, y) => this.nodes.some((other) => Math.abs(other.x - x) < GRID * 2 && Math.abs(other.y - y) < GRID * 2);
+    for (let k = 0; k < 64; k += 1) {
+      const x = node.x + (k % 8) * step;
+      const y = node.y + (k % 8) * step + Math.floor(k / 8) * GRID * 2;
+      if (!taken(x, y)) {
+        node.x = x;
+        node.y = y;
+        return;
+      }
+    }
   }
 
   updateNodeConfig(nodeId, patch) {

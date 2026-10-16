@@ -154,3 +154,34 @@ test('a flow, a block and an addon tool dropped from the palette survive save an
   expect(await stored()).toEqual(tasks);
   expect(errors, diagnostics(errors, proc)).toEqual([]);
 });
+
+test('palette keyboard adds cascade, keep focus on the row and the group comes first', async ({ page }) => {
+  test.setTimeout(120000);
+  const errors = collectConsoleErrors(page);
+  await openDesigner(page);
+
+  await expect(page.locator('.fb-palette-category').first()).toHaveAttribute('data-cat', 'tentaflow');
+  await expect(page.locator('.fb-palette-subgroup').first()).toHaveAttribute('role', 'heading');
+
+  const rows = page.locator('.fb-palette-category[data-cat="tentaflow"] .fb-node-item', { hasText: 'Language model' });
+  const nodes = page.locator('.fb-canvas .fb-node');
+  // The definition already holds the nodes the previous test saved.
+  const before = await nodes.count();
+  await rows.first().locator('button').focus();
+  await page.keyboard.press('Enter');
+  await expect(nodes).toHaveCount(before + 1);
+  await expect(rows.first().locator('button')).toBeFocused();
+  await page.keyboard.press('Enter');
+  await expect(nodes).toHaveCount(before + 2);
+  await expect(rows.first().locator('button')).toBeFocused();
+
+  const spots = await nodes.evaluateAll((all) => all.slice(-2).map((node) => `${node.style.left},${node.style.top}`));
+  expect(new Set(spots).size).toBe(2);
+
+  const items = page.locator('.fb-palette .fb-node-item');
+  const all = await items.count();
+  await page.locator('.fb-palette tf-searchbox input').fill(' ');
+  await page.waitForTimeout(400);
+  expect(await items.count()).toBe(all);
+  expect(errors, diagnostics(errors, proc)).toEqual([]);
+});

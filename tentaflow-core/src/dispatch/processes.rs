@@ -175,7 +175,7 @@ fn options(ctx: &HandlerContext, actor: &ProcessActor) -> Result<P, ProtocolErro
         {
             assignees.push(ProcessOptionUser {
                 user_id: user.id,
-                display_name: user.display_name,
+                display_name: bounded_name(&user.display_name),
             });
         }
     }
@@ -192,7 +192,10 @@ fn options(ctx: &HandlerContext, actor: &ProcessActor) -> Result<P, ProtocolErro
         if executor.snapshot_flow(&flow.id, &meta).is_ok() {
             service_flows.push(ProcessOptionFlow {
                 flow_id: flow.id,
-                name: flow.name,
+                name: bounded_name(&flow.name),
+                description: crate::processes::tool_host::truncate_chars(
+                    flow.description.as_deref().unwrap_or_default(),
+                ),
             });
         }
     }
@@ -209,14 +212,32 @@ fn options(ctx: &HandlerContext, actor: &ProcessActor) -> Result<P, ProtocolErro
     })
 }
 
+fn bounded_name(name: &str) -> String {
+    name.chars().take(MAX_OPTION_NAME_CHARS).collect()
+}
+
 /// Largest tool catalogue sent to the designer. Tools beyond it are cut after
 /// the stable addon/tool ordering; the Service task inspector still accepts any
 /// tool by identifier, so a cut hides a shortcut, not a capability.
 const MAX_TOOL_OPTIONS: usize = 1000;
-// Every entry is bounded by `MAX_OFFERED_TOOL_BYTES`, so the cap keeps the
-// catalogue within the share of a transport frame the simulation view also uses.
+/// Longest flow name or assignee name sent to the designer, in characters.
+const MAX_OPTION_NAME_CHARS: usize = 256;
+// Worst-case encoded size of a flow row (36-byte id, a name and a description
+// of four-byte characters) and of an assignee row (36-byte id, a name).
+const MAX_FLOW_OPTION_BYTES: usize = 36
+    + MAX_OPTION_NAME_CHARS * 4
+    + crate::processes::tool_host::MAX_OFFERED_TEXT_CHARS * 4
+    + crate::processes::tool_host::OFFERED_ENTRY_CBOR_OVERHEAD;
+const MAX_ASSIGNEE_OPTION_BYTES: usize =
+    36 + MAX_OPTION_NAME_CHARS * 4 + crate::processes::tool_host::OFFERED_ENTRY_CBOR_OVERHEAD;
+// The handler refuses more than 1000 assignees and 1000 flows and cuts tools at
+// `MAX_TOOL_OPTIONS`; all three bounded catalogues together, with the small
+// block list as the margin, stay within the frame share the simulation view
+// also uses.
 const _: () = assert!(
     MAX_TOOL_OPTIONS * crate::processes::tool_host::MAX_OFFERED_TOOL_BYTES
+        + 1000 * MAX_FLOW_OPTION_BYTES
+        + 1000 * MAX_ASSIGNEE_OPTION_BYTES
         <= tentaflow_transport::MAX_FRAME_SIZE / 4 * 3
 );
 
@@ -1903,6 +1924,15 @@ mod tests {
         .unwrap();
         let allowed = test_support::flow(&state.db, &actor, &test_support::graph("allowed", None));
         let denied = test_support::flow(&state.db, &actor, &test_support::graph("denied", None));
+        state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "UPDATE flows SET description = ?1 WHERE id = ?2",
+                rusqlite::params!["ż".repeat(700), allowed],
+            )
+            .unwrap();
         crate::db::repository::resource_permissions::set(
             &state.db,
             "flow",
@@ -1923,6 +1953,14 @@ mod tests {
         assert!(assignees.iter().any(|user| user.user_id == actor.user_id));
         assert!(assignees.iter().all(|user| user.user_id != other.user_id));
         assert!(service_flows.iter().any(|flow| flow.flow_id == allowed));
+        let described = service_flows
+            .iter()
+            .find(|flow| flow.flow_id == allowed)
+            .unwrap();
+        assert_eq!(
+            described.description,
+            "ż".repeat(crate::processes::tool_host::MAX_OFFERED_TEXT_CHARS)
+        );
         assert!(service_flows.iter().all(|flow| flow.flow_id != denied));
         let mut anonymous = ctx.clone();
         anonymous.session = SessionAuth::Anonymous;
@@ -2046,12 +2084,18 @@ mod tests {
         let ctx = context(&state, &actor);
         let executor = dispatcher(&ctx).unwrap();
         executor.set_process_tool_host(ScriptedToolHost::new(serde_json::json!(null)));
-        assert!(!service_block_options().is_empty());
+        assert!(matches!(
+            request(&ctx, P::OptionsRequest {}).await,
+            P::OptionsResponse { .. }
+        ));
+        // The request path reads the same tables for its own authorization
+        // before it reaches the catalogue, so a request cannot be made to fail
+        // only at the catalogue; the handler's conversion is exercised directly.
         state
             .db
             .write()
             .unwrap()
-            .execute_batch("ALTER TABLE org_memberships RENAME TO org_memberships_gone")
+            .execute_batch("ALTER TABLE organizations RENAME TO organizations_gone")
             .unwrap();
         assert_eq!(
             executor
@@ -2060,7 +2104,8 @@ mod tests {
             ToolAccessError::Unavailable
         );
         let failure = service_tool_options(executor, &actor).unwrap_err();
-        assert!(!failure.message.is_empty());
+        assert_eq!(failure.message, "the addon tool catalogue is unavailable");
+        refused(&ctx, P::OptionsRequest {}).await;
     }
 
     #[tokio::test]

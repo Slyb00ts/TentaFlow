@@ -47,6 +47,38 @@ function localized(key, fallback) {
   return text && text !== key ? text : fallback;
 }
 
+const MAX_NODE_NAME_BYTES = 256;
+const utf8Length = (char) => {
+  const code = char.codePointAt(0);
+  return code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+};
+
+// The server refuses a node name over 256 UTF-8 bytes or with a control
+// character, and the palette label becomes the node name, so a long or odd
+// addon name must be cleaned here rather than fail the save.
+export function boundedNodeName(text, limit = MAX_NODE_NAME_BYTES) {
+  let out = '';
+  let bytes = 0;
+  for (const char of String(text ?? '').replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').trim()) {
+    bytes += utf8Length(char);
+    if (bytes > limit) break;
+    out += char;
+  }
+  return out.trimEnd();
+}
+
+const nameBytes = (text) => [...text].reduce((sum, char) => sum + utf8Length(char), 0);
+
+// "Addon › tool"; the addon part yields to the tool name when the whole label
+// would not fit, so the tool that runs is never the part that is cut.
+function toolLabel(tool, withId) {
+  const toolName = boundedNodeName(tool.toolName);
+  const addonName = boundedNodeName(tool.addonName);
+  if (!addonName) return toolName;
+  const suffix = ` › ${toolName}${withId ? ` (${boundedNodeName(tool.addonId)})` : ''}`;
+  return boundedNodeName(`${boundedNodeName(addonName, Math.max(0, MAX_NODE_NAME_BYTES - nameBytes(suffix)))}${suffix}`);
+}
+
 /**
  * Palette entries that drop a ready-made Service task. `preset` is merged over
  * the Service task's default configuration, so the entry never asks which
@@ -57,22 +89,31 @@ function tentaflowTemplates(options) {
     node_type: 'bpmn_service_task', label, description, icon, category: 'tentaflow',
     subgroup, preset, ...SERVICE_TASK_SHAPE,
   });
+  const tools = options.serviceTools || [];
+  // Two instances of one package share addon and tool names; the instance id
+  // is the only thing left to tell their rows apart.
+  const labelCounts = new Map();
+  for (const tool of tools) {
+    const label = toolLabel(tool, false);
+    labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
+  }
   return [
     ...(options.serviceFlows || []).map((flow) =>
-      entry('flows', 'flow', flow.name, I18n.t('bpmn.palette_flow_hint'), { flowId: flow.flowId })),
+      entry('flows', 'flow', boundedNodeName(flow.name), flow.description || I18n.t('bpmn.palette_flow_hint'),
+        { flowId: flow.flowId })),
     ...(options.serviceBlocks || []).map((block) => entry('blocks', block.nodeType === 'llm' ? 'brain'
       : block.nodeType === 'pii_filter' ? 'shield' : 'sparkle',
     localized(`bpmn.block_${block.nodeType}`, block.label),
     localized(`bpmn.block_${block.nodeType}_hint`, block.description),
     { implementation: { Block: { nodeType: block.nodeType, config: processBlockTemplate(block.nodeType) } } })),
-    ...(options.serviceTools || []).map((tool) => entry('tools', 'puzzle',
-      tool.addonName ? `${tool.addonName} › ${tool.toolName}` : tool.toolName,
+    ...tools.map((tool) => entry('tools', 'puzzle',
+      toolLabel(tool, labelCounts.get(toolLabel(tool, false)) > 1),
       tool.description || tool.addonId,
       { implementation: { AddonTool: { addonId: tool.addonId, toolName: tool.toolName } } })),
   ];
 }
 
-export function processTemplates(options = null) {
+export function processTemplates(options) {
   const elements = ELEMENTS.map(([kind, name, icon, group, width, height]) => ({
     node_type: `bpmn_${name}`, label: I18n.t(`bpmn.node_${name}`),
     description: I18n.t(`bpmn.node_${name}_hint`), icon, category: group,

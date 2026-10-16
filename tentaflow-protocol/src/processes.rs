@@ -1807,6 +1807,9 @@ pub struct ProcessOptionUser {
 pub struct ProcessOptionFlow {
     pub flow_id: String,
     pub name: String,
+    /// The flow's own description; empty when it has none.
+    #[serde(default)]
+    pub description: String,
 }
 
 /// A Flow Builder block a Service task may run on its own.
@@ -2199,6 +2202,7 @@ mod tests {
             panic!("options response expected");
         };
         assert_eq!(service_flows.len(), 1);
+        assert_eq!(service_flows[0].description, "");
         assert!(service_blocks.is_empty() && service_tools.is_empty());
 
         let older_tool = serde_json::json!({"OptionsResponse": {
@@ -2213,7 +2217,11 @@ mod tests {
 
         let current = ProcessPayload::OptionsResponse {
             assignees: Vec::new(),
-            service_flows: Vec::new(),
+            service_flows: vec![ProcessOptionFlow {
+                flow_id: "f1".into(),
+                name: "Checker".into(),
+                description: "Checks a contract".into(),
+            }],
             service_blocks: vec![ProcessOptionBlock {
                 node_type: "llm".into(),
                 label: "Language model (LLM)".into(),

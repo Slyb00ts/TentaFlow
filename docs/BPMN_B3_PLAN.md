@@ -122,7 +122,7 @@ Paleta BPMN nie ładuje szablonów bloków (`palette.js:101`). `ELEMENTS` w `bpm
 
 ### Projekt
 - **Protokół (addytywnie, `#[serde(default)]`):** rozszerzyć `OptionsResponse` o `service_blocks`, `service_agents`, `service_tools`.
-  - Typy: `ProcessOptionBlock{node_type,label,description,category}`, `ProcessOptionAgent{agent_id,name,description}`, `ProcessOptionTool{addon_id,tool_name,description}`.
+  - Typy: `ProcessOptionBlock{node_type,label,description,category}`, `ProcessOptionAgent{agent_id,name,description}`, `ProcessOptionTool{addon_id,tool_name,description,addon_name}` (`addon_name` = nazwa zainstalowanej instancji, przy braku nazwy id instancji) oraz `description` w `ProcessOptionFlow`.
   - Serwer filtruje te listy tymi samymi regułami autoryzacji co §1.4, więc klient nie oferuje niczego, czego i tak nie da się opublikować.
 - **UI:**
   - `processTemplates()` (+ `palette.js`) dostaje szablony dynamiczne: `node_type: 'bpmn_service_task'`, kategoria `tentaflow`, `preset: { implementation: … }`. Mechanizm presetów (`presetTypes`, `palette.js:52`) już obsługuje wiele wpisów o tym samym `node_type`.
@@ -185,6 +185,7 @@ Paleta BPMN nie ładuje szablonów bloków (`palette.js:101`). `ELEMENTS` w `bpm
 - **Ładowanie.** Opcje są pobierane razem z definicją przy otwarciu projektanta (jedno `Promise.all`, jak dotąd dla przepływów i osób), więc paleta dostaje je synchronicznie i nie ma osobnego asynchronicznego odświeżania; niepowodzenie nadal przerywa otwarcie. Gdy palety nie da się zbudować z opcji, grupa „Bloki TentaFlow” pokazuje komunikat, a pusta podgrupa komunikat „brak pozycji”.
 - **Szablony.** Wpisy dynamiczne dzielą `node_type: bpmn_service_task` ze zwykłym elementem. Płótno zachowuje szablon zwykłego elementu (ikona BPMN, brak etykiety), a upuszczenie wpisu z `preset` scala preset z `processNodeConfig('ServiceTask')` i nadaje węzłowi nazwę pozycji.
 - **Inspektor.** Lista typów bloków w inspektorze nadal jest stałą po stronie klienta (`PROCESS_BLOCK_TYPES`); przejście na `serviceBlocks` należy do B3.3b.
+- **Odroczone z krytyki GUI B3.3a (G5).** Węzły zadania usługi z palety „Bloki TentaFlow” (przepływ, blok, narzędzie addonu) wyglądają na płótnie jak zwykłe zadanie usługi; odróżnienie rodzaju implementacji (ikona/plakietka na węźle) należy do B3.3b razem z inspektorem.
 
 ### 3.3 Agent z ujściem `task.complete`
 Ujście proponuję nazwać **`core.task_complete`** (prefiks `core.` wymusza enum `CoreToolName`, `builtins.rs:24`, a istniejące `core.task_plan/update/list` należą do Code Studio, więc nazwa nie koliduje). Plan nazywa je `task.complete`, więc trzeba zmienić jego brzmienie przy aktualizacji dokumentu.

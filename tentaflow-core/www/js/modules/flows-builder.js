@@ -205,7 +205,7 @@ const FlowBuilderScreen = {
       },
       onAdd: (tpl) => {
         const rect = root.querySelector('[data-role="canvas"]').getBoundingClientRect();
-        state.canvas.addNodeFromTemplate(tpl, rect.left + rect.width / 2, rect.top + rect.height / 2);
+        state.canvas.addNodeFromTemplate(tpl, rect.left + rect.width / 2, rect.top + rect.height / 2, { cascade: true });
       },
     });
     await state.palette.init();
