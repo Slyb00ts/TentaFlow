@@ -379,7 +379,12 @@ export class FlowCanvas {
     // round-tripie (load → save → load) konsystentnie zaznaczal te same
     // krawedzie. Dla nowych krawedzi `_onPointerUp` nadal generuje
     // unikalne `e_<timestamp>` przy tworzeniu.
-    this.edges = (edges || []).map((e, idx) => {
+    this.edges = (edges || []).map((raw, idx) => {
+      // The engine also accepts from/to and source/target; the editor and the
+      // serializer know only from_node/to_node, so any other spelling must be
+      // folded in here or the connection is counted but never drawn.
+      const { from, to, source, target, ...rest } = raw;
+      const e = { ...rest, from_node: raw.from_node ?? from ?? source, to_node: raw.to_node ?? to ?? target };
       const id = e.id || `e${idx}_${e.from_node || ''}-${e.to_node || ''}_${e.from_port || ''}-${e.to_port || ''}`;
       return { ...e, id };
     });
@@ -877,34 +882,65 @@ export class FlowCanvas {
       node.x = snapGridCoordinate(pt.x - node.width / 2);
       node.y = snapGridCoordinate(pt.y - node.height / 2);
     }
-    if (cascade) this._moveToFreeSpot(node);
+    const classic = this.mode !== 'bpmn';
+    let placed = null;
+    if (cascade) placed = this._moveToFreeSpot(node, this._firstPassSize(node));
     this.nodes.push(node);
-    this._pushHistory();
     this.render();
+    // A classic node's height is only known once it is rendered, so a drop is
+    // centred on the cursor and a cascade add is re-checked with the real size.
+    const real = classic ? this._renderedHeight(node) : 0;
+    if (real > 0) {
+      if (!cascade) {
+        node.y = snapGridCoordinate(pt.y - real / 2);
+        this.render();
+      } else if (real > placed.h) {
+        placed = this._moveToFreeSpot(node, { w: NODE_WIDTH, h: real }, node);
+        this.render();
+      }
+    }
+    if (cascade) this._panToReveal(node, placed);
+    this._pushHistory();
     this.selectNode(node.id);
     this.onChange();
     return node;
   }
 
-  _nodeSize(node) {
-    if (this.mode === 'bpmn') return { w: node.width || 240, h: node.height || 96 };
+  // Rendered height in world units: offsetHeight ignores CSS transforms, so
+  // it is already unscaled by the zoom.
+  _renderedHeight(node) {
     const element = this.nodesLayer?.querySelector(`[data-node-id="${CSS.escape(node.id)}"]`);
-    const measured = element ? element.offsetHeight / this._positiveZoom() : 0;
-    return { w: NODE_WIDTH, h: Math.max(NODE_H_APPROX, measured || 0) };
+    return element ? element.offsetHeight || 0 : 0;
+  }
+
+  // One DOM pass per placement: every rectangle is measured once, nodes that
+  // are not rendered yet get the tallest measured height.
+  _nodeRects(skip = null) {
+    if (this.mode === 'bpmn') {
+      return this.nodes.filter((n) => n !== skip)
+        .map((n) => ({ x: n.x, y: n.y, w: n.width || 240, h: n.height || 96 }));
+    }
+    const heights = this.nodes.map((n) => this._renderedHeight(n));
+    const typical = heights.reduce((max, h) => Math.max(max, h), NODE_H_APPROX);
+    return this.nodes.flatMap((n, i) => (n === skip ? []
+      : [{ x: n.x, y: n.y, w: NODE_WIDTH, h: heights[i] || typical }]));
+  }
+
+  _firstPassSize(node) {
+    if (this.mode === 'bpmn') return { w: node.width || 240, h: node.height || 96 };
+    return { w: NODE_WIDTH, h: this._nodeRects().reduce((max, r) => Math.max(max, r.h), NODE_H_APPROX) };
   }
 
   // Scans a bounded grid of candidate corners, nearest to the requested spot
   // first, for one whose rectangle (plus a gap) intersects no existing node.
   // Corners inside the visible canvas win; with no free one there, the node
-  // goes right of the rightmost node so it never overlaps.
-  _moveToFreeSpot(node) {
+  // goes right of the rightmost node so it never overlaps (the caller then
+  // pans the view to it). Returns the size it was placed with.
+  _moveToFreeSpot(node, size, skip = null) {
     const gap = GRID * 2;
-    const size = this._nodeSize(node);
-    const free = (x, y) => this.nodes.every((other) => {
-      const o = this._nodeSize(other);
-      return x >= other.x + o.w + gap || x + size.w + gap <= other.x
-        || y >= other.y + o.h + gap || y + size.h + gap <= other.y;
-    });
+    const rects = this._nodeRects(skip);
+    const free = (x, y) => rects.every((o) => x >= o.x + o.w + gap || x + size.w + gap <= o.x
+      || y >= o.y + o.h + gap || y + size.h + gap <= o.y);
     const zoom = this._positiveZoom();
     const rect = this.root.getBoundingClientRect();
     const known = rect.width > 0 && rect.height > 0;
@@ -923,10 +959,30 @@ export class FlowCanvas {
     const spot = candidates.find(([x, y]) => free(x, y));
     if (spot) {
       [node.x, node.y] = spot;
-      return;
+    } else {
+      const right = rects.reduce((max, o) => Math.max(max, o.x + o.w), node.x);
+      node.x = snapGridCoordinate(right + gap);
     }
-    const right = this.nodes.reduce((max, other) => Math.max(max, other.x + this._nodeSize(other).w), node.x);
-    node.x = snapGridCoordinate(right + gap);
+    return size;
+  }
+
+  // Minimal pan that brings the whole node into view; a node larger than the
+  // canvas is aligned to its top-left corner instead.
+  _panToReveal(node, size) {
+    const rect = this.root.getBoundingClientRect();
+    if (!(rect.width > 0 && rect.height > 0)) return;
+    const margin = GRID * 2;
+    const zoom = this._positiveZoom();
+    const axis = (position, length, view, extent) => {
+      const lo = position * zoom + view;
+      const hi = (position + length) * zoom + view;
+      if (hi - lo + 2 * margin > extent || lo < margin) return view + margin - lo;
+      if (hi > extent - margin) return view + extent - margin - hi;
+      return view;
+    };
+    this.view.x = axis(node.x, size.w, this.view.x, rect.width);
+    this.view.y = axis(node.y, size.h, this.view.y, rect.height);
+    this._applyView();
   }
 
   updateNodeConfig(nodeId, patch) {
@@ -1871,7 +1927,7 @@ export class FlowCanvas {
       minX = Math.min(minX, n.x);
       minY = Math.min(minY, n.y);
       maxX = Math.max(maxX, n.x + (this.mode === 'bpmn' ? n.width : NODE_WIDTH));
-      maxY = Math.max(maxY, n.y + (this.mode === 'bpmn' ? n.height : NODE_H_APPROX));
+      maxY = Math.max(maxY, n.y + (this.mode === 'bpmn' ? n.height : Math.max(NODE_H_APPROX, this._renderedHeight(n))));
       if (this.mode === 'bpmn') {
         const label = this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(n.id)}"] .fb-process-label`);
         if (label && !label.hidden && label.offsetWidth && label.offsetHeight) {

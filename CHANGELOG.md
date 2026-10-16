@@ -95,6 +95,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   „Bloki TentaFlow”. Etykieta z sufiksem id zachowuje nazwę addonu i nawias, a etykieta
   złożona z samych białych znaków wraca do id instancji. Opcje procesu przeglądają
   tabelę przepływów stronami, więc nieaktywne wiersze nie ukrywają dozwolonych przepływów.
+- Paleta i płótno BPMN (B3.3a, czwarta runda): dodanie z palety do klasycznego Flow
+  Buildera mierzy renderowany węzeł i powtarza szukanie wolnego miejsca z jego
+  rzeczywistą wysokością (nadal jeden wpis cofania), a upuszczony węzeł jest
+  wyśrodkowany na kursorze. Rozmiar węzła nie jest już dzielony przez zoom, prostokąty
+  są mierzone raz na wyszukiwanie, a widok przesuwa się tak, by nowy węzeł był w całości
+  widoczny. Skrócone id instancji zachowuje koniec, wiersz narzędzia pokazuje nazwę
+  narzędzia i osobną linię z addonem, a nazwa złożona z niewidocznych znaków (zero-width)
+  jest pusta po obu stronach. Opcje procesu przeglądają przepływy kursorem (nazwa, id).
+  Przepływy z krawędziami `from`/`to` (lub `source`/`target`) otwierają się z narysowanymi
+  połączeniami i zapisują jako `from_node`/`to_node`.
 
 ### TentaNas
 

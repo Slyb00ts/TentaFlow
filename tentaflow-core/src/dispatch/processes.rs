@@ -181,18 +181,19 @@ fn options(ctx: &HandlerContext, actor: &ProcessActor) -> Result<P, ProtocolErro
     }
     let executor = dispatcher(ctx)?;
     let mut service_flows = Vec::new();
-    // Inactive and unauthorized rows sort among the allowed ones, so a fixed
-    // window could hide an allowed flow; read the table page by page instead.
-    let mut offset = 0;
+    // Unauthorized rows sort among the allowed ones, so a fixed window could
+    // hide an allowed flow; read the table page by page on a (name, id) cursor.
+    let mut cursor: Option<(String, String)> = None;
     loop {
-        let page = crate::db::repository::list_flows(&ctx.state.db, offset, FLOW_SCAN_PAGE)
-            .map_err(error)?;
+        let page = crate::db::repository::list_active_flows_after(
+            &ctx.state.db,
+            cursor.as_ref().map(|(name, id)| (name.as_str(), id.as_str())),
+            FLOW_SCAN_PAGE,
+        )
+        .map_err(error)?;
         let exhausted = (page.len() as i64) < FLOW_SCAN_PAGE;
-        offset += page.len() as i64;
+        cursor = page.last().map(|flow| (flow.name.clone(), flow.id.clone())).or(cursor);
         for flow in page {
-            if flow.status != "active" {
-                continue;
-            }
             let Ok(meta) =
                 executor.authorize_process_flow(&flow.id, &actor.user_id, &actor.org_id)
             else {

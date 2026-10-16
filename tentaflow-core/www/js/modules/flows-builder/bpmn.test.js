@@ -4717,10 +4717,11 @@ test('TentaFlow palette group lists flows, blocks and addon tools as ready-made 
   assert.deepEqual([...group.querySelectorAll('[data-subgroup]')].map((row) => row.dataset.subgroup), ['flows', 'blocks', 'tools']);
   assert.equal(group.querySelectorAll('[data-node-type="bpmn_service_task"]').length, 5);
   assert.equal(root.querySelectorAll('[data-node-type="bpmn_service_task"]').length, 6);
-  const toolNames = [...group.querySelectorAll('.fb-node-name')].map((row) => row.textContent).slice(-2);
-  assert.deepEqual(toolNames, ['Notes <b>A</b> › search', 'Notes B › search']);
+  const toolRows = [...group.querySelectorAll('.fb-node-item')].slice(-2);
+  assert.deepEqual(toolRows.map((row) => row.querySelector('.fb-node-name').textContent), ['search', 'search']);
+  assert.deepEqual(toolRows.map((row) => row.querySelector('.fb-node-desc').textContent), ['Notes <b>A</b>', 'Notes B']);
   assert.equal(group.querySelector('.fb-node-name b'), null, 'the addon name is escaped');
-  assert.match(group.textContent, /Searches notes/);
+  assert.match(toolRows[0].getAttribute('title'), /Searches notes/);
   palette.destroy();
 });
 
@@ -4968,4 +4969,175 @@ test('twelve successive keyboard adds on an empty canvas never overlap, for BPMN
   const dropped = classic.addNodeFromTemplate(tpl, 520, 355);
   assert.deepEqual([dropped.x, dropped.y], [380, 300], 'a drop keeps the exact position');
   classic.destroy(); graph.destroy();
+});
+
+function stubClassicNodeHeight(height) {
+  const proto = window.HTMLElement.prototype;
+  const original = Object.getOwnPropertyDescriptor(proto, 'offsetHeight');
+  Object.defineProperty(proto, 'offsetHeight', {
+    configurable: true,
+    get() { return this.classList?.contains('fb-node') ? height : 0; },
+  });
+  return () => {
+    if (original) Object.defineProperty(proto, 'offsetHeight', original);
+    else delete proto.offsetHeight;
+  };
+}
+
+function classicCanvas(width, height) {
+  const root = document.createElement('div'); document.body.append(root);
+  root.getBoundingClientRect = () => ({ left: 0, top: 0, width, height, right: width, bottom: height });
+  const graph = new FlowCanvas(root, { mode: 'flow' });
+  const tpl = { node_type: 'activity_result', category: 'output', label: 'Result', default_config: '{}', input_ports: ['in'], output_ports: [] };
+  graph.setTemplates([tpl]);
+  return { graph, tpl, root };
+}
+
+test('classic click adds avoid rendered nodes that are taller than the first estimate and a drop is centred on the cursor', () => {
+  const restore = stubClassicNodeHeight(190);
+  try {
+    const { graph, tpl } = classicCanvas(1600, 950);
+    const seed = [];
+    for (let i = 0; i < 12; i += 1) seed.push({ id: `Seed${i}`, type: 'activity_result', label: '', position: { x: 40 + (i % 5) * 300, y: 40 + Math.floor(i / 5) * 220 }, config: {} });
+    graph.setData(seed, []);
+    graph.view = { x: 0, y: 0, zoom: 0.75 };
+    for (let i = 0; i < 5; i += 1) graph.addNodeFromTemplate(tpl, 800, 400, { cascade: true });
+    assert.ok(noOverlaps(graph.nodes, () => ({ w: 280, h: 190 })), 'no pair intersects at the rendered height');
+    const dropped = graph.addNodeFromTemplate(tpl, 900, 700);
+    const centre = graph._clientToWorld(900, 700);
+    assert.equal(dropped.y, Math.round((centre.y - 95) / 10) * 10, 'the drop is centred using the measured height');
+    graph.destroy();
+  } finally { restore(); }
+});
+
+test('a cascade add is one undo entry even when the real size moves it', () => {
+  const restore = stubClassicNodeHeight(190);
+  try {
+    const { graph, tpl } = classicCanvas(1600, 950);
+    graph.setData([{ id: 'Seed', type: 'activity_result', label: '', position: { x: 40, y: 40 }, config: {} }], []);
+    const before = graph.history.length;
+    graph.addNodeFromTemplate(tpl, 100, 100, { cascade: true });
+    assert.equal(graph.history.length, before + 1);
+    graph.undo();
+    assert.equal(graph.nodes.length, 1);
+    graph.destroy();
+  } finally { restore(); }
+});
+
+test('node rectangles take the rendered height as world units whatever the zoom', () => {
+  const restore = stubClassicNodeHeight(200);
+  try {
+    const { graph } = classicCanvas(1600, 950);
+    graph.setData([{ id: 'Seed', type: 'activity_result', label: '', position: { x: 40, y: 40 }, config: {} }], []);
+    graph.view = { x: 0, y: 0, zoom: 0.5 };
+    assert.equal(graph._nodeRects()[0].h, 200);
+    graph.destroy();
+  } finally { restore(); }
+});
+
+test('a click add into a full viewport pans so the whole new node is visible', () => {
+  const graph = canvas();
+  graph.root.getBoundingClientRect = () => ({ left: 0, top: 0, width: 800, height: 600, right: 800, bottom: 600 });
+  const template = processTemplates().find((row) => row.node_type === 'bpmn_service_task');
+  graph.nodes = [];
+  for (let row = 0; row < 6; row += 1) for (let col = 0; col < 3; col += 1) {
+    graph.nodes.push({ id: `d${row}_${col}`, type: 'bpmn_service_task', x: 10 + col * 270, y: 10 + row * 100, width: 240, height: 96, config: {} });
+  }
+  graph.view = { x: 0, y: 0, zoom: 1 };
+  const node = graph.addNodeFromTemplate(template, 400, 300, { cascade: true });
+  const zoom = graph.view.zoom;
+  const left = node.x * zoom + graph.view.x;
+  const top = node.y * zoom + graph.view.y;
+  assert.ok(left >= 0 && left + node.width * zoom <= 800, `horizontally visible at ${left}`);
+  assert.ok(top >= 0 && top + node.height * zoom <= 600, `vertically visible at ${top}`);
+  assert.ok(noOverlaps(graph.nodes, (n) => ({ w: n.width, h: n.height })));
+  graph.destroy();
+});
+
+test('free-spot search reads the DOM once per node, not once per candidate', () => {
+  const restore = stubClassicNodeHeight(190);
+  try {
+    const { graph, tpl } = classicCanvas(1600, 950);
+    const seed = [];
+    for (let i = 0; i < 40; i += 1) seed.push({ id: `Seed${i}`, type: 'activity_result', label: '', position: { x: 40 + (i % 5) * 300, y: 40 + Math.floor(i / 5) * 220 }, config: {} });
+    graph.setData(seed, []);
+    let reads = 0;
+    const query = graph.nodesLayer.querySelector.bind(graph.nodesLayer);
+    graph.nodesLayer.querySelector = (selector) => { reads += 1; return query(selector); };
+    graph.addNodeFromTemplate(tpl, 800, 400, { cascade: true });
+    assert.ok(reads < 40 * 12, `${reads} DOM reads`);
+    graph.destroy();
+  } finally { restore(); }
+});
+
+test('dedupe keeps the end of a long instance id so sibling instances stay apart', () => {
+  const labels = processTemplates({ ...options, serviceTools: ['notes-instance-1', 'notes-instance-2'].map((addonId) => ({
+    addonId, toolName: 't'.repeat(250), description: '', addonName: 'Notes' })) })
+    .filter((row) => row.subgroup === 'tools').map((row) => row.label);
+  assert.equal(new Set(labels).size, 2);
+  assert.ok(labels[0].endsWith('1)') && labels[1].endsWith('2)'), labels.map((l) => l.slice(-12)).join('|'));
+  for (const label of labels) assert.ok(validNodeName(label));
+  const sub = processTemplates({ ...options, serviceTools: [{ addonId: 'é'.repeat(200), toolName: 't'.repeat(250), description: '', addonName: 'N' },
+    { addonId: `${'é'.repeat(199)}x`, toolName: 't'.repeat(250), description: '', addonName: 'N' }] })
+    .filter((row) => row.subgroup === 'tools').map((row) => row.label);
+  for (const label of sub) assert.ok(validNodeName(label) && !label.includes('�'));
+});
+
+test('invisible-only addon names fall back to the instance id like blank ones', () => {
+  const labels = processTemplates({ ...options, serviceTools: [
+    { addonId: 'x-1', toolName: 'search', description: '', addonName: '​⁠' },
+    { addonId: 'x-2', toolName: 'search', description: '', addonName: '﻿­ ' },
+  ] }).filter((row) => row.subgroup === 'tools');
+  assert.deepEqual(labels.map((row) => row.label), ['search (x-1)', 'search (x-2)']);
+  assert.deepEqual(labels.map((row) => row.rowSub), ['x-1 (x-1)', 'x-2 (x-2)']);
+});
+
+test('a tool row names the tool on its first line and the addon on a separate line', async () => {
+  const root = document.createElement('aside'); document.body.append(root);
+  const long = 'Very long instance name '.repeat(8);
+  const palette = new FlowPalette(root, { mode: 'bpmn', processOptions: { ...options, serviceTools: [
+    { addonId: 'a-1', toolName: 'search', description: 'Searches', addonName: long },
+    { addonId: 'b-1', toolName: 'lookup', description: '', addonName: 'Wiki' },
+    { addonId: 'b-2', toolName: 'lookup', description: '', addonName: 'Wiki' },
+  ] } });
+  await palette.init();
+  const rows = [...root.querySelectorAll('.fb-node-item[data-node-type="bpmn_service_task"]')];
+  const text = (row, cls) => row.querySelector(cls).textContent.trim();
+  const search = rows.find((row) => text(row, '.fb-node-name') === 'search');
+  assert.ok(search, 'the tool name is the name line');
+  assert.ok(text(search, '.fb-node-desc').startsWith('Very long instance name'));
+  const lookups = rows.filter((row) => text(row, '.fb-node-name') === 'lookup').map((row) => text(row, '.fb-node-desc'));
+  assert.deepEqual(lookups, ['Wiki (b-1)', 'Wiki (b-2)']);
+  assert.match(search.getAttribute('title'), /›.*search/s, 'the title keeps the node name');
+  palette.destroy();
+});
+
+test('edges saved with from/to or source/target open drawable and save as from_node/to_node', () => {
+  const { graph } = classicCanvas(1600, 950);
+  graph.setData([
+    { id: 'a', type: 'activity_result', label: '', position: { x: 0, y: 0 }, config: {} },
+    { id: 'b', type: 'activity_result', label: '', position: { x: 400, y: 0 }, config: {} },
+  ], [{ from: 'a', to: 'b' }, { source: 'a', target: 'b', from_port: 'x' }]);
+  assert.deepEqual(graph.edges.map((e) => [e.from_node, e.to_node]), [['a', 'b'], ['a', 'b']]);
+  for (const edge of graph.getData().edges) {
+    assert.equal(edge.from_node, 'a');
+    assert.equal(edge.to_node, 'b');
+    assert.ok(!('from' in edge) && !('to' in edge) && !('source' in edge) && !('target' in edge));
+  }
+  graph.destroy();
+});
+
+test('keys typed in an unlisted component with an inner input are left to that input', () => {
+  const calls = [];
+  const state = { readOnly: false, canvas: { deleteSelected: () => calls.push('delete'), undo: () => calls.push('undo'), selectedIds: new Set() } };
+  const host = document.createElement('tf-tag-input'); document.body.append(host);
+  const inner = host.attachShadow({ mode: 'open' }).appendChild(document.createElement('input'));
+  // A browser retargets the document-level event to the shadow host, which no
+  // tag list names; only the composed path still reveals the inner input.
+  builder._onKey.call({ _state: state }, {
+    key: 'Delete', target: host, preventDefault: () => calls.push('prevented'),
+    composedPath: () => [inner, inner.getRootNode(), host, document.body, document, window],
+  });
+  host.remove();
+  assert.deepEqual(calls, [], 'Delete typed into the inner input does not delete canvas nodes');
 });

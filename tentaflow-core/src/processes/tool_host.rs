@@ -57,6 +57,22 @@ pub fn truncate_chars(text: &str) -> String {
     text.chars().take(MAX_OFFERED_TEXT_CHARS).collect()
 }
 
+/// Unicode format characters (category Cf): invisible, so a label made only of
+/// them shows nothing. std has no category lookup; the designer applies the
+/// same predicate with `\p{Cf}` in flows-builder/bpmn.js.
+fn is_format_char(c: char) -> bool {
+    matches!(u32::from(c),
+        0xAD | 0x600..=0x605 | 0x61C | 0x6DD | 0x70F | 0x890..=0x891 | 0x8E2 | 0x180E
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF
+        | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3
+        | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
+}
+
+/// A label with only whitespace, control or format characters is not a name.
+pub(crate) fn is_blank_label(label: &str) -> bool {
+    label.chars().all(|c| c.is_whitespace() || c.is_control() || is_format_char(c))
+}
+
 /// Builds the sorted catalogue from the registry. A tool whose identifiers
 /// publication would reject is never offered, `decide` runs once per addon and
 /// the sort happens here so any later cap cuts a stable tail.
@@ -83,7 +99,7 @@ pub fn select_offered_tools(
             addon_name: labels
                 .get(&tool.addon_id)
                 .map(|label| truncate_chars(label))
-                .filter(|label| label.chars().any(|c| !c.is_whitespace() && !c.is_control()))
+                .filter(|label| !is_blank_label(label))
                 .unwrap_or_else(|| tool.addon_id.clone()),
             description: truncate_chars(&tool.description),
             addon_id: tool.addon_id,
@@ -635,7 +651,7 @@ mod tests {
     fn a_label_of_only_blanks_or_control_characters_falls_back_to_the_id() {
         let labels = std::collections::HashMap::from([
             ("notes-a".to_owned(), "  \t\u{7} ".to_owned()),
-            ("notes-b".to_owned(), "\u{0}\u{1}".to_owned()),
+            ("notes-b".to_owned(), "\u{0}\u{1}\u{200B}\u{FEFF}\u{AD}".to_owned()),
         ]);
         let offered = select_offered_tools(
             vec![definition("notes-a", "search", ""), definition("notes-b", "search", "")],
@@ -644,6 +660,8 @@ mod tests {
         );
         let names: Vec<&str> = offered.iter().map(|t| t.addon_name.as_str()).collect();
         assert_eq!(names, ["notes-a", "notes-b"]);
+        assert!(is_blank_label("\u{200B}\u{2060} \u{E0020}"));
+        assert!(!is_blank_label("\u{200B}Notes"));
     }
 
     #[tokio::test]

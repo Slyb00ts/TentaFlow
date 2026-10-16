@@ -100,6 +100,51 @@ mod core_sync_repository_tests {
     }
 
     #[test]
+    fn keyset_paging_over_duplicate_names_neither_skips_nor_repeats_across_changes() {
+        let db = setup_db();
+        let _actor_id = create_actor(&db);
+        let mut expected = Vec::new();
+        for name in ["Same", "Same", "Same", "Same", "Same", "Zed"] {
+            expected.push(create_flow(&db, &flow_params(name, "{}", None)).expect("flow"));
+        }
+        let mut draft = flow_params("Same", "{}", None);
+        draft.status = "draft";
+        create_flow(&db, &draft).expect("draft");
+        let mut ordered: Vec<(String, String)> = expected
+            .iter()
+            .map(|id| (get_flow(&db, id).unwrap().unwrap().name, id.clone()))
+            .collect();
+        ordered.sort();
+
+        let first = list_active_flows_after(&db, None, 2).expect("page");
+        let last = first.last().expect("row");
+        let cursor = (last.name.clone(), last.id.clone());
+        // A flow sorting before the cursor appears between the pages.
+        create_flow(&db, &flow_params("Aaa", "{}", None)).expect("new flow");
+        let mut seen: Vec<(String, String)> = first.iter().map(|f| (f.name.clone(), f.id.clone())).collect();
+        let mut after = Some(cursor);
+        loop {
+            let page = list_active_flows_after(
+                &db,
+                after.as_ref().map(|(n, i)| (n.as_str(), i.as_str())),
+                2,
+            )
+            .expect("page");
+            let done = page.len() < 2;
+            if let Some(f) = page.last() {
+                after = Some((f.name.clone(), f.id.clone()));
+            }
+            seen.extend(page.into_iter().map(|f| (f.name, f.id)));
+            if done {
+                break;
+            }
+        }
+        // The seeded flows share the table; only this test's rows are compared.
+        seen.retain(|(_, id)| expected.contains(id));
+        assert_eq!(seen, ordered, "every active row exactly once, drafts excluded, in (name, id) order");
+    }
+
+    #[test]
     fn create_flow_records_binary_core_capture() {
         let db = setup_db();
         let _actor_id = create_actor(&db);
@@ -4282,6 +4327,27 @@ pub fn list_flows(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbFlow>>
     ))?;
     let rows = stmt
         .query_map(rusqlite::params![limit, offset], row_to_flow)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Active flows in `(name, id)` order, strictly after `after`. Keyset paging:
+/// names are not unique and flows change between pages, so an OFFSET could skip
+/// or repeat a row, while the `(name, id)` cursor cannot.
+pub fn list_active_flows_after(
+    pool: &DbPool,
+    after: Option<(&str, &str)>,
+    limit: i64,
+) -> Result<Vec<DbFlow>> {
+    let conn = acquire(pool)?;
+    let (name, id) = after.unzip();
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM flows WHERE status = 'active' AND (?1 IS NULL OR name > ?1 OR (name = ?1 AND id > ?2)) \
+         ORDER BY name, id LIMIT ?3",
+        FLOW_COLS
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![name, id, limit], row_to_flow)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }

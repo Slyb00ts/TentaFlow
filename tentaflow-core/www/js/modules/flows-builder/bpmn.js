@@ -69,6 +69,31 @@ export function boundedNodeName(text, limit = MAX_NODE_NAME_BYTES) {
 
 const nameBytes = (text) => [...text].reduce((sum, char) => sum + utf8Length(char), 0);
 
+// A label with nothing but whitespace, control or invisible format characters
+// (zero-width space, BOM, soft hyphen) shows nothing; the server applies the
+// same predicate in processes/tool_host.rs.
+const BLANK_LABEL = /^[\p{White_Space}\p{Cc}\p{Cf}]*$/u;
+export const isBlankLabel = (text) => BLANK_LABEL.test(String(text ?? ''));
+
+// Keeps both ends of an id: instances of one package differ at the end, so a
+// cut from the start would make `notes-instance-1` and `-2` read the same.
+function shortenId(text, limit) {
+  const id = boundedNodeName(text);
+  if (nameBytes(id) <= limit) return id;
+  const chars = [...id];
+  const room = limit - 3;
+  let tail = '';
+  let tailBytes = 0;
+  for (let index = chars.length - 1; index >= 0; index -= 1) {
+    const size = utf8Length(chars[index]);
+    if (tailBytes + size > Math.ceil(room * 2 / 3)) break;
+    tail = chars[index] + tail;
+    tailBytes += size;
+  }
+  const head = boundedNodeName(id, Math.max(0, room - tailBytes));
+  return `${head}\u2026${tail}`;
+}
+
 const ADDON_NAME_RESERVE_BYTES = 16;
 const MIN_ID_BYTES = 8;
 
@@ -78,7 +103,7 @@ const MIN_ID_BYTES = 8;
 // with the separator: an addon name that does not fit is dropped whole.
 function toolLabel(tool, withId) {
   let toolName = boundedNodeName(tool.toolName);
-  const addonName = boundedNodeName(tool.addonName);
+  const addonName = isBlankLabel(tool.addonName) ? '' : boundedNodeName(tool.addonName);
   const addonId = withId ? boundedNodeName(tool.addonId) : '';
   const separator = addonName ? ' › ' : '';
   const reserve = addonName ? nameBytes(separator) + Math.min(nameBytes(addonName), ADDON_NAME_RESERVE_BYTES) : 0;
@@ -86,7 +111,7 @@ function toolLabel(tool, withId) {
   if (addonId) {
     const frame = 3;
     const idRoom = Math.max(MIN_ID_BYTES, MAX_NODE_NAME_BYTES - frame - reserve - nameBytes(toolName));
-    idPart = ` (${boundedNodeName(addonId, idRoom)})`;
+    idPart = ` (${shortenId(addonId, idRoom)})`;
   }
   const toolRoom = MAX_NODE_NAME_BYTES - reserve - nameBytes(idPart);
   if (nameBytes(toolName) > toolRoom) toolName = boundedNodeName(toolName, Math.max(1, toolRoom));
@@ -102,9 +127,9 @@ function toolLabel(tool, withId) {
  * implementation the task has. `subgroup` orders them inside the palette group.
  */
 function tentaflowTemplates(options) {
-  const entry = (subgroup, icon, label, description, preset) => ({
+  const entry = (subgroup, icon, label, description, preset, row = {}) => ({
     node_type: 'bpmn_service_task', label, description, icon, category: 'tentaflow',
-    subgroup, preset, ...SERVICE_TASK_SHAPE,
+    subgroup, preset, ...SERVICE_TASK_SHAPE, ...row,
   });
   const tools = options.serviceTools || [];
   // Two instances of one package share addon and tool names; the instance id
@@ -114,6 +139,11 @@ function tentaflowTemplates(options) {
     const label = toolLabel(tool, false);
     labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
   }
+  const toolRow = (tool) => {
+    const shown = isBlankLabel(tool.addonName) ? tool.addonId : boundedNodeName(tool.addonName);
+    return { rowName: boundedNodeName(tool.toolName),
+      rowSub: labelCounts.get(toolLabel(tool, false)) > 1 ? `${shown} (${tool.addonId})` : shown };
+  };
   return [
     ...(options.serviceFlows || []).map((flow) =>
       entry('flows', 'flow', boundedNodeName(flow.name), flow.description || I18n.t('bpmn.palette_flow_hint'),
@@ -126,7 +156,7 @@ function tentaflowTemplates(options) {
     ...tools.map((tool) => entry('tools', 'puzzle',
       toolLabel(tool, labelCounts.get(toolLabel(tool, false)) > 1),
       tool.description || tool.addonId,
-      { implementation: { AddonTool: { addonId: tool.addonId, toolName: tool.toolName } } })),
+      { implementation: { AddonTool: { addonId: tool.addonId, toolName: tool.toolName } } }, toolRow(tool))),
   ];
 }
 

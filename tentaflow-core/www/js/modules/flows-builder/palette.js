@@ -242,12 +242,16 @@ export class FlowPalette {
     const varName = nodeColorVar(tpl.node_type, cat);
     const name = this._nameOf(tpl);
     const desc = this._descOf(tpl);
+    // A tool row leads with the tool and puts the addon on its own line, so a
+    // long instance name can no longer push the tool out of the clamp.
+    const shownName = tpl.rowName ?? name;
+    const shownSub = tpl.rowSub ?? desc;
     return `
       <tf-button variant="ghost" wrap class="fb-node-item${tpl.category === 'tentaflow' ? ' fb-node-clamped' : ''}" data-index="${index}" data-node-type="${escapeAttr(tpl.node_type)}" title="${escapeAttr(desc ? `${name}\n${desc}` : name)}" ${this.readOnly ? 'disabled' : ''} style="--node-color: var(${varName})">
         <div class="fb-node-icon"><svg><use href="#i-${iconId}"/></svg></div>
         <div class="fb-node-info">
-          <div class="fb-node-name">${escapeHtml(name)}</div>
-          ${desc ? `<div class="fb-node-desc">${escapeHtml(desc)}</div>` : ''}
+          <div class="fb-node-name">${escapeHtml(shownName)}</div>
+          ${shownSub ? `<div class="fb-node-desc">${escapeHtml(shownSub)}</div>` : ''}
         </div>
       </tf-button>`;
   }

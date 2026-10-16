@@ -120,11 +120,12 @@ test('a flow, a block and an addon tool dropped from the palette survive save an
   await expect(group.locator('[data-subgroup]')).toHaveCount(3);
   await expect(group.locator('.fb-node-item', { hasText: FLOW_NAME })).toHaveCount(1);
   await expect(group.locator('.fb-node-item', { hasText: 'Language model' })).toHaveCount(1);
-  await expect(group.locator('.fb-node-item', { hasText: 'Notes B3 › search_notes' })).toHaveCount(1);
+  await expect(group.locator('.fb-node-item', { hasText: 'search_notes' })).toHaveCount(1);
+  await expect(group.locator('.fb-node-item', { hasText: 'search_notes' }).locator('.fb-node-desc')).toHaveText('Notes B3');
 
   await dragToCanvas(page, FLOW_NAME, 120, 150);
   await dragToCanvas(page, 'Language model', 360, 150);
-  await dragToCanvas(page, 'Notes B3 › search_notes', 600, 150);
+  await dragToCanvas(page, 'search_notes', 600, 150);
 
   await page.locator('[data-role="save"]').click();
 
