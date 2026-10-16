@@ -26,6 +26,16 @@ import '/js/components/tf-tabs.js';
 import '/js/components/tf-file-input.js';
 import '/js/components/tf-table.js';
 
+// Delete and undo must keep working after a click on Save or a palette Enter
+// leaves focus on a button, so only elements that consume these keys
+// themselves (text fields, pickers, open dialogs and menus) swallow them.
+const TEXT_ENTRY_TAGS = new Set(['INPUT', 'TEXTAREA', 'SELECT', 'TF-INPUT', 'TF-TEXTAREA', 'TF-SEARCHBOX',
+  'TF-COMBOBOX', 'TF-SELECT', 'TF-DATEPICKER', 'TF-MENU', 'TF-MODAL', 'TF-WINDOW', 'DIALOG']);
+function isTextEntryOrDialog(element) {
+  return element.isContentEditable === true || TEXT_ENTRY_TAGS.has(element.tagName)
+    || element.getAttribute?.('role') === 'dialog';
+}
+
 export function openFlowBuilder(flowId, { mode = 'flow' } = {}) {
   return Router.navigate('flow-builder', { flowId, mode });
 }
@@ -1008,9 +1018,7 @@ const FlowBuilderScreen = {
   _onKey(ev) {
     const s = this._state;
     if (!s) return;
-    if (ev.composedPath().some((element) => element.tagName?.startsWith('TF-') || element.isContentEditable)) return;
-    const tag = (ev.target.tagName || '').toUpperCase();
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (ev.composedPath().some(isTextEntryOrDialog)) return;
     if (s.readOnly) return;
     if (ev.key === 'Delete' || ev.key === 'Backspace') {
       s.canvas.deleteSelected();

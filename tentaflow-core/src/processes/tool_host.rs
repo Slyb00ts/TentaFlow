@@ -82,8 +82,8 @@ pub fn select_offered_tools(
             // The instance id tells two instances apart when no name is known.
             addon_name: labels
                 .get(&tool.addon_id)
-                .filter(|label| !label.is_empty())
                 .map(|label| truncate_chars(label))
+                .filter(|label| label.chars().any(|c| !c.is_whitespace() && !c.is_control()))
                 .unwrap_or_else(|| tool.addon_id.clone()),
             description: truncate_chars(&tool.description),
             addon_id: tool.addon_id,
@@ -629,6 +629,21 @@ mod tests {
         );
         let names: Vec<&str> = offered.iter().map(|t| t.addon_name.as_str()).collect();
         assert_eq!(names, ["notes-a", "Notes", "notes-c"]);
+    }
+
+    #[test]
+    fn a_label_of_only_blanks_or_control_characters_falls_back_to_the_id() {
+        let labels = std::collections::HashMap::from([
+            ("notes-a".to_owned(), "  \t\u{7} ".to_owned()),
+            ("notes-b".to_owned(), "\u{0}\u{1}".to_owned()),
+        ]);
+        let offered = select_offered_tools(
+            vec![definition("notes-a", "search", ""), definition("notes-b", "search", "")],
+            |_| true,
+            &labels,
+        );
+        let names: Vec<&str> = offered.iter().map(|t| t.addon_name.as_str()).collect();
+        assert_eq!(names, ["notes-a", "notes-b"]);
     }
 
     #[tokio::test]

@@ -338,22 +338,23 @@
   color: var(--tf-text, #f5f6ff);
   line-height: 1.2;
 }
-/* Names and descriptions of dropped-in flows and addon tools are
-   user-authored and unbounded; two lines each, the full text is the row title. */
+/* Names and descriptions of the BPMN TentaFlow group (flows, addon tools) are
+   user-authored and unbounded; those rows keep two lines each and the full
+   text is the row title. Other palettes show their text unclamped. */
 .fb-node-name,
-.fb-node-desc {
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  overflow-wrap: anywhere;
-}
-.fb-node-name { -webkit-line-clamp: 2; line-clamp: 2; }
+.fb-node-desc { overflow-wrap: anywhere; }
 .fb-node-desc {
   font-size: 11px;
   color: var(--tf-text-3, #6a7196);
   line-height: 1.4;
   margin-top: 2px;
+}
+.fb-node-clamped .fb-node-name,
+.fb-node-clamped .fb-node-desc {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  text-overflow: ellipsis;
   -webkit-line-clamp: 2;
   line-clamp: 2;
 }

@@ -181,22 +181,35 @@ fn options(ctx: &HandlerContext, actor: &ProcessActor) -> Result<P, ProtocolErro
     }
     let executor = dispatcher(ctx)?;
     let mut service_flows = Vec::new();
-    for flow in crate::db::repository::list_flows(&ctx.state.db, 0, 1001).map_err(error)? {
-        if flow.status != "active" {
-            continue;
+    // Inactive and unauthorized rows sort among the allowed ones, so a fixed
+    // window could hide an allowed flow; read the table page by page instead.
+    let mut offset = 0;
+    loop {
+        let page = crate::db::repository::list_flows(&ctx.state.db, offset, FLOW_SCAN_PAGE)
+            .map_err(error)?;
+        let exhausted = (page.len() as i64) < FLOW_SCAN_PAGE;
+        offset += page.len() as i64;
+        for flow in page {
+            if flow.status != "active" {
+                continue;
+            }
+            let Ok(meta) =
+                executor.authorize_process_flow(&flow.id, &actor.user_id, &actor.org_id)
+            else {
+                continue;
+            };
+            if executor.snapshot_flow(&flow.id, &meta).is_ok() {
+                service_flows.push(ProcessOptionFlow {
+                    flow_id: flow.id,
+                    name: bounded_name(&flow.name),
+                    description: crate::processes::tool_host::truncate_chars(
+                        flow.description.as_deref().unwrap_or_default(),
+                    ),
+                });
+            }
         }
-        let Ok(meta) = executor.authorize_process_flow(&flow.id, &actor.user_id, &actor.org_id)
-        else {
-            continue;
-        };
-        if executor.snapshot_flow(&flow.id, &meta).is_ok() {
-            service_flows.push(ProcessOptionFlow {
-                flow_id: flow.id,
-                name: bounded_name(&flow.name),
-                description: crate::processes::tool_host::truncate_chars(
-                    flow.description.as_deref().unwrap_or_default(),
-                ),
-            });
+        if exhausted || service_flows.len() > 1000 {
+            break;
         }
     }
     if service_flows.len() > 1000 {
@@ -222,6 +235,7 @@ fn bounded_name(name: &str) -> String {
 const MAX_TOOL_OPTIONS: usize = 1000;
 /// Longest flow name or assignee name sent to the designer, in characters.
 const MAX_OPTION_NAME_CHARS: usize = 256;
+const FLOW_SCAN_PAGE: i64 = 500;
 // Worst-case encoded size of a flow row (36-byte id, a name and a description
 // of four-byte characters) and of an assignee row (36-byte id, a name).
 const MAX_FLOW_OPTION_BYTES: usize = 36
@@ -2106,6 +2120,51 @@ mod tests {
         let failure = service_tool_options(executor, &actor).unwrap_err();
         assert_eq!(failure.message, "the addon tool catalogue is unavailable");
         refused(&ctx, P::OptionsRequest {}).await;
+    }
+
+    #[tokio::test]
+    async fn options_truncate_long_flow_names_and_find_allowed_flows_past_draft_rows() {
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "scan-author");
+        let ctx = context(&state, &actor);
+        let graph = test_support::graph("scan", None);
+        let last = test_support::flow(&state.db, &actor, &graph);
+        state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "UPDATE flows SET name = ?1, description = ?2 WHERE id = ?3",
+                rusqlite::params!["z".repeat(300), "d".repeat(600), last],
+            )
+            .unwrap();
+        // 1100 draft rows sort before the only allowed flow.
+        state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1100) \
+                 INSERT INTO flows(id, name, description, version, is_default, service_type, flow_json, status, \
+                   published_model_name, created_at, updated_at, is_system) \
+                 SELECT 'bulk-' || i, 'a' || printf('%05d', i), description, version, 0, NULL, flow_json, 'draft', \
+                   NULL, created_at, updated_at, 0 FROM n, flows WHERE flows.id = ?1",
+                rusqlite::params![last],
+            )
+            .unwrap();
+        let P::OptionsResponse { service_flows, .. } = request(&ctx, P::OptionsRequest {}).await
+        else {
+            panic!("typed options expected")
+        };
+        let found = service_flows
+            .iter()
+            .find(|flow| flow.flow_id == last)
+            .expect("an allowed flow past 1001 draft rows is offered");
+        assert_eq!(found.name.chars().count(), MAX_OPTION_NAME_CHARS);
+        assert_eq!(
+            found.description.chars().count(),
+            crate::processes::tool_host::MAX_OFFERED_TEXT_CHARS
+        );
     }
 
     #[tokio::test]

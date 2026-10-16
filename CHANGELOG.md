@@ -87,6 +87,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   Dodanie z palety klawiszem lub kliknięciem układa kolejne węzły kaskadą zamiast
   na jednym punkcie, wyszukiwanie ignoruje białe znaki na brzegach, a po Enter fokus
   zostaje na wierszu. Nagłówki podgrup mają rolę `heading` i kontrast 11:1.
+- Paleta i płótno BPMN (B3.3a, trzecia runda): dodanie bez pozycji szuka wolnego miejsca
+  testem przecięcia prostokątów (z rzeczywistym rozmiarem węzła i odstępem), więc nowe
+  węzły nie nakładają się na siebie ani na istniejące; upuszczenie zachowuje pozycję.
+  Delete i Ctrl+Z działają także po kliknięciu Zapisz lub Enter na palecie (klawisze
+  ignorują tylko pola tekstowe i okna). Obcięcie do dwóch linii dotyczy wyłącznie grupy
+  „Bloki TentaFlow”. Etykieta z sufiksem id zachowuje nazwę addonu i nawias, a etykieta
+  złożona z samych białych znaków wraca do id instancji. Opcje procesu przeglądają
+  tabelę przepływów stronami, więc nieaktywne wiersze nie ukrywają dozwolonych przepływów.
 
 ### TentaNas
 

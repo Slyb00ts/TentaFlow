@@ -886,20 +886,47 @@ export class FlowCanvas {
     return node;
   }
 
-  // Walks a diagonal cascade (wrapping to a shifted row after eight steps) to
-  // the first spot whose corner is not within two grid cells of another node.
+  _nodeSize(node) {
+    if (this.mode === 'bpmn') return { w: node.width || 240, h: node.height || 96 };
+    const element = this.nodesLayer?.querySelector(`[data-node-id="${CSS.escape(node.id)}"]`);
+    const measured = element ? element.offsetHeight / this._positiveZoom() : 0;
+    return { w: NODE_WIDTH, h: Math.max(NODE_H_APPROX, measured || 0) };
+  }
+
+  // Scans a bounded grid of candidate corners, nearest to the requested spot
+  // first, for one whose rectangle (plus a gap) intersects no existing node.
+  // Corners inside the visible canvas win; with no free one there, the node
+  // goes right of the rightmost node so it never overlaps.
   _moveToFreeSpot(node) {
-    const step = GRID * 4;
-    const taken = (x, y) => this.nodes.some((other) => Math.abs(other.x - x) < GRID * 2 && Math.abs(other.y - y) < GRID * 2);
-    for (let k = 0; k < 64; k += 1) {
-      const x = node.x + (k % 8) * step;
-      const y = node.y + (k % 8) * step + Math.floor(k / 8) * GRID * 2;
-      if (!taken(x, y)) {
-        node.x = x;
-        node.y = y;
-        return;
+    const gap = GRID * 2;
+    const size = this._nodeSize(node);
+    const free = (x, y) => this.nodes.every((other) => {
+      const o = this._nodeSize(other);
+      return x >= other.x + o.w + gap || x + size.w + gap <= other.x
+        || y >= other.y + o.h + gap || y + size.h + gap <= other.y;
+    });
+    const zoom = this._positiveZoom();
+    const rect = this.root.getBoundingClientRect();
+    const known = rect.width > 0 && rect.height > 0;
+    const left = known ? -this.view.x / zoom : node.x - 800;
+    const top = known ? -this.view.y / zoom : node.y - 500;
+    const width = known ? rect.width / zoom : 1600;
+    const height = known ? rect.height / zoom : 1000;
+    const step = Math.max(gap, snapGridCoordinate(Math.max(width, height) / 100));
+    const candidates = [];
+    for (let y = snapGridCoordinate(top + gap); y + size.h + gap <= top + height; y += step) {
+      for (let x = snapGridCoordinate(left + gap); x + size.w + gap <= left + width; x += step) {
+        candidates.push([x, y]);
       }
     }
+    candidates.sort((p, q) => Math.hypot(p[0] - node.x, p[1] - node.y) - Math.hypot(q[0] - node.x, q[1] - node.y));
+    const spot = candidates.find(([x, y]) => free(x, y));
+    if (spot) {
+      [node.x, node.y] = spot;
+      return;
+    }
+    const right = this.nodes.reduce((max, other) => Math.max(max, other.x + this._nodeSize(other).w), node.x);
+    node.x = snapGridCoordinate(right + gap);
   }
 
   updateNodeConfig(nodeId, patch) {

@@ -69,14 +69,31 @@ export function boundedNodeName(text, limit = MAX_NODE_NAME_BYTES) {
 
 const nameBytes = (text) => [...text].reduce((sum, char) => sum + utf8Length(char), 0);
 
-// "Addon › tool"; the addon part yields to the tool name when the whole label
-// would not fit, so the tool that runs is never the part that is cut.
+const ADDON_NAME_RESERVE_BYTES = 16;
+const MIN_ID_BYTES = 8;
+
+// "Addon › tool (id)"; the id part is bounded first, with its parentheses kept
+// outside the cut, then the tool name yields only if the label is still too
+// long, and the addon name takes whatever room is left. A label never starts
+// with the separator: an addon name that does not fit is dropped whole.
 function toolLabel(tool, withId) {
-  const toolName = boundedNodeName(tool.toolName);
+  let toolName = boundedNodeName(tool.toolName);
   const addonName = boundedNodeName(tool.addonName);
-  if (!addonName) return toolName;
-  const suffix = ` › ${toolName}${withId ? ` (${boundedNodeName(tool.addonId)})` : ''}`;
-  return boundedNodeName(`${boundedNodeName(addonName, Math.max(0, MAX_NODE_NAME_BYTES - nameBytes(suffix)))}${suffix}`);
+  const addonId = withId ? boundedNodeName(tool.addonId) : '';
+  const separator = addonName ? ' › ' : '';
+  const reserve = addonName ? nameBytes(separator) + Math.min(nameBytes(addonName), ADDON_NAME_RESERVE_BYTES) : 0;
+  let idPart = '';
+  if (addonId) {
+    const frame = 3;
+    const idRoom = Math.max(MIN_ID_BYTES, MAX_NODE_NAME_BYTES - frame - reserve - nameBytes(toolName));
+    idPart = ` (${boundedNodeName(addonId, idRoom)})`;
+  }
+  const toolRoom = MAX_NODE_NAME_BYTES - reserve - nameBytes(idPart);
+  if (nameBytes(toolName) > toolRoom) toolName = boundedNodeName(toolName, Math.max(1, toolRoom));
+  const tail = `${separator}${toolName}${idPart}`;
+  const addonRoom = MAX_NODE_NAME_BYTES - nameBytes(tail);
+  const addon = addonName ? boundedNodeName(addonName, addonRoom) : '';
+  return addon ? `${addon}${tail}` : `${toolName}${idPart}`;
 }
 
 /**

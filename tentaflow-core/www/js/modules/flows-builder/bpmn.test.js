@@ -4863,3 +4863,109 @@ test('successive adds without a position cascade instead of stacking', () => {
   assert.equal(`${plain.x},${plain.y}`, `${dropped.x},${dropped.y}`, 'a drop keeps the exact position the user chose');
   graph.destroy();
 });
+
+test('the dedupe suffix keeps the addon name, closes its parenthesis and never leads with the separator', () => {
+  const tool = 't'.repeat(128);
+  const rows = ['a', 'b'].map((first) => ({
+    addonId: `${first}${'i'.repeat(127)}`, toolName: tool, description: '', addonName: 'Notes',
+  }));
+  const labels = processTemplates({ ...options, serviceTools: rows }).filter((row) => row.subgroup === 'tools').map((row) => row.label);
+  assert.equal(new Set(labels).size, 2);
+  for (const label of labels) {
+    assert.ok(validNodeName(label));
+    assert.ok(label.startsWith('Notes › '), label.slice(0, 20));
+    assert.ok(label.endsWith(')'));
+    assert.ok(label.includes(` ${tool} (`), 'the tool name is not cut while the id can yield');
+  }
+  const huge = processTemplates({ ...options, serviceTools: ['a', 'b'].map((first) => ({
+    addonId: `${first}${'i'.repeat(127)}`, toolName: 't'.repeat(250), description: '', addonName: 'N'.repeat(300) })) })
+    .filter((row) => row.subgroup === 'tools').map((row) => row.label);
+  for (const label of huge) {
+    assert.ok(validNodeName(label));
+    assert.ok(!label.startsWith('›') && !label.startsWith(' '));
+    assert.ok(label.endsWith(')'));
+  }
+});
+
+test('rows with an empty cleaned addon name are still told apart by their instance id', () => {
+  const labels = processTemplates({ ...options, serviceTools: [
+    { addonId: 'x-1', toolName: 'search', description: '', addonName: '\u0001 ' },
+    { addonId: 'x-2', toolName: 'search', description: '', addonName: '' },
+  ] }).filter((row) => row.subgroup === 'tools').map((row) => row.label);
+  assert.deepEqual(labels, ['search (x-1)', 'search (x-2)']);
+});
+
+test('Delete and undo still reach the canvas after focus rests on a button, but not in text fields or dialogs', () => {
+  const calls = [];
+  const state = { readOnly: false, canvas: { deleteSelected: () => calls.push('delete'), undo: () => calls.push('undo'), selectedIds: new Set() } };
+  const press = (element, init) => {
+    const handler = (ev) => builder._onKey.call({ _state: state }, ev);
+    document.addEventListener('keydown', handler);
+    element.dispatchEvent(new window.KeyboardEvent('keydown', { bubbles: true, composed: true, cancelable: true, ...init }));
+    document.removeEventListener('keydown', handler);
+  };
+  const host = document.createElement('div'); document.body.append(host);
+  host.innerHTML = '<tf-button id="save"></tf-button><tf-input id="field"></tf-input><tf-searchbox id="find"></tf-searchbox>'
+    + '<tf-modal><tf-button id="inside"></tf-button></tf-modal><textarea id="plain"></textarea>';
+  const at = (id) => host.querySelector(`#${id}`);
+  press(at('save'), { key: 'Delete' });
+  press(at('save'), { key: 'z', ctrlKey: true });
+  assert.deepEqual(calls, ['delete', 'undo']);
+  for (const id of ['field', 'find', 'inside', 'plain']) press(at(id), { key: 'Delete' });
+  assert.deepEqual(calls, ['delete', 'undo'], 'text entry and dialogs keep their own keys');
+  host.remove();
+});
+
+test('only the TentaFlow group rows are clamped to two lines and every row keeps its full title', async () => {
+  const root = document.createElement('aside'); document.body.append(root);
+  const palette = new FlowPalette(root, { mode: 'bpmn', processOptions: tentaflowOptions }); await palette.init();
+  const rows = [...root.querySelectorAll('.fb-node-item')];
+  const clamped = rows.filter((row) => row.classList.contains('fb-node-clamped'));
+  assert.ok(clamped.length > 0 && clamped.length < rows.length);
+  for (const row of clamped) assert.equal(row.dataset.nodeType, 'bpmn_service_task');
+  assert.ok(rows.filter((row) => row.dataset.nodeType !== 'bpmn_service_task').every((row) => !row.classList.contains('fb-node-clamped')));
+  assert.ok(rows.every((row) => row.getAttribute('title')));
+  const css = readFileSync(new URL('../../../css/flows-builder.css', import.meta.url), 'utf8');
+  assert.ok(!/^\.fb-node-desc\s*\{[^}]*line-clamp/m.test(css), 'the clamp is scoped to .fb-node-clamped');
+  palette.destroy();
+});
+
+const overlaps = (a, b, size) => {
+  const sa = size(a); const sb = size(b);
+  return a.x < b.x + sb.w && a.x + sa.w > b.x && a.y < b.y + sb.h && a.y + sa.h > b.y;
+};
+const noOverlaps = (nodes, size) => nodes.every((a, i) => nodes.slice(i + 1).every((b) => !overlaps(a, b, size)));
+
+test('a click add on a crowded process canvas intersects no existing node', () => {
+  const graph = canvas();
+  const template = processTemplates().find((row) => row.node_type === 'bpmn_service_task');
+  const size = (n) => ({ w: n.width, h: n.height });
+  graph.nodes = [];
+  for (let row = 0; row < 8; row += 1) for (let col = 0; col < 8; col += 1) {
+    graph.nodes.push({ id: `d${row}_${col}`, type: 'bpmn_service_task', x: 40 + col * 280, y: 40 + row * 130, width: 240, height: 96, config: {} });
+  }
+  const crowded = graph.nodes.length;
+  for (let index = 0; index < 12; index += 1) graph.addNodeFromTemplate(template, 700, 400, { cascade: true });
+  assert.equal(graph.nodes.length, crowded + 12);
+  assert.ok(noOverlaps(graph.nodes, size), 'no pair of nodes intersects');
+  graph.destroy();
+});
+
+test('twelve successive keyboard adds on an empty canvas never overlap, for BPMN and classic nodes', () => {
+  const graph = canvas();
+  const template = processTemplates().find((row) => row.node_type === 'bpmn_user_task');
+  for (let index = 0; index < 12; index += 1) graph.addNodeFromTemplate(template, 500, 400, { cascade: true });
+  assert.ok(noOverlaps(graph.nodes.slice(-12), (n) => ({ w: n.width, h: n.height })));
+
+  const root = document.createElement('div'); document.body.append(root);
+  const classic = new FlowCanvas(root, { mode: 'flow' });
+  const tpl = { node_type: 'activity_result', category: 'output', label: 'Result', default_config: '{}', input_ports: ['in'], output_ports: [] };
+  classic.setTemplates([tpl]);
+  classic.setData([{ id: 'Seed', type: 'activity_result', label: '', position: { x: 380, y: 300 }, config: {} }], []);
+  for (let index = 0; index < 12; index += 1) classic.addNodeFromTemplate(tpl, 520, 355, { cascade: true });
+  assert.equal(classic.nodes.length, 13);
+  assert.ok(noOverlaps(classic.nodes, () => ({ w: 280, h: 110 })));
+  const dropped = classic.addNodeFromTemplate(tpl, 520, 355);
+  assert.deepEqual([dropped.x, dropped.y], [380, 300], 'a drop keeps the exact position');
+  classic.destroy(); graph.destroy();
+});

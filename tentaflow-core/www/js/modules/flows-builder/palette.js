@@ -243,7 +243,7 @@ export class FlowPalette {
     const name = this._nameOf(tpl);
     const desc = this._descOf(tpl);
     return `
-      <tf-button variant="ghost" wrap class="fb-node-item" data-index="${index}" data-node-type="${escapeAttr(tpl.node_type)}" title="${escapeAttr(desc ? `${name}\n${desc}` : name)}" ${this.readOnly ? 'disabled' : ''} style="--node-color: var(${varName})">
+      <tf-button variant="ghost" wrap class="fb-node-item${tpl.category === 'tentaflow' ? ' fb-node-clamped' : ''}" data-index="${index}" data-node-type="${escapeAttr(tpl.node_type)}" title="${escapeAttr(desc ? `${name}\n${desc}` : name)}" ${this.readOnly ? 'disabled' : ''} style="--node-color: var(${varName})">
         <div class="fb-node-icon"><svg><use href="#i-${iconId}"/></svg></div>
         <div class="fb-node-info">
           <div class="fb-node-name">${escapeHtml(name)}</div>
