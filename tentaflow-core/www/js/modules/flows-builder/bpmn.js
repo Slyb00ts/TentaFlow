@@ -48,6 +48,9 @@ function localized(key, fallback) {
 }
 
 const MAX_NODE_NAME_BYTES = 256;
+// Bidirectional controls reorder the text around them, so the server refuses
+// them in a node name (processes/model.rs valid_node_name).
+const BIDI_CONTROLS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
 const utf8Length = (char) => {
   const code = char.codePointAt(0);
   return code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
@@ -59,7 +62,7 @@ const utf8Length = (char) => {
 export function boundedNodeName(text, limit = MAX_NODE_NAME_BYTES) {
   let out = '';
   let bytes = 0;
-  for (const char of String(text ?? '').replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').trim()) {
+  for (const char of String(text ?? '').replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').replace(BIDI_CONTROLS, '').trim()) {
     bytes += utf8Length(char);
     if (bytes > limit) break;
     out += char;
@@ -70,9 +73,10 @@ export function boundedNodeName(text, limit = MAX_NODE_NAME_BYTES) {
 const nameBytes = (text) => [...text].reduce((sum, char) => sum + utf8Length(char), 0);
 
 // A label with nothing but whitespace, control or invisible format characters
-// (zero-width space, BOM, soft hyphen) shows nothing; the server applies the
-// same predicate in processes/tool_host.rs.
-const BLANK_LABEL = /^[\p{White_Space}\p{Cc}\p{Cf}]*$/u;
+// (zero-width space, BOM, soft hyphen) shows nothing, and so do the filler
+// letters below that are not category Cf; the server applies the same
+// predicate in processes/tool_host.rs.
+const BLANK_LABEL = /^[\p{White_Space}\p{Cc}\p{Cf}\u034f\u115f\u1160\u3164\uffa0]*$/u;
 export const isBlankLabel = (text) => BLANK_LABEL.test(String(text ?? ''));
 
 // Keeps both ends of an id: instances of one package differ at the end, so a
@@ -96,6 +100,7 @@ function shortenId(text, limit) {
 
 const ADDON_NAME_RESERVE_BYTES = 16;
 const MIN_ID_BYTES = 8;
+const ROW_ID_BYTES = 64;
 
 // "Addon › tool (id)"; the id part is bounded first, with its parentheses kept
 // outside the cut, then the tool name yields only if the label is still too
@@ -140,9 +145,13 @@ function tentaflowTemplates(options) {
     labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
   }
   const toolRow = (tool) => {
-    const shown = isBlankLabel(tool.addonName) ? tool.addonId : boundedNodeName(tool.addonName);
-    return { rowName: boundedNodeName(tool.toolName),
-      rowSub: labelCounts.get(toolLabel(tool, false)) > 1 ? `${shown} (${tool.addonId})` : shown };
+    const id = shortenId(tool.addonId, ROW_ID_BYTES);
+    const blank = isBlankLabel(tool.addonName);
+    // The id leads, because the two-line clamp cuts the end of a long instance
+    // name; a blank name already shows the id, once.
+    const duplicate = labelCounts.get(toolLabel(tool, false)) > 1;
+    const rowSub = blank ? id : duplicate ? `(${id}) ${boundedNodeName(tool.addonName)}` : boundedNodeName(tool.addonName);
+    return { rowName: boundedNodeName(tool.toolName), rowSub };
   };
   return [
     ...(options.serviceFlows || []).map((flow) =>

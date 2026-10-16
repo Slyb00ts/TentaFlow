@@ -105,6 +105,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   jest pusta po obu stronach. Opcje procesu przeglądają przepływy kursorem (nazwa, id).
   Przepływy z krawędziami `from`/`to` (lub `source`/`target`) otwierają się z narysowanymi
   połączeniami i zapisują jako `from_node`/`to_node`.
+- Paleta i płótno BPMN (B3.3a, piąta runda): powtórne szukanie miejsca zaczyna od
+  pierwotnego celu i używa tych samych prostokątów, a zewnętrzna etykieta zadania
+  wlicza się do miejsca i przesunięcia widoku. Odstęp od krawędzi płótna to margines
+  przesunięcia przeliczony przez zoom. Wiersze narzędzi o tej samej nazwie addonu
+  zaczynają się od id instancji (wiersz bez nazwy pokazuje id raz). Kliknięcie
+  płótna lub węzła zabiera fokus polu tekstowemu spoza płótna, więc Delete i Ctrl+Z
+  działają po edycji nazwy. Serwer odrzuca w nazwie węzła znaki sterujące kierunkiem
+  tekstu (bidi), projektant je usuwa, a znaki wypełniające (U+034F, U+115F, U+1160,
+  U+3164, U+FFA0) liczą się po obu stronach jako puste.
 
 ### TentaNas
 

@@ -27,7 +27,7 @@ const { emptyProcessModel, processToCanvas, canvasToProcess, cloneProcessBody, p
 const { FlowCanvas } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
-const { processTemplates, boundedNodeName } = await import('./bpmn.js');
+const { processTemplates, boundedNodeName, isBlankLabel } = await import('./bpmn.js');
 const { openProcessCalendar, openProcessInstance, openProcessInstances, openProcessMessageDetail, openProcessMessageSend, openProcessRun, openProcessSchedule, processEventText, processLifecycleReasonText, processTimerText } = await import('./process-monitor.js');
 const { simulationWindow } = await import('./process-simulation.js');
 const { default: builder } = await import('../flows-builder.js');
@@ -4971,12 +4971,16 @@ test('twelve successive keyboard adds on an empty canvas never overlap, for BPMN
   classic.destroy(); graph.destroy();
 });
 
+// `height` is a number for every node or a function of the node id.
 function stubClassicNodeHeight(height) {
   const proto = window.HTMLElement.prototype;
   const original = Object.getOwnPropertyDescriptor(proto, 'offsetHeight');
   Object.defineProperty(proto, 'offsetHeight', {
     configurable: true,
-    get() { return this.classList?.contains('fb-node') ? height : 0; },
+    get() {
+      if (!this.classList?.contains('fb-node')) return 0;
+      return typeof height === 'function' ? height(this.dataset.nodeId) : height;
+    },
   });
   return () => {
     if (original) Object.defineProperty(proto, 'offsetHeight', original);
@@ -4993,7 +4997,7 @@ function classicCanvas(width, height) {
   return { graph, tpl, root };
 }
 
-test('classic click adds avoid rendered nodes that are taller than the first estimate and a drop is centred on the cursor', () => {
+test('classic click adds avoid nodes rendered taller than the estimate and a drop is centred on the measured height', () => {
   const restore = stubClassicNodeHeight(190);
   try {
     const { graph, tpl } = classicCanvas(1600, 950);
@@ -5010,7 +5014,7 @@ test('classic click adds avoid rendered nodes that are taller than the first est
   } finally { restore(); }
 });
 
-test('a cascade add is one undo entry even when the real size moves it', () => {
+test('a cascade add is exactly one undo entry', () => {
   const restore = stubClassicNodeHeight(190);
   try {
     const { graph, tpl } = classicCanvas(1600, 950);
@@ -5070,6 +5074,130 @@ test('free-spot search reads the DOM once per node, not once per candidate', () 
   } finally { restore(); }
 });
 
+test('a cascade add re-measures the rendered node and moves off a spot that only fit the estimate', () => {
+  const restore = stubClassicNodeHeight((id) => (id.startsWith('Seed') ? 110 : 190));
+  try {
+    const { graph, tpl } = classicCanvas(340, 600);
+    // Only y 160 on the candidate grid fits a 110 px node between the seeds; a 190 px one fits nowhere in view.
+    graph.setData([
+      { id: 'SeedA', type: 'activity_result', label: '', position: { x: 20, y: 20 }, config: {} },
+      { id: 'SeedB', type: 'activity_result', label: '', position: { x: 20, y: 290 }, config: {} },
+    ], []);
+    graph.view = { x: 0, y: 0, zoom: 1 };
+    const before = graph.history.length;
+    const spots = [];
+    const origins = [];
+    const search = graph._moveToFreeSpot.bind(graph);
+    graph._moveToFreeSpot = (...args) => { const size = search(...args); spots.push([args[0].x, args[0].y, size.h]); origins.push({ ...args[3] }); return size; };
+    const node = graph.addNodeFromTemplate(tpl, 160, 225, { cascade: true });
+    assert.deepEqual(spots[0], [20, 160, 110], 'the first pass fits the estimate');
+    assert.equal(spots.length, 2, 'the rendered 190 px height triggered one more search');
+    assert.deepEqual(origins[1], origins[0], 'the second search starts from the original target, not the first spot');
+    assert.deepEqual(origins[0], { x: 20, y: 170 }, 'the target is off the candidate grid, so it differs from the first spot');
+    assert.notDeepEqual([node.x, node.y], [20, 160], 'the node left the spot that fit the estimate');
+    const height = (n) => (n.id.startsWith('Seed') ? 110 : 190);
+    assert.ok(noOverlaps(graph.nodes, (n) => ({ w: 280, h: height(n) })), 'nothing overlaps at the rendered heights');
+    assert.equal(graph.history.length, before + 1);
+    graph.destroy();
+  } finally { restore(); }
+});
+
+test('a service task with an external label keeps the label inside the canvas after placement', () => {
+  const proto = window.HTMLElement.prototype;
+  const saved = ['offsetWidth', 'offsetHeight', 'scrollHeight'].map((name) => [name, Object.getOwnPropertyDescriptor(proto, name)]);
+  Object.defineProperty(proto, 'offsetWidth', { configurable: true, get() { return this.classList?.contains('fb-process-label') ? 200 : 0; } });
+  Object.defineProperty(proto, 'offsetHeight', { configurable: true, get() { return this.classList?.contains('fb-process-label') ? 40 : 0; } });
+  Object.defineProperty(proto, 'scrollHeight', { configurable: true, get() { return this.parentElement?.classList?.contains('fb-process-symbol') ? 90 : 0; } });
+  try {
+    const graph = canvas();
+    graph.root.getBoundingClientRect = () => ({ left: 0, top: 0, width: 800, height: 600, right: 800, bottom: 600 });
+    graph.nodes = [];
+    graph.view = { x: 0, y: 0, zoom: 1 };
+    // The content clamp counts labels too and would hide a placement that ignores them.
+    graph._clampView = () => {};
+    const template = processTemplates().find((row) => row.node_type === 'bpmn_service_task');
+    const node = graph.addNodeFromTemplate({ ...template, label: 'A very long tool name' , preset: {} }, 400, 20, { cascade: true });
+    const label = graph.nodesLayer.querySelector(`[data-node-id="${node.id}"] .fb-process-label`);
+    assert.equal(label.hidden, false, 'the label is outside the box');
+    const labelTop = (node.y + parseFloat(label.style.top)) * graph.view.zoom + graph.view.y;
+    assert.ok(labelTop >= 20, `the label top is ${labelTop} px from the canvas top`);
+    graph.destroy();
+  } finally {
+    for (const [name, descriptor] of saved) {
+      if (descriptor) Object.defineProperty(proto, name, descriptor); else delete proto[name];
+    }
+  }
+});
+
+test('a spot found while zoomed out is visible without a further pan, and the pan maths hold at zoom 0.6', () => {
+  const graph = canvas();
+  graph.root.getBoundingClientRect = () => ({ left: 0, top: 0, width: 800, height: 600, right: 800, bottom: 600 });
+  graph.nodes = [];
+  // The content clamp (a separate 40 px rule) is not what is measured here.
+  graph._clampView = () => {};
+  graph.view = { x: -300, y: 150, zoom: 0.6 };
+  const template = processTemplates().find((row) => row.node_type === 'bpmn_service_task');
+  const node = graph.addNodeFromTemplate(template, 0, 0, { cascade: true });
+  assert.deepEqual([graph.view.x, graph.view.y], [-300, 150], 'a visible spot never pans');
+  const left = node.x * 0.6 - 300;
+  const top = node.y * 0.6 + 150;
+  assert.ok(left >= 20 && top >= 20 && left + node.width * 0.6 <= 780 && top + node.height * 0.6 <= 580);
+
+  const far = { x: 2000, y: -400 };
+  graph._applyView = () => {};
+  graph._panToReveal(far, { w: 240, h: 96, ox: 0, oy: 0 });
+  assert.equal(graph.view.x, -300 + 800 - 20 - (2240 * 0.6 - 300), 'right edge lands on the right margin');
+  assert.equal(graph.view.y, 150 + 20 - (-400 * 0.6 + 150), 'top edge lands on the top margin');
+  graph.destroy();
+});
+
+test('clicking the canvas or a node takes focus from a text field outside it', () => {
+  const graph = canvas();
+  const field = document.createElement('input'); document.body.append(field);
+  const pointerdown = (target, id) => target.dispatchEvent(new window.PointerEvent('pointerdown', {
+    bubbles: true, pointerId: id, button: 0, clientX: 10, clientY: 10 }));
+  field.focus();
+  assert.equal(document.activeElement, field);
+  pointerdown(graph.root, 61);
+  assert.notEqual(document.activeElement, field, 'an empty-canvas click blurs the field');
+  assert.equal(document.activeElement, graph.root);
+  window.dispatchEvent(new window.PointerEvent('pointerup', { pointerId: 61, button: 0 }));
+
+  const node = userNode(graph);
+  field.focus();
+  pointerdown(graph.nodesLayer.querySelector(`[data-node-id="${node.id}"]`), 62);
+  assert.notEqual(document.activeElement, field, 'a node click blurs the field');
+  window.dispatchEvent(new window.PointerEvent('pointerup', { pointerId: 62, button: 0 }));
+  field.remove(); graph.destroy();
+});
+
+test('palette labels drop bidi controls and the blank list matches the server', () => {
+  for (const code of [0x61c, 0x200e, 0x200f, 0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069]) {
+    const bidi = String.fromCodePoint(code);
+    assert.equal(boundedNodeName(`Notes${bidi}search`), 'Notessearch', `U+${code.toString(16)}`);
+    assert.ok(validNodeName(boundedNodeName(`a${bidi}b`)));
+  }
+  // Same list as the_blank_label_list_is_shared_with_the_designer in tool_host.rs.
+  const blank = [0x34f, 0x115f, 0x1160, 0x3164, 0xffa0, 0x61c, 0x200e, 0x200f, 0x202a, 0x202e,
+    0x2066, 0x2069, 0x200b, 0xfeff, 0xad, 0x20, 0x09];
+  for (const code of blank) assert.ok(isBlankLabel(String.fromCodePoint(code)), `U+${code.toString(16)} is blank`);
+  for (const code of [0x41, 0x3042, 0x1161]) assert.ok(!isBlankLabel(String.fromCodePoint(code)), `U+${code.toString(16)} is not blank`);
+});
+
+test('duplicate tool rows lead with the instance id so a long shared name cannot hide it', async () => {
+  const root = document.createElement('aside'); document.body.append(root);
+  const shared = 'Shared instance name '.repeat(9);
+  const palette = new FlowPalette(root, { mode: 'bpmn', processOptions: { ...options, serviceTools: ['inst-aaa', 'inst-bbb'].map((addonId) => ({
+    addonId, toolName: 'search', description: '', addonName: shared })) } });
+  await palette.init();
+  const subs = [...root.querySelectorAll('.fb-node-item[data-node-type="bpmn_service_task"]')]
+    .filter((row) => row.querySelector('.fb-node-name').textContent.trim() === 'search')
+    .map((row) => row.querySelector('.fb-node-desc').textContent.trim());
+  assert.ok(shared.length > 150);
+  assert.ok(subs[0].startsWith('(inst-aaa) ') && subs[1].startsWith('(inst-bbb) '), subs.join('|'));
+  palette.destroy();
+});
+
 test('dedupe keeps the end of a long instance id so sibling instances stay apart', () => {
   const labels = processTemplates({ ...options, serviceTools: ['notes-instance-1', 'notes-instance-2'].map((addonId) => ({
     addonId, toolName: 't'.repeat(250), description: '', addonName: 'Notes' })) })
@@ -5089,7 +5217,7 @@ test('invisible-only addon names fall back to the instance id like blank ones', 
     { addonId: 'x-2', toolName: 'search', description: '', addonName: '﻿­ ' },
   ] }).filter((row) => row.subgroup === 'tools');
   assert.deepEqual(labels.map((row) => row.label), ['search (x-1)', 'search (x-2)']);
-  assert.deepEqual(labels.map((row) => row.rowSub), ['x-1 (x-1)', 'x-2 (x-2)']);
+  assert.deepEqual(labels.map((row) => row.rowSub), ['x-1', 'x-2']);
 });
 
 test('a tool row names the tool on its first line and the addon on a separate line', async () => {
@@ -5107,7 +5235,7 @@ test('a tool row names the tool on its first line and the addon on a separate li
   assert.ok(search, 'the tool name is the name line');
   assert.ok(text(search, '.fb-node-desc').startsWith('Very long instance name'));
   const lookups = rows.filter((row) => text(row, '.fb-node-name') === 'lookup').map((row) => text(row, '.fb-node-desc'));
-  assert.deepEqual(lookups, ['Wiki (b-1)', 'Wiki (b-2)']);
+  assert.deepEqual(lookups, ['(b-1) Wiki', '(b-2) Wiki']);
   assert.match(search.getAttribute('title'), /›.*search/s, 'the title keeps the node name');
   palette.destroy();
 });

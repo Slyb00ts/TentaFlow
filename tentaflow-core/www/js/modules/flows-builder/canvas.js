@@ -19,6 +19,8 @@ const NODE_H_APPROX = 110;
 // ~8 px, poniżej z bloku zostają same wartości.
 const READABLE_MIN_ZOOM = 0.75;
 const GRID = 10;
+// Screen pixels kept between a revealed node and the canvas edge.
+const REVEAL_MARGIN = GRID * 2;
 
 function snapGridCoordinate(value) {
   const snapped = Math.round(value / GRID) * GRID;
@@ -883,27 +885,42 @@ export class FlowCanvas {
       node.y = snapGridCoordinate(pt.y - node.height / 2);
     }
     const classic = this.mode !== 'bpmn';
-    let placed = null;
-    if (cascade) placed = this._moveToFreeSpot(node, this._firstPassSize(node));
-    this.nodes.push(node);
-    this.render();
-    // A classic node's height is only known once it is rendered, so a drop is
-    // centred on the cursor and a cascade add is re-checked with the real size.
-    const real = classic ? this._renderedHeight(node) : 0;
-    if (real > 0) {
-      if (!cascade) {
+    if (!cascade) {
+      this.nodes.push(node);
+      this.render();
+      // A classic node's height is only known once it is rendered, so a drop is
+      // centred on the cursor with the measured size.
+      const real = classic ? this._renderedHeight(node) : 0;
+      if (real > 0) {
         node.y = snapGridCoordinate(pt.y - real / 2);
         this.render();
-      } else if (real > placed.h) {
-        placed = this._moveToFreeSpot(node, { w: NODE_WIDTH, h: real }, node);
-        this.render();
       }
+    } else {
+      this._placeCascade(node, classic);
     }
-    if (cascade) this._panToReveal(node, placed);
     this._pushHistory();
     this.selectNode(node.id);
     this.onChange();
     return node;
+  }
+
+  // A cascade add searches from where the add asked to land. The node is
+  // placed with its estimated size, rendered, then measured once: a classic
+  // node is taller than the estimate, a BPMN task may carry an external label
+  // outside its box. Only a footprint that outgrew the estimate is searched
+  // again, from the original target against the same neighbour rectangles.
+  _placeCascade(node, classic) {
+    const origin = { x: node.x, y: node.y };
+    const rects = this._nodeRects();
+    let placed = this._moveToFreeSpot(node, this._firstPassSize(node, rects), rects, origin);
+    this.nodes.push(node);
+    this.render();
+    const real = this._footprint(node, classic);
+    if (real.h > placed.h || real.w > placed.w || real.ox > placed.ox || real.oy > placed.oy) {
+      placed = this._moveToFreeSpot(node, real, rects, origin);
+      this.render();
+    }
+    this._panToReveal(node, this._footprint(node, classic));
   }
 
   // Rendered height in world units: offsetHeight ignores CSS transforms, so
@@ -913,65 +930,94 @@ export class FlowCanvas {
     return element ? element.offsetHeight || 0 : 0;
   }
 
-  // One DOM pass per placement: every rectangle is measured once, nodes that
-  // are not rendered yet get the tallest measured height.
-  _nodeRects(skip = null) {
+  // The rectangle a node occupies, as the box plus the offsets (ox, oy) from
+  // the footprint corner to the node corner: a classic node by its rendered
+  // height, a BPMN node together with its external label, which hangs outside
+  // the box and is positioned by _layoutProcessLabels relative to the node.
+  _footprint(node, classic) {
+    if (classic) {
+      const rendered = this._renderedHeight(node);
+      return { w: NODE_WIDTH, h: rendered || NODE_H_APPROX, ox: 0, oy: 0 };
+    }
+    const width = node.width || 240;
+    const height = node.height || 96;
+    const element = this.nodesLayer?.querySelector(`[data-node-id="${CSS.escape(node.id)}"]`);
+    const label = element?.querySelector('.fb-process-label');
+    let left = 0; let top = 0; let right = width; let bottom = height;
+    if (label && !label.hidden && label.offsetWidth > 0 && label.offsetHeight > 0) {
+      const x = parseFloat(label.style.left) || 0;
+      const y = parseFloat(label.style.top) || 0;
+      left = Math.min(0, x); top = Math.min(0, y);
+      right = Math.max(width, x + label.offsetWidth);
+      bottom = Math.max(height, y + label.offsetHeight);
+    }
+    const ox = Math.ceil(-left / GRID) * GRID;
+    const oy = Math.ceil(-top / GRID) * GRID;
+    return { w: right + ox, h: bottom + oy, ox, oy };
+  }
+
+  // Rectangles of every node, measured in one pass; a classic node that is not
+  // rendered yet gets the tallest measured height.
+  _nodeRects() {
     if (this.mode === 'bpmn') {
-      return this.nodes.filter((n) => n !== skip)
-        .map((n) => ({ x: n.x, y: n.y, w: n.width || 240, h: n.height || 96 }));
+      return this.nodes.map((n) => ({ x: n.x, y: n.y, w: n.width || 240, h: n.height || 96 }));
     }
     const heights = this.nodes.map((n) => this._renderedHeight(n));
     const typical = heights.reduce((max, h) => Math.max(max, h), NODE_H_APPROX);
-    return this.nodes.flatMap((n, i) => (n === skip ? []
-      : [{ x: n.x, y: n.y, w: NODE_WIDTH, h: heights[i] || typical }]));
+    return this.nodes.map((n, i) => ({ x: n.x, y: n.y, w: NODE_WIDTH, h: heights[i] || typical }));
   }
 
-  _firstPassSize(node) {
-    if (this.mode === 'bpmn') return { w: node.width || 240, h: node.height || 96 };
-    return { w: NODE_WIDTH, h: this._nodeRects().reduce((max, r) => Math.max(max, r.h), NODE_H_APPROX) };
+  _firstPassSize(node, rects) {
+    if (this.mode === 'bpmn') return { w: node.width || 240, h: node.height || 96, ox: 0, oy: 0 };
+    return { w: NODE_WIDTH, h: rects.reduce((max, r) => Math.max(max, r.h), NODE_H_APPROX), ox: 0, oy: 0 };
   }
 
   // Scans a bounded grid of candidate corners, nearest to the requested spot
-  // first, for one whose rectangle (plus a gap) intersects no existing node.
+  // first, for one whose footprint (plus a gap) intersects no rectangle.
   // Corners inside the visible canvas win; with no free one there, the node
   // goes right of the rightmost node so it never overlaps (the caller then
-  // pans the view to it). Returns the size it was placed with.
-  _moveToFreeSpot(node, size, skip = null) {
+  // pans the view to it). The inset from the canvas edge is the pan margin
+  // converted to world units, so a spot found here never triggers a pan.
+  _moveToFreeSpot(node, size, rects, origin) {
     const gap = GRID * 2;
-    const rects = this._nodeRects(skip);
+    const zoom = this._positiveZoom();
+    const inset = Math.max(gap, Math.ceil(REVEAL_MARGIN / zoom / GRID) * GRID);
     const free = (x, y) => rects.every((o) => x >= o.x + o.w + gap || x + size.w + gap <= o.x
       || y >= o.y + o.h + gap || y + size.h + gap <= o.y);
-    const zoom = this._positiveZoom();
     const rect = this.root.getBoundingClientRect();
     const known = rect.width > 0 && rect.height > 0;
-    const left = known ? -this.view.x / zoom : node.x - 800;
-    const top = known ? -this.view.y / zoom : node.y - 500;
+    const left = known ? -this.view.x / zoom : origin.x - 800;
+    const top = known ? -this.view.y / zoom : origin.y - 500;
     const width = known ? rect.width / zoom : 1600;
     const height = known ? rect.height / zoom : 1000;
     const step = Math.max(gap, snapGridCoordinate(Math.max(width, height) / 100));
+    const ceilGrid = (value) => Math.ceil(value / GRID) * GRID;
     const candidates = [];
-    for (let y = snapGridCoordinate(top + gap); y + size.h + gap <= top + height; y += step) {
-      for (let x = snapGridCoordinate(left + gap); x + size.w + gap <= left + width; x += step) {
+    for (let y = ceilGrid(top + inset); y + size.h + inset <= top + height; y += step) {
+      for (let x = ceilGrid(left + inset); x + size.w + inset <= left + width; x += step) {
         candidates.push([x, y]);
       }
     }
-    candidates.sort((p, q) => Math.hypot(p[0] - node.x, p[1] - node.y) - Math.hypot(q[0] - node.x, q[1] - node.y));
+    const distance = ([x, y]) => Math.hypot(x + size.ox - origin.x, y + size.oy - origin.y);
+    candidates.sort((p, q) => distance(p) - distance(q));
     const spot = candidates.find(([x, y]) => free(x, y));
     if (spot) {
-      [node.x, node.y] = spot;
+      node.x = spot[0] + size.ox;
+      node.y = spot[1] + size.oy;
     } else {
-      const right = rects.reduce((max, o) => Math.max(max, o.x + o.w), node.x);
-      node.x = snapGridCoordinate(right + gap);
+      const right = rects.reduce((max, o) => Math.max(max, o.x + o.w), origin.x);
+      node.x = snapGridCoordinate(right + gap) + size.ox;
+      node.y = origin.y;
     }
     return size;
   }
 
-  // Minimal pan that brings the whole node into view; a node larger than the
+  // Minimal pan that brings the whole footprint into view; one larger than the
   // canvas is aligned to its top-left corner instead.
   _panToReveal(node, size) {
     const rect = this.root.getBoundingClientRect();
     if (!(rect.width > 0 && rect.height > 0)) return;
-    const margin = GRID * 2;
+    const margin = REVEAL_MARGIN;
     const zoom = this._positiveZoom();
     const axis = (position, length, view, extent) => {
       const lo = position * zoom + view;
@@ -980,8 +1026,8 @@ export class FlowCanvas {
       if (hi > extent - margin) return view + extent - margin - hi;
       return view;
     };
-    this.view.x = axis(node.x, size.w, this.view.x, rect.width);
-    this.view.y = axis(node.y, size.h, this.view.y, rect.height);
+    this.view.x = axis(node.x - size.ox, size.w, this.view.x, rect.width);
+    this.view.y = axis(node.y - size.oy, size.h, this.view.y, rect.height);
     this._applyView();
   }
 
@@ -2064,8 +2110,22 @@ export class FlowCanvas {
   // -------------------------------------------------------------------------
   // Zdarzenia pointer
   // -------------------------------------------------------------------------
+  // The node and pan branches cancel the pointerdown default, which is also
+  // what would move focus: a name field edited just before would keep it, and
+  // Delete / undo would be taken for typing. A field inside the canvas (a node
+  // control) keeps its focus.
+  _takeFocusFromOutside() {
+    let active = document.activeElement;
+    while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+    if (!active || active === document.body || this.root.contains(active)) return;
+    active.blur?.();
+    if (!this.root.hasAttribute('tabindex')) this.root.tabIndex = -1;
+    this.root.focus({ preventScroll: true });
+  }
+
   _onPointerDown(ev) {
     if (ev.button !== undefined && ev.button !== 0) return;
+    this._takeFocusFromOutside();
     this._activePointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
 
     // Pinch start

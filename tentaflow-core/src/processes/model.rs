@@ -212,6 +212,17 @@ pub fn starter_model() -> ProcessModel {
     }
 }
 
+/// A node name is at most 256 bytes and carries neither control characters nor
+/// bidirectional controls, which reorder the text around them. The designer
+/// strips the same set in flows-builder/bpmn.js (`BIDI_CONTROLS`).
+pub(crate) fn valid_node_name(name: &str) -> bool {
+    name.len() <= 256 && !name.chars().any(|c| c.is_control() || is_bidi_control(c))
+}
+
+fn is_bidi_control(c: char) -> bool {
+    matches!(u32::from(c), 0x61C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069)
+}
+
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -756,7 +767,7 @@ fn validate_draft_body<'a>(
             node.id
         );
         ensure!(
-            node.name.len() <= 256 && !node.name.chars().any(char::is_control),
+            valid_node_name(&node.name),
             "invalid node name"
         );
         validate_repeat(node, variables, false)?;
@@ -1297,7 +1308,7 @@ fn validate_body<'a>(
     for node in graph_nodes {
         ensure!(valid_id(&node.id), "invalid node ID: {}", node.id);
         ensure!(
-            node.name.len() <= 256 && !node.name.chars().any(char::is_control),
+            valid_node_name(&node.name),
             "invalid node name: {}",
             node.id
         );
@@ -3385,6 +3396,11 @@ mod tests {
         assert!(named(&"ż".repeat(128)).is_ok());
         assert!(named(&format!("{}x", "ż".repeat(128))).is_err());
         assert!(named("Notes\u{0}\u{7f} › search").is_err());
+        for bidi in ["\u{61C}", "\u{200E}", "\u{200F}", "\u{202A}", "\u{202B}", "\u{202C}",
+            "\u{202D}", "\u{202E}", "\u{2066}", "\u{2067}", "\u{2068}", "\u{2069}"] {
+            assert!(named(&format!("Notes{bidi}search")).is_err(), "U+{:04X} accepted", bidi.chars().next().unwrap() as u32);
+        }
+        assert!(named("Notes \u{200B} search").is_ok());
     }
 
     #[test]

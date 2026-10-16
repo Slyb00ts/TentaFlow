@@ -68,9 +68,15 @@ fn is_format_char(c: char) -> bool {
         | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
 }
 
-/// A label with only whitespace, control or format characters is not a name.
+/// Filler letters that are not category Cf yet draw nothing: combining grapheme
+/// joiner, Hangul fillers and the halfwidth Hangul filler.
+fn is_filler_char(c: char) -> bool {
+    matches!(u32::from(c), 0x34F | 0x115F | 0x1160 | 0x3164 | 0xFFA0)
+}
+
+/// A label with only whitespace, control, format or filler characters is not a name.
 pub(crate) fn is_blank_label(label: &str) -> bool {
-    label.chars().all(|c| c.is_whitespace() || c.is_control() || is_format_char(c))
+    label.chars().all(|c| c.is_whitespace() || c.is_control() || is_format_char(c) || is_filler_char(c))
 }
 
 /// Builds the sorted catalogue from the registry. A tool whose identifiers
@@ -662,6 +668,20 @@ mod tests {
         assert_eq!(names, ["notes-a", "notes-b"]);
         assert!(is_blank_label("\u{200B}\u{2060} \u{E0020}"));
         assert!(!is_blank_label("\u{200B}Notes"));
+    }
+
+    // The designer tests the same list in bpmn.test.js ("blank labels match the server list").
+    #[test]
+    fn the_blank_label_list_is_shared_with_the_designer() {
+        for code in [0x34F, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x61C, 0x200E, 0x200F, 0x202A, 0x202E,
+            0x2066, 0x2069, 0x200B, 0xFEFF, 0xAD, 0x20, 0x09] {
+            let c = char::from_u32(code).unwrap();
+            assert!(is_blank_label(&c.to_string()), "U+{code:04X} must be blank");
+        }
+        for code in [0x41, 0x3042, 0x1161] {
+            let c = char::from_u32(code).unwrap();
+            assert!(!is_blank_label(&c.to_string()), "U+{code:04X} must not be blank");
+        }
     }
 
     #[tokio::test]
