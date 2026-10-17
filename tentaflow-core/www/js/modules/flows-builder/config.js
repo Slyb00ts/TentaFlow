@@ -15,11 +15,12 @@ import '/js/components/tf-textarea.js';
 import '/js/components/tf-toggle.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-keyvalue-editor.js';
+import '/js/components/tf-disclosure.js';
 import '/js/components/tf-person-picker.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-alert.js';
-import { processNodeKind, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processHandlerName, processBodyLabels, processDistinctLabels } from './bpmn.js';
+import { processNodeKind, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processStartEntryLabels, processItemLabels } from './bpmn.js';
 import { openProcessCallPreview } from './process-monitor.js';
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
@@ -300,7 +301,8 @@ export class FlowConfig {
     const canvas = this.opts.getCanvas();
     const source = canvas.nodes.find((node) => node.id === edge.from_node);
     const target = canvas.nodes.find((node) => node.id === edge.to_node);
-    const name = (node) => node?.label || getNodeName(node?.type);
+    const labels = processNodeLabels(canvas.nodes, canvas.templates);
+    const name = (node) => labels.get(node?.id) ?? getNodeName(node?.type);
     const exclusive = source?.type === 'bpmn_exclusive_gateway';
     const inclusive = source?.type === 'bpmn_inclusive_gateway'
       && canvas.edges.filter((candidate) => candidate.from_node === source.id).length >= 2;
@@ -310,6 +312,7 @@ export class FlowConfig {
     const calledBody = calledProcessId ? [canvas.processModel, ...(canvas.processModel.additionalProcesses || [])]
       .find((body) => body.processId === calledProcessId) : null;
     const localStarts = calledBody?.nodes.filter((node) => node.kind === 'Start') || [];
+    const startLabels = processDistinctLabels(localStarts.map((node) => [node.id, String(node.name || '').trim() || I18n.t('bpmn.node_start')]));
     this.root.innerHTML = `
       <div class="fb-config-header"><div class="fb-config-title-wrap">
         <div class="fb-config-title">${escapeHtml(I18n.t('bpmn.sequence_flow'))}</div>
@@ -322,10 +325,10 @@ export class FlowConfig {
         ${target?.type === 'bpmn_call_activity' ? (calledBody
           ? `<tf-select data-process="callStartNodeId" label="${escapeAttr(I18n.t('bpmn.call_start_entry'))}" value="${escapeAttr(edge.callStartNodeId || '')}" ${this.readOnly ? 'disabled' : ''}>
               <option value="">${escapeHtml(I18n.t('bpmn.call_start_automatic'))}</option>
-              ${localStarts.map((node) => `<option value="${escapeAttr(node.id)}">${escapeHtml(node.name || node.id)} · ${escapeHtml(node.id)}</option>`).join('')}
+              ${localStarts.map((node) => `<option value="${escapeAttr(node.id)}">${escapeHtml(startLabels.get(node.id))}</option>`).join('')}
             </tf-select>`
           : `<tf-input data-process="callStartNodeId" label="${escapeAttr(I18n.t('bpmn.call_start_entry'))}" value="${escapeAttr(edge.callStartNodeId || '')}" ${this.readOnly ? 'disabled' : ''}></tf-input>`) : ''}
-        <tf-textarea data-process="elementId" readonly autogrow rows="2" label="${escapeAttr(I18n.t('bpmn.element_id'))}" value="${escapeAttr(edge.id)}"></tf-textarea>
+        <tf-disclosure label="${escapeAttr(I18n.t('bpmn.technical_details'))}" data-technical><tf-textarea data-process="elementId" readonly autogrow rows="2" label="${escapeAttr(I18n.t('bpmn.element_id'))}" value="${escapeAttr(edge.id)}"></tf-textarea></tf-disclosure>
       </div>
       ${this.readOnly ? '' : `<footer class="fb-config-footer"><tf-button variant="danger" icon="trash" data-process="delete">${escapeHtml(I18n.t('flows_config.delete'))}</tf-button></footer>`}`;
     this.root.querySelector('[data-process="condition"]')?.addEventListener('change', (event) => {
@@ -349,6 +352,11 @@ export class FlowConfig {
     });
   }
 
+  // Server messages cite elements by id; the author reads their names.
+  _explain(error) {
+    return processExplainError(error.message, this.opts.getCanvas().getData());
+  }
+
   _activityIoReferences() {
     const canvas = this.opts.getCanvas();
     const body = processBody(canvas.processModel, canvas.processPath, canvas.selectedProcessId);
@@ -357,13 +365,10 @@ export class FlowConfig {
 
   _activityIoSelectOptions(items, value, emptyLabel) {
     const options = [`<option value="">${escapeHtml(emptyLabel)}</option>`];
-    for (const item of items) {
-      const id = typeof item === 'string' ? item : item.id;
-      const label = typeof item === 'string' ? item : (item.name || item.id);
-      options.push(`<option value="${escapeAttr(id)}">${escapeHtml(label)} · ${escapeHtml(id)}</option>`);
-    }
-    if (value && !items.some((item) => (typeof item === 'string' ? item : item.id) === value)) {
-      options.push(`<option value="${escapeAttr(value)}" disabled>${escapeHtml(value)}</option>`);
+    const labels = processItemLabels(items);
+    for (const item of items) options.push(`<option value="${escapeAttr(item.id)}">${escapeHtml(labels.get(item.id))}</option>`);
+    if (value && !items.some((item) => item.id === value)) {
+      options.push(`<option value="${escapeAttr(value)}" disabled>${escapeHtml(I18n.t('bpmn.declaration_unavailable'))}</option>`);
     }
     return options.join('');
   }
@@ -605,6 +610,7 @@ export class FlowConfig {
     const textarea = (key, label, value, rows = 2) => `<tf-textarea data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(String(value ?? ''))}" autogrow rows="${rows}" ${disabled}></tf-textarea>`;
     const mapping = (key, label) => `<tf-keyvalue-editor data-process="${key}" multiline label="${escapeAttr(I18n.t(`bpmn.${label}`))}" add-label="${escapeAttr(I18n.t('bpmn.add_mapping'))}" remove-label="${escapeAttr(I18n.t('bpmn.remove_mapping'))}" key-placeholder="${escapeAttr(I18n.t('bpmn.mapping_key'))}" value-placeholder="${escapeAttr(I18n.t('bpmn.mapping_expression'))}" ${disabled}></tf-keyvalue-editor>`;
     const model = this.opts.getCanvas().processModel;
+    const targetLabels = processNodeLabels(this.opts.getCanvas().nodes, this.opts.getCanvas().templates);
     const declaration = (key, label, choices, idKey, selected) => {
       const labels = processDistinctLabels((choices || []).map((choice) => [choice[idKey], choice.name]));
       return `<tf-select data-process="${key}" wrap-selected label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(selected || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.choose_declaration'))}</option>${(choices || []).map((choice) => `<option value="${escapeAttr(choice[idKey])}">${escapeHtml(labels.get(choice[idKey]))}</option>`).join('')}${selected && !(choices || []).some((choice) => choice[idKey] === selected) ? `<option value="${escapeAttr(selected)}" disabled>${escapeHtml(I18n.t('bpmn.declaration_unavailable'))}</option>` : ''}</tf-select>`;
@@ -613,10 +619,10 @@ export class FlowConfig {
       const graph = this.opts.getCanvas();
       const activities = processBoundaryHosts(graph, kind);
       const target = activities.find((candidate) => candidate.id === config.attachedToId);
-      const names = processDistinctLabels(activities.map((candidate) => [candidate.id, candidate.label || getNodeName(candidate.type)]));
+      const names = targetLabels;
       const scopeHint = target?.repeat ? 'bpmn.boundary_repeat_group_hint'
         : target && graph.processPath.length ? 'bpmn.boundary_child_local_hint' : null;
-      return `<tf-select data-process="attachedToId" wrap-selected label="${escapeAttr(I18n.t('bpmn.boundary_attach'))}" value="${escapeAttr(config.attachedToId || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.boundary_choose_activity'))}</option>${activities.map((candidate) => `<option value="${escapeAttr(candidate.id)}">${escapeHtml(names.get(candidate.id))}</option>`).join('')}${config.attachedToId && !target ? `<option value="${escapeAttr(config.attachedToId)}" disabled>${escapeHtml(I18n.t('bpmn.boundary_unavailable_option'))}</option>` : ''}</tf-select><p class="fb-field-hint" data-boundary-target>${escapeHtml(target ? (target.label || getNodeName(target.type)) : I18n.t(config.attachedToId ? 'bpmn.boundary_unavailable' : 'bpmn.boundary_required'))}</p>${scopeHint ? `<p class="fb-field-hint" data-boundary-scope>${escapeHtml(I18n.t(scopeHint))}</p>` : ''}`;
+      return `<tf-select data-process="attachedToId" wrap-selected label="${escapeAttr(I18n.t('bpmn.boundary_attach'))}" value="${escapeAttr(config.attachedToId || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.boundary_choose_activity'))}</option>${activities.map((candidate) => `<option value="${escapeAttr(candidate.id)}">${escapeHtml(names.get(candidate.id))}</option>`).join('')}${config.attachedToId && !target ? `<option value="${escapeAttr(config.attachedToId)}" disabled>${escapeHtml(I18n.t('bpmn.boundary_unavailable_option'))}</option>` : ''}</tf-select><p class="fb-field-hint" data-boundary-target>${escapeHtml(target ? names.get(target.id) : I18n.t(config.attachedToId ? 'bpmn.boundary_unavailable' : 'bpmn.boundary_required'))}</p>${scopeHint ? `<p class="fb-field-hint" data-boundary-scope>${escapeHtml(I18n.t(scopeHint))}</p>` : ''}`;
     };
     let servicePanels = '';
     let servicePanel = null;
@@ -637,7 +643,8 @@ export class FlowConfig {
     } else if (kind === 'ServiceTask') {
       const flows = this.opts.processOptions.serviceFlows;
       const blocks = this.opts.processOptions.serviceBlocks || [];
-      const options = `<option value="">${escapeHtml(I18n.t('bpmn.choose_flow'))}</option>` + flows.map((flow) => `<option value="${escapeAttr(flow.flowId)}">${escapeHtml(flow.name)}</option>`).join('');
+      const flowLabels = processDistinctLabels(flows.map((flow) => [flow.flowId, flow.name]));
+      const options = `<option value="">${escapeHtml(I18n.t('bpmn.choose_flow'))}</option>` + flows.map((flow) => `<option value="${escapeAttr(flow.flowId)}">${escapeHtml(flowLabels.get(flow.flowId))}</option>`).join('');
       const unavailable = config.flowId && !flows.some((flow) => flow.flowId === config.flowId);
       const tool = config.implementation?.AddonTool;
       const blockTask = config.implementation?.Block;
@@ -781,11 +788,7 @@ export class FlowConfig {
           ${this.readOnly ? '' : `<tf-button variant="secondary" data-load-targets>${escapeHtml(I18n.t('bpmn.load_target_definitions'))}</tf-button>`}
           <p class="fb-field-hint" data-target-capability>${escapeHtml(I18n.t('bpmn.target_capability_hint'))}</p>`;
         fields += textarea('targetDefinitionId', 'message_target_definition', target[targetKind]?.definitionId, 2);
-        if (targetKind === 'Start') fields += `<tf-select data-process="targetStartChoice" label="${escapeAttr(I18n.t('bpmn.message_target_start_entry'))}" value="${target.Start?.processId && target.Start?.startNodeId ? '0' : ''}" ${disabled}>
-          <option value="">${escapeHtml(I18n.t('bpmn.start_entry'))}</option>
-          ${target.Start?.processId && target.Start?.startNodeId
-    ? `<option value="0">${escapeHtml(target.Start.processId)} · ${escapeHtml(target.Start.startNodeId)}</option>` : ''}
-        </tf-select>`;
+        if (targetKind === 'Start') fields += `<tf-select data-process="targetStartChoice" wrap-selected label="${escapeAttr(I18n.t('bpmn.message_target_start_entry'))}" ${disabled}></tf-select>`;
         if (targetKind === 'Catch') fields += textarea('instanceIdExpression', 'message_target_instance_expression', target.Catch.instanceIdExpression || '', 3) + textarea('subscriptionIdExpression', 'message_target_subscription_expression', target.Catch.subscriptionIdExpression || '', 3);
         fields += textarea('payloadExpression', 'message_payload_expression', config.payloadExpression, 4) + input('ttlSeconds', 'message_ttl', config.ttlSeconds, 'type="number" min="1" max="604800" step="1"');
       }
@@ -794,14 +797,13 @@ export class FlowConfig {
     } else if (kind === 'ExclusiveGateway' || kind === 'InclusiveGateway') {
       const canvas = this.opts.getCanvas();
       const outgoing = canvas.edges.filter((edge) => edge.from_node === node.id);
+      const pathLabels = processDistinctLabels(outgoing.map((edge) => [edge.id,
+        `${targetLabels.get(edge.to_node) ?? ''}${edge.condition ? ` \u2014 ${edge.condition}` : ''}`]));
       if (kind === 'InclusiveGateway' && outgoing.length < 2) {
         fields += `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.or_join_hint'))}</p>`;
       } else fields += `<tf-select data-process="defaultFlowId" wrap-selected label="${escapeAttr(I18n.t('bpmn.default_path'))}" value="${escapeAttr(config.defaultFlowId || '')}" ${disabled}>
         <option value="">${escapeHtml(I18n.t('bpmn.no_default'))}</option>
-        ${outgoing.map((edge) => {
-          const target = canvas.nodes.find((candidate) => candidate.id === edge.to_node);
-          return `<option value="${escapeAttr(edge.id)}">${escapeHtml(target?.label || getNodeName(target?.type))}${edge.condition ? ` — ${escapeHtml(edge.condition)}` : ''}</option>`;
-        }).join('')}</tf-select><p class="fb-field-hint">${escapeHtml(I18n.t(kind === 'InclusiveGateway' ? 'bpmn.or_hint' : 'bpmn.xor_hint'))}</p>`;
+        ${outgoing.map((edge) => `<option value="${escapeAttr(edge.id)}">${escapeHtml(pathLabels.get(edge.id))}</option>`).join('')}</tf-select><p class="fb-field-hint">${escapeHtml(I18n.t(kind === 'InclusiveGateway' ? 'bpmn.or_hint' : 'bpmn.xor_hint'))}</p>`;
     } else {
       fields += `<p class="fb-field-hint">${escapeHtml(getNodeName(node.type))}: ${escapeHtml(I18n.t(`bpmn.node_${node.type.slice(5)}_hint`))}</p>`;
     }
@@ -822,7 +824,7 @@ export class FlowConfig {
         repeatHtml += `<tf-select data-process="repeatOutput" wrap-selected label="${escapeAttr(I18n.t('bpmn.repeat_output'))}" value="${escapeAttr(output)}" ${disabled}>
           <option value="">${escapeHtml(I18n.t('bpmn.repeat_choose_output'))}</option>
           ${variables.map((name) => `<option value="${escapeAttr(name)}">${escapeHtml(name)}</option>`).join('')}
-        </tf-select>`;
+        </tf-select>${output ? '' : `<tf-alert tone="warning" data-repeat-warning message="${escapeAttr(I18n.t('bpmn.repeat_output_missing', { node: targetLabels.get(node.id) ?? getNodeName(node.type) }))}"></tf-alert>`}`;
       }
       if (repeat?.MultiInstance) {
         const repeatInput = repeat.MultiInstance.input;
@@ -847,12 +849,10 @@ export class FlowConfig {
     const canvas = this.opts.getCanvas();
     const outgoing = canvas.edges.filter((edge) => edge.from_node === node.id);
     let sequenceHtml = '';
-    if (outgoing.length) sequenceHtml += `<tf-select data-process="editSequence" label="${escapeAttr(I18n.t('bpmn.edit_sequence'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_sequence'))}</option>${outgoing.map((edge) => {
-      const target = canvas.nodes.find((candidate) => candidate.id === edge.to_node);
-      return `<option value="${escapeAttr(edge.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`;
-    }).join('')}</tf-select>`;
-    if (!['End', 'ErrorEnd', 'TerminateEnd'].includes(kind) && !this.readOnly) sequenceHtml += `<div class="fb-process-connect"><tf-select data-connect label="${escapeAttr(I18n.t('bpmn.connect_to'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_element'))}</option>${canvas.nodes.filter((target) => target.id !== node.id && !['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(target.type) && !processBoundaryKind(target.type)).map((target) => `<option value="${escapeAttr(target.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`).join('')}</tf-select><tf-button variant="secondary" data-connect-add disabled>${escapeHtml(I18n.t('bpmn.add_sequence'))}</tf-button></div>`;
-    const elementIdHtml = `<tf-textarea data-process="elementId" readonly autogrow rows="2" label="${escapeAttr(I18n.t('bpmn.element_id'))}" value="${escapeAttr(node.id)}"></tf-textarea>`;
+    const sequenceLabels = processDistinctLabels(outgoing.map((edge) => [edge.id, targetLabels.get(edge.to_node) ?? '']));
+    if (outgoing.length) sequenceHtml += `<tf-select data-process="editSequence" label="${escapeAttr(I18n.t('bpmn.edit_sequence'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_sequence'))}</option>${outgoing.map((edge) => `<option value="${escapeAttr(edge.id)}">${escapeHtml(sequenceLabels.get(edge.id))}</option>`).join('')}</tf-select>`;
+    if (!['End', 'ErrorEnd', 'TerminateEnd'].includes(kind) && !this.readOnly) sequenceHtml += `<div class="fb-process-connect"><tf-select data-connect label="${escapeAttr(I18n.t('bpmn.connect_to'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_element'))}</option>${canvas.nodes.filter((target) => target.id !== node.id && !['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(target.type) && !processBoundaryKind(target.type)).map((target) => `<option value="${escapeAttr(target.id)}">${escapeHtml(targetLabels.get(target.id))}</option>`).join('')}</tf-select><tf-button variant="secondary" data-connect-add disabled>${escapeHtml(I18n.t('bpmn.add_sequence'))}</tf-button></div>`;
+    const elementIdHtml = `<tf-disclosure label="${escapeAttr(I18n.t('bpmn.technical_details'))}" data-technical><tf-textarea data-process="elementId" readonly autogrow rows="2" label="${escapeAttr(I18n.t('bpmn.element_id'))}" value="${escapeAttr(node.id)}"></tf-textarea></tf-disclosure>`;
     fields += kind === 'ServiceTask'
       ? `${servicePanels}${servicePanel('advanced', repeatHtml + elementIdHtml)}${sequenceHtml}`
       : `${repeatHtml}${sequenceHtml}${elementIdHtml}`;
@@ -867,55 +867,82 @@ export class FlowConfig {
     this._bindActivityIo(node);
     if (serviceRouting) this._bindServiceTabs(node);
     this.root.querySelector('[data-process-enter]')?.addEventListener('click', () => this.opts.onEnterProcess?.(node.id));
-    const loadTargets = this.root.querySelector('[data-load-targets]');
-    if (loadTargets) {
-      let offset = 0;
-      const choice = this.root.querySelector('[data-process="targetDefinitionChoice"]');
+    const choice = this.root.querySelector('[data-process="targetDefinitionChoice"]');
+    if (choice) {
+      const loadTargets = this.root.querySelector('[data-load-targets]');
       const capability = this.root.querySelector('[data-target-capability]');
       const startChoice = this.root.querySelector('[data-process="targetStartChoice"]');
-      let targetStarts = node.config.target?.Start?.processId && node.config.target.Start.startNodeId
-        ? [{ processId: node.config.target.Start.processId, startNodeId: node.config.target.Start.startNodeId }] : [];
-      loadTargets.addEventListener('click', async () => {
+      const savedTarget = Object.values(node.config.target || {})[0];
+      const savedDefinitionId = savedTarget?.definitionId || '';
+      const rows = [{ value: '', label: I18n.t('bpmn.choose_target_definition') }];
+      const names = new Map();
+      let offset = 0;
+      let targetStarts = [];
+      const startRows = [{ value: '', label: I18n.t('bpmn.start_entry') }];
+      // Two definitions with one name get a number; the id is never a label.
+      const showTargets = () => {
+        const labels = processDistinctLabels([...names]);
+        for (const row of rows) if (labels.has(row.value)) row.label = labels.get(row.value);
+        choice.setOptions(rows, choice.value || savedDefinitionId);
+      };
+      if (savedDefinitionId) rows.push({ value: savedDefinitionId, label: I18n.t('bpmn.call_definition_checking') });
+      choice.setOptions(rows, savedDefinitionId);
+      // The published version of a target says which entries and message names it
+      // offers; `selected` keeps the entry the node already points at.
+      const describeTarget = async (definitionId, selected) => {
+        const detail = await ApiBinary.one('processDefinitionGetRequest', { definitionId });
+        if (!this.root.contains(choice) || choice.value !== definitionId) return;
+        names.set(definitionId, detail.definition.name);
+        showTargets();
+        if (!detail.definition.publishedVersion) { capability.textContent = I18n.t('bpmn.target_unpublished'); return; }
+        const published = await ApiBinary.one('processVersionGetRequest', { definitionId, version: detail.definition.publishedVersion });
+        if (!this.root.contains(choice) || choice.value !== definitionId) return;
+        const publishedModel = published.version.model;
+        targetStarts = published.startCatalog.filter((entry) => entry.trigger?.MessageStart);
+        const startLabels = processStartEntryLabels(targetStarts, publishedModel);
+        startRows.splice(1, startRows.length, ...targetStarts.map((entry, index) => ({ value: String(index), label: startLabels.get(index) })));
+        const chosen = selected ? targetStarts.findIndex((entry) => entry.processId === selected.processId && entry.startNodeId === selected.startNodeId) : -1;
+        startChoice?.setOptions(startRows, chosen < 0 ? '' : String(chosen));
+        const declared = [publishedModel, ...(publishedModel.additionalProcesses || [])].flatMap((bodyModel) => bodyModel.nodes).flatMap((candidate) => {
+          if (typeof candidate.kind !== 'object') return [];
+          const [tag, body] = Object.entries(candidate.kind)[0];
+          if (!['MessageStart', 'MessageCatch', 'ReceiveTask', 'BoundaryMessage'].includes(tag)) return [];
+          return publishedModel.messages.filter((declaration) => declaration.messageId === body.messageRef).map((declaration) => declaration.name);
+        });
+        capability.textContent = `${I18n.t('bpmn.target_declared_names')}: ${[...new Set(declared)].join(', ') || I18n.t('bpmn.none')}`;
+      };
+      const explainFailure = (error) => {
+        if (this.root.contains(capability)) capability.textContent = this._explain(error);
+      };
+      if (savedDefinitionId) {
+        startChoice?.setOptions([{ value: '', label: I18n.t('bpmn.start_entry') }, ...(savedTarget.processId && savedTarget.startNodeId
+          ? [{ value: '0', label: I18n.t('bpmn.call_definition_checking') }] : [])], savedTarget.processId && savedTarget.startNodeId ? '0' : '');
+        describeTarget(savedDefinitionId, savedTarget).catch(explainFailure);
+      }
+      loadTargets?.addEventListener('click', async () => {
         loadTargets.setAttribute('disabled', '');
         try {
           const page = await ApiBinary.one('processDefinitionListRequest', { offset, limit: 100 });
           if (!this.root.contains(choice)) return;
           for (const definition of page.definitions) {
-            const option = document.createElement('option'); option.value = definition.definitionId;
-            option.textContent = `${definition.name} · ${definition.definitionId}`;
-            choice.append(option);
+            names.set(definition.definitionId, definition.name);
+            if (!rows.some((row) => row.value === definition.definitionId)) rows.push({ value: definition.definitionId, label: definition.name });
           }
+          showTargets();
           offset += page.definitions.length;
           loadTargets.hidden = !page.hasMore;
-        } catch (error) { capability.textContent = error.message; }
+        } catch (error) { explainFailure(error); }
         finally { loadTargets.removeAttribute('disabled'); }
       });
       choice.addEventListener('change', async () => {
-        if (!choice.value) return;
+        if (!choice.value || this.readOnly) return;
         const target = node.config.target;
         this.opts.onConfigChange(node.id, { target: { [Object.keys(target)[0]]: target.Start
           ? { definitionId: choice.value }
           : { ...Object.values(target)[0], definitionId: choice.value } } });
         this.root.querySelector('[data-process="targetDefinitionId"]').value = choice.value;
         startChoice?.setOptions([{ value: '', label: I18n.t('bpmn.start_entry') }], '');
-        try {
-          const detail = await ApiBinary.one('processDefinitionGetRequest', { definitionId: choice.value });
-          if (!detail.definition.publishedVersion) { capability.textContent = I18n.t('bpmn.target_unpublished'); return; }
-          const published = await ApiBinary.one('processVersionGetRequest', { definitionId: choice.value, version: detail.definition.publishedVersion });
-          if (!this.root.contains(capability) || choice.value !== detail.definition.definitionId) return;
-          const publishedModel = published.version.model;
-          targetStarts = published.startCatalog.filter((entry) => entry.trigger?.MessageStart);
-          startChoice?.setOptions([{ value: '', label: I18n.t('bpmn.start_entry') },
-            ...targetStarts.map((entry, index) => ({ value: String(index),
-              label: `${entry.processName || entry.processId} · ${entry.startNodeName || entry.startNodeId}` }))], '');
-          const names = [publishedModel, ...(publishedModel.additionalProcesses || [])].flatMap((bodyModel) => bodyModel.nodes).flatMap((candidate) => {
-            if (typeof candidate.kind !== 'object') return [];
-            const [tag, body] = Object.entries(candidate.kind)[0];
-            if (!['MessageStart', 'MessageCatch', 'ReceiveTask', 'BoundaryMessage'].includes(tag)) return [];
-            return publishedModel.messages.filter((declaration) => declaration.messageId === body.messageRef).map((declaration) => declaration.name);
-          });
-          capability.textContent = `${I18n.t('bpmn.target_declared_names')}: ${[...new Set(names)].join(', ') || I18n.t('bpmn.none')}`;
-        } catch (error) { if (this.root.contains(capability)) capability.textContent = error.message; }
+        try { await describeTarget(choice.value, null); } catch (error) { explainFailure(error); }
       });
       startChoice?.addEventListener('change', () => {
         if (this.readOnly || !node.config.target?.Start) return;
@@ -998,7 +1025,7 @@ export class FlowConfig {
           showDefinitions();
           if (loadDefinitions) loadDefinitions.hidden = !response.hasMore;
           if (definitions.length === 1 && !response.hasMore && !callChoice.value) say('bpmn.call_no_published');
-        } catch (error) { if (this.root.contains(capability)) capability.textContent = error.message; }
+        } catch (error) { if (this.root.contains(capability)) capability.textContent = this._explain(error); }
         finally { loadDefinitions?.removeAttribute('disabled'); }
       };
       // The saved target is looked up by itself: it may be archived or gone, so
@@ -1007,21 +1034,25 @@ export class FlowConfig {
         const definitionId = published?.calledDefinitionId;
         if (!definitionId) return;
         const stored = definitions.find((row) => row.value === definitionId);
+        // The author may pick another definition while this is in flight; an
+        // answer about the stored one must not touch the new choice.
+        const request = listGeneration;
+        const superseded = () => !this.root.contains(callChoice) || request !== listGeneration || callChoice.value !== definitionId;
         let problem = null;
         try {
           const { definition } = await ApiBinary.one('processDefinitionGetRequest', { definitionId });
-          if (!this.root.contains(callChoice)) return;
+          if (superseded()) return;
           definitionNames.set(definitionId, definition.name);
           if (definition.archived) problem = 'archived';
           if (published.calledVersion) {
             const response = await ApiBinary.one('processVersionGetRequest', { definitionId, version: published.calledVersion });
-            if (!this.root.contains(callChoice)) return;
+            if (superseded()) return;
             const labels = processBodyLabels(response.version.model);
             processChoice.setOptions([{ value: '', label: I18n.t('bpmn.call_choose_body') },
               ...[...labels].map(([value, label]) => ({ value, label }))], processChoice.value || published.calledElement?.processId || '');
           }
         } catch (error) {
-          if (!this.root.contains(callChoice)) return;
+          if (superseded()) return;
           if (/not found|denied/i.test(error.message)) problem = 'missing';
           else say('bpmn.call_definition_unavailable');
           if (stored) stored.label = I18n.t('bpmn.call_definition_unavailable');
@@ -1049,7 +1080,7 @@ export class FlowConfig {
           if (loadVersions) loadVersions.hidden = !response.hasMore;
           if (versions.length === 1 && !response.hasMore) say('bpmn.call_no_versions');
           else if (!versionChoice.value) say('bpmn.call_choose_version');
-        } catch (error) { if (request === listGeneration && this.root.contains(capability)) capability.textContent = error.message; }
+        } catch (error) { if (request === listGeneration && this.root.contains(capability)) capability.textContent = this._explain(error); }
         finally { loadVersions?.removeAttribute('disabled'); }
       };
       loadDefinitions?.addEventListener('click', fetchDefinitions);
@@ -1108,7 +1139,7 @@ export class FlowConfig {
           syncVersionWarning();
           this.root.querySelector('[data-process="calledElement"]').value = '';
           capability.textContent = I18n.t('bpmn.call_choose_body');
-        } catch (error) { if (request === pickGeneration && this.root.contains(capability)) capability.textContent = error.message; }
+        } catch (error) { if (request === pickGeneration && this.root.contains(capability)) capability.textContent = this._explain(error); }
       });
       processChoice.addEventListener('change', () => {
         if (this.readOnly || !processChoice.value || !versionChoice.value || !callChoice.value) return;
@@ -1128,7 +1159,7 @@ export class FlowConfig {
         try {
           const response = await ApiBinary.one('processVersionGetRequest', { definitionId: calledDefinitionId, version: calledVersion });
           if (this.root.contains(preview)) openProcessCallPreview(response.version, processId);
-        } catch (error) { if (this.root.contains(capability)) capability.textContent = error.message; }
+        } catch (error) { if (this.root.contains(capability)) capability.textContent = this._explain(error); }
       });
     }
     const picker = this.root.querySelector('tf-person-picker');
@@ -1161,7 +1192,7 @@ export class FlowConfig {
         this.opts.onConfigChange(node.id, { attachedToId: control.value || (kind === 'BoundaryTimer' ? null : '') });
         const selected = canvas.nodes.find((candidate) => candidate.id === control.value);
         this.root.querySelector('[data-boundary-target]').textContent = selected
-          ? (selected.label || getNodeName(selected.type)) : I18n.t('bpmn.boundary_required');
+          ? targetLabels.get(selected.id) : I18n.t('bpmn.boundary_required');
       } else if (key === 'verification') {
         this.opts.onConfigChange(node.id, { verification: control.value === 'Human' ? 'Human' : { Condition: { expression: this.root.querySelector('[data-process="expression"]').value } } });
         this.root.querySelector('[data-process-condition]').hidden = control.value === 'Human';

@@ -16,7 +16,7 @@ import { TfWindow } from '/js/components/tf-window.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
-import { checkProcessDocument, processBody, processCommand, processEditorLabels, processExplainError, processHasTimer, processHasTimerStart, processTimezoneGaps, processBodyLabels } from '/js/modules/flows-builder/bpmn.js';
+import { checkProcessDocument, processBody, processCommand, processDistinctLabels, processEditorLabels, processElementNames, processExplainError, processHasTimer, processHasTimerStart, processNodeLabels, processPublishProblems, processStartEntryLabels, processTimezoneGaps, processTimezoneProblem, processTimezoneText, processBodyLabels } from '/js/modules/flows-builder/bpmn.js';
 import { openProcessCalendar, openProcessDeclarations, openProcessInstances, openProcessMessageSend, openProcessMessages, openProcessModeling, openProcessRun, openProcessSchedule, openProcessVariables, processLifecycleReasonText, processTimerText } from '/js/modules/flows-builder/process-monitor.js';
 import { openProcessSimulation } from '/js/modules/flows-builder/process-simulation.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
@@ -50,7 +50,7 @@ const FlowBuilderScreen = {
     return `
       <div class="fb-shell ${process ? 'fb-process-shell' : ''}" data-role="shell">
         <header class="fb-topbar">
-          <tf-button variant="ghost" size="sm" data-role="back" title="${escapeAttr(I18n.t('flows_builder.back_title'))}"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="transform:rotate(180deg)"><use href="#i-chevron-right"/></svg>${escapeHtml(I18n.t('flows_builder.back'))}</tf-button>
+          <tf-button variant="ghost" size="sm" data-role="back" ${process ? 'data-fit-compact' : ''} title="${escapeAttr(I18n.t('flows_builder.back_title'))}"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="transform:rotate(180deg)"><use href="#i-chevron-right"/></svg>${escapeHtml(I18n.t('flows_builder.back'))}</tf-button>
           <div class="fb-topbar-separator"></div>
           <${process ? 'tf-textarea autogrow rows="1"' : 'tf-input'} class="fb-flow-name" data-role="name" aria-label="${escapeAttr(I18n.t('flows_builder.name_label'))}" placeholder="${escapeAttr(I18n.t('flows_builder.name_placeholder'))}"></${process ? 'tf-textarea' : 'tf-input'}>
           <tf-select class="fb-status-select" data-role="status" ${process ? 'hidden' : ''} aria-label="${escapeAttr(I18n.t('flows_builder.status_label'))}">
@@ -72,8 +72,8 @@ const FlowBuilderScreen = {
           </div>
           <div class="fb-topbar-separator"></div>
           ${process ? `<tf-button variant="secondary" size="sm" icon="check-circle" data-compact data-role="publish">${escapeHtml(I18n.t('bpmn.publish'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="play" data-compact data-role="run" disabled>${escapeHtml(I18n.t('bpmn.run'))}</tf-button>
-          <tf-button variant="primary" size="sm" icon="save" data-role="save">${escapeHtml(I18n.t('flows_builder.save'))}</tf-button>
+          <span class="fb-run-wrap" data-role="run-wrap"><tf-button variant="ghost" size="sm" icon="play" data-compact data-role="run" aria-describedby="fb-run-reason" disabled>${escapeHtml(I18n.t('bpmn.run'))}</tf-button><span class="fb-sr-only" id="fb-run-reason" data-role="run-reason"></span></span>
+          <tf-button variant="primary" size="sm" icon="save" data-fit-compact data-role="save">${escapeHtml(I18n.t('flows_builder.save'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="more" data-role="more" aria-haspopup="menu" aria-expanded="false" title="${escapeAttr(I18n.t('bpmn.more_actions'))}" aria-label="${escapeAttr(I18n.t('bpmn.more_actions'))}"></tf-button>
           <tf-menu data-role="more-menu" placement="bottom-end">
             <tf-menu-item icon="code" data-role="variables">${escapeHtml(I18n.t('flows_vars.button'))}</tf-menu-item>
@@ -116,9 +116,10 @@ const FlowBuilderScreen = {
         <footer class="fb-bottombar">
           <div class="fb-breadcrumb">
             <span class="fb-crumb">${escapeHtml(I18n.t(process ? 'bpmn.crumb_root' : 'flows_builder.crumb_root'))}</span>
-            ${process ? `<tf-button variant="ghost" size="sm" data-role="scope-up" hidden>${escapeHtml(I18n.t('bpmn.leave_subprocess'))}</tf-button><span class="fb-crumb" data-role="scope-path" hidden></span>` : ''}
+            ${process ? `<span class="fb-sep" data-role="scope-sep" hidden>›</span><span class="fb-crumb" data-role="scope-path" hidden></span>` : ''}
             <span class="fb-sep" data-role="crumb-sep">›</span>
             <span class="fb-crumb active" data-role="crumb-name">${escapeHtml(I18n.t('flows_builder.crumb_empty'))}</span>
+            ${process ? `<tf-button variant="ghost" size="sm" icon="arrow-up" data-role="scope-up" hidden>${escapeHtml(I18n.t('bpmn.leave_subprocess'))}</tf-button>` : ''}
           </div>
           <div class="fb-bottombar-separator"></div>
           <div class="fb-tool-group" role="group" aria-label="${escapeAttr(I18n.t('flows_builder.history_group'))}">
@@ -387,10 +388,13 @@ const FlowBuilderScreen = {
     });
     // Choosing an element on a phone opens its inspector; the tab bar is only
     // shown there, so a wider window never sees the overlay.
-    state.showMobileTab = (tab) => {
-      if (mobileTabs.offsetParent === null || mobileTabs.value === tab) return;
+    const setMobileTab = (tab) => {
       mobileTabs.setAttribute('value', tab);
       applyMobileTab(tab);
+    };
+    state.showMobileTab = (tab) => {
+      if (mobileTabs.offsetParent === null || mobileTabs.value === tab) return;
+      setMobileTab(tab);
     };
 
     if (state.mode === 'bpmn') {
@@ -417,11 +421,25 @@ const FlowBuilderScreen = {
       window.addEventListener('resize', onResize);
       state.cleanupFns.push(() => window.removeEventListener('resize', onResize));
       // Secondary buttons shrink to their icon on a narrow bar; the text stays as the tooltip.
-      for (const button of root.querySelectorAll('.fb-topbar tf-button[data-compact]')) {
+      for (const button of root.querySelectorAll('.fb-topbar tf-button[data-compact], .fb-topbar tf-button[data-fit-compact]')) {
         const name = button.textContent.trim();
         if (!button.hasAttribute('title')) button.setAttribute('title', name);
         if (!button.hasAttribute('aria-label')) button.setAttribute('aria-label', name);
       }
+      const topbar = root.querySelector('.fb-topbar');
+      const fitTopbar = () => {
+        topbar.classList.remove('fb-bar-1', 'fb-bar-2', 'fb-bar-3');
+        for (const level of [1, 2, 3]) {
+          if (topbar.scrollWidth <= topbar.clientWidth) break;
+          topbar.classList.add(`fb-bar-${level}`);
+        }
+      };
+      const barObserver = new ResizeObserver(fitTopbar);
+      barObserver.observe(topbar);
+      document.fonts?.ready.then(fitTopbar);
+      state.cleanupFns.push(() => barObserver.disconnect());
+      // The chip's words change its width.
+      state.fitTopbar = fitTopbar;
       // Everything the bar has no room for sits behind one menu that opens under
       // its button; Escape or a choice puts focus back on the button.
       const more = root.querySelector('[data-role="more"]');
@@ -526,7 +544,14 @@ const FlowBuilderScreen = {
       const timezone = root.querySelector('[data-role="timer-timezone"]');
       timezone.addEventListener('change', (event) => {
         if (event.target !== timezone || !this._current(state) || state.readOnly) return;
-        state.canvas.updateProcessTimezone(timezone.value);
+        const zone = timezone.value.trim();
+        if (processTimezoneProblem(zone)) {
+          timezone.setAttribute('error', I18n.t('bpmn.timer_timezone_invalid', { zone }));
+          return;
+        }
+        timezone.removeAttribute('error');
+        if (zone !== timezone.value) timezone.value = zone;
+        state.canvas.updateProcessTimezone(zone);
       });
       root.querySelector('[data-role="instances"]').addEventListener('click', () => openProcessInstances(state.flowId));
       root.querySelector('[data-role="messages"]').addEventListener('click', () => openProcessMessages(state.flowId));
@@ -546,7 +571,7 @@ const FlowBuilderScreen = {
     }
 
     // Swipe z lewej krawędzi → paleta; z prawej → config (tablet)
-    this._setupEdgeSwipes(root);
+    this._setupEdgeSwipes(root, setMobileTab);
 
     // Klawiatura
     const onKey = (ev) => this._onKey(ev);
@@ -614,9 +639,19 @@ const FlowBuilderScreen = {
     const timedVersion = !!entry?.trigger?.TimerStart;
     const run = state.root.querySelector('[data-role="run"]');
     const messageVersion = !!entry?.trigger?.MessageStart;
-    run.toggleAttribute('disabled', !state.definition.publishedVersion || state.definition.archived
-      || !!state.operationBusy || !entry?.trigger?.Start?.canStart);
-    run.setAttribute('title', `${I18n.t('bpmn.run')} — ${I18n.t(timedVersion ? 'bpmn.timer_start_manual_hint' : messageVersion ? 'bpmn.message_start_manual_hint' : 'bpmn.run_hint')}`);
+    // A disabled button takes no pointer, so the tooltip hangs on its wrapper and
+    // the same words are the button's description for assistive technology.
+    const runReason = !state.definition.publishedVersion ? 'bpmn.run_reason_unpublished'
+      : state.definition.archived ? 'bpmn.run_reason_archived'
+        : state.operationBusy ? null
+          : !entry ? 'bpmn.run_reason_choose_entry'
+            : timedVersion ? 'bpmn.timer_start_manual_hint'
+              : messageVersion ? 'bpmn.message_start_manual_hint'
+                : !entry.trigger?.Start?.canStart ? 'bpmn.run_reason_no_access' : null;
+    run.toggleAttribute('disabled', !!runReason || !!state.operationBusy);
+    const runText = `${I18n.t('bpmn.run')} \u2014 ${I18n.t(runReason ?? 'bpmn.run_hint')}`;
+    state.root.querySelector('[data-role="run-wrap"]').setAttribute('title', runText);
+    state.root.querySelector('[data-role="run-reason"]').textContent = runText;
     const simulate = state.root.querySelector('[data-role="simulate"]');
     simulate.toggleAttribute('disabled', !state.definition.publishedVersion || state.definition.archived
       || state.previewVersion !== null || !!state.operationBusy || !entry?.trigger?.Start?.canStart);
@@ -689,6 +724,12 @@ const FlowBuilderScreen = {
     if (!state || state.readOnly || state.saving) return;
     if (state.dirty && !await this._save()) return;
     if (!this._current(state) || state.dirty) return;
+    // What the server would refuse is told here, by name, before it is asked.
+    const problems = processPublishProblems(state.canvas.getData());
+    if (problems.length) {
+      this._reportSaveProblem(state, problems.join(' '), false);
+      return;
+    }
     await this._processOperation(async (current) => {
       const selectedBody = processBody(current.canvas.processModel, [], current.canvas.selectedProcessId);
       const calendar = selectedBody.workCalendar;
@@ -970,6 +1011,7 @@ const FlowBuilderScreen = {
     // A silent autosave has no toast, so the element that blocks it is named here;
     // on a narrow bar the chip is only its icon and the tooltip is its text.
     el.setAttribute('title', kind === 'error' && reason ? reason : t.textContent);
+    s.fitTopbar?.();
   },
 
   _updateStats() {
@@ -989,15 +1031,20 @@ const FlowBuilderScreen = {
     state.root.querySelector('.fb-breadcrumb').classList.toggle('fb-breadcrumb-scoped', path.length > 0);
     up.hidden = path.length === 0;
     label.hidden = path.length === 0;
+    state.root.querySelector('[data-role="scope-sep"]').hidden = path.length === 0;
     let body = processBody(state.canvas.processModel, [],
       state.canvas.selectedProcessId);
+    const elementNames = processElementNames(state.canvas.processModel);
     const names = [];
     for (const id of path) {
-      const node = body.nodes.find((candidate) => candidate.id === id);
-      names.push(node.name || I18n.t('bpmn.node_sub_process'));
+      // Siblings that share a name are numbered; the path as a whole is numbered
+      // too, so "Sub-process › Sub-process" never reads as one place twice.
+      const labels = processDistinctLabels(body.nodes.map((candidate) => [candidate.id, elementNames.get(candidate.id)]));
+      names.push(labels.get(id));
       body = processBody(body, [id]);
     }
-    state.scopeNames = names;
+    const onPath = processDistinctLabels(names.map((name, index) => [index, name]));
+    state.scopeNames = names.map((_, index) => onPath.get(index));
     this._syncCrumb(state);
     this._syncProcessBodySelect();
   },
@@ -1014,7 +1061,9 @@ const FlowBuilderScreen = {
     const scoped = state.mode === 'bpmn' && state.canvas?.processPath.length > 0;
     const label = root.querySelector('[data-role="scope-path"]');
     if (label) label.textContent = [flowName, ...(state.scopeNames || [])].join(' › ');
-    crumb.textContent = selected ? getNodeDisplayTitle(selected, state.templatesMap.get(selected.type)) : flowName;
+    crumb.textContent = selected
+      ? processNodeLabels(state.canvas.nodes, state.canvas.templates).get(selected.id) ?? getNodeDisplayTitle(selected, state.templatesMap.get(selected.type))
+      : flowName;
     crumb.hidden = separator.hidden = scoped && !selected;
   },
 
@@ -1049,12 +1098,12 @@ const FlowBuilderScreen = {
     if (!state || state.mode !== 'bpmn') return;
     const select = state.root.querySelector('[data-role="start-entry"]');
     const current = select.value;
-    const labels = processBodyLabels(state.canvas.processModel);
-    const startKind = (entry) => entry.trigger?.TimerStart ? 'timer_start' : entry.trigger?.MessageStart ? 'message_start' : 'start';
+    const labels = processStartEntryLabels(state.startCatalog, state.canvas.processModel);
+    // The only entry there is needs no choosing.
+    const chosen = current && state.startCatalog[Number(current)] ? current : state.startCatalog.length === 1 ? '0' : '';
     select.setOptions([{ value: '', label: I18n.t('bpmn.start_entry'), disabled: true }, ...state.startCatalog.map((entry, index) => ({
-      value: String(index),
-      label: `${labels.get(entry.processId) || entry.processName || I18n.t('bpmn.crumb_root')} · ${entry.startNodeName || I18n.t(`bpmn.node_${startKind(entry)}`)}`,
-    }))], current && state.startCatalog[Number(current)] ? current : '');
+      value: String(index), label: labels.get(index),
+    }))], chosen);
   },
 
   async _save({ silent = false } = {}) {
@@ -1067,7 +1116,7 @@ const FlowBuilderScreen = {
     if (errors.length > 0) {
       this._reportSaveProblem(s, errors.length > 1
         ? I18n.t('flows_builder.save_blocked_more', { first: errors[0], count: errors.length - 1 }) : errors[0], silent);
-      if (!silent && s.mode === 'bpmn') this._revealMissingTimezone(s);
+      if (!silent && s.mode === 'bpmn') this._revealMissingTimezone(s, errors);
       return false;
     }
     s.saving = true;
@@ -1132,9 +1181,9 @@ const FlowBuilderScreen = {
   // A refused save for want of a time zone takes the author to the field: its
   // body is shown, the settings row (folded on a short window) is opened and the
   // field is focused. A silent autosave never moves focus.
-  _revealMissingTimezone(state) {
+  _revealMissingTimezone(state, errors) {
     const gap = processTimezoneGaps(state.canvas.getData())[0];
-    if (!gap) return;
+    if (!gap || !errors.includes(processTimezoneText(gap))) return;
     if (gap.processId !== state.canvas.selectedProcessId) {
       state.canvas.navigateProcessBody([], gap.processId);
       state.config.renderEmpty();
@@ -1229,12 +1278,14 @@ const FlowBuilderScreen = {
     }
   },
 
-  _setupEdgeSwipes(root) {
+  // Every way a panel opens or closes goes through `setMobileTab`, so the tab bar
+  // always names the panel on screen; otherwise a closed inspector leaves its tab
+  // active and the next tap on an element finds nothing to change.
+  _setupEdgeSwipes(root, setMobileTab) {
     const body = root.querySelector('[data-role="body"]');
-    const paletteEl = body.querySelector('[data-role="palette"]');
-    const configEl = body.querySelector('[data-role="config"]');
     let startX = null;
     let target = null;
+    let pressedBackdrop = false;
     body.addEventListener('touchstart', (ev) => {
       if (window.innerWidth >= 1024) return;
       const x = ev.touches[0].clientX;
@@ -1246,16 +1297,16 @@ const FlowBuilderScreen = {
     body.addEventListener('touchmove', (ev) => {
       if (startX == null) return;
       const dx = ev.touches[0].clientX - startX;
-      if (target === 'palette' && dx > 60) { paletteEl.classList.add('open'); body.classList.add('overlay-backdrop'); startX = null; }
-      if (target === 'config' && dx < -60) { configEl.classList.add('open'); body.classList.add('overlay-backdrop'); startX = null; }
+      if (target === 'palette' && dx > 60) { setMobileTab('palette'); startX = null; }
+      if (target === 'config' && dx < -60) { setMobileTab('config'); startX = null; }
     }, { passive: true });
+    // The press that opened a panel ends in a click on the backdrop it just
+    // raised; only a press that began on the backdrop dismisses.
+    body.addEventListener('pointerdown', (ev) => { pressedBackdrop = ev.target === body; }, true);
     body.addEventListener('click', (ev) => {
-      if (window.innerWidth >= 1024) return;
-      if (ev.target === body) {
-        paletteEl.classList.remove('open');
-        configEl.classList.remove('open');
-        body.classList.remove('overlay-backdrop');
-      }
+      if (window.innerWidth >= 1024 || ev.target !== body || !pressedBackdrop) return;
+      pressedBackdrop = false;
+      setMobileTab('canvas');
     });
   },
 

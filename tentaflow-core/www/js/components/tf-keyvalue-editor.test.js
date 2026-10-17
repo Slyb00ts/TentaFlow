@@ -186,3 +186,20 @@ test('multiline rows preserve long keys and CEL expressions through edits, add/r
   assert.equal(rowEls(el)[0].querySelectorAll('tf-input').length, 2);
   assert.deepEqual(el.value, { [key]: expression + ' && vars.Result_OK' });
 });
+
+test('label: a heading names the group above its rows and follows the attribute', () => {
+  const el = new TfKeyvalueEditor();
+  el.setAttribute('label', 'Input mapping');
+  document.body.appendChild(el);
+  const heading = el.querySelector('.tf-kve-label');
+  assert.equal(heading.textContent, 'Input mapping');
+  assert.equal(heading.hidden, false);
+  const group = el.querySelector('[role="group"]');
+  assert.equal(group.getAttribute('aria-labelledby'), heading.id, 'the group is named by the heading, so two editors are told apart');
+  el.setAttribute('label', 'Output mapping');
+  assert.equal(heading.textContent, 'Output mapping');
+  el.removeAttribute('label');
+  assert.equal(heading.hidden, true);
+  assert.equal(el.querySelector('[role="group"]'), null);
+  el.remove();
+});

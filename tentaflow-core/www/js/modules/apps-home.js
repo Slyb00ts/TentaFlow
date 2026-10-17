@@ -131,11 +131,14 @@ const AppsHomeScreen = {
     try {
       me = await ApiBinary.one('authMeRequest');
     } catch {}
-    byId('apps-greeting-h').textContent = I18n.t('apps_home.greeting', { name: me?.username ?? '' });
+    // The screen is replaced when the language changes while the request is out.
+    const greeting = byId('apps-greeting-h');
+    const grid = byId('apps-grid');
+    if (!greeting || !grid) return;
+    greeting.textContent = I18n.t('apps_home.greeting', { name: me?.username ?? '' });
     const role = (me?.role ?? 'user').toLowerCase();
     const isPowerUser = role === 'admin' || role === 'power_user';
 
-    const grid = byId('apps-grid');
     grid.innerHTML = TILES
       .filter((t) => !t.requiresPowerUser || isPowerUser)
       .map(renderTile)
@@ -146,7 +149,7 @@ const AppsHomeScreen = {
     // zabijamy calego widoku — kafelki built-in zostaja widoczne.
     try {
       const apps = await ApiBinary.list('appsListRequest', { arrayKey: 'apps' });
-      if (Array.isArray(apps) && apps.length > 0) {
+      if (grid.isConnected && Array.isArray(apps) && apps.length > 0) {
         const html = sortAddonApps(apps).map(renderAddonTile).join('');
         grid.insertAdjacentHTML('beforeend', html);
       }

@@ -323,7 +323,9 @@ class TfMenu extends HTMLElement {
     }
     if (!this.contains(document.activeElement)) return;
     if (e.key === 'Tab') { this.close(); return; }
-    const rows = [...this.querySelectorAll(':scope > tf-menu-item > .tf-menu-item')];
+    // A hidden item cannot take focus and a disabled one cannot act, so neither
+    // is a stop: the arrows would otherwise end on the first of them.
+    const rows = [...this.querySelectorAll(':scope > tf-menu-item:not([hidden]):not([disabled]) > .tf-menu-item')];
     const at = rows.indexOf(document.activeElement);
     if (at < 0) return;
     const go = (i) => { e.preventDefault(); rows[(i + rows.length) % rows.length].focus(); };

@@ -4,6 +4,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeAttr, escapeHtml } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
+import { processElementNames, processExplainError, processStartEntryLabels } from './bpmn.js';
 import '/js/components/tf-alert.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-code-editor.js';
@@ -40,7 +41,7 @@ function jsonSection(label, value) {
   return section;
 }
 
-export function simulationWindow(view) {
+export function simulationWindow(view, model = null) {
   const win = document.createElement('tf-window');
   win.setAttribute('title', text('simulation'));
   win.setAttribute('icon', 'play');
@@ -56,10 +57,15 @@ export function simulationWindow(view) {
   const content = win.querySelector('[data-simulation-content]');
   let current = view;
   let busy = false;
+  // The run reports elements by id; the author knows them by the names of the
+  // model that was started.
+  const elementNames = model ? processElementNames(model) : new Map();
+  const elementName = (nodeId, name) => String(name || '').trim() || elementNames.get(nodeId) || text('element_unavailable');
 
   const setError = (error) => {
     const alert = win.querySelector('[data-error]');
-    alert.setAttribute('message', error?.message || String(error));
+    const message = error?.message || String(error);
+    alert.setAttribute('message', model ? processExplainError(message, model) : message);
     alert.hidden = false;
   };
 
@@ -99,7 +105,7 @@ export function simulationWindow(view) {
       <section class="fb-simulation-section"><h3>${escapeHtml(text('simulation_tasks'))}</h3>
         ${tasks.length ? tasks.map((task) => {
           const manual = task.kind === 'Manual';
-          return `<article class="fb-simulation-task"><div><strong>${escapeHtml(task.name || task.nodeId || task.userTaskId)}</strong> · ${escapeHtml(task.kind || '')}</div>
+          return `<article class="fb-simulation-task"><div><strong>${escapeHtml(elementName(task.nodeId, task.name))}</strong> · ${escapeHtml(task.kind || '')}</div>
             <div>${escapeHtml(task.instructions || '')}</div>
             ${manual ? '' : `<tf-code-editor data-simulation-output="${escapeAttr(task.userTaskId)}" language="json" aria-label="${escapeAttr(text('simulation_outputs'))}"></tf-code-editor>`}
             <tf-button variant="${manual ? 'secondary' : 'primary'}" size="sm" data-simulation-task="${escapeAttr(task.userTaskId)}" data-simulation-manual="${manual ? 'true' : 'false'}" ${busy ? 'disabled' : ''}>${escapeHtml(text(manual ? 'simulation_acknowledge_task' : 'simulation_complete_task'))}</tf-button>
@@ -112,14 +118,14 @@ export function simulationWindow(view) {
           const statusKey = ['pending', 'fired', 'blocked'].includes(status)
             ? `simulation_timer_${status}` : null;
           const due = timer.dueAtMs == null ? '—' : String(timer.dueAtMs);
-          return `<article class="fb-simulation-timer"><div><strong>${escapeHtml(timer.nodeName || timer.nodeId || timer.timerId)}</strong> · ${escapeHtml(String(timer.kind || ''))}
+          return `<article class="fb-simulation-timer"><div><strong>${escapeHtml(elementName(timer.nodeId, timer.nodeName))}</strong> · ${escapeHtml(String(timer.kind || ''))}
             <tf-chip status="info">${escapeHtml(statusKey ? text(statusKey) : String(timer.status || ''))}</tf-chip></div>
             <div>${escapeHtml(text('simulation_timer_due'))}: ${escapeHtml(due)} · ${escapeHtml(text('simulation_timer_occurrence'))}: ${escapeHtml(String(timer.occurrence ?? 0))}</div>
           </article>`;
         }).join('') : `<p>${escapeHtml(text('simulation_empty_timers'))}</p>`}
       </section>
       <section class="fb-simulation-section"><h3>${escapeHtml(text('simulation_events'))}</h3>
-        ${events.length ? `<ol class="fb-simulation-events">${shownEvents.map((event) => `<li><span>${escapeHtml(String(event.atMs))}</span> ${escapeHtml(event.kind)}${event.nodeId ? ` · ${escapeHtml(event.nodeId)}` : ''}</li>`).join('')}</ol>` : `<p>${escapeHtml(text('simulation_empty_events'))}</p>`}
+        ${events.length ? `<ol class="fb-simulation-events">${shownEvents.map((event) => `<li><span>${escapeHtml(String(event.atMs))}</span> ${escapeHtml(event.kind)}${event.nodeId ? ` · ${escapeHtml(elementName(event.nodeId))}` : ''}</li>`).join('')}</ol>` : `<p>${escapeHtml(text('simulation_empty_events'))}</p>`}
         ${hiddenEvents > 0 ? `<p data-simulation-events-omitted>${escapeHtml(text('simulation_events_omitted', { count: hiddenEvents }))}</p>` : ''}
         ${current.traceStepsOmitted > 0 ? `<p data-simulation-trace-omitted>${escapeHtml(text('simulation_trace_steps_omitted', { count: current.traceStepsOmitted }))}</p>` : ''}
       </section>`;
@@ -169,7 +175,8 @@ export function openProcessSimulation(definition, version, startCatalog, selecte
   const manualStarts = startCatalog.filter((entry) => entry.trigger?.Start?.canStart);
   const selection = document.createElement('section');
   selection.className = 'fb-process-simulation-start';
-  selection.innerHTML = `<tf-select data-simulation-start label="${escapeAttr(text('start_entry'))}"><option value="">${escapeHtml(text('start_entry'))}</option>${manualStarts.map((entry, index) => `<option value="${index}">${escapeHtml(entry.processName || entry.processId)} · ${escapeHtml(entry.startNodeName || entry.startNodeId)}</option>`).join('')}</tf-select>`;
+  const startLabels = processStartEntryLabels(manualStarts, definition.model);
+  selection.innerHTML = `<tf-select data-simulation-start wrap-selected label="${escapeAttr(text('start_entry'))}"><option value="">${escapeHtml(text('start_entry'))}</option>${manualStarts.map((entry, index) => `<option value="${index}">${escapeHtml(startLabels.get(index))}</option>`).join('')}</tf-select>`;
   const variables = jsonSection(text('simulation_variables'), definition.model.variables || {});
   const selectedIndex = manualStarts.findIndex((entry) => entry.processId === selectedStart?.processId
     && entry.startNodeId === selectedStart?.startNodeId);
@@ -209,7 +216,7 @@ export function openProcessSimulation(definition, version, startCatalog, selecte
         horizonMs: startMs + 60 * 60 * 1000,
         tickDurationMs: 1000,
       });
-      simulationWindow(response.view);
+      simulationWindow(response.view, definition.model);
       return { message: text('simulation_started') };
     },
   });

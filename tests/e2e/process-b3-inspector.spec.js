@@ -208,9 +208,23 @@ for (const [width, height] of [[1280, 720], [1024, 700], [390, 844]]) {
     const phone = width < 768;
     if (phone) await page.locator('.fb-mobile-tabs tf-tab[id="palette"] button').click();
     await dragFlowToCanvas(page, 120, 120);
-    if (phone) await page.locator('.fb-mobile-tabs tf-tab[id="config"] button').click();
     const node = page.locator('.fb-canvas .fb-node.bpmn_service_task');
     await expect(node).toHaveCount(1);
+    if (phone) {
+      // The author leaves the inspector and taps the element again: that alone must bring the inspector back.
+      await page.locator('.fb-mobile-tabs tf-tab[id="canvas"] button').click();
+      await expect(page.locator('.fb-config')).not.toHaveClass(/open/);
+      // An element that is not selected yet: the press selects it, the click that ends the press must not undo that.
+      await page.locator('.fb-canvas .fb-node.bpmn_start').click();
+      await expect(page.locator('.fb-config')).toHaveClass(/open/);
+      await expect(page.locator('.fb-mobile-tabs')).toHaveAttribute('value', 'config');
+      await page.waitForTimeout(600);
+      await expect(page.locator('.fb-config')).toHaveClass(/open/);
+      await page.locator('.fb-mobile-tabs tf-tab[id="canvas"] button').click();
+      await node.click();
+      await expect(page.locator('.fb-config')).toHaveClass(/open/);
+      await expect(page.locator('.fb-mobile-tabs')).toHaveAttribute('value', 'config');
+    }
 
     // The inspector slides in on a phone; measure it once it has stopped.
     for (let attempt = 0, previous = null; attempt < 30; attempt += 1) {
@@ -331,6 +345,22 @@ test.describe('on a large window', () => {
     const handlers = page.locator('.fb-canvas .fb-node.bpmn_boundary_error');
     const boxes = [];
     for (let index = 0; index < 6; index += 1) boxes.push(await rect(handlers.nth(index)));
+    // The line from a handler to its name stays outside the task it hangs from.
+    const crossings = await handlers.evaluateAll((elements, host) => elements.filter((element) => {
+      const leader = element.querySelector('.fb-process-label-leader');
+      if (!leader || leader.hidden) return false;
+      // A rotated line's box is the box of the segment; the angle says which corners it joins.
+      const box = leader.getBoundingClientRect();
+      const angle = parseFloat(/rotate\(([-\d.e]+)rad\)/.exec(leader.style.transform)?.[1] ?? 0);
+      const [x0, x1] = Math.cos(angle) >= 0 ? [box.left, box.right] : [box.right, box.left];
+      const [y0, y1] = Math.sin(angle) >= 0 ? [box.top, box.bottom] : [box.bottom, box.top];
+      return Array.from({ length: 41 }, (_, step) => step / 40).some((t) => {
+        const x = x0 + (x1 - x0) * t;
+        const y = y0 + (y1 - y0) * t;
+        return x > host.left + 4 && x < host.right - 4 && y > host.top + 4 && y < host.bottom - 4;
+      });
+    }).length, task);
+    expect(crossings, 'no leader line runs through the task').toBe(0);
     // Nothing the task draws or connects with is covered: icon, kind badge and both ports.
     const covered = [
       ['icon', await rect(node.locator('.fb-process-symbol > svg').first())],
@@ -638,7 +668,7 @@ test.describe('toolbar, refusals, drops and labels', () => {
     await more.click();
     const menu = page.locator('tf-menu[data-role="more-menu"]');
     await expect(menu).toHaveAttribute('open', '');
-    await expect(more).toHaveAttribute('aria-expanded', 'true');
+    await expect(more.locator('button')).toHaveAttribute('aria-expanded', 'true');
     // The button that opened the menu closes it; the press must not close it first and the click reopen it.
     await more.click();
     await expect(menu).not.toHaveAttribute('open', '');
@@ -650,7 +680,7 @@ test.describe('toolbar, refusals, drops and labels', () => {
     expect(await page.evaluate(() => document.activeElement?.closest('tf-menu') != null), 'focus moved into the menu').toBe(true);
     await page.keyboard.press('Escape');
     await expect(menu).not.toHaveAttribute('open', '');
-    await expect(more).toHaveAttribute('aria-expanded', 'false');
+    await expect(more.locator('button')).toHaveAttribute('aria-expanded', 'false');
     expect(await page.evaluate(() => document.activeElement?.closest('[data-role="more"]') != null), 'focus is back on the button').toBe(true);
     await more.click();
     await menu.locator('[data-role="calendar"]').click();
@@ -865,5 +895,207 @@ test.describe('refusals on a laptop window', () => {
     await page.locator('[data-role="save"]').click();
     await expect(banner).toBeHidden();
     await expect(page.locator('[data-role="autosave"]')).toHaveAttribute('title', /Saved/);
+  });
+});
+
+// Round 4 of the designer review: the bar at tablet widths, names instead of ids
+// in every list and window, the keyboard in the More menu, and what an author
+// needs to publish and run.
+const ID_SHAPE = /\b[ne]_[0-9a-z]{6,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|Process_[0-9a-f_]{12,}/i;
+const shownText = (locator) => locator.evaluate((element) => [
+  element.innerText,
+  ...[...element.querySelectorAll('option')].map((option) => option.textContent),
+  ...[...element.querySelectorAll('[message]')].map((alert) => alert.getAttribute('message')),
+].join('\n'));
+
+test.describe('round 4: toolbar width, keyboard, names and publishing', () => {
+  test.use({ viewport: { width: 1600, height: 950 } });
+
+  test('the toolbar fits from 768 px up in five languages: every button stays inside the bar', async ({ page }) => {
+    test.setTimeout(300000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Toolbar widths with a rather long process name');
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await page.setViewportSize({ width: 1600, height: 900 });
+      await setLanguage(page, language);
+      await openDesigner(page, { login: false, id: own });
+      for (const width of [768, 820, 900, 1024]) {
+        await page.setViewportSize({ width, height: 800 });
+        // The screen eases in with a transform; boxes are read once the shell has settled at the window's width.
+        await expect.poll(async () => {
+          const first = await rect(page.locator('.fb-shell'));
+          await page.waitForTimeout(150);
+          const second = await rect(page.locator('.fb-shell'));
+          return Math.abs(first.right - second.right) < 0.01 && Math.abs(second.right - width) < 2;
+        }, { message: `${language} ${width}: the shell has settled` }).toBe(true);
+        const bar = page.locator('.fb-topbar');
+        await expect.poll(() => bar.evaluate((element) => element.scrollWidth <= element.clientWidth + 1), { message: `${language} ${width}: nothing is cut off` }).toBe(true);
+        const shell = await rect(page.locator('.fb-shell'));
+        for (const role of ['back', 'save', 'publish', 'run-wrap', 'more']) {
+          const box = await rect(page.locator(`.fb-topbar [data-role="${role}"]`));
+          expect(box.left, `${language} ${width}: ${role} starts inside the window`).toBeGreaterThanOrEqual(shell.left - 1);
+          expect(box.right, `${language} ${width}: ${role} ends inside the window`).toBeLessThanOrEqual(shell.right + 1);
+        }
+        expect((await rect(bar)).height, `${language} ${width}: one line`).toBeLessThanOrEqual(60);
+        await page.locator('[data-role="more"]').click();
+        await expect(page.locator('tf-menu[data-role="more-menu"]')).toHaveAttribute('open', '');
+        const menu = await rect(page.locator('tf-menu[data-role="more-menu"] .tf-menu'));
+        expect(menu.right, `${language} ${width}: the menu is on screen`).toBeLessThanOrEqual(width);
+        await page.keyboard.press('Escape');
+      }
+    }
+    await setLanguage(page, 'en');
+  });
+
+  test('the arrow keys, Home and End walk the whole More menu and skip what is hidden or disabled', async ({ page }) => {
+    test.setTimeout(120000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Menu keys');
+    await openDesigner(page, { login: false, id: own });
+    // The menu closes on any scroll or resize of the page, so it is opened once the screen has stopped moving.
+    await page.waitForTimeout(1000);
+    await page.locator('[data-role="more"]').click();
+    const menu = page.locator('tf-menu[data-role="more-menu"]');
+    await expect(menu).toHaveAttribute('open', '');
+    const reachable = await menu.evaluate((element) => [...element.querySelectorAll(':scope > tf-menu-item:not([hidden]):not([disabled])')].map((item) => item.dataset.role));
+    expect(reachable.length).toBeGreaterThan(6);
+    const focused = () => page.evaluate(() => document.activeElement?.closest('tf-menu-item')?.dataset.role ?? null);
+    expect(await focused()).toBe(reachable[0]);
+    const down = [];
+    for (let step = 0; step < reachable.length; step += 1) { await page.keyboard.press('ArrowDown'); down.push(await focused()); }
+    expect(down, 'ArrowDown visits every reachable item and wraps').toEqual([...reachable.slice(1), reachable[0]]);
+    await page.keyboard.press('ArrowUp');
+    expect(await focused(), 'ArrowUp wraps to the last').toBe(reachable.at(-1));
+    await page.keyboard.press('Home');
+    expect(await focused()).toBe(reachable[0]);
+    await page.keyboard.press('End');
+    expect(await focused(), 'End reaches the last one past the hidden items').toBe(reachable.at(-1));
+    expect(reachable).not.toContain('refresh-calendar');
+    expect(reachable).not.toContain('simulate');
+  });
+
+  test('the autosave chip shows its whole text at laptop width and above, in every state and language', async ({ page }) => {
+    test.setTimeout(240000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Chip text');
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await setLanguage(page, language);
+      await openDesigner(page, { login: false, id: own });
+      for (const [kind, reason] of [['ok'], ['pending'], ['error', 'Refused']]) {
+        await page.evaluate(async ({ state, why }) => {
+          const { default: builder } = await import('/js/modules/flows-builder.js');
+          builder._setAutosave(state, why);
+        }, { state: kind, why: reason });
+        const text = page.locator('[data-role="autosave-text"]');
+        expect(await text.evaluate((element) => element.scrollWidth <= element.clientWidth + 1), `${language} ${kind}: the text is not cut`).toBe(true);
+      }
+    }
+    await setLanguage(page, 'en');
+  });
+
+  test('a published process names its start entry without an id, Run takes the only entry and says why it is off before', async ({ page }) => {
+    test.setTimeout(180000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Publish and run', { errors: [], escalations: [] });
+    await openDesigner(page, { login: false, id: own });
+    const wrap = page.locator('[data-role="run-wrap"]');
+    await expect(page.locator('[data-role="run"]')).toBeDisabled().catch(() => {});
+    expect(await wrap.getAttribute('title')).toContain('Publish the process first');
+    await page.locator('[data-role="publish"]').click();
+    await expect(page.locator('.toast').first()).toContainText('published');
+    // One entry exists, so it is chosen without a visit to the settings row.
+    await expect(page.locator('[data-role="run"]')).not.toHaveAttribute('disabled', '');
+    expect(await wrap.getAttribute('title')).not.toContain('Choose a start entry');
+    await page.locator('[data-role="run"]').click();
+    const windowText = (locator) => locator.evaluate((element) => [element.textContent,
+      ...[...element.querySelectorAll('option')].map((option) => option.textContent)].join('\n'));
+    const run = page.locator('tf-window.tf-act-window').last();
+    await expect(run.locator('[data-start]')).toBeVisible();
+    expect(await windowText(run)).not.toMatch(ID_SHAPE);
+    await expect(run.locator('[data-start] .tf-select-selected')).toContainText('Process 1');
+    await page.keyboard.press('Escape');
+    await expect(run.locator('[data-start]')).toBeHidden();
+
+    await page.locator('[data-role="more"]').click();
+    await page.locator('tf-menu[data-role="more-menu"] [data-role="simulate"]').click();
+    const simulation = page.locator('tf-window.tf-act-window').last();
+    await expect(simulation.locator('[data-simulation-start]')).toBeVisible();
+    expect(await windowText(simulation)).not.toMatch(ID_SHAPE);
+  });
+
+  test('publishing with an unused declaration names it in the banner and never shows the server\'s words', async ({ page }) => {
+    test.setTimeout(120000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Unused declarations');
+    await openDesigner(page, { login: false, id: own });
+    await page.locator('[data-role="publish"]').click();
+    const banner = page.locator('[data-role="error"]');
+    await expect(banner).toBeVisible();
+    const text = await banner.getAttribute('message');
+    expect(text).toContain('INVALID_INPUT');
+    expect(text).not.toMatch(/protocol error|BadRequest/);
+    await expect(page.locator('[data-role="run"]')).toBeDisabled().catch(() => {});
+  });
+
+  test('inspectors show names, never ids: every service tab, a handler, a gateway, a sub-process, and element ids sit behind technical details', async ({ page }) => {
+    test.setTimeout(180000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'No ids');
+    await openDesigner(page, { login: false, id: own });
+    await dragFlowToCanvas(page, 300, 200);
+    await giveResultRule(page);
+    const config = page.locator('.fb-config');
+    for (const tab of ['Action', 'Data', 'Result', 'Timing', 'More']) {
+      await page.getByRole('tab', { name: tab }).click();
+      expect(await shownText(config), `${tab} tab`).not.toMatch(ID_SHAPE);
+    }
+    await page.getByRole('tab', { name: 'Result' }).click();
+    await page.locator('[data-routing-add="error"]').scrollIntoViewIfNeeded();
+    await page.locator('[data-routing-add="error"]').click();
+    await expect(page.locator('.fb-canvas .fb-node.bpmn_boundary_error')).toHaveCount(1);
+    await page.locator('.fb-canvas .fb-node.bpmn_boundary_error').click();
+    expect(await shownText(config), 'the handler').not.toMatch(ID_SHAPE);
+    const technical = config.locator('tf-disclosure[data-technical]');
+    await expect(technical).toBeVisible();
+    await expect(technical).not.toHaveAttribute('open', '');
+    await expect(config.locator('[data-process="elementId"]')).toBeHidden();
+    await technical.locator('summary').click();
+    await expect(config.locator('[data-process="elementId"]')).toBeVisible();
+
+    await dragPaletteItem(page, 'Sub-?process', 700, 120);
+    const headings = config.locator('tf-keyvalue-editor .tf-kve-label');
+    await expect(headings).toHaveText([/^Input mapping/, /^Output mapping/]);
+    expect(await shownText(config), 'the sub-process').not.toMatch(ID_SHAPE);
+  });
+
+  test('a boundary event that is not on a task is drawn dashed and tagged, not like an attached one', async ({ page }) => {
+    test.setTimeout(120000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Unattached look');
+    await openDesigner(page, { login: false, id: own });
+    await dragPaletteItem(page, 'Boundary timer', 500, 330);
+    const event = page.locator('.fb-canvas .fb-node.bpmn_boundary_timer');
+    await expect(event).toHaveCount(1);
+    await expect(event).toHaveClass(/fb-unattached/);
+    expect(await event.evaluate((element) => getComputedStyle(element).outlineStyle)).toBe('dashed');
+    expect(await event.evaluate((element) => getComputedStyle(element, '::after').content)).toContain('Not attached');
+  });
+});
+
+test.describe('round 4: settings row on a short window', () => {
+  test.use({ viewport: { width: 1024, height: 700 } });
+
+  test('opening the process settings keeps the inspector body at 400 px or more', async ({ page }) => {
+    test.setTimeout(120000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Settings height');
+    await openDesigner(page, { login: false, id: own });
+    await dragFlowToCanvas(page, 120, 120);
+    const body = page.locator('.fb-config-body');
+    const height = () => body.evaluate((element) => element.offsetHeight);
+    await expect.poll(height).toBeGreaterThanOrEqual(400);
+    await page.locator('[data-role="notice-toggle"]').click();
+    await expect(page.locator('.fb-process-notice')).not.toHaveClass(/fb-collapsed/);
+    await expect.poll(height, { message: 'with the settings row open' }).toBeGreaterThanOrEqual(400);
   });
 });

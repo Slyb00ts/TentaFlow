@@ -1465,18 +1465,57 @@ test('tf-menu: a pointerdown on its anchor leaves the menu to the anchor, one an
   anchor.remove(); menu.remove();
 });
 
-test('tf-button: aria-label, aria-describedby, aria-expanded and aria-haspopup reach the real button, also when they change', async () => {
+test('tf-menu: the arrow keys, Home and End walk only the items that are shown and enabled', async () => {
+  await import('./tf-menu.js');
+  const menu = document.createElement('tf-menu');
+  menu.innerHTML = `<tf-menu-item action="a">A</tf-menu-item><tf-menu-item action="b" hidden>B</tf-menu-item>
+    <tf-menu-item action="c" disabled>C</tf-menu-item><tf-menu-item action="d">D</tf-menu-item>
+    <tf-menu-divider></tf-menu-divider><tf-menu-item action="e" hidden>E</tf-menu-item>`;
+  document.body.append(menu);
+  menu.open();
+  const rows = () => [...menu.querySelectorAll(':scope > tf-menu-item > .tf-menu-item')];
+  const focused = () => document.activeElement.parentElement.getAttribute('action');
+  const press = (key) => document.dispatchEvent(new window.KeyboardEvent('keydown', { key, bubbles: true }));
+  rows()[0].focus();
+  press('ArrowDown'); assert.equal(focused(), 'd', 'hidden and disabled items are skipped going down');
+  press('ArrowDown'); assert.equal(focused(), 'a', 'the list wraps past the hidden last item');
+  press('ArrowUp'); assert.equal(focused(), 'd');
+  press('Home'); assert.equal(focused(), 'a');
+  press('End'); assert.equal(focused(), 'd', 'End lands on the last item that can be focused');
+  menu.remove();
+});
+
+test('tf-button: aria-label, aria-describedby, aria-controls, aria-expanded and aria-haspopup reach the real button only, also when they change', async () => {
   const button = mount(new TfButton(), { icon: 'more' });
   await flush();
   const inner = () => button.querySelector('button');
+  const names = ['aria-label', 'aria-describedby', 'aria-controls', 'aria-expanded', 'aria-haspopup'];
   button.setAttribute('aria-label', 'More');
   button.setAttribute('aria-describedby', 'why');
+  button.setAttribute('aria-controls', 'panel');
   button.setAttribute('aria-expanded', 'false');
   button.setAttribute('aria-haspopup', 'menu');
-  assert.deepEqual(['aria-label', 'aria-describedby', 'aria-expanded', 'aria-haspopup'].map((name) => inner().getAttribute(name)), ['More', 'why', 'false', 'menu']);
+  assert.deepEqual(names.map((name) => inner().getAttribute(name)), ['More', 'why', 'panel', 'false', 'menu']);
+  assert.deepEqual(names.map((name) => Element.prototype.hasAttribute.call(button, name)), [false, false, false, false, false],
+    'the host keeps no second copy for assistive technology to announce');
+  assert.equal(button.getAttribute('aria-expanded'), 'false', 'the host still answers for the state it was given');
   button.setAttribute('aria-expanded', 'true');
   assert.equal(inner().getAttribute('aria-expanded'), 'true');
   button.removeAttribute('aria-describedby');
   assert.equal(inner().hasAttribute('aria-describedby'), false);
+  assert.equal(button.hasAttribute('aria-describedby'), false);
   button.remove();
+});
+
+test('tf-button: aria attributes written in markup move to the real button', async () => {
+  const host = document.createElement('div');
+  host.innerHTML = '<tf-button icon="more" aria-controls="drawer" aria-expanded="true"></tf-button>';
+  document.body.append(host);
+  await flush();
+  const button = host.querySelector('tf-button');
+  const inner = button.querySelector('button');
+  assert.equal(inner.getAttribute('aria-controls'), 'drawer');
+  assert.equal(inner.getAttribute('aria-expanded'), 'true');
+  assert.equal(Element.prototype.hasAttribute.call(button, 'aria-controls'), false);
+  host.remove();
 });

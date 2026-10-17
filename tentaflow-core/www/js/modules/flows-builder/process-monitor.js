@@ -4,7 +4,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeAttr, escapeHtml } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
-import { checkProcessValue, processBody, processCommand, processEditorLabels, processJson, processStatusLabel } from './bpmn.js';
+import { checkProcessValue, processBody, processBodyLabels, processCommand, processDistinctLabels, processEditorLabels, processElementNames, processJson, processStartEntryLabels, processStatusLabel, processUnusedDeclarations } from './bpmn.js';
 import '/js/components/tf-code-editor.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-table.js';
@@ -68,12 +68,14 @@ function activityInputsSection(task) {
   section.className = 'fb-process-activity-inputs';
   section.innerHTML = `<h3>${escapeHtml(text('activity_input_values'))}</h3>
     <p class="fb-process-activity-inputs-hint">${escapeHtml(text('activity_input_values_hint'))}</p>`;
-  for (const input of task.activityInputs) {
+  const labels = processDistinctLabels(task.activityInputs.map((input, index) =>
+    [index, input.name || text('activity_input_unnamed')]));
+  for (const [index, input] of task.activityInputs.entries()) {
     const row = document.createElement('div');
     row.className = 'fb-process-activity-input';
-    const label = input.name || input.declarationId || text('activity_input_unnamed');
+    const label = labels.get(index);
     const title = document.createElement('h4');
-    title.textContent = `${label} · ${input.declarationId || ''}`;
+    title.textContent = label;
     row.append(title);
     const missing = input.value === 'Missing';
     if (missing) {
@@ -573,6 +575,13 @@ export async function openProcessInstance(instanceId, initial = null) {
     container.append(controls);
   }
 
+  // A scope is told apart by the element it belongs to, never by its id; the
+  // root scope and a scope outside the loaded page carry no extra line.
+  function scopeLine(scopeId, key = 'scope_name') {
+    const scope = instance.scopes.find((candidate) => candidate.scopeId === scopeId);
+    return scope ? `<p>${escapeHtml(text(key, { name: scope.subprocessNodeName || text('root_scope') }))}</p>` : '';
+  }
+
   function render() {
     if (!win.isConnected) return;
     renderedSnapshot = JSON.stringify(instance);
@@ -587,8 +596,8 @@ export async function openProcessInstance(instanceId, initial = null) {
       detail.className = 'fb-process-work';
       detail.dataset.terminalError = '';
       detail.innerHTML = `<div><strong>${escapeHtml(text('terminal_business_error'))}</strong>
-        <p>${escapeHtml(instance.terminalError.errorCode)} · ${escapeHtml(instance.terminalError.errorRef)}</p>
-        <p>${escapeHtml(text('call_error_source'))}: ${escapeHtml(instance.terminalError.sourceNodeId)} · ${escapeHtml(instance.terminalError.sourceScopeId)}</p></div>`;
+        <p>${escapeHtml(instance.terminalError.errorCode)}</p>${scopeLine(instance.terminalError.sourceScopeId)}</div>`;
+      detail.title = `${text('call_error_source')}: ${instance.terminalError.sourceNodeId} \u00b7 ${instance.terminalError.sourceScopeId}`;
       host.querySelector('[data-summary]').append(detail);
     }
     host.querySelector('[data-cancel]')?.addEventListener('click', async () => {
@@ -600,7 +609,7 @@ export async function openProcessInstance(instanceId, initial = null) {
     for (const task of instance.userTasks) {
       const row = document.createElement('div');
       row.className = 'fb-process-work';
-      row.innerHTML = `<div><strong>${escapeHtml(task.name)}</strong><p>${escapeHtml(text(`work_kind_${task.kind.toLowerCase()}`))} · ${escapeHtml(processStatusLabel(task.status))}</p><p>${escapeHtml(text('scope_id'))}: ${escapeHtml(task.scopeId)}</p></div>
+      row.innerHTML = `<div><strong>${escapeHtml(task.name)}</strong><p>${escapeHtml(text(`work_kind_${task.kind.toLowerCase()}`))} · ${escapeHtml(processStatusLabel(task.status))}</p>${scopeLine(task.scopeId)}</div>
         ${task.canComplete && task.status === 'Open' ? `<tf-button variant="primary" data-complete>${escapeHtml(text(task.kind === 'Verification' ? 'review_result' : task.kind === 'Manual' ? 'acknowledge_manual' : 'complete_work'))}</tf-button>` : ''}`;
       row.querySelector('[data-complete]')?.addEventListener('click', () => complete(task));
       work.appendChild(row);
@@ -611,7 +620,7 @@ export async function openProcessInstance(instanceId, initial = null) {
     for (const incident of instance.incidents) {
       const row = document.createElement('div');
       row.className = 'fb-process-work';
-      row.innerHTML = `<div><strong>${escapeHtml(incident.nodeName || text('element_unavailable'))}</strong><p>${escapeHtml(processIncidentText(incident))}</p><p>${escapeHtml(text('scope_id'))}: ${escapeHtml(incident.scopeId)}</p></div>
+      row.innerHTML = `<div><strong>${escapeHtml(incident.nodeName || text('element_unavailable'))}</strong><p>${escapeHtml(processIncidentText(incident))}</p><p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)}</p>${scopeLine(incident.scopeId)}</div>
         <tf-button variant="secondary" data-inspect-incident>${escapeHtml(text('inspect_incident'))}</tf-button>
         ${incident.canRetry && incident.jobId ? `<tf-button variant="secondary" icon="refresh" data-retry>${escapeHtml(text('retry'))}</tf-button>` : ''}`;
       row.querySelector('[data-inspect-incident]').addEventListener('click', () => { selectedIncidentId = incident.incidentId; refresh(); });
@@ -627,7 +636,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       const detail = document.createElement('div');
       detail.className = 'fb-process-work';
       detail.dataset.selectedIncident = incident.incidentId;
-      detail.innerHTML = `<div><strong>${escapeHtml(incident.nodeName || incident.nodeId)}</strong>
+      detail.innerHTML = `<div><strong>${escapeHtml(incident.nodeName || text('element_unavailable'))}</strong>
         <p>${escapeHtml(incident.code)} · ${escapeHtml(incident.message)}</p>
         ${resolvedAtMs == null ? '' : `<p>${escapeHtml(text('incident_resolved_at', { time: date(resolvedAtMs) }))}</p>`}</div>
         <tf-button variant="ghost" data-close-incident>${escapeHtml(text('close_detail'))}</tf-button>`;
@@ -648,8 +657,8 @@ export async function openProcessInstance(instanceId, initial = null) {
       const subject = subscription.kind === 'BoundaryEscalation'
         ? subscription.escalationCode || text('escalation_any_code')
         : subscription.signalName || subscription.messageName || subscription.errorCode || text('element_unavailable');
-      row.innerHTML = `<div><strong>${escapeHtml(subscription.nodeName || subscription.nodeId)}</strong><p>${escapeHtml(subject)} · ${escapeHtml(text(`subscription_status_${subscription.status.toLowerCase()}`))}</p>
-        ${subscription.kind === 'BoundaryEscalation' || subscription.kind === 'SignalCatch' ? '' : `<p>${escapeHtml(text('message_correlation_key'))}: ${escapeHtml(subscription.correlationKey || '')}</p>`}<p>${escapeHtml(subscription.subscriptionId)}</p></div>`;
+      row.innerHTML = `<div><strong>${escapeHtml(subscription.nodeName || text('element_unavailable'))}</strong><p>${escapeHtml(subject)} · ${escapeHtml(text(`subscription_status_${subscription.status.toLowerCase()}`))}</p>
+        ${subscription.kind === 'BoundaryEscalation' || subscription.kind === 'SignalCatch' ? '' : `<p>${escapeHtml(text('message_correlation_key'))}: ${escapeHtml(subscription.correlationKey || '')}</p>`}</div>`;
       subscriptions.append(row);
     }
     renderPageControls(host.querySelector('[data-subscriptions]'), 'subscriptions');
@@ -668,7 +677,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       const row = document.createElement('div');
       row.className = 'fb-process-work';
       row.dataset.messageId = message.messageId;
-      row.innerHTML = `<div><strong>${escapeHtml(message.messageName)}</strong><p>${escapeHtml(text(`message_status_${message.status.toLowerCase()}`))} · ${escapeHtml(message.correlationKey)}</p><p>${escapeHtml(message.messageId)}</p></div>
+      row.innerHTML = `<div><strong>${escapeHtml(message.messageName)}</strong><p>${escapeHtml(text(`message_status_${message.status.toLowerCase()}`))} · ${escapeHtml(message.correlationKey)}</p></div>
         <tf-button variant="secondary" data-message-detail>${escapeHtml(text('message_detail'))}</tf-button>`;
       row.querySelector('[data-message-detail]').addEventListener('click', () => openProcessMessageDetail(message, refresh));
       outgoing.append(row);
@@ -682,9 +691,8 @@ export async function openProcessInstance(instanceId, initial = null) {
       row.dataset.scopeId = scope.scopeId;
       row.innerHTML = `<div><strong>${escapeHtml(scope.subprocessNodeName || text('root_scope'))}</strong>
         <p>${escapeHtml(processStatusLabel(scope.status))} · ${escapeHtml(text('scope_depth', { depth: scope.depth }))}</p>
-        <p>${escapeHtml(text('scope_id'))}: ${escapeHtml(scope.scopeId)}</p>
         ${scope.terminalError ? `<p>${escapeHtml(text('terminal_business_error'))}: ${escapeHtml(scope.terminalError.errorCode)}</p>` : ''}
-        ${scope.parentScopeId ? `<p>${escapeHtml(text('parent_scope_id'))}: ${escapeHtml(scope.parentScopeId)}</p>` : ''}</div>
+        ${scope.parentScopeId ? scopeLine(scope.parentScopeId, 'parent_scope_name') : ''}</div>
         <tf-button variant="secondary" data-scope-inspect>${escapeHtml(text('scope_inspect'))}</tf-button>`;
       row.querySelector('[data-scope-inspect]').addEventListener('click', async () => {
         selectedScopeId = scope.scopeId;
@@ -735,7 +743,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       row.innerHTML = `<div><strong>${escapeHtml(group.nodeName)}</strong>
         <p>${escapeHtml(text(`repeat_mode_${group.mode}`))} · ${escapeHtml(text(`repeat_status_${group.status}`))}</p>
         <p>${escapeHtml(text('repeat_progress', { completed: group.completed, created: group.createdCount, total: count }))}</p>
-        <p>${escapeHtml(text('scope_id'))}: ${escapeHtml(group.scopeId)}</p></div>
+        ${scopeLine(group.scopeId)}</div>
         <tf-button variant="secondary" data-repeat-inspect>${escapeHtml(text('repeat_inspect'))}</tf-button>`;
       row.querySelector('[data-repeat-inspect]').addEventListener('click', () => {
         selectedRepetitionGroupId = group.groupId;
@@ -754,8 +762,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       row.className = 'fb-process-work';
       row.dataset.repetitionOccurrenceId = occurrence.occurrenceId;
       row.innerHTML = `<div><strong>${escapeHtml(text('repeat_ordinal', { ordinal: occurrence.ordinal + 1 }))}</strong>
-        <p>${escapeHtml(text(`repeat_occurrence_status_${occurrence.status}`))}</p>
-        <p>${escapeHtml(occurrence.occurrenceId)}</p></div>
+        <p>${escapeHtml(text(`repeat_occurrence_status_${occurrence.status}`))}</p></div>
         <tf-button variant="secondary" data-repeat-item>${escapeHtml(text('repeat_item'))}</tf-button>
         <tf-button variant="secondary" data-repeat-aggregate>${escapeHtml(text('repeat_aggregate'))}</tf-button>`;
       for (const [selector, kind] of [['[data-repeat-item]', 'item'], ['[data-repeat-aggregate]', 'aggregate']]) {
@@ -830,8 +837,9 @@ export async function openProcessInstance(instanceId, initial = null) {
 export function openProcessRun(definition, versions, startCatalog, selectedStart) {
   const selection = document.createElement('div');
   const manualStarts = startCatalog.filter((entry) => entry.trigger?.Start?.canStart);
+  const startLabels = processStartEntryLabels(manualStarts, definition.model);
   selection.innerHTML = `<tf-select data-version label="${escapeAttr(text('published_version'))}">${versions.map((version) => `<option value="${version.version}">${escapeHtml(text('version_number', { version: version.version }))}</option>`).join('')}</tf-select>
-    <tf-select data-start wrap-selected label="${escapeAttr(text('start_entry'))}"><option value="">${escapeHtml(text('start_entry'))}</option>${manualStarts.map((entry, index) => `<option value="${index}">${escapeHtml(entry.processName || entry.processId)} · ${escapeHtml(entry.startNodeName || entry.startNodeId)}</option>`).join('')}</tf-select>`;
+    <tf-select data-start wrap-selected label="${escapeAttr(text('start_entry'))}"><option value="">${escapeHtml(text('start_entry'))}</option>${manualStarts.map((entry, index) => `<option value="${index}">${escapeHtml(startLabels.get(index))}</option>`).join('')}</tf-select>`;
   const variables = jsonSection(text('initial_variables'), definition.model.variables);
   const selectedIndex = manualStarts.findIndex((entry) => entry.processId === selectedStart?.processId
     && entry.startNodeId === selectedStart?.startNodeId);
@@ -870,7 +878,9 @@ export function openProcessVariables(value, onSave) {
 export function openProcessDeclarations(model, readOnly, onSave) {
   const section = document.createElement('section');
   section.className = 'fb-process-declarations';
-  section.innerHTML = `<tf-textarea data-declaration-namespace label="${escapeAttr(text('target_namespace'))}" value="${escapeAttr(model.targetNamespace || '')}" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>
+  const unused = processUnusedDeclarations(model).map(({ kind, name }) => text(`unused_${kind}`, { name }));
+  section.innerHTML = `${unused.length ? `<tf-alert tone="warning" data-unused-declarations message="${escapeAttr(unused.join(' '))}"></tf-alert>` : ''}
+    <tf-textarea data-declaration-namespace label="${escapeAttr(text('target_namespace'))}" value="${escapeAttr(model.targetNamespace || '')}" autogrow rows="2" ${readOnly ? 'disabled' : ''}></tf-textarea>
     <h3>${escapeHtml(text('message_declarations'))}</h3><div data-message-rows></div>
     ${readOnly ? '' : `<tf-button variant="secondary" data-add-message>${escapeHtml(text('add_message_declaration'))}</tf-button>`}
     <h3>${escapeHtml(text('error_declarations'))}</h3><div data-error-rows></div>
@@ -972,8 +982,14 @@ export function openProcessModeling(model, path, processId, readOnly, onSave) {
       ['width', 'modeling_width'], ['height', 'modeling_height']].map(([key, label]) =>
       `<tf-input type="number" step="1" data-geometry-field="${key}" value="${bounds[key]}" label="${escapeAttr(text(label))}" ${readOnly ? 'disabled' : ''}></tf-input>`).join('')}</div>`;
   };
-  const optionList = (items, selected, blank = '') => `<option value="">${escapeHtml(blank)}</option>${items.map(([value, label]) =>
-    `<option value="${escapeAttr(value)}" ${value === selected ? 'selected' : ''}>${escapeHtml(label)}</option>`).join('')}`;
+  // Entries that share a label get their occurrence number; an id is never one.
+  const optionList = (items, selected, blank = '') => {
+    const labels = processDistinctLabels(items);
+    return `<option value="">${escapeHtml(blank)}</option>${items.map(([value]) =>
+      `<option value="${escapeAttr(value)}" ${value === selected ? 'selected' : ''}>${escapeHtml(labels.get(value))}</option>`).join('')}`;
+  };
+  const elementNames = processElementNames(draft);
+  const elementName = (node) => elementNames.get(node.id) ?? text('element_unavailable');
   const edgeGeometry = (edges, item) => {
     const edge = edges.find((entry) => entry.elementId === item.id);
     if (!edge) return '';
@@ -984,26 +1000,26 @@ export function openProcessModeling(model, path, processId, readOnly, onSave) {
   const render = () => {
     const lanes = laneRows();
     const refs = modeling.dataObjectReferences;
-    const annotationIds = modeling.textAnnotations.map((item) => [item.id, item.text || item.id]);
-    const endpoints = [...body.nodes.map((item) => [item.id, item.name || item.id]),
-      ...refs.map((item) => [item.id, item.name ?? item.id]),
-      ...modeling.dataStoreReferences.map((item) => [item.id, item.name ?? item.id]), ...annotationIds];
+    const annotationIds = modeling.textAnnotations.map((item) => [item.id, item.text || text('modeling_annotation')]);
+    const endpoints = [...body.nodes.map((item) => [item.id, elementName(item)]),
+      ...refs.map((item) => [item.id, item.name || text('modeling_data_reference')]),
+      ...modeling.dataStoreReferences.map((item) => [item.id, item.name || text('modeling_store_reference')]), ...annotationIds];
     const variableOptions = Object.keys(body.variables).map((key) => [key, key]);
     const collaboration = draft.collaboration;
     const participantShapes = collaboration?.diagram.modelingShapes || [];
-    const participantOptions = (collaboration?.participants || []).map((item) => [item.id, item.name ?? item.id]);
+    const participantOptions = (collaboration?.participants || []).map((item) => [item.id, item.name || text('modeling_pool')]);
     const messageEndpoints = [...participantOptions,
-      ...allBodies.flatMap((item) => nodesInBody(item).map((node) => [node.id, node.name || node.id]))];
+      ...allBodies.flatMap((item) => nodesInBody(item).map((node) => [node.id, elementName(node)]))];
     section.innerHTML = `<p>${escapeHtml(text('modeling_hint'))}</p>
       <h3>${escapeHtml(text('modeling_lanes'))}</h3>
       <div data-modeling-lanes>${lanes.map(({ lane, depth }) => `<div data-modeling-kind="lane" data-modeling-id="${escapeAttr(lane.id)}">
         <tf-input data-modeling-field="name" value="${escapeAttr(lane.name ?? '')}" label="${escapeAttr(`${text('modeling_lane')} ${depth + 1}`)}" ${readOnly ? 'disabled' : ''}></tf-input>
         ${geometry(bodyShapes, lane)}
-        <tf-select data-modeling-node="${escapeAttr(lane.id)}" wrap-selected label="${escapeAttr(text('modeling_assign_node'))}" ${readOnly ? 'disabled' : ''}>${optionList(body.nodes.map((node) => [node.id, node.name || node.id]), '', text('modeling_choose'))}</tf-select>
+        <tf-select data-modeling-node="${escapeAttr(lane.id)}" wrap-selected label="${escapeAttr(text('modeling_assign_node'))}" ${readOnly ? 'disabled' : ''}>${optionList(body.nodes.map((node) => [node.id, elementName(node)]), '', text('modeling_choose'))}</tf-select>
         ${readOnly ? '' : `<tf-button variant="secondary" data-assign-node="${escapeAttr(lane.id)}">${escapeHtml(text('modeling_assign_node'))}</tf-button>
           ${depth < 3 ? `<tf-button variant="secondary" data-add-child-lane="${escapeAttr(lane.id)}">${escapeHtml(text('modeling_add_child_lane'))}</tf-button>` : ''}
           <tf-button variant="danger" data-remove-modeling="${escapeAttr(lane.id)}">${escapeHtml(text('remove_declaration'))}</tf-button>`}
-        <div>${lane.flowNodeRefs.map((nodeId) => `<tf-chip status="info">${escapeHtml(body.nodes.find((node) => node.id === nodeId)?.name || nodeId)}</tf-chip>${readOnly ? '' : `<tf-button variant="ghost" data-remove-node="${escapeAttr(lane.id)}" data-node-id="${escapeAttr(nodeId)}">${escapeHtml(text('remove_declaration'))}</tf-button>`}`).join('')}</div>
+        <div>${lane.flowNodeRefs.map((nodeId) => `<tf-chip status="info">${escapeHtml(elementNames.get(nodeId) ?? text('element_unavailable'))}</tf-chip>${readOnly ? '' : `<tf-button variant="ghost" data-remove-node="${escapeAttr(lane.id)}" data-node-id="${escapeAttr(nodeId)}">${escapeHtml(text('remove_declaration'))}</tf-button>`}`).join('')}</div>
       </div>`).join('')}</div>
       ${readOnly ? '' : `<tf-button variant="secondary" data-add-modeling="lane">${escapeHtml(text('modeling_add_lane'))}</tf-button>`}
       <h3>${escapeHtml(text('modeling_stores'))}</h3>
@@ -1017,7 +1033,7 @@ export function openProcessModeling(model, path, processId, readOnly, onSave) {
       <h3>${escapeHtml(text('modeling_store_references'))}</h3>
       <div data-modeling-store-references>${modeling.dataStoreReferences.map((reference) => `<div data-modeling-kind="storeReference" data-modeling-id="${escapeAttr(reference.id)}">
         <tf-input data-modeling-field="name" value="${escapeAttr(reference.name ?? '')}" label="${escapeAttr(text('modeling_store_reference'))}" ${readOnly ? 'disabled' : ''}></tf-input>
-        <tf-select data-modeling-field="dataStoreRef" wrap-selected label="${escapeAttr(text('modeling_store'))}" ${readOnly ? 'disabled' : ''}>${optionList(draft.dataStores.map((store) => [store.id, store.name ?? store.id]), reference.dataStoreRef, text('modeling_choose'))}</tf-select>
+        <tf-select data-modeling-field="dataStoreRef" wrap-selected label="${escapeAttr(text('modeling_store'))}" ${readOnly ? 'disabled' : ''}>${optionList(draft.dataStores.map((store) => [store.id, store.name || text('modeling_store')]), reference.dataStoreRef, text('modeling_choose'))}</tf-select>
         ${geometry(bodyShapes, reference)}
         ${readOnly ? '' : `<tf-button variant="danger" data-remove-modeling="${escapeAttr(reference.id)}">${escapeHtml(text('remove_declaration'))}</tf-button>`}
       </div>`).join('')}</div>
@@ -1052,7 +1068,7 @@ export function openProcessModeling(model, path, processId, readOnly, onSave) {
       ${path.length ? '' : `<h3>${escapeHtml(text('modeling_pools'))}</h3>
       <div data-modeling-participants>${(collaboration?.participants || []).map((participant) => `<div data-modeling-kind="participant" data-modeling-id="${escapeAttr(participant.id)}">
         <tf-input data-modeling-field="name" value="${escapeAttr(participant.name ?? '')}" label="${escapeAttr(text('modeling_pool'))}" ${readOnly ? 'disabled' : ''}></tf-input>
-        <tf-select data-modeling-field="processRef" wrap-selected label="${escapeAttr(text('modeling_pool_body'))}" ${readOnly ? 'disabled' : ''}>${optionList(allBodies.map((item) => [item.processId, item.processName || item.processId]), participant.processRef?.processId, text('modeling_black_box'))}</tf-select>
+        <tf-select data-modeling-field="processRef" wrap-selected label="${escapeAttr(text('modeling_pool_body'))}" ${readOnly ? 'disabled' : ''}>${optionList([...processBodyLabels(draft)], participant.processRef?.processId, text('modeling_black_box'))}</tf-select>
         ${geometry(participantShapes, participant)}
         ${readOnly ? '' : `<tf-button variant="danger" data-remove-modeling="${escapeAttr(participant.id)}">${escapeHtml(text('remove_declaration'))}</tf-button>`}
       </div>`).join('')}</div>

@@ -8,8 +8,9 @@
 //       JSON-schema `type: "object"` arm (additionalProperties: string), but
 //       carries no flow-builder-specific knowledge — labels/placeholders are
 //       supplied by the caller via attributes, same as <tf-tag-input>.
-//       Attributes: disabled, multiline, key-placeholder, value-placeholder, add-label,
-//       remove-label.
+//       Attributes: label (a heading above the rows that also names the group for
+//       assistive technology), disabled, multiline, key-placeholder,
+//       value-placeholder, add-label, remove-label.
 //       Property: .value — plain object, e.g. {"content-type": "text/plain"}.
 //       Rows with an empty key or an empty value are dropped from `.value`
 //       (a half-typed row stays visible while editing, never reaches config).
@@ -25,14 +26,17 @@ import '/js/components/tf-input.js';
 import '/js/components/tf-textarea.js';
 import '/js/components/tf-button.js';
 
+let labelCounter = 0;
+
 class TfKeyvalueEditor extends HTMLElement {
   static get observedAttributes() {
-    return ['disabled', 'multiline', 'key-placeholder', 'value-placeholder', 'add-label', 'remove-label'];
+    return ['label', 'disabled', 'multiline', 'key-placeholder', 'value-placeholder', 'add-label', 'remove-label'];
   }
 
   constructor() {
     super();
     this._wrap = null;
+    this._labelEl = null;
     this._list = null;
     this._addBtn = null;
     // Row objects (not just the committed `.value` object) so a row with one
@@ -53,6 +57,8 @@ class TfKeyvalueEditor extends HTMLElement {
       this._renderRows();
     } else if (name === 'add-label') {
       this._updateAddButton();
+    } else if (name === 'label') {
+      this._updateLabel();
     }
   }
 
@@ -82,6 +88,11 @@ class TfKeyvalueEditor extends HTMLElement {
     const wrap = document.createElement('div');
     wrap.className = 'tf-kve';
 
+    const label = document.createElement('span');
+    label.className = 'tf-kve-label';
+    label.id = `tf-kve-label-${++labelCounter}`;
+    wrap.appendChild(label);
+
     const list = document.createElement('div');
     list.className = 'tf-kve-rows';
     wrap.appendChild(list);
@@ -96,8 +107,10 @@ class TfKeyvalueEditor extends HTMLElement {
 
     this.appendChild(wrap);
     this._wrap = wrap;
+    this._labelEl = label;
     this._list = list;
     this._addBtn = addBtn;
+    this._updateLabel();
     this._updateAddButton();
 
     // Delegated listeners: rows are rebuilt wholesale on every add/remove, so
@@ -119,6 +132,20 @@ class TfKeyvalueEditor extends HTMLElement {
       const idx = Number(rowEl?.dataset.idx);
       if (Number.isInteger(idx)) this._removeAt(idx);
     });
+  }
+
+  _updateLabel() {
+    if (!this._labelEl) return;
+    const text = this.getAttribute('label') || '';
+    this._labelEl.textContent = text;
+    this._labelEl.hidden = !text;
+    if (text) {
+      this._wrap.setAttribute('role', 'group');
+      this._wrap.setAttribute('aria-labelledby', this._labelEl.id);
+    } else {
+      this._wrap.removeAttribute('role');
+      this._wrap.removeAttribute('aria-labelledby');
+    }
   }
 
   _updateAddButton() {

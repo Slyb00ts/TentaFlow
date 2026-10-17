@@ -1392,7 +1392,7 @@
     max-content
     max-content
     max-content
-    minmax(clamp(500px, 70vh, 600px), 1fr)
+    minmax(clamp(520px, 70vh, 600px), 1fr)
     minmax(52px, max-content);
   align-content: start;
   overflow-y: auto;
@@ -1444,7 +1444,7 @@ body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transf
     white-space: nowrap;
     text-overflow: ellipsis;
   }
-  .fb-process-shell .fb-topbar .fb-autosave { width: 108px; box-sizing: border-box; overflow: hidden; position: relative; }
+  .fb-process-shell .fb-topbar .fb-autosave { max-width: 280px; box-sizing: border-box; overflow: hidden; position: relative; }
   .fb-process-shell .fb-topbar .fb-autosave [data-role="autosave-text"] { overflow: hidden; text-overflow: ellipsis; }
   .fb-process-shell .fb-topbar-spacer { flex: 1 1 0; min-width: 0; }
 }
@@ -1460,11 +1460,23 @@ body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transf
 }
 @media (max-width: 767px) {
   .fb-topbar > [data-role="publish"] { order: 8; }
-  .fb-topbar > [data-role="run"] { order: 9; }
+  .fb-topbar > [data-role="run-wrap"] { order: 9; }
   .fb-topbar > [data-role="more"] { order: 10; }
 }
-/* On a narrower bar the secondary buttons keep their icon and lose the text
-   (it stays as the tooltip), so the toolbar needs two rows, not three. */
+/* A disabled button takes no pointer, so Run's tooltip hangs on this wrapper;
+   the reason is also the button's description, read but never drawn. */
+.fb-run-wrap { display: inline-flex; flex-shrink: 0; }
+.fb-sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+/* The bar gives up room in steps measured on the bar itself (flows-builder.js
+   fitTopbar), not on the window: the sidebar and the language decide how much
+   the bar has. Back and Save keep their icon, then the zoom percentage goes,
+   then the name may shrink further. */
+.fb-process-shell .fb-topbar.fb-bar-1 [data-fit-compact] .tf-btn > span { display: none; }
+.fb-process-shell .fb-topbar.fb-bar-2 .fb-zoom-level { display: none; }
+.fb-process-shell .fb-topbar.fb-bar-3 .fb-flow-name { min-width: 72px; }
+.fb-process-shell .fb-topbar.fb-bar-3 .fb-zoom-controls [data-role="zoom-fit"] { display: none; }
+/* Below a wide window the secondary buttons keep their icon and lose the text
+   (it stays as the tooltip), so the bar stays one line. */
 @media (max-width: 1699px) {
   .fb-process-shell .fb-topbar tf-button[data-compact] .tf-btn > span { display: none; }
   .fb-process-shell .fb-flow-name { flex: 1 1 200px; min-width: 160px; max-width: 260px; }
@@ -1587,9 +1599,14 @@ body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transf
 .fb-repeat-marker-sequential { background: repeating-linear-gradient(to bottom, var(--tf-text) 0 2px, transparent 2px 5px); height: 12px; }
 .fb-repeat-marker-parallel { background: repeating-linear-gradient(to right, var(--tf-text) 0 2px, transparent 2px 6px); height: 12px; }
 .fb-process-node:focus-visible { outline: 3px solid var(--tf-accent-1); outline-offset: 5px; }
+.fb-process-node.fb-unattached { outline: 2px dashed var(--tf-warning, #d97706); outline-offset: 6px; }
+.fb-process-node.fb-unattached::after { content: attr(data-unattached-label); position: absolute; left: 50%; bottom: calc(100% + 10px); transform: translateX(-50%); padding: 1px 8px; border-radius: 999px; background: var(--tf-warning, #d97706); color: #1a1205; font-size: 11px; font-weight: 700; line-height: 1.5; white-space: nowrap; pointer-events: none; z-index: 3; }
 .fb-process-label { position: absolute; width: max-content; max-width: 200px; padding: 4px 6px; box-sizing: border-box; line-height: 1.4; text-align: center; overflow-wrap: anywhere; white-space: normal; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; line-clamp: 4; overflow: hidden; background: var(--tf-bg-card); border: 1px solid var(--tf-border); border-radius: 6px; z-index: 2; }
 .fb-process-label[hidden], .fb-process-label-leader[hidden] { display: none; }
+.fb-process-node:hover > .fb-process-label, .fb-process-node.selected > .fb-process-label { border-color: var(--tf-accent-1); }
+.fb-process-node:hover > .fb-process-label-leader, .fb-process-node.selected > .fb-process-label-leader { border-top: 2px solid var(--tf-accent-1); }
 .fb-process-label-leader { position: absolute; height: 0; border-top: 1px solid var(--tf-accent-2); transform-origin: left center; pointer-events: none; }
+.fb-process-label-leader::before { content: ''; position: absolute; left: -3px; top: -4px; width: 6px; height: 6px; border-radius: 50%; background: var(--tf-accent-2); }
 .fb-process-edge-label { fill: var(--tf-text-2); font-size: 12px; paint-order: stroke; stroke: var(--tf-bg); stroke-width: 4px; stroke-linejoin: round; pointer-events: none; }
 .fb-process-shell .fb-edge-hit:focus-visible { stroke: var(--tf-accent-1); stroke-opacity: 0.4; }
 .fb-process-fields, .fb-process-connect, .fb-process-content { min-width: 0; }

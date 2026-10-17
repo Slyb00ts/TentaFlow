@@ -1,6 +1,7 @@
 // ============ File: flows-builder/bpmn.js — BPMN presentation and lossless canvas model mapping ============
 
 import { I18n } from '/js/i18n.js';
+import { getNodeDisplayTitle } from './node-i18n.js';
 
 const ELEMENTS = [
   ['Start', 'start', 'bpmn-none-start', 'events', 56, 56],
@@ -158,9 +159,13 @@ function tentaflowTemplates(options) {
     const rowSub = blank ? id : duplicate ? `(${id}) ${boundedNodeName(tool.addonName)}` : boundedNodeName(tool.addonName);
     return { rowName: boundedNodeName(tool.toolName), rowSub };
   };
+  // Flows that share a name are told apart by their occurrence number, in the
+  // palette and on the task dropped from it.
+  const flows = options.serviceFlows || [];
+  const flowNames = processDistinctLabels(flows.map((flow) => [flow.flowId, boundedNodeName(flow.name)]));
   return [
-    ...(options.serviceFlows || []).map((flow) =>
-      entry('flows', 'flow', boundedNodeName(flow.name), flow.description || I18n.t('bpmn.palette_flow_hint'),
+    ...flows.map((flow) =>
+      entry('flows', 'flow', flowNames.get(flow.flowId), flow.description || I18n.t('bpmn.palette_flow_hint'),
         { flowId: flow.flowId })),
     ...(options.serviceBlocks || []).map((block) => entry('blocks', block.nodeType === 'llm' ? 'brain'
       : block.nodeType === 'pii_filter' ? 'shield' : 'sparkle',
@@ -366,7 +371,7 @@ const ESCALATION_PATH_REASONS = ['terminal_before_wait', 'scope_entry', 'call_en
 
 // What an author calls each element of a model: its name, else its kind. The
 // elements of every body and nested sub-process, keyed by id.
-function processElementNames(model) {
+export function processElementNames(model) {
   const names = new Map();
   const visit = (body) => {
     for (const node of body?.nodes || []) {
@@ -407,10 +412,69 @@ export function processTimezoneGaps(model) {
   return gaps;
 }
 
+// Why a typed time zone cannot be used, or null. An IANA name is accepted when
+// the engine lists it or still resolves it (a link such as "US/Eastern"); where
+// the runtime knows no zone data at all, only the shape of a name is checked.
+export function processTimezoneProblem(value) {
+  const zone = String(value ?? '').trim();
+  if (!zone) return null;
+  if (!/^[A-Za-z][A-Za-z0-9_+-]*(\/[A-Za-z0-9_+-]+)*$/.test(zone)) return 'invalid';
+  if (typeof Intl === 'undefined' || typeof Intl.DateTimeFormat !== 'function') return null;
+  if (typeof Intl.supportedValuesOf === 'function' && Intl.supportedValuesOf('timeZone').includes(zone)) return null;
+  try { new Intl.DateTimeFormat('en', { timeZone: zone }); return null; } catch (_) { return 'invalid'; }
+}
+
 export function processTimezoneText(gap) {
   if (!gap) return I18n.t('bpmn.timer_timezone_server');
   return gap.element == null ? I18n.t('bpmn.timer_timezone_calendar_missing')
     : I18n.t('bpmn.timer_timezone_missing', { element: gap.element });
+}
+
+const DECLARATIONS = [['message', 'messages', 'messageId', 'messageRef'], ['error', 'errors', 'errorId', 'errorRef'],
+  ['escalation', 'escalations', 'escalationId', 'escalationRef'], ['signal', 'signals', 'signalId', 'signalRef']];
+
+// The declared messages, errors, escalations and signals that no element
+// references. Publishing refuses them; the author is told which, by name.
+export function processUnusedDeclarations(model) {
+  const used = new Set();
+  const visit = (body) => {
+    for (const node of body?.nodes || []) {
+      if (typeof node.kind !== 'object') continue;
+      const payload = Object.values(node.kind)[0];
+      for (const [, , , ref] of DECLARATIONS) if (payload?.[ref]) used.add(payload[ref]);
+      if (node.kind.SubProcess) visit(node.kind.SubProcess.body);
+    }
+  };
+  [model, ...(model?.additionalProcesses || [])].forEach(visit);
+  return DECLARATIONS.flatMap(([kind, list, idKey]) => (model?.[list] || [])
+    .filter((declaration) => !used.has(declaration[idKey]))
+    .map((declaration) => ({ kind, name: String(declaration.name || declaration.errorCode || declaration.escalationCode || '').trim() })));
+}
+
+// The repeated elements that have no output collection variable. Saving a draft
+// accepts that; publishing does not.
+export function processRepeatOutputGaps(model) {
+  const names = processElementNames(model);
+  const gaps = [];
+  const visit = (body) => {
+    for (const node of body?.nodes || []) {
+      const repeat = node.repeat;
+      const output = repeat?.MultiInstance?.outputCollectionVariable ?? repeat?.StructuredLoop?.outputCollectionVariable;
+      if (repeat && !/^[A-Za-z][A-Za-z0-9_.-]{0,127}$/.test(output ?? '')) gaps.push({ nodeId: node.id, name: names.get(node.id) });
+      if (node.kind?.SubProcess) visit(node.kind.SubProcess.body);
+    }
+  };
+  [model, ...(model?.additionalProcesses || [])].forEach(visit);
+  return gaps;
+}
+
+// What would make the server refuse a publication, told by name before it is
+// asked: the texts are the ones the author reads in the banner.
+export function processPublishProblems(model) {
+  return [
+    ...processUnusedDeclarations(model).map(({ kind, name }) => I18n.t(`bpmn.unused_${kind}`, { name })),
+    ...processRepeatOutputGaps(model).map(({ name }) => I18n.t('bpmn.repeat_output_missing', { node: name })),
+  ];
 }
 
 // Names that tell two entries apart without showing an internal id: a name two
@@ -434,6 +498,30 @@ export function processBodyLabels(model) {
     [body.processId, String(body.processName || '').trim() || I18n.t('bpmn.process_body_unnamed', { number: index + 1 })]));
 }
 
+// The title of each canvas node as the author reads it on the canvas; two nodes
+// that share a title get their occurrence number, so a list never offers two
+// identical lines. `templates` is the canvas' type -> template map.
+export function processNodeLabels(nodes, templates = null) {
+  return processDistinctLabels(nodes.map((node) => [node.id, getNodeDisplayTitle(node, templates?.get?.(node.type))]));
+}
+
+// The entries of a start catalog by the body and the start element an author
+// sees, keyed by their index in the catalog. A body without a name is "Process
+// N" by position, never the id the server falls back to.
+export function processStartEntryLabels(catalog, model) {
+  const bodies = processBodyLabels(model);
+  const kindOf = (entry) => entry.trigger?.TimerStart ? 'timer_start' : entry.trigger?.MessageStart ? 'message_start' : 'start';
+  return processDistinctLabels(catalog.map((entry, index) => [index,
+    `${bodies.get(entry.processId) || I18n.t('bpmn.crumb_root')} \u00b7 ${String(entry.startNodeName || '').trim() || I18n.t(`bpmn.node_${kindOf(entry)}`)}`]));
+}
+
+// Data inputs, outputs and object references have a name or are told apart by
+// their position ("Item 2"); the id they carry stays out of the lists.
+export function processItemLabels(items) {
+  return processDistinctLabels(items.map((item, index) =>
+    [item.id, String(item.name ?? '').trim() || I18n.t('bpmn.activity_io_unnamed', { number: index + 1 })]));
+}
+
 const ID_SLOT = /\b(?:task|node|event|gateway|activity|element|boundary|repeat|call|catch|throw|flow|subprocess|id|origin|reaches)[:]?\s+$|["'`\u201c\u2018]$/i;
 
 /**
@@ -455,8 +543,17 @@ export function processExplainError(message, model) {
     for (const node of body?.nodes || []) if (node.kind?.SubProcess) collect(node.kind.SubProcess.body);
   };
   bodies.forEach(collect);
-  const text = String(message ?? '');
+  const text = String(message ?? '').replace(/^protocol error \w+:\s*/i, '');
   if (/explicit IANA timezone/.test(text)) return processTimezoneText(processTimezoneGaps(model)[0]);
+  if (/timerless process cannot declare a timer timezone/.test(text)) return I18n.t('bpmn.timer_timezone_unused');
+  const unused = /unreferenced (message|error|escalation|signal) declaration/.exec(text);
+  if (unused) {
+    const named = processUnusedDeclarations(model).filter((declaration) => declaration.kind === unused[1]);
+    return named.length ? named.map(({ kind, name }) => I18n.t(`bpmn.unused_${kind}`, { name })).join(' ')
+      : I18n.t(`bpmn.unused_${unused[1]}_any`);
+  }
+  const repeated = /repeat ([\w.-]+) has invalid output collection variable/.exec(text);
+  if (repeated && names.has(repeated[1])) return I18n.t('bpmn.repeat_output_missing', { node: names.get(repeated[1]) });
   const path = /escalation boundary ([\w-]+) has unsupported immediate path (\w+) at/.exec(text);
   if (path && names.has(path[1])) {
     const key = ESCALATION_PATH_REASONS.includes(path[2]) ? path[2] : 'other';

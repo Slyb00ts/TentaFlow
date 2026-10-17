@@ -167,17 +167,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   sama wczytuje opublikowane definicje i wersje. Dolny pasek w podprocesie to jeden
   wiersz, ciało inspektora ma 400 px i więcej przy 1280x720 i 1024x700, szuflada
   palety zamyka się Escape i kliknięciem płótna.
-
-### TentaNas
-
-- Lista dozwolonych targetu iSCSI/NVMe-oF jest zapamiętywana w bazie
-  (migracja 30: `nas_targets.allowlist_mode` i `nas_targets.open_confirmed`).
-  Target z listą dozwolonych, której ostatni wpis usunięto, jest **zamknięty
-  dla wszystkich**: nikt nowy się nie zaloguje (także po restarcie węzła czy
-  przebudowie grupy portali). Na iSCSI sesje usuniętych klientów są zrywane;
-  na NVMe-oF hosty połączone w tej chwili zachowują dostęp, dopóki nie połączą
-  się ponownie (aby odciąć je od razu, zatrzymaj target).
-  Usunięcie ostatniego wpisu (w edytorze listy albo „Rozłącz … i usuń z listy”)
 - Projektant BPMN, runda 3 (GUI): zapis odmawia timera bez strefy czasowej procesu
   z nazwą elementu, rozwija zwinięty wiersz ustawień i ustawia fokus w polu (zamiast
   surowego błędu serwera); żaden komunikat walidacji nie podaje identyfikatora
@@ -190,6 +179,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   nieistniejący) jest nazwany i oznaczony ostrzeżeniem. Przerysowanie 80 elementów
   nie wymusza układu strony dla każdego z nich, długie kody w etykietach łamią się po
   podkreślniku i mają wielokropek.
+- Projektant BPMN, runda 4 (GUI): pasek narzędzi mieści się przy każdej szerokości od
+  768 px w pięciu językach (kroki liczy sam pasek: Wstecz i Zapisz same ikony, potem
+  bez procentu powiększenia), znacznik zapisu pokazuje cały tekst, a Uruchom ma powód
+  na opakowaniu (wyłączony przycisk nie przyjmuje myszy) i sam wybiera jedyne wejście
+  startowe. Na telefonie dotknięcie elementu otwiera inspektor (kliknięcie kończące
+  naciśnięcie nie zamyka go już jako tła, a pasek kart nadąża za panelem). Okna
+  Uruchom i Symulacja, wejścia startowe, listy wyboru, paleta i okruszki nazywają
+  elementy (powtórzone nazwy dostają numer), okno instancji podaje kod incydentu
+  zamiast identyfikatora zakresu, a identyfikator elementu jest za zwijanymi
+  szczegółami technicznymi. `tf-keyvalue-editor` rysuje nagłówek `label`, `tf-menu`
+  pomija w strzałkach pozycje ukryte i wyłączone, `tf-button` przekazuje
+  `aria-controls` i nie zostawia kopii aria na hoście. Przed publikacją klient nazywa
+  nieużywane deklaracje i powtórzenia bez zmiennej wynikowej (zamiast „protocol error
+  BadRequest”), strefa czasowa jest przycinana, sprawdzana i znika z ostatnim timerem,
+  linie etykiet omijają zadanie, do którego należą, a niepodłączone zdarzenie
+  brzegowe ma przerywany kontur i napis.
+
+### TentaNas
+
+- Lista dozwolonych targetu iSCSI/NVMe-oF jest zapamiętywana w bazie
+  (migracja 30: `nas_targets.allowlist_mode` i `nas_targets.open_confirmed`).
+  Target z listą dozwolonych, której ostatni wpis usunięto, jest **zamknięty
+  dla wszystkich**: nikt nowy się nie zaloguje (także po restarcie węzła czy
+  przebudowie grupy portali). Na iSCSI sesje usuniętych klientów są zrywane;
+  na NVMe-oF hosty połączone w tej chwili zachowują dostęp, dopóki nie połączą
+  się ponownie (aby odciąć je od razu, zatrzymaj target).
+  Usunięcie ostatniego wpisu (w edytorze listy albo „Rozłącz … i usuń z listy”)
   nie jest już odrzucane (`refusal:target_last_initiator` wysyłają tylko
   starsze węzły) i wymaga potwierdzenia na ekranie.
 - „Otwórz dla wszystkich”: jedyna świadoma droga od listy dozwolonych do

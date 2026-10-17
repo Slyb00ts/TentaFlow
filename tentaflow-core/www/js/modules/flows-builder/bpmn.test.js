@@ -28,9 +28,9 @@ const { emptyProcessModel, processToCanvas, canvasToProcess, cloneProcessBody, p
 const { FlowCanvas } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
-const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processRowFor, processRoutingTextKeys, processEscalationPathProblem, processExplainError, processMissingSettings, processNodeWarnings, processServiceKind, processBlockTemplate } = await import('./bpmn.js');
+const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processRowFor, processRoutingTextKeys, processEscalationPathProblem, processExplainError, processMissingSettings, processNodeWarnings, processServiceKind, processBlockTemplate, processStartEntryLabels, processTimezoneProblem, processPublishProblems, processNodeLabels, processTimezoneGaps, processTimezoneText } = await import('./bpmn.js');
 const { openProcessCalendar, openProcessInstance, openProcessInstances, openProcessMessageDetail, openProcessMessageSend, openProcessRun, openProcessSchedule, processEventText, processLifecycleReasonText, processTimerText } = await import('./process-monitor.js');
-const { simulationWindow } = await import('./process-simulation.js');
+const { simulationWindow, openProcessSimulation } = await import('./process-simulation.js');
 const { default: builder } = await import('../flows-builder.js');
 const { default: flows } = await import('../flows.js');
 localStorage.setItem('tentaflow_lang', 'en');
@@ -5676,10 +5676,12 @@ test('simulation event list counts the server omissions and the rows the view it
   fixtures({ processSimulationReleaseRequest: {} });
   const events = Array.from({ length: 120 }, (_, index) => ({ atMs: index, kind: 'node_completed', nodeId: `Node_${index}` }));
   const win = simulationWindow({ simulationId: 'simulation-one', clock: { nowMs: 5, horizonMs: 10, stepIndex: 2 },
-    instance: null, userTasks: [], timers: [], events, eventsOmitted: 7, traceStepsOmitted: 3 });
+    instance: null, userTasks: [], timers: [], events, eventsOmitted: 7, traceStepsOmitted: 3 },
+  { nodes: events.map((event, index) => ({ id: event.nodeId, name: `Step ${index}`, kind: 'ServiceTask' })), additionalProcesses: [] });
   const content = win.querySelector('[data-simulation-content]');
   assert.equal(content.querySelectorAll('.fb-simulation-events li').length, 50);
-  assert.match(content.querySelector('.fb-simulation-events li').textContent, /Node_70/);
+  assert.match(content.querySelector('.fb-simulation-events li').textContent, /Step 70/);
+  assert.doesNotMatch(content.querySelector('.fb-simulation-events').textContent, /Node_\d+/, 'events name their elements, never cite ids');
   assert.equal(content.querySelector('[data-simulation-events-omitted]').textContent.trim(), '77 earlier events not shown');
   assert.equal(content.querySelector('[data-simulation-trace-omitted]').textContent.trim(), '3 earlier trace steps not shown');
   win.remove();
@@ -6464,7 +6466,7 @@ test('boundary slots follow the sizes the stylesheet gives the task decorations'
 test('the process toolbar keeps the main actions on the bar, the rest behind a menu, and gives every control its own icon', async () => {
   const state = await mount(definition('toolbar-menu'));
   const bar = state.root.querySelector('.fb-topbar');
-  const buttons = [...bar.querySelectorAll(':scope > tf-button')].map((button) => button.dataset.role);
+  const buttons = [...bar.querySelectorAll(':scope > tf-button, :scope > .fb-run-wrap > tf-button')].map((button) => button.dataset.role);
   assert.deepEqual(buttons, ['back', 'publish', 'run', 'save', 'more']);
   const menu = bar.querySelector('tf-menu[data-role="more-menu"]');
   const inMenu = [...menu.querySelectorAll('tf-menu-item')].map((item) => item.dataset.role);
@@ -6586,5 +6588,387 @@ test('the lines from six handlers to their names never run through another name'
   }
   assert.equal(rects.length, 6);
   assert.equal(crossings, 0, 'no line crosses a name that is not its own');
+  graph.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// Round 4 of the designer review: names instead of ids, numbered repeats,
+// declarations and time zones told before the server refuses them.
+// ---------------------------------------------------------------------------
+
+const userTemplate = () => processTemplates().find((row) => row.node_type === 'bpmn_user_task');
+const ID_SHAPE = /\b(?:n|e)_[0-9a-z]{6,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|Process_[0-9a-f_]{12,}/i;
+
+function twoStartCatalog(model) {
+  return ['Start', 'Start_second'].map((id) => ({ processId: model.processId, processName: model.processId,
+    startNodeId: id, startNodeName: '', version: 3, trigger: { Start: { canStart: true } } }));
+}
+
+test('start entries are named by body and start element, numbered when they repeat, and never by the id the server falls back to', () => {
+  const model = emptyProcessModel();
+  model.nodes.push({ id: 'Start_second', name: '', kind: 'Start' });
+  const labels = [...processStartEntryLabels(twoStartCatalog(model), model).values()];
+  assert.deepEqual(labels, ['Process 1 · Start (1)', 'Process 1 · Start (2)']);
+  model.processName = 'Billing';
+  assert.deepEqual([...processStartEntryLabels(twoStartCatalog(model).slice(0, 1), model).values()], ['Billing · Start']);
+});
+
+test('the Run and Simulate windows name their start entries without ids', async () => {
+  const model = emptyProcessModel();
+  model.nodes.push({ id: 'Start_second', name: 'Manual intake', kind: 'Start' });
+  const published = definition('named-run', { publishedVersion: 3, model });
+  const catalog = twoStartCatalog(model);
+  catalog[1].startNodeName = 'Manual intake';
+  const run = openProcessRun(published, [{ version: 3 }], catalog, catalog[0]);
+  const shown = (form, selector) => [...form.querySelectorAll(`${selector} option`)].map((option) => option.textContent);
+  assert.deepEqual(shown(run, '[data-start]'), [I18n.t('bpmn.start_entry'), 'Process 1 · Start', 'Process 1 · Manual intake']);
+  run.remove();
+  const simulation = openProcessSimulation(published, { version: 3 }, catalog, catalog[0]);
+  assert.deepEqual(shown(simulation, '[data-simulation-start]'), [I18n.t('bpmn.start_entry'), 'Process 1 · Start', 'Process 1 · Manual intake']);
+  assert.doesNotMatch(document.body.textContent, ID_SHAPE);
+  simulation.remove();
+});
+
+test('every list of the inspector numbers elements that share a name, and a palette of two flows with one name does too', async () => {
+  const graph = canvas();
+  const config = inspector(graph);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_exclusive_gateway'), 300, 300);
+  const gateway = graph.nodes.at(-1);
+  const first = graph.addNodeFromTemplate(userTemplate(), 600, 200);
+  const second = graph.addNodeFromTemplate(userTemplate(), 600, 400);
+  graph.connectNodes(gateway.id, first.id); graph.connectNodes(gateway.id, second.id);
+  config.show(gateway, graph.templates.get(gateway.type));
+  await flush(2);
+  const taskName = graph.templates.get('bpmn_user_task').label;
+  const texts = (selector) => [...config.root.querySelectorAll(`${selector} option`)].filter((option) => option.value).map((option) => option.textContent);
+  assert.deepEqual(texts('[data-process="defaultFlowId"]'), [`${taskName} (1)`, `${taskName} (2)`], 'Default path');
+  assert.deepEqual(texts('[data-process="editSequence"]'), [`${taskName} (1)`, `${taskName} (2)`], 'Edit path');
+  assert.ok(texts('[data-connect]').includes(`${taskName} (1)`) && texts('[data-connect]').includes(`${taskName} (2)`), 'Connect to');
+  const labels = processNodeLabels(graph.nodes, graph.templates);
+  assert.equal(labels.get(first.id), `${taskName} (1)`);
+  const crowded = processTemplates({ serviceFlows: [{ flowId: 'a', name: 'Contract checker' }, { flowId: 'b', name: 'Contract checker' }, { flowId: 'c', name: 'Archive' }] });
+  assert.deepEqual(crowded.filter((row) => row.subgroup === 'flows').map((row) => row.label), ['Contract checker (1)', 'Contract checker (2)', 'Archive']);
+  const flowGraph = canvas(); const flowConfig = new FlowConfig(document.body.appendChild(document.createElement('aside')), { mode: 'bpmn',
+    processOptions: { ...options, serviceBlocks, serviceFlows: [{ flowId: 'a', name: 'Contract checker' }, { flowId: 'b', name: 'Contract checker' }] },
+    getCanvas: () => flowGraph, onConfigChange: () => {}, onEdgeChange: () => {}, onLabelChange: () => {} });
+  const service = flowGraph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  flowConfig.show(service, flowGraph.templates.get(service.type));
+  await flush(2);
+  assert.deepEqual([...flowConfig.root.querySelectorAll('[data-process="flowId"] option')].filter((option) => option.value).map((option) => option.textContent),
+    ['Contract checker (1)', 'Contract checker (2)'], 'the Service task flow list');
+  flowGraph.destroy(); graph.destroy();
+});
+
+test('the breadcrumb numbers sub-processes that share a name and keeps Leave after the path', async () => {
+  const state = await mount(definition('nested-crumb'));
+  const sub = (x) => state.canvas.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_sub_process'), x, 300);
+  const outer = sub(300);
+  state.canvas.navigateProcessBody([outer.id]);
+  const inner = sub(300);
+  state.canvas.navigateProcessBody([outer.id, inner.id]);
+  builder._syncProcessPath();
+  const path = state.root.querySelector('[data-role="scope-path"]');
+  const kind = I18n.t('bpmn.node_sub_process');
+  assert.equal(path.textContent, `${state.root.querySelector('[data-role="name"]').value} › ${kind} (1) › ${kind} (2)`);
+  const up = state.root.querySelector('[data-role="scope-up"]');
+  assert.equal(up.hidden, false);
+  assert.ok(up.compareDocumentPosition(state.root.querySelector('[data-role="crumb-name"]')) & window.Node.DOCUMENT_POSITION_PRECEDING,
+    'the Leave button follows the whole path');
+  assert.ok(up.compareDocumentPosition(path) & window.Node.DOCUMENT_POSITION_PRECEDING);
+});
+
+test('Sub-process and Human task inspectors head each mapping, so the two Add buttons are told apart', async () => {
+  const graph = canvas();
+  const config = inspector(graph);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_sub_process'), 300, 300);
+  const sub = graph.nodes.at(-1);
+  config.show(sub, graph.templates.get(sub.type));
+  await flush(2);
+  const headings = (root) => [...root.querySelectorAll('tf-keyvalue-editor .tf-kve-label')].map((label) => label.textContent);
+  assert.deepEqual(headings(config.root), [I18n.t('bpmn.input_mapping'), I18n.t('bpmn.output_mapping')]);
+  const user = userNode(graph);
+  config.show(user, graph.templates.get(user.type));
+  await flush(2);
+  assert.deepEqual(headings(config.root), [I18n.t('bpmn.output_mapping')]);
+  graph.destroy();
+});
+
+test('no inspector of a typical process shows an element id, a UUID or a definition id outside its technical details', async () => {
+  const model = emptyProcessModel();
+  model.errors = [{ errorId: 'Err_x', name: 'Payment failed', errorCode: 'PAY' }];
+  const graph = canvas(model); const config = inspector(graph);
+  const service = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  const gateway = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_exclusive_gateway'), 600, 300);
+  graph.connectNodes(service.id, gateway.id);
+  graph.addBoundaryNode(service.id, 'bpmn_boundary_error', 'Err_x');
+  const boundary = graph.nodes.at(-1);
+  const call = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_call_activity'), 300, 600);
+  fixtures({ processDefinitionListRequest: { definitions: [], hasMore: false } });
+  for (const node of [service, gateway, boundary, call, graph.nodes[0]]) {
+    config.show(node, graph.templates.get(node.type));
+    await flush(2);
+    const clone = config.root.cloneNode(true);
+    clone.querySelectorAll('[data-technical], [data-activity-field="id"], [data-process="calledElement"], [data-process="linkDefinitionId"]').forEach((technical) => technical.remove());
+    const visible = [...clone.querySelectorAll('option, .fb-config-title, .fb-config-subtitle, .fb-field-hint, tf-alert')]
+      .map((element) => element.textContent + (element.getAttribute?.('message') ?? '')).join('\n');
+    assert.doesNotMatch(visible, ID_SHAPE, node.type);
+  }
+  const edge = graph.edges[0];
+  config.showEdge(edge);
+  assert.ok(config.root.querySelector('tf-disclosure[data-technical] [data-process="elementId"]'), 'an element id sits behind the technical details');
+  assert.equal(config.root.querySelector('tf-disclosure[data-technical]').hasAttribute('open'), false, 'and starts closed');
+  graph.destroy();
+});
+
+test('a saved Send target is named, not shown as an id pair, and a failed lookup is told by name', async () => {
+  const model = emptyProcessModel();
+  model.nodes.splice(1, 0, { id: 'Send_1', name: 'Notify billing', kind: { SendTask: { messageRef: null, correlationExpression: null,
+    target: { Start: { definitionId: 'dddddddd-0000-4000-8000-00000000000d', processId: 'Process_target_0001', startNodeId: 'n_start_0001' } },
+    payloadExpression: null, ttlSeconds: null } } });
+  model.sequenceFlows = [{ id: 'Flow_1', sourceId: 'Start', targetId: 'Send_1', condition: null }, { id: 'Flow_2', sourceId: 'Send_1', targetId: 'End', condition: null }];
+  const published = emptyProcessModel(); published.processId = 'Process_target_0001'; published.processName = 'Billing intake';
+  published.messages = [{ messageId: 'Message_1', name: 'invoice.received' }];
+  const graph = canvas(model); const config = inspector(graph);
+  fixtures({
+    processDefinitionGetRequest: { definition: { definitionId: 'dddddddd-0000-4000-8000-00000000000d', name: 'Billing', archived: false, publishedVersion: 2 } },
+    processVersionGetRequest: { version: { model: published }, startCatalog: [{ processId: 'Process_target_0001', processName: 'Process_target_0001', startNodeId: 'n_start_0001', startNodeName: 'Invoice arrives', version: 2, trigger: { MessageStart: { messageName: 'invoice.received', canSend: true } } }] },
+  });
+  const send = graph.nodes.find((node) => node.id === 'Send_1');
+  config.show(send, graph.templates.get(send.type));
+  await flush(4);
+  assert.equal(config.root.querySelector('[data-process="targetDefinitionChoice"] .tf-select-selected').textContent, 'Billing');
+  assert.equal(config.root.querySelector('[data-process="targetStartChoice"] .tf-select-selected').textContent, 'Billing intake · Invoice arrives');
+  assert.doesNotMatch(config.root.textContent.replace(/[^\n]*\u0000/g, ''), /Process_target_0001|n_start_0001/);
+  graph.destroy();
+});
+
+test('a Call inspector answer for the stored definition is dropped once another definition was chosen', async () => {
+  const storedId = 'aaaaaaaa-0000-4000-8000-00000000000a', otherId = 'bbbbbbbb-0000-4000-8000-00000000000b';
+  const called = emptyProcessModel(); called.processId = 'Called_Process';
+  const graph = canvas(callerModel({ calledDefinitionId: storedId, calledVersion: 2, calledElement: { namespaceUri: 'urn:x', processId: 'Called_Process' } }));
+  const config = inspector(graph);
+  const lookup = deferred();
+  fixtures({
+    processDefinitionListRequest: { definitions: [{ definitionId: otherId, name: 'Other', publishedVersion: 1, archived: false }], hasMore: false },
+    processVersionListRequest: { versions: [{ version: 1 }], hasMore: false },
+    processDefinitionGetRequest: () => lookup.promise,
+    processVersionGetRequest: () => ({ version: { model: called }, startCatalog: [] }),
+  });
+  const call = graph.nodes.find((node) => node.id === 'Call_1');
+  config.show(call, graph.templates.get(call.type));
+  await flush(3);
+  change(config.root.querySelector('[data-process="calledDefinitionChoice"]'), otherId);
+  lookup.resolve({ definition: { definitionId: storedId, name: 'Old approvals', archived: true, publishedVersion: 2 } });
+  await flush(4);
+  assert.equal(config.root.querySelector('[data-call-target-warning]').hidden, true, 'the stale answer raised no warning for the new choice');
+  assert.equal(graph.nodes.find((node) => node.id === 'Call_1').config.calledDefinitionId, otherId);
+  graph.destroy();
+});
+
+test('a repeated element without an output collection variable says so in its inspector', async () => {
+  const graph = canvas(); const config = inspector(graph);
+  const task = userNode(graph);
+  graph.updateNodeLabel(task.id, 'Critic flow');
+  graph.updateNodeConfig(task.id, {});
+  task.repeat = { MultiInstance: { mode: 'Sequential', input: { Cardinality: { count: 2 } }, outputCollectionVariable: '' } };
+  config.show(task, graph.templates.get(task.type));
+  await flush(2);
+  const warning = config.root.querySelector('[data-repeat-warning]');
+  assert.ok(warning, 'a warning stands under the output variable');
+  assert.equal(warning.getAttribute('message'), I18n.t('bpmn.repeat_output_missing', { node: 'Critic flow' }));
+  task.repeat.MultiInstance.outputCollectionVariable = 'results';
+  config.show(task, graph.templates.get(task.type));
+  await flush(2);
+  assert.equal(config.root.querySelector('[data-repeat-warning]'), null);
+  graph.destroy();
+});
+
+test('server refusals about declarations, repeats and time zones are told in the author\'s words, naming the element', () => {
+  const model = emptyProcessModel();
+  model.errors = [{ errorId: 'Err_pay', name: 'Payment failed', errorCode: 'PAY' }, { errorId: 'Err_used', name: 'Used one', errorCode: 'USED' }];
+  model.nodes.splice(1, 0, { id: 'Critic_1', name: 'Critic flow', kind: { UserTask: { assigneeUserId: null, outputMapping: {} } },
+    repeat: { MultiInstance: { mode: 'Sequential', input: { Cardinality: { count: 2 } }, outputCollectionVariable: '' } } },
+  { id: 'Fail_end', name: 'Failed', kind: { ErrorEnd: { errorRef: 'Err_used' } } });
+  const unreferenced = processExplainError('protocol error BadRequest: unreferenced error declaration', model);
+  assert.match(unreferenced, /Payment failed/);
+  assert.doesNotMatch(unreferenced, /protocol error|BadRequest|Used one/);
+  assert.equal(processExplainError('repeat Critic_1 has invalid output collection variable', model), I18n.t('bpmn.repeat_output_missing', { node: 'Critic flow' }));
+  assert.equal(processExplainError('timerless process cannot declare a timer timezone', model), I18n.t('bpmn.timer_timezone_unused'));
+  assert.deepEqual(processPublishProblems(model), [I18n.t('bpmn.unused_error', { name: 'Payment failed' }), I18n.t('bpmn.repeat_output_missing', { node: 'Critic flow' })]);
+});
+
+test('publishing is refused before any request when a declaration is unused, naming it in the banner', async () => {
+  const model = emptyProcessModel();
+  model.messages = [{ messageId: 'Message_1', name: 'order.received' }];
+  const current = definition('unused-declaration', { model });
+  const state = await mount(current, { processDefinitionSaveRequest: { definition: { ...current, draftRevision: 5 } }, processDefinitionPublishRequest: () => { throw new Error('the server must not be asked'); } });
+  await builder._publish();
+  const banner = state.root.querySelector('[data-role="error"]');
+  assert.equal(banner.hidden, false);
+  assert.match(banner.getAttribute('message'), /order\.received/);
+  assert.equal(calls.some((call) => call.kind === 'processDefinitionPublishRequest'), false);
+});
+
+test('a time zone is trimmed and checked, and goes with the last timer', async () => {
+  assert.equal(processTimezoneProblem('Europe/Warsaw'), null);
+  assert.equal(processTimezoneProblem(' UTC '), null);
+  assert.equal(processTimezoneProblem(''), null);
+  assert.equal(processTimezoneProblem('Mars/Phobos'), 'invalid');
+  assert.equal(processTimezoneProblem('not a zone'), 'invalid');
+  const graph = canvas(timedModel('TimerCatch'));
+  graph.updateProcessTimezone('  Europe/Berlin ');
+  assert.equal(graph.getData().timerTimezone, 'Europe/Berlin');
+  graph.updateProcessTimezone('Mars/Phobos');
+  assert.equal(graph.getData().timerTimezone, 'Europe/Berlin', 'an invalid zone is not stored');
+  graph.removeNodes(['Wait']);
+  assert.equal(graph.getData().timerTimezone, undefined, 'the zone goes with the last timer, so the server never refuses a timerless process for it');
+  graph.destroy();
+  const calendarModel = timedModel('TimerCatch'); calendarModel.workCalendar = { name: 'Office', workingHours: [], holidays: [] };
+  const calendared = canvas(calendarModel);
+  calendared.removeNodes(['Wait']);
+  assert.equal(calendared.getData().timerTimezone, 'Europe/Warsaw', 'a work calendar keeps its zone');
+  calendared.destroy();
+  const invalid = canvas(timedModel('TimerCatch'));
+  invalid.processModel.timerTimezone = 'Mars/Phobos';
+  assert.ok(invalid.validate().some((message) => message === I18n.t('bpmn.timer_timezone_invalid', { zone: 'Mars/Phobos' })));
+  invalid.destroy();
+});
+
+test('the process time zone field refuses a bad zone with a message and a save only walks the author to it for that reason', async () => {
+  const current = definition('zone-field', { model: timedModel('TimerCatch') });
+  const state = await mount(current);
+  const field = state.root.querySelector('[data-role="timer-timezone"]');
+  field.value = 'Mars/Phobos';
+  field.dispatchEvent(new CustomEvent('change', { bubbles: true, detail: { value: field.value } }));
+  assert.equal(field.getAttribute('error'), I18n.t('bpmn.timer_timezone_invalid', { zone: 'Mars/Phobos' }));
+  assert.equal(state.canvas.getData().timerTimezone, 'Europe/Warsaw');
+  field.value = ' Europe/Paris ';
+  field.dispatchEvent(new CustomEvent('change', { bubbles: true, detail: { value: field.value } }));
+  assert.equal(field.hasAttribute('error'), false);
+  assert.equal(state.canvas.getData().timerTimezone, 'Europe/Paris');
+  let revealed = 0;
+  state.showSettings = () => { revealed += 1; };
+  state.canvas.processModel.timerTimezone = '';
+  builder._revealMissingTimezone(state, ['Some other refusal']);
+  assert.equal(revealed, 0, 'another refusal leaves the settings alone');
+  builder._revealMissingTimezone(state, [processTimezoneText(processTimezoneGaps(state.canvas.getData())[0])]);
+  assert.equal(revealed, 1);
+});
+
+test('undoing a change of a process setting says so instead of claiming another part of the process changed', async () => {
+  const graph = canvas(timedModel('TimerCatch'));
+  // Toasts with the same words merge into one that is already on screen.
+  for (const key of ['bpmn.undo_settings', 'bpmn.undo_elsewhere']) dismissToast(I18n.t(key), 'info');
+  const shown = watchToasts();
+  graph.updateProcessTimezone('Europe/Berlin');
+  graph.undo();
+  assert.ok(shown.texts().includes(I18n.t('bpmn.undo_settings')));
+  assert.equal(shown.texts().includes(I18n.t('bpmn.undo_elsewhere')), false);
+  shown.stop(); graph.destroy();
+});
+
+test('Run is described by its reason, takes the only start entry by itself and keeps the reason on a wrapper a disabled button cannot hide', async () => {
+  const model = emptyProcessModel();
+  const unpublished = await mount(definition('run-reason', { model }));
+  const wrap = () => builder._state.root.querySelector('[data-role="run-wrap"]');
+  assert.match(wrap().getAttribute('title'), new RegExp(I18n.t('bpmn.run_reason_unpublished').slice(0, 20)));
+  assert.equal(unpublished.root.querySelector('[data-role="run-reason"]').textContent, wrap().getAttribute('title'));
+  assert.equal(unpublished.root.querySelector('[data-role="run"]').getAttribute('aria-describedby'), 'fb-run-reason');
+  const published = definition('run-single', { model, publishedVersion: 2 });
+  const state = await mount(published, { processDefinitionGetRequest: { definition: published, startCatalog: manualStartCatalog(model, 2) } });
+  assert.equal(state.root.querySelector('[data-role="start-entry"]').value, '0', 'the only entry is chosen');
+  assert.equal(state.root.querySelector('[data-role="run"]').hasAttribute('disabled'), false);
+  model.nodes.push({ id: 'Start_second', name: 'Second', kind: 'Start' });
+  const many = definition('run-many', { model, publishedVersion: 2 });
+  const choose = await mount(many, { processDefinitionGetRequest: { definition: many, startCatalog: twoStartCatalog(model) } });
+  assert.equal(choose.root.querySelector('[data-role="start-entry"]').value, '');
+  assert.equal(choose.root.querySelector('[data-role="run"]').hasAttribute('disabled'), true);
+  assert.match(choose.root.querySelector('[data-role="run-wrap"]').getAttribute('title'), new RegExp(I18n.t('bpmn.run_reason_choose_entry').slice(0, 20)));
+});
+
+test('a press that opens the inspector on a phone is not closed by the click that follows, and the tab bar follows the panel', async () => {
+  const state = await mount(definition('phone-tabs'));
+  const tabs = state.root.querySelector('.fb-mobile-tabs');
+  Object.defineProperty(tabs, 'offsetParent', { configurable: true, get: () => document.body });
+  const body = state.root.querySelector('[data-role="body"]');
+  const config = state.root.querySelector('[data-role="config"]');
+  Object.defineProperty(window, 'innerWidth', { value: 390, configurable: true });
+  const press = (target) => target.dispatchEvent(new window.Event('pointerdown', { bubbles: true }));
+  press(body.querySelector('[data-role="canvas"]') ?? body);
+  state.showMobileTab('config');
+  assert.equal(config.classList.contains('open'), true);
+  body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  assert.equal(config.classList.contains('open'), true, 'the click that ends the opening press leaves the panel open');
+  press(body);
+  body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  assert.equal(config.classList.contains('open'), false, 'a press on the backdrop closes it');
+  assert.equal(tabs.getAttribute('value'), 'canvas', 'and the tab bar names the canvas again');
+  state.showMobileTab('config');
+  assert.equal(config.classList.contains('open'), true, 'so the next element opens the inspector again');
+  Object.defineProperty(window, 'innerWidth', { value: 1024, configurable: true });
+});
+
+test('a boundary event not on an activity looks unattached, not attached', () => {
+  const graph = canvas();
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_timer'), 400, 300);
+  const element = graph.nodesLayer.querySelector('.fb-process-node.bpmn_boundary_timer');
+  assert.equal(element.classList.contains('fb-unattached'), true);
+  assert.equal(element.dataset.unattachedLabel, I18n.t('bpmn.boundary_not_attached'));
+  graph.destroy();
+});
+
+test('leader lines of six handlers on one task never run through the task, and a hidden canvas keeps its labels', () => {
+  const model = emptyProcessModel();
+  model.errors = ['A', 'B', 'C', 'D', 'E', 'F'].map((code) => ({ errorId: `Err_${code}`, name: `Failure ${code}`, errorCode: `CODE_${code}` }));
+  const graph = canvas(model);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 600, 300);
+  const task = graph.nodes.at(-1);
+  model.errors.forEach((entry) => graph.addBoundaryNode(task.id, 'bpmn_boundary_error', entry.errorId));
+  for (const element of graph.nodesLayer.querySelectorAll('.fb-process-label')) {
+    Object.defineProperties(element, { offsetWidth: { value: 130, configurable: true }, offsetHeight: { value: 36, configurable: true } });
+  }
+  for (const element of graph.nodesLayer.querySelectorAll('.fb-process-symbol > span')) Object.defineProperties(element, { scrollHeight: { value: 99, configurable: true }, clientHeight: { value: 10, configurable: true } });
+  graph._layoutProcessLabels();
+  const inside = { left: task.x + 3, top: task.y + 3, right: task.x + task.width - 3, bottom: task.y + task.height - 3 };
+  let through = 0;
+  for (const node of graph.nodes.filter((candidate) => candidate.type === 'bpmn_boundary_error')) {
+    const leader = graph.nodesLayer.querySelector(`[data-node-id="${node.id}"] .fb-process-label-leader`);
+    const sx = node.x + parseFloat(leader.style.left), sy = node.y + parseFloat(leader.style.top);
+    const length = parseFloat(leader.style.width), angle = parseFloat(/rotate\(([-\d.e]+)rad\)/.exec(leader.style.transform)?.[1] ?? 0);
+    for (let step = 0; step <= 40; step += 1) {
+      const x = sx + Math.cos(angle) * length * step / 40, y = sy + Math.sin(angle) * length * step / 40;
+      if (x > inside.left && x < inside.right && y > inside.top && y < inside.bottom) { through += 1; break; }
+    }
+  }
+  assert.equal(through, 0, 'no leader line crosses the task it hangs from');
+  const label = graph.nodesLayer.querySelector('.fb-process-node.bpmn_boundary_error .fb-process-label');
+  label.style.left = '123px';
+  graph.root.checkVisibility = () => false;
+  graph._layoutProcessLabels();
+  assert.equal(label.style.left, '123px', 'a canvas with no layout is left as it was placed');
+  assert.equal(label.hidden, false);
+  graph.destroy();
+});
+
+test('an outside label with nowhere to go: a title goes back inside the box, an event keeps its last place', () => {
+  const model = emptyProcessModel();
+  model.nodes.splice(1, 0, { id: 'Review', name: 'A name too long for the box', kind: { UserTask: { assigneeUserId: null, outputMapping: {} } } });
+  model.sequenceFlows = [{ id: 'Flow_1', sourceId: 'Start', targetId: 'Review', condition: null }, { id: 'Flow_2', sourceId: 'Review', targetId: 'End', condition: null }];
+  model.diagram.shapes.push({ elementId: 'Review', x: 200, y: 160, width: 240, height: 96 });
+  model.nodes.push({ id: 'Giant', name: '', kind: 'End' });
+  model.diagram.shapes.push({ elementId: 'Giant', x: -8000, y: -8000, width: 16000, height: 16000 });
+  const graph = canvas(model);
+  const review = graph.nodesLayer.querySelector('[data-node-id="Review"]');
+  const start = graph.nodesLayer.querySelector('[data-node-id="Start"]');
+  Object.defineProperties(review.querySelector('.fb-process-symbol > span'), { scrollHeight: { value: 99, configurable: true }, clientHeight: { value: 10, configurable: true }, scrollWidth: { value: 5, configurable: true }, clientWidth: { value: 5, configurable: true } });
+  for (const element of [review, start]) Object.defineProperties(element.querySelector('.fb-process-label'), { offsetWidth: { value: 100, configurable: true }, offsetHeight: { value: 30, configurable: true } });
+  const startLabel = start.querySelector('.fb-process-label');
+  startLabel.style.left = '5px';
+  graph._layoutProcessLabels();
+  assert.equal(review.querySelector('.fb-process-label').hidden, true);
+  assert.equal(review.querySelector('.fb-process-label-leader').hidden, true);
+  assert.equal(review.classList.contains('fb-external-label'), false, 'the title is inside the box again');
+  assert.equal(startLabel.hidden, false, 'an event has no title inside, so its label stays');
+  assert.equal(startLabel.style.left, '5px');
   graph.destroy();
 });

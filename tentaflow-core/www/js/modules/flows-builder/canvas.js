@@ -10,7 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
-import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processWarningText, processHandlerName, processBoundaryHosts, processEscalationPathProblem, processTimezoneGaps, processTimezoneText } from './bpmn.js';
+import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processWarningText, processHandlerName, processBoundaryHosts, processEscalationPathProblem, processHasTimer, processTimezoneGaps, processTimezoneProblem, processTimezoneText } from './bpmn.js';
 import '/js/components/tf-menu.js';
 
 const NODE_WIDTH = 280;
@@ -257,6 +257,9 @@ export class FlowCanvas {
     this._bindEvents();
     this._resizeObserver = new ResizeObserver(() => {
       if (this._pendingFitMinZoom !== null) this.fitToContent(this._pendingFitMinZoom);
+      // Labels are placed from measured sizes; a canvas that had no layout (a
+      // hidden tab) is placed once it has one.
+      if (this._labelsUnplaced) this._layoutProcessLabels();
     });
     this._resizeObserver.observe(this.root);
   }
@@ -433,6 +436,11 @@ export class FlowCanvas {
     if (this.mode === 'bpmn') {
       this.processModel = canvasToProcess(this.processModel, this.nodes, this.edges,
         (edge) => this._processEdgePoints(edge), this.processPath, this.selectedProcessId);
+      // A zone only means something to a process with a timer or a calendar, and
+      // the server refuses one on any other; it goes with the last timer.
+      for (const body of [this.processModel, ...(this.processModel.additionalProcesses || [])]) {
+        if (body.timerTimezone != null && !body.workCalendar && !processHasTimer({ ...body, additionalProcesses: [] })) delete body.timerTimezone;
+      }
       return structuredClone(this.processModel);
     }
     this._normalizeEdgePorts();
@@ -531,7 +539,7 @@ export class FlowCanvas {
 
   // What an author calls the element in a message: its name, else its kind.
   _nodeName(node) {
-    return node.label || this.templates.get(node.type)?.label || node.id;
+    return getNodeDisplayTitle(node, this.templates.get(node.type));
   }
 
   // Waliduje klient-side przed zapisem: kazdy edge musi wskazywac istniejace
@@ -541,7 +549,11 @@ export class FlowCanvas {
     if (this.mode === 'bpmn') {
       const errors = [];
       const selectedBody = processBody(this.processModel, [], this.selectedProcessId);
-      for (const gap of processTimezoneGaps(this.getData())) errors.push(processTimezoneText(gap));
+      const model = this.getData();
+      for (const gap of processTimezoneGaps(model)) errors.push(processTimezoneText(gap));
+      for (const body of [model, ...(model.additionalProcesses || [])]) {
+        if (processTimezoneProblem(body.timerTimezone)) errors.push(I18n.t('bpmn.timer_timezone_invalid', { zone: body.timerTimezone }));
+      }
       for (const node of this.nodes) {
         const condition = node.type === 'bpmn_service_task' && node.config.verification?.Condition;
         if (condition && !(condition.expression || '').trim()) {
@@ -800,6 +812,7 @@ export class FlowCanvas {
     this.historyIndex = index;
     const snap = structuredClone(this.history[index]);
     let hidden = false;
+    let settingsChanged = false;
     if (this.mode === 'bpmn') {
       const before = this.getData();
       const model = snap.processModel;
@@ -817,6 +830,10 @@ export class FlowCanvas {
       this.nodes = graph.nodes;
       this.edges = graph.edges;
       try { hidden = JSON.stringify(processToCanvas(before, path, processId)) === JSON.stringify(graph); } catch (_) { /* the scope is new */ }
+      // What changed instead of the drawing: the settings of the process (zone,
+      // calendar, variables, declarations), which have no place on the canvas.
+      const withoutDrawing = (full) => JSON.stringify(full, (key, value) => (['nodes', 'sequenceFlows', 'diagram'].includes(key) ? undefined : value));
+      settingsChanged = hidden && withoutDrawing(before) !== withoutDrawing(model);
     } else {
       this.nodes = snap.nodes;
       this.edges = snap.edges;
@@ -826,7 +843,7 @@ export class FlowCanvas {
     this.onSelect(null);
     this.render();
     this.onChange();
-    if (hidden) toast(I18n.t('bpmn.undo_elsewhere'), 'info');
+    if (hidden) toast(I18n.t(settingsChanged ? 'bpmn.undo_settings' : 'bpmn.undo_elsewhere'), 'info');
   }
 
   // -------------------------------------------------------------------------
@@ -835,8 +852,10 @@ export class FlowCanvas {
   updateProcessTimezone(value) {
     if (this.readOnly || this.mode !== 'bpmn') return;
     const body = processBody(this.processModel, [], this.selectedProcessId);
-    if (value === '') delete body.timerTimezone;
-    else body.timerTimezone = value;
+    const zone = String(value ?? '').trim();
+    if (zone !== '' && processTimezoneProblem(zone)) return;
+    if (zone === '') delete body.timerTimezone;
+    else body.timerTimezone = zone;
     this._pushHistory();
     this.onChange();
   }
@@ -1743,6 +1762,12 @@ export class FlowCanvas {
       const showKind = serviceKind && (serviceKind !== 'flow' || !!n.config.flowId);
       const kindIcon = { flow: 'flow', block: 'chip', tool: 'puzzle' }[serviceKind];
       const warnings = this._processWarnings(n);
+      // An event that is not on an activity sits on the canvas like one that is;
+      // a dashed outline and its own tag say it is waiting for a host.
+      if (warnings.includes('boundary_unattached')) {
+        div.classList.add('fb-unattached');
+        div.dataset.unattachedLabel = I18n.t('bpmn.boundary_not_attached');
+      }
       const warningText = warnings.map((key) => this._processWarningText(n, key)).join(' ');
       div.innerHTML = `
         ${showKind ? `<span class="fb-process-kind" data-kind="${serviceKind}" role="img" title="${escapeAttr(I18n.t(`bpmn.kind_${serviceKind}`))}" aria-label="${escapeAttr(I18n.t(`bpmn.kind_${serviceKind}`))}"><svg aria-hidden="true"><use href="#i-${kindIcon}"/></svg></span>` : ''}
@@ -1804,8 +1829,13 @@ export class FlowCanvas {
   // a fifth of a second.
   _layoutProcessLabels() {
     if (this.mode !== 'bpmn') return;
+    // Sizes read as zero while the canvas has no layout (a hidden tab); placing
+    // from them would strip every label, so the last placement stays until the
+    // canvas is shown.
+    this._labelsUnplaced = this.root.checkVisibility?.() === false;
+    if (this._labelsUnplaced) return;
     const nodeRects = this.nodes.map((node) => ({
-      left: node.x, top: node.y, right: node.x + node.width, bottom: node.y + node.height,
+      id: node.id, left: node.x, top: node.y, right: node.x + node.width, bottom: node.y + node.height,
     }));
     const entries = [];
     for (const node of this.nodes) {
@@ -1844,7 +1874,7 @@ export class FlowCanvas {
     const overlaps = (left, right) => left.left < right.right + gap && left.right + gap > right.left
       && left.top < right.bottom + gap && left.bottom + gap > right.top;
     const writes = [];
-    for (const { node, element, label, leader, width, height } of labels) {
+    for (const { node, element, label, leader, title, width, height } of labels) {
       if (!width || !height) continue;
       const centerX = node.x + node.width / 2;
       const centerY = node.y + node.height / 2;
@@ -1892,13 +1922,34 @@ export class FlowCanvas {
       };
       const free = ({ rect }) => !nodeRects.some((other) => overlaps(rect, other))
         && !occupied.some((other) => overlaps(rect, other));
+      // The line must not run through the element it names, the task a boundary
+      // event sits on or any other element; a few pixels of the host's border are
+      // where it starts.
+      const crossesNode = ({ rect }) => {
+        const { sourceX, sourceY, targetX, targetY } = leaderTo(rect);
+        return nodeRects.some((other) => other.id !== node.id && segmentHitsRect(sourceX, sourceY, targetX, targetY,
+          { left: other.left + 3, top: other.top + 3, right: other.right - 3, bottom: other.bottom - 3 }));
+      };
       const crossesLabel = ({ rect }) => occupied.some((other) => {
         const { sourceX, sourceY, targetX, targetY } = leaderTo(rect);
         return segmentHitsRect(sourceX, sourceY, targetX, targetY, other);
       });
-      const selected = (candidates.find((candidate) => free(candidate) && !crossesLabel(candidate))
+      const selected = (candidates.find((candidate) => free(candidate) && !crossesLabel(candidate) && !crossesNode(candidate))
+        ?? candidates.find((candidate) => free(candidate) && !crossesNode(candidate))
+        ?? candidates.find((candidate) => free(candidate) && !crossesLabel(candidate))
         ?? candidates.find(free))?.rect;
-      if (!selected) continue;
+      if (!selected) {
+        // Nowhere to put it. A title returns inside its box (clipped, the full
+        // text stays in the tooltip); an event has no title inside, so its label
+        // stays where the last layout had room for it, and shows nothing if it
+        // never had one.
+        if (title || !label.style.left) {
+          label.hidden = true;
+          leader.hidden = true;
+          element.classList.remove('fb-external-label');
+        }
+        continue;
+      }
       const place = { label, leader, left: selected.left - node.x, top: selected.top - node.y };
       writes.push(place);
       const { sourceX, sourceY, targetX, targetY } = leaderTo(selected);
