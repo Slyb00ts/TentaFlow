@@ -5,12 +5,12 @@
 //       pointer-events z rAF throttle. Historia undo/redo in-memory.
 // =============================================================================
 
-import { escapeHtml, escapeAttr } from '/js/utils.js';
+import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
-import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processHandlerName } from './bpmn.js';
+import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processWarningText, processHandlerName, processBoundaryHosts, processEscalationPathProblem } from './bpmn.js';
 import '/js/components/tf-menu.js';
 
 const NODE_WIDTH = 280;
@@ -28,6 +28,7 @@ function snapGridCoordinate(value) {
 }
 
 const MAX_HISTORY = 30;
+const ESCALATION_PATH_KEYS = ['terminal_before_wait', 'scope_entry', 'call_entry', 'no_durable_wait'];
 // Layout portów: header ma ~44px, porty zaczynają się od HEADER_OFFSET i są
 // rozłożone co PORT_STEP pikseli.
 const PORT_HEADER_OFFSET = 44;
@@ -506,6 +507,11 @@ export class FlowCanvas {
     this.onChange();
   }
 
+  // What an author calls the element in a message: its name, else its kind.
+  _nodeName(node) {
+    return node.label || this.templates.get(node.type)?.label || node.id;
+  }
+
   // Waliduje klient-side przed zapisem: kazdy edge musi wskazywac istniejace
   // node'y i porty obecne w adapter metadata. Zwraca liste bledow jako
   // stringi (juz zlokalizowane) — pusta lista oznacza flow gotowy do zapisu.
@@ -519,8 +525,20 @@ export class FlowCanvas {
       for (const node of this.nodes) {
         const condition = node.type === 'bpmn_service_task' && node.config.verification?.Condition;
         if (condition && !(condition.expression || '').trim()) {
-          errors.push(I18n.t('bpmn.verification_expression_required', { node: node.label || this.templates.get(node.type)?.label || node.id }));
+          errors.push(I18n.t('bpmn.verification_expression_required', { node: this._nodeName(node) }));
         }
+        const called = node.type === 'bpmn_call_activity' ? node.config : null;
+        if (called && !(called.localBody ? called.localBody.processId
+          : called.calledDefinitionId && Number.isInteger(called.calledVersion) && called.calledVersion >= 1
+            && called.calledElement?.processId)) {
+          errors.push(I18n.t('bpmn.call_target_required', { node: this._nodeName(node) }));
+        }
+        if (['bpmn_boundary_error', 'bpmn_boundary_escalation'].includes(node.type)
+          && !this.nodes.some((candidate) => candidate.id === node.config.attachedToId)) {
+          errors.push(I18n.t('bpmn.boundary_required_named', { node: this._nodeName(node) }));
+        }
+        const problem = node.type === 'bpmn_boundary_escalation' ? processEscalationPathProblem(this, node.id) : null;
+        if (problem) errors.push(I18n.t(`bpmn.routing_warning_escalation_path_${ESCALATION_PATH_KEYS.includes(problem.reason) ? problem.reason : 'other'}`, { names: this._nodeName(node) }));
         if (!['bpmn_timer_start', 'bpmn_timer_catch', 'bpmn_boundary_timer'].includes(node.type)) continue;
         const [kind, timer] = Object.entries(node.config.timer)[0];
         if (kind === 'Date' && (!timer.at || !timer.at.trim())) {
@@ -530,7 +548,7 @@ export class FlowCanvas {
           const parent = this.nodes.find((candidate) => candidate.id === node.config.attachedToId);
           if (!parent || !(['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(parent.type)
             || ['bpmn_script_task', 'bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task'].includes(parent.type))) {
-            errors.push(I18n.t('bpmn.boundary_required'));
+            errors.push(I18n.t('bpmn.boundary_required_named', { node: this._nodeName(node) }));
           }
           if (!['Date', 'Duration', 'WorkingDuration'].includes(kind) || this.edges.some((edge) => edge.to_node === node.id)) {
             errors.push(I18n.t('bpmn.boundary_timer_invalid', { node: node.label || node.id }));
@@ -553,7 +571,7 @@ export class FlowCanvas {
         const parent = this.nodes.find((candidate) => candidate.id === node.config.attachedToId);
         if (!parent || !(['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(parent.type)
           || ['bpmn_script_task', 'bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task'].includes(parent.type))) {
-          errors.push(I18n.t('bpmn.boundary_required'));
+          errors.push(I18n.t('bpmn.boundary_required_named', { node: this._nodeName(node) }));
         }
       }
       for (const gateway of this.nodes.filter((candidate) => candidate.type === 'bpmn_event_based_gateway')) {
@@ -887,6 +905,7 @@ export class FlowCanvas {
       node.height = tpl.height;
       node.x = snapGridCoordinate(pt.x - node.width / 2);
       node.y = snapGridCoordinate(pt.y - node.height / 2);
+      if (!cascade && processBoundaryKind(node.type)) this._attachDroppedBoundary(node, pt);
     }
     const classic = this.mode !== 'bpmn';
     if (!cascade) {
@@ -1097,7 +1116,7 @@ export class FlowCanvas {
       config: { ...processNodeConfig(processNodeKind(type)), attachedToId: parentId,
         ...(type === 'bpmn_boundary_error' ? { errorRef: ref } : { escalationRef: ref }) },
     };
-    this._placeNewBoundary(node, parent);
+    if (!this._placeNewBoundary(node, parent)) return null;
     this.nodes.push(node);
     this.render();
     this._pushHistory();
@@ -1105,28 +1124,98 @@ export class FlowCanvas {
     return node;
   }
 
-  // Boundary events of a task sit on its bottom edge from left to right, the
-  // BPMN convention, so none lands on the incoming port (left middle), the
-  // task icon (top left) or the kind badge (top right). A fifth and later one
-  // goes to the top edge, then to the generic placement.
-  _placeNewBoundary(node, parent) {
-    const half = node.width / 2;
-    const pitch = node.width + 4;
-    const usable = Math.max(0, parent.width - node.width);
-    const along = (count, from) => Array.from({ length: count }, (_, index) => from + index * pitch);
-    const bottom = along(Math.floor(usable / pitch) + 1, half).map((x) => [parent.x + x, parent.y + parent.height]);
-    const top = along(2, parent.width - 88 - pitch).map((x) => [parent.x + x, parent.y]).reverse();
-    const siblings = this.nodes.filter((candidate) => processBoundaryKind(candidate.type)
+  // Where the task's own decorations sit, read from the custom properties the
+  // stylesheet places them with, so the room left for boundary events cannot
+  // drift from what is drawn. The fallbacks only serve a document without
+  // layout; they equal the values in flows-builder.css.
+  _decorationMetrics(parent) {
+    const element = this.nodesLayer?.querySelector(`[data-node-id="${CSS.escape(parent.id)}"]`);
+    const style = element && typeof getComputedStyle === 'function' ? getComputedStyle(element) : null;
+    const read = (name, fallback) => {
+      const value = parseFloat(style?.getPropertyValue(name));
+      return Number.isFinite(value) ? value : fallback;
+    };
+    const size = read('--fb-deco-size', 20);
+    const gap = read('--fb-deco-gap', 4);
+    const iconLeft = read('--fb-task-icon-left', 10);
+    return {
+      gap,
+      // The icon plus the margin it keeps on its own left, so an event on the top
+      // edge clears the icon by as much as the icon clears the edge.
+      iconClear: 2 * iconLeft + read('--fb-task-icon-size', 22),
+      // The kind badge and the warning marker, both of which may appear later.
+      reserve: read('--fb-deco-inset', 6) + 2 * size + 2 * gap,
+    };
+  }
+
+  // The places on a task's border a boundary event of this size can take, in
+  // the order they fill: along the bottom edge from left to right, then along
+  // the top edge between the task icon and the badges. The side edges belong to
+  // the task's ports, so a task has room for a fixed number of events.
+  _boundarySlots(parent, size) {
+    const metrics = this._decorationMetrics(parent);
+    const half = size.width / 2;
+    const pitch = size.width + 4;
+    const along = (start, end) => Array.from({ length: Math.max(0, Math.floor((end - start - size.width) / pitch) + 1) },
+      (_, index) => parent.x + start + half + index * pitch);
+    return [
+      ...along(0, parent.width).map((x) => [x, parent.y + parent.height]),
+      ...along(metrics.iconClear, parent.width - metrics.reserve).map((x) => [x, parent.y]),
+    ];
+  }
+
+  _freeBoundarySlots(parent, size, ignore = null) {
+    const siblings = this.nodes.filter((candidate) => candidate !== ignore && processBoundaryKind(candidate.type)
       && candidate.config.attachedToId === parent.id);
-    const others = this.nodes.filter((candidate) => candidate !== parent && !processBoundaryKind(candidate.type));
-    const near = (x, y, other) => Math.abs(other.x + other.width / 2 - x) < node.width && Math.abs(other.y + other.height / 2 - y) < node.height;
+    const near = (x, y, other) => Math.abs(other.x + other.width / 2 - x) < size.width && Math.abs(other.y + other.height / 2 - y) < size.height;
+    return this._boundarySlots(parent, size).filter(([x, y]) => !siblings.some((sibling) => near(x, y, sibling)));
+  }
+
+  /** How many more boundary events fit on the task's border. */
+  boundaryRoom(parentId) {
+    const parent = this.nodes.find((candidate) => candidate.id === parentId);
+    if (!parent) return 0;
+    const template = this.templates.get('bpmn_boundary_error');
+    return this._freeBoundarySlots(parent, { width: template?.width || 56, height: template?.height || 56 }).length;
+  }
+
+  // A new boundary event takes the first free slot (or the one nearest to
+  // `near`, where it was dropped), preferring a slot no other node covers.
+  // False when the border is full: nothing is placed on top of the icon, the
+  // ports or another event.
+  _placeNewBoundary(node, parent, near = null) {
+    const slots = this._freeBoundarySlots(parent, node, node);
+    if (!slots.length) return false;
+    if (near) slots.sort((left, right) => Math.hypot(left[0] - near.x, left[1] - near.y) - Math.hypot(right[0] - near.x, right[1] - near.y));
+    const half = node.width / 2;
+    const others = this.nodes.filter((candidate) => candidate !== parent && candidate !== node
+      && !(processBoundaryKind(candidate.type) && candidate.config.attachedToId === parent.id));
     const covers = (x, y, other) => x + half > other.x && x - half < other.x + other.width
       && y + node.height / 2 > other.y && y - node.height / 2 < other.y + other.height;
-    const slots = [...bottom, ...top].filter(([x, y]) => !siblings.some((sibling) => near(x, y, sibling)));
     const slot = slots.find(([x, y]) => !others.some((other) => covers(x, y, other))) ?? slots[0];
-    if (!slot) { this._positionBoundary(node); return; }
     node.x = slot[0] - half;
     node.y = slot[1] - node.height / 2;
+    return true;
+  }
+
+  // A boundary event dropped from the palette attaches to the activity it lands
+  // on (or touches), at the free slot nearest the drop. Dropped anywhere else,
+  // or on a task with a full border, it stays unattached and says so.
+  _attachDroppedBoundary(node, point) {
+    const margin = node.width / 2;
+    const hosts = processBoundaryHosts(this, processNodeKind(node.type)).filter((candidate) =>
+      point.x >= candidate.x - margin && point.x <= candidate.x + candidate.width + margin
+      && point.y >= candidate.y - margin && point.y <= candidate.y + candidate.height + margin);
+    if (!hosts.length) return;
+    const gap = (candidate) => Math.hypot(
+      Math.max(candidate.x - point.x, 0, point.x - candidate.x - candidate.width),
+      Math.max(candidate.y - point.y, 0, point.y - candidate.y - candidate.height));
+    const host = hosts.sort((left, right) => gap(left) - gap(right))[0];
+    node.config.attachedToId = host.id;
+    if (!this._placeNewBoundary(node, host, point)) {
+      node.config.attachedToId = null;
+      toast(I18n.t('bpmn.boundary_no_room', { node: host.label || this.templates.get(host.type)?.label || host.id }), 'warning');
+    }
   }
 
   _positionBoundary(node) {
@@ -1616,7 +1705,7 @@ export class FlowCanvas {
       const warnings = processNodeWarnings(n, this.opts.processOptions?.serviceBlocks);
       div.innerHTML = `
         ${showKind ? `<span class="fb-process-kind" data-kind="${serviceKind}" role="img" title="${escapeAttr(I18n.t(`bpmn.kind_${serviceKind}`))}" aria-label="${escapeAttr(I18n.t(`bpmn.kind_${serviceKind}`))}"><svg aria-hidden="true"><use href="#i-${kindIcon}"/></svg></span>` : ''}
-        ${warnings.length ? `<span class="fb-process-warn" data-warning="${warnings.join(' ')}" role="img" title="${escapeAttr(warnings.map((key) => I18n.t(`bpmn.warning_${key}`)).join(' '))}" aria-label="${escapeAttr(warnings.map((key) => I18n.t(`bpmn.warning_${key}`)).join(' '))}"><svg aria-hidden="true"><use href="#i-alert"/></svg></span>` : ''}
+        ${warnings.length ? `<span class="fb-process-warn" data-warning="${warnings.join(' ')}" role="img" title="${escapeAttr(warnings.map((key) => processWarningText(n, key, this.opts.processOptions?.serviceBlocks)).join(' '))}" aria-label="${escapeAttr(warnings.map((key) => processWarningText(n, key, this.opts.processOptions?.serviceBlocks)).join(' '))}"><svg aria-hidden="true"><use href="#i-alert"/></svg></span>` : ''}
         <div class="fb-process-symbol">${markerless ? '' : `<svg aria-hidden="true"><use href="#i-${escapeAttr(tmpl.icon)}"/></svg>`}
           ${event || gateway ? '' : `<span>${escapeHtml(title)}</span>`}
           ${repeatMarker ? `<i class="fb-repeat-marker fb-repeat-marker-${repeatMarker}" aria-hidden="true">${repeatMarker === 'loop' ? '↻' : ''}</i>` : ''}</div>
@@ -1674,8 +1763,6 @@ export class FlowCanvas {
     const nodeRects = this.nodes.map((node) => ({
       left: node.x, top: node.y, right: node.x + node.width, bottom: node.y + node.height,
     }));
-    const attachedParents = new Set(this.nodes.filter((node) => processBoundaryKind(node.type))
-      .map((node) => node.config.attachedToId));
     const labels = [];
     for (const node of this.nodes) {
       const element = this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(node.id)}"]`);
@@ -1683,7 +1770,7 @@ export class FlowCanvas {
       if (!label) continue;
       const title = element.querySelector('.fb-process-symbol > span');
       element.classList.remove('fb-external-label');
-      const outside = !title || attachedParents.has(node.id)
+      const outside = !title
         || title.scrollHeight > title.clientHeight + 1 || title.scrollWidth > title.clientWidth + 1;
       element.classList.toggle('fb-external-label', outside && !!title);
       label.hidden = !outside;
@@ -1716,23 +1803,32 @@ export class FlowCanvas {
       const sides = side ? [side, ...['top', 'bottom', 'right', 'left'].filter((candidate) => candidate !== side)]
         : element.classList.contains('fb-external-label') ? ['top', 'bottom', 'left', 'right']
           : ['bottom', 'top', 'right', 'left'];
-      let selected;
-      for (let slot = 0; slot <= this.nodes.length + labels.length + 4 && !selected; slot += 1) {
-        const shift = slot === 0 ? 0 : (slot % 2 ? 1 : -1) * Math.ceil(slot / 2);
-        for (const direction of sides) {
-          const x = direction === 'left' ? node.x - width - gap
-            : direction === 'right' ? node.x + node.width + gap
-              : centerX - width / 2 + shift * (width + gap);
-          const y = direction === 'top' ? node.y - height - gap
-            : direction === 'bottom' ? node.y + node.height + gap
-              : centerY - height / 2 + shift * (height + gap);
-          const rect = { left: x, top: y, right: x + width, bottom: y + height };
-          if (!nodeRects.some((other) => overlaps(rect, other)) && !occupied.some((other) => overlaps(rect, other))) {
-            selected = rect;
-            break;
+      // Every place a label could take, nearest to its element first: beside the
+      // element on each side, slid along that side, and in further rows behind the
+      // first. The side the element faces is preferred only by a few pixels, so a
+      // crowded edge spreads its names in rows next to their events instead of
+      // sending them across the canvas.
+      const candidates = [];
+      const steps = Math.min(this.nodes.length + labels.length + 4, 12);
+      sides.forEach((direction, order) => {
+        const horizontal = direction === 'top' || direction === 'bottom';
+        for (let row = 0; row < 3; row += 1) {
+          for (let slot = -steps; slot <= steps; slot += 1) {
+            const along = slot * ((horizontal ? width : height) + gap) / 2;
+            const x = direction === 'left' ? node.x - width - gap - row * (width + gap)
+              : direction === 'right' ? node.x + node.width + gap + row * (width + gap)
+                : centerX - width / 2 + along;
+            const y = direction === 'top' ? node.y - height - gap - row * (height + gap)
+              : direction === 'bottom' ? node.y + node.height + gap + row * (height + gap)
+                : centerY - height / 2 + along;
+            candidates.push({ rect: { left: x, top: y, right: x + width, bottom: y + height },
+              cost: Math.hypot(x + width / 2 - centerX, y + height / 2 - centerY) + order * 8 });
           }
         }
-      }
+      });
+      candidates.sort((left, right) => left.cost - right.cost);
+      const selected = candidates.find(({ rect }) => !nodeRects.some((other) => overlaps(rect, other))
+        && !occupied.some((other) => overlaps(rect, other)))?.rect;
       if (!selected) continue;
       label.style.left = `${selected.left - node.x}px`;
       label.style.top = `${selected.top - node.y}px`;

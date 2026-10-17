@@ -19,7 +19,7 @@ import '/js/components/tf-person-picker.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-alert.js';
-import { processNodeKind, processBoundaryKind, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processResultRouting, processHandlerName } from './bpmn.js';
+import { processNodeKind, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processHandlerName } from './bpmn.js';
 import { openProcessCallPreview } from './process-monitor.js';
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
@@ -608,18 +608,7 @@ export class FlowConfig {
     const declaration = (key, label, choices, idKey, selected) => `<tf-select data-process="${key}" wrap-selected label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(selected || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.choose_declaration'))}</option>${(choices || []).map((choice) => `<option value="${escapeAttr(choice[idKey])}">${escapeHtml(choice.name)} · ${escapeHtml(choice[idKey])}</option>`).join('')}${selected && !(choices || []).some((choice) => choice[idKey] === selected) ? `<option value="${escapeAttr(selected)}">${escapeHtml(selected)}</option>` : ''}</tf-select>`;
     const boundary = () => {
       const graph = this.opts.getCanvas();
-      const activities = graph.nodes.filter((candidate) => (!candidate.repeat
-        || ['BoundaryTimer', 'BoundaryMessage'].includes(kind)
-        || (kind === 'BoundaryError' && ['bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(candidate.type))
-        || (kind === 'BoundaryEscalation' && candidate.type === 'bpmn_service_task'))
-        && (['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(candidate.type)
-        || (['BoundaryTimer', 'BoundaryMessage'].includes(kind)
-          && ['bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task', 'bpmn_script_task'].includes(candidate.type)))
-        && (kind !== 'BoundaryError' || candidate.type !== 'bpmn_user_task')
-        && (kind !== 'BoundaryEscalation' || (candidate.type === 'bpmn_service_task' && !!candidate.config.resultExpression))
-        && !(candidate.type === 'bpmn_receive_task' && graph.edges.some((edge) =>
-          edge.to_node === candidate.id && graph.nodes.some((source) =>
-            source.id === edge.from_node && source.type === 'bpmn_event_based_gateway'))));
+      const activities = processBoundaryHosts(graph, kind);
       const target = activities.find((candidate) => candidate.id === config.attachedToId);
       const scopeHint = target?.repeat ? 'bpmn.boundary_repeat_group_hint'
         : target && graph.processPath.length ? 'bpmn.boundary_child_local_hint' : null;
@@ -662,7 +651,7 @@ export class FlowConfig {
       if (!tabs.some(([id]) => id === this.processTab)) this.processTab = 'impl';
       const panel = servicePanel = (id, html) => `<section class="fb-process-panel" role="tabpanel" id="svc-panel-${id}" aria-labelledby="${id}" data-service-panel="${id}" ${this.processTab === id ? '' : 'hidden'}>${html}</section>`;
       servicePanels = `<tf-tabs variant="bar" layout="stacked" value="${this.processTab}" data-service-tabs>${tabs.map(([id, label, icon]) => `<tf-tab id="${id}" icon="${icon}" panel="svc-panel-${id}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" title="${escapeAttr(I18n.t(`bpmn.${label}_title`))}"></tf-tab>`).join('')}</tf-tabs>`
-        + panel('impl', `${blockTask ? `<tf-alert tone="warning" data-service-warning="empty_model" message="${escapeAttr(I18n.t('bpmn.warning_empty_model'))}" ${processNodeWarnings(node, blocks).includes('empty_model') ? '' : 'hidden'}></tf-alert>` : ''}<tf-select data-process="implementation" label="${escapeAttr(I18n.t('bpmn.service_implementation'))}" value="${blockTask ? 'block' : tool ? 'tool' : 'flow'}" ${disabled}>
+        + panel('impl', `${blockTask ? `<tf-alert tone="warning" data-service-warning="empty_setting" message="${escapeAttr(processWarningText(node, 'empty_setting', blocks))}" ${processNodeWarnings(node, blocks).includes('empty_setting') ? '' : 'hidden'}></tf-alert>` : ''}<tf-select data-process="implementation" label="${escapeAttr(I18n.t('bpmn.service_implementation'))}" value="${blockTask ? 'block' : tool ? 'tool' : 'flow'}" ${disabled}>
           <option value="flow">${escapeHtml(I18n.t('bpmn.implementation_flow'))}</option>
           <option value="tool">${escapeHtml(I18n.t('bpmn.implementation_tool'))}</option>
           ${blocks.length || blockTask ? `<option value="block">${escapeHtml(I18n.t('bpmn.implementation_block'))}</option>` : ''}
@@ -733,7 +722,7 @@ export class FlowConfig {
           <option value="">${escapeHtml(I18n.t('bpmn.call_choose_definition'))}</option>
           ${published?.definitionId ? `<option value="${escapeAttr(published.definitionId)}">${escapeHtml(published.definitionId)}</option>` : ''}
         </tf-select>
-        ${this.readOnly ? '' : `<tf-button variant="secondary" data-load-calls ${local ? 'hidden' : ''}>${escapeHtml(I18n.t('bpmn.call_load_definitions'))}</tf-button>`}
+        ${this.readOnly ? '' : `<tf-button variant="secondary" data-load-calls hidden>${escapeHtml(I18n.t('bpmn.call_load_definitions'))}</tf-button>`}
         <tf-select data-process="calledVersionChoice" label="${escapeAttr(I18n.t('bpmn.call_version'))}" value="${escapeAttr(String(published?.version || ''))}" ${disabled} ${local ? 'hidden' : ''}>
           <option value="">${escapeHtml(I18n.t('bpmn.call_choose_version'))}</option>
           ${published?.version ? `<option value="${escapeAttr(String(published.version))}">${escapeHtml(I18n.t('bpmn.version_number', { version: published.version }))}</option>` : ''}
@@ -742,7 +731,7 @@ export class FlowConfig {
           <option value="">${escapeHtml(I18n.t('bpmn.call_choose_body'))}</option>
           ${published?.calledElement?.processId ? `<option value="${escapeAttr(published.calledElement.processId)}">${escapeHtml(published.calledElement.processId)}</option>` : ''}
         </tf-select>
-        ${this.readOnly ? '' : `<tf-button variant="secondary" data-load-call-versions ${local ? 'hidden' : ''}>${escapeHtml(I18n.t('bpmn.call_load_versions'))}</tf-button>`}
+        ${this.readOnly ? '' : `<tf-button variant="secondary" data-load-call-versions hidden>${escapeHtml(I18n.t('bpmn.call_load_versions'))}</tf-button>`}
         <tf-textarea readonly autogrow rows="2" data-process="calledElement" label="${escapeAttr(I18n.t('bpmn.call_qname'))}" value="${escapeAttr(target.namespaceUri && target.processId ? `${target.namespaceUri} · ${target.processId}` : '')}"></tf-textarea>
         <p class="fb-field-hint" data-call-capability>${escapeHtml(I18n.t('bpmn.call_exact_hint'))}</p>
         <tf-button variant="secondary" data-preview-called ${published?.definitionId && published?.version && !local ? '' : 'disabled'} ${local ? 'hidden' : ''}>${escapeHtml(I18n.t('bpmn.call_preview'))}</tf-button>
@@ -967,12 +956,18 @@ export class FlowConfig {
       let definitionOffset = 0, versionOffset = 0, generation = 0;
       const loadDefinitions = this.root.querySelector('[data-load-calls]');
       const loadVersions = this.root.querySelector('[data-load-call-versions]');
-      loadDefinitions?.addEventListener('click', async () => {
-        loadDefinitions.setAttribute('disabled', '');
+      const say = (key, params) => { if (this.root.contains(capability)) capability.textContent = I18n.t(key, params); };
+      // Only a definition with a published, unarchived version can be called: a
+      // draft would list a name that then has no version to choose. The edited
+      // process stays when it has a published version, since calling an earlier
+      // version of itself is allowed.
+      const fetchDefinitions = async () => {
+        loadDefinitions?.setAttribute('disabled', '');
         try {
           const response = await ApiBinary.one('processDefinitionListRequest', { offset: definitionOffset, limit: 100 });
           if (!this.root.contains(callChoice)) return;
           for (const definition of response.definitions) {
+            if (definition.archived || !definition.publishedVersion) continue;
             const item = definitions.find((row) => row.value === definition.definitionId);
             if (item) item.label = `${definition.name} · ${definition.definitionId}`;
             else definitions.push({ value: definition.definitionId,
@@ -980,31 +975,16 @@ export class FlowConfig {
           }
           definitionOffset += response.definitions.length;
           callChoice.setOptions(definitions, callChoice.value);
-          loadDefinitions.hidden = !response.hasMore;
+          if (loadDefinitions) loadDefinitions.hidden = !response.hasMore;
+          if (definitions.length === 1 && !response.hasMore && !callChoice.value) say('bpmn.call_no_published');
         } catch (error) { if (this.root.contains(capability)) capability.textContent = error.message; }
-        finally { loadDefinitions.removeAttribute('disabled'); }
-      });
-      callChoice.addEventListener('change', () => {
-        if (this.readOnly) return;
-        generation++;
-        versionOffset = 0;
-        versions.splice(1);
-        versionChoice.setOptions(versions, '');
-        processChoice.setOptions([{ value: '', label: I18n.t('bpmn.call_choose_body') }], '');
-        preview.setAttribute('disabled', '');
-        const calledDefinitionId = callChoice.value;
-        loadVersions.hidden = !calledDefinitionId;
-        this.opts.onConfigChange(node.id, { calledDefinitionId, calledVersion: 0,
-          calledElement: { namespaceUri: '', processId: '' } });
-        syncVersionWarning();
-        this.root.querySelector('[data-process="calledElement"]').value = '';
-        capability.textContent = calledDefinitionId ? I18n.t('bpmn.call_choose_version') : I18n.t('bpmn.call_exact_hint');
-      });
-      loadVersions?.addEventListener('click', async () => {
+        finally { loadDefinitions?.removeAttribute('disabled'); }
+      };
+      const fetchVersions = async () => {
         const definitionId = callChoice.value;
         if (!definitionId) return;
         const request = generation;
-        loadVersions.setAttribute('disabled', '');
+        loadVersions?.setAttribute('disabled', '');
         try {
           const response = await ApiBinary.one('processVersionListRequest', { definitionId, offset: versionOffset, limit: 100 });
           if (!this.root.contains(versionChoice) || request !== generation || callChoice.value !== definitionId) return;
@@ -1015,10 +995,37 @@ export class FlowConfig {
           }
           versionOffset += response.versions.length;
           versionChoice.setOptions(versions, versionChoice.value);
-          loadVersions.hidden = !response.hasMore;
+          if (loadVersions) loadVersions.hidden = !response.hasMore;
+          if (versions.length === 1 && !response.hasMore) say('bpmn.call_no_versions');
+          else if (!versionChoice.value) say('bpmn.call_choose_version');
         } catch (error) { if (request === generation && this.root.contains(capability)) capability.textContent = error.message; }
-        finally { loadVersions.removeAttribute('disabled'); }
+        finally { loadVersions?.removeAttribute('disabled'); }
+      };
+      loadDefinitions?.addEventListener('click', fetchDefinitions);
+      loadVersions?.addEventListener('click', fetchVersions);
+      callChoice.addEventListener('change', () => {
+        if (this.readOnly) return;
+        generation++;
+        versionOffset = 0;
+        versions.splice(1);
+        versionChoice.setOptions(versions, '');
+        processChoice.setOptions([{ value: '', label: I18n.t('bpmn.call_choose_body') }], '');
+        preview.setAttribute('disabled', '');
+        const calledDefinitionId = callChoice.value;
+        if (loadVersions) loadVersions.hidden = true;
+        this.opts.onConfigChange(node.id, { calledDefinitionId, calledVersion: 0,
+          calledElement: { namespaceUri: '', processId: '' } });
+        syncVersionWarning();
+        this.root.querySelector('[data-process="calledElement"]').value = '';
+        capability.textContent = calledDefinitionId ? I18n.t('bpmn.call_choose_version') : I18n.t('bpmn.call_exact_hint');
+        fetchVersions();
       });
+      // The lists fill themselves: a published target is chosen from what exists,
+      // so nothing waits behind a "Load" button.
+      if (!this.readOnly && !node.config.localBody) {
+        fetchDefinitions();
+        if (callChoice.value || published?.calledDefinitionId) fetchVersions();
+      }
       versionChoice.addEventListener('change', async () => {
         if (this.readOnly) return;
         if (!versionChoice.value) {
@@ -1201,8 +1208,12 @@ export class FlowConfig {
         if (valid) {
           this.opts.onConfigChange(node.id, { implementation: { Block: {
             ...node.config.implementation.Block, config: parsed } } });
-          const warning = this.root.querySelector('[data-service-warning="empty_model"]');
-          if (warning) warning.hidden = !processNodeWarnings(node, this.opts.processOptions.serviceBlocks).includes('empty_model');
+          const warning = this.root.querySelector('[data-service-warning="empty_setting"]');
+          const blocks = this.opts.processOptions.serviceBlocks;
+          if (warning) {
+            warning.hidden = !processNodeWarnings(node, blocks).includes('empty_setting');
+            warning.setAttribute('message', processWarningText(node, 'empty_setting', blocks));
+          }
         }
       } else if (key === 'addonId' || key === 'toolName') {
         this.opts.onConfigChange(node.id, { implementation: { AddonTool: {
@@ -1270,15 +1281,6 @@ export class FlowConfig {
     const routing = processResultRouting(this.opts.getCanvas(), node.id);
     const name = (entry) => entry.name || entry.label || getNodeName(entry.type);
     const targets = (list) => (list.length ? list.map(name).join(', ') : I18n.t('bpmn.routing_no_flow'));
-    const outcomeText = (row) => {
-      if (row.outcome === 'timeout') return I18n.t('bpmn.routing_outcome_timeout', { seconds: row.seconds });
-      if (row.outcome === 'rejected') return I18n.t(`bpmn.routing_outcome_rejected_${routing.verification === 'Human' ? 'human' : 'condition'}`);
-      if ((row.outcome === 'error' || row.outcome === 'needs_human') && row.route !== 'unavailable') {
-        if (row.other) return I18n.t(`bpmn.routing_outcome_${row.outcome}_other`);
-        return I18n.t(`bpmn.routing_outcome_${row.outcome}_code`, { code: row.code });
-      }
-      return I18n.t(`bpmn.routing_outcome_${row.outcome}`);
-    };
     const timerText = (timer) => {
       const [kind] = Object.keys(timer || {});
       const value = timer?.[kind];
@@ -1287,24 +1289,19 @@ export class FlowConfig {
       if (kind === 'Date') return value.at || I18n.t('bpmn.routing_timer_unset');
       return kind ? I18n.t(`bpmn.timer_type_${kind.toLowerCase()}`) : I18n.t('bpmn.routing_timer_unset');
     };
-    const routeText = (row) => {
-      if (row.route === 'next') return I18n.t(`bpmn.routing_next_${row.gate}`, { targets: targets(row.targets) });
-      if (row.route === 'boundary' && row.outcome === 'timer') {
-        return I18n.t(row.boundary.interrupting ? 'bpmn.routing_timer_interrupting' : 'bpmn.routing_timer_parallel',
-          { when: timerText(row.timer), name: name(row.boundary), targets: targets(row.targets) });
-      }
-      if (row.route === 'boundary' || row.route === 'boundary_keep') {
-        return I18n.t(`bpmn.routing_${row.route}`, { name: name(row.boundary), targets: targets(row.targets) });
-      }
-      if (row.route === 'incident') {
-        if (row.outcome === 'error' && row.other) return I18n.t('bpmn.routing_incident_repeated');
-        if (row.outcome === 'error' || row.outcome === 'cancelled') return I18n.t('bpmn.routing_incident_result');
-        if (row.outcome === 'platform') return I18n.t('bpmn.routing_incident_platform');
-        if (row.outcome === 'timeout') return I18n.t('bpmn.routing_incident_timeout', { code: row.code, reason: row.reason });
-        return I18n.t('bpmn.routing_incident', { code: row.code });
-      }
-      if (row.route === 'review' && row.outcome === 'denied') return I18n.t('bpmn.routing_review_denied', { code: row.code });
-      return I18n.t(`bpmn.routing_${row.route}`);
+    // A code such as EXTERNAL_OUTCOME_UNCERTAIN may only wrap after an underscore;
+    // without these break points a narrow cell cuts it in the middle of a word.
+    const breakable = (text) => escapeHtml(text).replace(/\w+(?:_\w+)+/g, (code) => code.replaceAll('_', '_<wbr>'));
+    const rowTexts = (row) => {
+      const keys = processRoutingTextKeys(row, routing.verification);
+      const params = {
+        targets: targets(row.targets || []), code: row.code, reason: row.reason, seconds: row.seconds,
+        name: row.boundary ? name(row.boundary) : row.parent?.name ?? '', scope: row.parent?.scope ?? '',
+        when: row.timer ? timerText(row.timer) : '',
+      };
+      const outcome = I18n.t(keys.outcome, params);
+      const route = I18n.t(keys.route, params);
+      return { outcome, route, outcomeHtml: breakable(outcome), routeHtml: breakable(route) };
     };
     const warningText = (warning) => I18n.t(`bpmn.routing_warning_${warning.key}`, { names: warning.names.join(', ') });
     const addReason = (kind) => {
@@ -1315,17 +1312,21 @@ export class FlowConfig {
       const reason = addReason(kind);
       return `<tf-button variant="secondary" size="sm" data-routing-add="${kind}" ${reason ? `disabled title="${escapeAttr(reason)}"` : ''}>${escapeHtml(I18n.t(`bpmn.routing_add_${kind}`))}</tf-button>`;
     };
-    const reasons = ['error', 'escalation'].map(addReason).filter(Boolean);
-    host.innerHTML = `<div class="fb-label">${escapeHtml(I18n.t('bpmn.routing_title'))}</div>
+    const reasons = [...new Set(['error', 'escalation'].map(addReason).filter(Boolean))];
+    // The table is the longest thing the tab holds; a short window starts it
+    // folded, and what the author chose stays through every redraw.
+    const open = this.routingOpen ?? window.innerHeight >= 860;
+    host.innerHTML = `<tf-disclosure data-routing-disclosure label="${escapeAttr(I18n.t('bpmn.routing_title'))}" ${open ? 'open' : ''}>
       <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.routing_hint'))}</p>
       <tf-table data-routing density="compact">
-        <tf-column key="outcome" label="${escapeAttr(I18n.t('bpmn.routing_column_outcome'))}" width="38%"></tf-column>
-        <tf-column key="route" label="${escapeAttr(I18n.t('bpmn.routing_column_route'))}" fill></tf-column>
-      </tf-table>
+        <tf-column key="outcomeHtml" renderer="html" label="${escapeAttr(I18n.t('bpmn.routing_column_outcome'))}" width="34%"></tf-column>
+        <tf-column key="routeHtml" renderer="html" label="${escapeAttr(I18n.t('bpmn.routing_column_route'))}" fill></tf-column>
+      </tf-table></tf-disclosure>
       <div class="fb-routing-warnings" data-routing-warnings>${routing.warnings.map((warning) => `<tf-alert tone="${warning.tone}" data-routing-warning="${warning.key}" message="${escapeAttr(warningText(warning))}"></tf-alert>`).join('')}</div>
       ${this.readOnly ? '' : `<div class="fb-routing-actions">${addButton('error')}${addButton('escalation')}</div>
       <p class="fb-field-hint" data-routing-add-hint>${escapeHtml([I18n.t('bpmn.routing_add_hint'), ...reasons].join(' '))}</p>`}`;
-    host.querySelector('tf-table').rows = routing.rows.map((row) => ({ outcome: outcomeText(row), route: routeText(row) }));
+    host.querySelector('tf-table').rows = routing.rows.map(rowTexts);
+    host.querySelector('tf-disclosure').addEventListener('toggle', (event) => { this.routingOpen = event.detail.open; });
     if (focused) host.querySelector(`[data-routing-add="${focused}"]:not([disabled])`)?.focus();
     host.querySelectorAll('[data-routing-add]').forEach((button) => button.addEventListener('click', () => {
       const kind = button.dataset.routingAdd;

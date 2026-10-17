@@ -238,25 +238,35 @@ export function processServiceKind(config) {
   return implementation?.Block ? 'block' : implementation?.AddonTool ? 'tool' : 'flow';
 }
 
-// Problems the canvas marks on a node itself. A block whose required settings
-// include `model` and a published Call without an exact version are both saved
-// or refused only later (publication, or the wire codec), so the author sees
-// them here first. `blocks` is the server's block list.
+// The settings the server lists as required that a block task has left empty.
+// The list comes from the server (`requiredSettings`), so a block that needs
+// more than `model` is covered without a client change.
+export function processMissingSettings(node, blocks = []) {
+  const block = node.type === 'bpmn_service_task' ? node.config?.implementation?.Block : null;
+  const listed = block && blocks.find((candidate) => candidate.nodeType === block.nodeType);
+  return (listed?.requiredSettings || []).filter((key) => {
+    const value = block.config?.[key];
+    return typeof value === 'string' ? value.trim() === '' : value == null;
+  });
+}
+
+// Problems the canvas marks on a node itself. A block with an empty required
+// setting, a boundary event attached to nothing and a published Call without
+// an exact version are saved or refused only later (publication, or the wire
+// codec), so the author sees them here first. `blocks` is the server's block list.
 export function processNodeWarnings(node, blocks = []) {
   const warnings = [];
-  if (node.type === 'bpmn_service_task') {
-    const block = node.config?.implementation?.Block;
-    const listed = block && blocks.find((candidate) => candidate.nodeType === block.nodeType);
-    if (listed?.requiredSettings?.includes('model')
-      && (typeof block.config?.model !== 'string' || block.config.model.trim() === '')) {
-      warnings.push('empty_model');
-    }
-  }
+  if (processMissingSettings(node, blocks).length) warnings.push('empty_setting');
+  if (processBoundaryKind(node.type) && !node.config?.attachedToId) warnings.push('boundary_unattached');
   if (node.type === 'bpmn_call_activity' && !node.config?.localBody
     && !(Number.isInteger(node.config?.calledVersion) && node.config.calledVersion >= 1)) {
     warnings.push('call_version');
   }
   return warnings;
+}
+
+export function processWarningText(node, key, blocks = []) {
+  return I18n.t(`bpmn.warning_${key}`, { names: processMissingSettings(node, blocks).join(', ') });
 }
 
 // Name of an error or escalation handler added from the result tab: the code it
@@ -266,11 +276,165 @@ export function processHandlerName(type, code) {
   return code == null ? I18n.t(`bpmn.handler_name_${kind}_any`) : I18n.t(`bpmn.handler_name_${kind}`, { code });
 }
 
+const ESCALATION_WAITS = ['bpmn_user_task', 'bpmn_manual_task', 'bpmn_service_task', 'bpmn_timer_catch', 'bpmn_message_catch',
+  'bpmn_receive_task', 'bpmn_signal_catch', 'bpmn_event_based_gateway'];
+const ESCALATION_PASS_THROUGH = ['bpmn_message_throw', 'bpmn_send_task', 'bpmn_signal_throw', 'bpmn_script_task'];
+
+/**
+ * The first reason an escalation handler's immediate path is refused at
+ * publication (processes/model.rs EscalationPrefixProof), for the shapes a
+ * designer draws: straight lines and exclusive gateways. Parallel and inclusive
+ * gateways are left to the server. Returns `{ reason, nodeId }` or null.
+ */
+export function processEscalationPathProblem(graph, boundaryId) {
+  const byId = new Map(graph.nodes.map((node) => [node.id, node]));
+  const outgoing = (id) => graph.edges.filter((edge) => edge.from_node === id).map((edge) => edge.to_node);
+  const starts = outgoing(boundaryId);
+  if (starts.length !== 1) return null;
+  const seen = new Set();
+  const visit = (id) => {
+    if (seen.has(id)) return null;
+    seen.add(id);
+    const node = byId.get(id);
+    if (!node) return { reason: 'no_durable_wait', nodeId: id };
+    const fail = (reason) => ({ reason, nodeId: id });
+    if (ESCALATION_WAITS.includes(node.type)) return null;
+    if (ESCALATION_PASS_THROUGH.includes(node.type)) {
+      const next = outgoing(id);
+      return next.length === 1 ? visit(next[0]) : fail('no_durable_wait');
+    }
+    if (node.type === 'bpmn_exclusive_gateway') {
+      const next = outgoing(id);
+      if (!next.length) return fail('no_durable_wait');
+      for (const target of next) {
+        const problem = visit(target);
+        if (problem) return problem;
+      }
+      return null;
+    }
+    if (node.type === 'bpmn_parallel_gateway' || node.type === 'bpmn_inclusive_gateway') return null;
+    if (['bpmn_end', 'bpmn_error_end', 'bpmn_terminate_end'].includes(node.type)) return fail('terminal_before_wait');
+    if (node.type === 'bpmn_sub_process') return fail('scope_entry');
+    if (node.type === 'bpmn_call_activity') return fail('call_entry');
+    return fail('no_durable_wait');
+  };
+  return visit(starts[0]);
+}
+
+// The error boundary events of the sub-processes around a task, innermost first,
+// each with the code it catches (null for the catch-all). `path` lists the
+// sub-process ids from the process body inward; a model that does not hold them
+// yields nothing.
+function enclosingErrorHandlers(model, selectedProcessId, path) {
+  const root = selectedProcessId && selectedProcessId !== model.processId
+    ? (model.additionalProcesses || []).find((candidate) => candidate.processId === selectedProcessId) : model;
+  const bodies = [root ?? null];
+  for (const id of path) {
+    const holder = bodies.at(-1)?.nodes?.find((node) => node.id === id);
+    bodies.push(holder?.kind?.SubProcess?.body ?? null);
+  }
+  const handlers = [];
+  for (let depth = path.length; depth > 0; depth -= 1) {
+    const enclosing = bodies[depth - 1];
+    const scope = enclosing?.nodes?.find((node) => node.id === path[depth - 1]);
+    if (!scope) continue;
+    for (const node of enclosing.nodes.filter((candidate) => candidate.kind?.BoundaryError?.attachedToId === scope.id)) {
+      const ref = node.kind.BoundaryError.errorRef;
+      const declared = ref == null ? null : (model.errors || []).find((entry) => entry.errorId === ref);
+      if (ref != null && !declared) continue;
+      handlers.push({ depth, code: declared?.errorCode ?? null, catchAll: ref == null,
+        name: node.name || I18n.t('bpmn.node_boundary_error'), scope: scope.name || I18n.t('bpmn.node_sub_process') });
+    }
+  }
+  return handlers;
+}
+
+// What takes `code` from the handlers above: per scope the exact code before the
+// catch-all, the innermost scope first. A null code is "any other error", which
+// only a catch-all takes.
+function climbingHandler(handlers, code) {
+  for (const depth of [...new Set(handlers.map((handler) => handler.depth))]) {
+    const here = handlers.filter((handler) => handler.depth === depth);
+    const taken = (code != null && here.find((handler) => !handler.catchAll && handler.code === code))
+      || here.find((handler) => handler.catchAll);
+    if (taken) return taken;
+  }
+  return null;
+}
+
+const ESCALATION_PATH_REASONS = ['terminal_before_wait', 'scope_entry', 'call_entry', 'no_durable_wait'];
+
+/**
+ * Server and codec messages cite elements by internal id; the author knows them
+ * by name. Every id of `model` found in `message` becomes the element's name
+ * (or its kind when it has none), a flow becomes "from → to", and the one
+ * refusal a drawn graph reaches often, an escalation path with nothing waiting,
+ * is replaced by the text the inspector shows for it.
+ */
+export function processExplainError(message, model) {
+  const names = new Map();
+  const visit = (body) => {
+    for (const node of body?.nodes || []) {
+      const kind = typeof node.kind === 'string' ? node.kind : Object.keys(node.kind || {})[0];
+      const element = ELEMENTS.find(([candidate]) => candidate === kind);
+      names.set(node.id, String(node.name || '').trim() || (element ? I18n.t(`bpmn.node_${element[1]}`) : node.id));
+      if (node.kind?.SubProcess) visit(node.kind.SubProcess.body);
+    }
+  };
+  const bodies = [model, ...(model?.additionalProcesses || [])];
+  bodies.forEach(visit);
+  const flows = new Map();
+  const collect = (body) => {
+    for (const flow of body?.sequenceFlows || []) flows.set(flow.id, flow);
+    for (const node of body?.nodes || []) if (node.kind?.SubProcess) collect(node.kind.SubProcess.body);
+  };
+  bodies.forEach(collect);
+  const text = String(message ?? '');
+  const path = /escalation boundary ([\w-]+) has unsupported immediate path (\w+) at/.exec(text);
+  if (path && names.has(path[1])) {
+    const key = ESCALATION_PATH_REASONS.includes(path[2]) ? path[2] : 'other';
+    return I18n.t(`bpmn.routing_warning_escalation_path_${key}`, { names: names.get(path[1]) });
+  }
+  return text.replace(/[\w-]+/g, (token) => {
+    if (names.has(token)) return `\u201c${names.get(token)}\u201d`;
+    const flow = flows.get(token);
+    return flow ? I18n.t('bpmn.error_flow', { from: names.get(flow.sourceId) ?? flow.sourceId, to: names.get(flow.targetId) ?? flow.targetId }) : token;
+  });
+}
+
+// Which i18n texts a row of the routing table shows; the parameters they need
+// (targets, handler, code, timer) come from the row itself.
+export function processRoutingTextKeys(row, verification) {
+  const outcome = row.outcome === 'timeout' ? 'bpmn.routing_outcome_timeout'
+    : row.outcome === 'rejected' ? `bpmn.routing_outcome_rejected_${verification === 'Human' ? 'human' : 'condition'}`
+      : (row.outcome === 'error' || row.outcome === 'needs_human') && row.route !== 'unavailable'
+        ? `bpmn.routing_outcome_${row.outcome}_${row.other ? 'other' : 'code'}`
+        : `bpmn.routing_outcome_${row.outcome}`;
+  let route = `bpmn.routing_${row.route}`;
+  if (row.route === 'next') route = `bpmn.routing_next_${row.gate}`;
+  else if (row.route === 'boundary' && row.outcome === 'timer') route = row.boundary.interrupting ? 'bpmn.routing_timer_interrupting' : 'bpmn.routing_timer_parallel';
+  else if (row.route === 'incident') {
+    route = row.outcome === 'error' && row.other ? 'bpmn.routing_incident_repeated'
+      : row.outcome === 'error' || row.outcome === 'cancelled' ? 'bpmn.routing_incident_result'
+        : row.outcome === 'platform' ? 'bpmn.routing_incident_platform'
+          : row.outcome === 'timeout' ? 'bpmn.routing_incident_timeout' : 'bpmn.routing_incident';
+  } else if (row.route === 'review' && row.outcome === 'denied') route = 'bpmn.routing_review_denied';
+  return { outcome, route };
+}
+
+// The row a stimulus lands on: the handler with the exact code first, then the
+// catch-all one. Outcomes with a single row ignore the code.
+export function processRowFor(routing, outcome, code = null) {
+  const rows = routing.rows.filter((row) => row.outcome === outcome);
+  return rows.find((row) => row.route !== 'unavailable' && !row.other && row.code === code)
+    ?? rows.find((row) => row.other || row.route === 'unavailable') ?? rows[0];
+}
+
 /**
  * What happens to a Service task's outcomes, derived from the graph alone.
  * There is no server-side rule table: the rules below mirror the engine in
- * processes/runtime.rs (plan_job_result, error_handler, report_denied_tool) and
- * processes/jobs.rs (classify_result, fail_claim). The shared fixture
+ * processes/runtime.rs (plan_job_result, error_handler) and processes/jobs.rs
+ * (classify_result, fail_claim, report_denied_tool). The shared fixture
  * tests/fixtures/process_result_routing.json pins every row against both sides:
  * - only a Contract result (a non-empty `resultExpression`) can be Error,
  *   NeedsHuman or Cancelled; a platform failure (flow, tool or expression
@@ -280,7 +444,8 @@ export function processHandlerName(type, code) {
  * - Error goes to the boundary with the exact code, else to the catch-all
  *   boundary, else (inside a sub-process) up the enclosing scopes, else an
  *   incident, unless the process runs as a called process whose Call activity
- *   has an error boundary. A repeated task never climbs: it raises the incident itself;
+ *   has an error boundary. A repeated task never climbs: it raises the incident
+ *   itself, and so does a Cancelled result or a rejecting condition;
  * - NeedsHuman goes to the escalation boundary with the exact code, else the
  *   catch-all one, else the initiator's verification task. A non-interrupting
  *   escalation keeps the task, which still opens its verification task;
@@ -331,6 +496,7 @@ export function processResultRouting(graph, nodeId) {
   const catchAll = (list) => list.find((entry) => entry.catchAll) || null;
   const specific = (list) => list.filter((entry) => !entry.catchAll && !entry.undeclared);
   const human = typeof config.verification === 'string';
+  const enclosing = nested && !repeated ? enclosingErrorHandlers(model, graph.selectedProcessId, graph.processPath) : [];
   const rows = [];
   rows.push({ outcome: 'completed', route: 'next', gate: human ? 'human' : 'condition', targets: targetsOf(nodeId) });
   rows.push({ outcome: 'rejected', route: 'incident', code: human ? 'HUMAN_REJECTED' : 'VERIFICATION_FAILED' });
@@ -338,13 +504,22 @@ export function processResultRouting(graph, nodeId) {
   if (hasResult) {
     for (const entry of specific(errors)) rows.push({ outcome: 'error', route: 'boundary', code: entry.code, boundary: entry, targets: entry.targets });
     const otherError = catchAll(errors);
-    rows.push({ outcome: 'error', route: otherError ? 'boundary' : repeated ? 'incident' : nested ? 'parent' : 'caller', other: true,
-      code: null, boundary: otherError, targets: otherError ? otherError.targets : [] });
+    const taskCodes = new Set(specific(errors).map((entry) => entry.code));
+    for (const code of otherError ? [] : [...new Set(enclosing.filter((handler) => !handler.catchAll).map((handler) => handler.code))]) {
+      const taken = climbingHandler(enclosing, code);
+      if (taskCodes.has(code) || !taken || taken.catchAll) continue;
+      rows.push({ outcome: 'error', route: 'parent', code, boundary: null, parent: taken, targets: [] });
+    }
+    // An error no handler on the task takes climbs scope by scope; with no
+    // handler in any enclosing scope it ends up where a top-level task's does.
+    const climbed = otherError ? null : climbingHandler(enclosing, null);
+    rows.push({ outcome: 'error', route: otherError ? 'boundary' : repeated ? 'incident' : climbed ? 'parent' : 'caller', other: true,
+      code: null, boundary: otherError, parent: climbed, targets: otherError ? otherError.targets : [] });
     for (const entry of specific(escalations)) rows.push({ outcome: 'needs_human', route: escalationRoute(entry), code: entry.code, boundary: entry, targets: entry.targets });
     const otherEscalation = catchAll(escalations);
     rows.push({ outcome: 'needs_human', route: otherEscalation ? escalationRoute(otherEscalation) : 'review', other: true,
       code: null, boundary: otherEscalation, targets: otherEscalation ? otherEscalation.targets : [] });
-    rows.push({ outcome: 'cancelled', route: 'incident', code: 'SERVICE_ERROR' });
+    rows.push({ outcome: 'cancelled', route: 'incident' });
   } else {
     for (const outcome of ['error', 'needs_human', 'cancelled']) rows.push({ outcome, route: 'unavailable' });
   }
@@ -368,6 +543,12 @@ export function processResultRouting(graph, nodeId) {
   for (const entry of [...errors, ...escalations, ...timers]) {
     if (!entry.targets.length) warn('boundary_no_flow', entry.name);
     if (entry.undeclared) warn('undeclared_reference', entry.name);
+  }
+  // The server refuses to publish an escalation handler whose path reaches an
+  // End, a sub-process or a Call activity before anything waits for a person.
+  for (const entry of escalations) {
+    const problem = processEscalationPathProblem(graph, entry.id);
+    if (problem) warn(`escalation_path_${problem.reason}`, entry.name);
   }
   for (const list of [errors, escalations]) {
     const seen = new Set();
@@ -394,14 +575,18 @@ export function processResultRouting(graph, nodeId) {
     const free = (declarations || []).find((entry) => !used.has(entry[codeKey]));
     return free ? { ref: free[idKey] } : null;
   };
-  const addError = nextRef(errors, model.errors, 'errorId', 'errorCode');
+  // Both buttons need a result rule: only a rule can return an error or ask a
+  // person. The task also has a finite number of places on its border.
+  const room = typeof graph.boundaryRoom === 'function' ? graph.boundaryRoom(nodeId) : Infinity;
+  const addError = hasResult ? nextRef(errors, model.errors, 'errorId', 'errorCode') : null;
   const addEscalation = hasResult ? nextRef(escalations, model.escalations, 'escalationId', 'escalationCode') : null;
+  const reason = (ref) => (!hasResult ? 'no_result' : !ref ? 'all_taken' : room < 1 ? 'no_room' : null);
+  const errorReason = reason(addError);
+  const escalationReason = reason(addEscalation);
   return {
     node, hasResult, kind: serviceKind, verification: human ? 'Human' : 'Condition', rows, warnings,
     boundaries: { errors, escalations, timers },
-    add: { error: addError, escalation: addEscalation,
-      errorReason: addError ? null : 'all_taken',
-      escalationReason: addEscalation ? null : hasResult ? 'all_taken' : 'no_result' },
+    add: { error: errorReason ? null : addError, escalation: escalationReason ? null : addEscalation, errorReason, escalationReason },
   };
 }
 
@@ -423,6 +608,25 @@ export function processHasTimer(model) {
       || (kind === 'SubProcess' && bodyHasTimer(node.kind.SubProcess.body));
   });
   return [model, ...(model.additionalProcesses || [])].some(bodyHasTimer);
+}
+
+// The activities a boundary event of `kind` (BoundaryTimer, BoundaryMessage,
+// BoundaryError, BoundaryEscalation) may be attached to in the shown scope. The
+// inspector's list and a drop from the palette share it.
+export function processBoundaryHosts(graph, kind) {
+  const timerOrMessage = ['BoundaryTimer', 'BoundaryMessage'].includes(kind);
+  return graph.nodes.filter((candidate) => (!candidate.repeat
+    || timerOrMessage
+    || (kind === 'BoundaryError' && ['bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(candidate.type))
+    || (kind === 'BoundaryEscalation' && candidate.type === 'bpmn_service_task'))
+    && (['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(candidate.type)
+    || (timerOrMessage
+      && ['bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task', 'bpmn_script_task'].includes(candidate.type)))
+    && (kind !== 'BoundaryError' || candidate.type !== 'bpmn_user_task')
+    && (kind !== 'BoundaryEscalation' || (candidate.type === 'bpmn_service_task' && !!candidate.config.resultExpression))
+    && !(candidate.type === 'bpmn_receive_task' && graph.edges.some((edge) =>
+      edge.to_node === candidate.id && graph.nodes.some((source) =>
+        source.id === edge.from_node && source.type === 'bpmn_event_based_gateway'))));
 }
 
 export function processBoundaryKind(type) {

@@ -27,7 +27,7 @@ const { emptyProcessModel, processToCanvas, canvasToProcess, cloneProcessBody, p
 const { FlowCanvas } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
-const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processNodeWarnings, processServiceKind, processBlockTemplate } = await import('./bpmn.js');
+const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processRowFor, processRoutingTextKeys, processEscalationPathProblem, processExplainError, processMissingSettings, processNodeWarnings, processServiceKind, processBlockTemplate } = await import('./bpmn.js');
 const { openProcessCalendar, openProcessInstance, openProcessInstances, openProcessMessageDetail, openProcessMessageSend, openProcessRun, openProcessSchedule, processEventText, processLifecycleReasonText, processTimerText } = await import('./process-monitor.js');
 const { simulationWindow } = await import('./process-simulation.js');
 const { default: builder } = await import('../flows-builder.js');
@@ -786,27 +786,38 @@ test('call picker binds an exact published version and previews it without repla
     { id: 'Flow_2', sourceId: 'Call_1', targetId: 'End', condition: null },
   ];
   const graph = canvas(model);
+  const ownId = 'cccccccc-0000-4000-8000-000000000001';
   const config = inspector(graph);
   const call = graph.nodes.find((node) => node.id === 'Call_1');
-  config.show(call, graph.templates.get(call.type));
   const before = structuredClone(graph.getData());
   const definitionId = '91764f75-dadb-41aa-a252-a8a911fe7a94';
   const secondDefinitionId = 'f020336c-5ae2-4b7d-b7ef-c71497b192db';
   fixtures({
-    processDefinitionListRequest: { definitions: [{ definitionId, name: 'Published review' },
-      { definitionId: secondDefinitionId, name: 'Second published process' }], hasMore: false },
+    // The picker lists what can be called: a published, unarchived version. A draft is not offered, and the
+    // edited process is just another definition (calling its earlier published version is allowed).
+    processDefinitionListRequest: { definitions: [{ definitionId, name: 'Published review', publishedVersion: 7 },
+      { definitionId: secondDefinitionId, name: 'Second published process', publishedVersion: 3 },
+      { definitionId: 'draft-only', name: 'Never published', publishedVersion: null },
+      { definitionId: 'retired', name: 'Archived one', publishedVersion: 1, archived: true },
+      { definitionId: ownId, name: 'This very process', publishedVersion: 2 }], hasMore: false },
     processVersionListRequest: ({ definitionId: selected }) => ({ versions: [{ definitionId: selected,
       version: selected === definitionId ? 7 : 3 }], hasMore: false }),
     processVersionGetRequest: ({ definitionId: selected, version }) => ({ version: { definitionId: selected,
       version, model: selected === definitionId ? called : second }, startCatalog: [] }),
   });
-  click(config.root.querySelector('[data-load-calls]'));
-  await flush(2);
+  config.show(call, graph.templates.get(call.type));
+  await flush(3);
+  // Nothing waits behind a Load button: the definitions are listed on their own.
+  assert.deepEqual([...config.root.querySelectorAll('[data-process="calledDefinitionChoice"] option')].map((option) => option.value).filter(Boolean),
+    [definitionId, secondDefinitionId, ownId]);
+  assert.equal(config.root.querySelector('[data-load-calls]').hidden, true, 'no more to load');
   change(config.root.querySelector('[data-process="calledDefinitionChoice"]'), definitionId);
   assert.match(config.root.querySelector('[data-process="calledDefinitionChoice"] .tf-select-selected').textContent,
     /Published review/, 'the selected call uses the published name rather than only its UUID');
-  click(config.root.querySelector('[data-load-call-versions]'));
-  await flush(2);
+  await flush(3);
+  assert.deepEqual([...config.root.querySelectorAll('[data-process="calledVersionChoice"] option')].map((option) => option.value).filter(Boolean), ['7'],
+    'the versions of the chosen definition are listed on their own');
+  assert.equal(config.root.querySelector('[data-load-call-versions]').hidden, true);
   change(config.root.querySelector('[data-process="calledVersionChoice"]'), '7');
   await flush(2);
   change(config.root.querySelector('[data-process="calledProcessChoice"]'), 'Called_Process');
@@ -835,9 +846,8 @@ test('call picker binds an exact published version and previews it without repla
   const loader = config.root.querySelector('[data-load-call-versions]');
   assert.equal(loader.hidden, true, 'one exhausted page hides the first target loader');
   change(config.root.querySelector('[data-process="calledDefinitionChoice"]'), secondDefinitionId);
-  assert.equal(loader.hidden, false, 'switching targets permits an exact version load in the same inspector');
-  click(loader);
-  await flush(2);
+  await flush(3);
+  assert.equal(loader.hidden, true, 'switching targets loads the versions of the new one by itself');
   change(config.root.querySelector('[data-process="calledVersionChoice"]'), '3');
   await flush(2);
   change(config.root.querySelector('[data-process="calledProcessChoice"]'), 'Second_Process');
@@ -2012,12 +2022,35 @@ test('result routing: a result source without boundary events falls back to inci
   const graph = routingGraph([taskNode('T', { resultExpression: '{}', verification: { Condition: { expression: 'true' } } }), { id: 'E', type: 'bpmn_end', config: {} }], [edge('T', 'E')]);
   const routing = processResultRouting(graph, 'T');
   assert.deepEqual(outcomes(routing), ['completed=next', 'rejected:VERIFICATION_FAILED=incident', 'error:other=caller', 'needs_human:other=review',
-    'cancelled:SERVICE_ERROR=incident', 'platform=incident', 'timeout:EXTERNAL_OUTCOME_UNCERTAIN=incident']);
+    'cancelled=incident', 'platform=incident', 'timeout:EXTERNAL_OUTCOME_UNCERTAIN=incident']);
   assert.equal(routing.rows[0].gate, 'condition');
-  // Inside a sub-process an unhandled error continues to the enclosing scopes.
+  // Inside a sub-process an unhandled error climbs to the enclosing scopes; with no
+  // handler in any of them it is an incident like a top-level one.
   const nested = processResultRouting(routingGraph(graph.nodes, graph.edges, { path: ['Sub'] }), 'T');
-  assert.equal(nested.rows.find((row) => row.outcome === 'error').route, 'parent');
+  assert.equal(nested.rows.find((row) => row.outcome === 'error').route, 'caller');
   assert.equal(nested.rows.find((row) => row.outcome === 'needs_human').route, 'review');
+});
+
+test('result routing: a nested task names the enclosing handler an error climbs to, innermost scope first', () => {
+  const handler = (id, scope, ref, name) => ({ id, name, kind: { BoundaryError: { attachedToId: scope, errorRef: ref } } });
+  const sub = (id, name, nodes) => ({ id, name, kind: { SubProcess: { body: { nodes } } } });
+  const model = { processId: 'Root', errors: [{ errorId: 'Err_A', name: 'A', errorCode: 'CODE_A' }, { errorId: 'Err_B', name: 'B', errorCode: 'CODE_B' }],
+    nodes: [
+      sub('Outer', 'Handle claim', [sub('Inner', 'Check', []), handler('InnerB', 'Inner', 'Err_B', 'Inner B')]),
+      handler('OuterA', 'Outer', 'Err_A', 'Claim failed'), handler('OuterB', 'Outer', 'Err_B', 'Outer B'), handler('OuterAny', 'Outer', null, 'Outer catch'),
+    ] };
+  const graph = routingGraph([taskNode('T', { resultExpression: '{}' }), { id: 'X', type: 'bpmn_end', config: {} }], [edge('T', 'X')], { model, path: ['Outer', 'Inner'] });
+  const rows = processResultRouting(graph, 'T').rows.filter((row) => row.outcome === 'error');
+  // CODE_B is taken by the inner scope's exact handler, CODE_A by the outer exact one, anything else by the outer catch-all.
+  assert.deepEqual(rows.map((row) => [row.code, row.route, row.parent?.name, row.parent?.scope]),
+    [['CODE_B', 'parent', 'Inner B', 'Check'], ['CODE_A', 'parent', 'Claim failed', 'Handle claim'], [null, 'parent', 'Outer catch', 'Handle claim']]);
+  // A catch-all on the task itself takes everything before any enclosing handler.
+  const own = routingGraph([taskNode('T', { resultExpression: '{}' }), boundaryNode('Own', 'bpmn_boundary_error', 'T', { errorRef: null }, 'Own'),
+    { id: 'X', type: 'bpmn_end', config: {} }], [edge('T', 'X'), edge('Own', 'X')], { model, path: ['Outer', 'Inner'] });
+  assert.deepEqual(processResultRouting(own, 'T').rows.filter((row) => row.outcome === 'error').map((row) => [row.route, row.boundary?.id]), [['boundary', 'Own']]);
+  // A repeated task never climbs, whatever surrounds it.
+  const repeated = routingGraph([{ ...taskNode('T', { resultExpression: '{}' }), repeat: { MultiInstance: {} } }, { id: 'X', type: 'bpmn_end', config: {} }], [edge('T', 'X')], { model, path: ['Outer', 'Inner'] });
+  assert.deepEqual(processResultRouting(repeated, 'T').rows.filter((row) => row.outcome === 'error').map((row) => row.route), ['incident']);
 });
 
 test('result routing: exact codes win over catch-all boundary events and every code gets a row', () => {
@@ -2029,12 +2062,12 @@ test('result routing: exact codes win over catch-all boundary events and every c
     boundaryNode('BB', 'bpmn_boundary_error', 'T', { errorRef: 'Err_B' }),
     boundaryNode('BAll', 'bpmn_boundary_error', 'T', { errorRef: null }, 'Any error'),
     boundaryNode('BE', 'bpmn_boundary_escalation', 'T', { escalationRef: null, cancelActivity: true }),
-    { id: 'X', type: 'bpmn_end', config: {} }, { id: 'Y', type: 'bpmn_end', config: {} },
-  ], [edge('T', 'X'), edge('BA', 'Y'), edge('BB', 'Y'), edge('BAll', 'Y'), edge('BE', 'Y')], { model });
+    { id: 'X', type: 'bpmn_end', config: {} }, { id: 'Y', type: 'bpmn_end', config: {} }, { id: 'W', type: 'bpmn_user_task', config: {} },
+  ], [edge('T', 'X'), edge('BA', 'Y'), edge('BB', 'Y'), edge('BAll', 'Y'), edge('BE', 'W'), edge('W', 'Y')], { model });
   const routing = processResultRouting(graph, 'T');
   assert.deepEqual(outcomes(routing), ['completed=next', 'rejected:HUMAN_REJECTED=incident',
     'error:CODE_A=boundary', 'error:CODE_B=boundary', 'error:other=boundary', 'needs_human:other=boundary',
-    'cancelled:SERVICE_ERROR=incident', 'platform=incident', 'timeout:EXTERNAL_OUTCOME_UNCERTAIN=incident']);
+    'cancelled=incident', 'platform=incident', 'timeout:EXTERNAL_OUTCOME_UNCERTAIN=incident']);
   assert.equal(routing.rows.find((row) => row.code === 'CODE_A').boundary.id, 'BA');
   assert.equal(routing.rows.find((row) => row.outcome === 'error' && row.other).boundary.id, 'BAll');
   assert.deepEqual(routing.warnings, []);
@@ -2075,14 +2108,15 @@ test('result routing warns about handlers that cannot work', () => {
   // One message per kind of problem, however many handlers it concerns.
   assert.deepEqual(keys.sort(), ['boundary_no_flow:First|Second|Gone|Esc', 'duplicate_handler:Second', 'error_boundary_without_result:',
     'escalation_boundary_without_result:', 'no_outgoing:', 'undeclared_reference:Gone']);
-  // Without a result source an escalation cannot be added; an error handler still can.
+  // Without a result source neither handler can be added, and both buttons say why.
   const routing = processResultRouting(graph, 'T');
-  assert.equal(routing.add.escalation, null);
+  assert.deepEqual([routing.add.error, routing.add.errorReason, routing.add.escalation, routing.add.escalationReason], [null, 'no_result', null, 'no_result']);
 });
 
 // The routing table and the engine read the same cases: tests/fixtures/process_result_routing.json
 // is also driven through the real engine by processes::result_routing_tests.
-const routingCases = JSON.parse(readFileSync(new URL('../../../../tests/fixtures/process_result_routing.json', import.meta.url), 'utf8')).cases;
+const routingFixture = JSON.parse(readFileSync(new URL('../../../../tests/fixtures/process_result_routing.json', import.meta.url), 'utf8'));
+const routingCases = routingFixture.cases;
 
 function graphOfCase(entry) {
   const { task } = entry;
@@ -2105,40 +2139,41 @@ function graphOfCase(entry) {
     attach(handler.id, 'bpmn_boundary_escalation', { escalationRef: handler.code === null ? null : `Decl_${handler.id}`, cancelActivity: handler.interrupting });
   }
   for (const timer of entry.timers || []) attach(timer.id, 'bpmn_boundary_timer', { cancelActivity: timer.interrupting, timer: { Duration: { seconds: timer.seconds } } });
+  // The enclosing sub-process of a nested case, with its catch-all error handler when the case says so.
+  if (entry.nested) {
+    model.processId = 'Root';
+    model.nodes = [{ id: 'Scope', name: 'Scope', kind: { SubProcess: { body: { nodes: [] } } } },
+      ...(entry.scopeCatch ? [{ id: 'ScopeCatch', name: 'ScopeCatch', kind: { BoundaryError: { attachedToId: 'Scope', errorRef: null } } }] : [])];
+  }
   return routingGraph(nodes, edges, { model, path: entry.nested ? ['Scope'] : [] });
-}
-
-// The row the engine would take for a stimulus: the exact code first, then the catch-all.
-function rowForStimulus(routing, stimulus) {
-  const { type, code } = stimulus;
-  const byOutcome = (outcome) => routing.rows.filter((row) => row.outcome === outcome);
-  if (type === 'completed') return byOutcome('completed')[0];
-  if (type === 'rejected') return byOutcome('rejected')[0];
-  if (type === 'tool_error' || type === 'bad_result_rule') return byOutcome('platform')[0];
-  if (type === 'denied') return byOutcome('denied')[0];
-  if (type === 'timeout') return byOutcome('timeout')[0];
-  if (type === 'cancelled') return byOutcome('cancelled')[0];
-  const rows = byOutcome(type);
-  return rows.find((row) => row.route !== 'unavailable' && !row.other && row.code === code) ?? rows.find((row) => row.other || row.route === 'unavailable');
 }
 
 for (const entry of routingCases) {
   test(`result routing fixture: ${entry.name}`, () => {
     const routing = processResultRouting(graphOfCase(entry), 'T');
-    const row = rowForStimulus(routing, entry.stimulus);
+    const stimulus = routingFixture.stimuli[entry.stimulus.type];
+    const row = processRowFor(routing, stimulus.row, entry.stimulus.code ?? null);
     assert.ok(row, 'the table has a row for this outcome');
     assert.equal(row.route, entry.expect.route);
     for (const key of ['code', 'reason']) if (entry.expect[key] !== undefined) assert.equal(row[key], entry.expect[key]);
     if (entry.expect.boundary) assert.equal(row.boundary.id, entry.expect.boundary);
+    // The texts the row shows are decided by the product code from the row alone.
+    assert.deepEqual(processRoutingTextKeys(row, routing.verification), entry.expect.text);
     if (entry.expect.warning) assert.ok(routing.warnings.some((warning) => warning.key === entry.expect.warning));
     else assert.equal(routing.warnings.some((warning) => warning.key.startsWith('timer_')), false);
   });
 }
 
-test('result routing fixture covers every route the table can show', () => {
+test('result routing fixture covers every route the table can show and pairs each with an engine fact that can honour it', () => {
   const routes = new Set(routingCases.map((entry) => entry.expect.route));
   assert.deepEqual([...routes].sort(), ['boundary', 'boundary_keep', 'caller', 'incident', 'next', 'parent', 'review', 'unavailable']);
+  assert.deepEqual(Object.keys(routingFixture.routeFacts).sort(), [...routes].sort());
   assert.ok(routingCases.every((entry) => entry.engine !== undefined && (entry.engine !== null || entry.engineReason)), 'a row without an engine probe says why');
+  for (const entry of routingCases.filter((candidate) => candidate.engine)) {
+    assert.ok(routingFixture.routeFacts[entry.expect.route].includes(entry.engine.fact),
+      `${entry.name}: the table says ${entry.expect.route}, the engine fact ${entry.engine.fact} cannot honour it`);
+  }
+  for (const [type, stimulus] of Object.entries(routingFixture.stimuli)) assert.ok(stimulus.row, `stimulus ${type} names its table row`);
 });
 
 test('result routing texts name both timeout codes, the caller catch, the kept task and working time', async () => {
@@ -2250,6 +2285,48 @@ test('boundary events added from the buttons sit on the bottom edge, spread left
     assert.equal(overlap(node, badge), false, 'clear of the kind badge');
   }
   assert.deepEqual(added.map((node) => node.label), ['Error: any', 'Error: CODE_A', 'Error: CODE_B', 'Error: CODE_C', 'Error: CODE_D', 'Error: CODE_E']);
+  // The border is full: a seventh event is refused instead of piled on the icon, the ports or another event.
+  assert.equal(graph.boundaryRoom(task.id), 0);
+  const count = graph.nodes.length;
+  assert.equal(graph.addBoundaryNode(task.id, 'bpmn_boundary_escalation', null), null);
+  assert.equal(graph.nodes.length, count, 'nothing was added');
+  assert.equal(processResultRouting(graph, task.id).add.errorReason === 'no_room' || processResultRouting(graph, task.id).add.errorReason === 'all_taken', true);
+  graph.destroy();
+});
+
+test('a task with a full border says so on both add buttons, and room returns when a handler goes', () => {
+  const model = emptyProcessModel();
+  model.errors = ['A', 'B', 'C', 'D', 'E', 'F', 'G'].map((code) => ({ errorId: `Err_${code}`, name: code, errorCode: `CODE_${code}` }));
+  model.escalations = [{ escalationId: 'Esc_R', name: 'R', escalationCode: 'REVIEW' }];
+  const graph = canvas(model); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  const task = graph.nodes.at(-1);
+  graph.updateNodeConfig(task.id, { resultExpression: 'outputs.result' });
+  const added = ['Err_A', 'Err_B', 'Err_C', 'Err_D', 'Err_E', 'Err_F'].map((ref) => graph.addBoundaryNode(task.id, 'bpmn_boundary_error', ref));
+  const routing = processResultRouting(graph, task.id);
+  assert.deepEqual([routing.add.error, routing.add.errorReason, routing.add.escalation, routing.add.escalationReason], [null, 'no_room', null, 'no_room']);
+  graph.removeNodes([added[2].id]);
+  const after = processResultRouting(graph, task.id);
+  assert.deepEqual([after.add.errorReason, after.add.escalationReason], [null, null]);
+  assert.ok(graph.addBoundaryNode(task.id, 'bpmn_boundary_error', 'Err_G'), 'the freed place is taken');
+  graph.destroy();
+});
+
+test('a boundary event dropped from the palette attaches to the task it lands on, or says it did not', () => {
+  const graph = canvas(); const template = (type) => processTemplates().find((row) => row.node_type === type);
+  graph.addNodeFromTemplate(template('bpmn_service_task'), 300, 300);
+  const task = graph.nodes.at(-1);
+  const [x, y] = [task.x + task.width / 2, task.y + task.height + 10];
+  // Dropped on the bottom edge: attached, on a slot of the border near the drop.
+  const timer = graph.addNodeFromTemplate(template('bpmn_boundary_timer'), x, y);
+  assert.equal(timer.config.attachedToId, task.id);
+  assert.equal(timer.y + timer.height / 2, task.y + task.height, 'it sits on the border');
+  assert.deepEqual(processNodeWarnings(timer), []);
+  assert.deepEqual(graph.validate(), [], 'a saved process keeps it');
+  // Dropped in the open: not attached, flagged, and the save names it.
+  const loose = graph.addNodeFromTemplate(template('bpmn_boundary_timer'), 900, 900);
+  assert.ok(!loose.config.attachedToId);
+  assert.deepEqual(processNodeWarnings(loose), ['boundary_unattached']);
+  assert.match(graph.validate().join(' '), new RegExp(`“${loose.label || template('bpmn_boundary_timer').label}”|${loose.id}`));
   graph.destroy();
 });
 
@@ -2466,13 +2543,14 @@ test('result tab shows the derived routing and its buttons add boundary events a
   const rows = () => config.root.querySelector('tf-table[data-routing]').rows;
   assert.equal(rows().length, 7);
   assert.match(rows()[2].route, /result rule/);
-  // The escalation button needs a result rule, and says so; the error button does not.
-  assert.ok(config.root.querySelector('[data-routing-add="escalation"]').hasAttribute('disabled'));
-  assert.match(config.root.querySelector('[data-routing-add="escalation"]').getAttribute('title'), /result rule/);
+  // Both buttons need a result rule, and say so.
+  for (const kind of ['error', 'escalation']) {
+    assert.ok(config.root.querySelector(`[data-routing-add="${kind}"]`).hasAttribute('disabled'), `${kind} is disabled without a result rule`);
+    assert.match(config.root.querySelector(`[data-routing-add="${kind}"]`).getAttribute('title'), /result rule/);
+  }
   assert.match(config.root.querySelector('[data-routing-add-hint]').textContent, /result rule/);
-  assert.equal(config.root.querySelector('[data-routing-add="error"]').hasAttribute('disabled'), false);
   change(config.root.querySelector('[data-process="resultExpression"]'), '{}');
-  assert.equal(config.root.querySelector('[data-routing-add="escalation"]').hasAttribute('disabled'), false);
+  for (const kind of ['error', 'escalation']) assert.equal(config.root.querySelector(`[data-routing-add="${kind}"]`).hasAttribute('disabled'), false);
   assert.equal(rows().length, 7);
   assert.doesNotMatch(rows()[2].route, /result rule/, 'the table follows the result rule');
   assert.match(rows()[3].route, /verification task/);
@@ -2516,21 +2594,26 @@ test('canvas marks the kind of a Service task and an LLM block without a model',
   assert.equal(element(plain).querySelector('.fb-process-kind'), null);
   assert.deepEqual([flow, block, pii, tool].map((node) => element(node).querySelector('.fb-process-kind')?.dataset.kind), ['flow', 'block', 'block', 'tool']);
   assert.equal(element(flow).querySelector('.fb-process-kind').getAttribute('aria-label'), I18n.t('bpmn.kind_flow'));
-  assert.equal(element(block).querySelector('.fb-process-warn')?.getAttribute('data-warning'), 'empty_model');
-  assert.equal(element(block).querySelector('.fb-process-warn').getAttribute('aria-label'), I18n.t('bpmn.warning_empty_model'));
+  assert.equal(element(block).querySelector('.fb-process-warn')?.getAttribute('data-warning'), 'empty_setting');
+  assert.equal(element(block).querySelector('.fb-process-warn').getAttribute('aria-label'), I18n.t('bpmn.warning_empty_setting', { names: 'model' }));
   for (const node of [plain, flow, pii, tool]) assert.equal(element(node).querySelector('.fb-process-warn'), null);
   const config = inspector(graph); config.show(block, graph.templates.get(block.type));
   await flush(2);
-  const alert = config.root.querySelector('[data-service-warning="empty_model"]');
+  const alert = config.root.querySelector('[data-service-warning="empty_setting"]');
   assert.equal(alert.hidden, false);
+  assert.match(alert.getAttribute('message'), /model/);
   change(config.root.querySelector('[data-process="blockConfig"]'), '{"model":"m"}');
   assert.equal(alert.hidden, true);
   assert.equal(element(block).querySelector('.fb-process-warn'), null, 'the node follows the setting');
   change(config.root.querySelector('[data-process="blockConfig"]'), '{"model":"  "}');
   assert.equal(alert.hidden, false);
-  assert.deepEqual(processNodeWarnings(block, serviceBlocks), ['empty_model']);
-  // Which blocks need a model is the server's word, not a list in the client.
+  assert.deepEqual(processNodeWarnings(block, serviceBlocks), ['empty_setting']);
+  // Which blocks need which settings is the server's word, not a list in the client.
   assert.deepEqual(processNodeWarnings(block, [{ nodeType: 'llm', requiredSettings: [] }]), []);
+  const other = [{ nodeType: 'llm', requiredSettings: ['model', 'temperature_mode'] }];
+  block.config = { ...block.config, implementation: { Block: { nodeType: 'llm', config: { model: 'm', temperature_mode: '' } } } };
+  assert.deepEqual(processMissingSettings(block, other), ['temperature_mode'], 'whatever key the server lists is checked, not only model');
+  assert.match(I18n.t('bpmn.warning_empty_setting', { names: processMissingSettings(block, other).join(', ') }), /temperature_mode/);
   assert.deepEqual(processNodeWarnings(block), []);
   assert.equal(processServiceKind(tool.config), 'tool');
   graph.destroy(); config.destroy();
@@ -2985,7 +3068,7 @@ test('repeated manual and receive waits reject an unattached boundary draft befo
       mode: 'Sequential', input: { Cardinality: { count: 2 } }, outputCollectionVariable: 'results' } };
     model.nodes.find((node) => node.id === 'Timer_A').kind.BoundaryTimer.attachedToId = 'MissingActivity';
     const state = await mount(definition('repeat-boundary-draft', { model }));
-    assert.ok(state.canvas.validate().includes(I18n.t('bpmn.boundary_required')));
+    assert.ok(state.canvas.validate().includes(I18n.t('bpmn.boundary_required_named', { node: 'Deadline' })), 'the refusal names the boundary event');
     assert.equal(await builder._save(), false);
     assert.equal(calls.some((row) => row.kind === 'processDefinitionSaveRequest'), false);
   }
@@ -4752,9 +4835,10 @@ test('BPMN full task and sibling boundary names occupy separate measured regions
   }
   assert.deepEqual(graph.getData(), original);
   graph.updateNodeLabel('Review', 'Review contract');
+  // A name that fits stays in the box even with events attached: they sit on the border.
   const shortTask = graph.nodesLayer.querySelector('[data-node-id="Review"]');
-  assert.equal(shortTask.classList.contains('fb-external-label'), true);
-  assert.equal(shortTask.querySelector('.fb-process-label').hidden, false);
+  assert.equal(shortTask.classList.contains('fb-external-label'), false);
+  assert.equal(shortTask.querySelector('.fb-process-label').hidden, true);
   graph.removeNodes(['Timer_A', 'Timer_B']);
   const unencumberedTask = graph.nodesLayer.querySelector('[data-node-id="Review"]');
   assert.equal(unencumberedTask.classList.contains('fb-external-label'), false);
@@ -4763,7 +4847,7 @@ test('BPMN full task and sibling boundary names occupy separate measured regions
   graph.destroy();
 });
 
-test('short Manual and Receive task labels clear attached boundary symbols without changing DI', () => {
+test('short Manual and Receive task labels stay inside the box while boundary events sit on its border, without changing DI', () => {
   for (const kind of ['ManualTask', 'ReceiveTask']) {
     const model = emptyProcessModel();
     model.targetNamespace = 'urn:example:boundary-labels';
@@ -4789,20 +4873,13 @@ test('short Manual and Receive task labels clear attached boundary symbols witho
     const title = element.querySelector('.fb-process-symbol > span');
     Object.defineProperties(title, { clientHeight: { value: 60 }, scrollHeight: { value: 36 },
       clientWidth: { value: 190 }, scrollWidth: { value: 120 } });
-    const label = element.querySelector('.fb-process-label');
-    Object.defineProperties(label, { offsetWidth: { value: 180 }, offsetHeight: { value: 38 } });
     graph._layoutProcessLabels();
-    assert.equal(element.classList.contains('fb-external-label'), true, kind);
-    assert.equal(label.hidden, false, kind);
-    assert.equal(label.textContent, `Short ${kind} label`);
-    const work = graph.nodes.find((node) => node.id === 'Work');
-    const boundary = graph.nodes.find((node) => node.id === 'Attached');
-    const left = work.x + Number.parseFloat(label.style.left);
-    const top = work.y + Number.parseFloat(label.style.top);
-    assert.ok(left + label.offsetWidth <= boundary.x || left >= boundary.x + boundary.width
-      || top + label.offsetHeight <= boundary.y || top >= boundary.y + boundary.height, kind);
+    assert.equal(element.classList.contains('fb-external-label'), false, `${kind}: the name stays on the task`);
+    assert.equal(element.querySelector('.fb-process-label').hidden, true, kind);
+    // The attached event itself has no room for a name inside, so its own label is outside.
+    assert.equal(graph.nodesLayer.querySelector('[data-node-id="Attached"] .fb-process-label').hidden, false, kind);
     graph.fitToContent();
-    assert.equal(element.classList.contains('fb-external-label'), true, kind);
+    assert.equal(element.classList.contains('fb-external-label'), false, kind);
     assert.deepEqual(graph.getData(), before);
     graph.destroy();
   }
@@ -5867,4 +5944,205 @@ test('keys typed in an unlisted component with an inner input are left to that i
   });
   host.remove();
   assert.deepEqual(calls, [], 'Delete typed into the inner input does not delete canvas nodes');
+});
+
+// ---------------------------------------------------------------------------
+// Round 2 of the Service task inspector: what the live critic and the code
+// review found, each pinned where it was seen.
+// ---------------------------------------------------------------------------
+
+const graphWithEscalation = (...path) => {
+  const nodes = [taskNode('T', { resultExpression: '{}' }), boundaryNode('H', 'bpmn_boundary_escalation', 'T', { escalationRef: null }, 'Handle review'),
+    ...path.map(([id, type]) => ({ id, type, label: id, config: {} }))];
+  const edges = [edge('T', path.at(-1)[0]), edge('H', path[0][0]), ...path.slice(1).map(([id], index) => edge(path[index][0], id))];
+  return routingGraph(nodes, edges);
+};
+
+test('an escalation handler path is judged like the server judges it before anything waits for a person', () => {
+  const reason = (...path) => processEscalationPathProblem(graphWithEscalation(...path), 'H')?.reason ?? null;
+  assert.equal(reason(['E', 'bpmn_end']), 'terminal_before_wait');
+  assert.equal(reason(['E', 'bpmn_terminate_end']), 'terminal_before_wait');
+  assert.equal(reason(['S', 'bpmn_sub_process'], ['E', 'bpmn_end']), 'scope_entry');
+  assert.equal(reason(['C', 'bpmn_call_activity'], ['E', 'bpmn_end']), 'call_entry');
+  // A wait ends the search; a script, a send or a throw is passed through.
+  assert.equal(reason(['U', 'bpmn_user_task'], ['E', 'bpmn_end']), null);
+  assert.equal(reason(['R', 'bpmn_script_task'], ['U', 'bpmn_user_task'], ['E', 'bpmn_end']), null);
+  assert.equal(reason(['R', 'bpmn_script_task'], ['E', 'bpmn_end']), 'terminal_before_wait');
+  assert.equal(reason(['G', 'bpmn_parallel_gateway'], ['E', 'bpmn_end']), null, 'gateways with joins are left to the server');
+  // Every branch of an exclusive gateway counts.
+  const branches = routingGraph([taskNode('T', { resultExpression: '{}' }), boundaryNode('H', 'bpmn_boundary_escalation', 'T', { escalationRef: null }),
+    { id: 'G', type: 'bpmn_exclusive_gateway', config: {} }, { id: 'U', type: 'bpmn_user_task', config: {} }, { id: 'E', type: 'bpmn_end', config: {} }],
+  [edge('H', 'G'), edge('G', 'U'), edge('G', 'E')]);
+  assert.equal(processEscalationPathProblem(branches, 'H').reason, 'terminal_before_wait');
+  // The table names the handler, the save is refused by its name, and a path with no outgoing flow is only "no flow yet".
+  const routing = processResultRouting(graphWithEscalation(['E', 'bpmn_end']), 'T');
+  assert.deepEqual(routing.warnings.filter((warning) => warning.key.startsWith('escalation_path')).map((warning) => [warning.key, warning.names]),
+    [['escalation_path_terminal_before_wait', ['Handle review']]]);
+  assert.equal(processEscalationPathProblem(routingGraph([taskNode('T'), boundaryNode('H', 'bpmn_boundary_escalation', 'T', { escalationRef: null })], []), 'H'), null);
+});
+
+test('an escalation handler that runs into an End blocks the save with its name', async () => {
+  const model = emptyProcessModel();
+  model.escalations = [{ escalationId: 'Esc_1', name: 'Review', escalationCode: 'REVIEW' }];
+  model.nodes.splice(1, 0,
+    { id: 'Work', name: 'Check claim', kind: { ServiceTask: { flowId: 'flow-one', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60, resultExpression: '{}' } } },
+    { id: 'Esc', name: 'Needs review', kind: { BoundaryEscalation: { attachedToId: 'Work', escalationRef: 'Esc_1', cancelActivity: true, outputMapping: {} } } });
+  model.sequenceFlows = [{ id: 'F1', sourceId: 'Start', targetId: 'Work', condition: null }, { id: 'F2', sourceId: 'Work', targetId: 'End', condition: null },
+    { id: 'F3', sourceId: 'Esc', targetId: 'End', condition: null }];
+  const state = await mount(definition('escalation-end', { model }));
+  assert.equal(await builder._save({ silent: true }), false);
+  const banner = state.root.querySelector('[data-role="error"]');
+  assert.equal(banner.hidden, false, 'the problem is on the screen, not only in a tooltip');
+  assert.match(banner.getAttribute('message'), /Needs review/);
+  assert.match(state.root.querySelector('[data-role="autosave"]').getAttribute('title'), /Needs review/);
+  assert.equal(calls.some((call) => call.kind === 'processDefinitionSaveRequest'), false);
+});
+
+test('server and codec messages name elements instead of citing their ids', () => {
+  const model = emptyProcessModel();
+  model.nodes.splice(1, 0, { id: 'n_k1_ab12', name: 'Handle claim', kind: { UserTask: { assigneeUserId: null, outputMapping: {} } } },
+    { id: 'n_k1_cd34', name: '', kind: { BoundaryEscalation: { attachedToId: 'n_k1_ab12', escalationRef: null, cancelActivity: true, outputMapping: {} } } });
+  model.sequenceFlows = [{ id: 'e_k1_ef56', sourceId: 'Start', targetId: 'n_k1_ab12', condition: null }];
+  assert.match(processExplainError('escalation boundary n_k1_cd34 has unsupported immediate path terminal_before_wait at e_k1_ef56', model), /^Escalation handler Boundary escalation runs into an End/,
+    'the refusal the inspector already explains is explained the same way, with the handler named by its kind when it has no name');
+  const flow = processExplainError('flow e_k1_ef56 leaves n_k1_ab12', model);
+  assert.equal(flow, 'flow the flow “Start” → “Handle claim” leaves “Handle claim”');
+  assert.equal(processExplainError('call activity requires one exact local or published target', model), 'call activity requires one exact local or published target');
+  assert.doesNotMatch(processExplainError('node n_k1_ab12 and n_unknown_xx', model), /n_k1_ab12/);
+  assert.match(processExplainError('node n_unknown_xx', model), /n_unknown_xx/, 'an id the model does not know is left as it is');
+});
+
+test('a server refusal is shown by name in the banner and the status, and a silent autosave does not toast', async () => {
+  const current = definition('server-refusal');
+  const state = await mount(current, { processDefinitionSaveRequest: () => { throw new Error('escalation boundary Start has unsupported immediate path no_durable_wait at End'); } });
+  // The toast container is replaced with the page by every mount, so the toasts made are counted as they are created.
+  const created = []; const createElement = document.createElement.bind(document);
+  document.createElement = (...args) => { const node = createElement(...args); created.push(node); return node; };
+  const toasts = () => created.filter((node) => node.className === 'toast toast-error').length;
+  const before = toasts();
+  assert.equal(await builder._save({ silent: true }), false);
+  assert.equal(toasts(), before, 'ten seconds later the same refusal would toast again; the banner carries it instead');
+  const banner = state.root.querySelector('[data-role="error"]');
+  assert.equal(banner.hidden, false);
+  assert.match(banner.getAttribute('message'), /^Save error: Escalation handler Start has a path/, 'the element is named in visible text');
+  assert.match(state.root.querySelector('[data-role="autosave"]').getAttribute('title'), /Escalation handler/);
+  // An asked-for save does toast, and a save that works clears the banner.
+  assert.equal(await builder._save(), false);
+  assert.ok(toasts() > before, 'a save the author asked for says so');
+  delete document.createElement;
+  fixtures({ processDefinitionSaveRequest: (payload) => ({ definition: { ...current, model: payload.model, draftRevision: 5 } }) });
+  assert.equal(await builder._save({ silent: true }), true);
+  assert.equal(banner.hidden, true);
+});
+
+test('a Call activity without an exact target blocks the save naming it, and the picker explains an empty list', async () => {
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_call_activity'), 200, 200);
+  const node = graph.nodes.at(-1); graph.updateNodeLabel(node.id, 'Ask the bank');
+  assert.deepEqual(graph.validate(), [I18n.t('bpmn.call_target_required', { node: 'Ask the bank' })]);
+  graph.updateNodeConfig(node.id, { calledDefinitionId: 'd1', calledVersion: 2, calledElement: { namespaceUri: 'urn:x', processId: '' } });
+  assert.equal(graph.validate().length, 1, 'a version without the process is not exact either');
+  graph.updateNodeConfig(node.id, { calledElement: { namespaceUri: 'urn:x', processId: 'P' } });
+  assert.deepEqual(graph.validate(), []);
+  graph.updateNodeConfig(node.id, { localBody: { namespaceUri: 'urn:x', processId: '' } });
+  assert.equal(graph.validate().length, 1, 'a local call needs its body');
+  graph.destroy();
+
+  const empty = canvas(); empty.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_call_activity'), 200, 200);
+  const call = empty.nodes.at(-1);
+  fixtures({ processDefinitionListRequest: { definitions: [{ definitionId: 'draft', name: 'Draft only', publishedVersion: null }], hasMore: false } });
+  const config = inspector(empty); config.show(call, empty.templates.get(call.type));
+  await flush(3);
+  assert.equal(config.root.querySelector('[data-call-capability]').textContent, I18n.t('bpmn.call_no_published'));
+  fixtures({ processDefinitionListRequest: { definitions: [{ definitionId: 'd1', name: 'Callee', publishedVersion: 1 }], hasMore: false },
+    processVersionListRequest: { versions: [], hasMore: false } });
+  config.show(call, empty.templates.get(call.type)); await flush(3);
+  change(config.root.querySelector('[data-process="calledDefinitionChoice"]'), 'd1'); await flush(3);
+  assert.equal(config.root.querySelector('[data-call-capability]').textContent, I18n.t('bpmn.call_no_versions'));
+  empty.destroy(); config.destroy();
+});
+
+test('an unattached boundary event is flagged on the canvas, and the save names it', () => {
+  const graph = canvas();
+  const timer = processTemplates().find((row) => row.node_type === 'bpmn_boundary_timer');
+  graph.addNodeFromTemplate(timer, 400, 400);
+  const loose = graph.nodes.at(-1);
+  assert.deepEqual(processNodeWarnings(loose), ['boundary_unattached']);
+  assert.ok(graph.nodesLayer.querySelector(`[data-node-id="${loose.id}"] .fb-process-warn[data-warning="boundary_unattached"]`));
+  assert.match(graph.validate().join('\n'), new RegExp(`“${loose.label || graph._nodeName(loose)}” is not attached`));
+  for (const type of ['bpmn_boundary_error', 'bpmn_boundary_escalation']) {
+    const bare = { id: `bare_${type}`, type, label: 'Bare handler', x: 100, y: 100, width: 56, height: 56, config: { attachedToId: '', ...(type === 'bpmn_boundary_error' ? { errorRef: null } : { escalationRef: null }) } };
+    graph.nodes.push(bare);
+    assert.ok(graph.validate().some((message) => /“Bare handler” is not attached/.test(message)), `${type} is refused by name`);
+    graph.nodes.pop();
+  }
+  graph.destroy();
+});
+
+test('a new boundary event does not land on a handler of the task next to it', () => {
+  const graph = canvas(); const template = (type) => processTemplates().find((row) => row.node_type === type);
+  graph.addNodeFromTemplate(template('bpmn_service_task'), 300, 300);
+  graph.addNodeFromTemplate(template('bpmn_service_task'), 300, 700);
+  const [above, below] = graph.nodes.filter((node) => node.type === 'bpmn_service_task');
+  // `below` sits 32 px under `above`: clear of the task itself, but a handler on its top edge reaches into
+  // the handlers on the bottom edge of `above`.
+  below.x = above.x; below.y = above.y + above.height + 32;
+  for (const task of [above, below]) graph.updateNodeConfig(task.id, { resultExpression: '{}' });
+  const neighbour = graph.addBoundaryNode(above.id, 'bpmn_boundary_error', null);
+  for (let count = 0; count < 4; count += 1) graph.addBoundaryNode(below.id, 'bpmn_boundary_error', null);
+  // The bottom edge of `below` is full, so the fifth goes to its top edge: the first place there is under
+  // the neighbour's handler, the second is clear.
+  const fifth = graph.addBoundaryNode(below.id, 'bpmn_boundary_error', null);
+  const crosses = (a, b) => a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+  assert.equal(fifth.y + fifth.height / 2, below.y, 'on the top edge');
+  assert.equal(crosses(fifth, neighbour), false, 'it does not sit on the neighbour\'s handler');
+  graph.destroy();
+});
+
+test('boundary slots follow the sizes the stylesheet gives the task decorations', () => {
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  const task = graph.nodes.at(-1);
+  const size = { width: 56, height: 56 };
+  const before = graph._boundarySlots(task, size).filter(([, y]) => y === task.y).length;
+  // A wider reserved corner (bigger badges) leaves fewer places along the top edge.
+  const element = graph.nodesLayer.querySelector(`[data-node-id="${task.id}"]`);
+  element.style.setProperty('--fb-deco-size', '40px');
+  const original = globalThis.getComputedStyle;
+  globalThis.getComputedStyle = (target) => (target === element ? { getPropertyValue: (name) => (name === '--fb-deco-size' ? '40px' : '') } : original(target));
+  try {
+    const after = graph._boundarySlots(task, size).filter(([, y]) => y === task.y).length;
+    assert.ok(after < before, `${after} places with 40px badges against ${before} with the default ones`);
+  } finally { globalThis.getComputedStyle = original; }
+  graph.destroy();
+});
+
+test('the settings row follows the window until the author uses its toggle, a phone opens the inspector on selection and the root crumb says process', async () => {
+  const resize = (width, height) => {
+    Object.defineProperty(window, 'innerWidth', { value: width, configurable: true });
+    Object.defineProperty(window, 'innerHeight', { value: height, configurable: true });
+    window.dispatchEvent(new window.Event('resize'));
+  };
+  resize(1400, 1000);
+  const state = await mount(definition('responsive-settings'));
+  const notice = state.root.querySelector('.fb-process-notice');
+  assert.equal(notice.classList.contains('fb-collapsed'), false);
+  resize(1400, 700);
+  assert.equal(notice.classList.contains('fb-collapsed'), true, 'a window made shorter folds the row');
+  resize(390, 1000);
+  assert.equal(notice.classList.contains('fb-collapsed'), true, 'a phone never opens it by height alone');
+  resize(1400, 1000);
+  assert.equal(notice.classList.contains('fb-collapsed'), false);
+  click(state.root.querySelector('[data-role="notice-toggle"]'));
+  resize(1400, 700);
+  assert.equal(notice.classList.contains('fb-collapsed'), true, 'the toggle just folded it');
+  click(state.root.querySelector('[data-role="notice-toggle"]'));
+  resize(1400, 650);
+  assert.equal(notice.classList.contains('fb-collapsed'), false, 'what the author chose is kept');
+  assert.equal(state.root.querySelector('.fb-breadcrumb .fb-crumb').textContent, I18n.t('bpmn.crumb_root'));
+  assert.notEqual(I18n.t('bpmn.crumb_root'), I18n.t('flows_builder.crumb_root'));
+  // The secondary toolbar buttons keep their name as a tooltip when the stylesheet shrinks them to an icon.
+  const compact = [...state.root.querySelectorAll('.fb-topbar tf-button[data-compact]')];
+  assert.ok(compact.length >= 8);
+  for (const button of compact) assert.ok(button.getAttribute('title'), `${button.dataset.role} keeps a tooltip`);
+  Object.defineProperty(window, 'innerWidth', { value: 1024, configurable: true });
+  Object.defineProperty(window, 'innerHeight', { value: 768, configurable: true });
 });

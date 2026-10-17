@@ -7,7 +7,11 @@
 //              table is derived again from the stored model. A second test
 //              measures the layout at laptop, small-laptop and phone sizes: every
 //              tab reachable, a usable inspector height, handlers on the task's
-//              bottom edge clear of its icon.
+//              bottom edge clear of its icon. Further tests cover a task with
+//              more handlers than its border holds, an escalation handler that
+//              runs into an End, a timer dropped on a task, the one-line bottom
+//              bar inside a sub-process, a Call activity picker that fills
+//              itself, and the palette drawer's keyboard and click behaviour.
 // =============================================================================
 
 const path = require('path');
@@ -58,19 +62,19 @@ test.beforeAll(async ({ browser }, testInfo) => {
 
 // A process whose model declares the error and escalation codes the layout test
 // adds one handler per code for, besides the catch-all.
-function createDefinition(page, name) {
-  return page.evaluate(async (processName) => {
+function createDefinition(page, name, { errors = ['INVALID_INPUT', 'NOT_FOUND', 'DENIED'], escalations = ['REVIEW'] } = {}) {
+  return page.evaluate(async ({ processName, errorCodes, escalationCodes }) => {
     const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
     const { emptyProcessModel } = await import('/js/modules/flows-builder/bpmn.js');
     const model = emptyProcessModel();
-    model.errors = ['INVALID_INPUT', 'NOT_FOUND', 'DENIED'].map((code) => ({ errorId: `Err_${code}`, name: code, errorCode: code }));
-    model.escalations = [{ escalationId: 'Esc_REVIEW', name: 'REVIEW', escalationCode: 'REVIEW' }];
+    model.errors = errorCodes.map((code) => ({ errorId: `Err_${code}`, name: code, errorCode: code }));
+    model.escalations = escalationCodes.map((code) => ({ escalationId: `Esc_${code}`, name: code, escalationCode: code }));
     const saved = await ApiBinary.one('processDefinitionSaveRequest', {
       commandId: crypto.randomUUID(), definitionId: null, expectedRevision: 0,
       name: processName, description: '', model,
     });
     return saved.definition.definitionId;
-  }, name);
+  }, { processName: name, errorCodes: errors, escalationCodes: escalations });
 }
 
 test.afterAll(async () => {
@@ -217,7 +221,8 @@ for (const [width, height] of [[1280, 720], [1024, 700], [390, 844]]) {
 
     // The inspector body keeps a height a form can be used at; the page never scrolls sideways.
     if (!phone) {
-      expect((await rect(page.locator('.fb-config-body'))).height).toBeGreaterThanOrEqual(300);
+      // The scrolling part of the inspector, once its header and footer are paid for.
+      expect((await rect(page.locator('.fb-config-body'))).height).toBeGreaterThanOrEqual(400);
       expect((await rect(page.locator('.fb-canvas'))).width).toBeGreaterThanOrEqual(400);
     }
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
@@ -250,3 +255,309 @@ for (const [width, height] of [[1280, 720], [1024, 700], [390, 844]]) {
     await expect(page.locator('[data-routing-add-hint]')).toBeVisible();
   });
 }
+
+// Palette entries that are not Service tasks (a sub-process, a Call activity, a
+// boundary timer) are dragged by their name; the drawer below laptop width is
+// opened first, as in dragFlowToCanvas.
+async function dragPaletteItem(page, name, offsetX, offsetY) {
+  const drawer = page.locator('[data-role="palette-toggle"]');
+  if (await drawer.isVisible()) {
+    await drawer.click();
+    await expect(page.locator('.fb-palette')).toHaveClass(/open/);
+    await page.waitForTimeout(400);
+  }
+  const item = page.locator('.fb-palette .fb-node-item', { hasText: new RegExp(`^\\s*${name}`, 'i') }).first();
+  await item.scrollIntoViewIfNeeded();
+  const from = await item.boundingBox();
+  const canvas = await page.locator('.fb-canvas').boundingBox();
+  await page.mouse.move(from.x + 30, from.y + 20);
+  await page.mouse.down();
+  await page.mouse.move(canvas.x + offsetX, canvas.y + offsetY, { steps: 8 });
+  await page.mouse.up();
+  await page.waitForTimeout(300);
+}
+
+async function giveResultRule(page) {
+  await page.getByRole('tab', { name: 'Result' }).click();
+  await page.locator('[data-process="resultExpression"] textarea').fill(RESULT_EXPRESSION);
+  await page.locator('[data-process="resultExpression"] textarea').blur();
+}
+
+test.describe('on a large window', () => {
+  test.use({ viewport: { width: 1600, height: 950 } });
+
+  test('a task with more handlers than its border holds refuses the extra one and keeps icon, ports, badge and centre clear', async ({ page }) => {
+    test.setTimeout(180000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Many handlers', {
+      errors: ['E1', 'E2', 'E3', 'E4', 'E5', 'E6', 'E7', 'E8'], escalations: ['R1', 'R2'],
+    });
+    await openDesigner(page, { login: false, id: own });
+    await dragFlowToCanvas(page, 400, 250);
+    const node = page.locator('.fb-canvas .fb-node.bpmn_service_task');
+    await expect(node).toHaveCount(1);
+    await giveResultRule(page);
+
+    // Eight codes are declared, but the border holds six: the sixth click is the last one that works.
+    const addError = page.locator('[data-routing-add="error"]');
+    let added = 0;
+    for (let attempt = 0; attempt < 10 && (await addError.getAttribute('aria-disabled')) !== 'true'; attempt += 1) {
+      await addError.scrollIntoViewIfNeeded();
+      await addError.click();
+      added += 1;
+      await expect(page.locator('.fb-canvas .fb-node.bpmn_boundary_error')).toHaveCount(added);
+    }
+    expect(added).toBe(6);
+    for (const kind of ['error', 'escalation']) {
+      const button = page.locator(`[data-routing-add="${kind}"]`);
+      await expect(button).toHaveAttribute('aria-disabled', 'true');
+      await expect(button).toHaveAttribute('title', /no free place on its border/);
+    }
+    await expect(page.locator('[data-routing-add-hint]')).toContainText('no free place on its border');
+
+    const task = await rect(node);
+    const handlers = page.locator('.fb-canvas .fb-node.bpmn_boundary_error');
+    const boxes = [];
+    for (let index = 0; index < 6; index += 1) boxes.push(await rect(handlers.nth(index)));
+    // Nothing the task draws or connects with is covered: icon, kind badge and both ports.
+    const covered = [
+      ['icon', await rect(node.locator('.fb-process-symbol > svg').first())],
+      ['kind badge', await rect(node.locator('.fb-process-kind'))],
+      ['incoming port', await rect(node.locator('.fb-port-in'))],
+      ['outgoing port', await rect(node.locator('.fb-port-out'))],
+    ];
+    boxes.forEach((box, index) => {
+      for (const [what, other] of covered) expect(intersects(box, other), `handler ${index} stays off the ${what}`).toBe(false);
+      boxes.slice(index + 1).forEach((next, offset) => expect(intersects(box, next), `handlers ${index} and ${index + 1 + offset} do not overlap`).toBe(false));
+    });
+    // The task stays selectable: its centre and most of its area answer to the task, not to a handler.
+    const share = await page.evaluate(({ left, top, right, bottom }) => {
+      const belongs = (x, y) => document.elementFromPoint(x, y)?.closest('.fb-node')?.classList.contains('bpmn_service_task');
+      let hit = 0; let total = 0; let centre = true;
+      for (let x = left + 2; x < right - 2; x += 4) {
+        for (let y = top + 2; y < bottom - 2; y += 4) {
+          total += 1;
+          const ok = belongs(x, y);
+          if (ok) hit += 1;
+          const inMiddle = x > left + (right - left) * 0.25 && x < right - (right - left) * 0.25 && y > top + (bottom - top) * 0.3 && y < bottom - (bottom - top) * 0.3;
+          if (inMiddle && !ok) centre = false;
+        }
+      }
+      return { fraction: hit / total, centre };
+    }, task);
+    expect(share.centre, 'the middle of the task is never under a handler').toBe(true);
+    expect(share.fraction, 'most of the task can still be clicked').toBeGreaterThan(0.5);
+
+    // Every name sits near its own handler and inside the canvas, not across it.
+    const canvas = await rect(page.locator('.fb-canvas'));
+    for (let index = 0; index < 6; index += 1) {
+      const label = await rect(handlers.nth(index).locator('.fb-process-label'));
+      const centre = (box) => ({ x: (box.left + box.right) / 2, y: (box.top + box.bottom) / 2 });
+      expect(Math.hypot(centre(label).x - centre(boxes[index]).x, centre(label).y - centre(boxes[index]).y), `label ${index} stays near its handler`).toBeLessThan(150);
+      expect(label.left, `label ${index} inside the canvas`).toBeGreaterThanOrEqual(canvas.left);
+      expect(label.right).toBeLessThanOrEqual(canvas.right);
+    }
+    // The task keeps its own name in its box.
+    await expect(node.locator('.fb-process-symbol > span')).toBeVisible();
+    await page.screenshot({ path: test.info().outputPath('many-handlers.png') });
+  });
+
+  test('an escalation handler that runs into an End is named in the table and in the save refusal, never by id', async ({ page }) => {
+    test.setTimeout(180000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Escalation to End');
+    await openDesigner(page, { login: false, id: own });
+    await dragFlowToCanvas(page, 400, 250);
+    await giveResultRule(page);
+    await page.locator('[data-routing-add="escalation"]').click();
+    const handler = page.locator('.fb-canvas .fb-node.bpmn_boundary_escalation');
+    await handler.click();
+    await page.locator('tf-select[data-connect]').evaluate((select) => {
+      select.value = [...select.querySelectorAll('option')].find((option) => option.textContent === 'End').value;
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await page.locator('[data-connect-add]').click();
+    await page.locator('.fb-canvas .fb-node.bpmn_service_task').click({ position: { x: 30, y: 36 } });
+    await page.getByRole('tab', { name: 'Result' }).click();
+    const warning = page.locator('[data-routing-warning="escalation_path_terminal_before_wait"]');
+    await expect(warning).toHaveAttribute('message', /Escalation: any.*End/);
+    await page.locator('[data-role="save"]').click();
+    const banner = page.locator('[data-role="error"]');
+    await expect(banner).toBeVisible();
+    const text = await banner.getAttribute('message');
+    expect(text).toContain('Escalation: any');
+    expect(text).not.toMatch(/\b[ne]_[a-z0-9]+_[a-z0-9]+/);
+
+    // The same refusal from the server, past the client check, is rewritten by name as well.
+    await page.evaluate(async () => {
+      const { FlowCanvas } = await import('/js/modules/flows-builder/canvas.js');
+      FlowCanvas.prototype.validate = () => [];
+    });
+    await page.locator('[data-role="save"]').click();
+    await expect(banner).toHaveAttribute('message', /Escalation: any/);
+    expect(await banner.getAttribute('message')).not.toMatch(/\b[ne]_[a-z0-9]+_[a-z0-9]+/);
+    expect(await banner.getAttribute('message')).not.toContain('unsupported immediate path');
+  });
+
+  test('a boundary timer dropped on a task attaches to it; one dropped in the open says it is attached to nothing', async ({ page }) => {
+    test.setTimeout(180000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Timer drop');
+    await openDesigner(page, { login: false, id: own });
+    await dragFlowToCanvas(page, 400, 250);
+    const task = await rect(page.locator('.fb-canvas .fb-node.bpmn_service_task'));
+    const canvas = await page.locator('.fb-canvas').boundingBox();
+    await dragPaletteItem(page, 'Boundary timer', task.left - canvas.x + 120, task.bottom - canvas.y + 2);
+    const timers = page.locator('.fb-canvas .fb-node.bpmn_boundary_timer');
+    await expect(timers).toHaveCount(1);
+    await expect(page.locator('[data-boundary-target]')).toHaveText('B3 inspector flow');
+    // Measured again: choosing the timer replaced the task's inspector and moved the canvas.
+    const box = await rect(timers.first());
+    const host = await rect(page.locator('.fb-canvas .fb-node.bpmn_service_task'));
+    expect(Math.abs((box.top + box.bottom) / 2 - host.bottom), 'it sits on the task border').toBeLessThan(3);
+    await expect(page.locator('.fb-canvas .fb-process-warn[data-warning~="boundary_unattached"]')).toHaveCount(0);
+
+    await dragPaletteItem(page, 'Boundary timer', 600, 420);
+    await expect(timers).toHaveCount(2);
+    await expect(page.locator('.fb-canvas .fb-process-warn[data-warning~="boundary_unattached"]')).toHaveCount(1);
+    await page.locator('[data-role="save"]').click();
+    const banner = page.locator('[data-role="error"]');
+    await expect(banner).toBeVisible();
+    expect(await banner.getAttribute('message')).toMatch(/“Boundary timer” is not attached to an activity/);
+  });
+
+  test('inside a sub-process the bottom bar stays on one line with its counts and undo buttons in view', async ({ page }) => {
+    test.setTimeout(180000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Sub-process bar');
+    await openDesigner(page, { login: false, id: own });
+    await dragPaletteItem(page, 'Subprocess', 300, 250);
+    await page.locator('[data-process-enter]').click();
+    await expect(page.locator('[data-role="scope-up"]')).toBeVisible();
+    for (const [width, height] of [[1600, 950], [1280, 720]]) {
+      await page.setViewportSize({ width, height });
+      await page.waitForTimeout(300);
+      const bar = await rect(page.locator('.fb-bottombar'));
+      expect(bar.height, `one line at ${width}`).toBeLessThanOrEqual(60);
+      for (const selector of ['.fb-stats', '[data-role="undo"]', '[data-role="redo"]', '[data-role="scope-up"]']) {
+        const box = await rect(page.locator(selector));
+        expect(box.right, `${selector} ends inside the window at ${width}`).toBeLessThanOrEqual(width);
+        expect(box.bottom).toBeLessThanOrEqual(bar.bottom + 1);
+        expect(box.top).toBeGreaterThanOrEqual(bar.top - 1);
+      }
+      // The path never shows an internal id and the root crumb names the process, not a flow.
+      const crumb = await page.locator('.fb-breadcrumb').innerText();
+      expect(crumb).toMatch(/PROCESS/);
+      expect(crumb).not.toMatch(/N_[A-Z0-9]+_[A-Z0-9]+/);
+    }
+  });
+
+  test('a task inside a sub-process names the enclosing handler its error climbs to', async ({ page }) => {
+    test.setTimeout(180000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Nested handler');
+    await openDesigner(page, { login: false, id: own });
+    await dragPaletteItem(page, 'Subprocess', 250, 250);
+    const sub = page.locator('.fb-canvas .fb-node.bpmn_sub_process');
+    const box = await rect(sub);
+    const canvas = await page.locator('.fb-canvas').boundingBox();
+    await dragPaletteItem(page, 'Boundary error', box.left - canvas.x + 120, box.bottom - canvas.y + 2);
+    const handler = page.locator('.fb-canvas .fb-node.bpmn_boundary_error');
+    await expect(handler).toHaveCount(1);
+    await handler.click();
+    await page.locator('[data-process="name"] textarea').fill('Claim failed');
+    await page.locator('[data-process="name"] textarea').blur();
+    await sub.click({ position: { x: 20, y: 20 } });
+    await page.locator('[data-process="name"] textarea').fill('Handle claim');
+    await page.locator('[data-process="name"] textarea').blur();
+    await page.locator('[data-process-enter]').click();
+    await dragFlowToCanvas(page, 250, 250);
+    await giveResultRule(page);
+    await page.locator('tf-disclosure[data-routing-disclosure] summary').click();
+    await expect.poll(async () => (await routingRows(page)).find((row) => row.outcome === 'Any other error')?.route)
+      .toBe('An unhandled error climbs to the error boundary event “Claim failed” on the enclosing sub-process “Handle claim”.');
+  });
+
+  test('a Call activity lists what can be called by itself and says what is missing before it saves', async ({ page }) => {
+    test.setTimeout(180000);
+    await loginAsAdmin(page, { port: PORT });
+    const callee = await createDefinition(page, 'Callee process', { errors: [], escalations: [] });
+    await createDefinition(page, 'Never published', { errors: [], escalations: [] });
+    await page.evaluate(async (id) => {
+      const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+      const current = (await ApiBinary.one('processDefinitionGetRequest', { definitionId: id })).definition;
+      await ApiBinary.one('processDefinitionPublishRequest', { commandId: crypto.randomUUID(), definitionId: id, expectedRevision: current.draftRevision });
+    }, callee);
+    const own = await createDefinition(page, 'Caller process', { errors: [], escalations: [] });
+    await openDesigner(page, { login: false, id: own });
+    await dragPaletteItem(page, 'Call activity', 400, 250);
+
+    const definitions = page.locator('[data-process="calledDefinitionChoice"]');
+    await expect.poll(() => definitions.evaluate((select) => [...select.querySelectorAll('option')].map((option) => option.textContent.split(' · ')[0])))
+      .toEqual(['Choose a published definition', 'Callee process']);
+    await expect(page.locator('[data-load-calls]')).toBeHidden();
+
+    // Saving before a version is chosen names the element and what to choose.
+    await page.locator('[data-role="save"]').click();
+    const banner = page.locator('[data-role="error"]');
+    await expect(banner).toHaveAttribute('message', /The call activity “Call activity” has no exact target/);
+
+    await definitions.evaluate((select, value) => { select.value = value; select.dispatchEvent(new Event('change', { bubbles: true })); }, callee);
+    const versions = page.locator('[data-process="calledVersionChoice"]');
+    await expect.poll(() => versions.evaluate((select) => [...select.querySelectorAll('option')].map((option) => option.value).filter(Boolean))).toEqual(['1']);
+    await expect(page.locator('[data-load-call-versions]')).toBeHidden();
+    await versions.evaluate((select) => { select.value = '1'; select.dispatchEvent(new Event('change', { bubbles: true })); });
+    const body = page.locator('[data-process="calledProcessChoice"]');
+    await expect.poll(() => body.evaluate((select) => select.querySelectorAll('option').length)).toBeGreaterThan(1);
+    await body.evaluate((select) => { select.value = [...select.querySelectorAll('option')].find((option) => option.value).value; select.dispatchEvent(new Event('change', { bubbles: true })); });
+    await page.locator('[data-role="save"]').click();
+    await expect(banner).toBeHidden();
+    await expect(page.locator('[data-role="autosave-text"]')).toHaveText(/Saved/);
+  });
+});
+
+test.describe('on a laptop window', () => {
+  test.use({ viewport: { width: 1024, height: 700 } });
+
+  test('the palette drawer takes focus when it opens, closes on Escape and on a canvas click, and slides out', async ({ page }) => {
+    test.setTimeout(120000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Drawer');
+    await openDesigner(page, { login: false, id: own });
+    const palette = page.locator('.fb-palette');
+    const toggle = page.locator('[data-role="palette-toggle"]');
+    await toggle.click();
+    await expect(palette).toHaveClass(/open/);
+    await page.waitForTimeout(400);
+    expect(await page.evaluate(() => document.activeElement?.closest('.fb-palette') != null), 'focus moved into the drawer').toBe(true);
+    await page.keyboard.press('Escape');
+    await expect(palette).not.toHaveClass(/open/);
+    // Closing is animated: the drawer is still painted right after, and gone once it has slid out.
+    expect(await palette.evaluate((element) => getComputedStyle(element).visibility)).toBe('visible');
+    await expect.poll(() => palette.evaluate((element) => getComputedStyle(element).visibility)).toBe('hidden');
+    expect(await page.evaluate(() => document.activeElement?.closest('[data-role="palette-toggle"]') != null), 'focus returned to the button').toBe(true);
+
+    await toggle.click();
+    await expect(palette).toHaveClass(/open/);
+    await page.waitForTimeout(400);
+    await page.mouse.click(520, 400);
+    await expect(palette).not.toHaveClass(/open/);
+  });
+
+  test('the routing table starts folded on a short window and keeps the tab reachable', async ({ page }) => {
+    test.setTimeout(120000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Folded table');
+    await openDesigner(page, { login: false, id: own });
+    await dragFlowToCanvas(page, 120, 120);
+    await giveResultRule(page);
+    const disclosure = page.locator('tf-disclosure[data-routing-disclosure]');
+    await expect(disclosure).not.toHaveAttribute('open', '');
+    // What the author chose survives every redraw.
+    await disclosure.locator('summary').click();
+    await expect(disclosure).toHaveAttribute('open', '');
+    await page.locator('[data-routing-add="error"]').click();
+    await expect(disclosure).toHaveAttribute('open', '');
+    expect((await routingRows(page)).length).toBeGreaterThanOrEqual(7);
+  });
+});

@@ -137,6 +137,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   blok, narzędzie addonu) i znacznik ostrzeżenia dla bloku bez wymaganego modelu. Nowa
   aktywność wywołująca bez dokładnej wersji ma znacznik na węźle i komunikat na górze
   inspektora, który wyjaśnia przyczynę; zapis nadal wymaga wybranej wersji.
+- Silnik BPMN: powtarzane zadanie usługi, którego wynik jest nieobsłużonym Błędem,
+  Anulowanym albo odrzuconym przez warunek (`VERIFICATION_FAILED`,
+  `EXPRESSION_ERROR`), nie było nigdy zatwierdzane: plan nie nazywał incydentu w
+  grupie powtórzeń, walidator go odrzucał, a wynik zostawał w stanie `observed` bez
+  incydentu. Grupa wskazuje teraz swój incydent, a walidator przyjmuje taki plan tylko
+  dla incydentu o kodzie i komunikacie tego wyniku. Błąd z powtarzanego zadania w
+  podprocesie nie wspina się do zakresów nadrzędnych (tak jak w silniku).
+- Inspektor zadania usługi BPMN, runda 2: tabela „co się stanie” nazywa zdarzenie, do
+  którego wspina się błąd w podprocesie, wymaga reguły wyniku dla obu przycisków,
+  jest zwijana (zwinięta na niskim oknie) i łamie kody tylko po podkreślniku.
+  Zadanie ma sześć miejsc na zdarzenia brzegowe; przy pełnej granicy przyciski są
+  wyłączone z powodem, a timer upuszczony z palety przyczepia się do zadania, na które
+  spadł (albo mówi, że nie jest podłączony). Obsługa eskalacji prowadząca od razu do
+  zakończenia jest oznaczona w tabeli i odmawiana przy zapisie z jej nazwą; komunikaty
+  serwera cytują nazwy elementów zamiast identyfikatorów, widać je pod paskiem
+  narzędzi, a automatyczny zapis nie wyświetla toastu co 10 s. Aktywność wywołująca
+  sama wczytuje opublikowane definicje i wersje. Dolny pasek w podprocesie to jeden
+  wiersz, ciało inspektora ma 400 px i więcej przy 1280x720 i 1024x700, szuflada
+  palety zamyka się Escape i kliknięciem płótna.
 
 ### TentaNas
 

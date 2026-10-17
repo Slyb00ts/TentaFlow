@@ -16,7 +16,7 @@ import { TfWindow } from '/js/components/tf-window.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
-import { checkProcessDocument, processBody, processCommand, processEditorLabels, processHasTimer, processHasTimerStart } from '/js/modules/flows-builder/bpmn.js';
+import { checkProcessDocument, processBody, processCommand, processEditorLabels, processExplainError, processHasTimer, processHasTimerStart } from '/js/modules/flows-builder/bpmn.js';
 import { openProcessCalendar, openProcessDeclarations, openProcessInstances, openProcessMessageSend, openProcessMessages, openProcessModeling, openProcessRun, openProcessSchedule, openProcessVariables, processLifecycleReasonText, processTimerText } from '/js/modules/flows-builder/process-monitor.js';
 import { openProcessSimulation } from '/js/modules/flows-builder/process-simulation.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
@@ -70,20 +70,20 @@ const FlowBuilderScreen = {
             <tf-button variant="ghost" size="sm" icon="max" data-role="zoom-fit" title="${escapeAttr(I18n.t('flows_builder.zoom_fit'))}"></tf-button>
           </div>
           <div class="fb-topbar-separator"></div>
-          <tf-button variant="ghost" size="sm" icon="code" data-role="variables" title="${escapeAttr(I18n.t('flows_vars.button_title'))}">${escapeHtml(I18n.t('flows_vars.button'))}</tf-button>
-          ${process ? `<tf-button variant="ghost" size="sm" icon="arrow-up" data-role="import">${escapeHtml(I18n.t('bpmn.import_xml'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="download" data-role="export">${escapeHtml(I18n.t('bpmn.export_xml'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="clock" data-role="calendar">${escapeHtml(I18n.t('bpmn.calendar_title'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="mail" data-role="declarations">${escapeHtml(I18n.t('bpmn.declarations'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="layers" data-role="modeling">${escapeHtml(I18n.t('bpmn.modeling_title'))}</tf-button>
+          <tf-button variant="ghost" size="sm" icon="code" data-compact data-role="variables" title="${escapeAttr(I18n.t('flows_vars.button_title'))}">${escapeHtml(I18n.t('flows_vars.button'))}</tf-button>
+          ${process ? `<tf-button variant="ghost" size="sm" icon="arrow-up" data-compact data-role="import">${escapeHtml(I18n.t('bpmn.import_xml'))}</tf-button>
+          <tf-button variant="ghost" size="sm" icon="download" data-compact data-role="export">${escapeHtml(I18n.t('bpmn.export_xml'))}</tf-button>
+          <tf-button variant="ghost" size="sm" icon="clock" data-compact data-role="calendar">${escapeHtml(I18n.t('bpmn.calendar_title'))}</tf-button>
+          <tf-button variant="ghost" size="sm" icon="mail" data-compact data-role="declarations">${escapeHtml(I18n.t('bpmn.declarations'))}</tf-button>
+          <tf-button variant="ghost" size="sm" icon="layers" data-compact data-role="modeling">${escapeHtml(I18n.t('bpmn.modeling_title'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="refresh" data-role="refresh-calendar" hidden>${escapeHtml(I18n.t('bpmn.calendar_refresh'))}</tf-button>
           <tf-button variant="secondary" size="sm" icon="check" data-role="publish">${escapeHtml(I18n.t('bpmn.publish'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="play" data-role="run" disabled>${escapeHtml(I18n.t('bpmn.run'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="play" data-role="simulate" disabled>${escapeHtml(I18n.t('bpmn.simulation'))}</tf-button>
+          <tf-button variant="ghost" size="sm" icon="play" data-compact data-role="simulate" disabled>${escapeHtml(I18n.t('bpmn.simulation'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="mail" data-role="send-start" hidden>${escapeHtml(I18n.t('bpmn.send_message'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="clock" data-role="schedule" hidden>${escapeHtml(I18n.t('bpmn.timer_schedule'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="clock" data-role="instances">${escapeHtml(I18n.t('bpmn.instances'))}</tf-button>` : ''}
-          ${process ? `<tf-button variant="ghost" size="sm" icon="mail" data-role="messages">${escapeHtml(I18n.t('bpmn.messages'))}</tf-button>` : ''}
+          <tf-button variant="ghost" size="sm" icon="clock" data-compact data-role="instances">${escapeHtml(I18n.t('bpmn.instances'))}</tf-button>` : ''}
+          ${process ? `<tf-button variant="ghost" size="sm" icon="mail" data-compact data-role="messages">${escapeHtml(I18n.t('bpmn.messages'))}</tf-button>` : ''}
           <tf-button variant="primary" size="sm" icon="check" data-role="save">${escapeHtml(I18n.t('flows_builder.save'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="clock" data-role="history" title="${escapeAttr(I18n.t('flows_builder.history_title'))}"></tf-button>
         </header>
@@ -105,7 +105,7 @@ const FlowBuilderScreen = {
 
         <footer class="fb-bottombar">
           <div class="fb-breadcrumb">
-            <span class="fb-crumb">${escapeHtml(I18n.t('flows_builder.crumb_root'))}</span>
+            <span class="fb-crumb">${escapeHtml(I18n.t(process ? 'bpmn.crumb_root' : 'flows_builder.crumb_root'))}</span>
             ${process ? `<tf-button variant="ghost" size="sm" data-role="scope-up" hidden>${escapeHtml(I18n.t('bpmn.leave_subprocess'))}</tf-button><span class="fb-crumb" data-role="scope-path" hidden></span>` : ''}
             <span class="fb-sep">›</span>
             <span class="fb-crumb active" data-role="crumb-name">${escapeHtml(I18n.t('flows_builder.crumb_empty'))}</span>
@@ -244,6 +244,7 @@ const FlowBuilderScreen = {
         const tpl = node ? state.templatesMap.get(node.type) : null;
         if (edge) state.config?.showEdge(edge);
         else state.config?.show(node, tpl);
+        if ((node || edge) && state.mode === 'bpmn') state.showMobileTab?.('config');
         const crumb = root.querySelector('[data-role="crumb-name"]');
         if (crumb) crumb.textContent = node ? getNodeDisplayTitle(node, tpl) : (state.flow?.name || I18n.t('flows_builder.crumb_empty'));
       },
@@ -365,14 +366,24 @@ const FlowBuilderScreen = {
     root.querySelector('[data-role="redo"]').addEventListener('click', () => state.canvas.redo());
 
     // Mobile tabs
-    root.querySelector('.fb-mobile-tabs').addEventListener('change', (event) => {
-        if (event.target.tagName !== 'TF-TABS') return;
-        const tab = event.detail.value;
-        const body = root.querySelector('[data-role="body"]');
-        body.querySelector('[data-role="palette"]').classList.toggle('open', tab === 'palette');
-        body.querySelector('[data-role="config"]').classList.toggle('open', tab === 'config');
-        body.classList.toggle('overlay-backdrop', tab !== 'canvas');
+    const mobileTabs = root.querySelector('.fb-mobile-tabs');
+    const applyMobileTab = (tab) => {
+      const body = root.querySelector('[data-role="body"]');
+      body.querySelector('[data-role="palette"]').classList.toggle('open', tab === 'palette');
+      body.querySelector('[data-role="config"]').classList.toggle('open', tab === 'config');
+      body.classList.toggle('overlay-backdrop', tab !== 'canvas');
+    };
+    mobileTabs.addEventListener('change', (event) => {
+      if (event.target.tagName !== 'TF-TABS') return;
+      applyMobileTab(event.detail.value);
     });
+    // Choosing an element on a phone opens its inspector; the tab bar is only
+    // shown there, so a wider window never sees the overlay.
+    state.showMobileTab = (tab) => {
+      if (mobileTabs.offsetParent === null || mobileTabs.value === tab) return;
+      mobileTabs.setAttribute('value', tab);
+      applyMobileTab(tab);
+    };
 
     if (state.mode === 'bpmn') {
       // On a short window the settings row starts folded to its state chip, so the
@@ -384,15 +395,43 @@ const FlowBuilderScreen = {
         noticeToggle.setAttribute('aria-expanded', String(open));
         noticeToggle.setAttribute('icon', open ? 'chevron-down' : 'chevron-right');
       };
-      showNotice(window.innerHeight >= 820);
-      noticeToggle.addEventListener('click', () => showNotice(notice.classList.contains('fb-collapsed')));
+      const roomy = () => window.innerWidth >= 768 && window.innerHeight >= 820;
+      showNotice(roomy());
+      // The window can be resized after the screen opened; until the author has
+      // used the toggle, the row follows the room there is.
+      let noticeTouched = false;
+      noticeToggle.addEventListener('click', () => {
+        noticeTouched = true;
+        showNotice(notice.classList.contains('fb-collapsed'));
+      });
+      const onResize = () => { if (!noticeTouched) showNotice(roomy()); };
+      window.addEventListener('resize', onResize);
+      state.cleanupFns.push(() => window.removeEventListener('resize', onResize));
+      // Secondary buttons shrink to their icon on a narrow bar; the text stays as the tooltip.
+      for (const button of root.querySelectorAll('.fb-topbar tf-button[data-compact]')) {
+        if (!button.hasAttribute('title')) button.setAttribute('title', button.textContent.trim());
+      }
       const paletteEl = root.querySelector('[data-role="palette"]');
       const paletteToggle = root.querySelector('[data-role="palette-toggle"]');
-      state.setPaletteOpen = (open) => {
+      state.setPaletteOpen = (open, { restoreFocus = false } = {}) => {
+        const wasOpen = paletteEl.classList.contains('open');
         paletteEl.classList.toggle('open', open);
         paletteToggle.setAttribute('aria-expanded', String(open));
+        // A drawer takes focus in when it opens and gives it back when it closes.
+        if (open && !wasOpen && paletteToggle.offsetParent) {
+          paletteEl.querySelector('tf-searchbox input, tf-searchbox')?.focus?.();
+        } else if (!open && wasOpen && restoreFocus) {
+          (paletteToggle.querySelector('button') ?? paletteToggle).focus?.();
+        }
       };
       paletteToggle.addEventListener('click', () => state.setPaletteOpen(!paletteEl.classList.contains('open')));
+      const closeDrawerOnEscape = (event) => {
+        if (event.key !== 'Escape' || !paletteToggle.offsetParent || !paletteEl.classList.contains('open')) return;
+        event.stopPropagation();
+        state.setPaletteOpen(false, { restoreFocus: true });
+      };
+      document.addEventListener('keydown', closeDrawerOnEscape, true);
+      state.cleanupFns.push(() => document.removeEventListener('keydown', closeDrawerOnEscape, true));
       root.querySelector('[data-role="canvas"]').addEventListener('pointerdown', () => {
         if (paletteToggle.offsetParent) state.setPaletteOpen(false);
       });
@@ -601,7 +640,7 @@ const FlowBuilderScreen = {
       if (!this._current(state)) return;
       const alert = state.root.querySelector('[data-role="error"]');
       alert.hidden = false;
-      alert.setAttribute('message', I18n.t('bpmn.request_error', { error: error.message }));
+      alert.setAttribute('message', I18n.t('bpmn.request_error', { error: this._explain(state, error.message) }));
     } finally {
       state.operationBusy = false;
       if (this._current(state)) this._syncProcessControls();
@@ -918,7 +957,7 @@ const FlowBuilderScreen = {
     const names = [];
     for (const id of path) {
       const node = body.nodes.find((candidate) => candidate.id === id);
-      names.push(node.name || id);
+      names.push(node.name || I18n.t('bpmn.node_sub_process'));
       body = processBody(body, [id]);
     }
     label.textContent = names.join(' › ');
@@ -964,8 +1003,8 @@ const FlowBuilderScreen = {
     // ochrona przed zbednym round-tripem i czytelnym komunikatem inline.
     const errors = s.canvas.validate ? s.canvas.validate() : [];
     if (errors.length > 0) {
-      this._setAutosave('error', errors[0]);
-      if (!silent) toast(errors[0], 'error');
+      this._reportSaveProblem(s, errors.length > 1
+        ? I18n.t('flows_builder.save_blocked_more', { first: errors[0], count: errors.length - 1 }) : errors[0], silent);
       return false;
     }
     s.saving = true;
@@ -987,6 +1026,7 @@ const FlowBuilderScreen = {
         s.flow.name = response.definition.name;
         s.dirty = s.editRevision !== editRevision;
         this._syncProcessControls();
+        this._clearSaveProblem(s);
         this._setAutosave(s.dirty ? 'pending' : 'ok');
         if (!silent) toast(I18n.t('bpmn.saved'), 'success');
         return true;
@@ -1013,17 +1053,45 @@ const FlowBuilderScreen = {
       };
       if (!this._current(s)) return false;
       s.dirty = s.editRevision !== editRevision;
+      this._clearSaveProblem(s);
       this._setAutosave('ok');
       if (!silent) toast(I18n.t('flows_builder.save_success'), 'success');
       return true;
     } catch (err) {
       if (!this._current(s)) return false;
-      this._setAutosave('error');
-      toast(I18n.t('flows_builder.save_error', { error: err.message }), 'error');
+      this._reportSaveProblem(s, I18n.t('flows_builder.save_error', { error: this._explain(s, err.message) }), silent);
       return false;
     } finally {
       s.saving = false;
     }
+  },
+
+  // Messages from the server and the codec cite elements by internal id; the
+  // author sees their names.
+  _explain(state, message) {
+    return state.mode === 'bpmn' ? processExplainError(message, state.canvas.getData()) : message;
+  },
+
+  // A save that cannot go through says so where the author looks: the status
+  // text, a banner under the toolbar naming the element, and, for a save the
+  // author asked for, a toast. A silent autosave repeats every ten seconds and
+  // must not toast each time.
+  _reportSaveProblem(state, text, silent) {
+    this._setAutosave('error', text);
+    const alert = state.root.querySelector('[data-role="error"]');
+    if (alert) {
+      alert.hidden = false;
+      alert.setAttribute('message', text);
+      state.saveProblem = true;
+    }
+    if (!silent) toast(text, 'error');
+  },
+
+  _clearSaveProblem(state) {
+    if (!state.saveProblem) return;
+    state.saveProblem = false;
+    const alert = state.root.querySelector('[data-role="error"]');
+    if (alert) alert.hidden = true;
   },
 
   async _openVariables() {
