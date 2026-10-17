@@ -1249,12 +1249,19 @@
   .fb-bottombar {
     padding: 0;
   }
-  .fb-bottombar > :not(.fb-mobile-tabs) { display: none; }
+  /* The bar keeps Undo and Redo beside the tabs, so the commands stay in reach
+     of a thumb; the path and the counts have no room here. */
+  .fb-bottombar > :not(.fb-mobile-tabs):not(.fb-tool-group):not(.fb-breadcrumb) { display: none; }
+  .fb-bottombar .fb-breadcrumb { display: none; }
+  /* Inside a sub-process the way out stays: only its button of the path. */
+  .fb-bottombar .fb-breadcrumb:has([data-role="scope-up"]:not([hidden])) { display: flex; flex: none; }
+  .fb-bottombar .fb-breadcrumb > :not([data-role="scope-up"]) { display: none; }
+  .fb-bottombar { gap: 4px; padding: 0 4px; }
   .fb-mobile-tabs {
     display: flex !important;
-    width: 100%;
     height: 100%;
   }
+  .fb-shell .fb-bottombar > .fb-mobile-tabs, .fb-shell.fb-process-shell .fb-bottombar > .fb-mobile-tabs { flex: 1 1 0; min-width: 0; }
 }
 
 .fb-mobile-tabs { display: none; }
@@ -1402,9 +1409,11 @@
   align-content: flex-start;
   min-height: 0;
   padding-block: 8px;
-  overflow-x: hidden;
-  overflow-y: auto;
-  scrollbar-gutter: stable;
+  /* The bar takes the rows its buttons need; it is never a scroll box, or Back and
+     the name would scroll away after a tap. `clip` also refuses the scrolling a
+     focus or a tap would otherwise do on a hidden box. */
+  overflow: hidden;
+  overflow: clip;
   gap: 8px;
 }
 .fb-process-shell .fb-topbar > tf-button { flex-shrink: 0; }
@@ -1530,9 +1539,8 @@ body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transf
 .fb-process-shell .fb-breadcrumb tf-button { flex: none; }
 .fb-process-shell .fb-bottombar > :not(.fb-breadcrumb) { flex: none; }
 .fb-process-shell .fb-bottombar-spacer { flex: 0 0 0; }
-.fb-process-shell .fb-canvas-wrap { display: flex; flex-direction: column; }
-.fb-process-shell [data-role="canvas"] { position: relative; flex: 1; min-height: 0; }
-.fb-process-shell .fb-minimap { position: relative; right: auto; bottom: auto; align-self: flex-end; flex: none; width: 120px; height: 80px; margin: 12px; }
+/* The minimap floats over the canvas corner, so the drawing area (and a palette drop) covers the whole visible canvas. */
+.fb-process-shell .fb-minimap { right: 12px; bottom: 12px; width: 120px; height: 80px; }
 .fb-process-notice { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 16px; border-bottom: 1px solid var(--tf-border); color: var(--tf-text-2); }
 /* Collapsed, the settings row keeps only the publication state and its own toggle. */
 .fb-process-shell .fb-process-notice.fb-collapsed > :not([data-role="publication"]):not([data-role="notice-toggle"]) { display: none; }
@@ -1605,6 +1613,8 @@ body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transf
 .fb-process-label[hidden], .fb-process-label-leader[hidden] { display: none; }
 .fb-process-node:hover > .fb-process-label, .fb-process-node.selected > .fb-process-label { border-color: var(--tf-accent-1); }
 .fb-process-node:hover > .fb-process-label-leader, .fb-process-node.selected > .fb-process-label-leader { border-top: 2px solid var(--tf-accent-1); }
+.fb-process-node.fb-label-deferred > .fb-process-label { left: 50%; top: auto; bottom: calc(100% + 8px); transform: translateX(-50%); visibility: hidden; }
+.fb-process-node.fb-label-deferred:hover > .fb-process-label, .fb-process-node.fb-label-deferred.selected > .fb-process-label, .fb-process-node.fb-label-deferred:focus-visible > .fb-process-label { visibility: visible; z-index: 6; }
 .fb-process-label-leader { position: absolute; height: 0; border-top: 1px solid var(--tf-accent-2); transform-origin: left center; pointer-events: none; }
 .fb-process-label-leader::before { content: ''; position: absolute; left: -3px; top: -4px; width: 6px; height: 6px; border-radius: 50%; background: var(--tf-accent-2); }
 .fb-process-edge-label { fill: var(--tf-text-2); font-size: 12px; paint-order: stroke; stroke: var(--tf-bg); stroke-width: 4px; stroke-linejoin: round; pointer-events: none; }
@@ -1651,4 +1661,31 @@ body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transf
 @media (max-width: 700px) {
   .fb-calendar-row, .fb-calendar-row:has([data-calendar-date]) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .fb-calendar-row tf-button { justify-self: start; }
+}
+
+/* A column rather than a grid: the grid sized its middle row from the content, a
+   fraction of a pixel or the whole 600 px more than was left, and pushed the
+   bottom bar off a phone whenever the settings row grew. Where the window has
+   height for it the body keeps the room the inspector needs and the shell
+   scrolls (see above); on a phone, where the inspector is a drawer, the body
+   takes what is left so both bars stay in view. */
+.fb-shell.fb-process-shell { display: flex; flex-direction: column; }
+.fb-shell.fb-process-shell > * { flex: none; }
+.fb-shell.fb-process-shell > .fb-body { flex: 1 1 0; min-height: 0; }
+.fb-shell.fb-process-shell > .fb-bottombar { height: 52px; }
+@media (min-width: 768px) and (min-height: 600px) {
+  .fb-shell.fb-process-shell > .fb-body { min-height: clamp(520px, 70vh, 600px); }
+}
+/* A phone held sideways has height for little more than the canvas: the app's
+   own sidebar steps aside (Back still leaves the designer), the three bars get
+   slimmer and the inspector narrower. */
+@media (max-height: 500px) {
+  .app:has(.fb-process-shell) { grid-template-columns: minmax(0, 1fr); }
+  .app:has(.fb-process-shell) > .sidebar { display: none; }
+  .fb-shell.fb-process-shell > .fb-bottombar { height: 36px; }
+  .fb-process-shell .fb-topbar { height: 44px; }
+  .fb-process-shell .fb-process-notice { padding-block: 2px; }
+}
+@media (max-height: 500px) and (min-width: 768px) and (max-width: 1439px) {
+  .fb-process-shell .fb-body { grid-template-columns: minmax(0, 1fr) 280px; }
 }

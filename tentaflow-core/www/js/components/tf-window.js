@@ -44,6 +44,7 @@
 
 import { adoptControlsInto, injectSpriteIntoShadow } from './shared-styles.js';
 import { Sfx } from '/js/lib/sfx.js';
+import { I18n } from '/js/i18n.js';
 
 let _zCounter = 1000;
 
@@ -332,10 +333,10 @@ class TfWindow extends HTMLElement {
       collapse: 'collapse',
     };
     const labelMap = {
-      close: 'Zamknij',
-      minimize: 'Minimalizuj',
-      maximize: 'Maksymalizuj',
-      collapse: 'Zwin',
+      close: I18n.t('common.close'),
+      minimize: I18n.t('common.window_minimize'),
+      maximize: I18n.t('common.window_maximize'),
+      collapse: I18n.t('common.window_collapse'),
     };
     const html = actions.map((a) => {
       const sym = symbolMap[a];
@@ -777,11 +778,11 @@ TfWindow.open = function openWindow(opts = {}) {
 
 // Confirm dialog helper — oparty o TfWindow.open
 TfWindow.confirm = function confirmDialog({
-  title = 'Potwierdz',
+  title = I18n.t('common.confirm'),
   message = '',
   description = '',
-  confirmLabel = 'Potwierdz',
-  cancelLabel = 'Anuluj',
+  confirmLabel = I18n.t('common.confirm'),
+  cancelLabel = I18n.t('common.cancel'),
   danger = false,
   icon = null,
 } = {}) {

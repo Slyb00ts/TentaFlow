@@ -276,7 +276,8 @@ export function processLifecycleReasonText(reason) {
   }
 }
 
-function renderTimers(host, timers) {
+// `attachedNames` maps element ids to names; null while the model is still being read.
+function renderTimers(host, timers, attachedNames = null) {
   host.replaceChildren();
   for (const timer of timers) {
     const row = document.createElement('div');
@@ -284,7 +285,7 @@ function renderTimers(host, timers) {
     row.dataset.timerId = timer.timerId;
     row.innerHTML = `<div><strong>${escapeHtml(timer.nodeName || text(timer.kind === 'Start' ? 'node_timer_start' : timer.kind === 'Boundary' ? 'node_boundary_timer' : 'node_timer_catch'))}</strong>
       <p>${escapeHtml(processTimerText(timer))}</p><dl><dt>${escapeHtml(text('timer_occurrence'))}</dt><dd>${escapeHtml(timer.totalFirings == null ? String(timer.occurrence) : text('timer_slot', { occurrence: timer.occurrence, total: timer.totalFirings }))}</dd>
-      ${timer.kind === 'Boundary' ? `<dt>${escapeHtml(text('boundary_attached_element_id'))}</dt><dd>${escapeHtml(timer.attachedToId)}</dd>` : ''}
+      ${timer.kind === 'Boundary' ? `<dt>${escapeHtml(text('boundary_attach'))}</dt><dd>${escapeHtml(attachedNames ? attachedNames.get(timer.attachedToId) ?? text('element_unavailable') : text('call_definition_checking'))}</dd>` : ''}
       ${timer.workingTime ? `<dt>${escapeHtml(text('calendar_name'))}</dt><dd>${escapeHtml(timer.workingTime.calendarName)}</dd>
       <dt>${escapeHtml(text('calendar_holiday_policy'))}</dt><dd>${escapeHtml(text(timer.workingTime.holidayPolicy === 'None' ? 'calendar_policy_none' : 'calendar_policy_poland'))}</dd>
       <dt>${escapeHtml(text('calendar_release'))}</dt><dd>${escapeHtml(text('calendar_pin_info', {
@@ -398,6 +399,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       <tf-button variant="secondary" data-more>${escapeHtml(text('more_history'))}</tf-button></section>`;
   let instance = initial;
   let renderedSnapshot = null;
+  const attached = { key: '', names: null };
   let available = true;
   let readGeneration = 0;
   let refreshing = false;
@@ -553,6 +555,22 @@ export async function openProcessInstance(instanceId, initial = null) {
     workWindow.addEventListener('closed', () => { workWindows.delete(workWindow); if (selectedUserTaskId === task.userTaskId) selectedUserTaskId = null; }, { once: true });
   }
 
+  // A boundary timer reports the id of the task it hangs on; the model of the
+  // running version names it. The version is read once per instance version.
+  async function readAttachedNames() {
+    const key = `${instance.definitionId}:${instance.version}`;
+    if (attached.key === key) return;
+    attached.key = key;
+    try {
+      const response = await ApiBinary.one('processVersionGetRequest', { definitionId: instance.definitionId, version: instance.version });
+      if (!win.isConnected) return;
+      attached.names = processElementNames(response.version.model);
+    } catch (_) {
+      attached.names = new Map();
+    }
+    if (win.isConnected) renderTimers(host.querySelector('[data-timers]'), instance.timers || [], attached.names);
+  }
+
   function renderPageControls(container, name) {
     container.querySelector('[data-page-controls]')?.remove();
     const info = instance.pages[name];
@@ -617,10 +635,12 @@ export async function openProcessInstance(instanceId, initial = null) {
     renderPageControls(work, 'userTasks');
     const incidents = host.querySelector('[data-incidents]');
     incidents.innerHTML = instance.incidents.length ? `<h3>${escapeHtml(text('incidents'))}</h3>` : '';
+    // Incidents of one repeated task all carry its name; the occurrence number tells them apart.
+    const incidentTitles = processDistinctLabels(instance.incidents.map((incident) => [incident.incidentId, incident.nodeName || text('element_unavailable')]));
     for (const incident of instance.incidents) {
       const row = document.createElement('div');
       row.className = 'fb-process-work';
-      row.innerHTML = `<div><strong>${escapeHtml(incident.nodeName || text('element_unavailable'))}</strong><p>${escapeHtml(processIncidentText(incident))}</p><p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)}</p>${scopeLine(incident.scopeId)}</div>
+      row.innerHTML = `<div><strong>${escapeHtml(incidentTitles.get(incident.incidentId))}</strong><p>${escapeHtml(processIncidentText(incident))}</p><p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)}</p>${scopeLine(incident.scopeId)}</div>
         <tf-button variant="secondary" data-inspect-incident>${escapeHtml(text('inspect_incident'))}</tf-button>
         ${incident.canRetry && incident.jobId ? `<tf-button variant="secondary" icon="refresh" data-retry>${escapeHtml(text('retry'))}</tf-button>` : ''}`;
       row.querySelector('[data-inspect-incident]').addEventListener('click', () => { selectedIncidentId = incident.incidentId; refresh(); });
@@ -636,7 +656,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       const detail = document.createElement('div');
       detail.className = 'fb-process-work';
       detail.dataset.selectedIncident = incident.incidentId;
-      detail.innerHTML = `<div><strong>${escapeHtml(incident.nodeName || text('element_unavailable'))}</strong>
+      detail.innerHTML = `<div><strong>${escapeHtml(incidentTitles.get(incident.incidentId) ?? (incident.nodeName || text('element_unavailable')))}</strong>
         <p>${escapeHtml(incident.code)} · ${escapeHtml(incident.message)}</p>
         ${resolvedAtMs == null ? '' : `<p>${escapeHtml(text('incident_resolved_at', { time: date(resolvedAtMs) }))}</p>`}</div>
         <tf-button variant="ghost" data-close-incident>${escapeHtml(text('close_detail'))}</tf-button>`;
@@ -646,7 +666,8 @@ export async function openProcessInstance(instanceId, initial = null) {
     renderPageControls(incidents, 'incidents');
     host.querySelector('[data-variables]').replaceChildren(jsonSection(text('current_variables'), instance.variables, false));
     host.querySelector('[data-timer-section]').hidden = !instance.timers?.length && !instance.pages.timers.total;
-    renderTimers(host.querySelector('[data-timers]'), instance.timers || []);
+    renderTimers(host.querySelector('[data-timers]'), instance.timers || [], attached.names);
+    if ((instance.timers || []).some((timer) => timer.kind === 'Boundary')) readAttachedNames();
     renderPageControls(host.querySelector('[data-timer-section]'), 'timers');
     const subscriptions = host.querySelector('[data-subscription-rows]');
     subscriptions.replaceChildren();
@@ -1401,10 +1422,12 @@ export async function openProcessMessageDetail(summary, onChanged = () => {}) {
               pages: { subscriptions: { offset, limit: 20 } } });
             if (generation !== loadGeneration || instanceControl.value !== targetInstanceId || !section.isConnected) return;
             if (result.instance.definitionId !== target.definitionId) throw new Error(text('message_target_mismatch'));
-            for (const subscription of result.instance.subscriptions) {
-              if (subscription.status !== 'Open' || subscription.messageName !== current.messageName || subscription.correlationKey !== current.correlationKey) continue;
+            const open = result.instance.subscriptions.filter((subscription) => subscription.status === 'Open'
+              && subscription.messageName === current.messageName && subscription.correlationKey === current.correlationKey);
+            const labels = processDistinctLabels(open.map((subscription) => [subscription.subscriptionId, subscription.nodeName || text('element_unavailable')]));
+            for (const subscription of open) {
               const option = document.createElement('option'); option.value = subscription.subscriptionId;
-              option.textContent = `${subscription.nodeName || subscription.nodeId} · ${subscription.subscriptionId}`;
+              option.textContent = labels.get(subscription.subscriptionId);
               select.append(option);
             }
             more = result.instance.pages.subscriptions.hasMore;

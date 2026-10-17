@@ -25,10 +25,10 @@ const { Router } = await import('../../router.js');
 const { dismissToast } = await import('../../utils.js');
 const { TfWindow } = await import('../../components/tf-window.js');
 const { emptyProcessModel, processToCanvas, canvasToProcess, cloneProcessBody, processBoundaryKind, processCommand, processJson, processStatusLabel, checkProcessDocument, PROCESS_DOCUMENT_BYTES } = await import('./bpmn.js');
-const { FlowCanvas } = await import('./canvas.js');
+const { FlowCanvas, UNATTACHED_TAG } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
-const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processRowFor, processRoutingTextKeys, processEscalationPathProblem, processExplainError, processMissingSettings, processNodeWarnings, processServiceKind, processBlockTemplate, processStartEntryLabels, processTimezoneProblem, processPublishProblems, processNodeLabels, processTimezoneGaps, processTimezoneText } = await import('./bpmn.js');
+const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processRowFor, processRoutingTextKeys, processEscalationPathProblem, processExplainError, processMissingSettings, processNodeWarnings, processServiceKind, processBlockTemplate, processStartEntryLabels, processTimezoneProblem, processPublishProblems, processNodeLabels, processTimezoneGaps, processTimezoneText, processTimezoneCanonical, processRepeatedElements } = await import('./bpmn.js');
 const { openProcessCalendar, openProcessInstance, openProcessInstances, openProcessMessageDetail, openProcessMessageSend, openProcessRun, openProcessSchedule, processEventText, processLifecycleReasonText, processTimerText } = await import('./process-monitor.js');
 const { simulationWindow, openProcessSimulation } = await import('./process-simulation.js');
 const { default: builder } = await import('../flows-builder.js');
@@ -3521,6 +3521,31 @@ test('message resolution ignores stale subscription pages after the target insta
   assert.ok(form.querySelector('[data-act="submit"]').hasAttribute('disabled'));
 });
 
+test('the resolve picker names each open subscription by its step and never by its id', async () => {
+  const summary = { messageId: 'message-2', senderUserId: 'owner', messageName: 'order.received',
+    correlationKey: 'case-1', status: 'Ambiguous', revision: 1, payloadAvailable: false,
+    canResolve: true, canCancel: true, target: { Catch: { definitionId: 'definition-one', instanceId: null, subscriptionId: null } } };
+  const open = (id, nodeName) => ({ subscriptionId: id, nodeId: 'Wait', nodeName, status: 'Open', messageName: 'order.received', correlationKey: 'case-1' });
+  fixtures({ processMessageGetRequest: { message: { message: summary } },
+    processInstanceGetRequest: { instance: instance('A', { subscriptions: [open('11111111-2222-4333-8444-555555555555', 'Wait for payment'),
+      open('66666666-7777-4888-8999-000000000000', 'Wait for payment'), open('aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', '')] }) } });
+  const detail = await openProcessMessageDetail(summary);
+  click(detail.querySelector('[data-resolve]'));
+  const form = document.querySelector('.tf-act-window');
+  change(form.querySelector('[data-resolve-instance]'), 'A'); click(form.querySelector('[data-load-subscriptions]'));
+  await flush();
+  const labels = [...form.querySelectorAll('[data-resolve-subscription] option')].filter((option) => option.value).map((option) => option.textContent);
+  assert.deepEqual(labels, ['Wait for payment (1)', 'Wait for payment (2)', I18n.t('bpmn.element_unavailable')]);
+  assert.doesNotMatch(labels.join('\n'), ID_SHAPE);
+});
+
+test('incidents of one repeated task are told apart by their occurrence number', async () => {
+  const incident = (id) => ({ incidentId: id, nodeId: 'Flow_task', nodeName: 'Boom flow', code: 'FLOW_FAILED', message: 'failed', jobId: null, canRetry: false });
+  const win = await monitor(instance('twin-incidents', { status: 'Incident', incidents: [incident('inc-a'), incident('inc-b')] }));
+  const titles = [...win.querySelectorAll('[data-incidents] .fb-process-work strong')].map((title) => title.textContent);
+  assert.deepEqual(titles, ['Boom flow (1)', 'Boom flow (2)']);
+});
+
 test('message receipts and cancellation history localize finite reasons while preserving diagnostics', async () => {
   const reasons = [
     ['sender_cancelled', 'reason_sender_cancelled'],
@@ -4700,6 +4725,50 @@ test('boundary-only processes expose the editable timezone while timerless proce
   assert.equal(plainState.root.querySelector('[data-role="timer-timezone"]').hidden, true);
 });
 
+test('a typed time zone is stored as the engine spells it, and an unusable one blocks the save instead of being dropped', async () => {
+  assert.equal(processTimezoneCanonical('europe/warsaw'), 'Europe/Warsaw');
+  assert.equal(processTimezoneCanonical(' Europe/Warsaw '), 'Europe/Warsaw');
+  assert.equal(processTimezoneCanonical(''), '');
+  assert.equal(processTimezoneCanonical('Mars/Olympus'), null);
+  const model = timedModel(); delete model.timerTimezone;
+  const state = await mount(definition('zone-typed', { model }), { processDefinitionSaveRequest: (payload) => ({ definition: definition('zone-typed', { model: payload.model, draftRevision: 5 }) }) });
+  const field = state.root.querySelector('[data-role="timer-timezone"]');
+  const saves = () => calls.filter((call) => call.kind === 'processDefinitionSaveRequest').length;
+  const before = saves();
+  change(field, 'Mars/Olympus');
+  assert.match(field.getAttribute('error'), /Mars\/Olympus/);
+  assert.equal(await builder._save(), false);
+  assert.equal(saves(), before, 'nothing is sent for a zone that cannot be used');
+  assert.equal(field.value, 'Mars/Olympus', 'the typed text is not replaced by the saved value');
+  assert.match(state.root.querySelector('[data-role="error"]').getAttribute('message'), /Mars\/Olympus/);
+  state.canvas.updateProcessVariables({ ...state.canvas.getData().variables, Other_Edit: 'x' });
+  builder._syncProcessControls();
+  assert.equal(field.value, 'Mars/Olympus', 'a canvas change keeps the text the author is still fixing');
+  change(field, 'europe/warsaw');
+  assert.equal(field.value, 'Europe/Warsaw');
+  assert.equal(field.hasAttribute('error'), false);
+  assert.equal(state.canvas.getData().timerTimezone, 'Europe/Warsaw');
+  assert.equal(await builder._save(), true);
+  assert.equal(calls.filter((call) => call.kind === 'processDefinitionSaveRequest').at(-1).payload.model.timerTimezone, 'Europe/Warsaw');
+});
+
+test('a zone stays in the editor when the process has no timer, and is left out of what is saved', async () => {
+  const state = await mount(definition('zone-orphan'));
+  state.canvas.processModel.timerTimezone = 'Europe/Warsaw';
+  assert.equal(Object.hasOwn(state.canvas.getData(), 'timerTimezone'), false);
+  assert.equal(state.canvas.processModel.timerTimezone, 'Europe/Warsaw');
+});
+
+test('the server refusing a time zone name is told by field, and a simulation refusal by element name', () => {
+  const model = { ...timedModel(), timerTimezone: 'Mars/Olympus' };
+  assert.equal(processExplainError('protocol error BadRequest: unknown timezone', model), I18n.t('bpmn.timer_timezone_invalid', { zone: 'Mars/Olympus' }));
+  const repeated = emptyProcessModel();
+  repeated.nodes.push({ id: 'n_abc123_def', name: 'Review step', kind: { ServiceTask: {} }, repeat: { StructuredLoop: { outputCollectionVariable: 'out' } } });
+  assert.deepEqual(processRepeatedElements(repeated), ['Review step']);
+  assert.equal(processExplainError('protocol error BadRequest: repetition is unsupported in simulation (n_abc123_def)', repeated),
+    I18n.t('bpmn.simulation_repeat_unsupported', { names: 'Review step' }));
+});
+
 test('calendar-only process exposes timezone and structured editor rejects invalid closures', async () => {
   const state = await mount(definition('calendar-only'));
   assert.equal(state.root.querySelector('[data-role="timer-timezone"]').hidden, true);
@@ -5472,20 +5541,23 @@ test('all five locales render boundary cancellation truth and preserve arbitrary
       assert.ok(processEventText({ kind: 'timer_cancelled', nodeName: 'Deadline', data: { reason: arbitrary } }).includes(arbitrary));
     }
   } finally { await I18n.setLanguage('en'); }
-  const current = instance('boundary-empty-name', { timers: [{ ...savedTimer({ kind: 'Boundary', nodeName: '' }), attachedToId: 'Review' }] });
-  const win = await monitor(current);
+  const current = instance('boundary-empty-name', { timers: [{ ...savedTimer({ kind: 'Boundary', nodeName: '' }), attachedToId: 'n_review_a1b2' }] });
+  const named = emptyProcessModel();
+  named.nodes.push({ id: 'n_review_a1b2', name: 'Check documents', kind: { UserTask: { assigneeUserId: null, outputMapping: {} } } });
+  const win = await monitor(current, { processVersionGetRequest: { version: { model: named }, startCatalog: [] } });
+  await flush(2);
   assert.ok(win.querySelector('[data-timers]').textContent.includes(I18n.t('bpmn.node_boundary_timer')));
-  assert.ok(win.querySelector('[data-timers]').textContent.includes('Review'));
+  assert.ok(win.querySelector('[data-timers]').textContent.includes('Check documents'));
+  assert.doesNotMatch(win.querySelector('[data-timers]').textContent, /n_review_a1b2/);
   assert.equal(win.querySelector('[data-timers] script'), null);
 });
 
-test('boundary timer shows its actual escaped element ID and ordinal occurrence in five locales', async () => {
-  const captions = {
-    en: ['Attached activity', 'Attached activity (element ID)'],
-    pl: ['Przypięta czynność', 'Przypięta czynność (ID elementu)'],
-    de: ['Angehängte Aktivität', 'Angehängte Aktivität (Element-ID)'],
-    es: ['Actividad adjunta', 'Actividad adjunta (ID del elemento)'],
-    fr: ['Activité attachée', 'Activité attachée (ID de l’élément)'],
+test('a boundary timer names its attached activity in five locales, escaped, and never by its element id', async () => {
+  const captions = { en: 'Attached activity', pl: 'Przypięta czynność', de: 'Angehängte Aktivität', es: 'Actividad adjunta', fr: 'Activité attachée' };
+  const modelWith = (name) => {
+    const model = emptyProcessModel();
+    model.nodes.push({ id: 'Review_1', name, kind: { UserTask: { assigneeUserId: null, outputMapping: {} } } });
+    return { version: { model }, startCatalog: [] };
   };
   try {
     for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
@@ -5494,25 +5566,29 @@ test('boundary timer shows its actual escaped element ID and ordinal occurrence 
       const boundary = graph.nodes.find((node) => node.id === 'Timer_A');
       const panel = inspector(graph);
       panel.show(boundary, graph.templates.get(boundary.type));
-      assert.equal(panel.root.querySelector('[data-process="attachedToId"]').getAttribute('label'), captions[language][0]);
+      assert.equal(panel.root.querySelector('[data-process="attachedToId"]').getAttribute('label'), captions[language]);
       const timer = savedTimer({ kind: 'Boundary', nodeName: 'Deadline', attachedToId: 'Review_1' });
-      const win = await monitor(instance(`boundary-id-${language}`, { timers: [timer] }));
+      const win = await monitor(instance(`boundary-id-${language}`, { timers: [timer] }), { processVersionGetRequest: modelWith('Check documents') });
+      await flush(2);
       const terms = [...win.querySelectorAll('[data-timers] dt')].map((term) => term.textContent);
       const values = [...win.querySelectorAll('[data-timers] dd')].map((value) => value.textContent);
-      assert.deepEqual(terms, [I18n.t('bpmn.timer_occurrence'), captions[language][1]]);
-      assert.deepEqual(values, [I18n.t('bpmn.timer_slot', { occurrence: 3, total: 7 }), 'Review_1']);
-      assert.doesNotMatch(terms.join(' '), /bpmn\.|\{occurrence\}|\{total\}/);
-      assert.notEqual(terms[0], terms[1]);
+      assert.deepEqual(terms, [I18n.t('bpmn.timer_occurrence'), captions[language]]);
+      assert.deepEqual(values, [I18n.t('bpmn.timer_slot', { occurrence: 3, total: 7 }), 'Check documents']);
+      assert.doesNotMatch(terms.join(' '), /bpmn\.|\{occurrence\}|\{total\}|ID/);
       win.remove();
       graph.destroy();
     }
     await I18n.setLanguage('en');
     const untrusted = '<img src=x onerror=alert(1)>';
-    const timer = savedTimer({ kind: 'Boundary', attachedToId: untrusted, totalFirings: null });
-    const win = await monitor(instance('boundary-escaped-id', { timers: [timer] }));
+    const timer = savedTimer({ kind: 'Boundary', attachedToId: 'Review_1', totalFirings: null });
+    const win = await monitor(instance('boundary-escaped-name', { timers: [timer] }), { processVersionGetRequest: modelWith(untrusted) });
+    await flush(2);
     const values = [...win.querySelectorAll('[data-timers] dd')].map((value) => value.textContent);
     assert.deepEqual(values, ['3', untrusted]);
     assert.equal(win.querySelector('[data-timers] img'), null);
+    const lost = await monitor(instance('boundary-lost-model', { timers: [{ ...timer, attachedToId: 'n_gone_zz99' }] }));
+    await flush(2);
+    assert.deepEqual([...lost.querySelectorAll('[data-timers] dd')].map((value) => value.textContent), ['3', I18n.t('bpmn.element_unavailable')]);
   } finally { await I18n.setLanguage('en'); }
 });
 
@@ -6470,8 +6546,9 @@ test('the process toolbar keeps the main actions on the bar, the rest behind a m
   assert.deepEqual(buttons, ['back', 'publish', 'run', 'save', 'more']);
   const menu = bar.querySelector('tf-menu[data-role="more-menu"]');
   const inMenu = [...menu.querySelectorAll('tf-menu-item')].map((item) => item.dataset.role);
-  assert.deepEqual(inMenu, ['variables', 'import', 'export', 'calendar', 'refresh-calendar', 'declarations', 'modeling',
+  assert.deepEqual(inMenu, ['zoom-fit-more', 'variables', 'import', 'export', 'calendar', 'refresh-calendar', 'declarations', 'modeling',
     'simulate', 'send-start', 'schedule', 'instances', 'messages', 'history']);
+  assert.equal(menu.querySelector('[data-role="zoom-fit-more"]').hidden, true, 'the menu offers zoom to fit only once the bar has dropped its own button');
   const icons = [...bar.querySelectorAll('[icon]')].map((control) => control.getAttribute('icon'));
   assert.equal(new Set(icons).size, icons.length, `every control has its own icon (${icons.join(', ')})`);
   const more = bar.querySelector('[data-role="more"]');
@@ -6629,6 +6706,26 @@ test('the Run and Simulate windows name their start entries without ids', async 
   simulation.remove();
 });
 
+test('the Simulate window says up front that a repeated step cannot be simulated, names it and offers no start', async () => {
+  const model = emptyProcessModel();
+  model.nodes.push({ id: 'n_mvcvd0bg_3zhn', name: 'Review step', kind: { UserTask: { assigneeUserId: null, outputMapping: {} } },
+    repeat: { StructuredLoop: { outputCollectionVariable: 'out' } } });
+  const published = definition('repeat-simulation', { publishedVersion: 3, model });
+  const catalog = manualStartCatalog(model, 3);
+  const simulation = openProcessSimulation(published, { version: 3 }, catalog, catalog[0]);
+  await flush(2);
+  const note = simulation.querySelector('.tf-act__note').getAttribute('message');
+  assert.equal(note, I18n.t('bpmn.simulation_repeat_unsupported', { names: 'Review step' }));
+  assert.doesNotMatch(note, /n_mvcvd0bg_3zhn/);
+  assert.equal(simulation.querySelector('[data-act="submit"]').hasAttribute('disabled'), true);
+  simulation.remove();
+  const plain = openProcessSimulation(definition('plain-simulation', { publishedVersion: 3, model: emptyProcessModel() }), { version: 3 }, catalog, catalog[0]);
+  await flush(2);
+  assert.equal(plain.querySelector('.tf-act__note').getAttribute('message'), I18n.t('bpmn.simulation_hint'));
+  assert.equal(plain.querySelector('[data-act="submit"]').hasAttribute('disabled'), false);
+  plain.remove();
+});
+
 test('every list of the inspector numbers elements that share a name, and a palette of two flows with one name does too', async () => {
   const graph = canvas();
   const config = inspector(graph);
@@ -6708,7 +6805,7 @@ test('no inspector of a typical process shows an element id, a UUID or a definit
     config.show(node, graph.templates.get(node.type));
     await flush(2);
     const clone = config.root.cloneNode(true);
-    clone.querySelectorAll('[data-technical], [data-activity-field="id"], [data-process="calledElement"], [data-process="linkDefinitionId"]').forEach((technical) => technical.remove());
+    clone.querySelectorAll('[data-technical], [data-activity-field="id"], [data-process="linkDefinitionId"]').forEach((technical) => technical.remove());
     const visible = [...clone.querySelectorAll('option, .fb-config-title, .fb-config-subtitle, .fb-field-hint, tf-alert')]
       .map((element) => element.textContent + (element.getAttribute?.('message') ?? '')).join('\n');
     assert.doesNotMatch(visible, ID_SHAPE, node.type);
@@ -6739,6 +6836,26 @@ test('a saved Send target is named, not shown as an id pair, and a failed lookup
   assert.equal(config.root.querySelector('[data-process="targetDefinitionChoice"] .tf-select-selected').textContent, 'Billing');
   assert.equal(config.root.querySelector('[data-process="targetStartChoice"] .tf-select-selected').textContent, 'Billing intake · Invoice arrives');
   assert.doesNotMatch(config.root.textContent.replace(/[^\n]*\u0000/g, ''), /Process_target_0001|n_start_0001/);
+  graph.destroy();
+});
+
+test('a Send task lists the owned definitions without a click and keeps the target id and the called process id behind technical details', async () => {
+  const definitionId = 'eeeeeeee-0000-4000-8000-00000000000e';
+  const graph = canvas(emptyProcessModel()); const config = inspector(graph);
+  const send = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_send_task'), 300, 300);
+  fixtures({ processDefinitionListRequest: { definitions: [{ definitionId, name: 'Billing', publishedVersion: 1, archived: false }], hasMore: false } });
+  config.show(send, graph.templates.get(send.type));
+  await flush(3);
+  assert.ok(calls.some((call) => call.kind === 'processDefinitionListRequest' && call.payload.offset === 0), 'the first page is requested on its own');
+  const choice = config.root.querySelector('[data-process="targetDefinitionChoice"]');
+  assert.ok([...choice.querySelectorAll('option')].some((option) => option.textContent === 'Billing'), 'and offered by name');
+  assert.ok(config.root.querySelector('tf-disclosure[data-technical] [data-process="targetDefinitionId"]'), 'the target id is a technical field');
+  assert.equal(config.root.querySelector('tf-disclosure[data-technical]').hasAttribute('open'), false);
+  assert.equal(config.root.querySelector('[data-load-targets]').hidden, true, 'nothing more to load');
+  const call = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_call_activity'), 300, 600);
+  fixtures({ processDefinitionListRequest: { definitions: [], hasMore: false } });
+  config.show(call, graph.templates.get(call.type));
+  assert.ok(config.root.querySelector('tf-disclosure[data-technical] [data-process="calledElement"]'), 'the called namespace and id are technical details');
   graph.destroy();
 });
 
@@ -6867,6 +6984,20 @@ test('undoing a change of a process setting says so instead of claiming another 
   shown.stop(); graph.destroy();
 });
 
+test('redoing a change of a process setting does not say it was undone', async () => {
+  const graph = canvas(timedModel('TimerCatch'));
+  for (const key of ['bpmn.undo_settings', 'bpmn.redo_settings']) dismissToast(I18n.t(key), 'info');
+  graph.updateProcessTimezone('Europe/Berlin');
+  graph.undo();
+  for (const key of ['bpmn.undo_settings', 'bpmn.redo_settings']) dismissToast(I18n.t(key), 'info');
+  const shown = watchToasts();
+  graph.redo();
+  assert.ok(shown.texts().includes(I18n.t('bpmn.redo_settings')));
+  assert.equal(shown.texts().includes(I18n.t('bpmn.undo_settings')), false);
+  assert.doesNotMatch(I18n.t('bpmn.redo_settings'), /^Undone|^Cofni/);
+  shown.stop(); graph.destroy();
+});
+
 test('Run is described by its reason, takes the only start entry by itself and keeps the reason on a wrapper a disabled button cannot hide', async () => {
   const model = emptyProcessModel();
   const unpublished = await mount(definition('run-reason', { model }));
@@ -6917,6 +7048,28 @@ test('a boundary event not on an activity looks unattached, not attached', () =>
   graph.destroy();
 });
 
+test('the label of an unattached event keeps clear of its Not attached tag when the room below is taken', () => {
+  const graph = canvas();
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_timer'), 400, 300);
+  const event = graph.nodes.at(-1);
+  const task = processTemplates().find((row) => row.node_type === 'bpmn_user_task');
+  for (const [x, y] of [[event.x - 120, event.y + 90], [event.x + 120, event.y + 90], [event.x - 330, event.y - 20], [event.x + 330, event.y - 20]]) graph.addNodeFromTemplate(task, x, y);
+  graph.nodes.filter((node) => node.type === 'bpmn_user_task').forEach((node, index) => { node.x = [event.x - 120, event.x + 120, event.x - 330, event.x + 330][index]; node.y = [event.y + 90, event.y + 90, event.y - 20, event.y - 20][index]; });
+  for (const element of graph.nodesLayer.querySelectorAll('.fb-process-label')) {
+    Object.defineProperties(element, { offsetWidth: { value: 100, configurable: true }, offsetHeight: { value: 30, configurable: true } });
+  }
+  graph._layoutProcessLabels();
+  const element = graph.nodesLayer.querySelector(`[data-node-id="${event.id}"]`);
+  const label = element.querySelector('.fb-process-label');
+  if (!element.classList.contains('fb-label-deferred')) {
+    const left = event.x + parseFloat(label.style.left), top = event.y + parseFloat(label.style.top);
+    const tag = { left: event.x + event.width / 2 - UNATTACHED_TAG.width / 2, right: event.x + event.width / 2 + UNATTACHED_TAG.width / 2,
+      top: event.y - UNATTACHED_TAG.offset - UNATTACHED_TAG.height, bottom: event.y - UNATTACHED_TAG.offset };
+    assert.equal(left < tag.right && tag.left < left + 100 && top < tag.bottom && tag.top < top + 30, false, 'the label does not cover the tag');
+  }
+  graph.destroy();
+});
+
 test('leader lines of six handlers on one task never run through the task, and a hidden canvas keeps its labels', () => {
   const model = emptyProcessModel();
   model.errors = ['A', 'B', 'C', 'D', 'E', 'F'].map((code) => ({ errorId: `Err_${code}`, name: `Failure ${code}`, errorCode: `CODE_${code}` }));
@@ -6947,10 +7100,16 @@ test('leader lines of six handlers on one task never run through the task, and a
   graph._layoutProcessLabels();
   assert.equal(label.style.left, '123px', 'a canvas with no layout is left as it was placed');
   assert.equal(label.hidden, false);
+  // A browser without checkVisibility answers the same question from the client rects.
+  graph.root.checkVisibility = undefined;
+  graph.root.getClientRects = () => [];
+  graph._layoutProcessLabels();
+  assert.equal(label.style.left, '123px', 'without checkVisibility a hidden canvas still keeps its labels');
+  assert.equal(label.hidden, false);
   graph.destroy();
 });
 
-test('an outside label with nowhere to go: a title goes back inside the box, an event keeps its last place', () => {
+test('an outside label with nowhere to go: a title goes back inside the box, an event shows its name on hover and in its tooltip', () => {
   const model = emptyProcessModel();
   model.nodes.splice(1, 0, { id: 'Review', name: 'A name too long for the box', kind: { UserTask: { assigneeUserId: null, outputMapping: {} } } });
   model.sequenceFlows = [{ id: 'Flow_1', sourceId: 'Start', targetId: 'Review', condition: null }, { id: 'Flow_2', sourceId: 'Review', targetId: 'End', condition: null }];
@@ -6968,7 +7127,10 @@ test('an outside label with nowhere to go: a title goes back inside the box, an 
   assert.equal(review.querySelector('.fb-process-label').hidden, true);
   assert.equal(review.querySelector('.fb-process-label-leader').hidden, true);
   assert.equal(review.classList.contains('fb-external-label'), false, 'the title is inside the box again');
-  assert.equal(startLabel.hidden, false, 'an event has no title inside, so its label stays');
-  assert.equal(startLabel.style.left, '5px');
+  assert.equal(startLabel.hidden, false, 'an event has no title inside, so its label stays available');
+  assert.equal(startLabel.style.left, '', 'but not at a spot that covers or crosses something');
+  assert.equal(start.classList.contains('fb-label-deferred'), true, 'it shows on hover and selection');
+  assert.equal(start.getAttribute('title'), startLabel.textContent, 'and always in the tooltip');
+  assert.equal(start.querySelector('.fb-process-label-leader').hidden, true);
   graph.destroy();
 });

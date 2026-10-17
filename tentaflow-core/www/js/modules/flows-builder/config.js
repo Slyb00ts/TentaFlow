@@ -747,7 +747,7 @@ export class FlowConfig {
           ${published?.calledElement?.processId ? `<option value="${escapeAttr(published.calledElement.processId)}">${escapeHtml(I18n.t('bpmn.call_definition_checking'))}</option>` : ''}
         </tf-select>
         ${this.readOnly ? '' : `<tf-button variant="secondary" data-load-call-versions hidden>${escapeHtml(I18n.t('bpmn.call_load_versions'))}</tf-button>`}
-        <tf-textarea readonly autogrow rows="2" data-process="calledElement" label="${escapeAttr(I18n.t('bpmn.call_qname'))}" value="${escapeAttr(target.namespaceUri && target.processId ? `${target.namespaceUri} · ${target.processId}` : '')}"></tf-textarea>
+        <tf-disclosure label="${escapeAttr(I18n.t('bpmn.technical_details'))}" data-technical><tf-textarea readonly autogrow rows="2" data-process="calledElement" label="${escapeAttr(I18n.t('bpmn.call_qname'))}" value="${escapeAttr(target.namespaceUri && target.processId ? `${target.namespaceUri} · ${target.processId}` : '')}"></tf-textarea></tf-disclosure>
         <p class="fb-field-hint" data-call-capability>${escapeHtml(I18n.t('bpmn.call_exact_hint'))}</p>
         <tf-button variant="secondary" data-preview-called ${published?.definitionId && published?.version && !local ? '' : 'disabled'} ${local ? 'hidden' : ''}>${escapeHtml(I18n.t('bpmn.call_preview'))}</tf-button>
         ${mapping('inputMapping', 'input_mapping')}${mapping('outputMapping', 'output_mapping')}`;
@@ -787,7 +787,7 @@ export class FlowConfig {
         fields += `<tf-select data-process="targetDefinitionChoice" wrap-selected label="${escapeAttr(I18n.t('bpmn.message_target_choice'))}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.choose_target_definition'))}</option></tf-select>
           ${this.readOnly ? '' : `<tf-button variant="secondary" data-load-targets>${escapeHtml(I18n.t('bpmn.load_target_definitions'))}</tf-button>`}
           <p class="fb-field-hint" data-target-capability>${escapeHtml(I18n.t('bpmn.target_capability_hint'))}</p>`;
-        fields += textarea('targetDefinitionId', 'message_target_definition', target[targetKind]?.definitionId, 2);
+        fields += `<tf-disclosure label="${escapeAttr(I18n.t('bpmn.technical_details'))}" data-technical>${textarea('targetDefinitionId', 'message_target_definition', target[targetKind]?.definitionId, 2)}</tf-disclosure>`;
         if (targetKind === 'Start') fields += `<tf-select data-process="targetStartChoice" wrap-selected label="${escapeAttr(I18n.t('bpmn.message_target_start_entry'))}" ${disabled}></tf-select>`;
         if (targetKind === 'Catch') fields += textarea('instanceIdExpression', 'message_target_instance_expression', target.Catch.instanceIdExpression || '', 3) + textarea('subscriptionIdExpression', 'message_target_subscription_expression', target.Catch.subscriptionIdExpression || '', 3);
         fields += textarea('payloadExpression', 'message_payload_expression', config.payloadExpression, 4) + input('ttlSeconds', 'message_ttl', config.ttlSeconds, 'type="number" min="1" max="604800" step="1"');
@@ -919,8 +919,8 @@ export class FlowConfig {
           ? [{ value: '0', label: I18n.t('bpmn.call_definition_checking') }] : [])], savedTarget.processId && savedTarget.startNodeId ? '0' : '');
         describeTarget(savedDefinitionId, savedTarget).catch(explainFailure);
       }
-      loadTargets?.addEventListener('click', async () => {
-        loadTargets.setAttribute('disabled', '');
+      const loadPage = async () => {
+        loadTargets?.setAttribute('disabled', '');
         try {
           const page = await ApiBinary.one('processDefinitionListRequest', { offset, limit: 100 });
           if (!this.root.contains(choice)) return;
@@ -930,10 +930,14 @@ export class FlowConfig {
           }
           showTargets();
           offset += page.definitions.length;
-          loadTargets.hidden = !page.hasMore;
+          if (loadTargets) loadTargets.hidden = !page.hasMore;
         } catch (error) { explainFailure(error); }
-        finally { loadTargets.removeAttribute('disabled'); }
-      });
+        finally { loadTargets?.removeAttribute('disabled'); }
+      };
+      loadTargets?.addEventListener('click', loadPage);
+      // A target is chosen from what exists, so the first page is already there
+      // when the inspector opens; the button only asks for the rest.
+      if (!this.readOnly) loadPage();
       choice.addEventListener('change', async () => {
         if (!choice.value || this.readOnly) return;
         const target = node.config.target;

@@ -326,9 +326,16 @@ class TfMenu extends HTMLElement {
     // A hidden item cannot take focus and a disabled one cannot act, so neither
     // is a stop: the arrows would otherwise end on the first of them.
     const rows = [...this.querySelectorAll(':scope > tf-menu-item:not([hidden]):not([disabled]) > .tf-menu-item')];
+    if (rows.length === 0) return;
     const at = rows.indexOf(document.activeElement);
-    if (at < 0) return;
     const go = (i) => { e.preventDefault(); rows[(i + rows.length) % rows.length].focus(); };
+    // Focus sits on an item that is hidden or disabled: the arrows walk in from
+    // the end they point to instead of doing nothing.
+    if (at < 0) {
+      if (e.key === 'ArrowDown' || e.key === 'Home') go(0);
+      else if (e.key === 'ArrowUp' || e.key === 'End') go(-1);
+      return;
+    }
     if (e.key === 'ArrowDown') go(at + 1);
     else if (e.key === 'ArrowUp') go(at - 1);
     else if (e.key === 'Home') go(0);

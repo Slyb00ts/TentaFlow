@@ -7,7 +7,7 @@
 
 class TfSelect extends HTMLElement {
   static get observedAttributes() {
-    return ['value', 'disabled', 'name', 'label', 'prefix', 'dot', 'hint', 'wrap-selected'];
+    return ['value', 'disabled', 'name', 'label', 'prefix', 'dot', 'hint', 'wrap-selected', 'title'];
   }
 
   constructor() {
@@ -168,8 +168,14 @@ class TfSelect extends HTMLElement {
     this._updateSelected();
   }
 
+  // A narrow field cuts the chosen text; the real select carries the host's title,
+  // or the whole text of the choice, as its tooltip.
   _updateSelected() {
-    this._selectedEl.textContent = this._select.selectedOptions[0]?.textContent || '';
+    const text = this._select.selectedOptions[0]?.textContent || '';
+    this._selectedEl.textContent = text;
+    const title = this.getAttribute('title') || text;
+    if (title) this._select.setAttribute('title', title);
+    else this._select.removeAttribute('title');
   }
 
   // The prefix sits over the field's left padding, so the padding follows its

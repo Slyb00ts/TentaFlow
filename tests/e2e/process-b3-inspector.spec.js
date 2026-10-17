@@ -1099,3 +1099,386 @@ test.describe('round 4: settings row on a short window', () => {
     await expect.poll(height, { message: 'with the settings row open' }).toBeGreaterThanOrEqual(400);
   });
 });
+
+// Round 5 of the designer review: the host attributes of tf-button, names in the
+// run, schedule and simulation windows, leader lines on a crowded diagram, the
+// time zone field, the closed menu, the whole canvas as a drop target, and the
+// phone in both orientations.
+function createModelDefinition(page, name, patch) {
+  return page.evaluate(async ({ processName, source }) => {
+    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+    const { emptyProcessModel } = await import('/js/modules/flows-builder/bpmn.js');
+    const model = emptyProcessModel();
+    new Function('model', source)(model);
+    const saved = await ApiBinary.one('processDefinitionSaveRequest', {
+      commandId: crypto.randomUUID(), definitionId: null, expectedRevision: 0,
+      name: processName, description: '', model,
+    });
+    return saved.definition.definitionId;
+  }, { processName: name, source: patch });
+}
+
+const REVIEW_ID = 'n_mvcuyz3t_kubw';
+const WITH_BOUNDARY_TIMER = `
+  model.timerTimezone = 'Europe/Warsaw';
+  model.nodes.splice(1, 0,
+    { id: '${REVIEW_ID}', name: 'Review step', kind: { UserTask: { assigneeUserId: null, outputMapping: {} } } },
+    { id: 'n_mvcuzz00_t1mr', name: 'Deadline', kind: { BoundaryTimer: { attachedToId: '${REVIEW_ID}', cancelActivity: true, timer: { Duration: { seconds: 3600 } } } } });
+  model.sequenceFlows = [
+    { id: 'e_mvcu0001_aaaa', sourceId: 'Start', targetId: '${REVIEW_ID}', condition: null },
+    { id: 'e_mvcu0002_bbbb', sourceId: '${REVIEW_ID}', targetId: 'End', condition: null },
+    { id: 'e_mvcu0003_cccc', sourceId: 'n_mvcuzz00_t1mr', targetId: 'End', condition: null }];
+  model.diagram.shapes = [
+    { elementId: 'Start', x: 80, y: 160, width: 56, height: 56 }, { elementId: '${REVIEW_ID}', x: 200, y: 160, width: 240, height: 96 },
+    { elementId: 'n_mvcuzz00_t1mr', x: 412, y: 228, width: 56, height: 56 }, { elementId: 'End', x: 550, y: 160, width: 56, height: 56 }];
+  model.diagram.edges = model.sequenceFlows.map((edge) => ({ sequenceFlowId: edge.id, waypoints: [{ x: 100, y: 180 }, { x: 300, y: 180 }] }));`;
+const WITH_REPEAT = `
+  model.nodes.splice(1, 0, { id: 'n_mvcvd0bg_3zhn', name: 'Review step', kind: { UserTask: { assigneeUserId: null, outputMapping: {} } },
+    repeat: { StructuredLoop: { condition: 'vars.more', testBefore: false, maxIterations: 3, outputCollectionVariable: 'results' } } });
+  model.variables = { results: [] };
+  model.sequenceFlows = [
+    { id: 'e_mvcu0001_aaaa', sourceId: 'Start', targetId: 'n_mvcvd0bg_3zhn', condition: null },
+    { id: 'e_mvcu0002_bbbb', sourceId: 'n_mvcvd0bg_3zhn', targetId: 'End', condition: null }];
+  model.diagram.shapes = [
+    { elementId: 'Start', x: 80, y: 160, width: 56, height: 56 }, { elementId: 'n_mvcvd0bg_3zhn', x: 200, y: 160, width: 240, height: 96 },
+    { elementId: 'End', x: 550, y: 160, width: 56, height: 56 }];
+  model.diagram.edges = model.sequenceFlows.map((edge) => ({ sequenceFlowId: edge.id, waypoints: [{ x: 100, y: 180 }, { x: 300, y: 180 }] }));`;
+
+test.describe('round 5: names in every window, closed menu, drops and the clock', () => {
+  test.use({ viewport: { width: 1600, height: 950 } });
+
+  test('tf-button keeps its attributes on the host and announces one button', async ({ page }) => {
+    test.setTimeout(120000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Host attributes');
+    await openDesigner(page, { login: false, id: own });
+    const host = page.locator('tf-button[aria-label="More"]');
+    await expect(host).toHaveCount(1);
+    await expect(page.getByRole('button', { name: 'More' })).toHaveCount(1);
+    expect(await host.evaluate((element) => element.matches('[aria-haspopup="menu"]') && element.closest('.fb-topbar') !== null)).toBe(true);
+    await host.click();
+    await expect(page.locator('tf-button[aria-label="More"][aria-expanded="true"]')).toHaveCount(1);
+    await page.keyboard.press('Escape');
+    await expect(page.locator('tf-button[aria-label="More"][aria-expanded="true"]')).toHaveCount(0);
+    expect(await page.locator('tf-button[data-role="zoom-in"]').evaluate((element) => element.querySelector('button').getAttribute('title')), 'title reaches the real button').toBeTruthy();
+  });
+
+  test('a closed menu leaves the tab order and the accessibility tree', async ({ page }) => {
+    test.setTimeout(120000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Closed menu');
+    await openDesigner(page, { login: false, id: own });
+    const menu = page.locator('tf-menu[data-role="more-menu"]');
+    await expect(menu.getByRole('menuitem')).toHaveCount(0);
+    await page.locator('[data-role="more"] button').focus();
+    await page.keyboard.press('Tab');
+    expect(await page.evaluate(() => document.activeElement?.closest('tf-menu[data-role="more-menu"]') !== null), 'Tab does not land in the closed menu').toBe(false);
+    await page.locator('[data-role="more"] button').click();
+    await expect.poll(() => menu.getByRole('menuitem').count()).toBeGreaterThan(5);
+  });
+
+  for (const [width, height] of [[1600, 950], [1280, 720], [1024, 700]]) {
+    test(`a palette drop works over the whole visible canvas at ${width}x${height}, down to its bottom edge`, async ({ page }) => {
+      test.setTimeout(120000);
+      await page.setViewportSize({ width, height });
+      await loginAsAdmin(page, { port: PORT });
+      const own = await createDefinition(page, `Edge drop ${width}`);
+      await openDesigner(page, { login: false, id: own });
+      // The screen eases in with a transform; positions are read once it has settled.
+      await page.waitForTimeout(1500);
+      const wrap = await rect(page.locator('.fb-canvas-wrap'));
+      const canvas = await rect(page.locator('.fb-canvas'));
+      expect(canvas.bottom, 'the canvas reaches the bottom of its area').toBeGreaterThanOrEqual(wrap.bottom - 1);
+      await dragPaletteItem(page, 'Sub-?process', 120, canvas.bottom - canvas.top - 24);
+      await expect(page.locator('.fb-canvas .fb-node.bpmn_sub_process')).toHaveCount(1);
+    });
+  }
+
+  test('a time zone that is not one blocks the save and keeps the text, a lowercase one is stored as the engine spells it', async ({ page }) => {
+    test.setTimeout(180000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createModelDefinition(page, 'Zone typing', WITH_BOUNDARY_TIMER);
+    await openDesigner(page, { login: false, id: own });
+    const field = page.locator('[data-role="timer-timezone"]');
+    if (await page.locator('.fb-process-notice.fb-collapsed').count()) await page.locator('[data-role="notice-toggle"]').click();
+    const input = field.locator('input');
+    await input.fill('Mars/Olympus');
+    await input.blur();
+    await expect(field).toHaveAttribute('error', /Mars\/Olympus/);
+    await page.locator('[data-role="save"]').click();
+    await expect(page.locator('.toast', { hasText: 'Process saved' })).toHaveCount(0);
+    await expect(page.locator('[data-role="error"]')).toBeVisible();
+    await expect(input).toHaveValue('Mars/Olympus');
+    await page.locator('.fb-canvas .fb-node.bpmn_user_task').click({ position: { x: 20, y: 20 } });
+    await expect(field).toHaveAttribute('error', /Mars\/Olympus/);
+    await input.fill('europe/warsaw');
+    await input.blur();
+    await expect(input).toHaveValue('Europe/Warsaw');
+    await expect(field).not.toHaveAttribute('error', /.+/);
+    await page.locator('[data-role="save"]').click();
+    await expect(page.locator('.toast', { hasText: 'Process saved' })).toHaveCount(1);
+    expect((await storedModel2(page, own)).timerTimezone).toBe('Europe/Warsaw');
+  });
+
+  test('redo of a process setting says it was redone', async ({ page }) => {
+    test.setTimeout(120000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createModelDefinition(page, 'Redo toast', WITH_BOUNDARY_TIMER);
+    await openDesigner(page, { login: false, id: own });
+    await page.evaluate(async () => {
+      const { default: builder } = await import('/js/modules/flows-builder.js');
+      builder._state.canvas.updateProcessTimezone('Europe/Berlin');
+      builder._state.canvas.undo();
+    });
+    await expect(page.locator('.toast', { hasText: /^Undone/ })).toHaveCount(1);
+    await page.evaluate(async () => {
+      const { default: builder } = await import('/js/modules/flows-builder.js');
+      builder._state.canvas.redo();
+    });
+    await expect(page.locator('.toast', { hasText: /^Redone/ })).toHaveCount(1);
+  });
+
+  test('windows of a running process name the activity and never show an element id', async ({ page }) => {
+    test.setTimeout(240000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createModelDefinition(page, 'Run with timer', WITH_BOUNDARY_TIMER);
+    await openDesigner(page, { login: false, id: own });
+    await page.locator('[data-role="publish"]').click();
+    await expect(page.locator('.toast').first()).toContainText('published', { timeout: 20000 });
+    await page.locator('[data-role="run"]').click();
+    const run = page.locator('tf-window.tf-act-window').last();
+    await run.locator('[data-act="submit"]').click();
+    const instance = page.locator('tf-window.fb-process-window', { hasText: 'Run with timer' }).last();
+    const timers = instance.locator('[data-timers]');
+    await expect(timers).toContainText('Review step', { timeout: 20000 });
+    expect(await timers.innerText()).not.toMatch(ID_SHAPE);
+    expect(await instance.innerText()).not.toMatch(ID_SHAPE);
+  });
+
+  test('the Simulate window says up front that a repeated step cannot run, by name', async ({ page }) => {
+    test.setTimeout(240000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createModelDefinition(page, 'Repeat simulation', WITH_REPEAT);
+    await openDesigner(page, { login: false, id: own });
+    await page.locator('[data-role="publish"]').click();
+    await expect(page.locator('.toast').first()).toContainText('published', { timeout: 20000 });
+    await page.locator('[data-role="more"]').click();
+    await page.locator('tf-menu[data-role="more-menu"] [data-role="simulate"]').click();
+    const simulation = page.locator('tf-window.tf-act-window').last();
+    await expect(simulation.locator('.tf-act__note')).toHaveAttribute('message', /Review step/);
+    expect(await simulation.innerText()).not.toMatch(ID_SHAPE);
+    await expect(simulation.locator('[data-act="submit"]')).toHaveAttribute('disabled', '');
+  });
+
+  test('a Send task offers the owned definitions on its own and keeps the target id behind technical details', async ({ page }) => {
+    test.setTimeout(180000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Send picker');
+    await openDesigner(page, { login: false, id: own });
+    await dragPaletteItem(page, 'Send task', 400, 200);
+    await page.locator('.fb-canvas .fb-node.bpmn_send_task').click({ position: { x: 20, y: 20 } });
+    const picker = page.locator('.fb-config [data-process="targetDefinitionChoice"]');
+    await expect(picker).toBeVisible();
+    await expect.poll(() => picker.evaluate((element) => [...element.querySelectorAll('option')].map((option) => option.textContent)),
+      { message: 'the first page of owned definitions is listed without a click' }).toContain(PROCESS_NAME);
+    const technical = page.locator('.fb-config tf-disclosure[data-technical]', { has: page.locator('[data-process="targetDefinitionId"]') });
+    await expect(technical).not.toHaveAttribute('open', '');
+    await expect(page.locator('.fb-config [data-process="targetDefinitionId"]')).toBeHidden();
+  });
+});
+
+const storedModel2 = (page, id) => page.evaluate(async (target) => {
+  const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+  return (await ApiBinary.one('processDefinitionGetRequest', { definitionId: target })).definition.model;
+}, id);
+
+test.describe('round 5: the bar and its menu', () => {
+  test('zoom to fit is in the More menu exactly when the bar has dropped its own button', async ({ page }) => {
+    test.setTimeout(180000);
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Zoom fit menu');
+    await openDesigner(page, { login: false, id: own });
+    const state = () => page.evaluate(() => ({
+      barHidden: getComputedStyle(document.querySelector('[data-role="zoom-fit"]')).display === 'none',
+      menuHidden: document.querySelector('[data-role="zoom-fit-more"]').hidden,
+    }));
+    expect(await state(), 'room enough: the bar keeps its button and the menu does not repeat it').toEqual({ barHidden: false, menuHidden: true });
+    // A bar this narrow is out of room for everything but the last step.
+    await page.locator('.fb-topbar').evaluate((bar) => { bar.style.maxWidth = '430px'; });
+    await expect.poll(state).toEqual({ barHidden: true, menuHidden: false });
+    await page.locator('.fb-topbar').evaluate((bar) => { bar.style.maxWidth = ''; });
+    await expect.poll(state).toEqual({ barHidden: false, menuHidden: true });
+  });
+});
+
+test.describe('round 5: tag and label', () => {
+  test.use({ viewport: { width: 1600, height: 950 } });
+
+  test('the name of an event that is on no task is not covered by its Not attached tag', async ({ page }) => {
+    test.setTimeout(120000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Tag and label');
+    await openDesigner(page, { login: false, id: own });
+    await page.waitForTimeout(1500);
+    await dragPaletteItem(page, 'Boundary timer', 500, 330);
+    const event = page.locator('.fb-canvas .fb-node.bpmn_boundary_timer');
+    await expect(event).toHaveClass(/fb-unattached/);
+    await page.waitForTimeout(500);
+    const covered = await event.evaluate((element) => {
+      const tag = getComputedStyle(element, '::after');
+      const box = element.getBoundingClientRect();
+      const scale = box.width / element.offsetWidth;
+      const width = parseFloat(tag.width) * scale; const height = parseFloat(tag.height) * scale;
+      const pill = { left: box.left + box.width / 2 - width / 2, right: box.left + box.width / 2 + width / 2,
+        top: box.top - 10 * scale - height, bottom: box.top - 10 * scale };
+      const label = element.querySelector('.fb-process-label');
+      if (label.hidden || getComputedStyle(label).visibility === 'hidden') return false;
+      const l = label.getBoundingClientRect();
+      return l.left < pill.right && pill.left < l.right && l.top < pill.bottom && pill.top < l.bottom;
+    });
+    expect(covered, 'the label and the tag do not overlap').toBe(false);
+  });
+});
+
+test.describe('round 5: crowded diagram', () => {
+  test.use({ viewport: { width: 1600, height: 950 } });
+
+  test('no leader line crosses an element and a label without a spot shows its name on hover', async ({ page }) => {
+    test.setTimeout(240000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Crowded');
+    await openDesigner(page, { login: false, id: own });
+    await page.evaluate(async () => {
+      const { default: builder } = await import('/js/modules/flows-builder.js');
+      const canvas = builder._state.canvas;
+      for (let index = 0; index < 12; index += 1) {
+        const task = canvas.addNodeFromTemplate(canvas.templates.get('bpmn_service_task'), 0, 0, { cascade: true });
+        task.x = 100 + (index % 6) * 320; task.y = 100 + Math.floor(index / 6) * 300;
+        task.label = `Review step ${index}`;
+        for (let handler = 0; handler < 4; handler += 1) canvas.addBoundaryNode(task.id, handler % 2 ? 'bpmn_boundary_escalation' : 'bpmn_boundary_error');
+      }
+      canvas.render();
+      canvas.fitToContent();
+    });
+    await page.waitForTimeout(800);
+    const crossings = await page.evaluate(async () => {
+      const { default: builder } = await import('/js/modules/flows-builder.js');
+      const canvas = builder._state.canvas;
+      const hits = (x1, y1, x2, y2, rect) => {
+        let near = 0; let far = 1;
+        for (const [from, delta, low, high] of [[x1, x2 - x1, rect.left, rect.right], [y1, y2 - y1, rect.top, rect.bottom]]) {
+          if (delta === 0) { if (from < low || from > high) return false; } else {
+            const enter = (low - from) / delta; const leave = (high - from) / delta;
+            near = Math.max(near, Math.min(enter, leave)); far = Math.min(far, Math.max(enter, leave));
+            if (near > far) return false;
+          }
+        }
+        return true;
+      };
+      const found = [];
+      let shown = 0; let deferred = 0;
+      for (const node of canvas.nodes) {
+        const element = canvas.nodesLayer.querySelector(`[data-node-id="${CSS.escape(node.id)}"]`);
+        if (element.classList.contains('fb-label-deferred')) deferred += 1;
+        const leader = element.querySelector('.fb-process-label-leader');
+        if (!leader || leader.hidden) continue;
+        shown += 1;
+        const x1 = node.x + parseFloat(leader.style.left); const y1 = node.y + parseFloat(leader.style.top);
+        const angle = Number(/rotate\(([-\d.e]+)rad\)/.exec(leader.style.transform)[1]);
+        const length = parseFloat(leader.style.width);
+        const x2 = x1 + Math.cos(angle) * length; const y2 = y1 + Math.sin(angle) * length;
+        for (const other of canvas.nodes) {
+          if (other.id === node.id) continue;
+          if (hits(x1, y1, x2, y2, { left: other.x + 3, top: other.y + 3, right: other.x + other.width - 3, bottom: other.y + other.height - 3 })) found.push(`${node.id} -> ${other.id}`);
+        }
+        if (length > 260) found.push(`${node.id} leader ${Math.round(length)}px`);
+      }
+      return { found, shown, deferred, nodes: canvas.nodes.length };
+    });
+    expect(crossings.nodes, '12 tasks with 4 handlers each, plus Start and End').toBe(62);
+    expect(crossings.found).toEqual([]);
+    expect(crossings.shown + crossings.deferred).toBeGreaterThan(0);
+  });
+});
+
+test.describe('round 5: phone', () => {
+  for (const [name, width, height] of [['portrait', 390, 844], ['landscape', 844, 390]]) {
+    test(`the bars stay in view and the More menu stays on screen in ${name}`, async ({ page }) => {
+      test.setTimeout(180000);
+      await page.setViewportSize({ width, height });
+      await loginAsAdmin(page, { port: PORT });
+      const own = await createDefinition(page, `Phone ${name}`);
+      await openDesigner(page, { login: false, id: own });
+      await addServiceTask(page);
+      const bar = page.locator('.fb-bottombar');
+      // The screen eases in with a transform, so a first sample would be mid-flight.
+      await page.waitForTimeout(1800);
+      expect((await rect(bar)).bottom, 'the bottom bar ends inside the window').toBeLessThanOrEqual(height + 0.5);
+      await expect(page.locator('.fb-bottombar [data-role="undo"]')).toBeVisible();
+      expect((await rect(page.locator('.fb-bottombar [data-role="undo"]'))).bottom).toBeLessThanOrEqual(height);
+      const topbar = page.locator('.fb-topbar');
+      await page.locator('[data-role="zoom-in"]').click();
+      expect(await topbar.evaluate((element) => element.scrollTop), 'Back and the name never scroll away').toBe(0);
+      await page.locator('[data-role="more"]').click();
+      await page.waitForTimeout(500);
+      const menu = await page.locator('tf-menu[data-role="more-menu"]').evaluate((element) => {
+        const box = element.shadowRoot.querySelector('.tf-menu').getBoundingClientRect();
+        return { top: box.top, bottom: box.bottom, left: box.left, right: box.right };
+      });
+      expect(menu.bottom, 'the menu ends inside the window').toBeLessThanOrEqual(height);
+      expect(menu.right).toBeLessThanOrEqual(width);
+      expect(menu.left).toBeGreaterThanOrEqual(0);
+    });
+  }
+
+  test('the bar refits without flicker or a ResizeObserver loop while the window is resized', async ({ page }) => {
+    test.setTimeout(180000);
+    const errors = [];
+    page.on('pageerror', (error) => errors.push(error.message));
+    page.on('console', (message) => { if (message.type() === 'error') errors.push(message.text()); });
+    await page.setViewportSize({ width: 1100, height: 800 });
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Refit');
+    await openDesigner(page, { login: false, id: own });
+    // Find the width where the bar takes a step, so the wobble below crosses it.
+    const classesAt = async (width) => {
+      await page.setViewportSize({ width, height: 800 });
+      await page.waitForTimeout(150);
+      return page.locator('.fb-topbar').evaluate((bar) => bar.className);
+    };
+    let edge = null;
+    let previous = await classesAt(1500);
+    for (let width = 1460; width >= 800 && edge === null; width -= 10) {
+      const current = await classesAt(width);
+      if (current !== previous) edge = width;
+      previous = current;
+    }
+    expect(edge, 'the bar takes a step somewhere between 1500 and 800 px').not.toBeNull();
+    // The step lies between `edge` and the 10 px wider window; narrow that to a pixel.
+    const tight = await classesAt(edge);
+    let wide = edge + 10;
+    for (let probe = edge + 1; probe < edge + 10; probe += 1) {
+      if (await classesAt(probe) === tight) wide = probe; else break;
+    }
+    edge = wide;
+    await classesAt(edge);
+    // The classes as painted, one sample per frame: the measuring itself briefly
+    // clears them inside a frame, which nobody sees.
+    await page.evaluate(() => {
+      const bar = document.querySelector('.fb-topbar');
+      window.__barFrames = [];
+      const sample = () => { window.__barFrames.push(bar.className); window.__barSampling = requestAnimationFrame(sample); };
+      sample();
+    });
+    for (let step = 0; step < 16; step += 1) {
+      await page.setViewportSize({ width: edge + (step % 2 ? 4 : -3), height: 800 });
+      await page.waitForTimeout(60);
+    }
+    await page.waitForTimeout(400);
+    const frames = await page.evaluate(() => { cancelAnimationFrame(window.__barSampling); return window.__barFrames; });
+    const changes = frames.filter((value, index) => index > 0 && value !== frames[index - 1]).length;
+    expect(changes, 'the buttons are not toggled back and forth as the width wobbles').toBeLessThanOrEqual(2);
+    expect(errors.filter((message) => /ResizeObserver/.test(message))).toEqual([]);
+  });
+});

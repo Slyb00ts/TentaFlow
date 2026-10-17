@@ -1256,6 +1256,20 @@ test('tf-window: a dialog still renders exactly one control, and it closes', asy
   assert.deepEqual(actions, ['close']);
 });
 
+test('tf-window: the control names and the confirm buttons come from the UI language, not from Polish', async () => {
+  const { TfWindow } = await import('./tf-window.js');
+  const { I18n } = await import('/js/i18n.js');
+  const win = mount(new TfWindow(), { title: 'X', buttons: 'close' });
+  const close = win.shadowRoot.querySelector('.tf-window-control[data-action="close"]');
+  assert.equal(close.getAttribute('aria-label'), I18n.t('common.close'));
+  assert.notEqual(close.getAttribute('aria-label'), 'Zamknij');
+  void TfWindow.confirm({ message: 'Sure?' });
+  const dialog = [...document.querySelectorAll('tf-window')].at(-1);
+  assert.equal(dialog.querySelector('[data-action="cancel"]').textContent.trim(), I18n.t('common.cancel'));
+  assert.equal(dialog.querySelector('[data-action="confirm"]').textContent.trim(), I18n.t('common.confirm'));
+  dialog.remove();
+});
+
 test('tf-window: controls.css spaces the group from the title on its left', () => {
   const css = readFileSync(join(WWW_ROOT, 'css', 'controls.css'), 'utf8');
   assert.match(css, /\.tf-window-controls \{[^}]*margin-left: 4px/);
@@ -1485,20 +1499,29 @@ test('tf-menu: the arrow keys, Home and End walk only the items that are shown a
   menu.remove();
 });
 
-test('tf-button: aria-label, aria-describedby, aria-controls, aria-expanded and aria-haspopup reach the real button only, also when they change', async () => {
+test('tf-select: the real select carries the host title, else the whole chosen text as its tooltip', () => {
+  const host = document.createElement('div');
+  host.innerHTML = '<tf-select value="b"><option value="a">First</option><option value="b">A long chosen option that the field cuts</option></tf-select>';
+  document.body.append(host);
+  const select = host.querySelector('tf-select');
+  assert.equal(select.querySelector('select').getAttribute('title'), 'A long chosen option that the field cuts');
+  select.setAttribute('title', 'Repetition');
+  assert.equal(select.querySelector('select').getAttribute('title'), 'Repetition');
+  select.removeAttribute('title');
+  select.setAttribute('value', 'a');
+  assert.equal(select.querySelector('select').getAttribute('title'), 'First');
+  host.remove();
+});
+
+test('tf-button: the host keeps its aria attributes and title, and the real button mirrors them, also when they change', async () => {
   const button = mount(new TfButton(), { icon: 'more' });
   await flush();
   const inner = () => button.querySelector('button');
-  const names = ['aria-label', 'aria-describedby', 'aria-controls', 'aria-expanded', 'aria-haspopup'];
-  button.setAttribute('aria-label', 'More');
-  button.setAttribute('aria-describedby', 'why');
-  button.setAttribute('aria-controls', 'panel');
-  button.setAttribute('aria-expanded', 'false');
-  button.setAttribute('aria-haspopup', 'menu');
-  assert.deepEqual(names.map((name) => inner().getAttribute(name)), ['More', 'why', 'panel', 'false', 'menu']);
-  assert.deepEqual(names.map((name) => Element.prototype.hasAttribute.call(button, name)), [false, false, false, false, false],
-    'the host keeps no second copy for assistive technology to announce');
-  assert.equal(button.getAttribute('aria-expanded'), 'false', 'the host still answers for the state it was given');
+  const names = ['aria-label', 'aria-describedby', 'aria-controls', 'aria-expanded', 'aria-haspopup', 'title'];
+  const values = ['More', 'why', 'panel', 'false', 'menu', 'Hint'];
+  names.forEach((name, index) => button.setAttribute(name, values[index]));
+  assert.deepEqual(names.map((name) => inner().getAttribute(name)), values);
+  assert.deepEqual(names.map((name) => button.getAttribute(name)), values, 'the host stays selectable by them');
   button.setAttribute('aria-expanded', 'true');
   assert.equal(inner().getAttribute('aria-expanded'), 'true');
   button.removeAttribute('aria-describedby');
@@ -1507,7 +1530,7 @@ test('tf-button: aria-label, aria-describedby, aria-controls, aria-expanded and 
   button.remove();
 });
 
-test('tf-button: aria attributes written in markup move to the real button', async () => {
+test('tf-button: aria attributes written in markup stay on the host and reach the real button', async () => {
   const host = document.createElement('div');
   host.innerHTML = '<tf-button icon="more" aria-controls="drawer" aria-expanded="true"></tf-button>';
   document.body.append(host);
@@ -1516,6 +1539,7 @@ test('tf-button: aria attributes written in markup move to the real button', asy
   const inner = button.querySelector('button');
   assert.equal(inner.getAttribute('aria-controls'), 'drawer');
   assert.equal(inner.getAttribute('aria-expanded'), 'true');
-  assert.equal(Element.prototype.hasAttribute.call(button, 'aria-controls'), false);
+  assert.equal(button.getAttribute('aria-controls'), 'drawer');
+  assert.equal(host.querySelector('tf-button[aria-expanded="true"]'), button);
   host.remove();
 });

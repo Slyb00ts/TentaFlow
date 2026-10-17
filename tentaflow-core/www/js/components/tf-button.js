@@ -3,11 +3,12 @@
 // Opis: Komponent <tf-button> — renderuje standardowy button z klasami .tf-btn.
 //       Light DOM (bez Shadow DOM) zeby controls.css obslugiwal style.
 //       Atrybuty: variant, tone, size, icon, disabled, full-width, wrap.
-//       `aria-label`, `aria-describedby`, `aria-controls`, `aria-expanded` and
-//       `aria-haspopup` live on the inner <button>, also when they change later:
-//       the host is not focusable, so a name, a description or a menu state has
-//       to be on the real control. The host never keeps a second copy; its
-//       get/set/removeAttribute still answer for these names.
+//       `aria-label`, `aria-describedby`, `aria-controls`, `aria-expanded`,
+//       `aria-haspopup` and `title` stay on the host (selectors, closest(),
+//       toggleAttribute and cloneNode keep working) and are mirrored onto the
+//       inner <button>, also when they change later: the host is not focusable,
+//       so a name, a description or a menu state has to be on the real control.
+//       The host is a generic element, so assistive tech announces only the button.
 // Przyklad: <tf-button variant="primary" icon="plus">Dodaj</tf-button>
 // =============================================================================
 
@@ -27,7 +28,7 @@ function safeIconName(value) {
   return /^[a-z0-9_-]{1,64}$/i.test(text) ? text : '';
 }
 
-const FORWARDED_ARIA = ['aria-label', 'aria-describedby', 'aria-controls', 'aria-expanded', 'aria-haspopup'];
+const FORWARDED_ARIA = ['aria-label', 'aria-describedby', 'aria-controls', 'aria-expanded', 'aria-haspopup', 'title'];
 
 const VARIANT_CLASS = {
   primary:        'tf-btn-primary',
@@ -61,7 +62,6 @@ class TfButton extends HTMLElement {
     super();
     this._btn = null;
     this._observer = null;
-    this._aria = new Map();
     this._onLightMutation = this._onLightMutation.bind(this);
   }
 
@@ -84,34 +84,8 @@ class TfButton extends HTMLElement {
     }
   }
 
-  // A parser or a template sets these as plain attributes; they are taken over
-  // here so the host does not announce the same name or state as the button.
-  attributeChangedCallback(name, _before, value) {
-    if (FORWARDED_ARIA.includes(name) && value !== null) {
-      this._aria.set(name, value);
-      super.removeAttribute(name);
-    }
+  attributeChangedCallback() {
     if (this._btn) this._update();
-  }
-
-  setAttribute(name, value) {
-    if (!FORWARDED_ARIA.includes(name)) { super.setAttribute(name, value); return; }
-    this._aria.set(name, String(value));
-    if (this._btn) this._update();
-  }
-
-  removeAttribute(name) {
-    if (!FORWARDED_ARIA.includes(name)) { super.removeAttribute(name); return; }
-    this._aria.delete(name);
-    if (this._btn) this._update();
-  }
-
-  getAttribute(name) {
-    return FORWARDED_ARIA.includes(name) ? (this._aria.get(name) ?? null) : super.getAttribute(name);
-  }
-
-  hasAttribute(name) {
-    return FORWARDED_ARIA.includes(name) ? this._aria.has(name) : super.hasAttribute(name);
   }
 
   // The rebuild re-appends the button, which mutates children again; that pass
@@ -225,8 +199,8 @@ class TfButton extends HTMLElement {
     const type = this.getAttribute('type');
     if (type) this._btn.setAttribute('type', type);
     for (const name of FORWARDED_ARIA) {
-      const value = this._aria.get(name);
-      if (value === undefined || value === '') this._btn.removeAttribute(name);
+      const value = this.getAttribute(name);
+      if (value === null || value === '') this._btn.removeAttribute(name);
       else this._btn.setAttribute(name, value);
     }
   }

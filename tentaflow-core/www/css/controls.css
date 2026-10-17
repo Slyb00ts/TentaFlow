@@ -1793,6 +1793,7 @@ tf-chip[clickable]:focus-visible > .tf-chip {
 
 .tf-menu {
   position: absolute;
+  box-sizing: border-box;
   background: var(--tf-bg-card);
   border: 1px solid var(--tf-border);
   border-radius: var(--tf-radius);
@@ -1804,10 +1805,14 @@ tf-chip[clickable]:focus-visible > .tf-chip {
   filter: blur(8px);
   transform-origin: top left;
   pointer-events: none;
+  /* Closed means out of the tab order and the accessibility tree, not just
+     transparent; the delay lets the fade finish before it drops out. */
+  visibility: hidden;
   transition:
     opacity 0.22s var(--tf-spring-smooth),
     transform 0.24s var(--tf-spring-smooth),
-    filter 0.24s var(--tf-spring-smooth);
+    filter 0.24s var(--tf-spring-smooth),
+    visibility 0s linear 0.24s;
   z-index: 100;
 }
 /* `compact`: a menu anchored to a table row hangs over the records the reader
@@ -1838,6 +1843,8 @@ tf-menu[compact] .tf-menu-item {
   transform: translateY(0) scale(1);
   filter: blur(0);
   pointer-events: auto;
+  visibility: visible;
+  transition-delay: 0s, 0s, 0s, 0s;
 }
 /* Inline standalone menu (e.g. SDK Menu component without a trigger): the panel
    lives in normal flow inside its host instead of floating as an absolute
@@ -1845,6 +1852,7 @@ tf-menu[compact] .tf-menu-item {
    :host-context targets the host's inline modifier from inside the shadow. */
 :host-context(.tf-menu--inline) .tf-menu {
   position: static;
+  visibility: visible;
   opacity: 1;
   transform: none;
   filter: none;

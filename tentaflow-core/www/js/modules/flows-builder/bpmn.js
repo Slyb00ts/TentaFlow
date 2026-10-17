@@ -424,6 +424,16 @@ export function processTimezoneProblem(value) {
   try { new Intl.DateTimeFormat('en', { timeZone: zone }); return null; } catch (_) { return 'invalid'; }
 }
 
+// The spelling the engine lists for a zone the runtime resolves ("europe/warsaw"
+// becomes "Europe/Warsaw", a link becomes its target), '' for an empty field and
+// null for a name that cannot be used. The server compares names exactly.
+export function processTimezoneCanonical(value) {
+  const zone = String(value ?? '').trim();
+  if (processTimezoneProblem(zone)) return null;
+  if (!zone || typeof Intl === 'undefined' || typeof Intl.DateTimeFormat !== 'function') return zone;
+  return new Intl.DateTimeFormat('en', { timeZone: zone }).resolvedOptions().timeZone || zone;
+}
+
 export function processTimezoneText(gap) {
   if (!gap) return I18n.t('bpmn.timer_timezone_server');
   return gap.element == null ? I18n.t('bpmn.timer_timezone_calendar_missing')
@@ -449,6 +459,20 @@ export function processUnusedDeclarations(model) {
   return DECLARATIONS.flatMap(([kind, list, idKey]) => (model?.[list] || [])
     .filter((declaration) => !used.has(declaration[idKey]))
     .map((declaration) => ({ kind, name: String(declaration.name || declaration.errorCode || declaration.escalationCode || '').trim() })));
+}
+
+// The names of the elements that repeat, in every body and nested sub-process.
+export function processRepeatedElements(model) {
+  const names = processElementNames(model);
+  const repeated = [];
+  const visit = (body) => {
+    for (const node of body?.nodes || []) {
+      if (node.repeat) repeated.push(names.get(node.id));
+      if (node.kind?.SubProcess) visit(node.kind.SubProcess.body);
+    }
+  };
+  [model, ...(model?.additionalProcesses || [])].forEach(visit);
+  return repeated;
 }
 
 // The repeated elements that have no output collection variable. Saving a draft
@@ -546,12 +570,18 @@ export function processExplainError(message, model) {
   const text = String(message ?? '').replace(/^protocol error \w+:\s*/i, '');
   if (/explicit IANA timezone/.test(text)) return processTimezoneText(processTimezoneGaps(model)[0]);
   if (/timerless process cannot declare a timer timezone/.test(text)) return I18n.t('bpmn.timer_timezone_unused');
+  if (/unknown timezone/i.test(text)) {
+    const zone = [model, ...(model?.additionalProcesses || [])].map((body) => body?.timerTimezone).find(Boolean);
+    return zone ? I18n.t('bpmn.timer_timezone_invalid', { zone }) : I18n.t('bpmn.timer_timezone_server');
+  }
   const unused = /unreferenced (message|error|escalation|signal) declaration/.exec(text);
   if (unused) {
     const named = processUnusedDeclarations(model).filter((declaration) => declaration.kind === unused[1]);
     return named.length ? named.map(({ kind, name }) => I18n.t(`bpmn.unused_${kind}`, { name })).join(' ')
       : I18n.t(`bpmn.unused_${unused[1]}_any`);
   }
+  const unsimulated = /repetition is unsupported in simulation \(([\w.-]+)\)/.exec(text);
+  if (unsimulated && names.has(unsimulated[1])) return I18n.t('bpmn.simulation_repeat_unsupported', { names: names.get(unsimulated[1]) });
   const repeated = /repeat ([\w.-]+) has invalid output collection variable/.exec(text);
   if (repeated && names.has(repeated[1])) return I18n.t('bpmn.repeat_output_missing', { node: names.get(repeated[1]) });
   const path = /escalation boundary ([\w-]+) has unsupported immediate path (\w+) at/.exec(text);

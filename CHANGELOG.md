@@ -207,6 +207,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   BadRequest”), strefa czasowa jest przycinana, sprawdzana i znika z ostatnim timerem,
   linie etykiet omijają zadanie, do którego należą, a niepodłączone zdarzenie
   brzegowe ma przerywany kontur i napis.
+- Projektant BPMN, runda 5 (GUI): `tf-button` znów trzyma atrybuty aria i `title`
+  na hoście (selektory, `closest()`, `toggleAttribute`, `cloneNode`) i odzwierciedla
+  je na prawdziwym przycisku. Zadanie Send samo ładuje definicje, identyfikatory
+  celu i wywoływanego procesu są za szczegółami technicznymi, a okno instancji,
+  wybór subskrypcji i incydenty nazywają kroki. Symulacja z góry mówi, że kroku
+  powtarzanego nie uruchomi. Linie do etykiet nie przechodzą przez żaden element,
+  a etykieta bez miejsca pokazuje nazwę po najechaniu. Strefa czasowa jest
+  zapisywana w pisowni silnika, a tekst, który nią nie jest, blokuje zapis i zostaje
+  w polu. Ponowienie mówi „Ponowiono”, zamknięte menu wypada z kolejności Tab,
+  upuszczanie z palety działa na całym płótnie, a telefon (pionowo i poziomo) ma
+  dolny pasek z Cofnij i Ponów w zasięgu oraz menu „Więcej” w oknie.
 
 ### TentaNas
 

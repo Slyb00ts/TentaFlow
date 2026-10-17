@@ -11,7 +11,10 @@
 //   await I18n.setLanguage('fr');
 // =============================================================================
 
-import { ApiBinary } from '/js/protocol/api-binary-shim.js';
+// The protocol shim is loaded where a preference is synced, not with this
+// module: components read their texts through I18n, and none of them should
+// pull the binary codec in just to be created.
+const loadApi = async () => (await import('/js/protocol/api-binary-shim.js')).ApiBinary;
 
 const STORAGE_KEY = 'tentaflow_lang';
 const DEFAULT_LANG = 'en';
@@ -144,7 +147,7 @@ async function syncFromBackend() {
     if (typeof localStorage !== 'undefined' && !localStorage.getItem('tentaflow_jwt')) {
       return;
     }
-    const data = await ApiBinary.one('mePreferencesGetRequest');
+    const data = await (await loadApi()).one('mePreferencesGetRequest');
     if (data && typeof data.language === 'string'
         && SUPPORTED_LANGS.some((l) => l.code === data.language)
         && data.language !== currentLang) {
@@ -159,7 +162,7 @@ async function syncFromBackend() {
 // Zapisuje wybór języka po stronie backendu. ApiBinary.action rzuca przy
 // bledzie protokolu — caller dostaje sciezke success/throw bez statusow HTTP.
 async function syncToBackend(lang) {
-  return await ApiBinary.action('mePreferencesUpdateRequest', { language: lang });
+  return await (await loadApi()).action('mePreferencesUpdateRequest', { language: lang });
 }
 
 async function init() {

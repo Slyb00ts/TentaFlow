@@ -10,7 +10,8 @@ import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
-import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processWarningText, processHandlerName, processBoundaryHosts, processEscalationPathProblem, processHasTimer, processTimezoneGaps, processTimezoneProblem, processTimezoneText } from './bpmn.js';
+import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processWarningText, processHandlerName, processBoundaryHosts, processEscalationPathProblem, processHasTimer, processTimezoneCanonical, processTimezoneGaps, processTimezoneProblem, processTimezoneText } from './bpmn.js';
+import { planProcessLabels } from './label-layout.js';
 import '/js/components/tf-menu.js';
 
 const NODE_WIDTH = 280;
@@ -201,20 +202,9 @@ function breakableHtml(text) {
   return escapeHtml(text).replace(/([_./-])/g, '$1<wbr>');
 }
 
-// Whether the segment (x1,y1)-(x2,y2) passes through the rectangle (slab method).
-function segmentHitsRect(x1, y1, x2, y2, rect) {
-  let near = 0; let far = 1;
-  for (const [from, delta, low, high] of [[x1, x2 - x1, rect.left, rect.right], [y1, y2 - y1, rect.top, rect.bottom]]) {
-    if (delta === 0) {
-      if (from < low || from > high) return false;
-    } else {
-      const enter = (low - from) / delta; const leave = (high - from) / delta;
-      near = Math.max(near, Math.min(enter, leave)); far = Math.min(far, Math.max(enter, leave));
-      if (near > far) return false;
-    }
-  }
-  return true;
-}
+// The tag drawn above a boundary event that is on no task (flows-builder.css
+// .fb-unattached::after): it is a pseudo-element, so its box is estimated.
+export const UNATTACHED_TAG = { width: 140, height: 20, offset: 10 };
 
 export class FlowCanvas {
   constructor(rootEl, opts = {}) {
@@ -436,12 +426,15 @@ export class FlowCanvas {
     if (this.mode === 'bpmn') {
       this.processModel = canvasToProcess(this.processModel, this.nodes, this.edges,
         (edge) => this._processEdgePoints(edge), this.processPath, this.selectedProcessId);
+      const data = structuredClone(this.processModel);
       // A zone only means something to a process with a timer or a calendar, and
-      // the server refuses one on any other; it goes with the last timer.
-      for (const body of [this.processModel, ...(this.processModel.additionalProcesses || [])]) {
+      // the server refuses one on any other, so it is left out of what is sent.
+      // The editor keeps it: deleting the last timer and adding another must not
+      // make the field forget it at the next autosave.
+      for (const body of [data, ...(data.additionalProcesses || [])]) {
         if (body.timerTimezone != null && !body.workCalendar && !processHasTimer({ ...body, additionalProcesses: [] })) delete body.timerTimezone;
       }
-      return structuredClone(this.processModel);
+      return data;
     }
     this._normalizeEdgePorts();
     // Przy serializacji pomijamy porty rowne domyslnym ("full"/"in"), zeby
@@ -809,6 +802,7 @@ export class FlowCanvas {
   // that left the shown scope unchanged says where it happened instead of
   // looking like a dead button.
   _restoreHistory(index) {
+    const forward = index > this.historyIndex;
     this.historyIndex = index;
     const snap = structuredClone(this.history[index]);
     let hidden = false;
@@ -843,7 +837,7 @@ export class FlowCanvas {
     this.onSelect(null);
     this.render();
     this.onChange();
-    if (hidden) toast(I18n.t(settingsChanged ? 'bpmn.undo_settings' : 'bpmn.undo_elsewhere'), 'info');
+    if (hidden) toast(I18n.t(settingsChanged ? (forward ? 'bpmn.redo_settings' : 'bpmn.undo_settings') : 'bpmn.undo_elsewhere'), 'info');
   }
 
   // -------------------------------------------------------------------------
@@ -853,9 +847,10 @@ export class FlowCanvas {
     if (this.readOnly || this.mode !== 'bpmn') return;
     const body = processBody(this.processModel, [], this.selectedProcessId);
     const zone = String(value ?? '').trim();
-    if (zone !== '' && processTimezoneProblem(zone)) return;
-    if (zone === '') delete body.timerTimezone;
-    else body.timerTimezone = zone;
+    const canonical = processTimezoneCanonical(zone);
+    if (canonical === null) return;
+    if (canonical === '') delete body.timerTimezone;
+    else body.timerTimezone = canonical;
     this._pushHistory();
     this.onChange();
   }
@@ -1832,7 +1827,10 @@ export class FlowCanvas {
     // Sizes read as zero while the canvas has no layout (a hidden tab); placing
     // from them would strip every label, so the last placement stays until the
     // canvas is shown.
-    this._labelsUnplaced = this.root.checkVisibility?.() === false;
+    // Safari before 17.4 has no checkVisibility; a box without client rects is
+    // the same "not rendered" answer.
+    this._labelsUnplaced = typeof this.root.checkVisibility === 'function'
+      ? !this.root.checkVisibility() : this.root.getClientRects().length === 0;
     if (this._labelsUnplaced) return;
     const nodeRects = this.nodes.map((node) => ({
       id: node.id, left: node.x, top: node.y, right: node.x + node.width, bottom: node.y + node.height,
@@ -1847,7 +1845,10 @@ export class FlowCanvas {
     }
     // A title shows inside its box until it does not fit, so every title is
     // measured in its inner state before any element is moved outside.
-    for (const { element } of entries) element.classList.remove('fb-external-label');
+    for (const { element } of entries) {
+      element.classList.remove('fb-external-label', 'fb-label-deferred');
+      element.removeAttribute('title');
+    }
     for (const entry of entries) {
       const { title } = entry;
       entry.outside = !title || title.scrollHeight > title.clientHeight + 1 || title.scrollWidth > title.clientWidth + 1;
@@ -1869,96 +1870,50 @@ export class FlowCanvas {
         : ['bpmn_user_task', 'bpmn_service_task'].includes(node.type) ? 0 : 2;
       return priority(left) - priority(right) || left.node.id.localeCompare(right.node.id);
     });
-    const occupied = [];
-    const gap = 12;
-    const overlaps = (left, right) => left.left < right.right + gap && left.right + gap > right.left
-      && left.top < right.bottom + gap && left.bottom + gap > right.top;
+    // The "Not attached" tag sits above its event; a label must not land under it.
+    const tags = this.nodes.filter((node) => this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(node.id)}"]`)?.classList.contains('fb-unattached'))
+      .map((node) => ({ id: `${node.id}#tag`, left: node.x + node.width / 2 - UNATTACHED_TAG.width / 2, right: node.x + node.width / 2 + UNATTACHED_TAG.width / 2,
+        top: node.y - UNATTACHED_TAG.offset - UNATTACHED_TAG.height, bottom: node.y - UNATTACHED_TAG.offset }));
+    const plan = planProcessLabels({
+      nodes: [...nodeRects, ...tags],
+      labels: labels.filter(({ width, height }) => width && height).map(({ node, element, width, height }) => ({
+        id: node.id, left: node.x, top: node.y, right: node.x + node.width, bottom: node.y + node.height, width, height,
+        external: element.classList.contains('fb-external-label'),
+        host: processBoundaryKind(node.type) ? nodeRects.find((candidate) => candidate.id === node.config.attachedToId) ?? null : null,
+      })),
+    });
     const writes = [];
-    for (const { node, element, label, leader, title, width, height } of labels) {
-      if (!width || !height) continue;
-      const centerX = node.x + node.width / 2;
-      const centerY = node.y + node.height / 2;
-      const parent = processBoundaryKind(node.type)
-        ? this.nodes.find((candidate) => candidate.id === node.config.attachedToId) : null;
-      const side = parent && Math.abs(centerX - (parent.x + parent.width)) <= 1 ? 'right'
-        : parent && Math.abs(centerX - parent.x) <= 1 ? 'left'
-          : parent && Math.abs(centerY - parent.y) <= 1 ? 'top'
-            : parent && Math.abs(centerY - (parent.y + parent.height)) <= 1 ? 'bottom'
-              : null;
-      const sides = side ? [side, ...['top', 'bottom', 'right', 'left'].filter((candidate) => candidate !== side)]
-        : element.classList.contains('fb-external-label') ? ['top', 'bottom', 'left', 'right']
-          : ['bottom', 'top', 'right', 'left'];
-      // Every place a label could take, nearest to its element first: beside the
-      // element on each side, slid along that side, and in further rows behind the
-      // first. The side the element faces is preferred only by a few pixels, so a
-      // crowded edge spreads its names in rows next to their events instead of
-      // sending them across the canvas.
-      const candidates = [];
-      const steps = Math.min(this.nodes.length + labels.length + 4, 12);
-      sides.forEach((direction, order) => {
-        const horizontal = direction === 'top' || direction === 'bottom';
-        for (let row = 0; row < 3; row += 1) {
-          for (let slot = -steps; slot <= steps; slot += 1) {
-            const along = slot * ((horizontal ? width : height) + gap) / 2;
-            const x = direction === 'left' ? node.x - width - gap - row * (width + gap)
-              : direction === 'right' ? node.x + node.width + gap + row * (width + gap)
-                : centerX - width / 2 + along;
-            const y = direction === 'top' ? node.y - height - gap - row * (height + gap)
-              : direction === 'bottom' ? node.y + node.height + gap + row * (height + gap)
-                : centerY - height / 2 + along;
-            candidates.push({ rect: { left: x, top: y, right: x + width, bottom: y + height },
-              cost: Math.hypot(x + width / 2 - centerX, y + height / 2 - centerY) + order * 8 });
-          }
-        }
-      });
-      candidates.sort((left, right) => left.cost - right.cost);
-      // The line from the element to its label, from the element's border to the
-      // label's nearest point; it must not run through another label.
-      const leaderTo = (rect) => {
-        const targetX = Math.max(rect.left, Math.min(centerX, rect.right));
-        const targetY = Math.max(rect.top, Math.min(centerY, rect.bottom));
-        return { targetX, targetY, sourceX: Math.max(node.x, Math.min(targetX, node.x + node.width)),
-          sourceY: Math.max(node.y, Math.min(targetY, node.y + node.height)) };
-      };
-      const free = ({ rect }) => !nodeRects.some((other) => overlaps(rect, other))
-        && !occupied.some((other) => overlaps(rect, other));
-      // The line must not run through the element it names, the task a boundary
-      // event sits on or any other element; a few pixels of the host's border are
-      // where it starts.
-      const crossesNode = ({ rect }) => {
-        const { sourceX, sourceY, targetX, targetY } = leaderTo(rect);
-        return nodeRects.some((other) => other.id !== node.id && segmentHitsRect(sourceX, sourceY, targetX, targetY,
-          { left: other.left + 3, top: other.top + 3, right: other.right - 3, bottom: other.bottom - 3 }));
-      };
-      const crossesLabel = ({ rect }) => occupied.some((other) => {
-        const { sourceX, sourceY, targetX, targetY } = leaderTo(rect);
-        return segmentHitsRect(sourceX, sourceY, targetX, targetY, other);
-      });
-      const selected = (candidates.find((candidate) => free(candidate) && !crossesLabel(candidate) && !crossesNode(candidate))
-        ?? candidates.find((candidate) => free(candidate) && !crossesNode(candidate))
-        ?? candidates.find((candidate) => free(candidate) && !crossesLabel(candidate))
-        ?? candidates.find(free))?.rect;
-      if (!selected) {
-        // Nowhere to put it. A title returns inside its box (clipped, the full
-        // text stays in the tooltip); an event has no title inside, so its label
-        // stays where the last layout had room for it, and shows nothing if it
-        // never had one.
-        if (title || !label.style.left) {
+    for (const { node, element, label, leader, title } of labels) {
+      if (!plan.has(node.id)) continue;
+      const placement = plan.get(node.id);
+      if (!placement) {
+        // Nowhere to put it without covering something or crossing an element. A
+        // title returns inside its box (clipped, the full text stays in the
+        // tooltip); an event has no title inside, so its name shows on hover and
+        // selection and stays in the tooltip and the accessible name.
+        leader.hidden = true;
+        if (title) {
           label.hidden = true;
-          leader.hidden = true;
           element.classList.remove('fb-external-label');
+        } else {
+          writes.push({ label, leader, deferred: true, element, name: label.textContent });
         }
         continue;
       }
-      const place = { label, leader, left: selected.left - node.x, top: selected.top - node.y };
-      writes.push(place);
-      const { sourceX, sourceY, targetX, targetY } = leaderTo(selected);
-      const distance = Math.hypot(targetX - sourceX, targetY - sourceY);
-      Object.assign(place, { leaderLeft: sourceX - node.x, leaderTop: sourceY - node.y, distance,
-        angle: Math.atan2(targetY - sourceY, targetX - sourceX) });
-      occupied.push(selected);
+      const { rect, leader: line } = placement;
+      writes.push({ label, leader, element, left: rect.left - node.x, top: rect.top - node.y,
+        leaderLeft: line.sourceX - node.x, leaderTop: line.sourceY - node.y,
+        distance: Math.hypot(line.targetX - line.sourceX, line.targetY - line.sourceY),
+        angle: Math.atan2(line.targetY - line.sourceY, line.targetX - line.sourceX) });
     }
-    for (const { label, leader, left, top, leaderLeft, leaderTop, distance, angle } of writes) {
+    for (const { label, leader, element, left, top, leaderLeft, leaderTop, distance, angle, deferred, name } of writes) {
+      if (deferred) {
+        element.classList.add('fb-label-deferred');
+        label.style.left = '';
+        label.style.top = '';
+        element.title = name;
+        continue;
+      }
       label.style.left = `${left}px`;
       label.style.top = `${top}px`;
       leader.style.left = `${leaderLeft}px`;

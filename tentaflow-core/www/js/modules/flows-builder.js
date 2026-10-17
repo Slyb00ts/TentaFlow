@@ -16,7 +16,7 @@ import { TfWindow } from '/js/components/tf-window.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
-import { checkProcessDocument, processBody, processCommand, processDistinctLabels, processEditorLabels, processElementNames, processExplainError, processHasTimer, processHasTimerStart, processNodeLabels, processPublishProblems, processStartEntryLabels, processTimezoneGaps, processTimezoneProblem, processTimezoneText, processBodyLabels } from '/js/modules/flows-builder/bpmn.js';
+import { checkProcessDocument, processBody, processCommand, processDistinctLabels, processEditorLabels, processElementNames, processExplainError, processHasTimer, processHasTimerStart, processNodeLabels, processPublishProblems, processStartEntryLabels, processTimezoneCanonical, processTimezoneGaps, processTimezoneText, processBodyLabels } from '/js/modules/flows-builder/bpmn.js';
 import { openProcessCalendar, openProcessDeclarations, openProcessInstances, openProcessMessageSend, openProcessMessages, openProcessModeling, openProcessRun, openProcessSchedule, openProcessVariables, processLifecycleReasonText, processTimerText } from '/js/modules/flows-builder/process-monitor.js';
 import { openProcessSimulation } from '/js/modules/flows-builder/process-simulation.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
@@ -76,6 +76,7 @@ const FlowBuilderScreen = {
           <tf-button variant="primary" size="sm" icon="save" data-fit-compact data-role="save">${escapeHtml(I18n.t('flows_builder.save'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="more" data-role="more" aria-haspopup="menu" aria-expanded="false" title="${escapeAttr(I18n.t('bpmn.more_actions'))}" aria-label="${escapeAttr(I18n.t('bpmn.more_actions'))}"></tf-button>
           <tf-menu data-role="more-menu" placement="bottom-end">
+            <tf-menu-item icon="fit" data-role="zoom-fit-more" hidden>${escapeHtml(I18n.t('flows_builder.zoom_fit'))}</tf-menu-item>
             <tf-menu-item icon="code" data-role="variables">${escapeHtml(I18n.t('flows_vars.button'))}</tf-menu-item>
             <tf-menu-item icon="arrow-up" data-role="import">${escapeHtml(I18n.t('bpmn.import_xml'))}</tf-menu-item>
             <tf-menu-item icon="download" data-role="export">${escapeHtml(I18n.t('bpmn.export_xml'))}</tf-menu-item>
@@ -367,6 +368,7 @@ const FlowBuilderScreen = {
     root.querySelector('[data-role="zoom-in"]').addEventListener('click', () => state.canvas.zoomBy(1.2));
     root.querySelector('[data-role="zoom-out"]').addEventListener('click', () => state.canvas.zoomBy(1 / 1.2));
     root.querySelector('[data-role="zoom-fit"]').addEventListener('click', () => state.canvas.fitToContent());
+    root.querySelector('[data-role="zoom-fit-more"]')?.addEventListener('click', () => state.canvas.fitToContent());
     root.querySelector('[data-role="save"]').addEventListener('click', () => this._save());
     root.querySelector('[data-role="variables"]').addEventListener('click', () => this._openVariables());
     root.querySelector('[data-role="history"]').addEventListener('click', () => this._openHistory());
@@ -427,17 +429,47 @@ const FlowBuilderScreen = {
         if (!button.hasAttribute('aria-label')) button.setAttribute('aria-label', name);
       }
       const topbar = root.querySelector('.fb-topbar');
-      const fitTopbar = () => {
+      // The bar gives up room in steps. Measuring waits for the next frame so one
+      // burst of changes is one measurement, and the observer never resizes what it
+      // watches inside its own callback. A step is only given back once the bar is
+      // clearly wider than where it was taken, so a width that sits on the edge
+      // does not flip the buttons back and forth.
+      const zoomFitMore = root.querySelector('[data-role="zoom-fit-more"]');
+      let level = 0;
+      let tightenedAt = 0;
+      let measuring = false;
+      const measureTopbar = () => {
+        measuring = false;
+        const width = topbar.clientWidth;
         topbar.classList.remove('fb-bar-1', 'fb-bar-2', 'fb-bar-3');
-        for (const level of [1, 2, 3]) {
+        let needed = 0;
+        for (const step of [1, 2, 3]) {
           if (topbar.scrollWidth <= topbar.clientWidth) break;
-          topbar.classList.add(`fb-bar-${level}`);
+          topbar.classList.add(`fb-bar-${step}`);
+          needed = step;
         }
+        if (needed < level && width < tightenedAt + 16) {
+          for (let step = needed + 1; step <= level; step += 1) topbar.classList.add(`fb-bar-${step}`);
+          needed = level;
+        }
+        if (needed > level) tightenedAt = width;
+        level = needed;
+        // Level 3 hides the button in the bar; the menu keeps the action.
+        zoomFitMore.hidden = level < 3;
+      };
+      const fitTopbar = () => {
+        if (measuring) return;
+        measuring = true;
+        requestAnimationFrame(measureTopbar);
       };
       const barObserver = new ResizeObserver(fitTopbar);
       barObserver.observe(topbar);
+      // Publish and Run appear and disappear with the process, and a language
+      // change rewrites every label.
+      const contentObserver = new MutationObserver(fitTopbar);
+      contentObserver.observe(topbar, { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['hidden'] });
       document.fonts?.ready.then(fitTopbar);
-      state.cleanupFns.push(() => barObserver.disconnect());
+      state.cleanupFns.push(() => { barObserver.disconnect(); contentObserver.disconnect(); }, I18n.subscribe(fitTopbar));
       // The chip's words change its width.
       state.fitTopbar = fitTopbar;
       // Everything the bar has no room for sits behind one menu that opens under
@@ -544,15 +576,9 @@ const FlowBuilderScreen = {
       const timezone = root.querySelector('[data-role="timer-timezone"]');
       timezone.addEventListener('change', (event) => {
         if (event.target !== timezone || !this._current(state) || state.readOnly) return;
-        const zone = timezone.value.trim();
-        if (processTimezoneProblem(zone)) {
-          timezone.setAttribute('error', I18n.t('bpmn.timer_timezone_invalid', { zone }));
-          return;
-        }
-        timezone.removeAttribute('error');
-        if (zone !== timezone.value) timezone.value = zone;
-        state.canvas.updateProcessTimezone(zone);
+        this._commitTimezone(state);
       });
+      timezone.addEventListener('input', () => timezone.removeAttribute('error'));
       root.querySelector('[data-role="instances"]').addEventListener('click', () => openProcessInstances(state.flowId));
       root.querySelector('[data-role="messages"]').addEventListener('click', () => openProcessMessages(state.flowId));
       root.querySelector('[data-role="send-start"]').addEventListener('click', () => {
@@ -666,7 +692,14 @@ const FlowBuilderScreen = {
     const timezone = state.root.querySelector('[data-role="timer-timezone"]');
     const selectedBody = processBody(state.canvas.processModel, [], state.canvas.selectedProcessId);
     timezone.hidden = !selectedBody.workCalendar && !processHasTimer({ ...selectedBody, additionalProcesses: [] });
-    timezone.value = selectedBody.timerTimezone || '';
+    // Text the author typed that is not a zone stays with its error until it is
+    // fixed or another body is shown; anything else follows the model.
+    if (timezone.hasAttribute('error') && timezone.dataset.body === String(state.canvas.selectedProcessId)) {
+      timezone.toggleAttribute('disabled', readOnly);
+    } else {
+      timezone.removeAttribute('error');
+      timezone.value = selectedBody.timerTimezone || '';
+    }
     timezone.toggleAttribute('disabled', readOnly);
     const calendarState = state.root.querySelector('[data-role="calendar-state"]');
     const currentCalendar = selectedBody.workCalendar;
@@ -1106,9 +1139,42 @@ const FlowBuilderScreen = {
     }))], chosen);
   },
 
+  // Takes what is typed in the time zone field into the model, as the engine
+  // spells it. Returns the refusal text when the field holds something that is
+  // not a zone: that text is never replaced by the saved value behind the
+  // author's back.
+  _commitTimezone(state) {
+    const field = state.root.querySelector('[data-role="timer-timezone"]');
+    if (!field || field.hidden || state.readOnly) return null;
+    const typed = field.value.trim();
+    const canonical = processTimezoneCanonical(typed);
+    if (canonical === null) {
+      const text = I18n.t('bpmn.timer_timezone_invalid', { zone: typed });
+      field.dataset.body = String(state.canvas.selectedProcessId);
+      field.setAttribute('error', text);
+      return text;
+    }
+    field.removeAttribute('error');
+    if (canonical !== field.value) field.value = canonical;
+    const body = processBody(state.canvas.processModel, [], state.canvas.selectedProcessId);
+    if (canonical !== (body.timerTimezone || '')) state.canvas.updateProcessTimezone(canonical);
+    return null;
+  },
+
   async _save({ silent = false } = {}) {
     const s = this._state;
     if (!s || s.saving || s.readOnly) return false;
+    if (s.mode === 'bpmn') {
+      const field = s.root.querySelector('[data-role="timer-timezone"]');
+      // An autosave must not judge a zone that is still being typed.
+      if (silent && field.contains(document.activeElement)) return false;
+      const problem = this._commitTimezone(s);
+      if (problem) {
+        this._reportSaveProblem(s, problem, silent);
+        if (!silent) { s.showSettings(true); field.focus(); }
+        return false;
+      }
+    }
     // Walidacja klient-side przed wyslaniem do backendu — porty, wiszace
     // krawedzie, cykle. Backend ma swoj validate_flow_json_str, wiec to jest
     // ochrona przed zbednym round-tripem i czytelnym komunikatem inline.

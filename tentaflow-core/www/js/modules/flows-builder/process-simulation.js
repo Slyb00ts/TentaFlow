@@ -4,7 +4,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeAttr, escapeHtml } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
-import { processElementNames, processExplainError, processStartEntryLabels } from './bpmn.js';
+import { processElementNames, processExplainError, processRepeatedElements, processStartEntryLabels } from './bpmn.js';
 import '/js/components/tf-alert.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-code-editor.js';
@@ -181,10 +181,15 @@ export function openProcessSimulation(definition, version, startCatalog, selecte
   const selectedIndex = manualStarts.findIndex((entry) => entry.processId === selectedStart?.processId
     && entry.startNodeId === selectedStart?.startNodeId);
   selection.querySelector('[data-simulation-start]').value = selectedIndex < 0 ? '' : String(selectedIndex);
+  // The simulation clock cannot run a repetition, so the window says so before
+  // the author starts it instead of after the server refuses.
+  const repeated = [...new Set(processRepeatedElements(definition.model))];
   return openFormWindow({
     title: text('simulation'), icon: 'play', subject: definition.name,
-    note: { text: text('simulation_hint') }, sections: [selection, variables],
+    note: repeated.length ? { tone: 'warning', text: text('simulation_repeat_unsupported', { names: repeated.join(', ') }) } : { text: text('simulation_hint') },
+    sections: [selection, variables],
     submitLabel: text('simulation_start'), anchor,
+    errorMessage: (error) => processExplainError(error?.message, definition.model),
     validate: () => {
       const selected = selection.querySelector('[data-simulation-start]').value;
       if (selected !== '') {
@@ -198,7 +203,7 @@ export function openProcessSimulation(definition, version, startCatalog, selecte
       selection.querySelector('[data-simulation-start]').setAttribute('error', text('start_entry_changed'));
       return false;
     },
-    canSubmit: () => selection.querySelector('[data-simulation-start]').value !== '' && !definition.archived,
+    canSubmit: () => selection.querySelector('[data-simulation-start]').value !== '' && !definition.archived && repeated.length === 0,
     collect: () => {
       const entry = manualStarts[Number(selection.querySelector('[data-simulation-start]').value)];
       if (!entry) throw new Error(text('start_entry_changed'));
