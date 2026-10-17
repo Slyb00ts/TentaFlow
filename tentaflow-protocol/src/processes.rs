@@ -1426,6 +1426,8 @@ pub enum ProcessRepetitionOccurrenceStatus {
     Pending,
     Active,
     AwaitingVerification,
+    /// Reserved wire value that no engine path produces; it stays so the append-only
+    /// status vocabulary keeps decoding rows written under it.
     RetryableError,
     AcceptedBlocked,
     Completed,

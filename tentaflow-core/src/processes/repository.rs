@@ -6980,7 +6980,7 @@ fn validate_scope_plan_on(
                         | ProcessInstanceStatus::Cancelled
                         | ProcessInstanceStatus::Error
                 ),
-            "process scope revision conflict or terminal scope"
+            RevisionConflict("process scope revision conflict or terminal scope")
         );
         sql_incrementable(update.expected_revision)?;
         if let Some(variables) = &update.variables {
@@ -18258,6 +18258,18 @@ fn validate_termination_plan_on(
         }
         let boundary_wait_id = outer_groups.first().map_or(attached_id,
             |group| group.parent_token_id.as_str());
+        // The coordinator's boundary closes every ordinal's scope, so the failing
+        // Service may sit under any of them, not only under this closure root.
+        let error_source_roots = match outer_groups.first() {
+            Some(group) => scopes.iter().filter(|scope|
+                scope.parent_scope_id.as_deref() == Some(parent_scope)
+                    && scope.subprocess_node_id.as_deref() == Some(group.node_id.as_str())
+                    && prior_closure_occurrences.iter().any(|occurrence|
+                        occurrence.group_id == group.group_id
+                            && Some(occurrence.token_id.as_str()) == scope.parent_token_id.as_deref()))
+                .map(|scope| scope.scope_id.as_str()).collect::<Vec<_>>(),
+            None => vec![root.as_str()],
+        };
         let accepted_error_service = |caught: &PlannedEvent| -> Result<bool> {
             let EntryAuthority::Accepted(AcceptedInputRef::Service {
                 job_id, attempt, fence, result_event_id,
@@ -18290,7 +18302,9 @@ fn validate_termination_plan_on(
                 && result.outcome == ActivityOutcome::Error
                 && caught.data["error_code"] == serde_json::to_value(&result.code)?
                 && caught.data["result_origin"] == "contract"
-                && descendant_scope_ids(scopes, root)?.contains(&scope_id)
+                && error_source_roots.iter().try_fold(false, |found, source_root|
+                    descendant_scope_ids(scopes, source_root)
+                        .map(|closure| found || closure.contains(&scope_id)))?
                 && result_event.scope_id == scope_id
                 && result_event.node_id.as_deref() == Some(node_id.as_str())
                 && result_event.data == expected_event
@@ -19426,7 +19440,11 @@ fn apply_repetition_plan_on(
                     let decision_kind = if row.approval_event_id.is_some() {
                         "verification_approved"
                     } else {
-                        ensure!(row.status == ProcessRepetitionOccurrenceStatus::AcceptedBlocked,
+                        // A rejected ordinal stays rejected after a boundary or a
+                        // terminate closes the group around it.
+                        ensure!(matches!(row.status,
+                            ProcessRepetitionOccurrenceStatus::AcceptedBlocked
+                            | ProcessRepetitionOccurrenceStatus::Cancelled),
                             "completed repeated Verification lacks its accepted decision");
                         "verification_rejected"
                     };
@@ -19489,7 +19507,7 @@ fn apply_repetition_plan_on(
                     && row.status == ProcessRepetitionOccurrenceStatus::AcceptedBlocked
                     && row.verification_user_task_id.is_some()
                     && job_incident_on(tx, instance_id, &row.scope_id, &group.node_id,
-                        row.job_id.as_deref(), "HUMAN_REJECTED", HUMAN_REJECTED_MESSAGE)?.is_some();
+                        row.job_id.as_deref(), "HUMAN_REJECTED")?.is_some();
                 let rejected_verification = planned_rejection || retained_rejection;
                 if row.status == ProcessRepetitionOccurrenceStatus::Completed
                     && !prior_occurrences.iter().any(|prior|
@@ -19765,7 +19783,7 @@ fn apply_repetition_plan_on(
                                     .map(|incident| incident.incident_id.clone())
                             } else {
                                 job_incident_on(tx, instance_id, &row.scope_id, &group.node_id,
-                                    Some(job_id), code, message)?
+                                    Some(job_id), code)?
                             },
                         _ => None,
                     };
@@ -20515,15 +20533,18 @@ fn terminal_job_status(outcome: &tentaflow_protocol::processes::ActivityOutcome)
 pub(super) const HUMAN_REJECTED_MESSAGE: &str = "the activity result was rejected by its verifier";
 
 /// The one stored incident a job raised with exactly this code and message.
+/// Looks an earlier plan's incident up by what identifies it, not by its text: the
+/// message of an expression error is the evaluator's wording, which a later release
+/// may change under rows that were already written.
 fn job_incident_on(
     tx: &Connection, instance_id: &str, scope_id: &str, node_id: &str,
-    job_id: Option<&str>, code: &str, message: &str,
+    job_id: Option<&str>, code: &str,
 ) -> Result<Option<String>> {
     let Some(job_id) = job_id else { return Ok(None) };
     let mut statement = tx.prepare(
-        "SELECT incident_id FROM bpmn_incidents WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND job_id=?4 AND code=?5 AND message=?6")?;
+        "SELECT incident_id FROM bpmn_incidents WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND job_id=?4 AND code=?5")?;
     let mut found = statement
-        .query_map(params![instance_id, scope_id, node_id, job_id, code, message],
+        .query_map(params![instance_id, scope_id, node_id, job_id, code],
             |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(if found.len() == 1 { found.pop() } else { None })
@@ -21031,7 +21052,7 @@ fn apply_plan_on(
     ensure!(
         current_revision == expected_revision
             && !matches!(current_status.as_str(), "completed" | "cancelled" | "error"),
-        "process instance revision conflict or closed instance"
+        RevisionConflict("process instance revision conflict or closed instance")
     );
     sql_incrementable(expected_revision)?;
     // A supplied plan bypasses the runtime planner, so the writer admits every
@@ -21685,7 +21706,7 @@ fn apply_plan_on(
             params![status_text(&update.status),update.variables.as_ref().map(json).transpose()?,at_ms,update.scope_id,instance_id,sql_incrementable(update.expected_revision)?,error.map(json).transpose()?,error.map(|e|&e.source_event_id),error.map(|e|&e.source_scope_id)])?;
         ensure!(
             count == 1,
-            "process scope revision conflict or terminal scope"
+            RevisionConflict("process scope revision conflict or terminal scope")
         );
     }
     validate_gateway_state_on(tx, instance_id, &model, &proposed_scopes)?;
@@ -21726,7 +21747,7 @@ fn apply_plan_on(
         params![status_text(&status),json(&plan.variables)?,at_ms,instance_id,sql_incrementable(expected_revision)?,plan.terminal_error.as_ref().map(json).transpose()?,plan.terminal_error.as_ref().map(|e|&e.source_event_id),plan.terminal_error.as_ref().map(|e|&e.source_scope_id)])?;
     ensure!(
         affected == 1,
-        "process instance revision conflict or closed instance"
+        RevisionConflict("process instance revision conflict or closed instance")
     );
     if status == ProcessInstanceStatus::Cancelled {
         notify_parent_of_cancelled_call_child_on(tx, instance_id, actor_id,
@@ -22887,7 +22908,7 @@ fn prepare_call_plan<'pool>(
         }
         drop(conn);
     }
-    bail!("process call transition revision conflict after bounded replanning")
+    Err(RevisionConflict("process call transition revision conflict after bounded replanning").into())
 }
 
 pub fn start_instance(
@@ -26677,6 +26698,88 @@ fn prepare_service_result_plan(
     Ok((prepared, retained_failure, result_index))
 }
 
+/// The instance or one of its scopes moved on between planning a transition and
+/// committing it. The same observed result is planned again from the new state.
+#[derive(Debug)]
+pub(super) struct RevisionConflict(pub(super) &'static str);
+
+impl std::fmt::Display for RevisionConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for RevisionConflict {}
+
+pub(super) fn is_revision_conflict(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<RevisionConflict>())
+}
+
+/// The engine or the validator refused the plan for an observed Service result.
+/// The plan is a function of stored facts, so every retry is refused the same way;
+/// anything else that stops an acceptance (a lost race, a busy or failing store, a
+/// lease another worker holds) is not marked and is worth trying again.
+#[derive(Debug)]
+pub(super) struct ResultRefused(anyhow::Error);
+
+impl std::fmt::Display for ResultRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for ResultRefused {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(&*self.0)
+    }
+}
+
+/// Another worker owns the acceptance of this result (or the observation it was
+/// planned from changed): that owner publishes it, so nothing is left to do here.
+#[derive(Debug)]
+pub(super) struct AcceptanceHeld;
+
+impl std::fmt::Display for AcceptanceHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Service acceptance owner or durable observation changed")
+    }
+}
+
+impl std::error::Error for AcceptanceHeld {}
+
+pub(super) fn is_acceptance_held(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<AcceptanceHeld>())
+}
+
+pub(super) fn is_result_refusal(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<ResultRefused>())
+}
+
+fn is_storage_failure(error: &anyhow::Error) -> bool {
+    use rusqlite::ErrorCode::{
+        DatabaseBusy, DatabaseLocked, DiskFull, OperationInterrupted, OutOfMemory,
+        SystemIoFailure,
+    };
+    error.chain().any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some_and(|failure|
+        matches!(failure, rusqlite::Error::SqliteFailure(code, _)
+            if matches!(code.code, DatabaseBusy | DatabaseLocked | DiskFull
+                | OperationInterrupted | OutOfMemory | SystemIoFailure))))
+        || error.chain().any(|cause| cause.is::<std::io::Error>())
+}
+
+/// Marks a failure of the plan or its validation as a refusal, unless it is a lost
+/// race, a storage failure or a Script infrastructure failure: a later attempt can
+/// get past those, and the Script one has its own recovery.
+fn refuse_result(error: anyhow::Error) -> anyhow::Error {
+    if is_revision_conflict(&error) || is_storage_failure(&error)
+        || error.chain().any(|cause|
+            cause.is::<crate::flow_engine::expr::InfrastructureExprError>()) {
+        error
+    } else {
+        anyhow::Error::new(ResultRefused(error))
+    }
+}
+
 pub fn accept_job_result(
     pool: &DbPool,
     actor: &ProcessActor,
@@ -26765,9 +26868,10 @@ pub fn accept_job_result(
         "Service acceptance lost its factual waiting activation");
     let (precomposed, mut conn) = if let Some(plan) = supplied_plan {
         let (prepared, retained_failure, result_index) = prepare_service_result_plan(plan, observed, job_id,
-            attempt, fence, selected_escalation, repeated_source, &reserved_result_event_id)?;
+            attempt, fence, selected_escalation, repeated_source, &reserved_result_event_id)
+            .map_err(refuse_result)?;
         let (composite, conn) = prepare_call_plan(pool, actor, &source_id, None,
-            &prepared, at_ms)?;
+            &prepared, at_ms).map_err(refuse_result)?;
         (Some((composite, retained_failure, result_index)), conn)
     } else {
         #[cfg(test)]
@@ -26814,7 +26918,7 @@ pub fn accept_job_result(
         && !matches!(instance.status,
             ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
                 | ProcessInstanceStatus::Error),
-        "process instance revision conflict or closed instance");
+        RevisionConflict("process instance revision conflict or closed instance"));
     let commit_now_ms = now_ms()?;
     ensure!(status == "running" && current_attempt == attempt
         && current_fence == fence && job_activation_live_on(&tx, job_id)?,
@@ -26823,8 +26927,9 @@ pub fn accept_job_result(
         "UPDATE bpmn_service_invocations SET acceptance_owner_id=?1,acceptance_lease_until_ms=?2,acceptance_revision=acceptance_revision+1,phase_revision=phase_revision+1,updated_at_ms=?3 WHERE job_id=?4 AND instance_id=?5 AND phase='observed' AND dispatch_evidence='committed_boundary' AND dispatch_attempt=?6 AND dispatch_fence=?7 AND observed_result_json=?8 AND reserved_result_event_id=?9 AND (acceptance_owner_id IS NULL OR acceptance_owner_id=?1 OR acceptance_lease_until_ms<?3)",
         params![worker_id,commit_now_ms+30_000,commit_now_ms,job_id,instance_id,
             attempt,sql_integer(fence)?,observed_bytes,reserved_result_event_id])?;
-    ensure!(acquired == 1,
-        "Service acceptance owner or durable observation changed");
+    if acquired != 1 {
+        return Err(AcceptanceHeld.into());
+    }
     // The incident raised while this result waited or failed to recover closes in
     // THIS transaction, before the plan is made: the plan then sees a healthy
     // instance, and an acceptance that fails rolls the close back with it. The
@@ -26848,20 +26953,23 @@ pub fn accept_job_result(
             signal_admission_on(&tx, actor, &instance_id, prefix, signal, accepted)
         };
         let planned = super::runtime::plan_job_result(&snapshot, job, observed, at_ms,
-            Some(&resolve))?;
+            Some(&resolve)).map_err(refuse_result)?;
         prepare_service_result_plan(&planned, observed, job_id, attempt, fence,
-            selected_escalation, repeated_source, &reserved_result_event_id)?
+            selected_escalation, repeated_source, &reserved_result_event_id)
+            .map_err(refuse_result)?
     };
     for attempt_fact in &composite.termination_attempts {
         let accepted = match attempt_fact {
             TerminationAttempt::Success(source) => &source.accepted_input,
             TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
         };
-        ensure!(matches!(accepted,
+        if !(matches!(accepted,
             AcceptedInputRef::Service { job_id: selected, attempt: selected_attempt, fence: selected_fence, .. }
                 if selected == job_id && *selected_attempt == attempt && *selected_fence == fence)
-            || matches!(accepted, AcceptedInputRef::PersistedReady { .. }),
-            "terminating service input differs from its accepted job generation");
+            || matches!(accepted, AcceptedInputRef::PersistedReady { .. })) {
+            return Err(refuse_result(anyhow::anyhow!(
+                "terminating service input differs from its accepted job generation")));
+        }
     }
     require_call_control_authority_on(&tx, actor, &instance_id)?;
     let flow_id = job_source_ref_on(&tx, job_id)?;
@@ -26871,7 +26979,7 @@ pub fn accept_job_result(
         "result plan does not consume service job"
     );
     validate_job_result_plan_on(&tx, &instance, &node_id, job_id, worker_id, observed,
-        &composite)?;
+        &composite).map_err(refuse_result)?;
     if retained_failure {
         ensure!(composite.call_steps.is_empty()
             && composite.termination_attempts.is_empty(),
@@ -26898,7 +27006,7 @@ pub fn accept_job_result(
         at_ms,
         None,
         EntryAuthority::Accepted(&entry),
-    &[])?;
+    &[]).map_err(refuse_result)?;
     let terminal = terminal_job_status(&result.outcome);
     tx.execute("UPDATE bpmn_jobs SET status=?1,result_json=?2,lease_until_ms=NULL,updated_at_ms=?3,result_origin=?5 WHERE job_id=?4",params![terminal,json(result)?,at_ms,job_id,result_origin_text(&observed.origin)])?;
     let accepted = tx.execute(
@@ -27219,7 +27327,7 @@ fn accept_with_retries(
     for _ in 0..attempts {
         match accept() {
             Ok(()) => return Ok(RecoveryStep::Resolved),
-            Err(error) if error.to_string().contains("revision conflict") => continue,
+            Err(error) if is_revision_conflict(&error) => continue,
             Err(_) if block_closed()? => return Ok(RecoveryStep::Resolved),
             Err(error) => return Err(error.context(
                 "durably observed Service result could not resume canonical acceptance")),
@@ -27650,9 +27758,10 @@ pub fn fail_job_with_authority(
                     .context("observed Service result has no reserved event ID")?,
                 reason, now_ms)?;
         } else {
-            // A refused acceptance is deterministic: leaving the result observed
-            // for the next restart's recovery would hang the activity unseen.
-            if code == "RESULT_REJECTED" {
+            // A result the engine will not accept, or that kept losing its race,
+            // stays observed with nothing retrying a flow result before the next
+            // restart: it must show as an incident instead of hanging unseen.
+            if matches!(code, "RESULT_REJECTED" | "TRANSITION_ERROR" | "REVISION_CONFLICT") {
                 count_recovery_failure_on(&tx, job_id, now_ms, 1)?;
                 tx.commit()?;
             }
@@ -33163,7 +33272,7 @@ mod recovery_tests {
             RECOVERY_ACCEPT_ATTEMPTS,
             || {
                 tries += 1;
-                Err(anyhow::anyhow!("process revision conflict"))
+                Err(RevisionConflict("process revision conflict").into())
             },
             || {
                 closed_checks += 1;

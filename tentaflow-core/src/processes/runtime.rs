@@ -1057,6 +1057,8 @@ impl<'a> Transition<'a> {
         &mut self, mut group: RepetitionGroup, node_id: &str, job_id: &str,
         code: &str, message: String,
     ) -> Result<()> {
+        ensure!(!group.terminal_capacity,
+            "a capacity-closed repetition group cannot be re-parked by a Service result");
         self.incident(node_id, Some(job_id.to_owned()), code,
             super::repository::bounded_failure_message(&message));
         let incident_id = self.plan.add_incidents.last()
@@ -2940,24 +2942,27 @@ impl<'a> Transition<'a> {
         );
         self.jobs
             .retain(|job| !self.plan.cancel_job_ids.contains(&job.job_id));
-        for mut occurrence in self.repetition_occurrences.iter()
+        let closing_groups = self.repetition_groups.iter()
             .filter(|row| active_ids.contains(&row.scope_id)
                 && matches!(row.status,
-                    ProcessRepetitionOccurrenceStatus::Pending
-                    | ProcessRepetitionOccurrenceStatus::Active
-                    | ProcessRepetitionOccurrenceStatus::AwaitingVerification
-                    | ProcessRepetitionOccurrenceStatus::RetryableError))
+                    ProcessRepetitionGroupStatus::Open | ProcessRepetitionGroupStatus::Incident)
+                && !row.terminal_capacity)
+            .cloned().collect::<Vec<_>>();
+        // A blocked ordinal is the retained evidence of a capacity closure, so it
+        // is cancelled only together with a group this closure itself cancels.
+        for mut occurrence in self.repetition_occurrences.iter()
+            .filter(|row| active_ids.contains(&row.scope_id)
+                && !matches!(row.status,
+                    ProcessRepetitionOccurrenceStatus::Completed
+                    | ProcessRepetitionOccurrenceStatus::Cancelled)
+                && (row.status != ProcessRepetitionOccurrenceStatus::AcceptedBlocked
+                    || closing_groups.iter().any(|group| group.group_id == row.group_id)))
             .cloned().collect::<Vec<_>>() {
             occurrence.status = ProcessRepetitionOccurrenceStatus::Cancelled;
             occurrence.updated_at_ms = self.now_ms;
             self.write_repetition_occurrence(occurrence)?;
         }
-        for mut group in self.repetition_groups.iter()
-            .filter(|row| active_ids.contains(&row.scope_id)
-                && matches!(row.status,
-                    ProcessRepetitionGroupStatus::Open | ProcessRepetitionGroupStatus::Incident)
-                && !row.terminal_capacity)
-            .cloned().collect::<Vec<_>>() {
+        for mut group in closing_groups {
             group.status = ProcessRepetitionGroupStatus::Cancelled;
             group.updated_at_ms = self.now_ms;
             self.write_repetition_group(group)?;
@@ -7305,6 +7310,8 @@ pub fn plan_job_result(
         transition.plan.event_ids.insert(result_event_index, result_event_id.clone());
         occurrence.accepted_source_event_id = Some(result_event_id.clone());
         occurrence.accepted_origin = Some(observed.origin.clone());
+        // The Condition sees the ordinal's source-time variables, like every other
+        // repeated mapping, so a sibling that finished first cannot change its verdict.
         if let Some((code, message)) = unhandled_repeated_result(verification, result,
             &group.group_id, occurrence.ordinal, &occurrence.item, &occurrence.input_variables) {
             occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;

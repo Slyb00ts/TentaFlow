@@ -1024,14 +1024,14 @@ fn finish_observed(
                 super::runtime::signal_cancelled_claims(dispatcher, &committed.cancelled_claims);
                 return Ok(());
             }
-            Err(error) if error.to_string().contains("revision conflict") => continue,
             Err(error) if script_infrastructure(&error) => {
                 repository::record_observed_script_infrastructure_failure(
                     pool, claimed, worker_id, &result, &error, now_ms())?;
                 return Ok(());
             }
             Err(error)
-                if escalation_boundary.is_some()
+                if repository::is_result_refusal(&error)
+                    && escalation_boundary.is_some()
                     && plan
                         .events
                         .iter()
@@ -1066,13 +1066,12 @@ fn finish_observed(
                         );
                         return Ok(());
                     }
-                    Err(conflict) if conflict.to_string().contains("revision conflict") => continue,
                     Err(failure) if script_infrastructure(&failure) => {
                         repository::record_observed_script_infrastructure_failure(
                             pool, claimed, worker_id, &result, &failure, now_ms())?;
                         return Ok(());
                     }
-                    Err(failure) => {
+                    Err(failure) if repository::is_result_refusal(&failure) => {
                         return fail_claim(
                             pool,
                             worker_id,
@@ -1082,9 +1081,11 @@ fn finish_observed(
                             Some(&result),
                         )
                     }
+                    Err(failure) if repository::is_acceptance_held(&failure) => return Ok(()),
+                    Err(_) => continue,
                 }
             }
-            Err(error) => {
+            Err(error) if repository::is_result_refusal(&error) => {
                 return fail_claim(
                     pool,
                     worker_id,
@@ -1094,6 +1095,9 @@ fn finish_observed(
                     Some(&result),
                 )
             }
+            Err(error) if repository::is_acceptance_held(&error) => return Ok(()),
+            // A lost race or a busy store: the result is still recorded, so plan it again.
+            Err(_) => continue,
         }
     }
     fail_claim(
@@ -1105,6 +1109,9 @@ fn finish_observed(
         Some(&result),
     )
 }
+
+#[cfg(test)]
+mod acceptance_failure_tests;
 
 #[cfg(test)]
 mod tests {

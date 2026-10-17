@@ -151,10 +151,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   kończy się (incydent grupy nie blokuje wyników zadań będących w locie): drugi
   nieobsłużony wynik zgłasza własny incydent, a grupa zostaje przy pierwszym, więc żaden incydent nie jest podmieniany ani osierocony, a wynik
   rodzeństwa nie zostaje w stanie `observed`. Odrzucenie weryfikacji przez człowieka
-  też nie blokuje decyzji o rodzeństwie. Odrzucone przyjęcie wyniku zgłasza od razu
-  incydent `RESULT_RECOVERY_FAILED` (wynik zostaje zapisany i da się go przyjąć
-  później), zamiast czekać na restart. Błąd zadania wewnątrz powtarzanego podprocesu
-  trafia do zdarzenia brzegowego na tym podprocesie także w walidatorze.
+  też nie blokuje decyzji o rodzeństwie. Wynik, którego plan silnik albo walidator
+  odrzuca na stałe (`RESULT_REJECTED`, `TRANSITION_ERROR`), oraz wynik, który nie może
+  się opublikować mimo ponowień (`REVISION_CONFLICT`), zgłasza od razu incydent
+  `RESULT_RECOVERY_FAILED` (wynik zostaje zapisany i da się go przyjąć później),
+  zamiast czekać na restart. Przyjęcie trzymane przez inny worker, zajęty magazyn
+  i przegrany wyścig rewizji nie są odrzuceniem planu: pierwsze zostawia wynik jego
+  właścicielowi, pozostałe są ponawiane. Błąd zadania wewnątrz powtarzanego
+  podprocesu trafia do zdarzenia brzegowego na tym podprocesie także w walidatorze.
+- Silnik BPMN: plan zamknięcia grupy powtórzeń z zablokowanym wynikiem (TerminateEnd,
+  zdarzenie brzegowe na podprocesie nadrzędnym, zdarzenie brzegowe na zadaniu z
+  odrzuconą weryfikacją) nie jest już odrzucany przez walidator, a zamknięcie anuluje
+  także ordynały `AcceptedBlocked`. Walidator rozpoznaje zapisany incydent po kodzie i
+  zadaniu, nie po brzmieniu komunikatu, więc zmiana komunikatu w nowszym wydaniu nie
+  odrzuca planów dotykających starych wierszy. Błąd z podprocesu powtarzanego z
+  licznością większą niż 1 trafia do zdarzenia brzegowego na jego koordynatorze także
+  wtedy, gdy zawiódł inny ordynał niż zamykany jako pierwszy.
 - Inspektor zadania usługi BPMN, runda 2: tabela „co się stanie” nazywa zdarzenie, do
   którego wspina się błąd w podprocesie, wymaga reguły wyniku dla obu przycisków,
   jest zwijana (zwinięta na niskim oknie) i łamie kody tylko po podkreślniku.
