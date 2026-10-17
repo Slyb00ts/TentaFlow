@@ -243,6 +243,24 @@ pub(super) fn fail_claim(
     Ok(())
 }
 
+/// An acceptance failed for a reason planning again cannot change: a revoked actor or
+/// source is an access failure, anything else is a failed acceptance. Either way the
+/// observed result stays recorded and the failure shows as an incident.
+fn fail_acceptance(
+    pool: &DbPool,
+    worker_id: &str,
+    claimed: &ClaimedProcessJob,
+    result: &ObservedActivityResult,
+    error: anyhow::Error,
+) -> Result<()> {
+    let code = if repository::is_authority_denied(&error) {
+        "SOURCE_ACCESS_REVOKED"
+    } else {
+        "RESULT_ACCEPTANCE_FAILED"
+    };
+    fail_claim(pool, worker_id, claimed, code, error, Some(result))
+}
+
 fn script_infrastructure(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<InfrastructureExprError>())
 }
@@ -1082,7 +1100,8 @@ fn finish_observed(
                         )
                     }
                     Err(failure) if repository::is_acceptance_held(&failure) => return Ok(()),
-                    Err(_) => continue,
+                    Err(failure) if repository::is_retryable_acceptance(&failure) => continue,
+                    Err(failure) => return fail_acceptance(pool, worker_id, claimed, &result, failure),
                 }
             }
             Err(error) if repository::is_result_refusal(&error) => {
@@ -1097,7 +1116,8 @@ fn finish_observed(
             }
             Err(error) if repository::is_acceptance_held(&error) => return Ok(()),
             // A lost race or a busy store: the result is still recorded, so plan it again.
-            Err(_) => continue,
+            Err(error) if repository::is_retryable_acceptance(&error) => continue,
+            Err(error) => return fail_acceptance(pool, worker_id, claimed, &result, error),
         }
     }
     fail_claim(

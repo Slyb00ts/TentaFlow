@@ -1081,6 +1081,121 @@ fn outer_timer_closes_the_real_wait_after_repeated_script_body_failure() {
     assert!(closed.timers.iter().all(|timer| timer.status != ProcessTimerStatus::Pending));
 }
 
+/// A Parallel repeated Script with an interrupting deadline whose authored input
+/// evaluates `input_expression` and whose body is `script`; started and parked.
+fn parallel_script_with_deadline(
+    fixture: &Fixture, input_expression: &str, script: &str,
+) -> (String, repository::RuntimeSnapshot) {
+    let mut model = script_model(script, BTreeMap::new(), false);
+    model.variables.insert("results".into(), json!([]));
+    model.timer_timezone = Some("UTC".into());
+    let compute = model.nodes.iter_mut().find(|node| node.id == "Compute").unwrap();
+    compute.repeat = Some(ProcessRepeatSpec::MultiInstance {
+        mode: ProcessMultiInstanceMode::Parallel,
+        input: ProcessMultiInstanceInput::Cardinality { count: 2 },
+        output_collection_variable: "results".into(),
+    });
+    compute.activity_io = Some(tentaflow_protocol::processes::ProcessActivityIo {
+        data_inputs: vec![tentaflow_protocol::processes::ProcessIoDataInput {
+            id: "Input_Compute".into(), name: None }],
+        data_outputs: Vec::new(),
+        input_set_id: "InputSet_Compute".into(),
+        input_set: vec!["Input_Compute".into()],
+        output_set_id: "OutputSet_Compute".into(),
+        output_set: Vec::new(),
+        input_associations: vec![tentaflow_protocol::processes::ProcessInputAssociation::CelAssignment {
+            id: "Association_Compute_Input".into(),
+            from_expression: input_expression.into(),
+            target_input_id: "Input_Compute".into(),
+        }],
+        output_associations: Vec::new(),
+        coordinator_output: None,
+    });
+    model.nodes.extend([
+        ProcessNode { id: "OuterTimer".into(), name: "Outer timer".into(),
+            kind: ProcessNodeKind::BoundaryTimer {
+                attached_to_id: "Compute".into(), cancel_activity: true,
+                timer: ProcessTimerSpec::Duration { seconds: 1 },
+            }, repeat: None, activity_io: None,},
+        ProcessNode { id: "TimeoutEnd".into(), name: "Timeout end".into(),
+            kind: ProcessNodeKind::End, repeat: None, activity_io: None,},
+    ]);
+    model.sequence_flows.push(edge("ToTimeoutEnd", "OuterTimer", "TimeoutEnd"));
+    let started = runtime::test_support::start_model(fixture, &model);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    (started.instance_id, snapshot)
+}
+
+fn fire_outer_timer(fixture: &Fixture, snapshot: &repository::RuntimeSnapshot) {
+    let timer = snapshot.timers.iter().find(|timer|
+        timer.node_id == "OuterTimer" && timer.status == ProcessTimerStatus::Pending).unwrap();
+    let due = timer.due_at_ms.unwrap() + 1;
+    let candidate = repository::due_timers(&fixture.db, due, 32).unwrap().into_iter()
+        .find(|candidate| candidate.timer_id == timer.timer_id).unwrap();
+    let timer_snapshot = repository::timer_snapshot(&fixture.db, &candidate).unwrap();
+    let fire = super::timers::plan_timer_fire(&timer_snapshot, due, None, None).unwrap();
+    repository::fire_timer(&fixture.db, &candidate, &fixture.owner,
+        Some(snapshot.instance.revision), repository::ProcessPlanInput::Supplied(&fire), due)
+        .unwrap_or_else(|error| panic!("the deadline was refused: {error:#}"));
+}
+
+/// A group that holds an incident skips its other ready ordinals (`advance`), so one
+/// activation of a repeated task raises exactly one incident without a job. The group
+/// names it and an interrupting deadline closes it together with the group.
+#[test]
+fn an_interrupting_deadline_resolves_the_incident_a_parked_repeated_script_holds() {
+    for (input, script, code) in [
+        ("1 / 0", "1", "ACTIVITY_IO_INPUT_FAILED"),
+    ] {
+        let fixture = Fixture::new();
+        let (instance_id, snapshot) = parallel_script_with_deadline(&fixture, input, script);
+        assert_eq!(snapshot.instance.status, ProcessInstanceStatus::Incident, "{code}");
+        assert_eq!(snapshot.incidents.iter().map(|incident| incident.code.as_str())
+            .collect::<Vec<_>>(), [code], "{code}: the second ordinal is not activated");
+        assert_eq!(snapshot.repetition_groups[0].terminal_incident_id.as_deref(),
+            Some(snapshot.incidents[0].incident_id.as_str()), "{code}");
+        fire_outer_timer(&fixture, &snapshot);
+        let closed = repository::runtime_snapshot(&fixture.db, &fixture.owner, &instance_id)
+            .unwrap();
+        assert_eq!(closed.instance.status, ProcessInstanceStatus::Completed, "{code}");
+        assert!(closed.incidents.is_empty(), "{code}: no incident may outlive the group");
+    }
+}
+
+#[test]
+fn an_interrupting_deadline_closes_the_single_incident_of_a_repeated_script_without_io() {
+    let fixture = Fixture::new();
+    let mut model = script_model("1 / 0", BTreeMap::new(), false);
+    model.variables.insert("results".into(), json!([]));
+    model.timer_timezone = Some("UTC".into());
+    model.nodes.iter_mut().find(|node| node.id == "Compute").unwrap().repeat =
+        Some(ProcessRepeatSpec::MultiInstance {
+            mode: ProcessMultiInstanceMode::Parallel,
+            input: ProcessMultiInstanceInput::Cardinality { count: 2 },
+            output_collection_variable: "results".into(),
+        });
+    model.nodes.extend([
+        ProcessNode { id: "OuterTimer".into(), name: "Outer timer".into(),
+            kind: ProcessNodeKind::BoundaryTimer {
+                attached_to_id: "Compute".into(), cancel_activity: true,
+                timer: ProcessTimerSpec::Duration { seconds: 1 },
+            }, repeat: None, activity_io: None,},
+        ProcessNode { id: "TimeoutEnd".into(), name: "Timeout end".into(),
+            kind: ProcessNodeKind::End, repeat: None, activity_io: None,},
+    ]);
+    model.sequence_flows.push(edge("ToTimeoutEnd", "OuterTimer", "TimeoutEnd"));
+    let started = runtime::test_support::start_model(&fixture, &model);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    assert_eq!(snapshot.incidents.len(), 1);
+    fire_outer_timer(&fixture, &snapshot);
+    let closed = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    assert_eq!(closed.instance.status, ProcessInstanceStatus::Completed);
+    assert!(closed.incidents.is_empty());
+}
+
 #[test]
 fn repeated_script_joined_worker_failure_aborts_the_whole_start() {
     let fixture = Fixture::new();

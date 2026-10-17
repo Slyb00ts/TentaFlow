@@ -19782,8 +19782,21 @@ fn apply_repetition_plan_on(
                                 raised.next().filter(|_| raised.next().is_none())
                                     .map(|incident| incident.incident_id.clone())
                             } else {
-                                job_incident_on(tx, instance_id, &row.scope_id, &group.node_id,
-                                    Some(job_id), code)?
+                                // A Condition decides between two incident codes, and a
+                                // release that evaluates the same expression differently
+                                // wrote the other one under this row.
+                                let own = [code.as_str()];
+                                let candidates: &[&str] = if accepted_result.outcome
+                                    == tentaflow_protocol::processes::ActivityOutcome::Completed {
+                                    &["EXPRESSION_ERROR", "VERIFICATION_FAILED"]
+                                } else { &own };
+                                let mut stored = None;
+                                for candidate in candidates {
+                                    stored = job_incident_on(tx, instance_id, &row.scope_id,
+                                        &group.node_id, Some(job_id), candidate)?;
+                                    if stored.is_some() { break; }
+                                }
+                                stored
                             },
                         _ => None,
                     };
@@ -26755,22 +26768,49 @@ pub(super) fn is_result_refusal(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<ResultRefused>())
 }
 
+/// The store failed, not the plan. A transient failure (busy, interrupted, full disk,
+/// I/O) may pass on a later attempt; a read-only, unopenable or corrupt database
+/// will not, but it is just as little a verdict on the plan, so it is never
+/// reported as a refusal either (it surfaces as a failed acceptance instead).
 fn is_storage_failure(error: &anyhow::Error) -> bool {
     use rusqlite::ErrorCode::{
-        DatabaseBusy, DatabaseLocked, DiskFull, OperationInterrupted, OutOfMemory,
-        SystemIoFailure,
+        CannotOpen, DatabaseBusy, DatabaseCorrupt, DatabaseLocked, DiskFull, NotADatabase,
+        OperationInterrupted, OutOfMemory, ReadOnly, SystemIoFailure,
     };
     error.chain().any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some_and(|failure|
         matches!(failure, rusqlite::Error::SqliteFailure(code, _)
             if matches!(code.code, DatabaseBusy | DatabaseLocked | DiskFull
-                | OperationInterrupted | OutOfMemory | SystemIoFailure))))
+                | OperationInterrupted | OutOfMemory | SystemIoFailure | ReadOnly
+                | CannotOpen | DatabaseCorrupt | NotADatabase))))
         || error.chain().any(|cause| cause.is::<std::io::Error>())
+}
+
+/// The store was busy or its connection pool exhausted: nothing was decided about
+/// the result, and the same acceptance can simply be made again.
+fn is_store_busy(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some_and(|failure|
+        matches!(failure, rusqlite::Error::SqliteFailure(code, _)
+            if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy
+                | rusqlite::ErrorCode::DatabaseLocked))))
+        || error.chain().any(|cause| cause.is::<crate::db::DbError>())
+}
+
+/// A failed acceptance that planning the same observed result again can get past:
+/// a lost revision race or a busy store. Every other failure is a fact about the
+/// stored state (a missing observation, a revoked actor, a lost generation) and
+/// stays the same on every retry.
+pub(super) fn is_retryable_acceptance(error: &anyhow::Error) -> bool {
+    is_revision_conflict(error) || is_store_busy(error)
+}
+
+pub(super) fn is_authority_denied(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<ProcessAuthorityDenied>())
 }
 
 /// Marks a failure of the plan or its validation as a refusal, unless it is a lost
 /// race, a storage failure or a Script infrastructure failure: a later attempt can
 /// get past those, and the Script one has its own recovery.
-fn refuse_result(error: anyhow::Error) -> anyhow::Error {
+pub(super) fn refuse_result(error: anyhow::Error) -> anyhow::Error {
     if is_revision_conflict(&error) || is_storage_failure(&error)
         || error.chain().any(|cause|
             cause.is::<crate::flow_engine::expr::InfrastructureExprError>()) {
@@ -27761,7 +27801,8 @@ pub fn fail_job_with_authority(
             // A result the engine will not accept, or that kept losing its race,
             // stays observed with nothing retrying a flow result before the next
             // restart: it must show as an incident instead of hanging unseen.
-            if matches!(code, "RESULT_REJECTED" | "TRANSITION_ERROR" | "REVISION_CONFLICT") {
+            if matches!(code, "RESULT_REJECTED" | "RESULT_ACCEPTANCE_FAILED" | "TRANSITION_ERROR"
+                | "REVISION_CONFLICT") {
                 count_recovery_failure_on(&tx, job_id, now_ms, 1)?;
                 tx.commit()?;
             }

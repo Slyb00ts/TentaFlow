@@ -2276,6 +2276,7 @@ async fn noninterrupting_outer_escalation_keeps_both_ordinals_and_factual_verifi
 #[tokio::test]
 async fn error_of_a_task_inside_a_repeated_subprocess_is_caught_by_the_boundary_on_its_coordinator() {
     for (mapped, count) in [(false, 1), (true, 1), (false, 2), (true, 2)] {
+        for failing in 0..count {
         let fixture = Fixture::new();
         let business = json!({"outcome":"Error","code":"REJECTED","summary":"Inner business rejection",
             "outputs":{"case":"alpha"},"evidence":[]});
@@ -2328,9 +2329,27 @@ async fn error_of_a_task_inside_a_repeated_subprocess_is_caught_by_the_boundary_
         let version = publish_model(&fixture, &model);
         let started = start_version(&fixture, &version);
         let at = chrono::Utc::now().timestamp_millis();
-        let worker = "inner-error-worker";
-        let claim = repository::claim_job(&fixture.db, worker, at).unwrap().unwrap();
-        let observed = super::repetition_service_tests::observed_flow_result(&fixture, &claim).await;
+        let mut claims = Vec::new();
+        for index in 0..count {
+            let worker = format!("inner-error-worker-{index}");
+            claims.push((worker.clone(),
+                repository::claim_job(&fixture.db, &worker, at).unwrap().unwrap()));
+        }
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        // The ordinal a job belongs to is the one whose token opened the job's scope.
+        let ordinal_of = |job_id: &str| {
+            let job = snapshot.jobs.iter().find(|job| job.job_id == job_id).unwrap();
+            let scope = snapshot.scopes.iter().find(|scope| scope.scope_id == job.scope_id).unwrap();
+            snapshot.repetition_occurrences.iter().find(|row|
+                Some(row.token_id.as_str()) == scope.parent_token_id.as_deref()).unwrap().ordinal
+        };
+        claims.sort_by_key(|(_, claim)| ordinal_of(&claim.job.job_id));
+        assert_eq!(claims.iter().map(|(_, claim)| ordinal_of(&claim.job.job_id)).collect::<Vec<_>>(),
+            (0..u32::from(count)).collect::<Vec<_>>(), "one Service job per ordinal");
+        // The failing ordinal is not the one that happens to be claimed first.
+        let (worker, claim) = &claims[usize::from(failing)];
+        let observed = super::repetition_service_tests::observed_flow_result(&fixture, claim).await;
         let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
             &started.instance_id).unwrap();
         let job = snapshot.jobs.iter().find(|job| job.job_id == claim.job.job_id).unwrap();
@@ -2341,7 +2360,7 @@ async fn error_of_a_task_inside_a_repeated_subprocess_is_caught_by_the_boundary_
         repository::accept_job_result(&fixture.db, &fixture.owner, &claim.job.job_id,
             claim.job.attempt, claim.job.fence, worker, &observed, snapshot.instance.revision,
             ProcessPlanInput::Supplied(&plan), at)
-            .unwrap_or_else(|error| panic!("{count} ordinals, mapped {mapped}: the validator refused the engine's own plan: {error:#}"));
+            .unwrap_or_else(|error| panic!("{count} ordinals, ordinal {failing} fails, mapped {mapped}: the validator refused the engine's own plan: {error:#}"));
         let after = repository::runtime_snapshot(&fixture.db, &fixture.owner,
             &started.instance_id).unwrap();
         assert!(after.incidents.is_empty());
@@ -2355,6 +2374,7 @@ async fn error_of_a_task_inside_a_repeated_subprocess_is_caught_by_the_boundary_
             "{count} ordinals: the coordinator closes every ordinal, not only the failing one");
         assert!(after.jobs.iter().all(|job| job.status != "running" && job.status != "queued"),
             "{count} ordinals: no sibling Service job keeps running");
+        }
     }
 }
 

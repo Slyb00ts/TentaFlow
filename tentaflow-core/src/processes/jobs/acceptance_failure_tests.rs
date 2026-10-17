@@ -127,9 +127,116 @@ async fn a_result_the_engine_cannot_plan_raises_an_incident() {
         chrono::Utc::now().timestamp_millis(), None).unwrap_err();
     assert!(!repository::is_result_refusal(&error), "the planner's own error is not typed");
 
-    publish(&group, member, &|| AccessCheck::Allowed);
+    let polls = AtomicUsize::new(0);
+    publish(&group, member, &|| { polls.fetch_add(1, Ordering::SeqCst); AccessCheck::Allowed });
+    // The planner's refusal is permanent, so it is planned once and not eight times; the
+    // incident is the same one an exhausted race raises (the observed result stays
+    // recorded either way and recovery is the same), so the attempts tell them apart.
+    assert_eq!(polls.load(Ordering::SeqCst), 1, "a result the engine cannot plan is not retried");
     assert_eq!(incident_codes(&group), ["RESULT_RECOVERY_FAILED"]);
     assert_eq!(phase(&group, member), "observed");
+}
+
+#[tokio::test]
+async fn an_untyped_permanent_acceptance_failure_is_not_retried() {
+    let group = two_completed_ordinals().await;
+    let member = &group.members[0];
+    let polls = AtomicUsize::new(0);
+    let sever = || {
+        polls.fetch_add(1, Ordering::SeqCst);
+        // An undecided-result incident that recovery does not own stays open across the
+        // acceptance: a fact of the stored state that planning again cannot change.
+        group.fixture.db.write().unwrap().execute(
+            "INSERT OR IGNORE INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) SELECT 'undecided-incident',instance_id,scope_id,node_id,job_id,'TOOL_RESULT_UNDECIDED','left by another pass',0 FROM bpmn_jobs WHERE job_id=?1",
+            [&member.claim.job.job_id]).unwrap();
+        AccessCheck::Allowed
+    };
+    publish(&group, member, &sever);
+    assert_eq!(polls.load(Ordering::SeqCst), 1, "a permanent failure is not retried eight times");
+    assert_eq!(incident_codes(&group), ["TOOL_RESULT_UNDECIDED"],
+        "the failure is already visible, so no second incident is raised");
+    assert_eq!(phase(&group, member), "observed", "the result stays recorded");
+    let failed_passes: i64 = group.fixture.db.read().unwrap().query_row(
+        "SELECT failed_passes FROM bpmn_result_recovery WHERE invocation_id=(SELECT invocation_id FROM bpmn_service_invocations WHERE job_id=?1)",
+        [&member.claim.job.job_id], |row| row.get(0)).unwrap();
+    assert_eq!(failed_passes, 1, "the failure is counted once, as a failed acceptance");
+}
+
+#[tokio::test]
+async fn a_revoked_authority_blocks_the_observed_result_instead_of_retrying() {
+    let group = two_completed_ordinals().await;
+    let member = &group.members[0];
+    let polls = AtomicUsize::new(0);
+    let revoke = || {
+        polls.fetch_add(1, Ordering::SeqCst);
+        // The actor still reads the instance, but no longer owns its definition.
+        let conn = group.fixture.db.write().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO user_accounts(id,username,password_hash,is_active) VALUES('another-owner','another-owner','x',1)",
+            []).unwrap();
+        conn.execute(
+            "UPDATE bpmn_definitions SET owner_user_id='another-owner' WHERE definition_id=(SELECT definition_id FROM bpmn_instances WHERE instance_id=?1)",
+            [&group.instance_id]).unwrap();
+        AccessCheck::Allowed
+    };
+    publish(&group, member, &revoke);
+    assert_eq!(polls.load(Ordering::SeqCst), 1, "a revoked authority is not retried eight times");
+    assert_ne!(phase(&group, member), "observed", "the result is blocked, not left hanging");
+}
+
+#[test]
+fn only_a_lost_race_or_a_busy_store_is_worth_another_acceptance() {
+    use rusqlite::ffi::{Error as SqliteError, ErrorCode};
+    let sqlite = |code: ErrorCode| anyhow::Error::new(rusqlite::Error::SqliteFailure(
+        SqliteError { code, extended_code: 0 }, None)).context("acceptance");
+    for retry in [ErrorCode::DatabaseBusy, ErrorCode::DatabaseLocked] {
+        assert!(repository::is_retryable_acceptance(&sqlite(retry)), "{retry:?}");
+    }
+    for stop in [ErrorCode::ReadOnly, ErrorCode::DatabaseCorrupt, ErrorCode::DiskFull,
+        ErrorCode::CannotOpen, ErrorCode::ConstraintViolation] {
+        assert!(!repository::is_retryable_acceptance(&sqlite(stop)), "{stop:?}");
+    }
+    assert!(repository::is_retryable_acceptance(&anyhow::Error::new(
+        repository::RevisionConflict("moved on"))));
+    assert!(!repository::is_retryable_acceptance(&anyhow::anyhow!(
+        "Service acceptance lacks its immutable original observation")));
+}
+
+#[test]
+fn a_failing_store_is_never_a_verdict_on_the_plan() {
+    use rusqlite::ffi::{Error as SqliteError, ErrorCode};
+    let sqlite = |code: ErrorCode| anyhow::Error::new(rusqlite::Error::SqliteFailure(
+        SqliteError { code, extended_code: 0 }, None));
+    for failing in [ErrorCode::DatabaseBusy, ErrorCode::DiskFull, ErrorCode::ReadOnly,
+        ErrorCode::CannotOpen, ErrorCode::DatabaseCorrupt] {
+        assert!(!repository::is_result_refusal(&repository::refuse_result(sqlite(failing))),
+            "{failing:?}");
+    }
+    assert!(repository::is_result_refusal(&repository::refuse_result(
+        sqlite(ErrorCode::ConstraintViolation))), "a plan the schema rejects is a refusal");
+}
+
+#[tokio::test]
+async fn a_busy_store_is_waited_out_and_the_result_is_accepted_on_the_next_attempt() {
+    let group = two_completed_ordinals().await;
+    let member = &group.members[0];
+    let path = group.fixture.directory.path().join("processes.db");
+    let holder = std::sync::Mutex::new(None);
+    let polls = AtomicUsize::new(0);
+    let contend = || {
+        if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+            let other = rusqlite::Connection::open(&path).unwrap();
+            other.execute_batch("BEGIN IMMEDIATE").unwrap();
+            *holder.lock().unwrap() = Some(other);
+        } else {
+            holder.lock().unwrap().take();
+        }
+        AccessCheck::Allowed
+    };
+    publish(&group, member, &contend);
+    assert_eq!(polls.load(Ordering::SeqCst), 2, "the busy attempt is made again exactly once");
+    assert_eq!(phase(&group, member), "accepted");
+    assert_eq!(incident_codes(&group), Vec::<String>::new());
 }
 
 #[tokio::test]

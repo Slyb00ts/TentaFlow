@@ -538,19 +538,86 @@ async fn an_incident_written_with_other_wording_still_matches_its_stored_row() {
 }
 
 #[tokio::test]
-async fn a_capacity_closed_group_is_not_parked_again_by_a_sibling_result() {
+async fn an_incident_written_under_the_other_condition_code_still_matches_its_stored_row() {
+    for (expression, stored, flipped) in [
+        ("outputs.missing.deeper", "EXPRESSION_ERROR", "VERIFICATION_FAILED"),
+        ("false", "VERIFICATION_FAILED", "EXPRESSION_ERROR"),
+    ] {
+        let group = ParallelGroup::start(
+            [service_result("Completed", None, 1), service_result("Completed", None, 2)],
+            condition(expression)).await;
+        group.accept(0).unwrap();
+        assert_eq!(codes(&group.snapshot()), [stored]);
+        // A release that evaluates the same expression the other way wrote this code.
+        let changed = group.fixture.db.write().unwrap().execute(
+            "UPDATE bpmn_incidents SET code=?3 WHERE instance_id=?1 AND code=?2",
+            rusqlite::params![group.instance_id, stored, flipped]).unwrap();
+        assert_eq!(changed, 1);
+        group.accept(1).unwrap_or_else(|error|
+            panic!("{expression}: a sibling was refused over an earlier release's code: {error:#}"));
+        let snapshot = group.snapshot();
+        let mut expected = [stored.to_owned(), flipped.to_owned()];
+        expected.sort();
+        assert_eq!(codes(&snapshot), expected, "{expression}");
+        assert_eq!(statuses(&snapshot), [Status::AcceptedBlocked, Status::AcceptedBlocked]);
+    }
+}
+
+/// The state a capacity latch leaves, while a sibling's job is still in flight.
+fn latch_capacity(group: &ParallelGroup) {
+    let conn = group.fixture.db.write().unwrap();
+    conn.execute(
+        "INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) SELECT 'limit-incident',instance_id,scope_id,node_id,NULL,'REPETITION_LIMIT','closed by capacity',0 FROM bpmn_repetition_groups WHERE instance_id=?1",
+        [&group.instance_id]).unwrap();
+    let latched = conn.execute(
+        "UPDATE bpmn_repetition_groups SET status='incident',terminal_capacity=1,terminal_incident_id='limit-incident',terminal_event_id=(SELECT event_id FROM bpmn_events WHERE instance_id=?1 LIMIT 1) WHERE instance_id=?1",
+        [&group.instance_id]).unwrap();
+    assert_eq!(latched, 1);
+}
+
+#[tokio::test]
+async fn a_capacity_closed_group_refuses_a_sibling_result_and_keeps_it_recorded() {
+    let group = ParallelGroup::start(
+        [service_result("Error", Some("CODE_A"), 1), service_result("Completed", None, 2)],
+        condition_true()).await;
+    latch_capacity(&group);
+    let before = group.snapshot();
+    let member = &group.members[0];
+    let error = repository::accept_job_result(&group.fixture.db, &group.fixture.owner,
+        &member.claim.job.job_id, member.claim.job.attempt, member.claim.job.fence,
+        &member.worker, &member.observed, before.instance.revision, repository::ProcessPlanInput::Canonical,
+        chrono::Utc::now().timestamp_millis()).unwrap_err();
+    assert!(repository::is_result_refusal(&error), "{error:#}");
+    assert!(format!("{error:#}").contains("live boundary coordinator"), "{error:#}");
+    let after = group.snapshot();
+    assert_eq!(codes(&after), ["REPETITION_LIMIT"], "a closed group is not parked under a second incident");
+    assert_eq!(after.repetition_groups[0].terminal_incident_id,
+        before.repetition_groups[0].terminal_incident_id);
+    assert_eq!(statuses(&after), statuses(&before));
+    assert_eq!(phase_of(&group, member), "observed", "the result stays recorded");
+}
+
+/// Only a Contract result is checked against its live coordinator beforehand, so an
+/// Envelope result reaches the parking step itself, which must refuse a closed group.
+#[tokio::test]
+async fn a_capacity_closed_group_is_not_parked_again_by_an_envelope_result() {
     let group = ParallelGroup::start(
         [service_result("Error", Some("CODE_A"), 1), service_result("Completed", None, 2)],
         condition_true()).await;
     let mut snapshot = group.snapshot();
     snapshot.repetition_groups[0].terminal_capacity = true;
     let job = snapshot.jobs.iter().find(|job| job.job_id == group.members[0].claim.job.job_id).unwrap();
-    // Only a Contract result is checked against its live coordinator beforehand.
     let mut observed = group.members[0].observed.clone();
     observed.origin = repository::ActivityResultOrigin::Envelope;
     let error = runtime::plan_job_result(&snapshot, job, &observed,
         chrono::Utc::now().timestamp_millis(), None).unwrap_err();
     assert!(format!("{error:#}").contains("capacity-closed"), "{error:#}");
+}
+
+fn phase_of(group: &ParallelGroup, member: &Member) -> String {
+    group.fixture.db.read().unwrap().query_row(
+        "SELECT phase FROM bpmn_service_invocations WHERE job_id=?1",
+        [&member.claim.job.job_id], |row| row.get(0)).unwrap()
 }
 
 /// A repeated Service's Error does not climb out of its own scope: only a handler on

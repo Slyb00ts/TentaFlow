@@ -1281,10 +1281,13 @@ async fn near_limit_repeated_service_retains_observation_through_accepted_capaci
     let before = super::call_tests::transition_rows(&fixture);
     let mut forged = canonical.clone();
     forged.repetition_capacity.as_mut().unwrap().retained_before_closure_bytes += 1;
-    assert!(repository::accept_job_result(&fixture.db, &fixture.owner,
+    let refusal = repository::accept_job_result(&fixture.db, &fixture.owner,
         &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
         &observed, after_observation.instance.revision,
-        repository::ProcessPlanInput::Supplied(&forged), at_ms).is_err());
+        repository::ProcessPlanInput::Supplied(&forged), at_ms).unwrap_err();
+    assert!(repository::is_result_refusal(&refusal), "{refusal:#}");
+    assert!(format!("{refusal:#}").contains(
+        "capacity latch differs from independently serialized durable evidence"), "{refusal:#}");
     assert_eq!(super::call_tests::transition_rows(&fixture), before);
     repository::accept_job_result(&fixture.db, &fixture.owner,
         &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
