@@ -114,19 +114,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   działają po edycji nazwy. Serwer odrzuca w nazwie węzła znaki sterujące kierunkiem
   tekstu (bidi), projektant je usuwa, a znaki wypełniające (U+034F, U+115F, U+1160,
   U+3164, U+FFA0) liczą się po obu stronach jako puste.
-- Inspektor zadania usługi BPMN (B3.3b): pola są w zakładkach Implementacja, Wejścia i
-  wyjścia, Wynik i błędy, Czas i Zaawansowane. Lista typów bloków pochodzi z opcji
-  serwera (`serviceBlocks`), a stała po stronie klienta zniknęła. Zakładka „Wynik i
-  błędy” pokazuje tabelę „co się stanie” wyliczaną z grafu (`processResultRouting`):
-  ukończone, błąd z kodem lub bez, wymaga człowieka, anulowane, awaria platformy i
-  przekroczenie czasu, ze zdarzeniami brzegowymi przypiętymi do zadania, oraz
-  ostrzeżenia i przyciski „Dodaj obsługę błędu / eskalacji” (zdarzenie brzegowe,
-  jeden wpis cofania). Reguły odtwarzają silnik (`plan_service_result`,
-  `error_handler`, `fail_claim`) i nie ma nowej reguły po stronie serwera. Węzeł
-  zadania usługi ma plakietkę rodzaju (przepływ, blok, narzędzie addonu) i znacznik
-  ostrzeżenia dla bloku LLM lub embeddingów bez modelu. Nowa aktywność wywołująca bez
-  dokładnej wersji ma znacznik na węźle i komunikat w inspektorze zamiast błędu
-  dopiero przy zapisie.
+- Inspektor zadania usługi BPMN (B3.3b): pola są w pięciu zakładkach (Akcja, Dane,
+  Wynik, Czas i Więcej, z pełnymi nazwami w podpowiedzi), widocznych naraz w panelu
+  o szerokości 340 px. Lista typów bloków i ich wymaganych ustawień pochodzi z opcji
+  serwera (`serviceBlocks`, `requiredSettings`), a stała po stronie klienta zniknęła.
+  Zakładka „Wynik” pokazuje tabelę „co się stanie” wyliczaną z grafu
+  (`processResultRouting`): ukończone, odrzucone przez weryfikującego (`HUMAN_REJECTED`,
+  `VERIFICATION_FAILED`), błąd z kodem lub bez, wymaga człowieka (także eskalacja
+  nieprzerywająca, która zostawia zadanie), anulowane, odmowa uprawnienia narzędzia
+  addonu (zadanie weryfikacji, niezależnie od reguły wyniku), awaria platformy i
+  przekroczenie czasu (incydent `EXTERNAL_OUTCOME_UNCERTAIN`, powód `SERVICE_TIMEOUT`;
+  przerywający timer brzegowy nadal kończy zadanie i go rozwiązuje), ze zdarzeniami
+  brzegowymi przypiętymi do zadania, oraz ostrzeżenia (jedno na rodzaj problemu) i
+  przyciski „Dodaj obsługę błędu / eskalacji”. Zdarzenie dodane przyciskiem leży na
+  dolnej krawędzi zadania i nosi nazwę po kodzie („Błąd: INVALID_INPUT”). Tabela jest
+  sprawdzana przeciwko silnikowi wspólnym plikiem `tests/fixtures/process_result_routing.json`,
+  który czytają test projektanta i test silnika `processes::result_routing_tests`.
+  Przy niskim oknie wiersz ustawień procesu jest zwinięty do znacznika stanu, a przy
+  szerokości poniżej 1440 px paleta jest szufladą otwieraną z płótna, więc inspektor ma
+  użyteczną wysokość, a płótno szerokość. Pusty warunek akceptacji jest zgłaszany z
+  nazwą zadania przed zapisem. Węzeł zadania usługi ma plakietkę rodzaju (przepływ,
+  blok, narzędzie addonu) i znacznik ostrzeżenia dla bloku bez wymaganego modelu. Nowa
+  aktywność wywołująca bez dokładnej wersji ma znacznik na węźle i komunikat na górze
+  inspektora, który wyjaśnia przyczynę; zapis nadal wymaga wybranej wersji.
 
 ### TentaNas
 

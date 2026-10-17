@@ -1819,6 +1819,10 @@ pub struct ProcessOptionBlock {
     pub label: String,
     pub description: String,
     pub category: String,
+    /// Settings the block cannot run without, so a new task starts with each
+    /// of them present and empty instead of the client guessing per block type.
+    #[serde(default)]
+    pub required_settings: Vec<String>,
 }
 
 /// An addon tool the requesting user may publish as a Service task.
@@ -2227,6 +2231,7 @@ mod tests {
                 label: "Language model (LLM)".into(),
                 description: "Generates text".into(),
                 category: "service".into(),
+                required_settings: vec!["model".into()],
             }],
             service_tools: vec![ProcessOptionTool {
                 addon_id: "notes-1".into(),

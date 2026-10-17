@@ -1,0 +1,670 @@
+{
+  "description": "Where each outcome of a BPMN Service task goes. Read by the designer's routing table (www/js/modules/flows-builder/bpmn.test.js, processResultRouting) and by the engine test processes::result_routing_tests, so a rule that changes on one side turns the other red. A case builds a Service task with the given boundary events, feeds it the stimulus, and states both the table row (expect) and the engine fact (engine). engine=null means no engine probe exists for the row; engineReason says why.",
+  "stimuli": {
+    "completed": "the result source returns a Completed result",
+    "rejected": "the result is Completed but the verifier says no (Human: the task is rejected, Condition: it evaluates to false)",
+    "error": "a result rule returns Error with the given code",
+    "needs_human": "a result rule returns NeedsHuman with the given code",
+    "cancelled": "a result rule returns Cancelled",
+    "tool_error": "the addon tool fails: a platform result, not a result rule outcome",
+    "bad_result_rule": "the result rule does not return an ActivityResult: a platform result",
+    "denied": "the initiator lost the addon permission, found at claim time",
+    "timeout": "the task runs past timeoutSeconds after dispatch"
+  },
+  "cases": [
+    {
+      "name": "Human review of a completed result opens the verification task",
+      "task": {
+        "kind": "tool",
+        "resultExpression": false,
+        "verification": "Human"
+      },
+      "stimulus": {
+        "type": "completed"
+      },
+      "expect": {
+        "route": "next"
+      },
+      "engine": {
+        "fact": "verification"
+      }
+    },
+    {
+      "name": "An accepting condition lets the process go on",
+      "task": {
+        "kind": "tool",
+        "resultExpression": false,
+        "verification": "Condition",
+        "conditionAccepts": true
+      },
+      "stimulus": {
+        "type": "completed"
+      },
+      "expect": {
+        "route": "next"
+      },
+      "engine": {
+        "fact": "advanced"
+      }
+    },
+    {
+      "name": "A condition that does not accept is an incident",
+      "task": {
+        "kind": "tool",
+        "resultExpression": false,
+        "verification": "Condition",
+        "conditionAccepts": false
+      },
+      "stimulus": {
+        "type": "rejected"
+      },
+      "expect": {
+        "route": "incident",
+        "code": "VERIFICATION_FAILED"
+      },
+      "engine": {
+        "fact": "incident",
+        "code": "VERIFICATION_FAILED"
+      }
+    },
+    {
+      "name": "A reviewer who rejects the result raises HUMAN_REJECTED",
+      "task": {
+        "kind": "tool",
+        "resultExpression": false,
+        "verification": "Human"
+      },
+      "stimulus": {
+        "type": "rejected"
+      },
+      "expect": {
+        "route": "incident",
+        "code": "HUMAN_REJECTED"
+      },
+      "engine": {
+        "fact": "incident",
+        "code": "HUMAN_REJECTED"
+      }
+    },
+    {
+      "name": "An error goes to the boundary with its exact code",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human"
+      },
+      "errors": [
+        {
+          "id": "ErrExact",
+          "code": "CODE_A"
+        }
+      ],
+      "stimulus": {
+        "type": "error",
+        "code": "CODE_A"
+      },
+      "expect": {
+        "route": "boundary",
+        "boundary": "ErrExact"
+      },
+      "engine": {
+        "fact": "boundary",
+        "node": "ErrExact"
+      }
+    },
+    {
+      "name": "An error with another code goes to the catch-all boundary",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human"
+      },
+      "errors": [
+        {
+          "id": "ErrExact",
+          "code": "CODE_A"
+        },
+        {
+          "id": "ErrAny",
+          "code": null
+        }
+      ],
+      "stimulus": {
+        "type": "error",
+        "code": "CODE_B"
+      },
+      "expect": {
+        "route": "boundary",
+        "boundary": "ErrAny"
+      },
+      "engine": {
+        "fact": "boundary",
+        "node": "ErrAny"
+      }
+    },
+    {
+      "name": "The exact error boundary wins over the catch-all one",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human"
+      },
+      "errors": [
+        {
+          "id": "ErrExact",
+          "code": "CODE_A"
+        },
+        {
+          "id": "ErrAny",
+          "code": null
+        }
+      ],
+      "stimulus": {
+        "type": "error",
+        "code": "CODE_A"
+      },
+      "expect": {
+        "route": "boundary",
+        "boundary": "ErrExact"
+      },
+      "engine": {
+        "fact": "boundary",
+        "node": "ErrExact"
+      }
+    },
+    {
+      "name": "An unhandled error at the top level is an incident with its code, unless a Call activity catches it",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human"
+      },
+      "errors": [
+        {
+          "id": "ErrExact",
+          "code": "CODE_A"
+        }
+      ],
+      "stimulus": {
+        "type": "error",
+        "code": "CODE_B"
+      },
+      "expect": {
+        "route": "caller"
+      },
+      "engine": {
+        "fact": "incident",
+        "code": "CODE_B"
+      },
+      "callerCatch": "call_tests::accepted_real_contract_error_crosses_calls_with_original_outputs_and_result_origin"
+    },
+    {
+      "name": "An unhandled error without a code is an incident SERVICE_ERROR",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human"
+      },
+      "stimulus": {
+        "type": "error",
+        "code": null
+      },
+      "expect": {
+        "route": "caller"
+      },
+      "engine": {
+        "fact": "incident",
+        "code": "SERVICE_ERROR"
+      }
+    },
+    {
+      "name": "Inside a sub-process an unhandled error climbs to the sub-process error boundary",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human"
+      },
+      "nested": true,
+      "stimulus": {
+        "type": "error",
+        "code": "CODE_B"
+      },
+      "expect": {
+        "route": "parent"
+      },
+      "engine": {
+        "fact": "propagated",
+        "node": "ScopeCatch"
+      }
+    },
+    {
+      "name": "A repeated task raises the incident itself",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human",
+        "repeat": true
+      },
+      "stimulus": {
+        "type": "error",
+        "code": "CODE_B"
+      },
+      "expect": {
+        "route": "incident"
+      },
+      "engine": null,
+      "engineReason": "a repeated tool task whose Error result no boundary event catches stays 'observed' under the scripted harness: the job keeps running, the invocation phase is 'observed' and no incident appears, because accept_job_result does not commit the plan that plan_job_result builds; the cause was not found, so the incident this row promises comes from reading runtime.rs (the repetition branch of plan_job_result), not from a run"
+    },
+    {
+      "name": "A repeated task inside a sub-process raises the incident itself instead of climbing",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human",
+        "repeat": true
+      },
+      "nested": true,
+      "stimulus": {
+        "type": "error",
+        "code": "CODE_B"
+      },
+      "expect": {
+        "route": "incident"
+      },
+      "engine": null,
+      "engineReason": "a repeated tool task whose Error result no boundary event catches stays 'observed' under the scripted harness: the job keeps running, the invocation phase is 'observed' and no incident appears, because accept_job_result does not commit the plan that plan_job_result builds; the cause was not found, so the incident this row promises comes from reading runtime.rs (the repetition branch of plan_job_result), not from a run"
+    },
+    {
+      "name": "A repeated task still uses a boundary event attached to it",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human",
+        "repeat": true
+      },
+      "errors": [
+        {
+          "id": "ErrExact",
+          "code": "CODE_A"
+        }
+      ],
+      "stimulus": {
+        "type": "error",
+        "code": "CODE_A"
+      },
+      "expect": {
+        "route": "boundary",
+        "boundary": "ErrExact"
+      },
+      "engine": {
+        "fact": "boundary",
+        "node": "ErrExact"
+      }
+    },
+    {
+      "name": "An interrupting escalation replaces the verification task",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human"
+      },
+      "escalations": [
+        {
+          "id": "EscExact",
+          "code": "REVIEW",
+          "interrupting": true
+        }
+      ],
+      "stimulus": {
+        "type": "needs_human",
+        "code": "REVIEW"
+      },
+      "expect": {
+        "route": "boundary",
+        "boundary": "EscExact"
+      },
+      "engine": {
+        "fact": "boundary",
+        "node": "EscExact"
+      }
+    },
+    {
+      "name": "A non-interrupting escalation keeps the task and still opens the verification task",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human"
+      },
+      "escalations": [
+        {
+          "id": "EscExact",
+          "code": "REVIEW",
+          "interrupting": false
+        }
+      ],
+      "stimulus": {
+        "type": "needs_human",
+        "code": "REVIEW"
+      },
+      "expect": {
+        "route": "boundary_keep",
+        "boundary": "EscExact"
+      },
+      "engine": {
+        "fact": "boundary_and_verification",
+        "node": "EscExact"
+      }
+    },
+    {
+      "name": "A catch-all escalation takes any other code",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human"
+      },
+      "escalations": [
+        {
+          "id": "EscExact",
+          "code": "REVIEW",
+          "interrupting": false
+        },
+        {
+          "id": "EscAny",
+          "code": null,
+          "interrupting": true
+        }
+      ],
+      "stimulus": {
+        "type": "needs_human",
+        "code": "OTHER"
+      },
+      "expect": {
+        "route": "boundary",
+        "boundary": "EscAny"
+      },
+      "engine": {
+        "fact": "boundary",
+        "node": "EscAny"
+      }
+    },
+    {
+      "name": "Needs a human without an escalation boundary opens the verification task",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human"
+      },
+      "stimulus": {
+        "type": "needs_human",
+        "code": "REVIEW"
+      },
+      "expect": {
+        "route": "review"
+      },
+      "engine": {
+        "fact": "verification"
+      }
+    },
+    {
+      "name": "An escalation with another code than the exact boundary falls back to the verification task",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human"
+      },
+      "escalations": [
+        {
+          "id": "EscExact",
+          "code": "REVIEW",
+          "interrupting": true
+        }
+      ],
+      "stimulus": {
+        "type": "needs_human",
+        "code": "OTHER"
+      },
+      "expect": {
+        "route": "review"
+      },
+      "engine": {
+        "fact": "verification"
+      }
+    },
+    {
+      "name": "A cancelled result is an incident with its code",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human"
+      },
+      "errors": [
+        {
+          "id": "ErrAny",
+          "code": null
+        }
+      ],
+      "stimulus": {
+        "type": "cancelled",
+        "code": "STOPPED_BY_RULE"
+      },
+      "expect": {
+        "route": "incident"
+      },
+      "engine": {
+        "fact": "incident",
+        "code": "STOPPED_BY_RULE"
+      }
+    },
+    {
+      "name": "A failing tool is a platform incident that no boundary event catches",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human"
+      },
+      "errors": [
+        {
+          "id": "ErrAny",
+          "code": null
+        }
+      ],
+      "stimulus": {
+        "type": "tool_error"
+      },
+      "expect": {
+        "route": "incident"
+      },
+      "engine": {
+        "fact": "incident",
+        "code": "TOOL_ERROR"
+      }
+    },
+    {
+      "name": "A result rule that returns no ActivityResult is a platform incident, not an error boundary hit",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human"
+      },
+      "errors": [
+        {
+          "id": "ErrAny",
+          "code": null
+        }
+      ],
+      "stimulus": {
+        "type": "bad_result_rule"
+      },
+      "expect": {
+        "route": "incident"
+      },
+      "engine": {
+        "fact": "incident",
+        "code": "RESULT_EXPRESSION_ERROR"
+      }
+    },
+    {
+      "name": "A denied tool permission opens a verification task without a result rule",
+      "task": {
+        "kind": "tool",
+        "resultExpression": false,
+        "verification": "Human"
+      },
+      "stimulus": {
+        "type": "denied"
+      },
+      "expect": {
+        "route": "review",
+        "code": "TOOL_PERMISSION_DENIED"
+      },
+      "engine": {
+        "fact": "verification"
+      }
+    },
+    {
+      "name": "A denied tool permission is not an escalation even with a result rule and a catch-all escalation boundary",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human"
+      },
+      "escalations": [
+        {
+          "id": "EscAny",
+          "code": null,
+          "interrupting": true
+        }
+      ],
+      "stimulus": {
+        "type": "denied"
+      },
+      "expect": {
+        "route": "review",
+        "code": "TOOL_PERMISSION_DENIED"
+      },
+      "engine": {
+        "fact": "verification"
+      }
+    },
+    {
+      "name": "Without a result rule an error-shaped output is only an output",
+      "task": {
+        "kind": "tool",
+        "resultExpression": false,
+        "verification": "Condition",
+        "conditionAccepts": true
+      },
+      "errors": [
+        {
+          "id": "ErrAny",
+          "code": null
+        }
+      ],
+      "stimulus": {
+        "type": "error",
+        "code": "CODE_A"
+      },
+      "expect": {
+        "route": "unavailable"
+      },
+      "engine": {
+        "fact": "advanced"
+      }
+    },
+    {
+      "name": "Without a result rule a needs-human-shaped output is only an output",
+      "task": {
+        "kind": "tool",
+        "resultExpression": false,
+        "verification": "Condition",
+        "conditionAccepts": true
+      },
+      "stimulus": {
+        "type": "needs_human",
+        "code": "REVIEW"
+      },
+      "expect": {
+        "route": "unavailable"
+      },
+      "engine": {
+        "fact": "advanced"
+      }
+    },
+    {
+      "name": "A timeout records the uncertain-outcome incident",
+      "task": {
+        "kind": "tool",
+        "resultExpression": false,
+        "verification": "Human",
+        "timeoutSeconds": 1
+      },
+      "stimulus": {
+        "type": "timeout"
+      },
+      "expect": {
+        "route": "incident",
+        "code": "EXTERNAL_OUTCOME_UNCERTAIN",
+        "reason": "SERVICE_TIMEOUT"
+      },
+      "engine": {
+        "fact": "uncertain_incident",
+        "reason": "SERVICE_TIMEOUT"
+      }
+    },
+    {
+      "name": "An interrupting timer still ends a timed-out task and resolves the incident",
+      "task": {
+        "kind": "tool",
+        "resultExpression": false,
+        "verification": "Human",
+        "timeoutSeconds": 1
+      },
+      "timers": [
+        {
+          "id": "Deadline",
+          "seconds": 1,
+          "interrupting": true
+        }
+      ],
+      "stimulus": {
+        "type": "timeout"
+      },
+      "expect": {
+        "route": "incident",
+        "code": "EXTERNAL_OUTCOME_UNCERTAIN",
+        "reason": "SERVICE_TIMEOUT",
+        "warning": "timer_resolves_timeout"
+      },
+      "engine": {
+        "fact": "timer_resolves"
+      }
+    },
+    {
+      "name": "A shorter interrupting timer ends the task before the timeout can apply",
+      "task": {
+        "kind": "tool",
+        "resultExpression": false,
+        "verification": "Human",
+        "timeoutSeconds": 60
+      },
+      "timers": [
+        {
+          "id": "Deadline",
+          "seconds": 5,
+          "interrupting": true
+        }
+      ],
+      "stimulus": {
+        "type": "timeout"
+      },
+      "expect": {
+        "route": "incident",
+        "code": "EXTERNAL_OUTCOME_UNCERTAIN",
+        "reason": "SERVICE_TIMEOUT",
+        "warning": "timer_preempts_timeout"
+      },
+      "engine": null,
+      "engineReason": "which of two deadlines fires first is wall-clock ordering of a timer and a worker timeout, and the engine has no fact to read for it; the shared fact (the timer ends a task that is still waiting) is the timer_resolves case above"
+    }
+  ]
+}

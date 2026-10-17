@@ -87,12 +87,13 @@ const FlowBuilderScreen = {
           <tf-button variant="primary" size="sm" icon="check" data-role="save">${escapeHtml(I18n.t('flows_builder.save'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="clock" data-role="history" title="${escapeAttr(I18n.t('flows_builder.history_title'))}"></tf-button>
         </header>
-        ${process ? `<div class="fb-process-notice"><tf-chip status="info" data-role="publication">${escapeHtml(I18n.t('bpmn.draft'))}</tf-chip><span data-role="process-hint">${escapeHtml(I18n.t('bpmn.supported_hint'))}</span><tf-select data-role="body-select" wrap-selected label="${escapeAttr(I18n.t('bpmn.process_body'))}"></tf-select><tf-select data-role="start-entry" wrap-selected label="${escapeAttr(I18n.t('bpmn.start_entry'))}"></tf-select><tf-button variant="secondary" size="sm" data-role="add-body">${escapeHtml(I18n.t('bpmn.add_process_body'))}</tf-button><tf-input data-role="body-name" label="${escapeAttr(I18n.t('bpmn.process_body_name'))}"></tf-input><tf-chip status="info" data-role="calendar-state" hidden></tf-chip><tf-input class="fb-timer-timezone" data-role="timer-timezone" label="${escapeAttr(I18n.t('bpmn.timer_timezone'))}" hint="${escapeAttr(I18n.t('bpmn.timer_timezone_hint'))}" placeholder="Europe/Warsaw" hidden></tf-input><tf-button variant="ghost" size="sm" data-role="draft" hidden>${escapeHtml(I18n.t('bpmn.return_draft'))}</tf-button><tf-button variant="ghost" size="sm" data-role="archive">${escapeHtml(I18n.t('bpmn.archive'))}</tf-button><span data-role="timer-summary" hidden></span></div>` : ''}
+        ${process ? `<div class="fb-process-notice" id="fb-process-notice"><tf-chip status="info" data-role="publication">${escapeHtml(I18n.t('bpmn.draft'))}</tf-chip><tf-button variant="ghost" size="sm" icon="chevron-down" data-role="notice-toggle" aria-controls="fb-process-notice">${escapeHtml(I18n.t('bpmn.process_settings'))}</tf-button><span data-role="process-hint">${escapeHtml(I18n.t('bpmn.supported_hint'))}</span><tf-select data-role="body-select" wrap-selected label="${escapeAttr(I18n.t('bpmn.process_body'))}"></tf-select><tf-select data-role="start-entry" wrap-selected label="${escapeAttr(I18n.t('bpmn.start_entry'))}"></tf-select><tf-button variant="secondary" size="sm" data-role="add-body">${escapeHtml(I18n.t('bpmn.add_process_body'))}</tf-button><tf-input data-role="body-name" label="${escapeAttr(I18n.t('bpmn.process_body_name'))}"></tf-input><tf-chip status="info" data-role="calendar-state" hidden></tf-chip><tf-input class="fb-timer-timezone" data-role="timer-timezone" label="${escapeAttr(I18n.t('bpmn.timer_timezone'))}" hint="${escapeAttr(I18n.t('bpmn.timer_timezone_hint'))}" placeholder="Europe/Warsaw" hidden></tf-input><tf-button variant="ghost" size="sm" data-role="draft" hidden>${escapeHtml(I18n.t('bpmn.return_draft'))}</tf-button><tf-button variant="ghost" size="sm" data-role="archive">${escapeHtml(I18n.t('bpmn.archive'))}</tf-button><span data-role="timer-summary" hidden></span></div>` : ''}
         <tf-alert data-role="error" tone="danger" hidden></tf-alert>
 
         <div class="fb-body" data-role="body">
-          <aside class="fb-palette" data-role="palette"></aside>
+          <aside class="fb-palette" id="fb-palette" data-role="palette"></aside>
           <main class="fb-canvas-wrap" data-role="canvas-wrap">
+            ${process ? `<tf-button class="fb-palette-toggle" variant="secondary" size="sm" icon="plus" data-role="palette-toggle" aria-controls="fb-palette" aria-expanded="false">${escapeHtml(I18n.t('bpmn.palette_open'))}</tf-button>` : ''}
             <div data-role="canvas"></div>
             <div class="fb-minimap" data-role="minimap" aria-label="${escapeAttr(I18n.t('flows_builder.minimap_label'))}">
               <span class="fb-minimap-label">${escapeHtml(I18n.t('flows_builder.minimap_name'))}</span>
@@ -212,10 +213,12 @@ const FlowBuilderScreen = {
       onDrop: (tpl, clientX, clientY) => {
         state.canvas.addNodeFromTemplate(tpl, clientX, clientY);
         this._markDirty();
+        state.setPaletteOpen?.(false);
       },
       onAdd: (tpl) => {
         const rect = root.querySelector('[data-role="canvas"]').getBoundingClientRect();
         state.canvas.addNodeFromTemplate(tpl, rect.left + rect.width / 2, rect.top + rect.height / 2, { cascade: true });
+        state.setPaletteOpen?.(false);
       },
     });
     await state.palette.init();
@@ -226,6 +229,7 @@ const FlowBuilderScreen = {
     state.canvas = new FlowCanvas(canvasRoot, {
       readOnly: state.readOnly,
       mode: state.mode,
+      processOptions: state.processOptions,
       onChange: () => {
         this._markDirty();
         this._updateStats();
@@ -233,6 +237,7 @@ const FlowBuilderScreen = {
         if (state.mode === 'bpmn' && state.config) {
           this._syncProcessPath();
           this._syncProcessControls();
+          state.config.refreshRouting();
         }
       },
       onSelect: (node, edge) => {
@@ -370,6 +375,27 @@ const FlowBuilderScreen = {
     });
 
     if (state.mode === 'bpmn') {
+      // On a short window the settings row starts folded to its state chip, so the
+      // canvas and inspector get the height; the toggle unfolds it again.
+      const notice = root.querySelector('.fb-process-notice');
+      const noticeToggle = root.querySelector('[data-role="notice-toggle"]');
+      const showNotice = (open) => {
+        notice.classList.toggle('fb-collapsed', !open);
+        noticeToggle.setAttribute('aria-expanded', String(open));
+        noticeToggle.setAttribute('icon', open ? 'chevron-down' : 'chevron-right');
+      };
+      showNotice(window.innerHeight >= 820);
+      noticeToggle.addEventListener('click', () => showNotice(notice.classList.contains('fb-collapsed')));
+      const paletteEl = root.querySelector('[data-role="palette"]');
+      const paletteToggle = root.querySelector('[data-role="palette-toggle"]');
+      state.setPaletteOpen = (open) => {
+        paletteEl.classList.toggle('open', open);
+        paletteToggle.setAttribute('aria-expanded', String(open));
+      };
+      paletteToggle.addEventListener('click', () => state.setPaletteOpen(!paletteEl.classList.contains('open')));
+      root.querySelector('[data-role="canvas"]').addEventListener('pointerdown', () => {
+        if (paletteToggle.offsetParent) state.setPaletteOpen(false);
+      });
       root.querySelector('[data-role="body-select"]').addEventListener('change', (event) => {
         if (event.target !== root.querySelector('[data-role="body-select"]')) return;
         state.canvas.navigateProcessBody([], event.target.value);
@@ -848,12 +874,15 @@ const FlowBuilderScreen = {
   // Jeden punkt, w którym powstaje napis o stanie zapisu — „Zapisano" obok
   // trzech bloków z czerwoną obwódką i wierszem „wymagane" przeczy płótnu, więc
   // stan zapisany raportuje też, ile bloków czeka na konfigurację.
-  _setAutosave(kind) {
+  _setAutosave(kind, reason = '') {
     const s = this._state;
     if (!s) return;
     const el = s.root.querySelector('[data-role="autosave"]');
     const t = s.root.querySelector('[data-role="autosave-text"]');
     if (!el || !t) return;
+    // A silent autosave has no toast, so the element that blocks it is named here.
+    if (kind === 'error' && reason) el.setAttribute('title', reason);
+    else el.removeAttribute('title');
     const incomplete = s.canvas.incompleteNodeCount();
     const warn = kind === 'ok' && incomplete > 0;
     el.classList.toggle('pending', kind === 'pending');
@@ -935,7 +964,7 @@ const FlowBuilderScreen = {
     // ochrona przed zbednym round-tripem i czytelnym komunikatem inline.
     const errors = s.canvas.validate ? s.canvas.validate() : [];
     if (errors.length > 0) {
-      this._setAutosave('error');
+      this._setAutosave('error', errors[0]);
       if (!silent) toast(errors[0], 'error');
       return false;
     }
@@ -959,7 +988,7 @@ const FlowBuilderScreen = {
         s.dirty = s.editRevision !== editRevision;
         this._syncProcessControls();
         this._setAutosave(s.dirty ? 'pending' : 'ok');
-        if (!silent) toast(I18n.t('flows_builder.save_success'), 'success');
+        if (!silent) toast(I18n.t('bpmn.saved'), 'success');
         return true;
       }
       // `variables` dopisujemy tylko gdy niepuste — pusty flow round-trippuje

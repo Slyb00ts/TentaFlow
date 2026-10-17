@@ -1296,6 +1296,9 @@ tf-tabs {
 .tf-table--variant-borderless tbody tr + tr td { border-top: 0; }
 .tf-table--density-compact th,
 .tf-table--density-compact td { padding: 6px 10px; }
+/* A compact table sits in a narrow card (an inspector): a long identifier such as
+   an incident code has to wrap instead of widening the table past its card. */
+.tf-table--density-compact td { overflow-wrap: anywhere; }
 .tf-table--density-comfortable th,
 .tf-table--density-comfortable td { padding: 16px 18px; }
 

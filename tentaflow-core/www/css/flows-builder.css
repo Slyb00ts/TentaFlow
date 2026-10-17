@@ -1383,15 +1383,18 @@
   opacity: 0.6;
 }
 
-/* Process chrome follows its controls; the flexible body receives unused height. */
+/* Process chrome follows its controls; the flexible body receives unused height.
+   The body row never drops below a height an inspector can be used at: on a
+   short window the shell scrolls instead of squeezing the canvas and inspector. */
 .fb-process-shell {
   grid-template-rows:
-    auto
-    auto
-    auto
-    minmax(clamp(160px, 30vh, 320px), 1fr)
+    max-content
+    max-content
+    max-content
+    minmax(clamp(440px, 60vh, 560px), 1fr)
     minmax(52px, clamp(56px, 10vh, 88px));
   align-content: start;
+  overflow-y: auto;
 }
 .fb-process-shell .fb-topbar {
   flex-wrap: wrap;
@@ -1464,6 +1467,22 @@
 .fb-process-shell [data-role="canvas"] { position: relative; flex: 1; min-height: 0; }
 .fb-process-shell .fb-minimap { position: relative; right: auto; bottom: auto; align-self: flex-end; flex: none; width: 120px; height: 80px; margin: 12px; }
 .fb-process-notice { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 16px; border-bottom: 1px solid var(--tf-border); color: var(--tf-text-2); }
+/* Collapsed, the settings row keeps only the publication state and its own toggle. */
+.fb-process-shell .fb-process-notice.fb-collapsed > :not([data-role="publication"]):not([data-role="notice-toggle"]) { display: none; }
+.fb-process-shell .fb-process-notice [data-role="notice-toggle"] { margin-left: auto; }
+.fb-palette-toggle { display: none; position: absolute; top: 12px; left: 12px; z-index: 12; }
+/* From a laptop width down, the palette is a drawer opened from the canvas and the
+   inspector keeps its column, so the canvas is not squeezed to a strip. */
+@media (min-width: 768px) and (max-width: 1439px) {
+  .fb-process-shell .fb-body { grid-template-columns: minmax(0, 1fr) 340px; }
+  .fb-process-shell .fb-palette { position: absolute; top: 0; bottom: 0; left: 0; z-index: 15; width: min(320px, 86vw); box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6); transition: transform 0.28s cubic-bezier(0.32, 0.72, 0, 1); }
+  .fb-process-shell .fb-palette:not(.open) { transform: translateX(-105%) !important; visibility: hidden; }
+  .fb-process-shell .fb-palette.open { transform: none !important; }
+  .fb-process-shell .fb-config { position: static; width: auto; transform: none !important; box-shadow: none; }
+  .fb-process-shell .fb-palette-toggle { display: inline-flex; }
+}
+/* The inspector's tab strip stays in view while its panel scrolls. */
+.fb-process-fields > tf-tabs[data-service-tabs] { position: sticky; top: -16px; z-index: 3; margin: 0 -16px; width: calc(100% + 32px); max-width: none; }
 .fb-process-notice > span { flex: 1; min-width: 220px; line-height: 1.5; }
 .fb-process-node { border: 2px solid var(--tf-accent-2); border-radius: 12px; background: var(--tf-bg-card); }
 .fb-process-symbol { display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; height: 100%; padding: 12px; box-sizing: border-box; overflow-wrap: anywhere; }
@@ -1480,11 +1499,6 @@
 .fb-process-kind svg, .fb-process-warn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; }
 .fb-process-kind[data-kind="block"] { color: var(--tf-accent-3, var(--tf-accent-2)); }
 .fb-process-kind[data-kind="tool"] { color: var(--tf-success, #16a34a); }
-.fb-routing { width: 100%; border-collapse: collapse; font-size: 12px; }
-.fb-routing th, .fb-routing td { padding: 6px 8px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--tf-border); overflow-wrap: anywhere; }
-.fb-routing th { font-weight: 600; color: var(--tf-text-2); }
-.fb-routing [data-route="incident"] { color: var(--tf-danger, #ef4444); }
-.fb-routing [data-route="unavailable"] { color: var(--tf-text-2); }
 .fb-routing-warnings { display: flex; flex-direction: column; gap: 8px; margin: 8px 0; }
 .fb-routing-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
 .fb-process-panel[hidden], .fb-process-fields tf-alert[hidden] { display: none; }

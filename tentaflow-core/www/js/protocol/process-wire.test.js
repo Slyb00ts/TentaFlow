@@ -1018,11 +1018,13 @@ test('process options decode the block and tool catalogues and tolerate a server
   const full = decode({
     assignees: [{ user_id: 'u1', display_name: 'Anna' }],
     service_flows: [{ flow_id: 'f1', name: 'Checker', description: 'Checks a contract' }],
-    service_blocks: [{ node_type: 'llm', label: 'Language model (LLM)', description: 'Generates text', category: 'service' }],
+    service_blocks: [{ node_type: 'llm', label: 'Language model (LLM)', description: 'Generates text', category: 'service', required_settings: ['model'] }],
     service_tools: [{ addon_id: 'notes-1', tool_name: 'search', description: 'Searches notes', addon_name: 'Notes' }],
   });
   assert.equal(full.variant, 'ProcessOptionsResponse');
-  assert.deepEqual(full.serviceBlocks, [{ nodeType: 'llm', label: 'Language model (LLM)', description: 'Generates text', category: 'service' }]);
+  assert.deepEqual(full.serviceBlocks, [{ nodeType: 'llm', label: 'Language model (LLM)', description: 'Generates text', category: 'service', requiredSettings: ['model'] }]);
+  const noSettings = decode({ assignees: [], service_flows: [], service_blocks: [{ node_type: 'pii_filter', label: 'Filter', description: 'd', category: 'filter' }] });
+  assert.deepEqual(noSettings.serviceBlocks[0].requiredSettings, [], 'a server that omits the list means the block needs nothing');
   assert.deepEqual(full.serviceTools, [{ addonId: 'notes-1', toolName: 'search', description: 'Searches notes', addonName: 'Notes' }]);
   assert.deepEqual(full.serviceFlows, [{ flowId: 'f1', name: 'Checker', description: 'Checks a contract' }]);
   const old = decode({ assignees: [], service_flows: [] });

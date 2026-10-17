@@ -34,9 +34,10 @@ const ELEMENTS = [
   ['EventBasedGateway', 'event_based_gateway', 'bpmn-gateway-event-based', 'gateways', 72, 72],
 ];
 
-// The settings a block starts with: the keys it requires, empty. Choosing a type
-// replaces the settings, so keys of the previous type never linger.
-export const processBlockTemplate = (type) => (type === 'pii_filter' ? {} : { model: '' });
+// The settings a block starts with: the keys the server lists as required,
+// empty. Choosing a type replaces the settings, so keys of the previous type
+// never linger.
+export const processBlockTemplate = (block) => Object.fromEntries((block?.requiredSettings || []).map((key) => [key, '']));
 
 // Block names come from the process options; the locale wins when it knows the
 // block, the server's English text covers a block this client has no key for.
@@ -165,7 +166,7 @@ function tentaflowTemplates(options) {
       : block.nodeType === 'pii_filter' ? 'shield' : 'sparkle',
     localized(`bpmn.block_${block.nodeType}`, block.label),
     localized(`bpmn.block_${block.nodeType}_hint`, block.description),
-    { implementation: { Block: { nodeType: block.nodeType, config: processBlockTemplate(block.nodeType) } } })),
+    { implementation: { Block: { nodeType: block.nodeType, config: processBlockTemplate(block) } } })),
     ...tools.map((tool) => entry('tools', 'puzzle',
       toolLabel(tool, labelCounts.get(toolLabel(tool, false)) > 1),
       tool.description || tool.addonId,
@@ -237,15 +238,16 @@ export function processServiceKind(config) {
   return implementation?.Block ? 'block' : implementation?.AddonTool ? 'tool' : 'flow';
 }
 
-// Problems the canvas marks on a node itself. A block whose template carries a
-// `model` key and a published Call without an exact version are both saved or
-// refused only later (publication, or the wire codec), so the author sees them
-// here first.
-export function processNodeWarnings(node) {
+// Problems the canvas marks on a node itself. A block whose required settings
+// include `model` and a published Call without an exact version are both saved
+// or refused only later (publication, or the wire codec), so the author sees
+// them here first. `blocks` is the server's block list.
+export function processNodeWarnings(node, blocks = []) {
   const warnings = [];
   if (node.type === 'bpmn_service_task') {
     const block = node.config?.implementation?.Block;
-    if (block && Object.hasOwn(processBlockTemplate(block.nodeType), 'model')
+    const listed = block && blocks.find((candidate) => candidate.nodeType === block.nodeType);
+    if (listed?.requiredSettings?.includes('model')
       && (typeof block.config?.model !== 'string' || block.config.model.trim() === '')) {
       warnings.push('empty_model');
     }
@@ -257,22 +259,37 @@ export function processNodeWarnings(node) {
   return warnings;
 }
 
+// Name of an error or escalation handler added from the result tab: the code it
+// catches, or "any" for the catch-all handler.
+export function processHandlerName(type, code) {
+  const kind = type === 'bpmn_boundary_error' ? 'error' : 'escalation';
+  return code == null ? I18n.t(`bpmn.handler_name_${kind}_any`) : I18n.t(`bpmn.handler_name_${kind}`, { code });
+}
+
 /**
  * What happens to a Service task's outcomes, derived from the graph alone.
  * There is no server-side rule table: the rules below mirror the engine in
- * processes/runtime.rs (plan_service_result, error_handler) and processes/jobs.rs
- * (classify_result, fail_claim):
+ * processes/runtime.rs (plan_job_result, error_handler, report_denied_tool) and
+ * processes/jobs.rs (classify_result, fail_claim). The shared fixture
+ * tests/fixtures/process_result_routing.json pins every row against both sides:
  * - only a Contract result (a non-empty `resultExpression`) can be Error,
  *   NeedsHuman or Cancelled; a platform failure (flow, tool or expression
- *   error) is always an incident and no boundary event catches it;
+ *   error) is always an incident and no boundary event catches it. The one
+ *   platform result that is NOT an incident is a denied addon tool permission:
+ *   it opens a verification task for the initiator, whatever `resultExpression` says;
  * - Error goes to the boundary with the exact code, else to the catch-all
- *   boundary, else (inside a sub-process) to the enclosing scope, else an incident;
+ *   boundary, else (inside a sub-process) up the enclosing scopes, else an
+ *   incident, unless the process runs as a called process whose Call activity
+ *   has an error boundary. A repeated task never climbs: it raises the incident itself;
  * - NeedsHuman goes to the escalation boundary with the exact code, else the
- *   catch-all one, else the initiator's verification task;
- * - Cancelled is an incident; a service timeout after dispatch is an incident
- *   (reason SERVICE_TIMEOUT, outcome uncertain);
- * - a boundary timer runs on its own clock from activation and is not a reaction
- *   to the service timeout.
+ *   catch-all one, else the initiator's verification task. A non-interrupting
+ *   escalation keeps the task, which still opens its verification task;
+ * - a rejected verification is an incident (HUMAN_REJECTED, VERIFICATION_FAILED);
+ *   Cancelled is an incident; a service timeout after dispatch records the
+ *   uncertain-outcome incident EXTERNAL_OUTCOME_UNCERTAIN (reason SERVICE_TIMEOUT)
+ *   and the job stays running, so an interrupting boundary timer still ends the
+ *   task and resolves that incident;
+ * - a boundary timer runs on its own clock from activation.
  */
 export function processResultRouting(graph, nodeId) {
   const node = graph.nodes.find((candidate) => candidate.id === nodeId);
@@ -281,6 +298,8 @@ export function processResultRouting(graph, nodeId) {
   const config = node.config || {};
   const hasResult = typeof config.resultExpression === 'string' && config.resultExpression.length > 0;
   const nested = (graph.processPath || []).length > 0;
+  const repeated = node.repeat != null;
+  const serviceKind = processServiceKind(config);
   const byId = new Map(graph.nodes.map((candidate) => [candidate.id, candidate]));
   const targetsOf = (id) => graph.edges.filter((edge) => edge.from_node === id)
     .map((edge) => byId.get(edge.to_node)).filter(Boolean)
@@ -288,6 +307,8 @@ export function processResultRouting(graph, nodeId) {
   const describe = (boundary, code, undeclared) => ({
     id: boundary.id, label: boundary.label || '', type: boundary.type, code, catchAll: code === null && !undeclared,
     undeclared, interrupting: boundary.config.cancelActivity !== false, targets: targetsOf(boundary.id),
+    name: boundary.label || (boundary.type === 'bpmn_boundary_timer' || undeclared
+      ? I18n.t(`bpmn.node_${boundary.type.slice(5)}`) : processHandlerName(boundary.type, code)),
   });
   const attached = (type) => graph.nodes.filter((candidate) => candidate.type === type
     && candidate.config.attachedToId === nodeId);
@@ -312,45 +333,57 @@ export function processResultRouting(graph, nodeId) {
   const human = typeof config.verification === 'string';
   const rows = [];
   rows.push({ outcome: 'completed', route: 'next', gate: human ? 'human' : 'condition', targets: targetsOf(nodeId) });
-  if (!human) rows.push({ outcome: 'rejected', route: 'incident', code: 'VERIFICATION_FAILED' });
+  rows.push({ outcome: 'rejected', route: 'incident', code: human ? 'HUMAN_REJECTED' : 'VERIFICATION_FAILED' });
+  const escalationRoute = (entry) => (entry.interrupting ? 'boundary' : 'boundary_keep');
   if (hasResult) {
     for (const entry of specific(errors)) rows.push({ outcome: 'error', route: 'boundary', code: entry.code, boundary: entry, targets: entry.targets });
     const otherError = catchAll(errors);
-    rows.push({ outcome: 'error', route: otherError ? 'boundary' : nested ? 'parent' : 'incident', other: true,
+    rows.push({ outcome: 'error', route: otherError ? 'boundary' : repeated ? 'incident' : nested ? 'parent' : 'caller', other: true,
       code: null, boundary: otherError, targets: otherError ? otherError.targets : [] });
-    for (const entry of specific(escalations)) rows.push({ outcome: 'needs_human', route: 'boundary', code: entry.code, boundary: entry, targets: entry.targets });
+    for (const entry of specific(escalations)) rows.push({ outcome: 'needs_human', route: escalationRoute(entry), code: entry.code, boundary: entry, targets: entry.targets });
     const otherEscalation = catchAll(escalations);
-    rows.push({ outcome: 'needs_human', route: otherEscalation ? 'boundary' : 'review', other: true,
+    rows.push({ outcome: 'needs_human', route: otherEscalation ? escalationRoute(otherEscalation) : 'review', other: true,
       code: null, boundary: otherEscalation, targets: otherEscalation ? otherEscalation.targets : [] });
     rows.push({ outcome: 'cancelled', route: 'incident', code: 'SERVICE_ERROR' });
   } else {
     for (const outcome of ['error', 'needs_human', 'cancelled']) rows.push({ outcome, route: 'unavailable' });
   }
+  if (serviceKind === 'tool') rows.push({ outcome: 'denied', route: 'review', code: 'TOOL_PERMISSION_DENIED' });
   rows.push({ outcome: 'platform', route: 'incident' });
-  rows.push({ outcome: 'timeout', route: 'incident', code: 'SERVICE_TIMEOUT', seconds: config.timeoutSeconds });
+  rows.push({ outcome: 'timeout', route: 'incident', code: 'EXTERNAL_OUTCOME_UNCERTAIN', reason: 'SERVICE_TIMEOUT', seconds: config.timeoutSeconds });
   for (const entry of timers) rows.push({ outcome: 'timer', route: 'boundary', boundary: entry, targets: entry.targets, timer: entry.timer });
 
+  // One entry per kind of problem, listing every element it concerns, so five
+  // new handlers do not produce five identical messages.
   const warnings = [];
-  if (!rows[0].targets.length) warnings.push({ key: 'no_outgoing' });
-  if (!hasResult && errors.length) warnings.push({ key: 'error_boundary_without_result' });
-  if (!hasResult && escalations.length) warnings.push({ key: 'escalation_boundary_without_result' });
+  const warn = (key, name, tone = 'warning') => {
+    let entry = warnings.find((candidate) => candidate.key === key);
+    if (!entry) warnings.push(entry = { key, tone, names: [] });
+    if (name !== undefined && !entry.names.includes(name)) entry.names.push(name);
+  };
+  if (!human && !(config.verification?.Condition?.expression || '').trim()) warn('empty_condition');
+  if (!rows[0].targets.length) warn('no_outgoing');
+  if (!hasResult && errors.length) warn('error_boundary_without_result');
+  if (!hasResult && escalations.length) warn('escalation_boundary_without_result');
   for (const entry of [...errors, ...escalations, ...timers]) {
-    if (!entry.targets.length) warnings.push({ key: 'boundary_no_flow', name: entry.label || entry.id });
-    if (entry.undeclared) warnings.push({ key: 'undeclared_reference', name: entry.label || entry.id });
+    if (!entry.targets.length) warn('boundary_no_flow', entry.name);
+    if (entry.undeclared) warn('undeclared_reference', entry.name);
   }
   for (const list of [errors, escalations]) {
     const seen = new Set();
     for (const entry of list) {
       const key = entry.undeclared ? `u:${entry.id}` : entry.code ?? '';
-      if (seen.has(key)) warnings.push({ key: 'duplicate_handler', name: entry.label || entry.id });
+      if (seen.has(key)) warn('duplicate_handler', entry.name);
       seen.add(key);
     }
   }
-  for (const entry of timers) {
+  // An interrupting timer neither replaces nor races the timeout incident: the
+  // job stays running behind it, so the timer fires on an incident instance and
+  // resolves the uncertain outcome. A shorter timer simply ends the task first.
+  for (const entry of timers.filter((candidate) => candidate.interrupting)) {
     const seconds = entry.timer?.Duration?.seconds;
-    if (Number.isInteger(seconds) && Number.isInteger(config.timeoutSeconds) && seconds >= config.timeoutSeconds) {
-      warnings.push({ key: 'timer_after_timeout', name: entry.label || entry.id });
-    }
+    const shorter = Number.isInteger(seconds) && Number.isInteger(config.timeoutSeconds) && seconds < config.timeoutSeconds;
+    warn(shorter ? 'timer_preempts_timeout' : 'timer_resolves_timeout', entry.name, 'info');
   }
 
   // The first catch-all, then each declared code, that has no handler yet: a
@@ -361,11 +394,14 @@ export function processResultRouting(graph, nodeId) {
     const free = (declarations || []).find((entry) => !used.has(entry[codeKey]));
     return free ? { ref: free[idKey] } : null;
   };
+  const addError = nextRef(errors, model.errors, 'errorId', 'errorCode');
+  const addEscalation = hasResult ? nextRef(escalations, model.escalations, 'escalationId', 'escalationCode') : null;
   return {
-    node, hasResult, verification: human ? 'Human' : 'Condition', rows, warnings,
+    node, hasResult, kind: serviceKind, verification: human ? 'Human' : 'Condition', rows, warnings,
     boundaries: { errors, escalations, timers },
-    add: { error: nextRef(errors, model.errors, 'errorId', 'errorCode'),
-      escalation: hasResult ? nextRef(escalations, model.escalations, 'escalationId', 'escalationCode') : null },
+    add: { error: addError, escalation: addEscalation,
+      errorReason: addError ? null : 'all_taken',
+      escalationReason: addEscalation ? null : hasResult ? 'all_taken' : 'no_result' },
   };
 }
 

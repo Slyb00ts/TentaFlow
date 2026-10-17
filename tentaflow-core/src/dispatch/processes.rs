@@ -286,6 +286,7 @@ fn service_block_options() -> Vec<ProcessOptionBlock> {
                 label: label.to_owned(),
                 description: description.to_owned(),
                 category: category.to_owned(),
+                required_settings: crate::processes::blocks::required_settings(node_type),
             })
         })
         .collect()
@@ -2018,9 +2019,31 @@ mod tests {
         let allowed: Vec<&str> = crate::processes::blocks::allowed_block_types().collect();
         assert_eq!(offered_types, allowed);
         assert_eq!(allowed, ["llm", "embeddings", "pii_filter"]);
-        for block in offered {
+        for block in &offered {
             assert!(!block.label.is_empty() && !block.description.is_empty());
             assert!(!block.category.is_empty());
+        }
+        let required: Vec<(&str, Vec<&str>)> = offered
+            .iter()
+            .map(|block| {
+                (
+                    block.node_type.as_str(),
+                    block.required_settings.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            required,
+            [("llm", vec!["model"]), ("embeddings", vec!["model"]), ("pii_filter", vec![])]
+        );
+        // The list is what the publication check insists on, not a copy of it.
+        for (node_type, keys) in required {
+            let refusal = crate::processes::blocks::validate_block(node_type, &serde_json::json!({}));
+            match (keys.first(), refusal) {
+                (Some(key), Err(error)) => assert!(error.to_string().contains(key)),
+                (Some(key), Ok(_)) => panic!("{node_type} runs without its required setting {key}"),
+                (None, refusal) => assert!(refusal.is_ok()),
+            }
         }
     }
 

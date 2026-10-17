@@ -23,7 +23,7 @@ pub(super) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-fn tool_model(timeout_seconds: u32, result_expression: Option<&str>) -> ProcessModel {
+pub(super) fn tool_model(timeout_seconds: u32, result_expression: Option<&str>) -> ProcessModel {
     let mut model = service_model(
         "",
         ActivityVerification::Condition {
@@ -52,7 +52,7 @@ fn tool_model(timeout_seconds: u32, result_expression: Option<&str>) -> ProcessM
     model
 }
 
-fn fixture_with(host: &Arc<ScriptedToolHost>) -> Fixture {
+pub(super) fn fixture_with(host: &Arc<ScriptedToolHost>) -> Fixture {
     let fixture = Fixture::new();
     fixture.dispatcher().set_process_tool_host(host.clone());
     // The database side of the pin: the enabled addon row and its approved bundle.

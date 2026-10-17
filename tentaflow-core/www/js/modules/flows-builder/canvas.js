@@ -10,7 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
-import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings } from './bpmn.js';
+import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processHandlerName } from './bpmn.js';
 import '/js/components/tf-menu.js';
 
 const NODE_WIDTH = 280;
@@ -517,6 +517,10 @@ export class FlowCanvas {
         errors.push(I18n.t('bpmn.timer_timezone_required'));
       }
       for (const node of this.nodes) {
+        const condition = node.type === 'bpmn_service_task' && node.config.verification?.Condition;
+        if (condition && !(condition.expression || '').trim()) {
+          errors.push(I18n.t('bpmn.verification_expression_required', { node: node.label || this.templates.get(node.type)?.label || node.id }));
+        }
         if (!['bpmn_timer_start', 'bpmn_timer_catch', 'bpmn_boundary_timer'].includes(node.type)) continue;
         const [kind, timer] = Object.entries(node.config.timer)[0];
         if (kind === 'Date' && (!timer.at || !timer.at.trim())) {
@@ -1073,7 +1077,8 @@ export class FlowCanvas {
 
   /**
    * Attaches a new error or escalation boundary event to a Service task as one
-   * undo step. `ref` is the declaration it catches, null for any.
+   * undo step. `ref` is the declaration it catches, null for any. The event is
+   * named after the code it catches so the table and the canvas read the same.
    */
   addBoundaryNode(parentId, type, ref = null) {
     if (this.readOnly || this.mode !== 'bpmn') return null;
@@ -1081,18 +1086,47 @@ export class FlowCanvas {
     if (!parent || parent.type !== 'bpmn_service_task'
       || !['bpmn_boundary_error', 'bpmn_boundary_escalation'].includes(type)) return null;
     const template = this.templates.get(type);
+    const declarations = type === 'bpmn_boundary_error'
+      ? { list: this.processModel.errors, id: 'errorId', code: 'errorCode' }
+      : { list: this.processModel.escalations, id: 'escalationId', code: 'escalationCode' };
+    const code = ref == null ? null : (declarations.list || []).find((entry) => entry[declarations.id] === ref)?.[declarations.code] ?? null;
     const node = {
       id: 'n_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6),
-      type, label: '', x: parent.x, y: parent.y, width: template?.width || 56, height: template?.height || 56,
+      type, label: processHandlerName(type, code), x: parent.x, y: parent.y,
+      width: template?.width || 56, height: template?.height || 56,
       config: { ...processNodeConfig(processNodeKind(type)), attachedToId: parentId,
         ...(type === 'bpmn_boundary_error' ? { errorRef: ref } : { escalationRef: ref }) },
     };
-    this._positionBoundary(node);
+    this._placeNewBoundary(node, parent);
     this.nodes.push(node);
     this.render();
     this._pushHistory();
     this.onChange();
     return node;
+  }
+
+  // Boundary events of a task sit on its bottom edge from left to right, the
+  // BPMN convention, so none lands on the incoming port (left middle), the
+  // task icon (top left) or the kind badge (top right). A fifth and later one
+  // goes to the top edge, then to the generic placement.
+  _placeNewBoundary(node, parent) {
+    const half = node.width / 2;
+    const pitch = node.width + 4;
+    const usable = Math.max(0, parent.width - node.width);
+    const along = (count, from) => Array.from({ length: count }, (_, index) => from + index * pitch);
+    const bottom = along(Math.floor(usable / pitch) + 1, half).map((x) => [parent.x + x, parent.y + parent.height]);
+    const top = along(2, parent.width - 88 - pitch).map((x) => [parent.x + x, parent.y]).reverse();
+    const siblings = this.nodes.filter((candidate) => processBoundaryKind(candidate.type)
+      && candidate.config.attachedToId === parent.id);
+    const others = this.nodes.filter((candidate) => candidate !== parent && !processBoundaryKind(candidate.type));
+    const near = (x, y, other) => Math.abs(other.x + other.width / 2 - x) < node.width && Math.abs(other.y + other.height / 2 - y) < node.height;
+    const covers = (x, y, other) => x + half > other.x && x - half < other.x + other.width
+      && y + node.height / 2 > other.y && y - node.height / 2 < other.y + other.height;
+    const slots = [...bottom, ...top].filter(([x, y]) => !siblings.some((sibling) => near(x, y, sibling)));
+    const slot = slots.find(([x, y]) => !others.some((other) => covers(x, y, other))) ?? slots[0];
+    if (!slot) { this._positionBoundary(node); return; }
+    node.x = slot[0] - half;
+    node.y = slot[1] - node.height / 2;
   }
 
   _positionBoundary(node) {
@@ -1579,7 +1613,7 @@ export class FlowCanvas {
       const serviceKind = n.type === 'bpmn_service_task' ? processServiceKind(n.config) : null;
       const showKind = serviceKind && (serviceKind !== 'flow' || !!n.config.flowId);
       const kindIcon = { flow: 'flow', block: 'chip', tool: 'puzzle' }[serviceKind];
-      const warnings = processNodeWarnings(n);
+      const warnings = processNodeWarnings(n, this.opts.processOptions?.serviceBlocks);
       div.innerHTML = `
         ${showKind ? `<span class="fb-process-kind" data-kind="${serviceKind}" role="img" title="${escapeAttr(I18n.t(`bpmn.kind_${serviceKind}`))}" aria-label="${escapeAttr(I18n.t(`bpmn.kind_${serviceKind}`))}"><svg aria-hidden="true"><use href="#i-${kindIcon}"/></svg></span>` : ''}
         ${warnings.length ? `<span class="fb-process-warn" data-warning="${warnings.join(' ')}" role="img" title="${escapeAttr(warnings.map((key) => I18n.t(`bpmn.warning_${key}`)).join(' '))}" aria-label="${escapeAttr(warnings.map((key) => I18n.t(`bpmn.warning_${key}`)).join(' '))}"><svg aria-hidden="true"><use href="#i-alert"/></svg></span>` : ''}

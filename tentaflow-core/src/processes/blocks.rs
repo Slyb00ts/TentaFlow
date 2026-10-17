@@ -143,6 +143,21 @@ pub fn allowed_block(node_type: &str) -> Option<&'static AllowedBlock> {
     ALLOWED.iter().find(|block| block.node_type == node_type)
 }
 
+/// The settings `validate_block` refuses a block without, for the designer to
+/// seed a new task with.
+pub fn required_settings(node_type: &str) -> Vec<String> {
+    allowed_block(node_type)
+        .map(|block| {
+            block
+                .keys
+                .iter()
+                .filter(|key| key.required)
+                .map(|key| key.name.to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Why a process may not run a block right now. `Unavailable` is "cannot tell":
 /// a failed read is never a verdict on the initiator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
