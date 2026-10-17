@@ -1048,8 +1048,11 @@ impl<'a> Transition<'a> {
     }
 
     /// An accepted result that no boundary event takes parks the whole repeated
-    /// group under the incident it raises; the group must name that incident,
-    /// or the plan is refused and the claim stays observed forever.
+    /// group under the incident it raises, and the group names that incident.
+    ///
+    /// A sibling that is still in flight can reach this after the group already
+    /// holds an incident: it raises its own incident for its job and the group
+    /// keeps naming the first one, so no incident is orphaned or replaced.
     fn block_repetition_on_result(
         &mut self, mut group: RepetitionGroup, node_id: &str, job_id: &str,
         code: &str, message: String,
@@ -1059,7 +1062,7 @@ impl<'a> Transition<'a> {
         let incident_id = self.plan.add_incidents.last()
             .context("blocked repeated Service result has no incident")?.incident_id.clone();
         group.status = ProcessRepetitionGroupStatus::Incident;
-        group.terminal_incident_id = Some(incident_id);
+        group.terminal_incident_id.get_or_insert(incident_id);
         group.terminal_event_id = None;
         group.updated_at_ms = self.now_ms;
         self.write_repetition_group(group)
@@ -6705,6 +6708,37 @@ pub fn plan_manual_acknowledgment_with_id_source(
     transition.finish()
 }
 
+/// The incident an accepted repeated Service result raises when no boundary takes
+/// it, as (code, message), or None when the result goes on to its verification.
+/// The engine and the repository validator both read it from here, so a plan can
+/// neither name another code nor park a result its Condition accepts.
+pub(super) fn unhandled_repeated_result(
+    verification: &ActivityVerification, result: &ActivityResult,
+    group_id: &str, ordinal: u32, item: &Value, variables: &Value,
+) -> Option<(String, String)> {
+    match result.outcome {
+        ActivityOutcome::Error | ActivityOutcome::Cancelled => Some((
+            result.code.clone().unwrap_or_else(|| "SERVICE_ERROR".to_owned()),
+            result.summary.clone(),
+        )),
+        ActivityOutcome::NeedsHuman => None,
+        ActivityOutcome::Completed => {
+            let ActivityVerification::Condition { expression } = verification else {
+                return None;
+            };
+            match evaluate(expression, variables, &result.outputs,
+                &Transition::repeat_extra(group_id, ordinal, item.clone()))
+                .and_then(|value| value.as_bool()
+                    .context("process condition must evaluate to a boolean")) {
+                Ok(true) => None,
+                Ok(false) => Some(("VERIFICATION_FAILED".to_owned(),
+                    "the configured condition did not accept the activity result".to_owned())),
+                Err(error) => Some(("EXPRESSION_ERROR".to_owned(), error.to_string())),
+            }
+        }
+    }
+}
+
 pub fn plan_user_completion(
     snapshot: &RuntimeSnapshot,
     task_id: &str,
@@ -6777,7 +6811,7 @@ pub fn plan_user_completion_with_id_source(
                     &node.id,
                     job,
                     "HUMAN_REJECTED",
-                    "the activity result was rejected by its verifier".into(),
+                    super::repository::HUMAN_REJECTED_MESSAGE.into(),
                 );
                 if let Some((mut group, mut occurrence)) = transition.repetition_for_token(&token.token_id) {
                     occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
@@ -7271,16 +7305,12 @@ pub fn plan_job_result(
         transition.plan.event_ids.insert(result_event_index, result_event_id.clone());
         occurrence.accepted_source_event_id = Some(result_event_id.clone());
         occurrence.accepted_origin = Some(observed.origin.clone());
-        if matches!(result.outcome, ActivityOutcome::Error | ActivityOutcome::Cancelled) {
-            occurrence.status = if result.outcome == ActivityOutcome::Error {
-                ProcessRepetitionOccurrenceStatus::RetryableError
-            } else {
-                ProcessRepetitionOccurrenceStatus::AcceptedBlocked
-            };
+        if let Some((code, message)) = unhandled_repeated_result(verification, result,
+            &group.group_id, occurrence.ordinal, &occurrence.item, &occurrence.input_variables) {
+            occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
             occurrence.updated_at_ms = now_ms;
             transition.write_repetition_occurrence(occurrence)?;
-            transition.block_repetition_on_result(group, &node.id, &job.job_id,
-                result.code.as_deref().unwrap_or("SERVICE_ERROR"), result.summary.clone())?;
+            transition.block_repetition_on_result(group, &node.id, &job.job_id, &code, message)?;
             return transition.finish();
         }
         if result.outcome == ActivityOutcome::NeedsHuman
@@ -7305,21 +7335,6 @@ pub fn plan_job_result(
         let ActivityVerification::Condition { expression } = verification else {
             anyhow::bail!("repeated Service verification mode is invalid");
         };
-        let approved = evaluate(expression, &occurrence.input_variables, &result.outputs,
-            &Transition::repeat_extra(&group.group_id, occurrence.ordinal, occurrence.item.clone()))
-            .and_then(|value| value.as_bool().context("process condition must evaluate to a boolean"));
-        let failure = match approved {
-            Ok(true) => None,
-            Ok(false) => Some(("VERIFICATION_FAILED", "the configured condition did not accept the activity result".to_owned())),
-            Err(error) => Some(("EXPRESSION_ERROR", error.to_string())),
-        };
-        if let Some((code, message)) = failure {
-            occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
-            occurrence.updated_at_ms = now_ms;
-            transition.write_repetition_occurrence(occurrence)?;
-            transition.block_repetition_on_result(group, &node.id, &job.job_id, code, message)?;
-            return transition.finish();
-        }
         if node.activity_io.is_some() {
             let repeat_extra = Transition::repeat_extra(
                 &group.group_id, occurrence.ordinal, occurrence.item.clone());

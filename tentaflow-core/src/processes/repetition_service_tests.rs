@@ -899,9 +899,9 @@ async fn repeated_result_that_nothing_catches_commits_its_incident_and_refuses_f
     // (result, verification, status the ordinal keeps, incident code)
     let cases = [
         (json!({"outcome":"Error","code":"CODE_B","summary":"business failure","outputs":{},"evidence":[]}),
-            ActivityVerification::Human, ProcessRepetitionOccurrenceStatus::RetryableError, "CODE_B"),
+            ActivityVerification::Human, ProcessRepetitionOccurrenceStatus::AcceptedBlocked, "CODE_B"),
         (json!({"outcome":"Error","code":null,"summary":"no code","outputs":{},"evidence":[]}),
-            ActivityVerification::Human, ProcessRepetitionOccurrenceStatus::RetryableError, "SERVICE_ERROR"),
+            ActivityVerification::Human, ProcessRepetitionOccurrenceStatus::AcceptedBlocked, "SERVICE_ERROR"),
         (json!({"outcome":"Cancelled","code":"STOPPED","summary":"stopped by rule","outputs":{},"evidence":[]}),
             ActivityVerification::Human, ProcessRepetitionOccurrenceStatus::AcceptedBlocked, "STOPPED"),
         (json!({"outcome":"Completed","code":null,"summary":"fine","outputs":{},"evidence":[]}),
@@ -965,7 +965,11 @@ async fn repeated_result_that_nothing_catches_commits_its_incident_and_refuses_f
         assert_eq!(snapshot.repetition_groups[0].terminal_incident_id.as_deref(),
             Some(snapshot.incidents[0].incident_id.as_str()), "{code}");
         assert_eq!(snapshot.repetition_occurrences[0].status, status, "{code}");
-        assert_ne!(snapshot.jobs[0].status, "running", "{code}: the result was accepted, not left observed");
+        assert_eq!(snapshot.jobs[0].status, match observed.result.outcome {
+            ActivityOutcome::Error => "error",
+            ActivityOutcome::Cancelled => "cancelled",
+            _ => "completed",
+        }, "{code}: the result was accepted, not left observed");
         assert_eq!(snapshot.jobs[0].result.as_ref(), Some(&observed.result), "{code}");
         assert!(history(&fixture, &started.instance_id).iter()
             .all(|event| event.kind != "repetition_group_blocked"), "{code}: no aggregate was attempted");

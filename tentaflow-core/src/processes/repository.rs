@@ -9247,6 +9247,10 @@ fn validate_termination_variables_on(
                                         attached_token = parent_token.clone();
                                         depth += 1;
                                     }
+                                    if let Some(coordinator) = repetition_coordinator_on(
+                                        tx, instance_id, &attached_scope, &attached_token)? {
+                                        attached_token = coordinator;
+                                    }
                                     subscription.kind == subscription_kind
                                         && subscription.status == ProcessSubscriptionStatus::Open
                                         && subscription.instance_id == instance_id
@@ -18760,6 +18764,7 @@ fn apply_repetition_plan_on(
     let mut planned_group_ids = HashSet::new();
     let mut planned_occurrence_ids = HashSet::new();
     let mut human_rejected_groups = HashSet::new();
+    let mut parked_by_result = HashSet::new();
     for group in &plan.repetition_groups {
         ensure!(planned_group_ids.insert(group.group_id.as_str())
             && group.instance_id == instance_id && group.updated_at_ms == at_ms,
@@ -19458,7 +19463,11 @@ fn apply_repetition_plan_on(
                 | ProcessRepetitionOccurrenceStatus::AcceptedBlocked) {
                 let source_id = row.accepted_source_event_id.as_deref()
                     .context("accepted repetition occurrence lacks its source event")?;
-                let rejected_verification = row.status == ProcessRepetitionOccurrenceStatus::AcceptedBlocked
+                // A row this plan did not write keeps the incident an earlier plan
+                // raised, so its fact is read back from the store, not from the plan.
+                let planned_row = !prior_occurrences.iter().any(|prior|
+                    prior.occurrence_id == row.occurrence_id && prior.revision == row.revision);
+                let planned_rejection = row.status == ProcessRepetitionOccurrenceStatus::AcceptedBlocked
                     && row.verification_user_task_id.as_ref().is_some_and(|task_id|
                         matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::Human {
                             task_id: accepted, .. }) if accepted == task_id)
@@ -19474,8 +19483,14 @@ fn apply_repetition_plan_on(
                             && incident.node_id.as_deref() == Some(group.node_id.as_str())
                             && incident.job_id.as_deref() == row.job_id.as_deref()
                             && incident.code == "HUMAN_REJECTED" && !incident.can_retry
-                            && incident.message == "the activity result was rejected by its verifier")
+                            && incident.message == HUMAN_REJECTED_MESSAGE)
                         .count() == 1;
+                let retained_rejection = !planned_row
+                    && row.status == ProcessRepetitionOccurrenceStatus::AcceptedBlocked
+                    && row.verification_user_task_id.is_some()
+                    && job_incident_on(tx, instance_id, &row.scope_id, &group.node_id,
+                        row.job_id.as_deref(), "HUMAN_REJECTED", HUMAN_REJECTED_MESSAGE)?.is_some();
+                let rejected_verification = planned_rejection || retained_rejection;
                 if row.status == ProcessRepetitionOccurrenceStatus::Completed
                     && !prior_occurrences.iter().any(|prior|
                         prior.occurrence_id == row.occurrence_id
@@ -19711,40 +19726,62 @@ fn apply_repetition_plan_on(
                 if kind == "service_result" {
                     let job_id = row.job_id.as_deref()
                         .context("completed Service occurrence has no fenced job")?;
-                    let (result_json, origin): (String,String) = tx.query_row(
-                        "SELECT result_json,result_origin FROM bpmn_jobs WHERE instance_id=?1 AND scope_id=?2 AND job_id=?3 AND status='completed'",
+                    let (job_status, result_json, origin): (String,String,String) = tx.query_row(
+                        "SELECT status,result_json,result_origin FROM bpmn_jobs WHERE instance_id=?1 AND scope_id=?2 AND job_id=?3",
                         params![instance_id,row.scope_id,job_id],
-                        |sql| Ok((sql.get(0)?,sql.get(1)?)),
+                        |sql| Ok((sql.get(0)?,sql.get(1)?,sql.get(2)?)),
                     )?;
                     let mut expected = parse::<Value>(result_json)?;
                     let accepted_result: ActivityResult = serde_json::from_value(expected.clone())?;
+                    // The plan completes the job before it is checked; the outcome's own
+                    // terminal status is written once the transition has committed.
+                    ensure!(job_status == if planned_row { "completed" }
+                            else { terminal_job_status(&accepted_result.outcome) },
+                        "repeated Service job is not in the status its accepted result leaves");
                     let human_verification = matches!(&node.kind,
                         ProcessNodeKind::ServiceTask { verification:
                             tentaflow_protocol::processes::ActivityVerification::Human, .. });
-                    // A Cancelled result, or a Completed one whose Condition refuses it,
-                    // is accepted and then parked under the incident it raised.
-                    blocked_service_result = row.status == ProcessRepetitionOccurrenceStatus::AcceptedBlocked
-                        && !rejected_verification
-                        && matches!(&node.kind, ProcessNodeKind::ServiceTask { .. })
-                        && row.approval_event_id.is_none()
-                        && group.terminal_incident_id.as_deref().is_some_and(|incident_id|
-                            plan.add_incidents.iter().filter(|incident|
-                                incident.incident_id == incident_id
-                                    && incident.scope_id == row.scope_id
-                                    && incident.node_id.as_deref() == Some(group.node_id.as_str())
-                                    && incident.job_id.as_deref() == Some(job_id)
-                                    && !incident.can_retry
-                                    && match accepted_result.outcome {
-                                        tentaflow_protocol::processes::ActivityOutcome::Cancelled =>
-                                            incident.code == accepted_result.code.as_deref()
-                                                .unwrap_or("SERVICE_ERROR")
-                                                && incident.message == bounded_failure_message(&accepted_result.summary),
-                                        tentaflow_protocol::processes::ActivityOutcome::Completed =>
-                                            !human_verification
-                                                && matches!(incident.code.as_str(),
-                                                    "VERIFICATION_FAILED" | "EXPRESSION_ERROR"),
-                                        _ => false,
-                                    }).count() == 1);
+                    // An Error or Cancelled result, or a Completed one whose Condition
+                    // refuses it, is accepted and then parked under the incident it raised.
+                    // The pinned configuration decides which incident that is.
+                    let unhandled = match &node.kind {
+                        ProcessNodeKind::ServiceTask { verification, .. } =>
+                            super::runtime::unhandled_repeated_result(verification,
+                                &accepted_result, &group.group_id, row.ordinal, &row.item,
+                                &row.input_variables),
+                        _ => None,
+                    }.map(|(code, message)| (code, bounded_failure_message(&message)));
+                    let blocked_incident_id = match &unhandled {
+                        Some((code, message)) if row.status == ProcessRepetitionOccurrenceStatus::AcceptedBlocked
+                            && !rejected_verification && row.approval_event_id.is_none() =>
+                            if planned_row {
+                                let mut raised = plan.add_incidents.iter().filter(|incident|
+                                    incident.scope_id == row.scope_id
+                                        && incident.node_id.as_deref() == Some(group.node_id.as_str())
+                                        && incident.job_id.as_deref() == Some(job_id)
+                                        && !incident.can_retry
+                                        && incident.code == *code && incident.message == *message);
+                                raised.next().filter(|_| raised.next().is_none())
+                                    .map(|incident| incident.incident_id.clone())
+                            } else {
+                                job_incident_on(tx, instance_id, &row.scope_id, &group.node_id,
+                                    Some(job_id), code, message)?
+                            },
+                        _ => None,
+                    };
+                    // The group names the first incident it ever held; a later blocked
+                    // sibling raises its own and leaves that naming alone.
+                    let held_before = prior_groups.iter()
+                        .find(|prior| prior.group_id == group.group_id)
+                        .and_then(|prior| prior.terminal_incident_id.as_deref());
+                    blocked_service_result = blocked_incident_id.as_deref().is_some_and(|incident_id|
+                        !planned_row
+                            || group.terminal_incident_id.as_deref()
+                                == Some(held_before.unwrap_or(incident_id)));
+                    if let (true, true, Some(incident_id)) =
+                        (blocked_service_result, planned_row, blocked_incident_id) {
+                        parked_by_result.insert((group.group_id.as_str(), incident_id));
+                    }
                     ensure!(blocked_service_result
                         || matches!(accepted_result.outcome,
                         tentaflow_protocol::processes::ActivityOutcome::Completed
@@ -19774,7 +19811,9 @@ fn apply_repetition_plan_on(
                                 event.kind == "repetition_group_blocked"
                                     && event.data["group_id"] == group.group_id),
                             "rejected Verification changed its retained Service evidence or continuation");
-                        human_rejected_groups.insert(group.group_id.as_str());
+                        if planned_rejection {
+                            human_rejected_groups.insert(group.group_id.as_str());
+                        }
                         continue;
                     }
                     if blocked_service_result {
@@ -20326,8 +20365,16 @@ fn apply_repetition_plan_on(
                 serde_json::json!({"group_id":group.group_id,"completed":group.completed_count,
                     "parent_token_id":group.parent_token_id})));
         }
+        // A write that leaves the incident it already held alone (a sibling that
+        // completes, or one that raises an incident of its own) states no new block.
+        let incident_unchanged = prior.is_some_and(|row|
+            row.status == ProcessRepetitionGroupStatus::Incident
+                && row.terminal_capacity == group.terminal_capacity
+                && row.terminal_incident_id == group.terminal_incident_id
+                && row.terminal_event_id == group.terminal_event_id);
         if group.status == ProcessRepetitionGroupStatus::Incident
             && !human_rejected_groups.contains(group.group_id.as_str())
+            && !incident_unchanged
             && !(prior.is_none() && group.created_count == 0 && group.total_count.is_none()
                 && !group.terminal_capacity) {
             let incident_id = group.terminal_incident_id.as_deref()
@@ -20345,35 +20392,11 @@ fn apply_repetition_plan_on(
                         && row.accepted_source_event_id.is_none());
             // An accepted Service result that nothing catches (Error, Cancelled, a
             // rejecting Condition) parks the group under the incident the result
-            // raised. The result event is the fact; like a failed Script body there
-            // is no aggregate attempt, hence no blocked-group event.
-            let service_result_failure = matches!(&node.kind, ProcessNodeKind::ServiceTask { .. })
-                && plan.events.iter().filter(|event| event.kind == "service_result"
-                    && event.scope_id == group.scope_id
-                    && event.node_id.as_deref() == Some(group.node_id.as_str()))
-                    .any(|result| plan.add_incidents.iter().any(|incident|
-                        incident.incident_id == incident_id
-                            && incident.scope_id == group.scope_id
-                            && incident.node_id.as_deref() == Some(group.node_id.as_str())
-                            && incident.job_id.is_some()
-                            && !incident.can_retry
-                            && match result.data["outcome"].as_str() {
-                                Some("Error" | "Cancelled") =>
-                                    incident.code == result.data["code"].as_str()
-                                        .unwrap_or("SERVICE_ERROR")
-                                        && incident.message == bounded_failure_message(
-                                            result.data["summary"].as_str().unwrap_or_default()),
-                                Some("Completed") => matches!(incident.code.as_str(),
-                                    "VERIFICATION_FAILED" | "EXPRESSION_ERROR"),
-                                _ => false,
-                            }
-                            && current_occurrences.iter().any(|row|
-                                row.group_id == group.group_id
-                                    && row.job_id == incident.job_id
-                                    && matches!(row.status,
-                                        ProcessRepetitionOccurrenceStatus::RetryableError
-                                            | ProcessRepetitionOccurrenceStatus::AcceptedBlocked)
-                                    && row.accepted_source_event_id.is_some())));
+            // raised; its row proved the incident. The result event is the fact; like
+            // a failed Script body there is no aggregate attempt, hence no
+            // blocked-group event.
+            let service_result_failure = parked_by_result
+                .contains(&(group.group_id.as_str(), incident_id.to_owned()));
             // A failing authored input parks its ordinal under a typed parked-input
             // fact; no aggregate was attempted, so there is no blocked-group event.
             let input_failure = plan.activity_io_inputs.iter().any(|fact| matches!(fact,
@@ -20477,6 +20500,33 @@ fn apply_repetition_plan_on(
                 && event.data == *data).count() == 1),
         "repetition history differs from its factual group and ordinal effects");
     Ok(())
+}
+
+/// The status an accepted Service job keeps once its result is committed.
+fn terminal_job_status(outcome: &tentaflow_protocol::processes::ActivityOutcome) -> &'static str {
+    match outcome {
+        tentaflow_protocol::processes::ActivityOutcome::Completed
+        | tentaflow_protocol::processes::ActivityOutcome::NeedsHuman => "completed",
+        tentaflow_protocol::processes::ActivityOutcome::Error => "error",
+        tentaflow_protocol::processes::ActivityOutcome::Cancelled => "cancelled",
+    }
+}
+
+pub(super) const HUMAN_REJECTED_MESSAGE: &str = "the activity result was rejected by its verifier";
+
+/// The one stored incident a job raised with exactly this code and message.
+fn job_incident_on(
+    tx: &Connection, instance_id: &str, scope_id: &str, node_id: &str,
+    job_id: Option<&str>, code: &str, message: &str,
+) -> Result<Option<String>> {
+    let Some(job_id) = job_id else { return Ok(None) };
+    let mut statement = tx.prepare(
+        "SELECT incident_id FROM bpmn_incidents WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND job_id=?4 AND code=?5 AND message=?6")?;
+    let mut found = statement
+        .query_map(params![instance_id, scope_id, node_id, job_id, code, message],
+            |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(if found.len() == 1 { found.pop() } else { None })
 }
 
 fn script_infrastructure_incident_on(
@@ -25601,16 +25651,38 @@ fn repeated_service_boundary_parent_on(
     let group = repetition_groups_on(conn, instance_id)?.into_iter()
         .find(|row| row.group_id == occurrence.group_id)
         .context("repeated service result has no factual coordinator")?;
-    ensure!(group.scope_id == scope_id && group.node_id == node_id
-        && !group.terminal_capacity
+    ensure!(group.node_id == node_id, "service result differs from its live boundary coordinator");
+    live_coordinator_on(conn, instance_id, scope_id, &group).map(Some)
+}
+
+/// The waiting coordinator the boundary events of a repeated activity attach to,
+/// for a token that is one of its ordinals (a repeated sub-process's ordinal is
+/// the token an inner error climbs to). `None` for any other token.
+fn repetition_coordinator_on(
+    conn: &Connection, instance_id: &str, scope_id: &str, token_id: &str,
+) -> Result<Option<String>> {
+    let Some(occurrence) = repetition_occurrences_on(conn, instance_id)?.into_iter()
+        .find(|row| row.token_id == token_id) else {
+        return Ok(None);
+    };
+    let group = repetition_groups_on(conn, instance_id)?.into_iter()
+        .find(|row| row.group_id == occurrence.group_id)
+        .context("repetition ordinal has no factual coordinator")?;
+    live_coordinator_on(conn, instance_id, scope_id, &group).map(Some)
+}
+
+fn live_coordinator_on(
+    conn: &Connection, instance_id: &str, scope_id: &str, group: &RepetitionGroup,
+) -> Result<String> {
+    ensure!(group.scope_id == scope_id && !group.terminal_capacity
         && matches!(group.status,
             ProcessRepetitionGroupStatus::Open | ProcessRepetitionGroupStatus::Incident),
         "service result differs from its live boundary coordinator");
     let waiting: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3 AND node_id=?4 AND status='waiting')",
-        params![instance_id, scope_id, group.parent_token_id, node_id], |row| row.get(0))?;
+        params![instance_id, scope_id, group.parent_token_id, group.node_id], |row| row.get(0))?;
     ensure!(waiting, "repeated service boundary coordinator lost its factual wait");
-    Ok(Some(group.parent_token_id))
+    Ok(group.parent_token_id.clone())
 }
 
 fn selected_escalation_subscription_on(
@@ -26388,6 +26460,12 @@ fn validate_job_result_plan_on(
                     at_repeated_coordinator = true;
                     continue;
                 }
+            } else if let Some(coordinator) = repetition_coordinator_on(tx,
+                &instance.instance_id, &scope_id, &attached_token)? {
+                // The error climbed into a repeated sub-process: its handlers hang on
+                // the coordinator, and past them it keeps climbing like any scope.
+                attached_token = coordinator;
+                continue;
             }
             if at_repeated_coordinator {
                 break;
@@ -26657,7 +26735,7 @@ pub fn accept_job_result(
             && selected_escalation_subscription_on(&conn, &source_id, &source_scope,
                 &source_node_id, &source_token_id, job_id, result.code.as_deref())?.is_some();
         let repeated_source: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM bpmn_repetition_occurrences o JOIN bpmn_repetition_groups g ON g.group_id=o.group_id AND g.instance_id=o.instance_id JOIN bpmn_jobs j ON j.job_id=o.job_id AND j.instance_id=o.instance_id WHERE o.instance_id=?1 AND o.job_id=?2 AND o.scope_id=?3 AND o.token_id=?4 AND o.status='active' AND g.status='open' AND g.scope_id=o.scope_id AND g.node_id=j.node_id AND j.token_id=o.token_id AND j.scope_id=o.scope_id)",
+            "SELECT EXISTS(SELECT 1 FROM bpmn_repetition_occurrences o JOIN bpmn_repetition_groups g ON g.group_id=o.group_id AND g.instance_id=o.instance_id JOIN bpmn_jobs j ON j.job_id=o.job_id AND j.instance_id=o.instance_id WHERE o.instance_id=?1 AND o.job_id=?2 AND o.scope_id=?3 AND o.token_id=?4 AND o.status='active' AND (g.status='open' OR g.status='incident' AND g.terminal_capacity=0) AND g.scope_id=o.scope_id AND g.node_id=j.node_id AND j.token_id=o.token_id AND j.scope_id=o.scope_id)",
             params![source_id,job_id,source_scope,source_token_id], |row| row.get(0))?;
         (source_id,status,attempt,fence,worker,lease,activation,selected_escalation,
             repeated_source)
@@ -26821,12 +26899,7 @@ pub fn accept_job_result(
         None,
         EntryAuthority::Accepted(&entry),
     &[])?;
-    let terminal = match result.outcome {
-        tentaflow_protocol::processes::ActivityOutcome::Completed
-        | tentaflow_protocol::processes::ActivityOutcome::NeedsHuman => "completed",
-        tentaflow_protocol::processes::ActivityOutcome::Error => "error",
-        tentaflow_protocol::processes::ActivityOutcome::Cancelled => "cancelled",
-    };
+    let terminal = terminal_job_status(&result.outcome);
     tx.execute("UPDATE bpmn_jobs SET status=?1,result_json=?2,lease_until_ms=NULL,updated_at_ms=?3,result_origin=?5 WHERE job_id=?4",params![terminal,json(result)?,at_ms,job_id,result_origin_text(&observed.origin)])?;
     let accepted = tx.execute(
         "UPDATE bpmn_service_invocations SET phase='accepted',acceptance_owner_id=NULL,acceptance_lease_until_ms=NULL,acceptance_revision=acceptance_revision+1,phase_revision=phase_revision+1,updated_at_ms=?1 WHERE job_id=?2 AND instance_id=?3 AND phase='observed' AND acceptance_owner_id=?4 AND reserved_result_event_id=?5 AND observed_result_json=?6",
@@ -27163,6 +27236,32 @@ fn recovered_by_periodic_pass(pool: &DbPool, job_id: &str, phase: &str) -> bool 
             [job_id], |row| row.get::<_, String>(0)).ok()).as_deref() == Some("addon_tool")
 }
 
+/// Counts one failed recovery pass of a row and, once `incident_after` passes
+/// have failed, raises its visible incident.
+fn count_recovery_failure_on(
+    tx: &Transaction<'_>, job_id: &str, now_ms: i64, incident_after: i64,
+) -> Result<()> {
+    let Some(row) = recovery_row_on(tx, job_id)? else { return Ok(()) };
+    tx.execute(
+        "INSERT INTO bpmn_result_recovery(invocation_id,last_checked_ms,failed_passes,last_error_code) VALUES(?1,?2,1,'RESULT_RECOVERY_FAILED') ON CONFLICT(invocation_id) DO UPDATE SET failed_passes=failed_passes+1,last_checked_ms=?2,last_error_code='RESULT_RECOVERY_FAILED'",
+        params![row.invocation_id, now_ms],
+    )?;
+    let (passes, incident): (i64, Option<String>) = tx.query_row(
+        "SELECT failed_passes,incident_id FROM bpmn_result_recovery WHERE invocation_id=?1",
+        [&row.invocation_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    // A row that already shows an open incident of its own (the script
+    // infrastructure one, say) is visible; a second would only add noise.
+    let already_visible: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_incidents WHERE job_id=?1 AND resolved_at_ms IS NULL)",
+        [job_id], |r| r.get(0))?;
+    if passes >= incident_after && incident.is_none() && !already_visible {
+        raise_recovery_incident_on(tx, &row, "RESULT_RECOVERY_FAILED",
+            "the observed Service result could not be recovered; it stays recorded",
+            now_ms)?;
+    }
+    Ok(())
+}
+
 /// Logs a row that recovery could not process (job id and size only) and counts
 /// the failure; after `RECOVERY_FAILURES_BEFORE_INCIDENT` passes in a row the
 /// row raises a visible incident.
@@ -27178,24 +27277,7 @@ fn report_recovery_failure(
     let outcome = (|| -> Result<()> {
         let mut conn = pool.write()?;
         let tx = conn.transaction()?;
-        let Some(row) = recovery_row_on(&tx, job_id)? else { return Ok(()) };
-        tx.execute(
-            "INSERT INTO bpmn_result_recovery(invocation_id,last_checked_ms,failed_passes,last_error_code) VALUES(?1,?2,1,'RESULT_RECOVERY_FAILED') ON CONFLICT(invocation_id) DO UPDATE SET failed_passes=failed_passes+1,last_checked_ms=?2,last_error_code='RESULT_RECOVERY_FAILED'",
-            params![row.invocation_id, now_ms],
-        )?;
-        let (passes, incident): (i64, Option<String>) = tx.query_row(
-            "SELECT failed_passes,incident_id FROM bpmn_result_recovery WHERE invocation_id=?1",
-            [&row.invocation_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        // A row that already shows an open incident of its own (the script
-        // infrastructure one, say) is visible; a second would only add noise.
-        let already_visible: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM bpmn_incidents WHERE job_id=?1 AND resolved_at_ms IS NULL)",
-            [job_id], |r| r.get(0))?;
-        if passes >= incident_after && incident.is_none() && !already_visible {
-            raise_recovery_incident_on(&tx, &row, "RESULT_RECOVERY_FAILED",
-                "the observed Service result could not be recovered; it stays recorded",
-                now_ms)?;
-        }
+        count_recovery_failure_on(&tx, job_id, now_ms, incident_after)?;
         tx.commit()?;
         Ok(())
     })();
@@ -27568,6 +27650,12 @@ pub fn fail_job_with_authority(
                     .context("observed Service result has no reserved event ID")?,
                 reason, now_ms)?;
         } else {
+            // A refused acceptance is deterministic: leaving the result observed
+            // for the next restart's recovery would hang the activity unseen.
+            if code == "RESULT_REJECTED" {
+                count_recovery_failure_on(&tx, job_id, now_ms, 1)?;
+                tx.commit()?;
+            }
             return Ok(false);
         }
     }

@@ -72,3 +72,5 @@ mod tool_task_tests;
 mod block_task_tests;
 #[cfg(test)]
 mod result_routing_tests;
+#[cfg(test)]
+mod repetition_group_incident_tests;

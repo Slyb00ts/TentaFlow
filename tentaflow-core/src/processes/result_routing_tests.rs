@@ -371,8 +371,8 @@ fn check(case: &Value, fixture: &Fixture, instance_id: &str, facts: &Facts) {
         "incident" => {
             let code = engine["code"].as_str().unwrap();
             assert!(
-                facts.incidents.iter().any(|incident| incident == code) && facts.caught.is_empty(),
-                "{name}: incident {code} that no boundary event caught, got {}", facts.story()
+                facts.incidents == [code] && facts.caught.is_empty(),
+                "{name}: exactly the incident {code}, that no boundary event caught, got {}", facts.story()
             );
             assert_eq!(
                 facts.status,
@@ -511,6 +511,11 @@ fn every_case_pairs_its_route_with_a_fact_that_can_honour_it() {
             continue;
         }
         let fact = case["engine"]["fact"].as_str().unwrap();
+        if let (Some(promised), Some(driven)) =
+            (case["expect"]["code"].as_str(), case["engine"]["code"].as_str())
+        {
+            assert_eq!(promised, driven, "{name}: the table shows a code the engine probe does not drive");
+        }
         assert!(
             allowed.iter().any(|candidate| candidate == fact),
             "{name}: the table says {route}, but the engine fact {fact} cannot honour it"

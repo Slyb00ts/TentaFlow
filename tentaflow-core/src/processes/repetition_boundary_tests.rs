@@ -2272,3 +2272,81 @@ async fn noninterrupting_outer_escalation_keeps_both_ordinals_and_factual_verifi
         1
     );
 }
+
+#[tokio::test]
+async fn error_of_a_task_inside_a_repeated_subprocess_is_caught_by_the_boundary_on_its_coordinator() {
+    for mapped in [false, true] {
+        let fixture = Fixture::new();
+        let business = json!({"outcome":"Error","code":"REJECTED","summary":"Inner business rejection",
+            "outputs":{"case":"alpha"},"evidence":[]});
+        let graph = json!({"nodes":[
+            {"id":"trigger","type":"trigger","config":{
+                "output_mapping":{"actual_result":business.to_string()}}},
+            {"id":"output","type":"output","config":{}}],
+            "edges":[{"from":"trigger","to":"output","from_port":"text","to_port":"text"}],
+            "variables":[{"name":"actual_result","type":"json"}]}).to_string();
+        let flow_id = runtime::test_support::flow(&fixture.db, &fixture.owner, &graph);
+        let mut inner = runtime::test_support::service_model(&flow_id,
+            ActivityVerification::Condition { expression: "true".into() });
+        let ProcessNodeKind::ServiceTask { result_expression, .. } = &mut inner.nodes.iter_mut()
+            .find(|node| node.id == "Service").unwrap().kind else { panic!("pinned ServiceTask") };
+        *result_expression = Some("outputs.variables.actual_result".into());
+        let mut model = runtime::test_support::embedded_model(inner, "Sub");
+        model.variables.insert("results".into(), json!([]));
+        model.variables.insert("caught_case".into(), serde_json::Value::Null);
+        model.nodes.iter_mut().find(|node| node.id == "Sub").unwrap().repeat =
+            Some(ProcessRepeatSpec::MultiInstance {
+                mode: ProcessMultiInstanceMode::Parallel,
+                input: ProcessMultiInstanceInput::Cardinality { count: 1 },
+                output_collection_variable: "results".into(),
+            });
+        model.errors.push(ProcessErrorDeclaration {
+            error_id: "BusinessError".into(), name: "Business rejection".into(),
+            error_code: "REJECTED".into(),
+        });
+        model.nodes.extend([
+            ProcessNode {
+                id: "HandleError".into(), name: "Handle error".into(),
+                kind: ProcessNodeKind::BoundaryError {
+                    attached_to_id: "Sub".into(), error_ref: Some("BusinessError".into()),
+                    output_mapping: if mapped {
+                        BTreeMap::from([("caught_case".into(), "outputs.case".into())])
+                    } else { BTreeMap::new() },
+                }, repeat: None, activity_io: None,
+            },
+            ProcessNode {
+                id: "ReviewError".into(), name: "Review error".into(),
+                kind: ProcessNodeKind::UserTask {
+                    assignee_user_id: None, output_mapping: BTreeMap::new(),
+                }, repeat: None, activity_io: None,
+            },
+        ]);
+        model.sequence_flows.extend([
+            edge("ErrorToReview", "HandleError", "ReviewError"),
+            edge("ReviewToEnd", "ReviewError", "RootEnd_Sub"),
+        ]);
+        let version = publish_model(&fixture, &model);
+        let started = start_version(&fixture, &version);
+        let at = chrono::Utc::now().timestamp_millis();
+        let worker = "inner-error-worker";
+        let claim = repository::claim_job(&fixture.db, worker, at).unwrap().unwrap();
+        let observed = super::repetition_service_tests::observed_flow_result(&fixture, &claim).await;
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        let job = snapshot.jobs.iter().find(|job| job.job_id == claim.job.job_id).unwrap();
+        let plan = runtime::plan_job_result(&snapshot, job, &observed, at, None).unwrap();
+        assert!(plan.events.iter().any(|event| event.kind == "business_error_caught"
+            && event.node_id.as_deref() == Some("HandleError")),
+            "the engine hands the inner Error to the handler on the repeated sub-process");
+        repository::accept_job_result(&fixture.db, &fixture.owner, &claim.job.job_id,
+            claim.job.attempt, claim.job.fence, worker, &observed, snapshot.instance.revision,
+            ProcessPlanInput::Supplied(&plan), at)
+            .unwrap_or_else(|error| panic!("the validator refused the engine's own plan: {error:#}"));
+        let after = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        assert!(after.incidents.is_empty());
+        assert!(after.user_tasks.iter().any(|task| task.node_id == "ReviewError"
+            && task.status == ProcessUserTaskStatus::Open));
+        assert_eq!(after.instance.variables["caught_case"], if mapped { json!("alpha") } else { json!(null) });
+    }
+}

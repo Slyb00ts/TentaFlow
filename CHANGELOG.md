@@ -142,8 +142,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   `EXPRESSION_ERROR`), nie było nigdy zatwierdzane: plan nie nazywał incydentu w
   grupie powtórzeń, walidator go odrzucał, a wynik zostawał w stanie `observed` bez
   incydentu. Grupa wskazuje teraz swój incydent, a walidator przyjmuje taki plan tylko
-  dla incydentu o kodzie i komunikacie tego wyniku. Błąd z powtarzanego zadania w
+  dla incydentu o kodzie i komunikacie, który wynika z przypiętej konfiguracji: wynik
+  przyjęty przez warunek nie da się zablokować, a kod i komunikat odrzucenia walidator
+  wylicza ponownie z przypiętego wyrażenia. Ordynał zablokowanego wyniku ma zawsze
+  status `AcceptedBlocked` (nie `RetryableError`). Błąd z powtarzanego zadania w
   podprocesie nie wspina się do zakresów nadrzędnych (tak jak w silniku).
+- Silnik BPMN: w równoległej grupie powtórzeń rodzeństwo zablokowanego ordynału nadal
+  kończy się (incydent grupy nie blokuje wyników zadań będących w locie): drugi
+  nieobsłużony wynik zgłasza własny incydent, a grupa zostaje przy pierwszym, więc żaden incydent nie jest podmieniany ani osierocony, a wynik
+  rodzeństwa nie zostaje w stanie `observed`. Odrzucenie weryfikacji przez człowieka
+  też nie blokuje decyzji o rodzeństwie. Odrzucone przyjęcie wyniku zgłasza od razu
+  incydent `RESULT_RECOVERY_FAILED` (wynik zostaje zapisany i da się go przyjąć
+  później), zamiast czekać na restart. Błąd zadania wewnątrz powtarzanego podprocesu
+  trafia do zdarzenia brzegowego na tym podprocesie także w walidatorze.
 - Inspektor zadania usługi BPMN, runda 2: tabela „co się stanie” nazywa zdarzenie, do
   którego wspina się błąd w podprocesie, wymaga reguły wyniku dla obu przycisków,
   jest zwijana (zwinięta na niskim oknie) i łamie kody tylko po podkreślniku.
