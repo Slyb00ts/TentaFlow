@@ -19707,6 +19707,7 @@ fn apply_repetition_plan_on(
                 ensure!(row.status == ProcessRepetitionOccurrenceStatus::AcceptedBlocked
                     || row.aggregate_item.as_ref() == Some(&expected_output),
                     "repetition aggregate item differs from its accepted source output");
+                let mut blocked_service_result = false;
                 if kind == "service_result" {
                     let job_id = row.job_id.as_deref()
                         .context("completed Service occurrence has no fenced job")?;
@@ -19720,7 +19721,32 @@ fn apply_repetition_plan_on(
                     let human_verification = matches!(&node.kind,
                         ProcessNodeKind::ServiceTask { verification:
                             tentaflow_protocol::processes::ActivityVerification::Human, .. });
-                    ensure!(matches!(accepted_result.outcome,
+                    // A Cancelled result, or a Completed one whose Condition refuses it,
+                    // is accepted and then parked under the incident it raised.
+                    blocked_service_result = row.status == ProcessRepetitionOccurrenceStatus::AcceptedBlocked
+                        && !rejected_verification
+                        && matches!(&node.kind, ProcessNodeKind::ServiceTask { .. })
+                        && row.approval_event_id.is_none()
+                        && group.terminal_incident_id.as_deref().is_some_and(|incident_id|
+                            plan.add_incidents.iter().filter(|incident|
+                                incident.incident_id == incident_id
+                                    && incident.scope_id == row.scope_id
+                                    && incident.node_id.as_deref() == Some(group.node_id.as_str())
+                                    && incident.job_id.as_deref() == Some(job_id)
+                                    && !incident.can_retry
+                                    && match accepted_result.outcome {
+                                        tentaflow_protocol::processes::ActivityOutcome::Cancelled =>
+                                            incident.code == accepted_result.code.as_deref()
+                                                .unwrap_or("SERVICE_ERROR")
+                                                && incident.message == bounded_failure_message(&accepted_result.summary),
+                                        tentaflow_protocol::processes::ActivityOutcome::Completed =>
+                                            !human_verification
+                                                && matches!(incident.code.as_str(),
+                                                    "VERIFICATION_FAILED" | "EXPRESSION_ERROR"),
+                                        _ => false,
+                                    }).count() == 1);
+                    ensure!(blocked_service_result
+                        || matches!(accepted_result.outcome,
                         tentaflow_protocol::processes::ActivityOutcome::Completed
                         | tentaflow_protocol::processes::ActivityOutcome::NeedsHuman)
                         && (rejected_verification && row.approval_event_id.is_none()
@@ -19749,6 +19775,17 @@ fn apply_repetition_plan_on(
                                     && event.data["group_id"] == group.group_id),
                             "rejected Verification changed its retained Service evidence or continuation");
                         human_rejected_groups.insert(group.group_id.as_str());
+                        continue;
+                    }
+                    if blocked_service_result {
+                        ensure!(group.status == ProcessRepetitionGroupStatus::Incident
+                            && !group.terminal_capacity && group.terminal_event_id.is_none()
+                            && row.aggregate_item.is_none() && row.state_patch.is_none()
+                            && row.state_after.is_none()
+                            && !plan.events.iter().any(|event|
+                                event.kind == "repetition_group_blocked"
+                                    && event.data["group_id"] == group.group_id),
+                            "blocked Service result changed its retained evidence or continuation");
                         continue;
                     }
                     let byte_denied = plan.repetition_capacity.as_ref().is_some_and(|source|
@@ -20306,6 +20343,37 @@ fn apply_repetition_plan_on(
                     row.group_id == group.group_id
                         && row.status == ProcessRepetitionOccurrenceStatus::Active
                         && row.accepted_source_event_id.is_none());
+            // An accepted Service result that nothing catches (Error, Cancelled, a
+            // rejecting Condition) parks the group under the incident the result
+            // raised. The result event is the fact; like a failed Script body there
+            // is no aggregate attempt, hence no blocked-group event.
+            let service_result_failure = matches!(&node.kind, ProcessNodeKind::ServiceTask { .. })
+                && plan.events.iter().filter(|event| event.kind == "service_result"
+                    && event.scope_id == group.scope_id
+                    && event.node_id.as_deref() == Some(group.node_id.as_str()))
+                    .any(|result| plan.add_incidents.iter().any(|incident|
+                        incident.incident_id == incident_id
+                            && incident.scope_id == group.scope_id
+                            && incident.node_id.as_deref() == Some(group.node_id.as_str())
+                            && incident.job_id.is_some()
+                            && !incident.can_retry
+                            && match result.data["outcome"].as_str() {
+                                Some("Error" | "Cancelled") =>
+                                    incident.code == result.data["code"].as_str()
+                                        .unwrap_or("SERVICE_ERROR")
+                                        && incident.message == bounded_failure_message(
+                                            result.data["summary"].as_str().unwrap_or_default()),
+                                Some("Completed") => matches!(incident.code.as_str(),
+                                    "VERIFICATION_FAILED" | "EXPRESSION_ERROR"),
+                                _ => false,
+                            }
+                            && current_occurrences.iter().any(|row|
+                                row.group_id == group.group_id
+                                    && row.job_id == incident.job_id
+                                    && matches!(row.status,
+                                        ProcessRepetitionOccurrenceStatus::RetryableError
+                                            | ProcessRepetitionOccurrenceStatus::AcceptedBlocked)
+                                    && row.accepted_source_event_id.is_some())));
             // A failing authored input parks its ordinal under a typed parked-input
             // fact; no aggregate was attempted, so there is no blocked-group event.
             let input_failure = plan.activity_io_inputs.iter().any(|fact| matches!(fact,
@@ -20317,7 +20385,7 @@ fn apply_repetition_plan_on(
                         event.kind != "repetition_group_blocked"
                             || event.data["group_id"] != group.group_id),
                     "failed IO input cannot claim an accepted aggregate source");
-            } else if pre_body_script_failure {
+            } else if pre_body_script_failure || service_result_failure {
                 ensure!(group.terminal_event_id.is_none()
                     && plan.events.iter().all(|event|
                         event.kind != "repetition_group_blocked"
@@ -26294,6 +26362,9 @@ fn validate_job_result_plan_on(
     let mut scope_id = source_scope.clone();
     let mut hops = Vec::new();
     let mut handler = None;
+    // A repeated task answers for its own incident: past the boundary events
+    // attached to its coordinator the error does not climb to enclosing scopes.
+    let mut at_repeated_coordinator = false;
     if observed.origin == ActivityResultOrigin::Contract
         && observed.result.outcome == tentaflow_protocol::processes::ActivityOutcome::Error
     {
@@ -26314,8 +26385,12 @@ fn validate_job_result_plan_on(
                 if let Some(parent) = repeated_service_boundary_parent_on(tx,
                     &instance.instance_id, &scope_id, node_id, &token_id, job_id)? {
                     attached_token = parent;
+                    at_repeated_coordinator = true;
                     continue;
                 }
+            }
+            if at_repeated_coordinator {
+                break;
             }
             let scope = scopes
                 .iter()

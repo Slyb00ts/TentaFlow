@@ -45,6 +45,8 @@ struct Facts {
     caught: Vec<String>,
     propagated: bool,
     verification_open: bool,
+    /// Assignee and payload of every open verification task.
+    verification_tasks: Vec<(String, Value)>,
     service_results: usize,
     timeout_reason: Option<String>,
     /// `kind@node` of every event, so a drifting case reads as a story.
@@ -57,8 +59,8 @@ impl Facts {
     /// Everything the engine did, for the message of a case that drifted.
     fn story(&self) -> String {
         format!(
-            "status {:?}, incidents {:?}, caught {:?}, climbed {}, verification open {}, events [{}], jobs [{}], invocations {:?}",
-            self.status, self.incidents, self.caught, self.propagated, self.verification_open,
+            "status {:?}, incidents {:?}, caught {:?}, climbed {}, verification tasks {:?}, events [{}], jobs [{}], invocations {:?}",
+            self.status, self.incidents, self.caught, self.propagated, self.verification_tasks,
             self.trail.join(", "), self.jobs.join(", "), self.invocations,
         )
     }
@@ -82,6 +84,15 @@ fn facts(fixture: &Fixture, instance_id: &str) -> Facts {
             task.kind == ProcessUserTaskKind::Verification
                 && task.status == ProcessUserTaskStatus::Open
         }),
+        verification_tasks: snapshot
+            .user_tasks
+            .iter()
+            .filter(|task| {
+                task.kind == ProcessUserTaskKind::Verification
+                    && task.status == ProcessUserTaskStatus::Open
+            })
+            .map(|task| (task.assignee_user_id.clone(), task.outputs.clone()))
+            .collect(),
         service_results: history.iter().filter(|event| event.kind == "service_result").count(),
         timeout_reason: history
             .iter()
@@ -194,7 +205,7 @@ fn model_of(case: &Value) -> ProcessModel {
             output_mapping: BTreeMap::new(),
         }));
     }
-    if nested && case["errors"].as_array().is_none_or(|errors| errors.is_empty()) {
+    if nested && case["scopeCatch"].as_bool().unwrap_or(false) {
         wire(&mut model, boundary("ScopeCatch", ProcessNodeKind::BoundaryError {
             attached_to_id: "Scope".into(),
             error_ref: None,
@@ -329,10 +340,30 @@ fn check(case: &Value, fixture: &Fixture, instance_id: &str, facts: &Facts) {
     let caught_only = |node: &str| facts.caught == [node.to_owned()];
     let none_of_the_incidents = facts.incidents.is_empty();
     match wanted {
-        "verification" => assert!(
-            facts.verification_open && none_of_the_incidents && facts.caught.is_empty(),
-            "{name}: a verification task and nothing else, got {}", facts.story()
-        ),
+        "verification" => {
+            assert!(
+                facts.verification_open && none_of_the_incidents && facts.caught.is_empty()
+                    && facts.status == Some(ProcessInstanceStatus::Waiting),
+                "{name}: a verification task, a waiting instance and nothing else, got {}", facts.story()
+            );
+            let [(assignee, payload)] = facts.verification_tasks.as_slice() else {
+                panic!("{name}: exactly one verification task, got {}", facts.story());
+            };
+            assert_eq!(
+                assignee, &fixture.owner.user_id,
+                "{name}: the verification task belongs to the process initiator"
+            );
+            assert_eq!(
+                payload["outcome"].as_str(),
+                engine["outcome"].as_str(),
+                "{name}: the result the reviewer is shown"
+            );
+            assert_eq!(
+                payload["code"].as_str(),
+                engine["code"].as_str(),
+                "{name}: the code the reviewer is shown"
+            );
+        }
         "advanced" => assert!(
             facts.status == Some(ProcessInstanceStatus::Completed) && none_of_the_incidents,
             "{name}: the process runs on, got {}", facts.story()
@@ -343,6 +374,15 @@ fn check(case: &Value, fixture: &Fixture, instance_id: &str, facts: &Facts) {
                 facts.incidents.iter().any(|incident| incident == code) && facts.caught.is_empty(),
                 "{name}: incident {code} that no boundary event caught, got {}", facts.story()
             );
+            assert_eq!(
+                facts.status,
+                Some(ProcessInstanceStatus::Incident),
+                "{name}: the instance waits on the incident, got {}", facts.story()
+            );
+            assert!(
+                !facts.verification_open,
+                "{name}: no verification task is left open beside the incident, got {}", facts.story()
+            );
         }
         "boundary" => assert!(
             caught_only(engine["node"].as_str().unwrap())
@@ -350,12 +390,21 @@ fn check(case: &Value, fixture: &Fixture, instance_id: &str, facts: &Facts) {
                 && !facts.verification_open,
             "{name}: caught by the boundary event alone, got {}", facts.story()
         ),
-        "boundary_and_verification" => assert!(
-            caught_only(engine["node"].as_str().unwrap())
-                && facts.verification_open
-                && none_of_the_incidents,
-            "{name}: the boundary event runs and the verification task stays, got {}", facts.story()
-        ),
+        "boundary_and_verification" => {
+            assert!(
+                caught_only(engine["node"].as_str().unwrap())
+                    && facts.verification_open
+                    && none_of_the_incidents,
+                "{name}: the boundary event runs and the verification task stays, got {}", facts.story()
+            );
+            assert_eq!(
+                facts.verification_tasks.iter().map(|(_, payload)| {
+                    (payload["outcome"].as_str(), payload["code"].as_str())
+                }).collect::<Vec<_>>(),
+                [(engine["outcome"].as_str(), engine["code"].as_str())],
+                "{name}: the kept task still asks for the human the result called for"
+            );
+        }
         "propagated" => assert!(
             facts.propagated && caught_only(engine["node"].as_str().unwrap()) && none_of_the_incidents,
             "{name}: climbed to the enclosing boundary event, got {}", facts.story()
@@ -421,7 +470,7 @@ async fn run_case(case: Value) {
 #[tokio::test]
 async fn every_routing_case_goes_where_the_designer_says() {
     let cases = cases();
-    assert!(cases.len() >= 25, "the fixture is the contract; do not thin it out");
+    assert!(cases.len() >= 30, "the fixture is the contract; do not thin it out");
     let mut failures = Vec::new();
     let local = tokio::task::LocalSet::new();
     local
@@ -443,23 +492,35 @@ async fn every_routing_case_goes_where_the_designer_says() {
     assert!(failures.is_empty(), "{} of {} cases failed:\n{}", failures.len(), cases.len(), failures.join("\n"));
 }
 
-/// A caller's error boundary is a property of the Call activity, which a
-/// single-process case cannot build; the engine test below proves it, and the
-/// fixture names it so the claim "unless a Call activity catches it" cannot
-/// outlive its proof.
+/// The table promises a route and the engine probe states a fact; the fixture's
+/// `routeFacts` says which facts can honour which route, so a case cannot pair
+/// "the process goes on" with an incident and still pass on both sides.
 #[test]
-fn the_caller_catch_named_by_the_fixture_exists() {
-    let calls = include_str!("call_tests.rs");
-    let mut named = 0;
+fn every_case_pairs_its_route_with_a_fact_that_can_honour_it() {
+    let document: Value = serde_json::from_str(FIXTURE).unwrap();
+    let compatible = document["routeFacts"].as_object().expect("the fixture maps routes to facts");
+    let mut probed_routes = std::collections::BTreeSet::new();
     for case in cases() {
-        let Some(test) = case["callerCatch"].as_str() else { continue };
-        named += 1;
-        let (module, function) = test.split_once("::").unwrap();
-        assert_eq!(module, "call_tests");
+        let name = case["name"].as_str().unwrap();
+        let route = case["expect"]["route"].as_str().unwrap();
+        let allowed = compatible
+            .get(route)
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("{name}: route {route} has no entry in routeFacts"));
+        if case["engine"].is_null() {
+            continue;
+        }
+        let fact = case["engine"]["fact"].as_str().unwrap();
         assert!(
-            calls.contains(&format!("async fn {function}()")) || calls.contains(&format!("fn {function}()")),
-            "the engine test {test} named by the fixture is gone"
+            allowed.iter().any(|candidate| candidate == fact),
+            "{name}: the table says {route}, but the engine fact {fact} cannot honour it"
         );
+        probed_routes.insert(route.to_owned());
     }
-    assert!(named >= 1);
+    let every_route: std::collections::BTreeSet<String> = compatible.keys().cloned().collect();
+    assert_eq!(
+        probed_routes,
+        every_route,
+        "every route the table can show is driven through the engine at least once"
+    );
 }

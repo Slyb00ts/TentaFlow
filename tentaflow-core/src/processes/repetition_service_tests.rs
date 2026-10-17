@@ -893,3 +893,81 @@ async fn ordinary_service_claim_keeps_its_three_field_event_without_repeat_conte
         &started.instance_id, None).unwrap();
     assert_eq!(completed.status, ProcessInstanceStatus::Completed);
 }
+
+#[tokio::test]
+async fn repeated_result_that_nothing_catches_commits_its_incident_and_refuses_forged_plans() {
+    // (result, verification, status the ordinal keeps, incident code)
+    let cases = [
+        (json!({"outcome":"Error","code":"CODE_B","summary":"business failure","outputs":{},"evidence":[]}),
+            ActivityVerification::Human, ProcessRepetitionOccurrenceStatus::RetryableError, "CODE_B"),
+        (json!({"outcome":"Error","code":null,"summary":"no code","outputs":{},"evidence":[]}),
+            ActivityVerification::Human, ProcessRepetitionOccurrenceStatus::RetryableError, "SERVICE_ERROR"),
+        (json!({"outcome":"Cancelled","code":"STOPPED","summary":"stopped by rule","outputs":{},"evidence":[]}),
+            ActivityVerification::Human, ProcessRepetitionOccurrenceStatus::AcceptedBlocked, "STOPPED"),
+        (json!({"outcome":"Completed","code":null,"summary":"fine","outputs":{},"evidence":[]}),
+            ActivityVerification::Condition { expression: "false".into() },
+            ProcessRepetitionOccurrenceStatus::AcceptedBlocked, "VERIFICATION_FAILED"),
+        (json!({"outcome":"Completed","code":null,"summary":"fine","outputs":{},"evidence":[]}),
+            ActivityVerification::Condition { expression: "outputs.missing.deeper".into() },
+            ProcessRepetitionOccurrenceStatus::AcceptedBlocked, "EXPRESSION_ERROR"),
+    ];
+    for (result, verification, status, code) in cases {
+        let fixture = Fixture::new();
+        let graph = json!({"nodes":[{"id":"trigger","type":"trigger","config":{
+            "output_mapping":{"actual_result":result.to_string()}}},
+            {"id":"output","type":"output","config":{}}],
+            "edges":[{"from":"trigger","to":"output","from_port":"text","to_port":"text"}],
+            "variables":[{"name":"actual_result","type":"json"}]}).to_string();
+        let flow_id = flow(&fixture.db, &fixture.owner, &graph);
+        let mut model = repeated_service_model(&flow_id, verification);
+        let service = model.nodes.iter_mut().find(|node| node.id == "Service").unwrap();
+        let ProcessNodeKind::ServiceTask { result_expression, .. } = &mut service.kind
+            else { panic!("fixture Service node changed kind") };
+        *result_expression = Some("outputs.variables.actual_result".into());
+        let started = start_model(&fixture, &model);
+        let worker = "unaccepted-repeat-worker";
+        let claim = repository::claim_job(&fixture.db, worker,
+            chrono::Utc::now().timestamp_millis()).unwrap().unwrap();
+        let observed = observed_flow_result(&fixture, &claim).await;
+        let at = chrono::Utc::now().timestamp_millis();
+        let plan = plan_recorded_result(&fixture, &claim, &observed, at).unwrap();
+        let incident = plan.add_incidents.iter().find(|incident| incident.code == code)
+            .unwrap_or_else(|| panic!("{code}: the plan raises the incident"));
+        assert_eq!(plan.repetition_groups[0].terminal_incident_id.as_deref(),
+            Some(incident.incident_id.as_str()), "{code}: the group names its incident");
+
+        let before = super::call_tests::transition_rows(&fixture);
+        let accept = |plan: &repository::RuntimePlan| repository::accept_job_result(&fixture.db,
+            &fixture.owner, &claim.job.job_id, claim.job.attempt, claim.job.fence, worker,
+            &observed, claim.snapshot.instance.revision,
+            repository::ProcessPlanInput::Supplied(plan), at);
+        let mut unnamed = plan.clone();
+        unnamed.repetition_groups[0].terminal_incident_id = None;
+        assert!(accept(&unnamed).is_err(), "{code}: a group without its incident is refused");
+        let mut foreign = plan.clone();
+        foreign.repetition_groups[0].terminal_incident_id = Some(uuid::Uuid::new_v4().to_string());
+        assert!(accept(&foreign).is_err(), "{code}: a group naming an unknown incident is refused");
+        let mut renamed = plan.clone();
+        renamed.add_incidents[0].code = "FORGED".into();
+        assert!(accept(&renamed).is_err(), "{code}: an incident that is not the result's is refused");
+        let mut retryable = plan.clone();
+        retryable.add_incidents[0].can_retry = true;
+        assert!(accept(&retryable).is_err(), "{code}: a retryable incident is refused");
+        assert_eq!(super::call_tests::transition_rows(&fixture), before,
+            "{code}: a refused plan leaves no trace");
+
+        accept(&plan).unwrap();
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        assert_eq!(snapshot.instance.status, ProcessInstanceStatus::Incident, "{code}");
+        assert_eq!(snapshot.incidents.iter().map(|row| row.code.as_str()).collect::<Vec<_>>(), [code]);
+        assert_eq!(snapshot.incidents[0].job_id.as_deref(), Some(claim.job.job_id.as_str()));
+        assert_eq!(snapshot.repetition_groups[0].terminal_incident_id.as_deref(),
+            Some(snapshot.incidents[0].incident_id.as_str()), "{code}");
+        assert_eq!(snapshot.repetition_occurrences[0].status, status, "{code}");
+        assert_ne!(snapshot.jobs[0].status, "running", "{code}: the result was accepted, not left observed");
+        assert_eq!(snapshot.jobs[0].result.as_ref(), Some(&observed.result), "{code}");
+        assert!(history(&fixture, &started.instance_id).iter()
+            .all(|event| event.kind != "repetition_group_blocked"), "{code}: no aggregate was attempted");
+    }
+}

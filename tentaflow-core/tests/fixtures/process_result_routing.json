@@ -1,15 +1,42 @@
 {
-  "description": "Where each outcome of a BPMN Service task goes. Read by the designer's routing table (www/js/modules/flows-builder/bpmn.test.js, processResultRouting) and by the engine test processes::result_routing_tests, so a rule that changes on one side turns the other red. A case builds a Service task with the given boundary events, feeds it the stimulus, and states both the table row (expect) and the engine fact (engine). engine=null means no engine probe exists for the row; engineReason says why.",
+  "description": "Where each outcome of a BPMN Service task goes. Read by the designer's routing table (www/js/modules/flows-builder/bpmn.test.js) and by the engine test processes::result_routing_tests, so a rule that changes on one side turns the other red. A case builds a Service task with the given boundary events, feeds it the stimulus, and states the table row (expect: route, optional code/reason/boundary/warning, and text, the i18n keys of the row's two cells) and the engine fact (engine). stimuli[].row names the table row a stimulus lands on. routeFacts lists, per route, the engine facts that can honour it; both test suites assert every case against it. engine=null means no engine probe exists for the row; engineReason says why. Facts: verification = one open verification task for the initiator showing the given result outcome and code, instance running; advanced = the instance completed without incident; incident = the given incident code, no boundary caught it, instance in Incident, no open verification task; boundary = caught by that node alone; propagated = climbed to that enclosing boundary. nested puts the task inside a sub-process; scopeCatch says whether that sub-process carries a catch-all error boundary event.",
   "stimuli": {
-    "completed": "the result source returns a Completed result",
-    "rejected": "the result is Completed but the verifier says no (Human: the task is rejected, Condition: it evaluates to false)",
-    "error": "a result rule returns Error with the given code",
-    "needs_human": "a result rule returns NeedsHuman with the given code",
-    "cancelled": "a result rule returns Cancelled",
-    "tool_error": "the addon tool fails: a platform result, not a result rule outcome",
-    "bad_result_rule": "the result rule does not return an ActivityResult: a platform result",
-    "denied": "the initiator lost the addon permission, found at claim time",
-    "timeout": "the task runs past timeoutSeconds after dispatch"
+    "completed": {
+      "text": "the result source returns a Completed result",
+      "row": "completed"
+    },
+    "rejected": {
+      "text": "the result is Completed but the verifier says no (Human: the task is rejected, Condition: it evaluates to false)",
+      "row": "rejected"
+    },
+    "error": {
+      "text": "a result rule returns Error with the given code",
+      "row": "error"
+    },
+    "needs_human": {
+      "text": "a result rule returns NeedsHuman with the given code",
+      "row": "needs_human"
+    },
+    "cancelled": {
+      "text": "a result rule returns Cancelled",
+      "row": "cancelled"
+    },
+    "tool_error": {
+      "text": "the addon tool fails: a platform result, not a result rule outcome",
+      "row": "platform"
+    },
+    "bad_result_rule": {
+      "text": "the result rule does not return an ActivityResult: a platform result",
+      "row": "platform"
+    },
+    "denied": {
+      "text": "the initiator lost the addon permission, found at claim time",
+      "row": "denied"
+    },
+    "timeout": {
+      "text": "the task runs past timeoutSeconds after dispatch",
+      "row": "timeout"
+    }
   },
   "cases": [
     {
@@ -23,10 +50,15 @@
         "type": "completed"
       },
       "expect": {
-        "route": "next"
+        "route": "next",
+        "text": {
+          "outcome": "bpmn.routing_outcome_completed",
+          "route": "bpmn.routing_next_human"
+        }
       },
       "engine": {
-        "fact": "verification"
+        "fact": "verification",
+        "outcome": "Completed"
       }
     },
     {
@@ -41,7 +73,11 @@
         "type": "completed"
       },
       "expect": {
-        "route": "next"
+        "route": "next",
+        "text": {
+          "outcome": "bpmn.routing_outcome_completed",
+          "route": "bpmn.routing_next_condition"
+        }
       },
       "engine": {
         "fact": "advanced"
@@ -60,7 +96,11 @@
       },
       "expect": {
         "route": "incident",
-        "code": "VERIFICATION_FAILED"
+        "code": "VERIFICATION_FAILED",
+        "text": {
+          "outcome": "bpmn.routing_outcome_rejected_condition",
+          "route": "bpmn.routing_incident"
+        }
       },
       "engine": {
         "fact": "incident",
@@ -79,7 +119,11 @@
       },
       "expect": {
         "route": "incident",
-        "code": "HUMAN_REJECTED"
+        "code": "HUMAN_REJECTED",
+        "text": {
+          "outcome": "bpmn.routing_outcome_rejected_human",
+          "route": "bpmn.routing_incident"
+        }
       },
       "engine": {
         "fact": "incident",
@@ -105,7 +149,11 @@
       },
       "expect": {
         "route": "boundary",
-        "boundary": "ErrExact"
+        "boundary": "ErrExact",
+        "text": {
+          "outcome": "bpmn.routing_outcome_error_code",
+          "route": "bpmn.routing_boundary"
+        }
       },
       "engine": {
         "fact": "boundary",
@@ -135,7 +183,11 @@
       },
       "expect": {
         "route": "boundary",
-        "boundary": "ErrAny"
+        "boundary": "ErrAny",
+        "text": {
+          "outcome": "bpmn.routing_outcome_error_other",
+          "route": "bpmn.routing_boundary"
+        }
       },
       "engine": {
         "fact": "boundary",
@@ -165,7 +217,11 @@
       },
       "expect": {
         "route": "boundary",
-        "boundary": "ErrExact"
+        "boundary": "ErrExact",
+        "text": {
+          "outcome": "bpmn.routing_outcome_error_code",
+          "route": "bpmn.routing_boundary"
+        }
       },
       "engine": {
         "fact": "boundary",
@@ -173,7 +229,7 @@
       }
     },
     {
-      "name": "An unhandled error at the top level is an incident with its code, unless a Call activity catches it",
+      "name": "An unhandled error at the top level is an incident with its code",
       "task": {
         "kind": "tool",
         "resultExpression": true,
@@ -190,13 +246,16 @@
         "code": "CODE_B"
       },
       "expect": {
-        "route": "caller"
+        "route": "caller",
+        "text": {
+          "outcome": "bpmn.routing_outcome_error_other",
+          "route": "bpmn.routing_caller"
+        }
       },
       "engine": {
         "fact": "incident",
         "code": "CODE_B"
-      },
-      "callerCatch": "call_tests::accepted_real_contract_error_crosses_calls_with_original_outputs_and_result_origin"
+      }
     },
     {
       "name": "An unhandled error without a code is an incident SERVICE_ERROR",
@@ -210,7 +269,11 @@
         "code": null
       },
       "expect": {
-        "route": "caller"
+        "route": "caller",
+        "text": {
+          "outcome": "bpmn.routing_outcome_error_other",
+          "route": "bpmn.routing_caller"
+        }
       },
       "engine": {
         "fact": "incident",
@@ -230,11 +293,41 @@
         "code": "CODE_B"
       },
       "expect": {
-        "route": "parent"
+        "route": "parent",
+        "text": {
+          "outcome": "bpmn.routing_outcome_error_other",
+          "route": "bpmn.routing_parent"
+        }
       },
       "engine": {
         "fact": "propagated",
         "node": "ScopeCatch"
+      },
+      "scopeCatch": true
+    },
+    {
+      "name": "Inside a sub-process an error that no enclosing scope catches is an incident",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human"
+      },
+      "nested": true,
+      "scopeCatch": false,
+      "stimulus": {
+        "type": "error",
+        "code": "CODE_B"
+      },
+      "expect": {
+        "route": "caller",
+        "text": {
+          "outcome": "bpmn.routing_outcome_error_other",
+          "route": "bpmn.routing_caller"
+        }
+      },
+      "engine": {
+        "fact": "incident",
+        "code": "CODE_B"
       }
     },
     {
@@ -250,10 +343,65 @@
         "code": "CODE_B"
       },
       "expect": {
-        "route": "incident"
+        "route": "incident",
+        "text": {
+          "outcome": "bpmn.routing_outcome_error_other",
+          "route": "bpmn.routing_incident_repeated"
+        }
       },
-      "engine": null,
-      "engineReason": "a repeated tool task whose Error result no boundary event catches stays 'observed' under the scripted harness: the job keeps running, the invocation phase is 'observed' and no incident appears, because accept_job_result does not commit the plan that plan_job_result builds; the cause was not found, so the incident this row promises comes from reading runtime.rs (the repetition branch of plan_job_result), not from a run"
+      "engine": {
+        "fact": "incident",
+        "code": "CODE_B"
+      }
+    },
+    {
+      "name": "A repeated task turns a cancelled result into an incident with its code",
+      "task": {
+        "kind": "tool",
+        "resultExpression": true,
+        "verification": "Human",
+        "repeat": true
+      },
+      "stimulus": {
+        "type": "cancelled",
+        "code": "STOPPED_BY_RULE"
+      },
+      "expect": {
+        "route": "incident",
+        "text": {
+          "outcome": "bpmn.routing_outcome_cancelled",
+          "route": "bpmn.routing_incident_result"
+        }
+      },
+      "engine": {
+        "fact": "incident",
+        "code": "STOPPED_BY_RULE"
+      }
+    },
+    {
+      "name": "A repeated task whose condition does not accept is an incident",
+      "task": {
+        "kind": "tool",
+        "resultExpression": false,
+        "verification": "Condition",
+        "conditionAccepts": false,
+        "repeat": true
+      },
+      "stimulus": {
+        "type": "rejected"
+      },
+      "expect": {
+        "route": "incident",
+        "code": "VERIFICATION_FAILED",
+        "text": {
+          "outcome": "bpmn.routing_outcome_rejected_condition",
+          "route": "bpmn.routing_incident"
+        }
+      },
+      "engine": {
+        "fact": "incident",
+        "code": "VERIFICATION_FAILED"
+      }
     },
     {
       "name": "A repeated task inside a sub-process raises the incident itself instead of climbing",
@@ -269,10 +417,17 @@
         "code": "CODE_B"
       },
       "expect": {
-        "route": "incident"
+        "route": "incident",
+        "text": {
+          "outcome": "bpmn.routing_outcome_error_other",
+          "route": "bpmn.routing_incident_repeated"
+        }
       },
-      "engine": null,
-      "engineReason": "a repeated tool task whose Error result no boundary event catches stays 'observed' under the scripted harness: the job keeps running, the invocation phase is 'observed' and no incident appears, because accept_job_result does not commit the plan that plan_job_result builds; the cause was not found, so the incident this row promises comes from reading runtime.rs (the repetition branch of plan_job_result), not from a run"
+      "engine": {
+        "fact": "incident",
+        "code": "CODE_B"
+      },
+      "scopeCatch": true
     },
     {
       "name": "A repeated task still uses a boundary event attached to it",
@@ -294,7 +449,11 @@
       },
       "expect": {
         "route": "boundary",
-        "boundary": "ErrExact"
+        "boundary": "ErrExact",
+        "text": {
+          "outcome": "bpmn.routing_outcome_error_code",
+          "route": "bpmn.routing_boundary"
+        }
       },
       "engine": {
         "fact": "boundary",
@@ -306,7 +465,8 @@
       "task": {
         "kind": "tool",
         "resultExpression": true,
-        "verification": "Human"
+        "verification": "Condition",
+        "conditionAccepts": true
       },
       "escalations": [
         {
@@ -321,7 +481,11 @@
       },
       "expect": {
         "route": "boundary",
-        "boundary": "EscExact"
+        "boundary": "EscExact",
+        "text": {
+          "outcome": "bpmn.routing_outcome_needs_human_code",
+          "route": "bpmn.routing_boundary"
+        }
       },
       "engine": {
         "fact": "boundary",
@@ -333,7 +497,8 @@
       "task": {
         "kind": "tool",
         "resultExpression": true,
-        "verification": "Human"
+        "verification": "Condition",
+        "conditionAccepts": true
       },
       "escalations": [
         {
@@ -348,11 +513,17 @@
       },
       "expect": {
         "route": "boundary_keep",
-        "boundary": "EscExact"
+        "boundary": "EscExact",
+        "text": {
+          "outcome": "bpmn.routing_outcome_needs_human_code",
+          "route": "bpmn.routing_boundary_keep"
+        }
       },
       "engine": {
         "fact": "boundary_and_verification",
-        "node": "EscExact"
+        "node": "EscExact",
+        "outcome": "NeedsHuman",
+        "code": "REVIEW"
       }
     },
     {
@@ -360,7 +531,8 @@
       "task": {
         "kind": "tool",
         "resultExpression": true,
-        "verification": "Human"
+        "verification": "Condition",
+        "conditionAccepts": true
       },
       "escalations": [
         {
@@ -380,7 +552,11 @@
       },
       "expect": {
         "route": "boundary",
-        "boundary": "EscAny"
+        "boundary": "EscAny",
+        "text": {
+          "outcome": "bpmn.routing_outcome_needs_human_other",
+          "route": "bpmn.routing_boundary"
+        }
       },
       "engine": {
         "fact": "boundary",
@@ -392,17 +568,24 @@
       "task": {
         "kind": "tool",
         "resultExpression": true,
-        "verification": "Human"
+        "verification": "Condition",
+        "conditionAccepts": true
       },
       "stimulus": {
         "type": "needs_human",
         "code": "REVIEW"
       },
       "expect": {
-        "route": "review"
+        "route": "review",
+        "text": {
+          "outcome": "bpmn.routing_outcome_needs_human_other",
+          "route": "bpmn.routing_review"
+        }
       },
       "engine": {
-        "fact": "verification"
+        "fact": "verification",
+        "outcome": "NeedsHuman",
+        "code": "REVIEW"
       }
     },
     {
@@ -410,7 +593,8 @@
       "task": {
         "kind": "tool",
         "resultExpression": true,
-        "verification": "Human"
+        "verification": "Condition",
+        "conditionAccepts": true
       },
       "escalations": [
         {
@@ -424,10 +608,16 @@
         "code": "OTHER"
       },
       "expect": {
-        "route": "review"
+        "route": "review",
+        "text": {
+          "outcome": "bpmn.routing_outcome_needs_human_other",
+          "route": "bpmn.routing_review"
+        }
       },
       "engine": {
-        "fact": "verification"
+        "fact": "verification",
+        "outcome": "NeedsHuman",
+        "code": "OTHER"
       }
     },
     {
@@ -448,7 +638,11 @@
         "code": "STOPPED_BY_RULE"
       },
       "expect": {
-        "route": "incident"
+        "route": "incident",
+        "text": {
+          "outcome": "bpmn.routing_outcome_cancelled",
+          "route": "bpmn.routing_incident_result"
+        }
       },
       "engine": {
         "fact": "incident",
@@ -472,7 +666,11 @@
         "type": "tool_error"
       },
       "expect": {
-        "route": "incident"
+        "route": "incident",
+        "text": {
+          "outcome": "bpmn.routing_outcome_platform",
+          "route": "bpmn.routing_incident_platform"
+        }
       },
       "engine": {
         "fact": "incident",
@@ -496,7 +694,11 @@
         "type": "bad_result_rule"
       },
       "expect": {
-        "route": "incident"
+        "route": "incident",
+        "text": {
+          "outcome": "bpmn.routing_outcome_platform",
+          "route": "bpmn.routing_incident_platform"
+        }
       },
       "engine": {
         "fact": "incident",
@@ -504,29 +706,37 @@
       }
     },
     {
-      "name": "A denied tool permission opens a verification task without a result rule",
+      "name": "A denied tool permission opens a verification task even where the condition would accept",
       "task": {
         "kind": "tool",
         "resultExpression": false,
-        "verification": "Human"
+        "verification": "Condition",
+        "conditionAccepts": true
       },
       "stimulus": {
         "type": "denied"
       },
       "expect": {
         "route": "review",
-        "code": "TOOL_PERMISSION_DENIED"
+        "code": "TOOL_PERMISSION_DENIED",
+        "text": {
+          "outcome": "bpmn.routing_outcome_denied",
+          "route": "bpmn.routing_review_denied"
+        }
       },
       "engine": {
-        "fact": "verification"
+        "fact": "verification",
+        "outcome": "NeedsHuman",
+        "code": "TOOL_PERMISSION_DENIED"
       }
     },
     {
-      "name": "A denied tool permission is not an escalation even with a result rule and a catch-all escalation boundary",
+      "name": "A denied tool permission is not an escalation even with a result rule and a catch-all escalation boundary, and not accepted by an accepting condition",
       "task": {
         "kind": "tool",
         "resultExpression": true,
-        "verification": "Human"
+        "verification": "Condition",
+        "conditionAccepts": true
       },
       "escalations": [
         {
@@ -540,10 +750,16 @@
       },
       "expect": {
         "route": "review",
-        "code": "TOOL_PERMISSION_DENIED"
+        "code": "TOOL_PERMISSION_DENIED",
+        "text": {
+          "outcome": "bpmn.routing_outcome_denied",
+          "route": "bpmn.routing_review_denied"
+        }
       },
       "engine": {
-        "fact": "verification"
+        "fact": "verification",
+        "outcome": "NeedsHuman",
+        "code": "TOOL_PERMISSION_DENIED"
       }
     },
     {
@@ -565,7 +781,11 @@
         "code": "CODE_A"
       },
       "expect": {
-        "route": "unavailable"
+        "route": "unavailable",
+        "text": {
+          "outcome": "bpmn.routing_outcome_error",
+          "route": "bpmn.routing_unavailable"
+        }
       },
       "engine": {
         "fact": "advanced"
@@ -584,7 +804,11 @@
         "code": "REVIEW"
       },
       "expect": {
-        "route": "unavailable"
+        "route": "unavailable",
+        "text": {
+          "outcome": "bpmn.routing_outcome_needs_human",
+          "route": "bpmn.routing_unavailable"
+        }
       },
       "engine": {
         "fact": "advanced"
@@ -604,7 +828,11 @@
       "expect": {
         "route": "incident",
         "code": "EXTERNAL_OUTCOME_UNCERTAIN",
-        "reason": "SERVICE_TIMEOUT"
+        "reason": "SERVICE_TIMEOUT",
+        "text": {
+          "outcome": "bpmn.routing_outcome_timeout",
+          "route": "bpmn.routing_incident_timeout"
+        }
       },
       "engine": {
         "fact": "uncertain_incident",
@@ -633,7 +861,11 @@
         "route": "incident",
         "code": "EXTERNAL_OUTCOME_UNCERTAIN",
         "reason": "SERVICE_TIMEOUT",
-        "warning": "timer_resolves_timeout"
+        "warning": "timer_resolves_timeout",
+        "text": {
+          "outcome": "bpmn.routing_outcome_timeout",
+          "route": "bpmn.routing_incident_timeout"
+        }
       },
       "engine": {
         "fact": "timer_resolves"
@@ -661,10 +893,43 @@
         "route": "incident",
         "code": "EXTERNAL_OUTCOME_UNCERTAIN",
         "reason": "SERVICE_TIMEOUT",
-        "warning": "timer_preempts_timeout"
+        "warning": "timer_preempts_timeout",
+        "text": {
+          "outcome": "bpmn.routing_outcome_timeout",
+          "route": "bpmn.routing_incident_timeout"
+        }
       },
       "engine": null,
       "engineReason": "which of two deadlines fires first is wall-clock ordering of a timer and a worker timeout, and the engine has no fact to read for it; the shared fact (the timer ends a task that is still waiting) is the timer_resolves case above"
     }
-  ]
+  ],
+  "routeFacts": {
+    "next": [
+      "verification",
+      "advanced"
+    ],
+    "incident": [
+      "incident",
+      "uncertain_incident",
+      "timer_resolves"
+    ],
+    "caller": [
+      "incident"
+    ],
+    "parent": [
+      "propagated"
+    ],
+    "boundary": [
+      "boundary"
+    ],
+    "boundary_keep": [
+      "boundary_and_verification"
+    ],
+    "review": [
+      "verification"
+    ],
+    "unavailable": [
+      "advanced"
+    ]
+  }
 }

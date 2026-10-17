@@ -1047,6 +1047,24 @@ impl<'a> Transition<'a> {
         );
     }
 
+    /// An accepted result that no boundary event takes parks the whole repeated
+    /// group under the incident it raises; the group must name that incident,
+    /// or the plan is refused and the claim stays observed forever.
+    fn block_repetition_on_result(
+        &mut self, mut group: RepetitionGroup, node_id: &str, job_id: &str,
+        code: &str, message: String,
+    ) -> Result<()> {
+        self.incident(node_id, Some(job_id.to_owned()), code,
+            super::repository::bounded_failure_message(&message));
+        let incident_id = self.plan.add_incidents.last()
+            .context("blocked repeated Service result has no incident")?.incident_id.clone();
+        group.status = ProcessRepetitionGroupStatus::Incident;
+        group.terminal_incident_id = Some(incident_id);
+        group.terminal_event_id = None;
+        group.updated_at_ms = self.now_ms;
+        self.write_repetition_group(group)
+    }
+
     fn fail_send_admission(
         &mut self, node: &ProcessNode, token: &ProcessToken,
         pending_event_id: &str, code: &'static str, reason: String,
@@ -7261,11 +7279,8 @@ pub fn plan_job_result(
             };
             occurrence.updated_at_ms = now_ms;
             transition.write_repetition_occurrence(occurrence)?;
-            group.status = ProcessRepetitionGroupStatus::Incident;
-            group.updated_at_ms = now_ms;
-            transition.write_repetition_group(group)?;
-            transition.incident(&node.id, Some(job.job_id.clone()),
-                result.code.as_deref().unwrap_or("SERVICE_ERROR"), result.summary.clone());
+            transition.block_repetition_on_result(group, &node.id, &job.job_id,
+                result.code.as_deref().unwrap_or("SERVICE_ERROR"), result.summary.clone())?;
             return transition.finish();
         }
         if result.outcome == ActivityOutcome::NeedsHuman
@@ -7302,10 +7317,7 @@ pub fn plan_job_result(
             occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
             occurrence.updated_at_ms = now_ms;
             transition.write_repetition_occurrence(occurrence)?;
-            group.status = ProcessRepetitionGroupStatus::Incident;
-            group.updated_at_ms = now_ms;
-            transition.write_repetition_group(group)?;
-            transition.incident(&node.id, Some(job.job_id.clone()), code, message);
+            transition.block_repetition_on_result(group, &node.id, &job.job_id, code, message)?;
             return transition.finish();
         }
         if node.activity_io.is_some() {
