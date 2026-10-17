@@ -38,10 +38,14 @@ const ELEMENTS = [
 // replaces the settings, so keys of the previous type never linger.
 export const processBlockTemplate = (type) => (type === 'pii_filter' ? {} : { model: '' });
 
-const SERVICE_TASK_SHAPE = { input_ports: ['in'], output_ports: ['full'], width: 240, height: 96 };
-
 // Block names come from the process options; the locale wins when it knows the
 // block, the server's English text covers a block this client has no key for.
+export function processBlockLabel(block) {
+  return localized(`bpmn.block_${block.nodeType}`, block.label || block.nodeType);
+}
+
+const SERVICE_TASK_SHAPE = { input_ports: ['in'], output_ports: ['full'], width: 240, height: 96 };
+
 function localized(key, fallback) {
   const text = I18n.t(key);
   return text && text !== key ? text : fallback;
@@ -225,6 +229,144 @@ export function processNodeConfig(kind) {
     calledElement: { namespaceUri: '', processId: '' }, inputMapping: {}, outputMapping: {} };
   if (kind === 'ErrorEnd') return { errorRef: '' };
   return {};
+}
+
+// Which implementation a Service task runs; a task without the field is a flow.
+export function processServiceKind(config) {
+  const implementation = config?.implementation;
+  return implementation?.Block ? 'block' : implementation?.AddonTool ? 'tool' : 'flow';
+}
+
+// Problems the canvas marks on a node itself. A block whose template carries a
+// `model` key and a published Call without an exact version are both saved or
+// refused only later (publication, or the wire codec), so the author sees them
+// here first.
+export function processNodeWarnings(node) {
+  const warnings = [];
+  if (node.type === 'bpmn_service_task') {
+    const block = node.config?.implementation?.Block;
+    if (block && Object.hasOwn(processBlockTemplate(block.nodeType), 'model')
+      && (typeof block.config?.model !== 'string' || block.config.model.trim() === '')) {
+      warnings.push('empty_model');
+    }
+  }
+  if (node.type === 'bpmn_call_activity' && !node.config?.localBody
+    && !(Number.isInteger(node.config?.calledVersion) && node.config.calledVersion >= 1)) {
+    warnings.push('call_version');
+  }
+  return warnings;
+}
+
+/**
+ * What happens to a Service task's outcomes, derived from the graph alone.
+ * There is no server-side rule table: the rules below mirror the engine in
+ * processes/runtime.rs (plan_service_result, error_handler) and processes/jobs.rs
+ * (classify_result, fail_claim):
+ * - only a Contract result (a non-empty `resultExpression`) can be Error,
+ *   NeedsHuman or Cancelled; a platform failure (flow, tool or expression
+ *   error) is always an incident and no boundary event catches it;
+ * - Error goes to the boundary with the exact code, else to the catch-all
+ *   boundary, else (inside a sub-process) to the enclosing scope, else an incident;
+ * - NeedsHuman goes to the escalation boundary with the exact code, else the
+ *   catch-all one, else the initiator's verification task;
+ * - Cancelled is an incident; a service timeout after dispatch is an incident
+ *   (reason SERVICE_TIMEOUT, outcome uncertain);
+ * - a boundary timer runs on its own clock from activation and is not a reaction
+ *   to the service timeout.
+ */
+export function processResultRouting(graph, nodeId) {
+  const node = graph.nodes.find((candidate) => candidate.id === nodeId);
+  if (!node || node.type !== 'bpmn_service_task') return null;
+  const model = graph.processModel || {};
+  const config = node.config || {};
+  const hasResult = typeof config.resultExpression === 'string' && config.resultExpression.length > 0;
+  const nested = (graph.processPath || []).length > 0;
+  const byId = new Map(graph.nodes.map((candidate) => [candidate.id, candidate]));
+  const targetsOf = (id) => graph.edges.filter((edge) => edge.from_node === id)
+    .map((edge) => byId.get(edge.to_node)).filter(Boolean)
+    .map((target) => ({ id: target.id, label: target.label || '', type: target.type }));
+  const describe = (boundary, code, undeclared) => ({
+    id: boundary.id, label: boundary.label || '', type: boundary.type, code, catchAll: code === null && !undeclared,
+    undeclared, interrupting: boundary.config.cancelActivity !== false, targets: targetsOf(boundary.id),
+  });
+  const attached = (type) => graph.nodes.filter((candidate) => candidate.type === type
+    && candidate.config.attachedToId === nodeId);
+  const declared = (list, idKey, codeKey, ref) => {
+    if (ref == null) return { code: null, undeclared: false };
+    const found = (list || []).find((entry) => entry[idKey] === ref);
+    return { code: found ? found[codeKey] : null, undeclared: !found };
+  };
+  const errors = attached('bpmn_boundary_error').map((boundary) => {
+    const { code, undeclared } = declared(model.errors, 'errorId', 'errorCode', boundary.config.errorRef);
+    return describe(boundary, code, undeclared);
+  });
+  const escalations = attached('bpmn_boundary_escalation').map((boundary) => {
+    const { code, undeclared } = declared(model.escalations, 'escalationId', 'escalationCode', boundary.config.escalationRef);
+    return describe(boundary, code, undeclared);
+  });
+  const timers = attached('bpmn_boundary_timer').map((boundary) => ({
+    ...describe(boundary, null, false), timer: boundary.config.timer,
+  }));
+  const catchAll = (list) => list.find((entry) => entry.catchAll) || null;
+  const specific = (list) => list.filter((entry) => !entry.catchAll && !entry.undeclared);
+  const human = typeof config.verification === 'string';
+  const rows = [];
+  rows.push({ outcome: 'completed', route: 'next', gate: human ? 'human' : 'condition', targets: targetsOf(nodeId) });
+  if (!human) rows.push({ outcome: 'rejected', route: 'incident', code: 'VERIFICATION_FAILED' });
+  if (hasResult) {
+    for (const entry of specific(errors)) rows.push({ outcome: 'error', route: 'boundary', code: entry.code, boundary: entry, targets: entry.targets });
+    const otherError = catchAll(errors);
+    rows.push({ outcome: 'error', route: otherError ? 'boundary' : nested ? 'parent' : 'incident', other: true,
+      code: null, boundary: otherError, targets: otherError ? otherError.targets : [] });
+    for (const entry of specific(escalations)) rows.push({ outcome: 'needs_human', route: 'boundary', code: entry.code, boundary: entry, targets: entry.targets });
+    const otherEscalation = catchAll(escalations);
+    rows.push({ outcome: 'needs_human', route: otherEscalation ? 'boundary' : 'review', other: true,
+      code: null, boundary: otherEscalation, targets: otherEscalation ? otherEscalation.targets : [] });
+    rows.push({ outcome: 'cancelled', route: 'incident', code: 'SERVICE_ERROR' });
+  } else {
+    for (const outcome of ['error', 'needs_human', 'cancelled']) rows.push({ outcome, route: 'unavailable' });
+  }
+  rows.push({ outcome: 'platform', route: 'incident' });
+  rows.push({ outcome: 'timeout', route: 'incident', code: 'SERVICE_TIMEOUT', seconds: config.timeoutSeconds });
+  for (const entry of timers) rows.push({ outcome: 'timer', route: 'boundary', boundary: entry, targets: entry.targets, timer: entry.timer });
+
+  const warnings = [];
+  if (!rows[0].targets.length) warnings.push({ key: 'no_outgoing' });
+  if (!hasResult && errors.length) warnings.push({ key: 'error_boundary_without_result' });
+  if (!hasResult && escalations.length) warnings.push({ key: 'escalation_boundary_without_result' });
+  for (const entry of [...errors, ...escalations, ...timers]) {
+    if (!entry.targets.length) warnings.push({ key: 'boundary_no_flow', name: entry.label || entry.id });
+    if (entry.undeclared) warnings.push({ key: 'undeclared_reference', name: entry.label || entry.id });
+  }
+  for (const list of [errors, escalations]) {
+    const seen = new Set();
+    for (const entry of list) {
+      const key = entry.undeclared ? `u:${entry.id}` : entry.code ?? '';
+      if (seen.has(key)) warnings.push({ key: 'duplicate_handler', name: entry.label || entry.id });
+      seen.add(key);
+    }
+  }
+  for (const entry of timers) {
+    const seconds = entry.timer?.Duration?.seconds;
+    if (Number.isInteger(seconds) && Number.isInteger(config.timeoutSeconds) && seconds >= config.timeoutSeconds) {
+      warnings.push({ key: 'timer_after_timeout', name: entry.label || entry.id });
+    }
+  }
+
+  // The first catch-all, then each declared code, that has no handler yet: a
+  // second handler for one code is refused at publication.
+  const nextRef = (list, declarations, idKey, codeKey) => {
+    const used = new Set(list.map((entry) => (entry.catchAll ? null : entry.undeclared ? undefined : entry.code)));
+    if (!used.has(null)) return { ref: null };
+    const free = (declarations || []).find((entry) => !used.has(entry[codeKey]));
+    return free ? { ref: free[idKey] } : null;
+  };
+  return {
+    node, hasResult, verification: human ? 'Human' : 'Condition', rows, warnings,
+    boundaries: { errors, escalations, timers },
+    add: { error: nextRef(errors, model.errors, 'errorId', 'errorCode'),
+      escalation: hasResult ? nextRef(escalations, model.escalations, 'escalationId', 'escalationCode') : null },
+  };
 }
 
 export function processHasTimerStart(model) {

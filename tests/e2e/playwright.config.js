@@ -80,6 +80,7 @@ module.exports = defineConfig({
     // account suite, whose whole premise is that it is alone.
     { name: 'agent-accounts-mesh', testMatch: 'agent-accounts-mesh.spec.js' },
     { name: 'process-b3-palette', testMatch: 'process-b3-palette.spec.js' },
+    { name: 'process-b3-inspector', testMatch: 'process-b3-inspector.spec.js' },
     { name: 'tentaquant', testMatch: 'tentaquant.spec.js' },
     { name: 'tentabus-seed', testMatch: 'tentabus-seed.spec.js' },
     { name: 'tentabus-ui', testMatch: 'tentabus-ui.spec.js' },

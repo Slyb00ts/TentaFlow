@@ -10,7 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
-import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind } from './bpmn.js';
+import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings } from './bpmn.js';
 import '/js/components/tf-menu.js';
 
 const NODE_WIDTH = 280;
@@ -1071,6 +1071,30 @@ export class FlowCanvas {
     this.onChange();
   }
 
+  /**
+   * Attaches a new error or escalation boundary event to a Service task as one
+   * undo step. `ref` is the declaration it catches, null for any.
+   */
+  addBoundaryNode(parentId, type, ref = null) {
+    if (this.readOnly || this.mode !== 'bpmn') return null;
+    const parent = this.nodes.find((candidate) => candidate.id === parentId);
+    if (!parent || parent.type !== 'bpmn_service_task'
+      || !['bpmn_boundary_error', 'bpmn_boundary_escalation'].includes(type)) return null;
+    const template = this.templates.get(type);
+    const node = {
+      id: 'n_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6),
+      type, label: '', x: parent.x, y: parent.y, width: template?.width || 56, height: template?.height || 56,
+      config: { ...processNodeConfig(processNodeKind(type)), attachedToId: parentId,
+        ...(type === 'bpmn_boundary_error' ? { errorRef: ref } : { escalationRef: ref }) },
+    };
+    this._positionBoundary(node);
+    this.nodes.push(node);
+    this.render();
+    this._pushHistory();
+    this.onChange();
+    return node;
+  }
+
   _positionBoundary(node) {
     const parent = this.nodes.find((candidate) => candidate.id === node.config?.attachedToId);
     if (!parent || !['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity',
@@ -1552,7 +1576,13 @@ export class FlowCanvas {
       const repeatMarker = n.repeat?.StructuredLoop ? 'loop'
         : n.repeat?.MultiInstance?.mode === 'Sequential' ? 'sequential'
           : n.repeat?.MultiInstance?.mode === 'Parallel' ? 'parallel' : null;
+      const serviceKind = n.type === 'bpmn_service_task' ? processServiceKind(n.config) : null;
+      const showKind = serviceKind && (serviceKind !== 'flow' || !!n.config.flowId);
+      const kindIcon = { flow: 'flow', block: 'chip', tool: 'puzzle' }[serviceKind];
+      const warnings = processNodeWarnings(n);
       div.innerHTML = `
+        ${showKind ? `<span class="fb-process-kind" data-kind="${serviceKind}" role="img" title="${escapeAttr(I18n.t(`bpmn.kind_${serviceKind}`))}" aria-label="${escapeAttr(I18n.t(`bpmn.kind_${serviceKind}`))}"><svg aria-hidden="true"><use href="#i-${kindIcon}"/></svg></span>` : ''}
+        ${warnings.length ? `<span class="fb-process-warn" data-warning="${warnings.join(' ')}" role="img" title="${escapeAttr(warnings.map((key) => I18n.t(`bpmn.warning_${key}`)).join(' '))}" aria-label="${escapeAttr(warnings.map((key) => I18n.t(`bpmn.warning_${key}`)).join(' '))}"><svg aria-hidden="true"><use href="#i-alert"/></svg></span>` : ''}
         <div class="fb-process-symbol">${markerless ? '' : `<svg aria-hidden="true"><use href="#i-${escapeAttr(tmpl.icon)}"/></svg>`}
           ${event || gateway ? '' : `<span>${escapeHtml(title)}</span>`}
           ${repeatMarker ? `<i class="fb-repeat-marker fb-repeat-marker-${repeatMarker}" aria-hidden="true">${repeatMarker === 'loop' ? '↻' : ''}</i>` : ''}</div>

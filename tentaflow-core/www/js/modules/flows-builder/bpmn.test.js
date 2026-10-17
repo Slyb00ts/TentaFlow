@@ -27,7 +27,7 @@ const { emptyProcessModel, processToCanvas, canvasToProcess, cloneProcessBody, p
 const { FlowCanvas } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
-const { processTemplates, boundedNodeName, isBlankLabel } = await import('./bpmn.js');
+const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processNodeWarnings, processServiceKind } = await import('./bpmn.js');
 const { openProcessCalendar, openProcessInstance, openProcessInstances, openProcessMessageDetail, openProcessMessageSend, openProcessRun, openProcessSchedule, processEventText, processLifecycleReasonText, processTimerText } = await import('./process-monitor.js');
 const { simulationWindow } = await import('./process-simulation.js');
 const { default: builder } = await import('../flows-builder.js');
@@ -64,6 +64,12 @@ const click = (element) => { assert.ok(element, 'the actual control exists'); el
 const change = (control, value) => { control.value = value; control.dispatchEvent(new CustomEvent('change', { bubbles: true, detail: { value } })); };
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 const options = { assignees: [{ userId: 'anna', displayName: 'Anna Kowalska' }, { userId: 'lee', displayName: 'Lee Chen' }], serviceFlows: [{ flowId: 'flow-one', name: 'Contract checker' }] };
+// The server's allow-list; the inspector offers exactly these block types.
+const serviceBlocks = [
+  { nodeType: 'llm', label: 'Language model (LLM)', description: 'Generates text', category: 'service' },
+  { nodeType: 'embeddings', label: 'Embeddings', description: 'Embeds text', category: 'service' },
+  { nodeType: 'pii_filter', label: 'Personal data filter', description: 'Masks personal data', category: 'filter' },
+];
 function definition(id = 'definition-one', overrides = {}) {
   return { definitionId: id, name: `Process ${id}`, description: '', ownerUserId: 'owner', draftRevision: 4, model: emptyProcessModel(), publishedVersion: null, archived: false, ...overrides };
 }
@@ -98,7 +104,7 @@ function canvas(model = emptyProcessModel()) {
 }
 function inspector(graph, readOnly = false) {
   const root = document.createElement('aside'); document.body.append(root);
-  return new FlowConfig(root, { mode: 'bpmn', readOnly, processOptions: options, getCanvas: () => graph,
+  return new FlowConfig(root, { mode: 'bpmn', readOnly, processOptions: { ...options, serviceBlocks }, getCanvas: () => graph,
     onConfigChange: (id, value) => graph.updateNodeConfig(id, value), onEdgeChange: (id, value) => graph.updateEdge(id, value),
     onLabelChange: (id, value) => graph.updateNodeLabel(id, value), onDelete: (id) => graph.removeNodes([id]), onDuplicate: (id) => graph.duplicateNodes([id]) });
 }
@@ -425,7 +431,7 @@ test('BPMN canvas renders the official marker mapping for every supported templa
     graph.addNodeFromTemplate(processTemplates().find((template) => template.node_type === nodeType), 250, 300);
     const node = graph.nodes.at(-1);
     const element = graph.nodesLayer.querySelector(`[data-node-id="${node.id}"]`);
-    const use = element.querySelector('use');
+    const use = element.querySelector('.fb-process-symbol use');
     assert.equal(use?.getAttribute('href') ?? null, marker == null ? null : `#i-${marker}`, nodeType);
     if (nodeType === 'bpmn_start' || nodeType === 'bpmn_end') assert.equal(element.querySelector('.fb-process-symbol svg'), null, nodeType);
     graph.destroy();
@@ -1983,6 +1989,245 @@ test('service inspector configures a block from a valid template and reports inv
   assert.equal(node.config.implementation, 'Flow');
   assert.equal(config.root.querySelector('[data-process="blockType"]'), null);
   graph.destroy(); config.destroy(); readonly.destroy();
+});
+
+const taskNode = (id, config = {}, label = '') => ({ id, type: 'bpmn_service_task', label, config: { flowId: 'flow-one', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60, ...config } });
+const boundaryNode = (id, type, attachedToId, config = {}, label = '') => ({ id, type, label, config: { attachedToId, ...config } });
+const edge = (from, to) => ({ id: `${from}-${to}`, from_node: from, to_node: to });
+const routingGraph = (nodes, edges, extra = {}) => ({ nodes, edges, processModel: { errors: [], escalations: [], ...extra.model }, processPath: extra.path || [] });
+const outcomes = (routing) => routing.rows.map((row) => `${row.outcome}${row.code ? `:${row.code}` : ''}${row.other ? ':other' : ''}=${row.route}`);
+
+test('result routing: a task without a result source can only complete or end in an incident', () => {
+  const graph = routingGraph([taskNode('T'), { id: 'E', type: 'bpmn_end', label: 'Done', config: {} }], [edge('T', 'E')]);
+  const routing = processResultRouting(graph, 'T');
+  assert.deepEqual(outcomes(routing), ['completed=next', 'error=unavailable', 'needs_human=unavailable', 'cancelled=unavailable', 'platform=incident', 'timeout:SERVICE_TIMEOUT=incident']);
+  assert.equal(routing.rows[0].gate, 'human');
+  assert.deepEqual(routing.rows[0].targets.map((target) => target.id), ['E']);
+  assert.deepEqual(routing.warnings, []);
+  assert.equal(processResultRouting(graph, 'E'), null);
+  assert.equal(processResultRouting(graph, 'missing'), null);
+});
+
+test('result routing: a result source without boundary events falls back to incident and verification', () => {
+  const graph = routingGraph([taskNode('T', { resultExpression: '{}', verification: { Condition: { expression: 'true' } } }), { id: 'E', type: 'bpmn_end', config: {} }], [edge('T', 'E')]);
+  const routing = processResultRouting(graph, 'T');
+  assert.deepEqual(outcomes(routing), ['completed=next', 'rejected:VERIFICATION_FAILED=incident', 'error:other=incident', 'needs_human:other=review',
+    'cancelled:SERVICE_ERROR=incident', 'platform=incident', 'timeout:SERVICE_TIMEOUT=incident']);
+  assert.equal(routing.rows[0].gate, 'condition');
+  // Inside a sub-process an unhandled error continues to the enclosing scope.
+  const nested = processResultRouting(routingGraph(graph.nodes, graph.edges, { path: ['Sub'] }), 'T');
+  assert.equal(nested.rows.find((row) => row.outcome === 'error').route, 'parent');
+  assert.equal(nested.rows.find((row) => row.outcome === 'needs_human').route, 'review');
+});
+
+test('result routing: exact codes win over catch-all boundary events and every code gets a row', () => {
+  const model = { errors: [{ errorId: 'Err_A', name: 'A', errorCode: 'CODE_A' }, { errorId: 'Err_B', name: 'B', errorCode: 'CODE_B' }],
+    escalations: [{ escalationId: 'Esc_1', name: 'One', escalationCode: 'REVIEW' }] };
+  const graph = routingGraph([
+    taskNode('T', { resultExpression: '{}' }),
+    boundaryNode('BA', 'bpmn_boundary_error', 'T', { errorRef: 'Err_A' }, 'Handle A'),
+    boundaryNode('BB', 'bpmn_boundary_error', 'T', { errorRef: 'Err_B' }),
+    boundaryNode('BAll', 'bpmn_boundary_error', 'T', { errorRef: null }, 'Any error'),
+    boundaryNode('BE', 'bpmn_boundary_escalation', 'T', { escalationRef: null, cancelActivity: true }),
+    { id: 'X', type: 'bpmn_end', config: {} }, { id: 'Y', type: 'bpmn_end', config: {} },
+  ], [edge('T', 'X'), edge('BA', 'Y'), edge('BB', 'Y'), edge('BAll', 'Y'), edge('BE', 'Y')], { model });
+  const routing = processResultRouting(graph, 'T');
+  assert.deepEqual(outcomes(routing), ['completed=next', 'rejected:VERIFICATION_FAILED=incident'].slice(0, 1).concat([
+    'error:CODE_A=boundary', 'error:CODE_B=boundary', 'error:other=boundary', 'needs_human:other=boundary',
+    'cancelled:SERVICE_ERROR=incident', 'platform=incident', 'timeout:SERVICE_TIMEOUT=incident']));
+  assert.equal(routing.rows.find((row) => row.code === 'CODE_A').boundary.id, 'BA');
+  assert.equal(routing.rows.find((row) => row.outcome === 'error' && row.other).boundary.id, 'BAll');
+  assert.deepEqual(routing.warnings, []);
+  // Every code and the catch-all are taken, so there is nothing left to add.
+  assert.equal(routing.add.error, null);
+  assert.deepEqual(routing.add.escalation, { ref: 'Esc_1' });
+});
+
+test('result routing: an escalation by code replaces the verification task only for that code', () => {
+  const model = { escalations: [{ escalationId: 'Esc_1', name: 'One', escalationCode: 'REVIEW' }] };
+  const graph = routingGraph([taskNode('T', { resultExpression: '{}' }),
+    boundaryNode('BE', 'bpmn_boundary_escalation', 'T', { escalationRef: 'Esc_1' }), { id: 'X', type: 'bpmn_end', config: {} }],
+  [edge('T', 'X'), edge('BE', 'X')], { model });
+  const routing = processResultRouting(graph, 'T');
+  assert.deepEqual(routing.rows.filter((row) => row.outcome === 'needs_human').map((row) => `${row.code}:${row.route}`), ['REVIEW:boundary', 'null:review']);
+});
+
+test('result routing: timers run on their own clock and never replace the service timeout incident', () => {
+  const graph = routingGraph([taskNode('T', { timeoutSeconds: 30 }),
+    boundaryNode('TA', 'bpmn_boundary_timer', 'T', { cancelActivity: true, timer: { Duration: { seconds: 10 } } }, 'Soon'),
+    boundaryNode('TB', 'bpmn_boundary_timer', 'T', { cancelActivity: false, timer: { Duration: { seconds: 45 } } }, 'Late'),
+    { id: 'X', type: 'bpmn_end', config: {} }], [edge('T', 'X'), edge('TA', 'X'), edge('TB', 'X')]);
+  const routing = processResultRouting(graph, 'T');
+  assert.equal(routing.rows.find((row) => row.outcome === 'timeout').route, 'incident');
+  const timers = routing.rows.filter((row) => row.outcome === 'timer');
+  assert.deepEqual(timers.map((row) => [row.boundary.id, row.boundary.interrupting]), [['TA', true], ['TB', false]]);
+  assert.deepEqual(routing.warnings, [{ key: 'timer_after_timeout', name: 'Late' }]);
+});
+
+test('result routing warns about handlers that cannot work', () => {
+  const model = { errors: [{ errorId: 'Err_A', name: 'A', errorCode: 'CODE_A' }] };
+  const graph = routingGraph([taskNode('T'),
+    boundaryNode('B1', 'bpmn_boundary_error', 'T', { errorRef: 'Err_A' }, 'First'),
+    boundaryNode('B2', 'bpmn_boundary_error', 'T', { errorRef: 'Err_A' }, 'Second'),
+    boundaryNode('B3', 'bpmn_boundary_error', 'T', { errorRef: 'Err_Gone' }, 'Gone'),
+    boundaryNode('B4', 'bpmn_boundary_escalation', 'T', { escalationRef: null }, 'Esc')], [], { model });
+  const keys = processResultRouting(graph, 'T').warnings.map((warning) => `${warning.key}:${warning.name ?? ''}`);
+  assert.deepEqual(keys.sort(), ['boundary_no_flow:Esc', 'boundary_no_flow:First', 'boundary_no_flow:Gone', 'boundary_no_flow:Second',
+    'duplicate_handler:Second', 'error_boundary_without_result:', 'escalation_boundary_without_result:', 'no_outgoing:', 'undeclared_reference:Gone']);
+  // Without a result source an escalation cannot be added; an error handler still can.
+  const routing = processResultRouting(graph, 'T');
+  assert.equal(routing.add.escalation, null);
+});
+
+test('service inspector groups the task into tabs and keeps every control reachable', async () => {
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
+  const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
+  await flush(2);
+  const tabs = config.root.querySelector('[data-service-tabs]');
+  assert.deepEqual([...tabs.querySelectorAll('tf-tab')].map((tab) => tab.id), ['impl', 'io', 'result', 'time', 'advanced']);
+  const panelOf = (selector) => config.root.querySelector(selector).closest('[data-service-panel]').dataset.servicePanel;
+  assert.equal(panelOf('[data-process="flowId"]'), 'impl');
+  assert.equal(panelOf('[data-process="inputMapping"]'), 'io');
+  assert.equal(panelOf('[data-process="outputMapping"]'), 'io');
+  assert.equal(panelOf('[data-process="resultExpression"]'), 'result');
+  assert.equal(panelOf('[data-process="verification"]'), 'result');
+  assert.equal(panelOf('[data-process="timeoutSeconds"]'), 'time');
+  assert.equal(panelOf('[data-process="repeatMode"]'), 'advanced');
+  assert.equal(panelOf('[data-process="elementId"]'), 'advanced');
+  const visible = () => [...config.root.querySelectorAll('[data-service-panel]')].filter((panel) => !panel.hidden).map((panel) => panel.dataset.servicePanel);
+  assert.deepEqual(visible(), ['impl']);
+  tabs.dispatchEvent(new CustomEvent('change', { detail: { value: 'result' } }));
+  assert.deepEqual(visible(), ['result']);
+  // The same node shown again keeps its tab; another node starts on the first one.
+  config.show(node, graph.templates.get(node.type));
+  assert.deepEqual(visible(), ['result']);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 400, 300);
+  const other = graph.nodes.at(-1); config.show(other, graph.templates.get(other.type));
+  assert.deepEqual(visible(), ['impl']);
+  const hosts = 'tf-input, tf-textarea, tf-select, tf-keyvalue-editor, tf-table, tf-tabs, tf-button, tf-toggle, tf-person-picker, tf-alert';
+  const raw = [...config.root.querySelectorAll('button, input, select, textarea, table')].filter((element) => !element.closest(hosts));
+  assert.equal(raw.length, 0, 'the service inspector is built from tf-* components only');
+  graph.destroy(); config.destroy();
+});
+
+test('result tab shows the derived routing and its buttons add boundary events as one undo step', async () => {
+  const model = emptyProcessModel();
+  model.errors = [{ errorId: 'Err_A', name: 'A', errorCode: 'CODE_A' }];
+  const graph = canvas(model); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
+  const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
+  await flush(2);
+  config.root.querySelector('[data-service-tabs]').dispatchEvent(new CustomEvent('change', { detail: { value: 'result' } }));
+  const rows = () => config.root.querySelector('tf-table[data-routing]').rows;
+  assert.equal(rows().length, 6);
+  assert.match(rows()[1].route, /result source/);
+  // The escalation button needs a result source; the error button does not.
+  assert.ok(config.root.querySelector('[data-routing-add="escalation"]').hasAttribute('disabled'));
+  assert.equal(config.root.querySelector('[data-routing-add="error"]').hasAttribute('disabled'), false);
+  change(config.root.querySelector('[data-process="resultExpression"]'), '{}');
+  assert.equal(config.root.querySelector('[data-routing-add="escalation"]').hasAttribute('disabled'), false);
+  assert.equal(rows().length, 6);
+  assert.doesNotMatch(rows()[1].route, /result source/, 'the table follows the result source');
+  assert.match(rows()[2].route, /verification task/);
+  const history = graph.historyIndex; const count = graph.nodes.length;
+  click(config.root.querySelector('[data-routing-add="error"]'));
+  assert.equal(graph.nodes.length, count + 1);
+  assert.equal(graph.historyIndex, history + 1, 'one undo step');
+  const added = graph.nodes.at(-1);
+  assert.equal(added.type, 'bpmn_boundary_error');
+  assert.deepEqual([added.config.attachedToId, added.config.errorRef], [node.id, null]);
+  assert.ok(rows().some((row) => row.outcome === 'Any other error' && /Boundary event/.test(row.route)));
+  assert.ok(config.root.querySelector('[data-routing-warning="boundary_no_flow"]'), 'the new event has no flow yet');
+  // The catch-all is taken, so the next click attaches the declared code.
+  click(config.root.querySelector('[data-routing-add="error"]'));
+  assert.deepEqual(graph.nodes.at(-1).config.errorRef, 'Err_A');
+  assert.equal(config.root.querySelector('[data-routing-add="error"]').hasAttribute('disabled'), true);
+  click(config.root.querySelector('[data-routing-add="escalation"]'));
+  assert.equal(graph.nodes.at(-1).type, 'bpmn_boundary_escalation');
+  graph.undo();
+  assert.equal(graph.nodes.filter((candidate) => candidate.type === 'bpmn_boundary_escalation').length, 0);
+  assert.equal(graph.nodes.filter((candidate) => candidate.type === 'bpmn_boundary_error').length, 2);
+  const saved = canvasToProcess(graph.processModel, graph.nodes, graph.edges, () => []);
+  assert.equal(saved.nodes.filter((row) => row.kind.BoundaryError).length, 2);
+  const readonly = inspector(graph, true); readonly.show(node, graph.templates.get(node.type));
+  assert.equal(readonly.root.querySelector('[data-routing-add]'), null);
+  graph.destroy(); config.destroy(); readonly.destroy();
+});
+
+test('canvas marks the kind of a Service task and an LLM block without a model', async () => {
+  const graph = canvas();
+  const add = (preset, x, label = '') => { graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.node_type === 'bpmn_service_task'), preset, label }, x, 300); return graph.nodes.at(-1); };
+  const element = (node) => graph.nodesLayer.querySelector(`[data-node-id="${node.id}"]`);
+  const plain = add(undefined, 100);
+  const flow = add({ flowId: 'flow-one' }, 300);
+  const block = add({ implementation: { Block: { nodeType: 'llm', config: { model: '' } } } }, 500);
+  const pii = add({ implementation: { Block: { nodeType: 'pii_filter', config: {} } } }, 700);
+  const tool = add({ implementation: { AddonTool: { addonId: 'notes-1', toolName: 'search' } } }, 900);
+  assert.equal(element(plain).querySelector('.fb-process-kind'), null);
+  assert.deepEqual([flow, block, pii, tool].map((node) => element(node).querySelector('.fb-process-kind')?.dataset.kind), ['flow', 'block', 'block', 'tool']);
+  assert.equal(element(flow).querySelector('.fb-process-kind').getAttribute('aria-label'), I18n.t('bpmn.kind_flow'));
+  assert.equal(element(block).querySelector('.fb-process-warn')?.getAttribute('data-warning'), 'empty_model');
+  assert.equal(element(block).querySelector('.fb-process-warn').getAttribute('aria-label'), I18n.t('bpmn.warning_empty_model'));
+  for (const node of [plain, flow, pii, tool]) assert.equal(element(node).querySelector('.fb-process-warn'), null);
+  const config = inspector(graph); config.show(block, graph.templates.get(block.type));
+  await flush(2);
+  const alert = config.root.querySelector('[data-service-warning="empty_model"]');
+  assert.equal(alert.hidden, false);
+  change(config.root.querySelector('[data-process="blockConfig"]'), '{"model":"m"}');
+  assert.equal(alert.hidden, true);
+  assert.equal(element(block).querySelector('.fb-process-warn'), null, 'the node follows the setting');
+  change(config.root.querySelector('[data-process="blockConfig"]'), '{"model":"  "}');
+  assert.equal(alert.hidden, false);
+  assert.deepEqual(processNodeWarnings(block), ['empty_model']);
+  assert.equal(processServiceKind(tool.config), 'tool');
+  graph.destroy(); config.destroy();
+});
+
+test('a new Call activity says it needs an exact version instead of failing at save', async () => {
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_call_activity'), 200, 200);
+  const node = graph.nodes.at(-1);
+  assert.deepEqual(processNodeWarnings(node), ['call_version']);
+  assert.equal(graph.nodesLayer.querySelector(`[data-node-id="${node.id}"] .fb-process-warn`).getAttribute('data-warning'), 'call_version');
+  const config = inspector(graph); config.show(node, graph.templates.get(node.type));
+  await flush(2);
+  const alert = config.root.querySelector('[data-call-version-warning]');
+  assert.equal(alert.hidden, false);
+  assert.equal(alert.getAttribute('message'), I18n.t('bpmn.warning_call_version'));
+  graph.updateNodeConfig(node.id, { calledDefinitionId: '8d0e1c0e-0000-4000-8000-000000000001', calledVersion: 2,
+    calledElement: { namespaceUri: 'urn:x', processId: 'P' } });
+  assert.deepEqual(processNodeWarnings(node), []);
+  config.show(node, graph.templates.get(node.type));
+  assert.equal(config.root.querySelector('[data-call-version-warning]').hidden, true);
+  // A local body needs no version at all.
+  graph.updateNodeConfig(node.id, { localBody: { namespaceUri: 'urn:x', processId: '' } });
+  assert.deepEqual(processNodeWarnings(node), []);
+  graph.destroy(); config.destroy();
+});
+
+test('service inspector offers the block types the server lists, not a built-in list', async () => {
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
+  const node = graph.nodes.at(-1);
+  const mountWith = async (blocks) => {
+    const root = document.createElement('aside'); document.body.append(root);
+    const config = new FlowConfig(root, { mode: 'bpmn', processOptions: { ...options, serviceBlocks: blocks }, getCanvas: () => graph,
+      onConfigChange: (id, value) => graph.updateNodeConfig(id, value), onEdgeChange: () => {}, onLabelChange: () => {}, onDelete: () => {}, onDuplicate: () => {} });
+    config.show(node, graph.templates.get(node.type));
+    await flush(2);
+    return config;
+  };
+  const none = await mountWith([]);
+  assert.deepEqual([...none.root.querySelectorAll('[data-process="implementation"] option')].map((option) => option.value), ['flow', 'tool']);
+  change(none.root.querySelector('[data-process="implementation"]'), 'block');
+  assert.equal(node.config.implementation?.Block, undefined, 'no block can be chosen when the server lists none');
+  const only = await mountWith([{ nodeType: 'pii_filter', label: 'Personal data filter', description: '', category: 'filter' }]);
+  change(only.root.querySelector('[data-process="implementation"]'), 'block');
+  await flush(2);
+  assert.deepEqual(node.config.implementation, { Block: { nodeType: 'pii_filter', config: {} } });
+  assert.deepEqual([...only.root.querySelectorAll('[data-process="blockType"] option')].map((option) => option.value), ['pii_filter']);
+  // A saved block the server no longer lists stays visible, disabled.
+  const stale = await mountWith([{ nodeType: 'llm', label: 'Language model (LLM)', description: '', category: 'service' }]);
+  const staleOption = stale.root.querySelector('[data-process="blockType"] option[value="pii_filter"]');
+  assert.ok(staleOption?.hasAttribute('disabled'));
+  graph.destroy(); none.destroy(); only.destroy(); stale.destroy();
 });
 
 test('choosing a block keeps a payload mapping the author already wrote', async () => {

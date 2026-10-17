@@ -17,13 +17,10 @@ import '/js/components/tf-select.js';
 import '/js/components/tf-keyvalue-editor.js';
 import '/js/components/tf-person-picker.js';
 import '/js/components/tf-tabs.js';
-import { processNodeKind, processBoundaryKind, processBody, processBlockTemplate } from './bpmn.js';
+import '/js/components/tf-table.js';
+import '/js/components/tf-alert.js';
+import { processNodeKind, processBoundaryKind, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processResultRouting } from './bpmn.js';
 import { openProcessCallPreview } from './process-monitor.js';
-
-// Blocks a BPMN Service task may run on its own. The server allow-list is the
-// authority (it validates on save and again at publication); this list only
-// decides what the inspector offers until the process options carry it.
-const PROCESS_BLOCK_TYPES = ['llm', 'embeddings', 'pii_filter'];
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
 // these from `node.config`; an empty value means "use the built-in default".
@@ -270,6 +267,8 @@ export class FlowConfig {
     this.node = null;
     this.template = null;
     this.activeTab = 'config';
+    this.processTab = 'impl';
+    this.processTabNode = null;
     this.readOnly = !!opts.readOnly;
     this.mode = opts.mode || 'flow';
     this.root.classList.add('fb-config');
@@ -283,6 +282,10 @@ export class FlowConfig {
     this.template = template;
     this.activeTab = 'config';
     if (!node) { this.renderEmpty(); return; }
+    // A re-show of the same node (a declaration changed, the view became
+    // read-only) keeps the tab the author was on.
+    if (node.id !== this.processTabNode) this.processTab = 'impl';
+    this.processTabNode = node.id;
     if (this.mode === 'bpmn') this._renderProcess();
     else this._render();
   }
@@ -619,6 +622,9 @@ export class FlowConfig {
         : target && graph.processPath.length ? 'bpmn.boundary_child_local_hint' : null;
       return `<tf-select data-process="attachedToId" wrap-selected label="${escapeAttr(I18n.t('bpmn.boundary_attach'))}" value="${escapeAttr(config.attachedToId || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.boundary_choose_activity'))}</option>${activities.map((candidate) => `<option value="${escapeAttr(candidate.id)}">${escapeHtml(candidate.label || getNodeName(candidate.type))} · ${escapeHtml(candidate.id)}</option>`).join('')}${config.attachedToId && !target ? `<option value="${escapeAttr(config.attachedToId)}" disabled>${escapeHtml(config.attachedToId)}</option>` : ''}</tf-select><p class="fb-field-hint" data-boundary-target>${escapeHtml(target ? (target.label || getNodeName(target.type)) : I18n.t(config.attachedToId ? 'bpmn.boundary_unavailable' : 'bpmn.boundary_required'))}</p>${scopeHint ? `<p class="fb-field-hint" data-boundary-scope>${escapeHtml(I18n.t(scopeHint))}</p>` : ''}`;
     };
+    let servicePanels = '';
+    let servicePanel = null;
+    let serviceRouting = null;
     let fields = `<tf-textarea data-process="name" label="${escapeAttr(I18n.t('bpmn.element_name'))}" value="${escapeAttr(node.label || '')}" autogrow rows="1" ${disabled}></tf-textarea>`;
     if (kind === 'UserTask' || kind === 'ManualTask') {
       const available = !config.assigneeUserId || this.opts.processOptions.assignees.some((user) => user.userId === config.assigneeUserId);
@@ -634,33 +640,43 @@ export class FlowConfig {
           : mapping('outputMapping', 'output_mapping')}`;
     } else if (kind === 'ServiceTask') {
       const flows = this.opts.processOptions.serviceFlows;
+      const blocks = this.opts.processOptions.serviceBlocks || [];
       const options = `<option value="">${escapeHtml(I18n.t('bpmn.choose_flow'))}</option>` + flows.map((flow) => `<option value="${escapeAttr(flow.flowId)}">${escapeHtml(flow.name)}</option>`).join('');
       const unavailable = config.flowId && !flows.some((flow) => flow.flowId === config.flowId);
       const tool = config.implementation?.AddonTool;
       const blockTask = config.implementation?.Block;
       const source = blockTask
-        ? `<tf-select data-process="blockType" label="${escapeAttr(I18n.t('bpmn.block_type'))}" value="${escapeAttr(blockTask.nodeType)}" ${disabled}>${PROCESS_BLOCK_TYPES.map((type) => `<option value="${type}">${escapeHtml(I18n.t(`bpmn.block_${type}`))}</option>`).join('')}${PROCESS_BLOCK_TYPES.includes(blockTask.nodeType) ? '' : `<option value="${escapeAttr(blockTask.nodeType)}" disabled>${escapeHtml(blockTask.nodeType)}</option>`}</tf-select>
+        ? `<tf-select data-process="blockType" label="${escapeAttr(I18n.t('bpmn.block_type'))}" value="${escapeAttr(blockTask.nodeType)}" ${disabled}>${blocks.map((block) => `<option value="${escapeAttr(block.nodeType)}">${escapeHtml(processBlockLabel(block))}</option>`).join('')}${blocks.some((block) => block.nodeType === blockTask.nodeType) ? '' : `<option value="${escapeAttr(blockTask.nodeType)}" disabled>${escapeHtml(blockTask.nodeType)}</option>`}</tf-select>
         ${textarea('blockConfig', 'block_config', JSON.stringify(blockTask.config, null, 2), 5)}
+        <tf-alert tone="warning" data-service-warning="empty_model" message="${escapeAttr(I18n.t('bpmn.warning_empty_model'))}" ${processNodeWarnings(node).includes('empty_model') ? '' : 'hidden'}></tf-alert>
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.block_hint'))}</p>`
         : tool
         ? `${input('addonId', 'tool_addon_id', tool.addonId)}${input('toolName', 'tool_name', tool.toolName)}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.tool_hint'))}</p>`
         : `<tf-select data-process="flowId" wrap-selected label="${escapeAttr(I18n.t('bpmn.service_flow'))}" value="${escapeAttr(config.flowId)}" ${disabled}>${options}${unavailable ? `<option value="${escapeAttr(config.flowId)}" disabled>${escapeHtml(I18n.t('bpmn.flow_unavailable'))}</option>` : ''}</tf-select>`;
-      fields += `<tf-select data-process="implementation" label="${escapeAttr(I18n.t('bpmn.service_implementation'))}" value="${blockTask ? 'block' : tool ? 'tool' : 'flow'}" ${disabled}>
+      const routing = processResultRouting(this.opts.getCanvas(), node.id);
+      const tabs = [['impl', 'tab_implementation'], ['io', 'tab_io'], ['result', 'tab_result'], ['time', 'tab_time'], ['advanced', 'tab_advanced']];
+      if (!tabs.some(([id]) => id === this.processTab)) this.processTab = 'impl';
+      const panel = servicePanel = (id, html) => `<section class="fb-process-panel" data-service-panel="${id}" ${this.processTab === id ? '' : 'hidden'}>${html}</section>`;
+      servicePanels = `<tf-tabs class="fb-config-tabs" variant="underline" value="${this.processTab}" data-service-tabs>${tabs.map(([id, label]) => `<tf-tab id="${id}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}"></tf-tab>`).join('')}</tf-tabs>`
+        + panel('impl', `<tf-select data-process="implementation" label="${escapeAttr(I18n.t('bpmn.service_implementation'))}" value="${blockTask ? 'block' : tool ? 'tool' : 'flow'}" ${disabled}>
           <option value="flow">${escapeHtml(I18n.t('bpmn.implementation_flow'))}</option>
           <option value="tool">${escapeHtml(I18n.t('bpmn.implementation_tool'))}</option>
-          <option value="block">${escapeHtml(I18n.t('bpmn.implementation_block'))}</option>
+          ${blocks.length || blockTask ? `<option value="block">${escapeHtml(I18n.t('bpmn.implementation_block'))}</option>` : ''}
         </tf-select>
-        ${source}
-        ${mapping('inputMapping', 'input_mapping')}${mapping('outputMapping', 'output_mapping')}
-        ${textarea('resultExpression', 'result_expression', config.resultExpression || '', 4)}
+        ${source}`)
+        + panel('io', `${mapping('inputMapping', 'input_mapping')}${mapping('outputMapping', 'output_mapping')}${this._renderActivityIo(node, kind, disabled)}`)
+        + panel('result', `${textarea('resultExpression', 'result_expression', config.resultExpression || '', 4)}
         <tf-select data-process="verification" label="${escapeAttr(I18n.t('bpmn.verification'))}" value="${typeof config.verification === 'string' ? 'Human' : 'Condition'}" ${disabled}>
           <option value="Human">${escapeHtml(I18n.t('bpmn.verification_human'))}</option>
           <option value="Condition">${escapeHtml(I18n.t('bpmn.verification_condition'))}</option>
         </tf-select>
         <div data-process-condition ${typeof config.verification === 'string' ? 'hidden' : ''}>${input('expression', 'verification_expression', config.verification?.Condition?.expression)}</div>
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_hint'))}</p>
-        ${input('timeoutSeconds', 'timeout', config.timeoutSeconds, 'type="number" min="1" max="600" step="1"')}`;
+        <div data-routing-view></div>`)
+        + panel('time', `${input('timeoutSeconds', 'timeout', config.timeoutSeconds, 'type="number" min="1" max="600" step="1"')}
+        <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.timeout_hint'))}</p>`);
+      serviceRouting = routing;
     } else if (kind === 'ScriptTask') {
       fields += `${textarea('script', 'script_body', config.script, 3)}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.script_task_hint'))}</p>
@@ -722,6 +738,7 @@ export class FlowConfig {
           ${published?.calledElement?.processId ? `<option value="${escapeAttr(published.calledElement.processId)}">${escapeHtml(published.calledElement.processId)}</option>` : ''}
         </tf-select>
         ${this.readOnly ? '' : `<tf-button variant="secondary" data-load-call-versions ${local ? 'hidden' : ''}>${escapeHtml(I18n.t('bpmn.call_load_versions'))}</tf-button>`}
+        <tf-alert tone="warning" data-call-version-warning message="${escapeAttr(I18n.t('bpmn.warning_call_version'))}" ${processNodeWarnings(node).includes('call_version') ? '' : 'hidden'}></tf-alert>
         <tf-textarea readonly autogrow rows="2" data-process="calledElement" label="${escapeAttr(I18n.t('bpmn.call_qname'))}" value="${escapeAttr(target.namespaceUri && target.processId ? `${target.namespaceUri} · ${target.processId}` : '')}"></tf-textarea>
         <p class="fb-field-hint" data-call-capability>${escapeHtml(I18n.t('bpmn.call_exact_hint'))}</p>
         <tf-button variant="secondary" data-preview-called ${published?.definitionId && published?.version && !local ? '' : 'disabled'} ${local ? 'hidden' : ''}>${escapeHtml(I18n.t('bpmn.call_preview'))}</tf-button>
@@ -787,7 +804,8 @@ export class FlowConfig {
     } else {
       fields += `<p class="fb-field-hint">${escapeHtml(getNodeName(node.type))}: ${escapeHtml(I18n.t(`bpmn.node_${node.type.slice(5)}_hint`))}</p>`;
     }
-    fields += this._renderActivityIo(node, kind, disabled);
+    if (kind !== 'ServiceTask') fields += this._renderActivityIo(node, kind, disabled);
+    let repeatHtml = '';
     if (['UserTask', 'ServiceTask', 'ScriptTask', 'ManualTask', 'SendTask', 'ReceiveTask', 'SubProcess', 'CallActivity'].includes(kind)) {
       const repeat = node.repeat;
       const mode = repeat?.MultiInstance
@@ -795,12 +813,12 @@ export class FlowConfig {
       const output = repeat?.MultiInstance?.outputCollectionVariable
         ?? repeat?.StructuredLoop?.outputCollectionVariable ?? '';
       const variables = Object.keys(processBody(model, this.opts.getCanvas().processPath).variables);
-      fields += `<section class="fb-repeat-fields" data-repeat-fields>
+      repeatHtml += `<section class="fb-repeat-fields" data-repeat-fields>
         <tf-select data-process="repeatMode" label="${escapeAttr(I18n.t('bpmn.repeat_mode'))}" value="${mode}" ${disabled}>
           ${['off', 'mi_sequential', 'mi_parallel', 'loop'].map((value) => `<option value="${value}">${escapeHtml(I18n.t(`bpmn.repeat_${value}`))}</option>`).join('')}
         </tf-select>`;
       if (repeat) {
-        fields += `<tf-select data-process="repeatOutput" wrap-selected label="${escapeAttr(I18n.t('bpmn.repeat_output'))}" value="${escapeAttr(output)}" ${disabled}>
+        repeatHtml += `<tf-select data-process="repeatOutput" wrap-selected label="${escapeAttr(I18n.t('bpmn.repeat_output'))}" value="${escapeAttr(output)}" ${disabled}>
           <option value="">${escapeHtml(I18n.t('bpmn.repeat_choose_output'))}</option>
           ${variables.map((name) => `<option value="${escapeAttr(name)}">${escapeHtml(name)}</option>`).join('')}
         </tf-select>`;
@@ -808,14 +826,14 @@ export class FlowConfig {
       if (repeat?.MultiInstance) {
         const repeatInput = repeat.MultiInstance.input;
         const source = repeatInput.Cardinality ? 'cardinality' : 'collection';
-        fields += `<tf-select data-process="repeatInputMode" label="${escapeAttr(I18n.t('bpmn.repeat_input'))}" value="${source}" ${disabled}>
+        repeatHtml += `<tf-select data-process="repeatInputMode" label="${escapeAttr(I18n.t('bpmn.repeat_input'))}" value="${source}" ${disabled}>
           <option value="cardinality">${escapeHtml(I18n.t('bpmn.repeat_cardinality'))}</option>
           <option value="collection">${escapeHtml(I18n.t('bpmn.repeat_collection'))}</option>
         </tf-select>${source === 'cardinality'
     ? input('repeatCount', 'repeat_count', repeatInput.Cardinality.count, 'type="number" min="0" max="16" step="1"')
     : textarea('repeatCollection', 'repeat_collection_expression', repeatInput.CollectionExpression.expression, 4)}`;
       } else if (repeat?.StructuredLoop) {
-        fields += `${textarea('repeatCondition', 'repeat_condition', repeat.StructuredLoop.condition, 4)}
+        repeatHtml += `${textarea('repeatCondition', 'repeat_condition', repeat.StructuredLoop.condition, 4)}
           <tf-toggle data-process="repeatTestBefore" label="${escapeAttr(I18n.t('bpmn.repeat_test_before'))}" ${repeat.StructuredLoop.testBefore ? 'checked' : ''} ${disabled}></tf-toggle>
           ${input('repeatMaximum', 'repeat_maximum', repeat.StructuredLoop.maxIterations, 'type="number" min="1" max="32" step="1"')}`;
       }
@@ -823,16 +841,20 @@ export class FlowConfig {
         SubProcess: 'subprocess', CallActivity: 'call' })[kind];
       const repeatHint = kind === 'ScriptTask' ? (mode === 'loop' ? 'repeat_script_loop_meaning' : 'repeat_script_mi_meaning')
         : repeatMeaning ? `repeat_${repeatMeaning}_meaning` : 'repeat_hint';
-      fields += `<p class="fb-field-hint">${escapeHtml(I18n.t(`bpmn.${repeatHint}`))}</p></section>`;
+      repeatHtml += `<p class="fb-field-hint">${escapeHtml(I18n.t(`bpmn.${repeatHint}`))}</p></section>`;
     }
     const canvas = this.opts.getCanvas();
     const outgoing = canvas.edges.filter((edge) => edge.from_node === node.id);
-    if (outgoing.length) fields += `<tf-select data-process="editSequence" label="${escapeAttr(I18n.t('bpmn.edit_sequence'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_sequence'))}</option>${outgoing.map((edge) => {
+    let sequenceHtml = '';
+    if (outgoing.length) sequenceHtml += `<tf-select data-process="editSequence" label="${escapeAttr(I18n.t('bpmn.edit_sequence'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_sequence'))}</option>${outgoing.map((edge) => {
       const target = canvas.nodes.find((candidate) => candidate.id === edge.to_node);
       return `<option value="${escapeAttr(edge.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`;
     }).join('')}</tf-select>`;
-    if (!['End', 'ErrorEnd', 'TerminateEnd'].includes(kind) && !this.readOnly) fields += `<div class="fb-process-connect"><tf-select data-connect label="${escapeAttr(I18n.t('bpmn.connect_to'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_element'))}</option>${canvas.nodes.filter((target) => target.id !== node.id && !['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(target.type) && !processBoundaryKind(target.type)).map((target) => `<option value="${escapeAttr(target.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`).join('')}</tf-select><tf-button variant="secondary" data-connect-add disabled>${escapeHtml(I18n.t('bpmn.add_sequence'))}</tf-button></div>`;
-    fields += `<tf-textarea data-process="elementId" readonly autogrow rows="2" label="${escapeAttr(I18n.t('bpmn.element_id'))}" value="${escapeAttr(node.id)}"></tf-textarea>`;
+    if (!['End', 'ErrorEnd', 'TerminateEnd'].includes(kind) && !this.readOnly) sequenceHtml += `<div class="fb-process-connect"><tf-select data-connect label="${escapeAttr(I18n.t('bpmn.connect_to'))}"><option value="">${escapeHtml(I18n.t('bpmn.choose_element'))}</option>${canvas.nodes.filter((target) => target.id !== node.id && !['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start'].includes(target.type) && !processBoundaryKind(target.type)).map((target) => `<option value="${escapeAttr(target.id)}">${escapeHtml(target.label || getNodeName(target.type))}</option>`).join('')}</tf-select><tf-button variant="secondary" data-connect-add disabled>${escapeHtml(I18n.t('bpmn.add_sequence'))}</tf-button></div>`;
+    const elementIdHtml = `<tf-textarea data-process="elementId" readonly autogrow rows="2" label="${escapeAttr(I18n.t('bpmn.element_id'))}" value="${escapeAttr(node.id)}"></tf-textarea>`;
+    fields += kind === 'ServiceTask'
+      ? `${servicePanels}${servicePanel('advanced', repeatHtml + elementIdHtml)}${sequenceHtml}`
+      : `${repeatHtml}${sequenceHtml}${elementIdHtml}`;
     this.root.innerHTML = `<div class="fb-config-header"><div class="fb-config-title-wrap"><div class="fb-config-title">${escapeHtml(getNodeDisplayTitle(node, this.template))}</div><div class="fb-config-subtitle">${escapeHtml(getNodeName(node.type))}</div></div></div>
       <div class="fb-config-body fb-process-fields">${fields}<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.mapping_hint'))}</p></div>
       ${this.readOnly ? '' : `<footer class="fb-config-footer"><tf-button variant="secondary" icon="copy" data-process="duplicate">${escapeHtml(I18n.t('flows_config.duplicate'))}</tf-button><tf-button variant="danger" icon="trash" data-process="delete">${escapeHtml(I18n.t('flows_config.delete'))}</tf-button></footer>`}`;
@@ -842,6 +864,7 @@ export class FlowConfig {
     })), repeatModeChoice.getAttribute('value'));
     this.root.querySelectorAll('tf-keyvalue-editor').forEach((editor) => { editor.value = config[editor.dataset.process]; });
     this._bindActivityIo(node);
+    if (serviceRouting) this._bindServiceTabs(node);
     this.root.querySelector('[data-process-enter]')?.addEventListener('click', () => this.opts.onEnterProcess?.(node.id));
     const loadTargets = this.root.querySelector('[data-load-targets]');
     if (loadTargets) {
@@ -930,6 +953,8 @@ export class FlowConfig {
       const processChoice = this.root.querySelector('[data-process="calledProcessChoice"]');
       const capability = this.root.querySelector('[data-call-capability]');
       const preview = this.root.querySelector('[data-preview-called]');
+      const versionWarning = this.root.querySelector('[data-call-version-warning]');
+      const syncVersionWarning = () => { versionWarning.hidden = !processNodeWarnings(node).includes('call_version'); };
       const definitions = [{ value: '', label: I18n.t('bpmn.call_choose_definition') }];
       const published = node.config.localBody ? null : node.config;
       if (published?.calledDefinitionId) definitions.push({ value: published.calledDefinitionId, label: published.calledDefinitionId });
@@ -967,6 +992,7 @@ export class FlowConfig {
         loadVersions.hidden = !calledDefinitionId;
         this.opts.onConfigChange(node.id, { calledDefinitionId, calledVersion: 0,
           calledElement: { namespaceUri: '', processId: '' } });
+        syncVersionWarning();
         this.root.querySelector('[data-process="calledElement"]').value = '';
         capability.textContent = calledDefinitionId ? I18n.t('bpmn.call_choose_version') : I18n.t('bpmn.call_exact_hint');
       });
@@ -997,6 +1023,7 @@ export class FlowConfig {
           processChoice.setOptions([{ value: '', label: I18n.t('bpmn.call_choose_body') }], '');
           this.opts.onConfigChange(node.id, { calledDefinitionId: callChoice.value,
             calledVersion: 0, calledElement: { namespaceUri: '', processId: '' } });
+          syncVersionWarning();
           this.root.querySelector('[data-process="calledElement"]').value = '';
           capability.textContent = I18n.t('bpmn.call_choose_version');
           return;
@@ -1014,6 +1041,7 @@ export class FlowConfig {
             ...bodies.map((body) => ({ value: body.processId, label: body.processName || body.processId }))], '');
           this.opts.onConfigChange(node.id, { calledDefinitionId: definitionId,
             calledVersion: version, calledElement });
+          syncVersionWarning();
           this.root.querySelector('[data-process="calledElement"]').value = '';
           capability.textContent = I18n.t('bpmn.call_choose_body');
         } catch (error) { if (request === generation && this.root.contains(capability)) capability.textContent = error.message; }
@@ -1146,10 +1174,12 @@ export class FlowConfig {
         return;
       } else if (key === 'implementation') {
         // A Flow task never carries the field on the wire; 'Flow' is how the form says "back to default".
+        const firstBlock = (this.opts.processOptions.serviceBlocks || [])[0]?.nodeType;
+        if (control.value === 'block' && !firstBlock) return;
         this.opts.onConfigChange(node.id, control.value === 'tool'
           ? { flowId: '', implementation: { AddonTool: { addonId: '', toolName: '' } } }
           : control.value === 'block'
-            ? { flowId: '', implementation: { Block: { nodeType: PROCESS_BLOCK_TYPES[0], config: processBlockTemplate(PROCESS_BLOCK_TYPES[0]) } },
+            ? { flowId: '', implementation: { Block: { nodeType: firstBlock, config: processBlockTemplate(firstBlock) } },
               inputMapping: { ...node.config.inputMapping, payload: node.config.inputMapping?.payload ?? 'vars.text' } }
             : { implementation: 'Flow' });
         this._renderProcess();
@@ -1166,6 +1196,8 @@ export class FlowConfig {
         if (valid) {
           this.opts.onConfigChange(node.id, { implementation: { Block: {
             ...node.config.implementation.Block, config: parsed } } });
+          const warning = this.root.querySelector('[data-service-warning="empty_model"]');
+          if (warning) warning.hidden = !processNodeWarnings(node).includes('empty_model');
         }
       } else if (key === 'addonId' || key === 'toolName') {
         this.opts.onConfigChange(node.id, { implementation: { AddonTool: {
@@ -1175,6 +1207,7 @@ export class FlowConfig {
         if (key === 'defaultFlowId' && kind === 'InclusiveGateway' && control.value) this.opts.onEdgeChange(control.value, { condition: null });
         this.opts.onConfigChange(node.id, { [key]: key === 'timeoutSeconds' || key === 'ttlSeconds' ? Number(control.value) : (control.value || (key === 'assigneeUserId' || key === 'defaultFlowId' ? null : '')) });
       }
+      if (serviceRouting && ['resultExpression', 'verification', 'expression', 'timeoutSeconds'].includes(key)) this._renderRouting(node);
       if (key === 'assigneeUserId') this.root.querySelector('[data-assignee-hint]').textContent = I18n.t(kind === 'ManualTask'
         ? (control.value ? 'bpmn.manual_assignee_hint' : 'bpmn.manual_initiator_hint')
         : (control.value ? 'bpmn.assignee_hint' : 'bpmn.initiator'));
@@ -1191,6 +1224,80 @@ export class FlowConfig {
     });
     this.root.querySelector('[data-process="delete"]')?.addEventListener('click', () => { this.opts.onDelete(node.id); this.renderEmpty(); });
     this.root.querySelector('[data-process="duplicate"]')?.addEventListener('click', () => this.opts.onDuplicate(node.id));
+  }
+
+  _bindServiceTabs(node) {
+    const tabs = this.root.querySelector('[data-service-tabs]');
+    tabs.addEventListener('change', (event) => {
+      if (event.target !== tabs) return;
+      this.processTab = event.detail.value;
+      this.root.querySelectorAll('[data-service-panel]').forEach((panel) => {
+        panel.hidden = panel.dataset.servicePanel !== this.processTab;
+      });
+      if (this.processTab === 'result') this._renderRouting(node);
+    });
+    this._renderRouting(node);
+  }
+
+  // The "what happens" table is derived from the live graph on every call, so
+  // a boundary event added or removed elsewhere is never shown stale.
+  _renderRouting(node) {
+    const host = this.root.querySelector('[data-routing-view]');
+    if (!host) return;
+    const routing = processResultRouting(this.opts.getCanvas(), node.id);
+    const name = (entry) => entry.label || getNodeName(entry.type);
+    const targets = (list) => (list.length ? list.map(name).join(', ') : I18n.t('bpmn.routing_no_flow'));
+    const outcomeText = (row) => {
+      if (row.outcome === 'timeout') return I18n.t('bpmn.routing_outcome_timeout', { seconds: row.seconds });
+      if (row.outcome === 'error' || row.outcome === 'needs_human') {
+        if (row.other) return I18n.t(`bpmn.routing_outcome_${row.outcome}_other`);
+        return I18n.t(`bpmn.routing_outcome_${row.outcome}_code`, { code: row.code ?? '' });
+      }
+      return I18n.t(`bpmn.routing_outcome_${row.outcome}`);
+    };
+    const timerText = (timer) => {
+      const [kind] = Object.keys(timer || {});
+      const value = timer?.[kind];
+      if (kind === 'Duration' || kind === 'WorkingDuration') return I18n.t('bpmn.routing_timer_seconds', { seconds: value.seconds });
+      if (kind === 'Date') return value.at || I18n.t('bpmn.routing_timer_unset');
+      return kind ? I18n.t(`bpmn.timer_type_${kind.toLowerCase()}`) : I18n.t('bpmn.routing_timer_unset');
+    };
+    const routeText = (row) => {
+      if (row.route === 'next') return I18n.t(`bpmn.routing_next_${row.gate}`, { targets: targets(row.targets) });
+      if (row.route === 'boundary' && row.outcome === 'timer') {
+        return I18n.t(row.boundary.interrupting ? 'bpmn.routing_timer_interrupting' : 'bpmn.routing_timer_parallel',
+          { when: timerText(row.timer), name: name(row.boundary), targets: targets(row.targets) });
+      }
+      if (row.route === 'boundary') return I18n.t('bpmn.routing_boundary', { name: name(row.boundary), targets: targets(row.targets) });
+      if (row.route === 'incident') {
+        if (row.outcome === 'error' || row.outcome === 'cancelled') return I18n.t('bpmn.routing_incident_result');
+        if (row.outcome === 'platform') return I18n.t('bpmn.routing_incident_platform');
+        if (row.outcome === 'timeout') return I18n.t('bpmn.routing_incident_timeout');
+        return I18n.t('bpmn.routing_incident', { code: row.code });
+      }
+      return I18n.t(`bpmn.routing_${row.route}`);
+    };
+    const warningText = (warning) => I18n.t(`bpmn.routing_warning_${warning.key}`, { name: warning.name ?? '' });
+    host.innerHTML = `<div class="fb-label">${escapeHtml(I18n.t('bpmn.routing_title'))}</div>
+      <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.routing_hint'))}</p>
+      <tf-table data-routing density="compact">
+        <tf-column key="outcome" label="${escapeAttr(I18n.t('bpmn.routing_column_outcome'))}" width="38%"></tf-column>
+        <tf-column key="route" label="${escapeAttr(I18n.t('bpmn.routing_column_route'))}" fill></tf-column>
+      </tf-table>
+      <div class="fb-routing-warnings" data-routing-warnings>${routing.warnings.map((warning) => `<tf-alert tone="warning" data-routing-warning="${warning.key}" message="${escapeAttr(warningText(warning))}"></tf-alert>`).join('')}</div>
+      ${this.readOnly ? '' : `<div class="fb-routing-actions">
+        <tf-button variant="secondary" size="sm" data-routing-add="error" ${routing.add.error ? '' : 'disabled'}>${escapeHtml(I18n.t('bpmn.routing_add_error'))}</tf-button>
+        <tf-button variant="secondary" size="sm" data-routing-add="escalation" ${routing.add.escalation ? '' : 'disabled'}>${escapeHtml(I18n.t('bpmn.routing_add_escalation'))}</tf-button>
+      </div>
+      <p class="fb-field-hint">${escapeHtml(I18n.t(routing.hasResult ? 'bpmn.routing_add_hint' : 'bpmn.routing_add_hint_no_result'))}</p>`}`;
+    host.querySelector('tf-table').rows = routing.rows.map((row) => ({ outcome: outcomeText(row), route: routeText(row) }));
+    host.querySelectorAll('[data-routing-add]').forEach((button) => button.addEventListener('click', () => {
+      const kind = button.dataset.routingAdd;
+      const next = processResultRouting(this.opts.getCanvas(), node.id).add[kind];
+      if (this.readOnly || !next) return;
+      this.opts.getCanvas().addBoundaryNode(node.id, kind === 'error' ? 'bpmn_boundary_error' : 'bpmn_boundary_escalation', next.ref);
+      this._renderRouting(node);
+    }));
   }
 
   renderEmpty() {

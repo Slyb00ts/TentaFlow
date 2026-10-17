@@ -114,6 +114,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   działają po edycji nazwy. Serwer odrzuca w nazwie węzła znaki sterujące kierunkiem
   tekstu (bidi), projektant je usuwa, a znaki wypełniające (U+034F, U+115F, U+1160,
   U+3164, U+FFA0) liczą się po obu stronach jako puste.
+- Inspektor zadania usługi BPMN (B3.3b): pola są w zakładkach Implementacja, Wejścia i
+  wyjścia, Wynik i błędy, Czas i Zaawansowane. Lista typów bloków pochodzi z opcji
+  serwera (`serviceBlocks`), a stała po stronie klienta zniknęła. Zakładka „Wynik i
+  błędy” pokazuje tabelę „co się stanie” wyliczaną z grafu (`processResultRouting`):
+  ukończone, błąd z kodem lub bez, wymaga człowieka, anulowane, awaria platformy i
+  przekroczenie czasu, ze zdarzeniami brzegowymi przypiętymi do zadania, oraz
+  ostrzeżenia i przyciski „Dodaj obsługę błędu / eskalacji” (zdarzenie brzegowe,
+  jeden wpis cofania). Reguły odtwarzają silnik (`plan_service_result`,
+  `error_handler`, `fail_claim`) i nie ma nowej reguły po stronie serwera. Węzeł
+  zadania usługi ma plakietkę rodzaju (przepływ, blok, narzędzie addonu) i znacznik
+  ostrzeżenia dla bloku LLM lub embeddingów bez modelu. Nowa aktywność wywołująca bez
+  dokładnej wersji ma znacznik na węźle i komunikat w inspektorze zamiast błędu
+  dopiero przy zapisie.
 
 ### TentaNas
 
