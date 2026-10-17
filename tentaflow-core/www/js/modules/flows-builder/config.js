@@ -19,7 +19,7 @@ import '/js/components/tf-person-picker.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-alert.js';
-import { processNodeKind, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processHandlerName } from './bpmn.js';
+import { processNodeKind, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processHandlerName, processBodyLabels, processDistinctLabels } from './bpmn.js';
 import { openProcessCallPreview } from './process-monitor.js';
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
@@ -605,14 +605,18 @@ export class FlowConfig {
     const textarea = (key, label, value, rows = 2) => `<tf-textarea data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(String(value ?? ''))}" autogrow rows="${rows}" ${disabled}></tf-textarea>`;
     const mapping = (key, label) => `<tf-keyvalue-editor data-process="${key}" multiline label="${escapeAttr(I18n.t(`bpmn.${label}`))}" add-label="${escapeAttr(I18n.t('bpmn.add_mapping'))}" remove-label="${escapeAttr(I18n.t('bpmn.remove_mapping'))}" key-placeholder="${escapeAttr(I18n.t('bpmn.mapping_key'))}" value-placeholder="${escapeAttr(I18n.t('bpmn.mapping_expression'))}" ${disabled}></tf-keyvalue-editor>`;
     const model = this.opts.getCanvas().processModel;
-    const declaration = (key, label, choices, idKey, selected) => `<tf-select data-process="${key}" wrap-selected label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(selected || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.choose_declaration'))}</option>${(choices || []).map((choice) => `<option value="${escapeAttr(choice[idKey])}">${escapeHtml(choice.name)} · ${escapeHtml(choice[idKey])}</option>`).join('')}${selected && !(choices || []).some((choice) => choice[idKey] === selected) ? `<option value="${escapeAttr(selected)}">${escapeHtml(selected)}</option>` : ''}</tf-select>`;
+    const declaration = (key, label, choices, idKey, selected) => {
+      const labels = processDistinctLabels((choices || []).map((choice) => [choice[idKey], choice.name]));
+      return `<tf-select data-process="${key}" wrap-selected label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(selected || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.choose_declaration'))}</option>${(choices || []).map((choice) => `<option value="${escapeAttr(choice[idKey])}">${escapeHtml(labels.get(choice[idKey]))}</option>`).join('')}${selected && !(choices || []).some((choice) => choice[idKey] === selected) ? `<option value="${escapeAttr(selected)}" disabled>${escapeHtml(I18n.t('bpmn.declaration_unavailable'))}</option>` : ''}</tf-select>`;
+    };
     const boundary = () => {
       const graph = this.opts.getCanvas();
       const activities = processBoundaryHosts(graph, kind);
       const target = activities.find((candidate) => candidate.id === config.attachedToId);
+      const names = processDistinctLabels(activities.map((candidate) => [candidate.id, candidate.label || getNodeName(candidate.type)]));
       const scopeHint = target?.repeat ? 'bpmn.boundary_repeat_group_hint'
         : target && graph.processPath.length ? 'bpmn.boundary_child_local_hint' : null;
-      return `<tf-select data-process="attachedToId" wrap-selected label="${escapeAttr(I18n.t('bpmn.boundary_attach'))}" value="${escapeAttr(config.attachedToId || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.boundary_choose_activity'))}</option>${activities.map((candidate) => `<option value="${escapeAttr(candidate.id)}">${escapeHtml(candidate.label || getNodeName(candidate.type))} · ${escapeHtml(candidate.id)}</option>`).join('')}${config.attachedToId && !target ? `<option value="${escapeAttr(config.attachedToId)}" disabled>${escapeHtml(config.attachedToId)}</option>` : ''}</tf-select><p class="fb-field-hint" data-boundary-target>${escapeHtml(target ? (target.label || getNodeName(target.type)) : I18n.t(config.attachedToId ? 'bpmn.boundary_unavailable' : 'bpmn.boundary_required'))}</p>${scopeHint ? `<p class="fb-field-hint" data-boundary-scope>${escapeHtml(I18n.t(scopeHint))}</p>` : ''}`;
+      return `<tf-select data-process="attachedToId" wrap-selected label="${escapeAttr(I18n.t('bpmn.boundary_attach'))}" value="${escapeAttr(config.attachedToId || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.boundary_choose_activity'))}</option>${activities.map((candidate) => `<option value="${escapeAttr(candidate.id)}">${escapeHtml(names.get(candidate.id))}</option>`).join('')}${config.attachedToId && !target ? `<option value="${escapeAttr(config.attachedToId)}" disabled>${escapeHtml(I18n.t('bpmn.boundary_unavailable_option'))}</option>` : ''}</tf-select><p class="fb-field-hint" data-boundary-target>${escapeHtml(target ? (target.label || getNodeName(target.type)) : I18n.t(config.attachedToId ? 'bpmn.boundary_unavailable' : 'bpmn.boundary_required'))}</p>${scopeHint ? `<p class="fb-field-hint" data-boundary-scope>${escapeHtml(I18n.t(scopeHint))}</p>` : ''}`;
     };
     let servicePanels = '';
     let servicePanel = null;
@@ -686,12 +690,14 @@ export class FlowConfig {
       const candidates = this.opts.getCanvas().nodes.filter((candidate) =>
         candidate.type === (kind === 'LinkThrow' ? 'bpmn_link_catch' : 'bpmn_link_throw')
           && candidate.id !== node.id);
+      const candidateNames = processDistinctLabels(candidates.map((candidate) =>
+        [candidate.config.definition.id, candidate.label || candidate.config.definition.name || getNodeName(candidate.type)]));
       fields += `${input('linkDefinitionId', 'link_definition_id', definition.id)}
         ${input('linkName', 'link_name', definition.name)}`;
       if (kind === 'LinkThrow') {
         fields += `<tf-select data-process="linkTargetRef" wrap-selected label="${escapeAttr(I18n.t('bpmn.link_target'))}" value="${escapeAttr(definition.targetRef || '')}" ${disabled}>
           <option value="">${escapeHtml(I18n.t('bpmn.link_choose_catch'))}</option>
-          ${candidates.map((candidate) => `<option value="${escapeAttr(candidate.config.definition.id)}">${escapeHtml(candidate.label || candidate.config.definition.name || candidate.id)} · ${escapeHtml(candidate.config.definition.id)}</option>`).join('')}
+          ${candidates.map((candidate) => `<option value="${escapeAttr(candidate.config.definition.id)}">${escapeHtml(candidateNames.get(candidate.config.definition.id))}</option>`).join('')}
         </tf-select>`;
       } else {
         fields += textarea('linkSourceRefs', 'link_sources', definition.sourceRefs.join('\n'), 3);
@@ -709,18 +715,20 @@ export class FlowConfig {
       const local = config.localBody ? { calledElement: config.localBody } : null;
       const target = published?.calledElement || local?.calledElement || { namespaceUri: '', processId: '' };
       const localBodies = [model, ...(model.additionalProcesses || [])];
+      const bodyNames = processBodyLabels(model);
       fields += `<tf-alert tone="warning" data-call-version-warning message="${escapeAttr(I18n.t('bpmn.warning_call_version'))}" ${processNodeWarnings(node).includes('call_version') ? '' : 'hidden'}></tf-alert>
+        <tf-alert tone="warning" data-call-target-warning hidden></tf-alert>
         <tf-select data-process="callTargetMode" label="${escapeAttr(I18n.t('bpmn.call_target_mode'))}" value="${local ? 'local' : 'published'}" ${disabled}>
           <option value="published">${escapeHtml(I18n.t('bpmn.call_published_target'))}</option>
           <option value="local">${escapeHtml(I18n.t('bpmn.call_local_target'))}</option>
         </tf-select>
         <tf-select data-process="localBodyChoice" label="${escapeAttr(I18n.t('bpmn.call_local_body'))}" value="${escapeAttr(local?.calledElement?.processId || '')}" ${disabled} ${local ? '' : 'hidden'}>
           <option value="">${escapeHtml(I18n.t('bpmn.call_choose_body'))}</option>
-          ${localBodies.map((body) => `<option value="${escapeAttr(body.processId)}">${escapeHtml(body.processName || body.processId)}</option>`).join('')}
+          ${localBodies.map((body) => `<option value="${escapeAttr(body.processId)}">${escapeHtml(bodyNames.get(body.processId))}</option>`).join('')}
         </tf-select>
         <tf-select data-process="calledDefinitionChoice" wrap-selected label="${escapeAttr(I18n.t('bpmn.call_definition'))}" value="${escapeAttr(published?.definitionId || '')}" ${disabled} ${local ? 'hidden' : ''}>
           <option value="">${escapeHtml(I18n.t('bpmn.call_choose_definition'))}</option>
-          ${published?.definitionId ? `<option value="${escapeAttr(published.definitionId)}">${escapeHtml(published.definitionId)}</option>` : ''}
+          ${published?.definitionId ? `<option value="${escapeAttr(published.definitionId)}">${escapeHtml(I18n.t('bpmn.call_definition_checking'))}</option>` : ''}
         </tf-select>
         ${this.readOnly ? '' : `<tf-button variant="secondary" data-load-calls hidden>${escapeHtml(I18n.t('bpmn.call_load_definitions'))}</tf-button>`}
         <tf-select data-process="calledVersionChoice" label="${escapeAttr(I18n.t('bpmn.call_version'))}" value="${escapeAttr(String(published?.version || ''))}" ${disabled} ${local ? 'hidden' : ''}>
@@ -729,7 +737,7 @@ export class FlowConfig {
         </tf-select>
         <tf-select data-process="calledProcessChoice" label="${escapeAttr(I18n.t('bpmn.call_choose_body'))}" value="${escapeAttr(published?.calledElement?.processId || '')}" ${disabled} ${local ? 'hidden' : ''}>
           <option value="">${escapeHtml(I18n.t('bpmn.call_choose_body'))}</option>
-          ${published?.calledElement?.processId ? `<option value="${escapeAttr(published.calledElement.processId)}">${escapeHtml(published.calledElement.processId)}</option>` : ''}
+          ${published?.calledElement?.processId ? `<option value="${escapeAttr(published.calledElement.processId)}">${escapeHtml(I18n.t('bpmn.call_definition_checking'))}</option>` : ''}
         </tf-select>
         ${this.readOnly ? '' : `<tf-button variant="secondary" data-load-call-versions hidden>${escapeHtml(I18n.t('bpmn.call_load_versions'))}</tf-button>`}
         <tf-textarea readonly autogrow rows="2" data-process="calledElement" label="${escapeAttr(I18n.t('bpmn.call_qname'))}" value="${escapeAttr(target.namespaceUri && target.processId ? `${target.namespaceUri} · ${target.processId}` : '')}"></tf-textarea>
@@ -922,7 +930,7 @@ export class FlowConfig {
       const localBodyChoice = this.root.querySelector('[data-process="localBodyChoice"]');
       localBodyChoice.setOptions([{ value: '', label: I18n.t('bpmn.call_choose_body') },
         ...[model, ...(model.additionalProcesses || [])].map((body) => ({
-          value: body.processId, label: body.processName || body.processId,
+          value: body.processId, label: processBodyLabels(model).get(body.processId),
         }))], localBodyChoice.getAttribute('value'));
       targetMode.addEventListener('change', () => {
         if (this.readOnly) return;
@@ -950,10 +958,25 @@ export class FlowConfig {
       const syncVersionWarning = () => { versionWarning.hidden = !processNodeWarnings(node).includes('call_version'); };
       const definitions = [{ value: '', label: I18n.t('bpmn.call_choose_definition') }];
       const published = node.config.localBody ? null : node.config;
-      if (published?.calledDefinitionId) definitions.push({ value: published.calledDefinitionId, label: published.calledDefinitionId });
+      const definitionNames = new Map();
+      const targetWarning = this.root.querySelector('[data-call-target-warning]');
+      // Names tell definitions apart; only two with the same name get a number.
+      const showDefinitions = () => {
+        const labels = processDistinctLabels([...definitionNames]);
+        for (const item of definitions) if (labels.has(item.value)) item.label = labels.get(item.value);
+        callChoice.setOptions(definitions, callChoice.value);
+      };
+      if (published?.calledDefinitionId) definitions.push({ value: published.calledDefinitionId, label: I18n.t('bpmn.call_definition_checking') });
       const versions = [{ value: '', label: I18n.t('bpmn.call_choose_version') }];
       if (published?.calledVersion) versions.push({ value: String(published.calledVersion), label: I18n.t('bpmn.version_number', { version: published.calledVersion }) });
-      let definitionOffset = 0, versionOffset = 0, generation = 0;
+      // The selects adopt their markup options asynchronously, so until then
+      // `.value` is empty and nothing would load for the saved target.
+      callChoice.setOptions(definitions, published?.calledDefinitionId || '');
+      versionChoice.setOptions(versions, published?.calledVersion ? String(published.calledVersion) : '');
+      // `listGeneration` follows the chosen definition: a version list still in
+      // flight for it stays valid when only the version changes. `pickGeneration`
+      // follows the chosen version and discards a slower answer for an earlier one.
+      let definitionOffset = 0, versionOffset = 0, listGeneration = 0, pickGeneration = 0;
       const loadDefinitions = this.root.querySelector('[data-load-calls]');
       const loadVersions = this.root.querySelector('[data-load-call-versions]');
       const say = (key, params) => { if (this.root.contains(capability)) capability.textContent = I18n.t(key, params); };
@@ -968,26 +991,54 @@ export class FlowConfig {
           if (!this.root.contains(callChoice)) return;
           for (const definition of response.definitions) {
             if (definition.archived || !definition.publishedVersion) continue;
-            const item = definitions.find((row) => row.value === definition.definitionId);
-            if (item) item.label = `${definition.name} · ${definition.definitionId}`;
-            else definitions.push({ value: definition.definitionId,
-              label: `${definition.name} · ${definition.definitionId}` });
+            definitionNames.set(definition.definitionId, definition.name);
+            if (!definitions.some((row) => row.value === definition.definitionId)) definitions.push({ value: definition.definitionId, label: definition.name });
           }
           definitionOffset += response.definitions.length;
-          callChoice.setOptions(definitions, callChoice.value);
+          showDefinitions();
           if (loadDefinitions) loadDefinitions.hidden = !response.hasMore;
           if (definitions.length === 1 && !response.hasMore && !callChoice.value) say('bpmn.call_no_published');
         } catch (error) { if (this.root.contains(capability)) capability.textContent = error.message; }
         finally { loadDefinitions?.removeAttribute('disabled'); }
       };
+      // The saved target is looked up by itself: it may be archived or gone, so
+      // the list of callable definitions cannot name it, and a bare id is no name.
+      const resolveStoredTarget = async () => {
+        const definitionId = published?.calledDefinitionId;
+        if (!definitionId) return;
+        const stored = definitions.find((row) => row.value === definitionId);
+        let problem = null;
+        try {
+          const { definition } = await ApiBinary.one('processDefinitionGetRequest', { definitionId });
+          if (!this.root.contains(callChoice)) return;
+          definitionNames.set(definitionId, definition.name);
+          if (definition.archived) problem = 'archived';
+          if (published.calledVersion) {
+            const response = await ApiBinary.one('processVersionGetRequest', { definitionId, version: published.calledVersion });
+            if (!this.root.contains(callChoice)) return;
+            const labels = processBodyLabels(response.version.model);
+            processChoice.setOptions([{ value: '', label: I18n.t('bpmn.call_choose_body') },
+              ...[...labels].map(([value, label]) => ({ value, label }))], processChoice.value || published.calledElement?.processId || '');
+          }
+        } catch (error) {
+          if (!this.root.contains(callChoice)) return;
+          if (/not found|denied/i.test(error.message)) problem = 'missing';
+          else say('bpmn.call_definition_unavailable');
+          if (stored) stored.label = I18n.t('bpmn.call_definition_unavailable');
+        }
+        if (problem === 'missing' && stored) stored.label = I18n.t('bpmn.call_definition_unavailable');
+        targetWarning.hidden = !problem;
+        if (problem) targetWarning.setAttribute('message', I18n.t(`bpmn.call_target_${problem}`));
+        showDefinitions();
+      };
       const fetchVersions = async () => {
         const definitionId = callChoice.value;
         if (!definitionId) return;
-        const request = generation;
+        const request = listGeneration;
         loadVersions?.setAttribute('disabled', '');
         try {
           const response = await ApiBinary.one('processVersionListRequest', { definitionId, offset: versionOffset, limit: 100 });
-          if (!this.root.contains(versionChoice) || request !== generation || callChoice.value !== definitionId) return;
+          if (!this.root.contains(versionChoice) || request !== listGeneration || callChoice.value !== definitionId) return;
           for (const version of response.versions) {
             const value = String(version.version);
             if (!versions.some((item) => item.value === value)) versions.push({ value,
@@ -998,14 +1049,16 @@ export class FlowConfig {
           if (loadVersions) loadVersions.hidden = !response.hasMore;
           if (versions.length === 1 && !response.hasMore) say('bpmn.call_no_versions');
           else if (!versionChoice.value) say('bpmn.call_choose_version');
-        } catch (error) { if (request === generation && this.root.contains(capability)) capability.textContent = error.message; }
+        } catch (error) { if (request === listGeneration && this.root.contains(capability)) capability.textContent = error.message; }
         finally { loadVersions?.removeAttribute('disabled'); }
       };
       loadDefinitions?.addEventListener('click', fetchDefinitions);
       loadVersions?.addEventListener('click', fetchVersions);
       callChoice.addEventListener('change', () => {
         if (this.readOnly) return;
-        generation++;
+        listGeneration++;
+        pickGeneration++;
+        targetWarning.hidden = true;
         versionOffset = 0;
         versions.splice(1);
         versionChoice.setOptions(versions, '');
@@ -1026,10 +1079,11 @@ export class FlowConfig {
         fetchDefinitions();
         if (callChoice.value || published?.calledDefinitionId) fetchVersions();
       }
+      if (published?.calledDefinitionId) resolveStoredTarget();
       versionChoice.addEventListener('change', async () => {
         if (this.readOnly) return;
         if (!versionChoice.value) {
-          generation++;
+          pickGeneration++;
           preview.setAttribute('disabled', '');
           processChoice.setOptions([{ value: '', label: I18n.t('bpmn.call_choose_body') }], '');
           this.opts.onConfigChange(node.id, { calledDefinitionId: callChoice.value,
@@ -1040,22 +1094,21 @@ export class FlowConfig {
           return;
         }
         if (!callChoice.value) return;
-        const request = ++generation;
+        const request = ++pickGeneration;
         const definitionId = callChoice.value, version = Number(versionChoice.value);
         preview.setAttribute('disabled', '');
         try {
           const response = await ApiBinary.one('processVersionGetRequest', { definitionId, version });
-          if (!this.root.contains(versionChoice) || request !== generation || callChoice.value !== definitionId || Number(versionChoice.value) !== version) return;
+          if (!this.root.contains(versionChoice) || request !== pickGeneration || callChoice.value !== definitionId || Number(versionChoice.value) !== version) return;
           const calledElement = { namespaceUri: response.version.model.targetNamespace || 'https://tentaflow.app/bpmn/1', processId: '' };
-          const bodies = [response.version.model, ...(response.version.model.additionalProcesses || [])];
           processChoice.setOptions([{ value: '', label: I18n.t('bpmn.call_choose_body') },
-            ...bodies.map((body) => ({ value: body.processId, label: body.processName || body.processId }))], '');
+            ...[...processBodyLabels(response.version.model)].map(([value, label]) => ({ value, label }))], '');
           this.opts.onConfigChange(node.id, { calledDefinitionId: definitionId,
             calledVersion: version, calledElement });
           syncVersionWarning();
           this.root.querySelector('[data-process="calledElement"]').value = '';
           capability.textContent = I18n.t('bpmn.call_choose_body');
-        } catch (error) { if (request === generation && this.root.contains(capability)) capability.textContent = error.message; }
+        } catch (error) { if (request === pickGeneration && this.root.contains(capability)) capability.textContent = error.message; }
       });
       processChoice.addEventListener('change', () => {
         if (this.readOnly || !processChoice.value || !versionChoice.value || !callChoice.value) return;
@@ -1310,7 +1363,7 @@ export class FlowConfig {
     };
     const addButton = (kind) => {
       const reason = addReason(kind);
-      return `<tf-button variant="secondary" size="sm" data-routing-add="${kind}" ${reason ? `disabled title="${escapeAttr(reason)}"` : ''}>${escapeHtml(I18n.t(`bpmn.routing_add_${kind}`))}</tf-button>`;
+      return `<tf-button variant="secondary" size="sm" data-routing-add="${kind}" aria-describedby="routing-add-hint" ${reason ? `disabled title="${escapeAttr(reason)}"` : ''}>${escapeHtml(I18n.t(`bpmn.routing_add_${kind}`))}</tf-button>`;
     };
     const reasons = [...new Set(['error', 'escalation'].map(addReason).filter(Boolean))];
     // The table is the longest thing the tab holds; a short window starts it
@@ -1324,7 +1377,7 @@ export class FlowConfig {
       </tf-table></tf-disclosure>
       <div class="fb-routing-warnings" data-routing-warnings>${routing.warnings.map((warning) => `<tf-alert tone="${warning.tone}" data-routing-warning="${warning.key}" message="${escapeAttr(warningText(warning))}"></tf-alert>`).join('')}</div>
       ${this.readOnly ? '' : `<div class="fb-routing-actions">${addButton('error')}${addButton('escalation')}</div>
-      <p class="fb-field-hint" data-routing-add-hint>${escapeHtml([I18n.t('bpmn.routing_add_hint'), ...reasons].join(' '))}</p>`}`;
+      <p class="fb-field-hint" id="routing-add-hint" data-routing-add-hint>${escapeHtml([I18n.t('bpmn.routing_add_hint'), ...reasons].join(' '))}</p>`}`;
     host.querySelector('tf-table').rows = routing.rows.map(rowTexts);
     host.querySelector('tf-disclosure').addEventListener('toggle', (event) => { this.routingOpen = event.detail.open; });
     if (focused) host.querySelector(`[data-routing-add="${focused}"]:not([disabled])`)?.focus();

@@ -6,7 +6,8 @@
 //       Click-outside zamyka. Metody .open()/.close() oraz atrybut "open".
 //       Ustawienie `.anchor = element` przenosi panel na position:fixed i
 //       ustawia go POD (albo, gdy brak miejsca, NAD) kotwica — kotwica nigdy
-//       nie jest zaslonieta. Bez `.anchor` panel dziala jak dotad.
+//       nie jest zaslonieta. Klik w kotwice nie zamyka menu przed wlasnym
+//       przelaczeniem (kotwica jest wyzwalaczem). Bez `.anchor` panel dziala jak dotad.
 //       Atrybut `heading` pokazuje nieklikalny naglowek nad pozycjami (o czym jest
 //       menu), a atrybut `hint` pozycji dokleja pod etykieta krotkie wyjasnienie
 //       (np. dlaczego pozycja jest wylaczona). Strzalki, Home/End i Enter/Spacja
@@ -307,6 +308,9 @@ class TfMenu extends HTMLElement {
     if (!this.hasAttribute('open')) return;
     const path = e.composedPath();
     if (path.includes(this)) return;
+    // The anchor is the trigger: its own click toggles, so closing here as well
+    // would let that click reopen the menu it just dismissed.
+    if (this._anchor && path.includes(this._anchor)) return;
     this.close();
   }
 

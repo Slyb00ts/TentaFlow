@@ -364,14 +364,9 @@ function climbingHandler(handlers, code) {
 
 const ESCALATION_PATH_REASONS = ['terminal_before_wait', 'scope_entry', 'call_entry', 'no_durable_wait'];
 
-/**
- * Server and codec messages cite elements by internal id; the author knows them
- * by name. Every id of `model` found in `message` becomes the element's name
- * (or its kind when it has none), a flow becomes "from → to", and the one
- * refusal a drawn graph reaches often, an escalation path with nothing waiting,
- * is replaced by the text the inspector shows for it.
- */
-export function processExplainError(message, model) {
+// What an author calls each element of a model: its name, else its kind. The
+// elements of every body and nested sub-process, keyed by id.
+function processElementNames(model) {
   const names = new Map();
   const visit = (body) => {
     for (const node of body?.nodes || []) {
@@ -381,8 +376,79 @@ export function processExplainError(message, model) {
       if (node.kind?.SubProcess) visit(node.kind.SubProcess.body);
     }
   };
+  [model, ...(model?.additionalProcesses || [])].forEach(visit);
+  return names;
+}
+
+// The first thing in each body that needs a process time zone and has none: a
+// timer element (named), else the work calendar (null). The engine refuses a
+// timer or a calendar without an explicit zone and never guesses one, because
+// the zone decides when a deadline falls.
+export function processTimezoneGaps(model) {
+  const names = processElementNames(model);
+  const firstTimer = (body) => {
+    for (const node of body.nodes) {
+      const kind = typeof node.kind === 'object' ? Object.keys(node.kind)[0] : null;
+      if (['TimerStart', 'TimerCatch', 'BoundaryTimer'].includes(kind)) return node.id;
+      if (kind === 'SubProcess') {
+        const nested = firstTimer(node.kind.SubProcess.body);
+        if (nested) return nested;
+      }
+    }
+    return null;
+  };
+  const gaps = [];
+  for (const body of [model, ...(model.additionalProcesses || [])]) {
+    if (body.timerTimezone?.trim()) continue;
+    const timer = firstTimer(body);
+    if (timer) gaps.push({ processId: body.processId, element: names.get(timer) });
+    else if (body.workCalendar) gaps.push({ processId: body.processId, element: null });
+  }
+  return gaps;
+}
+
+export function processTimezoneText(gap) {
+  if (!gap) return I18n.t('bpmn.timer_timezone_server');
+  return gap.element == null ? I18n.t('bpmn.timer_timezone_calendar_missing')
+    : I18n.t('bpmn.timer_timezone_missing', { element: gap.element });
+}
+
+// Names that tell two entries apart without showing an internal id: a name two
+// entries share gets its occurrence number appended, one that is unique stays
+// as written. `entries` is [[key, name], ...]; the result maps key to label.
+export function processDistinctLabels(entries) {
+  const seen = new Map();
+  const total = new Map();
+  for (const [, name] of entries) total.set(name, (total.get(name) || 0) + 1);
+  return new Map(entries.map(([key, name]) => {
+    const occurrence = (seen.get(name) || 0) + 1;
+    seen.set(name, occurrence);
+    return [key, total.get(name) > 1 ? `${name} (${occurrence})` : name];
+  }));
+}
+
+// The name an author gives each body of a document: its name, else "Process N"
+// by position.
+export function processBodyLabels(model) {
+  return processDistinctLabels([model, ...(model.additionalProcesses || [])].map((body, index) =>
+    [body.processId, String(body.processName || '').trim() || I18n.t('bpmn.process_body_unnamed', { number: index + 1 })]));
+}
+
+const ID_SLOT = /\b(?:task|node|event|gateway|activity|element|boundary|repeat|call|catch|throw|flow|subprocess|id|origin|reaches)[:]?\s+$|["'`\u201c\u2018]$/i;
+
+/**
+ * Server and codec messages cite elements by internal id; the author knows them
+ * by name. An id of `model` found in `message` becomes the element's name (or
+ * its kind when it has none), a flow becomes "from → to", and the one refusal a
+ * drawn graph reaches often, an escalation path with nothing waiting, is
+ * replaced by the text the inspector shows for it. An id is recognised by its
+ * shape (generated and imported ids carry a digit, underscore or hyphen) or by
+ * the noun the message puts in front of it, so an imported element called
+ * "Start" never rewrites the ordinary word.
+ */
+export function processExplainError(message, model) {
+  const names = processElementNames(model);
   const bodies = [model, ...(model?.additionalProcesses || [])];
-  bodies.forEach(visit);
   const flows = new Map();
   const collect = (body) => {
     for (const flow of body?.sequenceFlows || []) flows.set(flow.id, flow);
@@ -390,12 +456,15 @@ export function processExplainError(message, model) {
   };
   bodies.forEach(collect);
   const text = String(message ?? '');
+  if (/explicit IANA timezone/.test(text)) return processTimezoneText(processTimezoneGaps(model)[0]);
   const path = /escalation boundary ([\w-]+) has unsupported immediate path (\w+) at/.exec(text);
   if (path && names.has(path[1])) {
     const key = ESCALATION_PATH_REASONS.includes(path[2]) ? path[2] : 'other';
     return I18n.t(`bpmn.routing_warning_escalation_path_${key}`, { names: names.get(path[1]) });
   }
-  return text.replace(/[\w-]+/g, (token) => {
+  const citesId = (token, offset) => /[\d_-]/.test(token) || ID_SLOT.test(text.slice(0, offset));
+  return text.replace(/[\w-]+/g, (token, offset) => {
+    if (!citesId(token, offset)) return token;
     if (names.has(token)) return `\u201c${names.get(token)}\u201d`;
     const flow = flows.get(token);
     return flow ? I18n.t('bpmn.error_flow', { from: names.get(flow.sourceId) ?? flow.sourceId, to: names.get(flow.targetId) ?? flow.targetId }) : token;

@@ -10,7 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
-import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processWarningText, processHandlerName, processBoundaryHosts, processEscalationPathProblem } from './bpmn.js';
+import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processWarningText, processHandlerName, processBoundaryHosts, processEscalationPathProblem, processTimezoneGaps, processTimezoneText } from './bpmn.js';
 import '/js/components/tf-menu.js';
 
 const NODE_WIDTH = 280;
@@ -192,6 +192,28 @@ function arePortTypesCompatible(fromType, toType) {
   const a = (fromType || 'any').toLowerCase();
   const b = (toType || 'any').toLowerCase();
   return a === 'any' || b === 'any' || a === b;
+}
+
+// A code such as INVALID_CUSTOMER_ADDRESS has no break opportunity of its own,
+// so the label would split it mid-word; the marker offers one after each
+// separator and the mid-word split stays the last resort.
+function breakableHtml(text) {
+  return escapeHtml(text).replace(/([_./-])/g, '$1<wbr>');
+}
+
+// Whether the segment (x1,y1)-(x2,y2) passes through the rectangle (slab method).
+function segmentHitsRect(x1, y1, x2, y2, rect) {
+  let near = 0; let far = 1;
+  for (const [from, delta, low, high] of [[x1, x2 - x1, rect.left, rect.right], [y1, y2 - y1, rect.top, rect.bottom]]) {
+    if (delta === 0) {
+      if (from < low || from > high) return false;
+    } else {
+      const enter = (low - from) / delta; const leave = (high - from) / delta;
+      near = Math.max(near, Math.min(enter, leave)); far = Math.min(far, Math.max(enter, leave));
+      if (near > far) return false;
+    }
+  }
+  return true;
 }
 
 export class FlowCanvas {
@@ -519,9 +541,7 @@ export class FlowCanvas {
     if (this.mode === 'bpmn') {
       const errors = [];
       const selectedBody = processBody(this.processModel, [], this.selectedProcessId);
-      if (selectedBody.workCalendar && !selectedBody.timerTimezone?.trim()) {
-        errors.push(I18n.t('bpmn.timer_timezone_required'));
-      }
+      for (const gap of processTimezoneGaps(this.getData())) errors.push(processTimezoneText(gap));
       for (const node of this.nodes) {
         const condition = node.type === 'bpmn_service_task' && node.config.verification?.Condition;
         if (condition && !(condition.expression || '').trim()) {
@@ -542,7 +562,7 @@ export class FlowCanvas {
         if (!['bpmn_timer_start', 'bpmn_timer_catch', 'bpmn_boundary_timer'].includes(node.type)) continue;
         const [kind, timer] = Object.entries(node.config.timer)[0];
         if (kind === 'Date' && (!timer.at || !timer.at.trim())) {
-          errors.push(I18n.t('bpmn.timer_date_required', { node: node.label || node.id }));
+          errors.push(I18n.t('bpmn.timer_date_required', { node: this._nodeName(node) }));
         }
         if (processBoundaryKind(node.type)) {
           const parent = this.nodes.find((candidate) => candidate.id === node.config.attachedToId);
@@ -551,7 +571,7 @@ export class FlowCanvas {
             errors.push(I18n.t('bpmn.boundary_required_named', { node: this._nodeName(node) }));
           }
           if (!['Date', 'Duration', 'WorkingDuration'].includes(kind) || this.edges.some((edge) => edge.to_node === node.id)) {
-            errors.push(I18n.t('bpmn.boundary_timer_invalid', { node: node.label || node.id }));
+            errors.push(I18n.t('bpmn.boundary_timer_invalid', { node: this._nodeName(node) }));
           }
         }
         const fields = kind === 'Daily'
@@ -563,7 +583,7 @@ export class FlowCanvas {
         if (['Cycle', 'Daily'].includes(kind) && timer.totalFirings != null) fields.push(['totalFirings', 'timer_total', 1, 4294967295]);
         for (const [field, label, min, max] of fields) {
           if (!Number.isInteger(timer[field]) || timer[field] < min || timer[field] > max) {
-            errors.push(I18n.t('bpmn.timer_number_invalid', { node: node.label || node.id, field: I18n.t(`bpmn.${label}`), min, max }));
+            errors.push(I18n.t('bpmn.timer_number_invalid', { node: this._nodeName(node), field: I18n.t(`bpmn.${label}`), min, max }));
           }
         }
       }
@@ -579,16 +599,16 @@ export class FlowCanvas {
           .map((edge) => this.nodes.find((node) => node.id === edge.to_node)).filter(Boolean);
         if (branches.some((node) => node.type === 'bpmn_receive_task')
           && branches.some((node) => node.type === 'bpmn_message_catch')) {
-          errors.push(I18n.t('bpmn.event_gateway_receive_message_mix', { node: gateway.label || gateway.id }));
+          errors.push(I18n.t('bpmn.event_gateway_receive_message_mix', { node: this._nodeName(gateway) }));
         }
         for (const branch of branches) {
           if (this.edges.filter((edge) => edge.to_node === branch.id).length !== 1
             || this.edges.filter((edge) => edge.from_node === branch.id).length !== 1) {
-            errors.push(I18n.t('bpmn.event_gateway_branch_incoming', { node: branch.label || branch.id }));
+            errors.push(I18n.t('bpmn.event_gateway_branch_incoming', { node: this._nodeName(branch) }));
           }
           if (branch.type === 'bpmn_receive_task'
             && this.nodes.some((node) => processBoundaryKind(node.type) && node.config.attachedToId === branch.id)) {
-            errors.push(I18n.t('bpmn.event_gateway_receive_boundary', { node: branch.label || branch.id }));
+            errors.push(I18n.t('bpmn.event_gateway_receive_boundary', { node: this._nodeName(branch) }));
           }
         }
       }
@@ -752,50 +772,61 @@ export class FlowCanvas {
     // Odcinamy redo-branche po nowej operacji. structuredClone zamiast
     // JSON round-trip — szybszy binary copy + zachowuje typy Date/Map jesli
     // kiedys trafia do node.config (JSON.stringify gubi wszystko nieprymitywne).
+    // A process snapshot is the whole model: the scope being viewed is not part
+    // of the step, so an undo never moves the author between bodies.
     this.history = this.history.slice(0, this.historyIndex + 1);
-    this.history.push(structuredClone({ nodes: this.nodes, edges: this.edges,
-      ...(this.mode === 'bpmn' ? { processModel: this.getData(), processPath: this.processPath,
-        selectedProcessId: this.selectedProcessId } : {}) }));
+    this.history.push(structuredClone(this.mode === 'bpmn'
+      ? { processModel: this.getData() } : { nodes: this.nodes, edges: this.edges }));
     if (this.history.length > MAX_HISTORY) this.history.shift();
     this.historyIndex = this.history.length - 1;
   }
 
   undo() {
-    if (this.readOnly) return;
-    if (this.historyIndex <= 0) return;
-    this.historyIndex -= 1;
-    const snap = structuredClone(this.history[this.historyIndex]);
-    this.nodes = snap.nodes;
-    this.edges = snap.edges;
-    if (this.mode === 'bpmn') {
-      this.processModel = snap.processModel;
-      this.processPath = snap.processPath;
-      this.selectedProcessId = snap.selectedProcessId;
-    }
-    this.selectedIds.clear();
-    this.selectedEdgeId = null;
-    this.onSelect(null);
-    this.render();
-    this.onChange();
+    if (this.readOnly || this.historyIndex <= 0) return;
+    this._restoreHistory(this.historyIndex - 1);
   }
 
   redo() {
-    if (this.readOnly) return;
-    if (this.historyIndex >= this.history.length - 1) return;
-    this.historyIndex += 1;
-    const snap = structuredClone(this.history[this.historyIndex]);
-    this.nodes = snap.nodes;
-    this.edges = snap.edges;
+    if (this.readOnly || this.historyIndex >= this.history.length - 1) return;
+    this._restoreHistory(this.historyIndex + 1);
+  }
+
+  // A process step restores the model and redraws the scope that is on screen;
+  // only when that scope no longer exists (the step removed the sub-process or
+  // body being viewed) does the view climb to the nearest one that does. A step
+  // that left the shown scope unchanged says where it happened instead of
+  // looking like a dead button.
+  _restoreHistory(index) {
+    this.historyIndex = index;
+    const snap = structuredClone(this.history[index]);
+    let hidden = false;
     if (this.mode === 'bpmn') {
-      this.processModel = snap.processModel;
-      this.processPath = snap.processPath;
-      this.selectedProcessId = snap.selectedProcessId;
+      const before = this.getData();
+      const model = snap.processModel;
+      const known = model.processId === this.selectedProcessId
+        || (model.additionalProcesses || []).some((body) => body.processId === this.selectedProcessId);
+      const processId = known ? this.selectedProcessId : model.processId;
+      let path = known ? [...this.processPath] : [];
+      for (; path.length > 0; path = path.slice(0, -1)) {
+        try { processBody(model, path, processId); break; } catch (_) { /* sub-process is gone */ }
+      }
+      const graph = processToCanvas(model, path, processId);
+      this.processModel = model;
+      this.processPath = path;
+      this.selectedProcessId = processId;
+      this.nodes = graph.nodes;
+      this.edges = graph.edges;
+      try { hidden = JSON.stringify(processToCanvas(before, path, processId)) === JSON.stringify(graph); } catch (_) { /* the scope is new */ }
+    } else {
+      this.nodes = snap.nodes;
+      this.edges = snap.edges;
     }
     this.selectedIds.clear();
     this.selectedEdgeId = null;
     this.onSelect(null);
     this.render();
     this.onChange();
+    if (hidden) toast(I18n.t('bpmn.undo_elsewhere'), 'info');
   }
 
   // -------------------------------------------------------------------------
@@ -908,7 +939,11 @@ export class FlowCanvas {
       if (!cascade && processBoundaryKind(node.type)) this._attachDroppedBoundary(node, pt);
     }
     const classic = this.mode !== 'bpmn';
-    if (!cascade) {
+    // A drop that would land on another node, or a boundary event the task had no
+    // room for, takes the nearest free spot instead of hiding what is there.
+    if (!cascade && this.mode === 'bpmn' && !node.config.attachedToId && this._coversNode(node)) {
+      this._placeCascade(node, classic);
+    } else if (!cascade) {
       this.nodes.push(node);
       this.render();
       // A classic node's height is only known once it is rendered, so a drop is
@@ -925,6 +960,11 @@ export class FlowCanvas {
     this.selectNode(node.id);
     this.onChange();
     return node;
+  }
+
+  _coversNode(node) {
+    return this._nodeRects().some((other) => node.x < other.x + other.w && other.x < node.x + node.width
+      && node.y < other.y + other.h && other.y < node.y + node.height);
   }
 
   // A cascade add searches from where the add asked to land. The node is
@@ -1214,7 +1254,7 @@ export class FlowCanvas {
     node.config.attachedToId = host.id;
     if (!this._placeNewBoundary(node, host, point)) {
       node.config.attachedToId = null;
-      toast(I18n.t('bpmn.boundary_no_room', { node: host.label || this.templates.get(host.type)?.label || host.id }), 'warning');
+      toast(I18n.t('bpmn.boundary_no_room', { node: this._nodeName(host) }), 'warning');
     }
   }
 
@@ -1702,14 +1742,15 @@ export class FlowCanvas {
       const serviceKind = n.type === 'bpmn_service_task' ? processServiceKind(n.config) : null;
       const showKind = serviceKind && (serviceKind !== 'flow' || !!n.config.flowId);
       const kindIcon = { flow: 'flow', block: 'chip', tool: 'puzzle' }[serviceKind];
-      const warnings = processNodeWarnings(n, this.opts.processOptions?.serviceBlocks);
+      const warnings = this._processWarnings(n);
+      const warningText = warnings.map((key) => this._processWarningText(n, key)).join(' ');
       div.innerHTML = `
         ${showKind ? `<span class="fb-process-kind" data-kind="${serviceKind}" role="img" title="${escapeAttr(I18n.t(`bpmn.kind_${serviceKind}`))}" aria-label="${escapeAttr(I18n.t(`bpmn.kind_${serviceKind}`))}"><svg aria-hidden="true"><use href="#i-${kindIcon}"/></svg></span>` : ''}
-        ${warnings.length ? `<span class="fb-process-warn" data-warning="${warnings.join(' ')}" role="img" title="${escapeAttr(warnings.map((key) => processWarningText(n, key, this.opts.processOptions?.serviceBlocks)).join(' '))}" aria-label="${escapeAttr(warnings.map((key) => processWarningText(n, key, this.opts.processOptions?.serviceBlocks)).join(' '))}"><svg aria-hidden="true"><use href="#i-alert"/></svg></span>` : ''}
+        ${warnings.length ? `<span class="fb-process-warn" data-warning="${warnings.join(' ')}" role="img" title="${escapeAttr(warningText)}" aria-label="${escapeAttr(warningText)}"><svg aria-hidden="true"><use href="#i-alert"/></svg></span>` : ''}
         <div class="fb-process-symbol">${markerless ? '' : `<svg aria-hidden="true"><use href="#i-${escapeAttr(tmpl.icon)}"/></svg>`}
           ${event || gateway ? '' : `<span>${escapeHtml(title)}</span>`}
           ${repeatMarker ? `<i class="fb-repeat-marker fb-repeat-marker-${repeatMarker}" aria-hidden="true">${repeatMarker === 'loop' ? '↻' : ''}</i>` : ''}</div>
-        <div class="fb-process-label" ${event || gateway ? '' : 'hidden'}>${escapeHtml(title)}</div>
+        <div class="fb-process-label" title="${escapeAttr(title)}" ${event || gateway ? '' : 'hidden'}>${breakableHtml(title)}</div>
         <span class="fb-process-label-leader" aria-hidden="true"></span>
         ${(['bpmn_start', 'bpmn_timer_start', 'bpmn_message_start', 'bpmn_link_catch'].includes(n.type) || processBoundaryKind(n.type)) ? '' : this._renderPortEl(n.id, { name: 'in', type: 'any' }, 0, 'in', 1)}
         ${['bpmn_end', 'bpmn_error_end', 'bpmn_terminate_end', 'bpmn_link_throw'].includes(n.type) ? '' : this._renderPortEl(n.id, { name: 'full', type: 'any' }, 0, 'out', 1)}`;
@@ -1758,25 +1799,40 @@ export class FlowCanvas {
     return div;
   }
 
+  // Runs in phases that each only read or only write the DOM: a read after a
+  // write forces a layout, and one per node made an edit on a large diagram take
+  // a fifth of a second.
   _layoutProcessLabels() {
     if (this.mode !== 'bpmn') return;
     const nodeRects = this.nodes.map((node) => ({
       left: node.x, top: node.y, right: node.x + node.width, bottom: node.y + node.height,
     }));
-    const labels = [];
+    const entries = [];
     for (const node of this.nodes) {
       const element = this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(node.id)}"]`);
       const label = element?.querySelector('.fb-process-label');
       if (!label) continue;
-      const title = element.querySelector('.fb-process-symbol > span');
-      element.classList.remove('fb-external-label');
-      const outside = !title
-        || title.scrollHeight > title.clientHeight + 1 || title.scrollWidth > title.clientWidth + 1;
+      entries.push({ node, element, label, title: element.querySelector('.fb-process-symbol > span'),
+        leader: element.querySelector('.fb-process-label-leader') });
+    }
+    // A title shows inside its box until it does not fit, so every title is
+    // measured in its inner state before any element is moved outside.
+    for (const { element } of entries) element.classList.remove('fb-external-label');
+    for (const entry of entries) {
+      const { title } = entry;
+      entry.outside = !title || title.scrollHeight > title.clientHeight + 1 || title.scrollWidth > title.clientWidth + 1;
+    }
+    const labels = [];
+    for (const entry of entries) {
+      const { element, label, leader, title, outside } = entry;
       element.classList.toggle('fb-external-label', outside && !!title);
       label.hidden = !outside;
-      const leader = element.querySelector('.fb-process-label-leader');
       leader.hidden = !outside;
-      if (outside) labels.push({ node, element, label, leader });
+      if (outside) labels.push(entry);
+    }
+    for (const entry of labels) {
+      entry.width = entry.label.offsetWidth;
+      entry.height = entry.label.offsetHeight;
     }
     labels.sort((left, right) => {
       const priority = ({ node }) => processBoundaryKind(node.type) ? 1
@@ -1787,9 +1843,8 @@ export class FlowCanvas {
     const gap = 12;
     const overlaps = (left, right) => left.left < right.right + gap && left.right + gap > right.left
       && left.top < right.bottom + gap && left.bottom + gap > right.top;
-    for (const { node, element, label, leader } of labels) {
-      const width = label.offsetWidth;
-      const height = label.offsetHeight;
+    const writes = [];
+    for (const { node, element, label, leader, width, height } of labels) {
       if (!width || !height) continue;
       const centerX = node.x + node.width / 2;
       const centerY = node.y + node.height / 2;
@@ -1827,22 +1882,39 @@ export class FlowCanvas {
         }
       });
       candidates.sort((left, right) => left.cost - right.cost);
-      const selected = candidates.find(({ rect }) => !nodeRects.some((other) => overlaps(rect, other))
-        && !occupied.some((other) => overlaps(rect, other)))?.rect;
+      // The line from the element to its label, from the element's border to the
+      // label's nearest point; it must not run through another label.
+      const leaderTo = (rect) => {
+        const targetX = Math.max(rect.left, Math.min(centerX, rect.right));
+        const targetY = Math.max(rect.top, Math.min(centerY, rect.bottom));
+        return { targetX, targetY, sourceX: Math.max(node.x, Math.min(targetX, node.x + node.width)),
+          sourceY: Math.max(node.y, Math.min(targetY, node.y + node.height)) };
+      };
+      const free = ({ rect }) => !nodeRects.some((other) => overlaps(rect, other))
+        && !occupied.some((other) => overlaps(rect, other));
+      const crossesLabel = ({ rect }) => occupied.some((other) => {
+        const { sourceX, sourceY, targetX, targetY } = leaderTo(rect);
+        return segmentHitsRect(sourceX, sourceY, targetX, targetY, other);
+      });
+      const selected = (candidates.find((candidate) => free(candidate) && !crossesLabel(candidate))
+        ?? candidates.find(free))?.rect;
       if (!selected) continue;
-      label.style.left = `${selected.left - node.x}px`;
-      label.style.top = `${selected.top - node.y}px`;
-      const targetX = Math.max(selected.left, Math.min(centerX, selected.right));
-      const targetY = Math.max(selected.top, Math.min(centerY, selected.bottom));
-      const sourceX = Math.max(node.x, Math.min(targetX, node.x + node.width));
-      const sourceY = Math.max(node.y, Math.min(targetY, node.y + node.height));
+      const place = { label, leader, left: selected.left - node.x, top: selected.top - node.y };
+      writes.push(place);
+      const { sourceX, sourceY, targetX, targetY } = leaderTo(selected);
       const distance = Math.hypot(targetX - sourceX, targetY - sourceY);
-      leader.style.left = `${sourceX - node.x}px`;
-      leader.style.top = `${sourceY - node.y}px`;
-      leader.style.width = `${distance}px`;
-      leader.style.transform = `rotate(${Math.atan2(targetY - sourceY, targetX - sourceX)}rad)`;
-      leader.hidden = distance === 0;
+      Object.assign(place, { leaderLeft: sourceX - node.x, leaderTop: sourceY - node.y, distance,
+        angle: Math.atan2(targetY - sourceY, targetX - sourceX) });
       occupied.push(selected);
+    }
+    for (const { label, leader, left, top, leaderLeft, leaderTop, distance, angle } of writes) {
+      label.style.left = `${left}px`;
+      label.style.top = `${top}px`;
+      leader.style.left = `${leaderLeft}px`;
+      leader.style.top = `${leaderTop}px`;
+      leader.style.width = `${distance}px`;
+      leader.style.transform = `rotate(${angle}rad)`;
+      leader.hidden = distance === 0;
     }
   }
 
@@ -2089,6 +2161,32 @@ export class FlowCanvas {
       p.setAttribute('d', d);
       this.svg.appendChild(p);
     }
+    if (!this._connecting) this._syncEscalationBadges();
+  }
+
+  // Whether an escalation handler's path would be refused depends on the flows
+  // after it, which change without the handler itself being redrawn, so its
+  // badge is checked whenever the edges are.
+  _syncEscalationBadges() {
+    if (this.mode !== 'bpmn') return;
+    for (const node of this.nodes) {
+      if (node.type !== 'bpmn_boundary_escalation') continue;
+      const element = this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(node.id)}"]`);
+      const shown = element?.querySelector('.fb-process-warn')?.dataset.warning ?? '';
+      if (element && shown !== this._processWarnings(node).join(' ')) this._renderSingleNode(node);
+    }
+  }
+
+  _processWarnings(node) {
+    const warnings = processNodeWarnings(node, this.opts.processOptions?.serviceBlocks);
+    if (node.type === 'bpmn_boundary_escalation' && processEscalationPathProblem(this, node.id)) warnings.push('escalation_path');
+    return warnings;
+  }
+
+  _processWarningText(node, key) {
+    if (key !== 'escalation_path') return processWarningText(node, key, this.opts.processOptions?.serviceBlocks);
+    const reason = processEscalationPathProblem(this, node.id)?.reason;
+    return I18n.t(`bpmn.routing_warning_escalation_path_${ESCALATION_PATH_KEYS.includes(reason) ? reason : 'other'}`, { names: this._nodeName(node) });
   }
 
   _bezierPath(x1, y1, x2, y2) {

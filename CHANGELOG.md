@@ -167,6 +167,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   na NVMe-oF hosty połączone w tej chwili zachowują dostęp, dopóki nie połączą
   się ponownie (aby odciąć je od razu, zatrzymaj target).
   Usunięcie ostatniego wpisu (w edytorze listy albo „Rozłącz … i usuń z listy”)
+- Projektant BPMN, runda 3 (GUI): zapis odmawia timera bez strefy czasowej procesu
+  z nazwą elementu, rozwija zwinięty wiersz ustawień i ustawia fokus w polu (zamiast
+  surowego błędu serwera); żaden komunikat walidacji nie podaje identyfikatora
+  elementu bez nazwy. Pasek narzędzi to jeden wiersz o stałej wysokości w pięciu
+  językach (Publikuj, Uruchom i Zapisz na pasku, reszta w menu „Więcej”, każda ikona
+  inna); toasty wiszą pod paskiem, nie nad Publikuj i Zapisz. Zdarzenie brzegowe
+  upuszczone na zadanie bez miejsca ląduje obok, a każdy upuszczony element omija
+  istniejące. Cofnij i Ponów działają w widoku, w którym jest autor. Listy pokazują
+  nazwy zamiast identyfikatorów, a zapisany cel wywołania (zarchiwizowany lub
+  nieistniejący) jest nazwany i oznaczony ostrzeżeniem. Przerysowanie 80 elementów
+  nie wymusza układu strony dla każdego z nich, długie kody w etykietach łamią się po
+  podkreślniku i mają wielokropek.
   nie jest już odrzucane (`refusal:target_last_initiator` wysyłają tylko
   starsze węzły) i wymaga potwierdzenia na ekranie.
 - „Otwórz dla wszystkich”: jedyna świadoma droga od listy dozwolonych do

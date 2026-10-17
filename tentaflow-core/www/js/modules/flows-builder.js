@@ -16,7 +16,7 @@ import { TfWindow } from '/js/components/tf-window.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
-import { checkProcessDocument, processBody, processCommand, processEditorLabels, processExplainError, processHasTimer, processHasTimerStart } from '/js/modules/flows-builder/bpmn.js';
+import { checkProcessDocument, processBody, processCommand, processEditorLabels, processExplainError, processHasTimer, processHasTimerStart, processTimezoneGaps, processBodyLabels } from '/js/modules/flows-builder/bpmn.js';
 import { openProcessCalendar, openProcessDeclarations, openProcessInstances, openProcessMessageSend, openProcessMessages, openProcessModeling, openProcessRun, openProcessSchedule, openProcessVariables, processLifecycleReasonText, processTimerText } from '/js/modules/flows-builder/process-monitor.js';
 import { openProcessSimulation } from '/js/modules/flows-builder/process-simulation.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
@@ -25,6 +25,7 @@ import '/js/components/tf-textarea.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-file-input.js';
 import '/js/components/tf-table.js';
+import '/js/components/tf-menu.js';
 
 // Delete and undo must keep working after a click on Save or a palette Enter
 // leaves focus on a button, so only elements that consume these keys
@@ -70,22 +71,31 @@ const FlowBuilderScreen = {
             <tf-button variant="ghost" size="sm" icon="max" data-role="zoom-fit" title="${escapeAttr(I18n.t('flows_builder.zoom_fit'))}"></tf-button>
           </div>
           <div class="fb-topbar-separator"></div>
-          <tf-button variant="ghost" size="sm" icon="code" data-compact data-role="variables" title="${escapeAttr(I18n.t('flows_vars.button_title'))}">${escapeHtml(I18n.t('flows_vars.button'))}</tf-button>
-          ${process ? `<tf-button variant="ghost" size="sm" icon="arrow-up" data-compact data-role="import">${escapeHtml(I18n.t('bpmn.import_xml'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="download" data-compact data-role="export">${escapeHtml(I18n.t('bpmn.export_xml'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="clock" data-compact data-role="calendar">${escapeHtml(I18n.t('bpmn.calendar_title'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="mail" data-compact data-role="declarations">${escapeHtml(I18n.t('bpmn.declarations'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="layers" data-compact data-role="modeling">${escapeHtml(I18n.t('bpmn.modeling_title'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="refresh" data-role="refresh-calendar" hidden>${escapeHtml(I18n.t('bpmn.calendar_refresh'))}</tf-button>
-          <tf-button variant="secondary" size="sm" icon="check" data-role="publish">${escapeHtml(I18n.t('bpmn.publish'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="play" data-role="run" disabled>${escapeHtml(I18n.t('bpmn.run'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="play" data-compact data-role="simulate" disabled>${escapeHtml(I18n.t('bpmn.simulation'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="mail" data-role="send-start" hidden>${escapeHtml(I18n.t('bpmn.send_message'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="clock" data-role="schedule" hidden>${escapeHtml(I18n.t('bpmn.timer_schedule'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="clock" data-compact data-role="instances">${escapeHtml(I18n.t('bpmn.instances'))}</tf-button>` : ''}
-          ${process ? `<tf-button variant="ghost" size="sm" icon="mail" data-compact data-role="messages">${escapeHtml(I18n.t('bpmn.messages'))}</tf-button>` : ''}
+          ${process ? `<tf-button variant="secondary" size="sm" icon="check-circle" data-compact data-role="publish">${escapeHtml(I18n.t('bpmn.publish'))}</tf-button>
+          <tf-button variant="ghost" size="sm" icon="play" data-compact data-role="run" disabled>${escapeHtml(I18n.t('bpmn.run'))}</tf-button>
+          <tf-button variant="primary" size="sm" icon="save" data-role="save">${escapeHtml(I18n.t('flows_builder.save'))}</tf-button>
+          <tf-button variant="ghost" size="sm" icon="more" data-role="more" aria-haspopup="menu" aria-expanded="false" title="${escapeAttr(I18n.t('bpmn.more_actions'))}" aria-label="${escapeAttr(I18n.t('bpmn.more_actions'))}"></tf-button>
+          <tf-menu data-role="more-menu" placement="bottom-end">
+            <tf-menu-item icon="code" data-role="variables">${escapeHtml(I18n.t('flows_vars.button'))}</tf-menu-item>
+            <tf-menu-item icon="arrow-up" data-role="import">${escapeHtml(I18n.t('bpmn.import_xml'))}</tf-menu-item>
+            <tf-menu-item icon="download" data-role="export">${escapeHtml(I18n.t('bpmn.export_xml'))}</tf-menu-item>
+            <tf-menu-divider></tf-menu-divider>
+            <tf-menu-item icon="calendar" data-role="calendar">${escapeHtml(I18n.t('bpmn.calendar_title'))}</tf-menu-item>
+            <tf-menu-item icon="refresh" data-role="refresh-calendar" hidden>${escapeHtml(I18n.t('bpmn.calendar_refresh'))}</tf-menu-item>
+            <tf-menu-item icon="message" data-role="declarations">${escapeHtml(I18n.t('bpmn.declarations'))}</tf-menu-item>
+            <tf-menu-item icon="layers" data-role="modeling">${escapeHtml(I18n.t('bpmn.modeling_title'))}</tf-menu-item>
+            <tf-menu-divider></tf-menu-divider>
+            <tf-menu-item icon="flask" data-role="simulate" disabled>${escapeHtml(I18n.t('bpmn.simulation'))}</tf-menu-item>
+            <tf-menu-item icon="send" data-role="send-start" hidden>${escapeHtml(I18n.t('bpmn.send_message'))}</tf-menu-item>
+            <tf-menu-item icon="clock" data-role="schedule" hidden>${escapeHtml(I18n.t('bpmn.timer_schedule'))}</tf-menu-item>
+            <tf-menu-divider></tf-menu-divider>
+            <tf-menu-item icon="list" data-role="instances">${escapeHtml(I18n.t('bpmn.instances'))}</tf-menu-item>
+            <tf-menu-item icon="inbox" data-role="messages">${escapeHtml(I18n.t('bpmn.messages'))}</tf-menu-item>
+            <tf-menu-divider></tf-menu-divider>
+            <tf-menu-item icon="history" data-role="history">${escapeHtml(I18n.t('flows_builder.history_title'))}</tf-menu-item>
+          </tf-menu>` : `<tf-button variant="ghost" size="sm" icon="code" data-compact data-role="variables" title="${escapeAttr(I18n.t('flows_vars.button_title'))}">${escapeHtml(I18n.t('flows_vars.button'))}</tf-button>
           <tf-button variant="primary" size="sm" icon="check" data-role="save">${escapeHtml(I18n.t('flows_builder.save'))}</tf-button>
-          <tf-button variant="ghost" size="sm" icon="clock" data-role="history" title="${escapeAttr(I18n.t('flows_builder.history_title'))}"></tf-button>
+          <tf-button variant="ghost" size="sm" icon="clock" data-role="history" title="${escapeAttr(I18n.t('flows_builder.history_title'))}"></tf-button>`}
         </header>
         ${process ? `<div class="fb-process-notice" id="fb-process-notice"><tf-chip status="info" data-role="publication">${escapeHtml(I18n.t('bpmn.draft'))}</tf-chip><tf-button variant="ghost" size="sm" icon="chevron-down" data-role="notice-toggle" aria-controls="fb-process-notice">${escapeHtml(I18n.t('bpmn.process_settings'))}</tf-button><span data-role="process-hint">${escapeHtml(I18n.t('bpmn.supported_hint'))}</span><tf-select data-role="body-select" wrap-selected label="${escapeAttr(I18n.t('bpmn.process_body'))}"></tf-select><tf-select data-role="start-entry" wrap-selected label="${escapeAttr(I18n.t('bpmn.start_entry'))}"></tf-select><tf-button variant="secondary" size="sm" data-role="add-body">${escapeHtml(I18n.t('bpmn.add_process_body'))}</tf-button><tf-input data-role="body-name" label="${escapeAttr(I18n.t('bpmn.process_body_name'))}"></tf-input><tf-chip status="info" data-role="calendar-state" hidden></tf-chip><tf-input class="fb-timer-timezone" data-role="timer-timezone" label="${escapeAttr(I18n.t('bpmn.timer_timezone'))}" hint="${escapeAttr(I18n.t('bpmn.timer_timezone_hint'))}" placeholder="Europe/Warsaw" hidden></tf-input><tf-button variant="ghost" size="sm" data-role="draft" hidden>${escapeHtml(I18n.t('bpmn.return_draft'))}</tf-button><tf-button variant="ghost" size="sm" data-role="archive">${escapeHtml(I18n.t('bpmn.archive'))}</tf-button><span data-role="timer-summary" hidden></span></div>` : ''}
         <tf-alert data-role="error" tone="danger" hidden></tf-alert>
@@ -107,7 +117,7 @@ const FlowBuilderScreen = {
           <div class="fb-breadcrumb">
             <span class="fb-crumb">${escapeHtml(I18n.t(process ? 'bpmn.crumb_root' : 'flows_builder.crumb_root'))}</span>
             ${process ? `<tf-button variant="ghost" size="sm" data-role="scope-up" hidden>${escapeHtml(I18n.t('bpmn.leave_subprocess'))}</tf-button><span class="fb-crumb" data-role="scope-path" hidden></span>` : ''}
-            <span class="fb-sep">›</span>
+            <span class="fb-sep" data-role="crumb-sep">›</span>
             <span class="fb-crumb active" data-role="crumb-name">${escapeHtml(I18n.t('flows_builder.crumb_empty'))}</span>
           </div>
           <div class="fb-bottombar-separator"></div>
@@ -245,8 +255,7 @@ const FlowBuilderScreen = {
         if (edge) state.config?.showEdge(edge);
         else state.config?.show(node, tpl);
         if ((node || edge) && state.mode === 'bpmn') state.showMobileTab?.('config');
-        const crumb = root.querySelector('[data-role="crumb-name"]');
-        if (crumb) crumb.textContent = node ? getNodeDisplayTitle(node, tpl) : (state.flow?.name || I18n.t('flows_builder.crumb_empty'));
+        this._syncCrumb(state, node);
       },
       onViewChange: (v) => {
         const zl = root.querySelector('[data-role="zoom-level"]');
@@ -282,7 +291,7 @@ const FlowBuilderScreen = {
         state.canvas.updateNodeLabel(id, label);
         if (state.canvas.selectedIds.size !== 1 || !state.canvas.selectedIds.has(id)) return;
         const node = state.canvas.nodes.find((candidate) => candidate.id === id);
-        if (node) root.querySelector('[data-role="crumb-name"]').textContent = getNodeDisplayTitle(node, state.templatesMap.get(node.type));
+        if (node) this._syncCrumb(state, node);
       },
       onPositionChange: (id, patch) => {
         const n = state.canvas.nodes.find((x) => x.id === id);
@@ -313,10 +322,9 @@ const FlowBuilderScreen = {
     // Topbar bindings
     const nameEl = root.querySelector('[data-role="name"]');
     const statusEl = root.querySelector('[data-role="status"]');
-    const crumbName = root.querySelector('[data-role="crumb-name"]');
     nameEl.value = state.flow.name || '';
     statusEl.value = state.flow.status || 'draft';
-    crumbName.textContent = state.flow.name || I18n.t('flows_builder.crumb_empty');
+    this._syncCrumb(state, null);
     root.querySelector('[data-role="scope-up"]')?.addEventListener('click', () => {
       state.canvas.navigateProcessBody(state.canvas.processPath.slice(0, -1));
       state.config.renderEmpty();
@@ -339,7 +347,7 @@ const FlowBuilderScreen = {
       root.insertBefore(banner, root.querySelector('[data-role="body"]'));
     }
 
-    nameEl.addEventListener('input', (event) => { if (event.target !== nameEl) return; this._markDirty(); crumbName.textContent = nameEl.value || I18n.t('flows_builder.crumb_empty'); });
+    nameEl.addEventListener('input', (event) => { if (event.target !== nameEl) return; this._markDirty(); this._syncCrumb(state); });
     statusEl.addEventListener('change', () => this._markDirty());
 
     root.querySelector('[data-role="back"]').addEventListener('click', async () => {
@@ -396,6 +404,7 @@ const FlowBuilderScreen = {
         noticeToggle.setAttribute('icon', open ? 'chevron-down' : 'chevron-right');
       };
       const roomy = () => window.innerWidth >= 768 && window.innerHeight >= 820;
+      state.showSettings = (open) => { noticeTouched = true; showNotice(open); };
       showNotice(roomy());
       // The window can be resized after the screen opened; until the author has
       // used the toggle, the row follows the room there is.
@@ -409,8 +418,27 @@ const FlowBuilderScreen = {
       state.cleanupFns.push(() => window.removeEventListener('resize', onResize));
       // Secondary buttons shrink to their icon on a narrow bar; the text stays as the tooltip.
       for (const button of root.querySelectorAll('.fb-topbar tf-button[data-compact]')) {
-        if (!button.hasAttribute('title')) button.setAttribute('title', button.textContent.trim());
+        const name = button.textContent.trim();
+        if (!button.hasAttribute('title')) button.setAttribute('title', name);
+        if (!button.hasAttribute('aria-label')) button.setAttribute('aria-label', name);
       }
+      // Everything the bar has no room for sits behind one menu that opens under
+      // its button; Escape or a choice puts focus back on the button.
+      const more = root.querySelector('[data-role="more"]');
+      const moreMenu = root.querySelector('[data-role="more-menu"]');
+      moreMenu.anchor = more;
+      more.addEventListener('click', () => moreMenu.toggle());
+      moreMenu.addEventListener('open', (event) => {
+        if (event.target !== moreMenu) return;
+        more.setAttribute('aria-expanded', 'true');
+        queueMicrotask(() => [...moreMenu.querySelectorAll(':scope > tf-menu-item:not([hidden]):not([disabled]) > .tf-menu-item')][0]?.focus());
+      });
+      moreMenu.addEventListener('close', (event) => {
+        if (event.target !== moreMenu) return;
+        const wasOpen = more.getAttribute('aria-expanded') === 'true';
+        more.setAttribute('aria-expanded', 'false');
+        if (wasOpen && (moreMenu.contains(document.activeElement) || document.activeElement === document.body)) (more.querySelector('button') ?? more).focus?.();
+      });
       const paletteEl = root.querySelector('[data-role="palette"]');
       const paletteToggle = root.querySelector('[data-role="palette-toggle"]');
       state.setPaletteOpen = (open, { restoreFocus = false } = {}) => {
@@ -425,8 +453,17 @@ const FlowBuilderScreen = {
         }
       };
       paletteToggle.addEventListener('click', () => state.setPaletteOpen(!paletteEl.classList.contains('open')));
+      // The drawer answers Escape only when nothing sits above it: a dialog, an
+      // open menu or a select takes that key for itself, and this listener runs
+      // first (capture), so it must not steal it. A dialog or a select holds the
+      // focus, so the key is the drawer's only when it comes from the drawer, its
+      // button, the canvas or the page itself, and no menu is open.
+      const canvasWrap = root.querySelector('[data-role="canvas-wrap"]');
       const closeDrawerOnEscape = (event) => {
         if (event.key !== 'Escape' || !paletteToggle.offsetParent || !paletteEl.classList.contains('open')) return;
+        const origin = event.composedPath()[0];
+        const own = origin === document.body || paletteEl.contains(origin) || canvasWrap.contains(origin);
+        if (!own || document.querySelector('tf-menu[open], tf-modal[open]')) return;
         event.stopPropagation();
         state.setPaletteOpen(false, { restoreFocus: true });
       };
@@ -579,7 +616,7 @@ const FlowBuilderScreen = {
     const messageVersion = !!entry?.trigger?.MessageStart;
     run.toggleAttribute('disabled', !state.definition.publishedVersion || state.definition.archived
       || !!state.operationBusy || !entry?.trigger?.Start?.canStart);
-    run.setAttribute('title', I18n.t(timedVersion ? 'bpmn.timer_start_manual_hint' : messageVersion ? 'bpmn.message_start_manual_hint' : 'bpmn.run_hint'));
+    run.setAttribute('title', `${I18n.t('bpmn.run')} — ${I18n.t(timedVersion ? 'bpmn.timer_start_manual_hint' : messageVersion ? 'bpmn.message_start_manual_hint' : 'bpmn.run_hint')}`);
     const simulate = state.root.querySelector('[data-role="simulate"]');
     simulate.toggleAttribute('disabled', !state.definition.publishedVersion || state.definition.archived
       || state.previewVersion !== null || !!state.operationBusy || !entry?.trigger?.Start?.canStart);
@@ -727,7 +764,7 @@ const FlowBuilderScreen = {
       if (!selected?.trigger?.Start?.canStart) throw new Error(I18n.t('bpmn.start_entry_changed'));
       openProcessSimulation({ ...current.definition, model: response.version.model },
         response.version, response.startCatalog, selected,
-        current.root.querySelector('[data-role="simulate"]'));
+        current.root.querySelector('[data-role="more"]'));
     });
   },
 
@@ -919,9 +956,6 @@ const FlowBuilderScreen = {
     const el = s.root.querySelector('[data-role="autosave"]');
     const t = s.root.querySelector('[data-role="autosave-text"]');
     if (!el || !t) return;
-    // A silent autosave has no toast, so the element that blocks it is named here.
-    if (kind === 'error' && reason) el.setAttribute('title', reason);
-    else el.removeAttribute('title');
     const incomplete = s.canvas.incompleteNodeCount();
     const warn = kind === 'ok' && incomplete > 0;
     el.classList.toggle('pending', kind === 'pending');
@@ -933,6 +967,9 @@ const FlowBuilderScreen = {
     else if (kind === 'error') t.textContent = I18n.t('flows_builder.autosave_error');
     else if (warn) t.textContent = I18n.t('flows_builder.autosave_incomplete', { count: incomplete });
     else t.textContent = I18n.t('flows_builder.autosave_saved');
+    // A silent autosave has no toast, so the element that blocks it is named here;
+    // on a narrow bar the chip is only its icon and the tooltip is its text.
+    el.setAttribute('title', kind === 'error' && reason ? reason : t.textContent);
   },
 
   _updateStats() {
@@ -960,8 +997,30 @@ const FlowBuilderScreen = {
       names.push(node.name || I18n.t('bpmn.node_sub_process'));
       body = processBody(body, [id]);
     }
-    label.textContent = names.join(' › ');
+    state.scopeNames = names;
+    this._syncCrumb(state);
     this._syncProcessBodySelect();
+  },
+
+  // The path reads from the outside in: process, the definition, the sub-processes
+  // entered and, last, the element selected. Inside a sub-process the definition
+  // name moves into the scope label so it stays before them, and the last crumb
+  // appears only for a selection; unscoped it shows the definition when nothing is.
+  _syncCrumb(state, selected = this._selectedNode(state)) {
+    const root = state.root;
+    const crumb = root.querySelector('[data-role="crumb-name"]');
+    const separator = root.querySelector('[data-role="crumb-sep"]');
+    const flowName = root.querySelector('[data-role="name"]')?.value || state.flow?.name || I18n.t('flows_builder.crumb_empty');
+    const scoped = state.mode === 'bpmn' && state.canvas?.processPath.length > 0;
+    const label = root.querySelector('[data-role="scope-path"]');
+    if (label) label.textContent = [flowName, ...(state.scopeNames || [])].join(' › ');
+    crumb.textContent = selected ? getNodeDisplayTitle(selected, state.templatesMap.get(selected.type)) : flowName;
+    crumb.hidden = separator.hidden = scoped && !selected;
+  },
+
+  _selectedNode(state) {
+    const canvas = state.canvas;
+    return canvas?.selectedIds.size === 1 ? canvas.nodes.find((node) => canvas.selectedIds.has(node.id)) ?? null : null;
   },
 
   _syncProcessBodySelect() {
@@ -970,8 +1029,9 @@ const FlowBuilderScreen = {
     const model = state.canvas.processModel;
     const bodies = [model, ...(model.additionalProcesses || [])];
     const select = state.root.querySelector('[data-role="body-select"]');
+    const labels = processBodyLabels(model);
     select?.setOptions(bodies.map((body) => ({
-      value: body.processId, label: body.processName || body.processId,
+      value: body.processId, label: labels.get(body.processId),
     })), state.canvas.selectedProcessId);
     const name = state.root.querySelector('[data-role="body-name"]');
     if (name) name.value = processBody(model, [], state.canvas.selectedProcessId).processName || '';
@@ -989,9 +1049,11 @@ const FlowBuilderScreen = {
     if (!state || state.mode !== 'bpmn') return;
     const select = state.root.querySelector('[data-role="start-entry"]');
     const current = select.value;
+    const labels = processBodyLabels(state.canvas.processModel);
+    const startKind = (entry) => entry.trigger?.TimerStart ? 'timer_start' : entry.trigger?.MessageStart ? 'message_start' : 'start';
     select.setOptions([{ value: '', label: I18n.t('bpmn.start_entry'), disabled: true }, ...state.startCatalog.map((entry, index) => ({
       value: String(index),
-      label: `${entry.processName || entry.processId} · ${entry.startNodeName || entry.startNodeId}`,
+      label: `${labels.get(entry.processId) || entry.processName || I18n.t('bpmn.crumb_root')} · ${entry.startNodeName || I18n.t(`bpmn.node_${startKind(entry)}`)}`,
     }))], current && state.startCatalog[Number(current)] ? current : '');
   },
 
@@ -1005,6 +1067,7 @@ const FlowBuilderScreen = {
     if (errors.length > 0) {
       this._reportSaveProblem(s, errors.length > 1
         ? I18n.t('flows_builder.save_blocked_more', { first: errors[0], count: errors.length - 1 }) : errors[0], silent);
+      if (!silent && s.mode === 'bpmn') this._revealMissingTimezone(s);
       return false;
     }
     s.saving = true;
@@ -1066,6 +1129,24 @@ const FlowBuilderScreen = {
     }
   },
 
+  // A refused save for want of a time zone takes the author to the field: its
+  // body is shown, the settings row (folded on a short window) is opened and the
+  // field is focused. A silent autosave never moves focus.
+  _revealMissingTimezone(state) {
+    const gap = processTimezoneGaps(state.canvas.getData())[0];
+    if (!gap) return;
+    if (gap.processId !== state.canvas.selectedProcessId) {
+      state.canvas.navigateProcessBody([], gap.processId);
+      state.config.renderEmpty();
+      this._syncProcessPath();
+      this._updateStats();
+      this._renderMinimap();
+    }
+    state.showSettings(true);
+    this._syncProcessControls();
+    state.root.querySelector('[data-role="timer-timezone"]').focus();
+  },
+
   // Messages from the server and the codec cite elements by internal id; the
   // author sees their names.
   _explain(state, message) {
@@ -1116,6 +1197,10 @@ const FlowBuilderScreen = {
     const s = this._state;
     if (!s) return;
     if (ev.composedPath().some(isTextEntryOrDialog)) return;
+    if (ev.key === 'Escape') {
+      if (s.canvas.selectedIds.size || s.canvas.selectedEdgeId) s.canvas.clearSelection();
+      return;
+    }
     if (s.readOnly) return;
     if (ev.key === 'Delete' || ev.key === 'Backspace') {
       s.canvas.deleteSelected();

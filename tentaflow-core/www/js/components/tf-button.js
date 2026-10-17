@@ -3,8 +3,10 @@
 // Opis: Komponent <tf-button> — renderuje standardowy button z klasami .tf-btn.
 //       Light DOM (bez Shadow DOM) zeby controls.css obslugiwal style.
 //       Atrybuty: variant, tone, size, icon, disabled, full-width, wrap.
-//       `aria-label` is copied onto the inner <button>: the host is not
-//       focusable, so an icon-only button needs its name on the real control.
+//       `aria-label`, `aria-describedby`, `aria-expanded` and `aria-haspopup`
+//       are copied onto the inner <button>, also when they change later: the
+//       host is not focusable, so a name, a description or a menu state has to
+//       be on the real control.
 // Przyklad: <tf-button variant="primary" icon="plus">Dodaj</tf-button>
 // =============================================================================
 
@@ -23,6 +25,8 @@ function safeIconName(value) {
   const text = String(value || '').trim();
   return /^[a-z0-9_-]{1,64}$/i.test(text) ? text : '';
 }
+
+const FORWARDED_ARIA = ['aria-label', 'aria-describedby', 'aria-expanded', 'aria-haspopup'];
 
 const VARIANT_CLASS = {
   primary:        'tf-btn-primary',
@@ -49,7 +53,7 @@ const TONE_CLASS = {
 
 class TfButton extends HTMLElement {
   static get observedAttributes() {
-    return ['variant', 'tone', 'size', 'icon', 'trailing-icon', 'disabled', 'type', 'label', 'full-width', 'wrap'];
+    return ['variant', 'tone', 'size', 'icon', 'trailing-icon', 'disabled', 'type', 'label', 'full-width', 'wrap', ...FORWARDED_ARIA];
   }
 
   constructor() {
@@ -98,8 +102,6 @@ class TfButton extends HTMLElement {
     this.innerHTML = '';
     const btn = document.createElement('button');
     btn.className = 'tf-btn';
-    const ariaLabel = this.getAttribute('aria-label');
-    if (ariaLabel) btn.setAttribute('aria-label', ariaLabel);
     btn.innerHTML = this._renderContent(innerHtml);
     btn.addEventListener('click', (e) => {
       if (this.hasAttribute('disabled')) {
@@ -194,6 +196,11 @@ class TfButton extends HTMLElement {
 
     const type = this.getAttribute('type');
     if (type) this._btn.setAttribute('type', type);
+    for (const name of FORWARDED_ARIA) {
+      const value = this.getAttribute(name);
+      if (value === null || value === '') this._btn.removeAttribute(name);
+      else this._btn.setAttribute(name, value);
+    }
   }
 }
 

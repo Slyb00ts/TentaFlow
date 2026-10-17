@@ -1450,3 +1450,33 @@ test('tf-tag-input: invalid marks the chips of the wrong values and leaves the r
   assert.equal(chips()[0].getAttribute('tone'), 'neutral');
   input.remove();
 });
+
+test('tf-menu: a pointerdown on its anchor leaves the menu to the anchor, one anywhere else closes it', async () => {
+  await import('./tf-menu.js');
+  const anchor = document.createElement('button');
+  const menu = document.createElement('tf-menu');
+  document.body.append(anchor, menu);
+  menu.anchor = anchor;
+  menu.open();
+  anchor.dispatchEvent(new window.Event('pointerdown', { bubbles: true, composed: true }));
+  assert.equal(menu.hasAttribute('open'), true, 'the trigger decides: its click toggles, so the press must not close first');
+  document.body.dispatchEvent(new window.Event('pointerdown', { bubbles: true, composed: true }));
+  assert.equal(menu.hasAttribute('open'), false, 'a press elsewhere dismisses it');
+  anchor.remove(); menu.remove();
+});
+
+test('tf-button: aria-label, aria-describedby, aria-expanded and aria-haspopup reach the real button, also when they change', async () => {
+  const button = mount(new TfButton(), { icon: 'more' });
+  await flush();
+  const inner = () => button.querySelector('button');
+  button.setAttribute('aria-label', 'More');
+  button.setAttribute('aria-describedby', 'why');
+  button.setAttribute('aria-expanded', 'false');
+  button.setAttribute('aria-haspopup', 'menu');
+  assert.deepEqual(['aria-label', 'aria-describedby', 'aria-expanded', 'aria-haspopup'].map((name) => inner().getAttribute(name)), ['More', 'why', 'false', 'menu']);
+  button.setAttribute('aria-expanded', 'true');
+  assert.equal(inner().getAttribute('aria-expanded'), 'true');
+  button.removeAttribute('aria-describedby');
+  assert.equal(inner().hasAttribute('aria-describedby'), false);
+  button.remove();
+});
