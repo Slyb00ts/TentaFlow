@@ -1347,12 +1347,24 @@ fn pack_container_contexts(out_dir: &Path) {
     }
     println!("cargo:rerun-if-changed=src/services/manifest/vocabulary.rs");
     println!("cargo:rerun-if-env-changed=TENTAFLOW_PYTHON");
+    println!(
+        "cargo:rerun-if-changed={}",
+        workspace_root.join("scripts/ensure-python.sh").display()
+    );
     let python = std::env::var("TENTAFLOW_PYTHON").unwrap_or_else(|_| {
         if cfg!(windows) {
-            "python".into()
-        } else {
-            "python3".into()
+            return "python".into();
         }
+        // A bare `cargo build` has no wrapper to pick the interpreter, and the system
+        // python3 on macOS is 3.9; reuse the one resolver the scripts already share.
+        Command::new("bash")
+            .arg(workspace_root.join("scripts/ensure-python.sh"))
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| "python3".into())
     });
     let bundle_path = out_dir.join("container_bundle.tar.gz");
     let output = Command::new(python)
