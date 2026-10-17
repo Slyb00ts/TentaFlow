@@ -293,6 +293,11 @@ case "$PLATFORM" in
     resolve_macos_sdk "$PLATFORM"
     ensure_cmake_pin_on_path
     ensure_apple_libtool_shim_on_program_path
+    # Thrift z Arrow 21 uzywa SSLv3_method/ASN1_STRING_data, usunietych w OpenSSL 4;
+    # generyczny /opt/homebrew/opt/openssl wskazuje juz na openssl@4, wiec pinujemy 3.
+    openssl3_prefix="$(brew --prefix openssl@3 2>/dev/null || true)"
+    [[ -d "$openssl3_prefix" ]] || { echo "[zvec] brak openssl@3 — brew install openssl@3" >&2; exit 1; }
+    export OPENSSL_ROOT_DIR="$openssl3_prefix"
     # Izolacja symboli: eksportuj WYŁĄCZNIE C API zvec (`_zvec_*`), schowaj
     # zbundlowane protobuf/abseil/RocksDB. macOS ld64 nie używa version-scriptów —
     # odpowiednikiem jest allowlista `-exported_symbols_list` (tylko wymienione

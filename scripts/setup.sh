@@ -136,30 +136,6 @@ run_privileged() {
     fi
 }
 
-ensure_macos_metal_toolchain() {
-    # macOS 26 / Xcode 26 wydzielil kompilator Metala jako osobny komponent.
-    # Bez niego mlx-swift buduje zepsuty metallib i KAZDY model MLX zwraca
-    # belkot (zle logity), bez bledu builda. Instalujemy go raz na maszyne.
-    if [[ "$DISTRO" != "macos" ]]; then
-        return
-    fi
-    if xcrun --sdk macosx metal --version &>/dev/null; then
-        log_ok "Metal Toolchain juz dostepny"
-        return
-    fi
-    log_warn "Brak Metal Toolchain (macOS 26+) — bez niego modele MLX beda belkotac"
-    log_info "Pobieranie Metal Toolchain (~688 MB)..."
-    if xcodebuild -downloadComponent MetalToolchain; then
-        log_ok "Metal Toolchain zainstalowany"
-        INSTALLED+=("Metal Toolchain")
-        # Wyczysc stary, zepsuty metallib zeby xcodebuild zbudowal poprawny.
-        rm -rf "$(dirname "$0")/../tentaflow-desktop/macos/swift/MLXBridge/build-xcode" 2>/dev/null || true
-    else
-        log_error "Nie udalo sie pobrac Metal Toolchain — uruchom recznie:"
-        log_error "  xcodebuild -downloadComponent MetalToolchain"
-    fi
-}
-
 configure_macos_gstreamer_pkg_config() {
     if [[ "$DISTRO" != "macos" ]]; then
         return
@@ -550,7 +526,6 @@ install_base() {
             log_info "Instalacja: ${pkgs[*]}"
             brew install "${pkgs[@]}"
             configure_macos_gstreamer_pkg_config
-            ensure_macos_metal_toolchain
             INSTALLED+=("cmake" "ninja" "llvm (clang+lld)" "git" "openjdk@17" "unzip" "pkg-config" "glib" "gstreamer" "gst-plugins-base" "ffmpeg" "openssl@3" "sqlite")
             ;;
     esac
@@ -1141,11 +1116,19 @@ install_metal_toolchain() {
     local xcode_dev
     xcode_dev=$(xcode-select -p)
     if [[ "$xcode_dev" != *"Xcode.app"* ]]; then
-        log_warn "Aktywne Developer Dir: $xcode_dev"
-        log_warn "Metal Toolchain wymaga pelnego Xcode. Zainstaluj Xcode i przelacz:"
-        log_warn "  sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
-        log_warn "Potem uruchom: xcodebuild -downloadComponent MetalToolchain"
-        return
+        local app_dev
+        app_dev=$(ls -d /Applications/Xcode*.app 2>/dev/null | head -1)
+        if [[ -z "$app_dev" ]]; then
+            log_warn "Aktywne Developer Dir: $xcode_dev"
+            log_warn "Metal Toolchain wymaga pelnego Xcode. Zainstaluj Xcode z App Store."
+            return
+        fi
+        app_dev="$app_dev/Contents/Developer"
+        log_info "Przelaczam Developer Dir na $app_dev"
+        if ! sudo xcode-select -s "$app_dev"; then
+            log_warn "Nie udalo sie przelaczyc Developer Dir — uruchom: sudo xcode-select -s $app_dev"
+            return
+        fi
     fi
 
     log_info "Metal Toolchain brakuje. Pobieram komponent (moze potrwac, kilkaset MB)..."
@@ -2085,6 +2068,7 @@ main() {
     install_wasm_bindgen_cli
     install_dotnet_sdk
     install_wasi_sdk
+    install_metal_toolchain
     install_zvec
     update_vllm_recipes
     install_android_rust_tools
@@ -2092,7 +2076,6 @@ main() {
     install_android_gradle_runner
     install_ios_targets
     require_full_xcode
-    install_metal_toolchain
     install_ios_platform
     install_ios_gstreamer_xcframework
     install_zvec_ios
