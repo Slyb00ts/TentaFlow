@@ -1082,7 +1082,11 @@ async fn run_rgb_vehicle_forward(frames: Vec<CvFrameLocal>) -> Vec<Vec<Detection
             .iter()
             .map(|f| (f.data.as_ref(), f.width, f.height))
             .collect();
-        detector.detect_batch(&refs)
+        detector.detect_batch(
+            &refs,
+            crate::vision::detector_coco::VEHICLE_CLASSES,
+            crate::vision::detector_coco::VEHICLE_SCORE_THRESHOLD,
+        )
     })
     .await;
     match out {

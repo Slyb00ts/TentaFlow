@@ -193,12 +193,6 @@ pub struct VisionConfig {
     #[serde(default)]
     pub zerocopy_crops: bool,
 
-    /// Trust that `gst_memory_map(GST_MAP_CUDA)` already synced the decode
-    /// surface and skip the `cudaDeviceSynchronize` barrier (lower latency;
-    /// enable only once confirmed on the target GStreamer build).
-    #[serde(default)]
-    pub zerocopy_map_sync: bool,
-
     /// Verify the zero-copy DETECT preprocess against the download path on the
     /// first few frames (correctness gate; logged, never fatal).
     #[serde(default)]
@@ -360,7 +354,6 @@ impl Default for VisionConfig {
             trt_cuda_graph: false,
             zerocopy_detect: false,
             zerocopy_crops: false,
-            zerocopy_map_sync: false,
             zerocopy_verify: false,
             zerocopy_crops_verify: false,
             nv12_detect: default_true(),

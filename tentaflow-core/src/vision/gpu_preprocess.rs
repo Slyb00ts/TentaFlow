@@ -74,7 +74,6 @@ extern "C" {
     fn cudaStreamCreateWithFlags(stream: *mut CudaStream, flags: c_uint) -> c_int;
     fn cudaStreamDestroy(stream: CudaStream) -> c_int;
     fn cudaStreamSynchronize(stream: CudaStream) -> c_int;
-    fn cudaDeviceSynchronize() -> c_int;
     fn cudaGetErrorString(err: c_int) -> *const c_char;
 
     fn launch_crop_resize_normalize(
@@ -900,12 +899,8 @@ pub struct Nv12CropDownload {
 /// bytes as cropping the full host frame would. Transfers ~`crop_w*crop_h*1.5`
 /// bytes, never the full frame.
 ///
-/// SYNCHRONIZATION: the NVDEC decode is asynchronous. By default we
-/// `cudaDeviceSynchronize()` before the copies so the decoder has finished
-/// writing the surface (the enrichment crop runs off the mailbox's latest frame,
-/// usually already complete, but the barrier is correct against any stream
-/// setup). `[vision] zerocopy_map_sync = true` trusts the map already synced and
-/// skips it (lower latency once confirmed on the target GStreamer build).
+/// SYNCHRONIZATION: the NVDEC decode is asynchronous; `map_nv12_device` already
+/// waited for the decoder's stream, so the surface is complete here.
 pub fn download_nv12_crop_rect(
     planes: Nv12DevicePlanes,
     x0: u32,
@@ -930,8 +925,6 @@ pub fn download_nv12_crop_rect(
     let y_bytes = y_stride * ech_u;
     let uv_bytes = uv_stride * chroma_rows;
     let mut data = vec![0u8; y_bytes + uv_bytes];
-
-    wait_for_decoded_surface()?;
 
     // Y sub-plane: rows [ey0, ey0+ech), cols [ex0, ex0+ecw) → tight dst.
     let y_src = planes.y_ptr + (ey0 as u64) * (planes.y_stride as u64) + ex0 as u64;
@@ -1096,13 +1089,8 @@ fn letterbox_pad(fit: FrameFit) -> u8 {
 /// thread's stream, for callers that hand the tensor to another thread and
 /// unmap the surface right after this returns.
 ///
-/// SYNCHRONIZATION: the decode is asynchronous, so the decoder may still be
-/// writing the surface when we map it. Before launching the kernel we ensure the
-/// decode has completed: by default `cudaDeviceSynchronize()` (correct against
-/// ANY nvcodec stream configuration, the safe choice for the opt-in path). Set
-/// `[vision] zerocopy_map_sync = true` to trust that `gst_memory_map(GST_MAP_CUDA)`
-/// already synced the surface's stream and skip the device sync (lower latency,
-/// only once confirmed on the target GStreamer build).
+/// SYNCHRONIZATION: the decode is asynchronous; `map_nv12_device` already waited
+/// for the decoder's stream, so the surface is complete when this runs.
 ///
 /// LIFETIME: the caller MUST keep the source `GstBuffer` mapped + ref-held across
 /// this whole call (the kernel reads its device memory); it may unmap
@@ -1117,8 +1105,6 @@ pub fn preprocess_nv12_device_gpu(
 ) -> Result<OwnedDeviceTensor> {
     check_device_planes(&planes, "preprocess_nv12_device_gpu")?;
     let mut out = OwnedDeviceTensor::alloc(s)?;
-
-    wait_for_decoded_surface()?;
 
     SCRATCH.with(|cell| {
         let mut guard = cell.borrow_mut();
@@ -1156,22 +1142,6 @@ pub const MOSAIC_BLOCK_MIN: u32 = 12;
 pub const MOSAIC_BLOCK_MAX: u32 = 48;
 /// Block side of the whole-frame (fail-closed) mosaic.
 pub const MOSAIC_WHOLE_FRAME_BLOCK: u32 = 32;
-
-/// Make sure an NVDEC surface that was just mapped is fully decoded before a
-/// kernel reads (or rewrites) it: the decode runs asynchronously on nvcodec's own
-/// stream. By default a `cudaDeviceSynchronize()`, correct against any nvcodec
-/// stream configuration; `[vision] zerocopy_map_sync = true` trusts that
-/// `gst_memory_map(GST_MAP_CUDA)` already synced the surface's stream and skips
-/// it (lower latency, only once confirmed on the target GStreamer build).
-pub fn wait_for_decoded_surface() -> Result<()> {
-    if crate::vision::settings::get().zerocopy_map_sync {
-        return Ok(());
-    }
-    cuda_check(
-        unsafe { cudaDeviceSynchronize() },
-        "cudaDeviceSynchronize decode-wait",
-    )
-}
 
 /// A rectangle to pixelate, in luma pixels of the full frame. It may extend past
 /// the frame (it is clamped) and may sit on odd coordinates (it is widened to

@@ -240,8 +240,8 @@ fn load_nhwc(path: &Path, _n: usize) -> Result<Net> {
         path,
         &path.with_file_name(format!("trt-cache-{stem}")),
         None,
-        // Two hands are tracked (or two wrist regions searched) at once.
-        2,
+        // Every person's hands are tracked (and wrist regions searched) at once.
+        4,
         false,
         // Tiny static graphs: an engine build would cost more than it saves.
         crate::vision::ort_common::EpChain::CudaOnly,

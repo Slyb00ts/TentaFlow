@@ -39,7 +39,7 @@ inference-mlx-kokoro = ["dep:libloading"]
 inference-supertonic = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode-normalization", "dep:crossbeam-channel"]
 # ONNX Runtime dla głównej ścieżki wizji. Jest niezależny od Supertonic, żeby
 # AMD/Intel mogły używać Burn przez WGPU/Vulkan przy zachowaniu TTS przez ORT.
-vision-ort = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode-normalization", "dep:crossbeam-channel"]
+vision-ort = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode-normalization", "dep:crossbeam-channel", "dep:libloading"]
 # RF-DETR ADR detector (Burn). Gates the whole detector/state/OCR modules + the
 # per-camera always-on analysis loop. Pulls the wgpu backend as the universal
 # floor; add `vision-cuda`/`vision-metal` for a native backend.
@@ -333,7 +333,8 @@ tentaflow-wrappers = { workspace = true, optional = true }
 tentaflow-hardware = { workspace = true, default-features = true }
 
 # STT — Whisper (optional)
-# dlopen libMLXBridge.dylib — feature inference-mlx-whisper.
+# dlopen: libMLXBridge.dylib (inference-mlx-*), libgstcuda for the NVDEC stream
+# wait of the zero-copy map (vision-ort).
 libloading = { workspace = true, optional = true }
 sherpa-rs-sys = { workspace = true, optional = true }
 # Supertonic TTS i wizja — ONNX Runtime przez `ort` z `load-dynamic`: runtime

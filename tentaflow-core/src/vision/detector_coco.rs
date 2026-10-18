@@ -157,10 +157,16 @@ impl CocoDetector {
     }
 
     /// Runs N RGB24 frames through host-tensor forwards (one per frame, the
-    /// graph has a static batch of 1) and returns their vehicle boxes. The host
-    /// preprocess is the YOLOX one: letterbox into 416, BGR, raw 0..255, NCHW.
-    /// Output order == input order, length == `frames.len()`.
-    pub fn detect_batch(&self, frames: &[(&[u8], u32, u32)]) -> Result<Vec<Vec<Detection>>> {
+    /// graph has a static batch of 1) and returns their boxes of `classes` scoring
+    /// at least `score_threshold`. The host preprocess is the YOLOX one: letterbox
+    /// into 416, BGR, raw 0..255, NCHW. Output order == input order, length ==
+    /// `frames.len()`.
+    pub fn detect_batch(
+        &self,
+        frames: &[(&[u8], u32, u32)],
+        classes: &[(usize, &str)],
+        score_threshold: f32,
+    ) -> Result<Vec<Vec<Detection>>> {
         if frames.is_empty() {
             return Ok(Vec::new());
         }
@@ -176,12 +182,7 @@ impl CocoDetector {
                 contents.push(fill_frame_yolox(&mut data[..need], bi, rgb, w, h)?);
             }
             let outputs = self.forward(data.as_mut_ptr() as usize, InputMemory::Host, n)?;
-            Ok(decode_all(
-                &outputs,
-                &contents,
-                VEHICLE_CLASSES,
-                VEHICLE_SCORE_THRESHOLD,
-            ))
+            Ok(decode_all(&outputs, &contents, classes, score_threshold))
         })
     }
 
@@ -818,7 +819,7 @@ mod tests {
         let persons = decode_yolox(&out[0], content, PERSON_CLASSES, PERSON_SCORE_THRESHOLD);
         // Same input bytes as the reference: only FP16/EP rounding remains.
         assert_matches_reference("host", persons, 0.01, 2.0);
-        let vehicles = det.detect_batch(&[(rgb.as_slice(), 1280, 720)]).unwrap();
+        let vehicles = det.detect_batch(&[(rgb.as_slice(), 1280, 720)], VEHICLE_CLASSES, VEHICLE_SCORE_THRESHOLD).unwrap();
         assert_eq!(vehicles[0].len(), 1, "one bus: {:?}", vehicles[0]);
     }
 
@@ -876,7 +877,7 @@ mod tests {
         assert_matches_reference("device", persons, 0.03, 6.0);
 
         // Host letterbox path and NV12 batch path agree with the device path.
-        let host = det.detect_batch(&[(rgb.as_slice(), w, h)]).unwrap();
+        let host = det.detect_batch(&[(rgb.as_slice(), w, h)], VEHICLE_CLASSES, VEHICLE_SCORE_THRESHOLD).unwrap();
         let frame = Nv12Frame {
             y: &nv12.y,
             y_stride: nv12.w as usize,

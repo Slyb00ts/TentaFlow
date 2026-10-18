@@ -2,11 +2,15 @@
 // File: services/camera_ingest/gesture.rs — gestures on robot cameras
 // =============================================================================
 //
-// For every LOCAL robot whose operator turned "Gesty" on, a single worker takes
-// every new camera frame, finds the person (MoveNet, 17 body points, tracked
-// from frame to frame), follows the hands (MediaPipe hand landmarks, tracked from
-// the previous frame; the palm detector searches only near wrists still missing
-// a hand) and recognizes two gestures over time:
+// For every LOCAL robot whose operator turned "Gesty" on, one task per camera
+// takes every new frame and follows EVERYONE in view: the person detector
+// (YOLOX) finds each person, the pose model (MoveNet, 17 body points) reads each
+// person from their own crop — a single-person model fed a frame with several
+// people mixes their limbs — and the hands are followed from frame to frame
+// (MediaPipe hand landmarks; the palm detector searches only near wrists still
+// missing a hand). Each hand is given to the person it belongs to, hands without
+// a person are paired when side by side, and every person and pair has its own
+// recognizer for two gestures over time:
 //
 //   * wave  — a raised hand swinging side to side → the robot says hello;
 //   * heart — a finger heart, two hands joined into a heart, or both arms making
@@ -49,11 +53,19 @@ const WAVE_REVERSALS: usize = 3;
 /// change. A real wave swings ±0.5 or more; keypoint jitter of a still arm stays
 /// around 0.1, so this sits well clear of it.
 const WAVE_MIN_SWING: f32 = 0.3;
+/// Smallest swing of the hand's tilt (radians, wrist → knuckles) counted as a
+/// direction change. A normal wave is mostly the hand rocking at the wrist: the
+/// palm itself moves a fraction of a shoulder width, while its tilt swings by
+/// 30–60°. Landmark jitter of a still hand stays within a few degrees.
+const WAVE_MIN_TILT: f32 = 0.3;
 /// A hand lowered or lost for this long ends the raise. Shorter gaps are a fast
 /// swing blurring the hand, or a keypoint misread for a few frames — at the
 /// camera's full frame rate those come every few frames during a real wave and
 /// must not restart the count.
 const WAVE_GAP_MS: u64 = 400;
+/// How far past the knuckles (wrist → index base = 1) a fingertip must reach to
+/// count as held out of the fist.
+const TIP_OUT_OF_FIST: f32 = 1.3;
 /// How long a heart shape must be held.
 const HEART_HOLD_MS: u64 = 600;
 /// Minimum gap between two reactions of the same gesture on one robot.
@@ -167,6 +179,14 @@ fn three_fingers_folded(h: &Hand) -> bool {
         .all(|&(tip, mcp)| dist(h.landmarks[tip], w) < dist(h.landmarks[mcp], w) * 1.2)
 }
 
+/// A fingertip held out beyond the knuckles rather than curled into the palm:
+/// the bent index of a finger heart (or the thumb crossing it) still reaches
+/// well past the knuckle line, while in a fist both tips rest on the palm.
+fn tip_out_of_fist(h: &Hand, tip: usize) -> bool {
+    let w = h.landmarks[H_WRIST];
+    dist(h.landmarks[tip], w) > TIP_OUT_OF_FIST * dist(h.landmarks[H_INDEX_MCP], w)
+}
+
 /// Side of the line `a → b` that `p` lies on (sign of the cross product).
 fn side(a: Pt, b: Pt, p: Pt) -> f32 {
     (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x)
@@ -187,6 +207,8 @@ fn finger_heart(h: &Hand) -> bool {
         * side(l[H_INDEX_MCP], l[H_INDEX_TIP], l[H_THUMB_MCP])
         < 0.0;
     dist(l[H_THUMB_TIP], l[H_INDEX_TIP]) < 0.45 * size
+        && tip_out_of_fist(h, H_INDEX_TIP)
+        && tip_out_of_fist(h, H_THUMB_TIP)
         && index_bent
         && crossed
         && three_fingers_folded(h)
@@ -204,6 +226,8 @@ fn two_hand_heart(a: &Hand, b: &Hand) -> bool {
     let thumb_y = (la[H_THUMB_TIP].y + lb[H_THUMB_TIP].y) / 2.0;
     let opening = dist(la[H_INDEX_MCP], lb[H_INDEX_MCP]);
     index_gap < 0.6 * size
+        && tip_out_of_fist(a, H_INDEX_TIP)
+        && tip_out_of_fist(b, H_INDEX_TIP)
         && thumb_gap < 0.6 * size
         && thumb_y - index_y > 0.4 * size
         && opening > 0.8 * size
@@ -308,9 +332,9 @@ fn open_upright(h: &Hand) -> bool {
 /// side — whether or not the pose model sees the person. Of several such hands
 /// the one nearest the hand followed so far is taken, so two hands are never
 /// mixed into one swing; otherwise the highest one.
-fn waving_hand(hands: &[Hand], previous_x: Option<f32>) -> Arm {
+fn waving_hand(hands: &[Hand], previous_x: Option<f32>) -> (Arm, Arm) {
     if hands.is_empty() {
-        return Arm::Lost;
+        return (Arm::Lost, Arm::Lost);
     }
     let palm = |h: &Hand| h.landmarks[H_MIDDLE_MCP];
     let open = hands.iter().filter(|h| open_upright(h));
@@ -319,37 +343,31 @@ fn waving_hand(hands: &[Hand], previous_x: Option<f32>) -> Arm {
         None => open.min_by(|a, b| palm(a).y.total_cmp(&palm(b).y)),
     };
     match chosen {
-        Some(h) => Arm::Raised {
-            x: palm(h).x,
-            unit: HAND_SIZES_PER_SHOULDER * hand_size(h),
-        },
-        None => Arm::Lowered,
+        Some(h) => (
+            Arm::Raised {
+                x: palm(h).x,
+                unit: HAND_SIZES_PER_SHOULDER * hand_size(h),
+            },
+            Arm::Raised { x: hand_tilt(h), unit: 1.0 },
+        ),
+        None => (Arm::Lowered, Arm::Lowered),
     }
+}
+
+/// The hand's lean from upright, radians, positive towards +x: the direction
+/// wrist → middle knuckle. It rocks with the wrist in a wave, whatever the palm does.
+fn hand_tilt(h: &Hand) -> f32 {
+    let (w, m) = (h.landmarks[H_WRIST], h.landmarks[H_MIDDLE_MCP]);
+    (m.x - w.x).atan2(w.y - m.y)
 }
 
 fn contains(r: &Region, p: Pt) -> bool {
     p.x >= r.x && p.x < r.x + r.size && p.y >= r.y && p.y < r.y + r.size
 }
 
-/// Hands found twice (one hand inside both wrist regions) are one hand: keep the
-/// more confident copy.
-fn dedupe_hands(mut hands: Vec<Hand>) -> Vec<Hand> {
-    hands.sort_by(|a, b| b.presence.total_cmp(&a.presence));
-    let mut kept: Vec<Hand> = Vec::new();
-    for h in hands {
-        let same = kept.iter().any(|k| {
-            dist(k.landmarks[H_WRIST], h.landmarks[H_WRIST]) < 0.5 * hand_size(k).min(hand_size(&h))
-        });
-        if !same {
-            kept.push(h);
-        }
-    }
-    kept
-}
-
 /// Direction changes in a series of offsets, ignoring wiggles smaller than
-/// `WAVE_MIN_SWING` (hysteresis on the running extreme).
-fn count_reversals(offsets: impl Iterator<Item = f32>) -> usize {
+/// `min_swing` (hysteresis on the running extreme).
+fn count_reversals(offsets: impl Iterator<Item = f32>, min_swing: f32) -> usize {
     let mut reversals = 0;
     let mut extreme: Option<f32> = None;
     let mut rising: Option<bool> = None;
@@ -360,7 +378,7 @@ fn count_reversals(offsets: impl Iterator<Item = f32>) -> usize {
         };
         match rising {
             None => {
-                if (x - e).abs() >= WAVE_MIN_SWING {
+                if (x - e).abs() >= min_swing {
                     rising = Some(x > e);
                     extreme = Some(x);
                 }
@@ -368,7 +386,7 @@ fn count_reversals(offsets: impl Iterator<Item = f32>) -> usize {
             Some(up) => {
                 if (up && x > e) || (!up && x < e) {
                     extreme = Some(x);
-                } else if (x - e).abs() >= WAVE_MIN_SWING {
+                } else if (x - e).abs() >= min_swing {
                     reversals += 1;
                     rising = Some(!up);
                     extreme = Some(x);
@@ -396,8 +414,9 @@ struct ArmSeries {
 }
 
 impl ArmSeries {
-    /// Add this frame's arm pose; true when the series now holds a wave.
-    fn push(&mut self, ts_ms: u64, arm: Arm) -> bool {
+    /// Add this frame's arm pose; true when the series now holds a wave of
+    /// swings of at least `min_swing` (in the raise's unit).
+    fn push(&mut self, ts_ms: u64, arm: Arm, min_swing: f32) -> bool {
         let x = match arm {
             Arm::Raised { x, unit } => {
                 let (x0, u0) = *self.origin.get_or_insert((x, unit.max(1.0)));
@@ -417,7 +436,7 @@ impl ArmSeries {
         };
         // No averaging: a normal wave swings in ~2 frames per direction, and an
         // average of those flattens the very swing being counted. Keypoint
-        // jitter is already ignored by WAVE_MIN_SWING's hysteresis.
+        // jitter is already ignored by the `min_swing` hysteresis.
         self.samples.push_back((ts_ms, x));
         while self
             .samples
@@ -426,7 +445,7 @@ impl ArmSeries {
         {
             self.samples.pop_front();
         }
-        self.reversals = count_reversals(self.samples.iter().map(|(_, x)| *x));
+        self.reversals = count_reversals(self.samples.iter().map(|(_, x)| *x), min_swing);
         self.reversals >= WAVE_REVERSALS
     }
 
@@ -441,8 +460,10 @@ impl ArmSeries {
 /// Gesture recognition over time for one camera.
 #[derive(Default)]
 pub struct Recognizer {
-    /// The waving hand itself, read from the hand tracker.
+    /// The waving hand itself, read from the hand tracker: where it is…
     hand: ArmSeries,
+    /// …and how it leans — the wave rocked at the wrist.
+    tilt: ArmSeries,
     /// The arms of the pose model — for a hand too far or too blurred to track.
     left: ArmSeries,
     right: ArmSeries,
@@ -470,6 +491,7 @@ impl Recognizer {
             if ts_ms.saturating_sub(since) >= HEART_HOLD_MS {
                 self.heart_since = None;
                 self.hand.clear();
+                self.tilt.clear();
                 self.left.clear();
                 self.right.clear();
                 return Some(Gesture::Heart);
@@ -485,30 +507,35 @@ impl Recognizer {
             ),
             None => (Arm::Lost, Arm::Lost),
         };
-        let hand = waving_hand(hands, self.hand.last_x);
+        let (hand, tilt) = waving_hand(hands, self.hand.last_x);
         tracing::debug!(
             ?hand,
+            ?tilt,
             ?left,
             ?right,
             hand_swings = self.hand.reversals,
+            tilt_swings = self.tilt.reversals,
             left_swings = self.left.reversals,
             right_swings = self.right.reversals,
             hands = hands.len(),
             "[gesture] wave"
         );
-        let hand_waved = self.hand.push(ts_ms, hand);
-        let left_waved = self.left.push(ts_ms, left);
-        let right_waved = self.right.push(ts_ms, right);
+        let hand_waved = self.hand.push(ts_ms, hand, WAVE_MIN_SWING);
+        let tilt_waved = self.tilt.push(ts_ms, tilt, WAVE_MIN_TILT);
+        let left_waved = self.left.push(ts_ms, left, WAVE_MIN_SWING);
+        let right_waved = self.right.push(ts_ms, right, WAVE_MIN_SWING);
         if [hand, left, right].iter().any(|a| matches!(a, Arm::Raised { .. })) {
             self.raised_frames += 1;
         }
         self.peak_reversals = self
             .peak_reversals
             .max(self.hand.reversals)
+            .max(self.tilt.reversals)
             .max(self.left.reversals)
             .max(self.right.reversals);
-        if hand_waved || left_waved || right_waved {
+        if hand_waved || tilt_waved || left_waved || right_waved {
             self.hand.clear();
+            self.tilt.clear();
             self.left.clear();
             self.right.clear();
             self.heart_since = None;
@@ -556,10 +583,255 @@ fn hand_regions(body: &Body) -> Vec<(Region, usize)> {
 }
 
 // -----------------------------------------------------------------------------
+// People and hands across frames
+// -----------------------------------------------------------------------------
+
+/// Most people analysed in one frame: the largest boxes, i.e. the people nearest
+/// the robot. Each costs one pose run and up to two hand runs.
+const MAX_PEOPLE: usize = 6;
+/// Person boxes the detector is less sure of are not analysed.
+const MIN_PERSON_SCORE: f32 = 0.4;
+/// Most hands followed at once — two per analysed person.
+const MAX_HANDS: usize = 2 * MAX_PEOPLE;
+/// A person box continues last frame's person when the two overlap this much.
+const PERSON_MATCH_IOU: f32 = 0.3;
+/// The square handed to the pose model around a person box, relative to the box:
+/// room for a raised or swinging arm that the detector's box cut off.
+const PERSON_CROP_MARGIN: f32 = 1.25;
+/// Body points further out of their person's box than this share of its size
+/// belong to someone else standing close: the single-person pose model drifts to
+/// the strongest nearby limb.
+const BODY_BOX_SLACK: f32 = 0.2;
+/// Recognition state of a person or hand group not seen for this long is dropped.
+const GROUP_FORGET_MS: u64 = 2000;
+/// A hand's landmarks span at most this many hand sizes (wrist → middle base, a
+/// real open hand spans ~2.2); beyond it the landmarker drew a "hand" over
+/// something that is not one — a sleeve, a torso.
+const MAX_HAND_SPAN: f32 = 3.5;
+/// A hand is at most this many of its person's shoulder widths (a real one ~0.45).
+const MAX_HAND_PER_SHOULDER: f32 = 0.9;
+/// …and its landmarks span at most this share of its person's box height.
+const MAX_HAND_PER_PERSON: f32 = 0.5;
+/// With no person to compare against, a hand spans at most this share of the
+/// frame's short side (someone right in front of the camera).
+const MAX_HAND_PER_FRAME: f32 = 0.5;
+/// A followed hand may change size by at most this factor between frames; a
+/// bigger jump is the tracker sliding onto something else.
+const MAX_HAND_GROWTH: f32 = 1.6;
+/// Two hands that belong to no person are one pair (a two-hand heart) when their
+/// wrists are closer than this many hand sizes.
+const PAIR_HAND_SIZES: f32 = 4.0;
+
+/// One person in the frame: the detector's box (frame px: x, y, w, h), an id that
+/// stays while the box keeps overlapping, and the body when the pose model read one.
+#[derive(Debug, Clone)]
+struct Person {
+    id: u64,
+    bbox: [f32; 4],
+    body: Option<Body>,
+    pose_score: f32,
+}
+
+/// A hand with an id that stays while the tracker follows it.
+#[derive(Debug, Clone)]
+struct TrackedHand {
+    id: u64,
+    hand: Hand,
+}
+
+fn box_iou(a: [f32; 4], b: [f32; 4]) -> f32 {
+    let iw = ((a[0] + a[2]).min(b[0] + b[2]) - a[0].max(b[0])).max(0.0);
+    let ih = ((a[1] + a[3]).min(b[1] + b[3]) - a[1].max(b[1])).max(0.0);
+    let inter = iw * ih;
+    let union = a[2] * a[3] + b[2] * b[3] - inter;
+    if union <= 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
+fn box_contains(b: [f32; 4], slack: f32, p: Pt) -> bool {
+    let (sx, sy) = (b[2] * slack, b[3] * slack);
+    p.x >= b[0] - sx && p.x <= b[0] + b[2] + sx && p.y >= b[1] - sy && p.y <= b[1] + b[3] + sy
+}
+
+/// Ids for this frame's person boxes: each takes the id of the previous person it
+/// overlaps most (best pairs first), the rest get new ones.
+fn match_people(previous: &[Person], boxes: &[[f32; 4]], next_id: &mut u64) -> Vec<u64> {
+    let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
+    for (i, b) in boxes.iter().enumerate() {
+        for (j, p) in previous.iter().enumerate() {
+            let iou = box_iou(*b, p.bbox);
+            if iou >= PERSON_MATCH_IOU {
+                pairs.push((iou, i, j));
+            }
+        }
+    }
+    pairs.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut ids: Vec<Option<u64>> = vec![None; boxes.len()];
+    let mut taken = vec![false; previous.len()];
+    for (_, i, j) in pairs {
+        if ids[i].is_none() && !taken[j] {
+            ids[i] = Some(previous[j].id);
+            taken[j] = true;
+        }
+    }
+    ids.into_iter()
+        .map(|id| {
+            id.unwrap_or_else(|| {
+                *next_id += 1;
+                *next_id
+            })
+        })
+        .collect()
+}
+
+/// The square the pose model reads for a person box.
+fn person_region(b: [f32; 4]) -> Region {
+    let side = b[2].max(b[3]) * PERSON_CROP_MARGIN;
+    Region {
+        x: b[0] + b[2] / 2.0 - side / 2.0,
+        y: b[1] + b[3] / 2.0 - side / 2.0,
+        size: side,
+    }
+}
+
+/// `body` without the points that lie outside its person's box.
+fn body_within(mut body: Body, bbox: [f32; 4]) -> Body {
+    for p in body.iter_mut() {
+        if p.is_some_and(|p| !box_contains(bbox, BODY_BOX_SLACK, p)) {
+            *p = None;
+        }
+    }
+    body
+}
+
+/// Width and height of the box around a hand's landmarks.
+fn hand_extent(h: &Hand) -> (f32, f32) {
+    let (mut x1, mut y1, mut x2, mut y2) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for p in &h.landmarks {
+        x1 = x1.min(p.x);
+        y1 = y1.min(p.y);
+        x2 = x2.max(p.x);
+        y2 = y2.max(p.y);
+    }
+    (x2 - x1, y2 - y1)
+}
+
+/// A hand shaped like a hand and no bigger than the frame allows.
+fn plausible_hand(h: &Hand, w: u32, hgt: u32) -> bool {
+    let (ew, eh) = hand_extent(h);
+    let span = ew.max(eh);
+    span <= MAX_HAND_SPAN * hand_size(h) && span <= MAX_HAND_PER_FRAME * w.min(hgt) as f32
+}
+
+/// A hand no bigger than the person it belongs to allows.
+fn fits_person(h: &Hand, person: &Person) -> bool {
+    let (ew, eh) = hand_extent(h);
+    if ew.max(eh) > MAX_HAND_PER_PERSON * person.bbox[3] {
+        return false;
+    }
+    person
+        .body
+        .as_ref()
+        .and_then(shoulder_width)
+        .is_none_or(|sw| hand_size(h) <= MAX_HAND_PER_SHOULDER * sw)
+}
+
+/// The person a hand belongs to: the one whose wrist it sits at, else the one
+/// whose box holds it (the smallest, when boxes overlap).
+fn owner_of(h: &Hand, people: &[Person]) -> Option<usize> {
+    let wrist = h.landmarks[H_WRIST];
+    let at_wrist = people
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let body = p.body.as_ref()?;
+            let reach = shoulder_width(body).unwrap_or(p.bbox[2] * 0.3);
+            [L_WRIST, R_WRIST]
+                .iter()
+                .filter_map(|&k| body[k])
+                .map(|pw| dist(pw, wrist) / reach)
+                .filter(|d| *d < 1.0)
+                .min_by(|a, b| a.total_cmp(b))
+                .map(|d| (i, d))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i);
+    at_wrist.or_else(|| {
+        people
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| box_contains(p.bbox, 0.1, wrist))
+            .min_by(|a, b| (a.1.bbox[2] * a.1.bbox[3]).total_cmp(&(b.1.bbox[2] * b.1.bbox[3])))
+            .map(|(i, _)| i)
+    })
+}
+
+/// Who a recognizer follows: a person, or hands with no person (keyed by the
+/// lowest hand id of the group).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum GroupKey {
+    Person(u64),
+    Hands(u64),
+}
+
+/// One frame split into what each recognizer sees: every person with the hands
+/// that are theirs (at most two), and hands without a person — those near each
+/// other paired, since a two-hand heart is two hands side by side.
+fn group_hands(people: &[Person], hands: &[TrackedHand]) -> Vec<(GroupKey, Option<Body>, Vec<Hand>)> {
+    let mut own: Vec<Vec<&TrackedHand>> = vec![Vec::new(); people.len()];
+    let mut loose: Vec<&TrackedHand> = Vec::new();
+    for t in hands {
+        match owner_of(&t.hand, people) {
+            Some(i) => own[i].push(t),
+            None => loose.push(t),
+        }
+    }
+    let mut groups = Vec::with_capacity(people.len() + loose.len());
+    for (person, mut theirs) in people.iter().zip(own) {
+        theirs.sort_by(|a, b| b.hand.presence.total_cmp(&a.hand.presence));
+        // Any hand past two is a duplicate the tracker has not merged yet.
+        theirs.truncate(2);
+        groups.push((
+            GroupKey::Person(person.id),
+            person.body,
+            theirs.into_iter().map(|t| t.hand.clone()).collect(),
+        ));
+    }
+    let mut paired = vec![false; loose.len()];
+    for i in 0..loose.len() {
+        if paired[i] {
+            continue;
+        }
+        paired[i] = true;
+        let a = &loose[i].hand;
+        let partner = (i + 1..loose.len())
+            .filter(|&j| !paired[j])
+            .map(|j| (j, dist(a.landmarks[H_WRIST], loose[j].hand.landmarks[H_WRIST])))
+            .filter(|&(j, d)| d < PAIR_HAND_SIZES * hand_size(a).max(hand_size(&loose[j].hand)))
+            .min_by(|x, y| x.1.total_cmp(&y.1))
+            .map(|(j, _)| j);
+        let mut group = vec![a.clone()];
+        let mut key = loose[i].id;
+        if let Some(j) = partner {
+            paired[j] = true;
+            group.push(loose[j].hand.clone());
+            key = key.min(loose[j].id);
+        }
+        groups.push((GroupKey::Hands(key), None, group));
+    }
+    groups
+}
+
+// -----------------------------------------------------------------------------
 // Worker
 // -----------------------------------------------------------------------------
 
 struct Models {
+    #[cfg(feature = "vision-ort")]
+    people: crate::vision::detector_coco::CocoDetector,
     pose: crate::vision::movenet::MovenetEngine,
     hands: HandTracker,
 }
@@ -585,10 +857,14 @@ async fn install_models() -> anyhow::Result<()> {
 fn load_models() -> Option<Arc<Models>> {
     use crate::vision::camera_cv_models::{HAND_LANDMARK_FILE, MOVENET_FILE, PALM_DETECTION_FILE};
     let dir = crate::paths::vision_models_dir();
-    let loaded = crate::vision::movenet::load(&dir.join(MOVENET_FILE)).and_then(|pose| {
-        HandTracker::load(&dir.join(PALM_DETECTION_FILE), &dir.join(HAND_LANDMARK_FILE))
-            .map(|hands| Models { pose, hands })
-    });
+    let loaded = (|| -> anyhow::Result<Models> {
+        Ok(Models {
+            #[cfg(feature = "vision-ort")]
+            people: crate::vision::detector_coco::CocoDetector::load()?,
+            pose: crate::vision::movenet::load(&dir.join(MOVENET_FILE))?,
+            hands: HandTracker::load(&dir.join(PALM_DETECTION_FILE), &dir.join(HAND_LANDMARK_FILE))?,
+        })
+    })();
     match loaded {
         Ok(m) => Some(Arc::new(m)),
         Err(e) => {
@@ -598,20 +874,110 @@ fn load_models() -> Option<Arc<Models>> {
     }
 }
 
+/// Person boxes the privacy probe found, per camera, keyed by frame PTS: the probe
+/// runs YOLOX on the GPU on every decoded frame before it reaches the host branch
+/// the gestures read, so a frame that went through it needs no second detection.
+type SharedPeople = HashMap<String, std::collections::VecDeque<(u64, Vec<([f32; 4], f32)>)>>;
+
+fn shared_people() -> &'static parking_lot::Mutex<SharedPeople> {
+    static PEOPLE: OnceLock<parking_lot::Mutex<SharedPeople>> = OnceLock::new();
+    PEOPLE.get_or_init(Default::default)
+}
+
+/// Frames of person boxes kept per camera — the host branch trails the probe by
+/// a few frames at most.
+const SHARED_PEOPLE_FRAMES: usize = 32;
+
+/// Called by the privacy probe for every analyzed frame.
+pub(crate) fn note_people(camera_id: &str, pts_ns: u64, persons: impl IntoIterator<Item = ([f32; 4], f32)>) {
+    let boxes = persons.into_iter().collect();
+    let mut all = shared_people().lock();
+    let frames = all.entry(camera_id.to_string()).or_default();
+    frames.push_back((pts_ns, boxes));
+    while frames.len() > SHARED_PEOPLE_FRAMES {
+        frames.pop_front();
+    }
+}
+
+/// Called when the camera's privacy probe goes away.
+pub(crate) fn forget_people(camera_id: &str) {
+    shared_people().lock().remove(camera_id);
+}
+
+/// The probe's person boxes (normalized) for the frame with this PTS, if it saw it.
+fn people_seen_by_privacy(camera_id: &str, pts_ns: Option<u64>) -> Option<Vec<([f32; 4], f32)>> {
+    let pts_ns = pts_ns?;
+    let all = shared_people().lock();
+    all.get(camera_id)?
+        .iter()
+        .rev()
+        .find(|(pts, _)| *pts == pts_ns)
+        .map(|(_, boxes)| boxes.clone())
+}
+
+/// Normalized person boxes (and scores) → frame px, largest first.
+fn people_boxes(found: impl IntoIterator<Item = ([f32; 4], f32)>, w: u32, h: u32) -> Vec<[f32; 4]> {
+    let (fw, fh) = (w as f32, h as f32);
+    let mut boxes: Vec<[f32; 4]> = found
+        .into_iter()
+        .filter(|(_, score)| *score >= MIN_PERSON_SCORE)
+        .map(|(b, _)| [b[0] * fw, b[1] * fh, b[2] * fw, b[3] * fh])
+        .collect();
+    boxes.sort_by(|a, b| (b[2] * b[3]).total_cmp(&(a[2] * a[3])));
+    boxes.truncate(MAX_PEOPLE);
+    boxes
+}
+
+/// Person boxes (frame px) of the people nearest the robot, largest first.
+#[cfg(feature = "vision-ort")]
+fn find_people(models: &Models, rgb: &[u8], w: u32, h: u32) -> anyhow::Result<Vec<[f32; 4]>> {
+    use crate::vision::detector_coco::PERSON_CLASSES;
+    let found = models
+        .people
+        .detect_batch(&[(rgb, w, h)], PERSON_CLASSES, MIN_PERSON_SCORE)?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    Ok(people_boxes(found.into_iter().map(|d| (d.bbox, d.score)), w, h))
+}
+
+/// A build without ONNX Runtime has no person detector; the single-person pose
+/// model then reads the whole frame as one person.
+#[cfg(not(feature = "vision-ort"))]
+fn find_people(_models: &Models, _rgb: &[u8], w: u32, h: u32) -> anyhow::Result<Vec<[f32; 4]>> {
+    Ok(vec![[0.0, 0.0, w as f32, h as f32]])
+}
+
 struct Analysis {
-    body: Option<Body>,
-    pose_score: f32,
-    hands: Vec<Hand>,
-    /// Where to look for the person in the next frame.
-    next_pose_region: Option<Region>,
+    people: Vec<Person>,
+    hands: Vec<TrackedHand>,
+    palm_searches: usize,
+    took: StageTimes,
+}
+
+/// Wall time of each stage of one frame's analysis.
+#[derive(Clone, Copy, Default)]
+struct StageTimes {
+    people: Duration,
+    poses: Duration,
+    tracking: Duration,
+    palm_search: Duration,
+}
+
+impl std::ops::AddAssign for StageTimes {
+    fn add_assign(&mut self, o: Self) {
+        self.people += o.people;
+        self.poses += o.poses;
+        self.tracking += o.tracking;
+        self.palm_search += o.palm_search;
+    }
 }
 
 /// Side of the square image handed to MoveNet (it resizes to its own input).
 const POSE_CROP: u32 = 256;
 
-/// The whole frame as a square, letterboxed — the first look, before the person
-/// is found. Squeezing a 16:9 frame into MoveNet's square input instead would
-/// halve the horizontal resolution and lose a raised, moving arm first.
+/// The whole frame as a square, letterboxed — the palm search for someone so
+/// close to the camera that the person detector sees no body.
 fn full_frame_region(w: u32, h: u32) -> Region {
     let side = w.max(h) as f32;
     Region {
@@ -619,28 +985,6 @@ fn full_frame_region(w: u32, h: u32) -> Region {
         y: (h as f32 - side) / 2.0,
         size: side,
     }
-}
-
-/// Next frame's pose crop: the person's keypoint box, squared and enlarged so a
-/// raised or swinging arm stays inside (the MoveNet reference tracking crop).
-fn track_region(body: &Body, w: u32, h: u32) -> Option<Region> {
-    let pts: Vec<Pt> = body.iter().flatten().copied().collect();
-    if pts.is_empty() {
-        return None;
-    }
-    let (mut x1, mut y1, mut x2, mut y2) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-    for p in &pts {
-        x1 = x1.min(p.x);
-        y1 = y1.min(p.y);
-        x2 = x2.max(p.x);
-        y2 = y2.max(p.y);
-    }
-    let side = ((x2 - x1).max(y2 - y1) * 1.7).clamp(0.25 * w.min(h) as f32, w.max(h) as f32);
-    Some(Region {
-        x: (x1 + x2) / 2.0 - side / 2.0,
-        y: (y1 + y2) / 2.0 - side / 2.0,
-        size: side,
-    })
 }
 
 /// `region` of an RGB24 frame resampled to an `n`×`n` RGB24 image; black outside
@@ -666,8 +1010,7 @@ fn square_crop_rgb(rgb: &[u8], w: u32, h: u32, region: Region, n: u32) -> Vec<u8
     out
 }
 
-/// The person in `region` of the frame (the previous frame's tracking crop),
-/// keypoints in frame pixels.
+/// The body of the person in `region` of the frame, keypoints in frame pixels.
 fn estimate_pose(models: &Models, rgb: &[u8], w: u32, h: u32, region: Region) -> anyhow::Result<Option<PoseDetection>> {
     let crop = square_crop_rgb(rgb, w, h, region, POSE_CROP);
     let scale = region.size / POSE_CROP as f32;
@@ -685,8 +1028,8 @@ fn estimate_pose(models: &Models, rgb: &[u8], w: u32, h: u32, region: Region) ->
         }))
 }
 
-/// Runs `jobs` at once, one thread each — the models sit in separate session
-/// pools, so a pose, two hand trackings or two palm searches overlap on the GPU
+/// Runs `jobs` at once, one thread each — the models sit in session pools, so
+/// poses of several people, hand trackings and palm searches overlap on the GPU
 /// instead of queuing. Results keep the order of `jobs`.
 fn run_parallel<T, F>(jobs: Vec<F>) -> Vec<T>
 where
@@ -702,104 +1045,160 @@ where
     })
 }
 
-/// One frame. The person (in the tracking crop from the previous frame) and the
-/// hands of the previous frame, re-found from their landmarks, are read at the
-/// same time; then the palm detector searches, in parallel, only the wrist
-/// regions still missing a hand.
+/// Hands found twice (one hand inside two search regions, or re-found by the
+/// tracker and the palm detector) are one hand: keep the more confident copy.
+fn dedupe_hands(mut hands: Vec<TrackedHand>) -> Vec<TrackedHand> {
+    hands.sort_by(|a, b| b.hand.presence.total_cmp(&a.hand.presence));
+    let mut kept: Vec<TrackedHand> = Vec::new();
+    for t in hands {
+        let same = kept.iter().any(|k| {
+            dist(k.hand.landmarks[H_WRIST], t.hand.landmarks[H_WRIST])
+                < 0.5 * hand_size(&k.hand).min(hand_size(&t.hand))
+        });
+        if !same {
+            kept.push(t);
+        }
+    }
+    kept
+}
+
+/// One frame. Everyone in view is found by the person detector while the hands
+/// of the previous frame are re-found from their landmarks; then every person's
+/// body is read from their own crop, all at once; then the palm detector
+/// searches, in parallel, only the wrist regions still missing a hand.
 fn analyze(
     models: &Models,
     rgb: &[u8],
     w: u32,
     h: u32,
-    pose_region: Option<Region>,
-    previous_hands: &[Hand],
+    previous_people: &[Person],
+    previous_hands: &[TrackedHand],
+    next_id: &mut u64,
+    seen_by_privacy: Option<Vec<([f32; 4], f32)>>,
 ) -> anyhow::Result<Analysis> {
-    let region = pose_region.unwrap_or_else(|| full_frame_region(w, h));
-    let (det, tracked) = std::thread::scope(|scope| {
-        let pose = scope.spawn(|| estimate_pose(models, rgb, w, h, region));
+    let mut took = StageTimes::default();
+    let (found, tracked) = std::thread::scope(|scope| {
+        let people = scope.spawn(|| -> anyhow::Result<(Vec<([f32; 4], Option<PoseDetection>)>, Duration, Duration)> {
+            let started = std::time::Instant::now();
+            let boxes = match seen_by_privacy {
+                Some(found) => people_boxes(found, w, h),
+                None => find_people(models, rgb, w, h)?,
+            };
+            let people_took = started.elapsed();
+            let poses = run_parallel(
+                boxes
+                    .iter()
+                    .map(|b| move || estimate_pose(models, rgb, w, h, person_region(*b)))
+                    .collect(),
+            );
+            let poses_took = started.elapsed() - people_took;
+            let found = boxes.into_iter().zip(poses).map(|(b, p)| Ok((b, p?))).collect::<anyhow::Result<_>>()?;
+            Ok((found, people_took, poses_took))
+        });
+        let started = std::time::Instant::now();
         let tracked = run_parallel(
             previous_hands
                 .iter()
-                .map(|previous| move || models.hands.track(rgb, w, h, previous))
+                .map(|previous| move || models.hands.track(rgb, w, h, &previous.hand))
                 .collect(),
         );
-        let pose = pose.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        (pose, tracked)
+        took.tracking = started.elapsed();
+        let people = people.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (people, tracked)
     });
-    let det = det?;
-    let body = det.as_ref().and_then(body_from);
-    let mut hands = Vec::with_capacity(tracked.len());
-    for hand in tracked {
-        hands.extend(hand?);
+    let (found, people_took, poses_took) = found?;
+    took.people = people_took;
+    took.poses = poses_took;
+    let boxes: Vec<[f32; 4]> = found.iter().map(|(b, _)| *b).collect();
+    let ids = match_people(previous_people, &boxes, next_id);
+    let people: Vec<Person> = found
+        .into_iter()
+        .zip(ids)
+        .map(|((bbox, det), id)| Person {
+            id,
+            bbox,
+            body: det.as_ref().and_then(body_from).map(|b| body_within(b, bbox)),
+            pose_score: det.map_or(0.0, |d| d.score),
+        })
+        .collect();
+
+    let mut hands = Vec::with_capacity(previous_hands.len());
+    for (previous, found) in previous_hands.iter().zip(tracked) {
+        let Some(hand) = found? else { continue };
+        let growth = hand_size(&hand) / hand_size(&previous.hand);
+        if plausible_hand(&hand, w, h) && (1.0 / MAX_HAND_GROWTH..=MAX_HAND_GROWTH).contains(&growth) {
+            hands.push(TrackedHand { id: previous.id, hand });
+        }
     }
     let mut hands = dedupe_hands(hands);
-    let regions = body.as_ref().map(hand_regions).unwrap_or_default();
-    let mut missing: Vec<Region> = regions
-        .iter()
-        .filter(|(region, expected)| {
-            hands.iter().filter(|h| contains(region, h.landmarks[H_WRIST])).count() < *expected
-        })
-        .map(|(region, _)| *region)
-        .collect();
-    // No person and no hand: someone close to the camera shows hands without a
-    // body the pose model can read — search the whole frame, where such hands
-    // are large enough for the palm detector.
-    if body.is_none() && hands.is_empty() {
+
+    let mut missing: Vec<Region> = Vec::new();
+    for person in &people {
+        let Some(body) = &person.body else { continue };
+        for (region, expected) in hand_regions(body) {
+            let inside = hands
+                .iter()
+                .filter(|t| contains(&region, t.hand.landmarks[H_WRIST]))
+                .count();
+            if inside < expected {
+                missing.push(region);
+            }
+        }
+    }
+    // Nobody the detector sees and no hand: someone close to the camera shows
+    // only hands — search the whole frame, where such hands are large.
+    if people.is_empty() && hands.is_empty() {
         missing.push(full_frame_region(w, h));
     }
-    let searched = missing.len();
+    let palm_searches = missing.len();
+    let started = std::time::Instant::now();
     for found in run_parallel(
         missing
             .into_iter()
             .map(|region| move || models.hands.hands_in(rgb, w, h, region))
             .collect(),
     ) {
-        hands.extend(found?);
+        for hand in found? {
+            if plausible_hand(&hand, w, h) {
+                *next_id += 1;
+                hands.push(TrackedHand { id: *next_id, hand });
+            }
+        }
     }
-    if searched > 0 {
+    took.palm_search = started.elapsed();
+    if palm_searches > 0 {
         hands = dedupe_hands(hands);
     }
-    // One person has two hands; extra ones (most confident first) are strays that
-    // would otherwise be tracked forever.
-    hands.truncate(2);
-    if tracing::enabled!(tracing::Level::DEBUG) {
-        let score_of = |id: usize| {
-            det.as_ref()
-                .and_then(|d| d.keypoints.iter().find(|k| k.id as usize == id))
-                .map_or(0.0, |k| k.score)
-        };
-        let found = det
-            .as_ref()
-            .map_or(0, |d| d.keypoints.iter().filter(|k| k.score >= MIN_KEYPOINT_SCORE).count());
-        tracing::debug!(
-            person = body.is_some(),
-            keypoints = found,
-            l_wrist = score_of(L_WRIST),
-            r_wrist = score_of(R_WRIST),
-            l_arm = ?body.as_ref().map(|b| arm(b, &hands, L_WRIST, L_ELBOW, L_SHOULDER)),
-            r_arm = ?body.as_ref().map(|b| arm(b, &hands, R_WRIST, R_ELBOW, R_SHOULDER)),
-            regions = regions.len(),
-            palm_searches = searched,
-            hands = hands.len(),
-            "[gesture] frame"
-        );
-    }
-    let next_pose_region = body.as_ref().and_then(|b| track_region(b, w, h));
+    // A "hand" bigger than the person it sits on is the landmarker drawing over a
+    // sleeve or a torso; dropping it here also stops it being followed.
+    hands.retain(|t| owner_of(&t.hand, &people).is_none_or(|i| fits_person(&t.hand, &people[i])));
+    // Most confident first: past the cap are strays that would be followed forever.
+    hands.truncate(MAX_HANDS);
+    tracing::debug!(
+        people = people.len(),
+        bodies = people.iter().filter(|p| p.body.is_some()).count(),
+        hands = hands.len(),
+        palm_searches,
+        "[gesture] frame"
+    );
     Ok(Analysis {
-        body,
-        pose_score: det.map(|d| d.score).unwrap_or(0.0),
+        people,
         hands,
-        next_pose_region,
+        palm_searches,
+        took,
     })
 }
 
 /// Per-camera recognition state, kept while the robot has gestures on.
 #[derive(Default)]
 struct CameraState {
-    recognizer: Recognizer,
+    /// One recognizer per person and per group of hands without a person, with
+    /// the time it was last fed.
+    recognizers: HashMap<GroupKey, (Recognizer, u64)>,
     last_reaction: HashMap<Gesture, u64>,
     last_any_reaction: u64,
-    label: Option<(Gesture, u64)>,
+    /// The last gesture, where it was made (frame px box) and when.
+    label: Option<(Gesture, [f32; 4], u64)>,
     timed_frames: u32,
     /// Start of the current timing window: frames per second actually analyzed.
     timed_since: Option<std::time::Instant>,
@@ -807,10 +1206,16 @@ struct CameraState {
     timed_fetch: Duration,
     timed_total: Duration,
     timed_max: Duration,
-    /// Tracking crop for the pose model; `None` = search the whole frame.
-    pose_region: Option<Region>,
-    /// Hands of the previous frame, re-found from their landmarks on the next.
-    hands: Vec<Hand>,
+    timed_people: usize,
+    timed_searches: usize,
+    timed_stages: StageTimes,
+    /// Frames whose person boxes came from the privacy probe.
+    timed_shared: usize,
+    /// People and hands of the previous frame, followed on the next.
+    people: Vec<Person>,
+    hands: Vec<TrackedHand>,
+    /// Source of person and hand ids.
+    next_id: u64,
 }
 
 /// Frames per analysis-cost log line.
@@ -818,31 +1223,72 @@ const TIMING_LOG_EVERY: u32 = 100;
 
 impl CameraState {
     /// Log the cost and the rate now and then: what this camera's gestures cost
-    /// the node, how many frames per second they really see, and how close the
-    /// people in view come to a wave.
-    fn note_timing(&mut self, camera_id: &str, fetch: Duration, took: Duration, hands: usize) {
+    /// the node, how many frames per second they really see, how many people
+    /// they follow, and how close those people come to a wave.
+    fn note_timing(&mut self, camera_id: &str, fetch: Duration, took: Duration, a: &Analysis) {
         let since = *self.timed_since.get_or_insert_with(std::time::Instant::now);
         self.timed_frames += 1;
         self.timed_fetch += fetch;
         self.timed_total += took;
         self.timed_max = self.timed_max.max(took);
+        self.timed_people = self.timed_people.max(a.people.len());
+        self.timed_searches += a.palm_searches;
+        self.timed_stages += a.took;
         if self.timed_frames == TIMING_LOG_EVERY {
             let n = f64::from(self.timed_frames);
-            let (raised, swings) = self.recognizer.take_wave_stats();
+            let (raised, swings) = self
+                .recognizers
+                .values_mut()
+                .map(|(r, _)| r.take_wave_stats())
+                .fold((0, 0), |(r, s), (r2, s2)| (r + r2, s.max(s2)));
             info!(
-                "[gesture] {camera_id}: {:.1} fps, frame fetch mean={:.0}ms, analysis mean={:.0}ms max={:.0}ms over {} frames (hands now: {hands}; raised-hand frames: {raised}, most swings: {swings}/{WAVE_REVERSALS})",
+                "[gesture] {camera_id}: {:.1} fps, frame fetch mean={:.0}ms, analysis mean={:.0}ms max={:.0}ms over {} frames (people max {}, palm searches {}, hands now {}; raised-hand frames: {raised}, most swings: {swings}/{WAVE_REVERSALS}); stage means: people {:.1}ms (from privacy in {} frames), poses {:.1}ms, hand tracking {:.1}ms (beside people+poses), palm search {:.1}ms",
                 n / since.elapsed().as_secs_f64().max(1e-3),
                 self.timed_fetch.as_secs_f64() * 1000.0 / n,
                 self.timed_total.as_secs_f64() * 1000.0 / n,
                 self.timed_max.as_secs_f64() * 1000.0,
-                self.timed_frames
+                self.timed_frames,
+                self.timed_people,
+                self.timed_searches,
+                a.hands.len(),
+                self.timed_stages.people.as_secs_f64() * 1000.0 / n,
+                self.timed_shared,
+                self.timed_stages.poses.as_secs_f64() * 1000.0 / n,
+                self.timed_stages.tracking.as_secs_f64() * 1000.0 / n,
+                self.timed_stages.palm_search.as_secs_f64() * 1000.0 / n,
             );
             self.timed_frames = 0;
+            self.timed_stages = StageTimes::default();
+            self.timed_shared = 0;
             self.timed_since = Some(std::time::Instant::now());
             self.timed_fetch = Duration::ZERO;
             self.timed_total = Duration::ZERO;
             self.timed_max = Duration::ZERO;
+            self.timed_people = 0;
+            self.timed_searches = 0;
         }
+    }
+
+    /// Feeds every person and hand group to its own recognizer; the first gesture
+    /// completed this frame, with the box it was made in.
+    fn recognize(&mut self, ts_ms: u64, a: &Analysis) -> Option<(Gesture, [f32; 4])> {
+        let mut made = None;
+        for (key, body, hands) in group_hands(&a.people, &a.hands) {
+            let entry = self.recognizers.entry(key).or_insert_with(|| (Recognizer::default(), ts_ms));
+            entry.1 = ts_ms;
+            if let Some(g) = entry.0.update(ts_ms, body.as_ref(), &hands) {
+                if made.is_none() {
+                    let place = match key {
+                        GroupKey::Person(id) => a.people.iter().find(|p| p.id == id).map(|p| p.bbox),
+                        GroupKey::Hands(_) => None,
+                    };
+                    made = Some((g, place.unwrap_or_else(|| hands_box(&hands))));
+                }
+            }
+        }
+        self.recognizers
+            .retain(|_, (_, seen)| ts_ms.saturating_sub(*seen) <= GROUP_FORGET_MS);
+        made
     }
 
     fn may_react(&self, g: Gesture, now: u64) -> bool {
@@ -852,6 +1298,21 @@ impl CameraState {
                 .get(&g)
                 .is_none_or(|t| now.saturating_sub(*t) >= GESTURE_COOLDOWN_MS)
     }
+}
+
+/// The box (frame px) around a group of hands.
+fn hands_box(hands: &[Hand]) -> [f32; 4] {
+    let (mut x1, mut y1, mut x2, mut y2) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for p in hands.iter().flat_map(|h| h.landmarks.iter()) {
+        x1 = x1.min(p.x);
+        y1 = y1.min(p.y);
+        x2 = x2.max(p.x);
+        y2 = y2.max(p.y);
+    }
+    if x1 > x2 {
+        return [0.0; 4];
+    }
+    [x1, y1, x2 - x1, y2 - y1]
 }
 
 /// Start the gesture worker once per process. Cheap while no robot has gestures on.
@@ -942,52 +1403,56 @@ async fn analyze_frames(
         let Some((frame, fetch)) = rx.borrow_and_update().clone() else {
             continue;
         };
-        let (m, f, pose_region, previous_hands) =
-            (models.clone(), frame.clone(), s.pose_region, s.hands.clone());
+        let (m, f) = (models.clone(), frame.clone());
+        let (people, hands, mut next_id) = (s.people.clone(), s.hands.clone(), s.next_id);
+        let seen_by_privacy = people_seen_by_privacy(camera_id, frame.pts_ns);
+        s.timed_shared += usize::from(seen_by_privacy.is_some());
         let started = std::time::Instant::now();
-        let analysis = match tokio::task::spawn_blocking(move || {
-            analyze(&m, &f.rgb, f.width, f.height, pose_region, &previous_hands)
+        let result = tokio::task::spawn_blocking(move || {
+            let a = analyze(&m, &f.rgb, f.width, f.height, &people, &hands, &mut next_id, seen_by_privacy);
+            (a, next_id)
         })
-        .await
-        {
-            Ok(Ok(a)) => a,
-            Ok(Err(e)) => {
+        .await;
+        let analysis = match result {
+            Ok((Ok(a), next_id)) => {
+                s.next_id = next_id;
+                a
+            }
+            Ok((Err(e), _)) => {
                 warn!("[gesture] analysis failed for {camera_id}: {e:#}");
-                s.pose_region = None;
+                s.people.clear();
                 s.hands.clear();
                 continue;
             }
             Err(e) => {
                 warn!("[gesture] analysis task dropped for {camera_id}: {e}");
-                s.pose_region = None;
+                s.people.clear();
                 s.hands.clear();
                 continue;
             }
         };
         let took = started.elapsed();
-        s.pose_region = analysis.next_pose_region;
-        s.hands = analysis.hands.clone();
-        s.note_timing(camera_id, fetch, took, analysis.hands.len());
+        s.note_timing(camera_id, fetch, took, &analysis);
         let now = now_ms();
-        let gesture = s
-            .recognizer
-            .update(frame.captured_ms, analysis.body.as_ref(), &analysis.hands);
+        let gesture = s.recognize(frame.captured_ms, &analysis);
         let operator_busy =
             crate::mesh::robot_dispatch::manual_control_within(robot_id, MANUAL_CONTROL_QUIET);
-        let reaction = gesture.filter(|g| !operator_busy && s.may_react(*g, now));
-        if let Some(g) = gesture {
-            s.label = Some((g, now));
+        let reaction = gesture.filter(|(g, _)| !operator_busy && s.may_react(*g, now));
+        if let Some((g, place)) = gesture {
+            s.label = Some((g, place, now));
         }
-        if let Some(g) = reaction {
+        if let Some((g, _)) = reaction {
             s.last_reaction.insert(g, now);
             s.last_any_reaction = now;
         }
         let label = s
             .label
-            .filter(|(_, at)| now.saturating_sub(*at) < LABEL_MS)
-            .map(|(g, _)| g);
+            .filter(|(_, _, at)| now.saturating_sub(*at) < LABEL_MS)
+            .map(|(g, place, _)| (g, place));
         publish_overlay(camera_id, &frame, took, &analysis, label);
-        if let Some(g) = reaction {
+        s.people = analysis.people;
+        s.hands = analysis.hands;
+        if let Some((g, _)) = reaction {
             react(robot_id.to_string(), g);
         }
     }
@@ -1021,31 +1486,18 @@ fn publish_overlay(
     frame: &crate::addon::host_functions::camera::RgbFrame,
     took: Duration,
     a: &Analysis,
-    label: Option<Gesture>,
+    label: Option<(Gesture, [f32; 4])>,
 ) {
     let (fw, fh) = (frame.width.max(1) as f32, frame.height.max(1) as f32);
     let norm = |p: Pt, score: f32| [p.x / fw, p.y / fh, score];
-    let bbox = |pts: &mut dyn Iterator<Item = Pt>| {
-        let (mut x1, mut y1, mut x2, mut y2) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-        for p in pts {
-            x1 = x1.min(p.x);
-            y1 = y1.min(p.y);
-            x2 = x2.max(p.x);
-            y2 = y2.max(p.y);
-        }
-        if x1 > x2 {
-            return [0.0; 4];
-        }
-        [x1 / fw, y1 / fh, (x2 - x1) / fw, (y2 - y1) / fh]
-    };
+    let norm_box = |b: [f32; 4]| [b[0] / fw, b[1] / fh, b[2] / fw, b[3] / fh];
     let mut items = Vec::new();
-    let mut person_box = [0.0f32; 4];
-    if let Some(body) = &a.body {
-        person_box = bbox(&mut body.iter().flatten().copied());
+    for person in &a.people {
+        let Some(body) = &person.body else { continue };
         items.push(PoseItem {
             klasa: "pose",
-            bbox: person_box,
-            score: a.pose_score,
+            bbox: norm_box(person.bbox),
+            score: person.pose_score,
             keypoints: body
                 .iter()
                 .map(|p| p.map_or([0.0, 0.0, 0.0], |p| norm(p, 1.0)))
@@ -1053,19 +1505,19 @@ fn publish_overlay(
             label: None,
         });
     }
-    for hand in &a.hands {
+    for t in &a.hands {
         items.push(PoseItem {
             klasa: "hand",
-            bbox: bbox(&mut hand.landmarks.iter().copied()),
-            score: hand.presence,
-            keypoints: hand.landmarks.iter().map(|p| norm(*p, 1.0)).collect(),
+            bbox: norm_box(hands_box(std::slice::from_ref(&t.hand))),
+            score: t.hand.presence,
+            keypoints: t.hand.landmarks.iter().map(|p| norm(*p, 1.0)).collect(),
             label: None,
         });
     }
-    if let Some(g) = label {
+    if let Some((g, place)) = label {
         items.push(PoseItem {
             klasa: "gesture",
-            bbox: person_box,
+            bbox: norm_box(place),
             score: 1.0,
             keypoints: Vec::new(),
             label: Some(g.id().to_string()),
@@ -1255,6 +1707,41 @@ mod tests {
         assert_eq!(fired, Some(Gesture::Wave));
     }
 
+    /// `hand_at` rotated by `angle` radians about its wrist.
+    fn tilted(h: &Hand, angle: f32) -> Hand {
+        let mut h = h.clone();
+        let w = h.landmarks[H_WRIST];
+        let (sin, cos) = angle.sin_cos();
+        for p in h.landmarks.iter_mut() {
+            let (dx, dy) = (p.x - w.x, p.y - w.y);
+            p.x = w.x + dx * cos - dy * sin;
+            p.y = w.y + dx * sin + dy * cos;
+        }
+        h
+    }
+
+    #[test]
+    fn a_hand_rocked_at_the_wrist_is_a_wave_though_the_palm_hardly_moves() {
+        // What a normal wave looks like on camera: the palm shifts ±12 px of a
+        // 150 px shoulder-width unit, the hand rocks ±25° at ~1 Hz.
+        let mut r = Recognizer::default();
+        let fired = (0..60u64).map(|i| i * 70).find_map(|t| {
+            let phase = (2.0 * std::f32::consts::PI * t as f32 / 1000.0).sin();
+            let h = tilted(&hand_at(440.0 + 12.0 * phase, 300.0), 0.45 * phase);
+            r.update(t, None, &[h])
+        });
+        assert_eq!(fired, Some(Gesture::Wave));
+    }
+
+    #[test]
+    fn a_still_hand_whose_tilt_jitters_is_not_a_wave() {
+        let mut r = Recognizer::default();
+        for i in 0..90u64 {
+            let angle = if i % 2 == 0 { 0.08 } else { -0.08 };
+            assert_eq!(r.update(i * 70, None, &[tilted(&hand_at(440.0, 300.0), angle)]), None);
+        }
+    }
+
     #[test]
     fn a_still_open_hand_whose_size_jitters_is_not_a_wave() {
         let mut r = Recognizer::default();
@@ -1284,9 +1771,9 @@ mod tests {
     #[test]
     fn a_wrist_lost_for_long_ends_the_raise() {
         let mut series = ArmSeries::default();
-        assert!(!series.push(0, Arm::Raised { x: 60.0, unit: 100.0 }));
-        assert!(!series.push(100, Arm::Raised { x: -60.0, unit: 100.0 }));
-        assert!(!series.push(200 + WAVE_GAP_MS, Arm::Lost));
+        assert!(!series.push(0, Arm::Raised { x: 60.0, unit: 100.0 }, WAVE_MIN_SWING));
+        assert!(!series.push(100, Arm::Raised { x: -60.0, unit: 100.0 }, WAVE_MIN_SWING));
+        assert!(!series.push(200 + WAVE_GAP_MS, Arm::Lost, WAVE_MIN_SWING));
         assert!(series.samples.is_empty());
     }
 
@@ -1360,6 +1847,50 @@ mod tests {
         assert!(!finger_heart(&h));
     }
 
+    #[test]
+    fn person_boxes_of_the_privacy_probe_are_found_by_frame_pts() {
+        let cam = "test-cam-shared-people";
+        note_people(cam, 1_000, [([0.1, 0.1, 0.2, 0.5], 0.9)]);
+        note_people(cam, 2_000, [([0.5, 0.0, 0.4, 1.0], 0.9), ([0.0, 0.0, 0.1, 0.1], 0.2)]);
+        let found = people_seen_by_privacy(cam, Some(2_000)).expect("frame 2000 was seen");
+        // Frame px, the weak detection below the gesture threshold left out.
+        assert_eq!(people_boxes(found, 1000, 500), vec![[500.0, 0.0, 400.0, 500.0]]);
+        assert!(people_seen_by_privacy(cam, Some(3_000)).is_none());
+        assert!(people_seen_by_privacy(cam, None).is_none());
+        forget_people(cam);
+        assert!(people_seen_by_privacy(cam, Some(1_000)).is_none());
+    }
+
+    /// A clenched fist: the index curled back onto the palm, the thumb lying
+    /// across it, the other fingers folded.
+    fn fist_hand() -> Hand {
+        let mut h = finger_heart_hand();
+        h.landmarks[H_INDEX_PIP] = Pt { x: 90.0, y: 150.0 };
+        h.landmarks[H_INDEX_DIP] = Pt { x: 97.0, y: 160.0 };
+        h.landmarks[H_INDEX_TIP] = Pt { x: 100.0, y: 172.0 };
+        h.landmarks[H_THUMB_TIP] = Pt { x: 104.0, y: 168.0 };
+        h
+    }
+
+    #[test]
+    fn a_clenched_fist_is_not_a_finger_heart() {
+        assert!(!finger_heart(&fist_hand()));
+    }
+
+    #[test]
+    fn two_fists_held_together_are_not_a_heart() {
+        let mut a = fist_hand();
+        let mut b = fist_hand();
+        for l in a.landmarks.iter_mut() {
+            l.x -= 20.0;
+        }
+        for l in b.landmarks.iter_mut() {
+            l.x = 200.0 - l.x + 20.0;
+        }
+        assert!(!two_hand_heart(&a, &b));
+        assert!(!heart_shape(None, &[a, b]));
+    }
+
     /// Two hands whose index tips meet at the top and thumbs at the bottom.
     fn two_hand_heart_pair() -> [Hand; 2] {
         let mut a = hand_at(80.0, 200.0);
@@ -1395,9 +1926,9 @@ mod tests {
     #[test]
     fn one_hand_found_twice_is_one_hand_and_never_a_heart_with_itself() {
         let h = hand_at(100.0, 200.0);
-        let hands = dedupe_hands(vec![h.clone(), h.clone()]);
+        let hands = dedupe_hands(vec![tracked(1, h.clone()), tracked(2, h)]);
         assert_eq!(hands.len(), 1);
-        assert!(!heart_shape(None, &hands));
+        assert!(!heart_shape(None, &[hands[0].hand.clone()]));
     }
 
     #[test]
@@ -1506,15 +2037,124 @@ mod tests {
         assert!(crop[..256 * 3 * 40].iter().all(|v| *v == 0), "top bar is black");
     }
 
+    fn person(id: u64, bbox: [f32; 4], body: Option<Body>) -> Person {
+        Person { id, bbox, body, pose_score: 0.9 }
+    }
+
+    fn tracked(id: u64, hand: Hand) -> TrackedHand {
+        TrackedHand { id, hand }
+    }
+
     #[test]
-    fn the_tracking_crop_keeps_a_raised_arm_inside() {
-        let b = raised_right(60.0);
-        let r = track_region(&b, 1280, 720).unwrap();
-        for p in b.iter().flatten() {
-            assert!(p.x > r.x && p.x < r.x + r.size && p.y > r.y && p.y < r.y + r.size, "{p:?} in {r:?}");
+    fn the_pose_crop_keeps_a_raised_arm_of_the_person_box_inside() {
+        let b = [100.0, 50.0, 200.0, 400.0];
+        let r = person_region(b);
+        assert!(r.size >= 400.0 * PERSON_CROP_MARGIN - 1e-3);
+        // The box sits in the middle of the square.
+        assert!((r.x + r.size / 2.0 - 200.0).abs() < 1e-3);
+        assert!((r.y + r.size / 2.0 - 250.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn people_keep_their_ids_while_their_boxes_overlap_and_newcomers_get_new_ones() {
+        let previous = vec![
+            person(1, [0.0, 0.0, 100.0, 300.0], None),
+            person(2, [400.0, 0.0, 100.0, 300.0], None),
+        ];
+        let mut next_id = 2;
+        // Both moved a little; a third person walked in.
+        let boxes = [[410.0, 5.0, 100.0, 300.0], [5.0, 0.0, 100.0, 300.0], [800.0, 0.0, 100.0, 300.0]];
+        assert_eq!(match_people(&previous, &boxes, &mut next_id), vec![2, 1, 3]);
+        assert_eq!(next_id, 3);
+    }
+
+    #[test]
+    fn body_points_outside_the_persons_box_are_dropped() {
+        let b = raised_right(0.0);
+        // A box around everything but the raised right wrist (at y=80).
+        let within = body_within(b, [100.0, 140.0, 200.0, 200.0]);
+        assert!(within[R_SHOULDER].is_some());
+        assert!(within[R_WRIST].is_none(), "the wrist above the box is someone else's");
+    }
+
+    #[test]
+    fn a_hand_spread_over_a_whole_person_is_not_a_hand() {
+        let h = hand_at(100.0, 200.0);
+        assert!(plausible_hand(&h, 1280, 720));
+        // The same landmarks stretched over a torso: the fingertips far from the
+        // knuckles, the span many hand sizes.
+        let mut torso = h.clone();
+        for tip in [H_INDEX_TIP, H_MIDDLE_TIP, H_RING_TIP, H_PINKY_TIP] {
+            torso.landmarks[tip].y -= 300.0;
         }
-        // Never smaller than a quarter of the frame's short side.
-        assert!(r.size >= 180.0);
+        assert!(!plausible_hand(&torso, 1280, 720));
+        // A hand-shaped detection as large as a person far away is not their hand.
+        let far = person(1, [80.0, 120.0, 40.0, 120.0], None);
+        assert!(!fits_person(&h, &far));
+        let near = person(1, [0.0, 0.0, 300.0, 700.0], None);
+        assert!(fits_person(&h, &near));
+    }
+
+    #[test]
+    fn hands_go_to_the_person_at_whose_wrist_they_are() {
+        let left_person = person(1, [100.0, 50.0, 200.0, 400.0], Some(raised_right(0.0)));
+        let mut right_body = raised_right(0.0);
+        for p in right_body.iter_mut().flatten() {
+            p.x += 600.0;
+        }
+        let right_person = person(2, [700.0, 50.0, 200.0, 400.0], Some(right_body));
+        let people = [left_person, right_person];
+        // At the right person's raised right wrist (720, 80).
+        assert_eq!(owner_of(&hand_at(720.0, 85.0), &people), Some(1));
+        assert_eq!(owner_of(&hand_at(120.0, 85.0), &people), Some(0));
+        // Far from everyone.
+        assert_eq!(owner_of(&hand_at(1200.0, 600.0), &people), None);
+    }
+
+    #[test]
+    fn hands_without_a_person_are_paired_only_when_side_by_side() {
+        let [a, b] = two_hand_heart_pair();
+        let far = hand_at(900.0, 200.0);
+        let groups = group_hands(&[], &[tracked(5, a), tracked(3, b), tracked(9, far)]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, GroupKey::Hands(3));
+        assert_eq!(groups[0].2.len(), 2, "the heart pair stays together");
+        assert_eq!(groups[1].0, GroupKey::Hands(9));
+        assert_eq!(groups[1].2.len(), 1);
+    }
+
+    #[test]
+    fn a_heart_made_by_one_person_is_seen_among_several_people() {
+        let mut s = CameraState::default();
+        let [a, b] = two_hand_heart_pair();
+        // Two other people stand around, each with one hand up.
+        let analysis = Analysis {
+            people: Vec::new(),
+            hands: vec![
+                tracked(1, a),
+                tracked(2, b),
+                tracked(3, hand_at(600.0, 200.0)),
+                tracked(4, hand_at(1000.0, 300.0)),
+            ],
+            palm_searches: 0,
+            took: StageTimes::default(),
+        };
+        assert!(s.recognize(0, &analysis).is_none());
+        assert!(s.recognize(300, &analysis).is_none());
+        let (g, place) = s.recognize(700, &analysis).expect("the heart pair fires");
+        assert_eq!(g, Gesture::Heart);
+        assert!(place[0] < 150.0, "labelled where the pair is: {place:?}");
+    }
+
+    #[test]
+    fn recognizers_of_people_who_left_are_forgotten() {
+        let mut s = CameraState::default();
+        let one = Analysis { people: vec![person(1, [0.0, 0.0, 100.0, 300.0], None)], hands: Vec::new(), palm_searches: 0, took: StageTimes::default() };
+        s.recognize(0, &one);
+        assert_eq!(s.recognizers.len(), 1);
+        let nobody = Analysis { people: Vec::new(), hands: Vec::new(), palm_searches: 0, took: StageTimes::default() };
+        s.recognize(GROUP_FORGET_MS + 1, &nobody);
+        assert!(s.recognizers.is_empty());
     }
 
     #[test]

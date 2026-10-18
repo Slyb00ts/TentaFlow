@@ -191,7 +191,8 @@ pub fn load(model_path: &Path) -> Result<MovenetEngine> {
         model_path,
         &model_path.with_file_name("trt-cache-movenet"),
         None,
-        1,
+        // The gesture engine reads several people's poses in the same frame.
+        4,
         false,
         // The int32 preprocessing prefix splits the graph between EPs; a
         // TensorRT engine for a model this small would not pay for its build.

@@ -106,6 +106,9 @@ pub enum CudaMapError {
     },
     /// The frame is not a 2-plane NV12 surface we can describe.
     UnexpectedLayout,
+    /// `gst_cuda_memory_sync` is not available (no libgstcuda) or the wait on the
+    /// decoder's stream failed — the surface may still be mid-decode.
+    SyncUnavailable,
 }
 
 impl std::fmt::Display for CudaMapError {
@@ -123,6 +126,7 @@ impl std::fmt::Display for CudaMapError {
                 "pointer not on CUDA device 0 (device={device}, type={memory_type}, rc={rc})"
             ),
             CudaMapError::UnexpectedLayout => write!(f, "frame is not a 2-plane NV12 surface"),
+            CudaMapError::SyncUnavailable => write!(f, "cannot wait for the decoder's CUDA stream (libgstcuda)"),
         }
     }
 }
@@ -189,6 +193,49 @@ impl<'a> Drop for CudaNv12Map<'a> {
 /// written. The borrow is shared (`&BufferRef`) even for `write = true` because
 /// the edit happens in device memory the Rust borrow checker cannot see; the
 /// caller guarantees exclusive ownership of the buffer for a write map.
+/// `gst_cuda_memory_sync` from libgstcuda — the library nvcodec itself links, so
+/// it is present wherever NVDEC surfaces exist. Resolved once.
+fn gst_cuda_memory_sync_fn() -> Option<unsafe extern "C" fn(*mut gst::ffi::GstMemory)> {
+    type SyncFn = unsafe extern "C" fn(*mut gst::ffi::GstMemory);
+    static SYNC: std::sync::OnceLock<Option<(libloading::Library, SyncFn)>> = std::sync::OnceLock::new();
+    SYNC.get_or_init(|| {
+        let names: &[&str] = if cfg!(windows) {
+            &["gstcuda-1.0-0.dll"]
+        } else {
+            &["libgstcuda-1.0.so.0", "libgstcuda-1.0.so"]
+        };
+        for name in names {
+            // SAFETY: loading GStreamer's own CUDA helper library, which runs no
+            // initialisation beyond its constructors; the symbol has the
+            // documented signature `void gst_cuda_memory_sync (GstCudaMemory *)`.
+            let Ok(lib) = (unsafe { libloading::Library::new(*name) }) else {
+                continue;
+            };
+            let sym = unsafe { lib.get::<SyncFn>(b"gst_cuda_memory_sync\0") }.map(|s| *s);
+            match sym {
+                Ok(f) => return Some((lib, f)),
+                Err(e) => tracing::warn!("[cuda-map] {name} has no gst_cuda_memory_sync: {e}"),
+            }
+        }
+        tracing::warn!("[cuda-map] libgstcuda not found: zero-copy NVDEC maps are unavailable");
+        None
+    })
+    .as_ref()
+    .map(|(_, f)| *f)
+}
+
+fn sync_decoder_stream(mem: *mut gst::ffi::GstMemory) -> bool {
+    match gst_cuda_memory_sync_fn() {
+        // SAFETY: `mem` is the GstCudaMemory just mapped with GST_MAP_CUDA (a
+        // non-CUDA memory rejected that map), alive for the caller's buffer ref.
+        Some(sync) => {
+            unsafe { sync(mem) };
+            true
+        }
+        None => false,
+    }
+}
+
 pub fn map_nv12_device<'a>(
     buffer: &'a gst::BufferRef,
     info: &gst_video::VideoInfo,
@@ -223,6 +270,16 @@ pub fn map_nv12_device<'a>(
     if base == 0 {
         unsafe { gst::ffi::gst_memory_unmap(mem, &mut map_info) };
         return Err(CudaMapError::NullPointer);
+    }
+
+    // A CUDA map does not wait for the decoder: NVDEC writes the surface
+    // asynchronously on nvcodec's stream. `gst_cuda_memory_sync` waits for THAT
+    // stream only (a no-op when nothing is pending), where a device-wide sync would
+    // also wait for every other model, camera and encoder on the GPU — with a busy
+    // GPU that one wait made each anonymized frame as slow as all of them together.
+    if !sync_decoder_stream(mem) {
+        unsafe { gst::ffi::gst_memory_unmap(mem, &mut map_info) };
+        return Err(CudaMapError::SyncUnavailable);
     }
 
     // Validate the device pointer is CUDA device 0 device memory. Any mismatch or

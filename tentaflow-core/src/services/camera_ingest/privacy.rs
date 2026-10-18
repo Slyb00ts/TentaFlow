@@ -41,7 +41,7 @@ use super::gst_cuda_ffi::map_nv12_device;
 use super::privacy_options::PrivacyOptions;
 use crate::services::detection_bus::{self, Detection, MotionSignal};
 use crate::vision::gpu_preprocess::{
-    mosaic_nv12_device, preprocess_nv12_device_into, wait_for_decoded_surface, BlurRect,
+    mosaic_nv12_device, preprocess_nv12_device_into, BlurRect,
     ColorCoeffs, GpuStream, MosaicMode, MosaicScratch, Nv12DevicePlanes, OwnedDeviceTensor,
     MOSAIC_MAX_RECTS,
 };
@@ -170,6 +170,7 @@ struct ProbeState {
 impl Drop for ProbeState {
     fn drop(&mut self) {
         super::tracker::remove(&self.camera_id);
+        super::gesture::forget_people(&self.camera_id);
     }
 }
 
@@ -203,8 +204,6 @@ impl ProbeState {
             w: width,
             h: height,
         };
-        wait_for_decoded_surface()?;
-
         let color = {
             let (kr, kb, full_range) = nv12_color_from_info(video_info);
             ColorCoeffs { kr, kb, full_range }
@@ -257,6 +256,13 @@ impl ProbeState {
         drop(map);
 
         let work_ms = started.elapsed().as_secs_f64() * 1000.0;
+        if let (Some(found), Some(pts)) = (analysis.as_ref(), buffer.pts()) {
+            super::gesture::note_people(
+                &self.camera_id,
+                pts.nseconds(),
+                found.persons.iter().map(|d| (d.bbox, d.score)),
+            );
+        }
         if self.options.person_detect {
             if let Some(Analysis { persons, .. }) = analysis {
                 let mut persons: Vec<Detection> = persons
@@ -365,20 +371,29 @@ fn analyse(
         &gpu.stream,
     )?;
     gpu.stream.synchronize()?;
-    // SAFETY: both inputs are live device-0 tensors of the models' input shapes,
-    // owned by this probe, and the stream sync above completed every write.
-    let persons = unsafe {
-        coco.detect_device_input(
-            gpu.coco_input.device_ptr(),
-            content,
-            detector_coco::PERSON_CLASSES,
-            PRIVACY_PERSON_SCORE,
-        )
-    }?;
-    let faces = unsafe {
-        faces.detect_device_input(gpu.face_input.device_ptr(), face_yunet::FACE_SCORE_THRESHOLD)
-    }?;
-    Ok(Analysis { persons, faces })
+    // The two models sit in separate session pools: run them at the same time, so
+    // a frame waits for the slower one, not for both in a row.
+    let (coco_ptr, face_ptr) = (gpu.coco_input.device_ptr() as usize, gpu.face_input.device_ptr() as usize);
+    let (persons, faces) = std::thread::scope(|scope| {
+        let persons = scope.spawn(|| {
+            // SAFETY: a live device-0 tensor of YOLOX's input shape, owned by this
+            // probe and not written again before the scope ends; the stream sync
+            // above completed every write.
+            unsafe {
+                coco.detect_device_input(
+                    coco_ptr as *const f32,
+                    content,
+                    detector_coco::PERSON_CLASSES,
+                    PRIVACY_PERSON_SCORE,
+                )
+            }
+        });
+        // SAFETY: as above, for YuNet's input tensor.
+        let faces = unsafe { faces.detect_device_input(face_ptr as *const f32, face_yunet::FACE_SCORE_THRESHOLD) };
+        let persons = persons.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (persons, faces)
+    });
+    Ok(Analysis { persons: persons?, faces: faces? })
 }
 
 /// Head region of a person box (`bbox` normalized `[x, y, w, h]`) in luma

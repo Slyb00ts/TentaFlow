@@ -96,7 +96,7 @@ pub const YOLOX_TINY_FILE: &str = "yolox_tiny.onnx";
 pub const YUNET_FILE: &str = "face_detection_yunet_2023mar.onnx";
 
 /// YOLOX-tiny COCO detector (Megvii, Apache-2.0): vehicle association next to
-/// RF-DETR and person boxes for the camera privacy probe.
+/// RF-DETR, person boxes for the camera privacy probe and for the gesture engine.
 const YOLOX_TINY: CvFile = CvFile {
     name: YOLOX_TINY_FILE,
     remote: true,
@@ -306,12 +306,15 @@ const BUNDLES: &[CvBundle] = &[
         files: &[YOLOX_TINY, YUNET],
     },
     CvBundle {
-        // Gesture recognition on robot cameras: body pose locates the hands, the
-        // palm detector + landmarker read the fingers. All three are third-party
-        // releases pinned by sha256 and run on tract (CPU), so no ORT build gate.
+        // Gesture recognition on robot cameras: the person detector finds
+        // everyone in view, body pose locates each person's hands, the palm
+        // detector + landmarker read the fingers. All are third-party releases
+        // pinned by sha256. The pose and hand models also run on tract (CPU);
+        // YOLOX is ORT-only, so a build without ONNX Runtime skips it and reads
+        // the whole frame as one person.
         engine_id: "gesture-cv",
         runs_on: BundleHost::Cpu,
-        files: &[MOVENET, PALM_DETECTION, HAND_LANDMARK],
+        files: &[YOLOX_TINY, MOVENET, PALM_DETECTION, HAND_LANDMARK],
     },
 ];
 
