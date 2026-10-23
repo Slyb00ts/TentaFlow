@@ -31,12 +31,26 @@ test('the closed panel is visibility:hidden and the open one visible, so Tab can
   assert.match(css, /:host-context\(\.tf-menu--inline\) \.tf-menu \{[^}]*visibility: visible/);
 });
 
-test('arrows walk in from the first or last enabled item when focus sits on a disabled one', () => {
-  const menu = mount(`<tf-menu-item data-name="a">A</tf-menu-item><tf-menu-item data-name="b" disabled>B</tf-menu-item><tf-menu-item data-name="c">C</tf-menu-item>`);
+test('arrows continue from a disabled item to the next or the previous enabled one', () => {
+  const menu = mount(`<tf-menu-item data-name="a">A</tf-menu-item><tf-menu-item data-name="b" disabled>B</tf-menu-item><tf-menu-item data-name="c">C</tf-menu-item><tf-menu-item data-name="d">D</tf-menu-item>`);
   rowOf(menu, 'b').focus();
   press('ArrowDown');
-  assert.equal(document.activeElement, rowOf(menu, 'a'));
+  assert.equal(document.activeElement, rowOf(menu, 'c'));
   rowOf(menu, 'b').focus();
   press('ArrowUp');
-  assert.equal(document.activeElement, rowOf(menu, 'c'));
+  assert.equal(document.activeElement, rowOf(menu, 'a'));
+});
+
+test('arrows wrap from a disabled item at either end of the list', () => {
+  const menu = mount(`<tf-menu-item data-name="a">A</tf-menu-item><tf-menu-item data-name="b">B</tf-menu-item><tf-menu-item data-name="z" disabled>Z</tf-menu-item>`);
+  rowOf(menu, 'z').focus();
+  press('ArrowDown');
+  assert.equal(document.activeElement, rowOf(menu, 'a'));
+  rowOf(menu, 'z').focus();
+  press('ArrowUp');
+  assert.equal(document.activeElement, rowOf(menu, 'b'));
+});
+
+test('a long panel scrolls inside itself and keeps the wheel to itself', () => {
+  assert.match(css, /\.tf-menu \{[^}]*overscroll-behavior: contain/);
 });

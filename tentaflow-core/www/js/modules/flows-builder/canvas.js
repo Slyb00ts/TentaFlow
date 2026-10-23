@@ -10,7 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
-import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processWarningText, processHandlerName, processBoundaryHosts, processEscalationPathProblem, processHasTimer, processTimezoneCanonical, processTimezoneGaps, processTimezoneProblem, processTimezoneText } from './bpmn.js';
+import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processWarningText, processHandlerName, processBoundaryHosts, processBoundaryRefusals, processEscalationPathProblem, processHasTimer, processTimezoneCanonical, processTimezoneGaps, processTimezoneProblem, processTimezoneText } from './bpmn.js';
 import { planProcessLabels } from './label-layout.js';
 import '/js/components/tf-menu.js';
 
@@ -424,6 +424,7 @@ export class FlowCanvas {
 
   getData() {
     if (this.mode === 'bpmn') {
+      this._keepGeometryFinite();
       this.processModel = canvasToProcess(this.processModel, this.nodes, this.edges,
         (edge) => this._processEdgePoints(edge), this.processPath, this.selectedProcessId);
       const data = structuredClone(this.processModel);
@@ -475,6 +476,18 @@ export class FlowCanvas {
         return out;
       }),
     };
+  }
+
+  // A coordinate that is not a finite number cannot be stored as a number (the
+  // server refuses `null` for an f64), so it falls back to the origin or the
+  // default size before it reaches the model.
+  _keepGeometryFinite() {
+    for (const node of this.nodes) {
+      if (!Number.isFinite(node.x)) node.x = 0;
+      if (!Number.isFinite(node.y)) node.y = 0;
+      if (node.width !== undefined && !(Number.isFinite(node.width) && node.width > 0)) node.width = 240;
+      if (node.height !== undefined && !(Number.isFinite(node.height) && node.height > 0)) node.height = 96;
+    }
   }
 
   navigateProcessBody(path, processId = this.selectedProcessId) {
@@ -561,6 +574,11 @@ export class FlowCanvas {
         if (['bpmn_boundary_error', 'bpmn_boundary_escalation'].includes(node.type)
           && !this.nodes.some((candidate) => candidate.id === node.config.attachedToId)) {
           errors.push(I18n.t('bpmn.boundary_required_named', { node: this._nodeName(node) }));
+        }
+        if (processBoundaryKind(node.type) && node.config.attachedToId
+          && processBoundaryRefusals(this, processNodeKind(node.type)).get(node.config.attachedToId) === 'repeat') {
+          const host = this.nodes.find((candidate) => candidate.id === node.config.attachedToId);
+          errors.push(I18n.t('bpmn.boundary_repeat_refused_named', { node: this._nodeName(node), host: this._nodeName(host) }));
         }
         const problem = node.type === 'bpmn_boundary_escalation' ? processEscalationPathProblem(this, node.id) : null;
         if (problem) errors.push(I18n.t(`bpmn.routing_warning_escalation_path_${ESCALATION_PATH_KEYS.includes(problem.reason) ? problem.reason : 'other'}`, { names: this._nodeName(node) }));
@@ -932,7 +950,10 @@ export class FlowCanvas {
     if (this.mode === 'bpmn' && this.processPath.length > 0
       && ['bpmn_timer_start', 'bpmn_message_start'].includes(tpl.node_type)) return;
     if (this.mode === 'bpmn' && this.processPath.length >= 3 && tpl.node_type === 'bpmn_sub_process') return;
-    const pt = this._clientToWorld(clientX, clientY);
+    const rect = this.root.getBoundingClientRect();
+    const pt = this._clientToWorld(Number.isFinite(clientX) ? clientX : rect.left + rect.width / 2,
+      Number.isFinite(clientY) ? clientY : rect.top + rect.height / 2);
+    if (!Number.isFinite(pt.x) || !Number.isFinite(pt.y)) { pt.x = 0; pt.y = 0; }
     let defaultConfig = {};
     try { defaultConfig = JSON.parse(tpl.default_config || '{}'); } catch (_) {}
     const node = {
@@ -958,6 +979,7 @@ export class FlowCanvas {
     if (!cascade && this.mode === 'bpmn' && !node.config.attachedToId && this._coversNode(node)) {
       this._placeCascade(node, classic);
     } else if (!cascade) {
+      if (!node.config?.attachedToId) this._clearOfObstacles(node);
       this.nodes.push(node);
       this.render();
       // A classic node's height is only known once it is rendered, so a drop is
@@ -965,8 +987,11 @@ export class FlowCanvas {
       const real = classic ? this._renderedHeight(node) : 0;
       if (real > 0) {
         node.y = snapGridCoordinate(pt.y - real / 2);
+        if (!node.config?.attachedToId) this._clearOfObstacles(node, real);
         this.render();
       }
+      // A drop at the edge of the canvas would leave the node half outside it.
+      this._panToReveal(node, this._footprint(node, classic));
     } else {
       this._placeCascade(node, classic);
     }
@@ -974,6 +999,30 @@ export class FlowCanvas {
     this.selectNode(node.id);
     this.onChange();
     return node;
+  }
+
+  // What floats over the drawing area (the minimap, on a phone the open
+  // inspector), as rectangles in world units. A node placed under one of them
+  // could not be seen or reached.
+  _obstacleWorldRects() {
+    const boxes = this.opts.obstacles?.() ?? [];
+    if (!boxes.length) return [];
+    const rect = this.root.getBoundingClientRect();
+    const zoom = this._positiveZoom();
+    return boxes.map((box) => ({ x: (box.left - rect.left - this.view.x) / zoom, y: (box.top - rect.top - this.view.y) / zoom,
+      w: box.width / zoom, h: box.height / zoom }));
+  }
+
+  // A drop that lands under an obstacle moves to the nearer free side of it.
+  _clearOfObstacles(node, measuredHeight) {
+    const width = node.width || NODE_WIDTH;
+    const height = node.height || measuredHeight || NODE_H_APPROX;
+    for (const box of this._obstacleWorldRects()) {
+      if (!(node.x < box.x + box.w && box.x < node.x + width && node.y < box.y + box.h && box.y < node.y + height)) continue;
+      const left = Math.floor((box.x - width - GRID) / GRID) * GRID;
+      const above = Math.floor((box.y - height - GRID) / GRID) * GRID;
+      if (node.x - left <= node.y - above) node.x = left; else node.y = above;
+    }
   }
 
   _coversNode(node) {
@@ -988,7 +1037,7 @@ export class FlowCanvas {
   // again, from the original target against the same neighbour rectangles.
   _placeCascade(node, classic) {
     const origin = { x: node.x, y: node.y };
-    const rects = this._nodeRects();
+    const rects = [...this._nodeRects(), ...this._obstacleWorldRects()];
     let placed = this._moveToFreeSpot(node, this._firstPassSize(node, rects), rects, origin);
     this.nodes.push(node);
     this.render();
@@ -1007,6 +1056,20 @@ export class FlowCanvas {
     return element ? element.offsetHeight || 0 : 0;
   }
 
+  // Where a label sits outside its element, relative to the element. A deferred
+  // label has no placement (it only appears on hover and selection) and an
+  // unplaced one has no offsets, so neither may take part in any geometry.
+  _placedLabelBox(node) {
+    const element = this.nodesLayer?.querySelector(`[data-node-id="${CSS.escape(node.id)}"]`);
+    if (!element || element.classList.contains('fb-label-deferred')) return null;
+    const label = element.querySelector('.fb-process-label');
+    if (!label || label.hidden || !(label.offsetWidth > 0) || !(label.offsetHeight > 0)) return null;
+    const left = Number.parseFloat(label.style.left);
+    const top = Number.parseFloat(label.style.top);
+    if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
+    return { left, top, width: label.offsetWidth, height: label.offsetHeight };
+  }
+
   // The rectangle a node occupies, as the box plus the offsets (ox, oy) from
   // the footprint corner to the node corner: a classic node by its rendered
   // height, a BPMN node together with its external label, which hangs outside
@@ -1018,15 +1081,12 @@ export class FlowCanvas {
     }
     const width = node.width || 240;
     const height = node.height || 96;
-    const element = this.nodesLayer?.querySelector(`[data-node-id="${CSS.escape(node.id)}"]`);
-    const label = element?.querySelector('.fb-process-label');
+    const label = this._placedLabelBox(node);
     let left = 0; let top = 0; let right = width; let bottom = height;
-    if (label && !label.hidden && label.offsetWidth > 0 && label.offsetHeight > 0) {
-      const x = parseFloat(label.style.left) || 0;
-      const y = parseFloat(label.style.top) || 0;
-      left = Math.min(0, x); top = Math.min(0, y);
-      right = Math.max(width, x + label.offsetWidth);
-      bottom = Math.max(height, y + label.offsetHeight);
+    if (label) {
+      left = Math.min(0, label.left); top = Math.min(0, label.top);
+      right = Math.max(width, label.left + label.width);
+      bottom = Math.max(height, label.top + label.height);
     }
     const ox = Math.ceil(-left / GRID) * GRID;
     const oy = Math.ceil(-top / GRID) * GRID;
@@ -1260,7 +1320,10 @@ export class FlowCanvas {
     const hosts = processBoundaryHosts(this, processNodeKind(node.type)).filter((candidate) =>
       point.x >= candidate.x - margin && point.x <= candidate.x + candidate.width + margin
       && point.y >= candidate.y - margin && point.y <= candidate.y + candidate.height + margin);
-    if (!hosts.length) return;
+    if (!hosts.length) {
+      this._explainRefusedDrop(node, point, margin);
+      return;
+    }
     const gap = (candidate) => Math.hypot(
       Math.max(candidate.x - point.x, 0, point.x - candidate.x - candidate.width),
       Math.max(candidate.y - point.y, 0, point.y - candidate.y - candidate.height));
@@ -1270,6 +1333,16 @@ export class FlowCanvas {
       node.config.attachedToId = null;
       toast(I18n.t('bpmn.boundary_no_room', { node: this._nodeName(host) }), 'warning');
     }
+  }
+
+  // A boundary event dropped on an activity that cannot take it stays unattached;
+  // the toast says why, so it is not left to be worked out from the "Not attached" tag.
+  _explainRefusedDrop(node, point, margin) {
+    const refusals = processBoundaryRefusals(this, processNodeKind(node.type));
+    const target = this.nodes.filter((candidate) => refusals.get(candidate.id)
+      && point.x >= candidate.x - margin && point.x <= candidate.x + candidate.width + margin
+      && point.y >= candidate.y - margin && point.y <= candidate.y + candidate.height + margin)[0];
+    if (target) toast(I18n.t(`bpmn.boundary_refused_${refusals.get(target.id)}`, { node: this._nodeName(target) }), 'warning');
   }
 
   _positionBoundary(node) {
@@ -2234,19 +2307,18 @@ export class FlowCanvas {
     if (this.nodes.length === 0 && modelingShapes.length === 0) return null;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const n of this.nodes) {
+      if (!Number.isFinite(n.x) || !Number.isFinite(n.y)) continue;
       minX = Math.min(minX, n.x);
       minY = Math.min(minY, n.y);
       maxX = Math.max(maxX, n.x + (this.mode === 'bpmn' ? n.width : NODE_WIDTH));
       maxY = Math.max(maxY, n.y + (this.mode === 'bpmn' ? n.height : Math.max(NODE_H_APPROX, this._renderedHeight(n))));
       if (this.mode === 'bpmn') {
-        const label = this.nodesLayer.querySelector(`[data-node-id="${CSS.escape(n.id)}"] .fb-process-label`);
-        if (label && !label.hidden && label.offsetWidth && label.offsetHeight) {
-          const left = n.x + Number.parseFloat(label.style.left);
-          const top = n.y + Number.parseFloat(label.style.top);
-          minX = Math.min(minX, left);
-          minY = Math.min(minY, top);
-          maxX = Math.max(maxX, left + label.offsetWidth);
-          maxY = Math.max(maxY, top + label.offsetHeight);
+        const label = this._placedLabelBox(n);
+        if (label) {
+          minX = Math.min(minX, n.x + label.left);
+          minY = Math.min(minY, n.y + label.top);
+          maxX = Math.max(maxX, n.x + label.left + label.width);
+          maxY = Math.max(maxY, n.y + label.top + label.height);
         }
       }
     }
@@ -2258,7 +2330,7 @@ export class FlowCanvas {
       maxX = Math.max(maxX, shape.x + Math.max(shape.width, label?.scrollWidth || 0));
       maxY = Math.max(maxY, shape.y + Math.max(shape.height, label?.scrollHeight || 0));
     }
-    return { minX, minY, maxX, maxY };
+    return Number.isFinite(minX + minY + maxX + maxY) ? { minX, minY, maxX, maxY } : null;
   }
 
   /**
@@ -2267,12 +2339,24 @@ export class FlowCanvas {
    * kadrze jest wiec ZAWSZE caly widoczny — a graf wiekszy niz kadr da sie
    * przesuwac tylko do granicy tresci, nie w pusta przestrzen za nia.
    */
+  // What floats over the lower part of the canvas (the minimap) takes that much
+  // of its height: the drawing is kept above it, so a name at the right edge is
+  // never hidden under the panel.
+  _bottomInset(rect) {
+    let inset = 0;
+    for (const box of this.opts.obstacles?.() ?? []) {
+      if (box.top + box.height / 2 > rect.top + rect.height / 2) inset = Math.max(inset, rect.top + rect.height - box.top + 12);
+    }
+    return Math.min(inset, rect.height / 2);
+  }
+
   _clampView() {
     const b = this._contentBounds();
     if (!b) return;
     const rect = this.root.getBoundingClientRect();
     if (!Number.isFinite(rect.width) || !Number.isFinite(rect.height)
       || rect.width <= 0 || rect.height <= 0) return;
+    const inset = this._bottomInset(rect);
     const z = this._positiveZoom();
     const clampAxis = (value, lo, hi) => Math.min(Math.max(value, Math.min(lo, hi)), Math.max(lo, hi));
     this.view.x = clampAxis(
@@ -2283,13 +2367,19 @@ export class FlowCanvas {
     this.view.y = clampAxis(
       this.view.y,
       CONTENT_MARGIN - b.minY * z,
-      rect.height - CONTENT_MARGIN - b.maxY * z,
+      rect.height - inset - CONTENT_MARGIN - b.maxY * z,
     );
   }
 
+  // A view that is not a finite number would stop the world transform from
+  // being written at all, so it never leaves this method.
   _applyView() {
     this._positiveZoom();
+    if (!Number.isFinite(this.view.x)) this.view.x = 0;
+    if (!Number.isFinite(this.view.y)) this.view.y = 0;
     this._clampView();
+    if (!Number.isFinite(this.view.x)) this.view.x = 0;
+    if (!Number.isFinite(this.view.y)) this.view.y = 0;
     this.world.style.transform = `translate(${this.view.x}px, ${this.view.y}px) scale(${this.view.zoom})`;
     this.onViewChange(this.view);
   }
@@ -2297,8 +2387,8 @@ export class FlowCanvas {
   setZoom(zoom, cx, cy) {
     if (!Number.isFinite(zoom)) return;
     const rect = this.root.getBoundingClientRect();
-    if (cx === undefined) cx = rect.width / 2;
-    if (cy === undefined) cy = rect.height / 2;
+    if (!Number.isFinite(cx)) cx = rect.width / 2;
+    if (!Number.isFinite(cy)) cy = rect.height / 2;
     const z = Math.max(0.2, Math.min(3, zoom));
     // Zoom względem punktu (cx,cy) w lokalnych współrz. canvasu
     const currentZoom = this._positiveZoom();
@@ -2308,6 +2398,16 @@ export class FlowCanvas {
     this.view.y = cy - worldY * z;
     this.view.zoom = z;
     this._pendingFitMinZoom = null;
+    this._applyView();
+  }
+
+  // Puts a point of the drawing at the middle of the canvas (the minimap's pan).
+  centerOn(worldX, worldY) {
+    if (!Number.isFinite(worldX) || !Number.isFinite(worldY)) return;
+    const rect = this.root.getBoundingClientRect();
+    const zoom = this._positiveZoom();
+    this.view.x = rect.width / 2 - worldX * zoom;
+    this.view.y = rect.height / 2 - worldY * zoom;
     this._applyView();
   }
 
@@ -2344,7 +2444,8 @@ export class FlowCanvas {
       this._pendingFitMinZoom = minZoom;
       return;
     }
-    const fit = Math.min(1, Math.min(rect.width / w, rect.height / h));
+    const usableHeight = rect.height - this._bottomInset(rect);
+    const fit = Math.min(1, Math.min(rect.width / w, usableHeight / h));
     const z = Math.max(fit, minZoom);
     if (!Number.isFinite(z) || z <= 0) {
       this._pendingFitMinZoom = minZoom;
@@ -2357,7 +2458,7 @@ export class FlowCanvas {
       this.view.y = pad * z - minY * z;
     } else {
       this.view.x = (rect.width - (maxX + minX) * z) / 2;
-      this.view.y = (rect.height - (maxY + minY) * z) / 2;
+      this.view.y = (usableHeight - (maxY + minY) * z) / 2;
     }
     this._applyView();
   }

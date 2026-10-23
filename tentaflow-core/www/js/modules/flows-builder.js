@@ -30,6 +30,7 @@ import '/js/components/tf-menu.js';
 // Delete and undo must keep working after a click on Save or a palette Enter
 // leaves focus on a button, so only elements that consume these keys
 // themselves (text fields, pickers, open dialogs and menus) swallow them.
+const MINIMAP_COLLAPSED_KEY = 'tf_fb_minimap_collapsed';
 const TEXT_ENTRY_TAGS = new Set(['INPUT', 'TEXTAREA', 'SELECT', 'TF-INPUT', 'TF-TEXTAREA', 'TF-SEARCHBOX',
   'TF-COMBOBOX', 'TF-SELECT', 'TF-DATEPICKER', 'TF-MENU', 'TF-MODAL', 'TF-WINDOW', 'DIALOG']);
 function isTextEntryOrDialog(element) {
@@ -98,7 +99,7 @@ const FlowBuilderScreen = {
           <tf-button variant="primary" size="sm" icon="check" data-role="save">${escapeHtml(I18n.t('flows_builder.save'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="clock" data-role="history" title="${escapeAttr(I18n.t('flows_builder.history_title'))}"></tf-button>`}
         </header>
-        ${process ? `<div class="fb-process-notice" id="fb-process-notice"><tf-chip status="info" data-role="publication">${escapeHtml(I18n.t('bpmn.draft'))}</tf-chip><tf-button variant="ghost" size="sm" icon="chevron-down" data-role="notice-toggle" aria-controls="fb-process-notice">${escapeHtml(I18n.t('bpmn.process_settings'))}</tf-button><span data-role="process-hint">${escapeHtml(I18n.t('bpmn.supported_hint'))}</span><tf-select data-role="body-select" wrap-selected label="${escapeAttr(I18n.t('bpmn.process_body'))}"></tf-select><tf-select data-role="start-entry" wrap-selected label="${escapeAttr(I18n.t('bpmn.start_entry'))}"></tf-select><tf-button variant="secondary" size="sm" data-role="add-body">${escapeHtml(I18n.t('bpmn.add_process_body'))}</tf-button><tf-input data-role="body-name" label="${escapeAttr(I18n.t('bpmn.process_body_name'))}"></tf-input><tf-chip status="info" data-role="calendar-state" hidden></tf-chip><tf-input class="fb-timer-timezone" data-role="timer-timezone" label="${escapeAttr(I18n.t('bpmn.timer_timezone'))}" hint="${escapeAttr(I18n.t('bpmn.timer_timezone_hint'))}" placeholder="Europe/Warsaw" hidden></tf-input><tf-button variant="ghost" size="sm" data-role="draft" hidden>${escapeHtml(I18n.t('bpmn.return_draft'))}</tf-button><tf-button variant="ghost" size="sm" data-role="archive">${escapeHtml(I18n.t('bpmn.archive'))}</tf-button><span data-role="timer-summary" hidden></span></div>` : ''}
+        ${process ? `<div class="fb-process-notice" id="fb-process-notice"><tf-chip status="info" data-role="publication">${escapeHtml(I18n.t('bpmn.draft'))}</tf-chip><tf-button variant="ghost" size="sm" icon="chevron-down" data-role="notice-toggle" aria-controls="fb-process-notice">${escapeHtml(I18n.t('bpmn.process_settings'))}</tf-button><span data-role="process-hint">${escapeHtml(I18n.t('bpmn.supported_hint'))}</span><tf-select data-role="body-select" wrap-selected label="${escapeAttr(I18n.t('bpmn.process_body'))}"></tf-select><tf-select data-role="start-entry" wrap-selected label="${escapeAttr(I18n.t('bpmn.start_entry'))}"></tf-select><tf-button variant="secondary" size="sm" data-role="add-body">${escapeHtml(I18n.t('bpmn.add_process_body'))}</tf-button><tf-input data-role="body-name" label="${escapeAttr(I18n.t('bpmn.process_body_name'))}"></tf-input><tf-chip status="info" data-role="calendar-state" hidden></tf-chip><tf-input class="fb-timer-timezone" data-role="timer-timezone" label="${escapeAttr(I18n.t('bpmn.timer_timezone'))}" hint="${escapeAttr(I18n.t('bpmn.timer_timezone_hint'))}" placeholder="${escapeAttr(I18n.t('bpmn.timer_timezone_placeholder'))}" hidden></tf-input><tf-button variant="ghost" size="sm" data-role="draft" hidden>${escapeHtml(I18n.t('bpmn.return_draft'))}</tf-button><tf-button variant="ghost" size="sm" data-role="archive">${escapeHtml(I18n.t('bpmn.archive'))}</tf-button><span data-role="timer-summary" hidden></span></div>` : ''}
         <tf-alert data-role="error" tone="danger" hidden></tf-alert>
 
         <div class="fb-body" data-role="body">
@@ -106,8 +107,9 @@ const FlowBuilderScreen = {
           <main class="fb-canvas-wrap" data-role="canvas-wrap">
             ${process ? `<tf-button class="fb-palette-toggle" variant="secondary" size="sm" icon="plus" data-role="palette-toggle" aria-controls="fb-palette" aria-expanded="false">${escapeHtml(I18n.t('bpmn.palette_open'))}</tf-button>` : ''}
             <div data-role="canvas"></div>
-            <div class="fb-minimap" data-role="minimap" aria-label="${escapeAttr(I18n.t('flows_builder.minimap_label'))}">
+            <div class="fb-minimap" data-role="minimap" role="group" aria-label="${escapeAttr(I18n.t('flows_builder.minimap_label'))}">
               <span class="fb-minimap-label">${escapeHtml(I18n.t('flows_builder.minimap_name'))}</span>
+              <tf-button class="fb-minimap-toggle" variant="ghost" size="sm" icon="min" data-role="minimap-toggle" aria-expanded="true" aria-label="${escapeAttr(I18n.t('flows_builder.minimap_collapse'))}" title="${escapeAttr(I18n.t('flows_builder.minimap_collapse'))}"></tf-button>
               <div class="fb-minimap-viewport" data-role="minimap-viewport"></div>
             </div>
           </main>
@@ -259,6 +261,8 @@ const FlowBuilderScreen = {
         if ((node || edge) && state.mode === 'bpmn') state.showMobileTab?.('config');
         this._syncCrumb(state, node);
       },
+      obstacles: () => [...root.querySelectorAll('[data-role="minimap"]:not([hidden])')]
+        .map((element) => element.getBoundingClientRect()).filter((box) => box.width > 0 && box.height > 0),
       onViewChange: (v) => {
         const zl = root.querySelector('[data-role="zoom-level"]');
         if (zl) zl.textContent = `${Math.round(v.zoom * 100)}%`;
@@ -275,6 +279,8 @@ const FlowBuilderScreen = {
       this._syncProcessBodySelect();
       this._syncStartCatalog();
     }
+
+    this._bindMinimap(state);
 
     // Config
     state.config = new FlowConfig(root.querySelector('[data-role="config"]'), {
@@ -454,15 +460,21 @@ const FlowBuilderScreen = {
         }
         if (needed > level) tightenedAt = width;
         level = needed;
-        // Level 3 hides the button in the bar; the menu keeps the action.
-        zoomFitMore.hidden = level < 3;
+        // Level 3 hides the button in the bar; the menu keeps the action. The
+        // attribute is written only on a change: the observer below watches
+        // `hidden`, so even a write of the same value would schedule the next
+        // measurement and the bar would measure itself on every frame.
+        const hideMore = level < 3;
+        if (zoomFitMore.hidden !== hideMore) zoomFitMore.hidden = hideMore;
       };
       const fitTopbar = () => {
         if (measuring) return;
         measuring = true;
         requestAnimationFrame(measureTopbar);
       };
-      const barObserver = new ResizeObserver(fitTopbar);
+      // A resize is measured in the observer's own turn, before the frame is
+      // painted, so a narrowing window never shows the bar overflowing for a frame.
+      const barObserver = new ResizeObserver(measureTopbar);
       barObserver.observe(topbar);
       // Publish and Run appear and disappear with the process, and a language
       // change rewrites every label.
@@ -485,7 +497,7 @@ const FlowBuilderScreen = {
       });
       moreMenu.addEventListener('close', (event) => {
         if (event.target !== moreMenu) return;
-        const wasOpen = more.getAttribute('aria-expanded') === 'true';
+        const wasOpen = more.dataset.expanded === 'true';
         more.setAttribute('aria-expanded', 'false');
         if (wasOpen && (moreMenu.contains(document.activeElement) || document.activeElement === document.body)) (more.querySelector('button') ?? more).focus?.();
       });
@@ -1167,11 +1179,11 @@ const FlowBuilderScreen = {
     if (s.mode === 'bpmn') {
       const field = s.root.querySelector('[data-role="timer-timezone"]');
       // An autosave must not judge a zone that is still being typed.
-      if (silent && field.contains(document.activeElement)) return false;
+      if (silent && field?.contains(document.activeElement)) return false;
       const problem = this._commitTimezone(s);
       if (problem) {
         this._reportSaveProblem(s, problem, silent);
-        if (!silent) { s.showSettings(true); field.focus(); }
+        if (!silent) { s.showSettings(true); field?.focus(); }
         return false;
       }
     }
@@ -1237,7 +1249,7 @@ const FlowBuilderScreen = {
       return true;
     } catch (err) {
       if (!this._current(s)) return false;
-      this._reportSaveProblem(s, I18n.t('flows_builder.save_error', { error: this._explain(s, err.message) }), silent);
+      this._reportSaveProblem(s, this._explain(s, err.message), silent);
       return false;
     } finally {
       s.saving = false;
@@ -1376,6 +1388,50 @@ const FlowBuilderScreen = {
     });
   },
 
+  // The minimap pans the canvas: a press puts the spot under it at the middle
+  // of the view and a drag carries on. It folds to its title bar, and the choice
+  // is remembered (storage may be refused, then it simply is not kept).
+  _bindMinimap(state) {
+    const mini = state.root.querySelector('[data-role="minimap"]');
+    const toggle = mini.querySelector('[data-role="minimap-toggle"]');
+    const setCollapsed = (collapsed) => {
+      mini.classList.toggle('collapsed', collapsed);
+      toggle.setAttribute('aria-expanded', String(!collapsed));
+      toggle.setAttribute('icon', collapsed ? 'max' : 'min');
+      const label = I18n.t(collapsed ? 'flows_builder.minimap_expand' : 'flows_builder.minimap_collapse');
+      toggle.setAttribute('aria-label', label);
+      toggle.setAttribute('title', label);
+      this._renderMinimap();
+    };
+    let remembered = false;
+    try { remembered = localStorage.getItem(MINIMAP_COLLAPSED_KEY) === '1'; } catch (_) { /* storage refused */ }
+    if (remembered) setCollapsed(true);
+    toggle.addEventListener('click', () => {
+      const collapsed = !mini.classList.contains('collapsed');
+      setCollapsed(collapsed);
+      try { localStorage.setItem(MINIMAP_COLLAPSED_KEY, collapsed ? '1' : '0'); } catch (_) { /* storage refused */ }
+    });
+    const panTo = (event) => {
+      const map = state.minimapMap;
+      if (!map || !state.canvas) return;
+      const box = mini.getBoundingClientRect();
+      state.canvas.centerOn(map.minX + (event.clientX - box.left - map.offX) / map.scale,
+        map.minY + (event.clientY - box.top - map.offY) / map.scale);
+    };
+    let pointer = null;
+    mini.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0 || event.target.closest('[data-role="minimap-toggle"]') || mini.classList.contains('collapsed')) return;
+      pointer = event.pointerId;
+      try { mini.setPointerCapture(event.pointerId); } catch (_) { /* a synthetic pointer cannot be captured */ }
+      panTo(event);
+      event.preventDefault();
+    });
+    mini.addEventListener('pointermove', (event) => { if (pointer === event.pointerId) panTo(event); });
+    const release = (event) => { if (pointer === event.pointerId) pointer = null; };
+    mini.addEventListener('pointerup', release);
+    mini.addEventListener('pointercancel', release);
+  },
+
   _renderMinimap() {
     const s = this._state;
     if (!s) return;
@@ -1384,8 +1440,9 @@ const FlowBuilderScreen = {
     if (!mini || !vp) return;
     // Usuń poprzednie kropki
     mini.querySelectorAll('.fb-minimap-node').forEach((el) => el.remove());
+    s.minimapMap = null;
     const nodes = s.canvas.nodes;
-    if (nodes.length === 0) return;
+    if (nodes.length === 0 || mini.classList.contains('collapsed')) return;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const n of nodes) {
       minX = Math.min(minX, n.x); minY = Math.min(minY, n.y);
@@ -1400,6 +1457,7 @@ const FlowBuilderScreen = {
     const scale = Math.min(miniW / w, miniH / h) * 0.85;
     const offX = (miniW - w * scale) / 2;
     const offY = captionHeight + (miniH - h * scale) / 2;
+    s.minimapMap = { minX, minY, scale, offX, offY };
     for (const n of nodes) {
       const dot = document.createElement('div');
       dot.className = 'fb-minimap-node';

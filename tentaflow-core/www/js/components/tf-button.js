@@ -3,12 +3,15 @@
 // Opis: Komponent <tf-button> — renderuje standardowy button z klasami .tf-btn.
 //       Light DOM (bez Shadow DOM) zeby controls.css obslugiwal style.
 //       Atrybuty: variant, tone, size, icon, disabled, full-width, wrap.
-//       `aria-label`, `aria-describedby`, `aria-controls`, `aria-expanded`,
-//       `aria-haspopup` and `title` stay on the host (selectors, closest(),
-//       toggleAttribute and cloneNode keep working) and are mirrored onto the
-//       inner <button>, also when they change later: the host is not focusable,
-//       so a name, a description or a menu state has to be on the real control.
-//       The host is a generic element, so assistive tech announces only the button.
+//       `aria-label`, `aria-describedby`, `aria-controls` and `title` stay on the
+//       host (selectors, closest(), toggleAttribute and cloneNode keep working)
+//       and are mirrored onto the inner <button>, also when they change later:
+//       the host is not focusable, so a name, a description or a control has to
+//       be on the real control. `aria-expanded` and `aria-haspopup` are not
+//       allowed on the host, so setting them there is taken in: they live on the
+//       inner button and a `data-expanded` / `data-haspopup` mirror stays on the
+//       host for selectors (clear a state by removing the data attribute).
+//       The host is `role="none"`, so assistive tech announces only the button.
 // Przyklad: <tf-button variant="primary" icon="plus">Dodaj</tf-button>
 // =============================================================================
 
@@ -28,7 +31,9 @@ function safeIconName(value) {
   return /^[a-z0-9_-]{1,64}$/i.test(text) ? text : '';
 }
 
-const FORWARDED_ARIA = ['aria-label', 'aria-describedby', 'aria-controls', 'aria-expanded', 'aria-haspopup', 'title'];
+const FORWARDED_ARIA = ['aria-label', 'aria-describedby', 'aria-controls', 'title'];
+// ARIA state that belongs to the real control; the host keeps a data mirror.
+const CONSUMED_ARIA = { 'aria-expanded': 'data-expanded', 'aria-haspopup': 'data-haspopup' };
 
 const VARIANT_CLASS = {
   primary:        'tf-btn-primary',
@@ -55,7 +60,8 @@ const TONE_CLASS = {
 
 class TfButton extends HTMLElement {
   static get observedAttributes() {
-    return ['variant', 'tone', 'size', 'icon', 'trailing-icon', 'disabled', 'type', 'label', 'full-width', 'wrap', ...FORWARDED_ARIA];
+    return ['variant', 'tone', 'size', 'icon', 'trailing-icon', 'disabled', 'type', 'label', 'full-width', 'wrap', ...FORWARDED_ARIA,
+      ...Object.keys(CONSUMED_ARIA), ...Object.values(CONSUMED_ARIA)];
   }
 
   constructor() {
@@ -66,6 +72,9 @@ class TfButton extends HTMLElement {
   }
 
   connectedCallback() {
+    // A name from `title` would otherwise make the host a second, generic node
+    // beside the button it wraps.
+    if (!this.hasAttribute('role')) this.setAttribute('role', 'none');
     if (!this._btn) this._build();
     this._update();
     // A caller that sets textContent/innerHTML on the host AFTER the upgrade
@@ -84,7 +93,14 @@ class TfButton extends HTMLElement {
     }
   }
 
-  attributeChangedCallback() {
+  attributeChangedCallback(name, _before, value) {
+    const mirror = CONSUMED_ARIA[name];
+    if (mirror) {
+      if (value === null) return;
+      this.setAttribute(mirror, value);
+      this.removeAttribute(name);
+      return;
+    }
     if (this._btn) this._update();
   }
 
@@ -97,6 +113,14 @@ class TfButton extends HTMLElement {
   }
 
   _build() {
+    // A clone arrives with the button its original built; building again from
+    // that markup would put a button inside the button.
+    const built = this.querySelector(':scope > button.tf-btn');
+    if (built) {
+      this._attachClick(built);
+      this._btn = built;
+      return;
+    }
     // przenosimy slot content do wnetrza <button>, zachowujac HTML
     // jesli podano atrybut "label" — ma pierwszenstwo nad slotem
     const labelAttr = this.getAttribute('label');
@@ -105,6 +129,12 @@ class TfButton extends HTMLElement {
     const btn = document.createElement('button');
     btn.className = 'tf-btn';
     btn.innerHTML = this._renderContent(innerHtml);
+    this._attachClick(btn);
+    this.appendChild(btn);
+    this._btn = btn;
+  }
+
+  _attachClick(btn) {
     btn.addEventListener('click', (e) => {
       if (this.hasAttribute('disabled')) {
         e.preventDefault();
@@ -116,8 +146,6 @@ class TfButton extends HTMLElement {
         Sfx.play('ui-click');
       }
     });
-    this.appendChild(btn);
-    this._btn = btn;
   }
 
   _renderContent(text) {
@@ -198,8 +226,9 @@ class TfButton extends HTMLElement {
 
     const type = this.getAttribute('type');
     if (type) this._btn.setAttribute('type', type);
-    for (const name of FORWARDED_ARIA) {
-      const value = this.getAttribute(name);
+    const mirrored = [...FORWARDED_ARIA.map((name) => [name, name]), ...Object.entries(CONSUMED_ARIA)];
+    for (const [name, source] of mirrored) {
+      const value = this.getAttribute(source);
       if (value === null || value === '') this._btn.removeAttribute(name);
       else this._btn.setAttribute(name, value);
     }

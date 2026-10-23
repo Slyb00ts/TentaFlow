@@ -1513,24 +1513,43 @@ test('tf-select: the real select carries the host title, else the whole chosen t
   host.remove();
 });
 
-test('tf-button: the host keeps its aria attributes and title, and the real button mirrors them, also when they change', async () => {
+test('tf-button: the host keeps its name, description and title, and the real button mirrors them, also when they change', async () => {
   const button = mount(new TfButton(), { icon: 'more' });
   await flush();
   const inner = () => button.querySelector('button');
-  const names = ['aria-label', 'aria-describedby', 'aria-controls', 'aria-expanded', 'aria-haspopup', 'title'];
-  const values = ['More', 'why', 'panel', 'false', 'menu', 'Hint'];
+  const names = ['aria-label', 'aria-describedby', 'aria-controls', 'title'];
+  const values = ['More', 'why', 'panel', 'Hint'];
   names.forEach((name, index) => button.setAttribute(name, values[index]));
   assert.deepEqual(names.map((name) => inner().getAttribute(name)), values);
   assert.deepEqual(names.map((name) => button.getAttribute(name)), values, 'the host stays selectable by them');
-  button.setAttribute('aria-expanded', 'true');
-  assert.equal(inner().getAttribute('aria-expanded'), 'true');
   button.removeAttribute('aria-describedby');
   assert.equal(inner().hasAttribute('aria-describedby'), false);
   assert.equal(button.hasAttribute('aria-describedby'), false);
+  assert.equal(button.getAttribute('role'), 'none', 'the host is not a second named node beside its button');
   button.remove();
 });
 
-test('tf-button: aria attributes written in markup stay on the host and reach the real button', async () => {
+test('tf-button: expanded state and popup kind live on the real button, with a data mirror on the host', async () => {
+  const button = mount(new TfButton(), { icon: 'more' });
+  await flush();
+  const inner = () => button.querySelector('button');
+  button.setAttribute('aria-expanded', 'false');
+  button.setAttribute('aria-haspopup', 'menu');
+  assert.equal(inner().getAttribute('aria-expanded'), 'false');
+  assert.equal(inner().getAttribute('aria-haspopup'), 'menu');
+  assert.equal(button.hasAttribute('aria-expanded'), false, 'ARIA does not allow the state on the host');
+  assert.equal(button.hasAttribute('aria-haspopup'), false);
+  assert.equal(button.getAttribute('data-expanded'), 'false');
+  assert.equal(button.getAttribute('data-haspopup'), 'menu');
+  button.setAttribute('aria-expanded', 'true');
+  assert.equal(inner().getAttribute('aria-expanded'), 'true');
+  assert.equal(button.getAttribute('data-expanded'), 'true');
+  button.removeAttribute('data-expanded');
+  assert.equal(inner().hasAttribute('aria-expanded'), false);
+  button.remove();
+});
+
+test('tf-button: aria attributes written in markup reach the real button and the state is mirrored for selectors', async () => {
   const host = document.createElement('div');
   host.innerHTML = '<tf-button icon="more" aria-controls="drawer" aria-expanded="true"></tf-button>';
   document.body.append(host);
@@ -1540,6 +1559,6 @@ test('tf-button: aria attributes written in markup stay on the host and reach th
   assert.equal(inner.getAttribute('aria-controls'), 'drawer');
   assert.equal(inner.getAttribute('aria-expanded'), 'true');
   assert.equal(button.getAttribute('aria-controls'), 'drawer');
-  assert.equal(host.querySelector('tf-button[aria-expanded="true"]'), button);
+  assert.equal(host.querySelector('tf-button[data-expanded="true"]'), button);
   host.remove();
 });

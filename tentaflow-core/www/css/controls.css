@@ -1800,6 +1800,11 @@ tf-chip[clickable]:focus-visible > .tf-chip {
   box-shadow: var(--tf-shadow-lg);
   padding: 6px;
   min-width: 180px;
+  /* tf-menu.js caps the height to the room below or above the anchor and lets
+     the panel scroll; a visible thin bar tells the reader there is more, and the
+     wheel never carries on to the page behind it. */
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
   opacity: 0;
   transform: translateY(-4px) scale(0.9);
   filter: blur(8px);

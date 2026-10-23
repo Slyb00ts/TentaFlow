@@ -4,11 +4,12 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeAttr, escapeHtml } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
-import { checkProcessValue, processBody, processBodyLabels, processCommand, processDistinctLabels, processEditorLabels, processElementNames, processJson, processStartEntryLabels, processStatusLabel, processUnusedDeclarations } from './bpmn.js';
+import { checkProcessValue, processBody, processBodyLabels, processCommand, processDistinctLabels, processEditorLabels, processElementNames, processJson, processPlainError, processStartEntryLabels, processStatusLabel, processUnusedDeclarations } from './bpmn.js';
 import '/js/components/tf-code-editor.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-chip.js';
+import '/js/components/tf-disclosure.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-textarea.js';
 import '/js/components/tf-toggle.js';
@@ -49,7 +50,7 @@ function showError(win, error) {
   if (!win.isConnected) return;
   const el = win.querySelector('[data-error]');
   el.hidden = false;
-  el.setAttribute('message', text('request_error', { error: error.message }));
+  el.setAttribute('message', text('request_error', { error: processPlainError(error.message) ?? error.message }));
 }
 
 function jsonSection(label, value, editable = true) {
@@ -60,6 +61,48 @@ function jsonSection(label, value, editable = true) {
   editor.labels = processEditorLabels();
   editor.value = JSON.stringify(value, null, 2);
   return section;
+}
+
+// What a repetition event says, in words: occurrences are counted from 1 (the
+// server counts from 0), a total only where the instance names one, and only what
+// the event carries. The ids stay behind "Technical details".
+function repetitionFacts(event, total) {
+  const data = event.data;
+  const rows = [];
+  const occurrence = Number.isInteger(data.ordinal) ? data.ordinal + 1 : null;
+  if (event.kind === 'repetition_group_started') {
+    rows.push(['repeat_mode', text(`repeat_mode_${data.mode}`)],
+      ['repeat_total', data.total == null ? text('repeat_total_unknown') : String(data.total)]);
+  } else if (event.kind === 'repetition_occurrence_started' || event.kind === 'repetition_occurrence_completed') {
+    rows.push(['repeat_occurrences_one', total == null ? String(occurrence) : text('repeat_of', { number: occurrence, total })]);
+  } else if (event.kind === 'repetition_condition_checked') {
+    rows.push(['repeat_condition_when', data.phase === 'before_first' ? text('repeat_condition_before_first')
+        : text('repeat_condition_after', { number: data.candidate_ordinal })],
+      ['repeat_condition_result', text(data.matched ? 'repeat_condition_met' : 'repeat_condition_not_met')]);
+  } else if (event.kind === 'repetition_completed') {
+    rows.push(['repeat_completed_count', String(data.completed)]);
+  } else {
+    rows.push(['incident_code', data.code ? processIncidentText(data) : text('incident_generic')]);
+    if (data.reason) rows.push(['repeat_reason', processLifecycleReasonText(data.reason)]);
+    if (event.kind === 'repetition_group_blocked') {
+      rows.push(['repeat_last_completed', data.last_completed_ordinal == null ? text('repeat_none_completed')
+        : text('repeat_ordinal', { ordinal: data.last_completed_ordinal + 1 })]);
+      rows.push(['repeat_failed_occurrence', text('repeat_failed_occurrence_unknown')]);
+    }
+  }
+  const facts = document.createElement('div');
+  facts.className = 'fb-process-facts';
+  const list = document.createElement('dl');
+  for (const [key, value] of rows) {
+    const term = document.createElement('dt'); term.textContent = text(key);
+    const detail = document.createElement('dd'); detail.textContent = value;
+    list.append(term, detail);
+  }
+  const technical = document.createElement('tf-disclosure');
+  technical.setAttribute('label', text('technical_details'));
+  technical.append(jsonSection(text('repeat_facts'), data, false));
+  facts.append(list, technical);
+  return facts;
 }
 
 function activityInputsSection(task) {
@@ -188,6 +231,9 @@ export function processEventText(event) {
     event.data.phase === 'capacity' ? 'event_repetition_group_blocked_capacity' : 'event_repetition_group_blocked_aggregate',
     { node, code: processIncidentText(event.data), reason: processLifecycleReasonText(event.data.reason || '') },
   );
+  if (event.kind === 'repetition_occurrence_started' || event.kind === 'repetition_occurrence_completed') {
+    return text(`event_${event.kind}`, { node, number: Number.isInteger(event.data.ordinal) ? event.data.ordinal + 1 : '' });
+  }
   if (event.kind === 'repetition_entry_failed') return text('event_repetition_entry_failed', {
     node, code: processIncidentText(event.data),
   });
@@ -458,7 +504,9 @@ export async function openProcessInstance(instanceId, initial = null) {
         item.append(description, at);
         if (event.kind === 'service_result') item.append(jsonSection(text('actual_outputs'), event.data, false));
         if (event.kind === 'script_completed') item.append(jsonSection(text('script_result'), event.data.outputs, false));
-        if (event.kind.startsWith('repetition_')) item.append(jsonSection(text('repeat_facts'), event.data, false));
+        if (event.kind.startsWith('repetition_')) {
+          item.append(repetitionFacts(event, instance?.repetitionGroups.find((group) => group.groupId === event.data.group_id)?.total ?? null));
+        }
         if (event.kind === 'terminate_end_reached') item.append(jsonSection(text('terminate_facts'), event.data, false));
         if (event.kind === 'message_delivered' && Object.hasOwn(event.data, 'payload')) item.append(jsonSection(text('message_payload'), event.data.payload, false));
         events.appendChild(item);
@@ -574,6 +622,8 @@ export async function openProcessInstance(instanceId, initial = null) {
   function renderPageControls(container, name) {
     container.querySelector('[data-page-controls]')?.remove();
     const info = instance.pages[name];
+    // An empty list has nothing to page through, and its section is hidden with it.
+    if (!info.total && info.offset === 0) return;
     const controls = document.createElement('div');
     controls.className = 'fb-process-page';
     controls.dataset.pageControls = name;
@@ -598,6 +648,30 @@ export async function openProcessInstance(instanceId, initial = null) {
   function scopeLine(scopeId, key = 'scope_name') {
     const scope = instance.scopes.find((candidate) => candidate.scopeId === scopeId);
     return scope ? `<p>${escapeHtml(text(key, { name: scope.subprocessNodeName || text('root_scope') }))}</p>` : '';
+  }
+
+  // A section with no rows on its page and none behind it shows neither heading nor list.
+  function hideWhenEmpty(selector, name, rows) {
+    host.querySelector(selector).hidden = rows.length === 0 && !instance.pages[name].total;
+  }
+
+  // In a group that holds an incident the engine leaves the occurrence that failed
+  // `active` (no job, no result) and the ones after it `pending`; said that way,
+  // "Active" would read as still running.
+  function occurrenceStatusText(occurrence) {
+    const group = instance.repetitionGroups.find((candidate) => candidate.groupId === occurrence.groupId);
+    const held = group?.status === 'incident'
+      && instance.incidents.some((incident) => incident.nodeId === group.nodeId && !incident.jobId);
+    if (held && occurrence.status === 'active' && !occurrence.jobId) return text('repeat_occurrence_failed');
+    if (held && occurrence.status === 'pending') return text('repeat_occurrence_not_started');
+    return text(`repeat_occurrence_status_${occurrence.status}`);
+  }
+
+  // "Occurrence 2 of 5" counted from 1; the total only where the instance names one.
+  function occurrenceLabel(occurrence) {
+    const total = instance.repetitionGroups.find((group) => group.groupId === occurrence.groupId)?.total;
+    return total == null ? text('repeat_ordinal', { ordinal: occurrence.ordinal + 1 })
+      : text('repeat_of', { number: occurrence.ordinal + 1, total });
   }
 
   function render() {
@@ -636,11 +710,20 @@ export async function openProcessInstance(instanceId, initial = null) {
     const incidents = host.querySelector('[data-incidents]');
     incidents.innerHTML = instance.incidents.length ? `<h3>${escapeHtml(text('incidents'))}</h3>` : '';
     // Incidents of one repeated task all carry its name; the occurrence number tells them apart.
-    const incidentTitles = processDistinctLabels(instance.incidents.map((incident) => [incident.incidentId, incident.nodeName || text('element_unavailable')]));
+    const occurrenceOf = (incident) => (incident.jobId ? instance.repetitionOccurrences.find((candidate) => candidate.jobId === incident.jobId) : null);
+    const incidentTitles = processDistinctLabels(instance.incidents.map((incident) => {
+      const name = incident.nodeName || text('element_unavailable');
+      const occurrence = occurrenceOf(incident);
+      return [incident.incidentId, occurrence ? `${name} \u00b7 ${occurrenceLabel(occurrence)}` : name];
+    }));
+    // The incident carries no occurrence id; where its job does not lead to a loaded
+    // occurrence, the row says what is known instead of guessing a number.
+    const repeatedNote = (incident) => (!occurrenceOf(incident) && instance.repetitionGroups.some((group) => group.nodeId === incident.nodeId)
+      ? `<p>${escapeHtml(text('incident_repeat_unplaced'))}</p>` : '');
     for (const incident of instance.incidents) {
       const row = document.createElement('div');
       row.className = 'fb-process-work';
-      row.innerHTML = `<div><strong>${escapeHtml(incidentTitles.get(incident.incidentId))}</strong><p>${escapeHtml(processIncidentText(incident))}</p><p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)}</p>${scopeLine(incident.scopeId)}</div>
+      row.innerHTML = `<div><strong>${escapeHtml(incidentTitles.get(incident.incidentId))}</strong><p>${escapeHtml(processIncidentText(incident))}</p><p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)}</p>${repeatedNote(incident)}${scopeLine(incident.scopeId)}</div>
         <tf-button variant="secondary" data-inspect-incident>${escapeHtml(text('inspect_incident'))}</tf-button>
         ${incident.canRetry && incident.jobId ? `<tf-button variant="secondary" icon="refresh" data-retry>${escapeHtml(text('retry'))}</tf-button>` : ''}`;
       row.querySelector('[data-inspect-incident]').addEventListener('click', () => { selectedIncidentId = incident.incidentId; refresh(); });
@@ -683,6 +766,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       subscriptions.append(row);
     }
     renderPageControls(host.querySelector('[data-subscriptions]'), 'subscriptions');
+    hideWhenEmpty('[data-subscriptions]', 'subscriptions', instance.subscriptions);
     const races = host.querySelector('[data-race-rows]');
     races.replaceChildren();
     for (const race of instance.eventRaces) {
@@ -692,6 +776,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       races.append(row);
     }
     renderPageControls(host.querySelector('[data-event-races]'), 'eventRaces');
+    hideWhenEmpty('[data-event-races]', 'eventRaces', instance.eventRaces);
     const outgoing = host.querySelector('[data-outgoing-rows]');
     outgoing.replaceChildren();
     for (const message of instance.outgoingMessages) {
@@ -704,6 +789,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       outgoing.append(row);
     }
     renderPageControls(host.querySelector('[data-outgoing]'), 'outgoingMessages');
+    hideWhenEmpty('[data-outgoing]', 'outgoingMessages', instance.outgoingMessages);
     const scopeRows = host.querySelector('[data-scope-rows]');
     scopeRows.replaceChildren();
     for (const scope of instance.scopes) {
@@ -731,6 +817,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       scopeRows.append(row);
     }
     renderPageControls(host.querySelector('[data-scopes]'), 'scopes');
+    hideWhenEmpty('[data-scopes]', 'scopes', instance.scopes);
     const callRows = host.querySelector('[data-call-rows]');
     callRows.replaceChildren();
     for (const call of instance.calls) {
@@ -754,6 +841,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       callRows.append(row);
     }
     renderPageControls(host.querySelector('[data-calls]'), 'calls');
+    hideWhenEmpty('[data-calls]', 'calls', instance.calls);
     const groups = host.querySelector('[data-repetition-group-rows]');
     groups.replaceChildren();
     for (const group of instance.repetitionGroups) {
@@ -776,14 +864,17 @@ export async function openProcessInstance(instanceId, initial = null) {
       groups.append(row);
     }
     renderPageControls(host.querySelector('[data-repetition-groups]'), 'repetitionGroups');
+    hideWhenEmpty('[data-repetition-groups]', 'repetitionGroups', instance.repetitionGroups);
     const occurrences = host.querySelector('[data-repetition-occurrence-rows]');
     occurrences.replaceChildren();
     for (const occurrence of instance.repetitionOccurrences) {
       const row = document.createElement('div');
       row.className = 'fb-process-work';
       row.dataset.repetitionOccurrenceId = occurrence.occurrenceId;
-      row.innerHTML = `<div><strong>${escapeHtml(text('repeat_ordinal', { ordinal: occurrence.ordinal + 1 }))}</strong>
-        <p>${escapeHtml(text(`repeat_occurrence_status_${occurrence.status}`))}</p></div>
+      const incident = instance.incidents.find((candidate) => candidate.jobId && candidate.jobId === occurrence.jobId);
+      row.innerHTML = `<div><strong>${escapeHtml(occurrenceLabel(occurrence))}</strong>
+        <p>${escapeHtml(occurrenceStatusText(occurrence))}</p>
+        ${incident ? `<p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)} \u00b7 ${escapeHtml(processIncidentText(incident))}</p>` : ''}</div>
         <tf-button variant="secondary" data-repeat-item>${escapeHtml(text('repeat_item'))}</tf-button>
         <tf-button variant="secondary" data-repeat-aggregate>${escapeHtml(text('repeat_aggregate'))}</tf-button>`;
       for (const [selector, kind] of [['[data-repeat-item]', 'item'], ['[data-repeat-aggregate]', 'aggregate']]) {
@@ -796,12 +887,13 @@ export async function openProcessInstance(instanceId, initial = null) {
       occurrences.append(row);
     }
     renderPageControls(host.querySelector('[data-repetition-occurrences]'), 'repetitionOccurrences');
+    hideWhenEmpty('[data-repetition-occurrences]', 'repetitionOccurrences', instance.repetitionOccurrences);
     const detail = host.querySelector('[data-repetition-detail]');
     detail.replaceChildren();
     if (instance.selectedRepetitionOccurrence) {
       const selected = instance.selectedRepetitionOccurrence;
       const heading = document.createElement('p');
-      heading.textContent = `${text('repeat_ordinal', { ordinal: selected.summary.ordinal + 1 })} · ${text(`repeat_${selected.valueKind}`)}`;
+      heading.textContent = `${occurrenceLabel(selected.summary)} · ${text(`repeat_${selected.valueKind}`)}`;
       detail.append(heading);
       if (selected.valueAvailable) detail.append(jsonSection(text(`repeat_${selected.valueKind}`), selected.value, false));
       else {
@@ -809,15 +901,18 @@ export async function openProcessInstance(instanceId, initial = null) {
         unavailable.textContent = text('repeat_value_unavailable');
         detail.append(unavailable);
       }
-      if (selected.summary.acceptedSourceEventId) {
-        const source = document.createElement('p');
-        source.textContent = `${text('repeat_accepted_source_event')}: ${selected.summary.acceptedSourceEventId}`;
-        detail.append(source);
-      }
       if (selected.acceptedOrigin) {
         const origin = document.createElement('p');
         origin.textContent = `${text('repeat_result_origin')}: ${text(`repeat_origin_${selected.acceptedOrigin.toLowerCase()}`)}`;
         detail.append(origin);
+      }
+      if (selected.summary.acceptedSourceEventId) {
+        const technical = document.createElement('tf-disclosure');
+        technical.setAttribute('label', text('technical_details'));
+        const source = document.createElement('p');
+        source.textContent = `${text('repeat_accepted_source_event')}: ${selected.summary.acceptedSourceEventId}`;
+        technical.append(source);
+        detail.append(technical);
       }
     }
   }
@@ -1436,7 +1531,7 @@ export async function openProcessMessageDetail(summary, onChanged = () => {}) {
           errorHost.hidden = true;
         } catch (error) {
           if (generation !== loadGeneration || instanceControl.value !== targetInstanceId || !section.isConnected) return;
-          errorHost.setAttribute('message', error.message);
+          errorHost.setAttribute('message', processPlainError(error.message) ?? error.message);
           errorHost.hidden = false;
         }
       });

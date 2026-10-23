@@ -325,15 +325,22 @@ class TfMenu extends HTMLElement {
     if (e.key === 'Tab') { this.close(); return; }
     // A hidden item cannot take focus and a disabled one cannot act, so neither
     // is a stop: the arrows would otherwise end on the first of them.
-    const rows = [...this.querySelectorAll(':scope > tf-menu-item:not([hidden]):not([disabled]) > .tf-menu-item')];
+    const all = [...this.querySelectorAll(':scope > tf-menu-item > .tf-menu-item')];
+    const rows = all.filter((row) => !row.parentElement.hidden && !row.parentElement.hasAttribute('disabled'));
     if (rows.length === 0) return;
     const at = rows.indexOf(document.activeElement);
     const go = (i) => { e.preventDefault(); rows[(i + rows.length) % rows.length].focus(); };
-    // Focus sits on an item that is hidden or disabled: the arrows walk in from
-    // the end they point to instead of doing nothing.
+    // Focus sits on a disabled item: the arrows continue from where it stands in
+    // the list, to the next or the previous enabled item, instead of jumping to an end.
     if (at < 0) {
-      if (e.key === 'ArrowDown' || e.key === 'Home') go(0);
-      else if (e.key === 'ArrowUp' || e.key === 'End') go(-1);
+      const place = all.indexOf(document.activeElement);
+      const order = (row) => all.indexOf(row);
+      let target = null;
+      if (e.key === 'ArrowDown') target = rows.find((row) => order(row) > place) ?? rows[0];
+      else if (e.key === 'ArrowUp') target = rows.findLast((row) => order(row) < place) ?? rows.at(-1);
+      else if (e.key === 'Home') target = rows[0];
+      else if (e.key === 'End') target = rows.at(-1);
+      if (target) { e.preventDefault(); target.focus(); }
       return;
     }
     if (e.key === 'ArrowDown') go(at + 1);

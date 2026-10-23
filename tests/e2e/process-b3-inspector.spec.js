@@ -1155,11 +1155,11 @@ test.describe('round 5: names in every window, closed menu, drops and the clock'
     const host = page.locator('tf-button[aria-label="More"]');
     await expect(host).toHaveCount(1);
     await expect(page.getByRole('button', { name: 'More' })).toHaveCount(1);
-    expect(await host.evaluate((element) => element.matches('[aria-haspopup="menu"]') && element.closest('.fb-topbar') !== null)).toBe(true);
+    expect(await host.evaluate((element) => element.matches('[data-haspopup="menu"]') && element.closest('.fb-topbar') !== null)).toBe(true);
     await host.click();
-    await expect(page.locator('tf-button[aria-label="More"][aria-expanded="true"]')).toHaveCount(1);
+    await expect(page.locator('tf-button[aria-label="More"][data-expanded="true"]')).toHaveCount(1);
     await page.keyboard.press('Escape');
-    await expect(page.locator('tf-button[aria-label="More"][aria-expanded="true"]')).toHaveCount(0);
+    await expect(page.locator('tf-button[aria-label="More"][data-expanded="true"]')).toHaveCount(0);
     expect(await page.locator('tf-button[data-role="zoom-in"]').evaluate((element) => element.querySelector('button').getAttribute('title')), 'title reaches the real button').toBeTruthy();
   });
 
@@ -1480,5 +1480,212 @@ test.describe('round 5: phone', () => {
     const changes = frames.filter((value, index) => index > 0 && value !== frames[index - 1]).length;
     expect(changes, 'the buttons are not toggled back and forth as the width wobbles').toBeLessThanOrEqual(2);
     expect(errors.filter((message) => /ResizeObserver/.test(message))).toEqual([]);
+  });
+});
+
+test.describe('round 6: crowded labels, idle bar, zone, menu, minimap and drops', () => {
+  const finiteView = (page) => page.evaluate(async () => {
+    const { default: builder } = await import('/js/modules/flows-builder.js');
+    const canvas = builder._state.canvas;
+    return { finite: [canvas.view.x, canvas.view.y, canvas.view.zoom].every(Number.isFinite),
+      transform: canvas.world.style.transform, badNodes: canvas.nodes.filter((node) => !Number.isFinite(node.x) || !Number.isFinite(node.y)).length,
+      minimap: document.querySelectorAll('.fb-minimap-node').length, nodes: canvas.nodes.length };
+  });
+
+  test('one deferred label does not break zoom, fit, the minimap, a drop or the save', async ({ page }) => {
+    test.setTimeout(240000);
+    await page.setViewportSize({ width: 2400, height: 1100 });
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Deferred label');
+    await openDesigner(page, { login: false, id: own });
+    await page.waitForTimeout(1500);
+    const box = await page.locator('.fb-canvas').boundingBox();
+    await page.evaluate(async ({ left, top }) => {
+      const { default: builder } = await import('/js/modules/flows-builder.js');
+      const canvas = builder._state.canvas;
+      canvas.resetZoom();
+      const tasks = [];
+      for (let index = 0; index < 4; index += 1) {
+        tasks.push(canvas.addNodeFromTemplate(canvas.templates.get('bpmn_user_task'), left + 400 + index * 320, top + 600));
+      }
+      for (const task of tasks) {
+        for (let slot = 0; slot < 4; slot += 1) {
+          const timer = canvas.addNodeFromTemplate(canvas.templates.get('bpmn_boundary_timer'),
+            left + task.x + 30 + slot * 55 + canvas.view.x, top + task.y + task.height + canvas.view.y);
+          canvas.updateNodeLabel(timer.id, 'Send a reminder to the reviewer after N working days');
+        }
+      }
+      canvas.updateProcessTimezone('Europe/Warsaw');
+      canvas.render();
+    }, { left: box.x, top: box.y });
+    await page.waitForTimeout(800);
+    expect(await page.locator('.fb-label-deferred').count(), 'the repro produces a deferred label').toBeGreaterThan(0);
+    const before = await page.locator('[data-role="zoom-level"]').textContent();
+    await page.locator('[data-role="zoom-in"]').click();
+    await page.waitForTimeout(300);
+    const zoomed = await finiteView(page);
+    expect(zoomed.finite && zoomed.transform.startsWith('translate(')).toBe(true);
+    expect(await page.locator('[data-role="zoom-level"]').textContent()).not.toBe(before);
+    await page.locator('[data-role="zoom-fit"]').click();
+    await page.waitForTimeout(400);
+    const fitted = await finiteView(page);
+    expect(fitted.finite).toBe(true);
+    expect(fitted.minimap, 'the minimap shows every node').toBe(fitted.nodes);
+    await dragPaletteItem(page, 'Script task', 400, 300);
+    const after = await finiteView(page);
+    expect(after.badNodes, 'a dropped node has a real position').toBe(0);
+    const saved = await page.evaluate(async () => (await import('/js/modules/flows-builder.js')).default._save());
+    expect(saved, await page.locator('[data-role="error"]').getAttribute('message')).toBe(true);
+  });
+
+  test('a cascade of 100 nodes keeps a finite view and a drawn minimap', async ({ page }) => {
+    test.setTimeout(240000);
+    await page.setViewportSize({ width: 1600, height: 950 });
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Hundred nodes');
+    await openDesigner(page, { login: false, id: own });
+    await page.evaluate(async () => {
+      const { default: builder } = await import('/js/modules/flows-builder.js');
+      const canvas = builder._state.canvas;
+      for (let index = 0; index < 100; index += 1) {
+        canvas.addNodeFromTemplate(canvas.templates.get(index % 2 ? 'bpmn_boundary_timer' : 'bpmn_user_task'), 0, 0, { cascade: true });
+      }
+    });
+    await page.waitForTimeout(1000);
+    const state = await finiteView(page);
+    expect(state.finite && state.badNodes === 0).toBe(true);
+    expect(state.minimap).toBe(state.nodes);
+    await page.locator('[data-role="zoom-fit"]').click();
+    await page.waitForTimeout(400);
+    expect((await finiteView(page)).finite).toBe(true);
+  });
+
+  test('an idle toolbar is not touched at all for two seconds', async ({ page }) => {
+    test.setTimeout(120000);
+    await page.setViewportSize({ width: 1100, height: 800 });
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Idle bar');
+    await openDesigner(page, { login: false, id: own });
+    await page.waitForTimeout(2000);
+    const mutations = await page.evaluate(() => new Promise((resolve) => {
+      let count = 0;
+      const observer = new MutationObserver((records) => { count += records.length; });
+      observer.observe(document.querySelector('.fb-topbar'), { subtree: true, attributes: true, childList: true, characterData: true });
+      setTimeout(() => { observer.disconnect(); resolve(count); }, 2000);
+    }));
+    expect(mutations).toBe(0);
+  });
+
+  test('a typed time zone keeps its spelling and the empty field shows an example, not a value', async ({ page }) => {
+    test.setTimeout(120000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Zone spelling');
+    await openDesigner(page, { login: false, id: own });
+    await dragPaletteItem(page, 'Boundary timer', 500, 330);
+    const field = page.locator('[data-role="timer-timezone"]');
+    await expect(field).toBeVisible();
+    expect(await field.getAttribute('placeholder')).toMatch(/^(e\.g\.|np\.|z\. B\.|p\. ej\.|p\. ex\.)/);
+    for (const zone of ['Europe/Kyiv', 'Asia/Kolkata', 'US/Pacific']) {
+      await field.locator('input').fill(zone);
+      await field.locator('input').blur();
+      await expect.poll(() => page.evaluate(async () => (await import('/js/modules/flows-builder.js')).default._state.canvas.getData().timerTimezone)).toBe(zone);
+    }
+    await field.locator('input').fill('europe/warsaw');
+    await field.locator('input').blur();
+    await expect.poll(() => page.evaluate(async () => (await import('/js/modules/flows-builder.js')).default._state.canvas.getData().timerTimezone)).toBe('Europe/Warsaw');
+  });
+
+  test('the More menu fits a landscape phone, scrolls, and the arrow leaves a disabled item for the next one', async ({ page }) => {
+    test.setTimeout(120000);
+    await page.setViewportSize({ width: 844, height: 390 });
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Menu landscape');
+    await openDesigner(page, { login: false, id: own });
+    await page.waitForTimeout(1800);
+    await page.locator('[data-role="more"]').click();
+    await page.waitForTimeout(500);
+    const menu = await page.locator('tf-menu[data-role="more-menu"]').evaluate((element) => {
+      const panel = element.shadowRoot.querySelector('.tf-menu');
+      const box = panel.getBoundingClientRect();
+      return { bottom: box.bottom, scrolls: panel.scrollHeight > panel.clientHeight, overflow: getComputedStyle(panel).overflowY };
+    });
+    expect(menu.bottom).toBeLessThanOrEqual(390);
+    expect(menu.scrolls && menu.overflow === 'auto').toBe(true);
+    await page.locator('[data-role="simulate"] .tf-menu-item').focus();
+    await page.keyboard.press('ArrowDown');
+    expect(await page.evaluate(() => document.activeElement.closest('tf-menu-item')?.dataset.role)).toBe('instances');
+    await page.locator('[data-role="history"] .tf-menu-item').focus();
+    await expect(page.locator('[data-role="history"] .tf-menu-item')).toBeInViewport();
+  });
+
+  test('the minimap pans on a press, folds away and is remembered, and a drop never lands under it', async ({ page }) => {
+    test.setTimeout(180000);
+    await page.setViewportSize({ width: 1600, height: 950 });
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Minimap');
+    await openDesigner(page, { login: false, id: own });
+    await page.evaluate(() => localStorage.removeItem('tf_fb_minimap_collapsed'));
+    await page.waitForTimeout(1500);
+    await page.evaluate(async () => {
+      const { default: builder } = await import('/js/modules/flows-builder.js');
+      const canvas = builder._state.canvas;
+      const far = canvas.addNodeFromTemplate(canvas.templates.get('bpmn_user_task'), 0, 0, { cascade: true });
+      far.x = 3000; far.y = 200; canvas.render(); canvas.resetZoom();
+    });
+    const before = await page.evaluate(async () => (await import('/js/modules/flows-builder.js')).default._state.canvas.view.x);
+    const mini = page.locator('[data-role="minimap"]');
+    const miniBox = await mini.boundingBox();
+    await page.mouse.click(miniBox.x + miniBox.width - 12, miniBox.y + miniBox.height / 2);
+    await page.waitForTimeout(200);
+    expect(await page.evaluate(async () => (await import('/js/modules/flows-builder.js')).default._state.canvas.view.x)).toBeLessThan(before);
+    // A drop onto the minimap itself moves aside.
+    await dragPaletteItem(page, 'Script task', miniBox.x - (await page.locator('.fb-canvas').boundingBox()).x + 40, miniBox.y - (await page.locator('.fb-canvas').boundingBox()).y + 30);
+    const node = page.locator('.fb-canvas .fb-node.bpmn_script_task').last();
+    expect(intersects(await rect(node), await rect(mini)), 'the node is not under the minimap').toBe(false);
+    await page.locator('[data-role="minimap-toggle"]').click();
+    await expect(mini).toHaveClass(/collapsed/);
+    await page.reload();
+    await openDesigner(page, { login: false, id: own });
+    await expect(page.locator('[data-role="minimap"]')).toHaveClass(/collapsed/);
+    await page.evaluate(() => localStorage.removeItem('tf_fb_minimap_collapsed'));
+  });
+
+  test('hosts of tf-button carry no accessible name of their own and the state sits on the real button', async ({ page }) => {
+    test.setTimeout(120000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Host names');
+    await openDesigner(page, { login: false, id: own });
+    const cdp = await page.context().newCDPSession(page);
+    const { nodes } = await cdp.send('Accessibility.getFullAXTree');
+    const hosts = await page.evaluate(() => [...document.querySelectorAll('tf-button[title]:not([aria-label])')].map((element) => element.getAttribute('title')));
+    expect(hosts.length).toBeGreaterThan(0);
+    const generic = nodes.filter((node) => !node.ignored && node.role?.value === 'generic' && hosts.includes(node.name?.value));
+    expect(generic.map((node) => node.name.value)).toEqual([]);
+    expect(await page.locator('tf-button[aria-expanded], tf-button[aria-haspopup]').count()).toBe(0);
+  });
+
+  test('on a short phone held sideways the toolbar rows do not run over the canvas', async ({ page }) => {
+    test.setTimeout(120000);
+    await page.setViewportSize({ width: 667, height: 375 });
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Short phone');
+    await openDesigner(page, { login: false, id: own });
+    await page.waitForTimeout(1800);
+    const bar = await rect(page.locator('.fb-topbar'));
+    const canvas = await rect(page.locator('.fb-canvas'));
+    const lowest = await page.evaluate(() => Math.max(...[...document.querySelectorAll('.fb-topbar > *')]
+      .filter((element) => getComputedStyle(element).position !== 'absolute' && element.getBoundingClientRect().height)
+      .map((element) => element.getBoundingClientRect().bottom)));
+    expect(lowest).toBeLessThanOrEqual(bar.bottom + 0.5);
+    expect(bar.bottom).toBeLessThanOrEqual(canvas.top + 0.5);
+  });
+
+  test('a short desktop window keeps the app sidebar', async ({ page }) => {
+    test.setTimeout(120000);
+    await page.setViewportSize({ width: 1280, height: 480 });
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Docked devtools');
+    await openDesigner(page, { login: false, id: own });
+    expect(await page.evaluate(() => getComputedStyle(document.querySelector('.sidebar')).display)).not.toBe('none');
   });
 });

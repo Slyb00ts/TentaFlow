@@ -846,6 +846,13 @@
   z-index: 5;
   touch-action: none;
 }
+/* The press pans the canvas; folded, the panel keeps only its title bar and the
+   button that unfolds it. */
+.fb-minimap { cursor: pointer; }
+.fb-minimap-toggle { position: absolute; top: 0; right: 0; z-index: 1; }
+.fb-minimap.collapsed { height: 26px; width: auto; min-width: 96px; cursor: default; }
+.fb-minimap.collapsed .fb-minimap-node,
+.fb-minimap.collapsed .fb-minimap-viewport { display: none; }
 .fb-minimap-viewport {
   position: absolute;
   border: 1.5px solid var(--tf-accent-2, #818cf8);
@@ -1541,6 +1548,7 @@ body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transf
 .fb-process-shell .fb-bottombar-spacer { flex: 0 0 0; }
 /* The minimap floats over the canvas corner, so the drawing area (and a palette drop) covers the whole visible canvas. */
 .fb-process-shell .fb-minimap { right: 12px; bottom: 12px; width: 120px; height: 80px; }
+.fb-process-shell .fb-minimap.collapsed { width: auto; height: 26px; }
 .fb-process-notice { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 8px 16px; border-bottom: 1px solid var(--tf-border); color: var(--tf-text-2); }
 /* Collapsed, the settings row keeps only the publication state and its own toggle. */
 .fb-process-shell .fb-process-notice.fb-collapsed > :not([data-role="publication"]):not([data-role="notice-toggle"]) { display: none; }
@@ -1632,6 +1640,9 @@ body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transf
 .fb-process-work > div { flex: 1; min-width: 200px; overflow-wrap: anywhere; }
 .fb-process-work p { color: var(--tf-text-2); margin-bottom: 0; line-height: 1.5; }
 .fb-process-json { min-width: 0; }
+.fb-process-facts dl { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(0, 2fr); gap: 4px 12px; margin: 6px 0; }
+.fb-process-facts dt { color: var(--tf-text-3); }
+.fb-process-facts dd { margin: 0; overflow-wrap: anywhere; }
 .fb-process-json tf-code-editor { display: block; height: 200px; max-width: 100%; border: 1px solid var(--tf-border); border-radius: var(--tf-radius); }
 .fb-process-activity-inputs { min-width: 0; width: 100%; }
 .fb-process-activity-inputs h3 { margin-block: 0 4px; }
@@ -1680,11 +1691,20 @@ body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transf
    own sidebar steps aside (Back still leaves the designer), the three bars get
    slimmer and the inspector narrower. */
 @media (max-height: 500px) {
-  .app:has(.fb-process-shell) { grid-template-columns: minmax(0, 1fr); }
-  .app:has(.fb-process-shell) > .sidebar { display: none; }
   .fb-shell.fb-process-shell > .fb-bottombar { height: 36px; }
+  /* Under a tablet width the bar wraps to a second row; a fixed height would
+     draw that row over the canvas. */
   .fb-process-shell .fb-topbar { height: 44px; }
   .fb-process-shell .fb-process-notice { padding-block: 2px; }
+}
+@media (max-height: 500px) and (max-width: 767px) {
+  .fb-process-shell .fb-topbar { height: auto; min-height: 44px; }
+}
+/* Only a touch device held sideways gives up the app's sidebar; a desktop
+   window that is short (docked devtools) keeps it. */
+@media (max-height: 500px) and (pointer: coarse) {
+  .app:has(.fb-process-shell) { grid-template-columns: minmax(0, 1fr); }
+  .app:has(.fb-process-shell) > .sidebar { display: none; }
 }
 @media (max-height: 500px) and (min-width: 768px) and (max-width: 1439px) {
   .fb-process-shell .fb-body { grid-template-columns: minmax(0, 1fr) 280px; }

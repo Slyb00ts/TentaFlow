@@ -24,9 +24,10 @@ const BORDER_GRACE = 3;
 
 /**
  * Chooses a spot for each label, nearest to its element first. A spot is never
- * taken when the label would cover an element or another label, or when the line
- * from the element to the label would run through another element: such a label
- * gets `null` and is shown on hover and selection only.
+ * taken when the label would cover an element or another label, when the line
+ * from the element to the label would run through another element or label, or
+ * when the label would sit on the line of one placed before it: such a label gets
+ * `null` and is shown on hover and selection only.
  *
  * `nodes`: every element as { id, left, top, right, bottom }.
  * `labels`: in placement order, { id, left, top, right, bottom, host, external,
@@ -36,6 +37,7 @@ const BORDER_GRACE = 3;
  */
 export function planProcessLabels({ nodes, labels }) {
   const occupied = [];
+  const leaders = [];
   const placed = new Map();
   const overlaps = (left, right) => left.left < right.right + GAP && left.right + GAP > right.left
     && left.top < right.bottom + GAP && left.bottom + GAP > right.top;
@@ -92,11 +94,16 @@ export function planProcessLabels({ nodes, labels }) {
       const { sourceX, sourceY, targetX, targetY } = leaderTo(rect);
       return occupied.some((other) => segmentHitsRect(sourceX, sourceY, targetX, targetY, other));
     };
-    const usable = candidates.filter((candidate) => free(candidate) && !crossesNode(candidate));
-    const chosen = usable.find((candidate) => !crossesLabel(candidate)) ?? usable[0];
+    // A label that would sit on the line of an earlier label reads as that
+    // label's pointer, so it is as unwelcome as a line through a label.
+    const coversLeader = ({ rect }) => leaders.some((line) => segmentHitsRect(line.sourceX, line.sourceY, line.targetX, line.targetY, rect));
+    const chosen = candidates.find((candidate) => free(candidate) && !crossesNode(candidate)
+      && !crossesLabel(candidate) && !coversLeader(candidate));
     if (!chosen) { placed.set(item.id, null); continue; }
     occupied.push(chosen.rect);
-    placed.set(item.id, { rect: chosen.rect, leader: leaderTo(chosen.rect) });
+    const leader = leaderTo(chosen.rect);
+    leaders.push(leader);
+    placed.set(item.id, { rect: chosen.rect, leader });
   }
   return placed;
 }

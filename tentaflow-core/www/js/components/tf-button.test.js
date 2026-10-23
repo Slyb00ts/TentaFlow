@@ -36,18 +36,27 @@ test('later changes reach both the host and the inner button', () => {
   assert.equal(el.querySelector('button').hasAttribute('aria-label'), false);
 });
 
-test('aria-expanded can be added and removed again on the host', () => {
+test('aria-expanded is taken to the inner button and mirrored on the host as data-expanded', () => {
   const el = mount();
   el.setAttribute('aria-expanded', 'true');
-  assert.equal(el.querySelector('button').hasAttribute('aria-expanded'), true);
-  el.removeAttribute('aria-expanded');
+  assert.equal(el.querySelector('button').getAttribute('aria-expanded'), 'true');
   assert.equal(el.hasAttribute('aria-expanded'), false);
+  assert.equal(el.getAttribute('data-expanded'), 'true');
+  el.removeAttribute('data-expanded');
   assert.equal(el.querySelector('button').hasAttribute('aria-expanded'), false);
 });
 
-test('a deep clone keeps the label on the host and on its button', () => {
+test('the host is presentational, so a title does not make it a second named node', () => {
+  const el = mount('title="Hint"');
+  assert.equal(el.getAttribute('role'), 'none');
+  assert.equal(el.querySelector('button').getAttribute('title'), 'Hint');
+});
+
+test('a deep clone keeps the label on the host and on its one button', () => {
   const copy = mount('aria-label="Copy me"').cloneNode(true);
   document.body.appendChild(copy);
   assert.equal(copy.getAttribute('aria-label'), 'Copy me');
   assert.equal(copy.querySelector('button').getAttribute('aria-label'), 'Copy me');
+  assert.equal(copy.querySelectorAll('button').length, 1, 'a button inside a button is not built');
+  copy.querySelector('button').click();
 });

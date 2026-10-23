@@ -63,3 +63,32 @@ test('a label whose only free spots lie beyond a wall is deferred, not forced th
   const plan = planProcessLabels({ nodes: [event, ...walls], labels: [{ ...event, host: null, external: false, width: 80, height: 30 }] });
   assert.equal(plan.get('event'), null);
 });
+
+// A small deterministic generator, so a failing layout can be reproduced.
+function random(seed) {
+  let state = seed;
+  return () => { state = (state * 1664525 + 1013904223) % 4294967296; return state / 4294967296; };
+}
+
+test('no leader line crosses another label and no label sits on another leader, on scattered layouts', () => {
+  for (let seed = 1; seed <= 60; seed += 1) {
+    const next = random(seed);
+    const nodes = []; const labels = [];
+    for (let index = 0; index < 14; index += 1) {
+      const left = Math.round(next() * 700); const top = Math.round(next() * 400);
+      const event = { id: `e${index}`, left, top, right: left + 36, bottom: top + 36 };
+      if (nodes.some((other) => event.left < other.right + 8 && other.left < event.right + 8 && event.top < other.bottom + 8 && other.top < event.bottom + 8)) continue;
+      nodes.push(event);
+      labels.push({ ...event, host: null, external: false, width: 70 + Math.round(next() * 90), height: 24 + Math.round(next() * 24) });
+    }
+    const plan = planProcessLabels({ nodes, labels });
+    const spots = labels.map((label) => [label.id, plan.get(label.id)]).filter(([, spot]) => spot);
+    for (const [id, spot] of spots) {
+      for (const [other, otherSpot] of spots) {
+        if (other === id) continue;
+        assert.equal(segmentHitsRect(spot.leader.sourceX, spot.leader.sourceY, spot.leader.targetX, spot.leader.targetY, otherSpot.rect), false,
+          `seed ${seed}: the leader of ${id} crosses the label of ${other}`);
+      }
+    }
+  }
+});

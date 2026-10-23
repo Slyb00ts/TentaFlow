@@ -263,6 +263,8 @@ export function processNodeWarnings(node, blocks = []) {
   const warnings = [];
   if (processMissingSettings(node, blocks).length) warnings.push('empty_setting');
   if (processBoundaryKind(node.type) && !node.config?.attachedToId) warnings.push('boundary_unattached');
+  if (node.type === 'bpmn_script_task' && node.repeat
+    && (node.activityIo?.dataOutputs?.length || node.activityIo?.outputAssociations?.length)) warnings.push('repeated_script_io');
   if (node.type === 'bpmn_call_activity' && !node.config?.localBody
     && !(Number.isInteger(node.config?.calledVersion) && node.config.calledVersion >= 1)) {
     warnings.push('call_version');
@@ -424,14 +426,18 @@ export function processTimezoneProblem(value) {
   try { new Intl.DateTimeFormat('en', { timeZone: zone }); return null; } catch (_) { return 'invalid'; }
 }
 
-// The spelling the engine lists for a zone the runtime resolves ("europe/warsaw"
-// becomes "Europe/Warsaw", a link becomes its target), '' for an empty field and
-// null for a name that cannot be used. The server compares names exactly.
+// The spelling the engine lists for a zone: only the letter case is repaired
+// ("europe/warsaw" becomes "Europe/Warsaw"). A valid name is otherwise kept as
+// typed, because the runtime's own spelling differs from the engine's for links
+// ("Europe/Kyiv" resolves to "Europe/Kiev", "EST" to "America/Panama"). '' for an
+// empty field and null for a name that cannot be used. The server compares names
+// exactly.
 export function processTimezoneCanonical(value) {
   const zone = String(value ?? '').trim();
   if (processTimezoneProblem(zone)) return null;
-  if (!zone || typeof Intl === 'undefined' || typeof Intl.DateTimeFormat !== 'function') return zone;
-  return new Intl.DateTimeFormat('en', { timeZone: zone }).resolvedOptions().timeZone || zone;
+  if (!zone || typeof Intl === 'undefined' || typeof Intl.supportedValuesOf !== 'function') return zone;
+  const lower = zone.toLowerCase();
+  return Intl.supportedValuesOf('timeZone').find((name) => name.toLowerCase() === lower) ?? zone;
 }
 
 export function processTimezoneText(gap) {
@@ -548,6 +554,15 @@ export function processItemLabels(items) {
 
 const ID_SLOT = /\b(?:task|node|event|gateway|activity|element|boundary|repeat|call|catch|throw|flow|subprocess|id|origin|reaches)[:]?\s+$|["'`\u201c\u2018]$/i;
 
+// The refusals that need no element name, told in plain words; null for any
+// other message. The engine's own wording stays for what is not known here.
+export function processPlainError(message) {
+  const text = String(message ?? '');
+  if (/process draft revision conflict or archived definition/.test(text)) return I18n.t('bpmn.error_draft_conflict');
+  if (/publication needs a Current verified calendar pin/.test(text)) return I18n.t('bpmn.error_calendar_pin');
+  return null;
+}
+
 /**
  * Server and codec messages cite elements by internal id; the author knows them
  * by name. An id of `model` found in `message` becomes the element's name (or
@@ -568,6 +583,8 @@ export function processExplainError(message, model) {
   };
   bodies.forEach(collect);
   const text = String(message ?? '').replace(/^protocol error \w+:\s*/i, '');
+  const plain = processPlainError(text);
+  if (plain) return plain;
   if (/explicit IANA timezone/.test(text)) return processTimezoneText(processTimezoneGaps(model)[0]);
   if (/timerless process cannot declare a timer timezone/.test(text)) return I18n.t('bpmn.timer_timezone_unused');
   if (/unknown timezone/i.test(text)) {
@@ -582,6 +599,8 @@ export function processExplainError(message, model) {
   }
   const unsimulated = /repetition is unsupported in simulation \(([\w.-]+)\)/.exec(text);
   if (unsimulated && names.has(unsimulated[1])) return I18n.t('bpmn.simulation_repeat_unsupported', { names: names.get(unsimulated[1]) });
+  const repeatedBoundary = /repeat ([\w.-]+) has an unsupported boundary event/.exec(text);
+  if (repeatedBoundary && names.has(repeatedBoundary[1])) return I18n.t('bpmn.repeat_boundary_unsupported', { node: names.get(repeatedBoundary[1]) });
   const repeated = /repeat ([\w.-]+) has invalid output collection variable/.exec(text);
   if (repeated && names.has(repeated[1])) return I18n.t('bpmn.repeat_output_missing', { node: names.get(repeated[1]) });
   const path = /escalation boundary ([\w-]+) has unsupported immediate path (\w+) at/.exec(text);
@@ -811,10 +830,7 @@ export function processHasTimer(model) {
 // inspector's list and a drop from the palette share it.
 export function processBoundaryHosts(graph, kind) {
   const timerOrMessage = ['BoundaryTimer', 'BoundaryMessage'].includes(kind);
-  return graph.nodes.filter((candidate) => (!candidate.repeat
-    || timerOrMessage
-    || (kind === 'BoundaryError' && ['bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(candidate.type))
-    || (kind === 'BoundaryEscalation' && candidate.type === 'bpmn_service_task'))
+  return graph.nodes.filter((candidate) => (!candidate.repeat || !processRepeatRefusesBoundary(kind, candidate.type))
     && (['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(candidate.type)
     || (timerOrMessage
       && ['bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task', 'bpmn_script_task'].includes(candidate.type)))
@@ -823,6 +839,32 @@ export function processBoundaryHosts(graph, kind) {
     && !(candidate.type === 'bpmn_receive_task' && graph.edges.some((edge) =>
       edge.to_node === candidate.id && graph.nodes.some((source) =>
         source.id === edge.from_node && source.type === 'bpmn_event_based_gateway'))));
+}
+
+// The engine takes timers and messages on a repeating activity, an error on a
+// Service task, a subprocess or a Call activity, and an escalation on a Service
+// task; any other boundary event on a repeating activity is refused at save
+// (processes/model.rs).
+export function processRepeatRefusesBoundary(kind, type) {
+  if (kind === 'BoundaryTimer' || kind === 'BoundaryMessage') return false;
+  if (kind === 'BoundaryError') return !['bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(type);
+  return !(kind === 'BoundaryEscalation' && type === 'bpmn_service_task');
+}
+
+const BOUNDARY_CAPABLE = ['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity',
+  'bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task', 'bpmn_script_task'];
+
+// Every activity that could carry some boundary event in the shown scope, with
+// the reason a boundary event of `kind` is refused on it: 'repeat' when the
+// activity repeats and the engine refuses that event on a repeating one,
+// 'error_type' / 'escalation_type' when the kind of activity does, null when it
+// is offered.
+export function processBoundaryRefusals(graph, kind) {
+  const offered = new Set(processBoundaryHosts(graph, kind).map((candidate) => candidate.id));
+  return new Map(graph.nodes.filter((node) => BOUNDARY_CAPABLE.includes(node.type)).map((candidate) => [candidate.id,
+    offered.has(candidate.id) ? null
+      : candidate.repeat && processRepeatRefusesBoundary(kind, candidate.type) ? 'repeat'
+        : kind === 'BoundaryError' ? 'error_type' : kind === 'BoundaryEscalation' ? 'escalation_type' : 'other']));
 }
 
 export function processBoundaryKind(type) {

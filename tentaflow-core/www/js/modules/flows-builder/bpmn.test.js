@@ -28,7 +28,7 @@ const { emptyProcessModel, processToCanvas, canvasToProcess, cloneProcessBody, p
 const { FlowCanvas, UNATTACHED_TAG } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
-const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processRowFor, processRoutingTextKeys, processEscalationPathProblem, processExplainError, processMissingSettings, processNodeWarnings, processServiceKind, processBlockTemplate, processStartEntryLabels, processTimezoneProblem, processPublishProblems, processNodeLabels, processTimezoneGaps, processTimezoneText, processTimezoneCanonical, processRepeatedElements } = await import('./bpmn.js');
+const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processRowFor, processRoutingTextKeys, processEscalationPathProblem, processExplainError, processMissingSettings, processNodeWarnings, processServiceKind, processBlockTemplate, processStartEntryLabels, processTimezoneProblem, processPublishProblems, processNodeLabels, processTimezoneGaps, processTimezoneText, processTimezoneCanonical, processRepeatedElements, processBoundaryRefusals, processPlainError } = await import('./bpmn.js');
 const { openProcessCalendar, openProcessInstance, openProcessInstances, openProcessMessageDetail, openProcessMessageSend, openProcessRun, openProcessSchedule, processEventText, processLifecycleReasonText, processTimerText } = await import('./process-monitor.js');
 const { simulationWindow, openProcessSimulation } = await import('./process-simulation.js');
 const { default: builder } = await import('../flows-builder.js');
@@ -2580,10 +2580,10 @@ test('the process settings row folds on a short window and the palette drawer cl
     const notice = state.root.querySelector('.fb-process-notice');
     const toggle = state.root.querySelector('[data-role="notice-toggle"]');
     heights.push(notice.classList.contains('fb-collapsed'));
-    assert.equal(toggle.getAttribute('aria-expanded'), String(!notice.classList.contains('fb-collapsed')));
+    assert.equal(toggle.dataset.expanded, String(!notice.classList.contains('fb-collapsed')));
     click(toggle);
     assert.equal(notice.classList.contains('fb-collapsed'), !heights.at(-1), 'the toggle flips it');
-    assert.equal(toggle.getAttribute('aria-expanded'), String(!notice.classList.contains('fb-collapsed')));
+    assert.equal(toggle.dataset.expanded, String(!notice.classList.contains('fb-collapsed')));
     // The state chip stays when everything else folds away.
     assert.ok(notice.querySelector('[data-role="publication"]'));
   }
@@ -2593,7 +2593,7 @@ test('the process settings row folds on a short window and the palette drawer cl
   const opener = state.root.querySelector('[data-role="palette-toggle"]');
   click(opener);
   assert.equal(palette.classList.contains('open'), true);
-  assert.equal(opener.getAttribute('aria-expanded'), 'true');
+  assert.equal(opener.dataset.expanded, 'true');
   const template = processTemplates().find((row) => row.node_type === 'bpmn_service_task');
   state.palette.opts.onAdd(template);
   assert.equal(palette.classList.contains('open'), false, 'adding a node puts the drawer away');
@@ -4139,12 +4139,16 @@ test('instance pages advance independently and keep the exact incident selection
   assert.equal(win.querySelector('[data-selected-incident]').dataset.selectedIncident, 'incident-1');
 });
 
-test('empty required message collections render each page for an active instance', async () => {
+test('empty collections of an active instance show no heading, no list and no page controls', async () => {
   const current = instance('empty-message-pages', { canSendMessage: true, messageNames: [],
     subscriptions: [], eventRaces: [], outgoingMessages: [] });
   const win = await monitor(current);
   for (const name of ['subscriptions', 'eventRaces', 'outgoingMessages']) {
-    assert.ok(win.querySelector(`[data-page-controls="${name}"]`), `${name} has a real empty page`);
+    assert.equal(win.querySelector(`[data-page-controls="${name}"]`), null, `${name} has nothing to page through`);
+  }
+  for (const section of ['[data-subscriptions]', '[data-event-races]', '[data-outgoing]', '[data-calls]', '[data-scopes]',
+    '[data-repetition-groups]', '[data-repetition-occurrences]']) {
+    assert.equal(win.querySelector(section).hidden, true, `${section} is hidden while empty`);
   }
   assert.equal(win.querySelector('[data-subscription-rows]').children.length, 0);
   assert.equal(win.querySelector('[data-race-rows]').children.length, 0);
@@ -4173,8 +4177,6 @@ test('repeat monitor pages and one selected value preserve actual null availabil
           acceptedOrigin: null,
         } : null,
       }) }) });
-      assert.ok(win.querySelector('[data-page-controls="repetitionGroups"]'));
-      assert.ok(win.querySelector('[data-page-controls="repetitionOccurrences"]'));
       assert.match(win.querySelector('[data-repetition-group-rows]').textContent, /Review <&> order/);
       assert.match(win.querySelector('[data-repetition-group-rows]').textContent, new RegExp(I18n.t('bpmn.repeat_total_unknown')));
       click(win.querySelector('[data-repeat-inspect]')); await flush();
@@ -4730,6 +4732,9 @@ test('a typed time zone is stored as the engine spells it, and an unusable one b
   assert.equal(processTimezoneCanonical(' Europe/Warsaw '), 'Europe/Warsaw');
   assert.equal(processTimezoneCanonical(''), '');
   assert.equal(processTimezoneCanonical('Mars/Olympus'), null);
+  for (const kept of ['Europe/Kyiv', 'Asia/Kolkata', 'US/Pacific', 'EST', 'UTC']) {
+    assert.equal(processTimezoneCanonical(kept), kept, `${kept} is stored as typed, not as the runtime respells it`);
+  }
   const model = timedModel(); delete model.timerTimezone;
   const state = await mount(definition('zone-typed', { model }), { processDefinitionSaveRequest: (payload) => ({ definition: definition('zone-typed', { model: payload.model, draftRevision: 5 }) }) });
   const field = state.root.querySelector('[data-role="timer-timezone"]');
@@ -6448,7 +6453,7 @@ test('a server refusal is shown by name in the banner and the status, and a sile
   assert.equal(toasts(), before, 'ten seconds later the same refusal would toast again; the banner carries it instead');
   const banner = state.root.querySelector('[data-role="error"]');
   assert.equal(banner.hidden, false);
-  assert.match(banner.getAttribute('message'), /^Save error: Escalation handler “Start” has a path/, 'the element is named in visible text');
+  assert.match(banner.getAttribute('message'), /^Escalation handler “Start” has a path/, 'the element is named in visible text');
   assert.match(state.root.querySelector('[data-role="autosave"]').getAttribute('title'), /Escalation handler/);
   // An asked-for save does toast, and a save that works clears the banner.
   assert.equal(await builder._save(), false);
@@ -6552,13 +6557,13 @@ test('the process toolbar keeps the main actions on the bar, the rest behind a m
   const icons = [...bar.querySelectorAll('[icon]')].map((control) => control.getAttribute('icon'));
   assert.equal(new Set(icons).size, icons.length, `every control has its own icon (${icons.join(', ')})`);
   const more = bar.querySelector('[data-role="more"]');
-  assert.equal(more.getAttribute('aria-expanded'), 'false');
+  assert.equal(more.dataset.expanded, 'false');
   click(more);
   assert.equal(menu.hasAttribute('open'), true);
-  assert.equal(more.getAttribute('aria-expanded'), 'true');
+  assert.equal(more.dataset.expanded, 'true');
   click(more);
   assert.equal(menu.hasAttribute('open'), false, 'the trigger closes what it opened');
-  assert.equal(more.getAttribute('aria-expanded'), 'false');
+  assert.equal(more.dataset.expanded, 'false');
   click(bar.querySelector('[data-role="calendar"]'));
   assert.ok([...document.querySelectorAll('tf-window')].length > 0, 'a menu item runs its action');
 });
@@ -7133,4 +7138,189 @@ test('an outside label with nowhere to go: a title goes back inside the box, an 
   assert.equal(start.getAttribute('title'), startLabel.textContent, 'and always in the tooltip');
   assert.equal(start.querySelector('.fb-process-label-leader').hidden, true);
   graph.destroy();
+});
+
+test('a deferred label takes no part in bounds or footprints and no non-finite number reaches the view or the model', () => {
+  const graph = canvas(timedModel());
+  graph.root.getBoundingClientRect = () => ({ left: 0, top: 0, width: 800, height: 600 });
+  const element = graph.nodesLayer.querySelector('[data-node-id="Start"]');
+  const label = element.querySelector('.fb-process-label');
+  Object.defineProperties(label, { offsetWidth: { value: 200, configurable: true }, offsetHeight: { value: 40, configurable: true } });
+  label.hidden = false;
+  label.style.left = '';
+  label.style.top = '';
+  element.classList.add('fb-label-deferred');
+  const bounds = graph._contentBounds();
+  for (const value of Object.values(bounds)) assert.ok(Number.isFinite(value), 'a deferred label has no offsets to measure');
+  const start = graph.nodes.find((node) => node.id === 'Start');
+  const footprint = graph._footprint(start, false);
+  assert.deepEqual([footprint.w, footprint.h, footprint.ox + 0, footprint.oy + 0], [start.width, start.height, 0, 0]);
+  graph.fitToContent();
+  for (const value of [graph.view.x, graph.view.y, graph.view.zoom]) assert.ok(Number.isFinite(value));
+  assert.match(graph.world.style.transform, /^translate\(-?[\d.]+px, -?[\d.]+px\) scale\([\d.]+\)$/);
+
+  element.classList.remove('fb-label-deferred');
+  label.style.left = '';
+  assert.equal(graph._placedLabelBox(start), null, 'an unplaced label without offsets is not a box either');
+
+  graph.view.x = Number.NaN;
+  graph.view.y = Number.POSITIVE_INFINITY;
+  graph.setZoom(1.5, Number.NaN, Number.NaN);
+  assert.ok(Number.isFinite(graph.view.x) && Number.isFinite(graph.view.y));
+
+  graph.nodes[0].x = Number.NaN;
+  graph.nodes[0].y = Number.NaN;
+  const saved = graph.getData();
+  for (const shape of saved.diagram.shapes) for (const value of [shape.x, shape.y, shape.width, shape.height]) assert.ok(Number.isFinite(value));
+  assert.doesNotMatch(JSON.stringify(saved), /"(x|y|width|height)":null/);
+
+  const dropped = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_user_task'), Number.NaN, Number.NaN);
+  assert.ok(Number.isFinite(dropped.x) && Number.isFinite(dropped.y));
+  graph.destroy();
+});
+
+test('an idle toolbar does not measure itself again', async () => {
+  const frames = [];
+  const original = globalThis.requestAnimationFrame;
+  globalThis.requestAnimationFrame = (callback) => { frames.push(callback); return original(callback); };
+  try {
+    const state = await mount(definition('toolbar-idle'));
+    await flush(10);
+    state.fitTopbar();
+    await flush(10);
+    frames.length = 0;
+    await flush(20);
+    assert.equal(frames.length, 0, 'nothing changed, so nothing is measured');
+  } finally {
+    globalThis.requestAnimationFrame = original;
+  }
+});
+
+test('a drop under the minimap moves aside and a drop at the canvas edge is brought into view', () => {
+  const root = document.createElement('div'); document.body.append(root);
+  root.getBoundingClientRect = () => ({ left: 0, top: 0, width: 800, height: 600 });
+  const minimap = { left: 660, top: 500, width: 120, height: 80 };
+  const graph = new FlowCanvas(root, { mode: 'bpmn', processOptions: { ...options, serviceBlocks }, obstacles: () => [minimap] });
+  graph.setTemplates(processTemplates()); graph.setData(emptyProcessModel());
+  graph.view = { x: 0, y: 0, zoom: 1 };
+  const task = processTemplates().find((row) => row.node_type === 'bpmn_user_task');
+  const under = graph.addNodeFromTemplate(task, 720, 540);
+  const hidden = under.x < minimap.left + minimap.width && minimap.left < under.x + under.width
+    && under.y < minimap.top + minimap.height && minimap.top < under.y + under.height;
+  assert.equal(hidden, false, 'the node is not under the minimap');
+  graph.view = { x: 0, y: 0, zoom: 1 };
+  const edge = graph.addNodeFromTemplate(task, 799, 20);
+  const left = edge.x * graph.view.zoom + graph.view.x;
+  const right = (edge.x + edge.width) * graph.view.zoom + graph.view.x;
+  assert.ok(left >= 0 && right <= 800, `the node (${left}..${right}) lies inside the canvas after the pan`);
+  graph.destroy();
+});
+
+test('the minimap pans the canvas on a press and folds to its title bar, remembered across screens', async () => {
+  localStorage.removeItem('tf_fb_minimap_collapsed');
+  const model = emptyProcessModel();
+  model.diagram.shapes.find((shape) => shape.elementId === 'End').x = 4000;
+  const state = await mount(definition('minimap-pan', { model }));
+  const mini = state.root.querySelector('[data-role="minimap"]');
+  mini.getBoundingClientRect = () => ({ left: 100, top: 100, width: 120, height: 80, right: 220, bottom: 180 });
+  Object.defineProperties(mini, { clientWidth: { value: 120, configurable: true }, clientHeight: { value: 80, configurable: true } });
+  state.canvas.root.getBoundingClientRect = () => ({ left: 0, top: 0, width: 800, height: 600 });
+  builder._renderMinimap();
+  const map = state.minimapMap;
+  assert.ok(map, 'the minimap knows where the drawing sits');
+  const before = state.canvas.view.x;
+  mini.dispatchEvent(new window.MouseEvent('pointerdown', { bubbles: true, button: 0, clientX: 215, clientY: 140 }));
+  assert.ok(state.canvas.view.x < before, 'a press on the right of the map moves the view toward the right of the drawing');
+  const toggle = mini.querySelector('[data-role="minimap-toggle"]');
+  assert.equal(toggle.dataset.expanded, 'true');
+  click(toggle);
+  assert.equal(mini.classList.contains('collapsed'), true);
+  assert.equal(toggle.dataset.expanded, 'false');
+  assert.equal(toggle.getAttribute('aria-label'), I18n.t('flows_builder.minimap_expand'));
+  assert.equal(localStorage.getItem('tf_fb_minimap_collapsed'), '1');
+  const pressed = state.canvas.view.x;
+  mini.dispatchEvent(new window.MouseEvent('pointerdown', { bubbles: true, button: 0, clientX: 120, clientY: 140 }));
+  assert.equal(state.canvas.view.x, pressed, 'a folded minimap does not pan');
+  const again = await mount(definition('minimap-pan-again', { model }));
+  assert.equal(again.root.querySelector('[data-role="minimap"]').classList.contains('collapsed'), true, 'the choice is remembered');
+  localStorage.removeItem('tf_fb_minimap_collapsed');
+});
+
+test('a boundary event refused by a repeating task says why in the drop toast, the attach list, the check before saving and the server message', async () => {
+  const repeat = { MultiInstance: { mode: 'Sequential', input: { Cardinality: { count: 2 } }, outputCollectionVariable: 'parts' } };
+  const graph = canvas();
+  const script = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_script_task'), 700, 300);
+  graph.updateNodeLabel(script.id, 'Compute each part');
+  graph.updateNodeConfig(script.id, { repeat });
+  const manual = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_user_task'), 1100, 300);
+  graph.updateNodeLabel(manual.id, 'Review each part');
+  graph.updateNodeConfig(manual.id, { repeat });
+  const toasts = watchToasts();
+  try {
+    const point = (node) => [node.x + node.width / 2, node.y + node.height];
+    const error = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_error'), ...point(script));
+    assert.equal(error.config.attachedToId ?? '', '', 'a Script task takes no error event');
+    assert.ok(toasts.texts().some((text) => text.includes('Compute each part') && /repeats/.test(text)), 'the toast names the task and the reason');
+    const escalation = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_escalation'), ...point(manual));
+    assert.equal(escalation.config.attachedToId ?? '', '');
+    assert.ok(toasts.texts().some((text) => text.includes('Review each part') && /repeats/.test(text)));
+    const service = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 600);
+    graph.updateNodeLabel(service.id, 'Call each part');
+    graph.updateNodeConfig(service.id, { repeat });
+    graph.updateNodeConfig(service.id, { resultExpression: '{}' });
+    const timer = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_timer'), ...point(manual));
+    assert.equal(timer.config.attachedToId, manual.id, 'a timer is welcome on a repeating task');
+    const refusals = processBoundaryRefusals(graph, 'BoundaryError');
+    assert.equal(refusals.get(service.id), null, 'an error event fits a repeating Service task');
+    assert.equal(refusals.get(manual.id), 'repeat');
+  } finally { toasts.stop(); }
+
+  const config = inspector(graph);
+  graph.updateNodeConfig(manual.id, { resultExpression: undefined });
+  const tail = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_message'), 500, 700);
+  graph.updateNodeConfig(tail.id, { attachedToId: manual.id });
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_escalation'), 800, 800);
+  const escalation = graph.nodes.at(-1);
+  config.show(escalation, graph.templates.get(escalation.type));
+  await flush(2);
+  assert.match(config.root.querySelector('[data-boundary-excluded]')?.textContent ?? '', /Call each part|Review each part|Compute each part/,
+    'the repeating tasks left out of the list are named, with the reason');
+
+  graph.updateNodeConfig(escalation.id, { attachedToId: manual.id });
+  assert.ok(graph.validate().some((message) => message.includes('Review each part') && /repeats/.test(message) && !/repeat “/.test(message)),
+    'the check before saving names the task and says what to do');
+
+  const model = graph.getData();
+  const hostId = graph.nodes.find((node) => node.label === 'Compute each part').id;
+  const explained = processExplainError(`protocol error BadRequest: repeat ${hostId} has an unsupported boundary event`, model);
+  assert.match(explained, /Compute each part/);
+  assert.match(explained, /Remove the repetition/);
+  assert.doesNotMatch(explained, /^repeat |protocol error/);
+  graph.destroy();
+});
+
+test('known refusals from the engine are told in plain words and a repeating Script task with data inputs is flagged', () => {
+  assert.equal(processPlainError('activity IO input capture lacks one later resource or accepted body fact'), null, 'the engine no longer refuses that start');
+  assert.match(processPlainError('process draft revision conflict or archived definition'), /changed somewhere else/);
+  assert.match(processPlainError('publication needs a Current verified calendar pin'), /working calendar/);
+  assert.equal(processPlainError('something else'), null);
+  const script = { type: 'bpmn_script_task', config: {}, repeat: { StructuredLoop: {} }, activityIo: { dataInputs: [{ id: 'in' }], inputAssociations: [{}], dataOutputs: [{ id: 'out' }], outputAssociations: [] } };
+  assert.ok(processNodeWarnings(script).includes('repeated_script_io'));
+  assert.equal(processNodeWarnings({ ...script, repeat: undefined }).includes('repeated_script_io'), false);
+  assert.equal(processNodeWarnings({ ...script, activityIo: { dataInputs: [{ id: 'in' }], inputAssociations: [{}], dataOutputs: [], outputAssociations: [] } }).includes('repeated_script_io'), false, 'input data is supported');
+});
+
+test('in a repeated group that holds an incident the failed occurrence reads as failed and the later ones as not started', async () => {
+  const group = { groupId: 'g1', nodeId: 'Script_1', nodeName: 'Compute each part', scopeId: 's', parentTokenId: 'p', mode: 'multi_instance_sequential',
+    status: 'incident', total: 3, createdCount: 1, completed: 0, maxIterations: null, revision: 1, createdAtMs: 1, updatedAtMs: 1 };
+  const row = (ordinal, status) => ({ occurrenceId: `o${ordinal}`, groupId: 'g1', ordinal, status, tokenId: `t${ordinal}`, userTaskId: null, jobId: null,
+    verificationUserTaskId: null, acceptedSourceEventId: null, approvalEventId: null, createdAtMs: 1, updatedAtMs: 1 });
+  const incident = { incidentId: 'i1', nodeId: 'Script_1', nodeName: 'Compute each part', jobId: null, code: 'SCRIPT_EVALUATION_FAILED', message: 'x', atMs: 1, canRetry: false, scopeId: 's' };
+  const win = await monitor(instance('held-group', { repetitionGroups: [group], incidents: [incident],
+    repetitionOccurrences: [row(0, 'active'), row(1, 'pending'), row(2, 'pending')] }));
+  const rows = [...win.querySelectorAll('[data-repetition-occurrence-id]')].map((node) => node.textContent);
+  assert.match(rows[0], new RegExp(`Occurrence 1 of 3[\\s\\S]*${I18n.t('bpmn.repeat_occurrence_failed')}`));
+  assert.doesNotMatch(rows[0], new RegExp(I18n.t('bpmn.repeat_occurrence_status_active')));
+  assert.match(rows[1], new RegExp(I18n.t('bpmn.repeat_occurrence_not_started')));
+  win.remove();
 });
