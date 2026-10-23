@@ -1731,8 +1731,9 @@ test.describe('round 6: crowded labels, idle bar, zone, menu, minimap and drops'
     await page.evaluate(() => { window.__menuWindow.shadowRoot.querySelector('.tf-window-body').scrollTop = 30; });
     await expect.poll(async () => {
       const now = await geometry();
-      return Math.round((before.panel - now.panel) - (before.trigger - now.trigger));
-    }, { message: 'the panel moves with its trigger' }).toBe(0);
+      // The panel is placed on whole pixels, the trigger is not.
+      return Math.abs((before.panel - now.panel) - (before.trigger - now.trigger)) <= 1;
+    }, { message: 'the panel moves with its trigger' }).toBe(true);
     expect((await geometry()).trigger).toBeLessThan(before.trigger);
     await page.evaluate(() => { window.__menuWindow.shadowRoot.querySelector('.tf-window-body').scrollTop = 1000; });
     await expect(page.locator('body > tf-menu')).toHaveCount(0);
