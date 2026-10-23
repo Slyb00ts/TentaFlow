@@ -220,3 +220,91 @@ async fn explicit_result_error_reaches_the_real_boundary_and_review_task() {
     );
     assert_ne!(actual.instance.status, ProcessInstanceStatus::Completed);
 }
+
+fn completed_flow_fixture() -> (Fixture, tentaflow_protocol::processes::ProcessInstance) {
+    let fixture = Fixture::new();
+    let flow_id = flow(&fixture.db, &fixture.owner, &result_graph("Completed"));
+    let mut model = service_model(
+        &flow_id,
+        ActivityVerification::Condition { expression: "true".into() },
+    );
+    let ProcessNodeKind::ServiceTask { result_expression, output_mapping, .. } =
+        &mut model.nodes[1].kind
+    else {
+        panic!("service fixture changed kind");
+    };
+    *result_expression = Some("outputs.payload".into());
+    output_mapping.clear();
+    let started = start_model(&fixture, &model);
+    (fixture, started)
+}
+
+fn open_incident_codes(fixture: &Fixture, instance_id: &str) -> Vec<String> {
+    let conn = fixture.db.read().unwrap();
+    let mut statement = conn
+        .prepare("SELECT code FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL")
+        .unwrap();
+    statement.query_map([instance_id], |row| row.get(0)).unwrap()
+        .collect::<Result<_, _>>().unwrap()
+}
+
+/// Arms a trigger that runs `statement` the moment the flow result is durably
+/// observed, so the authorization that follows sees its effect.
+fn change_state_when_observed(fixture: &Fixture, statement: &str) {
+    fixture.db.write().unwrap().execute_batch(&format!(
+        "CREATE TRIGGER change_state_when_observed AFTER UPDATE ON bpmn_service_invocations
+         WHEN NEW.phase='observed' BEGIN {statement}; END;"
+    )).unwrap();
+}
+
+#[tokio::test]
+async fn an_authorization_read_that_fails_after_the_flow_ran_does_not_block_its_result() {
+    let (fixture, started) = completed_flow_fixture();
+    change_state_when_observed(&fixture, "UPDATE user_accounts SET email=X'00'");
+    let worker = "unreadable-account-worker";
+    let claim = repository::claim_job(&fixture.db, worker, chrono::Utc::now().timestamp_millis())
+        .unwrap().unwrap();
+    super::jobs::execute_claimed(&fixture.db, fixture.dispatcher(), worker, claim.clone(),
+        CancellationToken::new()).await.unwrap();
+    let after = repository::runtime_snapshot(&fixture.db, &fixture.owner, &started.instance_id)
+        .unwrap();
+    assert!(open_incident_codes(&fixture, &started.instance_id).is_empty(),
+        "a failed read is not a revocation");
+    assert_ne!(after.instance.status, ProcessInstanceStatus::Incident);
+    let phase: String = fixture.db.read().unwrap().query_row(
+        "SELECT phase FROM bpmn_service_invocations WHERE job_id=?1",
+        [&claim.job.job_id], |row| row.get(0)).unwrap();
+    assert_eq!(phase, "observed", "the result stays recorded and recoverable");
+}
+
+#[tokio::test]
+async fn a_true_denial_after_the_flow_ran_still_blocks_its_result() {
+    let (fixture, started) = completed_flow_fixture();
+    change_state_when_observed(&fixture, "UPDATE flows SET status='draft'");
+    let worker = "revoked-account-worker";
+    let claim = repository::claim_job(&fixture.db, worker, chrono::Utc::now().timestamp_millis())
+        .unwrap().unwrap();
+    super::jobs::execute_claimed(&fixture.db, fixture.dispatcher(), worker, claim,
+        CancellationToken::new()).await.unwrap();
+    assert_eq!(open_incident_codes(&fixture, &started.instance_id).len(), 1);
+    let revoked: bool = fixture.db.read().unwrap().query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_incidents WHERE instance_id=?1 AND message LIKE '%authority was revoked%')",
+        [&started.instance_id], |row| row.get(0)).unwrap();
+    assert!(revoked, "the result is blocked as observed after revocation");
+}
+
+#[tokio::test]
+async fn an_unreadable_account_defers_a_flow_claim_instead_of_revoking_the_source() {
+    let (fixture, started) = completed_flow_fixture();
+    let worker = "deferring-flow-worker";
+    let claim = repository::claim_job(&fixture.db, worker, chrono::Utc::now().timestamp_millis())
+        .unwrap().unwrap();
+    fixture.db.write().unwrap().execute("UPDATE user_accounts SET email=X'00'", []).unwrap();
+    super::jobs::execute_claimed(&fixture.db, fixture.dispatcher(), worker, claim.clone(),
+        CancellationToken::new()).await.unwrap();
+    assert!(open_incident_codes(&fixture, &started.instance_id).is_empty());
+    let status: String = fixture.db.read().unwrap().query_row(
+        "SELECT status FROM bpmn_jobs WHERE job_id=?1", [&claim.job.job_id],
+        |row| row.get(0)).unwrap();
+    assert_eq!(status, "queued");
+}

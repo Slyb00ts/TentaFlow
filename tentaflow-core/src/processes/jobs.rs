@@ -432,7 +432,9 @@ async fn execute_flow(
     let authorize = || {
         match dispatcher.authorize_process_flow(flow_id, &claimed.actor.user_id, &claimed.actor.org_id) {
             Ok(_) => AccessCheck::Allowed,
-            Err(error) => AccessCheck::Revoked(error.to_string()),
+            Err(error @ DispatchError::Denied { .. }) => AccessCheck::Revoked(error.to_string()),
+            // A failed read (database error, read-pool timeout) is not a denial.
+            Err(_) => AccessCheck::Undecided,
         }
     };
     let mut meta = match dispatcher.authorize_process_flow(
@@ -441,6 +443,11 @@ async fn execute_flow(
         &claimed.actor.org_id,
     ) {
         Ok(meta) => meta,
+        // Nothing ran and nothing is wrong with the process: wait (bounded).
+        Err(error) if !matches!(error, DispatchError::Denied { .. }) => {
+            repository::defer_job(pool, claimed, worker_id, "FLOW_UNAVAILABLE", now_ms())?;
+            return Ok(());
+        }
         Err(error) => {
             return fail_claim(
                 pool,

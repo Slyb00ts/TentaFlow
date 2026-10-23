@@ -24262,6 +24262,10 @@ pub fn claim_job_where(
         .and_then(|_| require_call_control_authority_on(&tx, &actor, &instance_id))
         .and_then(|_| require_source_current(&tx, &actor, &flow_id, None))
     {
+        // Only a typed denial revokes; a failed read leaves the job queued.
+        if error.downcast_ref::<ProcessAuthorityDenied>().is_none() {
+            return Err(error);
+        }
         let reason = bounded_failure_message(&error.to_string());
         fail_queued_job_on(&tx, &job_id, &instance_id, &scope_id, &node_id,
             "SOURCE_ACCESS_REVOKED", &reason, now_ms)?;
@@ -27458,11 +27462,12 @@ fn recovered_by_periodic_pass(pool: &DbPool, job_id: &str, phase: &str) -> bool 
 }
 
 /// Counts one failed recovery pass of a row and, once `incident_after` passes
-/// have failed, raises its visible incident. Returns the passes counted so far.
+/// have failed, raises its visible incident. Returns the passes counted so far
+/// and whether this pass raised the incident.
 fn count_recovery_failure_on(
     tx: &Transaction<'_>, job_id: &str, now_ms: i64, incident_after: i64,
-) -> Result<i64> {
-    let Some(row) = recovery_row_on(tx, job_id)? else { return Ok(0) };
+) -> Result<(i64, bool)> {
+    let Some(row) = recovery_row_on(tx, job_id)? else { return Ok((0, false)) };
     tx.execute(
         "INSERT INTO bpmn_result_recovery(invocation_id,last_checked_ms,failed_passes,last_error_code) VALUES(?1,?2,1,'RESULT_RECOVERY_FAILED') ON CONFLICT(invocation_id) DO UPDATE SET failed_passes=failed_passes+1,last_checked_ms=?2,last_error_code='RESULT_RECOVERY_FAILED'",
         params![row.invocation_id, now_ms],
@@ -27479,8 +27484,9 @@ fn count_recovery_failure_on(
         raise_recovery_incident_on(tx, &row, "RESULT_RECOVERY_FAILED",
             "the observed Service result could not be recovered; it stays recorded",
             now_ms)?;
+        return Ok((passes, true));
     }
-    Ok(passes)
+    Ok((passes, false))
 }
 
 /// Logs a row that recovery could not process (job id and size only) and counts
@@ -27494,16 +27500,16 @@ fn report_recovery_failure(
     now_ms: i64,
     incident_after: i64,
 ) {
-    let outcome = (|| -> Result<i64> {
+    let outcome = (|| -> Result<(i64, bool)> {
         let mut conn = pool.write()?;
         let tx = conn.transaction()?;
-        let passes = count_recovery_failure_on(&tx, job_id, now_ms, incident_after)?;
+        let counted = count_recovery_failure_on(&tx, job_id, now_ms, incident_after)?;
         tx.commit()?;
-        Ok(passes)
+        Ok(counted)
     })();
     let error_len = format!("{error:#}").len();
     match outcome {
-        Ok(passes) if passes > 1 && passes != incident_after => tracing::debug!(job_id, passes,
+        Ok((passes, false)) if passes > 1 => tracing::debug!(job_id, passes,
             error_len, "process result recovery failed again for one row"),
         Ok(_) => tracing::error!(job_id, error_len,
             "process result recovery failed for one row; the others continue"),

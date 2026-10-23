@@ -1816,6 +1816,20 @@ fn a_failure_message_over_the_incident_bound_is_still_admitted_for_a_repeated_sc
     }).expect("a long failure message must not make the validator refuse the plan");
 }
 
+#[test]
+fn a_failure_message_over_the_incident_bound_is_admitted_for_a_repeated_script_without_io() {
+    let mut model = repeated_script_with_input_io("{\"a\":1}[vars.long_key]", 1,
+        ProcessMultiInstanceMode::Sequential);
+    model.nodes.iter_mut().find(|node| node.id == "Compute").unwrap().activity_io = None;
+    model.variables.insert("long_key".into(), json!("k".repeat(40 * 1024)));
+    let instance = offer_forged_failing_start(&model, |plan| {
+        assert_eq!(plan.add_incidents.len(), 1);
+        let stored = plan.add_incidents[0].message.len();
+        assert!(stored < 40 * 1024, "the runtime stores the bounded message, got {stored} bytes");
+    }).expect("a long failure message must not make the validator refuse the plan");
+    assert_eq!(instance.status, ProcessInstanceStatus::Incident);
+}
+
 /// Start -> Review (user task) -> repeated Script whose output IO fails -> End.
 fn review_then_repeated_script_with_failing_output(fixture: &Fixture) -> ProcessModel {
     use tentaflow_protocol::processes::{ProcessActivityIo, ProcessBodyModeling, ProcessDataObject,

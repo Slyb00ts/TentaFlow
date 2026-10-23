@@ -191,7 +191,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   debug (błędem są pierwsze i to, które zgłasza incydent). Wiersz, który przegrał wyścig
   rewizji, jest oznaczany jako sprawdzony i nie wraca w każdym takcie. Wyczerpanie ośmiu
   prób na zajętym magazynie jest zgłaszane jako `STORE_BUSY`, nie `REVISION_CONFLICT`.
-  Komunikat błędu powtarzanego skryptu z wejściem IO porównuje walidator z tą samą
+  Komunikat błędu powtarzanego skryptu (z IO i bez) porównuje walidator z tą samą
   ograniczoną treścią, którą zapisuje silnik, więc komunikat dłuższy niż 32 KiB nie
   powoduje już odrzucenia planu. **Znana, otwarta wada:** powtarzane zadanie skryptu,
   którego odwzorowanie WYJŚCIA IO zawodzi (`ACTIVITY_IO_OUTPUT_FAILED`), nie przechodzi
@@ -202,6 +202,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   zadania usługi zostaje zapisany i zgłasza incydent `RESULT_RECOVERY_FAILED`, ponawiany
   z narastającym opóźnieniem. Nic nie jest uszkodzone, ale taka instancja czeka na
   anulowanie albo poprawkę silnika.
+- Silnik BPMN (runda 8): autoryzacja przepływu zadania usługi blokuje wynik jako
+  `SOURCE_ACCESS_REVOKED` tylko przy typowanej odmowie (`DispatchError::Denied`). Błąd
+  odczytu (baza, przeterminowana pula odczytu, także w `resolve_org_context`) nie jest
+  już odmową: przed granicą wysyłki odkłada zadanie (`FLOW_UNAVAILABLE`), po uzyskaniu
+  wyniku zostawia go zapisanym do odzyskania. Ta sama zasada obowiązuje przy claimie:
+  stałą odmową jest tylko `ProcessAuthorityDenied`, inny błąd zostawia zadanie w kolejce.
+  Nieudany powtarzany skrypt bez IO zapisuje ograniczony komunikat, jak ten z IO.
+  Piąte niepowodzenie przebiegu odzyskiwania, które nie zgłasza nowego incydentu, jest
+  logowane jako debug.
 - Silnik BPMN: plan zamknięcia grupy powtórzeń z zablokowanym wynikiem (TerminateEnd,
   zdarzenie brzegowe na podprocesie nadrzędnym, zdarzenie brzegowe na zadaniu z
   odrzuconą weryfikacją) nie jest już odrzucany przez walidator, a zamknięcie anuluje

@@ -4888,7 +4888,8 @@ impl<'a> Transition<'a> {
                             let (mut group, mut occurrence) = repeated
                                 .context("failed repeated Script lost its active ordinal")?;
                             let waiting = self.wait(&token, "waiting");
-                            self.incident(&node.id, None, "SCRIPT_EVALUATION_FAILED", error.to_string());
+                            self.incident(&node.id, None, "SCRIPT_EVALUATION_FAILED",
+                                super::repository::bounded_failure_message(&error.to_string()));
                             let incident_id = self.plan.add_incidents.last()
                                 .context("failed repeated Script has no incident")?.incident_id.clone();
                             group.status = ProcessRepetitionGroupStatus::Incident;

@@ -1396,8 +1396,14 @@ impl FlowDispatcher {
             .map_err(|e| DispatchError::Internal(e.to_string()))?
             .filter(|user| user.is_active)
             .ok_or_else(denied)?;
-        crate::services::rbac::resolve_org_context(&self.db, user_id, Some(org_id))
-            .map_err(|_| denied())?;
+        crate::services::rbac::resolve_org_context(&self.db, user_id, Some(org_id)).map_err(
+            |error| match error {
+                crate::services::rbac::OrgContextError::Db(message) => {
+                    DispatchError::Internal(message)
+                }
+                _ => denied(),
+            },
+        )?;
         let flow = repository::get_flow(&self.db, flow_id)
             .map_err(|e| DispatchError::Internal(e.to_string()))?
             .filter(|flow| flow.status == "active")
