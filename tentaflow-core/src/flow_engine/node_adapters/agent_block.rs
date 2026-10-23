@@ -29,7 +29,7 @@ use crate::flow_engine::subflow_runner::{SubflowRunnerSlot, MAX_SUBFLOW_DEPTH};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 use crate::agents::AgentServiceSlot;
-use crate::processes::agent_sink::PROCESS_ACTIVITY_META_KEY;
+use crate::processes::agent_sink::{step_tools_marker, PROCESS_ACTIVITY_META_KEY};
 
 const NODE_TYPE: &str = "agent";
 
@@ -169,11 +169,12 @@ impl AgentNodeAdapter {
         child_input
             .meta
             .insert("agent_id".into(), Value::String(agent.id.clone()));
-        // The nested agent is a run of its own. Letting it inherit the caller's
-        // run id or process-step binding would make it indistinguishable from the
-        // run that owns them: it would reuse the caller's run row and could claim
-        // the caller's process step.
-        child_input.meta.remove("agent_run_id");
+        // The nested agent keeps the caller's run row (depth, fan-out and the
+        // run log stay one account) but must not be able to claim the caller's
+        // process step: the claim is swapped for a marker that only narrows.
+        if let Some((key, tools)) = step_tools_marker(&child_input.meta) {
+            child_input.meta.insert(key.into(), tools);
+        }
         child_input.meta.remove(PROCESS_ACTIVITY_META_KEY);
 
         // Clamp the harness flow's deadline to the agent's own budget (§3.7).
@@ -570,35 +571,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_nested_agent_inherits_neither_the_callers_run_id_nor_its_process_step() {
+    async fn a_nested_agent_keeps_the_run_and_narrowing_but_cannot_claim_the_step() {
         let pool = db();
-        seed_agent(&pool, "agent-n", "nested", None, true);
+        let agent_id = "agent-n";
+        crate::db::repository::upsert_agent(
+            &pool,
+            &AgentParams {
+                runtime_json: crate::agents::LLM_RUNTIME_JSON,
+                id: agent_id,
+                name: "nested",
+                display_name: None,
+                description: "test agent",
+                system_prompt: Some("sp"),
+                model: Some("test-model"),
+                tools_json: r#"["core.skill_view","core.ask_user"]"#,
+                skills_json: "{}",
+                params_json: "{}",
+                max_iterations: 5,
+                timeout_secs: 600,
+                max_subagents: 0,
+                max_spawn_depth: 1,
+                flow_id: None,
+                routable: true,
+                is_enabled: true,
+                on_child_complete: "notify",
+                allowed_agents_json: None,
+                actor_user_id: None,
+            },
+        )
+        .expect("seed agent");
         let svc = service(pool.clone());
         let (_registry, runner) = registry_and_runner(pool.clone());
         let mut env = FlowEnvelope::empty();
         env.meta.insert("agent_run_id".into(), json!("caller-run"));
-        env.meta.insert(
-            crate::processes::agent_sink::PROCESS_ACTIVITY_META_KEY.into(),
-            json!({"invocation_id": "inv"}),
-        );
+        let (key, binding) = crate::processes::agent_sink::ProcessActivityBinding {
+            invocation_id: "inv".into(),
+            instance_id: "ins".into(),
+            node_id: "n".into(),
+            attempt: 1,
+            fence: 1,
+            allowed_tools: vec!["core.skill_view".into(), "core.fs_read".into()],
+            output_schema: None,
+        }
+        .meta_entry();
+        env.meta.insert(key.into(), binding);
         env.meta.insert("unrelated".into(), json!("kept"));
 
-        let adapter = AgentNodeAdapter::new(svc, runner);
+        let adapter = AgentNodeAdapter::new(svc.clone(), runner);
         let (_, child, _, _) = adapter
             .prepare(
-                &node(json!({"agent_id": "agent-n"})),
+                &node(json!({"agent_id": agent_id})),
                 &[input(env.clone())],
                 &stub_ctx(),
             )
             .await
             .expect("prepare");
-        assert!(child.meta.get("agent_run_id").is_none());
-        assert!(child
-            .meta
-            .get(crate::processes::agent_sink::PROCESS_ACTIVITY_META_KEY)
-            .is_none());
-        assert_eq!(child.meta.get("agent_id"), Some(&json!("agent-n")));
+        assert_eq!(child.meta.get("agent_run_id"), Some(&json!("caller-run")));
+        assert!(child.meta.get(PROCESS_ACTIVITY_META_KEY).is_none());
+        assert!(crate::processes::agent_sink::binding_from_meta(&child.meta).is_none());
+        assert_eq!(child.meta.get("agent_id"), Some(&json!(agent_id)));
         assert_eq!(child.meta.get("unrelated"), Some(&json!("kept")));
+        // Delegation from the nested run stays inside the step's list.
+        assert_eq!(
+            crate::agents::run_manager::CallerRun::from_envelope(
+                &child,
+                crate::agents::AgentPrincipal::user("u1"),
+                None
+            )
+            .step_tools,
+            Some(vec![
+                "core.skill_view".to_owned(),
+                "core.fs_read".to_owned()
+            ])
+        );
+
+        // The nested agent's context reuses the caller's run row and still sees
+        // only the step's narrowing, without the completion tool.
+        let mut ctx = stub_ctx();
+        ctx.user_id = Some("u1".into());
+        let context = crate::flow_engine::node_adapters::agent_context::AgentContextNodeAdapter::new(svc)
+            .execute(
+                &FlowNode {
+                    id: "ac".into(),
+                    node_type: "agent_context".into(),
+                    config: json!({"agent_id": agent_id}),
+                    position: None,
+                    label: None,
+                    region: None,
+                },
+                &[input(child)],
+                &ctx,
+            )
+            .await
+            .expect("agent_context");
+        assert_eq!(context.meta.get("agent_run_id"), Some(&json!("caller-run")));
+        let tools: Vec<&str> = context.meta["harness_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(tools, ["core.skill_view"]);
+        let rows: i64 = pool
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM agent_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0, "a nested agent must not open a run row of its own");
 
         // The caller keeps its own identity: the nested run's id does not
         // overwrite it on the way out.

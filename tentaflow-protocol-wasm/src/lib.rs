@@ -13131,6 +13131,8 @@ fn process_json_to_js(value: &serde_json::Value, opaque: bool) -> JsValue {
                         // A block's own settings (`max_tokens`, ...) are keys of the
                         // block, not fields of the protocol.
                         | "config"
+                        // An agent step's output schema is authored JSON Schema.
+                        | "output_schema"
                 );
                 let out_key = if opaque {
                     key.clone()

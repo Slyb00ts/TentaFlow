@@ -1330,9 +1330,11 @@ fn bpmn_agent_completions_and_invocation_kinds(
         let fk_disabled: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
         anyhow::ensure!(fk_disabled == 0, "agent migration requires foreign keys disabled");
         let tx = conn.unchecked_transaction()?;
+        let existing = foreign_key_check(&tx)?;
         anyhow::ensure!(
-            foreign_key_check(&tx)?.is_empty(),
-            "agent migration refuses an invalid existing foreign key"
+            existing.is_empty(),
+            "agent migration refuses an invalid existing foreign key: {}",
+            existing.join("; ")
         );
         rebuild_service_invocations_with_widened_kinds(&tx)?;
         tx.execute_batch(BPMN_AGENT_COMPLETIONS)?;
@@ -17253,7 +17255,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("refuses an invalid existing foreign key"),
+                .contains("refuses an invalid existing foreign key: bpmn_service_invocations rowid="),
             "{error:#}"
         );
         let table_after: String = conn

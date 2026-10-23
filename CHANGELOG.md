@@ -88,7 +88,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   modelu i w blokach grafu `exec_command` oraz `patch_review`), plus samo ujście;
   wiązanie, którego nie da się odczytać, nie zostawia żadnego narzędzia, a
   podagent z `core.agent_spawn` dostaje najwyżej to przecięcie i żadnego wiązania.
-  Zagnieżdżony blok `agent` nie dziedziczy identyfikatora przebiegu ani wiązania.
+  Zagnieżdżony blok `agent` zachowuje wiersz przebiegu wywołującego (głębokość,
+  limity delegowania i dziennik pozostają jednym rachunkiem), ale zamiast wiązania
+  dostaje znacznik `process_step_tools`: samą listę narzędzi kroku, która zawęża
+  katalog, bramę wywołań, bloki grafu i delegowanie, nie otwierając ujścia.
+  Blok grafu `spawn` przechodzi to samo sito co `core.agent_spawn`.
   Poza krokiem procesu ujście nie jest oferowane ani wybieralne w edytorze agenta.
   Zawężenie czyta wiązanie z metadanych, więc blok grafu uprawniony do zapisu
   metadanych może je usunąć; do B3.4b wykonawca musi przypiąć graf harnessu.
@@ -98,7 +102,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   z krokiem agenta jest odrzucana („agent steps are not runnable yet”), a zadanie
   agenta uruchomione przez silnik (np. ze starszej wersji) kończy się
   `AGENT_EXECUTOR_UNAVAILABLE` przed granicą wysyłki; projektant pokazuje taki krok
-  jako agenta i zachowuje jego ustawienia, nie edytuje ich. Eksport XML: `implementation="agent" agentId maxIterations`
+  jako agenta, nie edytuje jego ustawień, a zapis procesu zachowuje je bez zmian
+  (kodek przesyła krok agenta dokładnie tak, jak go odczytał, w tym schemat wyjścia
+  z kluczami autora). Eksport XML: `implementation="agent" agentId maxIterations`
   z `<tentaflow:agentConfig>`. Migracja 203 przebudowuje CHECK kolumny
   `implementation_kind` (dozwolone `flow`, `addon_tool`, `block`, `agent`, każde
   tylko z własnym prefiksem referencji) i tworzy `bpmn_agent_completions`.

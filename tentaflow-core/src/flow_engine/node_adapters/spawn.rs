@@ -12,7 +12,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::agents::{AgentPrincipal, AgentServiceSlot, CallerRun};
+use crate::agents::{AgentPrincipal, AgentServiceSlot, CallerRun, CoreToolName};
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::expr::{evaluate, ExprScope};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
@@ -184,6 +184,14 @@ impl SpawnNodeAdapter {
                 "spawn: requires a managed run context (place after agent_context)"
             ));
         }
+        // The block delegates on the agent's behalf, so it passes the sieve the
+        // model-issued `core.agent_spawn` call passes, step narrowing included.
+        let service = self
+            .service
+            .read()
+            .clone()
+            .ok_or_else(|| anyhow!("spawn: AgentService slot not wired"))?;
+        service.require_core_tool(&envelope.meta, CoreToolName::AgentSpawn)?;
 
         let mut args = json!({ "agent_name": agent_name, "task": task });
         if let Some(context) = context {
@@ -340,7 +348,7 @@ mod tests {
                 description: "d",
                 system_prompt: None,
                 model: None,
-                tools_json: "[]",
+                tools_json: r#"["core.agent_spawn"]"#,
                 skills_json: "{}",
                 params_json: "{}",
                 max_iterations: 5,
@@ -356,6 +364,14 @@ mod tests {
             },
         )
         .expect("seed agent");
+    }
+
+    fn seed_agent_without_tools(pool: &DbPool, id: &str, name: &str) {
+        seed_agent(pool, id, name, 4);
+        pool.write()
+            .unwrap()
+            .execute("UPDATE agents SET tools_json='[]' WHERE id=?1", [id])
+            .expect("clear tools");
     }
 
     fn node(config: serde_json::Value) -> FlowNode {
@@ -522,5 +538,52 @@ mod tests {
             err.to_string().contains("managed run context"),
             "got: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_is_refused_when_the_agent_or_the_step_does_not_list_agent_spawn() {
+        let pool = db();
+        seed_agent(&pool, "parent4", "boss4", 4);
+        // A toolless worker fits under any parent, so only the block's own gate can refuse.
+        seed_agent_without_tools(&pool, "worker4", "worker4");
+        let mgr = manager(pool.clone());
+        let parent = parent_run(&mgr, "parent4").await;
+        let adapter = SpawnNodeAdapter::new(service(pool.clone()));
+        let spawn = json!({"agent_name": "worker4", "task": "x"});
+
+        // The step lists other tools only: the block may not out-run it.
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert("agent_id".into(), json!("parent4"));
+        env.meta
+            .insert("agent_run_id".into(), json!(parent.clone()));
+        env.meta.insert(
+            crate::processes::agent_sink::PROCESS_STEP_TOOLS_META_KEY.into(),
+            json!(["core.skill_view"]),
+        );
+        let err = adapter
+            .spawn_with(&mgr, &node(spawn.clone()), &env, &stub_ctx())
+            .await
+            .expect_err("a step without core.agent_spawn must not delegate");
+        assert!(err.to_string().contains("core.agent_spawn"), "got: {err}");
+
+        // An agent whose own list omits it is refused with no step at all.
+        seed_agent_without_tools(&pool, "mute", "mute");
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert("agent_id".into(), json!("mute"));
+        env.meta.insert("agent_run_id".into(), json!(parent));
+        adapter
+            .spawn_with(&mgr, &node(spawn), &env, &stub_ctx())
+            .await
+            .expect_err("an agent without core.agent_spawn must not delegate");
+        let children: i64 = pool
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE parent_run_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(children, 0);
     }
 }

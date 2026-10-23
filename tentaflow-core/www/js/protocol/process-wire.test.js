@@ -228,7 +228,16 @@ test('service task implementation is sent only for tools and a Flow task keeps i
   assert.deepEqual(tool.model.nodes[0].kind.ServiceTask.implementation,
     { AddonTool: { addonId: 'notes-1', toolName: 'search' } });
   assert.equal(tool.model.nodes[0].kind.ServiceTask.flowId, '');
-  assert.throws(() => encode(task({ implementation: { Agent: {} } })), /unsupported service implementation/);
+  assert.throws(() => encode(task({ implementation: { Agent: {} } })), /agent requires/);
+  assert.throws(() => encode(task({ implementation: { Agent: { agentId: 'a', goalExpression: 'g',
+    allowedTools: [], maxIterations: 1, extra: 1 } } })), /unsupported agent field/);
+  assert.throws(() => encode(task({ implementation: { Agent: { agentId: 'a', goalExpression: 'g',
+    allowedTools: [1], maxIterations: 1 } } })), /agent requires/);
+  assert.throws(() => encode(task({ implementation: { Agent: { agentId: 'a', goalExpression: 'g',
+    allowedTools: [], maxIterations: 1, outputSchema: [] } } })), /output schema must be an object/);
+  assert.throws(() => encode(task({ implementation: { Agent: { agentId: 'a', goalExpression: 'g',
+    allowedTools: [], maxIterations: 1 }, Block: { nodeType: 'llm', config: {} } } })),
+    /unsupported service implementation/);
   assert.throws(() => encode(task({ implementation: { AddonTool: { addonId: 'a', toolName: 't', extra: 1 } } })),
     /unsupported addon tool field/);
   assert.throws(() => encode(task({ implementation: { AddonTool: { addonId: 'a' } } })),
@@ -253,6 +262,27 @@ test('block service task sends its settings as authored and reads them back unch
   assert.throws(() => encode(task({ Block: { config } })), /node type and a configuration object/);
   assert.throws(() => encode(task({ Block: { nodeType: 'llm', config }, AddonTool: { addonId: 'a', toolName: 't' } })),
     /unsupported service implementation/);
+});
+
+test('an agent step is saved exactly as stored and read back unchanged', { skip }, () => {
+  const task = (implementation) => ({ id: 'Service_1', name: 'Agent', kind: { ServiceTask: {
+    flowId: '', inputMapping: {}, outputMapping: {}, verification: 'Human',
+    timeoutSeconds: 60, implementation } } });
+  const payload = (node) => ({ commandId: 'cmd', definitionId: null, expectedRevision: 0, name: 'Agent',
+    description: '', model: { schemaVersion: 1, processId: 'P_1', variables: {}, nodes: [node],
+      sequenceFlows: [], diagram: { shapes: [], edges: [] } } });
+  // Property names in the schema are the schema's own and must not be camel-cased.
+  const full = { agentId: 'agent-1', goalExpression: 'vars.goal', allowedTools: ['core.skill_view'],
+    maxIterations: 8, outputSchema: { type: 'object', required: ['order_id'],
+      properties: { order_id: { type: 'string' } } } };
+  const decoded = request('processDefinitionSaveRequest', payload(task({ Agent: full })));
+  assert.deepEqual(decoded.model.nodes[0].kind.ServiceTask.implementation, { Agent: full });
+  const bare = { agentId: 'agent-1', goalExpression: 'vars.goal', allowedTools: [], maxIterations: 1 };
+  const decodedBare = request('processDefinitionSaveRequest', payload(task({ Agent: bare })));
+  assert.deepEqual(decodedBare.model.nodes[0].kind.ServiceTask.implementation, { Agent: bare });
+  // Saving what was read yields the same bytes.
+  const again = (value) => codec.encode.processDefinitionSaveRequest(17, payload(task(value)));
+  assert.deepEqual(again(decoded.model.nodes[0].kind.ServiceTask.implementation), again({ Agent: full }));
 });
 
 test('embedded subprocess wire preserves nested graph and opaque local variable keys', { skip }, () => {

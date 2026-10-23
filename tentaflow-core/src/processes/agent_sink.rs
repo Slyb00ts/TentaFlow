@@ -31,6 +31,12 @@ use crate::db::DbPool;
 /// Key of the binding in `FlowEnvelope::meta`.
 pub const PROCESS_ACTIVITY_META_KEY: &str = "process_activity";
 
+/// Key of the narrowing-only marker a nested agent inherits from a run bound to
+/// a process step: the step's tool list and nothing else. Unlike the binding it
+/// carries no claim, so it narrows the nested run's tools and delegation without
+/// opening `core.task_complete`.
+pub const PROCESS_STEP_TOOLS_META_KEY: &str = "process_step_tools";
+
 /// Largest output schema an agent step may carry; larger ones are refused at
 /// publication so the sink never compiles an unbounded document per call.
 pub const MAX_OUTPUT_SCHEMA_BYTES: usize = 64 * 1024;
@@ -72,8 +78,13 @@ impl ProcessActivityBinding {
     /// The agent's own allow-list shaped as a node allow-list, for the
     /// intersection the tool catalog and the dispatch gate apply.
     pub fn allowed_tools_json(&self) -> String {
-        serde_json::to_string(&self.allowed_tools).expect("tool names are plain strings")
+        allow_list_json(&self.allowed_tools)
     }
+}
+
+/// A tool list shaped as a node allow-list.
+pub fn allow_list_json(tools: &[String]) -> String {
+    serde_json::to_string(tools).expect("tool names are plain strings")
 }
 
 /// Run id of the agent run an invocation spawns. Derived from the invocation
@@ -117,14 +128,23 @@ pub fn binding_from_meta(meta: &BTreeMap<String, Value>) -> Option<ProcessActivi
     }
 }
 
+/// The tool list a nested agent inherits from a run bound to a process step, as
+/// the marker that narrows without claiming the step.
+pub fn step_tools_marker(meta: &BTreeMap<String, Value>) -> Option<(&'static str, Value)> {
+    step_tool_list(meta).map(|tools| (PROCESS_STEP_TOOLS_META_KEY, json!(tools)))
+}
+
 /// The tools a run may hand on to a sub-agent besides the agent's own limit:
-/// `None` outside a process step, the step's list inside one, nothing at all
-/// for a binding that cannot be read.
+/// `None` outside a process step, the step's list inside one (its own binding or
+/// the marker inherited from the run that owns the step), nothing at all for an
+/// entry that cannot be read.
 pub fn step_tool_list(meta: &BTreeMap<String, Value>) -> Option<Vec<String>> {
     match binding_in_meta(meta) {
-        MetaBinding::Absent => None,
         MetaBinding::Valid(binding) => Some(binding.allowed_tools),
         MetaBinding::Malformed => Some(Vec::new()),
+        MetaBinding::Absent => meta.get(PROCESS_STEP_TOOLS_META_KEY).map(|value| {
+            serde_json::from_value::<Vec<String>>(value.clone()).unwrap_or_default()
+        }),
     }
 }
 

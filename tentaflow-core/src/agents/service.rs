@@ -15,7 +15,7 @@ use crate::compliance::ai_gateway::{AiGateway, ToolExecution};
 use crate::db::{models::DbAgent, repository, DbPool};
 use crate::flow_engine::dispatchers::LlmToolSpec;
 use crate::flow_engine::envelope::LlmToolCall;
-use crate::processes::agent_sink::{binding_in_meta, MetaBinding};
+use crate::processes::agent_sink::{allow_list_json, binding_in_meta, step_tool_list, MetaBinding};
 
 use super::builtins::{execute_core_tool, is_core_tool, CoreToolName};
 use super::catalog::{tool_in_allowlist, ToolCatalog};
@@ -363,7 +363,13 @@ impl AgentService {
     ) -> bool {
         let sink = CoreToolName::TaskComplete.public_name();
         match binding_in_meta(meta) {
-            MetaBinding::Absent => self.tool_allowed(tools_json, name),
+            MetaBinding::Absent => match step_tool_list(meta) {
+                None => self.tool_allowed(tools_json, name),
+                Some(step_tools) => {
+                    self.tool_allowed(tools_json, name)
+                        && self.tool_allowed(&allow_list_json(&step_tools), name)
+                }
+            },
             MetaBinding::Malformed => false,
             MetaBinding::Valid(binding) => {
                 name == sink
@@ -384,7 +390,12 @@ impl AgentService {
         let sink = CoreToolName::TaskComplete;
         specs.retain(|spec| spec.name != sink.public_name());
         match binding_in_meta(meta) {
-            MetaBinding::Absent => {}
+            MetaBinding::Absent => {
+                if let Some(step_tools) = step_tool_list(meta) {
+                    let allowed = allow_list_json(&step_tools);
+                    specs.retain(|spec| self.tool_allowed(&allowed, &spec.name));
+                }
+            }
             MetaBinding::Malformed => specs.clear(),
             MetaBinding::Valid(binding) => {
                 let allowed = binding.allowed_tools_json();
@@ -723,6 +734,33 @@ mod tests {
         assert!(!svc.tool_allowed_in_run(agent_tools, &BTreeMap::new(), "core.task_complete"));
         // Without a binding the agent's own list decides.
         assert!(svc.tool_allowed_in_run(agent_tools, &BTreeMap::new(), "core.ask_user"));
+    }
+
+    #[tokio::test]
+    async fn an_inherited_step_marker_narrows_without_opening_the_sink() {
+        let svc = service(db());
+        let agent_tools = r#"["core.skill_view","core.ask_user"]"#;
+        let marker = BTreeMap::from([(
+            crate::processes::agent_sink::PROCESS_STEP_TOOLS_META_KEY.to_owned(),
+            serde_json::json!(["core.skill_view", "core.fs_read"]),
+        )]);
+        assert!(svc.tool_allowed_in_run(agent_tools, &marker, "core.skill_view"));
+        assert!(!svc.tool_allowed_in_run(agent_tools, &marker, "core.ask_user"));
+        assert!(!svc.tool_allowed_in_run(agent_tools, &marker, "core.fs_read"));
+        assert!(!svc.tool_allowed_in_run(agent_tools, &marker, "core.task_complete"));
+        let listed = svc.tool_catalog_from_allowlist(
+            r#"["core.skill_view","core.ask_user","core.task_complete"]"#,
+            &AgentPrincipal::user("u1"),
+            false,
+        );
+        let narrowed = svc.narrow_catalog_for_run(listed, &marker);
+        assert_eq!(names(&narrowed), ["core.skill_view"]);
+
+        let broken = BTreeMap::from([(
+            crate::processes::agent_sink::PROCESS_STEP_TOOLS_META_KEY.to_owned(),
+            serde_json::json!("not a list"),
+        )]);
+        assert!(!svc.tool_allowed_in_run(agent_tools, &broken, "core.skill_view"));
     }
 
     fn malformed_binding() -> BTreeMap<String, serde_json::Value> {

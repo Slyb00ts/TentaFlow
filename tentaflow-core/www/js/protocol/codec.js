@@ -308,8 +308,25 @@ function processServiceImplementation(implementation) {
   if (implementation == null || implementation === 'Flow') return {};
   const variants = typeof implementation === 'object' && !Array.isArray(implementation)
     ? Object.keys(implementation) : [];
-  if (variants.length !== 1 || !(implementation.AddonTool || implementation.Block)) {
+  if (variants.length !== 1 || !(implementation.AddonTool || implementation.Block || implementation.Agent)) {
     throw new TypeError('unsupported service implementation');
+  }
+  if (implementation.Agent) {
+    const agent = implementation.Agent;
+    processKnownFields(agent, ['agentId', 'goalExpression', 'allowedTools', 'maxIterations', 'outputSchema'], 'agent');
+    if (typeof agent.agentId !== 'string' || typeof agent.goalExpression !== 'string'
+        || !Array.isArray(agent.allowedTools) || agent.allowedTools.some((tool) => typeof tool !== 'string')
+        || !Number.isInteger(agent.maxIterations) || agent.maxIterations < 0 || agent.maxIterations > 0xFFFFFFFF) {
+      throw new TypeError('agent requires an agent id, a goal, a tool list and an iteration limit');
+    }
+    const schema = agent.outputSchema;
+    if (schema != null && (typeof schema !== 'object' || Array.isArray(schema))) {
+      throw new TypeError('agent output schema must be an object');
+    }
+    // An agent step is saved exactly as stored; the output schema's keys are the schema's own.
+    return { implementation: { Agent: {
+      agent_id: agent.agentId, goal_expression: agent.goalExpression, allowed_tools: agent.allowedTools,
+      max_iterations: agent.maxIterations, ...(schema == null ? {} : { output_schema: schema }) } } };
   }
   if (implementation.Block) {
     const block = implementation.Block;
