@@ -12555,6 +12555,25 @@ fn validate_termination_action_provenance_on(
                                     "code":incident.code,"message":incident.message,
                                 })),
                             _ => None,
+                        }).or_else(|| {
+                            // A repeated ordinal parks its group instead of a token, so its
+                            // incident names no source; the failed-repeated-Script replay
+                            // checks the exact body.
+                            (!plan.event_sources.contains_key(&event_index)
+                                && plan.repetition_occurrences.iter().any(|row|
+                                    row.scope_id == event.scope_id
+                                        && row.status == ProcessRepetitionOccurrenceStatus::Active
+                                        && row.accepted_source_event_id.is_none()
+                                        && plan.activity_io_inputs.iter().any(|fact| matches!(fact,
+                                            ActivityIoInputFact::Captured {
+                                                activation_token_id, event_index: input_index, .. }
+                                                if *activation_token_id == row.token_id
+                                                    && *input_index < event_index))
+                                        && plan.repetition_groups.iter().any(|group|
+                                            group.group_id == row.group_id
+                                                && Some(group.node_id.as_str()) == node)))
+                                .then(|| serde_json::json!({
+                                    "code":incident.code,"message":incident.message}))
                         }),
                     "SCRIPT_MAPPING_FAILED" if node.is_some_and(|node_id|
                         scope_node(model, &selected_process_id, scopes, instance_id,
@@ -14172,8 +14191,19 @@ fn validate_script_actions_on(
             let extra = vec![("repeat".to_owned(), serde_json::json!({
                 "group_id":current.group_id,"index":current.ordinal,"item":current.item,
             }))];
+            let mut body_extra = extra.clone();
+            if node.activity_io.is_some() {
+                let captured = plan.activity_io_inputs.iter().filter_map(|fact| match fact {
+                    ActivityIoInputFact::Captured { activation_token_id, inputs, .. }
+                        if *activation_token_id == current.token_id => Some(inputs),
+                    _ => None,
+                }).collect::<Vec<_>>();
+                ensure!(captured.len() == 1,
+                    "failed repeated Script IO body lost its one captured input");
+                body_extra.extend(super::runtime::activity_inputs_extra(captured[0])?);
+            }
             let failure = super::runtime::script_evaluate(script,
-                &current.input_variables, &Value::Null, &extra)
+                &current.input_variables, &Value::Null, &body_extra)
                 .err().context("failed repeated Script has a successful pinned body")?;
             ensure!(failure.downcast_ref::<crate::flow_engine::expr::InfrastructureExprError>().is_none(),
                 "repeated Script infrastructure failure cannot become an incident");
@@ -17102,7 +17132,19 @@ fn validate_activity_io_inputs_on(
                                 && plan.event_sources.get(index)
                                     == Some(activation_token_id)
                                 && script_io_action_handoff_on(plan,
-                                    activation_token_id, *index),
+                                    activation_token_id, *index)
+                            // A repeated ordinal's failed body names no token source: its
+                            // exact replay is the failed-repeated-Script check.
+                            || candidate.kind == "incident"
+                                && candidate.data["code"] == "SCRIPT_EVALUATION_FAILED"
+                                && !plan.event_sources.contains_key(index)
+                                && occurrence_id.as_ref().is_some_and(|occurrence_id|
+                                    plan.repetition_occurrences.iter().any(|row|
+                                        row.occurrence_id == *occurrence_id
+                                            && row.token_id == *activation_token_id
+                                            && row.status
+                                                == ProcessRepetitionOccurrenceStatus::Active
+                                            && row.accepted_source_event_id.is_none())),
                         ProcessNodeKind::SendTask { .. } =>
                             candidate.kind == "send_task_pending"
                                 && candidate.data["pending_token_id"] == *activation_token_id
@@ -27168,6 +27210,17 @@ pub const RECOVERY_FAILURES_BEFORE_INCIDENT: i64 = 5;
 /// The periodic scan over observed addon tool results (`?1` is the page size).
 pub const DEFERRED_SCAN_SQL: &str = "SELECT j.job_id,j.attempt,j.fence,COALESCE(v.dispatch_worker_id,j.worker_id),j.instance_id,i.org_id,i.initiator_user_id,v.observed_result_json FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id JOIN bpmn_instances i ON i.instance_id=j.instance_id LEFT JOIN bpmn_result_recovery r ON r.invocation_id=v.invocation_id WHERE v.phase='observed' AND v.implementation_kind='addon_tool' ORDER BY COALESCE(r.last_checked_ms,0),j.created_at_ms,j.job_id LIMIT ?1";
 
+/// The periodic scan over observed flow and block results whose acceptance failed and
+/// shows a recovery incident (`?1` is the page size, `?2` the newest `last_checked_ms`
+/// worth another try). Such a result was correct but could not be accepted; nothing
+/// else revisits it before the next restart. The driving table only holds rows that
+/// ever failed or waited, and the incident column keeps it to the ones still failing.
+pub const OPEN_INCIDENT_SCAN_SQL: &str = "SELECT j.job_id,j.attempt,j.fence,COALESCE(v.dispatch_worker_id,j.worker_id),j.instance_id,i.org_id,i.initiator_user_id,v.observed_result_json FROM bpmn_result_recovery r JOIN bpmn_service_invocations v ON v.invocation_id=r.invocation_id JOIN bpmn_jobs j ON j.job_id=v.job_id JOIN bpmn_instances i ON i.instance_id=j.instance_id WHERE r.incident_id IS NOT NULL AND r.last_checked_ms<=?2 AND v.phase='observed' AND v.implementation_kind<>'addon_tool' ORDER BY r.last_checked_ms,j.created_at_ms,j.job_id LIMIT ?1";
+
+/// How long a failed flow or block result waits before its acceptance is tried again:
+/// a result the engine refuses for good is looked at once a minute, not every pass.
+pub const OPEN_INCIDENT_RETRY_AFTER_MS: i64 = 60_000;
+
 /// Rows one periodic recovery pass examines.
 pub const RECOVERY_PAGE: i64 = 64;
 
@@ -27251,14 +27304,16 @@ pub fn recover_jobs(
     Ok(recovered)
 }
 
-/// Looks again at observed addon tool results whose authority could not be
-/// decided at recovery time. Run periodically by the worker: it applies a
-/// result once its addon is running and the initiator's access is confirmed,
-/// and blocks it on a definite denial. Claims `is_live` names are being
-/// accepted by a running worker and are left alone. Each pass takes the rows
-/// checked longest ago, a page at a time, and one failing row never holds up the
-/// others.
-pub fn recover_deferred_tool_results(
+/// Looks again at observed results that were recorded but not accepted. Run
+/// periodically by the worker. An addon tool result whose authority could not be
+/// decided at recovery time is applied once its addon is running and the
+/// initiator's access is confirmed, and blocked on a definite denial. A flow or
+/// block result that failed its acceptance (a storage hiccup, a lost race) is
+/// accepted again once the cause is gone, which also closes its incident. Claims
+/// `is_live` names are being accepted by a running worker and are left alone. Each
+/// pass takes the rows checked longest ago, a page at a time, and one failing row
+/// never holds up the others.
+pub fn recover_deferred_results(
     pool: &DbPool,
     now_ms: i64,
     tool_authority: ToolAuthority<'_>,
@@ -27266,13 +27321,18 @@ pub fn recover_deferred_tool_results(
     page: i64,
 ) -> Result<u32> {
     let conn = pool.read()?;
-    let mut statement = conn.prepare(DEFERRED_SCAN_SQL)?;
-    let rows = statement.query_map([page], |row| {
-        Ok((row.get::<_, String>(0)?,row.get::<_, u32>(1)?,row_u64(row,2)?,
-            row.get::<_, String>(3)?,row.get::<_, String>(4)?,row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,row.get::<_, Option<String>>(7)?))
-    })?.collect::<rusqlite::Result<Vec<ObservedRecoveryRow>>>()?;
-    drop(statement);
+    let read_rows = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> Result<Vec<ObservedRecoveryRow>> {
+        let mut statement = conn.prepare(sql)?;
+        let rows = statement.query_map(params, |row| {
+            Ok((row.get::<_, String>(0)?,row.get::<_, u32>(1)?,row_u64(row,2)?,
+                row.get::<_, String>(3)?,row.get::<_, String>(4)?,row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,row.get::<_, Option<String>>(7)?))
+        })?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    };
+    let mut rows = read_rows(DEFERRED_SCAN_SQL, &[&page])?;
+    rows.extend(read_rows(OPEN_INCIDENT_SCAN_SQL,
+        &[&page, &(now_ms - OPEN_INCIDENT_RETRY_AFTER_MS)])?);
     drop(conn);
     let mut recovered = 0u32;
     let mut waiting = Vec::new();

@@ -152,16 +152,24 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   nieobsłużony wynik zgłasza własny incydent powiązany ze swoim zadaniem, a grupa zostaje
   przy pierwszym, więc żaden incydent wyniku zadania nie jest podmieniany ani osierocony
   (przerwanie grupy zamyka je przez zadanie), a wynik rodzeństwa nie zostaje w stanie
-  `observed`. Incydenty bez zadania (błąd wejścia, błąd skryptu) powstają najwyżej jeden na
-  grupę, bo grupa z incydentem nie aktywuje kolejnych ordynałów. Odrzucenie weryfikacji przez człowieka
+  `observed`. Incydenty bez zadania (błąd wejścia, błąd oceny skryptu) powstają najwyżej jeden na
+  grupę, bo grupa z incydentem nie aktywuje kolejnych ordynałów (ordynał, który
+  zawiódł, zostaje `Active`, następne `Pending`). Odrzucenie weryfikacji przez człowieka
   też nie blokuje decyzji o rodzeństwie. Wynik, którego plan silnik albo walidator
   odrzuca na stałe (`RESULT_REJECTED`, `TRANSITION_ERROR`), oraz wynik, który nie może
   się opublikować mimo ponowień (`REVISION_CONFLICT`), zgłasza od razu incydent
-  `RESULT_RECOVERY_FAILED` (wynik zostaje zapisany i da się go przyjąć później),
-  zamiast czekać na restart. Przyjęcie trzymane przez inny worker, zajęty magazyn
+  `RESULT_RECOVERY_FAILED` (wynik zostaje zapisany), a okresowy przebieg odzyskiwania
+  próbuje go przyjąć ponownie co minutę, także dla wyników przepływu i bloku (nie tylko
+  narzędzi addonu), i po sukcesie zamyka incydent; nie trzeba restartu. Przyjęcie trzymane przez inny worker, zajęty magazyn
   i przegrany wyścig rewizji nie są odrzuceniem planu: pierwsze zostawia wynik jego
   właścicielowi, pozostałe są ponawiane. Błąd zadania wewnątrz powtarzanego
   podprocesu trafia do zdarzenia brzegowego na tym podprocesie także w walidatorze.
+- Silnik BPMN: nieudany odczyt migawki instancji podczas publikacji wyniku nie jest już
+  cofnięciem uprawnień. Zajęta pula albo magazyn są ponawiane, każdy inny błąd odczytu
+  kończy się `RESULT_ACCEPTANCE_FAILED` (wynik zostaje zapisany i da się go przyjąć), a
+  tylko odmowa dostępu blokuje wynik jako `SOURCE_ACCESS_REVOKED`. Powtarzane zadanie
+  skryptu z wejściem IO, którego treść zawodzi, przestało przerywać start instancji:
+  walidator odtwarza treść z zapisanymi wejściami i przyjmuje incydent ordynału bez źródła.
 - Silnik BPMN: przyjęcie zapisanego wyniku ponawia się tylko po przegranym wyścigu rewizji
   albo zajętym magazynie. Każde inne niepowodzenie przyjęcia (brak zapisanej obserwacji,
   utracona generacja zadania, otwarty incydent odzyskiwania) jest stałe: wynik zostaje

@@ -933,16 +933,11 @@ fn finish_observed(
         let current =
             match repository::runtime_snapshot(pool, &claimed.actor, &claimed.job.instance_id) {
                 Ok(current) => current,
-                Err(error) => {
-                    return fail_claim(
-                        pool,
-                        worker_id,
-                        claimed,
-                        "SOURCE_ACCESS_REVOKED",
-                        error,
-                        Some(&result),
-                    )
-                }
+                // Only a denial is a verdict on the actor. A busy store says
+                // nothing about the recorded result, and any other failure is a
+                // failed acceptance that leaves it acceptable.
+                Err(error) if repository::is_retryable_acceptance(&error) => continue,
+                Err(error) => return fail_acceptance(pool, worker_id, claimed, &result, error),
             };
         let Some(job) = current
             .jobs

@@ -2057,7 +2057,8 @@ impl<'a> Transition<'a> {
             "reason":Value::Null
         }));
         group.status = ProcessRepetitionGroupStatus::Incident;
-        group.terminal_incident_id = Some(incident_id);
+        // A sibling still in flight can block a group that already names an incident.
+        group.terminal_incident_id.get_or_insert(incident_id);
         group.updated_at_ms = self.now_ms;
         self.write_repetition_group(group)
     }
@@ -6822,6 +6823,8 @@ pub fn plan_user_completion_with_id_source(
                     occurrence.status = ProcessRepetitionOccurrenceStatus::AcceptedBlocked;
                     occurrence.updated_at_ms = now_ms;
                     transition.write_repetition_occurrence(occurrence)?;
+                    // The rejection incident belongs to its ordinal's job, not to the
+                    // group: the group names the first incident that parks it as a whole.
                     group.status = ProcessRepetitionGroupStatus::Incident;
                     group.updated_at_ms = now_ms;
                     transition.write_repetition_group(group)?;
@@ -8402,7 +8405,7 @@ impl ProcessRuntime {
                     // never two passes at once.
                     let worker = self.clone();
                     deferred_pass = Some(tokio::task::spawn_blocking(move || {
-                        if let Err(error) = super::repository::recover_deferred_tool_results(
+                        if let Err(error) = super::repository::recover_deferred_results(
                             &worker.db,
                             chrono::Utc::now().timestamp_millis(),
                             &tool_authority(&dispatcher),

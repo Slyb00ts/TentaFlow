@@ -719,7 +719,7 @@ async fn recovery_cannot_tell_yet_leaves_the_result_observed_until_authority_is_
     *host.allow.lock().unwrap() = Ok(());
     let live = |_: &str| false;
     assert_eq!(
-        repository::recover_deferred_tool_results(
+        repository::recover_deferred_results(
             &fixture.db,
             now_ms(),
             &authority,
@@ -746,7 +746,7 @@ async fn the_periodic_pass_blocks_on_a_definite_denial_and_skips_claims_a_worker
     let held = claimed.job.job_id.clone();
     let live = move |job_id: &str| job_id == held;
     assert_eq!(
-        repository::recover_deferred_tool_results(
+        repository::recover_deferred_results(
             &fixture.db,
             now_ms(),
             &authority,
@@ -759,7 +759,7 @@ async fn the_periodic_pass_blocks_on_a_definite_denial_and_skips_claims_a_worker
     assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "observed");
     let nobody = |_: &str| false;
     assert_eq!(
-        repository::recover_deferred_tool_results(
+        repository::recover_deferred_results(
             &fixture.db,
             now_ms(),
             &authority,
@@ -1088,7 +1088,7 @@ async fn an_addon_stopping_after_the_tool_returned_leaves_the_result_for_the_def
     let authority = super::runtime::tool_authority(fixture.dispatcher());
     let nobody = |_: &str| false;
     assert_eq!(
-        repository::recover_deferred_tool_results(
+        repository::recover_deferred_results(
             &fixture.db,
             now_ms(),
             &authority,
@@ -1116,7 +1116,7 @@ async fn an_undecided_result_is_announced_once_and_escalates_after_the_bound_or_
     let nobody = |_: &str| false;
     let start = now_ms();
     for pass in 0..4 {
-        repository::recover_deferred_tool_results(
+        repository::recover_deferred_results(
             &fixture.db,
             start + pass * 5_000,
             &authority,
@@ -1135,7 +1135,7 @@ async fn an_undecided_result_is_announced_once_and_escalates_after_the_bound_or_
     assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "observed");
     // Past the bound: one incident, still observed.
     for pass in 0..3 {
-        repository::recover_deferred_tool_results(
+        repository::recover_deferred_results(
             &fixture.db,
             start + repository::UNDECIDED_DEADLINE_MS + pass,
             &authority,
@@ -1156,7 +1156,7 @@ async fn an_undecided_result_is_announced_once_and_escalates_after_the_bound_or_
     // The addon returns: the result is applied and the incident closes.
     *host.allow.lock().unwrap() = Ok(());
     assert_eq!(
-        repository::recover_deferred_tool_results(
+        repository::recover_deferred_results(
             &fixture.db,
             start + repository::UNDECIDED_DEADLINE_MS + 10,
             &authority,
@@ -1180,7 +1180,7 @@ async fn an_undecided_result_is_announced_once_and_escalates_after_the_bound_or_
     let (started, _) = observed_but_unaccepted(&fixture, &gone_host).await;
     *gone_host.allow.lock().unwrap() = Err(ToolAccessError::Missing);
     let authority = super::runtime::tool_authority(fixture.dispatcher());
-    repository::recover_deferred_tool_results(
+    repository::recover_deferred_results(
         &fixture.db,
         now_ms(),
         &authority,
@@ -1244,7 +1244,7 @@ async fn one_poisoned_row_does_not_stall_newer_rows_or_the_start() {
             "no incident before pass {pass}"
         );
         assert_eq!(
-            repository::recover_deferred_tool_results(
+            repository::recover_deferred_results(
                 &fixture.db,
                 now_ms(),
                 &authority,
@@ -1265,7 +1265,7 @@ async fn one_poisoned_row_does_not_stall_newer_rows_or_the_start() {
     assert_eq!(after.incidents.len(), 1);
     assert_eq!(after.incidents[0].code, "RESULT_RECOVERY_FAILED");
     // Further passes do not pile up incidents.
-    repository::recover_deferred_tool_results(
+    repository::recover_deferred_results(
         &fixture.db,
         now_ms(),
         &authority,
@@ -1550,13 +1550,13 @@ async fn a_recovery_pass_is_paged_and_takes_the_rows_checked_longest_ago_first()
     let nobody = |_: &str| false;
     let seen = |instance: &str| events_of(&fixture, instance, "service_result_deferred");
     // One row per pass: the second pass reaches the row the first one left out.
-    repository::recover_deferred_tool_results(&fixture.db, now_ms(), &authority, &nobody, 1)
+    repository::recover_deferred_results(&fixture.db, now_ms(), &authority, &nobody, 1)
         .unwrap();
     assert_eq!(
         (seen(&first.instance_id), seen(&second.instance_id)),
         (1, 0)
     );
-    repository::recover_deferred_tool_results(&fixture.db, now_ms() + 1, &authority, &nobody, 1)
+    repository::recover_deferred_results(&fixture.db, now_ms() + 1, &authority, &nobody, 1)
         .unwrap();
     assert_eq!(
         (seen(&first.instance_id), seen(&second.instance_id)),
@@ -1613,7 +1613,7 @@ async fn a_failing_acceptance_keeps_one_incident_open_and_closes_it_with_the_res
         "CREATE TRIGGER refuse_acceptance BEFORE INSERT ON bpmn_events WHEN NEW.kind='service_result' \
          BEGIN SELECT RAISE(ABORT,'acceptance refused'); END;").unwrap();
     for pass in 0..9 {
-        repository::recover_deferred_tool_results(
+        repository::recover_deferred_results(
             &fixture.db,
             now_ms() + pass,
             &authority,
@@ -1636,7 +1636,7 @@ async fn a_failing_acceptance_keeps_one_incident_open_and_closes_it_with_the_res
         .execute_batch("DROP TRIGGER refuse_acceptance;")
         .unwrap();
     assert_eq!(
-        repository::recover_deferred_tool_results(
+        repository::recover_deferred_results(
             &fixture.db,
             now_ms() + 100,
             &authority,
@@ -1679,7 +1679,7 @@ async fn one_undecided_row_that_cannot_be_recorded_does_not_cost_the_rest_of_the
         .unwrap();
     let authority = super::runtime::tool_authority(fixture.dispatcher());
     let nobody = |_: &str| false;
-    repository::recover_deferred_tool_results(
+    repository::recover_deferred_results(
         &fixture.db,
         now_ms(),
         &authority,
@@ -1791,7 +1791,7 @@ async fn a_denial_closes_the_incident_raised_while_the_result_waited() {
     *host.allow.lock().unwrap() = Err(ToolAccessError::Missing);
     let authority = super::runtime::tool_authority(fixture.dispatcher());
     let nobody = |_: &str| false;
-    repository::recover_deferred_tool_results(
+    repository::recover_deferred_results(
         &fixture.db,
         now_ms(),
         &authority,
@@ -1804,7 +1804,7 @@ async fn a_denial_closes_the_incident_raised_while_the_result_waited() {
         vec![("TOOL_RESULT_UNDECIDED".to_owned(), false)]
     );
     *host.allow.lock().unwrap() = Err(ToolAccessError::PermissionDenied);
-    repository::recover_deferred_tool_results(
+    repository::recover_deferred_results(
         &fixture.db,
         now_ms() + 1,
         &authority,
@@ -2008,7 +2008,7 @@ async fn a_failed_read_leaves_the_result_observed_and_a_missing_initiator_blocks
         )
         .unwrap();
     assert_eq!(
-        repository::recover_deferred_tool_results(
+        repository::recover_deferred_results(
             &fixture.db,
             now_ms(),
             &authority,
@@ -2032,7 +2032,7 @@ async fn a_failed_read_leaves_the_result_observed_and_a_missing_initiator_blocks
         )
         .unwrap();
     assert_eq!(
-        repository::recover_deferred_tool_results(
+        repository::recover_deferred_results(
             &fixture.db,
             now_ms() + 1,
             &authority,
@@ -2061,7 +2061,7 @@ async fn an_undecided_pass_adds_no_incident_to_a_row_that_already_shows_one_and_
     fixture.db.write().unwrap().execute_batch(
         "CREATE TRIGGER refuse_note BEFORE INSERT ON bpmn_events WHEN NEW.kind='service_result_deferred' \
          BEGIN SELECT RAISE(ABORT,'note refused'); END;").unwrap();
-    repository::recover_deferred_tool_results(
+    repository::recover_deferred_results(
         &fixture.db,
         now_ms(),
         &authority,
@@ -2094,7 +2094,7 @@ async fn an_undecided_pass_adds_no_incident_to_a_row_that_already_shows_one_and_
         "INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) \
          SELECT 'own-incident',instance_id,scope_id,node_id,job_id,'SOMETHING_ELSE','m',1 FROM bpmn_service_invocations WHERE job_id=?1",
         [&claimed.job.job_id]).unwrap();
-    repository::recover_deferred_tool_results(
+    repository::recover_deferred_results(
         &fixture.db,
         now_ms() + 1,
         &authority,

@@ -1705,3 +1705,100 @@ fn parent_cancel_closes_pinned_called_script_group_after_body_failure() {
     let history = repository::list_events(&reopened, &fixture.owner, &child_id, 0, 200).unwrap().0;
     assert!(!history.iter().any(|event| event.kind == "script_completed"));
 }
+
+fn repeated_script_with_input_io(
+    script: &str, count: u8, mode: ProcessMultiInstanceMode,
+) -> ProcessModel {
+    let mut model = script_model(script, BTreeMap::new(), false);
+    model.variables.insert("results".into(), json!([]));
+    let compute = model.nodes.iter_mut().find(|node| node.id == "Compute").unwrap();
+    compute.repeat = Some(ProcessRepeatSpec::MultiInstance {
+        mode,
+        input: ProcessMultiInstanceInput::Cardinality { count },
+        output_collection_variable: "results".into(),
+    });
+    compute.activity_io = Some(tentaflow_protocol::processes::ProcessActivityIo {
+        data_inputs: vec![tentaflow_protocol::processes::ProcessIoDataInput {
+            id: "Input_Compute".into(), name: None }],
+        data_outputs: Vec::new(),
+        input_set_id: "InputSet_Compute".into(),
+        input_set: vec!["Input_Compute".into()],
+        output_set_id: "OutputSet_Compute".into(),
+        output_set: Vec::new(),
+        input_associations: vec![tentaflow_protocol::processes::ProcessInputAssociation::CelAssignment {
+            id: "Association_Compute_Input".into(),
+            from_expression: "1".into(),
+            target_input_id: "Input_Compute".into(),
+        }],
+        output_associations: Vec::new(),
+        coordinator_output: None,
+    });
+    model
+}
+
+/// A body that reads the captured input: its failure message differs from the one the
+/// same script gives without `inputs`, so a replay that forgets the input is refused.
+const FAILING_BODY_OVER_INPUT: &str = "1 / (inputs.Input_Compute - 1)";
+
+#[test]
+fn a_failing_body_of_a_repeated_script_with_input_io_parks_the_group_under_one_incident() {
+    for (count, mode) in [(1u8, ProcessMultiInstanceMode::Sequential),
+        (1, ProcessMultiInstanceMode::Parallel), (3, ProcessMultiInstanceMode::Parallel)] {
+        let fixture = Fixture::new();
+        let model = repeated_script_with_input_io(FAILING_BODY_OVER_INPUT, count, mode);
+        let started = start_model(&fixture, &model);
+        assert_eq!(started.status, ProcessInstanceStatus::Incident, "{count} {mode:?}");
+        let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+            &started.instance_id).unwrap();
+        assert_eq!(snapshot.incidents.iter().map(|row| row.code.as_str()).collect::<Vec<_>>(),
+            ["SCRIPT_EVALUATION_FAILED"], "{count} {mode:?}");
+        assert_eq!(snapshot.repetition_groups[0].status, ProcessRepetitionGroupStatus::Incident);
+        assert_eq!(snapshot.repetition_groups[0].terminal_incident_id.as_deref(),
+            Some(snapshot.incidents[0].incident_id.as_str()));
+        assert_eq!(snapshot.repetition_occurrences.iter()
+            .find(|row| row.ordinal == 0).unwrap().status,
+            ProcessRepetitionOccurrenceStatus::Active);
+    }
+}
+
+#[test]
+fn an_interrupting_deadline_closes_the_incident_of_a_repeated_script_body_with_input_io() {
+    let fixture = Fixture::new();
+    let (instance_id, snapshot) = parallel_script_with_deadline(&fixture, "1",
+        FAILING_BODY_OVER_INPUT);
+    assert_eq!(snapshot.incidents.len(), 1);
+    assert_eq!(snapshot.incidents[0].code, "SCRIPT_EVALUATION_FAILED");
+    fire_outer_timer(&fixture, &snapshot);
+    let closed = repository::runtime_snapshot(&fixture.db, &fixture.owner, &instance_id).unwrap();
+    assert_eq!(closed.instance.status, ProcessInstanceStatus::Completed);
+    assert!(closed.incidents.is_empty(), "no incident may outlive the group");
+}
+
+/// What a monitor sees for a repeated Script whose body fails at its second ordinal:
+/// the ordinal that failed stays Active (it has no job and no result), the ordinals
+/// after it were never activated and stay Pending, and the group holds the one incident.
+#[test]
+fn a_failing_parallel_ordinal_leaves_it_active_and_the_later_ones_pending_under_one_incident() {
+    let fixture = Fixture::new();
+    let mut model = script_model("1 / (repeat.index - 1)", BTreeMap::new(), false);
+    model.variables.insert("results".into(), json!([]));
+    model.nodes.iter_mut().find(|node| node.id == "Compute").unwrap().repeat =
+        Some(ProcessRepeatSpec::MultiInstance {
+            mode: ProcessMultiInstanceMode::Parallel,
+            input: ProcessMultiInstanceInput::Cardinality { count: 3 },
+            output_collection_variable: "results".into(),
+        });
+    let started = start_model(&fixture, &model);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    let mut statuses = snapshot.repetition_occurrences.iter()
+        .map(|row| (row.ordinal, row.status)).collect::<Vec<_>>();
+    statuses.sort_by_key(|(ordinal, _)| *ordinal);
+    assert_eq!(statuses, [
+        (0, ProcessRepetitionOccurrenceStatus::Completed),
+        (1, ProcessRepetitionOccurrenceStatus::Active),
+        (2, ProcessRepetitionOccurrenceStatus::Pending)]);
+    assert_eq!(snapshot.incidents.len(), 1);
+    assert!(snapshot.incidents[0].job_id.is_none());
+    assert_eq!(snapshot.repetition_groups[0].status, ProcessRepetitionGroupStatus::Incident);
+}

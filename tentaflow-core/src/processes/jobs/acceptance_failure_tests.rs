@@ -274,3 +274,125 @@ async fn two_siblings_publishing_at_the_same_time_both_land_under_one_group_inci
         assert_eq!(phase(&group, member), "accepted");
     }
 }
+
+/// Lost race on the first look (so the worker reads the snapshot again) plus whatever
+/// `disturb` does to the store before that second read.
+fn lose_the_race_then<'a>(group: &'a ParallelGroup, disturb: impl Fn() + 'a) -> impl Fn() -> AccessCheck + 'a {
+    let first = std::sync::Once::new();
+    let disturb_once = move || first.call_once(|| {
+        group.fixture.db.write().unwrap().execute(
+            "UPDATE bpmn_instances SET revision=revision+1 WHERE instance_id=?1",
+            [&group.instance_id]).unwrap();
+        disturb();
+    });
+    move || { disturb_once(); AccessCheck::Allowed }
+}
+
+/// Publishes `member` while every read connection is taken for `hold`. The first
+/// look loses its revision race and `damage` runs, so the acceptance that follows
+/// fails on the empty pool and the NEXT snapshot read is the one that meets the
+/// pool (when `hold` outlasts the 5 s acquisition timeout) and the damage.
+fn publish_with_read_pool_held(
+    group: &ParallelGroup, member: &Member, hold: std::time::Duration,
+    damage: impl Fn() + Send + Sync,
+) {
+    let (start_tx, start_rx) = std::sync::mpsc::channel::<()>();
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (start_tx, held_rx) = (std::sync::Mutex::new(start_tx), std::sync::Mutex::new(held_rx));
+    let exhaust = || {
+        damage();
+        start_tx.lock().unwrap().send(()).unwrap();
+        held_rx.lock().unwrap().recv().unwrap();
+    };
+    let authorize = lose_the_race_then(group, exhaust);
+    std::thread::scope(|scope| {
+        let db = group.fixture.db.clone();
+        scope.spawn(move || {
+            start_rx.recv().unwrap();
+            let size = (num_cpus::get() as u32 * 2).clamp(4, 16);
+            let guards = (0..size).map(|_| db.read().unwrap()).collect::<Vec<_>>();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(hold);
+            drop(guards);
+        });
+        publish(group, member, &authorize);
+    });
+}
+
+fn open_incident_codes(group: &ParallelGroup) -> Vec<String> {
+    let conn = group.fixture.db.read().unwrap();
+    let mut statement = conn.prepare(
+        "SELECT code FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL").unwrap();
+    statement.query_map([&group.instance_id], |row| row.get(0)).unwrap()
+        .collect::<rusqlite::Result<_>>().unwrap()
+}
+
+#[tokio::test]
+async fn a_snapshot_read_that_fails_without_a_denial_leaves_the_result_acceptable() {
+    let group = two_completed_ordinals().await;
+    let member = &group.members[0];
+    let corrupt = || {
+        let conn = group.fixture.db.write().unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints=ON").unwrap();
+        conn.execute("UPDATE bpmn_repetition_groups SET status='bogus' WHERE instance_id=?1",
+            [&group.instance_id]).unwrap();
+        conn.execute_batch("PRAGMA ignore_check_constraints=OFF").unwrap();
+    };
+    publish_with_read_pool_held(&group, member, std::time::Duration::from_secs(7), corrupt);
+    assert_eq!(phase(&group, member), "observed", "an unreadable snapshot is not a revocation");
+    assert_eq!(open_incident_codes(&group), ["RESULT_RECOVERY_FAILED"]);
+}
+
+#[tokio::test]
+async fn a_snapshot_read_the_actor_is_denied_blocks_the_result() {
+    let group = two_completed_ordinals().await;
+    let member = &group.members[0];
+    let deactivate = || {
+        group.fixture.db.write().unwrap().execute(
+            "UPDATE user_accounts SET is_active=0 WHERE id=?1",
+            [&group.fixture.owner.user_id]).unwrap();
+    };
+    publish_with_read_pool_held(&group, member, std::time::Duration::from_secs(7), deactivate);
+    assert_eq!(phase(&group, member), "observed_blocked");
+}
+
+#[tokio::test]
+async fn an_exhausted_read_pool_is_waited_out_instead_of_revoking_the_result() {
+    let group = two_completed_ordinals().await;
+    let member = &group.members[0];
+    publish_with_read_pool_held(&group, member, std::time::Duration::from_secs(12), || {});
+    assert_eq!(phase(&group, member), "accepted");
+    assert_eq!(open_incident_codes(&group), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_recorded_flow_result_is_accepted_by_the_periodic_pass_once_its_cause_is_gone() {
+    let group = two_completed_ordinals().await;
+    let member = &group.members[0];
+    let original: String = group.fixture.db.read().unwrap().query_row(
+        "SELECT input_variables_json FROM bpmn_repetition_occurrences WHERE instance_id=?1 AND ordinal=0",
+        [&group.instance_id], |row| row.get(0)).unwrap();
+    group.fixture.db.write().unwrap().execute(
+        "UPDATE bpmn_repetition_occurrences SET input_variables_json='{\"tampered\":true}' WHERE instance_id=?1 AND ordinal=0",
+        [&group.instance_id]).unwrap();
+    publish(&group, member, &|| AccessCheck::Allowed);
+    assert_eq!(incident_codes(&group), ["RESULT_RECOVERY_FAILED"]);
+
+    let pass = |at_ms: i64| repository::recover_deferred_results(&group.fixture.db, at_ms,
+        &repository::no_tool_authority, &|_| false, repository::RECOVERY_PAGE).unwrap();
+    let now = chrono::Utc::now().timestamp_millis();
+    assert_eq!(pass(now), 0);
+    let later = now + repository::OPEN_INCIDENT_RETRY_AFTER_MS + 1_000;
+    assert_eq!(pass(later), 0, "the cause is still there");
+    assert_eq!(incident_codes(&group), ["RESULT_RECOVERY_FAILED"], "no second incident");
+    assert_eq!(phase(&group, member), "observed");
+
+    group.fixture.db.write().unwrap().execute(
+        "UPDATE bpmn_repetition_occurrences SET input_variables_json=?2 WHERE instance_id=?1 AND ordinal=0",
+        rusqlite::params![group.instance_id, original]).unwrap();
+    assert_eq!(pass(later + 1), 0, "a result tried a moment ago waits for its backoff");
+    assert_eq!(phase(&group, member), "observed");
+    assert_eq!(pass(later + repository::OPEN_INCIDENT_RETRY_AFTER_MS + 1_000), 1);
+    assert_eq!(phase(&group, member), "accepted");
+    assert!(group.snapshot().incidents.is_empty(), "accepting the result closes the incident");
+}
