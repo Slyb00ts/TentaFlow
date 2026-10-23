@@ -8414,7 +8414,7 @@ impl ProcessRuntime {
                         ) {
                             tracing::error!(
                                 error_len = error.to_string().len(),
-                                "deferred tool result recovery failed"
+                                "deferred observed result recovery failed"
                             );
                         }
                     }));

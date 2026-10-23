@@ -911,6 +911,16 @@ async fn drive_dispatch(
     }
 }
 
+/// What the attempt budget ran out against: a busy store is not a concurrent
+/// transition, and the incident has to say which one it was.
+fn exhausted_attempts_failure(store_busy: bool) -> (&'static str, &'static str) {
+    if store_busy {
+        ("STORE_BUSY", "the process store stayed busy and prevented result publication")
+    } else {
+        ("REVISION_CONFLICT", "concurrent process transitions prevented result publication")
+    }
+}
+
 /// Records the observed result and publishes it. A revision conflict only
 /// recalculates the transition from the already observed result; it never
 /// repeats the external execution.
@@ -929,6 +939,7 @@ fn finish_observed(
 
     // A CAS retry only recalculates transitions from the already observed result.
     // It never repeats an external flow execution.
+    let mut store_busy = false;
     for _ in 0..8 {
         let current =
             match repository::runtime_snapshot(pool, &claimed.actor, &claimed.job.instance_id) {
@@ -936,7 +947,10 @@ fn finish_observed(
                 // Only a denial is a verdict on the actor. A busy store says
                 // nothing about the recorded result, and any other failure is a
                 // failed acceptance that leaves it acceptable.
-                Err(error) if repository::is_retryable_acceptance(&error) => continue,
+                Err(error) if repository::is_retryable_acceptance(&error) => {
+                    store_busy = repository::is_store_busy(&error);
+                    continue;
+                }
                 Err(error) => return fail_acceptance(pool, worker_id, claimed, &result, error),
             };
         let Some(job) = current
@@ -1095,7 +1109,10 @@ fn finish_observed(
                         )
                     }
                     Err(failure) if repository::is_acceptance_held(&failure) => return Ok(()),
-                    Err(failure) if repository::is_retryable_acceptance(&failure) => continue,
+                    Err(failure) if repository::is_retryable_acceptance(&failure) => {
+                        store_busy = repository::is_store_busy(&failure);
+                        continue;
+                    }
                     Err(failure) => return fail_acceptance(pool, worker_id, claimed, &result, failure),
                 }
             }
@@ -1111,18 +1128,15 @@ fn finish_observed(
             }
             Err(error) if repository::is_acceptance_held(&error) => return Ok(()),
             // A lost race or a busy store: the result is still recorded, so plan it again.
-            Err(error) if repository::is_retryable_acceptance(&error) => continue,
+            Err(error) if repository::is_retryable_acceptance(&error) => {
+                    store_busy = repository::is_store_busy(&error);
+                    continue;
+                }
             Err(error) => return fail_acceptance(pool, worker_id, claimed, &result, error),
         }
     }
-    fail_claim(
-        pool,
-        worker_id,
-        claimed,
-        "REVISION_CONFLICT",
-        "concurrent process transitions prevented result publication",
-        Some(&result),
-    )
+    let (code, message) = exhausted_attempts_failure(store_busy);
+    fail_claim(pool, worker_id, claimed, code, message, Some(&result))
 }
 
 #[cfg(test)]

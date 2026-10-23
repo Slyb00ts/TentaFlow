@@ -125,14 +125,14 @@ impl Db {
     /// timeout, same `query_only=ON` initialiser — so a side database cannot
     /// drift into different pool behaviour than the main one.
     pub fn with_read_pool(writer: Connection, db_path: &Path) -> Result<Self> {
-        let read_size = (num_cpus::get() as u32 * 2).clamp(4, 16);
+        let read_size = read_pool_size();
         let manager = SqliteConnectionManager::file(db_path)
             .with_flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_init(init_read_connection);
         let read_pool = r2d2::Pool::builder()
             .max_size(read_size)
             .min_idle(Some(1))
-            .connection_timeout(std::time::Duration::from_secs(5))
+            .connection_timeout(READ_POOL_ACQUIRE_TIMEOUT)
             .build(manager)?;
         Ok(Db {
             writer: Mutex::new(writer),
@@ -140,6 +140,14 @@ impl Db {
         })
     }
 }
+
+/// Read connections per pool: scaled to the cores but hard-capped, see `init`.
+pub(crate) fn read_pool_size() -> u32 {
+    (num_cpus::get() as u32 * 2).clamp(4, 16)
+}
+
+/// How long a read waits for a free pooled connection before `DbError`.
+pub(crate) const READ_POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Globalny uchwyt do poola — ustawiony w `init()`. Pozwala modulom ktore nie
 /// dostaja DbPool przez argumenty (np. transcript_store wolany z reverse_request)
@@ -204,14 +212,14 @@ pub fn init_read_only(db_path: &Path) -> Result<DbPool> {
     let mut writer_slot = Connection::open_with_flags(&target, flags)?;
     init_read_connection(&mut writer_slot)?;
 
-    let read_size = (num_cpus::get() as u32 * 2).clamp(4, 16);
+    let read_size = read_pool_size();
     let manager = SqliteConnectionManager::file(&target)
         .with_flags(flags)
         .with_init(init_read_connection);
     let read_pool = r2d2::Pool::builder()
         .max_size(read_size)
         .min_idle(Some(1))
-        .connection_timeout(std::time::Duration::from_secs(5))
+        .connection_timeout(READ_POOL_ACQUIRE_TIMEOUT)
         .build(manager)?;
 
     let pool = Arc::new(Db {
@@ -328,7 +336,7 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
     // "timed out waiting for connection" już przy starcie. 16 połączeń odczytu w zupełności
     // wystarcza na równoległość; `min_idle(1)` sprawia, że start otwiera tylko jedno, a
     // reszta powstaje leniwie na żądanie.
-    let read_size = (num_cpus::get() as u32 * 2).clamp(4, 16);
+    let read_size = read_pool_size();
     let read_flags = if is_memory {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI
     } else {
@@ -340,7 +348,7 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
     let read_pool = r2d2::Pool::builder()
         .max_size(read_size)
         .min_idle(Some(1))
-        .connection_timeout(std::time::Duration::from_secs(5))
+        .connection_timeout(READ_POOL_ACQUIRE_TIMEOUT)
         .build(manager)?;
 
     let pool = Arc::new(Db {

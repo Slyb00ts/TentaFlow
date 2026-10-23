@@ -159,15 +159,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   odrzuca na stałe (`RESULT_REJECTED`, `TRANSITION_ERROR`), oraz wynik, który nie może
   się opublikować mimo ponowień (`REVISION_CONFLICT`), zgłasza od razu incydent
   `RESULT_RECOVERY_FAILED` (wynik zostaje zapisany), a okresowy przebieg odzyskiwania
-  próbuje go przyjąć ponownie co minutę, także dla wyników przepływu i bloku (nie tylko
-  narzędzi addonu), i po sukcesie zamyka incydent; nie trzeba restartu. Przyjęcie trzymane przez inny worker, zajęty magazyn
+  próbuje go przyjąć ponownie, także dla wyników przepływu i bloku (nie tylko
+  narzędzi addonu), z opóźnieniem podwajanym po każdej nieudanej próbie (minuta, dwie,
+  cztery, do godziny), i po sukcesie zamyka incydent; nie trzeba restartu. Przyjęcie trzymane przez inny worker, zajęty magazyn
   i przegrany wyścig rewizji nie są odrzuceniem planu: pierwsze zostawia wynik jego
   właścicielowi, pozostałe są ponawiane. Błąd zadania wewnątrz powtarzanego
   podprocesu trafia do zdarzenia brzegowego na tym podprocesie także w walidatorze.
 - Silnik BPMN: nieudany odczyt migawki instancji podczas publikacji wyniku nie jest już
   cofnięciem uprawnień. Zajęta pula albo magazyn są ponawiane, każdy inny błąd odczytu
   kończy się `RESULT_ACCEPTANCE_FAILED` (wynik zostaje zapisany i da się go przyjąć), a
-  tylko odmowa dostępu blokuje wynik jako `SOURCE_ACCESS_REVOKED`. Powtarzane zadanie
+  tylko odmowa dostępu blokuje wynik jako `SOURCE_ACCESS_REVOKED`. To samo dotyczy
+  odczytu uprawnień przy zapisie obserwacji i błędzie zadania: blokuje wyłącznie
+  typowana odmowa (`ProcessAuthorityDenied`, także dla niezgodnego inicjatora wywołanego
+  procesu), a błąd wejścia/wyjścia albo nieczytelny wiersz wersji, definicji czy instancji
+  zostawia wynik zapisany i widoczny jako incydent. Powtarzane zadanie
   skryptu z wejściem IO, którego treść zawodzi, przestało przerywać start instancji:
   walidator odtwarza treść z zapisanymi wejściami i przyjmuje incydent ordynału bez źródła.
 - Silnik BPMN: przyjęcie zapisanego wyniku ponawia się tylko po przegranym wyścigu rewizji
@@ -180,6 +185,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   nie jest odrzuceniem planu. Walidator przyjmuje zapisany incydent warunku zadania z
   którymkolwiek z dwóch kodów (`EXPRESSION_ERROR` albo `VERIFICATION_FAILED`), więc
   wydanie, które ocenia to samo wyrażenie inaczej, nie odrzuca planów rodzeństwa.
+- Silnik BPMN (runda 7): wynik przepływu lub bloku odrzucony na stałe nie jest już
+  ponawiany co minutę w nieskończoność: opóźnienie rośnie dwukrotnie po każdej nieudanej
+  próbie do godziny, a powtórzone niepowodzenia trafiają do dziennika na poziomie
+  debug (błędem są pierwsze i to, które zgłasza incydent). Wiersz, który przegrał wyścig
+  rewizji, jest oznaczany jako sprawdzony i nie wraca w każdym takcie. Wyczerpanie ośmiu
+  prób na zajętym magazynie jest zgłaszane jako `STORE_BUSY`, nie `REVISION_CONFLICT`.
+  Komunikat błędu powtarzanego skryptu z wejściem IO porównuje walidator z tą samą
+  ograniczoną treścią, którą zapisuje silnik, więc komunikat dłuższy niż 32 KiB nie
+  powoduje już odrzucenia planu. **Znana, otwarta wada:** powtarzane zadanie skryptu,
+  którego odwzorowanie WYJŚCIA IO zawodzi (`ACTIVITY_IO_OUTPUT_FAILED`), nie przechodzi
+  walidatora. Na starcie instancja się nie zapisuje. Gdy skrypt jest za stanem
+  oczekiwania, odmowa dotyka dopiero późniejszego przejścia: ukończenie zadania
+  użytkownika kończy się błędem polecenia bez zapisu i bez incydentu (zadanie zostaje
+  otwarte, instancja nie ulega zmianie, ale nie da się jej tą drogą ukończyć), a wynik
+  zadania usługi zostaje zapisany i zgłasza incydent `RESULT_RECOVERY_FAILED`, ponawiany
+  z narastającym opóźnieniem. Nic nie jest uszkodzone, ale taka instancja czeka na
+  anulowanie albo poprawkę silnika.
 - Silnik BPMN: plan zamknięcia grupy powtórzeń z zablokowanym wynikiem (TerminateEnd,
   zdarzenie brzegowe na podprocesie nadrzędnym, zdarzenie brzegowe na zadaniu z
   odrzuconą weryfikacją) nie jest już odrzucany przez walidator, a zamknięcie anuluje
@@ -239,7 +261,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   w polu. Ponowienie mówi „Ponowiono”, zamknięte menu wypada z kolejności Tab,
   upuszczanie z palety działa na całym płótnie, a telefon (pionowo i poziomo) ma
   dolny pasek z Cofnij i Ponów w zasięgu oraz menu „Więcej” w oknie.
-
 - Runda 6 poprawek designera (tylko GUI): jedna odroczona etykieta nie psuje już
   płótna ani zapisu (widok i model nigdy nie dostają NaN), pasek narzędzi w
   bezruchu się nie mierzy, strefa czasowa zachowuje wpisaną pisownię, menu „Więcej”

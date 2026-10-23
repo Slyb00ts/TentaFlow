@@ -1462,11 +1462,12 @@ fn script_io_mapping_failure_rejects_a_forged_action_source_without_writing_rows
     let mut forged = valid.clone();
     forged.event_sources.insert(route, Uuid::new_v4().to_string());
     let before_rows = super::call_tests::transition_rows(&fixture);
-    assert!(repository::start_instance(
+    let refusal = repository::start_instance(
         &fixture.db, &fixture.owner, &command, &instance_id,
         &version.definition_id, version.version, &variables, None, None,
         ProcessPlanInput::Supplied(&forged), at_ms,
-    ).is_err());
+    ).unwrap_err();
+    assert!(format!("{refusal:#}").contains("changed its accepted body or parked route"), "{refusal:#}");
     assert_eq!(super::call_tests::transition_rows(&fixture), before_rows);
     repository::start_instance(
         &fixture.db, &fixture.owner, &command, &instance_id,

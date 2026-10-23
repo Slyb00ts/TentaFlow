@@ -14207,11 +14207,12 @@ fn validate_script_actions_on(
                 .err().context("failed repeated Script has a successful pinned body")?;
             ensure!(failure.downcast_ref::<crate::flow_engine::expr::InfrastructureExprError>().is_none(),
                 "repeated Script infrastructure failure cannot become an incident");
+            let expected_message = bounded_failure_message(&failure.to_string());
             let incidents = plan.add_incidents.iter().filter(|incident|
                 incident.scope_id == event.scope_id
                     && incident.node_id.as_deref() == Some(node_id)
                     && incident.code == "SCRIPT_EVALUATION_FAILED"
-                    && incident.message == failure.to_string() && !incident.can_retry)
+                    && incident.message == expected_message && !incident.can_retry)
                 .collect::<Vec<_>>();
             ensure!(source.status == "ready" && source.scope_id == event.scope_id
                 && source.node_id == node.id && sources.insert(source_id.clone())
@@ -14225,7 +14226,7 @@ fn validate_script_actions_on(
                 && current.aggregate_item.is_none() && current.state_patch.is_none()
                 && current.state_after.is_none() && incidents.len() == 1
                 && event.data == serde_json::json!({
-                    "code":"SCRIPT_EVALUATION_FAILED","message":failure.to_string(),
+                    "code":"SCRIPT_EVALUATION_FAILED","message":expected_message,
                 })
                 && plan.events.iter().filter(|candidate|
                     candidate.kind == "incident" && candidate.scope_id == event.scope_id
@@ -21988,22 +21989,22 @@ fn historical_call_child_on(conn: &Connection, instance_id: &str) -> Result<bool
     Ok(true)
 }
 
-fn require_call_control_authority_on(
+pub(super) fn require_call_control_authority_on(
     conn: &Connection,
     actor: &ProcessActor,
     instance_id: &str,
 ) -> Result<()> {
-    ensure!(
-        call_control_live_on(conn, instance_id)?,
-        "called process control ancestry is closed"
-    );
+    if !call_control_live_on(conn, instance_id)? {
+        return Err(ProcessAuthorityDenied("called process control ancestry is closed").into());
+    }
     let mut id = instance_id.to_owned();
     loop {
         let (definition,version,org,initiator):(String,u32,String,String)=conn.query_row("SELECT definition_id,version,org_id,initiator_user_id FROM bpmn_instances WHERE instance_id=?1",[&id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-        ensure!(
-            org == actor.org_id && initiator == actor.user_id,
-            "called process actor differs from actual initiator"
-        );
+        if org != actor.org_id || initiator != actor.user_id {
+            return Err(ProcessAuthorityDenied(
+                "called process actor differs from actual initiator",
+            ).into());
+        }
         require_owner(conn, actor, &definition)?;
         require_version_execution_on(conn, actor, &definition, version)?;
         let Some(call) = calls_on(conn, &id)?
@@ -24719,7 +24720,7 @@ fn block_closed_observed_job(pool: &DbPool, job_id: &str, at_ms: i64) -> Result<
             .and_then(|flow| require_source_current(&tx, &actor, &flow, None))
     } else { Ok(()) };
     let reason = if !live { Some("activation_closed") }
-        else if authority.is_err() { Some("execution_authority_revoked") }
+        else if authority_denied(&authority) { Some("execution_authority_revoked") }
         else { None };
     let Some(reason) = reason else { return Ok(false) };
     block_observed_invocation_on(&tx, &invocation_id, job_id, &instance_id,
@@ -24836,7 +24837,7 @@ fn record_job_observation_on(
             .and_then(|flow| require_source_current(&tx, &claimed.actor, &flow, None))
     } else { Ok(()) };
     let blocked_reason = if !live { Some("activation_closed") }
-        else if authority.is_err() { Some("execution_authority_revoked") }
+        else if authority_denied(&authority) { Some("execution_authority_revoked") }
         else { None };
     let reserved = claimed.result_event_id.clone();
     let changed = tx.execute(
@@ -26829,7 +26830,7 @@ fn is_storage_failure(error: &anyhow::Error) -> bool {
 
 /// The store was busy or its connection pool exhausted: nothing was decided about
 /// the result, and the same acceptance can simply be made again.
-fn is_store_busy(error: &anyhow::Error) -> bool {
+pub(super) fn is_store_busy(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some_and(|failure|
         matches!(failure, rusqlite::Error::SqliteFailure(code, _)
             if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy
@@ -26847,6 +26848,13 @@ pub(super) fn is_retryable_acceptance(error: &anyhow::Error) -> bool {
 
 pub(super) fn is_authority_denied(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<ProcessAuthorityDenied>())
+}
+
+/// Only a typed denial is a revocation. Any other failure of the authority read
+/// (I/O, an unreadable row) says nothing about the actor: the result stays
+/// recorded and acceptance, which reads the same rows, reports the failure.
+fn authority_denied(authority: &Result<()>) -> bool {
+    matches!(authority, Err(error) if is_authority_denied(error))
 }
 
 /// Marks a failure of the plan or its validation as a refusal, unless it is a lost
@@ -27211,15 +27219,18 @@ pub const RECOVERY_FAILURES_BEFORE_INCIDENT: i64 = 5;
 pub const DEFERRED_SCAN_SQL: &str = "SELECT j.job_id,j.attempt,j.fence,COALESCE(v.dispatch_worker_id,j.worker_id),j.instance_id,i.org_id,i.initiator_user_id,v.observed_result_json FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id JOIN bpmn_instances i ON i.instance_id=j.instance_id LEFT JOIN bpmn_result_recovery r ON r.invocation_id=v.invocation_id WHERE v.phase='observed' AND v.implementation_kind='addon_tool' ORDER BY COALESCE(r.last_checked_ms,0),j.created_at_ms,j.job_id LIMIT ?1";
 
 /// The periodic scan over observed flow and block results whose acceptance failed and
-/// shows a recovery incident (`?1` is the page size, `?2` the newest `last_checked_ms`
-/// worth another try). Such a result was correct but could not be accepted; nothing
-/// else revisits it before the next restart. The driving table only holds rows that
-/// ever failed or waited, and the incident column keeps it to the ones still failing.
-pub const OPEN_INCIDENT_SCAN_SQL: &str = "SELECT j.job_id,j.attempt,j.fence,COALESCE(v.dispatch_worker_id,j.worker_id),j.instance_id,i.org_id,i.initiator_user_id,v.observed_result_json FROM bpmn_result_recovery r JOIN bpmn_service_invocations v ON v.invocation_id=r.invocation_id JOIN bpmn_jobs j ON j.job_id=v.job_id JOIN bpmn_instances i ON i.instance_id=j.instance_id WHERE r.incident_id IS NOT NULL AND r.last_checked_ms<=?2 AND v.phase='observed' AND v.implementation_kind<>'addon_tool' ORDER BY r.last_checked_ms,j.created_at_ms,j.job_id LIMIT ?1";
+/// shows a recovery incident (`?1` is the page size, `?2` the current time, `?3` the
+/// first retry delay and `?4` the longest one). Such a result was correct but could not
+/// be accepted; nothing else revisits it before the next restart. The driving table
+/// only holds rows that ever failed or waited, and the incident column keeps it to the
+/// ones still failing. The delay doubles with every failed pass, so a result the
+/// engine refuses for good costs one try an hour instead of one a minute.
+pub const OPEN_INCIDENT_SCAN_SQL: &str = "SELECT j.job_id,j.attempt,j.fence,COALESCE(v.dispatch_worker_id,j.worker_id),j.instance_id,i.org_id,i.initiator_user_id,v.observed_result_json FROM bpmn_result_recovery r JOIN bpmn_service_invocations v ON v.invocation_id=r.invocation_id JOIN bpmn_jobs j ON j.job_id=v.job_id JOIN bpmn_instances i ON i.instance_id=j.instance_id WHERE r.incident_id IS NOT NULL AND r.last_checked_ms+MIN(?4,?3*(1<<MIN(MAX(r.failed_passes-1,0),20)))<=?2 AND v.phase='observed' AND v.implementation_kind<>'addon_tool' ORDER BY r.last_checked_ms,j.created_at_ms,j.job_id LIMIT ?1";
 
-/// How long a failed flow or block result waits before its acceptance is tried again:
-/// a result the engine refuses for good is looked at once a minute, not every pass.
+/// How long a failed flow or block result waits before its acceptance is tried the
+/// first time again; every further failed pass doubles it up to the maximum below.
 pub const OPEN_INCIDENT_RETRY_AFTER_MS: i64 = 60_000;
+pub const OPEN_INCIDENT_RETRY_MAX_MS: i64 = 60 * 60 * 1000;
 
 /// Rows one periodic recovery pass examines.
 pub const RECOVERY_PAGE: i64 = 64;
@@ -27332,7 +27343,7 @@ pub fn recover_deferred_results(
     };
     let mut rows = read_rows(DEFERRED_SCAN_SQL, &[&page])?;
     rows.extend(read_rows(OPEN_INCIDENT_SCAN_SQL,
-        &[&page, &(now_ms - OPEN_INCIDENT_RETRY_AFTER_MS)])?);
+        &[&page, &now_ms, &OPEN_INCIDENT_RETRY_AFTER_MS, &OPEN_INCIDENT_RETRY_MAX_MS])?);
     drop(conn);
     let mut recovered = 0u32;
     let mut waiting = Vec::new();
@@ -27345,7 +27356,9 @@ pub fn recover_deferred_results(
             Ok(RecoveryStep::Resolved) => recovered += 1,
             Ok(RecoveryStep::Waiting(WaitReason::Undecided)) => waiting.push((job_id, false)),
             Ok(RecoveryStep::Waiting(WaitReason::ToolGone)) => waiting.push((job_id, true)),
-            Ok(RecoveryStep::Waiting(WaitReason::Conflict)) => {}
+            // Nothing is wrong with the row, but it was just looked at: without the
+            // stamp the oldest-checked ordering would offer it on every tick.
+            Ok(RecoveryStep::Waiting(WaitReason::Conflict)) => stamp_recovery_checked(pool, &job_id, now_ms),
             Err(error) => report_recovery_failure(
                 pool, &job_id, &error, now_ms, RECOVERY_FAILURES_BEFORE_INCIDENT),
         }
@@ -27445,11 +27458,11 @@ fn recovered_by_periodic_pass(pool: &DbPool, job_id: &str, phase: &str) -> bool 
 }
 
 /// Counts one failed recovery pass of a row and, once `incident_after` passes
-/// have failed, raises its visible incident.
+/// have failed, raises its visible incident. Returns the passes counted so far.
 fn count_recovery_failure_on(
     tx: &Transaction<'_>, job_id: &str, now_ms: i64, incident_after: i64,
-) -> Result<()> {
-    let Some(row) = recovery_row_on(tx, job_id)? else { return Ok(()) };
+) -> Result<i64> {
+    let Some(row) = recovery_row_on(tx, job_id)? else { return Ok(0) };
     tx.execute(
         "INSERT INTO bpmn_result_recovery(invocation_id,last_checked_ms,failed_passes,last_error_code) VALUES(?1,?2,1,'RESULT_RECOVERY_FAILED') ON CONFLICT(invocation_id) DO UPDATE SET failed_passes=failed_passes+1,last_checked_ms=?2,last_error_code='RESULT_RECOVERY_FAILED'",
         params![row.invocation_id, now_ms],
@@ -27467,12 +27480,13 @@ fn count_recovery_failure_on(
             "the observed Service result could not be recovered; it stays recorded",
             now_ms)?;
     }
-    Ok(())
+    Ok(passes)
 }
 
 /// Logs a row that recovery could not process (job id and size only) and counts
-/// the failure; after `RECOVERY_FAILURES_BEFORE_INCIDENT` passes in a row the
-/// row raises a visible incident.
+/// the failure; after `incident_after` passes in a row the row raises a visible
+/// incident. A row refused for good is tried again with a growing delay, and only
+/// its first failure and the one that raises the incident are logged as errors.
 fn report_recovery_failure(
     pool: &DbPool,
     job_id: &str,
@@ -27480,18 +27494,36 @@ fn report_recovery_failure(
     now_ms: i64,
     incident_after: i64,
 ) {
-    tracing::error!(job_id, error_len = format!("{error:#}").len(),
-        "process result recovery failed for one row; the others continue");
-    let outcome = (|| -> Result<()> {
+    let outcome = (|| -> Result<i64> {
         let mut conn = pool.write()?;
         let tx = conn.transaction()?;
-        count_recovery_failure_on(&tx, job_id, now_ms, incident_after)?;
+        let passes = count_recovery_failure_on(&tx, job_id, now_ms, incident_after)?;
         tx.commit()?;
-        Ok(())
+        Ok(passes)
     })();
+    let error_len = format!("{error:#}").len();
+    match outcome {
+        Ok(passes) if passes > 1 && passes != incident_after => tracing::debug!(job_id, passes,
+            error_len, "process result recovery failed again for one row"),
+        Ok(_) => tracing::error!(job_id, error_len,
+            "process result recovery failed for one row; the others continue"),
+        Err(recording) => {
+            tracing::error!(job_id, error_len,
+                "process result recovery failed for one row; the others continue");
+            tracing::error!(job_id, error_len = recording.to_string().len(),
+                "process result recovery could not record its own failure");
+        }
+    }
+}
+
+/// Stamps a row as looked at without counting a failure.
+fn stamp_recovery_checked(pool: &DbPool, job_id: &str, now_ms: i64) {
+    let outcome = pool.write().map_err(anyhow::Error::from).and_then(|conn| Ok(conn.execute(
+        "INSERT INTO bpmn_result_recovery(invocation_id,last_checked_ms) SELECT invocation_id,?2 FROM bpmn_service_invocations WHERE job_id=?1 ON CONFLICT(invocation_id) DO UPDATE SET last_checked_ms=?2",
+        params![job_id, now_ms])?));
     if let Err(error) = outcome {
-        tracing::error!(job_id, error_len = error.to_string().len(),
-            "process result recovery could not record its own failure");
+        tracing::debug!(job_id, error_len = error.to_string().len(),
+            "process result recovery could not stamp its check");
     }
 }
 
@@ -27849,7 +27881,7 @@ pub fn fail_job_with_authority(
                 .and_then(|flow| require_source_current(&tx, &actor, &flow, None))
         } else { Ok(()) };
         let reason = if !live { Some("activation_closed") }
-            else if authority.is_err() || authority_revoked { Some("execution_authority_revoked") }
+            else if authority_revoked || authority_denied(&authority) { Some("execution_authority_revoked") }
             else { None };
         if let Some(reason) = reason {
             block_observed_invocation_on(&tx, &invocation_id, job_id, &instance_id,
@@ -27862,7 +27894,7 @@ pub fn fail_job_with_authority(
             // stays observed with nothing retrying a flow result before the next
             // restart: it must show as an incident instead of hanging unseen.
             if matches!(code, "RESULT_REJECTED" | "RESULT_ACCEPTANCE_FAILED" | "TRANSITION_ERROR"
-                | "REVISION_CONFLICT") {
+                | "REVISION_CONFLICT" | "STORE_BUSY") {
                 count_recovery_failure_on(&tx, job_id, now_ms, 1)?;
                 tx.commit()?;
             }

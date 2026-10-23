@@ -8,6 +8,7 @@ use tentaflow_protocol::processes::{
 
 use super::super::repetition_group_incident_tests::{service_result, Member, ParallelGroup};
 use super::super::repository::{self, ProcessPlanInput};
+use crate::db::READ_POOL_ACQUIRE_TIMEOUT;
 use super::{finish_observed, AccessCheck, ServiceJob};
 
 fn condition_true() -> ActivityVerification {
@@ -309,8 +310,7 @@ fn publish_with_read_pool_held(
         let db = group.fixture.db.clone();
         scope.spawn(move || {
             start_rx.recv().unwrap();
-            let size = (num_cpus::get() as u32 * 2).clamp(4, 16);
-            let guards = (0..size).map(|_| db.read().unwrap()).collect::<Vec<_>>();
+            let guards = (0..crate::db::read_pool_size()).map(|_| db.read().unwrap()).collect::<Vec<_>>();
             held_tx.send(()).unwrap();
             std::thread::sleep(hold);
             drop(guards);
@@ -338,7 +338,7 @@ async fn a_snapshot_read_that_fails_without_a_denial_leaves_the_result_acceptabl
             [&group.instance_id]).unwrap();
         conn.execute_batch("PRAGMA ignore_check_constraints=OFF").unwrap();
     };
-    publish_with_read_pool_held(&group, member, std::time::Duration::from_secs(7), corrupt);
+    publish_with_read_pool_held(&group, member, READ_POOL_ACQUIRE_TIMEOUT + std::time::Duration::from_secs(2), corrupt);
     assert_eq!(phase(&group, member), "observed", "an unreadable snapshot is not a revocation");
     assert_eq!(open_incident_codes(&group), ["RESULT_RECOVERY_FAILED"]);
 }
@@ -352,7 +352,7 @@ async fn a_snapshot_read_the_actor_is_denied_blocks_the_result() {
             "UPDATE user_accounts SET is_active=0 WHERE id=?1",
             [&group.fixture.owner.user_id]).unwrap();
     };
-    publish_with_read_pool_held(&group, member, std::time::Duration::from_secs(7), deactivate);
+    publish_with_read_pool_held(&group, member, READ_POOL_ACQUIRE_TIMEOUT + std::time::Duration::from_secs(2), deactivate);
     assert_eq!(phase(&group, member), "observed_blocked");
 }
 
@@ -360,7 +360,7 @@ async fn a_snapshot_read_the_actor_is_denied_blocks_the_result() {
 async fn an_exhausted_read_pool_is_waited_out_instead_of_revoking_the_result() {
     let group = two_completed_ordinals().await;
     let member = &group.members[0];
-    publish_with_read_pool_held(&group, member, std::time::Duration::from_secs(12), || {});
+    publish_with_read_pool_held(&group, member, READ_POOL_ACQUIRE_TIMEOUT * 2 + std::time::Duration::from_secs(2), || {});
     assert_eq!(phase(&group, member), "accepted");
     assert_eq!(open_incident_codes(&group), Vec::<String>::new());
 }
@@ -392,7 +392,86 @@ async fn a_recorded_flow_result_is_accepted_by_the_periodic_pass_once_its_cause_
         rusqlite::params![group.instance_id, original]).unwrap();
     assert_eq!(pass(later + 1), 0, "a result tried a moment ago waits for its backoff");
     assert_eq!(phase(&group, member), "observed");
-    assert_eq!(pass(later + repository::OPEN_INCIDENT_RETRY_AFTER_MS + 1_000), 1);
+    // The failed retry above doubled the delay.
+    assert_eq!(pass(later + 2 * repository::OPEN_INCIDENT_RETRY_AFTER_MS + 1_000), 1);
     assert_eq!(phase(&group, member), "accepted");
     assert!(group.snapshot().incidents.is_empty(), "accepting the result closes the incident");
+}
+
+fn recovery_state(group: &ParallelGroup, member: &Member) -> (i64, i64) {
+    group.fixture.db.read().unwrap().query_row(
+        "SELECT last_checked_ms,failed_passes FROM bpmn_result_recovery WHERE invocation_id=(SELECT invocation_id FROM bpmn_service_invocations WHERE job_id=?1)",
+        [&member.claim.job.job_id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap()
+}
+
+#[tokio::test]
+async fn a_result_refused_for_good_is_retried_with_a_doubling_delay_up_to_an_hour() {
+    let group = two_completed_ordinals().await;
+    let member = &group.members[0];
+    group.fixture.db.write().unwrap().execute(
+        "UPDATE bpmn_repetition_occurrences SET input_variables_json='{\"tampered\":true}' WHERE instance_id=?1 AND ordinal=0",
+        [&group.instance_id]).unwrap();
+    publish(&group, member, &|| AccessCheck::Allowed);
+    assert_eq!(incident_codes(&group), ["RESULT_RECOVERY_FAILED"]);
+
+    const BASE: i64 = repository::OPEN_INCIDENT_RETRY_AFTER_MS;
+    const CAP: i64 = repository::OPEN_INCIDENT_RETRY_MAX_MS;
+    let from = 1_000_000_000_000_i64;
+    let pass = |at_ms: i64| repository::recover_deferred_results(&group.fixture.db, at_ms,
+        &repository::no_tool_authority, &|_| false, repository::RECOVERY_PAGE).unwrap();
+    for (failed_passes, delay) in [(1, BASE), (2, 2 * BASE), (3, 4 * BASE), (6, 32 * BASE),
+        (7, CAP), (8, CAP), (60, CAP)] {
+        group.fixture.db.write().unwrap().execute(
+            "UPDATE bpmn_result_recovery SET failed_passes=?2,last_checked_ms=?3 WHERE invocation_id=(SELECT invocation_id FROM bpmn_service_invocations WHERE job_id=?1)",
+            rusqlite::params![member.claim.job.job_id, failed_passes, from]).unwrap();
+        pass(from + delay - 1);
+        assert_eq!(recovery_state(&group, member), (from, failed_passes),
+            "{failed_passes} failed passes: tried {delay} ms early");
+        pass(from + delay);
+        assert_eq!(recovery_state(&group, member).1, failed_passes + 1,
+            "{failed_passes} failed passes: not tried once {delay} ms passed");
+    }
+}
+
+#[tokio::test]
+async fn an_authority_read_that_fails_without_a_denial_leaves_the_result_acceptable() {
+    let group = two_completed_ordinals().await;
+    let member = &group.members[0];
+    // The authority check reads the pinned version; an unreadable one says nothing
+    // about the actor.
+    let damaged = group.fixture.db.write().unwrap().execute(
+        "UPDATE bpmn_versions SET service_snapshots_json='not json' WHERE definition_id=(SELECT definition_id FROM bpmn_instances WHERE instance_id=?1)",
+        [&group.instance_id]).unwrap();
+    assert_eq!(damaged, 1);
+    publish(&group, member, &|| AccessCheck::Allowed);
+    assert_eq!(phase(&group, member), "observed", "an unreadable row is not a revocation");
+    assert_eq!(open_incident_codes(&group), ["RESULT_RECOVERY_FAILED"]);
+}
+
+#[tokio::test]
+async fn an_ancestry_that_names_another_actor_is_a_typed_denial() {
+    let group = two_completed_ordinals().await;
+    let other = repository::ProcessActor {
+        org_id: group.fixture.owner.org_id.clone(), user_id: "someone-else".into() };
+    let conn = group.fixture.db.read().unwrap();
+    let error = repository::require_call_control_authority_on(&conn, &other, &group.instance_id)
+        .unwrap_err();
+    assert!(repository::is_authority_denied(&error), "{error:#}");
+}
+
+#[test]
+fn an_exhausted_attempt_budget_names_what_it_ran_out_against() {
+    assert_eq!(super::exhausted_attempts_failure(true).0, "STORE_BUSY");
+    assert_eq!(super::exhausted_attempts_failure(false).0, "REVISION_CONFLICT");
+}
+
+#[tokio::test]
+async fn a_busy_store_failure_keeps_the_result_acceptable_and_shows_as_an_incident() {
+    let group = two_completed_ordinals().await;
+    let member = &group.members[0];
+    let (code, message) = super::exhausted_attempts_failure(true);
+    super::fail_claim(&group.fixture.db, &member.worker, &member.claim, code, message,
+        Some(&member.observed)).unwrap();
+    assert_eq!(phase(&group, member), "observed");
+    assert_eq!(open_incident_codes(&group), ["RESULT_RECOVERY_FAILED"]);
 }

@@ -1761,6 +1761,136 @@ fn a_failing_body_of_a_repeated_script_with_input_io_parks_the_group_under_one_i
     }
 }
 
+/// Plans the start of a repeated Script with input IO whose body fails, and offers the
+/// plan to the validator after `forge` changed it.
+fn offer_forged_failing_start(model: &ProcessModel, forge: impl FnOnce(&mut repository::RuntimePlan))
+    -> anyhow::Result<tentaflow_protocol::processes::ProcessInstance>
+{
+    let fixture = Fixture::new();
+    let version = publish_model(&fixture, model);
+    let id = Uuid::new_v4().to_string();
+    let variables = serde_json::to_value(&model.variables).unwrap();
+    let at_ms = chrono::Utc::now().timestamp_millis();
+    let command = stamp("start");
+    let mut plan = runtime::plan_start(&version.model, &version.model.process_id,
+        ordinary_start_id(&version.model), &id, &fixture.owner, &version.definition_id,
+        version.version, variables.clone(), runtime::StartCause::Manual, at_ms,
+        manual_input(&command), None).expect("plan the failing start");
+    forge(&mut plan);
+    repository::start_instance(&fixture.db, &fixture.owner, &command, &id,
+        &version.definition_id, version.version, &variables, None, None,
+        repository::ProcessPlanInput::Supplied(&plan), at_ms)
+}
+
+#[test]
+fn a_replay_that_forgets_the_captured_input_of_a_failed_repeated_script_is_refused() {
+    let model = repeated_script_with_input_io(FAILING_BODY_OVER_INPUT, 1,
+        ProcessMultiInstanceMode::Sequential);
+    offer_forged_failing_start(&model, |_| {}).expect("the honest plan is admitted");
+    // The message the body gives without `inputs`: a validator that replayed the body
+    // without the captured input would find exactly this and admit the forgery.
+    let refusal = offer_forged_failing_start(&model, |plan| {
+        let occurrence = &plan.repetition_occurrences[0];
+        let repeat = vec![("repeat".to_owned(), json!({
+            "group_id":occurrence.group_id,"index":occurrence.ordinal,"item":occurrence.item}))];
+        let without_inputs = runtime::script_evaluate(FAILING_BODY_OVER_INPUT,
+            &occurrence.input_variables, &Value::Null, &repeat).unwrap_err().to_string();
+        assert_ne!(without_inputs, plan.add_incidents[0].message);
+        plan.add_incidents[0].message = without_inputs.clone();
+        for event in plan.events.iter_mut().filter(|event| event.kind == "incident") {
+            event.data["message"] = json!(without_inputs);
+        }
+    }).unwrap_err();
+    assert!(format!("{refusal:#}").contains("changed its exact body, incident, or parked ordinal"),
+        "{refusal:#}");
+}
+
+#[test]
+fn a_failure_message_over_the_incident_bound_is_still_admitted_for_a_repeated_script() {
+    let mut model = repeated_script_with_input_io("{\"a\":1}[vars.long_key]", 1,
+        ProcessMultiInstanceMode::Sequential);
+    model.variables.insert("long_key".into(), json!("k".repeat(40 * 1024)));
+    offer_forged_failing_start(&model, |plan| {
+        let stored = plan.add_incidents[0].message.len();
+        assert!(stored < 40 * 1024, "the runtime stores the bounded message, got {stored} bytes");
+    }).expect("a long failure message must not make the validator refuse the plan");
+}
+
+/// Start -> Review (user task) -> repeated Script whose output IO fails -> End.
+fn review_then_repeated_script_with_failing_output(fixture: &Fixture) -> ProcessModel {
+    use tentaflow_protocol::processes::{ProcessActivityIo, ProcessBodyModeling, ProcessDataObject,
+        ProcessDataObjectReference, ProcessIoDataOutput, ProcessOutputAssociation};
+    let mut model = script_model("1", BTreeMap::new(), false);
+    model.variables.insert("results".into(), json!([]));
+    model.variables.insert("mapped".into(), Value::Null);
+    model.modeling = Some(ProcessBodyModeling {
+        data_objects: vec![ProcessDataObject { id: "Object_Compute".into(), name: None }],
+        data_object_references: vec![ProcessDataObjectReference {
+            id: "Ref_Compute".into(), name: None, data_object_ref: "Object_Compute".into(),
+            variable_binding_key: Some("mapped".into()) }],
+        ..ProcessBodyModeling::default()
+    });
+    let compute = model.nodes.iter_mut().find(|node| node.id == "Compute").unwrap();
+    compute.repeat = Some(ProcessRepeatSpec::MultiInstance {
+        mode: ProcessMultiInstanceMode::Sequential,
+        input: ProcessMultiInstanceInput::Cardinality { count: 1 },
+        output_collection_variable: "results".into(),
+    });
+    compute.activity_io = Some(ProcessActivityIo {
+        data_inputs: Vec::new(),
+        data_outputs: vec![ProcessIoDataOutput {
+            id: "Output_Compute".into(), name: None, value_expression: "1 / 0".into() }],
+        input_set_id: "InputSet_Compute".into(), input_set: Vec::new(),
+        output_set_id: "OutputSet_Compute".into(), output_set: vec!["Output_Compute".into()],
+        input_associations: Vec::new(),
+        output_associations: vec![ProcessOutputAssociation {
+            id: "Association_Compute".into(), source_output_id: "Output_Compute".into(),
+            target_object_ref_id: "Ref_Compute".into() }],
+        coordinator_output: None,
+    });
+    model.nodes.insert(1, ProcessNode {
+        id: "Review".into(), name: "Review".into(),
+        kind: ProcessNodeKind::UserTask {
+            assignee_user_id: Some(fixture.owner.user_id.clone()),
+            output_mapping: BTreeMap::new(),
+        },
+        repeat: None,
+        activity_io: None,
+    });
+    model.sequence_flows = vec![edge("ToReview", "Start_1", "Review"),
+        edge("ToCompute", "Review", "Compute"), edge("FromCompute", "Compute", "End_1")];
+    model
+}
+
+/// The open defect of the repeated Script: a failing OUTPUT association is not
+/// admitted by the validator. Reached after a wait state the refusal lands on the
+/// later transition, and nothing is written.
+#[test]
+fn a_user_task_completion_reaching_a_repeated_script_with_failing_output_is_refused_whole() {
+    let fixture = Fixture::new();
+    let model = review_then_repeated_script_with_failing_output(&fixture);
+    let started = start_model(&fixture, &model);
+    assert_eq!(started.status, ProcessInstanceStatus::Waiting);
+    let before = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    let task = before.user_tasks.iter().find(|task| task.node_id == "Review").unwrap();
+    let rows = transition_rows(&fixture);
+    let refusal = repository::complete_user_task(&fixture.db, &fixture.owner,
+        &stamp("complete review"), &started.instance_id, &task.user_task_id,
+        before.instance.revision, &Value::Null, None, repository::ProcessPlanInput::Canonical,
+        chrono::Utc::now().timestamp_millis()).unwrap_err();
+    assert!(format!("{refusal:#}").contains("accepted repetition occurrence lacks its source event"),
+        "{refusal:#}");
+    assert_eq!(transition_rows(&fixture), rows, "the refused completion wrote nothing");
+    let after = repository::runtime_snapshot(&fixture.db, &fixture.owner,
+        &started.instance_id).unwrap();
+    assert_eq!(after.instance.revision, before.instance.revision);
+    assert_eq!(after.instance.status, ProcessInstanceStatus::Waiting);
+    assert!(after.incidents.is_empty(), "no incident: the command only fails");
+    assert!(after.user_tasks.iter().any(|row| row.user_task_id == task.user_task_id
+        && row.status == tentaflow_protocol::processes::ProcessUserTaskStatus::Open));
+}
+
 #[test]
 fn an_interrupting_deadline_closes_the_incident_of_a_repeated_script_body_with_input_io() {
     let fixture = Fixture::new();

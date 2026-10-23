@@ -1660,6 +1660,31 @@ async fn a_failing_acceptance_keeps_one_incident_open_and_closes_it_with_the_res
 }
 
 #[tokio::test]
+async fn a_row_that_lost_its_race_is_stamped_so_the_next_tick_does_not_offer_it_again() {
+    let host = ScriptedToolHost::new(json!(null));
+    let fixture = fixture_with(&host);
+    let (_, claimed) = observed_but_unaccepted(&fixture, &host).await;
+    let checked = |fixture: &Fixture| -> Option<(i64, i64)> {
+        use rusqlite::OptionalExtension;
+        fixture.db.read().unwrap().query_row(
+            "SELECT last_checked_ms,failed_passes FROM bpmn_result_recovery WHERE invocation_id=(SELECT invocation_id FROM bpmn_service_invocations WHERE job_id=?1)",
+            [&claimed.job.job_id], |row| Ok((row.get(0)?, row.get(1)?))).optional().unwrap()
+    };
+    assert_eq!(checked(&fixture), None);
+    // The denial arrives after the scan read the row, when its claim is already gone.
+    let denied_after_the_claim_moved = |_: &repository::ProcessActor, _: &str, _: &str| {
+        fixture.db.write().unwrap().execute(
+            "UPDATE bpmn_jobs SET fence=fence+1 WHERE job_id=?1", [&claimed.job.job_id]).unwrap();
+        repository::ToolDecision::Denied
+    };
+    let at_ms = now_ms() + 5_000;
+    repository::recover_deferred_results(&fixture.db, at_ms, &denied_after_the_claim_moved,
+        &|_| false, repository::RECOVERY_PAGE).unwrap();
+    assert_eq!(checked(&fixture), Some((at_ms, 0)),
+        "stamped as looked at, and not counted as a failure");
+}
+
+#[tokio::test]
 async fn one_undecided_row_that_cannot_be_recorded_does_not_cost_the_rest_of_the_page() {
     let host = ScriptedToolHost::new(json!(null));
     let fixture = fixture_with(&host);
