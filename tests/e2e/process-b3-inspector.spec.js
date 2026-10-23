@@ -1696,4 +1696,45 @@ test.describe('round 6: crowded labels, idle bar, zone, menu, minimap and drops'
     await openDesigner(page, { login: false, id: own });
     expect(await page.evaluate(() => getComputedStyle(document.querySelector('.sidebar')).display)).not.toBe('none');
   });
+  test('a menu opened inside a tf-window follows its trigger while the window body scrolls and closes once it is scrolled out', async ({ page }) => {
+    test.setTimeout(120000);
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'Menu in a scrolling window');
+    await openDesigner(page, { login: false, id: own });
+    await page.evaluate(async () => {
+      const { openActionMenu } = await import('/js/lib/actions/menu.js');
+      const win = document.createElement('tf-window');
+      win.setAttribute('title', 'Scrolling');
+      win.setAttribute('buttons', 'close');
+      win.setAttribute('width', '480');
+      win.setAttribute('height', '320');
+      win.setAttribute('initial-x', 'center');
+      win.setAttribute('initial-y', 'center');
+      win.innerHTML = '<div slot="body"><div style="height:60px"></div><tf-button id="menu-trigger" variant="secondary">Open</tf-button><div style="height:1600px"></div></div>';
+      document.body.appendChild(win);
+      window.__menuWindow = win;
+      window.__openMenu = () => openActionMenu(document.getElementById('menu-trigger'), [{ label: 'Edit', run() {} }], 'Item');
+    });
+    const geometry = () => page.evaluate(() => {
+      const body = window.__menuWindow.shadowRoot.querySelector('.tf-window-body');
+      const panel = document.querySelector('body > tf-menu')?.shadowRoot.querySelector('.tf-menu');
+      return {
+        scrollable: body.scrollHeight > body.clientHeight,
+        trigger: document.getElementById('menu-trigger').getBoundingClientRect().bottom,
+        panel: panel ? panel.getBoundingClientRect().top : null,
+      };
+    });
+    await expect.poll(async () => (await geometry()).scrollable).toBe(true);
+    await page.evaluate(() => window.__openMenu());
+    await expect(page.locator('body > tf-menu[open]')).toHaveCount(1);
+    const before = await geometry();
+    await page.evaluate(() => { window.__menuWindow.shadowRoot.querySelector('.tf-window-body').scrollTop = 30; });
+    await expect.poll(async () => {
+      const now = await geometry();
+      return Math.round((before.panel - now.panel) - (before.trigger - now.trigger));
+    }, { message: 'the panel moves with its trigger' }).toBe(0);
+    expect((await geometry()).trigger).toBeLessThan(before.trigger);
+    await page.evaluate(() => { window.__menuWindow.shadowRoot.querySelector('.tf-window-body').scrollTop = 1000; });
+    await expect(page.locator('body > tf-menu')).toHaveCount(0);
+  });
 });

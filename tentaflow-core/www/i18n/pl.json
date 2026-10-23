@@ -16292,7 +16292,7 @@
     "repeat_status_completed": "Ukończone",
     "repeat_status_cancelled": "Anulowane",
     "repeat_occurrence_status_pending": "Oczekuje",
-    "repeat_occurrence_not_started": "Nie rozpoczęte",
+    "repeat_occurrence_not_started": "Nierozpoczęte",
     "repeat_occurrence_failed": "Zakończone błędem",
     "repeat_occurrence_status_active": "Aktywne",
     "repeat_occurrence_status_awaiting_verification": "Oczekuje na weryfikację",

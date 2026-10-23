@@ -2155,7 +2155,7 @@ test('U5 Wzory at 1440: the list, a pattern\'s page with its text, versions and 
   const blocked = schemaRow(page, 'wizyta').locator('tf-button[data-act="delete-blocked"]');
   await expect(schemaRow(page, 'wizyta').locator('tf-button[data-act="delete"]')).toHaveCount(0);
   await expect(blocked).not.toHaveAttribute('disabled', '');
-  await expect(blocked).toHaveAttribute('aria-label', new RegExp(`^Nie można usunąć: używa(ją)? go topik(i)? ${used[0]}.*wybierzesz inny wzór\\.$`));
+  await expect(blocked).toHaveAttribute('data-aria-label', new RegExp(`^Nie można usunąć: używa(ją)? go topik(i)? ${used[0]}.*wybierzesz inny wzór\\.$`));
   await blocked.click();
   await expect(page.locator('.toast', { hasText: `Nie można usunąć: używa` })).toBeVisible();
   await expect(schemaSlot(page)).toBeHidden();

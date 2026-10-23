@@ -285,6 +285,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   powtarzane czekające na człowieka nie jest opisane jako „zawiodło”, strefa czasowa
   w złej wielkości liter jest odrzucana przed zapisem, a niemieckie notki o
   pominiętych zdarzeniach mają poprawną liczbę pojedynczą.
+- Runda 8 poprawek designera (tylko GUI): menu `tf-menu` podąża za wyzwalaczem także
+  wtedy, gdy przewija go kontener w shadow DOM (treść okna `tf-window`), i zamyka się,
+  gdy wyzwalacz znika pod krawędzią tego kontenera; zamykane menu oddaje fokus
+  wyzwalaczowi, jeśli był w panelu; polski status „Nierozpoczęte” jest pisany łącznie.
 
 ### TentaNas
 

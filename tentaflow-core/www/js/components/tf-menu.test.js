@@ -145,3 +145,67 @@ test('a viewport shorter than the old 120 px floor still holds the panel', () =>
   menu.anchor = trigger;
   assert.ok(parseInt(panel.style.top, 10) + parseInt(panel.style.maxHeight, 10) <= 100 - 8);
 });
+
+const frames = (n = 3) => new Promise((resolve) => {
+  const step = (left) => (left === 0 ? resolve() : requestAnimationFrame(() => step(left - 1)));
+  step(n);
+});
+
+test('an anchor inside a shadow root that moves without any scroll event drags the panel along', async () => {
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  const root = host.attachShadow({ mode: 'open' });
+  root.innerHTML = '<div data-role="body"><button data-role="trigger">More</button></div>';
+  const trigger = root.querySelector('[data-role="trigger"]');
+  const rect = { top: 40, bottom: 70, left: 100, right: 160, width: 60, height: 30 };
+  trigger.getBoundingClientRect = () => ({ ...rect, x: rect.left, y: rect.top });
+  const menu = document.createElement('tf-menu');
+  menu.innerHTML = '<tf-menu-item>A</tf-menu-item>';
+  document.body.appendChild(menu);
+  menu.anchor = trigger;
+  menu.open();
+  const panel = menu.shadowRoot.querySelector('.tf-menu');
+  const before = panel.style.top;
+  rect.top = 90; rect.bottom = 120;
+  await frames();
+  assert.equal(menu.hasAttribute('open'), true);
+  assert.notEqual(panel.style.top, before);
+  rect.top = -80; rect.bottom = -50;
+  await frames();
+  assert.equal(menu.hasAttribute('open'), false);
+});
+
+test('an anchor scrolled out of its clipping container closes the menu even while inside the viewport', async () => {
+  const { menu, bar, rect } = anchored();
+  bar.style.overflow = 'auto';
+  bar.getBoundingClientRect = () => ({ top: 100, bottom: 300, left: 0, right: 400, width: 400, height: 200 });
+  rect.top = 10; rect.bottom = 40;
+  await frames();
+  assert.equal(menu.hasAttribute('open'), false);
+});
+
+test('the frame watch stops with the menu', async () => {
+  const { menu } = anchored();
+  assert.ok(menu._frame);
+  menu.close();
+  assert.equal(menu._frame, 0);
+  assert.equal(menu._viewportBound, false);
+});
+
+test('closing with focus inside the panel returns it to the trigger', () => {
+  const { menu, trigger } = anchored();
+  const row = menu.querySelector('tf-menu-item > .tf-menu-item');
+  row.focus();
+  assert.equal(document.activeElement, row);
+  menu.close();
+  assert.equal(document.activeElement, trigger);
+});
+
+test('closing does not take focus back when the reader already moved it elsewhere', () => {
+  const { menu, other } = anchored();
+  const elsewhere = document.createElement('button');
+  other.appendChild(elsewhere);
+  elsewhere.focus();
+  menu.close();
+  assert.equal(document.activeElement, elsewhere);
+});

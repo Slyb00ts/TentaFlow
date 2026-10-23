@@ -229,8 +229,12 @@ class TfMenu extends HTMLElement {
       this.dispatchEvent(new CustomEvent('open', { bubbles: true }));
     } else {
       if (this._wasOpen) Sfx.play('menu-close');
+      const wasOpen = this._wasOpen;
       this._wasOpen = false;
       this._box.classList.remove('open');
+      // Inert drops focus held inside the panel to <body>; hand it back to the
+      // trigger. Focus that already moved elsewhere (outside click) is left alone.
+      if (wasOpen && this._focusInside()) this._focusAnchor();
       // The fade-out keeps the panel visible for 0.24 s; inert takes it out of
       // hit-testing and the tab order at once so it cannot catch a click meant for
       // what lies underneath.
@@ -239,6 +243,19 @@ class TfMenu extends HTMLElement {
       this._clearStagger();
       this.dispatchEvent(new CustomEvent('close', { bubbles: true }));
     }
+  }
+
+  _focusInside() {
+    let active = document.activeElement;
+    while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+    return !!active && active !== document.body && holdsAcrossShadows(this, active);
+  }
+
+  _focusAnchor() {
+    const anchor = this._anchor;
+    if (!anchor || !anchor.isConnected) return;
+    const target = anchor.matches('tf-button') ? anchor.querySelector('button') ?? anchor : anchor;
+    target.focus?.();
   }
 
   // With an anchor the panel leaves flow entirely: an absolutely positioned
@@ -293,13 +310,38 @@ class TfMenu extends HTMLElement {
     this._viewportBound = true;
     window.addEventListener('scroll', this._onViewportChange, true);
     window.addEventListener('resize', this._onViewportChange);
+    this._lastAnchorKey = this._anchorKey();
+    this._watchAnchor();
   }
 
   _unbindViewport() {
     if (!this._viewportBound) return;
     this._viewportBound = false;
+    cancelAnimationFrame(this._frame);
+    this._frame = 0;
     window.removeEventListener('scroll', this._onViewportChange, true);
     window.removeEventListener('resize', this._onViewportChange);
+  }
+
+  // A scroll event is not composed, so a scroller inside a shadow root (a tf-window
+  // body) never reaches the window listener. Following the anchor's own rect on
+  // animation frames needs no knowledge of where it scrolls; it runs only while open.
+  _watchAnchor() {
+    this._frame = requestAnimationFrame(() => {
+      if (!this._viewportBound) return;
+      const key = this._anchorKey();
+      if (key !== this._lastAnchorKey) {
+        this._lastAnchorKey = key;
+        if (this._anchor.isConnected && this._anchorVisible(this._anchor)) this._position();
+        else { this.close(); return; }
+      }
+      this._watchAnchor();
+    });
+  }
+
+  _anchorKey() {
+    const r = this._anchor.getBoundingClientRect();
+    return `${r.top}|${r.left}|${r.width}|${r.height}`;
   }
 
   _onViewportChange(event) {
@@ -313,13 +355,29 @@ class TfMenu extends HTMLElement {
     // Focusing the trigger can scroll its own overflow container by a few pixels
     // to bring it into view. That is not the reader leaving: follow the anchor
     // while it is still on screen and only dismiss once it is not.
-    if (!document_ && this._anchorOnScreen(anchor)) { this._position(); return; }
+    if (!document_ && this._anchorVisible(anchor)) { this._position(); return; }
     this.close();
   }
 
   _anchorOnScreen(anchor) {
     const r = anchor.getBoundingClientRect();
     return r.bottom > 0 && r.right > 0 && r.top < window.innerHeight && r.left < window.innerWidth;
+  }
+
+  // On screen AND not scrolled out of a clipping ancestor such as a window body,
+  // where it would still be inside the viewport but no longer visible.
+  _anchorVisible(anchor) {
+    if (!this._anchorOnScreen(anchor)) return false;
+    const r = anchor.getBoundingClientRect();
+    for (let n = anchor.parentNode || anchor.host; n; n = n.parentNode || n.host) {
+      if (!(n instanceof Element)) continue;
+      const overflow = getComputedStyle(n);
+      if (overflow.overflowX === 'visible' && overflow.overflowY === 'visible') continue;
+      const c = n.getBoundingClientRect();
+      if (c.width === 0 || c.height === 0) continue;
+      if (r.bottom <= c.top || r.top >= c.bottom || r.right <= c.left || r.left >= c.right) return false;
+    }
+    return true;
   }
 
   _applyStagger() {
