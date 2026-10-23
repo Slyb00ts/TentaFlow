@@ -269,6 +269,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   zadaniach mają wyjaśnienie w toaście, podpowiedzi i sprawdzeniu przed zapisem,
   historia powtórzeń jest tabelą faktów liczoną od 1, znane odmowy silnika mówią
   zwykłymi słowami, a statystyki mają liczbę mnogą we wszystkich językach.
+- Runda 7 poprawek designera (tylko GUI): menu „Więcej” nie zamyka się samo, gdy
+  fokus przewija pasek narzędzi, zamykany panel nie łapie kliknięć, a wysokie menu
+  mieści się w oknie i się przewija. Host przycisku `tf-button` nie niesie
+  globalnych atrybutów ARIA (nazwa i opis są na wewnętrznym przycisku), wystąpienie
+  powtarzane czekające na człowieka nie jest opisane jako „zawiodło”, strefa czasowa
+  w złej wielkości liter jest odrzucana przed zapisem, a niemieckie notki o
+  pominiętych zdarzeniach mają poprawną liczbę pojedynczą.
 
 ### TentaNas
 
