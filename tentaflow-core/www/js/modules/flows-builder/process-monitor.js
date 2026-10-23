@@ -657,14 +657,27 @@ export async function openProcessInstance(instanceId, initial = null) {
 
   // In a group that holds an incident the engine leaves the occurrence that failed
   // `active` (no job, no result) and the ones after it `pending`; said that way,
-  // "Active" would read as still running.
+  // "Active" would read as still running. An active occurrence that waits on a
+  // person (a task, a verification) is not the one that failed, so the incidents
+  // are matched only to the first job-less, task-less active ordinals, one each.
   function occurrenceStatusText(occurrence) {
     const group = instance.repetitionGroups.find((candidate) => candidate.groupId === occurrence.groupId);
     const held = group?.status === 'incident'
-      && instance.incidents.some((incident) => incident.nodeId === group.nodeId && !incident.jobId);
-    if (held && occurrence.status === 'active' && !occurrence.jobId) return text('repeat_occurrence_failed');
+      ? instance.incidents.filter((incident) => incident.nodeId === group.nodeId && incident.scopeId === group.scopeId && !incident.jobId).length
+      : 0;
     if (held && occurrence.status === 'pending') return text('repeat_occurrence_not_started');
+    if (held && isUnattachedActive(occurrence)) {
+      const failed = instance.repetitionOccurrences
+        .filter((candidate) => candidate.groupId === occurrence.groupId && isUnattachedActive(candidate))
+        .sort((left, right) => left.ordinal - right.ordinal)
+        .slice(0, held);
+      if (failed.includes(occurrence)) return text('repeat_occurrence_failed');
+    }
     return text(`repeat_occurrence_status_${occurrence.status}`);
+  }
+
+  function isUnattachedActive(occurrence) {
+    return occurrence.status === 'active' && !occurrence.jobId && !occurrence.userTaskId && !occurrence.verificationUserTaskId;
   }
 
   // "Occurrence 2 of 5" counted from 1; the total only where the instance names one.

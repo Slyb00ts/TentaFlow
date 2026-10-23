@@ -7324,3 +7324,22 @@ test('in a repeated group that holds an incident the failed occurrence reads as 
   assert.match(rows[1], new RegExp(I18n.t('bpmn.repeat_occurrence_not_started')));
   win.remove();
 });
+
+test('a waiting person is never told as failed: the incident belongs to the first active occurrence without a job or a task', async () => {
+  const group = { groupId: 'g1', nodeId: 'Script_1', nodeName: 'Compute each part', scopeId: 's', parentTokenId: 'p', mode: 'multi_instance_parallel',
+    status: 'incident', total: 4, createdCount: 4, completed: 0, maxIterations: null, revision: 1, createdAtMs: 1, updatedAtMs: 1 };
+  const row = (ordinal, status, patch = {}) => ({ occurrenceId: `o${ordinal}`, groupId: 'g1', ordinal, status, tokenId: `t${ordinal}`, userTaskId: null, jobId: null,
+    verificationUserTaskId: null, acceptedSourceEventId: null, approvalEventId: null, createdAtMs: 1, updatedAtMs: 1, ...patch });
+  const incident = { incidentId: 'i1', nodeId: 'Script_1', nodeName: 'Compute each part', jobId: null, code: 'SCRIPT_EVALUATION_FAILED', message: 'x', atMs: 1, canRetry: false, scopeId: 's' };
+  const other = { ...incident, incidentId: 'i2', nodeId: 'Other_1', scopeId: 's' };
+  const win = await monitor(instance('held-waiting', { repetitionGroups: [group], incidents: [incident, other],
+    repetitionOccurrences: [row(0, 'active', { userTaskId: 'task-1' }), row(1, 'active', { jobId: 'job-1' }), row(2, 'active'), row(3, 'active')] }));
+  const rows = [...win.querySelectorAll('[data-repetition-occurrence-id]')].map((node) => node.textContent);
+  const failed = new RegExp(I18n.t('bpmn.repeat_occurrence_failed'));
+  assert.doesNotMatch(rows[0], failed, 'a person is still working on it');
+  assert.doesNotMatch(rows[1], failed, 'a job is running');
+  assert.match(rows[2], failed);
+  assert.doesNotMatch(rows[3], failed, 'one incident explains one occurrence');
+  assert.match(rows[3], new RegExp(I18n.t('bpmn.repeat_occurrence_status_active')));
+  win.remove();
+});
