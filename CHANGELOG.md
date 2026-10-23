@@ -240,6 +240,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   upuszczanie z palety działa na całym płótnie, a telefon (pionowo i poziomo) ma
   dolny pasek z Cofnij i Ponów w zasięgu oraz menu „Więcej” w oknie.
 
+- Runda 6 poprawek designera (tylko GUI): jedna odroczona etykieta nie psuje już
+  płótna ani zapisu (widok i model nigdy nie dostają NaN), pasek narzędzi w
+  bezruchu się nie mierzy, strefa czasowa zachowuje wpisaną pisownię, menu „Więcej”
+  przewija się w niskim oknie, minimapa przesuwa płótno i się zwija, a upuszczenie
+  schodzi jej z drogi i przewija widok do węzła. Zdarzenia brzegowe na powtarzanych
+  zadaniach mają wyjaśnienie w toaście, podpowiedzi i sprawdzeniu przed zapisem,
+  historia powtórzeń jest tabelą faktów liczoną od 1, znane odmowy silnika mówią
+  zwykłymi słowami, a statystyki mają liczbę mnogą we wszystkich językach.
+
 ### TentaNas
 
 - Lista dozwolonych targetu iSCSI/NVMe-oF jest zapamiętywana w bazie
