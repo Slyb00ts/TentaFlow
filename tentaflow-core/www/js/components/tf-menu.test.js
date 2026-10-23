@@ -54,3 +54,94 @@ test('arrows wrap from a disabled item at either end of the list', () => {
 test('a long panel scrolls inside itself and keeps the wheel to itself', () => {
   assert.match(css, /\.tf-menu \{[^}]*overscroll-behavior: contain/);
 });
+
+function anchored({ scroller = true } = {}) {
+  const host = document.createElement('div');
+  host.innerHTML = `<div data-role="bar"><button data-role="trigger">More</button></div><div data-role="other"></div><tf-menu><tf-menu-item>A</tf-menu-item></tf-menu>`;
+  document.body.appendChild(host);
+  const menu = host.querySelector('tf-menu');
+  const trigger = host.querySelector('[data-role="trigger"]');
+  const rect = { top: 40, bottom: 70, left: 100, right: 160, width: 60, height: 30 };
+  trigger.getBoundingClientRect = () => ({ ...rect, x: rect.left, y: rect.top });
+  menu.anchor = trigger;
+  menu.open();
+  return { menu, trigger, bar: host.querySelector('[data-role="bar"]'), other: host.querySelector('[data-role="other"]'), rect };
+}
+
+const scrolled = (target) => target.dispatchEvent(new window.Event('scroll', { bubbles: false }));
+
+test('a scroll of the trigger\'s own container keeps the menu open while the trigger is still on screen', () => {
+  const { menu, bar } = anchored();
+  scrolled(bar);
+  assert.equal(menu.hasAttribute('open'), true);
+});
+
+test('a scroll that carries the trigger off screen closes the menu', () => {
+  const { menu, bar, rect } = anchored();
+  rect.top = -80; rect.bottom = -50;
+  scrolled(bar);
+  assert.equal(menu.hasAttribute('open'), false);
+});
+
+test('a scroll of an unrelated container leaves the menu alone', () => {
+  const { menu, other } = anchored();
+  scrolled(other);
+  assert.equal(menu.hasAttribute('open'), true);
+});
+
+test('a page scroll closes the menu and so does a resize', () => {
+  const first = anchored();
+  scrolled(document);
+  assert.equal(first.menu.hasAttribute('open'), false);
+  const second = anchored();
+  window.dispatchEvent(new window.Event('resize'));
+  assert.equal(second.menu.hasAttribute('open'), false);
+});
+
+test('a scroll inside the panel itself never closes it', () => {
+  const { menu } = anchored();
+  scrolled(menu.querySelector('tf-menu-item'));
+  assert.equal(menu.hasAttribute('open'), true);
+});
+
+test('a menu without an anchor ignores scrolls entirely', () => {
+  const menu = mount('<tf-menu-item>A</tf-menu-item>');
+  scrolled(document);
+  assert.equal(menu.hasAttribute('open'), true);
+});
+
+test('the closing panel is inert at once, so the fade cannot catch a click meant for what lies below', () => {
+  const { menu } = anchored();
+  const panel = menu.shadowRoot.querySelector('.tf-menu');
+  assert.equal(panel.inert, false);
+  menu.close();
+  assert.equal(panel.inert, true);
+  menu.open();
+  assert.equal(panel.inert, false);
+});
+
+test('a panel taller than the room scrolls inside the viewport instead of running past it', () => {
+  const { menu, trigger, rect } = anchored();
+  const panel = menu.shadowRoot.querySelector('.tf-menu');
+  Object.defineProperty(window, 'innerHeight', { value: 300, configurable: true });
+  Object.defineProperty(panel, 'offsetHeight', { value: 900, configurable: true });
+  Object.defineProperty(panel, 'offsetWidth', { value: 200, configurable: true });
+  rect.top = 140; rect.bottom = 170;
+  menu.anchor = trigger;
+  const top = parseInt(panel.style.top, 10);
+  const max = parseInt(panel.style.maxHeight, 10);
+  assert.ok(top >= 8, `top ${top} stays inside`);
+  assert.ok(top + max <= 300 - 8, `bottom ${top + max} stays inside the 300 px viewport`);
+  assert.equal(panel.style.overflowY, 'auto');
+});
+
+test('a viewport shorter than the old 120 px floor still holds the panel', () => {
+  const { menu, trigger, rect } = anchored();
+  const panel = menu.shadowRoot.querySelector('.tf-menu');
+  Object.defineProperty(window, 'innerHeight', { value: 100, configurable: true });
+  Object.defineProperty(panel, 'offsetHeight', { value: 500, configurable: true });
+  Object.defineProperty(panel, 'offsetWidth', { value: 200, configurable: true });
+  rect.top = 40; rect.bottom = 60;
+  menu.anchor = trigger;
+  assert.ok(parseInt(panel.style.top, 10) + parseInt(panel.style.maxHeight, 10) <= 100 - 8);
+});

@@ -87,6 +87,14 @@ test.afterAll(async () => {
   await new Promise((resolve) => setTimeout(resolve, 1500));
 });
 
+// A press on More is only done once the menu reports itself open: the click that
+// follows must not land on a panel that is still closed or already fading.
+async function openMore(page) {
+  await page.locator('[data-role="more"]').click();
+  await expect(page.locator('tf-menu[data-role="more-menu"]')).toHaveAttribute('open', '');
+  await expect(page.locator('tf-menu[data-role="more-menu"] .tf-menu.open')).toHaveCount(1);
+}
+
 async function openDesigner(page, { login = true, id = definitionId } = {}) {
   if (login) await loginAsAdmin(page, { port: PORT });
   await page.evaluate(async (target) => {
@@ -682,7 +690,7 @@ test.describe('toolbar, refusals, drops and labels', () => {
     await expect(menu).not.toHaveAttribute('open', '');
     await expect(more.locator('button')).toHaveAttribute('aria-expanded', 'false');
     expect(await page.evaluate(() => document.activeElement?.closest('[data-role="more"]') != null), 'focus is back on the button').toBe(true);
-    await more.click();
+    await openMore(page);
     await menu.locator('[data-role="calendar"]').click();
     await expect(menu).not.toHaveAttribute('open', '');
     await expect(page.getByText('Working calendar').first()).toBeVisible();
@@ -937,7 +945,7 @@ test.describe('round 4: toolbar width, keyboard, names and publishing', () => {
           expect(box.right, `${language} ${width}: ${role} ends inside the window`).toBeLessThanOrEqual(shell.right + 1);
         }
         expect((await rect(bar)).height, `${language} ${width}: one line`).toBeLessThanOrEqual(60);
-        await page.locator('[data-role="more"]').click();
+        await openMore(page);
         await expect(page.locator('tf-menu[data-role="more-menu"]')).toHaveAttribute('open', '');
         const menu = await rect(page.locator('tf-menu[data-role="more-menu"] .tf-menu'));
         expect(menu.right, `${language} ${width}: the menu is on screen`).toBeLessThanOrEqual(width);
@@ -954,7 +962,7 @@ test.describe('round 4: toolbar width, keyboard, names and publishing', () => {
     await openDesigner(page, { login: false, id: own });
     // The menu closes on any scroll or resize of the page, so it is opened once the screen has stopped moving.
     await page.waitForTimeout(1000);
-    await page.locator('[data-role="more"]').click();
+    await openMore(page);
     const menu = page.locator('tf-menu[data-role="more-menu"]');
     await expect(menu).toHaveAttribute('open', '');
     const reachable = await menu.evaluate((element) => [...element.querySelectorAll(':scope > tf-menu-item:not([hidden]):not([disabled])')].map((item) => item.dataset.role));
@@ -1016,7 +1024,7 @@ test.describe('round 4: toolbar width, keyboard, names and publishing', () => {
     await page.keyboard.press('Escape');
     await expect(run.locator('[data-start]')).toBeHidden();
 
-    await page.locator('[data-role="more"]').click();
+    await openMore(page);
     await page.locator('tf-menu[data-role="more-menu"] [data-role="simulate"]').click();
     const simulation = page.locator('tf-window.tf-act-window').last();
     await expect(simulation.locator('[data-simulation-start]')).toBeVisible();
@@ -1262,7 +1270,7 @@ test.describe('round 5: names in every window, closed menu, drops and the clock'
     await openDesigner(page, { login: false, id: own });
     await page.locator('[data-role="publish"]').click();
     await expect(page.locator('.toast').first()).toContainText('published', { timeout: 20000 });
-    await page.locator('[data-role="more"]').click();
+    await openMore(page);
     await page.locator('tf-menu[data-role="more-menu"] [data-role="simulate"]').click();
     const simulation = page.locator('tf-window.tf-act-window').last();
     await expect(simulation.locator('.tf-act__note')).toHaveAttribute('message', /Review step/);
@@ -1420,7 +1428,7 @@ test.describe('round 5: phone', () => {
       const topbar = page.locator('.fb-topbar');
       await page.locator('[data-role="zoom-in"]').click();
       expect(await topbar.evaluate((element) => element.scrollTop), 'Back and the name never scroll away').toBe(0);
-      await page.locator('[data-role="more"]').click();
+      await openMore(page);
       await page.waitForTimeout(500);
       const menu = await page.locator('tf-menu[data-role="more-menu"]').evaluate((element) => {
         const box = element.shadowRoot.querySelector('.tf-menu').getBoundingClientRect();
@@ -1602,7 +1610,7 @@ test.describe('round 6: crowded labels, idle bar, zone, menu, minimap and drops'
     const own = await createDefinition(page, 'Menu landscape');
     await openDesigner(page, { login: false, id: own });
     await page.waitForTimeout(1800);
-    await page.locator('[data-role="more"]').click();
+    await openMore(page);
     await page.waitForTimeout(500);
     const menu = await page.locator('tf-menu[data-role="more-menu"]').evaluate((element) => {
       const panel = element.shadowRoot.querySelector('.tf-menu');

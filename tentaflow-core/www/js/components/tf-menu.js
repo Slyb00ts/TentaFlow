@@ -42,6 +42,14 @@ function safeIconName(value) {
   return /^[a-z0-9_-]{1,64}$/i.test(text) ? text : '';
 }
 
+// Node.contains() stops at a shadow boundary, and a trigger often sits in one.
+function holdsAcrossShadows(container, node) {
+  for (let n = node; n; n = n.parentNode || n.host) {
+    if (n === container) return true;
+  }
+  return false;
+}
+
 class TfMenuItem extends HTMLElement {
   static get observedAttributes() {
     return ['icon', 'danger', 'action', 'disabled', 'shortcut', 'label', 'hint'];
@@ -199,6 +207,7 @@ class TfMenu extends HTMLElement {
     box.appendChild(slot);
     this._shadow.appendChild(box);
     this._box = box;
+    box.inert = true;
   }
 
   _update() {
@@ -212,6 +221,7 @@ class TfMenu extends HTMLElement {
       if (!this._wasOpen) this._box.style.zIndex = String(nextOverlayLayer());
       if (!this._wasOpen) Sfx.play('menu-open');
       this._wasOpen = true;
+      this._box.inert = false;
       this._box.classList.add('open');
       this._position();
       this._bindViewport();
@@ -221,6 +231,10 @@ class TfMenu extends HTMLElement {
       if (this._wasOpen) Sfx.play('menu-close');
       this._wasOpen = false;
       this._box.classList.remove('open');
+      // The fade-out keeps the panel visible for 0.24 s; inert takes it out of
+      // hit-testing and the tab order at once so it cannot catch a click meant for
+      // what lies underneath.
+      this._box.inert = true;
       this._unbindViewport();
       this._clearStagger();
       this.dispatchEvent(new CustomEvent('close', { bubbles: true }));
@@ -256,19 +270,24 @@ class TfMenu extends HTMLElement {
     // Below the anchor by default; flipping up only when it does not fit and
     // there is genuinely more room the other way keeps the reading order.
     const placeAbove = h > below && above > below;
-    const top = placeAbove ? Math.max(margin, a.top - gap - h) : a.bottom + gap;
-    box.setAttribute('data-placement', placeAbove ? 'top-end' : 'bottom-end');
     const room = placeAbove ? above : below;
-    if (h > room) box.style.maxHeight = `${Math.max(120, room)}px`;
-    box.style.overflowY = h > room ? 'auto' : '';
+    // A floor keeps a tiny gap from squeezing the list to nothing, but never
+    // above what the viewport itself can hold: the panel scrolls instead.
+    const floor = Math.min(120, Math.max(0, vh - 2 * margin));
+    const fitted = Math.min(h, Math.max(room, floor));
+    if (fitted < h) box.style.maxHeight = `${Math.floor(fitted)}px`;
+    box.style.overflowY = fitted < h ? 'auto' : '';
+    const wanted = placeAbove ? a.top - gap - fitted : a.bottom + gap;
+    const top = Math.min(Math.max(margin, wanted), Math.max(margin, vh - margin - fitted));
+    box.setAttribute('data-placement', placeAbove ? 'top-end' : 'bottom-end');
 
     const left = Math.min(Math.max(margin, a.right - w), vw - w - margin);
     box.style.top = `${Math.round(top)}px`;
     box.style.left = `${Math.round(Math.max(margin, left))}px`;
   }
 
-  // A fixed panel does not travel with its anchor, so a scroll or resize
-  // dismisses it rather than leaving it stranded over unrelated content.
+  // A fixed panel does not travel with its anchor, so a scroll that moves the
+  // anchor dismisses it rather than leaving it stranded over unrelated content.
   _bindViewport() {
     if (!this._anchor || this._viewportBound) return;
     this._viewportBound = true;
@@ -283,8 +302,24 @@ class TfMenu extends HTMLElement {
     window.removeEventListener('resize', this._onViewportChange);
   }
 
-  _onViewportChange() {
+  _onViewportChange(event) {
+    if (event.type !== 'scroll') { this.close(); return; }
+    const source = event.target;
+    // The panel scrolling inside itself moves nothing else.
+    if (source instanceof Node && (source === this || this.contains(source))) return;
+    const anchor = this._anchor;
+    const document_ = source === document || source === document.documentElement || source === document.body;
+    if (!document_ && !holdsAcrossShadows(source, anchor)) return;
+    // Focusing the trigger can scroll its own overflow container by a few pixels
+    // to bring it into view. That is not the reader leaving: follow the anchor
+    // while it is still on screen and only dismiss once it is not.
+    if (!document_ && this._anchorOnScreen(anchor)) { this._position(); return; }
     this.close();
+  }
+
+  _anchorOnScreen(anchor) {
+    const r = anchor.getBoundingClientRect();
+    return r.bottom > 0 && r.right > 0 && r.top < window.innerHeight && r.left < window.innerWidth;
   }
 
   _applyStagger() {
