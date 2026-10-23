@@ -50,8 +50,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   rekordu wykonania. Do bloku trafia wyłącznie tekst z mapowania `payload`
   (inny typ kończy się `BLOCK_INPUT_INVALID` przed granicą wysyłki). Błąd odczytu
   konta nie jest odmową: przed startem odkłada zadanie (`BLOCK_UNAVAILABLE`), a
-  po wyniku nie unieważnia go. Bez migracji: wywołanie bloku zapisuje się jako
-  `flow` z `flow_id = block:<typ>`. Eksport XML: `<tentaflow:service
+  po wyniku nie unieważnia go. Wywołanie bloku miało zapis `flow` z
+  `flow_id = block:<typ>`; od migracji 203 (B3.4a) ma własny
+  `implementation_kind = block`. Eksport XML: `<tentaflow:service
   implementation="block" nodeType>` z `<tentaflow:blockConfig>`; inspektor
   pozwala wybrać blok i wpisać jego ustawienia jako JSON.
   Blok z modelem podlega tym samym zasadom co czat: inicjator musi mieć dostęp
@@ -63,6 +64,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   kod, a blok usunięty z listy kończy się odmową dostępu. Własne ponowienia bloku
   LLM są wyłączone (jedna próba), `stop` ma najwyżej 4 napisy, a
   `reasoning_effort` jest jedną z wartości `low`, `medium`, `high`, `xhigh`, `max`.
+- Zadanie usługi może być krokiem agenta (B3.4a, ujście i wiązanie; wykonawca
+  dojdzie w B3.4b): `implementation` dostaje wariant `Agent { agent_id,
+  goal_expression, allowed_tools, max_iterations, output_schema }`, limit czasu
+  takiego zadania to 1..=3600 s, a jego wynik pochodzi ze zgłoszenia agenta, nie
+  z `result_expression` (model go odrzuca). Agent kończy krok narzędziem
+  `core.task_complete` (`outcome` = `completed`, `error` albo `needs_human`, `code`,
+  `summary`, `outputs`, `evidence`): krok, do którego należy, ustala serwer w
+  wiązaniu `process_activity` w metadanych przebiegu, nie argument, więc model nie
+  zgłosi cudzego zadania. Zgłoszenie jest sprawdzane na żywo (faza
+  `may_have_executed`, próba i ogrodzenie, otwarta instancja, przebieg o
+  identyfikatorze wyprowadzonym z wywołania), mieści się w limitach wyniku
+  kontraktowego, a `outputs` kroku `completed` muszą pasować do `output_schema`
+  (podzbiór JSON Schema). Pierwsze zgłoszenie jest ostateczne, drugie dostaje
+  `[TOOL_ERROR] already completed`; tabela `bpmn_agent_completions` odmawia
+  drugiego wiersza i każdej zmiany. Narzędzia przebiegu to przecięcie
+  `tools_json` agenta z `allowed_tools` kroku (w katalogu modelu i przy
+  wywołaniu), plus samo ujście; poza krokiem procesu ujście nie jest oferowane ani
+  wybieralne w edytorze agenta. Publikacja wymaga agenta włączonego,
+  z runtime `llm` (agent `cli` jest odrzucany), `allowed_tools` zawartych w jego
+  narzędziach i `max_iterations` nie większego niż agenta. Do czasu B3.4b zadanie
+  agenta uruchomione przez silnik kończy się `AGENT_EXECUTOR_UNAVAILABLE` przed
+  granicą wysyłki. Eksport XML: `implementation="agent" agentId maxIterations`
+  z `<tentaflow:agentConfig>`. Migracja 203 przebudowuje CHECK kolumny
+  `implementation_kind` (dozwolone `flow`, `addon_tool`, `block`, `agent`, każde
+  tylko z własnym prefiksem referencji) i tworzy `bpmn_agent_completions`.
 - Paleta projektanta BPMN ma grupę „Bloki TentaFlow” (B3.3a): przepływy, bloki
   Flow Buildera (`llm`, `embeddings`, `pii_filter`) i narzędzia addonów
   upuszcza się na płótno jako gotowe zadania usługi, z nazwą pozycji i bez pytania
