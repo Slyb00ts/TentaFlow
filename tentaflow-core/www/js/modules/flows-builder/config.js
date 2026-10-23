@@ -676,7 +676,11 @@ export class FlowConfig {
       const unavailable = config.flowId && !flows.some((flow) => flow.flowId === config.flowId);
       const tool = config.implementation?.AddonTool;
       const blockTask = config.implementation?.Block;
-      const source = blockTask
+      const agentTask = config.implementation?.Agent;
+      const source = agentTask
+        ? `<p class="fb-field-hint" data-agent-summary>${escapeHtml(I18n.t('bpmn.agent_summary', { agent: agentTask.agentId }))}</p>
+        <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.agent_hint'))}</p>`
+        : blockTask
         ? `<tf-select data-process="blockType" label="${escapeAttr(I18n.t('bpmn.block_type'))}" value="${escapeAttr(blockTask.nodeType)}" ${disabled}>${blocks.map((block) => `<option value="${escapeAttr(block.nodeType)}">${escapeHtml(processBlockLabel(block))}</option>`).join('')}${blocks.some((block) => block.nodeType === blockTask.nodeType) ? '' : `<option value="${escapeAttr(blockTask.nodeType)}" disabled>${escapeHtml(blockTask.nodeType)}</option>`}</tf-select>
         ${textarea('blockConfig', 'block_config', JSON.stringify(blockTask.config, null, 2), 5)}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.block_hint'))}</p>`
@@ -690,10 +694,11 @@ export class FlowConfig {
       if (!tabs.some(([id]) => id === this.processTab)) this.processTab = 'impl';
       const panel = servicePanel = (id, html) => `<section class="fb-process-panel" role="tabpanel" id="svc-panel-${id}" aria-labelledby="${id}" data-service-panel="${id}" ${this.processTab === id ? '' : 'hidden'}>${html}</section>`;
       servicePanels = `<tf-tabs variant="bar" layout="stacked" value="${this.processTab}" data-service-tabs>${tabs.map(([id, label, icon]) => `<tf-tab id="${id}" icon="${icon}" panel="svc-panel-${id}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" title="${escapeAttr(I18n.t(`bpmn.${label}_title`))}"></tf-tab>`).join('')}</tf-tabs>`
-        + panel('impl', `${blockTask ? `<tf-alert tone="warning" data-service-warning="empty_setting" message="${escapeAttr(processWarningText(node, 'empty_setting', blocks))}" ${processNodeWarnings(node, blocks).includes('empty_setting') ? '' : 'hidden'}></tf-alert>` : ''}<tf-select data-process="implementation" label="${escapeAttr(I18n.t('bpmn.service_implementation'))}" value="${blockTask ? 'block' : tool ? 'tool' : 'flow'}" ${disabled}>
+        + panel('impl', `${blockTask ? `<tf-alert tone="warning" data-service-warning="empty_setting" message="${escapeAttr(processWarningText(node, 'empty_setting', blocks))}" ${processNodeWarnings(node, blocks).includes('empty_setting') ? '' : 'hidden'}></tf-alert>` : ''}<tf-select data-process="implementation" label="${escapeAttr(I18n.t('bpmn.service_implementation'))}" value="${agentTask ? 'agent' : blockTask ? 'block' : tool ? 'tool' : 'flow'}" ${agentTask ? 'disabled' : disabled}>
           <option value="flow">${escapeHtml(I18n.t('bpmn.implementation_flow'))}</option>
           <option value="tool">${escapeHtml(I18n.t('bpmn.implementation_tool'))}</option>
           ${blocks.length || blockTask ? `<option value="block">${escapeHtml(I18n.t('bpmn.implementation_block'))}</option>` : ''}
+          ${agentTask ? `<option value="agent">${escapeHtml(I18n.t('bpmn.implementation_agent'))}</option>` : ''}
         </tf-select>
         ${source}`)
         + panel('io', `${mapping('inputMapping', 'input_mapping')}${mapping('outputMapping', 'output_mapping')}${this._renderActivityIo(node, kind, disabled)}`)
@@ -1304,6 +1309,8 @@ export class FlowConfig {
       } else if (key === 'targetDefinitionChoice' || key === 'targetStartChoice') {
         return;
       } else if (key === 'implementation') {
+        // An agent step has no editor yet: switching would silently replace its stored settings.
+        if (node.config.implementation?.Agent) return;
         // A Flow task never carries the field on the wire; 'Flow' is how the form says "back to default".
         const firstBlock = (this.opts.processOptions.serviceBlocks || [])[0];
         if (control.value === 'block' && !firstBlock) return;

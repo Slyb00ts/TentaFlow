@@ -107,9 +107,72 @@ pub(crate) fn agent_model(implementation: ServiceImplementation) -> ProcessModel
     model
 }
 
+/// Writes an `agent_runs` row the way the run manager does and moves it to
+/// `status`, so the sink has a run row to check.
+pub(crate) fn insert_run(
+    fixture: &Fixture,
+    run_id: &str,
+    agent_id: &str,
+    parent_run_id: Option<&str>,
+    correlation_id: Option<&str>,
+    status: &str,
+) {
+    let principal = AgentPrincipal::user(&fixture.owner.user_id);
+    crate::db::repository::create_agent_run(
+        &fixture.db,
+        &crate::db::models::NewAgentRun {
+            id: run_id,
+            agent_id,
+            parent_run_id,
+            flow_execution_id: None,
+            user_id: principal.user_id(),
+            org_id: principal.org_id.as_deref(),
+            prompt: "Summarise the case",
+            origin: principal.origin.as_str(),
+            actor_kind: principal.actor.kind().as_str(),
+            actor_id: principal.actor.id(),
+            actor_user_id: principal.actor.user_id(),
+            correlation_id,
+        },
+    )
+    .expect("insert the run row");
+    crate::db::repository::update_agent_run_status(
+        &fixture.db,
+        run_id,
+        &crate::db::models::AgentRunStatusUpdate {
+            status,
+            ..Default::default()
+        },
+    )
+    .expect("set the run status");
+}
+
 /// A started process whose agent step is claimed and past the dispatch
-/// boundary: the only state in which the sink may record a report.
+/// boundary, with the running top-level run the executor would have spawned for
+/// it: the only state in which the sink may record a report.
 pub(crate) fn running_step(
+    fixture: &Fixture,
+    implementation: ServiceImplementation,
+) -> (ClaimedProcessJob, ProcessActivityBinding) {
+    let ServiceImplementation::Agent { agent_id, .. } = &implementation else {
+        panic!("an agent step is needed");
+    };
+    let agent_id = agent_id.clone();
+    let (claimed, binding) = step_past_the_boundary(fixture, implementation);
+    insert_run(
+        fixture,
+        &binding.agent_run_id(),
+        &agent_id,
+        None,
+        Some(&binding.invocation_id),
+        "running",
+    );
+    (claimed, binding)
+}
+
+/// The same step before any run exists for it: the state in which the executor
+/// spawns the run.
+pub(crate) fn step_past_the_boundary(
     fixture: &Fixture,
     implementation: ServiceImplementation,
 ) -> (ClaimedProcessJob, ProcessActivityBinding) {
@@ -534,7 +597,10 @@ fn the_run_id_is_a_stable_function_of_the_invocation() {
 
 /// Runs the agent the way the process executor will: through the manager, with
 /// the binding handed to `spawn_with_run_id` as extra meta, and a scripted
-/// runner standing in for the model that reports through the sink.
+/// runner standing in for the model that reports through the sink. The runner
+/// reports under `scope`, the id the engine is executing (what the real
+/// `tool_exec` reads from `ExecutionContext::request_id`), never under an id it
+/// finds in meta.
 struct ReportingRunner {
     db: crate::db::DbPool,
     reports: Vec<Value>,
@@ -551,14 +617,13 @@ impl BackgroundFlowRunner for ReportingRunner {
         _deadline: Option<std::time::Instant>,
         _cancel: CancellationToken,
         _progress: Arc<dyn ProgressSink>,
-        _scope: String,
+        scope: String,
     ) -> anyhow::Result<AgentFlowOutcome> {
         let binding = binding_from_meta(&initial.meta).expect("the spawn carried the binding");
-        let run_id = initial.meta["agent_run_id"].as_str().unwrap().to_owned();
         let outcomes = self
             .reports
             .iter()
-            .map(|arguments| complete_task(&self.db, &binding, &run_id, arguments, now_ms()))
+            .map(|arguments| complete_task(&self.db, &binding, &scope, arguments, now_ms()))
             .collect();
         self.seen.send(outcomes).unwrap();
         Ok(AgentFlowOutcome {
@@ -574,7 +639,8 @@ impl BackgroundFlowRunner for ReportingRunner {
 async fn a_run_spawned_with_the_derived_id_and_the_binding_reports_through_the_sink() {
     let fixture = Fixture::new();
     seed_agent(&fixture, AGENT_ID, "[]", 10, true);
-    let (claimed, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+    let (claimed, binding) =
+        step_past_the_boundary(&fixture, agent_implementation(AGENT_ID, &[], None));
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let manager = Arc::new(AgentRunManager::new(
         fixture.db.clone(),
@@ -590,7 +656,8 @@ async fn a_run_spawned_with_the_derived_id_and_the_binding_reports_through_the_s
         2,
     ));
     manager.attach_self();
-    let principal = AgentPrincipal::user(&fixture.owner.user_id);
+    let principal = AgentPrincipal::user(&fixture.owner.user_id)
+        .with_correlation_id(Some(binding.invocation_id.clone()));
 
     let run_id = manager
         .spawn_with_run_id(
@@ -622,11 +689,15 @@ async fn a_run_spawned_with_the_derived_id_and_the_binding_reports_through_the_s
     assert_eq!(completions(&fixture)[0].1, run_id);
 }
 
-#[tokio::test]
-async fn a_run_with_another_id_cannot_report_for_the_step() {
-    let fixture = Fixture::new();
-    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
-    let (_, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+/// Spawns a run through the manager with a runner that tries to report the
+/// given arguments, and returns what the sink answered.
+async fn reports_from_a_spawned_run(
+    fixture: &Fixture,
+    spawn: impl FnOnce(
+        Arc<AgentRunManager>,
+        AgentPrincipal,
+    ) -> futures::future::BoxFuture<'static, String>,
+) -> Vec<Result<Value, String>> {
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let manager = Arc::new(AgentRunManager::new(
         fixture.db.clone(),
@@ -639,31 +710,158 @@ async fn a_run_with_another_id_cannot_report_for_the_step() {
         2,
     ));
     manager.attach_self();
-    let principal = AgentPrincipal::user(&fixture.owner.user_id);
-    // `spawn` mints its own id: a run nobody derived from the invocation.
-    let run_id = manager
-        .spawn(
-            AGENT_ID,
-            "hijack",
-            None,
-            &principal,
-            &[],
-            &[binding.meta_entry()],
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    let run_id = spawn(
+        manager.clone(),
+        AgentPrincipal::user(&fixture.owner.user_id),
+    )
+    .await;
     manager
         .await_run(&run_id, Duration::from_secs(10))
         .await
         .unwrap();
-    let outcomes = receiver.recv().await.unwrap();
+    receiver.recv().await.unwrap()
+}
+
+#[tokio::test]
+async fn a_run_with_a_forged_binding_and_an_id_of_its_own_cannot_report_for_the_step() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    let (_, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+    // `spawn` mints its own id: a run nobody derived from the invocation, whose
+    // meta nevertheless carries the genuine binding.
+    let outcomes = reports_from_a_spawned_run(&fixture, |manager, principal| {
+        let entry = binding.meta_entry();
+        Box::pin(async move {
+            manager
+                .spawn(
+                    AGENT_ID,
+                    "hijack",
+                    None,
+                    &principal,
+                    &[],
+                    &[entry],
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+        })
+    })
+    .await;
     assert!(outcomes[0]
         .as_ref()
         .unwrap_err()
         .contains("was not started for the step"));
     assert!(completions(&fixture).is_empty());
+}
+
+#[tokio::test]
+async fn naming_the_derived_run_id_in_meta_does_not_make_a_run_the_step_run() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    let (_, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+    // The forged run copies both meta entries a flow node can write, but the id
+    // the engine executes it under is its own.
+    let outcomes = reports_from_a_spawned_run(&fixture, |manager, principal| {
+        let entries = [
+            binding.meta_entry(),
+            ("agent_run_id", json!(binding.agent_run_id())),
+        ];
+        Box::pin(async move {
+            manager
+                .spawn(
+                    AGENT_ID,
+                    "hijack",
+                    None,
+                    &principal,
+                    &[],
+                    &entries,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+        })
+    })
+    .await;
+    assert!(outcomes[0]
+        .as_ref()
+        .unwrap_err()
+        .contains("was not started for the step"));
+    assert!(completions(&fixture).is_empty());
+}
+
+#[test]
+fn only_the_running_top_level_run_of_the_pinned_agent_for_this_invocation_may_report() {
+    const OTHER_AGENT: &str = "99999999-2222-4333-8444-555555555555";
+    let cases: [(&str, &dyn Fn(&Fixture, &ProcessActivityBinding)); 6] = [
+        ("another agent", &|fixture, binding| {
+            seed_agent(fixture, OTHER_AGENT, "[]", 10, true);
+            insert_run(
+                fixture,
+                &binding.agent_run_id(),
+                OTHER_AGENT,
+                None,
+                Some(&binding.invocation_id),
+                "running",
+            );
+        }),
+        ("a sub-agent", &|fixture, binding| {
+            insert_run(fixture, "parent-run", AGENT_ID, None, None, "running");
+            insert_run(
+                fixture,
+                &binding.agent_run_id(),
+                AGENT_ID,
+                Some("parent-run"),
+                Some(&binding.invocation_id),
+                "running",
+            );
+        }),
+        ("another invocation's run", &|fixture, binding| {
+            insert_run(
+                fixture,
+                &binding.agent_run_id(),
+                AGENT_ID,
+                None,
+                Some("another-invocation"),
+                "running",
+            );
+        }),
+        ("a run without a correlation", &|fixture, binding| {
+            insert_run(
+                fixture,
+                &binding.agent_run_id(),
+                AGENT_ID,
+                None,
+                None,
+                "running",
+            );
+        }),
+        ("a run that is not running", &|fixture, binding| {
+            insert_run(
+                fixture,
+                &binding.agent_run_id(),
+                AGENT_ID,
+                None,
+                Some(&binding.invocation_id),
+                "completed",
+            );
+        }),
+        ("no run row at all", &|_, _| {}),
+    ];
+    for (name, make_run) in cases {
+        let fixture = Fixture::new();
+        seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+        let (_, binding) =
+            step_past_the_boundary(&fixture, agent_implementation(AGENT_ID, &[], None));
+        make_run(&fixture, &binding);
+        let refusal = report(&fixture, &binding, finished("x", json!({}))).unwrap_err();
+        assert!(
+            refusal.contains("was not started for the step"),
+            "{name}: {refusal}"
+        );
+        assert!(completions(&fixture).is_empty(), "{name}");
+    }
 }
 
 // --- Publication ---------------------------------------------------------------

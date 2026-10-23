@@ -6,6 +6,13 @@
 // call belongs to is not a tool argument: the process layer mints a binding into
 // `envelope.meta["process_activity"]` when it spawns the run (as Project Studio
 // does with `ps_generation`), so a model cannot report for another activity.
+//
+// Meta is writable by every node of a flow (an addon block deserializes the whole
+// envelope), so the binding only says "this run claims a step". What the sink
+// believes comes from the database: the reporting run is the one the flow engine
+// is executing (`ExecutionContext::request_id`, never meta), and its `agent_runs`
+// row must be the running, top-level run of the step's pinned agent that was
+// started for this very invocation.
 
 use std::collections::BTreeMap;
 
@@ -13,7 +20,7 @@ use anyhow::Result;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use tentaflow_protocol::processes::{ActivityOutcome, ActivityResult};
+use tentaflow_protocol::processes::{parse_agent_source_ref, ActivityOutcome, ActivityResult};
 use uuid::Uuid;
 
 use super::jobs::parse_contract_result;
@@ -27,6 +34,8 @@ pub const PROCESS_ACTIVITY_META_KEY: &str = "process_activity";
 /// Largest output schema an agent step may carry; larger ones are refused at
 /// publication so the sink never compiles an unbounded document per call.
 pub const MAX_OUTPUT_SCHEMA_BYTES: usize = 64 * 1024;
+
+const NOT_THIS_RUN: &str = "this run was not started for the step it reports on";
 
 const REPORT_KEYS: [&str; 5] = ["outcome", "code", "summary", "outputs", "evidence"];
 
@@ -79,10 +88,44 @@ pub fn agent_run_id(invocation_id: &str) -> String {
     Uuid::new_v5(&NAMESPACE, invocation_id.as_bytes()).to_string()
 }
 
+/// What run meta says about a process step. A malformed entry is its own case:
+/// it must narrow a run to nothing, never read as "no step" and hand back the
+/// agent's full tool list.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetaBinding {
+    Absent,
+    Valid(ProcessActivityBinding),
+    Malformed,
+}
+
+pub fn binding_in_meta(meta: &BTreeMap<String, Value>) -> MetaBinding {
+    match meta.get(PROCESS_ACTIVITY_META_KEY) {
+        None => MetaBinding::Absent,
+        Some(value) => match serde_json::from_value(value.clone()) {
+            Ok(binding) => MetaBinding::Valid(binding),
+            Err(_) => MetaBinding::Malformed,
+        },
+    }
+}
+
 /// Reads the binding from run meta. Absent or malformed means the run was not
 /// spawned for a process step, and the sink must refuse.
 pub fn binding_from_meta(meta: &BTreeMap<String, Value>) -> Option<ProcessActivityBinding> {
-    serde_json::from_value(meta.get(PROCESS_ACTIVITY_META_KEY)?.clone()).ok()
+    match binding_in_meta(meta) {
+        MetaBinding::Valid(binding) => Some(binding),
+        MetaBinding::Absent | MetaBinding::Malformed => None,
+    }
+}
+
+/// The tools a run may hand on to a sub-agent besides the agent's own limit:
+/// `None` outside a process step, the step's list inside one, nothing at all
+/// for a binding that cannot be read.
+pub fn step_tool_list(meta: &BTreeMap<String, Value>) -> Option<Vec<String>> {
+    match binding_in_meta(meta) {
+        MetaBinding::Absent => None,
+        MetaBinding::Valid(binding) => Some(binding.allowed_tools),
+        MetaBinding::Malformed => Some(Vec::new()),
+    }
 }
 
 /// Why a report could not be recorded.
@@ -93,6 +136,9 @@ pub enum CompletionError {
     NotLive,
     /// The invocation already has its final report.
     AlreadyCompleted,
+    /// The calling run is not the running, top-level run that was started for
+    /// this invocation of its pinned agent.
+    NotThisRun,
     Storage(anyhow::Error),
 }
 
@@ -108,9 +154,12 @@ impl From<anyhow::Error> for CompletionError {
     }
 }
 
-/// Writes the final report of an invocation. The live check and the insert are
-/// one transaction: a report cannot be accepted for a step that closed between
-/// the two, and of two simultaneous reports only one gets the row.
+/// Writes the final report of an invocation. The live check, the check of the
+/// reporting run and the insert are one transaction: a report cannot be accepted
+/// for a step that closed between them, and of two simultaneous reports only one
+/// gets the row. Nothing the run claims in meta is taken on trust here: the run
+/// row must exist, be running and top-level, belong to the agent the invocation
+/// pinned, and carry this invocation as its correlation id.
 fn record_completion(
     pool: &DbPool,
     binding: &ProcessActivityBinding,
@@ -120,9 +169,9 @@ fn record_completion(
 ) -> std::result::Result<(), CompletionError> {
     let mut conn = pool.write().map_err(|error| anyhow::anyhow!(error))?;
     let tx = conn.transaction()?;
-    let job_id: Option<String> = tx
+    let live: Option<(String, String)> = tx
         .query_row(
-            "SELECT v.job_id FROM bpmn_service_invocations v \
+            "SELECT v.job_id, v.flow_id FROM bpmn_service_invocations v \
              JOIN bpmn_jobs j ON j.job_id=v.job_id \
              WHERE v.invocation_id=?1 AND v.instance_id=?2 AND v.node_id=?3 \
                AND v.implementation_kind='agent' AND v.phase='may_have_executed' \
@@ -136,14 +185,24 @@ fn record_completion(
                 binding.attempt,
                 i64::try_from(binding.fence).map_err(|error| anyhow::anyhow!(error))?
             ],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some(job_id) = job_id else {
+    let Some((job_id, source_ref)) = live else {
         return Err(CompletionError::NotLive);
     };
     if !job_activation_live_on(&tx, &job_id)? {
         return Err(CompletionError::NotLive);
+    }
+    let pinned_agent = parse_agent_source_ref(&source_ref);
+    let run_matches: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE id=?1 AND agent_id=?2 \
+         AND status='running' AND parent_run_id IS NULL AND correlation_id=?3)",
+        params![run_id, pinned_agent, binding.invocation_id],
+        |row| row.get(0),
+    )?;
+    if !run_matches {
+        return Err(CompletionError::NotThisRun);
     }
     let taken: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM bpmn_agent_completions WHERE invocation_id=?1)",
@@ -258,8 +317,9 @@ pub fn validate_output_schema(schema: &Value) -> Result<()> {
         .map_err(|error| anyhow::anyhow!("the output schema is not supported: {error}"))
 }
 
-/// Executes one `core.task_complete` call. `run_id` is the id of the calling
-/// run (server-owned meta, never a model argument). An `Err` is the text of a
+/// Executes one `core.task_complete` call. `run_id` is the id of the run the
+/// flow engine is executing (`ExecutionContext::request_id`; never meta and never
+/// a model argument). An `Err` is the text of a
 /// `[TOOL_ERROR]` the model can act on; nothing about the process leaks into it
 /// beyond what the model itself sent.
 pub fn complete_task(
@@ -270,11 +330,12 @@ pub fn complete_task(
     at_ms: i64,
 ) -> std::result::Result<Value, String> {
     if run_id != binding.agent_run_id() {
-        return Err("this run was not started for the step it reports on".into());
+        return Err(NOT_THIS_RUN.into());
     }
     let result = report_from_arguments(arguments, binding.output_schema.as_ref())?;
     match record_completion(pool, binding, run_id, &result, at_ms) {
         Ok(()) => Ok(json!({ "recorded": true })),
+        Err(CompletionError::NotThisRun) => Err(NOT_THIS_RUN.into()),
         Err(CompletionError::NotLive) => {
             Err("this step is no longer running, so the report was not recorded".into())
         }

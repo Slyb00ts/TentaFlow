@@ -1324,11 +1324,16 @@ fn bpmn_agent_completions_and_invocation_kinds(
     version: i64,
     name: &str,
 ) -> Result<()> {
+    let original_fk: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
     conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
     let result = (|| -> Result<()> {
         let fk_disabled: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
         anyhow::ensure!(fk_disabled == 0, "agent migration requires foreign keys disabled");
         let tx = conn.unchecked_transaction()?;
+        anyhow::ensure!(
+            foreign_key_check(&tx)?.is_empty(),
+            "agent migration refuses an invalid existing foreign key"
+        );
         rebuild_service_invocations_with_widened_kinds(&tx)?;
         tx.execute_batch(BPMN_AGENT_COMPLETIONS)?;
         let violations = foreign_key_check(&tx)?;
@@ -1346,16 +1351,25 @@ fn bpmn_agent_completions_and_invocation_kinds(
         tx.commit()?;
         Ok(())
     })();
+    let restore = if original_fk == 0 {
+        "PRAGMA foreign_keys = OFF;"
+    } else {
+        "PRAGMA foreign_keys = ON;"
+    };
     let restored = conn
-        .execute_batch("PRAGMA foreign_keys = ON;")
+        .execute_batch(restore)
         .and_then(|()| conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0)));
-    match result {
-        Err(error) => Err(error),
-        Ok(()) => {
-            let enabled = restored?;
-            anyhow::ensure!(enabled == 1, "agent migration could not restore foreign keys");
-            Ok(())
+    match (result, restored) {
+        (Ok(()), Ok(mode)) if mode == original_fk => Ok(()),
+        (Ok(()), Ok(_)) => anyhow::bail!("agent migration could not restore foreign key mode"),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Err(error), Ok(mode)) if mode == original_fk => Err(error),
+        (Err(error), Ok(_)) => {
+            Err(error.context("agent migration could not restore foreign key mode"))
         }
+        (Err(error), Err(restore)) => Err(error.context(format!(
+            "agent migration could not restore foreign key mode: {restore}"
+        ))),
     }
 }
 
@@ -17215,6 +17229,68 @@ mod tests {
             2
         );
         assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    /// A foreign key that was already broken is refused before anything is rebuilt,
+    /// with a message that says so, and the connection keeps the mode it came with.
+    #[test]
+    fn migration_203_refuses_an_existing_foreign_key_violation_before_rebuilding() {
+        let conn = agent_invocation_fixture();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        insert_invocation(&conn, "inv-orphan", "flow-1", "flow").unwrap();
+        conn.execute("DELETE FROM bpmn_jobs", []).unwrap();
+        assert!(!foreign_key_check(&conn).unwrap().is_empty());
+        let table_before: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='bpmn_service_invocations'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        let error = bpmn_agent_completions_and_invocation_kinds(&conn, 203, "x").unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("refuses an invalid existing foreign key"),
+            "{error:#}"
+        );
+        let table_after: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='bpmn_service_invocations'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_after, table_before);
+        assert!(!table_exists(&conn, "bpmn_agent_completions").unwrap());
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    /// The rung gives the connection back in the foreign key mode it received.
+    #[test]
+    fn migration_203_restores_the_foreign_key_mode_it_found() {
+        for original in [0_i64, 1] {
+            let conn = agent_invocation_fixture();
+            conn.execute_batch(&format!("PRAGMA foreign_keys = {original};"))
+                .unwrap();
+            bpmn_agent_completions_and_invocation_kinds(
+                &conn,
+                203,
+                "bpmn_agent_completions_and_invocation_kinds",
+            )
+            .unwrap();
+            assert_eq!(
+                conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                original
+            );
+        }
     }
 
     /// v179 on a database at v178: subjects (deprecations, generation) and

@@ -29,6 +29,7 @@ use crate::flow_engine::subflow_runner::{SubflowRunnerSlot, MAX_SUBFLOW_DEPTH};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 use crate::agents::AgentServiceSlot;
+use crate::processes::agent_sink::PROCESS_ACTIVITY_META_KEY;
 
 const NODE_TYPE: &str = "agent";
 
@@ -168,6 +169,12 @@ impl AgentNodeAdapter {
         child_input
             .meta
             .insert("agent_id".into(), Value::String(agent.id.clone()));
+        // The nested agent is a run of its own. Letting it inherit the caller's
+        // run id or process-step binding would make it indistinguishable from the
+        // run that owns them: it would reuse the caller's run row and could claim
+        // the caller's process step.
+        child_input.meta.remove("agent_run_id");
+        child_input.meta.remove(PROCESS_ACTIVITY_META_KEY);
 
         // Clamp the harness flow's deadline to the agent's own budget (§3.7).
         let mut child_ctx = ctx.clone();
@@ -230,7 +237,11 @@ impl NodeAdapter for AgentNodeAdapter {
             .map(|i| (*i.envelope).clone())
             .unwrap_or_else(|| (*ctx.initial_envelope).clone());
         out.payload = FlowValue::Text(final_text);
-        out.meta.insert("agent_run_id".into(), agent_run_id);
+        // A caller that is itself an agent run keeps its own id; the nested
+        // run's id only fills the gap for a flow that has none.
+        if !out.meta.contains_key("agent_run_id") {
+            out.meta.insert("agent_run_id".into(), agent_run_id);
+        }
         out.meta.insert("agent_exit_reason".into(), exit_reason);
 
         Ok(out)
@@ -556,6 +567,53 @@ mod tests {
         assert_eq!(out.context.messages[0].text(), Some("parent msg"));
         // Internal control signals must not leak either.
         assert!(out.meta.get("harness_done").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_nested_agent_inherits_neither_the_callers_run_id_nor_its_process_step() {
+        let pool = db();
+        seed_agent(&pool, "agent-n", "nested", None, true);
+        let svc = service(pool.clone());
+        let (_registry, runner) = registry_and_runner(pool.clone());
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert("agent_run_id".into(), json!("caller-run"));
+        env.meta.insert(
+            crate::processes::agent_sink::PROCESS_ACTIVITY_META_KEY.into(),
+            json!({"invocation_id": "inv"}),
+        );
+        env.meta.insert("unrelated".into(), json!("kept"));
+
+        let adapter = AgentNodeAdapter::new(svc, runner);
+        let (_, child, _, _) = adapter
+            .prepare(
+                &node(json!({"agent_id": "agent-n"})),
+                &[input(env.clone())],
+                &stub_ctx(),
+            )
+            .await
+            .expect("prepare");
+        assert!(child.meta.get("agent_run_id").is_none());
+        assert!(child
+            .meta
+            .get(crate::processes::agent_sink::PROCESS_ACTIVITY_META_KEY)
+            .is_none());
+        assert_eq!(child.meta.get("agent_id"), Some(&json!("agent-n")));
+        assert_eq!(child.meta.get("unrelated"), Some(&json!("kept")));
+
+        // The caller keeps its own identity: the nested run's id does not
+        // overwrite it on the way out.
+        let flow_id = "aaaaaaaa-agnt-0000-0000-000000000002";
+        insert_flow(&pool, flow_id, "agent-run", &harness_flow_json(), "active");
+        seed_agent(&pool, "agent-m", "nested-2", Some(flow_id), true);
+        let out = adapter
+            .execute(
+                &node(json!({"agent_id": "agent-m"})),
+                &[input(env)],
+                &stub_ctx(),
+            )
+            .await
+            .expect("execute");
+        assert_eq!(out.meta.get("agent_run_id"), Some(&json!("caller-run")));
     }
 
     #[tokio::test]

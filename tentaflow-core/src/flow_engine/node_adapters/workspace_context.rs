@@ -103,7 +103,8 @@ impl WorkspaceContextNodeAdapter {
 
     /// The Code Studio verbs the running agent may actually call, in catalog
     /// order. Derived from the agent's `tools_json` allowlist — the same first
-    /// sieve the tool_exec block enforces (§10), so the context can never
+    /// sieve the tool_exec block enforces (§10), narrowed by a process step's
+    /// own list the way the dispatcher narrows it, so the context can never
     /// advertise a verb the dispatcher would reject.
     fn harness_tools(envelope: &FlowEnvelope, service: &AgentService) -> Vec<String> {
         let Some(agent_id) = envelope.meta.get("agent_id").and_then(|v| v.as_str()) else {
@@ -117,7 +118,7 @@ impl WorkspaceContextNodeAdapter {
             .iter()
             .filter(|tool| tool.is_code_studio())
             .map(|tool| tool.public_name())
-            .filter(|name| crate::agents::tool_in_allowlist(&tools_json, name, None))
+            .filter(|name| service.tool_allowed_in_run(&tools_json, &envelope.meta, name))
             .map(str::to_string)
             .collect()
     }
@@ -469,6 +470,63 @@ mod tests {
     fn context_names_grep_as_the_authoritative_search() {
         let rendered = render(&facts(), &[]);
         assert!(rendered.contains("core.fs_grep is the authoritative search"));
+    }
+
+    #[tokio::test]
+    async fn a_process_step_advertises_only_the_verbs_inside_its_own_list() {
+        let fixture = crate::processes::runtime::test_support::Fixture::new();
+        crate::processes::agent_sink_tests::seed_agent(
+            &fixture,
+            crate::processes::agent_sink_tests::AGENT_ID,
+            r#"["core.fs_read","core.exec"]"#,
+            10,
+            true,
+        );
+        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
+        let addon_manager = std::sync::Arc::new(
+            crate::addon::AddonManager::new(fixture.db.clone(), cipher).expect("addon manager"),
+        );
+        let service = AgentService::new(fixture.db.clone(), addon_manager);
+        let envelope = |binding: Option<(&'static str, Value)>| {
+            let mut envelope = FlowEnvelope::empty();
+            envelope.meta.insert(
+                "agent_id".into(),
+                Value::String(crate::processes::agent_sink_tests::AGENT_ID.into()),
+            );
+            if let Some((key, value)) = binding {
+                envelope.meta.insert(key.into(), value);
+            }
+            envelope
+        };
+        let bound = crate::processes::agent_sink::ProcessActivityBinding {
+            invocation_id: "inv".into(),
+            instance_id: "ins".into(),
+            node_id: "n".into(),
+            attempt: 1,
+            fence: 1,
+            allowed_tools: vec!["core.fs_read".into()],
+            output_schema: None,
+        };
+
+        assert_eq!(
+            WorkspaceContextNodeAdapter::harness_tools(&envelope(None), &service),
+            ["core.fs_read", "core.exec"]
+        );
+        assert_eq!(
+            WorkspaceContextNodeAdapter::harness_tools(
+                &envelope(Some(bound.meta_entry())),
+                &service
+            ),
+            ["core.fs_read"]
+        );
+        let broken = (
+            "process_activity",
+            serde_json::json!({"invocation_id": "inv"}),
+        );
+        assert!(
+            WorkspaceContextNodeAdapter::harness_tools(&envelope(Some(broken)), &service)
+                .is_empty()
+        );
     }
 
     #[test]

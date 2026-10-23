@@ -15,7 +15,7 @@ use crate::compliance::ai_gateway::{AiGateway, ToolExecution};
 use crate::db::{models::DbAgent, repository, DbPool};
 use crate::flow_engine::dispatchers::LlmToolSpec;
 use crate::flow_engine::envelope::LlmToolCall;
-use crate::processes::agent_sink::binding_from_meta;
+use crate::processes::agent_sink::{binding_in_meta, MetaBinding};
 
 use super::builtins::{execute_core_tool, is_core_tool, CoreToolName};
 use super::catalog::{tool_in_allowlist, ToolCatalog};
@@ -352,7 +352,9 @@ impl AgentService {
     /// limited to the agent's allow-list AND the step's own list (the
     /// intersection), and `core.task_complete` is open to it alone. Any other run
     /// is judged by the agent's list; the completion tool is never advertised to
-    /// it and refuses to run (the sink checks the binding itself).
+    /// it and refuses to run (the sink checks the binding itself). A binding that
+    /// is present but unreadable admits nothing, so damaging the entry can only
+    /// shrink a run's surface.
     pub fn tool_allowed_in_run(
         &self,
         tools_json: &str,
@@ -360,9 +362,10 @@ impl AgentService {
         name: &str,
     ) -> bool {
         let sink = CoreToolName::TaskComplete.public_name();
-        match binding_from_meta(meta) {
-            None => self.tool_allowed(tools_json, name),
-            Some(binding) => {
+        match binding_in_meta(meta) {
+            MetaBinding::Absent => self.tool_allowed(tools_json, name),
+            MetaBinding::Malformed => false,
+            MetaBinding::Valid(binding) => {
                 name == sink
                     || (self.tool_allowed(tools_json, name)
                         && self.tool_allowed(&binding.allowed_tools_json(), name))
@@ -380,10 +383,14 @@ impl AgentService {
     ) -> Vec<LlmToolSpec> {
         let sink = CoreToolName::TaskComplete;
         specs.retain(|spec| spec.name != sink.public_name());
-        if let Some(binding) = binding_from_meta(meta) {
-            let allowed = binding.allowed_tools_json();
-            specs.retain(|spec| self.tool_allowed(&allowed, &spec.name));
-            specs.push(sink.spec());
+        match binding_in_meta(meta) {
+            MetaBinding::Absent => {}
+            MetaBinding::Malformed => specs.clear(),
+            MetaBinding::Valid(binding) => {
+                let allowed = binding.allowed_tools_json();
+                specs.retain(|spec| self.tool_allowed(&allowed, &spec.name));
+                specs.push(sink.spec());
+            }
         }
         specs
     }
@@ -409,9 +416,17 @@ impl AgentService {
     /// A flow author dropping an `exec_command` block into the harness of a
     /// read-only agent must get the agent's answer, not the graph's: the block
     /// therefore passes exactly the sieve a model-issued call passes.
-    pub fn require_core_tool(&self, agent_id: Option<&str>, tool: CoreToolName) -> Result<()> {
+    ///
+    /// The sieve is the run's own ([`Self::tool_allowed_in_run`]): inside a
+    /// process step a graph block may not out-run the step's tool list either.
+    pub fn require_core_tool(
+        &self,
+        meta: &BTreeMap<String, serde_json::Value>,
+        tool: CoreToolName,
+    ) -> Result<()> {
         let name = tool.public_name();
-        if self.tool_allowed(&self.agent_tools_json(agent_id), name) {
+        let agent_id = meta.get("agent_id").and_then(|v| v.as_str());
+        if self.tool_allowed_in_run(&self.agent_tools_json(agent_id), meta, name) {
             return Ok(());
         }
         let who = match agent_id {
@@ -506,7 +521,7 @@ fn error_result(call: &LlmToolCall, error: String) -> ToolCallResult {
 mod tests {
     use super::*;
     use crate::db::migrations;
-    use crate::db::models::SkillParams;
+    use crate::db::models::{AgentParams, SkillParams};
 
     fn db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
@@ -708,6 +723,84 @@ mod tests {
         assert!(!svc.tool_allowed_in_run(agent_tools, &BTreeMap::new(), "core.task_complete"));
         // Without a binding the agent's own list decides.
         assert!(svc.tool_allowed_in_run(agent_tools, &BTreeMap::new(), "core.ask_user"));
+    }
+
+    fn malformed_binding() -> BTreeMap<String, serde_json::Value> {
+        BTreeMap::from([(
+            "process_activity".to_owned(),
+            serde_json::json!({"invocation_id": "inv"}),
+        )])
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_binding_admits_no_tool_instead_of_the_agents_full_list() {
+        let svc = service(db());
+        let agent_tools = r#"["core.skill_view","core.ask_user"]"#;
+        let broken = malformed_binding();
+        for name in ["core.skill_view", "core.ask_user", "core.task_complete"] {
+            assert!(
+                !svc.tool_allowed_in_run(agent_tools, &broken, name),
+                "{name}"
+            );
+        }
+        let catalog =
+            svc.tool_catalog_from_allowlist(agent_tools, &AgentPrincipal::user("u1"), false);
+        assert!(!catalog.is_empty());
+        assert!(svc.narrow_catalog_for_run(catalog, &broken).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_graph_block_runs_a_core_verb_only_inside_the_step_list_too() {
+        let pool = db();
+        let agent_id = "55555555-0000-0000-0000-000000000001";
+        repository::upsert_agent(
+            &pool,
+            &AgentParams {
+                runtime_json: crate::agents::LLM_RUNTIME_JSON,
+                id: agent_id,
+                name: "stepper",
+                display_name: None,
+                description: "d",
+                system_prompt: None,
+                model: None,
+                tools_json: r#"["core.exec","core.git_commit"]"#,
+                skills_json: "{}",
+                params_json: "{}",
+                max_iterations: 5,
+                timeout_secs: 600,
+                max_subagents: 0,
+                max_spawn_depth: 1,
+                flow_id: None,
+                routable: false,
+                is_enabled: true,
+                on_child_complete: "notify",
+                allowed_agents_json: None,
+                actor_user_id: None,
+            },
+        )
+        .expect("seed agent");
+        let svc = service(pool);
+        let with_meta = |extra: Option<BTreeMap<String, serde_json::Value>>| {
+            let mut meta = extra.unwrap_or_default();
+            meta.insert("agent_id".into(), serde_json::json!(agent_id));
+            meta
+        };
+
+        // Outside a step the agent's own list decides.
+        assert!(svc
+            .require_core_tool(&with_meta(None), CoreToolName::Exec)
+            .is_ok());
+        // A step that lists only the commit verb takes exec away from the block.
+        let step = with_meta(Some(binding(&["core.git_commit"])));
+        assert!(svc.require_core_tool(&step, CoreToolName::Exec).is_err());
+        assert!(svc
+            .require_core_tool(&step, CoreToolName::GitCommit)
+            .is_ok());
+        // An unreadable binding takes everything away.
+        let broken = with_meta(Some(malformed_binding()));
+        assert!(svc
+            .require_core_tool(&broken, CoreToolName::GitCommit)
+            .is_err());
     }
 
     #[tokio::test]

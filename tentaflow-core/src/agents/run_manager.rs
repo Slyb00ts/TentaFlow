@@ -36,7 +36,7 @@ use crate::flow_engine::dispatchers::{ProgressEvent, ProgressSink};
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, TokenUsage};
 use crate::flow_engine::progress_broker::ProgressBroker;
 
-use super::catalog::tool_in_allowlist;
+use super::catalog::{allowlist_admits_entry, tool_in_allowlist};
 use super::principal::AgentPrincipal;
 
 /// Global concurrency cap setting key and default (§3.6). Bounds how many
@@ -614,8 +614,17 @@ impl AgentRunManager {
             ));
         }
 
-        let parent_tools: Vec<String> =
-            serde_json::from_str(&parent.tools_json).unwrap_or_default();
+        // A caller bound to a process step may hand on only what the step lets it
+        // use: the agent's list narrowed to the step's, so a child's own list
+        // (checked as a subset of this one) cannot exceed what the step allows.
+        let inherited_tools: Vec<String> = match &caller.step_tools {
+            None => serde_json::from_str(&parent.tools_json).unwrap_or_default(),
+            Some(step_tools) => step_tools
+                .iter()
+                .filter(|entry| allowlist_admits_entry(&parent.tools_json, entry))
+                .cloned()
+                .collect(),
+        };
 
         // Every child is resolved before any of them starts, because the
         // session rows below are registered for the whole batch at once and a
@@ -684,7 +693,7 @@ impl AgentRunManager {
                     &child.prompt,
                     Some(&caller.run_id),
                     &caller.principal,
-                    &parent_tools,
+                    &inherited_tools,
                     &extra_meta,
                     caller.session_id.as_deref(),
                     // A sub-agent runs ITS OWN harness, not the caller's: the
@@ -1207,6 +1216,11 @@ pub struct CallerRun {
     /// cannot name a workspace, and a caller outside Code Studio has `None`, so
     /// spawning never grants access that the parent did not already hold.
     pub code_session: Option<Value>,
+    /// The tool list of the process step the calling run is bound to, `None`
+    /// outside one. Delegation is limited to it (an unreadable binding is an empty
+    /// list), and the child is given no binding of its own, so it can neither
+    /// report for the step nor outgrow the list.
+    pub step_tools: Option<Vec<String>>,
 }
 
 /// One child of a delegation, resolved and given its run id before anything is
@@ -1252,6 +1266,7 @@ impl CallerRun {
             principal,
             session_id,
             code_session,
+            step_tools: crate::processes::agent_sink::step_tool_list(&envelope.meta),
         }
     }
 }
@@ -2069,6 +2084,7 @@ mod tests {
             principal: principal.clone(),
             session_id: None,
             code_session: None,
+            step_tools: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
@@ -2205,6 +2221,7 @@ mod tests {
                 principal: principal.clone(),
                 session_id: None,
                 code_session: None,
+                step_tools: None,
             });
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -2270,6 +2287,7 @@ mod tests {
             principal,
             session_id: None,
             code_session: None,
+            step_tools: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "t"}))
@@ -2302,6 +2320,7 @@ mod tests {
             principal: principal.clone(),
             session_id: None,
             code_session: None,
+            step_tools: None,
         };
 
         // First child fits max_subagents=1.
@@ -2343,6 +2362,7 @@ mod tests {
             principal,
             session_id: None,
             code_session: None,
+            step_tools: None,
         };
         let grand = mgr
             .handle_agent_spawn(&mid_caller, &json!({"agent_name": "worker", "task": "g"}))
@@ -2369,6 +2389,7 @@ mod tests {
             principal,
             session_id: None,
             code_session: None,
+            step_tools: None,
         };
         let out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "x"}))
@@ -2378,6 +2399,88 @@ mod tests {
             "child tool outside parent surface must reject"
         );
         assert!(out.unwrap_err().to_string().contains("tool surface"));
+    }
+
+    #[tokio::test]
+    async fn a_run_bound_to_a_process_step_delegates_only_inside_the_step_list() {
+        let pool = db();
+        seed_agent(
+            &pool,
+            "parent",
+            "boss",
+            r#"["memory.memory_search","contacts.lookup"]"#,
+            4,
+            2,
+        );
+        seed_agent(&pool, "child", "worker", r#"["contacts.lookup"]"#, 0, 1);
+        let mgr = manager(pool.clone(), Arc::new(InstantRunner), 8);
+        let principal = AgentPrincipal::user("u1");
+        let parent_run = mgr
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
+            .await
+            .expect("spawn parent");
+        let caller = |step_tools: Option<Vec<String>>| CallerRun {
+            run_id: parent_run.clone(),
+            agent_id: "parent".into(),
+            principal: principal.clone(),
+            session_id: None,
+            code_session: None,
+            step_tools,
+        };
+        let spawn = |caller: CallerRun| {
+            let mgr = mgr.clone();
+            async move {
+                mgr.handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "x"}))
+                    .await
+            }
+        };
+
+        // The agent itself may delegate to this child.
+        assert!(spawn(caller(None)).await.is_ok());
+        // The step lists a tool the child has: allowed.
+        let own = vec!["contacts.lookup".to_string()];
+        assert!(spawn(caller(Some(own))).await.is_ok());
+        // The step leaves the child's tool out: the child would outgrow the step.
+        let narrower = vec!["memory.memory_search".to_string()];
+        let refused = spawn(caller(Some(narrower))).await.unwrap_err();
+        assert!(refused.to_string().contains("tool surface"), "{refused}");
+        // A tool the step lists but the parent agent does not have adds nothing.
+        let wider = vec![
+            "memory.memory_search".to_string(),
+            "core.fs_read".to_string(),
+        ];
+        assert!(spawn(caller(Some(wider))).await.is_err());
+        // An unreadable binding delegates nothing.
+        assert!(spawn(caller(Some(Vec::new()))).await.is_err());
+    }
+
+    #[test]
+    fn a_caller_reads_the_step_list_from_the_binding_and_fails_closed_on_a_broken_one() {
+        let caller_of = |binding: Option<Value>| {
+            let mut envelope = FlowEnvelope::empty();
+            if let Some(binding) = binding {
+                envelope.meta.insert("process_activity".into(), binding);
+            }
+            CallerRun::from_envelope(&envelope, AgentPrincipal::user("u1"), None).step_tools
+        };
+        assert_eq!(caller_of(None), None);
+        assert_eq!(
+            caller_of(Some(json!({"invocation_id": "inv"}))),
+            Some(Vec::new())
+        );
+        let binding = crate::processes::agent_sink::ProcessActivityBinding {
+            invocation_id: "inv".into(),
+            instance_id: "ins".into(),
+            node_id: "n".into(),
+            attempt: 1,
+            fence: 1,
+            allowed_tools: vec!["core.skill_view".into()],
+            output_schema: None,
+        };
+        assert_eq!(
+            caller_of(Some(binding.meta_entry().1)),
+            Some(vec!["core.skill_view".to_string()])
+        );
     }
 
     /// §2.5 — the run row must be stamped by the SPAWN PATH, off the principal
@@ -2446,6 +2549,7 @@ mod tests {
             principal: principal.clone(),
             session_id: None,
             code_session: None,
+            step_tools: None,
         };
         let spawned = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
@@ -2646,6 +2750,7 @@ mod tests {
             principal: principal.clone(),
             session_id: None,
             code_session: None,
+            step_tools: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
@@ -2723,6 +2828,7 @@ mod tests {
             principal: principal.clone(),
             session_id: Some("sess-7".into()),
             code_session: None,
+            step_tools: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
@@ -2784,6 +2890,7 @@ mod tests {
             principal: principal.clone(),
             session_id: None,
             code_session: None,
+            step_tools: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
@@ -2863,6 +2970,7 @@ mod tests {
             principal: principal.clone(),
             session_id: None,
             code_session: None,
+            step_tools: None,
         };
         let spawned = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
@@ -2939,6 +3047,7 @@ mod tests {
             principal: principal.clone(),
             session_id: None,
             code_session: None,
+            step_tools: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))

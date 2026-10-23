@@ -255,6 +255,7 @@ mod tests {
             principal: AgentPrincipal::user("u1"),
             session_id: None,
             code_session: None,
+            step_tools: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "x"}))

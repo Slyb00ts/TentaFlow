@@ -240,7 +240,7 @@ export function processNodeConfig(kind) {
 // Which implementation a Service task runs; a task without the field is a flow.
 export function processServiceKind(config) {
   const implementation = config?.implementation;
-  return implementation?.Block ? 'block' : implementation?.AddonTool ? 'tool' : 'flow';
+  return implementation?.Block ? 'block' : implementation?.AddonTool ? 'tool' : implementation?.Agent ? 'agent' : 'flow';
 }
 
 // The settings the server lists as required that a block task has left empty.

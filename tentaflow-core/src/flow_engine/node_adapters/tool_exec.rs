@@ -235,13 +235,13 @@ impl ToolExecNodeAdapter {
             .unwrap_or(false)
     }
 
-    /// Runs one `core.task_complete` call. The step it reports for comes ONLY
-    /// from `envelope.meta["process_activity"]`, minted when the process layer
-    /// spawned the run, and the reporting run must be the one created for that
-    /// step; a run without the binding gets a tool error. A rejected report is a
-    /// `[TOOL_ERROR]` the model can repair and retry, except a second report,
-    /// which is final.
-    fn run_task_complete_call(
+    /// Runs one `core.task_complete` call. `run_id` is the id of the run the
+    /// engine is executing (`ExecutionContext::request_id`), not a meta entry;
+    /// meta only names the step the run claims, and the sink accepts the claim
+    /// only when the database agrees (see `processes::agent_sink`). A run without
+    /// the claim gets a tool error. A rejected report is a `[TOOL_ERROR]` the
+    /// model can repair and retry, except a second report, which is final.
+    async fn run_task_complete_call(
         service: &Arc<AgentService>,
         run_id: &str,
         envelope: &FlowEnvelope,
@@ -259,20 +259,27 @@ impl ToolExecNodeAdapter {
                     .to_string(),
             );
         };
-        match process_sink::complete_task(
-            service.db(),
-            &binding,
-            run_id,
-            &args,
-            Utc::now().timestamp_millis(),
-        ) {
-            Ok(output) => ToolCallResult {
+        let db = service.db().clone();
+        let run_id = run_id.to_owned();
+        let outcome = tokio::task::spawn_blocking(move || {
+            process_sink::complete_task(
+                &db,
+                &binding,
+                &run_id,
+                &args,
+                Utc::now().timestamp_millis(),
+            )
+        })
+        .await;
+        match outcome {
+            Ok(Ok(output)) => ToolCallResult {
                 tool_call_id: call.id.clone(),
                 name: call.name.clone(),
                 content: output.to_string(),
                 success: true,
             },
-            Err(message) => error_result(call, message),
+            Ok(Err(message)) => error_result(call, message),
+            Err(e) => error_result(call, format!("task completion join failed: {e}")),
         }
     }
 
@@ -970,7 +977,7 @@ impl ToolExecNodeAdapter {
         if !service.tool_allowed_in_run(&tools_json, &envelope.meta, &call.name) {
             error_result(call, format!("tool '{}' not in agent allowlist", call.name))
         } else if Self::is_process_sink(&call.name) {
-            Self::run_task_complete_call(service, run_id, envelope, call)
+            Self::run_task_complete_call(service, &ctx.request_id, envelope, call).await
         } else if CoreToolName::from_public_name(&call.name)
             .map(|c| c.is_ask_user())
             .unwrap_or(false)
@@ -2120,13 +2127,16 @@ mod process_sink_tests {
     use crate::processes::runtime::test_support::Fixture;
     use serde_json::json;
 
-    fn adapter(fixture: &Fixture) -> ToolExecNodeAdapter {
+    fn service(fixture: &Fixture) -> Arc<AgentService> {
         let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
         let addon_manager = Arc::new(
             crate::addon::AddonManager::new(fixture.db.clone(), cipher).expect("addon manager"),
         );
-        let service = Arc::new(AgentService::new(fixture.db.clone(), addon_manager));
-        ToolExecNodeAdapter::new(Arc::new(parking_lot::RwLock::new(Some(service))))
+        Arc::new(AgentService::new(fixture.db.clone(), addon_manager))
+    }
+
+    fn adapter(fixture: &Fixture) -> ToolExecNodeAdapter {
+        ToolExecNodeAdapter::new(Arc::new(parking_lot::RwLock::new(Some(service(fixture)))))
     }
 
     fn call(id: &str, name: &str, arguments: Value) -> LlmToolCall {
@@ -2145,9 +2155,21 @@ mod process_sink_tests {
         run_id: &str,
         calls: Vec<LlmToolCall>,
     ) -> Vec<String> {
+        answers_as(fixture, binding, run_id, run_id, calls).await
+    }
+
+    /// Like [`answers`], with the id written to meta and the id the engine
+    /// executes the run under (`ExecutionContext::request_id`) given apart.
+    async fn answers_as(
+        fixture: &Fixture,
+        binding: Option<&ProcessActivityBinding>,
+        meta_run_id: &str,
+        request_id: &str,
+        calls: Vec<LlmToolCall>,
+    ) -> Vec<String> {
         let mut env = FlowEnvelope::empty();
         env.meta.insert("agent_id".into(), json!(AGENT_ID));
-        env.meta.insert("agent_run_id".into(), json!(run_id));
+        env.meta.insert("agent_run_id".into(), json!(meta_run_id));
         if let Some(binding) = binding {
             let (key, value) = binding.meta_entry();
             env.meta.insert(key.into(), value);
@@ -2168,8 +2190,10 @@ mod process_sink_tests {
             from_port: "full".into(),
             envelope: Arc::new(env),
         };
+        let mut ctx = stub_ctx();
+        ctx.request_id = request_id.to_owned();
         let out = adapter(fixture)
-            .execute(&node, &[input], &stub_ctx())
+            .execute(&node, &[input], &ctx)
             .await
             .expect("the turn ends normally");
         out.context
@@ -2235,6 +2259,120 @@ mod process_sink_tests {
         )
         .await;
         assert!(answered[0].contains("was not started for the step"), "{answered:?}");
+        assert_eq!(rows(&fixture), 0);
+    }
+
+    #[tokio::test]
+    async fn a_run_id_written_to_meta_does_not_make_a_run_the_step_run() {
+        let fixture = Fixture::new();
+        seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+        let (_, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+        let derived = binding.agent_run_id();
+        let report = json!({"outcome": "completed", "summary": "done"});
+
+        // Meta (writable by any node of the flow) names the genuine run; the
+        // engine executes some other request.
+        let forged = answers_as(
+            &fixture,
+            Some(&binding),
+            &derived,
+            "some-other-run",
+            vec![call("c1", "core.task_complete", report.clone())],
+        )
+        .await;
+        assert!(
+            forged[0].contains("was not started for the step"),
+            "{forged:?}"
+        );
+        assert_eq!(rows(&fixture), 0);
+
+        // The converse: meta lies about the id, the engine runs the genuine one.
+        let honest = answers_as(
+            &fixture,
+            Some(&binding),
+            "some-other-run",
+            &derived,
+            vec![call("c2", "core.task_complete", report)],
+        )
+        .await;
+        assert!(honest[0].contains("recorded"), "{honest:?}");
+        assert_eq!(rows(&fixture), 1);
+    }
+
+    /// On a single-threaded runtime a report that waits for the database lock on
+    /// the async worker would stop every other task; it must wait on a blocking
+    /// thread instead.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_report_waiting_for_the_database_does_not_stall_the_async_worker() {
+        let fixture = Fixture::new();
+        seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+        let (_, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+        let db = fixture.db.clone();
+        let (locked, is_locked) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _write = db.write().unwrap();
+            locked.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+        });
+        is_locked.recv().unwrap();
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        let mut envelope = FlowEnvelope::empty();
+        let (key, value) = binding.meta_entry();
+        envelope.meta.insert(key.into(), value);
+        let report = call(
+            "c1",
+            "core.task_complete",
+            json!({"outcome": "completed", "summary": "done"}),
+        );
+        let answered = ToolExecNodeAdapter::run_task_complete_call(
+            &service(&fixture),
+            &binding.agent_run_id(),
+            &envelope,
+            &report,
+        )
+        .await;
+        ticker.abort();
+        holder.join().unwrap();
+
+        assert!(answered.content.contains("recorded"), "{answered:?}");
+        assert!(
+            ticks.load(std::sync::atomic::Ordering::SeqCst) >= 5,
+            "the runtime made no progress while the report waited for the database"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_binding_naming_another_invocation_cannot_use_the_genuine_run() {
+        let fixture = Fixture::new();
+        seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+        let (_, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+        let forged = ProcessActivityBinding {
+            invocation_id: "another-invocation".into(),
+            ..binding.clone()
+        };
+        let answered = answers(
+            &fixture,
+            Some(&forged),
+            &binding.agent_run_id(),
+            vec![call(
+                "c1",
+                "core.task_complete",
+                json!({"outcome": "completed", "summary": "done"}),
+            )],
+        )
+        .await;
+        assert!(
+            answered[0].contains("was not started for the step"),
+            "{answered:?}"
+        );
         assert_eq!(rows(&fixture), 0);
     }
 

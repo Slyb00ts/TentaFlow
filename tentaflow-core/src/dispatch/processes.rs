@@ -312,6 +312,32 @@ fn service_tool_options(
         .collect())
 }
 
+/// Every instance that reaches an agent step ends in the incident
+/// `AGENT_EXECUTOR_UNAVAILABLE` until the agent executor exists, so publishing
+/// such a process would only promise a run nothing can perform. The executor
+/// change removes this function and its call.
+fn refuse_agent_steps_until_runnable(
+    model: &tentaflow_protocol::processes::ProcessModel,
+) -> Result<(), ProtocolError> {
+    let has_agent_step = crate::processes::model::all_nodes(model)
+        .into_iter()
+        .any(|node| {
+            matches!(
+                &node.kind,
+                ProcessNodeKind::ServiceTask {
+                    implementation: ServiceImplementation::Agent { .. },
+                    ..
+                }
+            )
+        });
+    if has_agent_step {
+        return Err(ProtocolError::bad_request(
+            "agent steps are not runnable yet",
+        ));
+    }
+    Ok(())
+}
+
 /// Mints the server-side pin of every Service task for publication. This is the
 /// one place a publication gets its snapshots, so tests exercise the same code
 /// the handler runs.
@@ -468,6 +494,7 @@ pub fn process_dispatch(
             let (definition, _) =
                 repository::get_definition(pool, &actor, definition_id).map_err(error)?;
             crate::processes::model::validate_model(&definition.model).map_err(error)?;
+            refuse_agent_steps_until_runnable(&definition.model)?;
             let snapshots = pin_service_snapshots(dispatcher(ctx)?, &actor, &definition.model)?;
             let (definition, version) = repository::publish_definition(
                 pool,
@@ -1311,6 +1338,40 @@ mod tests {
             .code,
             ProtocolErrorCode::NotFound
         );
+    }
+
+    #[tokio::test]
+    async fn publication_refuses_an_agent_step_until_something_can_run_it() {
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "agent-step-owner");
+        let ctx = context(&state, &actor);
+        let model = crate::processes::agent_sink_tests::agent_model(
+            crate::processes::agent_sink_tests::agent_implementation(
+                "11111111-2222-4333-8444-555555555555",
+                &[],
+                None,
+            ),
+        );
+        let definition = save(&ctx, model).await;
+        let error = refused(
+            &ctx,
+            P::DefinitionPublishRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: definition.definition_id.clone(),
+                expected_revision: definition.draft_revision,
+                repin_calendar: None,
+            },
+        )
+        .await;
+        assert_eq!(error.code, ProtocolErrorCode::BadRequest);
+        assert!(
+            error.message.contains("agent steps are not runnable yet"),
+            "{}",
+            error.message
+        );
+        let (stored, _) =
+            repository::get_definition(&state.db, &actor, &definition.definition_id).unwrap();
+        assert_eq!(stored.published_version, None);
     }
 
     async fn save_and_publish(

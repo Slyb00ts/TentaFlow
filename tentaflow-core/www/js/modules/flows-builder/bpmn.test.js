@@ -2853,6 +2853,30 @@ test('canvas marks the kind of a Service task and an LLM block without a model',
   graph.destroy(); config.destroy();
 });
 
+test('an agent step is shown as an agent and the implementation control cannot replace its settings', async () => {
+  const graph = canvas();
+  const stored = { agentId: 'agent-1', goalExpression: '"Summarise"', allowedTools: ['core.skill_view'], maxIterations: 5 };
+  graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.node_type === 'bpmn_service_task'), preset: { implementation: { Agent: structuredClone(stored) } } }, 300, 300);
+  const agent = graph.nodes.at(-1);
+  assert.equal(processServiceKind(agent.config), 'agent');
+  const marker = graph.nodesLayer.querySelector(`[data-node-id="${agent.id}"] .fb-process-kind`);
+  assert.equal(marker.dataset.kind, 'agent');
+  assert.equal(marker.getAttribute('aria-label'), I18n.t('bpmn.kind_agent'));
+
+  const config = inspector(graph); config.show(agent, graph.templates.get(agent.type));
+  await flush(2);
+  const select = config.root.querySelector('[data-process="implementation"]');
+  assert.equal(select.getAttribute('value'), 'agent', 'not shown as a Flow task');
+  assert.equal(select.hasAttribute('disabled'), true);
+  assert.match(config.root.querySelector('[data-agent-summary]').textContent, /agent-1/);
+  assert.equal(config.root.querySelector('[data-process="flowId"]'), null);
+
+  for (const choice of ['flow', 'tool', 'block']) change(select, choice);
+  assert.deepEqual(agent.config.implementation.Agent, stored, 'the stored settings are kept');
+  assert.equal(processServiceKind(agent.config), 'agent');
+  graph.destroy(); config.destroy();
+});
+
 test('a new Call activity says it needs an exact version instead of failing at save', async () => {
   const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_call_activity'), 200, 200);
   const node = graph.nodes.at(-1);

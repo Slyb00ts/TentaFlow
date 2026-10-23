@@ -1830,7 +1830,7 @@ export class FlowCanvas {
           : n.repeat?.MultiInstance?.mode === 'Parallel' ? 'parallel' : null;
       const serviceKind = n.type === 'bpmn_service_task' ? processServiceKind(n.config) : null;
       const showKind = serviceKind && (serviceKind !== 'flow' || !!n.config.flowId);
-      const kindIcon = { flow: 'flow', block: 'chip', tool: 'puzzle' }[serviceKind];
+      const kindIcon = { flow: 'flow', block: 'chip', tool: 'puzzle', agent: 'bot' }[serviceKind];
       const warnings = this._processWarnings(n);
       // An event that is not on an activity sits on the canvas like one that is;
       // a dashed outline and its own tag say it is waiting for a host.

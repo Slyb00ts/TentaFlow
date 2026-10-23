@@ -70,22 +70,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   takiego zadania to 1..=3600 s, a jego wynik pochodzi ze zgłoszenia agenta, nie
   z `result_expression` (model go odrzuca). Agent kończy krok narzędziem
   `core.task_complete` (`outcome` = `completed`, `error` albo `needs_human`, `code`,
-  `summary`, `outputs`, `evidence`): krok, do którego należy, ustala serwer w
-  wiązaniu `process_activity` w metadanych przebiegu, nie argument, więc model nie
-  zgłosi cudzego zadania. Zgłoszenie jest sprawdzane na żywo (faza
-  `may_have_executed`, próba i ogrodzenie, otwarta instancja, przebieg o
-  identyfikatorze wyprowadzonym z wywołania), mieści się w limitach wyniku
+  `summary`, `outputs`, `evidence`): krok, do którego należy, nie jest
+  argumentem, więc model nie zgłosi cudzego zadania; wskazuje go wiązanie
+  `process_activity` w metadanych przebiegu, ale metadane zapisze każdy węzeł
+  przepływu (także blok addonu), więc same niczego nie dowodzą. Ujście ufa bazie:
+  zgłasza przebieg, który silnik wykonuje (`ExecutionContext::request_id`, nie
+  metadane), a jego wiersz w `agent_runs` musi być uruchomionym przebiegiem
+  najwyższego poziomu agenta przypiętego w kroku, utworzonym dla tego wywołania
+  (`correlation_id` = identyfikator wywołania). Do tego zgłoszenie jest sprawdzane
+  na żywo (faza `may_have_executed`, próba i ogrodzenie, otwarta instancja,
+  identyfikator przebiegu wyprowadzony z wywołania), mieści się w limitach wyniku
   kontraktowego, a `outputs` kroku `completed` muszą pasować do `output_schema`
   (podzbiór JSON Schema). Pierwsze zgłoszenie jest ostateczne, drugie dostaje
   `[TOOL_ERROR] already completed`; tabela `bpmn_agent_completions` odmawia
   drugiego wiersza i każdej zmiany. Narzędzia przebiegu to przecięcie
-  `tools_json` agenta z `allowed_tools` kroku (w katalogu modelu i przy
-  wywołaniu), plus samo ujście; poza krokiem procesu ujście nie jest oferowane ani
-  wybieralne w edytorze agenta. Publikacja wymaga agenta włączonego,
+  `tools_json` agenta z `allowed_tools` kroku (w katalogu modelu, przy wywołaniu
+  modelu i w blokach grafu `exec_command` oraz `patch_review`), plus samo ujście;
+  wiązanie, którego nie da się odczytać, nie zostawia żadnego narzędzia, a
+  podagent z `core.agent_spawn` dostaje najwyżej to przecięcie i żadnego wiązania.
+  Zagnieżdżony blok `agent` nie dziedziczy identyfikatora przebiegu ani wiązania.
+  Poza krokiem procesu ujście nie jest oferowane ani wybieralne w edytorze agenta.
+  Zawężenie czyta wiązanie z metadanych, więc blok grafu uprawniony do zapisu
+  metadanych może je usunąć; do B3.4b wykonawca musi przypiąć graf harnessu.
+  Publikacja wymaga agenta włączonego,
   z runtime `llm` (agent `cli` jest odrzucany), `allowed_tools` zawartych w jego
-  narzędziach i `max_iterations` nie większego niż agenta. Do czasu B3.4b zadanie
-  agenta uruchomione przez silnik kończy się `AGENT_EXECUTOR_UNAVAILABLE` przed
-  granicą wysyłki. Eksport XML: `implementation="agent" agentId maxIterations`
+  narzędziach i `max_iterations` nie większego niż agenta. Do czasu B3.4b publikacja procesu
+  z krokiem agenta jest odrzucana („agent steps are not runnable yet”), a zadanie
+  agenta uruchomione przez silnik (np. ze starszej wersji) kończy się
+  `AGENT_EXECUTOR_UNAVAILABLE` przed granicą wysyłki; projektant pokazuje taki krok
+  jako agenta i zachowuje jego ustawienia, nie edytuje ich. Eksport XML: `implementation="agent" agentId maxIterations`
   z `<tentaflow:agentConfig>`. Migracja 203 przebudowuje CHECK kolumny
   `implementation_kind` (dozwolone `flow`, `addon_tool`, `block`, `agent`, każde
   tylko z własnym prefiksem referencji) i tworzy `bpmn_agent_completions`.
