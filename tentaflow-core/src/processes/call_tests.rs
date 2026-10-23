@@ -327,7 +327,7 @@ pub(super) const TRANSITION_TABLES: [&str; 18] = [
 
 /// Process tables that a transition snapshot deliberately leaves out, with the reason.
 /// A table in neither list means a transition test would silently miss its rows.
-const NON_TRANSITION_TABLES: [&str; 7] = [
+const NON_TRANSITION_TABLES: [&str; 8] = [
     // Authoring tables: a transition reads the pinned version but never writes them.
     "bpmn_definitions",
     "bpmn_versions",
@@ -340,6 +340,9 @@ const NON_TRANSITION_TABLES: [&str; 7] = [
     // Recovery's own bookkeeping about observed tool results; it never changes
     // what a transition is.
     "bpmn_result_recovery",
+    // The final report of an agent step, written by the agent's own tool call
+    // while the step waits; no transition reads or writes it.
+    "bpmn_agent_completions",
 ];
 
 #[test]
