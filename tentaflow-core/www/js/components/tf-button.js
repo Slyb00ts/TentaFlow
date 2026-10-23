@@ -3,15 +3,16 @@
 // Opis: Komponent <tf-button> — renderuje standardowy button z klasami .tf-btn.
 //       Light DOM (bez Shadow DOM) zeby controls.css obslugiwal style.
 //       Atrybuty: variant, tone, size, icon, disabled, full-width, wrap.
-//       `aria-label`, `aria-describedby`, `aria-controls` and `title` stay on the
-//       host (selectors, closest(), toggleAttribute and cloneNode keep working)
-//       and are mirrored onto the inner <button>, also when they change later:
-//       the host is not focusable, so a name, a description or a control has to
-//       be on the real control. `aria-expanded` and `aria-haspopup` are not
-//       allowed on the host, so setting them there is taken in: they live on the
-//       inner button and a `data-expanded` / `data-haspopup` mirror stays on the
-//       host for selectors (clear a state by removing the data attribute).
-//       The host is `role="none"`, so assistive tech announces only the button.
+//       The host is `role="none"`, and a presentational role is dropped by browsers
+//       when the element carries a global ARIA attribute, so `aria-label`,
+//       `aria-describedby`, `aria-controls`, `aria-expanded` and `aria-haspopup` are
+//       taken in: they live on the inner <button> (the real, focusable control) and
+//       a `data-aria-label` / `data-aria-describedby` / `data-aria-controls` /
+//       `data-expanded` / `data-haspopup` mirror stays on the host for selectors
+//       (change or clear a value through the data attribute). `title` is not an ARIA
+//       attribute and stays on the host and on the button. `aria-disabled` is kept
+//       on the host while `disabled` is set: ARIA 1.2 no longer treats it as global
+//       and automation reads it there.
 // Przyklad: <tf-button variant="primary" icon="plus">Dodaj</tf-button>
 // =============================================================================
 
@@ -31,9 +32,15 @@ function safeIconName(value) {
   return /^[a-z0-9_-]{1,64}$/i.test(text) ? text : '';
 }
 
-const FORWARDED_ARIA = ['aria-label', 'aria-describedby', 'aria-controls', 'title'];
-// ARIA state that belongs to the real control; the host keeps a data mirror.
-const CONSUMED_ARIA = { 'aria-expanded': 'data-expanded', 'aria-haspopup': 'data-haspopup' };
+const FORWARDED_ARIA = ['title'];
+// Global ARIA that belongs to the real control; the host keeps a data mirror.
+const CONSUMED_ARIA = {
+  'aria-label': 'data-aria-label',
+  'aria-describedby': 'data-aria-describedby',
+  'aria-controls': 'data-aria-controls',
+  'aria-expanded': 'data-expanded',
+  'aria-haspopup': 'data-haspopup',
+};
 
 const VARIANT_CLASS = {
   primary:        'tf-btn-primary',

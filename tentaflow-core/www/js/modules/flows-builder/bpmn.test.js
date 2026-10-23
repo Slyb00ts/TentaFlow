@@ -6635,7 +6635,7 @@ test('the settings row follows the window until the author uses its toggle, a ph
   assert.deepEqual(compact.map((button) => button.dataset.role), ['publish', 'run']);
   for (const button of compact) {
     assert.ok(button.getAttribute('title').startsWith(button.textContent.trim()), `${button.dataset.role} keeps its name in the tooltip`);
-    assert.equal(button.getAttribute('aria-label'), button.textContent.trim(), `${button.dataset.role} keeps its name for assistive technology`);
+    assert.equal(button.getAttribute('data-aria-label'), button.textContent.trim(), `${button.dataset.role} keeps its name for assistive technology`);
   }
   Object.defineProperty(window, 'innerWidth', { value: 1024, configurable: true });
   Object.defineProperty(window, 'innerHeight', { value: 768, configurable: true });
@@ -7009,7 +7009,7 @@ test('Run is described by its reason, takes the only start entry by itself and k
   const wrap = () => builder._state.root.querySelector('[data-role="run-wrap"]');
   assert.match(wrap().getAttribute('title'), new RegExp(I18n.t('bpmn.run_reason_unpublished').slice(0, 20)));
   assert.equal(unpublished.root.querySelector('[data-role="run-reason"]').textContent, wrap().getAttribute('title'));
-  assert.equal(unpublished.root.querySelector('[data-role="run"]').getAttribute('aria-describedby'), 'fb-run-reason');
+  assert.equal(unpublished.root.querySelector('[data-role="run"]').getAttribute('data-aria-describedby'), 'fb-run-reason');
   const published = definition('run-single', { model, publishedVersion: 2 });
   const state = await mount(published, { processDefinitionGetRequest: { definition: published, startCatalog: manualStartCatalog(model, 2) } });
   assert.equal(state.root.querySelector('[data-role="start-entry"]').value, '0', 'the only entry is chosen');
@@ -7236,7 +7236,7 @@ test('the minimap pans the canvas on a press and folds to its title bar, remembe
   click(toggle);
   assert.equal(mini.classList.contains('collapsed'), true);
   assert.equal(toggle.dataset.expanded, 'false');
-  assert.equal(toggle.getAttribute('aria-label'), I18n.t('flows_builder.minimap_expand'));
+  assert.equal(toggle.getAttribute('data-aria-label'), I18n.t('flows_builder.minimap_expand'));
   assert.equal(localStorage.getItem('tf_fb_minimap_collapsed'), '1');
   const pressed = state.canvas.view.x;
   mini.dispatchEvent(new window.MouseEvent('pointerdown', { bubbles: true, button: 0, clientX: 120, clientY: 140 }));

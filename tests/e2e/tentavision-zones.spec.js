@@ -106,9 +106,9 @@ async function clickRowAction(page, tableIndex, label, rowIndex = 0) {
   const row = page
     .locator('.addon-app-shell tf-table')
     .nth(tableIndex)
-    .locator('tr', { has: page.locator('tf-button[aria-label="Akcje wiersza"]') })
+    .locator('tr', { has: page.locator('tf-button[data-aria-label="Akcje wiersza"]') })
     .nth(rowIndex);
-  const kebab = row.locator('tf-button[aria-label="Akcje wiersza"]').first();
+  const kebab = row.locator('tf-button[data-aria-label="Akcje wiersza"]').first();
   await expect(kebab).toBeVisible({ timeout: 10000 });
   await kebab.scrollIntoViewIfNeeded();
   await kebab.click();

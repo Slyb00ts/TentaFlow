@@ -174,7 +174,7 @@ test('right after withdrawing, the note of it stands alone; "Pokaż" is a word, 
   const table = body.querySelector('[data-role="versions"]');
   const show = table.rowActions(table.rows[1], 1).querySelector('[data-act="show-version"]');
   assert.equal(show.textContent, 'Pokaż');
-  assert.equal(show.getAttribute('aria-label'), 'Pokaż wersję 2');
+  assert.equal(show.getAttribute('data-aria-label'), 'Pokaż wersję 2');
 });
 
 test('every version withdrawn but the pattern not: the newest still checks and the page says so', () => {

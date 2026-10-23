@@ -99,7 +99,7 @@ async function fillField(page, fieldId, value) {
 
 // Opens the first row's kebab (⋯) action menu and clicks the item by label.
 async function clickRowAction(page, label) {
-  const kebab = page.locator('.addon-app-shell tf-table tf-button[aria-label="Akcje wiersza"]').first();
+  const kebab = page.locator('.addon-app-shell tf-table tf-button[data-aria-label="Akcje wiersza"]').first();
   await expect(kebab).toBeVisible({ timeout: 10000 });
   await kebab.scrollIntoViewIfNeeded();
   await kebab.click();

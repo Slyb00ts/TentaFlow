@@ -432,7 +432,7 @@ const FlowBuilderScreen = {
       for (const button of root.querySelectorAll('.fb-topbar tf-button[data-compact], .fb-topbar tf-button[data-fit-compact]')) {
         const name = button.textContent.trim();
         if (!button.hasAttribute('title')) button.setAttribute('title', name);
-        if (!button.hasAttribute('aria-label')) button.setAttribute('aria-label', name);
+        if (!button.hasAttribute('data-aria-label')) button.setAttribute('aria-label', name);
       }
       const topbar = root.querySelector('.fb-topbar');
       // The bar gives up room in steps. Measuring waits for the next frame so one

@@ -258,7 +258,10 @@ function renderMenuButton(component, ctx) {
         if (typeof v === 'string' && v.trim().length > 0) {
           trigger.setAttribute('aria-label', v);
         } else {
+          // tf-button moves the label to its inner button and leaves a mirror; the
+          // mirror is what a later removal has to clear.
           trigger.removeAttribute('aria-label');
+          trigger.removeAttribute('data-aria-label');
         }
       };
       apply();

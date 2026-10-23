@@ -75,7 +75,7 @@ async function fillField(page, fieldId, value) {
 }
 
 async function clickRowAction(page, label) {
-  const kebab = page.locator('.addon-app-shell tf-table tf-button[aria-label="Akcje wiersza"]').first();
+  const kebab = page.locator('.addon-app-shell tf-table tf-button[data-aria-label="Akcje wiersza"]').first();
   await expect(kebab).toBeVisible({ timeout: 15000 });
   await kebab.scrollIntoViewIfNeeded();
   await kebab.click();

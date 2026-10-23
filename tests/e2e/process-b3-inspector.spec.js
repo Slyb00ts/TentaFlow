@@ -1152,14 +1152,14 @@ test.describe('round 5: names in every window, closed menu, drops and the clock'
     await loginAsAdmin(page, { port: PORT });
     const own = await createDefinition(page, 'Host attributes');
     await openDesigner(page, { login: false, id: own });
-    const host = page.locator('tf-button[aria-label="More"]');
+    const host = page.locator('tf-button[data-aria-label="More"]');
     await expect(host).toHaveCount(1);
     await expect(page.getByRole('button', { name: 'More' })).toHaveCount(1);
     expect(await host.evaluate((element) => element.matches('[data-haspopup="menu"]') && element.closest('.fb-topbar') !== null)).toBe(true);
     await host.click();
-    await expect(page.locator('tf-button[aria-label="More"][data-expanded="true"]')).toHaveCount(1);
+    await expect(page.locator('tf-button[data-aria-label="More"][data-expanded="true"]')).toHaveCount(1);
     await page.keyboard.press('Escape');
-    await expect(page.locator('tf-button[aria-label="More"][data-expanded="true"]')).toHaveCount(0);
+    await expect(page.locator('tf-button[data-aria-label="More"][data-expanded="true"]')).toHaveCount(0);
     expect(await page.locator('tf-button[data-role="zoom-in"]').evaluate((element) => element.querySelector('button').getAttribute('title')), 'title reaches the real button').toBeTruthy();
   });
 
@@ -1657,7 +1657,7 @@ test.describe('round 6: crowded labels, idle bar, zone, menu, minimap and drops'
     await openDesigner(page, { login: false, id: own });
     const cdp = await page.context().newCDPSession(page);
     const { nodes } = await cdp.send('Accessibility.getFullAXTree');
-    const hosts = await page.evaluate(() => [...document.querySelectorAll('tf-button[title]:not([aria-label])')].map((element) => element.getAttribute('title')));
+    const hosts = await page.evaluate(() => [...document.querySelectorAll('tf-button[title]:not([data-aria-label])')].map((element) => element.getAttribute('title')));
     expect(hosts.length).toBeGreaterThan(0);
     const generic = nodes.filter((node) => !node.ignored && node.role?.value === 'generic' && hosts.includes(node.name?.value));
     expect(generic.map((node) => node.name.value)).toEqual([]);

@@ -88,7 +88,7 @@ test('an administrator: "Dodaj wzór", a row opens its pattern, the bin only for
   const lock = used.querySelector('[data-act="delete-blocked"]');
   assert.equal(lock.hasAttribute('disabled'), false, 'a disabled button would keep the reason from a tap and the keyboard');
   assert.equal(lock.getAttribute('icon'), 'lock');
-  assert.equal(lock.getAttribute('aria-label'), 'Nie można usunąć: używa go topik wizyty. Usuniesz go, gdy w ustawieniach tego topiku wybierzesz inny wzór.');
+  assert.equal(lock.getAttribute('data-aria-label'), 'Nie można usunąć: używa go topik wizyty. Usuniesz go, gdy w ustawieniach tego topiku wybierzesz inny wzór.');
   lock.click();
   table.rowActions(table.rows[1], 1).querySelector('[data-act="delete"]').click();
   table.rowActions(table.rows[3], 3).querySelector('[data-act="open"]').click();

@@ -100,7 +100,7 @@ async function clickButtonByText(page, text) {
 // recipients table is 0, the packages table is 1) and clicks the matching item.
 async function clickRowAction(page, label, tableIndex = 1) {
   const table = page.locator('.addon-app-shell tf-table').nth(tableIndex);
-  const kebab = table.locator('tf-button[aria-label="Akcje wiersza"]').first();
+  const kebab = table.locator('tf-button[data-aria-label="Akcje wiersza"]').first();
   await expect(kebab).toBeVisible({ timeout: 10000 });
   await kebab.scrollIntoViewIfNeeded();
   await kebab.click();
