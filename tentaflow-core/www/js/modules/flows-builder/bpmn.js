@@ -414,16 +414,27 @@ export function processTimezoneGaps(model) {
   return gaps;
 }
 
-// Why a typed time zone cannot be used, or null. An IANA name is accepted when
-// the engine lists it or still resolves it (a link such as "US/Eastern"); where
-// the runtime knows no zone data at all, only the shape of a name is checked.
+// Why a typed time zone cannot be used, or null. The engine compares names
+// exactly and spelt in full, but the browser resolves them in any letter case,
+// so a name is accepted when the runtime lists it (in any case: the canonical
+// spelling repairs that) or when it is a link such as "US/Eastern" that the
+// runtime still resolves AND is written the way tzdb writes every name, each
+// part starting with a capital. A link cannot be matched against a list, so a
+// capital in the wrong place inside a part is left to the engine to refuse.
 export function processTimezoneProblem(value) {
   const zone = String(value ?? '').trim();
   if (!zone) return null;
   if (!/^[A-Za-z][A-Za-z0-9_+-]*(\/[A-Za-z0-9_+-]+)*$/.test(zone)) return 'invalid';
   if (typeof Intl === 'undefined' || typeof Intl.DateTimeFormat !== 'function') return null;
-  if (typeof Intl.supportedValuesOf === 'function' && Intl.supportedValuesOf('timeZone').includes(zone)) return null;
+  if (listedTimezone(zone)) return null;
+  if (!zone.split('/').every((part) => /^[A-Z]/.test(part))) return 'invalid';
   try { new Intl.DateTimeFormat('en', { timeZone: zone }); return null; } catch (_) { return 'invalid'; }
+}
+
+function listedTimezone(zone) {
+  if (typeof Intl.supportedValuesOf !== 'function') return null;
+  const lower = zone.toLowerCase();
+  return Intl.supportedValuesOf('timeZone').find((name) => name.toLowerCase() === lower) ?? null;
 }
 
 // The spelling the engine lists for a zone: only the letter case is repaired
@@ -435,9 +446,8 @@ export function processTimezoneProblem(value) {
 export function processTimezoneCanonical(value) {
   const zone = String(value ?? '').trim();
   if (processTimezoneProblem(zone)) return null;
-  if (!zone || typeof Intl === 'undefined' || typeof Intl.supportedValuesOf !== 'function') return zone;
-  const lower = zone.toLowerCase();
-  return Intl.supportedValuesOf('timeZone').find((name) => name.toLowerCase() === lower) ?? zone;
+  if (!zone || typeof Intl === 'undefined') return zone;
+  return listedTimezone(zone) ?? zone;
 }
 
 export function processTimezoneText(gap) {

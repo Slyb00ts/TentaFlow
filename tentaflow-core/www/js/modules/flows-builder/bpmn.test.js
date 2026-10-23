@@ -4732,6 +4732,9 @@ test('a typed time zone is stored as the engine spells it, and an unusable one b
   assert.equal(processTimezoneCanonical(' Europe/Warsaw '), 'Europe/Warsaw');
   assert.equal(processTimezoneCanonical(''), '');
   assert.equal(processTimezoneCanonical('Mars/Olympus'), null);
+  for (const lowercase of ['us/pacific', 'utc', 'est', 'US/pacific', 'europe/uTC']) {
+    assert.equal(processTimezoneCanonical(lowercase) === lowercase, false, `${lowercase} is never stored in a spelling the engine refuses`);
+  }
   for (const kept of ['Europe/Kyiv', 'Asia/Kolkata', 'US/Pacific', 'EST', 'UTC']) {
     assert.equal(processTimezoneCanonical(kept), kept, `${kept} is stored as typed, not as the runtime respells it`);
   }
@@ -6024,6 +6027,26 @@ test('only the TentaFlow group rows are clamped to two lines and every row keeps
   palette.destroy();
 });
 
+test('the process toolbar is clipped, never a scroll box, at every width', () => {
+  const css = readFileSync(new URL('../../../css/flows-builder.css', import.meta.url), 'utf8');
+  const rules = [...css.matchAll(/\.fb-process-shell \.fb-topbar \{([^}]*)\}/g)].map((match) => match[1]);
+  assert.ok(rules.length >= 2, 'the base rule and the tablet rule');
+  for (const body of rules.filter((rule) => /overflow:/.test(rule))) {
+    const last = [...body.matchAll(/(?<![-\w])overflow:\s*([^;]+);/g)].pop()[1].trim();
+    assert.equal(last, 'clip', 'a focus must not be able to scroll the bar');
+  }
+});
+
+test('the omitted-trace notes agree in gender and number in German, one and many', async () => {
+  try {
+    await I18n.setLanguage('de');
+    assert.equal(I18n.t('bpmn.simulation_events_omitted', { count: 1 }), '1 älteres Ereignis nicht angezeigt');
+    assert.equal(I18n.t('bpmn.simulation_events_omitted', { count: 3 }), '3 ältere Ereignisse nicht angezeigt');
+    assert.equal(I18n.t('bpmn.simulation_trace_steps_omitted', { count: 1 }), '1 älterer Ablaufschritt nicht angezeigt');
+    assert.equal(I18n.t('bpmn.simulation_trace_steps_omitted', { count: 2 }), '2 ältere Ablaufschritte nicht angezeigt');
+  } finally { await I18n.setLanguage('en'); }
+});
+
 const overlaps = (a, b, size) => {
   const sa = size(a); const sb = size(b);
   return a.x < b.x + sb.w && a.x + sa.w > b.x && a.y < b.y + sb.h && a.y + sa.h > b.y;
@@ -6937,6 +6960,11 @@ test('a time zone is trimmed and checked, and goes with the last timer', async (
   assert.equal(processTimezoneProblem(''), null);
   assert.equal(processTimezoneProblem('Mars/Phobos'), 'invalid');
   assert.equal(processTimezoneProblem('not a zone'), 'invalid');
+  for (const lowercase of ['us/pacific', 'utc', 'est', 'gmt']) {
+    assert.equal(processTimezoneProblem(lowercase), 'invalid', `${lowercase} resolves in the browser but the engine compares names exactly`);
+  }
+  assert.equal(processTimezoneProblem('us/pacific'), 'invalid', 'a link in lower case would pass the browser and be refused by the engine');
+  assert.equal(processTimezoneProblem('US/Pacific'), null);
   const graph = canvas(timedModel('TimerCatch'));
   graph.updateProcessTimezone('  Europe/Berlin ');
   assert.equal(graph.getData().timerTimezone, 'Europe/Berlin');

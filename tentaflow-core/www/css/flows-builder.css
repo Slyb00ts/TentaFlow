@@ -1432,15 +1432,15 @@
   max-width: min(560px, 100%);
   align-self: flex-start;
 }
-/* The bar is one line from a tablet up, whatever the language or the state of the
-   autosave chip: the chip has a reserved width, the name is clipped to one line
-   and everything beyond the main actions sits behind the More menu. The menu's
-   own host takes no room. */
 /* Toasts normally appear in the top right corner, which is where this bar keeps
    Publish and Save; while the builder is open they hang from the middle, under the bar. */
 body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transform: translateX(-50%); align-items: center; }
 @media (max-width: 767px) { body:has(.fb-shell) .toast-container { top: 120px; } }
 .fb-topbar > tf-menu { position: absolute; }
+/* The bar is one line from a tablet up, whatever the language or the state of the
+   autosave chip: the chip has a reserved width, the name is clipped to one line
+   and everything beyond the main actions sits behind the More menu. The menu's
+   own host takes no room. */
 @media (min-width: 768px) {
   .fb-process-shell .fb-topbar {
     flex-wrap: nowrap;
@@ -1448,7 +1448,10 @@ body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transf
     align-content: center;
     height: 52px;
     padding-block: 0;
+    /* Clip, not just hidden: a hidden box is still scrolled by a focus, which moved
+       Back and the name away and shifted the More button under the pointer. */
     overflow: hidden;
+    overflow: clip;
   }
   .fb-process-shell .fb-topbar .fb-flow-name { flex: 1 1 200px; min-width: 120px; max-width: 360px; align-self: center; }
   .fb-process-shell .fb-topbar .fb-flow-name textarea {
