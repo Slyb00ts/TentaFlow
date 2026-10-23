@@ -157,11 +157,14 @@ class TfMenu extends HTMLElement {
     this._onSelect = this._onSelect.bind(this);
     this._onKey = this._onKey.bind(this);
     this._onViewportChange = this._onViewportChange.bind(this);
+    this._onAnchorKey = this._onAnchorKey.bind(this);
   }
 
   /** Element the panel must never cover (e.g. the table row it was opened from). */
   set anchor(el) {
+    this._anchor?.removeEventListener('keydown', this._onAnchorKey);
     this._anchor = el instanceof Element ? el : null;
+    this._anchor?.addEventListener('keydown', this._onAnchorKey);
     if (this.hasAttribute('open')) this._position();
   }
 
@@ -365,11 +368,14 @@ class TfMenu extends HTMLElement {
   }
 
   // On screen AND not scrolled out of a clipping ancestor such as a window body,
-  // where it would still be inside the viewport but no longer visible.
+  // where it would still be inside the viewport but no longer visible. The walk
+  // follows the composed tree: a slotted trigger (tf-window content) reaches the
+  // scroller inside the host's shadow root only through its slot, never through
+  // parentNode.
   _anchorVisible(anchor) {
     if (!this._anchorOnScreen(anchor)) return false;
     const r = anchor.getBoundingClientRect();
-    for (let n = anchor.parentNode || anchor.host; n; n = n.parentNode || n.host) {
+    for (let n = anchor.assignedSlot || anchor.parentNode || anchor.host; n; n = n.assignedSlot || n.parentNode || n.host) {
       if (!(n instanceof Element)) continue;
       const overflow = getComputedStyle(n);
       if (overflow.overflowX === 'visible' && overflow.overflowY === 'visible') continue;
@@ -407,7 +413,28 @@ class TfMenu extends HTMLElement {
     this.close();
   }
 
+  // Down/Up on a closed trigger opens the menu at its first/last enabled item,
+  // as a menu button does. Only a button-like anchor qualifies: a table row would
+  // open it from the arrows of any field inside it.
+  _onAnchorKey(e) {
+    if ((e.key !== 'ArrowDown' && e.key !== 'ArrowUp') || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey
+      || e.defaultPrevented || this.hasAttribute('open') || !this._anchor.matches('button, tf-button, [role="button"]')) return;
+    e.preventDefault();
+    // The same event still bubbles to the document listener, which would move
+    // focus on once more now that the menu is open.
+    this._openedBy = e;
+    this.open();
+    const rows = this._enabledRows();
+    (e.key === 'ArrowDown' ? rows[0] : rows.at(-1))?.focus();
+  }
+
+  _enabledRows() {
+    return [...this.querySelectorAll(':scope > tf-menu-item > .tf-menu-item')]
+      .filter((row) => !row.parentElement.hidden && !row.parentElement.hasAttribute('disabled'));
+  }
+
   _onKey(e) {
+    if (e === this._openedBy) return;
     if (!this.hasAttribute('open')) return;
     if (e.key === 'Escape') {
       e.stopPropagation();

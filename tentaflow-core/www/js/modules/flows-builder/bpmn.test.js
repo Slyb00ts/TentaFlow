@@ -28,7 +28,7 @@ const { emptyProcessModel, processToCanvas, canvasToProcess, cloneProcessBody, p
 const { FlowCanvas, UNATTACHED_TAG } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
-const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processRowFor, processRoutingTextKeys, processEscalationPathProblem, processExplainError, processMissingSettings, processNodeWarnings, processServiceKind, processBlockTemplate, processStartEntryLabels, processTimezoneProblem, processPublishProblems, processNodeLabels, processTimezoneGaps, processTimezoneText, processTimezoneCanonical, processRepeatedElements, processBoundaryRefusals, processPlainError } = await import('./bpmn.js');
+const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processRowFor, processRoutingTextKeys, processEscalationPathProblem, processExplainError, processMissingSettings, processNodeWarnings, processServiceKind, processBlockTemplate, processStartEntryLabels, processTimezoneProblem, processPublishProblems, processNodeLabels, processTimezoneGaps, processTimezoneText, processTimezoneCanonical, processRepeatedElements, processBoundaryRefusals, processBoundaryHosts, processRepeatOutputGaps, processPlainError } = await import('./bpmn.js');
 const { openProcessCalendar, openProcessInstance, openProcessInstances, openProcessMessageDetail, openProcessMessageSend, openProcessRun, openProcessSchedule, processEventText, processLifecycleReasonText, processTimerText } = await import('./process-monitor.js');
 const { simulationWindow, openProcessSimulation } = await import('./process-simulation.js');
 const { default: builder } = await import('../flows-builder.js');
@@ -6920,7 +6920,8 @@ test('a repeated element without an output collection variable says so in its in
   await flush(2);
   const warning = config.root.querySelector('[data-repeat-warning]');
   assert.ok(warning, 'a warning stands under the output variable');
-  assert.equal(warning.getAttribute('message'), I18n.t('bpmn.repeat_output_missing', { node: 'Critic flow' }));
+  assert.equal(warning.getAttribute('message'), I18n.t('bpmn.repeat_output_declare', { node: 'Critic flow' }));
+  assert.ok(config.root.querySelector('[data-repeat-declare-output]'), 'the section offers to declare one right there');
   task.repeat.MultiInstance.outputCollectionVariable = 'results';
   config.show(task, graph.templates.get(task.type));
   await flush(2);
@@ -6960,10 +6961,18 @@ test('a time zone is trimmed and checked, and goes with the last timer', async (
   assert.equal(processTimezoneProblem(''), null);
   assert.equal(processTimezoneProblem('Mars/Phobos'), 'invalid');
   assert.equal(processTimezoneProblem('not a zone'), 'invalid');
-  for (const lowercase of ['us/pacific', 'utc', 'est', 'gmt']) {
-    assert.equal(processTimezoneProblem(lowercase), 'invalid', `${lowercase} resolves in the browser but the engine compares names exactly`);
+  const realSupportedValuesOf = Intl.supportedValuesOf;
+  Intl.supportedValuesOf = () => ['Europe/Warsaw', 'America/Winnipeg'];
+  try {
+    for (const [typed, spelt] of [['utc', 'UTC'], ['Utc', 'UTC'], ['gmt', 'GMT'], ['est', 'EST'], ['europe/warsaw', 'Europe/Warsaw']]) {
+      assert.equal(processTimezoneProblem(typed), null, `${typed} is accepted`);
+      assert.equal(processTimezoneCanonical(typed), spelt, `${typed} is repaired to the engine spelling`);
+    }
+    assert.equal(processTimezoneProblem('us/pacific'), 'invalid', 'a link in lower case would pass the browser and be refused by the engine');
+    assert.equal(processTimezoneCanonical('us/pacific'), null);
+  } finally {
+    Intl.supportedValuesOf = realSupportedValuesOf;
   }
-  assert.equal(processTimezoneProblem('us/pacific'), 'invalid', 'a link in lower case would pass the browser and be refused by the engine');
   assert.equal(processTimezoneProblem('US/Pacific'), null);
   const graph = canvas(timedModel('TimerCatch'));
   graph.updateProcessTimezone('  Europe/Berlin ');
@@ -7274,7 +7283,7 @@ test('the minimap pans the canvas on a press and folds to its title bar, remembe
   localStorage.removeItem('tf_fb_minimap_collapsed');
 });
 
-test('a boundary event refused by a repeating task says why in the drop toast, the attach list, the check before saving and the server message', async () => {
+test('a boundary event refused on a repeating task names the real cause in the drop toast, the check before saving and the server message', async () => {
   const repeat = { MultiInstance: { mode: 'Sequential', input: { Cardinality: { count: 2 } }, outputCollectionVariable: 'parts' } };
   const graph = canvas();
   const script = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_script_task'), 700, 300);
@@ -7288,10 +7297,12 @@ test('a boundary event refused by a repeating task says why in the drop toast, t
     const point = (node) => [node.x + node.width / 2, node.y + node.height];
     const error = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_error'), ...point(script));
     assert.equal(error.config.attachedToId ?? '', '', 'a Script task takes no error event');
-    assert.ok(toasts.texts().some((text) => text.includes('Compute each part') && /repeats/.test(text)), 'the toast names the task and the reason');
+    assert.ok(toasts.texts().some((text) => text.includes('Compute each part') && /error event fits only a Service task/.test(text) && !/repeat/.test(text)),
+      'the toast names the task and the kind of task as the reason, not the repetition');
     const escalation = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_escalation'), ...point(manual));
     assert.equal(escalation.config.attachedToId ?? '', '');
-    assert.ok(toasts.texts().some((text) => text.includes('Review each part') && /repeats/.test(text)));
+    assert.ok(toasts.texts().some((text) => text.includes('Review each part') && /escalation event fits only a Service task/.test(text) && !/repeat/.test(text)),
+      'an escalation dropped on a looping User task is explained too');
     const service = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 600);
     graph.updateNodeLabel(service.id, 'Call each part');
     graph.updateNodeConfig(service.id, { repeat });
@@ -7300,7 +7311,9 @@ test('a boundary event refused by a repeating task says why in the drop toast, t
     assert.equal(timer.config.attachedToId, manual.id, 'a timer is welcome on a repeating task');
     const refusals = processBoundaryRefusals(graph, 'BoundaryError');
     assert.equal(refusals.get(service.id), null, 'an error event fits a repeating Service task');
-    assert.equal(refusals.get(manual.id), 'repeat');
+    assert.equal(refusals.get(manual.id), 'error_type', 'a User task takes no error event, repeating or not');
+    assert.equal(processBoundaryRefusals(graph, 'BoundaryEscalation').get(manual.id), 'escalation_type');
+    assert.equal(processBoundaryRefusals(graph, 'BoundaryTimer').get(manual.id), null);
   } finally { toasts.stop(); }
 
   const config = inspector(graph);
@@ -7311,12 +7324,11 @@ test('a boundary event refused by a repeating task says why in the drop toast, t
   const escalation = graph.nodes.at(-1);
   config.show(escalation, graph.templates.get(escalation.type));
   await flush(2);
-  assert.match(config.root.querySelector('[data-boundary-excluded]')?.textContent ?? '', /Call each part|Review each part|Compute each part/,
-    'the repeating tasks left out of the list are named, with the reason');
+  assert.equal(config.root.querySelector('[data-boundary-excluded]'), null, 'no event is refused by repetition alone, so no list blames it');
 
   graph.updateNodeConfig(escalation.id, { attachedToId: manual.id });
-  assert.ok(graph.validate().some((message) => message.includes('Review each part') && /repeats/.test(message) && !/repeat “/.test(message)),
-    'the check before saving names the task and says what to do');
+  assert.ok(graph.validate().some((message) => message.includes('Review each part') && /escalation event fits only a Service task/.test(message) && !/repeats/.test(message)),
+    'the check before saving names the task and the real cause');
 
   const model = graph.getData();
   const hostId = graph.nodes.find((node) => node.label === 'Compute each part').id;
@@ -7370,4 +7382,56 @@ test('a waiting person is never told as failed: the incident belongs to the firs
   assert.doesNotMatch(rows[3], failed, 'one incident explains one occurrence');
   assert.match(rows[3], new RegExp(I18n.t('bpmn.repeat_occurrence_status_active')));
   win.remove();
+});
+
+test('a repeating activity refuses a boundary event exactly as the engine does', () => {
+  const kinds = { bpmn_user_task: 'User', bpmn_service_task: 'Service', bpmn_sub_process: 'SubProcess', bpmn_call_activity: 'Call',
+    bpmn_script_task: 'Script', bpmn_send_task: 'Send', bpmn_manual_task: 'Manual', bpmn_receive_task: 'Receive' };
+  const accepted = { BoundaryTimer: Object.keys(kinds), BoundaryMessage: Object.keys(kinds),
+    BoundaryError: ['bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'], BoundaryEscalation: ['bpmn_service_task'] };
+  for (const [kind, types] of Object.entries(accepted)) {
+    for (const repeat of [undefined, { StructuredLoop: {} }]) {
+      const nodes = Object.keys(kinds).map((type) => ({ id: type, type, repeat, config: { resultExpression: '{}' } }));
+      const offered = processBoundaryHosts({ nodes, edges: [] }, kind).map((node) => node.id);
+      assert.deepEqual(offered.sort(), [...types].sort(), `${kind} hosts, repeat=${!!repeat}`);
+    }
+  }
+});
+
+test('a repeating Service task with no declared variable can declare its output collection in place', async () => {
+  const graph = canvas();
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 250, 300);
+  const node = graph.nodes.at(-1);
+  const config = inspector(graph);
+  config.show(node, graph.templates.get(node.type));
+  await flush(2);
+  change(config.root.querySelector('[data-process="repeatMode"]'), 'mi_sequential');
+  await flush(2);
+  const select = () => config.root.querySelector('[data-process="repeatOutput"]');
+  assert.equal(select().querySelectorAll('option').length, 1, 'only the placeholder: nothing is declared yet');
+  assert.match(config.root.querySelector('[data-repeat-warning]').getAttribute('message'), /declares none yet/);
+  const field = config.root.querySelector('[data-repeat-new-output]');
+  assert.equal(field.getAttribute('value'), 'results', 'a free name is suggested');
+
+  field.value = '1 bad';
+  click(config.root.querySelector('[data-repeat-declare-output]'));
+  assert.ok(field.getAttribute('error'), 'a name the engine would refuse is refused here');
+  assert.deepEqual(graph.processModel.variables, {});
+
+  node.config.outputMapping = { results: 'outputs.result' };
+  field.value = 'results';
+  click(config.root.querySelector('[data-repeat-declare-output]'));
+  assert.match(field.getAttribute('error'), /output mapping/, 'a name the task itself writes is refused');
+  assert.equal(node.repeat.MultiInstance.outputCollectionVariable, '');
+
+  field.value = ' collected ';
+  click(config.root.querySelector('[data-repeat-declare-output]'));
+  await flush(2);
+  assert.deepEqual(graph.processModel.variables, { collected: [] });
+  assert.equal(node.repeat.MultiInstance.outputCollectionVariable, 'collected');
+  assert.equal(select().value, 'collected');
+  assert.equal(config.root.querySelector('[data-repeat-warning]'), null);
+  assert.equal(config.root.querySelector('[data-repeat-new-output]'), null);
+  assert.deepEqual(processRepeatOutputGaps(graph.getData()), []);
+  graph.destroy();
 });

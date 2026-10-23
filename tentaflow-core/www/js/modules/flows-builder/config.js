@@ -20,7 +20,7 @@ import '/js/components/tf-person-picker.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-alert.js';
-import { processNodeKind, processBoundaryKind, processBoundaryHosts, processBoundaryRefusals, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processStartEntryLabels, processItemLabels } from './bpmn.js';
+import { processNodeKind, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processStartEntryLabels, processItemLabels } from './bpmn.js';
 import { openProcessCallPreview } from './process-monitor.js';
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
@@ -601,6 +601,34 @@ export class FlowConfig {
     });
   }
 
+  // Declares the typed name as a process variable (an empty list, which the
+  // engine fills with the collected results) and makes it the collection of the
+  // repeating task, so the author is never sent elsewhere to fix what the
+  // section itself asks for. The engine publishes only a declared name that the
+  // task's own output mapping does not write.
+  _declareRepeatOutput() {
+    const node = this.node;
+    const field = this.root.querySelector('[data-repeat-new-output]');
+    if (!node?.repeat || !field || this.readOnly) return;
+    const name = String(field.value ?? '').trim();
+    const canvas = this.opts.getCanvas();
+    const variables = processBody(canvas.processModel, canvas.processPath).variables;
+    if (!/^[A-Za-z][A-Za-z0-9_.-]{0,127}$/.test(name)) {
+      field.setAttribute('error', I18n.t('bpmn.repeat_output_new_invalid'));
+      return;
+    }
+    if (Object.hasOwn(node.config.outputMapping ?? {}, name)) {
+      field.setAttribute('error', I18n.t('bpmn.repeat_output_new_mapped', { name }));
+      return;
+    }
+    if (!Object.hasOwn(variables, name)) canvas.updateProcessVariables({ ...variables, [name]: [] });
+    const next = structuredClone(node.repeat);
+    (next.MultiInstance ?? next.StructuredLoop).outputCollectionVariable = name;
+    this.opts.onConfigChange(node.id, { repeat: next });
+    this._renderProcess();
+    this.root.querySelector('[data-process="repeatOutput"]')?.focus();
+  }
+
   _renderProcess() {
     const node = this.node;
     const kind = processNodeKind(node.type);
@@ -620,11 +648,9 @@ export class FlowConfig {
       const activities = processBoundaryHosts(graph, kind);
       const target = activities.find((candidate) => candidate.id === config.attachedToId);
       const names = targetLabels;
-      const refusals = processBoundaryRefusals(graph, kind);
-      const repeating = graph.nodes.filter((candidate) => refusals.get(candidate.id) === 'repeat').map((candidate) => names.get(candidate.id));
       const scopeHint = target?.repeat ? 'bpmn.boundary_repeat_group_hint'
         : target && graph.processPath.length ? 'bpmn.boundary_child_local_hint' : null;
-      return `<tf-select data-process="attachedToId" wrap-selected label="${escapeAttr(I18n.t('bpmn.boundary_attach'))}" value="${escapeAttr(config.attachedToId || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.boundary_choose_activity'))}</option>${activities.map((candidate) => `<option value="${escapeAttr(candidate.id)}">${escapeHtml(names.get(candidate.id))}</option>`).join('')}${config.attachedToId && !target ? `<option value="${escapeAttr(config.attachedToId)}" disabled>${escapeHtml(I18n.t('bpmn.boundary_unavailable_option'))}</option>` : ''}</tf-select><p class="fb-field-hint" data-boundary-target>${escapeHtml(target ? names.get(target.id) : I18n.t(config.attachedToId ? 'bpmn.boundary_unavailable' : 'bpmn.boundary_required'))}</p>${repeating.length ? `<p class="fb-field-hint" data-boundary-excluded>${escapeHtml(I18n.t('bpmn.boundary_excluded_repeat', { names: repeating.join(', ') }))}</p>` : ''}${scopeHint ? `<p class="fb-field-hint" data-boundary-scope>${escapeHtml(I18n.t(scopeHint))}</p>` : ''}`;
+      return `<tf-select data-process="attachedToId" wrap-selected label="${escapeAttr(I18n.t('bpmn.boundary_attach'))}" value="${escapeAttr(config.attachedToId || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.boundary_choose_activity'))}</option>${activities.map((candidate) => `<option value="${escapeAttr(candidate.id)}">${escapeHtml(names.get(candidate.id))}</option>`).join('')}${config.attachedToId && !target ? `<option value="${escapeAttr(config.attachedToId)}" disabled>${escapeHtml(I18n.t('bpmn.boundary_unavailable_option'))}</option>` : ''}</tf-select><p class="fb-field-hint" data-boundary-target>${escapeHtml(target ? names.get(target.id) : I18n.t(config.attachedToId ? 'bpmn.boundary_unavailable' : 'bpmn.boundary_required'))}</p>${scopeHint ? `<p class="fb-field-hint" data-boundary-scope>${escapeHtml(I18n.t(scopeHint))}</p>` : ''}`;
     };
     let servicePanels = '';
     let servicePanel = null;
@@ -826,7 +852,9 @@ export class FlowConfig {
         repeatHtml += `<tf-select data-process="repeatOutput" wrap-selected label="${escapeAttr(I18n.t('bpmn.repeat_output'))}" value="${escapeAttr(output)}" ${disabled}>
           <option value="">${escapeHtml(I18n.t('bpmn.repeat_choose_output'))}</option>
           ${variables.map((name) => `<option value="${escapeAttr(name)}">${escapeHtml(name)}</option>`).join('')}
-        </tf-select>${output ? '' : `<tf-alert tone="warning" data-repeat-warning message="${escapeAttr(I18n.t('bpmn.repeat_output_missing', { node: targetLabels.get(node.id) ?? getNodeName(node.type) }))}"></tf-alert>`}`;
+        </tf-select>${output ? '' : `<tf-alert tone="warning" data-repeat-warning message="${escapeAttr(I18n.t(variables.length ? 'bpmn.repeat_output_choose_or_declare' : 'bpmn.repeat_output_declare', { node: targetLabels.get(node.id) ?? getNodeName(node.type) }))}"></tf-alert>
+          ${this.readOnly ? '' : `<tf-input data-repeat-new-output label="${escapeAttr(I18n.t('bpmn.repeat_output_new'))}" value="${variables.includes('results') ? '' : 'results'}"></tf-input>
+          <tf-button variant="secondary" data-repeat-declare-output>${escapeHtml(I18n.t('bpmn.repeat_output_declare_use'))}</tf-button>`}`}`;
       }
       if (repeat?.MultiInstance) {
         const repeatInput = repeat.MultiInstance.input;
@@ -1179,6 +1207,8 @@ export class FlowConfig {
           ? 'bpmn.manual_initiator_hint' : 'bpmn.initiator');
       });
     }
+    this.root.querySelector('[data-repeat-declare-output]')?.addEventListener('click', () => this._declareRepeatOutput());
+    this.root.querySelector('[data-repeat-new-output]')?.addEventListener('input', (event) => event.currentTarget.removeAttribute('error'));
     this.root.querySelector('.fb-process-fields').addEventListener('change', (event) => {
       const control = event.target.closest('[data-process]');
       if (!control || control !== event.target || !this.root.contains(control)) return;

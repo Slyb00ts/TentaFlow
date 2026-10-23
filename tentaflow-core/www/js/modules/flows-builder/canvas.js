@@ -575,10 +575,12 @@ export class FlowCanvas {
           && !this.nodes.some((candidate) => candidate.id === node.config.attachedToId)) {
           errors.push(I18n.t('bpmn.boundary_required_named', { node: this._nodeName(node) }));
         }
-        if (processBoundaryKind(node.type) && node.config.attachedToId
-          && processBoundaryRefusals(this, processNodeKind(node.type)).get(node.config.attachedToId) === 'repeat') {
+        if (processBoundaryKind(node.type) && node.config.attachedToId) {
           const host = this.nodes.find((candidate) => candidate.id === node.config.attachedToId);
-          errors.push(I18n.t('bpmn.boundary_repeat_refused_named', { node: this._nodeName(node), host: this._nodeName(host) }));
+          const refusal = host?.repeat ? processBoundaryRefusals(this, processNodeKind(node.type)).get(host.id) : null;
+          if (refusal === 'error_type' || refusal === 'escalation_type') {
+            errors.push(I18n.t(`bpmn.boundary_attached_refused_${refusal}`, { node: this._nodeName(node), host: this._nodeName(host) }));
+          }
         }
         const problem = node.type === 'bpmn_boundary_escalation' ? processEscalationPathProblem(this, node.id) : null;
         if (problem) errors.push(I18n.t(`bpmn.routing_warning_escalation_path_${ESCALATION_PATH_KEYS.includes(problem.reason) ? problem.reason : 'other'}`, { names: this._nodeName(node) }));

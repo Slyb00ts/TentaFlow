@@ -184,6 +184,29 @@ test('an anchor scrolled out of its clipping container closes the menu even whil
   assert.equal(menu.hasAttribute('open'), false);
 });
 
+test('a slotted trigger scrolled out of the host\'s shadow-root scroller closes the menu', async () => {
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  const root = host.attachShadow({ mode: 'open' });
+  root.innerHTML = '<div data-role="title"></div><div data-role="scroller" style="overflow:auto"><slot></slot></div>';
+  const scroller = root.querySelector('[data-role="scroller"]');
+  scroller.getBoundingClientRect = () => ({ top: 100, bottom: 400, left: 0, right: 500, width: 500, height: 300 });
+  const trigger = document.createElement('button');
+  host.appendChild(trigger);
+  // happy-dom does not assign slots; a browser reports the slot a light child lands in.
+  Object.defineProperty(trigger, 'assignedSlot', { value: root.querySelector('slot') });
+  const rect = { top: 140, bottom: 170, left: 100, right: 160, width: 60, height: 30 };
+  trigger.getBoundingClientRect = () => ({ ...rect, x: rect.left, y: rect.top });
+  const menu = document.createElement('tf-menu');
+  menu.innerHTML = '<tf-menu-item>A</tf-menu-item>';
+  document.body.appendChild(menu);
+  menu.anchor = trigger;
+  menu.open();
+  rect.top = 60; rect.bottom = 90;
+  await frames();
+  assert.equal(menu.hasAttribute('open'), false, 'a trigger over the title bar is hidden even though the page still shows that spot');
+});
+
 test('the frame watch stops with the menu', async () => {
   const { menu } = anchored();
   assert.ok(menu._frame);
@@ -208,4 +231,59 @@ test('closing does not take focus back when the reader already moved it elsewher
   elsewhere.focus();
   menu.close();
   assert.equal(document.activeElement, elsewhere);
+});
+
+function closedMenuWithTrigger(tag = 'button') {
+  const host = document.createElement('div');
+  host.innerHTML = `<${tag} data-role="trigger">More</${tag}><tf-menu><tf-menu-item data-name="a">A</tf-menu-item><tf-menu-item data-name="b" disabled>B</tf-menu-item><tf-menu-item data-name="c">C</tf-menu-item><tf-menu-item data-name="d">D</tf-menu-item></tf-menu>`;
+  document.body.appendChild(host);
+  const menu = host.querySelector('tf-menu');
+  const trigger = host.querySelector('[data-role="trigger"]');
+  menu.anchor = trigger;
+  return { menu, trigger };
+}
+const keyOn = (target, key, init = {}) => {
+  const event = new window.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...init });
+  target.dispatchEvent(event);
+  return event;
+};
+
+test('ArrowDown on the closed trigger opens the menu at the first enabled item and stays there', () => {
+  const { menu, trigger } = closedMenuWithTrigger();
+  const event = keyOn(trigger, 'ArrowDown');
+  assert.equal(menu.hasAttribute('open'), true);
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(document.activeElement, rowOf(menu, 'a'), 'the event that opened it does not also move focus on');
+});
+
+test('ArrowUp on the closed trigger opens the menu at the last enabled item', () => {
+  const { menu, trigger } = closedMenuWithTrigger();
+  keyOn(trigger, 'ArrowUp');
+  assert.equal(menu.hasAttribute('open'), true);
+  assert.equal(document.activeElement, rowOf(menu, 'd'));
+});
+
+test('the arrows leave an open menu, a modified press and a non-button anchor alone', () => {
+  const { menu, trigger } = closedMenuWithTrigger();
+  keyOn(trigger, 'ArrowDown', { shiftKey: true });
+  assert.equal(menu.hasAttribute('open'), false);
+  keyOn(trigger, 'Home');
+  assert.equal(menu.hasAttribute('open'), false);
+  const row = closedMenuWithTrigger('section');
+  keyOn(row.trigger, 'ArrowDown');
+  assert.equal(row.menu.hasAttribute('open'), false, 'a row anchor must not open from the arrows of a field inside it');
+  menu.open();
+  keyOn(trigger, 'ArrowDown');
+  assert.equal(menu.hasAttribute('open'), true);
+});
+
+test('a re-anchored menu no longer answers to its previous trigger', () => {
+  const { menu, trigger } = closedMenuWithTrigger();
+  const other = document.createElement('button');
+  document.body.appendChild(other);
+  menu.anchor = other;
+  keyOn(trigger, 'ArrowDown');
+  assert.equal(menu.hasAttribute('open'), false);
+  keyOn(other, 'ArrowDown');
+  assert.equal(menu.hasAttribute('open'), true);
 });

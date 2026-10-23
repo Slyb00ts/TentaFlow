@@ -1739,3 +1739,90 @@ test.describe('round 6: crowded labels, idle bar, zone, menu, minimap and drops'
     await expect(page.locator('body > tf-menu')).toHaveCount(0);
   });
 });
+
+test.describe('round 9: classic toolbar, clipped menu trigger, menu arrows', () => {
+  test.use({ viewport: { width: 1440, height: 900 } });
+
+  test('the classic flow toolbar does not reflow when the autosave chip turns to unsaved changes', async ({ page }) => {
+    await loginAsAdmin(page, { port: PORT });
+    const flowId = await page.evaluate(async (graph) => {
+      const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+      const created = await ApiBinary.one('flowCreateRequest', { name: 'Classic toolbar flow', description: '', graphJson: graph });
+      return String(created.id ?? created.flowId);
+    }, FLOW_GRAPH);
+    await page.evaluate(async (id) => {
+      const { openFlowBuilder } = await import('/js/modules/flows-builder.js');
+      openFlowBuilder(id);
+    }, flowId);
+    await expect(page.locator('.fb-canvas')).toBeVisible({ timeout: 15000 });
+    const layout = async () => ({
+      history: await rect(page.locator('.fb-topbar [data-role="history"]')),
+      palette: await rect(page.locator('.fb-palette')),
+      chip: await rect(page.locator('.fb-topbar .fb-autosave')),
+      bar: await rect(page.locator('.fb-topbar')),
+    });
+    await expect.poll(async () => {
+      const first = await rect(page.locator('.fb-topbar'));
+      await page.waitForTimeout(200);
+      return Math.abs(first.right - (await rect(page.locator('.fb-topbar'))).right) < 0.5;
+    }).toBe(true);
+    const saved = await layout();
+    await page.locator('.fb-topbar [data-role="name"] input').fill('Classic toolbar flow edited');
+    await expect(page.locator('.fb-topbar .fb-autosave')).toHaveClass(/pending/);
+    const edited = await layout();
+    expect(edited.chip.width, 'the chip keeps its width').toBeCloseTo(saved.chip.width, 0);
+    expect(edited.history.top, 'History stays on its row').toBeCloseTo(saved.history.top, 0);
+    expect(edited.bar.height, 'the bar keeps its height').toBeCloseTo(saved.bar.height, 0);
+    expect(edited.palette.top, 'the palette does not move').toBeCloseTo(saved.palette.top, 0);
+  });
+
+  test('a menu opened from a window is closed when its trigger is scrolled under the title bar', async ({ page }) => {
+    test.setTimeout(120000);
+    await loginAsAdmin(page, { port: PORT });
+    await page.evaluate(async () => {
+      const { openActionMenu } = await import('/js/lib/actions/menu.js');
+      const win = document.createElement('tf-window');
+      win.setAttribute('title', 'Scrolling');
+      win.setAttribute('buttons', 'close');
+      win.setAttribute('width', '480');
+      win.setAttribute('height', '320');
+      win.setAttribute('initial-x', 'center');
+      win.setAttribute('initial-y', 'center');
+      win.innerHTML = '<div slot="body"><div style="height:20px"></div><tf-button id="menu-trigger" variant="secondary">Open</tf-button><div style="height:1600px"></div></div>';
+      document.body.appendChild(win);
+      window.__menuWindow = win;
+      window.__openMenu = () => openActionMenu(document.getElementById('menu-trigger'), [{ label: 'Edit', run() {} }], 'Item');
+    });
+    await expect.poll(() => page.evaluate(() => { const b = window.__menuWindow.shadowRoot.querySelector('.tf-window-body'); return b.scrollHeight > b.clientHeight; })).toBe(true);
+    await page.evaluate(() => window.__openMenu());
+    await expect(page.locator('body > tf-menu[open]')).toHaveCount(1);
+    await page.evaluate(() => { window.__menuWindow.shadowRoot.querySelector('.tf-window-body').scrollTop = 120; });
+    // The body may scroll smoothly: the menu must be gone once the trigger is hidden.
+    await expect.poll(() => page.evaluate(() => {
+      const body = window.__menuWindow.shadowRoot.querySelector('.tf-window-body').getBoundingClientRect();
+      const trigger = document.getElementById('menu-trigger').getBoundingClientRect();
+      return { above: trigger.bottom <= body.top, onScreen: trigger.bottom > 0, scrollTop: body.scrollTop, gap: body.top - trigger.bottom };
+    }), { message: 'the trigger is fully above the body yet still inside the page' }).toMatchObject({ above: true, onScreen: true });
+    await expect(page.locator('body > tf-menu')).toHaveCount(0);
+  });
+
+  test('ArrowDown and ArrowUp on the closed More button open the menu at its first and its last item', async ({ page }) => {
+    await loginAsAdmin(page, { port: PORT });
+    const own = await createDefinition(page, 'More arrows');
+    await openDesigner(page, { login: false, id: own });
+    await page.waitForTimeout(1000);
+    const menu = page.locator('tf-menu[data-role="more-menu"]');
+    const reachable = await menu.evaluate((element) => [...element.querySelectorAll(':scope > tf-menu-item:not([hidden]):not([disabled])')].map((item) => item.dataset.role));
+    const focused = () => page.evaluate(() => document.activeElement?.closest('tf-menu-item')?.dataset.role ?? null);
+    for (const [key, expected] of [['ArrowDown', reachable[0]], ['ArrowUp', reachable.at(-1)]]) {
+      await page.locator('[data-role="more"] button').focus();
+      await page.keyboard.press(key);
+      await expect(menu).toHaveAttribute('open', '');
+      await expect(page.locator('tf-menu[data-role="more-menu"] .tf-menu.open')).toHaveCount(1);
+      await page.waitForTimeout(150);
+      expect(await focused(), `${key} lands on the ${key === 'ArrowDown' ? 'first' : 'last'} item`).toBe(expected);
+      await page.keyboard.press('Escape');
+      await expect(menu).not.toHaveAttribute('open', '');
+    }
+  });
+});

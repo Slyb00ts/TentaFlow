@@ -289,6 +289,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   wtedy, gdy przewija go kontener w shadow DOM (treść okna `tf-window`), i zamyka się,
   gdy wyzwalacz znika pod krawędzią tego kontenera; zamykane menu oddaje fokus
   wyzwalaczowi, jeśli był w panelu; polski status „Nierozpoczęte” jest pisany łącznie.
+- Runda 9 poprawek designera (tylko GUI): pasek klasycznego Flow Buildera nie zmienia
+  układu przy zmianie chipa autozapisu; menu `tf-menu` zamyka się, gdy wyzwalacz w
+  oknie `tf-window` zniknie pod paskiem tytułu, a strzałki na zamkniętym przycisku
+  „Więcej” je otwierają; odmowa zdarzenia brzegowego na powtarzanym zadaniu podaje
+  rodzaj zadania, nie powtarzanie; strefa czasowa `utc`/`gmt`/`est` jest naprawiana
+  do pisowni silnika; zadanie z powtarzaniem może zadeklarować zmienną na zebrane
+  wyniki w swojej sekcji.
 
 ### TentaNas
 

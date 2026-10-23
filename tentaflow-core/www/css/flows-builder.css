@@ -109,6 +109,11 @@
   }
   .fb-shell:not(.fb-process-shell) .fb-flow-name,
   .fb-shell:not(.fb-process-shell) .fb-topbar > tf-button { flex-shrink: 0; }
+  /* The wrapping bar must not reflow when the chip changes from "Saved" to
+     "Unsaved changes…": a width that holds the usual texts, the rest is clipped
+     with an ellipsis (the full text is the tooltip). */
+  .fb-shell:not(.fb-process-shell) .fb-topbar .fb-autosave { box-sizing: border-box; width: 144px; overflow: hidden; }
+  .fb-shell:not(.fb-process-shell) .fb-topbar .fb-autosave [data-role="autosave-text"] { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 }
 
 /* The shared tf-select is a full-width form control; in the toolbar row it has

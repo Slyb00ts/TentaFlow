@@ -414,10 +414,16 @@ export function processTimezoneGaps(model) {
   return gaps;
 }
 
+// tzdb names the engine accepts that are not spelt with a capital per part and
+// that the runtime's own list may omit ("UTC" is missing from older ICU lists).
+// Typed in another letter case they are repaired to this spelling.
+const SHOUTED_TIMEZONES = ['CET', 'CST6CDT', 'EET', 'EST', 'EST5EDT', 'GB', 'GB-Eire', 'GMT', 'GMT+0', 'GMT-0', 'GMT0', 'HST', 'MET', 'MST', 'MST7MDT', 'NZ', 'NZ-CHAT', 'PRC', 'PST8PDT', 'ROC', 'ROK', 'UCT', 'UTC', 'W-SU', 'WET'];
+
 // Why a typed time zone cannot be used, or null. The engine compares names
 // exactly and spelt in full, but the browser resolves them in any letter case,
 // so a name is accepted when the runtime lists it (in any case: the canonical
-// spelling repairs that) or when it is a link such as "US/Eastern" that the
+// spelling repairs that), when it is one of the tzdb names written in capitals
+// ("utc" becomes "UTC") or when it is a link such as "US/Eastern" that the
 // runtime still resolves AND is written the way tzdb writes every name, each
 // part starting with a capital. A link cannot be matched against a list, so a
 // capital in the wrong place inside a part is left to the engine to refuse.
@@ -432,8 +438,10 @@ export function processTimezoneProblem(value) {
 }
 
 function listedTimezone(zone) {
-  if (typeof Intl.supportedValuesOf !== 'function') return null;
   const lower = zone.toLowerCase();
+  const shouted = SHOUTED_TIMEZONES.find((name) => name.toLowerCase() === lower);
+  if (shouted) return shouted;
+  if (typeof Intl.supportedValuesOf !== 'function') return null;
   return Intl.supportedValuesOf('timeZone').find((name) => name.toLowerCase() === lower) ?? null;
 }
 
@@ -837,11 +845,14 @@ export function processHasTimer(model) {
 
 // The activities a boundary event of `kind` (BoundaryTimer, BoundaryMessage,
 // BoundaryError, BoundaryEscalation) may be attached to in the shown scope. The
-// inspector's list and a drop from the palette share it.
+// inspector's list and a drop from the palette share it. Repetition adds no
+// refusal of its own: on a repeating activity the engine takes timers and
+// messages on any kind, an error only on a Service task, subprocess or Call
+// activity and an escalation only on a Service task, which is exactly what the
+// kind rules below already allow (processes/model.rs).
 export function processBoundaryHosts(graph, kind) {
   const timerOrMessage = ['BoundaryTimer', 'BoundaryMessage'].includes(kind);
-  return graph.nodes.filter((candidate) => (!candidate.repeat || !processRepeatRefusesBoundary(kind, candidate.type))
-    && (['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(candidate.type)
+  return graph.nodes.filter((candidate) => (['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(candidate.type)
     || (timerOrMessage
       && ['bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task', 'bpmn_script_task'].includes(candidate.type)))
     && (kind !== 'BoundaryError' || candidate.type !== 'bpmn_user_task')
@@ -851,30 +862,18 @@ export function processBoundaryHosts(graph, kind) {
         source.id === edge.from_node && source.type === 'bpmn_event_based_gateway'))));
 }
 
-// The engine takes timers and messages on a repeating activity, an error on a
-// Service task, a subprocess or a Call activity, and an escalation on a Service
-// task; any other boundary event on a repeating activity is refused at save
-// (processes/model.rs).
-export function processRepeatRefusesBoundary(kind, type) {
-  if (kind === 'BoundaryTimer' || kind === 'BoundaryMessage') return false;
-  if (kind === 'BoundaryError') return !['bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity'].includes(type);
-  return !(kind === 'BoundaryEscalation' && type === 'bpmn_service_task');
-}
-
 const BOUNDARY_CAPABLE = ['bpmn_user_task', 'bpmn_service_task', 'bpmn_sub_process', 'bpmn_call_activity',
   'bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task', 'bpmn_script_task'];
 
 // Every activity that could carry some boundary event in the shown scope, with
-// the reason a boundary event of `kind` is refused on it: 'repeat' when the
-// activity repeats and the engine refuses that event on a repeating one,
-// 'error_type' / 'escalation_type' when the kind of activity does, null when it
-// is offered.
+// the reason a boundary event of `kind` is refused on it: 'error_type' /
+// 'escalation_type' when the kind of activity cannot take that event (whether or
+// not it repeats), 'other' for any remaining refusal, null when it is offered.
 export function processBoundaryRefusals(graph, kind) {
   const offered = new Set(processBoundaryHosts(graph, kind).map((candidate) => candidate.id));
   return new Map(graph.nodes.filter((node) => BOUNDARY_CAPABLE.includes(node.type)).map((candidate) => [candidate.id,
     offered.has(candidate.id) ? null
-      : candidate.repeat && processRepeatRefusesBoundary(kind, candidate.type) ? 'repeat'
-        : kind === 'BoundaryError' ? 'error_type' : kind === 'BoundaryEscalation' ? 'escalation_type' : 'other']));
+      : kind === 'BoundaryError' ? 'error_type' : kind === 'BoundaryEscalation' ? 'escalation_type' : 'other']));
 }
 
 export function processBoundaryKind(type) {

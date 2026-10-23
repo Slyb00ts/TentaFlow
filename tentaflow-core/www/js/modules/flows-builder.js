@@ -493,7 +493,12 @@ const FlowBuilderScreen = {
       moreMenu.addEventListener('open', (event) => {
         if (event.target !== moreMenu) return;
         more.setAttribute('aria-expanded', 'true');
-        queueMicrotask(() => [...moreMenu.querySelectorAll(':scope > tf-menu-item:not([hidden]):not([disabled]) > .tf-menu-item')][0]?.focus());
+        // The arrow keys on the button open it at the first or the last item
+        // themselves; only a press or a click still needs the first one.
+        queueMicrotask(() => {
+          if (moreMenu.contains(document.activeElement)) return;
+          [...moreMenu.querySelectorAll(':scope > tf-menu-item:not([hidden]):not([disabled]) > .tf-menu-item')][0]?.focus();
+        });
       });
       moreMenu.addEventListener('close', (event) => {
         if (event.target !== moreMenu) return;
