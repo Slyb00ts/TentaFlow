@@ -2985,6 +2985,27 @@ fn require_source_current(
         }
         return Ok(());
     }
+    if let Some(agent_id) = tentaflow_protocol::processes::parse_agent_source_ref(flow_id) {
+        // An agent is not frozen by publication: the step stays runnable while
+        // the agent exists, is enabled and still runs on a model.
+        let agent = crate::db::repository::get_agent_on(conn, agent_id)?
+            .filter(|agent| agent.is_enabled)
+            .ok_or(ProcessAuthorityDenied("source agent is no longer enabled"))?;
+        if !matches!(
+            crate::agents::AgentRuntime::parse(&agent.runtime_json),
+            Ok(crate::agents::AgentRuntime::Llm)
+        ) {
+            return Err(ProcessAuthorityDenied("source agent no longer runs on a model").into());
+        }
+        if let Some(snapshot) = expected {
+            let pin: Value = serde_json::from_str(&snapshot.graph_json)?;
+            ensure!(
+                pin["agent_id"] == agent_id,
+                "source agent pin does not match its reference"
+            );
+        }
+        return Ok(());
+    }
     if let Some((addon_id, tool_name)) = tentaflow_protocol::processes::parse_tool_source_ref(flow_id) {
         let bundle_hash: String = conn
             .query_row(
@@ -4336,6 +4357,16 @@ pub fn publish_definition(
             ensure!(
                 snapshot.graph_json == super::blocks::block_pin(node_type, config)?.0,
                 "block snapshot does not match service task"
+            );
+        }
+        if let tentaflow_protocol::processes::ServiceImplementation::Agent {
+            agent_id, allowed_tools, max_iterations, ..
+        } = implementation {
+            // The pin must describe THIS step's agent and tool list as they are now.
+            let agent = super::agent_pin::check_agent(&tx, agent_id, allowed_tools, *max_iterations)?;
+            ensure!(
+                snapshot.graph_json == super::agent_pin::agent_pin(&agent, allowed_tools)?.graph_json,
+                "agent snapshot does not match service task"
             );
         }
         if snapshot.implementation_kind.is_flow() {
@@ -21421,7 +21452,7 @@ fn apply_plan_on(
                 job.node_id,job.token_id,definition_id,version,selected_process_id,
                 model_sha256,source_ref,pins[0].info.graph_sha256,
                 hex::encode(Sha256::digest(input_json.as_bytes())),at_ms,
-                implementation.kind().invocation_column()])?;
+                implementation.kind().as_str()])?;
     }
     for token_id in &plan.consume_token_ids {
         let mut statement=tx.prepare("SELECT user_task_id FROM bpmn_user_tasks WHERE instance_id=?1 AND token_id=?2 AND status='open'")?;
@@ -24130,7 +24161,7 @@ fn job_source_ref_on(conn: &Connection, job_id: &str) -> Result<String> {
     }
 }
 
-fn job_activation_live_on(conn: &Connection, job_id: &str) -> Result<bool> {
+pub(super) fn job_activation_live_on(conn: &Connection, job_id: &str) -> Result<bool> {
     let instance_id: Option<String> = conn
         .query_row(
             "SELECT instance_id FROM bpmn_jobs WHERE job_id=?1",

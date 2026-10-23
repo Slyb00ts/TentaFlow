@@ -431,6 +431,17 @@ fn mapping(parent: &Element, name: &str) -> Result<BTreeMap<String, String>> {
     }
 }
 
+/// The text of `<tentaflow:agentConfig>`: what an agent step carries besides
+/// its agent id and iteration budget attributes.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentConfigXml {
+    goal_expression: String,
+    allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_schema: Option<serde_json::Value>,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MessageStartConfig {
@@ -2510,6 +2521,8 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                 "addonId",
                 "toolName",
                 "nodeType",
+                "agentId",
+                "maxIterations",
                 "timeoutSeconds",
                 "verification",
             ])?;
@@ -2519,6 +2532,7 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                 (TF, "condition"),
                 (TF, "resultExpression"),
                 (TF, "blockConfig"),
+                (TF, "agentConfig"),
             ])?;
             let result_expression = service
                 .child(TF, "resultExpression")?
@@ -2560,8 +2574,10 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                         service.attr("addonId").is_none()
                             && service.attr("toolName").is_none()
                             && service.attr("nodeType").is_none()
-                            && service.child(TF, "blockConfig")?.is_none(),
-                        "flow service cannot name an addon tool or a block"
+                            && service.attr("agentId").is_none()
+                            && service.child(TF, "blockConfig")?.is_none()
+                            && service.child(TF, "agentConfig")?.is_none(),
+                        "flow service cannot name an addon tool, a block or an agent"
                     );
                     (service.required("flowId")?, ServiceImplementation::Flow)
                 }
@@ -2569,8 +2585,10 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                     ensure!(
                         service.attr("flowId").is_none()
                             && service.attr("addonId").is_none()
-                            && service.attr("toolName").is_none(),
-                        "block service cannot name a flow or an addon tool"
+                            && service.attr("toolName").is_none()
+                            && service.attr("agentId").is_none()
+                            && service.child(TF, "agentConfig")?.is_none(),
+                        "block service cannot name a flow, an addon tool or an agent"
                     );
                     let config = match service.child(TF, "blockConfig")? {
                         None => serde_json::json!({}),
@@ -2593,14 +2611,46 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                     ensure!(
                         service.attr("flowId").is_none()
                             && service.attr("nodeType").is_none()
-                            && service.child(TF, "blockConfig")?.is_none(),
-                        "tool service cannot name a flow or a block"
+                            && service.attr("agentId").is_none()
+                            && service.child(TF, "blockConfig")?.is_none()
+                            && service.child(TF, "agentConfig")?.is_none(),
+                        "tool service cannot name a flow, a block or an agent"
                     );
                     (
                         String::new(),
                         ServiceImplementation::AddonTool {
                             addon_id: service.required("addonId")?,
                             tool_name: service.required("toolName")?,
+                        },
+                    )
+                }
+                "agent" => {
+                    ensure!(
+                        service.attr("flowId").is_none()
+                            && service.attr("addonId").is_none()
+                            && service.attr("toolName").is_none()
+                            && service.attr("nodeType").is_none()
+                            && service.child(TF, "blockConfig")?.is_none(),
+                        "agent service cannot name a flow, an addon tool or a block"
+                    );
+                    let config = service
+                        .child(TF, "agentConfig")?
+                        .context("agent service requires its agentConfig")?;
+                    config.attrs_only(&[])?;
+                    ensure!(config.children.is_empty(), "agent configuration must be text");
+                    let config: AgentConfigXml = serde_json::from_str(config.text.trim())
+                        .context("agent configuration is not valid JSON")?;
+                    (
+                        String::new(),
+                        ServiceImplementation::Agent {
+                            agent_id: service.required("agentId")?,
+                            goal_expression: config.goal_expression,
+                            allowed_tools: config.allowed_tools,
+                            max_iterations: service
+                                .required("maxIterations")?
+                                .parse()
+                                .context("invalid agent iteration budget")?,
+                            output_schema: config.output_schema,
                         },
                     )
                 }
@@ -4695,6 +4745,10 @@ fn write_graph(
                         "implementation=\"block\" nodeType=\"{}\"",
                         escaped(node_type)
                     ),
+                    ServiceImplementation::Agent { agent_id, max_iterations, .. } => format!(
+                        "implementation=\"agent\" agentId=\"{}\" maxIterations=\"{max_iterations}\"",
+                        escaped(agent_id)
+                    ),
                 };
                 xml.push_str(&format!("><bpmn:extensionElements><tentaflow:service {source} timeoutSeconds=\"{timeout_seconds}\" verification=\"{verify}\">"));
                 if !input_mapping.is_empty() {
@@ -4725,6 +4779,25 @@ fn write_graph(
                     xml.push_str(&format!(
                         "<tentaflow:blockConfig>{}</tentaflow:blockConfig>",
                         escaped(&serde_json::to_string(&super::repository::canonical_json_value(config))?)
+                    ));
+                }
+                if let ServiceImplementation::Agent {
+                    goal_expression,
+                    allowed_tools,
+                    output_schema,
+                    ..
+                } = implementation
+                {
+                    let config = AgentConfigXml {
+                        goal_expression: goal_expression.clone(),
+                        allowed_tools: allowed_tools.clone(),
+                        output_schema: output_schema
+                            .as_ref()
+                            .map(super::repository::canonical_json_value),
+                    };
+                    xml.push_str(&format!(
+                        "<tentaflow:agentConfig>{}</tentaflow:agentConfig>",
+                        escaped(&serde_json::to_string(&config)?)
                     ));
                 }
                 xml.push_str("</tentaflow:service>");

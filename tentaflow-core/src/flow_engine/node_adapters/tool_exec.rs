@@ -28,6 +28,7 @@ use crate::flow_engine::envelope::{ChatRole, FlowEnvelope, FlowValue, LlmToolCal
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::node_adapters::InteractionGate;
 use crate::flow_engine::types::{FlowDataType, FlowNode};
+use crate::processes::agent_sink as process_sink;
 use crate::project_studio::{
     generation as project_generation, ingest as project_ingest, knowledge as project_knowledge,
 };
@@ -225,6 +226,54 @@ impl ToolExecNodeAdapter {
         CoreToolName::from_public_name(name)
             .map(|c| c.is_case_save())
             .unwrap_or(false)
+    }
+
+    /// True for `core.task_complete` — the sink of a process agent step.
+    fn is_process_sink(name: &str) -> bool {
+        CoreToolName::from_public_name(name)
+            .map(|c| c.is_process_sink())
+            .unwrap_or(false)
+    }
+
+    /// Runs one `core.task_complete` call. The step it reports for comes ONLY
+    /// from `envelope.meta["process_activity"]`, minted when the process layer
+    /// spawned the run, and the reporting run must be the one created for that
+    /// step; a run without the binding gets a tool error. A rejected report is a
+    /// `[TOOL_ERROR]` the model can repair and retry, except a second report,
+    /// which is final.
+    fn run_task_complete_call(
+        service: &Arc<AgentService>,
+        run_id: &str,
+        envelope: &FlowEnvelope,
+        call: &LlmToolCall,
+    ) -> ToolCallResult {
+        let args: Value = match serde_json::from_str(&call.arguments) {
+            Ok(v) => v,
+            Err(e) => return error_result(call, format!("invalid arguments JSON: {e}")),
+        };
+        let Some(binding) = process_sink::binding_from_meta(&envelope.meta) else {
+            return error_result(
+                call,
+                "this run is not a process step \
+                 (core.task_complete works only inside a process agent step)"
+                    .to_string(),
+            );
+        };
+        match process_sink::complete_task(
+            service.db(),
+            &binding,
+            run_id,
+            &args,
+            Utc::now().timestamp_millis(),
+        ) {
+            Ok(output) => ToolCallResult {
+                tool_call_id: call.id.clone(),
+                name: call.name.clone(),
+                content: output.to_string(),
+                success: true,
+            },
+            Err(message) => error_result(call, message),
+        }
     }
 
     /// True for the Code Studio verbs (§10). Async: every one of them binds its
@@ -918,8 +967,10 @@ impl ToolExecNodeAdapter {
         tools_json: &str,
         call: &LlmToolCall,
     ) -> ToolCallResult {
-        if !service.tool_allowed(&tools_json, &call.name) {
+        if !service.tool_allowed_in_run(&tools_json, &envelope.meta, &call.name) {
             error_result(call, format!("tool '{}' not in agent allowlist", call.name))
+        } else if Self::is_process_sink(&call.name) {
+            Self::run_task_complete_call(service, run_id, envelope, call)
         } else if CoreToolName::from_public_name(&call.name)
             .map(|c| c.is_ask_user())
             .unwrap_or(false)
@@ -2055,5 +2106,180 @@ mod tests {
             http.finish();
             std::mem::forget(root);
         }
+    }
+}
+
+#[cfg(test)]
+mod process_sink_tests {
+    use super::*;
+    use crate::agents::AgentService;
+    use crate::flow_engine::envelope::ChatMessage;
+    use crate::flow_engine::node_adapter::test_support::stub_ctx;
+    use crate::processes::agent_sink::ProcessActivityBinding;
+    use crate::processes::agent_sink_tests::{agent_implementation, running_step, seed_agent, AGENT_ID};
+    use crate::processes::runtime::test_support::Fixture;
+    use serde_json::json;
+
+    fn adapter(fixture: &Fixture) -> ToolExecNodeAdapter {
+        let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
+        let addon_manager = Arc::new(
+            crate::addon::AddonManager::new(fixture.db.clone(), cipher).expect("addon manager"),
+        );
+        let service = Arc::new(AgentService::new(fixture.db.clone(), addon_manager));
+        ToolExecNodeAdapter::new(Arc::new(parking_lot::RwLock::new(Some(service))))
+    }
+
+    fn call(id: &str, name: &str, arguments: Value) -> LlmToolCall {
+        LlmToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: arguments.to_string(),
+        }
+    }
+
+    /// Runs one assistant turn of tool calls the way the harness loop does and
+    /// returns the text of each tool answer, in call order.
+    async fn answers(
+        fixture: &Fixture,
+        binding: Option<&ProcessActivityBinding>,
+        run_id: &str,
+        calls: Vec<LlmToolCall>,
+    ) -> Vec<String> {
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert("agent_id".into(), json!(AGENT_ID));
+        env.meta.insert("agent_run_id".into(), json!(run_id));
+        if let Some(binding) = binding {
+            let (key, value) = binding.meta_entry();
+            env.meta.insert(key.into(), value);
+        }
+        let mut turn = ChatMessage::assistant("");
+        turn.tool_calls = Some(calls);
+        env.context.messages.push(turn);
+        let node = FlowNode {
+            id: "te1".into(),
+            node_type: NODE_TYPE.into(),
+            config: json!({}),
+            position: None,
+            label: None,
+            region: None,
+        };
+        let input = NodeInput {
+            from_node_id: "llm".into(),
+            from_port: "full".into(),
+            envelope: Arc::new(env),
+        };
+        let out = adapter(fixture)
+            .execute(&node, &[input], &stub_ctx())
+            .await
+            .expect("the turn ends normally");
+        out.context
+            .messages
+            .iter()
+            .filter(|message| message.role == ChatRole::Tool)
+            .map(|message| message.text().expect("text answer").to_owned())
+            .collect()
+    }
+
+    fn rows(fixture: &Fixture) -> i64 {
+        fixture
+            .db
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM bpmn_agent_completions", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_sink_reports_for_the_bound_step_and_a_second_report_is_final() {
+        let fixture = Fixture::new();
+        seed_agent(&fixture, AGENT_ID, r#"["core.skill_view"]"#, 10, true);
+        let (_, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+        let run_id = binding.agent_run_id();
+        let report = json!({"outcome": "completed", "summary": "done", "outputs": {"n": 1}});
+
+        let first = answers(
+            &fixture,
+            Some(&binding),
+            &run_id,
+            vec![call("c1", "core.task_complete", report.clone())],
+        )
+        .await;
+        assert!(first[0].contains("recorded"), "{first:?}");
+        assert_eq!(rows(&fixture), 1);
+
+        let second = answers(
+            &fixture,
+            Some(&binding),
+            &run_id,
+            vec![call("c2", "core.task_complete", report)],
+        )
+        .await;
+        assert!(second[0].contains("already completed"), "{second:?}");
+        assert_eq!(rows(&fixture), 1);
+    }
+
+    #[tokio::test]
+    async fn the_sink_refuses_a_run_that_is_not_the_one_spawned_for_the_step() {
+        let fixture = Fixture::new();
+        seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+        let (_, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+        let answered = answers(
+            &fixture,
+            Some(&binding),
+            "some-other-run",
+            vec![call(
+                "c1",
+                "core.task_complete",
+                json!({"outcome": "completed", "summary": "done"}),
+            )],
+        )
+        .await;
+        assert!(answered[0].contains("was not started for the step"), "{answered:?}");
+        assert_eq!(rows(&fixture), 0);
+    }
+
+    #[tokio::test]
+    async fn without_the_binding_the_sink_is_not_a_process_step() {
+        let fixture = Fixture::new();
+        seed_agent(&fixture, AGENT_ID, r#"["core.task_complete"]"#, 10, true);
+        let (_, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+        let answered = answers(
+            &fixture,
+            None,
+            &binding.agent_run_id(),
+            vec![call(
+                "c1",
+                "core.task_complete",
+                json!({"outcome": "completed", "summary": "done"}),
+            )],
+        )
+        .await;
+        assert!(answered[0].contains("not a process step"), "{answered:?}");
+        assert_eq!(rows(&fixture), 0);
+    }
+
+    #[tokio::test]
+    async fn a_step_runs_only_the_tools_both_the_agent_and_the_step_allow() {
+        let fixture = Fixture::new();
+        seed_agent(&fixture, AGENT_ID, r#"["core.skill_view"]"#, 10, true);
+        let (_, mut binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+        let run_id = binding.agent_run_id();
+        let skill = call("c1", "core.skill_view", json!({"name": "missing"}));
+        let other = call("c2", "core.fs_read", json!({"path": "a"}));
+
+        // The step allows nothing: even a tool the agent has is out of surface.
+        binding.allowed_tools = Vec::new();
+        let none = answers(&fixture, Some(&binding), &run_id, vec![skill.clone()]).await;
+        assert!(none[0].contains("not in agent allowlist"), "{none:?}");
+
+        // The step lists a tool the agent does not have: still out of surface.
+        binding.allowed_tools = vec!["core.skill_view".into(), "core.fs_read".into()];
+        let both = answers(&fixture, Some(&binding), &run_id, vec![skill.clone(), other]).await;
+        assert!(!both[0].contains("not in agent allowlist"), "{both:?}");
+        assert!(both[1].contains("not in agent allowlist"), "{both:?}");
+
+        // Outside a process step the agent's own list is the whole rule.
+        let plain = answers(&fixture, None, &run_id, vec![skill]).await;
+        assert!(!plain[0].contains("not in agent allowlist"), "{plain:?}");
     }
 }

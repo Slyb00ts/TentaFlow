@@ -297,10 +297,13 @@ impl NodeAdapter for AgentContextNodeAdapter {
         )
         .with_correlation_id(ctx.correlation_id.clone());
         let skills = service.skill_index(&agent.skills_json)?;
-        let tool_specs = service.tool_catalog_from_allowlist(
-            &agent.tools_json,
-            &principal,
-            agent.max_subagents > 0,
+        let tool_specs = service.narrow_catalog_for_run(
+            service.tool_catalog_from_allowlist(
+                &agent.tools_json,
+                &principal,
+                agent.max_subagents > 0,
+            ),
+            &envelope.meta,
         );
 
         let mut out: FlowEnvelope = (**envelope).clone();
@@ -675,6 +678,54 @@ mod tests {
             .expect("run exists");
         assert_eq!(run.status, "running");
         assert_eq!(run.prompt, "find facts");
+    }
+
+    #[tokio::test]
+    async fn a_process_step_run_sees_the_intersection_of_tools_plus_the_sink() {
+        let pool = db();
+        let agent_id = "44444444-0000-0000-0000-000000000001";
+        seed_agent(&pool, agent_id, "stepper", "sp", r#"["core.skill_view","core.ask_user"]"#, "{}");
+        let slot = service(pool.clone());
+        let tool_names = |out: &FlowEnvelope| -> Vec<String> {
+            out.meta["harness_tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let run = |meta: Option<(&'static str, serde_json::Value)>| {
+            let slot = slot.clone();
+            async move {
+                let mut env = FlowEnvelope::empty();
+                env.payload = FlowValue::Text("work".into());
+                if let Some((key, value)) = meta {
+                    env.meta.insert(key.into(), value);
+                }
+                let mut ctx = stub_ctx();
+                ctx.user_id = Some("u1".into());
+                AgentContextNodeAdapter::new(slot)
+                    .execute(&node(json!({"agent_id": agent_id})), &[input(env)], &ctx)
+                    .await
+                    .expect("execute")
+            }
+        };
+        let binding = |allowed: &[&str]| {
+            crate::processes::agent_sink::ProcessActivityBinding {
+                invocation_id: "inv".into(),
+                instance_id: "ins".into(),
+                node_id: "n".into(),
+                attempt: 1,
+                fence: 1,
+                allowed_tools: allowed.iter().map(|tool| (*tool).to_owned()).collect(),
+                output_schema: None,
+            }
+            .meta_entry()
+        };
+
+        assert_eq!(tool_names(&run(None).await), ["core.skill_view", "core.ask_user"]);
+        let narrowed = run(Some(binding(&["core.skill_view", "core.fs_read"]))).await;
+        assert_eq!(tool_names(&narrowed), ["core.skill_view", "core.task_complete"]);
     }
 
     #[tokio::test]

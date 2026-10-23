@@ -409,6 +409,18 @@ pub async fn execute_claimed(
         ServiceImplementation::Block { node_type, config } => {
             execute_block(&job, snapshot, node_type, config).await
         }
+        // The sink and the binding an agent run reports through exist
+        // (`agent_sink`), the executor that spawns it does not yet. Failing
+        // before the dispatch boundary leaves nothing running and the failure
+        // visible as an incident instead of a task that waits forever.
+        ServiceImplementation::Agent { .. } => fail_claim(
+            pool,
+            worker_id,
+            &claimed,
+            "AGENT_EXECUTOR_UNAVAILABLE",
+            "agent steps cannot be executed by this build yet",
+            None,
+        ),
     }
 }
 

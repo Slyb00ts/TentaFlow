@@ -4755,6 +4755,9 @@ mod tests {
         // No addon manager in for_test() → addons empty, but core builtins always present.
         let core = catalog["core"].as_array().unwrap();
         assert!(core.iter().any(|t| t["name"] == "core.skill_view"));
+        // The completion tool of a process step is granted by the process, never
+        // picked into an agent's allow-list.
+        assert!(!core.iter().any(|t| t["name"] == "core.task_complete"));
     }
 
     #[tokio::test]

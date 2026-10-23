@@ -438,9 +438,12 @@ impl AgentRunManager {
     ///
     /// The sub-agent path needs the id BEFORE the run exists: a Code Studio
     /// session registers the run's row and timeline entry before it starts, so
-    /// the run can never report into a session that does not know it.
+    /// the run can never report into a session that does not know it. A process
+    /// step needs it for the same reason in reverse: the run id is derived from
+    /// the invocation, so the sink can tell the run that was spawned for a step
+    /// from any other.
     #[allow(clippy::too_many_arguments)]
-    async fn spawn_with_run_id(
+    pub async fn spawn_with_run_id(
         &self,
         run_id: &str,
         agent_id: &str,

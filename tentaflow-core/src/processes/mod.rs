@@ -1,5 +1,7 @@
 // ============ File: processes/mod.rs — BPMN B1 process validation, persistence, XML, and execution ============
 
+pub mod agent_pin;
+pub mod agent_sink;
 pub mod blocks;
 pub mod bpmn;
 pub mod calendar;
@@ -70,6 +72,8 @@ mod simulation_tests;
 mod tool_task_tests;
 #[cfg(test)]
 mod block_task_tests;
+#[cfg(test)]
+pub(crate) mod agent_sink_tests;
 #[cfg(test)]
 mod result_routing_tests;
 #[cfg(test)]

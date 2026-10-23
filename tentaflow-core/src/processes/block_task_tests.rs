@@ -93,7 +93,7 @@ async fn block_result_flows_through_the_shared_machinery_as_an_envelope_result()
     assert_eq!(result.outputs["payload"], "call me later");
     assert_eq!(
         invocation(&fixture, &claimed.job.job_id),
-        ("flow".into(), "block:pii_filter".into(), "accepted".into())
+        ("block".into(), "block:pii_filter".into(), "accepted".into())
     );
     // A block has no `flows` row, so no execution record may be written for it.
     assert_eq!(execution_rows(&fixture), 0);

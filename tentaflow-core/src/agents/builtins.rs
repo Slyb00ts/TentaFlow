@@ -56,6 +56,12 @@ pub enum CoreToolName {
     /// minted at spawn, so the model can never redirect output to another
     /// project. Async path (per-call membership + editor re-check).
     CaseSave,
+    /// `core.task_complete(...)` — the ONE way an agent step of a process ends.
+    /// The invocation it reports for is not a parameter: it binds server-side
+    /// via `envelope.meta["process_activity"]`, minted when the process layer
+    /// spawns the run, so a model can never complete another activity. The
+    /// first report wins; a second is a tool error.
+    TaskComplete,
 
     // --- Code Studio (§10). The complete verb set of a coding agent: every
     // one of these binds its session server-side through
@@ -128,6 +134,7 @@ impl CoreToolName {
             CoreToolName::ProjectSearch => "core.project_search",
             CoreToolName::ProjectListSources => "core.project_list_sources",
             CoreToolName::CaseSave => "core.project_case_save",
+            CoreToolName::TaskComplete => "core.task_complete",
             CoreToolName::FsRead => "core.fs_read",
             CoreToolName::FsList => "core.fs_list",
             CoreToolName::FsGlob => "core.fs_glob",
@@ -207,6 +214,13 @@ impl CoreToolName {
         matches!(self, CoreToolName::CaseSave)
     }
 
+    /// True for `core.task_complete` — the process-activity sink. It is offered
+    /// only to a run that carries the server-minted binding, never through an
+    /// allow-list, so it is also kept out of the editor's pickable catalog.
+    pub fn is_process_sink(self) -> bool {
+        matches!(self, CoreToolName::TaskComplete)
+    }
+
     /// True for the sub-agent control builtins, which are admitted to the tool
     /// catalog only when the running agent may spawn (`max_subagents > 0`, §3.6).
     pub fn is_subagent_control(self) -> bool {
@@ -264,6 +278,7 @@ impl CoreToolName {
             CoreToolName::ProjectSearch,
             CoreToolName::ProjectListSources,
             CoreToolName::CaseSave,
+            CoreToolName::TaskComplete,
             CoreToolName::FsRead,
             CoreToolName::FsList,
             CoreToolName::FsGlob,
@@ -477,6 +492,48 @@ impl CoreToolName {
                         }
                     },
                     "required": ["project_id"]
+                }),
+            },
+            CoreToolName::TaskComplete => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Finish the process step you were given by reporting its result. \
+                              Call it exactly once, when the work is done or cannot be done: \
+                              the first report is final and a second one is rejected. Which \
+                              step you report for is bound server-side; do not pass any ids. \
+                              Use outcome `completed` with the produced `outputs`, `error` \
+                              when the step failed (give a short `code`), or `needs_human` \
+                              when a person must decide. A [TOOL_ERROR] means the report was \
+                              not accepted: fix it per the message and call again."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "outcome": {
+                            "type": "string",
+                            "enum": ["completed", "error", "needs_human"],
+                            "description": "How the step ended."
+                        },
+                        "code": {
+                            "type": "string",
+                            "description": "Machine-readable reason, 1..64 characters of \
+                                            A-Z a-z 0-9 _ . : -. Recommended for error and \
+                                            needs_human."
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "What happened, in a few sentences."
+                        },
+                        "outputs": {
+                            "description": "The produced data. For `completed` it must match \
+                                            the output schema of the step, when it has one."
+                        },
+                        "evidence": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Short references that support the report."
+                        }
+                    },
+                    "required": ["outcome", "summary"]
                 }),
             },
             CoreToolName::CaseSave => LlmToolSpec {
@@ -1408,6 +1465,34 @@ mod tests {
                 "bare name must be the public name without the prefix"
             );
         }
+    }
+
+    #[test]
+    fn task_complete_is_the_process_sink_and_names_no_target() {
+        let tool = CoreToolName::from_public_name("core.task_complete").expect("known builtin");
+        assert_eq!(tool, CoreToolName::TaskComplete);
+        assert!(tool.is_process_sink());
+        assert!(!tool.is_synchronous());
+        assert!(!tool.is_code_studio() && !tool.is_case_save() && !tool.is_ask_user());
+        for other in CoreToolName::all().iter().filter(|t| **t != tool) {
+            assert!(!other.is_process_sink(), "{}", other.public_name());
+        }
+        // The step it reports for is bound server-side; a parameter naming one
+        // would be the redirection the binding exists to prevent.
+        let spec = tool.spec();
+        let mut properties: Vec<&str> = spec.parameters["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        properties.sort_unstable();
+        assert_eq!(properties, ["code", "evidence", "outcome", "outputs", "summary"]);
+        assert_eq!(spec.parameters["required"], serde_json::json!(["outcome", "summary"]));
+        assert_eq!(
+            spec.parameters["properties"]["outcome"]["enum"],
+            serde_json::json!(["completed", "error", "needs_human"])
+        );
     }
 
     #[test]

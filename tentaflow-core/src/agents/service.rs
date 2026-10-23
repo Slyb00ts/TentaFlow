@@ -4,6 +4,7 @@
 // Constructed in main.rs and pinned into FlowDispatcher's AgentServiceSlot so
 // the phase-3 blocks (agent_context, tool_exec) read it. =====
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -14,6 +15,7 @@ use crate::compliance::ai_gateway::{AiGateway, ToolExecution};
 use crate::db::{models::DbAgent, repository, DbPool};
 use crate::flow_engine::dispatchers::LlmToolSpec;
 use crate::flow_engine::envelope::LlmToolCall;
+use crate::processes::agent_sink::binding_from_meta;
 
 use super::builtins::{execute_core_tool, is_core_tool, CoreToolName};
 use super::catalog::{tool_in_allowlist, ToolCatalog};
@@ -346,6 +348,46 @@ impl AgentService {
         tool_in_allowlist(tools_json, name, package_id.as_deref())
     }
 
+    /// [`Self::tool_allowed`] for one run: a run spawned for a process step is
+    /// limited to the agent's allow-list AND the step's own list (the
+    /// intersection), and `core.task_complete` is open to it alone. Any other run
+    /// is judged by the agent's list; the completion tool is never advertised to
+    /// it and refuses to run (the sink checks the binding itself).
+    pub fn tool_allowed_in_run(
+        &self,
+        tools_json: &str,
+        meta: &BTreeMap<String, serde_json::Value>,
+        name: &str,
+    ) -> bool {
+        let sink = CoreToolName::TaskComplete.public_name();
+        match binding_from_meta(meta) {
+            None => self.tool_allowed(tools_json, name),
+            Some(binding) => {
+                name == sink
+                    || (self.tool_allowed(tools_json, name)
+                        && self.tool_allowed(&binding.allowed_tools_json(), name))
+            }
+        }
+    }
+
+    /// The catalog a run's model sees, after the process-step narrowing: the
+    /// same intersection as [`Self::tool_allowed_in_run`], with the completion
+    /// tool added exactly when the run carries the binding.
+    pub fn narrow_catalog_for_run(
+        &self,
+        mut specs: Vec<LlmToolSpec>,
+        meta: &BTreeMap<String, serde_json::Value>,
+    ) -> Vec<LlmToolSpec> {
+        let sink = CoreToolName::TaskComplete;
+        specs.retain(|spec| spec.name != sink.public_name());
+        if let Some(binding) = binding_from_meta(meta) {
+            let allowed = binding.allowed_tools_json();
+            specs.retain(|spec| self.tool_allowed(&allowed, &spec.name));
+            specs.push(sink.spec());
+        }
+        specs
+    }
+
     /// The allowlist of the agent the harness pinned on the run
     /// (`envelope.meta["agent_id"]`). THE one loader: `tool_exec` and every
     /// deterministic block that runs a core verb read the surface here, so the
@@ -598,6 +640,74 @@ mod tests {
         // gamma is disabled → excluded; result is name-sorted.
         assert_eq!(names, vec!["alpha", "beta"]);
         assert_eq!(index[0].1, "Alpha skill");
+    }
+
+    fn binding(allowed_tools: &[&str]) -> BTreeMap<String, serde_json::Value> {
+        let binding = crate::processes::agent_sink::ProcessActivityBinding {
+            invocation_id: "inv".into(),
+            instance_id: "ins".into(),
+            node_id: "n".into(),
+            attempt: 1,
+            fence: 1,
+            allowed_tools: allowed_tools.iter().map(|tool| (*tool).to_owned()).collect(),
+            output_schema: None,
+        };
+        let (key, value) = binding.meta_entry();
+        BTreeMap::from([(key.to_owned(), value)])
+    }
+
+    fn names(specs: &[LlmToolSpec]) -> Vec<&str> {
+        specs.iter().map(|spec| spec.name.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_process_step_narrows_to_the_intersection_and_adds_the_sink() {
+        let svc = service(db());
+        let agent_tools = r#"["core.skill_view","core.ask_user"]"#;
+        let catalog = svc.tool_catalog_from_allowlist(
+            agent_tools,
+            &AgentPrincipal::user("u1"),
+            false,
+        );
+        assert_eq!(names(&catalog), ["core.skill_view", "core.ask_user"]);
+
+        // A step that allows more than the agent has gets no more than the agent.
+        let narrowed = svc.narrow_catalog_for_run(
+            catalog.clone(),
+            &binding(&["core.skill_view", "core.fs_read"]),
+        );
+        assert_eq!(names(&narrowed), ["core.skill_view", "core.task_complete"]);
+
+        // A step that allows nothing still gets the way to finish.
+        let bare = svc.narrow_catalog_for_run(catalog.clone(), &binding(&[]));
+        assert_eq!(names(&bare), ["core.task_complete"]);
+
+        // Any other run never sees the sink, even when its author listed it.
+        let listed = svc.tool_catalog_from_allowlist(
+            r#"["core.skill_view","core.task_complete"]"#,
+            &AgentPrincipal::user("u1"),
+            false,
+        );
+        assert_eq!(names(&listed), ["core.skill_view", "core.task_complete"]);
+        let plain = svc.narrow_catalog_for_run(listed, &BTreeMap::new());
+        assert_eq!(names(&plain), ["core.skill_view"]);
+    }
+
+    #[tokio::test]
+    async fn the_dispatch_gate_applies_the_same_intersection() {
+        let svc = service(db());
+        let agent_tools = r#"["core.skill_view","core.ask_user"]"#;
+        let step = binding(&["core.skill_view", "core.fs_read"]);
+        assert!(svc.tool_allowed_in_run(agent_tools, &step, "core.skill_view"));
+        // Allowed by the agent, not by the step.
+        assert!(!svc.tool_allowed_in_run(agent_tools, &step, "core.ask_user"));
+        // Allowed by the step, not by the agent.
+        assert!(!svc.tool_allowed_in_run(agent_tools, &step, "core.fs_read"));
+        // The sink needs no list entry, but only a bound run has it open.
+        assert!(svc.tool_allowed_in_run(agent_tools, &step, "core.task_complete"));
+        assert!(!svc.tool_allowed_in_run(agent_tools, &BTreeMap::new(), "core.task_complete"));
+        // Without a binding the agent's own list decides.
+        assert!(svc.tool_allowed_in_run(agent_tools, &BTreeMap::new(), "core.ask_user"));
     }
 
     #[tokio::test]

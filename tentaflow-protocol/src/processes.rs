@@ -838,6 +838,18 @@ pub enum ServiceImplementation {
         node_type: String,
         config: serde_json::Value,
     },
+    /// One run of a platform agent that reports through the `core.task_complete`
+    /// sink. `allowed_tools` narrows the agent's own allow-list for this step
+    /// and can never widen it; `output_schema` (a JSON Schema subset) bounds the
+    /// `outputs` of a `completed` report.
+    Agent {
+        agent_id: String,
+        goal_expression: String,
+        allowed_tools: Vec<String>,
+        max_iterations: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_schema: Option<serde_json::Value>,
+    },
 }
 
 impl ServiceImplementation {
@@ -850,21 +862,33 @@ impl ServiceImplementation {
             Self::Flow => ServiceImplementationKind::Flow,
             Self::AddonTool { .. } => ServiceImplementationKind::AddonTool,
             Self::Block { .. } => ServiceImplementationKind::Block,
+            Self::Agent { .. } => ServiceImplementationKind::Agent,
         }
     }
 
     /// Stable reference to the implementation, stored in the immutable
     /// invocation row and in the publication pin: the Flow id itself for a
     /// Flow, `tool:<addon>/<tool>` for an addon tool, `block:<node_type>` for a
-    /// block. Flow ids are UUIDs and tool and block identifiers cannot contain
-    /// `/` or `:`, so the forms never collide.
+    /// block, `agent:<agent_id>` for an agent. Flow ids are UUIDs and the other
+    /// identifiers cannot contain `/` or `:`, so the forms never collide.
     pub fn source_ref(&self, flow_id: &str) -> String {
         match self {
             Self::Flow => flow_id.to_owned(),
             Self::AddonTool { addon_id, tool_name } => tool_source_ref(addon_id, tool_name),
             Self::Block { node_type, .. } => block_source_ref(node_type),
+            Self::Agent { agent_id, .. } => agent_source_ref(agent_id),
         }
     }
+}
+
+/// `agent:<agent_id>` — see [`ServiceImplementation::source_ref`].
+pub fn agent_source_ref(agent_id: &str) -> String {
+    format!("agent:{agent_id}")
+}
+
+/// Splits an `agent:<agent_id>` reference; `None` for anything else.
+pub fn parse_agent_source_ref(source_ref: &str) -> Option<&str> {
+    source_ref.strip_prefix("agent:")
 }
 
 /// `block:<node_type>` — see [`ServiceImplementation::source_ref`].
@@ -897,6 +921,7 @@ pub enum ServiceImplementationKind {
     Flow,
     AddonTool,
     Block,
+    Agent,
 }
 
 impl ServiceImplementationKind {
@@ -909,18 +934,7 @@ impl ServiceImplementationKind {
             Self::Flow => "flow",
             Self::AddonTool => "addon_tool",
             Self::Block => "block",
-        }
-    }
-
-    /// Value of `bpmn_service_invocations.implementation_kind`. That column was
-    /// added with a CHECK that admits only `flow` and `addon_tool`, and the
-    /// table cannot be rebuilt cheaply; a block is therefore recorded as `flow`
-    /// and told apart by the `block:` prefix of the row's `flow_id`. Only the
-    /// addon-tool recovery scan reads the column.
-    pub fn invocation_column(self) -> &'static str {
-        match self {
-            Self::AddonTool => "addon_tool",
-            Self::Flow | Self::Block => "flow",
+            Self::Agent => "agent",
         }
     }
 }
@@ -3190,7 +3204,7 @@ mod tests {
     }
 
     #[test]
-    fn block_reference_is_distinct_and_recorded_as_a_flow_row() {
+    fn block_and_agent_references_are_distinct() {
         let block = ServiceImplementation::Block {
             node_type: "llm".into(),
             config: serde_json::json!({}),
@@ -3201,8 +3215,52 @@ mod tests {
         assert_eq!(parse_tool_source_ref("block:llm"), None);
         assert_eq!(block.kind(), ServiceImplementationKind::Block);
         assert_eq!(ServiceImplementationKind::Block.as_str(), "block");
-        assert_eq!(ServiceImplementationKind::Block.invocation_column(), "flow");
-        assert_eq!(ServiceImplementationKind::AddonTool.invocation_column(), "addon_tool");
-        assert_eq!(ServiceImplementationKind::Flow.invocation_column(), "flow");
+        let agent = agent_service_implementation();
+        assert_eq!(agent.source_ref("ignored"), "agent:agent-1");
+        assert_eq!(parse_agent_source_ref("agent:agent-1"), Some("agent-1"));
+        assert_eq!(parse_agent_source_ref("block:llm"), None);
+        assert_eq!(parse_block_source_ref("agent:agent-1"), None);
+        assert_eq!(parse_tool_source_ref("agent:agent-1"), None);
+        assert_eq!(agent.kind(), ServiceImplementationKind::Agent);
+        assert_eq!(ServiceImplementationKind::Agent.as_str(), "agent");
+    }
+
+    fn agent_service_implementation() -> ServiceImplementation {
+        ServiceImplementation::Agent {
+            agent_id: "agent-1".into(),
+            goal_expression: "vars.goal".into(),
+            allowed_tools: vec!["core.skill_view".into()],
+            max_iterations: 8,
+            output_schema: Some(serde_json::json!({"type": "object"})),
+        }
+    }
+
+    #[test]
+    fn agent_implementation_round_trips_and_omits_an_absent_schema() {
+        let agent = agent_service_implementation();
+        let json = serde_json::to_value(&agent).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"Agent": {
+                "agent_id": "agent-1", "goal_expression": "vars.goal",
+                "allowed_tools": ["core.skill_view"], "max_iterations": 8,
+                "output_schema": {"type": "object"}}})
+        );
+        assert_eq!(serde_json::from_value::<ServiceImplementation>(json).unwrap(), agent);
+        assert_eq!(
+            crate::cbor::decode::<ServiceImplementation>(&crate::cbor::encode(&agent).unwrap()).unwrap(),
+            agent
+        );
+        let bare = ServiceImplementation::Agent {
+            agent_id: "agent-1".into(),
+            goal_expression: "vars.goal".into(),
+            allowed_tools: Vec::new(),
+            max_iterations: 8,
+            output_schema: None,
+        };
+        assert!(serde_json::to_value(&bare).unwrap()["Agent"].get("output_schema").is_none());
+        assert!(serde_json::from_value::<ServiceImplementation>(serde_json::json!(
+            {"Agent": {"agent_id": "a", "goal_expression": "g", "allowed_tools": [],
+                       "max_iterations": 1, "extra": 1}})).is_err());
     }
 }

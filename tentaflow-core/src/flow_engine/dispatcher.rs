@@ -1023,6 +1023,33 @@ impl FlowDispatcher {
         })
     }
 
+    /// Pin of an agent step for publication. The initiator must be an active
+    /// member of the organization; the agent itself is checked and described by
+    /// [`crate::processes::agent_pin`]. There is no `flows` row behind it.
+    pub fn snapshot_process_agent(
+        &self,
+        agent_id: &str,
+        allowed_tools: &[String],
+        max_iterations: u32,
+        user_id: &str,
+        org_id: &str,
+    ) -> std::result::Result<PinnedFlowSnapshot, crate::processes::agent_pin::AgentPinError> {
+        use crate::processes::agent_pin::{pin_agent, AgentPinError};
+        use crate::processes::tool_host::ToolAccessError;
+        self.check_process_initiator(user_id, org_id)
+            .map_err(|error| match error {
+                ToolAccessError::Unavailable => AgentPinError::Unavailable,
+                _ => AgentPinError::Initiator,
+            })?;
+        let pin = pin_agent(&self.db, agent_id, allowed_tools, max_iterations)?;
+        Ok(PinnedFlowSnapshot {
+            flow_id: tentaflow_protocol::processes::agent_source_ref(agent_id),
+            source_version: 0,
+            graph_json: pin.graph_json,
+            graph_sha256: pin.graph_sha256,
+        })
+    }
+
     /// Process counterpart of [`authorize_process_flow`] for a block run as a
     /// Service task. The block must be on the allow-list, the initiator an
     /// active member of the organization, and, for a block that calls a model,

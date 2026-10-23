@@ -824,11 +824,13 @@ fn validate_draft_body<'a>(
                 verification,
                 timeout_seconds,
                 result_expression,
+                implementation,
                 ..
             } => {
+                let max_timeout = service_timeout_ceiling(implementation);
                 ensure!(
-                    (1..=600).contains(timeout_seconds),
-                    "service timeout outside 1..=600 seconds"
+                    (1..=max_timeout).contains(timeout_seconds),
+                    "service timeout outside 1..={max_timeout} seconds"
                 );
                 validate_mapping(input_mapping, false)?;
                 validate_mapping(output_mapping, false)?;
@@ -1383,6 +1385,11 @@ fn validate_body<'a>(
                             "service task {} names a flow with a reserved block: prefix",
                             node.id
                         );
+                        ensure!(
+                            !flow_id.starts_with("agent:"),
+                            "service task {} names a flow with a reserved agent: prefix",
+                            node.id
+                        );
                     }
                     ServiceImplementation::AddonTool { addon_id, tool_name } => {
                         ensure!(
@@ -1407,10 +1414,25 @@ fn validate_body<'a>(
                             node.id
                         );
                     }
+                    ServiceImplementation::Agent { .. } => {
+                        ensure!(
+                            flow_id.is_empty(),
+                            "service task {} runs an agent and must not name a flow",
+                            node.id
+                        );
+                        ensure!(
+                            result_expression.is_none(),
+                            "service task {} runs an agent whose result comes from its \
+                             completion report, not from a result expression",
+                            node.id
+                        );
+                        validate_agent_implementation(implementation, &node.id)?;
+                    }
                 }
+                let max_timeout = service_timeout_ceiling(implementation);
                 ensure!(
-                    (1..=600).contains(timeout_seconds),
-                    "service task {} timeout is outside 1..=600 seconds",
+                    (1..=max_timeout).contains(timeout_seconds),
+                    "service task {} timeout is outside 1..={max_timeout} seconds",
                     node.id
                 );
                 validate_mapping(input_mapping, false)?;
@@ -2545,6 +2567,68 @@ fn validate_event_gateway_regions<'a>(
 
 /// Addon and tool identifiers end up inside the `tool:<addon>/<tool>` source
 /// reference, so they must not contain its separators.
+/// An agent step may think for an hour; every other implementation answers in
+/// ten minutes at most.
+fn service_timeout_ceiling(implementation: &ServiceImplementation) -> u32 {
+    match implementation {
+        ServiceImplementation::Agent { .. } => 3600,
+        _ => 600,
+    }
+}
+
+/// The agent-specific rules of a Service task. Whether the agent exists, is
+/// enabled and runs on a model is a fact of the live registry and is decided at
+/// pinning; this checks only what the model itself can state.
+fn validate_agent_implementation(
+    implementation: &ServiceImplementation,
+    node_id: &str,
+) -> Result<()> {
+    let ServiceImplementation::Agent {
+        agent_id,
+        goal_expression,
+        allowed_tools,
+        max_iterations,
+        output_schema,
+    } = implementation
+    else {
+        return Ok(());
+    };
+    validate_tool_identifier(agent_id, "agent id", node_id)?;
+    validate_expression(goal_expression, "agent goal expression", true)
+        .with_context(|| format!("service task {node_id}"))?;
+    ensure!(
+        (1..=crate::db::repository::AGENT_MAX_ITERATIONS_CAP).contains(&i64::from(*max_iterations)),
+        "service task {node_id} agent iterations are outside 1..={}",
+        crate::db::repository::AGENT_MAX_ITERATIONS_CAP
+    );
+    ensure!(
+        allowed_tools.len() <= MAX_AGENT_TOOLS,
+        "service task {node_id} allows more than {MAX_AGENT_TOOLS} tools"
+    );
+    let mut seen = std::collections::HashSet::new();
+    for tool in allowed_tools {
+        ensure!(
+            crate::agents::AllowlistEntry::parse(tool).is_some(),
+            "service task {node_id} allows an unknown or malformed tool name"
+        );
+        ensure!(
+            tool != crate::agents::CoreToolName::TaskComplete.public_name(),
+            "service task {node_id} lists the completion tool, which an agent step always has"
+        );
+        ensure!(
+            seen.insert(tool.as_str()),
+            "service task {node_id} lists a tool twice"
+        );
+    }
+    if let Some(schema) = output_schema {
+        super::agent_sink::validate_output_schema(schema)
+            .with_context(|| format!("service task {node_id}"))?;
+    }
+    Ok(())
+}
+
+const MAX_AGENT_TOOLS: usize = 64;
+
 pub(crate) fn validate_tool_identifier(value: &str, what: &str, node_id: &str) -> Result<()> {
     ensure!(
         !value.is_empty()

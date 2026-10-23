@@ -9270,6 +9270,12 @@ pub fn list_cli_agents(pool: &DbPool) -> Result<Vec<CliAgentRow>> {
 
 pub fn get_agent(pool: &DbPool, id: &str) -> Result<Option<DbAgent>> {
     let conn = acquire(pool)?;
+    get_agent_on(&conn, id)
+}
+
+/// [`get_agent`] on a connection the caller already holds, so a transaction
+/// reads the agent it is deciding about.
+pub fn get_agent_on(conn: &rusqlite::Connection, id: &str) -> Result<Option<DbAgent>> {
     let mut stmt =
         conn.prepare_cached(&format!("SELECT {AGENT_COLS} FROM agents WHERE id = ?1"))?;
     let result = stmt

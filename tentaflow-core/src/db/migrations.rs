@@ -1297,7 +1297,156 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bpmn_deferred_jobs_and_result_recovery",
             MigrationStep::Rust(bpmn_deferred_jobs_and_result_recovery),
         ),
+        (
+            203,
+            "bpmn_agent_completions_and_invocation_kinds",
+            MigrationStep::RustSelfManaged(bpmn_agent_completions_and_invocation_kinds),
+        ),
     ]
+}
+
+/// Agent steps and a proper `block` kind for Service invocations.
+///
+/// The CHECK of `implementation_kind` (v201) admitted only `flow` and
+/// `addon_tool`, so a block was recorded as `flow` under a `block:` reference.
+/// SQLite cannot alter a CHECK, so the table is rebuilt from its own stored
+/// definition (the text v198 and v201 left in the schema, not a copy of it here)
+/// with the widened rule, keeping every index and trigger, and rows that carry a
+/// `block:` reference are re-read as `block`. Foreign keys are off for the
+/// rebuild because `bpmn_result_recovery` cascades from this table and a plain
+/// DROP would delete its rows.
+///
+/// `bpmn_agent_completions` is the durable sink of `core.task_complete`: one
+/// final report per invocation, which the table itself enforces by refusing
+/// both a second row and any update.
+fn bpmn_agent_completions_and_invocation_kinds(
+    conn: &Connection,
+    version: i64,
+    name: &str,
+) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let result = (|| -> Result<()> {
+        let fk_disabled: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        anyhow::ensure!(fk_disabled == 0, "agent migration requires foreign keys disabled");
+        let tx = conn.unchecked_transaction()?;
+        rebuild_service_invocations_with_widened_kinds(&tx)?;
+        tx.execute_batch(BPMN_AGENT_COMPLETIONS)?;
+        let violations = foreign_key_check(&tx)?;
+        anyhow::ensure!(
+            violations.is_empty(),
+            "agent migration foreign key violations: {}",
+            violations.join("; ")
+        );
+        let integrity: String = tx.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        anyhow::ensure!(integrity == "ok", "agent migration integrity: {integrity}");
+        tx.execute(
+            "INSERT INTO _migrations (version,name) VALUES (?1,?2)",
+            rusqlite::params![version, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+    let restored = conn
+        .execute_batch("PRAGMA foreign_keys = ON;")
+        .and_then(|()| conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0)));
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => {
+            let enabled = restored?;
+            anyhow::ensure!(enabled == 1, "agent migration could not restore foreign keys");
+            Ok(())
+        }
+    }
+}
+
+const BPMN_AGENT_COMPLETIONS: &str = r#"
+CREATE TABLE bpmn_agent_completions (
+    invocation_id TEXT PRIMARY KEY
+        REFERENCES bpmn_service_invocations(invocation_id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL CHECK (length(run_id) > 0),
+    result_json TEXT NOT NULL CHECK (
+        json_valid(result_json) AND json_type(result_json) = 'object' AND
+        length(CAST(result_json AS BLOB)) <= 393216),
+    created_at_ms INTEGER NOT NULL CHECK (typeof(created_at_ms) = 'integer')
+);
+CREATE TRIGGER bpmn_agent_completions_immutable
+BEFORE UPDATE ON bpmn_agent_completions
+BEGIN SELECT RAISE(ABORT, 'agent completion is immutable'); END;
+"#;
+
+fn rebuild_service_invocations_with_widened_kinds(tx: &Connection) -> Result<()> {
+    use anyhow::Context;
+
+    const TABLE: &str = "bpmn_service_invocations";
+    const REBUILT: &str = "bpmn_service_invocations_203";
+    // The rule v201 added, whitespace-normalised: ALTER TABLE keeps the text
+    // exactly as written, line breaks included.
+    const OLD_RULE: &str = "CHECK (implementation_kind IN ('flow','addon_tool') AND \
+        (implementation_kind='addon_tool') = (flow_id GLOB 'tool:*'))";
+    const NEW_RULE: &str = "CHECK (implementation_kind IN ('flow','addon_tool','block','agent') AND \
+        (implementation_kind='addon_tool') = (flow_id GLOB 'tool:*') AND \
+        (implementation_kind='block') = (flow_id GLOB 'block:*') AND \
+        (implementation_kind='agent') = (flow_id GLOB 'agent:*'))";
+    let normalise = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let table_sql: String = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+            [TABLE],
+            |row| row.get(0),
+        )
+        .context("bpmn_service_invocations is missing")?;
+    let table_sql = normalise(&table_sql);
+    anyhow::ensure!(
+        table_sql.matches(OLD_RULE).count() == 1,
+        "bpmn_service_invocations has an unexpected implementation_kind rule"
+    );
+    let rebuilt_sql = table_sql
+        .replacen(OLD_RULE, NEW_RULE, 1)
+        .replacen(&format!("CREATE TABLE {TABLE} "), &format!("CREATE TABLE {REBUILT} "), 1);
+    anyhow::ensure!(
+        rebuilt_sql.contains(&format!("CREATE TABLE {REBUILT} ")),
+        "bpmn_service_invocations has an unexpected definition header"
+    );
+
+    let dependents = tx
+        .prepare(
+            "SELECT sql FROM sqlite_master WHERE tbl_name=?1 AND sql IS NOT NULL \
+             AND type IN ('index','trigger') ORDER BY type, name",
+        )?
+        .query_map([TABLE], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let columns = tx
+        .prepare(&format!("PRAGMA table_info({TABLE})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let column_list = columns.join(",");
+    let select_list = columns
+        .iter()
+        .map(|column| {
+            if column == "implementation_kind" {
+                "CASE WHEN flow_id GLOB 'block:*' THEN 'block' ELSE implementation_kind END"
+                    .to_owned()
+            } else {
+                column.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let before: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM {TABLE}"), [], |row| row.get(0))?;
+    tx.execute_batch(&rebuilt_sql)?;
+    tx.execute_batch(&format!(
+        "INSERT INTO {REBUILT}({column_list}) SELECT {select_list} FROM {TABLE};
+         DROP TABLE {TABLE};
+         ALTER TABLE {REBUILT} RENAME TO {TABLE};"
+    ))?;
+    for dependent in dependents {
+        tx.execute_batch(&dependent)?;
+    }
+    let after: i64 = tx.query_row(&format!("SELECT COUNT(*) FROM {TABLE}"), [], |row| row.get(0))?;
+    anyhow::ensure!(before == after, "agent migration changed the invocation row count");
+    Ok(())
 }
 
 /// Deferral and recovery bookkeeping for Service tasks that run addon tools.
@@ -16627,7 +16776,7 @@ mod tests {
             assert_eq!(*version, index as i64 + 1, "the ladder must stay contiguous");
         }
         let head = ladder.last().unwrap().0;
-        assert_eq!(head, 202);
+        assert_eq!(head, 203);
 
         let fresh = Connection::open_in_memory().unwrap();
         run(&fresh).unwrap();
@@ -16646,7 +16795,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(applied_after_179.len(), 23);
+        assert_eq!(applied_after_179.len(), 24);
         assert_eq!(applied_after_179[0], "org_structure");
         assert_eq!(applied_after_179[19], "bpmn_activity_io_witnesses");
         assert_eq!(applied_after_179[20], "org_absences_drop_reason");
@@ -16655,6 +16804,7 @@ mod tests {
             "bpmn_service_invocation_implementation_kind"
         );
         assert_eq!(applied_after_179[22], "bpmn_deferred_jobs_and_result_recovery");
+        assert_eq!(applied_after_179[23], "bpmn_agent_completions_and_invocation_kinds");
         let tables = |conn: &Connection| -> Vec<String> {
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap()
@@ -16853,6 +17003,218 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    /// A database at v202 with one real instance and a token to hang invocations on.
+    fn agent_invocation_fixture() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        selected_body_history_fixture(&conn);
+        run_ladder_up_to(&conn, 202);
+        conn.execute(
+            "INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,fork_stack_json,status,created_at_ms) \
+             VALUES('t1','selected-instance','selected-instance','Service','[]','waiting',1)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_invocation(
+        conn: &Connection,
+        id: &str,
+        flow_id: &str,
+        kind: &str,
+    ) -> rusqlite::Result<usize> {
+        let digest = "a".repeat(64);
+        conn.execute(
+            "INSERT OR IGNORE INTO bpmn_jobs(job_id,instance_id,scope_id,node_id,token_id,input_json,status,\
+             created_at_ms,updated_at_ms) \
+             VALUES(?1,'selected-instance','selected-instance','Service','t1','{}','queued',1,1)",
+            [id],
+        )?;
+        conn.execute(
+            "INSERT INTO bpmn_service_invocations(invocation_id,job_id,instance_id,scope_id,node_id,\
+             token_id,definition_id,version,selected_process_id,whole_document_sha256,flow_id,\
+             pinned_flow_digest,input_sha256,stable_request_id,phase,dispatch_evidence,created_at_ms,\
+             updated_at_ms,implementation_kind) \
+             VALUES(?1,?1,'selected-instance','selected-instance','Service','t1','selected-definition',1,\
+             'p',?4,?2,?4,?4,?1,'prepared','no_boundary',1,1,?3)",
+            rusqlite::params![id, flow_id, kind, digest],
+        )
+    }
+
+    fn invocation_schema_objects(conn: &Connection) -> Vec<(String, String)> {
+        conn.prepare(
+            "SELECT name,sql FROM sqlite_master WHERE tbl_name='bpmn_service_invocations' \
+             AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// v203: the rebuilt invocation table keeps every row, index, trigger and
+    /// dependent row, re-reads a block recorded as `flow` as `block`, and now
+    /// admits `block` and `agent` only for their own reference prefix.
+    #[test]
+    fn migration_203_rebuilds_invocation_kinds_and_keeps_every_dependent() {
+        let conn = agent_invocation_fixture();
+        insert_invocation(&conn, "inv-flow", "flow-1", "flow").unwrap();
+        insert_invocation(&conn, "inv-block", "block:pii_filter", "flow").unwrap();
+        insert_invocation(&conn, "inv-tool", "tool:notes-1/search", "addon_tool").unwrap();
+        conn.execute(
+            "INSERT INTO bpmn_result_recovery(invocation_id,last_checked_ms) VALUES('inv-tool',5)",
+            [],
+        )
+        .unwrap();
+        let objects_before = invocation_schema_objects(&conn);
+        let rows_before: Vec<String> = conn
+            .prepare("SELECT invocation_id||job_id||phase||flow_id||created_at_ms FROM bpmn_service_invocations ORDER BY invocation_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+
+        run(&conn).unwrap();
+
+        let kinds: Vec<(String, String)> = conn
+            .prepare("SELECT invocation_id,implementation_kind FROM bpmn_service_invocations ORDER BY invocation_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            kinds,
+            [
+                ("inv-block".to_owned(), "block".to_owned()),
+                ("inv-flow".to_owned(), "flow".to_owned()),
+                ("inv-tool".to_owned(), "addon_tool".to_owned()),
+            ]
+        );
+        let rows_after: Vec<String> = conn
+            .prepare("SELECT invocation_id||job_id||phase||flow_id||created_at_ms FROM bpmn_service_invocations ORDER BY invocation_id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows_after, rows_before);
+        // The cascade-bearing dependent was not emptied by the rebuild.
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM bpmn_result_recovery", [], |r| r.get::<_, i64>(0)).unwrap(),
+            1
+        );
+        assert_eq!(invocation_schema_objects(&conn), objects_before);
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0)).unwrap(), "ok");
+        assert_eq!(
+            conn.query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get::<_, i64>(0)).unwrap(),
+            203
+        );
+
+        // The widened rule: each kind only with its own prefix, in both directions.
+        insert_invocation(&conn, "inv-agent", "agent:a-1", "agent").unwrap();
+        insert_invocation(&conn, "inv-block-2", "block:llm", "block").unwrap();
+        for (id, flow_id, kind) in [
+            ("agent-as-flow", "agent:a-1", "flow"),
+            ("flow-as-agent", "flow-2", "agent"),
+            ("block-as-flow", "block:llm", "flow"),
+            ("flow-as-block", "flow-2", "block"),
+            ("tool-as-agent", "tool:n/t", "agent"),
+            ("unknown-kind", "flow-2", "weird"),
+        ] {
+            let error = insert_invocation(&conn, id, flow_id, kind).unwrap_err();
+            assert!(error.to_string().contains("CHECK constraint failed"), "{id}: {error}");
+        }
+
+        // The immutability trigger came through the rebuild with its kind clause.
+        let frozen = conn
+            .execute("UPDATE bpmn_service_invocations SET implementation_kind='block' WHERE invocation_id='inv-flow'", [])
+            .unwrap_err();
+        assert!(frozen.to_string().contains("invocation identity changed"), "{frozen}");
+        conn.execute(
+            "UPDATE bpmn_service_invocations SET phase='proved_no_effect',phase_revision=2,updated_at_ms=2 WHERE invocation_id='inv-agent'",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// v203 sink table: one immutable report per invocation, gone with its invocation.
+    #[test]
+    fn migration_203_agent_completions_are_unique_immutable_and_cascade() {
+        let conn = agent_invocation_fixture();
+        run(&conn).unwrap();
+        insert_invocation(&conn, "inv-agent", "agent:a-1", "agent").unwrap();
+        let record = |run_id: &str| {
+            conn.execute(
+                "INSERT INTO bpmn_agent_completions(invocation_id,run_id,result_json,created_at_ms) \
+                 VALUES('inv-agent',?1,'{\"outcome\":\"Completed\"}',1)",
+                [run_id],
+            )
+        };
+        record("run-1").unwrap();
+        assert!(record("run-2").is_err());
+        let edit = conn
+            .execute("UPDATE bpmn_agent_completions SET run_id='run-2'", [])
+            .unwrap_err();
+        assert!(edit.to_string().contains("agent completion is immutable"), "{edit}");
+        for (run_id, json) in [("", "{}"), ("r", "not json"), ("r", "[]")] {
+            conn.execute("DELETE FROM bpmn_agent_completions", []).unwrap();
+            assert!(
+                conn.execute(
+                    "INSERT INTO bpmn_agent_completions(invocation_id,run_id,result_json,created_at_ms) \
+                     VALUES('inv-agent',?1,?2,1)",
+                    [run_id, json],
+                )
+                .is_err(),
+                "{run_id:?} {json:?}"
+            );
+        }
+        record("run-1").unwrap();
+        conn.execute("DELETE FROM bpmn_service_invocations WHERE invocation_id='inv-agent'", [])
+            .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM bpmn_agent_completions", [], |r| r.get::<_, i64>(0)).unwrap(),
+            0
+        );
+    }
+
+    /// A reference the new rule cannot hold aborts the whole rung: the old table, the
+    /// ladder position and the foreign key mode are exactly what they were.
+    #[test]
+    fn migration_203_rolls_back_atomically_and_restores_foreign_keys() {
+        let conn = agent_invocation_fixture();
+        insert_invocation(&conn, "inv-flow", "flow-1", "flow").unwrap();
+        // The v201 rule lets a flow named like an agent in; the v203 rule cannot.
+        insert_invocation(&conn, "inv-odd", "agent:zzz", "flow").unwrap();
+        let before = invocation_schema_objects(&conn);
+        let table_before: String = conn
+            .query_row("SELECT sql FROM sqlite_master WHERE name='bpmn_service_invocations'", [], |r| r.get(0))
+            .unwrap();
+
+        assert!(run(&conn).is_err());
+
+        assert_eq!(
+            conn.query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get::<_, i64>(0)).unwrap(),
+            202
+        );
+        let table_after: String = conn
+            .query_row("SELECT sql FROM sqlite_master WHERE name='bpmn_service_invocations'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(table_after, table_before);
+        assert!(!table_exists(&conn, "bpmn_service_invocations_203").unwrap());
+        assert!(!table_exists(&conn, "bpmn_agent_completions").unwrap());
+        assert_eq!(invocation_schema_objects(&conn), before);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM bpmn_service_invocations", [], |r| r.get::<_, i64>(0)).unwrap(),
+            2
+        );
+        assert_eq!(conn.query_row("PRAGMA foreign_keys", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
     }
 
     /// v179 on a database at v178: subjects (deprecations, generation) and

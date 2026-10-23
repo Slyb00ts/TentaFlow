@@ -8537,6 +8537,9 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
     });
     let core = crate::agents::CoreToolName::all()
         .iter()
+        // The completion tool of a process step is granted by the process, not
+        // picked into an allow-list.
+        .filter(|t| !t.is_process_sink())
         .map(|t| {
             let spec = t.spec();
             CatalogTool {

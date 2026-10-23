@@ -11,6 +11,7 @@ use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode, SessionA
 
 use super::HandlerContext;
 use crate::flow_engine::dispatcher::{DispatchError, FlowDispatcher};
+use crate::processes::agent_pin::AgentPinError;
 use crate::processes::{bpmn, repository, runtime, simulation};
 use repository::{CommandStamp, PinnedServiceSnapshot, ProcessActor};
 
@@ -354,6 +355,26 @@ pub(crate) fn pin_service_snapshots(
                         ProtocolError::new(ProtocolErrorCode::PolicyDenied, error.to_string())
                     }
                     other => ProtocolError::bad_request(other.to_string()),
+                })?,
+            ServiceImplementation::Agent {
+                agent_id,
+                allowed_tools,
+                max_iterations,
+                ..
+            } => executor
+                .snapshot_process_agent(
+                    agent_id,
+                    allowed_tools,
+                    *max_iterations,
+                    &actor.user_id,
+                    &actor.org_id,
+                )
+                .map_err(|error| match error {
+                    AgentPinError::Initiator => {
+                        ProtocolError::new(ProtocolErrorCode::PolicyDenied, error.to_string())
+                    }
+                    AgentPinError::Unavailable => ProtocolError::internal(error.to_string()),
+                    AgentPinError::Refused(_) => ProtocolError::bad_request(error.to_string()),
                 })?,
         };
         snapshots.push(PinnedServiceSnapshot {

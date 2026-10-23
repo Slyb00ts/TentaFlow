@@ -16,7 +16,7 @@ mod subagent_reactor;
 use std::sync::Arc;
 
 pub use builtins::{is_core_tool, BuiltinToolError, CoreToolName, CORE_ADDON_ID};
-pub use catalog::{tool_in_allowlist, AllowlistEntry, ToolCatalog};
+pub use catalog::{allowlist_admits_entry, tool_in_allowlist, AllowlistEntry, ToolCatalog};
 pub use interaction::{
     await_reply as await_interaction_reply, global as interaction_registry_global,
     init_global as interaction_registry_init_global, no_response_sentinel,

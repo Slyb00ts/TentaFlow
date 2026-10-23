@@ -32,7 +32,7 @@ impl AllowlistEntry {
     /// Parses a single public name. `core.<tool>` resolves against the known
     /// builtin set (an unknown `core.*` is rejected, not silently ignored, so a
     /// typo in an agent definition surfaces). `addon.*` is the addon wildcard.
-    fn parse(raw: &str) -> Option<Self> {
+    pub fn parse(raw: &str) -> Option<Self> {
         let (head, tail) = raw.split_once('.')?;
         if head.is_empty() || tail.is_empty() {
             return None;
@@ -99,6 +99,21 @@ pub fn tool_in_allowlist(tools_json: &str, name: &str, package_id: Option<&str>)
             .iter()
             .any(|e| e.matches_addon_tool(addon_id, package_id.unwrap_or(""), tool_name)),
         _ => false,
+    }
+}
+
+/// True when the allow-list `tools_json` admits everything the declared entry
+/// `raw_entry` names. An exact tool is compared by name; an `addon.*` wildcard
+/// is admitted only by the same wildcard, because single tools cannot prove
+/// that every tool of the addon is allowed. Used to keep a narrower list (a
+/// process step's) inside the agent's own.
+pub fn allowlist_admits_entry(tools_json: &str, raw_entry: &str) -> bool {
+    match AllowlistEntry::parse(raw_entry) {
+        Some(AllowlistEntry::AddonWildcard { addon_id }) => parse_allowlist(tools_json)
+            .iter()
+            .any(|entry| matches!(entry, AllowlistEntry::AddonWildcard { addon_id: a } if *a == addon_id)),
+        Some(_) => tool_in_allowlist(tools_json, raw_entry, None),
+        None => false,
     }
 }
 
