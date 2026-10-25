@@ -261,6 +261,7 @@ test('a T1 run streams its histogram and its keyframes into the panel', async ()
   const asked = screen.requests.find(([kind]) => kind === 'tentaQuantCircuitSimulateRequest');
   assert.ok(asked, 'a T1 run is started on the wire, never computed here');
   assert.equal(asked[1].projectId, 'grover-4q');
+  assert.equal(asked[1].options.recordEvolution, true, 'the panel is fed by the recorded evolution, which Core skips for a Clifford circuit unless asked');
   assert.equal(screen.subscriptions[0].kind, 'tentaQuantRunSubscribeRequest');
   assert.equal(screen.subscriptions[0].payload.runId, T1_RUN.runId);
 

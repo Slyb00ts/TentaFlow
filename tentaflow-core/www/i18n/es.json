@@ -5736,29 +5736,6 @@
       "public": "público"
     }
   },
-  "install_wizard": {
-    "access_loading": "Cargando requisitos de acceso…",
-    "access_none": "Este complemento no declara requisitos de acceso a modelos ni alias.",
-    "access_required": "Obligatorio",
-    "access_optional": "Opcional",
-    "access_kind_alias": "Alias",
-    "access_kind_model": "Modelo",
-    "access_vis_public": "Público",
-    "access_vis_restricted": "Restringido",
-    "access_vis_private": "Privado",
-    "access_auto_granted": "Concedido automáticamente",
-    "access_blocked_private": "Bloqueado (el propietario es privado)",
-    "access_denied": "Denegado",
-    "access_pending_readonly": "Pendiente de aprobación",
-    "access_approve": "Aprobar",
-    "access_reject": "Rechazar",
-    "access_approved_toast": "Acceso aprobado",
-    "access_rejected_toast": "Acceso rechazado",
-    "access_decision_error": "No se pudo aplicar la decisión de acceso",
-    "access_err_load": "No se pudieron cargar los requisitos de acceso",
-    "access_advance_blocked": "Concede o elimina el acceso requerido antes de continuar.",
-    "access_required_blocked": "El acceso requerido no se ha concedido"
-  },
   "ml_studio": {
     "annotate": {
       "save": "Guardar",

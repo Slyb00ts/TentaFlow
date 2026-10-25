@@ -150,6 +150,14 @@ export function bytesToHex(bytes) {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+/// Canonical UUID text of a 16-byte wire id (`[u8; 16]` fields such as
+/// `AuthMeResponse.user_id` decode to a Uint8Array, while stored rows name the
+/// same user by this text).
+export function uuidFromBytes(bytes) {
+  const hex = bytesToHex(bytes);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 export function shortHex(bytes, len = 8) {
   return bytesToHex(bytes).slice(0, len);
 }

@@ -17,9 +17,10 @@
 
 const { test, expect } = require('@playwright/test');
 const {
-  startBinary, stopBinary, waitForServer, binaryExists, baseUrl,
+  startBinary, stopBinary, waitForServer, binaryExists,
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
+const { ensureNativeApp, gotoCodeStudio, openSession } = require('./helpers/code-studio');
 const { startScriptedModel, helloWorldScript } = require('./helpers/scripted-model');
 const { startLiveModel, liveModelRequested } = require('./helpers/live-model');
 /// Live models are an order of magnitude slower than the script: a 27B at
@@ -71,6 +72,8 @@ test.describe('Code Studio ↔ Projekty', () => {
   test('zakłada workspace i projekt', async ({ page }) => {
     test.setTimeout(T(180_000));
     await loginAsAdmin(page, { port: PORT });
+    await ensureNativeApp(page, 'code-studio');
+    await ensureNativeApp(page, 'projekty');
 
     const me = await api(page, 'authMeRequest');
     const users = await api(page, 'usersListRequest');
@@ -83,10 +86,7 @@ test.describe('Code Studio ↔ Projekty', () => {
     await api(page, 'projectStudioCreatorGrantSetRequest', { userId, granted: true })
       .catch(() => null);
 
-    await page.goto(`${baseUrl(PORT)}/`);
-    await page.locator('[data-view="apps-home"]').first().click();
-    await page.locator('[data-route="code-studio"]').first().click();
-    await page.waitForSelector('#cs-new, #cs-empty-new, #cs-table-host', { timeout: 30_000 });
+    await gotoCodeStudio(page, PORT);
     await page.locator('#cs-new, #cs-empty-new').first().click();
     await page.locator('#cs-wz-name input').first().fill(WORKSPACE);
     await page.locator('[data-action="next"]').first().click();
@@ -137,27 +137,7 @@ test.describe('Code Studio ↔ Projekty', () => {
 
     // Git reads are session-scoped, so open one to reach the log. The commit it
     // reports is the provisioning commit — exactly what a project would pin.
-    await page.goto(`${baseUrl(PORT)}/`);
-    await page.locator('[data-view="apps-home"]').first().click();
-    await page.locator('[data-route="code-studio"]').first().click();
-    await page.locator(`text=${WORKSPACE}`).first().click();
-    await page.locator('#cs-open-session:not([disabled])').waitFor({ timeout: 60_000 });
-    await page.locator('#cs-open-session').click();
-    await page.locator('#cs-sess-title input').first().waitFor({ timeout: 30_000 });
-    await page.locator('#cs-sess-title input').first().fill('link e2e');
-    await page.locator('[data-action="create"]').first().click();
-    await page.waitForSelector('#cs-session-view', { state: 'visible', timeout: 30_000 });
-
-    let sessionId = '';
-    await expect.poll(async () => {
-      const list = await api(page, 'codeStudioSessionsListRequest', { workspaceId })
-        .catch((e) => ({ err: String(e) }));
-      if (!sessionId) console.log('[diag] sessions:', JSON.stringify(list).slice(0, 300));
-      const first = (list?.sessions ?? [])[0] ?? {};
-      sessionId = first.sessionId ?? first.id ?? '';
-      return sessionId;
-    }, { timeout: 30_000, message: 'no session was created for the link test' })
-      .toBeTruthy();
+    const sessionId = await openSession(page, PORT, { workspaceName: WORKSPACE, workspaceId });
 
     const log = await api(page, 'codeStudioGitLogRequest', { workspaceId, sessionId, limit: 5 })
       .catch((e) => ({ err: String(e) }));

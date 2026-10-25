@@ -197,6 +197,7 @@ module.exports = {
   renderConfig,
   registerCleanup,
   startBinary,
+  homeForPort,
   waitForServer,
   stopBinary,
 };

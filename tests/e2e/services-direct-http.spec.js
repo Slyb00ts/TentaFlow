@@ -51,37 +51,30 @@ test.describe('Services — direct-http migration smoke', () => {
     await expect(screen).toBeVisible({ timeout: 10000 });
   });
 
-  test('engine catalog lists deployable engines', async ({ page }) => {
+  // The catalog opens on a target picker; engines are listed only after a
+  // target (here the local node) is chosen.
+  async function openLocalCatalog(page) {
     await page.goto(`${baseUrl(PORT)}/#/catalog`);
-    await page.waitForLoadState('networkidle');
+    await page.locator('.target-card[data-target-kind="local"]').click();
+    await expect(page.locator('#catalog-tabs')).toBeVisible({ timeout: 10000 });
+  }
+
+  test('engine catalog lists deployable engines', async ({ page }) => {
+    await openLocalCatalog(page);
     // The catalog renders one tile per manifest engine (vllm, whisper, ...).
-    // We only assert that at least one deployable engine surfaces — proof the
-    // manifests still parse after the transport flip to direct-http.
-    const tiles = page.locator(
-      '[data-engine-id], [data-catalog-engine], .catalog-tile, tf-card'
-    );
-    await page.waitForTimeout(1500);
-    const count = await tiles.count();
-    if (count === 0) {
-      test.skip(true, 'catalog empty in this build — no deployable engines surfaced');
-    }
-    expect(count).toBeGreaterThan(0);
+    // At least one deployable engine must surface — proof the manifests still
+    // parse after the transport flip to direct-http.
+    await expect(page.locator('.catalog-card[data-engine-id]').first()).toBeVisible({ timeout: 15000 });
   });
 
   test('deploy wizard opens for an engine', async ({ page }) => {
-    await page.goto(`${baseUrl(PORT)}/#/catalog`);
-    await page.waitForLoadState('networkidle');
-    await page.waitForTimeout(1500);
-    const tile = page
-      .locator('[data-engine-id], [data-catalog-engine], .catalog-tile, tf-card')
-      .first();
-    if ((await tile.count()) === 0) {
-      test.skip(true, 'no engine tile to open');
-    }
-    await tile.click();
-    // The deploy wizard (engine-deploy-wizard.js) renders into a tf-window /
-    // tf-modal. Either a wizard window or an engine detail panel is acceptable.
-    const surface = page.locator('tf-window, tf-modal, [data-deploy-wizard], #engine-detail').first();
-    await expect(surface).toBeVisible({ timeout: 8000 });
+    await openLocalCatalog(page);
+    // Managed-CLI coding agents route to the accounts screen instead of a
+    // wizard (icon "users"), so open a real engine.
+    const deploy = page.locator('tf-button[data-engine-deploy]:not([icon="users"])').first();
+    await expect(deploy).toBeVisible({ timeout: 15000 });
+    await deploy.click();
+    // The deploy wizard (engine-deploy-wizard.js) renders into a tf-window.
+    await expect(page.locator('tf-window').first()).toBeVisible({ timeout: 8000 });
   });
 });

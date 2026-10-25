@@ -452,13 +452,6 @@ function renderHead(n, hostname, online) {
 function renderSystemInfo(n) {
   const ageSec = lastFetchAt ? Math.max(0, Math.round((Date.now() - lastFetchAt) / 1000)) : 0;
   const stats = [];
-  if (n.cpu_model || n.cpuCount) {
-    stats.push({
-      label: 'CPU',
-      icon: ico('i-cpu'),
-      value: n.cpu_model || `${n.cpuCount} ${I18n.t('mesh.cpu_cores')}`,
-    });
-  }
   if (n.cpuCount) {
     stats.push({
       label: I18n.t('mesh.cores') || 'Cores',

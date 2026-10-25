@@ -8,7 +8,7 @@
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { confirmDialog } from '/js/lib/confirm-dialog.js';
-import { byId, escapeHtml, escapeAttr, toast, bytesToHex } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast, bytesToHex, uuidFromBytes } from '/js/utils.js';
 import { Router } from '/js/router.js';
 import { I18n } from '/js/i18n.js';
 import '/js/components/tf-button.js';
@@ -376,17 +376,6 @@ async function ensureCurrentUser() {
 // authMe niesie userId jako 16 SUROWYCH BAJTÓW, a członkowie projektu mają
 // user_id jako kanoniczny string UUID — bez konwersji porównanie uid === selfId
 // nigdy by nie pasowało, więc tu zamieniamy bajty na kanoniczny UUID.
-function uuidFromBytes(bytes) {
-  const hex = Array.from(bytes, (b) => (b & 0xff).toString(16).padStart(2, '0'));
-  return [
-    hex.slice(0, 4).join(''),
-    hex.slice(4, 6).join(''),
-    hex.slice(6, 8).join(''),
-    hex.slice(8, 10).join(''),
-    hex.slice(10, 16).join(''),
-  ].join('-');
-}
-
 function currentUserId() {
   if (!currentUser) return '';
   const raw = currentUser.userId ?? '';

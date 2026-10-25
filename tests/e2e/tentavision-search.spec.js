@@ -14,7 +14,6 @@
 // =============================================================================
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { test, expect } = require('@playwright/test');
@@ -23,6 +22,7 @@ const {
   stopBinary,
   waitForServer,
   binaryExists,
+  homeForPort,
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
 const {
@@ -93,7 +93,7 @@ test.afterAll(async () => {
 
 function addonDbPath() {
   return path.join(
-    os.homedir(), '.tentaflow', 'orgs', 'org-default', 'addons', addonId, 'data.db',
+    homeForPort(PORT), 'orgs', 'org-default', 'addons', addonId, 'data.db',
   );
 }
 

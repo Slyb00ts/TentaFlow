@@ -11,9 +11,13 @@
 
 const fs = require('fs');
 const { chromium } = require('playwright');
+const { createProjectViaWizard } = require('./helpers/ml-studio');
 
 const BASE = 'https://localhost:8095';
 const SHOT = '/tmp/mlstudio-shots';
+
+// Unique per run: the backend enforces UNIQUE(org_id, name).
+const PROJECT_NAME = `Test cysterny ${Date.now().toString(36).slice(-5)}`;
 
 const results = [];
 function step(name, pass, note) {
@@ -32,7 +36,7 @@ async function shot(page, file) {
   const failedRequests = [];
 
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1440, height: 900 } });
+  const context = await browser.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: { width: 1440, height: 900 } });
   const page = await context.newPage();
 
   page.on('console', (msg) => {
@@ -98,31 +102,8 @@ async function shot(page, file) {
     // ---- Step 3: create project ----
     let typeChosen = '';
     try {
-      await page.locator('#ml-studio-new').click();
-      // tf-modal host stays zero-size (collapsed); the visible portal is the
-      // .tf-modal-backdrop subtree it injects. Wait on the inner field instead.
-      const nameInput = page.locator('#ml-studio-name input').first();
-      await nameInput.waitFor({ state: 'visible', timeout: 10000 });
-      // tf-input/tf-textarea expose .value via the inner native control; fill it.
-      await nameInput.fill('Test cysterny');
-      await page.locator('#ml-studio-desc textarea').first().fill('smoke test');
-
-      // Pick the recognition (Rozpoznawanie obrazu) type card. It is also the
-      // radio-group default (projectTypes[0].slug === "recognition").
-      const recRadio = page.locator('#ml-studio-types tf-radio[value="recognition"]');
-      if (await recRadio.count()) {
-        await recRadio.first().click();
-        typeChosen = 'recognition';
-      } else {
-        typeChosen = 'default (pierwszy typ)';
-      }
-      await shot(page, '04-create-form.png');
-
-      // Footer submit button labelled "Utwórz projekt" (moved into the backdrop).
-      const submit = page.locator('#ml-studio-create-modal tf-button', { hasText: 'Utwórz projekt' }).first();
-      await submit.click();
-      // On success the module closes the modal and navigates to detail.
-      await page.waitForSelector('#ml-studio-create-modal', { state: 'detached', timeout: 15000 }).catch(() => {});
+      typeChosen = 'recognition';
+      await createProjectViaWizard(page, { name: PROJECT_NAME, description: 'smoke test', type: typeChosen });
 
       // On success the module navigates to project detail (projectId param).
       await page.waitForSelector('#ml-studio-detail, .ml-studio-card', { timeout: 15000 });
@@ -159,10 +140,10 @@ async function shot(page, file) {
       await page.waitForTimeout(800);
 
       const names = await page.locator('#ml-studio-list .ml-studio-card .ml-studio-card-name').allTextContents();
-      const found = names.some((n) => n.trim() === 'Test cysterny');
+      const found = names.some((n) => n.trim() === PROJECT_NAME);
       await shot(page, '07-list-after-create.png');
       step('4. Projekt na liście (realne dane backendu)', found,
-        `Karty na liście: [${names.map((n) => n.trim()).join(', ')}] — "Test cysterny" ${found ? 'ZNALEZIONY' : 'NIE znaleziony'}`);
+        `Karty na liście: [${names.map((n) => n.trim()).join(', ')}] — "${PROJECT_NAME}" ${found ? 'ZNALEZIONY' : 'NIE znaleziony'}`);
       if (!found) ok = false;
     } catch (e) {
       ok = false;
@@ -172,14 +153,14 @@ async function shot(page, file) {
 
     // ---- Step 5: open detail explicitly ----
     try {
-      const card = page.locator('#ml-studio-list .ml-studio-card', { hasText: 'Test cysterny' }).first();
+      const card = page.locator('#ml-studio-list .ml-studio-card', { hasText: PROJECT_NAME }).first();
       if (await card.count()) {
         await card.click();
         await page.waitForSelector('#ml-studio-detail tf-detail-header', { timeout: 15000 });
         await page.waitForTimeout(600);
         const title = await page.locator('#ml-studio-detail tf-detail-header').getAttribute('title').catch(() => '');
         await shot(page, '08-project-detail.png');
-        step('5. Widok szczegółu projektu', title.includes('Test cysterny') || title === 'Test cysterny',
+        step('5. Widok szczegółu projektu', title === PROJECT_NAME,
           `Nagłówek szczegółu: "${title}"`);
       } else {
         step('5. Widok szczegółu projektu', false, 'Brak karty do otwarcia');

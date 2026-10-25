@@ -866,6 +866,60 @@ test.describe('toolbar, refusals, drops and labels', () => {
   });
 });
 
+test('an agent step is saved and read back by the codec with its output schema keys untouched, opens as an agent and is refused at publication', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors = collectConsoleErrors(page);
+  await loginAsAdmin(page, { port: PORT });
+  const id = await createDefinition(page, 'Agent step', { errors: [], escalations: [] });
+  const agent = {
+    agentId: 'agent-1', goalExpression: '"Triage the ticket"', allowedTools: ['core.skill_view'], maxIterations: 8,
+    outputSchema: { type: 'object', required: ['order_id'], properties: { order_id: { type: 'string' }, line_items: { type: 'array' } } },
+  };
+  const outcome = await page.evaluate(async ({ definitionId, step }) => {
+    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+    const current = (await ApiBinary.one('processDefinitionGetRequest', { definitionId })).definition;
+    const model = current.model;
+    model.nodes.splice(1, 0, { id: 'Agent_1', name: 'Triage', kind: { ServiceTask: {
+      flowId: '', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60,
+      implementation: { Agent: step } } } });
+    model.sequenceFlows = [
+      { id: 'Sequence_start_agent', sourceId: 'Start', targetId: 'Agent_1', condition: null },
+      { id: 'Sequence_agent_end', sourceId: 'Agent_1', targetId: 'End', condition: null },
+    ];
+    model.diagram = { shapes: [
+      { elementId: 'Start', x: 80, y: 160, width: 56, height: 56 },
+      { elementId: 'Agent_1', x: 220, y: 148, width: 120, height: 80 },
+      { elementId: 'End', x: 440, y: 160, width: 56, height: 56 },
+    ], edges: [
+      { sequenceFlowId: 'Sequence_start_agent', waypoints: [{ x: 136, y: 188 }, { x: 220, y: 188 }] },
+      { sequenceFlowId: 'Sequence_agent_end', waypoints: [{ x: 340, y: 188 }, { x: 440, y: 188 }] },
+    ] };
+    await ApiBinary.one('processDefinitionSaveRequest', {
+      commandId: crypto.randomUUID(), definitionId, expectedRevision: current.draftRevision,
+      name: current.name, description: '', model,
+    });
+    const reread = (await ApiBinary.one('processDefinitionGetRequest', { definitionId })).definition;
+    let refusal = null;
+    try {
+      await ApiBinary.one('processDefinitionPublishRequest', {
+        commandId: crypto.randomUUID(), definitionId, expectedRevision: reread.draftRevision });
+    } catch (error) { refusal = String(error?.message ?? error); }
+    return {
+      implementation: reread.model.nodes.find((node) => node.id === 'Agent_1').kind.ServiceTask.implementation,
+      refusal,
+    };
+  }, { definitionId: id, step: agent });
+  expect(outcome.implementation).toEqual({ Agent: agent });
+  expect(outcome.refusal).toMatch(/agent steps are not runnable yet/);
+
+  await openDesigner(page, { login: false, id });
+  const node = page.locator('.fb-canvas .fb-node.bpmn_service_task');
+  await expect(node.locator('.fb-process-kind[data-kind="agent"]')).toHaveCount(1);
+  await node.click({ position: { x: 20, y: 20 } });
+  await expect(page.locator('[data-agent-summary]')).toContainText('agent-1');
+  expect(errors, diagnostics(errors, proc)).toEqual([]);
+});
+
 test.describe('refusals on a laptop window', () => {
   test.use({ viewport: { width: 1024, height: 700 } });
 

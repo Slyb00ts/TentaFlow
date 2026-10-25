@@ -975,7 +975,12 @@ test.describe('Agent accounts across two real mesh nodes', () => {
     });
     expect(minted.revision, 'the satellite mints its own revision 1').toBe(1);
     expect(minted.material_sha256).toBe(sha256Hex(KEY5));
-    expect(dbAccount(B_DB, acc2)?.home_node_id, 'the paste claims the home').toBe(bId);
+    // `home_node_id` is a SYNCED column: the home answers this very paste with a
+    // conflict capture of its own copy of the row, and that ledger write can land
+    // here before this line reads it. The claim is therefore read from the audit
+    // row the claiming transaction wrote, which no peer can supersede.
+    const claim = auditDetails(B_DB, 'provider_account.home_moved', acc2).at(-1);
+    expect(claim?.home, 'the paste claims the home').toBe(bId);
 
     // The frame that write originates reaches the node that already holds
     // revision 1 — which refuses it and says so, in the documented audit.

@@ -17,10 +17,11 @@
 const fs = require('fs');
 const { execSync } = require('child_process');
 const { chromium } = require('playwright');
+const { createProjectViaWizard } = require('./helpers/ml-studio');
 
 const BASE = 'https://localhost:8095';
 const SHOT = '/tmp/mlstudio-shots6';
-const DB = '/home/critix/repos/rust/TentaFlow-ml/.runtime/data/ml_studio.db';
+const DB = process.env.TF_ML_DB || '/home/critix/repos/rust/TentaFlow-ml/.runtime/data/ml_studio.db';
 const PROJECT_NAME = 'Zasoby test';
 
 const results = [];
@@ -62,7 +63,7 @@ async function selectTfByLabel(page, hostSelector, label) {
   const failedRequests = [];
 
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1440, height: 1000 } });
+  const context = await browser.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: { width: 1440, height: 1000 } });
   const page = await context.newPage();
 
   page.on('console', (msg) => {
@@ -161,17 +162,7 @@ async function selectTfByLabel(page, hostSelector, label) {
       projectExists = names.some((n) => n.trim() === PROJECT_NAME);
 
       if (!projectExists) {
-        await page.locator('#ml-studio-new').click();
-        const nameInput = page.locator('#ml-studio-name input').first();
-        await nameInput.waitFor({ state: 'visible', timeout: 10000 });
-        await nameInput.fill(PROJECT_NAME);
-        await page.locator('#ml-studio-desc textarea').first().fill('test alokacji zasobów mesh');
-        const recRadio = page.locator('#ml-studio-types tf-radio[value="recognition"]');
-        if (await recRadio.count()) await recRadio.first().click();
-        const submit = page.locator('#ml-studio-create-modal tf-button', { hasText: 'Utwórz projekt' }).first();
-        await submit.click();
-        await page.waitForSelector('#ml-studio-create-modal', { state: 'detached', timeout: 15000 }).catch(() => {});
-        await page.waitForSelector('#ml-studio-detail, .ml-studio-card', { timeout: 15000 });
+        await createProjectViaWizard(page, { name: PROJECT_NAME, description: 'test alokacji zasobów mesh', type: 'recognition' });
         await page.waitForTimeout(800);
         // Back to list to re-confirm.
         const back = page.locator('#ml-studio-back');

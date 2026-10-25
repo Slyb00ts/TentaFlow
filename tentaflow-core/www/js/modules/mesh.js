@@ -723,13 +723,13 @@ function renderTransportRow(node, online) {
     // offline: brak `connection` znaczy ze nigdy nie udalo sie polaczyc lub
     // sesja zostala zerwana. Rozrozniamy "unreachable" (mielismy adres ale
     // nieosiagalny) od "no path" (brak jakiegokolwiek sladu).
-    const lastSeen = node.discovered_at || node.last_seen || node.lastSeen;
+    const lastSeen = node.lastSeenEpoch;
     const everConnected = lastSeen != null;
     pillCls = 'relay-bad';
     pillLabel = everConnected ? I18n.t('mesh.transport_unreachable') : I18n.t('mesh.transport_no_path');
     pillSvg = '<svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
     addr = everConnected
-      ? formatRelativeFromIso(lastSeen, I18n.t('mesh.last_reachable'))
+      ? formatRelativeSince(lastSeen, I18n.t('mesh.last_reachable'))
       : '';
   }
 
@@ -756,11 +756,9 @@ function formatRelativeSecs(epochSecs) {
   return `${Math.floor(diff / 86400)} d ago`;
 }
 
-function formatRelativeFromIso(value, label) {
-  if (!value) return '';
-  const t = typeof value === 'number' ? value * 1000 : Date.parse(value);
-  if (!t || isNaN(t)) return '';
-  const secs = Math.floor((Date.now() - t) / 1000);
+function formatRelativeSince(epochSecs, label) {
+  if (!epochSecs) return '';
+  const secs = Math.floor(Date.now() / 1000 - Number(epochSecs));
   if (secs < 0) return '';
   if (secs < 60) return `${label} ${secs} s ago`;
   if (secs < 3600) return `${label} ${Math.floor(secs / 60)} min ago`;
@@ -863,7 +861,7 @@ function buildMeta(node) {
 }
 
 function buildOfflineMeta(node) {
-  const lastSeen = node.discovered_at ? new Date(node.discovered_at).toLocaleString() : '';
+  const lastSeen = node.lastSeenEpoch ? new Date(node.lastSeenEpoch * 1000).toLocaleString() : '';
   return `
     <div class="mesh-card-meta">
       <div class="meta-item warning-meta">

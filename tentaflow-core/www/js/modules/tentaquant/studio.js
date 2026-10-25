@@ -39,7 +39,7 @@ import { uploadFile } from '/js/modules/tentaquant/files.js';
 import { downloadText } from '/js/lib/download.js';
 import { saveCircuitToNotebook, openNotebookPicker } from '/js/modules/tentaquant/notebook.js';
 import {
-  MAX_LIVE_STATE_QUBITS, MS_PER_GATE, T0_MAX_QUBITS, advance, appliedColumns,
+  MAX_LIVE_STATE_QUBITS, MS_PER_GATE, RECORD_EVOLUTION_QUBITS, T0_MAX_QUBITS, advance, appliedColumns,
   blochFromAmplitudes, canSample, cellOfOp, collapseFrame, countsBundle, gateDetails, gridOf,
   isCollapsing, mergeCounts, opAtColumn, playheadAt, pyFileName, qasmFileName, renderFraction,
   resourceSummary, runSeed, shotBatchSize, shotPlan, stateBundle, stepSummary, svgFileName,
@@ -1048,6 +1048,10 @@ class StudioView {
           // without has only a state, and that is then what is worth storing.
           wantState: !canSample(this.circuit),
           wantProbabilities: false,
+          // The state panel of this screen is driven by the evolution a node
+          // records. Left undecided, Core keeps a Clifford circuit on the
+          // stabilizer tableau, which has no amplitudes and so no frames.
+          recordEvolution: this.grid.numQubits <= RECORD_EVOLUTION_QUBITS,
         },
         projectId: this.screen.projectId,
         notebookId: this.state.notebookId,

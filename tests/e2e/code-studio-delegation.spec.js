@@ -21,9 +21,10 @@
 
 const { test, expect } = require('@playwright/test');
 const {
-  startBinary, stopBinary, waitForServer, binaryExists, baseUrl,
+  startBinary, stopBinary, waitForServer, binaryExists,
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
+const { ensureNativeApp, gotoCodeStudio, openSession } = require('./helpers/code-studio');
 const { startScriptedModel, delegationScripts } = require('./helpers/scripted-model');
 const { startLiveModel, liveModelRequested } = require('./helpers/live-model');
 /// Live models are an order of magnitude slower than the script: a 27B at
@@ -96,6 +97,7 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
   test('przygotowanie: model, grant, workspace i sesja', async ({ page }) => {
     test.setTimeout(T(180_000));
     await loginAsAdmin(page, { port: PORT });
+    await ensureNativeApp(page, 'code-studio');
 
     // Provider.
     const nodes = await api(page, 'meshNodeListRequest');
@@ -145,10 +147,7 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
       userId: mine?.id ?? mine?.userId, granted: true,
     });
 
-    await page.goto(`${baseUrl(PORT)}/`);
-    await page.locator('[data-view="apps-home"]').first().click();
-    await page.locator('[data-route="code-studio"]').first().click();
-    await page.waitForSelector('#cs-new, #cs-empty-new, #cs-table-host', { timeout: 30_000 });
+    await gotoCodeStudio(page, PORT);
 
     await page.locator('#cs-new, #cs-empty-new').first().click();
     await page.locator('#cs-wz-name input').first().fill(WORKSPACE);
@@ -163,34 +162,13 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
       return ws?.status ?? 'missing';
     }, { timeout: 60_000 }).toBe('active');
 
-    await page.locator(`text=${WORKSPACE}`).first().click();
-    // The button carries `disabled` until the workspace is active (code-studio.js:1252),
-    // and a click on a disabled tf-button is silently swallowed.
-    await page.locator('#cs-open-session:not([disabled])').waitFor({ timeout: 60_000 });
-    await page.locator('#cs-open-session').click();
-    await page.locator('#cs-sess-title input').first().waitFor({ timeout: 30_000 });
-    await page.locator('#cs-sess-title input').first().fill('delegacja e2e');
-    await page.locator('[data-action="create"]').first().click();
-    await page.waitForSelector('#cs-session-view', { state: 'visible', timeout: 30_000 });
-
-    await expect.poll(async () => {
-      const sessions = await api(page, 'codeStudioSessionsListRequest', { workspaceId });
-      sessionId = (sessions?.sessions ?? [])[0]?.id
-        ?? (sessions?.sessions ?? [])[0]?.sessionId ?? '';
-      return sessionId;
-    }, { timeout: 30_000, message: 'the created session never reached the listing' })
-      .toBeTruthy();
+    sessionId = await openSession(page, PORT, { workspaceName: WORKSPACE, workspaceId });
   });
 
   test('orkiestrator uruchamia subagenta, widzi go i czeka na niego', async ({ page }) => {
     test.setTimeout(TURN_TIMEOUT + 120_000);
     await loginAsAdmin(page, { port: PORT });
-    await page.goto(`${baseUrl(PORT)}/`);
-    await page.locator('[data-view="apps-home"]').first().click();
-    await page.locator('[data-route="code-studio"]').first().click();
-    await page.locator(`text=${WORKSPACE}`).first().click();
-    await page.locator('[data-open-session]').first().click();
-    await page.waitForSelector('#cs-session-view', { state: 'visible', timeout: 30_000 });
+    await openSession(page, PORT, { workspaceName: WORKSPACE, workspaceId });
 
     const composer = page.locator('#cs-session-view textarea').first();
     await composer.fill(`Zleć subagentowi utworzenie ${PROGRAM}.`);

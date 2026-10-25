@@ -14,11 +14,12 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 const { chromium } = require('playwright');
+const { createProjectViaWizard } = require('./helpers/ml-studio');
 
 const BASE = 'https://localhost:8095';
 const SHOT = '/tmp/mlstudio-chunk-shots';
 const JSONL = '/tmp/guard_big.jsonl';
-const DB = '/home/critix/repos/rust/TentaFlow-ml/.runtime/data/ml_studio.db';
+const DB = process.env.TF_ML_DB || '/home/critix/repos/rust/TentaFlow-ml/.runtime/data/ml_studio.db';
 const PROJECT_NAME = `Guard chunked ${Date.now()}`;
 // ml-studio.js: CHUNK_SIZE = 256 KiB. We want several chunks to exercise the path.
 const TARGET_BYTES = 900 * 1024;
@@ -59,21 +60,10 @@ function buildJsonl() {
   const chunkRequests = [];
 
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1440, height: 900 } });
+  const context = await browser.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: { width: 1440, height: 900 } });
   const page = await context.newPage();
   page.on('console', (msg) => { if (msg.type() === 'error') consoleErrors.push(msg.text()); });
   page.on('pageerror', (err) => consoleErrors.push(`pageerror: ${err.message}`));
-
-  // Pick the most recent ft_llm project — its "Dane" tab is the simple uploader.
-  const ftProjectId = execSync(
-    `sqlite3 "${DB.replace('ml_studio.db', 'ml_studio.db')}" "SELECT project_id FROM projects WHERE project_type='ft_llm' ORDER BY rowid DESC LIMIT 1;"`,
-    { encoding: 'utf8' },
-  ).trim();
-  if (!ftProjectId) {
-    console.log('FATAL: brak projektu ft_llm w bazie do testu uploadu');
-    process.exit(1);
-  }
-  console.log(`Projekt ft_llm do testu: ${ftProjectId}`);
 
   try {
     // ---- Step 1: login → ML Studio → open existing ft_llm project → Dane tab ----
@@ -92,9 +82,13 @@ function buildJsonl() {
       await page.waitForSelector('#ml-studio-new', { timeout: 15000 });
       await page.waitForTimeout(600);
 
-      const card = page.locator(`[data-project-id="${ftProjectId}"]`).first();
-      await card.waitFor({ state: 'visible', timeout: 15000 });
-      await card.click();
+      // A fresh fine-tuning project owned by the logged-in user: its "Dane" tab is
+      // the simple uploader, and a run does not depend on what an earlier run left.
+      const ftProjectId = await createProjectViaWizard(page, {
+        name: `Guard upload ${Date.now().toString(36).slice(-5)}`,
+        description: 'e2e: wielofragmentowy upload JSONL',
+        type: 'ft_llm',
+      });
       await page.waitForTimeout(800);
 
       const daneTab = page.locator('#ml-studio-tabs tf-tab[label="Dane"]');

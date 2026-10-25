@@ -1387,10 +1387,8 @@
 /* ============================================================================
    Podgląd flow systemowego (read-only)
    ============================================================================ */
-.fb-shell.fb-readonly {
-  grid-template-rows: 56px auto 1fr 44px;
-}
 .fb-readonly [data-role="system-readonly"] {
+  grid-area: notice;
   margin: 8px 12px 0;
 }
 .fb-readonly .fb-topbar [hidden],

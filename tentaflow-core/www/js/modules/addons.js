@@ -27,8 +27,6 @@ import { openInstallSteps } from '/js/modules/addons/install-steps.js';
 import { openUninstallDialog } from '/js/modules/addons/uninstall-dialog.js';
 import { confirmDisable } from '/js/modules/addons/disable-dialog.js';
 import { openRobotCloudDialog, robotCloudFieldValues, robotCloudVendorName } from '/js/modules/addons/robot-cloud-dialog.js';
-// `openInstallWizard` reserved for the future "Install from ZIP" flow on the
-// addons list page; it is no longer triggered from the per-addon header.
 
 // The one package that finishes installing unable to do its job. TentaNas can
 // run nothing privileged until an admin picks a channel mode, and the install

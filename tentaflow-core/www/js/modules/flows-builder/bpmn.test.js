@@ -2856,7 +2856,7 @@ test('canvas marks the kind of a Service task and an LLM block without a model',
 test('an agent step is shown as an agent and the implementation control cannot replace its settings', async () => {
   const graph = canvas();
   const stored = { agentId: 'agent-1', goalExpression: '"Summarise"', allowedTools: ['core.skill_view'], maxIterations: 5 };
-  graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.node_type === 'bpmn_service_task'), preset: { implementation: { Agent: structuredClone(stored) } } }, 300, 300);
+  graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), preset: { implementation: { Agent: structuredClone(stored) } } }, 300, 300);
   const agent = graph.nodes.at(-1);
   assert.equal(processServiceKind(agent.config), 'agent');
   const marker = graph.nodesLayer.querySelector(`[data-node-id="${agent.id}"] .fb-process-kind`);

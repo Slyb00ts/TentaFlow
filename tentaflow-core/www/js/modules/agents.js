@@ -13,7 +13,7 @@
 // tf-* components only.
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { byId, escapeHtml, escapeAttr, toast, fmtCompact } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast, fmtCompact, uuidFromBytes } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
 import { TfWindow } from '/js/components/tf-window.js';
@@ -186,13 +186,6 @@ const CORE_TOOL_GROUPS = [
     names: ['core.skill_view'],
   },
 ];
-
-// authMe carries userId as 16 raw bytes while stored runs name their initiator
-// by canonical UUID text.
-function uuidFromBytes(bytes) {
-  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
 
 const state = {
   agents: [],

@@ -5736,29 +5736,6 @@
       "public": "öffentlich"
     }
   },
-  "install_wizard": {
-    "access_loading": "Zugriffsanforderungen werden geladen…",
-    "access_none": "Dieses Add-on deklariert keine Zugriffsanforderungen für Modelle oder Aliase.",
-    "access_required": "Erforderlich",
-    "access_optional": "Optional",
-    "access_kind_alias": "Alias",
-    "access_kind_model": "Modell",
-    "access_vis_public": "Öffentlich",
-    "access_vis_restricted": "Eingeschränkt",
-    "access_vis_private": "Privat",
-    "access_auto_granted": "Automatisch gewährt",
-    "access_blocked_private": "Blockiert (Eigentümer ist privat)",
-    "access_denied": "Abgelehnt",
-    "access_pending_readonly": "Warten auf Freigabe",
-    "access_approve": "Genehmigen",
-    "access_reject": "Ablehnen",
-    "access_approved_toast": "Zugriff genehmigt",
-    "access_rejected_toast": "Zugriff abgelehnt",
-    "access_decision_error": "Zugriffsentscheidung konnte nicht angewendet werden",
-    "access_err_load": "Zugriffsanforderungen konnten nicht geladen werden",
-    "access_advance_blocked": "Erforderlichen Zugriff vor dem Fortfahren gewähren oder entfernen.",
-    "access_required_blocked": "Erforderlicher Zugriff wurde nicht gewährt"
-  },
   "ml_studio": {
     "annotate": {
       "save": "Speichern",

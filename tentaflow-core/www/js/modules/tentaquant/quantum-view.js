@@ -38,6 +38,11 @@ export const MAX_LIVE_STATE_QUBITS = 12;
 // select promises and the width the simulator accepts are one constant.
 export const T0_MAX_QUBITS = 24;
 
+// The widest register whose evolution a Core run records by default
+// (`KEYFRAME_DEFAULT_QUBITS` in tentaflow-protocol): a keyframe is one pass over
+// the state per gate, so wider runs record only on an explicit request.
+export const RECORD_EVOLUTION_QUBITS = 24;
+
 // ---------------------------------------------------------------------------
 // Grid ⇄ step
 // ---------------------------------------------------------------------------

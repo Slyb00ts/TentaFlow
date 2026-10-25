@@ -22,6 +22,7 @@ const {
   startBinary, stopBinary, waitForServer, binaryExists, baseUrl,
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
+const { ensureNativeApp, openSession: openSessionOf } = require('./helpers/code-studio');
 const {
   startScriptedModel, helloWorldScript, enforcedPipelineScripts, tool, say,
 } = require('./helpers/scripted-model');
@@ -87,7 +88,7 @@ function rolesConsulted() {
   const markers = {
     orkiestrator: 'Jesteś agentem programistycznym',
     planista: 'Jesteś planistą zmian w kodzie',
-    krytyk: 'Jestes krytykiem',
+    krytyk: 'Jesteś krytykiem',
     wykonawca: 'Piszesz kod',
     tester: 'Uruchamiasz testy i buildy',
   };
@@ -103,14 +104,9 @@ function rolesConsulted() {
   return seen;
 }
 
-async function openSession(page, title) {
-  await page.goto(`${baseUrl(PORT)}/#/code-studio`);
-  await page.locator(`text=${WORKSPACE}`).first().click();
-  await page.locator('#cs-open-session:not([disabled])').waitFor({ timeout: 90_000 });
-  await page.locator('#cs-open-session').click();
-  await page.locator('#cs-sess-title input').first().fill(title);
-  await page.locator('[data-action="create"]').first().click();
-  await page.waitForSelector('#cs-session-view', { state: 'visible', timeout: 60_000 });
+// Clicking the workspace re-enters its latest open session or opens one.
+async function openSession(page) {
+  await openSessionOf(page, PORT, { workspaceName: WORKSPACE, workspaceId });
 }
 
 // Answers every permission question the agent raises, so a turn is not judged
@@ -135,6 +131,7 @@ test.describe('Code Studio — wymuszony potok', () => {
   test('zaklada workspace', async ({ page }) => {
     test.setTimeout(240_000);
     await loginAsAdmin(page, { port: PORT });
+    await ensureNativeApp(page, 'code-studio');
 
     const nodes = await api(page, 'meshNodeListRequest');
     await api(page, 'serviceManifestDeployRequest', {
@@ -174,7 +171,7 @@ test.describe('Code Studio — wymuszony potok', () => {
     async ({ page }) => {
       test.setTimeout(420_000);
       await loginAsAdmin(page, { port: PORT });
-      await openSession(page, 'potok');
+      await openSession(page);
 
       const box = page.locator('#cs-session-view textarea').first();
       await box.waitFor({ state: 'visible', timeout: 25_000 });
@@ -243,7 +240,7 @@ test.describe('Code Studio — wymuszony potok', () => {
     });
     await new Promise((r) => setTimeout(r, 800));
 
-    await openSession(page, 'samo pytanie');
+    await openSession(page);
     const box = page.locator('#cs-session-view textarea').first();
     await box.waitFor({ state: 'visible', timeout: 25_000 });
     await box.fill('Co robi ten plik?');

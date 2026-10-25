@@ -380,6 +380,20 @@ async function pendingApprovals(page, workspace = workspaceId, session = session
   return body?.approvals ?? [];
 }
 
+/// A turn outlives the assertions that watched it: the build loop keeps
+/// spawning agents, and a later round of the implementer raises its own
+/// question. Left alone, that question is the one the NEXT test's click would
+/// answer, so a test that starts a turn first cancels whatever the session
+/// still runs and waits until nothing in it is open.
+async function settleSession(page, workspace = workspaceId, session = sessionId) {
+  await api(page, 'codeStudioSessionCancelRequest', scope(workspace, session));
+  await expect.poll(async () => {
+    const runs = (await api(page, 'codeStudioSessionRunsRequest', scope(workspace, session)))?.runs ?? [];
+    const open = runs.filter((r) => !['completed', 'failed', 'cancelled'].includes(r.status));
+    return open.length + (await pendingApprovals(page, workspace, session)).length;
+  }, { timeout: 60_000, message: 'the previous turn never settled' }).toBe(0);
+}
+
 /// The account cards a session has open.
 function pendingAccounts(page, workspace = workspaceId, session = sessionId) {
   return pendingApprovals(page, workspace, session)
@@ -1015,8 +1029,10 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
 
     // The click landed on the durable row, and the scope is the narrow one: the
     // person allowed THIS run, so the question comes back for the next one.
+    // The graph's build loop may open another round the moment this run ends, and
+    // that round asks its own question; only the answered one is under test.
     const settled = dbApprovals(cliWorkspaceId)
-      .filter((a) => a.capability === 'cli_delegate');
+      .filter((a) => a.capability === 'cli_delegate' && a.status === 'decided');
     expect(settled).toHaveLength(1);
     expect(settled[0].status).toBe('decided');
     expect(settled[0].decision).toBe('allow_once');
@@ -1165,6 +1181,7 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     await loginAsAdmin(page, { port: PORT });
     await openStudio(page);
     await openWorkspace(page, WORKSPACE_CLI);
+    await settleSession(page, cliWorkspaceId, cliSessionId);
 
     // ---------------------------------------------------------------------
     // 1. The state this test is about: a credential the node can read that
@@ -1363,6 +1380,7 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     // ---------------------------------------------------------------------
     await openStudio(page);
     await openWorkspace(page, WORKSPACE_CLI);
+    await settleSession(page, cliWorkspaceId, cliSessionId);
 
     const sessions = scope(cliWorkspaceId, cliSessionId);
     const runsNow = async () => ((await api(page, 'codeStudioSessionRunsRequest', sessions))?.runs ?? []);
@@ -1409,6 +1427,7 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     await loginAsAdmin(page, { port: PORT });
     await openStudio(page);
     await openWorkspace(page, WORKSPACE_CLI);
+    await settleSession(page, cliWorkspaceId, cliSessionId);
 
     // ---------------------------------------------------------------------
     // 1. A working credential, produced the way the product produces one. The
@@ -1558,6 +1577,7 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     await loginAsAdmin(page, { port: PORT });
     await openStudio(page);
     await openWorkspace(page, WORKSPACE_CLI);
+    await settleSession(page, cliWorkspaceId, cliSessionId);
 
     // ---------------------------------------------------------------------
     // 1. A working credential, produced the way the product produces one. The

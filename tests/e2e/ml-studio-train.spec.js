@@ -19,11 +19,12 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 const { chromium } = require('playwright');
+const { createProjectViaWizard } = require('./helpers/ml-studio');
 
 const BASE = 'https://localhost:8095';
 const SHOT = '/tmp/mlstudio-shots7';
 const CSV = '/tmp/przesylki_test.csv';
-const DB = '/home/critix/repos/rust/TentaFlow-ml/.runtime/data/ml_studio.db';
+const DB = process.env.TF_ML_DB || '/home/critix/repos/rust/TentaFlow-ml/.runtime/data/ml_studio.db';
 const PROJECT_NAME = `Cysterny trening ${Date.now()}`;
 
 const results = [];
@@ -76,7 +77,7 @@ function readLeaderboard(page) {
   const failedRequests = [];
 
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1440, height: 900 } });
+  const context = await browser.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: { width: 1440, height: 900 } });
   const page = await context.newPage();
 
   page.on('console', (msg) => { if (msg.type() === 'error') consoleErrors.push(msg.text()); });
@@ -112,21 +113,7 @@ function readLeaderboard(page) {
       await page.waitForSelector('#ml-studio-new', { timeout: 15000 });
       await page.waitForTimeout(500);
 
-      await page.locator('#ml-studio-new').click();
-      const nameInput = page.locator('#ml-studio-name input').first();
-      await nameInput.waitFor({ state: 'visible', timeout: 10000 });
-      await nameInput.fill(PROJECT_NAME);
-      await page.locator('#ml-studio-desc textarea').first().fill('e2e: realny trening tabelaryczny → leaderboard');
-
-      const tabRadio = page.locator('#ml-studio-types tf-radio[value="tabular_anomaly"]');
-      await tabRadio.first().waitFor({ state: 'attached', timeout: 10000 });
-      await tabRadio.first().click();
-      await shot(page, '01-create-form.png');
-
-      const submit = page.locator('#ml-studio-create-modal tf-button', { hasText: 'Utwórz projekt' }).first();
-      await submit.click();
-      await page.waitForSelector('#ml-studio-create-modal', { state: 'detached', timeout: 15000 }).catch(() => {});
-      await page.waitForSelector('#ml-studio-detail tf-detail-header', { timeout: 15000 });
+      await createProjectViaWizard(page, { name: PROJECT_NAME, description: 'e2e: realny trening tabelaryczny → leaderboard', type: 'tabular_anomaly' });
       await page.waitForTimeout(600);
 
       step('1. Login → ML Studio → projekt tabular_anomaly → szczegół', true,

@@ -55,12 +55,11 @@ const ClusterWizard = {
       fName = cluster.name || '';
       fDesc = cluster.description || '';
       fStrategy = cluster.strategy || 'distributed';
-      fFailover = !!(cluster.failoverEnabled ?? cluster.failover_enabled);
-      fFailoverTarget = cluster.failoverTarget || cluster.failover_target || '';
-      fHealthInterval = cluster.healthCheckIntervalMs || cluster.health_check_interval_ms || 5000;
-      fTimeout = cluster.timeoutMs || cluster.timeout_ms || 10000;
-      const members = cluster.members || cluster.nodes || [];
-      for (const m of members) selectedIds.add(m.nodeId || m.nodeId);
+      fFailover = !!cluster.failoverEnabled;
+      fFailoverTarget = cluster.failoverTarget || '';
+      fHealthInterval = cluster.healthCheckIntervalMs || 5000;
+      fTimeout = cluster.timeoutMs || 10000;
+      for (const m of cluster.members) selectedIds.add(m.nodeId);
     } else {
       fName = '';
       fDesc = '';

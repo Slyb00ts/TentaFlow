@@ -1888,11 +1888,21 @@ tf-menu[compact] .tf-menu-item {
   visibility: visible;
   transition-delay: 0s, 0s, 0s, 0s;
 }
+/* tf-menu.js un-hides the panel in the same frame it gains `.open`, so the
+   entry animation needs an explicit starting point. */
+@starting-style {
+  .tf-menu.open {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.9);
+    filter: blur(8px);
+  }
+}
 /* Inline standalone menu (e.g. SDK Menu component without a trigger): the panel
    lives in normal flow inside its host instead of floating as an absolute
    dropdown. controls.css is adopted into the tf-menu shadow root, so
    :host-context targets the host's inline modifier from inside the shadow. */
 :host-context(.tf-menu--inline) .tf-menu {
+  display: block; /* beats the [hidden] the host sets on a menu that is never "opened" */
   position: static;
   visibility: visible;
   opacity: 1;

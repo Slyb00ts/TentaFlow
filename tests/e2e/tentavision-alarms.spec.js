@@ -152,7 +152,10 @@ test.describe('TentaVision Alarms — SQLite read + decision workflow + persiste
 
     // --- Raise a second (warning) alarm so the amber tone is visible too. ---
     await clickButtonByText(page, 'Symuluj alarm');
-    await expect(page.locator('.addon-app-shell').getByText('warning').first())
+    // 'warning' alone is not proof: the severity filter already shows the word.
+    // The second alarm's own message appears only once its repaint has landed, so
+    // waiting for it keeps the next step off the tree that repaint replaces.
+    await expect(page.locator('.addon-app-shell').getByText('nieczytelna tablica ADR').first())
       .toBeVisible({ timeout: 10000 });
 
     // --- Make a decision on the selected alarm: Potwierdź. This UPDATEs status

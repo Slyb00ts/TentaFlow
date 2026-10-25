@@ -14,6 +14,7 @@
 
 const fs = require('fs');
 const { chromium } = require('playwright');
+const { createProjectViaWizard } = require('./helpers/ml-studio');
 
 const BASE = 'https://localhost:8095';
 const SHOT = '/tmp/mlstudio-shots3';
@@ -21,7 +22,10 @@ const SHOT = '/tmp/mlstudio-shots3';
 // makes re-runs collide (second create fails on the taken name). The scenario
 // asks for "Cysterny share"; we keep that prefix and append a short run tag.
 const PROJECT_NAME = `Cysterny share ${Date.now().toString(36).slice(-5)}`;
-const INVITE_ID = '00000000-0000-4000-8000-0000000000aa';
+// Only Power Users can be invited (ml-studio-invite-validation covers the refusal);
+// the member cell shows the resolved username, not the id.
+const INVITE_NAME = 'power1';
+const INVITE_ID = '00000000-0000-4000-8000-0000000000bb';
 
 const results = [];
 function step(name, pass, note) {
@@ -77,7 +81,7 @@ async function sectionHeadingFor(page, view) {
   // ---------------------------------------------------------------------------
   // SCENARIO A — admin: nav placement, ownership split, sharing screen, invite.
   // ---------------------------------------------------------------------------
-  const ctxA = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1440, height: 900 } });
+  const ctxA = await browser.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: { width: 1440, height: 900 } });
   const page = await ctxA.newPage();
   const diagA = attachDiagnostics(page, 'admin');
 
@@ -116,21 +120,7 @@ async function sectionHeadingFor(page, view) {
       await page.waitForTimeout(500);
       await shot(page, '03-ml-studio-list.png');
 
-      // Create the project via the wizard modal.
-      await page.locator('#ml-studio-new').click();
-      const nameInput = page.locator('#ml-studio-name input').first();
-      await nameInput.waitFor({ state: 'visible', timeout: 10000 });
-      await nameInput.fill(PROJECT_NAME);
-      await page.locator('#ml-studio-desc textarea').first().fill('smoke test udostępniania');
-      const recRadio = page.locator('#ml-studio-types tf-radio[value="recognition"]');
-      if (await recRadio.count()) await recRadio.first().click();
-      await shot(page, '04-create-form.png');
-
-      const submit = page.locator('#ml-studio-create-modal tf-button', { hasText: 'Utwórz projekt' }).first();
-      await submit.click();
-      await page.waitForSelector('#ml-studio-create-modal', { state: 'detached', timeout: 15000 }).catch(() => {});
-      // On success the module navigates to the project detail.
-      await page.waitForSelector('#ml-studio-detail tf-detail-header, .ml-studio-card', { timeout: 15000 });
+      await createProjectViaWizard(page, { name: PROJECT_NAME, description: 'smoke test udostępniania', type: 'tabular_anomaly' });
       await page.waitForTimeout(800);
 
       // Capture the projectId from the router URL (hash/query) if we landed on detail.
@@ -265,21 +255,21 @@ async function sectionHeadingFor(page, view) {
         await page.locator('#ml-studio-invite-send').click();
 
         // The module reloads the share screen on success; wait for the new id row.
-        // We match the FULL invited id (its 8-char prefix "00000000" collides with the
-        // owner UUID, so a prefix match would false-positive on the owner row).
-        await page.waitForFunction((id) => {
+        // We match the invitee's username: the id would also match the owner row's
+        // inviter column.
+        await page.waitForFunction((name) => {
           const t = document.querySelector('#ml-studio-members');
           if (!t || !t.shadowRoot) return false;
-          return [...t.shadowRoot.querySelectorAll('tbody tr')].some((r) => r.textContent.includes(id));
-        }, INVITE_ID, { timeout: 12000 }).catch(() => {});
+          return [...t.shadowRoot.querySelectorAll('tbody tr')].some((r) => r.textContent.includes(name));
+        }, INVITE_NAME, { timeout: 12000 }).catch(() => {});
         await page.waitForTimeout(500);
         await shot(page, '08-invite-result.png');
 
-        const inviteState = await page.evaluate((id) => {
+        const inviteState = await page.evaluate((name) => {
           const t = document.querySelector('#ml-studio-members');
           const rows = t?.shadowRoot ? [...t.shadowRoot.querySelectorAll('tbody tr')] : [];
           // The invited row is the one carrying the full invited id in its member cell.
-          const row = rows.find((r) => r.textContent.includes(id));
+          const row = rows.find((r) => r.textContent.includes(name));
           const txt = row ? row.textContent.replace(/\s+/g, ' ').trim() : '';
           const toastEl = document.querySelector('tf-toast, .tf-toast');
           return {
@@ -290,20 +280,20 @@ async function sectionHeadingFor(page, view) {
             rowCount: rows.length,
             toast: toastEl ? toastEl.textContent.replace(/\s+/g, ' ').trim() : null,
           };
-        }, INVITE_ID);
+        }, INVITE_NAME);
 
         const okInvite = inviteState.rowFound && inviteState.isEditor;
-        step('A4. Zaproszenie „zwykly" (Edytor) na liście członków', okInvite,
+        step('A4. Zaproszenie „power1" (Edytor) na liście członków', okInvite,
           okInvite
             ? `Wiersz zaproszonego: "${inviteState.rowText}" (rola Edytor: ${inviteState.isEditor}, status oczekuje/aktywny: ${inviteState.isPending}; łącznie ${inviteState.rowCount} wierszy)`
             : `Zaproszony NIE pojawił się poprawnie. rowFound=${inviteState.rowFound}, isEditor=${inviteState.isEditor}; wierszy: ${inviteState.rowCount}; toast: "${inviteState.toast}". Sprawdź backend (project_members).`);
       } else {
-        step('A4. Zaproszenie „zwykly"', false,
+        step('A4. Zaproszenie „power1"', false,
           'ZABLOKOWANE: formularz zaproszenia nie istnieje, bo ekran udostępniania nie rozpoznaje admina jako właściciela (ProjectDetail bez is_owner). Zaproszenia nie da się wysłać przez UI mimo że members_list pokazuje admina jako ownera. Naprawa po stronie backendu: to_detail() musi nieść is_owner/role.');
       }
     } catch (e) {
       await shot(page, '08-invite-FAIL.png');
-      step('A4. Zaproszenie „zwykly"', false, `Błąd: ${e.message}`);
+      step('A4. Zaproszenie „power1"', false, `Błąd: ${e.message}`);
     }
   } catch (fatal) {
     console.log(`\nFATAL (admin): ${fatal.message}`);
@@ -323,9 +313,9 @@ async function sectionHeadingFor(page, view) {
   await ctxA.close();
 
   // ---------------------------------------------------------------------------
-  // SCENARIO B — plain user (zwykly/admin): §11.2 gate hides ML Studio.
+  // SCENARIO B — plain user (zwykly/admin): the read permission shows ML Studio.
   // ---------------------------------------------------------------------------
-  const ctxB = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1440, height: 900 } });
+  const ctxB = await browser.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: { width: 1440, height: 900 } });
   const pageB = await ctxB.newPage();
   const diagB = attachDiagnostics(pageB, 'zwykly');
 
@@ -340,7 +330,8 @@ async function sectionHeadingFor(page, view) {
       return { items, headings, roleText, hasMlStudio: items.includes('ml-studio') };
     });
 
-    step('B6. §11.2 — zwykły user NIE widzi „ML Studio"', !gate.hasMlStudio,
+    // mlstudio.read defaults to allow in the permission matrix, so the entry is visible.
+    step('B6. Matryca uprawnień — zwykły user widzi „ML Studio" (mlstudio.read)', gate.hasMlStudio,
       `Rola w UI: "${gate.roleText}"; pozycje nawigacji: [${gate.items.join(', ')}]; sekcje: [${gate.headings.join(' | ')}]`);
   } catch (e) {
     await shot(pageB, '09-zwykly-FAIL.png');

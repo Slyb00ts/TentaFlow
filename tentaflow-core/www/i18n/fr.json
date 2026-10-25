@@ -5736,29 +5736,6 @@
       "public": "public"
     }
   },
-  "install_wizard": {
-    "access_loading": "Chargement des exigences d’accès…",
-    "access_none": "Ce module ne déclare aucune exigence d’accès aux modèles ou aux alias.",
-    "access_required": "Requis",
-    "access_optional": "Facultatif",
-    "access_kind_alias": "Alias",
-    "access_kind_model": "Modèle",
-    "access_vis_public": "Public",
-    "access_vis_restricted": "Restreint",
-    "access_vis_private": "Privé",
-    "access_auto_granted": "Accordé automatiquement",
-    "access_blocked_private": "Bloqué (le propriétaire est privé)",
-    "access_denied": "Refusé",
-    "access_pending_readonly": "En attente d’approbation",
-    "access_approve": "Approuver",
-    "access_reject": "Rejeter",
-    "access_approved_toast": "Accès approuvé",
-    "access_rejected_toast": "Accès rejeté",
-    "access_decision_error": "Impossible d’appliquer la décision d’accès",
-    "access_err_load": "Impossible de charger les exigences d’accès",
-    "access_advance_blocked": "Accordez ou supprimez l’accès requis avant de continuer.",
-    "access_required_blocked": "L’accès requis n’a pas été accordé"
-  },
   "ml_studio": {
     "annotate": {
       "save": "Enregistrer",

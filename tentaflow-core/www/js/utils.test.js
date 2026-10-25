@@ -7,7 +7,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { fmtCompact, fmtExact, fmtCurrency, fmtPct, fmtMs, fmtDuration } from './utils.js';
+import { fmtCompact, fmtExact, fmtCurrency, fmtPct, fmtMs, fmtDuration, uuidFromBytes } from './utils.js';
 
 // Intl emits narrow/regular no-break spaces as group separators; normalize.
 const norm = (s) => s.replace(/[  ]/g, ' ');
@@ -84,4 +84,9 @@ test('fmtDuration', () => {
 
 test('default language falls back to pl without a DOM', () => {
   assert.equal(norm(fmtCompact(12400)), '12,4 tys');
+});
+
+test('uuidFromBytes renders a 16-byte wire id as canonical UUID text', () => {
+  const bytes = Uint8Array.from([0, 0, 0, 0, 0, 0, 0x40, 0, 0x80, 0, 0, 0, 0, 0, 0, 2]);
+  assert.equal(uuidFromBytes(bytes), '00000000-0000-4000-8000-000000000002');
 });

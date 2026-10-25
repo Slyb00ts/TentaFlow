@@ -51,7 +51,7 @@ const {
   waitForServer,
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
-const { api, ensureCodeStudioApp } = require('./helpers/code-studio');
+const { api, ensureNativeApp } = require('./helpers/code-studio');
 
 const A_PORT = 18131;
 const PEER_PORT = 18132;
@@ -246,7 +246,7 @@ test.describe('Code Studio — process_sandbox on a REMOTE node', () => {
 
   test('the wizard offers both isolation modes the remote node reports, and refuses the ones it does not', async ({ page }) => {
     await loginAsAdmin(page, { port: A_PORT });
-    await ensureCodeStudioApp(page);
+    await ensureNativeApp(page, 'code-studio');
 
     // Workspace creation is gated by a per-user grant, which a fresh database
     // does not carry — without it the wizard button renders disabled.

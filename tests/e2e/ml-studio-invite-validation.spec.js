@@ -15,10 +15,11 @@
 const fs = require('fs');
 const { execSync } = require('child_process');
 const { chromium } = require('playwright');
+const { createProjectViaWizard } = require('./helpers/ml-studio');
 
 const BASE = 'https://localhost:8095';
 const SHOT = '/tmp/mlstudio-shots4';
-const ML_DB = '/home/critix/repos/rust/TentaFlow-ml/.runtime/data/ml_studio.db';
+const ML_DB = process.env.TF_ML_DB || '/home/critix/repos/rust/TentaFlow-ml/.runtime/data/ml_studio.db';
 // Unique per run — backend enforces UNIQUE(org_id, name); a fixed name collides on re-run.
 const PROJECT_NAME = `Walidacja zaproszen ${Date.now().toString(36).slice(-5)}`;
 // Plain `user` — must be REJECTED (the key negative test).
@@ -65,17 +66,19 @@ async function login(page, user, pass) {
 
 // Reads members from the open shadow root of the #ml-studio-members tf-table.
 async function readMembers(page) {
-  return page.evaluate((ids) => {
+  return page.evaluate((names) => {
     const t = document.querySelector('#ml-studio-members');
     const rows = t?.shadowRoot ? [...t.shadowRoot.querySelectorAll('tbody tr')] : [];
     const rowTexts = rows.map((r) => r.textContent.replace(/\s+/g, ' ').trim());
     return {
       rowCount: rows.length,
       rowTexts,
-      hasZwykly: rowTexts.some((tx) => tx.includes(ids.zwykly)),
-      hasPower1: rowTexts.some((tx) => tx.includes(ids.power1)),
+      // The member cell shows the resolved username, not the id (the id column is
+      // the inviter's), so rows are matched by name.
+      hasZwykly: rowTexts.some((tx) => tx.includes(names.zwykly)),
+      hasPower1: rowTexts.some((tx) => tx.includes(names.power1)),
     };
-  }, { zwykly: ZWYKLY_ID, power1: POWER1_ID });
+  }, { zwykly: 'zwykly', power1: 'power1' });
 }
 
 // Drains any visible toast text (error/success) for evidence.
@@ -127,7 +130,7 @@ async function sendInvite(page, userId) {
   fs.mkdirSync(SHOT, { recursive: true });
   const browser = await chromium.launch({ headless: true });
 
-  const ctxA = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1440, height: 900 } });
+  const ctxA = await browser.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: { width: 1440, height: 900 } });
   const page = await ctxA.newPage();
   const diagA = attachDiagnostics(page, 'admin');
 
@@ -140,19 +143,7 @@ async function sendInvite(page, userId) {
       await page.locator('.sidebar .nav-item[data-view="ml-studio"]').click();
       await page.waitForSelector('#ml-studio-new', { timeout: 15000 });
       await page.waitForTimeout(400);
-      await page.locator('#ml-studio-new').click();
-      const nameInput = page.locator('#ml-studio-name input').first();
-      await nameInput.waitFor({ state: 'visible', timeout: 10000 });
-      await nameInput.fill(PROJECT_NAME);
-      await page.locator('#ml-studio-desc textarea').first().fill('test walidacji zaproszen — tylko Power User');
-      const recRadio = page.locator('#ml-studio-types tf-radio[value="recognition"]');
-      if (await recRadio.count()) await recRadio.first().click();
-      await shot(page, '01-create-form.png');
-
-      const submit = page.locator('#ml-studio-create-modal tf-button', { hasText: 'Utwórz projekt' }).first();
-      await submit.click();
-      await page.waitForSelector('#ml-studio-create-modal', { state: 'detached', timeout: 15000 }).catch(() => {});
-      await page.waitForSelector('#ml-studio-detail tf-detail-header, .ml-studio-card', { timeout: 15000 });
+      await createProjectViaWizard(page, { name: PROJECT_NAME, description: 'test walidacji zaproszen — tylko Power User', type: 'recognition' });
       await page.waitForTimeout(800);
 
       createdProjectId = await page.evaluate(() => {
@@ -205,17 +196,17 @@ async function sendInvite(page, userId) {
     // ---- Step 3: invite POWER1 (power_user) — MUST be ACCEPTED ----
     try {
       await sendInvite(page, POWER1_ID);
-      await page.waitForFunction((id) => {
+      await page.waitForFunction((name) => {
         const t = document.querySelector('#ml-studio-members');
         if (!t || !t.shadowRoot) return false;
-        return [...t.shadowRoot.querySelectorAll('tbody tr')].some((r) => r.textContent.includes(id));
-      }, POWER1_ID, { timeout: 12000 }).catch(() => {});
+        return [...t.shadowRoot.querySelectorAll('tbody tr')].some((r) => r.textContent.includes(name));
+      }, 'power1', { timeout: 12000 }).catch(() => {});
       await page.waitForTimeout(500);
       const toast = await readToast(page);
       const after = await readMembers(page);
       await shot(page, '04-invite-power1-accepted.png');
 
-      const power1Row = after.rowTexts.find((tx) => tx.includes(POWER1_ID)) || '';
+      const power1Row = after.rowTexts.find((tx) => tx.includes('power1')) || '';
       const isEditor = /edytor/i.test(power1Row);
       const isPendingOrActive = /oczekuj|aktywn|zapros/i.test(power1Row);
       const accepted = after.hasPower1;
@@ -280,8 +271,8 @@ async function sendInvite(page, userId) {
 
   await ctxA.close();
 
-  // ---- Step 6 (optional): §11.2 nav gate for plain user ----
-  const ctxB = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1440, height: 900 } });
+  // ---- Step 6: permission-matrix nav entry for a plain user ----
+  const ctxB = await browser.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: { width: 1440, height: 900 } });
   const pageB = await ctxB.newPage();
   const diagB = attachDiagnostics(pageB, 'zwykly');
   try {
@@ -292,7 +283,9 @@ async function sendInvite(page, userId) {
       const roleText = document.querySelector('.user-chip .role')?.textContent.trim() ?? null;
       return { items, roleText, hasMlStudio: items.includes('ml-studio') };
     });
-    step('6. §11.2 — zwykły user NIE widzi „ML Studio" w nav', !gate.hasMlStudio,
+    // ML Studio is an app behind the permission matrix: mlstudio.read defaults to
+    // allow, so a plain user sees the entry; writing is what stays denied.
+    step('6. Matryca uprawnień — zwykły user widzi „ML Studio" w nav (mlstudio.read)', gate.hasMlStudio,
       `Rola w UI: "${gate.roleText}"; nav: [${gate.items.join(', ')}]`);
   } catch (e) {
     await shot(pageB, '06-zwykly-FAIL.png');

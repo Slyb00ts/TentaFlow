@@ -14,17 +14,33 @@ const {
   baseUrl,
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
+const { installAddonInstance } = require('./helpers/addon-setup');
 
 const PORT = 18099;
 const DB = '/tmp/e2e-m14.db';
 let proc;
 
-test.beforeAll(async () => {
+test.beforeAll(async ({ browser }) => {
   if (!binaryExists()) {
     test.skip(true, 'tentaflow release binary not built');
   }
   proc = startBinary({ port: PORT, db: DB });
   await waitForServer(PORT);
+  // The Bindings tab lives in an addon's detail view, so one addon instance must exist.
+  const page = await browser.newPage({ ignoreHTTPSErrors: true });
+  await loginAsAdmin(page, { port: PORT });
+  const addonId = await installAddonInstance(page, {
+    packageId: 'tentavision',
+    displayName: 'M14 bindings E2E',
+    permissions: ['ui'],
+  });
+  // The tab attributes aliases to an addon by name prefix, so an alias named
+  // after the instance is what makes the heuristic banner appear.
+  await page.evaluate(async (alias) => {
+    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+    await ApiBinary.action('modelAliasCreateRequest', { alias, targetModel: 'm14-target' });
+  }, `${addonId}-chat`);
+  await page.close();
 });
 
 test.afterAll(async () => {
@@ -36,56 +52,21 @@ test.describe('M14 — Addon detail > Bindings', () => {
   test.beforeEach(async ({ page }) => {
     await loginAsAdmin(page, { port: PORT });
     await page.goto(`${baseUrl(PORT)}/#/addons`);
-    await page.waitForLoadState('networkidle');
+    await page.locator('[data-addon-card]').first().click();
+    await page.locator('tf-tab#bindings').click();
   });
 
   test('Bindings tab renders inside addon detail', async ({ page }) => {
-    // Without an installed addon there is nothing to drill into. We assert
-    // that the addons screen rendered, and if a row exists, we click it and
-    // confirm the Bindings tab is reachable.
-    const firstAddon = page.locator('[data-addon-id], tf-table tr').first();
-    if ((await firstAddon.count()) === 0) {
-      test.skip(true, 'no installed addons — bindings tab unreachable in F1a default state');
-    }
-    await firstAddon.click();
-    const tab = page.locator('tf-tab#bindings, [data-tab="bindings"]').first();
-    await expect(tab).toBeVisible({ timeout: 5000 });
-    await tab.click();
-    // Bindings body should contain a storage section.
-    await expect(page.locator('text=/storage|aliases|bindings/i').first()).toBeVisible();
+    await expect(page.locator('.addon-bindings')).toBeVisible({ timeout: 10000 });
+    await expect(page.locator('#bindings-refresh')).toBeVisible();
   });
 
   test('heuristic warning banner is rendered', async ({ page }) => {
-    const firstAddon = page.locator('[data-addon-id], tf-table tr').first();
-    if ((await firstAddon.count()) === 0) {
-      test.skip(true, 'no addons installed');
-    }
-    await firstAddon.click();
-    const tab = page.locator('tf-tab#bindings').first();
-    if ((await tab.count()) === 0) {
-      test.skip(true, 'bindings tab not present');
-    }
-    await tab.click();
-    const warnChip = page.locator('tf-chip[status="warn"]').first();
-    await expect(warnChip).toBeVisible({ timeout: 5000 });
+    await expect(page.locator('.addon-bindings tf-chip[status="warn"]')).toBeVisible({ timeout: 10000 });
   });
 
   test('"Manage in M16" link navigates to Services aliases', async ({ page }) => {
-    const firstAddon = page.locator('[data-addon-id], tf-table tr').first();
-    if ((await firstAddon.count()) === 0) {
-      test.skip(true, 'no addons installed');
-    }
-    await firstAddon.click();
-    const tab = page.locator('tf-tab#bindings').first();
-    if ((await tab.count()) === 0) {
-      test.skip(true, 'bindings tab not present');
-    }
-    await tab.click();
-    const link = page.locator('a[href*="services"], tf-button', { hasText: /Manage|M16|Zarządz/i }).first();
-    if ((await link.count()) === 0) {
-      test.skip(true, 'manage-in-M16 link not present');
-    }
-    await link.click();
+    await page.locator('#bindings-open-m16').click();
     await expect(page).toHaveURL(/services/);
   });
 });
