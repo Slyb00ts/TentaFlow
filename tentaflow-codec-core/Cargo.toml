@@ -1,0 +1,17 @@
+[package]
+name = "tentaflow-codec-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["TentaFlow"]
+description = "Platform-neutral wire-shape rules of the CBOR protocol, shared by the browser codec and native clients"
+
+[dependencies]
+ciborium = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+syn = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+tentaflow-protocol = { workspace = true }

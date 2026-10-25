@@ -49,14 +49,14 @@ test('member creation carries multiple functions, a separate administrator flag 
 
 test('nested access requests preserve their pinned names and authoritative fields', { skip }, () => {
   const decoded = sent('projectStudioMemberAccessSetRequest', { projectId: 'p1', userId: 'u1', functions: ['designer'], projectAdmin: false, expiresAt: null });
-  assert.equal(decoded.variant, 'ProjectStudioMemberAccessSetRequest');
+  assert.equal(decoded._variant, 'ProjectStudioBody.Access.MemberAccessSetRequest');
   assert.equal(decoded.projectId, 'p1');
   assert.deepEqual(decoded.functions, ['designer']);
   assert.equal(decoded.projectAdmin, false);
   assert.equal(decoded.expiresAt, null);
-  assert.equal(sent('projectStudioCatalogueGetRequest', { projectId: 'p1' }).variant, 'ProjectStudioCatalogueGetRequest');
+  assert.equal(sent('projectStudioCatalogueGetRequest', { projectId: 'p1' })._variant, 'ProjectStudioBody.Access.CatalogueGetRequest');
   const deleted = sent('projectStudioFunctionDeleteRequest', { projectId: 'p1', functionId: 'custom' });
-  assert.equal(deleted.variant, 'ProjectStudioFunctionDeleteRequest');
+  assert.equal(deleted._variant, 'ProjectStudioBody.Access.FunctionDeleteRequest');
   assert.equal(deleted.functionId, 'custom');
 });
 
@@ -64,16 +64,16 @@ test('function save keeps per-area levels and does not invent legacy roles', { s
   const decoded = sent('projectStudioFunctionSaveRequest', {
     projectId: 'p1', function: { functionId: 'custom', name: 'Review', description: '', builtin: false, grants: [{ area: 'tests', level: 'write' }, { area: 'security.confidential', level: 'none' }] },
   });
-  assert.equal(decoded.variant, 'ProjectStudioFunctionSaveRequest');
+  assert.equal(decoded._variant, 'ProjectStudioBody.Access.FunctionSaveRequest');
   assert.deepEqual(decoded.function.grants, [{ area: 'tests', level: 'write' }, { area: 'security.confidential', level: 'none' }]);
   assert.equal(decoded.function.functionId, 'custom');
   assert.equal(Object.hasOwn(decoded.function, 'role'), false);
 });
 
-test('server catalogue answers flatten the nested family and retain caller-visible grants', { skip }, () => {
+test('server catalogue answers decode through the nested family and retain caller-visible grants', { skip }, () => {
   const answer = { ProjectStudioBody: { Access: { CatalogueGetResponse: { functions: [{ function_id: 'tester', name: 'QA', description: '', builtin: true, grants: [{ area: 'tests', level: 'admin' }] }] } } } };
   const decoded = wasm.decodeMessageBody(new Uint8Array(cbor(answer)));
-  assert.equal(decoded.variant, 'ProjectStudioCatalogueGetResponse');
+  assert.equal(decoded._variant, 'ProjectStudioBody.Access.CatalogueGetResponse');
   assert.equal(decoded.functions[0].functionId, 'tester');
   assert.equal(decoded.functions[0].name, 'QA');
   assert.equal(decoded.functions[0].grants[0].level, 'admin');

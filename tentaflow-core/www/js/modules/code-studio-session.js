@@ -346,19 +346,19 @@ function execVerdict(payload) {
 // are absent on a server that predates §17.3 accounting — an absent counter is
 // left at zero rather than guessed at.
 function runInfoOf(run) {
-  const started = parseAt(run.started_at ?? run.startedAt);
-  const finished = parseAt(run.finished_at ?? run.finishedAt);
+  const started = parseAt(run.startedAt);
+  const finished = parseAt(run.finishedAt);
   const kind = String(run.kind || '');
   return {
     // The widget renders this as the row's name: the agent's name, else the
     // kind of run, with its ordinal — the same name the run chain shows.
-    agent: [runName(run, run.run_id ?? run.runId, kind), run.ordinal ? `#${run.ordinal}` : ''].filter(Boolean).join(' '),
+    agent: [runName(run, run.runId, kind), run.ordinal ? `#${run.ordinal}` : ''].filter(Boolean).join(' '),
     status: run.status,
-    parentRunId: run.parent_run_id ?? run.parentRunId ?? '',
+    parentRunId: run.parentRunId ?? '',
     startedAt: Number.isNaN(started) ? 0 : started,
     finishedAt: Number.isNaN(finished) ? 0 : finished,
-    promptTokens: run.prompt_tokens ?? run.promptTokens ?? 0,
-    completionTokens: run.completion_tokens ?? run.completionTokens ?? 0,
+    promptTokens: run.promptTokens ?? 0,
+    completionTokens: run.completionTokens ?? 0,
     model: run.model || '',
     accountLabel: accountChipLabel(run.account),
   };
@@ -367,7 +367,7 @@ function runInfoOf(run) {
 // What a person reads as the run's name: the agent's name the server resolved,
 // else what kind of run it is. `agent_id` is a uuid and is never shown.
 function runName(run, runId, kind = run?.kind) {
-  if (run?.agent_name) return run.agent_name;
+  if (run?.agentName) return run.agentName;
   if (kind) return t(`run_kind.${kind}`);
   return shortId(runId);
 }
@@ -380,8 +380,8 @@ function runName(run, runId, kind = run?.kind) {
 // screens already use, so the same fact reads the same way on both.
 function accountChipLabel(account) {
   if (!account) return '';
-  const engine = String(account.engine_name ?? account.engineName ?? '');
-  const name = String(account.account_name ?? account.accountName ?? '');
+  const engine = String(account.engineName ?? '');
+  const name = String(account.accountName ?? '');
   const mode = I18n.t(`agent_accounts.subtitle_${account.mode === 'global' ? 'global' : 'user'}`);
   return String(name
     ? t('session.account_chip', { engine, mode, account: name })
@@ -454,8 +454,8 @@ export function mountSession(hostEl, context) {
   if (!hostEl || !context) return;
 
   ctx = {
-    workspaceId: context.workspaceId || context.workspace?.workspace_id || '',
-    sessionId: context.sessionId || context.session?.session_id || '',
+    workspaceId: context.workspaceId || context.workspace?.workspaceId || '',
+    sessionId: context.sessionId || context.session?.sessionId || '',
     workspace: context.workspace || {},
     session: context.session || {},
     isAdmin: context.isAdmin === true,
@@ -465,7 +465,7 @@ export function mountSession(hostEl, context) {
   host = hostEl;
   shell = hostEl.closest('.cs-shell');
   state = freshState();
-  state.autonomy = ctx.session.autonomy_mode || ctx.session.autonomyMode || 'normal';
+  state.autonomy = ctx.session.autonomyMode || 'normal';
 
   buildStage();
   buildDock();
@@ -524,10 +524,10 @@ export function applyEvent(event) {
 function buildStage() {
   const ws = ctx.workspace || {};
   const session = ctx.session || {};
-  const native = (ws.exec_mode || ws.execMode) === 'trusted_native';
-  const unrestricted = (ws.egress_enforcement || ws.egressEnforcement) === 'unrestricted';
-  const directory = (ws.repoKind ?? ws.repo_kind) === 'local' ? (ws.repoUrl ?? ws.repo_url ?? '') : '';
-  const projectContext = [ws.name, ws.nodeName ?? ws.node_name].filter(Boolean).join(' · ');
+  const native = ws.execMode === 'trusted_native';
+  const unrestricted = ws.egressEnforcement === 'unrestricted';
+  const directory = ws.repoKind === 'local' ? (ws.repoUrl ?? '') : '';
+  const projectContext = [ws.name, ws.nodeName].filter(Boolean).join(' · ');
 
   const stage = node(`
     <div class="cs-stage">
@@ -560,7 +560,7 @@ function buildStage() {
           <tf-tooltip text="${escapeAttr(t('flow.unavailable'))}">
             <tf-button size="sm" icon="workflow-app" disabled>${escapeHtml(t('flow.open'))}</tf-button>
           </tf-tooltip>
-          <tf-button size="sm" variant="ghost" icon="plus" data-action="new-session" ${(ctx.workspace.myRole ?? ctx.workspace.my_role) === 'viewer' ? 'disabled' : ''}>${escapeHtml(t('session_new'))}</tf-button>
+          <tf-button size="sm" variant="ghost" icon="plus" data-action="new-session" ${ctx.workspace.myRole === 'viewer' ? 'disabled' : ''}>${escapeHtml(t('session_new'))}</tf-button>
           <tf-button size="sm" variant="danger" icon="stop" data-action="cancel-session" disabled>${escapeHtml(t('session.stop'))}</tf-button>
         </div>
 
@@ -662,7 +662,7 @@ function buildStage() {
 }
 
 function autonomyOptions() {
-  const ceiling = ctx.workspace.autonomy_ceiling || ctx.workspace.autonomyCeiling || 'normal';
+  const ceiling = ctx.workspace.autonomyCeiling || 'normal';
   const max = Math.max(0, AUTONOMY_ORDER.indexOf(ceiling));
   return AUTONOMY_ORDER.slice(0, max + 1).map((mode) => (
     `<option value="${escapeAttr(mode)}"${mode === state.autonomy ? ' selected' : ''}>${escapeHtml(t('composer.mode', {}))} ${escapeHtml(t(`autonomy.${mode}`))}</option>`
@@ -1217,7 +1217,7 @@ function openFromDock(detail) {
       data: { path },
     });
   } else if (kind === 'change') {
-    openChangeTab(detail.patchSetId || detail.patch_set_id || '', detail.path || '', detail.patchFileId || detail.patch_file_id || '');
+    openChangeTab(detail.patchSetId || '', detail.path || '', detail.patchFileId || '');
   } else if (kind === 'commit') {
     const oid = String(detail.oid || detail.commit || '');
     if (!oid) return;
@@ -1227,7 +1227,7 @@ function openFromDock(detail) {
       data: { oid },
     });
   } else if (kind === 'terminal') {
-    const id = String(detail.terminalId || detail.terminal_id || detail.id || '');
+    const id = String(detail.terminalId || detail.id || '');
     if (!id) return;
     openTab('terminal', {
       id: `term:${id}`, stage: 'terminal', icon: 'desktop',
@@ -1241,8 +1241,8 @@ function openFromDock(detail) {
 function openChangeTab(patchSetId, path, patchFileId, sub = '') {
   const file = state.patchSets
     .flatMap((set) => (set.files || []).map((f) => ({ set, f })))
-    .find(({ set, f }) => set.patch_set_id === patchSetId && (!path || f.path === path));
-  const changeKind = file?.f?.change_kind || 'modify';
+    .find(({ set, f }) => set.patchSetId === patchSetId && (!path || f.path === path));
+  const changeKind = file?.f?.changeKind || 'modify';
   const conflicted = file?.f?.status === 'conflicted';
   const label = (path || file?.f?.path || patchSetId).split('/').pop();
   openTab('zmiany', {
@@ -1274,7 +1274,7 @@ function openInStage(stage, key, sub, extra = {}) {
 }
 
 function openSubagentTab(runId) {
-  const run = state.runs.find((r) => r.run_id === runId);
+  const run = state.runs.find((r) => r.runId === runId);
   openTab('agenci', {
     id: `run:${runId}`,
     stage: 'subagent',
@@ -1315,7 +1315,7 @@ function normalizeEvent(raw) {
   const kind = String(raw.kind || '');
   if (!kind) return null;
   let payload = {};
-  const encoded = raw.payload_json ?? raw.payloadJson;
+  const encoded = raw.payloadJson;
   if (typeof encoded === 'string' && encoded) {
     try { payload = JSON.parse(encoded); } catch { payload = {}; }
   } else if (encoded && typeof encoded === 'object') {
@@ -1330,12 +1330,12 @@ function normalizeEvent(raw) {
   }
   return {
     seq: Number(raw.seq ?? 0),
-    id: String(raw.event_id ?? raw.eventId ?? ''),
+    id: String(raw.eventId ?? ''),
     kind,
-    runId: String(raw.run_id ?? raw.runId ?? ''),
-    agentId: String(raw.agent_id ?? raw.agentId ?? ''),
-    at: String(raw.created_at ?? raw.createdAt ?? ''),
-    security: !!(raw.security_relevant ?? raw.securityRelevant),
+    runId: String(raw.runId ?? ''),
+    agentId: String(raw.agentId ?? ''),
+    at: String(raw.createdAt ?? ''),
+    security: !!raw.securityRelevant,
     p: payload,
   };
 }
@@ -1477,7 +1477,7 @@ async function refreshSide(kinds) {
 function runningRootIds() {
   return state.runs
     .filter((run) => run.kind === 'root' && run.status === 'running')
-    .map((run) => run.run_id);
+    .map((run) => run.runId);
 }
 
 function feedActivity(ev) {
@@ -1672,13 +1672,13 @@ function runStartedNode(ev, scope) {
     // afterwards. A run whose account the poll has not reported yet shows no
     // chip on this one line, and the tab and the agents dock carry it either way.
     const account = accountChipLabel(
-      state.runs.find((r) => r.run_id === runId)?.account,
+      state.runs.find((r) => r.runId === runId)?.account,
     );
     return node(`
       <div class="ev ev-spawn" data-run="${escapeAttr(runId)}">
         <span class="av">${sprite('brain')}</span>
         <span>
-          <span class="nm">${escapeHtml(runName(state.runs.find((r) => r.run_id === runId), runId, kind))}</span>
+          <span class="nm">${escapeHtml(runName(state.runs.find((r) => r.runId === runId), runId, kind))}</span>
           <span class="ds">${escapeHtml(t(`trigger.${trigger}`))}</span>
         </span>
         ${account ? `<tf-chip size="sm" status="accent" label="${escapeAttr(account)}"></tf-chip>` : ''}
@@ -1814,7 +1814,7 @@ function askMarkNode(ev) {
   // The server's summary is English; the line says the same thing in the
   // person's language. An account question names what the card below names.
   const approval = account
-    ? state?.approvals?.find((a) => a.approval_id === ev.p.approval_id)
+    ? state?.approvals?.find((a) => a.approvalId === ev.p.approval_id)
     : null;
   const what = account
     ? (approval ? accountAskFromApproval(approval).who : '')
@@ -1856,7 +1856,7 @@ async function fillPatchCard(patchSetId, card) {
       workspaceId: ctx.workspaceId, sessionId: ctx.sessionId, patchSetId,
     });
     const files = resp.files || [];
-    upsertPatchSet({ patch_set_id: patchSetId, files, status: resp.patch_set?.status || 'open' });
+    upsertPatchSet({ patchSetId, files, status: resp.patchSet?.status || 'open' });
     // `PatchSetOpened.files` is the number the event carried when the set was
     // opened; the set has since gained or lost files. The card lists what the
     // set holds NOW, so its headline has to be recounted from the same list.
@@ -1866,11 +1866,11 @@ async function fillPatchCard(patchSetId, card) {
     if (!list) return;
     list.innerHTML = files.map((file) => {
       const conflicted = file.status === 'conflicted';
-      const cls = conflicted ? 'c' : (CHANGE_LETTER[file.change_kind] || 'm');
+      const cls = conflicted ? 'c' : (CHANGE_LETTER[file.changeKind] || 'm');
       const letter = conflicted ? '!' : cls.toUpperCase();
       return `
         <div class="pf" data-patch-set="${escapeAttr(patchSetId)}" data-path="${escapeAttr(file.path)}"
-             data-file-id="${escapeAttr(file.patch_file_id || '')}">
+             data-file-id="${escapeAttr(file.patchFileId || '')}">
           <span class="st ${cls}">${escapeHtml(letter)}</span>
           <span class="p">${escapeHtml(file.path)}</span>
           <span class="n">${escapeHtml(t(`patch.status.${file.status}`))}</span>
@@ -1883,7 +1883,7 @@ async function fillPatchCard(patchSetId, card) {
 }
 
 function upsertPatchSet(entry) {
-  const index = state.patchSets.findIndex((set) => set.patch_set_id === entry.patch_set_id);
+  const index = state.patchSets.findIndex((set) => set.patchSetId === entry.patchSetId);
   if (index < 0) state.patchSets.push(entry);
   else state.patchSets[index] = { ...state.patchSets[index], ...entry };
   state.docks.zmiany?.update?.({
@@ -1898,7 +1898,7 @@ function upsertPatchSet(entry) {
 function openSubagent(runId) {
   if (!runId) return;
   state.openRunId = runId;
-  const run = state.runs.find((r) => r.run_id === runId);
+  const run = state.runs.find((r) => r.runId === runId);
   const title = host.querySelector('[data-sub-title]');
   const meta = host.querySelector('[data-sub-meta]');
   const dot = host.querySelector('[data-sub-dot]');
@@ -1907,7 +1907,7 @@ function openSubagent(runId) {
     meta.textContent = [
       run ? t(`run_kind.${run.kind}`) : '',
       run ? t(`trigger.${run.trigger}`) : '',
-      run ? durationOf(run.started_at, run.finished_at) : '',
+      run ? durationOf(run.startedAt, run.finishedAt) : '',
     ].filter(Boolean).join(' · ');
   }
   if (dot) dot.className = `cs-dot ${dotClassFor(run?.status)}`;
@@ -2004,7 +2004,7 @@ function paintExecHead() {
 // and "more" is refused when a page moved nothing.
 function mergeExecPage(view, resp) {
   const lines = Array.isArray(resp?.lines) ? resp.lines.map(String) : [];
-  const answered = Number(resp?.next_seq ?? resp?.nextSeq ?? NaN);
+  const answered = Number(resp?.nextSeq ?? NaN);
   const cursor = Number.isFinite(answered) && answered > view.cursor
     ? answered
     : view.cursor + lines.length;
@@ -2012,7 +2012,7 @@ function mergeExecPage(view, resp) {
     lines,
     cursor,
     count: view.count + lines.length,
-    hasMore: !!(resp?.has_more ?? resp?.hasMore) && cursor > view.cursor,
+    hasMore: !!resp?.hasMore && cursor > view.cursor,
     status: String(resp?.status ?? view.status ?? ''),
   };
 }
@@ -2129,19 +2129,19 @@ function capabilityQuestion(capability, fallback) {
 
 function askFromApproval(approval) {
   const capability = String(approval.capability || '');
-  const mandatory = !!approval.mandatory_interactive || MANDATORY_CAPABILITIES.has(capability);
+  const mandatory = !!approval.mandatoryInteractive || MANDATORY_CAPABILITIES.has(capability);
   if (capability === ACCOUNT_LOGIN_CAPABILITY) return accountAskFromApproval(approval);
-  const runId = String(approval.run_id || '');
+  const runId = String(approval.runId || '');
   return {
     kind: REVIEW_CAPABILITIES.has(capability) ? 'review' : 'approval',
-    approvalId: String(approval.approval_id || ''),
+    approvalId: String(approval.approvalId || ''),
     capability,
-    who: runId ? runName(state?.runs?.find((r) => r.run_id === runId), runId) : t('session.orchestrator'),
+    who: runId ? runName(state?.runs?.find((r) => r.runId === runId), runId) : t('session.orchestrator'),
     question: capabilityQuestion(capability, approval.summary),
     detail: String(approval.detail || ''),
     mandatory,
     options: [],
-    runId: String(approval.run_id || ''),
+    runId: String(approval.runId || ''),
   };
 }
 
@@ -2166,17 +2166,17 @@ function accountAskBody(account) {
 function accountAskFromApproval(approval) {
   const raw = approval.account ?? approval.accountInfo ?? {};
   const account = {
-    engineId: String(raw.engine_id ?? raw.engineId ?? ''),
-    engineName: String(raw.engine_name ?? raw.engineName ?? ''),
+    engineId: String(raw.engineId ?? ''),
+    engineName: String(raw.engineName ?? ''),
     mode: String(raw.mode || 'user'),
-    agentName: String(raw.agent_name ?? raw.agentName ?? ''),
-    accountId: raw.account_id ?? raw.accountId ?? null,
-    accountName: String(raw.account_name ?? raw.accountName ?? ''),
+    agentName: String(raw.agentName ?? ''),
+    accountId: raw.accountId ?? null,
+    accountName: String(raw.accountName ?? ''),
   };
   const engine = account.engineName || account.engineId;
   return {
     kind: 'account',
-    approvalId: String(approval.approval_id || ''),
+    approvalId: String(approval.approvalId || ''),
     capability: ACCOUNT_LOGIN_CAPABILITY,
     who: [
       account.agentName,
@@ -2190,7 +2190,7 @@ function accountAskFromApproval(approval) {
     mandatory: false,
     options: [],
     account,
-    runId: String(approval.run_id || ''),
+    runId: String(approval.runId || ''),
   };
 }
 
@@ -2377,9 +2377,9 @@ function focusAsk() {
 // another.
 function openReviewFromAsk() {
   const open = [...state.patchSets]
-    .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0];
+    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))[0];
   if (!open) { toast(t('patch.none'), 'warning'); return; }
-  openChangeTab(open.patch_set_id, '', '');
+  openChangeTab(open.patchSetId, '', '');
 }
 
 // C01 — the answer to an account question is a SIGN-IN, not a decision, so the
@@ -2459,7 +2459,7 @@ function renderRunChain() {
       <span class="gnode"><span class="gdot"></span>${index < state.runs.length - 1 ? '<span class="gline"></span>' : ''}</span>
       <span>
         <span class="gmsg">${escapeHtml(t(`run_kind.${run.kind}`))} #${escapeHtml(String(run.ordinal))} — ${escapeHtml(t(`trigger.${run.trigger}`))}</span>
-        <span class="gmeta">${escapeHtml(runName(run, run.run_id))} · ${escapeHtml(runStatusLabel(run.status))} · ${escapeHtml(durationOf(run.started_at, run.finished_at))}</span>
+        <span class="gmeta">${escapeHtml(runName(run, run.runId))} · ${escapeHtml(runStatusLabel(run.status))} · ${escapeHtml(durationOf(run.startedAt, run.finishedAt))}</span>
         ${run.note ? `<span class="gmeta">${escapeHtml(run.note)}</span>` : ''}
       </span>
     </div>
@@ -2475,21 +2475,21 @@ function renderOperations() {
   }
   box.innerHTML = state.operations.map((op) => {
     const unknown = op.status === 'unknown';
-    const profile = profileLabel(op.mount_access, op.network_access);
+    const profile = profileLabel(op.mountAccess, op.networkAccess);
     return `
       <div class="cs-insp-row">
         <span class="cs-dot ${dotClassFor(op.status === 'completed' ? 'completed' : op.status === 'failed' ? 'failed' : unknown ? 'waiting' : 'running')}"></span>
         <span class="cs-insp-txt">
-          <span class="cs-insp-t">${escapeHtml(op.op_kind)} · ${escapeHtml(op.capability)}</span>
-          <span class="cs-insp-s">${escapeHtml([op.origin_kind, profile, durationOf(op.started_at, op.finished_at)].filter(Boolean).join(' · '))}</span>
+          <span class="cs-insp-t">${escapeHtml(op.opKind)} · ${escapeHtml(op.capability)}</span>
+          <span class="cs-insp-s">${escapeHtml([op.originKind, profile, durationOf(op.startedAt, op.finishedAt)].filter(Boolean).join(' · '))}</span>
           ${op.error ? `<span class="cs-insp-s">${escapeHtml(op.error)}</span>` : ''}
         </span>
         <span class="m">
           <span class="cs-chip${unknown ? ' warn' : ''}">${escapeHtml(t(`op_status.${op.status}`))}</span>
           ${unknown ? `
-            <tf-input size="sm" data-op-note="${escapeAttr(op.op_id)}" placeholder="${escapeAttr(t('inspector.note'))}"></tf-input>
-            <tf-button size="sm" data-action="resolve-op" data-op-id="${escapeAttr(op.op_id)}" data-resolution="completed">${escapeHtml(t('inspector.resolve_completed'))}</tf-button>
-            <tf-button size="sm" variant="danger" data-action="resolve-op" data-op-id="${escapeAttr(op.op_id)}" data-resolution="failed">${escapeHtml(t('inspector.resolve_failed'))}</tf-button>
+            <tf-input size="sm" data-op-note="${escapeAttr(op.opId)}" placeholder="${escapeAttr(t('inspector.note'))}"></tf-input>
+            <tf-button size="sm" data-action="resolve-op" data-op-id="${escapeAttr(op.opId)}" data-resolution="completed">${escapeHtml(t('inspector.resolve_completed'))}</tf-button>
+            <tf-button size="sm" variant="danger" data-action="resolve-op" data-op-id="${escapeAttr(op.opId)}" data-resolution="failed">${escapeHtml(t('inspector.resolve_failed'))}</tf-button>
           ` : ''}
         </span>
       </div>`;
@@ -2534,8 +2534,8 @@ function paintProfile() {
   const chip = host.querySelector('[data-profile-chip]');
   const text = host.querySelector('[data-profile-text]');
   if (!chip || !text) return;
-  const current = state.operations.find((op) => op.status === 'pending' && op.mount_access) || null;
-  const label = current ? profileLabel(current.mount_access, current.network_access) : '';
+  const current = state.operations.find((op) => op.status === 'pending' && op.mountAccess) || null;
+  const label = current ? profileLabel(current.mountAccess, current.networkAccess) : '';
   chip.hidden = !label;
   text.textContent = label;
   state.profile = label;
@@ -2553,7 +2553,7 @@ function paintSessionHead() {
     const root = state.runs.find((run) => run.kind === 'root');
     sub.textContent = [
       t('session.orchestrator'),
-      root ? durationOf(root.started_at, root.finished_at) : '',
+      root ? durationOf(root.startedAt, root.finishedAt) : '',
     ].filter(Boolean).join(' · ');
   }
 }
@@ -2610,9 +2610,9 @@ async function loadTimeline() {
       });
       const events = resp.events || [];
       ingestEvents(events);
-      const next = Number(resp.next_seq ?? resp.nextSeq ?? 0);
+      const next = Number(resp.nextSeq ?? 0);
       if (next > state.cursor) state.cursor = next;
-      more = !!(resp.has_more ?? resp.hasMore) && events.length > 0;
+      more = !!resp.hasMore && events.length > 0;
     }
   } catch (err) {
     console.warn('[code-studio] timeline load failed:', err?.message ?? err);
@@ -2628,14 +2628,14 @@ async function loadRuns() {
     });
     state.runs = resp.runs || [];
     for (const run of state.runs) {
-      if (run.kind === 'subagent' || run.kind === 'cli') state.subagentRuns.add(run.run_id);
+      if (run.kind === 'subagent' || run.kind === 'cli') state.subagentRuns.add(run.runId);
       // The activity widget lived on live events alone, so a page opened after
       // the turn had ended showed a run dated from the moment it was replayed
       // and no consumption at all. `session_runs` is the record: its two
       // timestamps and its token counters are what the row must state.
       const info = runInfoOf(run);
       for (const widget of [state.widgets.dock, state.widgets.now]) {
-        if (widget) widget.setRunInfo(run.run_id, info);
+        if (widget) widget.setRunInfo(run.runId, info);
       }
     }
     renderRunChain();
@@ -2725,7 +2725,7 @@ function fillAccountAnchors() {
   for (const approval of state.approvals) {
     if (approval.capability !== ACCOUNT_LOGIN_CAPABILITY) continue;
     const who = accountAskFromApproval(approval).who;
-    host?.querySelectorAll(`.ev-askmark[data-approval="${CSS.escape(String(approval.approval_id || ''))}"] [data-ask-what]`)
+    host?.querySelectorAll(`.ev-askmark[data-approval="${CSS.escape(String(approval.approvalId || ''))}"] [data-ask-what]`)
       .forEach((el) => { if (!el.textContent) el.textContent = who; });
   }
 }
@@ -2758,7 +2758,7 @@ async function loadPatchSets() {
     const resp = await ApiBinary.one('codeStudioPatchSetsListRequest', {
       workspaceId: ctx.workspaceId, sessionId: ctx.sessionId, status: '',
     });
-    const sets = resp.patch_sets || resp.patchSets || [];
+    const sets = resp.patchSets || [];
     for (const set of sets) upsertPatchSet(set);
     updateCounters();
   } catch (err) {
@@ -2816,7 +2816,7 @@ async function cancelSession(runId) {
     const resp = await ApiBinary.action('codeStudioSessionCancelRequest', {
       workspaceId: ctx.workspaceId, sessionId: ctx.sessionId, runId: runId || '',
     });
-    const cancelled = (resp.cancelled_runs || resp.cancelledRuns || []).length;
+    const cancelled = (resp.cancelledRuns || []).length;
     toast(t('session.cancelled', { count: cancelled }), 'info');
     await loadRuns();
   } catch (err) {
@@ -2831,9 +2831,9 @@ async function setAutonomy(mode) {
       workspaceId: ctx.workspaceId, sessionId: ctx.sessionId, autonomyMode: mode,
     });
     // The server clamps to the workspace ceiling; the answer is authoritative.
-    state.autonomy = String(resp.autonomy_mode || resp.autonomyMode || mode);
+    state.autonomy = String(resp.autonomyMode || mode);
     paintAutonomy();
-    const ceiling = String(resp.autonomy_ceiling || resp.autonomyCeiling || '');
+    const ceiling = String(resp.autonomyCeiling || '');
     if (state.autonomy !== mode) {
       toast(t('autonomy.clamped', { ceiling: ceiling ? t(`autonomy.${ceiling}`) : state.autonomy }), 'warning');
     }
@@ -2905,7 +2905,7 @@ function applyPaneResult(kind, body) {
   } else if (kind === 'codeStudioGitPushRequest') {
     const status = String(body.status || '');
     if (status === 'pushed') {
-      toast(t('git.pushed', { branch: body.remote_branch || body.remoteBranch || '' }), 'success');
+      toast(t('git.pushed', { branch: body.remoteBranch || '' }), 'success');
     } else {
       toast(body.error || t('git.push_failed'), 'error');
     }

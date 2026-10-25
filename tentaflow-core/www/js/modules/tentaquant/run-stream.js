@@ -66,7 +66,7 @@ export function runStreamState(patch = {}) {
   };
 }
 
-const outputKey = (output) => `${output.cellId ?? output.cell_id ?? ''}#${Number(output.seq) || 0}`;
+const outputKey = (output) => `${output.cellId ?? ''}#${Number(output.seq) || 0}`;
 
 /// Folds one `RunEvent` into the state. Pure: the caller keeps the result.
 export function applyRunEvent(state, event) {
@@ -148,7 +148,7 @@ export function outputOfMime(state, mime) {
 /// drawn).
 export function outputBundle(output) {
   if (!output) return null;
-  const inline = output.inlineJson ?? output.inline_json;
+  const inline = output.inlineJson;
   if (!inline) return null;
   try {
     return { [String(output.mime)]: JSON.parse(inline) };
@@ -198,7 +198,7 @@ export function keyframeStateBundle(keyframe, numQubits) {
 /// it. These are PROBABILITIES, not draws, so the bundle carries no shot
 /// count — a footer saying "0 shots" would be a lie about a measured run.
 export function keyframeProbsBundle(keyframe) {
-  const rows = (keyframe && (keyframe.probsTop ?? keyframe.probs_top)) || [];
+  const rows = (keyframe && keyframe.probsTop) || [];
   if (!rows.length) return null;
   const counts = {};
   for (const row of rows) counts[String(row.bitstring)] = Number(row.probability) || 0;

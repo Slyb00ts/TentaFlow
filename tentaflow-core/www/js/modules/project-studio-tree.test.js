@@ -11,8 +11,8 @@ globalThis.localStorage = window.localStorage;
 after(async () => window.happyDOM.close());
 
 test('a child-only card has name-only ancestors without hidden siblings or decorations', () => {
-  const child = { project_id: 'child', parent_id: 'hidden', path: '/hidden/child', name: 'Accessible child' };
-  const breadcrumbs = [{ project_id: 'hidden', name: 'Ancestor name', depth: 1 }, { project_id: 'unrelated', name: 'Other ancestor', depth: 1 }];
+  const child = { projectId: 'child', parentId: 'hidden', path: '/hidden/child', name: 'Accessible child' };
+  const breadcrumbs = [{ projectId: 'hidden', name: 'Ancestor name', depth: 1 }, { projectId: 'unrelated', name: 'Other ancestor', depth: 1 }];
   assert.deepEqual(projectRoots([child]), [child]);
   assert.deepEqual(projectAncestors(child, [child], breadcrumbs), [breadcrumbs[0]]);
   const nodes = projectTreeNodes([child], breadcrumbs, () => ({ badge: 'Current own count', draggable: true }));
@@ -24,11 +24,11 @@ test('a child-only card has name-only ancestors without hidden siblings or decor
 });
 
 test('authorized roots and four-level paths retain stable identities when names repeat', () => {
-  const projects = ['a', 'b', 'c', 'd'].map((id, i, ids) => ({ project_id: id, parent_id: ids[i - 1] || null, path: `/${ids.slice(0, i + 1).join('/')}`, name: 'Repeated name' }));
-  assert.deepEqual(projectRoots(projects).map((row) => row.project_id), ['a']);
+  const projects = ['a', 'b', 'c', 'd'].map((id, i, ids) => ({ projectId: id, parentId: ids[i - 1] || null, path: `/${ids.slice(0, i + 1).join('/')}`, name: 'Repeated name' }));
+  assert.deepEqual(projectRoots(projects).map((row) => row.projectId), ['a']);
   const tree = projectTreeNodes(projects, []);
   assert.equal(tree[0].children[0].children[0].children[0].id, 'd');
-  assert.deepEqual(projectAncestors(projects[3], projects, []).map((row) => row.project_id), ['a', 'b', 'c']);
+  assert.deepEqual(projectAncestors(projects[3], projects, []).map((row) => row.projectId), ['a', 'b', 'c']);
 });
 
 test('scope defaults depend on current children and persist independently by account, project and view', () => {

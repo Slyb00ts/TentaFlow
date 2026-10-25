@@ -95,24 +95,24 @@ test('rzeczywisty login → katalog → gotowy NAS → capabilities i dyski', as
     const capabilities = await ApiBinary.one('tentaNasElasticCapabilitiesRequest', {});
     const inventory = await ApiBinary.one('tentaNasDisksListRequest', {});
     return {
-      catalogVariant: catalog.variant,
+      catalogVariant: catalog._variant,
       packageCount: catalog.packages?.length,
       nodeId: nodes.localNodeId,
       instanceStatus: node.instanceStatus,
       capabilities,
       disks: inventory.disks,
-      inventoryVariant: inventory.variant,
+      inventoryVariant: inventory._variant,
     };
   }, { expectedNodeId });
-  expect(observed.catalogVariant).toBe('AddonCatalogListResponse');
+  expect(observed.catalogVariant).toBe('AddonInstanceBody.ResCatalogList');
   expect(observed.packageCount).toBeGreaterThan(0);
   expect(observed.nodeId).toBe(expectedNodeId);
   expect(observed.instanceStatus).toBe('ready');
-  expect(observed.capabilities.variant).toBe('TentaNasElasticCapabilitiesResponse');
+  expect(observed.capabilities._variant).toBe('TentaNasBody.ElasticCapabilitiesResponse');
   expect(observed.capabilities.capabilities.mergerfs).toBe(true);
   expect(observed.capabilities.capabilities.snapraid).toBe(true);
   expect([...observed.capabilities.capabilities.filesystems].sort()).toEqual(['ext4', 'xfs']);
-  expect(observed.inventoryVariant).toBe('TentaNasDisksListResponse');
+  expect(observed.inventoryVariant).toBe('TentaNasBody.DisksListResponse');
   expect(Array.isArray(observed.disks)).toBe(true);
   expect(observed.disks.map((disk) => ({ serial: disk.serial, bytes: disk.sizeBytes }))
     .sort((a, b) => a.serial.localeCompare(b.serial)))

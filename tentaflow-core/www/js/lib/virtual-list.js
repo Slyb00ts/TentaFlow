@@ -540,9 +540,11 @@ export function createVirtualList(host, opts) {
             // by zakres policzył się na dolnym scrollTop. Render w tym callbacku
             // korzysta z osobnego rafId (scroll/render) — nie planuje kolejnego
             // tail-rAF, więc nie powstaje pętla.
+            // render() skips an unchanged range on its own, so the settled rows
+            // (and a text selection inside them) survive a token; only a window
+            // that really moved is redrawn.
             if (pinned) {
               setScrollTop(host.scrollHeight);
-              lastRenderRange = { start: -1, end: -1 };
               render();
             }
           });

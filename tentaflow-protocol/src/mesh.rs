@@ -1602,7 +1602,6 @@ pub const MESH_MSG_NODE_LEAVING: u8 = 0x27;
 /// bodies are stored and relayed in plaintext.
 pub const MESH_MSG_SHARED_SECRETS_SYNC: u8 = 0x28;
 pub const MESH_MSG_FORWARD_STREAM_REQ: u8 = 0x38;
-pub const MESH_MSG_ALIAS_SYNC: u8 = 0x39;
 /// Pull request: nowo polaczony peer prosi o pelny snapshot serwisow.
 pub const MESH_MSG_SERVICES_GET: u8 = 0x40;
 /// Odpowiedz na `MESH_MSG_SERVICES_GET` — pelen snapshot lokalnego nodu.

@@ -46,10 +46,7 @@ function renderCodeBlock(lang, filename, code) {
       `<span class="lang mono">${langLabel}</span>` +
       fileLabel +
       `<div class="actions">` +
-        `<button type="button" class="icon-btn copy-btn" data-code="${encoded}" title="Kopiuj">` +
-          `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>` +
-          `<span>Kopiuj</span>` +
-        `</button>` +
+        `<tf-button variant="ghost" size="sm" icon="copy" class="copy-btn" data-code="${encoded}" title="Kopiuj" label="Kopiuj"></tf-button>` +
       `</div>` +
     `</div>` +
     `<pre><code>${escaped}</code></pre>` +
@@ -86,7 +83,7 @@ function applyInlineMarkdown(escapedHtml) {
 const HEADING_RE = /^(#{1,6})\s+(\S.*)$/;
 const BULLET_RE = /^[-*+]\s+(\S.*)$/;
 const NUMBERED_RE = /^(\d{1,9})[.)]\s+(\S.*)$/;
-const PLACEHOLDER_RE = /^(THINK|CODE)\d+$/;
+const PLACEHOLDER_RE = /^(THINK|CODE|OPENCODE)\d+$/;
 
 /// The blocks of one chunk: headings and list items stand on their own, every
 /// other line joins the running paragraph (single \n → <br>, as before).
@@ -200,16 +197,22 @@ export function renderMarkdown(text, opts = {}) {
     handler: (_m, lang, filename, code) => renderCodeBlock(lang, filename, code),
   });
 
+  // 2b) A fence still being streamed has no closing line yet; it is already a
+  //     code block, or it would show as a paragraph and jump when the fence closes.
+  const openFenceRegex = /^```([a-zA-Z0-9_+\-]*)(?::([^\n]+))?(?:\n([\s\S]*))?$/gm;
+  const { text: t3, slots: openSlots } = withPlaceholders(t2, 'OPENCODE', {
+    regex: openFenceRegex,
+    handler: (_m, lang, filename, code) => renderCodeBlock(lang, filename, code || ''),
+  });
+
   // 3) Escape remaining text and apply inline + paragraph rules.
-  const escaped = escapeHtml(t2);
+  const escaped = escapeHtml(t3);
   const inlined = applyInlineMarkdown(escaped);
   let html = paragraphize(inlined);
 
   // 4) Restore placeholders. Iterate from largest index down to avoid prefix overlaps.
-  html = html.replace(/(THINK|CODE)(\d+)/g, (_m, kind, idxStr) => {
-    const idx = Number(idxStr);
-    return (kind === 'THINK' ? thinkSlots[idx] : codeSlots[idx]) || '';
-  });
+  const slotsByKind = { THINK: thinkSlots, CODE: codeSlots, OPENCODE: openSlots };
+  html = html.replace(/(THINK|OPENCODE|CODE)(\d+)/g, (_m, kind, idxStr) => slotsByKind[kind][Number(idxStr)] || '');
   return html;
 }
 

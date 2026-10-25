@@ -215,11 +215,7 @@ pub async fn vision_import_model(
     }
 
     if alias.is_some() {
-        crate::services::models::broadcast_alias_mutation(
-            &ctx.state.db,
-            &ctx.state.router,
-            &ctx.state.quic_mesh,
-        );
+        crate::services::models::refresh_router_aliases(&ctx.state.router);
     }
     crate::services::onnx_cv_service::reconcile_and_announce(&ctx.state);
     respond(true, Some(import.model_name), None)

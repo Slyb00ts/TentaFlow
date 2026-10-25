@@ -25,17 +25,17 @@ test('the distance of a day from today is read as today, future or past', () => 
 });
 
 const entries = [
-  { effective_date: '2026-11-01' },
-  { effective_date: '2026-09-15' },
-  { effective_date: '2026-09-15' },
-  { effective_date: '2026-01-01' },
+  { effectiveDate: '2026-11-01' },
+  { effectiveDate: '2026-09-15' },
+  { effectiveDate: '2026-09-15' },
+  { effectiveDate: '2026-01-01' },
 ];
 
 test('the marks are the distinct days with something changed, planned ones flagged, plans of open change sets included', () => {
   const marks = markers(entries, [
-    { state: 'pending', effective_date: '2026-12-01' },
-    { state: 'withdrawn', effective_date: '2027-06-01' },
-    { state: 'applied', effective_date: '2027-07-01' },
+    { state: 'pending', effectiveDate: '2026-12-01' },
+    { state: 'withdrawn', effectiveDate: '2027-06-01' },
+    { state: 'applied', effectiveDate: '2027-07-01' },
   ], '2026-09-30');
   assert.deepEqual(marks, [
     { day: '2026-01-01', planned: false },
@@ -57,8 +57,8 @@ test('the slider spans a month either side of today at least and every change at
 
 test('quick jumps offer the first change, the last past one, today and up to three planned days, once each', () => {
   const marks = markers([
-    { effective_date: '2026-01-01' }, { effective_date: '2026-09-15' },
-    { effective_date: '2026-10-01' }, { effective_date: '2026-11-01' }, { effective_date: '2026-12-01' }, { effective_date: '2027-01-01' },
+    { effectiveDate: '2026-01-01' }, { effectiveDate: '2026-09-15' },
+    { effectiveDate: '2026-10-01' }, { effectiveDate: '2026-11-01' }, { effectiveDate: '2026-12-01' }, { effectiveDate: '2027-01-01' },
   ], [], '2026-09-30');
   assert.deepEqual(quickJumps(marks, '2026-09-30').map((j) => [j.day, j.kind]), [
     ['2026-01-01', 'past'], ['2026-09-15', 'past'], ['2026-09-30', 'today'],
@@ -80,12 +80,12 @@ test('a value reads as its label, "none", or words for a flag, an assignment typ
 const moveEntry = {
   id: 7,
   at: '2026-09-29 10:00:00',
-  actor_name: 'Hanna',
+  actorName: 'Hanna',
   action: 'org.unit.move',
-  target_name: 'DevOps',
-  unit_name: 'DevOps',
-  effective_date: '2026-11-01',
-  changes: [{ field: 'parent_unit_id', before: 'u-0', after: 'u-9', before_label: 'IT', after_label: 'Realizacja' }],
+  targetName: 'DevOps',
+  unitName: 'DevOps',
+  effectiveDate: '2026-11-01',
+  changes: [{ field: 'parent_unit_id', before: 'u-0', after: 'u-9', beforeLabel: 'IT', afterLabel: 'Realizacja' }],
 };
 
 test('an entry reads with its sentence, its before and after, who wrote it and whether it is planned', () => {
@@ -97,16 +97,16 @@ test('an entry reads with its sentence, its before and after, who wrote it and w
   assert.equal(planned.who, 'Hanna');
   assert.equal(planned.day, '2026-11-01');
 
-  const past = entryModel({ ...moveEntry, effective_date: '2026-07-01' }, { t, today: '2026-09-30' });
+  const past = entryModel({ ...moveEntry, effectiveDate: '2026-07-01' }, { t, today: '2026-09-30' });
   assert.equal(past.planned, false);
   assert.equal(past.dot, '');
 });
 
 test('a batch entry lists its operations, says how many were left out and names its source', () => {
   const batch = entryModel({
-    id: 9, at: '2026-09-29 11:00:00', actor_name: 'Hanna', action: 'org.structure.batch', source: 'batch',
-    effective_date: '2026-09-29', hidden_ops: 2,
-    ops: Array.from({ length: 10 }, (_, i) => ({ action: 'org.unit.create', target_name: `U${i}` })),
+    id: 9, at: '2026-09-29 11:00:00', actorName: 'Hanna', action: 'org.structure.batch', source: 'batch',
+    effectiveDate: '2026-09-29', hiddenOps: 2,
+    ops: Array.from({ length: 10 }, (_, i) => ({ action: 'org.unit.create', targetName: `U${i}` })),
   }, { t, today: '2026-09-30' });
   assert.equal(batch.ops.length, 9, 'eight lines and the "and more" one');
   assert.equal(batch.ops[8], 'ops_more{"count":2}');
@@ -117,12 +117,12 @@ test('a batch entry lists its operations, says how many were left out and names 
 });
 
 const items = [
-  { change: 'added', entity: 'unit', id: 'qa', name: 'Quality', unit_id: 'qa' },
-  { change: 'changed', entity: 'unit', id: 'devops', name: 'DevOps', unit_id: 'devops', field: 'parent_unit_id', before: 'it', after: 'board', before_label: 'IT', after_label: 'Board' },
-  { change: 'added', entity: 'position', id: 'tester', name: 'Tester', unit_id: 'qa' },
-  { change: 'changed', entity: 'position', id: 'lead', name: 'Lead', unit_id: 'devops', field: 'primary_parent_position_id', before: 'cto', after: null, before_label: 'Adam' },
-  { change: 'removed', entity: 'assignment', id: 'lead', name: 'Lead', unit_id: 'devops', subject: { kind: 'user', id: 'ewa' }, subject_name: 'Ewa' },
-  { change: 'added', entity: 'assignment', id: 'tester', name: 'Tester', unit_id: 'qa', subject: { kind: 'user', id: 'kasia' }, subject_name: 'Kasia' },
+  { change: 'added', entity: 'unit', id: 'qa', name: 'Quality', unitId: 'qa' },
+  { change: 'changed', entity: 'unit', id: 'devops', name: 'DevOps', unitId: 'devops', field: 'parent_unit_id', before: 'it', after: 'board', beforeLabel: 'IT', afterLabel: 'Board' },
+  { change: 'added', entity: 'position', id: 'tester', name: 'Tester', unitId: 'qa' },
+  { change: 'changed', entity: 'position', id: 'lead', name: 'Lead', unitId: 'devops', field: 'primary_parent_position_id', before: 'cto', after: null, beforeLabel: 'Adam' },
+  { change: 'removed', entity: 'assignment', id: 'lead', name: 'Lead', unitId: 'devops', subject: { kind: 'user', id: 'ewa' }, subjectName: 'Ewa' },
+  { change: 'added', entity: 'assignment', id: 'tester', name: 'Tester', unitId: 'qa', subject: { kind: 'user', id: 'kasia' }, subjectName: 'Kasia' },
 ];
 
 test('a difference reads as one sentence, with the values around a changed field', () => {
@@ -132,7 +132,7 @@ test('a difference reads as one sentence, with the values around a changed field
   });
   assert.equal(diffLine(items[3], t).after, 'none', 'a cleared reference is "none"');
   assert.equal(diffLine(items[4], t).text, 'diff.assignment_removed{"person":"Ewa","name":"Lead"}');
-  assert.equal(diffLine({ ...items[4], subject_name: '' }, t).text, 'diff.assignment_removed{"person":"diff.someone","name":"Lead"}');
+  assert.equal(diffLine({ ...items[4], subjectName: '' }, t).text, 'diff.assignment_removed{"person":"diff.someone","name":"Lead"}');
 });
 
 test('the counts treat a thing with several changed fields as one thing', () => {
@@ -165,24 +165,24 @@ test('a diff marks positions and units on the chart, the strongest mark winning,
 const view = {
   at: '2026-09-30',
   units: [
-    { unit_id: 'board', name: 'Board', parent_unit_id: null },
-    { unit_id: 'it', name: 'IT', parent_unit_id: 'board' },
-    { unit_id: 'devops', name: 'DevOps', parent_unit_id: 'it' },
-    { unit_id: 'hr', name: 'HR', parent_unit_id: 'board' },
+    { unitId: 'board', name: 'Board', parentUnitId: null },
+    { unitId: 'it', name: 'IT', parentUnitId: 'board' },
+    { unitId: 'devops', name: 'DevOps', parentUnitId: 'it' },
+    { unitId: 'hr', name: 'HR', parentUnitId: 'board' },
   ],
   positions: [
-    { position_id: 'cto', unit_id: 'it' }, { position_id: 'lead', unit_id: 'devops' }, { position_id: 'hrm', unit_id: 'hr' },
+    { positionId: 'cto', unitId: 'it' }, { positionId: 'lead', unitId: 'devops' }, { positionId: 'hrm', unitId: 'hr' },
   ],
-  assignments: [{ position_id: 'lead', subject: { kind: 'user', id: 'ewa' } }, { position_id: 'hrm', subject: { kind: 'user', id: 'z' } }],
+  assignments: [{ positionId: 'lead', subject: { kind: 'user', id: 'ewa' } }, { positionId: 'hrm', subject: { kind: 'user', id: 'z' } }],
   vacancies: ['cto'],
 };
 
 test('a unit\'s part of a structure is the unit, its sub-units, their positions and the people on them', () => {
   assert.deepEqual([...subtreeUnitIds(view, 'it')].sort(), ['devops', 'it']);
   const part = viewSubset(view, 'it');
-  assert.deepEqual(part.units.map((u) => u.unit_id), ['it', 'devops']);
-  assert.deepEqual(part.positions.map((p) => p.position_id), ['cto', 'lead']);
-  assert.deepEqual(part.assignments.map((a) => a.position_id), ['lead']);
+  assert.deepEqual(part.units.map((u) => u.unitId), ['it', 'devops']);
+  assert.deepEqual(part.positions.map((p) => p.positionId), ['cto', 'lead']);
+  assert.deepEqual(part.assignments.map((a) => a.positionId), ['lead']);
   assert.deepEqual(part.vacancies, ['cto']);
   assert.equal(viewSubset(view, ''), view, 'no unit is the whole structure');
 });
@@ -194,7 +194,7 @@ test('the unit choices list the busiest unit first', () => {
   assert.deepEqual(choices.map((c) => c.id).sort(), ['board', 'devops', 'hr', 'it', 'qa'].filter((id) => id !== 'qa').sort());
 });
 
-const set = (over) => ({ id: 'cs', state: 'pending', author_user_id: '11111111-2222-3333-4444-555555555555', effective_date: '2026-11-01', ...over });
+const set = (over) => ({ id: 'cs', state: 'pending', authorUserId: '11111111-2222-3333-4444-555555555555', effectiveDate: '2026-11-01', ...over });
 
 test('only somebody other than the author may approve, and the author is told why the button is off', () => {
   const author = '11111111222233334444555555555555';
@@ -216,18 +216,18 @@ test('only somebody other than the author may approve, and the author is told wh
 
   const applied = changeSetFlags(set({ state: 'applied' }), { me: 'x', today: '2026-09-30' });
   assert.deepEqual([applied.canApprove, applied.canEdit, applied.canWithdraw, applied.isApplied], [false, false, true, true], 'an approved one is withdrawable until its day');
-  assert.equal(changeSetFlags(set({ state: 'applied', effective_date: '2026-09-30' }), { me: 'x', today: '2026-09-30' }).canWithdraw, false, 'not on the day itself');
-  assert.equal(changeSetFlags(set({ effective_date: '2026-09-01' }), { me: 'x', today: '2026-09-30' }).datePassed, true);
+  assert.equal(changeSetFlags(set({ state: 'applied', effectiveDate: '2026-09-30' }), { me: 'x', today: '2026-09-30' }).canWithdraw, false, 'not on the day itself');
+  assert.equal(changeSetFlags(set({ effectiveDate: '2026-09-01' }), { me: 'x', today: '2026-09-30' }).datePassed, true);
 });
 
 test('open reorganizations come first, then approved ones waiting for their day, then the closed', () => {
   const groups = groupChangeSets([
-    set({ id: 'a', state: 'applied', effective_date: '2026-05-01' }),
-    set({ id: 'b', state: 'pending', effective_date: '2026-12-01' }),
-    set({ id: 'c', state: 'draft', effective_date: '2026-10-01' }),
-    set({ id: 'd', state: 'withdrawn', effective_date: '2026-06-01' }),
-    set({ id: 'e', state: 'applied', effective_date: '2026-11-01' }),
-    set({ id: 'f', state: 'applied', effective_date: '2026-09-30' }),
+    set({ id: 'a', state: 'applied', effectiveDate: '2026-05-01' }),
+    set({ id: 'b', state: 'pending', effectiveDate: '2026-12-01' }),
+    set({ id: 'c', state: 'draft', effectiveDate: '2026-10-01' }),
+    set({ id: 'd', state: 'withdrawn', effectiveDate: '2026-06-01' }),
+    set({ id: 'e', state: 'applied', effectiveDate: '2026-11-01' }),
+    set({ id: 'f', state: 'applied', effectiveDate: '2026-09-30' }),
   ], '2026-09-30');
   assert.deepEqual(groups.open.map((s) => s.id), ['c', 'b']);
   assert.deepEqual(groups.upcoming.map((s) => s.id), ['f', 'e'], 'the day of taking effect is still "upcoming"');
@@ -246,9 +246,9 @@ test('a typed refusal has its own sentence; an unknown rule falls back to the se
 
 test('the stored operations come back in the shape the edit mode builds them in', () => {
   const stored = [
-    { temp_id: 'tmp:q', request: { UnitCreateRequest: { name: 'Quality', parent_unit_id: 'board', valid_from: '2026-11-01', confirm_backdated: false } } },
-    { temp_id: null, request: { PositionMoveRequest: { position_id: 'lead', new_parent_position_id: null, from: '2026-11-01' } } },
-    { request: { AssignRequest: { position_id: 'p', subject: { kind: 'user', id: 'u' }, share: 1, valid_from: '2026-11-01' } } },
+    { tempId: 'tmp:q', request: { UnitCreateRequest: { name: 'Quality', parentUnitId: 'board', validFrom: '2026-11-01', confirmBackdated: false } } },
+    { tempId: null, request: { PositionMoveRequest: { positionId: 'lead', newParentPositionId: null, from: '2026-11-01' } } },
+    { request: { AssignRequest: { positionId: 'p', subject: { kind: 'user', id: 'u' }, share: 1, validFrom: '2026-11-01' } } },
   ];
   const ops = opsFromWire(stored);
   assert.deepEqual(ops[0], { kind: 'unitCreate', tempId: 'tmp:q', name: 'Quality', parentUnitId: 'board', validFrom: '2026-11-01', confirmBackdated: false });

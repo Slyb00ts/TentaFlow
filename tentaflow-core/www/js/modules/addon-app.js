@@ -124,9 +124,9 @@ const AddonAppScreen = {
 
     // Subscribe to unsolicited pushes for this panel
     _session.unsubUnsolicited = client.addUnsolicitedListener(({ envelope, body: msgBody }) => {
-      console.log('[addon-app] unsolicited:', msgBody.variant, msgBody);
-      if (msgBody.variant !== 'UiChannelCbor') return;
-      handleUiMessage(msgBody.cbor);
+      console.log('[addon-app] unsolicited:', msgBody._variant, msgBody);
+      if (msgBody._variant !== 'UiChannelCbor') return;
+      handleUiMessage(msgBody.value);
     });
 
     // Send PanelOpen as request-response (pending, not subscribe).
@@ -147,13 +147,13 @@ const AddonAppScreen = {
     try {
       console.log('[addon-app] awaiting PanelOpen response...');
       const { envelope: respEnv, body: respBody } = await openPromise;
-      console.log('[addon-app] PanelOpen response:', respBody.variant, respBody);
-      if (respEnv.isError || respBody.variant === 'Error') {
+      console.log('[addon-app] PanelOpen response:', respBody._variant, respBody);
+      if (respEnv.isError || respBody._variant === 'Error') {
         showError(respBody.message ?? 'Panel open failed');
         return;
       }
-      if (respBody.variant === 'UiChannelCbor' && _session) {
-        const decoded = wasm.decodeUiPayload(respBody.cbor);
+      if (respBody._variant === 'UiChannelCbor' && _session) {
+        const decoded = wasm.decodeUiPayload(respBody.value);
         if (decoded.assignedEpoch) {
           _session.panelEpoch = Number(decoded.assignedEpoch);
         }
@@ -497,8 +497,8 @@ async function sendAction(addonId, panelId, panelEpoch, actionId, params, editTo
       console.warn('[addon-app] action', actionId, 'got no ack:', e);
       return;
     }
-    if (response == null || response.body.variant !== 'UiChannelCbor') return;
-    const ack = s.wasm.decodeUiPayload(response.body.cbor);
+    if (response == null || response.body._variant !== 'UiChannelCbor') return;
+    const ack = s.wasm.decodeUiPayload(response.body.value);
     if (ack.tag !== TAG_ACTION_ACK) return;
     if (FAILED_ACK_STATUSES.has(ack.status)) {
       console.warn('[addon-app] action', actionId, 'failed:', ack.status);

@@ -51,6 +51,11 @@ pub enum CoreSyncResourceKind {
     TokenLease,
     ModelMetricsRollup,
     ModelPricing,
+    /// A model alias, keyed by its NAME. The local integer `id` is an
+    /// autoincrement that differs per node and never leaves it. Aliases
+    /// registered by an addon belong to that node's install and are not part
+    /// of this resource (see `repository::model_alias_replicates`).
+    ModelAlias,
     CameraCvPipeline,
     VisionModel,
     CodeWorkspace,
@@ -679,6 +684,18 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "metrics",
+    },
+    // Model aliases are admin edited on any node (LWW by name). Deleting one
+    // is a tombstone, so a node that was offline during the delete cannot
+    // bring the alias back with an older write.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::ModelAlias,
+        table_name: "model_aliases",
+        resource_type: "core.model_alias",
+        primary_key_column: "alias",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "model-aliases",
     },
     // Configurable camera CV pipelines. Admin-edited on any node (LWW) and
     // replicated fleet-wide like flows; the per-camera assignment

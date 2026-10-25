@@ -68,7 +68,7 @@ function genRegionId() {
 }
 
 // Zwraca listę portów wejściowych/wyjściowych dla nody. Priorytet: adapter
-// metadata z backendu (`template.input_ports`/`template.output_ports` plus
+// metadata z backendu (`template.inputPorts`/`template.outputPorts` plus
 // `input_port_types`/`output_port_types`), potem legacy pola
 // `inputs`/`outputs`, a na koncu heurystyki.
 // Adapter metadata jest autorytatywnym zrodlem — backend odrzuci krawedz z
@@ -135,19 +135,19 @@ function portsForNode(node, template) {
   let tplIn = null;
   let tplOut = null;
   if (template) {
-    if (Array.isArray(template.input_ports) && template.input_ports.length > 0) {
-      tplIn = readList(template.input_ports, template.input_port_types);
+    if (Array.isArray(template.inputPorts) && template.inputPorts.length > 0) {
+      tplIn = readList(template.inputPorts, template.inputPortTypes);
     }
-    if (Array.isArray(template.output_ports) && template.output_ports.length > 0) {
-      tplOut = readList(template.output_ports, template.output_port_types);
+    if (Array.isArray(template.outputPorts) && template.outputPorts.length > 0) {
+      tplOut = readList(template.outputPorts, template.outputPortTypes);
     }
     if (!tplIn) tplIn = readList(template.inputs, null);
     if (!tplOut) tplOut = readList(template.outputs, null);
     if (!tplIn || !tplOut) {
       try {
-        const schema = typeof template.params_schema === 'string'
-          ? JSON.parse(template.params_schema)
-          : template.params_schema;
+        const schema = typeof template.paramsSchema === 'string'
+          ? JSON.parse(template.paramsSchema)
+          : template.paramsSchema;
         if (schema && schema.ports) {
           if (!tplIn) tplIn = readList(schema.ports.inputs, null);
           if (!tplOut) tplOut = readList(schema.ports.outputs, null);
@@ -260,9 +260,9 @@ export class FlowCanvas {
     for (const t of list || []) {
       // A drop-in Service task shares its node_type with the plain element and
       // must not replace how that element is drawn.
-      if (t.preset && this.templates.has(t.node_type)) continue;
-      if (this.templates.has(t.node_type)) this.presetTypes.add(t.node_type);
-      this.templates.set(t.node_type, t);
+      if (t.preset && this.templates.has(t.nodeType)) continue;
+      if (this.templates.has(t.nodeType)) this.presetTypes.add(t.nodeType);
+      this.templates.set(t.nodeType, t);
     }
     this._normalizeNodeLabels();
     this._normalizeEdgePorts();
@@ -653,13 +653,13 @@ export class FlowCanvas {
       const toTpl = to ? this.templates.get(to.type) : null;
       const fromPort = edge.from_port || 'full';
       const toPort = edge.to_port || 'in';
-      if (fromTpl && Array.isArray(fromTpl.output_ports) && fromTpl.output_ports.length > 0) {
-        if (!fromTpl.output_ports.includes(fromPort)) {
+      if (fromTpl && Array.isArray(fromTpl.outputPorts) && fromTpl.outputPorts.length > 0) {
+        if (!fromTpl.outputPorts.includes(fromPort)) {
           errors.push(I18n.t('flows_builder.invalid_port', { node_type: from.type, port: fromPort }));
         }
       }
-      if (toTpl && Array.isArray(toTpl.input_ports) && toTpl.input_ports.length > 0) {
-        if (!toTpl.input_ports.includes(toPort)) {
+      if (toTpl && Array.isArray(toTpl.inputPorts) && toTpl.inputPorts.length > 0) {
+        if (!toTpl.inputPorts.includes(toPort)) {
           errors.push(I18n.t('flows_builder.invalid_port', { node_type: to.type, port: toPort }));
         }
       }
@@ -950,18 +950,18 @@ export class FlowCanvas {
   addNodeFromTemplate(tpl, clientX, clientY, { cascade = false } = {}) {
     if (this.readOnly) return;
     if (this.mode === 'bpmn' && this.processPath.length > 0
-      && ['bpmn_timer_start', 'bpmn_message_start'].includes(tpl.node_type)) return;
-    if (this.mode === 'bpmn' && this.processPath.length >= 3 && tpl.node_type === 'bpmn_sub_process') return;
+      && ['bpmn_timer_start', 'bpmn_message_start'].includes(tpl.nodeType)) return;
+    if (this.mode === 'bpmn' && this.processPath.length >= 3 && tpl.nodeType === 'bpmn_sub_process') return;
     const rect = this.root.getBoundingClientRect();
     const pt = this._clientToWorld(Number.isFinite(clientX) ? clientX : rect.left + rect.width / 2,
       Number.isFinite(clientY) ? clientY : rect.top + rect.height / 2);
     if (!Number.isFinite(pt.x) || !Number.isFinite(pt.y)) { pt.x = 0; pt.y = 0; }
     let defaultConfig = {};
-    try { defaultConfig = JSON.parse(tpl.default_config || '{}'); } catch (_) {}
+    try { defaultConfig = JSON.parse(tpl.defaultConfig || '{}'); } catch (_) {}
     const node = {
       id: 'n_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6),
-      type: tpl.node_type,
-      label: this.presetTypes.has(tpl.node_type) ? String(tpl.label || '') : '',
+      type: tpl.nodeType,
+      label: this.presetTypes.has(tpl.nodeType) ? String(tpl.label || '') : '',
       x: snapGridCoordinate(pt.x - NODE_WIDTH / 2),
       y: snapGridCoordinate(pt.y - NODE_H_APPROX / 2),
       config: defaultConfig,
@@ -2048,9 +2048,9 @@ export class FlowCanvas {
   /** Etykiety wymaganych pól bez wartości, w kolejności ze schematu. */
   _missingRequired(n) {
     const tmpl = this.templates.get(n.type);
-    if (!tmpl || !tmpl.params_schema) return [];
+    if (!tmpl || !tmpl.paramsSchema) return [];
     let schema;
-    try { schema = typeof tmpl.params_schema === 'string' ? JSON.parse(tmpl.params_schema) : tmpl.params_schema; }
+    try { schema = typeof tmpl.paramsSchema === 'string' ? JSON.parse(tmpl.paramsSchema) : tmpl.paramsSchema; }
     catch (_) { return []; }
     const missing = [];
     for (const key of schema.required || []) {
@@ -2735,8 +2735,8 @@ export class FlowCanvas {
           const toNode = this.nodes.find((n) => n.id === toNodeId);
           const fromTpl = this.templates.get(fromNode.type);
           const toTpl = toNode ? this.templates.get(toNode.type) : null;
-          const fromOutputs = (fromTpl && Array.isArray(fromTpl.output_ports) && fromTpl.output_ports.length > 0) ? fromTpl.output_ports : null;
-          const toInputs = (toTpl && Array.isArray(toTpl.input_ports) && toTpl.input_ports.length > 0) ? toTpl.input_ports : null;
+          const fromOutputs = (fromTpl && Array.isArray(fromTpl.outputPorts) && fromTpl.outputPorts.length > 0) ? fromTpl.outputPorts : null;
+          const toInputs = (toTpl && Array.isArray(toTpl.inputPorts) && toTpl.inputPorts.length > 0) ? toTpl.inputPorts : null;
           let rejectMsg = null;
           if (fromOutputs && !fromOutputs.includes(fromPort)) {
             rejectMsg = I18n.t('flows_builder.invalid_port', { node_type: fromNode.type, port: fromPort });
@@ -2749,10 +2749,10 @@ export class FlowCanvas {
             // Text node'a a backend rzucilby blad dopiero przy save.
             const fromIdx = fromOutputs ? fromOutputs.indexOf(fromPort) : -1;
             const toIdx = toInputs ? toInputs.indexOf(toPort) : -1;
-            const fromType = (fromIdx >= 0 && Array.isArray(fromTpl?.output_port_types))
-              ? fromTpl.output_port_types[fromIdx] : 'any';
-            const toType = (toIdx >= 0 && Array.isArray(toTpl?.input_port_types))
-              ? toTpl.input_port_types[toIdx] : 'any';
+            const fromType = (fromIdx >= 0 && Array.isArray(fromTpl?.outputPortTypes))
+              ? fromTpl.outputPortTypes[fromIdx] : 'any';
+            const toType = (toIdx >= 0 && Array.isArray(toTpl?.inputPortTypes))
+              ? toTpl.inputPortTypes[toIdx] : 'any';
             if (!arePortTypesCompatible(fromType, toType)) {
               rejectMsg = I18n.t('flows_builder.invalid_port_type', {
                 from_type: fromType,

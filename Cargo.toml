@@ -10,6 +10,7 @@ members = [
     "tentaflow-bus",
     "tentaflow-cli",
     "tentaflow-client/native",
+    "tentaflow-codec-core",
     "tentaflow-containers/agents/native/coding-agent-bridge",
     "tentaflow-containers/agents/native/teams-bot",
     "tentaflow-containers/sidecar",
@@ -274,6 +275,7 @@ tentaflow-core = {path = "tentaflow-core", default-features = false}
 tentaflow-desktop-core = {path = "tentaflow-desktop/core"}
 tentaflow-hardware = {path = "tentaflow-hardware", default-features = false}
 tentaflow-macros = {path = "tentaflow-macros"}
+tentaflow-codec-core = {path = "tentaflow-codec-core"}
 tentaflow-protocol = {path = "tentaflow-protocol"}
 tentaflow-quantum = {path = "tentaflow-quantum"}
 tentaflow-sdk-spec = {path = "tentaflow-sdk-spec"}

@@ -423,7 +423,7 @@ fn build_service_model_entries(
 /// — without the inference an alias targeting an audio chat flow would be
 /// advertised as text-only and the resolver would reject audio requests.
 fn build_flow_entries(pool: &DbPool, taken_ids: &HashSet<String>) -> Result<Vec<CatalogEntry>> {
-    let flows = repository::list_flows(pool, 0, i64::MAX)?;
+    let flows = repository::list_published_active_flows(pool)?;
     let mut entries = Vec::new();
     for flow in flows {
         let Some(published_name) = flow.published_model_name.clone() else {

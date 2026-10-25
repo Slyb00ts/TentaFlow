@@ -203,21 +203,21 @@ function paintSubtitle() {
 
 function normalize(a) {
   return {
-    addonId: a.addonId ?? a.addon_id,
-    addonName: a.addonName ?? a.addon_name,
-    addonIcon: a.addonIcon ?? a.addon_icon ?? null,
-    addonDescription: a.addonDescription ?? a.addon_description ?? '',
-    addonVersion: a.addonVersion ?? a.addon_version ?? '',
-    providerId: a.providerId ?? a.provider_id,
-    providerDisplayName: a.providerDisplayName ?? a.provider_display_name ?? '',
+    addonId: a.addonId,
+    addonName: a.addonName,
+    addonIcon: a.addonIcon ?? null,
+    addonDescription: a.addonDescription ?? '',
+    addonVersion: a.addonVersion ?? '',
+    providerId: a.providerId,
+    providerDisplayName: a.providerDisplayName ?? '',
     status: a.status || 'not_connected',
-    accountId: a.accountId ?? a.account_id ?? null,
-    accountEmail: a.accountEmail ?? a.account_email ?? '',
-    accountDisplayName: a.accountDisplayName ?? a.account_display_name ?? '',
+    accountId: a.accountId ?? null,
+    accountEmail: a.accountEmail ?? '',
+    accountDisplayName: a.accountDisplayName ?? '',
     scopes: Array.isArray(a.scopes) ? a.scopes : [],
-    connectedAtEpoch: Number(a.connectedAtEpoch ?? a.connected_at_epoch ?? 0),
-    lastUsedAtEpoch: Number(a.lastUsedAtEpoch ?? a.last_used_at_epoch ?? 0),
-    expiresAtEpoch: Number(a.expiresAtEpoch ?? a.expires_at_epoch ?? 0),
+    connectedAtEpoch: Number(a.connectedAtEpoch ?? 0),
+    lastUsedAtEpoch: Number(a.lastUsedAtEpoch ?? 0),
+    expiresAtEpoch: Number(a.expiresAtEpoch ?? 0),
   };
 }
 
@@ -436,13 +436,13 @@ function renderAgentApps() {
     return;
   }
   grid.innerHTML = agentEngines
-    .map((engine) => renderAgentCard(engine.engine_id ?? engine.engineId))
+    .map((engine) => renderAgentCard(engine.engineId))
     .join('');
   wireAgentCards(grid);
 }
 
 function renderAgentCard(engineId) {
-  const forEngine = agentAccounts.filter((a) => (a.engine_id ?? a.engineId) === engineId);
+  const forEngine = agentAccounts.filter((a) => a.engineId === engineId);
   const own = forEngine.find((a) => a.scope === 'user') ?? null;
   const shared = forEngine.filter((a) => a.scope !== 'user');
   const head = own
@@ -468,20 +468,20 @@ function renderOwnAccount(account) {
   // The account's NAME leads, the way the mockup's connected card does; the
   // provider identity, where it is in use and how it authenticates are the
   // lines under it.
-  const title = account.display_name || accountSubtitle(account) || '';
-  const lastUsed = account.last_used_at ?? account.lastUsedAt;
+  const title = account.displayName || accountSubtitle(account) || '';
+  const lastUsed = account.lastUsedAt;
   const used = lastUsed ? T('apps_last_used', { when: whenLabel(lastUsed) }) : T('apps_never_used');
-  const kind = credentialKindLabel(account.credential_kind ?? account.credentialKind);
+  const kind = credentialKindLabel(account.credentialKind);
   const meta = [accountSubtitle(account), kind, used].filter(Boolean).join(' · ');
   // "Używane na" and the session count are what THIS node measured; a session
   // running on a peer is in neither, which is why the line says "tu".
-  const sessions = Number(account.session_count ?? account.sessionCount ?? 0);
+  const sessions = Number(account.sessionCount ?? 0);
   const usage = [
     T('apps_used_on', { nodes: usedOnLabel(account) }),
     sessions > 0 ? T('apps_sessions', { count: sessions }) : '',
   ].filter(Boolean).join(' · ');
-  const canDelete = (account.can_delete ?? account.canDelete) !== false;
-  const canLogin = (account.can_login ?? account.canLogin) === true;
+  const canDelete = account.canDelete !== false;
+  const canLogin = account.canLogin === true;
   // U01 carries a status, not a credential revision: an account that is active
   // holds one, and anything else is still waiting for a first sign-in.
   const signedIn = account.status === 'active';
@@ -507,9 +507,9 @@ function renderSharedAccount(account) {
   const subtitle = accountSubtitle(account);
   return `
     <div class="myapp-linked">
-      <div class="linked-avatar">${escapeHtml(initials(account.display_name ?? ''))}</div>
+      <div class="linked-avatar">${escapeHtml(initials(account.displayName ?? ''))}</div>
       <div class="linked-info">
-        <div class="linked-email">${escapeHtml(account.display_name ?? '')}</div>
+        <div class="linked-email">${escapeHtml(account.displayName ?? '')}</div>
         <div class="linked-meta">${escapeHtml([T('apps_shared'), subtitle].filter(Boolean).join(' · '))}</div>
       </div>
       <div class="linked-actions">${statusChipHtml(account)}</div>
@@ -529,7 +529,7 @@ function renderConnectPrompt() {
 /** The caller's OWN account for one engine, which is the only one they manage. */
 function ownAccount(engineId) {
   return agentAccounts.find(
-    (a) => (a.engine_id ?? a.engineId) === engineId && a.scope === 'user',
+    (a) => a.engineId === engineId && a.scope === 'user',
   ) ?? null;
 }
 
@@ -538,8 +538,8 @@ function ownAccount(engineId) {
 // names no node and the account's home (or this one) runs the terminal.
 function openOwnLogin(account, engineId) {
   openLoginWizard({
-    accountId: account.account_id ?? account.accountId,
-    accountName: account.display_name ?? account.displayName ?? '',
+    accountId: account.accountId,
+    accountName: account.displayName ?? '',
     engineId,
     engines: agentEngines,
     onFinished: () => loadAgentApps(),
@@ -550,7 +550,7 @@ function wireAgentCards(grid) {
   grid.querySelectorAll('.myapp-card[data-engine]').forEach((card) => {
     const engineId = card.dataset.engine;
     card.querySelector('[data-role="app-connect"]')?.addEventListener('click', () => {
-      const engine = agentEngines.find((e) => (e.engine_id ?? e.engineId) === engineId);
+      const engine = agentEngines.find((e) => e.engineId === engineId);
       openCreateAccountWindow({
         engines: engine ? [engine] : agentEngines,
         scope: 'user',
@@ -558,7 +558,7 @@ function wireAgentCards(grid) {
         // and the sign-in it exists for opens on top of it.
         onCreated: () => loadAgentApps().then(() => {
           const account = ownAccount(engineId);
-          if (account && (account.can_login ?? account.canLogin) === true) {
+          if (account && account.canLogin === true) {
             openOwnLogin(account, engineId);
           }
         }),
@@ -573,7 +573,7 @@ function wireAgentCards(grid) {
       if (!account) return;
       const ok = await TfWindow.confirm({
         title: T('apps_disconnect_confirm_title'),
-        message: T('apps_disconnect_confirm_body', { name: escapeHtml(account.display_name ?? '') }),
+        message: T('apps_disconnect_confirm_body', { name: escapeHtml(account.displayName ?? '') }),
         confirmLabel: T('apps_disconnect'),
         cancelLabel: I18n.t('common.cancel'),
         danger: true,
@@ -583,7 +583,7 @@ function wireAgentCards(grid) {
         // "Odłącz" is the same delete the account window sends, so it reports
         // the same partial outcome the same way.
         reportWriteOutcome(
-          await AgentAccounts.remove(account.account_id ?? account.accountId),
+          await AgentAccounts.remove(account.accountId),
           T('apps_disconnected'),
         );
         await loadAgentApps();

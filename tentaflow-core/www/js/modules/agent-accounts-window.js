@@ -56,7 +56,7 @@ export function openCreateAccountWindow({ engines = [], scope = 'global', onCrea
   }
   const engineOptions = available
     .map((engine) => {
-      const id = engine.engine_id ?? engine.engineId;
+      const id = engine.engineId;
       return `<option value="${escapeAttr(id)}">${escapeHtml(engineName(id, engines))}</option>`;
     })
     .join('');
@@ -148,7 +148,7 @@ export function openCreateAccountWindow({ engines = [], scope = 'global', onCrea
         scope,
         credentialKind,
       });
-      const accountId = created?.account?.account_id ?? created?.account?.accountId;
+      const accountId = created?.account?.accountId;
       if (credentialKind === 'api_key' && accountId) {
         await AgentAccounts.setCredential(accountId, material);
       }
@@ -180,8 +180,8 @@ export function openCreateAccountWindow({ engines = [], scope = 'global', onCrea
  * Benchmark Studio screen already use.
  */
 export function localNodeIdOf(runtimeNodes) {
-  const local = (runtimeNodes ?? []).find((node) => node.is_local ?? node.isLocal);
-  return String(local?.node_id ?? local?.nodeId ?? '');
+  const local = (runtimeNodes ?? []).find((node) => node.isLocal);
+  return String(local?.nodeId ?? '');
 }
 
 /**
@@ -229,14 +229,14 @@ export function localNodeIdOf(runtimeNodes) {
 export function sessionScopePresentation({
   account, sessionCount, localNodeId, runtimeNodes = [],
 }) {
-  const homeNodeId = String(account?.home_node_id ?? account?.homeNodeId ?? '');
+  const homeNodeId = String(account?.homeNodeId ?? '');
   const homedHere = Boolean(localNodeId) && homeNodeId === String(localNodeId);
   // Which node's deletion took the home away, when the home is gone. The two
   // fields are written and cleared together (`forget_node_tx` NULLs the home and
   // sets the marker in one UPDATE; `claim_home_tx` clears the marker with the
   // home it claims), so the marker is read only while there is no home — a value
   // left behind by a re-home must not outrank a home this node can see.
-  const lostHomeId = String(account?.home_lost_node_id ?? account?.homeLostNodeId ?? '');
+  const lostHomeId = String(account?.homeLostNodeId ?? '');
   if (!homeNodeId && lostHomeId) {
     // The node is gone from the registry, so Core has no display name to send for
     // it and this is the only form of it a sentence can carry.
@@ -258,7 +258,7 @@ export function sessionScopePresentation({
   // A node with no name yet resolves to its own id, and a sentence carrying 64
   // hex characters names nothing — the short id is the readable form of the
   // very same node, not a different one.
-  const homeName = String(account?.home_node_name ?? account?.homeNodeName ?? '').trim();
+  const homeName = String(account?.homeNodeName ?? '').trim();
   const node = !homeName || homeName === homeNodeId ? shortId(homeNodeId) : homeName;
   const title = T('sessions_title_scope', { count: sessionCount });
   if (!localNodeId) {
@@ -275,7 +275,7 @@ export function sessionScopePresentation({
   // is not a measurement of the other node, so the caveat states the scope the
   // cell is missing rather than a cause this node never observed.
   const home = runtimeNodes.find(
-    (row) => String(row?.node_id ?? row?.nodeId ?? '') === homeNodeId,
+    (row) => String(row?.nodeId ?? '') === homeNodeId,
   );
   if (!home?.online) {
     return {
@@ -314,8 +314,8 @@ export async function openAccountWindow(accountId, {
     agents: loaded.agents ?? [],
     // Access draft: the org switch and the picked subjects are one list on the
     // wire (a full replace), but two controls here.
-    orgWide: (loaded.grants ?? []).some((g) => (g.subject_type ?? g.subjectType) === 'org'),
-    subjects: (loaded.grants ?? []).filter((g) => (g.subject_type ?? g.subjectType) !== 'org'),
+    orgWide: (loaded.grants ?? []).some((g) => g.subjectType === 'org'),
+    subjects: (loaded.grants ?? []).filter((g) => g.subjectType !== 'org'),
     accessDirty: false,
     users: [],
     groups: [],
@@ -328,7 +328,7 @@ export async function openAccountWindow(accountId, {
   // attributed to, and the node refuses that on a PERSONAL account from anyone
   // but its owner — who has their own button in "Moje konta". A window an
   // administrator opened therefore offers the sign-in on shared accounts only.
-  const canLogin = isAdmin && !scopeUser && state.account.credential_kind === 'provider_login';
+  const canLogin = isAdmin && !scopeUser && state.account.credentialKind === 'provider_login';
 
   const body = document.createElement('div');
   body.className = 'aa-detail';
@@ -347,7 +347,7 @@ export async function openAccountWindow(accountId, {
 
   TfWindow.open({
     title: T('title'),
-    subtitle: `${state.account.display_name ?? ''} · ${T(scopeUser ? 'subtitle_user' : 'subtitle_global')}`,
+    subtitle: `${state.account.displayName ?? ''} · ${T(scopeUser ? 'subtitle_user' : 'subtitle_global')}`,
     icon: 'users',
     width: 900,
     modal: true,
@@ -373,8 +373,8 @@ export async function openAccountWindow(accountId, {
     state.nodes = fresh.nodes ?? [];
     state.agents = fresh.agents ?? [];
     if (!state.accessDirty) {
-      state.orgWide = state.grants.some((g) => (g.subject_type ?? g.subjectType) === 'org');
-      state.subjects = state.grants.filter((g) => (g.subject_type ?? g.subjectType) !== 'org');
+      state.orgWide = state.grants.some((g) => g.subjectType === 'org');
+      state.subjects = state.grants.filter((g) => g.subjectType !== 'org');
     }
     body.querySelector('tf-tab#access')?.setAttribute('count', String(state.grants.length));
     body.querySelector('tf-tab#agents')?.setAttribute('count', String(state.agents.length));
@@ -388,11 +388,11 @@ export async function openAccountWindow(accountId, {
   loginButton?.addEventListener('click', () => {
     openLoginWizard({
       accountId,
-      accountName: state.account.display_name ?? '',
-      engineId: state.account.engine_id,
+      accountName: state.account.displayName ?? '',
+      engineId: state.account.engineId,
       engines,
       nodes: runtimeNodes,
-      homeNodeId: state.account.home_node_id ?? null,
+      homeNodeId: state.account.homeNodeId ?? null,
       onFinished: (outcome) => {
         if (outcome === 'succeeded') notifyChanged();
         reload();
@@ -402,7 +402,7 @@ export async function openAccountWindow(accountId, {
 
   const paint = () => {
     if (loginButton) {
-      const revision = Number(state.account.credential_revision ?? 0);
+      const revision = Number(state.account.credentialRevision ?? 0);
       loginButton.setAttribute('label', T(revision > 0 ? 'action_relogin' : 'action_login'));
     }
     if (state.tab === 'access') paintAccess();
@@ -413,12 +413,12 @@ export async function openAccountWindow(accountId, {
   // ---- Przegląd ----------------------------------------------------------
   function paintOverview() {
     const account = state.account;
-    const apiKey = account.credential_kind === 'api_key';
-    const revision = Number(account.credential_revision ?? 0);
+    const apiKey = account.credentialKind === 'api_key';
+    const revision = Number(account.credentialRevision ?? 0);
     const enabled = account.status !== 'disabled';
     // 0 is "no limit" — the state every account starts in, and the one an
     // administrator returns it to by saving 0.
-    const limit = Math.max(0, Number(account.max_sessions ?? 0));
+    const limit = Math.max(0, Number(account.maxSessions ?? 0));
     const sessions = sessionScopePresentation({
       account,
       sessionCount: state.sessions.length,
@@ -430,7 +430,7 @@ export async function openAccountWindow(accountId, {
         <dt>${escapeHtml(T('kv_provider_account'))}</dt>
         <dd>${escapeHtml(accountSubtitle(account) || '—')}</dd>
         <dt>${escapeHtml(T('kv_credential'))}</dt>
-        <dd>${escapeHtml(credentialKindLabel(account.credential_kind))} · ${escapeHtml(revision > 0
+        <dd>${escapeHtml(credentialKindLabel(account.credentialKind))} · ${escapeHtml(revision > 0
           ? T('kv_credential_stored')
           : T('kv_no_credential'))}</dd>
         <dt>${escapeHtml(T('kv_status'))}</dt>
@@ -438,7 +438,7 @@ export async function openAccountWindow(accountId, {
           ? `<span class="aa-hint">${escapeHtml(T(apiKey ? 'kv_needs_key_hint' : 'kv_needs_login_hint'))}</span>`
           : ''}</dd>
         <dt>${escapeHtml(T('kv_engine'))}</dt>
-        <dd>${engineTile(account.engine_id)} ${escapeHtml(engineName(account.engine_id, engines))}</dd>
+        <dd>${engineTile(account.engineId)} ${escapeHtml(engineName(account.engineId, engines))}</dd>
         <dt>${escapeHtml(T('col_used_on'))}</dt>
         <dd title="${escapeAttr(T('used_on_tooltip'))}">${escapeHtml(usedOnLabel(account))}</dd>
       </dl>
@@ -447,7 +447,7 @@ export async function openAccountWindow(accountId, {
         <h4 class="aa-sub-h">${escapeHtml(T('settings_title'))}</h4>
         <div class="aa-form aa-form-row">
           <tf-input data-field="name" label="${escapeAttr(T('field_name'))}"
-            value="${escapeAttr(account.display_name ?? '')}" maxlength="120"></tf-input>
+            value="${escapeAttr(account.displayName ?? '')}" maxlength="120"></tf-input>
           <tf-button variant="primary" data-act="rename">${escapeHtml(T('action_rename'))}</tf-button>
         </div>
         ${isAdmin ? `
@@ -502,17 +502,17 @@ export async function openAccountWindow(accountId, {
 
     const sessionsByNode = new Map();
     for (const session of state.sessions) {
-      const id = session.node_id ?? session.nodeId ?? '';
+      const id = session.nodeId ?? '';
       sessionsByNode.set(id, (sessionsByNode.get(id) ?? 0) + 1);
     }
     const sessionsTable = pane.querySelector('[data-table="sessions"]');
     sessionsTable.rows = state.sessions.map((session) => ({
-      user: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(session.user_display_name ?? '')}</div>`,
-      agent: session.agent_name ?? T('value_none'),
-      workspace: session.workspace_name ?? T('value_none'),
+      user: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(session.userDisplayName ?? '')}</div>`,
+      agent: session.agentName ?? T('value_none'),
+      workspace: session.workspaceName ?? T('value_none'),
       node: nodeTitle(session),
-      since: sinceLabel(session.started_at),
-      _sessionId: session.session_id,
+      since: sinceLabel(session.startedAt),
+      _sessionId: session.sessionId,
     }));
     // "Zakończ": the node closes the CLI first and only then forgets the row,
     // so a bridge that refuses leaves the session visible and closable instead
@@ -547,8 +547,8 @@ export async function openAccountWindow(accountId, {
       return button;
     };
     pane.querySelector('[data-table="nodes"]').rows = state.nodes.map((node) => {
-      const credential = nodeCredentialLabel(node, state.account.credential_revision);
-      const nodeId = String(node.node_id ?? node.nodeId ?? '');
+      const credential = nodeCredentialLabel(node, state.account.credentialRevision);
+      const nodeId = String(node.nodeId ?? '');
       // Which row is the machine the operator is looking at: the per-account
       // node state says nothing about that, so it comes from the matrix mark.
       const isLocal = Boolean(localNodeId) && nodeId === localNodeId;
@@ -560,8 +560,8 @@ export async function openAccountWindow(accountId, {
             : '')
           + (isLocal ? `<div class="tf-table__cell-sub">${escapeHtml(T('node_local'))}</div>` : ''),
         credential: `<tf-chip size="sm" status="${credential.tone}" dot label="${escapeAttr(credential.label)}"></tf-chip>`
-          + (node.last_error ? `<div class="tf-table__cell-sub">${escapeHtml(node.last_error)}</div>` : ''),
-        sessions: String(sessionsByNode.get(node.node_id ?? '') ?? 0),
+          + (node.lastError ? `<div class="tf-table__cell-sub">${escapeHtml(node.lastError)}</div>` : ''),
+        sessions: String(sessionsByNode.get(node.nodeId ?? '') ?? 0),
       };
     });
 
@@ -611,10 +611,10 @@ export async function openAccountWindow(accountId, {
       // Re-enabling restores the TRUE state, not "active": an account whose
       // credential was never stored is waiting for one, and saying "signed in"
       // because somebody flipped a switch would be a lie the operator acts on.
-      const revision = Number(state.account.credential_revision ?? 0);
+      const revision = Number(state.account.credentialRevision ?? 0);
       const restored = revision > 0
         ? 'active'
-        : (state.account.credential_kind === 'api_key' ? 'pending' : 'needs_login');
+        : (state.account.credentialKind === 'api_key' ? 'pending' : 'needs_login');
       try {
         await AgentAccounts.update({ accountId, status: wantEnabled ? restored : 'disabled' });
         notifyChanged();
@@ -706,13 +706,13 @@ export async function openAccountWindow(accountId, {
   }
 
   function subjectKey(grant) {
-    return `${grant.subject_type ?? grant.subjectType}:${grant.subject_id ?? grant.subjectId ?? ''}`;
+    return `${grant.subjectType}:${grant.subjectId ?? ''}`;
   }
 
   function paintAccess() {
     const sessionsByUser = new Map();
     for (const session of state.sessions) {
-      const id = session.user_id ?? session.userId ?? '';
+      const id = session.userId ?? '';
       sessionsByUser.set(id, (sessionsByUser.get(id) ?? 0) + 1);
     }
     pane.innerHTML = `
@@ -742,7 +742,7 @@ export async function openAccountWindow(accountId, {
     const table = pane.querySelector('[data-table="grants"]');
     const error = pane.querySelector('[data-error]');
 
-    const userName = (user) => String(user.displayName ?? user.display_name ?? user.username ?? user.email ?? user.id ?? '');
+    const userName = (user) => String(user.displayName ?? user.username ?? user.email ?? user.id ?? '');
     const userSub = (id) => {
       const user = state.users.find((u) => String(u.id) === String(id));
       return user?.email ? String(user.email) : '';
@@ -764,7 +764,7 @@ export async function openAccountWindow(accountId, {
           .map((group) => ({
             value: `group:${group.id}`,
             label: String(group.name ?? group.id),
-            description: T('access_members', { count: Number(group.memberCount ?? group.member_count ?? 0) }),
+            description: T('access_members', { count: Number(group.memberCount ?? 0) }),
             group: T('access_group_groups'),
           })),
       ];
@@ -778,22 +778,22 @@ export async function openAccountWindow(accountId, {
             who: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(T('access_whole_org'))}</div>`
               + `<div class="tf-table__cell-sub">${escapeHtml(T('access_whole_org_sub'))}</div>`,
             kind: T('subject_org'),
-            granted: grantedByLabel(state.grants.find((g) => (g.subject_type ?? g.subjectType) === 'org') ?? {}),
+            granted: grantedByLabel(state.grants.find((g) => g.subjectType === 'org') ?? {}),
             sessions: '—',
             _subject: null,
           }]
         : state.subjects.map((grant) => {
-          const type = grant.subject_type ?? grant.subjectType;
-          const id = grant.subject_id ?? grant.subjectId ?? '';
-          const members = grant.member_count ?? grant.memberCount;
+          const type = grant.subjectType;
+          const id = grant.subjectId ?? '';
+          const members = grant.memberCount;
           const known = type === 'user'
             ? state.users.find((u) => String(u.id) === String(id))
             : state.groups.find((g) => String(g.id) === String(id));
-          const title = grant.display_name
+          const title = grant.displayName
             || (type === 'user' ? (known ? userName(known) : id) : String(known?.name ?? id));
           const sub = type === 'user'
             ? userSub(id)
-            : T('access_members', { count: Number(members ?? known?.memberCount ?? known?.member_count ?? 0) });
+            : T('access_members', { count: Number(members ?? known?.memberCount ?? 0) });
           return {
             who: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(title)}</div>`
               + (sub ? `<div class="tf-table__cell-sub">${escapeHtml(sub)}</div>` : ''),
@@ -844,7 +844,7 @@ export async function openAccountWindow(accountId, {
       if (!value) return;
       const [type, id] = String(value).split(':');
       if (!type || !id) return;
-      state.subjects = [...state.subjects, { subject_type: type, subject_id: id, display_name: event.detail?.label ?? '' }];
+      state.subjects = [...state.subjects, { subjectType: type, subjectId: id, displayName: event.detail?.label ?? '' }];
       state.accessDirty = true;
       picker.setAttribute('value', '');
       paintPicker();
@@ -855,10 +855,10 @@ export async function openAccountWindow(accountId, {
       error.hidden = true;
       save.setAttribute('disabled', '');
       const grants = state.orgWide
-        ? [{ subject_type: 'org', subject_id: '' }]
+        ? [{ subjectType: 'org', subjectId: '' }]
         : state.subjects.map((grant) => ({
-          subject_type: grant.subject_type ?? grant.subjectType,
-          subject_id: grant.subject_id ?? grant.subjectId,
+          subjectType: grant.subjectType,
+          subjectId: grant.subjectId,
         }));
       try {
         const response = await AgentAccounts.setGrants(accountId, grants);
@@ -898,8 +898,8 @@ export async function openAccountWindow(accountId, {
       <div class="aa-foot">${escapeHtml(T('agents_foot', { count: state.agents.length }))}</div>
       <p class="aa-note">${escapeHtml(T('agents_note'))}</p>`;
     pane.querySelector('[data-table="agents"]').rows = state.agents.map((agent) => ({
-      agent: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(agent.agent_name ?? '')}</div>`,
-      mode: T(agent.bind_mode === 'user' ? 'bind_mode_user' : 'bind_mode_global'),
+      agent: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(agent.agentName ?? '')}</div>`,
+      mode: T(agent.bindMode === 'user' ? 'bind_mode_user' : 'bind_mode_global'),
     }));
   }
 
@@ -911,7 +911,7 @@ export async function openAccountWindow(accountId, {
   footer.querySelector('[data-act="delete"]').addEventListener('click', async () => {
     const confirmed = await TfWindow.confirm({
       title: T('delete_confirm_title'),
-      message: T('delete_confirm_body', { name: escapeHtml(state.account.display_name ?? '') }),
+      message: T('delete_confirm_body', { name: escapeHtml(state.account.displayName ?? '') }),
       description: T('delete_confirm_hint'),
       confirmLabel: T('action_delete'),
       cancelLabel: I18n.t('common.cancel'),

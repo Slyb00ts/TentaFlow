@@ -189,7 +189,7 @@ function updateSubtitle() {
 }
 
 function isActive(doc) {
-  const revoked = doc.revokedAtMs ?? doc.revoked_at_ms ?? 0;
+  const revoked = doc.revokedAtMs ?? 0;
   return !revoked || Number(revoked) === 0;
 }
 
@@ -197,18 +197,18 @@ function filterDocuments() {
   if (!filterText) return documents;
   return documents.filter((d) => {
     const variant = String(d.variant ?? '').toLowerCase();
-    const dateStr = formatDate(d.generatedAtMs ?? d.generated_at_ms).toLowerCase();
+    const dateStr = formatDate(d.generatedAt).toLowerCase();
     return variant.includes(filterText) || dateStr.includes(filterText);
   });
 }
 
 function buildRows() {
   return filterDocuments().map((d) => {
-    const docId = String(d.docId ?? d.doc_id ?? '');
+    const docId = String(d.docId ?? '');
     const variant = String(d.variant ?? '');
     const variantLabel = VARIANT_LABELS[variant] || variant;
-    const generatedAt = formatDate(d.generatedAtMs ?? d.generated_at_ms);
-    const hashFull = String(d.contentHash ?? d.content_hash ?? '');
+    const generatedAt = formatDate(d.generatedAt);
+    const hashFull = String(d.contentHash ?? '');
     const hashShort = hashFull.slice(0, 12);
     const active = isActive(d);
     return {
@@ -361,8 +361,8 @@ function openGenerateDialog() {
     const variant = String(variantEl?.value ?? 'standard');
     try {
       const resp = await ApiBinary.one('legalDocumentGenerateRequest', { variant });
-      const docId = String(resp.docId ?? resp.doc_id ?? '');
-      const signedUrl = String(resp.signedUrl ?? resp.signed_url ?? '');
+      const docId = String(resp.docId ?? '');
+      const signedUrl = String(resp.signedUrl ?? '');
       if (docId && signedUrl) {
         signedUrlCache.set(docId, signedUrl);
       }

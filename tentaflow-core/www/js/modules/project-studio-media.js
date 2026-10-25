@@ -63,8 +63,8 @@ export async function uploadProjectAttachment(file, { projectId, userId, signal,
   onProgress({ phase: 'uploading', offset: record.nextOffset, total: file.size, uploadId: record.uploadId });
   if (resume) {
     const status = await ApiBinary.one('projectStudioAttachmentUploadStatusRequest', { projectId, uploadId: record.uploadId });
-    if (status.sha256 !== sha256 || Number(status.total_size) !== file.size || status.filename !== file.name || status.mime !== record.mime) throw new Error('Upload metadata differs from the selected file');
-    record.nextOffset = Number(status.next_offset); record.complete = status.complete; record.expiresAt = status.expires_at;
+    if (status.sha256 !== sha256 || Number(status.totalSize) !== file.size || status.filename !== file.name || status.mime !== record.mime) throw new Error('Upload metadata differs from the selected file');
+    record.nextOffset = Number(status.nextOffset); record.complete = status.complete; record.expiresAt = status.expiresAt;
     storeUpload(record);
   }
   while (!record.complete) {
@@ -74,9 +74,9 @@ export async function uploadProjectAttachment(file, { projectId, userId, signal,
     const bytes = new Uint8Array(await file.slice(offset, Math.min(offset + ATTACHMENT_CHUNK_BYTES, file.size)).arrayBuffer());
     checkAborted(signal);
     const status = await ApiBinary.one('projectStudioAttachmentUploadChunkRequest', { projectId, uploadId: record.uploadId, filename: record.filename, mime: record.mime, sha256, totalSize: file.size, offset, bytes });
-    const next = Number(status.next_offset);
-    if (status.sha256 !== sha256 || Number(status.total_size) !== file.size || status.filename !== record.filename || !Number.isSafeInteger(next) || next !== offset + bytes.length || !status.complete && next === offset) throw new Error('Server returned an invalid upload acknowledgement');
-    record.nextOffset = next; record.complete = status.complete; record.expiresAt = status.expires_at;
+    const next = Number(status.nextOffset);
+    if (status.sha256 !== sha256 || Number(status.totalSize) !== file.size || status.filename !== record.filename || !Number.isSafeInteger(next) || next !== offset + bytes.length || !status.complete && next === offset) throw new Error('Server returned an invalid upload acknowledgement');
+    record.nextOffset = next; record.complete = status.complete; record.expiresAt = status.expiresAt;
     if (record.complete && next !== file.size) throw new Error('Server completed an incomplete upload');
     storeUpload(record);
     onProgress({ phase: record.complete ? 'complete' : 'uploading', offset: next, total: file.size, uploadId: record.uploadId });
@@ -97,7 +97,7 @@ export async function cancelAttachmentUpload(projectId, uploadId) {
 
 export async function refreshAttachmentUpload(record) {
   const status = await ApiBinary.one('projectStudioAttachmentUploadStatusRequest', { projectId: record.projectId, uploadId: record.uploadId });
-  const updated = { ...record, nextOffset: Number(status.next_offset), complete: status.complete, expiresAt: status.expires_at };
+  const updated = { ...record, nextOffset: Number(status.nextOffset), complete: status.complete, expiresAt: status.expiresAt };
   storeUpload(updated);
   return updated;
 }
@@ -105,7 +105,7 @@ export async function refreshAttachmentUpload(record) {
 export async function readAttachmentChunk(owner, attachment, offset, maxBytes = ATTACHMENT_CHUNK_BYTES, preview = false) {
   const response = await ApiBinary.one('projectStudioAttachmentGetRequest', { ...owner, sha256: attachment.sha256, offset, maxBytes, preview });
   const bytes = response.bytes instanceof Uint8Array ? response.bytes : new Uint8Array(response.bytes);
-  return { ...response, bytes, total_size: Number(response.total_size) };
+  return { ...response, bytes, totalSize: Number(response.totalSize) };
 }
 
 function installWorkerListener() {
@@ -133,7 +133,7 @@ function installWorkerListener() {
         if (!sessions.has(event.data.token)) throw new Error('Attachment session is closed');
         if (!Number.isSafeInteger(data.offset) || data.offset < 0 || !Number.isSafeInteger(data.maxBytes) || data.maxBytes < 1 || data.maxBytes > ATTACHMENT_CHUNK_BYTES) throw new Error('Invalid attachment byte range');
         const response = await readAttachmentChunk(session.owner, session.attachment, data.offset, data.maxBytes, session.preview);
-        if (response.total_size !== session.totalSize || response.bytes.length > data.maxBytes || data.offset + response.bytes.length > session.totalSize) throw new Error('Attachment bytes do not match the stream metadata');
+        if (response.totalSize !== session.totalSize || response.bytes.length > data.maxBytes || data.offset + response.bytes.length > session.totalSize) throw new Error('Attachment bytes do not match the stream metadata');
         const bytes = response.bytes.byteOffset === 0 && response.bytes.byteLength === response.bytes.buffer.byteLength ? response.bytes : response.bytes.slice();
         const received = bytes.length;
         port.postMessage({ requestId: data.requestId, bytes, eof: response.eof }, [bytes.buffer]);
@@ -153,12 +153,12 @@ export async function openAttachmentStream(owner, attachment, { preview = false 
   if (!navigator.serviceWorker?.controller) throw new Error('attachment_stream_reload');
   installWorkerListener();
   const first = await readAttachmentChunk(owner, attachment, 0, 1, preview);
-  if (!Number.isSafeInteger(first.total_size) || first.total_size < 0 || first.bytes.length !== Math.min(1, first.total_size)) throw new Error('Invalid attachment size');
+  if (!Number.isSafeInteger(first.totalSize) || first.totalSize < 0 || first.bytes.length !== Math.min(1, first.totalSize)) throw new Error('Invalid attachment size');
   const token = crypto.randomUUID();
-  const session = { owner: { ...owner }, attachment, preview, totalSize: first.total_size, mime: first.mime, filename: first.filename, ports: new Set() };
+  const session = { owner: { ...owner }, attachment, preview, totalSize: first.totalSize, mime: first.mime, filename: first.filename, ports: new Set() };
   sessions.set(token, session);
   const url = new URL(`/__project_attachment/${token}/${encodeURIComponent(first.filename || attachment.name)}`, location.origin);
-  return { url: url.href, totalSize: first.total_size, mime: first.mime, filename: first.filename,
+  return { url: url.href, totalSize: first.totalSize, mime: first.mime, filename: first.filename,
     set onComplete(callback) { session.onComplete = callback; },
     set onProgress(callback) { session.onProgress = callback; },
     set onError(callback) { session.onError = callback; },

@@ -460,6 +460,7 @@ tf-window [slot="footer"] {
   transition: border-color 0.15s ease, background 0.15s ease, box-shadow 0.25s ease;
 }
 .tf-searchbox:hover { border-color: var(--tf-border-hover); }
+tf-searchbox[size="sm"] .tf-searchbox { height: 32px; }
 .tf-searchbox:focus-within {
   border-color: var(--tf-accent-1);
   background: var(--tf-bg-card);
@@ -1632,11 +1633,24 @@ td:has(> .tf-table__row-select) {
 .tf-table__tile--t5 { background: linear-gradient(135deg, #ef4444, #f97316); }
 /* Liveness dot: green pulsing = seen within the liveness window, grey = stale. */
 .tf-table__dot { width: 8px; height: 8px; border-radius: 50%; background: var(--tf-text-3); flex-shrink: 0; display: inline-block; }
-.tf-table__dot--live { background: var(--tf-success); animation: tf-dot-pulse 2s infinite; }
+.tf-table__dot--live { background: var(--tf-success); position: relative; --tf-dot-grow: 2.75; }
+/* The expanding ring is a scaled pseudo-element (compositor): animating a
+   box-shadow spread repaints the dot on the main thread every frame. */
+.tf-table__dot--live::after,
+.tf-chip.tf-chip--outline .tf-chip-dot--tone-success::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: rgba(34, 197, 94, 0.45);
+  box-shadow: none;
+  opacity: 0;
+  animation: tf-dot-pulse 2s infinite;
+}
 @keyframes tf-dot-pulse {
-  0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.45); }
-  70% { box-shadow: 0 0 0 7px rgba(34, 197, 94, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+  0% { transform: scale(1); opacity: 1; }
+  70% { transform: scale(var(--tf-dot-grow)); opacity: 0; }
+  100% { transform: scale(1); opacity: 0; }
 }
 /* Share / usage bar: track + scaleX-animated fill + percentage label. */
 .tf-table__share { display: flex; align-items: center; gap: 8px; min-width: 120px; }
@@ -1704,7 +1718,9 @@ tf-chip[data-sdk-chip] .tf-chip { text-transform: none; letter-spacing: normal; 
 .tf-chip.tf-chip--outline.info { color: var(--tf-info); border-color: rgba(96, 165, 250, 0.35); background: rgba(96, 165, 250, 0.08); }
 .tf-chip.tf-chip--outline.neutral { color: var(--tf-text-2); border-color: var(--tf-border-hover); background: var(--tf-bg-3); }
 .tf-chip.tf-chip--outline .tf-chip-dot { width: 7px; height: 7px; animation: none; }
-.tf-chip.tf-chip--outline .tf-chip-dot--tone-success { animation: tf-dot-pulse 2s infinite; }
+.tf-chip.tf-chip--outline .tf-chip-dot::after { animation: none; }
+.tf-chip.tf-chip--outline .tf-chip-dot--tone-success { --tf-dot-grow: 3; }
+.tf-chip.tf-chip--outline .tf-chip-dot--tone-success::after { animation: tf-dot-pulse 2s infinite; }
 tf-chip[data-sdk-chip] .tf-chip.active {
   background: var(--tf-accent-glow);
   color: var(--tf-accent-2);
@@ -1737,6 +1753,18 @@ tf-chip[data-sdk-chip] .tf-chip.active {
   height: 6px;
   border-radius: 50%;
   background: currentColor;
+  position: relative;
+}
+/* The glow is a static shadow on a pseudo-element whose opacity is animated:
+   animating box-shadow itself repaints on the main thread every frame for every
+   status dot on the screen, opacity runs on the compositor. */
+.tf-chip .tf-chip-dot::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  box-shadow: 0 0 8px 2px currentColor;
+  opacity: 0;
   animation: tf-chip-pulse 2s ease-in-out infinite;
 }
 /* Neutral chip: plain framed pill (entity chips carry meaning in the dot). */
@@ -1769,22 +1797,31 @@ tf-chip[clickable]:focus-visible > .tf-chip {
 .tf-chip.pending .tf-chip-dot {
   animation: tf-chip-pending-pulse 1.2s ease-in-out infinite;
 }
+.tf-chip.pending .tf-chip-dot::after { animation: none; }
 /* recording — szybsza, mocniejsza pulsacja (REC). Krotszy okres niz default
    sygnalizuje aktywne nagrywanie a nie zwykly status. */
 .tf-chip.recording .tf-chip-dot {
   animation: tf-chip-recording-pulse 1s ease-in-out infinite;
 }
+.tf-chip.recording .tf-chip-dot::after {
+  box-shadow: 0 0 6px 3px currentColor;
+  animation: tf-chip-recording-glow 1s ease-in-out infinite;
+}
 @keyframes tf-chip-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 currentColor; }
-  50%      { box-shadow: 0 0 8px 2px currentColor; }
+  0%, 100% { opacity: 0; }
+  50%      { opacity: 1; }
 }
 @keyframes tf-chip-pending-pulse {
   0%, 100% { opacity: 1; }
   50%      { opacity: 0.5; }
 }
 @keyframes tf-chip-recording-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 currentColor; opacity: 1; }
-  50%      { box-shadow: 0 0 6px 3px currentColor; opacity: 0.85; }
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.85; }
+}
+@keyframes tf-chip-recording-glow {
+  0%, 100% { opacity: 0; }
+  50%      { opacity: 1; }
 }
 
 /* =============================================================================
@@ -3233,6 +3270,17 @@ tf-alert[hidden] { display: none; }
 /* SDK Alert action buttons (slotted by feedback-inline-renderer). */
 .tf-alert__actions { display: flex; gap: 8px; margin-top: 8px; }
 
+/* inline-actions: the slotted actions sit to the right of the text block and
+   drop below it when the row is too narrow for both. */
+.tf-alert.inline-actions .tf-alert-content {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+.tf-alert.inline-actions .tf-alert-text { flex: 1 1 220px; min-width: 0; }
+.tf-alert.inline-actions .tf-alert__actions { margin-top: 0; flex: 0 0 auto; }
+
 /* =============================================================================
    tf-progress-bar
    ============================================================================= */
@@ -4588,6 +4636,28 @@ tf-date-field .tf-input-wrap { position: relative; padding-right: 40px; }
   top: 50%;
   transform: translateY(-50%);
 }
+.tf-tooltip-wrap.block { display: block; }
+.tf-tooltip-bubble.align-start { left: 0; right: auto; transform: none; }
+.tf-tooltip-bubble.align-end { left: auto; right: 0; transform: none; }
+/* Rich bubble (a slot="content" child): wraps lines and carries a short
+   explanation instead of a one-word label. */
+.tf-tooltip-bubble.rich {
+  width: var(--tf-tooltip-width, 300px);
+  max-width: calc(100vw - 24px);
+  padding: 12px 14px;
+  white-space: normal;
+  text-align: left;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--tf-text-2);
+  border-color: var(--tf-border-hover, var(--tf-border));
+  border-radius: var(--tf-radius);
+  box-shadow: var(--tf-shadow-lg, var(--tf-shadow-sm));
+  letter-spacing: 0;
+  text-transform: none;
+  font-weight: 500;
+}
+.tf-tooltip-bubble.rich b { color: var(--tf-text); }
 .tf-tooltip-wrap:hover .tf-tooltip-bubble,
 .tf-tooltip-wrap.show .tf-tooltip-bubble {
   opacity: 1;
@@ -5076,6 +5146,26 @@ tf-file-input {
   font-weight: 600;
   color: var(--tf-accent-2);
 }
+
+/* variant="icon": a square ghost trigger that sits next to a text field. */
+tf-file-input[variant="icon"] { display: inline-block; width: auto; }
+.tf-file-input-dropzone.tf-file-input-icon {
+  width: 34px;
+  height: 34px;
+  min-height: 0;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--tf-radius-sm);
+  background: transparent;
+  color: var(--tf-text-2);
+}
+.tf-file-input-dropzone.tf-file-input-icon:hover {
+  background: var(--tf-bg-3);
+  border-color: var(--tf-border);
+  color: var(--tf-text);
+}
+.tf-file-input-icon .tf-file-input-label,
+.tf-file-input-icon .tf-file-input-display { display: none; }
 
 .tf-file-input-display {
   font-size: 12px;
@@ -9499,8 +9589,7 @@ tf-relation-graph {
 
 /* --- PdfViewer (0x060D) --- */
 .tf-pdf-viewer { border: 1px solid var(--tf-border); border-radius: var(--tf-radius-md, 6px); overflow: hidden; }
-.tf-pdf-viewer__object { display: block; width: 100%; height: 100%; }
-.tf-pdf-viewer__fallback { padding: var(--tf-space-md); text-align: center; color: var(--tf-text-3); }
+.tf-pdf-viewer__frame { display: block; width: 100%; height: 100%; border: 0; }
 .tf-pdf-viewer__blocked { padding: var(--tf-space-md); color: var(--tf-color-critical, #ef4444); text-align: center; }
 
 /* --- FpsCounter (0x060E) --- */
@@ -10392,6 +10481,10 @@ tf-diff[wrap] .tf-diff__body { overflow-x: hidden; }
   text-transform: none;
   letter-spacing: normal;
 }
+
+/* <tf-chip tag variant="outline">: a rectangular tag with a rounded corner, for
+   metadata rows under a message, instead of the fully round status pill. */
+tf-chip[tag] .tf-chip.tf-chip--outline { border-radius: 12px; padding: 2px 8px; }
 
 /* =============================================================================
    tf-badge — "hot" tone: the only solid fill, for "waiting on you" counters

@@ -23,21 +23,21 @@ const ola = { kind: 'external', id: 'x-ola' };
 const view = {
   at: '2026-09-30',
   units: [
-    { unit_id: 'unit-board', name: 'Zarząd', head_position_id: 'pos-ceo', deputy_head_position_ids: [] },
-    { unit_id: 'unit-it', name: 'Dział IT', head_position_id: 'pos-cto', deputy_head_position_ids: [] },
+    { unitId: 'unit-board', name: 'Zarząd', headPositionId: 'pos-ceo', deputyHeadPositionIds: [] },
+    { unitId: 'unit-it', name: 'Dział IT', headPositionId: 'pos-cto', deputyHeadPositionIds: [] },
   ],
   positions: [
-    { position_id: 'pos-dev', unit_id: 'unit-it', name: 'Programista', primary_parent_position_id: 'pos-cto', valid_from: '2026-09-15' },
-    { position_id: 'pos-cto', unit_id: 'unit-it', name: 'Dyrektor IT', primary_parent_position_id: 'pos-ceo', valid_from: '2025-01-01' },
-    { position_id: 'pos-ceo', unit_id: 'unit-board', name: 'Prezes', primary_parent_position_id: null, valid_from: '2024-01-01' },
-    { position_id: 'pos-qa', unit_id: 'unit-it', name: 'Tester', primary_parent_position_id: 'pos-cto', valid_from: '2025-06-01' },
-    { position_id: 'pos-ops', unit_id: 'unit-board', name: 'Asystent', primary_parent_position_id: 'pos-ceo', valid_from: '2026-01-01' },
+    { positionId: 'pos-dev', unitId: 'unit-it', name: 'Programista', primaryParentPositionId: 'pos-cto', validFrom: '2026-09-15' },
+    { positionId: 'pos-cto', unitId: 'unit-it', name: 'Dyrektor IT', primaryParentPositionId: 'pos-ceo', validFrom: '2025-01-01' },
+    { positionId: 'pos-ceo', unitId: 'unit-board', name: 'Prezes', primaryParentPositionId: null, validFrom: '2024-01-01' },
+    { positionId: 'pos-qa', unitId: 'unit-it', name: 'Tester', primaryParentPositionId: 'pos-cto', validFrom: '2025-06-01' },
+    { positionId: 'pos-ops', unitId: 'unit-board', name: 'Asystent', primaryParentPositionId: 'pos-ceo', validFrom: '2026-01-01' },
   ],
   assignments: [
-    { id: 'a-ceo', position_id: 'pos-ceo', subject: anna, display_name: 'Anna Nowak', share: 1, assignment_type: 'permanent', is_primary: true, valid_from: '2024-01-01' },
-    { id: 'a-cto', position_id: 'pos-cto', subject: jan, display_name: 'Jan Żółć', share: 1, assignment_type: 'permanent', is_primary: true, valid_from: '2025-01-01' },
-    { id: 'a-qa', position_id: 'pos-qa', subject: ola, display_name: 'Ola Kowal', share: 0.5, assignment_type: 'contractor', is_primary: true, valid_from: '2025-06-01' },
-    { id: 'a-dev', position_id: 'pos-dev', subject: jan, display_name: 'Jan Żółć', share: 0.25, assignment_type: 'acting', is_primary: false, valid_from: '2026-09-20' },
+    { id: 'a-ceo', positionId: 'pos-ceo', subject: anna, displayName: 'Anna Nowak', share: 1, assignmentType: 'permanent', isPrimary: true, validFrom: '2024-01-01' },
+    { id: 'a-cto', positionId: 'pos-cto', subject: jan, displayName: 'Jan Żółć', share: 1, assignmentType: 'permanent', isPrimary: true, validFrom: '2025-01-01' },
+    { id: 'a-qa', positionId: 'pos-qa', subject: ola, displayName: 'Ola Kowal', share: 0.5, assignmentType: 'contractor', isPrimary: true, validFrom: '2025-06-01' },
+    { id: 'a-dev', positionId: 'pos-dev', subject: jan, displayName: 'Jan Żółć', share: 0.25, assignmentType: 'acting', isPrimary: false, validFrom: '2026-09-20' },
   ],
   vacancies: ['pos-ops'],
 };
@@ -82,8 +82,8 @@ test('a cycle without a root is still listed rather than dropped', () => {
   const looped = {
     ...view,
     positions: [
-      { position_id: 'p1', unit_id: 'unit-it', name: 'Jeden', primary_parent_position_id: 'p2', valid_from: '2026-01-01' },
-      { position_id: 'p2', unit_id: 'unit-it', name: 'Dwa', primary_parent_position_id: 'p1', valid_from: '2026-01-01' },
+      { positionId: 'p1', unitId: 'unit-it', name: 'Jeden', primaryParentPositionId: 'p2', validFrom: '2026-01-01' },
+      { positionId: 'p2', unitId: 'unit-it', name: 'Dwa', primaryParentPositionId: 'p1', validFrom: '2026-01-01' },
     ],
     assignments: [],
   };
@@ -145,7 +145,7 @@ test('ending an assignment says what happens to the position, the unit, the repo
 });
 
 test('a position with a second holder does not become vacant when one of them leaves', () => {
-  const two = [...view.assignments, { id: 'a-cto2', position_id: 'pos-cto', subject: anna, display_name: 'Anna Nowak', share: 0.5, assignment_type: 'permanent', is_primary: false, valid_from: '2026-01-01' }];
+  const two = [...view.assignments, { id: 'a-cto2', positionId: 'pos-cto', subject: anna, displayName: 'Anna Nowak', share: 0.5, assignmentType: 'permanent', isPrimary: false, validFrom: '2026-01-01' }];
   const both = listRows({ ...view, assignments: two }, t);
   const keys = endConsequences(both.find((r) => r._id === 'a-cto'), { ...view, assignments: two }, both).map((c) => c.key);
   assert.equal(keys.includes('becomes_vacant'), false);

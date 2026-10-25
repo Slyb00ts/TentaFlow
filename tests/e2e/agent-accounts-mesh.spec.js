@@ -304,7 +304,7 @@ async function openRuntimeSegment(page) {
 }
 
 /// The answering node's own row. `node_catalog` puts the local node first, so
-/// the matrix on node X describes X in `nodes[0]`, and `is_local` says so.
+/// the matrix on node X describes X in `nodes[0]`, and `isLocal` says so.
 async function localRow(page) {
   const runtime = await api(page, 'providerAccountRuntimeListRequest', {});
   return runtime.nodes[0];
@@ -317,7 +317,7 @@ async function localRow(page) {
 /// the refusal this suite is looking for.
 async function toggleLocalReceives(page) {
   const local = await localRow(page);
-  if (local?.is_local !== true) throw new Error('the first row of the matrix is not the local node');
+  if (local?.isLocal !== true) throw new Error('the first row of the matrix is not the local node');
   await page.locator('#aa-runtime-table').evaluate((table) => {
     // tf-toggle listens on the span it builds, not on the host.
     table.shadowRoot.querySelector('tf-toggle .tf-toggle').click();
@@ -339,10 +339,10 @@ async function toggleLocalReceives(page) {
 async function setLocalReceives(page, enabled, { peerDb, peerNodeId } = {}) {
   await openRuntimeSegment(page);
   const local = await localRow(page);
-  if (local?.is_local !== true) throw new Error('the first row of the matrix is not the local node');
-  if (local.receives_accounts !== enabled) {
+  if (local?.isLocal !== true) throw new Error('the first row of the matrix is not the local node');
+  if (local.receivesAccounts !== enabled) {
     await toggleLocalReceives(page);
-    await poll(async () => ((await localRow(page)).receives_accounts === enabled ? true : null), {
+    await poll(async () => ((await localRow(page)).receivesAccounts === enabled ? true : null), {
       timeoutMs: 30_000,
       what: `the local receives-accounts switch to read ${enabled}`,
     });
@@ -514,8 +514,8 @@ test.describe('Agent accounts across two real mesh nodes', () => {
 
     const identityA = await api(pageA, 'meshIdentityRequest');
     const identityB = await api(pageB, 'meshIdentityRequest');
-    aId = String(identityA?.nodeId ?? identityA?.node_id ?? '');
-    bId = String(identityB?.nodeId ?? identityB?.node_id ?? '');
+    aId = String(identityA?.nodeId ?? '');
+    bId = String(identityB?.nodeId ?? '');
     expect(aId, 'the dashboard node has no mesh identity').toHaveLength(64);
     expect(bId, 'the peer node has no mesh identity').toHaveLength(64);
 
@@ -524,7 +524,7 @@ test.describe('Agent accounts across two real mesh nodes', () => {
     await poll(
       async () => {
         const list = await api(pageA, 'meshNodeListRequest');
-        const ids = (list?.nodes ?? []).map((n) => String(n?.nodeId ?? n?.node_id ?? ''));
+        const ids = (list?.nodes ?? []).map((n) => String(n?.nodeId ?? ''));
         return ids.includes(bId) ? ids : null;
       },
       { timeoutMs: 90_000, what: `node ${bId.slice(0, 12)} to be discovered by node A` },
@@ -547,14 +547,14 @@ test.describe('Agent accounts across two real mesh nodes', () => {
       async () => {
         const body = await api(pageB, 'meshPendingListRequest');
         return (
-          (body?.pending ?? []).find((p) => String(p.remoteNodeId ?? p.remote_node_id) === aId) ?? null
+          (body?.pending ?? []).find((p) => String(p.remoteNodeId) === aId) ?? null
         );
       },
       { timeoutMs: 90_000, what: 'the pending pairing to reach node B' },
     );
 
     const confirmed = await api(pageB, 'meshPairingConfirmRequest', {
-      pairId: String(pending.remoteNodeId ?? pending.remote_node_id),
+      pairId: String(pending.remoteNodeId),
       pin,
     });
     expect(confirmed?.ok, 'the confirming node reported the pairing as done').toBe(true);
@@ -570,7 +570,7 @@ test.describe('Agent accounts across two real mesh nodes', () => {
       await poll(
         async () => {
           const body = await api(page, 'meshTrustedListRequest');
-          const trusted = (body?.trusted ?? []).map((n) => String(n?.nodeId ?? n?.node_id ?? ''));
+          const trusted = (body?.trusted ?? []).map((n) => String(n?.nodeId ?? ''));
           return trusted.includes(wanted) ? trusted : null;
         },
         { timeoutMs: 90_000, what: `node ${wanted.slice(0, 12)} to become trusted on node ${other}` },
@@ -593,7 +593,7 @@ test.describe('Agent accounts across two real mesh nodes', () => {
     // The operator's decision, taken on each node's own N01 matrix.
     await openRuntimeSegment(pageA);
     await toggleLocalReceives(pageA);
-    await poll(async () => ((await localRow(pageA)).receives_accounts === true ? true : null), {
+    await poll(async () => ((await localRow(pageA)).receivesAccounts === true ? true : null), {
       timeoutMs: 30_000,
       what: 'node A to accept accounts',
     });
@@ -601,7 +601,7 @@ test.describe('Agent accounts across two real mesh nodes', () => {
 
     await openRuntimeSegment(pageB);
     await toggleLocalReceives(pageB);
-    await poll(async () => ((await localRow(pageB)).receives_accounts === true ? true : null), {
+    await poll(async () => ((await localRow(pageB)).receivesAccounts === true ? true : null), {
       timeoutMs: 30_000,
       what: 'node B to accept accounts',
     });
@@ -681,8 +681,8 @@ test.describe('Agent accounts across two real mesh nodes', () => {
     // On the wire, from the satellite's own node: the account is in its catalog
     // and its home is still A.
     const wireB = await accountAfterReload(pageB, acc1);
-    expect(wireB.account_id).toBe(acc1);
-    expect(wireB.home_node_id).toBe(aId);
+    expect(wireB.accountId).toBe(acc1);
+    expect(wireB.homeNodeId).toBe(aId);
 
     // THE HONEST BOUNDARY of this item. `provider_account_node_state` is written
     // only by a bridge-backed materialization, and this node has no engine
@@ -696,9 +696,9 @@ test.describe('Agent accounts across two real mesh nodes', () => {
       'no bridge ran here, so no node-state row may exist for the delivered credential',
     ).toHaveLength(0);
     const rowB = await localRow(pageB);
-    expect(rowB.node_id).toBe(bId);
-    expect(rowB.is_local, "the matrix row describes the node that answered").toBe(true);
-    expect(rowB.account_count, 'the materialized count reads zero').toBe(0);
+    expect(rowB.nodeId).toBe(bId);
+    expect(rowB.isLocal, "the matrix row describes the node that answered").toBe(true);
+    expect(rowB.accountCount, 'the materialized count reads zero').toBe(0);
     await openRuntimeSegment(pageB);
     expect(
       await tableText(pageB, '#aa-runtime-table'),
@@ -722,7 +722,7 @@ test.describe('Agent accounts across two real mesh nodes', () => {
 
     await openRuntimeSegment(pageB);
     await toggleLocalReceives(pageB);
-    await poll(async () => ((await localRow(pageB)).receives_accounts === false ? true : null), {
+    await poll(async () => ((await localRow(pageB)).receivesAccounts === false ? true : null), {
       timeoutMs: 30_000,
       what: 'node B to stop accepting accounts',
     });
@@ -1158,9 +1158,9 @@ test.describe('Agent accounts across two real mesh nodes', () => {
 
     // And on the wire, from BOTH nodes: the home is B.
     const wireB = await accountAfterReload(pageB, acc1);
-    expect(wireB.home_node_id).toBe(bId);
+    expect(wireB.homeNodeId).toBe(bId);
     const wireA = await accountAfterReload(pageA, acc1);
-    expect(wireA.home_node_id).toBe(bId);
+    expect(wireA.homeNodeId).toBe(bId);
 
     await pageA.close();
     await pageB.close();
@@ -1189,7 +1189,7 @@ test.describe('Agent accounts across two real mesh nodes', () => {
     ).toBe(true);
 
     const before = await localRow(pageB);
-    expect(before.receives_accounts, 'precondition: the switch is on').toBe(true);
+    expect(before.receivesAccounts, 'precondition: the switch is on').toBe(true);
     const decisionsBefore = auditDetails(B_DB, 'agent_runtime.receives_accounts', bId).length;
 
     await openRuntimeSegment(pageB);

@@ -443,8 +443,7 @@ pub fn local_op_count() -> usize {
     match SYNC_RUNTIME.get() {
         Some(runtime) => runtime
             .ledger
-            .list_all_operations()
-            .map(|ops| ops.len())
+            .count_operations()
             .unwrap_or(0),
         None => 0,
     }
@@ -536,6 +535,12 @@ pub fn run_pending_environment_change_resume() -> LedgerResult<Option<usize>> {
 /// When the runtime is not initialized (in-process unit tests that exercise the
 /// pure SQLite import with two bare `DbPool`s), this is a no-op: the SQLite
 /// transaction is already committed and fully testable on its own.
+/// True once the process-wide sync runtime exists; adopt steps that would
+/// otherwise silently no-op must wait for it.
+pub fn sync_runtime_ready() -> bool {
+    SYNC_RUNTIME.get().is_some()
+}
+
 pub fn adopt_donor_baseline_epoch(donor_epoch: &BaselineEpoch) -> LedgerResult<()> {
     let Some(runtime) = SYNC_RUNTIME.get() else {
         return Ok(());
@@ -803,6 +808,23 @@ pub fn build_repair_pull_payloads_for_peer(
     runtime.build_repair_pull_payloads_for_peer(peer_id, max_partitions, operation_limit)
 }
 
+/// Opens a repair pull for every author chain `peer_id` may hold beyond our
+/// frontier (the peer's own chain and every other trusted node's).
+pub fn queue_anti_entropy_repairs(
+    peer_id: &str,
+    authors: &std::collections::HashSet<String>,
+) {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return;
+    };
+    for author in authors.iter().filter(|a| **a != runtime.local_node_id) {
+        match runtime.initial_node_frontier(author) {
+            Ok((expected, _)) => runtime.queue_repair_request(peer_id, author, expected),
+            Err(e) => warn!("sync runtime: anti-entropy frontier read failed: {}", e),
+        }
+    }
+}
+
 pub fn handle_snapshot_response_payload(
     source_node_id: &str,
     payload: MeshSyncSnapshotResponsePayload,
@@ -823,6 +845,19 @@ pub fn build_sql_snapshot_package(
         return Ok(None);
     };
     runtime.build_sql_snapshot_package(partition_id, up_to_sequence)
+}
+
+static PUSH_WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Asks the sync repair scheduler to run a push/repair round now. Wake-ups that
+/// arrive while a round runs coalesce into one more round.
+pub fn wake_push_scheduler() {
+    PUSH_WAKE.notify_one();
+}
+
+/// Resolves when `wake_push_scheduler` was called since the last wait.
+pub async fn push_scheduler_woken() {
+    PUSH_WAKE.notified().await;
 }
 
 pub fn apply_unapplied_inbox(limit: usize) -> LedgerResult<Option<usize>> {
@@ -1038,6 +1073,11 @@ impl SyncRuntime {
     /// after the baseline-adopt import transaction has committed.
     fn adopt_donor_baseline_epoch(&self, donor_epoch: &BaselineEpoch) -> LedgerResult<()> {
         self.ledger.set_epoch(donor_epoch.clone())?;
+        // Wipe first, reseed after: a write that reached the ledger before the
+        // wipe is still in SQLite and is restated by the reseed, while the other
+        // order lets such an op be wiped after its capture was marked ledgered.
+        // A reseed failure leaves the adopt phase at `Imported`, which
+        // `resume_imported_adopt` retries — the rows are still in SQLite.
         self.ledger.reset_core_partitions()?;
         crate::sync::core_capture::clear_core_capture_journal(&self.db)
             .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
@@ -1233,10 +1273,12 @@ impl SyncRuntime {
             .list_due_repair_requests(peer.clone(), now, max_partitions)?;
         let mut payloads = Vec::new();
         for request in requests {
+            // Never re-request a window the frontier already passed.
+            let (expected, _) = self.initial_node_frontier(&request.target_node_id)?;
             payloads.push(MeshSyncPullPayload {
                 from_node_id: self.local_node_id.clone(),
                 target_node_id: request.target_node_id.clone(),
-                from_node_seq: request.from_node_seq,
+                from_node_seq: request.from_node_seq.max(expected),
                 limit: operation_limit,
             });
             let retry_count = request.retry_count.saturating_add(1);
@@ -1292,8 +1334,7 @@ impl SyncRuntime {
             }
             match SyncTarget::new(target.node_id) {
                 Ok(sync_target) => {
-                    self.reset_push_backoff(sync_target.as_str());
-                    self.ledger.put_in_outbox(sync_target, op_id)?;
+                    self.enqueue_outbox(sync_target, op_id)?;
                     queued += 1;
                 }
                 Err(e) => warn!("sync runtime: pominieto niepoprawny target outbox: {}", e),
@@ -1369,8 +1410,7 @@ impl SyncRuntime {
             }
             match SyncTarget::new(target.node_id) {
                 Ok(sync_target) => {
-                    self.reset_push_backoff(sync_target.as_str());
-                    self.ledger.put_in_outbox(sync_target, op_id)?;
+                    self.enqueue_outbox(sync_target, op_id)?;
                     queued += 1;
                 }
                 Err(e) => warn!("sync runtime: pominieto niepoprawny target outbox: {}", e),
@@ -1414,8 +1454,7 @@ impl SyncRuntime {
             }
             match SyncTarget::new(node_id.clone()) {
                 Ok(sync_target) => {
-                    self.reset_push_backoff(sync_target.as_str());
-                    self.ledger.put_in_outbox(sync_target, op_id)?;
+                    self.enqueue_outbox(sync_target, op_id)?;
                     queued += 1;
                 }
                 Err(e) => warn!("sync runtime: pominieto niepoprawny target outbox: {}", e),
@@ -1663,11 +1702,19 @@ impl SyncRuntime {
         Ok(target_node_ids)
     }
 
-    /// Clears a target's push backoff so a freshly queued op ships on the next
-    /// tick instead of waiting out a previously-set retry deadline. Called from
-    /// the outbox enqueue paths.
+    /// Clears a target's push backoff so queued work ships on the next push
+    /// instead of waiting out a previously-set retry deadline.
     fn reset_push_backoff(&self, target_node_id: &str) {
         self.push_state.retry_after_ms.lock().remove(target_node_id);
+    }
+
+    /// Queues an op for a target and wakes the push scheduler, so a fresh write
+    /// leaves within the debounce window instead of waiting for the next tick.
+    fn enqueue_outbox(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()> {
+        self.ledger.put_in_outbox(target.clone(), op_id)?;
+        self.reset_push_backoff(target.as_str());
+        wake_push_scheduler();
+        Ok(())
     }
 
     /// Re-enqueues already-minted operations to receivers that gained access AFTER
@@ -1685,8 +1732,9 @@ impl SyncRuntime {
     /// enumerates orgs from the cheap `organizations` table and compares each org's
     /// permission epoch against its backfill marker. When NO org advanced (the common
     /// case on every 5s tick) this returns early after `O(orgs)` marker reads, WITHOUT
-    /// a full ledger scan or any CBOR decode. The ledger is only scanned after a real
-    /// grant moved at least one org's epoch.
+    /// the ledger. After a real grant moved an org's epoch the walk reads persisted
+    /// operation summaries (`list_operation_summaries`), decoding only operations
+    /// not summarised before.
     /// Re-enqueue is idempotent: `put_in_outbox` is keyed by `(target, op_id)`, and
     /// we skip targets that already hold the op, so a redelivered grant is a no-op.
     fn backfill_outbox_for_permission_grants(&self) -> LedgerResult<usize> {
@@ -1714,47 +1762,41 @@ impl SyncRuntime {
             return Ok(0);
         }
 
-        // At least one org advanced: now the (rarely paid) ledger scan is justified.
-        // The `operations` keyspace is keyed by op_id, not org, so per-org filtering
-        // still requires decoding each op; we restrict work to advanced orgs below.
-        let operations = self.ledger.list_all_operations()?;
-        if operations.is_empty() {
-            return Ok(0);
-        }
-
+        // At least one org advanced: walk the persisted per-operation summaries.
+        // A grant can newly permit ANY older op of the org, so every op of an
+        // advanced org is re-evaluated, but the walk only decodes operations the
+        // summary cache has not seen yet.
+        let summaries = self.ledger.list_operation_summaries()?;
         let mut enqueued = 0usize;
-        for operation in &operations {
-            if !advanced_orgs.contains(&operation.body.org_id) {
+        for summary in &summaries {
+            if !advanced_orgs.contains(&summary.org_id) {
                 continue;
             }
             // Reverse the SAME gate the mint-time fan-out uses, so a target is only
             // backfilled for ops it is NOW genuinely permitted to receive.
-            let targets = repository::list_sync_targets_for_resource(
-                &self.db,
-                &operation.body.org_id,
-                &operation.body.addon_id,
-                &operation.body.resource_type,
-                &operation.body.resource_id,
-            )
-            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+            let targets = self.cached_sync_targets_for_resource(
+                &summary.org_id,
+                &summary.addon_id,
+                &summary.resource_type,
+                &summary.resource_id,
+            )?;
             if targets.is_empty() {
                 continue;
             }
-            let existing = self.ledger.list_outbox_for_operation(operation.op_id)?;
+            let existing = self.ledger.list_outbox_for_operation(summary.op_id)?;
             for target in targets {
-                if target.node_id == self.local_node_id {
+                if target == self.local_node_id {
                     continue;
                 }
                 if existing
                     .iter()
-                    .any(|entry| entry.target.as_str() == target.node_id)
+                    .any(|entry| entry.target.as_str() == target)
                 {
                     continue;
                 }
-                match SyncTarget::new(target.node_id) {
+                match SyncTarget::new(target) {
                     Ok(sync_target) => {
-                        self.reset_push_backoff(sync_target.as_str());
-                        self.ledger.put_in_outbox(sync_target, operation.op_id)?;
+                        self.enqueue_outbox(sync_target, summary.op_id)?;
                         enqueued += 1;
                     }
                     Err(e) => warn!("sync runtime: backfill skipping invalid target: {}", e),
@@ -1764,17 +1806,8 @@ impl SyncRuntime {
             // receive its package bytes; the bare blob ops carry no permission of
             // their own and are skipped by the resource gate above, so couple them
             // to the instance's freshly-granted targets here.
-            if operation.body.resource_type == "core.addon_instance" {
-                if let (Some(package_id), Some(version)) = (
-                    changed_field_string(&operation.body.changed_fields, "package_id"),
-                    changed_field_string(&operation.body.changed_fields, "package_version"),
-                ) {
-                    enqueued += self.queue_addon_package_blob(
-                        &operation.body.org_id,
-                        &package_id,
-                        &version,
-                    )?;
-                }
+            if let Some((package_id, version)) = &summary.addon_package {
+                enqueued += self.queue_addon_package_blob(&summary.org_id, package_id, version)?;
             }
         }
 
@@ -1828,6 +1861,7 @@ impl SyncRuntime {
             )));
         }
         let target = SyncTarget::new(source_node_id.to_string())?;
+        let acknowledged = !payload.operation_ids.is_empty();
         for op_id in payload.operation_ids {
             match self
                 .ledger
@@ -1837,6 +1871,13 @@ impl SyncRuntime {
                 Err(SyncLedgerError::OutboxEntryNotFound { .. }) => {}
                 Err(e) => return Err(e),
             }
+        }
+        // An ACK proves the peer is alive and keeping up, so the backoff armed by
+        // the batch it answered no longer applies: ship the next slice of the
+        // backlog right away instead of after a doubling delay.
+        if acknowledged {
+            self.reset_push_backoff(target.as_str());
+            wake_push_scheduler();
         }
         Ok(())
     }
@@ -2743,6 +2784,7 @@ impl SyncRuntime {
         if let Err(e) = self.ledger.upsert_repair_request(entry) {
             warn!("sync runtime: repair request persist failed: {}", e);
         }
+        wake_push_scheduler();
     }
 
     fn clear_repair_request(&self, peer_id: &str, target_node_id: &str) {
@@ -2754,6 +2796,7 @@ impl SyncRuntime {
     }
 
     fn apply_unapplied_inbox(&self, limit: usize) -> LedgerResult<usize> {
+        let drain_started = std::time::Instant::now();
         let mut applied = 0usize;
         // Addon-instance reconciles are deferred until AFTER the drain loop (and
         // deduped) so heavy runtime work (wasmtime load, SQL migrations, flow
@@ -2927,9 +2970,15 @@ impl SyncRuntime {
         for ((source, op_id), context) in deferred_this_drain {
             self.escalate_or_defer_inbox_entry(source, op_id, context)?;
         }
+        // Something applied, so a prerequisite an exhausted entry waited for may
+        // have just landed: give those entries a fresh budget.
+        if applied > 0 {
+            self.ledger.reopen_ordering_exhausted()?;
+        }
         // Run deferred addon reconciles once, after all ops in this batch are
         // applied. Idempotent ("make runtime match DB"); a later op for the same
         // addon will reconcile again on the next drain.
+        let reconcile_started = std::time::Instant::now();
         if !pending_addon_reconciles.is_empty() {
             if let Some(reconciler) = self.addon_reconciler.read().clone() {
                 for addon_id in &pending_addon_reconciles {
@@ -2937,6 +2986,7 @@ impl SyncRuntime {
                 }
             }
         }
+        let reconcile_elapsed = reconcile_started.elapsed();
         // Drop cached vector backends for addons whose config was replicated, so
         // the next access rebuilds against the new `__vector_config`.
         for addon_id in &pending_config_invalidations {
@@ -2988,6 +3038,19 @@ impl SyncRuntime {
                 }
                 Err(e) => warn!("sync runtime: rozpakowanie pakietu '{blob_id}': {e}"),
             }
+        }
+        // A drain runs on the mesh event loop, so a slow one delays every message
+        // behind it; the split shows whether the time went to applying or to the
+        // addon runtime reconcile.
+        let drain_elapsed = drain_started.elapsed();
+        if drain_elapsed >= SLOW_DRAIN_WARN {
+            warn!(
+                applied,
+                reconciled_addons = pending_addon_reconciles.len(),
+                reconcile_ms = reconcile_elapsed.as_millis() as u64,
+                total_ms = drain_elapsed.as_millis() as u64,
+                "sync runtime: slow inbox drain"
+            );
         }
         Ok(applied)
     }
@@ -3081,7 +3144,17 @@ impl SyncRuntime {
             return Ok(());
         }
         // Prerequisite never arrived after the bounded number of drains: surface it
-        // as a terminal conflict so it stops being retried forever.
+        // as a terminal conflict so it stops being retried forever. A reopened
+        // entry that exhausts again is the same conflict, so only the first
+        // exhaustion is recorded and logged.
+        let reopen_cycles_used = self.ledger.mark_inbox_ordering_exhausted(
+            source.clone(),
+            op_id,
+            context.message.clone(),
+        )?;
+        if reopen_cycles_used > 0 {
+            return Ok(());
+        }
         if let Some(capture) = &context.capture {
             let storage_error = crate::addon::storage_sql_exec::StorageSqlError::OrderingGap(
                 context.message.clone(),
@@ -3094,8 +3167,6 @@ impl SyncRuntime {
             )
             .map_err(|record_error| SyncLedgerError::Runtime(record_error.to_string()))?;
         }
-        self.ledger
-            .mark_inbox_conflicted(source.clone(), op_id, context.message.clone())?;
         // context.message can embed raw rusqlite text (e.g. OrderingGap FK detail);
         // keep it out of tracing. Full detail still reaches the addon conflict
         // table and the ledger conflict_message above.
@@ -4255,6 +4326,8 @@ fn operation_id_from_wire(bytes: &[u8]) -> LedgerResult<OperationId> {
         })?;
     Ok(OperationId::from_hash(hash))
 }
+
+const SLOW_DRAIN_WARN: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn repair_backoff_ms(retry_count: u32) -> i64 {
     let shift = retry_count.min(6);
@@ -6420,7 +6493,12 @@ mod tests {
                     .runtime
                     .ledger
                     .list_outbox_for_operation(
-                        source.runtime.ledger.list_all_operations().expect("ops")[0].op_id
+                        source
+                            .runtime
+                            .ledger
+                            .list_operation_summaries()
+                            .expect("ops")[0]
+                            .op_id
                     )
                     .expect("outbox")
                     .is_empty(),
@@ -8325,6 +8403,185 @@ mod tests {
                 "escalation must record an operator conflict"
             );
             assert_eq!(conflicts[0].resource_id, "person-1");
+        });
+    }
+
+    #[test]
+    fn orphaned_update_ends_as_one_final_conflict_after_its_reopen_cycles() {
+        with_tmp_home(|| {
+            let source = make_runtime(101);
+            let mut receiver = make_runtime(102);
+            receiver.runtime.max_inbox_defer_attempts = 2;
+            let addon_id = "sync-addon-sql-reopen-cycles";
+            for db in [&source.runtime.db, &receiver.runtime.db] {
+                seed_authority_target(db, addon_id, &receiver.runtime.local_node_id);
+            }
+            open_contacts_table(addon_id);
+
+            let peer = PeerId::new(source.runtime.local_node_id.clone()).expect("peer");
+            let mut ghost = update_capture(addon_id, "ghost", "Ghost");
+            ghost.params[1] = JsonValue::from(999);
+            let orphan = addon_sql_operation(&source, ghost);
+            receiver
+                .runtime
+                .ledger
+                .put_verified_in_inbox(peer.clone(), orphan.clone(), &HexNodeIdOperationVerifier)
+                .expect("inbox orphan");
+
+            // Every drain that applies something reopens exhausted entries, so a
+            // stream of unrelated writes keeps handing the orphan a fresh budget.
+            // The budget of reopens is bounded: the entry must settle as a final
+            // conflict instead of cycling for as long as writes keep arriving.
+            let mut drains = 0;
+            let entry = loop {
+                drains += 1;
+                assert!(drains < 40, "the orphan never settled");
+                let mut row = capture(addon_id, &format!("filler-{drains}"), "Filler");
+                row.params[0] = JsonValue::from(drains);
+                let filler = addon_sql_operation(&source, row);
+                receiver
+                    .runtime
+                    .ledger
+                    .put_verified_in_inbox(peer.clone(), filler, &HexNodeIdOperationVerifier)
+                    .expect("inbox filler");
+                assert_eq!(
+                    receiver.runtime.apply_unapplied_inbox(128).expect("drain"),
+                    1,
+                    "only the filler applies (drain {drains})"
+                );
+                let entry = receiver
+                    .runtime
+                    .ledger
+                    .get_inbox_entry(peer.clone(), orphan.op_id)
+                    .expect("orphan entry");
+                if entry.conflicted && !entry.ordering_exhausted {
+                    break entry;
+                }
+            };
+            assert_eq!(entry.reopen_cycles, 3);
+            assert!(!entry.applied);
+
+            let conflicts = crate::addon::storage_sql_exec::list_sync_conflicts(
+                "org-default",
+                addon_id,
+                Some("open"),
+                10,
+            )
+            .expect("conflicts");
+            assert_eq!(
+                conflicts.len(),
+                1,
+                "reopen cycles must not record the same conflict again"
+            );
+
+            // Settled for good: later applying drains leave it alone.
+            let mut row = capture(addon_id, "filler-last", "Last");
+            row.params[0] = JsonValue::from(1000);
+            let filler = addon_sql_operation(&source, row);
+            receiver
+                .runtime
+                .ledger
+                .put_verified_in_inbox(peer.clone(), filler, &HexNodeIdOperationVerifier)
+                .expect("inbox last filler");
+            receiver.runtime.apply_unapplied_inbox(128).expect("drain");
+            let after = receiver
+                .runtime
+                .ledger
+                .get_inbox_entry(peer, orphan.op_id)
+                .expect("orphan entry");
+            assert!(after.conflicted && !after.ordering_exhausted);
+            assert_eq!(after.reopen_cycles, 3);
+        });
+    }
+
+    #[test]
+    fn replaced_repair_window_still_pulls_the_missing_range() {
+        with_tmp_home(|| {
+            let source = make_runtime(103);
+            let receiver = make_runtime(104);
+            for db in [&source.runtime.db, &receiver.runtime.db] {
+                seed_core_authority_target(db, "core.flow", &receiver.runtime.local_node_id);
+            }
+            let mut ops = vec![source
+                .runtime
+                .record_core_capture(complete_core_flow_capture("103", "Window Flow"))
+                .expect("insert")];
+            for n in 0..5 {
+                ops.push(
+                    source
+                        .runtime
+                        .record_core_capture(core_flow_update_capture("103", &format!("Rev {n}")))
+                        .expect("update"),
+                );
+            }
+            let author = source.runtime.local_node_id.clone();
+            let wire = |index: usize| {
+                let operation = source
+                    .runtime
+                    .ledger
+                    .get_operation(ops[index].op_id)
+                    .expect("operation");
+                operation_to_wire(&operation).expect("wire")
+            };
+            let response = |from_node_seq: u64, indexes: &[usize]| MeshSyncPullResponsePayload {
+                from_node_id: author.clone(),
+                target_node_id: author.clone(),
+                from_node_seq,
+                operations: indexes.iter().map(|&i| wire(i)).collect(),
+                serving_floor_node_seq: 1,
+                serving_tip_node_seq: 6,
+            };
+            let frontier = || {
+                receiver
+                    .runtime
+                    .initial_node_frontier(&author)
+                    .expect("frontier")
+                    .0
+            };
+
+            // The tip arrives alone: window 1 is opened.
+            receiver
+                .runtime
+                .handle_pull_response_payload(&author, response(6, &[5]))
+                .expect("gap push");
+            // A partial answer lands (1, 2) and replaces the window with one that
+            // starts at the new frontier.
+            receiver
+                .runtime
+                .handle_pull_response_payload(&author, response(1, &[0, 1]))
+                .expect("partial answer");
+            assert_eq!(frontier(), 3);
+
+            let pulls = receiver
+                .runtime
+                .build_repair_pull_payloads_for_peer(&author, 8, 64)
+                .expect("repair pulls");
+            assert_eq!(pulls.len(), 1, "one window per (peer, author)");
+            assert_eq!(
+                pulls[0].from_node_seq, 3,
+                "the replaced window must still ask for the range that is missing"
+            );
+
+            let MeshSyncPullResult::Operations(payload) = source
+                .runtime
+                .handle_pull_payload(&receiver.runtime.local_node_id, pulls[0].clone())
+                .expect("serve repair")
+            else {
+                panic!("expected operations");
+            };
+            receiver
+                .runtime
+                .handle_pull_response_payload(&author, payload)
+                .expect("closing answer");
+            assert_eq!(frontier(), 7);
+            assert!(
+                receiver
+                    .runtime
+                    .build_repair_pull_payloads_for_peer(&author, 8, 64)
+                    .expect("no repair left")
+                    .is_empty(),
+                "a closed gap leaves no request behind"
+            );
         });
     }
 

@@ -161,7 +161,7 @@ const BenchmarkStudioScreen = {
     try { state.me = await ApiBinary.one('authMeRequest'); } catch { state.me = null; }
     const root = byId('bench-root');
     if (!root) return;
-    if (!state.me || (state.me.role !== 'admin' && !state.me.isAdmin)) {
+    if (!state.me || (state.me.role !== 'admin')) {
       root.innerHTML = `<div class="section-card"><p>${escapeHtml(T('admin_only'))}</p></div>`;
       return;
     }
@@ -384,8 +384,8 @@ async function goWizard(benchmarkId) {
       ApiBinary.list('serviceListRequest', { arrayKey: 'services' }),
       ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
     ]);
-    const localNode = (nodes || []).find((n) => n.is_local || n.isLocal);
-    state.localNodeId = String(localNode?.node_id || localNode?.nodeId || '');
+    const localNode = (nodes || []).find((n) => n.isLocal);
+    state.localNodeId = String(localNode?.nodeId || '');
     state.meshServices = (Array.isArray(services) ? services : [])
       .filter((s) => serviceChatModels(s).length > 0);
   } catch { state.meshServices = []; }
@@ -591,7 +591,7 @@ function defaultServiceModel(s) {
 // node'a, ktorego endpoint jest adresem PETLI ZWROTNEJ tamtego hosta) idzie
 // przez runtime executor: ta sama metoda stemplowania czasu, zero HTTP z zewnatrz.
 function serviceApiType(s) {
-  const nodeId = String(s.nodeId || s.node_id || '');
+  const nodeId = String(s.nodeId || '');
   const isLocalNode = !state.localNodeId || !nodeId || nodeId === state.localNodeId;
   const httpDirect = (s.transport || '').toLowerCase() === 'http_direct';
   const endpoint = s.endpointUrl || '';
@@ -1063,7 +1063,7 @@ function appendRunLog(line) {
 }
 
 function onRunChunk(body) {
-  if (!body || body.variant !== 'BenchmarkRunStreamChunk') return;
+  if (!body || body._variant !== 'BenchmarkBody.RunStreamChunk') return;
   if (body.runId && body.runId !== state.runId) return;
   const ts = body.tsMs ? new Date(body.tsMs).toLocaleTimeString(lang()) : '';
   if (body.kind === 'progress') {

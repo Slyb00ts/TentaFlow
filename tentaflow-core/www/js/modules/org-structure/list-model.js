@@ -23,8 +23,8 @@ export const DEFAULT_CHANGES_DAYS = 30;
 function positionHolders(view) {
   const holders = new Map();
   for (const assignment of view.assignments ?? []) {
-    if (!holders.has(assignment.position_id)) holders.set(assignment.position_id, []);
-    holders.get(assignment.position_id).push(assignment);
+    if (!holders.has(assignment.positionId)) holders.set(assignment.positionId, []);
+    holders.get(assignment.positionId).push(assignment);
   }
   return holders;
 }
@@ -33,13 +33,13 @@ function positionHolders(view) {
 // command is data and a pathological one must not exhaust the call stack.
 function orderedPositions(view, unitName) {
   const positions = view.positions ?? [];
-  const ids = new Set(positions.map((p) => p.position_id));
-  const byName = (a, b) => (unitName.get(a.unit_id) ?? '').localeCompare(unitName.get(b.unit_id) ?? '')
+  const ids = new Set(positions.map((p) => p.positionId));
+  const byName = (a, b) => (unitName.get(a.unitId) ?? '').localeCompare(unitName.get(b.unitId) ?? '')
     || a.name.localeCompare(b.name);
   const children = new Map();
   const roots = [];
   for (const position of positions) {
-    const parent = position.primary_parent_position_id;
+    const parent = position.primaryParentPositionId;
     if (parent && ids.has(parent)) {
       if (!children.has(parent)) children.set(parent, []);
       children.get(parent).push(position);
@@ -52,13 +52,13 @@ function orderedPositions(view, unitName) {
   const pending = roots.sort(byName).reverse();
   while (pending.length) {
     const position = pending.pop();
-    if (seen.has(position.position_id)) continue;
-    seen.add(position.position_id);
+    if (seen.has(position.positionId)) continue;
+    seen.add(position.positionId);
     out.push(position);
-    pending.push(...(children.get(position.position_id) ?? []).sort(byName).reverse());
+    pending.push(...(children.get(position.positionId) ?? []).sort(byName).reverse());
   }
   // A cycle that survived in the data has no root: its members are still people on the list.
-  for (const position of positions) if (!seen.has(position.position_id)) out.push(position);
+  for (const position of positions) if (!seen.has(position.positionId)) out.push(position);
   return out;
 }
 
@@ -68,35 +68,35 @@ function orderedPositions(view, unitName) {
  * position itself when nobody sits there.
  */
 export function listRows(view, t) {
-  const unitName = new Map((view.units ?? []).map((u) => [u.unit_id, u.name]));
-  const positions = new Map((view.positions ?? []).map((p) => [p.position_id, p]));
+  const unitName = new Map((view.units ?? []).map((u) => [u.unitId, u.name]));
+  const positions = new Map((view.positions ?? []).map((p) => [p.positionId, p]));
   const holders = positionHolders(view);
 
   const reportsTo = (position) => {
-    const parent = position.primary_parent_position_id ? positions.get(position.primary_parent_position_id) : null;
+    const parent = position.primaryParentPositionId ? positions.get(position.primaryParentPositionId) : null;
     if (!parent) return '';
-    const who = holders.get(parent.position_id) ?? [];
+    const who = holders.get(parent.positionId) ?? [];
     return who.length
-      ? who.map((a) => a.display_name || t('unknown_person')).join(', ')
+      ? who.map((a) => a.displayName || t('unknown_person')).join(', ')
       : `${parent.name} — ${t('vacancy')}`;
   };
 
   const rows = [];
   for (const position of orderedPositions(view, unitName)) {
     const base = {
-      positionId: position.position_id,
-      unitId: position.unit_id,
+      positionId: position.positionId,
+      unitId: position.unitId,
       positionName: position.name,
-      unitName: unitName.get(position.unit_id) ?? '',
+      unitName: unitName.get(position.unitId) ?? '',
       reportsTo: reportsTo(position),
-      parentPositionId: position.primary_parent_position_id ?? null,
-      staff: Boolean(position.is_staff),
+      parentPositionId: position.primaryParentPositionId ?? null,
+      staff: Boolean(position.isStaff),
     };
-    const who = holders.get(position.position_id) ?? [];
+    const who = holders.get(position.positionId) ?? [];
     if (!who.length) {
       rows.push({
-        ...base, _id: `vacant:${position.position_id}`, vacant: true, assignmentId: null, subject: null,
-        personName: t('vacancy'), external: false, since: position.valid_from, share: null, type: null, primary: false,
+        ...base, _id: `vacant:${position.positionId}`, vacant: true, assignmentId: null, subject: null,
+        personName: t('vacancy'), external: false, since: position.validFrom, share: null, type: null, primary: false,
       });
       continue;
     }
@@ -107,13 +107,13 @@ export function listRows(view, t) {
         vacant: false,
         assignmentId: assignment.id,
         subject: assignment.subject,
-        personName: assignment.display_name || t('unknown_person'),
+        personName: assignment.displayName || t('unknown_person'),
         external: assignment.subject?.kind === 'external',
-        since: assignment.valid_from,
-        validTo: assignment.valid_to ?? null,
+        since: assignment.validFrom,
+        validTo: assignment.validTo ?? null,
         share: assignment.share,
-        type: assignment.assignment_type,
-        primary: Boolean(assignment.is_primary),
+        type: assignment.assignmentType,
+        primary: Boolean(assignment.isPrimary),
       });
     }
   }
@@ -187,8 +187,8 @@ export function endConsequences(row, view, rows) {
   const out = [];
   const others = rows.filter((r) => r.positionId === row.positionId && r.assignmentId && r.assignmentId !== row.assignmentId);
   if (!others.length) out.push({ key: 'becomes_vacant', params: { position: row.positionName, unit: row.unitName } });
-  const unit = (view.units ?? []).find((u) => u.unit_id === row.unitId);
-  if (unit?.head_position_id === row.positionId && !others.length) {
+  const unit = (view.units ?? []).find((u) => u.unitId === row.unitId);
+  if (unit?.headPositionId === row.positionId && !others.length) {
     out.push({ key: 'unit_without_head', params: { unit: row.unitName } });
   }
   const reports = new Set(rows.filter((r) => r.parentPositionId === row.positionId).map((r) => r.positionId)).size;

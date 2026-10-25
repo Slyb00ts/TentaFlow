@@ -33,12 +33,12 @@ export async function openEditModal(svc, opts = {}) {
   closeModal();
   // External cloud providers don't expose a model/VRAM config — editing them
   // means picking which of the provider's live models become available.
-  if ((svc.deploy_method || '') === 'external') {
+  if ((svc.deployMethod || '') === 'external') {
     return openExternalModelPicker(svc, opts);
   }
   const onSaved = opts.onSaved || (() => {});
-  const engineId = opts.engineId || svc.engine_id;
-  const cfg = parseConfig(svc.config_json);
+  const engineId = opts.engineId || svc.engineId;
+  const cfg = parseConfig(svc.configJson);
   const initialPresetId = cfg.model_preset_id || null;
   const initialModelRepo = cfg.model_repo || '';
   // Load the manifest (idempotent) so the vLLM-backed check below sees the
@@ -162,14 +162,14 @@ export async function openEditModal(svc, opts = {}) {
 // models" persists the selection so chosen models appear in Modele dostępne.
 async function openExternalModelPicker(svc, opts = {}) {
   const onSaved = opts.onSaved || (() => {});
-  const nodeId = opts.nodeId || svc.node_id || undefined;
+  const nodeId = opts.nodeId || svc.nodeId || undefined;
 
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.innerHTML = `
     <div class="modal-shell">
       <div class="modal-head">
-        <h2>${escapeHtml(svc.display_name || svc.engine_id)} — ${escapeHtml(I18n.t('external.select_models'))}</h2>
+        <h2>${escapeHtml(svc.displayName || svc.engineId)} — ${escapeHtml(I18n.t('external.select_models'))}</h2>
         <button class="modal-x" data-close aria-label="close">×</button>
       </div>
       <div class="modal-body">
@@ -224,10 +224,10 @@ async function openExternalModelPicker(svc, opts = {}) {
         // Pricing prefill is best-effort; empty means "no change" on save.
       }
       listEl.innerHTML = models.map((m) => {
-        const id = m.id || m.model_name || '';
-        const ctxLen = m.contextLength || m.context_length;
+        const id = m.id || '';
+        const ctxLen = m.contextLength;
         const ctxTxt = ctxLen ? ` · ${ctxLen}` : '';
-        const name = m.displayName || m.display_name || id;
+        const name = m.displayName || id;
         // Prefill from stored pricing (keyed by model id); empty stays empty.
         const stored = pricingByModel.get(id);
         const pv = (field) => {
@@ -379,9 +379,9 @@ async function fetchRecommendation(overlay, _svc) {
     const res = await ApiBinary.action('serviceVramHintRequest', { gpuIndex: 0 });
     if (res && Array.isArray(res.gpus)) {
       gpus = res.gpus.map((g) => ({
-        index: g.gpu_index,
-        memory_gb: (g.total_mib || 0) / 1024,
-        name: g.gpu_name || '',
+        index: g.gpuIndex,
+        memory_gb: (g.totalMib || 0) / 1024,
+        name: g.gpuName || '',
       }));
     }
   } catch (_e) {}
@@ -419,13 +419,13 @@ async function fetchRecommendation(overlay, _svc) {
 }
 
 function renderRecommendation(card, r) {
-  const v = r.vram_estimate || {};
-  const spec = r.model_spec || {};
-  const totalGb = v.per_gpu_gb && r.applied?.tensor_parallel
-    ? (v.per_gpu_gb * r.applied.tensor_parallel)
-    : v.total_gb || 0;
-  const fitsPct = totalGb > 0 ? Math.min(200, Math.round((v.total_gb / totalGb) * 100)) : 0;
-  const fits = v.fits_per_gpu !== false;
+  const v = r.vramEstimate || {};
+  const spec = r.modelSpec || {};
+  const totalGb = v.perGpuGb && r.applied?.tensorParallel
+    ? (v.perGpuGb * r.applied.tensorParallel)
+    : v.totalGb || 0;
+  const fitsPct = totalGb > 0 ? Math.min(200, Math.round((v.totalGb / totalGb) * 100)) : 0;
+  const fits = v.fitsPerGpu !== false;
   const tk = (k) => I18n.t(`services_edit.vram.${k}`) || k;
 
   const pillCls = fits ? 'ok' : 'danger';
@@ -433,11 +433,11 @@ function renderRecommendation(card, r) {
     ? (I18n.t('services_edit.vram.pill_fits') || 'Mieści się')
     : (I18n.t('services_edit.vram.pill_oom') || 'Nie mieści się');
 
-  const weightsGb = (v.model_weights_gb || 0).toFixed(1);
-  const kvGb = (v.kv_cache_gb || 0).toFixed(1);
-  const actGb = (v.activations_gb || 0).toFixed(1);
-  const perGpuGb = (v.per_gpu_gb || 0).toFixed(1);
-  const totalUsed = (v.total_gb || 0).toFixed(1);
+  const weightsGb = (v.modelWeightsGb || 0).toFixed(1);
+  const kvGb = (v.kvCacheGb || 0).toFixed(1);
+  const actGb = (v.activationsGb || 0).toFixed(1);
+  const perGpuGb = (v.perGpuGb || 0).toFixed(1);
+  const totalUsed = (v.totalGb || 0).toFixed(1);
 
   const warningsHtml = (v.warnings || []).map((w) => `<li>${escapeHtml(w)}</li>`).join('');
 
@@ -454,9 +454,9 @@ function renderRecommendation(card, r) {
     </div>
     <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:10px;">
       ${kpiCell(tk('kpi_weights'), `${weightsGb} GB`, escapeHtml(spec.dtype || ''))}
-      ${kpiCell(tk('kpi_kv'), `${kvGb} GB`, `ctx ${(r.applied?.max_model_len || 0).toLocaleString()}`)}
+      ${kpiCell(tk('kpi_kv'), `${kvGb} GB`, `ctx ${(r.applied?.maxModelLen || 0).toLocaleString()}`)}
       ${kpiCell(tk('kpi_activations'), `${actGb} GB`, '')}
-      ${kpiCell(tk('kpi_per_gpu'), `${perGpuGb} GB`, `${r.applied?.tensor_parallel || 1}× GPU`)}
+      ${kpiCell(tk('kpi_per_gpu'), `${perGpuGb} GB`, `${r.applied?.tensorParallel || 1}× GPU`)}
       ${kpiCell(tk('kpi_total'), `${totalUsed} GB`, `${fitsPct}%`, fits ? 'success' : 'danger')}
     </div>
     ${warningsHtml ? `<ul style="font-size:11px;color:var(--warning);margin-left:18px;">${warningsHtml}</ul>` : ''}
@@ -542,8 +542,8 @@ function renderVramSnapshot(overlay, res) {
     return;
   }
   const gpu = res.gpus[0];
-  const totalMib = gpu.total_mib || 1;
-  const externalMib = (gpu.external_processes || []).reduce((acc, p) => acc + (p.used_mib || 0), 0);
+  const totalMib = gpu.totalMib || 1;
+  const externalMib = (gpu.externalProcesses || []).reduce((acc, p) => acc + (p.usedMib || 0), 0);
   const externalPct = (externalMib / totalMib) * 100;
 
   const slider = overlay.querySelector('[data-mu-slider]');
@@ -553,16 +553,16 @@ function renderVramSnapshot(overlay, res) {
   const headroomMib = Math.max(0, totalMib - externalMib - capMib);
   const headroomPct = Math.max(0, 100 - externalPct - capPct);
 
-  const procsHtml = (gpu.external_processes || [])
+  const procsHtml = (gpu.externalProcesses || [])
     .slice(0, 5)
     .map(
       (p) =>
-        `<span class="name">${escapeHtml(p.process_name || `pid ${p.pid}`)} (PID ${p.pid})</span><span class="mb">${(p.used_mib || 0).toLocaleString()} MiB</span>`
+        `<span class="name">${escapeHtml(p.processName || `pid ${p.pid}`)} (PID ${p.pid})</span><span class="mb">${(p.usedMib || 0).toLocaleString()} MiB</span>`
     )
     .join('');
 
-  const free = (gpu.free_mib || 0).toLocaleString();
-  const recommended = res.recommended_utilization;
+  const free = (gpu.freeMib || 0).toLocaleString();
+  const recommended = res.recommendedUtilization;
   const recommendHtml = recommended != null
     ? `<span style="color:var(--text-2);">Rekomendowane: <b style="color:var(--success);font-family:'JetBrains Mono',monospace;">${recommended.toFixed(2)}</b></span>`
     : '';
@@ -571,11 +571,11 @@ function renderVramSnapshot(overlay, res) {
   if (bar) {
     bar.innerHTML = `
       <div class="adv-extern-head">
-        <span>Co już używa GPU 0 (${escapeHtml(gpu.gpu_name || '?')}, ${(totalMib/1024).toFixed(1)} GB)</span>
+        <span>Co już używa GPU 0 (${escapeHtml(gpu.gpuName || '?')}, ${(totalMib/1024).toFixed(1)} GB)</span>
         <span class="extern-total">${externalMib.toLocaleString()} MiB · ${externalPct.toFixed(1)}%</span>
       </div>
       <div class="adv-extern-bar">
-        ${(gpu.external_processes || []).map((p) => `<div class="ext-seg" title="${escapeHtml(p.process_name)}: ${p.used_mib} MiB" style="width: ${((p.used_mib || 0) / totalMib * 100).toFixed(2)}%;"></div>`).join('')}
+        ${(gpu.externalProcesses || []).map((p) => `<div class="ext-seg" title="${escapeHtml(p.processName)}: ${p.usedMib} MiB" style="width: ${((p.usedMib || 0) / totalMib * 100).toFixed(2)}%;"></div>`).join('')}
         <div class="cap-seg" style="width: ${capPct.toFixed(1)}%; background: rgba(99,102,241,0.4);"></div>
         <div class="deploy-room" style="width: ${headroomPct.toFixed(1)}%; background: rgba(34,197,94,0.18);"></div>
       </div>
@@ -663,7 +663,7 @@ function renderShell(svc, engineId, cfg, isVllm, initialPresetId, initialModelRe
   const status = (svc.status || '').toLowerCase();
   const isStarting = status === 'starting';
   const dotCls = status === 'running' ? 'ok' : (status === 'failed' ? '' : 'warn');
-  const headMeta = `#${svc.id} · ${svc.endpoint_url ? svc.endpoint_url.replace(/^https?:\/\/[^/]*/, '') : ''} · ${svc.status}`;
+  const headMeta = `#${svc.id} · ${svc.endpointUrl ? svc.endpointUrl.replace(/^https?:\/\/[^/]*/, '') : ''} · ${svc.status}`;
   const restartWarn = isStarting || status === 'running' || status === 'degraded';
   const tk = (k) => I18n.t(`services_edit.${k}`) || k;
 
@@ -671,7 +671,7 @@ function renderShell(svc, engineId, cfg, isVllm, initialPresetId, initialModelRe
     <div class="modal-shell" style="margin-top:5vh;">
       <div class="modal-head">
         <div class="dot ${dotCls}"></div>
-        <h3>${escapeHtml(tk('title'))}: ${escapeHtml(svc.display_name || engineId)}</h3>
+        <h3>${escapeHtml(tk('title'))}: ${escapeHtml(svc.displayName || engineId)}</h3>
         <span class="head-meta">${escapeHtml(headMeta)}</span>
         <button class="btn ghost" data-close style="padding:4px 10px;min-height:0;font-size:18px;" title="${escapeAttr(tk('close'))}">×</button>
       </div>
@@ -698,10 +698,10 @@ function renderShell(svc, engineId, cfg, isVllm, initialPresetId, initialModelRe
         <div class="body-section">
           <div class="body-section-title">${escapeHtml(tk('immutable'))}</div>
           <div class="fact-list">
-            <div class="row"><span class="key">${escapeHtml(tk('immutable_engine'))}</span><span class="val">${escapeHtml(svc.engine_id || '')}</span></div>
-            <div class="row"><span class="key">${escapeHtml(tk('immutable_method'))}</span><span class="val">${escapeHtml(svc.deploy_method || '')}</span></div>
+            <div class="row"><span class="key">${escapeHtml(tk('immutable_engine'))}</span><span class="val">${escapeHtml(svc.engineId || '')}</span></div>
+            <div class="row"><span class="key">${escapeHtml(tk('immutable_method'))}</span><span class="val">${escapeHtml(svc.deployMethod || '')}</span></div>
             <div class="row"><span class="key">${escapeHtml(tk('immutable_transport'))}</span><span class="val">${escapeHtml(svc.transport || '')}</span></div>
-            <div class="row"><span class="key">${escapeHtml(tk('immutable_port'))}</span><span class="val">${escapeHtml(String(svc.runtime_port || ''))}</span></div>
+            <div class="row"><span class="key">${escapeHtml(tk('immutable_port'))}</span><span class="val">${escapeHtml(String(svc.runtimePort || ''))}</span></div>
           </div>
         </div>
       </div>
@@ -795,7 +795,7 @@ function renderPresetCards(presets, initialPresetId, tk) {
              data-preset-repo="${escapeAttr(p.repo)}">
           <div class="preset-radio"></div>
           <div class="preset-info">
-            <div class="preset-name">${escapeHtml(p.display_name)} ${recPill}</div>
+            <div class="preset-name">${escapeHtml(p.displayName)} ${recPill}</div>
             <div class="preset-meta">
               <span>${escapeHtml(p.repo)}</span>${quantTag}
             </div>

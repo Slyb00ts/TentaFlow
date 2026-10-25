@@ -178,7 +178,7 @@ function paintEngineFilter() {
   if (!select) return;
   const options = [{ value: '', label: T('filter_engine_all') }].concat(
     state.engines.map((engine) => {
-      const id = engine.engine_id ?? engine.engineId;
+      const id = engine.engineId;
       return { value: id, label: engineName(id, state.engines) };
     }),
   );
@@ -217,29 +217,29 @@ function paintAccounts(body) {
 
   const table = body.querySelector('#aa-accounts-table');
   table.rows = state.accounts.map((account) => ({
-    account: `<div class="tf-table__ent">${engineTile(account.engine_id)}<div>`
-      + `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(account.display_name ?? '')}</div>`
-      + `<div class="tf-table__cell-sub">${escapeHtml(accountSubtitle(account) || shortId(account.account_id))}</div>`
+    account: `<div class="tf-table__ent">${engineTile(account.engineId)}<div>`
+      + `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(account.displayName ?? '')}</div>`
+      + `<div class="tf-table__cell-sub">${escapeHtml(accountSubtitle(account) || shortId(account.accountId))}</div>`
       + '</div></div>',
     scope: scopeChipHtml(account.scope),
-    credential: credentialKindLabel(account.credential_kind),
+    credential: credentialKindLabel(account.credentialKind),
     status: statusChipHtml(account),
     sessions: sessionsCell(account),
     // The nodes that hold this account's credential, as this node measured
     // them — the column header carries the same caveat as its tooltip.
     nodes: usedOnLabel(account),
-    _accountId: account.account_id,
+    _accountId: account.accountId,
     _manageable: account.scope === 'global',
     // "Zaloguj" belongs where the account is waiting for one: a shared account
     // with no stored credential, or one the node put back into `needs_login`
     // after the bridge rejected what a session produced.
     _needsLogin: account.scope === 'global'
-      && account.credential_kind === 'provider_login'
+      && account.credentialKind === 'provider_login'
       && account.status !== 'disabled'
-      && (Number(account.credential_revision ?? 0) === 0 || account.status === 'needs_login'),
-    _engineId: account.engine_id,
-    _name: account.display_name ?? '',
-    _homeNodeId: account.home_node_id ?? null,
+      && (Number(account.credentialRevision ?? 0) === 0 || account.status === 'needs_login'),
+    _engineId: account.engineId,
+    _name: account.displayName ?? '',
+    _homeNodeId: account.homeNodeId ?? null,
   }));
   table.rowActions = (row, _idx, currentRow) => {
     const live = () => currentRow?.() ?? row;
@@ -315,7 +315,7 @@ function paintRuntime(body) {
       <tf-column key="node" label="${escapeAttr(T('col_node'))}" renderer="html" fill></tf-column>
       <tf-column key="sandbox" label="${escapeAttr(T('col_sandbox'))}" renderer="html"></tf-column>
       ${engines.map((engine) => {
-        const id = engine.engine_id ?? engine.engineId;
+        const id = engine.engineId;
         return `<tf-column key="engine_${escapeAttr(id)}" label="${escapeAttr(engineName(id, engines))}" renderer="html"></tf-column>`;
       }).join('')}
     </tf-table>
@@ -331,22 +331,22 @@ function paintRuntime(body) {
   const table = body.querySelector('#aa-runtime-table');
   wireRuntimeMenu(body);
   table.rows = state.nodes.map((node) => {
-    const capable = node.sandbox_capable;
-    const byEngine = new Map((node.engines ?? []).map((entry) => [entry.engine_id ?? entry.engineId, entry]));
+    const capable = node.sandboxCapable;
+    const byEngine = new Map((node.engines ?? []).map((entry) => [entry.engineId, entry]));
     const gate = runtimeGate(node);
     const row = {
       // The sub-line says what the operator can act on: the operating system
       // this node reported (only a node knows its own), whether it is reachable
       // and how many accounts already have a credential on it.
-      node: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(node.node_name ?? '')}</div>`
+      node: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(node.nodeName ?? '')}</div>`
         + `<div class="tf-table__cell-sub">${escapeHtml(nodeSubLine(node))}</div>`
         + (gate.ok ? '' : `<div class="tf-table__cell-sub">${escapeHtml(T(gate.reason))}</div>`),
       sandbox: sandboxCell(node),
-      _nodeId: node.node_id,
-      _receives: node.receives_accounts === true,
+      _nodeId: node.nodeId,
+      _receives: node.receivesAccounts === true,
     };
     for (const engine of engines) {
-      const id = engine.engine_id ?? engine.engineId;
+      const id = engine.engineId;
       row[`engine_${id}`] = installCell(node, id, byEngine.get(id), gate);
     }
     return row;
@@ -373,7 +373,7 @@ function paintRuntime(body) {
 }
 
 function nodeSubLine(node) {
-  const count = Number(node.account_count ?? 0);
+  const count = Number(node.accountCount ?? 0);
   const accounts = count > 0 ? T('node_accounts', { n: count }) : T('node_accounts_none');
   return `${osLabel(node.os)} · ${T(node.online ? 'node_online' : 'node_offline')} · ${accounts}`;
 }
@@ -387,7 +387,7 @@ function nodeSubLine(node) {
  * forwarded request that would time out with nothing to show for it.
  */
 function runtimeGate(node) {
-  if (node.sandbox_capable === false) return { ok: false, reason: 'runtime_not_possible' };
+  if (node.sandboxCapable === false) return { ok: false, reason: 'runtime_not_possible' };
   if (!node.online) return { ok: false, reason: 'runtime_node_unreachable' };
   return { ok: true, reason: '' };
 }
@@ -398,11 +398,11 @@ function runtimeGate(node) {
  * to do about it, not only as a red dot.
  */
 function sandboxCell(node) {
-  const chip = sandboxChip(node.sandbox_capable);
-  if (node.sandbox_capable !== false || !sandboxRepairable(node.sandbox_cause)) return chip;
-  const name = node.node_name ?? node.node_id ?? '';
+  const chip = sandboxChip(node.sandboxCapable);
+  if (node.sandboxCapable !== false || !sandboxRepairable(node.sandboxCause)) return chip;
+  const name = node.nodeName ?? node.nodeId ?? '';
   return `<div class="tf-table__ent">${chip}<tf-button variant="primary" size="sm" icon="shield"
-      data-sandbox-repair data-node="${escapeAttr(node.node_id ?? '')}"
+      data-sandbox-repair data-node="${escapeAttr(node.nodeId ?? '')}"
       title="${escapeAttr(sandboxRepairProblem(name))}">${escapeHtml(I18n.t('sandbox_repair.action'))}</tf-button></div>`;
 }
 
@@ -417,8 +417,8 @@ function sandboxChip(capable) {
  * than one of them — "2 · 1 osoba" says nothing the reader did not assume.
  */
 function sessionsCell(account) {
-  const sessions = Number(account.session_count ?? 0);
-  const people = Number(account.session_user_count ?? 0);
+  const sessions = Number(account.sessionCount ?? 0);
+  const people = Number(account.sessionUserCount ?? 0);
   return `<b>${sessions}</b>` + (people > 1
     ? ` <span class="tf-table__cell-sub">· ${escapeHtml(T('sessions_people', { count: people }))}</span>`
     : '');
@@ -434,15 +434,15 @@ function sessionsCell(account) {
  * opened it is what tells the menu which node and engine it is acting on.
  */
 function installCell(node, engineId, entry, gate) {
-  const stateName = entry?.install_state ?? entry?.installState ?? 'absent';
+  const stateName = entry?.installState ?? 'absent';
   // Nothing installed means one possible action, so it is the cell itself.
   if (stateName === 'absent') {
     return `<tf-button variant="secondary" size="sm" icon="download"
-      data-runtime-install data-node="${escapeAttr(node.node_id ?? '')}" data-engine="${escapeAttr(engineId)}"
+      data-runtime-install data-node="${escapeAttr(node.nodeId ?? '')}" data-engine="${escapeAttr(engineId)}"
       ${gate.ok ? '' : `disabled title="${escapeAttr(T(gate.reason))}"`}>${escapeHtml(T('runtime_install'))}</tf-button>`;
   }
   const trigger = `<tf-button variant="ghost" size="sm" icon="more"
-      data-runtime-menu data-node="${escapeAttr(node.node_id ?? '')}" data-engine="${escapeAttr(engineId)}"
+      data-runtime-menu data-node="${escapeAttr(node.nodeId ?? '')}" data-engine="${escapeAttr(engineId)}"
       data-state="${escapeAttr(stateName)}"
       aria-label="${escapeAttr(T('runtime_actions'))}"
       ${gate.ok ? '' : `disabled title="${escapeAttr(T(gate.reason))}"`}></tf-button>`;
@@ -455,7 +455,7 @@ function installCell(node, engineId, entry, gate) {
   } else if (stateName === 'installing') {
     label = `<tf-chip size="sm" status="info" dot label="${escapeAttr(T('install_installing'))}"></tf-chip>`;
   } else if (stateName === 'error') {
-    const reason = entry.last_error ?? entry.lastError ?? '';
+    const reason = entry.lastError ?? '';
     label = `<tf-chip size="sm" status="err" dot label="${escapeAttr(T('install_error'))}"></tf-chip>`
       + (reason ? `<div class="tf-table__cell-sub">${escapeHtml(reason)}</div>` : '');
   }
@@ -511,12 +511,12 @@ function wireRuntimeMenu(body) {
 
 /** Repairs one node's sandbox with its sudo password, then re-reads the matrix. */
 async function runSandboxRepair(nodeId) {
-  const node = state.nodes.find((entry) => entry.node_id === nodeId);
+  const node = state.nodes.find((entry) => entry.nodeId === nodeId);
   if (!node) return;
   const outcome = await repairProcessSandbox({
     nodeId,
-    nodeName: node.node_name ?? nodeId,
-    isLocal: node.is_local === true,
+    nodeName: node.nodeName ?? nodeId,
+    isLocal: node.isLocal === true,
   });
   if (!outcome) return;
   toast(I18n.t('sandbox_repair.done'), 'success');
@@ -547,9 +547,9 @@ async function runInstall(nodeId, engineId, install) {
 /** Re-reads the matrix while one cell is still `installing`, and then stops. */
 async function watchInstall(nodeId, engineId) {
   for (let attempt = 0; attempt < 60; attempt += 1) {
-    const node = state.nodes.find((row) => row.node_id === nodeId);
-    const entry = (node?.engines ?? []).find((e) => (e.engine_id ?? e.engineId) === engineId);
-    if ((entry?.install_state ?? entry?.installState ?? 'absent') !== 'installing') return;
+    const node = state.nodes.find((row) => row.nodeId === nodeId);
+    const entry = (node?.engines ?? []).find((e) => (e.engineId) === engineId);
+    if ((entry?.installState ?? 'absent') !== 'installing') return;
     await new Promise((resolve) => setTimeout(resolve, 2000));
     if (!state.host || state.segment !== 'runtime') return;
     await load();

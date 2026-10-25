@@ -5695,13 +5695,9 @@ pub async fn ml_studio_vision_model_publish(
     }
 
     if alias.is_some() {
-        // Alias committed with the row — refresh the router cache/catalog and
-        // broadcast the alias snapshot to the mesh.
-        crate::services::models::broadcast_alias_mutation(
-            &ctx.state.db,
-            &ctx.state.router,
-            &ctx.state.quic_mesh,
-        );
+        // Alias committed with the row — refresh the router cache/catalog; the
+        // ledger capture written in the same transaction carries it to peers.
+        crate::services::models::refresh_router_aliases(&ctx.state.router);
     }
 
     crate::services::onnx_cv_service::reconcile_and_announce(&ctx.state);

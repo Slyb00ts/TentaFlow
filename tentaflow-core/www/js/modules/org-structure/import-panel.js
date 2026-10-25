@@ -69,8 +69,8 @@ function rowListItems(rows) {
   return rows.map((row) => ({
     _id: `r${row.row}`,
     row: row.row,
-    what: row.person || row.position_code || row.unit_code || '—',
-    where: [row.unit_code, row.position_code].filter(Boolean).join(' · ') || '—',
+    what: row.person || row.positionCode || row.unitCode || '—',
+    where: [row.unitCode, row.positionCode].filter(Boolean).join(' · ') || '—',
     changes: (row.changes ?? []).map(changeText).join('; ') || '—',
   }));
 }
@@ -174,7 +174,7 @@ export function openImportPanel({ day, unitTypes = [], onApplied }) {
     const impact = s.report ? replaceImpact(s.report) : null;
     let text = it('mode_replace_note');
     if (impact && impact.total > 0) {
-      text = `${text} ${it('replace_impact', { ...impact, date: formatDay(s.report.as_of) })}`;
+      text = `${text} ${it('replace_impact', { ...impact, date: formatDay(s.report.asOf) })}`;
     } else if (impact) {
       text = `${text} ${it('replace_none')}`;
     }
@@ -186,8 +186,8 @@ export function openImportPanel({ day, unitTypes = [], onApplied }) {
     let html = '';
     if (s.busy === 'dry') html = `<tf-alert tone="info" message="${escapeAttr(it('running'))}"></tf-alert>`;
     else if (s.failure) html = `<tf-alert tone="danger" message="${escapeAttr(s.failure)}"></tf-alert>`;
-    else if (s.report?.file_error) {
-      const { code, field } = s.report.file_error;
+    else if (s.report?.fileError) {
+      const { code, field } = s.report.fileError;
       const column = field ? columnLabel(field) : '';
       html = `<tf-alert tone="danger" message="${escapeAttr(known(`file_error_${code}`, { column, code }, 'file_error_unknown'))}"></tf-alert>`;
     } else if (!s.report) html = `<tf-alert tone="info" message="${escapeAttr(it('idle'))}"></tf-alert>`;
@@ -202,14 +202,14 @@ export function openImportPanel({ day, unitTypes = [], onApplied }) {
   function renderSummary() {
     const c = s.report.counts;
     const cards = [
-      summaryCard(it('stat_added'), c.added, it('stat_added_detail', { units: c.units_added, positions: c.positions_added, assignments: c.assignments_added }), 'success'),
-      summaryCard(it('stat_changed'), c.changed, it('stat_changed_detail', { units: c.units_changed, positions: c.positions_changed, assignments: c.assignments_changed }), 'info'),
+      summaryCard(it('stat_added'), c.added, it('stat_added_detail', { units: c.unitsAdded, positions: c.positionsAdded, assignments: c.assignmentsAdded }), 'success'),
+      summaryCard(it('stat_changed'), c.changed, it('stat_changed_detail', { units: c.unitsChanged, positions: c.positionsChanged, assignments: c.assignmentsChanged }), 'info'),
       summaryCard(it('stat_errors'), errorCount(s.report), errorCount(s.report) > 0 ? it('stat_errors_detail') : it('stat_errors_none'), errorCount(s.report) > 0 ? 'danger' : ''),
       summaryCard(it('stat_unchanged'), c.unchanged, it('stat_unchanged_detail'), ''),
     ];
     if (s.mode === 'replace') {
       cards.push(summaryCard(it('stat_ended'), replaceImpact(s.report).total,
-        it('stat_ended_detail', { units: c.units_ended, positions: c.positions_ended, assignments: c.assignments_ended }), 'warning'));
+        it('stat_ended_detail', { units: c.unitsEnded, positions: c.positionsEnded, assignments: c.assignmentsEnded }), 'warning'));
     }
     q('summary').innerHTML = cards.join('');
   }
@@ -248,7 +248,7 @@ export function openImportPanel({ day, unitTypes = [], onApplied }) {
     let hint = '';
     if (issue.suggestion) {
       hint = issue.kind === 'unknown_person'
-        ? `<span>${escapeHtml(it('suggest_login_prefix'))}</span> <b>${escapeHtml(issue.suggestion)}</b>${issue.suggestion_label ? ` <span>(${escapeHtml(issue.suggestion_label)})</span>` : ''}<span>?</span>`
+        ? `<span>${escapeHtml(it('suggest_login_prefix'))}</span> <b>${escapeHtml(issue.suggestion)}</b>${issue.suggestionLabel ? ` <span>(${escapeHtml(issue.suggestionLabel)})</span>` : ''}<span>?</span>`
         : `<span>${escapeHtml(it(issue.kind === 'unknown_unit_type' ? 'suggest_type' : 'suggest_generic', { value: issue.suggestion }))}</span>`;
     }
     const buttons = card.actions.map((action) => {
@@ -330,7 +330,7 @@ export function openImportPanel({ day, unitTypes = [], onApplied }) {
   function renderPreview() {
     const host = q('preview');
     const preview = s.report.preview;
-    q('partial').hidden = !s.report.preview_partial;
+    q('partial').hidden = !s.report.previewPartial;
     if (!preview) {
       chart = null;
       host.innerHTML = `<div class="org-imp-empty">${escapeHtml(it('preview_none'))}</div>`;
@@ -374,7 +374,7 @@ export function openImportPanel({ day, unitTypes = [], onApplied }) {
   function render() {
     renderModeNote();
     renderStatus();
-    const showReport = Boolean(s.report) && !s.report.file_error;
+    const showReport = Boolean(s.report) && !s.report.fileError;
     q('report').hidden = !showReport;
     if (showReport) {
       renderSummary();
@@ -385,7 +385,7 @@ export function openImportPanel({ day, unitTypes = [], onApplied }) {
     }
     // The row count is the server's: a file it never read (too big, wrong type) has none to state.
     q('meta').textContent = !s.file ? it('file_hint')
-      : s.report && !s.report.file_error ? it('file_meta', { name: s.file.name, count: s.report.counts.rows })
+      : s.report && !s.report.fileError ? it('file_meta', { name: s.file.name, count: s.report.counts.rows })
         : s.file.name;
     renderFooter();
   }
@@ -409,7 +409,7 @@ export function openImportPanel({ day, unitTypes = [], onApplied }) {
       const body = await ApiBinary.one('orgImportDryRunRequest', payload());
       if (seq !== s.seq) return;
       s.report = body.report;
-      if (!s.report.file_error) {
+      if (!s.report.fileError) {
         const hasErrors = unresolvedErrors(s.report);
         if (!hasErrors && s.tab === 'errors') {
           s.tab = s.mode === 'replace' && endedItems(s.report).length ? 'ended' : s.report.counts.changed > 0 ? 'changed' : 'added';
@@ -476,7 +476,7 @@ export function openImportPanel({ day, unitTypes = [], onApplied }) {
     openConfirmWindow({
       kind: 'delete',
       title: it('end_confirm_title'),
-      subject: it('end_confirm_subject', { date: formatDay(s.report.as_of) }),
+      subject: it('end_confirm_subject', { date: formatDay(s.report.asOf) }),
       consequence: `${it('end_confirm_note', { ...impact, seats: seatsLost(s.report) })} ${endedSummary()}`,
       submitLabel: it('end_confirm_submit'),
       onSubmit: async () => { await runApply(true); },
@@ -489,7 +489,7 @@ export function openImportPanel({ day, unitTypes = [], onApplied }) {
     renderFooter();
     try {
       const body = await ApiBinary.one('orgExportErrorsRequest', payload());
-      downloadBytes(body.file_name ?? body.fileName ?? 'import-errors.csv', body.bytes, body.mime);
+      downloadBytes(body.fileName ?? body.fileName ?? 'import-errors.csv', body.bytes, body.mime);
     } catch (err) {
       TfToast.show({ tone: 'danger', message: it('request_failed', { message: err.message || '' }) });
     }

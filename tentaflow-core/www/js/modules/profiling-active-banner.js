@@ -11,6 +11,7 @@ import {
   profilingStop,
 } from '/js/protocol/profiling.js';
 import { I18n } from '/js/i18n.js';
+import { createRefresher } from '/js/lib/refresh.js';
 
 function fixtureMode() {
   return typeof window !== 'undefined' && window.__TF_PROFILING_FIXTURE === true;
@@ -110,7 +111,7 @@ export class ProfilingActiveBanner {
     this.nodeId = opts.nodeId;
     this.onSessionEnded = typeof opts.onSessionEnded === 'function' ? opts.onSessionEnded : null;
     this.root = null;
-    this.pollTimer = null;
+    this.poller = null;
     this.tickTimer = null;
     this.session = null;
     this._mountedAt = 0;
@@ -133,25 +134,40 @@ export class ProfilingActiveBanner {
     this.session = null;
   }
 
+  // The poller pauses while the tab is hidden; the countdown timer exists only
+  // while a session is running, so an idle node costs one request per second
+  // and no timer work.
   _startPolling() {
-    this._poll();
-    this.pollTimer = setInterval(() => this._poll(), 1000);
-    this.tickTimer = setInterval(() => this._tick(), 1000);
+    this.poller = createRefresher({ run: () => this._poll(), intervalMs: 1000, immediate: true });
+    this.poller.start();
   }
 
   _stopPolling() {
-    if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
+    if (this.poller) { this.poller.dispose(); this.poller = null; }
+    this._stopTick();
+  }
+
+  _startTick() {
+    if (!this.tickTimer) this.tickTimer = setInterval(() => this._tick(), 1000);
+  }
+
+  _stopTick() {
     if (this.tickTimer) { clearInterval(this.tickTimer); this.tickTimer = null; }
   }
 
   async _poll() {
-    if (!this.root) return;
+    // A target node that does not answer holds the request for its full timeout;
+    // polling every second on top of that would stack dozens of pending requests.
+    if (!this.root || this._polling) return;
+    this._polling = true;
     let sess = null;
     try {
       sess = await fetchActive(this.nodeId);
     } catch (err) {
       console.error('failed to fetch active profiling session', err);
       sess = null;
+    } finally {
+      this._polling = false;
     }
     // Banner moze zostac unmount'owany w trakcie fetchActive (route change,
     // user przeszedl gdzie indziej). this.root => null po unmount, dalsze
@@ -160,6 +176,7 @@ export class ProfilingActiveBanner {
     const previous = this.session;
     this.session = sess;
     if (!sess) {
+      this._stopTick();
       this.root.style.display = 'none';
       if (previous && this.onSessionEnded) {
         try { this.onSessionEnded(previous.session_id); }
@@ -168,6 +185,7 @@ export class ProfilingActiveBanner {
       return;
     }
     this.root.style.display = '';
+    this._startTick();
     this._render();
   }
 

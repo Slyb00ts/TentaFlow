@@ -58,7 +58,7 @@ const { tallyHunks, tallyDecisions, setHunks } = build(
 
 // The shape the server actually sends: `header` repeated as row 0 of `content`.
 const README_HUNK = {
-  patch_hunk_id: 'h3',
+  patchHunkId: 'h3',
   header: '@@ -120,4 +124,8 @@ dual licensed as above',
   content: [
     '@@ -120,4 +124,8 @@ dual licensed as above',
@@ -133,18 +133,18 @@ test('hunkStats/fileStats count only real added and removed lines', () => {
 
 const FILES = () => ([
   {
-    patch_file_id: 'f1',
+    patchFileId: 'f1',
     hunks: [
-      { patch_hunk_id: 'a', status: 'pending' },
-      { patch_hunk_id: 'b', status: 'pending' },
-      { patch_hunk_id: 'c', status: 'pending' },
+      { patchHunkId: 'a', status: 'pending' },
+      { patchHunkId: 'b', status: 'pending' },
+      { patchHunkId: 'c', status: 'pending' },
     ],
   },
   {
-    patch_file_id: 'f2',
+    patchFileId: 'f2',
     hunks: [
-      { patch_hunk_id: 'd', status: 'accepted' },
-      { patch_hunk_id: 'e', status: 'rejected' },
+      { patchHunkId: 'd', status: 'accepted' },
+      { patchHunkId: 'e', status: 'rejected' },
     ],
   },
 ]);

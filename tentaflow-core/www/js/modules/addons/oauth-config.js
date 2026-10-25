@@ -22,10 +22,10 @@ export const OAuthConfigTab = {
   async mount(container, addonId, { providerDecls = [] } = {}) {
     currentAddonId = addonId;
     providers = providerDecls.map((p) => ({
-      providerId: p.providerId ?? p.provider_id,
-      displayName: p.displayName ?? p.display_name,
-      authorizeUrl: p.authorizeUrl ?? p.authorize_url,
-      tokenUrl: p.tokenUrl ?? p.token_url,
+      providerId: p.providerId,
+      displayName: p.displayName,
+      authorizeUrl: p.authorizeUrl,
+      tokenUrl: p.tokenUrl,
       scopes: p.scopes || [],
       mode: p.mode || 'individual',
       pkce: !!p.pkce,
@@ -48,16 +48,16 @@ export const OAuthConfigTab = {
 };
 
 function buildConfig(c) {
-  const pid = c.providerId ?? c.provider_id;
+  const pid = c.providerId;
   return {
     providerId: pid,
-    clientId: c.clientId ?? c.client_id ?? '',
-    clientSecretSet: !!(c.clientSecretSet ?? c.client_secret_set),
-    redirectUri: c.redirectUri ?? c.redirect_uri ?? '',
+    clientId: c.clientId ?? '',
+    clientSecretSet: !!(c.clientSecretSet),
+    redirectUri: c.redirectUri ?? '',
     enabled: !!c.enabled,
-    oauthMode: c.oauthMode ?? c.oauth_mode ?? null,
-    linkedAccountsCount: c.linkedAccountsCount ?? c.linked_accounts_count ?? 0,
-    sharedAccountEmail: c.sharedAccountEmail ?? c.shared_account_email ?? null,
+    oauthMode: c.oauthMode ?? null,
+    linkedAccountsCount: c.linkedAccountsCount ?? 0,
+    sharedAccountEmail: c.sharedAccountEmail ?? null,
   };
 }
 
@@ -373,7 +373,7 @@ function attachProviderHandlers(container, p) {
         providerId: p.providerId,
       });
       if (resp.ok) {
-        const email = resp.accountEmail ?? resp.account_email ?? '';
+        const email = resp.accountEmail ?? '';
         toast(I18n.t('addon_oauth.test_success', { email }).replace('{email}', email), 'success');
       } else {
         const msg = resp.message || '';

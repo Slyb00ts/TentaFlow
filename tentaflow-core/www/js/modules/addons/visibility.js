@@ -24,11 +24,11 @@ export const VisibilityTab = {
     try {
       const client = await ApiBinary.client();
       unsubscribePush = client.addUnsolicitedListener(({ body }) => {
-        if (body?.variant !== 'AddonPermissionChangedEvent') return;
-        if ((body.addonId || body.addon_id) !== currentAddonId) return;
-        const st = body.subjectType ?? body.subject_type ?? '';
-        const sid = body.subjectId ?? body.subject_id ?? '';
-        const pid = body.permissionId ?? body.permission_id ?? '';
+        if (body?._variant !== 'AddonPermissionChangedEventBody') return;
+        if (body.addonId !== currentAddonId) return;
+        const st = body.subjectType ?? '';
+        const sid = body.subjectId ?? '';
+        const pid = body.permissionId ?? '';
         if (echoGuard.isOwnEcho(`${st}:${sid}:${pid}`)) return;
         loadAndRenderGroups(container).catch(() => {});
       });
@@ -110,7 +110,7 @@ async function loadAndRenderGroups(container) {
   try {
     const resp = await ApiBinary.one('addonVisibilityListRequest', { addonId: currentAddonId });
     const rows = resp.rows || [];
-    const showInCatalog = !!(resp.showInCatalog ?? resp.show_in_catalog ?? true);
+    const showInCatalog = !!(resp.showInCatalog ?? true);
     const catalogToggle = container.querySelector('#vis-show-in-catalog');
     if (catalogToggle) {
       if (showInCatalog) catalogToggle.setAttribute('checked', '');
@@ -128,10 +128,10 @@ async function loadAndRenderGroups(container) {
     }
 
     list.innerHTML = rows.map((r) => {
-      const gid = r.groupId ?? r.group_id;
-      const gname = r.groupName ?? r.group_name ?? `#${gid}`;
-      const userCount = Number(r.userCount ?? r.user_count ?? 0);
-      const groupDesc = r.groupDescription ?? r.group_description ?? '';
+      const gid = r.groupId;
+      const gname = r.groupName ?? `#${gid}`;
+      const userCount = Number(r.userCount ?? 0);
+      const groupDesc = r.groupDescription ?? '';
       const visible = !!r.visible;
       const metaParts = [];
       metaParts.push(I18n.t('addon_visibility.user_count', { n: userCount }));

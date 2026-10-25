@@ -110,17 +110,17 @@ const ADMIN_MODULES = new Map(LOCALES.map(([lang, root]) => [lang, ship(root, { 
 // The row the server parks the run on: `suspend_for_account` writes the snapshot
 // (`approval.account`) when it asks, so nothing here is read from the agent.
 const SERVER_APPROVAL = {
-  approval_id: 'ap-9',
-  run_id: 'run-7',
+  approvalId: 'ap-9',
+  runId: 'run-7',
   capability: 'account_login',
   summary: 'code-implementer używa Twojego konta Claude Code',
   account: {
-    engine_id: 'codex',
-    engine_name: 'Codex',
+    engineId: 'codex',
+    engineName: 'Codex',
     mode: 'user',
-    agent_name: 'code-implementer',
-    account_id: null,
-    account_name: '',
+    agentName: 'code-implementer',
+    accountId: null,
+    accountName: '',
   },
 };
 
@@ -156,7 +156,7 @@ test('an account that lost its credential asks for a new sign-in, not for a new 
     const create = mod.accountAskFromApproval(SERVER_APPROVAL);
     const again = mod.accountAskFromApproval({
       ...SERVER_APPROVAL,
-      account: { ...SERVER_APPROVAL.account, account_id: 'acc-1', account_name: 'Codex — firma' },
+      account: { ...SERVER_APPROVAL.account, accountId: 'acc-1', accountName: 'Codex — firma' },
     });
     assert.equal(again.account.accountId, 'acc-1', `${lang} existing account id`);
     assert.equal(
@@ -174,7 +174,7 @@ test('an account that lost its credential asks for a new sign-in, not for a new 
 test('a shared account that lost its sign-in sends a non-administrator to one, and lets an administrator fix it', () => {
   const shared = {
     ...SERVER_APPROVAL,
-    account: { ...SERVER_APPROVAL.account, mode: 'global', account_id: 'acc-9', account_name: 'Codex — firma' },
+    account: { ...SERVER_APPROVAL.account, mode: 'global', accountId: 'acc-9', accountName: 'Codex — firma' },
   };
   for (const [lang, root] of LOCALES) {
     const member = MODULES.get(lang);
@@ -265,8 +265,8 @@ test('the line in the stream says an account is missing, not that a permission i
 
 test('the chip names the engine and the mode, and the account when it is known', () => {
   const cases = [
-    [{ engine_name: 'Codex', account_name: 'Codex — firma', mode: 'global' }, true],
-    [{ engine_name: 'Codex', account_name: '', mode: 'user' }, false],
+    [{ engineName: 'Codex', accountName: 'Codex — firma', mode: 'global' }, true],
+    [{ engineName: 'Codex', accountName: '', mode: 'user' }, false],
   ];
   for (const [lang, root] of LOCALES) {
     const mod = MODULES.get(lang);
@@ -386,12 +386,12 @@ function ingestWorld(locale, runs) {
 function evt(seq, kind, runId, payload, agentId = '') {
   return {
     seq,
-    event_id: `e${seq}`,
+    eventId: `e${seq}`,
     kind,
-    run_id: runId,
-    agent_id: agentId,
-    created_at: '2026-09-17T10:00:00Z',
-    payload_json: JSON.stringify(payload),
+    runId: runId,
+    agentId: agentId,
+    createdAt: '2026-09-17T10:00:00Z',
+    payloadJson: JSON.stringify(payload),
   };
 }
 
@@ -399,11 +399,11 @@ function evt(seq, kind, runId, payload, agentId = '') {
 // from the run row, which the server resolves.
 const AGENT_UUID = '00000000-0000-4000-8000-000000000031';
 const SPAWNED_RUN = {
-  run_id: 'run-sub',
+  runId: 'run-sub',
   kind: 'subagent',
-  agent_id: AGENT_UUID,
-  agent_name: 'code-planner',
-  account: { engine_name: 'Codex', account_name: 'Codex — firma', mode: 'global' },
+  agentId: AGENT_UUID,
+  agentName: 'code-planner',
+  account: { engineName: 'Codex', accountName: 'Codex — firma', mode: 'global' },
 };
 
 test('a sub-agent spawn is announced once in the console and its later events are not', () => {
@@ -454,7 +454,7 @@ test('the announcement is not doubled when its pane is open or the poll repeats 
 
 test('a root run still opens the console with a turn, not a spawn row', () => {
   const [, root] = LOCALES.find(([lang]) => lang === 'en');
-  const w = ingestWorld(root, [{ run_id: 'run-root', kind: 'root', account: null }]);
+  const w = ingestWorld(root, [{ runId: 'run-root', kind: 'root', account: null }]);
   w.ingestEvents([evt(1, 'run_started', 'run-root', { kind: 'root', trigger: 'user' })]);
   const rows = w.appends.filter((a) => a.stream === 'console');
   assert.equal(rows.length, 1, 'the root run did not open the console once');

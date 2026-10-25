@@ -1,13 +1,14 @@
 // =============================================================================
 // File: modules/chat.js — User-facing Chat app.
-// Layout (matches design chat-redesign-20260430):
-//   [conversations sidebar 296px] | [model picker + title + actions |
-//    centered max-800px virtualized body | composer pill]
-// Virtualization: VirtualList mounted directly on .chat-body. The centered
-// 800px column is achieved via `padding-inline: max(24px, calc((100% - 800px)/2))`
-// on .chat-body so the vlist host stays full-width and the scrollbar sits at
-// the viewport edge. Streaming uses incremental tail-only height updates (O(1)
-// per chunk).
+// Layout (mockups/chat-20261024): [conversation list | top bar of three equal
+// cells (Decode, TTFT, Chat|Audio) / body / composer]. The body is a
+// virtualized message list in text mode and the face stage (chat-audio-view.js)
+// in audio mode; both belong to the same conversation, so switching keeps it.
+// Virtualization: VirtualList mounted directly on .chat-body. The centred
+// 736px column is achieved through padding-inline on .chat-body, so the vlist
+// host stays full width and the scrollbar sits at the edge of the screen.
+// The decode speed and TTFT in the bar come only from the stream of the
+// active conversation (lib/chat-metrics.js), never from node-wide counters.
 // Conversations: persisted locally (localStorage) — server history API is
 // a future addition.
 // =============================================================================
@@ -18,8 +19,11 @@ import { I18n } from '/js/i18n.js';
 import { measureItemHeight, getDefaultFont, getDefaultLineHeight } from '/js/lib/text-measure.js';
 import { createVirtualList } from '/js/lib/virtual-list.js';
 import { renderMarkdown, extractPlainText } from '/js/lib/md-lite.js';
+import { DecodeMeter, SessionMetrics, sparkMarkup, fmtRate } from '/js/lib/chat-metrics.js';
+import { TfWindow } from '/js/components/tf-window.js';
 import FaceBackground from '/js/modules/faceBackground.js';
 import { AudioPipeline } from '/js/modules/chat-audio.js';
+import { createAudioView } from '/js/modules/chat-audio-view.js';
 import '/js/components/tf-agent-activity.js';
 import { attachAgentActivity } from '/js/lib/agent-activity-bridge.js';
 
@@ -28,45 +32,64 @@ const STORAGE_KEY = 'tentaflow_chat_conversations_v1';
 // Chat has no flow picker: every turn, typed or spoken, runs on this one.
 const DEFAULT_CHAT_FLOW_ID = '00000000-0000-4000-8000-000000000010';
 const MAX_INPUT_CHARS = 4096;
-// Bubble chrome (avatar 36 + gap 12 + bubble padding 16+16). User messages do
-// not span the full inner column; assistant messages do. Heuristic — overscan
-// in VirtualList absorbs small drift from <think>/code blocks.
-const AVATAR_AND_GAP_PX = 36 + 12;
-const BUBBLE_PADDING_PX = 16 + 16;
-const USER_BUBBLE_MAX = 680;
+const MIC_PLACEHOLDER = '🎤';
+const STREAM_SAVE_MS = 400;
+const SAMPLE_INTERVAL_MS = 1000;
+const WEEK_MS = 7 * 86_400_000;
+
+// Attachments are inlined into the prompt, so they are text and they are small.
+const ATTACH_MAX_FILES = 5;
+const ATTACH_MAX_BYTES = 256 * 1024;
+const ATTACH_ACCEPT = 'text/*,.md,.json,.csv,.log,.yaml,.yml,.toml,.xml,.html,.css,.js,.ts,.py,.rs,.go,.java,.c,.cpp,.h,.sh,.sql';
+
+// Reading column: 28px avatar + 12px gap; the user bubble is capped like the CSS.
+const AVATAR_AND_GAP_PX = 28 + 12;
+const USER_BUBBLE_MAX = 640;
+const USER_BUBBLE_PADDING_PX = 28;
 const FENCE_HEADER_PX = 30;
 const THINK_COLLAPSED_PX = 40;
 
-let unsubscribe = null;
-// Teardown for the per-session agent-activity run-events subscription. Re-bound
-// on every conversation switch (each conversation is its own session scope).
-let agentActivityTeardown = null;
 let conversations = [];
 let activeConvId = null;
 let vlist = null;
-let resizeListener = null;
-let listWidth = 800;
+let listWidth = 736;
 let nextMsgId = 1;
 let searchFilter = '';
 
-// Tryb audio — handle do FaceBackground.embed. null gdy aktywna rozmowa jest
-// w trybie tekstowym, niepusty gdy audio.
-let faceHandle = null;
+// Teardown for the per-session agent-activity run-events subscription. Re-bound
+// on every conversation switch (each conversation is its own session scope).
+let agentActivityTeardown = null;
 // The Default Chat flow row, resolved once at mount(). Models (LLM/STT/TTS)
 // are picked INSIDE that flow in the Flow Builder, so the browser sends no
-// model id at all — a flow with no models has to say so, not quietly answer on
-// whatever model happens to be deployed first. null when the flow is missing.
+// model id at all. null when the flow is missing.
 let defaultChatFlow = null;
-let escKeyHandler = null;
 
-// AudioPipeline (Etap 2) — zywy obiekt tylko gdy aktywna konwersacja jest w
-// trybie audio I uzytkownik kliknal mic (gesture-gate). null w pozostalych
-// stanach. spaceHeldHandler trzymamy w globalu zeby unmount() mogl je
-// odlaczyc razem z escKeyHandler.
+// One generation at a time: { conv, msg, meter, sampler, unsub, cancelled, kind }.
+let turn = null;
+// Decode/TTFT series per conversation, seeded from the answers already stored.
+const metricsByConv = new Map();
+// Files picked for the next message.
+let pendingFiles = [];
+let userInitials = '?';
+// Conversation the open ⋮ menu belongs to.
+let menuConvId = null;
+
+// Server link as the UI sees it; the platform overlay owns the reconnect UI.
+let conn = { lost: false };
+let offLifecycle = null;
+
+let audioView = null;
+let faceHandle = null;
 let audioPipeline = null;
+let audioUi = { state: 'idle', text: '' };
+let escKeyHandler = null;
+let pageHideHandler = null;
 let spaceKeydownHandler = null;
 let spaceKeyupHandler = null;
 let spaceHeld = false;
+let bodyResizeObserver = null;
+
+const t = (key, vars) => I18n.t(`chat.${key}`, vars);
 
 // ---- Persistence ---------------------------------------------------------
 
@@ -75,7 +98,18 @@ function loadConversations() {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    // A page that was closed or reloaded mid-answer saved it while streaming;
+    // no stream exists any more, so it becomes an interrupted answer.
+    for (const conv of parsed) {
+      for (const msg of conv.messages || []) {
+        if (!msg.streaming) continue;
+        msg.streaming = false;
+        msg.status = '';
+        msg.failed = { kind: 'interrupted' };
+      }
+    }
+    return parsed;
   } catch {
     return [];
   }
@@ -91,36 +125,33 @@ function saveConversations() {
   }
 }
 
-function defaultAudioConfig() {
-  // `language` is the per-conversation transcription language, overwritten
-  // from I18n.getLanguage() when the pipeline starts.
-  return {
-    language: 'pl',
-  };
-}
-
-function newConversation(title) {
+function newConversation() {
   const id = `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
   return {
     id,
-    title: title || I18n.t('chat.new_conversation') || 'Nowa rozmowa',
+    // Empty until the first message names it or the user renames it; the list
+    // shows the localized "new conversation" label meanwhile.
+    title: '',
+    renamed: false,
     createdAt: Date.now(),
     updatedAt: Date.now(),
     messages: [],
     mode: 'text',
-    audioConfig: defaultAudioConfig(),
+    // `language` is the per-conversation transcription language, overwritten
+    // from I18n.getLanguage() when the pipeline starts.
+    audioConfig: { language: 'pl' },
   };
 }
 
-// Migracja konwersacji wczytanych z localStorage (sprzed wprowadzenia
-// trybu audio). In-place — wolane zaraz po loadConversations(). Bez bumpu
-// klucza STORAGE_KEY zeby nie tracic istniejacych rozmow uzytkownika.
+// Conversations stored by older builds: no mode, no audio config, and a
+// localized placeholder saved as the title of an empty conversation.
 function migrateConversations(list) {
   for (const c of list) {
     if (typeof c.mode !== 'string') c.mode = 'text';
-    if (!c.audioConfig || typeof c.audioConfig !== 'object') {
-      c.audioConfig = defaultAudioConfig();
-    }
+    if (!c.audioConfig || typeof c.audioConfig !== 'object') c.audioConfig = { language: 'pl' };
+    if (typeof c.renamed !== 'boolean') c.renamed = false;
+    if (!c.renamed && c.messages.length === 0) c.title = '';
+    for (const m of c.messages) delete m.modelLabel;
   }
 }
 
@@ -128,98 +159,129 @@ function activeConv() {
   return conversations.find((c) => c.id === activeConvId) || null;
 }
 
-// ---- Sidebar rendering ---------------------------------------------------
+function convTitle(conv) {
+  return conv.title || t('new_conversation');
+}
+
+function isVoiceConv(conv) {
+  return conv.mode === 'audio' || conv.messages.some((m) => m.via === 'voice');
+}
+
+// ---- Small helpers -------------------------------------------------------
 
 function sprite(id) {
   return `<svg class="icon"><use href="#i-${id}"/></svg>`;
 }
 
-function formatTime(ts) {
-  const diff = Date.now() - ts;
-  if (diff < 60_000) return 'teraz';
-  if (diff < 3600_000) return `${Math.floor(diff / 60_000)} min`;
-  if (diff < 86400_000) return `${Math.floor(diff / 3600_000)} h`;
-  return `${Math.floor(diff / 86400_000)} d`;
+function clock(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-function lastMessagePreview(conv) {
-  const last = conv.messages[conv.messages.length - 1];
-  if (!last) return '';
-  const prefix = last.role === 'user' ? 'User: ' : last.role === 'assistant' ? 'AI: ' : '';
-  const text = extractPlainText(last.text || '');
-  return prefix + (text.length > 60 ? `${text.slice(0, 60)}…` : text);
+// Translation strings mark emphasis with <b>; everything else stays inert text.
+function richText(text) {
+  return escapeHtml(text).replaceAll('&lt;b&gt;', '<b>').replaceAll('&lt;/b&gt;', '</b>');
 }
 
-// Group conversations into Today / Yesterday / Earlier buckets for sidebar.
-function groupByDay(items) {
+function lang() {
+  return (I18n.getLanguage && I18n.getLanguage()) || 'en';
+}
+
+// One line, whatever the message looked like.
+function titleFrom(text) {
+  const line = text.replace(/\s+/g, ' ').trim();
+  return line.slice(0, 40) + (line.length > 40 ? '…' : '');
+}
+
+function startOfToday() {
   const now = new Date();
-  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const startOfYesterday = startOfToday - 86_400_000;
-  const today = [];
-  const yesterday = [];
-  const earlier = [];
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+}
+
+// ---- Conversation list ---------------------------------------------------
+
+function groupByDay(items) {
+  const today0 = startOfToday();
+  const yesterday0 = today0 - 86_400_000;
+  const buckets = [
+    { label: t('day_now'), items: [] },
+    { label: t('day_today'), items: [] },
+    { label: t('day_yesterday'), items: [] },
+    { label: t('day_week'), items: [] },
+    { label: t('day_earlier'), items: [] },
+  ];
   for (const c of items) {
-    if (c.updatedAt >= startOfToday) today.push(c);
-    else if (c.updatedAt >= startOfYesterday) yesterday.push(c);
-    else earlier.push(c);
+    if (c.messages.length === 0) buckets[0].items.push(c);
+    else if (c.updatedAt >= today0) buckets[1].items.push(c);
+    else if (c.updatedAt >= yesterday0) buckets[2].items.push(c);
+    else if (c.updatedAt >= today0 - WEEK_MS) buckets[3].items.push(c);
+    else buckets[4].items.push(c);
   }
-  const groups = [];
-  if (today.length) groups.push({ label: I18n.t('chat.day_today') || 'Dziś', items: today });
-  if (yesterday.length) groups.push({ label: I18n.t('chat.day_yesterday') || 'Wczoraj', items: yesterday });
-  if (earlier.length) groups.push({ label: I18n.t('chat.day_earlier') || 'Wcześniej', items: earlier });
-  return groups;
+  return buckets.filter((b) => b.items.length > 0);
+}
+
+// Time of day for today and yesterday, weekday within the last week, else date.
+function convWhen(conv) {
+  const today0 = startOfToday();
+  const ts = conv.updatedAt;
+  if (ts >= today0 - 86_400_000) return clock(ts);
+  const d = new Date(ts);
+  if (ts >= today0 - WEEK_MS) return new Intl.DateTimeFormat(lang(), { weekday: 'short' }).format(d);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}`;
+}
+
+function convMeta(conv) {
+  const when = convWhen(conv);
+  if (conv.messages.length === 0) return t('conv_empty');
+  return isVoiceConv(conv) ? t('voice_meta', { time: when }) : when;
+}
+
+function convMatches(conv, needle) {
+  if (convTitle(conv).toLowerCase().includes(needle)) return true;
+  return conv.messages.some((m) => extractPlainText(m.text || '').toLowerCase().includes(needle));
 }
 
 function renderConvItem(conv) {
   const isActive = conv.id === activeConvId;
-  const isAudioActive = conv.mode === 'audio' && isActive;
-  let cls = 'conv-item';
-  if (isActive) cls += ' active';
-  if (isAudioActive) cls += ' audio-now';
-  const liveDot = isAudioActive ? '<span class="live-dot" aria-hidden="true"></span>' : '';
+  const voice = isVoiceConv(conv);
+  const live = isActive && conv.mode === 'audio';
   return `
-    <div class="${cls}" data-conv-id="${escapeHtml(conv.id)}">
-      <span class="conv-title">${liveDot}${escapeHtml(conv.title)}</span>
-      <span class="conv-time">${escapeHtml(formatTime(conv.updatedAt))}</span>
-      <span class="conv-snippet">${escapeHtml(lastMessagePreview(conv))}</span>
-    </div>
-  `;
+    <div class="conv-item${isActive ? ' active' : ''}" data-conv-id="${escapeHtml(conv.id)}" role="button" tabindex="0">
+      <div class="conv-item__title">${voice ? sprite('mic') : (conv.messages.length === 0 ? sprite('message') : '')}<span>${escapeHtml(convTitle(conv))}</span>${live ? '<span class="conv-live" aria-hidden="true"></span>' : ''}</div>
+      <div class="conv-item__meta">${escapeHtml(convMeta(conv))}</div>
+      <tf-button class="conv-more" variant="ghost" size="sm" icon="more-v" data-conv-more="${escapeHtml(conv.id)}"
+        aria-label="${escapeHtml(t('conv_more'))}" aria-haspopup="menu"></tf-button>
+    </div>`;
 }
 
 function renderConvList() {
   const host = byId('chat-conv-list');
   if (!host) return;
-  const filter = searchFilter.trim().toLowerCase();
-  const filtered = filter
-    ? conversations.filter((c) =>
-        c.title.toLowerCase().includes(filter) ||
-        lastMessagePreview(c).toLowerCase().includes(filter))
-    : conversations.slice();
-  filtered.sort((a, b) => b.updatedAt - a.updatedAt);
+  const needle = searchFilter.trim().toLowerCase();
+  const filtered = (needle ? conversations.filter((c) => convMatches(c, needle)) : conversations.slice())
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+  const foot = byId('chat-conv-foot');
+  if (foot) foot.textContent = t('conv_footer', { count: conversations.length });
   if (filtered.length === 0) {
-    host.innerHTML = `<div class="conv-empty">${escapeHtml(I18n.t('chat.no_conversations') || 'Brak rozmów')}</div>`;
+    host.innerHTML = `<div class="conv-empty">${escapeHtml(t('no_conversations'))}</div>`;
     return;
   }
-  const groups = groupByDay(filtered);
-  host.innerHTML = groups
-    .map((g) => `<div class="conv-day">${escapeHtml(g.label)}</div>${g.items.map(renderConvItem).join('')}`)
+  host.innerHTML = groupByDay(filtered)
+    .map((g) => `<div class="conv-grp">${escapeHtml(g.label)}</div>${g.items.map(renderConvItem).join('')}`)
     .join('');
-  host.querySelectorAll('.conv-item').forEach((el) => {
-    el.addEventListener('click', () => {
-      const id = el.dataset.convId;
-      if (id && id !== activeConvId) selectConversation(id);
-      // Close drawer on mobile pick.
-      document.querySelector('.chat-shell')?.classList.remove('drawer-open');
-    });
-  });
 }
 
-// ---- Bubble rendering ----------------------------------------------------
+function closeDrawer() {
+  byId('chat-shell')?.classList.remove('conv-open');
+}
 
-// Persistowany stan rozwiniecia <think> blokow per (msgId, blockIdx). Mapa
-// zyje przez cala sesje GUI — virtualizer re-renderuje bubble przy scrollu,
-// bez tej mapy `<details>` traci `open` po wyjsciu z viewport. Klucz to
-// `${msgId}-${blockIdx}`. Brak wpisu = uzyj defaultu (streaming -> open).
+// ---- Message rendering ---------------------------------------------------
+
+// Persisted <think> open state per (msgId, blockIdx): the virtualizer re-renders
+// bubbles on scroll, and without this map a `<details>` would lose `open`.
 const thinkOpenState = new Map();
 
 function getThinkOpenState(key) {
@@ -227,187 +289,154 @@ function getThinkOpenState(key) {
   return thinkOpenState.has(key) ? thinkOpenState.get(key) : undefined;
 }
 
-function renderBubble(msg) {
+function whoLine(msg) {
+  const name = msg.role === 'user' ? t('you') : t('assistant');
+  return `${escapeHtml(name)} · ${escapeHtml(clock(msg.ts))}`;
+}
+
+function attachmentChips(msg) {
+  if (!msg.attachments?.length) return '';
+  const chips = msg.attachments.map((a) => `<tf-chip icon="file" mono>${escapeHtml(a.name)}</tf-chip>`).join('');
+  return `<div class="chat-msg__files">${chips}</div>`;
+}
+
+function metaChips(msg) {
+  const p = msg.perf || {};
+  const chips = [];
+  if (p.decodeTps > 0) chips.push(`<tf-chip tag variant="outline" mono status="accent" icon="zap">${escapeHtml(fmtRate(p.decodeTps, lang()))} ${escapeHtml(t('perf_decode'))}</tf-chip>`);
+  if (p.ttftMs > 0) chips.push(`<tf-chip tag variant="outline" mono status="neutral">${escapeHtml(t('perf_ttft'))} ${Math.round(p.ttftMs)} ms</tf-chip>`);
+  if (p.completionTokens > 0) chips.push(`<tf-chip tag variant="outline" mono status="neutral">${Math.round(p.completionTokens)} ${escapeHtml(t('perf_tokens'))}</tf-chip>`);
+  if (msg.stopped) chips.push(`<tf-chip tag variant="outline" mono status="warn">${escapeHtml(t('stopped'))}</tf-chip>`);
+  return chips.join('');
+}
+
+// What each failure says; a fragment is only "kept" when there is one.
+const FAILURE_TEXT = {
+  interrupted: { kept: 'err_interrupted', none: 'err_interrupted_empty' },
+  fault: { kept: 'err_generic', none: 'err_generic_empty' },
+  unavailable: { kept: 'unavailable', none: 'unavailable' },
+  empty: { kept: 'err_generic', none: 'err_empty' },
+};
+
+function failureBox(msg) {
+  const chars = (msg.text || '').length;
+  const title = chars > 0 ? t('err_title', { count: chars }) : t('err_title_empty');
+  const detail = t(FAILURE_TEXT[msg.failed.kind][chars > 0 ? 'kept' : 'none']);
+  return `
+    <div class="chat-msg__error">
+      <tf-alert tone="danger" icon="alert" inline-actions title="${escapeHtml(title)}" message="${escapeHtml(detail)}">
+        <div slot="actions"><tf-button variant="secondary" size="sm" icon="play" data-act="resume">${escapeHtml(t('err_resume'))}</tf-button></div>
+      </tf-alert>
+    </div>`;
+}
+
+// The entry animation belongs to the first insertion only: updateTail
+// rewrites the tail's markup on every token, and a CSS animation restarts
+// with each new element.
+const enteredMessages = new WeakSet();
+function enterClass(msg) {
+  if (enteredMessages.has(msg)) return '';
+  enteredMessages.add(msg);
+  return ' chat-msg--enter';
+}
+
+function renderMessage(index, msg) {
   const isUser = msg.role === 'user';
-  const isSystem = msg.role === 'system';
-  const cls = isUser ? 'user' : (isSystem ? 'system' : 'assistant');
-  const isStreaming = msg.streaming === true;
-
-  const bubbleHtml = isUser
-    ? escapeHtml(msg.text || '').replaceAll('\n', '<br>')
-    : renderMarkdown(msg.text || '', {
-        streaming: isStreaming,
-        thinkKeyPrefix: String(msg.id || ''),
-        getThinkOpen: getThinkOpenState,
-      });
-  const streamCaret = isStreaming && !isUser ? '<span class="streaming-caret"></span>' : '';
-
-  const avatar = isUser
-    ? '<div class="avatar user">U</div>'
-    : isSystem
-      ? ''
-      : `<div class="avatar assistant">${sprite('model')}</div>`;
-
-  const timeStr = formatBubbleTime(msg.ts);
-  const meta = isUser
-    ? `<div class="bubble-meta"><span>${timeStr}</span><span class="who">${escapeHtml(I18n.t('chat.you') || 'Ty')}</span></div>`
-    : `<div class="bubble-meta"><span class="who">${escapeHtml(msg.modelLabel || I18n.t('chat.assistant') || 'Asystent')}</span><span>·</span><span>${timeStr}</span></div>`;
-
-  // Stopka metryk inferencji — tylko dla gotowych (nie-streaming) odpowiedzi
-  // asystenta z dostepnymi liczbami z ChatStreamEnd.
-  const perf = (!isUser && !isStreaming) ? renderPerfFooter(msg.perf) : '';
-  // Live step of an answer still being generated ("narzędzie · search_web",
-  // "Odpalam 3 agentów"). Only while streaming: once the turn settles the
-  // timeline in the activity widget is the record, not this line.
-  const statusRow = (!isUser && isStreaming && msg.status)
-    ? `<div class="bubble-status" role="status" aria-live="polite">
-        <span class="bubble-status-dot"></span>
-        <span class="bubble-status-text">${escapeHtml(msg.status)}</span>
-      </div>`
+  const streaming = msg.streaming === true;
+  if (isUser) {
+    return `
+      <div class="chat-msg user${enterClass(msg)}" data-msg-id="${msg.id}">
+        <div class="chat-msg__av" aria-hidden="true">${escapeHtml(userInitials)}</div>
+        <div class="chat-msg__body">
+          <div class="chat-msg__who">${whoLine(msg)}</div>
+          ${attachmentChips(msg)}
+          <div class="chat-msg__txt">${escapeHtml(msg.text || '').replaceAll('\n', '<br>')}</div>
+        </div>
+      </div>`;
+  }
+  const conv = activeConv();
+  const isLast = !!conv && index === conv.messages.length - 1;
+  const hasText = (msg.text || '').length > 0;
+  const body = hasText
+    ? renderMarkdown(msg.text, { streaming, thinkKeyPrefix: String(msg.id), getThinkOpen: getThinkOpenState })
     : '';
-
-  const actions = isUser ? renderUserActions() : renderAssistantActions();
-
+  const caret = streaming ? '<span class="chat-caret"></span>' : '';
+  // The caret has to sit inside the last block, or it lands on a line of its own.
+  const bodyWithCaret = /<\/code><\/pre><\/div>$/.test(body)
+    ? body.replace(/<\/code><\/pre><\/div>$/, `${caret}</code></pre></div>`)
+    : /<\/(?:p|li)>(?:\s*<\/(?:ul|ol)>)*\s*$/.test(body)
+    ? body.replace(/(<\/(?:p|li)>(?:\s*<\/(?:ul|ol)>)*\s*)$/, `${caret}$1`)
+    : body + caret;
+  const waiting = streaming && !hasText && !msg.status
+    ? '<span class="chat-typing" aria-hidden="true"><span></span><span></span><span></span></span>'
+    : '';
+  // Live step of an answer still being generated ("narzędzie · search_web").
+  // Only while streaming: once the turn settles the activity widget holds the record.
+  const status = streaming && msg.status
+    ? `<div class="chat-msg__status" role="status" aria-live="polite"><span class="chat-msg__status-dot"></span><span>${escapeHtml(msg.status)}</span></div>`
+    : '';
+  const settled = !streaming && !msg.failed;
+  const chips = settled ? metaChips(msg) : '';
+  const acts = streaming ? '' : `
+    <span class="chat-msg__acts">
+      <tf-button variant="ghost" size="sm" icon="copy" data-act="copy" aria-label="${escapeHtml(t('copy'))}" title="${escapeHtml(t('copy'))}"></tf-button>
+      ${isLast ? `<tf-button variant="ghost" size="sm" icon="refresh" data-act="regenerate" aria-label="${escapeHtml(t('regenerate'))}" title="${escapeHtml(t('regenerate'))}"></tf-button>` : '<span class="chat-msg__acts-gap" aria-hidden="true"></span>'}
+    </span>`;
   return `
-    <div class="msg-row ${cls}" data-msg-id="${msg.id}">
-      ${isUser ? `
-        <div class="bubble-wrap">
-          ${meta}
-          <div class="bubble">${bubbleHtml}${streamCaret}</div>
-          ${actions}
-        </div>
-        ${avatar}
-      ` : `
-        ${avatar}
-        <div class="bubble-wrap">
-          ${meta}
-          ${statusRow}
-          <div class="bubble">${bubbleHtml}${streamCaret}</div>
-          ${perf}
-          ${actions}
-        </div>
-      `}
-    </div>
-  `;
-}
-
-function formatBubbleTime(ts) {
-  if (!ts) return '';
-  const d = new Date(ts);
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-// Stopka z metrykami inferencji pod odpowiedzia asystenta. Zwraca pusty string
-// gdy brak danych albo gdy wszystkie wartosci sa zerowe (nie ma czego pokazac).
-function renderPerfFooter(perf) {
-  if (!perf) return '';
-  const completionTokens = Number(perf.completionTokens || 0);
-  const decodeTps = Number(perf.decodeTps || 0);
-  const ttftMs = Number(perf.ttftMs || 0);
-  const prefillTps = Number(perf.prefillTps || 0);
-  const totalMs = Number(perf.totalMs || 0);
-  if (!completionTokens && !decodeTps && !ttftMs && !prefillTps && !totalMs) return '';
-
-  const lblTok = escapeHtml(I18n.t('chat.perf_tokens') || 'tok');
-  const lblDecode = escapeHtml(I18n.t('chat.perf_decode') || 'tok/s');
-  const lblTtft = escapeHtml(I18n.t('chat.perf_ttft') || 'TTFT');
-  const lblPrefill = escapeHtml(I18n.t('chat.perf_prefill') || 'prefill');
-  const lblTotal = escapeHtml(I18n.t('chat.perf_total') || 'łącznie');
-
-  const parts = [];
-  if (completionTokens) parts.push(`${completionTokens} ${lblTok}`);
-  if (decodeTps) parts.push(`${Math.round(decodeTps)} ${lblDecode}`);
-  if (ttftMs) parts.push(`${lblTtft} ${Math.round(ttftMs)} ms`);
-  if (prefillTps) parts.push(`${lblPrefill} ${Math.round(prefillTps)} ${lblDecode}`);
-  if (totalMs) parts.push(`${lblTotal} ${(totalMs / 1000).toFixed(totalMs < 10000 ? 2 : 1)} s`);
-
-  return `<div class="bubble-perf">${parts.join(' · ')}</div>`;
-}
-
-function renderUserActions() {
-  return `
-    <div class="msg-actions">
-      <button type="button" class="msg-act" data-act="copy" title="${escapeHtml(I18n.t('chat.copy') || 'Kopiuj')}">${sprite('copy')}</button>
-      <button type="button" class="msg-act" data-act="edit" title="${escapeHtml(I18n.t('chat.edit') || 'Edytuj')}">${sprite('edit')}</button>
-    </div>
-  `;
-}
-
-function renderAssistantActions() {
-  return `
-    <div class="msg-actions">
-      <button type="button" class="msg-act" data-act="copy" title="${escapeHtml(I18n.t('chat.copy') || 'Kopiuj')}">${sprite('copy')}</button>
-      <button type="button" class="msg-act" data-act="regenerate" title="${escapeHtml(I18n.t('chat.regenerate') || 'Regeneruj')}">${sprite('refresh')}</button>
-    </div>
-  `;
+    <div class="chat-msg ai${enterClass(msg)}" data-msg-id="${msg.id}">
+      <div class="chat-msg__av" aria-hidden="true">${sprite('sparkles')}</div>
+      <div class="chat-msg__body">
+        <div class="chat-msg__who">${whoLine(msg)}</div>
+        ${status}
+        <div class="chat-msg__txt">${bodyWithCaret}${waiting}</div>
+        ${msg.failed ? failureBox(msg) : ''}
+        ${streaming || (!chips && !acts) ? '' : `<div class="chat-msg__meta">${chips}${acts}</div>`}
+      </div>
+    </div>`;
 }
 
 // ---- Height heuristics ---------------------------------------------------
 
-function measureBubbleHeight(text, maxWidth) {
-  const txtHeight = measureItemHeight(text || ' ', {
-    font: getDefaultFont(),
-    maxWidth: Math.max(80, maxWidth),
-    lineHeight: getDefaultLineHeight(),
-  });
-  return txtHeight;
-}
-
-// itemHeight is a heuristic (overscan absorbs the drift). For assistant
-// messages with code fences / <think> blocks, add fixed-cost extras instead
-// of doing per-segment monospace measurement — good enough for the virtualizer.
+// itemHeight is a heuristic (the virtualizer measures real heights once an item
+// is on screen). Fences and <think> blocks get fixed-cost extras instead of
+// per-segment monospace measurement.
 function itemHeight(msg) {
-  const innerWidth = listWidth || 800;
+  const inner = listWidth || 736;
   const isUser = msg.role === 'user';
-  const bubbleMax = isUser
-    ? Math.min(USER_BUBBLE_MAX, innerWidth) - BUBBLE_PADDING_PX
-    : (innerWidth - AVATAR_AND_GAP_PX - BUBBLE_PADDING_PX);
+  const colWidth = inner - AVATAR_AND_GAP_PX;
+  const bubbleMax = isUser ? Math.min(USER_BUBBLE_MAX, colWidth * 0.8) - USER_BUBBLE_PADDING_PX : colWidth;
   const text = msg.text || '';
 
   let extra = 0;
-  let measuredText = text;
+  let measured = text;
   if (!isUser) {
-    const fenceMatches = text.match(/```/g) || [];
-    extra += Math.floor(fenceMatches.length / 2) * FENCE_HEADER_PX;
-    // Thinking block jest collapsed w DOM (md-lite renderuje <details>), wiec
-    // jego dlugosc tekstu NIE liczy sie do wysokosci bubble — zliczamy tylko
-    // chip (THINK_COLLAPSED_PX). Detekcja implicit-open: jezeli widzimy
-    // </think> bez wczesniejszego <think>, calosc PRZED tagiem to thinking.
-    const closingRe = /<\/think(?:ing)?>/gi;
-    const explicitRe = /<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/gi;
+    extra += Math.floor((text.match(/```/g) || []).length / 2) * FENCE_HEADER_PX;
+    // A <think> block is collapsed in the DOM, so its text does not count toward
+    // the height; only the chip does. `</think>` without a preceding `<think>`
+    // means everything before the tag is thinking.
     let stripped = text;
-    let blockCount = 0;
-    stripped = stripped.replace(explicitRe, () => {
-      blockCount += 1;
-      return '';
-    });
-    const closes = stripped.match(closingRe);
-    if (closes && closes.length > 0) {
-      const lastClose = stripped.search(/<\/think(?:ing)?>[^<]*$/i);
-      if (lastClose >= 0) {
-        const tagEnd = stripped.indexOf('>', lastClose) + 1;
-        stripped = stripped.slice(tagEnd);
-        blockCount += 1;
-      }
+    let blocks = 0;
+    stripped = stripped.replace(/<think(?:ing)?>([\s\S]*?)<\/think(?:ing)?>/gi, () => { blocks += 1; return ''; });
+    const lastClose = stripped.search(/<\/think(?:ing)?>[^<]*$/i);
+    if (lastClose >= 0) {
+      stripped = stripped.slice(stripped.indexOf('>', lastClose) + 1);
+      blocks += 1;
     }
-    extra += blockCount * THINK_COLLAPSED_PX;
-    measuredText = stripped;
+    extra += blocks * THINK_COLLAPSED_PX;
+    measured = stripped;
   }
-
-  const txtHeight = measureBubbleHeight(measuredText, bubbleMax);
-  // Estymata przybliża PEŁNY offsetHeight itemu: bubble padding (24) + meta row
-  // (18) + actions (28) + 20px odstępu, który teraz jest realnym
-  // padding-bottom na `.chat-body .vlist-item` (więc wchodzi do offsetHeight).
-  // Dzięki temu estymata pierwszego renderu ≈ wartość zmierzona przez
-  // measureRendered i widok nie skacze, zanim pomiar skoryguje cache.
-  return Math.max(60, txtHeight + extra + 90);
+  const txt = measureItemHeight(measured || ' ', {
+    font: getDefaultFont(),
+    maxWidth: Math.max(80, bubbleMax),
+    lineHeight: getDefaultLineHeight(),
+  });
+  const chrome = isUser ? 22 + 24 : 22 + 44;
+  // + the 20px gap that is real padding-bottom on .vlist-item.
+  return Math.max(64, txt + extra + chrome + 20);
 }
 
-// ---- Virtual list mounting -----------------------------------------------
+// ---- Body: empty state / virtual list ------------------------------------
 
-// Inner column width (used by itemHeight) = host clientWidth minus left+right
-// computed padding. Centered 800px column comes from `.chat-body` padding-inline.
 function computeInnerWidth(host) {
   const cs = window.getComputedStyle(host);
   const pl = parseFloat(cs.paddingLeft) || 0;
@@ -415,10 +444,7 @@ function computeInnerWidth(host) {
   return Math.max(80, host.clientWidth - pl - pr);
 }
 
-// Delegated `toggle` listener na <details data-think-key>. Mountowany raz
-// per host przez `dataset.thinkToggleBound`, zeby remount listy nie podpinal
-// drugiej kopii. `toggle` event bublu, capture=true zlapie go z dowolnego
-// rozwinietego/zwinietego details w drzewie.
+// Delegated `toggle` listener on <details data-think-key>, bound once per host.
 function ensureThinkToggleListener(host) {
   if (!host || host.dataset.thinkToggleBound === '1') return;
   host.dataset.thinkToggleBound = '1';
@@ -426,572 +452,945 @@ function ensureThinkToggleListener(host) {
     const det = e.target;
     if (!(det instanceof HTMLDetailsElement)) return;
     const key = det.getAttribute('data-think-key');
-    if (!key) return;
-    thinkOpenState.set(key, det.open);
+    if (key) thinkOpenState.set(key, det.open);
   }, true);
 }
 
-function mountVList() {
+function destroyList() {
+  if (vlist) { vlist.destroy(); vlist = null; }
+}
+
+function emptyStateMarkup() {
+  const cards = [
+    ['code', 'sug_code', 'code'],
+    ['file', 'sug_doc', 'doc'],
+    ['gpu', 'sug_infra', 'infra'],
+    ['mic', 'sug_voice', 'voice'],
+  ].map(([icon, key, id]) => `
+    <tf-button wrap variant="ghost" icon="${icon}" data-suggest="${id}"><b>${escapeHtml(t(`${key}_cat`))}</b><i>${escapeHtml(t(`${key}_text`))}</i></tf-button>`).join('');
+  return `
+    <div class="chat-empty"><div>
+      <div class="chat-empty__ico">${sprite('sparkles')}</div>
+      <h2>${escapeHtml(t('empty_title'))}</h2>
+      <p>${escapeHtml(t('empty_text'))}</p>
+      <div class="chat-suggest">${cards}</div>
+    </div></div>`;
+}
+
+// Shows the list of the active conversation, or the empty state when it has no
+// messages yet (the list is mounted lazily by the first message).
+function mountBody() {
+  const host = byId('chat-body');
+  if (!host) return;
+  destroyList();
+  const conv = activeConv();
+  if (!conv || conv.messages.length === 0) {
+    host.innerHTML = emptyStateMarkup();
+    byId('chat-new-pill')?.classList.remove('visible');
+    return;
+  }
+  host.innerHTML = '';
+  mountVList(conv);
+}
+
+function mountVList(conv) {
   const host = byId('chat-body');
   if (!host) return;
   ensureThinkToggleListener(host);
   listWidth = computeInnerWidth(host);
-  const conv = activeConv();
-  const messages = conv ? conv.messages : [];
-  if (vlist) { vlist.destroy(); vlist = null; }
+  destroyList();
   vlist = createVirtualList(host, {
-    items: messages,
+    items: conv.messages,
     pinToBottom: true,
     measureHeights: true,
     overscan: 10,
     getItemHeight: (_i, msg) => itemHeight(msg),
-    renderItem: (_i, msg) => renderBubble(msg),
+    renderItem: (i, msg) => renderMessage(i, msg),
     onScroll: (_top, _dist, { pinned }) => {
-      const pill = byId('chat-new-pill');
-      if (!pill) return;
-      if (pinned) pill.classList.remove('visible');
+      if (pinned) byId('chat-new-pill')?.classList.remove('visible');
     },
   });
 }
 
 function remountIfWidthChanged() {
   const host = byId('chat-body');
-  if (!host) return;
+  if (!host || !vlist) return;
   const w = computeInnerWidth(host);
   if (Math.abs(w - listWidth) > 1) {
     listWidth = w;
-    vlist?.refresh();
+    vlist.refresh();
   }
 }
 
-// ---- Audio mode (Etap 1) -------------------------------------------------
-
-// Statyczna lista 8 dotow rozlozonych po obwodzie face-canvas. delay rozsuniety
-// rownomiernie 0..1.05s zeby pulse wygladal jak fala biegnaca dookola.
-const AMP_DOT_COUNT = 8;
-function renderAmpDots() {
-  let html = '';
-  for (let i = 0; i < AMP_DOT_COUNT; i++) {
-    const angle = (360 / AMP_DOT_COUNT) * i;
-    const delay = (i * 0.13).toFixed(2);
-    html += `<div class="amp-dot" style="--angle:${angle}deg;--delay:${delay}s"></div>`;
-  }
-  return html;
-}
-
-// Statyczne 20 barow waveform — animacja CSS waveDance, fazy rozsuniete.
-const WAVE_BAR_COUNT = 20;
-function renderWaveBars() {
-  let html = '';
-  for (let i = 0; i < WAVE_BAR_COUNT; i++) {
-    const delay = (i * 0.045).toFixed(3);
-    html += `<div class="bar" style="animation-delay:${delay}s"></div>`;
-  }
-  return html;
-}
-
-function renderAudioStage() {
-  // Tryb audio odpala Default Chat (z jego blokami STT/LLM/TTS i modelami) —
-  // nie ma tu zadnego wyboru flow ani silnikow, bo flow juz je ma.
-  const pendingTip = escapeHtml(I18n.t('chat.audio_pipeline_pending'));
-  return `
-    <div class="audio-stage" id="audio-stage" data-state="idle">
-      <div class="audio-status" id="audio-status">
-        <span class="dot"></span>
-        <span class="label" id="audio-status-label">${escapeHtml(I18n.t('chat.audio_state_idle'))}</span>
-        <span class="engine" id="audio-engine-name">${escapeHtml(defaultChatFlowLabel())}</span>
-      </div>
-      <aside class="rail" id="audio-rail">
-        <div class="rail-title">${escapeHtml(I18n.t('chat.audio_recent_entries'))}</div>
-      </aside>
-      <div class="face-stage">
-        <div class="face-canvas" id="chat-face-stage"></div>
-        ${renderAmpDots()}
-      </div>
-      <div class="subtitle" id="audio-subtitle">
-        <div class="who" id="audio-who"></div>
-        <div class="text" id="audio-text">${escapeHtml(I18n.t('chat.audio_preview_hint'))}</div>
-      </div>
-      <div class="wave" id="audio-wave">${renderWaveBars()}</div>
-      <div class="audio-controls">
-        <tf-button variant="ghost" icon="volume" id="audio-volume" disabled
-          aria-label="${pendingTip}" title="${pendingTip}"></tf-button>
-        <tf-button variant="primary" icon="mic" id="audio-mic" disabled
-          aria-label="${pendingTip}" title="${pendingTip}"></tf-button>
-        <tf-button variant="ghost" icon="pause" id="audio-pause" disabled
-          aria-label="${pendingTip}" title="${pendingTip}"></tf-button>
-        <tf-button variant="ghost" icon="x" id="audio-exit"
-          aria-label="${escapeHtml(I18n.t('chat.audio_exit'))}"
-          title="${escapeHtml(I18n.t('chat.audio_exit'))}">${escapeHtml(I18n.t('chat.audio_exit'))}</tf-button>
-      </div>
-    </div>
-  `;
-}
-
-// Name of the flow every turn runs on — shown in the audio status line.
-// A dash when it is missing; the toast on entering audio mode carries the why.
-function defaultChatFlowLabel() {
-  return defaultChatFlow?.name || '—';
-}
-
-// The flow reports an unconfigured block as "<llm|stt|tts> adapter: no model".
-// Chat no longer has a model picker, so the only actionable answer is: pick the
-// models inside Default Chat. Any other error is passed through verbatim.
-function chatFlowError(message) {
-  const raw = message || 'stream error';
-  return /no model/i.test(raw) ? I18n.t('chat.default_flow_no_models') : raw;
-}
-
-function renderRail() {
-  const conv = activeConv();
-  const rail = byId('audio-rail');
-  if (!rail || !conv) return;
-  const last = conv.messages.slice(-4);
-  const titleHtml = `<div class="rail-title">${escapeHtml(I18n.t('chat.audio_recent_entries'))}</div>`;
-  if (last.length === 0) {
-    rail.innerHTML = titleHtml +
-      `<div class="rail-msg" style="opacity:.6">${escapeHtml(I18n.t('chat.audio_no_history'))}</div>`;
-    return;
-  }
-  const itemsHtml = last.map((m) => {
-    const cls = m.role === 'user' ? 'user' : 'bot';
-    const who = m.role === 'user'
-      ? I18n.t('chat.you')
-      : (m.modelLabel || I18n.t('chat.assistant'));
-    const time = formatBubbleTime(m.ts);
-    // Pelny tekst w railu prawego panelu — wczesniejszy slice(0,200) ucinal
-    // dlugie odpowiedzi (audio czytalo calosc, a panel pokazywal tylko 200 zn.).
-    const preview = extractPlainText(m.text || '');
-    return `
-      <div class="rail-msg ${cls}">
-        <div class="who">${escapeHtml(who)} · ${escapeHtml(time)}</div>
-        <div>${escapeHtml(preview)}</div>
-      </div>
-    `;
-  }).join('');
-  rail.innerHTML = titleHtml + itemsHtml;
-}
-
-function updateAudioStatus(stateName, text) {
-  const stage = byId('audio-stage');
-  if (stage) stage.dataset.state = stateName;
-  const label = byId('audio-status-label');
-  if (label) label.textContent = text || I18n.t(`chat.audio_state_${stateName}`);
-}
-
-function mountFace() {
-  const stage = byId('chat-face-stage');
-  if (!stage) return;
-  if (faceHandle) faceHandle.destroy();
-  faceHandle = FaceBackground.embed(stage);
-  // Etap 1: tylko idle. Inne stany (listen/think/speak) czekaja na
-  // AudioPipeline (Etap 2) — API juz gotowe pod przyszlego callera.
-  faceHandle.setMode('idle');
-}
-
-function destroyFace() {
-  if (faceHandle) {
-    faceHandle.destroy();
-    faceHandle = null;
-  }
-}
-
-function bindAudioStageHandlers() {
-  byId('audio-exit')?.addEventListener('click', () => switchMode('text'));
-
-  byId('audio-mic')?.addEventListener('click', async () => {
-    if (!audioPipeline) {
-      // Pierwszy klik = startuje pipeline (wymagany user gesture dla
-      // getUserMedia). enableAudioControls() wywolane dopiero po sukcesie.
-      await startAudioPipeline();
-      return;
+function pushMessage(conv, msg) {
+  // vlist.append shares the items reference with conv.messages; a separate
+  // conv.messages.push would duplicate the entry.
+  if (conv.mode === 'text' && conv.id === activeConvId) {
+    if (!vlist) {
+      conv.messages.push(msg);
+      byId('chat-body').innerHTML = '';
+      mountVList(conv);
+    } else {
+      vlist.append(msg);
     }
-    // Pipeline aktywny — toggle mute na mikrofonie.
-    const willMute = !audioPipeline.isMuted();
-    audioPipeline.mute(willMute);
-    setMicMutedVisual(willMute);
-  });
-
-  byId('audio-pause')?.addEventListener('click', () => {
-    if (!audioPipeline) return;
-    // "Przerwij" — abort aktywnego LLM/TTS, zostaje listening.
-    audioPipeline.abort();
-  });
-
-  byId('audio-volume')?.addEventListener('click', () => {
-    if (!audioPipeline) return;
-    const muted = audioPipeline.toggleSpeaker();
-    byId('audio-volume')?.classList.toggle('muted', muted);
-    if (muted) toast(I18n.t('chat.audio_speaker_muted'), 'info');
-  });
-}
-
-function setActiveModeToggle(mode) {
-  const textBtn = byId('chat-mode-text');
-  const audioBtn = byId('chat-mode-audio');
-  const isAudio = mode === 'audio';
-  textBtn?.classList.toggle('active', !isAudio);
-  audioBtn?.classList.toggle('active', isAudio);
-  // tf-button variant przelaczamy zeby aktywny mial primary look (tf-button
-  // exposuje setAttribute variant). Pozwala uzyskac wizualny kontrast bez
-  // walki z shadow-DOM stylowaniem od zewnatrz.
-  if (textBtn) textBtn.setAttribute('variant', isAudio ? 'ghost' : 'primary');
-  if (audioBtn) audioBtn.setAttribute('variant', isAudio ? 'primary' : 'ghost');
-}
-
-function switchMode(targetMode) {
-  const conv = ensureActiveConv();
-  if (!conv) return;
-  if (conv.mode === targetMode) return;
-
-  if (targetMode === 'audio' && !defaultChatFlow) {
-    toast(I18n.t('chat.default_flow_missing'), 'error');
-    return;
+  } else {
+    conv.messages.push(msg);
   }
-
-  conv.mode = targetMode;
   conv.updatedAt = Date.now();
   saveConversations();
-  applyMode(conv);
-  renderConvList();
-  updateHeaderTitle();
-  setActiveModeToggle(targetMode);
+  if (conv.mode === 'audio' && conv.id === activeConvId) audioView?.render(conv);
 }
 
-// applyMode swapuje zawartosc #chat-body miedzy widokiem tekstowym a audio
-// w zaleznosci od conv.mode. Wolane przez switchMode i selectConversation.
-function applyMode(conv) {
-  const body = byId('chat-body');
-  if (!body) return;
-  // The activity widget lives in the composer wrap (outside #chat-body), so it
-  // survives mode swaps; only its density changes — audio mode uses the narrow
-  // dot+badge variant (§3.9).
-  const activity = byId('chat-agent-activity');
-  if (activity) activity.variant = conv.mode === 'audio' ? 'chat-audio' : 'chat';
-  if (conv.mode === 'audio') {
-    if (vlist) { vlist.destroy(); vlist = null; }
-    if (unsubscribe) { unsubscribe(); unsubscribe = null; }
-    body.classList.add('audio-mode');
-    body.innerHTML = renderAudioStage();
-    bindAudioStageHandlers();
-    mountFace();
-    renderRail();
-    updateAudioStatus('idle');
-    // Mic enabled w trybie pre-gesture — czeka na klik aby uruchomic
-    // AudioPipeline (getUserMedia wymaga user-gesture). Volume/Pause zostaja
-    // disabled do momentu gdy pipeline ruszy.
-    const mic = byId('audio-mic');
-    if (mic) {
-      mic.removeAttribute('disabled');
-      mic.setAttribute('title', I18n.t('chat.audio_start_mic'));
-    }
-  } else {
-    stopAudioPipeline();
-    destroyFace();
-    body.classList.remove('audio-mode');
-    body.innerHTML = '';
-    mountVList();
-  }
+// Direct call (no rAF) — background tabs throttle rAF to <1Hz in Chrome, which
+// would stall token rendering when the user switches away.
+// Streamed text reaches storage while it arrives, so a reload mid-answer keeps
+// the fragment the interrupted state promises.
+let saveTimer = null;
+function scheduleSave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    saveConversations();
+  }, STREAM_SAVE_MS);
 }
 
-// ---- Conversation switching ----------------------------------------------
-
-// (Re)subscribe the agent-activity widget to the active conversation's session
-// scope. The conversation id is the flow `session_id` background runs publish
-// under (§3.9). Tears down any prior subscription first.
-function rebindAgentActivity() {
-  if (agentActivityTeardown) { agentActivityTeardown(); agentActivityTeardown = null; }
-  const widget = byId('chat-agent-activity');
-  if (!widget || !activeConvId) return;
-  agentActivityTeardown = attachAgentActivity(widget, activeConvId, {
-    // Mirror the live step into the answer that is still streaming, so a slow
-    // local model shows "narzędzie · search_web" instead of an empty bubble.
-    onStatus: (status) => {
-      const conv = conversations.find((c) => c.id === activeConvId);
-      const streamingMsg = conv?.messages?.find((m) => m.streaming);
-      if (!streamingMsg || streamingMsg.status === status) return;
-      streamingMsg.status = status;
-      onStreamTick();
-    },
-  });
-}
-
-function selectConversation(id) {
-  if (unsubscribe) { unsubscribe(); unsubscribe = null; }
-  // Switch konwersacji = inny audioConfig + inny conv ref → pipeline z poprzedniej
-  // rozmowy nie pasuje. Zatrzymujemy bezwarunkowo, applyMode() w docelowym mode
-  // ponownie udostepni mic-button.
-  stopAudioPipeline();
-  activeConvId = id;
-  rebindAgentActivity();
-  renderConvList();
-  updateHeaderTitle();
+function onStreamTick() {
+  scheduleSave();
   const conv = activeConv();
-  if (conv) {
-    applyMode(conv);
-    setActiveModeToggle(conv.mode);
-  } else {
-    mountVList();
-  }
-}
-
-function updateHeaderTitle() {
-  const titleEl = byId('chat-head-title');
-  const metaEl = byId('chat-head-meta');
-  const conv = activeConv();
-  if (titleEl) titleEl.textContent = conv ? conv.title : '';
-  if (metaEl) {
-    const count = conv ? conv.messages.length : 0;
-    const label = I18n.t('chat.connected') || 'Połączony';
-    const msgsLabel = I18n.t('chat.messages_count') || 'wiadomości';
-    metaEl.textContent = conv ? `${label} · ${count} ${msgsLabel}` : '';
-  }
-}
-
-// ---- Send / receive ------------------------------------------------------
-
-function ensureActiveConv() {
-  if (activeConv()) return activeConv();
-  const conv = newConversation();
-  conversations.push(conv);
-  activeConvId = conv.id;
-  saveConversations();
-  renderConvList();
-  updateHeaderTitle();
-  // Nowa konwersacja zawsze startuje w trybie tekstowym — bez specjalnej
-  // sciezki audio (uzytkownik musi swiadomie kliknac toggle).
-  mountVList();
-  setActiveModeToggle('text');
-  return conv;
-}
-
-function currentInputValue() {
-  const inputEl = byId('chat-input');
-  return inputEl?.value || '';
-}
-
-function setInputValue(value) {
-  const inputEl = byId('chat-input');
-  if (inputEl) inputEl.value = value;
-}
-
-function sendMessage() {
-  const text = currentInputValue().trim();
-  if (!text) return;
-  setInputValue('');
-  updateInputCounter();
-  sendMessageInternal(text, { source: 'text' });
-}
-
-// sendMessageInternal — wspolna sciezka dla wiadomosci tekstowych (z input box)
-// i glosowych (transkrybowanych przez AudioPipeline). opts.source pozwala
-// callerowi rozroznic via=voice w meta wiadomosci, a zarazem decyduje
-// czy assistant deltas trzeba feedowac do AudioPipeline.
-function sendMessageInternal(text, opts = {}) {
-  // Czat dziala WYLACZNIE przez Default Chat — zadnego wyboru flow w GUI i
-  // zadnego fallbacku na surowy model. Brak tego flow = twardy stop.
-  if (!defaultChatFlow) {
-    toast(I18n.t('chat.default_flow_missing'), 'error');
+  if (conv?.mode === 'audio') {
+    audioView?.render(conv);
     return;
   }
-  const modelLabel = defaultChatFlow.name || 'Default Chat';
-  const conv = ensureActiveConv();
-  if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+  if (!vlist) return;
+  const wasPinned = vlist.pinned;
+  vlist.updateTail();
+  const pill = byId('chat-new-pill');
+  if (!pill) return;
+  pill.classList.toggle('visible', !wasPinned);
+}
 
-  if (!conv.messages.length && (conv.title === 'Nowa rozmowa' || conv.title === (I18n.t('chat.new_conversation') || 'Nowa rozmowa'))) {
-    conv.title = text.slice(0, 40) + (text.length > 40 ? '…' : '');
+// Re-renders every visible message: buttons that depend on position (the
+// regenerate action sits on the newest answer only) need it after the list grew.
+function refreshList() {
+  vlist?.refresh();
+}
+
+// ---- Top bar: decode speed and TTFT --------------------------------------
+
+function metricsFor(conv) {
+  let m = metricsByConv.get(conv.id);
+  if (!m) {
+    m = new SessionMetrics();
+    m.seed(conv.messages.map((msg) => msg.perf));
+    metricsByConv.set(conv.id, m);
   }
+  return m;
+}
 
-  pushMessage(conv, { id: nextMsgId++, role: 'user', text, ts: Date.now(), via: opts.source || 'text' });
+function tipRows(stats) {
+  const rate = (v) => `${fmtRate(v, lang())} ${t('perf_decode')}`;
+  return [
+    [t('tip_now'), rate(stats.cur)],
+    [t('tip_avg'), rate(stats.avg)],
+    [t('tip_minmax'), `${fmtRate(stats.min, lang())} · ${fmtRate(stats.max, lang())}`],
+    [t('tip_samples'), String(stats.n)],
+  ].map(([k, v]) => `<div class="tip-row"><span>${escapeHtml(k)}</span><span>${escapeHtml(v)}</span></div>`).join('');
+}
 
-  const assistantMsg = { id: nextMsgId++, role: 'assistant', text: '', ts: Date.now(), streaming: true, modelLabel, via: opts.source || 'text' };
-  pushMessage(conv, assistantMsg);
+function updateMetrics() {
+  const hero = byId('chat-decode');
+  if (!hero) return;
+  const conv = activeConv();
+  const metrics = conv ? metricsFor(conv) : null;
+  const stats = metrics ? metrics.stats() : null;
 
-  // Typed messages always go through the text chatStreamRequest (the backend
-  // sets outputAudio=false itself, so the flow's TTS block stays transparent).
-  // Głosowe wypowiedzi idą osobno przez sendVoiceUtterance (FlowInvoke).
-  ApiBinary.subscribe(
+  byId('m-cur').textContent = stats ? fmtRate(stats.cur, lang()) : '—';
+  const sub = byId('m-sub');
+  if (!stats) {
+    sub.innerHTML = '';
+  } else {
+    const vars = { avg: fmtRate(stats.avg, lang()), n: stats.n };
+    sub.innerHTML = richText(t('metric_avg', vars));
+  }
+  byId('m-spark').innerHTML = sparkMarkup(metrics ? metrics.values : [], stats ? stats.avg : 0);
+
+  const tip = byId('m-tip');
+  const head = `<b>${escapeHtml(t('tip_title'))}</b> `;
+  tip.innerHTML = stats
+    ? `${head}${richText(t('tip_body'))}${tipRows(stats)}`
+    : `${head}${richText(t('tip_empty'))}`;
+
+  hero.classList.toggle('has-data', !!stats);
+  byId('m-ttft').textContent = metrics?.ttftMs ? String(metrics.ttftMs) : '—';
+  byId('m-ttft-unit').hidden = !metrics?.ttftMs;
+}
+
+// ---- Connection ----------------------------------------------------------
+
+// What the UI does when the server link drops or returns. A generation in
+// flight cannot continue (its stream died with the socket), so it is marked
+// interrupted and offered for resume; the voice pipeline is paused, not stopped.
+function applyConnection() {
+  updateMetrics();
+  if (audioPipeline) audioPipeline.setSuspended(conn.lost);
+  syncAudioView();
+  if (!conn.lost) return;
+  if (turn) interruptTurn(turn);
+}
+
+// The stream died with the socket: what arrived stays, nothing is measured
+// from a truncated answer and the user can resume.
+function interruptTurn(tn) {
+  abandonTurn(tn);
+  discardTurnSamples(tn);
+  tn.msg.streaming = false;
+  tn.msg.status = '';
+  tn.msg.failed = { kind: 'interrupted' };
+  dropUnrecognizedUtterance(tn);
+  tn.conv.updatedAt = Date.now();
+  saveConversations();
+  onStreamTick();
+  refreshList();
+  renderConvList();
+  if (tn.kind === 'voice') {
+    audioPipeline?.feedAssistantError();
+    if (tn.conv.id === activeConvId) audioView?.render(tn.conv);
+  }
+}
+
+// A voice turn that failed before any transcript arrived has nothing to show:
+// the mic placeholder would read "recognizing…" forever.
+function dropUnrecognizedUtterance(tn) {
+  if (tn.kind !== 'voice' || tn.userMsg?.text !== MIC_PLACEHOLDER) return false;
+  tn.conv.messages = tn.conv.messages.filter((m) => m !== tn.userMsg && m !== tn.msg);
+  return true;
+}
+
+// The transport reports its own loss as a synthetic end-of-stream frame.
+function isTransportLoss(end) {
+  return end?._variant === 'StreamBody.Closed';
+}
+
+function onLifecycle(ev) {
+  if (ev.type === 'open') {
+    conn = { lost: false };
+  } else if (ev.type === 'disconnected' || ev.type === 'close' || ev.type === 'reconnect-scheduled') {
+    conn.lost = true;
+  } else {
+    return;
+  }
+  applyConnection();
+}
+
+// ---- Generation turns ----------------------------------------------------
+
+function beginTurn(conv, msg, kind) {
+  const meter = new DecodeMeter();
+  const metrics = metricsFor(conv);
+  const tn = { conv, msg, meter, sampler: null, unsub: null, cancelled: false, kind, pushed: 0 };
+  tn.sampler = setInterval(() => {
+    const rate = meter.sample();
+    if (rate === null) return;
+    metrics.push(rate);
+    if (rate > 0) tn.pushed += 1;
+    if (conv.id === activeConvId) updateMetrics();
+  }, SAMPLE_INTERVAL_MS);
+  turn = tn;
+  setSendMode(true);
+  return tn;
+}
+
+// An answer that did not finish says nothing about decode speed: the samples
+// it fed the session series are taken back.
+function discardTurnSamples(tn) {
+  metricsFor(tn.conv).drop(tn.pushed);
+  tn.pushed = 0;
+}
+
+function attachUnsub(tn, promise) {
+  promise.then((unsub) => {
+    tn.unsub = unsub;
+    if (tn.cancelled) unsub();
+  }).catch((err) => failTurn(tn, err));
+}
+
+// Stops listening to a turn's stream without touching its message.
+function abandonTurn(tn) {
+  tn.cancelled = true;
+  clearInterval(tn.sampler);
+  try { tn.unsub?.(); } catch { /* the socket may already be gone */ }
+  if (turn === tn) turn = null;
+  setSendMode(false);
+}
+
+function turnDelta(tn) {
+  const first = tn.meter.firstAt === null;
+  tn.meter.delta();
+  if (first) {
+    const metrics = metricsFor(tn.conv);
+    metrics.setTtft(tn.meter.ttftMs);
+    if (tn.conv.id === activeConvId) updateMetrics();
+  }
+}
+
+// Records what the finished answer measured. The server's own numbers win over
+// the browser's: they exclude network jitter between chunks.
+function finishMetrics(tn, end) {
+  const metrics = metricsFor(tn.conv);
+  const serverTps = Number(end?.decodeTps) || 0;
+  const serverTtft = Number(end?.ttftMs) || 0;
+  const rate = serverTps > 0 ? serverTps : tn.meter.overall();
+  const ttft = serverTtft > 0 ? serverTtft : tn.meter.ttftMs;
+  if (!tn.meter.sampled && rate) metrics.push(rate);
+  if (ttft) metrics.setTtft(ttft);
+  tn.msg.perf = {
+    decodeTps: rate || 0,
+    ttftMs: ttft || 0,
+    completionTokens: Number(end?.completionTokens) || 0,
+    promptTokens: Number(end?.promptTokens) || 0,
+    totalMs: Number(end?.totalMs) || 0,
+  };
+}
+
+function settleTurn(tn) {
+  clearInterval(tn.sampler);
+  if (turn === tn) turn = null;
+  setSendMode(false);
+  tn.conv.updatedAt = Date.now();
+  saveConversations();
+  onStreamTick();
+  renderConvList();
+  updateMetrics();
+  if (tn.conv.mode === 'audio' && tn.conv.id === activeConvId) audioView?.render(tn.conv);
+}
+
+function failTurn(tn, err) {
+  if (tn.cancelled) return;
+  clearInterval(tn.sampler);
+  if (turn === tn) turn = null;
+  setSendMode(false);
+  tn.msg.streaming = false;
+  tn.msg.status = '';
+  const raw = String(err?.message || err || '');
+  discardTurnSamples(tn);
+  if (conn.lost) tn.msg.failed = { kind: 'interrupted' };
+  else tn.msg.failed = { kind: /no model/i.test(raw) ? 'unavailable' : 'fault' };
+  // Detail stays in the console: it can name a backend the UI must not show.
+  console.warn('[chat] generation failed:', raw);
+  if (dropUnrecognizedUtterance(tn)) toast(t('audio_stt_failed'), 'error');
+  settleTurn(tn);
+  if (tn.kind === 'voice' && audioPipeline) audioPipeline.feedAssistantError(err);
+}
+
+// The user pressed Stop: the server stream is closed (that cancels generation
+// upstream) and what arrived so far stays as the answer.
+// A stream that ended without a single token is a failed answer, not a finished one.
+function emptyAnswer(tn) {
+  discardTurnSamples(tn);
+  tn.msg.failed = { kind: 'empty' };
+  settleTurn(tn);
+}
+
+function stopTurn() {
+  const tn = turn;
+  if (!tn) return;
+  abandonTurn(tn);
+  tn.msg.streaming = false;
+  tn.msg.status = '';
+  tn.msg.stopped = true;
+  finishMetrics(tn, null);
+  if (tn.kind === 'voice' && audioPipeline) audioPipeline.abort();
+  settleTurn(tn);
+}
+
+function composePrompt(userMsg) {
+  if (!userMsg.attachments?.length) return userMsg.text;
+  const files = userMsg.attachments.map((a) => `--- ${a.name} ---\n${a.content}`).join('\n\n');
+  return `${userMsg.text}\n\n${files}`;
+}
+
+// The two tags stream_handlers.rs puts in front of a failed stream's error text.
+// Exact names, so an answer that merely starts with "[Warning error] ..." stays an answer.
+const STREAM_FAULT_PREFIX = /^\s*\[(?:routing|stream) error\]\s/;
+
+function runTextTurn(conv, userMsg, assistantMsg) {
+  if (!defaultChatFlow) {
+    toast(t('unavailable'), 'error');
+    return;
+  }
+  assistantMsg.streaming = true;
+  const tn = beginTurn(conv, assistantMsg, 'text');
+  tn.fresh = true;
+  attachUnsub(tn, ApiBinary.subscribe(
     'chatStreamRequest',
     // conv.id is the flow session id — lets conversation_history / memory nodes
-    // in Default Chat key off the conversation (Agent flows require it).
-    // modelId stays empty on purpose: the models come from the flow's blocks.
-    { modelId: '', userMessage: text, flowId: defaultChatFlow.id, sessionId: conv.id },
+    // in Default Chat key off the conversation. modelId stays empty on purpose:
+    // the models come from the flow's blocks.
+    { modelId: '', userMessage: composePrompt(userMsg), flowId: defaultChatFlow.id, sessionId: conv.id },
     {
       onChunk: (body) => {
-        if (body.variant === 'ChatStreamChunk') {
-          assistantMsg.text += body.delta;
-          conv.updatedAt = Date.now();
-          onStreamTick();
+        if (tn.cancelled || body._variant !== 'ChatStreamChunkBody' || !body.delta) return;
+        // Its text names internals, so it is a turn failure, never part of the answer.
+        if (STREAM_FAULT_PREFIX.test(body.delta)) {
+          failTurn(tn, new Error(body.delta.trim()));
+          abandonTurn(tn);
+          return;
         }
-      },
-      onEnd: (endBody) => {
-        unsubscribe = null;
-        assistantMsg.streaming = false;
-        assistantMsg.status = '';
-        // ChatStreamEnd.text = pelny zakumulowany tekst z serwera — uzyj go
-        // gdy zlozone delty sa puste (np. zgubione chunki), zanim pokazemy
-        // "(pusta odpowiedz)".
-        if (assistantMsg.text === '' && endBody && typeof endBody.text === 'string' && endBody.text.length > 0) {
-          assistantMsg.text = endBody.text;
+        turnDelta(tn);
+        if (tn.fresh) {
+          assistantMsg.text = '';
+          tn.fresh = false;
         }
-        if (assistantMsg.text === '') {
-          assistantMsg.text = I18n.t('chat.empty_response') || '(empty response)';
-        }
-        // Metryki wydajnosci inferencji z ChatStreamEnd — backend podaje je w
-        // obu konwencjach (camelCase + snake_case), wartosci to liczby JS.
-        if (endBody) {
-          assistantMsg.perf = {
-            promptTokens: Number(endBody.promptTokens ?? endBody.prompt_tokens ?? 0),
-            completionTokens: Number(endBody.completionTokens ?? endBody.completion_tokens ?? 0),
-            ttftMs: Number(endBody.ttftMs ?? endBody.ttft_ms ?? 0),
-            prefillTps: Number(endBody.prefillTps ?? endBody.prefill_tps ?? 0),
-            decodeTps: Number(endBody.decodeTps ?? endBody.decode_tps ?? 0),
-            totalMs: Number(endBody.totalMs ?? endBody.total_ms ?? 0),
-          };
-        }
+        assistantMsg.text += body.delta;
         conv.updatedAt = Date.now();
-        saveConversations();
         onStreamTick();
-        renderConvList();
-        updateHeaderTitle();
-        if (conv.mode === 'audio' && conv.id === activeConvId) renderRail();
       },
-      onError: (err) => {
+      onEnd: (end) => {
+        if (tn.cancelled) return;
+        if (isTransportLoss(end)) {
+          interruptTurn(tn);
+          return;
+        }
         assistantMsg.streaming = false;
         assistantMsg.status = '';
-        const detail = chatFlowError(err.message);
-        assistantMsg.text = `[error] ${detail}`;
-        toast(`${I18n.t('common.error')}: ${detail}`, 'error');
-        saveConversations();
-        onStreamTick();
-        unsubscribe = null;
+        // ChatStreamEnd.text is the whole text from the server — used when the
+        // joined deltas are empty (lost chunks).
+        if (tn.fresh && typeof end?.text === 'string' && end.text !== '') {
+          assistantMsg.text = end.text;
+          tn.fresh = false;
+        }
+        if (tn.fresh) {
+          emptyAnswer(tn);
+          return;
+        }
+        finishMetrics(tn, end);
+        settleTurn(tn);
       },
+      onError: (err) => failTurn(tn, err),
     },
-  ).then((unsub) => {
-    unsubscribe = unsub;
-  }).catch((err) => {
-    toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
-  });
+  ));
 }
 
-// ---- AudioPipeline plumbing ---------------------------------------------
-
-// sendVoiceUtterance — głosowa wypowiedź idzie binarnym FlowInvoke do flow
-// engine: audio → STT → LLM → TTS, a flow odsyła przeplatane tekst+audio.
-// Tekst dopisujemy do bąbla asystenta, audio podajemy do AudioPipeline.
+// A voice utterance goes to the flow engine as one FlowInvoke: audio → STT →
+// LLM → TTS, answered with interleaved text and audio chunks.
 function sendVoiceUtterance(wav, sampleRate) {
   const conv = ensureActiveConv();
-  if (unsubscribe) { unsubscribe(); unsubscribe = null; }
-
-  // User bubble starts as a mic placeholder; the flow's `transcript` chunk
-  // (emitted before the first assistant token) replaces it with the STT text.
-  const userMsg = { id: nextMsgId++, role: 'user', text: '🎤', ts: Date.now(), via: 'voice' };
-  pushMessage(conv, userMsg);
-
-  const lang = conv.audioConfig?.language || (I18n.getLanguage && I18n.getLanguage()) || 'pl';
-
-  // Glos idzie tym samym Default Chat co tekst — bez fallbacku model+chat.
   if (!defaultChatFlow) {
-    toast(I18n.t('chat.default_flow_missing'), 'error');
+    toast(t('unavailable'), 'error');
     return;
   }
-  const modelLabel = defaultChatFlow.name || 'Default Chat';
-  const assistantMsg = { id: nextMsgId++, role: 'assistant', text: '', ts: Date.now(), streaming: true, modelLabel, via: 'voice' };
+  if (turn) abandonTurn(turn);
+
+  // The user bubble starts as a mic placeholder; the flow's `transcript` chunk
+  // (emitted before the first assistant token) replaces it with the STT text.
+  const userMsg = { id: nextMsgId++, role: 'user', text: MIC_PLACEHOLDER, ts: Date.now(), via: 'voice' };
+  pushMessage(conv, userMsg);
+  const assistantMsg = { id: nextMsgId++, role: 'assistant', text: '', ts: Date.now(), streaming: true, via: 'voice' };
   pushMessage(conv, assistantMsg);
 
-  ApiBinary.subscribe(
+  const tn = beginTurn(conv, assistantMsg, 'voice');
+  tn.userMsg = userMsg;
+  attachUnsub(tn, ApiBinary.subscribe(
     'flowInvokeRequest',
     {
-      // Same flow as text chat; outputAudio switches the TTS block on. The
-      // STT/LLM/TTS models all come from the flow's own blocks.
+      // Same flow as text chat; outputAudio switches the TTS block on.
       flowId: defaultChatFlow.id,
       model: '',
       serviceType: 'chat',
       mime: 'audio/wav',
       sampleRate,
       audio: wav,
-      language: lang,
+      language: conv.audioConfig?.language || lang(),
       sessionId: conv.id,
       outputAudio: true,
     },
     {
       onChunk: (body) => {
-        if (body.variant !== 'FlowInvokeChunk') return;
-        if (body.kind === 'transcript') {
-          const t = (body.text || '').trim();
-          if (t) {
-            userMsg.text = t;
-            conv.updatedAt = Date.now();
-            // The user bubble is not the tail, so updateTail() cannot patch it.
-            if (vlist) vlist.refresh();
-          }
-        } else if (body.kind === 'text') {
-          assistantMsg.text += body.delta || '';
+        if (tn.cancelled) return;
+        if (body._variant === 'FlowInvokeChunkBody.Transcript') {
+          const text = (body.text || '').trim();
+          if (!text) return;
+          userMsg.text = text;
+          if (!conv.renamed && !conv.title) conv.title = titleFrom(text);
+          conv.updatedAt = Date.now();
+          saveConversations();
+          renderConvList();
+          audioView?.render(conv);
+        } else if (body._variant === 'FlowInvokeChunkBody.Text') {
+          if (!body.delta) return;
+          turnDelta(tn);
+          assistantMsg.text += body.delta;
           conv.updatedAt = Date.now();
           onStreamTick();
-        } else if (body.kind === 'audio') {
-          if (audioPipeline) audioPipeline.playAudioChunk(body.bytes, body.mime);
+        } else if (body._variant === 'FlowInvokeChunkBody.Audio') {
+          audioPipeline?.playAudioChunk(body.bytes, body.mime);
         }
       },
-      onEnd: (endBody) => {
-        unsubscribe = null;
-        assistantMsg.streaming = false;
-        // FlowInvokeEnd niesie error gdy flow padł (np. brak flow 'voice',
-        // STT/LLM error). Bez tego pusty wynik wyglądał jak '(pusta odpowiedź)'.
-        if (endBody && endBody.error) {
-          const detail = chatFlowError(endBody.error);
-          assistantMsg.text = `[error] ${detail}`;
-          toast(`${I18n.t('common.error')}: ${detail}`, 'error');
-        } else {
-          // Pelny tekst z serwera (FlowInvokeEnd.text) jest autorytatywny — sklejane
-          // delty streamu bywaja uciete na koncu (audio leci dluzej niz dolecial tekst).
-          if (endBody && typeof endBody.text === 'string' && endBody.text.length > 0) {
-            assistantMsg.text = endBody.text;
-          }
-          if (assistantMsg.text === '') {
-            assistantMsg.text = I18n.t('chat.empty_response') || '(empty response)';
-          }
+      onEnd: (end) => {
+        if (tn.cancelled) return;
+        if (isTransportLoss(end)) {
+          interruptTurn(tn);
+          return;
         }
-        conv.updatedAt = Date.now();
-        saveConversations();
-        onStreamTick();
-        renderConvList();
-        updateHeaderTitle();
-        if (audioPipeline) audioPipeline.finishResponse();
-        if (conv.mode === 'audio' && conv.id === activeConvId) renderRail();
-      },
-      onError: (err) => {
         assistantMsg.streaming = false;
-        const detail = chatFlowError(err.message ?? 'flow error');
-        assistantMsg.text = `[error] ${detail}`;
-        toast(`${I18n.t('common.error')}: ${detail}`, 'error');
-        saveConversations();
-        onStreamTick();
-        unsubscribe = null;
-        if (audioPipeline) audioPipeline.feedAssistantError(err);
+        if (end?.error) {
+          failTurn(tn, new Error(end.error));
+          return;
+        }
+        // FlowInvokeEnd.text is authoritative: joined deltas can end early while
+        // the audio is still playing.
+        if (typeof end?.text === 'string' && end.text.length > 0) assistantMsg.text = end.text;
+        if (assistantMsg.text === '') {
+          emptyAnswer(tn);
+          audioPipeline?.finishResponse();
+          return;
+        }
+        finishMetrics(tn, null);
+        settleTurn(tn);
+        audioPipeline?.finishResponse();
       },
+      onError: (err) => failTurn(tn, err),
     },
-  ).then((unsub) => {
-    unsubscribe = unsub;
-  }).catch((err) => {
-    toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
-    if (audioPipeline) audioPipeline.feedAssistantError(err);
+  ));
+}
+
+// Resends the question of an answer and replaces that answer in place, so the
+// transcript never carries two answers to one question.
+function regenerate(msgId) {
+  if (turn || conn.lost) return;
+  const conv = activeConv();
+  if (!conv) return;
+  const idx = conv.messages.findIndex((m) => m.id === msgId);
+  if (idx < 1 || idx !== conv.messages.length - 1) return;
+  const answer = conv.messages[idx];
+  const question = conv.messages[idx - 1];
+  if (answer.role !== 'assistant' || question.role !== 'user' || question.text === MIC_PLACEHOLDER) return;
+  // The old fragment stays until the new stream delivers its first token, so a
+  // resume that fails leaves exactly what the failure box promised to keep.
+  answer.perf = undefined;
+  answer.failed = undefined;
+  answer.stopped = false;
+  answer.ts = Date.now();
+  answer.via = 'text';
+  runTextTurn(conv, question, answer);
+  refreshList();
+  vlist?.scrollToBottom();
+}
+
+// ---- Sending -------------------------------------------------------------
+
+function ensureActiveConv() {
+  const existing = activeConv();
+  if (existing) return existing;
+  const conv = newConversation();
+  conversations.push(conv);
+  activeConvId = conv.id;
+  saveConversations();
+  rebindAgentActivity();
+  renderConvList();
+  updateMetrics();
+  return conv;
+}
+
+function currentInputValue() {
+  return byId('chat-input')?.value || '';
+}
+
+function setInputValue(value) {
+  const input = byId('chat-input');
+  if (input) input.value = value;
+  updateInputCounter();
+}
+
+function sendMessage() {
+  if (turn || conn.lost) return;
+  const text = currentInputValue().trim();
+  if (!text) return;
+  if (!defaultChatFlow) {
+    toast(t('unavailable'), 'error');
+    return;
+  }
+  const conv = ensureActiveConv();
+  if (!conv.renamed && !conv.title && conv.messages.length === 0) {
+    conv.title = titleFrom(text);
+  }
+  const userMsg = { id: nextMsgId++, role: 'user', text, ts: Date.now(), via: 'text' };
+  if (pendingFiles.length) userMsg.attachments = pendingFiles;
+  pendingFiles = [];
+  renderAttachments();
+  setInputValue('');
+  pushMessage(conv, userMsg);
+  const assistantMsg = { id: nextMsgId++, role: 'assistant', text: '', ts: Date.now(), streaming: true, via: 'text' };
+  pushMessage(conv, assistantMsg);
+  renderConvList();
+  runTextTurn(conv, userMsg, assistantMsg);
+  refreshList();
+  vlist?.scrollToBottom();
+}
+
+// One button is both Send and Stop: while a turn runs it stops it.
+function setSendMode(generating) {
+  const btn = byId('chat-send');
+  if (!btn) return;
+  btn.setAttribute('icon', generating ? 'stop' : 'send');
+  const label = t(generating ? 'stop' : 'send');
+  btn.setAttribute('aria-label', label);
+  btn.setAttribute('title', label);
+  btn.dataset.generating = String(generating);
+}
+
+function onSendClick() {
+  if (turn) stopTurn();
+  else sendMessage();
+}
+
+function updateInputCounter() {
+  const counter = byId('chat-input-counter');
+  if (!counter) return;
+  const len = currentInputValue().length;
+  counter.textContent = t('counter', { len, max: MAX_INPUT_CHARS });
+  counter.classList.toggle('warn', len > MAX_INPUT_CHARS * 0.75);
+}
+
+// ---- Attachments ---------------------------------------------------------
+
+function renderAttachments() {
+  const host = byId('chat-attachments');
+  if (!host) return;
+  host.innerHTML = pendingFiles
+    .map((f, i) => `<tf-chip icon="file" mono removable data-file="${i}">${escapeHtml(f.name)}</tf-chip>`)
+    .join('');
+}
+
+async function onFilesPicked(files) {
+  for (const file of Array.from(files || [])) {
+    if (pendingFiles.length >= ATTACH_MAX_FILES) {
+      toast(t('attach_limit', { count: ATTACH_MAX_FILES }), 'error');
+      break;
+    }
+    if (file.size > ATTACH_MAX_BYTES) {
+      toast(t('attach_too_big', { name: file.name, kb: ATTACH_MAX_BYTES / 1024 }), 'error');
+      continue;
+    }
+    let content;
+    try {
+      content = await file.text();
+    } catch {
+      toast(t('attach_read_failed', { name: file.name }), 'error');
+      continue;
+    }
+    // A NUL byte means a binary file; its decoded text would only be noise in the prompt.
+    if (content.includes('\u0000')) {
+      toast(t('attach_binary', { name: file.name }), 'error');
+      continue;
+    }
+    pendingFiles.push({ name: file.name, size: file.size, content });
+  }
+  renderAttachments();
+  byId('chat-attach')?.clear?.();
+}
+
+// ---- Click delegation inside messages ------------------------------------
+
+function onBodyClick(e) {
+  const copyCode = e.target.closest('.copy-btn');
+  if (copyCode) {
+    let plain = '';
+    try { plain = decodeURIComponent(escape(atob(copyCode.dataset.code || ''))); } catch { plain = ''; }
+    if (plain) copyText(plain);
+    return;
+  }
+  const suggest = e.target.closest('[data-suggest]');
+  if (suggest) {
+    onSuggestion(suggest.dataset.suggest);
+    return;
+  }
+  const act = e.target.closest('[data-act]');
+  if (!act) return;
+  const msgId = Number(act.closest('.chat-msg')?.dataset.msgId);
+  const msg = activeConv()?.messages.find((m) => m.id === msgId);
+  if (!msg) return;
+  if (act.dataset.act === 'copy') copyText(msg.text || '');
+  else if (act.dataset.act === 'regenerate' || act.dataset.act === 'resume') regenerate(msg.id);
+}
+
+function copyText(text) {
+  const done = () => toast(t('copied'), 'info');
+  const fail = () => toast(t('copy_failed'), 'error');
+  if (!navigator.clipboard?.writeText) { fail(); return; }
+  navigator.clipboard.writeText(text).then(done, fail);
+}
+
+function onSuggestion(id) {
+  if (id === 'voice') {
+    switchMode('audio');
+    return;
+  }
+  setInputValue(t(`sug_${id}_text`));
+  byId('chat-input')?.focus();
+}
+
+// ---- Conversation actions ------------------------------------------------
+
+function pruneEmptyConversations(exceptId) {
+  const before = conversations.length;
+  conversations = conversations.filter((c) => c.id === exceptId || c.messages.length > 0 || c.renamed);
+  if (conversations.length !== before) saveConversations();
+}
+
+function startNewConversation() {
+  const current = activeConv();
+  // An empty conversation already is a new one.
+  if (current && current.messages.length === 0 && current.mode === 'text') {
+    byId('chat-input')?.focus();
+    closeDrawer();
+    return;
+  }
+  const conv = newConversation();
+  conversations.push(conv);
+  activateConversation(conv.id);
+  byId('chat-input')?.focus();
+}
+
+function selectConversation(id) {
+  if (id === activeConvId) {
+    closeDrawer();
+    return;
+  }
+  activateConversation(id);
+}
+
+function activateConversation(id) {
+  if (turn) stopTurn();
+  stopAudioPipeline();
+  activeConvId = id;
+  pruneEmptyConversations(id);
+  rebindAgentActivity();
+  renderConvList();
+  applyMode(activeConv());
+  updateMetrics();
+  closeDrawer();
+}
+
+async function renameConversation(id) {
+  const conv = conversations.find((c) => c.id === id);
+  if (!conv) return;
+  const body = document.createElement('div');
+  body.innerHTML = `<tf-input id="chat-rename-input" maxlength="120" aria-label="${escapeHtml(t('rename_label'))}" label="${escapeHtml(t('rename_label'))}"></tf-input>`;
+  const input = body.querySelector('tf-input');
+  input.setAttribute('value', conv.title || '');
+  const footer = document.createElement('div');
+  footer.innerHTML = `
+    <tf-button variant="secondary" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+    <tf-button variant="primary" data-action="save" id="chat-rename-save">${escapeHtml(t('rename_save'))}</tf-button>`;
+  body.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.isComposing) {
+      e.preventDefault();
+      footer.querySelector('[data-action="save"]').click();
+    }
+  });
+  const closed = TfWindow.open({
+    title: t('rename_title'),
+    icon: 'edit',
+    width: 420,
+    modal: true,
+    buttons: 'close',
+    body,
+    footer,
+  });
+  requestAnimationFrame(() => input.focus?.());
+  const { action } = await closed;
+  if (action !== 'save') return;
+  const next = String(input.value || '').trim().slice(0, 120);
+  if (!next || next === conv.title) return;
+  conv.title = next;
+  conv.renamed = true;
+  saveConversations();
+  renderConvList();
+}
+
+async function deleteConversation(id) {
+  const conv = conversations.find((c) => c.id === id);
+  if (!conv) return;
+  const ok = await TfWindow.confirm({
+    title: t('delete_title'),
+    message: t('delete_message', { title: convTitle(conv) }),
+    confirmLabel: t('delete_confirm'),
+    cancelLabel: I18n.t('common.cancel'),
+    danger: true,
+  });
+  if (!ok) return;
+  const wasActive = id === activeConvId;
+  if (wasActive) {
+    if (turn) stopTurn();
+    stopAudioPipeline();
+  }
+  conversations = conversations.filter((c) => c.id !== id);
+  metricsByConv.delete(id);
+  if (wasActive) {
+    activeConvId = [...conversations].sort((a, b) => b.updatedAt - a.updatedAt)[0]?.id || null;
+    rebindAgentActivity();
+  }
+  saveConversations();
+  renderConvList();
+  if (wasActive) {
+    applyMode(activeConv());
+    updateMetrics();
+  }
+  toast(t('delete_done'), 'info');
+}
+
+function onConvMenuAction(action) {
+  const id = menuConvId;
+  if (!id) return;
+  if (action === 'rename') renameConversation(id);
+  else if (action === 'delete') deleteConversation(id);
+}
+
+function onConvListClick(e) {
+  const more = e.target.closest('[data-conv-more]');
+  if (more) {
+    e.stopPropagation();
+    const menu = byId('chat-conv-menu');
+    const id = more.dataset.convMore;
+    if (menuConvId === id && menu.hasAttribute('open')) {
+      menu.close();
+      return;
+    }
+    menuConvId = id;
+    menu.anchor = more;
+    menu.open();
+    // A keyboard activation synthesizes a click with no pointer: focus has to
+    // enter the menu for the arrows to work.
+    if (e.detail === 0) menu.focusFirst();
+    return;
+  }
+  const item = e.target.closest('.conv-item');
+  if (item) selectConversation(item.dataset.convId);
+}
+
+function onConvListKey(e) {
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  const item = e.target.closest?.('.conv-item');
+  if (!item || e.target !== item) return;
+  e.preventDefault();
+  selectConversation(item.dataset.convId);
+}
+
+// ---- Audio mode ----------------------------------------------------------
+
+function switchMode(target) {
+  const conv = ensureActiveConv();
+  if (conv.mode === target) {
+    syncModeSwitch(target);
+    return;
+  }
+  if (target === 'audio' && !defaultChatFlow) {
+    toast(t('unavailable'), 'error');
+    syncModeSwitch(conv.mode);
+    return;
+  }
+  if (turn) stopTurn();
+  conv.mode = target;
+  conv.updatedAt = Date.now();
+  saveConversations();
+  applyMode(conv);
+  renderConvList();
+}
+
+function syncModeSwitch(mode) {
+  const sw = byId('chat-mode');
+  if (sw && sw.value !== mode) sw.value = mode;
+}
+
+// Swaps the body between the text view and the audio stage for the conversation.
+function applyMode(conv) {
+  const body = byId('chat-body');
+  const col = byId('chat-col');
+  if (!body || !col) return;
+  const mode = conv?.mode || 'text';
+  const activity = byId('chat-agent-activity');
+  if (activity) activity.variant = mode === 'audio' ? 'chat-audio' : 'chat';
+  col.classList.toggle('is-audio', mode === 'audio');
+  body.classList.toggle('audio-mode', mode === 'audio');
+  syncModeSwitch(mode);
+  destroyList();
+  destroyAudioView();
+  if (mode === 'audio') {
+    body.innerHTML = '';
+    audioView = createAudioView(body, {
+      onExit: () => switchMode('text'),
+      onMic: onDockMic,
+      onPause: onDockPause,
+      onVolume: onDockVolume,
+    });
+    faceHandle = FaceBackground.embed(audioView.faceHost, { fullscreen: true, track: 'pointer' });
+    faceHandle.setMode('idle');
+    audioUi = { state: 'idle', text: '' };
+    audioView.render(conv);
+    syncAudioView();
+  } else {
+    stopAudioPipeline();
+    mountBody();
+  }
+}
+
+function destroyAudioView() {
+  if (faceHandle) { faceHandle.destroy(); faceHandle = null; }
+  if (audioView) { audioView.destroy(); audioView = null; }
+}
+
+// Pushes the pipeline/link state to the stage: pill, dock and header chip.
+function syncAudioView() {
+  if (!audioView) return;
+  audioView.setState(audioUi.state, audioUi.text);
+  audioView.setChip(audioPipeline ? 'live' : 'idle');
+  audioView.setDock({
+    started: !!audioPipeline,
+    muted: !!audioPipeline?.isMuted(),
+    speakerMuted: !!audioPipeline?.speakerMuted,
   });
 }
 
+function setAudioUi(state, text = '') {
+  audioUi = { state, text };
+  syncAudioView();
+}
+
+async function onDockMic() {
+  if (!audioPipeline) {
+    await startAudioPipeline();
+    return;
+  }
+  audioPipeline.mute(!audioPipeline.isMuted());
+  syncAudioView();
+}
+
+function onDockPause() {
+  if (!audioPipeline) return;
+  // Cuts what is being said or generated; the pipeline keeps listening.
+  if (turn) stopTurn();
+  audioPipeline.abort();
+}
+
+function onDockVolume() {
+  if (!audioPipeline) return;
+  const muted = audioPipeline.toggleSpeaker();
+  if (muted) toast(t('audio_speaker_muted'), 'info');
+  syncAudioView();
+}
+
 async function startAudioPipeline() {
+  audioErrorToasted = false;
   if (audioPipeline) return;
   const conv = activeConv();
   if (!conv || conv.mode !== 'audio' || !faceHandle) return;
   if (!defaultChatFlow) {
-    toast(I18n.t('chat.default_flow_missing'), 'error');
-    updateAudioStatus('idle');
+    toast(t('unavailable'), 'error');
     return;
   }
-  // Jezyk transkrypcji bierzemy z aktywnego I18n — w Etapie 1 conv.audioConfig
-  // mial sztywne 'pl', ale uzytkownik moze rozmawiac w innym jezyku.
-  const lang = (I18n.getLanguage && I18n.getLanguage()) || conv.audioConfig.language || 'pl';
-  conv.audioConfig.language = lang;
+  // The transcription language follows the interface language.
+  conv.audioConfig.language = lang();
   try {
     audioPipeline = new AudioPipeline({
       conv,
@@ -999,357 +1398,157 @@ async function startAudioPipeline() {
       i18n: I18n,
       onUtteranceAudio: (wav, sampleRate) => {
         if (!wav || wav.length === 0) {
-          toast(I18n.t('chat.audio_empty_transcript'), 'info');
+          toast(t('audio_empty_transcript'), 'info');
           return;
         }
         sendVoiceUtterance(wav, sampleRate);
       },
       onStateChange: (state) => {
-        // FSM AudioPipeline → state stage'u 'idle'/'listen'/'think'/'speak'.
         const map = { idle: 'idle', listening: 'listen', transcribing: 'think', thinking: 'think', speaking: 'speak', error: 'idle' };
-        updateAudioStatus(map[state] || 'idle');
-        // Rail moze odswiezac sie czesto — to tani re-render z 4 wpisow.
-        if (conv.id === activeConvId) renderRail();
+        const ui = map[state] || 'idle';
+        if (ui !== 'speak') audioView?.stopSpeech();
+        setAudioUi(ui, state === 'transcribing' ? t('audio_state_transcribing') : '');
+      },
+      onVadChange: (active) => audioView?.setUserSpeaking(active),
+      onPlaybackChunk: (info) => {
+        const c = activeConv();
+        const last = c?.messages[c.messages.length - 1];
+        if (last?.role === 'assistant') audioView?.playChunk(info, last);
       },
       onError: (err) => {
-        // Loguj + toast — pipeline sam wraca do listen.
-        // eslint-disable-next-line no-console
-        console.error('[audio]', err);
-        toast(`${I18n.t('chat.audio_error')}: ${err.message || err.name || 'unknown'}`, 'error');
+        console.warn('[audio]', err);
+        notifyAudioError();
       },
       bargeInAbort: () => {
-        // Wywolywane gdy AudioPipeline zatrzymuje aktywny TTS i chce ze
-        // nasz LLM stream tez zostal anulowany. Mark assistant msg.
-        if (unsubscribe) { unsubscribe(); unsubscribe = null; }
-        const c = activeConv();
-        if (!c) return;
-        const last = c.messages[c.messages.length - 1];
-        if (last && last.role === 'assistant' && last.streaming) {
-          last.streaming = false;
-          const tag = I18n.t('chat.audio_interrupted') || '[interrupted]';
-          last.text = (last.text || '') + ' ' + tag;
-          saveConversations();
-          onStreamTick();
-        }
+        // The pipeline cut the TTS because the user started talking: the
+        // generation behind it has to stop too.
+        if (turn) stopTurn();
       },
     });
     await audioPipeline.start();
-    enableAudioControls(true);
+    audioPipeline.setSuspended(conn.lost);
+    setAudioUi('listen');
   } catch (err) {
     audioPipeline = null;
-    enableAudioControls(false);
-    if (err && err.name === 'NotAllowedError') {
-      toast(I18n.t('chat.audio_mic_denied'), 'error');
-    } else if (err && err.name === 'NotFoundError') {
-      toast(I18n.t('chat.audio_no_mic'), 'error');
-    } else {
-      toast(`${I18n.t('chat.audio_error')}: ${err.message || err.name || err}`, 'error');
+    syncAudioView();
+    if (err?.name === 'NotAllowedError') toast(t('audio_mic_denied'), 'error');
+    else if (err?.name === 'NotFoundError') toast(t('audio_no_mic'), 'error');
+    else {
+      console.warn('[audio]', err);
+      toast(t('audio_error'), 'error');
     }
   }
+}
+
+// A failing decoder reports once per chunk; one toast per session is enough,
+// and the browser's own wording (English, names internals) stays in the console.
+let audioErrorToasted = false;
+function notifyAudioError() {
+  if (audioErrorToasted) return;
+  audioErrorToasted = true;
+  toast(t('audio_error'), 'error');
 }
 
 function stopAudioPipeline() {
   if (!audioPipeline) return;
   try { audioPipeline.stop(); } catch { /* ignore */ }
   audioPipeline = null;
-  enableAudioControls(false);
+  audioUi = { state: 'idle', text: '' };
+  syncAudioView();
 }
 
-function enableAudioControls(enabled) {
-  // Toggle disabled na mic/volume/pause razem z tooltip update'em. Mic ma
-  // odrebny title w stanie "click to start" (przed startAudioPipeline) —
-  // tym sterujemy w applyMode dla stanu pre-gesture.
-  const ids = ['audio-mic', 'audio-volume', 'audio-pause'];
-  const tip = enabled ? '' : escapeHtml(I18n.t('chat.audio_pipeline_pending'));
-  for (const id of ids) {
-    const el = byId(id);
-    if (!el) continue;
-    if (enabled) el.removeAttribute('disabled');
-    else el.setAttribute('disabled', '');
-    if (tip) el.setAttribute('title', tip);
-    else el.removeAttribute('title');
-  }
-}
+// ---- Agent activity ------------------------------------------------------
 
-// Ikona muted — toggluje wizualnie button. tf-button nie expose'uje ikony do
-// runtime change, ale klasa .muted na hostie zmieni opacity i kolor; ikona
-// zostaje 'mic' (uzytkownik widzi po opacity ze mic jest off).
-function setMicMutedVisual(muted) {
-  const el = byId('audio-mic');
-  if (!el) return;
-  el.classList.toggle('muted', muted);
-  el.setAttribute('title', muted ? I18n.t('chat.audio_unmute') : I18n.t('chat.audio_mute'));
-}
-
-function pushMessage(conv, msg) {
-  // vlist.append shares the items reference with conv.messages (passed via
-  // mountVList items: messages). A separate conv.messages.push would dupe.
-  if (vlist) {
-    vlist.append(msg);
-  } else {
-    conv.messages.push(msg);
-  }
-  conv.updatedAt = Date.now();
-  saveConversations();
-  // Audio mode trzyma rail z 4 ostatnimi repliki — odswiez gdy nowa
-  // wiadomosc dochodzi w trakcie rozmowy.
-  if (conv.mode === 'audio' && conv.id === activeConvId) {
-    renderRail();
-  }
-}
-
-// Direct call (no rAF) — background tabs throttle rAF to <1Hz in Chrome,
-// which would stall token rendering when the user switches away.
-function onStreamTick() {
-  if (!vlist) return;
-  const wasPinned = vlist.pinned;
-  vlist.updateTail();
-  const pill = byId('chat-new-pill');
-  if (!pill) return;
-  if (!wasPinned) pill.classList.add('visible');
-  else pill.classList.remove('visible');
-}
-
-// ---- Composer hints ------------------------------------------------------
-
-function updateInputCounter() {
-  const counter = byId('chat-input-counter');
-  if (!counter) return;
-  const len = currentInputValue().length;
-  counter.textContent = `${len} / ${MAX_INPUT_CHARS} znaków`;
-  counter.classList.toggle('warn', len > MAX_INPUT_CHARS * 0.75);
-}
-
-// ---- Click delegation for in-bubble actions ------------------------------
-
-function onBodyClick(e) {
-  const copyBtn = e.target.closest('.copy-btn');
-  if (copyBtn) {
-    const encoded = copyBtn.dataset.code || '';
-    let plain = '';
-    try { plain = decodeURIComponent(escape(atob(encoded))); } catch { plain = ''; }
-    if (plain) {
-      navigator.clipboard?.writeText(plain).then(
-        () => toast(I18n.t('chat.copied') || 'Skopiowano', 'info'),
-        () => toast(I18n.t('chat.copy_failed') || 'Nie udało się skopiować', 'error'),
-      );
-    }
-    return;
-  }
-  const act = e.target.closest('.msg-act');
-  if (act) {
-    const action = act.dataset.act;
-    const row = act.closest('.msg-row');
-    const msgId = Number(row?.dataset.msgId);
-    if (action === 'copy') {
-      const conv = activeConv();
-      const msg = conv?.messages.find((m) => m.id === msgId);
-      if (msg) {
-        navigator.clipboard?.writeText(msg.text || '');
-        toast(I18n.t('chat.copied') || 'Skopiowano', 'info');
-      }
-    } else {
-      toast(I18n.t('chat.coming_soon') || 'Wkrótce', 'info');
-    }
-  }
-}
-
-// ---- Header actions ------------------------------------------------------
-
-function exportActiveConversation() {
-  const conv = activeConv();
-  if (!conv) { toast(I18n.t('chat.no_conversations'), 'info'); return; }
-  const payload = {
-    id: conv.id,
-    title: conv.title,
-    createdAt: conv.createdAt,
-    updatedAt: conv.updatedAt,
-    messages: conv.messages.map((m) => ({ role: m.role, text: m.text, ts: m.ts })),
-  };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const dt = new Date();
-  const yyyy = dt.getFullYear();
-  const mm = String(dt.getMonth() + 1).padStart(2, '0');
-  const dd = String(dt.getDate()).padStart(2, '0');
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `tentaflow-chat-${conv.id}-${yyyy}-${mm}-${dd}.json`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  // setTimeout so the download dialog has the URL when it pops, then revoke.
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-  toast(I18n.t('chat.export_done'), 'info');
-}
-
-function conversationToMarkdown(conv) {
-  const lines = [`# ${conv.title}`, ''];
-  const youLabel = I18n.t('chat.you');
-  const asstLabel = I18n.t('chat.assistant');
-  for (const m of conv.messages) {
-    const who = m.role === 'user' ? youLabel : (m.modelLabel || asstLabel);
-    lines.push(`**${who}:**`, '', m.text || '', '');
-  }
-  return lines.join('\n');
-}
-
-async function shareActiveConversation() {
-  const conv = activeConv();
-  if (!conv) { toast(I18n.t('chat.no_conversations'), 'info'); return; }
-  const md = conversationToMarkdown(conv);
-  // navigator.share is gated to secure contexts on mobile and accepts only
-  // a plain text payload here; clipboard is the desktop fallback.
-  if (navigator.share) {
-    try {
-      await navigator.share({ title: conv.title, text: md });
-      return;
-    } catch (err) {
-      // User cancelled or unsupported MIME — fall through to clipboard.
-      if (err && err.name === 'AbortError') return;
-    }
-  }
-  try {
-    await navigator.clipboard.writeText(md);
-    toast(I18n.t('chat.share_done'), 'info');
-  } catch {
-    toast(I18n.t('chat.share_failed'), 'error');
-  }
-}
-
-function renameActiveConversation() {
-  const conv = activeConv();
-  if (!conv) return;
-  // eslint-disable-next-line no-alert
-  const next = window.prompt(I18n.t('chat.rename_prompt'), conv.title);
-  if (next == null) return;
-  const trimmed = next.trim();
-  if (!trimmed || trimmed === conv.title) return;
-  conv.title = trimmed.slice(0, 200);
-  conv.updatedAt = Date.now();
-  saveConversations();
-  renderConvList();
-  updateHeaderTitle();
-}
-
-function clearActiveConversation() {
-  const conv = activeConv();
-  if (!conv) return;
-  // eslint-disable-next-line no-alert
-  if (!window.confirm(I18n.t('chat.confirm_clear'))) return;
-  conv.messages = [];
-  conv.updatedAt = Date.now();
-  saveConversations();
-  if (conv.mode === 'audio') {
-    renderRail();
-  } else {
-    mountVList();
-  }
-  renderConvList();
-  updateHeaderTitle();
-  toast(I18n.t('chat.clear_done'), 'info');
-}
-
-function deleteActiveConversation() {
-  const conv = activeConv();
-  if (!conv) return;
-  // eslint-disable-next-line no-alert
-  if (!window.confirm(I18n.t('chat.confirm_delete'))) return;
-  conversations = conversations.filter((c) => c.id !== conv.id);
-  activeConvId = conversations[0]?.id || null;
-  saveConversations();
-  // Po usunieciu rozmowy audio pipeline + face musza zniknac — applyMode
-  // dla nowo aktywnej (lub czystego stanu) zalatwia obie sciezki.
-  stopAudioPipeline();
-  destroyFace();
-  renderConvList();
-  updateHeaderTitle();
-  const next = activeConv();
-  if (next) {
-    applyMode(next);
-    setActiveModeToggle(next.mode);
-  } else {
-    const body = byId('chat-body');
-    if (body) {
-      body.classList.remove('audio-mode');
-      body.innerHTML = '';
-    }
-    mountVList();
-    setActiveModeToggle('text');
-  }
-  toast(I18n.t('chat.delete_done'), 'info');
+// (Re)subscribe the agent-activity widget to the active conversation's session
+// scope: the conversation id is the flow `session_id` background runs publish under.
+function rebindAgentActivity() {
+  if (agentActivityTeardown) { agentActivityTeardown(); agentActivityTeardown = null; }
+  const widget = byId('chat-agent-activity');
+  if (!widget || !activeConvId) return;
+  agentActivityTeardown = attachAgentActivity(widget, activeConvId, {
+    // Mirror the live step into the answer still streaming, so a slow local
+    // model shows "narzędzie · search_web" instead of an empty bubble.
+    onStatus: (status) => {
+      const streamingMsg = activeConv()?.messages?.find((m) => m.streaming);
+      if (!streamingMsg || streamingMsg.status === status) return;
+      streamingMsg.status = status;
+      onStreamTick();
+    },
+  });
 }
 
 // ---- Screen --------------------------------------------------------------
 
+function modeOption(value, icon) {
+  return `<option value="${value}" icon="${icon}">${escapeHtml(t(`mode_${value}`))}</option>`;
+}
+
 const ChatScreen = {
-  get title() { return I18n.t('chat.title'); },
+  get title() { return t('title'); },
 
   render() {
     return `
-      <div class="chat-shell">
-        <aside class="chat-sidebar">
-          <div class="sidebar-head">
-            <tf-searchbox id="chat-search" placeholder="${escapeHtml(I18n.t('chat.search_placeholder') || 'Szukaj rozmów...')}" debounce="200"></tf-searchbox>
-            <div class="chat-new-btn">
-              <tf-button variant="primary" icon="plus" id="chat-new">${escapeHtml(I18n.t('chat.new_conversation') || 'Nowa rozmowa')}</tf-button>
-            </div>
-          </div>
-          <div class="conv-list" id="chat-conv-list"></div>
-        </aside>
-        <div class="chat-scrim" id="chat-scrim"></div>
-        <section class="chat-main">
-          <div class="chat-head">
-            <div class="chat-head-left">
-              <tf-button variant="ghost" icon="management" id="chat-burger" class="head-burger" aria-label="Menu"></tf-button>
-            </div>
-            <div class="head-title">
-              <span class="title" id="chat-head-title"></span>
-              <span class="meta">
-                <span class="dot-status"></span>
-                <span id="chat-head-meta"></span>
-              </span>
-            </div>
-            <div class="head-actions">
-              <div class="mode-toggle" role="tablist" aria-label="${escapeHtml(I18n.t('chat.title'))}">
-                <tf-button variant="primary" icon="message" id="chat-mode-text" data-mode="text"
-                  title="${escapeHtml(I18n.t('chat.mode_text'))}"
-                  aria-label="${escapeHtml(I18n.t('chat.mode_text'))}">${escapeHtml(I18n.t('chat.mode_text'))}</tf-button>
-                <tf-button variant="ghost" icon="mic" id="chat-mode-audio" data-mode="audio"
-                  title="${escapeHtml(I18n.t('chat.mode_audio'))}"
-                  aria-label="${escapeHtml(I18n.t('chat.mode_audio'))}">${escapeHtml(I18n.t('chat.mode_audio'))}</tf-button>
+      <div class="chat-root" id="chat-root">
+        <tf-menu id="chat-conv-menu" placement="bottom-end">
+          <tf-menu-item action="rename" icon="edit">${escapeHtml(t('menu_rename'))}</tf-menu-item>
+          <tf-menu-item action="delete" icon="trash" danger>${escapeHtml(t('menu_delete'))}</tf-menu-item>
+        </tf-menu>
+        <div class="chat-cq">
+          <div class="chat-shell" id="chat-shell">
+            <aside class="conv-panel" aria-label="${escapeHtml(t('conv_aria'))}">
+              <div class="conv-top">
+                <tf-button variant="primary" size="sm" icon="plus" id="chat-new">${escapeHtml(t('new_conversation'))}</tf-button>
+                <tf-searchbox id="chat-search" size="sm" placeholder="${escapeHtml(t('search_placeholder'))}" debounce="200"></tf-searchbox>
               </div>
-              <tf-button variant="ghost" icon="download" id="chat-export" aria-label="${escapeHtml(I18n.t('chat.export'))}" title="${escapeHtml(I18n.t('chat.export'))}"></tf-button>
-              <tf-button variant="ghost" icon="share" id="chat-share" aria-label="${escapeHtml(I18n.t('chat.share'))}" title="${escapeHtml(I18n.t('chat.share'))}"></tf-button>
-              <div class="chat-more-wrap">
-                <tf-button variant="ghost" icon="management" id="chat-more" aria-label="${escapeHtml(I18n.t('chat.more'))}" title="${escapeHtml(I18n.t('chat.more'))}"></tf-button>
-                <tf-menu id="chat-more-menu" placement="bottom-end">
-                  <tf-menu-item action="rename" icon="edit">${escapeHtml(I18n.t('chat.menu_rename'))}</tf-menu-item>
-                  <tf-menu-item action="clear" icon="refresh">${escapeHtml(I18n.t('chat.menu_clear'))}</tf-menu-item>
-                  <tf-menu-divider></tf-menu-divider>
-                  <tf-menu-item action="delete" icon="trash" danger>${escapeHtml(I18n.t('chat.menu_delete'))}</tf-menu-item>
-                </tf-menu>
+              <div class="conv-list" id="chat-conv-list"></div>
+              <div class="conv-foot" id="chat-conv-foot"></div>
+            </aside>
+            <div class="conv-scrim" id="chat-scrim"></div>
+            <section class="chat-col" id="chat-col">
+              <header class="chat-top">
+                <tf-tooltip block align="start" side="bottom" delay="120">
+                  <div class="chat-metric is-decode" id="chat-decode" tabindex="0">
+                    <div class="chat-metric__k">${sprite('gauge')}<span>${escapeHtml(t('metric_decode'))}</span><span class="lbl-full"> · ${escapeHtml(t('metric_scope'))}</span><span class="chat-metric__info">${sprite('info')}</span></div>
+                    <div class="chat-metric__v"><b id="m-cur">—</b><small>${escapeHtml(t('perf_decode'))}</small></div>
+                    <div class="chat-metric__sub" id="m-sub"></div>
+                    <svg class="chat-metric__spark" id="m-spark" viewBox="0 0 64 22" aria-hidden="true"></svg>
+                  </div>
+                  <div slot="content" class="chat-tip" id="m-tip"></div>
+                </tf-tooltip>
+                <div class="chat-metric" id="chat-ttft" tabindex="0" title="${escapeHtml(t('metric_ttft_hint'))}">
+                  <div class="chat-metric__k">${escapeHtml(t('perf_ttft'))}</div>
+                  <div class="chat-metric__v"><b id="m-ttft">—</b><small id="m-ttft-unit" hidden>ms</small></div>
+                </div>
+                <div class="top-actions">
+                  <tf-segmented id="chat-mode" size="md" value="text" aria-label="${escapeHtml(t('mode_aria'))}">
+                    ${modeOption('text', 'message')}${modeOption('audio', 'mic')}
+                  </tf-segmented>
+                </div>
+              </header>
+              <div class="chat-body" id="chat-body"></div>
+              <div class="chat-new-pill" id="chat-new-pill">${sprite('chevron-down')}<span>${escapeHtml(t('new_messages'))}</span></div>
+              <div class="chat-composer-wrap" id="chat-composer-wrap">
+                <div class="chat-activity"><tf-agent-activity id="chat-agent-activity" variant="chat"></tf-agent-activity></div>
+                <div class="chat-attachments" id="chat-attachments"></div>
+                <div class="chat-composer" id="chat-composer">
+                  <tf-file-input id="chat-attach" variant="icon" icon="paperclip" multiple accept="${ATTACH_ACCEPT}"
+                    label="${escapeHtml(t('attach'))}"></tf-file-input>
+                  <tf-textarea id="chat-input" autogrow rows="1" maxlength="${MAX_INPUT_CHARS}"
+                    aria-label="${escapeHtml(t('placeholder'))}" placeholder="${escapeHtml(t('placeholder'))}"></tf-textarea>
+                  <tf-button variant="primary" size="sm" icon="send" id="chat-send" aria-label="${escapeHtml(t('send'))}" title="${escapeHtml(t('send'))}"></tf-button>
+                </div>
+                <div class="chat-hints" id="chat-hints">
+                  <tf-button class="conv-opener" id="chat-conv-open" variant="ghost" size="sm" icon="message"
+                    aria-label="${escapeHtml(t('conv_open'))}" title="${escapeHtml(t('conv_open'))}">${escapeHtml(t('conv_open'))}</tf-button>
+                  <span><kbd>Enter</kbd> ${escapeHtml(t('hint_send'))}</span>
+                  <span><kbd>Shift</kbd>+<kbd>Enter</kbd> ${escapeHtml(t('hint_newline'))}</span>
+                  <span class="spacer"></span>
+                  <span class="counter" id="chat-input-counter"></span>
+                </div>
               </div>
-            </div>
+            </section>
           </div>
-          <div class="chat-body" id="chat-body"></div>
-          <div class="chat-new-pill" id="chat-new-pill">${sprite('chevron-down')}<span>${escapeHtml(I18n.t('chat.new_messages') || 'Nowe wiadomości')}</span></div>
-          <div class="composer-wrap">
-            <tf-agent-activity id="chat-agent-activity" variant="chat"></tf-agent-activity>
-            <div class="composer">
-              <tf-button variant="ghost" icon="paperclip" id="chat-attach" class="composer-attach" aria-label="${escapeHtml(I18n.t('chat.attach') || 'Załącz')}"></tf-button>
-              <tf-textarea id="chat-input" autogrow rows="1"
-                placeholder="${escapeHtml(I18n.t('chat.placeholder'))}"></tf-textarea>
-              <tf-button variant="primary" icon="send" id="chat-send" class="composer-send" aria-label="${escapeHtml(I18n.t('chat.send') || 'Wyślij')}"></tf-button>
-            </div>
-            <div class="composer-hints">
-              <span class="kbd"><kbd>Enter</kbd> ${escapeHtml(I18n.t('chat.hint_send') || 'wyślij')}</span>
-              <span class="kbd"><kbd>Shift</kbd>+<kbd>Enter</kbd> ${escapeHtml(I18n.t('chat.hint_newline') || 'nowa linia')}</span>
-              <span class="spacer"></span>
-              <span class="counter" id="chat-input-counter">0 / ${MAX_INPUT_CHARS} znaków</span>
-            </div>
-          </div>
-        </section>
+        </div>
       </div>
     `;
   },
@@ -1357,55 +1556,59 @@ const ChatScreen = {
   async mount() {
     conversations = loadConversations();
     migrateConversations(conversations);
-    activeConvId = conversations.length ? conversations.sort((a, b) => b.updatedAt - a.updatedAt)[0].id : null;
+    conversations.sort((a, b) => b.updatedAt - a.updatedAt);
+    activeConvId = conversations[0]?.id || null;
     let maxId = 0;
     for (const c of conversations) for (const m of c.messages) if (m.id > maxId) maxId = m.id;
     nextMsgId = maxId + 1;
+    metricsByConv.clear();
+    pendingFiles = [];
+    turn = null;
+    conn = { lost: !ApiBinary.isConnected() };
+
+    // Avatar initials of the signed-in user, as the app shell shows them.
+    ApiBinary.one('authMeRequest').then((me) => {
+      userInitials = (me?.username ?? '?').slice(0, 2).toUpperCase();
+      refreshList();
+    }).catch(() => {});
 
     // Chat runs on ONE flow — the seeded Default Chat. Resolve it by its stable
     // id; the `isDefault` flag is the fallback for an installation whose admin
     // moved the default onto another flow.
     try {
-      const flows = (await ApiBinary.list('flowListRequest')) || [];
+      const flows = (await ApiBinary.list('flowListRequest', { arrayKey: 'flows' })) || [];
       defaultChatFlow = flows.find((f) => String(f.id) === DEFAULT_CHAT_FLOW_ID)
-        || flows.find((f) => f.isDefault || f.is_default)
+        || flows.find((f) => f.isDefault)
         || null;
     } catch {
       defaultChatFlow = null;
     }
-    if (!defaultChatFlow) toast(I18n.t('chat.default_flow_missing'), 'error');
+    if (!defaultChatFlow) toast(t('unavailable'), 'error');
 
     renderConvList();
-    updateHeaderTitle();
-    const initialConv = activeConv();
-    if (initialConv && initialConv.mode === 'audio') {
-      // Restore audio mode po reloadzie — mountFace dziala dopiero po render(),
-      // a render() juz sie wykonal gdy mount() jest wywolywany.
-      applyMode(initialConv);
-    } else {
-      mountVList();
-    }
-    setActiveModeToggle(initialConv?.mode || 'text');
+    applyMode(activeConv());
     updateInputCounter();
+    updateMetrics();
+    setSendMode(false);
 
-    byId('chat-mode-text')?.addEventListener('click', () => switchMode('text'));
-    byId('chat-mode-audio')?.addEventListener('click', () => switchMode('audio'));
+    byId('chat-mode')?.addEventListener('change', (e) => switchMode(e.detail?.value === 'audio' ? 'audio' : 'text'));
 
-    // Esc w trybie audio wraca do tekstu — keyboard escape hatch dla
-    // uzytkownikow ktorzy nie znajda przycisku 'Zakoncz rozmowe'.
+    // Esc closes the conversation drawer first, then returns audio mode to text —
+    // the keyboard way out for anyone who does not find the end-call button.
     escKeyHandler = (e) => {
-      if (e.key !== 'Escape') return;
-      const conv = activeConv();
-      if (conv?.mode === 'audio') {
-        switchMode('text');
-      }
+      if (e.key !== 'Escape' || document.querySelector('tf-window')) return;
+      if (byId('chat-shell')?.classList.contains('conv-open')) closeDrawer();
+      else if (activeConv()?.mode === 'audio') switchMode('text');
     };
     document.addEventListener('keydown', escKeyHandler);
 
-    // Push-to-talk — Spacja w trybie audio (poza textarea/input) jest
-    // manualnym override VAD. Trzymanie = mowa (ignoruje threshold), puscic
-    // = end-of-utterance natychmiast. Ulatwia testy i uzycie w halasliwym
-    // otoczeniu gdzie adaptive threshold jest nieskuteczny.
+    // A reload does not wait for the throttled save of the answer being streamed.
+    pageHideHandler = () => { if (turn) saveConversations(); };
+    window.addEventListener('pagehide', pageHideHandler);
+
+    // Push-to-talk — Space in audio mode (outside text fields) overrides the VAD:
+    // held = speech, released = end of utterance. Helps in noisy rooms where the
+    // adaptive threshold fails.
     spaceKeydownHandler = (e) => {
       if (e.key !== ' ' && e.code !== 'Space') return;
       if (activeConv()?.mode !== 'audio') return;
@@ -1413,7 +1616,7 @@ const ChatScreen = {
       if (tgt && (tgt.tagName === 'INPUT' || tgt.tagName === 'TEXTAREA' || tgt.isContentEditable)) return;
       if (spaceHeld) return;
       spaceHeld = true;
-      if (audioPipeline) audioPipeline.pushToTalkStart();
+      audioPipeline?.pushToTalkStart();
       e.preventDefault();
     };
     spaceKeyupHandler = (e) => {
@@ -1429,108 +1632,67 @@ const ChatScreen = {
       searchFilter = e.detail.value || '';
       renderConvList();
     });
-
-    byId('chat-new')?.addEventListener('click', () => {
-      const conv = newConversation();
-      conversations.push(conv);
-      activeConvId = conv.id;
-      saveConversations();
-      rebindAgentActivity();
-      // Nowa rozmowa = tryb tekstowy; jesli wczesniej byl mountowany face,
-      // applyMode sprzata go i przywraca vlist.
-      stopAudioPipeline();
-      destroyFace();
-      const body = byId('chat-body');
-      if (body) body.classList.remove('audio-mode');
-      renderConvList();
-      updateHeaderTitle();
-      mountVList();
-      setActiveModeToggle('text');
-      byId('chat-input')?.focus();
-      document.querySelector('.chat-shell')?.classList.remove('drawer-open');
-    });
+    byId('chat-new')?.addEventListener('click', startNewConversation);
+    const list = byId('chat-conv-list');
+    list?.addEventListener('click', onConvListClick);
+    list?.addEventListener('keydown', onConvListKey);
+    byId('chat-conv-menu')?.addEventListener('action', (e) => onConvMenuAction(e.detail?.action));
+    byId('chat-conv-open')?.addEventListener('click', () => byId('chat-shell')?.classList.add('conv-open'));
+    byId('chat-scrim')?.addEventListener('click', closeDrawer);
 
     byId('chat-new-pill')?.addEventListener('click', () => {
       vlist?.scrollToBottom();
       byId('chat-new-pill')?.classList.remove('visible');
     });
 
-    byId('chat-send')?.addEventListener('click', sendMessage);
-
-    byId('chat-attach')?.addEventListener('click', () => {
-      toast(I18n.t('chat.attach_unavailable') || 'Załączniki wkrótce', 'info');
+    byId('chat-send')?.addEventListener('click', onSendClick);
+    byId('chat-attach')?.addEventListener('change', (e) => onFilesPicked(e.detail?.files));
+    byId('chat-attachments')?.addEventListener('remove', (e) => {
+      const idx = Number(e.target.closest('[data-file]')?.dataset.file);
+      if (Number.isInteger(idx)) {
+        pendingFiles.splice(idx, 1);
+        renderAttachments();
+      }
     });
 
-    byId('chat-export')?.addEventListener('click', exportActiveConversation);
-    byId('chat-share')?.addEventListener('click', shareActiveConversation);
-
-    // More button toggles a tf-menu sibling; the menu handles outside-click
-    // dismissal itself, so we only need the toggle and the action router.
-    byId('chat-more')?.addEventListener('click', (e) => {
-      e.stopPropagation();
-      byId('chat-more-menu')?.toggle();
-    });
-    byId('chat-more-menu')?.addEventListener('action', (e) => {
-      const action = e.detail?.action;
-      if (action === 'rename') renameActiveConversation();
-      else if (action === 'clear') clearActiveConversation();
-      else if (action === 'delete') deleteActiveConversation();
-    });
-
-    byId('chat-burger')?.addEventListener('click', () => {
-      document.querySelector('.chat-shell')?.classList.toggle('drawer-open');
-    });
-    byId('chat-scrim')?.addEventListener('click', () => {
-      document.querySelector('.chat-shell')?.classList.remove('drawer-open');
-    });
-
-    // Composer keymap: bare Enter sends, Shift/Alt+Enter inserts newline,
+    // Composer keymap: bare Enter sends, Shift/Alt+Enter inserts a newline,
     // Cmd/Ctrl+Enter is kept as a power-user alias. IME composition passes
-    // through untouched so CJK input does not trigger a send mid-compose.
+    // through so CJK input does not send mid-compose.
     byId('chat-input')?.addEventListener('tf-keydown', (e) => {
-      const { key, ctrlKey, metaKey, shiftKey, altKey, original } = e.detail;
-      if (original?.isComposing) return;
-      if (key !== 'Enter') return;
-      if (shiftKey || altKey) return; // newline
+      const { key, shiftKey, altKey, original } = e.detail;
+      if (original?.isComposing || key !== 'Enter' || shiftKey || altKey) return;
       original?.preventDefault();
       sendMessage();
-      // Cmd/Ctrl+Enter falls through here too — fine, also sends.
-      void ctrlKey; void metaKey;
     });
-
     byId('chat-input')?.addEventListener('input', updateInputCounter);
 
-    byId('chat-body')?.addEventListener('click', onBodyClick);
+    const body = byId('chat-body');
+    body?.addEventListener('click', onBodyClick);
+    if (body && typeof ResizeObserver !== 'undefined') {
+      bodyResizeObserver = new ResizeObserver(() => remountIfWidthChanged());
+      bodyResizeObserver.observe(body);
+    }
 
-    resizeListener = () => remountIfWidthChanged();
-    window.addEventListener('resize', resizeListener);
-
-    // Subscribe the activity widget to the active conversation's session scope.
+    offLifecycle = ApiBinary.onLifecycle(onLifecycle);
     rebindAgentActivity();
   },
 
   async unmount() {
-    if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+    if (turn) {
+      abandonTurn(turn);
+      saveConversations();
+    }
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    if (pageHideHandler) { window.removeEventListener('pagehide', pageHideHandler); pageHideHandler = null; }
     if (agentActivityTeardown) { agentActivityTeardown(); agentActivityTeardown = null; }
-    if (vlist) { vlist.destroy(); vlist = null; }
+    destroyList();
     stopAudioPipeline();
-    destroyFace();
-    if (escKeyHandler) {
-      document.removeEventListener('keydown', escKeyHandler);
-      escKeyHandler = null;
-    }
-    if (spaceKeydownHandler) {
-      document.removeEventListener('keydown', spaceKeydownHandler);
-      spaceKeydownHandler = null;
-    }
-    if (spaceKeyupHandler) {
-      document.removeEventListener('keyup', spaceKeyupHandler);
-      spaceKeyupHandler = null;
-    }
-    if (resizeListener) {
-      window.removeEventListener('resize', resizeListener);
-      resizeListener = null;
-    }
+    destroyAudioView();
+    if (offLifecycle) { offLifecycle(); offLifecycle = null; }
+    if (bodyResizeObserver) { bodyResizeObserver.disconnect(); bodyResizeObserver = null; }
+    if (escKeyHandler) { document.removeEventListener('keydown', escKeyHandler); escKeyHandler = null; }
+    if (spaceKeydownHandler) { document.removeEventListener('keydown', spaceKeydownHandler); spaceKeydownHandler = null; }
+    if (spaceKeyupHandler) { document.removeEventListener('keyup', spaceKeyupHandler); spaceKeyupHandler = null; }
   },
 };
 

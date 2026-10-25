@@ -477,6 +477,7 @@ function makeHidingLoader(world) {
   return new Function('world', `
     const { state, ApiBinary, requireInstanceId, describeBusError, renderPanel, topicFormat } = world;
     let hidingTurn = 0;
+    async ${cut(source, 'busCall')}
     ${cut(source, 'freshHiding')}
     async ${cut(source, 'fetchFieldSchema')}
     async ${cut(source, 'loadTopicHiding')}
@@ -487,7 +488,7 @@ function hidingWorld(answers) {
   const painted = [];
   const world = {
     state: { instanceId: 'tentabus-a1b2c3d4', view: { name: 'wizyty' }, detail: { topic: { schemaId: '', contentType: 'application/json' } }, hiding: { topic: 'wizyty', policies: null, schemaSettled: false } },
-    ApiBinary: { one: (name, req) => answers[name](req) },
+    ApiBinary: { action: (name, req) => answers[name](req) },
     requireInstanceId: (id) => id,
     describeBusError: (e) => `błąd: ${e.message}`,
     renderPanel: () => painted.push(world.state.hiding),
@@ -504,9 +505,9 @@ test('loadTopicHiding: only the newest answer for the open topic lands', async (
   const { load } = makeHidingLoader(world);
   const first = load('wizyty');
   const second = load('wizyty');
-  waiting[1]({ policies: [{ subjectId: 'new' }] });
+  waiting[1]({ payload: { FieldPolicyListResponse: { policies: [{ subjectId: 'new' }] } } });
   await second;
-  waiting[0]({ policies: [{ subjectId: 'old' }] });
+  waiting[0]({ payload: { FieldPolicyListResponse: { policies: [{ subjectId: 'old' }] } } });
   await first;
   assert.deepEqual(world.state.hiding.policies, [{ subjectId: 'new' }], 'the slow, earlier answer did not overwrite the newer one');
   assert.equal(painted.length, 1);
@@ -518,14 +519,14 @@ test('loadTopicHiding: an answer for a topic that was left, or after the topic w
   const { load, leave } = makeHidingLoader(world);
   const pending = load('wizyty');
   world.state.view = { name: 'inny' };
-  waiting[0]({ policies: [{ subjectId: 'x' }] });
+  waiting[0]({ payload: { FieldPolicyListResponse: { policies: [{ subjectId: 'x' }] } } });
   await pending;
   assert.equal(world.state.hiding.policies, null);
   assert.equal(painted.length, 0);
   world.state.view = { name: 'wizyty' };
   const closed = load('wizyty');
   leave();
-  waiting[1]({ policies: [{ subjectId: 'y' }] });
+  waiting[1]({ payload: { FieldPolicyListResponse: { policies: [{ subjectId: 'y' }] } } });
   await closed;
   assert.equal(world.state.hiding.policies, null, 'the page was closed (turn bumped) before the answer');
   assert.equal(painted.length, 0);
@@ -533,7 +534,7 @@ test('loadTopicHiding: an answer for a topic that was left, or after the topic w
 
 test('loadTopicHiding: a failed reload keeps the rules the section showed; a first failure shows the reason', async () => {
   let fail = false;
-  const { world } = hidingWorld({ busFieldPolicyListRequest: async () => { if (fail) throw new Error('Unavailable'); return { policies: [{ subjectId: 'a' }] }; } });
+  const { world } = hidingWorld({ busFieldPolicyListRequest: async () => { if (fail) throw new Error('Unavailable'); return { payload: { FieldPolicyListResponse: { policies: [{ subjectId: 'a' }] } } }; } });
   const { load } = makeHidingLoader(world);
   await load('wizyty');
   fail = true;

@@ -177,7 +177,7 @@ function updateSubheader() {
   const sub = byId('mesh-sub');
   const total = nodes.length;
   const online = nodes.filter(n => isOnline(n)).length;
-  const offline = nodes.filter(n => !n.is_local && !isOnline(n)).length;
+  const offline = nodes.filter(n => !n.isLocal && !isOnline(n)).length;
   const pendingIncoming = pending.filter(p => p.state === 'incoming').length;
   if (sub) {
     const parts = [
@@ -225,7 +225,7 @@ function renderHeaderBadges() {
   if (status !== 'unknown') {
     const url = String(relayHealth.url || '');
     const host_ = relayHostname(url) || '—';
-    const rttMs = Number(relayHealth.rttMs ?? relayHealth.rtt_ms ?? 0);
+    const rttMs = Number(relayHealth.rttMs ?? 0);
     let chipStatus = 'info';
     let label = '';
     let withDot = true;
@@ -247,7 +247,7 @@ function renderHeaderBadges() {
   }
 
   // Bind addr (jak naprawde slucha iroh) — info chip, bez kropki.
-  const bind = String(relayHealth.bindAddrActual || relayHealth.bind_addr_actual || '');
+  const bind = String(relayHealth.bindAddrActual || '');
   if (bind) {
     const addrOnly = bind.replace(/:\d+$/, '');
     parts.push(`<tf-chip status="info">${escapeHtml(I18n.t('mesh.bind_label'))} ${escapeHtml(addrOnly || bind)}</tf-chip>`);
@@ -271,15 +271,15 @@ function mergeUnifiedModelsIntoNodes() {
   // entries describe the local catalog and have nothing to graft onto a peer.
   const byNode = new Map();
   for (const entry of unifiedModels) {
-    const kindWrapper = entry && entry.kind;
-    if (!kindWrapper || kindWrapper.kind !== 'service_model') continue;
+    const kindWrapper = entry && entry.kind && entry.kind.ServiceModel;
+    if (!kindWrapper) continue;
     const alias = entry.id;
     if (!alias) continue;
     const surfaceList = Array.isArray(entry.serviceSurfaces) ? entry.serviceSurfaces : [];
     const kindLabel = surfaceList[0] || 'service';
     const instances = Array.isArray(kindWrapper.instances) ? kindWrapper.instances : [];
     for (const inst of instances) {
-      const nid = inst.nodeId || inst.node_id;
+      const nid = inst.nodeId;
       if (!nid) continue;
       if (!byNode.has(nid)) byNode.set(nid, []);
       const status = inst.status || '';
@@ -287,7 +287,7 @@ function mergeUnifiedModelsIntoNodes() {
     }
   }
   for (const node of nodes) {
-    const extra = byNode.get(node.node_id);
+    const extra = byNode.get(node.nodeId);
     if (!extra || extra.length === 0) continue;
     const existing = Array.isArray(node.models) ? node.models.slice() : [];
     const seen = new Set(existing.map(m => m.alias).filter(Boolean));
@@ -334,7 +334,7 @@ const ENV_ORDER = ['dev', 'test', 'prod'];
 /// comparison in this module falls back to "unknown" (never same-env) when
 /// either side is `null`, matching the server's fail-closed rule (P1-2).
 function localEnvironment() {
-  const local = nodes.find(n => n.is_local || n.source === 'local');
+  const local = nodes.find(n => n.isLocal || n.source === 'local');
   return local?.environment || null;
 }
 
@@ -364,9 +364,9 @@ function renderListSections() {
     return `<div class="empty-state"><div class="empty-state-text">${escapeHtml(I18n.t('mesh.noNodes'))}</div></div>`;
   }
 
-  const local = nodes.filter(n => n.is_local || n.source === 'local');
-  const trusted = nodes.filter(n => !n.is_local && n.source === 'trusted');
-  const discovered = nodes.filter(n => !n.is_local && n.source === 'discovered');
+  const local = nodes.filter(n => n.isLocal || n.source === 'local');
+  const trusted = nodes.filter(n => !n.isLocal && n.source === 'trusted');
+  const discovered = nodes.filter(n => !n.isLocal && n.source === 'discovered');
   const pendingIncoming = pending.filter(p => p.state === 'incoming');
 
   let html = '';
@@ -439,7 +439,7 @@ function renderPendingSection(list) {
 /// Karta dla peera odkrytego przez mDNS/DHT, jeszcze nie sparowanego.
 /// Dashed orange border, brak gauges, info o sposobie odkrycia + fingerprint.
 function renderDiscoveredCard(node) {
-  const nodeId = node.node_id || '';
+  const nodeId = node.nodeId || '';
   const fpRaw = nodeId ? nodeId.slice(0, 12) : '';
   const shortFp = fpRaw ? fpRaw.match(/.{1,2}/g).join(':') : '—';
   const hostname = node.hostname || (nodeId ? nodeId.slice(0, 12) : I18n.t('mesh.unknown_host'));
@@ -469,7 +469,7 @@ function renderDiscoveredCard(node) {
 }
 
 function renderPendingCard(pairing) {
-  const nodeId = pairing.remoteNodeId || pairing.remote_node_id || '';
+  const nodeId = pairing.remoteNodeId || '';
   const shortId = nodeId.slice(0, 16);
   return `
     <div class="mesh-card pending">
@@ -495,7 +495,7 @@ function renderNodeCard(node, kind) {
   if (kind === 'discovered') {
     return renderDiscoveredCard(node);
   }
-  const nodeId = node.node_id || '';
+  const nodeId = node.nodeId || '';
   const hostname = node.hostname || nodeId.slice(0, 12) || I18n.t('mesh.unknown_host');
   const online = isOnline(node);
   const offlineClass = !online && kind !== 'local' ? ' offline' : '';
@@ -518,14 +518,13 @@ function renderNodeCard(node, kind) {
   }
 
   // Relay chip — jesli routed przez inny node. Pokazuje 'via <hostname>' inline,
-  // a tooltip daje pelny opis (hopsLabel + 'via' + nazwa). Uzywamy camelCase
-  // lub snake_case (obydwa sa setowane przez wasm — patrz protocol/wasm bindings).
+  // a tooltip daje pelny opis (hopsLabel + 'via' + nazwa).
   let relayChip = '';
   const route = node.route;
-  const nextHop = route && (route.nextHop || route.next_hop);
+  const nextHop = route && (route.nextHop);
   if (route && route.direct === false && route.hops != null && nextHop) {
     const hopsLabel = route.hops === 1 ? I18n.t('mesh.hop_one') : I18n.t('mesh.hop_many', { count: route.hops });
-    const nextHopNode = nodes.find(n => (n.node_id || '') === nextHop);
+    const nextHopNode = nodes.find(n => (n.nodeId || '') === nextHop);
     const nextHopName = (nextHopNode && nextHopNode.hostname) || nextHop.slice(0, 8);
     const viaLabel = I18n.t('mesh.via_peer', { peer: nextHopName });
     relayChip = `<tf-chip status="info" title="${escapeAttr(hopsLabel + ' · ' + viaLabel)}">${escapeHtml(hopsLabel)} · ${escapeHtml(viaLabel)}</tf-chip>`;
@@ -596,8 +595,8 @@ function renderNodeCard(node, kind) {
 /// has no row in the identity registry to edit.
 function renderRegistryRow(node, kind) {
   if (!isAdmin || (kind !== 'local' && kind !== 'trusted')) return '';
-  const nodeId = node.node_id || '';
-  const nodeKind = String(node.node_kind || node.nodeKind || 'unknown');
+  const nodeId = node.nodeId || '';
+  const nodeKind = String(node.nodeKind || 'unknown');
   const operator = !!(node.operator);
   const options = NODE_KINDS
     .map((k) => `<option value="${escapeAttr(k)}"${k === nodeKind ? ' selected' : ''}>${escapeHtml(I18n.t(`mesh.node_kind_${k}`))}</option>`)
@@ -630,7 +629,7 @@ function renderRegistryRow(node, kind) {
 /// reachable). Hostname interfejsu nie jest dostepny w protokole — pomijamy
 /// (mockup pokazywal `enp1s0np0` ale to opcjonalne).
 function renderLocalConnectivity(node) {
-  const bind = String(relayHealth?.bindAddrActual || relayHealth?.bind_addr_actual || '');
+  const bind = String(relayHealth?.bindAddrActual || '');
   const fallbackBind = (() => {
     if (bind) return bind;
     const ip = node.ip || (node.ip_addresses && node.ip_addresses[0]) || '';
@@ -640,8 +639,8 @@ function renderLocalConnectivity(node) {
   const relayStatus = String(relayHealth?.status || 'unknown').toLowerCase();
   const relayUrl = String(relayHealth?.url || '');
   const relayHost = relayHostname(relayUrl) || relayUrl || '—';
-  const rttMs = Number(relayHealth?.rttMs ?? relayHealth?.rtt_ms ?? 0);
-  const lastSuccess = Number(relayHealth?.lastSuccessUnixSecs ?? relayHealth?.last_success_unix_secs ?? 0);
+  const rttMs = Number(relayHealth?.rttMs ?? 0);
+  const lastSuccess = Number(relayHealth?.lastSuccessUnixSecs ?? 0);
 
   let relayDotCls = 'ok';
   let relayLabel = I18n.t('mesh.relay_connected');
@@ -697,7 +696,7 @@ function renderLocalConnectivity(node) {
 /// jakikolwiek slad poprzedniego connect-a).
 function renderTransportRow(node, online) {
   const conn = node.connection;
-  const heartbeat = node.heartbeat_ms ?? node.heartbeatMs ?? null;
+  const heartbeat = node.heartbeatMs ?? null;
 
   let pillCls = '';
   let pillLabel = '';
@@ -714,7 +713,7 @@ function renderTransportRow(node, online) {
     pillCls = 'relay';
     pillLabel = I18n.t('mesh.transport_relay');
     pillSvg = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M2 12h4M18 12h4"/></svg>';
-    addr = relayHostname(conn.relay_url || conn.relayUrl) || String(conn.address || '');
+    addr = relayHostname(conn.relayUrl) || String(conn.address || '');
   } else if (online && conn) {
     pillCls = 'relay';
     pillLabel = connectionTransportLabel(conn.transport);
@@ -775,14 +774,14 @@ function buildGauges(node) {
   const g = [];
 
   // CPU
-  const cpuPct = pctOr(node.cpu_usage ?? node.cpu_usage_percent, null);
-  const cpuSub = node.cpu_count ? `${node.cpu_count} cores` : '';
+  const cpuPct = pctOr(node.cpuUsagePercent, null);
+  const cpuSub = node.cpuCount ? `${node.cpuCount} cores` : '';
   g.push(renderRing('CPU', cpuPct != null ? `${cpuPct}` : '—', cpuPct != null ? `${cpuPct}%` : '—', cpuSub, cpuPct));
 
   // RAM
-  if (node.ram_used_mb != null && node.ram_total_mb) {
-    const pct = Math.round((node.ram_used_mb / node.ram_total_mb) * 100);
-    g.push(renderRing('RAM', formatMb(node.ram_used_mb), '', `${formatMb(node.ram_used_mb)} / ${formatMb(node.ram_total_mb)}`, pct));
+  if (node.ramUsedMb != null && node.ramTotalMb) {
+    const pct = Math.round((node.ramUsedMb / node.ramTotalMb) * 100);
+    g.push(renderRing('RAM', formatMb(node.ramUsedMb), '', `${formatMb(node.ramUsedMb)} / ${formatMb(node.ramTotalMb)}`, pct));
   } else {
     g.push(renderRing('RAM', '—', '', '', null));
   }
@@ -790,8 +789,8 @@ function buildGauges(node) {
   // VRAM — suma z wszystkich GPU
   const gpus = Array.isArray(node.gpus) ? node.gpus : [];
   if (gpus.length > 0) {
-    const vramUsed = gpus.reduce((s, x) => s + (x.vram_used_mb || 0), 0);
-    const vramTotal = gpus.reduce((s, x) => s + (x.vram_total_mb || 0), 0);
+    const vramUsed = gpus.reduce((s, x) => s + (x.vramUsedMb || 0), 0);
+    const vramTotal = gpus.reduce((s, x) => s + (x.vramTotalMb || 0), 0);
     if (vramTotal > 0) {
       const pct = Math.round((vramUsed / vramTotal) * 100);
       const names = gpus.map(x => x.name).filter(Boolean);
@@ -803,7 +802,7 @@ function buildGauges(node) {
       g.push(renderRing('VRAM', '—', '', I18n.t('mesh.no_gpu'), null));
     }
     // GPU util — srednia po wszystkich kartach
-    const avgUsage = gpus.length > 0 ? Math.round(gpus.reduce((s, x) => s + (x.usage_percent || 0), 0) / gpus.length) : null;
+    const avgUsage = gpus.length > 0 ? Math.round(gpus.reduce((s, x) => s + (x.utilizationPercent || 0), 0) / gpus.length) : null;
     g.push(renderRing(I18n.t('mesh.gpu_util'), avgUsage != null ? `${avgUsage}` : '—', avgUsage != null ? `${avgUsage}%` : '', gpus.length > 1 ? I18n.t('mesh.gpu_avg_of', { count: gpus.length }) : '', avgUsage));
   } else {
     g.push(renderRing('VRAM', '—', '', I18n.t('mesh.no_gpu'), null));
@@ -850,9 +849,10 @@ function buildMeta(node) {
   parts.push(`<div class="meta-item"><span><strong>${escapeHtml(I18n.t('mesh.active'))}:</strong> ${active} ${escapeHtml(I18n.t(active === 1 ? 'mesh.request_one' : 'mesh.request_many'))}${tpsLabel}</span></div>`);
 
   // Kontenery (jesli sa)
-  const cRun = node.containers_running;
-  const cTot = node.containers_total;
-  if (cRun != null && cTot != null && cTot > 0) {
+  const containers = node.containers ?? [];
+  const cTot = containers.length;
+  const cRun = containers.filter(c => /up|running/i.test(c.status ?? '')).length;
+  if (cTot > 0) {
     parts.push(`<div class="meta-item"><span><strong>${escapeHtml(I18n.t('mesh.containers_short'))}:</strong> ${cRun} / ${cTot}</span></div>`);
   }
 
@@ -913,7 +913,7 @@ async function handleRegistryChange(e) {
       // only provenance the materializer accepts for a registry write. Saying
       // "saved" flatly would be a half-truth on a node nobody has vouched for
       // yet — the admin would keep clicking and keep seeing nothing move.
-      const local = nodes.find((n) => n.is_local || n.isLocal);
+      const local = nodes.find((n) => n.isLocal);
       const key = local && local.operator ? 'mesh.node_profile_saved' : 'mesh.node_profile_saved_local_only';
       toast(I18n.t(key), local && local.operator ? 'success' : 'info');
     }
@@ -1323,11 +1323,11 @@ async function wireUpPairTabs(winEl) {
     if (!winEl.isConnected) return;
     try {
       const resp = await ApiBinary.one('meshIdentityRequest');
-      const hex = resp?.nodeId || resp?.node_id || '';
-      const pin = resp?.invitePin || resp?.invite_pin || '';
+      const hex = resp?.nodeId || '';
+      const pin = resp?.invitePin || '';
       const host = resp?.hostname || '';
-      const relayUrl = resp?.relayUrl || resp?.relay_url || '';
-      const publicKey = resp?.publicKey || resp?.public_key || '';
+      const relayUrl = resp?.relayUrl || '';
+      const publicKey = resp?.publicKey || '';
       const addresses = Array.isArray(resp?.addresses) ? resp.addresses.filter(Boolean) : [];
       const hexEl = winEl.querySelector('#pair-invite-hex');
       const pinEl = winEl.querySelector('#pair-invite-pin');
@@ -1483,7 +1483,7 @@ function openPinDisplayModal(targetNodeId, pin) {
     try {
       const pendingResp = await ApiBinary.list('meshPendingListRequest', { arrayKey: 'pending' });
       const stillPending = Array.isArray(pendingResp)
-        && pendingResp.some(p => (p.remoteNodeId || p.remote_node_id) === targetNodeId);
+        && pendingResp.some(p => (p.remoteNodeId) === targetNodeId);
       if (!stillPending) {
         clearInterval(pollIv);
         clearInterval(iv);
@@ -1559,7 +1559,7 @@ async function rejectPairing(nodeId) {
 }
 
 async function revokeTrust(nodeId) {
-  const peer = nodes.find((n) => (n.nodeId || n.node_id) === nodeId);
+  const peer = nodes.find((n) => (n.nodeId) === nodeId);
   const peerName = peer?.hostname || peer?.displayName || I18n.t('mesh.unknown_host');
   const ok = await confirmDialog({
     title: I18n.t('mesh.revoke_dialog_title'),

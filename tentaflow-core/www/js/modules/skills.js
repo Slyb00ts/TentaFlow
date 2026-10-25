@@ -186,7 +186,7 @@ export default SkillsScreen;
 async function loadSkills() {
   try {
     const resp = await ApiBinary.one('skillsListRequest', {});
-    const rows = JSON.parse(resp.skillsJson ?? resp.skills_json ?? '[]');
+    const rows = JSON.parse(resp.skillsJson ?? '[]');
     state.skills = Array.isArray(rows) ? rows : [];
     const sub = byId('skills-sub');
     if (sub) sub.textContent = I18n.t('skills.subtitle', { count: state.skills.length });
@@ -392,8 +392,8 @@ async function openSkillEditor(skillId) {
   if (skillId) {
     try {
       const resp = await ApiBinary.one('skillsDetailRequest', { skillId });
-      skill = JSON.parse(resp.skillJson ?? resp.skill_json ?? 'null');
-      files = JSON.parse(resp.filesJson ?? resp.files_json ?? '[]');
+      skill = JSON.parse(resp.skillJson ?? 'null');
+      files = JSON.parse(resp.filesJson ?? '[]');
     } catch (err) {
       toast(`${I18n.t('skills.detail_failed')}: ${err.message}`, 'error');
       return;
@@ -727,7 +727,7 @@ function openForkDialog(skill) {
       if (state.forkWin === win) state.forkWin = null;
       state.editor?.cleanup();
       await loadSkills();
-      const newId = resp.skillId ?? resp.skill_id;
+      const newId = resp.skillId;
       if (newId) openSkillEditor(newId);
     } catch (err) {
       forkError(`${I18n.t('skills.fork_failed')}: ${err.message}`);
@@ -751,7 +751,7 @@ async function runHubSearch() {
       query,
       source: source || undefined,
     });
-    const rows = JSON.parse(resp.resultsJson ?? resp.results_json ?? '[]');
+    const rows = JSON.parse(resp.resultsJson ?? '[]');
     state.hubResults = Array.isArray(rows) ? rows : [];
     renderHubResults(false);
   } catch (err) {
@@ -823,8 +823,8 @@ async function importFromSource(source) {
   state.hubBusy = true;
   try {
     const resp = await ApiBinary.one('skillsHubImportRequest', { source });
-    const skillId = resp.skillId ?? resp.skill_id;
-    const verdict = JSON.parse(resp.verdictJson ?? resp.verdict_json ?? '{"clean":true,"findings":[]}');
+    const skillId = resp.skillId;
+    const verdict = JSON.parse(resp.verdictJson ?? '{"clean":true,"findings":[]}');
     toast(I18n.t('skills.hub.import_ok'), 'success');
     await loadSkills();
     openVerdictModal(skillId, source, verdict);
@@ -916,9 +916,9 @@ async function runCuratorReview() {
   renderCurator();
   try {
     const resp = await ApiBinary.one('skillsCuratorRunRequest', {});
-    const proposal = JSON.parse(resp.proposalJson ?? resp.proposal_json ?? '{"actions":[]}');
+    const proposal = JSON.parse(resp.proposalJson ?? '{"actions":[]}');
     state.curatorProposal = Array.isArray(proposal.actions) ? proposal : { actions: [] };
-    state.curatorSnapshotId = resp.snapshotId ?? resp.snapshot_id ?? null;
+    state.curatorSnapshotId = resp.snapshotId ?? null;
     state.curatorApproved = new Set(state.curatorProposal.actions.map((_, i) => i));
     state.curatorAppliedSnapshotId = null;
   } catch (err) {

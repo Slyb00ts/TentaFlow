@@ -75,6 +75,10 @@ function buildClient() {
     onClose: (info) => emit({ type: 'close', info }),
     onProtocolError: (err) => emit({ type: 'protocol-error', err }),
     onUpdateAvailable: (info) => emit({ type: 'update-available', info }),
+    onAuthRejected: (info) => {
+      localStorage.removeItem(JWT_STORAGE_KEY);
+      emit({ type: 'auth-rejected', info });
+    },
   });
 }
 
@@ -133,7 +137,7 @@ function dispatch(kind, ...args) {
   const call = (async () => {
     const client = await getClient();
     const result = await client.request(kind, ...args);
-    if (result.envelope.isError || result.body.variant === 'Error') {
+    if (result.envelope.isError || result.body._variant === 'Error') {
       const err = new Error(result.body.message ?? `protocol error in ${kind}`);
       err.code = result.body.code;
       throw err;
@@ -150,8 +154,10 @@ export const ApiBinary = {
     // none at all) exactly like `.one`/`.action` do; omitted for every
     // caller that has no payload to send, unchanged from before.
     const body = options.payload !== undefined ? await dispatch(kind, options.payload) : await dispatch(kind);
-    const arrayKey = options.arrayKey ?? guessArrayKey(body);
-    return body[arrayKey] ?? [];
+    if (typeof options.arrayKey !== 'string' || !options.arrayKey) {
+      throw new Error(`list '${kind}' needs an explicit arrayKey`);
+    }
+    return body[options.arrayKey] ?? [];
   },
 
   async one(kind, ...args) {
@@ -215,7 +221,7 @@ export const ApiBinary = {
         const closeSeq = client.takeSequence();
         const closeFrame = codec.encode.streamCloseRequest(
           correlationId,
-          { streamId: payload?.streamId ?? payload?.stream_id ?? '' },
+          { streamId: payload?.streamId ?? '' },
           closeSeq,
         );
         client._send(closeFrame);
@@ -282,10 +288,3 @@ export const ApiBinary = {
     return !!(_client && _client.connected);
   },
 };
-
-function guessArrayKey(body) {
-  for (const k of Object.keys(body)) {
-    if (Array.isArray(body[k])) return k;
-  }
-  return null;
-}

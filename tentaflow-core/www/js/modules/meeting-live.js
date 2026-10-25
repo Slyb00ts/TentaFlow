@@ -292,11 +292,11 @@ async function subscribeLive() {
   try {
     const client = await ApiBinary.client();
     unsubscribeLive = client.addUnsolicitedListener(({ body }) => {
-      if (!body || body.variant !== 'MeetingLiveEventBody') return;
+      if (!body || body._variant !== 'MeetingLiveEventBody') return;
       if (body.meetingKey !== state.meetingKey) return;
-      const payload = body.payload;
-      if (!payload || !payload.type) return;
-      applyLiveEvent(Number(body.timestampMs || Date.now()), payload.type, payload.data || {});
+      const type = body.payload ? Object.keys(body.payload)[0] : null;
+      if (!type) return;
+      applyLiveEvent(Number(body.timestampMs || Date.now()), type, body.payload[type] || {});
       scheduleRender();
     });
   } catch (e) {

@@ -143,9 +143,9 @@ function makeEnv({ services = [], currentTab = 'list', subscribe } = {}) {
 function svc(overrides = {}) {
   return {
     id: 7,
-    node_id: 'node-1',
-    display_name: 'Teams Bot',
-    engine_id: 'teams-bot',
+    nodeId: 'node-1',
+    displayName: 'Teams Bot',
+    engineId: 'teams-bot',
     category: 'tools',
     status: 'running',
     models: [],
@@ -220,9 +220,9 @@ test('clearing the marker restores the row it was rendered from', () => {
 test('the delete marker is per node — the same service id on another node is untouched', () => {
   const env = makeEnv();
   const mod = build(env);
-  env.state.deletingServices.add(mod.serviceActionKey(svc({ node_id: 'node-1' })));
+  env.state.deletingServices.add(mod.serviceActionKey(svc({ nodeId: 'node-1' })));
 
-  const other = mod.renderRow(svc({ node_id: 'node-2' }));
+  const other = mod.renderRow(svc({ nodeId: 'node-2' }));
   assert.doesNotMatch(other, /svc-row-deleting/);
   assert.match(other, /data-svc-delete="7"/);
 });
@@ -236,9 +236,9 @@ test('a deploying row without a stream still shows what the list snapshot knows'
   const mod = build(env);
   const html = mod.renderRow(svc({
     status: 'deploying',
-    active_deploy_id: 'dep-1',
-    progress_message: '[assets] bundle (AlreadyPresent)',
-    deployment_progress_pct: 12,
+    activeDeployId: 'dep-1',
+    progressMessage: '[assets] bundle (AlreadyPresent)',
+    deploymentProgressPct: 12,
   }));
   assert.match(html, /\[assets\] bundle \(AlreadyPresent\)/);
   assert.match(html, /12%/);
@@ -251,9 +251,9 @@ test('a deploying row prefers the streamed phase and percentage over the stale s
 
   const html = mod.renderRow(svc({
     status: 'deploying',
-    active_deploy_id: 'dep-1',
-    progress_message: '[assets] bundle (AlreadyPresent)',
-    deployment_progress_pct: 0,
+    activeDeployId: 'dep-1',
+    progressMessage: '[assets] bundle (AlreadyPresent)',
+    deploymentProgressPct: 0,
   }));
   assert.match(html, /pulling image/);
   assert.match(html, /64%/);
@@ -272,8 +272,8 @@ test('a stream that reported a phase but no percentage yet falls back to the sna
 
   const html = mod.renderRow(svc({
     status: 'deploying',
-    active_deploy_id: 'dep-1',
-    deployment_progress_pct: 41,
+    activeDeployId: 'dep-1',
+    deploymentProgressPct: 41,
   }));
   assert.match(html, /starting container/);
   assert.match(html, /41%/);
@@ -282,7 +282,7 @@ test('a stream that reported a phase but no percentage yet falls back to the sna
 test('a row that is not deploying renders no progress cells at all', () => {
   const env = makeEnv();
   const mod = build(env);
-  const html = mod.renderRow(svc({ status: 'running', active_deploy_id: 'dep-1' }));
+  const html = mod.renderRow(svc({ status: 'running', activeDeployId: 'dep-1' }));
   assert.doesNotMatch(html, /data-svc-deploy-pct/);
 });
 
@@ -293,9 +293,9 @@ test('a row that is not deploying renders no progress cells at all', () => {
 test('every deploying row gets exactly one stream, no matter how often the list re-renders', async () => {
   const env = makeEnv({
     services: [
-      svc({ id: 1, status: 'deploying', active_deploy_id: 'dep-1' }),
-      svc({ id: 2, status: 'deploying', active_deploy_id: 'dep-2' }),
-      svc({ id: 3, status: 'running', active_deploy_id: 'dep-3' }),
+      svc({ id: 1, status: 'deploying', activeDeployId: 'dep-1' }),
+      svc({ id: 2, status: 'deploying', activeDeployId: 'dep-2' }),
+      svc({ id: 3, status: 'running', activeDeployId: 'dep-3' }),
     ],
   });
   const mod = build(env);
@@ -314,7 +314,7 @@ test('every deploying row gets exactly one stream, no matter how often the list 
 });
 
 test('a deployment that finished is not resubscribed on the next render', async () => {
-  const env = makeEnv({ services: [svc({ status: 'deploying', active_deploy_id: 'dep-1' })] });
+  const env = makeEnv({ services: [svc({ status: 'deploying', activeDeployId: 'dep-1' })] });
   const mod = build(env);
   mod.syncDeployWatchers();
   await flush();
@@ -330,12 +330,12 @@ test('a deployment that finished is not resubscribed on the next render', async 
 });
 
 test('a row that stops deploying releases its stream', async () => {
-  const env = makeEnv({ services: [svc({ status: 'deploying', active_deploy_id: 'dep-1' })] });
+  const env = makeEnv({ services: [svc({ status: 'deploying', activeDeployId: 'dep-1' })] });
   const mod = build(env);
   mod.syncDeployWatchers();
   await flush();
 
-  env.state.services = [svc({ status: 'running', active_deploy_id: 'dep-1' })];
+  env.state.services = [svc({ status: 'running', activeDeployId: 'dep-1' })];
   mod.syncDeployWatchers();
 
   assert.equal(env.calls[0].unsubscribed, 1);
@@ -345,8 +345,8 @@ test('a row that stops deploying releases its stream', async () => {
 test('leaving the list tab releases every stream', async () => {
   const env = makeEnv({
     services: [
-      svc({ id: 1, status: 'deploying', active_deploy_id: 'dep-1' }),
-      svc({ id: 2, status: 'deploying', active_deploy_id: 'dep-2' }),
+      svc({ id: 1, status: 'deploying', activeDeployId: 'dep-1' }),
+      svc({ id: 2, status: 'deploying', activeDeployId: 'dep-2' }),
     ],
   });
   const mod = build(env);
@@ -363,7 +363,7 @@ test('leaving the list tab releases every stream', async () => {
 test('a stream that fails to open frees its slot for the next render', async () => {
   let attempts = 0;
   const env = makeEnv({
-    services: [svc({ status: 'deploying', active_deploy_id: 'dep-1' })],
+    services: [svc({ status: 'deploying', activeDeployId: 'dep-1' })],
     subscribe: () => {
       attempts += 1;
       return attempts === 1 ? Promise.reject(new Error('socket down')) : Promise.resolve(() => {});
@@ -385,7 +385,7 @@ test('an unsubscribe racing a pending subscribe still closes the stream', async 
   let resolveSubscribe;
   let unsubscribed = 0;
   const env = makeEnv({
-    services: [svc({ status: 'deploying', active_deploy_id: 'dep-1' })],
+    services: [svc({ status: 'deploying', activeDeployId: 'dep-1' })],
     subscribe: () => new Promise((resolve) => { resolveSubscribe = resolve; }),
   });
   const mod = build(env);
@@ -404,7 +404,7 @@ test('an unsubscribe racing a pending subscribe still closes the stream', async 
 // ---------------------------------------------------------------------------
 
 test('phase and progress frames update the row, log lines do not', async () => {
-  const env = makeEnv({ services: [svc({ status: 'deploying', active_deploy_id: 'dep-1' })] });
+  const env = makeEnv({ services: [svc({ status: 'deploying', activeDeployId: 'dep-1' })] });
   const mod = build(env);
   const phaseCell = env.body.addCell('[data-svc-deploy-phase="dep-1"]');
   const pctCell = env.body.addCell('[data-svc-deploy-pct="dep-1"]');
@@ -412,28 +412,28 @@ test('phase and progress frames update the row, log lines do not', async () => {
   await flush();
   const { onChunk } = env.calls[0].handlers;
 
-  onChunk({ variant: 'DeploymentStreamChunk', kind: 'phase', phase: 'building', progressPct: 20 });
+  onChunk({ _variant: 'DeploymentBody.StreamChunk', kind: 'phase', phase: 'building', progressPct: 20 });
   assert.equal(phaseCell.textContent, 'building');
   assert.equal(pctCell.textContent, '20%');
 
-  onChunk({ variant: 'DeploymentStreamChunk', kind: 'progress', progressPct: 55, line: '#7 DONE' });
+  onChunk({ _variant: 'DeploymentBody.StreamChunk', kind: 'progress', progressPct: 55, line: '#7 DONE' });
   assert.equal(phaseCell.textContent, 'building', 'a progress frame without a phase keeps the last one');
   assert.equal(pctCell.textContent, '55%');
 
-  onChunk({ variant: 'DeploymentStreamChunk', kind: 'log', line: 'Step 3/9 : RUN pip install' });
+  onChunk({ _variant: 'DeploymentBody.StreamChunk', kind: 'log', line: 'Step 3/9 : RUN pip install' });
   assert.equal(phaseCell.textContent, 'building');
   assert.equal(pctCell.textContent, '55%');
 });
 
 test('a chunk addressed to another deployment is ignored', async () => {
-  const env = makeEnv({ services: [svc({ status: 'deploying', active_deploy_id: 'dep-1' })] });
+  const env = makeEnv({ services: [svc({ status: 'deploying', activeDeployId: 'dep-1' })] });
   const mod = build(env);
   const pctCell = env.body.addCell('[data-svc-deploy-pct="dep-1"]');
   mod.syncDeployWatchers();
   await flush();
 
   env.calls[0].handlers.onChunk({
-    variant: 'DeploymentStreamChunk', kind: 'progress', deployId: 'dep-9', progressPct: 90,
+    _variant: 'DeploymentBody.StreamChunk', kind: 'progress', deployId: 'dep-9', progressPct: 90,
   });
   assert.equal(pctCell.textContent, '');
   assert.equal(env.state.deployWatchers.get('dep-1').pct, null);
@@ -451,8 +451,8 @@ test('a percentage outside 0..100 is clamped before it reaches the cell', () => 
 test('deployIdFor prefers the active deployment over the last finished one', () => {
   const env = makeEnv();
   const mod = build(env);
-  assert.equal(mod.deployIdFor({ active_deploy_id: 'a', last_deploy_id: 'b' }), 'a');
-  assert.equal(mod.deployIdFor({ last_deploy_id: 'b' }), 'b');
+  assert.equal(mod.deployIdFor({ activeDeployId: 'a', lastDeployId: 'b' }), 'a');
+  assert.equal(mod.deployIdFor({ lastDeployId: 'b' }), 'b');
   assert.equal(mod.deployIdFor({}), '');
 });
 

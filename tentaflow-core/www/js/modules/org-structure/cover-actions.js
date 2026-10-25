@@ -40,7 +40,7 @@ export function scopeLabel(scope) {
 }
 
 export function rangeLabel(item) {
-  return rangeText(item.valid_from, item.valid_to, { from: ct('range_from') });
+  return rangeText(item.validFrom, item.validTo, { from: ct('range_from') });
 }
 
 // The service answers with a code; the sentence has to fit THIS screen, not the position list's.
@@ -119,8 +119,8 @@ export function createCoverActions({ reload, people = async () => [] }) {
       errorMessage: (err) => err.message,
       fields: absenceWindowFields({
         kind: absence.kind,
-        from: absence.valid_from,
-        last: lastDayOf(absence.valid_to),
+        from: absence.validFrom,
+        last: lastDayOf(absence.validTo),
       }),
       async onSubmit(values) {
         const result = absencePatch(absence, values);
@@ -146,9 +146,9 @@ export function createCoverActions({ reload, people = async () => [] }) {
         // Back: the same absence is added again.
         const undo = async () => {
           await write('orgAbsenceAddRequest', {
-            userId: absence.user_id,
-            validFrom: absence.valid_from,
-            validTo: absence.valid_to,
+            userId: absence.userId,
+            validFrom: absence.validFrom,
+            validTo: absence.validTo,
             kind: absence.kind,
             confirmBackdated: body.confirmedBackdated,
           });
@@ -204,7 +204,7 @@ export function createCoverActions({ reload, people = async () => [] }) {
 
   function editDeputy(deputy, { anchor = null }) {
     openEditWindow({
-      subject: ct('deputy_subject', { deputy: deputy.deputy_name, person: deputy.user_name }),
+      subject: ct('deputy_subject', { deputy: deputy.deputyName, person: deputy.userName }),
       title: ct('deputy_edit_title'),
       submitLabel: ct('deputy_edit_submit'),
       anchor,
@@ -222,8 +222,8 @@ export function createCoverActions({ reload, people = async () => [] }) {
           required: true,
           hint: ct('f_scope_hint'),
         },
-        { key: 'from', label: ct('f_from'), kind: 'date', value: deputy.valid_from, required: true },
-        { key: 'last', label: ct('f_last'), kind: 'date', value: lastDayOf(deputy.valid_to) ?? '', hint: ct('f_deputy_last_hint') },
+        { key: 'from', label: ct('f_from'), kind: 'date', value: deputy.validFrom, required: true },
+        { key: 'last', label: ct('f_last'), kind: 'date', value: lastDayOf(deputy.validTo) ?? '', hint: ct('f_deputy_last_hint') },
       ],
       async onSubmit(values, { changed }) {
         if (!changed.length) throw new Error(ct('nothing_changed'));
@@ -238,14 +238,14 @@ export function createCoverActions({ reload, people = async () => [] }) {
           else clear.push('valid_to');
         }
         const body = await write('orgDeputyUpdateRequest', { ...payload, clear });
-        return done(body, ct('toast_deputy_edited', { deputy: deputy.deputy_name }), null);
+        return done(body, ct('toast_deputy_edited', { deputy: deputy.deputyName }), null);
       },
     });
   }
 
   function endDeputy(deputy, { today, anchor = null }) {
     openEditWindow({
-      subject: ct('deputy_subject', { deputy: deputy.deputy_name, person: deputy.user_name }),
+      subject: ct('deputy_subject', { deputy: deputy.deputyName, person: deputy.userName }),
       title: ct('deputy_end_title'),
       submitLabel: ct('deputy_end_submit'),
       note: { tone: 'warning', text: ct('deputy_end_note') },
@@ -257,16 +257,16 @@ export function createCoverActions({ reload, people = async () => [] }) {
         // Back: appointed again over the same days.
         const undo = async () => {
           await write('orgDeputySetRequest', {
-            userId: deputy.user_id,
-            deputyUserId: deputy.deputy_user_id,
+            userId: deputy.userId,
+            deputyUserId: deputy.deputyUserId,
             scope: deputy.scope,
-            validFrom: deputy.valid_from,
-            validTo: deputy.valid_to,
+            validFrom: deputy.validFrom,
+            validTo: deputy.validTo,
             confirmBackdated: body.confirmedBackdated,
           });
           await refresh();
         };
-        return done(body, ct('toast_deputy_ended', { deputy: deputy.deputy_name }), undo);
+        return done(body, ct('toast_deputy_ended', { deputy: deputy.deputyName }), undo);
       },
     });
   }
@@ -279,7 +279,7 @@ export function accountPeople() {
   let promise = null;
   return () => {
     promise ??= ApiBinary.one('orgMemberListRequest', {})
-      .then((body) => (body.members ?? []).map((m) => ({ id: String(m.user_id), name: m.display_name || I18n.t('org_structure.unknown_person') })))
+      .then((body) => (body.members ?? []).map((m) => ({ id: String(m.userId), name: m.displayName || I18n.t('org_structure.unknown_person') })))
       .catch((err) => { promise = null; throw err; });
     return promise;
   };

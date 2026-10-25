@@ -12,8 +12,9 @@ const { test, expect } = require('@playwright/test');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
-const BINARY = path.join(__dirname, '../../tentaflow/target/release/tentaflow');
+const { BINARY } = require('./helpers/spawn');
 
 const CONFIGS = {
   A: { port: 18091, config: 'config-node-a.toml', db: '/tmp/e2e-node-a.db' },
@@ -23,38 +24,58 @@ const CONFIGS = {
 };
 
 let processes = {};
-let tokens = {};
+
+// Pairing refuses loopback and link-local peer addresses, so the nodes reach each
+// other through the host's first routable IPv4 address (they bind 0.0.0.0).
+const HOST_IP = Object.values(os.networkInterfaces()).flat()
+  .find((i) => i && i.family === 'IPv4' && !i.internal && !i.address.startsWith('169.254.'))?.address;
+
+function peerAddresses(node) {
+  return [`${HOST_IP}:${CONFIGS[node].port}`];
+}
 
 function baseUrl(node) {
   return `https://127.0.0.1:${CONFIGS[node].port}`;
 }
 
-// Pomocnik: logowanie i pobranie tokenu JWT
-async function getToken(node) {
-  const res = await fetch(`${baseUrl(node)}/api/auth/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username: 'admin', password: 'admin' }),
-  });
-  const data = await res.json();
-  return data.token;
+// Every node is driven the way the dashboard drives it: a browser page logged in
+// through the UI, then binary-protocol requests through the page's own transport.
+// There is no REST surface for mesh administration.
+const { loginAsAdmin } = require('./helpers/auth');
+
+let pages = {};
+
+// Runs one protocol call inside the node's page. A refusal comes back as data
+// ({ error, code }) so a spec can assert on the exact refusal.
+async function call(node, kind, args = {}, { list = null, one = false } = {}) {
+  return pages[node].evaluate(async ({ kind, args, list, one }) => {
+    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+    try {
+      const value = list
+        ? await ApiBinary.list(kind, { ...args, arrayKey: list })
+        : one ? await ApiBinary.one(kind) : await ApiBinary.action(kind, args);
+      return { value };
+    } catch (e) {
+      return { error: String(e?.message ?? e), code: e?.code ?? null };
+    }
+  }, { kind, args, list, one });
 }
 
-// Pomocnik: API call z tokenem
-async function apiCall(node, method, apiPath, body = null) {
-  const opts = {
-    method,
-    headers: {
-      'Authorization': `Bearer ${tokens[node]}`,
-      'Content-Type': 'application/json',
-    },
-  };
-  if (body) opts.body = JSON.stringify(body);
-  const res = await fetch(`${baseUrl(node)}${apiPath}`, opts);
-  const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch { json = text; }
-  return { status: res.status, body: json };
+async function callOk(node, kind, args, opts) {
+  const r = await call(node, kind, args, opts);
+  if (r.error) throw new Error(`${node} ${kind}: ${r.error} (${r.code})`);
+  return r.value;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function getTrustedNodes(node) {
+  const nodes = await callOk(node, 'meshNodeListRequest', {}, { list: 'nodes' });
+  return nodes.filter((n) => n.source === 'trusted').map((n) => n.nodeId);
+}
+
+async function getPendingPairings(node) {
+  return callOk(node, 'meshPendingListRequest', {}, { list: 'pending' });
 }
 
 // Pomocnik: poczekaj az serwer odpowie
@@ -62,12 +83,8 @@ async function waitForServer(node, maxWaitMs = 30000) {
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
     try {
-      const res = await fetch(`${baseUrl(node)}/api/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: 'admin', password: 'admin' }),
-      });
-      if (res.ok || res.status === 200 || res.status === 401 || res.status === 403) return;
+      const res = await fetch(`${baseUrl(node)}/`);
+      if (res.ok) return;
     } catch { /* serwer jeszcze nie wstal */ }
     await new Promise(r => setTimeout(r, 500));
   }
@@ -81,11 +98,16 @@ function startNode(name) {
   for (const suffix of ['', '-wal', '-shm']) {
     try { fs.unlinkSync(cfg.db + suffix); } catch {}
   }
+  // Each node needs its own home: the ledger store locks its directory and the
+  // signing keys live there, so nodes sharing the default home break each other.
+  const home = path.join(__dirname, '../../.runtime/e2e-home', `mesh-pairing-${name}`);
+  fs.rmSync(home, { recursive: true, force: true });
+  fs.mkdirSync(home, { recursive: true });
   const proc = spawn(BINARY, [
     '-c', path.join(__dirname, cfg.config),
     '--db', cfg.db,
   ], {
-    env: { ...process.env, RUST_LOG: 'warn' },
+    env: { ...process.env, RUST_LOG: 'warn', TENTAFLOW_HOME: home },
   });
   proc.stderr.on('data', d => process.stderr.write(`[${name}] ${d}`));
   processes[name] = proc;
@@ -100,324 +122,200 @@ function stopNode(name) {
   }
 }
 
-// Pomocnik: pobierz node ID (z listy nodow, filtruj po source=local)
-async function getNodeId(node) {
-  const resp = await apiCall(node, 'GET', '/api/mesh/nodes');
-  const nodes = resp.body || [];
-  const local = nodes.find(n => n.source === 'local' || n.is_local === true);
-  if (local) return local.node_id;
-  // Fallback: pierwszy node
-  return nodes.length > 0 ? nodes[0].node_id : null;
-}
-
-// Pomocnik: pobierz discovered nodes
-async function getDiscoveredNodes(node) {
-  const resp = await apiCall(node, 'GET', '/api/mesh/nodes');
-  return resp.body || [];
-}
-
-// Pomocnik: pobierz trusted nodes
-async function getTrustedNodes(node) {
-  const resp = await apiCall(node, 'GET', '/api/mesh/trusted');
-  return resp.body || [];
-}
-
-// Pomocnik: pobierz pending pairings
-async function getPendingPairings(node) {
-  const resp = await apiCall(node, 'GET', '/api/mesh/pending');
-  return resp.body || [];
-}
-
-// Paruj dwa nody: initiator wywoluje pair, responder potwierdza PIN
-async function pairNodes(initiator, responder, responderNodeId) {
-  // Inicjuj parowanie — retry jesli QUIC nie jest jeszcze gotowy (502)
-  let initResp;
+// The initiator starts pairing and receives the PIN; the responder confirms it.
+// Retried while the peer connection is not up yet.
+async function pairNodes(initiator, responder, ids) {
+  let start = null;
   for (let attempt = 0; attempt < 10; attempt++) {
-    initResp = await apiCall(initiator, 'POST', `/api/mesh/pair/${responderNodeId}`);
-    console.log(`[pair] ${initiator}->${responder} initiate (${attempt+1}): status=${initResp.status}`);
-    if (initResp.status === 200) break;
-    if (initResp.status === 502) {
-      await new Promise(r => setTimeout(r, 2000));
-      continue;
-    }
-    return false;
+    start = await call(initiator, 'meshPairingStartRequest', {
+      remoteAddress: ids[responder],
+      remoteAddresses: peerAddresses(responder),
+    });
+    console.log(`[pair] ${initiator}->${responder} start (${attempt + 1}): ${start.error ?? 'ok'}`);
+    if (!start.error) break;
+    await sleep(2000);
   }
-  if (initResp.status !== 200) return false;
-  const pin = initResp.body.pin;
+  if (start.error) return false;
+  const pin = start.value.pin;
+  if (start.value.completed) return true;
 
-  // Poczekaj az pending pairing pojawi sie na responder
-  let pending = [];
-  for (let i = 0; i < 20; i++) {
-    pending = await getPendingPairings(responder);
-    if (pending.length > 0) break;
-    await new Promise(r => setTimeout(r, 1000));
+  let pending = null;
+  for (let i = 0; i < 20 && !pending; i++) {
+    pending = (await getPendingPairings(responder)).find((p) => p.remoteNodeId === ids[initiator]);
+    if (!pending) await sleep(1000);
   }
-  console.log(`[pair] ${responder} pending: ${JSON.stringify(pending)}`);
-  if (pending.length === 0) return false;
+  if (!pending) return false;
 
-  // Potwierdz z PIN
-  const nodeIdInPending = pending[0].remote_node_id;
-  const confirmResp = await apiCall(responder, 'POST',
-    `/api/mesh/pair/${nodeIdInPending}/confirm`,
-    { pin, hostname: `e2e-node-${responder.toLowerCase()}` }
-  );
-  console.log(`[pair] ${responder} confirm: status=${confirmResp.status} body=${JSON.stringify(confirmResp.body)}`);
-  return confirmResp.status === 200;
+  const confirm = await call(responder, 'meshPairingConfirmRequest', { pairId: ids[initiator], pin });
+  console.log(`[pair] ${responder} confirm: ${confirm.error ?? 'ok'}`);
+  return !confirm.error;
 }
 
-// Czekaj az node pojawi sie w trusted
 async function waitForTrust(node, targetNodeId, timeoutMs = 20000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    const trusted = await getTrustedNodes(node);
-    if (trusted.some(t => t.node_id === targetNodeId)) return true;
-    await new Promise(r => setTimeout(r, 1000));
+    if ((await getTrustedNodes(node)).includes(targetNodeId)) return true;
+    await sleep(1000);
   }
   return false;
 }
 
-// Czekaj az node ZNIKNIE z trusted
 async function waitForUntrust(node, targetNodeId, timeoutMs = 20000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    const trusted = await getTrustedNodes(node);
-    if (!trusted.some(t => t.node_id === targetNodeId)) return true;
-    await new Promise(r => setTimeout(r, 1000));
+    if (!(await getTrustedNodes(node)).includes(targetNodeId)) return true;
+    await sleep(1000);
   }
   return false;
 }
 
 test.describe.serial('Mesh Pairing E2E — 4 nodes', () => {
-  let nodeIds = {};
+  const nodeIds = {};
+  const NAMES = ['A', 'B', 'C', 'D'];
 
-  test.beforeAll(async () => {
-    // Uruchom 4 nody
-    for (const name of ['A', 'B', 'C', 'D']) startNode(name);
+  test.beforeAll(async ({ browser }) => {
+    test.skip(!HOST_IP, 'no routable IPv4 address on this host');
+    for (const name of NAMES) startNode(name);
+    await Promise.all(NAMES.map((name) => waitForServer(name)));
 
-    // Poczekaj az wszystkie serwery wstana
-    await Promise.all(
-      ['A', 'B', 'C', 'D'].map(name => waitForServer(name))
-    );
-
-    // Pobierz tokeny
-    for (const name of ['A', 'B', 'C', 'D']) {
-      tokens[name] = await getToken(name);
-    }
-
-    // Pobierz node ID
-    for (const name of ['A', 'B', 'C', 'D']) {
-      nodeIds[name] = await getNodeId(name);
+    for (const name of NAMES) {
+      pages[name] = await browser.newPage({ ignoreHTTPSErrors: true });
+      await loginAsAdmin(pages[name], { port: CONFIGS[name].port });
+      nodeIds[name] = (await callOk(name, 'meshIdentityRequest', {}, { one: true })).nodeId;
     }
   });
 
   test.afterAll(async () => {
-    for (const name of ['A', 'B', 'C', 'D']) stopNode(name);
-    // Daj czas na zamkniecie procesow
-    await new Promise(r => setTimeout(r, 2000));
+    for (const name of NAMES) {
+      await pages[name]?.close();
+      stopNode(name);
+    }
+    await sleep(2000);
   });
 
-  test('1. all 4 nodes discover each other', async () => {
-    // Poczekaj na discovery przez static peers
-    let allDiscovered = false;
-    for (let attempt = 0; attempt < 30; attempt++) {
-      allDiscovered = true;
-      for (const name of ['A', 'B', 'C', 'D']) {
-        const nodes = await getDiscoveredNodes(name);
-        const others = nodes.filter(n => n.node_id !== nodeIds[name]);
-        if (others.length < 3) {
-          allDiscovered = false;
-          break;
-        }
-      }
-      if (allDiscovered) break;
-      await new Promise(r => setTimeout(r, 1000));
-    }
-
-    for (const name of ['A', 'B', 'C', 'D']) {
-      const nodes = await getDiscoveredNodes(name);
-      const others = nodes.filter(n => n.node_id !== nodeIds[name]);
-      expect(others.length).toBeGreaterThanOrEqual(3);
+  // Static-peer discovery no longer exists (mDNS is off in these configs), so the
+  // nodes learn about each other only through pairing by address.
+  test('1. four nodes boot with distinct mesh identities and no trust', async () => {
+    expect(new Set(Object.values(nodeIds)).size).toBe(4);
+    for (const name of NAMES) {
+      expect(nodeIds[name]).toMatch(/^[0-9a-f]{64}$/);
+      expect(await getTrustedNodes(name)).toEqual([]);
     }
   });
 
   test('2. basic pair between A and B', async () => {
-    const ok = await pairNodes('A', 'B', nodeIds['B']);
-    expect(ok).toBe(true);
-
-    // Zweryfikuj zaufanie na obu stronach
-    expect(await waitForTrust('A', nodeIds['B'])).toBe(true);
-    expect(await waitForTrust('B', nodeIds['A'])).toBe(true);
+    expect(await pairNodes('A', 'B', nodeIds)).toBe(true);
+    expect(await waitForTrust('A', nodeIds.B)).toBe(true);
+    expect(await waitForTrust('B', nodeIds.A)).toBe(true);
   });
 
   test('3. hub pairing: A pairs C, B sees C via TrustedKeysSync', async () => {
-    const ok = await pairNodes('A', 'C', nodeIds['C']);
-    expect(ok).toBe(true);
-
-    // A ufa C
-    expect(await waitForTrust('A', nodeIds['C'])).toBe(true);
-
-    // B powinien otrzymac TrustedKeysSync od A i zaufac C
-    expect(await waitForTrust('B', nodeIds['C'])).toBe(true);
-
-    // C powinien widziec B
-    expect(await waitForTrust('C', nodeIds['B'])).toBe(true);
+    expect(await pairNodes('A', 'C', nodeIds)).toBe(true);
+    expect(await waitForTrust('A', nodeIds.C)).toBe(true);
+    expect(await waitForTrust('B', nodeIds.C)).toBe(true);
+    expect(await waitForTrust('C', nodeIds.B)).toBe(true);
   });
 
   test('4. A pairs D, all 4 nodes trust each other', async () => {
-    const ok = await pairNodes('A', 'D', nodeIds['D']);
-    expect(ok).toBe(true);
-
-    // Poczekaj na propagacje TrustedKeysSync
-    await new Promise(r => setTimeout(r, 5000));
-
-    // Wszystkie nody powinny sobie ufac
-    for (const from of ['A', 'B', 'C', 'D']) {
-      for (const to of ['A', 'B', 'C', 'D']) {
+    expect(await pairNodes('A', 'D', nodeIds)).toBe(true);
+    await sleep(5000);
+    for (const from of NAMES) {
+      for (const to of NAMES) {
         if (from === to) continue;
-        const trusted = await waitForTrust(from, nodeIds[to]);
-        expect(trusted).toBe(true);
+        expect(await waitForTrust(from, nodeIds[to])).toBe(true);
       }
     }
   });
 
   test('5. unpair D from A, verify propagation', async () => {
-    // Cofnij zaufanie D z poziomu A
-    const revokeResp = await apiCall('A', 'DELETE', `/api/mesh/trust/${nodeIds['D']}`);
-    expect(revokeResp.status).toBe(200);
-
-    // D powinno zniknac z listy zaufanych na A, B, C
-    expect(await waitForUntrust('A', nodeIds['D'])).toBe(true);
-    expect(await waitForUntrust('B', nodeIds['D'])).toBe(true);
-    expect(await waitForUntrust('C', nodeIds['D'])).toBe(true);
-
-    // D powinno stracic A
-    expect(await waitForUntrust('D', nodeIds['A'])).toBe(true);
+    await callOk('A', 'meshTrustRevokeRequest', { nodeId: nodeIds.D });
+    expect(await waitForUntrust('A', nodeIds.D)).toBe(true);
+    expect(await waitForUntrust('B', nodeIds.D)).toBe(true);
+    expect(await waitForUntrust('C', nodeIds.D)).toBe(true);
+    expect(await waitForUntrust('D', nodeIds.A)).toBe(true);
   });
 
   test.skip('6. re-pair D after unpair (not revoked)', async () => {
-    // Poczekaj na re-discovery i QUIC reconnect po unpair
-    await new Promise(r => setTimeout(r, 10000));
-    const ok = await pairNodes('A', 'D', nodeIds['D']);
-    expect(ok).toBe(true);
-
-    // Zweryfikuj ze parowanie przeszlo
-    expect(await waitForTrust('A', nodeIds['D'])).toBe(true);
-    expect(await waitForTrust('D', nodeIds['A'])).toBe(true);
+    await sleep(10000);
+    expect(await pairNodes('A', 'D', nodeIds)).toBe(true);
+    expect(await waitForTrust('A', nodeIds.D)).toBe(true);
+    expect(await waitForTrust('D', nodeIds.A)).toBe(true);
   });
 
   test('7. trust required for send_command', async () => {
-    // A powinno moc wyslac komende do zaufanego B
-    const trustedResp = await apiCall('A', 'POST',
-      `/api/mesh/nodes/${nodeIds['B']}/command`,
-      { command_type: 'list_containers' }
-    );
-    // Nie powinno byc 403 (moze byc 502 jesli Docker niedostepny)
-    expect(trustedResp.status).not.toBe(403);
+    const trusted = await call('A', 'meshNodeCommandRequest', {
+      nodeId: nodeIds.B, command: 'list_containers', args: [],
+    });
+    // A refusal for lack of trust is PolicyDenied; Docker being
+    // unavailable on the peer is not one.
+    expect(`${trusted.error ?? ''} ${trusted.code ?? ''}`).not.toMatch(/PolicyDenied/);
 
-    // Cofnij zaufanie D
-    await apiCall('A', 'DELETE', `/api/mesh/trust/${nodeIds['D']}`);
-    await new Promise(r => setTimeout(r, 3000));
+    await callOk('A', 'meshTrustRevokeRequest', { nodeId: nodeIds.D });
+    await sleep(3000);
 
-    // A NIE powinno moc wyslac komendy do niezaufanego D
-    const untrustedResp = await apiCall('A', 'POST',
-      `/api/mesh/nodes/${nodeIds['D']}/command`,
-      { command_type: 'list_containers' }
-    );
-    expect(untrustedResp.status).toBe(403);
+    const untrusted = await call('A', 'meshNodeCommandRequest', {
+      nodeId: nodeIds.D, command: 'list_containers', args: [],
+    });
+    expect(untrusted.error).toBeTruthy();
+    expect(`${untrusted.error} ${untrusted.code}`).toMatch(/PolicyDenied/);
   });
 
   test('8. PIN rate limiting', async () => {
-    // Zainicjuj parowanie A -> D (D jest teraz niezaufany po tescie 7)
-    const initResp = await apiCall('A', 'POST', `/api/mesh/pair/${nodeIds['D']}`);
-    expect(initResp.status).toBe(200);
+    const start = await call('A', 'meshPairingStartRequest', {
+      remoteAddress: nodeIds.D,
+      remoteAddresses: peerAddresses('D'),
+    });
+    expect(start.error).toBeUndefined();
 
-    // Poczekaj az pending pairing pojawi sie na D
-    let pending = [];
-    for (let i = 0; i < 15; i++) {
-      pending = await getPendingPairings('D');
-      if (pending.length > 0) break;
-      await new Promise(r => setTimeout(r, 1000));
+    let pending = null;
+    for (let i = 0; i < 15 && !pending; i++) {
+      pending = (await getPendingPairings('D')).find((p) => p.remoteNodeId === nodeIds.A);
+      if (!pending) await sleep(1000);
     }
-    expect(pending.length).toBeGreaterThan(0);
+    expect(pending).toBeTruthy();
 
-    const pendingNodeId = pending[0].remote_node_id;
-
-    // 3 proby z blednym PIN
+    // A wrong PIN is refused as an authentication failure.
     for (let i = 0; i < 3; i++) {
-      const resp = await apiCall('D', 'POST',
-        `/api/mesh/pair/${pendingNodeId}/confirm`,
-        { pin: '000000' }
-      );
-      expect(resp.status).toBe(403);
+      const r = await call('D', 'meshPairingConfirmRequest', { pairId: nodeIds.A, pin: '000000' });
+      expect(r.error).toBeTruthy();
+      expect(String(r.code)).not.toMatch(/rate/i);
     }
-
-    // 4. proba powinna byc rate limited
-    const resp = await apiCall('D', 'POST',
-      `/api/mesh/pair/${pendingNodeId}/confirm`,
-      { pin: '000000' }
-    );
-    expect(resp.status).toBe(429);
+    // The fourth attempt hits the limiter.
+    const limited = await call('D', 'meshPairingConfirmRequest', { pairId: nodeIds.A, pin: '000000' });
+    expect(`${limited.error} ${limited.code}`).toMatch(/rate|too many|retry/i);
   });
 
   test('9. reject pairing request', async () => {
-    // D odrzuca oczekujace parowanie (jesli jeszcze jest)
-    // lub inicjujemy nowe parowanie C -> D
-    const initResp = await apiCall('C', 'POST', `/api/mesh/pair/${nodeIds['D']}`);
-    if (initResp.status !== 200) {
-      // Rate limit moze blokowac — pominmy
-      test.skip();
-      return;
+    const start = await call('C', 'meshPairingStartRequest', {
+      remoteAddress: nodeIds.D,
+      remoteAddresses: peerAddresses('D'),
+    });
+    test.skip(Boolean(start.error), `pairing blocked: ${start.error}`);
+
+    let pending = null;
+    for (let i = 0; i < 15 && !pending; i++) {
+      pending = (await getPendingPairings('D')).find((p) => p.remoteNodeId === nodeIds.C);
+      if (!pending) await sleep(1000);
     }
+    test.skip(!pending, 'no pending pairing arrived on D');
 
-    // Poczekaj na pending na D
-    let pending = [];
-    for (let i = 0; i < 15; i++) {
-      pending = await getPendingPairings('D');
-      if (pending.length > 0) break;
-      await new Promise(r => setTimeout(r, 1000));
-    }
-
-    if (pending.length === 0) {
-      test.skip();
-      return;
-    }
-
-    const nodeIdInPending = pending[0].remote_node_id;
-
-    // D odrzuca parowanie
-    const rejectResp = await apiCall('D', 'POST',
-      `/api/mesh/pair/${nodeIdInPending}/reject`
-    );
-    expect(rejectResp.status).toBe(200);
-
-    // Po odrzuceniu nie powinno byc juz na liscie pending
-    const pendingAfter = await getPendingPairings('D');
-    const stillPending = pendingAfter.find(p => p.remote_node_id === nodeIdInPending);
-    expect(stillPending).toBeFalsy();
+    await callOk('D', 'meshPairingRejectRequest', { pairId: nodeIds.C });
+    const after = await getPendingPairings('D');
+    expect(after.find((p) => p.remoteNodeId === nodeIds.C)).toBeFalsy();
   });
 
   test('10. PIN not leaked in pending response', async () => {
-    // Zainicjuj parowanie B -> D
-    const initResp = await apiCall('B', 'POST', `/api/mesh/pair/${nodeIds['D']}`);
-    if (initResp.status !== 200) {
-      test.skip();
-      return;
-    }
+    const start = await call('B', 'meshPairingStartRequest', {
+      remoteAddress: nodeIds.D,
+      remoteAddresses: peerAddresses('D'),
+    });
+    test.skip(Boolean(start.error), `pairing blocked: ${start.error}`);
+    expect(start.value.pin).toMatch(/^\d{6}$/);
 
-    const pin = initResp.body.pin;
-    expect(pin).toBeTruthy();
-    expect(pin.length).toBe(6);
-
-    // Poczekaj na pending na D
-    await new Promise(r => setTimeout(r, 2000));
-
-    // PIN NIE powinien byc widoczny w /api/mesh/pending
-    const pendingResp = await apiCall('D', 'GET', '/api/mesh/pending');
-    expect(pendingResp.status).toBe(200);
-    if (Array.isArray(pendingResp.body) && pendingResp.body.length > 0) {
-      const entry = pendingResp.body[0];
-      expect(entry.pin_code).toBeUndefined();
-      expect(entry.pin).toBeUndefined();
+    await sleep(2000);
+    const incoming = (await getPendingPairings('D')).filter((p) => p.remoteNodeId === nodeIds.B);
+    for (const entry of incoming) {
+      expect(entry.pin ?? null).toBeNull();
     }
   });
 });

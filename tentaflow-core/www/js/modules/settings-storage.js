@@ -117,7 +117,7 @@ function renderCategoryRow(c) {
   const desc = CAT_DESC[key] || '';
   const ico = CAT_ICON[key] || 'folder';
   const size = formatBytes(Number(c.sizeBytes || 0));
-  const pending = c.pendingPath || c.pending_path;
+  const pending = c.pendingPath;
   const overridden = c.overridden;
   const liveTag = c.liveMigratable === false
     ? `<span class="tf-cat-badge warn" title="Zmiana wymaga restartu aplikacji">restart</span>`
@@ -542,7 +542,7 @@ function openProgressModal(cat, newPath, jobId, reload) {
   }
 
   function onChunk(b) {
-    if (!b || b.variant !== 'DeploymentStreamChunk') return;
+    if (!b || b._variant !== 'DeploymentBody.StreamChunk') return;
     if (b.kind === 'phase') {
       markActive(b.phase);
       appendLog(`— ${b.line || b.phase}`);

@@ -94,9 +94,9 @@ test('pause preserves the confirmed offset and resume obtains the server offset 
     if (kind === 'projectStudioAttachmentUploadStatusRequest') return status;
     assert.equal(kind, 'projectStudioAttachmentUploadChunkRequest');
     assert.ok(payload.bytes.length <= ATTACHMENT_CHUNK_BYTES);
-    assert.equal(payload.offset, status?.next_offset || 0);
-    status = { upload_id: payload.uploadId, filename: payload.filename, mime: payload.mime, sha256: payload.sha256,
-      total_size: payload.totalSize, next_offset: payload.offset + payload.bytes.length, complete: payload.offset + payload.bytes.length === payload.totalSize, expires_at: '2030-01-01T00:00:00Z' };
+    assert.equal(payload.offset, status?.nextOffset || 0);
+    status = { uploadId: payload.uploadId, filename: payload.filename, mime: payload.mime, sha256: payload.sha256,
+      totalSize: payload.totalSize, nextOffset: payload.offset + payload.bytes.length, complete: payload.offset + payload.bytes.length === payload.totalSize, expiresAt: '2030-01-01T00:00:00Z' };
     return status;
   };
   const controller = new AbortController();
@@ -141,7 +141,7 @@ test('aborted hashing always frees its Wasm state and does not upload', async ()
 test('each chunk keeps the actual owner and step index, and readiness failure does not issue reads', async () => {
   const owner = { projectId: 'project', ownerKind: 'run_step', ownerId: 'execution', stepIndex: 4 };
   const requests = [];
-  ApiBinary.one = async (kind, payload) => { requests.push({ kind, payload }); return { bytes: [1, 2], total_size: 10, mime: 'image/png', filename: 'step.png', eof: false }; };
+  ApiBinary.one = async (kind, payload) => { requests.push({ kind, payload }); return { bytes: [1, 2], totalSize: 10, mime: 'image/png', filename: 'step.png', eof: false }; };
   const result = await readAttachmentChunk(owner, { sha256: 'hash' }, 2, 2);
   assert.deepEqual(requests[0], { kind: 'projectStudioAttachmentGetRequest', payload: { ...owner, sha256: 'hash', offset: 2, maxBytes: 2, preview: false } });
   assert.deepEqual([...result.bytes], [1, 2]);
@@ -155,7 +155,7 @@ test('native stream channels use the registered scope and reject unbounded read 
   const requests = [];
   ApiBinary.one = async (kind, payload) => {
     requests.push({ kind, payload });
-    return { bytes: new Uint8Array(Math.min(payload.maxBytes, 10 - payload.offset)), total_size: 10, mime: 'video/mp4', filename: 'movie.mp4', eof: payload.offset + payload.maxBytes >= 10 };
+    return { bytes: new Uint8Array(Math.min(payload.maxBytes, 10 - payload.offset)), totalSize: 10, mime: 'video/mp4', filename: 'movie.mp4', eof: payload.offset + payload.maxBytes >= 10 };
   };
   const stream = await openAttachmentStream(owner, { sha256: 'source-hash' }, { preview: true });
   const progress = [];
@@ -183,7 +183,7 @@ test('original downloads navigate through the worker and keep their own channel 
   const requests = [];
   ApiBinary.one = async (kind, payload) => {
     requests.push({ kind, payload });
-    return { bytes: new Uint8Array(Math.min(payload.maxBytes, 10 - payload.offset)), total_size: 10,
+    return { bytes: new Uint8Array(Math.min(payload.maxBytes, 10 - payload.offset)), totalSize: 10,
       mime: 'video/x-msvideo', filename: 'original.avi', eof: payload.offset + payload.maxBytes >= 10 };
   };
   const playback = await openAttachmentStream(owner, { sha256: 'source-hash' }, { preview: true });

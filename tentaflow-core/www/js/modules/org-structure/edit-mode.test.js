@@ -93,50 +93,50 @@ function runBatch(payload) {
     if (day && (!latest || day > latest)) latest = day;
     const error = world.refuse?.(op, index, payload) ?? null;
     if (error) return { index, ok: false, error };
-    const result = { index, ok: true, error: null, temp_id: op.tempId ?? null, created_id: null };
-    const unit = (id) => view.units.find((u) => u.unit_id === real(id));
-    const position = (id) => view.positions.find((p) => p.position_id === real(id));
+    const result = { index, ok: true, error: null, tempId: op.tempId ?? null, createdId: null };
+    const unit = (id) => view.units.find((u) => u.unitId === real(id));
+    const position = (id) => view.positions.find((p) => p.positionId === real(id));
     switch (op.kind) {
-      case 'positionMove': position(op.positionId).primary_parent_position_id = op.newParentPositionId ? real(op.newParentPositionId) : null; break;
-      case 'unitMove': unit(op.unitId).parent_unit_id = op.newParentUnitId ? real(op.newParentUnitId) : null; break;
-      case 'positionUpdate': if (op.name) position(op.positionId).name = op.name; if ('isStaff' in op) position(op.positionId).is_staff = op.isStaff; break;
+      case 'positionMove': position(op.positionId).primaryParentPositionId = op.newParentPositionId ? real(op.newParentPositionId) : null; break;
+      case 'unitMove': unit(op.unitId).parentUnitId = op.newParentUnitId ? real(op.newParentUnitId) : null; break;
+      case 'positionUpdate': if (op.name) position(op.positionId).name = op.name; if ('isStaff' in op) position(op.positionId).isStaff = op.isStaff; break;
       case 'unitUpdate': if (op.name) unit(op.unitId).name = op.name; break;
-      case 'headSet': unit(op.unitId).head_position_id = op.headPositionId ? real(op.headPositionId) : null; break;
-      case 'deputyHeadsSet': unit(op.unitId).deputy_head_position_ids = op.positionIds.map(real); break;
+      case 'headSet': unit(op.unitId).headPositionId = op.headPositionId ? real(op.headPositionId) : null; break;
+      case 'deputyHeadsSet': unit(op.unitId).deputyHeadPositionIds = op.positionIds.map(real); break;
       case 'unitCreate': {
         const id = `real-${world.counter += 1}`;
         map.set(op.tempId, id);
-        result.created_id = id;
-        view.units.push({ id: `v-${id}`, unit_id: id, name: op.name, code: op.code, type_id: null, parent_unit_id: op.parentUnitId ? real(op.parentUnitId) : null, color: null, head_position_id: null, deputy_head_position_ids: [], valid_from: day });
+        result.createdId = id;
+        view.units.push({ id: `v-${id}`, unitId: id, name: op.name, code: op.code, typeId: null, parentUnitId: op.parentUnitId ? real(op.parentUnitId) : null, color: null, headPositionId: null, deputyHeadPositionIds: [], validFrom: day });
         break;
       }
       case 'positionCreate': {
         const id = `real-${world.counter += 1}`;
         map.set(op.tempId, id);
-        result.created_id = id;
-        view.positions.push({ id: `v-${id}`, position_id: id, unit_id: real(op.unitId), name: op.name, code: op.code, primary_parent_position_id: op.parentPositionId ? real(op.parentPositionId) : null, functional_parent_position_ids: [], is_staff: op.isStaff, valid_from: day });
+        result.createdId = id;
+        view.positions.push({ id: `v-${id}`, positionId: id, unitId: real(op.unitId), name: op.name, code: op.code, primaryParentPositionId: op.parentPositionId ? real(op.parentPositionId) : null, functionalParentPositionIds: [], isStaff: op.isStaff, validFrom: day });
         view.vacancies.push(id);
         break;
       }
       case 'externalPersonCreate': {
         const id = `real-${world.counter += 1}`;
         map.set(op.tempId, id);
-        result.created_id = id;
+        result.createdId = id;
         world.externals.set(id, op.displayName);
         break;
       }
       case 'assign': {
         const id = `real-${world.counter += 1}`;
         map.set(op.tempId, id);
-        result.created_id = id;
+        result.createdId = id;
         const subject = { kind: op.subject.kind, id: real(op.subject.id) };
         const name = subject.kind === 'user' ? world.users.find((u) => u.id === subject.id)?.displayName : world.externals.get(subject.id);
-        view.assignments.push({ id, position_id: real(op.positionId), subject, assignment_type: op.assignmentType, share: op.share, is_primary: true, valid_from: day, display_name: name ?? '?' });
+        view.assignments.push({ id, positionId: real(op.positionId), subject, assignmentType: op.assignmentType, share: op.share, isPrimary: true, validFrom: day, displayName: name ?? '?' });
         view.vacancies = view.vacancies.filter((v) => v !== real(op.positionId));
         break;
       }
       case 'assignmentEnd': view.assignments = view.assignments.filter((a) => a.id !== real(op.assignmentId)); break;
-      case 'unitEnd': view.units = view.units.filter((u) => u.unit_id !== real(op.unitId)); break;
+      case 'unitEnd': view.units = view.units.filter((u) => u.unitId !== real(op.unitId)); break;
       case 'assignmentUpdate': Object.assign(view.assignments.find((a) => a.id === real(op.assignmentId)), Object.fromEntries(['share', 'assignmentType'].filter((k) => k in op).map((k) => [k === 'assignmentType' ? 'assignment_type' : k, op[k]]))); break;
       default:
     }
@@ -146,7 +146,7 @@ function runBatch(payload) {
   view.at = latest ?? TODAY;
   if (ok && !payload.dryRun) world.view = view;
   return {
-    ok, applied: ok && !payload.dryRun, error: null, results, warnings: view.warnings ?? [], preview_at: view.at, preview: payload.dryRun ? view : null, max_ops: 500,
+    ok, applied: ok && !payload.dryRun, error: null, results, warnings: view.warnings ?? [], previewAt: view.at, preview: payload.dryRun ? view : null, maxOps: 500,
   };
 }
 
@@ -156,7 +156,7 @@ function stubTransport() {
     requests.push({ kind, payload });
     if (kind === 'authMeRequest') return { userId: new Uint8Array(16), username: 'admin' };
     if (kind === 'orgStructureRequest') {
-      return { view: { ...structuredClone(world.view), at: payload?.at ?? TODAY }, unit_types: [{ id: 'ty-1', name: 'Dział' }], my_permissions: world.permissions };
+      return { view: { ...structuredClone(world.view), at: payload?.at ?? TODAY }, unitTypes: [{ id: 'ty-1', name: 'Dział' }], myPermissions: world.permissions };
     }
     if (kind === 'orgBatchRequest') return runBatch(payload);
     const answer = world.answers[kind];
@@ -180,10 +180,10 @@ function freshWorld(over = {}) {
   const view = sampleView();
   // A second deputy of Technologia, so the order of deputies means something.
   view.positions.push({
-    id: 'v-p-cto-deputy-2', position_id: 'p-cto-deputy-2', unit_id: 'u-tech', name: 'Zastępca do spraw sprzedaży',
-    primary_parent_position_id: 'p-cto', functional_parent_position_ids: [], is_staff: false, valid_from: '2026-01-01',
+    id: 'v-p-cto-deputy-2', positionId: 'p-cto-deputy-2', unitId: 'u-tech', name: 'Zastępca do spraw sprzedaży',
+    primaryParentPositionId: 'p-cto', functionalParentPositionIds: [], isStaff: false, validFrom: '2026-01-01',
   });
-  view.units.find((u) => u.unit_id === 'u-tech').deputy_head_position_ids = ['p-cto-deputy', 'p-cto-deputy-2'];
+  view.units.find((u) => u.unitId === 'u-tech').deputyHeadPositionIds = ['p-cto-deputy', 'p-cto-deputy-2'];
   view.vacancies.push('p-cto-deputy-2');
   return {
     view,
@@ -300,7 +300,7 @@ test('dropping a card on a new manager asks first, says how many people it touch
   assert.equal(applies().length, 0, 'nothing is applied');
   assert.equal(draftChip(), t('draft_chip', { count: 1 }));
   assert.equal(nodeOf('p-lead').parentId, 'p-sales', 'the canvas draws the structure the draft would leave');
-  assert.equal(world.view.positions.find((p) => p.position_id === 'p-lead').primary_parent_position_id, 'p-delivery', 'and the structure itself is untouched');
+  assert.equal(world.view.positions.find((p) => p.positionId === 'p-lead').primaryParentPositionId, 'p-delivery', 'and the structure itself is untouched');
   assert.equal($('org-edit-save').hasAttribute('disabled'), false);
   assert.ok($('org-edit-view'), '"Stan na dziś / Stan po zmianach" appears once there is a draft');
   OrgStructureScreen.unmount();
@@ -440,7 +440,7 @@ test('edits of one thing fold into ONE row, whichever fields of the inspector ma
   assert.equal(draftChip(), t('draft_chip', { count: 1 }));
   assert.equal(nodeOf('p-lead').role, 'Kierownik QA', 'and the card is already renamed on the canvas');
 
-  const anna = world.view.assignments.find((a) => a.position_id === 'p-lead');
+  const anna = world.view.assignments.find((a) => a.positionId === 'p-lead');
   await change('assignment.share', { value: '0,5' });
   await change('assignment.type', { value: 'contractor' });
   assert.deepEqual(draftOps().at(-1), { kind: 'assignmentUpdate', assignmentId: anna.id, from: TODAY, share: 0.5, assignmentType: 'contractor' });
@@ -615,7 +615,7 @@ test('"Zapisz zmiany" is one dry run and one apply of the whole draft, and then 
   assert.deepEqual(sent.map((b) => b.payload.dryRun), [true, false], 'a dry run first, then the apply');
   assert.deepEqual(sent[1].payload.ops, sent[0].payload.ops);
   assert.deepEqual(sent[1].payload.ops.map((o) => o.kind), ['positionMove', 'assign']);
-  assert.equal(world.view.positions.find((p) => p.position_id === 'p-tester').primary_parent_position_id, 'p-sales', 'and now the structure has it');
+  assert.equal(world.view.positions.find((p) => p.positionId === 'p-tester').primaryParentPositionId, 'p-sales', 'and now the structure has it');
   assert.equal(draftChip(), t('draft_chip', { count: 0 }));
   assert.ok(toastText().includes(t('saved', { count: 2 })));
   assert.equal($('org-edit-save').hasAttribute('disabled'), true);
@@ -732,7 +732,7 @@ test('ending an assignment or a unit asks once, says what follows on the effecti
   await settle();
   assert.match(windowEl().querySelector('.tf-act__note').getAttribute('message'), new RegExp(`od ${formatDay(TODAY).replaceAll('.', '\\.')}.*nie są przekazywane automatycznie`));
   await submit();
-  const tester = world.view.assignments.find((a) => a.position_id === 'p-tester');
+  const tester = world.view.assignments.find((a) => a.positionId === 'p-tester');
   assert.deepEqual(draftOps(), [{ kind: 'assignmentEnd', assignmentId: tester.id, from: TODAY }]);
   assert.equal(nodeOf('p-tester').vacant, true);
 
@@ -778,7 +778,7 @@ test('a future day is a planned reorganization: the chart shows that day, every 
 });
 
 test('"Zapisz jako reorganizację…" stores the draft as a change set of Historia and leaves the edit mode', async () => {
-  world.answers.orgChangeSetSaveRequest = (payload) => ({ ok: true, valid: true, change_set: { id: 'cs-1', name: payload.name, effective_date: payload.effectiveDate, ops: [] }, results: [], warnings: [] });
+  world.answers.orgChangeSetSaveRequest = (payload) => ({ ok: true, valid: true, changeSet: { id: 'cs-1', name: payload.name, effectiveDate: payload.effectiveDate, ops: [] }, results: [], warnings: [] });
   await enterEdit();
   drop('p-tester', 'p-sales');
   await settle();

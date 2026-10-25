@@ -108,9 +108,11 @@ export const FaceBackground = {
 
   /**
    * Embed mode — creates a <tf-face> element inside the given container.
+   * `fullscreen` lets the face fill and scale to its host (the host decides the
+   * geometry in CSS); `track` is the tf-face tracking list ("pointer", "gyro").
    * Returns a handle compatible with the old embed() API.
    */
-  embed(container) {
+  embed(container, { fullscreen = false, track = '' } = {}) {
     if (!container || !(container instanceof HTMLElement)) {
       throw new Error('FaceBackground.embed: container must be HTMLElement');
     }
@@ -128,12 +130,17 @@ export const FaceBackground = {
 
     const face = document.createElement('tf-face');
     face.setAttribute('mode', 'idle');
-    const w = container.clientWidth || 360;
-    const h = container.clientHeight || 360;
-    face.setAttribute('size', String(Math.min(w, h)));
-    face.style.width = '100%';
-    face.style.height = '100%';
-    face.style.display = 'block';
+    if (fullscreen) {
+      face.setAttribute('fullscreen', '');
+      if (track) face.setAttribute('track', track);
+    } else {
+      const w = container.clientWidth || 360;
+      const h = container.clientHeight || 360;
+      face.setAttribute('size', String(Math.min(w, h)));
+      face.style.width = '100%';
+      face.style.height = '100%';
+      face.style.display = 'block';
+    }
 
     container.classList.add('face-embed-host');
     container.appendChild(face);
@@ -141,7 +148,7 @@ export const FaceBackground = {
 
     // ResizeObserver keeps the size attribute in sync with host
     let resizeObs = null;
-    if (typeof ResizeObserver !== 'undefined') {
+    if (!fullscreen && typeof ResizeObserver !== 'undefined') {
       resizeObs = new ResizeObserver(() => {
         const cw = container.clientWidth || 360;
         const ch = container.clientHeight || 360;

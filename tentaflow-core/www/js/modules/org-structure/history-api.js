@@ -28,7 +28,7 @@ function setAnswer(body) {
   return {
     ok: Boolean(body.ok),
     error: body.error ?? null,
-    changeSet: setOf(body.change_set),
+    changeSet: setOf(body.changeSet),
     valid: Boolean(body.valid),
     results: body.results ?? [],
     warnings: body.warnings ?? [],
@@ -41,7 +41,7 @@ export async function listHistory(params = {}) {
   return {
     entries: body.entries ?? [],
     total: body.total ?? 0,
-    personalVisible: Boolean(body.personal_visible),
+    personalVisible: Boolean(body.personalVisible),
     today: body.today ?? '',
   };
 }
@@ -49,13 +49,13 @@ export async function listHistory(params = {}) {
 /** What differs between two days. `{ from, to, unitId? }` → `{ items, personalVisible }`. */
 export async function diffDays(params) {
   const body = await one('orgHistoryDiffRequest', params);
-  return { items: body.items ?? [], personalVisible: Boolean(body.personal_visible), from: body.from, to: body.to };
+  return { items: body.items ?? [], personalVisible: Boolean(body.personalVisible), from: body.from, to: body.to };
 }
 
 /** The planned reorganizations without their operations (`org.admin`). */
 export async function listChangeSets() {
   const body = await one('orgChangeSetListRequest', {});
-  return { items: body.items ?? [], today: body.today ?? '', soleAdmin: Boolean(body.sole_admin) };
+  return { items: body.items ?? [], today: body.today ?? '', soleAdmin: Boolean(body.soleAdmin) };
 }
 
 /** One reorganization with its operations in the edit mode's shape. */

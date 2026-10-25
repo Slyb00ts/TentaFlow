@@ -55,9 +55,9 @@ export async function repairProcessSandbox({ nodeId = null, nodeName = '', isLoc
         options,
       );
       const outcome = {
-        supported: (response?.supportsProcessSandbox ?? response?.supports_process_sandbox) === true,
-        cause: response?.processSandboxCause ?? response?.process_sandbox_cause ?? null,
-        reason: response?.processSandboxReason ?? response?.process_sandbox_reason ?? '',
+        supported: response?.supportsProcessSandbox === true,
+        cause: response?.processSandboxCause ?? null,
+        reason: response?.processSandboxReason ?? '',
       };
       if (!outcome.supported) {
         throw new Error(I18n.t('sandbox_repair.still_broken', { reason: outcome.reason || outcome.cause || '?' }));

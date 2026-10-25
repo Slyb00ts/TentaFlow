@@ -347,7 +347,7 @@ export function localIndex(index, qubits) {
 const blochList = (frame) => (frame && Array.isArray(frame.bloch) ? frame.bloch : [])
   .map((v) => Array.from(v || [], Number).slice(0, 3));
 
-const probsOf = (frame) => ((frame && (frame.probsTop ?? frame.probs_top)) || [])
+const probsOf = (frame) => ((frame && frame.probsTop) || [])
   .map((row) => ({ bitstring: String(row.bitstring), probability: Number(row.probability) || 0 }));
 
 /// The amplitudes a keyframe carries, flattened out of its `top` groups.

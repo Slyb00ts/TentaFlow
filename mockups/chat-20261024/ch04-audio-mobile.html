@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TentaFlow — Chat · Audio na telefonie (CH04)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=1">
+<link rel="stylesheet" href="shared/chat.css?v=1">
+</head>
+<body>
+<script src="shared/sprite.js"></script>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">CH04</span>
+    <h2>Chat · Audio na telefonie</h2>
+    <div class="frame-tools">
+      <div class="segmented" aria-label="Stan demonstracji (tylko mockup)">
+        <button type="button" data-audio-state="listen"><svg class="icon "><use href="#i-mic"/></svg>Słucha</button>
+        <button type="button" data-audio-state="think"><svg class="icon "><use href="#i-brain"/></svg>Myśli</button>
+        <button type="button" data-audio-state="speak"><svg class="icon "><use href="#i-volume"/></svg>Mówi</button>
+      </div>
+      <div class="segmented view-switch" aria-label="Rozmiar ramki (tylko mockup)">
+        <button type="button" data-view-set="desktop" class="active"><svg class="icon "><use href="#i-monitor"/></svg>Desktop</button>
+        <button type="button" data-view-set="phone"><svg class="icon "><use href="#i-phone"/></svg>Telefon 390</button>
+      </div>
+    </div>
+    <div class="desc">Mobile: wyłącznie twarz i dolny dock sterowania, bez prawego paska i bez transkryptu (zasłaniałby twarz). Pasek u góry skraca się do prędkości decode; pełne liczby są w dymku po dotknięciu.</div>
+  </div>
+  <div class="screen-frame" data-default-view="phone">
+    <div class="app chat-app">
+      <aside class="sidebar">
+  <div class="logo"><span class="name">TentaFlow</span></div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon "><use href="#i-settings"/></svg>Ogólne</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-home"/></svg>Pulpit</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-services"/></svg>Serwisy</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-cpu"/></svg>Nody mesh</div>
+  </div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon "><use href="#i-activity"/></svg>Aplikacje</div>
+    <div class="nav-item active"><svg class="icon "><use href="#i-message"/></svg>Chat</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-folder"/></svg>Projekty</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-brain"/></svg>ML Studio</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-flask"/></svg>Benchmark Studio</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-bot"/></svg>Agenci</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-atom"/></svg>TentaQuant</div>
+  </div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon "><use href="#i-users"/></svg>Zarządzanie</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-users"/></svg>Użytkownicy</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-audit"/></svg>Dziennik audytu</div>
+  </div>
+  <div class="footer">
+    <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Użytkowniczka</div><div class="role">Zespół Kwanty R&amp;D</div></div></div>
+  </div>
+</aside>
+      <div class="nav-scrim"></div>
+      <main class="main">
+        <div class="chat-shell">
+          <aside class="conv-panel" aria-label="Rozmowy">
+            <div class="conv-top">
+              <button class="btn btn-primary" type="button"><!-- otwiera: CH01 --><svg class="icon "><use href="#i-plus"/></svg>Nowa rozmowa</button>
+              <label class="search-box"><svg class="icon "><use href="#i-search"/></svg><input type="text" placeholder="Szukaj rozmów…" aria-label="Szukaj rozmów"></label>
+            </div>
+            <div class="conv-list">
+              <div class="conv-grp">Dzisiaj</div>
+              <div class="conv-item"><button class="icon-btn conv-more" type="button" aria-label="Opcje rozmowy" aria-haspopup="menu"><svg class="icon "><use href="#i-more-v"/></svg></button><div class="t"><span style="overflow:hidden;text-overflow:ellipsis">Przydział VRAM w vLLM</span></div><div class="m">14:02</div></div>
+              <div class="conv-item active"><button class="icon-btn conv-more" type="button" aria-label="Opcje rozmowy" aria-haspopup="menu"><svg class="icon "><use href="#i-more-v"/></svg></button><div class="t"><svg class="icon "><use href="#i-mic"/></svg><span style="overflow:hidden;text-overflow:ellipsis">Przypomnienie o spotkaniu</span><span class="live-dot" aria-hidden="true"></span></div><div class="m">Rozmowa głosowa · 13:40</div></div>
+              <div class="conv-item"><button class="icon-btn conv-more" type="button" aria-label="Opcje rozmowy" aria-haspopup="menu"><svg class="icon "><use href="#i-more-v"/></svg></button><div class="t"><span style="overflow:hidden;text-overflow:ellipsis">Podsumowanie notatek z review</span></div><div class="m">09:15</div></div>
+              <div class="conv-grp">Wczoraj</div>
+              <div class="conv-item"><button class="icon-btn conv-more" type="button" aria-label="Opcje rozmowy" aria-haspopup="menu"><svg class="icon "><use href="#i-more-v"/></svg></button><div class="t"><span style="overflow:hidden;text-overflow:ellipsis">Optymalizacja zapytania SQL</span></div><div class="m">17:48</div></div>
+              <div class="conv-item"><button class="icon-btn conv-more" type="button" aria-label="Opcje rozmowy" aria-haspopup="menu"><svg class="icon "><use href="#i-more-v"/></svg></button><div class="t"><span style="overflow:hidden;text-overflow:ellipsis">Tłumaczenie umowy PL → EN</span></div><div class="m">11:20</div></div>
+              <div class="conv-grp">Ostatnie 7 dni</div>
+              <div class="conv-item"><button class="icon-btn conv-more" type="button" aria-label="Opcje rozmowy" aria-haspopup="menu"><svg class="icon "><use href="#i-more-v"/></svg></button><div class="t"><span style="overflow:hidden;text-overflow:ellipsis">Plan migracji bazy</span></div><div class="m">pon.</div></div>
+              <div class="conv-item"><button class="icon-btn conv-more" type="button" aria-label="Opcje rozmowy" aria-haspopup="menu"><svg class="icon "><use href="#i-more-v"/></svg></button><div class="t"><span style="overflow:hidden;text-overflow:ellipsis">Pomysły na nazwę usługi</span></div><div class="m">niedz.</div></div>
+            </div>
+            <div class="conv-foot">7 rozmów · zapis lokalny</div>
+          </aside>
+          <div class="conv-scrim"></div>
+          <section class="chat-col">
+      <header class="chat-top">
+        <div class="top-metrics">
+          <div class="metric hero" tabindex="0" aria-describedby="tip-decode">
+          <div class="k"><svg class="icon "><use href="#i-gauge"/></svg>Decode<span class="lbl-full"> · ta rozmowa</span> <svg class="icon "><use href="#i-info"/></svg></div>
+          <div class="v"><b data-m="cur">47,3</b><small>tok/s</small></div>
+          <div class="sub">śr. <b data-m="avg">44,8</b> &middot; n=<b data-m="n">6</b></div>
+          <svg class="spark" viewBox="0 0 72 32" aria-hidden="true"></svg>
+          <div class="tip" role="tooltip" id="tip-decode">
+            <b>Prędkość decode tej rozmowy.</b> Liczba tokenów generowanych na sekundę w odpowiedziach <b>tylko tej sesji</b> (okno ok. 1 s, próbka co sekundę). To nie jest przepustowość całego serwera ani suma ruchu innych użytkowników &mdash; ich zapytania nie zmieniają tej liczby.
+            <div class="tip-row"><span>Teraz</span><span><span data-m="cur">47,3</span> tok/s</span></div>
+            <div class="tip-row"><span>Średnia sesji</span><span><span data-m="avg">44,8</span> tok/s</span></div>
+            <div class="tip-row"><span>Min · max</span><span><span data-m="min">43,2</span> · <span data-m="max">47,5</span></span></div>
+            <div class="tip-row"><span>Próbek</span><span data-m="n">6</span></div>
+          </div>
+        </div>
+          <div class="metric opt2" tabindex="0"><div class="k">TTFT</div><div class="v">184 <small>ms</small></div></div>
+        </div>
+        <div class="top-actions">
+          <div class="segmented mode-switch" role="tablist" aria-label="Tryb rozmowy">
+            <a role="tab" href="ch02-odpowiedz.html" data-keep-view><svg class="icon "><use href="#i-message"/></svg><span class="lbl">Chat</span></a>
+            <a role="tab" class="active" href="ch03-audio.html" data-keep-view><svg class="icon "><use href="#i-mic"/></svg><span class="lbl">Audio</span></a>
+          </div>
+        </div>
+      </header>
+
+            <div class="audio-body">
+              <div class="face-stage" data-state="listen" data-auto="true">
+                <tf-face fullscreen mode="listen" track="pointer"></tf-face>
+                <div class="stage-top"><div class="audio-status"><span class="dot"></span><span id="audioLabel">Słucham…</span></div></div>
+                <div class="stage-bottom">
+                  <div class="wave" id="wave" aria-hidden="true"></div>
+                  <div class="audio-controls">
+                    <button class="dock-btn" type="button" aria-label="Głośnik" title="Głośnik"><svg class="icon "><use href="#i-volume"/></svg></button>
+                    <button class="dock-btn primary" type="button" aria-label="Mikrofon" title="Mikrofon"><svg class="icon "><use href="#i-mic"/></svg></button>
+                    <button class="dock-btn" type="button" aria-label="Wstrzymaj" title="Wstrzymaj"><svg class="icon "><use href="#i-pause"/></svg></button>
+                    <a class="dock-btn end" href="ch02-odpowiedz.html" data-keep-view aria-label="Zakończ rozmowę głosową" title="Zakończ"><svg class="icon "><use href="#i-x"/></svg></a>
+                  </div>
+                </div>
+              </div>
+              <aside class="transcript" aria-label="Transkrypt na żywo">
+                <div class="tr-head"><h3><svg class="icon "><use href="#i-message"/></svg>Transkrypt na żywo</h3><span class="chip success"><span class="dot"></span>Na żywo</span></div>
+                <div class="tr-list" id="trList" aria-live="polite"></div>
+              </aside>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+  </div>
+</section>
+
+<script>window.__sessionSeed = [41.5, 44.8, 46.0, 43.9];</script>
+<script src="shared/tf-face.bundle.js"></script>
+<script src="shared/chat.js"></script>
+<script src="shared/audio.js"></script>
+</body>
+</html>

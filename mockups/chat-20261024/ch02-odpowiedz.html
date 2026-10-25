@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TentaFlow — Chat · Odpowiedź strumieniowana (CH02)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=1">
+<link rel="stylesheet" href="shared/chat.css?v=1">
+</head>
+<body>
+<script src="shared/sprite.js"></script>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">CH02</span>
+    <h2>Chat · Odpowiedź strumieniowana</h2>
+    <div class="frame-tools">
+      <button class="btn btn-secondary btn-sm" type="button" data-replay><svg class="icon "><use href="#i-refresh"/></svg>Odtwórz odpowiedź</button>
+      <div class="segmented view-switch" aria-label="Rozmiar ramki (tylko mockup)">
+        <button type="button" data-view-set="desktop" class="active"><svg class="icon "><use href="#i-monitor"/></svg>Desktop</button>
+        <button type="button" data-view-set="phone"><svg class="icon "><use href="#i-phone"/></svg>Telefon 390</button>
+      </div>
+    </div>
+    <div class="desc">Odpowiedź generuje się na żywo, a komórka Decode w pasku pokazuje prędkość tej rozmowy: wartość bieżąca, średnia sesji i sparkline. Przycisk wysyłania zamienia się w Zatrzymaj.</div>
+  </div>
+  <div class="screen-frame" data-default-view="desktop">
+    <div class="app chat-app">
+      <aside class="sidebar">
+  <div class="logo"><span class="name">TentaFlow</span></div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon "><use href="#i-settings"/></svg>Ogólne</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-home"/></svg>Pulpit</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-services"/></svg>Serwisy</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-cpu"/></svg>Nody mesh</div>
+  </div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon "><use href="#i-activity"/></svg>Aplikacje</div>
+    <div class="nav-item active"><svg class="icon "><use href="#i-message"/></svg>Chat</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-folder"/></svg>Projekty</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-brain"/></svg>ML Studio</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-flask"/></svg>Benchmark Studio</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-bot"/></svg>Agenci</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-atom"/></svg>TentaQuant</div>
+  </div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon "><use href="#i-users"/></svg>Zarządzanie</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-users"/></svg>Użytkownicy</div>
+    <div class="nav-item"><svg class="icon "><use href="#i-audit"/></svg>Dziennik audytu</div>
+  </div>
+  <div class="footer">
+    <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Użytkowniczka</div><div class="role">Zespół Kwanty R&amp;D</div></div></div>
+  </div>
+</aside>
+      <div class="nav-scrim"></div>
+      <main class="main">
+        <div class="chat-shell">
+          <aside class="conv-panel" aria-label="Rozmowy">
+            <div class="conv-top">
+              <button class="btn btn-primary" type="button"><!-- otwiera: CH01 --><svg class="icon "><use href="#i-plus"/></svg>Nowa rozmowa</button>
+              <label class="search-box"><svg class="icon "><use href="#i-search"/></svg><input type="text" placeholder="Szukaj rozmów…" aria-label="Szukaj rozmów"></label>
+            </div>
+            <div class="conv-list">
+              <div class="conv-grp">Dzisiaj</div>
+              <div class="conv-item active"><button class="icon-btn conv-more" type="button" aria-label="Opcje rozmowy" aria-haspopup="menu"><svg class="icon "><use href="#i-more-v"/></svg></button><div class="t"><span style="overflow:hidden;text-overflow:ellipsis">Przydział VRAM w vLLM</span></div><div class="m">14:02</div></div>
+              <div class="conv-item"><button class="icon-btn conv-more" type="button" aria-label="Opcje rozmowy" aria-haspopup="menu"><svg class="icon "><use href="#i-more-v"/></svg></button><div class="t"><svg class="icon "><use href="#i-mic"/></svg><span style="overflow:hidden;text-overflow:ellipsis">Przypomnienie o spotkaniu</span></div><div class="m">Rozmowa głosowa · 13:40</div></div>
+              <div class="conv-item"><button class="icon-btn conv-more" type="button" aria-label="Opcje rozmowy" aria-haspopup="menu"><svg class="icon "><use href="#i-more-v"/></svg></button><div class="t"><span style="overflow:hidden;text-overflow:ellipsis">Podsumowanie notatek z review</span></div><div class="m">09:15</div></div>
+              <div class="conv-grp">Wczoraj</div>
+              <div class="conv-item"><button class="icon-btn conv-more" type="button" aria-label="Opcje rozmowy" aria-haspopup="menu"><svg class="icon "><use href="#i-more-v"/></svg></button><div class="t"><span style="overflow:hidden;text-overflow:ellipsis">Optymalizacja zapytania SQL</span></div><div class="m">17:48</div></div>
+              <div class="conv-item"><button class="icon-btn conv-more" type="button" aria-label="Opcje rozmowy" aria-haspopup="menu"><svg class="icon "><use href="#i-more-v"/></svg></button><div class="t"><span style="overflow:hidden;text-overflow:ellipsis">Tłumaczenie umowy PL → EN</span></div><div class="m">11:20</div></div>
+              <div class="conv-grp">Ostatnie 7 dni</div>
+              <div class="conv-item"><button class="icon-btn conv-more" type="button" aria-label="Opcje rozmowy" aria-haspopup="menu"><svg class="icon "><use href="#i-more-v"/></svg></button><div class="t"><span style="overflow:hidden;text-overflow:ellipsis">Plan migracji bazy</span></div><div class="m">pon.</div></div>
+              <div class="conv-item"><button class="icon-btn conv-more" type="button" aria-label="Opcje rozmowy" aria-haspopup="menu"><svg class="icon "><use href="#i-more-v"/></svg></button><div class="t"><span style="overflow:hidden;text-overflow:ellipsis">Pomysły na nazwę usługi</span></div><div class="m">niedz.</div></div>
+            </div>
+            <div class="conv-foot">7 rozmów · zapis lokalny</div>
+          </aside>
+          <div class="conv-scrim"></div>
+          <section class="chat-col">
+      <header class="chat-top">
+        <div class="top-metrics">
+          <div class="metric hero" tabindex="0" aria-describedby="tip-decode">
+          <div class="k"><svg class="icon "><use href="#i-gauge"/></svg>Decode<span class="lbl-full"> · ta rozmowa</span> <svg class="icon "><use href="#i-info"/></svg></div>
+          <div class="v"><b data-m="cur">47,3</b><small>tok/s</small></div>
+          <div class="sub">śr. <b data-m="avg">44,8</b> &middot; n=<b data-m="n">6</b></div>
+          <svg class="spark" viewBox="0 0 72 32" aria-hidden="true"></svg>
+          <div class="tip" role="tooltip" id="tip-decode">
+            <b>Prędkość decode tej rozmowy.</b> Liczba tokenów generowanych na sekundę w odpowiedziach <b>tylko tej sesji</b> (okno ok. 1 s, próbka co sekundę). To nie jest przepustowość całego serwera ani suma ruchu innych użytkowników &mdash; ich zapytania nie zmieniają tej liczby.
+            <div class="tip-row"><span>Teraz</span><span><span data-m="cur">47,3</span> tok/s</span></div>
+            <div class="tip-row"><span>Średnia sesji</span><span><span data-m="avg">44,8</span> tok/s</span></div>
+            <div class="tip-row"><span>Min · max</span><span><span data-m="min">43,2</span> · <span data-m="max">47,5</span></span></div>
+            <div class="tip-row"><span>Próbek</span><span data-m="n">6</span></div>
+          </div>
+        </div>
+          <div class="metric opt2" tabindex="0"><div class="k">TTFT</div><div class="v">184 <small>ms</small></div></div>
+        </div>
+        <div class="top-actions">
+          <div class="segmented mode-switch" role="tablist" aria-label="Tryb rozmowy">
+            <a role="tab" class="active" href="ch02-odpowiedz.html" data-keep-view><svg class="icon "><use href="#i-message"/></svg><span class="lbl">Chat</span></a>
+            <a role="tab" href="ch03-audio.html" data-keep-view><svg class="icon "><use href="#i-mic"/></svg><span class="lbl">Audio</span></a>
+          </div>
+        </div>
+      </header>
+            <div class="chat-scroll">
+              <div class="chat-inner">
+                <div class="msg user"><div class="av">AK</div><div class="body"><div class="who">Ty · 13:58</div><div class="txt">Czym różni się tensor parallel od pipeline parallel w vLLM?</div></div></div>
+                <div class="msg ai"><div class="av"><svg class="icon "><use href="#i-sparkles"/></svg></div><div class="body">
+                  <div class="who">Asystent · 13:58</div>
+                  <div class="txt"><p><b>Tensor parallel</b> dzieli pojedyncze warstwy (macierze wag) między karty, więc każda karta liczy fragment każdej warstwy i po niej synchronizuje wynik. Zmniejsza opóźnienie, ale wymaga szybkiego łącza między GPU.</p><p><b>Pipeline parallel</b> dzieli model na kolejne grupy warstw: karta pierwsza liczy początek sieci, druga resztę. Komunikacji jest mniej, za to przy małej liczbie równoległych zapytań część kart czeka bezczynnie.</p></div>
+                  <div class="msg-meta"><span class="chip accent"><svg class="icon "><use href="#i-zap"/></svg>46,1 tok/s</span><span class="chip">TTFT 172 ms</span><span class="chip">318 tok</span>
+                    <span class="msg-acts"><button class="icon-btn" type="button" aria-label="Kopiuj"><svg class="icon "><use href="#i-copy"/></svg></button><button class="icon-btn" type="button" aria-label="Wygeneruj ponownie"><svg class="icon "><use href="#i-refresh"/></svg></button></span></div>
+                </div></div>
+                <div class="msg user"><div class="av">AK</div><div class="body"><div class="who">Ty · 14:02</div><div class="txt">A jak ustawić limit pamięci GPU dla dwóch kart? Mam dwa RTX 4090 po 24 GB.</div></div></div>
+                <div class="msg ai" data-stream="Przy|dwóch|kartach|RTX|4090|po|24|GB|najprościej|uruchomić|vLLM|z|&lt;code&gt;--tensor-parallel-size 2&lt;/code&gt;,|wtedy|wagi|modelu|są|dzielone|po|równo|między|GPU.|\n|Limit|pamięci|ustawiasz|parametrem|&lt;code&gt;--gpu-memory-utilization 0.90&lt;/code&gt;,|który|dotyczy|każdej|karty|osobno,|więc|na|obu|zostaje|około|2,4|GB|zapasu.|\n|Jeśli|model|się|nie|mieści,|zmniejsz|&lt;code&gt;--max-model-len&lt;/code&gt;|albo|włącz|kwantyzację|FP8|dla|pamięci|KV.|Pamiętaj,|że|przy|tensor|parallel|obie|karty|muszą|widzieć|się|przez|NVLink|albo|PCIe|z|włączonym|P2P,|inaczej|komunikacja|między|nimi|ograniczy|prędkość|decode."><div class="av"><svg class="icon "><use href="#i-sparkles"/></svg></div><div class="body">
+                  <div class="who">Asystent · 14:02</div>
+                  <div class="txt"><span class="stream-target caret"></span></div>
+                  <div class="msg-meta"><span class="chip accent"><svg class="icon "><use href="#i-zap"/></svg><span data-m="cur">47,3</span> tok/s</span><span class="chip">TTFT 184 ms</span><span class="chip">412 tok</span>
+                    <span class="msg-acts"><button class="icon-btn" type="button" aria-label="Kopiuj"><svg class="icon "><use href="#i-copy"/></svg></button><button class="icon-btn" type="button" aria-label="Wygeneruj ponownie"><svg class="icon "><use href="#i-refresh"/></svg></button></span></div>
+                </div></div>
+              </div>
+            </div>
+  <div class="composer-wrap">
+              <div class="composer" id="composer">
+                <button class="icon-btn" type="button" aria-label="Załącz plik" title="Załącz"><svg class="icon "><use href="#i-paperclip"/></svg></button>
+                <textarea rows="1" placeholder="Napisz wiadomość…" aria-label="Wiadomość"></textarea>
+                <button class="btn btn-primary" type="button" data-send aria-label="Wyślij"><svg class="icon "><use href="#i-send"/></svg></button>
+              </div>
+              <div class="composer-hints"><span><kbd>Enter</kbd> wyślij</span><span><kbd>Shift</kbd>+<kbd>Enter</kbd> nowa linia</span><span class="spacer"></span><span>0 / 4096 znaków</span></div>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+  </div>
+</section>
+
+<script>window.__sessionSeed = [44.1, 46.8, 43.2, 47.5, 45.0, 44.6];</script>
+<script src="shared/chat.js"></script>
+
+</body>
+</html>

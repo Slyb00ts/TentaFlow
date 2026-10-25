@@ -1415,6 +1415,11 @@ impl AddonManager {
                 );
             }
             self.unregister_addon_runtime(addon_id);
+            // A disabled instance is still an installed one: the node that
+            // installed it materialized its aliases, limits and migrations right
+            // away, so every other node must too — otherwise the aliases appear
+            // only where the instance happens to be enabled.
+            self.materialize_installed_instance(&addon);
             return;
         }
         let pkg_dir = crate::addon::bundled::package_dir(&addon.package_id, &addon.package_version);
@@ -1538,6 +1543,31 @@ impl AddonManager {
         // manifest — drop the checker's cached matrix so it re-reads it.
         self.permission_checker.refresh_addon(addon_id);
         info!("sync reconcile: addon '{addon_id}' zsynchronizowany i zaladowany");
+    }
+
+    /// Rebuilds the local derived state of an installed but disabled instance from
+    /// its package. A package whose bytes have not arrived yet is skipped: the sync
+    /// runtime reconciles the instance again once the blob lands.
+    fn materialize_installed_instance(&self, addon: &crate::db::models::Addon) {
+        let pkg_dir = crate::addon::bundled::package_dir(&addon.package_id, &addon.package_version);
+        if !pkg_dir.join("manifest.toml").exists() {
+            return;
+        }
+        let manifest = match self.load_addon_manifest(&addon.addon_id) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                warn!("sync reconcile addon '{}': blad manifestu: {e}", addon.addon_id);
+                return;
+            }
+        };
+        if let Err(e) =
+            crate::addon::lifecycle::materialize_addon_derived_state(&self.db, &manifest, &pkg_dir)
+        {
+            warn!(
+                "sync reconcile addon '{}': blad materializacji stanu wylaczonej instancji: {e}",
+                addon.addon_id
+            );
+        }
     }
 
     /// Iterates `manifest.aliases` and registers each in `model_aliases`
@@ -4402,6 +4432,53 @@ fn fnv1a_hash(s: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A synced instance that arrives disabled (the tentavision case) is still an
+    /// installed one: its `[[alias]]` rows must exist on this node.
+    #[tokio::test]
+    async fn reconcile_of_a_disabled_synced_instance_materializes_its_aliases() {
+        crate::addon::fs_sandbox::with_tmp_home(|| {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::db::migrations::run(&conn).unwrap();
+            let db: DbPool = Arc::new(crate::db::Db::from_connection(conn));
+            let manifest = "[addon]\nid = \"syncpkg\"\nname = \"Sync Pkg\"\nversion = \"1.0.0\"\n\
+                 wasm_file = \"addon.wasm\"\n\n\
+                 [[alias]]\nid = \"syncpkg-detect\"\ndisplay_name = \"Detect\"\n\
+                 methods = [\"detect\"]\nsuggested_default = \"some-model\"\nvisibility = \"private\"\n";
+            // The instance row carries the manifest under the instance's own id.
+            let instance_manifest = manifest.replace("id = \"syncpkg\"", "id = \"syncpkg-1\"");
+            let dir = crate::addon::bundled::package_dir("syncpkg", "1.0.0");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("manifest.toml"), manifest).unwrap();
+            std::fs::write(dir.join("addon.wasm"), b"\0asm\x01\0\0\0").unwrap();
+            db.write()
+                .unwrap()
+                .execute(
+                    "INSERT INTO addons (addon_id, name, version, package_id, package_version, \
+                     manifest_json, is_enabled) \
+                     VALUES ('syncpkg-1', 'Sync Pkg', '1.0.0', 'syncpkg', '1.0.0', ?1, 0)",
+                    rusqlite::params![instance_manifest],
+                )
+                .unwrap();
+            let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
+            let manager = AddonManager::new(db.clone(), cipher).expect("addon manager");
+
+            manager.reconcile_synced_addon("syncpkg-1");
+
+            let owner: String = db
+                .read()
+                .unwrap()
+                .query_row(
+                    "SELECT o.owner_id FROM model_aliases a \
+                     JOIN model_alias_owners o ON o.alias_id = a.id \
+                     WHERE a.alias = 'syncpkg-detect'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("alias materialized for the disabled instance");
+            assert_eq!(owner, "syncpkg-1");
+        });
+    }
 
     #[test]
     fn test_activate_skips_gated_aliases() {

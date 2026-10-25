@@ -215,7 +215,7 @@ async function runAction(answer, ackStatus) {
   return { shown, entry };
 }
 
-const UI_RESPONSE = { envelope: { isError: false }, body: { variant: 'UiChannelCbor', cbor: new Uint8Array() } };
+const UI_RESPONSE = { envelope: { isError: false }, body: { _variant: 'UiChannelCbor', value: new Uint8Array() } };
 
 test('sendAction: ok ack keeps the edit and marks it acked', async () => {
   const { shown, entry } = await runAction((p) => p.resolve(UI_RESPONSE), 'ok');

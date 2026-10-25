@@ -1,404 +1,144 @@
 /* =============================================================================
-   Plik: css/chat-audio.css
-   Opis: Style trybu audio (rozmowa głosowa) w ekranie Chat — toggle Tekst↔Audio,
-         audio-stage z osadzoną twarzą wireframe, status pill, engine pills,
-         rail z ostatnimi wpisami, subtitle, waveform, dock kontrolek.
+   File: css/chat-audio.css
+   Purpose: Audio mode of the Chat screen — the face stage (tf-face fills it),
+            state pill, wave, control dock and the live transcript on the right.
+            Layout follows the width of the screen (container chatcq, declared in
+            chat.css): the transcript narrows, then disappears on a phone.
    ============================================================================= */
 
-/* ---- Mode toggle (segmented "Tekst | Audio" w head-actions) -------------- */
+@keyframes chat-wave-dance { 0%, 100% { transform: scaleY(.25); } 20% { transform: scaleY(.85); } 40% { transform: scaleY(.45); } 60% { transform: scaleY(1); } 80% { transform: scaleY(.55); } }
 
-.chat-head .mode-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 0;
-  background: var(--bg-3);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 3px;
-  margin-right: 4px;
-}
-.chat-head .mode-toggle tf-button {
-  /* Wykorzystujemy ghost variant tf-button, ale chcemy zwart formę pill —
-     tf-button hostuje shadow DOM, wiec nadpisujemy CSS host'a (border-radius
-     i padding aplikuja sie do shadow .tf-btn poprzez :host wzorzec, ale tu
-     wystarczy zewnetrzny wrapper dla aktywnego stanu). */
-  border-radius: 999px;
-}
-.chat-head .mode-toggle tf-button.active::part(button),
-.chat-head .mode-toggle tf-button.active {
-  /* Aktywny tab — gradient z accent. tf-button shadow-DOM nie pozwala
-     stylować od zewnątrz w pełni; nadajemy klasę 'active' i polegamy na
-     wewnętrznym mechanizmie variant=primary (chat.js przełącza variant). */
+/* The stage owns the whole body: no reading column, no scroll. */
+.chat-root .chat-body.audio-mode { padding: 0; overflow: hidden; display: flex; }
+.chat-root .chat-col.is-audio .chat-composer-wrap { padding: 0; }
+.chat-root .chat-col.is-audio .chat-composer-wrap > :not(.chat-activity) { display: none; }
+
+.chat-root .audio-body {
+  flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 340px;
+  min-height: 0; min-width: 0;
 }
 
-/* W trybie audio chat-body sluzy jako prosty host audio-stage — bez
-   centrowanego paddingu kolumny i bez scrollu. audio-stage zarzadza
-   wlasnym ukladem flex w 100% wysokosci. */
-.chat-body.audio-mode {
-  padding: 0;
-  overflow: hidden;
+/* ----- Face stage ----- */
+.chat-root .face-stage {
+  position: relative; min-width: 0; min-height: 0; overflow: hidden; isolation: isolate;
+  background: radial-gradient(ellipse at 50% 40%, #121842 0%, #070a22 55%, #03050f 100%);
+}
+.chat-root .face-stage::after {
+  content: ''; position: absolute; inset: 0; pointer-events: none; z-index: 1;
+  box-shadow: inset 0 0 120px rgba(0, 0, 0, .55); transition: box-shadow .5s;
+}
+.chat-root .face-stage[data-state="listen"]::after { box-shadow: inset 0 0 120px rgba(0, 0, 0, .55), inset 0 0 90px rgba(34, 197, 94, .16); }
+.chat-root .face-stage[data-state="think"]::after { box-shadow: inset 0 0 120px rgba(0, 0, 0, .55), inset 0 0 90px rgba(245, 158, 11, .16); }
+.chat-root .face-stage[data-state="speak"]::after { box-shadow: inset 0 0 120px rgba(0, 0, 0, .55), inset 0 0 100px rgba(167, 139, 250, .22); }
+/* The face overflows its stage on purpose: the eyes sit in the upper third and
+   the lower part hides behind the wave and the dock. */
+.chat-root .face-stage tf-face {
+  position: absolute; inset: -30% -16% -4% -16%; display: block;
+  transition: opacity .4s, filter .4s;
 }
 
-/* ---- Audio stage (twarz + sterowanie) ----------------------------------- */
+.chat-root .stage-top {
+  position: absolute; top: 16px; left: 0; right: 0; z-index: 3;
+  display: flex; justify-content: center; padding: 0 12px; pointer-events: none;
+}
+.chat-root .audio-status {
+  display: inline-flex; align-items: center; gap: 10px; max-width: 100%;
+  padding: 8px 16px; border-radius: 999px;
+  background: rgba(14, 18, 48, .78); backdrop-filter: blur(8px);
+  border: 1px solid rgba(120, 130, 200, .28);
+  font-size: 12px; font-weight: 600; color: #e8ebf5;
+}
+.chat-root .audio-status .dot {
+  width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+  background: var(--listen); box-shadow: 0 0 10px var(--listen);
+  animation: chat-pulse-dot 1.4s ease-in-out infinite;
+}
+.chat-root .face-stage[data-state="think"] .audio-status .dot { background: var(--think); box-shadow: 0 0 10px var(--think); }
+.chat-root .face-stage[data-state="speak"] .audio-status .dot { background: var(--speak); box-shadow: 0 0 10px var(--speak); }
+.chat-root .face-stage[data-state="idle"] .audio-status .dot { background: var(--text-3); box-shadow: none; animation: none; }
 
-.audio-stage {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  background:
-    radial-gradient(ellipse at 50% 38%, rgba(99,102,241,0.10) 0%, transparent 60%),
-    var(--bg);
-  /* chat-main jest grid-template-rows: auto 1fr auto — audio-stage wstawiany
-     w wiersz "1fr", wiec wypelni przestrzen miedzy head a composerem. */
-  height: 100%;
-  overflow: hidden;
+.chat-root .stage-bottom {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 3;
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  padding: 0 16px 22px;
+  background: linear-gradient(0deg, rgba(3, 5, 15, .85), transparent);
 }
+.chat-root .wave {
+  height: 44px; width: 100%; max-width: 440px;
+  display: flex; align-items: center; justify-content: center; gap: 3px;
+}
+.chat-root .wave .wave-bar {
+  flex: 1; max-width: 4px; min-width: 2px; height: 100%;
+  background: var(--listen); border-radius: 2px; opacity: .9;
+  animation: chat-wave-dance .9s ease-in-out infinite; transform-origin: center;
+}
+.chat-root .face-stage[data-state="speak"] .wave .wave-bar { background: var(--speak); }
+.chat-root .face-stage[data-state="think"] .wave .wave-bar { background: var(--think); animation-duration: 1.5s; }
+.chat-root .face-stage[data-state="idle"] .wave .wave-bar { background: #5b6290; animation: none; transform: scaleY(.12); }
 
-/* ---- Status pill (gora) -------------------------------------------------- */
+/* ----- Control dock: round tf-buttons ----- */
+.chat-root .audio-controls { display: flex; align-items: center; justify-content: center; gap: 12px; flex-wrap: wrap; }
+.chat-root .dock-btn .tf-btn {
+  width: 46px; height: 46px; min-height: 0; padding: 0; justify-content: center;
+  border-radius: 50%; color: #e8ebf5;
+  background: rgba(20, 26, 66, .85); border: 1px solid rgba(120, 130, 200, .35);
+}
+.chat-root .dock-btn .tf-btn:hover { background: rgba(40, 48, 110, .9); border-color: rgba(167, 139, 250, .6); }
+.chat-root .dock-btn .tf-btn svg { width: 19px; height: 19px; }
+.chat-root .dock-btn.primary .tf-btn {
+  width: 56px; height: 56px; color: #fff; border-color: transparent;
+  background: var(--gradient-accent); box-shadow: 0 0 28px rgba(99, 102, 241, .45);
+}
+.chat-root .dock-btn.primary .tf-btn svg { width: 22px; height: 22px; }
+.chat-root .dock-btn.is-muted .tf-btn { background: rgba(239, 68, 68, .18); border-color: rgba(239, 68, 68, .55); color: #fca5a5; box-shadow: none; }
+.chat-root .dock-btn.end .tf-btn { background: rgba(239, 68, 68, .85); border-color: transparent; color: #fff; }
+.chat-root .dock-btn .tf-btn:disabled { opacity: .45; }
 
-.audio-stage .audio-status {
-  margin: 24px auto 0;
-  padding: 8px 16px;
-  background: rgba(20, 24, 54, 0.8);
-  -webkit-backdrop-filter: blur(8px);
-  backdrop-filter: blur(8px);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 12px;
-  font-weight: 600;
+/* ----- Live transcript ----- */
+.chat-root .transcript {
+  border-left: 1px solid var(--border); background: var(--bg-2);
+  display: flex; flex-direction: column; min-height: 0; min-width: 0;
 }
-.audio-stage .audio-status .dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--listen);
-  box-shadow: 0 0 10px var(--listen);
-  animation: chatAudioPulseDot 1.4s ease-in-out infinite;
+.chat-root .tr-head { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+.chat-root .tr-head h3 { flex: 1; display: flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 800; }
+.chat-root .tr-head h3 .icon { width: 14px; height: 14px; color: var(--accent-2); }
+.chat-root .tr-list {
+  flex: 1; min-height: 0; overflow-y: auto; padding: 14px;
+  display: flex; flex-direction: column; gap: 10px;
+  scrollbar-width: thin; scrollbar-color: var(--border) transparent;
 }
-@keyframes chatAudioPulseDot {
-  0%, 100% { transform: scale(1); opacity: 1; }
-  50%      { transform: scale(1.4); opacity: 0.6; }
+.chat-root .tr-item {
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 9px 12px;
+  background: var(--bg-card); font-size: 12.5px; line-height: 1.6; color: var(--text-2);
+  transition: border-color .2s, background .2s;
 }
-.audio-stage[data-state="think"] .audio-status .dot {
-  background: var(--think);
-  box-shadow: 0 0 10px var(--think);
+.chat-root .tr-item .who {
+  display: flex; gap: 8px; align-items: center; margin-bottom: 2px;
+  font-size: 10px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase;
 }
-.audio-stage[data-state="speak"] .audio-status .dot {
-  background: var(--speak);
-  box-shadow: 0 0 10px var(--speak);
-}
-.audio-stage[data-state="idle"] .audio-status .dot {
-  background: var(--text-3);
-  box-shadow: none;
-  animation: none;
-}
-.audio-stage .audio-status .label { color: var(--text); }
-.audio-stage .audio-status .engine {
-  margin-left: 8px;
-  padding: 2px 8px;
-  font-size: 10px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--text-3);
-  background: var(--bg-3);
-  border-radius: 999px;
-  border: 1px solid var(--border);
-}
+.chat-root .tr-item .who .t { margin-left: auto; font-family: var(--font-mono, ui-monospace, 'JetBrains Mono', monospace); color: var(--text-3); letter-spacing: 0; font-weight: 600; }
+.chat-root .tr-item.user .who { color: var(--success); }
+.chat-root .tr-item.bot .who { color: var(--accent-2); }
+.chat-root .tr-item.now { border-color: var(--accent-1); background: var(--accent-glow); color: var(--text); box-shadow: 0 0 0 3px var(--accent-glow); }
+.chat-root .tr-item.now.user { border-color: var(--listen); background: rgba(34, 197, 94, .07); box-shadow: 0 0 0 3px rgba(34, 197, 94, .14); }
+.chat-root .tr-item .text { font-size: 13px; overflow-wrap: anywhere; }
+.chat-root .tr-item .partial { font-style: italic; }
+.chat-root .tr-item .w { transition: color .15s, opacity .15s; }
+.chat-root .tr-item.now.bot .w { opacity: .42; }
+.chat-root .tr-item.now.bot .w.said { opacity: 1; color: var(--text); }
+.chat-root .tr-item.now.bot .w.cur { opacity: 1; color: var(--accent-2); font-weight: 800; }
+.chat-root .tr-item .sent { border-radius: 6px; padding: 1px 3px; transition: background .2s; }
+.chat-root .tr-item .sent.cur { background: var(--accent-glow); box-shadow: inset 2px 0 0 var(--accent-1); padding-left: 6px; }
+.chat-root .tr-item .think-note { display: flex; align-items: center; gap: 8px; color: var(--text-3); font-size: 12px; }
 
-/* ---- Face stage (kontener wireframe twarzy) ----------------------------- */
-
-.audio-stage .face-stage {
-  flex: 1;
-  width: 100%;
-  position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  --face-radius: 180px;
-  --dot-orbit: calc(var(--face-radius) + 18px);
+@container chatcq (max-width: 999px) {
+  .chat-root .audio-body { grid-template-columns: minmax(0, 1fr) 300px; }
 }
-
-/* Sam kontener twarzy. FaceBackground.embed() nadaje mu wewnatrz canvasy.
-   Klasa .face-canvas trzyma rozmiar i glow shadow per stan. */
-.audio-stage .face-canvas {
-  width: 360px;
-  height: 360px;
-  border-radius: 50%;
-  background: radial-gradient(circle at 50% 45%, #0e1234 0%, #050818 70%);
-  border: 1px solid var(--border);
-  box-shadow:
-    inset 0 0 60px rgba(0, 0, 0, 0.6),
-    0 0 80px var(--accent-glow);
-  position: relative;
-  overflow: hidden;
-  transition: box-shadow 0.4s ease, border-color 0.4s ease;
-}
-.audio-stage[data-state="listen"] .face-canvas {
-  border-color: rgba(34, 197, 94, 0.45);
-  box-shadow:
-    inset 0 0 60px rgba(0, 0, 0, 0.6),
-    0 0 100px var(--listen-glow);
-}
-.audio-stage[data-state="think"] .face-canvas {
-  border-color: rgba(245, 158, 11, 0.45);
-  box-shadow:
-    inset 0 0 60px rgba(0, 0, 0, 0.6),
-    0 0 100px var(--think-glow);
-}
-.audio-stage[data-state="speak"] .face-canvas {
-  border-color: rgba(167, 139, 250, 0.55);
-  box-shadow:
-    inset 0 0 60px rgba(0, 0, 0, 0.6),
-    0 0 120px var(--speak-glow);
-}
-
-/* ---- Amp dots (orbital, 8 sztuk wokol twarzy) --------------------------- */
-
-.audio-stage .amp-dot {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  width: 0;
-  height: 0;
-  pointer-events: none;
-  transform: translate(-50%, -50%) rotate(var(--angle, 0deg));
-}
-.audio-stage .amp-dot::before {
-  content: '';
-  position: absolute;
-  left: -4px;
-  top: calc(-1 * var(--dot-orbit) - 4px);
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--listen);
-  box-shadow: 0 0 8px var(--listen);
-  animation: chatAudioDotPulse 1.4s ease-in-out infinite;
-  animation-delay: var(--delay, 0s);
-}
-.audio-stage[data-state="speak"] .amp-dot::before {
-  background: var(--speak);
-  box-shadow: 0 0 10px var(--speak);
-  animation-duration: 0.8s;
-}
-.audio-stage[data-state="think"] .amp-dot::before,
-.audio-stage[data-state="idle"] .amp-dot::before {
-  display: none;
-}
-@keyframes chatAudioDotPulse {
-  0%, 100% { transform: scale(0.5); opacity: 0.35; }
-  50%      { transform: scale(1.0); opacity: 1.0; }
-}
-
-/* ---- Subtitle (transkrypcja partial / TTS speech) ----------------------- */
-
-.audio-stage .subtitle {
-  margin: 8px auto 0;
-  max-width: 520px;
-  padding: 0 24px;
-  min-height: 60px;
-  text-align: center;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  align-items: center;
-  word-wrap: break-word;
-  overflow-wrap: anywhere;
-}
-.audio-stage .subtitle .who {
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--text-3);
-}
-.audio-stage .subtitle .who.user { color: #6ee7b7; }
-.audio-stage .subtitle .who.bot  { color: #c4b5fd; }
-.audio-stage .subtitle .text {
-  font-size: 18px;
-  font-weight: 500;
-  line-height: 1.4;
-  color: var(--text);
-  word-wrap: break-word;
-  overflow-wrap: anywhere;
-  hyphens: auto;
-}
-.audio-stage .subtitle .text.partial {
-  color: var(--text-2);
-  font-style: italic;
-}
-.audio-stage .subtitle .text .caret {
-  display: inline-block;
-  width: 2px;
-  height: 18px;
-  background: currentColor;
-  margin-left: 2px;
-  vertical-align: text-bottom;
-  animation: chatAudioCaretBlink 1s steps(2) infinite;
-}
-@keyframes chatAudioCaretBlink { 50% { opacity: 0; } }
-
-/* ---- Waveform ------------------------------------------------------------ */
-
-.audio-stage .wave {
-  height: 56px;
-  width: 100%;
-  max-width: 480px;
-  margin: 8px auto 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 3px;
-  padding: 0 24px;
-}
-.audio-stage .wave .bar {
-  flex: 1;
-  max-width: 4px;
-  min-width: 2px;
-  background: var(--listen);
-  border-radius: 2px;
-  opacity: 0.9;
-  animation: chatAudioWaveDance 0.9s ease-in-out infinite;
-  transform-origin: center;
-}
-.audio-stage[data-state="speak"] .wave .bar { background: var(--speak); }
-.audio-stage[data-state="think"] .wave .bar {
-  background: var(--think);
-  animation-duration: 1.4s;
-}
-.audio-stage[data-state="idle"] .wave .bar {
-  background: var(--text-3);
-  animation: none;
-  transform: scaleY(0.15);
-}
-@keyframes chatAudioWaveDance {
-  0%, 100% { transform: scaleY(0.25); }
-  20%      { transform: scaleY(0.85); }
-  40%      { transform: scaleY(0.45); }
-  60%      { transform: scaleY(1.0); }
-  80%      { transform: scaleY(0.55); }
-}
-
-/* ---- Audio controls (bottom dock) --------------------------------------- */
-
-.audio-stage .audio-controls {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 14px;
-  padding: 18px 24px 28px;
-  flex-wrap: wrap;
-}
-
-/* tf-button[disabled] juz ma standardowy wyglad (opacity + cursor not-allowed)
-   z shared-styles. Dodajemy tylko subtelny tooltip-friendly state na
-   .audio-controls — bez nadpisywania komponentu. */
-.audio-stage .audio-controls tf-button[disabled] {
-  /* zachowujemy mozliwosc click->showTooltip jesli kiedys dodamy custom tip;
-     domyslny title="" wystarcza w Etapie 1. */
-  opacity: 0.55;
-}
-
-/* Muted state — uzywany dla mic (mikrofon wyciszony) i volume (glosnik
-   wyciszony). Wizualny sygnal: cien czerwony + lekka transparency, zeby
-   uzytkownik widzial od razu ze stan jest off. tf-button shadow DOM nie
-   pozwala wymienic ikony, wiec polegamy na aurze. */
-.audio-stage .audio-controls tf-button.muted {
-  filter: grayscale(0.4);
-  opacity: 0.7;
-  box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.45) inset;
-  border-radius: 999px;
-}
-
-/* ---- Rail (3-4 ostatnie wpisy z konwersacji) ---------------------------- */
-
-.audio-stage .rail {
-  position: absolute;
-  right: 20px;
-  top: 80px;
-  bottom: 100px;
-  width: 280px;
-  padding: 12px;
-  background: rgba(10, 13, 36, 0.7);
-  -webkit-backdrop-filter: blur(10px);
-  backdrop-filter: blur(10px);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  overflow-y: auto;
-  z-index: 2;
-}
-.audio-stage .rail-title {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--text-3);
-  padding: 4px 6px;
-}
-.audio-stage .rail-msg {
-  padding: 8px 10px;
-  border-radius: 8px;
-  font-size: 12px;
-  line-height: 1.45;
-}
-.audio-stage .rail-msg.user {
-  background: rgba(34, 197, 94, 0.10);
-  border: 1px solid rgba(34, 197, 94, 0.20);
-  color: var(--text);
-}
-.audio-stage .rail-msg.bot {
-  background: rgba(167, 139, 250, 0.10);
-  border: 1px solid rgba(167, 139, 250, 0.22);
-  color: var(--text);
-}
-.audio-stage .rail-msg .who {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--text-3);
-  margin-bottom: 4px;
-}
-.audio-stage .rail-msg.user .who { color: #6ee7b7; }
-.audio-stage .rail-msg.bot  .who { color: #c4b5fd; }
-
-/* ---- Sidebar live-dot (rozmowa w trybie audio aktywna) ------------------ */
-
-.conv-item.audio-now {
-  /* Nadpisuje accent gradient na green/cyan, zeby wizualnie odroznic od
-     zwyklego activeitem (juz aktywnej tekstowo rozmowy). */
-}
-.conv-item.audio-now::before {
-  background: var(--gradient-listen);
-}
-.conv-item.audio-now .live-dot {
-  display: inline-block;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--listen);
-  margin-right: 6px;
-  box-shadow: 0 0 6px var(--listen);
-  animation: chatAudioPulseDot 1.4s ease-in-out infinite;
-}
-
-/* ---- Mobile overrides --------------------------------------------------- */
-
-@media (max-width: 767px) {
-  .audio-stage .face-stage { --face-radius: 120px; }
-  .audio-stage .face-canvas { width: 240px; height: 240px; }
-  .audio-stage .rail { display: none; }
-  .audio-stage .subtitle .text { font-size: 16px; }
-  .audio-stage .audio-controls {
-    padding: 14px 14px 22px;
-    gap: 10px;
-  }
-  .chat-head .mode-toggle { margin-right: 0; }
+@container chatcq (max-width: 719px) {
+  .chat-root .audio-body { grid-template-columns: minmax(0, 1fr); }
+  .chat-root .transcript { display: none; }
+  .chat-root .face-stage tf-face { inset: -8% -4% 6% -4%; }
+  .chat-root .stage-bottom { padding-bottom: 28px; }
+  .chat-root .dock-btn .tf-btn { width: 50px; height: 50px; }
+  .chat-root .dock-btn.primary .tf-btn { width: 62px; height: 62px; }
 }

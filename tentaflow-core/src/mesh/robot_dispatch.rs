@@ -2631,7 +2631,6 @@ mod tests {
             m::MESH_MSG_STORAGE_PROXY_RESPONSE,
             m::MESH_MSG_NODE_LEAVING,
             m::MESH_MSG_FORWARD_STREAM_REQ,
-            m::MESH_MSG_ALIAS_SYNC,
             m::MESH_MSG_SERVICES_GET,
             m::MESH_MSG_SERVICES_GET_RESPONSE,
             m::MESH_MSG_SERVICES_ANNOUNCE,

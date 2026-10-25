@@ -146,7 +146,7 @@ const TentaQuantScreen = {
 
     try {
       const me = await ApiBinary.one('authMeRequest');
-      this.userId = me?.userId ?? me?.user_id ?? '';
+      this.userId = me?.userId ?? '';
     } catch {
       this.userId = '';
     }
@@ -362,7 +362,7 @@ const TentaQuantScreen = {
   /// "Otwórz w notatniku" on a run that came from one: the notebook the run was
   /// started in, with the project tabs back on screen.
   async openNotebookForRun(run) {
-    const notebookId = run && (run.notebookId ?? run.notebook_id);
+    const notebookId = run && run.notebookId;
     if (!notebookId) return;
     this.disposeRunView();
     this.resultRunId = null;

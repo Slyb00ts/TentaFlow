@@ -90,8 +90,8 @@ export class LoginFlow {
     this.notify();
     try {
       const started = await this.api.loginStart({ accountId, nodeId });
-      this.loginId = started.login_id ?? started.loginId ?? '';
-      this.nodeId = started.node_id ?? started.nodeId ?? nodeId;
+      this.loginId = started.loginId ?? '';
+      this.nodeId = started.nodeId ?? nodeId;
       // A sign-in cancelled while it was starting: this is the first moment the
       // node can be told, because the id it answers by did not exist before.
       // Checked BEFORE `disposed`, so closing the window cancels the terminal
@@ -101,9 +101,9 @@ export class LoginFlow {
         return;
       }
       if (this.disposed) return;
-      this.verificationUrl = started.verification_url ?? started.verificationUrl ?? '';
-      this.instructionKey = started.instruction_key ?? started.instructionKey ?? '';
-      this.expiresAt = started.expires_at ?? started.expiresAt ?? '';
+      this.verificationUrl = started.verificationUrl ?? '';
+      this.instructionKey = started.instructionKey ?? '';
+      this.expiresAt = started.expiresAt ?? '';
       this.state = 'awaiting_input';
       this.schedulePoll();
     } catch (error) {
@@ -227,9 +227,9 @@ export class LoginFlow {
     }
     if (this.disposed || this.finished) return;
     const state = String(snapshot.state ?? '');
-    const messageKey = snapshot.message_key ?? snapshot.messageKey ?? null;
-    this.providerSubject = snapshot.provider_subject ?? snapshot.providerSubject ?? this.providerSubject;
-    this.planLabel = snapshot.plan_label ?? snapshot.planLabel ?? this.planLabel;
+    const messageKey = snapshot.messageKey ?? null;
+    this.providerSubject = snapshot.providerSubject ?? this.providerSubject;
+    this.planLabel = snapshot.planLabel ?? this.planLabel;
     this.message = messageKey ? I18n.t(messageKey) : '';
     this.detail = '';
     if (state === 'succeeded' || state === 'failed') {
@@ -279,7 +279,7 @@ export function openLoginWizard({
   onFinished = null,
 } = {}) {
   const flow = new LoginFlow();
-  const eligible = nodes.filter((node) => node.receives_accounts ?? node.receivesAccounts);
+  const eligible = nodes.filter((node) => node.receivesAccounts);
   const body = document.createElement('div');
   body.className = 'aa-login';
   body.innerHTML = `
@@ -361,13 +361,13 @@ export function openLoginWizard({
 
   const picker = field('node');
   if (picker) {
-    const preferred = eligible.some((node) => (node.node_id ?? node.nodeId) === homeNodeId)
+    const preferred = eligible.some((node) => node.nodeId === homeNodeId)
       ? homeNodeId
-      : (eligible[0].node_id ?? eligible[0].nodeId);
+      : (eligible[0].nodeId);
     picker.setOptions(
       eligible.map((node) => {
-        const id = node.node_id ?? node.nodeId;
-        return { value: id, label: `${node.node_name ?? node.nodeName ?? id} · ${osLabel(node.os)}` };
+        const id = node.nodeId;
+        return { value: id, label: `${node.nodeName ?? id} · ${osLabel(node.os)}` };
       }),
       preferred,
     );
@@ -378,12 +378,12 @@ export function openLoginWizard({
   // all — a CLI that cannot be isolated dies before it prints an address.
   const targetNode = () => {
     const id = picker ? picker.value : homeNodeId;
-    return nodes.find((node) => (node.node_id ?? node.nodeId) === id)
-      ?? nodes.find((node) => node.is_local ?? node.isLocal);
+    return nodes.find((node) => node.nodeId === id)
+      ?? nodes.find((node) => node.isLocal);
   };
   const sandboxBlocked = () => {
     const node = targetNode();
-    return node?.sandbox_capable === false && sandboxRepairable(node.sandbox_cause);
+    return node?.sandboxCapable === false && sandboxRepairable(node.sandboxCause);
   };
 
   const stepState = () => {
@@ -418,7 +418,7 @@ export function openLoginWizard({
     sandboxAlert.hidden = !blocked;
     if (blocked) {
       const node = targetNode();
-      sandboxAlert.setAttribute('message', sandboxRepairProblem(node.node_name ?? node.node_id ?? ''));
+      sandboxAlert.setAttribute('message', sandboxRepairProblem(node.nodeName ?? node.nodeId ?? ''));
     }
     act('start').hidden = Boolean(flow.loginId);
     act('start').toggleAttribute('disabled', flow.busy || blocked);
@@ -472,13 +472,13 @@ export function openLoginWizard({
     const node = targetNode();
     if (!node) return;
     const outcome = await repairProcessSandbox({
-      nodeId: node.node_id ?? node.nodeId,
-      nodeName: node.node_name ?? node.nodeName ?? '',
-      isLocal: (node.is_local ?? node.isLocal) === true,
+      nodeId: node.nodeId,
+      nodeName: node.nodeName ?? '',
+      isLocal: node.isLocal === true,
     });
     if (!outcome) return;
-    node.sandbox_capable = true;
-    node.sandbox_cause = null;
+    node.sandboxCapable = true;
+    node.sandboxCause = null;
     toast(I18n.t('sandbox_repair.done'), 'success');
     paint();
   });

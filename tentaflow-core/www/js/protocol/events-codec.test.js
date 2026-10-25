@@ -19,6 +19,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { requests } from './requests.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -90,7 +91,7 @@ const ROW = {
 };
 
 test('BrowseRequest carries the variant names and every filter field', { skip }, () => {
-  const bytes = wasm.encodeEventsBrowseRequest(JSON.stringify({
+  const bytes = requests.encodeEventsBrowseRequest(JSON.stringify({
     origins: ['code_studio', 'api'],
     actor_id: 'key-42',
     org_id: null,
@@ -109,25 +110,25 @@ test('BrowseRequest carries the variant names and every filter field', { skip },
   // The decoder's *Request arm names the variant back, which is the only place
   // the encode and decode legs of this family meet inside the codec.
   const echoed = wasm.decodeMessageBody(bytes);
-  assert.equal(echoed.variant, 'EventsBrowseRequest');
+  assert.equal(echoed._variant, 'EventsBody.BrowseRequest');
 });
 
 test('an empty origin list is not the same wire value as no origin filter', { skip }, () => {
-  const none = Buffer.from(wasm.encodeEventsBrowseRequest(
+  const none = Buffer.from(requests.encodeEventsBrowseRequest(
     JSON.stringify({ origins: null, limit: 1 }),
   )).toString('latin1');
-  const empty = Buffer.from(wasm.encodeEventsBrowseRequest(
+  const empty = Buffer.from(requests.encodeEventsBrowseRequest(
     JSON.stringify({ origins: [], limit: 1 }),
   )).toString('latin1');
   assert.notEqual(none, empty, 'every chip off must not encode as no constraint');
 });
 
 test('RunRequest names its own variant', { skip }, () => {
-  const bytes = wasm.encodeEventsRunRequest('run-1', 2, 100);
+  const bytes = requests.encodeEventsRunRequest('run-1', 2, 100);
   const text = Buffer.from(bytes).toString('latin1');
   assert.ok(text.includes('EventsBody'));
   assert.ok(text.includes('RunRequest'));
-  assert.equal(wasm.decodeMessageBody(bytes).variant, 'EventsRunRequest');
+  assert.equal(wasm.decodeMessageBody(bytes)._variant, 'EventsBody.RunRequest');
 });
 
 test('a server BrowseResponse decodes into the shape events.js reads', { skip }, () => {
@@ -142,14 +143,12 @@ test('a server BrowseResponse decodes into the shape events.js reads', { skip },
   }));
   const body = wasm.decodeMessageBody(bytes);
 
-  assert.equal(body.variant, 'EventsBrowseResponse');
+  assert.equal(body._variant, 'EventsBody.BrowseResponse');
   assert.equal(body.rows.length, 1);
   assert.equal(body.scopedToSelf, true);
-  assert.equal(body.scoped_to_self, true);
 
   const row = body.rows[0];
   assert.equal(row.runId, 'run-1');
-  assert.equal(row.run_id, 'run-1');
   assert.equal(row.seq, 3);
   assert.equal(row.atMs, 1_760_000_000_000);
   assert.equal(row.kind, 'tool_call');
@@ -166,14 +165,13 @@ test('a server BrowseResponse decodes into the shape events.js reads', { skip },
   assert.equal(row.callId, 'c-a70');
   assert.equal(row.payloadJson, ROW.payload_json);
 
-  // The cursor comes back in the spelling the encoder reads, so a second page
-  // can be asked for with the object the first page returned.
+  // A second page is asked for with the cursor the first page returned.
   assert.equal(body.nextCursor.runId, 'run-1');
-  assert.equal(body.nextCursor.at_ms, 1_760_000_000_000);
-  const next = wasm.encodeEventsBrowseRequest(JSON.stringify({
+  assert.equal(body.nextCursor.atMs, 1_760_000_000_000);
+  const next = requests.encodeEventsBrowseRequest(JSON.stringify({
     cursor: {
-      at_ms: body.nextCursor.at_ms,
-      run_id: body.nextCursor.run_id,
+      at_ms: body.nextCursor.atMs,
+      run_id: body.nextCursor.runId,
       seq: body.nextCursor.seq,
     },
     limit: 200,
@@ -188,7 +186,7 @@ test('a BrowseResponse without a next cursor ends the paging', { skip }, () => {
     },
   }));
   const body = wasm.decodeMessageBody(bytes);
-  assert.equal(body.variant, 'EventsBrowseResponse');
+  assert.equal(body._variant, 'EventsBody.BrowseResponse');
   assert.deepEqual([...body.rows], []);
   assert.equal(body.nextCursor, null);
   assert.equal(body.scopedToSelf, false);
@@ -201,7 +199,7 @@ test('a RunResponse decodes with its timeline and paging seq', { skip }, () => {
     },
   }));
   const body = wasm.decodeMessageBody(bytes);
-  assert.equal(body.variant, 'EventsRunResponse');
+  assert.equal(body._variant, 'EventsBody.RunResponse');
   assert.equal(body.runId, 'run-1');
   assert.equal(body.events.length, 1);
   assert.equal(body.events[0].callId, 'c-a70');
@@ -231,5 +229,5 @@ test("the screen's own call resolves through the codec facade", { skip }, async 
   }, 3);
   const env = wasm.decodeEnvelope(frame);
   assert.equal(env.correlation_id, 7n);
-  assert.equal(wasm.decodeMessageBody(env.body).variant, 'EventsBrowseRequest');
+  assert.equal(wasm.decodeMessageBody(env.body)._variant, 'EventsBody.BrowseRequest');
 });

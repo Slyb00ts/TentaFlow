@@ -71,7 +71,7 @@ export function runPairProgress({ target, submit }) {
     body.className = 'pair-progress__body';
 
     const hostname = (target?.hostname || I18n.t('mesh.unknown_host')).toString();
-    const nodeId = (target?.nodeId || target?.node_id || '').toString();
+    const nodeId = (target?.nodeId || '').toString();
 
     body.innerHTML = `
       <div class="pair-progress__target">

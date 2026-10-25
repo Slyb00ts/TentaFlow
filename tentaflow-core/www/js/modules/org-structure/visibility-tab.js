@@ -26,7 +26,7 @@ const SHOWN_NAMES = 4;
 let state = null;
 
 function nameList(people) {
-  const names = people.map((p) => p.display_name || '—');
+  const names = people.map((p) => p.displayName || '—');
   if (names.length <= SHOWN_NAMES) return names.join(', ');
   return vt('people_more', { names: names.slice(0, SHOWN_NAMES).join(', '), count: names.length });
 }
@@ -45,7 +45,7 @@ function seesRowHtml(row) {
 
 function renderSees(response) {
   const rows = visibilityRows(response);
-  const name = response.user.display_name || '—';
+  const name = response.user.displayName || '—';
   return `
     <div class="org-vis-card-head"><h3>${escapeHtml(vt('sees_title', { name }))}</h3><span class="org-vis-hint">${escapeHtml(vt('sees_hint'))}</span></div>
     <div class="org-vis-scroll">
@@ -65,9 +65,9 @@ function viewerHtml(viewer) {
   const note = viewer.self ? vt('viewer_self') : kinds;
   return `
     <div class="org-vis-who-row">
-      <tf-avatar initials="${escapeAttr(initials(viewer.display_name))}" size="sm"></tf-avatar>
+      <tf-avatar initials="${escapeAttr(initials(viewer.displayName))}" size="sm"></tf-avatar>
       <div class="org-vis-who-main">
-        <div class="org-vis-who-name">${escapeHtml(viewer.display_name || '—')}</div>
+        <div class="org-vis-who-name">${escapeHtml(viewer.displayName || '—')}</div>
         <div class="org-vis-who-kinds">${escapeHtml(note)}</div>
       </div>
       <span class="org-vis-rule">${escapeHtml(vt(`rule_${viewer.rule}`))}</span>
@@ -75,8 +75,8 @@ function viewerHtml(viewer) {
 }
 
 function renderWho(response) {
-  const name = response.subject.display_name || '—';
-  const viewers = viewerRows(response, response.subject.user_id);
+  const name = response.subject.displayName || '—';
+  const viewers = viewerRows(response, response.subject.userId);
   return `
     <div class="org-vis-card-head"><h3>${escapeHtml(vt('who_title', { name }))}</h3></div>
     <div class="org-vis-who-ask">${escapeHtml(vt('who_sub'))}</div>
@@ -86,7 +86,7 @@ function renderWho(response) {
 
 function renderChips(response) {
   const chips = [];
-  if (response.manager) chips.push(`<tf-chip variant="outline" icon="user">${escapeHtml(vt('chip_manager', { name: response.manager.display_name || '—' }))}</tf-chip>`);
+  if (response.manager) chips.push(`<tf-chip variant="outline" icon="user">${escapeHtml(vt('chip_manager', { name: response.manager.displayName || '—' }))}</tf-chip>`);
   chips.push(`<tf-chip variant="outline" icon="users">${escapeHtml(vt('chip_subtree', { count: response.subtree.length }))}</tf-chip>`);
   return chips.join('');
 }

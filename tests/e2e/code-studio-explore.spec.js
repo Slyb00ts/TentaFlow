@@ -129,7 +129,7 @@ async function registerProvider(page) {
   await api(page, 'serviceManifestDeployRequest', {
     engineId: 'openai-compatible',
     deployMethod: 'external',
-    nodeId: first.nodeId ?? first.node_id ?? '',
+    nodeId: first.nodeId ?? '',
     configJson: JSON.stringify({
       base_url: model.baseUrl,
       api_key: 'explore-key',

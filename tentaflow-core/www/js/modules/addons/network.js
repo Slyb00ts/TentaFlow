@@ -32,9 +32,9 @@ async function loadAndRender(container) {
   try {
     const resp = await ApiBinary.one('addonNetworkRulesGetRequest', { addonId: currentAddonId });
     state.mode = String(resp.mode ?? 'strict').toLowerCase() === 'permissive' ? 'permissive' : 'strict';
-    state.allowed = normalizeHosts(resp.allowedHosts ?? resp.allowed_hosts);
-    state.blocked = normalizeHosts(resp.blockedHosts ?? resp.blocked_hosts);
-    state.declared = normalizeDeclared(resp.declaredRules ?? resp.declared_rules);
+    state.allowed = normalizeHosts(resp.allowedHosts);
+    state.blocked = normalizeHosts(resp.blockedHosts);
+    state.declared = normalizeDeclared(resp.declaredRules);
     render(container);
   } catch (err) {
     container.innerHTML = `<div class="addons-empty" style="color:var(--danger);">${escapeHtml(err.message)}</div>`;
@@ -50,9 +50,9 @@ function normalizeDeclared(v) {
   if (!Array.isArray(v)) return [];
   return v
     .map((r) => ({
-      ruleId: String(r?.ruleId ?? r?.rule_id ?? '').trim(),
+      ruleId: String(r?.ruleId ?? '').trim(),
       host: String(r?.host ?? '').trim(),
-      port: Number.isFinite(Number(r?.port)) ? Number(r.port) : null,
+      port: r?.port != null && Number.isFinite(Number(r.port)) ? Number(r.port) : null,
       protocol: String(r?.protocol ?? 'tcp').toLowerCase(),
       mode: String(r?.mode ?? 'allow').toLowerCase() === 'block' ? 'block' : 'allow',
       status: ['covered', 'missing', 'conflicting'].includes(String(r?.status))

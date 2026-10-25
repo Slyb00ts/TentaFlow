@@ -133,16 +133,15 @@ async function detectInstallerRole() {
   if (state.currentStep === 4) renderStep();
 }
 
-// Normalizes one access entry from either the wire response or the manifest,
-// tolerating both snake_case and camelCase field names.
+// Normalizes one access entry from either the wire response or the manifest.
 function normalizeAccessEntry(kind, e) {
   return {
     kind,
     target: e.target || e.alias || e.model || e.name || '',
-    required: !!(e.required ?? e.is_required),
+    required: !!e.required,
     reason: e.reason || e.description || '',
-    grantStatus: e.grantStatus || e.grant_status || 'pending',
-    ownerVisibility: e.ownerVisibility || e.owner_visibility || 'restricted',
+    grantStatus: e.grantStatus || 'pending',
+    ownerVisibility: e.ownerVisibility || 'restricted',
     // True while an approve/reject decision is in flight for this entry.
     pending: false,
   };
@@ -215,8 +214,8 @@ function recomputeAliasStatuses() {
     }
     // Defensive read — backend may not yet expose owner fields; treat unknown
     // ownership as a hard conflict so admin must resolve in M16.
-    const ownerType = hit.owner_type || hit.ownerType || null;
-    const ownerId = String(hit.owner_id || hit.ownerId || '').toLowerCase();
+    const ownerType = hit.ownerType || null;
+    const ownerId = String(hit.ownerId || '').toLowerCase();
     if (ownerType === 'manual') {
       a.conflictStatus = 'exists-compatible';
       a.conflictOwner = 'manual';
@@ -789,7 +788,7 @@ function renderCamerasStep() {
 
 function cameraRowKey(cam) {
   const xa = Array.isArray(cam?.xaddrs) ? cam.xaddrs[0] : null;
-  return xa || `${cam?.vendor || ''}|${cam?.model || ''}|${cam?.ip || ''}`;
+  return xa || `${cam?.manufacturer || ''}|${cam?.model || ''}|${cam?.address || ''}`;
 }
 
 function buildCameraRows() {
@@ -810,9 +809,9 @@ function buildCameraRows() {
       ? `<tf-chip status="ok" icon="check">${escapeHtml(actionLabel)}</tf-chip>`
       : `<tf-button size="sm" variant="primary" data-role="cam-add" data-idx="${idx}" ${isPending ? 'disabled' : ''} aria-label="${escapeAttr(I18n.t('install_wizard.cameras_action_add'))}">${escapeHtml(actionLabel)}</tf-button>`;
     return {
-      vendor: cam.vendor || '—',
+      vendor: cam.manufacturer || '—',
       model: cam.model || '—',
-      ip: cam.ip || '—',
+      ip: cam.address || '—',
       statusChip,
       actions: actionsHtml,
     };
@@ -859,7 +858,7 @@ function openAddCameraDialog(idx) {
   if (state.cameras.pending.has(key) || state.cameras.added.has(key)) return;
   state.cameras.pending.add(key);
   renderStep();
-  const defaultName = `${cam.vendor || ''} ${cam.model || ''}`.trim() || (cam.ip || 'camera');
+  const defaultName = `${cam.manufacturer || ''} ${cam.model || ''}`.trim() || (cam.address || 'camera');
   const xa = Array.isArray(cam.xaddrs) ? cam.xaddrs[0] : '';
   const dlg = document.createElement('tf-window');
   dlg.setAttribute('title', I18n.t('install_wizard.cameras_add_title'));
@@ -877,9 +876,9 @@ function openAddCameraDialog(idx) {
   body.className = 'wizard-cameras-dialog';
   body.innerHTML = `
     <div class="wizard-cameras-dialog-info">
-      <div><span class="muted">${escapeHtml(I18n.t('install_wizard.cameras_col_vendor'))}:</span> ${escapeHtml(cam.vendor || '—')}</div>
+      <div><span class="muted">${escapeHtml(I18n.t('install_wizard.cameras_col_vendor'))}:</span> ${escapeHtml(cam.manufacturer || '—')}</div>
       <div><span class="muted">${escapeHtml(I18n.t('install_wizard.cameras_col_model'))}:</span> ${escapeHtml(cam.model || '—')}</div>
-      <div><span class="muted">${escapeHtml(I18n.t('install_wizard.cameras_col_ip'))}:</span> ${escapeHtml(cam.ip || '—')}</div>
+      <div><span class="muted">${escapeHtml(I18n.t('install_wizard.cameras_col_ip'))}:</span> ${escapeHtml(cam.address || '—')}</div>
       <div class="muted small mono">${escapeHtml(xa || '')}</div>
     </div>
     <div class="wizard-cameras-dialog-fields">
@@ -1005,8 +1004,8 @@ function openAddCameraDialog(idx) {
       };
       const resp = await ApiBinary.action('cameraAddOnvifRequest', payload);
       const key = cameraRowKey(cam);
-      const cameraId = resp?.cameraId ?? resp?.camera_id ?? null;
-      const rtspUrl = resp?.rtspUrl ?? resp?.rtsp_url ?? '';
+      const cameraId = resp?.cameraId ?? null;
+      const rtspUrl = resp?.rtspUrl ?? '';
       state.cameras.added.set(key, { cameraId, rtspUrl });
       // Clear the pending guard explicitly — programmatic close(true) may not
       // dispatch close-request. After this, re-render shows the "Added" chip

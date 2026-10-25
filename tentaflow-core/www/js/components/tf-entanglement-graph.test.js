@@ -43,11 +43,6 @@ test('pairs are ordered, deduplicated by direction and filtered by weight', () =
   assert.deepEqual(edges.map((e) => `${e.a}${e.b}`), ['01', '02'], 'strongest first, no self-pair, no empty pair');
 });
 
-test('the snake_case field of the wire is read as well as the camelCase one', () => {
-  const [edge] = visibleEdges([{ qubits: [0, 1], mutual_information: 1.5, concurrence: 0.3 }]);
-  assert.equal(edge.mutualInformation, 1.5);
-});
-
 test('the element draws a wire per qubit, an arc per pair and names them', () => {
   const el = new TfEntanglementGraph();
   document.body.appendChild(el);

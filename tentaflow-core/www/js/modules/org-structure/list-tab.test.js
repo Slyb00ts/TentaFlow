@@ -30,19 +30,19 @@ const view = () => ({
   at: '2026-09-30',
   timezone: 'Europe/Warsaw',
   units: [
-    { unit_id: 'unit-board', name: 'Board', head_position_id: 'pos-ceo', deputy_head_position_ids: [] },
-    { unit_id: 'unit-it', name: 'IT', head_position_id: null, deputy_head_position_ids: [] },
+    { unitId: 'unit-board', name: 'Board', headPositionId: 'pos-ceo', deputyHeadPositionIds: [] },
+    { unitId: 'unit-it', name: 'IT', headPositionId: null, deputyHeadPositionIds: [] },
   ],
   positions: [
-    { position_id: 'pos-ceo', unit_id: 'unit-board', name: 'CEO', primary_parent_position_id: null, valid_from: '2024-01-01' },
-    { position_id: 'pos-dev', unit_id: 'unit-it', name: 'Developer', primary_parent_position_id: 'pos-ceo', valid_from: '2025-03-01' },
-    { position_id: 'pos-qa', unit_id: 'unit-it', name: 'Tester', primary_parent_position_id: 'pos-ceo', valid_from: '2026-09-20' },
-    { position_id: 'pos-ops', unit_id: 'unit-board', name: 'Assistant', primary_parent_position_id: 'pos-ceo', valid_from: '2026-01-01' },
+    { positionId: 'pos-ceo', unitId: 'unit-board', name: 'CEO', primaryParentPositionId: null, validFrom: '2024-01-01' },
+    { positionId: 'pos-dev', unitId: 'unit-it', name: 'Developer', primaryParentPositionId: 'pos-ceo', validFrom: '2025-03-01' },
+    { positionId: 'pos-qa', unitId: 'unit-it', name: 'Tester', primaryParentPositionId: 'pos-ceo', validFrom: '2026-09-20' },
+    { positionId: 'pos-ops', unitId: 'unit-board', name: 'Assistant', primaryParentPositionId: 'pos-ceo', validFrom: '2026-01-01' },
   ],
   assignments: [
-    { id: 'a-ceo', position_id: 'pos-ceo', subject: anna, display_name: 'Anna Nowak', share: 1, assignment_type: 'permanent', is_primary: true, valid_from: '2024-01-01' },
-    { id: 'a-dev', position_id: 'pos-dev', subject: jan, display_name: 'Jan Zawisza', share: 0.75, assignment_type: 'permanent', is_primary: true, valid_from: '2025-03-01' },
-    { id: 'a-qa', position_id: 'pos-qa', subject: ola, display_name: 'Ola Kowal', share: 1, assignment_type: 'contractor', is_primary: true, valid_from: '2026-09-20' },
+    { id: 'a-ceo', positionId: 'pos-ceo', subject: anna, displayName: 'Anna Nowak', share: 1, assignmentType: 'permanent', isPrimary: true, validFrom: '2024-01-01' },
+    { id: 'a-dev', positionId: 'pos-dev', subject: jan, displayName: 'Jan Zawisza', share: 0.75, assignmentType: 'permanent', isPrimary: true, validFrom: '2025-03-01' },
+    { id: 'a-qa', positionId: 'pos-qa', subject: ola, displayName: 'Ola Kowal', share: 1, assignmentType: 'contractor', isPrimary: true, validFrom: '2026-09-20' },
   ],
   vacancies: ['pos-ops'],
   warnings: [],
@@ -63,8 +63,8 @@ function stubTransport(handlers = {}) {
     return Promise.resolve(typeof handler === 'function' ? handler(payload) : handler);
   };
   ApiBinary.list = () => Promise.resolve([
-    { id: 'u-new', username: 'nowak', display_name: 'Zofia Nowak', is_active: true },
-    { id: 'u-off', username: 'off', display_name: 'Inactive One', is_active: false },
+    { id: 'u-new', username: 'nowak', displayName: 'Zofia Nowak', isActive: true },
+    { id: 'u-off', username: 'off', displayName: 'Inactive One', isActive: false },
   ]);
 }
 
@@ -390,7 +390,7 @@ test('move: with no vacant seat at all the window says so instead of offering no
   unmountListTab();
   document.body.innerHTML = '<div id="org-root"><span id="org-list-actions"></span><div id="host"></div></div>';
   const full = input();
-  full.view.assignments.push({ id: 'a-ops', position_id: 'pos-ops', subject: jan, display_name: 'Jan Ops', share: 1, assignment_type: 'permanent', is_primary: true, valid_from: '2026-01-01' });
+  full.view.assignments.push({ id: 'a-ops', positionId: 'pos-ops', subject: jan, displayName: 'Jan Ops', share: 1, assignmentType: 'permanent', isPrimary: true, validFrom: '2026-01-01' });
   full.view.vacancies = [];
   mountListTab(document.getElementById('host'), full, { reload: async () => {} });
   choose(openMenu('a-ceo'), lt('menu_move'));
@@ -423,7 +423,7 @@ test('end a vacant position sends its end from the chosen day', async () => {
   submit(lastWindow());
   await closed();
   assert.deepEqual(calls[0], { kind: 'orgPositionEndRequest', payload: { positionId: 'pos-ops', from: '2026-09-30' } });
-  stubTransport({ orgPositionCreateRequest: ok({ kind: 'position', value: { position_id: 'pos-back' } }) });
+  stubTransport({ orgPositionCreateRequest: ok({ kind: 'position', value: { positionId: 'pos-back' } }) });
   toastUndo().click();
   await sleep(10);
   assert.deepEqual(calls[1].payload, {
@@ -434,7 +434,7 @@ test('end a vacant position sends its end from the chosen day', async () => {
 test('add a position: it is created under the chosen unit and manager, then the person is assigned to it', async () => {
   await mount();
   stubTransport({
-    orgPositionCreateRequest: ok({ kind: 'position', value: { position_id: 'pos-new' } }),
+    orgPositionCreateRequest: ok({ kind: 'position', value: { positionId: 'pos-new' } }),
     orgAssignRequest: ok({ kind: 'assignment', value: { id: 'a-new' } }),
   });
   toolButton('add').click();
@@ -460,7 +460,7 @@ test('add a position: it is created under the chosen unit and manager, then the 
 
 test('add a position without a person creates a vacancy only', async () => {
   await mount();
-  stubTransport({ orgPositionCreateRequest: ok({ kind: 'position', value: { position_id: 'pos-new' } }) });
+  stubTransport({ orgPositionCreateRequest: ok({ kind: 'position', value: { positionId: 'pos-new' } }) });
   toolButton('add').click();
   await sleep(0);
   const win = lastWindow();
@@ -476,7 +476,7 @@ test('add a position without a person creates a vacancy only', async () => {
 test('add a position: a refused person does not leave the window open to create the position twice', async () => {
   await mount();
   stubTransport({
-    orgPositionCreateRequest: ok({ kind: 'position', value: { position_id: 'pos-new' } }),
+    orgPositionCreateRequest: ok({ kind: 'position', value: { positionId: 'pos-new' } }),
     orgAssignRequest: refused('assignment_overlap'),
   });
   toolButton('add').click();
@@ -570,7 +570,7 @@ test('declining the backdated confirmation sends nothing more and says so in the
 test('the server warnings of a write are shown as warning toasts', async () => {
   await mount();
   stubTransport({
-    orgAssignmentEndRequest: ok({ kind: 'done' }, [{ kind: 'unit_without_head', unit_id: 'unit-it', from: '2026-09-30' }]),
+    orgAssignmentEndRequest: ok({ kind: 'done' }, [{ kind: 'unit_without_head', unitId: 'unit-it', from: '2026-09-30' }]),
   });
   choose(openMenu('a-dev'), lt('menu_end'));
   submit(lastWindow());
@@ -584,7 +584,7 @@ test('the server warnings of a write are shown as warning toasts', async () => {
 
 test('export asks the server for the chosen format on the day shown', async () => {
   await mount([]);
-  stubTransport({ orgExportRequest: { file_name: 'org.csv', mime: 'text/csv', bytes: new Uint8Array([1]) } });
+  stubTransport({ orgExportRequest: { fileName: 'org.csv', mime: 'text/csv', bytes: new Uint8Array([1]) } });
   toolButton('export').click();
   choose(document.querySelector('tf-menu'), lt('export_csv'));
   await sleep(0);

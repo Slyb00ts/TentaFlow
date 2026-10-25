@@ -728,7 +728,7 @@ class RunResultView {
       pairs: query.pairs || [],
       amplitudes: new Map(amplitudeRows(amplitudes || {}, numQubits)
         .map((row) => [row.index, [row.re, row.im]])),
-      probs: (query.probsTop ?? query.probs_top ?? []),
+      probs: (query.probsTop ?? []),
       gate: null,
       collapsing: false,
     };
@@ -756,8 +756,8 @@ class RunResultView {
       if (dim) return { scope: 'full', matrix: { dim, rho } };
     }
     const strongest = (pairs || []).slice()
-      .sort((x, y) => (Number(y.mutualInformation ?? y.mutual_information) || 0)
-        - (Number(x.mutualInformation ?? x.mutual_information) || 0))[0];
+      .sort((x, y) => (Number(y.mutualInformation) || 0)
+        - (Number(x.mutualInformation) || 0))[0];
     if (!strongest || !strongest.rho) return null;
     const qubits = Array.from(strongest.qubits || [], Number);
     return {
@@ -838,7 +838,7 @@ class RunResultView {
   /// The convergence series of a variational run, as its tile recorded it. A
   /// run with no such tile simply has no chart — the series exists nowhere else.
   convergenceSeries() {
-    const raw = this.run.tileJson ?? this.run.tile_json;
+    const raw = this.run.tileJson;
     if (!raw) return null;
     try {
       const tile = typeof raw === 'string' ? JSON.parse(raw) : raw;
@@ -946,9 +946,9 @@ class RunResultView {
       target: run.target,
       backend: run.backend || '—',
       shots: String(Number(run.shots) || 0),
-      duration: `${Number(run.durationMs ?? run.duration_ms) || 0} ms`,
-      tvd: formatMetric(run.totalVariationDistance ?? run.total_variation_distance),
-      fidelity: formatMetric(run.hellingerFidelity ?? run.hellinger_fidelity),
+      duration: `${Number(run.durationMs) || 0} ms`,
+      tvd: formatMetric(run.totalVariationDistance),
+      fidelity: formatMetric(run.hellingerFidelity),
     }));
   }
 

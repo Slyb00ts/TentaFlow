@@ -44,25 +44,25 @@ function stub(handlers) {
 
 const counts = (over = {}) => ({
   rows: 212, added: 184, changed: 12, unchanged: 13, errors: 0,
-  units_added: 30, positions_added: 90, assignments_added: 64, units_changed: 1, positions_changed: 4, assignments_changed: 7,
-  units_ended: 0, positions_ended: 0, assignments_ended: 0, ...over,
+  unitsAdded: 30, positionsAdded: 90, assignmentsAdded: 64, unitsChanged: 1, positionsChanged: 4, assignmentsChanged: 7,
+  unitsEnded: 0, positionsEnded: 0, assignmentsEnded: 0, ...over,
 });
 
 const unknownPerson = {
   row: 47, rows: [47], column: 'person', kind: 'unknown_person', value: 'j.kowlski', message: 'no account',
-  suggestion: 'j.kowalski', suggestion_label: 'Jan Kowalski',
+  suggestion: 'j.kowalski', suggestionLabel: 'Jan Kowalski',
 };
 const cycle = { row: 89, rows: [88, 89], column: 'parent_code', kind: 'unit_cycle', message: 'cycle' };
 const twoHeads = { row: 134, rows: [131, 134], column: 'head', kind: 'two_heads', message: 'heads' };
 
 const report = (over = {}) => ({
-  mode: 'upsert', as_of: DAY, preview_at: DAY, applied: false, file_error: null, counts: counts(),
+  mode: 'upsert', asOf: DAY, previewAt: DAY, applied: false, fileError: null, counts: counts(),
   rows: [
-    { row: 2, status: 'added', unit_code: 'IT', position_code: 'IT-1', person: 'anna', position_id: 'p-1', changes: [{ entity: 'assignment', field: 'created', before: null, after: null }] },
-    { row: 3, status: 'changed', unit_code: 'IT', position_code: 'IT-2', person: 'jan', position_id: 'p-2', changes: [{ entity: 'position', field: 'manager', before: 'IT-9', after: 'IT-1' }] },
-    { row: 47, status: 'error', unit_code: 'IT', position_code: 'IT-3', person: 'j.kowlski', position_id: 'p-3', changes: [] },
+    { row: 2, status: 'added', unitCode: 'IT', positionCode: 'IT-1', person: 'anna', positionId: 'p-1', changes: [{ entity: 'assignment', field: 'created', before: null, after: null }] },
+    { row: 3, status: 'changed', unitCode: 'IT', positionCode: 'IT-2', person: 'jan', positionId: 'p-2', changes: [{ entity: 'position', field: 'manager', before: 'IT-9', after: 'IT-1' }] },
+    { row: 47, status: 'error', unitCode: 'IT', positionCode: 'IT-3', person: 'j.kowlski', positionId: 'p-3', changes: [] },
   ],
-  errors: [], warnings: [], preview: null, preview_partial: false, ...over,
+  errors: [], warnings: [], preview: null, previewPartial: false, ...over,
 });
 
 const withErrors = () => report({ counts: counts({ errors: 3 }), errors: [unknownPerson, cycle, twoHeads] });
@@ -70,11 +70,11 @@ const withErrors = () => report({ counts: counts({ errors: 3 }), errors: [unknow
 const preview = () => ({
   at: DAY,
   timezone: 'Europe/Warsaw',
-  units: [{ unit_id: 'u-it', name: 'IT', head_position_id: 'p-1', deputy_head_position_ids: [] }],
+  units: [{ unitId: 'u-it', name: 'IT', headPositionId: 'p-1', deputyHeadPositionIds: [] }],
   positions: [
-    { position_id: 'p-1', unit_id: 'u-it', name: 'Head', primary_parent_position_id: null, valid_from: DAY },
-    { position_id: 'p-2', unit_id: 'u-it', name: 'Dev', primary_parent_position_id: 'p-1', valid_from: DAY },
-    { position_id: 'p-3', unit_id: 'u-it', name: 'QA', primary_parent_position_id: 'p-1', valid_from: DAY },
+    { positionId: 'p-1', unitId: 'u-it', name: 'Head', primaryParentPositionId: null, validFrom: DAY },
+    { positionId: 'p-2', unitId: 'u-it', name: 'Dev', primaryParentPositionId: 'p-1', validFrom: DAY },
+    { positionId: 'p-3', unitId: 'u-it', name: 'QA', primaryParentPositionId: 'p-1', validFrom: DAY },
   ],
   assignments: [], vacancies: [], warnings: [],
 });
@@ -349,7 +349,7 @@ test('a row the report carries no cells for says so instead of showing nothing',
 test('the error report is requested with the very same run and downloaded', async () => {
   stub({
     orgImportDryRunRequest: withErrors(),
-    orgExportErrorsRequest: { file_name: 'errors.csv', mime: 'text/csv', bytes: new Uint8Array([9]) },
+    orgExportErrorsRequest: { fileName: 'errors.csv', mime: 'text/csv', bytes: new Uint8Array([9]) },
   });
   open();
   await chooseFile();
@@ -366,7 +366,7 @@ test('the error report is requested with the very same run and downloaded', asyn
 
 const replaceReport = () => report({
   mode: 'replace',
-  counts: counts({ errors: 1, units_ended: 2, positions_ended: 5, assignments_ended: 4 }),
+  counts: counts({ errors: 1, unitsEnded: 2, positionsEnded: 5, assignmentsEnded: 4 }),
   // As the server answers a replace that ends things and was not confirmed: one "error" that is the question.
   errors: [{ row: 0, rows: [], kind: 'ended_confirmation_required', message: 'confirm' }],
   ended: [
@@ -511,7 +511,7 @@ test('a file that is neither CSV nor XLSX is refused before it is sent', async (
 });
 
 test('an unusable file is a sentence about the file, with the missing column named', async () => {
-  stub({ orgImportDryRunRequest: report({ file_error: { code: 'missing_column', message: 'x', field: 'unit_code' }, counts: counts({ rows: 0 }) }) });
+  stub({ orgImportDryRunRequest: report({ fileError: { code: 'missing_column', message: 'x', field: 'unit_code' }, counts: counts({ rows: 0 }) }) });
   open();
   await chooseFile();
   assert.equal(q('report').hidden, true);
@@ -520,7 +520,7 @@ test('an unusable file is a sentence about the file, with the missing column nam
 });
 
 test('a file error this build has no sentence for still names its code', async () => {
-  stub({ orgImportDryRunRequest: report({ file_error: { code: 'error_from_the_future', message: 'x' } }) });
+  stub({ orgImportDryRunRequest: report({ fileError: { code: 'error_from_the_future', message: 'x' } }) });
   open();
   await chooseFile();
   assert.equal(q('status').querySelector('tf-alert').getAttribute('message'), it('file_error_unknown', { code: 'error_from_the_future' }));
@@ -559,7 +559,7 @@ test('an answer to an earlier run never overwrites the report of a later one', a
 // --- the preview -----------------------------------------------------------------------------------------------------------------
 
 test('the preview draws the tree the file leaves, marking added, changed and to-correct positions', async () => {
-  stub({ orgImportDryRunRequest: report({ counts: counts({ errors: 1 }), errors: [cycle], preview: preview(), preview_partial: true }) });
+  stub({ orgImportDryRunRequest: report({ counts: counts({ errors: 1 }), errors: [cycle], preview: preview(), previewPartial: true }) });
   open();
   await chooseFile();
   const chart = win.querySelector('tf-org-tree');

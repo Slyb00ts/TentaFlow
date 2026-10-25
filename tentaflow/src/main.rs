@@ -210,7 +210,11 @@ fn serve(args: Args) -> Result<()> {
         builder.worker_threads(worker_threads);
     }
     let runtime = builder.build()?;
-    runtime.block_on(run_server(args))
+    let result = runtime.block_on(run_server(args));
+    // Dropping a runtime waits for every blocking task without limit; one stuck
+    // in a syscall (disk, DNS) would leave a stopped node alive for good.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    result
 }
 
 /// Best-effort read of `[server].worker_threads` from the config file before the
@@ -496,6 +500,14 @@ async fn run_server(args: Args) -> Result<()> {
             match tentaflow_core::addon::storage_sql_exec::drain_installed_sql_captures(&db, 1000) {
                 Ok(drained) => info!("Sync Ledger drained {} pending SQL captures", drained),
                 Err(e) => error!("Sync Ledger SQL capture drain failed: {}", e),
+            }
+            match db::repository::backfill_model_alias_captures(&db) {
+                Ok(captured) if captured > 0 => info!(
+                    "Sync Ledger captured {} model aliases that predate the ledger",
+                    captured
+                ),
+                Ok(_) => {}
+                Err(e) => error!("Sync Ledger model alias backfill failed: {}", e),
             }
             match tentaflow_core::sync::core_capture::drain_pending_core_captures(&db, 1000) {
                 Ok(drained) => info!("Sync Ledger drained {} pending core captures", drained),
@@ -1130,32 +1142,6 @@ async fn run_server(args: Args) -> Result<()> {
                                 local_node_id: mesh_mgr.node_id(),
                             },
                         );
-
-                        // Obsluga przychodzacych alias sync od zdalnych nodow
-                        let router_for_alias = router.clone();
-                        let mut alias_rx = mesh_mgr.subscribe();
-                        tokio::spawn(async move {
-                            loop {
-                                match alias_rx.recv().await {
-                                    Ok(tentaflow_core::mesh::iroh_manager::IrohMeshEvent::AliasSyncReceived { from_node_id, data }) => {
-                                        match serde_json::from_slice::<Vec<tentaflow_core::db::models::DbModelAlias>>(&data) {
-                                            Ok(aliases) => {
-                                                tracing::debug!(from = %from_node_id, count = aliases.len(), "Alias cache zsynchronizowany z peera");
-                                                router_for_alias.update_alias_cache_from_sync(aliases);
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(from = %from_node_id, "Blad deserializacji AliasSync: {}", e);
-                                            }
-                                        }
-                                    }
-                                    Ok(_) => {}
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                        tracing::warn!("Alias sync listener opuscil {} wiadomosci", n);
-                                    }
-                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                                }
-                            }
-                        });
 
                         info!("Mesh routing podlaczony do routera");
                     }

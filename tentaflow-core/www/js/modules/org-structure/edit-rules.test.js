@@ -32,8 +32,8 @@ test('a person holding two seats inside the branch is counted once', () => {
   const view = sampleView();
   // Marek Nowak now also sits under the lead: still one person.
   view.assignments.push({
-    id: 'a-extra', position_id: 'p-tester-auto', subject: { kind: 'external', id: 'm-nowak' }, assignment_type: 'permanent',
-    share: 0.2, is_primary: false, valid_from: '2026-01-01', display_name: 'Marek Nowak',
+    id: 'a-extra', positionId: 'p-tester-auto', subject: { kind: 'external', id: 'm-nowak' }, assignmentType: 'permanent',
+    share: 0.2, isPrimary: false, validFrom: '2026-01-01', displayName: 'Marek Nowak',
   });
   assert.equal(reparentImpact(buildTreeModel(view, { t }), 'p-lead').people, 5);
 });
@@ -112,14 +112,14 @@ test('deputy heads are reordered in a copy, and a move that goes nowhere changes
 test('the seats a unit can still give to a head or a deputy exclude the two roles already filled', () => {
   const view = sampleView();
   assert.deepEqual(unitSeatCandidates(view, 'u-tech'), [], 'the head and the one deputy fill Technologia');
-  const delivery = unitSeatCandidates(view, 'u-delivery').map((p) => p.position_id);
+  const delivery = unitSeatCandidates(view, 'u-delivery').map((p) => p.positionId);
   assert.equal(delivery.includes('p-delivery'), false, 'the head is taken');
   assert.equal(delivery.includes('p-lead'), true);
 });
 
 test('people without a position are the active accounts nobody holds a seat for', () => {
   const view = sampleView();
-  view.assignments.push({ id: 'a-u', position_id: 'p-tester-auto', subject: { kind: 'user', id: 'u-held' }, assignment_type: 'permanent', share: 1, is_primary: true, valid_from: '2026-01-01', display_name: 'Held' });
+  view.assignments.push({ id: 'a-u', positionId: 'p-tester-auto', subject: { kind: 'user', id: 'u-held' }, assignmentType: 'permanent', share: 1, isPrimary: true, validFrom: '2026-01-01', displayName: 'Held' });
   const users = [
     { id: 'u-held', name: 'Held', isActive: true },
     { id: 'u-free', name: 'Free', isActive: true },

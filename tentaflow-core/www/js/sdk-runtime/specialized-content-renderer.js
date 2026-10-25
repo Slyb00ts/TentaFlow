@@ -257,7 +257,8 @@ function renderPdfViewer(component, ctx) {
   wrapper.setAttribute('data-searchable', String(searchable));
   if (pagePath != null) wrapper.setAttribute('data-page-path', JSON.stringify(pagePath));
 
-  // PDF rendering is delegated to platform adapter; embed via <object>.
+  // An <iframe>, not <object>: the dashboard CSP sets object-src 'none', which
+  // blocks every <object>/<embed>, while the browser's PDF viewer loads fine in a frame.
   if (/^javascript:/i.test(srcRef.trim())) {
     const err = document.createElement('div');
     err.classList.add('tf-pdf-viewer__blocked');
@@ -266,18 +267,12 @@ function renderPdfViewer(component, ctx) {
     return wrapper;
   }
 
-  const obj = document.createElement('object');
-  obj.classList.add('tf-pdf-viewer__object');
-  obj.type = 'application/pdf';
-  obj.data = srcRef;
-  obj.style.width = '100%';
-  obj.style.height = '100%';
-
-  const fallback = document.createElement('p');
-  fallback.classList.add('tf-pdf-viewer__fallback');
-  fallback.textContent = 'PDF cannot be displayed.';
-  obj.appendChild(fallback);
-  wrapper.appendChild(obj);
+  const frame = document.createElement('iframe');
+  frame.classList.add('tf-pdf-viewer__frame');
+  frame.src = srcRef;
+  frame.style.width = '100%';
+  frame.style.height = '100%';
+  wrapper.appendChild(frame);
   return wrapper;
 }
 

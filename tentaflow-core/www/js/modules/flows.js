@@ -91,7 +91,7 @@ async function load() {
   try {
     const response = selectedMode === 'bpmn'
       ? await ApiBinary.one('processDefinitionListRequest', { offset: state.offset, limit: 25 })
-      : await ApiBinary.list('flowListRequest');
+      : await ApiBinary.list('flowListRequest', { arrayKey: 'flows' });
     if (mounted !== state || generation !== state.generation || !state.host.isConnected) return;
     flows = selectedMode === 'bpmn' ? response.definitions : response;
     renderTable(selectedMode === 'bpmn' ? response.total : flows.length);
@@ -134,7 +134,7 @@ function renderRow(f) {
     statusHtml: `<tf-chip status="${f.archived ? 'neutral' : 'info'}">${escapeHtml(I18n.t(f.archived ? 'bpmn.archived' : 'bpmn.draft'))}</tf-chip>`,
     versionLabel: f.publishedVersion === null ? I18n.t('bpmn.not_published') : I18n.t('bpmn.version_number', { version: f.publishedVersion }) };
   const status = f.status || (f.enabled ? 'active' : 'draft');
-  const updated = f.updatedAtEpoch || f.updated_at_epoch || f.updated_at;
+  const updated = f.updatedAtEpoch;
   // The server rejects edit/delete/status changes on a system flow, so the row
   // offers only a read-only preview and no delete action.
   const isSystem = !!f.isSystem;
@@ -215,7 +215,7 @@ async function newFlow() {
       // nested, not flat x/y).
       graphJson: '{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}}],"edges":[]}',
     });
-    const id = resp?.flowId ?? resp?.flow_id;
+    const id = resp?.flowId;
     if (!id) throw new Error(I18n.t('flows.create_error_missing_id'));
     openFlowBuilder(id);
   } catch (err) {

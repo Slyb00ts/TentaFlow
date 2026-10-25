@@ -14,6 +14,7 @@ import {
   formatDateTime,
   formatDurationNs,
   escape,
+  deepSnakeKeys,
 } from '/js/modules/profile-report-helpers.js';
 import { profilingReport } from '/js/protocol/profiling.js';
 import { I18n } from '/js/i18n.js';
@@ -59,7 +60,7 @@ function unpackReport(raw) {
   if (!raw || typeof raw !== 'object') return null;
   if (raw.report && typeof raw.report === 'object') return raw.report;
   if ('V2' in raw && raw.V2) return raw.V2;
-  if (raw.schema_version === 2 || raw.schemaVersion === 2) return raw;
+  if (raw.schema_version === 2) return raw;
   return null;
 }
 
@@ -94,8 +95,8 @@ export class ProfileCompareView {
       return;
     }
 
-    const repA = unpackReport(raw.a);
-    const repB = unpackReport(raw.b);
+    const repA = unpackReport(deepSnakeKeys(raw.a));
+    const repB = unpackReport(deepSnakeKeys(raw.b));
     if (!repA || !repB) {
       container.innerHTML = renderError(new Error(ti('profiling.report.err_compare_v2_required', null, 'Compare requires both reports in V2 schema.')));
       bindBack(container);

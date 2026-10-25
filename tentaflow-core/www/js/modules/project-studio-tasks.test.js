@@ -16,37 +16,37 @@ test('project prefix suggestion matches the persisted prefix rules before reserv
 
 test('custom and inactive type names stay intact while built-ins are translated', () => {
   const types = [
-    { type_id: 'custom', name: 'Customer <review>', description: 'Actual description', active: false, built_in: false, sort_order: 5 },
-    { type_id: 'feature', name: 'Feature', description: 'Default', active: true, built_in: true, sort_order: 0 },
-    { type_id: 'technical', name: 'Technical', active: true, built_in: true, sort_order: 10 },
+    { typeId: 'custom', name: 'Customer <review>', description: 'Actual description', active: false, builtIn: false, sortOrder: 5 },
+    { typeId: 'feature', name: 'Feature', description: 'Default', active: true, builtIn: true, sortOrder: 0 },
+    { typeId: 'technical', name: 'Technical', active: true, builtIn: true, sortOrder: 10 },
   ];
   assert.equal(taskTypeLabel(types[0], translate), 'Customer <review>');
   assert.equal(taskTypeDescription(types[0], translate), 'Actual description');
   assert.equal(taskTypeLabel(types[1], translate), 'task_type_feature');
-  assert.deepEqual(activeTaskTypes(types).map((type) => type.type_id), ['feature', 'technical']);
-  assert.deepEqual(activeTaskTypes(types, 'custom').map((type) => type.type_id), ['feature', 'custom', 'technical']);
+  assert.deepEqual(activeTaskTypes(types).map((type) => type.typeId), ['feature', 'technical']);
+  assert.deepEqual(activeTaskTypes(types, 'custom').map((type) => type.typeId), ['feature', 'custom', 'technical']);
 });
 
 test('parent choices exclude archived and self and limit normal tasks to epics', () => {
   const rows = [
-    { task_id: 'self', task_type: 'epic' },
-    { task_id: 'epic', task_type: 'epic' },
-    { task_id: 'feature', task_type: 'feature' },
-    { task_id: 'subtask', task_type: 'subtask' },
-    { task_id: 'archived', task_type: 'epic', archived_at: '2026-10-01' },
+    { taskId: 'self', taskType: 'epic' },
+    { taskId: 'epic', taskType: 'epic' },
+    { taskId: 'feature', taskType: 'feature' },
+    { taskId: 'subtask', taskType: 'subtask' },
+    { taskId: 'archived', taskType: 'epic', archivedAt: '2026-10-01' },
   ];
-  assert.deepEqual(parentCandidates(rows, 'feature', 'self').map((task) => task.task_id), ['epic']);
-  assert.deepEqual(parentCandidates(rows, 'subtask', 'self').map((task) => task.task_id), ['epic', 'feature']);
+  assert.deepEqual(parentCandidates(rows, 'feature', 'self').map((task) => task.taskId), ['epic']);
+  assert.deepEqual(parentCandidates(rows, 'subtask', 'self').map((task) => task.taskId), ['epic', 'feature']);
   assert.deepEqual(parentCandidates(rows, 'epic', 'self'), []);
 });
 
 test('removed attachment metadata remains available from recorded before and after values', () => {
   const old = { sha256: 'a'.repeat(64), name: 'Original <file>.avi', mime: 'video/x-msvideo', size_bytes: 90000000 };
   const current = { ...old, sha256: 'b'.repeat(64), name: 'New image.png' };
-  const event = { kind: 'attachments_json', before_json: JSON.stringify(JSON.stringify([old])), after_json: JSON.stringify(JSON.stringify([old, current])) };
+  const event = { kind: 'attachments_json', beforeJson: JSON.stringify(JSON.stringify([old])), afterJson: JSON.stringify(JSON.stringify([old, current])) };
   assert.deepEqual(taskEventAttachments(event), [old, current]);
-  assert.deepEqual(taskEventAttachments({ kind: 'created', before_json: 'null', after_json: JSON.stringify({ attachments_json: JSON.stringify([old]) }) }), [old]);
-  assert.deepEqual(taskEventAttachments({ kind: 'title', before_json: '"Before"', after_json: '"After"' }), []);
+  assert.deepEqual(taskEventAttachments({ kind: 'created', beforeJson: 'null', afterJson: JSON.stringify({ attachments_json: JSON.stringify([old]) }) }), [old]);
+  assert.deepEqual(taskEventAttachments({ kind: 'title', beforeJson: '"Before"', afterJson: '"After"' }), []);
 });
 
 test('status durations use recorded seconds and history uses structural person identities', () => {
@@ -90,11 +90,11 @@ test('history uses authorized record labels and translated values without intern
 });
 
 test('historical record resolution collects only structural task and project endpoints', () => {
-  assert.deepEqual(taskEventReferences({ kind: 'parent_task_id', before_json: '"previous"', after_json: '"current"' }), { tasks: ['previous', 'current'], projects: [] });
-  assert.deepEqual(taskEventReferences({ kind: 'link_deleted', before_json: '{"source_task_id":"source","target_task_id":"target","link_id":42}', after_json: 'null' }), { tasks: ['source', 'target'], projects: [] });
-  assert.deepEqual(taskEventReferences({ kind: 'created', before_json: 'null', after_json: '{"parent_task_id":"parent","comment_id":"private-comment","title":"User text"}' }), { tasks: ['parent'], projects: [] });
-  assert.deepEqual(taskEventReferences({ kind: 'transferred', before_json: '{"project_id":"previous-project","operation_id":"not-a-project"}', after_json: '{"project_id":"current-project","task_key":"CH-1"}' }), { tasks: [], projects: ['previous-project', 'current-project'] });
-  assert.deepEqual(taskEventReferences({ kind: 'comment_deleted', before_json: '{"comment_id":"private-comment"}', after_json: 'null' }), { tasks: [], projects: [] });
+  assert.deepEqual(taskEventReferences({ kind: 'parent_task_id', beforeJson: '"previous"', afterJson: '"current"' }), { tasks: ['previous', 'current'], projects: [] });
+  assert.deepEqual(taskEventReferences({ kind: 'link_deleted', beforeJson: '{"source_task_id":"source","target_task_id":"target","link_id":42}', afterJson: 'null' }), { tasks: ['source', 'target'], projects: [] });
+  assert.deepEqual(taskEventReferences({ kind: 'created', beforeJson: 'null', afterJson: '{"parent_task_id":"parent","comment_id":"private-comment","title":"User text"}' }), { tasks: ['parent'], projects: [] });
+  assert.deepEqual(taskEventReferences({ kind: 'transferred', beforeJson: '{"project_id":"previous-project","operation_id":"not-a-project"}', afterJson: '{"project_id":"current-project","task_key":"CH-1"}' }), { tasks: [], projects: ['previous-project', 'current-project'] });
+  assert.deepEqual(taskEventReferences({ kind: 'comment_deleted', beforeJson: '{"comment_id":"private-comment"}', afterJson: 'null' }), { tasks: [], projects: [] });
 });
 
 test('task notifications use structured keys and translated status names in every supported language', () => {
@@ -105,14 +105,14 @@ test('task notifications use structured keys and translated status names in ever
       assert.equal(typeof dictionary[key], 'string', `${locale}: ${key}`);
       return dictionary[key].replace(/\{(\w+)\}/g, (match, name) => String(fields[name]));
     };
-    const text = taskNotificationText({ kind: 'task_status_changed', title: 'Untranslated server text', body: 'Old body', link_json: JSON.stringify(link) }, localized);
+    const text = taskNotificationText({ kind: 'task_status_changed', title: 'Untranslated server text', body: 'Old body', linkJson: JSON.stringify(link) }, localized);
     assert.equal(text.title, dictionary.nk_task_status_changed);
     assert.match(text.body, /WF-12 · Review <contract>/);
     assert.ok(text.body.includes(dictionary.task_status_todo));
     assert.ok(text.body.includes(dictionary.task_status_in_progress));
     assert.equal(text.body.includes('Untranslated server text'), false);
     for (const kind of ['task_assigned', 'task_reassigned', 'task_unassigned', 'task_mentioned', 'task_handed_over', 'task_handed_back']) {
-      const result = taskNotificationText({ kind, title: 'Unlocalized server title', body: 'Unlocalized server body', link_json: JSON.stringify({ ...link, to_user_id: kind === 'task_unassigned' ? '' : link.to_user_id }) }, localized);
+      const result = taskNotificationText({ kind, title: 'Unlocalized server title', body: 'Unlocalized server body', linkJson: JSON.stringify({ ...link, to_user_id: kind === 'task_unassigned' ? '' : link.to_user_id }) }, localized);
       assert.equal(result.title, dictionary[`nk_${kind}`]);
       assert.equal(result.body, 'WF-12 · Review <contract>');
       assert.equal(result.title.includes('Unlocalized server'), false);
@@ -152,17 +152,17 @@ test('organization notifications are worded from their facts in every supported 
       assert.equal(typeof dictionary[key], 'string', `${locale}: ${key}`);
       return dictionary[key].replace(/\{(\w+)\}/g, (match, name) => String(fields[name]));
     };
-    const handover = orgNotificationText({ kind: 'work_handed_over', title: 'Server title', body: 'Server body', link_json: JSON.stringify({ from_name: 'Anna', count: 3, return_on: '', note: 'Back soon' }) }, localized);
+    const handover = orgNotificationText({ kind: 'work_handed_over', title: 'Server title', body: 'Server body', linkJson: JSON.stringify({ from_name: 'Anna', count: 3, return_on: '', note: 'Back soon' }) }, localized);
     assert.equal(handover.title, dictionary.nk_work_handed_over);
     assert.ok(handover.body.includes('Anna') && handover.body.includes('Back soon'));
     assert.equal(handover.body.includes('Server body'), false);
-    const until = orgNotificationText({ kind: 'work_handed_over', link_json: JSON.stringify({ from_name: 'Anna', count: 1, return_on: '2026-11-02', note: 'n' }) }, localized);
+    const until = orgNotificationText({ kind: 'work_handed_over', linkJson: JSON.stringify({ from_name: 'Anna', count: 1, return_on: '2026-11-02', note: 'n' }) }, localized);
     assert.ok(until.body.includes('2026-11-02'));
     for (const kind of ['deputy_appointed', 'deputy_ended']) {
-      const open = orgNotificationText({ kind, link_json: JSON.stringify({ who: 'Boris', from: '2026-10-10', until: null, scope: 'all' }) }, localized);
+      const open = orgNotificationText({ kind, linkJson: JSON.stringify({ who: 'Boris', from: '2026-10-10', until: null, scope: 'all' }) }, localized);
       assert.equal(open.title, dictionary[`nk_${kind}`]);
       assert.ok(open.body.includes('Boris') && open.body.includes('2026-10-10') && open.body.includes('all'));
-      const bounded = orgNotificationText({ kind, link_json: JSON.stringify({ who: 'Boris', from: '2026-10-10', until: '2026-10-20', scope: 'all' }) }, localized);
+      const bounded = orgNotificationText({ kind, linkJson: JSON.stringify({ who: 'Boris', from: '2026-10-10', until: '2026-10-20', scope: 'all' }) }, localized);
       assert.ok(bounded.body.includes('2026-10-20'));
     }
   }

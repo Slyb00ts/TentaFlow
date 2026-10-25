@@ -146,7 +146,7 @@ test.describe('sdk-showcase — panel open & Live tab', () => {
     await expect(counter).toHaveText('1');
 
     // Navigate away (sends PanelClose) and back (fresh PanelOpen + epoch).
-    await page.locator('.sidebar .nav-item[data-view="dashboard"]').click();
+    await page.locator('.sidebar .nav-item[data-view="apps-home"]').click();
     await expect(page.locator('.addon-app-shell')).toHaveCount(0);
     await openPanelFromAppsMenu(page);
     await waitForLiveTab(page);

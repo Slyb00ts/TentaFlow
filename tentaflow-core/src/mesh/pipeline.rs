@@ -309,6 +309,20 @@ pub async fn start_mesh_pipeline(
                         Ok(None) => {}
                         Err(e) => warn!("baseline adopt: odczyt stanu wznowienia nieudany: {}", e),
                     }
+                    // A merge that committed but whose reseed failed stays at
+                    // `Imported`; retry until the sync runtime is up and it finishes.
+                    for _ in 0..24 {
+                        match crate::sync::core_baseline::resume_imported_adopt(&db) {
+                            Ok(resumed) => {
+                                if resumed {
+                                    info!("baseline adopt: dokonczono post-commit po restarcie");
+                                }
+                                break;
+                            }
+                            Err(e) => debug!("baseline adopt: wznowienie post-commit odroczone: {}", e),
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
                 });
             }
 
@@ -2869,51 +2883,6 @@ fn spawn_quic_event_handler(
                         }
                     }
                 }
-                Ok(IrohMeshEvent::AliasSyncReceived { from_node_id, data }) => {
-                    let is_trusted = match &mesh_security {
-                        Some(sec) => sec.is_trusted(&from_node_id),
-                        None => false,
-                    };
-                    if !is_trusted {
-                        debug!(peer = %from_node_id, "AliasSync od niezaufanego — ignoruje");
-                        continue;
-                    }
-                    let Some(ref pool) = db_pool else {
-                        debug!(peer = %from_node_id, "AliasSync bez db_pool — pomijam");
-                        continue;
-                    };
-                    match serde_json::from_slice::<Vec<crate::db::models::DbModelAlias>>(&data) {
-                        Ok(aliases) => {
-                            match crate::db::repository::replace_model_aliases_from_sync(
-                                pool, &aliases,
-                            ) {
-                                Ok(()) => {
-                                    debug!(
-                                        peer = %from_node_id,
-                                        count = aliases.len(),
-                                        "AliasSync: snapshot aliasow zapisany"
-                                    );
-                                    // Odswiez stan in-memory routera. Odbior synca
-                                    // NIE re-broadcastuje (anty-petla) — dlatego nie
-                                    // uzywamy broadcast_alias_mutation.
-                                    if let Some(router) = crate::routing::router::active_router() {
-                                        router.update_alias_cache_from_sync(aliases);
-                                        router.rebuild_catalog();
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        peer = %from_node_id,
-                                        "AliasSync: blad zapisu snapshotu: {}", e
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(peer = %from_node_id, "AliasSync decode error: {}", e);
-                        }
-                    }
-                }
                 Ok(IrohMeshEvent::RoutingSyncReceived { from_node_id, data }) => {
                     // Obsolete: clusters travel on the Sync Ledger now
                     // (`core.cluster` / `core.cluster_member`). The snapshot this
@@ -4191,11 +4160,43 @@ fn hex_to_node_id(node_id_hex: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
+/// Scheduler ticks (5 s each) between two anti-entropy rounds.
+const ANTI_ENTROPY_EVERY_TICKS: u32 = 12;
+
+/// Journal rows converted per scheduler round; a full batch schedules another.
+const CORE_CAPTURE_DRAIN_BATCH: usize = 256;
+
+/// Pause between a wake-up and the round it triggers: lets the writer's
+/// transaction commit and folds a burst of writes into one round.
+const SYNC_WAKE_DEBOUNCE: Duration = Duration::from_millis(150);
+
 fn spawn_sync_repair_scheduler(qm: Arc<IrohMeshManager>, mesh_security: Arc<MeshSecurity>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut ticks = 0u32;
         loop {
-            interval.tick().await;
+            // The tick drives retries, backoff expiry and anti-entropy; a wake-up
+            // (fresh write, ACK with backlog left, open gap) runs a round at once.
+            let woken = tokio::select! {
+                _ = interval.tick() => false,
+                _ = crate::sync::runtime::push_scheduler_woken() => true,
+            };
+            if woken {
+                tokio::time::sleep(SYNC_WAKE_DEBOUNCE).await;
+            } else {
+                // Repairs are otherwise opened only by a push that shows a gap, so an
+                // idle node that missed ops would never ask for them. Once a minute
+                // every connected peer is asked for each chain it may hold past ours.
+                if ticks % ANTI_ENTROPY_EVERY_TICKS == 0 {
+                    let authors = mesh_security.trusted_node_ids_snapshot();
+                    for peer_id in qm.connected_peers().await {
+                        if mesh_security.is_trusted(&peer_id) {
+                            crate::sync::runtime::queue_anti_entropy_repairs(&peer_id, &authors);
+                        }
+                    }
+                }
+                ticks = ticks.wrapping_add(1);
+            }
             run_sync_repair_scheduler_tick_with(
                 qm.as_ref(),
                 mesh_security.as_ref(),
@@ -4206,6 +4207,37 @@ fn spawn_sync_repair_scheduler(qm: Arc<IrohMeshManager>, mesh_security: Arc<Mesh
             )
             .await;
         }
+    });
+}
+
+static PERMISSION_BACKFILL_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Re-enqueues already-minted ops to receivers that gained access after the mint
+/// (a grant only bumps the permission epoch). The pass walks the whole ledger, so
+/// it runs on the blocking pool with one pass in flight at a time: inline it held
+/// every push behind it for as long as the ledger was long. What it enqueues wakes
+/// the scheduler, so the entries still leave within a debounce window.
+fn spawn_permission_backfill() {
+    use std::sync::atomic::Ordering;
+    if PERMISSION_BACKFILL_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    tokio::task::spawn_blocking(|| {
+        match crate::sync::runtime::backfill_outbox_for_permission_grants() {
+            Ok(Some(count)) if count > 0 => {
+                debug!(
+                    "sync repair: permission backfill re-enqueued {} outbox entries",
+                    count
+                );
+            }
+            Ok(_) => {}
+            Err(e) => warn!("sync repair: permission backfill failed: {}", e),
+        }
+        PERMISSION_BACKFILL_RUNNING.store(false, Ordering::Release);
     });
 }
 
@@ -4232,24 +4264,14 @@ pub(crate) async fn run_sync_repair_scheduler_tick_with<BuildPush, BuildRepairs>
     // instead of waiting for the next restart's startup drain. SQL/KV/blob
     // captures publish immediately after commit, so they are intentionally not
     // drained here to avoid double-emitting the same operation.
-    if let Err(e) = crate::sync::runtime::drain_pending_core_captures_online(256) {
-        warn!("sync repair: core capture drain failed: {}", e);
-    }
-    // Re-enqueue already-minted ops to receivers that gained access after the mint.
-    // A grant only bumps the permission epoch; without this the receiver — which may
-    // hold the position as a partition-less redacted placeholder — could never pull
-    // the full op. Runs before the per-peer push below so the backfilled entries ship
-    // in the same tick. Cheap when no epoch advanced.
-    match crate::sync::runtime::backfill_outbox_for_permission_grants() {
-        Ok(Some(count)) if count > 0 => {
-            debug!(
-                "sync repair: permission backfill re-enqueued {} outbox entries",
-                count
-            );
+    match crate::sync::runtime::drain_pending_core_captures_online(CORE_CAPTURE_DRAIN_BATCH) {
+        Ok(Some(drained)) if drained >= CORE_CAPTURE_DRAIN_BATCH => {
+            crate::sync::runtime::wake_push_scheduler();
         }
         Ok(_) => {}
-        Err(e) => warn!("sync repair: permission backfill failed: {}", e),
+        Err(e) => warn!("sync repair: core capture drain failed: {}", e),
     }
+    spawn_permission_backfill();
     let peers = qm.connected_peers().await;
     for peer_id in peers {
         if !mesh_security.is_trusted(&peer_id) {

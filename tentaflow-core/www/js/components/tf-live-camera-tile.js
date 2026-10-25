@@ -132,7 +132,7 @@ class TfLiveCameraTile extends HTMLElement {
         cameraId,
         ttlSecs: ttl,
       });
-      const url = String(res?.signedUrl ?? res?.signed_url ?? '').trim();
+      const url = String(res?.signedUrl ?? '').trim();
       if (!url) throw new Error('empty signedUrl');
       this._applyUrl(url);
       this._scheduleRefresh((ttl * 1000) / 2);

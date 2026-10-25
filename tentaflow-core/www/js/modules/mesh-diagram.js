@@ -44,8 +44,8 @@ export function renderDiagram(nodes) {
     `;
   }
 
-  const local = nodes.find(n => n.is_local || n.source === 'local');
-  const peers = nodes.filter(n => !(n.is_local || n.source === 'local'));
+  const local = nodes.find(n => n.isLocal || n.source === 'local');
+  const peers = nodes.filter(n => !(n.isLocal || n.source === 'local'));
 
   const W = WORLD_W;
   const H = WORLD_H;
@@ -56,7 +56,7 @@ export function renderDiagram(nodes) {
   const onlinePeers = peers.filter(isOnline);
   const offlinePeers = peers.filter(p => !isOnline(p));
   const positions = new Map();
-  if (local) positions.set(local.node_id, { x: cx, y: cy });
+  if (local) positions.set(local.nodeId, { x: cx, y: cy });
 
   const placeCircular = (list, radius) => {
     const count = list.length;
@@ -64,7 +64,7 @@ export function renderDiagram(nodes) {
     const step = (Math.PI * 2) / count;
     list.forEach((p, i) => {
       const angle = -Math.PI / 2 + i * step;
-      positions.set(p.node_id, {
+      positions.set(p.nodeId, {
         x: cx + radius * Math.cos(angle),
         y: cy + radius * Math.sin(angle),
       });
@@ -76,18 +76,18 @@ export function renderDiagram(nodes) {
   // Krawedzie — RYSUJEMY TYLKO miedzy zaufanymi (sparowanymi) nodami.
   // Discovered-but-not-paired pokazuja sie jako pojedyncze kropki bez krawedzi.
   // Wieloskok: hop (posredni) TEZ musi byc trusted, inaczej nie ma sparowanej sciezki.
-  const isTrusted = (n) => n && (n.source === 'trusted' || n.is_local || n.source === 'local');
+  const isTrusted = (n) => n && (n.source === 'trusted' || n.isLocal || n.source === 'local');
   const edges = [];
   for (const p of peers) {
     if (!isTrusted(p)) continue;
-    const to = positions.get(p.node_id);
+    const to = positions.get(p.nodeId);
     if (!to) continue;
     const route = p.route;
     if (!route || route.hops == null) continue;
-    const nextHop = route.nextHop || route.next_hop;
+    const nextHop = route.nextHop;
     if (route.direct || route.hops <= 1) {
       if (!local) continue;
-      const from = positions.get(local.node_id);
+      const from = positions.get(local.nodeId);
       edges.push({
         from,
         to,
@@ -96,12 +96,12 @@ export function renderDiagram(nodes) {
         color: isOnline(p) ? 'var(--accent-1, #6366f1)' : 'var(--text-3, #6a7196)',
       });
     } else if (nextHop) {
-      const hop = nodes.find(n => n.node_id === nextHop);
+      const hop = nodes.find(n => n.nodeId === nextHop);
       if (!isTrusted(hop)) continue;
-      const hopPos = hop ? positions.get(hop.node_id) : (local ? positions.get(local.node_id) : null);
+      const hopPos = hop ? positions.get(hop.nodeId) : (local ? positions.get(local.nodeId) : null);
       if (hopPos && local) {
         edges.push({
-          from: positions.get(local.node_id),
+          from: positions.get(local.nodeId),
           to: hopPos,
           dashed: false,
           label: null,
@@ -135,16 +135,16 @@ export function renderDiagram(nodes) {
   }).join('');
 
   const renderNode = (n) => {
-    const pos = positions.get(n.node_id);
+    const pos = positions.get(n.nodeId);
     if (!pos) return '';
-    const isLocal = n.is_local || n.source === 'local';
+    const isLocal = n.isLocal || n.source === 'local';
     const online = isOnline(n);
     let kind;
     if (isLocal) kind = 'local';
     else if (!online) kind = 'offline';
     else if (n.source === 'trusted') kind = 'paired';
     else kind = 'pending';
-    const hostname = n.hostname || (n.node_id ? n.node_id.slice(0, 8) : I18n.t('mesh.unknown_host'));
+    const hostname = n.hostname || (n.nodeId ? n.nodeId.slice(0, 8) : I18n.t('mesh.unknown_host'));
     const ip = n.ip || '';
     const subLabel = isLocal ? I18n.t('mesh.you') : (online ? (ip || '') : I18n.t('mesh.offline'));
     // Pozycja w world-coords zapisana w data-attr — applyTransform() przelicza na piksele.
@@ -152,7 +152,7 @@ export function renderDiagram(nodes) {
     return `
       <div class="diag-node ${kind}"
            style="left:${(pos.x / W * 100).toFixed(2)}%; top:${(pos.y / H * 100).toFixed(2)}%;"
-           data-node-detail="${escapeAttr(n.node_id || '')}"
+           data-node-detail="${escapeAttr(n.nodeId || '')}"
            data-world-x="${pos.x.toFixed(2)}"
            data-world-y="${pos.y.toFixed(2)}"
            role="button" tabindex="0">

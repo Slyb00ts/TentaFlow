@@ -41,8 +41,6 @@ export class OrgWriteError extends Error {
 export const BACKDATED = 'backdated_confirmation_required';
 const DEBOUNCE_MS = 220;
 
-const pick = (object, snake, camel) => object?.[snake] ?? object?.[camel];
-
 const CREATES = { unitCreate: 'u', positionCreate: 'p', externalPersonCreate: 'e', assign: 'a' };
 
 /**
@@ -76,7 +74,7 @@ export function createDraft({ send, getLive, askBackdated, day }) {
     const shown = (preview?.view.assignments ?? []).find((a) => a.id === id);
     const live = getLive();
     if (!shown || !live) return id;
-    const same = (live.assignments ?? []).find((a) => a.position_id === shown.position_id && subjectKey(a.subject) === subjectKey(shown.subject));
+    const same = (live.assignments ?? []).find((a) => a.positionId === shown.positionId && subjectKey(a.subject) === subjectKey(shown.subject));
     return same ? same.id : id;
   }
 
@@ -108,12 +106,12 @@ export function createDraft({ send, getLive, askBackdated, day }) {
       index: r.index,
       ok: Boolean(r.ok),
       error: r.error ?? null,
-      tempId: pick(r, 'temp_id', 'tempId') ?? null,
-      createdId: pick(r, 'created_id', 'createdId') ?? null,
+      tempId: r.tempId ?? null,
+      createdId: r.createdId ?? null,
     }));
     const renames = new Map(results.filter((r) => r.tempId && r.createdId).map((r) => [r.createdId, r.tempId]));
     preview = answer.preview
-      ? { view: withTempIds(answer.preview, renames), at: pick(answer, 'preview_at', 'previewAt') ?? at, warnings: withTempIds(answer.warnings ?? [], renames) }
+      ? { view: withTempIds(answer.preview, renames), at: answer.previewAt ?? at, warnings: withTempIds(answer.warnings ?? [], renames) }
       : null;
   }
 

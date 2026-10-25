@@ -62,7 +62,7 @@ function render(container, tools) {
   tbl.rows = tools.map((t, idx) => {
     const name = String(t.name ?? `tool-${idx}`);
     const desc = String(t.description ?? '');
-    const returnType = String(t.returnType ?? t.return_type ?? '');
+    const returnType = String(t.returnType ?? '');
     const params = Array.isArray(t.parameters) ? t.parameters : [];
     const nameCell = `<code style="font-family:'SF Mono',monospace;font-weight:600;color:var(--text);">${escapeHtml(name)}</code>${returnType ? ` <span style="color:var(--text-3);font-size:11px;">→ ${escapeHtml(returnType)}</span>` : ''}`;
     const paramsCell = renderParamsCell(params);
@@ -76,7 +76,7 @@ function renderParamsCell(params) {
   }
   return params.map((p) => {
     const pname = String(p.name ?? '');
-    const ptype = String(p.paramType ?? p.param_type ?? 'any');
+    const ptype = String(p.paramType ?? 'any');
     const preq = !!p.required;
     const status = preq ? 'warn' : 'info';
     const suffix = preq ? '*' : '';

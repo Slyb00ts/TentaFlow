@@ -193,7 +193,7 @@ test('Carousel without arrows and indicators', () => {
 // PdfViewer (0x060D)
 // ============================================================================
 
-test('PdfViewer renders object element with pdf type', () => {
+test('PdfViewer renders an iframe (CSP forbids object)', () => {
   setup();
   const engine = makeEngine();
   const el = engine.render(comp(PDF_VIEWER_TAG, [
@@ -204,9 +204,10 @@ test('PdfViewer renders object element with pdf type', () => {
   ]));
   document.body.appendChild(el);
   assert(el.classList.contains('tf-pdf-viewer'), 'wrapper class');
-  const obj = el.querySelector('object');
-  assert(obj != null, 'object element');
-  assertEq(obj.type, 'application/pdf');
+  assert(el.querySelector('object') == null, 'no object element');
+  const frame = el.querySelector('iframe');
+  assert(frame != null, 'iframe element');
+  assertEq(frame.getAttribute('src'), 'https://example.com/doc.pdf');
 });
 
 test('PdfViewer blocks javascript: src', () => {
@@ -216,7 +217,7 @@ test('PdfViewer blocks javascript: src', () => {
     [0, 'javascript:alert(1)'], [2, { kind: 'px', value: 500 }],
     [3, 'actual'], [4, false],
   ]));
-  assert(el.querySelector('object') == null, 'no object for javascript:');
+  assert(el.querySelector('iframe') == null, 'no frame for javascript:');
   assert(el.querySelector('.tf-pdf-viewer__blocked') != null, 'blocked msg');
 });
 

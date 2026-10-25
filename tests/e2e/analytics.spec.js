@@ -16,6 +16,11 @@ const path = require('path');
 const { startBinary, stopBinary, waitForServer, binaryExists } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
 
+// The harness serves a self-signed certificate; Chrome refuses to fetch /sw.js over it and
+// logs a console error that this spec's zero-errors assertion would count. The screen under
+// test does not depend on the worker.
+test.use({ serviceWorkers: 'block' });
+
 const PORT = 18299;
 const WORK_DIR = path.join(os.tmpdir(), `tentaflow-e2e-analytics-${PORT}`);
 const DB = path.join(WORK_DIR, 'analytics.db');

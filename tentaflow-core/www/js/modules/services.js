@@ -186,7 +186,7 @@ function setModelVisibility(resp) {
   modelVisibility = new Map();
   const list = Array.isArray(resp?.models) ? resp.models : [];
   for (const m of list) {
-    const mid = m.modelId || m.model_id || m.id;
+    const mid = m.modelId || m.id;
     const v = String(m.visibility || '').toLowerCase();
     if (mid && (v === 'restricted' || v === 'public')) {
       modelVisibility.set(String(mid), v);
@@ -351,7 +351,7 @@ function bindTabEvents() {
       const nodeId = b.dataset.svcNode || undefined;
       const svc = (services || []).find((s) =>
         String(s.id) === String(svcId)
-        && String(s.node_id || s.nodeId || '') === String(nodeId || '')
+        && String(s.nodeId || '') === String(nodeId || '')
       );
       if (!svc) return;
       import('./services-edit.js').then((mod) => {
@@ -694,7 +694,7 @@ async function saveAliasInline(id) {
       id,
       alias: alias.alias,
       targetModel: target,
-      isActive: unbind ? false : alias.is_active,
+      isActive: unbind ? false : alias.isActive,
       strategy: aliasEditDraft.strategy,
       fallbackTargets: fbJson,
     });
@@ -716,12 +716,12 @@ async function updateAliasActive(id, checked) {
     await ApiBinary.action('modelAliasUpdateRequest', {
       id,
       alias: alias.alias,
-      targetModel: alias.target_model,
+      targetModel: alias.targetModel,
       isActive: checked,
       strategy: alias.strategy ?? null,
-      fallbackTargets: alias.fallback_targets ?? null,
+      fallbackTargets: alias.fallbackTargets ?? null,
     });
-    alias.is_active = checked;
+    alias.isActive = checked;
     toast(I18n.t('services.alias_updated'), 'success');
   } catch (err) {
     toast(`${I18n.t('common.error')}: ${err.message}`, 'error');
@@ -769,22 +769,22 @@ function renderListTab(rows = services) {
 // meshNodes list. Falls back to a 12-char short hex when hostname is missing.
 function nodeLabelFor(nodeId) {
   if (!nodeId) return { label: '?', isLocal: false, hostname: null, full: '' };
-  const node = meshNodes.find((n) => (n.node_id || n.id) === nodeId);
+  const node = meshNodes.find((n) => n.nodeId === nodeId);
   const hostname = node?.hostname || null;
   const label = hostname || nodeId.slice(0, 12);
-  return { label, isLocal: !!node?.is_local, hostname, full: nodeId };
+  return { label, isLocal: !!node?.isLocal, hostname, full: nodeId };
 }
 
 // Row identity used by the delete/pause/pin state maps and by the inline error
 // slot. node_id is part of it because the same service id can exist on two nodes.
 function serviceActionKey(s) {
-  return `${s.node_id || s.nodeId || 'unknown'}:${s.id}`;
+  return `${s.nodeId || 'unknown'}:${s.id}`;
 }
 
 // deployId of the row's deployment — the very id the deploy-progress window
 // streams, so the row can follow the same stream.
 function deployIdFor(s) {
-  return s.active_deploy_id || s.activeDeployId || s.last_deploy_id || s.lastDeployId || '';
+  return s.activeDeployId || s.lastDeployId || '';
 }
 
 function clampPct(value) {
@@ -845,7 +845,7 @@ function startDeployWatcher(deployId) {
 function onDeployChunk(deployId, chunk) {
   const entry = deployWatchers.get(deployId);
   if (!entry || entry.closed) return;
-  if (!chunk || chunk.variant !== 'DeploymentStreamChunk') return;
+  if (!chunk || chunk._variant !== 'DeploymentBody.StreamChunk') return;
   if (chunk.deployId && String(chunk.deployId) !== String(deployId)) return;
   // Only phase/progress frames carry row-level state; plain log lines belong to
   // the deploy window, not to a table cell.
@@ -948,7 +948,7 @@ function renderRow(s) {
   // Silnik on-demand nie ma dlugozyjacego procesu — brak procesu jest jego
   // stanem docelowym. Bez tego wiersz wyglada identycznie jak serwis, ktory
   // padl (szary chip "Zatrzymany" + przycisk "Uruchom" sugerujacy naprawe).
-  const onDemandIdle = ManifestStore.isOnDemand(ManifestStore.byId(s.engine_id || s.engineId))
+  const onDemandIdle = ManifestStore.isOnDemand(ManifestStore.byId(s.engineId))
     && !paused
     && (s.status || '').toLowerCase() === 'stopped';
   const statusInfo = deleting
@@ -969,8 +969,8 @@ function renderRow(s) {
     ? I18n.t('services.on_demand_hint')
     : (statusInfo.key === 'deploying'
       ? ''
-      : (typeof s.progress_message === 'string' && s.progress_message.length > 0
-        ? s.progress_message
+      : (typeof s.progressMessage === 'string' && s.progressMessage.length > 0
+        ? s.progressMessage
         : ''));
   const progressBadge = progressMsg
     ? `<div style="font-size:11px;color:var(--text-3);margin-top:4px;line-height:1.3;">${escapeHtml(progressMsg)}</div>`
@@ -979,12 +979,12 @@ function renderRow(s) {
   // listy, bo lista przychodzi co 5 s i potrafi byc o cala faze do tylu.
   const watchedDeployId = statusInfo.key === 'deploying' ? deployIdFor(s) : '';
   const liveDeploy = watchedDeployId ? deployWatchers.get(watchedDeployId) : null;
-  const snapshotPct = Number.isFinite(s.deployment_progress_pct)
-    ? s.deployment_progress_pct
+  const snapshotPct = Number.isFinite(s.deploymentProgressPct)
+    ? s.deploymentProgressPct
     : (Number.isFinite(s.deploymentProgressPct) ? s.deploymentProgressPct : 0);
   const deployPct = Number.isFinite(liveDeploy?.pct) ? liveDeploy.pct : snapshotPct;
   const deployPhase = liveDeploy?.phase
-    || (typeof s.progress_message === 'string' ? s.progress_message : '');
+    || (typeof s.progressMessage === 'string' ? s.progressMessage : '');
   const deployProgress = statusInfo.key === 'deploying'
     ? `<div class="svc-deploy-progress">
         <span class="svc-deploy-phase" data-svc-deploy-phase="${escapeAttr(watchedDeployId)}">${escapeHtml(deployPhase)}</span>
@@ -996,13 +996,13 @@ function renderRow(s) {
     ? '<span style="color:var(--text-3);">—</span>'
     : models
         .map((m) => {
-          const label = m.display_name || m.model_name || '';
+          const label = m.displayName || m.modelName || '';
           return `<tf-chip status="info">${escapeHtml(label)}</tf-chip>`;
         })
         .join(' ');
-  const restartCount = Number.isFinite(s.restart_count) ? s.restart_count : 0;
-  const restartTitle = s.health_last_err
-    ? `title="${escapeAttr(s.health_last_err)}"`
+  const restartCount = Number.isFinite(s.restartCount) ? s.restartCount : 0;
+  const restartTitle = s.healthLastErr
+    ? `title="${escapeAttr(s.healthLastErr)}"`
     : '';
   const restartCell = restartCount > 0
     ? `<tf-chip status="warn" ${restartTitle}>${restartCount}</tf-chip>`
@@ -1010,12 +1010,12 @@ function renderRow(s) {
 
   // update_available (snake_case z protokolu binarnego) = zdeployowany bundle
   // rozni sie od aktualnego zrodla w binarce, wiec serwis trzeba wdrozyc ponownie.
-  const updateAvailable = !!s.update_available;
+  const updateAvailable = !!s.updateAvailable;
 
-  const displayName = s.display_name || s.engine_id || '';
-  const engineLabel = s.engine_id || '';
+  const displayName = s.displayName || s.engineId || '';
+  const engineLabel = s.engineId || '';
   const category = s.category || '';
-  const serviceNodeId = s.node_id || s.nodeId || '';
+  const serviceNodeId = s.nodeId || '';
   const nodeInfo = nodeLabelFor(serviceNodeId);
   const nodeBadge = nodeInfo.isLocal
     ? `<span class="svc-node-local">${escapeHtml(I18n.t('services.node_local_badge'))}</span>`
@@ -1055,8 +1055,8 @@ function renderRow(s) {
     ? `<tf-chip status="warn" icon="alert" clickable
           style="cursor:pointer;"
           data-svc-redeploy="${svcId}"
-          data-svc-engine="${escapeAttr(s.engine_id || '')}"
-          data-svc-method="${escapeAttr(s.deploy_method || '')}"
+          data-svc-engine="${escapeAttr(s.engineId || '')}"
+          data-svc-method="${escapeAttr(s.deployMethod || '')}"
           data-svc-node="${svcNodeId}"
           title="${escapeAttr(I18n.t('services.update_available_tooltip'))}">${escapeHtml(I18n.t('services.update_available'))}</tf-chip>`
     : '';
@@ -1064,13 +1064,13 @@ function renderRow(s) {
   const deployAction = deployId
     ? `<tf-button variant="ghost" size="sm" icon="terminal"
           data-svc-deploy-log="${escapeAttr(deployId)}"
-          data-svc-engine="${escapeAttr(s.engine_id || '')}"
-          data-svc-method="${escapeAttr(s.deploy_method || '')}"
+          data-svc-engine="${escapeAttr(s.engineId || '')}"
+          data-svc-method="${escapeAttr(s.deployMethod || '')}"
           title="${escapeAttr(I18n.t('services.btn_deploy_logs'))}"></tf-button>`
     : '';
   // Karty GPU serwisu (z deploy configu): "all" | "0,1" | "CPU". Puste = nie
   // dotyczy (np. serwis zdalny bez tej informacji) -> myslnik. Indeksy monospace.
-  const gpuSel = String(s.gpuSelection ?? s.gpu_selection ?? '').trim();
+  const gpuSel = String(s.gpuSelection ?? '').trim();
   const gpuCell = !gpuSel
     ? '<span style="color:var(--text-3);">—</span>'
     : (gpuSel === 'all' || gpuSel === 'CPU'
@@ -1122,7 +1122,7 @@ function renderRow(s) {
           title="${escapeAttr(pinTooltip)}"></tf-button>
         <tf-button variant="ghost" size="sm" icon="edit"
           data-svc-edit="${svcId}"
-          data-svc-engine="${escapeAttr(s.engine_id || '')}"
+          data-svc-engine="${escapeAttr(s.engineId || '')}"
           data-svc-node="${svcNodeId}"
           title="${escapeAttr(I18n.t('services.btn_edit') || 'Edit')}"></tf-button>
         ${deployAction}
@@ -1131,7 +1131,7 @@ function renderRow(s) {
           data-svc-name="${escapeAttr(displayName)}"
           data-svc-node="${svcNodeId}"
           data-svc-node-label="${svcNodeLabel}"
-          data-svc-cluster-dep="${escapeAttr(s.cluster_deployment_id || s.clusterDeploymentId || '')}"
+          data-svc-cluster-dep="${escapeAttr(s.clusterDeploymentId || '')}"
           title="${escapeAttr(I18n.t('services.btn_delete'))}"></tf-button>`}
         <span class="svc-row-error" data-svc-error="${svcActionKey}" hidden></span>
       </td>
@@ -1237,11 +1237,11 @@ function computeAliasFilterCounts(list) {
     const owner = aliasOwnerInfo(a);
     if (owner.type === 'addon') counts['owner:addon'] += 1;
     else counts['owner:manual'] += 1;
-    if (a.is_active) counts['status:active'] += 1;
+    if (a.isActive) counts['status:active'] += 1;
     else counts['status:inactive'] += 1;
-    const fbs = parseFallbackTargets(a.fallback_targets).values;
+    const fbs = parseFallbackTargets(a.fallbackTargets).values;
     if (fbs.length > 0) counts['fallback:has'] += 1;
-    if (!a.target_model || !String(a.target_model).trim()) counts['target:empty'] += 1;
+    if (!a.targetModel || !String(a.targetModel).trim()) counts['target:empty'] += 1;
   }
   return counts;
 }
@@ -1252,13 +1252,13 @@ function matchFilterToken(a, token) {
   const owner = aliasOwnerInfo(a);
   switch (group) {
     case 'owner': return owner.type === value;
-    case 'status': return value === 'active' ? !!a.is_active : !a.is_active;
+    case 'status': return value === 'active' ? !!a.isActive : !a.isActive;
     case 'fallback': {
-      const fbs = parseFallbackTargets(a.fallback_targets).values;
+      const fbs = parseFallbackTargets(a.fallbackTargets).values;
       return value === 'has' ? fbs.length > 0 : fbs.length === 0;
     }
     case 'target': {
-      const empty = !a.target_model || !String(a.target_model).trim();
+      const empty = !a.targetModel || !String(a.targetModel).trim();
       return value === 'empty' ? empty : !empty;
     }
     default: return true;
@@ -1285,13 +1285,13 @@ function filterAliases(list, filters, search) {
   });
 }
 
-// owner_type/owner_id are optional in current ModelAliasEntry schema —
+// ownerType/ownerId are optional in current ModelAliasEntry schema —
 // backend extension lands with M1.W5 follow-up. Frontend reads defensively:
-// explicit `owner_type` / `owner_id` when present, otherwise default to
+// explicit `ownerType` / `ownerId` when present, otherwise default to
 // `manual` so existing admin-created aliases keep their UI badge.
 function aliasOwnerInfo(a) {
-  const type = String(a.owner_type || a.ownerType || 'manual').toLowerCase();
-  const id = a.owner_id || a.ownerId || '';
+  const type = String(a.ownerType || 'manual').toLowerCase();
+  const id = a.ownerId || '';
   if (type === 'addon') {
     return { type: 'addon', label: id || 'addon', icon: 'puzzle' };
   }
@@ -1338,20 +1338,20 @@ function parseFallbackTargets(raw) {
 }
 
 function renderAliasRow(a) {
-  const fallbacks = parseFallbackTargets(a.fallback_targets).values;
+  const fallbacks = parseFallbackTargets(a.fallbackTargets).values;
   const owner = aliasOwnerInfo(a);
   const vis = aliasVisibilityInfo(a);
-  const emptyTarget = !a.target_model || !String(a.target_model).trim();
+  const emptyTarget = !a.targetModel || !String(a.targetModel).trim();
   const fallbackText = fallbacks.length === 0
     ? `<div class="fallbacks">${escapeHtml(I18n.t('services.alias_no_fallbacks'))}</div>`
     : `<div class="fallbacks">→ ${escapeHtml(fallbacks.join(' → '))}</div>`;
   const primary = emptyTarget
     ? `<div class="empty">${escapeHtml(I18n.t('services.alias_empty_target'))}</div>`
-    : `<div class="primary">${escapeHtml(a.target_model)}</div>`;
+    : `<div class="primary">${escapeHtml(a.targetModel)}</div>`;
   const strategyText = (a.strategy || 'first_available').toLowerCase();
   const rowClasses = [
     'svc-alias-row',
-    !a.is_active ? 'inactive' : '',
+    !a.isActive ? 'inactive' : '',
     emptyTarget ? 'empty-target' : '',
   ].filter(Boolean).join(' ');
   const aliasId = String(a.id);
@@ -1389,7 +1389,7 @@ function renderAliasRow(a) {
              </span>`}
       </div>
       <div>
-        <tf-toggle ${a.is_active ? 'checked' : ''} data-alias-toggle="${escapeAttr(a.id)}"></tf-toggle>
+        <tf-toggle ${a.isActive ? 'checked' : ''} data-alias-toggle="${escapeAttr(a.id)}"></tf-toggle>
       </div>
       <div class="svc-alias-actions">
         <tf-button variant="ghost" size="sm" icon="${isAccess ? 'chevron-down' : 'users'}"
@@ -1415,9 +1415,9 @@ function renderAliasRow(a) {
 // fallback add/remove become visible to the user before they click Save.
 function isDraftDirty(a) {
   if (!aliasEditDraft || aliasEditDraft.id !== String(a.id)) return false;
-  const origTarget = a.target_model || '';
+  const origTarget = a.targetModel || '';
   const origStrategy = (a.strategy || 'first_available').toLowerCase();
-  const origFbs = parseFallbackTargets(a.fallback_targets).values;
+  const origFbs = parseFallbackTargets(a.fallbackTargets).values;
   if (aliasEditDraft.targetModel !== origTarget) return true;
   if (aliasEditDraft.strategy !== origStrategy) return true;
   if (aliasEditDraft.fallbacks.length !== origFbs.length) return true;
@@ -1432,10 +1432,10 @@ function isDraftDirty(a) {
 // bind in `bindAliasInlineEditEvents` (called from bindTabEvents).
 function renderAliasInlineEdit(a) {
   if (!aliasEditDraft || aliasEditDraft.id !== String(a.id)) {
-    const fbParse = parseFallbackTargets(a.fallback_targets);
+    const fbParse = parseFallbackTargets(a.fallbackTargets);
     aliasEditDraft = {
       id: String(a.id),
-      targetModel: a.target_model || '',
+      targetModel: a.targetModel || '',
       strategy: (a.strategy || 'first_available').toLowerCase(),
       fallbacks: fbParse.values.slice(),
       parseFailed: !fbParse.ok,
@@ -1577,15 +1577,15 @@ function mergeUnifiedModelsIntoNodes() {
   if (!Array.isArray(unifiedModels) || unifiedModels.length === 0) return;
   const byNode = new Map();
   for (const entry of unifiedModels) {
-    const kindWrapper = entry && entry.kind;
-    if (!kindWrapper || kindWrapper.kind !== 'service_model') continue;
+    const kindWrapper = entry?.kind?.ServiceModel;
+    if (!kindWrapper) continue;
     const alias = entry.id;
     if (!alias) continue;
     const surfaces = Array.isArray(entry.serviceSurfaces) ? entry.serviceSurfaces : [];
     const kindLabel = surfaces[0] || 'service';
     const instances = Array.isArray(kindWrapper.instances) ? kindWrapper.instances : [];
     for (const inst of instances) {
-      const nid = inst.nodeId || inst.node_id;
+      const nid = inst.nodeId;
       if (!nid) continue;
       if (!byNode.has(nid)) byNode.set(nid, []);
       const status = inst.status || '';
@@ -1593,13 +1593,13 @@ function mergeUnifiedModelsIntoNodes() {
         alias,
         kind: kindLabel,
         backend: inst.backend || '',
-        size_mb: inst.sizeMb || inst.size_mb || 0,
+        sizeMb: inst.sizeMb || 0,
         loaded: status === 'running' || status === 'ready',
       });
     }
   }
   for (const node of meshNodes) {
-    const extra = byNode.get(node.node_id);
+    const extra = byNode.get(node.nodeId);
     if (!extra || extra.length === 0) continue;
     const existing = Array.isArray(node.models) ? node.models.slice() : [];
     const seen = new Set(existing.map((m) => m.alias).filter(Boolean));
@@ -1621,12 +1621,12 @@ function collectUniqueModels() {
   // distinguishable, and aggregates node_id into a chip list per row.
   const map = new Map();
   for (const m of modelsCache) {
-    const alias = m.model_name || m.modelName || m.id;
+    const alias = m.modelName;
     if (!alias) continue;
-    const backend = m.engine_id || m.engineId || '';
+    const backend = m.engineId || '';
     const kind = (m.category || '').toLowerCase();
     const key = `${alias}|${backend}`;
-    const nodeInfo = nodeLabelFor(m.node_id || m.nodeId || '');
+    const nodeInfo = nodeLabelFor(m.nodeId || '');
     const nodeLabel = nodeInfo.label;
     const isLoaded = (m.availability || '').toLowerCase() === 'running';
     if (!map.has(key)) {
@@ -1634,7 +1634,7 @@ function collectUniqueModels() {
         alias,
         kind,
         backend,
-        size_mb: 0,
+        sizeMb: 0,
         loaded: isLoaded,
         nodes: nodeLabel ? [nodeLabel] : [],
       });
@@ -1731,7 +1731,7 @@ function buildTargetOptionList(_excludeAliasName) {
     label: m.alias + (m.backend ? ` · ${m.backend}` : '') + (m.kind ? ` (${m.kind})` : ''),
   }));
   const flows = (Array.isArray(unifiedModels) ? unifiedModels : [])
-    .filter((e) => e && e.kind && e.kind.kind === 'flow' && typeof e.id === 'string')
+    .filter((e) => e?.kind?.Flow && typeof e.id === 'string')
     .map((e) => ({
       value: e.id,
       label: `${e.id} (flow)`,
@@ -1756,14 +1756,14 @@ function openAliasModal(alias) {
   // CSV ze stale taba). `ok=false` blokuje save z UI errorem zeby
   // przypadkowo nie wymazac istniejacych fallbackow w bazie.
   const fallbackParse = isEdit
-    ? parseFallbackTargets(alias.fallback_targets)
+    ? parseFallbackTargets(alias.fallbackTargets)
     : { ok: true, values: [] };
   const selectedFallbacks = fallbackParse.values;
   const fallbackParseFailed = !fallbackParse.ok;
 
   // Strategia w API: lowercase_snake (first_available | round_robin | least_loaded).
   const currentStrategy = (alias?.strategy || 'round_robin').toLowerCase();
-  const currentTarget = alias?.target_model || '';
+  const currentTarget = alias?.targetModel || '';
 
   const bodyEl = document.createElement('div');
   bodyEl.style.display = 'flex';

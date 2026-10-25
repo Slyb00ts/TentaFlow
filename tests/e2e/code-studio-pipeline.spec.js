@@ -140,7 +140,7 @@ test.describe('Code Studio — wymuszony potok', () => {
     await api(page, 'serviceManifestDeployRequest', {
       engineId: 'openai-compatible',
       deployMethod: 'external',
-      nodeId: (nodes?.nodes ?? [])[0]?.nodeId ?? (nodes?.nodes ?? [])[0]?.node_id ?? '',
+      nodeId: (nodes?.nodes ?? [])[0]?.nodeId ?? '',
       configJson: JSON.stringify({
         base_url: model.baseUrl,
         api_key: 'pipeline-key',
@@ -196,7 +196,7 @@ test.describe('Code Studio — wymuszony potok', () => {
       // one root run for the orchestrator plus a child per delegated role.
       const list = await api(page, 'codeStudioSessionsListRequest', { workspaceId });
       const first = (list?.sessions ?? [])[0] ?? {};
-      const sessionId = first.sessionId ?? first.session_id ?? first.id ?? '';
+      const sessionId = first.sessionId ?? first.id ?? '';
       const runs = await api(page, 'codeStudioSessionRunsRequest', { workspaceId, sessionId })
         .catch(() => null);
       expect((runs?.runs ?? []).length, 'sesja nie pokazuje przebiegow subagentow')

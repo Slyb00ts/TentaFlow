@@ -86,8 +86,8 @@ const SchedulerScreen = {
 async function loadAll() {
   try {
     const [jobRows, actionRows] = await Promise.all([
-      ApiBinary.one('schedulerJobsListRequest').then(resp => parseJson(resp.jobsJson || resp.jobs_json || '[]')),
-      ApiBinary.one('schedulerActionsListRequest').then(resp => parseJson(resp.actionsJson || resp.actions_json || '[]')),
+      ApiBinary.one('schedulerJobsListRequest').then(resp => parseJson(resp.jobsJson || '[]')),
+      ApiBinary.one('schedulerActionsListRequest').then(resp => parseJson(resp.actionsJson || '[]')),
     ]);
     jobs = Array.isArray(jobRows) ? jobRows : [];
     actions = Array.isArray(actionRows) ? actionRows : [];
@@ -110,7 +110,7 @@ async function loadRuns() {
   }
   try {
     const resp = await ApiBinary.one('schedulerRunsListRequest', { jobId: selectedJobId, limit: 20 });
-    runs = parseJson(resp.runsJson || resp.runs_json || '[]');
+    runs = parseJson(resp.runsJson || '[]');
     renderRuns();
   } catch (err) {
     runs = [];
@@ -303,7 +303,7 @@ async function saveJob() {
       concurrency_policy: 'skip',
     };
     const resp = await ApiBinary.one('schedulerJobUpsertRequest', { jobJson: JSON.stringify(body) });
-    const saved = parseJson(resp.jobJson || resp.job_json || '{}');
+    const saved = parseJson(resp.jobJson || '{}');
     selectedJobId = saved.id;
     toast('Job zapisany', 'success');
     await loadAll();

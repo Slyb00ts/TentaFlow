@@ -32,8 +32,8 @@ const NONE = '';
 const HEX = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
 
 const seatLabel = (node) => (node.vacant ? `${base('vacancy')} · ${node.role}` : `${node.name} · ${node.role}`);
-const positionOf = (view, id) => (view.positions ?? []).find((p) => p.position_id === id);
-const unitOf = (view, id) => (view.units ?? []).find((u) => u.unit_id === id);
+const positionOf = (view, id) => (view.positions ?? []).find((p) => p.positionId === id);
+const unitOf = (view, id) => (view.units ?? []).find((u) => u.unitId === id);
 
 function option(value, label, selected) {
   return `<option value="${escapeAttr(value)}"${selected ? ' selected' : ''}>${escapeHtml(label)}</option>`;
@@ -82,29 +82,29 @@ function positionSection(ctx) {
     input('position.code', t('position_code'), position.code ?? '', `hint="${escapeAttr(t('position_code_hint'))}"`),
     input('position.unit', base('col_unit'), node.unitName, `readonly hint="${escapeAttr(t('position_unit_hint'))}"`),
     select('position.parent', t('reports_to'), parents, node.parentId ?? NONE),
-    toggle('position.staff', t('position_staff'), Boolean(position.is_staff), t('position_staff_hint')),
-    select('position.role', t('position_role'), roles, position.role_id ?? NONE),
+    toggle('position.staff', t('position_staff'), Boolean(position.isStaff), t('position_staff_hint')),
+    select('position.role', t('position_role'), roles, position.roleId ?? NONE),
   ].join(''));
 }
 
 function assignmentBlock(assignment) {
-  const key = `${assignment.position_id}|${assignment.subject.kind}:${assignment.subject.id}`;
+  const key = `${assignment.positionId}|${assignment.subject.kind}:${assignment.subject.id}`;
   const types = TYPES.map((value) => ({ value, label: t(`type_${value}`) }));
   return `<div class="org-insp-assignment" data-assignment="${escapeAttr(key)}">`
-    + `<div class="org-insp-holder"><tf-avatar size="sm" initials="${escapeAttr(initialsOf(assignment.display_name))}"></tf-avatar>`
-    + `<span class="org-insp-holder-name">${escapeHtml(assignment.display_name || base('unknown_person'))}</span>`
+    + `<div class="org-insp-holder"><tf-avatar size="sm" initials="${escapeAttr(initialsOf(assignment.displayName))}"></tf-avatar>`
+    + `<span class="org-insp-holder-name">${escapeHtml(assignment.displayName || base('unknown_person'))}</span>`
     + `${assignment.subject.kind === 'external' ? `<tf-chip variant="outline">${escapeHtml(t('external_person'))}</tf-chip>` : ''}</div>`
     + `<div class="org-insp-row">${input('assignment.share', t('assignment_share'), String(assignment.share), 'type="number" min="0.05" max="1" step="0.05" stepper')}`
-    + `${select('assignment.type', t('assignment_type'), types, assignment.assignment_type)}</div>`
-    + toggle('assignment.primary', t('assignment_primary'), Boolean(assignment.is_primary))
-    + `<div class="org-insp-row">${input('assignment.from', t('assignment_from'), formatDay(assignment.valid_from), 'readonly')}`
-    + `${input('assignment.to', t('assignment_to'), assignment.valid_to ? formatDay(assignment.valid_to) : t('open_ended'), 'readonly')}</div>`
+    + `${select('assignment.type', t('assignment_type'), types, assignment.assignmentType)}</div>`
+    + toggle('assignment.primary', t('assignment_primary'), Boolean(assignment.isPrimary))
+    + `<div class="org-insp-row">${input('assignment.from', t('assignment_from'), formatDay(assignment.validFrom), 'readonly')}`
+    + `${input('assignment.to', t('assignment_to'), assignment.validTo ? formatDay(assignment.validTo) : t('open_ended'), 'readonly')}</div>`
     + `<div class="org-insp-actions">${button('assignment-replace', t('assignment_replace'), { icon: 'user', data: `data-key="${escapeAttr(key)}"` })}`
     + `${button('assignment-end', t('assignment_end'), { icon: 'user-x', data: `data-key="${escapeAttr(key)}"` })}</div></div>`;
 }
 
 function assignmentSection(ctx) {
-  const holders = (ctx.view.assignments ?? []).filter((a) => a.position_id === ctx.node.id);
+  const holders = (ctx.view.assignments ?? []).filter((a) => a.positionId === ctx.node.id);
   const body = holders.length
     ? holders.map(assignmentBlock).join('')
       + `<div class="org-insp-actions">${button('assign', t('assignment_add'), { icon: 'plus' })}</div>`
@@ -127,7 +127,7 @@ function unitSection(ctx) {
     input('unit.name', t('unit_name'), source.name),
     `<div class="org-insp-row">${input('unit.code', t('unit_code'), source.code ?? '')}`
     + `<tf-color-input data-edit="unit.color" label="${escapeAttr(t('unit_color'))}" value="${escapeAttr(HEX.test(source.color ?? '') ? source.color : unit.color)}"></tf-color-input></div>`,
-    select('unit.type', t('unit_type'), types, source.type_id ?? NONE),
+    select('unit.type', t('unit_type'), types, source.typeId ?? NONE),
     select('unit.parent', t('unit_parent'), parents, unit.parentId ?? NONE),
     `<div class="org-insp-actions">${button('unit-end', t('unit_end'), { icon: 'history' })}</div>`,
   ].join(''));
@@ -141,11 +141,11 @@ function leadershipSection(ctx) {
     const node = byId.get(id);
     return node ? seatLabel(node) : '';
   };
-  const head = source.head_position_id
-    ? `<div class="org-insp-seat"><tf-avatar size="sm" initials="${escapeAttr(initialsOf(byId.get(source.head_position_id)?.name))}"></tf-avatar>`
-      + `<span class="org-insp-seat-name">${escapeHtml(seat(source.head_position_id))}</span></div>`
+  const head = source.headPositionId
+    ? `<div class="org-insp-seat"><tf-avatar size="sm" initials="${escapeAttr(initialsOf(byId.get(source.headPositionId)?.name))}"></tf-avatar>`
+      + `<span class="org-insp-seat-name">${escapeHtml(seat(source.headPositionId))}</span></div>`
     : `<div class="org-insp-seat org-insp-seat--empty">${escapeHtml(base('no_head'))}</div>`;
-  const deputies = (source.deputy_head_position_ids ?? []).map((id, index) => (
+  const deputies = (source.deputyHeadPositionIds ?? []).map((id, index) => (
     `<li class="org-insp-deputy" data-pos="${escapeAttr(id)}" data-index="${index}" draggable="true" tabindex="0" `
     + `aria-label="${escapeAttr(t('deputy_row', { position: index + 1, name: seat(id) }))}">`
     + `<span class="org-insp-deputy-no">${index + 1}</span>`

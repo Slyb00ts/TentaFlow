@@ -109,7 +109,7 @@ test.describe('Code Studio ↔ Projekty', () => {
       modules: ['knowledge', 'tests'],
       members: [],
     });
-    projectId = created?.projectId ?? created?.project_id ?? created?.project?.id ?? '';
+    projectId = created?.projectId ?? created?.project?.id ?? '';
     expect(projectId, 'project was not created').toBeTruthy();
   });
 
@@ -120,15 +120,15 @@ test.describe('Code Studio ↔ Projekty', () => {
       workspaceId, projectId, linked: true,
     });
     const links = linked?.links ?? [];
-    expect(links.map((l) => l.projectId ?? l.project_id), 'link not reported back')
+    expect(links.map((l) => l.projectId), 'link not reported back')
       .toContain(projectId);
 
     // …and the listing agrees on a fresh call.
     const listed = await api(page, 'codeStudioProjectLinkListRequest', { workspaceId });
-    expect((listed?.links ?? []).map((l) => l.projectId ?? l.project_id))
+    expect((listed?.links ?? []).map((l) => l.projectId))
       .toContain(projectId);
     const entry = (listed?.links ?? [])[0];
-    expect(entry.projectName ?? entry.project_name, 'link carries no project name')
+    expect(entry.projectName, 'link carries no project name')
       .toBeTruthy();
   });
 
@@ -154,7 +154,7 @@ test.describe('Code Studio ↔ Projekty', () => {
         .catch((e) => ({ err: String(e) }));
       if (!sessionId) console.log('[diag] sessions:', JSON.stringify(list).slice(0, 300));
       const first = (list?.sessions ?? [])[0] ?? {};
-      sessionId = first.sessionId ?? first.session_id ?? first.id ?? '';
+      sessionId = first.sessionId ?? first.id ?? '';
       return sessionId;
     }, { timeout: 30_000, message: 'no session was created for the link test' })
       .toBeTruthy();
@@ -164,7 +164,7 @@ test.describe('Code Studio ↔ Projekty', () => {
     console.log('[diag] git log:', JSON.stringify(log).slice(0, 300));
     const commit = (log?.commits ?? [])[0];
     expect(commit, 'the workspace has no commit to pin').toBeTruthy();
-    const commitId = commit.id ?? commit.commitId ?? commit.commit_id ?? commit.oid;
+    const commitId = commit.id ?? commit.commitId ?? commit.oid;
 
     // The field is `commit` (protocol/code_studio.rs:1551), and the project is
     // identified separately — visibility comes from the link, not from the caller.
@@ -190,12 +190,12 @@ test.describe('Code Studio ↔ Projekty', () => {
     const after = await api(page, 'codeStudioProjectLinkSetRequest', {
       workspaceId, projectId, linked: false,
     });
-    expect((after?.links ?? []).map((l) => l.projectId ?? l.project_id))
+    expect((after?.links ?? []).map((l) => l.projectId))
       .not.toContain(projectId);
 
     const sessions = await api(page, 'codeStudioSessionsListRequest', { workspaceId });
     const s0 = (sessions?.sessions ?? [])[0] ?? {};
-    const sid = s0.sessionId ?? s0.session_id ?? s0.id ?? '';
+    const sid = s0.sessionId ?? s0.id ?? '';
     const log = await api(page, 'codeStudioGitLogRequest', { workspaceId, sessionId: sid, limit: 1 })
       .catch(() => null);
     const commitId = (log?.commits ?? [])[0]?.id;

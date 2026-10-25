@@ -170,11 +170,11 @@ export function reportWriteOutcome(ack, successMessage) {
     // one thing it must never do is print the caller's success sentence over it.
     // `I18n.t(undefined)` throws, which would lose the refusal entirely, so a
     // missing key renders as the unknown-error line this module already uses.
-    toast(ack.message_key ? I18n.t(ack.message_key) : T('error_unknown'), 'error');
+    toast(ack.messageKey ? I18n.t(ack.messageKey) : T('error_unknown'), 'error');
     return;
   }
-  if (ack?.message_key) {
-    toast(I18n.t(ack.message_key), 'success');
+  if (ack?.messageKey) {
+    toast(I18n.t(ack.messageKey), 'success');
     return;
   }
   toast(successMessage, 'success');
@@ -292,8 +292,8 @@ export function engineTile(engineId) {
  * being renamed by a guess.
  */
 export function engineName(engineId, engines = []) {
-  const entry = engines.find((e) => (e.engine_id ?? e.engineId) === engineId);
-  return entry?.display_name ?? entry?.displayName ?? String(engineId || '');
+  const entry = engines.find((e) => e.engineId === engineId);
+  return entry?.displayName ?? String(engineId || '');
 }
 
 /**
@@ -308,7 +308,7 @@ export function engineName(engineId, engines = []) {
  */
 export function statusChipHtml(account) {
   const status = String(account.status || '');
-  const kind = account.credential_kind ?? account.credentialKind ?? null;
+  const kind = account.credentialKind ?? null;
   const apiKey = kind === 'api_key';
   const forKind = (keyApiKey, keyLogin, keyAny) => (kind === null ? keyAny : (apiKey ? keyApiKey : keyLogin));
   const map = {
@@ -348,8 +348,8 @@ export function shortId(id) {
  * stays in the cell's mono sub-line, where `shortId` belongs.
  */
 export function nodeTitle(node) {
-  const name = String(node?.node_name ?? node?.nodeName ?? '').trim();
-  const id = String(node?.node_id ?? node?.nodeId ?? '');
+  const name = String(node?.nodeName ?? '').trim();
+  const id = String(node?.nodeId ?? '');
   return name && name !== id ? name : T('node_unnamed');
 }
 
@@ -360,12 +360,12 @@ export function nodeTitle(node) {
  */
 export function accountSubtitle(account) {
   const parts = [];
-  const subject = account.provider_subject ?? account.providerSubject;
-  const plan = account.plan_label ?? account.planLabel;
+  const subject = account.providerSubject;
+  const plan = account.planLabel;
   if (subject) parts.push(subject);
   if (plan) parts.push(plan);
   if (!parts.length) {
-    const owner = account.owner_display_name ?? account.ownerDisplayName;
+    const owner = account.ownerDisplayName;
     if (owner) parts.push(owner);
     else if (account.scope === 'user') parts.push(T('own_account'));
   }
@@ -374,8 +374,8 @@ export function accountSubtitle(account) {
 
 /** `absent | materializing | ready | error` → what the node column says. */
 export function nodeCredentialLabel(node, accountRevision) {
-  const state = String(node.runtime_state ?? node.runtimeState ?? '');
-  const applied = Number(node.applied_revision ?? node.appliedRevision ?? 0);
+  const state = String(node.runtimeState ?? '');
+  const applied = Number(node.appliedRevision ?? 0);
   if (state === 'error') return { tone: 'err', label: T('node_state_error') };
   if (state === 'materializing') return { tone: 'info', label: T('node_state_materializing') };
   if (state === 'ready') {
@@ -422,7 +422,7 @@ export function whenLabel(isoTimestamp) {
  * the rest.
  */
 export function usedOnLabel(account) {
-  const nodes = account.used_on ?? account.usedOn ?? [];
+  const nodes = account.usedOn ?? [];
   return nodes.length ? nodes.map(nodeTitle).join(', ') : T('value_none');
 }
 
@@ -436,8 +436,8 @@ export function osLabel(os) {
 
 /** A04 "Nadał": who granted access and when, or nothing when neither is known. */
 export function grantedByLabel(grant) {
-  const who = grant.granted_by_name ?? grant.grantedByName ?? '';
-  const when = grant.granted_at ?? grant.grantedAt ?? '';
+  const who = grant.grantedByName ?? '';
+  const when = grant.grantedAt ?? '';
   const parts = [who, when ? whenLabel(when) : ''].filter(Boolean);
   return parts.length ? parts.join(' · ') : T('value_none');
 }
@@ -445,11 +445,11 @@ export function grantedByLabel(grant) {
 /** The engine ids an account may be created for, given what the engine supports. */
 export function credentialKindsFor(engine) {
   const kinds = [];
-  if (engine?.supports_login ?? engine?.supportsLogin) kinds.push('provider_login');
-  if (engine?.supports_api_key ?? engine?.supportsApiKey) kinds.push('api_key');
+  if (engine?.supportsLogin) kinds.push('provider_login');
+  if (engine?.supportsApiKey) kinds.push('api_key');
   return kinds;
 }
 
 export function engineEntry(engines, engineId) {
-  return engines.find((e) => (e.engine_id ?? e.engineId) === engineId) ?? null;
+  return engines.find((e) => e.engineId === engineId) ?? null;
 }

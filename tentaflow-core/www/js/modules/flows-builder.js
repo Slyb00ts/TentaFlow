@@ -209,7 +209,7 @@ const FlowBuilderScreen = {
     try {
       if (state.mode === 'bpmn') parsed = state.definition.model;
       else
-      parsed = JSON.parse(state.flow.flow_json || state.flow.flowJson || '{"nodes":[],"edges":[]}');
+      parsed = JSON.parse(state.flow.flow_json || '{"nodes":[],"edges":[]}');
     } catch (_) { parsed = { nodes: [], edges: [] }; }
     state.flowVariables = Array.isArray(parsed.variables) ? parsed.variables : [];
 
@@ -220,7 +220,7 @@ const FlowBuilderScreen = {
       processOptions: state.processOptions,
       onTemplatesLoaded: (list) => {
         for (const t of list) {
-          if (!(t.preset && state.templatesMap.has(t.node_type))) state.templatesMap.set(t.node_type, t);
+          if (!(t.preset && state.templatesMap.has(t.nodeType))) state.templatesMap.set(t.nodeType, t);
         }
         state.canvas?.setTemplates(list);
       },
@@ -1524,9 +1524,9 @@ const FlowBuilderScreen = {
       body.innerHTML = `<div style="padding:24px;text-align:center;color:var(--tf-text-3);">${escapeHtml(I18n.t('flows_builder.history_empty'))}</div>`;
     } else {
       body.innerHTML = versions.map((v) => {
-        const id = v.id ?? v.versionId ?? v.version_id;
-        const author = v.author || v.created_by || v.createdBy || '—';
-        const ts = v.created_at_epoch || v.createdAtEpoch || v.created_at || 0;
+        const id = v.id;
+        const author = v.createdBy || '—';
+        const ts = v.createdAtEpoch || 0;
         const rel = typeof ts === 'number' ? formatRelative(ts) : '—';
         const name = v.name || s.flow.name || '—';
         const status = v.status || '—';

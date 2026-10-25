@@ -1,8 +1,8 @@
 // =============================================================================
 // File: gpu-topology-view.js — GPU pair/topology helpers shared by the deploy
 // wizard GPU step and the mesh node detail (fast-link groups, pair chips,
-// selection link stats, NxN link matrix). Reads `node.gpu_links`
-// [{a, b, link, p2p_ok}] where a<b index `node.gpus`.
+// selection link stats, NxN link matrix). Reads `node.gpuLinks`
+// [{a, b, link, p2pOk}] where a<b index `node.gpus`.
 // =============================================================================
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
@@ -20,15 +20,15 @@ export function shortPciBusId(id) {
   return String(id || '').replace(/^[0-9a-f]+:/i, '').replace(/\.[0-9a-f]+$/i, '').toLowerCase();
 }
 
-// PCIe link presentation. `pcie_link_gen`/`pcie_link_width` carry the slot
+// PCIe link presentation. `pcieLinkGen`/`pcieLinkWidth` carry the slot
 // maximum; `*_current` (append-only, absent on older nodes) is the negotiated
 // link, which idles down to Gen1 and must not read as the card's capability.
 export function pcieLinkInfo(gpu) {
-  const gen = gpu?.pcie_link_gen ?? null;
-  const width = gpu?.pcie_link_width ?? null;
+  const gen = gpu?.pcieLinkGen ?? null;
+  const width = gpu?.pcieLinkWidth ?? null;
   if (gen == null || width == null) return null;
-  const curGen = gpu?.pcie_link_gen_current ?? null;
-  const curWidth = gpu?.pcie_link_width_current ?? null;
+  const curGen = gpu?.pcieLinkGenCurrent ?? null;
+  const curWidth = gpu?.pcieLinkWidthCurrent ?? null;
   const lower = (curGen != null && curGen < gen) || (curWidth != null && curWidth < width);
   return {
     label: I18n.t('gpu_topology.pcie_link', { gen, width }),
@@ -68,7 +68,7 @@ export function linkMap(gpuLinks) {
     const a = Number(l?.a);
     const b = Number(l?.b);
     if (!Number.isInteger(a) || !Number.isInteger(b) || a === b) continue;
-    map.set(pairKey(a, b), { link: normLink(l.link), p2pOk: l.p2p_ok !== false });
+    map.set(pairKey(a, b), { link: normLink(l.link), p2pOk: l.p2pOk !== false });
   }
   return map;
 }

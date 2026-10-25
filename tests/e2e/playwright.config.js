@@ -68,6 +68,7 @@ module.exports = defineConfig({
     { name: 'tentavision-onboarding', testMatch: 'tentavision-onboarding.spec.js' },
     { name: 'tentavision-evidence', testMatch: 'tentavision-evidence.spec.js' },
     { name: 'analytics', testMatch: 'analytics.spec.js' },
+    { name: 'chat-redesign', testMatch: 'chat-redesign.spec.js' },
     { name: 'agents-ui', testMatch: 'agents-ui.spec.js' },
     { name: 'agent-accounts', testMatch: 'agent-accounts.spec.js' },
     // C01 inside Code Studio needs its own node: it seeds workspace state and

@@ -165,7 +165,7 @@ function freshnessClass() {
 }
 
 function ifaceRoleClass(iface) {
-  const t = String(iface.interface_type || '').toLowerCase();
+  const t = String(iface.interfaceType || '').toLowerCase();
   if (t === 'thunderbolt') return 'tb';
   if (t === 'wifi' || t === 'wireless') return 'wifi';
   if (t === 'vpn' || t === 'wireguard' || t === 'tailscale') return 'vpn';
@@ -269,7 +269,7 @@ function renderDetail() {
   }
 
   const n = nodeData;
-  const hostname = n.hostname || shortId(n.node_id) || I18n.t('mesh.unknown_host');
+  const hostname = n.hostname || shortId(n.nodeId) || I18n.t('mesh.unknown_host');
   const online = isOnline(n);
 
   const html = `
@@ -302,15 +302,15 @@ function renderDetail() {
 function ensureRecPill(root, n) {
   const host = root.querySelector('[data-rec-pill-host]');
   if (!host) return;
-  if (recPill && recPillNodeId !== n.node_id) {
+  if (recPill && recPillNodeId !== n.nodeId) {
     try { recPill.unmount(); } catch (_e) { /* ignore */ }
     recPill = null;
     recPillNodeId = null;
   }
   if (!recPill) {
-    recPill = new ProfileRecPill({ nodeId: n.node_id });
+    recPill = new ProfileRecPill({ nodeId: n.nodeId });
     recPill.mount(host);
-    recPillNodeId = n.node_id;
+    recPillNodeId = n.nodeId;
   } else if (recPill.root && recPill.root.parentNode !== host) {
     host.appendChild(recPill.root);
   }
@@ -323,13 +323,13 @@ function ensureRecPill(root, n) {
 function ensureActiveBanner(root, n) {
   const host = root.querySelector('[data-banner-host]');
   if (!host) return;
-  if (activeBanner && bannerNodeId !== n.node_id) {
+  if (activeBanner && bannerNodeId !== n.nodeId) {
     try { activeBanner.unmount(); } catch (_e) { /* ignore */ }
     activeBanner = null;
     bannerNodeId = null;
   }
   if (!activeBanner) {
-    const nodeId = n.node_id;
+    const nodeId = n.nodeId;
     activeBanner = new ProfilingActiveBanner({
       nodeId,
       // Po zakonczeniu sesji (timeout / external stop) — toast z akcjami:
@@ -407,12 +407,12 @@ function renderHead(n, hostname, online) {
   // `nsys_available` wraz z `nsys_version` to capability flag z heartbeatu —
   // backend dalej go raportuje jako wskaznik dostepnosci NVIDIA Nsight Systems
   // dla collectora `nvidia.nsys.gpu`. Pokazujemy go tylko jako informacyjny pill.
-  if (n.nsys_available === true) {
-    const ver = n.nsys_version ? ` ${escapeHtml(n.nsys_version)}` : '';
+  if (n.nsysAvailable === true) {
+    const ver = n.nsysVersion ? ` ${escapeHtml(n.nsysVersion)}` : '';
     badges.push(`<span class="nd-stat-pill info">nsys${ver}</span>`);
   }
 
-  const idChip = n.node_id ? `<span class="id-mono">${escapeHtml(shortId(n.node_id))}</span>` : '';
+  const idChip = n.nodeId ? `<span class="id-mono">${escapeHtml(shortId(n.nodeId))}</span>` : '';
 
   return `
     <header class="nd-head">
@@ -452,25 +452,25 @@ function renderHead(n, hostname, online) {
 function renderSystemInfo(n) {
   const ageSec = lastFetchAt ? Math.max(0, Math.round((Date.now() - lastFetchAt) / 1000)) : 0;
   const stats = [];
-  if (n.cpu_model || n.cpu_count) {
+  if (n.cpu_model || n.cpuCount) {
     stats.push({
       label: 'CPU',
       icon: ico('i-cpu'),
-      value: n.cpu_model || `${n.cpu_count} ${I18n.t('mesh.cpu_cores')}`,
+      value: n.cpu_model || `${n.cpuCount} ${I18n.t('mesh.cpu_cores')}`,
     });
   }
-  if (n.cpu_count) {
+  if (n.cpuCount) {
     stats.push({
       label: I18n.t('mesh.cores') || 'Cores',
       icon: ico('i-grid-rows'),
-      value: `${n.cpu_count} ${I18n.t('mesh.cpu_cores')}`,
+      value: `${n.cpuCount} ${I18n.t('mesh.cpu_cores')}`,
     });
   }
-  if (n.ram_total_mb) {
+  if (n.ramTotalMb) {
     stats.push({
       label: I18n.t('mesh.memory') || 'RAM',
       icon: ico('i-ram'),
-      value: formatMb(n.ram_total_mb),
+      value: formatMb(n.ramTotalMb),
     });
   }
   if (n.os_info) {
@@ -522,10 +522,10 @@ function renderSystemInfo(n) {
 }
 
 function renderResources(n) {
-  const cpuPct = n.cpu_usage ?? n.cpu_usage_percent;
+  const cpuPct = n.cpuUsagePercent;
   const cpuTemp = n.cpu_temperature_c;
-  const ramUsed = n.ram_used_mb;
-  const ramTotal = n.ram_total_mb;
+  const ramUsed = n.ramUsedMb;
+  const ramTotal = n.ramTotalMb;
   const swapUsed = n.swap_used_mb;
   const swapTotal = n.swap_total_mb;
 
@@ -544,7 +544,7 @@ function renderResources(n) {
 
   const cpuMini = [];
   if (cpuTemp != null) cpuMini.push({ l: I18n.t('mesh.temperature') || 'Temp', v: `${Math.round(cpuTemp)}°C` });
-  if (n.cpu_count) cpuMini.push({ l: I18n.t('mesh.cores') || 'Cores', v: `${n.cpu_count}` });
+  if (n.cpuCount) cpuMini.push({ l: I18n.t('mesh.cores') || 'Cores', v: `${n.cpuCount}` });
   if (n.load_avg_1) cpuMini.push({ l: 'Load', v: Number(n.load_avg_1).toFixed(2) });
 
   const cpuCard = cpuPct != null ? `
@@ -602,32 +602,32 @@ function renderGpus(n) {
   const gpus = Array.isArray(n.gpus) ? n.gpus : [];
   if (gpus.length === 0) return '';
 
-  const usedTotal = gpus.reduce((s, g) => s + (g.vram_used_mb || 0), 0);
-  const totalTotal = gpus.reduce((s, g) => s + (g.vram_total_mb || 0), 0);
+  const usedTotal = gpus.reduce((s, g) => s + (g.vramUsedMb || 0), 0);
+  const totalTotal = gpus.reduce((s, g) => s + (g.vramTotalMb || 0), 0);
   const summary = totalTotal > 0
     ? `VRAM: <strong style="color:var(--text);">${formatMb(usedTotal)} / ${formatMb(totalTotal)}</strong>`
     : '';
 
-  const gpuLinks = Array.isArray(n.gpu_links) ? n.gpu_links : [];
+  const gpuLinks = Array.isArray(n.gpuLinks) ? n.gpuLinks : [];
   const topology = computeGpuGroups(gpus.length, gpuLinks);
 
   const cards = gpus.map((g, idx) => {
-    const usage = g.usage_percent ?? 0;
+    const usage = g.utilizationPercent ?? 0;
     const usagePct = Math.min(100, Math.max(0, Math.round(usage)));
-    const vramPct = g.vram_total_mb ? Math.round((g.vram_used_mb / g.vram_total_mb) * 100) : 0;
-    const power = (g.power_draw_w != null && g.power_limit_w)
-      ? `${Math.round(g.power_draw_w)} / ${Math.round(g.power_limit_w)} W`
-      : (g.power_draw_w != null ? `${Math.round(g.power_draw_w)} W` : '—');
-    const temp = g.temperature_c != null ? `${Math.round(g.temperature_c)}°C` : '—';
-    const fan = g.fan_speed_percent != null ? `${Math.round(g.fan_speed_percent)}%` : '—';
+    const vramPct = g.vramTotalMb ? Math.round((g.vramUsedMb / g.vramTotalMb) * 100) : 0;
+    const power = (g.powerDrawW != null && g.powerLimitW)
+      ? `${Math.round(g.powerDrawW)} / ${Math.round(g.powerLimitW)} W`
+      : (g.powerDrawW != null ? `${Math.round(g.powerDrawW)} W` : '—');
+    const temp = g.temperatureC != null ? `${Math.round(g.temperatureC)}°C` : '—';
+    const fan = g.fanSpeedPercent != null ? `${Math.round(g.fanSpeedPercent)}%` : '—';
     const profileBtn = gpuProfileButtonHtml(n, g, idx);
     const pcieLine = [
-      g.pci_bus_id ? escapeHtml(shortPciBusId(g.pci_bus_id)) : null,
+      g.pciBusId ? escapeHtml(shortPciBusId(g.pciBusId)) : null,
       pcieLinkHtml(g) || null,
     ].filter(Boolean).join(' · ');
     const vendor = [
-      g.driver_version ? `driver ${g.driver_version}` : null,
-      g.cuda_version ? `CUDA ${g.cuda_version}` : null,
+      g.driverVersion ? `driver ${g.driverVersion}` : null,
+      g.cudaVersion ? `CUDA ${g.cudaVersion}` : null,
     ].filter(Boolean).join(' · ');
 
     return `
@@ -648,7 +648,7 @@ function renderGpus(n) {
             <div class="nd-meter-bar ${gaugeLevel(usagePct)}"><div class="fill" style="width:${usagePct}%;"></div></div>
           </div>
           <div class="nd-meter">
-            <div class="nd-meter-head"><span class="t">VRAM</span><span class="v">${formatMb(g.vram_used_mb || 0)} / ${formatMb(g.vram_total_mb || 0)} · ${vramPct}%</span></div>
+            <div class="nd-meter-head"><span class="t">VRAM</span><span class="v">${formatMb(g.vramUsedMb || 0)} / ${formatMb(g.vramTotalMb || 0)} · ${vramPct}%</span></div>
             <div class="nd-meter-bar ${gaugeLevel(vramPct)}"><div class="fill" style="width:${vramPct}%;"></div></div>
           </div>
         </div>
@@ -707,24 +707,24 @@ function renderProfilingWrap(n) {
 }
 
 function renderNetwork(n) {
-  const ifaces = Array.isArray(n.network_interfaces) ? n.network_interfaces : [];
+  const ifaces = Array.isArray(n.networkInterfaces) ? n.networkInterfaces : [];
   if (ifaces.length === 0) return '';
 
   const rows = ifaces.map((i, idx) => {
-    const up = i.link_up;
-    const speed = speedLabel(i.speed_mbps);
-    const ipv4 = i.ipv4_address || (up ? '—' : (I18n.t('mesh.network_no_link') || '—'));
+    const up = i.linkUp;
+    const speed = speedLabel(i.speedMbps);
+    const ipv4 = i.ipv4Address || (up ? '—' : (I18n.t('mesh.network_no_link') || '—'));
     const ipv6 = i.ipv6_address || '';
-    const rx = i.rx_bytes_per_sec || 0;
-    const tx = i.tx_bytes_per_sec || 0;
+    const rx = i.rxBytesPerSec || 0;
+    const tx = i.txBytesPerSec || 0;
     const role = ifaceRoleClass(i);
     const roleLabel = ifaceRoleLabel(i);
 
     const badges = [];
-    if (i.interface_type === 'thunderbolt') badges.push('<span class="nd-net-badge tb">TB</span>');
-    if (i.rdma_available) badges.push('<span class="nd-net-badge rdma">RDMA</span>');
-    if (i.roce_available) badges.push('<span class="nd-net-badge roce">RoCE</span>');
-    if (i.numa_node != null && i.numa_node >= 0) badges.push(`<span class="nd-net-badge numa">NUMA${i.numa_node}</span>`);
+    if (i.interfaceType === 'thunderbolt') badges.push('<span class="nd-net-badge tb">TB</span>');
+    if (i.rdmaAvailable) badges.push('<span class="nd-net-badge rdma">RDMA</span>');
+    if (i.roceAvailable) badges.push('<span class="nd-net-badge roce">RoCE</span>');
+    if (i.numaNode != null && i.numaNode >= 0) badges.push(`<span class="nd-net-badge numa">NUMA${i.numaNode}</span>`);
 
     const statusPill = up
       ? '<span class="nd-stat-pill ok dot">UP</span>'
@@ -755,11 +755,11 @@ function renderNetwork(n) {
   }).join('');
 
   const mobileCards = ifaces.map((i, idx) => {
-    const up = i.link_up;
-    const speed = speedLabel(i.speed_mbps);
-    const ipv4 = i.ipv4_address || '—';
-    const rx = i.rx_bytes_per_sec || 0;
-    const tx = i.tx_bytes_per_sec || 0;
+    const up = i.linkUp;
+    const speed = speedLabel(i.speedMbps);
+    const ipv4 = i.ipv4Address || '—';
+    const rx = i.rxBytesPerSec || 0;
+    const tx = i.txBytesPerSec || 0;
     const statusPill = up ? '<span class="nd-stat-pill ok dot">UP</span>' : '<span class="nd-stat-pill off">DOWN</span>';
     return `
       <div class="nd-net-card-m" data-key="iface-card-${escapeAttr(i.name || idx)}">
@@ -823,7 +823,7 @@ function renderModels(n) {
         <span class="kind">${escapeHtml(m.kind || '—')}</span>
         <span class="alias" title="${escapeAttr(m.alias || '')}">${escapeHtml(m.alias || '—')}</span>
         <span class="backend">${escapeHtml(m.backend || '—')}</span>
-        <span class="size">${m.size_mb ? formatMb(m.size_mb) : '—'}</span>
+        <span class="size">${m.sizeMb ? formatMb(m.sizeMb) : '—'}</span>
         ${statusPill}
       </div>
     `;
@@ -854,10 +854,10 @@ function renderContainers(n) {
     else if (exited) statusPill = `<span class="nd-stat-pill off">${escapeHtml(c.status || 'Exited')}</span>`;
     else statusPill = `<span class="nd-stat-pill warn">${escapeHtml(c.status || '—')}</span>`;
 
-    const cpuPct = c.cpu_percent != null ? `${c.cpu_percent.toFixed(1)}%` : '—';
-    const mem = c.memory_limit_mb
-      ? `${formatMb(c.memory_mb || 0)} / ${formatMb(c.memory_limit_mb)}`
-      : formatMb(c.memory_mb || 0);
+    const cpuPct = c.cpuPercent != null ? `${c.cpuPercent.toFixed(1)}%` : '—';
+    const mem = c.memoryLimitMb
+      ? `${formatMb(c.memoryMb || 0)} / ${formatMb(c.memoryLimitMb)}`
+      : formatMb(c.memoryMb || 0);
 
     const actions = running
       ? `<tf-button variant="ghost" size="sm" data-container-action="stop" data-container-name="${escapeAttr(c.name)}">${escapeHtml(I18n.t('mesh.stop'))}</tf-button>
@@ -912,7 +912,7 @@ function renderContainers(n) {
 // Lista id-ow kolektorow rozglaszanych w heartbeacie. Pusta = node nie obsluguje
 // multi-source profilingu (np. brak natywnego daemona z odpowiednimi flagami).
 function profilingCollectors(node) {
-  const list = node?.profiling_collectors_available;
+  const list = node?.profilingCollectorsAvailable;
   return Array.isArray(list) ? list : [];
 }
 
@@ -969,7 +969,7 @@ async function openLaunchModal(node, { gpuIndex = null } = {}) {
   // wiedziec ktore source wymagaja sudo zeby zapytac o haslo PRZED startem.
   let sources = [];
   try {
-    const resp = await profilingCollectorsStatus({ nodeId: node.node_id });
+    const resp = await profilingCollectorsStatus({ nodeId: node.nodeId });
     const collectors = Array.isArray(resp?.collectors) ? resp.collectors : [];
     sources = collectors.map((c) => ({
       id: String(c.id),
@@ -995,7 +995,7 @@ async function openLaunchModal(node, { gpuIndex = null } = {}) {
   }
   try {
     const result = await ProfilingLaunchModal.open({
-      nodeId: node.node_id,
+      nodeId: node.nodeId,
       availableSources: sources,
       preselectGpu,
     });
@@ -1026,8 +1026,8 @@ function bindProfileActions(root, node) {
     if (action === 'profile-view-sessions') {
       const { Router } = await import('/js/router.js');
       Router.navigate('profiling-sessions', {
-        nodeId: node.node_id,
-        nodeName: node.hostname || node.node_id,
+        nodeId: node.nodeId,
+        nodeName: node.hostname || node.nodeId,
       });
     }
   };

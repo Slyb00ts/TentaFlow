@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TentaFlow — Chat (Chat + Audio) · Mockupy</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=1">
+<style>
+  body { padding-bottom: 40px; }
+  .grp { margin-bottom: 34px; }
+  .grp-title { font-size: 13px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--accent-2); font-weight: 800; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  .grp-title .ln { flex: 1; height: 1px; background: var(--border); margin-left: 6px; }
+  .index-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .index-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; color: inherit; display: block; transition: all .12s; }
+  .index-card:hover { border-color: var(--accent-1); transform: translateY(-2px); box-shadow: var(--shadow); }
+  .index-card .id { font-size: 10px; font-weight: 800; letter-spacing: .08em; color: var(--accent-2); margin-bottom: 6px; }
+  .index-card h3 { font-size: 14px; font-weight: 800; color: var(--text); }
+  .index-card p { font-size: 11.5px; color: var(--text-3); line-height: 1.55; margin-top: 4px; }
+  @media (max-width: 900px) { .index-grid { grid-template-columns: 1fr 1fr; } .intro .rules { grid-template-columns: 1fr; } }
+  @media (max-width: 560px) { .index-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<div class="intro">
+  <h1>Chat · tryby Chat i Audio (2026-10)</h1>
+  <p class="lead">
+    Nowy ekran Chat zastępuje dotychczasowy układ rozmowy: przełącznik <b>Chat / Audio</b>, na górnej belce i
+    <b>prędkość decode (tok/s) tej jednej rozmowy</b> (wartość bieżąca, średnia sesji, sparkline, tooltip z wyjaśnieniem), kompozytor jak w
+    TentaForge i konwencja nagłówka z TentaQuant. W trybie Audio animowana twarz <span class="mono">tf-face</span> (prawdziwy komponent, nie
+    uproszczenie) zajmuje większość sceny, po prawej stronie jest transkrypt na żywo z wyróżnionym bieżącym zdaniem; na telefonie zostaje
+    wyłącznie twarz i dolny dock.
+  </p>
+  <div class="rules">
+    <div class="rule"><h3>Zasada 1</h3><p>Metryka na belce dotyczy <b>tej sesji</b>, nigdy sumy ruchu wszystkich użytkowników; tooltip mówi to wprost.</p></div>
+    <div class="rule"><h3>Zasada 2</h3><p>Układ reaguje na szerokość kontenera (container queries): ≥1240 px trzy kolumny, poniżej lista rozmów jako szuflada, poniżej 1024 px także nawigacja, poniżej 720 px transkryptu nie ma.</p></div>
+    <div class="rule"><h3>Zasada 3</h3><p>W nagłówku każdego ekranu (tylko mockup) są przełączniki: Desktop / Telefon 390.</p></div>
+  </div>
+</div>
+
+<div class="screen">
+  <div class="grp">
+    <div class="grp-title">Tryb Chat<span class="ln"></span></div>
+    <div class="index-grid">
+      <a class="index-card" href="ch01-pusty.html"><div class="id">CH01</div><h3>Pusta rozmowa</h3><p>Nowa rozmowa, podpowiedzi startowe; komórka Decode czeka na pierwszą odpowiedź tej sesji.</p></a>
+      <a class="index-card" href="ch02-odpowiedz.html"><div class="id">CH02</div><h3>Odpowiedź strumieniowana</h3><p>Odpowiedź na żywo, metryki sesji (bieżąca, średnia, min–max, sparkline), przycisk Zatrzymaj.</p></a>
+    </div>
+  </div>
+  <div class="grp">
+    <div class="grp-title">Tryb Audio<span class="ln"></span></div>
+    <div class="index-grid">
+      <a class="index-card" href="ch03-audio.html"><div class="id">CH03</div><h3>Audio · desktop</h3><p>Twarz na większości sceny, transkrypt po prawej; stany: słucha, myśli, mówi (automatyczny scenariusz lub wybór).</p></a>
+      <a class="index-card" href="ch04-audio-mobile.html"><div class="id">CH04</div><h3>Audio · telefon</h3><p>Ten sam ekran w ramce 390 × 844: tylko twarz, fala i dock, bez transkryptu.</p></a>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

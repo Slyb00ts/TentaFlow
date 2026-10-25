@@ -92,7 +92,7 @@ export function createComparePanel(host) {
     const { before, after, items, unitTypes } = comparison;
     const choices = unitChoices(before.view, after.view, items);
     // A unit both days know shows a real "before"; a unit the reorganization creates has nothing to show on that side.
-    const existedBefore = (c) => (before.view.units ?? []).some((u) => u.unit_id === c.id);
+    const existedBefore = (c) => (before.view.units ?? []).some((u) => u.unitId === c.id);
     if (!choices.some((c) => c.id === unitId)) unitId = (choices.find(existedBefore) ?? choices[0])?.id ?? '';
     const unitSelect = q('unit');
     unitSelect.hidden = choices.length === 0;
@@ -105,7 +105,7 @@ export function createComparePanel(host) {
     q('hint').textContent = t('compare_hint', { before: before.label, after: after.label });
 
     const within = new Set([...subtreeUnitIds(before.view, unitId), ...subtreeUnitIds(after.view, unitId)]);
-    const inUnit = items.filter((item) => !unitId || within.has(item.unit_id));
+    const inUnit = items.filter((item) => !unitId || within.has(item.unitId));
     const scoped = { before: viewSubset(before.view, unitId), after: viewSubset(after.view, unitId) };
     const hasStructure = scoped.before.positions.length + scoped.after.positions.length > 0;
     const note = !hasStructure || inUnit.length === 0;

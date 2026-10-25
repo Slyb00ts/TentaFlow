@@ -372,13 +372,13 @@ function projectAccess(project = state.project) {
 }
 
 const canArea = (area, minimum = 'read') => allowsArea(projectAccess(), area, minimum);
-const canManageMembers = () => !!fv(projectAccess(), 'can_manage_members') && !projectAccess().archived && !projectAccess().ended;
-const canTransferOwnership = () => !!fv(projectAccess(), 'is_owner') && !projectAccess().archived && !projectAccess().ended;
+const canManageMembers = () => !!projectAccess()?.canManageMembers && !projectAccess().archived && !projectAccess().ended;
+const canTransferOwnership = () => !!projectAccess()?.isOwner && !projectAccess().archived && !projectAccess().ended;
 const canSendChat = () => canArea('chat', 'write') && canArea('knowledge');
 const canTryRun = () => canArea('tests', 'write') && canArea('environments');
 const canGenerateTests = () => canArea('tests', 'write') && canArea('knowledge');
-const canRunSchedule = (schedule) => canArea('tests', 'write') && (fv(schedule, 'run_type') === 'manual' || canArea('environments'));
-const canProject = (action, project = state.project) => project?.[`can_${action}`] === true;
+const canRunSchedule = (schedule) => canArea('tests', 'write') && (schedule?.runType === 'manual' || canArea('environments'));
+const canProject = (action, project = state.project) => project?.[`can${action[0].toUpperCase()}${action.slice(1)}`] === true;
 
 function functionLabel(definition) {
   return catalogueLabel(definition, 'name', t);
@@ -391,16 +391,16 @@ function functionDescription(definition) {
 function functionChips(functions, catalogue = state.functions) {
   if (!functions?.length) return `<span class="ps-field-hint">${escapeHtml(t('functions_none'))}</span>`;
   return functions.map((id) => {
-    const definition = catalogue.find((entry) => fv(entry, 'function_id') === id);
+    const definition = catalogue.find((entry) => entry?.functionId === id);
     return `<tf-chip status="info">${escapeHtml(definition ? functionLabel(definition) : id)}</tf-chip>`;
   }).join(' ');
 }
 
 function accessSummary(project) {
   const access = projectAccess(project);
-  if (fv(access, 'is_owner')) return t('access_owner');
-  if (fv(access, 'project_admin')) return t('access_project_admin');
-  if (fv(access, 'app_admin')) return t('access_app_admin');
+  if (access?.isOwner) return t('access_owner');
+  if (access?.projectAdmin) return t('access_project_admin');
+  if (access?.appAdmin) return t('access_app_admin');
   return t('access_member');
 }
 
@@ -417,14 +417,14 @@ function memberAccessFields(member, catalogue, suffix = '') {
     <div class="ps-access-form" data-access-form="${escapeAttr(suffix)}">
       <div class="ps-field-label">${escapeHtml(t('functions_label'))}</div>
       <div class="ps-function-choices">
-        ${catalogue.map((definition) => `<tf-checkbox data-member-function="${escapeAttr(fv(definition, 'function_id'))}"
-          label="${escapeAttr(functionLabel(definition))}" ${assigned.includes(fv(definition, 'function_id')) ? 'checked' : ''}></tf-checkbox>`).join('')}
+        ${catalogue.map((definition) => `<tf-checkbox data-member-function="${escapeAttr(definition?.functionId)}"
+          label="${escapeAttr(functionLabel(definition))}" ${assigned.includes(definition?.functionId) ? 'checked' : ''}></tf-checkbox>`).join('')}
       </div>
-      <tf-checkbox data-project-admin label="${escapeAttr(t('access_project_admin'))}" ${fv(member, 'project_admin') ? 'checked' : ''}></tf-checkbox>
+      <tf-checkbox data-project-admin label="${escapeAttr(t('access_project_admin'))}" ${member?.projectAdmin ? 'checked' : ''}></tf-checkbox>
       <div class="ps-field-hint">${escapeHtml(t('access_admin_hint'))}</div>
       <tf-input data-member-expiry type="datetime-local" step="1" label="${escapeAttr(t('members_expiry'))}"
-        value="${escapeAttr(expiryToLocal(fv(member, 'expires_at')))}" ${fv(member, 'is_owner') ? 'disabled' : ''}
-        hint="${escapeAttr(t(fv(member, 'is_owner') ? 'members_expiry_owner_hint' : 'members_expiry_hint', { timezone: Intl.DateTimeFormat().resolvedOptions().timeZone }))}"></tf-input>
+        value="${escapeAttr(expiryToLocal(member?.expiresAt))}" ${member?.isOwner ? 'disabled' : ''}
+        hint="${escapeAttr(t(member?.isOwner ? 'members_expiry_owner_hint' : 'members_expiry_hint', { timezone: Intl.DateTimeFormat().resolvedOptions().timeZone }))}"></tf-input>
     </div>`;
 }
 
@@ -722,12 +722,12 @@ async function loadProjects() {
     const response = await ApiBinary.one('projectStudioProjectTreeRequest', { projectId: null, includeEnded: true, includeArchived: true });
     state.projects = response.projects;
     state.breadcrumbs = response.breadcrumbs;
-    state.canCreate = response.can_create;
-    state.isAdmin = response.can_administer;
+    state.canCreate = response.canCreate;
+    state.isAdmin = response.canAdminister;
     state.catalogues.clear();
-    await Promise.allSettled(projectRoots(visibleProjects()).map((project) => loadCatalogue(project.project_id)));
+    await Promise.allSettled(projectRoots(visibleProjects()).map((project) => loadCatalogue(project.projectId)));
     const choices = new Map(BUILTIN_FUNCTIONS.map((definition) => [definition.functionId, definition]));
-    for (const catalogue of state.catalogues.values()) for (const definition of catalogue) choices.set(fv(definition, 'function_id'), definition);
+    for (const catalogue of state.catalogues.values()) for (const definition of catalogue) choices.set(definition?.functionId, definition);
     byId('ps-function-filter')?.setOptions([{ value: 'all', label: t('project_function_filter') }, ...[...choices].map(([value, definition]) => ({ value, label: functionLabel(definition) }))], state.functionFilter);
   } catch (error) { toast(`${t('load_failed')}: ${error.message}`, 'error'); return; }
   byId('ps-new').hidden = !state.canCreate;
@@ -771,12 +771,12 @@ function visibleProjects() {
 }
 
 function projectCardHtml(project) {
-  const projectId = project.project_id ?? project.projectId;
+  const projectId = project.projectId;
   const archived = project.status === 'archived';
   const access = projectAccess(project);
-  const memberCount = project.member_count ?? project.memberCount ?? 0;
-  const sourceCount = project.source_count ?? project.sourceCount ?? 0;
-  const sourcesReady = project.sources_ready ?? project.sourcesReady ?? 0;
+  const memberCount = project.memberCount ?? 0;
+  const sourceCount = project.sourceCount ?? 0;
+  const sourcesReady = project.sourcesReady ?? 0;
   const menuItems = [
     `<tf-menu-item action="open" icon="external-link">${escapeHtml(t('action_open'))}</tf-menu-item>`,
   ];
@@ -785,7 +785,7 @@ function projectCardHtml(project) {
       ? `<tf-menu-item action="unarchive" icon="refresh">${escapeHtml(t('action_unarchive'))}</tf-menu-item>`
       : `<tf-menu-item action="archive" icon="clock">${escapeHtml(t('action_archive'))}</tf-menu-item>`);
   }
-  if (canProject('create_child', project)) menuItems.push(`<tf-menu-item action="child" icon="plus">${escapeHtml(t('subproject_new'))}</tf-menu-item>`);
+  if (canProject('createChild', project)) menuItems.push(`<tf-menu-item action="child" icon="plus">${escapeHtml(t('subproject_new'))}</tf-menu-item>`);
   if (canProject('move', project)) menuItems.push(`<tf-menu-item action="move" icon="branch">${escapeHtml(t('subproject_move'))}</tf-menu-item>`);
   if (canProject('end', project) || canProject('resume', project)) menuItems.push(`<tf-menu-item action="lifecycle" icon="clock">${escapeHtml(t(project.lifecycle === 'ended' ? 'project_resume' : 'project_end'))}</tf-menu-item>`);
   if (canProject('delete', project)) {
@@ -802,11 +802,11 @@ function projectCardHtml(project) {
         </div>
         <tf-chip status="${archived || project.lifecycle === 'ended' ? 'warn' : 'ok'}" dot>${escapeHtml(t(archived ? 'status_archived' : project.lifecycle === 'ended' ? 'status_ended' : 'status_active'))}</tf-chip>
       </div>
-      ${project.parent_id ? `<div class="ps-card-ancestors">${escapeHtml(projectAncestors(project, state.projects, state.breadcrumbs).map((row) => row.name).join(' / '))}</div>` : ''}
+      ${project.parentId ? `<div class="ps-card-ancestors">${escapeHtml(projectAncestors(project, state.projects, state.breadcrumbs).map((row) => row.name).join(' / '))}</div>` : ''}
       <div class="ps-card-stats">
-        <span class="ps-card-stat">${escapeHtml(t('tree_open_count', { own: project.own_open_tasks, descendants: project.descendant_open_tasks }))}</span>
-        <span class="ps-card-stat">${escapeHtml(t('tree_my_count', { count: project.my_open_tasks }))}</span>
-        <span class="ps-card-stat">${escapeHtml(t('tree_overdue_count', { count: project.overdue_tasks }))}</span>
+        <span class="ps-card-stat">${escapeHtml(t('tree_open_count', { own: project.ownOpenTasks, descendants: project.descendantOpenTasks }))}</span>
+        <span class="ps-card-stat">${escapeHtml(t('tree_my_count', { count: project.myOpenTasks }))}</span>
+        <span class="ps-card-stat">${escapeHtml(t('tree_overdue_count', { count: project.overdueTasks }))}</span>
         <span class="ps-card-stat">${sprite('users')}<b>${memberCount}</b>&nbsp;${escapeHtml(t('stat_members'))}</span>
         <span class="ps-card-stat">${sprite('database')}<b>${sourcesReady}/${sourceCount}</b>&nbsp;${escapeHtml(t('stat_sources'))}</span>
       </div>
@@ -814,7 +814,7 @@ function projectCardHtml(project) {
         <tf-chip status="accent">${escapeHtml(accessSummary(project))}</tf-chip>
         ${functionChips(access.functions, state.catalogues.get(projectId) || [])}
         <tf-chip status="info">${escapeHtml(orientationLabel(project))}</tf-chip>
-        ${state.projects.some((child) => child.parent_id === projectId) ? `<tf-button variant="ghost" size="sm" icon="${state.expandedProjects.has(projectId) ? 'chevron-up' : 'chevron-down'}" data-expand-project aria-expanded="${state.expandedProjects.has(projectId)}">${escapeHtml(t('tree_children_count', { count: state.projects.filter((child) => child.parent_id === projectId).length }))}</tf-button>` : ''}
+        ${state.projects.some((child) => child.parentId === projectId) ? `<tf-button variant="ghost" size="sm" icon="${state.expandedProjects.has(projectId) ? 'chevron-up' : 'chevron-down'}" data-expand-project aria-expanded="${state.expandedProjects.has(projectId)}">${escapeHtml(t('tree_children_count', { count: state.projects.filter((child) => child.parentId === projectId).length }))}</tf-button>` : ''}
         <div class="ps-card-menu-wrap">
           <tf-button variant="ghost" size="sm" icon="chevron-down" data-more title="${escapeAttr(t('action_more'))}"></tf-button>
           <tf-menu placement="bottom-end" data-card-menu>${menuItems.join('')}</tf-menu>
@@ -848,8 +848,8 @@ function renderProjectGrid() {
   }
   host.innerHTML = `<div class="ps-grid">${visible.map(projectCardHtml).join('')}${addCard}</div>`;
   for (const project of visible) {
-    const tree = host.querySelector(`[data-project-id="${CSS.escape(project.project_id)}"] [data-card-children] tf-tree`);
-    if (tree) fillProjectTree(tree, descendantsOf(project.project_id, false));
+    const tree = host.querySelector(`[data-project-id="${CSS.escape(project.projectId)}"] [data-card-children] tf-tree`);
+    if (tree) fillProjectTree(tree, descendantsOf(project.projectId, false));
   }
 }
 
@@ -870,15 +870,15 @@ function renderProjectTable(host, visible) {
     const archived = p.status === 'archived';
     const modules = Array.isArray(p.modules) ? p.modules : [];
     return {
-      _id: p.project_id ?? p.projectId,
+      _id: p.projectId,
       name: `<div class="tf-table__cell-title">${escapeHtml(p.name)}</div>`
         + `<div class="tf-table__cell-sub">${escapeHtml(p.description || '')}</div>`,
       status: chipCell(archived ? 'warn' : 'ok', t(archived ? 'status_archived' : 'status_active')),
-      functions: `<tf-chip status="accent">${escapeHtml(accessSummary(p))}</tf-chip> ${functionChips(projectAccess(p).functions, state.catalogues.get(fv(p, 'project_id')) || [])}`,
+      functions: `<tf-chip status="accent">${escapeHtml(accessSummary(p))}</tf-chip> ${functionChips(projectAccess(p).functions, state.catalogues.get(p?.projectId) || [])}`,
       modules: modules.map((m) => t(`module_${m}`)).join(', ') || '—',
-      members: Number(p.member_count ?? p.memberCount ?? 0),
-      sources: `${p.sources_ready ?? p.sourcesReady ?? 0}/${p.source_count ?? p.sourceCount ?? 0}`,
-      updated: formatTimestamp(p.updated_at ?? p.updatedAt),
+      members: Number(p.memberCount ?? 0),
+      sources: `${p.sourcesReady ?? 0}/${p.sourceCount ?? 0}`,
+      updated: formatTimestamp(p.updatedAt),
     };
   });
   table.addEventListener('row-click', (e) => {
@@ -935,7 +935,7 @@ function wireGridEvents() {
     const card = e.target.closest('[data-project-id]');
     if (!card || !e.target.closest('[data-card-menu]')) return;
     const projectId = card.dataset.projectId;
-    const project = state.projects.find((p) => (p.project_id ?? p.projectId) === projectId);
+    const project = state.projects.find((p) => (p.projectId) === projectId);
     switch (e.detail?.action) {
       case 'open': openProject(projectId); break;
       case 'archive': setProjectArchived(projectId, true); break;
@@ -950,15 +950,15 @@ function wireGridEvents() {
 }
 
 function setProjectArchived(projectId, archived) {
-  const project = state.projects.find((row) => row.project_id === projectId) || (state.project?.project_id === projectId ? state.project : null);
+  const project = state.projects.find((row) => row.projectId === projectId) || (state.project?.projectId === projectId ? state.project : null);
   if (!canProject(archived ? 'archive' : 'unarchive', project)) return;
   openProjectArchiveWindow(project, archived);
 }
 
 function confirmDeleteProject(project, { fromList = false } = {}) {
-  const projectId = project.project_id ?? project.projectId;
-  const sourceCount = project.source_count ?? project.sourceCount ?? 0;
-  const memberCount = project.member_count ?? project.memberCount ?? 0;
+  const projectId = project.projectId;
+  const sourceCount = project.sourceCount ?? 0;
+  const memberCount = project.memberCount ?? 0;
   openDeleteWindow({
     title: t('delete_project_title'),
     targetName: project.name,
@@ -981,9 +981,9 @@ function confirmDeleteProject(project, { fromList = false } = {}) {
 }
 
 function descendantsOf(id, includeSelf = true) {
-  const project = state.projects.find((row) => row.project_id === id) || (state.project?.project_id === id ? state.project : null);
+  const project = state.projects.find((row) => row.projectId === id) || (state.project?.projectId === id ? state.project : null);
   if (!project) return [];
-  return state.projects.filter((row) => includeSelf && row.project_id === id || row.path.startsWith(`${project.path}/`));
+  return state.projects.filter((row) => includeSelf && row.projectId === id || row.path.startsWith(`${project.path}/`));
 }
 
 async function switchProject(id) {
@@ -996,13 +996,13 @@ async function switchProject(id) {
 }
 
 function projectTreeActions(project, anchor) {
-  const items = [{ label: t('action_open'), icon: 'external-link', run: () => switchProject(project.project_id) }];
+  const items = [{ label: t('action_open'), icon: 'external-link', run: () => switchProject(project.projectId) }];
   if (allowsArea(project.access, 'settings', 'write')) items.push({ label: t('inheritance_title'), icon: 'settings', run: () => openProjectInheritanceWindow(project) });
-  if (canProject('create_child', project)) items.push({ label: t('subproject_new'), icon: 'plus', run: () => openSubprojectWindow(project) });
+  if (canProject('createChild', project)) items.push({ label: t('subproject_new'), icon: 'plus', run: () => openSubprojectWindow(project) });
   if (canProject('move', project)) items.push({ label: t('subproject_move'), icon: 'branch', run: () => openProjectMoveWindow(project) });
   if (canProject('end', project) || canProject('resume', project)) items.push({ label: t(project.lifecycle === 'ended' ? 'project_resume' : 'project_end'), icon: 'clock', run: () => openProjectLifecycleWindow(project) });
-  if (canProject(project.status === 'archived' ? 'unarchive' : 'archive', project)) items.push({ label: t(project.status === 'archived' ? 'action_unarchive' : 'action_archive'), icon: 'archive', run: () => setProjectArchived(project.project_id, project.status !== 'archived') });
-  if (canProject('delete', project)) items.push({ label: t('action_delete'), icon: 'trash', danger: true, run: () => confirmDeleteProject(project, { fromList: state.project?.project_id !== project.project_id }) });
+  if (canProject(project.status === 'archived' ? 'unarchive' : 'archive', project)) items.push({ label: t(project.status === 'archived' ? 'action_unarchive' : 'action_archive'), icon: 'archive', run: () => setProjectArchived(project.projectId, project.status !== 'archived') });
+  if (canProject('delete', project)) items.push({ label: t('action_delete'), icon: 'trash', danger: true, run: () => confirmDeleteProject(project, { fromList: state.project?.projectId !== project.projectId }) });
   openActionMenu(anchor, items, project.name);
 }
 
@@ -1011,8 +1011,8 @@ function fillProjectTree(tree, projects, { onSelect, allowMove = false, breadcru
     const actions = document.createElement('tf-button');
     actions.setAttribute('variant', 'ghost'); actions.setAttribute('size', 'sm'); actions.setAttribute('icon', 'more'); actions.setAttribute('title', t('action_more'));
     actions.addEventListener('click', (event) => { event.stopPropagation(); projectTreeActions(project, actions); });
-    return { actions, draggable: allowMove && canProject('move', project), droppable: allowMove && project.depth < 4 && project.access.is_owner && !project.access.archived && !project.access.ended,
-      badge: { text: t('tree_open_count', { own: project.own_open_tasks, descendants: project.descendant_open_tasks }), tone: 'info' } };
+    return { actions, draggable: allowMove && canProject('move', project), droppable: allowMove && project.depth < 4 && project.access.isOwner && !project.access.archived && !project.access.ended,
+      badge: { text: t('tree_open_count', { own: project.ownOpenTasks, descendants: project.descendantOpenTasks }), tone: 'info' } };
   });
   const expanded = [];
   const expand = (nodes) => { for (const node of nodes) if (node.children.length) { expanded.push(node.id); expand(node.children); } };
@@ -1021,11 +1021,11 @@ function fillProjectTree(tree, projects, { onSelect, allowMove = false, breadcru
   tree.addEventListener('expand', (event) => { tree.expandedIds = [...new Set([...tree.expandedIds, event.detail.id])]; });
   tree.addEventListener('collapse', (event) => { tree.expandedIds = [...tree.expandedIds].filter((id) => id !== event.detail.id); });
   tree.addEventListener('select', (event) => {
-    const project = projects.find((row) => row.project_id === event.detail.id);
-    if (project) (onSelect || ((row) => switchProject(row.project_id)))(project);
+    const project = projects.find((row) => row.projectId === event.detail.id);
+    if (project) (onSelect || ((row) => switchProject(row.projectId)))(project);
   });
   tree.addEventListener('move', (event) => {
-    const source = projects.find((row) => row.project_id === event.detail.id);
+    const source = projects.find((row) => row.projectId === event.detail.id);
     if (source) openProjectMoveWindow(source, event.detail.parentId);
   });
 }
@@ -1037,13 +1037,13 @@ function openProjectPicker() {
   foot.querySelector('[data-close]').addEventListener('click', cleanup);
   const render = () => {
     const query = body.querySelector('[data-tree-search]').value.trim().toLowerCase();
-    const projects = state.projects.filter((project) => (!query || `${project.name} ${project.description}`.toLowerCase().includes(query)) && (!body.querySelector('[data-tree-my]').checked || project.my_open_tasks > 0) && (!body.querySelector('[data-tree-open]').checked || project.own_open_tasks + project.descendant_open_tasks > 0) && (!body.querySelector('[data-tree-due]').checked || project.overdue_tasks > 0) && (body.querySelector('[data-tree-ended]').checked || project.lifecycle !== 'ended'));
+    const projects = state.projects.filter((project) => (!query || `${project.name} ${project.description}`.toLowerCase().includes(query)) && (!body.querySelector('[data-tree-my]').checked || project.myOpenTasks > 0) && (!body.querySelector('[data-tree-open]').checked || project.ownOpenTasks + project.descendantOpenTasks > 0) && (!body.querySelector('[data-tree-due]').checked || project.overdueTasks > 0) && (body.querySelector('[data-tree-ended]').checked || project.lifecycle !== 'ended'));
     const host = body.querySelector('[data-picker-tree]');
     host.innerHTML = projects.length ? '<tf-tree></tf-tree>' : `<tf-empty-state icon="folder" title="${escapeAttr(t('tree_empty'))}"></tf-empty-state>`;
     if (projects.length) {
-      const filteredIds = new Set(projects.map((project) => project.project_id));
-      const ancestors = state.projects.filter((project) => !filteredIds.has(project.project_id) && projects.some((child) => child.path.startsWith(`${project.path}/`))).map(({ project_id, name, depth }) => ({ project_id, name, depth }));
-      fillProjectTree(host.querySelector('tf-tree'), projects, { breadcrumbs: [...state.breadcrumbs, ...ancestors], onSelect: async (project) => { cleanup(); await switchProject(project.project_id); } });
+      const filteredIds = new Set(projects.map((project) => project.projectId));
+      const ancestors = state.projects.filter((project) => !filteredIds.has(project.projectId) && projects.some((child) => child.path.startsWith(`${project.path}/`))).map(({ projectId, name, depth }) => ({ projectId, name, depth }));
+      fillProjectTree(host.querySelector('tf-tree'), projects, { breadcrumbs: [...state.breadcrumbs, ...ancestors], onSelect: async (project) => { cleanup(); await switchProject(project.projectId); } });
     }
   };
   body.querySelector('[data-tree-search]').addEventListener('search', render);
@@ -1056,7 +1056,7 @@ function moduleChips(modules) {
 }
 
 function openSubprojectWindow(parent) {
-  if (!canProject('create_child', parent)) return;
+  if (!canProject('createChild', parent)) return;
   const { body, foot, cleanup } = openWindow({ title: t('subproject_new'), subtitle: parent.name, icon: 'branch', width: 720 });
   body.innerHTML = `<tf-input data-child-name label="${escapeAttr(t('wizard_name_label'))}"></tf-input><tf-input data-child-prefix label="${escapeAttr(t('project_key_prefix'))}" maxlength="8" hint="${escapeAttr(t('project_key_prefix_hint'))}"></tf-input><tf-textarea data-child-desc rows="3" label="${escapeAttr(t('wizard_desc_label'))}"></tf-textarea><tf-select data-child-template label="${escapeAttr(t('wizard_template_label'))}" value="deployment">${CHILD_TEMPLATES.map((preset) => `<option value="${preset.id}">${escapeHtml(t(`subproject_template_${preset.id}`))}</option>`).join('')}</tf-select><span data-template-hint class="ps-field-hint"></span><tf-checkbox data-child-inherit-modules checked label="${escapeAttr(t('inherit_modules'))}"></tf-checkbox><tf-checkbox data-child-inherit-types checked label="${escapeAttr(t('inherit_task_types'))}"></tf-checkbox><div data-child-effective class="ps-module-preview"></div><tf-checkbox data-child-private label="${escapeAttr(t('subproject_private'))}"></tf-checkbox><span class="ps-field-hint">${escapeHtml(t('subproject_private_hint'))}</span><span class="ps-field-hint">${escapeHtml(t('inheritance_members_hint'))}</span><div data-form-error class="ps-form-error" hidden></div>`;
   foot.innerHTML = `<div></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" icon="plus" data-action="save">${escapeHtml(t('wizard_create'))}</tf-button></div>`;
@@ -1082,32 +1082,32 @@ function openSubprojectWindow(parent) {
     button.setAttribute('disabled', '');
     const preset = CHILD_TEMPLATES.find((entry) => entry.id === body.querySelector('[data-child-template]').value);
     try {
-      const result = await ApiBinary.one('projectStudioProjectCreateRequest', { name, description: body.querySelector('[data-child-desc]').value.trim(), keyPrefix, template: preset.id, modules: preset.modules, parentId: parent.project_id, isPrivate: body.querySelector('[data-child-private]').checked, inheritModules: body.querySelector('[data-child-inherit-modules]').checked, inheritTaskTypes: body.querySelector('[data-child-inherit-types]').checked, members: [] });
-      toast(t('subproject_created'), 'success'); cleanup(); await loadProjects(); await openProject(result.project_id);
+      const result = await ApiBinary.one('projectStudioProjectCreateRequest', { name, description: body.querySelector('[data-child-desc]').value.trim(), keyPrefix, template: preset.id, modules: preset.modules, parentId: parent.projectId, isPrivate: body.querySelector('[data-child-private]').checked, inheritModules: body.querySelector('[data-child-inherit-modules]').checked, inheritTaskTypes: body.querySelector('[data-child-inherit-types]').checked, members: [] });
+      toast(t('subproject_created'), 'success'); cleanup(); await loadProjects(); await openProject(result.projectId);
     } catch (error) { errorEl.hidden = false; errorEl.textContent = `${t('create_failed')}: ${error.message}`; button.removeAttribute('disabled'); }
   });
 }
 
 function openProjectMoveWindow(project, targetId = null) {
   if (!canProject('move', project)) return;
-  const height = Math.max(project.depth, ...descendantsOf(project.project_id).map((row) => row.depth)) - project.depth;
-  const destinations = state.projects.filter((row) => row.access.is_owner && !row.access.archived && !row.access.ended && row.project_id !== project.project_id && !row.path.startsWith(`${project.path}/`) && row.depth + 1 + height <= 4);
-  if (targetId && !destinations.some((row) => row.project_id === targetId)) { toast(t('subproject_move_invalid_target'), 'error'); return; }
+  const height = Math.max(project.depth, ...descendantsOf(project.projectId).map((row) => row.depth)) - project.depth;
+  const destinations = state.projects.filter((row) => row.access.isOwner && !row.access.archived && !row.access.ended && row.projectId !== project.projectId && !row.path.startsWith(`${project.path}/`) && row.depth + 1 + height <= 4);
+  if (targetId && !destinations.some((row) => row.projectId === targetId)) { toast(t('subproject_move_invalid_target'), 'error'); return; }
   const { body, foot, cleanup } = openWindow({ title: t('subproject_move'), subtitle: project.name, icon: 'branch', width: 650 });
-  body.innerHTML = `<div class="ps-banner-warn">${escapeHtml(t('subproject_move_hint'))}</div><tf-select data-move-parent label="${escapeAttr(t('subproject_parent'))}" value="${escapeAttr(targetId || '')}"><option value="">${escapeHtml(t('subproject_root'))}</option>${destinations.map((row) => `<option value="${escapeAttr(row.project_id)}" ${row.project_id === targetId ? 'selected' : ''}>${escapeHtml([...projectAncestors(row, state.projects, state.breadcrumbs).map((item) => item.name), row.name].join(' / '))}</option>`).join('')}</tf-select><div data-form-error class="ps-form-error" hidden></div>`;
+  body.innerHTML = `<div class="ps-banner-warn">${escapeHtml(t('subproject_move_hint'))}</div><tf-select data-move-parent label="${escapeAttr(t('subproject_parent'))}" value="${escapeAttr(targetId || '')}"><option value="">${escapeHtml(t('subproject_root'))}</option>${destinations.map((row) => `<option value="${escapeAttr(row.projectId)}" ${row.projectId === targetId ? 'selected' : ''}>${escapeHtml([...projectAncestors(row, state.projects, state.breadcrumbs).map((item) => item.name), row.name].join(' / '))}</option>`).join('')}</tf-select><div data-form-error class="ps-form-error" hidden></div>`;
   foot.innerHTML = `<div></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" icon="branch" data-action="save">${escapeHtml(t('subproject_move'))}</tf-button></div>`;
   foot.addEventListener('click', async (event) => {
     const button = event.target.closest('[data-action]'); if (!button || button.hasAttribute('disabled')) return;
     if (button.dataset.action === 'cancel') { cleanup(); return; }
     button.setAttribute('disabled', '');
-    try { await ApiBinary.one('projectStudioProjectMoveRequest', { projectId: project.project_id, newParentId: body.querySelector('[data-move-parent]').value || null }); toast(t('subproject_moved'), 'success'); cleanup(); await loadProjects(); if (state.project) await refreshProjectHeader(); }
+    try { await ApiBinary.one('projectStudioProjectMoveRequest', { projectId: project.projectId, newParentId: body.querySelector('[data-move-parent]').value || null }); toast(t('subproject_moved'), 'success'); cleanup(); await loadProjects(); if (state.project) await refreshProjectHeader(); }
     catch (error) { const el = body.querySelector('[data-form-error]'); el.hidden = false; el.textContent = error.message; button.removeAttribute('disabled'); }
   });
 }
 
 function renderSubprojectSettings(host) {
   if (!host) return;
-  host.innerHTML = `<div class="ps-members-toolbar">${canProject('create_child') ? `<tf-button variant="primary" icon="plus" data-child-create>${escapeHtml(t('subproject_new'))}</tf-button>` : ''}${canProject('move') ? `<tf-button variant="ghost" icon="branch" data-child-move>${escapeHtml(t('subproject_move'))}</tf-button>` : ''}</div><div class="ps-subproject-layout"><div class="ps-project-tree"><tf-tree></tf-tree></div><div data-inheritance-inspector></div></div>`;
+  host.innerHTML = `<div class="ps-members-toolbar">${canProject('createChild') ? `<tf-button variant="primary" icon="plus" data-child-create>${escapeHtml(t('subproject_new'))}</tf-button>` : ''}${canProject('move') ? `<tf-button variant="ghost" icon="branch" data-child-move>${escapeHtml(t('subproject_move'))}</tf-button>` : ''}</div><div class="ps-subproject-layout"><div class="ps-project-tree"><tf-tree></tf-tree></div><div data-inheritance-inspector></div></div>`;
   host.querySelector('[data-child-create]')?.addEventListener('click', () => openSubprojectWindow(state.project));
   host.querySelector('[data-child-move]')?.addEventListener('click', () => openProjectMoveWindow(state.project));
   const inspector = host.querySelector('[data-inheritance-inspector]');
@@ -1125,7 +1125,7 @@ function openProjectInheritanceWindow(project) {
 function renderProjectInheritance(host, project) {
   const mutable = allowsArea(project.access, 'settings', 'write');
   host.classList.add('ps-inheritance-editor');
-  host.innerHTML = `<h3>${escapeHtml(project.name)}</h3><span class="ps-field-hint">${escapeHtml(t('inheritance_members_hint'))}</span><tf-checkbox data-inheritance-private label="${escapeAttr(t('subproject_private'))}" ${project.is_private ? 'checked' : ''} ${mutable ? '' : 'disabled'}></tf-checkbox><span class="ps-field-hint">${escapeHtml(t('subproject_private_hint'))}</span><tf-checkbox data-inheritance-modules label="${escapeAttr(t('inherit_modules'))}" ${project.inherit_modules ? 'checked' : ''} ${mutable && project.parent_id ? '' : 'disabled'}></tf-checkbox><tf-checkbox data-inheritance-types label="${escapeAttr(t('inherit_task_types'))}" ${project.inherit_task_types ? 'checked' : ''} ${mutable && project.parent_id ? '' : 'disabled'}></tf-checkbox><div class="ps-members-toolbar">${mutable && project.parent_id ? `<tf-button variant="ghost" data-detach>${escapeHtml(t('inheritance_detach'))}</tf-button><tf-button variant="ghost" data-reinherit>${escapeHtml(t('inheritance_reinherit'))}</tf-button>` : ''}</div><div data-inheritance-diff></div>${mutable ? `<tf-button variant="primary" icon="check" data-inheritance-save disabled>${escapeHtml(t('action_save'))}</tf-button>` : ''}<div class="ps-form-error" data-form-error hidden></div>`;
+  host.innerHTML = `<h3>${escapeHtml(project.name)}</h3><span class="ps-field-hint">${escapeHtml(t('inheritance_members_hint'))}</span><tf-checkbox data-inheritance-private label="${escapeAttr(t('subproject_private'))}" ${project.isPrivate ? 'checked' : ''} ${mutable ? '' : 'disabled'}></tf-checkbox><span class="ps-field-hint">${escapeHtml(t('subproject_private_hint'))}</span><tf-checkbox data-inheritance-modules label="${escapeAttr(t('inherit_modules'))}" ${project.inheritModules ? 'checked' : ''} ${mutable && project.parentId ? '' : 'disabled'}></tf-checkbox><tf-checkbox data-inheritance-types label="${escapeAttr(t('inherit_task_types'))}" ${project.inheritTaskTypes ? 'checked' : ''} ${mutable && project.parentId ? '' : 'disabled'}></tf-checkbox><div class="ps-members-toolbar">${mutable && project.parentId ? `<tf-button variant="ghost" data-detach>${escapeHtml(t('inheritance_detach'))}</tf-button><tf-button variant="ghost" data-reinherit>${escapeHtml(t('inheritance_reinherit'))}</tf-button>` : ''}</div><div data-inheritance-diff></div>${mutable ? `<tf-button variant="primary" icon="check" data-inheritance-save disabled>${escapeHtml(t('action_save'))}</tf-button>` : ''}<div class="ps-form-error" data-form-error hidden></div>`;
   let generation = 0;
   let proposedModules = null;
   const showError = (error) => { const el = host.querySelector('[data-form-error]'); el.hidden = false; el.textContent = error.message; };
@@ -1134,11 +1134,11 @@ function renderProjectInheritance(host, project) {
     proposedModules = null;
     const save = host.querySelector('[data-inheritance-save]'); save?.setAttribute('disabled', '');
     try {
-      const result = await ApiBinary.one('projectStudioProjectInheritancePreviewRequest', { projectId: project.project_id, inheritModules: host.querySelector('[data-inheritance-modules]').checked, inheritTaskTypes: host.querySelector('[data-inheritance-types]').checked });
+      const result = await ApiBinary.one('projectStudioProjectInheritancePreviewRequest', { projectId: project.projectId, inheritModules: host.querySelector('[data-inheritance-modules]').checked, inheritTaskTypes: host.querySelector('[data-inheritance-types]').checked });
       if (!host.isConnected || request !== generation) return;
-      proposedModules = result.proposed_modules;
+      proposedModules = result.proposedModules;
       const types = (rows) => rows.map((row) => `${escapeHtml(taskTypeLabel(row, t))}${row.active ? '' : ` (${escapeHtml(t('task_type_inactive'))})`}`).join(', ') || '—';
-      host.querySelector('[data-inheritance-diff]').innerHTML = `<div class="ps-inheritance-diff"><div><b>${escapeHtml(t('inheritance_diff_current'))}</b><div>${moduleChips(result.current_modules)}</div><p>${types(result.current_task_types)}</p></div><div><b>${escapeHtml(t('inheritance_diff_proposed'))}</b><div>${moduleChips(result.proposed_modules)}</div><p>${types(result.proposed_task_types)}</p></div></div><span class="ps-field-hint">${escapeHtml(t('inheritance_diff_hint'))}</span>`;
+      host.querySelector('[data-inheritance-diff]').innerHTML = `<div class="ps-inheritance-diff"><div><b>${escapeHtml(t('inheritance_diff_current'))}</b><div>${moduleChips(result.currentModules)}</div><p>${types(result.currentTaskTypes)}</p></div><div><b>${escapeHtml(t('inheritance_diff_proposed'))}</b><div>${moduleChips(result.proposedModules)}</div><p>${types(result.proposedTaskTypes)}</p></div></div><span class="ps-field-hint">${escapeHtml(t('inheritance_diff_hint'))}</span>`;
       save?.removeAttribute('disabled');
     } catch (error) { if (request === generation) showError(error); }
   };
@@ -1149,14 +1149,14 @@ function renderProjectInheritance(host, project) {
     if (proposedModules === null) return;
     event.currentTarget.setAttribute('disabled', '');
     try {
-      await ApiBinary.one('projectStudioProjectInheritanceSaveRequest', { projectId: project.project_id, isPrivate: host.querySelector('[data-inheritance-private]').checked, inheritModules: host.querySelector('[data-inheritance-modules]').checked, inheritTaskTypes: host.querySelector('[data-inheritance-types]').checked, modules: proposedModules });
+      await ApiBinary.one('projectStudioProjectInheritanceSaveRequest', { projectId: project.projectId, isPrivate: host.querySelector('[data-inheritance-private]').checked, inheritModules: host.querySelector('[data-inheritance-modules]').checked, inheritTaskTypes: host.querySelector('[data-inheritance-types]').checked, modules: proposedModules });
       toast(t('inheritance_saved'), 'success'); await loadProjects();
-      if (projectId() === project.project_id) await refreshProjectHeader();
-      else { const current = state.projects.find((row) => row.project_id === project.project_id); if (current && host.isConnected) renderProjectInheritance(host, current); }
+      if (projectId() === project.projectId) await refreshProjectHeader();
+      else { const current = state.projects.find((row) => row.projectId === project.projectId); if (current && host.isConnected) renderProjectInheritance(host, current); }
     } catch (error) { showError(error); event.currentTarget.removeAttribute('disabled'); }
   });
   if (mutable) preview();
-  else host.querySelector('[data-inheritance-diff]').innerHTML = `<div class="ps-module-preview"><div>${moduleChips(project.modules)}</div><span class="ps-field-hint">${escapeHtml(t(project.inherit_modules || project.inherit_task_types ? 'inheritance_live' : 'inheritance_own'))}</span></div>`;
+  else host.querySelector('[data-inheritance-diff]').innerHTML = `<div class="ps-module-preview"><div>${moduleChips(project.modules)}</div><span class="ps-field-hint">${escapeHtml(t(project.inheritModules || project.inheritTaskTypes ? 'inheritance_live' : 'inheritance_own'))}</span></div>`;
 }
 
 function openProjectArchiveWindow(project, archived) {
@@ -1168,7 +1168,7 @@ function openProjectArchiveWindow(project, archived) {
   const preview = async () => {
     const query = ++version; const button = foot.querySelector('[data-action="archive"]'); button.setAttribute('disabled', '');
     const errorElement = body.querySelector('[data-form-error]'); errorElement.hidden = true; errorElement.textContent = '';
-    try { const result = await ApiBinary.one('projectStudioProjectScopePreviewRequest', { projectId: project.project_id, scope: body.querySelector('[data-archive-scope]').value, operation: 'archive' }); if (query !== version || !body.isConnected) return; body.querySelector('[data-scope-nodes]').innerHTML = scopeNodesHtml(result.nodes); button.removeAttribute('disabled'); }
+    try { const result = await ApiBinary.one('projectStudioProjectScopePreviewRequest', { projectId: project.projectId, scope: body.querySelector('[data-archive-scope]').value, operation: 'archive' }); if (query !== version || !body.isConnected) return; body.querySelector('[data-scope-nodes]').innerHTML = scopeNodesHtml(result.nodes); button.removeAttribute('disabled'); }
     catch (error) { if (query !== version || !body.isConnected) return; errorElement.hidden = false; errorElement.textContent = error.message; }
   };
   body.querySelector('[data-archive-scope]').addEventListener('change', preview); preview();
@@ -1176,7 +1176,7 @@ function openProjectArchiveWindow(project, archived) {
     const button = event.target.closest('[data-action]'); if (!button || button.hasAttribute('disabled')) return;
     if (button.dataset.action === 'cancel') { cleanup(); return; }
     button.setAttribute('disabled', '');
-    try { await ApiBinary.one('projectStudioProjectArchiveRequest', { projectId: project.project_id, archived, scope: body.querySelector('[data-archive-scope]').value }); toast(t(archived ? 'archive_ok' : 'unarchive_ok'), 'success'); cleanup(); await loadProjects(); if (state.project) await refreshProjectHeader(); }
+    try { await ApiBinary.one('projectStudioProjectArchiveRequest', { projectId: project.projectId, archived, scope: body.querySelector('[data-archive-scope]').value }); toast(t(archived ? 'archive_ok' : 'unarchive_ok'), 'success'); cleanup(); await loadProjects(); if (state.project) await refreshProjectHeader(); }
     catch (error) { const el = body.querySelector('[data-form-error]'); el.hidden = false; el.textContent = error.message; button.removeAttribute('disabled'); }
   });
 }
@@ -1200,34 +1200,34 @@ async function openProjectLifecycleWindow(project) {
     if (!host) return;
     const generation = ++taskGeneration;
     try {
-      const result = await ApiBinary.one('projectStudioTasksListRequest', { projectId: project.project_id, scope: 'single', sourceProjectIds: [], taskType: '', status: taskStatus, assignedTo: '', search: '', severity: '', includeArchived: false, offset: (taskPage - 1) * F2_PAGE_SIZE, limit: F2_PAGE_SIZE });
+      const result = await ApiBinary.one('projectStudioTasksListRequest', { projectId: project.projectId, scope: 'single', sourceProjectIds: [], taskType: '', status: taskStatus, assignedTo: '', search: '', severity: '', includeArchived: false, offset: (taskPage - 1) * F2_PAGE_SIZE, limit: F2_PAGE_SIZE });
       if (!host.isConnected || generation !== taskGeneration) return;
       const lastPage = Math.max(1, Math.ceil(result.total / F2_PAGE_SIZE));
       if (taskPage > lastPage) { taskPage = lastPage; await loadTaskRows(); return; }
       host.innerHTML = `<tf-select data-lifecycle-status label="${escapeAttr(t('tasks_col_status'))}" value="${taskStatus}">${TASK_STATUSES.filter((status) => status !== 'done').map((status) => `<option value="${status}" ${status === taskStatus ? 'selected' : ''}>${escapeHtml(t(`task_status_${status}`))}</option>`).join('')}</tf-select><tf-table page-size="${F2_PAGE_SIZE}" page="${taskPage}" total="${result.total}"><tf-column key="key" label="#"></tf-column><tf-column key="title" label="${escapeAttr(t('tasks_col_title'))}"></tf-column><tf-column key="status" label="${escapeAttr(t('tasks_col_status'))}"></tf-column></tf-table>`;
       host.querySelector('[data-lifecycle-status]').addEventListener('change', (event) => { taskStatus = event.detail.value; taskPage = 1; loadTaskRows(); });
       const table = host.querySelector('tf-table');
-      table.rows = result.tasks.map((task) => ({ _id: task.task_id, key: task.task_key, title: task.title, status: t(`task_status_${task.status}`) }));
+      table.rows = result.tasks.map((task) => ({ _id: task.taskId, key: task.taskKey, title: task.title, status: t(`task_status_${task.status}`) }));
       table.addEventListener('page-change', (event) => { taskPage = Number(event.detail.page); loadTaskRows(); });
-      table.addEventListener('row-click', (event) => { cleanup(); openProject(project.project_id, { tab: 'tasks', taskId: event.detail.row._id }); });
+      table.addEventListener('row-click', (event) => { cleanup(); openProject(project.projectId, { tab: 'tasks', taskId: event.detail.row._id }); });
       table.rowActions = (row) => {
         if (!allowsArea(project.access, 'tasks', 'write')) return null;
         const button = document.createElement('tf-button'); button.setAttribute('variant', 'ghost'); button.setAttribute('size', 'sm'); button.setAttribute('icon', 'more'); button.setAttribute('title', t('action_more'));
-        const task = result.tasks.find((item) => item.task_id === row._id);
-        button.addEventListener('click', (event) => { event.stopPropagation(); openActionMenu(button, [{ label: t('task_not_pursued'), icon: 'check', run: () => openTaskResolutionWindow(task, project, load) }, ...(project.access.is_owner ? [{ label: t('task_transfer'), icon: 'branch', run: () => openTaskTransferWindow(task, project, load) }] : [])], task.title); });
+        const task = result.tasks.find((item) => item.taskId === row._id);
+        button.addEventListener('click', (event) => { event.stopPropagation(); openActionMenu(button, [{ label: t('task_not_pursued'), icon: 'check', run: () => openTaskResolutionWindow(task, project, load) }, ...(project.access.isOwner ? [{ label: t('task_transfer'), icon: 'branch', run: () => openTaskTransferWindow(task, project, load) }] : [])], task.title); });
         return button;
       };
     } catch (error) { if (host.isConnected && generation === taskGeneration) host.innerHTML = `<div class="ps-form-error">${escapeHtml(error.message)}</div>`; }
   };
   const load = async () => {
     try {
-      preview = await ApiBinary.one('projectStudioProjectLifecyclePreviewRequest', { projectId: project.project_id });
+      preview = await ApiBinary.one('projectStudioProjectLifecyclePreviewRequest', { projectId: project.projectId });
       if (!body.isConnected) return;
-      body.innerHTML = `<div class="ps-banner-warn">${escapeHtml(t(ended ? 'project_resume_hint' : 'project_lifecycle_effect'))}</div><div class="ps-lifecycle-stats"><tf-stat-card label="${escapeAttr(t('project_lifecycle_open', { count: preview.open_task_count }))}" value="${preview.open_task_count}"></tf-stat-card><tf-stat-card label="${escapeAttr(t('project_lifecycle_members', { count: preview.exclusive_member_count }))}" value="${preview.exclusive_member_count}"></tf-stat-card></div>${preview.active_children.length ? `<b>${escapeHtml(t('project_lifecycle_children'))}</b><div class="ps-lifecycle-children">${preview.active_children.map((row) => `<tf-button variant="ghost" data-lifecycle-child="${escapeAttr(row.project_id)}">${escapeHtml(row.name)}</tf-button>`).join('')}</div>` : ''}${!ended && !preview.can_end ? `<div class="ps-banner-warn">${escapeHtml(t('project_lifecycle_blocked'))}</div><div data-lifecycle-tasks></div><tf-button variant="ghost" icon="refresh" data-lifecycle-refresh>${escapeHtml(t('refresh'))}</tf-button>` : ''}<tf-textarea data-lifecycle-reason label="${escapeAttr(t('project_lifecycle_reason'))}" rows="3"></tf-textarea><tf-input data-lifecycle-confirm label="${escapeAttr(t('project_lifecycle_confirm', { prefix: project.key_prefix }))}"></tf-input><div class="ps-form-error" data-form-error hidden></div>`;
-      foot.querySelector('[data-action="apply"]').toggleAttribute('disabled', !(ended || preview.can_end));
+      body.innerHTML = `<div class="ps-banner-warn">${escapeHtml(t(ended ? 'project_resume_hint' : 'project_lifecycle_effect'))}</div><div class="ps-lifecycle-stats"><tf-stat-card label="${escapeAttr(t('project_lifecycle_open', { count: preview.openTaskCount }))}" value="${preview.openTaskCount}"></tf-stat-card><tf-stat-card label="${escapeAttr(t('project_lifecycle_members', { count: preview.exclusiveMemberCount }))}" value="${preview.exclusiveMemberCount}"></tf-stat-card></div>${preview.activeChildren.length ? `<b>${escapeHtml(t('project_lifecycle_children'))}</b><div class="ps-lifecycle-children">${preview.activeChildren.map((row) => `<tf-button variant="ghost" data-lifecycle-child="${escapeAttr(row.projectId)}">${escapeHtml(row.name)}</tf-button>`).join('')}</div>` : ''}${!ended && !preview.canEnd ? `<div class="ps-banner-warn">${escapeHtml(t('project_lifecycle_blocked'))}</div><div data-lifecycle-tasks></div><tf-button variant="ghost" icon="refresh" data-lifecycle-refresh>${escapeHtml(t('refresh'))}</tf-button>` : ''}<tf-textarea data-lifecycle-reason label="${escapeAttr(t('project_lifecycle_reason'))}" rows="3"></tf-textarea><tf-input data-lifecycle-confirm label="${escapeAttr(t('project_lifecycle_confirm', { prefix: project.keyPrefix }))}"></tf-input><div class="ps-form-error" data-form-error hidden></div>`;
+      foot.querySelector('[data-action="apply"]').toggleAttribute('disabled', !(ended || preview.canEnd));
       body.querySelectorAll('[data-lifecycle-child]').forEach((button) => button.addEventListener('click', () => { cleanup(); switchProject(button.dataset.lifecycleChild); }));
       body.querySelector('[data-lifecycle-refresh]')?.addEventListener('click', load);
-      if (!ended && preview.open_task_count && (allowsArea(project.access, 'tasks') || allowsArea(project.access, 'board'))) {
+      if (!ended && preview.openTaskCount && (allowsArea(project.access, 'tasks') || allowsArea(project.access, 'board'))) {
         await loadTaskRows();
       }
     } catch (error) { body.innerHTML = `<div class="ps-form-error">${escapeHtml(error.message)}</div>`; }
@@ -1238,17 +1238,17 @@ async function openProjectLifecycleWindow(project) {
     const reason = body.querySelector('[data-lifecycle-reason]').value.trim();
     const confirmationKey = body.querySelector('[data-lifecycle-confirm]').value.trim();
     const errorEl = body.querySelector('[data-form-error]');
-    if (!reason || confirmationKey !== project.key_prefix) { errorEl.hidden = false; errorEl.textContent = t(!reason ? 'project_lifecycle_reason' : 'project_lifecycle_confirm', { prefix: project.key_prefix }); return; }
+    if (!reason || confirmationKey !== project.keyPrefix) { errorEl.hidden = false; errorEl.textContent = t(!reason ? 'project_lifecycle_reason' : 'project_lifecycle_confirm', { prefix: project.keyPrefix }); return; }
     button.setAttribute('disabled', '');
-    try { await ApiBinary.one('projectStudioProjectLifecycleRequest', { projectId: project.project_id, ended: !ended, confirmationKey, reason }); toast(t(ended ? 'project_resumed_ok' : 'project_ended_ok'), 'success'); cleanup(); await loadProjects(); if (state.project?.project_id === project.project_id) await refreshProjectHeader(); }
+    try { await ApiBinary.one('projectStudioProjectLifecycleRequest', { projectId: project.projectId, ended: !ended, confirmationKey, reason }); toast(t(ended ? 'project_resumed_ok' : 'project_ended_ok'), 'success'); cleanup(); await loadProjects(); if (state.project?.projectId === project.projectId) await refreshProjectHeader(); }
     catch (error) { errorEl.hidden = false; errorEl.textContent = error.message; button.removeAttribute('disabled'); }
   });
   await load();
 }
 
 function openTaskResolutionWindow(task, project = state.project, onSaved) {
-  if (!allowsArea(project.access, 'tasks', 'write') || task.status === 'done' || task.archived_at) return;
-  const { body, foot, cleanup } = openWindow({ title: t('task_not_pursued'), subtitle: `${task.task_key} · ${task.title}`, icon: 'check', width: 620 });
+  if (!allowsArea(project.access, 'tasks', 'write') || task.status === 'done' || task.archivedAt) return;
+  const { body, foot, cleanup } = openWindow({ title: t('task_not_pursued'), subtitle: `${task.taskKey} · ${task.title}`, icon: 'check', width: 620 });
   body.innerHTML = `<tf-textarea data-resolution-reason label="${escapeAttr(t('task_resolution_reason'))}" rows="3"></tf-textarea><div class="ps-form-error" data-form-error hidden></div>`;
   foot.innerHTML = `<div></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" data-action="save">${escapeHtml(t('action_save'))}</tf-button></div>`;
   foot.addEventListener('click', async (event) => {
@@ -1258,20 +1258,20 @@ function openTaskResolutionWindow(task, project = state.project, onSaved) {
     const errorEl = body.querySelector('[data-form-error]');
     if (!reason) { errorEl.hidden = false; errorEl.textContent = t('task_resolution_reason'); return; }
     button.setAttribute('disabled', '');
-    try { await ApiBinary.one('projectStudioTaskNotPursuedRequest', { projectId: project.project_id, taskId: task.task_id, reason }); toast(t('task_not_pursued_ok'), 'success'); cleanup(); if (onSaved) await onSaved(); else if (projectId() === project.project_id && state.tab === 'tasks') await renderTasksTab(); }
+    try { await ApiBinary.one('projectStudioTaskNotPursuedRequest', { projectId: project.projectId, taskId: task.taskId, reason }); toast(t('task_not_pursued_ok'), 'success'); cleanup(); if (onSaved) await onSaved(); else if (projectId() === project.projectId && state.tab === 'tasks') await renderTasksTab(); }
     catch (error) { errorEl.hidden = false; errorEl.textContent = error.message; button.removeAttribute('disabled'); }
   });
 }
 
 function openTaskTransferWindow(task, source = state.project, onSaved) {
-  if (!source.access.is_owner || source.access.archived || source.access.ended || task.archived_at) return;
-  const destinations = state.projects.filter((project) => project.project_id !== source.project_id && project.access.is_owner && !project.access.archived && !project.access.ended && project.modules.includes('tasks'));
-  const { body, foot, cleanup } = openWindow({ title: t('task_transfer'), subtitle: `${task.task_key} · ${task.title}`, icon: 'branch', width: 760 });
-  body.innerHTML = `<tf-select data-transfer-destination label="${escapeAttr(t('task_transfer_destination'))}" value=""><option value="">—</option>${destinations.map((project) => `<option value="${escapeAttr(project.project_id)}">${escapeHtml([...projectAncestors(project, state.projects, state.breadcrumbs).map((row) => row.name), project.name].join(' / '))}</option>`).join('')}</tf-select><div data-transfer-preview></div><div class="ps-field-hint">${escapeHtml(t('task_transfer_alias_hint'))}</div><div data-form-error class="ps-form-error" hidden></div>`;
+  if (!source.access.isOwner || source.access.archived || source.access.ended || task.archivedAt) return;
+  const destinations = state.projects.filter((project) => project.projectId !== source.projectId && project.access.isOwner && !project.access.archived && !project.access.ended && project.modules.includes('tasks'));
+  const { body, foot, cleanup } = openWindow({ title: t('task_transfer'), subtitle: `${task.taskKey} · ${task.title}`, icon: 'branch', width: 760 });
+  body.innerHTML = `<tf-select data-transfer-destination label="${escapeAttr(t('task_transfer_destination'))}" value=""><option value="">—</option>${destinations.map((project) => `<option value="${escapeAttr(project.projectId)}">${escapeHtml([...projectAncestors(project, state.projects, state.breadcrumbs).map((row) => row.name), project.name].join(' / '))}</option>`).join('')}</tf-select><div data-transfer-preview></div><div class="ps-field-hint">${escapeHtml(t('task_transfer_alias_hint'))}</div><div data-form-error class="ps-form-error" hidden></div>`;
   foot.innerHTML = `<div></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" icon="branch" data-action="transfer" disabled>${escapeHtml(t('task_transfer'))}</tf-button></div>`;
   let version = 0;
   let preview = null;
-  const ready = () => !!preview && preview.destination_type_valid && preview.blocking_reasons.length === 0 && (!preview.widens_access || body.querySelector('[data-confirm-wider]')?.checked === true);
+  const ready = () => !!preview && preview.destinationTypeValid && preview.blockingReasons.length === 0 && (!preview.widensAccess || body.querySelector('[data-confirm-wider]')?.checked === true);
   const sync = () => foot.querySelector('[data-action="transfer"]').toggleAttribute('disabled', !ready());
   body.querySelector('[data-transfer-destination]').addEventListener('change', async () => {
     const generation = ++version; preview = null; sync();
@@ -1279,10 +1279,10 @@ function openTaskTransferWindow(task, source = state.project, onSaved) {
     const host = body.querySelector('[data-transfer-preview]'); host.innerHTML = '';
     if (!destinationProjectId) return;
     try {
-      const result = await ApiBinary.one('projectStudioTaskTransferPreviewRequest', { sourceProjectId: source.project_id, destinationProjectId, taskId: task.task_id });
+      const result = await ApiBinary.one('projectStudioTaskTransferPreviewRequest', { sourceProjectId: source.projectId, destinationProjectId, taskId: task.taskId });
       if (!body.isConnected || generation !== version) return;
       preview = result;
-      host.innerHTML = `<h3>${escapeHtml(t('task_transfer_preview'))}</h3><p>${escapeHtml(t('task_transfer_closure', { count: result.task_ids.length }))}</p><div class="ps-function-choices">${result.old_keys.map((key) => `<tf-chip status="info">${escapeHtml(key)}</tf-chip>`).join(' ')}</div>${!result.destination_type_valid ? `<div class="ps-form-error">${escapeHtml(t('task_transfer_invalid_type'))}</div>` : ''}${result.blocking_reasons.length ? `<div class="ps-form-error">${escapeHtml(t('task_transfer_blocked'))}</div><ul>${result.blocking_reasons.map((reason) => `<li>${escapeHtml(t(`task_transfer_reason_${reason}`))}</li>`).join('')}</ul>` : ''}${result.widens_access ? `<div class="ps-banner-warn">${escapeHtml(t('task_transfer_wider_hint'))}</div><tf-checkbox data-confirm-wider label="${escapeAttr(t('task_transfer_confirm_wider'))}"></tf-checkbox>` : ''}`;
+      host.innerHTML = `<h3>${escapeHtml(t('task_transfer_preview'))}</h3><p>${escapeHtml(t('task_transfer_closure', { count: result.taskIds.length }))}</p><div class="ps-function-choices">${result.oldKeys.map((key) => `<tf-chip status="info">${escapeHtml(key)}</tf-chip>`).join(' ')}</div>${!result.destinationTypeValid ? `<div class="ps-form-error">${escapeHtml(t('task_transfer_invalid_type'))}</div>` : ''}${result.blockingReasons.length ? `<div class="ps-form-error">${escapeHtml(t('task_transfer_blocked'))}</div><ul>${result.blockingReasons.map((reason) => `<li>${escapeHtml(t(`task_transfer_reason_${reason}`))}</li>`).join('')}</ul>` : ''}${result.widensAccess ? `<div class="ps-banner-warn">${escapeHtml(t('task_transfer_wider_hint'))}</div><tf-checkbox data-confirm-wider label="${escapeAttr(t('task_transfer_confirm_wider'))}"></tf-checkbox>` : ''}`;
       host.querySelector('[data-confirm-wider]')?.addEventListener('change', sync); sync();
     } catch (error) { const el = body.querySelector('[data-form-error]'); el.hidden = false; el.textContent = error.message; }
   });
@@ -1292,10 +1292,10 @@ function openTaskTransferWindow(task, source = state.project, onSaved) {
     if (!ready()) return;
     button.setAttribute('disabled', '');
     try {
-      const result = await ApiBinary.one('projectStudioTaskTransferRequest', { sourceProjectId: source.project_id, destinationProjectId: body.querySelector('[data-transfer-destination]').value, taskId: task.task_id, confirmWiderAccess: body.querySelector('[data-confirm-wider]')?.checked === true });
-      toast(t('task_transfer_success', { key: result.new_key }), 'success'); cleanup();
+      const result = await ApiBinary.one('projectStudioTaskTransferRequest', { sourceProjectId: source.projectId, destinationProjectId: body.querySelector('[data-transfer-destination]').value, taskId: task.taskId, confirmWiderAccess: body.querySelector('[data-confirm-wider]')?.checked === true });
+      toast(t('task_transfer_success', { key: result.newKey }), 'success'); cleanup();
       if (onSaved) await onSaved(result);
-      else await openProject(result.destination_project_id, { tab: 'tasks', taskId: result.task_id });
+      else await openProject(result.destinationProjectId, { tab: 'tasks', taskId: result.taskId });
     } catch (error) { const el = body.querySelector('[data-form-error]'); el.hidden = false; el.textContent = error.message; sync(); }
   });
 }
@@ -1443,13 +1443,13 @@ function openWizard() {
     const chosen = new Set(wz.members.map((m) => m.userId));
     host.hidden = false;
     host.innerHTML = wz.candidates.map((u) => {
-      const userId = u.user_id ?? u.userId;
+      const userId = u.userId;
       if (chosen.has(userId) || isMe(userId)) return '';
       return `
         <div class="ps-candidate-row" data-candidate="${escapeAttr(userId)}" role="button" tabindex="0">
-          <div class="ps-av-mini">${escapeHtml(initials(u.display_name ?? u.displayName))}</div>
+          <div class="ps-av-mini">${escapeHtml(initials(u.displayName))}</div>
           <div>
-            <div class="ps-candidate-name">${escapeHtml(u.display_name ?? u.displayName ?? '')}</div>
+            <div class="ps-candidate-name">${escapeHtml(u.displayName ?? '')}</div>
             <div class="ps-candidate-mail">${escapeHtml(u.email || '')}</div>
           </div>
         </div>
@@ -1495,7 +1495,7 @@ function openWizard() {
         parentId: null, isPrivate: false, inheritModules: false, inheritTaskTypes: false,
         members: wz.members.map((member, index) => ({ userId: member.userId, ...readMemberAccess(body.querySelector(`[data-team-member="${index}"]`)) })),
       });
-      const projectId = resp.projectId ?? resp.project_id;
+      const projectId = resp.projectId;
       toast(t('create_ok'), 'success');
       cleanup();
       await loadProjects();
@@ -1575,11 +1575,11 @@ function openWizard() {
     const candidate = e.target.closest('[data-candidate]');
     if (candidate) {
       const userId = candidate.dataset.candidate;
-      const user = wz.candidates.find((u) => (u.user_id ?? u.userId) === userId);
+      const user = wz.candidates.find((u) => (u.userId) === userId);
       if (user) {
         wz.members.push({
           userId,
-          displayName: user.display_name ?? user.displayName ?? '',
+          displayName: user.displayName ?? '',
           email: user.email || '',
           functions: ['tester'],
           projectAdmin: false,
@@ -1626,8 +1626,8 @@ async function openProject(projectId, deep = null) {
   if (deep?.taskId || deep?.taskKey) {
     try {
       const target = await ApiBinary.one('projectStudioTaskKeyResolveRequest', { taskKey: deep.taskKey || null, taskId: deep.taskId || null, originProjectId: deep.eventId == null ? null : projectId, originEventId: deep.eventId == null ? null : String(deep.eventId) });
-      projectId = target.project_id;
-      deep = { ...deep, taskId: target.task_id, taskKey: null, eventId: target.event_id, tab: 'tasks' };
+      projectId = target.projectId;
+      deep = { ...deep, taskId: target.taskId, taskKey: null, eventId: target.eventId, tab: 'tasks' };
     } catch (error) { toast(`${t('task_load_failed')}: ${error.message}`, 'error'); return; }
   }
   let project = null;
@@ -1704,7 +1704,7 @@ function closeProject() {
 }
 
 async function refreshProjectHeader() {
-  const projectId = state.project?.project_id ?? state.project?.projectId;
+  const projectId = state.project?.projectId;
   if (!projectId) return;
   try {
     const resp = await ApiBinary.one('projectStudioProjectGetRequest', { projectId });
@@ -1733,9 +1733,9 @@ function projectHeaderSubtitle(project) {
   const parts = [];
   const desc = (project.description || '').trim();
   if (desc) parts.push(desc);
-  const created = fv(project, 'created_at');
+  const created = project?.createdAt;
   if (created) parts.push(t('head_created', { date: formatDate(created) }));
-  const updated = fv(project, 'updated_at');
+  const updated = project?.updatedAt;
   if (updated) parts.push(t('head_updated', { date: formatDate(updated) }));
   return parts.join(' · ');
 }
@@ -1745,15 +1745,15 @@ function renderProjectShell() {
   const project = state.project;
   if (!host || !project) return;
   const archived = project.status === 'archived';
-  const memberCount = project.member_count ?? project.memberCount ?? 0;
-  const sourceCount = project.source_count ?? project.sourceCount ?? 0;
+  const memberCount = project.memberCount ?? 0;
+  const sourceCount = project.sourceCount ?? 0;
   const tabs = enabledTabs();
   const ancestors = projectAncestors(project, state.projects, state.breadcrumbs);
 
   host.innerHTML = `
     <tf-breadcrumb class="ps-project-crumbs" id="ps-crumbs">
       <tf-breadcrumb-item href="#">${escapeHtml(t('title'))}</tf-breadcrumb-item>
-      ${ancestors.map((row) => `<tf-breadcrumb-item ${state.projects.some((item) => item.project_id === row.project_id) ? `href="#ancestor:${escapeAttr(row.project_id)}"` : ''}>${escapeHtml(row.name)}</tf-breadcrumb-item>`).join('')}
+      ${ancestors.map((row) => `<tf-breadcrumb-item ${state.projects.some((item) => item.projectId === row.projectId) ? `href="#ancestor:${escapeAttr(row.projectId)}"` : ''}>${escapeHtml(row.name)}</tf-breadcrumb-item>`).join('')}
       <tf-breadcrumb-item href="#project">${escapeHtml(project.name)}</tf-breadcrumb-item>
       <tf-breadcrumb-item current>${escapeHtml(t(`tab_${state.tab}`))}</tf-breadcrumb-item>
     </tf-breadcrumb>
@@ -1772,7 +1772,7 @@ function renderProjectShell() {
       </span>
       <span slot="actions">
         ${bellHtml()}
-        ${canProject('create_child') ? `<tf-button variant="ghost" icon="plus" data-new-child>${escapeHtml(t('subproject_new'))}</tf-button>` : ''}
+        ${canProject('createChild') ? `<tf-button variant="ghost" icon="plus" data-new-child>${escapeHtml(t('subproject_new'))}</tf-button>` : ''}
         ${canProject('end') || canProject('resume') ? `<tf-button variant="ghost" icon="clock" data-lifecycle>${escapeHtml(t(project.lifecycle === 'ended' ? 'project_resume' : 'project_end'))}</tf-button>` : ''}
         ${canCreateTask(projectAccess()) ? `<tf-button variant="primary" icon="plus" data-new-task>${escapeHtml(t('tasks_new'))}</tf-button>` : ''}
         ${canProject('export') ? `<tf-button variant="ghost" icon="download" data-export>${escapeHtml(t('export_btn'))}</tf-button>` : ''}
@@ -1864,7 +1864,7 @@ async function switchTab(tab) {
 }
 
 function projectId() {
-  return state.project?.project_id ?? state.project?.projectId;
+  return state.project?.projectId;
 }
 
 // =============================================================================
@@ -1876,13 +1876,13 @@ function projectId() {
 // counters are refreshed once those load.
 function tabCount(tabId) {
   const k = state.kpis || {};
-  const num = (snake, camel) => Number(k[snake] ?? k[camel] ?? 0);
+  const num = (key) => Number(k[key] ?? 0);
   switch (tabId) {
-    case 'knowledge': return Number(state.project?.source_count ?? state.project?.sourceCount ?? 0);
-    case 'tests': return num('cases_total', 'casesTotal');
-    case 'tasks': return num('tasks_open', 'tasksOpen');
-    case 'connections': return num('ml_links', 'mlLinks');
-    case 'members': return Number(state.project?.member_count ?? state.project?.memberCount ?? 0);
+    case 'knowledge': return Number(state.project?.sourceCount ?? 0);
+    case 'tests': return num('casesTotal');
+    case 'tasks': return num('tasksOpen');
+    case 'connections': return num('mlLinks');
+    case 'members': return Number(state.project?.memberCount ?? 0);
     default: return 0;
   }
 }
@@ -1914,9 +1914,9 @@ async function renderOverview() {
   }
   if (state.tab !== 'overview') return;
 
-  const sourcesReady = kpis?.sources_ready ?? kpis?.sourcesReady ?? 0;
-  const sourcesTotal = kpis?.sources_total ?? kpis?.sourcesTotal ?? 0;
-  const openJobs = kpis?.open_ingest_jobs ?? kpis?.openIngestJobs ?? 0;
+  const sourcesReady = kpis?.sourcesReady ?? 0;
+  const sourcesTotal = kpis?.sourcesTotal ?? 0;
+  const openJobs = kpis?.openIngestJobs ?? 0;
   const modules = Array.isArray(state.project?.modules) ? state.project.modules : [];
 
   const quickActions = [];
@@ -1939,17 +1939,17 @@ async function renderOverview() {
   }
   quickActions.push({ id: 'members', icon: 'users', name: t('qa_members'), sub: t('qa_members_sub') });
 
-  const kv = (snake, camel) => Number(kpis?.[snake] ?? kpis?.[camel] ?? 0);
+  const kv = (key) => Number(kpis?.[key] ?? 0);
   const hasTests = canArea('tests');
 
   // The dashboard answers four questions — what do we have, how good is it,
   // what is broken, is the knowledge ready. Every other counter lives next to
   // its own tab or section; a wall of raw numbers here reads as noise.
-  const casesTotal = kv('cases_total', 'casesTotal');
-  const casesApproved = kv('cases_approved', 'casesApproved');
-  const suitesTotal = kv('suites_total', 'suitesTotal');
-  const tasksOpen = kv('tasks_open', 'tasksOpen');
-  const defectsOpen = kv('defects_open', 'defectsOpen');
+  const casesTotal = kv('casesTotal');
+  const casesApproved = kv('casesApproved');
+  const suitesTotal = kv('suitesTotal');
+  const tasksOpen = kv('tasksOpen');
+  const defectsOpen = kv('defectsOpen');
 
   const casesCard = hasTests ? `
       <tf-stat-card icon="list" label="${escapeAttr(t('kpi_cases'))}" value="${casesTotal}"
@@ -2089,7 +2089,7 @@ async function loadOverviewCharts() {
     else {
       runsHost.innerHTML = '<tf-bar-chart></tf-bar-chart>';
       const chart = runsHost.firstElementChild;
-      const xs = runs.map((r) => `#${r.run_no ?? r.runNo ?? ''}`);
+      const xs = runs.map((r) => `#${r.runNo ?? ''}`);
       const serie = (id, key, tone, name) => ({
         id, name, tone, showInLegend: true,
         points: runs.map((r, i) => ({ x: xs[i], y: Number(r[key] ?? 0) })),
@@ -2116,7 +2116,7 @@ async function loadOverviewCharts() {
     const resp = await ApiBinary.one('projectStudioReportQueryRequest', {
       projectId: pid, report: 'runs_over_time', fromDate: iso(from), toDate: iso(to), suiteId: '', runIds: [],
     });
-    rows = JSON.parse(resp.rows_json ?? resp.rowsJson ?? '[]');
+    rows = JSON.parse(resp.rowsJson ?? '[]');
   } catch { /* keep the empty state */ }
   if (state.tab !== 'overview' || projectId() !== pid) return;
   if (!Array.isArray(rows) || !rows.length) {
@@ -2143,8 +2143,8 @@ async function loadOverviewCharts() {
 }
 
 function activityEntryHtml(entry) {
-  const kind = entry.actor_kind ?? entry.actorKind;
-  const actorName = entry.actor_name ?? entry.actorName ?? '';
+  const kind = entry.actorKind;
+  const actorName = entry.actorName ?? '';
   const av = kind === 'agent' || kind === 'system'
     ? `<div class="ps-activity-av is-agent">${sprite(kind === 'agent' ? 'sparkle' : 'settings')}</div>`
     : `<div class="ps-activity-av">${escapeHtml(initials(actorName))}</div>`;
@@ -2156,8 +2156,8 @@ function activityEntryHtml(entry) {
     <div class="ps-activity-item">
       ${av}
       <div>
-        <div class="ps-activity-text"><b>${escapeHtml(actorName)}</b> ${escapeHtml(actionLabel)}${entry.object_id ?? entry.objectId ? ` · <span class="ps-kb-path">${escapeHtml(entry.object_type ?? entry.objectType ?? '')}</span>` : ''}</div>
-        <div class="ps-activity-time">${escapeHtml(formatTimestamp(entry.created_at ?? entry.createdAt))}</div>
+        <div class="ps-activity-text"><b>${escapeHtml(actorName)}</b> ${escapeHtml(actionLabel)}${entry.objectId ? ` · <span class="ps-kb-path">${escapeHtml(entry.objectType ?? '')}</span>` : ''}</div>
+        <div class="ps-activity-time">${escapeHtml(formatTimestamp(entry.createdAt))}</div>
       </div>
     </div>
   `;
@@ -2186,7 +2186,7 @@ async function loadMoreActivity() {
     });
     const entries = Array.isArray(resp.entries) ? resp.entries : [];
     state.activity = state.activity.concat(entries);
-    state.activityHasMore = !!(resp.hasMore ?? resp.has_more);
+    state.activityHasMore = !!(resp.hasMore);
     renderActivityFeed();
   } catch (err) {
     toast(`${t('activity_failed')}: ${err.message}`, 'error');
@@ -2248,35 +2248,35 @@ function canRefreshRepo() {
 }
 
 function canFileWrite(file) {
-  const sourceId = fv(file, 'source_id') || state.files.sourceId;
-  return canSourceWrite(state.sources.find((source) => fv(source, 'source_id') === sourceId));
+  const sourceId = file?.sourceId || state.files.sourceId;
+  return canSourceWrite(state.sources.find((source) => source?.sourceId === sourceId));
 }
 
 function sourceRowHtml(source) {
-  const sourceId = source.source_id ?? source.sourceId;
+  const sourceId = source.sourceId;
   const status = source.status;
-  const job = source.last_job ?? source.lastJob;
-  const jobId = job ? (job.job_id ?? job.jobId) : null;
+  const job = source.lastJob;
+  const jobId = job ? (job.jobId) : null;
   const running = job && job.status === 'running';
-  const fileCount = source.file_count ?? source.fileCount ?? 0;
-  const chunkCount = source.chunk_count ?? source.chunkCount ?? 0;
+  const fileCount = source.fileCount ?? 0;
+  const chunkCount = source.chunkCount ?? 0;
   const mutable = canSourceWrite(source);
 
   let config = {};
-  try { config = JSON.parse(source.config_json ?? source.configJson ?? '{}') || {}; } catch { config = {}; }
+  try { config = JSON.parse(source.configJson ?? '{}') || {}; } catch { config = {}; }
   const meta = [
     t(`kind_${source.kind}`),
     source.kind === 'git' && config.branch ? t('source_git_branch_meta', { branch: config.branch }) : '',
     t('source_files_count', { count: fileCount }),
     t('source_chunks_count', { count: chunkCount }),
-    `${t('source_added')} ${formatTimestamp(source.created_at ?? source.createdAt)}`,
-    source.created_by_name ?? source.createdByName ?? '',
+    `${t('source_added')} ${formatTimestamp(source.createdAt)}`,
+    source.createdByName ?? '',
   ].filter(Boolean);
 
   const tracked = jobId ? state.jobs.get(jobId) : null;
   const liveJob = tracked?.job ?? job;
-  const filesTotal = liveJob ? (liveJob.files_total ?? liveJob.filesTotal ?? 0) : 0;
-  const filesDone = liveJob ? (liveJob.files_done ?? liveJob.filesDone ?? 0) : 0;
+  const filesTotal = liveJob ? (liveJob.filesTotal ?? 0) : 0;
+  const filesDone = liveJob ? (liveJob.filesDone ?? 0) : 0;
   const pct = filesTotal > 0 ? Math.round((filesDone / filesTotal) * 100) : 0;
 
   const ingestHtml = running ? `
@@ -2389,7 +2389,7 @@ async function renderSources() {
     const row = e.target.closest('[data-source-id]');
     if (!row || !e.target.closest('[data-source-menu]')) return;
     const sourceId = row.dataset.sourceId;
-    const source = state.sources.find((s) => (s.source_id ?? s.sourceId) === sourceId);
+    const source = state.sources.find((s) => (s.sourceId) === sourceId);
     if (!source) return;
     switch (e.detail?.action) {
       case 'edit': openSourceEditWindow(source); break;
@@ -2404,9 +2404,9 @@ async function renderSources() {
 
   // Resume live tracking for any job the server reports as running.
   for (const source of state.sources) {
-    const job = source.last_job ?? source.lastJob;
+    const job = source.lastJob;
     if (job && job.status === 'running') {
-      trackIngestJob(job.job_id ?? job.jobId);
+      trackIngestJob(job.jobId);
     }
   }
 }
@@ -2422,7 +2422,7 @@ async function reingestSource(sourceId) {
   try {
     const resp = await ApiBinary.one('projectStudioSourceReingestRequest', { projectId: projectId(), sourceId });
     toast(t('reingest_started'), 'success');
-    const jobId = resp.jobId ?? resp.job_id;
+    const jobId = resp.jobId;
     await renderSources();
     if (jobId) trackIngestJob(jobId);
   } catch (err) {
@@ -2436,7 +2436,7 @@ async function refreshGitSource(sourceId) {
   try {
     const resp = await ApiBinary.one('projectStudioSourceRefreshRequest', { projectId: projectId(), sourceId });
     toast(t('source_refresh_started'), 'success');
-    const jobId = fv(resp, 'job_id');
+    const jobId = resp?.jobId;
     await renderSources();
     if (jobId) trackIngestJob(jobId);
   } catch (err) {
@@ -2446,11 +2446,11 @@ async function refreshGitSource(sourceId) {
 
 // W02 — endpoint list parsed out of an OpenAPI/Swagger source.
 async function openApiSpecEndpoints(sourceId) {
-  const source = state.sources.find((s) => fv(s, 'source_id') === sourceId);
+  const source = state.sources.find((s) => s?.sourceId === sourceId);
   let endpoints = [];
   try {
     const resp = await ApiBinary.one('projectStudioApiSpecEndpointsRequest', { projectId: projectId(), sourceId });
-    const parsed = JSON.parse(fv(resp, 'endpoints_json') || '[]');
+    const parsed = JSON.parse(resp?.endpointsJson || '[]');
     endpoints = Array.isArray(parsed) ? parsed : [];
   } catch (err) {
     toast(`${t('source_endpoints_failed')}: ${err.message}`, 'error');
@@ -2497,7 +2497,7 @@ async function openApiSpecEndpoints(sourceId) {
         method: ep.method,
         path: ep.path,
         summary: ep.summary,
-        operation_id: fv(ep, 'operation_id') || '',
+        operation_id: ep?.operation_id || '',
         tags: (Array.isArray(ep.tags) ? ep.tags : []).join(' '),
       }))));
       return;
@@ -2516,7 +2516,7 @@ async function cancelIngest(jobId) {
 }
 
 function confirmDeleteSource(source) {
-  const sourceId = source.source_id ?? source.sourceId;
+  const sourceId = source.sourceId;
   openDeleteWindow({
     title: t('delete_source_title'),
     targetName: source.name,
@@ -2528,8 +2528,8 @@ function confirmDeleteSource(source) {
         icon: 'file-text',
         name: t('delete_source_item_files'),
         sub: t('delete_source_item_files_sub', {
-          files: source.file_count ?? source.fileCount ?? 0,
-          chunks: source.chunk_count ?? source.chunkCount ?? 0,
+          files: source.fileCount ?? 0,
+          chunks: source.chunkCount ?? 0,
         }),
       },
     ],
@@ -2554,7 +2554,7 @@ function trackIngestJob(jobId) {
     { projectId: projectId(), jobId },
     {
       onChunk: (body) => {
-        if (body?.variant !== 'ProjectStudioIngestStreamChunk') return;
+        if (body?._variant !== 'ProjectStudioBody.IngestStreamChunk') return;
         if (!state.jobs.has(jobId)) return;
         const kind = body.kind;
         if (kind === 'log' || kind === 'phase' || kind === 'file') {
@@ -2567,7 +2567,7 @@ function trackIngestJob(jobId) {
             logEl.scrollTop = logEl.scrollHeight;
           }
         } else if (kind === 'progress') {
-          updateJobProgressUi(jobId, body.progress_pct ?? body.progressPct ?? 0);
+          updateJobProgressUi(jobId, body.progressPct ?? 0);
         }
       },
       onError: () => { /* the poll below is the source of truth */ },
@@ -2607,8 +2607,8 @@ function ensureJobsPoll() {
       }
       if (!job) continue;
       entry.job = job;
-      const filesTotal = job.files_total ?? job.filesTotal ?? 0;
-      const filesDone = job.files_done ?? job.filesDone ?? 0;
+      const filesTotal = job.filesTotal ?? 0;
+      const filesDone = job.filesDone ?? 0;
       if (filesTotal > 0) updateJobProgressUi(jobId, Math.round((filesDone / filesTotal) * 100));
       if (job.status !== 'running') {
         if (entry.unsub) { entry.unsub(); entry.unsub = null; }
@@ -2832,7 +2832,7 @@ function openSourceWindow() {
       });
       item.progress = Math.round(((seq + 1) / totalChunks) * 100);
       body.querySelector(`[data-upload-progress="${index}"]`)?.setAttribute('value', String(item.progress));
-      fileRef = resp.fileRef ?? resp.file_ref ?? fileRef;
+      fileRef = resp.fileRef ?? fileRef;
     }
     if (!fileRef) throw new Error(t('upload_no_ref'));
     return fileRef;
@@ -2889,7 +2889,7 @@ function openSourceWindow() {
       });
       toast(t('source_created'), 'success');
       cleanup();
-      const jobId = resp.jobId ?? resp.job_id;
+      const jobId = resp.jobId;
       if (state.tab === 'knowledge' && state.kbView === 'sources') await renderSources();
       if (jobId) trackIngestJob(jobId);
     } catch (err) {
@@ -2903,7 +2903,7 @@ function openSourceWindow() {
 }
 
 function openSourceEditWindow(source) {
-  const sourceId = source.source_id ?? source.sourceId;
+  const sourceId = source.sourceId;
   const { body, foot, cleanup } = openWindow({
     title: t('source_edit_title'),
     subtitle: source.name,
@@ -2912,7 +2912,7 @@ function openSourceEditWindow(source) {
   });
 
   let config = {};
-  try { config = JSON.parse(source.config_json ?? source.configJson ?? '{}') || {}; } catch { config = {}; }
+  try { config = JSON.parse(source.configJson ?? '{}') || {}; } catch { config = {}; }
 
   body.innerHTML = `
     <tf-input id="ps-src-edit-name" label="${escapeAttr(t('source_name_label'))}" value="${escapeAttr(source.name)}"></tf-input>
@@ -2973,7 +2973,7 @@ function openSourceEditWindow(source) {
       if (errEl) { errEl.hidden = false; errEl.textContent = t('err_source_name'); }
       return;
     }
-    let configJson = source.config_json ?? source.configJson ?? '{}';
+    let configJson = source.configJson ?? '{}';
     if (source.kind === 'url') {
       const url = String(body.querySelector('#ps-src-edit-url')?.value ?? '').trim();
       if (!/^https:\/\/.+/.test(url)) {
@@ -3002,7 +3002,7 @@ function openSourceEditWindow(source) {
       toast(t('source_saved'), 'success');
       cleanup();
       await renderSources();
-      const jobId = resp.jobId ?? resp.job_id;
+      const jobId = resp.jobId;
       if (jobId) trackIngestJob(jobId);
     } catch (err) {
       if (errEl) { errEl.hidden = false; errEl.textContent = `${t('source_save_failed')}: ${err.message}`; }
@@ -3035,9 +3035,9 @@ function renderKbSearch() {
   const chips = byId('ps-kb-sources-filter');
   if (chips) {
     chips.filters = state.sources.map((s) => ({
-      id: s.source_id ?? s.sourceId,
+      id: s.sourceId,
       label: s.name,
-      active: state.kbSelectedSources.has(s.source_id ?? s.sourceId),
+      active: state.kbSelectedSources.has(s.sourceId),
     }));
     chips.addEventListener('change', (e) => {
       const id = e.detail?.id;
@@ -3065,9 +3065,9 @@ function renderKbSearch() {
       const chipHost = byId('ps-kb-sources-filter');
       if (chipHost) {
         chipHost.filters = state.sources.map((s) => ({
-          id: s.source_id ?? s.sourceId,
+          id: s.sourceId,
           label: s.name,
-          active: state.kbSelectedSources.has(s.source_id ?? s.sourceId),
+          active: state.kbSelectedSources.has(s.sourceId),
         }));
       }
     }).catch(() => { /* chips just stay empty */ });
@@ -3104,17 +3104,17 @@ function kbHitHtml(hit) {
   return `
     <div class="ps-kb-result">
       <div class="ps-kb-head">
-        <div class="ps-kb-ico">${sprite(SOURCE_KIND_ICON[hit.source_kind ?? hit.sourceKind] || 'file-text')}</div>
+        <div class="ps-kb-ico">${sprite(SOURCE_KIND_ICON[hit.sourceKind] || 'file-text')}</div>
         <div>
-          <div class="ps-kb-title">${escapeHtml(hit.source_name ?? hit.sourceName ?? '')}</div>
-          <div class="ps-kb-path">${escapeHtml(hit.file_path ?? hit.filePath ?? '')} · ${escapeHtml(hit.location || '')} · #${hit.chunk_index ?? hit.chunkIndex ?? 0}</div>
+          <div class="ps-kb-title">${escapeHtml(hit.sourceName ?? '')}</div>
+          <div class="ps-kb-path">${escapeHtml(hit.filePath ?? '')} · ${escapeHtml(hit.location || '')} · #${hit.chunkIndex ?? 0}</div>
         </div>
         <tf-chip class="ps-kb-score" status="accent">${escapeHtml(score.toFixed(2))}</tf-chip>
       </div>
       <div class="ps-kb-snippet">${escapeHtml(hit.snippet || '')}</div>
       <div class="ps-kb-foot">
-        <tf-button variant="ghost" size="sm" icon="eye" data-kb-preview="${escapeAttr(hit.file_id ?? hit.fileId)}">${escapeHtml(t('kb_preview'))}</tf-button>
-        <tf-button variant="ghost" size="sm" icon="file-text" data-kb-open-file="${escapeAttr(hit.source_id ?? hit.sourceId)}">${escapeHtml(t('kb_open_in_files'))}</tf-button>
+        <tf-button variant="ghost" size="sm" icon="eye" data-kb-preview="${escapeAttr(hit.fileId)}">${escapeHtml(t('kb_preview'))}</tf-button>
+        <tf-button variant="ghost" size="sm" icon="file-text" data-kb-open-file="${escapeAttr(hit.sourceId)}">${escapeHtml(t('kb_open_in_files'))}</tf-button>
       </div>
     </div>
   `;
@@ -3162,7 +3162,7 @@ async function renderFilesView() {
     try { await loadSources(); } catch { /* select stays empty */ }
   }
   if (!state.files.sourceId && state.sources.length) {
-    state.files.sourceId = state.sources[0].source_id ?? state.sources[0].sourceId;
+    state.files.sourceId = state.sources[0].sourceId;
   }
 
   host.innerHTML = `
@@ -3176,7 +3176,7 @@ async function renderFilesView() {
       <div class="ps-files-toolbar">
         <tf-select id="ps-files-source" value="${escapeAttr(state.files.sourceId || '')}">
           ${state.sources.map((s) => {
-            const id = s.source_id ?? s.sourceId;
+            const id = s.sourceId;
             return `<option value="${escapeAttr(id)}" ${id === state.files.sourceId ? 'selected' : ''}>${escapeHtml(s.name)}</option>`;
           }).join('')}
         </tf-select>
@@ -3268,7 +3268,7 @@ function buildFileTree(rows) {
     const files = node.files
       .sort((a, b) => a.name.localeCompare(b.name))
       .map(({ name, file }) => ({
-        id: `file:${file.file_id ?? file.fileId}`,
+        id: `file:${file.fileId}`,
         label: name,
         icon: 'file-text',
       }));
@@ -3298,7 +3298,7 @@ function renderFilesTree(host) {
 async function renderFilePreviewPane(fileId) {
   const pane = byId('ps-files-preview');
   if (!pane) return;
-  const file = state.files.rows.find((f) => (f.file_id ?? f.fileId) === fileId);
+  const file = state.files.rows.find((f) => (f.fileId) === fileId);
   if (!file) return;
   pane.innerHTML = `<div class="ps-loading"><tf-spinner size="sm"></tf-spinner> ${escapeHtml(t('loading'))}</div>`;
   let content = '';
@@ -3320,9 +3320,9 @@ async function renderFilePreviewPane(fileId) {
       <div>
         <div class="ps-files-preview-path">${escapeHtml(file.path)}</div>
         <div class="ps-files-preview-meta">
-          ${escapeHtml(t('files_chunk_count', { count: file.chunk_count ?? file.chunkCount ?? 0 }))}
-          · ${escapeHtml(formatBytes(Number(file.size_bytes ?? file.sizeBytes ?? 0)))}
-          · ${escapeHtml(formatTimestamp(file.updated_at ?? file.updatedAt))}
+          ${escapeHtml(t('files_chunk_count', { count: file.chunkCount ?? 0 }))}
+          · ${escapeHtml(formatBytes(Number(file.sizeBytes ?? 0)))}
+          · ${escapeHtml(formatTimestamp(file.updatedAt))}
         </div>
       </div>
       <tf-chip status="${FILE_STATUS_CHIP[file.status] || 'info'}">${escapeHtml(t(`file_status_${file.status}`))}</tf-chip>
@@ -3377,16 +3377,16 @@ function renderFilesTable() {
   `;
   const table = byId('ps-files-table');
   table.rows = state.files.rows.map((f) => ({
-    _id: f.file_id ?? f.fileId,
+    _id: f.fileId,
     _status: f.status,
     _file: f,
     path: f.path,
     status: { status: FILE_STATUS_CHIP[f.status] || 'info', label: t(`file_status_${f.status}`) },
     // Skip/error reason surfaces inline (skipped files carry it in `error`).
     note: f.error || '—',
-    size: formatBytes(Number(f.size_bytes ?? f.sizeBytes ?? 0)),
-    chunks: f.chunk_count ?? f.chunkCount ?? 0,
-    updated: formatTimestamp(f.updated_at ?? f.updatedAt),
+    size: formatBytes(Number(f.sizeBytes ?? 0)),
+    chunks: f.chunkCount ?? 0,
+    updated: formatTimestamp(f.updatedAt),
   }));
   table.rowActions = (row, idx, currentRow) => {
     const live = () => currentRow?.() ?? row;
@@ -3496,7 +3496,7 @@ async function renderChat() {
     return;
   }
   if (state.tab !== 'chat') return;
-  if (state.chatId && !state.chats.some((c) => (c.chat_id ?? c.chatId) === state.chatId)) {
+  if (state.chatId && !state.chats.some((c) => (c.chatId) === state.chatId)) {
     state.chatId = null;
   }
 
@@ -3573,12 +3573,12 @@ function renderChatConvs() {
     return;
   }
   host.innerHTML = state.chats.map((c) => {
-    const chatId = c.chat_id ?? c.chatId;
+    const chatId = c.chatId;
     return `
       <div class="ps-chat-conv ${chatId === state.chatId ? 'is-active' : ''}" data-conv="${escapeAttr(chatId)}" role="button" tabindex="0">
         <div class="ps-conv-main">
           <div class="ps-conv-title">${escapeHtml(c.title || t('chat_untitled'))}</div>
-          <div class="ps-conv-sub">${escapeHtml(c.last_message_preview ?? c.lastMessagePreview ?? '')}</div>
+          <div class="ps-conv-sub">${escapeHtml(c.lastMessagePreview ?? '')}</div>
         </div>
         <div class="ps-conv-actions" ${canArea('chat', 'write') ? '' : 'hidden'}>
           <tf-button variant="ghost" size="sm" icon="edit" data-conv-rename="${escapeAttr(chatId)}" title="${escapeAttr(t('chat_rename'))}"></tf-button>
@@ -3591,7 +3591,7 @@ function renderChatConvs() {
 
 function renderChatHeader() {
   const title = byId('ps-chat-title');
-  const chat = state.chats.find((c) => (c.chat_id ?? c.chatId) === state.chatId);
+  const chat = state.chats.find((c) => (c.chatId) === state.chatId);
   if (title) title.textContent = chat ? (chat.title || t('chat_untitled')) : t('chat_new_conversation');
   const renameBtn = byId('ps-chat-rename');
   const deleteBtn = byId('ps-chat-delete');
@@ -3618,8 +3618,8 @@ async function loadChatHistory() {
     state.chatMessages = messages.slice().reverse().map((m) => ({
       role: m.role,
       content: m.content,
-      citationsJson: m.citations_json ?? m.citationsJson ?? '',
-      time: formatTimestamp(m.created_at ?? m.createdAt),
+      citationsJson: m.citationsJson ?? '',
+      time: formatTimestamp(m.createdAt),
       streaming: false,
     }));
   } catch (err) {
@@ -3642,8 +3642,8 @@ function citationsHtml(citationsJson) {
   const citations = parseCitations(citationsJson);
   if (!citations.length) return '';
   const rows = citations.map((c, i) => {
-    const title = c.source_name ?? c.sourceName ?? c.title ?? c.file_path ?? c.filePath ?? t('chat_source');
-    const path = c.file_path ?? c.filePath ?? c.location ?? '';
+    const title = c.source_name ?? c.title ?? c.file_path ?? t('chat_source');
+    const path = c.file_path ?? c.location ?? '';
     const snippet = c.snippet ?? c.text ?? '';
     return `
       <div class="ps-chat-src">
@@ -3703,7 +3703,7 @@ async function sendChatMessage(text) {
       const chat = resp.chat;
       if (chat) {
         state.chats.unshift(chat);
-        state.chatId = chat.chat_id ?? chat.chatId;
+        state.chatId = chat.chatId;
       }
     } catch (err) {
       toast(`${t('chat_create_failed')}: ${err.message}`, 'error');
@@ -3736,13 +3736,13 @@ async function sendChatMessage(text) {
       { projectId: projectId(), chatId, message: text },
       {
         onChunk: (body) => {
-          if (body?.variant !== 'ProjectStudioChatStreamChunk') return;
+          if (body?._variant !== 'ProjectStudioBody.ChatStreamChunk') return;
           if (state.chatId !== chatId) return;
           if (body.kind === 'token') {
             assistant.content += body.text ?? '';
             renderChatMessages();
           } else if (body.kind === 'citations') {
-            assistant.citationsJson = body.citations_json ?? body.citationsJson ?? '';
+            assistant.citationsJson = body.citationsJson ?? '';
             renderChatMessages();
           }
           // kind === 'status' is informational only.
@@ -3785,7 +3785,7 @@ function stopChatStream() {
 }
 
 async function renameChat(chatId) {
-  const chat = state.chats.find((c) => (c.chat_id ?? c.chatId) === chatId);
+  const chat = state.chats.find((c) => (c.chatId) === chatId);
   if (!chat) return;
   const title = await openPromptWindow({
     title: t('chat_rename'),
@@ -3808,7 +3808,7 @@ function renameCurrentChat() {
 }
 
 async function deleteChat(chatId) {
-  const chat = state.chats.find((c) => (c.chat_id ?? c.chatId) === chatId);
+  const chat = state.chats.find((c) => (c.chatId) === chatId);
   if (!chat) return;
   const ok = await TfWindow.confirm({
     title: t('chat_delete_title'),
@@ -3820,7 +3820,7 @@ async function deleteChat(chatId) {
   if (!ok) return;
   try {
     await ApiBinary.one('projectStudioChatDeleteRequest', { projectId: projectId(), chatId });
-    state.chats = state.chats.filter((c) => (c.chat_id ?? c.chatId) !== chatId);
+    state.chats = state.chats.filter((c) => (c.chatId) !== chatId);
     if (state.chatId === chatId) {
       stopChatStream();
       state.chatId = null;
@@ -3871,18 +3871,18 @@ async function renderMembers() {
       <tf-searchbox id="ps-members-search" placeholder="${escapeAttr(t('members_search_placeholder'))}" debounce="200"></tf-searchbox>
       <tf-select id="ps-members-function-filter" value="${escapeAttr(state.memberFunctionFilter)}">
         <option value="all">${escapeHtml(t('functions_filter_all'))}</option>
-        ${state.functions.map((definition) => `<option value="${escapeAttr(fv(definition, 'function_id'))}">${escapeHtml(functionLabel(definition))}</option>`).join('')}
+        ${state.functions.map((definition) => `<option value="${escapeAttr(definition?.functionId)}">${escapeHtml(functionLabel(definition))}</option>`).join('')}
       </tf-select>
       <span class="ps-toolbar-spacer"></span>
-      <span class="ps-field-hint">${escapeHtml(t('members_enabled_modules'))}: ${escapeHtml((fv(projectAccess(), 'enabled_modules') || []).map((module) => t(`module_${module}`)).join(', '))}</span>
+      <span class="ps-field-hint">${escapeHtml(t('members_enabled_modules'))}: ${escapeHtml((projectAccess()?.enabledModules || []).map((module) => t(`module_${module}`)).join(', '))}</span>
     </div>
     <div id="ps-members-list"></div>
     ${state.memberAgents !== null ? `<tf-section-card title="${escapeAttr(t('members_agents'))}" icon="brain">
       <span slot="subtitle">${escapeHtml(t('members_agents_hint'))}</span>
-      <div class="ps-agent-bindings">${state.memberAgents.filter((binding) => fv(binding, 'agent_id')).map((binding) => `
+      <div class="ps-agent-bindings">${state.memberAgents.filter((binding) => binding?.agentId).map((binding) => `
         <div class="ps-agent-binding"><tf-chip status="accent">${escapeHtml(t(`agents_fn_${binding.function}`))}</tf-chip>
-          <span>${escapeHtml(fv(binding, 'agent_name') || fv(binding, 'agent_id'))}</span>
-          <span class="ps-field-hint">${escapeHtml(fv(binding, 'model_label') || '')}</span></div>`).join('') || `<div class="ps-field-hint">${escapeHtml(t('members_agents_empty'))}</div>`}</div>
+          <span>${escapeHtml(binding?.agentName || binding?.agentId)}</span>
+          <span class="ps-field-hint">${escapeHtml(binding?.modelLabel || '')}</span></div>`).join('') || `<div class="ps-field-hint">${escapeHtml(t('members_agents_empty'))}</div>`}</div>
     </tf-section-card>` : ''}
     <tf-section-card title="${escapeAttr(t('function_catalogue'))}" icon="shield">
       <span slot="actions">${canManageMembers() ? `<tf-button variant="ghost" size="sm" icon="plus" id="ps-function-new">${escapeHtml(t('function_new'))}</tf-button>` : ''}</span>
@@ -3937,7 +3937,7 @@ function renderMembersList() {
   const query = state.memberQuery.trim().toLowerCase();
   const visible = state.members.filter((member) =>
     (state.memberFunctionFilter === 'all' || member.functions?.includes(state.memberFunctionFilter))
-    && (!query || `${fv(member, 'display_name')} ${member.email || ''}`.toLowerCase().includes(query)));
+    && (!query || `${member?.displayName} ${member.email || ''}`.toLowerCase().includes(query)));
   const groups = ['people', 'inherited', 'temporary', 'expired'];
   host.innerHTML = groups.map((group) => {
     const rows = visible.filter((member) => memberGroup(member) === group);
@@ -3952,7 +3952,7 @@ function renderMembersList() {
     </tf-section-card>`;
   }).join('') + `<div class="ps-table-footer">${escapeHtml(t('members_access_footer', {
     shown: visible.length, total: state.members.length,
-    admins: state.members.filter((member) => member.active && fv(member, 'project_admin')).length,
+    admins: state.members.filter((member) => member.active && member?.projectAdmin).length,
     temporary: state.members.filter((member) => memberGroup(member) === 'temporary').length,
   }))}</div>`;
   for (const group of groups) {
@@ -3960,18 +3960,18 @@ function renderMembersList() {
     if (!table) continue;
     table.rowKey = '_id';
     table.rows = visible.filter((member) => memberGroup(member) === group).map((member) => {
-      const userId = fv(member, 'user_id');
-      const name = fv(member, 'display_name') || userId;
+      const userId = member?.userId;
+      const name = member?.displayName || userId;
       return {
         _id: userId, _member: member,
         person: `<div class="ps-member-person"><div class="ps-av-mini">${escapeHtml(initials(name))}</div><div><b>${escapeHtml(name)}</b>
           ${isMe(userId) ? `<tf-chip status="accent">${escapeHtml(t('you_chip'))}</tf-chip>` : ''}
           <div class="ps-member-mail">${escapeHtml(member.email || '')}</div>
-          <div class="ps-member-markers">${fv(member, 'is_owner') ? `<tf-chip status="accent">${escapeHtml(t('access_owner'))}</tf-chip>` : ''}
-          ${fv(member, 'project_admin') ? `<tf-chip status="accent">${escapeHtml(t('access_project_admin'))}</tf-chip>` : ''}</div>${member.origin_projects?.some((row) => row.project_id !== projectId()) ? `<div class="ps-field-hint">${escapeHtml(t('members_origin', { projects: member.origin_projects.filter((row) => row.project_id !== projectId()).map((row) => row.name).join(', ') }))}</div>` : ''}</div></div>`,
+          <div class="ps-member-markers">${member?.isOwner ? `<tf-chip status="accent">${escapeHtml(t('access_owner'))}</tf-chip>` : ''}
+          ${member?.projectAdmin ? `<tf-chip status="accent">${escapeHtml(t('access_project_admin'))}</tf-chip>` : ''}</div>${member.originProjects?.some((row) => row.projectId !== projectId()) ? `<div class="ps-field-hint">${escapeHtml(t('members_origin', { projects: member.originProjects.filter((row) => row.projectId !== projectId()).map((row) => row.name).join(', ') }))}</div>` : ''}</div></div>`,
         functions: `<div class="ps-member-function-chips">${functionChips(member.functions)}</div>`,
         access: effectiveAccessHtml(member.access),
-        expiry: `${escapeHtml(fv(member, 'expires_at') ? formatTimestamp(fv(member, 'expires_at')) : t('members_permanent'))}
+        expiry: `${escapeHtml(member?.expiresAt ? formatTimestamp(member?.expiresAt) : t('members_permanent'))}
           ${member.active ? '' : `<tf-chip status="warn">${escapeHtml(t('members_expired_badge'))}</tf-chip>`}`,
       };
     });
@@ -3983,7 +3983,7 @@ function renderMembersList() {
       button.setAttribute('title', t('action_more'));
       button.addEventListener('click', () => {
         const member = row._member;
-        const owner = !!fv(member, 'is_owner');
+        const owner = !!member?.isOwner;
         const self = isMe(row._id);
         const items = [];
         if (canManageMembers()) items.push({ label: t(member.inherited ? 'members_add_local' : 'access_edit'), icon: member.inherited ? 'plus' : 'edit', run: () => openMemberAccessWindow(member) });
@@ -3991,7 +3991,7 @@ function renderMembersList() {
         if (canManageMembers() && !member.inherited) items.push({ label: t('members_handover'), icon: 'arrow', danger: true, disabled: owner || self,
           reason: t(owner ? 'members_owner_handover' : 'members_self_remove'),
           run: () => openHandover({ userId: row._id, reason: 'project_removal', projectId: projectId() }) });
-        openActionMenu(button, items, fv(member, 'display_name') || row._id);
+        openActionMenu(button, items, member?.displayName || row._id);
       });
       return button;
     };
@@ -4014,7 +4014,7 @@ function renderFunctionCatalogue() {
         title: t('function_delete'), submitLabel: t('action_delete'),
         consequence: t('function_delete_message', { name: functionLabel(definition) }),
         onSubmit: async () => {
-          const response = await ApiBinary.one('projectStudioFunctionDeleteRequest', { projectId: projectId(), functionId: fv(definition, 'function_id') });
+          const response = await ApiBinary.one('projectStudioFunctionDeleteRequest', { projectId: projectId(), functionId: definition?.functionId });
           if (!response.ok) throw new Error(t('members_failed'));
           toast(t('function_delete_ok'), 'success');
           await refreshProjectHeader();
@@ -4041,7 +4041,7 @@ function openFunctionWindow(definition = null) {
   const { body, foot, cleanup } = openWindow({ title: t(definition ? 'function_edit' : 'function_new'), icon: 'shield', width: 720 });
   body.innerHTML = `
     <div class="ps-access-catalogue-fields">
-      <tf-input data-function-id label="${escapeAttr(t('function_id'))}" value="${escapeAttr(fv(definition, 'function_id') || '')}" ${definition ? 'disabled' : ''}></tf-input>
+      <tf-input data-function-id label="${escapeAttr(t('function_id'))}" value="${escapeAttr(definition?.functionId || '')}" ${definition ? 'disabled' : ''}></tf-input>
       <tf-input data-function-name label="${escapeAttr(t('function_name'))}" value="${escapeAttr(definition ? functionLabel(definition) : '')}" maxlength="128"></tf-input>
       <tf-textarea data-function-description label="${escapeAttr(t('function_description'))}" rows="3"></tf-textarea>
     </div>
@@ -4086,8 +4086,8 @@ function openFunctionWindow(definition = null) {
 
 function openMemberAccessWindow(member) {
   if (!canManageMembers()) return;
-  const { body, foot, cleanup } = openWindow({ title: t(member.inherited ? 'members_add_local' : 'access_edit'), subtitle: fv(member, 'display_name') || fv(member, 'user_id'), icon: 'users', width: 640 });
-  body.innerHTML = `${memberAccessFields(member, state.functions)}${member.origin_projects?.some((row) => row.project_id !== projectId()) ? `<div class="ps-field-hint">${escapeHtml(t('members_local_removal_hint'))}</div>` : ''}<div class="ps-field-hint">${escapeHtml(t('access_no_functions_hint'))}</div><div class="ps-form-error" data-form-error hidden></div>`;
+  const { body, foot, cleanup } = openWindow({ title: t(member.inherited ? 'members_add_local' : 'access_edit'), subtitle: member?.displayName || member?.userId, icon: 'users', width: 640 });
+  body.innerHTML = `${memberAccessFields(member, state.functions)}${member.originProjects?.some((row) => row.projectId !== projectId()) ? `<div class="ps-field-hint">${escapeHtml(t('members_local_removal_hint'))}</div>` : ''}<div class="ps-field-hint">${escapeHtml(t('access_no_functions_hint'))}</div><div class="ps-form-error" data-form-error hidden></div>`;
   foot.innerHTML = `<div class="ps-footer-left"></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" icon="check" data-action="save">${escapeHtml(t('action_save'))}</tf-button></div>`;
   foot.addEventListener('click', async (event) => {
     const button = event.target.closest('[data-action]');
@@ -4097,8 +4097,8 @@ function openMemberAccessWindow(member) {
       const access = readMemberAccess(body);
       button.setAttribute('disabled', '');
       const response = member.inherited
-        ? await ApiBinary.one('projectStudioMembersAddRequest', { projectId: projectId(), members: [{ userId: fv(member, 'user_id'), ...access }] })
-        : await ApiBinary.one('projectStudioMemberAccessSetRequest', { projectId: projectId(), userId: fv(member, 'user_id'), ...access });
+        ? await ApiBinary.one('projectStudioMembersAddRequest', { projectId: projectId(), members: [{ userId: member?.userId, ...access }] })
+        : await ApiBinary.one('projectStudioMemberAccessSetRequest', { projectId: projectId(), userId: member?.userId, ...access });
       if (member.inherited ? response.added !== 1 : !response.ok) throw new Error(t('members_failed'));
       cleanup();
       toast(t('access_saved'), 'success');
@@ -4113,10 +4113,10 @@ function openMemberAccessWindow(member) {
 }
 
 async function transferOwnership(userId) {
-  const member = state.members.find((entry) => fv(entry, 'user_id') === userId);
+  const member = state.members.find((entry) => entry?.userId === userId);
   if (!member || !canTransferOwnership()) return;
   const ok = await TfWindow.confirm({ title: t('members_transfer_title'),
-    message: t('members_transfer_message', { name: escapeHtml(fv(member, 'display_name') || '') }),
+    message: t('members_transfer_message', { name: escapeHtml(member?.displayName || '') }),
     confirmLabel: t('members_transfer'), cancelLabel: t('action_cancel'), danger: true });
   if (!ok) return;
   try {
@@ -4140,7 +4140,7 @@ function openInviteWindow() {
   foot.innerHTML = `<div class="ps-footer-left"></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" icon="plus" data-action="save">${escapeHtml(t('invite_submit'))}</tf-button></div>`;
   const renderSelected = () => {
     const host = body.querySelector('[data-invite-chips]');
-    host.innerHTML = invite.selected.map((person, index) => `<tf-chip status="accent" removable data-invite-chip="${index}">${escapeHtml(fv(person, 'display_name') || fv(person, 'user_id'))}</tf-chip>`).join('');
+    host.innerHTML = invite.selected.map((person, index) => `<tf-chip status="accent" removable data-invite-chip="${index}">${escapeHtml(person?.displayName || person?.userId)}</tf-chip>`).join('');
     host.querySelectorAll('[data-invite-chip]').forEach((chip) => chip.addEventListener('remove', () => {
       invite.selected.splice(Number(chip.dataset.inviteChip), 1);
       renderSelected();
@@ -4149,11 +4149,11 @@ function openInviteWindow() {
   };
   const renderCandidates = () => {
     const host = body.querySelector('[data-invite-candidates]');
-    const chosen = new Set(invite.selected.map((person) => fv(person, 'user_id')));
-    const effectiveIds = new Set(state.members.filter((member) => member.access.has_access).map((member) => member.user_id));
-    const rows = invite.candidates.filter((person) => !chosen.has(fv(person, 'user_id')) && !effectiveIds.has(fv(person, 'user_id')));
+    const chosen = new Set(invite.selected.map((person) => person?.userId));
+    const effectiveIds = new Set(state.members.filter((member) => member.access.hasAccess).map((member) => member.userId));
+    const rows = invite.candidates.filter((person) => !chosen.has(person?.userId) && !effectiveIds.has(person?.userId));
     host.hidden = !rows.length;
-    host.innerHTML = rows.map((person) => `<tf-button variant="ghost" data-invite-candidate="${escapeAttr(fv(person, 'user_id'))}">${escapeHtml(`${fv(person, 'display_name') || ''} · ${person.email || ''}`)}</tf-button>`).join('');
+    host.innerHTML = rows.map((person) => `<tf-button variant="ghost" data-invite-candidate="${escapeAttr(person?.userId)}">${escapeHtml(`${person?.displayName || ''} · ${person.email || ''}`)}</tf-button>`).join('');
   };
   body.querySelector('[data-invite-search]').addEventListener('search', async (event) => {
     const query = String(event.detail?.value || '').trim();
@@ -4171,8 +4171,8 @@ function openInviteWindow() {
   body.addEventListener('click', (event) => {
     const candidate = event.target.closest('[data-invite-candidate]');
     if (!candidate) return;
-    const person = invite.candidates.find((entry) => fv(entry, 'user_id') === candidate.dataset.inviteCandidate);
-    if (person && !invite.selected.some((entry) => fv(entry, 'user_id') === fv(person, 'user_id'))) invite.selected.push(person);
+    const person = invite.candidates.find((entry) => entry?.userId === candidate.dataset.inviteCandidate);
+    if (person && !invite.selected.some((entry) => entry?.userId === person?.userId)) invite.selected.push(person);
     renderSelected();
     renderCandidates();
   });
@@ -4184,7 +4184,7 @@ function openInviteWindow() {
       if (!invite.selected.length) throw new Error(t('err_invite_empty'));
       const access = readMemberAccess(body);
       button.setAttribute('disabled', '');
-      const response = await ApiBinary.one('projectStudioMembersAddRequest', { projectId: projectId(), members: invite.selected.map((person) => ({ userId: fv(person, 'user_id'), ...access })) });
+      const response = await ApiBinary.one('projectStudioMembersAddRequest', { projectId: projectId(), members: invite.selected.map((person) => ({ userId: person?.userId, ...access })) });
       toast(t('invite_ok', { count: Number(response.added) }), 'success');
       cleanup();
       await refreshProjectHeader();
@@ -4215,7 +4215,7 @@ async function renderSettings() {
   // degrades to showing only the current binding.
   try {
     const resp = await ApiBinary.one('agentsListRequest', {});
-    const rows = JSON.parse(resp.agentsJson ?? resp.agents_json ?? '[]');
+    const rows = JSON.parse(resp.agentsJson ?? '[]');
     state.agentOptions = Array.isArray(rows)
       ? rows.filter((a) => a.is_enabled).map((a) => ({ id: a.id, name: a.display_name || a.name }))
       : [];
@@ -4232,26 +4232,26 @@ async function renderSettings() {
   const enabledModules = new Set(
     Array.isArray(settings.modules) ? settings.modules : (Array.isArray(state.project?.modules) ? state.project.modules : []),
   );
-  const moduleLocked = (mod) => mod.locked && !state.project.parent_id && state.project.template !== 'empty';
-  const graphExtraction = fv(settings, 'graph_extraction') === true;
+  const moduleLocked = (mod) => mod.locked && !state.project.parentId && state.project.template !== 'empty';
+  const graphExtraction = settings?.graphExtraction === true;
 
   const bindingOf = (fn) => agents.find((a) => a.function === fn)
-    || { function: fn, agent_id: '', agent_name: '', model_label: '' };
+    || { function: fn, agentId: '', agentName: '', modelLabel: '' };
   const agentOptionsFor = (binding) => {
-    const agentId = fv(binding, 'agent_id') || '';
+    const agentId = binding?.agentId || '';
     const options = [
       `<option value="" ${!agentId ? 'selected' : ''}>${escapeHtml(t('agents_default_option'))}</option>`,
       ...state.agentOptions.map((a) => `<option value="${escapeAttr(a.id)}" ${a.id === agentId ? 'selected' : ''}>${escapeHtml(a.name)}</option>`),
     ];
     // Keep an unknown current binding visible even when the agent list failed.
     if (agentId && !state.agentOptions.some((a) => a.id === agentId)) {
-      options.push(`<option value="${escapeAttr(agentId)}" selected>${escapeHtml(fv(binding, 'agent_name') || agentId)}</option>`);
+      options.push(`<option value="${escapeAttr(agentId)}" selected>${escapeHtml(binding?.agentName || agentId)}</option>`);
     }
     return options.join('');
   };
   const agentRowHtml = (fn) => {
     const binding = bindingOf(fn);
-    const modelLabel = fv(binding, 'model_label') || '';
+    const modelLabel = binding?.modelLabel || '';
     return `
       <div class="ps-setting-row">
         <div class="ps-sr-main">
@@ -4259,7 +4259,7 @@ async function renderSettings() {
           <div class="ps-sr-desc">${escapeHtml(t(`agents_fn_${fn}_desc`))}</div>
         </div>
         <div class="ps-fn-controls">
-          <tf-select data-agent-fn="${escapeAttr(fn)}" value="${escapeAttr(fv(binding, 'agent_id') || '')}">${agentOptionsFor(binding)}</tf-select>
+          <tf-select data-agent-fn="${escapeAttr(fn)}" value="${escapeAttr(binding?.agentId || '')}">${agentOptionsFor(binding)}</tf-select>
           <span class="ps-fn-model" data-agent-model="${escapeAttr(fn)}">${escapeHtml(modelLabel ? `${t('agents_model_prefix')}: ${modelLabel}` : '')}</span>
         </div>
       </div>
@@ -4273,8 +4273,8 @@ async function renderSettings() {
           hint="${escapeAttr(t('settings_name_hint'))}"></tf-input>
       </div>
       <div class="ps-field" style="margin-bottom:12px;">
-        <tf-input id="ps-set-prefix" label="${escapeAttr(t('project_key_prefix'))}" value="${escapeAttr(fv(state.project, 'key_prefix'))}" maxlength="8" ${fv(state.project, 'key_prefix_locked') ? 'readonly' : ''}
-          hint="${escapeAttr(t(fv(state.project, 'key_prefix_locked') ? 'project_key_prefix_locked' : 'project_key_prefix_hint'))}"></tf-input>
+        <tf-input id="ps-set-prefix" label="${escapeAttr(t('project_key_prefix'))}" value="${escapeAttr(state.project?.keyPrefix)}" maxlength="8" ${state.project?.keyPrefixLocked ? 'readonly' : ''}
+          hint="${escapeAttr(t(state.project?.keyPrefixLocked ? 'project_key_prefix_locked' : 'project_key_prefix_hint'))}"></tf-input>
       </div>
       <div class="ps-field" style="margin-bottom:12px;">
         <tf-textarea id="ps-set-desc" label="${escapeAttr(t('wizard_desc_label'))}" rows="3"
@@ -4283,7 +4283,7 @@ async function renderSettings() {
       <tf-button variant="primary" icon="check" id="ps-set-save">${escapeHtml(t('settings_save'))}</tf-button>
     </tf-section-card>
 
-    ${projectAccess().enabled_modules?.includes('tasks') ? `<tf-section-card title="${escapeAttr(t('task_types_title'))}" icon="list"><div id="ps-set-task-types" class="ps-task-types"></div></tf-section-card>` : ''}
+    ${projectAccess().enabledModules?.includes('tasks') ? `<tf-section-card title="${escapeAttr(t('task_types_title'))}" icon="list"><div id="ps-set-task-types" class="ps-task-types"></div></tf-section-card>` : ''}
 
     <tf-section-card title="${escapeAttr(t('settings_modules_title'))}" icon="grid-rows">
       <span slot="subtitle">${escapeHtml(t('settings_modules_hint'))}</span>
@@ -4298,12 +4298,12 @@ async function renderSettings() {
               </div>
               <div class="ps-module-desc">${escapeHtml(t(`module_${mod.id}_desc`))}</div>
             </div>
-            <tf-toggle data-module="${escapeAttr(mod.id)}" ${enabledModules.has(mod.id) ? 'checked' : ''} ${moduleLocked(mod) || state.project.inherit_modules ? 'disabled' : ''}></tf-toggle>
+            <tf-toggle data-module="${escapeAttr(mod.id)}" ${enabledModules.has(mod.id) ? 'checked' : ''} ${moduleLocked(mod) || state.project.inheritModules ? 'disabled' : ''}></tf-toggle>
           </div>
         `).join('')}
       </div>
-      ${state.project.inherit_modules ? `<span class="ps-field-hint">${escapeHtml(t('inheritance_live'))}</span>` : ''}
-      <tf-button variant="primary" icon="check" id="ps-set-modules-save" ${state.project.inherit_modules ? 'disabled' : ''}>${escapeHtml(t('settings_save'))}</tf-button>
+      ${state.project.inheritModules ? `<span class="ps-field-hint">${escapeHtml(t('inheritance_live'))}</span>` : ''}
+      <tf-button variant="primary" icon="check" id="ps-set-modules-save" ${state.project.inheritModules ? 'disabled' : ''}>${escapeHtml(t('settings_save'))}</tf-button>
     </tf-section-card>
 
     <tf-section-card title="${escapeAttr(t('settings_graph_title'))}" icon="network">
@@ -4335,12 +4335,12 @@ async function renderSettings() {
       </div>
       <div id="ps-tags-list">
         ${tags.length ? tags.map((tag) => `
-          <div class="ps-tag-row" data-tag="${escapeAttr(tag.tag_id ?? tag.tagId)}">
+          <div class="ps-tag-row" data-tag="${escapeAttr(tag.tagId)}">
             <tf-chip status="info">${escapeHtml(tag.name)}</tf-chip>
-            <span class="ps-tag-count">${escapeHtml(t('tags_usage', { count: tag.usage_count ?? tag.usageCount ?? 0 }))}</span>
+            <span class="ps-tag-count">${escapeHtml(t('tags_usage', { count: tag.usageCount ?? 0 }))}</span>
             <div class="ps-tag-actions">
-              <tf-button variant="ghost" size="sm" icon="edit" data-tag-rename="${escapeAttr(tag.tag_id ?? tag.tagId)}" title="${escapeAttr(t('tags_rename'))}"></tf-button>
-              <tf-button variant="ghost" size="sm" icon="trash" data-tag-delete="${escapeAttr(tag.tag_id ?? tag.tagId)}" title="${escapeAttr(t('action_delete'))}"></tf-button>
+              <tf-button variant="ghost" size="sm" icon="edit" data-tag-rename="${escapeAttr(tag.tagId)}" title="${escapeAttr(t('tags_rename'))}"></tf-button>
+              <tf-button variant="ghost" size="sm" icon="trash" data-tag-delete="${escapeAttr(tag.tagId)}" title="${escapeAttr(t('action_delete'))}"></tf-button>
             </div>
           </div>
         `).join('') : `<div class="ps-field-hint">${escapeHtml(t('tags_empty'))}</div>`}
@@ -4382,7 +4382,7 @@ async function renderSettings() {
       toast(t('err_name_short'), 'error');
       return;
     }
-    const keyPrefix = fv(state.project, 'key_prefix_locked') ? null : byId('ps-set-prefix').value.trim().toUpperCase();
+    const keyPrefix = state.project?.keyPrefixLocked ? null : byId('ps-set-prefix').value.trim().toUpperCase();
     if (keyPrefix !== null && !/^[A-Z][A-Z0-9]{1,7}$/.test(keyPrefix)) { toast(t('err_project_key_prefix'), 'error'); return; }
     try {
       await ApiBinary.one('projectStudioSettingsSaveRequest', { projectId: projectId(), name, description, keyPrefix });
@@ -4399,7 +4399,7 @@ async function renderSettings() {
   // Modules replace the enabled set; only the original non-empty root presets
   // require Knowledge. An own empty preset can remain a grouping node.
   byId('ps-set-modules-save')?.addEventListener('click', async () => {
-    if (state.project.inherit_modules || !canArea('settings', 'write')) return;
+    if (state.project.inheritModules || !canArea('settings', 'write')) return;
     const host = byId('ps-set-modules');
     const modules = MODULE_DEFS
       .filter((mod) => moduleLocked(mod) || host?.querySelector(`tf-toggle[data-module="${CSS.escape(mod.id)}"]`)?.hasAttribute('checked'))
@@ -4428,7 +4428,7 @@ async function renderSettings() {
       });
       const resp = await ApiBinary.one('projectStudioSettingsGetRequest', { projectId: projectId() });
       state.settings = resp.settings;
-      const stored = fv(resp.settings ?? {}, 'graph_extraction') === true;
+      const stored = (resp.settings ?? {}).graphExtraction === true;
       if (toggle) {
         if (stored) toggle.setAttribute('checked', '');
         else toggle.removeAttribute('checked');
@@ -4461,7 +4461,7 @@ async function renderSettings() {
       for (const fn of AGENT_FUNCTIONS) {
         const binding = fresh.find((a) => a.function === fn);
         const modelEl = byId('ps-agent-rows')?.querySelector(`[data-agent-model="${CSS.escape(fn)}"]`);
-        const modelLabel = binding ? (fv(binding, 'model_label') || '') : '';
+        const modelLabel = binding ? (binding?.modelLabel || '') : '';
         if (modelEl) modelEl.textContent = modelLabel ? `${t('agents_model_prefix')}: ${modelLabel}` : '';
       }
     } catch (err) {
@@ -4485,7 +4485,7 @@ async function renderSettings() {
     const renameBtn = e.target.closest('[data-tag-rename]');
     if (renameBtn) {
       const tagId = renameBtn.dataset.tagRename;
-      const tag = (state.settings?.tags ?? []).find((x) => (x.tag_id ?? x.tagId) === tagId);
+      const tag = (state.settings?.tags ?? []).find((x) => (x.tagId) === tagId);
       const name = await openPromptWindow({
         title: t('tags_rename'),
         label: t('tags_new_label'),
@@ -4504,7 +4504,7 @@ async function renderSettings() {
     const deleteBtn = e.target.closest('[data-tag-delete]');
     if (deleteBtn) {
       const tagId = deleteBtn.dataset.tagDelete;
-      const tag = (state.settings?.tags ?? []).find((x) => (x.tag_id ?? x.tagId) === tagId);
+      const tag = (state.settings?.tags ?? []).find((x) => (x.tagId) === tagId);
       const ok = await TfWindow.confirm({
         title: t('tags_delete_title'),
         message: t('tags_delete_message', { name: escapeHtml(tag?.name || '') }),
@@ -4566,16 +4566,6 @@ const NOTIF_KIND_ICON = {
   environment_decided: 'globe',
 };
 
-// Wire structs decode with snake_case field names; some decode layers expose
-// camelCase aliases instead — read both so the UI never depends on which one
-// the glue produced.
-function fv(obj, key) {
-  if (!obj || typeof obj !== 'object') return undefined;
-  if (obj[key] !== undefined) return obj[key];
-  const camel = key.replace(/_([a-z0-9])/g, (_, c) => c.toUpperCase());
-  return obj[camel];
-}
-
 function chipCell(status, label) {
   return { status: status || 'info', label };
 }
@@ -4625,7 +4615,7 @@ async function loadProjectTags(force = false) {
   if (s.tagsLoaded && !force) return s.tags;
   try {
     const resp = await ApiBinary.one('projectStudioSettingsGetRequest', { projectId: projectId() });
-    const tags = fv(resp.settings ?? {}, 'tags');
+    const tags = (resp.settings ?? {}).tags;
     s.tags = Array.isArray(tags) ? tags : [];
   } catch {
     s.tags = [];
@@ -4635,7 +4625,7 @@ async function loadProjectTags(force = false) {
 }
 
 function tagNameById(tagId) {
-  const tag = f2().tags.find((x) => fv(x, 'tag_id') === tagId);
+  const tag = f2().tags.find((x) => x?.tagId === tagId);
   return tag ? tag.name : '';
 }
 
@@ -4657,8 +4647,8 @@ function testerMembers() {
 }
 
 function memberName(userId) {
-  const m = (f2().membersCache || []).find((x) => fv(x, 'user_id') === userId);
-  return m ? (fv(m, 'display_name') || '') : '';
+  const m = (f2().membersCache || []).find((x) => x?.userId === userId);
+  return m ? (m?.displayName || '') : '';
 }
 
 function attachmentOwner(ownerKind, ownerId, stepIndex = null, pid = projectId()) {
@@ -4718,7 +4708,7 @@ async function openAttachmentPreview(attachment, owner) {
         const next = await openAttachmentStream(owner, attachment, { preview: true });
         if (closed) { next.close(); return; }
         stream?.close(); stream = next; showSource(next.url, result.mime);
-        status.textContent = t('attachment_preview_ready', { duration: taskDuration(Number(result.duration_ms) / 1000, t) });
+        status.textContent = t('attachment_preview_ready', { duration: taskDuration(Number(result.durationMs) / 1000, t) });
       } else if (result.status === 'error') {
         status.textContent = `${t('attachment_preview_error')}: ${result.error}`; retry.hidden = false;
       } else {
@@ -4828,10 +4818,10 @@ function toCsv(rows, columns) {
 function attachmentRowHtml(att, index, { removable = false } = {}) {
   return `
     <div class="ps-added-file" data-att-index="${index}">
-      <span class="ps-af-ico">${sprite((fv(att, 'mime') || '').startsWith('image/') ? 'image' : 'file-text')}</span>
+      <span class="ps-af-ico">${sprite((att?.mime || '').startsWith('image/') ? 'image' : 'file-text')}</span>
       <div class="ps-af-main">
-        <div class="ps-af-name">${escapeHtml(fv(att, 'name') || '')}</div>
-        <div class="ps-af-size">${escapeHtml(formatBytes(Number(fv(att, 'size_bytes') ?? 0)))}</div>
+        <div class="ps-af-name">${escapeHtml(att?.name || '')}</div>
+        <div class="ps-af-size">${escapeHtml(formatBytes(Number(att?.size_bytes ?? 0)))}</div>
       </div>
       <tf-button variant="ghost" size="sm" icon="eye" data-att-preview="${index}" title="${escapeAttr(t('kb_preview'))}"></tf-button>
       ${removable ? `<tf-button variant="ghost" size="sm" icon="trash" data-att-remove="${index}" title="${escapeAttr(t('action_delete'))}"></tf-button>` : ''}
@@ -4985,7 +4975,7 @@ async function renderCasesView() {
       </tf-select>
       <tf-select id="ps-cases-f-tag" value="${escapeAttr(flt.tagId)}">
         ${selectOpt('', flt.tagId, t('cases_filter_tag_all'))}
-        ${s.tags.map((tag) => selectOpt(fv(tag, 'tag_id'), flt.tagId, tag.name)).join('')}
+        ${s.tags.map((tag) => selectOpt(tag?.tagId, flt.tagId, tag.name)).join('')}
       </tf-select>
       <tf-select id="ps-cases-f-origin" value="${escapeAttr(flt.origin)}">
         ${selectOpt('', flt.origin, t('cases_filter_origin_all'))}
@@ -5071,8 +5061,8 @@ function renderCasesTable() {
   const table = byId('ps-cases-table');
   const assignRows = () => {
     table.rows = s.cases.rows.map((c) => {
-      const caseId = fv(c, 'case_id');
-      const lastResult = fv(c, 'last_result');
+      const caseId = c?.caseId;
+      const lastResult = c?.lastResult;
       return {
         _id: caseId,
         _row: c,
@@ -5081,18 +5071,18 @@ function renderCasesTable() {
           + `<div class="tf-table__cell-sub">${escapeHtml(shortId(caseId))}</div>`,
         kind: chipCell('info', t(`case_kind_${c.kind}`)),
         priority: chipCell(PRIORITY_CHIP[c.priority], t(`prio_${c.priority}`)),
-        tags: (fv(c, 'tag_ids') || []).map(tagNameById).filter(Boolean).join(', ') || '—',
+        tags: (c?.tagIds || []).map(tagNameById).filter(Boolean).join(', ') || '—',
         status: chipCell(CASE_STATUS_CHIP[c.status], t(`case_status_${c.status}`)),
         // A <use> reference cannot resolve document symbols from inside the
         // table's shadow root, so this column carries a label, not an icon.
-        author: fv(c, 'created_by_name') || '—',
+        author: c?.createdByName || '—',
         origin: c.origin === 'agent'
           ? chipCell('accent', t('origin_agent'))
           : chipCell('info', t('origin_user')),
         lastResult: lastResult
           ? chipCell(ITEM_STATUS_CHIP[lastResult], t(`item_status_${lastResult}`))
           : chipCell('info', '—'),
-        updated: formatTimestamp(fv(c, 'updated_at')),
+        updated: formatTimestamp(c?.updatedAt),
       };
     });
   };
@@ -5130,7 +5120,7 @@ function renderCasesTable() {
     syncCasesFooter();
   });
   table.addEventListener('select-all', (e) => {
-    if (e.detail?.selected) s.cases.rows.forEach((c) => s.cases.selected.add(fv(c, 'case_id')));
+    if (e.detail?.selected) s.cases.rows.forEach((c) => s.cases.selected.add(c?.caseId));
     else s.cases.selected = new Set();
     assignRows();
     updateCasesBulkBar();
@@ -5157,7 +5147,7 @@ function renderCasesTable() {
 // shows their labels so a defect's origin is visible without opening it.
 function taskLinkLabels(task) {
   try {
-    const parsed = JSON.parse(fv(task, 'links_json') || '[]');
+    const parsed = JSON.parse(task?.linksJson || '[]');
     if (!Array.isArray(parsed) || !parsed.length) return '—';
     return parsed.map((l) => l.label || l.id || '').filter(Boolean).join(', ') || '—';
   } catch {
@@ -5248,7 +5238,7 @@ async function duplicateCase(caseId) {
   try {
     const resp = await ApiBinary.one('projectStudioCaseDuplicateRequest', { projectId: projectId(), caseId });
     toast(t('cases_duplicated'), 'success');
-    const newId = fv(resp, 'case_id');
+    const newId = resp?.caseId;
     if (newId) openCaseEditor(newId);
   } catch (err) {
     toast(`${t('cases_duplicate_failed')}: ${err.message}`, 'error');
@@ -5264,7 +5254,7 @@ function deleteCaseFromList(caseRow) {
     warning: t('case_delete_warning'),
     confirmLabel: t('delete_forever'),
     onConfirm: async () => {
-      await ApiBinary.one('projectStudioCaseDeleteRequest', { projectId: projectId(), caseId: fv(caseRow, 'case_id') });
+      await ApiBinary.one('projectStudioCaseDeleteRequest', { projectId: projectId(), caseId: caseRow?.caseId });
       toast(t('case_delete_ok'), 'success');
       await renderCasesView();
     },
@@ -5309,7 +5299,7 @@ function openCsvImportWindow() {
   const renderResult = (created, errors, dry) => {
     const errRows = (errors || []).map((e) => `
       <div class="ps-csv-err-row">
-        <tf-chip status="err">${escapeHtml(t('csv_line', { line: fv(e, 'line') }))}</tf-chip>
+        <tf-chip status="err">${escapeHtml(t('csv_line', { line: e?.line }))}</tf-chip>
         <span>${escapeHtml(e.message || '')}</span>
       </div>
     `).join('');
@@ -5417,14 +5407,14 @@ function parseCaseContent(contentJson) {
     : [];
   return {
     preconditions: String(content.preconditions ?? ''),
-    testData: String(content.test_data ?? content.testData ?? ''),
+    testData: String(content.test_data ?? ''),
     steps: steps.length ? steps : [{ action: '', expected: '' }],
     script: String(content.script ?? ''),
     language: String(content.language ?? '') || 'python',
     config: content.config && typeof content.config === 'object' ? content.config : {},
     profile: content.profile && typeof content.profile === 'object' ? content.profile : {},
     checklist: Array.isArray(content.checklist) ? content.checklist.map(String) : [],
-    buildProfileRef: String(content.build_profile_ref ?? content.buildProfileRef ?? ''),
+    buildProfileRef: String(content.build_profile_ref ?? ''),
   };
 }
 
@@ -5464,7 +5454,7 @@ async function loadCaseIntoEditor(ed) {
   });
   const detail = resp.detail || {};
   const info = detail.info || {};
-  const content = parseCaseContent(fv(detail, 'content_json'));
+  const content = parseCaseContent(detail?.contentJson);
   ed.info = info;
   ed.kind = info.kind || ed.kind;
   ed.title = info.title || '';
@@ -5477,11 +5467,11 @@ async function loadCaseIntoEditor(ed) {
   ed.config = ed.kind === 'perf' ? content.profile : content.config;
   ed.checklist = content.checklist;
   ed.buildProfileRef = content.buildProfileRef;
-  ed.tagNames = (fv(info, 'tag_ids') || []).map(tagNameById).filter(Boolean);
-  ed.linkedSourceIds = new Set(fv(info, 'linked_source_ids') || []);
+  ed.tagNames = (info?.tagIds || []).map(tagNameById).filter(Boolean);
+  ed.linkedSourceIds = new Set(info?.linkedSourceIds || []);
   ed.attachments = Array.isArray(detail.attachments) ? detail.attachments.slice() : [];
   ed.versions = Array.isArray(detail.versions) ? detail.versions.slice() : [];
-  ed.expectedVersion = Number(fv(info, 'current_version') ?? 1);
+  ed.expectedVersion = Number(info?.currentVersion ?? 1);
   ed.loaded = true;
 }
 
@@ -5511,7 +5501,7 @@ async function renderCaseEditor() {
     }
     if (state.tab !== 'tests' || f2().view !== 'case-editor') return;
     const approved = approvedEnvironments();
-    if (!ed.envId && approved.length === 1) ed.envId = fv(approved[0], 'environment_id');
+    if (!ed.envId && approved.length === 1) ed.envId = approved[0]?.environmentId;
   }
   const info = ed.info;
   const status = info?.status || 'draft';
@@ -5540,8 +5530,8 @@ async function renderCaseEditor() {
       </div>
       <div class="ps-editor-badges">
         ${info ? caseStatusChipHtml(status) : `<tf-chip status="info" dot>${escapeHtml(t('case_new_chip'))}</tf-chip>`}
-        ${info && fv(info, 'review_state') === 'pending' ? `<tf-chip status="warn">${escapeHtml(t('case_pending_chip'))}</tf-chip>` : ''}
-        ${info ? `<tf-chip status="info">v${Number(fv(info, 'current_version') ?? 1)}</tf-chip>` : ''}
+        ${info && info?.reviewState === 'pending' ? `<tf-chip status="warn">${escapeHtml(t('case_pending_chip'))}</tf-chip>` : ''}
+        ${info ? `<tf-chip status="info">v${Number(info?.currentVersion ?? 1)}</tf-chip>` : ''}
         <tf-chip status="${codeCase ? 'accent' : 'info'}">${escapeHtml(t(`case_kind_${ed.kind}`))}</tf-chip>
         ${info?.origin === 'agent' ? `<tf-chip status="accent">${sprite('sparkle')} ${escapeHtml(t('origin_agent'))}</tf-chip>` : ''}
       </div>
@@ -5551,7 +5541,7 @@ async function renderCaseEditor() {
         ${info && canArea('tests', 'write') ? `<tf-button variant="ghost" icon="trash" id="ps-case-delete" title="${escapeAttr(t('action_delete'))}"></tf-button>` : ''}
       </div>
     </div>
-    ${info && fv(info, 'status_reason') ? `<div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('case_status_reason', { reason: fv(info, 'status_reason') }))}</span></div>` : ''}
+    ${info && info?.statusReason ? `<div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('case_status_reason', { reason: info?.statusReason }))}</span></div>` : ''}
     ${!editable && info ? `<div class="ps-banner-info">${sprite('lock')}<span>${escapeHtml(t('case_readonly_hint'))}</span></div>` : ''}
 
     <div class="ps-editor-cols">
@@ -5571,7 +5561,7 @@ async function renderCaseEditor() {
             <span class="ps-field-label">${escapeHtml(t('case_sources_label'))}</span>
             <div class="ps-linked-sources" id="ps-case-sources">
               ${state.sources.length ? state.sources.map((src) => {
-                const sid = fv(src, 'source_id');
+                const sid = src?.sourceId;
                 const on = ed.linkedSourceIds.has(sid);
                 return `<tf-chip status="${on ? 'accent' : 'info'}" data-linked-source="${escapeAttr(sid)}" role="button" tabindex="0">${escapeHtml(src.name)}</tf-chip>`;
               }).join('') : `<span class="ps-field-hint">${escapeHtml(t('case_sources_empty'))}</span>`}
@@ -5616,8 +5606,8 @@ async function renderCaseEditor() {
                 <div class="ps-version-row">
                   <tf-chip status="${Number(v.version) === ed.expectedVersion ? 'accent' : 'info'}">v${Number(v.version)}</tf-chip>
                   <div class="ps-version-main">
-                    <div class="ps-version-note">${escapeHtml(fv(v, 'change_note') || t('case_version_no_note'))}</div>
-                    <div class="ps-version-meta">${escapeHtml(fv(v, 'created_by_name') || '')} · ${escapeHtml(formatTimestamp(fv(v, 'created_at')))}</div>
+                    <div class="ps-version-note">${escapeHtml(v?.changeNote || t('case_version_no_note'))}</div>
+                    <div class="ps-version-meta">${escapeHtml(v?.createdByName || '')} · ${escapeHtml(formatTimestamp(v?.createdAt))}</div>
                   </div>
                   <tf-button variant="ghost" size="sm" icon="eye" data-version-view="${Number(v.version)}" title="${escapeAttr(t('kb_preview'))}"></tf-button>
                   ${editable && Number(v.version) !== ed.expectedVersion ? `<tf-button variant="ghost" size="sm" icon="rotate" data-version-restore="${Number(v.version)}" title="${escapeAttr(t('case_restore'))}"></tf-button>` : ''}
@@ -5627,9 +5617,9 @@ async function renderCaseEditor() {
           </tf-section-card>
           <tf-section-card title="${escapeAttr(t('case_info_title'))}" icon="info">
             <div class="ps-case-info-list">
-              <div><span>${escapeHtml(t('case_info_author'))}</span><b>${escapeHtml(fv(info, 'created_by_name') || '')}</b></div>
-              <div><span>${escapeHtml(t('case_info_created'))}</span><b>${escapeHtml(formatTimestamp(fv(info, 'created_at')))}</b></div>
-              <div><span>${escapeHtml(t('case_info_updated'))}</span><b>${escapeHtml(formatTimestamp(fv(info, 'updated_at')))}</b></div>
+              <div><span>${escapeHtml(t('case_info_author'))}</span><b>${escapeHtml(info?.createdByName || '')}</b></div>
+              <div><span>${escapeHtml(t('case_info_created'))}</span><b>${escapeHtml(formatTimestamp(info?.createdAt))}</b></div>
+              <div><span>${escapeHtml(t('case_info_updated'))}</span><b>${escapeHtml(formatTimestamp(info?.updatedAt))}</b></div>
             </div>
           </tf-section-card>
         </div>
@@ -5696,7 +5686,7 @@ async function renderCaseEditor() {
     try {
       for (const file of Array.from(files)) {
         const att = await uploadAttachmentFile(file);
-        if (!ed.attachments.some((a) => fv(a, 'sha256') === att.sha256)) ed.attachments.push(att);
+        if (!ed.attachments.some((a) => a?.sha256 === att.sha256)) ed.attachments.push(att);
       }
       renderCaseAttachments(editable);
       toast(t('attachment_uploaded'), 'success');
@@ -5857,7 +5847,7 @@ function codeCaseSectionsHtml(ed, editable) {
         </tf-select>
         ${canArea('environments') ? `<tf-select id="ps-code-env" label="${escapeAttr(t('code_env_label'))}" value="${escapeAttr(ed.envId)}">
           <option value="">${escapeHtml(approved.length ? t('assign_choose') : t('code_env_missing'))}</option>
-          ${approved.map((env) => `<option value="${escapeAttr(fv(env, 'environment_id'))}" ${fv(env, 'environment_id') === ed.envId ? 'selected' : ''}>${escapeHtml(`${env.name} — ${fv(env, 'base_url')}`)}</option>`).join('')}
+          ${approved.map((env) => `<option value="${escapeAttr(env?.environmentId)}" ${env?.environmentId === ed.envId ? 'selected' : ''}>${escapeHtml(`${env.name} — ${env?.baseUrl}`)}</option>`).join('')}
         </tf-select>` : ''}
         <span class="ps-toolbar-spacer"></span>
         ${canArea('tests', 'write') ? `
@@ -6041,7 +6031,7 @@ async function startTryRun(ed) {
       },
       {
         onChunk: (body) => {
-          if (body?.variant !== 'ProjectStudioTryRunStreamChunk') return;
+          if (body?._variant !== 'ProjectStudioBody.TryRunStreamChunk') return;
           if (f2().editor !== ed) return;
           appendTryLog(ed, body.phase ? `[${body.phase}] ${body.line}` : String(body.line || ''));
         },
@@ -6050,7 +6040,7 @@ async function startTryRun(ed) {
           const status = body?.status || 'completed';
           const error = body?.error;
           appendTryLog(ed, error ? `${t('code_try_failed')}: ${error}` : t('code_try_done', { status }));
-          const summary = fv(body ?? {}, 'junit_summary_json');
+          const summary = (body ?? {}).junitSummaryJson;
           if (summary && summary !== '{}') appendTryLog(ed, summary);
           ed.tryRun.running = false;
           setTryRunButtons(false);
@@ -6128,7 +6118,7 @@ async function startCodeAssist(ed) {
       },
       {
         onChunk: (body) => {
-          if (body?.variant !== 'ProjectStudioCodeAssistStreamChunk') return;
+          if (body?._variant !== 'ProjectStudioBody.CodeAssistStreamChunk') return;
           if (f2().editor !== ed) return;
           ed.assist.stream += String(body.token || '');
           const el = byId('ps-ai-stream');
@@ -6305,7 +6295,7 @@ function resolveTagIds(tagNames) {
   const ids = [];
   for (const name of tagNames) {
     const tag = f2().tags.find((x) => x.name.toLowerCase() === String(name).toLowerCase());
-    if (tag) ids.push(fv(tag, 'tag_id'));
+    if (tag) ids.push(tag?.tagId);
     else unknown.push(name);
   }
   return { ids, unknown };
@@ -6361,7 +6351,7 @@ async function saveCaseFromEditor() {
       expectedVersion: ed.caseId ? ed.expectedVersion : null,
       changeNote: ed.changeNote,
     });
-    ed.caseId = fv(resp, 'case_id') || ed.caseId;
+    ed.caseId = resp?.caseId || ed.caseId;
     acknowledgeAttachmentUploads(projectId(), currentUserId(), ed.attachments);
     ed.changeNote = '';
     toast(t('case_saved', { version: Number(resp.version ?? 1) }), 'success');
@@ -6426,15 +6416,15 @@ async function openVersionPreview(caseId, version) {
     toast(`${t('case_version_failed')}: ${err.message}`, 'error');
     return;
   }
-  const content = parseCaseContent(fv(resp, 'content_json'));
+  const content = parseCaseContent(resp?.contentJson);
   const { body, foot, cleanup } = openWindow({
     title: t('case_version_title', { version }),
-    subtitle: `${fv(resp, 'created_by_name') || ''} · ${formatTimestamp(fv(resp, 'created_at'))}`,
+    subtitle: `${resp?.createdByName || ''} · ${formatTimestamp(resp?.createdAt)}`,
     icon: 'clock',
     width: 680,
   });
   body.innerHTML = `
-    ${fv(resp, 'change_note') ? `<div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(fv(resp, 'change_note'))}</span></div>` : ''}
+    ${resp?.changeNote ? `<div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(resp?.changeNote)}</span></div>` : ''}
     ${content.preconditions ? `
       <div class="ps-field"><span class="ps-field-label">${escapeHtml(t('case_preconditions_title'))}</span>
       <div class="ps-version-block">${escapeHtml(content.preconditions)}</div></div>` : ''}
@@ -6582,7 +6572,7 @@ function openGenerationWindow() {
       return;
     }
     hostEl.innerHTML = state.sources.map((src) => {
-      const sid = fv(src, 'source_id');
+      const sid = src?.sourceId;
       const ready = src.status === 'ready';
       return `
         <div class="ps-gen-source-row ${ready ? '' : 'is-disabled'}" title="${ready ? '' : escapeAttr(t(`source_status_${src.status}`))}">
@@ -6590,7 +6580,7 @@ function openGenerationWindow() {
           <div class="ps-source-ico">${sprite(SOURCE_KIND_ICON[src.kind] || 'file-text')}</div>
           <div class="ps-gen-source-main">
             <div class="ps-gen-source-name">${escapeHtml(src.name)}</div>
-            <div class="ps-gen-source-meta">${escapeHtml(t(`kind_${src.kind}`))} · ${escapeHtml(t('source_chunks_count', { count: fv(src, 'chunk_count') ?? 0 }))}</div>
+            <div class="ps-gen-source-meta">${escapeHtml(t(`kind_${src.kind}`))} · ${escapeHtml(t('source_chunks_count', { count: src?.chunkCount ?? 0 }))}</div>
           </div>
           <tf-chip status="${SOURCE_STATUS_CHIP[src.status] || 'info'}" dot>${escapeHtml(t(`source_status_${src.status}`))}</tf-chip>
         </div>
@@ -6627,9 +6617,9 @@ function openGenerationWindow() {
     if (!fn) { banner.hidden = true; return; }
     const bindings = Array.isArray(state.settings?.agents) ? state.settings.agents : [];
     const binding = bindings.find((a) => a.function === fn);
-    const agentId = binding ? (fv(binding, 'agent_id') || '') : '';
+    const agentId = binding ? (binding?.agentId || '') : '';
     const known = state.agentOptions.find((a) => a.id === agentId);
-    const name = known?.name || (binding ? fv(binding, 'agent_name') : '') || '';
+    const name = known?.name || (binding ? binding?.agentName : '') || '';
     banner.hidden = false;
     text.textContent = name
       ? t('gen_agent_kind_bound', { fn: t(`agents_fn_${fn}`), agent: name })
@@ -6640,7 +6630,7 @@ function openGenerationWindow() {
     const hostEl = body.querySelector('[data-gen-summary]');
     if (!hostEl) return;
     const names = state.sources
-      .filter((src) => gw.sourceIds.has(fv(src, 'source_id')))
+      .filter((src) => gw.sourceIds.has(src?.sourceId))
       .map((src) => src.name);
     hostEl.innerHTML = `
       <div class="ps-gen-summary">
@@ -6697,7 +6687,7 @@ function openGenerationWindow() {
       });
       toast(t('gen_started'), 'success');
       cleanup();
-      const genId = fv(resp, 'gen_id');
+      const genId = resp?.genId;
       f2().view = 'generations';
       await renderTestsView();
       if (genId) await openGenDetail(genId);
@@ -6733,7 +6723,7 @@ function openGenerationWindow() {
     if (!state.agentOptions.length) {
       try {
         const resp = await ApiBinary.one('agentsListRequest', {});
-        const rows = JSON.parse(fv(resp, 'agents_json') ?? '[]');
+        const rows = JSON.parse(resp?.agentsJson ?? '[]');
         state.agentOptions = Array.isArray(rows)
           ? rows.filter((a) => a.is_enabled).map((a) => ({ id: a.id, name: a.display_name || a.name }))
           : [];
@@ -6812,7 +6802,7 @@ function renderGenerationsTable() {
     if (s.gensStatus && g.status !== s.gensStatus) return false;
     if (s.gensKind && g.kind !== s.gensKind) return false;
     if (!needle) return true;
-    return `${fv(g, 'agent_name') || ''} ${g.instructions || ''} ${fv(g, 'gen_id')}`.toLowerCase().includes(needle);
+    return `${g?.agentName || ''} ${g.instructions || ''} ${g?.genId}`.toLowerCase().includes(needle);
   });
   if (!rows.length) {
     tableHost.innerHTML = `<tf-empty-state icon="sparkle" title="${escapeAttr(s.gens.length ? t('gens_no_match') : t('gens_empty'))}"></tf-empty-state>`;
@@ -6832,20 +6822,20 @@ function renderGenerationsTable() {
   `;
   const table = byId('ps-gens-table');
   table.rows = rows.map((g) => ({
-    _id: fv(g, 'gen_id'),
+    _id: g?.genId,
     _row: g,
     name: `<div class="tf-table__cell-title">${escapeHtml((g.instructions || t('gens_untitled')).slice(0, 70))}</div>`
-      + `<div class="tf-table__cell-sub">${escapeHtml(shortId(fv(g, 'gen_id')))}</div>`,
+      + `<div class="tf-table__cell-sub">${escapeHtml(shortId(g?.genId))}</div>`,
     kind: chipCell(CASE_KIND_CHIP[g.kind] || 'info', t(`case_kind_${g.kind}`)),
     status: chipCell(GEN_STATUS_CHIP[g.status], t(`gen_status_${g.status}`)),
-    agent: fv(g, 'agent_name') || '—',
+    agent: g?.agentName || '—',
     progress: t('gens_progress', {
-      generated: Number(fv(g, 'cases_generated') ?? 0),
-      accepted: Number(fv(g, 'cases_accepted') ?? 0),
-      rejected: Number(fv(g, 'cases_rejected') ?? 0),
+      generated: Number(g?.casesGenerated ?? 0),
+      accepted: Number(g?.casesAccepted ?? 0),
+      rejected: Number(g?.casesRejected ?? 0),
     }),
-    startedBy: fv(g, 'started_by_name') || '',
-    startedAt: formatTimestamp(fv(g, 'started_at')),
+    startedBy: g?.startedByName || '',
+    startedAt: formatTimestamp(g?.startedAt),
   }));
   table.rowActions = (row, idx, currentRow) => {
     const live = () => currentRow?.() ?? row;
@@ -6913,7 +6903,7 @@ async function loadGenDetail() {
   const gd = f2().genDetail;
   const resp = await ApiBinary.one('projectStudioGenerationGetRequest', { projectId: projectId(), genId: gd.genId });
   gd.run = resp.run || null;
-  gd.pendingCases = Array.isArray(fv(resp, 'pending_cases')) ? fv(resp, 'pending_cases') : [];
+  gd.pendingCases = Array.isArray(resp?.pendingCases) ? resp?.pendingCases : [];
   gd.loaded = true;
 }
 
@@ -6932,9 +6922,9 @@ async function renderGenDetailView() {
   const run = gd.run;
   if (!run) { s.view = 'generations'; return renderGenerationsView(); }
   const running = run.status === 'running';
-  const initiator = isMe(fv(run, 'started_by'));
-  const maxCases = Math.max(1, Number(fv(run, 'max_cases') ?? 1));
-  const generated = Number(fv(run, 'cases_generated') ?? 0);
+  const initiator = isMe(run?.startedBy);
+  const maxCases = Math.max(1, Number(run?.maxCases ?? 1));
+  const generated = Number(run?.casesGenerated ?? 0);
   const pct = Math.min(100, Math.round((generated / maxCases) * 100));
 
   host.innerHTML = `
@@ -6942,11 +6932,11 @@ async function renderGenDetailView() {
       <tf-button variant="ghost" icon="chevron-left" id="ps-gen-back">${escapeHtml(t('back_to_gens'))}</tf-button>
       <div class="ps-editor-title-static">
         <div class="ps-detail-name">${escapeHtml(t('gen_detail_title'))}</div>
-        <div class="ps-detail-sub">${escapeHtml(fv(run, 'agent_name') || '')} · ${escapeHtml(fv(run, 'started_by_name') || '')} · ${escapeHtml(formatTimestamp(fv(run, 'started_at')))}</div>
+        <div class="ps-detail-sub">${escapeHtml(run?.agentName || '')} · ${escapeHtml(run?.startedByName || '')} · ${escapeHtml(formatTimestamp(run?.startedAt))}</div>
       </div>
       <div class="ps-editor-badges">
         <tf-chip status="${GEN_STATUS_CHIP[run.status] || 'info'}" dot>${escapeHtml(t(`gen_status_${run.status}`))}</tf-chip>
-        <tf-chip status="info">${escapeHtml(t('gens_progress', { generated, accepted: Number(fv(run, 'cases_accepted') ?? 0), rejected: Number(fv(run, 'cases_rejected') ?? 0) }))}</tf-chip>
+        <tf-chip status="info">${escapeHtml(t('gens_progress', { generated, accepted: Number(run?.casesAccepted ?? 0), rejected: Number(run?.casesRejected ?? 0) }))}</tf-chip>
       </div>
       <div class="ps-editor-actions">
         ${running && canArea('tests', 'write') && (initiator || canArea('tests', 'admin')) ? `<tf-button variant="ghost" icon="ban" id="ps-gen-cancel">${escapeHtml(t('gen_cancel'))}</tf-button>` : ''}
@@ -6999,7 +6989,7 @@ async function renderGenDetailView() {
   byId('ps-gen-delete')?.addEventListener('click', () => deleteGeneration(gd.genId));
   byId('ps-gen-select-all')?.addEventListener('click', () => {
     const all = gd.selected.size === gd.pendingCases.length;
-    gd.selected = all ? new Set() : new Set(gd.pendingCases.map((c) => fv(c, 'case_id')));
+    gd.selected = all ? new Set() : new Set(gd.pendingCases.map((c) => c?.caseId));
     renderGenPendingList();
   });
   byId('ps-gen-accept')?.addEventListener('click', () => reviewGeneration('accept'));
@@ -7018,7 +7008,7 @@ function renderGenPendingList() {
     return;
   }
   host.innerHTML = gd.pendingCases.map((c) => {
-    const caseId = fv(c, 'case_id');
+    const caseId = c?.caseId;
     return `
       <div class="ps-gen-pending-row">
         <tf-checkbox data-gen-case="${escapeAttr(caseId)}" ${gd.selected.has(caseId) ? 'checked' : ''}></tf-checkbox>
@@ -7027,7 +7017,7 @@ function renderGenPendingList() {
           <div class="ps-gen-pending-meta">
             <tf-chip status="${PRIORITY_CHIP[c.priority] || 'info'}">${escapeHtml(t(`prio_${c.priority}`))}</tf-chip>
             <tf-chip status="info">${escapeHtml(t(`case_kind_${c.kind}`))}</tf-chip>
-            ${(fv(c, 'tag_ids') || []).map(tagNameById).filter(Boolean).map((name) => `<tf-chip status="info">${escapeHtml(name)}</tf-chip>`).join('')}
+            ${(c?.tagIds || []).map(tagNameById).filter(Boolean).map((name) => `<tf-chip status="info">${escapeHtml(name)}</tf-chip>`).join('')}
           </div>
         </div>
       </div>
@@ -7073,7 +7063,7 @@ function startGenLive(run, initiator) {
   const gd = s.genDetail;
   const genId = gd.genId;
 
-  if (initiator && fv(run, 'agent_run_id')) {
+  if (initiator && run?.agentRunId) {
     const widgetHost = byId('ps-gen-widget-host');
     if (widgetHost) {
       const widget = document.createElement('tf-agent-activity');
@@ -7084,10 +7074,10 @@ function startGenLive(run, initiator) {
     s.genSteps = [];
     ApiBinary.subscribe(
       'agentRunEventsSubscribeRequest',
-      { scopeKind: 'run', scopeId: fv(run, 'agent_run_id') },
+      { scopeKind: 'run', scopeId: run?.agentRunId },
       {
         onChunk: (body) => {
-          if (!body || body.variant !== 'AgentRunEvent') return;
+          if (!body || body._variant !== 'AgentsBody.RunEvent') return;
           if (s.genDetail !== gd || s.view !== 'gen-detail') return;
           s.genWidget?.applyEvent(body);
           const step = TfAgentActivity.stepsFromEvents([body], activityLabels())[0];
@@ -7121,8 +7111,8 @@ function startGenLive(run, initiator) {
       return;
     }
     if (!fresh) return;
-    const generated = Number(fv(fresh, 'cases_generated') ?? 0);
-    const maxCases = Math.max(1, Number(fv(fresh, 'max_cases') ?? 1));
+    const generated = Number(fresh?.casesGenerated ?? 0);
+    const maxCases = Math.max(1, Number(fresh?.maxCases ?? 1));
     byId('ps-gen-progressbar')?.setAttribute('value', String(Math.min(100, Math.round((generated / maxCases) * 100))));
     const label = byId('ps-gen-progress-label');
     if (label) label.textContent = t('gen_progress_label', { generated, max: maxCases });
@@ -7138,9 +7128,9 @@ function startGenLive(run, initiator) {
 // =============================================================================
 
 function envAuthLabel(env) {
-  const auth = fv(env, 'auth_type') || 'none';
+  const auth = env?.authType || 'none';
   const label = t(`env_auth_${auth}`);
-  return fv(env, 'has_secret') ? `${label} · ${t('env_secret_stored')}` : label;
+  return env?.hasSecret ? `${label} · ${t('env_secret_stored')}` : label;
 }
 
 // Mirrors environments::classify_base_url closely enough to warn BEFORE the
@@ -7164,12 +7154,12 @@ async function loadEnvironments(force = false) {
   const resp = await ApiBinary.one('projectStudioEnvironmentsListRequest', { projectId: projectId() });
   s.envs.rows = Array.isArray(resp.environments) ? resp.environments : [];
   s.envs.loaded = true;
-  s.envPending = s.envs.rows.filter((e) => fv(e, 'approval_status') === 'pending').length;
+  s.envPending = s.envs.rows.filter((e) => e?.approvalStatus === 'pending').length;
   return s.envs.rows;
 }
 
 function approvedEnvironments() {
-  return canArea('environments') ? (f2().envs.rows || []).filter((e) => fv(e, 'approval_status') === 'approved') : [];
+  return canArea('environments') ? (f2().envs.rows || []).filter((e) => e?.approvalStatus === 'approved') : [];
 }
 
 async function renderEnvironmentsView() {
@@ -7234,9 +7224,9 @@ function renderEnvironmentsTable() {
   if (!tableHost) return;
   const needle = (s.envs.filter || '').trim().toLowerCase();
   const rows = s.envs.rows.filter((env) => {
-    if (s.envs.type && fv(env, 'env_type') !== s.envs.type) return false;
-    if (s.envs.status && fv(env, 'approval_status') !== s.envs.status) return false;
-    if (needle && !`${env.name} ${fv(env, 'base_url') || ''}`.toLowerCase().includes(needle)) return false;
+    if (s.envs.type && env?.envType !== s.envs.type) return false;
+    if (s.envs.status && env?.approvalStatus !== s.envs.status) return false;
+    if (needle && !`${env.name} ${env?.baseUrl || ''}`.toLowerCase().includes(needle)) return false;
     return true;
   });
   if (!rows.length) {
@@ -7256,14 +7246,14 @@ function renderEnvironmentsTable() {
   `;
   const table = byId('ps-envs-table');
   table.rows = rows.map((env) => ({
-    _id: fv(env, 'environment_id'),
+    _id: env?.environmentId,
     _row: env,
     name: env.name,
-    type: t(`env_type_${fv(env, 'env_type')}`),
-    url: `<span class="ps-mono">${escapeHtml(fv(env, 'base_url') || '')}</span>`,
+    type: t(`env_type_${env?.envType}`),
+    url: `<span class="ps-mono">${escapeHtml(env?.baseUrl || '')}</span>`,
     auth: envAuthLabel(env),
-    status: chipCell(ENV_STATUS_CHIP[fv(env, 'approval_status')], t(`env_status_${fv(env, 'approval_status')}`)),
-    updated: formatTimestamp(fv(env, 'updated_at')),
+    status: chipCell(ENV_STATUS_CHIP[env?.approvalStatus], t(`env_status_${env?.approvalStatus}`)),
+    updated: formatTimestamp(env?.updatedAt),
   }));
   table.rowActions = (row, idx, currentRow) => {
     const live = () => currentRow?.() ?? row;
@@ -7296,16 +7286,16 @@ function renderEnvironmentsTable() {
 function buildEnvExpansion(env) {
   const wrap = document.createElement('div');
   wrap.className = 'ps-item-expansion';
-  const allowlist = Array.isArray(fv(env, 'host_allowlist')) ? fv(env, 'host_allowlist') : [];
-  const headers = fv(env, 'extra_headers_json') || '';
-  const reason = fv(env, 'approval_reason') || '';
+  const allowlist = Array.isArray(env?.hostAllowlist) ? env?.hostAllowlist : [];
+  const headers = env?.extraHeadersJson || '';
+  const reason = env?.approvalReason || '';
   wrap.innerHTML = `
-    ${fv(env, 'is_private_address') ? `<div class="ps-banner-warn">${sprite('alert')}<span>${escapeHtml(t('env_private_address'))}</span></div>` : ''}
+    ${env?.isPrivateAddress ? `<div class="ps-banner-warn">${sprite('alert')}<span>${escapeHtml(t('env_private_address'))}</span></div>` : ''}
     ${reason ? `<div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('env_reason_prefix', { reason }))}</span></div>` : ''}
     <div class="ps-case-info-list">
-      <div><span>${escapeHtml(t('env_requested_by'))}</span><b>${escapeHtml(fv(env, 'requested_by_name') || '—')}</b></div>
-      <div><span>${escapeHtml(t('env_decided_by'))}</span><b>${escapeHtml(fv(env, 'decided_by_name') || '—')}</b></div>
-      <div><span>${escapeHtml(t('env_decided_at'))}</span><b>${escapeHtml(fv(env, 'decided_at') ? formatTimestamp(fv(env, 'decided_at')) : '—')}</b></div>
+      <div><span>${escapeHtml(t('env_requested_by'))}</span><b>${escapeHtml(env?.requestedByName || '—')}</b></div>
+      <div><span>${escapeHtml(t('env_decided_by'))}</span><b>${escapeHtml(env?.decidedByName || '—')}</b></div>
+      <div><span>${escapeHtml(t('env_decided_at'))}</span><b>${escapeHtml(env?.decidedAt ? formatTimestamp(env?.decidedAt) : '—')}</b></div>
       <div><span>${escapeHtml(t('env_allowlist_label'))}</span><b>${escapeHtml(allowlist.join(', ') || '—')}</b></div>
     </div>
     ${headers && headers !== '{}' ? `<div class="ps-code-block">${escapeHtml(headers)}</div>` : ''}
@@ -7325,13 +7315,13 @@ function openEnvironmentWindow(env) {
   });
 
   const ew = {
-    type: editing ? (fv(env, 'env_type') || 'web') : 'web',
-    auth: editing ? (fv(env, 'auth_type') || 'none') : 'none',
+    type: editing ? (env?.envType || 'web') : 'web',
+    auth: editing ? (env?.authType || 'none') : 'none',
     secretTouched: false,
     busy: false,
   };
-  const allowlist = editing && Array.isArray(fv(env, 'host_allowlist')) ? fv(env, 'host_allowlist') : [];
-  const headersJson = editing ? (fv(env, 'extra_headers_json') || '') : '';
+  const allowlist = editing && Array.isArray(env?.hostAllowlist) ? env?.hostAllowlist : [];
+  const headersJson = editing ? (env?.extraHeadersJson || '') : '';
 
   body.innerHTML = `
     <tf-input id="ps-env-name" label="${escapeAttr(t('env_name_label'))}" value="${escapeAttr(editing ? env.name : '')}"
@@ -7344,7 +7334,7 @@ function openEnvironmentWindow(env) {
       <div class="ps-field-hint">${escapeHtml(t('env_type_hint'))}</div>
     </div>
     <tf-input id="ps-env-url" label="${escapeAttr(t('env_url_label'))}" placeholder="https://staging.example.com"
-      value="${escapeAttr(editing ? (fv(env, 'base_url') || '') : '')}" hint="${escapeAttr(t('env_url_hint'))}"></tf-input>
+      value="${escapeAttr(editing ? (env?.baseUrl || '') : '')}" hint="${escapeAttr(t('env_url_hint'))}"></tf-input>
     <div class="ps-banner-warn" data-env-private hidden>${sprite('alert')}<span>${escapeHtml(t('env_private_banner'))}</span></div>
     <div class="ps-field" data-env-justification hidden>
       <tf-textarea id="ps-env-justification" rows="3" label="${escapeAttr(t('env_justification_label'))}"
@@ -7358,7 +7348,7 @@ function openEnvironmentWindow(env) {
     </div>
     <div class="ps-field" data-env-secret ${ew.auth === 'none' ? 'hidden' : ''}>
       <tf-input id="ps-env-secret" type="password" label="${escapeAttr(t('env_secret_label'))}"
-        placeholder="${escapeAttr(editing && fv(env, 'has_secret') ? t('env_secret_keep_hint') : '')}"
+        placeholder="${escapeAttr(editing && env?.hasSecret ? t('env_secret_keep_hint') : '')}"
         hint="${escapeAttr(t('env_secret_hint'))}"></tf-input>
     </div>
     <div class="ps-field">
@@ -7385,7 +7375,7 @@ function openEnvironmentWindow(env) {
   const headersEl = body.querySelector('#ps-env-headers');
   if (headersEl && headersJson && headersJson !== '{}') headersEl.value = headersJson;
   const justificationEl = body.querySelector('#ps-env-justification');
-  if (justificationEl && editing) justificationEl.value = fv(env, 'justification') || '';
+  if (justificationEl && editing) justificationEl.value = env?.justification || '';
 
   const showError = (msg) => {
     const el = body.querySelector('[data-form-error]');
@@ -7447,7 +7437,7 @@ function openEnvironmentWindow(env) {
     try {
       const resp = await ApiBinary.one('projectStudioEnvironmentSaveRequest', {
         projectId: projectId(),
-        environmentId: editing ? fv(env, 'environment_id') : null,
+        environmentId: editing ? env?.environmentId : null,
         name,
         envType: ew.type,
         baseUrl,
@@ -7457,7 +7447,7 @@ function openEnvironmentWindow(env) {
         hostAllowlist: tagInput?.tags ?? [],
         justification,
       });
-      const status = fv(resp, 'approval_status') || 'approved';
+      const status = resp?.approvalStatus || 'approved';
       toast(status === 'pending' ? t('env_save_pending') : t('env_saved'), 'success');
       cleanup();
       f2().envs.loaded = false;
@@ -7474,14 +7464,14 @@ function confirmDeleteEnvironment(env) {
   openDeleteWindow({
     title: t('env_delete_title'),
     targetName: env.name,
-    targetSub: fv(env, 'base_url'),
+    targetSub: env?.baseUrl,
     targetIcon: 'globe',
     warning: t('env_delete_warning'),
     confirmLabel: t('delete_forever'),
     onConfirm: async () => {
       await ApiBinary.one('projectStudioEnvironmentDeleteRequest', {
         projectId: projectId(),
-        environmentId: fv(env, 'environment_id'),
+        environmentId: env?.environmentId,
       });
       toast(t('env_delete_ok'), 'success');
       f2().envs.loaded = false;
@@ -7523,29 +7513,29 @@ async function renderEnvApprovalsView() {
     <div id="ps-env-approvals-list">
       ${items.length ? items.map((item) => {
         const env = item.environment || {};
-        const envId = fv(env, 'environment_id');
+        const envId = env?.environmentId;
         return `
-          <div class="ps-approval-card" data-approval="${escapeAttr(envId)}" data-project="${escapeAttr(fv(item, 'project_id'))}">
+          <div class="ps-approval-card" data-approval="${escapeAttr(envId)}" data-project="${escapeAttr(item?.projectId)}">
             <div class="ps-approval-head">
               <div>
                 <div class="ps-approval-name">${escapeHtml(env.name || '')}</div>
-                <div class="ps-approval-url">${escapeHtml(fv(env, 'base_url') || '')}</div>
+                <div class="ps-approval-url">${escapeHtml(env?.baseUrl || '')}</div>
               </div>
               <div class="ps-approval-badges">
-                <tf-chip status="info">${escapeHtml(t(`env_type_${fv(env, 'env_type')}`))}</tf-chip>
+                <tf-chip status="info">${escapeHtml(t(`env_type_${env?.envType}`))}</tf-chip>
                 <tf-status-pill status="warn" label="${escapeAttr(t('env_status_pending'))}"></tf-status-pill>
-                ${fv(env, 'is_private_address') ? `<tf-chip status="warn">${escapeHtml(t('env_private_address'))}</tf-chip>` : ''}
+                ${env?.isPrivateAddress ? `<tf-chip status="warn">${escapeHtml(t('env_private_address'))}</tf-chip>` : ''}
               </div>
             </div>
             <div class="ps-approval-meta">
-              <span>${escapeHtml(t('envs_approval_project'))}: <b>${escapeHtml(fv(item, 'project_name') || '')}</b></span>
-              <span>${escapeHtml(t('env_requested_by'))}: <b>${escapeHtml(fv(env, 'requested_by_name') || '')}</b></span>
-              <span>${escapeHtml(formatTimestamp(fv(env, 'created_at')))}</span>
+              <span>${escapeHtml(t('envs_approval_project'))}: <b>${escapeHtml(item?.projectName || '')}</b></span>
+              <span>${escapeHtml(t('env_requested_by'))}: <b>${escapeHtml(env?.requestedByName || '')}</b></span>
+              <span>${escapeHtml(formatTimestamp(env?.createdAt))}</span>
               <span>${escapeHtml(t('env_auth_label'))}: <b>${escapeHtml(envAuthLabel(env))}</b></span>
             </div>
             <div class="ps-approval-justification">
               <span class="ps-field-label">${escapeHtml(t('env_justification_label'))}</span>
-              <p>${escapeHtml(fv(item, 'justification') || '—')}</p>
+              <p>${escapeHtml(item?.justification || '—')}</p>
             </div>
             <div class="ps-approval-actions">
               <tf-input data-reject-reason label="${escapeAttr(t('env_reject_reason_label'))}"
@@ -7639,9 +7629,9 @@ function visibleSuites() {
   const needle = (s.suitesFilter || '').trim().toLowerCase();
   const health = s.suitesHealth || 'all';
   return s.suites.filter((suite) => {
-    if (needle && !`${suite.name} ${fv(suite, 'suite_id') || ''}`.toLowerCase().includes(needle)) return false;
-    if (health === 'ok' && fv(suite, 'has_deprecated')) return false;
-    if (health === 'deprecated' && !fv(suite, 'has_deprecated')) return false;
+    if (needle && !`${suite.name} ${suite?.suiteId || ''}`.toLowerCase().includes(needle)) return false;
+    if (health === 'ok' && suite?.hasDeprecated) return false;
+    if (health === 'deprecated' && !suite?.hasDeprecated) return false;
     return true;
   });
 }
@@ -7667,20 +7657,20 @@ function renderSuitesTable() {
   `;
   const table = byId('ps-suites-table');
   table.rows = rows.map((suite) => {
-    const lastRun = fv(suite, 'last_run');
+    const lastRun = suite?.lastRun;
     return {
-      _id: fv(suite, 'suite_id'),
+      _id: suite?.suiteId,
       _row: suite,
       name: `<div class="tf-table__cell-title">${escapeHtml(suite.name)}</div>`
-        + `<div class="tf-table__cell-sub">${escapeHtml(shortId(fv(suite, 'suite_id')))}${suite.description ? ` · ${escapeHtml(suite.description)}` : ''}</div>`,
-      cases: Number(fv(suite, 'case_count') ?? 0),
-      deprecated: fv(suite, 'has_deprecated')
+        + `<div class="tf-table__cell-sub">${escapeHtml(shortId(suite?.suiteId))}${suite.description ? ` · ${escapeHtml(suite.description)}` : ''}</div>`,
+      cases: Number(suite?.caseCount ?? 0),
+      deprecated: suite?.hasDeprecated
         ? chipCell('warn', t('suites_has_deprecated'))
         : chipCell('ok', t('suites_ok')),
       lastRun: lastRun
-        ? `#${fv(lastRun, 'run_no')} · ${t(`run_status_${lastRun.status}`)}`
+        ? `#${lastRun?.runNo} · ${t(`run_status_${lastRun.status}`)}`
         : '—',
-      updated: formatTimestamp(fv(suite, 'updated_at')),
+      updated: formatTimestamp(suite?.updatedAt),
     };
   });
   table.rowActions = (row, idx, currentRow) => {
@@ -7710,7 +7700,7 @@ function renderSuitesTable() {
     if (suiteId) openSuiteEditor(suiteId);
   });
 
-  const assignments = rows.reduce((sum, suite) => sum + Number(fv(suite, 'case_count') ?? 0), 0);
+  const assignments = rows.reduce((sum, suite) => sum + Number(suite?.caseCount ?? 0), 0);
   const footer = document.createElement('div');
   footer.className = 'ps-table-footer';
   footer.textContent = t('suites_footer', { shown: rows.length, total: s.suites.length, assignments });
@@ -7721,12 +7711,12 @@ function deleteSuite(suite) {
   openDeleteWindow({
     title: t('suite_delete_title'),
     targetName: suite.name,
-    targetSub: t('suites_col_cases_sub', { count: Number(fv(suite, 'case_count') ?? 0) }),
+    targetSub: t('suites_col_cases_sub', { count: Number(suite?.caseCount ?? 0) }),
     targetIcon: 'grid-2x2',
     warning: t('suite_delete_warning'),
     confirmLabel: t('delete_forever'),
     onConfirm: async () => {
-      await ApiBinary.one('projectStudioSuiteDeleteRequest', { projectId: projectId(), suiteId: fv(suite, 'suite_id') });
+      await ApiBinary.one('projectStudioSuiteDeleteRequest', { projectId: projectId(), suiteId: suite?.suiteId });
       toast(t('suite_delete_ok'), 'success');
       await renderSuitesView();
     },
@@ -7764,7 +7754,7 @@ async function renderSuiteEditor() {
       se.cases = (Array.isArray(resp.cases) ? resp.cases : [])
         .slice()
         .sort((a, b) => Number(a.position ?? 0) - Number(b.position ?? 0))
-        .map((c) => ({ caseId: fv(c, 'case_id'), title: c.title, priority: c.priority, status: c.status }));
+        .map((c) => ({ caseId: c?.caseId, title: c.title, priority: c.priority, status: c.status }));
       se.loaded = true;
     }
     if (!se.pool.length) {
@@ -7842,7 +7832,7 @@ async function renderSuiteEditor() {
   });
   byId('ps-suite-add-selected')?.addEventListener('click', () => {
     for (const c of se.pool) {
-      const id = fv(c, 'case_id');
+      const id = c?.caseId;
       if (!se.poolSelected.has(id)) continue;
       se.cases.push({ caseId: id, title: c.title, priority: c.priority, status: c.status, kind: c.kind });
     }
@@ -7867,7 +7857,7 @@ async function renderSuiteEditor() {
       caseIds: se.cases.map((c) => c.caseId),
     });
     toast(t('suite_saved'), 'success');
-    return fv(resp, 'suite_id') || se.suiteId;
+    return resp?.suiteId || se.suiteId;
   };
   byId('ps-suite-save')?.addEventListener('click', async () => {
     try {
@@ -7928,7 +7918,7 @@ function renderSuitePool(editable) {
   const chosen = new Set(se.cases.map((c) => c.caseId));
   const query = se.poolFilter.trim().toLowerCase();
   const rows = se.pool.filter((c) => {
-    const id = fv(c, 'case_id');
+    const id = c?.caseId;
     if (chosen.has(id)) return false;
     if (se.poolKind !== 'all' && (c.kind || 'manual') !== se.poolKind) return false;
     if (query && !`${c.title} ${id}`.toLowerCase().includes(query)) return false;
@@ -7936,7 +7926,7 @@ function renderSuitePool(editable) {
   });
   // Selections of now-hidden rows would silently add invisible cases on
   // "add selected", so drop them whenever the filter changes.
-  const visible = new Set(rows.map((c) => fv(c, 'case_id')));
+  const visible = new Set(rows.map((c) => c?.caseId));
   for (const id of [...se.poolSelected]) if (!visible.has(id)) se.poolSelected.delete(id);
   syncSuiteAddSelected();
 
@@ -7948,7 +7938,7 @@ function renderSuitePool(editable) {
     return;
   }
   host.innerHTML = rows.map((c) => {
-    const id = fv(c, 'case_id');
+    const id = c?.caseId;
     return `
     <div class="ps-pane-row">
       ${editable ? `<tf-checkbox data-pool-pick="${escapeAttr(id)}" ${se.poolSelected.has(id) ? 'checked' : ''}></tf-checkbox>` : ''}
@@ -7974,9 +7964,9 @@ function renderSuitePool(editable) {
   });
   host.querySelectorAll('[data-pool-add]').forEach((btn) => {
     btn.addEventListener('click', () => {
-      const c = se.pool.find((x) => fv(x, 'case_id') === btn.dataset.poolAdd);
+      const c = se.pool.find((x) => x?.caseId === btn.dataset.poolAdd);
       if (!c) return;
-      se.cases.push({ caseId: fv(c, 'case_id'), title: c.title, priority: c.priority, status: c.status, kind: c.kind });
+      se.cases.push({ caseId: c?.caseId, title: c.title, priority: c.priority, status: c.status, kind: c.kind });
       se.poolSelected.delete(btn.dataset.poolAdd);
       renderSuitePool(editable);
       renderSuiteMembers(editable);
@@ -8118,9 +8108,9 @@ function visibleRuns() {
   const s = f2();
   const needle = (s.runs.filter || '').trim().toLowerCase();
   return s.runs.rows.filter((run) => {
-    if (s.runs.type && (fv(run, 'run_type') || 'manual') !== s.runs.type) return false;
+    if (s.runs.type && (run?.runType || 'manual') !== s.runs.type) return false;
     if (!needle) return true;
-    return `${run.name} ${fv(run, 'suite_name') || ''} #${fv(run, 'run_no')}`.toLowerCase().includes(needle);
+    return `${run.name} ${run?.suiteName || ''} #${run?.runNo}`.toLowerCase().includes(needle);
   });
 }
 
@@ -8156,19 +8146,19 @@ function renderRunsTable() {
       const pct = total ? Math.round((done / total) * 100) : 0;
       const tone = { completed: 'success', cancelled: 'warning', error: 'danger' }[run.status] || 'accent';
       return {
-        _id: fv(run, 'run_id'),
+        _id: run?.runId,
         _row: run,
-        name: `<div class="tf-table__cell-title">${escapeHtml(run.name)}</div><div class="tf-table__cell-sub">#${fv(run, 'run_no')}</div>`,
-        suite: fv(run, 'suite_name') || t('runs_adhoc'),
-        type: chipCell(fv(run, 'run_type') === 'manual' ? 'neutral' : 'accent', t(`run_type_${fv(run, 'run_type') || 'manual'}`)),
-        environment: fv(run, 'environment_name') || t(`assign_${fv(run, 'assignment_mode') || 'pool'}`),
+        name: `<div class="tf-table__cell-title">${escapeHtml(run.name)}</div><div class="tf-table__cell-sub">#${run?.runNo}</div>`,
+        suite: run?.suiteName || t('runs_adhoc'),
+        type: chipCell(run?.runType === 'manual' ? 'neutral' : 'accent', t(`run_type_${run?.runType || 'manual'}`)),
+        environment: run?.environmentName || t(`assign_${run?.assignmentMode || 'pool'}`),
         status: chipCell(RUN_STATUS_CHIP[run.status], t(`run_status_${run.status}`)),
         progress: '<div style="display:flex;align-items:center;gap:8px;min-width:120px;">'
           + `<tf-progress-bar value="${pct}" tone="${tone}" size="sm" style="flex:1 1 80px;"></tf-progress-bar>`
           + `<span style="font-size:11px;opacity:0.7;">${pct}%</span></div>`,
         result: t('runs_result', { done, total, passed: Number(run.passed ?? 0), failed: Number(run.failed ?? 0) }),
-        createdBy: fv(run, 'created_by_name') || '',
-        startedAt: formatTimestamp(fv(run, 'started_at')),
+        createdBy: run?.createdByName || '',
+        startedAt: formatTimestamp(run?.startedAt),
       };
     });
   };
@@ -8185,7 +8175,7 @@ function renderRunsTable() {
     open.addEventListener('click', (e) => {
       e.stopPropagation();
       const r = live();
-      openRunByType(r._id, fv(r._row, 'run_type'));
+      openRunByType(r._id, r._row?.runType);
     });
     wrap.appendChild(open);
     if (canArea('tests', 'admin') && row._row.status !== 'running') {
@@ -8201,7 +8191,7 @@ function renderRunsTable() {
   };
   table.addEventListener('row-click', (e) => {
     const row = e.detail?.row;
-    if (row?._id) openRunByType(row._id, fv(row._row, 'run_type'));
+    if (row?._id) openRunByType(row._id, row._row?.runType);
   });
   table.addEventListener('page-change', async (e) => {
     s.runs.page = Number(e.detail?.page ?? 1);
@@ -8226,13 +8216,13 @@ function renderRunsTable() {
 function deleteRun(run) {
   openDeleteWindow({
     title: t('run_delete_title'),
-    targetName: `#${fv(run, 'run_no')} ${run.name}`,
+    targetName: `#${run?.runNo} ${run.name}`,
     targetSub: t(`run_status_${run.status}`),
     targetIcon: 'play',
     warning: t('run_delete_warning'),
     confirmLabel: t('delete_forever'),
     onConfirm: async () => {
-      await ApiBinary.one('projectStudioRunDeleteRequest', { projectId: projectId(), runId: fv(run, 'run_id') });
+      await ApiBinary.one('projectStudioRunDeleteRequest', { projectId: projectId(), runId: run?.runId });
       toast(t('run_delete_ok'), 'success');
       if (f2().view === 'run-detail') f2().view = 'runs';
       await renderTestsView();
@@ -8406,7 +8396,7 @@ async function openRunWindow(prefill = {}) {
   };
 
   const currentSourceCases = () => {
-    if (rw.source === 'cases') return rw.pool.filter((c) => rw.caseIds.has(fv(c, 'case_id')));
+    if (rw.source === 'cases') return rw.pool.filter((c) => rw.caseIds.has(c?.caseId));
     if (rw.source === 'suite') return rw.sourceCases;
     return [];
   };
@@ -8421,14 +8411,14 @@ async function openRunWindow(prefill = {}) {
     }
     const testers = testerMembers();
     hostEl.innerHTML = cases.map((c) => {
-      const caseId = fv(c, 'case_id');
+      const caseId = c?.caseId;
       const chosen = rw.assignments.get(caseId) || '';
       return `
         <div class="ps-pane-row">
           <div class="ps-pane-row-main"><div class="ps-pane-row-title">${escapeHtml(c.title)}</div></div>
           <tf-select data-assign-case="${escapeAttr(caseId)}" value="${escapeAttr(chosen)}">
             <option value="" ${chosen === '' ? 'selected' : ''}>${escapeHtml(t('assign_choose'))}</option>
-            ${testers.map((m) => `<option value="${escapeAttr(fv(m, 'user_id'))}" ${fv(m, 'user_id') === chosen ? 'selected' : ''}>${escapeHtml(fv(m, 'display_name') || '')}</option>`).join('')}
+            ${testers.map((m) => `<option value="${escapeAttr(m?.userId)}" ${m?.userId === chosen ? 'selected' : ''}>${escapeHtml(m?.displayName || '')}</option>`).join('')}
           </tf-select>
         </div>
       `;
@@ -8448,7 +8438,7 @@ async function openRunWindow(prefill = {}) {
       return;
     }
     hostEl.innerHTML = rw.pool.map((c) => {
-      const caseId = fv(c, 'case_id');
+      const caseId = c?.caseId;
       return `
         <div class="ps-pane-row">
           <tf-checkbox data-run-case="${escapeAttr(caseId)}" ${rw.caseIds.has(caseId) ? 'checked' : ''}></tf-checkbox>
@@ -8483,7 +8473,7 @@ async function openRunWindow(prefill = {}) {
   });
   body.querySelector('#ps-run-runner')?.addEventListener('change', (e) => {
     rw.runnerServiceId = e.detail?.value ?? '';
-    const runner = (f2().runners || []).find((r) => fv(r, 'service_id') === rw.runnerServiceId);
+    const runner = (f2().runners || []).find((r) => r?.serviceId === rw.runnerServiceId);
     const hint = body.querySelector('[data-runner-hint]');
     if (hint) hint.textContent = runner ? runnerToolchainLabel(runner) : t('run_runner_hint');
   });
@@ -8562,9 +8552,9 @@ async function openRunWindow(prefill = {}) {
           runnerServiceId: rw.runnerServiceId,
           perfProfileJson,
         });
-        toast(t('run_auto_started', { no: Number(fv(resp, 'run_no') ?? 0) }), 'success');
+        toast(t('run_auto_started', { no: Number(resp?.runNo ?? 0) }), 'success');
         cleanup();
-        const runId = fv(resp, 'run_id');
+        const runId = resp?.runId;
         if (runId) await openAutoRun(runId);
       } catch (err) {
         rw.busy = false;
@@ -8578,7 +8568,7 @@ async function openRunWindow(prefill = {}) {
     let assignments = [];
     if (rw.mode === 'per_case') {
       const cases = currentSourceCases();
-      assignments = cases.map((c) => ({ caseId: fv(c, 'case_id'), userId: rw.assignments.get(fv(c, 'case_id')) || '' }));
+      assignments = cases.map((c) => ({ caseId: c?.caseId, userId: rw.assignments.get(c?.caseId) || '' }));
       if (!cases.length || assignments.some((a) => !a.userId)) { showError(t('err_run_assignments')); return; }
     }
     showError(null);
@@ -8596,9 +8586,9 @@ async function openRunWindow(prefill = {}) {
         singleAssignee: rw.mode === 'single' ? rw.singleAssignee : '',
         assignments,
       });
-      toast(t('run_created', { no: Number(fv(resp, 'run_no') ?? 0) }), 'success');
+      toast(t('run_created', { no: Number(resp?.runNo ?? 0) }), 'success');
       cleanup();
-      const runId = fv(resp, 'run_id');
+      const runId = resp?.runId;
       if (runId) await openRunDetail(runId);
     } catch (err) {
       rw.busy = false;
@@ -8616,7 +8606,7 @@ async function openRunWindow(prefill = {}) {
     // Connected tf-selects only accept new options via setOptions().
     body.querySelector('#ps-run-assignee')?.setOptions([
       { value: '', label: t('assign_choose') },
-      ...testers.map((m) => ({ value: fv(m, 'user_id'), label: fv(m, 'display_name') || '' })),
+      ...testers.map((m) => ({ value: m?.userId, label: m?.displayName || '' })),
     ], '');
     try {
       const resp = await ApiBinary.one('projectStudioSuitesListRequest', { projectId: projectId() });
@@ -8625,8 +8615,8 @@ async function openRunWindow(prefill = {}) {
     body.querySelector('#ps-run-suite')?.setOptions([
       { value: '', label: t('assign_choose') },
       ...rw.suites.map((su) => ({
-        value: fv(su, 'suite_id'),
-        label: `${su.name} (${Number(fv(su, 'case_count') ?? 0)})`,
+        value: su?.suiteId,
+        label: `${su.name} (${Number(su?.caseCount ?? 0)})`,
       })),
     ], rw.suiteId || '');
     if (rw.suiteId) {
@@ -8652,8 +8642,8 @@ async function openRunWindow(prefill = {}) {
     body.querySelector('#ps-run-failed')?.setOptions([
       { value: '', label: t('assign_choose') },
       ...rw.completedRuns.map((r) => ({
-        value: fv(r, 'run_id'),
-        label: `#${fv(r, 'run_no')} ${r.name} (${Number(r.failed ?? 0)}+${Number(r.blocked ?? 0)})`,
+        value: r?.runId,
+        label: `#${r?.runNo} ${r.name} (${Number(r.failed ?? 0)}+${Number(r.blocked ?? 0)})`,
       })),
     ], rw.fromFailedRunId || '');
 
@@ -8665,17 +8655,17 @@ async function openRunWindow(prefill = {}) {
       } catch { /* the select stays empty and the guard below blocks the start */ }
     }
     const approved = approvedEnvironments();
-    rw.environmentId = approved.length === 1 ? fv(approved[0], 'environment_id') : '';
+    rw.environmentId = approved.length === 1 ? approved[0]?.environmentId : '';
     body.querySelector('#ps-run-environment')?.setOptions([
       { value: '', label: approved.length ? t('assign_choose') : t('run_env_none') },
-      ...approved.map((env) => ({ value: fv(env, 'environment_id'), label: `${env.name} — ${fv(env, 'base_url')}` })),
+      ...approved.map((env) => ({ value: env?.environmentId, label: `${env.name} — ${env?.baseUrl}` })),
     ], rw.environmentId);
     await loadRunners();
     body.querySelector('#ps-run-runner')?.setOptions([
       { value: '', label: t('run_runner_auto') },
       ...(f2().runners || []).map((r) => ({
-        value: fv(r, 'service_id'),
-        label: `${fv(r, 'display_name') || fv(r, 'engine_id')} — ${runnerToolchainLabel(r)}`,
+        value: r?.serviceId,
+        label: `${r?.displayName || r?.engineId} — ${runnerToolchainLabel(r)}`,
       })),
     ], '');
 
@@ -8703,7 +8693,7 @@ async function openRunByType(runId, runType) {
   if (!type) {
     try {
       const resp = await ApiBinary.one('projectStudioRunGetRequest', { projectId: projectId(), runId });
-      type = fv(resp.run ?? {}, 'run_type') || 'manual';
+      type = (resp.run ?? {}).runType || 'manual';
     } catch {
       type = 'manual';
     }
@@ -8732,13 +8722,13 @@ async function renderRunDetailView() {
   const runTotal = Number(run.total ?? 0);
   const runPassRate = runTotal ? Math.round((Number(run.passed ?? 0) / runTotal) * 1000) / 10 : 0;
   const runShare = (n) => (runTotal ? Math.round((Number(n ?? 0) / runTotal) * 100) : 0);
-  const openItems = Number(run.pending ?? 0) + Number(fv(run, 'in_progress') ?? 0);
+  const openItems = Number(run.pending ?? 0) + Number(run?.inProgress ?? 0);
   const runDuration = runElapsed(run);
-  const creator = isMe(fv(run, 'created_by'));
+  const creator = isMe(run?.createdBy);
   const canClose = running && canArea('tests', 'write') && (canArea('tests', 'admin') || creator);
   const failedCount = Number(run.failed ?? 0) + Number(run.blocked ?? 0);
   const myItems = rd.items.filter((it) => {
-    const assignee = fv(it, 'assigned_to');
+    const assignee = it?.assignedTo;
     if (isMe(assignee)) return it.status === 'pending' || it.status === 'in_progress';
     return assignee === '' && it.status === 'pending';
   });
@@ -8747,16 +8737,16 @@ async function renderRunDetailView() {
     <div class="ps-editor-head">
       <tf-button variant="ghost" icon="chevron-left" id="ps-run-back">${escapeHtml(t('back_to_runs'))}</tf-button>
       <div class="ps-editor-title-static">
-        <div class="ps-detail-name">#${fv(run, 'run_no')} ${escapeHtml(run.name)}</div>
+        <div class="ps-detail-name">#${run?.runNo} ${escapeHtml(run.name)}</div>
         <div class="ps-detail-sub">
-          ${escapeHtml(fv(run, 'suite_name') || t('runs_adhoc'))} ·
-          ${escapeHtml(t(`assign_${fv(run, 'assignment_mode') || 'pool'}`))} ·
-          ${escapeHtml(fv(run, 'created_by_name') || '')} · ${escapeHtml(formatTimestamp(fv(run, 'started_at')))}
+          ${escapeHtml(run?.suiteName || t('runs_adhoc'))} ·
+          ${escapeHtml(t(`assign_${run?.assignmentMode || 'pool'}`))} ·
+          ${escapeHtml(run?.createdByName || '')} · ${escapeHtml(formatTimestamp(run?.startedAt))}
         </div>
       </div>
       <div class="ps-editor-badges">
         <tf-chip status="${RUN_STATUS_CHIP[run.status] || 'info'}" dot>${escapeHtml(t(`run_status_${run.status}`))}</tf-chip>
-        ${fv(run, 'env_note') ? `<tf-chip status="info">${escapeHtml(fv(run, 'env_note'))}</tf-chip>` : ''}
+        ${run?.envNote ? `<tf-chip status="info">${escapeHtml(run?.envNote)}</tf-chip>` : ''}
       </div>
       <div class="ps-editor-actions">
         <tf-button variant="ghost" icon="download" id="ps-run-export">${escapeHtml(t('run_export_csv'))}</tf-button>
@@ -8797,10 +8787,10 @@ async function renderRunDetailView() {
             <div class="ps-pane-row">
               <tf-chip status="${ITEM_STATUS_CHIP[it.status] || 'info'}" dot>${escapeHtml(t(`item_status_${it.status}`))}</tf-chip>
               <div class="ps-pane-row-main">
-                <div class="ps-pane-row-title">${escapeHtml(fv(it, 'case_title'))}</div>
-                <span class="ps-pane-row-sub">${escapeHtml(fv(it, 'assigned_to') ? t('run_item_assigned_you') : t('run_item_pool'))}</span>
+                <div class="ps-pane-row-title">${escapeHtml(it?.caseTitle)}</div>
+                <span class="ps-pane-row-sub">${escapeHtml(it?.assignedTo ? t('run_item_assigned_you') : t('run_item_pool'))}</span>
               </div>
-              <tf-button variant="ghost" size="sm" icon="play" data-claim-item="${escapeAttr(fv(it, 'item_id'))}">${escapeHtml(it.status === 'in_progress' ? t('run_item_continue') : t('run_item_execute'))}</tf-button>
+              <tf-button variant="ghost" size="sm" icon="play" data-claim-item="${escapeAttr(it?.itemId)}">${escapeHtml(it.status === 'in_progress' ? t('run_item_continue') : t('run_item_execute'))}</tf-button>
             </div>
           `).join('') : `<div class="ps-field-hint">${escapeHtml(t('run_my_items_empty'))}</div>`}
         </div>
@@ -8836,7 +8826,7 @@ async function renderRunDetailView() {
       { id: 'failed', label: t('item_status_failed'), value: Number(run.failed ?? 0), tone: 'critical' },
       { id: 'blocked', label: t('item_status_blocked'), value: Number(run.blocked ?? 0), tone: 'warning' },
       { id: 'skipped', label: t('item_status_skipped'), value: Number(run.skipped ?? 0), tone: 'muted' },
-      { id: 'in_progress', label: t('item_status_in_progress'), value: Number(run.in_progress ?? fv(run, 'in_progress') ?? 0), tone: 'info' },
+      { id: 'in_progress', label: t('item_status_in_progress'), value: Number(run.inProgress ?? 0), tone: 'info' },
     ];
     stacked.replaceChildren(bar);
   }
@@ -8851,8 +8841,8 @@ async function renderRunDetailView() {
   byId('ps-run-my-items')?.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-claim-item]');
     if (!btn) return;
-    const item = rd.items.find((it) => fv(it, 'item_id') === btn.dataset.claimItem);
-    if (item?.status === 'in_progress' && isMe(fv(item, 'assigned_to'))) {
+    const item = rd.items.find((it) => it?.itemId === btn.dataset.claimItem);
+    if (item?.status === 'in_progress' && isMe(item?.assignedTo)) {
       openExecItem(btn.dataset.claimItem);
     } else {
       claimAndExec(rd.runId, btn.dataset.claimItem);
@@ -8886,15 +8876,15 @@ function renderRunItemsTable(rd) {
   table.expandable = true;
   table.expandRenderer = (row) => buildRunItemExpansion(row._row);
   table.rows = rows.map((it) => ({
-    _id: fv(it, 'item_id'),
+    _id: it?.itemId,
     _row: it,
     pos: Number(it.position ?? 0) + 1,
-    title: fv(it, 'case_title'),
-    assignee: fv(it, 'assigned_to_name') || t('run_item_pool'),
+    title: it?.caseTitle,
+    assignee: it?.assignedToName || t('run_item_pool'),
     status: chipCell(ITEM_STATUS_CHIP[it.status], t(`item_status_${it.status}`)),
-    steps: `${Number(fv(it, 'steps_done') ?? 0)}/${Number(fv(it, 'steps_total') ?? 0)}`,
-    duration: formatDuration(Number(fv(it, 'duration_secs') ?? 0)),
-    finished: fv(it, 'finished_at') ? formatTimestamp(fv(it, 'finished_at')) : '—',
+    steps: `${Number(it?.stepsDone ?? 0)}/${Number(it?.stepsTotal ?? 0)}`,
+    duration: formatDuration(Number(it?.durationSecs ?? 0)),
+    finished: it?.finishedAt ? formatTimestamp(it?.finishedAt) : '—',
   }));
 }
 
@@ -8907,7 +8897,7 @@ function buildRunItemExpansion(item) {
   (async () => {
     let resp = null;
     try {
-      resp = await ApiBinary.one('projectStudioRunItemGetRequest', { projectId: projectId(), itemId: fv(item, 'item_id') });
+      resp = await ApiBinary.one('projectStudioRunItemGetRequest', { projectId: projectId(), itemId: item?.itemId });
     } catch (err) {
       wrap.innerHTML = `<div class="ps-form-error">${escapeHtml(err.message)}</div>`;
       return;
@@ -8916,10 +8906,10 @@ function buildRunItemExpansion(item) {
     const steps = Array.isArray(resp.steps) ? resp.steps : [];
     const itemAtts = Array.isArray(resp.item?.attachments) ? resp.item.attachments : [];
     wrap.innerHTML = `
-      ${fv(resp.item || {}, 'result_note') ? `<div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(fv(resp.item, 'result_note'))}</span></div>` : ''}
+      ${(resp.item || {}).resultNote ? `<div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(resp.item?.resultNote)}</span></div>` : ''}
       ${steps.map((st) => `
         <div class="ps-exp-step">
-          <div class="ps-step-num">${Number(fv(st, 'step_index') ?? 0) + 1}</div>
+          <div class="ps-step-num">${Number(st?.stepIndex ?? 0) + 1}</div>
           <div class="ps-exp-step-main">
             <div class="ps-exp-step-action">${escapeHtml(st.action)}</div>
             <div class="ps-exp-step-expected">${escapeHtml(st.expected)}</div>
@@ -8931,19 +8921,19 @@ function buildRunItemExpansion(item) {
       <div class="ps-exp-atts" data-exp-atts></div>
     `;
     const allAtts = [
-      ...itemAtts.map((att) => ({ att, owner: attachmentOwner('run_item', fv(item, 'item_id')) })),
-      ...steps.flatMap((step) => (Array.isArray(step.attachments) ? step.attachments : []).map((att) => ({ att, owner: attachmentOwner('run_step', fv(item, 'item_id'), fv(step, 'step_index')) }))),
+      ...itemAtts.map((att) => ({ att, owner: attachmentOwner('run_item', item?.itemId) })),
+      ...steps.flatMap((step) => (Array.isArray(step.attachments) ? step.attachments : []).map((att) => ({ att, owner: attachmentOwner('run_step', item?.itemId, step?.stepIndex) }))),
     ];
     const attHost = wrap.querySelector('[data-exp-atts]');
     if (attHost && allAtts.length) {
       for (const { att, owner } of allAtts) {
-        const mime = fv(att, 'mime') || '';
+        const mime = att?.mime || '';
         const cell = document.createElement('div');
         cell.className = 'ps-exp-att';
-        cell.title = fv(att, 'name') || '';
+        cell.title = att?.name || '';
         if (mime.startsWith('image/')) {
           const img = document.createElement('img');
-          img.alt = fv(att, 'name') || '';
+          img.alt = att?.name || '';
           cell.appendChild(img);
           openAttachmentStream(owner, att).then((stream) => {
             if (img.isConnected || cell.isConnected) {
@@ -8951,9 +8941,9 @@ function buildRunItemExpansion(item) {
               const observer = new MutationObserver(() => { if (!cell.isConnected) { stream.close(); observer.disconnect(); } });
               observer.observe(document.body, { childList: true, subtree: true });
             } else stream.close();
-          }).catch(() => { cell.textContent = fv(att, 'name') || ''; });
+          }).catch(() => { cell.textContent = att?.name || ''; });
         } else {
-          cell.textContent = fv(att, 'name') || '';
+          cell.textContent = att?.name || '';
         }
         cell.addEventListener('click', () => openAttachmentPreview(att, owner));
         attHost.appendChild(cell);
@@ -8973,9 +8963,9 @@ function parseTimestamp(value) {
 
 // Wall-clock length of a run; a still-running run measures against "now".
 function runElapsed(run) {
-  const started = parseTimestamp(fv(run, 'started_at'));
+  const started = parseTimestamp(run?.startedAt);
   if (!Number.isFinite(started)) return '—';
-  const finishedRaw = fv(run, 'finished_at');
+  const finishedRaw = run?.finishedAt;
   const end = finishedRaw ? parseTimestamp(finishedRaw) : Date.now();
   if (!Number.isFinite(end) || end < started) return '—';
   return formatDuration(Math.round((end - started) / 1000));
@@ -9010,17 +9000,17 @@ async function closeRun(runId, cancelled) {
 function exportRunCsv(rd) {
   const rows = rd.items.map((it) => ({
     position: Number(it.position ?? 0) + 1,
-    case_title: fv(it, 'case_title'),
-    case_version: fv(it, 'case_version'),
-    assigned_to: fv(it, 'assigned_to_name') || '',
+    case_title: it?.caseTitle,
+    case_version: it?.caseVersion,
+    assigned_to: it?.assignedToName || '',
     status: it.status,
-    steps_done: fv(it, 'steps_done'),
-    steps_total: fv(it, 'steps_total'),
-    duration_secs: fv(it, 'duration_secs'),
-    result_note: fv(it, 'result_note') || '',
-    finished_at: fv(it, 'finished_at') || '',
+    steps_done: it?.stepsDone,
+    steps_total: it?.stepsTotal,
+    duration_secs: it?.durationSecs,
+    result_note: it?.resultNote || '',
+    finished_at: it?.finishedAt || '',
   }));
-  downloadTextFile(`run-${fv(rd.run, 'run_no')}.csv`, toCsv(rows));
+  downloadTextFile(`run-${rd.run?.runNo}.csv`, toCsv(rows));
 }
 
 // =============================================================================
@@ -9085,8 +9075,8 @@ async function loadAutoRun(ar) {
   });
   ar.run = resp.run || null;
   ar.items = Array.isArray(resp.items) ? resp.items : [];
-  ar.perfStats = Array.isArray(fv(resp, 'perf_stats')) ? fv(resp, 'perf_stats') : [];
-  ar.perfTimeline = Array.isArray(fv(resp, 'perf_timeline')) ? fv(resp, 'perf_timeline') : [];
+  ar.perfStats = Array.isArray(resp?.perfStats) ? resp?.perfStats : [];
+  ar.perfTimeline = Array.isArray(resp?.perfTimeline) ? resp?.perfTimeline : [];
 }
 
 async function renderAutoRunView() {
@@ -9105,28 +9095,28 @@ async function renderAutoRunView() {
   if (!run) { s.view = 'runs'; return renderRunsView(); }
 
   const running = run.status === 'running';
-  const isPerf = fv(run, 'run_type') === 'perf';
+  const isPerf = run?.runType === 'perf';
   const total = Math.max(1, Number(run.total ?? ar.items.length ?? 1));
   const done = Number(run.passed ?? 0) + Number(run.failed ?? 0) + Number(run.blocked ?? 0)
     + Number(run.skipped ?? 0) + Number(run.errored ?? 0);
   const pct = Math.min(100, Math.round((done / total) * 100));
-  const creator = isMe(fv(run, 'created_by'));
+  const creator = isMe(run?.createdBy);
   const canCancel = running && canArea('tests', 'write') && (canArea('tests', 'admin') || creator);
 
   host.innerHTML = `
     <div class="ps-editor-head">
       <tf-button variant="ghost" icon="chevron-left" id="ps-auto-back">${escapeHtml(t('back_to_runs'))}</tf-button>
       <div class="ps-editor-title-static">
-        <div class="ps-detail-name">#${fv(run, 'run_no')} ${escapeHtml(run.name)}</div>
+        <div class="ps-detail-name">#${run?.runNo} ${escapeHtml(run.name)}</div>
         <div class="ps-detail-sub">
-          ${escapeHtml(fv(run, 'suite_name') || t('runs_adhoc'))} ·
-          ${escapeHtml(t('auto_env_prefix'))}: ${escapeHtml(fv(run, 'environment_name') || '—')} ·
-          ${escapeHtml(fv(run, 'created_by_name') || '')} · ${escapeHtml(formatTimestamp(fv(run, 'started_at')))}
+          ${escapeHtml(run?.suiteName || t('runs_adhoc'))} ·
+          ${escapeHtml(t('auto_env_prefix'))}: ${escapeHtml(run?.environmentName || '—')} ·
+          ${escapeHtml(run?.createdByName || '')} · ${escapeHtml(formatTimestamp(run?.startedAt))}
         </div>
       </div>
       <div class="ps-editor-badges">
         <tf-chip status="${RUN_STATUS_CHIP[run.status] || 'info'}" dot>${escapeHtml(t(`run_status_${run.status}`))}</tf-chip>
-        <tf-chip status="info">${escapeHtml(t(`run_type_${fv(run, 'run_type') || 'auto'}`))}</tf-chip>
+        <tf-chip status="info">${escapeHtml(t(`run_type_${run?.runType || 'auto'}`))}</tf-chip>
       </div>
       <div class="ps-editor-actions">
         <tf-button variant="ghost" icon="refresh" id="ps-auto-refresh">${escapeHtml(t('refresh'))}</tf-button>
@@ -9150,7 +9140,7 @@ async function renderAutoRunView() {
       <tf-stat-card size="sm" icon="x" accent="danger" label="${escapeAttr(t('item_status_failed'))}" value="${Number(run.failed ?? 0)}"></tf-stat-card>
       <tf-stat-card size="sm" icon="alert" accent="danger" label="${escapeAttr(t('item_status_error'))}" value="${Number(run.errored ?? 0)}"></tf-stat-card>
       <tf-stat-card size="sm" icon="chevron-right" label="${escapeAttr(t('item_status_skipped'))}" value="${Number(run.skipped ?? 0)}"></tf-stat-card>
-      <tf-stat-card size="sm" icon="clock" label="${escapeAttr(t('run_kpi_open'))}" value="${Number(run.pending ?? 0) + Number(fv(run, 'in_progress') ?? 0)}"></tf-stat-card>
+      <tf-stat-card size="sm" icon="clock" label="${escapeAttr(t('run_kpi_open'))}" value="${Number(run.pending ?? 0) + Number(run?.inProgress ?? 0)}"></tf-stat-card>
     </div>
 
     ${isPerf ? `
@@ -9184,7 +9174,7 @@ async function renderAutoRunView() {
   byId('ps-auto-export')?.addEventListener('click', () => exportAutoRunCsv(ar));
   byId('ps-auto-again')?.addEventListener('click', () => openRunWindow({
     runType: isPerf ? 'perf' : 'auto',
-    suiteId: fv(run, 'suite_id') || '',
+    suiteId: run?.suiteId || '',
     name: run.name,
   }));
   byId('ps-auto-stop')?.addEventListener('click', () => cancelAutoRun(ar.runId));
@@ -9192,7 +9182,7 @@ async function renderAutoRunView() {
     ar.autoScroll = !!(e.detail?.checked ?? e.target.checked);
   });
   byId('ps-auto-log-download')?.addEventListener('click', () => {
-    downloadTextFile(`run-${fv(run, 'run_no')}.log`, ar.log.join('\n'), 'text/plain');
+    downloadTextFile(`run-${run?.runNo}.log`, ar.log.join('\n'), 'text/plain');
   });
 
   renderAutoItemsTable(ar);
@@ -9230,15 +9220,15 @@ function renderAutoItemsTable(ar) {
 
 function assignAutoItemRows(table, ar) {
   table.rows = ar.items.map((it) => ({
-    _id: fv(it, 'item_id'),
+    _id: it?.itemId,
     _row: it,
     pos: Number(it.position ?? 0) + 1,
-    title: fv(it, 'case_title'),
+    title: it?.caseTitle,
     kind: t(`case_kind_${it.kind}`),
     status: chipCell(ITEM_STATUS_CHIP[it.status], t(`item_status_${it.status}`)),
-    duration: formatMillis(Number(fv(it, 'duration_ms') ?? 0)),
+    duration: formatMillis(Number(it?.durationMs ?? 0)),
     message: String(it.message || '').slice(0, 160),
-    artifacts: Array.isArray(fv(it, 'artifact_refs')) ? fv(it, 'artifact_refs').length : 0,
+    artifacts: Array.isArray(it?.artifactRefs) ? it?.artifactRefs.length : 0,
   }));
 }
 
@@ -9247,14 +9237,14 @@ function assignAutoItemRows(table, ar) {
 function buildAutoItemExpansion(item) {
   const wrap = document.createElement('div');
   wrap.className = 'ps-item-expansion';
-  const artifacts = Array.isArray(fv(item, 'artifact_refs')) ? fv(item, 'artifact_refs') : [];
+  const artifacts = Array.isArray(item?.artifactRefs) ? item?.artifactRefs : [];
   wrap.innerHTML = `
     ${item.message ? `<div class="ps-code-block">${escapeHtml(item.message)}</div>` : `<div class="ps-field-hint">${escapeHtml(t('auto_item_no_message'))}</div>`}
     <div class="ps-artifact-row">
       ${!canArea('tests') ? `<span class="ps-field-hint">${escapeHtml(t('access_read_only'))}</span>`
         : artifacts.length ? artifacts.map((art, i) => `
-        <tf-button variant="ghost" size="sm" icon="${ARTIFACT_ICON[fv(art, 'kind')] || 'paperclip'}" data-artifact="${i}">
-          ${escapeHtml(fv(art, 'name') || t(`artifact_kind_${fv(art, 'kind')}`))} · ${escapeHtml(formatBytes(Number(fv(art, 'size_bytes') ?? 0)))}
+        <tf-button variant="ghost" size="sm" icon="${ARTIFACT_ICON[art?.kind] || 'paperclip'}" data-artifact="${i}">
+          ${escapeHtml(art?.name || t(`artifact_kind_${art?.kind}`))} · ${escapeHtml(formatBytes(Number(art?.sizeBytes ?? 0)))}
         </tf-button>
       `).join('') : `<span class="ps-field-hint">${escapeHtml(t('auto_item_no_artifacts'))}</span>`}
     </div>
@@ -9273,7 +9263,7 @@ async function openArtifact(artifact) {
   try {
     resp = await ApiBinary.one('projectStudioRunArtifactGetRequest', {
       projectId: projectId(),
-      artifactId: fv(artifact, 'artifact_id'),
+      artifactId: artifact?.artifactId,
       maxBytes: ARTIFACT_MAX_BYTES,
     });
   } catch (err) {
@@ -9281,8 +9271,8 @@ async function openArtifact(artifact) {
     return;
   }
   const bytes = resp.bytes instanceof Uint8Array ? resp.bytes : new Uint8Array(resp.bytes || []);
-  const mime = resp.mime || fv(artifact, 'mime') || 'application/octet-stream';
-  const name = fv(artifact, 'name') || 'artifact';
+  const mime = resp.mime || artifact?.mime || 'application/octet-stream';
+  const name = artifact?.name || 'artifact';
   const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
   if (resp.truncated) toast(t('artifact_truncated'), 'info');
   if (mime.startsWith('image/')) {
@@ -9320,12 +9310,12 @@ function renderPerfSection(ar) {
     acc.requests += Number(row.requests ?? 0);
     acc.failures += Number(row.failures ?? 0);
     acc.rps += Number(row.rps ?? 0);
-    acc.p90 = Math.max(acc.p90, Number(fv(row, 'p90_ms') ?? 0));
-    acc.p99 = Math.max(acc.p99, Number(fv(row, 'p99_ms') ?? 0));
+    acc.p90 = Math.max(acc.p90, Number(row?.p90Ms ?? 0));
+    acc.p99 = Math.max(acc.p99, Number(row?.p99Ms ?? 0));
     return acc;
   }, { requests: 0, failures: 0, rps: 0, p90: 0, p99: 0 });
   const rps = Number(last.rps ?? totals.rps ?? 0);
-  const p90 = Number(fv(last, 'p90_ms') ?? totals.p90 ?? 0);
+  const p90 = Number(last?.p90Ms ?? totals.p90 ?? 0);
   const errPct = totals.requests > 0 ? (totals.failures / totals.requests) * 100 : 0;
 
   if (!timeline.length && !stats.length) {
@@ -9364,7 +9354,7 @@ function renderPerfSection(ar) {
         tone: 'info',
         style: 'solid',
         showInLegend: true,
-        points: timeline.map((p) => ({ x: formatElapsed(Number(fv(p, 'ts_s') ?? 0)), y: Number(p.rps ?? 0) })),
+        points: timeline.map((p) => ({ x: formatElapsed(Number(p?.tsS ?? 0)), y: Number(p.rps ?? 0) })),
       },
       {
         id: 'p90',
@@ -9372,7 +9362,7 @@ function renderPerfSection(ar) {
         tone: 'warning',
         style: 'dashed',
         showInLegend: true,
-        points: timeline.map((p) => ({ x: formatElapsed(Number(fv(p, 'ts_s') ?? 0)), y: Number(fv(p, 'p90_ms') ?? 0) })),
+        points: timeline.map((p) => ({ x: formatElapsed(Number(p?.tsS ?? 0)), y: Number(p?.p90Ms ?? 0) })),
       },
     ];
     chartHost.replaceChildren(chart);
@@ -9400,23 +9390,23 @@ function renderPerfSection(ar) {
         endpoint: row.endpoint,
         requests: Number(row.requests ?? 0),
         rps: formatNum(Number(row.rps ?? 0)),
-        p50: formatNum(Number(fv(row, 'p50_ms') ?? 0)),
-        p90: formatNum(Number(fv(row, 'p90_ms') ?? 0)),
-        p99: formatNum(Number(fv(row, 'p99_ms') ?? 0)),
+        p50: formatNum(Number(row?.p50Ms ?? 0)),
+        p90: formatNum(Number(row?.p90Ms ?? 0)),
+        p99: formatNum(Number(row?.p99Ms ?? 0)),
         failures: Number(row.failures ?? 0),
       }));
     }
     byId('ps-perf-export')?.addEventListener('click', () => {
       if (!stats.length) { toast(t('reports_no_data'), 'info'); return; }
-      downloadTextFile(`perf-${fv(ar.run, 'run_no')}.csv`, toCsv(stats.map((row) => ({
+      downloadTextFile(`perf-${ar.run?.runNo}.csv`, toCsv(stats.map((row) => ({
         endpoint: row.endpoint,
         requests: Number(row.requests ?? 0),
         failures: Number(row.failures ?? 0),
         rps: Number(row.rps ?? 0),
-        p50_ms: Number(fv(row, 'p50_ms') ?? 0),
-        p90_ms: Number(fv(row, 'p90_ms') ?? 0),
-        p99_ms: Number(fv(row, 'p99_ms') ?? 0),
-        avg_ms: Number(fv(row, 'avg_ms') ?? 0),
+        p50_ms: Number(row?.p50Ms ?? 0),
+        p90_ms: Number(row?.p90Ms ?? 0),
+        p99_ms: Number(row?.p99Ms ?? 0),
+        avg_ms: Number(row?.avgMs ?? 0),
       }))));
     });
   }
@@ -9443,7 +9433,7 @@ function startAutoRunLive(ar) {
     { projectId: projectId(), runId: ar.runId },
     {
       onChunk: (body) => {
-        if (body?.variant !== 'ProjectStudioRunAutoStreamChunk') return;
+        if (body?._variant !== 'ProjectStudioBody.RunAutoStreamChunk') return;
         if (s.autoRun !== ar || s.view !== 'auto-run') return;
         const kind = body.kind;
         if (kind === 'log' || kind === 'phase') {
@@ -9451,14 +9441,14 @@ function startAutoRunLive(ar) {
           if (body.phase === 'watchdog') showAutoWatchdog(ar, String(body.line || ''));
         } else if (kind === 'item' && body.item) {
           const incoming = body.item;
-          const idx = ar.items.findIndex((it) => fv(it, 'item_id') === fv(incoming, 'item_id'));
+          const idx = ar.items.findIndex((it) => it?.itemId === incoming?.itemId);
           if (idx >= 0) ar.items[idx] = incoming;
           else ar.items.push(incoming);
           const table = byId('ps-auto-items-table');
           if (table) assignAutoItemRows(table, ar);
-          appendLog(`${fv(incoming, 'case_title')} — ${t(`item_status_${incoming.status}`)}`);
+          appendLog(`${incoming?.caseTitle} — ${t(`item_status_${incoming.status}`)}`);
         } else if (kind === 'artifact' && body.artifact) {
-          appendLog(`${t('auto_artifact_ready')}: ${fv(body.artifact, 'name')}`);
+          appendLog(`${t('auto_artifact_ready')}: ${body.artifact?.name}`);
         }
       },
       onError: () => { /* the poll below is the source of truth */ },
@@ -9490,7 +9480,7 @@ function startAutoRunLive(ar) {
     if (label) label.textContent = t('auto_progress', { done, total: Number(run.total ?? 0), pct });
     const table = byId('ps-auto-items-table');
     if (table) assignAutoItemRows(table, ar);
-    if (fv(run, 'run_type') === 'perf') renderPerfSection(ar);
+    if (run?.runType === 'perf') renderPerfSection(ar);
     if (run.status !== 'running') {
       stopAutoRunLive();
       await renderTestsView();
@@ -9527,15 +9517,15 @@ async function cancelAutoRun(runId) {
 function exportAutoRunCsv(ar) {
   const rows = ar.items.map((it) => ({
     position: Number(it.position ?? 0) + 1,
-    case_title: fv(it, 'case_title'),
+    case_title: it?.caseTitle,
     kind: it.kind,
     language: it.language,
     status: it.status,
-    duration_ms: Number(fv(it, 'duration_ms') ?? 0),
+    duration_ms: Number(it?.durationMs ?? 0),
     message: it.message || '',
-    artifacts: (Array.isArray(fv(it, 'artifact_refs')) ? fv(it, 'artifact_refs') : []).map((a) => fv(a, 'name')).join(' '),
+    artifacts: (Array.isArray(it?.artifactRefs) ? it?.artifactRefs : []).map((a) => a?.name).join(' '),
   }));
-  downloadTextFile(`run-${fv(ar.run, 'run_no')}.csv`, toCsv(rows));
+  downloadTextFile(`run-${ar.run?.runNo}.csv`, toCsv(rows));
 }
 
 function formatMillis(ms) {
@@ -9570,7 +9560,7 @@ async function claimAndExec(runId, itemId) {
       toast(t('exec_nothing_left'), 'info');
       return;
     }
-    await openExecItem(fv(item, 'item_id'));
+    await openExecItem(item?.itemId);
   } catch (err) {
     toast(`${t('exec_claim_failed')}: ${err.message}`, 'error');
   }
@@ -9589,17 +9579,17 @@ function buildExecQueue(ex, item) {
   const items = Array.isArray(ex.runItems) ? ex.runItems : [];
   const mine = items
     .filter((it) => {
-      if (fv(it, 'item_id') === fv(item, 'item_id')) return true;
-      const assignee = fv(it, 'assigned_to');
+      if (it?.itemId === item?.itemId) return true;
+      const assignee = it?.assignedTo;
       return isMe(assignee) || assignee === '';
     })
-    .sort((a, b) => Number(fv(a, 'position') ?? 0) - Number(fv(b, 'position') ?? 0));
-  const index = Math.max(0, mine.findIndex((it) => fv(it, 'item_id') === fv(item, 'item_id')));
+    .sort((a, b) => Number(a?.position ?? 0) - Number(b?.position ?? 0));
+  const index = Math.max(0, mine.findIndex((it) => it?.itemId === item?.itemId));
   return {
     total: mine.length,
     index,
-    prev: mine[index - 1] ? fv(mine[index - 1], 'item_id') : null,
-    next: mine[index + 1] ? fv(mine[index + 1], 'item_id') : null,
+    prev: mine[index - 1] ? mine[index - 1]?.itemId : null,
+    next: mine[index + 1] ? mine[index + 1]?.itemId : null,
   };
 }
 
@@ -9612,7 +9602,7 @@ async function renderExecView() {
     const resp = await ApiBinary.one('projectStudioRunItemGetRequest', { projectId: projectId(), itemId: ex.itemId });
     ex.item = resp.item || null;
     ex.steps = (Array.isArray(resp.steps) ? resp.steps : []).map((st) => ({
-      index: Number(fv(st, 'step_index') ?? 0),
+      index: Number(st?.stepIndex ?? 0),
       action: st.action,
       expected: st.expected,
       status: st.status || '',
@@ -9621,10 +9611,10 @@ async function renderExecView() {
       pendingStatus: '',
     }));
     ex.preconditions = resp.preconditions || '';
-    ex.testData = fv(resp, 'test_data') || '';
+    ex.testData = resp?.testData || '';
     // Run context (mockup T09): which run this belongs to and where the case
     // sits in the tester's queue.
-    const runId = fv(ex.item, 'run_id');
+    const runId = ex.item?.runId;
     if (runId) {
       const runResp = await ApiBinary.one('projectStudioRunGetRequest', { projectId: projectId(), runId });
       ex.run = runResp.run || null;
@@ -9637,13 +9627,13 @@ async function renderExecView() {
   if (state.tab !== 'tests' || s.view !== 'exec') return;
   const item = ex.item;
   if (!item) { s.view = 'runs'; return renderRunsView(); }
-  const claimedAt = fv(item, 'claimed_at');
+  const claimedAt = item?.claimedAt;
   if (claimedAt) {
     const parsed = new Date(String(claimedAt).includes('T') ? claimedAt : `${String(claimedAt).replace(' ', 'T')}Z`);
     if (!Number.isNaN(parsed.getTime())) ex.startedMs = parsed.getTime();
   }
-  ex.resultNote = fv(item, 'result_note') || '';
-  ex.testerConfig = fv(item, 'tester_config') || '';
+  ex.resultNote = item?.resultNote || '';
+  ex.testerConfig = item?.testerConfig || '';
   ex.attachments = Array.isArray(item.attachments) ? item.attachments.slice() : [];
   const execQueue = buildExecQueue(ex, item);
 
@@ -9651,13 +9641,13 @@ async function renderExecView() {
     <div class="ps-editor-head">
       <tf-button variant="ghost" icon="chevron-left" id="ps-exec-back">${escapeHtml(t('exec_back'))}</tf-button>
       <div class="ps-editor-title-static">
-        <div class="ps-detail-name">${escapeHtml(fv(item, 'case_title'))}</div>
+        <div class="ps-detail-name">${escapeHtml(item?.caseTitle)}</div>
         <div class="ps-detail-sub">
-          ${escapeHtml(t('exec_sub', { version: Number(fv(item, 'case_version') ?? 1) }))}
+          ${escapeHtml(t('exec_sub', { version: Number(item?.caseVersion ?? 1) }))}
           ${ex.run ? ` · ${escapeHtml(t('exec_run_context', {
-            no: fv(ex.run, 'run_no'),
-            suite: fv(ex.run, 'suite_name') || t('runs_adhoc'),
-            by: fv(ex.run, 'created_by_name') || '',
+            no: ex.run?.runNo,
+            suite: ex.run?.suiteName || t('runs_adhoc'),
+            by: ex.run?.createdByName || '',
           }))}` : ''}
           ${execQueue.total > 1 ? ` · ${escapeHtml(t('exec_position', { index: execQueue.index + 1, total: execQueue.total }))}` : ''}
         </div>
@@ -9728,10 +9718,10 @@ async function renderExecView() {
     openTaskWindow({
       taskType: 'defect',
       links: [
-        { kind: 'run', id: fv(item, 'run_id'), label: run ? `#${fv(run, 'run_no')} ${run.name}` : t('exec_link_run') },
-        { kind: 'run_item', id: fv(item, 'item_id'), label: fv(item, 'case_title') },
+        { kind: 'run', id: item?.runId, label: run ? `#${run?.runNo} ${run.name}` : t('exec_link_run') },
+        { kind: 'run_item', id: item?.itemId, label: item?.caseTitle },
       ],
-      titlePrefill: t('exec_defect_title_prefill', { title: fv(item, 'case_title') }),
+      titlePrefill: t('exec_defect_title_prefill', { title: item?.caseTitle }),
     });
   });
   byId('ps-exec-att-input')?.addEventListener('change', async (e) => {
@@ -9740,7 +9730,7 @@ async function renderExecView() {
     try {
       for (const file of Array.from(files)) {
         const att = await uploadAttachmentFile(file);
-        if (!ex.attachments.some((a) => fv(a, 'sha256') === att.sha256)) ex.attachments.push(att);
+        if (!ex.attachments.some((a) => a?.sha256 === att.sha256)) ex.attachments.push(att);
       }
       renderExecItemAtts();
       toast(t('attachment_uploaded'), 'success');
@@ -9795,7 +9785,7 @@ function renderExecSteps() {
           </div>
           ${step.attachments.length ? `
             <div class="ps-exp-atts">
-              ${step.attachments.map((a, ai) => `<tf-chip status="info" data-step-att-open="${i}:${ai}" role="button" tabindex="0">${sprite('paperclip')} ${escapeHtml(fv(a, 'name') || '')}</tf-chip>`).join('')}
+              ${step.attachments.map((a, ai) => `<tf-chip status="info" data-step-att-open="${i}:${ai}" role="button" tabindex="0">${sprite('paperclip')} ${escapeHtml(a?.name || '')}</tf-chip>`).join('')}
             </div>
           ` : ''}
         </div>
@@ -9821,7 +9811,7 @@ function renderExecSteps() {
       try {
         for (const file of Array.from(files)) {
           const att = await uploadAttachmentFile(file);
-          if (!step.attachments.some((a) => fv(a, 'sha256') === att.sha256)) step.attachments.push(att);
+          if (!step.attachments.some((a) => a?.sha256 === att.sha256)) step.attachments.push(att);
         }
         if (step.status) await sendExecStep(i, step.status);
         renderExecSteps();
@@ -9912,7 +9902,7 @@ function renderExecItemAtts() {
 function backToRunFromExec() {
   const s = f2();
   stopTestsLive();
-  const runId = s.exec?.item ? fv(s.exec.item, 'run_id') : s.runDetail?.runId;
+  const runId = s.exec?.item ? s.exec.item?.runId : s.runDetail?.runId;
   s.exec = null;
   if (runId) openRunDetail(runId);
   else { s.view = 'runs'; renderTestsView(); }
@@ -9955,16 +9945,16 @@ async function finishExecItem() {
   }
   toast(t('exec_finished'), 'success');
   acknowledgeAttachmentUploads(projectId(), currentUserId(), ex.attachments);
-  const next = fv(resp, 'next_item');
+  const next = resp?.nextItem;
   if (next) {
     const goNext = await TfWindow.confirm({
       title: t('exec_next_title'),
-      message: t('exec_next_message', { title: fv(next, 'case_title') }),
+      message: t('exec_next_message', { title: next?.caseTitle }),
       confirmLabel: t('exec_next_go'),
       cancelLabel: t('exec_next_back'),
     });
     if (goNext) {
-      await claimAndExec(fv(next, 'run_id'), fv(next, 'item_id'));
+      await claimAndExec(next?.runId, next?.itemId);
       return;
     }
   }
@@ -10009,7 +9999,7 @@ async function renderReportsView() {
       <tf-select id="ps-rep-suite" label="${escapeAttr(t('reports_suite'))}" value="${escapeAttr(rep.suiteId)}">
         <option value="" ${rep.suiteId ? '' : 'selected'}>${escapeHtml(t('reports_suite_all'))}</option>
         ${s.suites.map((su) => {
-          const sid = fv(su, 'suite_id');
+          const sid = su?.suiteId;
           return `<option value="${escapeAttr(sid)}" ${sid === rep.suiteId ? 'selected' : ''}>${escapeHtml(su.name)}</option>`;
         }).join('')}
       </tf-select>
@@ -10052,7 +10042,7 @@ async function loadReports() {
     if (res.status === 'fulfilled') {
       let rows = [];
       try {
-        const parsed = JSON.parse(fv(res.value, 'rows_json') || '[]');
+        const parsed = JSON.parse(res.value?.rowsJson || '[]');
         rows = Array.isArray(parsed) ? parsed : [];
       } catch { rows = []; }
       rep.data[kind] = { rows, error: null };
@@ -10351,7 +10341,7 @@ function renderPerfReport() {
       <tf-select id="ps-rep-perf-suite" label="${escapeAttr(t('reports_suite'))}" value="${escapeAttr(rep.perfSuiteId)}">
         <option value="" ${rep.perfSuiteId ? '' : 'selected'}>${escapeHtml(t('reports_suite_all'))}</option>
         ${s.suites.map((su) => {
-          const sid = fv(su, 'suite_id');
+          const sid = su?.suiteId;
           return `<option value="${escapeAttr(sid)}" ${sid === rep.perfSuiteId ? 'selected' : ''}>${escapeHtml(su.name)}</option>`;
         }).join('')}
       </tf-select>
@@ -10432,7 +10422,7 @@ async function reloadPerfTrend() {
       toDate: rep.to,
       suiteId: rep.perfSuiteId || rep.suiteId,
     });
-    const parsed = JSON.parse(fv(resp, 'rows_json') || '[]');
+    const parsed = JSON.parse(resp?.rowsJson || '[]');
     rep.data.perf_trend = { rows: Array.isArray(parsed) ? parsed : [], error: null };
   } catch (err) {
     rep.data.perf_trend = { rows: [], error: err.message };
@@ -10503,7 +10493,7 @@ function openPerfCompareWindow() {
         report: 'perf_compare',
         runIds: [runA, runB],
       });
-      const parsed = JSON.parse(fv(resp, 'rows_json') || '[]');
+      const parsed = JSON.parse(resp?.rowsJson || '[]');
       rows = Array.isArray(parsed) ? parsed : [];
     } catch (err) {
       host.innerHTML = `<div class="ps-form-error">${escapeHtml(err.message)}</div>`;
@@ -10543,7 +10533,7 @@ function renderPerfCompareTable(host, rows) {
           const status = String(rowVal(row, ['status'], '') || '');
           const a = row.a || {};
           const b = row.b || {};
-          const delta = row.delta_pct || row.deltaPct || {};
+          const delta = row.delta_pct || {};
           const badge = status
             ? `<tf-chip status="${status === 'added' ? 'ok' : 'warn'}">${escapeHtml(t(`report_perf_status_${status}`))}</tf-chip>`
             : '';
@@ -10649,7 +10639,7 @@ function renderTesterActivityReport() {
 // =============================================================================
 
 function taskNoLabel(task) {
-  return fv(task, 'task_key');
+  return task?.taskKey;
 }
 
 async function loadTaskTypes(isCurrent = () => true) {
@@ -10657,12 +10647,12 @@ async function loadTaskTypes(isCurrent = () => true) {
   const response = await ApiBinary.one('projectStudioTaskTypesListRequest', { projectId: id });
   if (projectId() !== id || !isCurrent()) return;
   state.taskTypes = response.types;
-  state.taskTypeSourceProjectId = response.source_project_id;
+  state.taskTypeSourceProjectId = response.sourceProjectId;
   return state.taskTypes;
 }
 
 function taskTypeName(typeId) {
-  const type = state.taskTypes.find((entry) => fv(entry, 'type_id') === typeId);
+  const type = state.taskTypes.find((entry) => entry?.typeId === typeId);
   return type ? taskTypeLabel(type, t) : t('task_history_unavailable_type');
 }
 
@@ -10670,14 +10660,14 @@ async function renderTaskTypes(host) {
   if (!host) return;
   try { await loadTaskTypes(); }
   catch (error) { host.innerHTML = `<div class="ps-form-error">${escapeHtml(`${t('task_types_failed')}: ${error.message}`)}</div>`; return; }
-  const mutable = canArea('tasks', 'admin') && !state.project.inherit_task_types;
+  const mutable = canArea('tasks', 'admin') && !state.project.inheritTaskTypes;
   host.classList.add('ps-task-types');
-  host.innerHTML = `${state.project.inherit_task_types ? `<div class="ps-banner-info">${escapeHtml(t('inheritance_types_readonly', { project: [...state.projects, ...state.breadcrumbs].find((row) => row.project_id === state.taskTypeSourceProjectId)?.name || t('subproject_parent') }))}</div>` : ''}<div class="ps-members-toolbar"><span class="ps-field-hint">${escapeHtml(t('task_types_hint'))}</span>${mutable ? `<tf-button variant="primary" icon="plus" data-new-type>${escapeHtml(t('task_type_new'))}</tf-button>` : ''}</div><tf-table><tf-column key="name" label="${escapeAttr(t('task_type_name'))}" renderer="html"></tf-column><tf-column key="description" label="${escapeAttr(t('task_type_description'))}"></tf-column><tf-column key="active" label="${escapeAttr(t('task_type_state'))}" renderer="chip"></tf-column><tf-column key="order" label="${escapeAttr(t('task_type_order'))}" renderer="num"></tf-column></tf-table>`;
+  host.innerHTML = `${state.project.inheritTaskTypes ? `<div class="ps-banner-info">${escapeHtml(t('inheritance_types_readonly', { project: [...state.projects, ...state.breadcrumbs].find((row) => row.projectId === state.taskTypeSourceProjectId)?.name || t('subproject_parent') }))}</div>` : ''}<div class="ps-members-toolbar"><span class="ps-field-hint">${escapeHtml(t('task_types_hint'))}</span>${mutable ? `<tf-button variant="primary" icon="plus" data-new-type>${escapeHtml(t('task_type_new'))}</tf-button>` : ''}</div><tf-table><tf-column key="name" label="${escapeAttr(t('task_type_name'))}" renderer="html"></tf-column><tf-column key="description" label="${escapeAttr(t('task_type_description'))}"></tf-column><tf-column key="active" label="${escapeAttr(t('task_type_state'))}" renderer="chip"></tf-column><tf-column key="order" label="${escapeAttr(t('task_type_order'))}" renderer="num"></tf-column></tf-table>`;
   const table = host.querySelector('tf-table');
-  table.rows = state.taskTypes.map((type) => ({ _id: type.type_id, name: `<div class="ps-task-type-name">${escapeHtml(taskTypeLabel(type, t))}</div><div class="ps-field-hint">${escapeHtml(t(type.built_in ? 'task_type_builtin' : 'task_type_custom'))} · ${escapeHtml(type.type_id)}</div>`, description: taskTypeDescription(type, t), active: chipCell(type.active ? 'ok' : 'info', t(type.active ? 'task_type_active' : 'task_type_inactive')), order: type.sort_order }));
+  table.rows = state.taskTypes.map((type) => ({ _id: type.typeId, name: `<div class="ps-task-type-name">${escapeHtml(taskTypeLabel(type, t))}</div><div class="ps-field-hint">${escapeHtml(t(type.builtIn ? 'task_type_builtin' : 'task_type_custom'))} · ${escapeHtml(type.typeId)}</div>`, description: taskTypeDescription(type, t), active: chipCell(type.active ? 'ok' : 'info', t(type.active ? 'task_type_active' : 'task_type_inactive')), order: type.sortOrder }));
   table.rowActions = (row) => {
-    const type = state.taskTypes.find((entry) => entry.type_id === row._id);
-    if (!mutable || type.built_in) return null;
+    const type = state.taskTypes.find((entry) => entry.typeId === row._id);
+    if (!mutable || type.builtIn) return null;
     const button = document.createElement('tf-button');
     button.setAttribute('variant', 'ghost'); button.setAttribute('size', 'sm'); button.setAttribute('icon', 'more'); button.setAttribute('title', t('action_more'));
     button.addEventListener('click', (event) => {
@@ -10685,7 +10675,7 @@ async function renderTaskTypes(host) {
       openActionMenu(button, [
         { id: 'edit', label: t('action_edit'), icon: 'edit', run: () => openTaskTypeEditor(type, () => renderTaskTypes(host)) },
         { id: 'active', label: t(type.active ? 'task_type_deactivate' : 'task_type_activate'), icon: type.active ? 'pause' : 'play', run: async () => {
-          try { await ApiBinary.one('projectStudioTaskTypeSaveRequest', { projectId: projectId(), typeId: type.type_id, name: type.name, description: type.description, sortOrder: type.sort_order, active: !type.active }); await renderTaskTypes(host); }
+          try { await ApiBinary.one('projectStudioTaskTypeSaveRequest', { projectId: projectId(), typeId: type.typeId, name: type.name, description: type.description, sortOrder: type.sortOrder, active: !type.active }); await renderTaskTypes(host); }
           catch (error) { toast(`${t('task_types_failed')}: ${error.message}`, 'error'); }
         } },
       ]);
@@ -10704,9 +10694,9 @@ function openTaskTypesWindow() {
 }
 
 function openTaskTypeEditor(type, onSaved) {
-  if (!canArea('tasks', 'admin') || state.project.inherit_task_types || type?.built_in) return;
+  if (!canArea('tasks', 'admin') || state.project.inheritTaskTypes || type?.builtIn) return;
   const { body, foot, cleanup } = openWindow({ title: t(type ? 'task_type_edit' : 'task_type_new'), icon: 'list', width: 600 });
-  body.innerHTML = `<tf-input id="ps-type-id" label="${escapeAttr(t('task_type_id'))}" hint="${escapeAttr(t('task_type_id_hint'))}" value="${escapeAttr(type?.type_id || '')}" ${type ? 'readonly' : ''}></tf-input><tf-input id="ps-type-name" label="${escapeAttr(t('task_type_name'))}" value="${escapeAttr(type?.name || '')}"></tf-input><tf-textarea id="ps-type-desc" label="${escapeAttr(t('task_type_description'))}" rows="3"></tf-textarea><tf-input id="ps-type-order" type="number" min="0" label="${escapeAttr(t('task_type_order'))}" value="${type?.sort_order ?? (Math.max(0, ...state.taskTypes.map((entry) => entry.sort_order)) + 10)}"></tf-input><div class="ps-toggle-inline"><tf-toggle id="ps-type-active" ${!type || type.active ? 'checked' : ''}></tf-toggle><span>${escapeHtml(t('task_type_active'))}</span></div><div class="ps-form-error" data-form-error hidden></div>`;
+  body.innerHTML = `<tf-input id="ps-type-id" label="${escapeAttr(t('task_type_id'))}" hint="${escapeAttr(t('task_type_id_hint'))}" value="${escapeAttr(type?.typeId || '')}" ${type ? 'readonly' : ''}></tf-input><tf-input id="ps-type-name" label="${escapeAttr(t('task_type_name'))}" value="${escapeAttr(type?.name || '')}"></tf-input><tf-textarea id="ps-type-desc" label="${escapeAttr(t('task_type_description'))}" rows="3"></tf-textarea><tf-input id="ps-type-order" type="number" min="0" label="${escapeAttr(t('task_type_order'))}" value="${type?.sortOrder ?? (Math.max(0, ...state.taskTypes.map((entry) => entry.sortOrder)) + 10)}"></tf-input><div class="ps-toggle-inline"><tf-toggle id="ps-type-active" ${!type || type.active ? 'checked' : ''}></tf-toggle><span>${escapeHtml(t('task_type_active'))}</span></div><div class="ps-form-error" data-form-error hidden></div>`;
   body.querySelector('#ps-type-desc').value = type?.description || '';
   foot.innerHTML = `<div></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" data-action="save">${escapeHtml(t('action_save'))}</tf-button></div>`;
   foot.addEventListener('click', async (event) => {
@@ -10724,16 +10714,16 @@ function openTaskTypeEditor(type, onSaved) {
 }
 
 function taskSourceProject(task) {
-  return state.projects.find((project) => project.project_id === task.project_id);
+  return state.projects.find((project) => project.projectId === task.projectId);
 }
 
 function taskRowTypeName(task) {
-  const builtIn = ['feature', 'defect', 'technical', 'security', 'subtask', 'epic'].includes(task.task_type);
-  return taskTypeLabel({ type_id: task.task_type, built_in: builtIn, name: task.task_type_name }, t);
+  const builtIn = ['feature', 'defect', 'technical', 'security', 'subtask', 'epic'].includes(task.taskType);
+  return taskTypeLabel({ typeId: task.taskType, builtIn, name: task.taskTypeName }, t);
 }
 
 async function openTaskRecord(task, fields = {}) {
-  await openProject(task.project_id, { tab: 'tasks', taskId: task.task_id, ...fields });
+  await openProject(task.projectId, { tab: 'tasks', taskId: task.taskId, ...fields });
 }
 
 async function loadTaskScopeProjects(isCurrent) {
@@ -10741,12 +10731,12 @@ async function loadTaskScopeProjects(isCurrent) {
   const tv = state.tasksView;
   const response = await ApiBinary.one('projectStudioProjectTreeRequest', { projectId: id, includeEnded: false, includeArchived: true });
   if (projectId() !== id || tv !== state.tasksView || !isCurrent()) return;
-  const previous = new Set(descendantsOf(id).map((row) => row.project_id));
-  state.projects = [...state.projects.filter((row) => !previous.has(row.project_id)), ...response.projects];
-  state.breadcrumbs = [...new Map([...state.breadcrumbs, ...response.breadcrumbs].map((row) => [row.project_id, row])).values()];
-  const current = response.projects.find((row) => row.project_id === id);
+  const previous = new Set(descendantsOf(id).map((row) => row.projectId));
+  state.projects = [...state.projects.filter((row) => !previous.has(row.projectId)), ...response.projects];
+  state.breadcrumbs = [...new Map([...state.breadcrumbs, ...response.breadcrumbs].map((row) => [row.projectId, row])).values()];
+  const current = response.projects.find((row) => row.projectId === id);
   if (current) state.project = current;
-  const allowed = new Set(response.projects.map((row) => row.project_id));
+  const allowed = new Set(response.projects.map((row) => row.projectId));
   tv.sourceProjectIds = tv.sourceProjectIds.filter((projectId) => allowed.has(projectId));
 }
 
@@ -10812,7 +10802,7 @@ async function renderTasksTab() {
       <tf-searchbox id="ps-tasks-search" placeholder="${escapeAttr(t('tasks_search_placeholder'))}" debounce="300" value="${escapeAttr(tv.filters.search)}"></tf-searchbox>
       <tf-select id="ps-tasks-f-type" label="${escapeAttr(t('tasks_col_type'))}" value="${escapeAttr(tv.filters.type)}">
         <option value="">${escapeHtml(t('tasks_filter_all'))}</option>
-        ${state.taskTypes.map((type) => `<option value="${escapeAttr(type.type_id)}" ${type.type_id === tv.filters.type ? 'selected' : ''}>${escapeHtml(taskTypeLabel(type, t))}</option>`).join('')}
+        ${state.taskTypes.map((type) => `<option value="${escapeAttr(type.typeId)}" ${type.typeId === tv.filters.type ? 'selected' : ''}>${escapeHtml(taskTypeLabel(type, t))}</option>`).join('')}
       </tf-select>
       ${board ? '' : `
         <tf-select id="ps-tasks-f-status" value="${escapeAttr(tv.filters.status)}">
@@ -10859,7 +10849,7 @@ async function renderTasksTab() {
   panel.querySelector('#ps-tasks-scope').addEventListener('change', (event) => { if (!isActive()) return; tv.scope = event.detail.value; writeTaskScope(currentUserId(), projectId(), tv.mode, tv.scope); tv.sourceProjectIds = []; reload(); });
   const projectFilter = panel.querySelector('#ps-tasks-project-filter');
   if (projectFilter) {
-    projectFilter.options = descendantsOf(projectId()).filter((project) => allowsArea(project.access, 'tasks') || allowsArea(project.access, 'board')).map((project) => ({ value: project.project_id, label: project.name }));
+    projectFilter.options = descendantsOf(projectId()).filter((project) => allowsArea(project.access, 'tasks') || allowsArea(project.access, 'board')).map((project) => ({ value: project.projectId, label: project.name }));
     projectFilter.value = tv.sourceProjectIds;
     projectFilter.addEventListener('change', (event) => { if (!isActive()) return; tv.sourceProjectIds = event.detail.value; reload(); });
   }
@@ -10901,28 +10891,28 @@ async function renderTasksTab() {
   const table = panel.querySelector('#ps-tasks-table');
   const assignRows = () => {
     table.rows = tv.rows.map((task) => {
-      const type = fv(task, 'task_type');
+      const type = task?.taskType;
       return {
-        _id: fv(task, 'task_id'),
+        _id: task?.taskId,
         no: taskNoLabel(task),
-        title: task.title, project: task.project_name,
+        title: task.title, project: task.projectName,
         type: chipCell(type === 'defect' ? 'err' : 'info', taskRowTypeName(task)),
         severity: task.severity
           ? chipCell(PRIORITY_CHIP[task.severity], t(`sev_${task.severity}`))
           : chipCell('info', '—'),
         priority: chipCell(PRIORITY_CHIP[task.priority], t(`prio_${task.priority}`)),
-        status: task.archived_at ? chipCell('warn', t('task_archived')) : task.resolution === 'not_pursued' ? chipCell('info', t('task_not_pursued')) : chipCell(TASK_STATUS_CHIP[task.status], t(`task_status_${task.status}`)),
-        assignee: fv(task, 'assigned_to_name') || '—',
-        due: fv(task, 'due_date') || '—',
+        status: task.archivedAt ? chipCell('warn', t('task_archived')) : task.resolution === 'not_pursued' ? chipCell('info', t('task_not_pursued')) : chipCell(TASK_STATUS_CHIP[task.status], t(`task_status_${task.status}`)),
+        assignee: task?.assignedToName || '—',
+        due: task?.dueDate || '—',
         links: taskLinkLabels(task),
-        comments: Number(fv(task, 'comment_count') ?? 0),
+        comments: Number(task?.commentCount ?? 0),
       };
     });
   };
   assignRows();
   table.addEventListener('row-click', (e) => {
     const taskId = e.detail?.row?._id;
-    const task = tv.rows.find((row) => row.task_id === taskId);
+    const task = tv.rows.find((row) => row.taskId === taskId);
     if (task) openTaskRecord(task);
   });
   table.addEventListener('page-change', (e) => {
@@ -10943,15 +10933,15 @@ function syncTasksFooter() {
     footer.className = 'ps-table-footer';
     host.appendChild(footer);
   }
-  footer.textContent = t('tasks_scope_footer', { shown: tv.mode === 'board' ? tv.boardRows.length : tv.rows.length, total: tv.total, own: tv.summary.own_total, descendants: tv.summary.descendant_total });
+  footer.textContent = t('tasks_scope_footer', { shown: tv.mode === 'board' ? tv.boardRows.length : tv.rows.length, total: tv.total, own: tv.summary.ownTotal, descendants: tv.summary.descendantTotal });
 }
 
 function renderTaskIndexState() {
   const host = byId('ps-task-index-state');
   const summary = state.tasksView?.summary;
   if (!host || !summary) return;
-  const lag = Math.max(0, Number(summary.source_revision) - Number(summary.applied_revision));
-  host.textContent = summary.indexed_at ? t('index_freshness', { date: formatTimestamp(summary.indexed_at) }) : t('index_time_unavailable');
+  const lag = Math.max(0, Number(summary.sourceRevision) - Number(summary.appliedRevision));
+  host.textContent = summary.indexedAt ? t('index_freshness', { date: formatTimestamp(summary.indexedAt) }) : t('index_time_unavailable');
   if (lag) {
     const chip = document.createElement('tf-chip'); chip.setAttribute('status', 'warn'); chip.textContent = t('index_lag', { count: lag }); host.append(' ', chip);
   }
@@ -10976,22 +10966,22 @@ function openAttachmentUsageWindow() {
     try {
       const result = await ApiBinary.one('projectStudioAttachmentUsageRequest', { projectId: pid, offset, limit });
       if (!body.isConnected) return;
-      body.innerHTML = `<div class="ps-attachment-usage-summary"><tf-stat-card label="${escapeAttr(t('attachment_usage_total'))}" value="${escapeAttr(formatBytes(Number(result.total_bytes)))}"></tf-stat-card><tf-stat-card label="${escapeAttr(t('attachment_usage_files'))}" value="${Number(result.file_count)}"></tf-stat-card><tf-stat-card label="${escapeAttr(t('attachment_usage_available'))}" value="${escapeAttr(result.available_bytes == null ? t('attachment_usage_unavailable') : formatBytes(Number(result.available_bytes)))}" accent="${result.warning ? 'danger' : 'info'}"></tf-stat-card></div>${result.warning ? `<div class="ps-form-error">${escapeHtml(t('attachment_usage_warning'))}</div>` : ''}${Number(result.missing_files) ? `<div class="ps-form-error">${escapeHtml(t('attachment_usage_missing', { count: result.missing_files }))}</div>` : ''}<span class="ps-field-hint">${escapeHtml(t('attachment_usage_shared'))}</span><tf-section-card title="${escapeAttr(t('attachment_usage_largest'))}" icon="paperclip"><tf-table data-largest><tf-column key="name" label="${escapeAttr(t('attachment_usage_file'))}"></tf-column><tf-column key="task" label="${escapeAttr(t('attachment_usage_owner'))}"></tf-column><tf-column key="size" label="${escapeAttr(t('attachment_usage_size'))}"></tf-column></tf-table></tf-section-card><tf-section-card title="${escapeAttr(t('attachment_usage_tasks'))}" icon="list"><tf-table data-per-task page-size="${limit}" page="${offset / limit + 1}" total="${result.total_tasks}"><tf-column key="key" label="${escapeAttr(t('attachment_usage_task'))}"></tf-column><tf-column key="count" label="${escapeAttr(t('attachment_usage_files'))}" renderer="num"></tf-column><tf-column key="size" label="${escapeAttr(t('attachment_usage_size'))}"></tf-column></tf-table></tf-section-card><div class="ps-field-hint">${escapeHtml(t('attachment_usage_no_retention'))}</div><div class="ps-form-error" data-form-error hidden></div>`;
+      body.innerHTML = `<div class="ps-attachment-usage-summary"><tf-stat-card label="${escapeAttr(t('attachment_usage_total'))}" value="${escapeAttr(formatBytes(Number(result.totalBytes)))}"></tf-stat-card><tf-stat-card label="${escapeAttr(t('attachment_usage_files'))}" value="${Number(result.fileCount)}"></tf-stat-card><tf-stat-card label="${escapeAttr(t('attachment_usage_available'))}" value="${escapeAttr(result.availableBytes == null ? t('attachment_usage_unavailable') : formatBytes(Number(result.availableBytes)))}" accent="${result.warning ? 'danger' : 'info'}"></tf-stat-card></div>${result.warning ? `<div class="ps-form-error">${escapeHtml(t('attachment_usage_warning'))}</div>` : ''}${Number(result.missingFiles) ? `<div class="ps-form-error">${escapeHtml(t('attachment_usage_missing', { count: result.missingFiles }))}</div>` : ''}<span class="ps-field-hint">${escapeHtml(t('attachment_usage_shared'))}</span><tf-section-card title="${escapeAttr(t('attachment_usage_largest'))}" icon="paperclip"><tf-table data-largest><tf-column key="name" label="${escapeAttr(t('attachment_usage_file'))}"></tf-column><tf-column key="task" label="${escapeAttr(t('attachment_usage_owner'))}"></tf-column><tf-column key="size" label="${escapeAttr(t('attachment_usage_size'))}"></tf-column></tf-table></tf-section-card><tf-section-card title="${escapeAttr(t('attachment_usage_tasks'))}" icon="list"><tf-table data-per-task page-size="${limit}" page="${offset / limit + 1}" total="${result.totalTasks}"><tf-column key="key" label="${escapeAttr(t('attachment_usage_task'))}"></tf-column><tf-column key="count" label="${escapeAttr(t('attachment_usage_files'))}" renderer="num"></tf-column><tf-column key="size" label="${escapeAttr(t('attachment_usage_size'))}"></tf-column></tf-table></tf-section-card><div class="ps-field-hint">${escapeHtml(t('attachment_usage_no_retention'))}</div><div class="ps-form-error" data-form-error hidden></div>`;
       const files = body.querySelector('[data-largest]');
-      files.rows = result.largest.map((file, index) => ({ _id: index, name: file.filename, task: file.task_key || t(`attachment_owner_${file.owner_kind}`), size: formatBytes(Number(file.size_bytes)) }));
+      files.rows = result.largest.map((file, index) => ({ _id: index, name: file.filename, task: file.taskKey || t(`attachment_owner_${file.ownerKind}`), size: formatBytes(Number(file.sizeBytes)) }));
       files.rowActions = (row) => {
         const file = result.largest[row._id];
         const button = document.createElement('tf-button'); button.setAttribute('variant', 'ghost'); button.setAttribute('size', 'sm'); button.setAttribute('icon', 'download'); button.setAttribute('title', t('attachment_download_original'));
         button.addEventListener('click', async (event) => {
           event.stopPropagation(); button.setAttribute('disabled', '');
-          try { await downloadProjectAttachment(attachmentOwner(file.owner_kind, file.owner_id, file.step_index, pid), { sha256: file.sha256, name: file.filename }); }
+          try { await downloadProjectAttachment(attachmentOwner(file.ownerKind, file.ownerId, file.stepIndex, pid), { sha256: file.sha256, name: file.filename }); }
           catch (error) { const el = body.querySelector('[data-form-error]'); el.hidden = false; el.textContent = attachmentError(error); }
           finally { button.removeAttribute('disabled'); }
         });
         return button;
       };
       const tasks = body.querySelector('[data-per-task]');
-      tasks.rows = result.per_task.map((task) => ({ _id: task.task_id, key: task.task_key, count: Number(task.file_count), size: formatBytes(Number(task.total_bytes)) }));
+      tasks.rows = result.perTask.map((task) => ({ _id: task.taskId, key: task.taskKey, count: Number(task.fileCount), size: formatBytes(Number(task.totalBytes)) }));
       tasks.addEventListener('page-change', (event) => { offset = (Number(event.detail.page) - 1) * limit; load(); });
       tasks.addEventListener('row-click', (event) => { if (event.detail.row?._id && (canArea('tasks') || canArea('board'))) { cleanup(); openTaskWindow({ taskId: event.detail.row._id }); } });
     } catch (error) { body.innerHTML = `<div class="ps-form-error">${escapeHtml(`${t('attachment_usage_failed')}: ${error.message}`)}</div>`; }
@@ -11102,39 +11092,39 @@ async function openTaskWindow(opts = {}) {
     tw.info = detail.info;
     tw.comments = detail.comments;
     tw.events = detail.events;
-    tw.eventsHasMore = detail.events_has_more;
-    tw.durations = detail.status_durations;
-    tw.taskLinks = detail.task_links;
-    tw.handoverCommentId = detail.handover_comment_id;
+    tw.eventsHasMore = detail.eventsHasMore;
+    tw.durations = detail.statusDurations;
+    tw.taskLinks = detail.taskLinks;
+    tw.handoverCommentId = detail.handoverCommentId;
     return detail;
   };
   try {
     await loadTaskTypes();
-    if (!tw.taskId && !state.taskTypes.some((type) => type.active && type.type_id === tw.taskType)) tw.taskType = state.taskTypes.find((type) => type.active)?.type_id || '';
+    if (!tw.taskId && !state.taskTypes.some((type) => type.active && type.typeId === tw.taskType)) tw.taskType = state.taskTypes.find((type) => type.active)?.typeId || '';
     if (tw.taskId) {
       const detail = await readDetail();
       const info = detail.info;
-      tw.taskType = info.task_type;
+      tw.taskType = info.taskType;
       tw.title = info.title;
-      tw.descriptionMd = detail.description_md;
+      tw.descriptionMd = detail.descriptionMd;
       tw.severity = info.severity;
       tw.priority = info.priority;
       tw.status = info.status;
-      tw.assignedTo = info.assigned_to;
-      tw.dueDate = info.due_date;
-      tw.parentTaskId = info.parent_task_id;
-      tw.links = JSON.parse(info.links_json);
+      tw.assignedTo = info.assignedTo;
+      tw.dueDate = info.dueDate;
+      tw.parentTaskId = info.parentTaskId;
+      tw.links = JSON.parse(info.linksJson);
       tw.attachments = detail.attachments.slice();
-      while (opts.eventId && !tw.events.some((event) => String(event.event_id) === String(opts.eventId)) && tw.eventsHasMore) {
-        const page = await ApiBinary.one('projectStudioTaskEventsRequest', { projectId: pid, taskId: tw.taskId, beforeId: tw.events.at(-1).event_id, limit: 50 });
-        tw.events.push(...page.events); tw.eventsHasMore = page.has_more;
+      while (opts.eventId && !tw.events.some((event) => String(event.eventId) === String(opts.eventId)) && tw.eventsHasMore) {
+        const page = await ApiBinary.one('projectStudioTaskEventsRequest', { projectId: pid, taskId: tw.taskId, beforeId: tw.events.at(-1).eventId, limit: 50 });
+        tw.events.push(...page.events); tw.eventsHasMore = page.hasMore;
       }
     }
   } catch (error) {
     toast(`${t('task_load_failed')}: ${error.message}`, 'error');
     return;
   }
-  const archived = !!tw.info?.archived_at;
+  const archived = !!tw.info?.archivedAt;
   const mayEdit = !archived && (tw.taskId ? canArea('tasks', 'write') : canCreateTask(projectAccess()));
   const maySetStatus = !archived && !!tw.taskId && (canArea('tasks', 'write') || canArea('board', 'write'));
   const mayArchive = !!tw.taskId && canArea('tasks', 'write');
@@ -11142,18 +11132,18 @@ async function openTaskWindow(opts = {}) {
   const mayComment = !archived && !!tw.taskId && canArea('tasks', 'write');
   const mayHandover = !projectAccess().archived && !projectAccess().ended && !archived && tw.status !== 'done' && !!tw.taskId && (canArea('tasks', 'write') || isMe(tw.assignedTo));
   const types = activeTaskTypes(state.taskTypes, tw.taskType);
-  const members = (f2().membersCache || []).filter((member) => member.access.has_access);
+  const members = (f2().membersCache || []).filter((member) => member.access.hasAccess);
   const assignees = members.filter((member) => allowsArea(member.access, 'tasks', 'write'));
   const readers = members.filter((member) => allowsArea(member.access, 'tasks') || allowsArea(member.access, 'board'));
   const { body, foot, cleanup, signal } = openWindow({
     title: tw.taskId ? t('task_win_title', { no: taskNoLabel(tw.info) }) : t('task_win_new_title'),
-    subtitle: tw.info ? `${fv(tw.info, 'created_by_name')} · ${formatTimestamp(fv(tw.info, 'created_at'))}` : t('task_new_key_hint', { prefix: fv(state.project, 'key_prefix') }),
+    subtitle: tw.info ? `${tw.info?.createdByName} · ${formatTimestamp(tw.info?.createdAt)}` : t('task_new_key_hint', { prefix: state.project?.keyPrefix }),
     icon: tw.taskType === 'defect' ? 'alert' : 'check', width: 1080,
   });
   body.classList.add('ps-task-card');
-  if (tw.info) updateProjectRoute({ taskKey: tw.info.task_key, taskId: null, eventId: opts.eventId || null, commentId: opts.commentId || null });
+  if (tw.info) updateProjectRoute({ taskKey: tw.info.taskKey, taskId: null, eventId: opts.eventId || null, commentId: opts.commentId || null });
   body.innerHTML = `
-    ${tw.info?.resolution === 'not_pursued' ? `<div class="ps-task-resolution"><tf-chip status="info">${escapeHtml(t('task_not_pursued'))}</tf-chip><span>${escapeHtml(tw.info.resolution_reason)}</span></div>` : ''}
+    ${tw.info?.resolution === 'not_pursued' ? `<div class="ps-task-resolution"><tf-chip status="info">${escapeHtml(t('task_not_pursued'))}</tf-chip><span>${escapeHtml(tw.info.resolutionReason)}</span></div>` : ''}
     ${archived ? `<div class="ps-task-archived"><tf-chip status="warn">${escapeHtml(t('task_archived'))}</tf-chip><span>${escapeHtml(t('task_archived_hint'))}</span></div>` : ''}
     <div class="ps-task-layout">
       <div class="ps-task-main">
@@ -11179,9 +11169,9 @@ async function openTaskWindow(opts = {}) {
       <aside class="ps-task-sidebar">
         <tf-section-card title="${escapeAttr(t('task_metadata_title'))}" icon="settings">
           <div class="ps-task-metadata">
-            ${!tw.taskId ? `<tf-select id="ps-task-project" label="${escapeAttr(t('task_source_project'))}" value="${escapeAttr(pid)}">${descendantsOf(pid).filter((project) => canCreateTask(project.access)).map((project) => `<option value="${escapeAttr(project.project_id)}" ${project.project_id === pid ? 'selected' : ''}>${escapeHtml(project.name)}</option>`).join('')}</tf-select><span class="ps-field-hint" data-task-project-hint hidden>${escapeHtml(t('task_project_change_upload_hint'))}</span>` : `<span class="ps-field-hint">${escapeHtml(state.project.name)}</span>`}
+            ${!tw.taskId ? `<tf-select id="ps-task-project" label="${escapeAttr(t('task_source_project'))}" value="${escapeAttr(pid)}">${descendantsOf(pid).filter((project) => canCreateTask(project.access)).map((project) => `<option value="${escapeAttr(project.projectId)}" ${project.projectId === pid ? 'selected' : ''}>${escapeHtml(project.name)}</option>`).join('')}</tf-select><span class="ps-field-hint" data-task-project-hint hidden>${escapeHtml(t('task_project_change_upload_hint'))}</span>` : `<span class="ps-field-hint">${escapeHtml(state.project.name)}</span>`}
             <tf-select id="ps-task-type" label="${escapeAttr(t('task_type_label'))}" value="${escapeAttr(tw.taskType)}" ${mayEdit ? '' : 'disabled'}>
-              ${types.map((type) => `<option value="${escapeAttr(type.type_id)}" ${type.type_id === tw.taskType ? 'selected' : ''} ${!type.active && type.type_id !== tw.taskType || type.type_id === 'subtask' && !mayReadTasks ? 'disabled' : ''}>${escapeHtml(taskTypeLabel(type, t))}${type.active ? '' : ` · ${escapeHtml(t('task_type_inactive'))}`}</option>`).join('')}
+              ${types.map((type) => `<option value="${escapeAttr(type.typeId)}" ${type.typeId === tw.taskType ? 'selected' : ''} ${!type.active && type.typeId !== tw.taskType || type.typeId === 'subtask' && !mayReadTasks ? 'disabled' : ''}>${escapeHtml(taskTypeLabel(type, t))}${type.active ? '' : ` · ${escapeHtml(t('task_type_inactive'))}`}</option>`).join('')}
             </tf-select>
             <span id="ps-task-type-hint" class="ps-field-hint"></span>
             <tf-select id="ps-task-status" label="${escapeAttr(t('task_status_label'))}" value="${escapeAttr(tw.status)}" ${mayEdit || maySetStatus ? '' : 'disabled'}>
@@ -11194,7 +11184,7 @@ async function openTaskWindow(opts = {}) {
               ${PRIORITIES.map((priority) => selectOpt(priority, tw.priority, t(`prio_${priority}`))).join('')}
             </tf-select>
             <tf-select id="ps-task-assignee" label="${escapeAttr(t('task_assignee_label'))}" value="${escapeAttr(tw.assignedTo)}" ${mayEdit ? '' : 'disabled'}>
-              ${selectOpt('', tw.assignedTo, t('task_unassigned'))}${assignees.map((member) => selectOpt(member.user_id, tw.assignedTo, member.display_name)).join('')}
+              ${selectOpt('', tw.assignedTo, t('task_unassigned'))}${assignees.map((member) => selectOpt(member.userId, tw.assignedTo, member.displayName)).join('')}
             </tf-select>
             ${mayHandover ? `<tf-button variant="ghost" icon="send" id="ps-task-handover">${escapeHtml(t('task_handover'))}</tf-button>` : ''}
             <tf-input id="ps-task-due" type="date" label="${escapeAttr(t('task_due_label'))}" value="${escapeAttr(tw.dueDate)}" ${mayEdit ? '' : 'readonly'}></tf-input>
@@ -11212,7 +11202,7 @@ async function openTaskWindow(opts = {}) {
       </aside>
     </div>
     <div class="ps-form-error" data-form-error hidden></div>`;
-  foot.innerHTML = `<div class="ps-footer-left">${tw.info && projectAccess().is_owner && !projectAccess().archived && !projectAccess().ended && !archived ? `<tf-button variant="ghost" icon="branch" data-action="transfer">${escapeHtml(t('task_transfer'))}</tf-button>` : ''}${mayEdit && tw.taskId && tw.status !== 'done' ? `<tf-button variant="ghost" icon="check" data-action="resolve">${escapeHtml(t('task_not_pursued'))}</tf-button>` : ''}${mayArchive ? `<tf-button variant="ghost" icon="${archived ? 'refresh' : 'archive'}" data-action="archive">${escapeHtml(t(archived ? 'task_restore' : 'action_archive'))}</tf-button>` : ''}${tw.info ? `<tf-button variant="ghost" icon="link" data-action="copy-link">${escapeHtml(t('task_copy_link'))}</tf-button>` : ''}</div>
+  foot.innerHTML = `<div class="ps-footer-left">${tw.info && projectAccess().isOwner && !projectAccess().archived && !projectAccess().ended && !archived ? `<tf-button variant="ghost" icon="branch" data-action="transfer">${escapeHtml(t('task_transfer'))}</tf-button>` : ''}${mayEdit && tw.taskId && tw.status !== 'done' ? `<tf-button variant="ghost" icon="check" data-action="resolve">${escapeHtml(t('task_not_pursued'))}</tf-button>` : ''}${mayArchive ? `<tf-button variant="ghost" icon="${archived ? 'refresh' : 'archive'}" data-action="archive">${escapeHtml(t(archived ? 'task_restore' : 'action_archive'))}</tf-button>` : ''}${tw.info ? `<tf-button variant="ghost" icon="link" data-action="copy-link">${escapeHtml(t('task_copy_link'))}</tf-button>` : ''}</div>
     <div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_close'))}</tf-button>${mayEdit || maySetStatus ? `<tf-button variant="primary" icon="check" data-action="save">${escapeHtml(t('action_save'))}</tf-button>` : ''}</div>`;
   const errorEl = body.querySelector('[data-form-error]');
   const showError = (message) => { errorEl.hidden = !message; errorEl.textContent = message || ''; };
@@ -11231,10 +11221,10 @@ async function openTaskWindow(opts = {}) {
   const historyTaskRequests = new Set();
   const historyProjectNames = new Map([[pid, state.project.name]]);
   const historyProjectRequests = new Set();
-  const rememberHistoryTask = (task) => { historyTaskNames.set(task.task_id, `${task.task_key} · ${task.title}`); historyProjectNames.set(task.project_id, task.project_name); };
+  const rememberHistoryTask = (task) => { historyTaskNames.set(task.taskId, `${task.taskKey} · ${task.title}`); historyProjectNames.set(task.projectId, task.projectName); };
   for (const task of [...(state.tasksView?.rows || []), ...(state.tasksView?.boardRows || [])]) rememberHistoryTask(task);
   if (tw.info) rememberHistoryTask(tw.info);
-  for (const link of tw.taskLinks) historyTaskNames.set(link.source_task_id === tw.taskId ? link.target_task_id : link.source_task_id, `${link.counterparty_task_key} · ${link.counterparty_task_title}`);
+  for (const link of tw.taskLinks) historyTaskNames.set(link.sourceTaskId === tw.taskId ? link.targetTaskId : link.sourceTaskId, `${link.counterpartyTaskKey} · ${link.counterpartyTaskTitle}`);
   let renderHistory;
   const parent = body.querySelector('#ps-task-parent');
   let parentQuery = 0;
@@ -11246,11 +11236,11 @@ async function openTaskWindow(opts = {}) {
     if (!parent.isConnected || query !== parentQuery) return;
     parentRows = parentCandidates(response.tasks, tw.taskType, tw.taskId);
     for (const task of parentRows) rememberHistoryTask(task);
-    parent.options = parentRows.map((task) => ({ value: task.task_id, label: `${task.task_key} · ${task.title}` }));
+    parent.options = parentRows.map((task) => ({ value: task.taskId, label: `${task.taskKey} · ${task.title}` }));
     renderHistory?.();
   };
   const syncType = () => {
-    const type = state.taskTypes.find((entry) => entry.type_id === tw.taskType);
+    const type = state.taskTypes.find((entry) => entry.typeId === tw.taskType);
     body.querySelector('#ps-task-type-hint').textContent = type ? taskTypeDescription(type, t) : '';
     body.querySelector('#ps-task-severity').hidden = tw.taskType !== 'defect';
     if (parent) { parent.disabled = !mayEdit || tw.taskType === 'epic'; parent.setAttribute('label', t(tw.taskType === 'subtask' ? 'task_parent_required' : 'task_parent_label')); }
@@ -11265,7 +11255,7 @@ async function openTaskWindow(opts = {}) {
       const response = await ApiBinary.one('projectStudioTaskGetRequest', { projectId: pid, taskId: tw.parentTaskId });
       parentRows.push(response.detail.info);
       rememberHistoryTask(response.detail.info);
-      parent.value = `${response.detail.info.task_key} · ${response.detail.info.title}`;
+      parent.value = `${response.detail.info.taskKey} · ${response.detail.info.title}`;
     } catch (error) { historyTaskNames.set(tw.parentTaskId, null); showError(`${t('task_load_failed')}: ${error.message}`); }
   }
   if (parent && mayEdit) findParents().catch((error) => showError(`${t('task_load_failed')}: ${error.message}`));
@@ -11275,9 +11265,9 @@ async function openTaskWindow(opts = {}) {
     body.querySelectorAll('[data-task-link]').forEach((chip) => chip.addEventListener('remove', () => { tw.links.splice(Number(chip.dataset.taskLink), 1); renderLinks(); }));
     const host = body.querySelector('#ps-task-relations');
     host.innerHTML = tw.taskLinks.length ? tw.taskLinks.map((link) => {
-      const otherId = link.source_task_id === tw.taskId ? link.target_task_id : link.source_task_id;
-      const direction = ['related', 'duplicate'].includes(link.kind) ? '' : t(link.source_task_id === tw.taskId ? 'task_relation_outgoing' : 'task_relation_incoming');
-      return `<div class="ps-task-relation"><tf-button variant="ghost" data-related-task="${escapeAttr(otherId)}" data-related-project="${escapeAttr(link.counterparty_project_id)}">${escapeHtml(link.counterparty_task_key)} · ${escapeHtml(link.counterparty_task_title)}</tf-button><span>${escapeHtml(t(`task_relation_${link.kind}`))}${direction ? ` · ${escapeHtml(direction)}` : ''}${link.lag_days ? ` · ${escapeHtml(t('task_relation_lag_value', { days: link.lag_days }))}` : ''}</span>${mayEdit ? `<tf-button variant="ghost" size="sm" icon="x" data-unlink="${link.link_id}" title="${escapeAttr(t('task_relation_remove'))}"></tf-button>` : ''}</div>`;
+      const otherId = link.sourceTaskId === tw.taskId ? link.targetTaskId : link.sourceTaskId;
+      const direction = ['related', 'duplicate'].includes(link.kind) ? '' : t(link.sourceTaskId === tw.taskId ? 'task_relation_outgoing' : 'task_relation_incoming');
+      return `<div class="ps-task-relation"><tf-button variant="ghost" data-related-task="${escapeAttr(otherId)}" data-related-project="${escapeAttr(link.counterpartyProjectId)}">${escapeHtml(link.counterpartyTaskKey)} · ${escapeHtml(link.counterpartyTaskTitle)}</tf-button><span>${escapeHtml(t(`task_relation_${link.kind}`))}${direction ? ` · ${escapeHtml(direction)}` : ''}${link.lagDays ? ` · ${escapeHtml(t('task_relation_lag_value', { days: link.lagDays }))}` : ''}</span>${mayEdit ? `<tf-button variant="ghost" size="sm" icon="x" data-unlink="${link.linkId}" title="${escapeAttr(t('task_relation_remove'))}"></tf-button>` : ''}</div>`;
     }).join('') : `<span class="ps-field-hint">${escapeHtml(t('task_relations_empty'))}</span>`;
     host.querySelectorAll('[data-related-task]').forEach((button) => button.addEventListener('click', () => { cleanup(); openProject(button.dataset.relatedProject, { tab: 'tasks', taskId: button.dataset.relatedTask }); }));
     host.querySelectorAll('[data-unlink]').forEach((button) => button.addEventListener('click', async () => {
@@ -11294,8 +11284,8 @@ async function openTaskWindow(opts = {}) {
     const markedId = history.querySelector('.ps-task-target [data-task-event]')?.dataset.taskEvent;
     const eventValue = (json, kind) => taskEventValue(json, { translate: t, memberName, taskName: (id) => historyTaskNames.get(id), projectName: (id) => historyProjectNames.get(id), typeName: taskTypeName, kind });
     history.entries = tw.events.map((event) => ({
-      title: `<span data-task-event="${event.event_id}">${escapeHtml(t(`task_event_${event.kind}`))}</span>`, time: escapeHtml(formatTimestamp(event.at)),
-      description: `<span class="ps-task-history-actor">${escapeHtml(event.actor_kind === 'user' ? memberName(event.actor_id) || t('task_history_unavailable_person') : t(`task_actor_${event.actor_kind}`))}</span><div class="ps-task-history-values">${escapeHtml(eventValue(event.before_json, event.kind))}<span aria-hidden="true"> → </span>${escapeHtml(eventValue(event.after_json, event.kind))}</div>${taskEventAttachments(event).map((attachment, index) => `<tf-button variant="ghost" size="sm" icon="paperclip" data-history-attachment="${event.event_id}:${index}">${escapeHtml(attachment.name)}</tf-button>`).join('')}`,
+      title: `<span data-task-event="${event.eventId}">${escapeHtml(t(`task_event_${event.kind}`))}</span>`, time: escapeHtml(formatTimestamp(event.at)),
+      description: `<span class="ps-task-history-actor">${escapeHtml(event.actorKind === 'user' ? memberName(event.actorId) || t('task_history_unavailable_person') : t(`task_actor_${event.actorKind}`))}</span><div class="ps-task-history-values">${escapeHtml(eventValue(event.beforeJson, event.kind))}<span aria-hidden="true"> → </span>${escapeHtml(eventValue(event.afterJson, event.kind))}</div>${taskEventAttachments(event).map((attachment, index) => `<tf-button variant="ghost" size="sm" icon="paperclip" data-history-attachment="${event.eventId}:${index}">${escapeHtml(attachment.name)}</tf-button>`).join('')}`,
     }));
     if (markedId) {
       const marked = [...history.querySelectorAll('[data-task-event]')].find((element) => element.dataset.taskEvent === markedId)?.closest('.tf-timeline-item');
@@ -11303,12 +11293,12 @@ async function openTaskWindow(opts = {}) {
     }
     history.querySelectorAll('[data-history-attachment]').forEach((button) => button.addEventListener('click', () => {
       const [eventId, index] = button.dataset.historyAttachment.split(':').map(Number);
-      const event = tw.events.find((item) => Number(item.event_id) === eventId);
+      const event = tw.events.find((item) => Number(item.eventId) === eventId);
       openAttachmentPreview(taskEventAttachments(event)[index], attachmentOwner('task', tw.taskId, null, pid));
     }));
     const more = body.querySelector('#ps-task-history-more');
     more.hidden = !tw.eventsHasMore;
-    body.querySelector('#ps-task-durations').innerHTML = tw.durations.map((duration) => `<div class="ps-task-duration"><tf-chip status="${TASK_STATUS_CHIP[duration.status]}">${escapeHtml(t(`task_status_${duration.status}`))}</tf-chip><b>${escapeHtml(taskDuration(duration.seconds, t))}</b><span>${escapeHtml(formatTimestamp(duration.entered_at))}${duration.left_at ? ` → ${escapeHtml(formatTimestamp(duration.left_at))}` : ` · ${escapeHtml(t('task_status_current'))}`}</span></div>`).join('');
+    body.querySelector('#ps-task-durations').innerHTML = tw.durations.map((duration) => `<div class="ps-task-duration"><tf-chip status="${TASK_STATUS_CHIP[duration.status]}">${escapeHtml(t(`task_status_${duration.status}`))}</tf-chip><b>${escapeHtml(taskDuration(duration.seconds, t))}</b><span>${escapeHtml(formatTimestamp(duration.enteredAt))}${duration.leftAt ? ` → ${escapeHtml(formatTimestamp(duration.leftAt))}` : ` · ${escapeHtml(t('task_status_current'))}`}</span></div>`).join('');
   };
   const resolveHistoryTasks = async (events) => {
     if (!mayReadTasks || !tw.taskId) return;
@@ -11330,7 +11320,7 @@ async function openTaskWindow(opts = {}) {
             if (!signal.aborted) historyProjectNames.set(id, response.project.name);
           } else {
             const target = await ApiBinary.one('projectStudioTaskKeyResolveRequest', { taskKey: null, taskId: id, originProjectId: null, originEventId: null });
-            const response = await ApiBinary.one('projectStudioTaskGetRequest', { projectId: target.project_id, taskId: target.task_id });
+            const response = await ApiBinary.one('projectStudioTaskGetRequest', { projectId: target.projectId, taskId: target.taskId });
             if (!signal.aborted) rememberHistoryTask(response.detail.info);
           }
         } catch { (kind === 'project' ? historyProjectNames : historyTaskNames).set(id, null); }
@@ -11342,12 +11332,12 @@ async function openTaskWindow(opts = {}) {
     const button = event.currentTarget;
     button.setAttribute('disabled', '');
     try {
-      const response = await ApiBinary.one('projectStudioTaskEventsRequest', { projectId: pid, taskId: tw.taskId, beforeId: tw.events.at(-1)?.event_id ?? null, limit: 50 });
+      const response = await ApiBinary.one('projectStudioTaskEventsRequest', { projectId: pid, taskId: tw.taskId, beforeId: tw.events.at(-1)?.eventId ?? null, limit: 50 });
       tw.events.push(...response.events);
-      tw.eventsHasMore = response.has_more;
+      tw.eventsHasMore = response.hasMore;
       renderHistory();
       await resolveHistoryTasks(response.events);
-      button.hidden = !response.has_more;
+      button.hidden = !response.hasMore;
     } catch (error) { showError(`${t('task_load_failed')}: ${error.message}`); }
     finally { button.removeAttribute('disabled'); }
   });
@@ -11362,18 +11352,18 @@ async function openTaskWindow(opts = {}) {
     const host = body.querySelector('#ps-task-comments');
     if (!host) return;
     const pin = body.querySelector('#ps-task-handover-note');
-    const note = isMe(tw.info?.assigned_to) && tw.handoverCommentId ? tw.comments.find((comment) => comment.comment_id === tw.handoverCommentId) : null;
+    const note = isMe(tw.info?.assignedTo) && tw.handoverCommentId ? tw.comments.find((comment) => comment.commentId === tw.handoverCommentId) : null;
     pin.hidden = !note;
-    pin.innerHTML = note ? `<tf-section-card title="${escapeAttr(t('task_handover_note'))}" icon="pin"><div class="ps-task-handover-note"><b>${escapeHtml(note.author_name)}</b><span>${escapeHtml(formatTimestamp(note.created_at))}</span><div class="ps-task-markdown">${renderMarkdown(note.body_md)}</div></div></tf-section-card>` : '';
+    pin.innerHTML = note ? `<tf-section-card title="${escapeAttr(t('task_handover_note'))}" icon="pin"><div class="ps-task-handover-note"><b>${escapeHtml(note.authorName)}</b><span>${escapeHtml(formatTimestamp(note.createdAt))}</span><div class="ps-task-markdown">${renderMarkdown(note.bodyMd)}</div></div></tf-section-card>` : '';
     host.innerHTML = tw.comments.length ? tw.comments.map((comment, index) => {
-      const own = isMe(comment.author_user_id);
-      return `<div class="ps-task-comment" data-task-comment="${escapeAttr(comment.comment_id)}"><div class="ps-av-mini">${escapeHtml(initials(comment.author_name))}</div><div class="ps-task-comment-main"><div class="ps-task-comment-head"><b>${escapeHtml(comment.author_name)}</b><span>${escapeHtml(formatTimestamp(comment.created_at))}${comment.edited_at ? ` · ${escapeHtml(t('task_comment_edited'))}` : ''}</span></div><div class="ps-task-markdown">${renderMarkdown(comment.body_md)}</div><div class="ps-task-mentioned">${comment.mention_user_ids.map((id) => `<tf-chip status="accent">@${escapeHtml(memberName(id) || id)}</tf-chip>`).join('')}</div></div><div class="ps-task-comment-actions">${mayComment && own ? `<tf-button variant="ghost" size="sm" icon="edit" data-comment-edit="${index}" title="${escapeAttr(t('action_edit'))}"></tf-button>` : ''}${mayComment && (own || canArea('tasks', 'admin')) ? `<tf-button variant="ghost" size="sm" icon="trash" data-comment-delete="${index}" title="${escapeAttr(t('action_delete'))}"></tf-button>` : ''}</div></div>`;
+      const own = isMe(comment.authorUserId);
+      return `<div class="ps-task-comment" data-task-comment="${escapeAttr(comment.commentId)}"><div class="ps-av-mini">${escapeHtml(initials(comment.authorName))}</div><div class="ps-task-comment-main"><div class="ps-task-comment-head"><b>${escapeHtml(comment.authorName)}</b><span>${escapeHtml(formatTimestamp(comment.createdAt))}${comment.editedAt ? ` · ${escapeHtml(t('task_comment_edited'))}` : ''}</span></div><div class="ps-task-markdown">${renderMarkdown(comment.bodyMd)}</div><div class="ps-task-mentioned">${comment.mentionUserIds.map((id) => `<tf-chip status="accent">@${escapeHtml(memberName(id) || id)}</tf-chip>`).join('')}</div></div><div class="ps-task-comment-actions">${mayComment && own ? `<tf-button variant="ghost" size="sm" icon="edit" data-comment-edit="${index}" title="${escapeAttr(t('action_edit'))}"></tf-button>` : ''}${mayComment && (own || canArea('tasks', 'admin')) ? `<tf-button variant="ghost" size="sm" icon="trash" data-comment-delete="${index}" title="${escapeAttr(t('action_delete'))}"></tf-button>` : ''}</div></div>`;
     }).join('') : `<span class="ps-field-hint">${escapeHtml(t('task_comments_empty'))}</span>`;
     host.querySelectorAll('[data-comment-edit]').forEach((button) => button.addEventListener('click', () => openTaskCommentEditor(tw.comments[Number(button.dataset.commentEdit)], readers, refreshRecorded)));
     host.querySelectorAll('[data-comment-delete]').forEach((button) => button.addEventListener('click', async () => {
       const comment = tw.comments[Number(button.dataset.commentDelete)];
       if (!await TfWindow.confirm({ title: t('task_comment_delete_title'), message: t('task_comment_delete_message'), confirmLabel: t('action_delete'), cancelLabel: t('action_cancel'), danger: true })) return;
-      try { await ApiBinary.one('projectStudioTaskCommentDeleteRequest', { projectId: pid, commentId: comment.comment_id }); await refreshRecorded(); }
+      try { await ApiBinary.one('projectStudioTaskCommentDeleteRequest', { projectId: pid, commentId: comment.commentId }); await refreshRecorded(); }
       catch (error) { showError(`${t('task_comment_failed')}: ${error.message}`); }
     }));
   };
@@ -11385,9 +11375,9 @@ async function openTaskWindow(opts = {}) {
     await resolveHistoryTasks(tw.events.slice(0, 50));
   }
   body.querySelector('#ps-task-handover')?.addEventListener('click', (event) => {
-    const win = openHandoverWindow({ subject: `${tw.info.task_key} · ${tw.title}`, title: t('task_handover'), submitLabel: t('task_handover'), anchor: event.currentTarget,
+    const win = openHandoverWindow({ subject: `${tw.info.taskKey} · ${tw.title}`, title: t('task_handover'), submitLabel: t('task_handover'), anchor: event.currentTarget,
       note: { tone: 'info', text: t('task_handover_hint') },
-      people: assignees.filter((member) => member.user_id !== tw.info.assigned_to).map((member) => ({ id: member.user_id, name: member.display_name })),
+      people: assignees.filter((member) => member.userId !== tw.info.assignedTo).map((member) => ({ id: member.userId, name: member.displayName })),
       onSubmit: async ({ personId, comment }) => {
         await ApiBinary.one('projectStudioTaskHandoverRequest', { projectId: pid, taskId: tw.taskId, assignedTo: personId, noteMd: comment, mentionUserIds: [personId] });
         cleanup();
@@ -11401,7 +11391,7 @@ async function openTaskWindow(opts = {}) {
   });
   const mentionPicker = body.querySelector('#ps-task-mentions');
   if (mentionPicker) {
-    mentionPicker.items = readers.map((member) => ({ id: member.user_id, name: member.display_name }));
+    mentionPicker.items = readers.map((member) => ({ id: member.userId, name: member.displayName }));
     body.querySelector('#ps-task-mention-toggle').addEventListener('click', () => { mentionPicker.hidden = !mentionPicker.hidden; if (!mentionPicker.hidden) mentionPicker.focusSearch(); });
     mentionPicker.addEventListener('change', () => { body.querySelector('#ps-task-mention-summary').textContent = mentionPicker.selectedItems.map((member) => `@${member.name}`).join(', '); });
   }
@@ -11433,7 +11423,7 @@ async function openTaskWindow(opts = {}) {
     const destinationId = event.detail.value;
     if (destinationId === pid) return;
     if (tw.attachments.length || uploads.busy) { body.querySelector('#ps-task-project').value = pid; body.querySelector('[data-task-project-hint]').hidden = false; return; }
-    const destination = descendantsOf(pid).find((project) => project.project_id === destinationId && canCreateTask(project.access));
+    const destination = descendantsOf(pid).find((project) => project.projectId === destinationId && canCreateTask(project.access));
     if (!destination) return;
     const draft = { taskType: tw.taskType, title: tw.title, descriptionMd: tw.descriptionMd, severity: tw.severity, priority: tw.priority, status: tw.status, dueDate: tw.dueDate };
     cleanup(); await switchProject(destinationId); await openTaskWindow({ draft });
@@ -11447,7 +11437,7 @@ async function openTaskWindow(opts = {}) {
       catch (error) { showError(`${t('task_link_copy_failed')}: ${error.message}`); }
       return;
     }
-    if (button.dataset.action === 'transfer') { openTaskTransferWindow(tw.info, state.project, async (result) => { cleanup(); await openProject(result.destination_project_id, { tab: 'tasks', taskId: result.task_id }); }); return; }
+    if (button.dataset.action === 'transfer') { openTaskTransferWindow(tw.info, state.project, async (result) => { cleanup(); await openProject(result.destinationProjectId, { tab: 'tasks', taskId: result.taskId }); }); return; }
     if (button.dataset.action === 'resolve') { openTaskResolutionWindow(tw.info, state.project, async () => { cleanup(); await renderTasksTab(); }); return; }
     if (button.dataset.action === 'archive') {
       try { await setTaskArchived(tw.taskId, !archived, pid); cleanup(); }
@@ -11468,7 +11458,7 @@ async function openTaskWindow(opts = {}) {
           severity: tw.taskType === 'defect' ? tw.severity : '', priority: tw.priority, status: tw.status, assignedTo: tw.assignedTo, dueDate: tw.dueDate,
           parentTaskId: tw.parentTaskId, linksJson: JSON.stringify(tw.links), attachmentsJson: JSON.stringify(tw.attachments) });
       }
-      toast(t('task_saved', { no: response.task_key || tw.info?.task_key }), 'success');
+      toast(t('task_saved', { no: response.taskKey || tw.info?.taskKey }), 'success');
       acknowledgeAttachmentUploads(pid, currentUserId(), tw.attachments);
       uploads.close(); galleryCleanup?.();
       cleanup();
@@ -11485,7 +11475,7 @@ async function openTaskWindow(opts = {}) {
   }
   signal.addEventListener('abort', () => {
     parentQuery += 1; galleryCleanup?.();
-    if (Router.currentParams()?.projectId === pid && Router.currentParams()?.taskKey === tw.info?.task_key) updateProjectRoute();
+    if (Router.currentParams()?.projectId === pid && Router.currentParams()?.taskKey === tw.info?.taskKey) updateProjectRoute();
   });
 }
 
@@ -11503,10 +11493,10 @@ async function setTaskArchived(taskId, archived, pid = projectId()) {
 function openTaskCommentEditor(comment, readers, onSaved) {
   const { body, foot, cleanup } = openWindow({ title: t('task_comment_edit_title'), icon: 'message', width: 620 });
   body.innerHTML = `<tf-textarea id="ps-comment-edit-body" label="${escapeAttr(t('task_comment_placeholder'))}" rows="5" autogrow></tf-textarea><tf-person-picker id="ps-comment-edit-mentions" multiple label="${escapeAttr(t('task_mentions_label'))}"></tf-person-picker><div class="ps-form-error" data-form-error hidden></div>`;
-  body.querySelector('#ps-comment-edit-body').value = comment.body_md;
+  body.querySelector('#ps-comment-edit-body').value = comment.bodyMd;
   const picker = body.querySelector('#ps-comment-edit-mentions');
-  picker.items = readers.map((member) => ({ id: member.user_id, name: member.display_name }));
-  picker.value = comment.mention_user_ids;
+  picker.items = readers.map((member) => ({ id: member.userId, name: member.displayName }));
+  picker.value = comment.mentionUserIds;
   foot.innerHTML = `<div></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" data-action="save">${escapeHtml(t('action_save'))}</tf-button></div>`;
   foot.addEventListener('click', async (event) => {
     const button = event.target.closest('[data-action]');
@@ -11515,7 +11505,7 @@ function openTaskCommentEditor(comment, readers, onSaved) {
     const bodyMd = body.querySelector('#ps-comment-edit-body').value.trim();
     if (!bodyMd) return;
     button.setAttribute('disabled', '');
-    try { await ApiBinary.one('projectStudioTaskCommentEditRequest', { projectId: projectId(), commentId: comment.comment_id, bodyMd, mentionUserIds: picker.value }); await onSaved(); cleanup(); }
+    try { await ApiBinary.one('projectStudioTaskCommentEditRequest', { projectId: projectId(), commentId: comment.commentId, bodyMd, mentionUserIds: picker.value }); await onSaved(); cleanup(); }
     catch (error) { button.removeAttribute('disabled'); const errorEl = body.querySelector('[data-form-error]'); errorEl.hidden = false; errorEl.textContent = `${t('task_comment_failed')}: ${error.message}`; }
   });
 }
@@ -11532,7 +11522,7 @@ function openTaskLinkWindow(sourceTaskId, onSaved) {
     const request = ++queryId;
     const response = await ApiBinary.one('projectStudioTasksListRequest', { projectId: projectId(), scope: 'descendants', sourceProjectIds: [], taskType: '', status: '', assignedTo: '', search: query, severity: '', offset: 0, limit: 50 });
     if (!target.isConnected || queryId !== request) return;
-    target.options = response.tasks.filter((task) => task.task_id !== sourceTaskId && !task.archived_at).map((task) => ({ value: task.task_id, label: `${task.task_key} · ${task.title}` }));
+    target.options = response.tasks.filter((task) => task.taskId !== sourceTaskId && !task.archivedAt).map((task) => ({ value: task.taskId, label: `${task.taskKey} · ${task.title}` }));
   };
   target.addEventListener('input', (event) => search(event.detail?.query || '').catch((error) => showError(error.message)));
   target.addEventListener('change', (event) => {
@@ -11590,7 +11580,7 @@ function updateBellBadges() {
 async function refreshNotifBadge() {
   try {
     const resp = await ApiBinary.one('projectStudioNotificationsListRequest', { onlyUnread: true, limit: 1 });
-    state.notifUnread = Number(fv(resp, 'unread_count') ?? 0);
+    state.notifUnread = Number(resp?.unreadCount ?? 0);
   } catch {
     // Backend not ready / offline — the badge simply stays as-is.
     return;
@@ -11604,7 +11594,7 @@ function installNotifListener() {
   ApiBinary.client()
     .then((client) => {
       client.addUnsolicitedListener(({ body }) => {
-        if (!body || body.variant !== 'UserNotification') return;
+        if (!body || body._variant !== 'SystemEventBody.UserNotification') return;
         const text = taskNotificationText(body, t) ?? orgNotificationText(body, t);
         const title = text ? text.title : body.title || t('notif_title');
         const message = text ? text.body : body.body;
@@ -11643,7 +11633,7 @@ async function openNotifWindow() {
     }
     listEl.innerHTML = `
       ${nw.items.map((n, i) => {
-        const unread = !fv(n, 'read_at');
+        const unread = !n?.readAt;
         const text = taskNotificationText(n, t) ?? orgNotificationText(n, t);
         return `
           <div class="ps-notif-item ${unread ? 'is-unread' : ''}" data-notif="${i}" role="button" tabindex="0">
@@ -11651,7 +11641,7 @@ async function openNotifWindow() {
             <div class="ps-notif-main">
               <div class="ps-notif-title">${escapeHtml(text ? text.title : n.title || t(`nk_${n.kind}`))}</div>
               <div class="ps-notif-body">${escapeHtml(text ? text.body : n.body || '')}</div>
-              <div class="ps-notif-meta">${escapeHtml(fv(n, 'project_name') || '')} · ${escapeHtml(formatTimestamp(fv(n, 'created_at')))}</div>
+              <div class="ps-notif-meta">${escapeHtml(n?.projectName || '')} · ${escapeHtml(formatTimestamp(n?.createdAt))}</div>
             </div>
             ${unread ? '<span class="ps-notif-dot"></span>' : ''}
           </div>
@@ -11670,8 +11660,8 @@ async function openNotifWindow() {
       });
       const rows = Array.isArray(resp.notifications) ? resp.notifications : [];
       nw.items = beforeId ? nw.items.concat(rows) : rows;
-      nw.hasMore = !!fv(resp, 'has_more');
-      state.notifUnread = Number(fv(resp, 'unread_count') ?? state.notifUnread);
+      nw.hasMore = !!resp?.hasMore;
+      state.notifUnread = Number(resp?.unreadCount ?? state.notifUnread);
       updateBellBadges();
       renderList();
     } catch (err) {
@@ -11685,17 +11675,17 @@ async function openNotifWindow() {
     const more = e.target.closest('[data-notif-more]');
     if (more) {
       const last = nw.items[nw.items.length - 1];
-      if (last) loadPage(fv(last, 'notification_id'));
+      if (last) loadPage(last?.notificationId);
       return;
     }
     const item = e.target.closest('[data-notif]');
     if (!item) return;
     const n = nw.items[Number(item.dataset.notif)];
     if (!n) return;
-    if (!fv(n, 'read_at')) {
+    if (!n?.readAt) {
       try {
-        await ApiBinary.one('projectStudioNotificationsMarkReadRequest', { notificationIds: [fv(n, 'notification_id')] });
-        n.read_at = new Date().toISOString();
+        await ApiBinary.one('projectStudioNotificationsMarkReadRequest', { notificationIds: [n?.notificationId] });
+        n.readAt = new Date().toISOString();
         state.notifUnread = Math.max(0, state.notifUnread - 1);
         updateBellBadges();
         renderList();
@@ -11704,12 +11694,12 @@ async function openNotifWindow() {
     // Deep link: run / generation / task notifications navigate straight into
     // the run detail, the generation detail or the task window.
     let link = null;
-    try { link = JSON.parse(fv(n, 'link_json') || 'null'); } catch { link = null; }
+    try { link = JSON.parse(n?.linkJson || 'null'); } catch { link = null; }
     const runId = link && (link.run_id || (link.kind === 'run' ? link.id : null));
     const genId = link && link.gen_id;
     const taskId = link && link.task_id;
     const environmentId = link && link.environment_id;
-    const pid = fv(n, 'project_id');
+    const pid = n?.projectId;
     if (!pid || !(runId || genId || taskId || environmentId)) return;
     cleanup();
     const sameProject = state.project && projectId() === pid;
@@ -11751,7 +11741,7 @@ async function openNotifWindow() {
     if (btn.dataset.action === 'mark-all') {
       try {
         await ApiBinary.one('projectStudioNotificationsMarkReadRequest', { notificationIds: [] });
-        nw.items.forEach((n) => { if (!fv(n, 'read_at')) n.read_at = new Date().toISOString(); });
+        nw.items.forEach((n) => { if (!n?.readAt) n.readAt = new Date().toISOString(); });
         state.notifUnread = 0;
         updateBellBadges();
         renderList();
@@ -11823,12 +11813,12 @@ async function openMyWorkWindow() {
     <div class="ps-mywork-row" data-mywork="${i}" role="button" tabindex="0">
       <div class="ps-notif-ico">${sprite('play')}</div>
       <div class="ps-notif-main">
-        <div class="ps-notif-title">#${fv(entry, 'run_no')} ${escapeHtml(fv(entry, 'run_name') || '')}</div>
-        <div class="ps-notif-meta">${escapeHtml(fv(entry, 'project_name') || '')}</div>
+        <div class="ps-notif-title">#${entry?.runNo} ${escapeHtml(entry?.runName || '')}</div>
+        <div class="ps-notif-meta">${escapeHtml(entry?.projectName || '')}</div>
       </div>
       <div class="ps-mywork-counts">
-        <tf-chip status="info">${escapeHtml(t('mywork_pending', { count: Number(fv(entry, 'items_pending') ?? 0) }))}</tf-chip>
-        ${Number(fv(entry, 'items_in_progress') ?? 0) > 0 ? `<tf-chip status="accent">${escapeHtml(t('mywork_in_progress', { count: Number(fv(entry, 'items_in_progress') ?? 0) }))}</tf-chip>` : ''}
+        <tf-chip status="info">${escapeHtml(t('mywork_pending', { count: Number(entry?.itemsPending ?? 0) }))}</tf-chip>
+        ${Number(entry?.itemsInProgress ?? 0) > 0 ? `<tf-chip status="accent">${escapeHtml(t('mywork_in_progress', { count: Number(entry?.itemsInProgress ?? 0) }))}</tf-chip>` : ''}
       </div>
     </div>
   `).join('');
@@ -11838,8 +11828,8 @@ async function openMyWorkWindow() {
     const entry = entries[Number(row.dataset.mywork)];
     if (!entry) return;
     cleanup();
-    const pid = fv(entry, 'project_id');
-    const runId = fv(entry, 'run_id');
+    const pid = entry?.projectId;
+    const runId = entry?.runId;
     if (state.project && projectId() === pid) await openRunDetailFromNotif(runId);
     else await openProject(pid, { tab: 'tests', runId });
   });
@@ -11854,7 +11844,7 @@ async function loadSchedules(force = false) {
   if (s.schedules.loaded && !force) return s.schedules.rows;
   const resp = await ApiBinary.one('projectStudioSchedulesListRequest', { projectId: projectId() });
   s.schedules.rows = Array.isArray(resp.schedules) ? resp.schedules : [];
-  s.schedules.serverTimezone = fv(resp, 'server_timezone') || '';
+  s.schedules.serverTimezone = resp?.serverTimezone || '';
   s.schedules.loaded = true;
   return s.schedules.rows;
 }
@@ -11863,14 +11853,14 @@ async function loadSchedules(force = false) {
 // though its "enabled" switch is on — that state is the one worth shouting
 // about, so it drives both the row accent and the result pill.
 function scheduleBlocked(row) {
-  const runType = fv(row, 'run_type');
+  const runType = row?.runType;
   if (runType !== 'auto' && runType !== 'perf') return false;
-  return fv(row, 'environment_status') !== 'approved';
+  return row?.environmentStatus !== 'approved';
 }
 
 function scheduleModeLabel(row) {
-  const kind = fv(row, 'schedule_kind');
-  const expr = fv(row, 'schedule_expr') || '';
+  const kind = row?.scheduleKind;
+  const expr = row?.scheduleExpr || '';
   if (kind === 'cron') {
     const match = DAILY_CRON_RE.exec(expr.trim());
     const time = match ? `${String(match[2]).padStart(2, '0')}:${String(match[1]).padStart(2, '0')}` : expr;
@@ -11882,9 +11872,9 @@ function scheduleModeLabel(row) {
 
 function scheduleLastChip(row) {
   if (scheduleBlocked(row)) return chipCell('warn', t('sch_last_blocked'));
-  if (fv(row, 'auto_disabled')) return chipCell('err', t('sch_last_auto_disabled'));
+  if (row?.autoDisabled) return chipCell('err', t('sch_last_auto_disabled'));
   if (!row.enabled) return chipCell('info', t('sch_last_off'));
-  const status = fv(row, 'last_status') || '';
+  const status = row?.lastStatus || '';
   if (!status) return chipCell('info', t('sch_last_never'));
   // last_status is either a run status or a trigger outcome, depending on
   // whether the last attempt actually started a run.
@@ -11899,9 +11889,9 @@ function scheduleLastChip(row) {
 
 function scheduleNextCell(row) {
   if (!row.enabled) return `<span style="color:var(--text-3)">${escapeHtml(t('sch_next_disabled'))}</span>`;
-  if (fv(row, 'auto_disabled')) return `<span style="color:var(--danger)">${escapeHtml(t('sch_next_auto_disabled'))}</span>`;
+  if (row?.autoDisabled) return `<span style="color:var(--danger)">${escapeHtml(t('sch_next_auto_disabled'))}</span>`;
   if (scheduleBlocked(row)) return `<span style="color:var(--warning)">${escapeHtml(t('sch_next_blocked'))}</span>`;
-  const next = fv(row, 'next_run_at');
+  const next = row?.nextRunAt;
   if (!next) return `<span style="color:var(--text-3)">—</span>`;
   return `<span>${escapeHtml(formatTimestamp(next))}</span>`;
 }
@@ -11910,12 +11900,12 @@ function visibleSchedules() {
   const flt = f2().schedules;
   const query = flt.search.trim().toLowerCase();
   return f2().schedules.rows.filter((row) => {
-    if (flt.kind && fv(row, 'schedule_kind') !== flt.kind) return false;
+    if (flt.kind && row?.scheduleKind !== flt.kind) return false;
     if (flt.status === 'enabled' && !row.enabled) return false;
     if (flt.status === 'disabled' && row.enabled) return false;
-    if (flt.status === 'blocked' && !scheduleBlocked(row) && !fv(row, 'auto_disabled')) return false;
+    if (flt.status === 'blocked' && !scheduleBlocked(row) && !row?.autoDisabled) return false;
     if (query) {
-      const haystack = `${row.name} ${fv(row, 'suite_name') || ''} ${fv(row, 'environment_name') || ''}`.toLowerCase();
+      const haystack = `${row.name} ${row?.suiteName || ''} ${row?.environmentName || ''}`.toLowerCase();
       if (!haystack.includes(query)) return false;
     }
     return true;
@@ -11937,8 +11927,8 @@ async function renderSchedulesView(reload = true) {
   if (state.tab !== 'tests' || s.view !== 'schedules') return;
 
   const rows = visibleSchedules();
-  const blocked = s.schedules.rows.filter((row) => scheduleBlocked(row) || fv(row, 'auto_disabled')).length;
-  const active = s.schedules.rows.filter((row) => row.enabled && !fv(row, 'auto_disabled')).length;
+  const blocked = s.schedules.rows.filter((row) => scheduleBlocked(row) || row?.autoDisabled).length;
+  const active = s.schedules.rows.filter((row) => row.enabled && !row?.autoDisabled).length;
 
   host.innerHTML = `
     <div class="ps-tests-toolbar ps-sch-toolbar">
@@ -11997,19 +11987,19 @@ async function renderSchedulesView(reload = true) {
     const dim = row.enabled ? '' : 'opacity:.62;';
     const accent = isBlocked ? 'border-left:3px solid var(--warning); padding-left:8px;' : '';
     const sub = [
-      fv(row, 'suite_name') ? t('sch_sub_suite', { suite: fv(row, 'suite_name'), count: Number(fv(row, 'cases_count') ?? 0) })
-        : t('sch_sub_cases', { count: Number(fv(row, 'cases_count') ?? 0) }),
-      fv(row, 'environment_name') || t('sch_sub_no_env'),
-      t(`run_type_${fv(row, 'run_type')}`),
+      row?.suiteName ? t('sch_sub_suite', { suite: row?.suiteName, count: Number(row?.casesCount ?? 0) })
+        : t('sch_sub_cases', { count: Number(row?.casesCount ?? 0) }),
+      row?.environmentName || t('sch_sub_no_env'),
+      t(`run_type_${row?.runType}`),
     ].join(' · ');
     return {
-      _id: fv(row, 'schedule_id'),
+      _id: row?.scheduleId,
       _row: row,
       name: `
         <div style="display:flex; flex-direction:column; gap:3px; ${dim} ${accent}">
           <span style="font-weight:700">${escapeHtml(row.name)}</span>
           <span style="font-size:11px; color:var(--text-3)">${escapeHtml(sub)}</span>
-          ${fv(row, 'auto_disabled') ? `<span style="font-size:11px; color:var(--danger)">${escapeHtml(t('sch_auto_disabled_badge', { count: Number(fv(row, 'consecutive_failures') ?? 0) }))}</span>` : ''}
+          ${row?.autoDisabled ? `<span style="font-size:11px; color:var(--danger)">${escapeHtml(t('sch_auto_disabled_badge', { count: Number(row?.consecutiveFailures ?? 0) }))}</span>` : ''}
         </div>
       `,
       mode: scheduleModeLabel(row),
@@ -12046,7 +12036,7 @@ function buildScheduleRowActions(row, live = () => row) {
       if (!canArea('tests', 'admin') || (enabled && !canRunSchedule(live()))) return;
       try {
         await ApiBinary.one('projectStudioScheduleSetEnabledRequest', {
-          projectId: projectId(), scheduleId: fv(live(), 'schedule_id'), enabled,
+          projectId: projectId(), scheduleId: live()?.scheduleId, enabled,
         });
         toast(t(enabled ? 'sch_enabled_ok' : 'sch_disabled_ok'), 'success');
       } catch (err) {
@@ -12082,11 +12072,11 @@ function buildScheduleRowActions(row, live = () => row) {
 function buildScheduleExpansion(row) {
   const wrap = document.createElement('div');
   wrap.className = 'ps-item-expansion';
-  const preview = Array.isArray(fv(row, 'next_runs_preview')) ? fv(row, 'next_runs_preview') : [];
-  const reason = fv(row, 'last_reason') || '';
+  const preview = Array.isArray(row?.nextRunsPreview) ? row?.nextRunsPreview : [];
+  const reason = row?.lastReason || '';
   wrap.innerHTML = `
     ${scheduleBlocked(row) ? `<div class="ps-banner-warn">${sprite('alert')}<span>${escapeHtml(t('sch_blocked_banner'))}</span></div>` : ''}
-    ${fv(row, 'auto_disabled') ? `<div class="ps-banner-warn">${sprite('alert')}<span>${escapeHtml(t('sch_breaker_banner'))}</span></div>` : ''}
+    ${row?.autoDisabled ? `<div class="ps-banner-warn">${sprite('alert')}<span>${escapeHtml(t('sch_breaker_banner'))}</span></div>` : ''}
     ${reason ? `<div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('sch_reason_prefix', { reason }))}</span></div>` : ''}
     <div class="ps-field-label">${escapeHtml(t('sch_preview_label'))}</div>
     <div class="ps-sch-preview">
@@ -12095,10 +12085,10 @@ function buildScheduleExpansion(row) {
         : `<span class="ps-field-hint">${escapeHtml(t('sch_preview_empty'))}</span>`}
     </div>
     <div class="ps-case-info-list">
-      <div><span>${escapeHtml(t('sch_info_timezone'))}</span><b>${escapeHtml(fv(row, 'timezone') || f2().schedules.serverTimezone || '—')}</b></div>
-      <div><span>${escapeHtml(t('sch_info_runner'))}</span><b>${escapeHtml(fv(row, 'runner_display_name') || t('run_runner_auto'))}</b></div>
-      <div><span>${escapeHtml(t('sch_info_last_trigger'))}</span><b>${escapeHtml(fv(row, 'last_trigger_at') ? formatTimestamp(fv(row, 'last_trigger_at')) : '—')}</b></div>
-      <div><span>${escapeHtml(t('sch_info_created_by'))}</span><b>${escapeHtml(fv(row, 'created_by_name') || '—')}</b></div>
+      <div><span>${escapeHtml(t('sch_info_timezone'))}</span><b>${escapeHtml(row?.timezone || f2().schedules.serverTimezone || '—')}</b></div>
+      <div><span>${escapeHtml(t('sch_info_runner'))}</span><b>${escapeHtml(row?.runnerDisplayName || t('run_runner_auto'))}</b></div>
+      <div><span>${escapeHtml(t('sch_info_last_trigger'))}</span><b>${escapeHtml(row?.lastTriggerAt ? formatTimestamp(row?.lastTriggerAt) : '—')}</b></div>
+      <div><span>${escapeHtml(t('sch_info_created_by'))}</span><b>${escapeHtml(row?.createdByName || '—')}</b></div>
     </div>
   `;
   return wrap;
@@ -12106,16 +12096,16 @@ function buildScheduleExpansion(row) {
 
 async function runScheduleNow(row) {
   if (!canRunSchedule(row)) return;
-  const scheduleId = fv(row, 'schedule_id');
+  const scheduleId = row?.scheduleId;
   try {
     const resp = await ApiBinary.one('projectStudioScheduleRunNowRequest', { projectId: projectId(), scheduleId });
     const outcome = String(resp.outcome || '');
     const reason = String(resp.reason || '');
-    const runNo = Number(fv(resp, 'run_no') ?? 0);
+    const runNo = Number(resp?.runNo ?? 0);
     if (outcome === 'started') {
       toast(t('sch_run_started', { no: runNo }), 'success');
-      const runId = fv(resp, 'run_id');
-      if (runId) await openRunByType(runId, fv(row, 'run_type'));
+      const runId = resp?.runId;
+      if (runId) await openRunByType(runId, row?.runType);
       return;
     }
     toast(t('sch_run_refused', { outcome: t(`sch_outcome_${outcome}`), reason: reason || '—' }), outcome === 'error' ? 'error' : 'info');
@@ -12137,7 +12127,7 @@ function confirmDeleteSchedule(row) {
     onConfirm: async () => {
       await ApiBinary.one('projectStudioScheduleDeleteRequest', {
         projectId: projectId(),
-        scheduleId: fv(row, 'schedule_id'),
+        scheduleId: row?.scheduleId,
       });
       toast(t('sch_deleted_ok'), 'success');
       await renderSchedulesView();
@@ -12157,7 +12147,7 @@ async function openScheduleRunsWindow(row) {
   try {
     const resp = await ApiBinary.one('projectStudioScheduleRunsListRequest', {
       projectId: projectId(),
-      scheduleId: fv(row, 'schedule_id'),
+      scheduleId: row?.scheduleId,
       limit: SCHEDULE_RUNS_LIMIT,
     });
     runs = Array.isArray(resp.runs) ? resp.runs : [];
@@ -12181,19 +12171,19 @@ async function openScheduleRunsWindow(row) {
   `;
   const table = body.querySelector('#ps-sch-runs-table');
   table.rows = runs.map((entry) => ({
-    _runId: fv(entry, 'run_id'),
-    fired: formatTimestamp(fv(entry, 'fired_at')),
-    scheduled: formatTimestamp(fv(entry, 'scheduled_for')),
+    _runId: entry?.runId,
+    fired: formatTimestamp(entry?.firedAt),
+    scheduled: formatTimestamp(entry?.scheduledFor),
     outcome: chipCell(SCHEDULE_OUTCOME_CHIP[entry.outcome] || 'info', t(`sch_outcome_${entry.outcome}`)),
     reason: entry.reason || '—',
-    run: Number(fv(entry, 'run_no') ?? 0) > 0 ? `#${fv(entry, 'run_no')}` : '—',
-    actor: fv(entry, 'actor_name') || t('sch_actor_loop'),
+    run: Number(entry?.runNo ?? 0) > 0 ? `#${entry?.runNo}` : '—',
+    actor: entry?.actorName || t('sch_actor_loop'),
   }));
   table.addEventListener('row-click', async (e) => {
     const runId = e.detail?.row?._runId;
     if (!runId) return;
     closeAllWindows();
-    await openRunByType(runId, fv(row, 'run_type'));
+    await openRunByType(runId, row?.runType);
   });
 }
 
@@ -12261,35 +12251,35 @@ function openScheduleWindow(schedule) {
 
   const s = f2();
   const serverZone = s.schedules.serverTimezone || '';
-  const kind = editing ? (fv(schedule, 'schedule_kind') || 'interval') : 'interval';
+  const kind = editing ? (schedule?.scheduleKind || 'interval') : 'interval';
   const sw = {
-    runType: editing ? (fv(schedule, 'run_type') || 'auto') : canTryRun() ? 'auto' : 'manual',
-    source: editing && !fv(schedule, 'suite_id') ? 'cases' : 'suite',
-    suiteId: editing ? (fv(schedule, 'suite_id') || '') : '',
-    caseIds: new Set(editing && Array.isArray(fv(schedule, 'case_ids')) ? fv(schedule, 'case_ids') : []),
-    environmentId: editing ? (fv(schedule, 'environment_id') || '') : '',
-    runnerServiceId: editing ? (fv(schedule, 'runner_service_id') || '') : '',
-    mode: editing ? (fv(schedule, 'assignment_mode') || 'pool') : 'pool',
-    assignees: new Set(editing && Array.isArray(fv(schedule, 'assignees')) ? fv(schedule, 'assignees') : []),
+    runType: editing ? (schedule?.runType || 'auto') : canTryRun() ? 'auto' : 'manual',
+    source: editing && !schedule?.suiteId ? 'cases' : 'suite',
+    suiteId: editing ? (schedule?.suiteId || '') : '',
+    caseIds: new Set(editing && Array.isArray(schedule?.caseIds) ? schedule?.caseIds : []),
+    environmentId: editing ? (schedule?.environmentId || '') : '',
+    runnerServiceId: editing ? (schedule?.runnerServiceId || '') : '',
+    mode: editing ? (schedule?.assignmentMode || 'pool') : 'pool',
+    assignees: new Set(editing && Array.isArray(schedule?.assignees) ? schedule?.assignees : []),
     kind,
-    timezone: editing ? (fv(schedule, 'timezone') || serverZone) : serverZone,
+    timezone: editing ? (schedule?.timezone || serverZone) : serverZone,
     pool: [],
     busy: false,
   };
   const perf = (() => {
     try {
-      const parsed = JSON.parse(fv(schedule, 'perf_profile_json') || '{}');
+      const parsed = JSON.parse(schedule?.perfProfileJson || '{}');
       return { ...PERF_DEFAULT_PROFILE, ...(parsed && typeof parsed === 'object' ? parsed : {}) };
     } catch {
       return { ...PERF_DEFAULT_PROFILE };
     }
   })();
   const exprValue = {
-    interval: kind === 'interval' ? (fv(schedule, 'schedule_expr') || '') : '',
-    cron: kind === 'cron' ? cronToTime(fv(schedule, 'schedule_expr')) : '',
-    once: kind === 'once' ? isoToLocalInput(fv(schedule, 'schedule_expr')) : '',
+    interval: kind === 'interval' ? (schedule?.scheduleExpr || '') : '',
+    cron: kind === 'cron' ? cronToTime(schedule?.scheduleExpr) : '',
+    once: kind === 'once' ? isoToLocalInput(schedule?.scheduleExpr) : '',
   };
-  const preview = editing && Array.isArray(fv(schedule, 'next_runs_preview')) ? fv(schedule, 'next_runs_preview') : [];
+  const preview = editing && Array.isArray(schedule?.nextRunsPreview) ? schedule?.nextRunsPreview : [];
 
   body.innerHTML = `
     <tf-input id="ps-sch-name" label="${escapeAttr(t('sch_name_label'))}" placeholder="${escapeAttr(t('sch_name_placeholder'))}"
@@ -12474,8 +12464,8 @@ function openScheduleWindow(schedule) {
   const syncEnvWarning = () => {
     const warn = body.querySelector('[data-sch-env-warn]');
     if (!warn) return;
-    const env = (f2().envs.rows || []).find((e) => fv(e, 'environment_id') === sw.environmentId);
-    warn.hidden = !isAutomated() || !sw.environmentId || fv(env, 'approval_status') === 'approved';
+    const env = (f2().envs.rows || []).find((e) => e?.environmentId === sw.environmentId);
+    warn.hidden = !isAutomated() || !sw.environmentId || env?.approvalStatus === 'approved';
   };
 
   const renderCasePool = () => {
@@ -12486,7 +12476,7 @@ function openScheduleWindow(schedule) {
       return;
     }
     hostEl.innerHTML = sw.pool.map((c) => {
-      const caseId = fv(c, 'case_id');
+      const caseId = c?.caseId;
       return `
         <div class="ps-pane-row">
           <tf-checkbox data-sch-case="${escapeAttr(caseId)}" ${sw.caseIds.has(caseId) ? 'checked' : ''}></tf-checkbox>
@@ -12515,12 +12505,12 @@ function openScheduleWindow(schedule) {
       return;
     }
     hostEl.innerHTML = testers.map((m) => {
-      const userId = fv(m, 'user_id');
+      const userId = m?.userId;
       return `
         <div class="ps-pane-row">
           <tf-checkbox data-sch-assignee="${escapeAttr(userId)}" ${sw.assignees.has(userId) ? 'checked' : ''}></tf-checkbox>
           <div class="ps-pane-row-main">
-            <div class="ps-pane-row-title">${escapeHtml(fv(m, 'display_name') || '')}</div>
+            <div class="ps-pane-row-title">${escapeHtml(m?.displayName || '')}</div>
             ${functionChips(m.functions)}
           </div>
         </div>
@@ -12620,7 +12610,7 @@ function openScheduleWindow(schedule) {
     try {
       const resp = await ApiBinary.one('projectStudioScheduleSaveRequest', {
         projectId: projectId(),
-        scheduleId: editing ? fv(schedule, 'schedule_id') : null,
+        scheduleId: editing ? schedule?.scheduleId : null,
         name,
         runType: sw.runType,
         suiteId: sw.source === 'suite' ? sw.suiteId : '',
@@ -12635,7 +12625,7 @@ function openScheduleWindow(schedule) {
         timezone: sw.timezone || serverZone,
         enabled: !!body.querySelector('#ps-sch-enabled')?.checked,
       });
-      const nextAt = fv(resp, 'next_run_at');
+      const nextAt = resp?.nextRunAt;
       toast(nextAt ? t('sch_saved_next', { at: formatTimestamp(nextAt) }) : t('sch_saved'), 'success');
       cleanup();
       f2().schedules.loaded = false;
@@ -12667,7 +12657,7 @@ function openScheduleWindow(schedule) {
     }
     body.querySelector('#ps-sch-suite')?.setOptions([
       { value: '', label: t('assign_choose') },
-      ...suites.map((su) => ({ value: fv(su, 'suite_id'), label: `${su.name} (${Number(fv(su, 'case_count') ?? 0)})` })),
+      ...suites.map((su) => ({ value: su?.suiteId, label: `${su.name} (${Number(su?.caseCount ?? 0)})` })),
     ], sw.suiteId);
     try {
       const resp = await ApiBinary.one('projectStudioCasesListRequest', {
@@ -12688,15 +12678,15 @@ function openScheduleWindow(schedule) {
     const approved = approvedEnvironments();
     body.querySelector('#ps-sch-env')?.setOptions([
       { value: '', label: approved.length ? t('assign_choose') : t('run_env_none') },
-      ...approved.map((env) => ({ value: fv(env, 'environment_id'), label: `${env.name} — ${fv(env, 'base_url')}` })),
+      ...approved.map((env) => ({ value: env?.environmentId, label: `${env.name} — ${env?.baseUrl}` })),
     ], sw.environmentId);
     syncEnvWarning();
     await loadRunners();
     body.querySelector('#ps-sch-runner')?.setOptions([
       { value: '', label: t('run_runner_auto') },
       ...(f2().runners || []).map((r) => ({
-        value: fv(r, 'service_id'),
-        label: `${fv(r, 'display_name') || fv(r, 'engine_id')} — ${runnerToolchainLabel(r)}`,
+        value: r?.serviceId,
+        label: `${r?.displayName || r?.engineId} — ${runnerToolchainLabel(r)}`,
       })),
     ], sw.runnerServiceId);
   })();
@@ -12715,7 +12705,7 @@ async function loadMlLinks() {
   const conn = connections();
   const resp = await ApiBinary.one('projectStudioMlLinksListRequest', { projectId: projectId() });
   conn.links = Array.isArray(resp.links) ? resp.links : [];
-  conn.canManage = !!fv(resp, 'can_manage') && canArea('settings', 'write') && canArea('repos', 'write');
+  conn.canManage = !!resp?.canManage && canArea('settings', 'write') && canArea('repos', 'write');
   conn.loaded = true;
   return conn.links;
 }
@@ -12723,10 +12713,10 @@ async function loadMlLinks() {
 // The wire deep link is a dashboard route ("ml-studio?projectId=..."); anything
 // unparseable still lands on the ML Studio project route.
 function openMlStudio(link) {
-  const mlProjectId = fv(link, 'ml_project_id');
+  const mlProjectId = link?.mlProjectId;
   let view = 'ml-studio';
   const params = { projectId: mlProjectId };
-  const raw = String(fv(link.summary || {}, 'deep_link') || '').trim().replace(/^#?\/?/, '');
+  const raw = String((link.summary || {}).deepLink || '').trim().replace(/^#?\/?/, '');
   if (raw) {
     const [path, query] = raw.split('?');
     if (/^[a-z0-9-]+$/.test(path)) view = path;
@@ -12742,7 +12732,7 @@ function openMlStudio(link) {
 function mlMetricChips(summary) {
   let metrics = null;
   try {
-    metrics = JSON.parse(fv(summary, 'last_training_metrics_json') || '{}');
+    metrics = JSON.parse(summary?.lastTrainingMetricsJson || '{}');
   } catch {
     metrics = null;
   }
@@ -12755,21 +12745,21 @@ function mlMetricChips(summary) {
 
 function mlCardHtml(link) {
   const summary = link.summary || null;
-  const linkId = fv(link, 'link_id');
-  const canOpen = !!fv(link, 'can_open');
-  const training = summary ? !!fv(summary, 'training_in_progress') : false;
-  const lastStatus = summary ? String(fv(summary, 'last_training_status') || '') : '';
+  const linkId = link?.linkId;
+  const canOpen = !!link?.canOpen;
+  const training = summary ? !!summary?.trainingInProgress : false;
+  const lastStatus = summary ? String(summary?.lastTrainingStatus || '') : '';
   const statusChip = !summary
     ? `<tf-chip status="err" dot>${escapeHtml(t('ml_summary_unavailable'))}</tf-chip>`
     : (training
       ? `<tf-chip status="accent" dot>${escapeHtml(t('ml_training_running'))}</tf-chip>`
       : `<tf-chip status="${lastStatus === 'completed' ? 'ok' : (lastStatus ? 'warn' : 'info')}" dot>${escapeHtml(lastStatus ? t('ml_training_last', { status: lastStatus }) : t('ml_training_none'))}</tf-chip>`);
-  const models = summary && Array.isArray(fv(summary, 'models')) ? fv(summary, 'models') : [];
+  const models = summary && Array.isArray(summary?.models) ? summary?.models : [];
   const metrics = summary ? mlMetricChips(summary) : [];
-  const syncChip = fv(link, 'sync_permissions')
+  const syncChip = link?.syncPermissions
     ? `<tf-chip status="accent">${sprite('refresh')} ${escapeHtml(t('ml_sync_on'))}</tf-chip>`
     : `<tf-chip status="info">${escapeHtml(t('ml_sync_off'))}</tf-chip>`;
-  const lastSyncResult = fv(link, 'last_sync_result') || '';
+  const lastSyncResult = link?.lastSyncResult || '';
 
   const menuItems = [
     `<tf-menu-item action="open" icon="external-link" ${canOpen ? '' : 'disabled'}>${escapeHtml(t('ml_open'))}</tf-menu-item>`,
@@ -12786,9 +12776,9 @@ function mlCardHtml(link) {
       <div class="ps-ml-top">
         <div class="ps-card-ico">${sprite('brain')}</div>
         <div class="ps-ml-heading">
-          <div class="ps-ml-name">${escapeHtml(fv(link, 'label') || (summary ? summary.name : fv(link, 'ml_project_id')))}${statusChip}</div>
+          <div class="ps-ml-name">${escapeHtml(link?.label || (summary ? summary.name : link?.mlProjectId))}${statusChip}</div>
           <div class="ps-ml-desc">${escapeHtml(summary
-            ? t('ml_card_desc', { type: fv(summary, 'project_type_label') || fv(summary, 'project_type') || '—' })
+            ? t('ml_card_desc', { type: summary?.projectTypeLabel || summary?.projectType || '—' })
             : t('ml_card_desc_unavailable'))}</div>
         </div>
         <div class="ps-card-menu-wrap">
@@ -12800,15 +12790,15 @@ function mlCardHtml(link) {
       ${training ? `
         <div class="ps-ml-progress">
           <div class="ps-ml-progress-track"><span></span></div>
-          <div class="ps-ml-progress-text"><tf-spinner size="sm"></tf-spinner>${escapeHtml(t('ml_training_progress', { started: formatTimestamp(fv(summary, 'last_training_started_at')) }))}</div>
+          <div class="ps-ml-progress-text"><tf-spinner size="sm"></tf-spinner>${escapeHtml(t('ml_training_progress', { started: formatTimestamp(summary?.lastTrainingStartedAt) }))}</div>
         </div>
       ` : ''}
       ${summary ? `
         <div class="ps-ml-stats">
           ${metrics.map((m) => `<span class="ps-ml-stat">${escapeHtml(m.key)} <b>${escapeHtml(String(m.value))}</b></span>`).join('')}
-          <span class="ps-ml-stat">${escapeHtml(t('ml_stat_datasets'))} <b>${Number(fv(summary, 'dataset_count') ?? 0)}</b></span>
-          <span class="ps-ml-stat">${escapeHtml(t('ml_stat_models'))} <b>${Number(fv(summary, 'model_count') ?? 0)}</b></span>
-          ${fv(summary, 'last_training_finished_at') ? `<span class="ps-ml-stat">${escapeHtml(t('ml_stat_trained'))} <b>${escapeHtml(formatTimestamp(fv(summary, 'last_training_finished_at')))}</b></span>` : ''}
+          <span class="ps-ml-stat">${escapeHtml(t('ml_stat_datasets'))} <b>${Number(summary?.datasetCount ?? 0)}</b></span>
+          <span class="ps-ml-stat">${escapeHtml(t('ml_stat_models'))} <b>${Number(summary?.modelCount ?? 0)}</b></span>
+          ${summary?.lastTrainingFinishedAt ? `<span class="ps-ml-stat">${escapeHtml(t('ml_stat_trained'))} <b>${escapeHtml(formatTimestamp(summary?.lastTrainingFinishedAt))}</b></span>` : ''}
         </div>
       ` : ''}
       <div class="ps-ml-foot">
@@ -12863,17 +12853,17 @@ async function renderConnections() {
     const openBtn = e.target.closest('[data-ml-open]');
     if (openBtn && !openBtn.hasAttribute('disabled')) {
       const card = openBtn.closest('[data-ml-link]');
-      const link = conn.links.find((l) => fv(l, 'link_id') === card?.dataset.mlLink);
+      const link = conn.links.find((l) => l?.linkId === card?.dataset.mlLink);
       if (link) openMlStudio(link);
     }
   });
   grid?.addEventListener('action', async (e) => {
     const card = e.target.closest('[data-ml-link]');
     if (!card || !e.target.closest('[data-ml-menu]')) return;
-    const link = conn.links.find((l) => fv(l, 'link_id') === card.dataset.mlLink);
+    const link = conn.links.find((l) => l?.linkId === card.dataset.mlLink);
     if (!link) return;
     switch (e.detail?.action) {
-      case 'open': if (fv(link, 'can_open')) openMlStudio(link); break;
+      case 'open': if (link?.canOpen) openMlStudio(link); break;
       case 'settings': openMlSettingsWindow(link); break;
       case 'sync': await syncMlLink(link); break;
       case 'detach': confirmDetachMlLink(link); break;
@@ -12886,14 +12876,14 @@ async function syncMlLink(link) {
   try {
     const resp = await ApiBinary.one('projectStudioMlLinkSyncNowRequest', {
       projectId: projectId(),
-      linkId: fv(link, 'link_id'),
+      linkId: link?.linkId,
     });
     const outcome = resp.outcome || {};
     const errors = Array.isArray(outcome.errors) ? outcome.errors : [];
     const summary = t('ml_sync_result', {
-      added: Number(fv(outcome, 'applied_add') ?? 0),
-      updated: Number(fv(outcome, 'applied_update') ?? 0),
-      removed: Number(fv(outcome, 'applied_remove') ?? 0),
+      added: Number(outcome?.appliedAdd ?? 0),
+      updated: Number(outcome?.appliedUpdate ?? 0),
+      removed: Number(outcome?.appliedRemove ?? 0),
       skipped: Number(outcome.skipped ?? 0),
     });
     toast(errors.length ? `${summary} — ${errors.join('; ')}` : summary, errors.length ? 'error' : 'success');
@@ -12904,7 +12894,7 @@ async function syncMlLink(link) {
 }
 
 function confirmDetachMlLink(link) {
-  const name = fv(link, 'label') || (link.summary ? link.summary.name : fv(link, 'ml_project_id'));
+  const name = link?.label || (link.summary ? link.summary.name : link?.mlProjectId);
   openDeleteWindow({
     title: t('ml_detach_title'),
     targetName: name,
@@ -12922,10 +12912,10 @@ function confirmDetachMlLink(link) {
     onConfirm: async (dialogBody) => {
       const resp = await ApiBinary.one('projectStudioMlLinkDetachRequest', {
         projectId: projectId(),
-        linkId: fv(link, 'link_id'),
+        linkId: link?.linkId,
         revokeMembers: !!dialogBody.querySelector('#ps-ml-revoke')?.checked,
       });
-      toast(t('ml_detached_ok', { count: Number(fv(resp, 'members_removed') ?? 0) }), 'success');
+      toast(t('ml_detached_ok', { count: Number(resp?.membersRemoved ?? 0) }), 'success');
       await renderConnections();
     },
   });
@@ -12968,10 +12958,10 @@ function roleMapEntries(roleMap) {
 
 function readRoleMap(link) {
   const map = {};
-  const wire = Array.isArray(fv(link, 'role_map')) ? fv(link, 'role_map') : [];
+  const wire = Array.isArray(link?.roleMap) ? link?.roleMap : [];
   for (const entry of wire) {
-    const role = fv(entry, 'project_role');
-    const mlRole = fv(entry, 'ml_role');
+    const role = entry?.projectRole;
+    const mlRole = entry?.mlRole;
     if (ML_PROJECT_LEVELS.includes(role) && ML_ROLES.includes(mlRole)) map[role] = mlRole;
   }
   return map;
@@ -13044,8 +13034,8 @@ function openMlCreateWindow() {
         label: mlName,
       });
       toast(t('ml_created_ok', {
-        mapped: Number(fv(resp, 'members_mapped') ?? 0),
-        skipped: Number(fv(resp, 'members_skipped') ?? 0),
+        mapped: Number(resp?.membersMapped ?? 0),
+        skipped: Number(resp?.membersSkipped ?? 0),
       }), 'success');
       cleanup();
       await renderConnections();
@@ -13163,9 +13153,9 @@ function openMlAttachWindow() {
     const box = body.querySelector('#ps-ml-candidate');
     if (!box) return;
     box.options = candidates.map((c) => ({
-      value: fv(c, 'ml_project_id'),
+      value: c?.mlProjectId,
       label: c.name,
-      description: fv(c, 'project_type_label') || fv(c, 'project_type') || '',
+      description: c?.projectTypeLabel || c?.projectType || '',
     }));
     if (!candidates.length) showError(t('ml_candidates_empty'));
   })();
@@ -13174,27 +13164,27 @@ function openMlAttachWindow() {
 function openMlSettingsWindow(link) {
   const { body, foot, cleanup } = openWindow({
     title: t('ml_settings_title'),
-    subtitle: fv(link, 'label') || (link.summary ? link.summary.name : fv(link, 'ml_project_id')),
+    subtitle: link?.label || (link.summary ? link.summary.name : link?.mlProjectId),
     icon: 'settings',
     width: 680,
   });
   const uw = { roleMap: readRoleMap(link), busy: false };
 
   body.innerHTML = `
-    <tf-input id="ps-ml-set-label" label="${escapeAttr(t('ml_label_label'))}" value="${escapeAttr(fv(link, 'label') || '')}"
+    <tf-input id="ps-ml-set-label" label="${escapeAttr(t('ml_label_label'))}" value="${escapeAttr(link?.label || '')}"
       hint="${escapeAttr(t('ml_label_hint'))}"></tf-input>
     <div class="ps-case-info-list">
-      <div><span>${escapeHtml(t('ml_info_origin'))}</span><b>${escapeHtml(t(`ml_origin_${fv(link, 'origin')}`))}</b></div>
-      <div><span>${escapeHtml(t('ml_info_created_by'))}</span><b>${escapeHtml(fv(link, 'created_by_name') || '—')}</b></div>
-      <div><span>${escapeHtml(t('ml_info_last_sync'))}</span><b>${escapeHtml(fv(link, 'last_sync_at') ? formatTimestamp(fv(link, 'last_sync_at')) : '—')}</b></div>
-      <div><span>${escapeHtml(t('ml_info_last_sync_result'))}</span><b>${escapeHtml(fv(link, 'last_sync_result') || '—')}</b></div>
+      <div><span>${escapeHtml(t('ml_info_origin'))}</span><b>${escapeHtml(t(`ml_origin_${link?.origin}`))}</b></div>
+      <div><span>${escapeHtml(t('ml_info_created_by'))}</span><b>${escapeHtml(link?.createdByName || '—')}</b></div>
+      <div><span>${escapeHtml(t('ml_info_last_sync'))}</span><b>${escapeHtml(link?.lastSyncAt ? formatTimestamp(link?.lastSyncAt) : '—')}</b></div>
+      <div><span>${escapeHtml(t('ml_info_last_sync_result'))}</span><b>${escapeHtml(link?.lastSyncResult || '—')}</b></div>
     </div>
     <div class="ps-field">
       <span class="ps-field-label">${escapeHtml(t('ml_permission_project'))}</span>
       ${roleMapHtml(uw.roleMap)}
     </div>
     <div class="ps-toggle-inline">
-      <tf-toggle id="ps-ml-set-sync" ${fv(link, 'sync_permissions') ? 'checked' : ''}></tf-toggle>
+      <tf-toggle id="ps-ml-set-sync" ${link?.syncPermissions ? 'checked' : ''}></tf-toggle>
       <span>${escapeHtml(t('ml_sync_label'))}</span>
     </div>
     <div class="ps-field-hint">${escapeHtml(t('ml_permission_hint'))}</div>
@@ -13218,7 +13208,7 @@ function openMlSettingsWindow(link) {
     try {
       await ApiBinary.one('projectStudioMlLinkUpdateRequest', {
         projectId: projectId(),
-        linkId: fv(link, 'link_id'),
+        linkId: link?.linkId,
         label: String(body.querySelector('#ps-ml-set-label')?.value ?? '').trim(),
         syncPermissions: !!body.querySelector('#ps-ml-set-sync')?.checked,
         roleMap: roleMapEntries(uw.roleMap),
@@ -13240,7 +13230,7 @@ function openMlSettingsWindow(link) {
 // =============================================================================
 
 function canMoveTask(task) {
-  return !task.archived_at && allowsArea(taskSourceProject(task)?.access, 'board', 'write');
+  return !task.archivedAt && allowsArea(taskSourceProject(task)?.access, 'board', 'write');
 }
 
 // Card order is NOT persisted in F4 — the board sorts by priority and then by
@@ -13250,28 +13240,28 @@ function boardSortedTasks(rows) {
   return rows.slice().sort((a, b) => {
     const byPriority = (rank[a.priority] ?? 9) - (rank[b.priority] ?? 9);
     if (byPriority !== 0) return byPriority;
-    return String(fv(b, 'updated_at') || '').localeCompare(String(fv(a, 'updated_at') || ''));
+    return String(b?.updatedAt || '').localeCompare(String(a?.updatedAt || ''));
   });
 }
 
 function taskCardModel(task) {
-  const type = fv(task, 'task_type');
+  const type = task?.taskType;
   const severity = task.severity || '';
-  const dueDate = fv(task, 'due_date') || '';
-  const assignee = fv(task, 'assigned_to_name') || '';
+  const dueDate = task?.dueDate || '';
+  const assignee = task?.assignedToName || '';
   const links = (() => {
     try {
-      const parsed = JSON.parse(fv(task, 'links_json') || '[]');
+      const parsed = JSON.parse(task?.linksJson || '[]');
       return Array.isArray(parsed) ? parsed : [];
     } catch {
       return [];
     }
   })();
   const meta = [];
-  if (state.tasksView.scope === 'descendants') meta.push({ text: task.project_name, icon: 'folder' });
+  if (state.tasksView.scope === 'descendants') meta.push({ text: task.projectName, icon: 'folder' });
   meta.push({ text: taskRowTypeName(task) });
   if (task.resolution === 'not_pursued') meta.push({ text: t('task_not_pursued'), tone: 'info' });
-  if (task.archived_at) meta.push({ text: t('task_archived'), tone: 'warning', icon: 'archive' });
+  if (task.archivedAt) meta.push({ text: t('task_archived'), tone: 'warning', icon: 'archive' });
   if (severity) {
     meta.push({
       text: t(`sev_${severity}`),
@@ -13280,17 +13270,17 @@ function taskCardModel(task) {
   }
   meta.push({ text: t(`prio_${task.priority}`), icon: 'trend' });
   if (links.length) meta.push({ text: t('board_links', { count: links.length }), icon: 'branch' });
-  if (Number(fv(task, 'comment_count') ?? 0) > 0) {
-    meta.push({ text: String(fv(task, 'comment_count')), icon: 'message' });
+  if (Number(task?.commentCount ?? 0) > 0) {
+    meta.push({ text: String(task?.commentCount), icon: 'message' });
   }
 
   const menu = [{ id: 'open', label: t('action_open'), icon: 'external-link' }];
   if (allowsArea(taskSourceProject(task)?.access, 'tasks', 'write')) {
-    menu.push({ id: task.archived_at ? 'restore' : 'archive', label: t(task.archived_at ? 'task_restore' : 'action_archive'), icon: task.archived_at ? 'refresh' : 'archive' });
+    menu.push({ id: task.archivedAt ? 'restore' : 'archive', label: t(task.archivedAt ? 'task_restore' : 'action_archive'), icon: task.archivedAt ? 'refresh' : 'archive' });
   }
 
   return {
-    id: fv(task, 'task_id'),
+    id: task?.taskId,
     column: task.status,
     title: task.title,
     badge: taskNoLabel(task),
@@ -13340,7 +13330,7 @@ function renderTaskBoard() {
 
   board.addEventListener('card-open', (e) => {
     const taskId = e.detail?.cardId;
-    const task = tv.boardRows.find((row) => row.task_id === taskId);
+    const task = tv.boardRows.find((row) => row.taskId === taskId);
     if (task) openTaskRecord(task);
   });
   board.addEventListener('column-add', (e) => {
@@ -13349,24 +13339,24 @@ function renderTaskBoard() {
   });
   board.addEventListener('card-menu', async (e) => {
     const taskId = e.detail?.cardId;
-    const task = tv.boardRows.find((row) => fv(row, 'task_id') === taskId);
+    const task = tv.boardRows.find((row) => row?.taskId === taskId);
     if (!task) return;
     if (e.detail?.actionId === 'open') { openTaskRecord(task); return; }
     if (e.detail?.actionId === 'archive') confirmArchiveBoardTask(task);
-    if (e.detail?.actionId === 'restore' && allowsArea(taskSourceProject(task)?.access, 'tasks', 'write')) setTaskArchived(taskId, false, task.project_id).catch((error) => toast(`${t('task_archive_failed')}: ${error.message}`, 'error'));
+    if (e.detail?.actionId === 'restore' && allowsArea(taskSourceProject(task)?.access, 'tasks', 'write')) setTaskArchived(taskId, false, task.projectId).catch((error) => toast(`${t('task_archive_failed')}: ${error.message}`, 'error'));
   });
   // The board already shows the new position when this fires; a rejected write
   // is undone with revertMove so the UI never drifts from the server.
   board.addEventListener('card-move', async (e) => {
     const { cardId, to } = e.detail || {};
-    const task = tv.boardRows.find((row) => fv(row, 'task_id') === cardId);
+    const task = tv.boardRows.find((row) => row?.taskId === cardId);
     if (!task || !to || task.status === to) return;
     if (!canMoveTask(task)) { board.revertMove(cardId); return; }
     const previous = task.status;
     task.status = to;
     try {
       await ApiBinary.one('projectStudioTaskStatusSetRequest', {
-        projectId: task.project_id,
+        projectId: task.projectId,
         taskId: cardId,
         status: to,
       });
@@ -13392,7 +13382,7 @@ async function confirmArchiveBoardTask(task) {
   if (!allowsArea(taskSourceProject(task)?.access, 'tasks', 'write')) return;
   const confirmed = await TfWindow.confirm({ title: t('task_archive_title'), message: t('task_archive_message', { key: taskNoLabel(task), title: task.title }), confirmLabel: t('action_archive'), cancelLabel: t('action_cancel') });
   if (!confirmed) return;
-  try { await setTaskArchived(fv(task, 'task_id'), true, task.project_id); }
+  try { await setTaskArchived(task?.taskId, true, task.projectId); }
   catch (error) { toast(`${t('task_archive_failed')}: ${error.message}`, 'error'); }
 }
 
@@ -13420,7 +13410,7 @@ function trackArchiveJob(jobId, kind, { onStatus, onLog }) {
     { jobId },
     {
       onChunk: (body) => {
-        if (body?.variant !== 'ProjectStudioArchiveStreamChunk') return;
+        if (body?._variant !== 'ProjectStudioBody.ArchiveStreamChunk') return;
         if (state.archiveJob !== job) return;
         const line = body.phase ? `[${body.phase}] ${body.line}` : String(body.line || '');
         job.log.push(line);
@@ -13466,10 +13456,10 @@ function inventoryHtml(inventory, totalBytes) {
       ${cell('inv_tasks', Number(inventory.tasks ?? 0))}
       ${cell('inv_documents', Number(inventory.documents ?? 0))}
       ${cell('inv_sources', Number(inventory.sources ?? 0))}
-      ${cell('inv_files', `${Number(inventory.files ?? 0)} · ${formatBytes(Number(fv(inventory, 'bytes_files') ?? 0))}`)}
-      ${cell('inv_run_artifacts', formatBytes(Number(fv(inventory, 'bytes_runs') ?? 0)))}
-      ${cell('inv_vectors', `${Number(inventory.vectors ?? 0)} · ${Number(fv(inventory, 'vector_dim') ?? 0)}d`)}
-      ${cell('inv_embedding', fv(inventory, 'embedding_model') || fv(inventory, 'embedding_alias') || '—')}
+      ${cell('inv_files', `${Number(inventory.files ?? 0)} · ${formatBytes(Number(inventory?.bytesFiles ?? 0))}`)}
+      ${cell('inv_run_artifacts', formatBytes(Number(inventory?.bytesRuns ?? 0)))}
+      ${cell('inv_vectors', `${Number(inventory.vectors ?? 0)} · ${Number(inventory?.vectorDim ?? 0)}d`)}
+      ${cell('inv_embedding', inventory?.embeddingModel || inventory?.embeddingAlias || '—')}
       ${totalBytes != null ? cell('inv_total_bytes', formatBytes(Number(totalBytes))) : ''}
     </div>
   `;
@@ -13542,7 +13532,7 @@ function openExportWindow() {
   body.querySelector('#ps-export-scope').addEventListener('change', previewScope); previewScope();
 
   const onStatus = (status) => {
-    const pct = Number(fv(status, 'progress_pct') ?? 0);
+    const pct = Number(status?.progressPct ?? 0);
     body.querySelector('#ps-exp-bar')?.setAttribute('value', String(pct));
     const phase = body.querySelector('[data-export-phase]');
     if (phase) phase.textContent = t('export_phase', { phase: status.phase || '—', pct });
@@ -13557,9 +13547,9 @@ function openExportWindow() {
       ew.busy = false;
       return;
     }
-    ew.signedUrl = fv(status, 'signed_url') || '';
+    ew.signedUrl = status?.signedUrl || '';
     result.innerHTML = `
-      <div class="ps-banner-info">${sprite('check')}<span>${escapeHtml(t('export_done', { size: formatBytes(Number(fv(status, 'archive_bytes') ?? 0)) }))}</span></div>
+      <div class="ps-banner-info">${sprite('check')}<span>${escapeHtml(t('export_done', { size: formatBytes(Number(status?.archiveBytes ?? 0)) }))}</span></div>
       ${inventoryHtml(status.inventory, null)}
       <div class="ps-export-download">
         <tf-button variant="primary" icon="download" data-action="download">${escapeHtml(t('export_download'))}</tf-button>
@@ -13592,7 +13582,7 @@ function openExportWindow() {
         includeVectors: !!body.querySelector('#ps-exp-vectors')?.checked,
         includeUserNames: !!body.querySelector('#ps-exp-names')?.checked,
       });
-      ew.jobId = fv(resp, 'job_id');
+      ew.jobId = resp?.jobId;
       body.querySelector('#ps-export-scope').setAttribute('disabled', '');
       body.querySelector('[data-export-progress]').hidden = false;
       trackArchiveJob(ew.jobId, 'export', {
@@ -13710,13 +13700,13 @@ function openImportWindow() {
     const host = body.querySelector('[data-import-step="preview"]');
     if (!host) return;
     const modules = Array.isArray(preview.modules) ? preview.modules : [];
-    const reusable = !!fv(preview, 'vectors_reusable');
+    const reusable = !!preview?.vectorsReusable;
     host.innerHTML = `
       <div class="ps-preview-head">
-        <div class="ps-preview-name">${escapeHtml(fv(preview, 'project_name') || '')}</div>
+        <div class="ps-preview-name">${escapeHtml(preview?.projectName || '')}</div>
         <div class="ps-preview-sub">${escapeHtml(t('import_preview_sub', {
-          exported: formatTimestamp(fv(preview, 'exported_at')),
-          version: Number(fv(preview, 'archive_version') ?? 0),
+          exported: formatTimestamp(preview?.exportedAt),
+          version: Number(preview?.archiveVersion ?? 0),
         }))}</div>
         <div class="ps-preview-chips">
           <tf-chip status="info">${escapeHtml(orientationLabel({ template: preview.template, modules: preview.modules }))}</tf-chip>
@@ -13724,42 +13714,42 @@ function openImportWindow() {
         </div>
       </div>
       <tf-section-card title="${escapeAttr(t('import_tree_title'))}" icon="branch"><div class="ps-field-hint">${escapeHtml(t('import_prefix_allocation'))}</div><tf-table data-import-tree><tf-column key="name" label="${escapeAttr(t('table_col_project'))}"></tf-column><tf-column key="prefix" label="${escapeAttr(t('import_source_prefix'))}"></tf-column><tf-column key="visibility" label="${escapeAttr(t('subproject_private'))}"></tf-column><tf-column key="status" label="${escapeAttr(t('table_col_status'))}"></tf-column><tf-column key="tasks" label="${escapeAttr(t('inv_tasks'))}" renderer="num"></tf-column></tf-table></tf-section-card>
-      ${inventoryHtml(preview.inventory, fv(preview, 'total_uncompressed_bytes'))}
+      ${inventoryHtml(preview.inventory, preview?.totalUncompressedBytes)}
       <div class="ps-banner-${reusable ? 'info' : 'warn'}">
         ${sprite(reusable ? 'info' : 'alert')}
         <span>${escapeHtml(reusable
           ? t('import_vectors_reusable')
-          : t('import_vectors_reindex', { reason: fv(preview, 'vectors_reason') || '—' }))}</span>
+          : t('import_vectors_reindex', { reason: preview?.vectorsReason || '—' }))}</span>
       </div>
       <div class="ps-banner-warn">${sprite('alert')}<span>${escapeHtml(t('import_env_warning'))}</span></div>
       <div class="ps-banner-warn">${sprite('alert')}<span>${escapeHtml(t('import_sources_warning'))}</span></div>
-      <tf-input id="ps-imp-name" label="${escapeAttr(t('import_name_label'))}" value="${escapeAttr(fv(preview, 'project_name') || '')}"
+      <tf-input id="ps-imp-name" label="${escapeAttr(t('import_name_label'))}" value="${escapeAttr(preview?.projectName || '')}"
         hint="${escapeAttr(t('import_name_hint'))}"></tf-input>
       <div class="ps-toggle-inline">
         <tf-checkbox id="ps-imp-vectors" ${reusable ? 'checked' : ''}></tf-checkbox>
         <span>${escapeHtml(t('import_take_vectors'))}</span>
       </div>
       <div class="ps-toggle-inline">
-        <tf-checkbox id="ps-imp-runs" ${fv(preview, 'has_runs') ? 'checked' : ''} ${fv(preview, 'has_runs') ? '' : 'disabled'}></tf-checkbox>
+        <tf-checkbox id="ps-imp-runs" ${preview?.hasRuns ? 'checked' : ''} ${preview?.hasRuns ? '' : 'disabled'}></tf-checkbox>
         <span>${escapeHtml(t('import_take_runs'))}</span>
       </div>
     `;
-    const nodes = new Map(preview.tree_nodes.map((row) => [row.project_id, row]));
+    const nodes = new Map(preview.treeNodes.map((row) => [row.projectId, row]));
     const nodePath = (row) => {
       const names = [row.name];
-      let ancestor = nodes.get(row.parent_id);
-      for (let level = 1; ancestor && level < 4; level++) { names.unshift(ancestor.name); ancestor = nodes.get(ancestor.parent_id); }
+      let ancestor = nodes.get(row.parentId);
+      for (let level = 1; ancestor && level < 4; level++) { names.unshift(ancestor.name); ancestor = nodes.get(ancestor.parentId); }
       return names.join(' / ');
     };
     const treeTable = host.querySelector('[data-import-tree]');
     treeTable.rowKey = '_id';
-    treeTable.rows = preview.tree_nodes.map((row) => ({ _id: row.project_id, name: nodePath(row), prefix: row.key_prefix, visibility: row.is_private ? t('subproject_private') : '—', status: t(row.lifecycle === 'ended' ? 'status_ended' : 'status_active'), tasks: row.inventory.tasks }));
+    treeTable.rows = preview.treeNodes.map((row) => ({ _id: row.projectId, name: nodePath(row), prefix: row.keyPrefix, visibility: row.isPrivate ? t('subproject_private') : '—', status: t(row.lifecycle === 'ended' ? 'status_ended' : 'status_active'), tasks: row.inventory.tasks }));
     const detail = document.createElement('div'); treeTable.after(detail);
-    treeTable.addEventListener('row-click', (event) => { const row = preview.tree_nodes.find((node) => node.project_id === event.detail.row._id); detail.innerHTML = `<h3>${escapeHtml(row.name)}</h3>${inventoryHtml(row.inventory, null)}`; });
+    treeTable.addEventListener('row-click', (event) => { const row = preview.treeNodes.find((node) => node.projectId === event.detail.row._id); detail.innerHTML = `<h3>${escapeHtml(row.name)}</h3>${inventoryHtml(row.inventory, null)}`; });
   };
 
   const onStatus = async (status) => {
-    const pct = Number(fv(status, 'progress_pct') ?? 0);
+    const pct = Number(status?.progressPct ?? 0);
     body.querySelector('#ps-imp-bar')?.setAttribute('value', String(pct));
     const phase = body.querySelector('[data-import-phase]');
     if (phase) phase.textContent = t('import_phase', { phase: status.phase || '—', pct });
@@ -13772,10 +13762,10 @@ function openImportWindow() {
       result.innerHTML = `<div class="ps-form-error">${escapeHtml(status.error || t('import_failed'))}</div>`;
       return;
     }
-    const newProjectId = fv(status, 'project_id');
-    const reindexJobs = Array.isArray(fv(status, 'reindex_job_ids')) ? fv(status, 'reindex_job_ids') : [];
+    const newProjectId = status?.projectId;
+    const reindexJobs = Array.isArray(status?.reindexJobIds) ? status?.reindexJobIds : [];
     result.innerHTML = `
-      <div class="ps-banner-info">${sprite('check')}<span>${escapeHtml(fv(status, 'vectors_imported')
+      <div class="ps-banner-info">${sprite('check')}<span>${escapeHtml(status?.vectorsImported
         ? t('import_done_vectors')
         : t('import_done_reindex', { count: reindexJobs.length }))}</span></div>
       <div class="ps-export-download">
@@ -13794,7 +13784,7 @@ function openImportWindow() {
       if (!result.isConnected) return;
       const table = result.querySelector('[data-imported-tree]');
       table.rowKey = '_id';
-      table.rows = tree.projects.map((project) => ({ _id: project.project_id, name: [...projectAncestors(project, tree.projects, tree.breadcrumbs).map((ancestor) => ancestor.name), project.name].join(' / '), prefix: project.key_prefix }));
+      table.rows = tree.projects.map((project) => ({ _id: project.projectId, name: [...projectAncestors(project, tree.projects, tree.breadcrumbs).map((ancestor) => ancestor.name), project.name].join(' / '), prefix: project.keyPrefix }));
       table.hidden = false;
       result.querySelector('[data-imported-tree-status]').remove();
       await loadProjects();
@@ -13840,7 +13830,7 @@ function openImportWindow() {
         importVectors: !!body.querySelector('#ps-imp-vectors')?.checked,
         importRuns: !!body.querySelector('#ps-imp-runs')?.checked,
       });
-      iw.jobId = fv(resp, 'job_id');
+      iw.jobId = resp?.jobId;
       setStep('apply');
       trackArchiveJob(iw.jobId, 'import', {
         onStatus,

@@ -127,7 +127,7 @@ export function mountAsOf(host, api, base, note) {
       const marks = diffMarks(diff.items);
       api.setDecorate((model) => decorateModel(model, marks, 'after'));
       counts = diffCounts(diff.items);
-      api.apply({ view: answer.view, unitTypes: answer.unit_types ?? [], myPermissions: answer.my_permissions ?? [] });
+      api.apply({ view: answer.view, unitTypes: answer.unitTypes ?? [], myPermissions: answer.myPermissions ?? [] });
       render();
     } catch (err) {
       if (mine !== token) return;
@@ -137,7 +137,7 @@ export function mountAsOf(host, api, base, note) {
   }
 
   async function applyPreview(set) {
-    day = set.effective_date;
+    day = set.effectiveDate;
     previewName = set.name;
     const mine = ++token;
     render();
@@ -148,13 +148,13 @@ export function mountAsOf(host, api, base, note) {
       const marks = diffMarks(preview.items);
       api.setDecorate((model) => decorateModel(model, marks, 'after'));
       counts = diffCounts(preview.items);
-      day = preview.at || set.effective_date;
+      day = preview.at || set.effectiveDate;
       api.apply({ view: preview.preview, unitTypes: today.unitTypes, myPermissions: today.myPermissions });
       render();
     } catch (err) {
       if (mine !== token) return;
       reset();
-      TfToast.show({ tone: 'danger', message: t('asof_load_failed', { date: formatDay(set.effective_date), message: err.message || '' }) });
+      TfToast.show({ tone: 'danger', message: t('asof_load_failed', { date: formatDay(set.effectiveDate), message: err.message || '' }) });
     }
   }
 
@@ -193,7 +193,7 @@ export function mountAsOf(host, api, base, note) {
         run: () => apply(planned),
       })),
       ...openSets.slice(0, 5).map((set) => ({
-        label: t('asof_menu_preview', { name: set.name, date: formatDay(set.effective_date) }),
+        label: t('asof_menu_preview', { name: set.name, date: formatDay(set.effectiveDate) }),
         icon: 'sitemap',
         run: () => applyPreview(set),
       })),

@@ -86,10 +86,9 @@ pub struct Router {
 }
 
 /// Globalny slot aktywnego routera procesu (Weak — nie przedluza zywotnosci
-/// routera po shutdown). Handlery mesh pipeline (np. AliasSyncReceived) nie
-/// maja dostepu do `HandlerContext`, a po zapisie snapshotu aliasow musza
-/// odswiezyc alias cache i katalog wlasnie na tym routerze. Ustawiany w
-/// `Router::start`.
+/// routera po shutdown). Sciezki bez `HandlerContext` (np. materializer Sync
+/// Ledgera po zastosowaniu aliasu) musza odswiezyc alias cache i katalog
+/// wlasnie na tym routerze. Ustawiany w `Router::start`.
 static ACTIVE_ROUTER: std::sync::OnceLock<parking_lot::RwLock<std::sync::Weak<Router>>> =
     std::sync::OnceLock::new();
 
@@ -385,8 +384,8 @@ impl Router {
     }
 
     pub fn start(self: &Arc<Self>) {
-        // Rejestracja w globalnym slocie — mesh pipeline odswieza przez niego
-        // alias cache + katalog po odbiorze MESH_MSG_ALIAS_SYNC.
+        // Rejestracja w globalnym slocie — materializer Sync Ledgera odswieza
+        // przez niego alias cache + katalog po zastosowaniu aliasu.
         *ACTIVE_ROUTER
             .get_or_init(|| parking_lot::RwLock::new(std::sync::Weak::new()))
             .write() = Arc::downgrade(self);

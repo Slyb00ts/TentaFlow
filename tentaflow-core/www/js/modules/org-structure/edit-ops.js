@@ -22,8 +22,8 @@ export const TEMP_PREFIX = 'tmp:';
 
 export const isTempId = (id) => typeof id === 'string' && id.startsWith(TEMP_PREFIX);
 
-const positionOf = (view, id) => (view.positions ?? []).find((p) => p.position_id === id);
-const unitOf = (view, id) => (view.units ?? []).find((u) => u.unit_id === id);
+const positionOf = (view, id) => (view.positions ?? []).find((p) => p.positionId === id);
+const unitOf = (view, id) => (view.units ?? []).find((u) => u.unitId === id);
 
 // ---- builders ------------------------------------------------------------------
 
@@ -37,8 +37,8 @@ export const setDeputiesOp = (unitId, positionIds, from) => ({ kind: 'deputyHead
 
 // A patch names the fields to change; `null` for a clearable field clears it, by the name the wire knows it by.
 const CLEAR_NAMES = { code: 'code', roleId: 'role_id', typeId: 'type_id', color: 'color' };
-const POSITION_FIELDS = { name: 'name', code: 'code', roleId: 'role_id', isStaff: 'is_staff' };
-const UNIT_FIELDS = { name: 'name', code: 'code', typeId: 'type_id', color: 'color' };
+const POSITION_FIELDS = { name: 'name', code: 'code', roleId: 'roleId', isStaff: 'isStaff' };
+const UNIT_FIELDS = { name: 'name', code: 'code', typeId: 'typeId', color: 'color' };
 
 function fieldOf(entity, wire, key) {
   return key === 'isStaff' ? Boolean(entity[wire]) : entity[wire] ?? null;
@@ -69,16 +69,16 @@ export function updateUnitOp(view, unitId, patch, from) {
 
 /** The assignment of `ref` (`{ positionId, subjectKey }`) in `view`. */
 export function findAssignment(view, ref) {
-  return (view.assignments ?? []).find((a) => a.position_id === ref.positionId && subjectKey(a.subject) === ref.subjectKey) ?? null;
+  return (view.assignments ?? []).find((a) => a.positionId === ref.positionId && subjectKey(a.subject) === ref.subjectKey) ?? null;
 }
 
-export const assignmentRef = (assignment) => ({ positionId: assignment.position_id, subjectKey: subjectKey(assignment.subject) });
+export const assignmentRef = (assignment) => ({ positionId: assignment.positionId, subjectKey: subjectKey(assignment.subject) });
 
 /** Type, share or primary flag of one assignment (`assignmentType`, `share`, `isPrimary`); null when nothing differs. */
 export function updateAssignmentOp(view, ref, patch, from) {
   const current = findAssignment(view, ref);
   if (!current) return null;
-  const wire = { assignmentType: 'assignment_type', share: 'share', isPrimary: 'is_primary' };
+  const wire = { assignmentType: 'assignmentType', share: 'share', isPrimary: 'isPrimary' };
   const changed = Object.entries(patch).filter(([key, value]) => current[wire[key]] !== value);
   if (!changed.length) return null;
   return { kind: 'assignmentUpdate', assignmentId: current.id, from, ...Object.fromEntries(changed) };

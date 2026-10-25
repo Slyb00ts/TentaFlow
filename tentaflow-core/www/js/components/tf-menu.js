@@ -428,6 +428,11 @@ class TfMenu extends HTMLElement {
     (e.key === 'ArrowDown' ? rows[0] : rows.at(-1))?.focus();
   }
 
+  /** Moves focus into an open menu, for a trigger that was activated from the keyboard. */
+  focusFirst() {
+    this._enabledRows()[0]?.focus();
+  }
+
   _enabledRows() {
     return [...this.querySelectorAll(':scope > tf-menu-item > .tf-menu-item')]
       .filter((row) => !row.parentElement.hidden && !row.parentElement.hasAttribute('disabled'));

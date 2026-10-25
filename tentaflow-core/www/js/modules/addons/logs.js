@@ -94,7 +94,7 @@ function renderTable(wrap) {
   const rows = currentEntries.map((e) => {
     const ts = formatTimestamp(e.timestamp);
     const level = String(e.level ?? 'info').toLowerCase();
-    const user = e.userName ?? e.user_name ?? (e.userId ?? e.user_id ? `#${e.userId ?? e.user_id}` : '—');
+    const user = e.userName ?? (e.userId ? `#${e.userId}` : '—');
     const details = String(e.details ?? '');
     const detailsAttr = details ? `data-details="${escapeAttr(details)}"` : '';
     return `

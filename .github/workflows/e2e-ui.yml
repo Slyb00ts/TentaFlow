@@ -13,6 +13,9 @@ on:
       - 'tentaflow-core/www/**'
       - 'tentaflow-core/src/api/**'
       - 'tentaflow/**'
+      - 'tentaflow-protocol/**'
+      - 'tentaflow-protocol-wasm/**'
+      - 'tentaflow-codec-core/**'
       - 'tests/e2e/**'
 
 jobs:
@@ -69,6 +72,13 @@ jobs:
           node-version: '20'
           cache: 'npm'
           cache-dependency-path: tests/e2e/package-lock.json
+
+      - name: Browser protocol codec — size budget and JS tests
+        run: |
+          scripts/check-wasm-size.sh
+          cd tentaflow-core/www
+          npm install --no-audit --no-fund
+          npm test
 
       - name: Cache Playwright browsers
         uses: actions/cache@v4

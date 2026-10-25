@@ -195,10 +195,10 @@ test('the acknowledgement and the undo leave the browser in the frame the client
   await client.request('tentaNasElasticArraySyncRequest', { name: 'media' });
   await client.request('tentaNasElasticArrayAddDiskAbortRequest', { name: 'media', diskId: 'wwn-0x5000c500a1b2c3d4', confirmName: 'media' });
   const [acknowledged, plain, undo] = sent.map(sentPayload);
-  assert.equal(acknowledged.variant, 'TentaNasElasticArraySyncRequest');
-  assert.equal(acknowledged.acknowledge_parity_fault, '018f2c1e-6b9a-7c3d-8e4f-5a6b7c8d9e0f', 'the confirm names its fault');
-  assert.equal(plain.acknowledge_parity_fault ?? null, null, 'a Sync that says nothing is not acknowledged');
-  assert.equal(undo.variant, 'TentaNasElasticArrayAddDiskAbortRequest');
-  assert.equal(undo.disk_id, 'wwn-0x5000c500a1b2c3d4');
-  assert.equal(undo.confirm_name, 'media');
+  assert.equal(acknowledged._variant, 'TentaNasBody.ElasticArraySyncRequest');
+  assert.equal(acknowledged.acknowledgeParityFault, '018f2c1e-6b9a-7c3d-8e4f-5a6b7c8d9e0f', 'the confirm names its fault');
+  assert.equal(plain.acknowledgeParityFault ?? null, null, 'a Sync that says nothing is not acknowledged');
+  assert.equal(undo._variant, 'TentaNasBody.ElasticArrayAddDiskAbortRequest');
+  assert.equal(undo.diskId, 'wwn-0x5000c500a1b2c3d4');
+  assert.equal(undo.confirmName, 'media');
 });

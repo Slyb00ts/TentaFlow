@@ -16,7 +16,7 @@ function client({ authenticated = false, secure = true, supported = true, regist
   const state = { authenticated, me: { role: 'user' }, mount: null, calls: [], warnings: [] };
   const workerRegistration = { scope: 'https://localhost/' };
   const context = {
-    ApiBinary: { hasJwt: () => state.authenticated, one: async () => state.me, clearSession: () => { state.authenticated = false; } },
+    ApiBinary: { onLifecycle: () => () => {}, hasJwt: () => state.authenticated, one: async () => state.me, clearSession: () => { state.authenticated = false; } },
     navigator: supported ? { serviceWorker: { register: async (url, options) => {
       state.calls.push({ url, options: JSON.parse(JSON.stringify(options)) });
       if (registrationError) throw new Error(registrationError);

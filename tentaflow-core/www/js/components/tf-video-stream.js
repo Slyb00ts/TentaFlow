@@ -368,16 +368,16 @@ class TfVideoStream extends HTMLElement {
   _onSubscriptionChunk(body) {
     if (this._disposed) return;
     if (!body || typeof body !== 'object') return;
-    if (body.variant === 'StreamSubscribeResponse') {
+    if (body._variant === 'StreamBody.SubscribeResponse') {
       this._resubscribeAttempt = 0;
-      this._mime = String(body.mime_type ?? body.mimeType ?? '');
-      const base = body.base_pts_ns ?? body.basePtsNs;
+      this._mime = String(body.mimeType ?? '');
+      const base = body.basePtsNs;
       this._basePtsNs = base == null ? null : (typeof base === 'bigint' ? Number(base) : Number(base));
       if (!Number.isFinite(this._basePtsNs)) this._basePtsNs = null;
       this._tryCreateSourceBuffer();
       return;
     }
-    if (body.variant === 'StreamFrame') {
+    if (body._variant === 'StreamBody.Frame') {
       // Dane plyna — subskrypcja zyje, watchdog no-data nie jest juz potrzebny.
       this._clearNoDataWatchdog();
       const data = body.data;
@@ -409,7 +409,7 @@ class TfVideoStream extends HTMLElement {
     // Wlasne zamkniecia nigdy tu nie trafiaja — unsubscribe zdejmuje listener
     // przed wyslaniem StreamCloseRequest, wiec pusty `reason` to zawsze serwer.
     const detail =
-      body?.variant === 'Error'
+      body?._variant === 'Error'
         ? `error: ${body?.message ?? body?.code ?? 'unknown'}`
         : reason || 'brak powodu';
     console.warn(`[tf-video-stream] strumien zerwany (${detail}), resubscribe`);

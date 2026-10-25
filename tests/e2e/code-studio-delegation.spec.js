@@ -82,7 +82,7 @@ async function approvePending(page, { deadlineMs = 90_000 } = {}) {
     for (const a of pending) {
       await api(page, 'codeStudioApprovalDecideRequest', {
         ...scope(),
-        approvalId: a.id ?? a.approvalId ?? a.approval_id,
+        approvalId: a.id ?? a.approvalId,
         decision: 'allow_for_run',
       });
       decided += 1;
@@ -99,7 +99,7 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
 
     // Provider.
     const nodes = await api(page, 'meshNodeListRequest');
-    const nodeId = (nodes?.nodes ?? [])[0]?.nodeId ?? (nodes?.nodes ?? [])[0]?.node_id ?? '';
+    const nodeId = (nodes?.nodes ?? [])[0]?.nodeId ?? '';
     await api(page, 'serviceManifestDeployRequest', {
       engineId: 'openai-compatible',
       deployMethod: 'external',
@@ -111,7 +111,7 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
     await expect.poll(async () => {
       const body = await api(page, 'serviceListRequest');
       return (body?.services ?? []).find(
-        (s) => (s.engineId ?? s.engine_id) === 'openai-compatible',
+        (s) => (s.engineId) === 'openai-compatible',
       )?.status ?? 'missing';
     }, { timeout: 60_000 }).toMatch(/running|degraded/);
 
@@ -122,17 +122,17 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
     await expect.poll(async () => {
       const models = await api(page, 'modelListRequest');
       modelName = (models?.models ?? [])
-        .map((m) => m.modelName ?? m.model_name)
+        .map((m) => m.modelName)
         .find((n) => String(n).includes('harness-test')) ?? '';
       return modelName;
     }, { timeout: 90_000, message: 'the scripted model never reached the catalogue' })
       .toBeTruthy();
 
     const listResp = await api(page, 'agentsListRequest', {});
-    const agents = JSON.parse(listResp?.agentsJson ?? listResp?.agents_json ?? '[]');
+    const agents = JSON.parse(listResp?.agentsJson ?? '[]');
     for (const a of agents.filter((x) => String(x.name ?? '').startsWith('code-'))) {
       const d = await api(page, 'agentsDetailRequest', { agentId: a.id });
-      const agent = JSON.parse(d?.agentJson ?? d?.agent_json ?? '{}');
+      const agent = JSON.parse(d?.agentJson ?? '{}');
       agent.model = modelName;
       await api(page, 'agentsUpsertRequest', { agentJson: JSON.stringify(agent) });
     }
@@ -142,7 +142,7 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
     const users = await api(page, 'usersListRequest');
     const mine = (users?.users ?? []).find((u) => (u.username ?? '') === (me?.username ?? 'admin'));
     await api(page, 'codeStudioWorkspaceCreatorGrantSetRequest', {
-      userId: mine?.id ?? mine?.userId ?? mine?.user_id, granted: true,
+      userId: mine?.id ?? mine?.userId, granted: true,
     });
 
     await page.goto(`${baseUrl(PORT)}/`);
@@ -204,15 +204,15 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
     await expect.poll(async () => {
       const body = await api(page, 'codeStudioSessionRunsRequest', scope());
       const runs = body?.runs ?? [];
-      const child = runs.find((r) => (r.parentRunId ?? r.parent_run_id));
+      const child = runs.find((r) => (r.parentRunId));
       if (child) {
         console.log('[diag] child run:', JSON.stringify({
           kind: child.kind, status: child.status,
-          agentId: child.agentId ?? child.agent_id,
-          parent: child.parentRunId ?? child.parent_run_id,
+          agentId: child.agentId,
+          parent: child.parentRunId,
         }));
       }
-      return runs.filter((r) => (r.parentRunId ?? r.parent_run_id)).length;
+      return runs.filter((r) => (r.parentRunId)).length;
     }, { timeout: TURN_TIMEOUT, message: 'orchestrator never spawned a child run' })
       .toBeGreaterThan(0);
 
@@ -256,12 +256,12 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
     // holding the tool meant holding the whole node's roster, bounded only by
     // depth/width/session budget. The orchestrator now ships an explicit team.
     const listResp = await api(page, 'agentsListRequest', {});
-    const agents = JSON.parse(listResp?.agentsJson ?? listResp?.agents_json ?? '[]');
+    const agents = JSON.parse(listResp?.agentsJson ?? '[]');
     const orch = agents.find((a) => a.name === 'code-orchestrator');
     expect(orch, 'no orchestrator').toBeTruthy();
 
     const detail = await api(page, 'agentsDetailRequest', { agentId: orch.id });
-    const full = JSON.parse(detail?.agentJson ?? detail?.agent_json ?? '{}');
+    const full = JSON.parse(detail?.agentJson ?? '{}');
     console.log('[diag] roster:', JSON.stringify(full.allowed_agents));
     expect(Array.isArray(full.allowed_agents), 'the orchestrator has no roster').toBe(true);
     expect(full.allowed_agents).toContain('code-implementer');
@@ -270,7 +270,7 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
     // which is the first gate; the roster is the second.
     const implementer = agents.find((a) => a.name === 'code-implementer');
     const implDetail = await api(page, 'agentsDetailRequest', { agentId: implementer.id });
-    const impl = JSON.parse(implDetail?.agentJson ?? implDetail?.agent_json ?? '{}');
+    const impl = JSON.parse(implDetail?.agentJson ?? '{}');
     expect(impl.tools ?? [], 'the implementer can delegate')
       .not.toContain('core.agent_spawn');
 
@@ -280,7 +280,7 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
       agentJson: JSON.stringify({ ...full, allowed_agents: ['code-planner'] }),
     });
     const after = await api(page, 'agentsDetailRequest', { agentId: orch.id });
-    const reread = JSON.parse(after?.agentJson ?? after?.agent_json ?? '{}');
+    const reread = JSON.parse(after?.agentJson ?? '{}');
     expect(reread.allowed_agents, 'the roster did not survive an upsert')
       .toEqual(['code-planner']);
   });
@@ -294,7 +294,7 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
     // install nothing resolves that alias, so point it at the scripted model.
     const models = await api(page, 'modelListRequest');
     const modelName = (models?.models ?? [])
-      .map((m) => m.modelName ?? m.model_name)
+      .map((m) => m.modelName)
       .find((n) => String(n).includes('harness-test'));
     // The payload is `{ entries: [{key, value, isSecret}] }` (codec.js:1878) —
     // and it must NOT be swallowed: if the write fails the builder falls back to
@@ -326,7 +326,7 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
 
     // A reply alone only proves the plumbing; the point of the builder is the
     // PROPOSAL, extracted from a model answer that wraps JSON in prose.
-    const result = JSON.parse(resp?.resultJson ?? resp?.result_json ?? '{}');
+    const result = JSON.parse(resp?.resultJson ?? '{}');
     expect(result.reply, 'builder returned no reply').toBeTruthy();
     expect(result.proposal, 'builder extracted no agent proposal').toBeTruthy();
     expect(result.proposal.name).toBe('security-reviewer');
@@ -345,7 +345,7 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
       }),
     });
     const listResp = await api(page, 'agentsListRequest', {});
-    const saved = JSON.parse(listResp?.agentsJson ?? listResp?.agents_json ?? '[]')
+    const saved = JSON.parse(listResp?.agentsJson ?? '[]')
       .find((a) => a.name === 'security-reviewer');
     expect(saved, 'the proposed agent was not saved').toBeTruthy();
   });

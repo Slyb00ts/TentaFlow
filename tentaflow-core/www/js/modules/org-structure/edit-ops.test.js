@@ -27,12 +27,12 @@ test('a move, a head and the deputies are operations of the names the batch take
 
 test('a field edit names only what differs from the structure, and clears by the wire\'s field name', () => {
   const view = sampleView();
-  view.positions.find((p) => p.position_id === 'p-tester').role_id = 'role-1';
+  view.positions.find((p) => p.positionId === 'p-tester').roleId = 'role-1';
   assert.equal(ops.updatePositionOp(view, 'p-tester', { name: 'Tester' }, DAY), null, 'nothing differs');
   assert.deepEqual(ops.updatePositionOp(view, 'p-tester', { name: 'QA', roleId: null }, DAY), {
     kind: 'positionUpdate', positionId: 'p-tester', from: DAY, name: 'QA', clear: ['role_id'],
   });
-  view.units.find((u) => u.unit_id === 'u-sales').type_id = 'ty-1';
+  view.units.find((u) => u.unitId === 'u-sales').typeId = 'ty-1';
   assert.deepEqual(ops.updateUnitOp(view, 'u-sales', { typeId: null, color: '#ff0000' }, DAY), {
     kind: 'unitUpdate', unitId: 'u-sales', from: DAY, color: '#ff0000', clear: ['type_id'],
   });
@@ -40,7 +40,7 @@ test('a field edit names only what differs from the structure, and clears by the
 
 test('an assignment edit is looked up by position and person and names only what differs', () => {
   const view = sampleView();
-  const anna = view.assignments.find((a) => a.position_id === 'p-lead');
+  const anna = view.assignments.find((a) => a.positionId === 'p-lead');
   assert.equal(ops.updateAssignmentOp(view, ops.assignmentRef(anna), { share: 1 }, DAY), null);
   assert.deepEqual(ops.updateAssignmentOp(view, ops.assignmentRef(anna), { share: 0.5, isPrimary: true }, DAY), {
     kind: 'assignmentUpdate', assignmentId: anna.id, from: DAY, share: 0.5,

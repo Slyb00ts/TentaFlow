@@ -175,7 +175,7 @@ const DashboardScreen = {
     try {
       const client = await ApiBinary.client();
       auditUnsubscribe = client.addUnsolicitedListener(({ body }) => {
-        if (body?.variant === 'AuditEvent') {
+        if (body?._variant === 'AuditEventBody') {
           recentEvents.unshift(body);
           if (recentEvents.length > MAX_RECENT_EVENTS) recentEvents.length = MAX_RECENT_EVENTS;
           renderEvents();
@@ -203,10 +203,10 @@ async function refresh() {
   try {
     const [metrics, nodes, services, flows, models] = await Promise.allSettled([
       ApiBinary.one('dashboardMetricsRequest'),
-      ApiBinary.list('meshNodeListRequest'),
-      ApiBinary.list('serviceListRequest'),
-      ApiBinary.list('flowListRequest'),
-      ApiBinary.list('modelListRequest'),
+      ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }),
+      ApiBinary.list('serviceListRequest', { arrayKey: 'services' }),
+      ApiBinary.list('flowListRequest', { arrayKey: 'flows' }),
+      ApiBinary.list('modelListRequest', { arrayKey: 'models' }),
     ]);
     const rtt = Math.round(performance.now() - start);
     const rttEl = byId('metrics-rtt');
@@ -242,7 +242,7 @@ function updateMetrics(m) {
 
 function updateMeshStat(nodes) {
   const total = nodes.length;
-  const online = nodes.filter((n) => isOnlineHelper(n) || n.isSelf).length;
+  const online = nodes.filter((n) => isOnlineHelper(n)).length;
   setText('stat-mesh-value', I18n.t('home.stat_mesh_value', { online }));
   const offline = total - online;
   setText('stat-mesh-sub', offline > 0

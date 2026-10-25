@@ -102,9 +102,19 @@ export async function profilingDownload({ nodeId, sessionId }) {
  *
  * @returns {Promise<{ info: object | null }>}
  */
-export async function profilingActiveInfo({ nodeId }) {
-  return ApiBinary.one('profilingActiveInfoRequest', { nodeId });
+export function profilingActiveInfo({ nodeId }) {
+  // The banner and the recording pill poll the same node every second; a request
+  // already in flight answers both instead of sending the same one twice.
+  let pending = activeInfoInFlight.get(nodeId);
+  if (!pending) {
+    pending = ApiBinary.one('profilingActiveInfoRequest', { nodeId })
+      .finally(() => activeInfoInFlight.delete(nodeId));
+    activeInfoInFlight.set(nodeId, pending);
+  }
+  return pending;
 }
+
+const activeInfoInFlight = new Map();
 
 /**
  * Walidacja sudo password (bez utrwalania) przez binary protocol.

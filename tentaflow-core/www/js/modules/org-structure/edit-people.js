@@ -20,16 +20,16 @@ const DRAG_SLOP = 4;
 export function normalizeUsers(list) {
   return (Array.isArray(list) ? list : []).map((u) => ({
     id: String(u.id),
-    name: u.displayName || u.display_name || u.username,
+    name: u.displayName || u.username,
     email: u.email || '',
-    isActive: (u.isActive ?? u.is_active) !== false,
+    isActive: u.isActive !== false,
   }));
 }
 
 /** Role catalog entries as `{ id, name }` in the interface language, falling back to the first translation. */
 export function normalizeRoles(list, language) {
   return (Array.isArray(list) ? list : []).map((role) => {
-    const pairs = role.nameTranslations ?? role.name_translations ?? [];
+    const pairs = role.nameTranslations ?? [];
     const exact = pairs.find((pair) => Array.isArray(pair) && pair[0] === language);
     const name = (exact ?? pairs.find(Array.isArray))?.[1] || role.slug;
     return { id: String(role.id), name };

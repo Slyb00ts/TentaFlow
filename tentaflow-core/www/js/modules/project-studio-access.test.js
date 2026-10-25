@@ -5,12 +5,12 @@ import assert from 'node:assert/strict';
 import { allowsArea, canCreateTask, projectTabs, catalogueLabel, memberGroup, expiryToInstant, expiryToLocal } from './project-studio-access.js';
 
 test('membership without functions can create a task while its Tasks tab remains hidden', () => {
-  const access = { has_access: true, archived: false, functions: [], can_create_tasks: true, areas: [{ area: 'tasks', enabled: true, level: 'none' }] };
+  const access = { hasAccess: true, archived: false, functions: [], canCreateTasks: true, areas: [{ area: 'tasks', enabled: true, level: 'none' }] };
   assert.equal(canCreateTask(access), true);
   assert.equal(allowsArea(access, 'tasks'), false);
   assert.deepEqual(projectTabs(access), ['overview', 'members']);
-  assert.equal(canCreateTask({ ...access, can_create_tasks: false }), false);
-  assert.equal(canCreateTask({ ...access, has_access: false }), false);
+  assert.equal(canCreateTask({ ...access, canCreateTasks: false }), false);
+  assert.equal(canCreateTask({ ...access, hasAccess: false }), false);
 });
 
 test('enabled server area grants control tabs and ordinary mutations independently', () => {
@@ -28,7 +28,7 @@ test('enabled server area grants control tabs and ordinary mutations independent
 });
 
 test('administrator inspection and archived projects keep returned read access', () => {
-  const access = { has_access: true, app_admin: true, archived: false, areas: [
+  const access = { hasAccess: true, appAdmin: true, archived: false, areas: [
     { area: 'settings', enabled: true, level: 'read' },
     { area: 'security.confidential', enabled: true, level: 'none' },
   ] };
@@ -41,7 +41,7 @@ test('administrator inspection and archived projects keep returned read access',
 
 test('only original built-in labels are localized; customized and custom labels survive', () => {
   const translate = (key) => `translated:${key}`;
-  const definition = { function_id: 'developer', name: 'Developer', description: 'Implementation and code review', builtin: true };
+  const definition = { functionId: 'developer', name: 'Developer', description: 'Implementation and code review', builtin: true };
   assert.equal(catalogueLabel(definition, 'name', translate), 'translated:function_developer_name');
   assert.equal(catalogueLabel(definition, 'description', translate), 'translated:function_developer_description');
   assert.equal(catalogueLabel({ ...definition, name: 'Engineering' }, 'name', translate), 'Engineering');
@@ -51,14 +51,14 @@ test('only original built-in labels are localized; customized and custom labels 
 
 test('expired memberships form a separate group using server activity', () => {
   assert.equal(memberGroup({ active: true, expiresAt: null }), 'people');
-  assert.equal(memberGroup({ active: true, expires_at: '2030-01-01T00:00:00Z' }), 'temporary');
-  assert.equal(memberGroup({ active: false, expires_at: '2030-01-01T00:00:00Z' }), 'expired');
+  assert.equal(memberGroup({ active: true, expiresAt: '2030-01-01T00:00:00Z' }), 'temporary');
+  assert.equal(memberGroup({ active: false, expiresAt: '2030-01-01T00:00:00Z' }), 'expired');
   assert.equal(memberGroup({ active: true, inherited: true }), 'inherited');
-  assert.equal(memberGroup({ active: false, access: { has_access: true } }), 'expired', 'local expiry stays visible when an ancestor still grants access');
+  assert.equal(memberGroup({ active: false, access: { hasAccess: true } }), 'expired', 'local expiry stays visible when an ancestor still grants access');
 });
 
 test('ended projects keep current reads but refuse ordinary writes and task creation', () => {
-  const access = { has_access: true, ended: true, can_create_tasks: true, areas: [{ area: 'tasks', enabled: true, level: 'admin' }] };
+  const access = { hasAccess: true, ended: true, canCreateTasks: true, areas: [{ area: 'tasks', enabled: true, level: 'admin' }] };
   assert.equal(allowsArea(access, 'tasks'), true);
   assert.equal(allowsArea(access, 'tasks', 'write'), false);
   assert.equal(canCreateTask(access), false);
@@ -74,11 +74,11 @@ test('expiry editor preserves the local instant and rejects invalid or elapsed v
 });
 
 test('Board and Tasks read permissions independently expose their shared tab', () => {
-  const boardOnly = { has_access: true, areas: [{ area: 'tasks', enabled: true, level: 'none' }, { area: 'board', enabled: true, level: 'write' }] };
+  const boardOnly = { hasAccess: true, areas: [{ area: 'tasks', enabled: true, level: 'none' }, { area: 'board', enabled: true, level: 'write' }] };
   assert.deepEqual(projectTabs(boardOnly), ['overview', 'tasks', 'members']);
   assert.equal(allowsArea(boardOnly, 'tasks'), false);
   assert.equal(allowsArea(boardOnly, 'board', 'write'), true);
-  const tasksOnly = { has_access: true, areas: [{ area: 'tasks', enabled: true, level: 'write' }, { area: 'board', enabled: true, level: 'none' }] };
+  const tasksOnly = { hasAccess: true, areas: [{ area: 'tasks', enabled: true, level: 'write' }, { area: 'board', enabled: true, level: 'none' }] };
   assert.deepEqual(projectTabs(tasksOnly), ['overview', 'tasks', 'members']);
   assert.equal(allowsArea(tasksOnly, 'board'), false);
 });

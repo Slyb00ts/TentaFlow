@@ -54,9 +54,9 @@ const yesNo = (value) => ({ value, label: t(value === 'yes' ? 'yes' : 'no') });
 
 /** Holder names of a position, or its own name while nobody holds it: how a card is named in a sentence. */
 export function seatName(view, positionId) {
-  const holders = (view.assignments ?? []).filter((a) => a.position_id === positionId && a.display_name);
-  if (holders.length) return holders.map((a) => a.display_name).join(', ');
-  return (view.positions ?? []).find((p) => p.position_id === positionId)?.name ?? '';
+  const holders = (view.assignments ?? []).filter((a) => a.positionId === positionId && a.displayName);
+  if (holders.length) return holders.map((a) => a.displayName).join(', ');
+  return (view.positions ?? []).find((p) => p.positionId === positionId)?.name ?? '';
 }
 
 /**
@@ -222,14 +222,14 @@ export function createActions(env) {
   function externalsOf() {
     const seen = new Map();
     for (const a of view().assignments ?? []) {
-      if (a.subject.kind === 'external' && !seen.has(a.subject.id)) seen.set(a.subject.id, { id: a.subject.id, name: a.display_name });
+      if (a.subject.kind === 'external' && !seen.has(a.subject.id)) seen.set(a.subject.id, { id: a.subject.id, name: a.displayName });
     }
     return [...seen.values()];
   }
 
   function assignmentOf(key) {
     const [positionId, subject] = key.split('|');
-    return (view().assignments ?? []).find((a) => a.position_id === positionId && subjectKey(a.subject) === subject) ?? null;
+    return (view().assignments ?? []).find((a) => a.positionId === positionId && subjectKey(a.subject) === subject) ?? null;
   }
 
   function assignWindow(positionId, anchor, previous = null) {
@@ -238,7 +238,7 @@ export function createActions(env) {
       subject: seatLabel(node),
       title: previous ? t('replace_title') : t('assign_title'),
       submitLabel: previous ? t('replace_submit') : t('assign_submit'),
-      note: previous ? { tone: 'info', text: t('replace_note', { name: previous.display_name, date: formatDay(at()) }) } : null,
+      note: previous ? { tone: 'info', text: t('replace_note', { name: previous.displayName, date: formatDay(at()) }) } : null,
       people: env.people(),
       externals: externalsOf(),
       anchor,
@@ -284,13 +284,13 @@ export function createActions(env) {
   }
 
   function endAssignmentWindow(assignment, anchor) {
-    const position = nodeOf(assignment.position_id);
+    const position = nodeOf(assignment.positionId);
     return openConfirmWindow({
       kind: 'delete',
       title: t('end_assignment_title'),
       submitLabel: t('end_assignment_submit'),
-      subject: `${assignment.display_name} · ${position.role}`,
-      consequence: t('end_assignment_consequence', { who: assignment.display_name, position: position.role, date: formatDay(at()) }),
+      subject: `${assignment.displayName} · ${position.role}`,
+      consequence: t('end_assignment_consequence', { who: assignment.displayName, position: position.role, date: formatDay(at()) }),
       anchor,
       errorMessage: errorText,
       onSubmit: () => perform(endAssignmentOp(assignment, at())),
@@ -304,7 +304,7 @@ export function createActions(env) {
   }
 
   function editPositionWindow(id, anchor) {
-    const position = view().positions.find((p) => p.position_id === id);
+    const position = view().positions.find((p) => p.positionId === id);
     return openEditWindow({
       subject: seatLabel(nodeOf(id)),
       title: t('edit_position_title'),
@@ -312,8 +312,8 @@ export function createActions(env) {
       fields: [
         { key: 'name', label: t('position_name'), kind: 'text', required: true, value: position.name },
         { key: 'code', label: t('position_code'), kind: 'text', value: position.code ?? '', hint: t('position_code_hint') },
-        { key: 'staff', label: t('position_staff'), kind: 'select', required: true, value: position.is_staff ? 'yes' : 'no', options: [yesNo('yes'), yesNo('no')], hint: t('position_staff_hint') },
-        { key: 'role', label: t('position_role'), kind: 'select', value: position.role_id ?? '', options: roleOptions() },
+        { key: 'staff', label: t('position_staff'), kind: 'select', required: true, value: position.isStaff ? 'yes' : 'no', options: [yesNo('yes'), yesNo('no')], hint: t('position_staff_hint') },
+        { key: 'role', label: t('position_role'), kind: 'select', value: position.roleId ?? '', options: roleOptions() },
       ],
       anchor,
       errorMessage: errorText,
@@ -329,7 +329,7 @@ export function createActions(env) {
   }
 
   function editUnitWindow(id, anchor) {
-    const unit = view().units.find((u) => u.unit_id === id);
+    const unit = view().units.find((u) => u.unitId === id);
     return openEditWindow({
       subject: unit.name,
       title: t('edit_unit_title'),
@@ -337,7 +337,7 @@ export function createActions(env) {
       fields: [
         { key: 'name', label: t('unit_name'), kind: 'text', required: true, value: unit.name },
         { key: 'code', label: t('unit_code'), kind: 'text', value: unit.code ?? '' },
-        { key: 'type', label: t('unit_type'), kind: 'select', value: unit.type_id ?? '', options: env.unitTypes().map((ty) => ({ value: ty.id, label: ty.name })) },
+        { key: 'type', label: t('unit_type'), kind: 'select', value: unit.typeId ?? '', options: env.unitTypes().map((ty) => ({ value: ty.id, label: ty.name })) },
       ],
       anchor,
       errorMessage: errorText,
@@ -410,8 +410,8 @@ export function createActions(env) {
   // A unit with the ids of its deputy heads, which the tree model does not carry.
   function unitInfo(unitId) {
     const unit = unitModelOf(unitId);
-    const source = view().units.find((u) => u.unit_id === unitId);
-    return { ...unit, deputyIds: source.deputy_head_position_ids ?? [] };
+    const source = view().units.find((u) => u.unitId === unitId);
+    return { ...unit, deputyIds: source.deputyHeadPositionIds ?? [] };
   }
 
   function headTargets(unit) {
@@ -447,12 +447,12 @@ export function createActions(env) {
   }
 
   function deputiesOf(unitId) {
-    return [...(view().units.find((u) => u.unit_id === unitId)?.deputy_head_position_ids ?? [])];
+    return [...(view().units.find((u) => u.unitId === unitId)?.deputyHeadPositionIds ?? [])];
   }
 
   function addDeputyWindow(unitId, anchor) {
     const unit = unitInfo(unitId);
-    const eligible = new Set(unitSeatCandidates(view(), unitId).map((p) => p.position_id));
+    const eligible = new Set(unitSeatCandidates(view(), unitId).map((p) => p.positionId));
     const targets = model().nodes.filter((n) => n.unitId === unitId).map((n) => {
       const target = { id: n.id, label: seatLabel(n) };
       if (!eligible.has(n.id)) target.disabled = n.id === unit.headId ? t('reason_is_head') : t('reason_is_deputy');
@@ -578,7 +578,7 @@ export function createActions(env) {
   // ---- menus ---------------------------------------------------------------------
 
   function positionMenu(node, anchor) {
-    const assignments = (view().assignments ?? []).filter((a) => a.position_id === node.id);
+    const assignments = (view().assignments ?? []).filter((a) => a.positionId === node.id);
     const unitId = node.unitId;
     const unit = unitInfo(unitId);
     const isHead = unit.headId === node.id;

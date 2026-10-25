@@ -151,13 +151,13 @@ function renderAliasesSection() {
   `;
 
   const rows = aliases.map((a) => {
-    const active = !!a.is_active;
+    const active = !!a.isActive;
     const statusLabel = active
       ? I18n.t('addon_bindings.status_active')
       : I18n.t('addon_bindings.status_inactive');
     const statusVariant = active ? 'ok' : 'warn';
-    const target = String(a.target_model || '').trim();
-    const fallback = String(a.fallback_targets || '').trim();
+    const target = String(a.targetModel || '').trim();
+    const fallback = String(a.fallbackTargets || '').trim();
     const strategy = String(a.strategy || 'first_available');
 
     return `
@@ -421,7 +421,7 @@ function renderStorageSection() {
 
   // KV
   const kv = s.kv || { keys: 0, bytes: 0, limitMb: 0 };
-  const kvLimitMb = Number(kv.limitMb ?? kv.limit_mb ?? 0);
+  const kvLimitMb = Number(kv.limitMb ?? 0);
   const kvFill = kvLimitMb > 0 ? (Number(kv.bytes) / (kvLimitMb * 1024 * 1024)) * 100 : null;
   const kvCard = storageCard({
     icon: 'key',
@@ -433,7 +433,7 @@ function renderStorageSection() {
 
   // SQL
   const sql = s.sql || {};
-  const sqlSize = Number(sql.dbSizeBytes ?? sql.db_size_bytes ?? -1);
+  const sqlSize = Number(sql.dbSizeBytes ?? -1);
   let sqlCard;
   if (!sql.enabled) {
     sqlCard = storageCard({
@@ -525,7 +525,7 @@ function renderStorageDetail(sql, vec) {
     const rows = tables.map((t) => `
       <tr>
         <td>${escapeHtml(t.name)}</td>
-        <td>${fmtCount(t.rows, !!(t.rowsCapped ?? t.rows_capped))} wierszy</td>
+        <td>${fmtCount(t.rows, !!(t.rowsCapped))} wierszy</td>
       </tr>`).join('');
     blocks.push(`
       <div class="storage-detail">

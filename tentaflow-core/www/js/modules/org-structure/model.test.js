@@ -23,19 +23,19 @@ const view = {
   at: '2026-09-30',
   timezone: 'Europe/Warsaw',
   units: [
-    { unit_id: 'unit-it', name: 'IT', code: 'IT', type_id: 'ty-dept', head_position_id: 'pos-cto' },
-    { unit_id: 'unit-qa', name: 'QA', code: null, type_id: null, head_position_id: null },
-    { unit_id: 'unit-ops', name: 'Ops', code: null, type_id: null, head_position_id: 'pos-ops' },
+    { unitId: 'unit-it', name: 'IT', code: 'IT', typeId: 'ty-dept', headPositionId: 'pos-cto' },
+    { unitId: 'unit-qa', name: 'QA', code: null, typeId: null, headPositionId: null },
+    { unitId: 'unit-ops', name: 'Ops', code: null, typeId: null, headPositionId: 'pos-ops' },
   ],
   positions: [
-    { position_id: 'pos-cto', unit_id: 'unit-it', name: 'CTO', primary_parent_position_id: null, is_staff: false, valid_from: '2026-01-01' },
-    { position_id: 'pos-dev', unit_id: 'unit-it', name: 'Developer', primary_parent_position_id: 'pos-cto', is_staff: false, valid_from: '2026-02-01' },
-    { position_id: 'pos-ops', unit_id: 'unit-ops', name: 'Ops lead', primary_parent_position_id: null, is_staff: true, valid_from: '2026-03-01' },
+    { positionId: 'pos-cto', unitId: 'unit-it', name: 'CTO', primaryParentPositionId: null, isStaff: false, validFrom: '2026-01-01' },
+    { positionId: 'pos-dev', unitId: 'unit-it', name: 'Developer', primaryParentPositionId: 'pos-cto', isStaff: false, validFrom: '2026-02-01' },
+    { positionId: 'pos-ops', unitId: 'unit-ops', name: 'Ops lead', primaryParentPositionId: null, isStaff: true, validFrom: '2026-03-01' },
   ],
   assignments: [
-    { position_id: 'pos-cto', subject: anna, display_name: 'Anna Nowak', share: 1 },
-    { position_id: 'pos-dev', subject: anna, display_name: 'Anna Nowak', share: 0.5 },
-    { position_id: 'pos-dev', subject: jan, display_name: '', share: 0.25 },
+    { positionId: 'pos-cto', subject: anna, displayName: 'Anna Nowak', share: 1 },
+    { positionId: 'pos-dev', subject: anna, displayName: 'Anna Nowak', share: 0.5 },
+    { positionId: 'pos-dev', subject: jan, displayName: '', share: 0.25 },
   ],
   vacancies: ['pos-ops'],
   warnings: [],
@@ -50,9 +50,9 @@ test('a platform account and an external person with one id are two people', () 
 });
 
 test('every warning kind is worded with the name of what it is about', () => {
-  assert.match(warningText({ kind: 'unit_without_head', unit_id: 'unit-qa' }, view, t), /"unit":"QA"/);
-  assert.match(warningText({ kind: 'unit_without_head', unit_id: 'a907-not-in-view' }, view, t), /unknown_unit/, 'an id never reaches the sentence');
-  assert.doesNotMatch(warningText({ kind: 'unit_without_head', unit_id: 'a907-not-in-view' }, view, t), /a907/);
+  assert.match(warningText({ kind: 'unit_without_head', unitId: 'unit-qa' }, view, t), /"unit":"QA"/);
+  assert.match(warningText({ kind: 'unit_without_head', unitId: 'a907-not-in-view' }, view, t), /unknown_unit/, 'an id never reaches the sentence');
+  assert.doesNotMatch(warningText({ kind: 'unit_without_head', unitId: 'a907-not-in-view' }, view, t), /a907/);
   assert.match(warningText({ kind: 'share_overbooked', subject: anna, total: 1.5000001 }, view, t), /"person":"Anna Nowak".*"total":1.5/);
   assert.match(warningText({ kind: 'person_without_primary', subject: jan }, view, t), /nieznana osoba/);
   assert.match(warningText({ kind: 'from_a_newer_server' }, view, t), /warning_unknown/, 'an unknown kind is never shown raw');

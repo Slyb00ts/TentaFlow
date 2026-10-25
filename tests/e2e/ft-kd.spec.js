@@ -94,8 +94,7 @@ async function shotBoth(page, base) {
       });
       let role = '';
       if (authMe.ok && authMe.raw) {
-        const u = authMe.raw.user || authMe.raw;
-        role = String(u.role ?? u.role_slug ?? authMe.raw.role ?? '');
+        role = String(authMe.raw.role ?? '');
       }
       facts.role = role;
 

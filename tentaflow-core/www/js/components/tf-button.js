@@ -204,6 +204,11 @@ class TfButton extends HTMLElement {
       this._btn.innerHTML = this._renderContent(escapeHtml(this.getAttribute('label')));
     }
 
+    // A changed `icon` has to reach the glyph that is already built (Send <-> Stop).
+    const glyph = this._btn.querySelector(':scope > svg:first-child > use');
+    const wanted = safeIconName(icon);
+    if (glyph && wanted) glyph.setAttribute('href', `#i-${wanted}`);
+
     const hasText = (this.textContent || '').trim().length > 0 || this._btn.textContent.trim().length > 0;
 
     const classes = ['tf-btn'];

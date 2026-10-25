@@ -107,7 +107,7 @@ const scope = () => ({ workspaceId, sessionId });
 async function registerScriptedProvider(page) {
   const nodes = await api(page, 'meshNodeListRequest');
   const first = (nodes?.nodes ?? [])[0] ?? {};
-  const nodeId = first.nodeId ?? first.node_id ?? '';
+  const nodeId = first.nodeId ?? '';
 
   const res = await api(page, 'serviceManifestDeployRequest', {
     engineId: 'openai-compatible',
@@ -120,7 +120,7 @@ async function registerScriptedProvider(page) {
       model_repo: 'harness-test',
     }),
   });
-  expect(res?.deployId || res?.deploy_id, 'provider deploy returned no id').toBeTruthy();
+  expect(res?.deployId, 'provider deploy returned no id').toBeTruthy();
 }
 
 async function gotoCodeStudio(page) {
@@ -162,7 +162,7 @@ async function gotoCodeStudioViaTile(page) {
 async function usePlainHarness(page) {
   if (!liveModelRequested()) return;
   const pinned = await api(page, 'flowGetRequest', { flowId: 'cs-harness-critic' }).catch(() => null);
-  const json = pinned?.flow?.flowJson ?? pinned?.flow?.flow_json ?? pinned?.flowJson;
+  const json = pinned?.flow?.flowJson ?? pinned?.flowJson;
   if (!json) {
     console.warn('[e2e] cs-harness-critic not found — the pinned pipeline stays in place');
     return;
@@ -227,7 +227,7 @@ async function drainApprovals(page, { decision = 'allow_for_run' } = {}) {
   for (const a of pending) {
     await api(page, 'codeStudioApprovalDecideRequest', {
       ...scope(),
-      approvalId: a.id ?? a.approvalId ?? a.approval_id,
+      approvalId: a.id ?? a.approvalId,
       decision,
     }).catch(() => null);
   }
@@ -243,7 +243,7 @@ async function approvePending(page, { deadlineMs = 60_000, decision = 'allow_for
     for (const a of pending) {
       await api(page, 'codeStudioApprovalDecideRequest', {
         ...scope(),
-        approvalId: a.id ?? a.approvalId ?? a.approval_id,
+        approvalId: a.id ?? a.approvalId,
         decision,
       });
       decided += 1;
@@ -269,7 +269,7 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
     await expect.poll(async () => {
       const body = await api(page, 'serviceListRequest');
       const svc = (body?.services ?? []).find(
-        (s) => (s.engineId ?? s.engine_id) === 'openai-compatible',
+        (s) => (s.engineId) === 'openai-compatible',
       );
       return svc?.status ?? 'missing';
     }, { timeout: 60_000, message: 'scripted provider never came up' }).toMatch(/running|degraded/);
@@ -285,7 +285,7 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
     // agent_context now falls back to the platform default, so we deliberately
     // do NOT bind a model here — the turn in the next test must work anyway.
     const listResp = await api(page, 'agentsListRequest', {});
-    const agents = JSON.parse(listResp?.agentsJson ?? listResp?.agents_json ?? '[]');
+    const agents = JSON.parse(listResp?.agentsJson ?? '[]');
     const codeAgents = agents.filter((a) => String(a.name ?? '').startsWith('code-'));
     expect(codeAgents.length, 'no seeded code-* agents').toBeGreaterThan(0);
     for (const a of codeAgents) {
@@ -313,7 +313,7 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
     const mine = (users?.users ?? []).find(
       (u) => (u.username ?? '') === (me?.username ?? 'admin'),
     );
-    const userId = mine?.id ?? mine?.userId ?? mine?.user_id ?? '';
+    const userId = mine?.id ?? mine?.userId ?? '';
     expect(userId, 'could not resolve the admin user id').toBeTruthy();
     await api(page, 'codeStudioWorkspaceCreatorGrantSetRequest', { userId, granted: true });
 
@@ -399,10 +399,10 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
       // review once the agent stops being parked on one.
       await drainApprovals(page);
       const body = await api(page, 'codeStudioPatchSetsListRequest', scope());
-      const sets = body?.patchSets ?? body?.patch_sets ?? [];
+      const sets = body?.patchSets ?? [];
       const paths = [];
       for (const info of sets) {
-        const id = info.patchSetId ?? info.patch_set_id;
+        const id = info.patchSetId;
         const detail = await api(page, 'codeStudioPatchSetGetRequest', {
           ...scope(), patchSetId: id,
         }).catch(() => null);
@@ -426,21 +426,21 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
     // and are covered by its own unit tests; what matters here is the wire
     // contract and what git does with an accepted set.
     const sets = await api(page, 'codeStudioPatchSetsListRequest', scope());
-    const all = sets?.patchSets ?? sets?.patch_sets ?? [];
+    const all = sets?.patchSets ?? [];
     console.log('[diag] patch sets:', JSON.stringify(all.map((x) => ({
-      id: x.patchSetId ?? x.patch_set_id, status: x.status, scope: x.scope,
-      files: x.fileCount ?? x.file_count,
+      id: x.patchSetId, status: x.status, scope: x.scope,
+      files: x.fileCount,
     }))));
     const target = all.find((s2) => ['open', 'in_review'].includes(s2.status ?? '')) ?? all[0];
     expect(target, 'no patch set at all').toBeTruthy();
-    const patchSetId = target.patchSetId ?? target.patch_set_id;
+    const patchSetId = target.patchSetId;
 
     const detail = await api(page, 'codeStudioPatchSetGetRequest', { ...scope(), patchSetId });
     const files = (detail?.files ?? []).map((f) => ({
-      patchFileId: f.patch_file_id ?? f.patchFileId,
+      patchFileId: f.patchFileId,
       decision: 'accept',
       hunks: (f.hunks ?? []).map((h) => ({
-        patchHunkId: h.patch_hunk_id ?? h.patchHunkId,
+        patchHunkId: h.patchHunkId,
         decision: 'accept',
       })),
     }));
@@ -473,7 +473,7 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
         .then((b) => (b?.approvals ?? []).find((a) => (a.status ?? '') === 'pending'))
         .then((a) => api(page, 'codeStudioApprovalDecideRequest', {
           ...scope(),
-          approvalId: a.id ?? a.approvalId ?? a.approval_id,
+          approvalId: a.id ?? a.approvalId,
           decision: 'allow_for_run',
         }).catch((e) => String(e)));
       expect(String(refused), 'a run-scoped grant with no run was accepted')

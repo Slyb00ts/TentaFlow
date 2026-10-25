@@ -238,7 +238,7 @@ export async function openDeployWizard(engineId, opts = {}) {
     // and derive gpusPerNode from real hardware — TP must be known already in the
     // Advanced step, which runs before cluster-config.
     selection.clusterMembers = await fetchClusterMembers(selection.clusterId);
-    const memberIds = selection.clusterMembers.map((m) => m.node_id).filter(Boolean);
+    const memberIds = selection.clusterMembers.map((m) => m.nodeId).filter(Boolean);
     const withGpu = memberIds.find((id) => nodeGpus(id).length > 0);
     selection.nodeId = withGpu || memberIds[0] || selection.nodeId;
     // gpusPerNode can never exceed a node's physical GPU count. DGX Spark exposes
@@ -250,8 +250,8 @@ export async function openDeployWizard(engineId, opts = {}) {
   }
 
   if (!selection.nodeId) {
-    const local = nodes.find((n) => n?.is_local === true) || nodes[0];
-    selection.nodeId = local ? (local.node_id || local.id) : null;
+    const local = nodes.find((n) => n?.isLocal === true) || nodes[0];
+    selection.nodeId = local ? local.nodeId : null;
   }
 
   hostOs = opts.hostOs || pickHostOs(selection.nodeId);
@@ -341,11 +341,11 @@ async function fetchNodes() {
   try {
     const resp = await ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' });
     if (Array.isArray(resp) && resp.length > 0) {
-      // MeshNodeInfo proto nie ma pola `is_trusted` — backend zwraca tylko
+      // MeshNodeInfo proto nie ma pola `isTrusted` — backend zwraca tylko
       // `source` ("local"|"trusted"|"discovered"). Dlatego filtrujemy po
-      // is_local + source==="trusted", inaczej paired peery wypadaja z
+      // isLocal + source==="trusted", inaczej paired peery wypadaja z
       // listy i wizard pokazuje tylko lokalny node.
-      return resp.filter((n) => n && (n.is_local === true || n.source === 'trusted'));
+      return resp.filter((n) => n && (n.isLocal === true || n.source === 'trusted'));
     }
   } catch (err) {
     console.warn('[wizard] fetchNodes:', err);
@@ -353,17 +353,16 @@ async function fetchNodes() {
   return [];
 }
 
-/// Cluster members for a cluster deploy — normalized to `{ node_id, hostname }`.
-/// Mirrors cluster-detail's resolveMembers (camelCase binary + snake_case legacy).
+/// Cluster members for a cluster deploy — reduced to `{ nodeId, hostname }`.
 async function fetchClusterMembers(clusterId) {
   if (!clusterId) return [];
   try {
     const detail = await ApiBinary.one('clusterDetailRequest', { clusterId });
-    const raw = (detail && (detail.members || detail.cluster?.members)) || [];
+    const raw = detail?.members || [];
     return raw.map((m) => ({
-      node_id: m.nodeId || m.node_id || m.id,
-      hostname: m.hostname || m.node_name || m.nodeId || m.node_id || '',
-    })).filter((m) => m.node_id);
+      nodeId: m.nodeId,
+      hostname: m.hostname || m.nodeId || '',
+    })).filter((m) => m.nodeId);
   } catch (err) {
     console.warn('[wizard] fetchClusterMembers:', err);
     return [];
@@ -378,9 +377,9 @@ function defaultUaOs() {
 }
 
 function pickHostOs(nodeId) {
-  const node = nodes.find((n) => n && (n.node_id || n.id) === nodeId);
+  const node = nodes.find((n) => n && n.nodeId === nodeId);
   if (!node) return defaultUaOs();
-  const os = node.platform || node.os;
+  const os = node.platform;
   return os ? String(os).toLowerCase() : defaultUaOs();
 }
 
@@ -388,9 +387,9 @@ function pickHostOs(nodeId) {
 /// Mirrors `target` in `catalog.js`: same DGX Spark detection so wizard
 /// agrees with the catalog tile that opened it.
 function pickHostCaps(nodeId) {
-  const node = nodes.find((n) => n && (n.node_id || n.id) === nodeId);
+  const node = nodes.find((n) => n && n.nodeId === nodeId);
   if (!node) return { isDgxSpark: false };
-  const os = String(node.platform || node.os || '').toLowerCase();
+  const os = String(node.platform || '').toLowerCase();
   const gpuNames = (Array.isArray(node.gpus) ? node.gpus : [])
     .map((g) => g?.name || '')
     .filter(Boolean);
@@ -608,10 +607,10 @@ function renderStepMethod() {
   let nodeSelector = '';
   if (nodes.length > 1) {
     const options = nodes.map((n) => {
-      const id = n.node_id || n.id;
+      const id = n.nodeId;
       const label = n.hostname || id;
       const selAttr = selection.nodeId === id ? ' selected' : '';
-      const localLabel = n.is_local ? ` (${I18n.t('mesh.local')})` : '';
+      const localLabel = n.isLocal ? ` (${I18n.t('mesh.local')})` : '';
       return `<option value="${escapeAttr(id)}"${selAttr}>${escapeHtml(label)}${localLabel}</option>`;
     }).join('');
     nodeSelector = `
@@ -1024,12 +1023,12 @@ function getAdvancedGpus() {
       ? [{ index: 0, name: 'Apple unified memory', memory_gb: mb / 1024 }]
       : [];
   }
-  const node = nodes.find((n) => (n.node_id || n.id) === selection.nodeId);
+  const node = nodes.find((n) => n.nodeId === selection.nodeId);
   if (!node) return [];
   const allGpus = (node.gpus || []).map((g, i) => ({
     index: g.index ?? i,
     name: g.name || 'GPU',
-    memory_gb: Math.round(((g.vram_total_mb || g.memory_mb || 0) / 1024) * 10) / 10,
+    memory_gb: Math.round(((g.vramTotalMb || 0) / 1024) * 10) / 10,
   }));
   if (selection.gpuSelectMode === 'specific') {
     const ids = new Set((selection.gpuIds || []).map(String));
@@ -1050,15 +1049,15 @@ function getClusterAdvancedGpus() {
   const perNode = Math.max(1, Number(selection.gpusPerNode) || 1);
   const members = selection.clusterMembers || [];
   const gpuMemGb = (g) =>
-    g ? Math.round(((g.vram_total_mb || g.memory_mb || 0) / 1024) * 10) / 10 : 0;
+    g ? Math.round(((g.vramTotalMb || 0) / 1024) * 10) / 10 : 0;
   const repGpus = nodeGpus(selection.nodeId);
   const fallbackMem = gpuMemGb(repGpus[0]);
   const fallbackName = (repGpus[0] && repGpus[0].name) || 'GPU';
   const out = [];
   let idx = 0;
   for (const m of members) {
-    if (!m || !m.node_id) continue;
-    const gpus = nodeGpus(m.node_id);
+    if (!m || !m.nodeId) continue;
+    const gpus = nodeGpus(m.nodeId);
     for (let i = 0; i < perNode; i += 1) {
       const g = gpus[i] || gpus[0] || null;
       out.push({
@@ -1108,17 +1107,14 @@ async function fetchVllmRecommendation(overrides = {}) {
     body.gguf_file = selection.modelFile;
   }
   try {
-    const wireResp = await ApiBinary.action('deployVllmRecommendRequest', body);
-    // Decoder pakuje cala odpowiedz w pole `json` (60+ pol w 4 zagniezdzonych
-    // structach — patrz tentaflow-protocol-wasm decode_message_body).
-    const resp = wireResp && wireResp.json ? JSON.parse(wireResp.json) : wireResp;
-    if (resp && resp.model_spec && !cachedModelSpec) {
+    const resp = await ApiBinary.action('deployVllmRecommendRequest', body);
+    if (resp && resp.modelSpec && !cachedModelSpec) {
       // Cache pomocniczy: dtype wag do readoutow. Pamiec KV liczy backend.
-      const ms = resp.model_spec;
+      const ms = resp.modelSpec;
       cachedModelSpec = {
-        num_layers: ms.num_hidden_layers || ms.num_layers || 0,
-        num_kv_heads: ms.num_key_value_heads || ms.num_kv_heads || ms.num_attention_heads || 0,
-        head_dim: ms.head_dim || (ms.hidden_size && ms.num_attention_heads ? Math.round(ms.hidden_size / ms.num_attention_heads) : 0),
+        num_layers: ms.numHiddenLayers || 0,
+        num_kv_heads: ms.numKeyValueHeads || ms.numAttentionHeads || 0,
+        head_dim: ms.hiddenSize && ms.numAttentionHeads ? Math.round(ms.hiddenSize / ms.numAttentionHeads) : 0,
         dtype: ms.dtype || 'fp16',
       };
     }
@@ -1162,11 +1158,11 @@ function mlxKvDtypeLabel() {
 // pool_tokens / N (mlx-lm dzieli pule miedzy sloty). Floor do 512.
 function mlxMaxContextFromBackend() {
   const rec = advancedRecommendation;
-  if (!rec || rec.error || !rec.vram_estimate) return null;
-  const pool = Number(rec.vram_estimate.pool_tokens) || 0;
+  if (!rec || rec.error || !rec.vramEstimate) return null;
+  const pool = Number(rec.vramEstimate.poolTokens) || 0;
   const seqs = Math.max(1, Number(selection.advanced?.mlx_max_num_seqs) || 1);
   let perSeq = Math.floor(pool / seqs);
-  const maxPos = Number(rec.model_spec?.max_position_embeddings) || 0;
+  const maxPos = Number(rec.modelSpec?.maxPositionEmbeddings) || 0;
   if (maxPos > 0) perSeq = Math.min(perSeq, maxPos);
   return Math.max(0, Math.floor(perSeq / 512) * 512);
 }
@@ -1177,11 +1173,11 @@ function mlxReadoutHtml() {
   const rec = advancedRecommendation;
   if (!rec) return `<div class="adv-loading">${escapeHtml(tAdv('mlx_computing'))}</div>`;
   if (rec.error) return `<div class="adv-error">${escapeHtml(rec.error)}</div>`;
-  const v = rec.vram_estimate || {};
-  const weightsGb = Number(v.model_weights_gb) || 0;
-  const kvPoolGb = Number(v.kv_pool_gb) || 0;
-  const maxPos = Number(rec.model_spec?.max_position_embeddings) || 0;
-  if (v.fits_per_gpu === false || v.fits_total === false) {
+  const v = rec.vramEstimate || {};
+  const weightsGb = Number(v.modelWeightsGb) || 0;
+  const kvPoolGb = Number(v.kvPoolGb) || 0;
+  const maxPos = Number(rec.modelSpec?.maxPositionEmbeddings) || 0;
+  if (v.fitsPerGpu === false || v.fitsTotal === false) {
     return `<div class="adv-error">${escapeHtml(tAdv('mlx_weights_overflow', { gb: weightsGb.toFixed(1) }))}</div>`;
   }
   const tokens = mlxMaxContextFromBackend();
@@ -1328,13 +1324,13 @@ function renderStepAdvanced() {
         <div class="adv-summary-cell">
           <div class="adv-cell-label">${escapeHtml(tk('summary_model'))}</div>
           <div class="adv-cell-value"><code>${escapeHtml(model)}</code></div>
-          ${rec && rec.model_spec ? `<div class="adv-cell-sub">${(rec.model_spec.estimated_params_billions || 0).toFixed(1)}B params · ${escapeHtml(weightDtypeLabel(rec.model_spec))} · max ctx ${(rec.model_spec.max_position_embeddings || 0).toLocaleString()}</div>` : ''}
+          ${rec && rec.modelSpec ? `<div class="adv-cell-sub">${(rec.modelSpec.estimatedParamsBillions || 0).toFixed(1)}B params · ${escapeHtml(weightDtypeLabel(rec.modelSpec))} · max ctx ${(rec.modelSpec.maxPositionEmbeddings || 0).toLocaleString()}</div>` : ''}
         </div>
         <div class="adv-summary-cell">
           <div class="adv-cell-label">${escapeHtml(tk('summary_gpu'))}</div>
           <div class="adv-cell-value">${escapeHtml(gpuLabel)}</div>
           <div class="adv-cell-sub">${escapeHtml(selection.isCluster
-            ? (selection.clusterMembers.map((m) => nodeDisplayName(m.node_id)).filter(Boolean).join(' · ') || '—')
+            ? (selection.clusterMembers.map((m) => nodeDisplayName(m.nodeId)).filter(Boolean).join(' · ') || '—')
             : (gpus.map((g) => `GPU ${g.index}`).join(' · ') || '—'))}</div>
         </div>
       </div>
@@ -1420,7 +1416,7 @@ function specMethodNeedsModel(method) {
 }
 
 function nativeMtpAvailable() {
-  return advancedRecommendation?.native_mtp_available === true;
+  return advancedRecommendation?.nativeMtpAvailable === true;
 }
 
 function renderSpeculativeCard(adv) {
@@ -1481,15 +1477,15 @@ function renderSpeculativeCard(adv) {
 function tAdv(k, params) { return I18n.t(`catalog.deploy_wizard.advanced.${k}`, params); }
 
 function renderVramCard(rec, totalVramGb, gpuCount) {
-  const v = rec.vram_estimate || {};
+  const v = rec.vramEstimate || {};
   const r = rec.recommended || {};
   const isLcpp = isLlamaCppEngine();
-  const perGpu = v.per_gpu_gb || 0;
-  const tpPp = (r.tensor_parallel || 1) * (r.pipeline_parallel || 1);
+  const perGpu = v.perGpuGb || 0;
+  const tpPp = (r.tensorParallel || 1) * (r.pipelineParallel || 1);
   // Backend liczy `total_gb` poprawnie dla obu silnikow (dla llama.cpp compute
   // buffer liczony raz, nie ×N GPU). Mnozenie perGpu × tpPp client-side
   // zawyzaloby total dla llama.cpp, wiec preferujemy autorytatywna wartosc.
-  const totalUsed = (typeof v.total_gb === 'number' && v.total_gb > 0) ? v.total_gb : perGpu * tpPp;
+  const totalUsed = (typeof v.totalGb === 'number' && v.totalGb > 0) ? v.totalGb : perGpu * tpPp;
   const headroomGb = totalVramGb - totalUsed;
   const pctUsed = totalVramGb > 0 ? Math.min(200, Math.round((totalUsed / totalVramGb) * 100)) : 0;
   // Werdykt OOM nalezy do backendu (model puli: dla vLLM total_gb ≈ util×VRAM
@@ -1497,11 +1493,11 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
   // tylko gdy backend zwroci fits_per_gpu/fits_total == false. NIE traktujemy
   // wysokiego pctUsed jako OOM, inaczej "mieszczacy sie" deploy migalby na
   // czerwono mimo poprawnej konfiguracji.
-  const backendFits = v.fits_per_gpu !== false && v.fits_total !== false;
+  const backendFits = v.fitsPerGpu !== false && v.fitsTotal !== false;
 
   // Backend raportuje `at_limit: true` gdy konfiguracja jest na granicy — wtedy
   // pokazujemy zolty pill (auto_adjusted, mieści się, ale brak zapasu).
-  const backendAtLimit = rec && rec.at_limit === true;
+  const backendAtLimit = rec && rec.atLimit === true;
   let pillCls = 'adv-pill ok';
   let pillTxt = backendAtLimit ? tAdv('pill_at_limit', { p: pctUsed }) : tAdv('pill_fits');
   let barCls = 'ok';
@@ -1522,14 +1518,14 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
   prevAtLimit = backendAtLimit;
   if (becameAtLimit) pillCls += ' pulse';
 
-  const weightsGb = v.model_weights_gb || 0;
+  const weightsGb = v.modelWeightsGb || 0;
   // KV to PULA resztkowa (vLLM: util*VRAM - wagi - aktywacje), nie skladnik
   // wymagany. `kv_pool_gb` jest autorytatywne; `kv_cache_gb` zostaje fallbackiem
   // dla starszych odpowiedzi. Pula nie zalezy od max_num_seqs (KRYT-1).
-  const kvGb = (typeof v.kv_pool_gb === 'number' && v.kv_pool_gb > 0) ? v.kv_pool_gb : (v.kv_cache_gb || 0);
-  const poolTokens = Number(v.pool_tokens) || 0;
-  const concurrentSeqs = Number(v.concurrent_full_len_seqs) || 0;
-  const actGb = v.activations_gb || 0;
+  const kvGb = (typeof v.kvPoolGb === 'number' && v.kvPoolGb > 0) ? v.kvPoolGb : (v.kvCacheGb || 0);
+  const poolTokens = Number(v.poolTokens) || 0;
+  const concurrentSeqs = Number(v.concurrentFullLenSeqs) || 0;
+  const actGb = v.activationsGb || 0;
   // Legend percentages must sum to <=100. When totalUsed > totalVramGb each
   // segment would clamp at 100%, producing nonsense like "59 + 100 + 56 = 215%".
   // Normalize against max(totalVramGb, totalUsed) so segments stay proportional
@@ -1556,13 +1552,13 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
       </div>
       ${noFitBanner}
       <div class="adv-kpi-grid" id="edw-adv-kpi">
-        <div class="adv-kpi"><div class="k-label">${escapeHtml(tAdv('kpi_weights'))}</div><div class="k-value">${weightsGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(weightDtypeLabel(rec.model_spec))}</div></div>
+        <div class="adv-kpi"><div class="k-label">${escapeHtml(tAdv('kpi_weights'))}</div><div class="k-value">${weightsGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(weightDtypeLabel(rec.modelSpec))}</div></div>
         <div class="adv-kpi ${kvCls}"><div class="k-label">${escapeHtml(isLcpp ? tAdv('kpi_kv_total') : tAdv('kpi_kv_pool'))}</div><div class="k-value">${kvGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(tAdv(isLcpp ? 'kpi_kv_total_sub' : 'kpi_kv_pool_sub', {
           tokens: poolTokens.toLocaleString(),
           // llama.cpp: whole slots only (-c = ctx × slots); vLLM: fractional pool capacity.
           seqs: isLcpp ? Math.max(1, Math.round(concurrentSeqs)).toLocaleString()
             : (concurrentSeqs >= 10 ? Math.round(concurrentSeqs).toLocaleString() : concurrentSeqs.toFixed(1)),
-          ctx: (r.max_model_len || 0).toLocaleString(),
+          ctx: (r.maxModelLen || 0).toLocaleString(),
         }))}</div></div>
         <div class="adv-kpi"><div class="k-label">${escapeHtml(isLcpp ? tAdv('kpi_compute_buffer') : tAdv('kpi_activations'))}</div><div class="k-value">${actGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(isLcpp ? tAdv('kpi_compute_buffer_sub') : tAdv('kpi_activations_sub'))}</div></div>
         <div class="adv-kpi ${leftCls}"><div class="k-label">${escapeHtml(tAdv('kpi_headroom'))}</div><div class="k-value">${headroomGb >= 0 ? headroomGb.toFixed(1) : '−' + Math.abs(headroomGb).toFixed(1)} GB</div><div class="k-sub">${escapeHtml(tAdv('kpi_headroom_sub', { p: Math.max(0, 100 - pctUsed) }))}</div></div>
@@ -1589,15 +1585,15 @@ function renderAutoAlert(rec) {
     return `<div class="form-hint" style="margin-top:10px;">${escapeHtml(tAdv('auto_default_hint'))}</div>`;
   }
   const r = rec.recommended || {};
-  const args = rec.recommended_vllm_args || '';
+  const args = rec.recommendedVllmArgs || '';
   const warnings = rec.warnings || [];
   // Official vLLM recipe (recipes.vllm.ai) badge: signals that expert flags +
   // per-GPU env were pre-filled from the matched recipe. Args stay editable.
-  const recipeEnv = rec.recommended_env || {};
+  const recipeEnv = rec.recommendedEnv || {};
   const envList = Object.keys(recipeEnv);
-  const recipeBadge = rec.recipe_applied
+  const recipeBadge = rec.recipeApplied
     ? `<div style="margin-top:10px; padding:8px 10px; background:#e8f5e9; border:1px solid #66bb6a; border-radius:6px; font-size:12px; color:#1b5e20;">
-        ✓ ${escapeHtml(tAdv('recipe_applied', { id: rec.recipe_applied }))}${
+        ✓ ${escapeHtml(tAdv('recipe_applied', { id: rec.recipeApplied }))}${
           envList.length
             ? `<br><span style="font-size:11px;">env: ${envList.map((k) => `<code>${escapeHtml(k)}=${escapeHtml(String(recipeEnv[k]))}</code>`).join(' ')}</span>`
             : ''
@@ -1607,10 +1603,10 @@ function renderAutoAlert(rec) {
   // GPU compatibility: when the chosen GPU count doesn't fit the model
   // architecture (TP must divide num_attention_heads, PP must divide
   // num_hidden_layers), surface a warning chip with better-fitting counts.
-  const compat = rec.gpu_compatibility;
+  const compat = rec.gpuCompatibility;
   let compatChip = '';
-  if (compat && !compat.clean_partition) {
-    const better = (compat.better_gpu_counts || []).map((n) => `<code>${n}</code>`).join(' / ');
+  if (compat && !compat.cleanPartition) {
+    const better = (compat.betterGpuCounts || []).map((n) => `<code>${n}</code>`).join(' / ');
     compatChip = `
       <div style="margin-top:10px; padding:10px; background:#fff4e0; border:1px solid #ffb84d; border-radius:6px; font-size:12px; color:#663d00;">
         ⚠️ <strong>${escapeHtml(tAdv('compat_warn_title'))}</strong>
@@ -1618,11 +1614,11 @@ function renderAutoAlert(rec) {
         <em>${escapeHtml(tAdv('compat_better', { options: '' }))} ${better || '—'}</em>
       </div>
     `;
-  } else if (compat && !compat.uses_all_gpus) {
-    const better = (compat.better_gpu_counts || []).map((n) => `<code>${n}</code>`).join(' / ');
+  } else if (compat && !compat.usesAllGpus) {
+    const better = (compat.betterGpuCounts || []).map((n) => `<code>${n}</code>`).join(' / ');
     compatChip = `
       <div style="margin-top:10px; padding:8px; background:#fffbe5; border:1px solid #f5d76e; border-radius:6px; font-size:12px; color:#5c4500;">
-        ℹ️ ${escapeHtml(tAdv('compat_idle', { tp: compat.used_tp, pp: compat.used_pp, used: compat.used_tp * compat.used_pp, options: '' }))} ${better}
+        ℹ️ ${escapeHtml(tAdv('compat_idle', { tp: compat.usedTp, pp: compat.usedPp, used: compat.usedTp * compat.usedPp, options: '' }))} ${better}
       </div>
     `;
   }
@@ -1632,12 +1628,12 @@ function renderAutoAlert(rec) {
       <div class="adv-alert-body">
         <strong>${escapeHtml(tAdv('rec_intro'))}</strong>
         ${escapeHtml(tAdv('rec_summary', {
-          tp: r.tensor_parallel || 1,
-          pp: r.pipeline_parallel || 1,
-          ctx: (r.max_model_len || 0).toLocaleString(),
-          dtype: r.kv_cache_dtype || 'auto',
-          seqs: r.max_num_seqs || 0,
-          mu: (r.gpu_memory_utilization || 0.9).toFixed(2),
+          tp: r.tensorParallel || 1,
+          pp: r.pipelineParallel || 1,
+          ctx: (r.maxModelLen || 0).toLocaleString(),
+          dtype: r.kvCacheDtype || 'auto',
+          seqs: r.maxNumSeqs || 0,
+          mu: (r.gpuMemoryUtilization || 0.9).toFixed(2),
         }))}
         ${recipeBadge}
         ${args ? `<div class="adv-alert-args">${escapeHtml(args)}</div>` : ''}
@@ -1669,42 +1665,42 @@ function renderAdvancedManualControls(adv, rec) {
   const applied = rec?.applied || rec?.recommended || {};
   const recCfg = rec?.recommended || {};
   const isLcpp = isLlamaCppEngine();
-  const autoAdjusted = new Set(Array.isArray(rec?.auto_adjusted) ? rec.auto_adjusted : []);
+  const autoAdjusted = new Set(Array.isArray(rec?.autoAdjusted) ? rec.autoAdjusted : []);
   const lockedParam = adv.lockedParam || null;
 
   // Limity per-param. Backend (po refaktorze rust) udostepnia
   // `max_supported_<param>` indywidualnie liczone pod aktualne overrides
   // — dzieki temu po zalockowaniu np. ctx, max num_seqs natychmiast spada.
-  const modelMaxCtx = rec?.model_spec?.max_position_embeddings || 0;
-  const vramMaxCtx = rec?.max_supported_model_len || 0;
+  const modelMaxCtx = rec?.modelSpec?.maxPositionEmbeddings || 0;
+  const vramMaxCtx = rec?.maxSupportedModelLen || 0;
   const ABSOLUTE_MAX = 1_048_576;
   const maxCtx = Math.min(ABSOLUTE_MAX, Math.max(modelMaxCtx, vramMaxCtx, 32768));
   // Seqs slider cap. vLLM family: fixed scheduler cap 256 (no memory cost).
   // llama.cpp: each slot reserves a full KV context, so the real cap comes
   // from the backend (`max_supported_num_seqs`).
   const seqsCap = isLcpp
-    ? Math.max(1, Math.min(256, Number(rec?.max_supported_num_seqs) || 1))
+    ? Math.max(1, Math.min(256, Number(rec?.maxSupportedNumSeqs) || 1))
     : 256;
 
   // Wartosci pokazywane na sliderach: dla locked param bierzemy z `adv`
   // (user-set), dla pozostalych z `applied` (auto-fit przez backend).
-  const valueFor = (key, fallback) => {
-    if (lockedParam === key) return adv[key] ?? applied[key] ?? recCfg[key] ?? fallback;
-    return applied[key] ?? adv[key] ?? recCfg[key] ?? fallback;
+  const valueFor = (key, wireKey, fallback) => {
+    if (lockedParam === key) return adv[key] ?? applied[wireKey] ?? recCfg[wireKey] ?? fallback;
+    return applied[wireKey] ?? adv[key] ?? recCfg[wireKey] ?? fallback;
   };
 
-  const tp = valueFor('tensor_parallel', 1);
-  const pp = adv.pipeline_parallel ?? applied.pipeline_parallel ?? recCfg.pipeline_parallel ?? 1;
-  const ctx = valueFor('max_model_len', 8192);
-  const seqs = valueFor('max_num_seqs', 16);
+  const tp = valueFor('tensor_parallel', 'tensorParallel', 1);
+  const pp = adv.pipeline_parallel ?? applied.pipelineParallel ?? recCfg.pipelineParallel ?? 1;
+  const ctx = valueFor('max_model_len', 'maxModelLen', 8192);
+  const seqs = valueFor('max_num_seqs', 'maxNumSeqs', 16);
   // Never let the slider clamp a backend-applied value.
   const maxSeqs = Math.max(seqsCap, Number(seqs) || 1);
   // llama.cpp has no 'auto' option (its selects list f16..iq4_nl), so normalize
   // 'auto' to the engine default f16 — otherwise the tf-select renders empty.
   const normKv = (v) => (isLcpp && v === 'auto') ? 'f16' : v;
-  const kv = normKv(adv.kv_cache_dtype || applied.kv_cache_dtype || recCfg.kv_cache_dtype || (isLcpp ? 'f16' : 'auto'));
+  const kv = normKv(adv.kv_cache_dtype || applied.kvCacheDtype || recCfg.kvCacheDtype || (isLcpp ? 'f16' : 'auto'));
   const kvV = normKv(adv.kv_cache_dtype_v || kv);
-  const memUtil = valueFor('gpu_memory_utilization', isPoolingEngine() ? 0.2 : 0.9);
+  const memUtil = valueFor('gpu_memory_utilization', 'gpuMemoryUtilization', isPoolingEngine() ? 0.2 : 0.9);
   const totalGpus = (getAdvancedGpus() || []).length || 1;
 
   // Helper: render the auto-adjust hint shown below a slider.
@@ -1747,10 +1743,10 @@ function renderAdvancedManualControls(adv, rec) {
   // delty. Backend powinien zwracac obie wartosci, ale dzialamy defensive
   // (graceful degradation): jezeli `auto_adjusted` puste, hint sie nie
   // pojawi, a porownanie applied vs recommended jest tylko podpowiedzia.
-  const ctxAdjust = adjustHint('max_model_len', recCfg.max_model_len, applied.max_model_len);
-  const seqsAdjust = adjustHint('max_num_seqs', recCfg.max_num_seqs, applied.max_num_seqs);
-  const tpAdjust = adjustHint('tensor_parallel', recCfg.tensor_parallel, applied.tensor_parallel);
-  const memAdjust = adjustHint('gpu_memory_utilization', recCfg.gpu_memory_utilization, applied.gpu_memory_utilization);
+  const ctxAdjust = adjustHint('max_model_len', recCfg.maxModelLen, applied.maxModelLen);
+  const seqsAdjust = adjustHint('max_num_seqs', recCfg.maxNumSeqs, applied.maxNumSeqs);
+  const tpAdjust = adjustHint('tensor_parallel', recCfg.tensorParallel, applied.tensorParallel);
+  const memAdjust = adjustHint('gpu_memory_utilization', recCfg.gpuMemoryUtilization, applied.gpuMemoryUtilization);
 
   const ctxHint = vramMaxCtx
     ? tAdv('ctx_hint_max_with_vram', { model: modelMaxCtx ? modelMaxCtx.toLocaleString() : '?', vram: vramMaxCtx.toLocaleString() })
@@ -2321,7 +2317,7 @@ function clusterTpSize() {
 /// dysku na kazdym czlonku, po czym dochodzi CUDA-graph capture i autotune.
 function defaultReadyTimeoutSecs() {
   const rec = advancedRecommendation && !advancedRecommendation.error ? advancedRecommendation : null;
-  const weightsGb = rec?.vram_estimate?.model_weights_gb || 0;
+  const weightsGb = rec?.vramEstimate?.modelWeightsGb || 0;
   // ~15 GB/min laczne czytanie wag + 15 min stalego narzutu startu.
   const scaled = Math.ceil((weightsGb / 15) * 60) + 900;
   return Math.min(14400, Math.max(1800, scaled));
@@ -2726,15 +2722,15 @@ function effectiveGpuSelectMode(entry, mode) {
 function nodeGpus(nodeId) {
   if (!nodeId) return [];
   if (gpuListByNode.has(nodeId)) return gpuListByNode.get(nodeId);
-  const node = nodes.find((n) => n && (n.node_id || n.id) === nodeId);
+  const node = nodes.find((n) => n && n.nodeId === nodeId);
   const gpus = Array.isArray(node?.gpus) ? node.gpus : [];
   gpuListByNode.set(nodeId, gpus);
   return gpus;
 }
 
 function nodeDisplayName(nodeId) {
-  const node = nodes.find((n) => n && (n.node_id || n.id) === nodeId);
-  return node?.hostname || node?.node_id || node?.id || nodeId || '';
+  const node = nodes.find((n) => n && n.nodeId === nodeId);
+  return node?.hostname || node?.nodeId || nodeId || '';
 }
 
 function fmtMb(mb) {
@@ -2750,8 +2746,8 @@ function fmtGb(mb) {
 }
 
 function nodeGpuLinks(nodeId) {
-  const node = nodes.find((n) => n && (n.node_id || n.id) === nodeId);
-  return Array.isArray(node?.gpu_links) ? node.gpu_links : [];
+  const node = nodes.find((n) => n && n.nodeId === nodeId);
+  return Array.isArray(node?.gpuLinks) ? node.gpuLinks : [];
 }
 
 function vramTone(pct) {
@@ -2773,11 +2769,11 @@ function gpuSummaryText(gpus) {
   if (selection.gpuSelectMode === 'all') return I18n.t('wizard.gpu_summary_all');
   const ids = new Set(selection.gpuIds);
   const chosen = gpus.filter((_, idx) => ids.has(String(idx)));
-  const totalVram = chosen.reduce((s, g) => s + (g.vram_total_mb || 0), 0);
+  const totalVram = chosen.reduce((s, g) => s + (g.vramTotalMb || 0), 0);
   let text = I18n.t('wizard.gpu_summary_specific', { n: chosen.length, total_vram: fmtMb(totalVram) });
-  const known = chosen.filter((g) => g.vram_used_mb != null && g.vram_total_mb);
+  const known = chosen.filter((g) => g.vramUsedMb != null && g.vramTotalMb);
   if (known.length > 0) {
-    const free = known.reduce((s, g) => s + Math.max(0, g.vram_total_mb - g.vram_used_mb), 0);
+    const free = known.reduce((s, g) => s + Math.max(0, g.vramTotalMb - g.vramUsedMb), 0);
     text += ` · ${I18n.t('wizard.gpu_summary_free', { free_vram: fmtMb(free) })}`;
   }
   return text;
@@ -2800,16 +2796,16 @@ function renderStepGpu() {
 
   const rows = gpus.map((g, idx) => {
     const meta = [
-      g.pci_bus_id ? escapeHtml(shortPciBusId(g.pci_bus_id)) : '',
+      g.pciBusId ? escapeHtml(shortPciBusId(g.pciBusId)) : '',
       pcieLinkHtml(g),
-      g.temperature_c != null ? escapeHtml(`${Math.round(g.temperature_c)}°C`) : '',
-      g.usage_percent != null ? escapeHtml(`util ${Math.round(g.usage_percent)}%`) : '',
+      g.temperatureC != null ? escapeHtml(`${Math.round(g.temperatureC)}°C`) : '',
+      g.utilizationPercent != null ? escapeHtml(`util ${Math.round(g.utilizationPercent)}%`) : '',
     ].filter(Boolean);
     const metaHtml = meta.map((m, i) => i < meta.length - 1 ? `<span>${m}</span><span class="sep">·</span>` : `<span>${m}</span>`).join(' ');
-    const total = Number(g.vram_total_mb) || 0;
+    const total = Number(g.vramTotalMb) || 0;
     let vramHtml;
-    if (total > 0 && g.vram_used_mb != null) {
-      const used = Math.min(total, Math.max(0, Number(g.vram_used_mb) || 0));
+    if (total > 0 && g.vramUsedMb != null) {
+      const used = Math.min(total, Math.max(0, Number(g.vramUsedMb) || 0));
       const pct = Math.round((used / total) * 100);
       const text = I18n.t('wizard.gpu_vram_line', { used: fmtGb(used), total: fmtGb(total), free: fmtGb(total - used) });
       vramHtml = `<tf-progress-bar size="sm" value="${pct}" tone="${vramTone(pct)}"></tf-progress-bar><span class="gpu-vram-text">${escapeHtml(text)}</span>`;
@@ -3415,7 +3411,7 @@ function buildVllmArgs() {
   const rec = advancedRecommendation;
   if (shouldSkipAdvancedStep() || !rec || rec.error) return null;
   const a = selection.advanced;
-  const recArgs = (rec.recommended_vllm_args || '').trim();
+  const recArgs = (rec.recommendedVllmArgs || '').trim();
   // llama.cpp: the backend already returned llama-server flags after the
   // round-trip with the manual overrides — use them verbatim in both modes.
   if (isLlamaCppEngine()) return recArgs || null;
@@ -3431,13 +3427,13 @@ function buildVllmArgs() {
     ]);
   } else {
     const r = rec.recommended || {};
-    const tp = a.tensor_parallel ?? r.tensor_parallel ?? 1;
-    const pp = a.pipeline_parallel ?? r.pipeline_parallel ?? 1;
-    const kv = a.kv_cache_dtype || r.kv_cache_dtype || 'auto';
+    const tp = a.tensor_parallel ?? r.tensorParallel ?? 1;
+    const pp = a.pipeline_parallel ?? r.pipelineParallel ?? 1;
+    const kv = a.kv_cache_dtype || r.kvCacheDtype || 'auto';
     argv = mergeCliArgs(argv, [
-      { flag: '--gpu-memory-utilization', value: String(a.gpu_memory_utilization ?? r.gpu_memory_utilization ?? 0.9) },
-      { flag: '--max-model-len', value: String(a.max_model_len ?? r.max_model_len ?? 8192) },
-      { flag: '--max-num-seqs', value: String(a.max_num_seqs ?? r.max_num_seqs ?? 16) },
+      { flag: '--gpu-memory-utilization', value: String(a.gpu_memory_utilization ?? r.gpuMemoryUtilization ?? 0.9) },
+      { flag: '--max-model-len', value: String(a.max_model_len ?? r.maxModelLen ?? 8192) },
+      { flag: '--max-num-seqs', value: String(a.max_num_seqs ?? r.maxNumSeqs ?? 16) },
       { flag: '--max-num-batched-tokens', value: String(a.max_num_batched_tokens || Math.max(a.max_model_len ?? 8192, 8192)) },
       { flag: '--tensor-parallel-size', value: tp > 1 ? String(tp) : null },
       { flag: '--pipeline-parallel-size', value: pp > 1 ? String(pp) : null },
@@ -3467,9 +3463,9 @@ function buildVllmArgs() {
 // deploy will actually send.
 function previewLaunchCommand() {
   const rec = advancedRecommendation;
-  if (!rec || rec.error || !rec.launch_command) return '';
-  const cmd = String(rec.launch_command);
-  const recArgs = (rec.recommended_vllm_args || '').trim();
+  if (!rec || rec.error || !rec.launchCommand) return '';
+  const cmd = String(rec.launchCommand);
+  const recArgs = (rec.recommendedVllmArgs || '').trim();
   const merged = buildVllmArgs();
   if (!recArgs || !cmd.endsWith(recArgs)) return cmd;
   const base = cmd.slice(0, cmd.length - recArgs.length).trimEnd();
@@ -3573,9 +3569,9 @@ async function startDeploy() {
     // on Blackwell). Backend (`apply_engine_env`) injects these into the engine
     // process env on both native and docker paths. Empty/missing = nothing extra.
     engine_env: (advActive && advancedRecommendation
-      && advancedRecommendation.recommended_env
-      && Object.keys(advancedRecommendation.recommended_env).length)
-      ? advancedRecommendation.recommended_env
+      && advancedRecommendation.recommendedEnv
+      && Object.keys(advancedRecommendation.recommendedEnv).length)
+      ? advancedRecommendation.recommendedEnv
       : undefined,
     // External cloud provider credentials. `api_key` is encrypted server-side
     // (never persisted in clear). `base_url`/`api_version` override the
@@ -3652,7 +3648,7 @@ async function startClusterDeploy() {
 
   const adv = selection.advanced;
   const rec = advancedRecommendation && !advancedRecommendation.error ? advancedRecommendation : null;
-  const maxModelLen = adv.max_model_len || (rec && rec.recommended && rec.recommended.max_model_len) || 8192;
+  const maxModelLen = adv.max_model_len || (rec && rec.recommended && rec.recommended.maxModelLen) || 8192;
   const gpuMem = adv.gpu_memory_utilization ?? 0.5;
 
   if (btn) btn.setAttribute('disabled', '');

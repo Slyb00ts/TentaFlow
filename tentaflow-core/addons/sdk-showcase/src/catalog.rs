@@ -656,6 +656,9 @@ fn sample_value(wire: &str, field: &str, depth: u32, ctr: &mut u64) -> Value {
             ]);
             encode_to_value(&path).unwrap_or(Value::Null)
         }
+        // PdfViewer.src_ref is framed: a relative sample would load the dashboard
+        // itself, which its own frame-ancestors CSP refuses (a console error).
+        "tstr" if field == "src_ref" => Value::Text("about:blank".into()),
         "tstr" => Value::Text(text_sample(field)),
         // Combobox requires searchable=true (catalog §5 0x0305); FormGroup
         // allows `expanded` (sampled as Option<BindRef>) only when collapsible.

@@ -40,22 +40,11 @@ async function loadAndRender(container) {
   try {
     const resp = await ApiBinary.one('addonConfigGetRequest', { addonId: currentAddonId });
     currentSchema = Array.isArray(resp.schema) ? resp.schema : [];
-    cloudProvider = resp.cloudAccountProvider ?? resp.cloud_account_provider ?? '';
+    cloudProvider = resp.cloudAccountProvider ?? '';
     requirements = Array.isArray(resp.requirements) ? resp.requirements : [];
-    // values: tablica [[k,v], ...] lub obiekt
+    // values: [[k, v], ...]
     currentValues = new Map();
-    const raw = resp.values;
-    if (Array.isArray(raw)) {
-      for (const entry of raw) {
-        if (Array.isArray(entry) && entry.length >= 2) {
-          currentValues.set(String(entry[0]), String(entry[1] ?? ''));
-        }
-      }
-    } else if (raw && typeof raw === 'object') {
-      for (const [k, v] of Object.entries(raw)) {
-        currentValues.set(String(k), String(v ?? ''));
-      }
-    }
+    for (const [k, v] of resp.values) currentValues.set(String(k), String(v ?? ''));
     render(container);
   } catch (err) {
     container.innerHTML = `<div class="addons-empty" style="color:var(--danger);">${escapeHtml(err.message)}</div>`;
@@ -128,7 +117,7 @@ function render(container) {
 /// missing engine links to the catalog (that is where an engine is deployed);
 /// an unsupported host says so instead of offering an install that cannot work.
 function renderRequirement(req) {
-  const engine = String(req.engineId ?? req.engine_id ?? '');
+  const engine = String(req.engineId ?? '');
   const status = String(req.status ?? '');
   const tone = status === 'installed' ? 'success' : status === 'missing' ? 'warning' : 'danger';
   const label = I18n.t(`addon_settings.requirement_${status}`);
@@ -157,7 +146,7 @@ async function onInstallRequirement(container, btn) {
     });
     requirements = Array.isArray(resp.requirements) ? resp.requirements : requirements;
     const done = requirements.some((r) =>
-      String(r.engineId ?? r.engine_id) === engineId && String(r.status) === 'installed');
+      String(r.engineId) === engineId && String(r.status) === 'installed');
     toast(
       I18n.t(done ? 'addon_settings.requirement_install_done' : 'addon_settings.requirement_install_incomplete', { engine: engineId }),
       done ? 'success' : 'warning',
@@ -173,11 +162,11 @@ async function onInstallRequirement(container, btn) {
 function renderField(field) {
   const id = String(field.id ?? '');
   const label = String(field.label ?? id);
-  const type = String(field.type ?? field.fieldType ?? field.field_type ?? 'text');
+  const type = String(field.fieldType ?? 'text');
   const desc = String(field.description ?? '');
   const required = !!field.required;
   const secret = !!field.secret;
-  const defaultVal = field.defaultValue ?? field.default_value ?? '';
+  const defaultVal = field.defaultValue ?? '';
   const currentVal = currentValues.has(id) ? currentValues.get(id) : String(defaultVal);
   const options = Array.isArray(field.options) ? field.options : [];
   const requiredMark = required
@@ -291,14 +280,14 @@ async function approvePendingHosts(addonId, hosts) {
   }
   try {
     const current = await ApiBinary.one('addonNetworkRulesGetRequest', { addonId });
-    const allowed = Array.isArray(current.allowedHosts ?? current.allowed_hosts)
-      ? [...(current.allowedHosts ?? current.allowed_hosts)]
+    const allowed = Array.isArray(current.allowedHosts)
+      ? [...current.allowedHosts]
       : [];
     for (const host of hosts) if (!allowed.includes(host)) allowed.push(host);
     await ApiBinary.action('addonNetworkRulesSetRequest', {
       addonId,
       allowedHosts: allowed,
-      blockedHosts: current.blockedHosts ?? current.blocked_hosts ?? [],
+      blockedHosts: current.blockedHosts ?? [],
       mode: current.mode ?? 'strict',
     });
     toast(I18n.t('addon_settings.network_approved'), 'success');

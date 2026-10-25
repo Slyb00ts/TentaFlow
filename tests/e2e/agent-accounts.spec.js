@@ -398,7 +398,7 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     // switch on the N01 tab sends.
     const local = await localRuntimeNode(page);
     expect(local, 'the node does not report its own row').toBeTruthy();
-    await setReceivesAccounts(page, local.node_id, true);
+    await setReceivesAccounts(page, local.nodeId, true);
     await createAccountThroughUi(page, { engine: 'claude-code', name: ACCOUNT_NAME, key: FIRST_KEY });
 
     await expect.poll(() => tableText(page, '#aa-accounts-table')).toContain(ACCOUNT_NAME);
@@ -419,8 +419,8 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     expect(credential.material_enc).not.toContain(FIRST_KEY);
 
     const reloaded = await accountAfterReload(page, row.account_id);
-    expect(reloaded.display_name).toBe(ACCOUNT_NAME);
-    expect(reloaded.credential_revision).toBe(1);
+    expect(reloaded.displayName).toBe(ACCOUNT_NAME);
+    expect(reloaded.credentialRevision).toBe(1);
   });
 
   test('renaming persists in the database and survives a reload', async ({ page }) => {
@@ -435,7 +435,7 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     await expect.poll(() => dbAccount(accountId).display_name).toBe(RENAMED);
 
     const reloaded = await accountAfterReload(page, accountId);
-    expect(reloaded.display_name).toBe(RENAMED);
+    expect(reloaded.displayName).toBe(RENAMED);
   });
 
   test('replacing the API key bumps the stored revision and its fingerprint', async ({ page }) => {
@@ -452,7 +452,7 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     expect(dbCredential(accountId).material_sha256).not.toBe(before.material_sha256);
 
     const reloaded = await accountAfterReload(page, accountId);
-    expect(reloaded.credential_revision).toBe(before.revision + 1);
+    expect(reloaded.credentialRevision).toBe(before.revision + 1);
   });
 
   // A pasted key exists only where it was pasted, so the node it was pasted on
@@ -478,14 +478,14 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     const revision = dbCredential(accountId).revision;
     await win.locator('[data-field="key"] input').fill(SECOND_KEY);
     await win.locator('tf-button[data-act="key-save"]').click();
-    await expect.poll(home).toBe(node.node_id);
+    await expect.poll(home).toBe(node.nodeId);
     expect(dbCredential(accountId).revision, 'the same material is not a rotation').toBe(revision);
 
     // A key the fleet has not seen: a new revision AND the home.
     await away();
     await win.locator('[data-field="key"] input').fill(THIRD_KEY);
     await win.locator('tf-button[data-act="key-save"]').click();
-    await expect.poll(home).toBe(node.node_id);
+    await expect.poll(home).toBe(node.nodeId);
     expect(dbCredential(accountId).revision).toBe(revision + 1);
   });
 
@@ -501,10 +501,10 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     const accountId = dbAccountByName(RENAMED).account_id;
     expect(dbAccount(accountId).credential_kind, 'the key account the previous test homed here').toBe('api_key');
     const home = () => dbAccount(accountId).home_node_id;
-    const row = () => dbRuntimeNodes().find((entry) => entry.node_id === node.node_id) ?? null;
+    const row = () => dbRuntimeNodes().find((entry) => entry.node_id === node.nodeId) ?? null;
 
-    await setReceivesAccounts(page, node.node_id, true);
-    seed(`UPDATE provider_accounts SET home_node_id = ${quote(node.node_id)}
+    await setReceivesAccounts(page, node.nodeId, true);
+    seed(`UPDATE provider_accounts SET home_node_id = ${quote(node.nodeId)}
           WHERE account_id = ${quote(accountId)}`);
 
     await openRuntimeSegment(page);
@@ -528,7 +528,7 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     await expect(refusal).not.toContainText("node '");
     await expect.poll(toggleChecked).toBe(true);
     expect(row()?.receives_accounts, 'a refused flip changes nothing').toBe(1);
-    expect(home()).toBe(node.node_id);
+    expect(home()).toBe(node.nodeId);
 
     // Releasing the binding is the whole of what stood in the way, and the
     // gesture now lands.
@@ -544,10 +544,10 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     // the switch OFF was only ever possible here because the home was cleared
     // first — the store refuses to take a home node out of the fleet (the test
     // above that), so this fixture pair is not a state the API can produce.
-    seed(`UPDATE provider_accounts SET home_node_id = ${quote(node.node_id)}
+    seed(`UPDATE provider_accounts SET home_node_id = ${quote(node.nodeId)}
           WHERE account_id = ${quote(accountId)}`);
-    await setReceivesAccounts(page, node.node_id, true);
-    expect(home()).toBe(node.node_id);
+    await setReceivesAccounts(page, node.nodeId, true);
+    expect(home()).toBe(node.nodeId);
     expect(row()?.receives_accounts).toBe(1);
   });
 
@@ -572,7 +572,7 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     expect(dbAccount(accountId).status).toBe('needs_login');
 
     const reloaded = await accountAfterReload(page, accountId);
-    expect(reloaded.credential_revision).toBe(0);
+    expect(reloaded.credentialRevision).toBe(0);
     expect(reloaded.status).toBe('needs_login');
   });
 
@@ -615,7 +615,7 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     await expect(sessionsHint).toContainText('najwyżej 2');
 
     const reloaded = await accountAfterReload(page, accountId);
-    expect(reloaded.max_sessions).toBe(2);
+    expect(reloaded.maxSessions).toBe(2);
 
     // 0 is a VALUE ("no limit"), not an absence: saving it has to reach the node
     // as 0 rather than being dropped as an empty field.
@@ -654,7 +654,7 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     await page.reload();
     await page.waitForSelector('aside', { timeout: 30000 });
     const fromWire = await api(page, 'providerAccountGetRequest', { accountId });
-    expect(fromWire.grants.map((g) => g.subject_type).sort()).toEqual(['group', 'user']);
+    expect(fromWire.grants.map((g) => g.subjectType).sort()).toEqual(['group', 'user']);
 
     await openAccountsTab(page);
     const reopened = await openAccountWindow(page, RENAMED);
@@ -708,7 +708,7 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     await page.reload();
     await page.waitForSelector('aside', { timeout: 30000 });
     const list = await api(page, 'providerAccountListRequest', { engineId: null, scope: null, query: null });
-    expect(list.accounts.some((a) => a.account_id === accountId)).toBe(false);
+    expect(list.accounts.some((a) => a.accountId === accountId)).toBe(false);
   });
 
   test('a seeded session is listed and "Zakończ" removes it from the node', async ({ page }) => {
@@ -721,7 +721,7 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
       `SELECT granted_by FROM provider_account_grants WHERE account_id = ${quote(accountId)} LIMIT 1`,
     )[0]?.granted_by;
     expect(owner, 'the access test left a grant to take a user id from').toBeTruthy();
-    seedSession(accountId, SESSION_ID, node.node_id, owner);
+    seedSession(accountId, SESSION_ID, node.nodeId, owner);
     expect(dbSessions(accountId).length).toBe(1);
 
     await openAccountsTab(page);
@@ -754,17 +754,17 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     await loginAsAdmin(page);
     const accountId = dbAccountByName(RENAMED).account_id;
     const node = await localRuntimeNode(page);
-    seedMaterialized(accountId, node.node_id);
+    seedMaterialized(accountId, node.nodeId);
 
     await openAccountsTab(page);
     // A01: the cell names the node, and the wire is what it took the name from.
     const list = await api(page, 'providerAccountListRequest', { engineId: null, scope: null, query: null });
-    const wireAccount = list.accounts.find((a) => a.account_id === accountId);
-    expect(wireAccount.used_on.map((n) => n.node_id)).toEqual([node.node_id]);
-    await expect.poll(() => tableText(page, '#aa-accounts-table')).toContain(wireAccount.used_on[0].node_name);
+    const wireAccount = list.accounts.find((a) => a.accountId === accountId);
+    expect(wireAccount.usedOn.map((n) => n.nodeId)).toEqual([node.nodeId]);
+    await expect.poll(() => tableText(page, '#aa-accounts-table')).toContain(wireAccount.usedOn[0].nodeName);
 
     const win = await openAccountWindow(page, RENAMED);
-    await expect(win.locator('.aa-kv')).toContainText(wireAccount.used_on[0].node_name);
+    await expect(win.locator('.aa-kv')).toContainText(wireAccount.usedOn[0].nodeName);
     await expect(win.locator('.aa-kv dd[title]')).toHaveAttribute(
       'title', 'Zgodnie z pomiarem noda, który odpowiedział.',
     );
@@ -772,14 +772,14 @@ test.describe('Konta agentów — administrator (A01, A03, A04)', () => {
     // A04: the org grant the access test left carries who granted it and when.
     const wire = await api(page, 'providerAccountGetRequest', { accountId });
     expect(wire.grants.length).toBeGreaterThan(0);
-    expect(wire.grants[0].granted_at, 'the node records when a grant was made').toBeTruthy();
+    expect(wire.grants[0].grantedAt, 'the node records when a grant was made').toBeTruthy();
     await win.locator('tf-tab#access').click();
     const grants = win.locator('[data-table="grants"]');
     await grants.waitFor({ state: 'visible', timeout: 10000 });
     await expect.poll(() => grants.evaluate((t) => t.shadowRoot?.textContent || '')).toContain('Nadał');
-    if (wire.grants[0].granted_by_name) {
+    if (wire.grants[0].grantedByName) {
       expect(await grants.evaluate((t) => t.shadowRoot?.textContent || ''))
-        .toContain(wire.grants[0].granted_by_name);
+        .toContain(wire.grants[0].grantedByName);
     }
     await page.keyboard.press('Escape');
   });
@@ -813,7 +813,7 @@ test.describe('Logowanie u dostawcy (A02)', () => {
     // nothing, so the binding is released the way an operator releases it — by
     // signing the account in elsewhere, which for a fixture is the column.
     seed('UPDATE provider_accounts SET home_node_id = NULL');
-    await setReceivesAccounts(page, node.node_id, false);
+    await setReceivesAccounts(page, node.nodeId, false);
     await openAccountsTab(page);
 
     await clickRowAction(page, LOGIN_NAME, 'Zaloguj');
@@ -840,7 +840,7 @@ test.describe('Logowanie u dostawcy (A02)', () => {
     await loginAsAdmin(page);
     const account = dbAccountByName(LOGIN_NAME);
     const node = await localRuntimeNode(page);
-    await setReceivesAccounts(page, node.node_id, true);
+    await setReceivesAccounts(page, node.nodeId, true);
     await openAccountsTab(page);
 
     await clickRowAction(page, LOGIN_NAME, 'Zaloguj');
@@ -884,7 +884,7 @@ test.describe('Logowanie u dostawcy (A02)', () => {
     // Put the matrix back the way this suite found it: a node that receives no
     // accounts and has no engine installed keeps NO row at all, which is the
     // starting point the N01 toggle test measures against.
-    await setReceivesAccounts(page, node.node_id, false);
+    await setReceivesAccounts(page, node.nodeId, false);
     expect(dbRuntimeNodes().length).toBe(0);
   });
 
@@ -932,7 +932,7 @@ test.describe('Aplikacje na nodach (N01)', () => {
     await page.reload();
     await page.waitForSelector('aside', { timeout: 30000 });
     const nodes = await api(page, 'providerAccountRuntimeListRequest', {});
-    expect(nodes.nodes[0].receives_accounts).toBe(!before);
+    expect(nodes.nodes[0].receivesAccounts).toBe(!before);
     await openAccountsTab(page);
     await page.locator('#svc-tab-body [data-field="segment"] .tf-seg-opt[data-value="runtime"]').click();
     await page.waitForSelector('#aa-runtime-table', { timeout: 15000 });
@@ -950,10 +950,10 @@ test.describe('Aplikacje na nodach (N01)', () => {
 
     // Every other node's copy is fanned out of the node that MINTED the
     // credential, so a node still holding that role may not leave the fleet.
-    await setReceivesAccounts(page, node.node_id, true);
-    seed(`UPDATE provider_accounts SET home_node_id = ${quote(node.node_id)}
+    await setReceivesAccounts(page, node.nodeId, true);
+    seed(`UPDATE provider_accounts SET home_node_id = ${quote(node.nodeId)}
           WHERE account_id = ${quote(account.account_id)}`);
-    const row = () => dbRuntimeNodes().find((entry) => entry.node_id === node.node_id) ?? null;
+    const row = () => dbRuntimeNodes().find((entry) => entry.node_id === node.nodeId) ?? null;
 
     await openRuntimeSegment(page);
     const toggleChecked = () => page.locator('#aa-runtime-table').evaluate(
@@ -971,7 +971,7 @@ test.describe('Aplikacje na nodach (N01)', () => {
     await expect(page.locator('.toast.toast-error').last()).toContainText('Na tym nodzie zalogowano konta agentów');
     await expect.poll(toggleChecked).toBe(true);
     expect(row()?.receives_accounts, 'a refused flip changes nothing').toBe(1);
-    expect(dbAccountByName(LOGIN_NAME).home_node_id).toBe(node.node_id);
+    expect(dbAccountByName(LOGIN_NAME).home_node_id).toBe(node.nodeId);
 
     // Releasing the binding — the effect of signing the account in on another
     // node — is the whole of what stood in the way, and the gesture now lands.
@@ -1009,10 +1009,10 @@ test.describe('Aplikacje na nodach (N01)', () => {
     // A CLI this node really installed would need the vendor's package; the
     // row it WOULD write is seeded instead, so the "installed" cell and the
     // uninstall that follows are the real ones.
-    seed(`INSERT OR IGNORE INTO agent_runtime_nodes (node_id) VALUES (${quote(node.node_id)})`);
+    seed(`INSERT OR IGNORE INTO agent_runtime_nodes (node_id) VALUES (${quote(node.nodeId)})`);
     seed(
       `INSERT OR REPLACE INTO agent_runtime_engines (node_id, engine_id, install_state, version, installed_at)
-       VALUES (${quote(node.node_id)}, 'codex', 'installed', '9.9.9-e2e', datetime('now'))`,
+       VALUES (${quote(node.nodeId)}, 'codex', 'installed', '9.9.9-e2e', datetime('now'))`,
     );
 
     await openRuntimeSegment(page);
@@ -1022,7 +1022,7 @@ test.describe('Aplikacje na nodach (N01)', () => {
     await expect.poll(() => dbRuntimeEngines().filter((e) => e.engine_id === 'codex').length).toBe(0);
     await expect.poll(() => tableText(page, '#aa-runtime-table')).not.toContain('9.9.9-e2e');
     const nodes = await api(page, 'providerAccountRuntimeListRequest', {});
-    expect((nodes.nodes[0].engines ?? []).some((e) => e.engine_id === 'codex')).toBe(false);
+    expect((nodes.nodes[0].engines ?? []).some((e) => e.engineId === 'codex')).toBe(false);
   });
 
   test('installing an application runs on the node and the matrix shows what it reported', async ({ page }) => {
@@ -1148,9 +1148,9 @@ test.describe('Logowanie u dostawcy na żywo (A02)', () => {
     test.setTimeout(600_000);
     await loginAsAdmin(page);
     const node = await localRuntimeNode(page);
-    await setReceivesAccounts(page, node.node_id, true);
+    await setReceivesAccounts(page, node.nodeId, true);
     const installed = await api(page, 'providerAccountRuntimeInstallRequest', {
-      nodeId: node.node_id, engineId: 'claude-code',
+      nodeId: node.nodeId, engineId: 'claude-code',
     }).catch((error) => ({ error: String(error?.message ?? error) }));
     const engineRow = dbRuntimeEngines().find((e) => e.engine_id === 'claude-code');
     test.skip(
@@ -1226,7 +1226,7 @@ test.describe('Logowanie u dostawcy na żywo (A02)', () => {
 
     // Leave the engine as the rest of the suite expects it. The node row stays
     // (it receives accounts), which is what the later U01 test reads its id from.
-    await api(page, 'providerAccountRuntimeUninstallRequest', { nodeId: node.node_id, engineId: 'claude-code' });
+    await api(page, 'providerAccountRuntimeUninstallRequest', { nodeId: node.nodeId, engineId: 'claude-code' });
   });
 });
 
@@ -1273,7 +1273,7 @@ test.describe('Moje konta — użytkownik (U01)', () => {
     await page.waitForSelector('#myacc-apps .myapp-card', { timeout: 20000 });
     await expect(page.locator('#myacc-apps .myapp-card[data-engine="codex"]')).toContainText('Odłącz');
     const mine = await api(page, 'providerAccountMyListRequest', { engineId: null });
-    expect(mine.accounts.some((a) => a.account_id === own.account_id)).toBe(true);
+    expect(mine.accounts.some((a) => a.accountId === own.account_id)).toBe(true);
   });
 
   test('the card says how the account authenticates, where it is used and how many sessions it has', async ({ page }) => {
@@ -1293,12 +1293,12 @@ test.describe('Moje konta — użytkownik (U01)', () => {
     // Every one of the three comes off the wire, and the count is inflected by
     // i18n rather than glued to a fixed noun.
     const wire = await api(page, 'providerAccountMyListRequest', { engineId: null });
-    const mine = wire.accounts.find((a) => a.account_id === own.account_id);
-    expect(mine.credential_kind).toBe('api_key');
-    expect(mine.used_on.map((n) => n.node_id)).toEqual([node.node_id]);
-    expect(mine.session_count).toBe(1);
+    const mine = wire.accounts.find((a) => a.accountId === own.account_id);
+    expect(mine.credentialKind).toBe('api_key');
+    expect(mine.usedOn.map((n) => n.nodeId)).toEqual([node.node_id]);
+    expect(mine.sessionCount).toBe(1);
     await expect(card).toContainText('Klucz API');
-    await expect(card).toContainText(`używane na: ${mine.used_on[0].node_name}`);
+    await expect(card).toContainText(`używane na: ${mine.usedOn[0].nodeName}`);
     await expect(card).toContainText('1 aktywna sesja');
     // An API-key account has nothing to sign in to.
     await expect(card.locator('[data-role="app-login"]')).toHaveCount(0);
@@ -1333,7 +1333,7 @@ test.describe('Moje konta — użytkownik (U01)', () => {
     expect(dbCredential(own.account_id)).toBeNull();
     await expect.poll(() => card.textContent()).toContain('Zaloguj');
     const mine = await api(page, 'providerAccountMyListRequest', { engineId: null });
-    expect(mine.accounts.find((a) => a.account_id === own.account_id).can_login).toBe(true);
+    expect(mine.accounts.find((a) => a.accountId === own.account_id).canLogin).toBe(true);
   });
 });
 
@@ -1433,7 +1433,7 @@ test.describe('Karty tf-radio na drugim ekranie (kreator ML Studio)', () => {
     const install = await page.evaluate(async () => {
       const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
       const packages = await ApiBinary.list('addonCatalogListRequest', { arrayKey: 'packages' });
-      const pkg = packages.find((p) => (p.packageId ?? p.package_id) === 'ml-studio');
+      const pkg = packages.find((p) => p.packageId === 'ml-studio');
       if (!pkg) return { ok: false, error: 'ml-studio is not in the catalogue' };
       const installed = await ApiBinary.action('addonInstanceInstallRequest', {
         packageId: 'ml-studio',
@@ -1444,10 +1444,10 @@ test.describe('Karty tf-radio na drugim ekranie (kreator ML Studio)', () => {
       if (!installed.ok) return installed;
       // An instance lands disabled, and the app gate refuses a disabled app.
       const addons = await ApiBinary.list('addonsListRequest', { arrayKey: 'addons' });
-      const instance = addons.find((a) => (a.packageId ?? a.package_id) === 'ml-studio');
+      const instance = addons.find((a) => a.packageId === 'ml-studio');
       if (!instance) return { ok: false, error: 'the ml-studio instance is not listed' };
       await ApiBinary.action('addonToggleRequest', {
-        addonId: instance.addonId ?? instance.addon_id,
+        addonId: instance.addonId,
         enabled: true,
       });
       return installed;
@@ -1599,7 +1599,7 @@ test.describe('Agent na aplikacji CLI (G01)', () => {
     // cli_model".
     // ---------------------------------------------------------------------
     const roster = await api(page, 'agentsListRequest', {});
-    const seeded = JSON.parse(roster?.agentsJson ?? roster?.agents_json ?? '[]')
+    const seeded = JSON.parse(roster?.agentsJson ?? '[]')
       .find((a) => a.name === AGENT_SLUG);
     expect(seeded?.id, 'the seeded agent is not on the node').toBeTruthy();
     await api(page, 'agentsUpsertRequest', {

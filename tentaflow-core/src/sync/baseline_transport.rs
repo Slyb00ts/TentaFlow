@@ -582,6 +582,12 @@ pub fn joiner_should_resume(state: &BaselineAdoptState) -> bool {
 /// wymaga. `None` gdy nic do wznowienia (brak stanu, donor, albo juz po imporcie).
 /// Wywolujacy (mesh startup) otwiera strumien do peera i wola `run_joiner_session`.
 pub fn pending_joiner_resume(db: &DbPool) -> LedgerResult<Option<(String, u64)>> {
+    if matches!(
+        crate::sync::core_baseline::load_adopt_state(db)?.map(|s| s.phase),
+        Some(BaselinePhase::Elected | BaselinePhase::Receiving)
+    ) {
+        crate::sync::core_baseline::drop_stale_adopt_state(db)?;
+    }
     let Some(state) = load_adopt_state(db)? else {
         return Ok(None);
     };

@@ -90,7 +90,7 @@ test('the target detail brings the session address and state, Opis, the sampler 
       },
     },
   });
-  assert.equal(body.variant, 'TentaNasTargetGetResponse');
+  assert.equal(body._variant, 'TentaNasBody.TargetGetResponse');
   assert.equal(body.sessions[0].address, '10.10.0.21');
   assert.equal(body.sessions[0].state, 'LOGGED_IN');
   assert.equal(body.sessions[0].connectedAt, '2026-09-20T07:00:00Z');
@@ -101,7 +101,7 @@ test('the target detail brings the session address and state, Opis, the sampler 
   assert.equal(body.listen[0].port, 3260);
 });
 
-test('an older node\'s answer decodes with empty session fields and no dates', { skip }, () => {
+test('an older node\'s answer decodes without the session fields and dates', { skip }, () => {
   const { initiator_descriptions: _dropped, ...older } = TARGET;
   const body = decodeBody({
     TentaNasBody: {
@@ -112,25 +112,26 @@ test('an older node\'s answer decodes with empty session fields and no dates', {
       },
     },
   });
-  assert.equal(body.sessions[0].address, '');
-  assert.equal(body.sessions[0].state, '');
-  assert.deepEqual(body.target.initiatorDescriptions, {});
-  assert.deepEqual(body.initiatorsSeen, []);
-  assert.equal(body.seenSince, '');
-  assert.deepEqual(body.listen, []);
+  // The generic decoder does not synthesize serde defaults: absent stays absent.
+  assert.equal(body.sessions[0].address, undefined);
+  assert.equal(body.sessions[0].state, undefined);
+  assert.equal(body.target.initiatorDescriptions, undefined);
+  assert.equal(body.initiatorsSeen, undefined);
+  assert.equal(body.seenSince, undefined);
+  assert.equal(body.listen, undefined);
 });
 
 // ----- "Rozłącz" and the allowlist save ------------------------------------------
 
 test('TargetSessionResetRequest crosses the real glue named by the IQN, revoke only when asked', { skip }, () => {
   const sent = request('tentaNasTargetSessionResetRequest', { targetId: 't1', initiator: 'iqn.1994-05.com.redhat:vmhost-01', revoke: true, sudoPassword: 'sekret' });
-  assert.equal(sent.variant, 'TentaNasTargetSessionResetRequest');
+  assert.equal(sent._variant, 'TentaNasBody.TargetSessionResetRequest');
   assert.equal(sent.targetId, 't1');
   assert.equal(sent.initiator, 'iqn.1994-05.com.redhat:vmhost-01');
   assert.equal(sent.revoke, true);
   // Exactly these fields travel: no session id, ISID, TSIH or cntlid.
-  const fields = Object.keys(sent).filter((k) => k !== 'variant' && !/[A-Z]/.test(k)).sort();
-  assert.deepEqual(fields, ['initiator', 'revoke', 'sudo_password', 'target_id']);
+  const fields = Object.keys(sent).filter((k) => k !== '_variant').sort();
+  assert.deepEqual(fields, ['initiator', 'revoke', 'sudoPassword', 'targetId']);
   const plain = request('tentaNasTargetSessionResetRequest', { targetId: 't1', initiator: 'iqn.1994-05.com.redhat:vmhost-01' });
   assert.equal(plain.revoke, false);
   assert.equal(plain.sudoPassword, null);
@@ -141,7 +142,7 @@ test('the allowlist save carries Opis, and leaves it null when the screen does n
     targetId: 't1', initiators: ['iqn.1994-05.com.redhat:vmhost-01'],
     initiatorDescriptions: { 'iqn.1994-05.com.redhat:vmhost-01': 'Proxmox vmhost-01' }, enabled: true,
   });
-  assert.equal(withOpis.variant, 'TentaNasTargetUpdateRequest');
+  assert.equal(withOpis._variant, 'TentaNasBody.TargetUpdateRequest');
   assert.equal(withOpis.initiatorDescriptions['iqn.1994-05.com.redhat:vmhost-01'], 'Proxmox vmhost-01');
   const without = request('tentaNasTargetUpdateRequest', { targetId: 't1', initiators: ['iqn.1994-05.com.redhat:vmhost-01'], enabled: true });
   assert.equal(without.initiatorDescriptions, null, 'absent means keep, never an empty map that wipes');

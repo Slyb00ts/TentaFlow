@@ -79,7 +79,7 @@ test('the disable preview brings every node by name and the answering node\'s mo
       privilege: 'password',
     },
   });
-  assert.equal(body.variant, 'AddonDisablePreviewResponse');
+  assert.equal(body._variant, 'AddonDisablePreviewResponseBody');
   assert.equal(body.privilege, 'password', 'the mode chip survives the decoder');
   assert.equal(body.nodes.length, 2, 'the node list survives the decoder');
   assert.equal(body.nodes[0].name, 'helios');
@@ -90,23 +90,24 @@ test('the disable preview brings every node by name and the answering node\'s mo
   assert.equal(body.consequences[0].kind, 'tentanas_api_closed');
 });
 
-test('an older node\'s preview without nodes decodes to an empty list and no mode', { skip }, () => {
+test('an older node\'s preview without nodes decodes with neither nodes nor mode', { skip }, () => {
   const body = decodeBody({
     AddonDisablePreviewResponseBody: {
       addon_id: 'tentanas-1a2b3c4d', display_name: 'TentaNas', node_name: 'helios', background_on_disable: false, consequences: [],
     },
   });
-  assert.deepEqual(body.nodes, []);
-  assert.equal(body.privilege, '');
+  // The generic decoder does not synthesize serde defaults: absent stays absent.
+  assert.equal(body.nodes, undefined);
+  assert.equal(body.privilege, undefined);
 });
 
 // ----- n18d: stop sharing on this node ----------------------------------------------
 
 test('SharingStopRequest crosses the real glue as the one field-less request', { skip }, () => {
   const sent = request('tentaNasSharingStopRequest', {});
-  assert.equal(sent.variant, 'TentaNasSharingStopRequest');
+  assert.equal(sent._variant, 'TentaNasBody.SharingStopRequest');
   // Nothing rides along: the node reads its own shares and targets.
-  const extra = Object.keys(sent).filter((k) => k !== 'variant');
+  const extra = Object.keys(sent).filter((k) => k !== '_variant');
   assert.deepEqual(extra, []);
 });
 
@@ -124,7 +125,7 @@ test('the parked stop comes back with its coded detail for the approver', { skip
       },
     },
   });
-  assert.equal(body.variant, 'TentaNasApprovalPendingResponse');
+  assert.equal(body._variant, 'TentaNasBody.ApprovalPendingResponse');
   assert.equal(body.approval.operation, 'sharing_stop');
   assert.equal(body.approval.subject, 'helios');
   assert.equal(body.approval.detailReasons[0].code, 'sharing_stop');

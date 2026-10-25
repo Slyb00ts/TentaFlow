@@ -60,17 +60,17 @@ export function rowsOf(groups) {
         title: item.title,
         role: item.role,
         state: item.state ?? '',
-        projectId: item.project_id ?? null,
-        projectName: item.project_name ?? null,
-        unitName: item.unit_name ?? null,
-        validTo: item.valid_to ?? null,
+        projectId: item.projectId ?? null,
+        projectName: item.projectName ?? null,
+        unitName: item.unitName ?? null,
+        validTo: item.validTo ?? null,
         action: item.action,
         suggestion,
-        eligible: Array.isArray(item.eligible_user_ids) ? new Set(item.eligible_user_ids) : null,
+        eligible: Array.isArray(item.eligibleUserIds) ? new Set(item.eligibleUserIds) : null,
         blocked: item.blocked ?? null,
         // An item the server says cannot be handed over now is shown but never ticked.
         selected: !item.blocked,
-        taker: suggestion?.user_id ?? '',
+        taker: suggestion?.userId ?? '',
         manual: false,
       });
     }
@@ -96,7 +96,7 @@ export function canTake(row, userId) {
 
 /** The people the row's select offers: the eligible ones, in the order the server sent them. */
 export function takerOptions(row, takers) {
-  return takers.filter((person) => canTake(row, person.user_id));
+  return takers.filter((person) => canTake(row, person.userId));
 }
 
 export const selectedRows = (rows) => rows.filter((row) => row.selected && !row.blocked);
@@ -130,7 +130,7 @@ export function absenceRecords(records, today) {
       return {
         record,
         // Waiting = the work is with the takers and comes back on the return day.
-        away: Boolean(record.return_date) && record.return_date > today && count('done') > 0,
+        away: Boolean(record.returnDate) && record.returnDate > today && count('done') > 0,
         done: count('done'),
         returned: count('returned'),
         kept: count('kept'),
@@ -184,7 +184,7 @@ export function summarize(answer) {
     failed: count('failed', 'not_started'),
     skipped: count('skipped'),
     failedKeys: items.filter((item) => FAILED.has(item.status)).map((item) => item.key),
-    retryable: Boolean(answer?.handover_id) && items.some((item) => FAILED.has(item.status)),
+    retryable: Boolean(answer?.handoverId) && items.some((item) => FAILED.has(item.status)),
     total: items.length,
   };
 }
@@ -196,7 +196,7 @@ export function reasonKey(code) {
 
 /** People as the select and the takers of "hand everything to" show them, sorted by name. */
 export function sortedTakers(takers) {
-  return [...(takers ?? [])].sort((a, b) => SORT(a.display_name, b.display_name) || SORT(a.user_id, b.user_id));
+  return [...(takers ?? [])].sort((a, b) => SORT(a.displayName, b.displayName) || SORT(a.userId, b.userId));
 }
 
 export function initials(name) {

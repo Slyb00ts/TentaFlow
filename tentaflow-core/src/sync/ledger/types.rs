@@ -346,6 +346,41 @@ pub struct SyncOperation {
     pub signature: Vec<u8>,
 }
 
+/// The slice of an operation the permission backfill needs: which resource it
+/// belongs to and, for an addon instance, which package it pins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationSummary {
+    pub op_id: OperationId,
+    pub org_id: String,
+    pub addon_id: String,
+    pub resource_type: String,
+    pub resource_id: String,
+    pub addon_package: Option<(String, String)>,
+}
+
+impl OperationSummary {
+    pub fn from_operation(operation: &SyncOperation) -> Self {
+        let body = &operation.body;
+        let field = |key: &str| match body.changed_fields.get(key) {
+            Some(FieldValue::String(value)) => Some(value.clone()),
+            _ => None,
+        };
+        let addon_package = if body.resource_type == "core.addon_instance" {
+            field("package_id").zip(field("package_version"))
+        } else {
+            None
+        };
+        Self {
+            op_id: operation.op_id,
+            org_id: body.org_id.clone(),
+            addon_id: body.addon_id.clone(),
+            resource_type: body.resource_type.clone(),
+            resource_id: body.resource_id.clone(),
+            addon_package,
+        }
+    }
+}
+
 impl SyncOperation {
     pub fn from_new(
         new_operation: NewSyncOperation,
@@ -552,6 +587,16 @@ pub struct InboxEntry {
     /// eventually surfaced as a conflict instead of being retried forever.
     #[serde(default)]
     pub deferred_count: u32,
+    /// Set when the entry gave up after its deferral budget. Unlike a data
+    /// conflict it is reopened as soon as another op applies, because the
+    /// prerequisite it waited for may have arrived in the meantime.
+    #[serde(default)]
+    pub ordering_exhausted: bool,
+    /// How many times an ordering-exhausted entry was reopened. Bounded so an
+    /// op whose prerequisite is gone for good ends as a permanent conflict
+    /// instead of cycling through reopen/exhaust on every drain.
+    #[serde(default)]
+    pub reopen_cycles: u8,
 }
 
 /// What the local node has observed of one remote node's chain: the highest
@@ -640,12 +685,16 @@ pub trait SyncLedgerStore: Send + Sync {
     /// Every operation routed to a partition (materialization index), unordered
     /// across node chains. Callers order by HLC.
     fn get_operations(&self, query: OperationQuery) -> LedgerResult<Vec<SyncOperation>>;
-    /// Every full operation body the store currently holds (the content keyspace),
+    /// Compact routing summary of every full operation the store holds,
     /// independent of partition. Used by the authority-side permission backfill to
     /// re-evaluate outbox targets for ops minted BEFORE a grant: a redacted op
     /// carries no partition/resource, so a freshly-permitted receiver cannot ask
     /// for the right partition — the authority must reverse the gate and re-enqueue.
-    fn list_all_operations(&self) -> LedgerResult<Vec<SyncOperation>>;
+    /// A summary is derived once per operation and persisted, so repeated calls
+    /// decode only operations added since the previous call.
+    fn list_operation_summaries(&self) -> LedgerResult<Vec<OperationSummary>>;
+    /// Number of full operations held, counted without decoding any body.
+    fn count_operations(&self) -> LedgerResult<usize>;
     /// A contiguous slice of one node's chain ordered by `node_seq`. The dense
     /// axis pull/repair/snapshot-tail validate against.
     fn get_node_operations(&self, query: NodeLogQuery) -> LedgerResult<Vec<SyncOperation>>;
@@ -724,6 +773,18 @@ pub trait SyncLedgerStore: Send + Sync {
         op_id: OperationId,
         message: String,
     ) -> LedgerResult<()>;
+    /// Terminal-for-now variant of `mark_inbox_conflicted` for an entry that ran
+    /// out of ordering deferrals; `reopen_ordering_exhausted` makes it retryable
+    /// until a fixed reopen budget is used, after which the conflict is final.
+    /// Returns the number of reopen cycles the entry had already used.
+    fn mark_inbox_ordering_exhausted(
+        &self,
+        source: PeerId,
+        op_id: OperationId,
+        message: String,
+    ) -> LedgerResult<u8>;
+    /// Makes every ordering-exhausted entry retryable again; returns how many.
+    fn reopen_ordering_exhausted(&self) -> LedgerResult<usize>;
     /// Marks an entry as deferred (retryable) for ordering reasons and returns the
     /// new deferral count, so the caller can give up after a bounded number of
     /// fruitless retries. The entry stays in `list_unapplied_inbox`.

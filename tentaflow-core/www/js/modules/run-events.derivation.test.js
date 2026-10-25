@@ -33,26 +33,26 @@ const { normalizeRow, deriveTimeline, plotFrom } = await import(moduleUrl);
 
 function row(seq, kind, atMs, payload, extra = {}) {
   return normalizeRow({
-    run_id: 'run-1',
+    runId: 'run-1',
     seq,
-    at_ms: atMs,
+    atMs: atMs,
     kind,
     origin: 'code_studio',
-    actor_kind: 'user',
-    actor_id: 'u-1',
-    payload_json: JSON.stringify({ kind, ...payload }),
+    actorKind: 'user',
+    actorId: 'u-1',
+    payloadJson: JSON.stringify({ kind, ...payload }),
     ...extra,
   });
 }
 
 test('two concurrent calls to one tool keep their own spans', () => {
   const rows = [
-    row(1, 'tool_call', 1000, { name: 'core.fs_read' }, { call_id: 'c-a' }),
-    row(2, 'tool_call', 1010, { name: 'core.fs_read' }, { call_id: 'c-b' }),
+    row(1, 'tool_call', 1000, { name: 'core.fs_read' }, { callId: 'c-a' }),
+    row(2, 'tool_call', 1010, { name: 'core.fs_read' }, { callId: 'c-b' }),
     // The SECOND call finishes first. Pairing by tool name would hand this end
     // to the first band and leave the second one open.
-    row(3, 'tool_result', 1050, { name: 'core.fs_read', ok: true }, { call_id: 'c-b' }),
-    row(4, 'tool_result', 1400, { name: 'core.fs_read', ok: true }, { call_id: 'c-a' }),
+    row(3, 'tool_result', 1050, { name: 'core.fs_read', ok: true }, { callId: 'c-b' }),
+    row(4, 'tool_result', 1400, { name: 'core.fs_read', ok: true }, { callId: 'c-a' }),
   ];
   const records = deriveTimeline(rows);
   const byId = new Map(records.map((r) => [r.id, r]));

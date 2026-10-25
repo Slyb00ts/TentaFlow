@@ -27,12 +27,12 @@ async function loadAndRender(container) {
   try {
     const resp = await ApiBinary.one('addonResourcesGetRequest', { addonId: currentAddonId });
     const values = {
-      maxInstances: Number(resp.maxInstances ?? resp.max_instances ?? 0),
-      cpuLimitPct: Number(resp.cpuLimitPct ?? resp.cpu_limit_pct ?? 0),
-      ramMb: Number(resp.ramMb ?? resp.ram_mb ?? 0),
-      storageMb: Number(resp.storageMb ?? resp.storage_mb ?? 0),
-      httpRequestsPerMin: Number(resp.httpRequestsPerMin ?? resp.http_requests_per_min ?? 0),
-      llmTokensPerMin: Number(resp.llmTokensPerMin ?? resp.llm_tokens_per_min ?? 0),
+      maxInstances: Number(resp.maxInstances ?? 0),
+      cpuLimitPct: Number(resp.cpuLimitPct ?? 0),
+      ramMb: Number(resp.ramMb ?? 0),
+      storageMb: Number(resp.storageMb ?? 0),
+      httpRequestsPerMin: Number(resp.httpRequestsPerMin ?? 0),
+      llmTokensPerMin: Number(resp.llmTokensPerMin ?? 0),
     };
     render(container, values);
   } catch (err) {

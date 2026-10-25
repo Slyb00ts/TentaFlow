@@ -125,10 +125,10 @@ export function reorder(list, from, to) {
 
 /** Positions of `unitId` that may still be named its head or a deputy: neither of the two already. */
 export function unitSeatCandidates(view, unitId) {
-  const unit = (view.units ?? []).find((u) => u.unit_id === unitId);
+  const unit = (view.units ?? []).find((u) => u.unitId === unitId);
   if (!unit) return [];
-  const taken = new Set([unit.head_position_id, ...(unit.deputy_head_position_ids ?? [])].filter(Boolean));
-  return (view.positions ?? []).filter((p) => p.unit_id === unitId && !taken.has(p.position_id));
+  const taken = new Set([unit.headPositionId, ...(unit.deputyHeadPositionIds ?? [])].filter(Boolean));
+  return (view.positions ?? []).filter((p) => p.unitId === unitId && !taken.has(p.positionId));
 }
 
 /** Users with no assignment in `view`: the people the "without a position" strip offers. */

@@ -98,7 +98,7 @@ export function endedItems(report) {
     kind: String(item.kind ?? ''),
     code: item.code ?? '',
     name: item.name ?? '',
-    holders: (item.holders ?? []).map((h) => (typeof h === 'string' ? h : h?.display_name ?? h?.name ?? '')).filter(Boolean),
+    holders: (item.holders ?? []).map((h) => (typeof h === 'string' ? h : h?.displayName ?? h?.name ?? '')).filter(Boolean),
   }));
 }
 
@@ -110,9 +110,9 @@ export function seatsLost(report) {
 /** What "replace" would end, from the counts of the dry run — the only honest number, the server's own. */
 export function replaceImpact(report) {
   const counts = report?.counts ?? {};
-  const units = counts.units_ended ?? 0;
-  const positions = counts.positions_ended ?? 0;
-  const assignments = counts.assignments_ended ?? 0;
+  const units = counts.unitsEnded ?? 0;
+  const positions = counts.positionsEnded ?? 0;
+  const assignments = counts.assignmentsEnded ?? 0;
   return { units, positions, assignments, total: units + positions + assignments };
 }
 
@@ -135,7 +135,7 @@ export function unresolvedErrors(report) {
  * has not been applied. What a replace ends is confirmed in a step of its own after the press.
  */
 export function canApply({ report, busy }) {
-  if (!report || busy || report.applied || report.file_error) return false;
+  if (!report || busy || report.applied || report.fileError) return false;
   return !unresolvedErrors(report);
 }
 
@@ -150,20 +150,20 @@ export function previewMarks(report) {
   const marks = new Map();
   const rank = { error: 3, changed: 2, added: 1 };
   for (const row of report?.rows ?? []) {
-    if (!row.position_id || !(row.status in rank)) continue;
-    if ((rank[marks.get(row.position_id)] ?? 0) < rank[row.status]) marks.set(row.position_id, row.status);
+    if (!row.positionId || !(row.status in rank)) continue;
+    if ((rank[marks.get(row.positionId)] ?? 0) < rank[row.status]) marks.set(row.positionId, row.status);
   }
   return marks;
 }
 
 /** Unit ids of the preview by the strongest thing the file does in them (its own row or any of its positions). */
 export function previewUnitMarks(report) {
-  const unitOfPosition = new Map((report?.preview?.positions ?? []).map((p) => [p.position_id, p.unit_id]));
+  const unitOfPosition = new Map((report?.preview?.positions ?? []).map((p) => [p.positionId, p.unitId]));
   const rank = { error: 3, changed: 2, added: 1 };
   const marks = new Map();
   for (const row of report?.rows ?? []) {
     if (!(row.status in rank)) continue;
-    for (const unit of new Set([row.unit_id, unitOfPosition.get(row.position_id)].filter(Boolean))) {
+    for (const unit of new Set([row.unitId, unitOfPosition.get(row.positionId)].filter(Boolean))) {
       if ((rank[marks.get(unit)] ?? 0) < rank[row.status]) marks.set(unit, row.status);
     }
   }

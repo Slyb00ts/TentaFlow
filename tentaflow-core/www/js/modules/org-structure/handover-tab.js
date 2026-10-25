@@ -130,12 +130,12 @@ function q(role) {
 
 function reasonLabel(reason) {
   return reason === 'project_removal'
-    ? ht('reason_project_removal', { project: state.listing?.project_name ?? '' })
+    ? ht('reason_project_removal', { project: state.listing?.projectName ?? '' })
     : ht(`reason_${reason}`);
 }
 
 function renderTitle() {
-  const name = state.listing?.user?.display_name ?? '';
+  const name = state.listing?.user?.displayName ?? '';
   const count = state.rows.length;
   q('title').innerHTML = `
     <tf-avatar initials="${escapeAttr(initials(name))}" size="sm"></tf-avatar>
@@ -150,7 +150,7 @@ function renderContext() {
   const dates = q('dates');
   const listing = state.listing;
   if (state.reason === 'departure') {
-    const ended = listing?.assignment_ended_on;
+    const ended = listing?.assignmentEndedOn;
     dates.innerHTML = `
       <tf-date-field data-role="date" label="${escapeAttr(ht('f_departure_date'))}" value="${escapeAttr(state.date ?? '')}"
         hint="${escapeAttr(ended ? ht('f_departure_locked') : ht('f_departure_hint'))}"${ended ? ' disabled' : ''}></tf-date-field>`;
@@ -170,13 +170,13 @@ function renderNote() {
   const note = q('ctxnote');
   const date = formatDay(state.date);
   if (state.reason === 'departure') {
-    note.setAttribute('message', listing?.assignment_ended_on ? ht('note_departure_ended', { date }) : ht('note_departure', { date }));
+    note.setAttribute('message', listing?.assignmentEndedOn ? ht('note_departure_ended', { date }) : ht('note_departure', { date }));
   } else if (state.reason === 'absence') {
     note.setAttribute('message', ht('note_absence', { date: formatDay(state.returnDate) }));
   } else {
-    note.setAttribute('message', ht('note_project', { project: listing?.project_name ?? '' }));
+    note.setAttribute('message', ht('note_project', { project: listing?.projectName ?? '' }));
   }
-  const skipped = listing?.skipped_projects ?? [];
+  const skipped = listing?.skippedProjects ?? [];
   if (skipped.length) {
     note.setAttribute('message', `${note.getAttribute('message')} ${ht('note_skipped_projects', { projects: skipped.join(', ') })}`);
   }
@@ -208,7 +208,7 @@ function subline(row) {
 }
 
 function takerName(userId) {
-  return state.takers.find((p) => p.user_id === userId)?.display_name ?? '';
+  return state.takers.find((p) => p.userId === userId)?.displayName ?? '';
 }
 
 function whyText(row) {
@@ -217,7 +217,7 @@ function whyText(row) {
     return `<span>${escapeHtml(row.category === 'deputy' ? ht('why_deputy_end') : ht('why_membership'))}</span>`;
   }
   if (row.manual && row.taker) return `<b>${escapeHtml(ht('why_manual'))}</b>`;
-  if (row.taker && row.suggestion && row.taker === row.suggestion.user_id) {
+  if (row.taker && row.suggestion && row.taker === row.suggestion.userId) {
     return `<b>${escapeHtml(ht(`why_${row.suggestion.reason}`))}</b>`;
   }
   if (!row.taker) {
@@ -243,7 +243,7 @@ function takerCell(row) {
     options.push(`<option value="">${escapeHtml(ht('taker_choose'))}</option>`);
   }
   for (const person of takerOptions(row, state.takers)) {
-    options.push(`<option value="${escapeAttr(person.user_id)}"${person.user_id === row.taker ? ' selected' : ''}>${escapeHtml(person.display_name || '—')}</option>`);
+    options.push(`<option value="${escapeAttr(person.userId)}"${person.userId === row.taker ? ' selected' : ''}>${escapeHtml(person.displayName || '—')}</option>`);
   }
   return `<tf-select data-taker="${escapeAttr(row.key)}" value="${escapeAttr(row.taker)}"
     aria-label="${escapeAttr(ht('taker_aria', { title: row.title }))}"${row.blocked ? ' disabled' : ''}>${options.join('')}</tf-select>`;
@@ -273,7 +273,7 @@ function groupHtml({ category, rows }) {
 
 function bulkHtml() {
   const options = state.takers
-    .map((p) => `<option value="${escapeAttr(p.user_id)}"${p.user_id === state.allTo ? ' selected' : ''}>${escapeHtml(p.display_name || '—')}</option>`)
+    .map((p) => `<option value="${escapeAttr(p.userId)}"${p.userId === state.allTo ? ' selected' : ''}>${escapeHtml(p.displayName || '—')}</option>`)
     .join('');
   return `
     <b class="org-ho-selected" data-role="selected"></b>
@@ -303,7 +303,7 @@ function renderRows() {
 function mostProposed() {
   const counts = new Map();
   for (const row of state.rows) {
-    const id = row.suggestion?.user_id;
+    const id = row.suggestion?.userId;
     if (id) counts.set(id, (counts.get(id) ?? 0) + 1);
   }
   return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
@@ -314,7 +314,7 @@ function renderBulk() {
   const empty = !state.rows.length;
   bulk.hidden = empty;
   if (!empty) {
-    if (!state.allTo) state.allTo = mostProposed() ?? state.takers[0]?.user_id ?? '';
+    if (!state.allTo) state.allTo = mostProposed() ?? state.takers[0]?.userId ?? '';
     bulk.innerHTML = bulkHtml();
   }
 }
@@ -353,13 +353,13 @@ const STATUS_TONE = {
 
 function resultItemHtml(item) {
   const reason = item.reason ? reasonText(item.reason) : '';
-  const taker = item.taker_user_id ? ht('result_to', { name: takerName(item.taker_user_id) || '—' }) : '';
+  const taker = item.takerUserId ? ht('result_to', { name: takerName(item.takerUserId) || '—' }) : '';
   const status = item.status === 'scheduled' ? ht('status_scheduled', { date: formatDay(state.date) }) : ht(`status_${item.status}`);
   return `
     <div class="org-ho-result-row">
       <tf-chip status="${escapeAttr(STATUS_TONE[item.status] ?? 'neutral')}">${escapeHtml(status)}</tf-chip>
       <div class="org-ho-result-main"><b>${escapeHtml(item.title || item.key)}</b>
-        <small>${escapeHtml([item.project_name, taker, reason].filter(Boolean).join(' · '))}</small></div>
+        <small>${escapeHtml([item.projectName, taker, reason].filter(Boolean).join(' · '))}</small></div>
     </div>`;
 }
 
@@ -372,7 +372,7 @@ function renderResult() {
   }
   const sum = summarize(answer);
   const tone = sum.failed ? 'warning' : 'success';
-  const error = answer.error && !answer.handover_id ? `<tf-alert tone="danger" message="${escapeAttr(reasonText(answer.error.code))}"></tf-alert>` : '';
+  const error = answer.error && !answer.handoverId ? `<tf-alert tone="danger" message="${escapeAttr(reasonText(answer.error.code))}"></tf-alert>` : '';
   const chips = [
     sum.done ? `<tf-chip status="ok">${escapeHtml(ht('result_done', { count: sum.done }))}</tf-chip>` : '',
     sum.scheduled ? `<tf-chip status="info">${escapeHtml(ht('result_scheduled', { count: sum.scheduled }))}</tf-chip>` : '',
@@ -427,7 +427,7 @@ function afterAnswer(answer) {
   const sum = summarize(answer);
   // Positions and deputies moved, and somebody may no longer be pending: the screen around this one reads the structure again.
   if (sum.done || sum.scheduled) state.onChanged?.();
-  if (answer.error && !answer.handover_id) {
+  if (answer.error && !answer.handoverId) {
     TfToast.show({ tone: 'danger', message: reasonText(answer.error.code) });
   } else if (sum.failed) {
     TfToast.show({ tone: 'warning', message: ht('toast_partial', { done: sum.done + sum.scheduled, failed: sum.failed }) });
@@ -464,12 +464,12 @@ async function submit() {
       rows: state.rows,
     }));
     afterAnswer(answer);
-    if (answer.error && !answer.handover_id) {
+    if (answer.error && !answer.handoverId) {
       // Nothing moved: what the operator chose stays, with the rows the server refused marked.
       const refused = new Set(answer.items.filter((item) => item.status === 'failed').map((item) => item.key));
       for (const row of state.rows) row.error = refused.has(row.key);
     } else {
-      q('note').value = answer.handover_id && summarize(answer).failed ? note : '';
+      q('note').value = answer.handoverId && summarize(answer).failed ? note : '';
       await load();
     }
   } catch (err) {
@@ -485,12 +485,12 @@ async function submit() {
 
 async function retry() {
   const answer = state.result;
-  if (!answer?.handover_id || state.busy) return;
+  if (!answer?.handoverId || state.busy) return;
   state.busy = true;
   syncSelection();
   try {
     const next = await ApiBinary.one('orgHandoverRetryRequest', {
-      handoverId: answer.handover_id,
+      handoverId: answer.handoverId,
       keys: summarize(answer).failedKeys,
     });
     afterAnswer(next);
@@ -544,7 +544,7 @@ function onChange(e) {
     const row = state.rows.find((r) => r.key === target.dataset.taker);
     if (row) {
       row.taker = String(detail.value ?? '');
-      row.manual = row.taker !== (row.suggestion?.user_id ?? '');
+      row.manual = row.taker !== (row.suggestion?.userId ?? '');
       row.error = false;
       const why = target.closest('.org-ho-row')?.querySelector('.org-ho-why');
       if (why) why.innerHTML = whyText(row);

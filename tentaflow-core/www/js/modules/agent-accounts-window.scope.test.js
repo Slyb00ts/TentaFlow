@@ -123,8 +123,8 @@ const REMOTE_ID = 'a3f1c07d5b28e64f90d1ab34c7e5082f6b1d9a40e3c75f8216ba4d09e7c31
 // The matrix the window is handed. Only the answering node marks its own row;
 // every other row is identified by its id, which is what `home_node_id` holds.
 const matrix = (homeId, { online = true, includeHome = true } = {}) => [
-  { node_id: LOCAL, node_name: 'laptop', is_local: true, online: true },
-  ...(includeHome ? [{ node_id: homeId, node_name: '', is_local: false, online }] : []),
+  { nodeId: LOCAL, nodeName: 'laptop', isLocal: true, online: true },
+  ...(includeHome ? [{ nodeId: homeId, nodeName: '', isLocal: false, online }] : []),
 ];
 
 // ---------------------------------------------------------------------------
@@ -134,8 +134,8 @@ const matrix = (homeId, { online = true, includeHome = true } = {}) => [
 const localId = (nodes) => localNodeIdOf(nodes);
 
 test('localNodeIdOf: the marked row is this machine and an unmarked matrix names none', () => {
-  assert.equal(localId([{ node_id: REMOTE, is_local: false }, { node_id: LOCAL, is_local: true }]), LOCAL);
-  assert.equal(localId([{ node_id: REMOTE, is_local: false }]), '', 'an unmarked matrix names no machine');
+  assert.equal(localId([{ nodeId: REMOTE, isLocal: false }, { nodeId: LOCAL, isLocal: true }]), LOCAL);
+  assert.equal(localId([{ nodeId: REMOTE, isLocal: false }]), '', 'an unmarked matrix names no machine');
   assert.equal(localId([]), '');
   assert.equal(localId(undefined), '');
 });
@@ -154,13 +154,13 @@ const scope = (account, sessionCount, runtimeNodes) => sessionScopePresentation(
 
 test('a home node that is absent or is this machine keeps the wording it always had', () => {
   const nodes = matrix(REMOTE_ID);
-  const noHome = scope({ home_node_id: null }, 0, nodes);
+  const noHome = scope({ homeNodeId: null }, 0, nodes);
   assert.equal(noHome.scope, 'home');
   assert.equal(noHome.title, fill(pl.sessions_title, { count: 0 }));
   assert.equal(noHome.empty, pl.sessions_empty);
   assert.equal(noHome.note, '', 'nothing is claimed about sessions this node can see');
 
-  const here = scope({ home_node_id: LOCAL, home_node_name: 'helios' }, 3, nodes);
+  const here = scope({ homeNodeId: LOCAL, homeNodeName: 'helios' }, 3, nodes);
   assert.equal(here.scope, 'home');
   assert.equal(here.title, fill(pl.sessions_title, { count: 3 }));
   assert.equal(here.empty, pl.sessions_empty);
@@ -169,7 +169,7 @@ test('a home node that is absent or is this machine keeps the wording it always 
 
 test('a home node elsewhere with no naming still reports as the subset it is', () => {
   const unnamed = 'abcdef0123456789';
-  const view = scope({ home_node_id: unnamed }, 0, matrix(unnamed));
+  const view = scope({ homeNodeId: unnamed }, 0, matrix(unnamed));
   assert.equal(view.scope, 'remote');
   assert.equal(view.title, fill(pl.sessions_title_scope, { count: 0 }));
   assert.equal(view.empty, pl.sessions_remote_empty, 'never "no active sessions" about another node');
@@ -180,7 +180,7 @@ test('a home node whose resolved name IS its id is shortened, not spelled out in
   // What the server sends for a node it has no display name for: the id. Sixty
   // four hex characters in a sentence name nothing.
   const view = scope(
-    { home_node_id: REMOTE_ID, home_node_name: REMOTE_ID },
+    { homeNodeId: REMOTE_ID, homeNodeName: REMOTE_ID },
     0,
     matrix(REMOTE_ID),
   );
@@ -196,7 +196,7 @@ test('the camelCase account spelling is read too', () => {
 
 test('a home node that does not answer is "brak danych", not an empty list', () => {
   for (const nodes of [matrix(REMOTE, { online: false }), matrix(REMOTE, { includeHome: false })]) {
-    const view = scope({ home_node_id: REMOTE, home_node_name: REMOTE }, 0, nodes);
+    const view = scope({ homeNodeId: REMOTE, homeNodeName: REMOTE }, 0, nodes);
     assert.equal(view.scope, 'offline', `a node with no "online" row has not answered: ${JSON.stringify(nodes)}`);
     assert.equal(view.title, fill(pl.sessions_title_scope, { count: 0 }));
     assert.equal(view.empty, pl.sessions_no_data, 'design §H.4: no data, never "there are none"');
@@ -209,8 +209,8 @@ test('a window with no matrix at hand calls the scope unknown, not "homed here"'
   // The row for the home node is there and online, so the ONLY thing missing is
   // the mark naming this machine — which is not enough to call the account
   // remote either.
-  const nodes = [{ node_id: REMOTE, node_name: REMOTE, is_local: false, online: true }];
-  const view = scope({ home_node_id: REMOTE, home_node_name: REMOTE }, 0, nodes);
+  const nodes = [{ nodeId: REMOTE, nodeName: REMOTE, isLocal: false, online: true }];
+  const view = scope({ homeNodeId: REMOTE, homeNodeName: REMOTE }, 0, nodes);
   assert.equal(view.scope, 'unknown');
   assert.equal(view.empty, pl.sessions_scope_unknown);
   assert.notEqual(view.empty, pl.sessions_empty, 'the unscoped claim is not available to this state');
@@ -223,7 +223,7 @@ test('a home that was DELETED from the registry is its own state, not "no home"'
   // `home_lost_node_id`. The node left the registry over expired trust, not
   // because it stopped, so its sessions may still be running — and the empty
   // cell must not claim there are none.
-  const view = scope({ home_node_id: null, home_lost_node_id: REMOTE_ID }, 0, matrix(REMOTE_ID));
+  const view = scope({ homeNodeId: null, homeLostNodeId: REMOTE_ID }, 0, matrix(REMOTE_ID));
   assert.equal(view.scope, 'lost');
   assert.equal(view.title, fill(pl.sessions_title_scope, { count: 0 }), 'the count is this node\'s, and the title says so');
   assert.equal(view.empty, pl.sessions_no_data, 'no data, never "Brak aktywnych sesji."');
@@ -237,13 +237,13 @@ test('a home that was DELETED from the registry is its own state, not "no home"'
   // The marker is written and cleared with the home it belongs to, so it is read
   // only while there is no home: a stale value must not outrank a home this node
   // can see, in either direction of "here" or "elsewhere".
-  const rehomed = scope({ home_node_id: LOCAL, home_lost_node_id: REMOTE_ID }, 0, matrix(REMOTE_ID));
+  const rehomed = scope({ homeNodeId: LOCAL, homeLostNodeId: REMOTE_ID }, 0, matrix(REMOTE_ID));
   assert.equal(rehomed.scope, 'home', 'a claimed home wins over the record of a lost one');
   assert.equal(rehomed.empty, pl.sessions_empty);
 
   // A node id that is not a uuid is still shortened, never spelled out.
   assert.equal(
-    scope({ home_lost_node_id: 'helios' }, 0, matrix(REMOTE_ID)).note,
+    scope({ homeLostNodeId: 'helios' }, 0, matrix(REMOTE_ID)).note,
     fill(pl.sessions_home_lost, { node: 'helios' }),
   );
 });
@@ -253,10 +253,10 @@ test('the lost-home state is NOT what an account that never had a home renders',
   // homed runs wherever it is first used, so this node's list IS its list, and
   // the caveat must not appear. Only a recorded loss can produce it.
   for (const never of [
-    { home_node_id: null },
-    { home_node_id: null, home_lost_node_id: null },
-    { home_node_id: null, home_lost_node_id: '' },
-    { home_node_id: null, home_lost_node_id: undefined },
+    { homeNodeId: null },
+    { homeNodeId: null, homeLostNodeId: null },
+    { homeNodeId: null, homeLostNodeId: '' },
+    { homeNodeId: null, homeLostNodeId: undefined },
   ]) {
     const view = scope(never, 0, matrix(REMOTE_ID));
     assert.equal(view.scope, 'home', `never homed: ${JSON.stringify(never)}`);
@@ -283,25 +283,25 @@ function answer({
 } = {}) {
   return {
     account: {
-      account_id: 'acct-1',
-      display_name: 'Konto',
+      accountId: 'acct-1',
+      displayName: 'Konto',
       scope: 'global',
-      engine_id: 'codex',
+      engineId: 'codex',
       status: 'active',
-      credential_kind: 'provider_login',
-      credential_revision: 1,
-      home_node_id: homeNodeId,
-      home_node_name: homeNodeName,
+      credentialKind: 'provider_login',
+      credentialRevision: 1,
+      homeNodeId: homeNodeId,
+      homeNodeName: homeNodeName,
       // What `forget_node_tx` writes when the home's node is deleted: the id of
       // the node that WAS the home, with no name beside it — a deleted node has
       // none to resolve.
-      home_lost_node_id: homeLostNodeId,
+      homeLostNodeId: homeLostNodeId,
     },
     grants: [],
     sessions,
     // The account's per-node state, as the server measured it on THIS node —
     // which is not the matrix and says nothing about which row is this machine.
-    nodes: nodes ?? [{ node_id: homeNodeId ?? LOCAL, node_name: homeNodeName, last_error: null }],
+    nodes: nodes ?? [{ nodeId: homeNodeId ?? LOCAL, nodeName: homeNodeName, lastError: null }],
     agents: [],
   };
 }
@@ -328,7 +328,7 @@ async function open({ payload, runtimeNodes }) {
 
 test('A03: an account homed here renders the unscoped wording, with no caveat', async () => {
   const view = await open({
-    payload: answer({ homeNodeId: LOCAL, homeNodeName: 'helios', sessions: [{ session_id: 's1' }] }),
+    payload: answer({ homeNodeId: LOCAL, homeNodeName: 'helios', sessions: [{ sessionId: 's1' }] }),
     runtimeNodes: matrix(REMOTE_ID),
   });
   assert.equal(view.headings[1], fill(pl.sessions_title, { count: 1 }), `sessions heading: ${view.headings.join(' | ')}`);
@@ -338,7 +338,7 @@ test('A03: an account homed here renders the unscoped wording, with no caveat', 
 
 test('A03: an account homed elsewhere names the node and scopes the heading and the cell', async () => {
   const view = await open({
-    payload: answer({ homeNodeId: REMOTE_ID, homeNodeName: REMOTE, sessions: [{ session_id: 's1' }] }),
+    payload: answer({ homeNodeId: REMOTE_ID, homeNodeName: REMOTE, sessions: [{ sessionId: 's1' }] }),
     runtimeNodes: matrix(REMOTE_ID),
   });
   assert.equal(view.headings[1], fill(pl.sessions_title_scope, { count: 1 }), 'the count is this node\'s, and the title says so');
@@ -406,13 +406,13 @@ test('A03: the node table marks the answering machine and no peer', async () => 
       // Both nodes hold the credential, so both appear in "Na nodach" — the
       // marker has to pick out the one this window is looking at.
       nodes: [
-        { node_id: LOCAL, node_name: 'laptop', last_error: null },
-        { node_id: REMOTE_ID, node_name: REMOTE, last_error: null },
+        { nodeId: LOCAL, nodeName: 'laptop', lastError: null },
+        { nodeId: REMOTE_ID, nodeName: REMOTE, lastError: null },
       ],
     }),
     runtimeNodes: [
-      { node_id: LOCAL, node_name: 'laptop', is_local: true, online: true },
-      { node_id: REMOTE_ID, node_name: REMOTE, is_local: false, online: true },
+      { nodeId: LOCAL, nodeName: 'laptop', isLocal: true, online: true },
+      { nodeId: REMOTE_ID, nodeName: REMOTE, isLocal: false, online: true },
     ],
   });
   assert.equal(view.nodeRows.length, 2, `both nodes are listed: ${JSON.stringify(view.nodeRows.map((r) => r.node))}`);
@@ -449,15 +449,15 @@ async function openThroughTab({ homeNodeId, homeNodeName, homeLostNodeId = null,
   document.body.appendChild(host);
   AgentAccounts.list = async () => ({
     accounts: [{
-      account_id: 'acct-1',
-      display_name: 'Konto',
+      accountId: 'acct-1',
+      displayName: 'Konto',
       scope: 'global',
-      engine_id: 'codex',
-      credential_kind: 'provider_login',
-      credential_revision: 1,
+      engineId: 'codex',
+      credentialKind: 'provider_login',
+      credentialRevision: 1,
       status: 'active',
-      home_node_id: homeNodeId,
-      home_node_name: homeNodeName,
+      homeNodeId: homeNodeId,
+      homeNodeName: homeNodeName,
     }],
     engines: [],
   });

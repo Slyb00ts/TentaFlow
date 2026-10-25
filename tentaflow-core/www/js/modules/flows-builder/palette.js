@@ -23,10 +23,10 @@ function categoryLabel(cat) {
 
 function catFor(tpl) {
   const c = (tpl.category || '').toLowerCase();
-  if (tpl.node_type.startsWith('bpmn_')) return c;
+  if (tpl.nodeType.startsWith('bpmn_')) return c;
   if (CATEGORY_ORDER.includes(c)) return c;
   // Sensible fallback: typ noda -> kategoria
-  const t = tpl.node_type;
+  const t = tpl.nodeType;
   if (t === 'trigger' || t === 'start') return 'trigger';
   if (['llm','stt','tts','embeddings','reranker'].includes(t)) return 'service';
   if (['memory','conversation_history','session_context','speaker_context','memory_analyzer','persist_turn'].includes(t)) return 'memory';
@@ -108,7 +108,7 @@ export class FlowPalette {
     }
     if (this._disposed || !this.root.isConnected) return;
     const perType = new Map();
-    for (const tpl of this.templates) perType.set(tpl.node_type, (perType.get(tpl.node_type) ?? 0) + 1);
+    for (const tpl of this.templates) perType.set(tpl.nodeType, (perType.get(tpl.nodeType) ?? 0) + 1);
     this.presetTypes = new Set([...perType.entries()].filter(([, n]) => n > 1).map(([t]) => t));
     if (this.opts.onTemplatesLoaded) this.opts.onTemplatesLoaded(this.templates);
     this._render();
@@ -123,20 +123,20 @@ export class FlowPalette {
 
   /** Nazwa wpisu palety — preset mówi własną etykietą, reszta tłumaczeniem typu. */
   _nameOf(tpl) {
-    if ((tpl.preset || this.presetTypes.has(tpl.node_type)) && tpl.label) return tpl.label;
-    return getNodeName(tpl.node_type, tpl.label);
+    if ((tpl.preset || this.presetTypes.has(tpl.nodeType)) && tpl.label) return tpl.label;
+    return getNodeName(tpl.nodeType, tpl.label);
   }
 
   _descOf(tpl) {
-    if ((tpl.preset || this.presetTypes.has(tpl.node_type)) && tpl.description) return tpl.description;
-    return getNodeDescription(tpl.node_type, tpl.description);
+    if ((tpl.preset || this.presetTypes.has(tpl.nodeType)) && tpl.description) return tpl.description;
+    return getNodeDescription(tpl.nodeType, tpl.description);
   }
 
   _render() {
     const groups = {};
     const available = this.templates.filter((tpl) => this.processDepth === 0
-      || (!['bpmn_timer_start', 'bpmn_message_start'].includes(tpl.node_type)
-        && (this.processDepth < 3 || tpl.node_type !== 'bpmn_sub_process')));
+      || (!['bpmn_timer_start', 'bpmn_message_start'].includes(tpl.nodeType)
+        && (this.processDepth < 3 || tpl.nodeType !== 'bpmn_sub_process')));
     const total = available.length;
     let shown = 0;
     for (let i = 0; i < this.templates.length; i += 1) {
@@ -145,7 +145,7 @@ export class FlowPalette {
       const c = catFor(tpl);
       const label = this._nameOf(tpl).toLowerCase();
       const desc = this._descOf(tpl).toLowerCase();
-      const type = (tpl.node_type || '').toLowerCase();
+      const type = (tpl.nodeType || '').toLowerCase();
       const matches = !this.filter || label.includes(this.filter) || desc.includes(this.filter) || type.includes(this.filter);
       if (!matches) continue;
       if (!groups[c]) groups[c] = [];
@@ -238,8 +238,8 @@ export class FlowPalette {
 
   _renderItem(tpl, index) {
     const cat = catFor(tpl);
-    const iconId = nodeIconId(tpl.node_type, tpl.icon, cat);
-    const varName = nodeColorVar(tpl.node_type, cat);
+    const iconId = nodeIconId(tpl.nodeType, tpl.icon, cat);
+    const varName = nodeColorVar(tpl.nodeType, cat);
     const name = this._nameOf(tpl);
     const desc = this._descOf(tpl);
     // A tool row leads with the tool and puts the addon on its own line, so a
@@ -247,7 +247,7 @@ export class FlowPalette {
     const shownName = tpl.rowName ?? name;
     const shownSub = tpl.rowSub ?? desc;
     return `
-      <tf-button variant="ghost" wrap class="fb-node-item${tpl.category === 'tentaflow' ? ' fb-node-clamped' : ''}" data-index="${index}" data-node-type="${escapeAttr(tpl.node_type)}" title="${escapeAttr(desc ? `${name}\n${desc}` : name)}" ${this.readOnly ? 'disabled' : ''} style="--node-color: var(${varName})">
+      <tf-button variant="ghost" wrap class="fb-node-item${tpl.category === 'tentaflow' ? ' fb-node-clamped' : ''}" data-index="${index}" data-node-type="${escapeAttr(tpl.nodeType)}" title="${escapeAttr(desc ? `${name}\n${desc}` : name)}" ${this.readOnly ? 'disabled' : ''} style="--node-color: var(${varName})">
         <div class="fb-node-icon"><svg><use href="#i-${iconId}"/></svg></div>
         <div class="fb-node-info">
           <div class="fb-node-name">${escapeHtml(shownName)}</div>
@@ -283,7 +283,7 @@ export class FlowPalette {
       d.moved = true;
       this._ghost = document.createElement('div');
       this._ghost.className = 'fb-drag-ghost';
-      this._ghost.style.setProperty('--node-color', `var(${nodeColorVar(d.tpl.node_type, catFor(d.tpl))})`);
+      this._ghost.style.setProperty('--node-color', `var(${nodeColorVar(d.tpl.nodeType, catFor(d.tpl))})`);
       this._ghost.textContent = this._nameOf(d.tpl);
       document.body.appendChild(this._ghost);
     }

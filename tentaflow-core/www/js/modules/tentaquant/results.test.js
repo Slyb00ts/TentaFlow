@@ -35,14 +35,14 @@ const run = (over = {}) => ({
 
 // ---- the tile --------------------------------------------------------------
 
-test('the tile is read out of the stored column, in either field spelling', () => {
+test('the tile is read out of the stored column', () => {
   const tile = parseTile(run());
   assert.equal(tile.kind, 'histogram');
   assert.deepEqual(tile.countsTop, [
     { bitstring: '00', probability: 0.5 },
     { bitstring: '11', probability: 0.5 },
   ]);
-  assert.equal(parseTile({ tile_json: CONV_TILE }).kind, 'convergence');
+  assert.equal(parseTile({ tileJson: CONV_TILE }).kind, 'convergence');
 });
 
 test('a run with no tile, or a broken one, is reported as having none', () => {

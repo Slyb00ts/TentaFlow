@@ -30,7 +30,7 @@ test('a position with a holder is a person card, one without is a vacancy', () =
 
 test('two holders of one position show the first and count the rest', () => {
   const view = sampleView();
-  view.assignments.push({ ...view.assignments[0], id: 'a-extra', subject: { kind: 'external', id: 'x2' }, display_name: 'Second Holder' });
+  view.assignments.push({ ...view.assignments[0], id: 'a-extra', subject: { kind: 'external', id: 'x2' }, displayName: 'Second Holder' });
   const model = buildTreeModel(view, { t, meHex });
   const ceo = node(model, 'p-ceo');
   assert.equal(ceo.extraHolders, 1);
@@ -67,10 +67,10 @@ test('a deputy in force is a "covering" badge, next to "absent" for somebody who
 
 test('"my position" lists the seats of the caller, the primary one first', () => {
   const view = sampleView();
-  view.assignments = view.assignments.map((a) => (a.position_id === 'p-lead' ? { ...a, is_primary: false } : a));
+  view.assignments = view.assignments.map((a) => (a.positionId === 'p-lead' ? { ...a, isPrimary: false } : a));
   view.assignments.push({
-    id: 'a-second', position_id: 'p-dev2', subject: { kind: 'user', id: '11111111-2222-3333-4444-555555555555' },
-    assignment_type: 'permanent', share: 0.5, is_primary: true, valid_from: '2026-01-01', display_name: 'Anna Kowalska',
+    id: 'a-second', positionId: 'p-dev2', subject: { kind: 'user', id: '11111111-2222-3333-4444-555555555555' },
+    assignmentType: 'permanent', share: 0.5, isPrimary: true, validFrom: '2026-01-01', displayName: 'Anna Kowalska',
   });
   const model = buildTreeModel(view, { t, meHex });
   assert.deepEqual(model.meIds, ['p-dev2', 'p-lead']);
@@ -94,7 +94,7 @@ test('parents, children and the count of people below', () => {
 
 test('a parent that is not in the answer makes the position a root instead of dropping it', () => {
   const view = sampleView();
-  view.positions.find((p) => p.position_id === 'p-fin').primary_parent_position_id = 'gone';
+  view.positions.find((p) => p.positionId === 'p-fin').primaryParentPositionId = 'gone';
   const model = buildTreeModel(view, { t, meHex });
   assert.equal(node(model, 'p-fin').parentId, null);
 });

@@ -101,7 +101,7 @@ pub mod sync_kinds {
 /// - 4c2.5: SYNC_PUSH, SYNC_ACK, SYNC_PULL, SYNC_PULL_RESPONSE,
 ///   SYNC_SNAPSHOT_PULL, SYNC_SNAPSHOT_RESPONSE
 /// - 4c2.6b: NODE_INFO, HELLO, TOPOLOGY_ANNOUNCE, KNOWN_PEERS,
-///   ALIAS_SYNC, MODEL_LIST, NODE_LEAVING
+///   MODEL_LIST, NODE_LEAVING
 /// - ROUTING_SYNC (broadcast konfiguracji routingu — klastry + czlonkowie)
 /// - PROVIDER_CREDENTIALS_SYNC (agent-account credentials, sealed per recipient)
 pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
@@ -138,7 +138,6 @@ pub fn is_migrated_to_ufp2_discriminator(disc: u8) -> bool {
             | legacy::MESH_MSG_HELLO
             | legacy::MESH_MSG_TOPOLOGY_ANNOUNCE
             | legacy::MESH_MSG_KNOWN_PEERS
-            | legacy::MESH_MSG_ALIAS_SYNC
             | legacy::MESH_MSG_MODEL_LIST
             | legacy::MESH_MSG_NODE_LEAVING
             | legacy::MESH_MSG_ROUTING_SYNC
@@ -161,7 +160,6 @@ pub mod kinds {
     pub const FORWARD_REQ: Kind = Kind(legacy::MESH_MSG_FORWARD_REQ as u16);
     pub const MODEL_LIST: Kind = Kind(legacy::MESH_MSG_MODEL_LIST as u16);
     pub const NODE_INFO: Kind = Kind(legacy::MESH_MSG_NODE_INFO as u16);
-    pub const ALIAS_SYNC: Kind = Kind(legacy::MESH_MSG_ALIAS_SYNC as u16);
     pub const ROUTING_SYNC: Kind = Kind(legacy::MESH_MSG_ROUTING_SYNC as u16);
     pub const ROBOTS_ANNOUNCE: Kind = Kind(legacy::MESH_MSG_ROBOTS_ANNOUNCE as u16);
     pub const ROBOTS_GET: Kind = Kind(legacy::MESH_MSG_ROBOTS_GET as u16);
@@ -274,7 +272,6 @@ mod tests {
             legacy::MESH_MSG_HELLO,
             legacy::MESH_MSG_TOPOLOGY_ANNOUNCE,
             legacy::MESH_MSG_KNOWN_PEERS,
-            legacy::MESH_MSG_ALIAS_SYNC,
             legacy::MESH_MSG_MODEL_LIST,
             legacy::MESH_MSG_NODE_LEAVING,
             legacy::MESH_MSG_ROUTING_SYNC,
@@ -331,7 +328,6 @@ mod tests {
             kinds::FORWARD_REQ,
             kinds::MODEL_LIST,
             kinds::NODE_INFO,
-            kinds::ALIAS_SYNC,
             kinds::ROUTING_SYNC,
             kinds::ROBOTS_ANNOUNCE,
             kinds::ROBOTS_GET,

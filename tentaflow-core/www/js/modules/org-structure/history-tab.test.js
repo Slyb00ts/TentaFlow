@@ -77,38 +77,38 @@ const view = (at) => ({
   at,
   timezone: 'Europe/Warsaw',
   units: [
-    { unit_id: 'u-board', name: 'Zarząd', parent_unit_id: null, head_position_id: 'p-ceo', deputy_head_position_ids: [] },
-    { unit_id: 'u-it', name: 'Dział IT', parent_unit_id: 'u-board', head_position_id: 'p-cto', deputy_head_position_ids: [] },
+    { unitId: 'u-board', name: 'Zarząd', parentUnitId: null, headPositionId: 'p-ceo', deputyHeadPositionIds: [] },
+    { unitId: 'u-it', name: 'Dział IT', parentUnitId: 'u-board', headPositionId: 'p-cto', deputyHeadPositionIds: [] },
   ],
   positions: [
-    { position_id: 'p-ceo', unit_id: 'u-board', name: 'Prezes', primary_parent_position_id: null, is_staff: false, valid_from: '2026-01-01' },
-    { position_id: 'p-cto', unit_id: 'u-it', name: 'CTO', primary_parent_position_id: 'p-ceo', is_staff: false, valid_from: '2026-01-01' },
+    { positionId: 'p-ceo', unitId: 'u-board', name: 'Prezes', primaryParentPositionId: null, isStaff: false, validFrom: '2026-01-01' },
+    { positionId: 'p-cto', unitId: 'u-it', name: 'CTO', primaryParentPositionId: 'p-ceo', isStaff: false, validFrom: '2026-01-01' },
   ],
-  assignments: [{ position_id: 'p-ceo', subject: { kind: 'user', id: ME }, display_name: 'Anna Nowak', share: 1, assignment_type: 'permanent', is_primary: true }],
+  assignments: [{ positionId: 'p-ceo', subject: { kind: 'user', id: ME }, displayName: 'Anna Nowak', share: 1, assignmentType: 'permanent', isPrimary: true }],
   vacancies: ['p-cto'],
   warnings: [],
 });
 
 const entry = (over) => ({
-  id: 1, at: '2026-09-29 10:00:00', actor_name: 'Hanna', action: 'org.unit.move', target_kind: 'unit', target_id: 'u-it',
-  target_name: 'Dział IT', unit_id: 'u-it', unit_name: 'Dział IT', effective_date: '2026-07-01',
-  changes: [{ field: 'parent_unit_id', before: 'u-x', after: 'u-board', before_label: 'Realizacja', after_label: 'Zarząd' }],
+  id: 1, at: '2026-09-29 10:00:00', actorName: 'Hanna', action: 'org.unit.move', targetKind: 'unit', targetId: 'u-it',
+  targetName: 'Dział IT', unitId: 'u-it', unitName: 'Dział IT', effectiveDate: '2026-07-01',
+  changes: [{ field: 'parent_unit_id', before: 'u-x', after: 'u-board', beforeLabel: 'Realizacja', afterLabel: 'Zarząd' }],
   ...over,
 });
 
 const changeSet = (over) => ({
-  id: 'cs-1', name: 'Reorganizacja Q4', effective_date: '2026-11-01', state: 'pending', author_user_id: OTHER, author_name: 'Hanna',
-  approver_user_id: null, approver_name: null, created_at_ms: 1, op_count: 2, ops: [], ...over,
+  id: 'cs-1', name: 'Reorganizacja Q4', effectiveDate: '2026-11-01', state: 'pending', authorUserId: OTHER, authorName: 'Hanna',
+  approverUserId: null, approverName: null, createdAtMs: 1, opCount: 2, ops: [], ...over,
 });
 
 const previewOf = (over = {}) => ({
   ok: true, valid: true, results: [], warnings: [], at: '2026-11-01',
   live: view('2026-11-01'), preview: view('2026-11-01'),
   items: [
-    { change: 'added', entity: 'unit', id: 'u-q', name: 'Zespół Jakości', unit_id: 'u-q' },
-    { change: 'changed', entity: 'position', id: 'p-cto', name: 'CTO', unit_id: 'u-it', field: 'primary_parent_position_id', before: 'p-ceo', after: null, before_label: 'Anna Nowak' },
+    { change: 'added', entity: 'unit', id: 'u-q', name: 'Zespół Jakości', unitId: 'u-q' },
+    { change: 'changed', entity: 'position', id: 'p-cto', name: 'CTO', unitId: 'u-it', field: 'primary_parent_position_id', before: 'p-ceo', after: null, beforeLabel: 'Anna Nowak' },
   ],
-  change_set: changeSet(), error: null,
+  changeSet: changeSet(), error: null,
   ...over,
 });
 
@@ -131,15 +131,15 @@ beforeEach(() => {
   world = {
     answers: {
       authMeRequest: { userId: ME, username: 'anna' },
-      orgStructureRequest: (p) => ({ view: view(p?.at ?? TODAY), unit_types: [], my_permissions: ['org.admin'] }),
+      orgStructureRequest: (p) => ({ view: view(p?.at ?? TODAY), unitTypes: [], myPermissions: ['org.admin'] }),
       orgHistoryListRequest: {
         entries: [
-          entry({ id: 3, effective_date: '2026-11-01', action: 'org.structure.batch', target_kind: 'structure', target_name: null, changes: [], source: 'batch', ops: [{ action: 'org.unit.create', target_kind: 'unit', target_name: 'Zespół Jakości' }] }),
+          entry({ id: 3, effectiveDate: '2026-11-01', action: 'org.structure.batch', targetKind: 'structure', targetName: null, changes: [], source: 'batch', ops: [{ action: 'org.unit.create', targetKind: 'unit', targetName: 'Zespół Jakości' }] }),
           entry({ id: 2 }),
         ],
-        total: 2, personal_visible: true, today: TODAY,
+        total: 2, personalVisible: true, today: TODAY,
       },
-      orgHistoryDiffRequest: { items: [], personal_visible: true, from: TODAY, to: TODAY },
+      orgHistoryDiffRequest: { items: [], personalVisible: true, from: TODAY, to: TODAY },
       orgChangeSetListRequest: { items: [changeSet()], today: TODAY },
       orgChangeSetPreviewRequest: previewOf(),
     },
@@ -181,7 +181,7 @@ test('the timeline draws what the server listed, planned changes marked, each wi
 test('a day picked, or a change clicked, asks for that day and what differs from today', async () => {
   await mount();
   world.answers.orgHistoryDiffRequest = {
-    items: [{ change: 'added', entity: 'unit', id: 'u-q', name: 'Zespół Jakości', unit_id: 'u-q' }], personal_visible: true,
+    items: [{ change: 'added', entity: 'unit', id: 'u-q', name: 'Zespół Jakości', unitId: 'u-q' }], personalVisible: true,
   };
   q('[data-act="jump"]').click();
   await settle();
@@ -199,7 +199,7 @@ test('a day picked, or a change clicked, asks for that day and what differs from
 });
 
 test('for anyone but an administrator the tab says what is left out and draws no reorganizations', async () => {
-  world.answers.orgHistoryListRequest = { entries: [entry()], total: 1, personal_visible: false, today: TODAY };
+  world.answers.orgHistoryListRequest = { entries: [entry()], total: 1, personalVisible: false, today: TODAY };
   await mount({ admin: false });
   assert.match(q('[data-role="privacy"]').textContent, /tylko dla administratorów/);
   assert.equal(q('[data-role="reorg"]'), null);
@@ -219,7 +219,7 @@ test('a reorganization card lists what it would change and who has to approve it
 });
 
 test('the author gets the approval button off, with the reason, and no request', async () => {
-  world.answers.orgChangeSetListRequest = { items: [changeSet({ author_user_id: ME })], today: TODAY };
+  world.answers.orgChangeSetListRequest = { items: [changeSet({ authorUserId: ME })], today: TODAY };
   await mount();
   const approve = q('.org-reorg [data-act="approve"]');
   assert.equal(approve.hasAttribute('disabled'), true);
@@ -232,8 +232,8 @@ test('the author gets the approval button off, with the reason, and no request',
 
 test('approving asks, sends the approval, and says when it takes effect', async () => {
   await mount();
-  world.answers.orgChangeSetApproveRequest = { ok: true, change_set: changeSet({ state: 'applied', approver_name: 'Anna' }), valid: true, results: [], warnings: [] };
-  world.answers.orgChangeSetListRequest = { items: [changeSet({ state: 'applied', approver_name: 'Anna' })], today: TODAY };
+  world.answers.orgChangeSetApproveRequest = { ok: true, changeSet: changeSet({ state: 'applied', approverName: 'Anna' }), valid: true, results: [], warnings: [] };
+  world.answers.orgChangeSetListRequest = { items: [changeSet({ state: 'applied', approverName: 'Anna' })], today: TODAY };
   q('.org-reorg [data-act="approve"]').click();
   await settle();
   assert.equal(sent('orgChangeSetApproveRequest').length, 0, 'nothing before the confirmation');
@@ -248,7 +248,7 @@ test('approving asks, sends the approval, and says when it takes effect', async 
 test('a refused approval stays in the window with its own sentence and changes nothing', async () => {
   await mount();
   world.answers.orgChangeSetApproveRequest = {
-    ok: false, error: { code: 'change_set_conflict', message: 'x' }, change_set: changeSet(), valid: false,
+    ok: false, error: { code: 'change_set_conflict', message: 'x' }, changeSet: changeSet(), valid: false,
     results: [{ index: 1, ok: false, error: { code: 'not_valid_at', message: 'm', date: '2026-11-01' } }], warnings: [],
   };
   q('.org-reorg [data-act="approve"]').click();
@@ -261,14 +261,14 @@ test('a refused approval stays in the window with its own sentence and changes n
 });
 
 test('submitting a draft and withdrawing a reorganization each send their request', async () => {
-  world.answers.orgChangeSetListRequest = { items: [changeSet({ state: 'draft', author_user_id: ME })], today: TODAY };
+  world.answers.orgChangeSetListRequest = { items: [changeSet({ state: 'draft', authorUserId: ME })], today: TODAY };
   await mount();
-  world.answers.orgChangeSetSubmitRequest = { ok: true, change_set: changeSet({ state: 'pending' }), valid: true, results: [], warnings: [] };
+  world.answers.orgChangeSetSubmitRequest = { ok: true, changeSet: changeSet({ state: 'pending' }), valid: true, results: [], warnings: [] };
   q('.org-reorg [data-act="submit"]').click();
   await settle();
   assert.deepEqual(sent('orgChangeSetSubmitRequest'), [{ id: 'cs-1' }]);
 
-  world.answers.orgChangeSetWithdrawRequest = { ok: true, change_set: changeSet({ state: 'withdrawn' }), valid: false, results: [], warnings: [] };
+  world.answers.orgChangeSetWithdrawRequest = { ok: true, changeSet: changeSet({ state: 'withdrawn' }), valid: false, results: [], warnings: [] };
   world.answers.orgChangeSetListRequest = { items: [changeSet({ state: 'withdrawn' })], today: TODAY };
   q('.org-reorg [data-act="withdraw"]').click();
   await settle();
@@ -279,13 +279,13 @@ test('submitting a draft and withdrawing a reorganization each send their reques
 });
 
 const stored = [
-  { temp_id: 'tmp:q', request: { UnitCreateRequest: { name: 'Zespół Jakości', valid_from: '2026-11-01' } } },
-  { temp_id: null, request: { PositionMoveRequest: { position_id: 'p-cto', new_parent_position_id: null, from: '2026-11-01' } } },
+  { tempId: 'tmp:q', request: { UnitCreateRequest: { name: 'Zespół Jakości', validFrom: '2026-11-01' } } },
+  { tempId: null, request: { PositionMoveRequest: { positionId: 'p-cto', newParentPositionId: null, from: '2026-11-01' } } },
 ];
 
 test('"Edytuj w trybie edycji" hands the reorganization to the edit mode when there is one', async () => {
   await mount();
-  world.answers.orgChangeSetGetRequest = { ok: true, change_set: changeSet({ ops: stored }), valid: false, results: [], warnings: [] };
+  world.answers.orgChangeSetGetRequest = { ok: true, changeSet: changeSet({ ops: stored }), valid: false, results: [], warnings: [] };
   const opened = [];
   registerChangeSetEditor({ open: async (request) => { opened.push(request); return true; } });
   q('.org-reorg [data-act="edit"]').click();
@@ -300,8 +300,8 @@ test('"Edytuj w trybie edycji" hands the reorganization to the edit mode when th
 
 test('without an edit mode to take it the reorganization opens in a basic editor that can drop a change and save', async () => {
   await mount();
-  world.answers.orgChangeSetGetRequest = { ok: true, change_set: changeSet({ ops: stored }), valid: false, results: [], warnings: [] };
-  world.answers.orgChangeSetSaveRequest = { ok: true, change_set: changeSet({ state: 'draft' }), valid: true, results: [], warnings: [] };
+  world.answers.orgChangeSetGetRequest = { ok: true, changeSet: changeSet({ ops: stored }), valid: false, results: [], warnings: [] };
+  world.answers.orgChangeSetSaveRequest = { ok: true, changeSet: changeSet({ state: 'draft' }), valid: true, results: [], warnings: [] };
   q('.org-reorg [data-act="edit"]').click();
   await settle();
   const win = windowEl();
@@ -319,7 +319,7 @@ test('a new reorganization is a name and a day; the draft goes to the edit mode 
   await mount();
   const opened = [];
   registerChangeSetEditor({ open: async (request) => { opened.push(request); return true; } });
-  world.answers.orgChangeSetSaveRequest = { ok: true, change_set: changeSet({ id: 'cs-2', name: 'Nowa', state: 'draft', ops: [] }), valid: true, results: [], warnings: [] };
+  world.answers.orgChangeSetSaveRequest = { ok: true, changeSet: changeSet({ id: 'cs-2', name: 'Nowa', state: 'draft', ops: [] }), valid: true, results: [], warnings: [] };
   q('[data-act="new-reorg"]').click();
   await settle();
   await confirm();
@@ -357,9 +357,9 @@ test('leaving the tab leaves nothing behind', async () => {
 });
 
 test('an approved reorganization whose day has not come can still be withdrawn, and the window says what that undoes', async () => {
-  world.answers.orgChangeSetListRequest = { items: [changeSet({ state: 'applied', approver_name: 'Anna' })], today: TODAY };
+  world.answers.orgChangeSetListRequest = { items: [changeSet({ state: 'applied', approverName: 'Anna' })], today: TODAY };
   await mount();
-  world.answers.orgChangeSetWithdrawRequest = { ok: true, change_set: changeSet({ state: 'withdrawn' }), valid: false, results: [], warnings: [] };
+  world.answers.orgChangeSetWithdrawRequest = { ok: true, changeSet: changeSet({ state: 'withdrawn' }), valid: false, results: [], warnings: [] };
   q('.org-reorg [data-act="withdraw"]').click();
   await settle();
   assert.equal(windowEl().querySelector('.tf-act__note').getAttribute('message'), t('withdraw_applied_consequence'));
@@ -370,7 +370,7 @@ test('an approved reorganization whose day has not come can still be withdrawn, 
 test('a withdrawal the server refuses because later changes lean on the plan stays in the window with its reason', async () => {
   world.answers.orgChangeSetListRequest = { items: [changeSet({ state: 'applied' })], today: TODAY };
   await mount();
-  world.answers.orgChangeSetWithdrawRequest = { ok: false, error: { code: 'change_set_dependents', message: 'x' }, change_set: changeSet({ state: 'applied' }), valid: false, results: [], warnings: [] };
+  world.answers.orgChangeSetWithdrawRequest = { ok: false, error: { code: 'change_set_dependents', message: 'x' }, changeSet: changeSet({ state: 'applied' }), valid: false, results: [], warnings: [] };
   q('.org-reorg [data-act="withdraw"]').click();
   await settle();
   await confirm();
@@ -378,7 +378,7 @@ test('a withdrawal the server refuses because later changes lean on the plan sta
 });
 
 test('the only administrator gets the approval button on their own plan, with the note that says why', async () => {
-  world.answers.orgChangeSetListRequest = { items: [changeSet({ author_user_id: ME })], today: TODAY, sole_admin: true };
+  world.answers.orgChangeSetListRequest = { items: [changeSet({ authorUserId: ME })], today: TODAY, soleAdmin: true };
   await mount();
   const approve = q('.org-reorg [data-act="approve"]');
   assert.equal(approve.hasAttribute('disabled'), false);

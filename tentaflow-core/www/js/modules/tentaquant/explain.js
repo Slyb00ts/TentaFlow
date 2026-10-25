@@ -73,7 +73,7 @@ export function stateFeatures(frame) {
       a: list[0],
       b: list[1],
       concurrence: Number(pair.concurrence ?? 0) || 0,
-      mutualInformation: Number(pair.mutualInformation ?? pair.mutual_information ?? 0) || 0,
+      mutualInformation: Number(pair.mutualInformation ?? 0) || 0,
     };
   });
   const amplitudes = [];

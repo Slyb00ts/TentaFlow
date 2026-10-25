@@ -16,6 +16,30 @@ import { openTransport, TRANSPORT_WEBTRANSPORT, TRANSPORT_WEBSOCKET } from './tr
 const DEFAULT_TIMEOUT_MS = 30_000;
 const RECONNECT_BASE_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
+// Failed opens (with a token and a reachable server) before the token is
+// treated as rejected: the browser hides the 401 of a WebSocket upgrade.
+const TOKEN_REJECT_AFTER_ATTEMPTS = 3;
+const REACHABILITY_PROBE_MS = 3000;
+
+// Expiry read from the token itself, so a stale session is dropped without
+// asking the server (an expired token makes every upgrade fail with 401).
+function jwtExpired(token) {
+  try {
+    const payload = JSON.parse(atob(token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')));
+    return typeof payload.exp === 'number' && payload.exp * 1000 <= Date.now();
+  } catch {
+    return false;
+  }
+}
+
+async function serverReachable() {
+  try {
+    await fetch('/', { method: 'HEAD', cache: 'no-store', signal: AbortSignal.timeout(REACHABILITY_PROBE_MS) });
+    return true;
+  } catch {
+    return false;
+  }
+}
 let GLOBAL_NEXT_SEQUENCE = 1n;
 
 // Zbakowany w tym buildzie hash frontu (build.rs -> asset-manifest.js). Ladowany
@@ -79,17 +103,28 @@ export class BinaryWsClient {
     // protokolu (stary wasm) i trzeba reload; required=false => tylko zmiana
     // zasobow (JS/CSS/panel), reload opcjonalny.
     this.onUpdateAvailable = opts.onUpdateAvailable ?? noop;
+    // onAuthRejected({ reason }) — the stored token can no longer open a
+    // socket (expired or refused); the client continues anonymously and the
+    // app has to send the user back to the login screen.
+    this.onAuthRejected = opts.onAuthRejected ?? noop;
     // P2c FIX: lista listenerow dla unsolicited frame (kazda screen moze
     // dodac swoj). Stare onUnsolicited (single) zachowane jako shortcut.
     this._unsolicitedListeners = [];
     if (opts.onUnsolicited) this._unsolicitedListeners.push(opts.onUnsolicited);
     this._reconnectTimer = null;
-    this._lastHeartbeatReplyAt = 0;
     // Dedup: emit onDisconnected tylko raz na kazdy prawdziwy disconnect,
     // nie per failed reconnect attempt.
     this._disconnectEmitted = false;
     this._connectPromise = null;
     this._transportGeneration = 0;
+    this._lastInboundAt = 0;
+    // A socket that went half-open while the device slept or changed network
+    // never fires `close`; coming back online / visible is the moment to look.
+    this._onWake = (ev) => this._wake(ev);
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', this._onWake);
+      document.addEventListener('visibilitychange', this._onWake);
+    }
   }
 
   /**
@@ -177,6 +212,8 @@ export class BinaryWsClient {
       this.nextCorrelationId = makeCorrelationIdGenerator();
     }
 
+    if (this.jwtToken && jwtExpired(this.jwtToken)) this._dropToken('expired');
+
     let transport = null;
     let generation = this._transportGeneration;
     try {
@@ -185,8 +222,8 @@ export class BinaryWsClient {
       this._transportGeneration = generation;
       this.transport = transport;
       this.connected = true;
-      this.reconnectAttempt = 0;
       this._disconnectEmitted = false;
+      this._lastInboundAt = Date.now();
       this._transportUnsub = transport.onMessage((bytes) => {
         if (generation !== this._transportGeneration || this.transport !== transport) return;
         this._handleBytes(bytes);
@@ -197,7 +234,10 @@ export class BinaryWsClient {
       }
       console.info(`[ws] transport: ${transport.kind}`);
       await this._handshake();
-      this._lastHeartbeatReplyAt = Date.now();
+      // Only a finished handshake proves the node is usable; resetting earlier
+      // turned a node that accepts sockets but fails the handshake into a
+      // 1-second retry loop.
+      this.reconnectAttempt = 0;
       this._startHeartbeat();
       this._drainOutbox();
       this.onOpen();
@@ -216,6 +256,12 @@ export class BinaryWsClient {
         try { transport.close(); } catch { /* ignore */ }
       }
       if (!this.closed) {
+        if (
+          !transport && this.jwtToken && this.reconnectAttempt >= TOKEN_REJECT_AFTER_ATTEMPTS &&
+          await serverReachable()
+        ) {
+          this._dropToken('rejected');
+        }
         // Emituj onDisconnected TYLKO przy pierwszej niudanej probie (transition).
         // Kolejne failed attempts leca tylko jako reconnect-attempt logi.
         const reason = String(err?.message ?? err);
@@ -253,11 +299,39 @@ export class BinaryWsClient {
     this._scheduleReconnect(info?.reason ?? 'closed');
   }
 
+  _dropToken(reason) {
+    this.jwtToken = null;
+    this.reconnectAttempt = 0;
+    this.onAuthRejected({ reason });
+  }
+
+  _wake(ev) {
+    if (this.closed || (ev.type === 'visibilitychange' && document.hidden)) return;
+    if (this.connected) {
+      this._checkAlive();
+    } else if (!this._connectPromise) {
+      this.reconnectNow();
+    }
+  }
+
+  // Heartbeat replies are the only proof a socket still reaches the node.
+  _checkAlive() {
+    if (!this.connected || this.heartbeatIntervalMs <= 0) return;
+    if (Date.now() - this._lastInboundAt <= this.heartbeatIntervalMs * 2 + 5000) return;
+    const generation = this._transportGeneration;
+    try { this.transport?.close(); } catch { /* ignore */ }
+    this._onTransportClose({ code: 4000, reason: 'heartbeat timeout' }, generation);
+  }
+
   /**
    * Zamyka klient. Po close() nie bedzie auto-reconnectu.
    */
   close() {
     this.closed = true;
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('online', this._onWake);
+      document.removeEventListener('visibilitychange', this._onWake);
+    }
     this._stopHeartbeat();
     if (this._reconnectTimer) {
       clearTimeout(this._reconnectTimer);
@@ -346,6 +420,8 @@ export class BinaryWsClient {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(correlationId.toString());
+        // A request that gave up must not be replayed after the next reconnect.
+        this.outbox = this.outbox.filter((queued) => queued !== frame);
         reject(new Error(`request ${kind} timed out after ${timeoutMs}ms`));
       }, timeoutMs);
 
@@ -416,7 +492,7 @@ export class BinaryWsClient {
     });
     await this.transport.send(frame);
     const { body } = await resultPromise;
-    if (body.variant !== 'MetaSchemaVersionAck' || !body.accepted) {
+    if (body._variant !== 'MetaSchemaVersionAck' || !body.accepted) {
       // Twardy mismatch protokolu — wasm/kodek jest nieaktualny wzgledem
       // backendu. Front MUSI sie przeladowac; zglos to zanim rzucimy.
       try {
@@ -443,6 +519,7 @@ export class BinaryWsClient {
   }
 
   _handleBytes(bytes) {
+    this._lastInboundAt = Date.now();
     let decoded;
     try {
       decoded = decodeFrame(bytes);
@@ -505,6 +582,8 @@ export class BinaryWsClient {
     if (this.heartbeatIntervalMs <= 0) return;
     this.heartbeatTimer = setInterval(() => {
       if (!this.connected || !this.transport?.isOpen()) return;
+      this._checkAlive();
+      if (!this.connected) return;
       const correlationId = this.nextCorrelationId();
       const sequence = this.takeSequence();
       const frame = encode.metaHeartbeat(correlationId, Math.floor(Date.now() / 1000), sequence);
@@ -545,7 +624,7 @@ export class BinaryWsClient {
             isStreamChunk: false,
             isStreamEnd: true,
           },
-          body: { variant: 'StreamClosed', stream_id: '', reason },
+          body: { _variant: 'StreamBody.Closed', streamId: '', reason },
         });
       } catch (err) {
         console.error('[ws] subscriber end handler threw:', err);
@@ -557,10 +636,11 @@ export class BinaryWsClient {
   _scheduleReconnect(reason) {
     if (this.closed) return;
     if (this._reconnectTimer) return; // juz zaplanowany
-    const delay = Math.min(
+    // Jitter keeps every tab of a restarted node from retrying in lockstep.
+    const delay = Math.round(Math.min(
       RECONNECT_BASE_MS * 2 ** this.reconnectAttempt,
       RECONNECT_MAX_MS,
-    );
+    ) * (0.8 + Math.random() * 0.4));
     const attempt = this.reconnectAttempt + 1;
     this.reconnectAttempt = attempt;
     this.onReconnectScheduled({ attempt, delayMs: delay, reason });

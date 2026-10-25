@@ -15,7 +15,7 @@ const HubScreen = {
   },
   async mount() {
     try {
-      const engines = await ApiBinary.list('hubEngineListRequest');
+      const engines = await ApiBinary.list('hubEngineListRequest', { arrayKey: 'engines' });
       const host = byId('engines-host');
       if (engines.length === 0) {
         host.innerHTML = `<div class="empty-state"><div class="empty-state-text">Brak silników</div></div>`;

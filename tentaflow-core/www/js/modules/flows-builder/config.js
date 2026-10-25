@@ -129,7 +129,7 @@ async function loadDynamicEnumOptions(source, category) {
       const aliases = Array.isArray(aliasesRaw) ? aliasesRaw : [];
       const modelByName = new Map();
       for (const m of models) {
-        const name = m.model_name || m.modelName;
+        const name = m.modelName;
         if (name) modelByName.set(name, m);
       }
       const cat = (category || '').toLowerCase();
@@ -137,17 +137,17 @@ async function loadDynamicEnumOptions(source, category) {
         ? models.filter((m) => (m.category || '').toLowerCase() === cat)
         : models;
       const opts = filtered.map((m) => {
-        const value = m.model_name || m.modelName || '';
-        const display = m.display_name || m.displayName || value;
-        const engine = m.engine_id || m.engineId;
+        const value = m.modelName || '';
+        const display = m.displayName || value;
+        const engine = m.engineId;
         const label = engine ? `${display} (${engine})` : display;
         return { value, label };
       });
       // Aliasy ktore kieruja do modelu z tej kategorii — uzytkownik widzi je
       // pod prawdziwymi modelami z prefixem `↪`.
       for (const a of aliases) {
-        if (a.is_active === false || a.isActive === false) continue;
-        const target = a.target_model || a.targetModel;
+        if (a.isActive === false) continue;
+        const target = a.targetModel;
         const targetModel = target ? modelByName.get(target) : null;
         if (!targetModel) continue;
         if (cat && (targetModel.category || '').toLowerCase() !== cat) continue;
@@ -163,7 +163,7 @@ async function loadDynamicEnumOptions(source, category) {
       // surface `camera_cv` — ten sam endpoint co zakladka Models w Services.
       const entries = await ApiBinary.list('catalogListRequest', { arrayKey: 'entries' }).catch(() => []);
       const cv = (Array.isArray(entries) ? entries : []).filter((e) => {
-        const surfaces = e?.serviceSurfaces || e?.service_surfaces || [];
+        const surfaces = e?.serviceSurfaces || [];
         return Array.isArray(surfaces) && surfaces.includes('camera_cv');
       });
       // Aliasy najpierw (z celem po strzalce, jak przy modelach), potem
@@ -172,9 +172,9 @@ async function loadDynamicEnumOptions(source, category) {
       const directOpts = [];
       for (const e of cv) {
         if (!e?.id) continue;
-        const kindWrapper = e.kind || {};
-        if (kindWrapper.kind === 'alias') {
-          const target = kindWrapper.target || '';
+        const aliasKind = e.kind?.Alias;
+        if (aliasKind) {
+          const target = aliasKind.target || '';
           aliasOpts.push({ value: e.id, label: target ? `↪ ${e.id} → ${target}` : e.id });
         } else {
           directOpts.push({ value: e.id, label: e.id });
@@ -187,7 +187,7 @@ async function loadDynamicEnumOptions(source, category) {
     if (source === 'prompts') {
       const list = await ApiBinary.list('promptListRequest', { arrayKey: 'prompts' }).catch(() => []);
       return (Array.isArray(list) ? list : []).map((p) => ({
-        value: p.id || p.promptId || '',
+        value: p.id || '',
         label: p.name || p.id || '',
       }));
     }
@@ -196,11 +196,11 @@ async function loadDynamicEnumOptions(source, category) {
       // flow id is not available to this loader yet, so self-reference is not
       // filtered here — the subflow runtime guard rejects a self/cycle
       // reference (UI gap noted in the adapter).
-      const list = await ApiBinary.list('flowListRequest').catch(() => []);
+      const list = await ApiBinary.list('flowListRequest', { arrayKey: 'flows' }).catch(() => []);
       return (Array.isArray(list) ? list : [])
-        .filter((f) => (f.status || (f.enabled ? 'active' : 'draft')) === 'active')
+        .filter((f) => f.enabled)
         .map((f) => ({
-          value: f.id || f.flowId || '',
+          value: f.id || '',
           label: f.name || f.id || '',
         }));
     }
@@ -212,15 +212,15 @@ async function loadDynamicEnumOptions(source, category) {
       const resp = await ApiBinary.one('agentsListRequest', {}).catch(() => null);
       let rows = [];
       try {
-        rows = JSON.parse(resp?.agentsJson ?? resp?.agents_json ?? '[]');
+        rows = JSON.parse(resp?.agentsJson ?? '[]');
       } catch (_e) {
         rows = [];
       }
       return (Array.isArray(rows) ? rows : [])
-        .filter((a) => a.is_enabled !== false && a.isEnabled !== false)
+        .filter((a) => a.is_enabled !== false)
         .map((a) => ({
-          value: a.id || a.agentId || '',
-          label: a.display_name || a.displayName || a.name || a.id || '',
+          value: a.id || '',
+          label: a.display_name || a.name || a.id || '',
         }));
     }
     if (source === 'projects') {
@@ -232,8 +232,8 @@ async function loadDynamicEnumOptions(source, category) {
       }).catch(() => null);
       const rows = Array.isArray(resp?.projects) ? resp.projects : [];
       return rows.map((p) => ({
-        value: p.project_id || p.projectId || '',
-        label: p.name || p.project_id || p.projectId || '',
+        value: p.projectId || '',
+        label: p.name || p.projectId || '',
       }));
     }
     if (source === 'bus_instances') {
@@ -248,10 +248,10 @@ async function loadDynamicEnumOptions(source, category) {
       // bespoke error state here.
       const apps = await ApiBinary.list('appsListRequest', { arrayKey: 'apps' }).catch(() => []);
       return (Array.isArray(apps) ? apps : [])
-        .filter((a) => (a.packageId ?? a.package_id) === 'tentabus' && a.enabled !== false)
+        .filter((a) => a.packageId === 'tentabus' && a.enabled !== false)
         .map((a) => ({
-          value: String(a.addonId ?? a.addon_id ?? ''),
-          label: String((a.titleKey && I18n.t(a.titleKey)) || a.title || a.addonId || a.addon_id || ''),
+          value: String(a.addonId ?? ''),
+          label: String((a.titleKey && I18n.t(a.titleKey)) || a.title || a.addonId || ''),
         }))
         .filter((o) => o.value);
     }
@@ -1478,7 +1478,7 @@ export class FlowConfig {
 
   _paramsSchema() {
     if (!this.template) return { properties: {}, required: [] };
-    const raw = this.template.params_schema;
+    const raw = this.template.paramsSchema;
     if (!raw) return { properties: {}, required: [] };
     try {
       const s = typeof raw === 'string' ? JSON.parse(raw) : raw;
@@ -2135,10 +2135,10 @@ export class FlowConfig {
     // Adapter metadata z backendu ma priorytet (input_ports/output_ports +
     // input_port_types/output_port_types z `FlowDataType::as_wire_str`).
     const tpl = this.template;
-    const tplIn = (tpl && Array.isArray(tpl.input_ports) && tpl.input_ports.length > 0) ? tpl.input_ports : null;
-    const tplOut = (tpl && Array.isArray(tpl.output_ports) && tpl.output_ports.length > 0) ? tpl.output_ports : null;
-    const tplInTypes = (tpl && Array.isArray(tpl.input_port_types)) ? tpl.input_port_types : null;
-    const tplOutTypes = (tpl && Array.isArray(tpl.output_port_types)) ? tpl.output_port_types : null;
+    const tplIn = (tpl && Array.isArray(tpl.inputPorts) && tpl.inputPorts.length > 0) ? tpl.inputPorts : null;
+    const tplOut = (tpl && Array.isArray(tpl.outputPorts) && tpl.outputPorts.length > 0) ? tpl.outputPorts : null;
+    const tplInTypes = (tpl && Array.isArray(tpl.inputPortTypes)) ? tpl.inputPortTypes : null;
+    const tplOutTypes = (tpl && Array.isArray(tpl.outputPortTypes)) ? tpl.outputPortTypes : null;
     const withType = (names, types) => names.map((name, i) => ({
       name,
       type: (types && typeof types[i] === 'string') ? types[i] : 'any',

@@ -66,6 +66,13 @@ export class SentenceBuffer {
   }
 }
 
+// The same split the TTS queue uses, so the transcript shows sentence k while
+// the k-th audio chunk plays.
+export function splitSentences(text) {
+  const buf = new SentenceBuffer();
+  return [...buf.push(String(text || '')), ...buf.drain()];
+}
+
 // Parametry akustyczne. Komentarze WHY:
 // - DEFAULT_RMS_THRESHOLD: 0.012 to RMS dla cichego pokoju z mikrofonem
 //   laptopowym; wyzej = false negatives, nizej = false positives na hum.
@@ -126,12 +133,20 @@ export class AudioPipeline {
     // callera, który odpala flow przez FlowInvoke. Flow robi STT→LLM→TTS.
     this.onUtteranceAudio = opts.onUtteranceAudio || (() => {});
     this.onStateChange = opts.onStateChange || (() => {});
+    // Live transcript hooks: the VAD edge (the user started / stopped talking)
+    // and every scheduled TTS chunk with its real audio duration, so the UI can
+    // follow the sentence being spoken without guessing from text length alone.
+    this.onVadChange = opts.onVadChange || (() => {});
+    this.onPlaybackChunk = opts.onPlaybackChunk || (() => {});
     this.onError = opts.onError || (() => {});
     this.bargeInAbort = opts.bargeInAbort || (() => {});
     this.i18n = opts.i18n || { t: (k) => k };
 
     this.state = STATES.IDLE;
     this.muted = false;
+    // Set while the server link is down: the mic stays open but nothing is
+    // captured, sent or played, and the user's own mute choice is untouched.
+    this.suspended = false;
     this.speakerMuted = false;
 
     // Audio graph
@@ -175,6 +190,7 @@ export class AudioPipeline {
     this.ttsNextStartTime = 0; // kursor planowania na audioCtx.currentTime
     this.ttsPumping = false; // serializacja decode'u kolejki
     this.ttsGen = 0; // bump przy stop/barge-in — porzuca chunk dekodowany w locie
+    this.ttsChunkIndex = 0; // kolejnosc chunka w biezacej odpowiedzi (== zdanie w transkrypcie)
     this.ttsGain = null; // master gain (mute speakera) -> analyser -> destination
     this.ttsAbortController = null;
     this.sttAbortController = null;
@@ -187,10 +203,6 @@ export class AudioPipeline {
     this.ttsAnalyser = null;
     this.ttsAmpRafId = null;
     this.lastTtsRms = 0; // poziom wyjscia TTS — echo-guard dla barge-in
-  }
-
-  getState() {
-    return this.state;
   }
 
   isMuted() {
@@ -357,6 +369,25 @@ export class AudioPipeline {
     }
   }
 
+  // Server link lost / back: stop everything in flight without touching the
+  // mute flags, so the dock keeps showing what the user chose.
+  setSuspended(suspended) {
+    this.suspended = !!suspended;
+    if (this.suspended) {
+      this._abortStt();
+      this._stopActiveTts(true);
+      this.ttsQueue = [];
+      this.sentenceBuf.reset();
+      this.streamComplete = false;
+      this._resetVad();
+      this.faceHandle.setListenAmplitude(0);
+      this.faceHandle.setMode('idle');
+      this.onVadChange(false);
+    } else if (!this.muted) {
+      this.faceHandle.setMode(FACE_MODE[this.state] || 'idle');
+    }
+  }
+
   toggleSpeaker() {
     this.speakerMuted = !this.speakerMuted;
     if (this.ttsGain) {
@@ -369,7 +400,7 @@ export class AudioPipeline {
     // Manualny override — uzytkownik trzyma Spacje. Wymusza speech-mode,
     // ignoruje VAD threshold do momentu pushToTalkEnd().
     if (this.state !== STATES.LISTENING) return;
-    if (this.muted) return;
+    if (this.muted || this.suspended) return;
     this.pttActive = true;
     if (!this.vadInSpeech) {
       this._onSpeechStart();
@@ -419,7 +450,7 @@ export class AudioPipeline {
 
   _onWorkletFrame(frame) {
     if (!frame || frame.length === 0) return;
-    if (this.muted) return;
+    if (this.muted || this.suspended) return;
 
     this.pcmFrames.push(frame);
     this.pcmTotalSamples += frame.length;
@@ -457,7 +488,7 @@ export class AudioPipeline {
   }
 
   _tick() {
-    if (!this.analyser || this.muted) {
+    if (!this.analyser || this.muted || this.suspended) {
       this.faceHandle.setListenAmplitude(0);
       this.lastTickAt = performance.now();
       return;
@@ -539,6 +570,7 @@ export class AudioPipeline {
     this.vadInSpeech = true;
     this.silenceMsAccumulated = 0;
     this.continuousSpeechMs = 0;
+    this.onVadChange(true);
     // Zapamietaj index ramki PCM, od ktorej wycinamy utterance — z prepad'em.
     const prePadSamples = (this.opts.prePadMs / 1000) * this.frameSampleRate;
     let cumulative = 0;
@@ -557,6 +589,7 @@ export class AudioPipeline {
     this.vadInSpeech = false;
     this.speechMsAccumulated = 0;
     this.silenceMsAccumulated = 0;
+    this.onVadChange(false);
 
     // Zlep ramki od speechStartFrameIdx do konca w jeden Float32Array.
     const frames = this.pcmFrames.slice(this.speechStartFrameIdx);
@@ -592,6 +625,7 @@ export class AudioPipeline {
     const wav = floatToWav(merged, this.frameSampleRate, 16000);
     this._setState(STATES.THINKING);
     this.streamComplete = false;
+    this.ttsChunkIndex = 0;
     this.onUtteranceAudio(wav, this.frameSampleRate >= 16000 ? 16000 : this.frameSampleRate);
   }
 
@@ -721,6 +755,12 @@ export class AudioPipeline {
         src.start(startAt);
         this.ttsNextStartTime = startAt + audioBuffer.duration;
         this.ttsSources.add(src);
+        this.onPlaybackChunk({
+          index: this.ttsChunkIndex,
+          startsInMs: Math.max(0, (startAt - now) * 1000),
+          durationMs: audioBuffer.duration * 1000,
+        });
+        this.ttsChunkIndex += 1;
 
         this._setState(STATES.SPEAKING);
         this._startTtsAmpRaf();
@@ -756,6 +796,7 @@ export class AudioPipeline {
 
   _stopActiveTts(_drop) {
     this.ttsGen = (this.ttsGen + 1) | 0;
+    this.ttsChunkIndex = 0;
     if (this.ttsAbortController) {
       try { this.ttsAbortController.abort(); } catch { /* ignore */ }
       this.ttsAbortController = null;
