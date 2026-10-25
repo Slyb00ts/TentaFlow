@@ -2408,7 +2408,7 @@ fn commit_cold(camera_id: &str, sig: u64) {
 /// the byte counter (which would wrap huge and permanently reject the budget gate).
 fn release_cold(camera_id: &str, frame_bytes: usize) {
     // Free the finished event's bytes first.
-    let _ = cold_bytes().fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |v| {
+    let _ = cold_bytes().try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |v| {
         Some(v.saturating_sub(frame_bytes))
     });
     // Clear the slot and take any freshest pending under the lock.
