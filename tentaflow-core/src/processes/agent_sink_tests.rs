@@ -13,8 +13,8 @@ use tentaflow_protocol::processes::{
 use tokio_util::sync::CancellationToken;
 
 use super::agent_sink::{
-    agent_run_id, binding_from_meta, complete_task, ProcessActivityBinding,
-    PROCESS_ACTIVITY_META_KEY,
+    agent_run_id, binding_from_meta, complete_task, sealed_meta, step_iteration_cap,
+    ProcessActivityBinding, PROCESS_ACTIVITY_META_KEY,
 };
 use super::repository::{self, ClaimedProcessJob};
 use super::runtime::test_support::*;
@@ -974,6 +974,19 @@ fn publication_refuses_an_agent_that_cannot_run_a_process_step() {
         )
         .unwrap();
     assert!(refused(agent_implementation("cli-agent", &[], None)).contains("CLI engine"));
+
+    seed_agent(&fixture, "continuing-agent", "[]", 10, true);
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute(
+            "UPDATE agents SET on_child_complete='continue' WHERE id='continuing-agent'",
+            [],
+        )
+        .unwrap();
+    assert!(refused(agent_implementation("continuing-agent", &[], None))
+        .contains("continues on its own"));
 }
 
 #[test]
@@ -1182,4 +1195,132 @@ fn an_agent_step_survives_the_xml_round_trip() {
     assert!(import(&mixed).is_none());
     let missing_config = xml.replace("agentConfig", "blockConfig");
     assert!(import(&missing_config).is_none());
+}
+
+fn schema_requiring_verdict() -> Value {
+    json!({"type": "object", "required": ["verdict"], "properties": {"verdict": {"type": "string"}}})
+}
+
+#[test]
+fn the_output_schema_is_the_published_one_even_when_the_binding_says_otherwise() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    let (_, mut binding) = running_step(
+        &fixture,
+        agent_implementation(AGENT_ID, &[], Some(schema_requiring_verdict())),
+    );
+    // A harness node rewrote the schema the run carries in meta.
+    binding.output_schema = None;
+    let refusal = report(&fixture, &binding, finished("done", json!({"other": 1}))).unwrap_err();
+    assert!(
+        refusal.contains("do not match the output schema"),
+        "{refusal}"
+    );
+    assert!(completions(&fixture).is_empty());
+
+    binding.output_schema = Some(json!({}));
+    report(
+        &fixture,
+        &binding,
+        finished("done", json!({"verdict": "ok"})),
+    )
+    .unwrap();
+    assert_eq!(completions(&fixture).len(), 1);
+}
+
+#[test]
+fn a_recorded_report_that_does_not_fit_the_published_step_is_never_accepted() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    let (claimed, _) = running_step(
+        &fixture,
+        agent_implementation(AGENT_ID, &[], Some(schema_requiring_verdict())),
+    );
+    let violating = ActivityResult {
+        outcome: ActivityOutcome::Completed,
+        code: None,
+        summary: "done".into(),
+        outputs: json!({"other": 1}),
+        evidence: Vec::new(),
+    };
+    // A row that bypassed the sink (an old binary, a repaired store).
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute(
+            "INSERT INTO bpmn_agent_completions(invocation_id,run_id,result_json,created_at_ms) VALUES(?1,?2,?3,1)",
+            rusqlite::params![
+                claimed.invocation_id,
+                agent_run_id(&claimed.invocation_id),
+                serde_json::to_string(&violating).unwrap()
+            ],
+        )
+        .unwrap();
+    let observed = repository::ObservedActivityResult {
+        result: violating,
+        origin: repository::ActivityResultOrigin::Contract,
+        expression_observation: None,
+    };
+    repository::record_job_observation(&fixture.db, &claimed, "agent-worker", &observed, now_ms())
+        .unwrap();
+    let current =
+        repository::runtime_snapshot(&fixture.db, &fixture.owner, &claimed.job.instance_id)
+            .unwrap();
+    let refusal = repository::accept_job_result(
+        &fixture.db,
+        &fixture.owner,
+        &claimed.job.job_id,
+        claimed.job.attempt,
+        claimed.job.fence,
+        "agent-worker",
+        &observed,
+        current.instance.revision,
+        repository::ProcessPlanInput::Canonical,
+        now_ms(),
+    )
+    .expect_err("an output that breaks the published schema is refused at acceptance");
+    assert!(
+        format!("{refusal:#}").contains("does not fit the published step"),
+        "{refusal:#}"
+    );
+}
+
+#[test]
+fn the_tool_list_and_iteration_budget_of_a_step_come_from_the_process_model_not_run_meta() {
+    let fixture = Fixture::new();
+    seed_agent(
+        &fixture,
+        AGENT_ID,
+        r#"["core.skill_view","core.fs_read"]"#,
+        10,
+        true,
+    );
+    let (_, binding) = running_step(
+        &fixture,
+        agent_implementation(AGENT_ID, &["core.skill_view"], None),
+    );
+    let run_id = binding.agent_run_id();
+
+    // The budget is the published one whatever meta holds: there is no entry to delete.
+    assert_eq!(step_iteration_cap(&fixture.db, &run_id).unwrap(), Some(5));
+    assert_eq!(
+        step_iteration_cap(&fixture.db, "not-a-step-run").unwrap(),
+        None
+    );
+
+    // A harness node widened the list in the binding it carries.
+    let mut widened = binding.clone();
+    widened.allowed_tools = vec!["core.skill_view".into(), "core.fs_read".into()];
+    let forged = BTreeMap::from([widened.meta_entry()].map(|(key, value)| (key.to_owned(), value)));
+    let sealed = sealed_meta(&fixture.db, &run_id, &forged);
+    assert_eq!(
+        binding_from_meta(&sealed).unwrap().allowed_tools,
+        ["core.skill_view"]
+    );
+    // A node dropped the binding altogether: the step is still a step.
+    let restored = sealed_meta(&fixture.db, &run_id, &BTreeMap::new());
+    assert_eq!(binding_from_meta(&restored), Some(binding.clone()));
+    // A run that is not a step keeps exactly the meta it has.
+    assert_eq!(sealed_meta(&fixture.db, "another-run", &forged), forged);
 }

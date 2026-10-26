@@ -13,9 +13,7 @@ use tentaflow_protocol::processes::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::agent_sink::{
-    agent_run_id, binding_from_meta, complete_task, PROCESS_STEP_ITERATIONS_META_KEY,
-};
+use super::agent_sink::{agent_run_id, binding_from_meta, complete_task};
 use super::agent_sink_tests::{
     agent_implementation, agent_model, running_step, seed_agent, AGENT_ID,
 };
@@ -38,6 +36,13 @@ enum Script {
     Silent,
     /// Works until its run is cancelled.
     Hold,
+    /// Reports and then keeps working until its run is cancelled.
+    ReportAndHold(Value),
+    /// Reports, stops the worker that runs the step at once, and works on.
+    ReportThenStopWorker(Value, CancellationToken),
+    /// Starts a sub-agent and works until cancelled; the sub-agent works until
+    /// cancelled too.
+    DelegateAndHold,
 }
 
 #[derive(Default)]
@@ -55,6 +60,7 @@ struct ScriptedRunner {
     seen: Arc<Mutex<Seen>>,
     started: Arc<AtomicUsize>,
     cancelled: Arc<AtomicBool>,
+    manager: Arc<Mutex<Option<Arc<AgentRunManager>>>>,
 }
 
 #[async_trait]
@@ -76,7 +82,7 @@ impl BackgroundFlowRunner for ScriptedRunner {
             seen.scopes.push(scope.clone());
             seen.prompts
                 .push(initial.payload.as_text().unwrap_or_default().to_owned());
-            seen.principals.push(principal);
+            seen.principals.push(principal.clone());
         }
         self.started.fetch_add(1, Ordering::AcqRel);
         match &self.script {
@@ -88,6 +94,48 @@ impl BackgroundFlowRunner for ScriptedRunner {
             }
             Script::Silent => {}
             Script::Hold => {
+                cancel.cancelled().await;
+                self.cancelled.store(true, Ordering::Release);
+                anyhow::bail!("cancelled");
+            }
+            Script::ReportAndHold(arguments) => {
+                let binding =
+                    binding_from_meta(&initial.meta).expect("the spawn carried the binding");
+                complete_task(&self.db, &binding, &scope, arguments, now_ms())
+                    .expect("the report is recorded");
+                cancel.cancelled().await;
+                self.cancelled.store(true, Ordering::Release);
+                anyhow::bail!("cancelled");
+            }
+            Script::ReportThenStopWorker(arguments, worker) => {
+                let binding =
+                    binding_from_meta(&initial.meta).expect("the spawn carried the binding");
+                complete_task(&self.db, &binding, &scope, arguments, now_ms())
+                    .expect("the report is recorded");
+                worker.cancel();
+                cancel.cancelled().await;
+                self.cancelled.store(true, Ordering::Release);
+                anyhow::bail!("cancelled");
+            }
+            Script::DelegateAndHold => {
+                if let Some(binding) = binding_from_meta(&initial.meta) {
+                    let manager = self.manager.lock().unwrap().clone().expect("a manager");
+                    let caller = crate::agents::CallerRun {
+                        run_id: scope.clone(),
+                        agent_id: AGENT_ID.into(),
+                        principal,
+                        session_id: None,
+                        code_session: None,
+                        step_tools: Some(binding.allowed_tools.clone()),
+                    };
+                    manager
+                        .handle_agent_spawn(
+                            &caller,
+                            &json!({"agent_name": HELPER_ID, "task": "help"}),
+                        )
+                        .await
+                        .expect("the step delegates");
+                }
                 cancel.cancelled().await;
                 self.cancelled.store(true, Ordering::Release);
                 anyhow::bail!("cancelled");
@@ -109,10 +157,13 @@ struct Rig {
     cancelled: Arc<AtomicBool>,
 }
 
+const HELPER_ID: &str = "helper-agent";
+
 fn install(fixture: &Fixture, script: Script) -> Rig {
     let seen = Arc::new(Mutex::new(Seen::default()));
     let started = Arc::new(AtomicUsize::new(0));
     let cancelled = Arc::new(AtomicBool::new(false));
+    let slot = Arc::new(Mutex::new(None));
     let manager = Arc::new(AgentRunManager::new(
         fixture.db.clone(),
         Arc::new(ScriptedRunner {
@@ -121,11 +172,13 @@ fn install(fixture: &Fixture, script: Script) -> Rig {
             seen: seen.clone(),
             started: started.clone(),
             cancelled: cancelled.clone(),
+            manager: slot.clone(),
         }),
         Arc::new(ProgressBroker::new()),
         8,
     ));
     manager.attach_self();
+    *slot.lock().unwrap() = Some(manager.clone());
     fixture.dispatcher().set_process_agent_runs(manager.clone());
     Rig {
         manager,
@@ -245,7 +298,6 @@ async fn a_reporting_agent_completes_its_step_with_a_contract_result_and_the_pin
     let binding = binding_from_meta(&seen.meta[0]).expect("binding in meta");
     assert_eq!(binding.invocation_id, claimed.invocation_id);
     assert_eq!(binding.allowed_tools, ["core.skill_view"]);
-    assert_eq!(seen.meta[0][PROCESS_STEP_ITERATIONS_META_KEY], json!(5));
     assert!(
         seen.prompts[0].starts_with("Summarise the case"),
         "{}",
@@ -715,5 +767,378 @@ fn an_agent_result_that_is_not_the_recorded_report_is_never_accepted() {
     assert_ne!(
         snapshot(&fixture, &claimed.job.instance_id).instance.status,
         ProcessInstanceStatus::Completed
+    );
+}
+
+#[tokio::test]
+async fn a_report_ends_the_step_while_the_run_keeps_working() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    let rig = install(
+        &fixture,
+        Script::ReportAndHold(report("early", json!({"n": 3}))),
+    );
+    let started = start_model(
+        &fixture,
+        &agent_model(agent_implementation(AGENT_ID, &[], None)),
+    );
+    let claimed = claim_and_execute(&fixture).await;
+
+    let current = snapshot(&fixture, &started.instance_id);
+    assert_eq!(current.instance.status, ProcessInstanceStatus::Completed);
+    assert_eq!(
+        current.jobs[0].result.as_ref().unwrap().outputs,
+        json!({"n": 3})
+    );
+    // The run that reported is stopped: it does not work on for a finished step.
+    wait_for(|| rig.cancelled.load(Ordering::Acquire)).await;
+    let run =
+        crate::db::repository::get_agent_run(&fixture.db, &agent_run_id(&claimed.invocation_id))
+            .unwrap()
+            .unwrap();
+    assert_eq!(run.status, "cancelled");
+}
+
+#[tokio::test]
+async fn abandoning_the_step_cancels_the_sub_agents_of_the_run_too() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    seed_agent(&fixture, HELPER_ID, "[]", 10, true);
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute(
+            "UPDATE agents SET max_subagents=2,max_spawn_depth=2 WHERE id=?1",
+            [AGENT_ID],
+        )
+        .unwrap();
+    let rig = install(&fixture, Script::DelegateAndHold);
+    start_model(
+        &fixture,
+        &agent_model(agent_implementation(AGENT_ID, &[], None)),
+    );
+    let claimed = repository::claim_job(&fixture.db, "agent-worker", now_ms())
+        .unwrap()
+        .unwrap();
+    let cancel = CancellationToken::new();
+    let execution = tokio::spawn({
+        let (db, dispatcher, claimed, cancel) = (
+            fixture.db.clone(),
+            fixture.dispatcher().clone(),
+            claimed.clone(),
+            cancel.clone(),
+        );
+        async move {
+            super::jobs::execute_claimed(&db, &dispatcher, "agent-worker", claimed, cancel).await
+        }
+    });
+    // The step run and its delegate are both working.
+    wait_for(|| rig.started.load(Ordering::Acquire) == 2).await;
+    let step_run = agent_run_id(&claimed.invocation_id);
+    let delegate = crate::db::repository::list_agent_runs_by_parent(&fixture.db, &step_run)
+        .unwrap()
+        .pop()
+        .expect("the step run delegated");
+
+    // The worker stops (the initiator lost access, the instance was cancelled).
+    cancel.cancel();
+    execution.await.unwrap().unwrap();
+
+    for id in [&step_run, &delegate.id] {
+        let id = id.clone();
+        let db = fixture.db.clone();
+        wait_for(move || {
+            crate::db::repository::get_agent_run(&db, &id)
+                .unwrap()
+                .is_some_and(|run| run.status == "cancelled")
+        })
+        .await;
+    }
+    drop(rig.manager);
+}
+
+/// Drives a dispatch whose execution never ends, with the worker cancelled, a
+/// short timeout, or a worker that does not own the lease.
+async fn drive_abandoned(
+    fixture: &Fixture,
+    claimed: &ClaimedProcessJob,
+    worker: &str,
+    timeout: Duration,
+    cancelled: bool,
+    salvage: super::jobs::Salvage<'_>,
+) -> anyhow::Result<Option<repository::ObservedActivityResult>> {
+    let cancel = CancellationToken::new();
+    if cancelled {
+        cancel.cancel();
+    }
+    let effective = json!({});
+    let job = super::jobs::ServiceJob {
+        pool: &fixture.db,
+        dispatcher: fixture.dispatcher(),
+        worker_id: worker,
+        claimed,
+        cancel: &cancel,
+        timeout,
+        result_expression: None,
+        effective: &effective,
+        repeat_extra: &[],
+    };
+    let allowed = || super::jobs::AccessCheck::Allowed;
+    super::jobs::drive_dispatch(&job, &allowed, salvage, std::future::pending()).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_step_still_ends_with_the_report_on_record() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    let (claimed, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+    complete_task(
+        &fixture.db,
+        &binding,
+        &binding.agent_run_id(),
+        &report("reported before the step was abandoned", json!({"n": 9})),
+        now_ms(),
+    )
+    .unwrap();
+    let recorded = || {
+        let conn = fixture.db.read().ok()?;
+        super::agent_sink::recorded_completion(&conn, &claimed.invocation_id)
+            .ok()
+            .flatten()
+            .map(|result| repository::ObservedActivityResult {
+                result,
+                origin: ActivityResultOrigin::Contract,
+                expression_observation: None,
+            })
+    };
+    let nothing = || None;
+    let long = Duration::from_secs(3600);
+
+    // Worker cancelled, step timed out, lease lost: each ends with the report.
+    for (name, result) in [
+        (
+            "cancelled",
+            drive_abandoned(
+                &fixture,
+                &claimed,
+                "agent-worker",
+                long,
+                true,
+                Some(&recorded),
+            )
+            .await,
+        ),
+        (
+            "timeout",
+            drive_abandoned(
+                &fixture,
+                &claimed,
+                "agent-worker",
+                Duration::from_secs(1),
+                false,
+                Some(&recorded),
+            )
+            .await,
+        ),
+        (
+            "lease lost",
+            drive_abandoned(
+                &fixture,
+                &claimed,
+                "someone-else",
+                long,
+                false,
+                Some(&recorded),
+            )
+            .await,
+        ),
+    ] {
+        let observed = result
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name}: the report was discarded"));
+        assert_eq!(observed.result.outputs, json!({"n": 9}), "{name}");
+        assert_eq!(observed.origin, ActivityResultOrigin::Contract, "{name}");
+    }
+    assert_eq!(
+        invocation(&fixture, &claimed.job.job_id).2,
+        "may_have_executed",
+        "nothing was failed on the way"
+    );
+
+    // Without a report to salvage the abandonment is the incident it always was.
+    assert!(drive_abandoned(
+        &fixture,
+        &claimed,
+        "agent-worker",
+        Duration::from_secs(1),
+        false,
+        Some(&nothing)
+    )
+    .await
+    .unwrap()
+    .is_none());
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "uncertain");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wait_for_the_run_that_fails_is_retried_and_only_the_deadline_gives_the_run_up() {
+    let attempts = AtomicUsize::new(0);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3600);
+    let settled = super::agent_exec::settle_with(deadline, |_| {
+        let attempt = attempts.fetch_add(1, Ordering::AcqRel);
+        async move {
+            if attempt < 3 {
+                anyhow::bail!("the store did not answer")
+            }
+            Ok("completed".to_owned())
+        }
+    })
+    .await;
+    assert_eq!(settled.as_deref(), Some("completed"));
+    assert_eq!(attempts.load(Ordering::Acquire), 4);
+
+    // A wait that never works is given up after a bounded number of tries.
+    let attempts = AtomicUsize::new(0);
+    let gave_up = super::agent_exec::settle_with(deadline, |_| {
+        attempts.fetch_add(1, Ordering::AcqRel);
+        async { anyhow::bail!("gone") }
+    })
+    .await;
+    assert_eq!(gave_up, None);
+    assert!(attempts.load(Ordering::Acquire) <= 10);
+
+    // So is one that fails at the deadline.
+    let late = tokio::time::Instant::now() + Duration::from_secs(1);
+    let attempts = AtomicUsize::new(0);
+    let timed_out = super::agent_exec::settle_with(late, |remaining| {
+        attempts.fetch_add(1, Ordering::AcqRel);
+        async move {
+            tokio::time::sleep(remaining).await;
+            anyhow::bail!("still running after the deadline")
+        }
+    })
+    .await;
+    assert_eq!(timed_out, None);
+    assert_eq!(attempts.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_report_read_that_fails_is_retried_before_the_outcome_is_called_unreadable() {
+    let reads = AtomicUsize::new(0);
+    let found = super::agent_exec::read_report_with(|| {
+        if reads.fetch_add(1, Ordering::AcqRel) < 3 {
+            anyhow::bail!("database is locked")
+        }
+        Ok(None)
+    })
+    .await;
+    assert!(found.unwrap().is_none());
+    assert_eq!(reads.load(Ordering::Acquire), 4);
+
+    let reads = AtomicUsize::new(0);
+    let unreadable = super::agent_exec::read_report_with(|| {
+        reads.fetch_add(1, Ordering::AcqRel);
+        anyhow::bail!("database is corrupt")
+    })
+    .await;
+    assert!(unreadable.is_err());
+    assert!(reads.load(Ordering::Acquire) > 1);
+}
+
+#[tokio::test]
+async fn a_store_that_cannot_pin_the_harness_defers_the_step_and_a_missing_flow_fails_it() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    install(&fixture, Script::Report(report("ok", json!({}))));
+    let started = start_model(
+        &fixture,
+        &agent_model(agent_implementation(AGENT_ID, &[], None)),
+    );
+    // The history table does not answer: a failure of the store, not of the flow.
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute_batch("ALTER TABLE flow_versions RENAME TO flow_versions_away")
+        .unwrap();
+    let claimed = claim_and_execute(&fixture).await;
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute_batch("ALTER TABLE flow_versions_away RENAME TO flow_versions")
+        .unwrap();
+    let current = snapshot(&fixture, &started.instance_id);
+    assert_eq!(
+        current.jobs[0].status, "queued",
+        "the step waits for the store"
+    );
+    assert_eq!(
+        invocation(&fixture, &claimed.job.job_id).2,
+        "prepared".to_owned()
+    );
+
+    // The flow itself is gone: that is a verdict on the step.
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute(
+            "DELETE FROM flows WHERE id=?1",
+            [crate::flow_engine::node_adapters::AGENT_RUN_FLOW_ID],
+        )
+        .unwrap();
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute("UPDATE bpmn_jobs SET not_before_ms=NULL", [])
+        .unwrap();
+    claim_and_execute(&fixture).await;
+    let history =
+        repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
+            .unwrap()
+            .0;
+    assert!(history.iter().any(
+        |event| event.kind == "job_failed" && event.data["code"] == "AGENT_HARNESS_UNAVAILABLE"
+    ));
+}
+
+#[tokio::test]
+async fn a_worker_stopped_right_after_the_report_still_ends_the_step_with_it() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    let worker = CancellationToken::new();
+    install(
+        &fixture,
+        Script::ReportThenStopWorker(report("reported", json!({"n": 4})), worker.clone()),
+    );
+    let started = start_model(
+        &fixture,
+        &agent_model(agent_implementation(AGENT_ID, &[], None)),
+    );
+    let claimed = repository::claim_job(&fixture.db, "agent-worker", now_ms())
+        .unwrap()
+        .unwrap();
+    super::jobs::execute_claimed(
+        &fixture.db,
+        fixture.dispatcher(),
+        "agent-worker",
+        claimed,
+        worker,
+    )
+    .await
+    .unwrap();
+
+    let current = snapshot(&fixture, &started.instance_id);
+    assert_eq!(
+        current.instance.status,
+        ProcessInstanceStatus::Completed,
+        "the report was on record when the worker stopped"
+    );
+    assert_eq!(
+        current.jobs[0].result.as_ref().unwrap().outputs,
+        json!({"n": 4})
     );
 }

@@ -37,16 +37,53 @@ pub const PROCESS_ACTIVITY_META_KEY: &str = "process_activity";
 /// opening `core.task_complete`.
 pub const PROCESS_STEP_TOOLS_META_KEY: &str = "process_step_tools";
 
-/// Key of the iteration budget of a process step in run meta. Unlike the
-/// binding it claims nothing about the step and can only lower the agent's own
-/// budget, so a forged entry gains a run nothing.
-pub const PROCESS_STEP_ITERATIONS_META_KEY: &str = "process_step_iterations";
+/// What the process model says about the step an agent run was started for. It
+/// is read from the database by run id, never from run meta: meta is writable by
+/// every node of the harness, so a step's tool list, iteration budget and output
+/// schema must not depend on it surviving.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentStepContract {
+    pub binding: ProcessActivityBinding,
+    pub max_iterations: u32,
+}
 
-/// The step's iteration budget when run meta carries one.
-pub fn step_iteration_cap(meta: &BTreeMap<String, Value>) -> Option<i64> {
-    meta.get(PROCESS_STEP_ITERATIONS_META_KEY)?
-        .as_i64()
-        .filter(|cap| *cap > 0)
+/// The contract of the step `run_id` was spawned for, `None` when the run is not
+/// one (no row, not top-level, not the run id derived from its invocation, or
+/// not the pinned agent of that invocation).
+pub fn step_contract(pool: &DbPool, run_id: &str) -> Result<Option<AgentStepContract>> {
+    let conn = pool.read()?;
+    super::repository::agent_step_contract_for_run_on(&conn, run_id)
+}
+
+/// The iteration budget the process model gives the step `run_id` belongs to.
+/// A budget in run meta would be one `meta.remove` away from the agent's own,
+/// larger one.
+pub fn step_iteration_cap(pool: &DbPool, run_id: &str) -> Result<Option<i64>> {
+    Ok(step_contract(pool, run_id)?.map(|contract| i64::from(contract.max_iterations)))
+}
+
+/// Run meta as the process layer vouches for it: for a run that really belongs to
+/// a step, the binding comes from the process model whatever meta says; any other
+/// run keeps its meta. A step whose contract cannot be read gets an unreadable
+/// binding, which admits no tool at all.
+pub fn sealed_meta(
+    pool: &DbPool,
+    run_id: &str,
+    meta: &BTreeMap<String, Value>,
+) -> BTreeMap<String, Value> {
+    let mut sealed = meta.clone();
+    match step_contract(pool, run_id) {
+        Ok(None) => {}
+        Ok(Some(contract)) => {
+            let (key, value) = contract.binding.meta_entry();
+            sealed.insert(key.to_owned(), value);
+        }
+        Err(error) => {
+            tracing::error!(run_id, error = %error, "cannot read the contract of an agent step");
+            sealed.insert(PROCESS_ACTIVITY_META_KEY.to_owned(), Value::Null);
+        }
+    }
+    sealed
 }
 
 /// Largest output schema an agent step may carry; larger ones are refused at
@@ -59,8 +96,9 @@ const REPORT_KEYS: [&str; 5] = ["outcome", "code", "summary", "outputs", "eviden
 
 /// What a run of an agent step is bound to. Everything but `allowed_tools` and
 /// `output_schema` identifies the invocation and the attempt the run was
-/// spawned for; those two travel with it so the run narrows its tools and
-/// checks its outputs without reading the process model again.
+/// spawned for. Those two travel with it as a convenience for the spawn; every
+/// reader that acts on them takes them from the process model by run id
+/// ([`sealed_meta`], [`step_contract`]), because meta can be rewritten.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessActivityBinding {
     pub invocation_id: String,
@@ -154,9 +192,9 @@ pub fn step_tool_list(meta: &BTreeMap<String, Value>) -> Option<Vec<String>> {
     match binding_in_meta(meta) {
         MetaBinding::Valid(binding) => Some(binding.allowed_tools),
         MetaBinding::Malformed => Some(Vec::new()),
-        MetaBinding::Absent => meta.get(PROCESS_STEP_TOOLS_META_KEY).map(|value| {
-            serde_json::from_value::<Vec<String>>(value.clone()).unwrap_or_default()
-        }),
+        MetaBinding::Absent => meta
+            .get(PROCESS_STEP_TOOLS_META_KEY)
+            .map(|value| serde_json::from_value::<Vec<String>>(value.clone()).unwrap_or_default()),
     }
 }
 
@@ -171,6 +209,9 @@ pub enum CompletionError {
     /// The calling run is not the running, top-level run that was started for
     /// this invocation of its pinned agent.
     NotThisRun,
+    /// The report does not fit the step's output schema, as the process model
+    /// (not run meta) states it.
+    Invalid(String),
     Storage(anyhow::Error),
 }
 
@@ -187,11 +228,12 @@ impl From<anyhow::Error> for CompletionError {
 }
 
 /// Writes the final report of an invocation. The live check, the check of the
-/// reporting run and the insert are one transaction: a report cannot be accepted
-/// for a step that closed between them, and of two simultaneous reports only one
-/// gets the row. Nothing the run claims in meta is taken on trust here: the run
-/// row must exist, be running and top-level, belong to the agent the invocation
-/// pinned, and carry this invocation as its correlation id.
+/// reporting run, the check of the outputs and the insert are one transaction: a
+/// report cannot be accepted for a step that closed between them, and of two
+/// simultaneous reports only one gets the row. Nothing the run claims in meta is
+/// taken on trust here: the run row must exist, be running and top-level, belong
+/// to the agent the invocation pinned, and carry this invocation as its
+/// correlation id, and the output schema is the one of the pinned process model.
 fn record_completion(
     pool: &DbPool,
     binding: &ProcessActivityBinding,
@@ -244,6 +286,10 @@ fn record_completion(
     if taken {
         return Err(CompletionError::AlreadyCompleted);
     }
+    let contract = super::repository::agent_step_contract_for_run_on(&tx, run_id)?
+        .ok_or(CompletionError::NotThisRun)?;
+    check_report_outputs(result, contract.binding.output_schema.as_ref())
+        .map_err(CompletionError::Invalid)?;
     tx.execute(
         "INSERT INTO bpmn_agent_completions(invocation_id,run_id,result_json,created_at_ms) \
          VALUES(?1,?2,?3,?4)",
@@ -288,12 +334,9 @@ fn parse_outcome(value: &Value) -> Option<ActivityOutcome> {
 
 /// Turns the tool arguments into a bounded `ActivityResult`: exactly the five
 /// report keys of a business result, with the same size and code limits as a
-/// `result_expression`, and `outputs` of a `completed` report checked against
-/// the step's output schema.
-fn report_from_arguments(
-    arguments: &Value,
-    output_schema: Option<&Value>,
-) -> std::result::Result<ActivityResult, String> {
+/// `result_expression`. Whether `outputs` fit the step's schema is checked
+/// against the process model in the recording transaction.
+fn report_from_arguments(arguments: &Value) -> std::result::Result<ActivityResult, String> {
     let object = arguments
         .as_object()
         .ok_or("the report must be a JSON object")?;
@@ -330,14 +373,21 @@ fn report_from_arguments(
         "evidence".into(),
         object.get("evidence").cloned().unwrap_or_else(|| json!([])),
     );
-    let result = parse_contract_result(Value::Object(report))
-        .map_err(|error| format!("invalid report: {error:#}"))?;
-    if outcome == ActivityOutcome::Completed {
-        if let Some(schema) = output_schema {
-            check_outputs(schema, &result.outputs)?;
+    parse_contract_result(Value::Object(report))
+        .map_err(|error| format!("invalid report: {error:#}"))
+}
+
+/// The `outputs` of a `completed` report against the step's output schema.
+pub(super) fn check_report_outputs(
+    result: &ActivityResult,
+    output_schema: Option<&Value>,
+) -> std::result::Result<(), String> {
+    match output_schema {
+        Some(schema) if result.outcome == ActivityOutcome::Completed => {
+            check_outputs(schema, &result.outputs)
         }
+        _ => Ok(()),
     }
-    Ok(result)
 }
 
 fn check_outputs(schema: &Value, outputs: &Value) -> std::result::Result<(), String> {
@@ -383,7 +433,7 @@ pub fn complete_task(
     if run_id != binding.agent_run_id() {
         return Err(NOT_THIS_RUN.into());
     }
-    let result = report_from_arguments(arguments, binding.output_schema.as_ref())?;
+    let result = report_from_arguments(arguments)?;
     match record_completion(pool, binding, run_id, &result, at_ms) {
         Ok(()) => Ok(json!({ "recorded": true })),
         Err(CompletionError::NotThisRun) => Err(NOT_THIS_RUN.into()),
@@ -395,6 +445,7 @@ pub fn complete_task(
              core.task_complete again"
                 .into(),
         ),
+        Err(CompletionError::Invalid(reason)) => Err(reason),
         Err(CompletionError::Storage(error)) => {
             tracing::error!(invocation_id = %binding.invocation_id, error = %error, "agent completion storage failed");
             Err("the report could not be stored; try once more".into())

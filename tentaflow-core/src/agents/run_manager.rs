@@ -18,7 +18,7 @@
 // marked `interrupted` (honest v1; resume is out of scope). Mailbox and
 // auto-continuation are phase 7 and deliberately absent. =====
 
-use crate::flow_engine::dispatcher::FlowRef;
+use crate::flow_engine::dispatcher::{FlowOrigin, FlowRef};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1143,6 +1143,40 @@ impl AgentRunManager {
         true
     }
 
+    /// Cancels a run and every run below it, deepest first. The tree is read from
+    /// the rows, not from the live registry: a descendant whose parent already
+    /// settled is still a run somebody started on this one's behalf. Returns how
+    /// many live runs were signalled.
+    pub fn cancel_tree(&self, run_id: &str) -> usize {
+        // Bounds the walk against a cycle or an absurdly wide tree; a row set that
+        // large is cancelled as far as it goes.
+        const MAX_TREE_RUNS: usize = 1024;
+        let mut order = vec![run_id.to_string()];
+        let mut seen = std::collections::HashSet::from([run_id.to_string()]);
+        let mut next = 0;
+        while next < order.len() && order.len() < MAX_TREE_RUNS {
+            let parent = order[next].clone();
+            next += 1;
+            match repository::list_agent_runs_by_parent(&self.db, &parent) {
+                Ok(children) => {
+                    for child in children {
+                        if seen.insert(child.id.clone()) {
+                            order.push(child.id);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(run_id = %parent, "cannot list the children of a run to cancel: {error}");
+                }
+            }
+        }
+        order
+            .iter()
+            .rev()
+            .filter(|id| self.cancel(id))
+            .count()
+    }
+
     /// Number of currently registered (in-flight) runs — test/diagnostic hook.
     pub fn live_run_count(&self) -> usize {
         self.runs.len()
@@ -1637,6 +1671,17 @@ fn deliver_child_result(
     let Some(manager) = manager.and_then(|w| w.upgrade()) else {
         return;
     };
+    // A run that belongs to a process step is bounded by that step: its tool
+    // narrowing, its pinned harness and its cancellation all hang on the step's
+    // run, and a continuation is a new top-level run that carries none of them.
+    // The mailbox entry above still reaches the parent through `agent_wait`.
+    if parent_run.origin.as_deref() == Some(FlowOrigin::Process.as_str()) {
+        tracing::info!(
+            "auto-continuation: run '{parent_run_id}' belongs to a process step — \
+not continued outside the step"
+        );
+        return;
+    }
 
     // The continuation prompt is the child's result (Ralph-style: the parent
     // resumes with what its delegate produced). Principal is inherited from the
@@ -3086,5 +3131,142 @@ mod tests {
             "notify must not start a continuation run; got {parent_runs:?}"
         );
         assert_eq!(parent_runs[0].id, parent_run);
+    }
+
+    /// A run of a process step is bounded by the step: when its sub-agent settles,
+    /// the parent's `continue` setting must not start a new top-level run, which
+    /// would carry none of the step's narrowing and outlive the step.
+    #[tokio::test]
+    async fn a_process_step_run_is_never_continued_outside_the_step() {
+        let pool = db();
+        seed_agent_with_continue(&pool, "parent", "boss", 4, "continue");
+        seed_agent(&pool, "child", "worker", "[]", 0, 1);
+        let gate = Gate::new();
+        let mgr = manager(
+            pool.clone(),
+            Arc::new(GatedRunner {
+                gate: gate.clone(),
+                honor_cancel: false,
+            }),
+            8,
+        );
+        let principal = AgentPrincipal::new(
+            Some("u1".into()),
+            Some("org-1".into()),
+            FlowOrigin::Process,
+            FlowActor::user("u1"),
+        );
+        let parent_run = mgr
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
+            .await
+            .expect("spawn parent");
+        let caller = CallerRun {
+            run_id: parent_run.clone(),
+            agent_id: "parent".into(),
+            principal: principal.clone(),
+            session_id: None,
+            code_session: None,
+            step_tools: Some(Vec::new()),
+        };
+        let spawned = mgr
+            .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
+            .await
+            .expect("spawn child");
+        let child_id = spawned["run_ids"][0].as_str().unwrap().to_string();
+
+        gate.open();
+        wait_until_status(&pool, &child_id, "completed").await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mailbox = repository::list_undelivered_mailbox_for_agent(&pool, "parent").unwrap();
+            if mailbox.iter().any(|entry| entry.run_id == child_id) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the mailbox entry never appeared"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let parent_runs = repository::list_agent_runs(
+            &pool,
+            &AgentRunListFilter {
+                agent_id: Some("parent"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            parent_runs.len(),
+            1,
+            "a process-step run must not be continued: {parent_runs:?}"
+        );
+    }
+
+    /// Cancelling a run cancels what it started, however deep, including a
+    /// descendant whose own parent already settled.
+    #[tokio::test]
+    async fn cancel_tree_stops_every_descendant_of_a_run() {
+        let pool = db();
+        seed_agent_with_continue(&pool, "top", "top", 4, "notify");
+        seed_agent_with_continue(&pool, "mid", "mid", 4, "notify");
+        seed_agent(&pool, "leaf", "leaf", "[]", 0, 1);
+        let gate = Gate::new();
+        let mgr = manager(
+            pool.clone(),
+            Arc::new(GatedRunner {
+                gate: gate.clone(),
+                honor_cancel: true,
+            }),
+            8,
+        );
+        let principal = AgentPrincipal::user("u1");
+        let top = mgr
+            .spawn("top", "lead", None, &principal, &[], &[], None, None)
+            .await
+            .expect("spawn top");
+        let delegate = |run_id: &str, agent_id: &str| CallerRun {
+            run_id: run_id.to_string(),
+            agent_id: agent_id.to_string(),
+            principal: principal.clone(),
+            session_id: None,
+            code_session: None,
+            step_tools: None,
+        };
+        let mid = mgr
+            .handle_agent_spawn(
+                &delegate(&top, "top"),
+                &json!({"agent_name": "mid", "task": "middle"}),
+            )
+            .await
+            .expect("spawn mid")["run_ids"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let leaf = mgr
+            .handle_agent_spawn(
+                &delegate(&mid, "mid"),
+                &json!({"agent_name": "leaf", "task": "leaf"}),
+            )
+            .await
+            .expect("spawn leaf")["run_ids"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert_eq!(mgr.cancel_tree(&top), 3);
+        for id in [&top, &mid, &leaf] {
+            wait_until_status(&pool, id, "cancelled").await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mgr.live_run_count() > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the cancelled runs never left the registry"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(mgr.cancel_tree(&top), 0, "nothing is left to signal");
     }
 }

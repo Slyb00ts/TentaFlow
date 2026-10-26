@@ -3491,6 +3491,22 @@ pub fn restore_factory_version(
 /// graph enters the history as a new version, in the same transaction that read
 /// it.
 pub fn pin_current_flow_version(db: &DbPool, flow_id: &str) -> Result<String> {
+    pin_current_flow_version_held(db, flow_id).map(|(version_id, _)| version_id)
+}
+
+/// The flow a pin was asked for has no row, as opposed to a store that failed to
+/// answer: only the first is a verdict on the flow.
+#[derive(Debug, thiserror::Error)]
+#[error("flow '{0}' does not exist")]
+pub struct FlowMissing(pub String);
+
+/// [`pin_current_flow_version`] for a caller that runs the version later than it
+/// pins it: the returned hold keeps the version out of history pruning until it is
+/// dropped, and it is taken before the pin commits.
+pub fn pin_current_flow_version_held(
+    db: &DbPool,
+    flow_id: &str,
+) -> Result<(String, crate::db::repository::FlowVersionHold)> {
     use rusqlite::OptionalExtension;
     let mut conn = db.write().map_err(|e| anyhow!("core db write: {e}"))?;
     let tx = conn.transaction()?;
@@ -3500,7 +3516,12 @@ pub fn pin_current_flow_version(db: &DbPool, flow_id: &str) -> Result<String> {
             rusqlite::params![flow_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .map_err(|e| anyhow!("flow '{flow_id}' cannot be read: {e}"))?;
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => {
+                anyhow::Error::new(FlowMissing(flow_id.to_owned()))
+            }
+            other => anyhow!("flow '{flow_id}' cannot be read: {other}"),
+        })?;
     let newest: Option<(String, i64, Option<String>)> = tx
         .query_row(
             "SELECT id, version_num, flow_json FROM flow_versions WHERE flow_id = ?1 \
@@ -3511,7 +3532,8 @@ pub fn pin_current_flow_version(db: &DbPool, flow_id: &str) -> Result<String> {
         .optional()?;
     if let Some((id, _, Some(json))) = &newest {
         if *json == flow_json {
-            return Ok(id.clone());
+            let hold = crate::db::repository::hold_flow_version(id);
+            return Ok((id.clone(), hold));
         }
     }
     let version_id = uuid::Uuid::new_v4().to_string();
@@ -3522,8 +3544,9 @@ pub fn pin_current_flow_version(db: &DbPool, flow_id: &str) -> Result<String> {
          VALUES (?1, ?2, ?3, ?4, ?5, 'session pin', 'active', NULL)",
         rusqlite::params![version_id, flow_id, next, flow_json, name],
     )?;
+    let hold = crate::db::repository::hold_flow_version(&version_id);
     tx.commit()?;
-    Ok(version_id)
+    Ok((version_id, hold))
 }
 
 /// The graph a session actually runs.
@@ -3595,6 +3618,72 @@ mod tests {
             .unwrap();
         assert_eq!(version.flow_json.as_deref(), Some(edited.as_str()));
         assert_eq!(pin_current_flow_version(&pool, flow).unwrap(), pinned);
+    }
+
+    /// A run that waits for a concurrency slot keeps its pinned graph through any
+    /// number of edits, and the history is trimmed again once the run is done.
+    #[test]
+    fn a_held_pin_survives_history_pruning_until_released() {
+        use crate::db::{models::FlowParams, repository};
+        let pool = crate::db::init(std::path::Path::new(":memory:")).expect("init db");
+        let flow = crate::db::seed::CODE_HARNESS_FLOW_ID;
+        let edit = |round: usize| {
+            let current = repository::get_flow(&pool, flow).unwrap().unwrap();
+            let edited = current.flow_json.replacen(
+                "\"nodes\"",
+                &format!("\"edit_{round}\":true,\"nodes\""),
+                1,
+            );
+            repository::update_flow_with_snapshot(
+                &pool,
+                flow,
+                current.version,
+                &FlowParams {
+                    name: &current.name,
+                    description: current.description.as_deref(),
+                    is_default: current.is_default,
+                    service_type: current.service_type.as_deref(),
+                    flow_json: &edited,
+                    status: &current.status,
+                    published_model_name: current.published_model_name.as_deref(),
+                    actor_user_id: None,
+                },
+                None,
+            )
+            .expect("edit the flow");
+        };
+        let exists = |version_id: &str| {
+            repository::get_flow_version(&pool, flow, version_id)
+                .unwrap()
+                .is_some()
+        };
+
+        edit(0);
+        let (pinned, hold) = pin_current_flow_version_held(&pool, flow).expect("pin");
+        let unheld = {
+            edit(1);
+            pin_current_flow_version(&pool, flow).expect("pin")
+        };
+        for round in 2..(2 + repository::FLOW_VERSIONS_KEEP as usize + 3) {
+            edit(round);
+        }
+        assert!(exists(&pinned), "a held version was pruned");
+        assert!(
+            !exists(&unheld),
+            "an unheld version outside the window stays"
+        );
+
+        drop(hold);
+        edit(100);
+        assert!(!exists(&pinned), "a released version is pruned again");
+    }
+
+    /// A flow that is not there is told apart from a store that did not answer.
+    #[test]
+    fn pinning_a_missing_flow_is_typed() {
+        let pool = crate::db::init(std::path::Path::new(":memory:")).expect("init db");
+        let error = pin_current_flow_version(&pool, "no-such-flow").unwrap_err();
+        assert!(error.is::<FlowMissing>(), "{error:#}");
     }
 
     use super::*;

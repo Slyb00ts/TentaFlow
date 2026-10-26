@@ -303,7 +303,13 @@ impl NodeAdapter for AgentContextNodeAdapter {
                 &principal,
                 agent.max_subagents > 0,
             ),
-            &envelope.meta,
+            // Meta is writable by every node of the harness; a process step's
+            // limits are re-read from the process model for this very run.
+            &crate::processes::agent_sink::sealed_meta(
+                service.db(),
+                &ctx.request_id,
+                &envelope.meta,
+            ),
         );
 
         let mut out: FlowEnvelope = (**envelope).clone();
@@ -371,10 +377,11 @@ impl NodeAdapter for AgentContextNodeAdapter {
             .and_then(|v| v.as_i64())
             .filter(|n| *n > 0)
             .unwrap_or(agent.max_iterations);
-        // A process step can only lower the budget; meta is writable by any node,
-        // so a forged entry has no way to raise it.
-        let max_iterations = crate::processes::agent_sink::step_iteration_cap(&envelope.meta)
-            .map_or(max_iterations, |cap| max_iterations.min(cap));
+        // A process step can only lower the budget, and the budget is the one the
+        // process model gives this run, not an entry a node could delete.
+        let max_iterations =
+            crate::processes::agent_sink::step_iteration_cap(service.db(), &ctx.request_id)?
+                .map_or(max_iterations, |cap| max_iterations.min(cap));
         out.meta.insert(
             "loop_max_iterations".into(),
             serde_json::json!(max_iterations),
@@ -730,6 +737,52 @@ mod tests {
         assert_eq!(tool_names(&run(None).await), ["core.skill_view", "core.ask_user"]);
         let narrowed = run(Some(binding(&["core.skill_view", "core.fs_read"]))).await;
         assert_eq!(tool_names(&narrowed), ["core.skill_view", "core.task_complete"]);
+    }
+
+    /// A harness node can rewrite or delete everything a run carries in meta. The
+    /// limits of a process step are read from the process model by the id of the
+    /// run the engine is executing, so a bare envelope changes nothing.
+    #[tokio::test]
+    async fn a_process_step_keeps_its_published_limits_when_meta_carries_nothing() {
+        use crate::processes::agent_sink_tests::{
+            agent_implementation, running_step, seed_agent as seed_step_agent, AGENT_ID,
+        };
+        let fixture = crate::processes::runtime::test_support::Fixture::new();
+        seed_step_agent(
+            &fixture,
+            AGENT_ID,
+            r#"["core.skill_view","core.ask_user"]"#,
+            10,
+            true,
+        );
+        let (_, binding) = running_step(
+            &fixture,
+            agent_implementation(AGENT_ID, &["core.skill_view"], None),
+        );
+        let slot = service(fixture.db.clone());
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text("work".into());
+        let mut ctx = stub_ctx();
+        ctx.user_id = Some("u1".into());
+        ctx.request_id = binding.agent_run_id();
+
+        let out = AgentContextNodeAdapter::new(slot)
+            .execute(
+                &node(json!({"agent_id": AGENT_ID, "model": "test-model"})),
+                &[input(env)],
+                &ctx,
+            )
+            .await
+            .expect("execute");
+
+        assert_eq!(out.meta["loop_max_iterations"], json!(5));
+        let tools: Vec<&str> = out.meta["harness_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(tools, ["core.skill_view", "core.task_complete"]);
     }
 
     #[tokio::test]

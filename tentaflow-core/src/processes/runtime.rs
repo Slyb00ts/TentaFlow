@@ -8302,19 +8302,62 @@ pub(crate) fn claim_admission(
 const GENERAL_JOB_SLOTS: usize = 4;
 const AGENT_JOB_SLOTS: usize = 4;
 
-/// One taken agent slot; the count falls when the job's task ends, however it ends.
-struct AgentSlot(Arc<AtomicUsize>);
+/// The slots the worker has taken, per class. Each count is its own atomic and
+/// falls when the job's task ends, however it ends: deriving the general count
+/// from the set of spawned tasks would also count a finished task that has not
+/// been joined yet.
+#[derive(Default)]
+struct JobSlots {
+    general: Arc<AtomicUsize>,
+    agents: Arc<AtomicUsize>,
+}
 
-impl AgentSlot {
-    fn take(count: &Arc<AtomicUsize>) -> Self {
+/// One taken slot, given back on drop.
+struct SlotGuard(Arc<AtomicUsize>);
+
+impl JobSlots {
+    fn take(&self, agent: bool) -> SlotGuard {
+        let count = if agent { &self.agents } else { &self.general };
         count.fetch_add(1, Ordering::AcqRel);
-        Self(count.clone())
+        SlotGuard(count.clone())
+    }
+
+    /// The classes that still have a free slot.
+    fn open(&self) -> super::repository::ClaimSlots {
+        super::repository::ClaimSlots {
+            general: self.general.load(Ordering::Acquire) < GENERAL_JOB_SLOTS,
+            agents: self.agents.load(Ordering::Acquire) < AGENT_JOB_SLOTS,
+        }
     }
 }
 
-impl Drop for AgentSlot {
+impl Drop for SlotGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+mod job_slot_tests {
+    use super::*;
+
+    #[test]
+    fn a_finished_agent_task_does_not_take_a_general_slot() {
+        let slots = JobSlots::default();
+        let agents: Vec<_> = (0..AGENT_JOB_SLOTS).map(|_| slots.take(true)).collect();
+        let open = slots.open();
+        assert!(open.general && !open.agents);
+
+        // The agent tasks ended but have not been joined yet: the worker's set of
+        // spawned tasks still holds them, and the slots must already be free.
+        drop(agents);
+        let open = slots.open();
+        assert!(open.general && open.agents);
+
+        let general: Vec<_> = (0..GENERAL_JOB_SLOTS).map(|_| slots.take(false)).collect();
+        let open = slots.open();
+        assert!(!open.general && open.agents, "the classes do not borrow from each other");
+        drop(general);
     }
 }
 
@@ -8417,7 +8460,7 @@ impl ProcessRuntime {
         let mut send_cursor = super::messages::SendCursor::default();
         let mut last_deferred_recovery = tokio::time::Instant::now();
         let mut deferred_pass: Option<tokio::task::JoinHandle<()>> = None;
-        let agent_jobs = Arc::new(AtomicUsize::new(0));
+        let job_slots = JobSlots::default();
         loop {
             if self.stop.is_cancelled() {
                 break;
@@ -8459,10 +8502,7 @@ impl ProcessRuntime {
                 tracing::error!(error = %error, "pending Send page scan failed");
             }
             loop {
-                let slots = super::repository::ClaimSlots {
-                    general: jobs.len().saturating_sub(agent_jobs.load(Ordering::Acquire)) < GENERAL_JOB_SLOTS,
-                    agents: agent_jobs.load(Ordering::Acquire) < AGENT_JOB_SLOTS,
-                };
+                let slots = job_slots.open();
                 if !(slots.general || slots.agents) || self.stop.is_cancelled() {
                     break;
                 }
@@ -8496,12 +8536,11 @@ impl ProcessRuntime {
                     },
                 );
                 let worker = self.clone();
-                let agent_slot = super::jobs::is_agent_job(&claimed)
-                    .then(|| AgentSlot::take(&agent_jobs));
+                let job_slot = job_slots.take(super::jobs::is_agent_job(&claimed));
                 jobs.spawn(async move {
                     use futures::FutureExt;
 
-                    let _agent_slot = agent_slot;
+                    let _job_slot = job_slot;
                     let attempt = claimed.job.attempt;
                     let fence = claimed.job.fence;
                     let result = std::panic::AssertUnwindSafe(super::jobs::execute_claimed(

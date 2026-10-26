@@ -251,17 +251,16 @@ impl ToolExecNodeAdapter {
             Ok(v) => v,
             Err(e) => return error_result(call, format!("invalid arguments JSON: {e}")),
         };
-        let Some(binding) = process_sink::binding_from_meta(&envelope.meta) else {
-            return error_result(
-                call,
-                "this run is not a process step \
-                 (core.task_complete works only inside a process agent step)"
-                    .to_string(),
-            );
-        };
         let db = service.db().clone();
         let run_id = run_id.to_owned();
+        let meta = envelope.meta.clone();
         let outcome = tokio::task::spawn_blocking(move || {
+            let sealed = process_sink::sealed_meta(&db, &run_id, &meta);
+            let Some(binding) = process_sink::binding_from_meta(&sealed) else {
+                return Err("this run is not a process step \
+                     (core.task_complete works only inside a process agent step)"
+                    .to_string());
+            };
             process_sink::complete_task(
                 &db,
                 &binding,
@@ -974,7 +973,8 @@ impl ToolExecNodeAdapter {
         tools_json: &str,
         call: &LlmToolCall,
     ) -> ToolCallResult {
-        if !service.tool_allowed_in_run(&tools_json, &envelope.meta, &call.name) {
+        let meta = process_sink::sealed_meta(service.db(), &ctx.request_id, &envelope.meta);
+        if !service.tool_allowed_in_run(&tools_json, &meta, &call.name) {
             error_result(call, format!("tool '{}' not in agent allowlist", call.name))
         } else if Self::is_process_sink(&call.name) {
             Self::run_task_complete_call(service, &ctx.request_id, envelope, call).await
@@ -2350,30 +2350,45 @@ mod process_sink_tests {
     }
 
     #[tokio::test]
-    async fn a_binding_naming_another_invocation_cannot_use_the_genuine_run() {
+    async fn a_binding_naming_another_invocation_cannot_redirect_the_genuine_run() {
         let fixture = Fixture::new();
         seed_agent(&fixture, AGENT_ID, "[]", 10, true);
-        let (_, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+        let (claimed, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
         let forged = ProcessActivityBinding {
             invocation_id: "another-invocation".into(),
             ..binding.clone()
         };
-        let answered = answers(
-            &fixture,
-            Some(&forged),
-            &binding.agent_run_id(),
+        let report = || {
             vec![call(
                 "c1",
                 "core.task_complete",
                 json!({"outcome": "completed", "summary": "done"}),
-            )],
-        )
-        .await;
+            )]
+        };
+
+        // The same forged binding on a run that was not started for any step.
+        let foreign = answers_as(&fixture, Some(&forged), "any-run", "foreign-run", report()).await;
         assert!(
-            answered[0].contains("was not started for the step"),
-            "{answered:?}"
+            foreign[0].contains("was not started for the step"),
+            "{foreign:?}"
         );
         assert_eq!(rows(&fixture), 0);
+
+        // On the genuine run the binding is the one the process model gives it,
+        // so the claim in meta changes nothing: the report is the step's own.
+        let answered = answers(&fixture, Some(&forged), &binding.agent_run_id(), report()).await;
+        assert!(answered[0].contains("recorded"), "{answered:?}");
+        let invocation: String = fixture
+            .db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT invocation_id FROM bpmn_agent_completions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(invocation, claimed.invocation_id);
     }
 
     #[tokio::test]
@@ -2381,43 +2396,61 @@ mod process_sink_tests {
         let fixture = Fixture::new();
         seed_agent(&fixture, AGENT_ID, r#"["core.task_complete"]"#, 10, true);
         let (_, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
-        let answered = answers(
-            &fixture,
-            None,
-            &binding.agent_run_id(),
+        let report = || {
             vec![call(
                 "c1",
                 "core.task_complete",
                 json!({"outcome": "completed", "summary": "done"}),
-            )],
-        )
-        .await;
+            )]
+        };
+        let answered = answers(&fixture, None, "an-ordinary-run", report()).await;
         assert!(answered[0].contains("not a process step"), "{answered:?}");
         assert_eq!(rows(&fixture), 0);
+
+        // A node that deleted the binding of a genuine step does not unmake the
+        // step: the process model still says which step this run belongs to.
+        let restored = answers(&fixture, None, &binding.agent_run_id(), report()).await;
+        assert!(restored[0].contains("recorded"), "{restored:?}");
+        assert_eq!(rows(&fixture), 1);
     }
 
     #[tokio::test]
     async fn a_step_runs_only_the_tools_both_the_agent_and_the_step_allow() {
+        let skill = call("c1", "core.skill_view", json!({"name": "missing"}));
+        let other = call("c2", "core.fs_read", json!({"path": "a"}));
+
+        // The step allows nothing: even a tool the agent has is out of surface,
+        // and a binding in meta that claims otherwise does not change that.
         let fixture = Fixture::new();
         seed_agent(&fixture, AGENT_ID, r#"["core.skill_view"]"#, 10, true);
         let (_, mut binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
         let run_id = binding.agent_run_id();
-        let skill = call("c1", "core.skill_view", json!({"name": "missing"}));
-        let other = call("c2", "core.fs_read", json!({"path": "a"}));
-
-        // The step allows nothing: even a tool the agent has is out of surface.
-        binding.allowed_tools = Vec::new();
+        binding.allowed_tools = vec!["core.skill_view".into()];
         let none = answers(&fixture, Some(&binding), &run_id, vec![skill.clone()]).await;
         assert!(none[0].contains("not in agent allowlist"), "{none:?}");
 
-        // The step lists a tool the agent does not have: still out of surface.
+        // The step lists a tool the agent does not have: still out of surface,
+        // even when the binding in meta widens the step's own list.
+        let fixture = Fixture::new();
+        seed_agent(&fixture, AGENT_ID, r#"["core.skill_view"]"#, 10, true);
+        let (_, mut binding) = running_step(
+            &fixture,
+            agent_implementation(AGENT_ID, &["core.skill_view"], None),
+        );
+        let run_id = binding.agent_run_id();
         binding.allowed_tools = vec!["core.skill_view".into(), "core.fs_read".into()];
-        let both = answers(&fixture, Some(&binding), &run_id, vec![skill.clone(), other]).await;
+        let both = answers(
+            &fixture,
+            Some(&binding),
+            &run_id,
+            vec![skill.clone(), other.clone()],
+        )
+        .await;
         assert!(!both[0].contains("not in agent allowlist"), "{both:?}");
         assert!(both[1].contains("not in agent allowlist"), "{both:?}");
 
         // Outside a process step the agent's own list is the whole rule.
-        let plain = answers(&fixture, None, &run_id, vec![skill]).await;
+        let plain = answers(&fixture, None, "an-ordinary-run", vec![skill]).await;
         assert!(!plain[0].contains("not in agent allowlist"), "{plain:?}");
     }
 }

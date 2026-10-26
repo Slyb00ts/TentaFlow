@@ -414,8 +414,8 @@ pub async fn execute_claimed(
             agent_id,
             goal_expression,
             allowed_tools,
-            max_iterations,
             output_schema,
+            ..
         } => {
             super::agent_exec::execute_agent(
                 &job,
@@ -424,7 +424,6 @@ pub async fn execute_claimed(
                     agent_id,
                     goal_expression,
                     allowed_tools,
-                    max_iterations: *max_iterations,
                     output_schema: output_schema.as_ref(),
                 },
             )
@@ -522,7 +521,7 @@ async fn execute_flow(
             dispatcher.dispatch_pinned_flow(&pinned, envelope, meta).await,
         )
     };
-    let Some(result) = drive_dispatch(job, &authorize, execution).await? else {
+    let Some(result) = drive_dispatch(job, &authorize, None, execution).await? else {
         return Ok(());
     };
     finish_observed(job, &authorize, result)
@@ -648,7 +647,7 @@ async fn execute_block(
             dispatcher.dispatch_pinned_synthetic(&pinned, envelope, meta).await,
         )
     };
-    let Some(result) = drive_dispatch(job, &authorize, execution).await? else {
+    let Some(result) = drive_dispatch(job, &authorize, None, execution).await? else {
         return Ok(());
     };
     finish_observed(job, &authorize, result)
@@ -751,7 +750,7 @@ async fn execute_tool(
             recheck,
         }
     };
-    let Some(result) = drive_dispatch(job, &authorize, execution).await? else {
+    let Some(result) = drive_dispatch(job, &authorize, None, execution).await? else {
         return Ok(());
     };
     finish_observed(job, &authorize, result)
@@ -849,11 +848,27 @@ pub(super) fn begin_dispatch(job: &ServiceJob<'_>, drift: Option<Value>) -> Resu
     )
 }
 
+/// How an executor's own durable work can still end a step that is being
+/// abandoned: a step whose source has already recorded its result (an agent that
+/// reported) must end with it, not with an incident about an outcome that is on
+/// record. `None` for a source that records nothing before it returns.
+pub(super) type Salvage<'a> = Option<&'a (dyn Fn() -> Option<ObservedActivityResult> + Send + Sync)>;
+
+fn salvaged(salvage: Salvage<'_>) -> Option<ObservedActivityResult> {
+    salvage.and_then(|find| find())
+}
+
+enum Renewal {
+    Held,
+    Stopped,
+    Salvaged(Box<ObservedActivityResult>),
+}
+
 /// Extends the lease. On a lost lease or a repository error the worker is
-/// cancelled and the claim failed; `false` then means "stop".
-fn renew_lease(job: &ServiceJob<'_>) -> Result<bool> {
+/// cancelled and the claim failed, unless the source already holds its result.
+fn renew_lease_or_salvage(job: &ServiceJob<'_>, salvage: Salvage<'_>) -> Result<Renewal> {
     let ServiceJob { pool, worker_id, claimed, cancel, .. } = *job;
-    match repository::renew_job_lease(
+    let (code, message) = match repository::renew_job_lease(
         pool,
         &claimed.job.job_id,
         claimed.job.attempt,
@@ -861,25 +876,24 @@ fn renew_lease(job: &ServiceJob<'_>) -> Result<bool> {
         worker_id,
         now_ms(),
     ) {
-        Ok(true) => Ok(true),
-        Ok(false) => {
-            cancel.cancel();
-            fail_claim(
-                pool,
-                worker_id,
-                claimed,
-                "LEASE_LOST",
-                "service job no longer owns its execution lease",
-                None,
-            )?;
-            Ok(false)
-        }
-        Err(error) => {
-            cancel.cancel();
-            fail_claim(pool, worker_id, claimed, "SOURCE_ACCESS_REVOKED", error, None)?;
-            Ok(false)
-        }
+        Ok(true) => return Ok(Renewal::Held),
+        Ok(false) => (
+            "LEASE_LOST",
+            "service job no longer owns its execution lease".to_owned(),
+        ),
+        Err(error) => ("SOURCE_ACCESS_REVOKED", error.to_string()),
+    };
+    cancel.cancel();
+    if let Some(result) = salvaged(salvage) {
+        return Ok(Renewal::Salvaged(Box::new(result)));
     }
+    fail_claim(pool, worker_id, claimed, code, message, None)?;
+    Ok(Renewal::Stopped)
+}
+
+/// Extends the lease. `false` means the claim was failed and the caller stops.
+fn renew_lease(job: &ServiceJob<'_>) -> Result<bool> {
+    Ok(matches!(renew_lease_or_salvage(job, None)?, Renewal::Held))
 }
 
 /// Waits for the execution while renewing the lease, re-checking access and
@@ -887,6 +901,7 @@ fn renew_lease(job: &ServiceJob<'_>) -> Result<bool> {
 pub(super) async fn drive_dispatch(
     job: &ServiceJob<'_>,
     authorize: Authorize<'_>,
+    salvage: Salvage<'_>,
     execution: impl std::future::Future<Output = ExecutionEnd>,
 ) -> Result<Option<ObservedActivityResult>> {
     let ServiceJob { pool, worker_id, claimed, cancel, .. } = *job;
@@ -900,6 +915,9 @@ pub(super) async fn drive_dispatch(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
+                if let Some(result) = salvaged(salvage) {
+                    return Ok(Some(result));
+                }
                 fail_claim(pool, worker_id, claimed, "INTERRUPTED", "the worker was cancelled before its external effect was confirmed", None)?;
                 return Ok(None);
             }
@@ -909,12 +927,17 @@ pub(super) async fn drive_dispatch(
                     fail_claim(pool, worker_id, claimed, "SOURCE_ACCESS_REVOKED", error, None)?;
                     return Ok(None);
                 }
-                if !renew_lease(job)? {
-                    return Ok(None);
+                match renew_lease_or_salvage(job, salvage)? {
+                    Renewal::Held => {}
+                    Renewal::Stopped => return Ok(None),
+                    Renewal::Salvaged(result) => return Ok(Some(*result)),
                 }
             }
             _ = &mut timeout => {
                 cancel.cancel();
+                if let Some(result) = salvaged(salvage) {
+                    return Ok(Some(result));
+                }
                 fail_claim(pool, worker_id, claimed, "SERVICE_TIMEOUT",
                     "the service task exceeded its configured timeout after dispatch", None)?;
                 return Ok(None);

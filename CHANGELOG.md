@@ -112,7 +112,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   z wywołania, bez rodzica, pod zasadą z korelacją równą wywołaniu i z wiązaniem w
   metadanych. Cel to wynik `goal_expression`; wejście aktywności dochodzi jako
   ogrodzone DANE, których znacznik końca jest w nich zneutralizowany. Budżet
-  iteracji kroku może tylko obniżyć budżet agenta. Wynikiem kroku jest wiersz
+  iteracji kroku może tylko obniżyć budżet agenta i jest czytany z modelu procesu. Wynikiem kroku jest wiersz
   w `bpmn_agent_completions` (nigdy ostatnia wiadomość), czytany po zakończeniu
   przebiegu, i ma pochodzenie `Contract`: błąd i eskalacja zgłoszone przez agenta
   uruchamiają zdarzenia brzegowe bez `result_expression`, a przyjęcie wyniku agenta
@@ -133,6 +133,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   `#[serde(default)]`; `SCHEMA_VERSION` zostaje 32), inspektor kroku agenta (agent,
   cel, narzędzia, limit iteracji, schemat wyniku) bez reguły wyniku, limit czasu
   do 3600 s i przyciski błędu oraz eskalacji dostępne bez `result_expression`.
+- Poprawki po przeglądzie kroku agenta (B3.4b). Agent z `on_child_complete =
+  continue` nie może być krokiem procesu, a przebieg z pochodzeniem `process` nie
+  jest kontynuowany poza krokiem (kontynuacja ominęłaby zawężenie narzędzi i
+  przeżyła krok). Porzucony krok anuluje całe drzewo przebiegów
+  (`AgentRunManager::cancel_tree`), a zgłoszenie zapisane w
+  `bpmn_agent_completions` kończy krok także przy limicie czasu, anulowaniu workera
+  i utracie dzierżawy; samo zgłoszenie zatrzymuje przebieg, który pracuje dalej.
+  Lista narzędzi, budżet iteracji i schemat wyniku kroku są czytane z opublikowanego
+  modelu po identyfikatorze przebiegu, nie z metadanych, które zapisze każdy węzeł
+  grafu; ujście sprawdza `outputs` względem tego schematu, a przyjęcie wyniku
+  sprawdza je ponownie. Błąd bazy przy przypięciu harnessu odracza krok zamiast go
+  kończyć, nieudane `await_run` i odczyt wiersza ujścia są ponawiane, a przycinanie
+  historii przepływu pomija wersje trzymane przez oczekujące przebiegi. Liczniki
+  slotów workera są niezależne według klasy. Projektant: limit iteracji to
+  najwyżej 100 i najwyżej limit agenta, puste pole jest odrzucane, nieważny schemat
+  wyniku zostaje widoczny z błędem po ponownym narysowaniu, a podpowiedzi celu i
+  narzędzi opisują to, co system naprawdę robi.
 - Paleta projektanta BPMN ma grupę „Bloki TentaFlow” (B3.3a): przepływy, bloki
   Flow Buildera (`llm`, `embeddings`, `pii_filter`) i narzędzia addonów
   upuszcza się na płótno jako gotowe zadania usługi, z nazwą pozycji i bez pytania

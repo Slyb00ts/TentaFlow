@@ -26331,8 +26331,93 @@ fn validate_escalation_result_plan_on(
     Ok(())
 }
 
+/// The agent step an invocation belongs to, read from the pinned process model:
+/// the tool list, iteration budget and output schema the author published, with
+/// the identity of the dispatch the invocation committed. `None` when the
+/// invocation is not an agent step or its dispatch boundary was never committed.
+fn agent_step_of_invocation_on(
+    conn: &Connection,
+    invocation_id: &str,
+) -> Result<Option<super::agent_sink::AgentStepContract>> {
+    let row: Option<(String, String, String, Option<u32>, Option<u64>)> = conn
+        .query_row(
+            "SELECT instance_id,scope_id,node_id,dispatch_attempt,dispatch_fence \
+             FROM bpmn_service_invocations WHERE invocation_id=?1 AND implementation_kind='agent'",
+            [invocation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row_optional_u64(row, 4)?)),
+        )
+        .optional()?;
+    let Some((instance_id, scope_id, node_id, Some(attempt), Some(fence))) = row else {
+        return Ok(None);
+    };
+    let (definition_id, version): (String, u32) = conn.query_row(
+        "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1",
+        [&instance_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let model = current_version_model_on(conn, &definition_id, version)?;
+    let node = scoped_node_on(conn, &instance_id, &scope_id, &model, &node_id)?;
+    let ProcessNodeKind::ServiceTask {
+        implementation: tentaflow_protocol::processes::ServiceImplementation::Agent {
+            allowed_tools, max_iterations, output_schema, ..
+        },
+        ..
+    } = &node.kind
+    else {
+        return Ok(None);
+    };
+    Ok(Some(super::agent_sink::AgentStepContract {
+        binding: super::agent_sink::ProcessActivityBinding {
+            invocation_id: invocation_id.to_owned(),
+            instance_id,
+            node_id,
+            attempt,
+            fence,
+            allowed_tools: allowed_tools.clone(),
+            output_schema: output_schema.clone(),
+        },
+        max_iterations: *max_iterations,
+    }))
+}
+
+/// The contract of the step an agent run was spawned for. The run proves it by
+/// being the top-level run under the id derived from its invocation, for the
+/// agent that invocation pinned; nothing in run meta is consulted.
+pub(super) fn agent_step_contract_for_run_on(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Option<super::agent_sink::AgentStepContract>> {
+    let run: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT agent_id,correlation_id FROM agent_runs WHERE id=?1 AND parent_run_id IS NULL",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((agent_id, Some(invocation_id))) = run else {
+        return Ok(None);
+    };
+    if super::agent_sink::agent_run_id(&invocation_id) != run_id {
+        return Ok(None);
+    }
+    let pinned: Option<String> = conn
+        .query_row(
+            "SELECT flow_id FROM bpmn_service_invocations WHERE invocation_id=?1",
+            [&invocation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if pinned.as_deref().and_then(tentaflow_protocol::processes::parse_agent_source_ref)
+        != Some(agent_id.as_str())
+    {
+        return Ok(None);
+    }
+    agent_step_of_invocation_on(conn, &invocation_id)
+}
+
 /// A Contract result of an agent step must be exactly the report the agent
-/// recorded for this job's invocation: nothing else gives an agent result its
+/// recorded for this job's invocation, and a completed one must still fit the
+/// output schema of the published step: nothing else gives an agent result its
 /// provenance.
 fn ensure_matches_agent_report(
     tx: &Transaction<'_>,
@@ -26350,7 +26435,10 @@ fn ensure_matches_agent_report(
         &recorded == result,
         "an agent result differs from the report the agent recorded"
     );
-    Ok(())
+    let contract = agent_step_of_invocation_on(tx, &invocation_id)?
+        .context("an agent result belongs to no agent step of the published process")?;
+    super::agent_sink::check_report_outputs(result, contract.binding.output_schema.as_ref())
+        .map_err(|reason| anyhow::anyhow!("an agent result does not fit the published step: {reason}"))
 }
 
 fn validate_job_result_plan_on(

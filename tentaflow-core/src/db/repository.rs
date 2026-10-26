@@ -7654,6 +7654,44 @@ pub fn delete_flow(pool: &DbPool, id: &str) -> Result<()> {
 /// Maksymalna liczba wersji historii przechowywana per flow.
 pub const FLOW_VERSIONS_KEEP: i64 = 5;
 
+/// Flow versions a live run is about to execute or is executing, by count of
+/// holders. Pruning skips them: a run that waits for a concurrency slot must find
+/// its pinned graph when it gets one, however many times the flow is edited
+/// meanwhile. A run dies with the process, so the registry needs no persistence.
+static HELD_FLOW_VERSIONS: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, usize>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Keeps a flow version out of pruning for as long as it lives.
+#[derive(Debug)]
+pub struct FlowVersionHold(String);
+
+/// Takes a hold on `version_id`. A caller that pins a version takes the hold
+/// before the transaction that created or found it commits: pruning needs the
+/// same writer, so it cannot run in between.
+pub fn hold_flow_version(version_id: &str) -> FlowVersionHold {
+    *HELD_FLOW_VERSIONS
+        .lock()
+        .entry(version_id.to_owned())
+        .or_insert(0) += 1;
+    FlowVersionHold(version_id.to_owned())
+}
+
+impl Drop for FlowVersionHold {
+    fn drop(&mut self) {
+        let mut held = HELD_FLOW_VERSIONS.lock();
+        if let Some(count) = held.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(&self.0);
+            }
+        }
+    }
+}
+
+fn flow_version_held(version_id: &str) -> bool {
+    HELD_FLOW_VERSIONS.lock().contains_key(version_id)
+}
+
 const FLOW_VERSION_LIST_COLS: &str =
     "id, flow_id, version_num, name, description, status, created_at, created_by";
 const FLOW_VERSION_FULL_COLS: &str =
@@ -7806,6 +7844,9 @@ pub fn update_flow_with_snapshot(
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             collected
+                .into_iter()
+                .filter(|version_id| !flow_version_held(version_id))
+                .collect()
         };
         for pruned_id in &pruned {
             tx.execute(

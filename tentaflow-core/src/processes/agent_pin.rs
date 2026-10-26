@@ -32,8 +32,9 @@ pub struct AgentPin {
     pub graph_sha256: String,
 }
 
-/// The agent as a step can run it today: it exists, is enabled and runs on a
-/// model (a CLI engine has no way to call the completion tool). This is the
+/// The agent as a step can run it today: it exists, is enabled, does not
+/// continue itself outside the step and runs on a model (a CLI engine has no way
+/// to call the completion tool). This is the
 /// whole of what a step needs from a registry that may change after
 /// publication, because a process uses the agent's current version.
 pub fn runnable_agent(conn: &Connection, agent_id: &str) -> Result<DbAgent, AgentPinError> {
@@ -42,6 +43,14 @@ pub fn runnable_agent(conn: &Connection, agent_id: &str) -> Result<DbAgent, Agen
         .ok_or_else(|| AgentPinError::Refused("the agent does not exist".into()))?;
     if !agent.is_enabled {
         return Err(AgentPinError::Refused("the agent is disabled".into()));
+    }
+    // A continuation is a new top-level run, which would leave the step: it has
+    // none of the step's narrowing and nothing cancels it with the step.
+    if agent.on_child_complete == "continue" {
+        return Err(AgentPinError::Refused(
+            "an agent that continues on its own when a delegate finishes cannot be a process step"
+                .into(),
+        ));
     }
     match AgentRuntime::parse(&agent.runtime_json) {
         Ok(AgentRuntime::Llm) => Ok(agent),
