@@ -1853,6 +1853,17 @@ pub struct ProcessOptionTool {
     pub addon_name: String,
 }
 
+/// An agent the requesting user may publish as a Service task.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessOptionAgent {
+    pub agent_id: String,
+    /// Display name when the agent has one, its name otherwise.
+    pub name: String,
+    pub description: String,
+    /// Iteration budget of the agent; a step may ask for no more.
+    pub max_iterations: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessSimulationSource {
@@ -1931,6 +1942,8 @@ pub enum ProcessPayload {
         service_blocks: Vec<ProcessOptionBlock>,
         #[serde(default)]
         service_tools: Vec<ProcessOptionTool>,
+        #[serde(default)]
+        service_agents: Vec<ProcessOptionAgent>,
     },
     DefinitionListRequest {
         offset: u32,
@@ -2216,6 +2229,7 @@ mod tests {
             service_flows,
             service_blocks,
             service_tools,
+            service_agents,
             ..
         } = decoded
         else {
@@ -2224,6 +2238,7 @@ mod tests {
         assert_eq!(service_flows.len(), 1);
         assert_eq!(service_flows[0].description, "");
         assert!(service_blocks.is_empty() && service_tools.is_empty());
+        assert!(service_agents.is_empty());
 
         let older_tool = serde_json::json!({"OptionsResponse": {
             "assignees": [], "service_flows": [],
@@ -2254,6 +2269,12 @@ mod tests {
                 tool_name: "search".into(),
                 description: "Searches notes".into(),
                 addon_name: "Notes".into(),
+            }],
+            service_agents: vec![ProcessOptionAgent {
+                agent_id: "agent-1".into(),
+                name: "Reviewer".into(),
+                description: "Reviews a case".into(),
+                max_iterations: 8,
             }],
         };
         let round_trip: ProcessPayload =

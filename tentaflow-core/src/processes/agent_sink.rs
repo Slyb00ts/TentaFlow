@@ -37,6 +37,18 @@ pub const PROCESS_ACTIVITY_META_KEY: &str = "process_activity";
 /// opening `core.task_complete`.
 pub const PROCESS_STEP_TOOLS_META_KEY: &str = "process_step_tools";
 
+/// Key of the iteration budget of a process step in run meta. Unlike the
+/// binding it claims nothing about the step and can only lower the agent's own
+/// budget, so a forged entry gains a run nothing.
+pub const PROCESS_STEP_ITERATIONS_META_KEY: &str = "process_step_iterations";
+
+/// The step's iteration budget when run meta carries one.
+pub fn step_iteration_cap(meta: &BTreeMap<String, Value>) -> Option<i64> {
+    meta.get(PROCESS_STEP_ITERATIONS_META_KEY)?
+        .as_i64()
+        .filter(|cap| *cap > 0)
+}
+
 /// Largest output schema an agent step may carry; larger ones are refused at
 /// publication so the sink never compiles an unbounded document per call.
 pub const MAX_OUTPUT_SCHEMA_BYTES: usize = 64 * 1024;
@@ -244,6 +256,25 @@ fn record_completion(
     )?;
     tx.commit()?;
     Ok(())
+}
+
+/// The final report an invocation recorded, if any. This row, never the run's
+/// last message, is what an agent step ended with: a run can finish with a
+/// confident answer and no report.
+pub fn recorded_completion(
+    conn: &rusqlite::Connection,
+    invocation_id: &str,
+) -> Result<Option<ActivityResult>> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT result_json FROM bpmn_agent_completions WHERE invocation_id=?1",
+            [invocation_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    stored
+        .map(|json| Ok(serde_json::from_str(&json)?))
+        .transpose()
 }
 
 fn parse_outcome(value: &Value) -> Option<ActivityOutcome> {

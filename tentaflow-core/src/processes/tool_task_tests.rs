@@ -913,7 +913,7 @@ async fn abandoned_calls_hold_the_gate_and_a_busy_task_waits_without_claim_noise
     let mut now = now_ms();
     for _ in 0..6 {
         assert!(
-            repository::claim_job_where(&fixture.db, "gate-worker-2", now, &admission)
+            repository::claim_job_where(&fixture.db, "gate-worker-2", now, repository::ClaimSlots::ALL, &admission)
                 .unwrap()
                 .is_none()
         );
@@ -941,7 +941,7 @@ async fn abandoned_calls_hold_the_gate_and_a_busy_task_waits_without_claim_noise
     // Once the guest really returns, the permits come back and the task runs.
     host.release();
     wait_for_permits(&fixture, ADDON).await;
-    let claimed = repository::claim_job_where(&fixture.db, "gate-worker-3", now, &admission)
+    let claimed = repository::claim_job_where(&fixture.db, "gate-worker-3", now, repository::ClaimSlots::ALL, &admission)
         .unwrap()
         .expect("the task is claimable once the addon has room");
     assert_eq!(claimed.job.instance_id, instances[2]);
@@ -970,7 +970,7 @@ async fn a_task_deferred_past_the_bound_raises_one_visible_incident() {
     let start = now_ms();
     let mut now = start;
     for _ in 0..5 {
-        assert!(repository::claim_job_where(&fixture.db, "w", now, &busy)
+        assert!(repository::claim_job_where(&fixture.db, "w", now, repository::ClaimSlots::ALL, &busy)
             .unwrap()
             .is_none());
         now += 40_000;
@@ -984,7 +984,7 @@ async fn a_task_deferred_past_the_bound_raises_one_visible_incident() {
     assert!(before.incidents.is_empty());
     // Past the bound the wait becomes a visible incident, and the task can be retried by hand.
     now = start + repository::DEFER_DEADLINE_MS;
-    assert!(repository::claim_job_where(&fixture.db, "w", now, &busy)
+    assert!(repository::claim_job_where(&fixture.db, "w", now, repository::ClaimSlots::ALL, &busy)
         .unwrap()
         .is_none());
     let after =
@@ -1028,7 +1028,7 @@ async fn an_unavailable_addon_defers_the_task_instead_of_raising_an_incident() {
     let admission = super::runtime::claim_admission(fixture.dispatcher());
     let start = now_ms();
     assert!(
-        repository::claim_job_where(&fixture.db, "early", start, &admission)
+        repository::claim_job_where(&fixture.db, "early", start, repository::ClaimSlots::ALL, &admission)
             .unwrap()
             .is_none()
     );
@@ -1063,7 +1063,7 @@ async fn an_unavailable_addon_defers_the_task_instead_of_raising_an_incident() {
     // Back up: it runs.
     *host.allow.lock().unwrap() = Ok(());
     let claimed =
-        repository::claim_job_where(&fixture.db, "back", start + 10 * 60_000 - 1, &admission)
+        repository::claim_job_where(&fixture.db, "back", start + 10 * 60_000 - 1, repository::ClaimSlots::ALL, &admission)
             .unwrap();
     assert!(
         claimed.is_some(),
@@ -1568,20 +1568,20 @@ async fn a_recovery_pass_is_paged_and_takes_the_rows_checked_longest_ago_first()
 fn the_production_claim_and_scan_queries_use_their_indexes() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     crate::db::migrations::run(&conn).unwrap();
-    let plan = |sql: &str| -> String {
+    let plan = |sql: &str, params: &[i64]| -> String {
         conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
             .unwrap()
-            .query_map([5_i64], |row| row.get::<_, String>(3))
+            .query_map(rusqlite::params_from_iter(params), |row| row.get::<_, String>(3))
             .unwrap()
             .map(|row| row.unwrap())
             .collect::<Vec<_>>()
             .join(" | ")
     };
-    let claim = plan(repository::CLAIM_CANDIDATES_SQL);
+    let claim = plan(repository::CLAIM_CANDIDATES_SQL, &[5, 1, 1]);
     assert!(claim.contains("USING INDEX idx_bpmn_jobs_ready"), "{claim}");
     // The index also delivers the rows in claim order: no sort of the queue.
     assert!(!claim.contains("TEMP B-TREE"), "{claim}");
-    let scan = plan(repository::DEFERRED_SCAN_SQL);
+    let scan = plan(repository::DEFERRED_SCAN_SQL, &[5]);
     assert!(
         scan.contains("idx_bpmn_invocations_observed_tool"),
         "{scan}"
@@ -1881,8 +1881,8 @@ async fn the_deferral_state_is_cleared_once_the_job_is_dispatched() {
     let busy =
         |_: &repository::ProcessActor, _: &str| repository::ClaimAdmission::Defer("TOOL_BUSY");
     let start = now_ms();
-    repository::claim_job_where(&fixture.db, "w", start, &busy).unwrap();
-    repository::claim_job_where(&fixture.db, "w", start + 5_000, &busy).unwrap();
+    repository::claim_job_where(&fixture.db, "w", start, repository::ClaimSlots::ALL, &busy).unwrap();
+    repository::claim_job_where(&fixture.db, "w", start + 5_000, repository::ClaimSlots::ALL, &busy).unwrap();
     let state = |db: &crate::db::DbPool| -> (i64, Option<i64>, Option<String>, Option<i64>) {
         db.read().unwrap().query_row(
             "SELECT defer_count,first_deferred_at_ms,last_defer_code,not_before_ms FROM bpmn_jobs",

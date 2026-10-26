@@ -8,6 +8,7 @@ use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use tentaflow_protocol::processes::{
     ActivityOutcome, ActivityResult, ProcessNodeKind, ServiceImplementation,
+    ServiceImplementationKind,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -30,7 +31,7 @@ pub(super) fn failure_for_test(code: &str, message: String) -> ActivityResult {
     failure(code, message)
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
@@ -267,20 +268,20 @@ fn script_infrastructure(error: &anyhow::Error) -> bool {
 
 /// Everything the shared claim/dispatch/observation machinery needs, whatever
 /// the Service task runs.
-struct ServiceJob<'a> {
-    pool: &'a DbPool,
-    dispatcher: &'a Arc<FlowDispatcher>,
-    worker_id: &'a str,
-    claimed: &'a ClaimedProcessJob,
-    cancel: &'a CancellationToken,
-    timeout: Duration,
-    result_expression: Option<&'a str>,
-    effective: &'a Value,
-    repeat_extra: &'a [(String, Value)],
+pub(super) struct ServiceJob<'a> {
+    pub(super) pool: &'a DbPool,
+    pub(super) dispatcher: &'a Arc<FlowDispatcher>,
+    pub(super) worker_id: &'a str,
+    pub(super) claimed: &'a ClaimedProcessJob,
+    pub(super) cancel: &'a CancellationToken,
+    pub(super) timeout: Duration,
+    pub(super) result_expression: Option<&'a str>,
+    pub(super) effective: &'a Value,
+    pub(super) repeat_extra: &'a [(String, Value)],
 }
 
 /// The answer of a source access re-check.
-enum AccessCheck {
+pub(super) enum AccessCheck {
     Allowed,
     /// Access is definitely gone (permission or initiator lost, flow denied).
     /// The message is only ever stored with the failure.
@@ -292,7 +293,7 @@ enum AccessCheck {
 
 /// Re-checks, before and during execution, that the initiator may still use
 /// the task's source.
-type Authorize<'a> = &'a (dyn Fn() -> AccessCheck + Send + Sync);
+pub(super) type Authorize<'a> = &'a (dyn Fn() -> AccessCheck + Send + Sync);
 
 fn tool_access(result: std::result::Result<super::tool_host::ProcessToolDescriptor, ToolAccessError>) -> AccessCheck {
     match result {
@@ -308,7 +309,7 @@ fn tool_access(result: std::result::Result<super::tool_host::ProcessToolDescript
 
 /// How an executor's work ended, before the shared machinery decides what the
 /// job does with it.
-enum ExecutionEnd {
+pub(super) enum ExecutionEnd {
     /// The source produced a result. `recheck` asks for the initiator's access
     /// to be confirmed first, for results that may be a symptom of a revocation.
     Observed {
@@ -409,19 +410,37 @@ pub async fn execute_claimed(
         ServiceImplementation::Block { node_type, config } => {
             execute_block(&job, snapshot, node_type, config).await
         }
-        // The sink and the binding an agent run reports through exist
-        // (`agent_sink`), the executor that spawns it does not yet. Failing
-        // before the dispatch boundary leaves nothing running and the failure
-        // visible as an incident instead of a task that waits forever.
-        ServiceImplementation::Agent { .. } => fail_claim(
-            pool,
-            worker_id,
-            &claimed,
-            "AGENT_EXECUTOR_UNAVAILABLE",
-            "agent steps cannot be executed by this build yet",
-            None,
-        ),
+        ServiceImplementation::Agent {
+            agent_id,
+            goal_expression,
+            allowed_tools,
+            max_iterations,
+            output_schema,
+        } => {
+            super::agent_exec::execute_agent(
+                &job,
+                snapshot,
+                super::agent_exec::AgentStep {
+                    agent_id,
+                    goal_expression,
+                    allowed_tools,
+                    max_iterations: *max_iterations,
+                    output_schema: output_schema.as_ref(),
+                },
+            )
+            .await
+        }
     }
+}
+
+/// Whether a claimed job is an agent step, which takes a slot of the agent
+/// class instead of the general one.
+pub(super) fn is_agent_job(claimed: &ClaimedProcessJob) -> bool {
+    claimed.snapshot.service_snapshots.iter().any(|snapshot| {
+        snapshot.info.node_id == claimed.job.node_id
+            && snapshot.role == PinnedServiceRole::Implementation
+            && snapshot.implementation_kind == ServiceImplementationKind::Agent
+    })
 }
 
 async fn execute_flow(
@@ -817,7 +836,7 @@ fn precheck_dispatch(job: &ServiceJob<'_>) -> Result<bool> {
 
 /// The precheck plus the committed dispatch boundary, which precedes the first
 /// poll of any external effect.
-fn begin_dispatch(job: &ServiceJob<'_>, drift: Option<Value>) -> Result<bool> {
+pub(super) fn begin_dispatch(job: &ServiceJob<'_>, drift: Option<Value>) -> Result<bool> {
     if !precheck_dispatch(job)? {
         return Ok(false);
     }
@@ -865,7 +884,7 @@ fn renew_lease(job: &ServiceJob<'_>) -> Result<bool> {
 
 /// Waits for the execution while renewing the lease, re-checking access and
 /// honouring cancellation and the timeout. `None` means the claim was failed.
-async fn drive_dispatch(
+pub(super) async fn drive_dispatch(
     job: &ServiceJob<'_>,
     authorize: Authorize<'_>,
     execution: impl std::future::Future<Output = ExecutionEnd>,
@@ -943,7 +962,7 @@ fn exhausted_attempts_failure(store_busy: bool) -> (&'static str, &'static str) 
 /// Records the observed result and publishes it. A revision conflict only
 /// recalculates the transition from the already observed result; it never
 /// repeats the external execution.
-fn finish_observed(
+pub(super) fn finish_observed(
     job: &ServiceJob<'_>,
     authorize: Authorize<'_>,
     result: ObservedActivityResult,

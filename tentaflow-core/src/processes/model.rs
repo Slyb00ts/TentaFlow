@@ -1800,11 +1800,17 @@ fn validate_body<'a>(
                     node.id
                 );
                 if matches!(node.kind, ProcessNodeKind::BoundaryEscalation { .. }) {
+                    // Only a business (Contract) result can be escalated: it comes
+                    // from a result expression or from the report of an agent.
                     ensure!(
                         matches!(nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
                         Some(ProcessNodeKind::ServiceTask { result_expression: Some(expression), .. })
-                            if !expression.is_empty()),
-                        "boundary escalation {} requires a ServiceTask with result expression",
+                            if !expression.is_empty())
+                            || matches!(nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
+                        Some(ProcessNodeKind::ServiceTask {
+                            implementation: ServiceImplementation::Agent { .. }, ..
+                        })),
+                        "boundary escalation {} requires a ServiceTask with result expression or an agent",
                         node.id
                     );
                 }

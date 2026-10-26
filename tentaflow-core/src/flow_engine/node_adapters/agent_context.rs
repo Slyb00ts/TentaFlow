@@ -371,6 +371,10 @@ impl NodeAdapter for AgentContextNodeAdapter {
             .and_then(|v| v.as_i64())
             .filter(|n| *n > 0)
             .unwrap_or(agent.max_iterations);
+        // A process step can only lower the budget; meta is writable by any node,
+        // so a forged entry has no way to raise it.
+        let max_iterations = crate::processes::agent_sink::step_iteration_cap(&envelope.meta)
+            .map_or(max_iterations, |cap| max_iterations.min(cap));
         out.meta.insert(
             "loop_max_iterations".into(),
             serde_json::json!(max_iterations),

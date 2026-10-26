@@ -24183,9 +24183,11 @@ pub(super) fn job_activation_live_on(conn: &Connection, job_id: &str) -> Result<
     )?)
 }
 
-/// The queued jobs a claim looks at, oldest first. A constant so a test can ask
-/// the planner about the very query the worker runs.
-pub const CLAIM_CANDIDATES_SQL: &str = "SELECT j.job_id,j.instance_id,j.scope_id,j.node_id,i.org_id,i.initiator_user_id FROM bpmn_jobs j JOIN bpmn_service_invocations v ON v.job_id=j.job_id AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id AND v.phase='prepared' AND v.dispatch_evidence='no_boundary' JOIN bpmn_instances i ON i.instance_id=j.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id AND t.node_id=j.node_id JOIN bpmn_scopes s ON s.instance_id=j.instance_id AND s.scope_id=j.scope_id WHERE j.status='queued' AND (j.not_before_ms IS NULL OR j.not_before_ms<=?1) AND i.status IN ('running','waiting','incident') AND t.status='waiting' AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled','error')) ORDER BY j.created_at_ms,j.job_id LIMIT 16";
+/// The queued jobs a claim looks at, oldest first. `?2` and `?3` switch the
+/// general and the agent slot class on, so a class with no free slot cannot
+/// fill the 16-row window with jobs nobody may claim and starve the other.
+/// A constant so a test can ask the planner about the very query the worker runs.
+pub const CLAIM_CANDIDATES_SQL: &str = "SELECT j.job_id,j.instance_id,j.scope_id,j.node_id,i.org_id,i.initiator_user_id FROM bpmn_jobs j JOIN bpmn_service_invocations v ON v.job_id=j.job_id AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id AND v.phase='prepared' AND v.dispatch_evidence='no_boundary' JOIN bpmn_instances i ON i.instance_id=j.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id AND t.node_id=j.node_id JOIN bpmn_scopes s ON s.instance_id=j.instance_id AND s.scope_id=j.scope_id WHERE j.status='queued' AND (j.not_before_ms IS NULL OR j.not_before_ms<=?1) AND i.status IN ('running','waiting','incident') AND t.status='waiting' AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled','error')) AND (?2=1 AND v.implementation_kind<>'agent' OR ?3=1 AND v.implementation_kind='agent') ORDER BY j.created_at_ms,j.job_id LIMIT 16";
 
 /// How long a queued tool task may keep being put off (addon busy, not running
 /// yet) before it raises an incident for a person. Nothing has run in that time.
@@ -24212,14 +24214,29 @@ pub fn admit_every_claim(_: &ProcessActor, _: &str) -> ClaimAdmission {
     ClaimAdmission::Admit
 }
 
+/// Which kinds of queued jobs a worker has a free slot for. An agent step runs
+/// for minutes to an hour, so agent jobs get slots of their own: a full set of
+/// them must not keep a quick flow, block or tool task from being claimed, and a
+/// burst of quick tasks must not keep an agent waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimSlots {
+    pub general: bool,
+    pub agents: bool,
+}
+
+impl ClaimSlots {
+    pub const ALL: Self = Self { general: true, agents: true };
+}
+
 pub fn claim_job(pool: &DbPool, worker_id: &str, now_ms: i64) -> Result<Option<ClaimedProcessJob>> {
-    claim_job_where(pool, worker_id, now_ms, &admit_every_claim)
+    claim_job_where(pool, worker_id, now_ms, ClaimSlots::ALL, &admit_every_claim)
 }
 
 pub fn claim_job_where(
     pool: &DbPool,
     worker_id: &str,
     now_ms: i64,
+    slots: ClaimSlots,
     admit: ClaimAdmit<'_>,
 ) -> Result<Option<ClaimedProcessJob>> {
     ensure!(
@@ -24234,7 +24251,7 @@ pub fn claim_job_where(
         let conn = pool.read()?;
         let mut statement = conn.prepare(CLAIM_CANDIDATES_SQL)?;
         let candidates = statement
-            .query_map([now_ms], |row| -> rusqlite::Result<Candidate> { Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, String>(3)?,row.get::<_, String>(4)?,row.get::<_, String>(5)?)) })?
+            .query_map(params![now_ms, slots.general, slots.agents], |row| -> rusqlite::Result<Candidate> { Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, String>(2)?,row.get::<_, String>(3)?,row.get::<_, String>(4)?,row.get::<_, String>(5)?)) })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(statement);
         let mut deferred = Vec::new();
@@ -26314,6 +26331,28 @@ fn validate_escalation_result_plan_on(
     Ok(())
 }
 
+/// A Contract result of an agent step must be exactly the report the agent
+/// recorded for this job's invocation: nothing else gives an agent result its
+/// provenance.
+fn ensure_matches_agent_report(
+    tx: &Transaction<'_>,
+    job_id: &str,
+    result: &ActivityResult,
+) -> Result<()> {
+    let invocation_id: String = tx.query_row(
+        "SELECT invocation_id FROM bpmn_service_invocations WHERE job_id=?1",
+        [job_id],
+        |row| row.get(0),
+    )?;
+    let recorded = super::agent_sink::recorded_completion(tx, &invocation_id)?
+        .context("an agent result has no recorded report")?;
+    ensure!(
+        &recorded == result,
+        "an agent result differs from the report the agent recorded"
+    );
+    Ok(())
+}
+
 fn validate_job_result_plan_on(
     tx: &Transaction<'_>,
     instance: &ProcessInstance,
@@ -26408,17 +26447,28 @@ fn validate_job_result_plan_on(
         node_id,
     )?;
     let ProcessNodeKind::ServiceTask {
-        result_expression, ..
+        result_expression,
+        implementation,
+        ..
     } = &node.kind
     else {
         bail!("result node is not a service activity")
     };
+    // An agent step has no result expression: its contract is the report the
+    // agent recorded, and the acceptance below holds the result to that row.
+    let agent_report = matches!(
+        implementation,
+        tentaflow_protocol::processes::ServiceImplementation::Agent { .. }
+    );
     if observed.origin == ActivityResultOrigin::Contract {
         ensure!(
-            result_expression.is_some(),
+            result_expression.is_some() || agent_report,
             "business result requires an explicit pinned output contract"
         );
         super::jobs::parse_contract_result(serde_json::to_value(&observed.result)?)?;
+        if agent_report {
+            ensure_matches_agent_report(tx, job_id, &observed.result)?;
+        }
     }
     let body_path = scope_path(&scopes, &instance.instance_id, &source_scope)?;
     if let Some(occurrence) = repetition_occurrences_on(tx, &instance.instance_id)?
@@ -26442,7 +26492,7 @@ fn validate_job_result_plan_on(
                 &job_scope, &job_node, &job_token, attempt, fence, &group, &occurrence,
             )?.as_str()),
             "repeated Service claim differs from its immutable occurrence and fence");
-        if observed.origin == ActivityResultOrigin::Contract {
+        if observed.origin == ActivityResultOrigin::Contract && !agent_report {
             let observation = observed.expression_observation.as_ref()
                 .context("repeated Contract result lacks its original observation")?;
             let expected = if group.mode == ProcessRepetitionGroupMode::StructuredLoop {
@@ -26471,7 +26521,7 @@ fn validate_job_result_plan_on(
             matches!(&candidate.kind,
             ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } if attached_to_id == node_id)
         });
-    if has_escalation && observed.origin == ActivityResultOrigin::Contract {
+    if has_escalation && observed.origin == ActivityResultOrigin::Contract && !agent_report {
         let observation = observed
             .expression_observation
             .as_ref()
@@ -27319,10 +27369,19 @@ pub fn recover_jobs(
                     observed_json),
                 now_ms, tool_authority)
         } else {
-            fail_job(pool, &job_id, attempt, fence, &original_worker,
-                "INTERRUPTED", "the worker stopped before its Service result was observed",
-                now_ms, None).map(|failed| if failed { RecoveryStep::Resolved }
-                    else { RecoveryStep::Waiting(WaitReason::Conflict) })
+            // An agent that reported before the worker stopped has its result in
+            // the sink; that row, and nothing the run said afterwards, is adopted.
+            adopt_agent_report(pool,
+                (job_id.clone(), attempt, fence, original_worker.clone(), phase.clone(),
+                    instance_id.clone(), org_id.clone(), user_id.clone()),
+                now_ms, tool_authority)
+            .and_then(|adopted| match adopted {
+                Some(step) => Ok(step),
+                None => fail_job(pool, &job_id, attempt, fence, &original_worker,
+                    "INTERRUPTED", "the worker stopped before its Service result was observed",
+                    now_ms, None).map(|failed| if failed { RecoveryStep::Resolved }
+                        else { RecoveryStep::Waiting(WaitReason::Conflict) }),
+            })
         };
         match outcome {
             Ok(RecoveryStep::Resolved) => recovered += 1,
@@ -27348,6 +27407,64 @@ pub fn recover_jobs(
     }
     record_undecided_batch(pool, &waiting, now_ms);
     Ok(recovered)
+}
+
+/// Resumes an agent step whose worker stopped after the agent reported: the
+/// recorded report becomes the observed `Contract` result of the interrupted
+/// dispatch and goes through the canonical acceptance, without running the agent
+/// again. `None` means there is nothing to adopt (another kind of step, a job
+/// that is not past its dispatch boundary, or an agent that never reported), and
+/// the caller keeps the existing interrupted path: a run that ended without a
+/// report is never a success.
+fn adopt_agent_report(
+    pool: &DbPool,
+    (job_id, attempt, fence, original_worker, phase, instance_id, org_id, user_id):
+        (String, u32, u64, String, String, String, String, String),
+    now_ms: i64,
+    tool_authority: ToolAuthority<'_>,
+) -> Result<Option<RecoveryStep>> {
+    if phase != "may_have_executed" {
+        return Ok(None);
+    }
+    let found: Option<(String, String, ActivityResult)> = {
+        let conn = pool.read()?;
+        let invocation: Option<(String, String)> = conn.query_row(
+            "SELECT invocation_id,stable_request_id FROM bpmn_service_invocations WHERE job_id=?1 AND implementation_kind='agent' AND phase='may_have_executed' AND dispatch_evidence='committed_boundary' AND dispatch_attempt=?2 AND dispatch_fence=?3 AND dispatch_worker_id=?4",
+            params![job_id, attempt, sql_integer(fence)?, original_worker],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        match invocation {
+            None => None,
+            Some((invocation_id, request_id)) => {
+                super::agent_sink::recorded_completion(&conn, &invocation_id)?
+                    .map(|result| (invocation_id, request_id, result))
+            }
+        }
+    };
+    let Some((invocation_id, request_id, result)) = found else { return Ok(None) };
+    let actor = ProcessActor { org_id: org_id.clone(), user_id: user_id.clone() };
+    let snapshot = runtime_snapshot(pool, &actor, &instance_id)?;
+    let job = snapshot.jobs.iter().find(|job| job.job_id == job_id).cloned()
+        .context("interrupted agent job disappeared")?;
+    let claimed = ClaimedProcessJob {
+        actor, job, snapshot, invocation_id, request_id,
+        result_event_id: Uuid::new_v4().to_string(),
+    };
+    let observed = ObservedActivityResult {
+        result,
+        origin: ActivityResultOrigin::Contract,
+        expression_observation: None,
+    };
+    match record_job_observation(pool, &claimed, &original_worker, &observed, now_ms)? {
+        JobObservationState::Blocked | JobObservationState::Accepted => {
+            return Ok(Some(RecoveryStep::Resolved));
+        }
+        JobObservationState::Observed => {}
+    }
+    recover_observed_job(pool,
+        (job_id, attempt, fence, original_worker, instance_id, org_id, user_id,
+            Some(json(&observed)?)),
+        now_ms, tool_authority).map(Some)
 }
 
 /// Looks again at observed results that were recorded but not accepted. Run

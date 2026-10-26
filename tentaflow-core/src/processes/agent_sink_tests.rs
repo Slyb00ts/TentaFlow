@@ -1146,45 +1146,6 @@ fn model_validation_bounds_an_agent_step() {
     );
 }
 
-#[tokio::test]
-async fn running_an_agent_step_before_its_executor_exists_fails_before_the_boundary() {
-    let fixture = Fixture::new();
-    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
-    let started = start_model(
-        &fixture,
-        &agent_model(agent_implementation(AGENT_ID, &[], None)),
-    );
-    let claimed = repository::claim_job(&fixture.db, "agent-worker", now_ms())
-        .unwrap()
-        .unwrap();
-    super::jobs::execute_claimed(
-        &fixture.db,
-        fixture.dispatcher(),
-        "agent-worker",
-        claimed.clone(),
-        CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-
-    let current =
-        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
-    assert_eq!(
-        current.status,
-        tentaflow_protocol::processes::ProcessInstanceStatus::Incident
-    );
-    assert_eq!(current.incidents[0].code, "AGENT_EXECUTOR_UNAVAILABLE");
-    assert_eq!(
-        invocation(&fixture, &claimed.job.job_id),
-        (
-            "agent".into(),
-            format!("agent:{AGENT_ID}"),
-            "proved_no_effect".into()
-        )
-    );
-    assert!(completions(&fixture).is_empty());
-}
-
 #[test]
 fn an_agent_step_survives_the_xml_round_trip() {
     let implementation = agent_implementation(

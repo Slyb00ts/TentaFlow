@@ -575,6 +575,10 @@ pub struct FlowDispatcher {
     process_tool_host:
         parking_lot::RwLock<Option<Arc<dyn crate::processes::tool_host::ProcessToolHost>>>,
     process_tool_gate: Arc<crate::processes::tool_host::ToolCallGate>,
+    /// Runs the agent of a BPMN agent step; filled at startup once the agent
+    /// run manager exists, so a process worker without one waits instead of
+    /// failing the step.
+    process_agent_runs: parking_lot::RwLock<Option<Arc<crate::agents::AgentRunManager>>>,
     /// Harness §3.5.0: AgentServiceSlot — wypełniany z main.rs przez
     /// `set_agent_service` po zbudowaniu AddonManager/AppState. Phase-3 bloki
     /// (`agent_context`, `tool_exec`) trzymają KLON tego slotu (wpięty w
@@ -808,6 +812,7 @@ impl FlowDispatcher {
             addon_flow_blocks: parking_lot::RwLock::new(None),
             process_tool_host: parking_lot::RwLock::new(None),
             process_tool_gate: Arc::new(crate::processes::tool_host::ToolCallGate::default()),
+            process_agent_runs: parking_lot::RwLock::new(None),
             agent_service,
             subflow_runner,
             frame_blobs,
@@ -932,6 +937,37 @@ impl FlowDispatcher {
 
     pub fn process_tool_gate(&self) -> &Arc<crate::processes::tool_host::ToolCallGate> {
         &self.process_tool_gate
+    }
+
+    pub fn set_process_agent_runs(&self, manager: Arc<crate::agents::AgentRunManager>) {
+        *self.process_agent_runs.write() = Some(manager);
+    }
+
+    pub fn process_agent_runs(&self) -> Option<Arc<crate::agents::AgentRunManager>> {
+        self.process_agent_runs.read().clone()
+    }
+
+    /// Process counterpart of [`authorize_process_tool`] for an agent step: the
+    /// initiator must be an active member of the organization and the agent must
+    /// still be runnable (exists, enabled, runs on a model). Everything else about
+    /// the agent may have changed since publication; a process uses its current
+    /// version.
+    pub fn authorize_process_agent(
+        &self,
+        agent_id: &str,
+        user_id: &str,
+        org_id: &str,
+    ) -> std::result::Result<crate::db::models::DbAgent, crate::processes::agent_pin::AgentPinError>
+    {
+        use crate::processes::agent_pin::{runnable_agent, AgentPinError};
+        use crate::processes::tool_host::ToolAccessError;
+        self.check_process_initiator(user_id, org_id)
+            .map_err(|error| match error {
+                ToolAccessError::Unavailable => AgentPinError::Unavailable,
+                _ => AgentPinError::Initiator,
+            })?;
+        let conn = self.db.read().map_err(|_| AgentPinError::Unavailable)?;
+        runnable_agent(&conn, agent_id)
     }
 
     /// Process counterpart of [`authorize_process_flow`] for an addon tool: the

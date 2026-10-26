@@ -2,8 +2,8 @@
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::processes::{
-    PinnedFlowInfo, ProcessNodeKind, ProcessOptionBlock, ProcessOptionFlow, ProcessOptionTool,
-    ProcessOptionUser, ProcessPayload as P, ProcessSimulationClock, ProcessSimulationEvent,
+    PinnedFlowInfo, ProcessNodeKind, ProcessOptionAgent, ProcessOptionBlock, ProcessOptionFlow,
+    ProcessOptionTool, ProcessOptionUser, ProcessPayload as P, ProcessSimulationClock, ProcessSimulationEvent,
     ProcessSimulationSource, ProcessSimulationTraceStep, ProcessSimulationView,
     ServiceImplementation,
 };
@@ -224,6 +224,7 @@ fn options(ctx: &HandlerContext, actor: &ProcessActor) -> Result<P, ProtocolErro
         service_flows,
         service_blocks: service_block_options(),
         service_tools: service_tool_options(executor, actor)?,
+        service_agents: service_agent_options(executor)?,
     })
 }
 
@@ -238,6 +239,9 @@ const MAX_TOOL_OPTIONS: usize = 1000;
 /// Longest flow name or assignee name sent to the designer, in characters.
 const MAX_OPTION_NAME_CHARS: usize = 256;
 const FLOW_SCAN_PAGE: i64 = 500;
+/// Largest agent list sent to the designer, cut after the stable name ordering;
+/// the inspector still accepts any agent id the author types.
+const MAX_AGENT_OPTIONS: usize = 500;
 // Worst-case encoded size of a flow row (36-byte id, a name and a description
 // of four-byte characters) and of an assignee row (36-byte id, a name).
 const MAX_FLOW_OPTION_BYTES: usize = 36
@@ -253,6 +257,7 @@ const MAX_ASSIGNEE_OPTION_BYTES: usize =
 const _: () = assert!(
     MAX_TOOL_OPTIONS * crate::processes::tool_host::MAX_OFFERED_TOOL_BYTES
         + 1000 * MAX_FLOW_OPTION_BYTES
+        + MAX_AGENT_OPTIONS * MAX_FLOW_OPTION_BYTES
         + 1000 * MAX_ASSIGNEE_OPTION_BYTES
         <= tentaflow_transport::MAX_FRAME_SIZE / 4 * 3
 );
@@ -293,6 +298,37 @@ fn service_block_options() -> Vec<ProcessOptionBlock> {
         .collect()
 }
 
+/// Agents a Service task could run: enabled and running on a model. Agents are
+/// open to every signed-in user in the agent list, so the catalogue adds no check
+/// of its own; publication pins the chosen agent and `authorize_process_agent`
+/// decides again on every run.
+fn service_agent_options(executor: &FlowDispatcher) -> Result<Vec<ProcessOptionAgent>, ProtocolError> {
+    let agents = crate::db::repository::list_agents(
+        executor.process_database(),
+        &crate::db::models::AgentListFilter {
+            is_enabled: Some(true),
+            routable: None,
+        },
+    )
+    .map_err(|_| ProtocolError::internal("the agent catalogue is unavailable"))?;
+    Ok(agents
+        .into_iter()
+        .filter(|agent| {
+            matches!(
+                crate::agents::AgentRuntime::parse(&agent.runtime_json),
+                Ok(crate::agents::AgentRuntime::Llm)
+            )
+        })
+        .take(MAX_AGENT_OPTIONS)
+        .map(|agent| ProcessOptionAgent {
+            name: bounded_name(agent.display_name.as_deref().unwrap_or(&agent.name)),
+            description: crate::processes::tool_host::truncate_chars(&agent.description),
+            max_iterations: u32::try_from(agent.max_iterations).unwrap_or(0),
+            agent_id: agent.id,
+        })
+        .collect())
+}
+
 fn service_tool_options(
     executor: &FlowDispatcher,
     actor: &ProcessActor,
@@ -310,32 +346,6 @@ fn service_tool_options(
             addon_name: tool.addon_name,
         })
         .collect())
-}
-
-/// Every instance that reaches an agent step ends in the incident
-/// `AGENT_EXECUTOR_UNAVAILABLE` until the agent executor exists, so publishing
-/// such a process would only promise a run nothing can perform. The executor
-/// change removes this function and its call.
-fn refuse_agent_steps_until_runnable(
-    model: &tentaflow_protocol::processes::ProcessModel,
-) -> Result<(), ProtocolError> {
-    let has_agent_step = crate::processes::model::all_nodes(model)
-        .into_iter()
-        .any(|node| {
-            matches!(
-                &node.kind,
-                ProcessNodeKind::ServiceTask {
-                    implementation: ServiceImplementation::Agent { .. },
-                    ..
-                }
-            )
-        });
-    if has_agent_step {
-        return Err(ProtocolError::bad_request(
-            "agent steps are not runnable yet",
-        ));
-    }
-    Ok(())
 }
 
 /// Mints the server-side pin of every Service task for publication. This is the
@@ -494,7 +504,6 @@ pub fn process_dispatch(
             let (definition, _) =
                 repository::get_definition(pool, &actor, definition_id).map_err(error)?;
             crate::processes::model::validate_model(&definition.model).map_err(error)?;
-            refuse_agent_steps_until_runnable(&definition.model)?;
             let snapshots = pin_service_snapshots(dispatcher(ctx)?, &actor, &definition.model)?;
             let (definition, version) = repository::publish_definition(
                 pool,
@@ -1340,38 +1349,66 @@ mod tests {
         );
     }
 
+    fn seed_option_agent(state: &Arc<AppState>, id: &str, name: &str, enabled: bool, runtime_json: &str) {
+        crate::db::repository::upsert_agent(
+            &state.db,
+            &crate::db::models::AgentParams {
+                runtime_json,
+                id,
+                name,
+                display_name: None,
+                description: "Reviews a case",
+                system_prompt: None,
+                model: None,
+                tools_json: "[]",
+                skills_json: "{}",
+                params_json: "{}",
+                max_iterations: 8,
+                timeout_secs: 600,
+                max_subagents: 0,
+                max_spawn_depth: 1,
+                flow_id: None,
+                routable: false,
+                is_enabled: enabled,
+                on_child_complete: "notify",
+                allowed_agents_json: None,
+                actor_user_id: None,
+            },
+        )
+        .expect("seed agent");
+    }
+
     #[tokio::test]
-    async fn publication_refuses_an_agent_step_until_something_can_run_it() {
+    async fn an_agent_step_publishes_and_the_options_offer_only_runnable_agents() {
         let state = AppState::for_test();
         let actor = test_support::actor(&state.db, "agent-step-owner");
         let ctx = context(&state, &actor);
+        let agent_id = "11111111-2222-4333-8444-555555555555";
+        seed_option_agent(&state, agent_id, "reviewer", true, crate::agents::LLM_RUNTIME_JSON);
+        seed_option_agent(
+            &state,
+            "11111111-2222-4333-8444-666666666666",
+            "sleeper",
+            false,
+            crate::agents::LLM_RUNTIME_JSON,
+        );
         let model = crate::processes::agent_sink_tests::agent_model(
-            crate::processes::agent_sink_tests::agent_implementation(
-                "11111111-2222-4333-8444-555555555555",
-                &[],
-                None,
-            ),
+            crate::processes::agent_sink_tests::agent_implementation(agent_id, &[], None),
         );
-        let definition = save(&ctx, model).await;
-        let error = refused(
-            &ctx,
-            P::DefinitionPublishRequest {
-                command_id: uuid::Uuid::new_v4().to_string(),
-                definition_id: definition.definition_id.clone(),
-                expected_revision: definition.draft_revision,
-                repin_calendar: None,
-            },
-        )
-        .await;
-        assert_eq!(error.code, ProtocolErrorCode::BadRequest);
-        assert!(
-            error.message.contains("agent steps are not runnable yet"),
-            "{}",
-            error.message
-        );
-        let (stored, _) =
-            repository::get_definition(&state.db, &actor, &definition.definition_id).unwrap();
-        assert_eq!(stored.published_version, None);
+        let published = save_and_publish(&ctx, model).await;
+        assert_eq!(published.published_version, Some(1));
+
+        let P::OptionsResponse { service_agents, .. } =
+            request(&ctx, P::OptionsRequest {}).await
+        else {
+            panic!("options expected")
+        };
+        let listed: Vec<_> = service_agents
+            .iter()
+            .map(|agent| (agent.agent_id.as_str(), agent.name.as_str(), agent.max_iterations))
+            .collect();
+        assert!(listed.contains(&(agent_id, "reviewer", 8)), "{listed:?}");
+        assert!(listed.iter().all(|(id, ..)| !id.ends_with("666666666666")), "{listed:?}");
     }
 
     async fn save_and_publish(
@@ -2074,6 +2111,7 @@ mod tests {
                     service_flows: vec![],
                     service_blocks: vec![],
                     service_tools: vec![],
+                    service_agents: vec![],
                 }),
                 &ctx
             )

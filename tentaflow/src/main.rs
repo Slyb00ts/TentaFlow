@@ -871,6 +871,7 @@ async fn run_server(args: Args) -> Result<()> {
                 tentaflow_core::flow_engine::progress_broker::global_broker(),
             ));
         let run_manager = tentaflow_core::agents::agent_run_manager_init_global(run_manager);
+        dispatcher.set_process_agent_runs(run_manager.clone());
 
         // Harness §3.6 phase 4b: the subagent reactor turns child-completion
         // events into reactive flow runs (flows whose entry is

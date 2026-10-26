@@ -32,9 +32,28 @@ pub struct AgentPin {
     pub graph_sha256: String,
 }
 
+/// The agent as a step can run it today: it exists, is enabled and runs on a
+/// model (a CLI engine has no way to call the completion tool). This is the
+/// whole of what a step needs from a registry that may change after
+/// publication, because a process uses the agent's current version.
+pub fn runnable_agent(conn: &Connection, agent_id: &str) -> Result<DbAgent, AgentPinError> {
+    let agent = repository::get_agent_on(conn, agent_id)
+        .map_err(|_| AgentPinError::Unavailable)?
+        .ok_or_else(|| AgentPinError::Refused("the agent does not exist".into()))?;
+    if !agent.is_enabled {
+        return Err(AgentPinError::Refused("the agent is disabled".into()));
+    }
+    match AgentRuntime::parse(&agent.runtime_json) {
+        Ok(AgentRuntime::Llm) => Ok(agent),
+        Ok(AgentRuntime::Cli(_)) => Err(AgentPinError::Refused(
+            "an agent that runs on a CLI engine cannot be a process step".into(),
+        )),
+        Err(_) => Err(AgentPinError::Unavailable),
+    }
+}
+
 /// Checks that `agent_id` can be a process step with this tool list and
-/// iteration budget: it exists, is enabled and runs on a model (a CLI engine
-/// has no way to call the completion tool), the step's tools are a subset of
+/// iteration budget: it is [`runnable_agent`], the step's tools are a subset of
 /// the agent's own, and the step does not ask for more iterations than the
 /// agent allows.
 pub fn check_agent(
@@ -43,21 +62,7 @@ pub fn check_agent(
     allowed_tools: &[String],
     max_iterations: u32,
 ) -> Result<DbAgent, AgentPinError> {
-    let agent = repository::get_agent_on(conn, agent_id)
-        .map_err(|_| AgentPinError::Unavailable)?
-        .ok_or_else(|| AgentPinError::Refused("the agent does not exist".into()))?;
-    if !agent.is_enabled {
-        return Err(AgentPinError::Refused("the agent is disabled".into()));
-    }
-    match AgentRuntime::parse(&agent.runtime_json) {
-        Ok(AgentRuntime::Llm) => {}
-        Ok(AgentRuntime::Cli(_)) => {
-            return Err(AgentPinError::Refused(
-                "an agent that runs on a CLI engine cannot be a process step".into(),
-            ))
-        }
-        Err(_) => return Err(AgentPinError::Unavailable),
-    }
+    let agent = runnable_agent(conn, agent_id)?;
     if let Some(tool) = allowed_tools
         .iter()
         .find(|tool| !allowlist_admits_entry(&agent.tools_json, tool))

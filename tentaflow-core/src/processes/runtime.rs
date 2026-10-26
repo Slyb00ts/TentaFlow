@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -8294,6 +8295,29 @@ pub(crate) fn claim_admission(
     }
 }
 
+/// Jobs a worker runs at once, per slot class. An agent step holds its slot for
+/// as long as the agent works (up to an hour), so agents are counted apart from
+/// the quick flow, block and tool tasks: neither class can use up the other's
+/// slots.
+const GENERAL_JOB_SLOTS: usize = 4;
+const AGENT_JOB_SLOTS: usize = 4;
+
+/// One taken agent slot; the count falls when the job's task ends, however it ends.
+struct AgentSlot(Arc<AtomicUsize>);
+
+impl AgentSlot {
+    fn take(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(count.clone())
+    }
+}
+
+impl Drop for AgentSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// How often the worker re-examines observed tool results whose authority was
 /// undecided at recovery.
 const DEFERRED_RECOVERY_EVERY: Duration = Duration::from_secs(5);
@@ -8393,6 +8417,7 @@ impl ProcessRuntime {
         let mut send_cursor = super::messages::SendCursor::default();
         let mut last_deferred_recovery = tokio::time::Instant::now();
         let mut deferred_pass: Option<tokio::task::JoinHandle<()>> = None;
+        let agent_jobs = Arc::new(AtomicUsize::new(0));
         loop {
             if self.stop.is_cancelled() {
                 break;
@@ -8433,7 +8458,14 @@ impl ProcessRuntime {
                 &self.db, &mut send_cursor, chrono::Utc::now().timestamp_millis()) {
                 tracing::error!(error = %error, "pending Send page scan failed");
             }
-            while jobs.len() < 4 && !self.stop.is_cancelled() {
+            loop {
+                let slots = super::repository::ClaimSlots {
+                    general: jobs.len().saturating_sub(agent_jobs.load(Ordering::Acquire)) < GENERAL_JOB_SLOTS,
+                    agents: agent_jobs.load(Ordering::Acquire) < AGENT_JOB_SLOTS,
+                };
+                if !(slots.general || slots.agents) || self.stop.is_cancelled() {
+                    break;
+                }
                 let Some(dispatcher) = self.dispatcher.upgrade() else {
                     self.stop.cancel();
                     break;
@@ -8442,6 +8474,7 @@ impl ProcessRuntime {
                     &self.db,
                     &self.worker_id,
                     chrono::Utc::now().timestamp_millis(),
+                    slots,
                     &claim_admission(&dispatcher),
                 ) {
                     Ok(Some(claimed)) => claimed,
@@ -8463,9 +8496,12 @@ impl ProcessRuntime {
                     },
                 );
                 let worker = self.clone();
+                let agent_slot = super::jobs::is_agent_job(&claimed)
+                    .then(|| AgentSlot::take(&agent_jobs));
                 jobs.spawn(async move {
                     use futures::FutureExt;
 
+                    let _agent_slot = agent_slot;
                     let attempt = claimed.job.attempt;
                     let fence = claimed.job.fence;
                     let result = std::panic::AssertUnwindSafe(super::jobs::execute_claimed(
