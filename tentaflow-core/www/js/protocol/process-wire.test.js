@@ -1050,8 +1050,10 @@ test('process options decode the block and tool catalogues and tolerate a server
     service_flows: [{ flow_id: 'f1', name: 'Checker', description: 'Checks a contract' }],
     service_blocks: [{ node_type: 'llm', label: 'Language model (LLM)', description: 'Generates text', category: 'service', required_settings: ['model'] }],
     service_tools: [{ addon_id: 'notes-1', tool_name: 'search', description: 'Searches notes', addon_name: 'Notes' }],
+    service_agents: [{ agent_id: 'agent-1', name: 'Reviewer', description: 'Reviews a case', max_iterations: 8 }],
   });
   assert.equal(full.variant, 'ProcessOptionsResponse');
+  assert.deepEqual(full.serviceAgents, [{ agentId: 'agent-1', name: 'Reviewer', description: 'Reviews a case', maxIterations: 8 }]);
   assert.deepEqual(full.serviceBlocks, [{ nodeType: 'llm', label: 'Language model (LLM)', description: 'Generates text', category: 'service', requiredSettings: ['model'] }]);
   const noSettings = decode({ assignees: [], service_flows: [], service_blocks: [{ node_type: 'pii_filter', label: 'Filter', description: 'd', category: 'filter' }] });
   assert.deepEqual(noSettings.serviceBlocks[0].requiredSettings, [], 'a server that omits the list means the block needs nothing');
@@ -1062,6 +1064,7 @@ test('process options decode the block and tool catalogues and tolerate a server
   assert.deepEqual(old.serviceBlocks, []);
   assert.equal(decode({ assignees: [], service_flows: [{ flow_id: 'f1', name: 'Checker' }] }).serviceFlows[0].description, '');
   assert.deepEqual(old.serviceTools, []);
+  assert.deepEqual(old.serviceAgents, [], 'a server that omits the agents offers none');
   const olderTool = decode({ assignees: [], service_flows: [], service_tools: [{ addon_id: 'notes-1', tool_name: 'search', description: 'd' }] });
   assert.equal(olderTool.serviceTools[0].addonName, '');
 });

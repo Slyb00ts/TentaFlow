@@ -73,6 +73,11 @@ function watchToasts() {
 }
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; };
 const options = { assignees: [{ userId: 'anna', displayName: 'Anna Kowalska' }, { userId: 'lee', displayName: 'Lee Chen' }], serviceFlows: [{ flowId: 'flow-one', name: 'Contract checker' }] };
+// The agents the server offers as steps.
+const serviceAgents = [
+  { agentId: 'agent-1', name: 'Reviewer', description: 'Reviews a case', maxIterations: 8 },
+  { agentId: 'agent-2', name: 'Writer', description: '', maxIterations: 3 },
+];
 // The server's allow-list; the inspector offers exactly these block types.
 const serviceBlocks = [
   { nodeType: 'llm', label: 'Language model (LLM)', description: 'Generates text', category: 'service', requiredSettings: ['model'] },
@@ -107,13 +112,13 @@ async function mount(current, additions = {}) {
 }
 function canvas(model = emptyProcessModel()) {
   const root = document.createElement('div'); document.body.append(root);
-  const graph = new FlowCanvas(root, { mode: 'bpmn', processOptions: { ...options, serviceBlocks } });
+  const graph = new FlowCanvas(root, { mode: 'bpmn', processOptions: { ...options, serviceBlocks, serviceAgents } });
   graph.setTemplates(processTemplates()); graph.setData(model);
   return graph;
 }
 function inspector(graph, readOnly = false) {
   const root = document.createElement('aside'); document.body.append(root);
-  return new FlowConfig(root, { mode: 'bpmn', readOnly, processOptions: { ...options, serviceBlocks }, getCanvas: () => graph,
+  return new FlowConfig(root, { mode: 'bpmn', readOnly, processOptions: { ...options, serviceBlocks, serviceAgents }, getCanvas: () => graph,
     onConfigChange: (id, value) => graph.updateNodeConfig(id, value), onEdgeChange: (id, value) => graph.updateEdge(id, value),
     onLabelChange: (id, value) => graph.updateNodeLabel(id, value), onDelete: (id) => graph.removeNodes([id]), onDuplicate: (id) => graph.duplicateNodes([id]) });
 }
@@ -2853,7 +2858,7 @@ test('canvas marks the kind of a Service task and an LLM block without a model',
   graph.destroy(); config.destroy();
 });
 
-test('an agent step is shown as an agent and the implementation control cannot replace its settings', async () => {
+test('an agent step is edited in the inspector, and every other control leaves its settings alone', async () => {
   const graph = canvas();
   const stored = { agentId: 'agent-1', goalExpression: '"Summarise"', allowedTools: ['core.skill_view'], maxIterations: 5 };
   graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.node_type === 'bpmn_service_task'), preset: { implementation: { Agent: structuredClone(stored) } } }, 300, 300);
@@ -2865,16 +2870,68 @@ test('an agent step is shown as an agent and the implementation control cannot r
 
   const config = inspector(graph); config.show(agent, graph.templates.get(agent.type));
   await flush(2);
-  const select = config.root.querySelector('[data-process="implementation"]');
-  assert.equal(select.getAttribute('value'), 'agent', 'not shown as a Flow task');
-  assert.equal(select.hasAttribute('disabled'), true);
-  assert.match(config.root.querySelector('[data-agent-summary]').textContent, /agent-1/);
-  assert.equal(config.root.querySelector('[data-process="flowId"]'), null);
+  const control = (key) => config.root.querySelector(`[data-process="${key}"]`);
+  const stepAgent = () => agent.config.implementation.Agent;
+  assert.equal(control('implementation').getAttribute('value'), 'agent', 'not shown as a Flow task');
+  assert.equal(control('implementation').hasAttribute('disabled'), false);
+  assert.equal(control('agentId').getAttribute('value'), 'agent-1');
+  assert.equal(control('agentGoal').getAttribute('value'), '"Summarise"');
+  assert.equal(control('agentTools').getAttribute('value'), 'core.skill_view');
+  assert.equal(control('agentIterations').getAttribute('value'), '5');
+  assert.equal(control('agentIterations').getAttribute('max'), '8', 'no more than the agent allows');
+  assert.equal(control('flowId'), null);
+  assert.equal(control('resultExpression'), null, 'an agent has no result rule');
+  assert.equal(config.root.querySelector('[data-agent-result]').textContent, I18n.t('bpmn.agent_result_hint'));
+  assert.equal(control('timeoutSeconds').getAttribute('max'), '3600');
 
-  for (const choice of ['flow', 'tool', 'block']) change(select, choice);
-  assert.deepEqual(agent.config.implementation.Agent, stored, 'the stored settings are kept');
-  assert.equal(processServiceKind(agent.config), 'agent');
+  change(control('agentGoal'), '"Check the clauses"');
+  change(control('agentTools'), 'core.skill_view\n memory.*\n\ncore.skill_view');
+  change(control('agentIterations'), '7');
+  assert.deepEqual(stepAgent(), { agentId: 'agent-1', goalExpression: '"Check the clauses"', allowedTools: ['core.skill_view', 'memory.*'], maxIterations: 7 });
+
+  change(control('agentSchema'), '{"type":"object"}');
+  assert.deepEqual(stepAgent().outputSchema, { type: 'object' });
+  change(control('agentSchema'), '{broken');
+  assert.equal(control('agentSchema').getAttribute('error'), I18n.t('bpmn.agent_output_schema_invalid'));
+  assert.deepEqual(stepAgent().outputSchema, { type: 'object' }, 'an unreadable schema is not saved');
+  change(control('agentSchema'), '');
+  assert.equal(stepAgent().outputSchema, null);
+
+  change(control('agentId'), 'agent-2');
+  assert.equal(stepAgent().agentId, 'agent-2');
+  assert.equal(stepAgent().maxIterations, 3, 'the budget follows the smaller limit of the new agent');
+
+  const saved = graph.getData().nodes.find((node) => node.id === agent.id).kind.ServiceTask;
+  assert.equal(saved.implementation.Agent.agentId, 'agent-2');
+
+  await flush(2);
+  change(control('implementation'), 'flow');
+  assert.equal(processServiceKind(agent.config), 'flow', 'the author may replace the agent on purpose');
+  await flush(2);
+  assert.equal(control('timeoutSeconds').getAttribute('max'), '600');
+  change(control('implementation'), 'agent');
+  assert.equal(stepAgent().agentId, 'agent-1');
+  assert.equal(JSON.parse(stepAgent().goalExpression), I18n.t('bpmn.agent_goal_default'));
+  assert.equal(agent.config.timeoutSeconds, 600);
   graph.destroy(); config.destroy();
+});
+
+test('an agent step can catch error and escalation events without a result rule', async () => {
+  const graph = canvas();
+  graph.addNodeFromTemplate(processTemplates(tentaflowOptions).find((row) => row.label === 'Reviewer'), 300, 300);
+  const agent = graph.nodes.at(-1);
+  const routing = processResultRouting(graph, agent.id);
+  assert.equal(routing.hasResult, true);
+  assert.equal(routing.add.errorReason, null);
+  assert.equal(routing.add.escalationReason, null);
+  assert.ok(routing.rows.some((row) => row.outcome === 'error' && row.route !== 'unavailable'));
+  assert.ok(processBoundaryHosts(graph, 'BoundaryEscalation').some((host) => host.id === agent.id));
+  const plain = processTemplates().find((row) => row.node_type === 'bpmn_service_task');
+  graph.addNodeFromTemplate(plain, 600, 300);
+  const task = graph.nodes.at(-1);
+  assert.equal(processResultRouting(graph, task.id).hasResult, false, 'a Flow task still needs its rule');
+  assert.ok(!processBoundaryHosts(graph, 'BoundaryEscalation').some((host) => host.id === task.id));
+  graph.destroy();
 });
 
 test('a new Call activity says it needs an exact version instead of failing at save', async () => {
@@ -5807,28 +5864,29 @@ const tentaflowOptions = {
     { nodeType: 'llm', label: 'Language model (LLM)', description: 'Generates text', category: 'service', requiredSettings: ['model'] },
     { nodeType: 'pii_filter', label: 'Personal data filter', description: 'Masks personal data', category: 'filter', requiredSettings: [] },
   ],
+  serviceAgents: [serviceAgents[0]],
   serviceTools: [
     { addonId: 'notes-1a2b3c4d', toolName: 'search', description: 'Searches notes', addonName: 'Notes <b>A</b>' },
     { addonId: 'notes-5e6f7a8b', toolName: 'search', description: 'Searches notes', addonName: 'Notes B' },
   ],
 };
 
-test('TentaFlow palette group lists flows, blocks and addon tools as ready-made Service tasks', async () => {
+test('TentaFlow palette group lists flows, blocks, agents and addon tools as ready-made Service tasks', async () => {
   const templates = processTemplates(tentaflowOptions);
   assert.equal(processTemplates().length, 29);
-  assert.equal(templates.length, 29 + 1 + 2 + 2);
+  assert.equal(templates.length, 29 + 1 + 2 + 1 + 2);
   const dynamic = templates.filter((row) => row.category === 'tentaflow');
-  assert.deepEqual(dynamic.map((row) => row.subgroup), ['flows', 'blocks', 'blocks', 'tools', 'tools']);
+  assert.deepEqual(dynamic.map((row) => row.subgroup), ['flows', 'blocks', 'blocks', 'agents', 'tools', 'tools']);
   assert.ok(dynamic.every((row) => row.node_type === 'bpmn_service_task' && row.preset));
-  assert.deepEqual(dynamic.map((row) => row.label), ['Contract checker', 'Language model (LLM)', 'Personal data filter', 'Notes <b>A</b> › search', 'Notes B › search']);
+  assert.deepEqual(dynamic.map((row) => row.label), ['Contract checker', 'Language model (LLM)', 'Personal data filter', 'Reviewer', 'Notes <b>A</b> › search', 'Notes B › search']);
 
   const root = document.createElement('aside'); document.body.append(root);
   const palette = new FlowPalette(root, { mode: 'bpmn', processOptions: tentaflowOptions }); await palette.init();
   const group = root.querySelector('[data-cat="tentaflow"]');
   assert.ok(group);
-  assert.deepEqual([...group.querySelectorAll('[data-subgroup]')].map((row) => row.dataset.subgroup), ['flows', 'blocks', 'tools']);
-  assert.equal(group.querySelectorAll('[data-node-type="bpmn_service_task"]').length, 5);
-  assert.equal(root.querySelectorAll('[data-node-type="bpmn_service_task"]').length, 6);
+  assert.deepEqual([...group.querySelectorAll('[data-subgroup]')].map((row) => row.dataset.subgroup), ['flows', 'blocks', 'agents', 'tools']);
+  assert.equal(group.querySelectorAll('[data-node-type="bpmn_service_task"]').length, 6);
+  assert.equal(root.querySelectorAll('[data-node-type="bpmn_service_task"]').length, 7);
   const toolRows = [...group.querySelectorAll('.fb-node-item')].slice(-2);
   assert.deepEqual(toolRows.map((row) => row.querySelector('.fb-node-name').textContent), ['search', 'search']);
   assert.deepEqual(toolRows.map((row) => row.querySelector('.fb-node-desc').textContent), ['Notes <b>A</b>', 'Notes B']);
@@ -5845,9 +5903,9 @@ test('TentaFlow palette group is absent without options and explains an empty ca
   first.destroy();
 
   const empty = document.createElement('aside'); document.body.append(empty);
-  const second = new FlowPalette(empty, { mode: 'bpmn', processOptions: { ...options, serviceFlows: [], serviceBlocks: [], serviceTools: [] } });
+  const second = new FlowPalette(empty, { mode: 'bpmn', processOptions: { ...options, serviceFlows: [], serviceBlocks: [], serviceAgents: [], serviceTools: [] } });
   await second.init();
-  assert.equal(empty.querySelectorAll('[data-cat="tentaflow"] .fb-palette-note').length, 3);
+  assert.equal(empty.querySelectorAll('[data-cat="tentaflow"] .fb-palette-note').length, 4);
   second.destroy();
 });
 
@@ -5858,8 +5916,9 @@ test('dropping a TentaFlow entry creates a configured, named Service task withou
   graph.addNodeFromTemplate(find('Language model (LLM)'), 200, 300);
   graph.addNodeFromTemplate(find('Personal data filter'), 200, 500);
   graph.addNodeFromTemplate(find('Notes B › search'), 200, 700);
+  graph.addNodeFromTemplate(find('Reviewer'), 400, 100);
   graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 600, 100);
-  const [flow, llm, pii, tool, plain] = graph.nodes.slice(-5);
+  const [flow, llm, pii, tool, agent, plain] = graph.nodes.slice(-6);
   assert.equal(flow.label, 'Contract checker');
   assert.equal(flow.config.flowId, 'flow-one');
   assert.equal(flow.config.implementation, undefined);
@@ -5868,13 +5927,22 @@ test('dropping a TentaFlow entry creates a configured, named Service task withou
   assert.equal(tool.label, 'Notes B › search');
   assert.deepEqual(tool.config.implementation, { AddonTool: { addonId: 'notes-5e6f7a8b', toolName: 'search' } });
   assert.equal(tool.config.verification, 'Human');
+  assert.equal(agent.label, 'Reviewer');
+  assert.equal(processServiceKind(agent.config), 'agent');
+  assert.equal(agent.config.implementation.Agent.agentId, 'agent-1');
+  assert.deepEqual(agent.config.implementation.Agent.allowedTools, []);
+  assert.equal(agent.config.implementation.Agent.maxIterations, 8, 'no more than the agent allows, and no more than ten to start with');
+  assert.equal(JSON.parse(agent.config.implementation.Agent.goalExpression), I18n.t('bpmn.agent_goal_default'));
+  assert.equal(agent.config.timeoutSeconds, 600);
+  assert.equal(agent.config.resultExpression, null);
   assert.equal(plain.label, '');
   assert.equal(plain.config.flowId, '');
   assert.equal(plain.config.implementation, undefined);
   assert.equal(graph.templates.get('bpmn_service_task').preset, undefined);
   const saved = graph.getData();
   const kinds = saved.nodes.filter((node) => node.kind.ServiceTask).map((node) => [node.name, node.kind.ServiceTask.implementation]);
-  assert.deepEqual(kinds.slice(-5).map(([name]) => name), ['Contract checker', 'Language model (LLM)', 'Personal data filter', 'Notes B › search', '']);
+  assert.deepEqual(kinds.slice(-6).map(([name]) => name), ['Contract checker', 'Language model (LLM)', 'Personal data filter', 'Notes B › search', 'Reviewer', '']);
+  assert.equal(kinds.at(-2)[1].Agent.agentId, 'agent-1');
   graph.destroy();
 });
 

@@ -14,7 +14,7 @@ import { processTemplates } from './bpmn.js';
 import '/js/components/tf-searchbox.js';
 import '/js/components/tf-button.js';
 
-const TENTAFLOW_SUBGROUPS = ['flows', 'blocks', 'tools'];
+const TENTAFLOW_SUBGROUPS = ['flows', 'blocks', 'agents', 'tools'];
 const CATEGORY_ORDER = ['trigger', 'service', 'memory', 'transform', 'logic', 'filter', 'output', 'other'];
 
 function categoryLabel(cat) {

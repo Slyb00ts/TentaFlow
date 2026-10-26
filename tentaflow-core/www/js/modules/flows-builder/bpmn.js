@@ -163,6 +163,8 @@ function tentaflowTemplates(options) {
   // palette and on the task dropped from it.
   const flows = options.serviceFlows || [];
   const flowNames = processDistinctLabels(flows.map((flow) => [flow.flowId, boundedNodeName(flow.name)]));
+  const agents = options.serviceAgents || [];
+  const agentNames = processDistinctLabels(agents.map((agent) => [agent.agentId, boundedNodeName(agent.name)]));
   return [
     ...flows.map((flow) =>
       entry('flows', 'flow', flowNames.get(flow.flowId), flow.description || I18n.t('bpmn.palette_flow_hint'),
@@ -172,11 +174,39 @@ function tentaflowTemplates(options) {
     localized(`bpmn.block_${block.nodeType}`, block.label),
     localized(`bpmn.block_${block.nodeType}_hint`, block.description),
     { implementation: { Block: { nodeType: block.nodeType, config: processBlockTemplate(block) } } })),
+    ...agents.map((agent) => entry('agents', 'bot', agentNames.get(agent.agentId),
+      agent.description || I18n.t('bpmn.palette_agent_hint'), processAgentPreset(agent))),
     ...tools.map((tool) => entry('tools', 'puzzle',
       toolLabel(tool, labelCounts.get(toolLabel(tool, false)) > 1),
       tool.description || tool.addonId,
       { implementation: { AddonTool: { addonId: tool.addonId, toolName: tool.toolName } } }, toolRow(tool))),
   ];
+}
+
+// Longest an agent step may work: its time limit starts at ten minutes, the
+// model allows an hour.
+export const AGENT_STEP_MAX_SECONDS = 3600;
+const AGENT_STEP_DEFAULT_SECONDS = 600;
+const AGENT_STEP_DEFAULT_ITERATIONS = 10;
+
+/**
+ * The configuration of a new Service task that runs `agent`: a goal to be
+ * written, no extra tools, and no more iterations than the agent allows. The goal
+ * is a rule, so the prefilled text is a quoted sentence the author replaces.
+ */
+export function processAgentPreset(agent) {
+  return {
+    flowId: '',
+    resultExpression: null,
+    timeoutSeconds: AGENT_STEP_DEFAULT_SECONDS,
+    implementation: { Agent: {
+      agentId: agent.agentId,
+      goalExpression: JSON.stringify(I18n.t('bpmn.agent_goal_default')),
+      allowedTools: [],
+      maxIterations: Math.max(1, Math.min(agent.maxIterations || AGENT_STEP_DEFAULT_ITERATIONS, AGENT_STEP_DEFAULT_ITERATIONS)),
+      outputSchema: null,
+    } },
+  };
 }
 
 export function processTemplates(options) {
@@ -669,7 +699,8 @@ export function processRowFor(routing, outcome, code = null) {
  * processes/runtime.rs (plan_job_result, error_handler) and processes/jobs.rs
  * (classify_result, fail_claim, report_denied_tool). The shared fixture
  * tests/fixtures/process_result_routing.json pins every row against both sides:
- * - only a Contract result (a non-empty `resultExpression`) can be Error,
+ * - only a Contract result (a non-empty `resultExpression`, or the report of an
+ *   agent step, which has no result rule) can be Error,
  *   NeedsHuman or Cancelled; a platform failure (flow, tool or expression
  *   error) is always an incident and no boundary event catches it. The one
  *   platform result that is NOT an incident is a denied addon tool permission:
@@ -694,10 +725,12 @@ export function processResultRouting(graph, nodeId) {
   if (!node || node.type !== 'bpmn_service_task') return null;
   const model = graph.processModel || {};
   const config = node.config || {};
-  const hasResult = typeof config.resultExpression === 'string' && config.resultExpression.length > 0;
+  const serviceKind = processServiceKind(config);
+  // An agent has no result rule: the report it sends is its Contract result.
+  const hasResult = serviceKind === 'agent'
+    || (typeof config.resultExpression === 'string' && config.resultExpression.length > 0);
   const nested = (graph.processPath || []).length > 0;
   const repeated = node.repeat != null;
-  const serviceKind = processServiceKind(config);
   const byId = new Map(graph.nodes.map((candidate) => [candidate.id, candidate]));
   const targetsOf = (id) => graph.edges.filter((edge) => edge.from_node === id)
     .map((edge) => byId.get(edge.to_node)).filter(Boolean)
@@ -856,7 +889,8 @@ export function processBoundaryHosts(graph, kind) {
     || (timerOrMessage
       && ['bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task', 'bpmn_script_task'].includes(candidate.type)))
     && (kind !== 'BoundaryError' || candidate.type !== 'bpmn_user_task')
-    && (kind !== 'BoundaryEscalation' || (candidate.type === 'bpmn_service_task' && !!candidate.config.resultExpression))
+    && (kind !== 'BoundaryEscalation' || (candidate.type === 'bpmn_service_task'
+      && (!!candidate.config.resultExpression || processServiceKind(candidate.config) === 'agent')))
     && !(candidate.type === 'bpmn_receive_task' && graph.edges.some((edge) =>
       edge.to_node === candidate.id && graph.nodes.some((source) =>
         source.id === edge.from_node && source.type === 'bpmn_event_based_gateway'))));

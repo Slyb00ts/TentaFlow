@@ -65,7 +65,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   LLM są wyłączone (jedna próba), `stop` ma najwyżej 4 napisy, a
   `reasoning_effort` jest jedną z wartości `low`, `medium`, `high`, `xhigh`, `max`.
 - Zadanie usługi może być krokiem agenta (B3.4a, ujście i wiązanie; wykonawca
-  dojdzie w B3.4b): `implementation` dostaje wariant `Agent { agent_id,
+  opisuje następny punkt): `implementation` dostaje wariant `Agent { agent_id,
   goal_expression, allowed_tools, max_iterations, output_schema }`, limit czasu
   takiego zadania to 1..=3600 s, a jego wynik pochodzi ze zgłoszenia agenta, nie
   z `result_expression` (model go odrzuca). Agent kończy krok narzędziem
@@ -95,19 +95,44 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   Blok grafu `spawn` przechodzi to samo sito co `core.agent_spawn`.
   Poza krokiem procesu ujście nie jest oferowane ani wybieralne w edytorze agenta.
   Zawężenie czyta wiązanie z metadanych, więc blok grafu uprawniony do zapisu
-  metadanych może je usunąć; do B3.4b wykonawca musi przypiąć graf harnessu.
+  metadanych może je usunąć; dlatego wykonawca (B3.4b) przypina graf harnessu.
   Publikacja wymaga agenta włączonego,
   z runtime `llm` (agent `cli` jest odrzucany), `allowed_tools` zawartych w jego
-  narzędziach i `max_iterations` nie większego niż agenta. Do czasu B3.4b publikacja procesu
-  z krokiem agenta jest odrzucana („agent steps are not runnable yet”), a zadanie
-  agenta uruchomione przez silnik (np. ze starszej wersji) kończy się
-  `AGENT_EXECUTOR_UNAVAILABLE` przed granicą wysyłki; projektant pokazuje taki krok
-  jako agenta, nie edytuje jego ustawień, a zapis procesu zachowuje je bez zmian
-  (kodek przesyła krok agenta dokładnie tak, jak go odczytał, w tym schemat wyjścia
-  z kluczami autora). Eksport XML: `implementation="agent" agentId maxIterations`
+  narzędziach i `max_iterations` nie większego niż agenta. Kodek zapisu przesyła
+  krok agenta dokładnie tak, jak go odczytał, w tym schemat wyjścia
+  z kluczami autora. Eksport XML: `implementation="agent" agentId maxIterations`
   z `<tentaflow:agentConfig>`. Migracja 203 przebudowuje CHECK kolumny
   `implementation_kind` (dozwolone `flow`, `addon_tool`, `block`, `agent`, każde
   tylko z własnym prefiksem referencji) i tworzy `bpmn_agent_completions`.
+- Krok agenta jest wykonywany i można go publikować (B3.4b). Wykonawca
+  (`processes/agent_exec.rs`) sprawdza agenta i inicjatora przed granicą wysyłki,
+  przypina wersję grafu harnessu (zapisana wersja przepływu równa grafowi z chwili
+  startu kroku, więc późniejsza edycja nie zmieni trwającego przebiegu), a po
+  granicy tworzy przebieg przez `spawn_with_run_id` z identyfikatorem wyprowadzonym
+  z wywołania, bez rodzica, pod zasadą z korelacją równą wywołaniu i z wiązaniem w
+  metadanych. Cel to wynik `goal_expression`; wejście aktywności dochodzi jako
+  ogrodzone DANE, których znacznik końca jest w nich zneutralizowany. Budżet
+  iteracji kroku może tylko obniżyć budżet agenta. Wynikiem kroku jest wiersz
+  w `bpmn_agent_completions` (nigdy ostatnia wiadomość), czytany po zakończeniu
+  przebiegu, i ma pochodzenie `Contract`: błąd i eskalacja zgłoszone przez agenta
+  uruchamiają zdarzenia brzegowe bez `result_expression`, a przyjęcie wyniku agenta
+  wymaga, by był dokładnie zapisanym zgłoszeniem. Przebieg zakończony bez
+  zgłoszenia, anulowany albo z wyczerpanym budżetem to incydent
+  (`EXTERNAL_OUTCOME_UNCERTAIN`, powód `AGENT_NO_RESULT`), nigdy sukces; porzucenie
+  kroku (limit czasu, anulowanie, utrata dzierżawy) anuluje przebieg. Bez menedżera
+  przebiegów krok czeka (`AGENT_UNAVAILABLE`, ten sam ograniczony czas co zajęte
+  narzędzie). Po restarcie zgłoszenie zapisane przed zatrzymaniem jest przyjmowane
+  jako zaobserwowany wynik `Contract` bez ponownego uruchamiania agenta;
+  przebieg bez zgłoszenia zostaje przy ścieżce `INTERRUPTED`. Zadania agentów mają
+  własną klasę slotów (4 sloty agentów obok 4 ogólnych) także w zapytaniu o
+  kandydatów, więc pełny zestaw długich przebiegów nie głodzi szybkich zadań, a
+  nadmiar zadań agentów nie wypełnia okna kandydatów. Publikacja procesu z krokiem
+  agenta jest otwarta (usunięto `refuse_agent_steps_until_runnable`), a model
+  dopuszcza zdarzenie eskalacji także na kroku agenta. Projektant: czwarta
+  podgrupa palety „Agenci” (`ProcessOptionsResponse.service_agents`, dopisane z
+  `#[serde(default)]`; `SCHEMA_VERSION` zostaje 32), inspektor kroku agenta (agent,
+  cel, narzędzia, limit iteracji, schemat wyniku) bez reguły wyniku, limit czasu
+  do 3600 s i przyciski błędu oraz eskalacji dostępne bez `result_expression`.
 - Paleta projektanta BPMN ma grupę „Bloki TentaFlow” (B3.3a): przepływy, bloki
   Flow Buildera (`llm`, `embeddings`, `pii_filter`) i narzędzia addonów
   upuszcza się na płótno jako gotowe zadania usługi, z nazwą pozycji i bez pytania
@@ -117,7 +142,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   (addon działa, jest z organizacji użytkownika, użytkownik ma uprawnienie „llm”),
   a decyzja o addonie zapada raz na addon, nie raz na narzędzie. Lista narzędzi
   jest ucięta po 1000 pozycjach (stała kolejność addon, narzędzie); w inspektorze
-  nadal można wpisać dowolne narzędzie. Agenci nie są oferowani (wchodzą w B3.4).
+  nadal można wpisać dowolne narzędzie. Agenci są oferowani od B3.4b.
   Pozycja narzędzia niesie nazwę zainstalowanego addonu (`addon_name`, dopisane z
   `#[serde(default)]`), więc dwie instancje jednego pakietu nie są nieodróżnialne
   („Notes › search_notes”). Katalog pomija narzędzia z identyfikatorami, które

@@ -20,7 +20,7 @@ import '/js/components/tf-person-picker.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-alert.js';
-import { processNodeKind, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processStartEntryLabels, processItemLabels } from './bpmn.js';
+import { processNodeKind, processAgentPreset, AGENT_STEP_MAX_SECONDS, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processStartEntryLabels, processItemLabels } from './bpmn.js';
 import { openProcessCallPreview } from './process-monitor.js';
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
@@ -677,8 +677,16 @@ export class FlowConfig {
       const tool = config.implementation?.AddonTool;
       const blockTask = config.implementation?.Block;
       const agentTask = config.implementation?.Agent;
+      const agents = this.opts.processOptions.serviceAgents || [];
+      const agentLabels = processDistinctLabels(agents.map((agent) => [agent.agentId, agent.name]));
       const source = agentTask
-        ? `<p class="fb-field-hint" data-agent-summary>${escapeHtml(I18n.t('bpmn.agent_summary', { agent: agentTask.agentId }))}</p>
+        ? `<tf-select data-process="agentId" wrap-selected label="${escapeAttr(I18n.t('bpmn.agent_label'))}" value="${escapeAttr(agentTask.agentId)}" ${disabled}>${agents.map((agent) => `<option value="${escapeAttr(agent.agentId)}">${escapeHtml(agentLabels.get(agent.agentId))}</option>`).join('')}${agents.some((agent) => agent.agentId === agentTask.agentId) ? '' : `<option value="${escapeAttr(agentTask.agentId)}" disabled>${escapeHtml(I18n.t('bpmn.agent_unavailable'))}</option>`}</tf-select>
+        ${textarea('agentGoal', 'agent_goal', agentTask.goalExpression, 3)}
+        <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.agent_goal_hint'))}</p>
+        ${textarea('agentTools', 'agent_tools', agentTask.allowedTools.join('\n'), 3)}
+        <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.agent_tools_hint'))}</p>
+        ${input('agentIterations', 'agent_iterations', agentTask.maxIterations, `type="number" min="1" max="${agents.find((agent) => agent.agentId === agentTask.agentId)?.maxIterations || 100}" step="1"`)}
+        ${textarea('agentSchema', 'agent_output_schema', agentTask.outputSchema == null ? '' : JSON.stringify(agentTask.outputSchema, null, 2), 4)}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.agent_hint'))}</p>`
         : blockTask
         ? `<tf-select data-process="blockType" label="${escapeAttr(I18n.t('bpmn.block_type'))}" value="${escapeAttr(blockTask.nodeType)}" ${disabled}>${blocks.map((block) => `<option value="${escapeAttr(block.nodeType)}">${escapeHtml(processBlockLabel(block))}</option>`).join('')}${blocks.some((block) => block.nodeType === blockTask.nodeType) ? '' : `<option value="${escapeAttr(blockTask.nodeType)}" disabled>${escapeHtml(blockTask.nodeType)}</option>`}</tf-select>
@@ -694,16 +702,18 @@ export class FlowConfig {
       if (!tabs.some(([id]) => id === this.processTab)) this.processTab = 'impl';
       const panel = servicePanel = (id, html) => `<section class="fb-process-panel" role="tabpanel" id="svc-panel-${id}" aria-labelledby="${id}" data-service-panel="${id}" ${this.processTab === id ? '' : 'hidden'}>${html}</section>`;
       servicePanels = `<tf-tabs variant="bar" layout="stacked" value="${this.processTab}" data-service-tabs>${tabs.map(([id, label, icon]) => `<tf-tab id="${id}" icon="${icon}" panel="svc-panel-${id}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" title="${escapeAttr(I18n.t(`bpmn.${label}_title`))}"></tf-tab>`).join('')}</tf-tabs>`
-        + panel('impl', `${blockTask ? `<tf-alert tone="warning" data-service-warning="empty_setting" message="${escapeAttr(processWarningText(node, 'empty_setting', blocks))}" ${processNodeWarnings(node, blocks).includes('empty_setting') ? '' : 'hidden'}></tf-alert>` : ''}<tf-select data-process="implementation" label="${escapeAttr(I18n.t('bpmn.service_implementation'))}" value="${agentTask ? 'agent' : blockTask ? 'block' : tool ? 'tool' : 'flow'}" ${agentTask ? 'disabled' : disabled}>
+        + panel('impl', `${blockTask ? `<tf-alert tone="warning" data-service-warning="empty_setting" message="${escapeAttr(processWarningText(node, 'empty_setting', blocks))}" ${processNodeWarnings(node, blocks).includes('empty_setting') ? '' : 'hidden'}></tf-alert>` : ''}<tf-select data-process="implementation" label="${escapeAttr(I18n.t('bpmn.service_implementation'))}" value="${agentTask ? 'agent' : blockTask ? 'block' : tool ? 'tool' : 'flow'}" ${disabled}>
           <option value="flow">${escapeHtml(I18n.t('bpmn.implementation_flow'))}</option>
           <option value="tool">${escapeHtml(I18n.t('bpmn.implementation_tool'))}</option>
           ${blocks.length || blockTask ? `<option value="block">${escapeHtml(I18n.t('bpmn.implementation_block'))}</option>` : ''}
-          ${agentTask ? `<option value="agent">${escapeHtml(I18n.t('bpmn.implementation_agent'))}</option>` : ''}
+          ${agents.length || agentTask ? `<option value="agent">${escapeHtml(I18n.t('bpmn.implementation_agent'))}</option>` : ''}
         </tf-select>
         ${source}`)
         + panel('io', `${mapping('inputMapping', 'input_mapping')}${mapping('outputMapping', 'output_mapping')}${this._renderActivityIo(node, kind, disabled)}`)
-        + panel('result', `${textarea('resultExpression', 'result_expression', config.resultExpression || '', 4)}
-        <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.result_expression_hint'))}</p>
+        + panel('result', `${agentTask
+    ? `<p class="fb-field-hint" data-agent-result>${escapeHtml(I18n.t('bpmn.agent_result_hint'))}</p>`
+    : `${textarea('resultExpression', 'result_expression', config.resultExpression || '', 4)}
+        <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.result_expression_hint'))}</p>`}
         <tf-select data-process="verification" label="${escapeAttr(I18n.t('bpmn.verification'))}" value="${typeof config.verification === 'string' ? 'Human' : 'Condition'}" ${disabled}>
           <option value="Human">${escapeHtml(I18n.t('bpmn.verification_human'))}</option>
           <option value="Condition">${escapeHtml(I18n.t('bpmn.verification_condition'))}</option>
@@ -711,8 +721,8 @@ export class FlowConfig {
         <div data-process-condition ${typeof config.verification === 'string' ? 'hidden' : ''}>${input('expression', 'verification_expression', config.verification?.Condition?.expression)}</div>
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_hint'))}</p>
         <div data-routing-view></div>`)
-        + panel('time', `${input('timeoutSeconds', 'timeout', config.timeoutSeconds, 'type="number" min="1" max="600" step="1"')}
-        <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.timeout_hint'))}</p>`);
+        + panel('time', `${input('timeoutSeconds', 'timeout', config.timeoutSeconds, `type="number" min="1" max="${agentTask ? AGENT_STEP_MAX_SECONDS : 600}" step="1"`)}
+        <p class="fb-field-hint">${escapeHtml(I18n.t(agentTask ? 'bpmn.timeout_agent_hint' : 'bpmn.timeout_hint'))}</p>`);
       serviceRouting = routing;
     } else if (kind === 'ScriptTask') {
       fields += `${textarea('script', 'script_body', config.script, 3)}
@@ -1309,18 +1319,47 @@ export class FlowConfig {
       } else if (key === 'targetDefinitionChoice' || key === 'targetStartChoice') {
         return;
       } else if (key === 'implementation') {
-        // An agent step has no editor yet: switching would silently replace its stored settings.
-        if (node.config.implementation?.Agent) return;
         // A Flow task never carries the field on the wire; 'Flow' is how the form says "back to default".
         const firstBlock = (this.opts.processOptions.serviceBlocks || [])[0];
+        const firstAgent = (this.opts.processOptions.serviceAgents || [])[0];
         if (control.value === 'block' && !firstBlock) return;
-        this.opts.onConfigChange(node.id, control.value === 'tool'
-          ? { flowId: '', implementation: { AddonTool: { addonId: '', toolName: '' } } }
-          : control.value === 'block'
-            ? { flowId: '', implementation: { Block: { nodeType: firstBlock.nodeType, config: processBlockTemplate(firstBlock) } },
-              inputMapping: { ...node.config.inputMapping, payload: node.config.inputMapping?.payload ?? 'vars.text' } }
-            : { implementation: 'Flow' });
+        if (control.value === 'agent' && (node.config.implementation?.Agent || !firstAgent)) return;
+        const next = control.value === 'agent'
+          ? processAgentPreset(firstAgent)
+          : control.value === 'tool'
+            ? { flowId: '', implementation: { AddonTool: { addonId: '', toolName: '' } } }
+            : control.value === 'block'
+              ? { flowId: '', implementation: { Block: { nodeType: firstBlock.nodeType, config: processBlockTemplate(firstBlock) } },
+                inputMapping: { ...node.config.inputMapping, payload: node.config.inputMapping?.payload ?? 'vars.text' } }
+              : { implementation: 'Flow' };
+        // Only an agent may work longer than ten minutes.
+        if (node.config.implementation?.Agent && node.config.timeoutSeconds > 600) next.timeoutSeconds = 600;
+        this.opts.onConfigChange(node.id, next);
         this._renderProcess();
+      } else if (key === 'agentId' || key === 'agentGoal' || key === 'agentIterations') {
+        const field = { agentId: 'agentId', agentGoal: 'goalExpression', agentIterations: 'maxIterations' }[key];
+        const current = node.config.implementation.Agent;
+        const next = { ...current, [field]: key === 'agentIterations' ? Number(control.value) : control.value };
+        // A step may not ask for more iterations than its agent allows.
+        const chosen = (this.opts.processOptions.serviceAgents || []).find((agent) => agent.agentId === next.agentId);
+        if (key === 'agentId' && chosen?.maxIterations) next.maxIterations = Math.min(next.maxIterations, chosen.maxIterations);
+        this.opts.onConfigChange(node.id, { implementation: { Agent: next } });
+        if (key === 'agentId') this._renderProcess();
+      } else if (key === 'agentTools') {
+        this.opts.onConfigChange(node.id, { implementation: { Agent: {
+          ...node.config.implementation.Agent,
+          allowedTools: [...new Set(control.value.split(/\r?\n/).map((tool) => tool.trim()).filter(Boolean))] } } });
+      } else if (key === 'agentSchema') {
+        let parsed = null;
+        const text = control.value.trim();
+        if (text) { try { parsed = JSON.parse(text); } catch { parsed = undefined; } }
+        const valid = parsed === null ? !text : parsed !== undefined && typeof parsed === 'object' && !Array.isArray(parsed);
+        if (valid) control.removeAttribute('error');
+        else control.setAttribute('error', I18n.t('bpmn.agent_output_schema_invalid'));
+        if (valid) {
+          this.opts.onConfigChange(node.id, { implementation: { Agent: {
+            ...node.config.implementation.Agent, outputSchema: parsed } } });
+        }
       } else if (key === 'blockType') {
         const chosen = (this.opts.processOptions.serviceBlocks || []).find((block) => block.nodeType === control.value);
         this.opts.onConfigChange(node.id, { implementation: { Block: {
