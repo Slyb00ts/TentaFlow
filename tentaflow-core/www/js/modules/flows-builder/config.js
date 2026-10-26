@@ -20,7 +20,7 @@ import '/js/components/tf-person-picker.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-alert.js';
-import { processNodeKind, processAgentPreset, AGENT_STEP_MAX_SECONDS, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processStartEntryLabels, processItemLabels } from './bpmn.js';
+import { processNodeKind, processAgentPreset, processAgentIterationLimit, AGENT_STEP_MAX_SECONDS, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processStartEntryLabels, processItemLabels } from './bpmn.js';
 import { openProcessCallPreview } from './process-monitor.js';
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
@@ -270,6 +270,9 @@ export class FlowConfig {
     this.activeTab = 'config';
     this.processTab = 'impl';
     this.processTabNode = null;
+    // Text of a field the author typed that cannot be saved yet, keyed by node and
+    // field: a re-render must show it with its error, not the last valid value.
+    this.processDrafts = new Map();
     this.readOnly = !!opts.readOnly;
     this.mode = opts.mode || 'flow';
     this.root.classList.add('fb-config');
@@ -288,7 +291,10 @@ export class FlowConfig {
     // its boundary events: looking at the handler and coming back must not
     // throw the author off the tab.
     const owner = processBoundaryKind(node.type) ? node.config.attachedToId : node.id;
-    if (owner !== this.processTabNode) this.processTab = 'impl';
+    if (owner !== this.processTabNode) {
+      this.processTab = 'impl';
+      this.processDrafts.clear();
+    }
     this.processTabNode = owner;
     if (this.mode === 'bpmn') this._renderProcess();
     else this._render();
@@ -635,7 +641,9 @@ export class FlowConfig {
     const config = node.config;
     const disabled = this.readOnly ? 'disabled' : '';
     const input = (key, label, value, attrs = '') => `<tf-input data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(String(value ?? ''))}" ${attrs} ${disabled}></tf-input>`;
-    const textarea = (key, label, value, rows = 2) => `<tf-textarea data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(String(value ?? ''))}" autogrow rows="${rows}" ${disabled}></tf-textarea>`;
+    const textarea = (key, label, value, rows = 2, attrs = '') => `<tf-textarea data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(String(value ?? ''))}" autogrow rows="${rows}" ${attrs} ${disabled}></tf-textarea>`;
+    const draftOf = (key) => this.processDrafts.get(`${node.id}:${key}`);
+    const draftError = (key) => (draftOf(key) ? `error="${escapeAttr(I18n.t(draftOf(key).errorKey))}"` : '');
     const mapping = (key, label) => `<tf-keyvalue-editor data-process="${key}" multiline label="${escapeAttr(I18n.t(`bpmn.${label}`))}" add-label="${escapeAttr(I18n.t('bpmn.add_mapping'))}" remove-label="${escapeAttr(I18n.t('bpmn.remove_mapping'))}" key-placeholder="${escapeAttr(I18n.t('bpmn.mapping_key'))}" value-placeholder="${escapeAttr(I18n.t('bpmn.mapping_expression'))}" ${disabled}></tf-keyvalue-editor>`;
     const model = this.opts.getCanvas().processModel;
     const targetLabels = processNodeLabels(this.opts.getCanvas().nodes, this.opts.getCanvas().templates);
@@ -685,8 +693,8 @@ export class FlowConfig {
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.agent_goal_hint'))}</p>
         ${textarea('agentTools', 'agent_tools', agentTask.allowedTools.join('\n'), 3)}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.agent_tools_hint'))}</p>
-        ${input('agentIterations', 'agent_iterations', agentTask.maxIterations, `type="number" min="1" max="${agents.find((agent) => agent.agentId === agentTask.agentId)?.maxIterations || 100}" step="1"`)}
-        ${textarea('agentSchema', 'agent_output_schema', agentTask.outputSchema == null ? '' : JSON.stringify(agentTask.outputSchema, null, 2), 4)}
+        ${input('agentIterations', 'agent_iterations', draftOf('agentIterations')?.text ?? agentTask.maxIterations, `type="number" min="1" max="${processAgentIterationLimit(agents.find((agent) => agent.agentId === agentTask.agentId))}" step="1" ${draftError('agentIterations')}`)}
+        ${textarea('agentSchema', 'agent_output_schema', draftOf('agentSchema')?.text ?? (agentTask.outputSchema == null ? '' : JSON.stringify(agentTask.outputSchema, null, 2)), 4, draftError('agentSchema'))}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.agent_hint'))}</p>`
         : blockTask
         ? `<tf-select data-process="blockType" label="${escapeAttr(I18n.t('bpmn.block_type'))}" value="${escapeAttr(blockTask.nodeType)}" ${disabled}>${blocks.map((block) => `<option value="${escapeAttr(block.nodeType)}">${escapeHtml(processBlockLabel(block))}</option>`).join('')}${blocks.some((block) => block.nodeType === blockTask.nodeType) ? '' : `<option value="${escapeAttr(blockTask.nodeType)}" disabled>${escapeHtml(blockTask.nodeType)}</option>`}</tf-select>
@@ -1337,12 +1345,32 @@ export class FlowConfig {
         this.opts.onConfigChange(node.id, next);
         this._renderProcess();
       } else if (key === 'agentId' || key === 'agentGoal' || key === 'agentIterations') {
-        const field = { agentId: 'agentId', agentGoal: 'goalExpression', agentIterations: 'maxIterations' }[key];
         const current = node.config.implementation.Agent;
-        const next = { ...current, [field]: key === 'agentIterations' ? Number(control.value) : control.value };
-        // A step may not ask for more iterations than its agent allows.
-        const chosen = (this.opts.processOptions.serviceAgents || []).find((agent) => agent.agentId === next.agentId);
-        if (key === 'agentId' && chosen?.maxIterations) next.maxIterations = Math.min(next.maxIterations, chosen.maxIterations);
+        const chosenId = key === 'agentId' ? control.value : current.agentId;
+        const limit = processAgentIterationLimit((this.opts.processOptions.serviceAgents || []).find((agent) => agent.agentId === chosenId));
+        const next = { ...current };
+        if (key === 'agentIterations') {
+          // An empty field reads as 0 and a typed number ignores the input's own
+          // bounds, so neither may reach the model unchecked.
+          const text = String(control.value ?? '').trim();
+          const count = Number(text);
+          if (!text || !Number.isInteger(count) || count < 1) {
+            this.processDrafts.set(`${node.id}:agentIterations`, { text, errorKey: 'bpmn.agent_iterations_invalid' });
+            control.setAttribute('error', I18n.t('bpmn.agent_iterations_invalid'));
+            return;
+          }
+          this.processDrafts.delete(`${node.id}:agentIterations`);
+          control.removeAttribute('error');
+          next.maxIterations = Math.min(count, limit);
+          if (next.maxIterations !== count) control.value = String(next.maxIterations);
+        } else if (key === 'agentGoal') {
+          next.goalExpression = control.value;
+        } else {
+          next.agentId = control.value;
+          // A step may not ask for more iterations than its agent allows.
+          next.maxIterations = Math.min(next.maxIterations, limit);
+          this.processDrafts.delete(`${node.id}:agentIterations`);
+        }
         this.opts.onConfigChange(node.id, { implementation: { Agent: next } });
         if (key === 'agentId') this._renderProcess();
       } else if (key === 'agentTools') {
@@ -1354,11 +1382,16 @@ export class FlowConfig {
         const text = control.value.trim();
         if (text) { try { parsed = JSON.parse(text); } catch { parsed = undefined; } }
         const valid = parsed === null ? !text : parsed !== undefined && typeof parsed === 'object' && !Array.isArray(parsed);
-        if (valid) control.removeAttribute('error');
-        else control.setAttribute('error', I18n.t('bpmn.agent_output_schema_invalid'));
         if (valid) {
+          this.processDrafts.delete(`${node.id}:agentSchema`);
+          control.removeAttribute('error');
           this.opts.onConfigChange(node.id, { implementation: { Agent: {
             ...node.config.implementation.Agent, outputSchema: parsed } } });
+        } else {
+          // The stored schema stays what the model holds; the field keeps the
+          // text and its error until the author fixes it or the node changes.
+          this.processDrafts.set(`${node.id}:agentSchema`, { text: control.value, errorKey: 'bpmn.agent_output_schema_invalid' });
+          control.setAttribute('error', I18n.t('bpmn.agent_output_schema_invalid'));
         }
       } else if (key === 'blockType') {
         const chosen = (this.opts.processOptions.serviceBlocks || []).find((block) => block.nodeType === control.value);

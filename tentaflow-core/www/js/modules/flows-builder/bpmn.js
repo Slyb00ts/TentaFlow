@@ -188,6 +188,13 @@ function tentaflowTemplates(options) {
 export const AGENT_STEP_MAX_SECONDS = 3600;
 const AGENT_STEP_DEFAULT_SECONDS = 600;
 const AGENT_STEP_DEFAULT_ITERATIONS = 10;
+// The model accepts 1..=100 iterations whatever the agent allows.
+const AGENT_STEP_MAX_ITERATIONS = 100;
+
+/** The most iterations a step of `agent` may ask for: the agent's own limit, never above the model's. */
+export function processAgentIterationLimit(agent) {
+  return agent?.maxIterations > 0 ? Math.min(agent.maxIterations, AGENT_STEP_MAX_ITERATIONS) : AGENT_STEP_MAX_ITERATIONS;
+}
 
 /**
  * The configuration of a new Service task that runs `agent`: a goal to be
@@ -203,7 +210,7 @@ export function processAgentPreset(agent) {
       agentId: agent.agentId,
       goalExpression: JSON.stringify(I18n.t('bpmn.agent_goal_default')),
       allowedTools: [],
-      maxIterations: Math.max(1, Math.min(agent.maxIterations || AGENT_STEP_DEFAULT_ITERATIONS, AGENT_STEP_DEFAULT_ITERATIONS)),
+      maxIterations: Math.min(AGENT_STEP_DEFAULT_ITERATIONS, processAgentIterationLimit(agent)),
       outputSchema: null,
     } },
   };

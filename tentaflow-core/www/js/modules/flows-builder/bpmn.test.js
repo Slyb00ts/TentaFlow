@@ -24,7 +24,7 @@ const wasm = await codecReady;
 const { Router } = await import('../../router.js');
 const { dismissToast } = await import('../../utils.js');
 const { TfWindow } = await import('../../components/tf-window.js');
-const { emptyProcessModel, processToCanvas, canvasToProcess, cloneProcessBody, processBoundaryKind, processCommand, processJson, processStatusLabel, checkProcessDocument, PROCESS_DOCUMENT_BYTES } = await import('./bpmn.js');
+const { processAgentIterationLimit, processAgentPreset, emptyProcessModel, processToCanvas, canvasToProcess, cloneProcessBody, processBoundaryKind, processCommand, processJson, processStatusLabel, checkProcessDocument, PROCESS_DOCUMENT_BYTES } = await import('./bpmn.js');
 const { FlowCanvas, UNATTACHED_TAG } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
@@ -2913,6 +2913,45 @@ test('an agent step is edited in the inspector, and every other control leaves i
   assert.equal(stepAgent().agentId, 'agent-1');
   assert.equal(JSON.parse(stepAgent().goalExpression), I18n.t('bpmn.agent_goal_default'));
   assert.equal(agent.config.timeoutSeconds, 600);
+  graph.destroy(); config.destroy();
+});
+
+test('an agent step keeps unsaved input visible and bounds the iteration limit', async () => {
+  const graph = canvas();
+  const stored = { agentId: 'agent-1', goalExpression: '"Summarise"', allowedTools: [], maxIterations: 5, outputSchema: { type: 'object' } };
+  graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.node_type === 'bpmn_service_task'), preset: { implementation: { Agent: structuredClone(stored) } } }, 300, 300);
+  const agent = graph.nodes.at(-1);
+  const config = inspector(graph); config.show(agent, graph.templates.get(agent.type));
+  await flush(2);
+  const control = (key) => config.root.querySelector(`[data-process="${key}"]`);
+  const stepAgent = () => agent.config.implementation.Agent;
+
+  change(control('agentIterations'), '');
+  assert.equal(control('agentIterations').getAttribute('error'), I18n.t('bpmn.agent_iterations_invalid'), 'an empty limit is refused');
+  assert.equal(stepAgent().maxIterations, 5, 'and not read as zero');
+  change(control('agentIterations'), '2.5');
+  assert.equal(stepAgent().maxIterations, 5);
+  change(control('agentIterations'), '500');
+  assert.equal(stepAgent().maxIterations, 8, 'a typed number above the agent limit is cut to it');
+  assert.equal(control('agentIterations').getAttribute('error'), null);
+
+  change(control('agentSchema'), '{broken');
+  config.show(agent, graph.templates.get(agent.type));
+  await flush(2);
+  assert.equal(control('agentSchema').getAttribute('value'), '{broken', 'a re-render keeps what the author typed');
+  assert.equal(control('agentSchema').getAttribute('error'), I18n.t('bpmn.agent_output_schema_invalid'));
+  assert.deepEqual(stepAgent().outputSchema, { type: 'object' }, 'the saved schema is unchanged while the field is invalid');
+  change(control('agentSchema'), '{"type":"string"}');
+  config.show(agent, graph.templates.get(agent.type));
+  await flush(2);
+  assert.equal(control('agentSchema').getAttribute('error'), null);
+  assert.deepEqual(stepAgent().outputSchema, { type: 'string' });
+
+  // A limit of 0 reported by the agent or one above the model's is never offered.
+  assert.equal(processAgentIterationLimit({ maxIterations: 0 }), 100);
+  assert.equal(processAgentIterationLimit({ maxIterations: 5000 }), 100);
+  assert.equal(processAgentIterationLimit({ maxIterations: 7 }), 7);
+  assert.equal(processAgentPreset({ agentId: 'a', maxIterations: 0 }).implementation.Agent.maxIterations, 10);
   graph.destroy(); config.destroy();
 });
 
