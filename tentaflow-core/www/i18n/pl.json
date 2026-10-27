@@ -15892,7 +15892,7 @@
     "verification_on_failure": "Gdy sprawdzenie odrzuci wynik",
     "verification_on_failure_error": "Błąd do obsłużenia w procesie",
     "verification_on_failure_human": "Skieruj do człowieka",
-    "verification_on_failure_hint": "Odrzucenie ma kod VERIFICATION_FAILED. Jeśli sprawdzenie nie mogło się wykonać albo nie dało werdyktu, zawsze decyduje człowiek (VERIFICATION_UNAVAILABLE), także po restarcie w trakcie sprawdzania.",
+    "verification_on_failure_hint": "Odrzucenie ma kod VERIFICATION_FAILED. Jeśli sprawdzenie nie mogło się wykonać albo nie dało werdyktu, zawsze decyduje człowiek (VERIFICATION_UNAVAILABLE). Po restarcie w trakcie sprawdzania praca agenta trafia do człowieka w ten sam sposób; wynik każdego innego kroku przepada i pojawia się jako niepewny wynik (EXTERNAL_OUTCOME_UNCERTAIN).",
     "timeout": "Limit czasu (sekundy)",
     "sequence_flow": "Ścieżka procesu",
     "condition": "Warunek ścieżki (CEL)",

@@ -825,6 +825,7 @@ fn validate_draft_body<'a>(
                 timeout_seconds,
                 result_expression,
                 implementation,
+                flow_id,
                 ..
             } => {
                 let max_timeout = service_timeout_ceiling(implementation);
@@ -841,7 +842,13 @@ fn validate_draft_body<'a>(
                 {
                     expr::validate_syntax(expression, None)?;
                 }
-                validate_verification(&node.id, verification, implementation, false)?;
+                validate_verification(
+                    &node.id,
+                    verification,
+                    implementation,
+                    &implementation.source_ref(flow_id),
+                    false,
+                )?;
                 if let Some(expression) = result_expression {
                     validate_expression(expression, "service result expression", false)?;
                 }
@@ -1446,7 +1453,13 @@ fn validate_body<'a>(
                     expr::validate_syntax(expression, None)
                         .with_context(|| format!("service task {} verification", node.id))?;
                 }
-                validate_verification(&node.id, verification, implementation, true)?;
+                validate_verification(
+                    &node.id,
+                    verification,
+                    implementation,
+                    &implementation.source_ref(flow_id),
+                    true,
+                )?;
                 if let Some(expression) = result_expression {
                     validate_expression(expression, "service result expression", true)?;
                 }
@@ -2589,9 +2602,6 @@ fn service_timeout_ceiling(implementation: &ServiceImplementation) -> u32 {
     }
 }
 
-/// The agent-specific rules of a Service task. Whether the agent exists, is
-/// enabled and runs on a model is a fact of the live registry and is decided at
-/// pinning; this checks only what the model itself can state.
 /// Longest criteria text a critic is given; it travels in every verification run.
 pub const MAX_CRITIC_CRITERIA_BYTES: usize = 8 * 1024;
 
@@ -2599,10 +2609,12 @@ pub const MAX_CRITIC_CRITERIA_BYTES: usize = 8 * 1024;
 /// its flow, agent or criteria (`complete == false`); a publishable step may not.
 /// A critic that is the agent of the step would grade its own work, which is
 /// the one thing the mode exists to prevent, so that is refused in drafts too.
+/// A test flow that is the flow of the step grades itself the same way.
 fn validate_verification(
     node_id: &str,
     verification: &tentaflow_protocol::processes::ActivityVerification,
     implementation: &ServiceImplementation,
+    work_source: &str,
     complete: bool,
 ) -> Result<()> {
     use tentaflow_protocol::processes::ActivityVerification as V;
@@ -2618,6 +2630,10 @@ fn validate_verification(
                 flow_id.len() <= 256
                     && !["tool:", "block:", "agent:"].iter().any(|prefix| flow_id.starts_with(prefix)),
                 "service task {node_id} names a test flow that is not a flow"
+            );
+            ensure!(
+                flow_id.is_empty() || flow_id != work_source,
+                "service task {node_id} is verified by the flow that does its work"
             );
         }
         V::Critic { agent_id, criteria, .. } => {
@@ -2647,6 +2663,9 @@ fn validate_verification(
     Ok(())
 }
 
+/// The agent-specific rules of a Service task. Whether the agent exists, is
+/// enabled and runs on a model is a fact of the live registry and is decided at
+/// pinning; this checks only what the model itself can state.
 fn validate_agent_implementation(
     implementation: &ServiceImplementation,
     node_id: &str,

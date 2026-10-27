@@ -441,7 +441,7 @@ pub(crate) fn pin_service_snapshots(
         // pin of the work: the process publishes with the verifier it was checked
         // against.
         if let Some(pinned) = pin_verifier(
-            executor, actor, verification, &node.id, &mut refused_agents,
+            executor, actor, verification, implementation, &node.id, &mut refused_agents,
         )? {
             snapshots.push(pinned);
         }
@@ -459,6 +459,7 @@ fn pin_verifier(
     executor: &FlowDispatcher,
     actor: &repository::ProcessActor,
     verification: &tentaflow_protocol::processes::ActivityVerification,
+    work: &ServiceImplementation,
     node_id: &str,
     refused: &mut Vec<String>,
 ) -> Result<Option<PinnedServiceSnapshot>, ProtocolError> {
@@ -485,7 +486,12 @@ fn pin_verifier(
             (pinned, ServiceImplementationKind::Flow)
         }
         VerificationKind::Critic => {
-            match executor.snapshot_process_critic(reference, &actor.user_id, &actor.org_id) {
+            match executor.snapshot_process_critic(
+                reference,
+                &crate::processes::agent_sink::critic_tools_for(work),
+                &actor.user_id,
+                &actor.org_id,
+            ) {
                 Ok(pinned) => (pinned, ServiceImplementationKind::Agent),
                 Err(error @ AgentPinError::Refused(_)) => {
                     refused.push(format!("service task {node_id} critic: {error}"));

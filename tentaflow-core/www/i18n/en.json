@@ -15892,7 +15892,7 @@
     "verification_on_failure": "When the check rejects the result",
     "verification_on_failure_error": "Error the process can handle",
     "verification_on_failure_human": "Send to a person",
-    "verification_on_failure_hint": "A rejection has the code VERIFICATION_FAILED. If the check could not run or gave no verdict, a person always decides (VERIFICATION_UNAVAILABLE), also after a restart in the middle of the check.",
+    "verification_on_failure_hint": "A rejection has the code VERIFICATION_FAILED. If the check could not run or gave no verdict, a person always decides (VERIFICATION_UNAVAILABLE). After a restart in the middle of the check, the work of an agent goes to a person the same way; the result of any other step is lost and shows as an uncertain outcome (EXTERNAL_OUTCOME_UNCERTAIN).",
     "timeout": "Timeout (seconds)",
     "sequence_flow": "Sequence flow",
     "condition": "Path condition (CEL)",

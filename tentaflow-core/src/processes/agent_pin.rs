@@ -10,7 +10,6 @@ use rusqlite::Connection;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use super::agent_sink::critic_tools;
 use crate::agents::{allowlist_admits_entry, AgentRuntime};
 use crate::db::{models::DbAgent, repository, DbPool};
 
@@ -130,12 +129,93 @@ pub fn pin_agent(
     agent_pin(&agent, allowed_tools).map_err(|_| AgentPinError::Unavailable)
 }
 
+/// Block types a critic's harness may not contain. A critic only checks, and
+/// narrowing its tool catalog does not reach a block of its own harness graph:
+/// these write, execute, publish, ask a person or start other agents regardless
+/// of the tools the run was given. The first group is what a pinned service flow
+/// already refuses, the rest are the blocks with an effect outside the run.
+const EFFECTFUL_HARNESS_BLOCKS: &[&str] = &[
+    "subflow",
+    "map",
+    "agent",
+    "agent_router",
+    "spawn",
+    "await_subagents",
+    "exec_command",
+    "delegate_cli",
+    "workspace_context",
+    "ask_user",
+    "bus_publish",
+    "bus_consume",
+    "bus_transform",
+    "memory",
+    "store",
+    "vector",
+    "graph_extract",
+    "camera_alert",
+    "patch_review",
+];
+
+/// Why a harness graph cannot run a critic: it holds a block with an effect.
+/// An addon block (`addon.*`) is always one.
+pub fn critic_harness_refusal(graph_json: &str) -> Result<(), String> {
+    let definition: crate::flow_engine::types::FlowDefinition = serde_json::from_str(graph_json)
+        .map_err(|_| "the harness flow of the critic cannot be read".to_owned())?;
+    match definition.nodes.iter().find(|node| {
+        node.node_type.starts_with("addon.")
+            || EFFECTFUL_HARNESS_BLOCKS.contains(&node.node_type.as_str())
+    }) {
+        Some(node) => Err(format!(
+            "the harness flow of the critic has a block with an effect ({})",
+            node.node_type
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The harness flow an agent runs, the way a run resolves it.
+fn harness_flow_id(agent: &DbAgent) -> Result<String, AgentPinError> {
+    match agent.flow_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(flow_id) => Ok(flow_id.to_owned()),
+        None => crate::flow_engine::node_adapters::flow_for(agent)
+            .map(str::to_owned)
+            .map_err(|error| AgentPinError::Refused(format!("{error:#}"))),
+    }
+}
+
+/// [`runnable_agent`] for a critic: its harness must also be free of blocks with
+/// an effect.
+pub fn runnable_critic(conn: &Connection, agent_id: &str) -> Result<DbAgent, AgentPinError> {
+    let agent = runnable_agent(conn, agent_id)?;
+    let flow_id = harness_flow_id(&agent)?;
+    let flow_json: Option<String> = conn
+        .query_row(
+            "SELECT flow_json FROM flows WHERE id=?1",
+            [&flow_id],
+            |row| row.get(0),
+        )
+        .map(Some)
+        .or_else(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            _ => Err(AgentPinError::Unavailable),
+        })?;
+    let flow_json = flow_json.ok_or_else(|| {
+        AgentPinError::Refused("the harness flow of the critic does not exist".into())
+    })?;
+    critic_harness_refusal(&flow_json).map_err(AgentPinError::Refused)?;
+    Ok(agent)
+}
+
 /// The pin publication stores for the critic of a step: the agent as it runs as
-/// a critic, which means with the read-only tools of [`critic_tools`] (the
-/// intersection with its own tools is taken at run time, so the critic needs no
-/// particular tool of its own, only to be runnable).
-pub fn pin_critic(pool: &DbPool, agent_id: &str) -> Result<AgentPin, AgentPinError> {
+/// a critic, which means with the read-only tools `tools` (the intersection with
+/// its own tools is taken at run time, so the critic needs no particular tool of
+/// its own, only to be runnable).
+pub fn pin_critic(
+    pool: &DbPool,
+    agent_id: &str,
+    tools: &[String],
+) -> Result<AgentPin, AgentPinError> {
     let conn = pool.read().map_err(|_| AgentPinError::Unavailable)?;
-    let agent = runnable_agent(&conn, agent_id)?;
-    agent_pin(&agent, &critic_tools()).map_err(|_| AgentPinError::Unavailable)
+    let agent = runnable_critic(&conn, agent_id)?;
+    agent_pin(&agent, tools).map_err(|_| AgentPinError::Unavailable)
 }

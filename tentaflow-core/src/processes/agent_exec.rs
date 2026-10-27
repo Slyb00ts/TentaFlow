@@ -22,7 +22,7 @@ use tentaflow_protocol::processes::ActivityResult;
 
 use super::agent_pin::AgentPinError;
 use super::agent_sink::{
-    agent_run_id, critic_tools, recorded_report, BindingRole, ProcessActivityBinding,
+    agent_run_id, critic_tools_for, recorded_report, BindingRole, ProcessActivityBinding,
 };
 use super::jobs::{
     begin_dispatch, drive_dispatch, fail_claim, now_ms, AccessCheck, ExecutionEnd, ServiceJob,
@@ -423,6 +423,17 @@ pub(super) async fn run_verifier_agent(
             format!("the critic harness cannot be pinned: {error:#}")
         }
     })?;
+    // The agent and its harness may have been edited since publication.
+    let harness_graph = flow
+        .version_id
+        .as_deref()
+        .map(|version_id| crate::db::repository::get_flow_version(pool, &flow.flow_id, version_id))
+        .transpose()
+        .map_err(|error| format!("the critic harness cannot be read: {error:#}"))?
+        .flatten()
+        .and_then(|version| version.flow_json)
+        .ok_or_else(|| "the critic harness cannot be read".to_owned())?;
+    super::agent_pin::critic_harness_refusal(&harness_graph)?;
     let binding = ProcessActivityBinding {
         role: BindingRole::Verification,
         invocation_id: claimed.invocation_id.clone(),
@@ -430,7 +441,7 @@ pub(super) async fn run_verifier_agent(
         node_id: claimed.job.node_id.clone(),
         attempt: claimed.job.attempt,
         fence: claimed.job.fence,
-        allowed_tools: critic_tools(),
+        allowed_tools: critic_tools_for(job.implementation),
         output_schema: None,
     };
     let principal = AgentPrincipal::new(

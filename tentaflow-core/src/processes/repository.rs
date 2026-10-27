@@ -1800,7 +1800,8 @@ fn timer_current_authority_on(
         params![timer.definition_id,timer.version],
         |row| row.get(0),
     )?;
-    for snapshot in parse::<Vec<PinnedServiceSnapshot>>(snapshots_json)? {
+    for snapshot in parse::<Vec<PinnedServiceSnapshot>>(snapshots_json)?
+        .into_iter().filter(runs_a_transition) {
         if let Err(error) = require_source_current(conn, &actor, &snapshot.info.flow_id, None) {
             if error.downcast_ref::<ProcessAuthorityDenied>().is_some() {
                 return Ok(false);
@@ -2786,7 +2787,8 @@ pub(crate) fn fire_timer_on(
             params![timer.definition_id,timer.version],
             |row| row.get(0),
         )?;
-        for snapshot in parse::<Vec<PinnedServiceSnapshot>>(snapshots_json)? {
+        for snapshot in parse::<Vec<PinnedServiceSnapshot>>(snapshots_json)?
+            .into_iter().filter(runs_a_transition) {
             require_source_current(tx, actor, &snapshot.info.flow_id, None)?;
         }
         let entry = AcceptedInputRef::Timer { timer_id: timer.timer_id.clone(),
@@ -2958,11 +2960,20 @@ fn require_owner(conn: &Connection, actor: &ProcessActor, definition_id: &str) -
     Ok(())
 }
 
+/// Whether a pinned source must be current for any transition of an instance. A
+/// verifier is not: it matters to the one step that uses it, which checks it
+/// before its work is dispatched and again when a verdict is accepted, so a
+/// verifier withdrawn after the work ran cannot hold up unrelated transitions or
+/// cost the work of the step it was verifying.
+fn runs_a_transition(snapshot: &PinnedServiceSnapshot) -> bool {
+    snapshot.role != PinnedServiceRole::Verification
+}
+
 /// Database-side check that the source behind a Service task still exists and
 /// the actor is still active: the Flow for a Flow task, the enabled addon for
 /// a `tool:` reference. Whether the actor may call that addon tool lives in the
 /// addon runtime and is decided by the executor.
-fn require_source_current(
+pub(super) fn require_source_current(
     conn: &Connection,
     actor: &ProcessActor,
     flow_id: &str,
@@ -4376,7 +4387,7 @@ pub fn publish_definition(
         } = &service_node.kind
         else { bail!("pinned node is not a service task"); };
         if snapshot.role == PinnedServiceRole::Verification {
-            super::verification::check_verifier_pin(&tx, snapshot, verification)?;
+            super::verification::check_verifier_pin(&tx, snapshot, verification, implementation)?;
             continue;
         }
         if let tentaflow_protocol::processes::ServiceImplementation::Block { node_type, config } = implementation {
@@ -21437,7 +21448,7 @@ fn apply_plan_on(
             &job.scope_id,
             &job.node_id,
         )?;
-        let ProcessNodeKind::ServiceTask { flow_id, implementation, .. } = &node.kind else {
+        let ProcessNodeKind::ServiceTask { flow_id, implementation, verification, .. } = &node.kind else {
             bail!("queued job node is not a service in its scope body")
         };
         let source_ref = implementation.source_ref(flow_id);
@@ -21474,12 +21485,13 @@ fn apply_plan_on(
             .context("queued Service job has no reserved invocation identity")?;
         ensure!(invocation_id != &job.job_id,
             "Service invocation identity must differ from its job identity");
-        tx.execute("INSERT INTO bpmn_service_invocations(invocation_id,job_id,instance_id,scope_id,node_id,token_id,definition_id,version,selected_process_id,whole_document_sha256,flow_id,pinned_flow_digest,input_sha256,stable_request_id,phase,dispatch_evidence,phase_revision,acceptance_revision,created_at_ms,updated_at_ms,implementation_kind) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?1,'prepared','no_boundary',1,0,?14,?14,?15)",
+        tx.execute("INSERT INTO bpmn_service_invocations(invocation_id,job_id,instance_id,scope_id,node_id,token_id,definition_id,version,selected_process_id,whole_document_sha256,flow_id,pinned_flow_digest,input_sha256,stable_request_id,phase,dispatch_evidence,phase_revision,acceptance_revision,created_at_ms,updated_at_ms,implementation_kind,critic_verified) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?1,'prepared','no_boundary',1,0,?14,?14,?15,?16)",
             params![invocation_id,job.job_id,instance_id,job.scope_id,
                 job.node_id,job.token_id,definition_id,version,selected_process_id,
                 model_sha256,source_ref,pins[0].info.graph_sha256,
                 hex::encode(Sha256::digest(input_json.as_bytes())),at_ms,
-                implementation.kind().as_str()])?;
+                implementation.kind().as_str(),
+                matches!(verification, tentaflow_protocol::processes::ActivityVerification::Critic { .. })])?;
     }
     for token_id in &plan.consume_token_ids {
         let mut statement=tx.prepare("SELECT user_task_id FROM bpmn_user_tasks WHERE instance_id=?1 AND token_id=?2 AND status='open'")?;
@@ -23321,7 +23333,7 @@ pub fn apply_transition(
         |row| row.get(0),
     )?;
     let snapshots: Vec<PinnedServiceSnapshot> = parse(snapshots_json)?;
-    for snapshot in &snapshots {
+    for snapshot in snapshots.iter().filter(|snapshot| runs_a_transition(snapshot)) {
         require_source_current(&tx, actor, &snapshot.info.flow_id, None)?;
     }
     let canonical;
@@ -24175,16 +24187,38 @@ pub(crate) fn cancel_instance_on(
     Ok(cancelled_claims)
 }
 
-fn job_source_ref_on(conn: &Connection, job_id: &str) -> Result<String> {
+fn job_service_node_on(conn: &Connection, job_id: &str) -> Result<ProcessNode> {
     let (instance,scope,definition,version,node):(String,String,String,u32,String)=conn.query_row(
         "SELECT j.instance_id,j.scope_id,i.definition_id,i.version,j.node_id FROM bpmn_jobs j JOIN bpmn_instances i ON i.instance_id=j.instance_id WHERE j.job_id=?1",[job_id],
         |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)))?;
     let model = current_version_model_on(conn, &definition, version)?;
-    match &scoped_node_on(conn, &instance, &scope, &model, &node)?.kind {
+    Ok(scoped_node_on(conn, &instance, &scope, &model, &node)?.clone())
+}
+
+fn job_source_ref_on(conn: &Connection, job_id: &str) -> Result<String> {
+    match &job_service_node_on(conn, job_id)?.kind {
         ProcessNodeKind::ServiceTask { flow_id, implementation, .. } => {
             Ok(implementation.source_ref(flow_id))
         }
         _ => bail!("service job references a non-service node in its exact scope"),
+    }
+}
+
+/// Before a step's work is dispatched its verifier must be current too: nothing
+/// has run yet, so a verifier that is gone stops the step. (Once the work ran, a
+/// withdrawn verifier hands the work to a person instead.)
+fn require_job_verifier_current_on(
+    conn: &Connection,
+    actor: &ProcessActor,
+    job_id: &str,
+) -> Result<()> {
+    let node = job_service_node_on(conn, job_id)?;
+    let ProcessNodeKind::ServiceTask { verification, .. } = &node.kind else {
+        bail!("service job references a non-service node in its exact scope")
+    };
+    match super::verification::verifier_pin_target(verification) {
+        Some((source_ref, _)) => require_source_current(conn, actor, &source_ref, None),
+        None => Ok(()),
     }
 }
 
@@ -24211,10 +24245,11 @@ pub(super) fn job_activation_live_on(conn: &Connection, job_id: &str) -> Result<
 }
 
 /// The queued jobs a claim looks at, oldest first. `?2` and `?3` switch the
-/// general and the agent slot class on, so a class with no free slot cannot
+/// general and the agent slot class on (an agent step, or a step with a critic,
+/// is of the agent class), so a class with no free slot cannot
 /// fill the 16-row window with jobs nobody may claim and starve the other.
 /// A constant so a test can ask the planner about the very query the worker runs.
-pub const CLAIM_CANDIDATES_SQL: &str = "SELECT j.job_id,j.instance_id,j.scope_id,j.node_id,i.org_id,i.initiator_user_id FROM bpmn_jobs j JOIN bpmn_service_invocations v ON v.job_id=j.job_id AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id AND v.phase='prepared' AND v.dispatch_evidence='no_boundary' JOIN bpmn_instances i ON i.instance_id=j.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id AND t.node_id=j.node_id JOIN bpmn_scopes s ON s.instance_id=j.instance_id AND s.scope_id=j.scope_id WHERE j.status='queued' AND (j.not_before_ms IS NULL OR j.not_before_ms<=?1) AND i.status IN ('running','waiting','incident') AND t.status='waiting' AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled','error')) AND (?2=1 AND v.implementation_kind<>'agent' OR ?3=1 AND v.implementation_kind='agent') ORDER BY j.created_at_ms,j.job_id LIMIT 16";
+pub const CLAIM_CANDIDATES_SQL: &str = "SELECT j.job_id,j.instance_id,j.scope_id,j.node_id,i.org_id,i.initiator_user_id FROM bpmn_jobs j JOIN bpmn_service_invocations v ON v.job_id=j.job_id AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id AND v.phase='prepared' AND v.dispatch_evidence='no_boundary' JOIN bpmn_instances i ON i.instance_id=j.instance_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id AND t.node_id=j.node_id JOIN bpmn_scopes s ON s.instance_id=j.instance_id AND s.scope_id=j.scope_id WHERE j.status='queued' AND (j.not_before_ms IS NULL OR j.not_before_ms<=?1) AND i.status IN ('running','waiting','incident') AND t.status='waiting' AND (s.parent_scope_id IS NULL OR s.status NOT IN ('completed','cancelled','error')) AND (?2=1 AND v.implementation_kind<>'agent' AND v.critic_verified=0 OR ?3=1 AND (v.implementation_kind='agent' OR v.critic_verified=1)) ORDER BY j.created_at_ms,j.job_id LIMIT 16";
 
 /// How long a queued tool task may keep being put off (addon busy, not running
 /// yet) before it raises an incident for a person. Nothing has run in that time.
@@ -24336,6 +24371,7 @@ pub fn claim_job_where(
     if let Err(error) = require_actor(&tx, &actor)
         .and_then(|_| require_call_control_authority_on(&tx, &actor, &instance_id))
         .and_then(|_| require_source_current(&tx, &actor, &flow_id, None))
+        .and_then(|_| require_job_verifier_current_on(&tx, &actor, &job_id))
     {
         // Only a typed denial revokes; a failed read leaves the job queued.
         if error.downcast_ref::<ProcessAuthorityDenied>().is_none() {
@@ -24692,6 +24728,7 @@ fn commit_job_dispatch_boundary_on(
     require_call_control_authority_on(&tx, &claimed.actor, &claimed.job.instance_id)?;
     let flow_id = job_source_ref_on(&tx, &claimed.job.job_id)?;
     require_source_current(&tx, &claimed.actor, &flow_id, None)?;
+    require_job_verifier_current_on(&tx, &claimed.actor, &claimed.job.job_id)?;
     if !job_activation_live_on(&tx, &claimed.job.job_id)? {
         return Ok(false);
     }
@@ -26444,6 +26481,7 @@ fn critic_step_of_invocation_on(
     };
     let ProcessNodeKind::ServiceTask {
         verification: tentaflow_protocol::processes::ActivityVerification::Critic { agent_id, .. },
+        implementation,
         ..
     } = &node.kind
     else {
@@ -26456,7 +26494,7 @@ fn critic_step_of_invocation_on(
             node_id,
             attempt,
             fence,
-            allowed_tools: super::agent_sink::critic_tools(),
+            allowed_tools: super::agent_sink::critic_tools_for(implementation),
             output_schema: None,
             role: super::agent_sink::BindingRole::Verification,
         },
@@ -26671,6 +26709,9 @@ fn validate_job_result_plan_on(
         tentaflow_protocol::processes::ServiceImplementation::Agent { .. }
     );
     super::verification::validate_record_on(tx, job_id, observed, verification)?;
+    if observed.verification.is_none() {
+        super::verification::reject_verdict_imitation(&observed.result)?;
+    }
     // A verdict can make the result a Contract one whatever the work was; the
     // contract of the work itself is held to the result the work gave.
     let work = observed.work_result();
@@ -27364,6 +27405,7 @@ pub fn accept_job_result(
     require_call_control_authority_on(&tx, actor, &instance_id)?;
     let flow_id = job_source_ref_on(&tx, job_id)?;
     require_source_current(&tx, actor, &flow_id, None)?;
+    super::verification::require_verifier_current(&tx, actor, observed)?;
     ensure!(
         composite.complete_job_ids.iter().any(|id| id == job_id),
         "result plan does not consume service job"
@@ -27683,12 +27725,12 @@ fn adopt_agent_report(
         actor, job, snapshot, invocation_id, request_id,
         result_event_id: Uuid::new_v4().to_string(),
     };
-    let observed = ObservedActivityResult {
+    let observed = unproven_report_on(&*pool.read()?, &claimed.invocation_id, ObservedActivityResult {
         result,
         origin: ActivityResultOrigin::Contract,
         expression_observation: None,
         verification: None,
-    };
+    })?;
     match record_job_observation(pool, &claimed, &original_worker, &observed, now_ms)? {
         JobObservationState::Blocked | JobObservationState::Accepted => {
             return Ok(Some(RecoveryStep::Resolved));
@@ -28149,6 +28191,24 @@ pub(super) fn record_observed_script_infrastructure_failure(
     Ok(true)
 }
 
+/// An agent report adopted after the step was abandoned never reached the test
+/// or critic its node asks for. It is recorded as work whose verification was
+/// interrupted, so the person who gets it reads that the result was not checked
+/// instead of a plain completed result.
+fn unproven_report_on(
+    conn: &Connection,
+    invocation_id: &str,
+    report: ObservedActivityResult,
+) -> Result<ObservedActivityResult> {
+    let Some((node, ..)) = dispatched_node_of_invocation_on(conn, invocation_id, "")? else {
+        return Ok(report);
+    };
+    let ProcessNodeKind::ServiceTask { verification, .. } = &node.kind else {
+        return Ok(report);
+    };
+    Ok(super::verification::interrupted(verification, report))
+}
+
 /// Records an agent's stored report as the observed result of its step.
 #[allow(clippy::too_many_arguments)]
 fn observe_agent_report(
@@ -28180,12 +28240,12 @@ fn observe_agent_report(
         request_id,
         result_event_id: Uuid::new_v4().to_string(),
     };
-    let reported = ObservedActivityResult {
+    let reported = unproven_report_on(tx, invocation_id, ObservedActivityResult {
         result: report,
         origin: ActivityResultOrigin::Contract,
         expression_observation: None,
         verification: None,
-    };
+    })?;
     record_job_observation_on(tx, &target, worker_id, &reported, now_ms)?;
     Ok(())
 }
@@ -29479,8 +29539,14 @@ fn require_version_execution_on(
 ) -> Result<()> {
     require_actor(conn, actor)?;
     let v = version_on(conn, definition_id, version)?;
-    for pin in v.service_flows {
-        require_source_current(conn, actor, &pin.flow_id, None)?;
+    let snapshots_json: String = conn.query_row(
+        "SELECT service_snapshots_json FROM bpmn_versions WHERE definition_id=?1 AND version=?2",
+        params![definition_id, version],
+        |row| row.get(0),
+    )?;
+    for snapshot in parse::<Vec<PinnedServiceSnapshot>>(snapshots_json)?
+        .into_iter().filter(runs_a_transition) {
+        require_source_current(conn, actor, &snapshot.info.flow_id, None)?;
     }
     for node in super::model::all_nodes(&v.model) {
         if let ProcessNodeKind::UserTask {

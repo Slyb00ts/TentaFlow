@@ -211,13 +211,28 @@ pub fn verification_run_id(invocation_id: &str) -> String {
     Uuid::new_v5(&NAMESPACE, invocation_id.as_bytes()).to_string()
 }
 
-/// Core tools a critic may use: the read-only ones. A critic checks, it never
-/// changes anything, and the completion tool is added by the binding.
+/// Core tools a critic may use at most: the read-only ones. A critic checks, it
+/// never changes anything, and the completion tool is added by the binding.
 pub fn critic_tools() -> Vec<String> {
     crate::flow_engine::node_adapters::tool_exec::READ_ONLY_CORE_TOOLS
         .iter()
         .map(|tool| tool.public_name().to_owned())
         .collect()
+}
+
+/// The tools the critic of a step is given: the read-only tools, and, when the
+/// work is an agent step, only those the step itself allowed its agent. A critic
+/// reaches no further than the work did; a work that is not an agent step has no
+/// tool list to hold the critic to.
+pub fn critic_tools_for(work: &tentaflow_protocol::processes::ServiceImplementation) -> Vec<String> {
+    let tools = critic_tools();
+    match work {
+        tentaflow_protocol::processes::ServiceImplementation::Agent { allowed_tools, .. } => tools
+            .into_iter()
+            .filter(|tool| allowed_tools.contains(tool))
+            .collect(),
+        _ => tools,
+    }
 }
 
 /// Iteration budget of a critic run; the critic agent's own budget still caps it.
@@ -509,8 +524,12 @@ fn report_from_arguments(arguments: &Value) -> std::result::Result<ActivityResul
         "evidence".into(),
         object.get("evidence").cloned().unwrap_or_else(|| json!([])),
     );
-    parse_contract_result(Value::Object(report))
-        .map_err(|error| format!("invalid report: {error:#}"))
+    let result = parse_contract_result(Value::Object(report))
+        .map_err(|error| format!("invalid report: {error:#}"))?;
+    // Only a verifier's decision carries these codes and markers.
+    super::verification::reject_verdict_imitation(&result)
+        .map_err(|error| format!("invalid report: {error:#}"))?;
+    Ok(result)
 }
 
 /// The `outputs` of a `completed` report against the step's output schema.

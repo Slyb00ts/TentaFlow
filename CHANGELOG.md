@@ -516,6 +516,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   wyłączonego agenta albo przepływ bez bloku wyniku. Projektant: zakładka wyniku
   oferuje Test i Krytyka (wybór przepływu lub agenta, kryteria, skutek odrzucenia)
   w pięciu językach.
+- Poprawki przeglądu B3.5. Rekord weryfikacji nie powtarza już dowodów i
+  podsumowania pracy (`work_summary` tylko przy odrzuceniu lub niedostępnym
+  weryfikatorze, `dropped_evidence` tylko dla 64. wpisu), więc odrzucenie dużego
+  wyniku mieści się w obserwacji; werdykt, którego obserwacja się nie mieści,
+  zapisuje się jako `VERIFICATION_UNAVAILABLE`, a wynik bez miejsca nawet na taki
+  zapis kończy się incydentem `OUTPUT_LIMIT` przed uruchomieniem weryfikatora.
+  Po wykonaniu pracy odmowa weryfikatora (wyłączony agent, flow poza ACL, błąd
+  odczytu, wycofanie w trakcie oceny) oddaje pracę człowiekowi jako
+  `VERIFICATION_UNAVAILABLE` zamiast `SOURCE_ACCESS_REVOKED`; tylko utrata dostępu
+  do źródła pracy blokuje krok, a przyjęcie sprawdza ponownie dostęp do
+  weryfikatora (przypięty weryfikator nie wstrzymuje już przejść całej instancji,
+  tylko krok, który z niego korzysta). Zgłoszenie agenta przyjęte po restarcie przy trybie Test albo
+  Krytyk jest zapisywane jako niezweryfikowane (`VERIFICATION_UNAVAILABLE`), nie
+  jako zwykłe `Completed`. Krok z krytykiem zajmuje slot klasy agentów
+  (migracja 205, kolumna `critic_verified`, zapytanie claim). Krytyk dostaje
+  przecięcie narzędzi do odczytu z `allowed_tools` kroku agenta, a jego przepływ
+  harnessu nie może zawierać bloków ze skutkami (publikacja i uruchomienie).
+  Wynik pracy nie może udawać werdyktu (kody `VERIFICATION_*`, dowody
+  `verified:` / `verification_rejected:` / `verification_unavailable:`), a przepływ
+  nie może być własnym testem. Tekst podpowiedzi o skutku odrzucenia opisuje
+  restart zgodnie z zachowaniem w pięciu językach.
 
 ### TentaNas
 

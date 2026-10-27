@@ -14754,7 +14754,7 @@
     "verification_on_failure": "Quand la vérification rejette le résultat",
     "verification_on_failure_error": "Erreur que le processus peut traiter",
     "verification_on_failure_human": "Confier à une personne",
-    "verification_on_failure_hint": "Un rejet porte le code VERIFICATION_FAILED. Si la vérification n’a pas pu s’exécuter ou n’a rendu aucun verdict, une personne décide toujours (VERIFICATION_UNAVAILABLE), y compris après un redémarrage en cours de vérification.",
+    "verification_on_failure_hint": "Un rejet porte le code VERIFICATION_FAILED. Si la vérification n’a pas pu s’exécuter ou n’a rendu aucun verdict, une personne décide toujours (VERIFICATION_UNAVAILABLE). Après un redémarrage en cours de vérification, le travail d’un agent revient à une personne de la même façon ; le résultat de tout autre pas est perdu et apparaît comme un résultat incertain (EXTERNAL_OUTCOME_UNCERTAIN).",
     "timeout": "Délai (secondes)",
     "sequence_flow": "Flux de séquence",
     "condition": "Condition du chemin (CEL)",

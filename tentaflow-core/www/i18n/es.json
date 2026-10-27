@@ -14754,7 +14754,7 @@
     "verification_on_failure": "Cuando la comprobación rechaza el resultado",
     "verification_on_failure_error": "Error que el proceso puede gestionar",
     "verification_on_failure_human": "Enviar a una persona",
-    "verification_on_failure_hint": "Un rechazo tiene el código VERIFICATION_FAILED. Si la comprobación no pudo ejecutarse o no dio veredicto, siempre decide una persona (VERIFICATION_UNAVAILABLE), también tras un reinicio a mitad de la comprobación.",
+    "verification_on_failure_hint": "Un rechazo tiene el código VERIFICATION_FAILED. Si la comprobación no pudo ejecutarse o no dio veredicto, siempre decide una persona (VERIFICATION_UNAVAILABLE). Tras un reinicio a mitad de la comprobación, el trabajo de un agente pasa a una persona del mismo modo; el resultado de cualquier otro paso se pierde y aparece como un resultado incierto (EXTERNAL_OUTCOME_UNCERTAIN).",
     "timeout": "Tiempo límite (segundos)",
     "sequence_flow": "Flujo de secuencia",
     "condition": "Condición de ruta (CEL)",

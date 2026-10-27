@@ -922,54 +922,111 @@ test('an agent step is saved and read back by the codec with its output schema k
   expect(errors, diagnostics(errors, proc)).toEqual([]);
 });
 
-test('a test and a critic verification are saved and read back by the codec, and the designer opens them with their pickers', async ({ page }) => {
-  test.setTimeout(180000);
+test('a test and a critic verification are saved and read back by the codec, and the designer opens each with its own pickers and routing', async ({ page }) => {
+  test.setTimeout(240000);
   const errors = collectConsoleErrors(page);
   await loginAsAdmin(page, { port: PORT });
   const id = await createDefinition(page, 'Verified step', { errors: [], escalations: [] });
-  const modes = [
-    { Test: { flowId: 'check-flow', onFailure: 'NeedsHuman' } },
-    { Critic: { agentId: 'critic-agent', criteria: 'Cite a source for every claim.', onFailure: 'Error' } },
+  const agentStep = {
+    agentId: 'agent-1', goalExpression: '"Triage the ticket"', allowedTools: [], maxIterations: 8, outputSchema: null,
+  };
+  const scenarios = [
+    { name: 'test', implementation: null, verification: { Test: { flowId: 'check-flow', onFailure: 'NeedsHuman' } } },
+    { name: 'critic', implementation: { Agent: agentStep },
+      verification: { Critic: { agentId: 'critic-agent', criteria: 'Cite a source for every claim.', onFailure: 'Error' } } },
   ];
-  const saved = await page.evaluate(async ({ definitionId, verifications }) => {
+  const save = (scenario) => page.evaluate(async ({ definitionId, verification, implementation }) => {
     const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
-    const readBack = [];
-    for (const verification of verifications) {
-      const current = (await ApiBinary.one('processDefinitionGetRequest', { definitionId })).definition;
-      const model = current.model;
-      model.nodes = model.nodes.filter((node) => node.id !== 'Service_1');
-      model.nodes.splice(1, 0, { id: 'Service_1', name: 'Check', kind: { ServiceTask: {
-        flowId: 'any-flow', inputMapping: {}, outputMapping: {}, verification, timeoutSeconds: 60 } } });
-      model.sequenceFlows = [
-        { id: 'Sequence_start_service', sourceId: 'Start', targetId: 'Service_1', condition: null },
-        { id: 'Sequence_service_end', sourceId: 'Service_1', targetId: 'End', condition: null },
-      ];
-      model.diagram = { shapes: [
-        { elementId: 'Start', x: 80, y: 160, width: 56, height: 56 },
-        { elementId: 'Service_1', x: 220, y: 148, width: 120, height: 80 },
-        { elementId: 'End', x: 440, y: 160, width: 56, height: 56 },
-      ], edges: [
-        { sequenceFlowId: 'Sequence_start_service', waypoints: [{ x: 136, y: 188 }, { x: 220, y: 188 }] },
-        { sequenceFlowId: 'Sequence_service_end', waypoints: [{ x: 340, y: 188 }, { x: 440, y: 188 }] },
-      ] };
-      await ApiBinary.one('processDefinitionSaveRequest', {
-        commandId: crypto.randomUUID(), definitionId, expectedRevision: current.draftRevision,
-        name: current.name, description: '', model,
-      });
-      const reread = (await ApiBinary.one('processDefinitionGetRequest', { definitionId })).definition;
-      readBack.push(reread.model.nodes.find((node) => node.id === 'Service_1').kind.ServiceTask.verification);
-    }
-    return readBack;
-  }, { definitionId: id, verifications: modes });
-  expect(saved).toEqual(modes);
+    const current = (await ApiBinary.one('processDefinitionGetRequest', { definitionId })).definition;
+    const model = current.model;
+    model.nodes = model.nodes.filter((node) => node.id !== 'Service_1');
+    model.nodes.splice(1, 0, { id: 'Service_1', name: 'Check', kind: { ServiceTask: {
+      flowId: implementation ? '' : 'any-flow', inputMapping: {}, outputMapping: {}, verification, timeoutSeconds: 60,
+      ...(implementation ? { implementation } : {}) } } });
+    model.sequenceFlows = [
+      { id: 'Sequence_start_service', sourceId: 'Start', targetId: 'Service_1', condition: null },
+      { id: 'Sequence_service_end', sourceId: 'Service_1', targetId: 'End', condition: null },
+    ];
+    model.diagram = { shapes: [
+      { elementId: 'Start', x: 80, y: 160, width: 56, height: 56 },
+      { elementId: 'Service_1', x: 220, y: 148, width: 120, height: 80 },
+      { elementId: 'End', x: 440, y: 160, width: 56, height: 56 },
+    ], edges: [
+      { sequenceFlowId: 'Sequence_start_service', waypoints: [{ x: 136, y: 188 }, { x: 220, y: 188 }] },
+      { sequenceFlowId: 'Sequence_service_end', waypoints: [{ x: 340, y: 188 }, { x: 440, y: 188 }] },
+    ] };
+    await ApiBinary.one('processDefinitionSaveRequest', {
+      commandId: crypto.randomUUID(), definitionId, expectedRevision: current.draftRevision,
+      name: current.name, description: '', model,
+    });
+    const reread = (await ApiBinary.one('processDefinitionGetRequest', { definitionId })).definition;
+    return reread.model.nodes.find((node) => node.id === 'Service_1').kind.ServiceTask;
+  }, { definitionId: id, verification: scenario.verification, implementation: scenario.implementation });
+  // The registry of the test node may hold no agents; the designer is shown the
+  // three it needs, so that the exclusion of the step's own agent has something to exclude.
+  const listAgents = () => page.evaluate(async () => {
+    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+    if (ApiBinary.optionsPatched) return;
+    const original = ApiBinary.one.bind(ApiBinary);
+    ApiBinary.one = async (kind, ...rest) => {
+      const response = await original(kind, ...rest);
+      if (kind === 'processOptionsRequest') {
+        const known = new Set((response.serviceAgents || []).map((agent) => agent.agentId));
+        response.serviceAgents = [...(response.serviceAgents || []), ...[
+          ['agent-1', 'Worker'], ['critic-agent', 'Reviewer'], ['agent-2', 'Second reviewer'],
+        ].filter(([agentId]) => !known.has(agentId)).map(([agentId, name]) => ({
+          agentId, name, description: '', maxIterations: 10 }))];
+      }
+      return response;
+    };
+    ApiBinary.optionsPatched = true;
+  });
+  await listAgents();
 
-  await openDesigner(page, { login: false, id });
-  await page.locator('.fb-canvas .fb-node.bpmn_service_task').click({ position: { x: 20, y: 20 } });
-  await page.getByRole('tab', { name: 'Result' }).click();
-  await expect(page.locator('[data-process="verification"]')).toBeVisible();
-  await expect(page.locator('[data-process="verifyAgentId"]')).toBeVisible();
-  await expect(page.locator('[data-process="verifyCriteria"]')).toBeVisible();
-  await expect(page.locator('[data-process="verifyOnFailure"]')).toBeVisible();
+  for (const scenario of scenarios) {
+    const task = await save(scenario);
+    expect(task.verification, scenario.name).toEqual(scenario.verification);
+    if (scenario.implementation) expect(task.implementation, scenario.name).toEqual(scenario.implementation);
+
+    await openDesigner(page, { login: false, id });
+    await page.locator('.fb-canvas .fb-node.bpmn_service_task').click({ position: { x: 20, y: 20 } });
+    await page.getByRole('tab', { name: 'Result' }).click();
+    await expect(page.locator('[data-process="verification"]')).toBeVisible();
+    const mode = Object.keys(scenario.verification)[0];
+    await expect(page.locator('[data-process="verification"] .tf-select-selected')).toHaveText(mode === 'Test' ? /Test/ : /Critic/);
+    await expect(page.locator('[data-process="verifyOnFailure"]')).toBeVisible();
+    const rejection = scenario.verification[mode].onFailure;
+    await expect.poll(() => page.locator('[data-process="verifyOnFailure"]').evaluate((element) => element.value)).toBe(rejection);
+
+    if (mode === 'Test') {
+      // The test picker, not the critic's.
+      await expect(page.locator('[data-process-test]')).toBeVisible();
+      await expect(page.locator('[data-process="verifyFlowId"]')).toBeVisible();
+      await expect(page.locator('[data-process-critic]')).toBeHidden();
+      await expect(page.locator('[data-process="verifyAgentId"]')).toBeHidden();
+      await expect.poll(() => page.locator('[data-process="verifyFlowId"]').evaluate((element) => element.value)).toBe('check-flow');
+      // A rejection sent to a person is not an Error to handle; the person is a NeedsHuman.
+      await expect(page.locator('[data-routing-add="error"]')).toHaveAttribute('aria-disabled', 'true');
+      await expect(page.locator('[data-routing-add="escalation"]')).not.toHaveAttribute('aria-disabled', 'true');
+    } else {
+      await expect(page.locator('[data-process-critic]')).toBeVisible();
+      await expect(page.locator('[data-process="verifyAgentId"]')).toBeVisible();
+      await expect(page.locator('[data-process="verifyCriteria"]')).toBeVisible();
+      await expect(page.locator('[data-process-test]')).toBeHidden();
+      await expect(page.locator('[data-process="verifyFlowId"]')).toBeHidden();
+      // The critic list never offers the agent that does the work.
+      const offered = await page.locator('[data-process="verifyAgentId"]').evaluate((element) => [...element.querySelectorAll('option')].map((option) => option.value));
+      expect(offered).toContain('critic-agent');
+      expect(offered).toContain('agent-2');
+      expect(offered).not.toContain('agent-1');
+      await expect.poll(() => page.locator('[data-process="verifyAgentId"]').evaluate((element) => element.value)).toBe('critic-agent');
+      // A rejection that is an Error can be handled as one, and the escalation is always offered.
+      await expect(page.locator('[data-routing-add="error"]')).not.toHaveAttribute('aria-disabled', 'true');
+      await expect(page.locator('[data-routing-add="escalation"]')).not.toHaveAttribute('aria-disabled', 'true');
+    }
+    // The routing table reads the verdict as a business result in both modes.
+    expect((await routingRows(page)).length, `${scenario.name}: the routing table`).toBeGreaterThanOrEqual(7);
+  }
   expect(errors, diagnostics(errors, proc)).toEqual([]);
 });
 

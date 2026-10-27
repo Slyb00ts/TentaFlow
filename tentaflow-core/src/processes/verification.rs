@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 use tentaflow_protocol::processes::{
     ActivityOutcome, ActivityResult, ActivityVerification, ServiceImplementationKind,
     VerificationKind, VerificationOnFailure,
@@ -26,8 +26,8 @@ use super::agent_exec::{run_verifier_agent, VerifierAgent};
 use super::agent_pin::AgentPinError;
 use super::agent_sink::verification_run_id;
 use super::jobs::{
-    drive_dispatch, fail_claim, finish_observed, now_ms, AccessCheck, Authorize, ExecutionEnd,
-    ServiceJob,
+    drive_dispatch, fail_claim, finish_observed, now_ms, output_limit_result, AccessCheck,
+    Authorize, ExecutionEnd, ServiceJob,
 };
 use super::repository::{
     self, ActivityResultOrigin, ObservedActivityResult, PinnedServiceRole, PinnedServiceSnapshot,
@@ -42,11 +42,23 @@ pub const VERIFICATION_FAILED: &str = "VERIFICATION_FAILED";
 pub const VERIFICATION_UNAVAILABLE: &str = "VERIFICATION_UNAVAILABLE";
 
 /// Longest justification kept from a verifier; the rest stays with the verifier.
-const MAX_REASON_BYTES: usize = 2048;
+pub(super) const MAX_REASON_BYTES: usize = 2048;
 /// Largest work result handed to a critic, like the process data of an agent step.
 const MAX_CRITIC_DATA_BYTES: usize = 64 * 1024;
 /// Evidence entries a result may carry (`parse_contract_result`).
 const MAX_EVIDENCE: usize = 64;
+/// Reason of a verdict that could not be kept as it was: the observation with
+/// it would not fit the history budget of an observed result.
+pub(super) const BUDGET_REASON: &str =
+    "the verdict does not fit the size an observed result may have";
+/// Reason of a work result recorded without its verifier having judged it.
+const INTERRUPTED_REASON: &str = "the verification was interrupted before it gave a verdict";
+/// Prefixes only a verdict writes into the evidence of a result.
+const VERDICT_EVIDENCE_PREFIXES: [&str; 3] = [
+    "verified:",
+    "verification_rejected:",
+    "verification_unavailable:",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -57,8 +69,11 @@ pub enum VerificationVerdict {
 }
 
 /// What the observation says about the verification that produced it. The work
-/// result is not stored a second time: its outputs are the outputs of the
-/// observed result (a verdict never changes them), and the rest is kept here.
+/// is not stored a second time: its outputs are the outputs of the observed
+/// result (a verdict never changes them), its evidence is the evidence of the
+/// observed result without the verdict's marker, and its summary is the summary
+/// of the observed result unless a rejection or an unavailable verifier replaced
+/// it. The record keeps only the rest, so it stays small however large the work is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationRecord {
     pub kind: VerificationKind,
@@ -68,8 +83,13 @@ pub struct VerificationRecord {
     pub reason: String,
     pub work_origin: ActivityResultOrigin,
     pub work_code: Option<String>,
-    pub work_summary: String,
-    pub work_evidence: Vec<String>,
+    /// The summary of the work, kept only when the final result has another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_summary: Option<String>,
+    /// The last evidence entry of a work that already carried the most a result
+    /// may; the marker of the verdict takes its place in the final result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_evidence: Option<String>,
 }
 
 impl VerificationRecord {
@@ -88,44 +108,62 @@ impl VerificationRecord {
             reason: bounded_reason(reason),
             work_origin: work.origin.clone(),
             work_code: work.result.code.clone(),
-            work_summary: work.result.summary.clone(),
-            work_evidence: work.result.evidence.clone(),
+            work_summary: (verdict != VerificationVerdict::Approved)
+                .then(|| work.result.summary.clone()),
+            dropped_evidence: work.result.evidence.get(MAX_EVIDENCE - 1).cloned(),
         }
     }
 
-    /// The work result this record was made for, given the outputs both share.
-    pub fn work_result(&self, outputs: &Value) -> ActivityResult {
+    /// The evidence entry the final result ends with.
+    fn marker(&self) -> String {
+        let tag = format!("{}:{}", self.kind.as_str(), self.reference);
+        match self.verdict {
+            VerificationVerdict::Approved => format!("verified:{tag}"),
+            VerificationVerdict::Rejected => format!("verification_rejected:{tag}"),
+            VerificationVerdict::Unavailable => format!("verification_unavailable:{tag}"),
+        }
+    }
+
+    /// The work result this record was made for, given the final result.
+    pub fn work_result(&self, result: &ActivityResult) -> ActivityResult {
+        let marker = self.marker();
+        let mut evidence = result.evidence.clone();
+        if evidence.last() == Some(&marker) {
+            evidence.pop();
+        }
+        evidence.extend(self.dropped_evidence.clone());
         ActivityResult {
             outcome: ActivityOutcome::Completed,
             code: self.work_code.clone(),
-            summary: self.work_summary.clone(),
-            outputs: outputs.clone(),
-            evidence: self.work_evidence.clone(),
+            summary: self
+                .work_summary
+                .clone()
+                .unwrap_or_else(|| result.summary.clone()),
+            outputs: result.outputs.clone(),
+            evidence,
         }
     }
 
-    /// The result the job records after the verdict, and its origin. This is the
-    /// one place the verdict turns into a result, for the executor that records
-    /// it and the validator that accepts it.
+    /// The result the job records after the verdict on `work`, and its origin.
+    /// This is the one place the verdict turns into a result, for the executor
+    /// that records it and the validator that accepts it.
     pub fn final_result(
         &self,
-        outputs: &Value,
+        work: &ActivityResult,
         on_failure: VerificationOnFailure,
     ) -> (ActivityResult, ActivityResultOrigin) {
-        let work = self.work_result(outputs);
         let mut evidence = work.evidence.clone();
         evidence.truncate(MAX_EVIDENCE - 1);
-        let tag = format!("{}:{}", self.kind.as_str(), self.reference);
+        evidence.push(self.marker());
         match self.verdict {
-            VerificationVerdict::Approved => {
-                evidence.push(format!("verified:{tag}"));
-                (
-                    ActivityResult { evidence, ..work },
-                    self.work_origin.clone(),
-                )
-            }
+            VerificationVerdict::Approved => (
+                ActivityResult {
+                    evidence,
+                    ..work.clone()
+                },
+                self.work_origin.clone(),
+            ),
             VerificationVerdict::Rejected => {
-                evidence.push(format!("verification_rejected:{tag}"));
                 let outcome = match on_failure {
                     VerificationOnFailure::Error => ActivityOutcome::Error,
                     VerificationOnFailure::NeedsHuman => ActivityOutcome::NeedsHuman,
@@ -135,27 +173,52 @@ impl VerificationRecord {
                         outcome,
                         code: Some(VERIFICATION_FAILED.to_owned()),
                         summary: self.reason.clone(),
-                        outputs: work.outputs,
+                        outputs: work.outputs.clone(),
                         evidence,
                     },
                     ActivityResultOrigin::Contract,
                 )
             }
-            VerificationVerdict::Unavailable => {
-                evidence.push(format!("verification_unavailable:{tag}"));
-                (
-                    ActivityResult {
-                        outcome: ActivityOutcome::NeedsHuman,
-                        code: Some(VERIFICATION_UNAVAILABLE.to_owned()),
-                        summary: self.reason.clone(),
-                        outputs: work.outputs,
-                        evidence,
-                    },
-                    ActivityResultOrigin::Contract,
-                )
-            }
+            VerificationVerdict::Unavailable => (
+                ActivityResult {
+                    outcome: ActivityOutcome::NeedsHuman,
+                    code: Some(VERIFICATION_UNAVAILABLE.to_owned()),
+                    summary: self.reason.clone(),
+                    outputs: work.outputs.clone(),
+                    evidence,
+                },
+                ActivityResultOrigin::Contract,
+            ),
         }
     }
+}
+
+/// Refuses a work result that reads like a verdict: the codes and evidence a
+/// result carries only when a verifier decided, so a work cannot pass for one
+/// that was judged, or for a rejection.
+pub fn reject_verdict_imitation(result: &ActivityResult) -> Result<()> {
+    anyhow::ensure!(
+        !matches!(
+            result.code.as_deref(),
+            Some(VERIFICATION_FAILED | VERIFICATION_UNAVAILABLE)
+        ),
+        "a work result cannot carry a verification code"
+    );
+    anyhow::ensure!(
+        !result.evidence.iter().any(|entry| VERDICT_EVIDENCE_PREFIXES
+            .iter()
+            .any(|prefix| entry.starts_with(prefix))),
+        "a work result cannot carry verification evidence"
+    );
+    Ok(())
+}
+
+/// Whether an observation is small enough to be recorded.
+fn fits_budget(observed: &ObservedActivityResult) -> bool {
+    serde_json::to_vec(observed).is_ok_and(|bytes| {
+        u64::try_from(bytes.len())
+            .is_ok_and(|len| len <= super::runtime::MAX_OBSERVED_SERVICE_RESULT_BYTES)
+    })
 }
 
 fn bounded_reason(reason: &str) -> String {
@@ -176,7 +239,7 @@ impl ObservedActivityResult {
     pub fn work_result(&self) -> Cow<'_, ActivityResult> {
         match &self.verification {
             None => Cow::Borrowed(&self.result),
-            Some(record) => Cow::Owned(record.work_result(&self.result.outputs)),
+            Some(record) => Cow::Owned(record.work_result(&self.result)),
         }
     }
 
@@ -197,14 +260,13 @@ impl ObservedActivityResult {
     }
 }
 
-/// The observation after a verdict: the final result of the record and the
-/// outputs of the work.
+/// The observation after a verdict: the final result of the record.
 fn verified(
     work: ObservedActivityResult,
     record: VerificationRecord,
     on_failure: VerificationOnFailure,
 ) -> ObservedActivityResult {
-    let (result, origin) = record.final_result(&work.result.outputs, on_failure);
+    let (result, origin) = record.final_result(&work.result, on_failure);
     ObservedActivityResult {
         result,
         origin,
@@ -258,6 +320,7 @@ pub(super) fn check_verifier_pin(
     conn: &rusqlite::Connection,
     snapshot: &PinnedServiceSnapshot,
     verification: &ActivityVerification,
+    work: &tentaflow_protocol::processes::ServiceImplementation,
 ) -> Result<()> {
     let (kind, reference, _) = verification
         .automatic()
@@ -269,11 +332,14 @@ pub(super) fn check_verifier_pin(
             )
         }
         VerificationKind::Critic => {
-            let agent = super::agent_pin::runnable_agent(conn, reference)?;
+            let agent = super::agent_pin::runnable_critic(conn, reference)?;
             anyhow::ensure!(
                 snapshot.graph_json
-                    == super::agent_pin::agent_pin(&agent, &super::agent_sink::critic_tools())?
-                        .graph_json,
+                    == super::agent_pin::agent_pin(
+                        &agent,
+                        &super::agent_sink::critic_tools_for(work)
+                    )?
+                    .graph_json,
                 "critic snapshot does not match service task"
             );
             Ok(())
@@ -306,7 +372,8 @@ pub(super) fn validate_record_on(
         record.work_origin != ActivityResultOrigin::Platform,
         "a platform result cannot be verified"
     );
-    let (expected, origin) = record.final_result(&observed.result.outputs, on_failure);
+    let work = record.work_result(&observed.result);
+    let (expected, origin) = record.final_result(&work, on_failure);
     anyhow::ensure!(
         expected == observed.result && origin == observed.origin,
         "the verified result differs from what its verdict makes of the work"
@@ -332,6 +399,61 @@ pub(super) fn validate_record_on(
     Ok(())
 }
 
+/// A completed work result recorded without its verifier having judged it (the
+/// worker was gone before the verdict): the result of an unavailable
+/// verification, which is never an approval. A result that is not completed, a
+/// step that asks for no machine verification, or a result with no room for the
+/// record stays as it is, and the planner gives a completed one to a person.
+pub(super) fn interrupted(
+    verification: &ActivityVerification,
+    work: ObservedActivityResult,
+) -> ObservedActivityResult {
+    let Some((kind, reference, on_failure)) = verification.automatic() else {
+        return work;
+    };
+    if work.result.outcome != ActivityOutcome::Completed {
+        return work;
+    }
+    let record = VerificationRecord::new(
+        kind,
+        reference,
+        VerificationVerdict::Unavailable,
+        INTERRUPTED_REASON,
+        &work,
+    );
+    let observed = verified(work.clone(), record, on_failure);
+    if fits_budget(&observed) {
+        observed
+    } else {
+        work
+    }
+}
+
+/// A recorded verdict stands only while the initiator may still use the verifier
+/// that gave it: a verifier withdrawn between the verdict and its acceptance is a
+/// denial like a withdrawn source. A failed read is not one (the result stays
+/// recorded and is accepted later), and an unavailable verification relied on
+/// nobody.
+pub(super) fn require_verifier_current(
+    conn: &rusqlite::Connection,
+    actor: &repository::ProcessActor,
+    observed: &ObservedActivityResult,
+) -> Result<()> {
+    let Some(record) = &observed.verification else {
+        return Ok(());
+    };
+    if record.verdict == VerificationVerdict::Unavailable {
+        return Ok(());
+    }
+    let source_ref = match record.kind {
+        VerificationKind::Test => record.reference.clone(),
+        VerificationKind::Critic => {
+            tentaflow_protocol::processes::agent_source_ref(&record.reference)
+        }
+    };
+    repository::require_source_current(conn, actor, &source_ref, None)
+}
+
 /// What the verification stage needs, resolved from the model and the pins.
 struct Stage<'a> {
     kind: VerificationKind,
@@ -342,8 +464,24 @@ struct Stage<'a> {
 }
 
 impl Stage<'_> {
-    /// The job's one observation after this stage's verdict on `work`.
+    /// The job's one observation after this stage's verdict on `work`. A verdict
+    /// whose observation would not fit the history budget is recorded as an
+    /// unavailable verification instead: the observation must be recordable, or
+    /// the verdict and the work would both be lost to an error.
     fn verdict(
+        &self,
+        work: &ObservedActivityResult,
+        verdict: VerificationVerdict,
+        reason: &str,
+    ) -> ObservedActivityResult {
+        let observed = self.observation(work, verdict, reason);
+        if fits_budget(&observed) {
+            return observed;
+        }
+        self.observation(work, VerificationVerdict::Unavailable, BUDGET_REASON)
+    }
+
+    fn observation(
         &self,
         work: &ObservedActivityResult,
         verdict: VerificationVerdict,
@@ -369,8 +507,9 @@ impl Stage<'_> {
         }
     }
 
-    /// Whether the initiator may still use the verifier.
-    fn access(&self, job: &ServiceJob<'_>) -> AccessCheck {
+    /// Whether the initiator may use the verifier, as far as anyone can tell.
+    /// `Err` carries the refusal, which is final only before the work ran.
+    fn usable(&self, job: &ServiceJob<'_>) -> std::result::Result<(), Refusal> {
         let (user_id, org_id) = (&job.claimed.actor.user_id, &job.claimed.actor.org_id);
         match self.kind {
             VerificationKind::Test => {
@@ -378,12 +517,12 @@ impl Stage<'_> {
                     .dispatcher
                     .authorize_process_flow(self.reference, user_id, org_id)
                 {
-                    Ok(_) => AccessCheck::Allowed,
+                    Ok(_) => Ok(()),
                     Err(error @ DispatchError::Denied { .. }) => {
-                        AccessCheck::Revoked(error.to_string())
+                        Err(Refusal::Denied(error.to_string()))
                     }
                     // A failed read is not a denial.
-                    Err(_) => AccessCheck::Undecided,
+                    Err(_) => Err(Refusal::Unknown),
                 }
             }
             VerificationKind::Critic => {
@@ -391,13 +530,31 @@ impl Stage<'_> {
                     .dispatcher
                     .authorize_process_agent(self.reference, user_id, org_id)
                 {
-                    Ok(_) => AccessCheck::Allowed,
-                    Err(AgentPinError::Unavailable) => AccessCheck::Undecided,
-                    Err(error) => AccessCheck::Revoked(error.to_string()),
+                    Ok(_) => Ok(()),
+                    Err(AgentPinError::Unavailable) => Err(Refusal::Unknown),
+                    Err(error) => Err(Refusal::Denied(error.to_string())),
                 }
             }
         }
     }
+
+    /// The access check before the work is dispatched, where a refusal still
+    /// stops the step.
+    fn access(&self, job: &ServiceJob<'_>) -> AccessCheck {
+        match self.usable(job) {
+            Ok(()) => AccessCheck::Allowed,
+            Err(Refusal::Denied(denial)) => AccessCheck::Revoked(denial),
+            Err(Refusal::Unknown) => AccessCheck::Undecided,
+        }
+    }
+}
+
+/// Why a verifier cannot be used right now.
+enum Refusal {
+    /// The registry says the initiator may not have it (gone, disabled, not allowed).
+    Denied(String),
+    /// A failed read.
+    Unknown,
 }
 
 fn stage<'a>(job: &ServiceJob<'a>) -> Result<Option<Stage<'a>>> {
@@ -483,6 +640,11 @@ pub(super) fn verifier_ready(job: &ServiceJob<'_>) -> Result<bool> {
 /// Records the work result of a step, after the verification its node asks for.
 /// A step without a machine verification, and any result but `Completed`, goes
 /// straight to the recording.
+///
+/// From here on the work has happened, so nothing about the verifier may cost
+/// the work: a verifier that was withdrawn, refuses the initiator or cannot be
+/// read is no verdict (the work goes to a person), and only a loss of the
+/// initiator's access to the work's own source blocks the step.
 pub(super) async fn finish_verified(
     job: &ServiceJob<'_>,
     authorize: Authorize<'_>,
@@ -494,16 +656,19 @@ pub(super) async fn finish_verified(
     let Some(stage) = stage(job)? else {
         return finish_observed(job, authorize, work);
     };
-    // The work's source and the verifier are both the initiator's to use.
-    let both = || match authorize() {
-        AccessCheck::Allowed => stage.access(job),
-        other => other,
-    };
-    let salvage_result = stage.verdict(
-        &work,
-        VerificationVerdict::Unavailable,
-        "the verification was interrupted before it gave a verdict",
-    );
+    // Checked before the verifier is started: a work that leaves no room for
+    // even the smallest verdict cannot be recorded with one, and a critic's
+    // time would be spent on a verdict nobody can keep.
+    if !fits_budget(&stage.observation(&work, VerificationVerdict::Unavailable, BUDGET_REASON)) {
+        return finish_observed(
+            job,
+            authorize,
+            output_limit_result(anyhow::anyhow!(
+                "the work result leaves no room for a verification verdict"
+            )),
+        );
+    }
+    let salvage_result = stage.verdict(&work, VerificationVerdict::Unavailable, INTERRUPTED_REASON);
     // An abandoned verification (cancellation, timeout, lost lease) still ends
     // with the work it was given, in the hands of a person.
     let salvage = || Some(salvage_result.clone());
@@ -513,9 +678,24 @@ pub(super) async fn finish_verified(
             VerificationKind::Critic => run_critic(job, &stage, &work).await,
         }
     };
-    let Some(observed) = drive_dispatch(job, &both, Some(&salvage), execution).await? else {
+    let Some(mut observed) = drive_dispatch(job, authorize, Some(&salvage), execution).await?
+    else {
         return Ok(());
     };
+    // A verifier withdrawn while it was judging gave a verdict nobody may rely on.
+    if observed.verification.as_ref().is_some_and(|record| {
+        matches!(
+            record.verdict,
+            VerificationVerdict::Approved | VerificationVerdict::Rejected
+        )
+    }) && matches!(stage.usable(job), Err(Refusal::Denied(_)))
+    {
+        observed = stage.verdict(
+            &work,
+            VerificationVerdict::Unavailable,
+            "the verifier was withdrawn before its verdict was recorded",
+        );
+    }
     finish_observed(job, authorize, observed)
 }
 
@@ -543,9 +723,6 @@ async fn run_test(
         &claimed.actor.org_id,
     ) {
         Ok(meta) => meta,
-        Err(error @ DispatchError::Denied { .. }) => {
-            return ExecutionEnd::Revoked(error.to_string())
-        }
         Err(error) => {
             return stage.end(
                 work,
@@ -593,7 +770,6 @@ async fn run_test(
                 outcome.error.unwrap_or_default()
             ),
         ),
-        Err(error @ DispatchError::Denied { .. }) => ExecutionEnd::Revoked(error.to_string()),
         Err(error) => stage.end(
             work,
             VerificationVerdict::Unavailable,

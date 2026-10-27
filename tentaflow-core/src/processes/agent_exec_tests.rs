@@ -48,6 +48,8 @@ pub(super) enum Script {
     /// One script for the run of the step's own agent, another for the run of
     /// its critic.
     Roles(Box<Script>, Box<Script>),
+    /// Changes something while the run works, then reports.
+    ReportAfter(Value, Arc<dyn Fn() + Send + Sync>),
 }
 
 #[derive(Default)]
@@ -105,6 +107,13 @@ impl BackgroundFlowRunner for ScriptedRunner {
                     .expect("the report is recorded");
             }
             Script::Silent => {}
+            Script::ReportAfter(arguments, change) => {
+                let binding =
+                    binding_from_meta(&initial.meta).expect("the spawn carried the binding");
+                change();
+                complete_task(&self.db, &binding, &scope, arguments, now_ms())
+                    .expect("the report is recorded");
+            }
             Script::Roles(..) => unreachable!("a role script is resolved to one of its parts"),
             Script::Hold => {
                 cancel.cancelled().await;
@@ -1059,6 +1068,7 @@ async fn drive_abandoned(
         timeout,
         result_expression: None,
         verification: &tentaflow_protocol::processes::ActivityVerification::Human,
+        implementation: &tentaflow_protocol::processes::ServiceImplementation::Flow,
         effective: &effective,
         repeat_extra: &[],
     };

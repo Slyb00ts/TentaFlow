@@ -14754,7 +14754,7 @@
     "verification_on_failure": "Wenn die Prüfung das Ergebnis ablehnt",
     "verification_on_failure_error": "Fehler, den der Prozess behandeln kann",
     "verification_on_failure_human": "An eine Person weiterleiten",
-    "verification_on_failure_hint": "Eine Ablehnung hat den Code VERIFICATION_FAILED. Konnte die Prüfung nicht laufen oder gab sie kein Urteil ab, entscheidet immer eine Person (VERIFICATION_UNAVAILABLE), auch nach einem Neustart mitten in der Prüfung.",
+    "verification_on_failure_hint": "Eine Ablehnung hat den Code VERIFICATION_FAILED. Konnte die Prüfung nicht laufen oder gab sie kein Urteil ab, entscheidet immer eine Person (VERIFICATION_UNAVAILABLE). Nach einem Neustart mitten in der Prüfung geht die Arbeit eines Agenten auf dieselbe Weise an eine Person; das Ergebnis jedes anderen Schritts geht verloren und erscheint als ungewisses Ergebnis (EXTERNAL_OUTCOME_UNCERTAIN).",
     "timeout": "Zeitlimit (Sekunden)",
     "sequence_flow": "Sequenzfluss",
     "condition": "Pfadbedingung (CEL)",

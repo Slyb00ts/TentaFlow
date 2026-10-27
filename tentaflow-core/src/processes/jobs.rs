@@ -97,7 +97,7 @@ pub(super) fn observed_result(
     }
 }
 
-fn output_limit_result(error: anyhow::Error) -> ObservedActivityResult {
+pub(super) fn output_limit_result(error: anyhow::Error) -> ObservedActivityResult {
     ObservedActivityResult {
         result: failure("OUTPUT_LIMIT", error.to_string()),
         origin: ActivityResultOrigin::Platform,
@@ -170,6 +170,10 @@ fn classify_result(
     };
     match super::runtime::evaluate(expression, variables, &result.outputs, extra)
         .and_then(parse_contract_result)
+        .and_then(|result| {
+            super::verification::reject_verdict_imitation(&result)?;
+            Ok(result)
+        })
     {
         Ok(result) => ObservedActivityResult {
             result,
@@ -282,6 +286,8 @@ pub(super) struct ServiceJob<'a> {
     pub(super) timeout: Duration,
     pub(super) result_expression: Option<&'a str>,
     pub(super) verification: &'a ActivityVerification,
+    /// What the step runs; a critic is given no more tools than an agent step allows.
+    pub(super) implementation: &'a ServiceImplementation,
     pub(super) effective: &'a Value,
     pub(super) repeat_extra: &'a [(String, Value)],
 }
@@ -407,6 +413,7 @@ pub async fn execute_claimed(
         timeout: Duration::from_secs(u64::from(*timeout_seconds)),
         result_expression: result_expression.as_deref(),
         verification,
+        implementation,
         effective: &effective,
         repeat_extra: &repeat_extra,
     };
@@ -443,12 +450,12 @@ pub async fn execute_claimed(
     }
 }
 
-/// Whether a claimed job is an agent step, which takes a slot of the agent
-/// class instead of the general one.
+/// Whether a claimed job runs an agent, as its work or as its critic, which
+/// takes a slot of the agent class instead of the general one. The claim query
+/// applies the same rule through `critic_verified`.
 pub(super) fn is_agent_job(claimed: &ClaimedProcessJob) -> bool {
     claimed.snapshot.service_snapshots.iter().any(|snapshot| {
         snapshot.info.node_id == claimed.job.node_id
-            && snapshot.role == PinnedServiceRole::Implementation
             && snapshot.implementation_kind == ServiceImplementationKind::Agent
     })
 }

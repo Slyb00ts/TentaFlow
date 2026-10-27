@@ -1092,6 +1092,7 @@ impl FlowDispatcher {
     pub fn snapshot_process_critic(
         &self,
         agent_id: &str,
+        tools: &[String],
         user_id: &str,
         org_id: &str,
     ) -> std::result::Result<PinnedFlowSnapshot, crate::processes::agent_pin::AgentPinError> {
@@ -1102,7 +1103,7 @@ impl FlowDispatcher {
                 ToolAccessError::Unavailable => AgentPinError::Unavailable,
                 _ => AgentPinError::Initiator,
             })?;
-        let pin = pin_critic(&self.db, agent_id)?;
+        let pin = pin_critic(&self.db, agent_id, tools)?;
         Ok(PinnedFlowSnapshot {
             flow_id: tentaflow_protocol::processes::agent_source_ref(agent_id),
             source_version: 0,

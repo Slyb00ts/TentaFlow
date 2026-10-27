@@ -34,6 +34,7 @@ fn publish(group: &ParallelGroup, member: &Member, authorize: &(dyn Fn() -> Acce
         timeout: std::time::Duration::from_secs(10),
         result_expression: None,
         verification: &tentaflow_protocol::processes::ActivityVerification::Human,
+        implementation: &tentaflow_protocol::processes::ServiceImplementation::Flow,
         effective: &effective,
         repeat_extra: &[],
     };

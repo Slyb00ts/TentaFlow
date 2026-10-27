@@ -1307,7 +1307,48 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bpmn_verification_completions",
             MigrationStep::Rust(bpmn_verification_completions),
         ),
+        (
+            205,
+            "bpmn_service_invocation_critic_verified",
+            MigrationStep::Rust(bpmn_service_invocation_critic_verified),
+        ),
     ]
+}
+
+/// Marks the invocations whose step is verified by a critic agent. A critic is an
+/// agent run of up to an hour, so such a job takes a slot of the agent class like
+/// an agent step does, and the claim query has to tell the two classes apart from
+/// the row itself: the verifier of a step is not part of the invocation identity.
+/// A plain column with a CHECK, so no rebuild is needed; it is as immutable as
+/// the other identity columns of the invocation.
+fn bpmn_service_invocation_critic_verified(conn: &Connection) -> Result<()> {
+    use anyhow::{ensure, Context};
+
+    const TRIGGER: &str = "bpmn_service_invocations_immutable";
+    const ANCHOR: &str = "NEW.implementation_kind IS NOT OLD.implementation_kind OR";
+    let trigger_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [TRIGGER],
+            |row| row.get(0),
+        )
+        .context("bpmn_service_invocations_immutable trigger is missing")?;
+    ensure!(
+        trigger_sql.matches(ANCHOR).count() == 1,
+        "bpmn_service_invocations_immutable has an unexpected kind clause"
+    );
+    let widened = trigger_sql.replace(
+        ANCHOR,
+        &format!("{ANCHOR}\n        NEW.critic_verified IS NOT OLD.critic_verified OR"),
+    );
+    conn.execute_batch(&format!(
+        "ALTER TABLE bpmn_service_invocations
+             ADD COLUMN critic_verified INTEGER NOT NULL DEFAULT 0
+             CHECK (critic_verified IN (0,1));
+         DROP TRIGGER {TRIGGER};
+         {widened};"
+    ))?;
+    Ok(())
 }
 
 /// The verdict of a critic that verifies the result of a Service step: the second
@@ -16823,7 +16864,7 @@ mod tests {
             assert_eq!(*version, index as i64 + 1, "the ladder must stay contiguous");
         }
         let head = ladder.last().unwrap().0;
-        assert_eq!(head, 204);
+        assert_eq!(head, 205);
 
         let fresh = Connection::open_in_memory().unwrap();
         run(&fresh).unwrap();
@@ -16842,7 +16883,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(applied_after_179.len(), 25);
+        assert_eq!(applied_after_179.len(), 26);
         assert_eq!(applied_after_179[0], "org_structure");
         assert_eq!(applied_after_179[19], "bpmn_activity_io_witnesses");
         assert_eq!(applied_after_179[20], "org_absences_drop_reason");
@@ -16853,6 +16894,10 @@ mod tests {
         assert_eq!(applied_after_179[22], "bpmn_deferred_jobs_and_result_recovery");
         assert_eq!(applied_after_179[23], "bpmn_agent_completions_and_invocation_kinds");
         assert_eq!(applied_after_179[24], "bpmn_verification_completions");
+        assert_eq!(
+            applied_after_179[25],
+            "bpmn_service_invocation_critic_verified"
+        );
         let tables = |conn: &Connection| -> Vec<String> {
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap()
@@ -17126,7 +17171,7 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .unwrap();
 
-        run(&conn).unwrap();
+        run_ladder_up_to(&conn, 204);
 
         let kinds: Vec<(String, String)> = conn
             .prepare("SELECT invocation_id,implementation_kind FROM bpmn_service_invocations ORDER BY invocation_id")
@@ -17230,6 +17275,40 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM bpmn_agent_completions", [], |r| r.get::<_, i64>(0)).unwrap(),
             0
         );
+    }
+
+    /// v205: an invocation records whether a critic verifies its step, the claim
+    /// query reads it to pick the slot class, and the column is as immutable as
+    /// the rest of the invocation identity.
+    #[test]
+    fn migration_205_marks_critic_verified_invocations_and_keeps_the_mark_immutable() {
+        let conn = agent_invocation_fixture();
+        insert_invocation(&conn, "inv-old", "flow-1", "flow").unwrap();
+        run(&conn).unwrap();
+
+        let marked: i64 = conn
+            .query_row(
+                "SELECT critic_verified FROM bpmn_service_invocations WHERE invocation_id='inv-old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marked, 0, "an invocation from before the migration has no critic");
+        conn.execute(
+            "UPDATE bpmn_service_invocations SET critic_verified=1 WHERE invocation_id='inv-old'",
+            [],
+        )
+        .expect_err("the mark is part of the invocation identity");
+        conn.execute_batch(
+            "DROP TRIGGER bpmn_service_invocations_immutable;
+             UPDATE bpmn_service_invocations SET critic_verified=1 WHERE invocation_id='inv-old';",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE bpmn_service_invocations SET critic_verified=2 WHERE invocation_id='inv-old'",
+            [],
+        )
+        .expect_err("the mark is a flag");
     }
 
     /// v204 sink table of the critic's verdict: independent of the work report of
