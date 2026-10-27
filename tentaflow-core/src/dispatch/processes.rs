@@ -357,6 +357,9 @@ pub(crate) fn pin_service_snapshots(
     model: &tentaflow_protocol::processes::ProcessModel,
 ) -> Result<Vec<PinnedServiceSnapshot>, ProtocolError> {
     let mut snapshots = Vec::new();
+    // Every agent step the registry refuses is named, not only the first: the
+    // author fixes them in one pass instead of one publication per step.
+    let mut refused_agents = Vec::new();
     for node in crate::processes::model::all_nodes(model) {
         let ProcessNodeKind::ServiceTask {
             flow_id,
@@ -397,24 +400,30 @@ pub(crate) fn pin_service_snapshots(
                 allowed_tools,
                 max_iterations,
                 ..
-            } => executor
-                .snapshot_process_agent(
+            } => {
+                match executor.snapshot_process_agent(
                     agent_id,
                     allowed_tools,
                     *max_iterations,
                     &actor.user_id,
                     &actor.org_id,
-                )
-                .map_err(|error| match error {
-                    AgentPinError::Initiator => {
-                        ProtocolError::new(ProtocolErrorCode::PolicyDenied, error.to_string())
+                ) {
+                    Ok(pinned) => pinned,
+                    Err(error @ AgentPinError::Refused(_)) => {
+                        refused_agents.push(format!("service task {}: {error}", node.id));
+                        continue;
                     }
-                    AgentPinError::Unavailable => ProtocolError::internal(error.to_string()),
-                    AgentPinError::Refused(_) => ProtocolError::bad_request(format!(
-                        "service task {}: {error}",
-                        node.id
-                    )),
-                })?,
+                    Err(error @ AgentPinError::Initiator) => {
+                        return Err(ProtocolError::new(
+                            ProtocolErrorCode::PolicyDenied,
+                            error.to_string(),
+                        ));
+                    }
+                    Err(error @ AgentPinError::Unavailable) => {
+                        return Err(ProtocolError::internal(error.to_string()));
+                    }
+                }
+            }
         };
         snapshots.push(PinnedServiceSnapshot {
             info: PinnedFlowInfo {
@@ -427,6 +436,9 @@ pub(crate) fn pin_service_snapshots(
             role: Default::default(),
             implementation_kind: implementation.kind(),
         });
+    }
+    if !refused_agents.is_empty() {
+        return Err(ProtocolError::bad_request(refused_agents.join("\n")));
     }
     Ok(snapshots)
 }

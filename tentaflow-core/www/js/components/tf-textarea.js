@@ -5,6 +5,8 @@
 // Example: <tf-textarea placeholder="Zapytaj o cokolwiek..." autogrow rows="2">
 // =============================================================================
 
+let errorSequence = 0;
+
 class TfTextarea extends HTMLElement {
   static get observedAttributes() {
     return ['label', 'aria-label', 'placeholder', 'value', 'hint', 'error', 'rows', 'disabled', 'readonly', 'autogrow', 'maxlength'];
@@ -98,6 +100,7 @@ class TfTextarea extends HTMLElement {
 
     const err = document.createElement('span');
     err.className = 'tf-error-text';
+    err.id = `tf-textarea-error-${++errorSequence}`;
     group.appendChild(err);
 
     this.appendChild(group);
@@ -139,6 +142,13 @@ class TfTextarea extends HTMLElement {
     this._hintEl.style.display = hint && !error ? '' : 'none';
     this._errorEl.textContent = error;
     this._errorEl.style.display = error ? '' : 'none';
+    if (error) {
+      this._textarea.setAttribute('aria-invalid', 'true');
+      this._textarea.setAttribute('aria-describedby', this._errorEl.id);
+    } else {
+      this._textarea.removeAttribute('aria-invalid');
+      this._textarea.removeAttribute('aria-describedby');
+    }
 
     this._autogrow();
   }

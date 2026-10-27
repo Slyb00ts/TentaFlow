@@ -913,6 +913,42 @@ fn a_valid_agent_step_publishes_with_a_pin_and_records_an_agent_invocation() {
 }
 
 #[test]
+fn publication_names_every_agent_step_it_refuses() {
+    let fixture = Fixture::new();
+    let disabled_id = "99999999-2222-4333-8444-555555555555";
+    seed_agent(&fixture, disabled_id, "[]", 4, false);
+    let mut model = agent_model(agent_implementation(disabled_id, &[], None));
+    let mut second = model
+        .nodes
+        .iter()
+        .find(|node| node.id == "Service")
+        .unwrap()
+        .clone();
+    second.id = "Second".into();
+    model.nodes.push(second);
+
+    let error = crate::dispatch::processes::pin_service_snapshots(
+        fixture.dispatcher(),
+        &fixture.owner,
+        &model,
+    )
+    .unwrap_err();
+    let lines: Vec<_> = error.message.lines().collect();
+    assert_eq!(lines.len(), 2, "{}", error.message);
+    assert!(
+        lines[0].starts_with("service task Service:")
+            && lines[1].starts_with("service task Second:"),
+        "{}",
+        error.message
+    );
+    assert!(
+        lines.iter().all(|line| line.contains("is disabled")),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
 fn publication_refuses_an_agent_that_cannot_run_a_process_step() {
     let fixture = Fixture::new();
     seed_agent(

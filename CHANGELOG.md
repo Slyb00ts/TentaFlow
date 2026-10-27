@@ -223,6 +223,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   ostrzeżenie w inspektorze i znaczek na płótnie, a odmowa publikacji nazywa krok i
   agenta. Paleta i lista agentów są posortowane po nazwie. Znane ograniczenie:
   kolejność właściwości schematu wyniku jest po zapisie alfabetyczna (opis w planie).
+- Siódma runda poprawek po przeglądzie kroku agenta (B3.4b), z drugiego przebiegu
+  żywego krytyka GUI. „Wstecz” nie pyta już dwa razy: pytanie zadaje wyłącznie
+  router (`canUnmount`), więc Wstecz, pasek boczny i adres mają jedno pytanie, a
+  „Odrzuć zmiany” nie zapisuje niczego (autozapis jest wstrzymany, gdy pytanie jest
+  otwarte). Otwarcie nieistniejącego procesu albo wyjście w trakcie ładowania nie
+  rzuca już błędu z `processDraftProblems`. Baner odrzuconych pól podąża za
+  poprawkami i znika z ostatnią; po odmowie edytor pokazuje pierwszy odrzucony krok
+  z polem (wchodzi do treści i podprocesu), a kliknięcie banera prowadzi do
+  następnego, więc dwa kroki o tej samej nazwie są rozróżnialne. Linie szkiców
+  nazywają miejsce (treść, podprocesy), mają jeden format „Nazwa”: komunikat we
+  wszystkich językach (po francusku ze spacją przed dwukropkiem; apostrofy w sekcji
+  `bpmn` ujednolicone). Odmowa publikacji agentów nazywa wszystkie kroki naraz
+  (serwer zbiera odmowy), z numerem wystąpienia przy powtórzonej nazwie. Zmiana
+  agenta na mniejszy limit iteracji oraz zmiana kroku agenta na Flow z limitem
+  czasu ponad 600 s ogłaszają obniżenie wartości. Nagłówek odmowy publikacji mówi
+  „Nie opublikowano”, a komunikat w toaście zachowuje łamanie linii; odmowa serwera
+  ma teraz toast jak odmowa edytora. `tf-alert` dostał atrybut `live` (rola
+  `alert`), a `tf-input` i `tf-textarea` ustawiają `aria-invalid` i
+  `aria-describedby` dla błędu pola.
 - Paleta projektanta BPMN ma grupę „Bloki TentaFlow” (B3.3a): przepływy, bloki
   Flow Buildera (`llm`, `embeddings`, `pii_filter`) i narzędzia addonów
   upuszcza się na płótno jako gotowe zadania usługi, z nazwą pozycji i bez pytania

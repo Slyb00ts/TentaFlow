@@ -3009,6 +3009,7 @@ test('a refused draft left inside a sub-process still blocks publishing from the
   const graph = canvas();
   const config = inspector(graph);
   const sub = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_sub_process'), 300, 300);
+  graph.updateNodeLabel(sub.id, 'Review stage');
   graph.navigateProcessBody([sub.id]);
   const preset = { implementation: { Agent: { agentId: 'agent-1', goalExpression: '"Summarise"', allowedTools: [], maxIterations: 5, outputSchema: { type: 'object' } } } };
   const agent = graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.node_type === 'bpmn_service_task'), preset }, 300, 300);
@@ -3021,6 +3022,7 @@ test('a refused draft left inside a sub-process still blocks publishing from the
   const problems = config.processDraftProblems();
   assert.equal(problems.length, 1, 'the refused value in the nested body is still reported');
   assert.ok(problems[0].includes('Nested summariser') && problems[0].includes(I18n.t('bpmn.agent_iterations_invalid', { max: 8 })));
+  assert.ok(problems[0].includes('Review stage › Nested summariser'), `a step inside a sub-process is named with it: ${problems[0]}`);
   graph.navigateProcessBody([sub.id]);
   config.show(graph.nodes.find((node) => node.id === agent.id), graph.templates.get(agent.type));
   await flush(2);
@@ -3138,6 +3140,162 @@ test('Save refuses while an inspector field holds a refused value, naming the no
     { type: 'object', properties: { b: {}, a: {} } });
 });
 
+// The real router asks the screen it leaves (`canUnmount`) before it navigates; the suite's stub does not.
+async function throughRouter(run) {
+  const stub = Router.navigate;
+  Router.navigate = async (view, params) => (await builder.canUnmount() ? stub(view, params) : false);
+  try { await run(); } finally { Router.navigate = stub; }
+}
+
+test('Back asks once whatever was left unsaved, and Discard really discards', async () => {
+  const saved = [];
+  const original = TfWindow.confirm;
+  const asked = [];
+  try {
+    await throughRouter(async () => {
+      for (const [label, edit] of [
+        ['a plain edit', (state) => { state.canvas.updateNodeLabel('Agent_1', 'Edited'); }],
+        ['a refused field', (state) => { state.canvas.selectNode('Agent_1'); change(state.root.querySelector('[data-process="agentSchema"]'), '{nope'); }],
+      ]) {
+        const state = await mount(definition('draft-once', { model: agentStepModel() }), saveFixtures('draft-once', saved));
+        state.canvas.selectNode('Agent_1'); await flush(2);
+        edit(state); await flush(2);
+        asked.length = 0; navigation.length = 0; saved.length = 0;
+        TfWindow.confirm = async (options) => {
+          asked.push(options.title);
+          // The autosave timer keeps running behind an open question; what is discarded must not be saved by it.
+          for (const timer of intervals.values()) if (timer.delay === 10000) timer.callback();
+          await flush(2);
+          return false;
+        };
+        click(state.root.querySelector('[data-role="back"]'));
+        await flush(6);
+        assert.equal(asked.length, 1, `${label}: one question`);
+        assert.deepEqual(navigation.map((entry) => entry.view), ['flows'], `${label}: Discard leaves`);
+        assert.equal(saved.length, 0, `${label}: nothing is saved behind the question`);
+        navigation.length = 0;
+      }
+      const state = await mount(definition('draft-once', { model: agentStepModel() }), saveFixtures('draft-once', saved));
+      state.canvas.updateNodeLabel('Agent_1', 'Edited'); await flush(2);
+      asked.length = 0; saved.length = 0;
+      TfWindow.confirm = async (options) => { asked.push(options.title); return true; };
+      click(state.root.querySelector('[data-role="back"]'));
+      await flush(6);
+      assert.equal(asked.length, 1, 'Save and exit asks once as well');
+      assert.equal(saved.length, 1, 'and saves once');
+      assert.deepEqual(navigation.map((entry) => entry.view), ['flows']);
+    });
+  } finally { TfWindow.confirm = original; }
+});
+
+test('leaving while the process is still loading does not look for work in an inspector that does not exist yet', async () => {
+  await builder.unmount();
+  const gate = deferred();
+  fixtures({ processDefinitionGetRequest: () => gate.promise, processOptionsRequest: options });
+  document.body.innerHTML = `<main>${builder.render({ mode: 'bpmn' })}</main>`;
+  const mounting = builder.mount({ flowId: 'loading', mode: 'bpmn' });
+  await flush(2);
+  assert.equal(builder._state.config, null);
+  assert.equal(await builder.canUnmount(), true, 'nothing is loaded, so nothing is unsaved');
+  gate.resolve({ definition: definition('loading'), startCatalog: [] });
+  await mounting;
+});
+
+test('the refusal banner follows the refused fields and goes away with the last one', async () => {
+  const state = await mount(definition('draft-banner', { model: agentStepModel() }), saveFixtures('draft-banner'));
+  state.canvas.selectNode('Agent_1'); await flush(2);
+  const control = (key) => state.root.querySelector(`[data-process="${key}"]`);
+  const banner = state.root.querySelector('[data-role="error"]');
+  change(control('agentSchema'), '{nope');
+  change(control('agentIterations'), '');
+  assert.equal(await builder._save(), false);
+  assert.equal(banner.hidden, false);
+  assert.equal(banner.getAttribute('message').split('\n').length, 4, 'heading, two fields and the hint');
+  change(control('agentSchema'), '{"type":"object"}');
+  assert.equal(banner.hidden, false, 'one field is still refused');
+  assert.equal(banner.getAttribute('message').split('\n').length, 2, 'the banner lists only what is left');
+  assert.ok(!banner.getAttribute('message').includes(I18n.t('bpmn.agent_output_schema_invalid')));
+  change(control('agentIterations'), '3');
+  assert.equal(banner.hidden, true, 'the last fix removes it');
+  assert.notEqual(state.root.querySelector('[data-role="autosave-text"]').textContent, I18n.t('flows_builder.autosave_error'));
+});
+
+test('a refusal shows the first refused step and the banner walks through the others, whatever their names', async () => {
+  const model = agentStepModel({}, [['Agent_1', 'Case reviewer'], ['Agent_2', 'Case reviewer']]);
+  const state = await mount(definition('draft-walk', { model }), saveFixtures('draft-walk'));
+  for (const id of ['Agent_1', 'Agent_2']) {
+    state.canvas.selectNode(id); await flush(2);
+    change(state.root.querySelector('[data-process="agentIterations"]'), '');
+  }
+  state.canvas.selectNode(null);
+  assert.equal(await builder._save(), false);
+  const selected = () => [...state.canvas.selectedIds];
+  assert.deepEqual(selected(), ['Agent_1'], 'the first refused step is shown with its field');
+  assert.equal(state.root.querySelector('[data-process="agentIterations"]').getAttribute('error'), I18n.t('bpmn.agent_iterations_invalid', { max: 8 }));
+  const message = state.root.querySelector('[data-role="error"]').getAttribute('message');
+  assert.ok(message.includes('“Case reviewer (1)”') && message.includes('“Case reviewer (2)”') && message.endsWith(I18n.t('bpmn.drafts_next_hint')), message);
+  click(state.root.querySelector('[data-role="error"]'));
+  assert.deepEqual(selected(), ['Agent_2'], 'the banner leads to the next one');
+  click(state.root.querySelector('[data-role="error"]'));
+  assert.deepEqual(selected(), ['Agent_1'], 'and round again');
+});
+
+test('a refused publication says it was not published and keeps line breaks like a refused save', async () => {
+  const state = await mount(definition('draft-heading', { model: agentStepModel() }), saveFixtures('draft-heading'));
+  state.canvas.selectNode('Agent_1'); await flush(2);
+  change(state.root.querySelector('[data-process="agentIterations"]'), '');
+  const toasts = watchToasts();
+  await builder._publish();
+  const texts = toasts.texts(); toasts.stop();
+  const message = state.root.querySelector('[data-role="error"]').getAttribute('message');
+  assert.ok(message.startsWith(I18n.t('bpmn.publish_drafts_refused')), message);
+  assert.ok(texts.includes(message), 'the toast is the banner, line breaks included');
+});
+
+test('a refusal from the server is also toasted and names every refused agent step', async () => {
+  const model = agentStepModel({ agentId: 'agent-gone' }, [['Agent_1', 'Case reviewer'], ['Agent_2', 'Case reviewer']]);
+  const state = await mount(definition('draft-server', { model }), {
+    ...saveFixtures('draft-server'),
+    processDefinitionPublishRequest: () => { throw new Error('protocol error bad_request: service task Agent_1: the agent "Night shift" is disabled\nservice task Agent_2: the agent "Night shift" is disabled'); },
+  });
+  const toasts = watchToasts();
+  await builder._publish();
+  const texts = toasts.texts(); toasts.stop();
+  const banner = state.root.querySelector('[data-role="error"]').getAttribute('message');
+  assert.ok(banner.includes('“Case reviewer (1)”') && banner.includes('“Case reviewer (2)”'), banner);
+  assert.ok(texts.some((text) => text.includes('“Case reviewer (2)”')), 'the author is told in a toast as for an editor refusal');
+});
+
+test('a value the agent or the kind of step cuts back is announced', async () => {
+  const state = await mount(definition('draft-clamp', { model: agentStepModel({ maxIterations: 40 }) }), saveFixtures('draft-clamp'));
+  state.canvas.selectNode('Agent_1'); await flush(2);
+  const toasts = watchToasts();
+  change(state.root.querySelector('[data-process="agentId"]'), 'agent-2');
+  await flush(2);
+  assert.ok(toasts.texts().includes(I18n.t('bpmn.agent_iterations_reduced', { was: 40, max: 3 })), toasts.texts().join(' | '));
+  state.canvas.updateNodeConfig('Agent_1', { timeoutSeconds: 1200 });
+  state.canvas.selectNode(null); state.canvas.selectNode('Agent_1'); await flush(2);
+  change(state.root.querySelector('[data-process="implementation"]'), 'flow');
+  await flush(2);
+  assert.ok(toasts.texts().includes(I18n.t('bpmn.timeout_reduced', { was: 1200, max: 600 })), toasts.texts().join(' | '));
+  toasts.stop();
+});
+
+test('the refusal banner and an inspector warning are live regions and a refused field is described by its error', async () => {
+  const state = await mount(definition('draft-live', { model: agentStepModel({ agentId: 'agent-gone' }) }), saveFixtures('draft-live'));
+  state.canvas.selectNode('Agent_1'); await flush(2);
+  assert.equal(state.root.querySelector('[data-role="error"]').querySelector('.tf-alert').getAttribute('role'), 'alert');
+  assert.equal(state.root.querySelector('[data-agent-warning] .tf-alert').getAttribute('role'), 'alert');
+  const field = state.root.querySelector('[data-process="agentIterations"]');
+  change(field, '');
+  const input = field.querySelector('input');
+  assert.equal(input.getAttribute('aria-invalid'), 'true');
+  assert.equal(field.querySelector(`#${input.getAttribute('aria-describedby')}`).textContent, I18n.t('bpmn.agent_iterations_invalid', { max: 5 }));
+  change(field, '3');
+  assert.equal(input.getAttribute('aria-invalid'), null);
+  assert.equal(input.getAttribute('aria-describedby'), null);
+});
+
 test('leaving the editor counts a refused field as unsaved even when nothing else changed', async () => {
   const saved = [];
   const state = await mount(definition('draft-leave', { model: agentStepModel() }), saveFixtures('draft-leave', saved));
@@ -3154,14 +3312,16 @@ test('leaving the editor counts a refused field as unsaved even when nothing els
     assert.deepEqual(asked, [I18n.t('flows_builder.unsaved_title')], 'but the author is asked first');
     TfWindow.confirm = async () => true;
     assert.equal(await builder.canUnmount(), false, 'saving what cannot be saved keeps the author here');
-    navigation.length = 0;
-    click(state.root.querySelector('[data-role="back"]'));
-    await flush(4);
-    assert.deepEqual(navigation, [], 'Back with such a field does not leave');
-    TfWindow.confirm = async () => false;
-    click(state.root.querySelector('[data-role="back"]'));
-    await flush(4);
-    assert.deepEqual(navigation.map((entry) => entry.view), ['flows'], 'discarding on purpose leaves');
+    await throughRouter(async () => {
+      navigation.length = 0;
+      click(state.root.querySelector('[data-role="back"]'));
+      await flush(4);
+      assert.deepEqual(navigation, [], 'Back with such a field does not leave');
+      TfWindow.confirm = async () => false;
+      click(state.root.querySelector('[data-role="back"]'));
+      await flush(4);
+      assert.deepEqual(navigation.map((entry) => entry.view), ['flows'], 'discarding on purpose leaves');
+    });
   } finally { TfWindow.confirm = original; }
   assert.equal(saved.length, 0);
 });
@@ -3192,8 +3352,8 @@ test('publication problems are listed one per line and name duplicate steps apar
   }
   await builder._publish();
   const lines = state.root.querySelector('[data-role="error"]').getAttribute('message').split('\n');
-  assert.equal(lines.length, 3, 'a heading and one line per refused field');
-  assert.ok(lines[1].startsWith('Review (1):') && lines[2].startsWith('Review (2):'), lines.join(' | '));
+  assert.equal(lines.length, 4, 'a heading, one line per refused field and the hint to the next one');
+  assert.ok(lines[1].startsWith('“Review (1)”:') && lines[2].startsWith('“Review (2)”:'), lines.join(' | '));
 });
 
 test('publication problems the editor finds itself are listed one per line and leave the save status alone', async () => {

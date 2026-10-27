@@ -678,11 +678,14 @@ export function processExplainError(message, model) {
   }
   const timeout = /service task ([\w.-]+) timeout is outside 1\.\.=(\d+) seconds/.exec(text);
   if (timeout && names.has(timeout[1])) return I18n.t('bpmn.timeout_out_of_range', { node: names.get(timeout[1]), max: Number(timeout[2]) });
-  const agentGone = /service task ([\w.-]+): the agent (?:"(.*?)" is disabled|\S+ does not exist)/s.exec(text);
-  if (agentGone && names.has(agentGone[1])) {
-    return agentGone[2] === undefined
-      ? I18n.t('bpmn.publish_agent_missing', { node: names.get(agentGone[1]) })
-      : I18n.t('bpmn.publish_agent_disabled', { node: names.get(agentGone[1]), agent: agentGone[2] });
+  // A publication names every refused agent step, one per line; two steps of one name carry their occurrence number.
+  const agentLines = [...text.matchAll(/service task ([\w.-]+): the agent (?:"(.*?)" is disabled|\S+ does not exist)/gs)]
+    .filter((line) => names.has(line[1]));
+  if (agentLines.length) {
+    const labels = processDistinctLabels([...names]);
+    return agentLines.map((line) => (line[2] === undefined
+      ? I18n.t('bpmn.publish_agent_missing', { node: labels.get(line[1]) })
+      : I18n.t('bpmn.publish_agent_disabled', { node: labels.get(line[1]), agent: line[2] }))).join('\n');
   }
   const unsimulated = /repetition is unsupported in simulation \(([\w.-]+)\)/.exec(text);
   if (unsimulated && names.has(unsimulated[1])) return I18n.t('bpmn.simulation_repeat_unsupported', { names: names.get(unsimulated[1]) });

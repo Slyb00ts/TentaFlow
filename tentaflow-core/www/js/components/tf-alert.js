@@ -15,7 +15,7 @@ const VALID_TONES = new Set(['info', 'success', 'warning', 'danger']);
 
 class TfAlert extends HTMLElement {
   static get observedAttributes() {
-    return ['tone', 'title', 'message', 'dismissable'];
+    return ['tone', 'title', 'message', 'dismissable', 'live'];
   }
 
   constructor() {
@@ -92,6 +92,9 @@ class TfAlert extends HTMLElement {
     const dismissable = this.hasAttribute('dismissable');
 
     this._root.className = `tf-alert ${tone}`;
+    // `live` makes the alert a live region: a message that appears or changes after the page is read out, which a plain banner does not do.
+    if (this.hasAttribute('live')) this._root.setAttribute('role', 'alert');
+    else this._root.removeAttribute('role');
     this._root.textContent = '';
 
     // Icon path comes from the trusted TONE_ICONS map keyed by a validated

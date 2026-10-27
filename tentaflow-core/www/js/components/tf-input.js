@@ -12,6 +12,8 @@
 //   name them for assistive tech. A button at its bound is disabled.
 // =============================================================================
 
+let errorSequence = 0;
+
 class TfInput extends HTMLElement {
   static get observedAttributes() {
     return ['label', 'placeholder', 'value', 'hint', 'error', 'type', 'icon', 'trailing-icon', 'prefix', 'suffix', 'disabled', 'readonly', 'autocomplete', 'autofocus', 'required', 'name', 'autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern', 'multiline', 'rows', 'min', 'max', 'step', 'stepper', 'stepper-dec-label', 'stepper-inc-label'];
@@ -154,6 +156,7 @@ class TfInput extends HTMLElement {
 
     const err = document.createElement('span');
     err.className = 'tf-error-text';
+    err.id = `tf-input-error-${++errorSequence}`;
     group.appendChild(err);
 
     this.appendChild(group);
@@ -264,6 +267,14 @@ class TfInput extends HTMLElement {
 
     this._errorEl.textContent = error;
     this._errorEl.style.display = error ? '' : 'none';
+    // The message must reach assistive technology with the field, not only the eye.
+    if (error) {
+      this._input.setAttribute('aria-invalid', 'true');
+      this._input.setAttribute('aria-describedby', this._errorEl.id);
+    } else {
+      this._input.removeAttribute('aria-invalid');
+      this._input.removeAttribute('aria-describedby');
+    }
   }
 
   _bound(name) {

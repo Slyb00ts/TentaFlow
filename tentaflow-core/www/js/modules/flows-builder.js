@@ -100,7 +100,7 @@ const FlowBuilderScreen = {
           <tf-button variant="ghost" size="sm" icon="clock" data-role="history" title="${escapeAttr(I18n.t('flows_builder.history_title'))}"></tf-button>`}
         </header>
         ${process ? `<div class="fb-process-notice" id="fb-process-notice"><tf-chip status="info" data-role="publication">${escapeHtml(I18n.t('bpmn.draft'))}</tf-chip><tf-button variant="ghost" size="sm" icon="chevron-down" data-role="notice-toggle" aria-controls="fb-process-notice">${escapeHtml(I18n.t('bpmn.process_settings'))}</tf-button><span data-role="process-hint">${escapeHtml(I18n.t('bpmn.supported_hint'))}</span><tf-select data-role="body-select" wrap-selected label="${escapeAttr(I18n.t('bpmn.process_body'))}"></tf-select><tf-select data-role="start-entry" wrap-selected label="${escapeAttr(I18n.t('bpmn.start_entry'))}"></tf-select><tf-button variant="secondary" size="sm" data-role="add-body">${escapeHtml(I18n.t('bpmn.add_process_body'))}</tf-button><tf-input data-role="body-name" label="${escapeAttr(I18n.t('bpmn.process_body_name'))}"></tf-input><tf-chip status="info" data-role="calendar-state" hidden></tf-chip><tf-input class="fb-timer-timezone" data-role="timer-timezone" label="${escapeAttr(I18n.t('bpmn.timer_timezone'))}" hint="${escapeAttr(I18n.t('bpmn.timer_timezone_hint'))}" placeholder="${escapeAttr(I18n.t('bpmn.timer_timezone_placeholder'))}" hidden></tf-input><tf-button variant="ghost" size="sm" data-role="draft" hidden>${escapeHtml(I18n.t('bpmn.return_draft'))}</tf-button><tf-button variant="ghost" size="sm" data-role="archive">${escapeHtml(I18n.t('bpmn.archive'))}</tf-button><span data-role="timer-summary" hidden></span></div>` : ''}
-        <tf-alert data-role="error" tone="danger" hidden></tf-alert>
+        <tf-alert data-role="error" tone="danger" live hidden></tf-alert>
 
         <div class="fb-body" data-role="body">
           <aside class="fb-palette" id="fb-palette" data-role="palette"></aside>
@@ -244,7 +244,7 @@ const FlowBuilderScreen = {
       readOnly: state.readOnly,
       mode: state.mode,
       processOptions: state.processOptions,
-      onModelReplace: (restored) => state.config?.modelReplaced(restored),
+      onModelReplace: (restored) => { state.config?.modelReplaced(restored); this._syncDraftBanner(state); },
       onChange: () => {
         this._markDirty();
         this._updateStats();
@@ -253,6 +253,7 @@ const FlowBuilderScreen = {
           this._syncProcessPath();
           this._syncProcessControls();
           state.config.refreshRouting();
+          this._syncDraftBanner(state);
         }
       },
       onSelect: (node, edge) => {
@@ -359,17 +360,12 @@ const FlowBuilderScreen = {
     nameEl.addEventListener('input', (event) => { if (event.target !== nameEl) return; this._markDirty(); this._syncCrumb(state); });
     statusEl.addEventListener('change', () => this._markDirty());
 
-    root.querySelector('[data-role="back"]').addEventListener('click', async () => {
-      if (this._hasUnsavedWork(state)) {
-        const ok = await TfWindow.confirm({
-          title: I18n.t('flows_builder.unsaved_title'),
-          message: I18n.t('flows_builder.unsaved_message'),
-          confirmLabel: I18n.t('flows_builder.unsaved_confirm'),
-          cancelLabel: I18n.t('flows_builder.unsaved_cancel'),
-        });
-        if (ok && !await this._save()) return;
-      }
-      Router.navigate('flows');
+    // The router asks `canUnmount` before it leaves, so Back, the sidebar and the
+    // address bar share ONE question; asking here as well made it twice.
+    root.querySelector('[data-role="back"]').addEventListener('click', () => Router.navigate('flows'));
+    // With several refused fields the banner is also the way to the next one.
+    root.querySelector('[data-role="error"]').addEventListener('click', () => {
+      if (state.saveProblem === 'draftsSave' || state.saveProblem === 'draftsPublish') this._revealDraft(state, (state.draftCursor ?? 0) + 1);
     });
 
     root.querySelector('[data-role="zoom-in"]').addEventListener('click', () => state.canvas.zoomBy(1.2));
@@ -625,7 +621,7 @@ const FlowBuilderScreen = {
     // Autosave co 10s gdy dirty
     if (!state.readOnly || state.mode === 'bpmn') {
       state.autosaveTimer = setInterval(() => {
-        if (this._current(state) && state.dirty && !state.readOnly && !state.saving) this._save({ silent: true });
+        if (this._current(state) && state.dirty && !state.readOnly && !state.saving && !state.leaving) this._save({ silent: true });
       }, 10000);
     }
 
@@ -649,8 +645,13 @@ const FlowBuilderScreen = {
     const state = this._state;
     if (!state || !this._hasUnsavedWork(state)) return true;
     if (state.saving || state.operationBusy) return false;
-    const save = await TfWindow.confirm({ title: I18n.t('flows_builder.unsaved_title'), message: I18n.t('flows_builder.unsaved_message'),
-      confirmLabel: I18n.t('flows_builder.unsaved_confirm'), cancelLabel: I18n.t('flows_builder.unsaved_cancel') });
+    // An autosave while the question is open would keep what the author is about to discard.
+    state.leaving = true;
+    let save;
+    try {
+      save = await TfWindow.confirm({ title: I18n.t('flows_builder.unsaved_title'), message: I18n.t('flows_builder.unsaved_message'),
+        confirmLabel: I18n.t('flows_builder.unsaved_confirm'), cancelLabel: I18n.t('flows_builder.unsaved_cancel') });
+    } finally { state.leaving = false; }
     return save ? this._save() : true;
   },
 
@@ -659,14 +660,36 @@ const FlowBuilderScreen = {
   // A value the inspector refused is not model state, so it never marks the
   // flow dirty; leaving the editor would still lose it, so it counts as unsaved.
   _hasUnsavedWork(state) {
-    return state.dirty || (state.mode === 'bpmn' && state.config.processDraftProblems().length > 0);
+    return state.dirty || (state.mode === 'bpmn' && (state.config?.processDraftProblems().length ?? 0) > 0);
   },
 
   // What the author typed and the inspector refused cannot be saved, and saving
   // around it would drop it unseen: the save says so and names the node.
-  _draftSaveProblem(state) {
+  _draftSaveProblem(state, headingKey = 'bpmn.save_drafts_refused') {
     const drafts = state.config.processDraftProblems();
-    return drafts.length ? [I18n.t('bpmn.save_drafts_refused'), ...drafts].join('\n') : null;
+    if (!drafts.length) return null;
+    return [I18n.t(headingKey), ...drafts, ...(drafts.length > 1 ? [I18n.t('bpmn.drafts_next_hint')] : [])].join('\n');
+  },
+
+  // Takes the author to the refused field `index` (wrapping): its body and
+  // sub-processes are entered, the step is selected and the field takes focus.
+  // Two steps of one name are told apart by being shown, one at a time.
+  _revealDraft(state, index) {
+    const targets = state.config.processDraftTargets();
+    if (!targets.length) return;
+    state.draftCursor = ((index % targets.length) + targets.length) % targets.length;
+    const target = targets[state.draftCursor];
+    const canvas = state.canvas;
+    const here = canvas.selectedProcessId === target.processId && canvas.processPath.join('/') === target.path.join('/');
+    if (!here) {
+      canvas.navigateProcessBody(target.path, target.processId);
+      state.config.renderEmpty();
+      this._syncProcessPath();
+      this._updateStats();
+      this._renderMinimap();
+    }
+    canvas.selectNode(target.nodeId);
+    state.config.focusDraftField(target.nodeId, target.field);
   },
 
   _syncProcessControls() {
@@ -769,14 +792,13 @@ const FlowBuilderScreen = {
     const state = this._state;
     if (!state || !this._current(state) || state.operationBusy) return;
     state.operationBusy = true;
+    this._clearSaveProblem(state);
     state.root.querySelector('[data-role="error"]').hidden = true;
     this._syncProcessControls();
     try { await action(state); }
     catch (error) {
       if (!this._current(state)) return;
-      const alert = state.root.querySelector('[data-role="error"]');
-      alert.hidden = false;
-      alert.setAttribute('message', I18n.t('bpmn.request_error', { error: this._explain(state, error.message) }));
+      this._reportPublishProblem(state, I18n.t('bpmn.request_error', { error: this._explain(state, error.message) }), 'request');
     } finally {
       state.operationBusy = false;
       if (this._current(state)) this._syncProcessControls();
@@ -787,9 +809,10 @@ const FlowBuilderScreen = {
     const state = this._state;
     if (!state || state.readOnly || state.saving) return;
     this._clearSaveProblem(state);
-    const drafts = this._draftSaveProblem(state);
+    const drafts = this._draftSaveProblem(state, 'bpmn.publish_drafts_refused');
     if (drafts) {
-      this._reportPublishProblem(state, drafts);
+      this._reportPublishProblem(state, drafts, 'draftsPublish');
+      this._revealDraft(state, 0);
       return;
     }
     if (state.dirty && !await this._save()) return;
@@ -1217,7 +1240,8 @@ const FlowBuilderScreen = {
     // ochrona przed zbednym round-tripem i czytelnym komunikatem inline.
     const drafts = s.mode === 'bpmn' ? this._draftSaveProblem(s) : null;
     if (drafts) {
-      this._reportSaveProblem(s, drafts, silent);
+      this._reportSaveProblem(s, drafts, silent, 'draftsSave');
+      if (!silent) this._revealDraft(s, 0);
       return false;
     }
     const errors = s.canvas.validate ? s.canvas.validate() : [];
@@ -1314,13 +1338,13 @@ const FlowBuilderScreen = {
   // text, a banner under the toolbar naming the element, and, for a save the
   // author asked for, a toast. A silent autosave repeats every ten seconds and
   // must not toast each time.
-  _reportSaveProblem(state, text, silent) {
+  _reportSaveProblem(state, text, silent, kind = 'save') {
     this._setAutosave('error', text);
     const alert = state.root.querySelector('[data-role="error"]');
     if (alert) {
       alert.hidden = false;
       alert.setAttribute('message', text);
-      state.saveProblem = true;
+      state.saveProblem = kind;
     }
     if (!silent) toast(text, 'error');
   },
@@ -1328,14 +1352,14 @@ const FlowBuilderScreen = {
   // A publication the author asked for and the editor refuses before asking the
   // server is not a failed save: the draft stays as saved, so the status keeps
   // saying so and only the banner and a toast name the cause.
-  _reportPublishProblem(state, text) {
+  _reportPublishProblem(state, text, kind = 'publish') {
     const alert = state.root.querySelector('[data-role="error"]');
     if (alert) {
       alert.hidden = false;
       alert.setAttribute('message', text);
-      state.saveProblem = true;
+      state.saveProblem = kind;
     }
-    toast(text.replaceAll('\n', ' '), 'error');
+    toast(text, 'error');
   },
 
   _clearSaveProblem(state) {
@@ -1343,6 +1367,21 @@ const FlowBuilderScreen = {
     state.saveProblem = false;
     const alert = state.root.querySelector('[data-role="error"]');
     if (alert) alert.hidden = true;
+  },
+
+  // The banner for refused fields lists what is still refused: it follows the
+  // fixes, and goes away with the last one instead of outliving them.
+  _syncDraftBanner(state) {
+    const kind = state.saveProblem;
+    if (kind !== 'draftsSave' && kind !== 'draftsPublish') return;
+    const text = this._draftSaveProblem(state, kind === 'draftsSave' ? 'bpmn.save_drafts_refused' : 'bpmn.publish_drafts_refused');
+    if (!text) {
+      this._clearSaveProblem(state);
+      if (kind === 'draftsSave') this._setAutosave(state.dirty ? 'pending' : 'ok');
+      return;
+    }
+    state.root.querySelector('[data-role="error"]')?.setAttribute('message', text);
+    if (kind === 'draftsSave') this._setAutosave('error', text);
   },
 
   async _openVariables() {

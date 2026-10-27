@@ -5,7 +5,7 @@
 //       (Konfiguracja/Porty/Zaawansowane), preview JSON, akcje Duplikuj/Usuń.
 // =============================================================================
 
-import { escapeHtml, escapeAttr } from '/js/utils.js';
+import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { getNodeName, getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
@@ -290,7 +290,7 @@ export class FlowConfig {
     const canvas = this.opts.getCanvas?.();
     const processId = canvas?.selectedProcessId ?? null;
     const path = [...(canvas?.processPath || [])];
-    return { key: JSON.stringify([processId, path, node.id, field]), processId, path, nodeId: node.id };
+    return { key: JSON.stringify([processId, path, node.id, field]), processId, path, nodeId: node.id, field };
   }
 
   _draftText(draft) { return I18n.t(draft.errorKey, draft.errorParams); }
@@ -320,14 +320,43 @@ export class FlowConfig {
     }
   }
 
-  /** One line per field whose typed text was refused and is still unfixed, named by its node in whichever body it lives. */
+  /** Where each refused field lives, in the order `processDraftProblems` lists them. */
+  processDraftTargets() {
+    this.pruneProcessDrafts();
+    return [...this.processDrafts.values()].map(({ processId, path, nodeId, field }) => ({ processId, path, nodeId, field }));
+  }
+
+  /**
+   * One line per field whose typed text was refused and is still unfixed. The
+   * step is named by its place: the body (when the document has several) and
+   * every sub-process entered, so two steps of one name in different places do
+   * not read alike; two in the same place get their occurrence number.
+   */
   processDraftProblems() {
     this.pruneProcessDrafts();
     const model = this.opts.getCanvas?.()?.getData();
     if (!model) return [];
-    // Two steps may share a name; the line must say which one it means.
-    const names = processDistinctLabels([...processElementNames(model)]);
-    return [...this.processDrafts.values()].map((draft) => `${names.get(draft.nodeId)}: ${this._draftText(draft)}`);
+    const names = processElementNames(model);
+    const bodies = processBodyLabels(model);
+    const places = [...this.processDrafts.values()].map((draft) => {
+      const where = [...(model.additionalProcesses?.length ? [bodies.get(draft.processId ?? model.processId)] : []),
+        ...draft.path.map((id) => names.get(id) ?? id), names.get(draft.nodeId)];
+      return [draft, where.join(' › ')];
+    });
+    const labels = processDistinctLabels(places.map(([draft, place]) => [draft.key, place]));
+    return places.map(([draft]) => I18n.t('bpmn.draft_line', { node: labels.get(draft.key), message: this._draftText(draft) }));
+  }
+
+  /** Shows a refused field again: its tab is opened when another one is in front, and the control takes focus. */
+  focusDraftField(nodeId, field) {
+    let control = this.root.querySelector(`[data-process="${field}"]`);
+    const panel = control?.closest('[data-service-panel]');
+    if (panel?.hidden && this.node?.id === nodeId) {
+      this.processTab = panel.dataset.servicePanel;
+      this._renderProcess();
+      control = this.root.querySelector(`[data-process="${field}"]`);
+    }
+    control?.focus?.();
   }
 
   show(node, template) {
@@ -739,7 +768,7 @@ export class FlowConfig {
       const iterationLimit = agentTask ? processAgentIterationLimit(listedAgent, agentTask.maxIterations) : 0;
       const source = agentTask
         ? `<tf-select data-process="agentId" wrap-selected label="${escapeAttr(I18n.t('bpmn.agent_label'))}" value="${escapeAttr(agentTask.agentId)}" ${disabled}>${agents.map((agent) => `<option value="${escapeAttr(agent.agentId)}">${escapeHtml(agentLabels.get(agent.agentId))}</option>`).join('')}${agents.some((agent) => agent.agentId === agentTask.agentId) ? '' : `<option value="${escapeAttr(agentTask.agentId)}" disabled>${escapeHtml(I18n.t('bpmn.agent_unavailable'))}</option>`}</tf-select>
-        ${listedAgent ? '' : `<tf-alert tone="warning" data-agent-warning message="${escapeAttr(I18n.t('bpmn.agent_unavailable_warning'))}"></tf-alert>`}
+        ${listedAgent ? '' : `<tf-alert tone="warning" live data-agent-warning message="${escapeAttr(I18n.t('bpmn.agent_unavailable_warning'))}"></tf-alert>`}
         ${textarea('agentGoal', 'agent_goal', agentTask.goalExpression, 3)}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.agent_goal_hint'))}</p>
         ${textarea('agentTools', 'agent_tools', agentTask.allowedTools.join('\n'), 3)}
@@ -1393,7 +1422,10 @@ export class FlowConfig {
                 inputMapping: { ...node.config.inputMapping, payload: node.config.inputMapping?.payload ?? 'vars.text' } }
               : { implementation: 'Flow' };
         // Only an agent may work longer than ten minutes.
-        if (node.config.implementation?.Agent && node.config.timeoutSeconds > 600) next.timeoutSeconds = 600;
+        if (node.config.implementation?.Agent && node.config.timeoutSeconds > 600) {
+          next.timeoutSeconds = 600;
+          toast(I18n.t('bpmn.timeout_reduced', { was: node.config.timeoutSeconds, max: 600 }), 'info');
+        }
         for (const field of ['agentIterations', 'agentSchema']) this._clearDraft(node, field);
         this.opts.onConfigChange(node.id, next);
         this._renderProcess();
@@ -1426,6 +1458,9 @@ export class FlowConfig {
           next.agentId = control.value;
           // A step may not ask for more iterations than its agent allows.
           next.maxIterations = Math.min(next.maxIterations, limit);
+          if (next.maxIterations < current.maxIterations) {
+            toast(I18n.t('bpmn.agent_iterations_reduced', { was: current.maxIterations, max: next.maxIterations }), 'info');
+          }
           this._clearDraft(node, 'agentIterations');
         }
         this.opts.onConfigChange(node.id, { implementation: { Agent: next } });
