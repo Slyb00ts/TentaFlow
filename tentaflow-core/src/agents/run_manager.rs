@@ -129,7 +129,7 @@ impl RunStatus {
 /// Terminal check on a persisted status string — the DB mirror of
 /// `RunStatus::is_terminal` for rows read back from `agent_runs`.
 fn db_status_is_terminal(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "cancelled" | "interrupted")
+    repository::agent_run_status_is_terminal(status)
 }
 
 /// Outcome of watching one run's live status channel until it settles — the
@@ -381,12 +381,7 @@ impl AgentRunManager {
         repository::list_agent_runs_by_parent(&self.db, parent_run_id)
             .map(|rows| {
                 rows.iter()
-                    .filter(|r| {
-                        matches!(
-                            r.status.as_str(),
-                            "queued" | "running" | "waiting" | "waiting_user"
-                        )
-                    })
+                    .filter(|r| repository::agent_run_status_is_active(&r.status))
                     .count()
             })
             .unwrap_or(0)
@@ -1085,12 +1080,7 @@ impl AgentRunManager {
         let children = repository::list_agent_runs_by_parent(&self.db, &caller.run_id)?;
         let active: Vec<Value> = children
             .iter()
-            .filter(|r| {
-                matches!(
-                    r.status.as_str(),
-                    "queued" | "running" | "waiting" | "waiting_user"
-                )
-            })
+            .filter(|r| repository::agent_run_status_is_active(&r.status))
             .map(|r| {
                 json!({
                     "run_id": r.id,
@@ -1579,9 +1569,22 @@ async fn run_task(ctx: TaskContext) {
             completion_tokens: usage.map(|u| u.completion_tokens as i64),
             model: model.as_deref(),
             set_finished: true,
+            // `cancel` writes its row before it signals the token, so the check
+            // above can miss a cancel that already settled the row.
+            keep_cancelled: true,
             ..Default::default()
         },
     );
+    let (final_status, exit_reason) = if final_status != RunStatus::Cancelled
+        && repository::get_agent_run(&db, &run_id)
+            .ok()
+            .flatten()
+            .is_some_and(|row| row.status == RunStatus::Cancelled.as_str())
+    {
+        (RunStatus::Cancelled, "cancelled".to_string())
+    } else {
+        (final_status, exit_reason)
+    };
     let _ = status.send(final_status);
     close_session_run(
         code_session.as_ref(),
@@ -3408,6 +3411,120 @@ mod tests {
         let row = repository::get_agent_run(&pool, &top).unwrap().unwrap();
         assert_eq!(row.status, "completed");
         assert_eq!(row.exit_reason.as_deref(), Some("final_response"));
+    }
+
+    /// Runs the interleaving `cancel` can produce: its row write lands, then the
+    /// flow finishes normally before the token is signalled.
+    struct CancelledRowRunner {
+        db: DbPool,
+    }
+
+    #[async_trait]
+    impl BackgroundFlowRunner for CancelledRowRunner {
+        async fn run_agent_flow(
+            &self,
+            _flow: FlowRef,
+            _initial: FlowEnvelope,
+            _principal: AgentPrincipal,
+            _deadline: Option<Instant>,
+            cancel: CancellationToken,
+            _progress: Arc<dyn ProgressSink>,
+            scope: String,
+        ) -> Result<AgentFlowOutcome> {
+            assert!(repository::cancel_active_agent_run(&self.db, &scope)?);
+            assert!(
+                !cancel.is_cancelled(),
+                "the token is signalled after the row"
+            );
+            Ok(AgentFlowOutcome {
+                text: "finished anyway".to_string(),
+                usage: TokenUsage {
+                    prompt_tokens: 7,
+                    completion_tokens: 5,
+                    total_tokens: 12,
+                },
+                model: Some("m".to_string()),
+                iterations: Some(2),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_flow_that_finishes_after_the_cancel_row_write_stays_cancelled() {
+        let pool = db();
+        seed_agent(&pool, "a1", "worker", "[]", 0, 1);
+        let mgr = manager(
+            pool.clone(),
+            Arc::new(CancelledRowRunner { db: pool.clone() }),
+            8,
+        );
+        let run_id = mgr
+            .spawn(
+                "a1",
+                "go",
+                None,
+                &AgentPrincipal::user("u1"),
+                &[],
+                &[],
+                None,
+                None,
+            )
+            .await
+            .expect("spawn");
+        let mut rx = mgr.runs.get(&run_id).map(|h| h.status.subscribe());
+        for _ in 0..200 {
+            if mgr.runs.get(&run_id).is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(mgr.runs.get(&run_id).is_none(), "the task settled");
+        let row = repository::get_agent_run(&pool, &run_id).unwrap().unwrap();
+        assert_eq!(
+            row.status, "cancelled",
+            "a completion does not overwrite the cancel"
+        );
+        assert_eq!(row.exit_reason.as_deref(), Some("cancelled"));
+        assert_eq!(row.result, None, "no completed result on a cancelled row");
+        assert_eq!(
+            row.total_tokens, 12,
+            "the cost the run burned is still recorded"
+        );
+        if let Some(rx) = rx.as_mut() {
+            assert_eq!(*rx.borrow_and_update(), RunStatus::Cancelled);
+        }
+    }
+
+    #[test]
+    fn agent_run_state_lists_partition_the_states() {
+        let mut classified: Vec<&str> = repository::AGENT_RUN_ACTIVE_STATES
+            .iter()
+            .chain(repository::AGENT_RUN_TERMINAL_STATES)
+            .copied()
+            .collect();
+        classified.sort_unstable();
+        let mut all = repository::AGENT_RUN_STATES.to_vec();
+        all.sort_unstable();
+        assert_eq!(
+            classified, all,
+            "every state is either active or terminal, once"
+        );
+        for status in [
+            RunStatus::Queued,
+            RunStatus::Running,
+            RunStatus::Waiting,
+            RunStatus::WaitingUser,
+            RunStatus::Completed,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+            RunStatus::Interrupted,
+        ] {
+            assert_eq!(status.is_terminal(), db_status_is_terminal(status.as_str()));
+            assert_eq!(
+                !status.is_terminal(),
+                repository::agent_run_status_is_active(status.as_str())
+            );
+        }
     }
 
     /// A tree wider than the bound stops being discovered, but the live runs

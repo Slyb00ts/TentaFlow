@@ -341,8 +341,17 @@ pub fn recorded_completion(
             |row| row.get(0),
         )
         .optional()?;
+    // The decode error is replaced by the row size: serde messages can quote the
+    // report text, and the callers log what they get.
     stored
-        .map(|json| Ok(serde_json::from_str(&json)?))
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|_| {
+                anyhow::anyhow!(
+                    "stored agent report is not decodable ({} bytes)",
+                    json.len()
+                )
+            })
+        })
         .transpose()
 }
 

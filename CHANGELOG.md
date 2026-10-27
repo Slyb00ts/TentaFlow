@@ -186,6 +186,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   potomków) synchronicznie z rejestru, a do `spawn_blocking` trafia tylko przejście
   po wierszach. Wywołania narzędzi biorą identyfikator przebiegu z `CallerRun`,
   nie z metadanych.
+- Czwarta runda poprawek po przeglądzie kroku agenta (B3.4b). Odrzucony szkic
+  pola kroku agenta blokuje publikację tylko, dopóki węzeł nadal jest krokiem
+  agenta: po cofnięciu (Ctrl+Z) do zadania przepływu, po usunięciu węzła i po
+  wczytaniu innego modelu (import XML, szkic z serwera, podgląd wersji) szkice są
+  odrzucane. Nieczytelny wiersz zgłoszenia agenta (`result_json`) nie cofa już
+  porażki zadania: jest traktowany jak zgłoszenie, którego nie da się
+  zaobserwować, i kończy się incydentem niepewności; komunikat błędu dekodowania
+  nie cytuje treści zgłoszenia, a dziennik niesie tylko identyfikatory i długość.
+  Przebieg, którego wiersz anulowanie już ustawiło na `cancelled`, nie jest
+  przepisywany na `completed` przez koniec jego własnego zadania: zapis końcowy
+  zachowuje status, wynik i powód wyjścia, zapisuje tylko koszt, a kanał statusu
+  mówi `Cancelled`. Lista stanów aktywnych i końcowych przebiegu jest jedna
+  (`AGENT_RUN_ACTIVE_STATES`, `AGENT_RUN_TERMINAL_STATES`), a test pilnuje, by
+  nowy stan trafił do jednej z nich.
 - Paleta projektanta BPMN ma grupę „Bloki TentaFlow” (B3.3a): przepływy, bloki
   Flow Buildera (`llm`, `embeddings`, `pii_filter`) i narzędzia addonów
   upuszcza się na płótno jako gotowe zadania usługi, z nazwą pozycji i bez pytania

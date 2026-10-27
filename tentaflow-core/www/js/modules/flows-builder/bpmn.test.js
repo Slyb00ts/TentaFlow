@@ -3029,6 +3029,66 @@ test('a refused draft left inside a sub-process still blocks publishing from the
   graph.destroy(); config.destroy();
 });
 
+function wireDrafts(graph, config) {
+  // The same wiring flows-builder.js gives the canvas it owns.
+  graph.onModelReplace = (restored) => (restored ? config.pruneProcessDrafts() : config.clearProcessDrafts());
+}
+
+test('undoing a step back to a flow drops the refused agent draft that nothing can fix any more', async () => {
+  const graph = canvas();
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  const id = graph.nodes.at(-1).id;
+  const config = inspector(graph); wireDrafts(graph, config);
+  config.show(graph.nodes.at(-1), graph.templates.get('bpmn_service_task'));
+  await flush(2);
+  const control = (key) => config.root.querySelector(`[data-process="${key}"]`);
+  change(control('implementation'), 'agent');
+  await flush(2);
+  change(control('agentSchema'), '{broken');
+  assert.equal(config.processDraftProblems().length, 1);
+
+  graph.undo();
+  assert.equal(graph.nodes.find((node) => node.id === id).config.implementation?.Agent, undefined, 'the step is a flow again');
+  assert.deepEqual(config.processDraftProblems(), [], 'nothing blocks publishing a flow step');
+  assert.equal(config.processDrafts.size, 0);
+
+  graph.redo();
+  assert.ok(graph.nodes.find((node) => node.id === id).config.implementation.Agent);
+  assert.deepEqual(config.processDraftProblems(), [], 'the discarded text does not come back with the agent');
+  graph.destroy(); config.destroy();
+});
+
+test('processDraftProblems ignores a draft whose node is not an agent step, whatever dropped the hook', async () => {
+  const graph = canvas();
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  const node = graph.nodes.at(-1);
+  const config = inspector(graph);
+  config.show(node, graph.templates.get(node.type));
+  await flush(2);
+  change(config.root.querySelector('[data-process="implementation"]'), 'agent');
+  await flush(2);
+  change(config.root.querySelector('[data-process="agentIterations"]'), '');
+  assert.equal(config.processDraftProblems().length, 1);
+  graph.updateNodeConfig(node.id, { implementation: 'Flow' });
+  assert.deepEqual(config.processDraftProblems(), []);
+  graph.destroy(); config.destroy();
+});
+
+test('loading another model drops every refused draft, even for a node id the new model shares', async () => {
+  const graph = canvas();
+  const preset = { implementation: { Agent: { agentId: 'agent-1', goalExpression: '"Summarise"', allowedTools: [], maxIterations: 5, outputSchema: { type: 'object' } } } };
+  graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.node_type === 'bpmn_service_task'), preset }, 300, 300);
+  const node = graph.nodes.at(-1);
+  const config = inspector(graph); wireDrafts(graph, config);
+  config.show(node, graph.templates.get(node.type));
+  await flush(2);
+  change(config.root.querySelector('[data-process="agentSchema"]'), '{broken');
+  assert.equal(config.processDraftProblems().length, 1);
+  graph.setData(graph.getData());
+  assert.deepEqual(config.processDraftProblems(), [], 're-importing the same model starts without the old refusals');
+  graph.destroy(); config.destroy();
+});
+
 test('an agent step can catch error and escalation events without a result rule', async () => {
   const graph = canvas();
   graph.addNodeFromTemplate(processTemplates(tentaflowOptions).find((row) => row.label === 'Reviewer'), 300, 300);

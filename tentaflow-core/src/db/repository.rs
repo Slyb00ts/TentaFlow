@@ -9072,6 +9072,34 @@ pub const AGENT_RUN_STATES: &[&str] = &[
     "interrupted",
 ];
 
+/// The states a run can still leave. Every "is this run live" check, in Rust or
+/// SQL, derives from this list; `agent_run_state_lists_partition_the_states`
+/// fails when a state is added to `AGENT_RUN_STATES` without being classified.
+pub const AGENT_RUN_ACTIVE_STATES: &[&str] =
+    &["queued", "running", "waiting", "waiting_user"];
+
+/// The states a run never leaves.
+pub const AGENT_RUN_TERMINAL_STATES: &[&str] =
+    &["completed", "failed", "cancelled", "interrupted"];
+
+pub fn agent_run_status_is_active(status: &str) -> bool {
+    AGENT_RUN_ACTIVE_STATES.contains(&status)
+}
+
+pub fn agent_run_status_is_terminal(status: &str) -> bool {
+    AGENT_RUN_TERMINAL_STATES.contains(&status)
+}
+
+/// `'queued','running',...` for an `IN (...)` clause; the values are constants,
+/// never caller input.
+fn agent_run_active_states_sql() -> String {
+    AGENT_RUN_ACTIVE_STATES
+        .iter()
+        .map(|state| format!("'{state}'"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 const AGENT_COLS: &str = "id, name, display_name, description, system_prompt, model, tools_json, \
      skills_json, params_json, max_iterations, timeout_secs, max_subagents, max_spawn_depth, \
      flow_id, routable, is_enabled, on_child_complete, allowed_agents_json, runtime_json, \
@@ -9477,9 +9505,9 @@ pub fn update_agent_run_status(
     let conn = acquire(pool)?;
     let rows = conn.execute(
         "UPDATE agent_runs SET \
-         status = ?2, \
-         result = COALESCE(?3, result), \
-         exit_reason = COALESCE(?4, exit_reason), \
+         status = CASE WHEN ?12 AND status = 'cancelled' THEN status ELSE ?2 END, \
+         result = CASE WHEN ?12 AND status = 'cancelled' THEN result ELSE COALESCE(?3, result) END, \
+         exit_reason = CASE WHEN ?12 AND status = 'cancelled' THEN exit_reason ELSE COALESCE(?4, exit_reason) END, \
          iterations = COALESCE(?5, iterations), \
          total_tokens = COALESCE(?6, total_tokens), \
          prompt_tokens = COALESCE(?7, prompt_tokens), \
@@ -9501,6 +9529,7 @@ pub fn update_agent_run_status(
             update.model,
             update.set_started as i64,
             update.set_finished as i64,
+            update.keep_cancelled as i64,
         ],
     )?;
     Ok(rows > 0)
@@ -9513,9 +9542,12 @@ pub fn update_agent_run_status(
 pub fn cancel_active_agent_run(pool: &DbPool, id: &str) -> Result<bool> {
     let conn = acquire(pool)?;
     let rows = conn.execute(
-        "UPDATE agent_runs SET status = 'cancelled', exit_reason = 'cancelled', \
-         finished_at = datetime('now'), last_heartbeat_at = datetime('now') \
-         WHERE id = ?1 AND status IN ('queued', 'running', 'waiting', 'waiting_user')",
+        &format!(
+            "UPDATE agent_runs SET status = 'cancelled', exit_reason = 'cancelled', \
+             finished_at = datetime('now'), last_heartbeat_at = datetime('now') \
+             WHERE id = ?1 AND status IN ({})",
+            agent_run_active_states_sql()
+        ),
         rusqlite::params![id],
     )?;
     Ok(rows > 0)
@@ -9586,8 +9618,9 @@ pub fn list_active_agent_runs(pool: &DbPool) -> Result<Vec<DbAgentRun>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {AGENT_RUN_COLS} FROM agent_runs \
-         WHERE status IN ('queued','running','waiting','waiting_user') \
-         ORDER BY created_at, id"
+         WHERE status IN ({}) \
+         ORDER BY created_at, id",
+        agent_run_active_states_sql()
     ))?;
     let rows = stmt
         .query_map([], row_to_agent_run)?

@@ -223,6 +223,8 @@ export class FlowCanvas {
     this.historyIndex = -1;
     this.onChange = opts.onChange || (() => {});
     this.onSelect = opts.onSelect || (() => {});
+    // `restored` is true for undo/redo (same model lineage), false when a different model was loaded.
+    this.onModelReplace = opts.onModelReplace || (() => {});
     this.onViewChange = opts.onViewChange || (() => {});
     // Read-only canvas (system flows): selection, pan and zoom stay, every
     // graph mutation is refused at the state level, not only hidden in CSS.
@@ -375,6 +377,7 @@ export class FlowCanvas {
       this.processPath = [];
       this.selectedProcessId = nodes.processId;
       this.processModel = structuredClone(nodes);
+      this.onModelReplace(false);
       const data = processToCanvas(nodes, this.processPath, this.selectedProcessId);
       nodes = data.nodes;
       edges = data.edges;
@@ -852,6 +855,7 @@ export class FlowCanvas {
       this.nodes = snap.nodes;
       this.edges = snap.edges;
     }
+    if (this.mode === 'bpmn') this.onModelReplace(true);
     this.selectedIds.clear();
     this.selectedEdgeId = null;
     this.onSelect(null);

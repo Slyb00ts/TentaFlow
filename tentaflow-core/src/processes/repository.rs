@@ -28155,7 +28155,19 @@ pub fn fail_job_with_authority(
         // observed result. A revocation still blocks: the report is then recorded
         // as observed and blocked by the observation itself.
         if !authority_revoked {
-            if let Some(report) = super::agent_sink::recorded_completion(&tx, &invocation_id)? {
+            // A row that cannot be read back is the same kind of failure as one that
+            // cannot be observed: it must not roll the failure back, or the job would
+            // stay running with no incident on every retry.
+            let recorded = match super::agent_sink::recorded_completion(&tx, &invocation_id) {
+                Ok(recorded) => recorded,
+                Err(error) => {
+                    tracing::warn!(job_id, invocation_id = %invocation_id,
+                        error_len = error.to_string().len(),
+                        "a recorded agent report cannot be read");
+                    None
+                }
+            };
+            if let Some(report) = recorded {
                 // A report the observation cannot take (over the history budget, no
                 // stable request identity) must not roll back the failure itself:
                 // the row would stay running with no incident until a restart. The
@@ -28172,7 +28184,8 @@ pub fn fail_job_with_authority(
                     }
                     Err(error) => {
                         tracing::warn!(job_id, invocation_id = %invocation_id,
-                            "a recorded agent report cannot be observed: {error:#}");
+                            error_len = error.to_string().len(),
+                            "a recorded agent report cannot be observed");
                         tx.execute_batch("ROLLBACK TO agent_report_salvage; RELEASE agent_report_salvage")?;
                     }
                 }

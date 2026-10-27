@@ -1357,6 +1357,52 @@ async fn a_report_the_observation_cannot_take_still_fails_the_claim_with_an_inci
 }
 
 #[tokio::test]
+async fn a_report_row_that_cannot_be_decoded_still_fails_the_claim_with_an_incident() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    let (claimed, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+    // Valid JSON of the wrong shape, with a variant name that serde would quote.
+    let corrupt = json!({"outcome": "SecretVariantName", "summary": "private report text",
+        "code": null, "outputs": {}, "evidence": []});
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute(
+            "INSERT INTO bpmn_agent_completions(invocation_id,run_id,result_json,created_at_ms) VALUES(?1,?2,?3,?4)",
+            rusqlite::params![
+                binding.invocation_id,
+                binding.agent_run_id(),
+                corrupt.to_string(),
+                now_ms()
+            ],
+        )
+        .unwrap();
+    let message =
+        super::agent_sink::recorded_completion(&fixture.db.read().unwrap(), &binding.invocation_id)
+            .unwrap_err()
+            .to_string();
+    assert!(
+        !message.contains("SecretVariantName") && !message.contains("private report text"),
+        "the decode error must not quote the report: {message}"
+    );
+    super::jobs::fail_claim(
+        &fixture.db,
+        "agent-worker",
+        &claimed,
+        "SERVICE_TIMEOUT",
+        "the service task exceeded its configured timeout after dispatch",
+        None,
+    )
+    .expect("an undecodable report row does not undo the failure");
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "uncertain");
+    assert_eq!(
+        snapshot(&fixture, &claimed.job.instance_id).instance.status,
+        ProcessInstanceStatus::Incident
+    );
+}
+
+#[tokio::test]
 async fn a_revoked_authority_still_fails_the_claim_even_with_a_report_on_record() {
     let fixture = Fixture::new();
     seed_agent(&fixture, AGENT_ID, "[]", 10, true);

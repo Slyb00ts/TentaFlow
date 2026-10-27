@@ -295,18 +295,27 @@ export class FlowConfig {
 
   _clearDraft(node, field) { this.processDrafts.delete(this._draftScope(node, field).key); }
 
+  /** Forget every refused draft: the model was replaced, so no node of it is the one the text was typed for. */
+  clearProcessDrafts() { this.processDrafts.clear(); }
+
+  /** Drop drafts whose node is gone or is no longer an agent step (undo, redo): there is no field left to fix them in. */
+  pruneProcessDrafts() {
+    const model = this.opts.getCanvas?.()?.getData();
+    if (!model) return;
+    for (const [key, draft] of this.processDrafts) {
+      let node;
+      try { node = processBody(model, draft.path, draft.processId ?? model.processId).nodes.find((candidate) => candidate.id === draft.nodeId); } catch { node = null; }
+      if (!node?.kind?.ServiceTask?.implementation?.Agent) this.processDrafts.delete(key);
+    }
+  }
+
   /** One line per field whose typed text was refused and is still unfixed, named by its node in whichever body it lives. */
   processDraftProblems() {
+    this.pruneProcessDrafts();
     const model = this.opts.getCanvas?.()?.getData();
     if (!model) return [];
     const names = processElementNames(model);
-    const problems = [];
-    for (const draft of this.processDrafts.values()) {
-      let body;
-      try { body = processBody(model, draft.path, draft.processId ?? model.processId); } catch { continue; }
-      if (body.nodes.some((node) => node.id === draft.nodeId)) problems.push(`${names.get(draft.nodeId)}: ${I18n.t(draft.errorKey)}`);
-    }
-    return problems;
+    return [...this.processDrafts.values()].map((draft) => `${names.get(draft.nodeId)}: ${I18n.t(draft.errorKey)}`);
   }
 
   show(node, template) {
