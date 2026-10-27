@@ -134,3 +134,49 @@ test('confirmation actions wrap full labels and retain cancel and confirm behavi
     styles.remove();
   }
 });
+
+const askThree = () => TfWindow.choose({ title: 'Leave?', message: 'Unsaved.', choices: [
+  { action: 'stay', label: 'Stay' }, { action: 'discard', label: 'Discard', variant: 'danger-solid' }, { action: 'save', label: 'Save', variant: 'primary' },
+] });
+// Happy DOM does not route slotted clicks into the shadow footer listener.
+const press = (action) => {
+  const win = document.querySelector('tf-window');
+  const footer = win.querySelector('[slot="footer"]');
+  footer.addEventListener('click', win._onFooterClick);
+  footer.querySelector(`tf-button[data-action="${action}"] button`).click();
+};
+const escape = () => document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+
+test('choose answers with the button pressed', async () => {
+  for (const action of ['stay', 'discard', 'save']) {
+    const answer = askThree();
+    press(action);
+    assert.equal(await answer, action);
+  }
+});
+
+test('Escape, the close button and the backdrop are not answers', async () => {
+  let answer = askThree();
+  escape();
+  assert.equal(await answer, null, 'Escape');
+
+  answer = askThree();
+  document.querySelector('tf-window').shadowRoot.querySelector('.tf-window-control[data-action="close"]').click();
+  assert.equal(await answer, null, 'the header close button');
+
+  answer = askThree();
+  document.querySelector('.tf-window-backdrop').click();
+  assert.equal(await answer, null, 'the backdrop');
+});
+
+test('confirm keeps its boolean answer: only the confirm button is true', async () => {
+  let answer = TfWindow.confirm({ message: 'Sure?' });
+  press('confirm');
+  assert.equal(await answer, true);
+  answer = TfWindow.confirm({ message: 'Sure?' });
+  press('cancel');
+  assert.equal(await answer, false);
+  answer = TfWindow.confirm({ message: 'Sure?' });
+  escape();
+  assert.equal(await answer, false);
+});

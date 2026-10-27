@@ -144,3 +144,20 @@ test('a refused navigation leaves the sidebar highlighting the screen still moun
   assert.equal(item('guarded').classList.contains('active'), true, 'still the mounted screen');
   assert.equal(item('other').classList.contains('active'), false, 'not the one that was refused');
 });
+
+test('a hand-edited address that the screen refuses is put back, and the question is asked once', async () => {
+  release = true;
+  assert.equal(await Router.navigate('guarded'), true);
+  Router.init();
+  asked.length = 0;
+  release = false;
+  const oldURL = window.location.href;
+  window.history.replaceState(null, '', '#/other');
+  window.dispatchEvent(new window.HashChangeEvent('hashchange', { oldURL, newURL: window.location.href }));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(asked, ['other'], 'one question for one move');
+  assert.equal(Router.current(), 'guarded');
+  assert.equal(window.location.hash, '#/guarded', 'the address names the screen that stayed');
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(asked, ['other'], 'restoring the address does not ask again');
+});

@@ -277,6 +277,8 @@ export class FlowConfig {
     // not mark the flow dirty, so replacing the model (version preview, import,
     // draft load) or an undo that removes its node discards it without a prompt.
     this.processDrafts = new Map();
+    // What the inspector cut back for one node ({ nodeId, iterations, timeout }): the toast passes, the field hint stays.
+    this.reduction = null;
     this.readOnly = !!opts.readOnly;
     this.mode = opts.mode || 'flow';
     this.root.classList.add('fb-config');
@@ -720,6 +722,8 @@ export class FlowConfig {
     const input = (key, label, value, attrs = '') => `<tf-input data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(String(value ?? ''))}" ${attrs} ${disabled}></tf-input>`;
     const textarea = (key, label, value, rows = 2, attrs = '') => `<tf-textarea data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(String(value ?? ''))}" autogrow rows="${rows}" ${attrs} ${disabled}></tf-textarea>`;
     const draftOf = (key) => this.processDrafts.get(this._draftScope(node, key).key);
+    if (this.reduction && this.reduction.nodeId !== node.id) this.reduction = null;
+    const reduced = (field) => (this.reduction?.nodeId === node.id ? this.reduction[field] : null);
     const draftError = (key) => (draftOf(key) ? `error="${escapeAttr(this._draftText(draftOf(key)))}"` : '');
     const mapping = (key, label) => `<tf-keyvalue-editor data-process="${key}" multiline label="${escapeAttr(I18n.t(`bpmn.${label}`))}" add-label="${escapeAttr(I18n.t('bpmn.add_mapping'))}" remove-label="${escapeAttr(I18n.t('bpmn.remove_mapping'))}" key-placeholder="${escapeAttr(I18n.t('bpmn.mapping_key'))}" value-placeholder="${escapeAttr(I18n.t('bpmn.mapping_expression'))}" ${disabled}></tf-keyvalue-editor>`;
     const model = this.opts.getCanvas().processModel;
@@ -774,7 +778,7 @@ export class FlowConfig {
         ${textarea('agentTools', 'agent_tools', agentTask.allowedTools.join('\n'), 3)}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.agent_tools_hint'))}</p>
         ${input('agentIterations', 'agent_iterations', draftOf('agentIterations')?.text ?? agentTask.maxIterations, `type="number" min="1" max="${iterationLimit}" step="1" ${draftError('agentIterations')}`)}
-        <p class="fb-field-hint" data-agent-iterations-hint>${escapeHtml(I18n.t(listedAgent ? 'bpmn.agent_iterations_hint' : 'bpmn.agent_iterations_hint_unavailable', { max: iterationLimit }))}</p>
+        <p class="fb-field-hint" data-agent-iterations-hint>${escapeHtml(reduced('iterations') ?? I18n.t(listedAgent ? 'bpmn.agent_iterations_hint' : 'bpmn.agent_iterations_hint_unavailable', { max: iterationLimit }))}</p>
         ${textarea('agentSchema', 'agent_output_schema', draftOf('agentSchema')?.text ?? (agentTask.outputSchema == null ? '' : JSON.stringify(agentTask.outputSchema, null, 2)), 4, draftError('agentSchema'))}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.agent_hint'))}</p>`
         : blockTask
@@ -811,7 +815,7 @@ export class FlowConfig {
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_hint'))}</p>
         <div data-routing-view></div>`)
         + panel('time', `${input('timeoutSeconds', 'timeout', config.timeoutSeconds, `type="number" min="1" max="${processTimeoutCeiling(config)}" step="1" ${processTimeoutProblem(config) ? `error="${escapeAttr(I18n.t('bpmn.timeout_invalid', { max: processTimeoutCeiling(config) }))}"` : ''}`)}
-        <p class="fb-field-hint">${escapeHtml(I18n.t(agentTask ? 'bpmn.timeout_agent_hint' : 'bpmn.timeout_hint'))}</p>`);
+        <p class="fb-field-hint" data-timeout-hint>${escapeHtml(reduced('timeout') ?? I18n.t(agentTask ? 'bpmn.timeout_agent_hint' : 'bpmn.timeout_hint'))}</p>`);
       serviceRouting = routing;
     } else if (kind === 'ScriptTask') {
       fields += `${textarea('script', 'script_body', config.script, 3)}
@@ -1424,7 +1428,9 @@ export class FlowConfig {
         // Only an agent may work longer than ten minutes.
         if (node.config.implementation?.Agent && node.config.timeoutSeconds > 600) {
           next.timeoutSeconds = 600;
-          toast(I18n.t('bpmn.timeout_reduced', { was: node.config.timeoutSeconds, max: 600 }), 'info');
+          const text = I18n.t('bpmn.timeout_reduced', { was: node.config.timeoutSeconds, max: 600 });
+          this.reduction = { nodeId: node.id, timeout: text };
+          toast(text, 'info');
         }
         for (const field of ['agentIterations', 'agentSchema']) this._clearDraft(node, field);
         this.opts.onConfigChange(node.id, next);
@@ -1444,22 +1450,31 @@ export class FlowConfig {
             const draft = { text, errorKey: 'bpmn.agent_iterations_invalid', errorParams: { max: limit } };
             this._setDraft(node, 'agentIterations', draft);
             control.setAttribute('error', this._draftText(draft));
+            // A hint about a value the field no longer holds would mislead.
+            this.reduction = null;
+            if (hint) hint.textContent = I18n.t(this._iterationsHintKey(chosenId), { max: limit });
             return;
           }
           this._clearDraft(node, 'agentIterations');
           control.removeAttribute('error');
           next.maxIterations = Math.min(count, limit);
-          if (hint) hint.textContent = I18n.t(next.maxIterations !== count ? 'bpmn.agent_iterations_clamped'
-            : this.opts.processOptions.serviceAgents?.some((agent) => agent.agentId === chosenId) ? 'bpmn.agent_iterations_hint' : 'bpmn.agent_iterations_hint_unavailable', { max: limit, entered: count });
-          if (next.maxIterations !== count) control.value = String(next.maxIterations);
+          this.reduction = null;
+          if (hint) hint.textContent = I18n.t(next.maxIterations !== count ? 'bpmn.agent_iterations_clamped' : this._iterationsHintKey(chosenId), { max: limit, entered: count });
+          if (next.maxIterations !== count) {
+            control.value = String(next.maxIterations);
+            toast(I18n.t('bpmn.agent_iterations_clamped', { max: limit }), 'info');
+          }
         } else if (key === 'agentGoal') {
           next.goalExpression = control.value;
         } else {
           next.agentId = control.value;
           // A step may not ask for more iterations than its agent allows.
           next.maxIterations = Math.min(next.maxIterations, limit);
+          this.reduction = null;
           if (next.maxIterations < current.maxIterations) {
-            toast(I18n.t('bpmn.agent_iterations_reduced', { was: current.maxIterations, max: next.maxIterations }), 'info');
+            const text = I18n.t('bpmn.agent_iterations_reduced', { was: current.maxIterations, max: next.maxIterations });
+            this.reduction = { nodeId: node.id, iterations: text };
+            toast(text, 'info');
           }
           this._clearDraft(node, 'agentIterations');
         }
@@ -1524,6 +1539,9 @@ export class FlowConfig {
         if (key === 'defaultFlowId' && kind === 'InclusiveGateway' && control.value) this.opts.onEdgeChange(control.value, { condition: null });
         this.opts.onConfigChange(node.id, { [key]: key === 'timeoutSeconds' || key === 'ttlSeconds' ? Number(control.value) : (control.value || (key === 'assigneeUserId' || key === 'defaultFlowId' ? null : '')) });
         if (key === 'timeoutSeconds') {
+          if (this.reduction?.nodeId === node.id) this.reduction = { ...this.reduction, timeout: null };
+          const hint = this.root.querySelector('[data-timeout-hint]');
+          if (hint) hint.textContent = I18n.t(node.config.implementation?.Agent ? 'bpmn.timeout_agent_hint' : 'bpmn.timeout_hint');
           const ceiling = processTimeoutProblem({ ...node.config, timeoutSeconds: Number(control.value) });
           if (ceiling) control.setAttribute('error', I18n.t('bpmn.timeout_invalid', { max: ceiling }));
           else control.removeAttribute('error');
@@ -1634,6 +1652,10 @@ export class FlowConfig {
       this.opts.getCanvas().addBoundaryNode(node.id, kind === 'error' ? 'bpmn_boundary_error' : 'bpmn_boundary_escalation', next.ref);
       this._renderRouting(node);
     }));
+  }
+
+  _iterationsHintKey(agentId) {
+    return this.opts.processOptions.serviceAgents?.some((agent) => agent.agentId === agentId) ? 'bpmn.agent_iterations_hint' : 'bpmn.agent_iterations_hint_unavailable';
   }
 
   renderEmpty() {

@@ -776,25 +776,22 @@ TfWindow.open = function openWindow(opts = {}) {
   });
 };
 
-// Confirm dialog helper — oparty o TfWindow.open
-TfWindow.confirm = function confirmDialog({
+// Modal question with any number of answers. Resolves to the `action` of the
+// button pressed, or `null` for every other way out (Escape, the header close
+// button, a click on the backdrop): leaving a question is never one of its answers.
+TfWindow.choose = function chooseDialog({
   title = I18n.t('common.confirm'),
   message = '',
   description = '',
-  confirmLabel = I18n.t('common.confirm'),
-  cancelLabel = I18n.t('common.cancel'),
-  danger = false,
   icon = null,
+  choices = [],
 } = {}) {
   const bodyHtml = `
     <p style="color: var(--tf-text-2); font-size: 13px;">${message}</p>
     ${description ? `<p style="color: var(--tf-text-3); font-size: 12px;">${description}</p>` : ''}
   `;
-  const confirmVariant = danger ? 'danger-solid' : 'primary';
-  const footerHtml = `
-    <tf-button variant="ghost" wrap data-action="cancel">${cancelLabel}</tf-button>
-    <tf-button variant="${confirmVariant}" wrap${danger ? ' icon="trash"' : ''} data-action="confirm">${confirmLabel}</tf-button>
-  `;
+  const footerHtml = choices.map(({ action, label, variant = 'ghost', icon: choiceIcon = null }) =>
+    `<tf-button variant="${variant}" wrap${choiceIcon ? ` icon="${choiceIcon}"` : ''} data-action="${action}">${label}</tf-button>`).join('\n');
   return TfWindow.open({
     title,
     icon,
@@ -807,7 +804,29 @@ TfWindow.confirm = function confirmDialog({
     minHeight: 160,
     width: 420,
     modal: true,
-  }).then((result) => result.action === 'confirm');
+  }).then((result) => (choices.some(({ action }) => action === result.action) ? result.action : null));
+};
+
+// Confirm dialog helper — a choose() with a cancel and a confirm button
+TfWindow.confirm = function confirmDialog({
+  title = I18n.t('common.confirm'),
+  message = '',
+  description = '',
+  confirmLabel = I18n.t('common.confirm'),
+  cancelLabel = I18n.t('common.cancel'),
+  danger = false,
+  icon = null,
+} = {}) {
+  return TfWindow.choose({
+    title,
+    message,
+    description,
+    icon,
+    choices: [
+      { action: 'cancel', label: cancelLabel },
+      { action: 'confirm', label: confirmLabel, variant: danger ? 'danger-solid' : 'primary', icon: danger ? 'trash' : null },
+    ],
+  }).then((action) => action === 'confirm');
 };
 
 export { TfWindow };

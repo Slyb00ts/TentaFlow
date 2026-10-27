@@ -84,6 +84,9 @@ function ensureToastContainer() {
   if (toastContainer) return toastContainer;
   toastContainer = document.createElement('div');
   toastContainer.className = 'toast-container';
+  // A message that only appears on screen does not exist for a screen reader.
+  toastContainer.setAttribute('role', 'status');
+  toastContainer.setAttribute('aria-live', 'polite');
   document.body.appendChild(toastContainer);
   return toastContainer;
 }

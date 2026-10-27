@@ -100,7 +100,7 @@ const FlowBuilderScreen = {
           <tf-button variant="ghost" size="sm" icon="clock" data-role="history" title="${escapeAttr(I18n.t('flows_builder.history_title'))}"></tf-button>`}
         </header>
         ${process ? `<div class="fb-process-notice" id="fb-process-notice"><tf-chip status="info" data-role="publication">${escapeHtml(I18n.t('bpmn.draft'))}</tf-chip><tf-button variant="ghost" size="sm" icon="chevron-down" data-role="notice-toggle" aria-controls="fb-process-notice">${escapeHtml(I18n.t('bpmn.process_settings'))}</tf-button><span data-role="process-hint">${escapeHtml(I18n.t('bpmn.supported_hint'))}</span><tf-select data-role="body-select" wrap-selected label="${escapeAttr(I18n.t('bpmn.process_body'))}"></tf-select><tf-select data-role="start-entry" wrap-selected label="${escapeAttr(I18n.t('bpmn.start_entry'))}"></tf-select><tf-button variant="secondary" size="sm" data-role="add-body">${escapeHtml(I18n.t('bpmn.add_process_body'))}</tf-button><tf-input data-role="body-name" label="${escapeAttr(I18n.t('bpmn.process_body_name'))}"></tf-input><tf-chip status="info" data-role="calendar-state" hidden></tf-chip><tf-input class="fb-timer-timezone" data-role="timer-timezone" label="${escapeAttr(I18n.t('bpmn.timer_timezone'))}" hint="${escapeAttr(I18n.t('bpmn.timer_timezone_hint'))}" placeholder="${escapeAttr(I18n.t('bpmn.timer_timezone_placeholder'))}" hidden></tf-input><tf-button variant="ghost" size="sm" data-role="draft" hidden>${escapeHtml(I18n.t('bpmn.return_draft'))}</tf-button><tf-button variant="ghost" size="sm" data-role="archive">${escapeHtml(I18n.t('bpmn.archive'))}</tf-button><span data-role="timer-summary" hidden></span></div>` : ''}
-        <tf-alert data-role="error" tone="danger" live hidden></tf-alert>
+        <tf-alert data-role="error" tone="danger" live hidden><div slot="actions"><tf-button variant="secondary" size="sm" data-role="next-draft" hidden>${escapeHtml(I18n.t('bpmn.drafts_next'))}</tf-button></div></tf-alert>
 
         <div class="fb-body" data-role="body">
           <aside class="fb-palette" id="fb-palette" data-role="palette"></aside>
@@ -363,10 +363,8 @@ const FlowBuilderScreen = {
     // The router asks `canUnmount` before it leaves, so Back, the sidebar and the
     // address bar share ONE question; asking here as well made it twice.
     root.querySelector('[data-role="back"]').addEventListener('click', () => Router.navigate('flows'));
-    // With several refused fields the banner is also the way to the next one.
-    root.querySelector('[data-role="error"]').addEventListener('click', () => {
-      if (state.saveProblem === 'draftsSave' || state.saveProblem === 'draftsPublish') this._revealDraft(state, (state.draftCursor ?? 0) + 1);
-    });
+    // With several refused fields the banner offers the way to the next one.
+    root.querySelector('[data-role="next-draft"]').addEventListener('click', () => this._revealDraft(state, (state.draftCursor ?? 0) + 1));
 
     root.querySelector('[data-role="zoom-in"]').addEventListener('click', () => state.canvas.zoomBy(1.2));
     root.querySelector('[data-role="zoom-out"]').addEventListener('click', () => state.canvas.zoomBy(1 / 1.2));
@@ -644,15 +642,21 @@ const FlowBuilderScreen = {
   async canUnmount() {
     const state = this._state;
     if (!state || !this._hasUnsavedWork(state)) return true;
-    if (state.saving || state.operationBusy) return false;
+    if (state.saving || state.operationBusy || state.leaving) return false;
     // An autosave while the question is open would keep what the author is about to discard.
     state.leaving = true;
-    let save;
+    let answer;
     try {
-      save = await TfWindow.confirm({ title: I18n.t('flows_builder.unsaved_title'), message: I18n.t('flows_builder.unsaved_message'),
-        confirmLabel: I18n.t('flows_builder.unsaved_confirm'), cancelLabel: I18n.t('flows_builder.unsaved_cancel') });
+      // Only a button is an answer: Escape, the window's close button and the backdrop leave the question open-ended, which means stay.
+      answer = await TfWindow.choose({ title: I18n.t('flows_builder.unsaved_title'), message: I18n.t('flows_builder.unsaved_message'),
+        choices: [
+          { action: 'stay', label: I18n.t('flows_builder.unsaved_stay') },
+          { action: 'discard', label: I18n.t('flows_builder.unsaved_cancel'), variant: 'danger-solid', icon: 'trash' },
+          { action: 'save', label: I18n.t('flows_builder.unsaved_confirm'), variant: 'primary' },
+        ] });
     } finally { state.leaving = false; }
-    return save ? this._save() : true;
+    if (answer === 'discard') return true;
+    return answer === 'save' ? this._save() : false;
   },
 
   _current(state) { return this._state === state && state.root.isConnected; },
@@ -668,7 +672,7 @@ const FlowBuilderScreen = {
   _draftSaveProblem(state, headingKey = 'bpmn.save_drafts_refused') {
     const drafts = state.config.processDraftProblems();
     if (!drafts.length) return null;
-    return [I18n.t(headingKey), ...drafts, ...(drafts.length > 1 ? [I18n.t('bpmn.drafts_next_hint')] : [])].join('\n');
+    return [I18n.t(headingKey), ...drafts].join('\n');
   },
 
   // Takes the author to the refused field `index` (wrapping): its body and
@@ -792,8 +796,11 @@ const FlowBuilderScreen = {
     const state = this._state;
     if (!state || !this._current(state) || state.operationBusy) return;
     state.operationBusy = true;
-    this._clearSaveProblem(state);
-    state.root.querySelector('[data-role="error"]').hidden = true;
+    // The banner follows the refused fields, not the operations: it stays while one is still refused.
+    if (state.saveProblem !== 'draftsSave' && state.saveProblem !== 'draftsPublish') {
+      this._clearSaveProblem(state);
+      state.root.querySelector('[data-role="error"]').hidden = true;
+    }
     this._syncProcessControls();
     try { await action(state); }
     catch (error) {
@@ -858,6 +865,7 @@ const FlowBuilderScreen = {
     const state = this._state;
     if (!state || state.definition.archived || !state.definition.publishedVersion) return;
     const version = state.previewVersion ?? state.definition.publishedVersion;
+    this._warnIgnoredDrafts(state);
     await this._processOperation(async (current) => {
       const response = await ApiBinary.one('processVersionGetRequest', { definitionId: current.flowId, version });
       if (!this._current(current)) return;
@@ -888,6 +896,7 @@ const FlowBuilderScreen = {
     const state = this._state;
     if (!state || state.definition.archived || !state.definition.publishedVersion) return;
     const version = state.definition.publishedVersion;
+    this._warnIgnoredDrafts(state);
     await this._processOperation(async (current) => {
       const response = await ApiBinary.one('processVersionGetRequest', { definitionId: current.flowId, version });
       if (!this._current(current)) return;
@@ -996,6 +1005,7 @@ const FlowBuilderScreen = {
     const state = this._state;
     if (!state || state.operationBusy) return;
     if (state.previewVersion === null && state.dirty && !await this._save()) return;
+    if (state.previewVersion === null) this._warnIgnoredDrafts(state);
     await this._processOperation(async (current) => {
       const response = await ApiBinary.one('processXmlExportRequest', { definitionId: current.flowId, version: current.previewVersion });
       if (!this._current(current)) return;
@@ -1346,6 +1356,7 @@ const FlowBuilderScreen = {
       alert.setAttribute('message', text);
       state.saveProblem = kind;
     }
+    this._syncDraftNext(state);
     if (!silent) toast(text, 'error');
   },
 
@@ -1359,6 +1370,7 @@ const FlowBuilderScreen = {
       alert.setAttribute('message', text);
       state.saveProblem = kind;
     }
+    this._syncDraftNext(state);
     toast(text, 'error');
   },
 
@@ -1367,6 +1379,22 @@ const FlowBuilderScreen = {
     state.saveProblem = false;
     const alert = state.root.querySelector('[data-role="error"]');
     if (alert) alert.hidden = true;
+    this._syncDraftNext(state);
+  },
+
+  // Only a banner about several refused fields has a next one to go to.
+  _syncDraftNext(state) {
+    const next = state.root.querySelector('[data-role="next-draft"]');
+    if (!next) return;
+    const drafts = state.saveProblem === 'draftsSave' || state.saveProblem === 'draftsPublish';
+    next.hidden = !(drafts && state.config.processDraftTargets().length > 1);
+  },
+
+  // An operation on the saved or published model goes on without the refused
+  // fields; the author is told which ones it leaves out.
+  _warnIgnoredDrafts(state) {
+    const text = this._draftSaveProblem(state, 'bpmn.operation_drafts_ignored');
+    if (text) toast(text, 'warning');
   },
 
   // The banner for refused fields lists what is still refused: it follows the
@@ -1381,6 +1409,7 @@ const FlowBuilderScreen = {
       return;
     }
     state.root.querySelector('[data-role="error"]')?.setAttribute('message', text);
+    this._syncDraftNext(state);
     if (kind === 'draftsSave') this._setAutosave('error', text);
   },
 

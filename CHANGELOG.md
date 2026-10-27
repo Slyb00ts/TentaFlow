@@ -242,6 +242,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   ma teraz toast jak odmowa edytora. `tf-alert` dostał atrybut `live` (rola
   `alert`), a `tf-input` i `tf-textarea` ustawiają `aria-invalid` i
   `aria-describedby` dla błędu pola.
+- Ósma runda poprawek po przeglądzie kroku agenta (B3.4b), z trzeciego przebiegu
+  żywego krytyka GUI. Pytanie „Niezapisane zmiany” ma trzy odpowiedzi: „Zostań w
+  edytorze”, „Odrzuć zmiany” i „Zapisz i wyjdź”; Esc, przycisk × okna i klik w tło
+  nie są odpowiedzią i znaczą „zostań” (edytor i zmiany zostają, a router
+  przywraca adres, bez pętli historii). Dotyczy to też klasycznego buildera, który
+  używa tego samego `canUnmount`. `TfWindow.choose` to nowe, ogólne okno pytania
+  z dowolnymi odpowiedziami (`TfWindow.confirm` jest na nim zbudowane i nie
+  zmienia wyniku). Obniżenie wartości (limit iteracji po zmianie agenta, ucięcie
+  wpisanej liczby, limit czasu po zmianie na Flow) jest zapisane w podpowiedzi
+  pola, a wspólny kontener toastów ma `role="status"` i `aria-live="polite"`.
+  Podpowiedź po wpisaniu nieprawidłowej liczby nie zostaje przy „zmniejszono”.
+  Dojście do następnego odrzuconego pola to przycisk `tf-button` w banerze
+  (dostępny z klawiatury), a nie klikalny komunikat. Eksport, symulacja i
+  uruchomienie nie chowają banera ani nie zmieniają napisu stanu, dopóki pole jest
+  odrzucone; toast mówi, które pola pomijają. Po francusku cudzysłowy « » mają
+  twarde spacje w całym pliku, a odmowa publikacji agenta używa półpauzy zamiast
+  drugiego dwukropka we wszystkich językach.
 - Paleta projektanta BPMN ma grupę „Bloki TentaFlow” (B3.3a): przepływy, bloki
   Flow Buildera (`llm`, `embeddings`, `pii_filter`) i narzędzia addonów
   upuszcza się na płótno jako gotowe zadania usługi, z nazwą pozycji i bez pytania
