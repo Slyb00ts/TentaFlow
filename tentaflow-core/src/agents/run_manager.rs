@@ -1118,10 +1118,11 @@ impl AgentRunManager {
         Ok(json!({ "run_id": run_id, "cancelled": cancelled }))
     }
 
-    /// Cancels a run by id: signals its cancel token (the flow stops between
-    /// nodes) and marks the row `cancelled`. Returns true when a live run was
-    /// signalled. The task itself finalizes the row in `run_task`, but we set
-    /// the status here too so a caller observing immediately sees `cancelled`.
+    /// Cancels a run by id: marks a still-active row `cancelled` and signals the
+    /// run's cancel token (the flow stops between nodes). Returns true when a
+    /// live run was cancelled; a run whose row already settled keeps its outcome
+    /// and is left alone. The task itself finalizes the row in `run_task`, but we
+    /// set the status here too so a caller observing immediately sees `cancelled`.
     pub fn cancel(&self, run_id: &str) -> bool {
         // Cancellation closes any open questions/grants this run raised so the
         // awaiting tool degrades (sentinel / deny) instead of hanging (§3.13 A).
@@ -1129,19 +1130,49 @@ impl AgentRunManager {
         let Some(handle) = self.runs.get(run_id) else {
             return false;
         };
+        let changed =
+            repository::cancel_active_agent_run(&self.db, run_id).unwrap_or_else(|error| {
+                tracing::warn!(run_id, "cannot mark a run cancelled: {error:#}");
+                true
+            });
+        if !changed {
+            return false;
+        }
         handle.cancel.cancel();
         let _ = handle.status.send(RunStatus::Cancelled);
-        let _ = repository::update_agent_run_status(
-            &self.db,
-            run_id,
-            &AgentRunStatusUpdate {
-                status: RunStatus::Cancelled.as_str(),
-                exit_reason: Some("cancelled"),
-                set_finished: true,
-                ..Default::default()
-            },
-        );
         true
+    }
+
+    /// Signals the cancel token of a run and of every live run below it, from the
+    /// registry alone: no row is read or written, so it is safe on any thread,
+    /// including one that is going away. The rows are settled by the runs
+    /// themselves, or by `cancel_tree`. Returns how many runs were signalled.
+    pub fn signal_cancel_tree(&self, run_id: &str) -> usize {
+        let mut tree = std::collections::HashSet::from([run_id.to_string()]);
+        loop {
+            let before = tree.len();
+            for entry in self.runs.iter() {
+                if entry
+                    .parent_run_id
+                    .as_ref()
+                    .is_some_and(|parent| tree.contains(parent))
+                {
+                    tree.insert(entry.key().clone());
+                }
+            }
+            if tree.len() == before {
+                break;
+            }
+        }
+        let mut signalled = 0;
+        for id in &tree {
+            super::interaction::global().drop_run(id);
+            if let Some(handle) = self.runs.get(id) {
+                handle.cancel.cancel();
+                signalled += 1;
+            }
+        }
+        signalled
     }
 
     /// Cancels a run and every run below it, parents first. The tree is read from
@@ -1149,53 +1180,60 @@ impl AgentRunManager {
     /// settled is still a run somebody started on this one's behalf. A parent is
     /// stopped before its children are listed so it starts nothing new, and the
     /// walk is repeated until a pass finds no run it has not already signalled,
-    /// so a child created while the walk was running is not left behind. Returns
-    /// how many live runs were signalled. The row reads are blocking: call from
-    /// a blocking context.
+    /// so a child created while the walk was running is not left behind. A tree
+    /// past the bound stops being discovered, but every run found before that
+    /// is still signalled. Returns how many live runs were signalled. The row
+    /// reads are blocking: call from a blocking context.
     pub fn cancel_tree(&self, run_id: &str) -> usize {
         // Bounds the walk against a cycle or an absurdly wide tree.
         const MAX_TREE_RUNS: usize = 1024;
         let mut seen = std::collections::HashSet::from([run_id.to_string()]);
         let mut pending = vec![run_id.to_string()];
         let mut signalled = 0;
-        // Lists the children of `parent` that the walk has not met yet. `false`
-        // when the tree outgrew the bound.
+        let mut overflowed = false;
+        // Lists the children of `parent` that the walk has not met yet.
         let discover = |parent: &str,
                         seen: &mut std::collections::HashSet<String>,
-                        pending: &mut Vec<String>|
-         -> bool {
+                        pending: &mut Vec<String>,
+                        overflowed: &mut bool| {
             match repository::list_agent_runs_by_parent(&self.db, parent) {
                 Ok(children) => {
                     for child in children {
+                        if seen.contains(&child.id) {
+                            continue;
+                        }
                         if seen.len() >= MAX_TREE_RUNS {
                             tracing::warn!(run_id, "the run tree is larger than {MAX_TREE_RUNS}; runs beyond that are not cancelled");
-                            return false;
+                            *overflowed = true;
+                            return;
                         }
-                        if seen.insert(child.id.clone()) {
-                            pending.push(child.id);
-                        }
+                        seen.insert(child.id.clone());
+                        pending.push(child.id);
                     }
                 }
                 Err(error) => {
                     tracing::warn!(run_id = %parent, "cannot list the children of a run to cancel: {error}");
                 }
             }
-            true
         };
         loop {
             while let Some(id) = pending.pop() {
                 if self.cancel(&id) {
                     signalled += 1;
                 }
-                if !discover(&id, &mut seen, &mut pending) {
-                    return signalled;
+                if !overflowed {
+                    discover(&id, &mut seen, &mut pending, &mut overflowed);
                 }
+            }
+            if overflowed {
+                return signalled;
             }
             // A run that was already listed may have gained a child since.
             let walked: Vec<String> = seen.iter().cloned().collect();
             for id in walked {
-                if !discover(&id, &mut seen, &mut pending) {
-                    return signalled;
+                discover(&id, &mut seen, &mut pending, &mut overflowed);
+                if overflowed {
+                    break;
                 }
             }
             if pending.is_empty() {
@@ -3324,6 +3362,109 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(mgr.cancel_tree(&top), 0, "nothing is left to signal");
+    }
+
+    /// A run whose row already settled keeps its outcome when a late cancel
+    /// reaches it before the registry forgets it.
+    #[tokio::test]
+    async fn cancel_tree_leaves_a_settled_run_as_it_finished() {
+        let pool = db();
+        seed_agent(&pool, "top", "top", "[]", 0, 1);
+        let mgr = manager(
+            pool.clone(),
+            Arc::new(GatedRunner {
+                gate: Gate::new(),
+                honor_cancel: true,
+            }),
+            8,
+        );
+        let top = mgr
+            .spawn(
+                "top",
+                "lead",
+                None,
+                &AgentPrincipal::user("u1"),
+                &[],
+                &[],
+                None,
+                None,
+            )
+            .await
+            .expect("spawn top");
+        repository::update_agent_run_status(
+            &pool,
+            &top,
+            &AgentRunStatusUpdate {
+                status: "completed",
+                exit_reason: Some("final_response"),
+                set_finished: true,
+                ..Default::default()
+            },
+        )
+        .expect("settle");
+
+        assert_eq!(mgr.cancel_tree(&top), 0, "a settled run is not cancelled");
+        assert!(!mgr.cancel(&top));
+        let row = repository::get_agent_run(&pool, &top).unwrap().unwrap();
+        assert_eq!(row.status, "completed");
+        assert_eq!(row.exit_reason.as_deref(), Some("final_response"));
+    }
+
+    /// A tree wider than the bound stops being discovered, but the live runs
+    /// found before the bound was hit are still cancelled.
+    #[tokio::test]
+    async fn cancel_tree_signals_what_it_found_before_the_bound() {
+        let pool = db();
+        seed_agent(&pool, "top", "top", "[]", 0, 1);
+        seed_agent(&pool, "leaf", "leaf", "[]", 0, 1);
+        let mgr = manager(
+            pool.clone(),
+            Arc::new(GatedRunner {
+                gate: Gate::new(),
+                honor_cancel: true,
+            }),
+            8,
+        );
+        let principal = AgentPrincipal::user("u1");
+        let top = mgr
+            .spawn("top", "lead", None, &principal, &[], &[], None, None)
+            .await
+            .expect("spawn top");
+        let live = mgr
+            .spawn("leaf", "live", Some(&top), &principal, &[], &[], None, None)
+            .await
+            .expect("spawn live child");
+        for index in 0..1100 {
+            repository::create_agent_run(
+                &pool,
+                &NewAgentRun {
+                    id: &format!("filler-{index}"),
+                    agent_id: "leaf",
+                    parent_run_id: Some(&top),
+                    flow_execution_id: None,
+                    user_id: Some("u1"),
+                    org_id: None,
+                    prompt: "p",
+                    origin: "system",
+                    actor_kind: "system",
+                    actor_id: None,
+                    actor_user_id: None,
+                    correlation_id: None,
+                },
+            )
+            .expect("filler");
+        }
+        // The live child lists first: the fillers are older.
+        pool.write()
+            .unwrap()
+            .execute(
+                "UPDATE agent_runs SET created_at='2000-01-01 00:00:00' WHERE id LIKE 'filler-%'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(mgr.cancel_tree(&top), 2);
+        wait_until_status(&pool, &live, "cancelled").await;
     }
 
     /// A run that joins the tree while the walk is under way is not left behind:

@@ -1151,13 +1151,10 @@ impl NodeAdapter for ToolExecNodeAdapter {
         .with_correlation_id(ctx.correlation_id.clone());
         let started_at = Utc::now();
 
-        // The calling run's identity (sub-agent control calls act under it).
-        let run_id = envelope
-            .meta
-            .get("agent_run_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
+        // The calling run, as the engine knows it: for a process step the id the
+        // run executes under, never the one a node wrote into the meta.
+        let caller = CallerRun::from_envelope(service.db(), ctx, envelope, principal.clone());
+        let run_id = caller.run_id.clone();
 
         // Dispatch every call in order. Each goes to exactly one path:
         //   - core.ask_user → async question interaction (§3.13 A),
@@ -1170,7 +1167,6 @@ impl NodeAdapter for ToolExecNodeAdapter {
         let manager = crate::agents::agent_run_manager_global();
         let mut results: Vec<ToolCallResult> = Vec::with_capacity(calls.len());
 
-        let caller = CallerRun::from_envelope(service.db(), ctx, envelope, principal.clone());
         // Parent chain for bubbling a child's question to the same principal
         // (§3.13 A): the dashboard sees the parent_run_id so the ask is visibly
         // attributed up the spawn tree.
@@ -1274,12 +1270,8 @@ impl NodeAdapter for ToolExecNodeAdapter {
 
         // Audit + run log against the run's AI event before truncation (the
         // audit keeps the full output; only the model-facing message is cut).
-        if let Some(run_id) = envelope
-            .meta
-            .get("agent_run_id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
+        if !run_id.is_empty() {
+            let run_id = run_id.as_str();
             Self::audit_results(&service, run_id, &calls, &results, started_at);
             let step = serde_json::json!({
                 "kind": "tool_exec",
@@ -2556,6 +2548,26 @@ mod process_sink_tests {
         assert!(svc
             .require_core_tool(&ctx, &forged.meta, crate::agents::CoreToolName::Exec)
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn a_step_is_logged_under_its_own_run_not_the_one_the_meta_names() {
+        let fixture = Fixture::new();
+        seed_agent(&fixture, AGENT_ID, r#"["core.skill_view"]"#, 10, true);
+        let (_, binding) = running_step(
+            &fixture,
+            agent_implementation(AGENT_ID, &["core.skill_view"], None),
+        );
+        let run_id = binding.agent_run_id();
+        let skill = call("c1", "core.skill_view", json!({"name": "missing"}));
+        answers_as(&fixture, Some(&binding), "another-run", &run_id, vec![skill]).await;
+
+        let log = crate::db::repository::get_agent_run(&fixture.db, &run_id)
+            .unwrap()
+            .unwrap()
+            .run_log
+            .unwrap_or_default();
+        assert!(log.contains("tool_exec"), "the turn is logged on the step's own run: {log}");
     }
 
     #[tokio::test]

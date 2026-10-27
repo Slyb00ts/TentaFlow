@@ -28043,6 +28043,46 @@ pub(super) fn record_observed_script_infrastructure_failure(
     Ok(true)
 }
 
+/// Records an agent's stored report as the observed result of its step.
+#[allow(clippy::too_many_arguments)]
+fn observe_agent_report(
+    tx: &Transaction<'_>,
+    job_id: &str,
+    instance_id: &str,
+    scope_id: &str,
+    node_id: &str,
+    invocation_id: &str,
+    attempt: u32,
+    fence: u64,
+    worker_id: &str,
+    report: ActivityResult,
+    now_ms: i64,
+) -> Result<()> {
+    let (org_id, user_id, request_id): (String, String, String) = tx.query_row(
+        "SELECT i.org_id,i.initiator_user_id,v.stable_request_id FROM bpmn_instances i JOIN bpmn_service_invocations v ON v.instance_id=i.instance_id WHERE i.instance_id=?1 AND v.invocation_id=?2",
+        params![instance_id,invocation_id],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+    let target = ObservationTarget {
+        actor: ProcessActor { org_id, user_id },
+        job_id: job_id.to_owned(),
+        instance_id: instance_id.to_owned(),
+        scope_id: scope_id.to_owned(),
+        node_id: node_id.to_owned(),
+        attempt,
+        fence,
+        invocation_id: invocation_id.to_owned(),
+        request_id,
+        result_event_id: Uuid::new_v4().to_string(),
+    };
+    let reported = ObservedActivityResult {
+        result: report,
+        origin: ActivityResultOrigin::Contract,
+        expression_observation: None,
+    };
+    record_job_observation_on(tx, &target, worker_id, &reported, now_ms)?;
+    Ok(())
+}
+
 pub fn fail_job(
     pool: &DbPool,
     job_id: &str,
@@ -28116,30 +28156,26 @@ pub fn fail_job_with_authority(
         // as observed and blocked by the observation itself.
         if !authority_revoked {
             if let Some(report) = super::agent_sink::recorded_completion(&tx, &invocation_id)? {
-                let (org_id, user_id, request_id): (String, String, String) = tx.query_row(
-                    "SELECT i.org_id,i.initiator_user_id,v.stable_request_id FROM bpmn_instances i JOIN bpmn_service_invocations v ON v.instance_id=i.instance_id WHERE i.instance_id=?1 AND v.invocation_id=?2",
-                    params![instance_id,invocation_id],
-                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
-                let target = ObservationTarget {
-                    actor: ProcessActor { org_id, user_id },
-                    job_id: job_id.to_owned(),
-                    instance_id: instance_id.clone(),
-                    scope_id: scope_id.clone(),
-                    node_id: node_id.clone(),
-                    attempt,
-                    fence,
-                    invocation_id: invocation_id.clone(),
-                    request_id,
-                    result_event_id: Uuid::new_v4().to_string(),
-                };
-                let reported = ObservedActivityResult {
-                    result: report,
-                    origin: ActivityResultOrigin::Contract,
-                    expression_observation: None,
-                };
-                record_job_observation_on(&tx, &target, worker_id, &reported, now_ms)?;
-                tx.commit()?;
-                return Ok(false);
+                // A report the observation cannot take (over the history budget, no
+                // stable request identity) must not roll back the failure itself:
+                // the row would stay running with no incident until a restart. The
+                // attempt runs in a savepoint and, when it fails, falls through to
+                // the uncertainty branch below.
+                tx.execute_batch("SAVEPOINT agent_report_salvage")?;
+                match observe_agent_report(&tx, job_id, &instance_id, &scope_id, &node_id,
+                    &invocation_id, attempt, fence, worker_id, report, now_ms)
+                {
+                    Ok(()) => {
+                        tx.execute_batch("RELEASE agent_report_salvage")?;
+                        tx.commit()?;
+                        return Ok(false);
+                    }
+                    Err(error) => {
+                        tracing::warn!(job_id, invocation_id = %invocation_id,
+                            "a recorded agent report cannot be observed: {error:#}");
+                        tx.execute_batch("ROLLBACK TO agent_report_salvage; RELEASE agent_report_salvage")?;
+                    }
+                }
             }
         }
         // This failure carries its own incident; a recovery incident raised for

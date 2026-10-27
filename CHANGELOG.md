@@ -171,6 +171,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   nie zwykłemu agentowi czatu. Projektant: odrzucony szkic limitu iteracji lub
   schematu przeżywa zmianę zaznaczenia, a publikacja go wymienia; agent spoza listy
   nie pozwala podnieść limitu ponad obecny.
+- Trzecia runda poprawek po przeglądzie kroku agenta (B3.4b). Odrzucony szkic
+  limitu iteracji lub schematu jest kluczowany treścią, ciałem (proces i ścieżka
+  podprocesów) oraz identyfikatorem węzła, a publikacja szuka go we wszystkich
+  ciałach modelu, więc szkic zostawiony w podprocesie nadal blokuje publikację
+  z głównego ciała. Spóźnione anulowanie nie przepisuje już zakończonego
+  przebiegu na `cancelled`: `cancel` zmienia tylko wiersz w stanie aktywnym i
+  tylko wtedy wysyła sygnał. `cancel_tree` po przekroczeniu granicy 1024 przebiegów
+  przestaje odkrywać, ale sygnalizuje wszystko, co znalazł, a granica dotyczy
+  tylko naprawdę nowych identyfikatorów. Zgłoszenie agenta, którego obserwacja
+  nie przechodzi (ponad budżet historii, brak tożsamości żądania), jest próbowane
+  w punkcie zapisu i nie cofa porażki zadania: następuje zwykły incydent
+  niepewności. Strażnik anulowania zatrzymuje żywe przebiegi (korzeń i znanych
+  potomków) synchronicznie z rejestru, a do `spawn_blocking` trafia tylko przejście
+  po wierszach. Wywołania narzędzi biorą identyfikator przebiegu z `CallerRun`,
+  nie z metadanych.
 - Paleta projektanta BPMN ma grupę „Bloki TentaFlow” (B3.3a): przepływy, bloki
   Flow Buildera (`llm`, `embeddings`, `pii_filter`) i narzędzia addonów
   upuszcza się na płótno jako gotowe zadania usługi, z nazwą pozycji i bez pytania

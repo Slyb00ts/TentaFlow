@@ -3005,6 +3005,30 @@ test('an agent step keeps a refused draft across a node switch and publishing na
   graph.destroy(); config.destroy();
 });
 
+test('a refused draft left inside a sub-process still blocks publishing from the main body', async () => {
+  const graph = canvas();
+  const config = inspector(graph);
+  const sub = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_sub_process'), 300, 300);
+  graph.navigateProcessBody([sub.id]);
+  const preset = { implementation: { Agent: { agentId: 'agent-1', goalExpression: '"Summarise"', allowedTools: [], maxIterations: 5, outputSchema: { type: 'object' } } } };
+  const agent = graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.node_type === 'bpmn_service_task'), preset }, 300, 300);
+  agent.label = 'Nested summariser';
+  config.show(agent, graph.templates.get(agent.type));
+  await flush(2);
+  change(config.root.querySelector('[data-process="agentIterations"]'), '');
+  graph.navigateProcessBody([]);
+  config.show(null, null);
+  const problems = config.processDraftProblems();
+  assert.equal(problems.length, 1, 'the refused value in the nested body is still reported');
+  assert.ok(problems[0].includes('Nested summariser') && problems[0].includes(I18n.t('bpmn.agent_iterations_invalid')));
+  graph.navigateProcessBody([sub.id]);
+  config.show(graph.nodes.find((node) => node.id === agent.id), graph.templates.get(agent.type));
+  await flush(2);
+  change(config.root.querySelector('[data-process="agentIterations"]'), '3');
+  assert.deepEqual(config.processDraftProblems(), [], 'fixing it clears the block');
+  graph.destroy(); config.destroy();
+});
+
 test('an agent step can catch error and escalation events without a result rule', async () => {
   const graph = canvas();
   graph.addNodeFromTemplate(processTemplates(tentaflowOptions).find((row) => row.label === 'Reviewer'), 300, 300);

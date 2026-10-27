@@ -20,7 +20,7 @@ import '/js/components/tf-person-picker.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-alert.js';
-import { processNodeKind, processAgentPreset, processAgentIterationLimit, AGENT_STEP_MAX_SECONDS, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processStartEntryLabels, processItemLabels } from './bpmn.js';
+import { processNodeKind, processAgentPreset, processAgentIterationLimit, AGENT_STEP_MAX_SECONDS, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processElementNames, processStartEntryLabels, processItemLabels } from './bpmn.js';
 import { openProcessCallPreview } from './process-monitor.js';
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
@@ -283,15 +283,28 @@ export class FlowConfig {
 
   setTemplate(tpl) { this.template = tpl; }
 
-  /** One line per field whose typed text was refused and is still unfixed, named by its node. */
-  processDraftProblems() {
+  /** The draft of one field of a node, scoped by the body the canvas shows: ids are only unique within a body. */
+  _draftScope(node, field) {
     const canvas = this.opts.getCanvas?.();
-    const nodes = canvas?.nodes || [];
-    const labels = processNodeLabels(nodes, canvas?.templates);
+    const processId = canvas?.selectedProcessId ?? null;
+    const path = [...(canvas?.processPath || [])];
+    return { key: JSON.stringify([processId, path, node.id, field]), processId, path, nodeId: node.id };
+  }
+
+  _setDraft(node, field, draft) { const scope = this._draftScope(node, field); this.processDrafts.set(scope.key, { ...draft, ...scope }); }
+
+  _clearDraft(node, field) { this.processDrafts.delete(this._draftScope(node, field).key); }
+
+  /** One line per field whose typed text was refused and is still unfixed, named by its node in whichever body it lives. */
+  processDraftProblems() {
+    const model = this.opts.getCanvas?.()?.getData();
+    if (!model) return [];
+    const names = processElementNames(model);
     const problems = [];
-    for (const [key, draft] of this.processDrafts) {
-      const nodeId = key.slice(0, key.lastIndexOf(':'));
-      if (nodes.some((node) => node.id === nodeId)) problems.push(`${labels.get(nodeId)}: ${I18n.t(draft.errorKey)}`);
+    for (const draft of this.processDrafts.values()) {
+      let body;
+      try { body = processBody(model, draft.path, draft.processId ?? model.processId); } catch { continue; }
+      if (body.nodes.some((node) => node.id === draft.nodeId)) problems.push(`${names.get(draft.nodeId)}: ${I18n.t(draft.errorKey)}`);
     }
     return problems;
   }
@@ -656,7 +669,7 @@ export class FlowConfig {
     const disabled = this.readOnly ? 'disabled' : '';
     const input = (key, label, value, attrs = '') => `<tf-input data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(String(value ?? ''))}" ${attrs} ${disabled}></tf-input>`;
     const textarea = (key, label, value, rows = 2, attrs = '') => `<tf-textarea data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(String(value ?? ''))}" autogrow rows="${rows}" ${attrs} ${disabled}></tf-textarea>`;
-    const draftOf = (key) => this.processDrafts.get(`${node.id}:${key}`);
+    const draftOf = (key) => this.processDrafts.get(this._draftScope(node, key).key);
     const draftError = (key) => (draftOf(key) ? `error="${escapeAttr(I18n.t(draftOf(key).errorKey))}"` : '');
     const mapping = (key, label) => `<tf-keyvalue-editor data-process="${key}" multiline label="${escapeAttr(I18n.t(`bpmn.${label}`))}" add-label="${escapeAttr(I18n.t('bpmn.add_mapping'))}" remove-label="${escapeAttr(I18n.t('bpmn.remove_mapping'))}" key-placeholder="${escapeAttr(I18n.t('bpmn.mapping_key'))}" value-placeholder="${escapeAttr(I18n.t('bpmn.mapping_expression'))}" ${disabled}></tf-keyvalue-editor>`;
     const model = this.opts.getCanvas().processModel;
@@ -1356,7 +1369,7 @@ export class FlowConfig {
               : { implementation: 'Flow' };
         // Only an agent may work longer than ten minutes.
         if (node.config.implementation?.Agent && node.config.timeoutSeconds > 600) next.timeoutSeconds = 600;
-        for (const field of ['agentIterations', 'agentSchema']) this.processDrafts.delete(`${node.id}:${field}`);
+        for (const field of ['agentIterations', 'agentSchema']) this._clearDraft(node, field);
         this.opts.onConfigChange(node.id, next);
         this._renderProcess();
       } else if (key === 'agentId' || key === 'agentGoal' || key === 'agentIterations') {
@@ -1370,11 +1383,11 @@ export class FlowConfig {
           const text = String(control.value ?? '').trim();
           const count = Number(text);
           if (!text || !Number.isInteger(count) || count < 1) {
-            this.processDrafts.set(`${node.id}:agentIterations`, { text, errorKey: 'bpmn.agent_iterations_invalid' });
+            this._setDraft(node, 'agentIterations', { text, errorKey: 'bpmn.agent_iterations_invalid' });
             control.setAttribute('error', I18n.t('bpmn.agent_iterations_invalid'));
             return;
           }
-          this.processDrafts.delete(`${node.id}:agentIterations`);
+          this._clearDraft(node, 'agentIterations');
           control.removeAttribute('error');
           next.maxIterations = Math.min(count, limit);
           if (next.maxIterations !== count) control.value = String(next.maxIterations);
@@ -1384,7 +1397,7 @@ export class FlowConfig {
           next.agentId = control.value;
           // A step may not ask for more iterations than its agent allows.
           next.maxIterations = Math.min(next.maxIterations, limit);
-          this.processDrafts.delete(`${node.id}:agentIterations`);
+          this._clearDraft(node, 'agentIterations');
         }
         this.opts.onConfigChange(node.id, { implementation: { Agent: next } });
         if (key === 'agentId') this._renderProcess();
@@ -1398,14 +1411,14 @@ export class FlowConfig {
         if (text) { try { parsed = JSON.parse(text); } catch { parsed = undefined; } }
         const valid = parsed === null ? !text : parsed !== undefined && typeof parsed === 'object' && !Array.isArray(parsed);
         if (valid) {
-          this.processDrafts.delete(`${node.id}:agentSchema`);
+          this._clearDraft(node, 'agentSchema');
           control.removeAttribute('error');
           this.opts.onConfigChange(node.id, { implementation: { Agent: {
             ...node.config.implementation.Agent, outputSchema: parsed } } });
         } else {
           // The stored schema stays what the model holds; the field keeps the
           // text and its error until the author fixes it or the node changes.
-          this.processDrafts.set(`${node.id}:agentSchema`, { text: control.value, errorKey: 'bpmn.agent_output_schema_invalid' });
+          this._setDraft(node, 'agentSchema', { text: control.value, errorKey: 'bpmn.agent_output_schema_invalid' });
           control.setAttribute('error', I18n.t('bpmn.agent_output_schema_invalid'));
         }
       } else if (key === 'blockType') {

@@ -573,6 +573,56 @@ async fn abandoning_the_step_cancels_the_agent_run() {
     drop(rig.manager);
 }
 
+/// Dropping the guard stops the live runs on the spot. The walk over the rows
+/// is a blocking job that a runtime shutting down never runs, so it must not be
+/// the only thing that cancels.
+#[test]
+fn dropping_the_guard_signals_the_live_run_without_the_blocking_walk() {
+    // One blocking thread, kept busy: the guard's walk is queued and never runs.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let fixture = Fixture::new();
+        seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+        let rig = install(&fixture, Script::Hold);
+        let run_id = "guarded-run".to_string();
+        rig.manager
+            .spawn_with_run_id(
+                &run_id,
+                AGENT_ID,
+                "work",
+                None,
+                &AgentPrincipal::user("u1"),
+                &[],
+                &[],
+                None,
+                Some(FlowRef {
+                    flow_id: "harness".into(),
+                    version_id: None,
+                }),
+            )
+            .await
+            .expect("spawn the run");
+        wait_for(|| rig.started.load(Ordering::Acquire) == 1).await;
+
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        tokio::task::spawn_blocking(move || {
+            let _ = parked.recv();
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(super::agent_exec::CancelRunOnDrop {
+            manager: rig.manager.clone(),
+            run_id,
+        });
+        wait_for(|| rig.cancelled.load(Ordering::Acquire)).await;
+        let _ = release.send(());
+    });
+}
+
 async fn wait_for(condition: impl Fn() -> bool) {
     for _ in 0..200 {
         if condition() {
@@ -1264,6 +1314,45 @@ async fn a_report_that_lands_while_the_claim_is_being_failed_is_observed_not_str
     assert_eq!(
         current.jobs[0].result.as_ref().unwrap().outputs,
         json!({"n": 4})
+    );
+}
+
+#[tokio::test]
+async fn a_report_the_observation_cannot_take_still_fails_the_claim_with_an_incident() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    let (claimed, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+    // The table accepts a row up to 384 KiB; the observed result has a smaller
+    // history budget, so the observation of this report is refused.
+    let oversized = json!({"outcome": "Completed", "summary": "x".repeat(390_000),
+        "code": null, "outputs": {}, "evidence": []});
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute(
+            "INSERT INTO bpmn_agent_completions(invocation_id,run_id,result_json,created_at_ms) VALUES(?1,?2,?3,?4)",
+            rusqlite::params![
+                binding.invocation_id,
+                binding.agent_run_id(),
+                oversized.to_string(),
+                now_ms()
+            ],
+        )
+        .unwrap();
+    super::jobs::fail_claim(
+        &fixture.db,
+        "agent-worker",
+        &claimed,
+        "SERVICE_TIMEOUT",
+        "the service task exceeded its configured timeout after dispatch",
+        None,
+    )
+    .expect("an unobservable report does not undo the failure");
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "uncertain");
+    assert_eq!(
+        snapshot(&fixture, &claimed.job.instance_id).instance.status,
+        ProcessInstanceStatus::Incident
     );
 }
 

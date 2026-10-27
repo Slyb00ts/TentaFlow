@@ -9506,6 +9506,21 @@ pub fn update_agent_run_status(
     Ok(rows > 0)
 }
 
+/// Marks a run `cancelled` only while it can still change. A run that settled
+/// (its row says `completed`, `failed`, ...) keeps the outcome it reported, even
+/// when a late cancel reaches it before its registry entry is gone. Returns
+/// whether a row changed.
+pub fn cancel_active_agent_run(pool: &DbPool, id: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    let rows = conn.execute(
+        "UPDATE agent_runs SET status = 'cancelled', exit_reason = 'cancelled', \
+         finished_at = datetime('now'), last_heartbeat_at = datetime('now') \
+         WHERE id = ?1 AND status IN ('queued', 'running', 'waiting', 'waiting_user')",
+        rusqlite::params![id],
+    )?;
+    Ok(rows > 0)
+}
+
 /// Bumps `last_heartbeat_at` without touching status — the liveness ping a
 /// long-running task sends while it works (and while parked in `waiting_user`).
 pub fn touch_agent_run_heartbeat(pool: &DbPool, id: &str) -> Result<bool> {

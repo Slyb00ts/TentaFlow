@@ -145,17 +145,20 @@ fn pinned_harness(
 /// it: abandoned (timeout, cancellation, lost lease), reported, or settled. A run
 /// that settled on its own may still have left sub-agents working, and none may
 /// outlive the step.
-struct CancelRunOnDrop {
-    manager: Arc<AgentRunManager>,
-    run_id: String,
+pub(super) struct CancelRunOnDrop {
+    pub(super) manager: Arc<AgentRunManager>,
+    pub(super) run_id: String,
 }
 
 impl Drop for CancelRunOnDrop {
     fn drop(&mut self) {
-        // The walk reads rows, so it must not run on the async worker that is
-        // dropping this guard. The cancellation is still signalled on every exit:
-        // a run that settled may have left sub-agents behind, and `cancel_tree`
-        // skips what is already settled by itself.
+        // The live runs are stopped here, on the dropping thread: that needs no
+        // row, and it must not wait for a blocking worker that a runtime on its
+        // way down never runs. Only the walk over the rows (descendants whose
+        // parent settled, and the `cancelled` marks) is moved off the async worker.
+        // Whatever a shutdown leaves in `running` is closed as `interrupted` by
+        // `reap_interrupted_on_startup`.
+        self.manager.signal_cancel_tree(&self.run_id);
         let (manager, run_id) = (self.manager.clone(), self.run_id.clone());
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
