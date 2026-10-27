@@ -670,8 +670,8 @@ pub struct AgentRunStatusUpdate<'a> {
     /// True the first time the run enters `running`, stamping `started_at`.
     pub set_started: bool,
     /// A write that races a cancel must not undo it: when the row already says
-    /// `cancelled`, its status, result and exit reason stay and only the
-    /// accounting (tokens, model, iterations) is recorded.
+    /// `cancelled`, its status, result, exit reason and finish time stay and
+    /// only the accounting (tokens, model, iterations) is recorded.
     pub keep_cancelled: bool,
 }
 

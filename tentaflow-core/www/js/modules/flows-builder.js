@@ -244,7 +244,7 @@ const FlowBuilderScreen = {
       readOnly: state.readOnly,
       mode: state.mode,
       processOptions: state.processOptions,
-      onModelReplace: (restored) => (restored ? state.config?.pruneProcessDrafts() : state.config?.clearProcessDrafts()),
+      onModelReplace: (restored) => state.config?.modelReplaced(restored),
       onChange: () => {
         this._markDirty();
         this._updateStats();

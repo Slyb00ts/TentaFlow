@@ -346,14 +346,27 @@ pub fn recorded_completion(
     stored
         .map(|json| {
             serde_json::from_str(&json).map_err(|_| {
-                anyhow::anyhow!(
-                    "stored agent report is not decodable ({} bytes)",
-                    json.len()
-                )
+                anyhow::Error::new(UndecodableReport { bytes: json.len() })
             })
         })
         .transpose()
 }
+
+/// A stored report that no longer decodes. Distinct from a database error: the
+/// row will never read back, so callers that can proceed without a report treat
+/// it as absent, while a database error is transient and must be retried.
+#[derive(Debug)]
+pub struct UndecodableReport {
+    pub bytes: usize,
+}
+
+impl std::fmt::Display for UndecodableReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stored agent report is not decodable ({} bytes)", self.bytes)
+    }
+}
+
+impl std::error::Error for UndecodableReport {}
 
 fn parse_outcome(value: &Value) -> Option<ActivityOutcome> {
     match value.as_str()? {

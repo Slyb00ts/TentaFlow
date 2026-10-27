@@ -273,7 +273,9 @@ export class FlowConfig {
     // Text of a field the author typed that cannot be saved yet, keyed by node and
     // field: a re-render must show it with its error, not the last valid value.
     // Leaving the node does not discard it, and publishing refuses while one is
-    // left (`processDraftProblems`), so a typed value never vanishes unseen.
+    // left (`processDraftProblems`). A refused draft is not model state and does
+    // not mark the flow dirty, so replacing the model (version preview, import,
+    // draft load) or an undo that removes its node discards it without a prompt.
     this.processDrafts = new Map();
     this.readOnly = !!opts.readOnly;
     this.mode = opts.mode || 'flow';
@@ -297,6 +299,13 @@ export class FlowConfig {
 
   /** Forget every refused draft: the model was replaced, so no node of it is the one the text was typed for. */
   clearProcessDrafts() { this.processDrafts.clear(); }
+
+  /** The canvas swapped its model: `restored` is undo/redo, otherwise a load, whose selection no longer exists. */
+  modelReplaced(restored) {
+    if (restored) { this.pruneProcessDrafts(); return; }
+    this.clearProcessDrafts();
+    this.renderEmpty();
+  }
 
   /** Drop drafts whose node is gone or is no longer an agent step (undo, redo): there is no field left to fix them in. */
   pruneProcessDrafts() {

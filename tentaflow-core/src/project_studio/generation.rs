@@ -1213,10 +1213,7 @@ pub fn reconcile_running(core_db: &DbPool, pool: &DbPool, org_id: &str, project_
         } else {
             match crate::db::repository::get_agent_run(core_db, &generation.agent_run_id) {
                 Ok(Some(run)) => {
-                    if matches!(
-                        run.status.as_str(),
-                        "completed" | "failed" | "cancelled" | "interrupted"
-                    ) {
+                    if crate::db::repository::agent_run_status_is_terminal(&run.status) {
                         map_terminal(
                             &run.status,
                             run.exit_reason.as_deref(),

@@ -995,7 +995,7 @@ impl AgentRunManager {
             let terminal = entry
                 .get("status")
                 .and_then(|s| s.as_str())
-                .map(|s| matches!(s, "completed" | "failed" | "cancelled" | "interrupted"))
+                .map(repository::agent_run_status_is_terminal)
                 .unwrap_or(false);
             if terminal {
                 // First finisher wins; the remaining waiters are dropped (the runs
@@ -1556,7 +1556,7 @@ async fn run_task(ctx: TaskContext) {
         }
     };
 
-    let _ = repository::update_agent_run_status(
+    let settled = repository::update_agent_run_status(
         &db,
         &run_id,
         &AgentRunStatusUpdate {
@@ -1575,11 +1575,13 @@ async fn run_task(ctx: TaskContext) {
             ..Default::default()
         },
     );
+    // The status the row holds after the write decides what the parent hears: a
+    // cancel that settled the row first wins over the outcome computed here. An
+    // unreadable result (database error) keeps the locally derived outcome.
     let (final_status, exit_reason) = if final_status != RunStatus::Cancelled
-        && repository::get_agent_run(&db, &run_id)
-            .ok()
-            .flatten()
-            .is_some_and(|row| row.status == RunStatus::Cancelled.as_str())
+        && settled
+            .as_ref()
+            .is_ok_and(|status| status.as_deref() == Some(RunStatus::Cancelled.as_str()))
     {
         (RunStatus::Cancelled, "cancelled".to_string())
     } else {

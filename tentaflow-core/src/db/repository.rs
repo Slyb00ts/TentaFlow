@@ -9093,7 +9093,15 @@ pub fn agent_run_status_is_terminal(status: &str) -> bool {
 /// `'queued','running',...` for an `IN (...)` clause; the values are constants,
 /// never caller input.
 fn agent_run_active_states_sql() -> String {
-    AGENT_RUN_ACTIVE_STATES
+    states_sql_list(AGENT_RUN_ACTIVE_STATES)
+}
+
+fn agent_run_terminal_states_sql() -> String {
+    states_sql_list(AGENT_RUN_TERMINAL_STATES)
+}
+
+fn states_sql_list(states: &[&str]) -> String {
+    states
         .iter()
         .map(|state| format!("'{state}'"))
         .collect::<Vec<_>>()
@@ -9490,12 +9498,14 @@ pub fn get_agent_run(pool: &DbPool, id: &str) -> Result<Option<DbAgentRun>> {
 
 /// Applies a lifecycle/counter update to a run. `started_at`/`finished_at` are
 /// stamped from the flags so the caller never races the wall clock per field;
-/// `last_heartbeat_at` always advances (the watchdog reads it).
+/// `last_heartbeat_at` always advances (the watchdog reads it). Returns the
+/// status the row holds after the write (`None` when no row matched), read in
+/// the same statement so a `keep_cancelled` write can tell whether a cancel won.
 pub fn update_agent_run_status(
     pool: &DbPool,
     id: &str,
     update: &AgentRunStatusUpdate<'_>,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     if !AGENT_RUN_STATES.contains(&update.status) {
         return Err(anyhow::anyhow!(
             "invalid agent run status: '{}'",
@@ -9503,7 +9513,8 @@ pub fn update_agent_run_status(
         ));
     }
     let conn = acquire(pool)?;
-    let rows = conn.execute(
+    let resulting = conn
+        .query_row(
         "UPDATE agent_runs SET \
          status = CASE WHEN ?12 AND status = 'cancelled' THEN status ELSE ?2 END, \
          result = CASE WHEN ?12 AND status = 'cancelled' THEN result ELSE COALESCE(?3, result) END, \
@@ -9514,9 +9525,9 @@ pub fn update_agent_run_status(
          completion_tokens = COALESCE(?8, completion_tokens), \
          model = COALESCE(?9, model), \
          started_at = CASE WHEN ?10 AND started_at IS NULL THEN datetime('now') ELSE started_at END, \
-         finished_at = CASE WHEN ?11 THEN datetime('now') ELSE finished_at END, \
+         finished_at = CASE WHEN ?11 AND NOT (?12 AND status = 'cancelled' AND finished_at IS NOT NULL) THEN datetime('now') ELSE finished_at END, \
          last_heartbeat_at = datetime('now') \
-         WHERE id = ?1",
+         WHERE id = ?1 RETURNING status",
         rusqlite::params![
             id,
             update.status,
@@ -9531,8 +9542,10 @@ pub fn update_agent_run_status(
             update.set_finished as i64,
             update.keep_cancelled as i64,
         ],
-    )?;
-    Ok(rows > 0)
+        |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(resulting)
 }
 
 /// Marks a run `cancelled` only while it can still change. A run that settled
@@ -9761,6 +9774,7 @@ pub fn purge_agent_runtime_before(
     // prompt/log; an already-redacted run is skipped so the count reflects
     // newly-redacted rows.
     let org_match = "(org_id = ?1 OR (?2 AND org_id IS NULL))";
+    let terminal = agent_run_terminal_states_sql();
     // Mailbox first (it references the runs about to be redacted): delete the
     // entries whose child run is in this org and finished before the cutoff.
     let mailbox = tx.execute(
@@ -9768,7 +9782,7 @@ pub fn purge_agent_runtime_before(
             "DELETE FROM agent_mailbox WHERE run_id IN ( \
                 SELECT id FROM agent_runs \
                 WHERE finished_at IS NOT NULL AND finished_at < ?3 \
-                  AND status IN ('completed','failed','cancelled','interrupted') \
+                  AND status IN ({terminal}) \
                   AND {org_match})"
         ),
         rusqlite::params![org_id, org_is_default, cutoff],
@@ -9777,7 +9791,7 @@ pub fn purge_agent_runtime_before(
         &format!(
             "UPDATE agent_runs SET prompt = '', result = NULL, run_log = NULL \
              WHERE finished_at IS NOT NULL AND finished_at < ?3 \
-               AND status IN ('completed','failed','cancelled','interrupted') \
+               AND status IN ({terminal}) \
                AND {org_match} \
                AND NOT (prompt = '' AND result IS NULL AND run_log IS NULL)"
         ),
@@ -10028,16 +10042,20 @@ mod agents_repository_tests {
         assert!(run.started_at.is_none());
 
         // queued -> running stamps started_at.
-        assert!(update_agent_run_status(
-            &db,
-            &run_id,
-            &AgentRunStatusUpdate {
-                status: "running",
-                set_started: true,
-                ..Default::default()
-            }
-        )
-        .expect("to running"));
+        assert_eq!(
+            update_agent_run_status(
+                &db,
+                &run_id,
+                &AgentRunStatusUpdate {
+                    status: "running",
+                    set_started: true,
+                    ..Default::default()
+                }
+            )
+            .expect("to running")
+            .as_deref(),
+            Some("running")
+        );
         let run = get_agent_run(&db, &run_id).expect("get").expect("exists");
         assert_eq!(run.status, "running");
         assert!(run.started_at.is_some());
@@ -10103,6 +10121,67 @@ mod agents_repository_tests {
             )
             .is_err(),
             "invalid status rejected"
+        );
+    }
+
+    #[test]
+    fn keep_cancelled_write_reports_the_cancel_and_keeps_the_finish_time() {
+        let db = setup_db();
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        upsert_agent(&db, &agent_params(&agent_id, "runner")).expect("agent");
+        let run_id = uuid::Uuid::new_v4().to_string();
+        create_agent_run(
+            &db,
+            &NewAgentRun {
+                id: &run_id,
+                agent_id: &agent_id,
+                parent_run_id: None,
+                flow_execution_id: None,
+                user_id: Some("user-1"),
+                org_id: Some("org-default"),
+                prompt: "p",
+                origin: "system",
+                actor_kind: "system",
+                actor_id: None,
+                actor_user_id: None,
+                correlation_id: None,
+            },
+        )
+        .expect("create");
+        assert!(cancel_active_agent_run(&db, &run_id).expect("cancel"));
+        {
+            let conn = acquire(&db).expect("conn");
+            conn.execute(
+                "UPDATE agent_runs SET finished_at = '2001-01-01 00:00:00' WHERE id = ?1",
+                rusqlite::params![run_id],
+            )
+            .expect("pin finish time");
+        }
+
+        let resulting = update_agent_run_status(
+            &db,
+            &run_id,
+            &AgentRunStatusUpdate {
+                status: "completed",
+                result: Some("late"),
+                total_tokens: Some(42),
+                set_finished: true,
+                keep_cancelled: true,
+                ..Default::default()
+            },
+        )
+        .expect("late write");
+        assert_eq!(resulting.as_deref(), Some("cancelled"));
+        let run = get_agent_run(&db, &run_id).expect("get").expect("exists");
+        assert_eq!(run.status, "cancelled");
+        assert_eq!(run.result, None);
+        assert_eq!(run.total_tokens, 42, "accounting is still recorded");
+        assert_eq!(run.finished_at.as_deref(), Some("2001-01-01 00:00:00"));
+
+        assert_eq!(
+            update_agent_run_status(&db, "missing", &AgentRunStatusUpdate::default())
+                .unwrap_or(None),
+            None
         );
     }
 

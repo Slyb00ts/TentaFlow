@@ -200,6 +200,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   mówi `Cancelled`. Lista stanów aktywnych i końcowych przebiegu jest jedna
   (`AGENT_RUN_ACTIVE_STATES`, `AGENT_RUN_TERMINAL_STATES`), a test pilnuje, by
   nowy stan trafił do jednej z nich.
+- Piąta runda poprawek po przeglądzie kroku agenta (B3.4b). Wczytanie innego
+  modelu (import XML, szkic, podgląd wersji) czyści też panel inspektora, więc
+  nie zostaje w nim odrzucony tekst usuniętego węzła. Stan końcowy przebiegu,
+  który słyszy rodzic, pochodzi z tej samej instrukcji `UPDATE ... RETURNING`,
+  co zapis końcowy (bez drugiego odczytu, który mógł się nie udać), a zapis po
+  anulowaniu zachowuje też czas zakończenia. Nieczytelne zgłoszenie agenta nie
+  jest porażką odzyskiwania powtarzaną przy każdym starcie: krok idzie zwykłą
+  ścieżką przerwanego zadania. Przejściowy błąd bazy przy odczycie zgłoszenia w
+  trakcie porażki zadania jest ponawiany, a nie zamieniany w incydent
+  niepewności. Listy stanów końcowych w czyszczeniu retencji, `wait_any` i
+  odczycie generacji wynikają z `AGENT_RUN_TERMINAL_STATES`.
 - Paleta projektanta BPMN ma grupę „Bloki TentaFlow” (B3.3a): przepływy, bloki
   Flow Buildera (`llm`, `embeddings`, `pii_filter`) i narzędzia addonów
   upuszcza się na płótno jako gotowe zadania usługi, z nazwą pozycji i bez pytania

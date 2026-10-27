@@ -677,6 +677,95 @@ fn a_report_recorded_before_a_restart_is_adopted_without_running_the_agent_again
     );
 }
 
+fn interrupt_run(fixture: &Fixture, binding: &super::agent_sink::ProcessActivityBinding) {
+    crate::db::repository::update_agent_run_status(
+        &fixture.db,
+        &binding.agent_run_id(),
+        &crate::db::models::AgentRunStatusUpdate {
+            status: "interrupted",
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+
+fn incident_codes(fixture: &Fixture, job_id: &str) -> Vec<String> {
+    let conn = fixture.db.read().unwrap();
+    let mut statement = conn
+        .prepare("SELECT code FROM bpmn_incidents WHERE job_id=?1 ORDER BY at_ms,incident_id")
+        .unwrap();
+    statement
+        .query_map([job_id], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+#[test]
+fn a_restart_with_an_undecodable_report_row_takes_the_path_of_a_run_that_never_reported() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    let (claimed, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+    let corrupt = json!({"outcome": "SecretVariantName", "summary": "private report text",
+        "code": null, "outputs": {}, "evidence": []});
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute(
+            "INSERT INTO bpmn_agent_completions(invocation_id,run_id,result_json,created_at_ms) VALUES(?1,?2,?3,?4)",
+            rusqlite::params![
+                binding.invocation_id,
+                binding.agent_run_id(),
+                corrupt.to_string(),
+                now_ms()
+            ],
+        )
+        .unwrap();
+    interrupt_run(&fixture, &binding);
+
+    let authority = super::runtime::tool_authority(fixture.dispatcher());
+    repository::recover_jobs(&fixture.db, None, now_ms(), &authority).unwrap();
+
+    let current = snapshot(&fixture, &claimed.job.instance_id);
+    assert_eq!(current.instance.status, ProcessInstanceStatus::Incident);
+    assert_eq!(current.jobs[0].result, None);
+    let codes = incident_codes(&fixture, &claimed.job.job_id);
+    assert_eq!(
+        codes,
+        vec!["EXTERNAL_OUTCOME_UNCERTAIN".to_owned()],
+        "the undecodable report is not a recovery failure that repeats on every restart"
+    );
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "uncertain");
+}
+
+#[test]
+fn a_database_error_while_reading_the_report_fails_the_claim_for_a_retry_not_as_uncertain() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    let (claimed, _binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute_batch("DROP TABLE bpmn_agent_completions")
+        .unwrap();
+    let result = super::jobs::fail_claim(
+        &fixture.db,
+        "agent-worker",
+        &claimed,
+        "SERVICE_TIMEOUT",
+        "the service task exceeded its configured timeout after dispatch",
+        None,
+    );
+    assert!(result.is_err(), "a transient read error must propagate");
+    assert_eq!(
+        invocation(&fixture, &claimed.job.job_id).2,
+        "may_have_executed",
+        "nothing is recorded, so the failure can be retried"
+    );
+}
+
 #[test]
 fn a_restart_without_a_report_keeps_the_interrupted_incident() {
     let fixture = Fixture::new();

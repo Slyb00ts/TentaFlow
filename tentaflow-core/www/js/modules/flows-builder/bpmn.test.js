@@ -3031,7 +3031,7 @@ test('a refused draft left inside a sub-process still blocks publishing from the
 
 function wireDrafts(graph, config) {
   // The same wiring flows-builder.js gives the canvas it owns.
-  graph.onModelReplace = (restored) => (restored ? config.pruneProcessDrafts() : config.clearProcessDrafts());
+  graph.onModelReplace = (restored) => config.modelReplaced(restored);
 }
 
 test('undoing a step back to a flow drops the refused agent draft that nothing can fix any more', async () => {
@@ -3086,6 +3086,9 @@ test('loading another model drops every refused draft, even for a node id the ne
   assert.equal(config.processDraftProblems().length, 1);
   graph.setData(graph.getData());
   assert.deepEqual(config.processDraftProblems(), [], 're-importing the same model starts without the old refusals');
+  assert.equal(config.node, null, 'the inspector no longer holds the replaced node');
+  assert.equal(config.root.querySelector('[data-process="agentSchema"]'), null, 'the refused text and its error are gone from the panel');
+  assert.ok(config.root.querySelector('.fb-config-empty'));
   graph.destroy(); config.destroy();
 });
 

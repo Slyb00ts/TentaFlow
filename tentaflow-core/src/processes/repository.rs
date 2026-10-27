@@ -27564,8 +27564,19 @@ fn adopt_agent_report(
         match invocation {
             None => None,
             Some((invocation_id, request_id)) => {
-                super::agent_sink::recorded_completion(&conn, &invocation_id)?
-                    .map(|result| (invocation_id, request_id, result))
+                match super::agent_sink::recorded_completion(&conn, &invocation_id) {
+                    Ok(report) => report.map(|result| (invocation_id, request_id, result)),
+                    // A report that never decodes would fail recovery on every
+                    // restart; without a usable report the step takes the same
+                    // interrupted path as an agent that never reported.
+                    Err(error) if error.is::<super::agent_sink::UndecodableReport>() => {
+                        tracing::warn!(job_id, invocation_id = %invocation_id,
+                            error_len = error.to_string().len(),
+                            "a recorded agent report cannot be decoded");
+                        None
+                    }
+                    Err(error) => return Err(error),
+                }
             }
         }
     };
@@ -28155,17 +28166,20 @@ pub fn fail_job_with_authority(
         // observed result. A revocation still blocks: the report is then recorded
         // as observed and blocked by the observation itself.
         if !authority_revoked {
-            // A row that cannot be read back is the same kind of failure as one that
+            // A row that will never decode is the same kind of failure as one that
             // cannot be observed: it must not roll the failure back, or the job would
-            // stay running with no incident on every retry.
+            // stay running with no incident on every retry. A database error is
+            // transient and propagates, so the failure is retried instead of
+            // recording uncertainty over a report that may be readable next time.
             let recorded = match super::agent_sink::recorded_completion(&tx, &invocation_id) {
                 Ok(recorded) => recorded,
-                Err(error) => {
+                Err(error) if error.is::<super::agent_sink::UndecodableReport>() => {
                     tracing::warn!(job_id, invocation_id = %invocation_id,
                         error_len = error.to_string().len(),
-                        "a recorded agent report cannot be read");
+                        "a recorded agent report cannot be decoded");
                     None
                 }
+                Err(error) => return Err(error),
             };
             if let Some(report) = recorded {
                 // A report the observation cannot take (over the history budget, no
