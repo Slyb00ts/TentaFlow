@@ -15983,6 +15983,7 @@
     "event_receive_task_opened": "{node}: waiting to receive message {message} ({key})",
     "event_receive_task_completed": "{node}: message {message} received",
     "event_verification_passed": "{node}: verification passed",
+    "event_verification_withdrawn": "{node}: the approval on this result is not relied on, a person decides",
     "event_user_task_completed": "{node}: human work completed",
     "event_verification_approved": "{node}: result approved",
     "event_verification_rejected": "{node}: result rejected",

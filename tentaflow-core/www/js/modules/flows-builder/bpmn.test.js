@@ -5162,7 +5162,7 @@ test('run uses immutable selected version variables and blocks oversized input b
 });
 
 test('all five locales translate supported elements, current statuses and every finite event without exposing internal IDs', async () => {
-  const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'manual_task_opened', 'manual_task_acknowledged', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'inclusive_split', 'inclusive_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
+  const events = ['instance_started', 'node_completed', 'end_reached', 'instance_completed', 'user_task_opened', 'manual_task_opened', 'manual_task_acknowledged', 'exclusive_selected', 'parallel_split', 'parallel_joined', 'inclusive_split', 'inclusive_joined', 'service_queued', 'service_claimed', 'service_result', 'verification_passed', 'verification_withdrawn', 'user_task_completed', 'verification_approved', 'verification_rejected', 'incident', 'cancelled', 'job_retried', 'job_interrupted', 'job_denied', 'job_failed'];
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     await I18n.setLanguage(language);
     assert.equal(processTemplates().length, 29);

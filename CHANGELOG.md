@@ -554,6 +554,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   weryfikatora zamiast zamieniać się w `OUTPUT_LIMIT`. Migracja 205 uzupełnia
   `critic_verified` dla istniejących wywołań z przypiętych migawek, a adopcja
   zgłoszenia agenta używa werdyktu krytyka, jeśli ten zdążył go zapisać.
+- Trzecia runda poprawek przeglądu B3.5. Zatwierdzone zadanie z Testem albo
+  Krytykiem, po którym następuje skrypt, wysyłka, sygnał, zadanie ręczne, odbiór,
+  link albo koniec Terminate, nie kończy się już odmową walidatora historii i
+  incydentem nad skończoną pracą: walidator przyjmuje `verification_passed` z
+  `{"mode","reference"}` i ponownie dowodzi zatwierdzenia na zapisanej obserwacji
+  (także braku wycofania). Zatwierdzenie, któremu nie wolno ufać, zostawia w
+  historii zdarzenie `verification_withdrawn` przed zadaniem dla człowieka (nowa
+  etykieta w pięciu językach). Wycofanie krytyka obejmuje jego harness, także przy
+  adopcji i odroczonym przyjęciu. Harness krytyka nie może zawierać `loop`, `map`
+  ani `subflow` (silnik nie przypina ciał, więc sprawdzenie ciała nie mogłoby
+  obowiązywać). Odrzucenie od wycofanego weryfikatora stoi tak samo w trakcie
+  wykonania i przy przyjęciu; tylko zatwierdzenie trafia wtedy do człowieka.
 
 ### TentaNas
 

@@ -6747,9 +6747,9 @@ pub(super) fn unhandled_repeated_result(
     }
 }
 
-/// The data of a `verification_passed` event. A condition keeps the bytes it
-/// always had; a machine mode names who approved.
-fn verification_passed_data(verification: &ActivityVerification) -> Value {
+/// The data of a `verification_passed` or `verification_withdrawn` event. A
+/// condition keeps the bytes it always had; a machine mode names the verifier.
+fn verification_event_data(verification: &ActivityVerification) -> Value {
     match (verification, verification.automatic()) {
         (ActivityVerification::Condition { expression }, _) => json!({"expression": expression}),
         (_, Some((kind, reference, _))) => json!({"mode": kind.as_str(), "reference": reference}),
@@ -7270,6 +7270,11 @@ pub fn plan_job_result(
         && verification.automatic().is_some_and(|(kind, reference, _)| {
             approval_withdrawn || !observed.approved_by(kind, reference)
         });
+    // The person is told why the approval on the result is not relied on.
+    let withdrawn = unverified
+        && approval_withdrawn
+        && verification.automatic().is_some_and(|(kind, reference, _)|
+            observed.approved_by(kind, reference));
     transition.plan.complete_job_ids.push(job.job_id.clone());
     transition
         .jobs
@@ -7348,6 +7353,10 @@ pub fn plan_job_result(
             || matches!(verification, ActivityVerification::Human)
             || unverified
         {
+            if withdrawn {
+                transition.event("verification_withdrawn", Some(node.id.clone()),
+                    verification_event_data(verification));
+            }
             let task_inputs = transition.activity_inputs_for_user_task(
                 &node, &token.token_id,
             )?;
@@ -7391,7 +7400,7 @@ pub fn plan_job_result(
         transition.resolve_boundary_incidents(&token.token_id);
         transition.consume(&token.token_id);
         transition.event("verification_passed", Some(node.id.clone()),
-            verification_passed_data(verification));
+            verification_event_data(verification));
         let before_mapping = transition.clone();
         if let Err(error) = transition.complete_repetition_occurrence(&token, &result.outputs,
             result_event_id, None, Some(observed.origin.clone())) {
@@ -7721,6 +7730,13 @@ pub fn plan_job_result(
             verification_opened = true;
         }
         _ if unverified => {
+            if withdrawn {
+                transition.event(
+                    "verification_withdrawn",
+                    Some(node.id.clone()),
+                    verification_event_data(verification),
+                );
+            }
             let task_inputs = transition.activity_inputs_for_user_task(
                 &node, &token.token_id,
             )?;
@@ -7785,7 +7801,7 @@ pub fn plan_job_result(
                         transition.event(
                             "verification_passed",
                             Some(node.id.clone()),
-                            verification_passed_data(verification),
+                            verification_event_data(verification),
                         );
                         for edge in transition.outgoing(&node.id) {
                             transition.follow(&token, &edge)?;

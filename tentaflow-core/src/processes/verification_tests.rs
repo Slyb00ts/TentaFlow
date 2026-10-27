@@ -2011,25 +2011,8 @@ fn critic_refusal_with(rig: &Rigged, harness_flow: &str) -> Option<String> {
 }
 
 #[test]
-fn a_critic_harness_cannot_hide_a_block_with_an_effect_in_a_body_flow() {
+fn a_critic_harness_cannot_run_another_flow_because_a_body_is_not_pinned() {
     let rig = rigged();
-    for effect in ["exec_command", "addon.notes.write", "store"] {
-        let body = flow(&rig.fixture.db, &rig.fixture.owner, &harness_with(effect));
-        for wrapper in ["loop", "map", "subflow"] {
-            let harness = flow(
-                &rig.fixture.db,
-                &rig.fixture.owner,
-                &harness_running(wrapper, &body),
-            );
-            let refused = critic_refusal_with(&rig, &harness)
-                .unwrap_or_else(|| panic!("{wrapper} -> {effect} was published"));
-            assert!(
-                refused.contains("may have an effect"),
-                "{wrapper}/{effect}: {refused}"
-            );
-        }
-    }
-    // The same wrappers around a harmless body are fine.
     let clean = flow(&rig.fixture.db, &rig.fixture.owner, &harness_with("llm"));
     for wrapper in ["loop", "map", "subflow"] {
         let harness = flow(
@@ -2037,109 +2020,13 @@ fn a_critic_harness_cannot_hide_a_block_with_an_effect_in_a_body_flow() {
             &rig.fixture.owner,
             &harness_running(wrapper, &clean),
         );
-        assert_eq!(critic_refusal_with(&rig, &harness), None, "{wrapper}");
-    }
-}
-
-#[test]
-fn a_critic_harness_is_checked_through_nested_bodies_up_to_a_depth_limit() {
-    let rig = rigged();
-    let wrap = |inner: &str| {
-        flow(
-            &rig.fixture.db,
-            &rig.fixture.owner,
-            &harness_running("loop", inner),
-        )
-    };
-    // The effect sits at the bottom of a chain of loops.
-    let mut harness = flow(
-        &rig.fixture.db,
-        &rig.fixture.owner,
-        &harness_with("exec_command"),
-    );
-    for _ in 0..2 {
-        harness = wrap(&harness);
-    }
-    let refused = critic_refusal_with(&rig, &harness).expect("a nested effect is found");
-    assert!(refused.contains("may have an effect"), "{refused}");
-
-    // Past the depth the body is not looked at, so it is not allowed, however clean.
-    let mut harness = flow(&rig.fixture.db, &rig.fixture.owner, &harness_with("llm"));
-    for _ in 0..3 {
-        harness = wrap(&harness);
-    }
-    assert_eq!(critic_refusal_with(&rig, &harness), None, "four flows deep");
-    harness = wrap(&harness);
-    let refused = critic_refusal_with(&rig, &harness).expect("five flows deep is refused");
-    assert!(refused.contains("deeper"), "{refused}");
-}
-
-#[test]
-fn a_critic_harness_refuses_a_body_it_cannot_check() {
-    let rig = rigged();
-    let missing = flow(
-        &rig.fixture.db,
-        &rig.fixture.owner,
-        &harness_running("loop", "no-such-flow"),
-    );
-    let refused = critic_refusal_with(&rig, &missing).expect("a missing body");
-    assert!(refused.contains("does not exist"), "{refused}");
-
-    for config in [json!({}), json!({"body_flow_engine_id": "round"})] {
-        let harness = flow(
-            &rig.fixture.db,
-            &rig.fixture.owner,
-            &harness_around("loop", config),
+        let refused = critic_refusal_with(&rig, &harness)
+            .unwrap_or_else(|| panic!("a {wrapper} over a clean body was published"));
+        assert!(
+            refused.contains(&format!("may have an effect ({wrapper})")),
+            "{wrapper}: {refused}"
         );
-        let refused = critic_refusal_with(&rig, &harness).expect("a body that is not an id");
-        assert!(refused.contains("no body flow it can check"), "{refused}");
     }
-
-    // A flow that runs itself.
-    let looping = flow(&rig.fixture.db, &rig.fixture.owner, &harness_with("llm"));
-    rig.fixture
-        .db
-        .write()
-        .unwrap()
-        .execute(
-            "UPDATE flows SET flow_json=?1 WHERE id=?2",
-            [&harness_running("loop", &looping), &looping],
-        )
-        .unwrap();
-    let refused = critic_refusal_with(&rig, &looping).expect("a cycle");
-    assert!(refused.contains("from inside itself"), "{refused}");
-}
-
-#[tokio::test]
-async fn a_body_flow_edited_after_publication_stops_a_critic_step_before_the_work_runs() {
-    let rig = rigged();
-    let runner = install(
-        &rig.fixture,
-        critic_roles(Script::Silent, Script::Report(verdict("completed", "fine"))),
-    );
-    let body = flow(&rig.fixture.db, &rig.fixture.owner, &harness_with("llm"));
-    let harness = flow(
-        &rig.fixture.db,
-        &rig.fixture.owner,
-        &harness_running("loop", &body),
-    );
-    set_harness(&rig.fixture, &harness);
-    let model = service_model(&rig.work_flow, critic_mode(VerificationOnFailure::Error));
-    let started = start_model(&rig.fixture, &model);
-    rig.fixture
-        .db
-        .write()
-        .unwrap()
-        .execute(
-            "UPDATE flows SET flow_json=?1 WHERE id=?2",
-            [&harness_with("exec_command"), &body],
-        )
-        .unwrap();
-    let claimed = repository::claim_job(&rig.fixture.db, "agent-worker", now_ms()).unwrap();
-    execute_if_claimed(&rig.fixture, claimed).await;
-
-    assert_stopped_before_the_work(&rig.fixture, &started.instance_id).await;
-    assert_eq!(runner.started.load(std::sync::atomic::Ordering::Acquire), 0);
 }
 
 #[test]
@@ -2349,11 +2236,18 @@ async fn a_recorded_work_result_that_imitates_a_verdict_is_refused_by_the_accept
     let authority = super::runtime::tool_authority(rig.fixture.dispatcher());
     repository::recover_jobs(&rig.fixture.db, None, now_ms(), &authority).unwrap();
     let current = snapshot(&rig.fixture, &claimed.job.instance_id);
-    assert_ne!(current.instance.status, ProcessInstanceStatus::Completed);
-    assert_eq!(current.instance.variables.get("answer"), None);
     // The acceptance refuses it outright: it is not handed to a person as if it
-    // were merely unverified.
+    // were merely unverified, and nothing is approved.
+    assert_eq!(current.instance.status, ProcessInstanceStatus::Incident);
+    assert_eq!(
+        incident_codes(&rig.fixture, &claimed.job.job_id),
+        ["RESULT_RECOVERY_FAILED"]
+    );
+    assert_eq!(current.instance.variables.get("answer"), None);
     assert!(current.user_tasks.is_empty());
+    assert!(!events(&rig.fixture, &claimed.job.instance_id)
+        .iter()
+        .any(|event| event.kind == "verification_passed"));
 }
 
 #[test]
@@ -2504,6 +2398,28 @@ async fn a_verdict_of_a_withdrawn_verifier_never_approves_and_never_strands_the_
                 result.outputs["variables"]["marker"], "work-done",
                 "the person is given the work the verdict was about"
             );
+        }
+        let history = events(&rig.fixture, &claimed.job.instance_id);
+        let withdrawn_events: Vec<_> = history
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.kind == "verification_withdrawn")
+            .collect();
+        if verdict == Approved && withdrawn {
+            // The history says why a person got a result that reads as approved.
+            assert_eq!(withdrawn_events.len(), 1, "{case}");
+            assert_eq!(
+                withdrawn_events[0].1.data,
+                json!({"mode": "test", "reference": verifier}),
+                "{case}"
+            );
+            let opened = history
+                .iter()
+                .position(|event| event.kind == "user_task_opened")
+                .unwrap();
+            assert!(withdrawn_events[0].0 < opened, "{case}");
+        } else {
+            assert!(withdrawn_events.is_empty(), "{case}");
         }
     }
 }
@@ -2711,13 +2627,12 @@ async fn a_verification_flow_may_reject_with_the_code_and_approve_with_the_evide
     assert_eq!(current.instance.status, ProcessInstanceStatus::Completed);
 }
 
-#[test]
-fn a_critic_verdict_written_before_the_worker_was_gone_is_the_verdict_of_an_adopted_report() {
-    let fixture = Fixture::new();
-    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
-    seed_agent(&fixture, CRITIC_ID, "[]", 10, true);
-    let (claimed, binding) =
-        machine_agent_step(&fixture, critic_mode(VerificationOnFailure::Error));
+/// An agent step with a critic whose work report and critic verdict were both
+/// written before the worker was gone, ready for the restart to adopt.
+fn critic_judged_agent_step(fixture: &Fixture, critic_verdict: Value) -> ClaimedProcessJob {
+    seed_agent(fixture, AGENT_ID, "[]", 10, true);
+    seed_agent(fixture, CRITIC_ID, "[]", 10, true);
+    let (claimed, binding) = machine_agent_step(fixture, critic_mode(VerificationOnFailure::Error));
     complete_task(
         &fixture.db,
         &binding,
@@ -2732,24 +2647,28 @@ fn a_critic_verdict_written_before_the_worker_was_gone_is_the_verdict_of_an_adop
         ..binding.clone()
     };
     insert_run(
-        &fixture,
+        fixture,
         &critic.agent_run_id(),
         CRITIC_ID,
         None,
         Some(&critic.invocation_id),
         "running",
     );
-    judge(
-        &fixture,
-        &critic,
-        &critic.agent_run_id(),
-        verdict("error", "the total is wrong"),
-    )
-    .unwrap();
-    interrupt_run(&fixture, &binding);
+    judge(fixture, &critic, &critic.agent_run_id(), critic_verdict).unwrap();
+    interrupt_run(fixture, &binding);
+    claimed
+}
 
+fn adopt_after_restart(fixture: &Fixture) {
     let authority = super::runtime::tool_authority(fixture.dispatcher());
     repository::recover_jobs(&fixture.db, None, now_ms(), &authority).unwrap();
+}
+
+#[test]
+fn a_critic_verdict_written_before_the_worker_was_gone_is_the_verdict_of_an_adopted_report() {
+    let fixture = Fixture::new();
+    let claimed = critic_judged_agent_step(&fixture, verdict("error", "the total is wrong"));
+    adopt_after_restart(&fixture);
 
     let current = snapshot(&fixture, &claimed.job.instance_id);
     let result = current.jobs[0].result.as_ref().unwrap();
@@ -2764,4 +2683,523 @@ fn a_critic_verdict_written_before_the_worker_was_gone_is_the_verdict_of_an_adop
         incident_codes(&fixture, &claimed.job.job_id),
         ["VERIFICATION_FAILED"]
     );
+}
+
+#[test]
+fn an_adopted_critic_approval_stands_while_the_critic_is_usable() {
+    let fixture = Fixture::new();
+    let claimed = critic_judged_agent_step(&fixture, verdict("completed", "all correct"));
+    adopt_after_restart(&fixture);
+
+    let current = snapshot(&fixture, &claimed.job.instance_id);
+    assert_eq!(current.instance.status, ProcessInstanceStatus::Completed);
+    assert!(current.user_tasks.is_empty());
+    let history = events(&fixture, &claimed.job.instance_id);
+    assert!(history
+        .iter()
+        .any(|event| event.kind == "verification_passed"
+            && event.data == json!({"mode": "critic", "reference": CRITIC_ID})));
+    assert!(!history
+        .iter()
+        .any(|event| event.kind == "verification_withdrawn"));
+}
+
+/// How the critic of an adopted approval can be taken away between its verdict
+/// and the restart.
+#[derive(Clone, Copy, Debug)]
+enum Withdrawal {
+    Disabled,
+    HarnessWithAnEffect,
+}
+
+fn withdraw_critic(fixture: &Fixture, how: Withdrawal) {
+    match how {
+        Withdrawal::Disabled => {
+            fixture
+                .db
+                .write()
+                .unwrap()
+                .execute("UPDATE agents SET is_enabled=0 WHERE id=?1", [CRITIC_ID])
+                .unwrap();
+        }
+        Withdrawal::HarnessWithAnEffect => {
+            let harness = flow(&fixture.db, &fixture.owner, &harness_with("exec_command"));
+            set_harness(fixture, &harness);
+        }
+    }
+}
+
+#[test]
+fn an_adopted_critic_approval_of_a_withdrawn_critic_goes_to_a_person_with_its_reason() {
+    for how in [Withdrawal::Disabled, Withdrawal::HarnessWithAnEffect] {
+        let fixture = Fixture::new();
+        let claimed = critic_judged_agent_step(&fixture, verdict("completed", "all correct"));
+        withdraw_critic(&fixture, how);
+        adopt_after_restart(&fixture);
+
+        let current = snapshot(&fixture, &claimed.job.instance_id);
+        assert_eq!(
+            current.instance.status,
+            ProcessInstanceStatus::Waiting,
+            "{how:?}"
+        );
+        assert_eq!(current.user_tasks.len(), 1, "{how:?}");
+        assert_eq!(current.instance.variables.get("answer"), None, "{how:?}");
+        assert!(
+            incident_codes(&fixture, &claimed.job.job_id).is_empty(),
+            "{how:?}: the work is not stranded"
+        );
+        let history = events(&fixture, &claimed.job.instance_id);
+        assert!(
+            !history
+                .iter()
+                .any(|event| event.kind == "verification_passed"),
+            "{how:?}"
+        );
+        let withdrawn: Vec<_> = history
+            .iter()
+            .filter(|event| event.kind == "verification_withdrawn")
+            .collect();
+        assert_eq!(withdrawn.len(), 1, "{how:?}");
+        assert_eq!(
+            withdrawn[0].data,
+            json!({"mode": "critic", "reference": CRITIC_ID}),
+            "{how:?}"
+        );
+    }
+}
+
+#[test]
+fn an_adopted_critic_rejection_stands_even_when_the_critic_is_withdrawn() {
+    let fixture = Fixture::new();
+    let claimed = critic_judged_agent_step(&fixture, verdict("error", "the total is wrong"));
+    withdraw_critic(&fixture, Withdrawal::HarnessWithAnEffect);
+    adopt_after_restart(&fixture);
+
+    let current = snapshot(&fixture, &claimed.job.instance_id);
+    assert_eq!(
+        incident_codes(&fixture, &claimed.job.job_id),
+        ["VERIFICATION_FAILED"]
+    );
+    assert!(current.user_tasks.is_empty());
+    assert!(!events(&fixture, &claimed.job.instance_id)
+        .iter()
+        .any(|event| event.kind == "verification_withdrawn"));
+}
+
+// ------------------------------------------------ review round 3: validator
+
+/// What follows the Service step, each tail being a fact the history validator
+/// re-proves the whole acceptance for.
+#[derive(Clone, Copy, Debug)]
+enum Tail {
+    Script,
+    TerminateEnd,
+    Manual,
+    Receive,
+    Link,
+}
+
+fn plain_node(id: &str, kind: ProcessNodeKind) -> tentaflow_protocol::processes::ProcessNode {
+    tentaflow_protocol::processes::ProcessNode {
+        id: id.into(),
+        name: id.into(),
+        kind,
+        repeat: None,
+        activity_io: None,
+    }
+}
+
+fn link_definition(
+    id: &str,
+    sources: &[&str],
+    target: Option<&str>,
+) -> tentaflow_protocol::processes::ProcessLinkEventDefinition {
+    tentaflow_protocol::processes::ProcessLinkEventDefinition {
+        id: id.into(),
+        name: "next".into(),
+        source_refs: sources.iter().map(|id| (*id).to_owned()).collect(),
+        target_ref: target.map(str::to_owned),
+    }
+}
+
+fn service_then(flow_id: &str, verification: ActivityVerification, tail: Tail) -> ProcessModel {
+    let mut model = service_model(flow_id, verification);
+    let (nodes, flows) = match tail {
+        Tail::TerminateEnd => {
+            model.nodes[2].kind = ProcessNodeKind::TerminateEnd;
+            return model;
+        }
+        Tail::Script => (
+            vec![plain_node(
+                "Tail",
+                ProcessNodeKind::ScriptTask {
+                    script: "null".into(),
+                    output_mapping: BTreeMap::new(),
+                },
+            )],
+            vec![
+                edge("ToTail", "Service", "Tail"),
+                edge("FromTail", "Tail", "End_1"),
+            ],
+        ),
+        Tail::Manual => (
+            vec![plain_node(
+                "Tail",
+                ProcessNodeKind::ManualTask {
+                    assignee_user_id: None,
+                    instructions: "Look at it.".into(),
+                },
+            )],
+            vec![
+                edge("ToTail", "Service", "Tail"),
+                edge("FromTail", "Tail", "End_1"),
+            ],
+        ),
+        Tail::Receive => {
+            model
+                .messages
+                .push(tentaflow_protocol::processes::ProcessMessageDeclaration {
+                    message_id: "Message_1".into(),
+                    name: "EvidenceReady".into(),
+                });
+            (
+                vec![plain_node(
+                    "Tail",
+                    ProcessNodeKind::ReceiveTask {
+                        message_ref: "Message_1".into(),
+                        correlation_expression: "'case-1'".into(),
+                        output_mapping: BTreeMap::new(),
+                    },
+                )],
+                vec![
+                    edge("ToTail", "Service", "Tail"),
+                    edge("FromTail", "Tail", "End_1"),
+                ],
+            )
+        }
+        Tail::Link => (
+            vec![
+                plain_node(
+                    "Throw",
+                    ProcessNodeKind::LinkThrow {
+                        definition: link_definition("Throw_Def", &[], Some("Catch_Def")),
+                    },
+                ),
+                plain_node(
+                    "Catch",
+                    ProcessNodeKind::LinkCatch {
+                        definition: link_definition("Catch_Def", &["Throw_Def"], None),
+                    },
+                ),
+            ],
+            vec![
+                edge("ToThrow", "Service", "Throw"),
+                edge("FromCatch", "Catch", "End_1"),
+            ],
+        ),
+    };
+    model.nodes.splice(2..2, nodes);
+    model.sequence_flows = vec![edge("ToService", "Start_1", "Service")];
+    model.sequence_flows.extend(flows);
+    model
+}
+
+fn machine_modes(rig: &Rigged) -> Vec<(ActivityVerification, Value)> {
+    let verifier = test_verifier(rig, "Completed", "fine");
+    vec![
+        (
+            test_mode(&verifier, VerificationOnFailure::Error),
+            json!({"mode": "test", "reference": verifier}),
+        ),
+        (
+            critic_mode(VerificationOnFailure::Error),
+            json!({"mode": "critic", "reference": CRITIC_ID}),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn an_approved_test_or_critic_is_accepted_whatever_follows_the_step() {
+    for tail in [
+        Tail::Script,
+        Tail::TerminateEnd,
+        Tail::Manual,
+        Tail::Receive,
+        Tail::Link,
+    ] {
+        for index in 0..2 {
+            let rig = rigged();
+            install(
+                &rig.fixture,
+                critic_roles(Script::Silent, Script::Report(verdict("completed", "fine"))),
+            );
+            let (mode, passed_data) = machine_modes(&rig).remove(index);
+            let model = service_then(&rig.work_flow, mode, tail);
+            let started = start_model(&rig.fixture, &model);
+            let claimed = claim_and_execute(&rig.fixture).await;
+
+            let case = format!("{tail:?} after {passed_data}");
+            let current = snapshot(&rig.fixture, &started.instance_id);
+            assert!(
+                current.incidents.is_empty(),
+                "{case}: {:?}",
+                current.incidents
+            );
+            assert_eq!(
+                current.jobs[0]
+                    .result
+                    .as_ref()
+                    .map(|result| &result.outcome),
+                Some(&ActivityOutcome::Completed),
+                "{case}"
+            );
+            assert_eq!(current.instance.variables["answer"], "work-done", "{case}");
+            let expected = match tail {
+                Tail::Manual | Tail::Receive => ProcessInstanceStatus::Waiting,
+                _ => ProcessInstanceStatus::Completed,
+            };
+            assert_eq!(current.instance.status, expected, "{case}");
+            let passed: Vec<_> = events(&rig.fixture, &started.instance_id)
+                .into_iter()
+                .filter(|event| event.kind == "verification_passed")
+                .collect();
+            assert_eq!(passed.len(), 1, "{case}");
+            assert_eq!(passed[0].data, passed_data, "{case}");
+            assert!(incident_codes(&rig.fixture, &claimed.job.job_id).is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_condition_followed_by_a_script_is_accepted_as_before() {
+    let rig = rigged();
+    let model = service_then(
+        &rig.work_flow,
+        ActivityVerification::Condition {
+            expression: "true".into(),
+        },
+        Tail::Script,
+    );
+    let started = start_model(&rig.fixture, &model);
+    claim_and_execute(&rig.fixture).await;
+
+    let current = snapshot(&rig.fixture, &started.instance_id);
+    assert_eq!(current.instance.status, ProcessInstanceStatus::Completed);
+    assert!(current.incidents.is_empty(), "{:?}", current.incidents);
+}
+
+#[tokio::test]
+async fn a_rejection_from_a_critic_withdrawn_while_it_judges_stands() {
+    let rig = rigged();
+    let db = rig.fixture.db.clone();
+    let withdraw: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        db.write()
+            .unwrap()
+            .execute("UPDATE agents SET is_enabled=0 WHERE id=?1", [CRITIC_ID])
+            .unwrap();
+    });
+    install(
+        &rig.fixture,
+        critic_roles(
+            Script::Silent,
+            Script::ReportAfter(verdict("error", "no source is cited"), withdraw),
+        ),
+    );
+    let model = service_model(&rig.work_flow, critic_mode(VerificationOnFailure::Error));
+    let started = start_model(&rig.fixture, &model);
+    let claimed = claim_and_execute(&rig.fixture).await;
+
+    // A rejection approves nothing, so it is the same at acceptance as here.
+    let current = snapshot(&rig.fixture, &started.instance_id);
+    let result = current.jobs[0].result.as_ref().unwrap();
+    assert_eq!(result.code.as_deref(), Some("VERIFICATION_FAILED"));
+    assert_eq!(result.summary, "no source is cited");
+    assert_eq!(
+        incident_codes(&rig.fixture, &claimed.job.job_id),
+        ["VERIFICATION_FAILED"]
+    );
+    assert!(current.user_tasks.is_empty());
+}
+
+#[tokio::test]
+async fn a_repeated_step_tells_the_person_why_a_withdrawn_approval_was_not_relied_on() {
+    use super::verification::VerificationVerdict::Approved;
+    let rig = rigged();
+    let verifier = test_verifier(&rig, "Completed", "fine");
+    let model = super::repetition_service_tests::repeated_service_model(
+        &rig.work_flow,
+        test_mode(&verifier, VerificationOnFailure::Error),
+    );
+    let started = start_model(&rig.fixture, &model);
+    let claimed = repository::claim_job(&rig.fixture.db, "agent-worker", now_ms())
+        .unwrap()
+        .unwrap();
+    assert!(repository::commit_job_dispatch_boundary(
+        &rig.fixture.db,
+        &claimed,
+        "agent-worker",
+        now_ms()
+    )
+    .unwrap());
+    repository::record_job_observation(
+        &rig.fixture.db,
+        &claimed,
+        "agent-worker",
+        &judged(&verifier, Approved),
+        now_ms(),
+    )
+    .unwrap();
+    rig.fixture
+        .db
+        .write()
+        .unwrap()
+        .execute("UPDATE flows SET status='draft' WHERE id=?1", [&verifier])
+        .unwrap();
+    let authority = super::runtime::tool_authority(rig.fixture.dispatcher());
+    repository::recover_jobs(&rig.fixture.db, None, now_ms(), &authority).unwrap();
+
+    let current = snapshot(&rig.fixture, &started.instance_id);
+    assert_eq!(current.instance.status, ProcessInstanceStatus::Waiting);
+    assert_eq!(current.user_tasks.len(), 1);
+    assert!(current.incidents.is_empty(), "{:?}", current.incidents);
+    let history = events(&rig.fixture, &started.instance_id);
+    let withdrawn: Vec<_> = history
+        .iter()
+        .filter(|event| event.kind == "verification_withdrawn")
+        .collect();
+    assert_eq!(withdrawn.len(), 1);
+    assert_eq!(
+        withdrawn[0].data,
+        json!({"mode": "test", "reference": verifier})
+    );
+    assert!(!history
+        .iter()
+        .any(|event| event.kind == "verification_passed"));
+}
+
+/// A Test step followed by a script, its work observed with an approval from
+/// `verifier`, ready to be accepted.
+fn observed_approval_before_a_script(
+    rig: &Rigged,
+) -> (
+    String,
+    ClaimedProcessJob,
+    repository::ObservedActivityResult,
+) {
+    use super::verification::VerificationVerdict::Approved;
+    let verifier = test_verifier(rig, "Completed", "fine");
+    let model = service_then(
+        &rig.work_flow,
+        test_mode(&verifier, VerificationOnFailure::Error),
+        Tail::Script,
+    );
+    start_model(&rig.fixture, &model);
+    let claimed = repository::claim_job(&rig.fixture.db, "agent-worker", now_ms())
+        .unwrap()
+        .unwrap();
+    assert!(repository::commit_job_dispatch_boundary(
+        &rig.fixture.db,
+        &claimed,
+        "agent-worker",
+        now_ms()
+    )
+    .unwrap());
+    let observed = judged(&verifier, Approved);
+    repository::record_job_observation(
+        &rig.fixture.db,
+        &claimed,
+        "agent-worker",
+        &observed,
+        now_ms(),
+    )
+    .unwrap();
+    (verifier, claimed, observed)
+}
+
+/// What the execution path would plan from the observation if nobody had
+/// withdrawn the verifier, offered to the acceptance as a supplied plan.
+fn accept_supplied(
+    rig: &Rigged,
+    claimed: &ClaimedProcessJob,
+    observed: &repository::ObservedActivityResult,
+    forge: impl FnOnce(&mut repository::RuntimePlan),
+) -> anyhow::Result<repository::ProcessTransitionOutcome> {
+    let current = snapshot(&rig.fixture, &claimed.job.instance_id);
+    let job = current
+        .jobs
+        .iter()
+        .find(|job| job.job_id == claimed.job.job_id)
+        .unwrap();
+    let mut plan =
+        super::runtime::plan_job_result(&current, job, observed, false, now_ms(), None).unwrap();
+    forge(&mut plan);
+    repository::accept_job_result(
+        &rig.fixture.db,
+        &claimed.actor,
+        &claimed.job.job_id,
+        claimed.job.attempt,
+        claimed.job.fence,
+        "agent-worker",
+        observed,
+        current.instance.revision,
+        repository::ProcessPlanInput::Supplied(&plan),
+        now_ms(),
+    )
+}
+
+#[test]
+fn a_supplied_plan_that_approves_is_accepted_only_for_the_verifier_the_observation_names() {
+    let rig = rigged();
+    let (verifier, claimed, observed) = observed_approval_before_a_script(&rig);
+    for forged in [
+        json!({"mode": "test", "reference": "another-flow"}),
+        json!({"mode": "critic", "reference": verifier}),
+        json!({"expression": "true"}),
+        json!({}),
+    ] {
+        let rejected = accept_supplied(&rig, &claimed, &observed, |plan| {
+            plan.events
+                .iter_mut()
+                .find(|event| event.kind == "verification_passed")
+                .unwrap()
+                .data = forged.clone();
+        })
+        .expect_err(&format!("{forged}"));
+        assert!(
+            repository::is_result_refusal(&rejected),
+            "{forged}: {rejected:#}"
+        );
+    }
+    let current = snapshot(&rig.fixture, &claimed.job.instance_id);
+    assert_eq!(current.instance.status, ProcessInstanceStatus::Running);
+
+    accept_supplied(&rig, &claimed, &observed, |_| {}).unwrap();
+    let current = snapshot(&rig.fixture, &claimed.job.instance_id);
+    assert_eq!(current.instance.status, ProcessInstanceStatus::Completed);
+}
+
+#[test]
+fn a_supplied_plan_cannot_approve_what_a_withdrawn_verifier_approved() {
+    let rig = rigged();
+    let (verifier, claimed, observed) = observed_approval_before_a_script(&rig);
+    rig.fixture
+        .db
+        .write()
+        .unwrap()
+        .execute("UPDATE flows SET status='draft' WHERE id=?1", [&verifier])
+        .unwrap();
+    let rejected = accept_supplied(&rig, &claimed, &observed, |_| {}).unwrap_err();
+    assert!(repository::is_result_refusal(&rejected), "{rejected:#}");
+    let current = snapshot(&rig.fixture, &claimed.job.instance_id);
+    assert_eq!(current.instance.status, ProcessInstanceStatus::Running);
+    assert_eq!(current.instance.variables.get("answer"), None);
+
+    // The recorded work is not stranded: the restart pass hands it to a person.
+    let authority = super::runtime::tool_authority(rig.fixture.dispatcher());
+    repository::recover_jobs(&rig.fixture.db, None, now_ms(), &authority).unwrap();
+    let current = snapshot(&rig.fixture, &claimed.job.instance_id);
+    assert_eq!(current.instance.status, ProcessInstanceStatus::Waiting);
+    assert_eq!(current.user_tasks.len(), 1);
+    assert!(current.incidents.is_empty(), "{:?}", current.incidents);
 }

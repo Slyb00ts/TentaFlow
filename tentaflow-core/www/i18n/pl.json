@@ -15983,6 +15983,7 @@
     "event_receive_task_opened": "{node}: oczekiwanie na odbiór wiadomości {message} ({key})",
     "event_receive_task_completed": "{node}: odebrano wiadomość {message}",
     "event_verification_passed": "{node}: weryfikacja zatwierdziła wynik",
+    "event_verification_withdrawn": "{node}: zatwierdzenie tego wyniku nie jest uwzględnione, decyduje człowiek",
     "event_user_task_completed": "{node}: człowiek zakończył pracę",
     "event_verification_approved": "{node}: wynik zatwierdzony",
     "event_verification_rejected": "{node}: wynik odrzucony",

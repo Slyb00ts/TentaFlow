@@ -13119,7 +13119,21 @@ fn validate_termination_action_provenance_on(
                                 })))
                     && plan.events.iter().filter(|candidate| candidate.kind == "service_result").count() == 1)
             }
-            "verification_passed" => (plan.termination_attempts.iter().any(|attempt| {
+            "verification_passed" | "verification_withdrawn" => {
+            let service_job_id = plan.termination_attempts.iter().find_map(|attempt| {
+                match match attempt {
+                    TerminationAttempt::Success(source) => &source.accepted_input,
+                    TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                } {
+                    AcceptedInputRef::Service { job_id, .. } => Some(job_id.as_str()),
+                    _ => None,
+                }
+            }).or_else(|| match entry {
+                EntryAuthority::Accepted(AcceptedInputRef::Service { job_id, .. })
+                    if plan.termination_attempts.is_empty() => Some(job_id.as_str()),
+                _ => None,
+            });
+            (plan.termination_attempts.iter().any(|attempt| {
                 let input = match attempt {
                     TerminationAttempt::Success(source) => &source.accepted_input,
                     TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
@@ -13130,14 +13144,29 @@ fn validate_termination_action_provenance_on(
                 && plan.events.iter().enumerate().any(|(index, prior)|
                     index < event_index && prior.kind == "service_result"
                         && prior.scope_id == event.scope_id && prior.node_id == event.node_id)
-                && plan.events.iter().filter(|candidate| candidate.kind == "verification_passed"
+                && plan.events.iter().filter(|candidate| candidate.kind == event.kind
                 && candidate.scope_id == event.scope_id && candidate.node_id == event.node_id).count() == 1
                 && node.is_some_and(|node_id| scope_node(model, &selected_process_id, scopes, instance_id,
-                    &event.scope_id, node_id).is_ok_and(|pinned| matches!(&pinned.kind,
-                        ProcessNodeKind::ServiceTask { verification:
+                    &event.scope_id, node_id).is_ok_and(|pinned| match &pinned.kind {
+                        ProcessNodeKind::ServiceTask { verification, .. } => match verification {
                             tentaflow_protocol::processes::ActivityVerification::Condition {
-                                expression }, .. }
-                            if event.data == serde_json::json!({"expression":expression})))),
+                                expression } => event.kind == "verification_passed"
+                                && event.data == serde_json::json!({"expression":expression}),
+                            // A machine verdict is re-proved against the observation the
+                            // job stored: the very verifier approved it and, for a
+                            // withdrawn event, its approval is no longer relied on.
+                            machine => machine.automatic().is_some_and(|(kind, reference, _)|
+                                event.data == serde_json::json!({
+                                    "mode":kind.as_str(),"reference":reference})
+                                && service_job_id.is_some_and(|job_id|
+                                    super::verification::recorded_approval_withdrawn(tx,
+                                        actor_id, instance_id, job_id, kind, reference)
+                                        .ok().flatten()
+                                        == Some(event.kind == "verification_withdrawn"))),
+                        },
+                        _ => false,
+                    }))
+            }
             "call_returned" | "call_error_propagated" => event.data["call_id"].as_str().is_some_and(|id|
                 count(event.kind.as_str(), "call_id", id) == 1
                 && calls_on(tx, instance_id).is_ok_and(|calls| calls.iter().any(|call|

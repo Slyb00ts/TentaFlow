@@ -433,13 +433,7 @@ pub(super) async fn run_verifier_agent(
         .flatten()
         .and_then(|version| version.flow_json)
         .ok_or_else(|| "the critic harness cannot be read".to_owned())?;
-    {
-        let conn = pool
-            .read()
-            .map_err(|_| "the critic harness cannot be read".to_owned())?;
-        super::agent_pin::critic_harness_refusal(&conn, &flow.flow_id, &harness_graph)
-            .map_err(|error| error.to_string())?;
-    }
+    super::agent_pin::critic_harness_refusal(&harness_graph).map_err(|error| error.to_string())?;
     let binding = ProcessActivityBinding {
         role: BindingRole::Verification,
         invocation_id: claimed.invocation_id.clone(),

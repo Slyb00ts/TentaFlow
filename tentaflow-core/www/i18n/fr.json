@@ -14845,6 +14845,7 @@
     "event_receive_task_opened": "{node} : en attente du message {message} ({key})",
     "event_receive_task_completed": "{node} : message {message} reçu",
     "event_verification_passed": "{node} : vérification réussie",
+    "event_verification_withdrawn": "{node} : l’approbation de ce résultat n’est plus retenue, une personne décide",
     "event_user_task_completed": "{node} : travail humain terminé",
     "event_verification_approved": "{node} : résultat approuvé",
     "event_verification_rejected": "{node} : résultat refusé",

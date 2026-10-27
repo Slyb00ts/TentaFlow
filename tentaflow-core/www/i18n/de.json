@@ -14845,6 +14845,7 @@
     "event_receive_task_opened": "{node}: wartet auf Nachricht {message} ({key})",
     "event_receive_task_completed": "{node}: Nachricht {message} empfangen",
     "event_verification_passed": "{node}: Prüfung bestanden",
+    "event_verification_withdrawn": "{node}: Die Freigabe dieses Ergebnisses gilt nicht mehr, eine Person entscheidet",
     "event_user_task_completed": "{node}: menschliche Arbeit abgeschlossen",
     "event_verification_approved": "{node}: Ergebnis bestätigt",
     "event_verification_rejected": "{node}: Ergebnis abgelehnt",

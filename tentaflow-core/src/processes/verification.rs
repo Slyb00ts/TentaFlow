@@ -449,10 +449,11 @@ pub(super) fn interrupted(
 
 /// Whether the verdict an observation relies on is one nobody may rely on any
 /// more: an approval whose verifier was withdrawn from the initiator between the
-/// verdict and its acceptance. The result stays as recorded (it cannot be
-/// rewritten) and the planner gives it to a person like any approval nobody
-/// proved. A rejection or an unavailable verification approves nothing, so they
-/// stand; a failed read is not a denial and is reported as the failure it is.
+/// verdict and its acceptance (a critic whose harness stopped being allowed
+/// counts as withdrawn). The result stays as recorded (it cannot be rewritten)
+/// and the planner gives it to a person like any approval nobody proved. A
+/// rejection or an unavailable verification approves nothing, so they stand; a
+/// failed read is not a denial and is reported as the failure it is.
 pub(super) fn approval_withdrawn(
     conn: &rusqlite::Connection,
     actor: &repository::ProcessActor,
@@ -471,10 +472,52 @@ pub(super) fn approval_withdrawn(
         }
     };
     match repository::require_source_current(conn, actor, &source_ref, None) {
-        Ok(()) => Ok(false),
-        Err(error) if repository::is_authority_denied(&error) => Ok(true),
-        Err(error) => Err(error),
+        Ok(()) => {}
+        Err(error) if repository::is_authority_denied(&error) => return Ok(true),
+        Err(error) => return Err(error),
     }
+    if record.kind != VerificationKind::Critic {
+        return Ok(false);
+    }
+    match super::agent_pin::runnable_critic(conn, &record.reference) {
+        Ok(_) => Ok(false),
+        Err(AgentPinError::Unavailable) => Err(AgentPinError::Unavailable.into()),
+        Err(_) => Ok(true),
+    }
+}
+
+/// How the job's stored observation stands for the machine verification a plan
+/// claims, for the history validator that re-proves a Service acceptance:
+/// `None` when the observation was not approved by exactly this verifier,
+/// otherwise whether that approval has been withdrawn.
+pub(super) fn recorded_approval_withdrawn(
+    tx: &rusqlite::Transaction<'_>,
+    actor_id: &str,
+    instance_id: &str,
+    job_id: &str,
+    kind: VerificationKind,
+    reference: &str,
+) -> Result<Option<bool>> {
+    let (org_id, observed): (String, Option<String>) = tx.query_row(
+        "SELECT i.org_id,v.observed_result_json FROM bpmn_jobs j \
+         JOIN bpmn_instances i ON i.instance_id=j.instance_id \
+         JOIN bpmn_service_invocations v ON v.job_id=j.job_id \
+         WHERE j.job_id=?1 AND j.instance_id=?2",
+        rusqlite::params![job_id, instance_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let Some(observed) = observed else {
+        return Ok(None);
+    };
+    let observed: ObservedActivityResult = serde_json::from_str(&observed)?;
+    if !observed.approved_by(kind, reference) {
+        return Ok(None);
+    }
+    let actor = repository::ProcessActor {
+        org_id,
+        user_id: actor_id.to_owned(),
+    };
+    approval_withdrawn(tx, &actor, &observed).map(Some)
 }
 
 /// What the verification stage needs, resolved from the model and the pins.
@@ -711,13 +754,13 @@ pub(super) async fn finish_verified(
     else {
         return Ok(());
     };
-    // A verifier withdrawn while it was judging gave a verdict nobody may rely on.
-    if observed.verification.as_ref().is_some_and(|record| {
-        matches!(
-            record.verdict,
-            VerificationVerdict::Approved | VerificationVerdict::Rejected
-        )
-    }) && matches!(stage.usable(job), Err(Refusal::Denied(_)))
+    // An approval from a verifier withdrawn while it was judging is not relied
+    // on. A rejection approves nothing, so it stands, as it does at acceptance.
+    if observed
+        .verification
+        .as_ref()
+        .is_some_and(|record| record.verdict == VerificationVerdict::Approved)
+        && matches!(stage.usable(job), Err(Refusal::Denied(_)))
     {
         observed = stage.verdict(
             &work,

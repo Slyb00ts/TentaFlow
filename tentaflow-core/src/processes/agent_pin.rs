@@ -135,7 +135,9 @@ pub fn pin_agent(
 /// acts regardless of the tools the run was given. So the list is of what is
 /// known to be harmless, not of what is known to be harmful: the blocks of the
 /// registry's own harness and the pure transforms of text. An addon block
-/// (`addon.*`) is never on it.
+/// (`addon.*`) is never on it, and neither are `loop`, `map` and `subflow`: the
+/// engine pins no body flow and re-reads it on every iteration, so no check of a
+/// body could hold for the run.
 const HARNESS_BLOCKS: &[&str] = &[
     "trigger",
     "output",
@@ -152,93 +154,24 @@ const HARNESS_BLOCKS: &[&str] = &[
     "tts_clean",
 ];
 
-/// How many flows deep a harness may nest through `loop`, `map` and `subflow`
-/// bodies before the check gives up: past the limit the body is not looked at,
-/// so it is not allowed.
-const MAX_HARNESS_DEPTH: usize = 4;
-
-/// The config key naming the body flow of a block that runs another flow.
-fn body_flow_key(node_type: &str) -> Option<&'static str> {
-    match node_type {
-        "loop" | "map" => Some("body_flow_id"),
-        "subflow" => Some("flow_id"),
-        _ => None,
-    }
-}
-
 /// Why a harness graph cannot run a critic: it holds a block that is not known
-/// to be harmless, here or in the body of a `loop`, `map` or `subflow` it runs.
-/// `flow_id` is the flow the graph belongs to. A body is read as the flow row the
-/// engine runs it from (the engine pins no body), so the answer holds for the
-/// moment it is given.
-pub fn critic_harness_refusal(
-    conn: &Connection,
-    flow_id: &str,
-    graph_json: &str,
-) -> Result<(), AgentPinError> {
-    check_harness_graph(conn, graph_json, &mut vec![flow_id.to_owned()])
-}
-
-fn check_harness_graph(
-    conn: &Connection,
-    graph_json: &str,
-    path: &mut Vec<String>,
-) -> Result<(), AgentPinError> {
+/// to be harmless.
+pub fn critic_harness_refusal(graph_json: &str) -> Result<(), AgentPinError> {
     let definition: crate::flow_engine::types::FlowDefinition = serde_json::from_str(graph_json)
         .map_err(|_| {
             AgentPinError::Refused("the harness flow of the critic cannot be read".into())
         })?;
-    for node in &definition.nodes {
-        let node_type = node.node_type.as_str();
-        let Some(key) = body_flow_key(node_type) else {
-            if HARNESS_BLOCKS.contains(&node_type) {
-                continue;
-            }
-            return Err(AgentPinError::Refused(format!(
-                "the harness flow of the critic has a block that may have an effect ({node_type})"
-            )));
-        };
-        let body_id = node
-            .config
-            .get(key)
-            .and_then(|value| value.as_str())
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| {
-                AgentPinError::Refused(format!(
-                    "the harness flow of the critic has a {node_type} block with no body flow it can check"
-                ))
-            })?;
-        if path.iter().any(|visited| visited == body_id) {
-            return Err(AgentPinError::Refused(format!(
-                "the harness flow of the critic runs the flow {body_id} from inside itself"
-            )));
-        }
-        if path.len() >= MAX_HARNESS_DEPTH {
-            return Err(AgentPinError::Refused(format!(
-                "the harness flow of the critic nests flows deeper than {MAX_HARNESS_DEPTH}"
-            )));
-        }
-        let body: Option<String> = conn
-            .query_row(
-                "SELECT flow_json FROM flows WHERE id=?1",
-                [body_id],
-                |row| row.get(0),
-            )
-            .map(Some)
-            .or_else(|error| match error {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                _ => Err(AgentPinError::Unavailable),
-            })?;
-        let body = body.ok_or_else(|| {
-            AgentPinError::Refused(format!(
-                "the harness flow of the critic runs the flow {body_id}, which does not exist"
-            ))
-        })?;
-        path.push(body_id.to_owned());
-        check_harness_graph(conn, &body, path)?;
-        path.pop();
+    match definition
+        .nodes
+        .iter()
+        .find(|node| !HARNESS_BLOCKS.contains(&node.node_type.as_str()))
+    {
+        Some(node) => Err(AgentPinError::Refused(format!(
+            "the harness flow of the critic has a block that may have an effect ({})",
+            node.node_type
+        ))),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// The harness flow an agent runs, the way a run resolves it.
@@ -270,7 +203,7 @@ pub fn runnable_critic(conn: &Connection, agent_id: &str) -> Result<DbAgent, Age
     let flow_json = flow_json.ok_or_else(|| {
         AgentPinError::Refused("the harness flow of the critic does not exist".into())
     })?;
-    critic_harness_refusal(conn, &flow_id, &flow_json)?;
+    critic_harness_refusal(&flow_json)?;
     Ok(agent)
 }
 
