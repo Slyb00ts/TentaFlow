@@ -932,6 +932,10 @@ fn publication_refuses_an_agent_that_cannot_run_a_process_step() {
     };
 
     assert!(refused(agent_implementation("missing-agent", &[], None)).contains("does not exist"));
+    let disabled_id = "99999999-2222-4333-8444-555555555555";
+    seed_agent(&fixture, disabled_id, "[]", 4, false);
+    let message = refused(agent_implementation(disabled_id, &[], None));
+    assert!(message.contains("is disabled"), "{message}");
     assert!(
         refused(agent_implementation(AGENT_ID, &["core.fs_read"], None))
             .contains("which the agent itself does not have")
@@ -1109,7 +1113,11 @@ fn model_validation_bounds_an_agent_step() {
     };
     *timeout_seconds = 3600;
     super::model::validate_model(&long).unwrap();
-    assert!(invalid(agent(&[], 5, "\"goal\"", None), 3601, None).contains("1..=3600"));
+    let out_of_range = invalid(agent(&[], 5, "\"goal\"", None), 3601, None);
+    assert!(
+        out_of_range.contains("service task Service timeout is outside 1..=3600"),
+        "{out_of_range}"
+    );
     assert!(invalid(agent(&[], 0, "\"goal\"", None), 60, None).contains("iterations"));
     assert!(invalid(agent(&[], 101, "\"goal\"", None), 60, None).contains("iterations"));
     assert!(invalid(agent(&[], 5, "", None), 60, None).contains("goal expression"));

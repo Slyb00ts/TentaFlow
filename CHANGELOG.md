@@ -211,6 +211,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   trakcie porażki zadania jest ponawiany, a nie zamieniany w incydent
   niepewności. Listy stanów końcowych w czyszczeniu retencji, `wait_any` i
   odczycie generacji wynikają z `AGENT_RUN_TERMINAL_STATES`.
+- Szósta runda poprawek po przeglądzie kroku agenta (B3.4b), z żywego krytyka GUI.
+  Zapis i Wstecz nie gubią już odrzuconego pola inspektora (limit iteracji, schemat
+  wyniku): zapis odmawia z nazwą węzła, a wyjście z edytora pyta jak przy
+  niezapisanych zmianach. Publikacja odrzucona przez edytor nie zmienia napisu stanu
+  zapisu na „Błąd zapisu” i nie towarzyszy jej „Zapisano”; problemy są w banerze po
+  jednym w linii, a dwa kroki o tej samej nazwie mają numer. Limit iteracji pokazuje
+  maksimum agenta i mówi, że wartość ucięto; limit czasu ma walidację w polu
+  (1–600 s, agent do 3600 s) i zapis odmawia z nazwą węzła, także gdy odmawia
+  serwer (komunikat modelu niesie id kroku). Agent wyłączony lub usunięty ma
+  ostrzeżenie w inspektorze i znaczek na płótnie, a odmowa publikacji nazywa krok i
+  agenta. Paleta i lista agentów są posortowane po nazwie. Znane ograniczenie:
+  kolejność właściwości schematu wyniku jest po zapisie alfabetyczna (opis w planie).
 - Paleta projektanta BPMN ma grupę „Bloki TentaFlow” (B3.3a): przepływy, bloki
   Flow Buildera (`llm`, `embeddings`, `pii_filter`) i narzędzia addonów
   upuszcza się na płótno jako gotowe zadania usługi, z nazwą pozycji i bez pytania

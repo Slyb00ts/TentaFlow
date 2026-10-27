@@ -231,7 +231,7 @@ export class FlowPalette {
       if (rows.length === 0 && this.filter) return '';
       return `<div class="fb-palette-subgroup" data-subgroup="${subgroup}" role="heading" aria-level="3">${escapeHtml(I18n.t(`bpmn.palette_${subgroup}`))}</div>
         ${rows.length === 0
-    ? `<div class="fb-palette-note">${escapeHtml(I18n.t('bpmn.palette_group_empty'))}</div>`
+    ? `<div class="fb-palette-note">${escapeHtml(I18n.t(subgroup === 'agents' ? 'bpmn.palette_agents_empty' : 'bpmn.palette_group_empty'))}</div>`
     : rows.map((it) => this._renderItem(it.tpl, it.index)).join('')}`;
     }).join('');
   }

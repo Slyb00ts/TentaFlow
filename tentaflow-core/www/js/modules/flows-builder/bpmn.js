@@ -163,7 +163,7 @@ function tentaflowTemplates(options) {
   // palette and on the task dropped from it.
   const flows = options.serviceFlows || [];
   const flowNames = processDistinctLabels(flows.map((flow) => [flow.flowId, boundedNodeName(flow.name)]));
-  const agents = options.serviceAgents || [];
+  const agents = processSortedAgents(options.serviceAgents);
   const agentNames = processDistinctLabels(agents.map((agent) => [agent.agentId, boundedNodeName(agent.name)]));
   return [
     ...flows.map((flow) =>
@@ -183,10 +183,29 @@ function tentaflowTemplates(options) {
   ];
 }
 
+/** The agents offered as steps, by the name an author reads; the server's order follows its own sort key, not the shown name. */
+export function processSortedAgents(agents) {
+  return [...(agents || [])].sort((a, b) => String(a.name).localeCompare(String(b.name), I18n.getLanguage())
+    || String(a.agentId).localeCompare(String(b.agentId)));
+}
+
 // Longest an agent step may work: its time limit starts at ten minutes, the
 // model allows an hour.
 export const AGENT_STEP_MAX_SECONDS = 3600;
 const AGENT_STEP_DEFAULT_SECONDS = 600;
+const SERVICE_STEP_MAX_SECONDS = 600;
+
+/** The longest time limit a Service task of this configuration may have: an agent may work for an hour, every other implementation for ten minutes. */
+export function processTimeoutCeiling(config) {
+  return config?.implementation?.Agent ? AGENT_STEP_MAX_SECONDS : SERVICE_STEP_MAX_SECONDS;
+}
+
+/** The ceiling a Service task's time limit breaks, or null when the limit is a whole number of seconds the model accepts. */
+export function processTimeoutProblem(config) {
+  const ceiling = processTimeoutCeiling(config);
+  const seconds = config?.timeoutSeconds;
+  return Number.isInteger(seconds) && seconds >= 1 && seconds <= ceiling ? null : ceiling;
+}
 const AGENT_STEP_DEFAULT_ITERATIONS = 10;
 // The model accepts 1..=100 iterations whatever the agent allows.
 const AGENT_STEP_MAX_ITERATIONS = 100;
@@ -656,6 +675,14 @@ export function processExplainError(message, model) {
     const named = processUnusedDeclarations(model).filter((declaration) => declaration.kind === unused[1]);
     return named.length ? named.map(({ kind, name }) => I18n.t(`bpmn.unused_${kind}`, { name })).join(' ')
       : I18n.t(`bpmn.unused_${unused[1]}_any`);
+  }
+  const timeout = /service task ([\w.-]+) timeout is outside 1\.\.=(\d+) seconds/.exec(text);
+  if (timeout && names.has(timeout[1])) return I18n.t('bpmn.timeout_out_of_range', { node: names.get(timeout[1]), max: Number(timeout[2]) });
+  const agentGone = /service task ([\w.-]+): the agent (?:"(.*?)" is disabled|\S+ does not exist)/s.exec(text);
+  if (agentGone && names.has(agentGone[1])) {
+    return agentGone[2] === undefined
+      ? I18n.t('bpmn.publish_agent_missing', { node: names.get(agentGone[1]) })
+      : I18n.t('bpmn.publish_agent_disabled', { node: names.get(agentGone[1]), agent: agentGone[2] });
   }
   const unsimulated = /repetition is unsupported in simulation \(([\w.-]+)\)/.exec(text);
   if (unsimulated && names.has(unsimulated[1])) return I18n.t('bpmn.simulation_repeat_unsupported', { names: names.get(unsimulated[1]) });

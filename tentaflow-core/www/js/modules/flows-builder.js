@@ -360,7 +360,7 @@ const FlowBuilderScreen = {
     statusEl.addEventListener('change', () => this._markDirty());
 
     root.querySelector('[data-role="back"]').addEventListener('click', async () => {
-      if (state.dirty) {
+      if (this._hasUnsavedWork(state)) {
         const ok = await TfWindow.confirm({
           title: I18n.t('flows_builder.unsaved_title'),
           message: I18n.t('flows_builder.unsaved_message'),
@@ -647,7 +647,7 @@ const FlowBuilderScreen = {
 
   async canUnmount() {
     const state = this._state;
-    if (!state?.dirty) return true;
+    if (!state || !this._hasUnsavedWork(state)) return true;
     if (state.saving || state.operationBusy) return false;
     const save = await TfWindow.confirm({ title: I18n.t('flows_builder.unsaved_title'), message: I18n.t('flows_builder.unsaved_message'),
       confirmLabel: I18n.t('flows_builder.unsaved_confirm'), cancelLabel: I18n.t('flows_builder.unsaved_cancel') });
@@ -655,6 +655,19 @@ const FlowBuilderScreen = {
   },
 
   _current(state) { return this._state === state && state.root.isConnected; },
+
+  // A value the inspector refused is not model state, so it never marks the
+  // flow dirty; leaving the editor would still lose it, so it counts as unsaved.
+  _hasUnsavedWork(state) {
+    return state.dirty || (state.mode === 'bpmn' && state.config.processDraftProblems().length > 0);
+  },
+
+  // What the author typed and the inspector refused cannot be saved, and saving
+  // around it would drop it unseen: the save says so and names the node.
+  _draftSaveProblem(state) {
+    const drafts = state.config.processDraftProblems();
+    return drafts.length ? [I18n.t('bpmn.save_drafts_refused'), ...drafts].join('\n') : null;
+  },
 
   _syncProcessControls() {
     const state = this._state;
@@ -773,12 +786,18 @@ const FlowBuilderScreen = {
   async _publish({ refreshCalendar = false } = {}) {
     const state = this._state;
     if (!state || state.readOnly || state.saving) return;
+    this._clearSaveProblem(state);
+    const drafts = this._draftSaveProblem(state);
+    if (drafts) {
+      this._reportPublishProblem(state, drafts);
+      return;
+    }
     if (state.dirty && !await this._save()) return;
     if (!this._current(state) || state.dirty) return;
     // What the server would refuse is told here, by name, before it is asked.
-    const problems = [...state.config.processDraftProblems(), ...processPublishProblems(state.canvas.getData())];
+    const problems = processPublishProblems(state.canvas.getData());
     if (problems.length) {
-      this._reportSaveProblem(state, problems.join(' '), false);
+      this._reportPublishProblem(state, problems.join('\n'));
       return;
     }
     await this._processOperation(async (current) => {
@@ -1196,6 +1215,11 @@ const FlowBuilderScreen = {
     // Walidacja klient-side przed wyslaniem do backendu — porty, wiszace
     // krawedzie, cykle. Backend ma swoj validate_flow_json_str, wiec to jest
     // ochrona przed zbednym round-tripem i czytelnym komunikatem inline.
+    const drafts = s.mode === 'bpmn' ? this._draftSaveProblem(s) : null;
+    if (drafts) {
+      this._reportSaveProblem(s, drafts, silent);
+      return false;
+    }
     const errors = s.canvas.validate ? s.canvas.validate() : [];
     if (errors.length > 0) {
       this._reportSaveProblem(s, errors.length > 1
@@ -1299,6 +1323,19 @@ const FlowBuilderScreen = {
       state.saveProblem = true;
     }
     if (!silent) toast(text, 'error');
+  },
+
+  // A publication the author asked for and the editor refuses before asking the
+  // server is not a failed save: the draft stays as saved, so the status keeps
+  // saying so and only the banner and a toast name the cause.
+  _reportPublishProblem(state, text) {
+    const alert = state.root.querySelector('[data-role="error"]');
+    if (alert) {
+      alert.hidden = false;
+      alert.setAttribute('message', text);
+      state.saveProblem = true;
+    }
+    toast(text.replaceAll('\n', ' '), 'error');
   },
 
   _clearSaveProblem(state) {

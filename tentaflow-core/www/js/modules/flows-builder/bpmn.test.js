@@ -2927,7 +2927,7 @@ test('an agent step keeps unsaved input visible and bounds the iteration limit',
   const stepAgent = () => agent.config.implementation.Agent;
 
   change(control('agentIterations'), '');
-  assert.equal(control('agentIterations').getAttribute('error'), I18n.t('bpmn.agent_iterations_invalid'), 'an empty limit is refused');
+  assert.equal(control('agentIterations').getAttribute('error'), I18n.t('bpmn.agent_iterations_invalid', { max: 8 }), 'an empty limit is refused');
   assert.equal(stepAgent().maxIterations, 5, 'and not read as zero');
   change(control('agentIterations'), '2.5');
   assert.equal(stepAgent().maxIterations, 5);
@@ -2995,9 +2995,9 @@ test('an agent step keeps a refused draft across a node switch and publishing na
   await flush(2);
   assert.equal(control('agentSchema').getAttribute('value'), '{broken', 'the text survives leaving the node');
   assert.equal(control('agentSchema').getAttribute('error'), I18n.t('bpmn.agent_output_schema_invalid'));
-  assert.equal(control('agentIterations').getAttribute('error'), I18n.t('bpmn.agent_iterations_invalid'));
+  assert.equal(control('agentIterations').getAttribute('error'), I18n.t('bpmn.agent_iterations_invalid', { max: 8 }));
   assert.equal(config.processDraftProblems().length, 2, 'publishing is told about both');
-  assert.ok(config.processDraftProblems().every((line) => line.includes(I18n.t('bpmn.agent_iterations_invalid')) || line.includes(I18n.t('bpmn.agent_output_schema_invalid'))));
+  assert.ok(config.processDraftProblems().every((line) => line.includes(I18n.t('bpmn.agent_iterations_invalid', { max: 8 })) || line.includes(I18n.t('bpmn.agent_output_schema_invalid'))));
 
   change(control('agentSchema'), '{"type":"string"}');
   change(control('agentIterations'), '4');
@@ -3020,7 +3020,7 @@ test('a refused draft left inside a sub-process still blocks publishing from the
   config.show(null, null);
   const problems = config.processDraftProblems();
   assert.equal(problems.length, 1, 'the refused value in the nested body is still reported');
-  assert.ok(problems[0].includes('Nested summariser') && problems[0].includes(I18n.t('bpmn.agent_iterations_invalid')));
+  assert.ok(problems[0].includes('Nested summariser') && problems[0].includes(I18n.t('bpmn.agent_iterations_invalid', { max: 8 })));
   graph.navigateProcessBody([sub.id]);
   config.show(graph.nodes.find((node) => node.id === agent.id), graph.templates.get(agent.type));
   await flush(2);
@@ -3089,6 +3089,227 @@ test('loading another model drops every refused draft, even for a node id the ne
   assert.equal(config.node, null, 'the inspector no longer holds the replaced node');
   assert.equal(config.root.querySelector('[data-process="agentSchema"]'), null, 'the refused text and its error are gone from the panel');
   assert.ok(config.root.querySelector('.fb-config-empty'));
+  graph.destroy(); config.destroy();
+});
+
+function agentStepModel(overrides = {}, steps = [['Agent_1', 'Review case']]) {
+  const model = emptyProcessModel();
+  let previous = 'Start';
+  model.sequenceFlows = [];
+  model.diagram.edges = [];
+  steps.forEach(([id, name], index) => {
+    model.nodes.splice(1 + index, 0, { id, name, kind: { ServiceTask: { flowId: '', inputMapping: {}, outputMapping: {}, verification: 'Human',
+      timeoutSeconds: 600, resultExpression: null, implementation: { Agent: { agentId: 'agent-1', goalExpression: '"Summarise"', allowedTools: [],
+        maxIterations: 5, outputSchema: { type: 'object' }, ...overrides } } } } });
+    model.diagram.shapes.splice(1 + index, 0, { elementId: id, x: 200 + index * 260, y: 160, width: 240, height: 96 });
+    model.sequenceFlows.push({ id: `F_${id}`, sourceId: previous, targetId: id, condition: null });
+    previous = id;
+  });
+  model.sequenceFlows.push({ id: 'F_end', sourceId: previous, targetId: 'End', condition: null });
+  model.diagram.edges = model.sequenceFlows.map((flow) => ({ sequenceFlowId: flow.id, waypoints: [{ x: 100, y: 188 }, { x: 300, y: 188 }] }));
+  return model;
+}
+const saveFixtures = (id, saved = []) => ({
+  processOptionsRequest: { ...options, serviceBlocks, serviceAgents },
+  processDefinitionSaveRequest: (payload) => { saved.push(payload.model); return { definition: definition(id, { model: payload.model, draftRevision: 5 }) }; },
+});
+
+test('Save refuses while an inspector field holds a refused value, naming the node, and nothing is dropped', async () => {
+  const saved = [];
+  const state = await mount(definition('draft-save', { model: agentStepModel() }), saveFixtures('draft-save', saved));
+  state.canvas.selectNode('Agent_1'); await flush(2);
+  const schema = () => state.root.querySelector('[data-process="agentSchema"]');
+  change(schema(), '{"properties": nope}');
+  state.canvas.updateNodeLabel('Agent_1', 'Review case v2');
+  const toasts = watchToasts();
+  assert.equal(await builder._save(), false, 'the refused text is not silently left out of a save');
+  assert.equal(saved.length, 0, 'no request carries a model without it');
+  const banner = state.root.querySelector('[data-role="error"]').getAttribute('message');
+  assert.ok(banner.includes('Review case v2') && banner.includes(I18n.t('bpmn.agent_output_schema_invalid')), banner);
+  assert.ok(banner.startsWith(I18n.t('bpmn.save_drafts_refused')));
+  assert.equal(state.root.querySelector('[data-role="autosave-text"]').textContent, I18n.t('flows_builder.autosave_error'));
+  assert.ok(!toasts.texts().includes(I18n.t('bpmn.saved')), 'and it never says "saved"');
+  toasts.stop();
+  assert.equal(await builder._save({ silent: true }), false, 'an autosave refuses the same way');
+
+  change(schema(), '{"type":"object","properties":{"b":{},"a":{}}}');
+  assert.equal(await builder._save(), true);
+  assert.deepEqual(saved.at(-1).nodes.find((node) => node.id === 'Agent_1').kind.ServiceTask.implementation.Agent.outputSchema,
+    { type: 'object', properties: { b: {}, a: {} } });
+});
+
+test('leaving the editor counts a refused field as unsaved even when nothing else changed', async () => {
+  const saved = [];
+  const state = await mount(definition('draft-leave', { model: agentStepModel() }), saveFixtures('draft-leave', saved));
+  assert.equal(state.dirty, false);
+  assert.equal(await builder.canUnmount(), true, 'a clean editor leaves without a question');
+  state.canvas.selectNode('Agent_1'); await flush(2);
+  change(state.root.querySelector('[data-process="agentSchema"]'), '{"properties": nope}');
+  assert.equal(state.dirty, false, 'the refused text is not model state');
+  const asked = [];
+  const original = TfWindow.confirm;
+  try {
+    TfWindow.confirm = async (options) => { asked.push(options.title); return false; };
+    assert.equal(await builder.canUnmount(), true, 'discarding is the author\'s choice');
+    assert.deepEqual(asked, [I18n.t('flows_builder.unsaved_title')], 'but the author is asked first');
+    TfWindow.confirm = async () => true;
+    assert.equal(await builder.canUnmount(), false, 'saving what cannot be saved keeps the author here');
+    navigation.length = 0;
+    click(state.root.querySelector('[data-role="back"]'));
+    await flush(4);
+    assert.deepEqual(navigation, [], 'Back with such a field does not leave');
+    TfWindow.confirm = async () => false;
+    click(state.root.querySelector('[data-role="back"]'));
+    await flush(4);
+    assert.deepEqual(navigation.map((entry) => entry.view), ['flows'], 'discarding on purpose leaves');
+  } finally { TfWindow.confirm = original; }
+  assert.equal(saved.length, 0);
+});
+
+test('a publication the editor refuses is not reported as a failed save', async () => {
+  const state = await mount(definition('draft-publish', { model: agentStepModel() }), saveFixtures('draft-publish'));
+  state.canvas.selectNode('Agent_1'); await flush(2);
+  change(state.root.querySelector('[data-process="agentIterations"]'), '');
+  state.canvas.updateNodeLabel('Agent_1', 'Review case v2');
+  const toasts = watchToasts();
+  await builder._publish();
+  const texts = toasts.texts(); toasts.stop();
+  assert.ok(!texts.includes(I18n.t('bpmn.saved')), 'no "saved" toast beside a refusal');
+  assert.equal(calls.filter((call) => call.kind === 'processDefinitionPublishRequest').length, 0);
+  assert.notEqual(state.root.querySelector('[data-role="autosave-text"]').textContent, I18n.t('flows_builder.autosave_error'), 'the draft was not a failed save');
+  const banner = state.root.querySelector('[data-role="error"]');
+  assert.equal(banner.hidden, false);
+  assert.ok(banner.getAttribute('message').includes('Review case v2'));
+  assert.equal(texts.length > 0, true);
+});
+
+test('publication problems are listed one per line and name duplicate steps apart', async () => {
+  const model = agentStepModel({}, [['Agent_1', 'Review'], ['Agent_2', 'Review']]);
+  const state = await mount(definition('draft-dupes', { model }), saveFixtures('draft-dupes'));
+  for (const id of ['Agent_1', 'Agent_2']) {
+    state.canvas.selectNode(id); await flush(2);
+    change(state.root.querySelector('[data-process="agentIterations"]'), '');
+  }
+  await builder._publish();
+  const lines = state.root.querySelector('[data-role="error"]').getAttribute('message').split('\n');
+  assert.equal(lines.length, 3, 'a heading and one line per refused field');
+  assert.ok(lines[1].startsWith('Review (1):') && lines[2].startsWith('Review (2):'), lines.join(' | '));
+});
+
+test('publication problems the editor finds itself are listed one per line and leave the save status alone', async () => {
+  const model = agentStepModel();
+  model.errors = [{ errorId: 'Err_pay', name: 'Payment failed', errorCode: 'PAY' }, { errorId: 'Err_late', name: 'Paid late', errorCode: 'LATE' }];
+  const state = await mount(definition('draft-unused', { model }), saveFixtures('draft-unused'));
+  await builder._publish();
+  assert.equal(calls.filter((call) => call.kind === 'processDefinitionPublishRequest').length, 0);
+  assert.equal(state.root.querySelector('[data-role="error"]').getAttribute('message'),
+    [I18n.t('bpmn.unused_error', { name: 'Payment failed' }), I18n.t('bpmn.unused_error', { name: 'Paid late' })].join('\n'));
+  assert.equal(state.root.querySelector('[data-role="autosave-text"]').textContent, I18n.t('flows_builder.autosave_saved'));
+});
+
+test('an iteration limit shows the agent maximum and says when a typed value was reduced', async () => {
+  const graph = canvas(agentStepModel({ agentId: 'agent-2', maxIterations: 2 }));
+  const config = inspector(graph);
+  const node = graph.nodes.find((candidate) => candidate.id === 'Agent_1');
+  config.show(node, graph.templates.get(node.type)); await flush(2);
+  const hint = () => config.root.querySelector('[data-agent-iterations-hint]').textContent;
+  const field = () => config.root.querySelector('[data-process="agentIterations"]');
+  assert.equal(hint(), I18n.t('bpmn.agent_iterations_hint', { max: 3 }));
+  change(field(), '999');
+  assert.equal(field().value, '3');
+  assert.equal(hint(), I18n.t('bpmn.agent_iterations_clamped', { max: 3, entered: 999 }));
+  assert.ok(hint().includes('3') && !hint().includes('limit shown'));
+  change(field(), '');
+  assert.equal(field().getAttribute('error'), I18n.t('bpmn.agent_iterations_invalid', { max: 3 }));
+  assert.ok(field().getAttribute('error').includes('1 to 3'), 'the error states the number itself');
+  graph.destroy(); config.destroy();
+});
+
+test('a step time limit outside its range is marked on the field and refuses Save naming the step', async () => {
+  const saved = [];
+  const state = await mount(definition('draft-time', { model: agentStepModel() }), saveFixtures('draft-time', saved));
+  state.canvas.selectNode('Agent_1'); await flush(2);
+  const timeout = () => state.root.querySelector('[data-process="timeoutSeconds"]');
+  change(timeout(), '3601');
+  assert.equal(timeout().getAttribute('error'), I18n.t('bpmn.timeout_invalid', { max: 3600 }));
+  assert.equal(await builder._save(), false);
+  assert.equal(saved.length, 0);
+  assert.equal(state.root.querySelector('[data-role="error"]').getAttribute('message'), I18n.t('bpmn.timeout_out_of_range', { node: 'Review case', max: 3600 }));
+  change(timeout(), '0');
+  assert.ok(timeout().getAttribute('error'));
+  change(timeout(), '');
+  assert.ok(timeout().getAttribute('error'));
+  change(timeout(), '3600');
+  assert.equal(timeout().getAttribute('error'), null);
+  assert.equal(await builder._save(), true);
+
+  const flow = canvas(agentStepModel());
+  flow.updateNodeConfig('Agent_1', { implementation: 'Flow', timeoutSeconds: 601 });
+  assert.deepEqual(flow.validate(), [I18n.t('bpmn.timeout_out_of_range', { node: 'Review case', max: 600 })], 'a step that is not an agent stops at ten minutes');
+  flow.destroy();
+  // The server's own refusal of the same limit is told in the author's words.
+  const named = processExplainError('protocol error bad_request: service task Agent_1 timeout is outside 1..=3600 seconds', agentStepModel());
+  assert.equal(named, I18n.t('bpmn.timeout_out_of_range', { node: 'Review case', max: 3600 }));
+});
+
+test('a disabled agent is flagged on the inspector and the canvas and its publication refusal names step and agent', async () => {
+  const state = await mount(definition('draft-gone', { model: agentStepModel({ agentId: 'agent-gone' }) }), saveFixtures('draft-gone'));
+  state.canvas.selectNode('Agent_1'); await flush(2);
+  const warning = state.root.querySelector('[data-agent-warning]');
+  assert.equal(warning.getAttribute('tone'), 'warning');
+  assert.equal(warning.getAttribute('message'), I18n.t('bpmn.agent_unavailable_warning'));
+  const badge = state.root.querySelector('[data-node-id="Agent_1"] .fb-process-warn');
+  assert.ok(badge?.dataset.warning.includes('agent_unavailable'), 'the canvas marks the step too');
+  assert.equal(badge.getAttribute('title'), I18n.t('bpmn.agent_unavailable_warning'));
+  change(state.root.querySelector('[data-process="agentId"]'), 'agent-1');
+  await flush(2);
+  assert.equal(state.root.querySelector('[data-agent-warning]'), null, 'choosing an available agent clears it');
+  assert.ok(!(state.root.querySelector('[data-node-id="Agent_1"] .fb-process-warn')?.dataset.warning || '').includes('agent_unavailable'));
+
+  const model = agentStepModel();
+  assert.equal(processExplainError('service task Agent_1: the agent "Night shift" is disabled', model),
+    I18n.t('bpmn.publish_agent_disabled', { node: 'Review case', agent: 'Night shift' }));
+  assert.equal(processExplainError('service task Agent_1: the agent 1111-2222 does not exist', model),
+    I18n.t('bpmn.publish_agent_missing', { node: 'Review case' }));
+});
+
+test('the palette lists agents by name and says how to get one when there is none', async () => {
+  const build = async (agents) => {
+    const root = document.createElement('aside'); document.body.append(root);
+    const view = new FlowPalette(root, { mode: 'bpmn', processOptions: { ...options, serviceFlows: [], serviceBlocks: [], serviceAgents: agents, serviceTools: [] } });
+    await view.init();
+    return { root, view };
+  };
+  const filled = await build([{ agentId: 'z', name: 'Zeta', maxIterations: 3 }, { agentId: 'a', name: 'Alpha', maxIterations: 3 }]);
+  const order = [...filled.root.querySelectorAll('[data-cat="tentaflow"] .fb-node-name')].map((row) => row.textContent);
+  assert.deepEqual(order, ['Alpha', 'Zeta']);
+  const empty = await build([]);
+  const notes = [...empty.root.querySelectorAll('[data-cat="tentaflow"] .fb-palette-note')].map((note) => note.textContent);
+  assert.ok(notes.includes(I18n.t('bpmn.palette_agents_empty')), notes.join(' | '));
+  assert.equal(notes.filter((text) => text === I18n.t('bpmn.palette_group_empty')).length, 3, 'the other groups keep the plain wording');
+  filled.view.destroy(); empty.view.destroy();
+});
+
+test('the allowed tools field shows exactly what is stored', async () => {
+  const graph = canvas(agentStepModel());
+  const config = inspector(graph);
+  const node = graph.nodes.find((candidate) => candidate.id === 'Agent_1');
+  config.show(node, graph.templates.get(node.type)); await flush(2);
+  const field = config.root.querySelector('[data-process="agentTools"]');
+  change(field, '  core.skill_view  \ncore.skill_view\n\n memory.* ');
+  assert.deepEqual(node.config.implementation.Agent.allowedTools, ['core.skill_view', 'memory.*']);
+  assert.equal(field.value, 'core.skill_view\nmemory.*');
+  graph.destroy(); config.destroy();
+});
+
+test('an escalation handler on an agent step speaks of the agent, not of a service task', async () => {
+  const graph = canvas(agentStepModel());
+  const boundary = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_escalation'), 300, 300);
+  graph.updateNodeConfig(boundary.id, { attachedToId: 'Agent_1' });
+  const config = inspector(graph);
+  config.show(graph.nodes.find((candidate) => candidate.id === boundary.id), graph.templates.get('bpmn_boundary_escalation')); await flush(2);
+  assert.ok(config.root.textContent.includes(I18n.t('bpmn.escalation_catch_all_agent_hint')));
+  assert.ok(!config.root.textContent.includes(I18n.t('bpmn.escalation_catch_all_hint')));
   graph.destroy(); config.destroy();
 });
 

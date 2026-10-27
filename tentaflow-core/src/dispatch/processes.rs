@@ -410,7 +410,10 @@ pub(crate) fn pin_service_snapshots(
                         ProtocolError::new(ProtocolErrorCode::PolicyDenied, error.to_string())
                     }
                     AgentPinError::Unavailable => ProtocolError::internal(error.to_string()),
-                    AgentPinError::Refused(_) => ProtocolError::bad_request(error.to_string()),
+                    AgentPinError::Refused(_) => ProtocolError::bad_request(format!(
+                        "service task {}: {error}",
+                        node.id
+                    )),
                 })?,
         };
         snapshots.push(PinnedServiceSnapshot {
@@ -1409,6 +1412,35 @@ mod tests {
             .collect();
         assert!(listed.contains(&(agent_id, "reviewer", 8)), "{listed:?}");
         assert!(listed.iter().all(|(id, ..)| !id.ends_with("666666666666")), "{listed:?}");
+    }
+
+    #[tokio::test]
+    async fn publishing_a_disabled_agent_step_names_the_step_and_the_agent() {
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "agent-step-refusal");
+        let ctx = context(&state, &actor);
+        let sleeper = "11111111-2222-4333-8444-666666666666";
+        seed_option_agent(&state, sleeper, "sleeper", false, crate::agents::LLM_RUNTIME_JSON);
+        let model = crate::processes::agent_sink_tests::agent_model(
+            crate::processes::agent_sink_tests::agent_implementation(sleeper, &[], None),
+        );
+        let definition = save(&ctx, model).await;
+        let error = refused(
+            &ctx,
+            P::DefinitionPublishRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: definition.definition_id.clone(),
+                expected_revision: definition.draft_revision,
+                repin_calendar: None,
+            },
+        )
+        .await;
+        assert_eq!(error.code, ProtocolErrorCode::BadRequest);
+        assert!(
+            error.message.contains("service task Service:") && error.message.contains("\"sleeper\" is disabled"),
+            "{}",
+            error.message
+        );
     }
 
     async fn save_and_publish(

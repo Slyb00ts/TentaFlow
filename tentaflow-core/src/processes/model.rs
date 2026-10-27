@@ -830,7 +830,8 @@ fn validate_draft_body<'a>(
                 let max_timeout = service_timeout_ceiling(implementation);
                 ensure!(
                     (1..=max_timeout).contains(timeout_seconds),
-                    "service timeout outside 1..={max_timeout} seconds"
+                    "service task {} timeout is outside 1..={max_timeout} seconds",
+                    node.id
                 );
                 validate_mapping(input_mapping, false)?;
                 validate_mapping(output_mapping, false)?;

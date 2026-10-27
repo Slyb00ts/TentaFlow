@@ -989,6 +989,8 @@
   display: block;
 }
 .fb-field-hint { font-size: 11px; color: var(--tf-text-3, #6a7196); }
+/* The banner lists one problem per line; a line break in its message is kept. */
+.fb-shell tf-alert[data-role="error"] .tf-alert-message { white-space: pre-line; }
 /* Activity data I/O editor — declarations, associations, and repeat coordinator. */
 .fb-activity-io {
   display: flex;

@@ -10,7 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
-import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processWarningText, processHandlerName, processBoundaryHosts, processBoundaryRefusals, processEscalationPathProblem, processHasTimer, processTimezoneCanonical, processTimezoneGaps, processTimezoneProblem, processTimezoneText } from './bpmn.js';
+import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processWarningText, processHandlerName, processBoundaryHosts, processBoundaryRefusals, processEscalationPathProblem, processTimeoutProblem, processHasTimer, processTimezoneCanonical, processTimezoneGaps, processTimezoneProblem, processTimezoneText } from './bpmn.js';
 import { planProcessLabels } from './label-layout.js';
 import '/js/components/tf-menu.js';
 
@@ -568,6 +568,8 @@ export class FlowCanvas {
         if (condition && !(condition.expression || '').trim()) {
           errors.push(I18n.t('bpmn.verification_expression_required', { node: this._nodeName(node) }));
         }
+        const timeoutCeiling = node.type === 'bpmn_service_task' ? processTimeoutProblem(node.config) : null;
+        if (timeoutCeiling) errors.push(I18n.t('bpmn.timeout_out_of_range', { node: this._nodeName(node), max: timeoutCeiling }));
         const called = node.type === 'bpmn_call_activity' ? node.config : null;
         if (called && !(called.localBody ? called.localBody.processId
           : called.calledDefinitionId && Number.isInteger(called.calledVersion) && called.calledVersion >= 1
@@ -2264,11 +2266,15 @@ export class FlowCanvas {
 
   _processWarnings(node) {
     const warnings = processNodeWarnings(node, this.opts.processOptions?.serviceBlocks);
+    const agents = this.opts.processOptions?.serviceAgents;
+    const agent = node.type === 'bpmn_service_task' ? node.config?.implementation?.Agent : null;
+    if (agent && Array.isArray(agents) && !agents.some((candidate) => candidate.agentId === agent.agentId)) warnings.push('agent_unavailable');
     if (node.type === 'bpmn_boundary_escalation' && processEscalationPathProblem(this, node.id)) warnings.push('escalation_path');
     return warnings;
   }
 
   _processWarningText(node, key) {
+    if (key === 'agent_unavailable') return I18n.t('bpmn.agent_unavailable_warning');
     if (key !== 'escalation_path') return processWarningText(node, key, this.opts.processOptions?.serviceBlocks);
     const reason = processEscalationPathProblem(this, node.id)?.reason;
     return I18n.t(`bpmn.routing_warning_escalation_path_${ESCALATION_PATH_KEYS.includes(reason) ? reason : 'other'}`, { names: this._nodeName(node) });

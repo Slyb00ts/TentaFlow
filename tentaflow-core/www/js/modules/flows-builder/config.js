@@ -20,7 +20,7 @@ import '/js/components/tf-person-picker.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-alert.js';
-import { processNodeKind, processAgentPreset, processAgentIterationLimit, AGENT_STEP_MAX_SECONDS, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processElementNames, processStartEntryLabels, processItemLabels } from './bpmn.js';
+import { processNodeKind, processAgentPreset, processAgentIterationLimit, processTimeoutCeiling, processTimeoutProblem, processSortedAgents, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processElementNames, processStartEntryLabels, processItemLabels } from './bpmn.js';
 import { openProcessCallPreview } from './process-monitor.js';
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
@@ -293,6 +293,8 @@ export class FlowConfig {
     return { key: JSON.stringify([processId, path, node.id, field]), processId, path, nodeId: node.id };
   }
 
+  _draftText(draft) { return I18n.t(draft.errorKey, draft.errorParams); }
+
   _setDraft(node, field, draft) { const scope = this._draftScope(node, field); this.processDrafts.set(scope.key, { ...draft, ...scope }); }
 
   _clearDraft(node, field) { this.processDrafts.delete(this._draftScope(node, field).key); }
@@ -323,8 +325,9 @@ export class FlowConfig {
     this.pruneProcessDrafts();
     const model = this.opts.getCanvas?.()?.getData();
     if (!model) return [];
-    const names = processElementNames(model);
-    return [...this.processDrafts.values()].map((draft) => `${names.get(draft.nodeId)}: ${I18n.t(draft.errorKey)}`);
+    // Two steps may share a name; the line must say which one it means.
+    const names = processDistinctLabels([...processElementNames(model)]);
+    return [...this.processDrafts.values()].map((draft) => `${names.get(draft.nodeId)}: ${this._draftText(draft)}`);
   }
 
   show(node, template) {
@@ -688,7 +691,7 @@ export class FlowConfig {
     const input = (key, label, value, attrs = '') => `<tf-input data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(String(value ?? ''))}" ${attrs} ${disabled}></tf-input>`;
     const textarea = (key, label, value, rows = 2, attrs = '') => `<tf-textarea data-process="${key}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" value="${escapeAttr(String(value ?? ''))}" autogrow rows="${rows}" ${attrs} ${disabled}></tf-textarea>`;
     const draftOf = (key) => this.processDrafts.get(this._draftScope(node, key).key);
-    const draftError = (key) => (draftOf(key) ? `error="${escapeAttr(I18n.t(draftOf(key).errorKey))}"` : '');
+    const draftError = (key) => (draftOf(key) ? `error="${escapeAttr(this._draftText(draftOf(key)))}"` : '');
     const mapping = (key, label) => `<tf-keyvalue-editor data-process="${key}" multiline label="${escapeAttr(I18n.t(`bpmn.${label}`))}" add-label="${escapeAttr(I18n.t('bpmn.add_mapping'))}" remove-label="${escapeAttr(I18n.t('bpmn.remove_mapping'))}" key-placeholder="${escapeAttr(I18n.t('bpmn.mapping_key'))}" value-placeholder="${escapeAttr(I18n.t('bpmn.mapping_expression'))}" ${disabled}></tf-keyvalue-editor>`;
     const model = this.opts.getCanvas().processModel;
     const targetLabels = processNodeLabels(this.opts.getCanvas().nodes, this.opts.getCanvas().templates);
@@ -730,15 +733,19 @@ export class FlowConfig {
       const tool = config.implementation?.AddonTool;
       const blockTask = config.implementation?.Block;
       const agentTask = config.implementation?.Agent;
-      const agents = this.opts.processOptions.serviceAgents || [];
+      const agents = processSortedAgents(this.opts.processOptions.serviceAgents);
       const agentLabels = processDistinctLabels(agents.map((agent) => [agent.agentId, agent.name]));
+      const listedAgent = agentTask && agents.find((agent) => agent.agentId === agentTask.agentId);
+      const iterationLimit = agentTask ? processAgentIterationLimit(listedAgent, agentTask.maxIterations) : 0;
       const source = agentTask
         ? `<tf-select data-process="agentId" wrap-selected label="${escapeAttr(I18n.t('bpmn.agent_label'))}" value="${escapeAttr(agentTask.agentId)}" ${disabled}>${agents.map((agent) => `<option value="${escapeAttr(agent.agentId)}">${escapeHtml(agentLabels.get(agent.agentId))}</option>`).join('')}${agents.some((agent) => agent.agentId === agentTask.agentId) ? '' : `<option value="${escapeAttr(agentTask.agentId)}" disabled>${escapeHtml(I18n.t('bpmn.agent_unavailable'))}</option>`}</tf-select>
+        ${listedAgent ? '' : `<tf-alert tone="warning" data-agent-warning message="${escapeAttr(I18n.t('bpmn.agent_unavailable_warning'))}"></tf-alert>`}
         ${textarea('agentGoal', 'agent_goal', agentTask.goalExpression, 3)}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.agent_goal_hint'))}</p>
         ${textarea('agentTools', 'agent_tools', agentTask.allowedTools.join('\n'), 3)}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.agent_tools_hint'))}</p>
-        ${input('agentIterations', 'agent_iterations', draftOf('agentIterations')?.text ?? agentTask.maxIterations, `type="number" min="1" max="${processAgentIterationLimit(agents.find((agent) => agent.agentId === agentTask.agentId), agentTask.maxIterations)}" step="1" ${draftError('agentIterations')}`)}
+        ${input('agentIterations', 'agent_iterations', draftOf('agentIterations')?.text ?? agentTask.maxIterations, `type="number" min="1" max="${iterationLimit}" step="1" ${draftError('agentIterations')}`)}
+        <p class="fb-field-hint" data-agent-iterations-hint>${escapeHtml(I18n.t(listedAgent ? 'bpmn.agent_iterations_hint' : 'bpmn.agent_iterations_hint_unavailable', { max: iterationLimit }))}</p>
         ${textarea('agentSchema', 'agent_output_schema', draftOf('agentSchema')?.text ?? (agentTask.outputSchema == null ? '' : JSON.stringify(agentTask.outputSchema, null, 2)), 4, draftError('agentSchema'))}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.agent_hint'))}</p>`
         : blockTask
@@ -774,7 +781,7 @@ export class FlowConfig {
         <div data-process-condition ${typeof config.verification === 'string' ? 'hidden' : ''}>${input('expression', 'verification_expression', config.verification?.Condition?.expression)}</div>
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_hint'))}</p>
         <div data-routing-view></div>`)
-        + panel('time', `${input('timeoutSeconds', 'timeout', config.timeoutSeconds, `type="number" min="1" max="${agentTask ? AGENT_STEP_MAX_SECONDS : 600}" step="1"`)}
+        + panel('time', `${input('timeoutSeconds', 'timeout', config.timeoutSeconds, `type="number" min="1" max="${processTimeoutCeiling(config)}" step="1" ${processTimeoutProblem(config) ? `error="${escapeAttr(I18n.t('bpmn.timeout_invalid', { max: processTimeoutCeiling(config) }))}"` : ''}`)}
         <p class="fb-field-hint">${escapeHtml(I18n.t(agentTask ? 'bpmn.timeout_agent_hint' : 'bpmn.timeout_hint'))}</p>`);
       serviceRouting = routing;
     } else if (kind === 'ScriptTask') {
@@ -873,7 +880,7 @@ export class FlowConfig {
       if (kind === 'BoundaryEscalation') fields += `<tf-toggle data-process="cancelActivity" label="${escapeAttr(I18n.t('bpmn.boundary_interrupting'))}" ${config.cancelActivity ? 'checked' : ''} ${disabled}></tf-toggle>`;
       if (kind === 'BoundaryError') fields += declaration('errorRef', 'error_reference', model.errors, 'errorId', config.errorRef) + `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.error_catch_all_hint'))}</p>`;
       else if (kind === 'BoundaryEscalation') fields += declaration('escalationRef', 'escalation_reference', model.escalations, 'escalationId', config.escalationRef)
-        + `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.escalation_catch_all_hint'))}</p>`;
+        + `<p class="fb-field-hint">${escapeHtml(I18n.t(this.opts.getCanvas().nodes.find((candidate) => candidate.id === config.attachedToId)?.config?.implementation?.Agent ? 'bpmn.escalation_catch_all_agent_hint' : 'bpmn.escalation_catch_all_hint'))}</p>`;
       else fields += declaration('messageRef', 'message_reference', model.messages, 'messageId', config.messageRef);
       if (kind === 'MessageCatch' || kind === 'ReceiveTask' || kind === 'BoundaryMessage' || kind === 'MessageThrow' || kind === 'SendTask') fields += textarea('correlationExpression', 'correlation_expression', config.correlationExpression, 3);
       if (kind === 'MessageThrow' || kind === 'SendTask') {
@@ -1400,14 +1407,18 @@ export class FlowConfig {
           // bounds, so neither may reach the model unchecked.
           const text = String(control.value ?? '').trim();
           const count = Number(text);
+          const hint = this.root.querySelector('[data-agent-iterations-hint]');
           if (!text || !Number.isInteger(count) || count < 1) {
-            this._setDraft(node, 'agentIterations', { text, errorKey: 'bpmn.agent_iterations_invalid' });
-            control.setAttribute('error', I18n.t('bpmn.agent_iterations_invalid'));
+            const draft = { text, errorKey: 'bpmn.agent_iterations_invalid', errorParams: { max: limit } };
+            this._setDraft(node, 'agentIterations', draft);
+            control.setAttribute('error', this._draftText(draft));
             return;
           }
           this._clearDraft(node, 'agentIterations');
           control.removeAttribute('error');
           next.maxIterations = Math.min(count, limit);
+          if (hint) hint.textContent = I18n.t(next.maxIterations !== count ? 'bpmn.agent_iterations_clamped'
+            : this.opts.processOptions.serviceAgents?.some((agent) => agent.agentId === chosenId) ? 'bpmn.agent_iterations_hint' : 'bpmn.agent_iterations_hint_unavailable', { max: limit, entered: count });
           if (next.maxIterations !== count) control.value = String(next.maxIterations);
         } else if (key === 'agentGoal') {
           next.goalExpression = control.value;
@@ -1420,9 +1431,11 @@ export class FlowConfig {
         this.opts.onConfigChange(node.id, { implementation: { Agent: next } });
         if (key === 'agentId') this._renderProcess();
       } else if (key === 'agentTools') {
+        const allowedTools = [...new Set(control.value.split(/\r?\n/).map((tool) => tool.trim()).filter(Boolean))];
         this.opts.onConfigChange(node.id, { implementation: { Agent: {
-          ...node.config.implementation.Agent,
-          allowedTools: [...new Set(control.value.split(/\r?\n/).map((tool) => tool.trim()).filter(Boolean))] } } });
+          ...node.config.implementation.Agent, allowedTools } } });
+        // What the field shows is what is stored: no duplicate or padded line survives the edit.
+        control.value = allowedTools.join('\n');
       } else if (key === 'agentSchema') {
         let parsed = null;
         const text = control.value.trim();
@@ -1436,8 +1449,9 @@ export class FlowConfig {
         } else {
           // The stored schema stays what the model holds; the field keeps the
           // text and its error until the author fixes it or the node changes.
-          this._setDraft(node, 'agentSchema', { text: control.value, errorKey: 'bpmn.agent_output_schema_invalid' });
-          control.setAttribute('error', I18n.t('bpmn.agent_output_schema_invalid'));
+          const draft = { text: control.value, errorKey: 'bpmn.agent_output_schema_invalid' };
+          this._setDraft(node, 'agentSchema', draft);
+          control.setAttribute('error', this._draftText(draft));
         }
       } else if (key === 'blockType') {
         const chosen = (this.opts.processOptions.serviceBlocks || []).find((block) => block.nodeType === control.value);
@@ -1474,6 +1488,11 @@ export class FlowConfig {
       else if (key !== 'elementId') {
         if (key === 'defaultFlowId' && kind === 'InclusiveGateway' && control.value) this.opts.onEdgeChange(control.value, { condition: null });
         this.opts.onConfigChange(node.id, { [key]: key === 'timeoutSeconds' || key === 'ttlSeconds' ? Number(control.value) : (control.value || (key === 'assigneeUserId' || key === 'defaultFlowId' ? null : '')) });
+        if (key === 'timeoutSeconds') {
+          const ceiling = processTimeoutProblem({ ...node.config, timeoutSeconds: Number(control.value) });
+          if (ceiling) control.setAttribute('error', I18n.t('bpmn.timeout_invalid', { max: ceiling }));
+          else control.removeAttribute('error');
+        }
       }
       if (serviceRouting && ['resultExpression', 'verification', 'expression', 'timeoutSeconds'].includes(key)) this._renderRouting(node);
       if (key === 'assigneeUserId') this.root.querySelector('[data-assignee-hint]').textContent = I18n.t(kind === 'ManualTask'

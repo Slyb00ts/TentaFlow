@@ -40,9 +40,12 @@ pub struct AgentPin {
 pub fn runnable_agent(conn: &Connection, agent_id: &str) -> Result<DbAgent, AgentPinError> {
     let agent = repository::get_agent_on(conn, agent_id)
         .map_err(|_| AgentPinError::Unavailable)?
-        .ok_or_else(|| AgentPinError::Refused("the agent does not exist".into()))?;
+        .ok_or_else(|| AgentPinError::Refused(format!("the agent {agent_id} does not exist")))?;
     if !agent.is_enabled {
-        return Err(AgentPinError::Refused("the agent is disabled".into()));
+        let name = agent.display_name.as_deref().unwrap_or(&agent.name);
+        return Err(AgentPinError::Refused(format!(
+            "the agent \"{name}\" is disabled"
+        )));
     }
     // A continuation is a new top-level run, which would leave the step: it has
     // none of the step's narrowing and nothing cancels it with the step.
