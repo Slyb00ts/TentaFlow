@@ -95,7 +95,8 @@ test.describe('M16 — Services > Aliases', () => {
       test.skip(true, '"new manual alias" button not found');
     }
     await newBtn.click();
-    const win = page.locator('tf-window');
-    await expect(win).toBeVisible({ timeout: 5000 });
+    // The tf-window host has no box of its own (its frame is position:fixed in the
+    // shadow root), so visibility is asserted on the frame.
+    await expect(page.locator('tf-window .tf-window')).toBeVisible({ timeout: 5000 });
   });
 });

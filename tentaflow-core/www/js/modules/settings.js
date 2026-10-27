@@ -132,7 +132,7 @@ async function loadAll() {
     const [settingsResp, ssoResp, registriesResp] = await Promise.all([
       ApiBinary.one('settingsListRequest').catch(() => ({ entries: [] })),
       ApiBinary.one('ssoProvidersListRequest').catch(() => ({ providers: [] })),
-      ApiBinary.list('registryListRequest').catch(() => []),
+      ApiBinary.list('registryListRequest', { arrayKey: 'registries' }).catch(() => []),
     ]);
     settings = {};
     for (const row of settingsResp.entries || []) {
@@ -299,14 +299,14 @@ function renderSyncConflictsTable() {
   const table = byId('sync-conflicts-table');
   if (!table) return;
   table.rows = syncConflicts.map((row) => {
-    const operationId = row.operationId || row.operation_id || '';
+    const operationId = row.operationId || '';
     const status = row.status || 'open';
-    const resourceType = row.resourceType || row.resource_type || '';
-    const resourceId = row.resourceId || row.resource_id || '';
-    const tableName = row.tableName || row.table_name || '';
-    const sourceNodeId = row.sourceNodeId || row.source_node_id || '';
-    const errorKind = row.errorKind || row.error_kind || '';
-    const errorMessage = row.errorMessage || row.error_message || '';
+    const resourceType = row.resourceType || '';
+    const resourceId = row.resourceId || '';
+    const tableName = row.tableName || '';
+    const sourceNodeId = row.sourceNodeId || '';
+    const errorKind = row.errorKind || '';
+    const errorMessage = row.errorMessage || '';
     return {
       resource: `
         <strong>${escapeHtml(resourceType || tableName || 'resource')}</strong>
@@ -910,7 +910,7 @@ function bindExternalAccessTab() {
   });
 
   byId('registries-refresh')?.addEventListener('click', async () => {
-    registries = await ApiBinary.list('registryListRequest').catch(() => []);
+    registries = await ApiBinary.list('registryListRequest', { arrayKey: 'registries' }).catch(() => []);
     renderTab();
   });
 }

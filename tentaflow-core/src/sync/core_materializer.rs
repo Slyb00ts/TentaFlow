@@ -58,6 +58,7 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::TokenLease
             | CoreSyncResourceKind::ModelMetricsRollup
             | CoreSyncResourceKind::ModelPricing
+            | CoreSyncResourceKind::ModelAlias
             | CoreSyncResourceKind::CameraCvPipeline
             | CoreSyncResourceKind::VisionModel
             // Code Studio: every one of these is revocable, and a revocation must
@@ -265,6 +266,11 @@ pub fn apply_core_operation(pool: &DbPool, operation: &SyncOperation) -> LedgerR
         CoreSyncResourceKind::TokenLease => apply_token_lease(&tx, operation)?,
         CoreSyncResourceKind::ModelMetricsRollup => apply_model_metrics_rollup(&tx, operation)?,
         CoreSyncResourceKind::ModelPricing => apply_model_pricing(&tx, operation)?,
+        CoreSyncResourceKind::ModelAlias => {
+            let applied = apply_model_alias(&tx, operation)?;
+            authorized = applied.authorized;
+            applied.rows
+        }
         CoreSyncResourceKind::CameraCvPipeline => apply_camera_cv_pipeline(&tx, operation)?,
         CoreSyncResourceKind::VisionModel => apply_vision_model(&tx, operation)?,
         CoreSyncResourceKind::CodeWorkspace => apply_code_workspace(&tx, operation)?,
@@ -359,6 +365,16 @@ pub fn apply_core_operation(pool: &DbPool, operation: &SyncOperation) -> LedgerR
     tx.commit()
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
 
+    // A replicated alias must reach the router the way a local edit does, or
+    // requests keep resolving through the cache loaded before the write. The
+    // writer lock goes first: both calls read the alias table back.
+    if rows > 0 && descriptor.kind == CoreSyncResourceKind::ModelAlias {
+        drop(conn);
+        if let Some(router) = crate::routing::router::active_router() {
+            router.reload_alias_cache();
+            router.rebuild_catalog();
+        }
+    }
     // A synced flow edit/delete/status change must drop the FlowDispatcher's
     // compiled-flow cache (same guarantee the local save handlers give), else a
     // remote change is masked by a cached compile until the TTL. Post-commit +
@@ -3150,6 +3166,80 @@ fn apply_model_pricing(
                 rusqlite::params![id],
             )
             .map_err(sql_error),
+    }
+}
+
+/// Outcome of applying an alias operation. `authorized` is false when the
+/// operation was refused because the alias is local to this node, so a refused
+/// write does not advance the alias's position in the LWW order.
+struct AppliedModelAlias {
+    rows: usize,
+    authorized: bool,
+}
+
+/// Aliases are keyed by name; the local integer `id` is kept on conflict
+/// because owner, visibility and consumer rows hang off it. Addon-owned
+/// aliases belong to this node's install of that addon, and platform aliases
+/// are recreated by the seed, so neither can be written over or deleted by a
+/// peer. The sender validated the chain rules inside its own transaction; the
+/// receiver does not repeat them.
+fn apply_model_alias(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<AppliedModelAlias> {
+    let alias = &operation.body.resource_id;
+    let refused = AppliedModelAlias {
+        rows: 0,
+        authorized: false,
+    };
+    if alias.trim().is_empty() {
+        return Ok(refused);
+    }
+    let replicates = crate::db::repository::model_alias_replicates(tx, alias).map_err(|e| {
+        SyncLedgerError::Runtime(e.to_string())
+    })?;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            if !replicates {
+                return Ok(refused);
+            }
+            let rows = tx
+                .execute(
+                    "INSERT INTO model_aliases \
+                     (alias, target_model, is_active, fallback_targets, strategy) \
+                     VALUES (?1, ?2, ?3, ?4, ?5) \
+                     ON CONFLICT(alias) DO UPDATE SET \
+                     target_model = excluded.target_model, is_active = excluded.is_active, \
+                     fallback_targets = excluded.fallback_targets, strategy = excluded.strategy",
+                    rusqlite::params![
+                        alias,
+                        field_string(operation, "target_model")?,
+                        field_bool_or(operation, "is_active", true)?,
+                        field_optional_string(operation, "fallback_targets")?,
+                        field_optional_string(operation, "strategy")?,
+                    ],
+                )
+                .map_err(sql_error)?;
+            Ok(AppliedModelAlias {
+                rows,
+                authorized: true,
+            })
+        }
+        ActionType::Delete => {
+            if !replicates || crate::db::seed::is_platform_seeded_alias(alias) {
+                return Ok(refused);
+            }
+            let rows = tx
+                .execute(
+                    "DELETE FROM model_aliases WHERE alias = ?1",
+                    rusqlite::params![alias],
+                )
+                .map_err(sql_error)?;
+            Ok(AppliedModelAlias {
+                rows,
+                authorized: true,
+            })
+        }
     }
 }
 
@@ -6032,6 +6122,15 @@ fn field_equals_stored(incoming: &FieldValue, held: &rusqlite::types::Value) -> 
 }
 
 pub(crate) fn sql_error(error: rusqlite::Error) -> SyncLedgerError {
+    // A foreign-key miss means the parent row (user, group, flow) has not
+    // arrived yet; it is an ordering gap, not a data conflict.
+    if matches!(
+        &error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY
+    ) {
+        return SyncLedgerError::DeferredOrdering(error.to_string());
+    }
     SyncLedgerError::Runtime(error.to_string())
 }
 
@@ -10524,5 +10623,373 @@ mod tests {
                 .unwrap();
         assert_ne!(subject.generation, 0);
         assert_eq!(version.subject_generation, subject.generation);
+    }
+}
+
+#[cfg(test)]
+mod model_alias_tests {
+    use super::*;
+    use crate::db::repository;
+    use crate::services::org::DEFAULT_ORG_ID;
+    use crate::sync::core_capture::load_core_write_capture;
+    use crate::sync::ledger::{BaselineEpoch, OperationId, PartitionId, SyncOperationBody};
+    use crate::sync::runtime::SqlWriteAction;
+    use std::collections::BTreeMap;
+
+    fn fresh_db() -> DbPool {
+        crate::db::init(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    fn alias_operation(
+        alias: &str,
+        action: ActionType,
+        wall_time_ms: i64,
+        fields: BTreeMap<String, FieldValue>,
+    ) -> SyncOperation {
+        SyncOperation {
+            op_id: OperationId::from_hash([9; 32]),
+            operation_hash: [9; 32],
+            body: SyncOperationBody {
+                org_id: DEFAULT_ORG_ID.to_string(),
+                partition_id: PartitionId::new("core/org/default/model-aliases").unwrap(),
+                node_seq: 1,
+                addon_id: CORE_SYNC_ADDON_ID.to_string(),
+                resource_type: "core.model_alias".to_string(),
+                resource_id: alias.to_string(),
+                table_name: "model_aliases".to_string(),
+                primary_key: "alias".to_string(),
+                action,
+                changed_fields: fields,
+                before_hash: None,
+                after_hash: None,
+                actor_user_id: String::new(),
+                actor_device_id: "peer".to_string(),
+                actor_node_id: "peer".to_string(),
+                hlc_timestamp: HybridLogicalTimestamp {
+                    wall_time_ms,
+                    logical: 0,
+                    node_id: "peer".to_string(),
+                },
+                epoch: BaselineEpoch::default(),
+                environment: crate::sync::ledger::NodeEnvironment::default(),
+                prev_node_hash: None,
+                payload_hash: [0; 32],
+                acl_snapshot_hash: [0; 32],
+                policy_epoch: 0,
+                encryption_info: None,
+            },
+            signature: Vec::new(),
+        }
+    }
+
+    fn upsert_fields(alias: &str, target: &str, active: bool) -> BTreeMap<String, FieldValue> {
+        BTreeMap::from([
+            ("alias".to_string(), FieldValue::String(alias.to_string())),
+            (
+                "target_model".to_string(),
+                FieldValue::String(target.to_string()),
+            ),
+            ("is_active".to_string(), FieldValue::Bool(active)),
+            ("fallback_targets".to_string(), FieldValue::Null),
+            (
+                "strategy".to_string(),
+                FieldValue::String("first_available".to_string()),
+            ),
+        ])
+    }
+
+    fn upsert(alias: &str, target: &str, wall_time_ms: i64) -> SyncOperation {
+        alias_operation(
+            alias,
+            ActionType::Insert,
+            wall_time_ms,
+            upsert_fields(alias, target, true),
+        )
+    }
+
+    fn delete(alias: &str, wall_time_ms: i64) -> SyncOperation {
+        alias_operation(
+            alias,
+            ActionType::Delete,
+            wall_time_ms,
+            BTreeMap::from([("alias".to_string(), FieldValue::String(alias.to_string()))]),
+        )
+    }
+
+    fn target_of(db: &DbPool, alias: &str) -> Option<String> {
+        repository::list_model_aliases(db)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.alias == alias)
+            .map(|row| row.target_model)
+    }
+
+    /// The captures a node's alias writes left behind, turned into the
+    /// operations a peer would receive.
+    fn captured_operations(db: &DbPool) -> Vec<SyncOperation> {
+        let conn = repository::acquire_for_baseline(db).unwrap();
+        let ids: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT capture_id FROM __tentaflow_core_sync_captures \
+                     WHERE table_name = 'model_aliases' ORDER BY rowid",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        ids.iter()
+            .map(|id| {
+                let capture = load_core_write_capture(&conn, id).unwrap().unwrap();
+                let action = match capture.action {
+                    SqlWriteAction::Insert => ActionType::Insert,
+                    SqlWriteAction::Update => ActionType::Update,
+                    SqlWriteAction::Delete => ActionType::Delete,
+                };
+                let mut op = alias_operation(
+                    &capture.resource_id,
+                    action,
+                    capture.hlc.wall_time_ms,
+                    capture.changed_fields,
+                );
+                op.body.hlc_timestamp = capture.hlc;
+                op
+            })
+            .collect()
+    }
+
+    #[test]
+    fn insert_update_and_delete_apply_by_name() {
+        let db = fresh_db();
+        assert_eq!(
+            apply_core_operation(&db, &upsert("fleet-chat", "model-a", 10)).unwrap(),
+            1
+        );
+        assert_eq!(target_of(&db, "fleet-chat").as_deref(), Some("model-a"));
+
+        assert_eq!(
+            apply_core_operation(&db, &upsert("fleet-chat", "model-b", 20)).unwrap(),
+            1
+        );
+        assert_eq!(target_of(&db, "fleet-chat").as_deref(), Some("model-b"));
+
+        assert_eq!(apply_core_operation(&db, &delete("fleet-chat", 30)).unwrap(), 1);
+        assert_eq!(target_of(&db, "fleet-chat"), None);
+    }
+
+    #[test]
+    fn an_update_keeps_the_local_row_id() {
+        let db = fresh_db();
+        let id = repository::create_model_alias_with_chain_check(&db, "keep-id", "m1", None, None)
+            .unwrap();
+        apply_core_operation(&db, &upsert("keep-id", "m2", i64::MAX / 2)).unwrap();
+        let row = repository::get_model_alias(&db, id).unwrap().unwrap();
+        assert_eq!(row.target_model, "m2");
+    }
+
+    #[test]
+    fn an_older_write_loses_to_a_newer_one() {
+        let db = fresh_db();
+        apply_core_operation(&db, &upsert("lww-alias", "new", 200)).unwrap();
+        assert_eq!(
+            apply_core_operation(&db, &upsert("lww-alias", "old", 100)).unwrap(),
+            0
+        );
+        assert_eq!(target_of(&db, "lww-alias").as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn a_delete_is_not_undone_by_an_older_insert() {
+        let db = fresh_db();
+        // The delete reaches a node that never saw the alias, then the insert
+        // it removed arrives late.
+        assert_eq!(apply_core_operation(&db, &delete("gone-alias", 500)).unwrap(), 0);
+        assert_eq!(
+            apply_core_operation(&db, &upsert("gone-alias", "m", 100)).unwrap(),
+            0
+        );
+        assert_eq!(target_of(&db, "gone-alias"), None);
+
+        // A write after the delete is a new alias and does apply.
+        assert_eq!(
+            apply_core_operation(&db, &upsert("gone-alias", "m2", 900)).unwrap(),
+            1
+        );
+        assert_eq!(target_of(&db, "gone-alias").as_deref(), Some("m2"));
+    }
+
+    #[test]
+    fn local_writes_converge_on_a_second_database() {
+        let author = fresh_db();
+        let id = repository::create_model_alias_with_chain_check(
+            &author,
+            "round-trip",
+            "model-a",
+            Some(r#"["model-fallback"]"#),
+            Some("round_robin"),
+        )
+        .unwrap();
+        repository::update_model_alias_with_chain_check(
+            &author,
+            id,
+            "round-trip",
+            "model-b",
+            true,
+            Some(r#"["model-fallback"]"#),
+            Some("round_robin"),
+        )
+        .unwrap();
+        repository::create_model_alias_with_chain_check(&author, "doomed", "model-c", None, None)
+            .unwrap();
+        let doomed = repository::list_model_aliases(&author)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.alias == "doomed")
+            .unwrap();
+        repository::delete_model_alias(&author, doomed.id).unwrap();
+
+        let peer = fresh_db();
+        for op in captured_operations(&author) {
+            apply_core_operation(&peer, &op).unwrap();
+        }
+
+        let replicated = repository::list_model_aliases(&peer)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.alias == "round-trip")
+            .expect("alias reached the peer");
+        assert_eq!(replicated.target_model, "model-b");
+        assert_eq!(
+            replicated.fallback_targets.as_deref(),
+            Some(r#"["model-fallback"]"#)
+        );
+        assert_eq!(replicated.strategy.as_deref(), Some("round_robin"));
+        assert_eq!(target_of(&peer, "doomed"), None);
+    }
+
+    #[test]
+    fn renaming_an_alias_removes_the_old_name_on_peers() {
+        let author = fresh_db();
+        let id = repository::create_model_alias_with_chain_check(&author, "old-name", "m", None, None)
+            .unwrap();
+        repository::update_model_alias_with_chain_check(
+            &author, id, "new-name", "m", true, None, None,
+        )
+        .unwrap();
+
+        let peer = fresh_db();
+        for op in captured_operations(&author) {
+            apply_core_operation(&peer, &op).unwrap();
+        }
+        assert_eq!(target_of(&peer, "old-name"), None);
+        assert_eq!(target_of(&peer, "new-name").as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn an_addon_owned_alias_is_neither_captured_nor_overwritten() {
+        let db = fresh_db();
+        repository::create_or_reactivate_model_alias(
+            &db,
+            "addon-alias",
+            "addon-model",
+            "first_available",
+            "addon",
+            Some("some-addon"),
+        )
+        .unwrap();
+        assert!(
+            captured_operations(&db).is_empty(),
+            "an addon alias is local to the node that installed the addon"
+        );
+
+        assert_eq!(
+            apply_core_operation(&db, &upsert("addon-alias", "hijacked", 100)).unwrap(),
+            0
+        );
+        assert_eq!(apply_core_operation(&db, &delete("addon-alias", 200)).unwrap(), 0);
+        assert_eq!(target_of(&db, "addon-alias").as_deref(), Some("addon-model"));
+        // A refused write must not claim the alias's slot in the LWW order.
+        let stamped: i64 = repository::acquire_for_baseline(&db)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM core_resource_versions \
+                 WHERE resource_type = 'core.model_alias' AND resource_id = 'addon-alias'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 0);
+    }
+
+    #[test]
+    fn a_platform_alias_replicates_its_binding_but_not_its_removal() {
+        let db = fresh_db();
+        let rag = repository::list_model_aliases(&db)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.alias == "rag-embeddings")
+            .expect("seeded platform alias");
+
+        assert_eq!(
+            apply_core_operation(&db, &upsert("rag-embeddings", "embed-model", i64::MAX / 2))
+                .unwrap(),
+            1
+        );
+        assert_eq!(target_of(&db, "rag-embeddings").as_deref(), Some("embed-model"));
+
+        assert_eq!(
+            apply_core_operation(&db, &delete("rag-embeddings", i64::MAX / 2 + 1)).unwrap(),
+            0
+        );
+        assert!(target_of(&db, "rag-embeddings").is_some());
+
+        let before = captured_operations(&db).len();
+        repository::delete_model_alias(&db, rag.id).unwrap();
+        assert_eq!(
+            captured_operations(&db).len(),
+            before,
+            "the seed recreates a platform alias, so its removal stays local"
+        );
+    }
+
+    #[test]
+    fn the_backfill_captures_existing_aliases_once() {
+        let db = fresh_db();
+        {
+            let conn = repository::acquire_for_baseline(&db).unwrap();
+            conn.execute(
+                "INSERT INTO model_aliases (alias, target_model, is_active) \
+                 VALUES ('legacy-admin', 'legacy-model', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        repository::create_or_reactivate_model_alias(
+            &db,
+            "legacy-addon",
+            "addon-model",
+            "first_available",
+            "addon",
+            Some("some-addon"),
+        )
+        .unwrap();
+
+        let captured = repository::backfill_model_alias_captures(&db).unwrap();
+        let names: Vec<String> = captured_operations(&db)
+            .into_iter()
+            .map(|op| op.body.resource_id)
+            .collect();
+        assert_eq!(captured, names.len());
+        assert!(names.contains(&"legacy-admin".to_string()));
+        assert!(!names.contains(&"legacy-addon".to_string()));
+        assert!(
+            !names.contains(&"rag-embeddings".to_string())
+                && !names.contains(&"tentavision-detect".to_string()),
+            "untouched platform seeds say nothing an admin decided: {names:?}"
+        );
+
+        assert_eq!(repository::backfill_model_alias_captures(&db).unwrap(), 0);
     }
 }

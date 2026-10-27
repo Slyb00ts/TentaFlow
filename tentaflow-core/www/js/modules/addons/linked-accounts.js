@@ -67,28 +67,28 @@ async function reloadAccount(accountId) {
 
 function normalize(a) {
   const nowEpoch = Math.floor(Date.now() / 1000);
-  const expiresAt = a.expiresAtEpoch ?? a.expires_at_epoch ?? null;
+  const expiresAt = a.expiresAtEpoch ?? null;
   const revoked = !!a.revoked;
   const status = revoked
     ? 'revoked'
     : (expiresAt && expiresAt > 0 && expiresAt < nowEpoch + 60 ? 'expired' : 'active');
   const scopes = a.scopes || [];
-  const email = a.externalAccountId ?? a.external_account_id ?? '';
-  const displayName = a.displayName ?? a.display_name ?? email;
+  const email = a.externalAccountId ?? '';
+  const displayName = a.displayName ?? email;
   return {
     id: a.id,
-    userId: a.userId ?? a.user_id ?? null,
-    addonId: a.addonId ?? a.addon_id,
-    providerId: a.providerId ?? a.provider_id,
+    userId: a.userId ?? null,
+    addonId: a.addonId,
+    providerId: a.providerId,
     email,
     displayName,
-    tenantDomain: extractTenant(email, a.providerId ?? a.provider_id),
-    tokenType: a.tokenType ?? a.token_type,
+    tenantDomain: extractTenant(email, a.providerId),
+    tokenType: a.tokenType,
     scopes,
     scopesCount: scopes.length,
     expiresAtEpoch: expiresAt,
-    createdAtEpoch: a.createdAtEpoch ?? a.created_at_epoch ?? 0,
-    lastUsedAtEpoch: a.lastUsedAtEpoch ?? a.last_used_at_epoch ?? null,
+    createdAtEpoch: a.createdAtEpoch ?? 0,
+    lastUsedAtEpoch: a.lastUsedAtEpoch ?? null,
     revoked,
     status,
   };

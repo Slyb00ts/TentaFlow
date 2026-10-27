@@ -375,3 +375,55 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
 
     Ok(pool)
 }
+
+#[cfg(test)]
+mod pool_concurrency_tests {
+    use super::*;
+
+    /// Writers serialise on the writer mutex while pooled readers run beside them;
+    /// neither side may ever surface SQLITE_BUSY ("database is locked").
+    #[test]
+    fn concurrent_readers_and_writers_never_hit_locked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = init(&dir.path().join("core.db")).expect("init");
+        pool.write()
+            .unwrap()
+            .execute_batch("CREATE TABLE IF NOT EXISTS pool_probe (id INTEGER PRIMARY KEY, v INTEGER)")
+            .unwrap();
+
+        let writers: Vec<_> = (0..4)
+            .map(|w| {
+                let pool = pool.clone();
+                std::thread::spawn(move || {
+                    for i in 0..100 {
+                        let conn = pool.write().unwrap();
+                        conn.execute("INSERT INTO pool_probe (v) VALUES (?1)", [w * 1000 + i])
+                            .expect("write");
+                    }
+                })
+            })
+            .collect();
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let pool = pool.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        let conn = pool.read().expect("pooled connection");
+                        let _: i64 = conn
+                            .query_row("SELECT COUNT(*) FROM pool_probe", [], |r| r.get(0))
+                            .expect("read");
+                    }
+                })
+            })
+            .collect();
+        for t in writers.into_iter().chain(readers) {
+            t.join().expect("worker");
+        }
+        let total: i64 = pool
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM pool_probe", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 400);
+    }
+}

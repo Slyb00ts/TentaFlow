@@ -895,7 +895,7 @@ export class ProfilingLaunchModal {
       // uniknie pytania o haslo dopoki uzytkownik nie zamknie zakladki.
       if (elevationPassword) setSudoPassword(elevationPassword);
       const resp = await startSession({ scope, nodeId: this.nodeId, elevationPassword });
-      const sessionId = resp.sessionId || resp.session_id;
+      const sessionId = resp.sessionId;
       this._launchedOk = true;
       if (this.onLaunched && sessionId) {
         try { this.onLaunched(sessionId); } catch (cbErr) { console.error('onLaunched callback error', cbErr); }

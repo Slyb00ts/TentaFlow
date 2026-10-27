@@ -19,7 +19,7 @@ const PromptsScreen = {
   },
   async mount() {
     try {
-      prompts = await ApiBinary.list('promptListRequest');
+      prompts = await ApiBinary.list('promptListRequest', { arrayKey: 'prompts' });
       renderTable();
     } catch (err) { toast(`${I18n.t('prompts.error_prefix')}: ${err.message}`, 'error'); }
   },

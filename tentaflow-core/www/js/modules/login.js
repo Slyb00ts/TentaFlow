@@ -89,7 +89,7 @@ const LoginScreen = {
           ApiBinary.clearSession();
         }
         const result = await ApiBinary.action('authLoginRequest', { username, password: passwordRotation ? newPassword : password });
-        if (result.variant === 'AuthLoginResponse' && result.jwt) {
+        if (result._variant === 'AuthLoginResponseBody' && result.jwt) {
           await ApiBinary.setJwt(result.jwt);
           if (result.mustChangePassword) {
             onSuccess();

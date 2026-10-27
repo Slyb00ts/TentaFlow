@@ -55,12 +55,11 @@ const ClusterWizard = {
       fName = cluster.name || '';
       fDesc = cluster.description || '';
       fStrategy = cluster.strategy || 'distributed';
-      fFailover = !!(cluster.failoverEnabled ?? cluster.failover_enabled);
-      fFailoverTarget = cluster.failoverTarget || cluster.failover_target || '';
-      fHealthInterval = cluster.healthCheckIntervalMs || cluster.health_check_interval_ms || 5000;
-      fTimeout = cluster.timeoutMs || cluster.timeout_ms || 10000;
-      const members = cluster.members || cluster.nodes || [];
-      for (const m of members) selectedIds.add(m.nodeId || m.node_id || m.id);
+      fFailover = !!cluster.failoverEnabled;
+      fFailoverTarget = cluster.failoverTarget || '';
+      fHealthInterval = cluster.healthCheckIntervalMs || 5000;
+      fTimeout = cluster.timeoutMs || 10000;
+      for (const m of cluster.members) selectedIds.add(m.nodeId);
     } else {
       fName = '';
       fDesc = '';
@@ -97,14 +96,14 @@ async function loadNodes() {
   try {
     const all = await ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' });
     availableNodes = (Array.isArray(all) ? all : []).filter(n => {
-      if (n.is_local) return true;
+      if (n.isLocal) return true;
       // MeshNodeInfo proto nie ma `is_trusted`/`trust`. Backend wystawia
       // tylko `source` ("local"|"trusted"|"discovered"); paired = "trusted".
       return String(n.source || '').toLowerCase() === 'trusted';
     });
     availableNodes.sort((a, b) => {
-      if (a.is_local && !b.is_local) return -1;
-      if (!a.is_local && b.is_local) return 1;
+      if (a.isLocal && !b.isLocal) return -1;
+      if (!a.isLocal && b.isLocal) return 1;
       return String(a.hostname || '').localeCompare(String(b.hostname || ''));
     });
   } catch (_) {
@@ -216,11 +215,11 @@ function renderStep2() {
   }
 
   const rows = availableNodes.map(n => {
-    const id = n.node_id || n.id;
+    const id = n.nodeId;
     const checked = selectedIds.has(id) ? 'checked' : '';
     const gpus = Array.isArray(n.gpus) ? n.gpus : [];
-    const vramTotal = gpus.reduce((s, g) => s + (g.vram_total_mb || 0), 0);
-    const ramTotal = n.ram_total_mb || 0;
+    const vramTotal = gpus.reduce((s, g) => s + (g.vramTotalMb || 0), 0);
+    const ramTotal = n.ramTotalMb || 0;
     const online = isOnline(n);
     const statusChip = online
       ? `<tf-chip status="online" dot>${escapeHtml(I18n.t('mesh.online'))}</tf-chip>`
@@ -228,8 +227,8 @@ function renderStep2() {
     return `
       <tr>
         <td><input type="checkbox" data-node-id="${escapeAttr(id)}" ${checked} class="cw-node-check"></td>
-        <td><strong>${escapeHtml(n.hostname || id)}</strong>${n.is_local ? ` <tf-chip status="accent">${escapeHtml(I18n.t('mesh.local'))}</tf-chip>` : ''}</td>
-        <td>${n.cpu_count || '—'}</td>
+        <td><strong>${escapeHtml(n.hostname || id)}</strong>${n.isLocal ? ` <tf-chip status="accent">${escapeHtml(I18n.t('mesh.local'))}</tf-chip>` : ''}</td>
+        <td>${n.cpuCount || '—'}</td>
         <td>${ramTotal ? formatMb(ramTotal) : '—'}</td>
         <td>${gpus.length > 0 ? gpus.length : '—'}</td>
         <td>${vramTotal > 0 ? formatMb(vramTotal) : '—'}</td>
@@ -274,14 +273,14 @@ function renderStep2() {
 }
 
 function renderProbeMatrix() {
-  const selected = availableNodes.filter(n => selectedIds.has(n.node_id || n.id));
+  const selected = availableNodes.filter(n => selectedIds.has(n.nodeId));
   if (selected.length < 2) return '';
 
-  const headers = selected.map(n => `<th>${escapeHtml(n.hostname || n.node_id)}</th>`).join('');
+  const headers = selected.map(n => `<th>${escapeHtml(n.hostname || n.nodeId)}</th>`).join('');
   const rows = selected.map((rowN, i) => {
     const cells = selected.map((colN, j) => {
       if (i === j) return '<td class="cell-self">—</td>';
-      const res = findProbeBetween(rowN.node_id || rowN.id, colN.node_id || colN.id);
+      const res = findProbeBetween(rowN.nodeId, colN.nodeId);
       if (!res) {
         return `<td class="cell-pending">${probeInProgress ? escapeHtml(I18n.t('clusters.probing')) : '—'}</td>`;
       }
@@ -293,7 +292,7 @@ function renderProbeMatrix() {
       const cls = bw > 40000 ? 'ok' : (bw > 5000 ? 'warn' : 'slow');
       return `<td class="cell-result ${cls}">${escapeHtml(bwLabel)}</td>`;
     }).join('');
-    return `<tr><th>${escapeHtml(rowN.hostname || rowN.node_id)}</th>${cells}</tr>`;
+    return `<tr><th>${escapeHtml(rowN.hostname || rowN.nodeId)}</th>${cells}</tr>`;
   }).join('');
 
   const summary = renderProbeSummary(selected);
@@ -416,14 +415,14 @@ function updatePrimaryBtn() {
 
 async function startProbe() {
   if (probeInProgress) return;
-  const selected = availableNodes.filter(n => selectedIds.has(n.node_id || n.id));
+  const selected = availableNodes.filter(n => selectedIds.has(n.nodeId));
   if (selected.length < 2) return;
 
   probeInProgress = true;
   probeResults = [];
   refreshBody();
 
-  const nodeIds = selected.map(n => n.node_id || n.id);
+  const nodeIds = selected.map(n => n.nodeId);
 
   try {
     probeUnsub = await ApiBinary.subscribe(
@@ -483,7 +482,7 @@ async function submitCluster() {
   try {
     let clusterId;
     if (editCluster) {
-      clusterId = editCluster.id || editCluster.cluster_id;
+      clusterId = editCluster.id;
       await ApiBinary.action('clusterUpdateRequest', {
         clusterId,
         name: fName.trim(),
@@ -496,7 +495,7 @@ async function submitCluster() {
       });
       // Sync czlonkow: usun ktorych juz nie ma, dodaj nowych.
       const prevIds = new Set(
-        (editCluster.members || editCluster.nodes || []).map(m => m.nodeId || m.node_id || m.id),
+        (editCluster.members || []).map(m => m.nodeId),
       );
       const newIds = new Set(selectedIds);
       for (const pid of prevIds) {
@@ -522,7 +521,7 @@ async function submitCluster() {
         healthCheckIntervalMs: fHealthInterval,
         timeoutMs: fTimeout,
       });
-      clusterId = created.clusterId || created.cluster_id || created.id;
+      clusterId = created.clusterId;
       for (const nid of selectedIds) {
         await addMember(clusterId, nid);
       }
@@ -542,15 +541,15 @@ async function submitCluster() {
 }
 
 async function addMember(clusterId, nodeId) {
-  const node = availableNodes.find(n => (n.node_id || n.id) === nodeId);
-  const ifaces = node && Array.isArray(node.network_interfaces) ? node.network_interfaces : [];
+  const node = availableNodes.find(n => (n.nodeId) === nodeId);
+  const ifaces = node && Array.isArray(node.networkInterfaces) ? node.networkInterfaces : [];
   // Wybierz najszybszy reachable interface (np. z probe) albo pierwszy non-lo.
-  const probeIface = pickBestInterfaceFromProbe(nodeId) || ifaces.find(i => i.ipv4_address && i.name !== 'lo');
+  const probeIface = pickBestInterfaceFromProbe(nodeId) || ifaces.find(i => i.ipv4Address && i.name !== 'lo');
   await ApiBinary.action('clusterAddMemberRequest', {
     clusterId,
     nodeId,
-    interfaceType: probeIface?.rdma_available ? 'rdma' : 'ethernet',
-    interfaceSpeedMbps: probeIface?.speed_mbps || 0,
+    interfaceType: probeIface?.rdmaAvailable ? 'rdma' : 'ethernet',
+    interfaceSpeedMbps: probeIface?.speedMbps || 0,
   });
 }
 
@@ -560,8 +559,8 @@ function pickBestInterfaceFromProbe(nodeId) {
   if (reachable.length === 0) return null;
   const best = reachable.reduce((m, r) => r.bandwidth_mbps > m.bandwidth_mbps ? r : m);
   const ifaceName = best.node_a === nodeId ? best.interface_a : best.interface_b;
-  const node = availableNodes.find(n => (n.node_id || n.id) === nodeId);
-  const ifaces = node && Array.isArray(node.network_interfaces) ? node.network_interfaces : [];
+  const node = availableNodes.find(n => (n.nodeId) === nodeId);
+  const ifaces = node && Array.isArray(node.networkInterfaces) ? node.networkInterfaces : [];
   return ifaces.find(i => i.name === ifaceName) || null;
 }
 

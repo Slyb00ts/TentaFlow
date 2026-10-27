@@ -135,7 +135,7 @@ function renderActiveTab() {
 // Data loaders
 // ---------------------------------------------------------------------------
 async function loadKeys() {
-  keys = await ApiBinary.list('apiKeyListRequest').catch(() => []);
+  keys = await ApiBinary.list('apiKeyListRequest', { arrayKey: 'keys' }).catch(() => []);
   if (!Array.isArray(keys)) keys = [];
 }
 
@@ -143,8 +143,8 @@ async function loadSubjectsAndResources() {
   const [g, u, models, flows, aliases, visionModels, mlProjects, apps, orgList] = await Promise.all([
     ApiBinary.action('iamListGroupsRequest').then((r) => r?.groups ?? []).catch(() => []),
     ApiBinary.action('iamListUsersRequest').then((r) => r?.users ?? []).catch(() => []),
-    ApiBinary.list('modelListRequest').catch(() => []),
-    ApiBinary.list('flowListRequest').catch(() => []),
+    ApiBinary.list('modelListRequest', { arrayKey: 'models' }).catch(() => []),
+    ApiBinary.list('flowListRequest', { arrayKey: 'flows' }).catch(() => []),
     ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
     ApiBinary.one('mlStudioVisionModelsListRequest', {}).then((r) => r?.models ?? []).catch(() => []),
     ApiBinary.one('mlStudioProjectsListRequest').then((r) => r?.projects ?? []).catch(() => []),
@@ -152,15 +152,15 @@ async function loadSubjectsAndResources() {
     ApiBinary.action('iamListOrganizationsRequest').then((r) => r?.orgs ?? []).catch(() => []),
   ]);
   busInstances = (Array.isArray(apps) ? apps : [])
-    .filter((a) => (a.packageId ?? a.package_id) === TENTABUS_PACKAGE_ID)
+    .filter((a) => a.packageId === TENTABUS_PACKAGE_ID)
     .map((a) => {
-      const addonId = String(a.addonId ?? a.addon_id ?? '');
+      const addonId = String(a.addonId ?? '');
       const title = (a.titleKey && I18n.t(a.titleKey) !== a.titleKey && I18n.t(a.titleKey)) || a.title || '';
       return { addonId, title: String(title) };
     })
     .filter((a) => a.addonId && a.title);
   orgs = (Array.isArray(orgList) ? orgList : [])
-    .map((o) => ({ orgId: String(o.orgId ?? o.org_id ?? ''), name: String(o.name ?? '') }))
+    .map((o) => ({ orgId: String(o.orgId ?? ''), name: String(o.name ?? '') }))
     .filter((o) => o.orgId && o.name);
   groups = Array.isArray(g) ? g : [];
   users = Array.isArray(u) ? u : [];
@@ -169,11 +169,11 @@ async function loadSubjectsAndResources() {
   // — the same refs the /models endpoints can serve.
   const bundleStatic = modelBundleScopeResources(t);
   const bundleRegistry = (Array.isArray(visionModels) ? visionModels : [])
-    .map((m) => String(m.modelName ?? m.model_name ?? ''))
+    .map((m) => String(m.modelName ?? ''))
     .filter((name) => name && !bundleStatic.some((b) => b.id === name))
     .map((name) => ({ id: name, name }));
   resources = {
-    model: (models || []).map((m) => ({ id: String(m.id || m.name || ''), name: String(m.name || m.id || '') })),
+    model: (models || []).map((m) => ({ id: String(m.id || ''), name: String(m.id || '') })),
     // Only flows published as a model are callable via /v1, and the resource
     // id must be the published model name (what the catalog + authorizer key
     // on) — NOT the flow UUID. A grant on the UUID would never match a request
@@ -186,7 +186,7 @@ async function loadSubjectsAndResources() {
     // ml_studio_export scopes a general key to ONE project's export archive
     // download — the resource id is the ML Studio project id (v4 UUID).
     ml_studio_export: (Array.isArray(mlProjects) ? mlProjects : [])
-      .map((p) => ({ id: String(p.projectId ?? p.project_id ?? ''), name: String(p.name || p.projectId || p.project_id || '') }))
+      .map((p) => ({ id: String(p.projectId ?? ''), name: String(p.name || p.projectId || '') }))
       .filter((p) => p.id),
   };
 }

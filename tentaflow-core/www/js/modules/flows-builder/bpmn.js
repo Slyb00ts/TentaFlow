@@ -46,7 +46,7 @@ export function processBlockLabel(block) {
   return localized(`bpmn.block_${block.nodeType}`, block.label || block.nodeType);
 }
 
-const SERVICE_TASK_SHAPE = { input_ports: ['in'], output_ports: ['full'], width: 240, height: 96 };
+const SERVICE_TASK_SHAPE = { inputPorts: ['in'], outputPorts: ['full'], width: 240, height: 96 };
 
 function localized(key, fallback) {
   const text = I18n.t(key);
@@ -139,7 +139,7 @@ function toolLabel(tool, withId) {
  */
 function tentaflowTemplates(options) {
   const entry = (subgroup, icon, label, description, preset, row = {}) => ({
-    node_type: 'bpmn_service_task', label, description, icon, category: 'tentaflow',
+    nodeType: 'bpmn_service_task', label, description, icon, category: 'tentaflow',
     subgroup, preset, ...SERVICE_TASK_SHAPE, ...row,
   });
   const tools = options.serviceTools || [];
@@ -242,10 +242,10 @@ export function processAgentPreset(agent) {
 
 export function processTemplates(options) {
   const elements = ELEMENTS.map(([kind, name, icon, group, width, height]) => ({
-    node_type: `bpmn_${name}`, label: I18n.t(`bpmn.node_${name}`),
+    nodeType: `bpmn_${name}`, label: I18n.t(`bpmn.node_${name}`),
     description: I18n.t(`bpmn.node_${name}_hint`), icon, category: group,
-    input_ports: ['Start', 'TimerStart', 'MessageStart', 'LinkCatch', 'BoundaryTimer', 'BoundaryMessage', 'BoundaryError', 'BoundaryEscalation'].includes(kind) ? [] : ['in'],
-    output_ports: ['End', 'ErrorEnd', 'TerminateEnd', 'LinkThrow'].includes(kind) ? [] : ['full'],
+    inputPorts: ['Start', 'TimerStart', 'MessageStart', 'LinkCatch', 'BoundaryTimer', 'BoundaryMessage', 'BoundaryError', 'BoundaryEscalation'].includes(kind) ? [] : ['in'],
+    outputPorts: ['End', 'ErrorEnd', 'TerminateEnd', 'LinkThrow'].includes(kind) ? [] : ['full'],
     width, height,
   }));
   return options ? [...elements, ...tentaflowTemplates(options)] : elements;

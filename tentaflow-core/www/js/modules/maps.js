@@ -72,15 +72,6 @@ function sprite(id) {
   return `<svg class="icon"><use href="#i-${id}"/></svg>`;
 }
 
-// The wasm decoder emits both spellings of every wire field; a row read through
-// one spelling only would be empty for half the payloads.
-function fv(obj, snake) {
-  if (!obj) return undefined;
-  if (obj[snake] !== undefined) return obj[snake];
-  const camel = snake.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
-  return obj[camel];
-}
-
 function formatMs(ms) {
   const n = Number(ms ?? 0);
   if (!Number.isFinite(n) || n <= 0) return '—';
@@ -99,21 +90,21 @@ function shortId(id) {
 }
 
 function localNodeId() {
-  const local = state.nodes.find((n) => fv(n, 'is_local') || n.source === 'local');
-  return String(fv(local, 'node_id') ?? '');
+  const local = state.nodes.find((n) => n?.isLocal || n.source === 'local');
+  return String(local?.nodeId ?? '');
 }
 
 function nodeLabel(nodeId) {
   const id = String(nodeId ?? '');
   if (!id) return t('owner_none');
-  const node = state.nodes.find((n) => String(fv(n, 'node_id') ?? '') === id);
+  const node = state.nodes.find((n) => String(n?.nodeId ?? '') === id);
   const host = String(node?.hostname ?? '').trim();
   return host || shortId(id);
 }
 
 /** The server's own message, or a generic one when it sent none. */
 function errText(resp) {
-  const raw = fv(resp, 'error');
+  const raw = resp?.error;
   const msg = typeof raw === 'string' ? raw.trim() : '';
   return msg || t('error_generic');
 }
@@ -151,7 +142,7 @@ const MapsScreen = {
     await loadSites();
 
     const site = String(params.site ?? '');
-    if (site && state.sites.some((s) => String(fv(s, 'site_id')) === site)) {
+    if (site && state.sites.some((s) => String(s?.siteId) === site)) {
       await openSite(site, { pushUrl: false });
     }
   },
@@ -274,9 +265,9 @@ function renderToolbar() {
 async function loadSites() {
   try {
     const body = await ApiBinary.one('mapSiteListRequest');
-    const granted = new Set((fv(body, 'my_permissions') ?? []).map((p) => String(p)));
+    const granted = new Set((body?.myPermissions ?? []).map((p) => String(p)));
     state.perms = { write: granted.has('map.write'), admin: granted.has('map.admin') };
-    state.sites = fv(body, 'sites') ?? [];
+    state.sites = body?.sites ?? [];
   } catch (e) {
     // A failed read tells us nothing about what the caller may change, so the
     // mutation surfaces go back to hidden rather than staying from last time.
@@ -292,7 +283,7 @@ function visibleSites() {
   const q = state.query.trim().toLowerCase();
   if (!q) return state.sites;
   return state.sites.filter((s) => {
-    const hay = `${fv(s, 'name') ?? ''} ${fv(s, 'address') ?? ''} ${fv(s, 'description') ?? ''}`;
+    const hay = `${s?.name ?? ''} ${s?.address ?? ''} ${s?.description ?? ''}`;
     return hay.toLowerCase().includes(q);
   });
 }
@@ -332,13 +323,13 @@ function renderSites() {
   `;
   const table = byId('maps-sites-table');
   table.rows = rows.map((s) => ({
-    _id: String(fv(s, 'site_id') ?? ''),
-    name: `<div class="tf-table__cell-title">${escapeHtml(String(fv(s, 'name') ?? ''))}</div>`
-      + `<div class="tf-table__cell-sub">${escapeHtml(String(fv(s, 'description') ?? ''))}</div>`,
-    address: String(fv(s, 'address') ?? '') || '—',
-    scenes: Number(fv(s, 'scene_count') ?? 0),
-    devices: Number(fv(s, 'devices_online') ?? 0),
-    updated: formatMs(fv(s, 'last_update_ms') ?? fv(s, 'updated_at_ms')),
+    _id: String(s?.siteId ?? ''),
+    name: `<div class="tf-table__cell-title">${escapeHtml(String(s?.name ?? ''))}</div>`
+      + `<div class="tf-table__cell-sub">${escapeHtml(String(s?.description ?? ''))}</div>`,
+    address: String(s?.address ?? '') || '—',
+    scenes: Number(s?.sceneCount ?? 0),
+    devices: Number(s?.devicesOnline ?? 0),
+    updated: formatMs(s?.lastUpdateMs ?? s?.updatedAtMs),
   }));
   if (state.perms.admin) {
     table.rowActions = (row, _idx, currentRow) => {
@@ -372,11 +363,11 @@ function actionRow(actions) {
 }
 
 function siteById(id) {
-  return state.sites.find((s) => String(fv(s, 'site_id')) === String(id)) ?? null;
+  return state.sites.find((s) => String(s?.siteId) === String(id)) ?? null;
 }
 
 function sceneById(id) {
-  return state.scenes.find((s) => String(fv(s, 'scene_id')) === String(id)) ?? null;
+  return state.scenes.find((s) => String(s?.sceneId) === String(id)) ?? null;
 }
 
 function openSiteWindow(site) {
@@ -386,13 +377,13 @@ function openSiteWindow(site) {
     icon: 'pin',
   });
   body.innerHTML = `
-    <tf-input id="maps-site-name" label="${escapeAttr(t('field_name'))}" value="${escapeAttr(String(fv(site, 'name') ?? ''))}"></tf-input>
-    <tf-textarea id="maps-site-desc" label="${escapeAttr(t('field_description'))}" rows="3">${escapeHtml(String(fv(site, 'description') ?? ''))}</tf-textarea>
-    <tf-input id="maps-site-address" label="${escapeAttr(t('field_address'))}" value="${escapeAttr(String(fv(site, 'address') ?? ''))}"></tf-input>
+    <tf-input id="maps-site-name" label="${escapeAttr(t('field_name'))}" value="${escapeAttr(String(site?.name ?? ''))}"></tf-input>
+    <tf-textarea id="maps-site-desc" label="${escapeAttr(t('field_description'))}" rows="3">${escapeHtml(String(site?.description ?? ''))}</tf-textarea>
+    <tf-input id="maps-site-address" label="${escapeAttr(t('field_address'))}" value="${escapeAttr(String(site?.address ?? ''))}"></tf-input>
     <div class="maps-field-row">
-      <tf-input id="maps-site-lat" label="${escapeAttr(t('field_lat'))}" value="${escapeAttr(numText(fv(site, 'lat')))}"></tf-input>
-      <tf-input id="maps-site-lon" label="${escapeAttr(t('field_lon'))}" value="${escapeAttr(numText(fv(site, 'lon')))}"></tf-input>
-      <tf-input id="maps-site-alt" label="${escapeAttr(t('field_alt'))}" value="${escapeAttr(numText(fv(site, 'alt')))}"></tf-input>
+      <tf-input id="maps-site-lat" label="${escapeAttr(t('field_lat'))}" value="${escapeAttr(numText(site?.lat))}"></tf-input>
+      <tf-input id="maps-site-lon" label="${escapeAttr(t('field_lon'))}" value="${escapeAttr(numText(site?.lon))}"></tf-input>
+      <tf-input id="maps-site-alt" label="${escapeAttr(t('field_alt'))}" value="${escapeAttr(numText(site?.alt))}"></tf-input>
     </div>
   `;
   foot.innerHTML = footerHtml(t('action_save'));
@@ -404,7 +395,7 @@ function openSiteWindow(site) {
     if (!name) { toast(t('error_name_required'), 'warn'); return; }
     const resp = await ApiBinary.action('mapSiteUpsertRequest', {
       site: {
-        siteId: editing ? String(fv(site, 'site_id')) : '',
+        siteId: editing ? String(site?.siteId) : '',
         name,
         description: fieldValue(body, 'maps-site-desc'),
         address: fieldValue(body, 'maps-site-address'),
@@ -413,7 +404,7 @@ function openSiteWindow(site) {
         alt: numberField(body, 'maps-site-alt'),
       },
     }).catch((err) => ({ ok: false, error: err.message }));
-    if (!fv(resp, 'ok')) { toast(errText(resp), 'error'); return; }
+    if (!resp?.ok) { toast(errText(resp), 'error'); return; }
     cleanup();
     toast(t('toast_site_saved'), 'success');
     await loadSites();
@@ -428,7 +419,7 @@ function openSiteDeleteWindow(site) {
   if (!site) return;
   const { body, foot, cleanup } = openWindow({
     title: t('delete_site_title'),
-    subtitle: String(fv(site, 'name') ?? ''),
+    subtitle: String(site?.name ?? ''),
     icon: 'alert',
     width: 480,
   });
@@ -441,9 +432,9 @@ function openSiteDeleteWindow(site) {
     const btn = e.target.closest('[data-action]');
     if (!btn) return;
     if (btn.dataset.action === 'cancel') { cleanup(); return; }
-    const resp = await ApiBinary.action('mapSiteDeleteRequest', { siteId: String(fv(site, 'site_id')) })
+    const resp = await ApiBinary.action('mapSiteDeleteRequest', { siteId: String(site?.siteId) })
       .catch((err) => ({ ok: false, error: err.message }));
-    if (!fv(resp, 'ok')) {
+    if (!resp?.ok) {
       const box = body.querySelector('#maps-site-del-error');
       box.textContent = errText(resp);
       box.hidden = false;
@@ -495,7 +486,7 @@ async function loadScenes() {
   // Keep the selected scene only while it still exists, otherwise fall back to
   // the first one so the devices panel is never bound to a deleted scene.
   if (!state.sceneId || !sceneById(state.sceneId)) {
-    state.sceneId = state.scenes.length ? String(fv(state.scenes[0], 'scene_id')) : null;
+    state.sceneId = state.scenes.length ? String(state.scenes[0]?.sceneId) : null;
   }
   renderSiteView();
   if (state.sceneId) await loadDevices();
@@ -519,7 +510,7 @@ function renderSiteView() {
   const view = byId('maps-site-view');
   if (!view) return;
   const site = siteById(state.siteId);
-  const name = String(fv(site, 'name') ?? '');
+  const name = String(site?.name ?? '');
 
   view.innerHTML = `
     <tf-breadcrumb id="maps-crumbs">
@@ -529,7 +520,7 @@ function renderSiteView() {
     <div class="page-header">
       <div>
         <h1>${sprite('pin')} ${escapeHtml(name)}</h1>
-        <div class="sub">${escapeHtml(String(fv(site, 'address') ?? '') || t('site_no_address'))}</div>
+        <div class="sub">${escapeHtml(String(site?.address ?? '') || t('site_no_address'))}</div>
       </div>
     </div>
     <div class="tf-toolbar">
@@ -585,27 +576,27 @@ function renderScenes() {
   const table = byId('maps-scenes-table');
   const local = localNodeId();
   table.rows = state.scenes.map((s) => {
-    const ownerId = String(fv(s, 'owner_node_id') ?? '');
+    const ownerId = String(s?.ownerNodeId ?? '');
     const isLocal = !!ownerId && ownerId === local;
-    const online = !!fv(s, 'owner_online');
-    const hasGeo = fv(s, 'geo_lat') !== null && fv(s, 'geo_lat') !== undefined;
-    const sceneId = String(fv(s, 'scene_id') ?? '');
+    const online = !!s?.ownerOnline;
+    const hasGeo = s?.geoLat !== null && s?.geoLat !== undefined;
+    const sceneId = String(s?.sceneId ?? '');
     return {
       _id: sceneId,
       _class: sceneId === state.sceneId ? 'selected' : '',
-      name: `<div class="tf-table__cell-title">${escapeHtml(String(fv(s, 'name') ?? ''))}</div>`
+      name: `<div class="tf-table__cell-title">${escapeHtml(String(s?.name ?? ''))}</div>`
         + `<div class="tf-table__cell-sub">${escapeHtml(shortId(sceneId))}</div>`,
       owner: `<div class="tf-table__cell-title">${escapeHtml(nodeLabel(ownerId))}</div>`
         + `<div class="tf-table__cell-sub">${escapeHtml(
           `${isLocal ? t('owner_this_node') : t('owner_remote_node')} · ${online ? t('owner_online') : t('owner_offline')}`,
         )}</div>`,
-      res: t('resolution_value', { m: fv(s, 'voxel_res_m') ?? DEFAULT_VOXEL_RES_M }),
+      res: t('resolution_value', { m: s?.voxelResM ?? DEFAULT_VOXEL_RES_M }),
       geometry: t('geometry_value', {
-        chunks: formatNum(fv(s, 'chunks')),
-        voxels: formatNum(fv(s, 'voxels')),
+        chunks: formatNum(s?.chunks),
+        voxels: formatNum(s?.voxels),
       }),
       geo: hasGeo ? { status: 'ok', label: t('geo_set') } : { status: 'info', label: t('geo_missing') },
-      updated: formatMs(fv(s, 'last_update_ms') ?? fv(s, 'updated_at_ms')),
+      updated: formatMs(s?.lastUpdateMs ?? s?.updatedAtMs),
     };
   });
   if (state.perms.admin) {
@@ -634,12 +625,12 @@ function openSceneWindow(scene) {
     title: editing ? t('scene_edit_title') : t('scene_new_title'),
     icon: 'layers',
   });
-  const ownerId = editing ? String(fv(scene, 'owner_node_id') ?? '') : localNodeId();
+  const ownerId = editing ? String(scene?.ownerNodeId ?? '') : localNodeId();
   body.innerHTML = `
-    <tf-input id="maps-scene-name" label="${escapeAttr(t('field_name'))}" value="${escapeAttr(String(fv(scene, 'name') ?? ''))}"></tf-input>
+    <tf-input id="maps-scene-name" label="${escapeAttr(t('field_name'))}" value="${escapeAttr(String(scene?.name ?? ''))}"></tf-input>
     <div class="maps-field-row">
-      <tf-input id="maps-scene-res" label="${escapeAttr(t('field_voxel_res'))}" value="${escapeAttr(String(fv(scene, 'voxel_res_m') ?? DEFAULT_VOXEL_RES_M))}"></tf-input>
-      <tf-input id="maps-scene-max" label="${escapeAttr(t('field_max_voxels'))}" value="${escapeAttr(String(fv(scene, 'max_voxels') ?? 0))}"></tf-input>
+      <tf-input id="maps-scene-res" label="${escapeAttr(t('field_voxel_res'))}" value="${escapeAttr(String(scene?.voxelResM ?? DEFAULT_VOXEL_RES_M))}"></tf-input>
+      <tf-input id="maps-scene-max" label="${escapeAttr(t('field_max_voxels'))}" value="${escapeAttr(String(scene?.maxVoxels ?? 0))}"></tf-input>
     </div>
     ${nodeSelectHtml('maps-scene-owner', ownerId)}
   `;
@@ -652,7 +643,7 @@ function openSceneWindow(scene) {
     if (!name) { toast(t('error_name_required'), 'warn'); return; }
     const resp = await ApiBinary.action('mapSceneUpsertRequest', {
       scene: {
-        sceneId: editing ? String(fv(scene, 'scene_id')) : '',
+        sceneId: editing ? String(scene?.sceneId) : '',
         siteId: state.siteId,
         name,
         voxelResM: numberField(body, 'maps-scene-res') ?? DEFAULT_VOXEL_RES_M,
@@ -660,13 +651,13 @@ function openSceneWindow(scene) {
         maxVoxels: numberField(body, 'maps-scene-max') ?? 0,
         // Georeference has its own action: editing a scene must not silently
         // clear an anchor the operator set from the map.
-        geoLat: fv(scene, 'geo_lat') ?? null,
-        geoLon: fv(scene, 'geo_lon') ?? null,
-        geoAlt: fv(scene, 'geo_alt') ?? null,
-        geoHeading: fv(scene, 'geo_heading') ?? null,
+        geoLat: scene?.geoLat ?? null,
+        geoLon: scene?.geoLon ?? null,
+        geoAlt: scene?.geoAlt ?? null,
+        geoHeading: scene?.geoHeading ?? null,
       },
     }).catch((err) => ({ ok: false, error: err.message }));
-    if (!fv(resp, 'ok')) { toast(errText(resp), 'error'); return; }
+    if (!resp?.ok) { toast(errText(resp), 'error'); return; }
     cleanup();
     toast(t('toast_scene_saved'), 'success');
     await loadScenes();
@@ -676,13 +667,13 @@ function openSceneWindow(scene) {
 
 function nodeSelectHtml(id, selected) {
   const options = state.nodes.map((n) => {
-    const nid = String(fv(n, 'node_id') ?? '');
-    const label = `${nodeLabel(nid)}${fv(n, 'is_local') || n.source === 'local' ? ` · ${t('owner_this_node')}` : ''}`;
+    const nid = String(n?.nodeId ?? '');
+    const label = `${nodeLabel(nid)}${n?.isLocal || n.source === 'local' ? ` · ${t('owner_this_node')}` : ''}`;
     return `<option value="${escapeAttr(nid)}"${nid === selected ? ' selected' : ''}>${escapeHtml(label)}</option>`;
   }).join('');
   // A node the mesh list does not carry (an owner that went away) still has to
   // stay selectable as the current value, so it is added explicitly.
-  const known = state.nodes.some((n) => String(fv(n, 'node_id') ?? '') === selected);
+  const known = state.nodes.some((n) => String(n?.nodeId ?? '') === selected);
   const extra = selected && !known
     ? `<option value="${escapeAttr(selected)}" selected>${escapeHtml(shortId(selected))}</option>`
     : '';
@@ -693,12 +684,12 @@ function openOwnerWindow(scene) {
   if (!scene) return;
   const { body, foot, cleanup } = openWindow({
     title: t('owner_title'),
-    subtitle: String(fv(scene, 'name') ?? ''),
+    subtitle: String(scene?.name ?? ''),
     icon: 'network',
   });
   body.innerHTML = `
     <div class="maps-danger">${sprite('alert')}<span>${escapeHtml(t('owner_warning'))}</span></div>
-    ${nodeSelectHtml('maps-owner-node', String(fv(scene, 'owner_node_id') ?? ''))}
+    ${nodeSelectHtml('maps-owner-node', String(scene?.ownerNodeId ?? ''))}
     <div class="maps-error" id="maps-owner-error" hidden></div>
   `;
   foot.innerHTML = footerHtml(t('action_save'));
@@ -712,11 +703,11 @@ function openOwnerWindow(scene) {
     // owner is unreachable means losing what it has not replicated, and P0 has
     // no window that states that loss — the server refusal is surfaced instead.
     const resp = await ApiBinary.action('mapSceneSetOwnerRequest', {
-      sceneId: String(fv(scene, 'scene_id')),
+      sceneId: String(scene?.sceneId),
       nodeId,
       acceptLoss: false,
     }).catch((err) => ({ ok: false, error: err.message }));
-    if (!fv(resp, 'ok')) {
+    if (!resp?.ok) {
       const box = body.querySelector('#maps-owner-error');
       box.textContent = errText(resp);
       box.hidden = false;
@@ -732,18 +723,18 @@ function openGeoWindow(scene) {
   if (!scene) return;
   const { body, foot, cleanup } = openWindow({
     title: t('geo_title'),
-    subtitle: String(fv(scene, 'name') ?? ''),
+    subtitle: String(scene?.name ?? ''),
     icon: 'globe',
   });
   body.innerHTML = `
     <div class="maps-hint">${escapeHtml(t('geo_hint'))}</div>
     <div class="maps-field-row">
-      <tf-input id="maps-geo-lat" label="${escapeAttr(t('field_lat'))}" value="${escapeAttr(numText(fv(scene, 'geo_lat')))}"></tf-input>
-      <tf-input id="maps-geo-lon" label="${escapeAttr(t('field_lon'))}" value="${escapeAttr(numText(fv(scene, 'geo_lon')))}"></tf-input>
+      <tf-input id="maps-geo-lat" label="${escapeAttr(t('field_lat'))}" value="${escapeAttr(numText(scene?.geoLat))}"></tf-input>
+      <tf-input id="maps-geo-lon" label="${escapeAttr(t('field_lon'))}" value="${escapeAttr(numText(scene?.geoLon))}"></tf-input>
     </div>
     <div class="maps-field-row">
-      <tf-input id="maps-geo-alt" label="${escapeAttr(t('field_alt'))}" value="${escapeAttr(numText(fv(scene, 'geo_alt')))}"></tf-input>
-      <tf-input id="maps-geo-heading" label="${escapeAttr(t('field_heading'))}" value="${escapeAttr(numText(fv(scene, 'geo_heading')))}"></tf-input>
+      <tf-input id="maps-geo-alt" label="${escapeAttr(t('field_alt'))}" value="${escapeAttr(numText(scene?.geoAlt))}"></tf-input>
+      <tf-input id="maps-geo-heading" label="${escapeAttr(t('field_heading'))}" value="${escapeAttr(numText(scene?.geoHeading))}"></tf-input>
     </div>
     <div class="maps-error" id="maps-geo-error" hidden></div>
   `;
@@ -753,13 +744,13 @@ function openGeoWindow(scene) {
     if (!btn) return;
     if (btn.dataset.action === 'cancel') { cleanup(); return; }
     const resp = await ApiBinary.action('mapSceneGeoAnchorSetRequest', {
-      sceneId: String(fv(scene, 'scene_id')),
+      sceneId: String(scene?.sceneId),
       lat: numberField(body, 'maps-geo-lat'),
       lon: numberField(body, 'maps-geo-lon'),
       alt: numberField(body, 'maps-geo-alt'),
       heading: numberField(body, 'maps-geo-heading'),
     }).catch((err) => ({ ok: false, error: err.message }));
-    if (!fv(resp, 'ok')) {
+    if (!resp?.ok) {
       const box = body.querySelector('#maps-geo-error');
       box.textContent = errText(resp);
       box.hidden = false;
@@ -780,7 +771,7 @@ function openSceneDeleteWindow(scene) {
   if (!scene) return;
   const { body, foot, cleanup } = openWindow({
     title: t('delete_scene_title'),
-    subtitle: String(fv(scene, 'name') ?? ''),
+    subtitle: String(scene?.name ?? ''),
     icon: 'alert',
     width: 520,
   });
@@ -793,10 +784,10 @@ function openSceneDeleteWindow(scene) {
 
   const send = async (force) => {
     const resp = await ApiBinary.action('mapSceneDeleteRequest', {
-      sceneId: String(fv(scene, 'scene_id')),
+      sceneId: String(scene?.sceneId),
       force,
     }).catch((err) => ({ ok: false, error: err.message }));
-    if (fv(resp, 'ok')) {
+    if (resp?.ok) {
       cleanup();
       toast(t('toast_scene_deleted'), 'success');
       await loadScenes();
@@ -835,7 +826,7 @@ function renderDevices() {
 
   host.innerHTML = `
     <div class="tf-toolbar">
-      <h2 class="maps-section-title">${escapeHtml(t('devices_title', { scene: String(fv(scene, 'name') ?? '') }))}</h2>
+      <h2 class="maps-section-title">${escapeHtml(t('devices_title', { scene: String(scene?.name ?? '') }))}</h2>
       <span class="tf-toolbar-spacer"></span>
       ${state.perms.write
         ? `<tf-button variant="primary" icon="plus" id="maps-assign">${escapeHtml(t('action_assign'))}</tf-button>`
@@ -859,20 +850,20 @@ function renderDevices() {
   const table = byId('maps-devices-table');
   if (!table) return;
   table.rows = placed.map((d) => {
-    const nodeId = String(fv(d, 'node_id') ?? '');
-    const deviceId = String(fv(d, 'device_id') ?? '');
-    const st = String(fv(d, 'state') ?? '');
-    const placement = fv(d, 'placement');
-    const method = String(fv(placement, 'method') ?? '');
-    const drift = fv(d, 'drift_estimate_m');
+    const nodeId = String(d?.nodeId ?? '');
+    const deviceId = String(d?.deviceId ?? '');
+    const st = String(d?.state ?? '');
+    const placement = d?.placement;
+    const method = String(placement?.method ?? '');
+    const drift = d?.driftEstimateM;
     return {
       _id: `${nodeId}|${deviceId}`,
-      device: `<div class="tf-table__cell-title">${escapeHtml(String(fv(d, 'display_name') ?? '') || deviceId)}</div>`
+      device: `<div class="tf-table__cell-title">${escapeHtml(String(d?.displayName ?? '') || deviceId)}</div>`
         + `<div class="tf-table__cell-sub">${escapeHtml(`${nodeLabel(nodeId)} · ${deviceId}`)}</div>`,
       state: { status: DEVICE_STATE_CHIP[st] ?? 'info', label: deviceStateLabel(st) },
       method: method ? methodLabel(method) : '—',
       drift: drift === null || drift === undefined ? '—' : t('drift_value', { m: Number(drift).toFixed(2) }),
-      frame: formatMs(fv(d, 'last_frame_ms')),
+      frame: formatMs(d?.lastFrameMs),
     };
   });
   if (state.perms.write) {
@@ -897,7 +888,7 @@ async function unassignDevice(key) {
   const [nodeId, deviceId] = String(key).split('|');
   const resp = await ApiBinary.action('mapDeviceUnassignRequest', { nodeId, deviceId })
     .catch((err) => ({ ok: false, error: err.message }));
-  if (!fv(resp, 'ok')) { toast(errText(resp), 'error'); return; }
+  if (!resp?.ok) { toast(errText(resp), 'error'); return; }
   toast(t('toast_device_unassigned'), 'success');
   await loadDevices();
   await loadSites();
@@ -915,7 +906,7 @@ async function openAssignWindow() {
   // another scene is, because assigning moves it (the server is the authority
   // on whether that move is allowed).
   const all = await ApiBinary.list('mapDeviceListRequest', { arrayKey: 'devices' }).catch(() => []);
-  const candidates = all.filter((d) => String(fv(d, 'scene_id') ?? '') !== String(state.sceneId));
+  const candidates = all.filter((d) => String(d?.sceneId ?? '') !== String(state.sceneId));
   if (candidates.length === 0) {
     body.innerHTML = `<div class="maps-hint">${escapeHtml(t('assign_none_available'))}</div>`;
     foot.querySelector('[data-action="confirm"]')?.setAttribute('disabled', '');
@@ -923,9 +914,9 @@ async function openAssignWindow() {
     body.innerHTML = `
       <tf-select id="maps-assign-device" label="${escapeAttr(t('field_device'))}">
         ${candidates.map((d) => {
-          const nodeId = String(fv(d, 'node_id') ?? '');
-          const deviceId = String(fv(d, 'device_id') ?? '');
-          const label = `${String(fv(d, 'display_name') ?? '') || deviceId} · ${nodeLabel(nodeId)}`;
+          const nodeId = String(d?.nodeId ?? '');
+          const deviceId = String(d?.deviceId ?? '');
+          const label = `${String(d?.displayName ?? '') || deviceId} · ${nodeLabel(nodeId)}`;
           return `<option value="${escapeAttr(`${nodeId}|${deviceId}`)}">${escapeHtml(label)}</option>`;
         }).join('')}
       </tf-select>
@@ -944,7 +935,7 @@ async function openAssignWindow() {
       nodeId,
       deviceId,
     }).catch((err) => ({ ok: false, error: err.message }));
-    if (!fv(resp, 'ok')) {
+    if (!resp?.ok) {
       const box = body.querySelector('#maps-assign-error');
       if (box) { box.textContent = errText(resp); box.hidden = false; }
       else toast(errText(resp), 'error');

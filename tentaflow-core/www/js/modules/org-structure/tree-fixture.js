@@ -29,22 +29,22 @@ export const t = (key) => ({ vacancy: 'vacancy', unknown_person: 'unknown' })[ke
 
 function unit(id, name, parent, head, extra = {}) {
   return {
-    id: `v-${id}`, unit_id: id, name, code: null, type_id: null, parent_unit_id: parent, color: null,
-    head_position_id: head, deputy_head_position_ids: [], valid_from: '2026-01-01', ...extra,
+    id: `v-${id}`, unitId: id, name, code: null, typeId: null, parentUnitId: parent, color: null,
+    headPositionId: head, deputyHeadPositionIds: [], validFrom: '2026-01-01', ...extra,
   };
 }
 
 function position(id, unitId, name, parent, extra = {}) {
   return {
-    id: `v-${id}`, position_id: id, unit_id: unitId, name, primary_parent_position_id: parent,
-    functional_parent_position_ids: [], is_staff: false, valid_from: '2026-01-01', ...extra,
+    id: `v-${id}`, positionId: id, unitId: unitId, name, primaryParentPositionId: parent,
+    functionalParentPositionIds: [], isStaff: false, validFrom: '2026-01-01', ...extra,
   };
 }
 
 function holder(positionId, key, name, extra = {}) {
   return {
-    id: `a-${positionId}-${key}`, position_id: positionId, subject: { kind: key === 'me' ? 'user' : 'external', id: key === 'me' ? ME : key },
-    assignment_type: 'permanent', share: 1, is_primary: true, valid_from: '2026-01-01', display_name: name, ...extra,
+    id: `a-${positionId}-${key}`, positionId: positionId, subject: { kind: key === 'me' ? 'user' : 'external', id: key === 'me' ? ME : key },
+    assignmentType: 'permanent', share: 1, isPrimary: true, validFrom: '2026-01-01', displayName: name, ...extra,
   };
 }
 
@@ -52,20 +52,20 @@ function holder(positionId, key, name, extra = {}) {
 export function sampleView() {
   const units = [
     unit('u-board', 'Zarząd', null, 'p-ceo'),
-    unit('u-tech', 'Technologia', 'u-board', 'p-cto', { deputy_head_position_ids: ['p-cto-deputy'] }),
+    unit('u-tech', 'Technologia', 'u-board', 'p-cto', { deputyHeadPositionIds: ['p-cto-deputy'] }),
     unit('u-delivery', 'Realizacja', 'u-tech', 'p-delivery'),
     unit('u-sales', 'Handlowy', 'u-board', 'p-sales'),
     unit('u-fin', 'Finanse', 'u-board', 'p-fin'),
   ];
   const positions = [
     position('p-ceo', 'u-board', 'Prezes Zarządu', null),
-    position('p-assistant', 'u-board', 'Asystentka Zarządu', 'p-ceo', { is_staff: true }),
+    position('p-assistant', 'u-board', 'Asystentka Zarządu', 'p-ceo', { isStaff: true }),
     position('p-cto', 'u-tech', 'Dyrektor Technologii', 'p-ceo'),
     position('p-cto-deputy', 'u-tech', 'Zastępca dyrektora', 'p-cto'),
     position('p-delivery', 'u-delivery', 'Dyrektor Realizacji', 'p-cto'),
     position('p-lead', 'u-delivery', 'Kierownik zespołu', 'p-delivery'),
     position('p-lead-deputy', 'u-delivery', 'Zastępca kierownika', 'p-lead'),
-    position('p-dev1', 'u-delivery', 'Developer', 'p-lead', { functional_parent_position_ids: ['p-sales'] }),
+    position('p-dev1', 'u-delivery', 'Developer', 'p-lead', { functionalParentPositionIds: ['p-sales'] }),
     position('p-dev2', 'u-delivery', 'Developer', 'p-lead'),
     position('p-tester', 'u-delivery', 'Tester', 'p-lead'),
     position('p-tester-auto', 'u-delivery', 'Tester automatyzujący', 'p-lead'),
@@ -82,24 +82,24 @@ export function sampleView() {
     holder('p-cto-deputy', 'b-sikora', 'Beata Sikora'),
     holder('p-delivery', 'm-kaminska', 'Magdalena Kamińska'),
     holder('p-lead', 'me', 'Anna Kowalska'),
-    holder('p-lead-deputy', 'p-szymanski', 'Paweł Szymański', { assignment_type: 'acting' }),
+    holder('p-lead-deputy', 'p-szymanski', 'Paweł Szymański', { assignmentType: 'acting' }),
     holder('p-dev1', 'm-nowak', 'Marek Nowak'),
     holder('p-dev2', 'p-zielinski', 'Piotr Zieliński'),
     holder('p-tester', 'e-wisniewska', 'Ewa Wiśniewska'),
     holder('p-sales', 'm-zajac', 'Michał Zając'),
     holder('p-sales-1', 'a-lis', 'Aneta Lis'),
-    holder('p-sales-2', 'm-nowak', 'Marek Nowak', { is_primary: false }),
+    holder('p-sales-2', 'm-nowak', 'Marek Nowak', { isPrimary: false }),
     holder('p-fin', 'j-pawlak', 'Joanna Pawlak'),
     holder('p-fin-1', 'r-kot', 'Renata Kot'),
   ];
-  const occupied = new Set(assignments.map((a) => a.position_id));
+  const occupied = new Set(assignments.map((a) => a.positionId));
   return {
     at: '2026-09-30',
     timezone: 'Europe/Warsaw',
     units,
     positions,
     assignments,
-    vacancies: positions.filter((p) => !occupied.has(p.position_id)).map((p) => p.position_id),
+    vacancies: positions.filter((p) => !occupied.has(p.positionId)).map((p) => p.positionId),
     warnings: [],
   };
 }
@@ -135,14 +135,14 @@ export function syntheticView(people, fanout = 6) {
       made += 1;
     }
   }
-  const occupied = new Set(assignments.map((a) => a.position_id));
+  const occupied = new Set(assignments.map((a) => a.positionId));
   return {
     at: '2026-09-30',
     timezone: 'Europe/Warsaw',
     units,
     positions,
     assignments,
-    vacancies: positions.filter((p) => !occupied.has(p.position_id)).map((p) => p.position_id),
+    vacancies: positions.filter((p) => !occupied.has(p.positionId)).map((p) => p.positionId),
     warnings: [],
   };
 }
@@ -180,14 +180,14 @@ export function realisticView(people) {
       made += 1;
     }
   }
-  const occupied = new Set(assignments.map((a) => a.position_id));
+  const occupied = new Set(assignments.map((a) => a.positionId));
   return {
     at: '2026-09-30',
     timezone: 'Europe/Warsaw',
     units,
     positions,
     assignments,
-    vacancies: positions.filter((p) => !occupied.has(p.position_id)).map((p) => p.position_id),
+    vacancies: positions.filter((p) => !occupied.has(p.positionId)).map((p) => p.positionId),
     warnings: [],
   };
 }

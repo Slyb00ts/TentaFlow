@@ -379,9 +379,9 @@ async function catchUp(firstPage) {
     guard += 1;
     const events = page.events || [];
     for (const ev of events) backlog.push(ev);
-    const next = Number(page.next_seq ?? page.nextSeq ?? 0);
+    const next = Number(page.nextSeq ?? 0);
     if (next > cursor) cursor = next;
-    const hasMore = !!(page.has_more ?? page.hasMore) && events.length > 0;
+    const hasMore = !!page.hasMore && events.length > 0;
     if (!hasMore) break;
     try {
       page = await ApiBinary.one('codeStudioSessionTimelineRequest', {

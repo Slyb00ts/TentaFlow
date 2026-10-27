@@ -30,19 +30,10 @@ function t(key, vars) { return I18n.t(`events.${key}`, vars ?? null); }
 // Wire rows
 // -----------------------------------------------------------------------------
 
-/**
- * The decoders emit camelCase for some bodies and both spellings for others, so
- * a row is read through both names once and never again.
- */
-function field(raw, camel, snake) {
-  const v = raw[camel] ?? raw[snake];
-  return v === undefined ? null : v;
-}
-
 export function normalizeRow(raw) {
-  const runId = String(field(raw, 'runId', 'run_id') ?? '');
-  const seq = Number(field(raw, 'seq', 'seq') ?? 0);
-  const payloadJson = String(field(raw, 'payloadJson', 'payload_json') ?? '');
+  const runId = String(raw.runId ?? '');
+  const seq = Number(raw.seq ?? 0);
+  const payloadJson = String(raw.payloadJson ?? '');
   let payload = null;
   try {
     payload = payloadJson ? JSON.parse(payloadJson) : null;
@@ -55,17 +46,17 @@ export function normalizeRow(raw) {
     key: `${runId}#${seq}`,
     runId,
     seq,
-    atMs: Number(field(raw, 'atMs', 'at_ms') ?? 0),
-    kind: String(field(raw, 'kind', 'kind') ?? ''),
-    origin: String(field(raw, 'origin', 'origin') ?? ''),
-    actorKind: String(field(raw, 'actorKind', 'actor_kind') ?? ''),
-    actorId: field(raw, 'actorId', 'actor_id'),
-    actorUserId: field(raw, 'actorUserId', 'actor_user_id'),
-    orgId: field(raw, 'orgId', 'org_id'),
-    correlationId: field(raw, 'correlationId', 'correlation_id'),
-    sessionId: field(raw, 'sessionId', 'session_id'),
-    nodeId: field(raw, 'nodeId', 'node_id'),
-    callId: field(raw, 'callId', 'call_id'),
+    atMs: Number(raw.atMs ?? 0),
+    kind: String(raw.kind ?? ''),
+    origin: String(raw.origin ?? ''),
+    actorKind: String(raw.actorKind ?? ''),
+    actorId: raw.actorId ?? null,
+    actorUserId: raw.actorUserId ?? null,
+    orgId: raw.orgId ?? null,
+    correlationId: raw.correlationId ?? null,
+    sessionId: raw.sessionId ?? null,
+    nodeId: raw.nodeId ?? null,
+    callId: raw.callId ?? null,
     payload,
     payloadJson,
     // Filled by deriveTimeline().

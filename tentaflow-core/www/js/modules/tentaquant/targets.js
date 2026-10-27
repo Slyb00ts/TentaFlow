@@ -36,8 +36,8 @@ export function targetByValue(targets, value) {
 /// One option's text: what the target is, how wide it goes, and — when it is
 /// refused — the server's own words for why.
 export function targetLabel(target) {
-  const q = Number(target.maxQubits ?? target.max_qubits) || 0;
-  const node = target.nodeName || target.node_name || target.nodeId || target.node_id || '';
+  const q = Number(target.maxQubits) || 0;
+  const node = target.nodeName || target.nodeId || '';
   const base = String(target.tier) === 'T0'
     ? T('targets.browser', { q })
     : T('targets.core', { node, q });
@@ -77,8 +77,8 @@ export function chooseTarget(targets, wanted) {
 export function resolvedNodeName(resolution, targets) {
   if (String(resolution.tier || '') === 'T0') return T('targets.node_browser');
   const found = targetByValue(targets, resolution.target);
-  const name = found && (found.nodeName || found.node_name);
-  return name || shortId(resolution.nodeId ?? resolution.node_id);
+  const name = found && found.nodeName;
+  return name || shortId(resolution.nodeId);
 }
 
 /// The hint under the select. Only `auto` has one: a named target IS its own

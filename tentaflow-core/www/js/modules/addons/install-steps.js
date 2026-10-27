@@ -177,7 +177,12 @@ export function openInstallSteps({ addonId, packageName, steps, onClose }) {
         stepId: step.id,
         values,
       });
-      outcome = { status: res.status, message: res.message || '', details: res.details || [] };
+      // The wire carries the Rust variant name ("Ok") and details as name/value pairs.
+      outcome = {
+        status: String(res.status).toLowerCase(),
+        message: res.message || '',
+        details: (res.details || []).map(([name, value]) => ({ name, value })),
+      };
     } catch (err) {
       outcome = { status: 'failed', message: err.message || String(err), details: [] };
     }

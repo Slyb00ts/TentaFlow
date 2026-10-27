@@ -21,7 +21,7 @@ export async function runOAuthPopup({ addon_id, provider_id, mode, accountIdForR
         mode: mode || 'individual',
       });
 
-  const url = resp.authorizeUrl || resp.authorize_url;
+  const url = resp.authorizeUrl;
   if (!url) throw new Error('missing authorize_url');
 
   const popup = window.open(url, 'tf-oauth', 'width=560,height=680,scrollbars=yes,resizable=yes');

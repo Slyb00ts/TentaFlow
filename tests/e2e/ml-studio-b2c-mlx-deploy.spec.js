@@ -25,7 +25,7 @@ async function shot(page, f) { await page.screenshot({ path: `${SHOT}/${f}`, ful
   fs.mkdirSync(SHOT, { recursive: true });
   const errs = [];
   const browser = await chromium.launch({ headless: true });
-  const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1440, height: 900 } });
+  const ctx = await browser.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: { width: 1440, height: 900 } });
   const page = await ctx.newPage();
   page.on('console', (m) => { if (m.type() === 'error') errs.push(m.text()); });
   page.on('pageerror', (e) => errs.push('pageerror: ' + e.message));

@@ -107,77 +107,22 @@ pub fn open_addon_db(org_id: &str, addon_id: &str) -> Result<AddonDbPool, AbiErr
 
     let db_path = addon_db_path(org_id, addon_id)?;
 
+    // The pool opens its connections concurrently on r2d2 helper threads. Switching
+    // the file to WAL and running the schema DDL there made them race for the
+    // exclusive lock, and SQLite answers that kind of contention with an immediate
+    // "database is locked" that the busy handler never sees. The file-level setup
+    // therefore runs once on a single connection before the pool exists.
+    bootstrap_addon_db(&db_path).map_err(|_| AbiError::Operation)?;
+
     let manager = SqliteConnectionManager::file(&db_path)
         .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE)
         .with_init(|conn| {
-            // PRAGMAs ustawione raz przy kazdym nowym connection w pool.
-            // WAL zapewnia jednoczesny reader+writer; foreign_keys default
-            // OFF w SQLite — musimy wlaczyc per-connection.
-            conn.pragma_update(None, "journal_mode", "WAL")?;
+            // Busy handler first, so every later statement of the initialiser waits
+            // for a lock instead of failing. Only per-connection settings remain here.
+            conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
             conn.pragma_update(None, "synchronous", "NORMAL")?;
             conn.pragma_update(None, "temp_store", "MEMORY")?;
-            conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)?;
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS __tentaflow_sync_captures (
-                    capture_id TEXT PRIMARY KEY,
-                    org_id TEXT NOT NULL,
-                    addon_id TEXT NOT NULL,
-                    table_name TEXT NOT NULL,
-                    action TEXT NOT NULL CHECK(action IN ('insert','update','delete')),
-                    resource_type TEXT NOT NULL,
-                    resource_id TEXT NOT NULL,
-                    query TEXT NOT NULL,
-                    params_json TEXT NOT NULL,
-                    rows_affected INTEGER NOT NULL,
-                    last_insert_id INTEGER NOT NULL,
-                    actor_user_id TEXT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ledgered','error')),
-                    operation_id TEXT NULL,
-                    error_message TEXT NULL,
-                    created_at_ms INTEGER NOT NULL,
-                    ledgered_at_ms INTEGER NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_tentaflow_sync_captures_status
-                    ON __tentaflow_sync_captures(status, created_at_ms);
-                CREATE TABLE IF NOT EXISTS __tentaflow_sync_applied (
-                    operation_id TEXT PRIMARY KEY,
-                    applied_at_ms INTEGER NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS __tentaflow_sync_conflicts (
-                    operation_id TEXT PRIMARY KEY,
-                    org_id TEXT NOT NULL,
-                    addon_id TEXT NOT NULL,
-                    table_name TEXT NOT NULL,
-                    resource_type TEXT NOT NULL,
-                    resource_id TEXT NOT NULL,
-                    action TEXT NOT NULL,
-                    source_node_id TEXT NOT NULL,
-                    error_kind TEXT NOT NULL,
-                    error_message TEXT NOT NULL,
-                    capture_json TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','resolved','ignored','superseded')),
-                    created_at_ms INTEGER NOT NULL,
-                    resolved_at_ms INTEGER NULL,
-                    resolution TEXT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_tentaflow_sync_conflicts_status
-                    ON __tentaflow_sync_conflicts(status, created_at_ms);
-                CREATE INDEX IF NOT EXISTS idx_tentaflow_sync_conflicts_resource
-                    ON __tentaflow_sync_conflicts(resource_type, resource_id);",
-            )?;
-            let has_operation_id = conn
-                .prepare("PRAGMA table_info(__tentaflow_sync_captures)")?
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()?
-                .iter()
-                .any(|name| name == "operation_id");
-            if !has_operation_id {
-                conn.execute(
-                    "ALTER TABLE __tentaflow_sync_captures ADD COLUMN operation_id TEXT NULL",
-                    [],
-                )?;
-            }
             Ok(())
         });
 
@@ -190,6 +135,78 @@ pub fn open_addon_db(org_id: &str, addon_id: &str) -> Result<AddonDbPool, AbiErr
     let pool = AddonDbPool { inner };
     registry().insert(key, pool.clone());
     Ok(pool)
+}
+
+/// One-time, file-level setup of an addon database: WAL (a property of the file,
+/// not of a connection) and the sync bookkeeping tables.
+fn bootstrap_addon_db(db_path: &std::path::Path) -> rusqlite::Result<()> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    )?;
+    conn.pragma_update(None, "busy_timeout", SQLITE_BUSY_TIMEOUT_MS)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS __tentaflow_sync_captures (
+            capture_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            addon_id TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            action TEXT NOT NULL CHECK(action IN ('insert','update','delete')),
+            resource_type TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            query TEXT NOT NULL,
+            params_json TEXT NOT NULL,
+            rows_affected INTEGER NOT NULL,
+            last_insert_id INTEGER NOT NULL,
+            actor_user_id TEXT NULL,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','ledgered','error')),
+            operation_id TEXT NULL,
+            error_message TEXT NULL,
+            created_at_ms INTEGER NOT NULL,
+            ledgered_at_ms INTEGER NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tentaflow_sync_captures_status
+            ON __tentaflow_sync_captures(status, created_at_ms);
+        CREATE TABLE IF NOT EXISTS __tentaflow_sync_applied (
+            operation_id TEXT PRIMARY KEY,
+            applied_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS __tentaflow_sync_conflicts (
+            operation_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            addon_id TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            resource_type TEXT NOT NULL,
+            resource_id TEXT NOT NULL,
+            action TEXT NOT NULL,
+            source_node_id TEXT NOT NULL,
+            error_kind TEXT NOT NULL,
+            error_message TEXT NOT NULL,
+            capture_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','resolved','ignored','superseded')),
+            created_at_ms INTEGER NOT NULL,
+            resolved_at_ms INTEGER NULL,
+            resolution TEXT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tentaflow_sync_conflicts_status
+            ON __tentaflow_sync_conflicts(status, created_at_ms);
+        CREATE INDEX IF NOT EXISTS idx_tentaflow_sync_conflicts_resource
+            ON __tentaflow_sync_conflicts(resource_type, resource_id);",
+    )?;
+    let has_operation_id = conn
+        .prepare("PRAGMA table_info(__tentaflow_sync_captures)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == "operation_id");
+    if !has_operation_id {
+        conn.execute(
+            "ALTER TABLE __tentaflow_sync_captures ADD COLUMN operation_id TEXT NULL",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 /// Usuwa pool z rejestru dla pary (org, addon). Wszystkie polaczenia zostana
@@ -347,6 +364,43 @@ mod tests {
             assert_eq!(pool.state().connections, POOL_MAX_SIZE);
             drop(conns);
             close_addon_db("org-default", "concurrent-test");
+        });
+    }
+
+    #[test]
+    fn test_concurrent_open_and_writes_never_report_locked() {
+        with_tmp_home(|| {
+            let id = super::super::fs_sandbox::unique_test_addon_id("locked");
+            let threads: Vec<_> = (0..8)
+                .map(|n| {
+                    let id = id.clone();
+                    std::thread::spawn(move || {
+                        let pool = open_addon_db("org-default", &id).expect("open");
+                        let conn = pool.get().expect("connection");
+                        conn.execute_batch(
+                            "CREATE TABLE IF NOT EXISTS t (n INTEGER, v INTEGER)",
+                        )
+                        .expect("create");
+                        for v in 0..50 {
+                            conn.execute("INSERT INTO t (n, v) VALUES (?1, ?2)", [n, v])
+                                .expect("write must wait for the lock, not fail");
+                            let _: i64 = conn
+                                .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+                                .expect("read");
+                        }
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().expect("worker");
+            }
+            let pool = open_addon_db("org-default", &id).expect("open");
+            let conn = pool.get().expect("connection");
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 8 * 50);
+            close_addon_db("org-default", &id);
         });
     }
 

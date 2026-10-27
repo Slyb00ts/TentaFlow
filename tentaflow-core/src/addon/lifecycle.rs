@@ -170,7 +170,11 @@ pub fn install_instance(
     let manifest = parse_manifest_toml(&instance_manifest)
         .map_err(|e| anyhow::anyhow!("manifest instancji niepoprawny: {e}"))?;
 
-    install_core(
+    // install_core writes the `addons` row before its later steps (aliases,
+    // migrations) run. A failure there must not leave that row behind: it would
+    // exist on this node only, never reach the sync ledger (the caller captures
+    // on success) and later updates of it would conflict on every peer.
+    if let Err(e) = install_core(
         &pkg_dir,
         db,
         manifest,
@@ -179,7 +183,12 @@ pub fn install_instance(
         package_version,
         false,
         true,
-    )?;
+    ) {
+        if let Err(cleanup) = uninstall_instance(&instance_id, db) {
+            warn!("install_instance: rollback of '{instance_id}' failed: {cleanup}");
+        }
+        return Err(e);
+    }
 
     // Persist the entered connection-param values into `addon_config` (scoped to
     // the new instance_id) so the addon can read its own IP/serial at runtime.
@@ -5760,5 +5769,65 @@ slot = "sidebar"
         assert_eq!(catalog[0].permission_id, "llm");
         assert_eq!(catalog[0].display_name, "Author wording");
         assert_eq!(catalog[0].risk, "medium");
+    }
+    /// A package that declares `[[alias]]` can back only one instance: the second
+    /// install trips the alias ownership guard AFTER `install_core` wrote the
+    /// `addons` row. The row must not outlive the failure, and the caller must see
+    /// the guard's message, not a rollback artifact.
+    #[test]
+    fn second_instance_of_an_alias_package_fails_cleanly_and_leaves_no_row() {
+        crate::addon::fs_sandbox::with_tmp_home(|| {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            crate::db::migrations::run(&conn).unwrap();
+            let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+            let manifest = "[addon]\nid = \"aliaspkg\"\nname = \"Alias Pkg\"\nversion = \"1.0.0\"\n\
+                 wasm_file = \"addon.wasm\"\n\n\
+                 [[alias]]\nid = \"aliaspkg-detect\"\ndisplay_name = \"Detect\"\n\
+                 methods = [\"detect\"]\nsuggested_default = \"some-model\"\nvisibility = \"private\"\n";
+            let dir = crate::addon::bundled::package_dir("aliaspkg", "1.0.0");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("manifest.toml"), manifest).unwrap();
+            std::fs::write(dir.join("addon.wasm"), b"\0asm\x01\0\0\0").unwrap();
+            crate::db::repository::upsert_addon_package(
+                &db, "aliaspkg", "1.0.0", "Alias Pkg", manifest, "h", "bundled",
+            )
+            .unwrap();
+            let config = std::collections::BTreeMap::new();
+
+            let first = install_instance(&db, "aliaspkg", "1.0.0", "First", &config)
+                .expect("the first instance owns the alias");
+            let error = install_instance(&db, "aliaspkg", "1.0.0", "Second", &config)
+                .expect_err("the alias already has an owner");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("already owned by addon") && message.contains(&first),
+                "the guard's own message must reach the caller, got: {message}"
+            );
+
+            let rows: Vec<String> = {
+                let conn = db.read().unwrap();
+                let mut stmt = conn.prepare("SELECT addon_id FROM addons").unwrap();
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<std::result::Result<_, _>>()
+                    .unwrap();
+                rows
+            };
+            assert_eq!(rows, vec![first.clone()], "no orphan row of the failed install");
+
+            let owner: String = db
+                .read()
+                .unwrap()
+                .query_row(
+                    "SELECT o.owner_id FROM model_aliases a \
+                     JOIN model_alias_owners o ON o.alias_id = a.id \
+                     WHERE a.alias = 'aliaspkg-detect'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(owner, first, "the failed install must not take the alias over");
+        });
     }
 }

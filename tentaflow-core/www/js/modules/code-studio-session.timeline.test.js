@@ -418,13 +418,13 @@ test('the run chain states every run state in the operator’s language', () => 
   for (const [lang, dict] of LOCALES) {
     for (const status of RUN_STATUS_KEYS) {
       const html = runChainHtml(dict, [{
-        run_id: 'abcdef0123456789abcd',
+        runId: 'abcdef0123456789abcd',
         kind: 'root',
         trigger: 'user',
         ordinal: 3,
         status,
-        started_at: '2026-01-01T00:00:00Z',
-        finished_at: '2026-01-01T00:00:05Z',
+        startedAt: '2026-01-01T00:00:00Z',
+        finishedAt: '2026-01-01T00:00:05Z',
       }]);
       const label = lookup(dict, `run_status.${status}`);
       // The row still carries its kind, ordinal and duration — the label change
@@ -466,7 +466,7 @@ test('a state the module does not know is shown as it arrived, not as a key', ()
 test('a page advances the cursor by the cursor the server answered with', () => {
   const view = { cursor: 0, count: 0, status: '' };
   const page = mergeExecPage(view, {
-    lines: ['a', 'b'], status: 'completed', next_seq: 2, has_more: true,
+    lines: ['a', 'b'], status: 'completed', nextSeq: 2, hasMore: true,
   });
   assert.deepEqual(page.lines, ['a', 'b']);
   assert.equal(page.cursor, 2);
@@ -477,7 +477,7 @@ test('a page advances the cursor by the cursor the server answered with', () => 
 
 test('a second page continues where the first stopped', () => {
   const view = { cursor: 2, count: 2, status: 'completed' };
-  const page = mergeExecPage(view, { lines: ['c'], status: 'completed', next_seq: 3, has_more: false });
+  const page = mergeExecPage(view, { lines: ['c'], status: 'completed', nextSeq: 3, hasMore: false });
   assert.equal(page.cursor, 3);
   assert.equal(page.count, 3);
   assert.equal(page.hasMore, false);
@@ -486,11 +486,11 @@ test('a second page continues where the first stopped', () => {
 test('a peer that omits the cursor is counted, not trusted backwards', () => {
   assert.equal(mergeExecPage({ cursor: 5, count: 5 }, { lines: ['x', 'y'] }).cursor, 7);
   // A cursor that went backwards would replay every line of the page.
-  assert.equal(mergeExecPage({ cursor: 5, count: 5 }, { lines: ['x'], next_seq: 1 }).cursor, 6);
+  assert.equal(mergeExecPage({ cursor: 5, count: 5 }, { lines: ['x'], nextSeq: 1 }).cursor, 6);
 });
 
 test('"there is more" is refused when the page moved nothing', () => {
-  const page = mergeExecPage({ cursor: 4, count: 4 }, { lines: [], has_more: true, next_seq: 4 });
+  const page = mergeExecPage({ cursor: 4, count: 4 }, { lines: [], hasMore: true, nextSeq: 4 });
   assert.equal(page.hasMore, false, 'an empty page that claims more is an endless button');
   assert.equal(page.cursor, 4);
   assert.equal(page.count, 4);

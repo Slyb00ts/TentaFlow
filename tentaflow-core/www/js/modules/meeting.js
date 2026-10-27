@@ -159,14 +159,14 @@ async function loadSettings() {
     // ignore
   }
   try {
-    availableFlows = (await ApiBinary.list('flowListRequest')) || [];
+    availableFlows = (await ApiBinary.list('flowListRequest', { arrayKey: 'flows' })) || [];
   } catch (_) {
     availableFlows = [];
   }
   try {
     const all = (await ApiBinary.list('modelListRequest', { arrayKey: 'models' })) || [];
     sttServices = (Array.isArray(all) ? all : [])
-      .filter((m) => (m.category || m.service_type || '').toLowerCase() === 'stt');
+      .filter((m) => (m.category || '').toLowerCase() === 'stt');
   } catch (_) {
     sttServices = [];
   }
@@ -302,11 +302,10 @@ async function subscribeToLifecycle() {
   try {
     const client = await ApiBinary.client();
     unsubscribeLifecycle = client.addUnsolicitedListener(({ body }) => {
-      if (!body || body.variant !== 'MeetingLiveEventBody') return;
+      if (!body || body._variant !== 'MeetingLiveEventBody') return;
       if (!activeSession || body.meetingKey !== activeSession.meetingKey) return;
-      const payload = body.payload;
-      if (!payload || payload.type !== 'LifecycleUpdate') return;
-      const data = payload.data || {};
+      const data = body.payload?.LifecycleUpdate;
+      if (!data) return;
       currentLifecycleStage = String(data.stage || currentLifecycleStage);
       currentLifecycleDetails = data.details ? String(data.details) : '';
       if (currentLifecycleStage === 'joined') {

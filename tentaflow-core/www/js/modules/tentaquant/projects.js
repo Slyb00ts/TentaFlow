@@ -229,7 +229,12 @@ function wire(screen, host) {
       return;
     }
     const more = e.target.closest('[data-more]');
-    if (more) { more.parentElement.querySelector('[data-project-menu]').toggle(); return; }
+    if (more) {
+      const menu = more.parentElement.querySelector('[data-project-menu]');
+      menu.anchor = more;
+      menu.toggle();
+      return;
+    }
     // The menu is a CHILD of the card, so a click on one of its items bubbles
     // out through the card: without this guard 'Usuń projekt' would open its
     // confirm window and navigate into the project underneath it.

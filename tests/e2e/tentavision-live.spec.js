@@ -2,8 +2,9 @@
 // File: tests/e2e/tentavision-live.spec.js
 // Description: E2E for the TentaVision "Live view" tab. Proves: empty state with
 //              a "Dodaj kamerę" CTA before any camera exists, one tile per REAL
-//              camera (from the per-addon SQLite cameras table) with a name + a
-//              toned online/offline status chip, the 1/4/9/16 grid-size segmented
+//              camera (from the per-addon SQLite cameras table) — an online one
+//              with its name + status overlay, an offline one as a placeholder
+//              that says there is no preview, the 1/4/9/16 grid-size segmented
 //              control, and that the chosen grid size persists across a full panel
 //              reopen (fresh context) — it is written to the settings table.
 //              ONLINE tiles render a real `<tf-video-stream>` (SDK VideoStream →
@@ -16,7 +17,6 @@
 // =============================================================================
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
@@ -26,6 +26,7 @@ const {
   stopBinary,
   waitForServer,
   binaryExists,
+  homeForPort,
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
 const {
@@ -49,8 +50,8 @@ const PERMISSIONS = [
 
 const SHOT_DIR = '/tmp/tv';
 
-// Four real cameras with mixed status so the grid shows both online (ok) and
-// offline (err) status chips. Canonical `cam_<uuid v4>` ids so the online tiles'
+// Four real cameras with mixed status so the grid shows both an online tile and
+// the offline placeholder. Canonical `cam_<uuid v4>` ids so the online tiles'
 // `camera:<id>` subscribe stream ids pass the camera ACL. Names mirror the
 // mockup's tile labels.
 const CAMERAS = [
@@ -91,7 +92,7 @@ test.afterAll(async () => {
 // Per-addon SQLite database the host created for this instance.
 function addonDbPath() {
   return path.join(
-    os.homedir(), '.tentaflow', 'orgs', 'org-default', 'addons', addonId, 'data.db',
+    homeForPort(PORT), 'orgs', 'org-default', 'addons', addonId, 'data.db',
   );
 }
 
@@ -149,9 +150,12 @@ test.describe('TentaVision Live view — real camera grid + grid-size persistenc
       await expect(page.locator('.addon-app-shell').getByText(c.name).first())
         .toBeVisible({ timeout: 10000 });
     }
-    // Online (ok) and offline (err) status chips both present.
+    // An online tile carries its status overlay; an offline camera has no
+    // stream to overlay, so its tile is a placeholder naming the camera.
     await expect(page.locator('.addon-app-shell').getByText('online', { exact: true }).first()).toBeVisible();
-    await expect(page.locator('.addon-app-shell').getByText('offline', { exact: true }).first()).toBeVisible();
+    const offlineTile = page.locator('.addon-app-shell tf-empty-state', { hasText: 'C-12 magazyn' });
+    await expect(offlineTile).toHaveCount(1);
+    await expect(offlineTile).toContainText('Offline — brak podglądu');
     // The segmented grid-size control is present.
     await expect(page.locator('.addon-app-shell tf-segmented').first()).toBeVisible({ timeout: 10000 });
     await page.screenshot({ path: `${SHOT_DIR}/live-grid.png`, fullPage: true });

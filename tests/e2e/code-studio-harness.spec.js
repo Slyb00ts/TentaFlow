@@ -21,9 +21,9 @@ const {
   stopBinary,
   waitForServer,
   binaryExists,
-  baseUrl,
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
+const { ensureNativeApp, gotoCodeStudio, sessionRuns, acceptOpenReviews, openSession: openSessionOf } = require('./helpers/code-studio');
 const { startLiveModel, liveModelRequested } = require('./helpers/live-model');
 const {
   startScriptedModel, helloWorldScript, enforcedPipelineScripts,
@@ -107,7 +107,7 @@ const scope = () => ({ workspaceId, sessionId });
 async function registerScriptedProvider(page) {
   const nodes = await api(page, 'meshNodeListRequest');
   const first = (nodes?.nodes ?? [])[0] ?? {};
-  const nodeId = first.nodeId ?? first.node_id ?? '';
+  const nodeId = first.nodeId ?? '';
 
   const res = await api(page, 'serviceManifestDeployRequest', {
     engineId: 'openai-compatible',
@@ -120,33 +120,8 @@ async function registerScriptedProvider(page) {
       model_repo: 'harness-test',
     }),
   });
-  expect(res?.deployId || res?.deploy_id, 'provider deploy returned no id').toBeTruthy();
+  expect(res?.deployId, 'provider deploy returned no id').toBeTruthy();
 }
-
-async function gotoCodeStudio(page) {
-  // Deep link: the router now reads `#/screen` at boot and on hashchange, so a
-  // pasted URL opens the screen it names instead of the dashboard. Before the
-  // fix the hash was decoration and every test had to click through All apps.
-  await page.goto(`${baseUrl(PORT)}/#/code-studio`);
-  const direct = page.locator('#cs-new, #cs-empty-new, #cs-table-host').first();
-  if (await direct.count().then((n) => n > 0).catch(() => false)) {
-    await direct.waitFor({ timeout: 30_000 });
-    return;
-  }
-  return gotoCodeStudioViaTile(page);
-}
-
-async function gotoCodeStudioViaTile(page) {
-  // Fallback when the deep link did not resolve: take the path a user takes
-  // from the start screen (apps-home for every role) — All apps → the Code
-  // Studio tile. It also proves the tile is reachable at all.
-  await page.goto(`${baseUrl(PORT)}/`);
-  await page.locator('[data-view="apps-home"]').first().click();
-  await page.locator('[data-route="code-studio"]').first().click();
-  await page.waitForSelector('#cs-new, #cs-empty-new, #cs-table-host', { timeout: 30_000 });
-}
-
-
 
 /// Points the PINNED harness at the plain tool loop, the way an operator would:
 /// by deleting the pipeline blocks in the graph, which is the seam the product
@@ -162,7 +137,7 @@ async function gotoCodeStudioViaTile(page) {
 async function usePlainHarness(page) {
   if (!liveModelRequested()) return;
   const pinned = await api(page, 'flowGetRequest', { flowId: 'cs-harness-critic' }).catch(() => null);
-  const json = pinned?.flow?.flowJson ?? pinned?.flow?.flow_json ?? pinned?.flowJson;
+  const json = pinned?.flow?.flowJson ?? pinned?.flowJson;
   if (!json) {
     console.warn('[e2e] cs-harness-critic not found — the pinned pipeline stays in place');
     return;
@@ -179,32 +154,10 @@ async function usePlainHarness(page) {
     .catch((e) => console.warn('[e2e] could not repoint the pinned harness:', String(e)));
 }
 
-// Re-opens the workspace and its session; every test gets a fresh page.
+// Re-opens the workspace and its session; every test gets a fresh page. Clicking
+// the workspace re-enters its most recent open session, so no test starts a new run.
 async function openSession(page) {
-  await gotoCodeStudio(page);
-  await page.locator(`text=${WORKSPACE}`).first().click();
-
-  // `#cs-open-session` opens a dialog that CREATES a session; on re-entry we
-  // want the one we already have, otherwise every test would start a new run.
-  const existing = page.locator('[data-open-session]').first();
-  if (await existing.count()) {
-    await existing.click();
-  } else {
-    await page.locator('#cs-open-session').click();
-    await page.locator('#cs-sess-title input').first().fill('harness e2e');
-    await page.locator('[data-action="create"]').first().click();
-  }
-  await page.waitForSelector('#cs-session-view', { state: 'visible', timeout: 30_000 });
-
-  // Keep the session we already know: re-deriving it from the listing picks
-  // whatever sits first, and a second session created along the way would send
-  // the later assertions to an empty one.
-  if (!sessionId) {
-    const list = await api(page, 'codeStudioSessionsListRequest', { workspaceId });
-    const sessions = list?.sessions ?? [];
-    sessionId = sessions[0]?.id ?? sessions[0]?.sessionId ?? '';
-  }
-  expect(sessionId, 'no session id after opening the session view').toBeTruthy();
+  sessionId = await openSessionOf(page, PORT, { workspaceName: WORKSPACE, workspaceId });
 }
 
 
@@ -227,7 +180,7 @@ async function drainApprovals(page, { decision = 'allow_for_run' } = {}) {
   for (const a of pending) {
     await api(page, 'codeStudioApprovalDecideRequest', {
       ...scope(),
-      approvalId: a.id ?? a.approvalId ?? a.approval_id,
+      approvalId: a.id ?? a.approvalId,
       decision,
     }).catch(() => null);
   }
@@ -243,7 +196,7 @@ async function approvePending(page, { deadlineMs = 60_000, decision = 'allow_for
     for (const a of pending) {
       await api(page, 'codeStudioApprovalDecideRequest', {
         ...scope(),
-        approvalId: a.id ?? a.approvalId ?? a.approval_id,
+        approvalId: a.id ?? a.approvalId,
         decision,
       });
       decided += 1;
@@ -269,7 +222,7 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
     await expect.poll(async () => {
       const body = await api(page, 'serviceListRequest');
       const svc = (body?.services ?? []).find(
-        (s) => (s.engineId ?? s.engine_id) === 'openai-compatible',
+        (s) => (s.engineId) === 'openai-compatible',
       );
       return svc?.status ?? 'missing';
     }, { timeout: 60_000, message: 'scripted provider never came up' }).toMatch(/running|degraded/);
@@ -285,7 +238,7 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
     // agent_context now falls back to the platform default, so we deliberately
     // do NOT bind a model here — the turn in the next test must work anyway.
     const listResp = await api(page, 'agentsListRequest', {});
-    const agents = JSON.parse(listResp?.agentsJson ?? listResp?.agents_json ?? '[]');
+    const agents = JSON.parse(listResp?.agentsJson ?? '[]');
     const codeAgents = agents.filter((a) => String(a.name ?? '').startsWith('code-'));
     expect(codeAgents.length, 'no seeded code-* agents').toBeGreaterThan(0);
     for (const a of codeAgents) {
@@ -300,6 +253,7 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
 
   test('zakłada workspace przez kreator', async ({ page }) => {
     await loginAsAdmin(page, { port: PORT });
+    await ensureNativeApp(page, 'code-studio');
 
     // Creating a workspace is gated by `code_studio_creator_grants` (plan §5.1):
     // org_admin may grant it, but nobody holds it in a fresh database. Without
@@ -313,11 +267,11 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
     const mine = (users?.users ?? []).find(
       (u) => (u.username ?? '') === (me?.username ?? 'admin'),
     );
-    const userId = mine?.id ?? mine?.userId ?? mine?.user_id ?? '';
+    const userId = mine?.id ?? mine?.userId ?? '';
     expect(userId, 'could not resolve the admin user id').toBeTruthy();
     await api(page, 'codeStudioWorkspaceCreatorGrantSetRequest', { userId, granted: true });
 
-    await gotoCodeStudio(page);
+    await gotoCodeStudio(page, PORT);
 
     // Empty state and populated list offer the same action under two ids.
     await page.locator('#cs-new, #cs-empty-new').first().click();
@@ -373,13 +327,13 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
 
     // 1) The harness really called the tools — these rows come from tool_exec,
     //    not from the model's prose.
-    await expect(view.getByText('core.fs_write', { exact: false }).first())
+    await expect(view.locator('.t-name', { hasText: /^fs_write$/ }).first())
       .toBeVisible({ timeout: TURN_TIMEOUT });
     // The write parks on an approval; answer it so the turn can continue.
     const firstDecisions = await approvePending(page);
     expect(firstDecisions, 'no approval was raised for fs_write').toBeGreaterThan(0);
 
-    await expect(view.getByText('core.exec', { exact: false }).first())
+    await expect(view.locator('.t-name', { hasText: /^exec$/ }).first())
       .toBeVisible({ timeout: TURN_TIMEOUT });
 
     // …and exec asks too, under autonomy `normal`.
@@ -399,10 +353,10 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
       // review once the agent stops being parked on one.
       await drainApprovals(page);
       const body = await api(page, 'codeStudioPatchSetsListRequest', scope());
-      const sets = body?.patchSets ?? body?.patch_sets ?? [];
+      const sets = body?.patchSets ?? [];
       const paths = [];
       for (const info of sets) {
-        const id = info.patchSetId ?? info.patch_set_id;
+        const id = info.patchSetId;
         const detail = await api(page, 'codeStudioPatchSetGetRequest', {
           ...scope(), patchSetId: id,
         }).catch(() => null);
@@ -414,7 +368,7 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
   });
 
   test('przegląd akceptuje zmianę, a commit powstaje z zaakceptowanych blobów', async ({ page }) => {
-    test.setTimeout(150_000);
+    test.setTimeout(240_000);
     await loginAsAdmin(page, { port: PORT });
     await openSession(page);
 
@@ -426,27 +380,39 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
     // and are covered by its own unit tests; what matters here is the wire
     // contract and what git does with an accepted set.
     const sets = await api(page, 'codeStudioPatchSetsListRequest', scope());
-    const all = sets?.patchSets ?? sets?.patch_sets ?? [];
+    const all = sets?.patchSets ?? [];
     console.log('[diag] patch sets:', JSON.stringify(all.map((x) => ({
-      id: x.patchSetId ?? x.patch_set_id, status: x.status, scope: x.scope,
-      files: x.fileCount ?? x.file_count,
+      id: x.patchSetId, status: x.status, scope: x.scope,
+      files: x.fileCount,
     }))));
     const target = all.find((s2) => ['open', 'in_review'].includes(s2.status ?? '')) ?? all[0];
     expect(target, 'no patch set at all').toBeTruthy();
-    const patchSetId = target.patchSetId ?? target.patch_set_id;
+    const patchSetId = target.patchSetId;
 
     const detail = await api(page, 'codeStudioPatchSetGetRequest', { ...scope(), patchSetId });
     const files = (detail?.files ?? []).map((f) => ({
-      patchFileId: f.patch_file_id ?? f.patchFileId,
+      patchFileId: f.patchFileId,
       decision: 'accept',
       hunks: (f.hunks ?? []).map((h) => ({
-        patchHunkId: h.patch_hunk_id ?? h.patchHunkId,
+        patchHunkId: h.patchHunkId,
         decision: 'accept',
       })),
     }));
     expect(files.length, 'the patch set carries no files').toBeGreaterThan(0);
 
     await api(page, 'codeStudioPatchDecideRequest', { ...scope(), patchSetId, files });
+
+    // The graph's review loops keep the run alive after the review is accepted
+    // (the tester asks before it executes); a commit asked for while a run lives
+    // is raised on behalf of that run, and the operator-initiated case under
+    // test is the one that belongs to no run. Answer the run's own questions and
+    // reviews until it has ended.
+    await expect.poll(async () => {
+      await drainApprovals(page);
+      await acceptOpenReviews(page, scope());
+      return (await sessionRuns(page, scope()))
+        .filter((r) => ['running', 'waiting'].includes(r.status)).length;
+    }, { timeout: 120_000, intervals: [1000], message: 'the run never ended after the review was accepted' }).toBe(0);
 
     // Accepting a review does NOT commit on its own: `commit_accepted_blobs` is
     // reached from the git_commit path (dispatch/code_studio.rs:4759), which
@@ -473,7 +439,7 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
         .then((b) => (b?.approvals ?? []).find((a) => (a.status ?? '') === 'pending'))
         .then((a) => api(page, 'codeStudioApprovalDecideRequest', {
           ...scope(),
-          approvalId: a.id ?? a.approvalId ?? a.approval_id,
+          approvalId: a.id ?? a.approvalId,
           decision: 'allow_for_run',
         }).catch((e) => String(e)));
       expect(String(refused), 'a run-scoped grant with no run was accepted')
@@ -503,8 +469,9 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
     const toolNames = (first.tools ?? []).map((t) => t.function?.name ?? t.name);
     expect(toolNames, 'the model was offered no file tools').toContain('core.fs_write');
 
-    const last = model.calls[model.calls.length - 1];
-    const roles = (last.messages ?? []).map((m) => m.role);
-    expect(roles, 'tool results never came back into the conversation').toContain('tool');
+    // The graph's review roles speak after the orchestrator, so the last call is
+    // not the orchestrator's: look for any call that carried a tool result.
+    const fedBack = model.calls.some((call) => (call.messages ?? []).some((m) => m.role === 'tool'));
+    expect(fedBack, 'tool results never came back into the conversation').toBe(true);
   });
 });

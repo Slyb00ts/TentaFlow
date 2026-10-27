@@ -183,7 +183,7 @@ function isLiveWorktree(wt) {
 // `<session uuid>-int-<op prefix>` for an integration one. Every row of the list
 // belongs to the same session, so the row keeps only the part that differs.
 function worktreeName(wt) {
-  const id = String(wt.worktree_id || '');
+  const id = String(wt.worktreeId || '');
   const cut = id.indexOf('-int-');
   return cut === -1 ? shortOid(id) : id.slice(cut + 1);
 }
@@ -230,7 +230,7 @@ const CONFLICT_KIND = { cls: 'c', mark: '!', labelKey: 'code_studio.panes.change
 
 function kindOf(file) {
   if (file.status === 'conflicted') return CONFLICT_KIND;
-  return CHANGE_KIND[file.change_kind] || CHANGE_KIND.modify;
+  return CHANGE_KIND[file.changeKind] || CHANGE_KIND.modify;
 }
 
 const PATCH_STATUSES = new Set([
@@ -356,7 +356,7 @@ function busEmit(bus, topic) {
 }
 
 function decisionOf(bus, hunk) {
-  const local = bus.decisions.get(hunk.patch_hunk_id);
+  const local = bus.decisions.get(hunk.patchHunkId);
   if (local) return local;
   if (hunk.status === 'accepted') return 'accept';
   if (hunk.status === 'rejected') return 'reject';
@@ -407,12 +407,12 @@ function decisionPayload(bus) {
     for (const hunk of file.hunks || []) {
       const decision = decisionOf(bus, hunk);
       if (!decision) continue;
-      hunks.push({ patchHunkId: hunk.patch_hunk_id, decision });
+      hunks.push({ patchHunkId: hunk.patchHunkId, decision });
       if (decision === 'accept') accepted += 1;
     }
     if (!hunks.length) continue;
     files.push({
-      patchFileId: file.patch_file_id,
+      patchFileId: file.patchFileId,
       decision: accepted > 0 ? 'accept' : 'reject',
       hunks,
     });
@@ -422,7 +422,7 @@ function decisionPayload(bus) {
 
 async function loadPatchSet(ctx, bus, patchSetId) {
   const body = await call(ctx, 'codeStudioPatchSetGetRequest', { patchSetId });
-  bus.patchSet = body.patch_set || null;
+  bus.patchSet = body.patchSet || null;
   bus.files = Array.isArray(body.files) ? body.files : [];
   bus.decisions.clear();
   busEmit(bus, 'loaded');
@@ -436,10 +436,10 @@ async function saveDecisions(ctx, bus) {
     return;
   }
   const body = await call(ctx, 'codeStudioPatchDecideRequest', {
-    patchSetId: bus.patchSet.patch_set_id,
+    patchSetId: bus.patchSet.patchSetId,
     files,
   });
-  const conflicted = Array.isArray(body.conflicted_paths) ? body.conflicted_paths : [];
+  const conflicted = Array.isArray(body.conflictedPaths) ? body.conflictedPaths : [];
   if (conflicted.length) {
     toast(T('code_studio.panes.changes.saved_with_conflicts', { count: conflicted.length }), 'warning');
   } else if (['accepted', 'partially_accepted'].includes(String(body.status ?? ''))) {
@@ -449,7 +449,7 @@ async function saveDecisions(ctx, bus) {
   } else {
     toast(T('code_studio.panes.changes.saved'), 'success');
   }
-  await loadPatchSet(ctx, bus, bus.patchSet.patch_set_id);
+  await loadPatchSet(ctx, bus, bus.patchSet.patchSetId);
   return body.status ?? '';
 }
 
@@ -568,7 +568,7 @@ export function renderFilePane(hostEl, ctx) {
         path: body_.path || path,
         content: body_.content || '',
         draft: null,
-        blobSha: body_.blob_sha || '',
+        blobSha: body_.blobSha || '',
         language: body_.language || 'plain',
         truncated: !!body_.truncated,
         dirty: false,
@@ -600,7 +600,7 @@ export function renderFilePane(hostEl, ctx) {
       if (disposed) return;
       entry.content = content;
       entry.draft = null;
-      entry.blobSha = body_.blob_sha || entry.blobSha;
+      entry.blobSha = body_.blobSha || entry.blobSha;
       entry.dirty = false;
       editor.markClean();
       conflictSlot.replaceChildren();
@@ -620,7 +620,7 @@ export function renderFilePane(hostEl, ctx) {
       failed(readErr, 'code_studio.panes.file.read_failed');
     }
     if (disposed) return;
-    if (!onDisk || onDisk.blob_sha === entry.blobSha) {
+    if (!onDisk || onDisk.blobSha === entry.blobSha) {
       failed(err, 'code_studio.panes.file.write_failed');
       return;
     }
@@ -634,7 +634,7 @@ export function renderFilePane(hostEl, ctx) {
       el('p', {
         text: T('code_studio.panes.file.cas_body', {
           expected: shortSha(entry.blobSha),
-          actual: shortSha(onDisk.blob_sha),
+          actual: shortSha(onDisk.blobSha),
         }),
       }),
       el(
@@ -654,7 +654,7 @@ export function renderFilePane(hostEl, ctx) {
             variant: 'primary',
             onClick: () => {
               entry.content = onDisk.content || '';
-              entry.blobSha = onDisk.blob_sha || '';
+              entry.blobSha = onDisk.blobSha || '';
               entry.draft = null;
               entry.dirty = false;
               editor.value = entry.content;
@@ -789,7 +789,7 @@ export function renderChangesPane(hostEl, ctx) {
 
   function activeFile() {
     if (!bus.files.length) return null;
-    return bus.files.find((f) => f.patch_file_id === activeFileId) || bus.files[0];
+    return bus.files.find((f) => f.patchFileId === activeFileId) || bus.files[0];
   }
 
   function paintProgress() {
@@ -835,7 +835,7 @@ export function renderChangesPane(hostEl, ctx) {
       paintProgress();
       return;
     }
-    activeFileId = file.patch_file_id;
+    activeFileId = file.patchFileId;
     paintPath(pathLabel, file.path);
     const kind = kindOf(file);
     const stats = fileStats(file);
@@ -846,7 +846,7 @@ export function renderChangesPane(hostEl, ctx) {
     );
 
     diffEl.hunks = (file.hunks || []).map((hunk) => ({
-      id: hunk.patch_hunk_id,
+      id: hunk.patchHunkId,
       header: hunk.header,
       lines: hunkLines(hunk),
       status: decisionOf(bus, hunk) === 'accept'
@@ -868,8 +868,8 @@ export function renderChangesPane(hostEl, ctx) {
       el('h4', {}, icon('alert'), document.createTextNode(T('code_studio.panes.changes.conflict_title'))),
       el('p', {
         text: T('code_studio.panes.changes.conflict_body', {
-          base: shortSha(file.patch_base_blob_sha),
-          current: shortSha(file.current_blob_sha),
+          base: shortSha(file.patchBaseBlobSha),
+          current: shortSha(file.currentBlobSha),
         }),
       }),
       el(
@@ -915,10 +915,10 @@ export function renderChangesPane(hostEl, ctx) {
     if (!bus.patchSet) return;
     try {
       await call(ctx, 'codeStudioPatchDecideRequest', {
-        patchSetId: bus.patchSet.patch_set_id,
-        files: [{ patchFileId: file.patch_file_id, decision: 'reject', hunks: [] }],
+        patchSetId: bus.patchSet.patchSetId,
+        files: [{ patchFileId: file.patchFileId, decision: 'reject', hunks: [] }],
       });
-      await loadPatchSet(ctx, bus, bus.patchSet.patch_set_id);
+      await loadPatchSet(ctx, bus, bus.patchSet.patchSetId);
     } catch (err) {
       failed(err, 'code_studio.panes.changes.decide_failed');
     }
@@ -949,7 +949,7 @@ export function renderChangesPane(hostEl, ctx) {
       el('div', {
         class: 'cs-note',
         text: T('code_studio.panes.changes.recon_body', {
-          base: shortSha(file.patch_base_blob_sha),
+          base: shortSha(file.patchBaseBlobSha),
           accepted: accepted.length,
           rejected: rejected.length,
         }),
@@ -973,14 +973,14 @@ export function renderChangesPane(hostEl, ctx) {
     grid.append(
       reconColumn(
         'file-text',
-        T('code_studio.panes.changes.recon_base', { sha: shortSha(file.patch_base_blob_sha) }),
+        T('code_studio.panes.changes.recon_base', { sha: shortSha(file.patchBaseBlobSha) }),
         baseLines,
         'old',
       ),
       reconColumn(
         'check',
         T('code_studio.panes.changes.recon_result', {
-          sha: shortSha(file.accepted_blob_sha || file.current_blob_sha),
+          sha: shortSha(file.acceptedBlobSha || file.currentBlobSha),
         }),
         resultLines,
         'new',
@@ -1023,12 +1023,12 @@ export function renderChangesPane(hostEl, ctx) {
     }
     try {
       await call(ctx, 'codeStudioPatchDecideRequest', {
-        patchSetId: bus.patchSet.patch_set_id,
-        files: [{ patchFileId: file.patch_file_id, decision: 'request_revision', note, hunks: [] }],
+        patchSetId: bus.patchSet.patchSetId,
+        files: [{ patchFileId: file.patchFileId, decision: 'request_revision', note, hunks: [] }],
       });
       revisionText.value = '';
       toggleRevisionBox(false);
-      await loadPatchSet(ctx, bus, bus.patchSet.patch_set_id);
+      await loadPatchSet(ctx, bus, bus.patchSet.patchSetId);
     } catch (err) {
       failed(err, 'code_studio.panes.changes.decide_failed');
     }
@@ -1037,7 +1037,7 @@ export function renderChangesPane(hostEl, ctx) {
   async function onCommit() {
     try {
       await commitAccepted(ctx, bus);
-      await loadPatchSet(ctx, bus, bus.patchSet.patch_set_id);
+      await loadPatchSet(ctx, bus, bus.patchSet.patchSetId);
       paintProgress();
     } catch (e) {
       // An approval gate answers with Conflict, which is not a failure: the
@@ -1064,7 +1064,7 @@ export function renderChangesPane(hostEl, ctx) {
         activeFileId = data.patchFileId;
         paintFile();
       }
-      if (data.patchSetId && (!bus.patchSet || bus.patchSet.patch_set_id !== data.patchSetId)) {
+      if (data.patchSetId && (!bus.patchSet || bus.patchSet.patchSetId !== data.patchSetId)) {
         loadPatchSet(ctx, bus, data.patchSetId).catch((err) =>
           failed(err, 'code_studio.panes.changes.load_failed'));
       }
@@ -1123,8 +1123,8 @@ export function renderGitPane(hostEl, ctx) {
   foot.append(footHint, spacer(), abandonBtn, primaryBtn);
 
   function targetBranch() {
-    return (merge && merge.target_branch)
-      || (ctx.workspace && ctx.workspace.target_branch)
+    return (merge && merge.targetBranch)
+      || (ctx.workspace && ctx.workspace.targetBranch)
       || T('code_studio.panes.git.target_fallback');
   }
 
@@ -1146,19 +1146,19 @@ export function renderGitPane(hostEl, ctx) {
     const clean = merge.outcome === 'clean';
     switch (name) {
       case 'integration_worktree': {
-        const wt = merge.integration_worktree;
+        const wt = merge.integrationWorktree;
         if (!wt) return { state: 'wait', fact: nothing };
         return {
           state: 'done',
           fact: T('code_studio.panes.git.step_worktree_fact', {
             worktree: worktreeName(wt),
-            base: shortOid(wt.base_commit || merge.expected_old),
+            base: shortOid(wt.baseCommit || merge.expectedOld),
           }),
         };
       }
       case 'merge': {
         if (merge.outcome === 'conflict') {
-          const files = Array.isArray(merge.conflict_files) ? merge.conflict_files : [];
+          const files = Array.isArray(merge.conflictFiles) ? merge.conflictFiles : [];
           return {
             state: 'failed',
             fact: files.length
@@ -1171,7 +1171,7 @@ export function renderGitPane(hostEl, ctx) {
         return {
           state: 'done',
           fact: T('code_studio.panes.git.step_merge_fact_clean', {
-            ref: `refs/code-studio/integration/${shortOid(merge.op_id)}`,
+            ref: `refs/code-studio/integration/${shortOid(merge.opId)}`,
           }),
         };
       }
@@ -1184,7 +1184,7 @@ export function renderGitPane(hostEl, ctx) {
         return {
           state: handedOver ? 'done' : 'now',
           fact: T('code_studio.panes.git.step_review_fact', {
-            set: shortOid(patchSet.patch_set_id),
+            set: shortOid(patchSet.patchSetId),
             status: patchStatusLabel(patchStatus),
           }),
         };
@@ -1193,7 +1193,7 @@ export function renderGitPane(hostEl, ctx) {
           return {
             state: 'done',
             fact: T('code_studio.panes.git.step_approval_fact_accepted', {
-              who: (patchSet && patchSet.decided_by) || T('code_studio.panes.git.who_unknown'),
+              who: (patchSet && patchSet.decidedBy) || T('code_studio.panes.git.who_unknown'),
             }),
           };
         }
@@ -1218,8 +1218,8 @@ export function renderGitPane(hostEl, ctx) {
           state: accepted ? 'now' : 'wait',
           fact: T('code_studio.panes.git.step_update_ref_fact_guard', {
             target: targetBranch(),
-            base: merge.expected_old
-              ? shortOid(merge.expected_old)
+            base: merge.expectedOld
+              ? shortOid(merge.expectedOld)
               : T('code_studio.panes.git.base_pending'),
           }),
         };
@@ -1282,7 +1282,7 @@ export function renderGitPane(hostEl, ctx) {
       el('p', { text: T('code_studio.panes.git.conflict_body') }),
     );
     conflictSlot.appendChild(box);
-    const files = Array.isArray(merge.conflict_files) ? merge.conflict_files : [];
+    const files = Array.isArray(merge.conflictFiles) ? merge.conflictFiles : [];
     conflictSlot.appendChild(dockTitle(T('code_studio.panes.git.conflict_files', {
       count: files.length,
     })));
@@ -1325,10 +1325,10 @@ export function renderGitPane(hostEl, ctx) {
       ? T('code_studio.panes.git.conflict_chip')
       : T('code_studio.panes.git.needs_confirm'));
     titleMain.textContent = T('code_studio.panes.git.merge_title_to', { target: targetBranch() });
-    titleSub.textContent = merge && merge.expected_old
-      ? T('code_studio.panes.git.merge_sub', { base: shortOid(merge.expected_old) })
+    titleSub.textContent = merge && merge.expectedOld
+      ? T('code_studio.panes.git.merge_sub', { base: shortOid(merge.expectedOld) })
       : T('code_studio.panes.git.merge_sub_pending');
-    abandonBtn.toggleAttribute('disabled', !merge || !merge.op_id);
+    abandonBtn.toggleAttribute('disabled', !merge || !merge.opId);
   }
 
   function paint() {
@@ -1344,7 +1344,7 @@ export function renderGitPane(hostEl, ctx) {
   /// instead made the broker refuse an invalid ref, surfacing as an opaque
   /// "internal" toast, so a merge could never be started from the dashboard.
   function sourceBranch() {
-    return (merge && merge.source_branch) || (ctx.session && ctx.session.branch) || '';
+    return (merge && merge.sourceBranch) || (ctx.session && ctx.session.branch) || '';
   }
 
   // The button never merges. `git_merge` is mandatory_interactive (§9.3 step 5)
@@ -1355,7 +1355,7 @@ export function renderGitPane(hostEl, ctx) {
       return;
     }
     const source = sourceBranch();
-    if (!merge?.op_id && !source) {
+    if (!merge?.opId && !source) {
       toast(T('code_studio.panes.git.no_source_branch'), 'error');
       return;
     }
@@ -1365,19 +1365,19 @@ export function renderGitPane(hostEl, ctx) {
       summary: T('code_studio.panes.git.ask_merge_summary', { target: targetBranch() }),
       detail: T('code_studio.panes.git.ask_merge_detail', { target: targetBranch() }),
       request: {
-        kind: merge && merge.op_id ? 'codeStudioGitMergeFinalizeRequest' : 'codeStudioGitMergeRequest',
-        payload: merge && merge.op_id
-          ? { opId: merge.op_id, patchSetId: merge.patch_set_id }
+        kind: merge && merge.opId ? 'codeStudioGitMergeFinalizeRequest' : 'codeStudioGitMergeRequest',
+        payload: merge && merge.opId
+          ? { opId: merge.opId, patchSetId: merge.patchSetId }
           : { sourceBranch: source, targetBranch: targetBranch() },
       },
     });
   }
 
   async function delegateConflict() {
-    const files = merge && Array.isArray(merge.conflict_files) ? merge.conflict_files : [];
-    const worktree = merge && merge.integration_worktree
-      ? merge.integration_worktree.worktree_id
-      : shortOid(merge && merge.op_id);
+    const files = merge && Array.isArray(merge.conflictFiles) ? merge.conflictFiles : [];
+    const worktree = merge && merge.integrationWorktree
+      ? merge.integrationWorktree.worktreeId
+      : shortOid(merge && merge.opId);
     try {
       await call(ctx, 'codeStudioSessionMessageSendRequest', {
         message: files.length
@@ -1401,14 +1401,14 @@ export function renderGitPane(hostEl, ctx) {
   // so the first click appeared to do nothing and only a second one — after the
   // question had been answered elsewhere — took effect.
   function abandon() {
-    if (!merge || !merge.op_id) return;
+    if (!merge || !merge.opId) return;
     ctx.ask({
       capability: 'git_merge',
       summary: T('code_studio.panes.git.ask_abandon_summary', { target: targetBranch() }),
       detail: T('code_studio.panes.git.ask_abandon_detail'),
       request: {
         kind: 'codeStudioGitMergeAbandonRequest',
-        payload: { opId: merge.op_id },
+        payload: { opId: merge.opId },
       },
     });
   }
@@ -1432,29 +1432,29 @@ export function renderGitPane(hostEl, ctx) {
         paint();
         return;
       }
-      const mergeSets = (Array.isArray(sets.patch_sets) ? sets.patch_sets : [])
+      const mergeSets = (Array.isArray(sets.patchSets) ? sets.patchSets : [])
         .filter((set) => set.scope === 'merge')
-        .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+        .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
       const patchSet = mergeSets[0] || null;
       // A finalize told us the target had moved; refreshing the same operation
       // must not throw that away, because no read request reports it.
-      const same = merge && merge.op_id === integration.op_id;
-      const livePaths = same && Array.isArray(merge.conflict_files) ? merge.conflict_files : [];
+      const same = merge && merge.opId === integration.opId;
+      const livePaths = same && Array.isArray(merge.conflictFiles) ? merge.conflictFiles : [];
       // The worktree row carries the paths the broker recorded, so they survive
       // a reload; the live merge answer is only preferred while it is the
       // fresher one for the SAME operation.
-      const persistedPaths = Array.isArray(integration.conflict_files) ? integration.conflict_files : [];
+      const persistedPaths = Array.isArray(integration.conflictFiles) ? integration.conflictFiles : [];
       const knownFinalize = same ? merge.finalizeStatus || '' : '';
       merge = {
-        op_id: integration.op_id || '',
+        opId: integration.opId || '',
         outcome: integration.state === 'held' ? 'conflict' : 'clean',
-        conflict_files: livePaths.length ? livePaths : persistedPaths,
-        patch_set_id: patchSet ? patchSet.patch_set_id : null,
-        integration_worktree: integration,
-        // `head_commit` of an integration worktree is the target tip the merge
+        conflictFiles: livePaths.length ? livePaths : persistedPaths,
+        patchSetId: patchSet ? patchSet.patchSetId : null,
+        integrationWorktree: integration,
+        // `headCommit` of an integration worktree is the target tip the merge
         // was computed on — the value `update-ref` will be checked against.
-        expected_old: integration.head_commit || '',
-        source_branch: (ctx.session && ctx.session.branch) || '',
+        expectedOld: integration.headCommit || '',
+        sourceBranch: (ctx.session && ctx.session.branch) || '',
         patchSet,
         finalizeStatus: knownFinalize,
       };
@@ -1564,11 +1564,11 @@ export function renderTerminalPane(hostEl, ctx) {
         cols: grid.cols,
       });
       if (disposed) return;
-      terminalId = body_.terminal_id;
+      terminalId = body_.terminalId;
       grid = { rows: body_.rows || grid.rows, cols: body_.cols || grid.cols };
       termEl.setAttribute('rows', String(grid.rows));
       termEl.setAttribute('cols', String(grid.cols));
-      paintProfile(body_.mount_access, body_.network_access);
+      paintProfile(body_.mountAccess, body_.networkAccess);
       await pullSnapshot();
     } catch (err) {
       failed(err, 'code_studio.panes.terminal.open_failed');
@@ -1586,9 +1586,9 @@ export function renderTerminalPane(hostEl, ctx) {
       termEl.applySnapshot({
         revision,
         cursor: {
-          row: Number(snap.cursor_row || 0),
-          col: Number(snap.cursor_col || 0),
-          visible: !!snap.cursor_visible,
+          row: Number(snap.cursorRow || 0),
+          col: Number(snap.cursorCol || 0),
+          visible: !!snap.cursorVisible,
         },
         rows: Array.isArray(snap.cells) ? snap.cells : [],
       });
@@ -1682,7 +1682,7 @@ export function renderCommitPane(hostEl, ctx) {
     );
 
     const branch = (ctx.session && ctx.session.branch) || T('code_studio.panes.commit.branch_unknown');
-    const base = patchSet ? shortOid(patchSet.base_commit) : T('code_studio.panes.commit.base_unknown');
+    const base = patchSet ? shortOid(patchSet.baseCommit) : T('code_studio.panes.commit.base_unknown');
     originKv.entries = [
       { key: T('code_studio.panes.commit.author'), value: commit ? commit.author : '—' },
       { key: T('code_studio.panes.commit.branch'), value: branch },
@@ -1690,7 +1690,7 @@ export function renderCommitPane(hostEl, ctx) {
       {
         key: T('code_studio.panes.commit.source'),
         value: patchSet
-          ? T('code_studio.panes.commit.source_value', { id: patchSet.patch_set_id })
+          ? T('code_studio.panes.commit.source_value', { id: patchSet.patchSetId })
           : T('code_studio.panes.commit.source_unknown'),
       },
       {
@@ -1699,7 +1699,7 @@ export function renderCommitPane(hostEl, ctx) {
           ? patchStatusLabel(patchSet.status)
           : T('code_studio.panes.commit.review_unknown'),
         chip: patchSet ? T('code_studio.panes.commit.review_by', {
-          who: patchSet.decided_by || T('code_studio.panes.commit.review_nobody'),
+          who: patchSet.decidedBy || T('code_studio.panes.commit.review_nobody'),
         }) : null,
         chipTone: 'ok',
       },
@@ -1713,8 +1713,8 @@ export function renderCommitPane(hostEl, ctx) {
         rowButton(
           {
             onClick: () => ctx.openInStage('zmiany', file.path, T(kind.labelKey), {
-              patchSetId: patchSet ? patchSet.patch_set_id : '',
-              patchFileId: file.patch_file_id,
+              patchSetId: patchSet ? patchSet.patchSetId : '',
+              patchFileId: file.patchFileId,
             }),
           },
           statusMark(kind),
@@ -1743,7 +1743,7 @@ export function renderCommitPane(hostEl, ctx) {
         call(ctx, 'codeStudioPatchSetGetRequest', { patchSetId: data.patchSetId })
           .then((body_) => {
             if (disposed) return;
-            patchSet = body_.patch_set || null;
+            patchSet = body_.patchSet || null;
             files = (Array.isArray(body_.files) ? body_.files : [])
               .filter((f) => f.status === 'accepted' || f.status === 'partially_accepted');
             paint();
@@ -1866,7 +1866,7 @@ export function renderTimelinePane(hostEl, ctx) {
       const raw = resp.rows || [];
       rows = raw.map(normalizeRow);
       paint();
-      if (resp.nextCursor || resp.next_cursor) {
+      if (resp.nextCursor) {
         toast(T('code_studio.panes.timeline.truncated', { count: TIMELINE_PAGE }), 'info');
       }
     } catch (err) {
@@ -1971,7 +1971,7 @@ export function renderFileTreeDock(hostEl, ctx) {
       if (disposed) return;
       const map = new Map();
       for (const entry of body_.entries || []) {
-        const code = `${entry.index_status || ''}${entry.worktree_status || ''}`;
+        const code = `${entry.indexStatus || ''}${entry.worktreeStatus || ''}`;
         if (code.includes('U') || code.includes('!')) map.set(entry.path, CONFLICT_KIND);
         else if (code.includes('A') || code.includes('?')) map.set(entry.path, CHANGE_KIND.add);
         else if (code.includes('D')) map.set(entry.path, CHANGE_KIND.delete);
@@ -2092,11 +2092,11 @@ export function renderChangesDock(hostEl, ctx) {
           {
             tone: file.status === 'conflicted' ? 'err' : null,
             onClick: () => {
-              bus.selectedFileId = file.patch_file_id;
+              bus.selectedFileId = file.patchFileId;
               busEmit(bus, 'select');
               ctx.openInStage('zmiany', file.path, T(kind.labelKey), {
-                patchSetId: bus.patchSet ? bus.patchSet.patch_set_id : '',
-                patchFileId: file.patch_file_id,
+                patchSetId: bus.patchSet ? bus.patchSet.patchSetId : '',
+                patchFileId: file.patchFileId,
               });
             },
           },
@@ -2131,7 +2131,7 @@ export function renderChangesDock(hostEl, ctx) {
   function onRejectRest() {
     for (const file of bus.files) {
       for (const hunk of file.hunks || []) {
-        if (!decisionOf(bus, hunk)) bus.decisions.set(hunk.patch_hunk_id, 'reject');
+        if (!decisionOf(bus, hunk)) bus.decisions.set(hunk.patchHunkId, 'reject');
       }
     }
     paintLegend();
@@ -2152,7 +2152,7 @@ export function renderChangesDock(hostEl, ctx) {
   return {
     update(data = {}) {
       if (disposed) return;
-      if (data.patchSetId && (!bus.patchSet || bus.patchSet.patch_set_id !== data.patchSetId)) {
+      if (data.patchSetId && (!bus.patchSet || bus.patchSet.patchSetId !== data.patchSetId)) {
         loadPatchSet(ctx, bus, data.patchSetId)
           .catch((err) => failed(err, 'code_studio.panes.changes.load_failed'));
         return;
@@ -2162,9 +2162,9 @@ export function renderChangesDock(hostEl, ctx) {
       // empty column until someone clicks a patch card in the stream.
       if (!bus.patchSet && Array.isArray(data.patchSets) && data.patchSets.length) {
         const newest = [...data.patchSets]
-          .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0];
+          .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))[0];
         if (newest) {
-          loadPatchSet(ctx, bus, newest.patch_set_id)
+          loadPatchSet(ctx, bus, newest.patchSetId)
             .catch((err) => failed(err, 'code_studio.panes.changes.load_failed'));
         }
       }
@@ -2225,7 +2225,7 @@ export function renderGitDock(hostEl, ctx) {
         : T('code_studio.panes.git.wt_work');
       const sub = wt.branch
         ? T('code_studio.panes.git.wt_sub_branch', { kind: label, branch: wt.branch })
-        : T('code_studio.panes.git.wt_sub_detached', { kind: label, base: shortOid(wt.base_commit) });
+        : T('code_studio.panes.git.wt_sub_detached', { kind: label, base: shortOid(wt.baseCommit) });
       row.append(
         icon(wt.purpose === 'integration' ? 'grid-rows' : 'folder'),
         el('span', { class: 'wt-txt' },
@@ -2256,7 +2256,7 @@ export function renderGitDock(hostEl, ctx) {
           el('span', { class: 'gmsg', text: commit.subject }),
           el('span', {
             class: 'gmeta',
-            text: `${shortOid(commit.oid || commit.short_oid)} · ${relDate(commit.date)}`,
+            text: `${shortOid(commit.oid || commit.shortOid)} · ${relDate(commit.date)}`,
           })),
       );
       frag.appendChild(row);
@@ -2356,20 +2356,20 @@ export function renderTerminalDock(hostEl, ctx) {
       frag.appendChild(
         rowButton(
           {
-            active: item.terminal_id === activeId,
+            active: item.terminalId === activeId,
             onClick: () => {
-              activeId = item.terminal_id;
+              activeId = item.terminalId;
               paint();
-              ctx.openInStage('terminal', item.terminal_id,
+              ctx.openInStage('terminal', item.terminalId,
                 T('code_studio.panes.terminal.profile', {
-                  mount: item.mount_access || 'cow',
-                  network: item.network_access || 'none',
+                  mount: item.mountAccess || 'cow',
+                  network: item.networkAccess || 'none',
                 }),
                 { label: item.title || T('code_studio.panes.terminal.shell') });
             },
           },
           icon('code'),
-          el('span', { class: 'cs-row-label', text: item.title || item.terminal_id }),
+          el('span', { class: 'cs-row-label', text: item.title || item.terminalId }),
           el('span', { class: 'n', text: terminalStateLabel(item.state) }),
         ),
       );
@@ -2387,19 +2387,19 @@ export function renderTerminalDock(hostEl, ctx) {
       sessions = [
         ...sessions,
         {
-          terminal_id: body_.terminal_id,
+          terminalId: body_.terminalId,
           title: T('code_studio.panes.terminal.shell'),
           state: 'idle',
-          mount_access: body_.mount_access,
-          network_access: body_.network_access,
+          mountAccess: body_.mountAccess,
+          networkAccess: body_.networkAccess,
         },
       ];
-      activeId = body_.terminal_id;
+      activeId = body_.terminalId;
       paint();
-      ctx.openInStage('terminal', body_.terminal_id,
+      ctx.openInStage('terminal', body_.terminalId,
         T('code_studio.panes.terminal.profile', {
-          mount: body_.mount_access || 'cow',
-          network: body_.network_access || 'none',
+          mount: body_.mountAccess || 'cow',
+          network: body_.networkAccess || 'none',
         }),
         { label: T('code_studio.panes.terminal.shell') });
     } catch (err) {

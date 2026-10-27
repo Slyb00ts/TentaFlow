@@ -15,6 +15,13 @@ fn acquire(pool: &DbPool) -> Result<parking_lot::MutexGuard<'_, rusqlite::Connec
         .map_err(|e| anyhow::anyhow!("Blad blokady bazy: {}", e))
 }
 
+/// Pooled read-only connection. Plain SELECT helpers use it so a list or lookup
+/// never queues behind the one process-wide writer mutex held by a slow write.
+fn acquire_read(pool: &DbPool) -> Result<crate::db::ReadGuard<'_>> {
+    pool.read()
+        .map_err(|e| anyhow::anyhow!("Blad polaczenia odczytu: {}", e))
+}
+
 /// Public connection handle for the baseline-adopt path, which drives its whole
 /// snapshot/import inside a single externally-managed transaction.
 ///
@@ -559,7 +566,7 @@ fn decode_hex(s: &str) -> Result<Vec<u8>> {
 
 /// Lists keys for the dashboard. The verifier is never returned on lists.
 pub fn list_api_keys(pool: &DbPool) -> Result<Vec<DbApiKey>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, uid, key_prefix, name, key_type, subject_id, rate_limit_rps, \
                 is_active, created_at, last_used_at \
@@ -766,7 +773,7 @@ pub fn delete_api_key_by_uid(
 }
 
 pub fn get_api_key_by_uid(pool: &DbPool, uid: &str) -> Result<Option<DbApiKey>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM api_keys WHERE uid = ?1",
         API_KEY_COLS
@@ -890,7 +897,7 @@ pub fn verify_api_key(pool: &DbPool, key_verifier: &str) -> Result<Option<DbApiK
 // --- Settings ---
 
 pub fn get_setting(pool: &DbPool, key: &str) -> Result<Option<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let result = conn
         .query_row(
             "SELECT value FROM settings WHERE key = ?1",
@@ -939,7 +946,7 @@ pub fn set_setting_tx(tx: &rusqlite::Transaction<'_>, key: &str, value: &str) ->
 /// Returns just the org ids. Used by the sync backfill pre-gate, which must
 /// enumerate orgs WITHOUT a full ledger scan to compare permission epochs.
 pub fn list_all_org_ids(pool: &DbPool) -> Result<Vec<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare("SELECT org_id FROM organizations ORDER BY org_id ASC")?;
     let ids = stmt
         .query_map([], |row| row.get::<_, String>(0))?
@@ -1250,7 +1257,7 @@ pub fn delete_setting(pool: &DbPool, key: &str) -> Result<()> {
 }
 
 pub fn list_settings(pool: &DbPool) -> Result<Vec<DbSetting>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt =
         conn.prepare_cached("SELECT key, value, updated_at FROM settings ORDER BY key")?;
     let settings = stmt
@@ -1269,7 +1276,7 @@ pub fn list_settings(pool: &DbPool) -> Result<Vec<DbSetting>> {
 /// Uzywane m.in. przez `net::iroh::pairing::sanitize_trusted_contacts` do iteracji
 /// po wpisach `trusted_contact:*` bez wczytywania calej tabeli.
 pub fn list_settings_with_prefix(pool: &DbPool, prefix: &str) -> Result<Vec<(String, String)>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let pattern = format!("{}%", prefix);
     let mut stmt = conn.prepare_cached(
         "SELECT key, value FROM settings WHERE key LIKE ?1 ESCAPE '\\' ORDER BY key",
@@ -1291,7 +1298,7 @@ pub const SUPPORTED_USER_LANGUAGES: &[&str] = &["pl", "en", "fr", "es", "de"];
 
 /// Zwraca preferowany jezyk uzytkownika lub None jesli brak preferencji.
 pub fn get_user_preferred_language(pool: &DbPool, user_id: &str) -> Result<Option<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let result = conn
         .query_row(
             "SELECT preferred_language FROM user_accounts WHERE id = ?1",
@@ -1328,7 +1335,7 @@ pub fn set_user_preferred_language(pool: &DbPool, user_id: &str, lang: Option<&s
 const PROMPT_COLS: &str = "id, prompt_id, name, description, content, prompt_type, default_model, variables, cache_priority, is_active, version, language, is_system, created_at, updated_at";
 
 pub fn list_prompts(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbPrompt>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM prompts ORDER BY name LIMIT ?1 OFFSET ?2",
         PROMPT_COLS
@@ -1340,7 +1347,7 @@ pub fn list_prompts(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbProm
 }
 
 pub fn get_prompt(pool: &DbPool, id: i64) -> Result<Option<DbPrompt>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM prompts WHERE id = ?1",
         PROMPT_COLS
@@ -1352,7 +1359,7 @@ pub fn get_prompt(pool: &DbPool, id: i64) -> Result<Option<DbPrompt>> {
 }
 
 pub fn get_prompt_by_prompt_id(pool: &DbPool, prompt_id: &str) -> Result<Option<DbPrompt>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM prompts WHERE prompt_id = ?1 ORDER BY (language = 'pl') DESC, language ASC LIMIT 1",
         PROMPT_COLS
@@ -1367,7 +1374,7 @@ pub fn get_prompt_by_prompt_id(pool: &DbPool, prompt_id: &str) -> Result<Option<
 /// per-jezyk, ale baza domyslnie ma polski seed wiec ten sam prompt zadziala
 /// gdy lokal nie jest przetlumaczony.
 pub fn find_prompt(pool: &DbPool, prompt_id: &str, language: &str) -> Result<Option<DbPrompt>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM prompts WHERE prompt_id = ?1 AND language = ?2",
         PROMPT_COLS
@@ -1441,7 +1448,7 @@ fn row_to_model_alias(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbModelAlias>
 }
 
 pub fn list_model_aliases(pool: &DbPool) -> Result<Vec<DbModelAlias>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM model_aliases ORDER BY alias",
         MODEL_ALIAS_COLS
@@ -1453,7 +1460,7 @@ pub fn list_model_aliases(pool: &DbPool) -> Result<Vec<DbModelAlias>> {
 }
 
 pub fn get_model_alias(pool: &DbPool, id: i64) -> Result<Option<DbModelAlias>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM model_aliases WHERE id = ?1",
         MODEL_ALIAS_COLS
@@ -2439,7 +2446,7 @@ pub fn record_model_visibility_change_within_tx(
 /// are implicitly `restricted` and are not enumerated here (the UI seeds them
 /// from the catalog/services list and overlays this map).
 pub fn list_model_visibility(pool: &DbPool) -> Result<Vec<DbModelVisibility>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT model_id, visibility, updated_at, updated_by_user_id \
          FROM model_visibility ORDER BY model_id",
@@ -2459,7 +2466,7 @@ pub fn list_model_visibility(pool: &DbPool) -> Result<Vec<DbModelVisibility>> {
 
 /// Full consumer grant timeline for a model (active and revoked rows).
 pub fn list_model_consumers(pool: &DbPool, model_id: &str) -> Result<Vec<DbAccessConsumer>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT consumer_addon_id, granted_by_user_id, granted_at, revoked_at \
          FROM model_consumers WHERE model_id = ?1 ORDER BY granted_at",
@@ -2479,7 +2486,7 @@ pub fn list_model_consumers(pool: &DbPool, model_id: &str) -> Result<Vec<DbAcces
 
 /// Every `[[uses_model]]` declaration of an addon with its reconciled status.
 pub fn list_addon_uses_model(pool: &DbPool, addon_id: &str) -> Result<Vec<DbAddonUses>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT addon_id, model_target_name, required, reason, grant_status, grant_decided_at \
          FROM addon_uses_model WHERE addon_id = ?1 ORDER BY model_target_name",
@@ -2502,7 +2509,7 @@ pub fn list_addon_uses_model(pool: &DbPool, addon_id: &str) -> Result<Vec<DbAddo
 /// Reverse view: every addon declaring it consumes `model_id`, with status.
 /// Used by the model detail panel ("who uses this model").
 pub fn list_model_consumed_by(pool: &DbPool, model_id: &str) -> Result<Vec<DbAddonUses>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT addon_id, model_target_name, required, reason, grant_status, grant_decided_at \
          FROM addon_uses_model WHERE model_target_name = ?1 ORDER BY addon_id",
@@ -2525,7 +2532,7 @@ pub fn list_model_consumed_by(pool: &DbPool, model_id: &str) -> Result<Vec<DbAdd
 /// Full consumer grant timeline for an alias (active and revoked rows).
 /// Mirror of `list_model_consumers` for the alias subtree (M16b needs it).
 pub fn list_alias_consumers(pool: &DbPool, alias_id: i64) -> Result<Vec<DbAccessConsumer>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT consumer_addon_id, granted_by_user_id, granted_at, revoked_at \
          FROM model_alias_consumers WHERE alias_id = ?1 ORDER BY granted_at",
@@ -2546,7 +2553,7 @@ pub fn list_alias_consumers(pool: &DbPool, alias_id: i64) -> Result<Vec<DbAccess
 /// Every `[[uses_alias]]` declaration of an addon with its grant_status.
 /// Mirror of `list_addon_uses_model` for the alias subtree (M12b needs it).
 pub fn list_addon_uses_alias(pool: &DbPool, addon_id: &str) -> Result<Vec<DbAddonUses>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT addon_id, alias_target_name, required, reason, grant_status, grant_decided_at \
          FROM addon_uses_alias WHERE addon_id = ?1 ORDER BY alias_target_name",
@@ -2974,6 +2981,160 @@ fn alias_is_inbound_target_within_tx(
     Ok(false)
 }
 
+/// Whether an alias is a Sync Ledger resource on this node. An alias owned by
+/// an addon is materialized by that addon's install on every node that has it,
+/// so its row, its activation flips and its removal are local: replicating them
+/// would let one node's uninstall delete the alias another node's addon still
+/// serves. Every other alias (admin, vision import, platform seed) replicates.
+pub(crate) fn model_alias_replicates(conn: &rusqlite::Connection, alias: &str) -> Result<bool> {
+    let owner_type: Option<String> = conn
+        .query_row(
+            "SELECT o.owner_type FROM model_alias_owners o \
+             JOIN model_aliases a ON a.id = o.alias_id WHERE a.alias = ?1",
+            rusqlite::params![alias],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(owner_type.as_deref() != Some("addon"))
+}
+
+/// Whether removing `alias` is replicated. Platform aliases are recreated by
+/// the seed on the next start, so a replicated delete would only make nodes
+/// disagree about whether the alias exists.
+pub(crate) fn model_alias_removal_replicates(
+    conn: &rusqlite::Connection,
+    alias: &str,
+) -> Result<bool> {
+    Ok(!crate::db::seed::is_platform_seeded_alias(alias) && model_alias_replicates(conn, alias)?)
+}
+
+fn model_alias_changed_fields(
+    row: &DbModelAlias,
+) -> BTreeMap<String, crate::sync::ledger::FieldValue> {
+    let mut fields = BTreeMap::new();
+    fields.insert("alias".to_string(), field_string(&row.alias));
+    fields.insert("target_model".to_string(), field_string(&row.target_model));
+    fields.insert("is_active".to_string(), field_bool(row.is_active));
+    fields.insert(
+        "fallback_targets".to_string(),
+        field_optional_string(row.fallback_targets.as_deref()),
+    );
+    fields.insert(
+        "strategy".to_string(),
+        field_optional_string(row.strategy.as_deref()),
+    );
+    fields
+}
+
+/// Records the current state of `alias` as a ledger write when it replicates.
+/// Reads the row back instead of taking values from the caller, so the capture
+/// is exactly what the table holds after the surrounding statement.
+pub(crate) fn capture_model_alias_upsert_tx(
+    tx: &rusqlite::Transaction<'_>,
+    alias: &str,
+) -> Result<()> {
+    let row = tx
+        .query_row(
+            &format!("SELECT {MODEL_ALIAS_COLS} FROM model_aliases WHERE alias = ?1"),
+            rusqlite::params![alias],
+            row_to_model_alias,
+        )
+        .optional()?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    if !model_alias_replicates(tx, &row.alias)? {
+        return Ok(());
+    }
+    record_core_capture_tx(
+        tx,
+        crate::sync::core_registry::CoreSyncResourceKind::ModelAlias,
+        row.alias.clone(),
+        crate::sync::runtime::SqlWriteAction::Insert,
+        model_alias_changed_fields(&row),
+        None,
+    )?;
+    Ok(())
+}
+
+fn capture_model_alias_delete_tx(tx: &rusqlite::Transaction<'_>, alias: &str) -> Result<()> {
+    let mut fields = BTreeMap::new();
+    fields.insert("alias".to_string(), field_string(alias));
+    record_core_capture_tx(
+        tx,
+        crate::sync::core_registry::CoreSyncResourceKind::ModelAlias,
+        alias.to_string(),
+        crate::sync::runtime::SqlWriteAction::Delete,
+        fields,
+        None,
+    )?;
+    Ok(())
+}
+
+/// Aliases the ledger is told about when it is seeded from the table: no
+/// addon-owned rows, and no platform alias still at its seed value — a node
+/// restating its untouched defaults would otherwise win last-writer-wins over a
+/// binding an admin set elsewhere.
+fn replicable_model_aliases(conn: &rusqlite::Connection) -> Result<Vec<DbModelAlias>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MODEL_ALIAS_COLS} FROM model_aliases a \
+         WHERE NOT EXISTS (SELECT 1 FROM model_alias_owners o \
+                           WHERE o.alias_id = a.id AND o.owner_type = 'addon') \
+         ORDER BY alias"
+    ))?;
+    let rows = stmt
+        .query_map([], row_to_model_alias)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            !crate::db::seed::is_untouched_platform_alias(
+                &row.alias,
+                &row.target_model,
+                row.fallback_targets.as_deref(),
+            )
+        })
+        .collect())
+}
+
+/// Settings key marking that the aliases that predate the ledger were captured.
+const MODEL_ALIAS_LEDGER_BACKFILL_KEY: &str = "model_alias_ledger_backfill";
+
+/// One-shot capture of the aliases an upgraded node already holds, so they
+/// reach the ledger instead of staying local forever. Returns the number of
+/// captures written; zero once the marker is set.
+pub fn backfill_model_alias_captures(pool: &DbPool) -> Result<usize> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let done: Option<String> = tx
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            rusqlite::params![MODEL_ALIAS_LEDGER_BACKFILL_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if done.is_some() {
+        return Ok(0);
+    }
+    let rows = replicable_model_aliases(&tx)?;
+    for row in &rows {
+        record_core_capture_tx(
+            &tx,
+            crate::sync::core_registry::CoreSyncResourceKind::ModelAlias,
+            row.alias.clone(),
+            crate::sync::runtime::SqlWriteAction::Insert,
+            model_alias_changed_fields(row),
+            None,
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, '1')",
+        rusqlite::params![MODEL_ALIAS_LEDGER_BACKFILL_KEY],
+    )?;
+    tx.commit()?;
+    Ok(rows.len())
+}
+
 /// Atomic create — chain check + insert under a single transaction so two
 /// concurrent admin writes cannot pass the validation independently and
 /// then jointly create an alias chain.
@@ -3033,7 +3194,9 @@ pub(crate) fn create_model_alias_with_chain_check_tx(
         "INSERT INTO model_aliases (alias, target_model, is_active, fallback_targets, strategy) VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![alias, target_model, active, fallback_targets, strategy.unwrap_or("first_available")],
     )?;
-    Ok(tx.last_insert_rowid())
+    let id = tx.last_insert_rowid();
+    capture_model_alias_upsert_tx(tx, alias)?;
+    Ok(id)
 }
 
 /// Atomic update — same rationale as the create variant.
@@ -3097,64 +3260,52 @@ pub(crate) fn update_model_alias_with_chain_check_tx(
             alias
         );
     }
+    // The ledger keys an alias by name, so a rename is the removal of the old
+    // name plus a write of the new one.
+    let previous_name: Option<String> = tx
+        .query_row(
+            "SELECT alias FROM model_aliases WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let renamed_away = match previous_name {
+        Some(old) if old != alias && model_alias_removal_replicates(tx, &old)? => Some(old),
+        _ => None,
+    };
     tx.execute(
         "UPDATE model_aliases SET alias = ?2, target_model = ?3, is_active = ?4, fallback_targets = ?5, strategy = ?6 WHERE id = ?1",
         rusqlite::params![id, alias, target_model, is_active, fallback_targets, strategy.unwrap_or("first_available")],
     )?;
+    if let Some(old) = renamed_away {
+        capture_model_alias_delete_tx(tx, &old)?;
+    }
+    capture_model_alias_upsert_tx(tx, alias)?;
     Ok(())
 }
 
 pub fn delete_model_alias(pool: &DbPool, id: i64) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let alias: Option<String> = tx
+        .query_row(
+            "SELECT alias FROM model_aliases WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(alias) = alias else {
+        return Ok(());
+    };
+    // Decided before the delete: the owner row that classifies the alias goes
+    // away with it.
+    let replicated = model_alias_removal_replicates(&tx, &alias)?;
+    tx.execute(
         "DELETE FROM model_aliases WHERE id = ?1",
         rusqlite::params![id],
     )?;
-    Ok(())
-}
-
-/// Zapisuje pelny snapshot aliasow otrzymany przez mesh sync
-/// (`MESH_MSG_ALIAS_SYNC`). Upsert po nazwie aliasu zachowuje lokalne `id`
-/// (tabele FK: owners/visibility/consumers wisza na `alias_id`), a wpisy
-/// nieobecne w snapshocie sa usuwane. Walidacja chain-check jest pomijana —
-/// nadawca zwalidowal mutacje przed broadcastem.
-pub fn replace_model_aliases_from_sync(pool: &DbPool, aliases: &[DbModelAlias]) -> Result<()> {
-    let conn = acquire(pool)?;
-    let tx = conn.unchecked_transaction()?;
-    for a in aliases {
-        tx.execute(
-            "INSERT INTO model_aliases (alias, target_model, is_active, fallback_targets, strategy) \
-             VALUES (?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT(alias) DO UPDATE SET \
-                target_model = excluded.target_model, \
-                is_active = excluded.is_active, \
-                fallback_targets = excluded.fallback_targets, \
-                strategy = excluded.strategy",
-            rusqlite::params![
-                a.alias,
-                a.target_model,
-                a.is_active,
-                a.fallback_targets,
-                a.strategy
-            ],
-        )?;
-    }
-    // Usun lokalne aliasy spoza snapshotu — snapshot jest pelnym stanem nadawcy.
-    let names: Vec<&str> = aliases.iter().map(|a| a.alias.as_str()).collect();
-    if names.is_empty() {
-        tx.execute("DELETE FROM model_aliases", [])?;
-    } else {
-        let placeholders = (1..=names.len())
-            .map(|i| format!("?{}", i))
-            .collect::<Vec<_>>()
-            .join(", ");
-        tx.execute(
-            &format!(
-                "DELETE FROM model_aliases WHERE alias NOT IN ({})",
-                placeholders
-            ),
-            rusqlite::params_from_iter(names.iter()),
-        )?;
+    if replicated {
+        capture_model_alias_delete_tx(&tx, &alias)?;
     }
     tx.commit()?;
     Ok(())
@@ -3424,6 +3575,7 @@ pub fn create_or_reactivate_model_alias_within_tx(
         rusqlite::params![alias_id, alias, changed_by_addon, after_snapshot, change_type],
     )?;
 
+    capture_model_alias_upsert_tx(tx, alias)?;
     Ok(alias_id)
 }
 
@@ -3818,7 +3970,7 @@ pub fn create_cluster(
 }
 
 pub fn list_clusters(pool: &DbPool) -> Result<Vec<DbCluster>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM clusters ORDER BY name",
         CLUSTER_COLS
@@ -3830,7 +3982,7 @@ pub fn list_clusters(pool: &DbPool) -> Result<Vec<DbCluster>> {
 }
 
 pub fn get_cluster(pool: &DbPool, cluster_id: &str) -> Result<Option<DbCluster>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM clusters WHERE cluster_id = ?1",
         CLUSTER_COLS
@@ -3982,7 +4134,7 @@ pub fn remove_cluster_member(pool: &DbPool, cluster_id: &str, node_id: &str) -> 
 pub fn list_clusters_with_counts(
     pool: &DbPool,
 ) -> Result<Vec<crate::db::models::DbClusterWithCounts>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let sql = format!(
         "SELECT {}, \
          (SELECT COUNT(*) FROM cluster_members cm WHERE cm.cluster_id = c.cluster_id) AS members_count \
@@ -4049,7 +4201,7 @@ pub fn update_cluster_full(
 }
 
 pub fn list_cluster_members(pool: &DbPool, cluster_id: &str) -> Result<Vec<DbClusterMember>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM cluster_members WHERE cluster_id = ?1 ORDER BY joined_at",
         CLUSTER_MEMBER_COLS
@@ -4191,7 +4343,7 @@ pub fn get_cluster_deployment(
     pool: &DbPool,
     deployment_cluster_id: &str,
 ) -> Result<Option<DbClusterDeployment>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM cluster_deployments WHERE deployment_cluster_id = ?1",
         CLUSTER_DEPLOYMENT_COLS
@@ -4209,7 +4361,7 @@ pub fn list_cluster_deployment_members(
     pool: &DbPool,
     deployment_cluster_id: &str,
 ) -> Result<Vec<DbClusterDeploymentMember>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT deployment_cluster_id, node_id, role, container_name FROM cluster_deployment_members WHERE deployment_cluster_id = ?1 ORDER BY role DESC, node_id",
     )?;
@@ -4243,7 +4395,7 @@ pub fn active_cluster_deployment(
     pool: &DbPool,
     cluster_id: &str,
 ) -> Result<Option<DbClusterDeployment>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM cluster_deployments WHERE cluster_id = ?1 AND status IN ('deploying','running','starting','degraded','stopped') ORDER BY created_at LIMIT 1",
         CLUSTER_DEPLOYMENT_COLS
@@ -4290,7 +4442,7 @@ pub fn failed_cluster_deployments(
     pool: &DbPool,
     cluster_id: &str,
 ) -> Result<Vec<DbClusterDeployment>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM cluster_deployments WHERE cluster_id = ?1 AND status = 'failed' ORDER BY created_at",
         CLUSTER_DEPLOYMENT_COLS
@@ -4320,13 +4472,27 @@ pub fn list_all_cluster_members(pool: &DbPool) -> Result<Vec<DbClusterMember>> {
 const FLOW_COLS: &str = "id, name, description, version, is_default, service_type, flow_json, status, published_model_name, created_at, updated_at, is_system";
 
 pub fn list_flows(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbFlow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flows ORDER BY name LIMIT ?1 OFFSET ?2",
         FLOW_COLS
     ))?;
     let rows = stmt
         .query_map(rusqlite::params![limit, offset], row_to_flow)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Active flows that advertise a catalog model name. The catalog is rebuilt on
+/// every flow/alias mutation, so it must not load every flow body in the table.
+pub fn list_published_active_flows(pool: &DbPool) -> Result<Vec<DbFlow>> {
+    let conn = acquire_read(pool)?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {} FROM flows WHERE status = 'active' AND published_model_name IS NOT NULL ORDER BY name",
+        FLOW_COLS
+    ))?;
+    let rows = stmt
+        .query_map([], row_to_flow)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -4339,7 +4505,7 @@ pub fn list_active_flows_after(
     after: Option<(&str, &str)>,
     limit: i64,
 ) -> Result<Vec<DbFlow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let (name, id) = after.unzip();
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flows WHERE status = 'active' AND (?1 IS NULL OR name > ?1 OR (name = ?1 AND id > ?2)) \
@@ -4353,7 +4519,7 @@ pub fn list_active_flows_after(
 }
 
 pub fn get_flow(pool: &DbPool, id: &str) -> Result<Option<DbFlow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt =
         conn.prepare_cached(&format!("SELECT {} FROM flows WHERE id = ?1", FLOW_COLS))?;
     let result = stmt
@@ -4366,7 +4532,7 @@ pub fn get_default_flow_for_service_type(
     pool: &DbPool,
     service_type: &str,
 ) -> Result<Option<DbFlow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flows WHERE is_default = 1 AND service_type = ?1 AND status = 'active' LIMIT 1", FLOW_COLS
     ))?;
@@ -6600,6 +6766,20 @@ pub fn reseed_core_state_from_current_rows(pool: &DbPool) -> Result<usize> {
                     emitted += 1;
                 }
             }
+            K::ModelAlias => {
+                for row in replicable_model_aliases(&tx)? {
+                    record_core_capture_for_org_tx(
+                        &tx,
+                        descriptor.kind,
+                        crate::services::org::DEFAULT_ORG_ID,
+                        row.alias.clone(),
+                        Insert,
+                        model_alias_changed_fields(&row),
+                        None,
+                    )?;
+                    emitted += 1;
+                }
+            }
             K::CameraCvPipeline => {
                 let mut stmt = tx.prepare(
                     "SELECT id, name, pipeline_json, is_default, org_id FROM camera_cv_pipelines",
@@ -7727,7 +7907,7 @@ fn row_to_flow_version_full(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowV
 
 /// Zwraca liste wersji (bez flow_json) posortowana malejaco, max 5.
 pub fn list_flow_versions(pool: &DbPool, flow_id: &str) -> Result<Vec<DbFlowVersion>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_versions WHERE flow_id = ?1 \
          ORDER BY version_num DESC LIMIT {}",
@@ -7912,7 +8092,7 @@ fn row_to_flow_binding(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowModelB
 }
 
 pub fn list_flow_model_bindings(pool: &DbPool) -> Result<Vec<DbFlowModelBinding>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_model_bindings ORDER BY priority DESC",
         FLOW_BINDING_COLS
@@ -7924,7 +8104,7 @@ pub fn list_flow_model_bindings(pool: &DbPool) -> Result<Vec<DbFlowModelBinding>
 }
 
 pub fn get_flow_model_binding(pool: &DbPool, id: &str) -> Result<Option<DbFlowModelBinding>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_model_bindings WHERE id = ?1",
         FLOW_BINDING_COLS
@@ -8354,7 +8534,7 @@ fn skill_file_changed_fields(
 }
 
 pub fn list_skills(pool: &DbPool, filter: &SkillListFilter<'_>) -> Result<Vec<DbSkill>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut sql = format!("SELECT {SKILL_COLS} FROM skills WHERE 1=1");
     let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
     if let Some(source) = &filter.source {
@@ -8380,7 +8560,7 @@ pub fn list_skills(pool: &DbPool, filter: &SkillListFilter<'_>) -> Result<Vec<Db
 }
 
 pub fn get_skill(pool: &DbPool, id: &str) -> Result<Option<DbSkill>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt =
         conn.prepare_cached(&format!("SELECT {SKILL_COLS} FROM skills WHERE id = ?1"))?;
     let result = stmt
@@ -8652,7 +8832,7 @@ pub fn create_curator_snapshot(
 }
 
 pub fn get_curator_snapshot(pool: &DbPool, snapshot_id: &str) -> Result<Option<DbCuratorSnapshot>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, proposal_json, status, created_by, created_at, applied_at, rolled_back_at \
          FROM skill_curator_snapshots WHERE id = ?1",
@@ -8677,7 +8857,7 @@ pub fn list_curator_snapshot_rows(
     pool: &DbPool,
     snapshot_id: &str,
 ) -> Result<Vec<DbCuratorSnapshotRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT skill_id, existed, name, display_name, description, content, tags_json, \
          category, source, source_ref, status, files_json \
@@ -9327,7 +9507,7 @@ pub struct CliAgentRow {
 /// where every agent is an LLM agent that question must not read (and parse)
 /// the whole agents table.
 pub fn list_cli_agents(pool: &DbPool) -> Result<Vec<CliAgentRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare(
         "SELECT id, name, display_name, runtime_json FROM agents \
          WHERE runtime_json <> ?1 ORDER BY name, id",
@@ -9346,7 +9526,7 @@ pub fn list_cli_agents(pool: &DbPool) -> Result<Vec<CliAgentRow>> {
 }
 
 pub fn get_agent(pool: &DbPool, id: &str) -> Result<Option<DbAgent>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     get_agent_on(&conn, id)
 }
 
@@ -9598,7 +9778,7 @@ pub fn append_agent_run_log(pool: &DbPool, id: &str, step_json: &str) -> Result<
 }
 
 pub fn list_agent_runs(pool: &DbPool, filter: &AgentRunListFilter<'_>) -> Result<Vec<DbAgentRun>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut sql = format!("SELECT {AGENT_RUN_COLS} FROM agent_runs WHERE 1=1");
     let mut binds: Vec<&dyn rusqlite::ToSql> = Vec::new();
     if let Some(agent_id) = &filter.agent_id {
@@ -9628,7 +9808,7 @@ pub fn list_agent_runs(pool: &DbPool, filter: &AgentRunListFilter<'_>) -> Result
 /// Active runs are everything not in a terminal state — the set the
 /// `AgentRunManager` rehydrates and the dashboard shows as "in flight".
 pub fn list_active_agent_runs(pool: &DbPool) -> Result<Vec<DbAgentRun>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {AGENT_RUN_COLS} FROM agent_runs \
          WHERE status IN ({}) \
@@ -9696,7 +9876,7 @@ pub fn list_undelivered_mailbox_for_session(
     pool: &DbPool,
     session_id: &str,
 ) -> Result<Vec<DbAgentMailbox>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {AGENT_MAILBOX_COLS} FROM agent_mailbox \
          WHERE target_session_id = ?1 AND delivered_at IS NULL \
@@ -9714,7 +9894,7 @@ pub fn list_undelivered_mailbox_for_agent(
     pool: &DbPool,
     agent_id: &str,
 ) -> Result<Vec<DbAgentMailbox>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {AGENT_MAILBOX_COLS} FROM agent_mailbox \
          WHERE target_agent_id = ?1 AND delivered_at IS NULL \
@@ -10373,7 +10553,7 @@ fn row_to_node_template(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowNodeT
 }
 
 pub fn list_flow_node_templates(pool: &DbPool) -> Result<Vec<DbFlowNodeTemplate>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_node_templates ORDER BY category, label",
         NODE_TEMPLATE_COLS
@@ -10385,7 +10565,7 @@ pub fn list_flow_node_templates(pool: &DbPool) -> Result<Vec<DbFlowNodeTemplate>
 }
 
 pub fn get_flow_node_template(pool: &DbPool, id: i64) -> Result<Option<DbFlowNodeTemplate>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_node_templates WHERE id = ?1",
         NODE_TEMPLATE_COLS
@@ -10474,7 +10654,7 @@ pub fn list_pii_rules(
     offset: i64,
     limit: i64,
 ) -> Result<Vec<DbPiiRule>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM pii_rules WHERE org_id = ?1 ORDER BY priority DESC LIMIT ?2 OFFSET ?3",
         PII_RULE_COLS
@@ -10486,7 +10666,7 @@ pub fn list_pii_rules(
 }
 
 pub fn list_pii_rules_active(pool: &DbPool, org_id: &str) -> Result<Vec<DbPiiRule>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM pii_rules WHERE org_id = ?1 AND is_active = 1 ORDER BY priority DESC",
         PII_RULE_COLS
@@ -10498,7 +10678,7 @@ pub fn list_pii_rules_active(pool: &DbPool, org_id: &str) -> Result<Vec<DbPiiRul
 }
 
 pub fn get_pii_rule(pool: &DbPool, org_id: &str, id: &str) -> Result<Option<DbPiiRule>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM pii_rules WHERE org_id = ?1 AND id = ?2",
         PII_RULE_COLS
@@ -11114,7 +11294,7 @@ pub fn delete_token_quota(pool: &DbPool, org_id: &str, id: &str) -> Result<()> {
 }
 
 pub fn list_token_quotas(pool: &DbPool, org_id: &str) -> Result<Vec<TokenQuota>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM token_quota WHERE org_id = ?1 ORDER BY created_at",
         TOKEN_QUOTA_COLS
@@ -11128,7 +11308,7 @@ pub fn list_token_quotas(pool: &DbPool, org_id: &str) -> Result<Vec<TokenQuota>>
 /// Wszystkie aktywne limity wszystkich organizacji — koordynator dzierzaw musi
 /// widziec limity miedzy organizacjami, zeby przydzielic pule tokenow per org.
 pub fn list_all_active_token_quotas(pool: &DbPool) -> Result<Vec<TokenQuota>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM token_quota WHERE is_active = 1 ORDER BY org_id, created_at",
         TOKEN_QUOTA_COLS
@@ -11224,7 +11404,7 @@ pub fn get_token_lease(
     node_id: &str,
     period_key: &str,
 ) -> Result<Option<TokenLease>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let id = token_lease_id(quota_id, node_id, period_key);
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM token_lease WHERE id = ?1 AND org_id = ?2",
@@ -11237,7 +11417,7 @@ pub fn get_token_lease(
 }
 
 pub fn list_token_leases(pool: &DbPool, org_id: &str) -> Result<Vec<TokenLease>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM token_lease WHERE org_id = ?1 ORDER BY created_at",
         TOKEN_LEASE_COLS
@@ -11256,7 +11436,7 @@ pub fn applicable_token_quotas(
     user_id: &str,
     model_id: &str,
 ) -> Result<Vec<TokenQuota>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM token_quota \
          WHERE org_id = ?1 AND is_active = 1 \
@@ -11293,7 +11473,7 @@ fn quota_usage_period_clause(period: &str) -> &'static str {
 /// Sumuje `total_tokens` na WSZYSTKICH wezlach pasujacych do podmiotu limitu w
 /// danym oknie okresu (z opcjonalnym ograniczeniem model_id limitu). Zwraca 0 dla NULL.
 pub fn global_usage_for_quota(pool: &DbPool, quota: &TokenQuota, period_key: &str) -> Result<i64> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let period_clause = quota_usage_period_clause(&quota.period);
     let subject = quota.subject_id.as_deref().unwrap_or("");
     let model = quota.model_id.as_deref().unwrap_or("");
@@ -11354,7 +11534,7 @@ pub fn node_usage_for_quota(
     quota: &TokenQuota,
     period_key: &str,
 ) -> Result<i64> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let period_clause = quota_usage_period_clause(&quota.period);
     let subject = quota.subject_id.as_deref().unwrap_or("");
     let model = quota.model_id.as_deref().unwrap_or("");
@@ -11415,7 +11595,7 @@ pub fn usage_summary(
     period_key: &str,
     group_by: &str,
 ) -> Result<Vec<UsageSummaryRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let period_clause = if period == "monthly" {
         "substr(usage_day, 1, 7) = ?2"
     } else {
@@ -11933,7 +12113,7 @@ pub fn list_model_metrics_rollup(
     org_id: &str,
     filter: &crate::db::models::ModelMetricsFilter<'_>,
 ) -> Result<Vec<crate::db::models::DbModelMetricsRollup>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut sql =
         format!("SELECT {MODEL_METRICS_COLS} FROM model_metrics_rollup WHERE org_id = ?1");
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(org_id.to_string())];
@@ -12088,7 +12268,7 @@ pub fn get_model_pricing(
     org_id: &str,
     model_id: &str,
 ) -> Result<Option<crate::db::models::DbModelPricing>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT model_id, org_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each, \
          updated_at, embedding_per_1k FROM model_pricing WHERE org_id = ?1 AND model_id = ?2",
@@ -12115,7 +12295,7 @@ pub fn list_model_pricing(
     pool: &DbPool,
     org_id: &str,
 ) -> Result<Vec<crate::db::models::DbModelPricing>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT model_id, org_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each, \
          updated_at, embedding_per_1k FROM model_pricing WHERE org_id = ?1 ORDER BY model_id",
@@ -12147,7 +12327,7 @@ pub fn list_fast_path_patterns(
     offset: i64,
     limit: i64,
 ) -> Result<Vec<DbFastPathPattern>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM fast_path_patterns ORDER BY module, priority DESC LIMIT ?1 OFFSET ?2",
         FAST_PATH_COLS
@@ -12162,7 +12342,7 @@ pub fn list_fast_path_patterns_by_module(
     pool: &DbPool,
     module: &str,
 ) -> Result<Vec<DbFastPathPattern>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM fast_path_patterns WHERE module = ?1 AND is_active = 1 ORDER BY priority DESC", FAST_PATH_COLS
     ))?;
@@ -12173,7 +12353,7 @@ pub fn list_fast_path_patterns_by_module(
 }
 
 pub fn get_fast_path_pattern(pool: &DbPool, id: i64) -> Result<Option<DbFastPathPattern>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM fast_path_patterns WHERE id = ?1",
         FAST_PATH_COLS
@@ -12228,7 +12408,7 @@ pub fn list_tts_cleaning_rules(
     offset: i64,
     limit: i64,
 ) -> Result<Vec<DbTtsCleaningRule>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM tts_cleaning_rules ORDER BY priority LIMIT ?1 OFFSET ?2",
         TTS_RULE_COLS
@@ -12240,7 +12420,7 @@ pub fn list_tts_cleaning_rules(
 }
 
 pub fn list_tts_cleaning_rules_active(pool: &DbPool) -> Result<Vec<DbTtsCleaningRule>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM tts_cleaning_rules WHERE is_active = 1 ORDER BY priority",
         TTS_RULE_COLS
@@ -12252,7 +12432,7 @@ pub fn list_tts_cleaning_rules_active(pool: &DbPool) -> Result<Vec<DbTtsCleaning
 }
 
 pub fn get_tts_cleaning_rule(pool: &DbPool, id: i64) -> Result<Option<DbTtsCleaningRule>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM tts_cleaning_rules WHERE id = ?1",
         TTS_RULE_COLS
@@ -12306,7 +12486,7 @@ pub fn list_flow_executions(
     offset: i64,
     limit: i64,
 ) -> Result<Vec<DbFlowExecution>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_executions ORDER BY id DESC LIMIT ?1 OFFSET ?2",
         FLOW_EXEC_COLS
@@ -12322,7 +12502,7 @@ pub fn list_flow_executions_for_flow(
     flow_id: &str,
     limit: i64,
 ) -> Result<Vec<DbFlowExecution>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM flow_executions WHERE flow_id = ?1 ORDER BY id DESC LIMIT ?2",
         FLOW_EXEC_COLS
@@ -12431,7 +12611,7 @@ fn row_to_portainer_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbPort
 }
 
 pub fn list_portainer_instances(pool: &DbPool) -> Result<Vec<DbPortainerInstance>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM portainer_instances ORDER BY name",
         PORTAINER_INSTANCE_COLS
@@ -12443,7 +12623,7 @@ pub fn list_portainer_instances(pool: &DbPool) -> Result<Vec<DbPortainerInstance
 }
 
 pub fn get_portainer_instance(pool: &DbPool, id: i64) -> Result<Option<DbPortainerInstance>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM portainer_instances WHERE id = ?1",
         PORTAINER_INSTANCE_COLS
@@ -12516,7 +12696,7 @@ fn row_to_docker_registry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbDockerR
 }
 
 pub fn list_registries(pool: &DbPool) -> Result<Vec<DbDockerRegistry>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM registries ORDER BY name",
         DOCKER_REGISTRY_COLS
@@ -12528,7 +12708,7 @@ pub fn list_registries(pool: &DbPool) -> Result<Vec<DbDockerRegistry>> {
 }
 
 pub fn get_registry(pool: &DbPool, id: i64) -> Result<Option<DbDockerRegistry>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM registries WHERE id = ?1",
         DOCKER_REGISTRY_COLS
@@ -12651,7 +12831,7 @@ pub fn set_user_role(pool: &DbPool, user_id: &str, role: &str) -> Result<()> {
 /// Zwraca `(role, is_admin)` uzytkownika z `user_accounts` lub `None` gdy nie istnieje.
 /// Zrodlo prawdy o rolach userow to baza CORE — ML Studio nie trzyma wlasnej kopii rol.
 pub fn get_user_role(pool: &DbPool, user_id: &str) -> Result<Option<(String, bool)>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let result = conn
         .query_row(
             "SELECT role, is_admin FROM user_accounts WHERE id = ?1",
@@ -12697,7 +12877,7 @@ pub fn create_user_account(
 
 /// Pobiera uzytkownika po nazwie z tabeli user_accounts.
 pub fn get_user_account_by_username(pool: &DbPool, username: &str) -> Result<Option<UserAccount>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM user_accounts WHERE username = ?1",
         USER_ACCOUNT_COLS
@@ -12710,7 +12890,7 @@ pub fn get_user_account_by_username(pool: &DbPool, username: &str) -> Result<Opt
 
 /// Pobiera uzytkownika po ID z tabeli user_accounts.
 pub fn get_user_account_by_id(pool: &DbPool, id: &str) -> Result<Option<UserAccount>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM user_accounts WHERE id = ?1",
         USER_ACCOUNT_COLS
@@ -12723,7 +12903,7 @@ pub fn get_user_account_by_id(pool: &DbPool, id: &str) -> Result<Option<UserAcco
 
 /// Lista wszystkich uzytkownikow z tabeli user_accounts.
 pub fn list_user_accounts(pool: &DbPool) -> Result<Vec<UserAccount>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM user_accounts ORDER BY id",
         USER_ACCOUNT_COLS
@@ -12881,7 +13061,7 @@ pub fn create_group(pool: &DbPool, name: &str, description: &str) -> Result<Stri
 
 /// Lista wszystkich grup uzytkownikow.
 pub fn list_groups(pool: &DbPool) -> Result<Vec<UserGroup>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn
         .prepare_cached("SELECT id, name, description, created_at FROM user_groups ORDER BY id")?;
     let rows = stmt
@@ -12894,6 +13074,19 @@ pub fn list_groups(pool: &DbPool) -> Result<Vec<UserGroup>> {
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Member count per group in one grouped query (groups without members are absent).
+pub fn group_member_counts(pool: &DbPool) -> Result<std::collections::HashMap<String, u32>> {
+    let conn = acquire_read(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT gm.group_id, COUNT(*) FROM group_members gm \
+         JOIN user_accounts u ON u.id = gm.user_id GROUP BY gm.group_id",
+    )?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
     Ok(rows)
 }
 
@@ -12943,7 +13136,7 @@ pub fn remove_user_from_group(pool: &DbPool, group_id: &str, user_id: &str) -> R
 
 /// Pobiera grupy do ktorych nalezy uzytkownik.
 pub fn get_user_groups(pool: &DbPool, user_id: &str) -> Result<Vec<UserGroup>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT g.id, g.name, g.description, g.created_at \
          FROM user_groups g \
@@ -12967,7 +13160,7 @@ pub fn get_user_groups(pool: &DbPool, user_id: &str) -> Result<Vec<UserGroup>> {
 /// Użytkownik w wielu grupach pojawia się w wielu parach; użytkownik bez grupy
 /// nie występuje w wyniku (caller decyduje o placeholderze).
 pub fn list_group_memberships(pool: &DbPool) -> Result<Vec<(String, String)>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT gm.user_id, gm.group_id \
          FROM group_members gm JOIN user_groups g ON g.id = gm.group_id",
@@ -13115,7 +13308,7 @@ pub struct OrgGroupRow {
 /// belongs to it (otherwise a tenant would see other tenants' group names
 /// with a zero count), and `member_count` counts only those members.
 pub fn list_org_groups(pool: &DbPool, org_id: &str) -> Result<Vec<OrgGroupRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, name, description, org_members FROM ( \
              SELECT g.id AS id, g.name AS name, \
@@ -13143,7 +13336,7 @@ pub fn list_org_groups(pool: &DbPool, org_id: &str) -> Result<Vec<OrgGroupRow>> 
 /// Active members of `org_id` as `(id, display_name, username)`, ordered by
 /// username. No credential or contact column is read.
 pub fn list_org_user_names(pool: &DbPool, org_id: &str) -> Result<Vec<(String, String, String)>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT u.id, u.display_name, u.username FROM user_accounts u \
          JOIN org_memberships m ON m.user_id = u.id \
@@ -13207,7 +13400,7 @@ pub fn list_bus_addon_candidates(pool: &DbPool) -> Result<Vec<(String, String)>>
 /// Whether `id` names an installed, non-native addon and no user account —
 /// a topic rule written for it as a `'user'` would never admit anything.
 pub fn names_an_addon_not_a_user(pool: &DbPool, id: &str) -> Result<bool> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM addons WHERE addon_id = ?1 AND runtime <> 'native') \
             AND NOT EXISTS(SELECT 1 FROM user_accounts WHERE id = ?1)",
@@ -13346,7 +13539,7 @@ pub fn rollup_usage_for_quota(
     hour_from: &str,
     hour_to: &str,
 ) -> Result<i64> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let subject = quota.subject_id.as_deref().unwrap_or("");
     let (subject_clause, bind_subject) = match quota.scope_type.as_str() {
         "user" => ("AND user_id = ?4", true),
@@ -13414,7 +13607,7 @@ pub fn update_group(pool: &DbPool, id: &str, name: &str, description: &str) -> R
 
 /// Lista czlonkow grupy (user accounts).
 pub fn list_group_members(pool: &DbPool, group_id: &str) -> Result<Vec<UserAccount>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM user_accounts u \
          JOIN group_members gm ON u.id = gm.user_id \
@@ -13429,7 +13622,7 @@ pub fn list_group_members(pool: &DbPool, group_id: &str) -> Result<Vec<UserAccou
 
 /// Pobiera grupe po id.
 pub fn get_group_by_id(pool: &DbPool, id: &str) -> Result<Option<UserGroup>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let result = conn
         .query_row(
             "SELECT id, name, description, created_at FROM user_groups WHERE id = ?1",
@@ -13501,7 +13694,7 @@ pub fn set_addon_permission(
 
 /// Pobiera wszystkie uprawnienia danego addonu.
 pub fn get_addon_permissions(pool: &DbPool, addon_id: &str) -> Result<Vec<AddonPermission>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, addon_id, subject_type, subject_id, permission_id, granted, created_at \
          FROM addon_permissions WHERE addon_id = ?1 ORDER BY id",
@@ -13530,7 +13723,7 @@ pub fn check_permission(
     user_id: &str,
     permission_id: &str,
 ) -> Result<bool> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
 
     // Sprawdz czy istnieje granted=1 dla uzytkownika lub jego grup
     let has_grant: bool = conn
@@ -13557,7 +13750,7 @@ pub fn check_permission(
 
 /// Pobiera wszystkie uprawnienia (bezposrednie i przez grupy) dla danego uzytkownika.
 pub fn get_user_permissions(pool: &DbPool, user_id: &str) -> Result<Vec<AddonPermission>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, addon_id, subject_type, subject_id, permission_id, granted, created_at \
          FROM addon_permissions \
@@ -13670,7 +13863,7 @@ pub fn list_audit_logs(
     offset: i64,
     limit: i64,
 ) -> Result<Vec<AuditLogEntry>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
 
     let mut sql = String::from(
         "SELECT id, timestamp, user_id, addon_id, action, resource, details, ip_address, node_id, correlation_id \
@@ -13870,7 +14063,7 @@ pub fn register_addon(
 
 /// Lista wszystkich addonow.
 pub fn list_addons(pool: &DbPool) -> Result<Vec<Addon>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, addon_id, name, version, description, author, platforms, \
          manifest_json, is_enabled, is_system, installed_at, updated_at, \
@@ -13924,7 +14117,7 @@ pub struct AddonPromptInfo {
 /// not exist. Names are soft-unique for skills, so the oldest active addon skill
 /// wins deterministically (same rule as `get_skill_by_name`).
 pub fn get_addon_prompt_info(pool: &DbPool, addon_id: &str) -> Result<Option<AddonPromptInfo>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT COALESCE(NULLIF(a.display_name, ''), a.name), COALESCE(a.description, ''),          (SELECT s.name FROM skills s           WHERE s.source = 'addon' AND s.source_ref = a.addon_id AND s.status = 'active'           ORDER BY s.created_at, s.id LIMIT 1)          FROM addons a WHERE a.addon_id = ?1",
     )?;
@@ -13943,7 +14136,7 @@ pub fn get_addon_prompt_info(pool: &DbPool, addon_id: &str) -> Result<Option<Add
 
 /// Pobiera addon po addon_id.
 pub fn get_addon(pool: &DbPool, addon_id: &str) -> Result<Option<Addon>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, addon_id, name, version, description, author, platforms, \
          manifest_json, is_enabled, is_system, installed_at, updated_at, \
@@ -13986,7 +14179,7 @@ pub fn get_addon_instance_package_ref(
     pool: &DbPool,
     addon_id: &str,
 ) -> Result<Option<(String, String)>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt =
         conn.prepare_cached("SELECT package_id, package_version FROM addons WHERE addon_id = ?1")?;
     let row = stmt
@@ -14005,7 +14198,7 @@ pub fn get_package_bundle_hash(
     package_id: &str,
     version: &str,
 ) -> Result<Option<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT bundle_hash FROM addon_packages WHERE package_id = ?1 AND version = ?2",
     )?;
@@ -14021,7 +14214,7 @@ pub fn get_package_bundle_hash(
 /// materializowana. Pusty string gdy instancja powstala przed migracja 77 (czyta
 /// sie jako "starsza niz dowolny skatalogowany hash").
 pub fn get_instance_installed_bundle_hash(pool: &DbPool, addon_id: &str) -> Result<String> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt =
         conn.prepare_cached("SELECT installed_bundle_hash FROM addons WHERE addon_id = ?1")?;
     let hash = stmt
@@ -14071,7 +14264,7 @@ pub struct AddonPackageRow {
 /// Statystyki KV store addona: (liczba kluczy, suma bajtow, limit_mb).
 /// Limit 0 = bez limitu. KV jest scope'owane po addon_id (= instancja).
 pub fn addon_kv_stats(pool: &DbPool, addon_id: &str) -> Result<(i64, i64, i64)> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let keys: i64 = conn.query_row(
         "SELECT COUNT(*) FROM addon_storage WHERE addon_id = ?1",
         rusqlite::params![addon_id],
@@ -14099,7 +14292,7 @@ pub fn addon_vector_namespace_stats(
     pool: &DbPool,
     addon_id: &str,
 ) -> Result<Vec<(String, i64, String, i64)>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT namespace, dim, metric, count FROM addon_vector_namespaces \
          WHERE addon_id = ?1 ORDER BY namespace ASC",
@@ -14120,7 +14313,7 @@ pub fn addon_vector_namespace_stats(
 /// `list_package_instances` / `get_instance_of_package` — this returns an
 /// arbitrary enabled instance.
 pub fn get_package_instance(pool: &DbPool, package_id: &str) -> Result<Option<(String, bool)>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let row = conn
         .query_row(
             "SELECT addon_id, is_enabled FROM addons WHERE package_id = ?1 \
@@ -14145,7 +14338,7 @@ pub fn list_package_instances(
         String, /* display_name */
     )>,
 > {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT addon_id, is_enabled, COALESCE(NULLIF(display_name, ''), name) \
          FROM addons WHERE package_id = ?1 ORDER BY is_enabled DESC, addon_id ASC",
@@ -14171,7 +14364,7 @@ pub fn get_instance_of_package(
     package_id: &str,
     addon_id: &str,
 ) -> Result<Option<(String, bool)>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let row = conn
         .query_row(
             "SELECT addon_id, is_enabled FROM addons WHERE package_id = ?1 AND addon_id = ?2",
@@ -14184,7 +14377,7 @@ pub fn get_instance_of_package(
 
 /// Liczba zainstalowanych instancji danego pakietu (wierszy w `addons`).
 pub fn count_addon_instances(pool: &DbPool, package_id: &str) -> Result<i64> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM addons WHERE package_id = ?1",
         rusqlite::params![package_id],
@@ -14199,7 +14392,7 @@ pub fn get_addon_package(
     package_id: &str,
     version: &str,
 ) -> Result<Option<AddonPackageRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT package_id, version, name, manifest_json, bundle_hash, source, created_at \
          FROM addon_packages WHERE package_id = ?1 AND version = ?2",
@@ -14225,7 +14418,7 @@ pub fn get_addon_package(
 /// aktualizacja" (instancja.package_version != versions[0]) i wyboru wersji
 /// docelowej update_instance.
 pub fn list_package_versions(pool: &DbPool, package_id: &str) -> Result<Vec<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT version FROM addon_packages WHERE package_id = ?1 \
          ORDER BY created_at DESC, version DESC",
@@ -14238,7 +14431,7 @@ pub fn list_package_versions(pool: &DbPool, package_id: &str) -> Result<Vec<Stri
 
 /// Lista wszystkich wersji wszystkich pakietow w katalogu, najnowsze najpierw.
 pub fn list_addon_packages(pool: &DbPool) -> Result<Vec<AddonPackageRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT package_id, version, name, manifest_json, bundle_hash, source, created_at \
          FROM addon_packages ORDER BY package_id ASC, created_at DESC",
@@ -14315,7 +14508,7 @@ pub fn get_addon_secret(
     user_id: Option<i64>,
     key: &str,
 ) -> Result<Option<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let result: Option<String> = conn
         .query_row(
             "SELECT value_encrypted FROM addon_secrets \
@@ -14377,7 +14570,7 @@ pub fn create_sso_provider(
 
 /// Lista wszystkich SSO providerow.
 pub fn list_sso_providers(pool: &DbPool) -> Result<Vec<SsoProvider>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, name, provider_type, client_id, client_secret_encrypted, \
          discovery_url, enabled, auto_create_users, default_group_id, created_at \
@@ -14404,7 +14597,7 @@ pub fn list_sso_providers(pool: &DbPool) -> Result<Vec<SsoProvider>> {
 
 /// Pobiera SSO providera po ID.
 pub fn get_sso_provider(pool: &DbPool, id: i64) -> Result<Option<SsoProvider>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let result = conn
         .query_row(
             "SELECT id, name, provider_type, client_id, client_secret_encrypted, \
@@ -14432,7 +14625,7 @@ pub fn get_sso_provider(pool: &DbPool, id: i64) -> Result<Option<SsoProvider>> {
 
 /// Pobiera SSO providera po nazwie.
 pub fn get_sso_provider_by_name(pool: &DbPool, name: &str) -> Result<Option<SsoProvider>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let result = conn
         .query_row(
             "SELECT id, name, provider_type, client_id, client_secret_encrypted, \
@@ -14518,7 +14711,7 @@ pub fn get_user_account_by_sso(
     sso_provider: &str,
     sso_subject: &str,
 ) -> Result<Option<UserAccount>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {} FROM user_accounts WHERE sso_provider = ?1 AND sso_subject = ?2",
         USER_ACCOUNT_COLS
@@ -14604,7 +14797,7 @@ pub fn add_trusted_node(
 
 /// Pobiera liste zaufanych nodow
 pub fn list_trusted_nodes(pool: &DbPool) -> Result<Vec<TrustedNode>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, node_id, public_key, hostname, approved_by, approved_at, is_active, last_addresses, environment \
          FROM trusted_nodes WHERE is_active = 1 ORDER BY approved_at DESC",
@@ -14661,7 +14854,7 @@ pub fn get_trusted_node_environment(
     pool: &DbPool,
     node_id: &str,
 ) -> Result<Option<tentaflow_protocol::environment::NodeEnvironment>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT environment FROM trusted_nodes WHERE node_id = ?1 AND is_active = 1",
     )?;
@@ -14730,7 +14923,7 @@ pub fn get_peer_last_seen_ms(pool: &DbPool, node_id_hex: &str) -> Result<Option<
     if hex::decode_to_slice(node_id_hex, &mut id_bytes).is_err() {
         return Ok(None);
     }
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let result = conn
         .query_row(
             "SELECT last_seen_ms FROM peer_persisted WHERE node_id = ?1",
@@ -14787,7 +14980,7 @@ pub fn delete_sync_node(pool: &DbPool, node_id: &str) -> Result<()> {
 
 /// Sprawdza czy node jest zaufany
 pub fn is_node_trusted(pool: &DbPool, node_id: &str) -> Result<bool> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM trusted_nodes WHERE node_id = ?1 AND is_active = 1",
         rusqlite::params![node_id],
@@ -14798,7 +14991,7 @@ pub fn is_node_trusted(pool: &DbPool, node_id: &str) -> Result<bool> {
 
 /// Pobiera klucz publiczny zaufanego noda
 pub fn get_trusted_node_public_key(pool: &DbPool, node_id: &str) -> Result<Option<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let result = conn
         .query_row(
             "SELECT public_key FROM trusted_nodes WHERE node_id = ?1 AND is_active = 1",
@@ -14889,7 +15082,7 @@ pub fn ensure_trusted_nodes_in_sync_identity(pool: &DbPool) -> Result<usize> {
 /// operation; mesh commands and TentaVM writes ask it here. One column answers
 /// all of them, so a node cannot be an operator for one path and not another.
 pub fn node_is_operator(pool: &DbPool, node_id: &str) -> Result<bool> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let flag: Option<bool> = conn
         .query_row(
             "SELECT operator FROM sync_nodes WHERE node_id = ?1",
@@ -15260,7 +15453,7 @@ pub fn sync_node_registry_flags(pool: &DbPool) -> Result<HashMap<String, SyncNod
 
 /// Pobiera techniczna tozsamosc node/device.
 pub fn get_sync_node_identity(pool: &DbPool, node_id: &str) -> Result<Option<SyncNodeIdentity>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT node_id, public_key, public_key_type, display_name, node_kind, trust_status, \
                 owner_user_id, sync_profile, last_seen_at, created_at, updated_at, operator \
@@ -15322,7 +15515,7 @@ pub fn list_active_user_identity_keys(
     pool: &DbPool,
     user_id: &str,
 ) -> Result<Vec<UserIdentityKey>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT key_id, user_id, key_type, public_key, purpose, status, created_at, revoked_at \
          FROM user_identity_keys \
@@ -15441,7 +15634,7 @@ pub fn list_active_node_user_assignments(
     pool: &DbPool,
     node_id: &str,
 ) -> Result<Vec<NodeUserAssignment>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT node_id, user_id, assignment_mode, valid_from, valid_until, created_by, created_at \
          FROM node_user_assignments \
@@ -15456,7 +15649,7 @@ pub fn list_active_node_user_assignments(
 
 /// Lista node/device aktywnie przypisanych do uzytkownika.
 pub fn list_sync_nodes_for_user(pool: &DbPool, user_id: &str) -> Result<Vec<SyncNodeIdentity>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT n.node_id, n.public_key, n.public_key_type, n.display_name, n.node_kind, \
                 n.trust_status, n.owner_user_id, n.sync_profile, n.last_seen_at, \
@@ -15662,7 +15855,7 @@ pub fn get_sync_resource_acl(
     resource_type: &str,
     resource_id: &str,
 ) -> Result<Option<SyncResourceAcl>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT org_id, addon_id, resource_type, resource_id, owner_user_id, assigned_user_id, \
                 department_id, manager_user_id, visibility_scope, created_at, updated_at \
@@ -16442,7 +16635,7 @@ pub fn create_pending_pairing(
 
 /// Pobiera oczekujace parowanie z nodem
 pub fn get_pending_pairing(pool: &DbPool, remote_node_id: &str) -> Result<Option<PendingPairing>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let result = conn
         .query_row(
             "SELECT id, remote_node_id, pin_code, direction, expires_at \
@@ -16464,7 +16657,7 @@ pub fn get_pending_pairing(pool: &DbPool, remote_node_id: &str) -> Result<Option
 
 /// Pobiera wszystkie oczekujace parowania
 pub fn list_pending_pairings(pool: &DbPool) -> Result<Vec<PendingPairing>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, remote_node_id, pin_code, direction, expires_at \
          FROM pending_pairings ORDER BY created_at DESC",
@@ -16645,7 +16838,7 @@ pub fn add_revoked_node(
 
 /// Sprawdza czy node jest revoked
 pub fn is_node_revoked(pool: &DbPool, node_id: &str) -> Result<bool> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM revoked_nodes WHERE node_id = ?1",
         rusqlite::params![node_id],
@@ -16666,7 +16859,7 @@ pub fn remove_revoked_node(pool: &DbPool, node_id: &str) -> Result<()> {
 
 /// Lista wszystkich revoked nodow jako `(node_id, revoked_at)`.
 pub fn list_revoked_nodes(pool: &DbPool) -> Result<Vec<(String, String)>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn
         .prepare_cached("SELECT node_id, revoked_at FROM revoked_nodes ORDER BY revoked_at DESC")?;
     let rows = stmt
@@ -16680,7 +16873,7 @@ pub fn list_revoked_nodes(pool: &DbPool) -> Result<Vec<(String, String)>> {
 /// `approved_at` of an active trusted node — the timestamp a revocation is
 /// ordered against.
 pub fn get_trusted_node_approved_at(pool: &DbPool, node_id: &str) -> Result<Option<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     conn.query_row(
         "SELECT approved_at FROM trusted_nodes WHERE node_id = ?1 AND is_active = 1",
         rusqlite::params![node_id],
@@ -16742,7 +16935,7 @@ const VOICE_PROFILE_COLUMNS: &str =
 
 /// Lista wszystkich profili (posortowana po last_seen malejaco, null na koncu)
 pub fn list_voice_profiles(pool: &DbPool) -> Result<Vec<DbVoiceProfile>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let sql = format!(
         "SELECT {} FROM voice_profiles
          ORDER BY COALESCE(last_seen_at, '0') DESC, name ASC",
@@ -16759,7 +16952,7 @@ pub fn list_voice_profiles(pool: &DbPool) -> Result<Vec<DbVoiceProfile>> {
 
 /// Pobiera profil po id
 pub fn get_voice_profile(pool: &DbPool, id: i64) -> Result<Option<DbVoiceProfile>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let sql = format!(
         "SELECT {} FROM voice_profiles WHERE id = ?1",
         VOICE_PROFILE_COLUMNS
@@ -16773,7 +16966,7 @@ pub fn get_voice_profile(pool: &DbPool, id: i64) -> Result<Option<DbVoiceProfile
 
 /// Pobiera profil po nazwie (unique constraint)
 pub fn get_voice_profile_by_name(pool: &DbPool, name: &str) -> Result<Option<DbVoiceProfile>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let sql = format!(
         "SELECT {} FROM voice_profiles WHERE name = ?1",
         VOICE_PROFILE_COLUMNS
@@ -16881,7 +17074,7 @@ pub fn list_voice_profile_samples(
     pool: &DbPool,
     profile_id: i64,
 ) -> Result<Vec<DbVoiceProfileSample>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, profile_id, embedding, duration_ms, snr_db, intra_similarity,
                 meeting_id, source, created_at
@@ -16958,7 +17151,7 @@ pub fn list_voice_temp_speakers(
     pool: &DbPool,
     meeting_id: &str,
 ) -> Result<Vec<DbVoiceTempSpeaker>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, meeting_id, temp_label, embeddings_blob, sample_count,
                 total_duration_ms, assigned_profile_id, created_at
@@ -17003,7 +17196,7 @@ pub fn assign_temp_speaker_to_profile(
 /// Szuka w voice_profiles najwyzszego uzytego numeru gdzie first_name pasuje
 /// wzorcowi 'KNOWN_SPEAKER_%' i zwraca max+1 (albo 0 gdy brak).
 pub fn next_known_speaker_number(pool: &DbPool) -> Result<i64> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let max_num: Option<i64> = conn
         .query_row(
             "SELECT MAX(CAST(SUBSTR(first_name, 15) AS INTEGER))
@@ -17885,7 +18078,7 @@ pub struct DbOAuthPendingState {
 // -------- Widocznosc addonu --------
 
 pub fn list_addon_visibility(pool: &DbPool, addon_id: &str) -> Result<Vec<DbAddonVisibilityRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT g.id, g.name, COALESCE(g.description, ''), COALESCE(v.visible, 0), \
                 (SELECT COUNT(*) FROM group_members gm WHERE gm.group_id = g.id) AS user_count \
@@ -17957,7 +18150,7 @@ pub fn seed_addon_visibility(pool: &DbPool, addon_id: &str, group_id: &str) -> R
 
 /// Zwraca aktualna wartosc widocznosci (visible) dla (addon, group) lub None gdy brak wpisu.
 pub fn get_addon_visibility(pool: &DbPool, addon_id: &str, group_id: &str) -> Result<Option<bool>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let v: Option<i64> = conn
         .query_row(
             "SELECT visible FROM addon_visibility WHERE addon_id = ?1 AND group_id = ?2",
@@ -17970,7 +18163,7 @@ pub fn get_addon_visibility(pool: &DbPool, addon_id: &str, group_id: &str) -> Re
 
 /// Zwraca nazwe grupy po id (lub None).
 pub fn get_group_name_by_id(pool: &DbPool, group_id: &str) -> Result<Option<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let name: Option<String> = conn
         .query_row(
             "SELECT name FROM user_groups WHERE id = ?1",
@@ -17983,7 +18176,7 @@ pub fn get_group_name_by_id(pool: &DbPool, group_id: &str) -> Result<Option<Stri
 
 /// Zwraca id grupy po nazwie (lub None jesli nie istnieje).
 pub fn get_group_id_by_name(pool: &DbPool, name: &str) -> Result<Option<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let id: Option<String> = conn
         .query_row(
             "SELECT id FROM user_groups WHERE name = ?1",
@@ -18032,7 +18225,7 @@ pub fn set_addon_admin_only(pool: &DbPool, addon_id: &str, admin_only: bool) -> 
 
 /// Zwraca aktualna wartosc admin_only dla addona (lub None gdy addon nie istnieje).
 pub fn peek_addon_admin_only(pool: &DbPool, addon_id: &str) -> Result<Option<bool>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let v: Option<i64> = conn
         .query_row(
             "SELECT admin_only FROM addons WHERE addon_id = ?1",
@@ -18044,7 +18237,7 @@ pub fn peek_addon_admin_only(pool: &DbPool, addon_id: &str) -> Result<Option<boo
 }
 
 pub fn get_addon_admin_only(pool: &DbPool, addon_id: &str) -> Result<bool> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let v: Option<i64> = conn
         .query_row(
             "SELECT admin_only FROM addons WHERE addon_id = ?1",
@@ -18072,7 +18265,7 @@ pub fn set_addon_show_in_catalog(
 
 /// Zwraca wartosc `show_in_catalog` (domyslnie true, gdy addon nie istnieje).
 pub fn get_addon_show_in_catalog(pool: &DbPool, addon_id: &str) -> Result<bool> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let v: Option<i64> = conn
         .query_row(
             "SELECT show_in_catalog FROM addons WHERE addon_id = ?1",
@@ -18085,7 +18278,7 @@ pub fn get_addon_show_in_catalog(pool: &DbPool, addon_id: &str) -> Result<bool> 
 
 /// Zwraca licencje addona (pole `addons.license`, ustawiane przy install/upgrade).
 pub fn get_addon_license(pool: &DbPool, addon_id: &str) -> Result<String> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let v: Option<String> = conn
         .query_row(
             "SELECT license FROM addons WHERE addon_id = ?1",
@@ -18098,7 +18291,7 @@ pub fn get_addon_license(pool: &DbPool, addon_id: &str) -> Result<String> {
 
 /// Zwraca rozmiar WASM w bajtach (`wasm_size_bytes`) — 0 jesli brak wpisu.
 pub fn get_addon_wasm_size(pool: &DbPool, addon_id: &str) -> Result<i64> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let v: Option<i64> = conn
         .query_row(
             "SELECT wasm_size_bytes FROM addons WHERE addon_id = ?1",
@@ -18111,7 +18304,7 @@ pub fn get_addon_wasm_size(pool: &DbPool, addon_id: &str) -> Result<i64> {
 
 /// Zwraca runtime addona (`addons.runtime`, domyslnie "wasmtime").
 pub fn get_addon_runtime(pool: &DbPool, addon_id: &str) -> Result<String> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let v: Option<String> = conn
         .query_row(
             "SELECT runtime FROM addons WHERE addon_id = ?1",
@@ -18124,7 +18317,7 @@ pub fn get_addon_runtime(pool: &DbPool, addon_id: &str) -> Result<String> {
 
 /// Zwraca sprite icon id addona (`addons.icon`, None gdy brak).
 pub fn get_addon_icon(pool: &DbPool, addon_id: &str) -> Result<Option<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let v: Option<Option<String>> = conn
         .query_row(
             "SELECT icon FROM addons WHERE addon_id = ?1",
@@ -18137,7 +18330,7 @@ pub fn get_addon_icon(pool: &DbPool, addon_id: &str) -> Result<Option<String>> {
 
 /// Zlicza aktywne (nie revoked) konta OAuth dla addona w `user_oauth_accounts`.
 pub fn count_linked_accounts_for_addon(pool: &DbPool, addon_id: &str) -> Result<i64> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM user_oauth_accounts WHERE addon_id = ?1 AND revoked = 0",
         rusqlite::params![addon_id],
@@ -18148,7 +18341,7 @@ pub fn count_linked_accounts_for_addon(pool: &DbPool, addon_id: &str) -> Result<
 
 /// Zwraca (visible_count, total_count) dla badge'a `N/M grup` na detail header.
 pub fn count_visibility_groups(pool: &DbPool, addon_id: &str) -> Result<(i64, i64)> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM user_groups", [], |row| row.get(0))?;
     let visible: i64 = conn.query_row(
         "SELECT COUNT(*) FROM addon_visibility WHERE addon_id = ?1 AND visible = 1",
@@ -18160,7 +18353,7 @@ pub fn count_visibility_groups(pool: &DbPool, addon_id: &str) -> Result<(i64, i6
 
 /// Zwraca liczbe deklarowanych tools addona (tabela `addon_tools` jesli istnieje).
 pub fn count_addon_tools(pool: &DbPool, addon_id: &str) -> Result<i64> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     // Sprawdz czy tabela addon_tools istnieje — niektore konfiguracje bez features moga ja pomijac.
     let has_table: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='addon_tools'",
@@ -18181,7 +18374,7 @@ pub fn count_addon_tools(pool: &DbPool, addon_id: &str) -> Result<i64> {
 /// Oblicza tryb OAuth dla addona na bazie deklarowanych providerow:
 /// brak = None; same "global" / same "individual" / same "none" = ten tryb; inaczej "mixed".
 pub fn compute_addon_oauth_mode(pool: &DbPool, addon_id: &str) -> Result<Option<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt =
         conn.prepare_cached("SELECT DISTINCT mode FROM addon_oauth_providers WHERE addon_id = ?1")?;
     let modes: Vec<String> = stmt
@@ -18198,7 +18391,7 @@ pub fn compute_addon_oauth_mode(pool: &DbPool, addon_id: &str) -> Result<Option<
 /// wystarczy dowolna grupa usera z `visible=1`. Gdy nikt nie skonfigurowal widocznosci —
 /// default = widoczny dla wszystkich.
 pub fn is_addon_visible_to_user(pool: &DbPool, addon_id: &str, user_id: &str) -> Result<bool> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let admin_only: i64 = conn
         .query_row(
             "SELECT admin_only FROM addons WHERE addon_id = ?1",
@@ -18252,7 +18445,7 @@ pub fn addon_visible_user_ids(
     pool: &DbPool,
     addon_id: &str,
 ) -> Result<Option<std::collections::HashSet<String>>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let admin_only: i64 = conn
         .query_row(
             "SELECT admin_only FROM addons WHERE addon_id = ?1",
@@ -18303,7 +18496,7 @@ pub struct AddonBadges {
 /// Pobiera zagregowane badge dla addona: oauth_mode (dominujacy/mixed), zakres
 /// widocznosci, liczbe deklarowanych uprawnien, liczbe aktywnych kont OAuth.
 pub fn get_addon_badges(pool: &DbPool, addon_id: &str) -> Result<AddonBadges> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
 
     let admin_only: i64 = conn
         .query_row(
@@ -18373,7 +18566,7 @@ pub fn list_permission_catalog(
     pool: &DbPool,
     addon_id: &str,
 ) -> Result<Vec<DbAddonPermissionCatalogEntry>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT addon_id, permission_id, display_name, description, risk, sort_order \
          FROM addon_permission_catalog WHERE addon_id = ?1 ORDER BY sort_order, permission_id",
@@ -18458,7 +18651,7 @@ pub fn list_permission_matrix(
     pool: &DbPool,
     addon_id: &str,
 ) -> Result<(Vec<DbAddonPermissionRow>, Vec<DbAddonPermissionDefault>)> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT addon_id, subject_type, subject_id, permission_id, grant_mode, updated_at \
          FROM addon_permissions WHERE addon_id = ?1",
@@ -18495,7 +18688,7 @@ pub fn list_permission_matrix(
 /// Zwraca (username, updated_at) ostatniej zmiany w addon_permissions lub
 /// addon_permission_defaults dla danego addona. None gdy brak wpisow.
 pub fn last_permission_change(pool: &DbPool, addon_id: &str) -> Result<Option<(String, String)>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let row: Option<(Option<String>, String)> = conn
         .query_row(
             "SELECT u.username, x.updated_at FROM ( \
@@ -18562,7 +18755,7 @@ pub fn get_permission_grant_mode(
     subject_id: &str,
     permission_id: &str,
 ) -> Result<Option<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let v: Option<String> = conn
         .query_row(
             "SELECT grant_mode FROM addon_permissions \
@@ -18628,7 +18821,7 @@ pub fn get_permission_default_grant_mode(
     addon_id: &str,
     permission_id: &str,
 ) -> Result<Option<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let v: Option<String> = conn
         .query_row(
             "SELECT grant_mode FROM addon_permission_defaults \
@@ -18646,7 +18839,7 @@ pub fn get_permission_catalog_risk(
     addon_id: &str,
     permission_id: &str,
 ) -> Result<Option<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let v: Option<String> = conn
         .query_row(
             "SELECT risk FROM addon_permission_catalog \
@@ -18786,7 +18979,7 @@ fn log_audit_full_conn(
 
 /// Pobiera email uzytkownika po id (do wzbogacenia wpisow audytowych o target_user_email).
 pub fn get_user_email_by_id(pool: &DbPool, user_id: &str) -> Result<Option<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let v: Option<String> = conn
         .query_row(
             "SELECT email FROM user_accounts WHERE id = ?1",
@@ -18805,7 +18998,7 @@ pub fn resolve_permission(
     permission_id: &str,
     user_id: &str,
 ) -> Result<(bool, String)> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     // 1. admin_only
     let admin_only: i64 = conn
         .query_row(
@@ -18884,7 +19077,7 @@ pub fn list_oauth_providers_decl(
     pool: &DbPool,
     addon_id: &str,
 ) -> Result<Vec<DbAddonOAuthProviderDecl>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT addon_id, provider_id, display_name, authorize_url, token_url, revoke_url, \
                 scopes, mode, pkce \
@@ -18942,7 +19135,7 @@ pub fn upsert_oauth_providers_decl(pool: &DbPool, decl: &DbAddonOAuthProviderDec
 // -------- OAuth config (admin-managed) --------
 
 pub fn list_oauth_config(pool: &DbPool, addon_id: &str) -> Result<Vec<DbAddonOAuthConfig>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT addon_id, provider_id, client_id, client_secret_encrypted, redirect_uri, \
                 enabled, updated_at, oauth_mode \
@@ -18971,7 +19164,7 @@ pub fn get_oauth_config(
     addon_id: &str,
     provider_id: &str,
 ) -> Result<Option<DbAddonOAuthConfig>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let out = conn
         .query_row(
             "SELECT addon_id, provider_id, client_id, client_secret_encrypted, redirect_uri, \
@@ -19070,7 +19263,7 @@ pub fn clear_oauth_config_secret(pool: &DbPool, addon_id: &str, provider_id: &st
 /// Zwraca (id, client_secret_encrypted) dla wszystkich skonfigurowanych sekretow OAuth.
 /// Uzywane przez migracje master-key (re-encrypt wszystkich blobow nowym kluczem).
 pub fn list_all_oauth_config_secrets(pool: &DbPool) -> Result<Vec<(i64, Vec<u8>)>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, client_secret_encrypted FROM addon_oauth_config \
          WHERE client_secret_encrypted IS NOT NULL",
@@ -19099,7 +19292,7 @@ pub fn update_oauth_config_secret_blob(pool: &DbPool, id: i64, new_blob: &[u8]) 
 pub fn list_all_user_oauth_token_blobs(
     pool: &DbPool,
 ) -> Result<Vec<(i64, Vec<u8>, Option<Vec<u8>>)>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT id, access_token_encrypted, refresh_token_encrypted \
          FROM user_oauth_accounts WHERE access_token_encrypted IS NOT NULL",
@@ -19329,7 +19522,7 @@ pub fn list_user_oauth_accounts_for_user(
     pool: &DbPool,
     user_id: &str,
 ) -> Result<Vec<DbUserOAuthAccount>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let sql = format!(
         "SELECT {} FROM user_oauth_accounts WHERE user_id = ?1 ORDER BY addon_id, provider_id",
         OAUTH_ACCOUNT_COLS
@@ -19345,7 +19538,7 @@ pub fn list_user_oauth_accounts_for_addon(
     pool: &DbPool,
     addon_id: &str,
 ) -> Result<Vec<DbUserOAuthAccount>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let sql = format!(
         "SELECT {} FROM user_oauth_accounts WHERE addon_id = ?1 ORDER BY user_id, provider_id",
         OAUTH_ACCOUNT_COLS
@@ -19361,7 +19554,7 @@ pub fn get_oauth_account_by_id(
     pool: &DbPool,
     account_id: i64,
 ) -> Result<Option<DbUserOAuthAccount>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let sql = format!(
         "SELECT {} FROM user_oauth_accounts WHERE id = ?1",
         OAUTH_ACCOUNT_COLS
@@ -19418,7 +19611,7 @@ pub struct MyOAuthEntryRow {
 /// - sa widoczne dla uzytkownika wg `is_addon_visible_to_user`.
 /// Dla kazdej pary LEFT JOIN do `user_oauth_accounts` (user_id) wyznacza status.
 pub fn list_my_oauth_entries(pool: &DbPool, user_id: &str) -> Result<Vec<MyOAuthEntryRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let sql = "
         SELECT
             a.addon_id,
@@ -19607,7 +19800,7 @@ pub fn list_my_oauth_entries(pool: &DbPool, user_id: &str) -> Result<Vec<MyOAuth
 
 /// Zwraca biezaca flage is_enabled dla addona.
 pub fn get_addon_enabled(pool: &DbPool, addon_id: &str) -> Result<Option<bool>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let val: Option<i64> = conn
         .query_row(
             "SELECT is_enabled FROM addons WHERE addon_id = ?1",
@@ -19741,7 +19934,7 @@ pub struct AddonConfigRow {
 
 /// Lista wartosci konfiguracji z tabeli `addon_config` (plaintext — callee decyduje czy zwrocic).
 pub fn list_addon_config_rows(pool: &DbPool, addon_id: &str) -> Result<Vec<AddonConfigRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt =
         conn.prepare_cached("SELECT key, value, is_secret FROM addon_config WHERE addon_id = ?1")?;
     let rows = stmt
@@ -19842,7 +20035,7 @@ pub fn list_addon_config_prefixed(
     addon_id: &str,
     prefix: &str,
 ) -> Result<Vec<(String, String, String)>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT key, value, updated_at FROM addon_config \
          WHERE addon_id = ?1 AND is_secret = 0 AND key LIKE ?2 || '%' ORDER BY key",
@@ -19867,7 +20060,7 @@ pub fn installed_addon_ids_for_package(
     package_id: &str,
     version: &str,
 ) -> Result<Vec<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt =
         conn.prepare("SELECT addon_id FROM addons WHERE package_id = ?1 AND package_version = ?2")?;
     let ids = stmt
@@ -19964,7 +20157,7 @@ pub fn list_addon_audit_logs(
     level: Option<&str>,
     search: Option<&str>,
 ) -> Result<(Vec<AddonAuditRow>, i64)> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let limit_clamped = limit.clamp(1, 500);
     let offset_clamped = offset.max(0);
 
@@ -20032,7 +20225,7 @@ pub struct AddonNetworkConfig {
 /// Pobiera konfiguracje regul sieciowych addona. Zwraca defaults (strict, puste listy)
 /// jesli brak wpisu w tabeli.
 pub fn get_addon_network_config(pool: &DbPool, addon_id: &str) -> Result<AddonNetworkConfig> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let result = conn
         .query_row(
             "SELECT allowed_hosts, blocked_hosts, mode FROM addon_network_config WHERE addon_id = ?1",
@@ -20081,7 +20274,7 @@ pub fn get_addon_declared_network_rules(
     pool: &DbPool,
     addon_id: &str,
 ) -> Result<Vec<AddonDeclaredNetworkRule>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT rule_id, host, port, protocol, required, approved FROM addon_network_rules \
          WHERE addon_id = ?1 ORDER BY host, port, rule_id",
@@ -23394,7 +23587,7 @@ fn node_id_from_blob(blob: Vec<u8>) -> Result<[u8; 32]> {
 /// Load every row from peer_persisted. Used once by PeerRegistry::hydrate_from_db
 /// at startup; afterwards the registry is the source of truth.
 pub fn load_peer_persisted_all(pool: &DbPool) -> Result<Vec<PeerPersistedRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT node_id, pubkey, trust_state, hostname, platform, role, \
                 last_seen_ms, persisted_ver, updated_at_ms \
@@ -23428,7 +23621,7 @@ pub fn load_peer_persisted_all(pool: &DbPool) -> Result<Vec<PeerPersistedRow>> {
 pub fn load_peer_hints_all(
     pool: &DbPool,
 ) -> Result<std::collections::HashMap<[u8; 32], Vec<PeerHintRow>>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT node_id, hint_kind, payload, last_ok_ms, fail_count FROM peer_hints",
     )?;
@@ -24432,7 +24625,7 @@ pub fn delete_camera_hard(pool: &DbPool, owner_addon_id: &str, camera_id: &str) 
 /// the pipeline layer.
 #[cfg(feature = "camera")]
 pub fn list_all_active_cameras(pool: &DbPool) -> Result<Vec<CameraRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let sql = format!(
         "SELECT {CAMERA_SELECT_COLS} FROM cameras \
          WHERE removed_at IS NULL ORDER BY camera_id"
@@ -24456,7 +24649,7 @@ pub fn list_cameras_for_addon(
     addon_id: &str,
     org_id: Option<&str>,
 ) -> Result<Vec<CameraRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let sql = format!(
         "SELECT {CAMERA_SELECT_COLS} FROM cameras \
@@ -24478,7 +24671,7 @@ pub fn list_cameras_for_addon(
 /// codes.
 #[cfg(feature = "camera")]
 pub fn camera_exists_in_org(pool: &DbPool, camera_id: &str, org_id: &str) -> Result<bool> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM cameras \
          WHERE camera_id = ?1 AND org_id = ?2 AND removed_at IS NULL",
@@ -24499,7 +24692,7 @@ pub fn get_camera_for_addon(
     camera_id: &str,
     org_id: Option<&str>,
 ) -> Result<Option<CameraRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let sql = format!(
         "SELECT {CAMERA_SELECT_COLS} FROM cameras \
@@ -24525,7 +24718,7 @@ pub fn get_camera_in_org(
     camera_id: &str,
     org_id: Option<&str>,
 ) -> Result<Option<CameraRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let sql = format!(
         "SELECT {CAMERA_SELECT_COLS} FROM cameras \
@@ -24553,7 +24746,7 @@ pub fn can_read_camera(
     camera_id: &str,
     org_id: Option<&str>,
 ) -> Result<bool> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let allowed: bool = conn.query_row(
         "SELECT EXISTS(\
@@ -24583,7 +24776,7 @@ pub fn list_accessible_cameras(
     addon_id: &str,
     org_id: Option<&str>,
 ) -> Result<Vec<CameraRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let sql = format!(
         "SELECT {CAMERA_SELECT_COLS} FROM cameras c \
@@ -24653,7 +24846,7 @@ pub fn list_camera_grants(
     camera_id: &str,
     org_id: &str,
 ) -> Result<Vec<(String, String, String)>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare(
         "SELECT grantee_addon_id, level, created_by FROM camera_grants \
          WHERE camera_id = ?1 AND org_id = ?2 ORDER BY grantee_addon_id, level",
@@ -24809,7 +25002,7 @@ mod camera_grant_tests {
 /// filter): the loop runs per `camera_id` regardless of tenant.
 #[cfg(feature = "camera")]
 pub fn camera_analysis_fps(pool: &DbPool, camera_id: &str) -> Result<u32> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let fps: Option<i64> = conn
         .query_row(
             "SELECT analysis_fps FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
@@ -24827,7 +25020,7 @@ pub fn camera_analysis_fps(pool: &DbPool, camera_id: &str) -> Result<u32> {
 /// [`camera_analysis_fps`]: the analysis loop is keyed by `camera_id`.
 #[cfg(feature = "camera")]
 pub fn camera_zones_json(pool: &DbPool, camera_id: &str) -> Result<String> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let raw: Option<String> = conn
         .query_row(
             "SELECT zones_json FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
@@ -24866,7 +25059,7 @@ pub fn camera_recording_identity(
     pool: &DbPool,
     camera_id: &str,
 ) -> Result<Option<(String, String, String)>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let row = conn
         .query_row(
             "SELECT owner_addon_id, org_id, retention_class FROM cameras \
@@ -24926,7 +25119,7 @@ pub fn camera_depth_mapping_config(
     pool: &DbPool,
     camera_id: &str,
 ) -> Result<Option<DepthMappingConfig>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     type Row = (i64, Option<String>, f64, i64, Option<String>, f64, f64, f64, [f64; 3]);
     let row: Option<Row> = conn
         .query_row(
@@ -24982,7 +25175,7 @@ pub fn camera_depth_mapping_config(
 /// Per-camera analysis Flow id (the cold path runs it on a detection event).
 /// `None` (NULL or empty) = no flow assigned → default hardcoded enrichment.
 pub fn camera_analysis_flow_id(pool: &DbPool, camera_id: &str) -> Result<Option<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let id: Option<String> = conn
         .query_row(
             "SELECT analysis_flow_id FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
@@ -25052,7 +25245,7 @@ pub fn list_camera_cv_pipelines(
     pool: &DbPool,
     org_id: Option<&str>,
 ) -> Result<Vec<(String, String, bool, i64)>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let mut stmt = conn.prepare_cached(
         "SELECT id, name, is_default, updated_at FROM camera_cv_pipelines \
@@ -25445,7 +25638,7 @@ fn vision_model_changed_fields(
 /// service reconciler, which advertises catalog entries for all servable
 /// models on this node (catalog model names are org-agnostic).
 pub fn list_vision_models_all(pool: &DbPool) -> Result<Vec<VisionModelRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {VISION_MODEL_COLS} FROM vision_models ORDER BY model_name ASC"
     ))?;
@@ -25457,7 +25650,7 @@ pub fn list_vision_models_all(pool: &DbPool) -> Result<Vec<VisionModelRow>> {
 
 /// Lists the caller org's vision models ordered by name.
 pub fn list_vision_models(pool: &DbPool, org_id: Option<&str>) -> Result<Vec<VisionModelRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {VISION_MODEL_COLS} FROM vision_models WHERE org_id = ?1 ORDER BY model_name ASC"
@@ -25680,7 +25873,7 @@ pub fn delete_vision_model(
 /// Per-camera CV pipeline id. `None` (NULL or empty) = the camera uses the
 /// default pipeline (see [`resolve_camera_cv_pipeline`]).
 pub fn camera_cv_pipeline_id(pool: &DbPool, camera_id: &str) -> Result<Option<String>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let id: Option<String> = conn
         .query_row(
             "SELECT cv_pipeline_id FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
@@ -26037,7 +26230,7 @@ pub fn get_recording_for_addon(
     recording_ref: &str,
     org_id: Option<&str>,
 ) -> Result<Option<RecordingRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     let sql = format!(
         "SELECT {RECORDING_SELECT_COLS} FROM recordings \
@@ -26101,7 +26294,7 @@ pub fn list_recordings(
     filters: &RecordingListFilters<'_>,
     limit: u32,
 ) -> Result<Vec<RecordingRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     // Bind params positionally; the optional filters are appended in a fixed
     // order so the placeholder indices stay stable regardless of which are set.
@@ -26167,7 +26360,7 @@ pub fn list_recordings(
 /// scoping is enforced at issuance time by `get_recording_for_addon`.
 #[cfg(feature = "camera")]
 pub fn get_recording_by_ref(pool: &DbPool, recording_ref: &str) -> Result<Option<RecordingRow>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let sql = format!(
         "SELECT {RECORDING_SELECT_COLS} FROM recordings \
          WHERE ref = ?1 AND purged_at IS NULL"
@@ -26413,7 +26606,7 @@ pub fn recent_conversation_messages(
     session_id: &str,
     limit: u32,
 ) -> Result<Vec<DbConversationMessage>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     // Take the newest `limit` rows (seq DESC) then flip to chronological order
     // so the caller receives oldest-first without loading the whole session.
     let mut stmt = conn.prepare_cached(
@@ -31866,7 +32059,7 @@ pub fn bus_topic_delete(
 /// topic-listing admin UI/dispatch layer (PLAN.md tentabus/PLAN.md tor U/P)
 /// that will call it once that layer is wired up.
 pub fn bus_topic_list(pool: &DbPool, instance_id: &str, org_id: &str) -> Result<Vec<DbBusTopic>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {BUS_TOPIC_COLUMNS} FROM bus_topics \
          WHERE instance_id = ?1 AND org_id = ?2 ORDER BY name"
@@ -31935,7 +32128,7 @@ pub fn bus_group_get(
     group_id: &str,
     topic: &str,
 ) -> Result<Option<DbBusGroup>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     conn.query_row(
         &format!(
             "SELECT {BUS_GROUP_COLUMNS} FROM bus_groups WHERE org_id = ?1 AND group_id = ?2 AND topic = ?3"
@@ -31953,7 +32146,7 @@ pub fn bus_group_get(
 /// pause state through `bus_group_upsert`, so there is deliberately no
 /// separate "set paused" statement here.
 pub fn bus_group_list(pool: &DbPool, org_id: &str) -> Result<Vec<DbBusGroup>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {BUS_GROUP_COLUMNS} FROM bus_groups WHERE org_id = ?1 ORDER BY group_id, topic"
     ))?;
@@ -32223,7 +32416,7 @@ pub fn bus_assignment_get(
     topic: &str,
     partition: u32,
 ) -> Result<Option<DbBusPartitionAssignment>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     conn.query_row(
         &format!(
             "SELECT {BUS_ASSIGNMENT_COLUMNS} FROM bus_partition_assignments \
@@ -32242,7 +32435,7 @@ pub fn bus_assignment_list_for_topic(
     org_id: &str,
     topic: &str,
 ) -> Result<Vec<DbBusPartitionAssignment>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {BUS_ASSIGNMENT_COLUMNS} FROM bus_partition_assignments \
          WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 ORDER BY partition"
@@ -32276,7 +32469,7 @@ pub fn bus_assignment_list_for_node(
     instance_id: &str,
     node_id: &str,
 ) -> Result<Vec<DbBusPartitionAssignment>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {BUS_ASSIGNMENT_COLUMNS} FROM bus_partition_assignments \
          WHERE instance_id = ?1 ORDER BY org_id, topic, partition"
@@ -32300,7 +32493,7 @@ pub fn bus_assignment_list_for_node(
 /// running instance on this node in one pass rather than one query per
 /// instance.
 pub fn bus_assignment_list_all(pool: &DbPool) -> Result<Vec<DbBusPartitionAssignment>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {BUS_ASSIGNMENT_COLUMNS} FROM bus_partition_assignments \
          ORDER BY instance_id, org_id, topic, partition"
@@ -32760,7 +32953,7 @@ pub fn bus_field_policy_get(
     subject_id: &str,
     direction: &str,
 ) -> Result<Option<DbBusFieldPolicy>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     conn.query_row(
         &format!(
             "SELECT {BUS_FIELD_POLICY_COLUMNS} FROM bus_field_policies \
@@ -33054,7 +33247,7 @@ pub fn bus_quota_set(pool: &DbPool, row: &DbBusQuota) -> Result<()> {
 /// read once at engine startup (`bus::quota::load_persisted_quotas`) to
 /// repopulate the in-memory `QuotaManager`.
 pub fn bus_quota_list_for_instance(pool: &DbPool, instance_id: &str) -> Result<Vec<DbBusQuota>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {BUS_QUOTA_COLUMNS} FROM bus_org_quotas WHERE instance_id = ?1 ORDER BY org_id"
     ))?;
@@ -33340,7 +33533,7 @@ pub fn bus_schema_subject_get(
     org_id: &str,
     subject: &str,
 ) -> Result<Option<DbBusSchemaSubject>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     conn.query_row(
         &format!(
             "SELECT {BUS_SCHEMA_SUBJECT_COLUMNS} FROM bus_schema_subjects \
@@ -33758,7 +33951,7 @@ pub fn bus_schema_version_list(
     org_id: &str,
     subject: &str,
 ) -> Result<Vec<DbBusSchemaVersion>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare(&format!(
         "SELECT {BUS_SCHEMA_VERSION_COLUMNS} FROM bus_schema_versions \
          WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3 ORDER BY version ASC"
@@ -33782,7 +33975,7 @@ pub fn bus_schema_version_heads(
     org_id: &str,
     subject: &str,
 ) -> Result<Vec<DbBusSchemaVersion>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare(
         "SELECT instance_id, org_id, subject, version, '' AS schema_text, \
          content_hash, schema_ref_id, created_by, created_at_ms, subject_generation \
@@ -33838,7 +34031,7 @@ pub fn bus_schema_version_latest(
     org_id: &str,
     subject: &str,
 ) -> Result<Option<DbBusSchemaVersion>> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     conn.query_row(
         &format!(
             "SELECT {BUS_SCHEMA_VERSION_COLUMNS} FROM bus_schema_versions \
@@ -33869,7 +34062,7 @@ pub fn bus_schema_versions_for_each_text(
     pool: &DbPool,
     mut visit: impl FnMut(BusSchemaVersionText<'_>),
 ) -> Result<()> {
-    let conn = acquire(pool)?;
+    let conn = acquire_read(pool)?;
     let mut stmt = conn.prepare(
         "SELECT v.instance_id, v.org_id, v.subject, v.version, s.schema_type, v.schema_text \
          FROM bus_schema_versions v \

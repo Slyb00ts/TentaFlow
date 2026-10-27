@@ -1557,7 +1557,10 @@ pub fn flow_create(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         actor_user_id: user_id.as_deref(),
     };
     let id = repository::create_flow(&ctx.state.db, &params).map_err(flow_write_err)?;
-    ctx.state.router.rebuild_catalog();
+    // A flow without a publish name cannot appear in the catalog.
+    if payload.published_model_name.is_some() {
+        ctx.state.router.rebuild_catalog();
+    }
     invalidate_flow_cache();
 
     let _ = repository::log_audit(
@@ -4198,12 +4201,15 @@ pub fn mesh_pending_list(
                 remote_hostname: None,
                 remote_ip: None,
                 initiated_at: parse_ts(&p.expires_at) as i64,
-                state: p.direction,
-                pin: if p.pin_code.is_empty() {
-                    None
-                } else {
+                // An incoming PIN was chosen by the requesting peer: showing it to
+                // the confirming side would let anyone "confirm" without the
+                // out-of-band PIN. Only a PIN this node generated is returned.
+                pin: if p.direction == "outgoing" && !p.pin_code.is_empty() {
                     Some(p.pin_code)
+                } else {
+                    None
                 },
+                state: p.direction,
                 environment,
             }
         })
@@ -4563,11 +4569,7 @@ pub fn model_alias_create(
     )
     .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
 
-    crate::services::models::broadcast_alias_mutation(
-        &ctx.state.db,
-        &ctx.state.router,
-        &ctx.state.quic_mesh,
-    );
+    crate::services::models::refresh_router_aliases(&ctx.state.router);
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
@@ -4617,11 +4619,7 @@ pub fn model_alias_update(
         )));
     }
 
-    crate::services::models::broadcast_alias_mutation(
-        &ctx.state.db,
-        &ctx.state.router,
-        &ctx.state.quic_mesh,
-    );
+    crate::services::models::refresh_router_aliases(&ctx.state.router);
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
@@ -4662,11 +4660,7 @@ pub fn model_alias_delete(
         )));
     }
 
-    crate::services::models::broadcast_alias_mutation(
-        &ctx.state.db,
-        &ctx.state.router,
-        &ctx.state.quic_mesh,
-    );
+    crate::services::models::refresh_router_aliases(&ctx.state.router);
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
     audit(
@@ -9653,13 +9647,11 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
         // ---- Groups ----
         P::ReqListGroups => {
             let groups = repository::list_groups(db).map_err(db_err)?;
+            let counts = repository::group_member_counts(db).map_err(db_err)?;
             let infos: Vec<_> = groups
                 .into_iter()
                 .map(|g| {
-                    let count = repository::list_group_members(db, &g.id)
-                        .ok()
-                        .map(|m| m.len() as u32)
-                        .unwrap_or(0);
+                    let count = counts.get(&g.id).copied().unwrap_or(0);
                     tentaflow_protocol::GroupInfo {
                         id: g.id,
                         name: g.name,

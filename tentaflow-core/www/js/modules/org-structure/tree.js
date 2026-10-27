@@ -28,7 +28,7 @@ function hash(text) {
 /** The colour of a unit: its own, or one derived from its id so it never changes between loads. */
 export function unitColor(unit) {
   if (unit.color && HEX_COLOR.test(unit.color)) return unit.color;
-  return PALETTE[hash(unit.unit_id) % PALETTE.length];
+  return PALETTE[hash(unit.unitId) % PALETTE.length];
 }
 
 /** First letters of the first two words; the card shows them where a photo will go later. */
@@ -84,49 +84,49 @@ export function buildTreeModel(view, options) {
   } = options;
   const units = view.units ?? [];
   const positions = view.positions ?? [];
-  const unitById = new Map(units.map((u) => [u.unit_id, u]));
+  const unitById = new Map(units.map((u) => [u.unitId, u]));
   const typeName = new Map(unitTypes.map((type) => [type.id, type.name]));
-  const holders = groupBy(view.assignments ?? [], (a) => a.position_id);
-  const deputyPositions = new Set(units.flatMap((u) => u.deputy_head_position_ids ?? []));
-  const positionIds = new Set(positions.map((p) => p.position_id));
+  const holders = groupBy(view.assignments ?? [], (a) => a.positionId);
+  const deputyPositions = new Set(units.flatMap((u) => u.deputyHeadPositionIds ?? []));
+  const positionIds = new Set(positions.map((p) => p.positionId));
 
   const nodes = positions.map((position) => {
-    const unit = unitById.get(position.unit_id);
-    const people = (holders.get(position.position_id) ?? []).map((a) => ({
+    const unit = unitById.get(position.unitId);
+    const people = (holders.get(position.positionId) ?? []).map((a) => ({
       key: subjectKey(a.subject),
-      name: a.display_name || t('unknown_person'),
+      name: a.displayName || t('unknown_person'),
       share: a.share,
-      type: a.assignment_type,
-      primary: Boolean(a.is_primary),
+      type: a.assignmentType,
+      primary: Boolean(a.isPrimary),
       me: isMe(a.subject, meHex),
     }));
     const vacant = people.length === 0;
     const badges = [];
-    if (position.is_staff) badges.push('staff');
-    if (deputyPositions.has(position.position_id)) badges.push('deputy');
+    if (position.isStaff) badges.push('staff');
+    if (deputyPositions.has(position.positionId)) badges.push('deputy');
     if (people.some((p) => p.type === 'acting')) badges.push('acting');
     if (people.some((p) => absentKeys.has(p.key))) badges.push('absent');
     if (people.some((p) => coveringKeys.has(p.key))) badges.push('covering');
     if (people.some((p) => p.me)) badges.push('me');
     const name = vacant ? t('vacancy') : people[0].name;
     return {
-      id: position.position_id,
+      id: position.positionId,
       // A parent outside the answer (ended, or another cut of history) makes this a root
       // rather than dropping the branch.
-      parentId: position.primary_parent_position_id && positionIds.has(position.primary_parent_position_id)
-        ? position.primary_parent_position_id
+      parentId: position.primaryParentPositionId && positionIds.has(position.primaryParentPositionId)
+        ? position.primaryParentPositionId
         : null,
       name,
       extraHolders: Math.max(0, people.length - 1),
       role: position.name,
-      unitId: position.unit_id,
+      unitId: position.unitId,
       unitName: unit?.name ?? '',
       color: unit ? unitColor(unit) : PALETTE[0],
       vacant,
-      staff: Boolean(position.is_staff),
+      staff: Boolean(position.isStaff),
       badges,
       people,
-      since: position.valid_from,
+      since: position.validFrom,
       below: 0,
       searchText: fold([name, ...people.map((p) => p.name), position.name, unit?.name ?? ''].join(' ')),
     };
@@ -139,8 +139,8 @@ export function buildTreeModel(view, options) {
 
   const functional = [];
   for (const position of positions) {
-    for (const parent of position.functional_parent_position_ids ?? []) {
-      if (positionIds.has(parent)) functional.push({ from: position.position_id, to: parent });
+    for (const parent of position.functionalParentPositionIds ?? []) {
+      if (positionIds.has(parent)) functional.push({ from: position.positionId, to: parent });
     }
   }
 
@@ -183,20 +183,20 @@ function fillBelow(nodes, nodeById) {
 
 function buildUnits(units, nodes, nodeById, typeName) {
   const byUnit = groupBy(nodes, (n) => n.unitId);
-  const unitIds = new Set(units.map((u) => u.unit_id));
+  const unitIds = new Set(units.map((u) => u.unitId));
   const models = units.map((unit) => {
-    const members = byUnit.get(unit.unit_id) ?? [];
+    const members = byUnit.get(unit.unitId) ?? [];
     const people = new Set(members.flatMap((m) => m.people.map((p) => p.key)));
     const managers = members.filter((m) => m.childIds.length > 0);
     const reports = managers.reduce((sum, m) => sum + m.childIds.length, 0);
     return {
-      id: unit.unit_id,
-      parentId: unit.parent_unit_id && unitIds.has(unit.parent_unit_id) ? unit.parent_unit_id : null,
+      id: unit.unitId,
+      parentId: unit.parentUnitId && unitIds.has(unit.parentUnitId) ? unit.parentUnitId : null,
       name: unit.name,
       code: unit.code ?? '',
-      typeName: (unit.type_id && typeName.get(unit.type_id)) || '',
+      typeName: (unit.typeId && typeName.get(unit.typeId)) || '',
       color: unitColor(unit),
-      headId: unit.head_position_id && nodeById.has(unit.head_position_id) ? unit.head_position_id : null,
+      headId: unit.headPositionId && nodeById.has(unit.headPositionId) ? unit.headPositionId : null,
       memberIds: members.map((m) => m.id),
       people: people.size,
       vacancies: members.filter((m) => m.vacant).length,

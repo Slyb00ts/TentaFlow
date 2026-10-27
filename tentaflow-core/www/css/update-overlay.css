@@ -31,9 +31,12 @@
   --uo-accent-rgb: 245, 158, 11;
 }
 
-/* Pauzuj infinite animations gdy niewidoczne — zero CPU gdy okno ukryte. */
+/* Pauzuj infinite animations gdy niewidoczne — zero CPU gdy okno ukryte.
+   Pierscien uoRingPulse jest na ::before, ktorego `*` nie obejmuje. */
 .update-overlay:not(.visible),
-.update-overlay:not(.visible) * {
+.update-overlay:not(.visible) *,
+.update-overlay:not(.visible) *::before,
+.update-overlay:not(.visible) *::after {
   animation-play-state: paused !important;
 }
 

@@ -35,24 +35,24 @@ const line = (el) => el.querySelector('.tf-aa-line')?.textContent.trim();
 test('a running run with no tool in flight reads as thinking, not idle', (t) => {
   const el = mount();
   t.after(() => el.remove());
-  el.applyEvent({ kind: 'child_spawned', run_id: 'r-1', agent: 'code-orchestrator' });
+  el.applyEvent({ kind: 'child_spawned', runId: 'r-1', agent: 'code-orchestrator' });
   assert.equal(line(el), 'code-orchestrator · thinking… · 0s');
 });
 
 test('a tool call reads as that tool until its result lands', (t) => {
   const el = mount();
   t.after(() => el.remove());
-  el.applyEvent({ kind: 'child_spawned', run_id: 'r-1', agent: 'code-orchestrator' });
-  el.applyEvent({ kind: 'tool_call_started', run_id: 'r-1', name: 'core.exec' });
+  el.applyEvent({ kind: 'child_spawned', runId: 'r-1', agent: 'code-orchestrator' });
+  el.applyEvent({ kind: 'tool_call_started', runId: 'r-1', name: 'core.exec' });
   assert.equal(line(el), 'code-orchestrator · tool · core.exec · 0s');
-  el.applyEvent({ kind: 'tool_call_finished', run_id: 'r-1', name: 'core.exec', status: 'ok' });
+  el.applyEvent({ kind: 'tool_call_finished', runId: 'r-1', name: 'core.exec', status: 'ok' });
   assert.equal(line(el), 'code-orchestrator · thinking… · 0s');
 });
 
 test('the clock counts from the last sign of life and stops with the run', async (t) => {
   const el = mount();
   t.after(() => el.remove());
-  el.applyEvent({ kind: 'child_spawned', run_id: 'r-1', agent: 'code-orchestrator' });
+  el.applyEvent({ kind: 'child_spawned', runId: 'r-1', agent: 'code-orchestrator' });
   el._runs.get('r-1').lastEventAt = Date.now() - 42_000;
   await new Promise((resolve) => setTimeout(resolve, 1100));
   assert.match(line(el), /^code-orchestrator · thinking… · 4[23]s$/);

@@ -20,31 +20,31 @@ const { mountProfileCover } = await import('./profile-cover.js');
 
 const ct = (key, params) => I18n.t(`org_structure.cover.${key}`, params);
 
-const mine = { id: 'abs-1', user_id: 'u-me', valid_from: '2026-09-29', valid_to: '2026-10-03', kind: 'leave', source: 'manual' };
-const later = { id: 'abs-2', user_id: 'u-me', valid_from: '2026-12-14', valid_to: '2026-12-15', kind: 'training', source: 'manual' };
-const imported = { id: 'abs-3', user_id: 'u-me', valid_from: '2026-11-02', valid_to: '2026-11-09', kind: 'leave', source: 'edokumenty' };
+const mine = { id: 'abs-1', userId: 'u-me', validFrom: '2026-09-29', validTo: '2026-10-03', kind: 'leave', source: 'manual' };
+const later = { id: 'abs-2', userId: 'u-me', validFrom: '2026-12-14', validTo: '2026-12-15', kind: 'training', source: 'manual' };
+const imported = { id: 'abs-3', userId: 'u-me', validFrom: '2026-11-02', validTo: '2026-11-09', kind: 'leave', source: 'edokumenty' };
 const deputy = {
-  id: 'dep-1', user_id: 'u-me', user_name: 'Marek Nowak', deputy_user_id: 'u-pz', deputy_name: 'Piotr Zieliński',
-  scope: 'approvals', valid_from: '2026-10-20', valid_to: '2026-10-25',
+  id: 'dep-1', userId: 'u-me', userName: 'Marek Nowak', deputyUserId: 'u-pz', deputyName: 'Piotr Zieliński',
+  scope: 'approvals', validFrom: '2026-10-20', validTo: '2026-10-25',
 };
 const covering = {
-  id: 'dep-2', user_id: 'u-ew', user_name: 'Ewa Wiśniewska', deputy_user_id: 'u-me', deputy_name: 'Marek Nowak',
-  scope: 'all', valid_from: '2026-09-01', valid_to: null,
+  id: 'dep-2', userId: 'u-ew', userName: 'Ewa Wiśniewska', deputyUserId: 'u-me', deputyName: 'Marek Nowak',
+  scope: 'all', validFrom: '2026-09-01', validTo: null,
 };
 
 const cover = (over = {}) => ({
-  user_id: 'u-me',
-  display_name: 'Marek Nowak',
+  userId: 'u-me',
+  displayName: 'Marek Nowak',
   available: false,
   today: '2026-09-30',
   absences: [mine, later, imported],
-  covered_by: [deputy],
+  coveredBy: [deputy],
   covering: [covering],
-  can_see_absences: true,
-  can_see_reason: false,
-  can_edit_absences: true,
-  can_edit_deputies: true,
-  is_admin: false,
+  canSeeAbsences: true,
+  canSeeReason: false,
+  canEditAbsences: true,
+  canEditDeputies: true,
+  isAdmin: false,
   ...over,
 });
 
@@ -58,7 +58,7 @@ function stubTransport(handlers = {}) {
     calls.push({ kind, payload });
     if (kind === 'orgCoverRequest') return Promise.resolve(current);
     if (kind === 'orgMemberListRequest') {
-      return Promise.resolve({ members: [{ user_id: 'u-me', display_name: 'Marek Nowak' }, { user_id: 'u-pz', display_name: 'Piotr Zieliński' }] });
+      return Promise.resolve({ members: [{ userId: 'u-me', displayName: 'Marek Nowak' }, { userId: 'u-pz', displayName: 'Piotr Zieliński' }] });
     }
     const handler = script[kind];
     if (!handler) return Promise.reject(new Error(`unexpected request ${kind}`));
@@ -129,7 +129,7 @@ test('the absence window asks for no reason', async () => {
 });
 
 test('an empty profile says so in each section', async () => {
-  await mount({ absences: [], covered_by: [], covering: [] });
+  await mount({ absences: [], coveredBy: [], covering: [] });
   assert.equal(section('org-cover-absences').querySelector('.org-cover-empty').textContent, ct('absence_empty'));
   assert.equal(section('org-cover-covered-by').querySelector('.org-cover-empty').textContent, ct('covered_by_empty'));
   assert.equal(section('org-cover-covering').querySelector('.org-cover-empty').textContent, ct('covering_empty'));
@@ -150,11 +150,11 @@ test('a person sets their own deputies and no note sends them to an administrato
   assert.equal(section('org-cover-covered-by').querySelector('.org-cover-note'), null);
   assert.equal(document.querySelectorAll('#org-cover-covering [data-act="deputy-menu"]').length, 0, 'the row of somebody else');
 
-  await mount({ can_edit_deputies: false });
+  await mount({ canEditDeputies: false });
   assert.equal(document.querySelector('[data-act="deputy-add"]'), null);
   assert.equal(document.querySelector('[data-act="deputy-menu"]'), null);
 
-  await mount({ is_admin: true });
+  await mount({ isAdmin: true });
   assert.equal(document.querySelectorAll('[data-act="deputy-menu"]').length, 2);
 });
 
@@ -162,12 +162,12 @@ test('an absence that came from another source has no menu for its person, but h
   await mount();
   const menus = rows('org-cover-absences').map((r) => Boolean(r.querySelector('[data-act="absence-menu"]')));
   assert.deepEqual(menus, [true, false, true], 'the imported one is the second, by date');
-  await mount({ is_admin: true });
+  await mount({ isAdmin: true });
   assert.deepEqual(rows('org-cover-absences').map((r) => Boolean(r.querySelector('[data-act="absence-menu"]'))), [true, true, true]);
 });
 
 test('a person who may not edit absences (somebody else\'s) gets no add button and no menus', async () => {
-  await mount({ can_edit_absences: false });
+  await mount({ canEditAbsences: false });
   assert.equal(document.querySelector('[data-act="absence-add"]'), null);
   assert.equal(document.querySelector('[data-act="absence-menu"]'), null);
 });
@@ -175,7 +175,7 @@ test('a person who may not edit absences (somebody else\'s) gets no add button a
 test('add: the window asks for the last day, the wire gets the exclusive end, and the undo deletes it', async () => {
   await mount();
   stubTransport({
-    orgAbsenceAddRequest: ok({ kind: 'absence', value: { ...later, id: 'abs-new', valid_from: '2026-10-20', valid_to: '2026-10-25' } }),
+    orgAbsenceAddRequest: ok({ kind: 'absence', value: { ...later, id: 'abs-new', validFrom: '2026-10-20', validTo: '2026-10-25' } }),
     orgAbsenceDeleteRequest: ok({ kind: 'done' }),
   });
   document.querySelector('[data-act="absence-add"]').click();
@@ -212,7 +212,7 @@ test('add: a last day before the first stays in the window as a sentence and not
 
 test('edit: the window shows the last day, only what changed is sent, the emptied end is cleared', async () => {
   await mount();
-  stubTransport({ orgAbsenceUpdateRequest: ok({ kind: 'absence', value: { ...mine, valid_to: '2026-10-05' } }) });
+  stubTransport({ orgAbsenceUpdateRequest: ok({ kind: 'absence', value: { ...mine, validTo: '2026-10-05' } }) });
   choose(menuFor(rows('org-cover-absences')[0]), ct('menu_edit'));
   const win = lastWindow();
   assert.equal(field(win, ct('f_last')).value, '2026-10-02', 'the inclusive last day of [29th, 3rd)');
@@ -325,7 +325,7 @@ test('a window\'s toast and the section survive the server refusing a change', a
 
 test('the handover section lists what was handed over for absences and opens the handover screen for the person', async () => {
   const record = (over) => ({
-    id: 'h-1', user_id: 'u-me', reason: 'absence', date: '2026-09-30', return_date: '2026-10-10', note: 'Galaz feature/opc',
+    id: 'h-1', userId: 'u-me', reason: 'absence', date: '2026-09-30', returnDate: '2026-10-10', note: 'Galaz feature/opc',
     items: [{ status: 'done' }, { status: 'done' }, { status: 'kept' }], ...over,
   });
   stubTransport({

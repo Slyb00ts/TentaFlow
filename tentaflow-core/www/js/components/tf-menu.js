@@ -50,6 +50,9 @@ function holdsAcrossShadows(container, node) {
   return false;
 }
 
+// Matches the 0.24s transition of `.tf-menu` in controls.css.
+const MENU_FADE_MS = 260;
+
 class TfMenuItem extends HTMLElement {
   static get observedAttributes() {
     return ['icon', 'danger', 'action', 'disabled', 'shortcut', 'label', 'hint'];
@@ -179,6 +182,7 @@ class TfMenu extends HTMLElement {
   }
 
   disconnectedCallback() {
+    clearTimeout(this._hideTimer);
     document.removeEventListener('pointerdown', this._onDocClick, true);
     document.removeEventListener('keydown', this._onKey);
     this.removeEventListener('tf-menu-select', this._onSelect);
@@ -211,6 +215,10 @@ class TfMenu extends HTMLElement {
     this._shadow.appendChild(box);
     this._box = box;
     box.inert = true;
+    // A closed panel must leave layout, not just become invisible: an absolutely
+    // positioned box keeps widening its scroll container, so a 180px menu parked
+    // at the right edge of a card made a phone-width page scroll sideways.
+    box.hidden = true;
   }
 
   _update() {
@@ -220,7 +228,9 @@ class TfMenu extends HTMLElement {
     this._headingEl.textContent = heading;
     this._headingEl.hidden = !heading;
     const isOpen = this.hasAttribute('open');
+    clearTimeout(this._hideTimer);
     if (isOpen) {
+      this._box.hidden = false;
       if (!this._wasOpen) this._box.style.zIndex = String(nextOverlayLayer());
       if (!this._wasOpen) Sfx.play('menu-open');
       this._wasOpen = true;
@@ -235,6 +245,9 @@ class TfMenu extends HTMLElement {
       const wasOpen = this._wasOpen;
       this._wasOpen = false;
       this._box.classList.remove('open');
+      // Taking the panel out of layout waits for the fade-out to finish.
+      if (wasOpen) this._hideTimer = setTimeout(() => { this._box.hidden = true; }, MENU_FADE_MS);
+      else this._box.hidden = true;
       // Inert drops focus held inside the panel to <body>; hand it back to the
       // trigger. Focus that already moved elsewhere (outside click) is left alone.
       if (wasOpen && this._focusInside()) this._focusAnchor();
@@ -426,6 +439,11 @@ class TfMenu extends HTMLElement {
     this.open();
     const rows = this._enabledRows();
     (e.key === 'ArrowDown' ? rows[0] : rows.at(-1))?.focus();
+  }
+
+  /** Moves focus into an open menu, for a trigger that was activated from the keyboard. */
+  focusFirst() {
+    this._enabledRows()[0]?.focus();
   }
 
   _enabledRows() {

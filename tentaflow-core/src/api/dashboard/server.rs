@@ -472,13 +472,14 @@ fn make_response_with_origin(
 
 fn make_static_response_with_origin(
     path: &str,
-    status: u16,
-    content_type: &str,
-    body: Vec<u8>,
+    asset: static_files::StaticAsset,
     origin: Option<&str>,
-    etag: &str,
     if_none_match: Option<&str>,
 ) -> Response<DashboardBody> {
+    let static_files::StaticAsset { status, content_type, body, etag, gzipped } = asset;
+    // A compressed representation is a different entity, so it gets its own validator.
+    let etag = if gzipped { format!("{etag}-gzip") } else { etag };
+    let etag = etag.as_str();
     // Tylko sw.js + jego importScripts (sw-version.js) sa no-store — to one
     // napedzaja wykrywanie update'u SW i musza byc zawsze swieze. Reszta (w tym
     // wasm glue /js/protocol/) idzie przez ETag+rewalidacje: gdy tresc niezmieniona
@@ -528,6 +529,12 @@ fn make_static_response_with_origin(
             .header("ETag", &quoted)
             .header("Cache-Control", "no-cache");
     }
+    if gzipped {
+        builder = builder.header("Content-Encoding", "gzip");
+    }
+    if status == 200 && static_files::is_compressible(content_type) {
+        builder = builder.header("Vary", "Accept-Encoding");
+    }
 
     // Add security headers for HTML content to prevent framing and clickjacking.
     // CSP with frame-ancestors 'none' + base-uri 'self' + object-src 'none' prevents
@@ -555,7 +562,7 @@ fn make_static_response_with_origin(
     }
 
     builder
-        .body(Either::Left(Full::new(Bytes::from(body))))
+        .body(Either::Left(Full::new(body)))
         .unwrap()
 }
 
@@ -2782,14 +2789,16 @@ pub async fn handle_request(
             .headers()
             .get("if-none-match")
             .and_then(|v| v.to_str().ok());
-        let (status, content_type, body, etag) = static_files::serve(&path);
+        let accepts_gzip = req
+            .headers()
+            .get("accept-encoding")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(static_files::accepts_gzip);
+        let asset = static_files::serve(&path, accepts_gzip).await;
         return Ok(make_static_response_with_origin(
             &path,
-            status,
-            content_type,
-            body,
+            asset,
             cors_origin.as_deref(),
-            &etag,
             if_none_match,
         ));
     }

@@ -86,11 +86,11 @@ function fakeApi({ start = {}, statuses = [], input = null, cancel = null } = {}
 }
 
 const STARTED = {
-  login_id: 'node-a:11111111-2222-3333-4444-555555555555',
-  node_id: 'node-a',
-  verification_url: 'https://provider.example/device',
-  instruction_key: 'agent_accounts.login.instruction.code',
-  expires_at: '2026-09-18T10:00:00Z',
+  loginId: 'node-a:11111111-2222-3333-4444-555555555555',
+  nodeId: 'node-a',
+  verificationUrl: 'https://provider.example/device',
+  instructionKey: 'agent_accounts.login.instruction.code',
+  expiresAt: '2026-09-18T10:00:00Z',
 };
 
 /** A flow that polls only when the test asks it to. */
@@ -111,10 +111,10 @@ test('a started sign-in carries the address, the instruction and the node it run
 
   assert.deepEqual(api.calls[0], { kind: 'start', payload: { accountId: 'acc-1', nodeId: 'node-a' } });
   assert.equal(flow.state, 'awaiting_input');
-  assert.equal(flow.loginId, STARTED.login_id);
+  assert.equal(flow.loginId, STARTED.loginId);
   assert.equal(flow.nodeId, 'node-a');
-  assert.equal(flow.verificationUrl, STARTED.verification_url);
-  assert.equal(flow.instructionKey, STARTED.instruction_key);
+  assert.equal(flow.verificationUrl, STARTED.verificationUrl);
+  assert.equal(flow.instructionKey, STARTED.instructionKey);
   assert.deepEqual(seen, ['starting', 'awaiting_input']);
   assert.equal(flow.finished, false);
   flow.dispose();
@@ -144,7 +144,7 @@ test('the code is typed once and the flow waits for the node to verify it', asyn
   const api = fakeApi({ start: STARTED });
   const flow = await startedFlow(api);
   await flow.submit('  ABCD-1234 ');
-  assert.deepEqual(api.calls.at(-1), { kind: 'input', loginId: STARTED.login_id, value: 'ABCD-1234' });
+  assert.deepEqual(api.calls.at(-1), { kind: 'input', loginId: STARTED.loginId, value: 'ABCD-1234' });
   assert.equal(flow.state, 'verifying');
 
   // Nothing is sent for an empty field, and nothing more once the flow ended.
@@ -173,7 +173,7 @@ test('polling follows the node to the outcome and stops there', async () => {
     start: STARTED,
     statuses: [
       { state: 'verifying' },
-      { state: 'succeeded', provider_subject: 'ops@example.com', plan_label: 'Max' },
+      { state: 'succeeded', providerSubject: 'ops@example.com', planLabel: 'Max' },
     ],
   });
   const flow = await startedFlow(api);
@@ -197,7 +197,7 @@ test('polling follows the node to the outcome and stops there', async () => {
 test('a failed sign-in shows the message key the node sent, translated', async () => {
   const api = fakeApi({
     start: STARTED,
-    statuses: [{ state: 'failed', message_key: 'agent_accounts.login.expired' }],
+    statuses: [{ state: 'failed', messageKey: 'agent_accounts.login.expired' }],
   });
   const flow = await startedFlow(api);
   await flow.poll();
@@ -236,7 +236,7 @@ test('cancelling a running sign-in tells the node, and an unstarted one tells no
   const api = fakeApi({ start: STARTED });
   const flow = await startedFlow(api);
   await flow.cancel();
-  assert.deepEqual(api.calls.at(-1), { kind: 'cancel', loginId: STARTED.login_id });
+  assert.deepEqual(api.calls.at(-1), { kind: 'cancel', loginId: STARTED.loginId });
   assert.equal(flow.state, 'cancelled');
   assert.equal(flow.finished, true);
 
@@ -420,7 +420,7 @@ test('cancelling during a start sends the cancel as soon as the node names the f
 
   release();
   await started;
-  assert.deepEqual(api.calls.at(-1), { kind: 'cancel', loginId: STARTED.login_id });
+  assert.deepEqual(api.calls.at(-1), { kind: 'cancel', loginId: STARTED.loginId });
   assert.equal(flow.state, 'cancelled', 'the answer does not resurrect a cancelled sign-in');
   assert.equal(flow.verificationUrl, '', 'no address is shown for a sign-in nobody is finishing');
   assert.equal(api.calls.filter((c) => c.kind === 'status').length, 0, 'and it is not polled');
@@ -440,7 +440,7 @@ test('closing the window during a start cancels it too, disposed or not', async 
 
   release();
   await started;
-  assert.deepEqual(api.calls.at(-1), { kind: 'cancel', loginId: STARTED.login_id });
+  assert.deepEqual(api.calls.at(-1), { kind: 'cancel', loginId: STARTED.loginId });
 });
 
 test('cancelling a start that then fails cancels nothing and keeps the cancellation', async () => {

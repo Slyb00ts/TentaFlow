@@ -291,9 +291,9 @@ test('the structure answer decodes units, positions, holders, vacancies and warn
       my_permissions: ['org.admin'],
     },
   });
-  assert.equal(body.variant, 'OrgStructureStructureResponse');
+  assert.equal(body._variant, 'OrgStructureBody.StructureResponse');
   assert.equal(body.view.units[0].deputyHeadPositionIds[0], 'p-2');
-  assert.equal(body.view.units[0].unit_id, 'u-1');
+  assert.equal(body.view.units[0].unitId, 'u-1');
   assert.equal(body.view.positions[0].isHead, true);
   assert.equal(body.view.assignments[0].subject.id, 'u-anna');
   assert.equal(body.view.assignments[0].displayName, 'Anna Nowak');
@@ -304,21 +304,22 @@ test('the structure answer decodes units, positions, holders, vacancies and warn
   assert.equal(body.unitTypes[0].name, 'Dział');
 });
 
-test('a structure answer without the defaulted fields decodes as empty', { skip }, () => {
+test('a structure answer without the defaulted fields leaves them absent', { skip }, () => {
   const body = decode({ StructureResponse: { view: { at: DAY, timezone: 'Europe/Warsaw' } } });
-  assert.deepEqual(body.view.units, []);
-  assert.deepEqual(body.view.warnings, []);
-  assert.deepEqual(body.unitTypes, []);
-  assert.deepEqual(body.myPermissions, []);
+  // The generic decoder invents no serde defaults: a field the writer left out stays absent.
+  assert.equal(body.view.units, undefined);
+  assert.equal(body.view.warnings, undefined);
+  assert.equal(body.unitTypes, undefined);
+  assert.equal(body.myPermissions, undefined);
 });
 
 test('chain, subordinates, manager, assignment and integrity answers decode', { skip }, () => {
   const link = { position_id: 'p-0', unit_id: 'u-0', name: 'Dyrektor', depth: 1, holders: [{ kind: 'external', id: 'x-1' }] };
   const chain = decode({ ReportsChainResponse: { links: [link] } });
-  assert.equal(chain.variant, 'OrgStructureReportsChainResponse');
+  assert.equal(chain._variant, 'OrgStructureBody.ReportsChainResponse');
   assert.equal(chain.links[0].positionId, 'p-0');
   assert.equal(chain.links[0].holders[0].kind, 'external');
-  assert.equal(decode({ SubordinatesResponse: { links: [] } }).variant, 'OrgStructureSubordinatesResponse');
+  assert.equal(decode({ SubordinatesResponse: { links: [] } })._variant, 'OrgStructureBody.SubordinatesResponse');
 
   const manager = decode({ ManagerResponse: { manager: { user_id: 'u-9', position_id: 'p-0' } } });
   assert.equal(manager.manager.userId, 'u-9');
@@ -341,9 +342,9 @@ test('a write answer carries the result, the warnings and a typed error', { skip
       result: { kind: 'ended', value: { reporting_lines: ['l-1'], deputy_heads: [], assignments: ['a-1'] } },
     },
   });
-  assert.equal(ok.variant, 'OrgStructureWriteResponse');
+  assert.equal(ok._variant, 'OrgStructureBody.WriteResponse');
   assert.equal(ok.ok, true);
-  assert.equal(ok.error, null);
+  assert.equal(ok.error, undefined);
   assert.equal(ok.warnings[0].unitId, 'u-1');
   assert.equal(ok.result.kind, 'ended');
   assert.deepEqual(ok.result.value.reportingLines, ['l-1']);
@@ -358,14 +359,14 @@ test('a write answer carries the result, the warnings and a typed error', { skip
   assert.equal(refused.ok, false);
   assert.equal(refused.error.code, 'backdated_confirmation_required');
   assert.equal(refused.error.date, '2026-01-01');
-  assert.equal(refused.error.id, null);
-  assert.deepEqual(refused.warnings, []);
-  assert.equal(refused.result, null);
+  assert.equal(refused.error.id, undefined);
+  assert.equal(refused.warnings, undefined);
+  assert.equal(refused.result, undefined);
 });
 
 test('the recompute answer decodes its counters', { skip }, () => {
   const body = decode({ RecomputeResponse: { written: 3, removed: 1, unchanged: 40, cycles_broken: ['u-3'] } });
-  assert.equal(body.variant, 'OrgStructureRecomputeResponse');
+  assert.equal(body._variant, 'OrgStructureBody.RecomputeResponse');
   assert.equal(body.written, 3);
   assert.deepEqual(body.cyclesBroken, ['u-3']);
 });
@@ -450,7 +451,7 @@ test('the import report decodes its counts, rows, issues with suggestions and th
       },
     },
   });
-  assert.equal(body.variant, 'OrgStructureImportReportResponse');
+  assert.equal(body._variant, 'OrgStructureBody.ImportReportResponse');
   const report = body.report;
   assert.equal(report.asOf, DAY);
   assert.equal(report.sheet, 'Osoby');
@@ -465,10 +466,10 @@ test('the import report decodes its counts, rows, issues with suggestions and th
   assert.equal(report.rows[0].changes[0].field, 'share');
   assert.equal(report.errors[0].suggestionLabel, 'Jan Kowalski');
   assert.deepEqual(report.errors[1].rows, [88, 89]);
-  assert.equal(report.errors[1].suggestion, null, 'an absent suggestion is null');
+  assert.equal(report.errors[1].suggestion, undefined, 'an absent suggestion stays absent');
   assert.equal(report.previewPartial, true);
-  assert.deepEqual(report.preview.units, []);
-  assert.equal(report.fileError, null);
+  assert.equal(report.preview.units, undefined);
+  assert.equal(report.fileError, undefined);
 });
 
 test('an unusable file is a typed file error in the report', { skip }, () => {
@@ -481,14 +482,14 @@ test('an unusable file is a typed file error in the report', { skip }, () => {
     },
   });
   assert.equal(body.report.fileError.code, 'file_too_large');
-  assert.deepEqual(body.report.errors, []);
-  assert.equal(body.report.preview, null);
+  assert.equal(body.report.errors, undefined);
+  assert.equal(body.report.preview, undefined);
 });
 
 test('an export answer hands the file over as a Uint8Array with its name and type', { skip }, () => {
   const file = new Uint8Array([0xef, 0xbb, 0xbf, 0x6b]);
   const body = decode({ ExportResponse: { file_name: 'org-structure-2026-10-01.csv', mime: 'text/csv; charset=utf-8', bytes: file } });
-  assert.equal(body.variant, 'OrgStructureExportResponse');
+  assert.equal(body._variant, 'OrgStructureBody.ExportResponse');
   assert.ok(body.bytes instanceof Uint8Array);
   assert.deepEqual(body.bytes, file);
   assert.equal(body.fileName, 'org-structure-2026-10-01.csv');
@@ -574,27 +575,27 @@ test('the batch answer decodes per-operation results, warnings, the preview and 
       max_ops: 500,
     },
   });
-  assert.equal(body.variant, 'OrgStructureBatchResponse');
+  assert.equal(body._variant, 'OrgStructureBody.BatchResponse');
   assert.equal(body.ok, false);
   assert.equal(body.applied, false);
-  assert.equal(body.error, null);
+  assert.equal(body.error, undefined);
   assert.equal(body.maxOps, 500);
   assert.equal(body.previewAt, DAY);
-  assert.deepEqual(body.preview.units, []);
+  assert.equal(body.preview.units, undefined);
   assert.equal(body.warnings[0].unitId, 'u-9');
   assert.equal(body.results[0].tempId, 'tmp:u');
   assert.equal(body.results[0].createdId, 'u-9');
   assert.equal(body.results[0].result.value.unitId, 'u-9');
-  assert.equal(body.results[0].error, null);
+  assert.equal(body.results[0].error, undefined);
   assert.equal(body.results[1].index, 1);
   assert.equal(body.results[1].error.code, 'unknown_temp_id');
   assert.equal(body.results[1].error.id, 'tmp:x');
-  assert.equal(body.results[1].createdId, null);
+  assert.equal(body.results[1].createdId, undefined);
 
   const refused = decode({ BatchResponse: { ok: false, applied: false, error: { code: 'too_many_ops', message: 'at most 500' } } });
   assert.equal(refused.error.code, 'too_many_ops');
-  assert.deepEqual(refused.results, []);
-  assert.equal(refused.preview, null);
+  assert.equal(refused.results, undefined);
+  assert.equal(refused.preview, undefined);
 });
 
 // ----- deputies, absences, escalation and visibility -------------------------
@@ -660,20 +661,20 @@ test('the cover answer decodes absences with an optional reason, deputies and th
       can_see_absences: true, can_see_reason: true, can_edit_absences: true, can_edit_deputies: false,
     },
   });
-  assert.equal(body.variant, 'OrgStructureCoverResponse');
+  assert.equal(body._variant, 'OrgStructureBody.CoverResponse');
   assert.equal(body.available, false);
   assert.equal(body.absences[0].reason, 'szkolenie');
   assert.equal(body.absences[0].validTo, null);
   assert.equal(body.coveredBy[0].deputyName, 'Marek');
   assert.equal(body.coveredBy[0].scope, 'project:p-7');
-  assert.deepEqual(body.covering, []);
+  assert.equal(body.covering, undefined);
   assert.equal(body.canEditDeputies, false);
 
   // A viewer who may not see the dates gets no absences and no rights.
   const hidden = decode({ CoverResponse: { user_id: 'u-1', available: true, today: DAY } });
-  assert.deepEqual(hidden.absences, []);
-  assert.equal(hidden.canSeeAbsences, false);
-  assert.equal(hidden.canSeeReason, false);
+  assert.equal(hidden.absences, undefined);
+  assert.equal(hidden.canSeeAbsences, undefined);
+  assert.equal(hidden.canSeeReason, undefined);
 });
 
 test('availability, chain, visibility and viewer answers decode', { skip }, () => {
@@ -691,7 +692,7 @@ test('availability, chain, visibility and viewer answers decode', { skip }, () =
   assert.equal(chain.steps[0].coveringUserId, 'u-4');
   assert.equal(chain.skipped[0].reason, 'unavailable');
   assert.equal(chain.problem.kind, 'cycle');
-  assert.equal(decode({ EscalationChainResponse: {} }).problem, null);
+  assert.equal(decode({ EscalationChainResponse: {} }).problem, undefined);
 
   const view = decode({
     VisibilityResponse: {
@@ -700,9 +701,9 @@ test('availability, chain, visibility and viewer answers decode', { skip }, () =
       rows: [{ area: 'absence_reasons', verdict: 'direct', rule: 'primary_manager' }],
     },
   });
-  assert.equal(view.manager, null);
+  assert.equal(view.manager, undefined);
   assert.equal(view.rows[0].verdict, 'direct');
-  assert.deepEqual(view.direct, []);
+  assert.equal(view.direct, undefined);
 
   const who = decode({
     WhoSeesResponse: {
@@ -733,9 +734,9 @@ test('a write answer carries a deputy or an absence as its result, a manager its
     },
   });
   assert.equal(absence.result.value.kind, 'leave');
-  assert.equal(absence.result.value.validTo, null);
+  assert.equal(absence.result.value.validTo, undefined);
   assert.equal(decode({ ManagerResponse: { manager: { user_id: 'u-9', position_id: 'p-0', source: 'deputy' } } }).manager.source, 'deputy');
-  assert.equal(decode({ ManagerResponse: { manager: { user_id: 'u-9', position_id: 'p-0' } } }).manager.source, '', 'an answer from before the field');
+  assert.equal(decode({ ManagerResponse: { manager: { user_id: 'u-9', position_id: 'p-0' } } }).manager.source, undefined, 'an answer from before the field');
 });
 
 // ----- history and planned reorganizations -----------------------------------
@@ -799,12 +800,12 @@ test('the history answers decode entries with their changes, and diffs with thei
       total: 1, personal_visible: false, today: '2026-09-30',
     },
   });
-  assert.equal(history.variant, 'OrgStructureHistoryListResponse');
+  assert.equal(history._variant, 'OrgStructureBody.HistoryListResponse');
   assert.equal(history.personalVisible, false);
   assert.equal(history.entries[0].effectiveDate, '2026-11-01');
   assert.equal(history.entries[0].hiddenOps, 1);
   assert.equal(history.entries[0].changes[0].afterLabel, 'Realizacja');
-  assert.equal(history.entries[0].changes[0].before_label, null, 'an absent label is null');
+  assert.equal(history.entries[0].changes[0].beforeLabel, undefined, 'an absent label stays absent');
   assert.equal(history.entries[0].ops[0].targetId, 'u-2');
 
   const diff = decode({
@@ -831,13 +832,13 @@ test('the change set answers decode the state, the people, the operations and th
       results: [{ index: 0, ok: false, error: { code: 'not_valid_at', message: 'm', date: '2026-11-01' } }],
     },
   });
-  assert.equal(answer.variant, 'OrgStructureChangeSetResponse');
+  assert.equal(answer._variant, 'OrgStructureBody.ChangeSetResponse');
   assert.equal(answer.error.code, 'self_approval');
-  assert.equal(answer.change_set.effective_date, '2026-11-01');
-  assert.equal(answer.change_set.author_name, 'Hanna');
-  assert.equal(answer.change_set.approver_user_id, null);
-  assert.equal(answer.change_set.ops[0].temp_id, 'tmp:q');
-  assert.equal(answer.change_set.ops[0].request.UnitCreateRequest.name, 'Quality');
+  assert.equal(answer.changeSet.effectiveDate, '2026-11-01');
+  assert.equal(answer.changeSet.authorName, 'Hanna');
+  assert.equal(answer.changeSet.approverUserId, undefined);
+  assert.equal(answer.changeSet.ops[0].tempId, 'tmp:q');
+  assert.equal(answer.changeSet.ops[0].request.UnitCreateRequest.name, 'Quality');
   assert.equal(answer.results[0].error.date, '2026-11-01');
 
   const preview = decode({
@@ -847,12 +848,12 @@ test('the change set answers decode the state, the people, the operations and th
       items: [{ change: 'added', entity: 'unit', id: 'u-q', name: 'Quality' }],
     },
   });
-  assert.equal(preview.variant, 'OrgStructureChangeSetPreviewResponse');
-  assert.deepEqual(preview.live.units, []);
+  assert.equal(preview._variant, 'OrgStructureBody.ChangeSetPreviewResponse');
+  assert.equal(preview.live.units, undefined);
   assert.equal(preview.items[0].name, 'Quality');
 
   const bare = decode({ ChangeSetResponse: { ok: true } });
-  assert.deepEqual([bare.valid, bare.results, bare.change_set], [false, [], null], 'an answer without the defaulted fields');
+  assert.deepEqual([bare.valid, bare.results, bare.changeSet], [undefined, undefined, undefined], 'an answer without the defaulted fields');
 });
 
 // ----- handover ("Do przekazania") -------------------------------------------
@@ -901,11 +902,11 @@ test('the handover answers decode groups, proposals, per-item results and record
       takers: [{ user_id: 'u-2', display_name: 'Anna' }],
     },
   });
-  assert.equal(list.variant, 'OrgStructureHandoverListResponse');
+  assert.equal(list._variant, 'OrgStructureBody.HandoverListResponse');
   assert.equal(list.groups[0].items[0].suggestion.reason, 'deputy');
-  assert.deepEqual(list.groups[0].items[0].eligible_user_ids, ['u-2', 'u-3']);
-  assert.equal(list.groups[0].items[0].blocked, null, 'a defaulted field arrives as null');
-  assert.equal(list.return_date, null);
+  assert.deepEqual(list.groups[0].items[0].eligibleUserIds, ['u-2', 'u-3']);
+  assert.equal(list.groups[0].items[0].blocked, undefined, 'a defaulted field stays absent');
+  assert.equal(list.returnDate, undefined);
 
   const applied = decode({
     HandoverApplyResponse: {
@@ -913,11 +914,11 @@ test('the handover answers decode groups, proposals, per-item results and record
       items: [{ key: 'task:p-1:t-1', category: 'task', title: '#1', status: 'failed', reason: 'internal' }],
     },
   });
-  assert.equal(applied.variant, 'OrgStructureHandoverApplyResponse');
-  assert.equal(applied.handover_id, 'h-1');
+  assert.equal(applied._variant, 'OrgStructureBody.HandoverApplyResponse');
+  assert.equal(applied.handoverId, 'h-1');
   assert.equal(applied.items[0].reason, 'internal');
-  assert.equal(applied.scheduled, 0);
-  assert.equal(applied.error, null);
+  assert.equal(applied.scheduled, undefined);
+  assert.equal(applied.error, undefined);
 
   const pending = decode({ HandoverPendingResponse: { people: [{ user_id: 'u-1', display_name: 'Piotr', count: 3, ended_on: DAY }] } });
   assert.equal(pending.people[0].count, 3);
@@ -927,6 +928,6 @@ test('the handover answers decode groups, proposals, per-item results and record
       records: [{ id: 'h-1', user_id: 'u-1', reason: 'absence', date: DAY, return_date: '2026-10-09', note: 'n', created_at_ms: 1790000000000, items: [] }],
     },
   });
-  assert.equal(records.records[0].return_date, '2026-10-09');
-  assert.deepEqual(decode({ HandoverRecordsResponse: {} }).records, []);
+  assert.equal(records.records[0].returnDate, '2026-10-09');
+  assert.equal(decode({ HandoverRecordsResponse: {} }).records, undefined);
 });

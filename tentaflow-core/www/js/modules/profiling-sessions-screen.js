@@ -63,11 +63,11 @@ const ProfilingSessionsScreen = {
     const filterNodeId = params && params.nodeId ? String(params.nodeId) : null;
     let nodes = await listNodes();
     if (filterNodeId) {
-      nodes = nodes.filter((n) => (n.node_id || '') === filterNodeId);
+      nodes = nodes.filter((n) => (n.nodeId || '') === filterNodeId);
       // Gdy nod nie zwrocony przez list (np. local lub przed pierwszym tickiem)
       // rezerwujemy slot z params.nodeName.
       if (nodes.length === 0) {
-        nodes = [{ node_id: filterNodeId, hostname: params.nodeName || filterNodeId }];
+        nodes = [{ nodeId: filterNodeId, hostname: params.nodeName || filterNodeId }];
       }
     }
 
@@ -90,7 +90,7 @@ const ProfilingSessionsScreen = {
     // Renderuje per-node section gdy >1 nod, w przeciwnym razie pojedyncza
     // instancja na pelnej szerokosci bez naglowka.
     for (const n of nodes) {
-      const nodeId = n.node_id;
+      const nodeId = n.nodeId;
       const nodeName = n.hostname || nodeId;
       if (nodes.length > 1) {
         const header = document.createElement('div');

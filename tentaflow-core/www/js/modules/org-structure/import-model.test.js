@@ -16,7 +16,7 @@ import {
 
 const unknownPerson = {
   row: 47, rows: [47], column: 'person', kind: 'unknown_person', value: 'j.kowlski',
-  suggestion: 'j.kowalski', suggestion_label: 'Jan Kowalski', message: 'x',
+  suggestion: 'j.kowalski', suggestionLabel: 'Jan Kowalski', message: 'x',
 };
 const cycle = { row: 89, rows: [88, 89], column: 'parent_code', kind: 'unit_cycle', message: 'x' };
 const twoHeads = { row: 134, rows: [131, 134], column: 'head', kind: 'two_heads', message: 'x' };
@@ -100,11 +100,11 @@ test('the number of errors is the number of listed problems, so the count and th
 
 test('what a replace ends is read from the dry run and never computed on the screen', () => {
   const report = {
-    counts: { units_ended: 2, positions_ended: 5, assignments_ended: 4 },
+    counts: { unitsEnded: 2, positionsEnded: 5, assignmentsEnded: 4 },
     ended: [
       { kind: 'unit', code: 'OLD', name: 'Stary dział', holders: [] },
       { kind: 'position', code: 'P-1', name: 'Księgowa', holders: ['Ewa Zet', 'Jan Nowy'] },
-      { kind: 'assignment', code: '', name: 'Tester', holders: [{ display_name: 'Ewa Zet' }] },
+      { kind: 'assignment', code: '', name: 'Tester', holders: [{ displayName: 'Ewa Zet' }] },
     ],
   };
   assert.deepEqual(replaceImpact(report), { units: 2, positions: 5, assignments: 4, total: 11 });
@@ -116,7 +116,7 @@ test('what a replace ends is read from the dry run and never computed on the scr
 });
 
 test('the ended-items confirmation is asked in replace mode only, and only when something ends', () => {
-  const ends = { counts: { units_ended: 1 }, ended: [] };
+  const ends = { counts: { unitsEnded: 1 }, ended: [] };
   assert.equal(needsEndedConfirmation(ends, 'replace'), true);
   assert.equal(needsEndedConfirmation(ends, 'upsert'), false);
   assert.equal(needsEndedConfirmation({ counts: {}, ended: [] }, 'replace'), false);
@@ -134,7 +134,7 @@ test('"Zapisz wszystko" needs a report without errors that is not applied and no
   assert.equal(canApply({ report: { ...clean, counts: { ...clean.counts, errors: 1 }, errors: [confirm] }, busy: null }), true, 'a replace that only awaits its confirmation can be applied');
   assert.equal(canApply({ report: clean, busy: 'dry' }), false);
   assert.equal(canApply({ report: { ...clean, applied: true }, busy: null }), false);
-  assert.equal(canApply({ report: { ...clean, file_error: { code: 'empty_file' } }, busy: null }), false);
+  assert.equal(canApply({ report: { ...clean, fileError: { code: 'empty_file' } }, busy: null }), false);
   assert.equal(unresolvedErrors(withErrors), true);
   assert.equal(unresolvedErrors(clean), false);
 });
@@ -142,12 +142,12 @@ test('"Zapisz wszystko" needs a report without errors that is not applied and no
 test('the preview marks positions by what the file does, an error beating a change', () => {
   const marks = previewMarks({
     rows: [
-      { row: 2, status: 'added', position_id: 'p-new' },
-      { row: 3, status: 'changed', position_id: 'p-chg' },
-      { row: 4, status: 'unchanged', position_id: 'p-same' },
-      { row: 5, status: 'changed', position_id: 'p-both' },
-      { row: 6, status: 'error', position_id: 'p-both' },
-      { row: 7, status: 'error', position_id: null },
+      { row: 2, status: 'added', positionId: 'p-new' },
+      { row: 3, status: 'changed', positionId: 'p-chg' },
+      { row: 4, status: 'unchanged', positionId: 'p-same' },
+      { row: 5, status: 'changed', positionId: 'p-both' },
+      { row: 6, status: 'error', positionId: 'p-both' },
+      { row: 7, status: 'error', positionId: null },
     ],
   });
   assert.deepEqual([...marks], [['p-new', 'added'], ['p-chg', 'changed'], ['p-both', 'error']]);

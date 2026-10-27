@@ -24,11 +24,11 @@ const BASE = 'https://127.0.0.1:8090';
     let last = '', stable = 0;
     for (let i = 0; i < 60; i++) {
       await page.waitForTimeout(1500);
-      const t = await page.evaluate(() => { const b=Array.from(document.querySelectorAll('.msg-row.assistant .bubble')); return b.length?(b[b.length-1].textContent||'').trim():''; });
+      const t = await page.evaluate(() => { const b=Array.from(document.querySelectorAll('.chat-msg.ai .chat-msg__txt')); return b.length?(b[b.length-1].textContent||'').trim():''; });
       if (t && t === last) { stable++; if (stable >= 3) break; } else { stable = 0; }
       last = t;
     }
-    const perf = await page.evaluate(() => { const p=Array.from(document.querySelectorAll('.msg-row.assistant .bubble-perf')).pop(); return p?(p.textContent||'').trim():''; });
+    const perf = await page.evaluate(() => (document.querySelector('#chat-decode')?.textContent || '').replace(/\s+/g, ' ').trim());
     log(`FULL ANSWER:\n${last}`);
     log(`PERF: ${perf}`);
     await b.close(); process.exit(last ? 0 : 2);

@@ -122,7 +122,7 @@ struct RelaySlot(Arc<AtomicUsize>);
 impl RelaySlot {
     /// `None` when the cap is already reached.
     fn claim(live: &Arc<AtomicUsize>) -> Option<Self> {
-        live.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+        live.try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
             (count < MAX_RELAYS).then_some(count + 1)
         })
         .ok()

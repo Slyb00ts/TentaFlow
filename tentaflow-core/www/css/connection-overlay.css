@@ -35,8 +35,11 @@
 /* Pauzuj wszystkie infinite animations (connDotPulse, connRingPulse) gdy
    overlay invisible — visibility:hidden samo nie zatrzymuje compositora,
    a animations sa cyklicznie liczone i palone CPU mimo ze user nic nie widzi.
-   `animation-play-state: paused` propaguje na descendants. */
+   `*` nie obejmuje pseudo-elementow, a pierscien connRingPulse jest na ::before
+   — bez jawnego ::before/::after biegl na kazdym ekranie przez caly czas. */
 .conn-overlay:not(.visible) *,
+.conn-overlay:not(.visible) *::before,
+.conn-overlay:not(.visible) *::after,
 .conn-overlay:not(.visible) {
   animation-play-state: paused !important;
 }

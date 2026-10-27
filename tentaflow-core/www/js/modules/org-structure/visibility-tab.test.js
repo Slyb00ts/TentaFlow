@@ -19,7 +19,7 @@ const { mountVisibilityTab, refreshVisibilityTab, unmountVisibilityTab } = await
 
 const vt = (key, params) => I18n.t(`org_structure.visibility.${key}`, params);
 
-const person = (id, name) => ({ user_id: id, display_name: name });
+const person = (id, name) => ({ userId: id, displayName: name });
 
 const seesFor = (id, name) => ({
   user: person(id, name),
@@ -38,16 +38,16 @@ const seesFor = (id, name) => ({
 const whoFor = (id, name) => ({
   subject: person(id, name),
   viewers: [
-    { user_id: 'u-adm', display_name: 'Admin', rule: 'administrator', kinds: ['absence_dates', 'position_history'] },
-    { user_id: id, display_name: name, rule: 'owner', kinds: ['absence_dates'] },
-    { user_id: 'u-anna', display_name: 'Anna', rule: 'primary_manager', kinds: ['absence_dates', 'time_utilization'] },
+    { userId: 'u-adm', displayName: 'Admin', rule: 'administrator', kinds: ['absence_dates', 'position_history'] },
+    { userId: id, displayName: name, rule: 'owner', kinds: ['absence_dates'] },
+    { userId: 'u-anna', displayName: 'Anna', rule: 'primary_manager', kinds: ['absence_dates', 'time_utilization'] },
   ],
 });
 
 const view = {
   assignments: [
-    { subject: { kind: 'user', id: 'u-anna' }, display_name: 'Anna Kowalska' },
-    { subject: { kind: 'user', id: 'u-marek' }, display_name: 'Marek Nowak' },
+    { subject: { kind: 'user', id: 'u-anna' }, displayName: 'Anna Kowalska' },
+    { subject: { kind: 'user', id: 'u-marek' }, displayName: 'Marek Nowak' },
   ],
 };
 

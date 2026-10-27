@@ -142,7 +142,7 @@ test('renders one section per declared step with its translated title, descripti
 });
 
 test('running a step sends the instance, the step id and the collected form values', async () => {
-  stubTransport(() => ({ status: 'ok', message: 'done', details: [] }));
+  stubTransport(() => ({ status: 'Ok', message: 'done', details: [] }));
   const win = open([form]);
   await settle();
   const f = section(win, 'form');
@@ -165,9 +165,9 @@ test('running a step sends the instance, the step id and the collected form valu
 
 test('an ok result shows its message and measurements, and the button offers a re-run', async () => {
   stubTransport(() => ({
-    status: 'ok',
+    status: 'Ok',
     message: 'Bell test passed',
-    details: [{ name: '00', value: '2051' }, { name: 'duration_ms', value: '3' }],
+    details: [['00', '2051'], ['duration_ms', '3']],
   }));
   const win = open([bell]);
   await settle();
@@ -187,8 +187,8 @@ test('a failed step is shown as failed, offers a retry, and the retry replaces t
   stubTransport(() => {
     attempt += 1;
     return attempt === 1
-      ? { status: 'failed', message: 'simulator fault', details: [] }
-      : { status: 'warning', message: 'slow but fine', details: [] };
+      ? { status: 'Failed', message: 'simulator fault', details: [] }
+      : { status: 'Warning', message: 'slow but fine', details: [] };
   });
   const win = open([bell]);
   await settle();
@@ -218,7 +218,7 @@ test('a transport error is a failed result, not a silent success', async () => {
 });
 
 test('a required field that is not answered sends nothing', async () => {
-  stubTransport(() => ({ status: 'ok', message: 'x', details: [] }));
+  stubTransport(() => ({ status: 'Ok', message: 'x', details: [] }));
   const win = open([form]);
   await settle();
   run(win, 'form').click();
@@ -230,8 +230,8 @@ test('a required field that is not answered sends nothing', async () => {
 
 test('run all goes in order and stops at the first failed step', async () => {
   stubTransport((_kind, { stepId }) => (stepId === 'first'
-    ? { status: 'failed', message: 'no', details: [] }
-    : { status: 'ok', message: 'yes', details: [] }));
+    ? { status: 'Failed', message: 'no', details: [] }
+    : { status: 'Ok', message: 'yes', details: [] }));
   const win = open([{ ...bell, id: 'first' }, { ...bell, id: 'second' }]);
   await settle();
   win.querySelector('[data-role="run-all"]').click();
@@ -243,7 +243,7 @@ test('run all goes in order and stops at the first failed step', async () => {
 });
 
 test('run all skips steps that already passed', async () => {
-  stubTransport(() => ({ status: 'ok', message: 'yes', details: [] }));
+  stubTransport(() => ({ status: 'Ok', message: 'yes', details: [] }));
   const win = open([{ ...bell, id: 'first' }, { ...bell, id: 'second' }]);
   await settle();
   run(win, 'first').click();
@@ -256,7 +256,7 @@ test('run all skips steps that already passed', async () => {
 });
 
 test('finishing with a step that did not pass says so; finishing green is silent', async () => {
-  stubTransport(() => ({ status: 'failed', message: 'no', details: [] }));
+  stubTransport(() => ({ status: 'Failed', message: 'no', details: [] }));
   let closed = 0;
   const win = open([bell], { onClose: () => { closed += 1; } });
   await settle();
@@ -269,7 +269,7 @@ test('finishing with a step that did not pass says so; finishing green is silent
   assert.match(document.querySelector('.toast-warning').textContent, /TentaQuant is installed, but 1 setup step has not passed/);
 
   document.querySelectorAll('.toast').forEach((t) => t.remove());
-  stubTransport(() => ({ status: 'ok', message: 'yes', details: [] }));
+  stubTransport(() => ({ status: 'Ok', message: 'yes', details: [] }));
   const green = open([bell]);
   await settle();
   run(green, 'bell-test').click();

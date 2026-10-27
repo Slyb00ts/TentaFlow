@@ -89,8 +89,8 @@ test('repoCell: a workspace WITHOUT a repository prints no branch at all', () =>
   assert.doesNotMatch(html, /cell-title/);
 });
 
-test('repoCell: snake_case payloads take the same empty path', () => {
-  const html = repoApi.repoCell({ repo_url: null, target_branch: 'main' });
+test('repoCell: a null repository takes the same empty path', () => {
+  const html = repoApi.repoCell({ repoUrl: null, targetBranch: 'main' });
   assert.match(html, /repo_none/);
   assert.doesNotMatch(html, /main/);
 });
@@ -120,21 +120,21 @@ test('repoCell: a repository without a branch prints one line, not an empty one'
 // ---------------------------------------------------------------------------
 
 test('nodeCell: one node in the mesh means the name carries the cell alone', () => {
-  nodeApi.state.nodes = [{ node_id: 'a' }];
+  nodeApi.state.nodes = [{ nodeId: 'a' }];
   const html = nodeApi.nodeCell({ nodeName: 'mainpc', isLocal: true });
   assert.match(html, /cell-title">mainpc</);
   assert.doesNotMatch(html, /cell-sub/);
 });
 
 test('nodeCell: with several nodes the caption separates rows, so it appears', () => {
-  nodeApi.state.nodes = [{ node_id: 'a' }, { node_id: 'b' }];
+  nodeApi.state.nodes = [{ nodeId: 'a' }, { nodeId: 'b' }];
   const html = nodeApi.nodeCell({ nodeName: 'mainpc', isLocal: true });
   assert.match(html, /cell-sub">node_local</);
 });
 
 test('nodeCell: a workspace on ANOTHER node always says so', () => {
-  nodeApi.state.nodes = [{ node_id: 'a' }];
-  const html = nodeApi.nodeCell({ node_name: 'gpu-01', is_local: false });
+  nodeApi.state.nodes = [{ nodeId: 'a' }];
+  const html = nodeApi.nodeCell({ nodeName: 'gpu-01', isLocal: false });
   assert.match(html, /cell-title">gpu-01</);
   assert.match(html, /cell-sub">node_remote</);
 });

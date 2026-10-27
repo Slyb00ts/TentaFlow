@@ -46,8 +46,8 @@ async function loadAll() {
   currentContainer.innerHTML = `<div class="addons-empty">${escapeHtml(I18n.t('common.loading'))}</div>`;
   try {
     const resp = await ApiBinary.one('addonAccessListRequest', { addonId: currentAddonId });
-    usesAlias = (resp.usesAlias || resp.uses_alias || []).map(normalizeUse);
-    usesModel = (resp.usesModel || resp.uses_model || []).map(normalizeUse);
+    usesAlias = (resp.usesAlias || []).map(normalizeUse);
+    usesModel = (resp.usesModel || []).map(normalizeUse);
     provides = await loadProvides();
     render();
   } catch (err) {
@@ -57,11 +57,11 @@ async function loadAll() {
 
 function normalizeUse(u) {
   return {
-    target: u.target ?? u.id ?? '',
+    target: u.target ?? '',
     required: !!(u.required ?? false),
     reason: u.reason ?? '',
-    grantStatus: u.grantStatus ?? u.grant_status ?? 'pending',
-    ownerVisibility: u.ownerVisibility ?? u.owner_visibility ?? 'private',
+    grantStatus: u.grantStatus ?? 'pending',
+    ownerVisibility: u.ownerVisibility ?? 'private',
   };
 }
 
@@ -82,7 +82,7 @@ async function loadProvides() {
       })
       .map((a) => ({
         alias: a.alias ?? '',
-        visibility: normalizeVisibility(a.visibility ?? a.owner_visibility ?? a.ownerVisibility),
+        visibility: normalizeVisibility(a.visibility),
       }));
   } catch (_) {
     return [];
@@ -253,7 +253,7 @@ async function decide(kind, target, decision) {
 // rather than trusting the optimistic guess.
 function applyTransitions(transitions) {
   for (const t of transitions) {
-    const addonId = t.addonId ?? t.addon_id;
+    const addonId = t.addonId;
     if (addonId && addonId !== currentAddonId) continue;
     const after = t.after;
     if (!after) continue;

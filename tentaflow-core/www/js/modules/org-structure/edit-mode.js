@@ -700,7 +700,7 @@ export function openEditMode(api, transport = ApiBinary, preset = null) {
     if (!(await confirmLeave())) return false;
     dispose();
     const body = await transport.one('orgStructureRequest', {});
-    api.exit({ view: body.view, unitTypes: body.unit_types ?? [], myPermissions: body.my_permissions ?? [] });
+    api.exit({ view: body.view, unitTypes: body.unitTypes ?? [], myPermissions: body.myPermissions ?? [] });
     return true;
   }
 

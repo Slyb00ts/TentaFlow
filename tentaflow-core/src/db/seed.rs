@@ -1596,6 +1596,45 @@ fn seed_platform_rag_aliases(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Aliases every node seeds for itself (platform RAG and camera CV). Their
+/// bindings replicate like any alias, but they are never deleted by sync: the
+/// seed recreates a missing row on the next start, so a replicated delete would
+/// only leave the fleet disagreeing about whether the alias exists.
+pub(crate) fn is_platform_seeded_alias(name: &str) -> bool {
+    PLATFORM_RAG_ALIASES.iter().any(|(alias, _)| *alias == name)
+        || CAMERA_CV_ALIASES.iter().any(|(alias, _, _)| *alias == name)
+}
+
+/// Whether a platform alias still holds exactly what the seed wrote. Such a row
+/// says nothing an admin decided, so seeding the ledger from the table skips it.
+pub(crate) fn is_untouched_platform_alias(
+    name: &str,
+    target_model: &str,
+    fallback_targets: Option<&str>,
+) -> bool {
+    (PLATFORM_RAG_ALIASES.iter().any(|(alias, _)| *alias == name) && target_model.trim().is_empty())
+        || CAMERA_CV_ALIASES.iter().any(|(alias, target, fallbacks)| {
+            *alias == name && *target == target_model && *fallbacks == fallback_targets
+        })
+}
+
+/// (alias, target preset, fallbacks as a JSON list) of the `tentavision-*`
+/// aliases every node seeds for itself.
+const CAMERA_CV_ALIASES: &[(&str, &str, Option<&str>)] = &[
+    ("tentavision-detect", "rfdetr-adr-base", None),
+    ("tentavision-stan", "nalepka-stan-mnv4", None),
+    // OCR: preset tablic rejestracyjnych, z fallbackiem na ogolne OCR
+    // (PP-OCRv5 na Linux/Windows, Apple Vision na macOS).
+    (
+        "tentavision-ocr",
+        "plate-ocr-fast",
+        Some(r#"["ppocrv5-mobile-onnx","apple-vision-ocr"]"#),
+    ),
+    // Uzywany przez wezel `vision_classify` w seedowanym flow analizy
+    // kamery — spojny z domyslnym klasyfikatorem stanu nalepek.
+    ("tentavision-action", "nalepka-stan-mnv4", None),
+];
+
 /// Seeduje aliasy modeli CV dla kamer (`tentavision-*`). Cele to identyfikatory
 /// presetow z manifestow `tentaflow-containers/vision/_services/*.toml`
 /// (`models_from_manifest` reklamuje w katalogu `model_preset.id`, bo silniki
@@ -1605,26 +1644,11 @@ fn seed_platform_rag_aliases(conn: &Connection) -> Result<()> {
 /// Idempotentne: `alias` ma UNIQUE, INSERT OR IGNORE nie nadpisuje edycji
 /// uzytkownika. `fallback_targets` to JSON-owa lista (konwencja repository).
 fn seed_camera_cv_aliases(conn: &Connection) -> Result<()> {
-    // (alias, preset docelowy, fallbacki JSON)
-    let aliases: &[(&str, &str, Option<&str>)] = &[
-        ("tentavision-detect", "rfdetr-adr-base", None),
-        ("tentavision-stan", "nalepka-stan-mnv4", None),
-        // OCR: preset tablic rejestracyjnych, z fallbackiem na ogolne OCR
-        // (PP-OCRv5 na Linux/Windows, Apple Vision na macOS).
-        (
-            "tentavision-ocr",
-            "plate-ocr-fast",
-            Some(r#"["ppocrv5-mobile-onnx","apple-vision-ocr"]"#),
-        ),
-        // Uzywany przez wezel `vision_classify` w seedowanym flow analizy
-        // kamery — spojny z domyslnym klasyfikatorem stanu nalepek.
-        ("tentavision-action", "nalepka-stan-mnv4", None),
-    ];
     let mut stmt = conn.prepare(
         "INSERT OR IGNORE INTO model_aliases (alias, target_model, fallback_targets) \
          VALUES (?1, ?2, ?3)",
     )?;
-    for (alias, target, fallbacks) in aliases {
+    for (alias, target, fallbacks) in CAMERA_CV_ALIASES {
         let inserted = stmt.execute(rusqlite::params![alias, target, fallbacks])?;
         if inserted > 0 {
             info!("seed: utworzono alias CV '{}' -> '{}'", alias, target);

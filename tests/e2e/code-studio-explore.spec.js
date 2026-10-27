@@ -23,6 +23,7 @@ const {
   startBinary, stopBinary, waitForServer, binaryExists, baseUrl,
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
+const { ensureNativeApp } = require('./helpers/code-studio');
 const {
   startScriptedModel, helloWorldScript, enforcedPipelineScripts,
 } = require('./helpers/scripted-model');
@@ -109,8 +110,9 @@ function watch(page, label) {
   page.on('console', (msg) => {
     if (msg.type() !== 'error') return;
     const text = msg.text();
-    // A failed favicon or an aborted stream on teardown is noise, not a defect.
-    if (/favicon|net::ERR_ABORTED|Failed to load resource/i.test(text)) return;
+    // A failed favicon, an aborted stream on teardown and the service-worker fetch
+    // that ignores the test's self-signed certificate setting are noise, not defects.
+    if (/favicon|net::ERR_ABORTED|Failed to load resource|An SSL certificate error occurred when fetching the script/i.test(text)) return;
     note(label, `blad w konsoli: ${text.slice(0, 240)}`);
   });
   page.on('pageerror', (err) => {
@@ -129,7 +131,7 @@ async function registerProvider(page) {
   await api(page, 'serviceManifestDeployRequest', {
     engineId: 'openai-compatible',
     deployMethod: 'external',
-    nodeId: first.nodeId ?? first.node_id ?? '',
+    nodeId: first.nodeId ?? '',
     configJson: JSON.stringify({
       base_url: model.baseUrl,
       api_key: 'explore-key',
@@ -144,6 +146,7 @@ test.describe('Spacer po Code Studio', () => {
     test.setTimeout(T(420_000));
     watch(page, 'start');
     await step('logowanie', () => loginAsAdmin(page, { port: PORT }), 60_000);
+    await step('instalacja aplikacji Code Studio', () => ensureNativeApp(page, 'code-studio'), 60_000);
     await step('rejestracja dostawcy modelu', () => registerProvider(page), 60_000);
 
     const me = await api(page, 'authMeRequest');
@@ -209,11 +212,8 @@ test.describe('Spacer po Code Studio', () => {
     await page.goto(`${baseUrl(PORT)}/#/code-studio`);
 
     await page.locator(`text=${WORKSPACE}`).first().click();
-    await page.locator('#cs-open-session:not([disabled])').waitFor({ timeout: 90_000 });
-    await page.locator('#cs-open-session').click();
-    await page.locator('#cs-sess-title input').first().fill('spacer');
-    await page.locator('[data-action="create"]').first().click();
-    await page.waitForSelector('#cs-session-view', { state: 'visible', timeout: 60_000 });
+    // Clicking an active workspace goes straight into its session.
+    await page.waitForSelector('#cs-session-view', { state: 'visible', timeout: 90_000 });
 
     // An ordinary sentence, the way someone actually asks for something. The
     // composer is a `tf-textarea`, and it is painted after the session view

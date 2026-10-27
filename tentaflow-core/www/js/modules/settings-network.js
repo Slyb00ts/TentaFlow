@@ -198,7 +198,7 @@ export function bindMeshTab(host, _outerRerender) {
         irohRelayUrl: config.irohRelayUrl || '',
         excludedInterfaces: Array.isArray(config.excludedInterfaces) ? config.excludedInterfaces : [],
       });
-      pendingRestart = !!(resp?.restartRequired ?? resp?.restart_required);
+      pendingRestart = !!(resp?.restartRequired);
       toast(I18n.t('settings.mesh.save_success'), 'success');
       rerender();
     } catch (err) {
@@ -231,21 +231,21 @@ async function loadAll() {
   try {
     const [ifacesResp, cfgResp] = await Promise.all([
       ApiBinary.one('networkInterfacesListRequest').catch(() => ({ interfaces: [] })),
-      ApiBinary.one('networkConfigGetRequest').catch(() => ({ config: defaultConfig() })),
+      ApiBinary.one('networkConfigGetRequest').catch(() => defaultConfig()),
     ]);
     interfaces = Array.isArray(ifacesResp?.interfaces) ? ifacesResp.interfaces : [];
-    const raw = cfgResp?.config || cfgResp || {};
+    const raw = cfgResp || {};
     config = {
-      bindMode: String(raw.bindMode ?? raw.bind_mode ?? 'auto'),
-      bindIpv4: String(raw.bindIpv4 ?? raw.bind_ipv4 ?? ''),
-      hideDocker: !!(raw.hideDocker ?? raw.hide_docker),
-      hideLinkLocal: !!(raw.hideLinkLocal ?? raw.hide_link_local),
-      hideLoopback: !!(raw.hideLoopback ?? raw.hide_loopback),
-      hideCgnat: !!(raw.hideCgnat ?? raw.hide_cgnat),
-      preferSameSubnet: !!(raw.preferSameSubnet ?? raw.prefer_same_subnet),
-      irohRelayUrl: String(raw.irohRelayUrl ?? raw.iroh_relay_url ?? ''),
-      excludedInterfaces: Array.isArray(raw.excludedInterfaces ?? raw.excluded_interfaces)
-        ? (raw.excludedInterfaces ?? raw.excluded_interfaces).map(String)
+      bindMode: String(raw.bindMode ?? 'auto'),
+      bindIpv4: String(raw.bindIpv4 ?? ''),
+      hideDocker: !!raw.hideDocker,
+      hideLinkLocal: !!raw.hideLinkLocal,
+      hideLoopback: !!raw.hideLoopback,
+      hideCgnat: !!raw.hideCgnat,
+      preferSameSubnet: !!raw.preferSameSubnet,
+      irohRelayUrl: String(raw.irohRelayUrl ?? ''),
+      excludedInterfaces: Array.isArray(raw.excludedInterfaces)
+        ? raw.excludedInterfaces.map(String)
         : [],
     };
   } catch (err) {

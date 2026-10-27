@@ -581,9 +581,29 @@ input, textarea, select {
   display: flex; align-items: center; justify-content: center;
   /* Przeciwrotacja: orby zostaja pionowe niezaleznie od katu na okregu. */
   transform: translate(-50%, -50%) rotate(calc(-1 * var(--angle, 0deg)));
-  box-shadow: 0 0 40px currentColor, inset 0 0 12px rgba(255,255,255,0.08);
-  animation: orbPulse 3.4s ease-in-out var(--float-delay, 0s) infinite;
   border: 1px solid currentColor;
+  position: relative;
+}
+/* Two glow layers cross-fade by opacity (compositor). Interpolating a 56px
+   blurred box-shadow on five orbs repainted the hero on the main thread every
+   frame. */
+.hero .orb::before,
+.hero .orb::after {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  border-radius: 50%;
+  z-index: -1;
+  pointer-events: none;
+}
+.hero .orb::before {
+  box-shadow: 0 0 32px currentColor, inset 0 0 12px rgba(255,255,255,0.08);
+  animation: orbPulse 3.4s ease-in-out var(--float-delay, 0s) infinite;
+}
+.hero .orb::after {
+  box-shadow: 0 0 56px currentColor, inset 0 0 16px rgba(255,255,255,0.14);
+  opacity: 0;
+  animation: orbPulseHigh 3.4s ease-in-out var(--float-delay, 0s) infinite;
 }
 .hero .orb .icon { width: 22px; height: 22px; color: white; stroke-width: 2; }
 
@@ -593,8 +613,12 @@ input, textarea, select {
   100% { transform: rotate(var(--angle, 0deg)) translateY(calc(-1 * var(--orbit-radius))) translateY(-12px); }
 }
 @keyframes orbPulse {
-  0%, 100% { box-shadow: 0 0 32px currentColor, inset 0 0 12px rgba(255,255,255,0.08); }
-  50%      { box-shadow: 0 0 56px currentColor, inset 0 0 16px rgba(255,255,255,0.14); }
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0; }
+}
+@keyframes orbPulseHigh {
+  0%, 100% { opacity: 0; }
+  50%      { opacity: 1; }
 }
 
 .orb.red    { background: rgba(239,68,68,0.22); color: #ef4444; }
@@ -615,7 +639,8 @@ input, textarea, select {
 
 @media (prefers-reduced-motion: reduce) {
   .hero-mesh-layer-a, .hero-mesh-layer-b,
-  .orb-wrap, .hero .orb, .hero-mascot { animation: none; }
+  .orb-wrap, .hero .orb::before, .hero .orb::after, .hero-mascot { animation: none; }
+  .hero .orb::before { box-shadow: 0 0 40px currentColor, inset 0 0 12px rgba(255,255,255,0.08); }
 }
 .hero-title {
   font-size: 44px; font-weight: 800;
@@ -2874,176 +2899,10 @@ input, textarea, select {
 .svc-aliases-toolbar { margin-bottom: 12px; display: flex; gap: 8px; }
 
 /* =============================================================================
- * Chat — conversations sidebar + virtualized message history + composer.
- * Layout follows designs/chat-redesign-20260430: 296px sidebar, centered
- * 800px message column, sticky composer pill, day-grouped sidebar items,
- * markdown bubbles with code blocks and <think> details.
+ * Chat bubbles and composer shared by tf-chat-bubble / tf-chat-composer (Project
+ * Studio chat). The Chat screen itself is styled in chat.css / chat-audio.css;
+ * its markdown output reuses the typography rules below through :is().
  * ============================================================================= */
-
-/* Pelnoekranowy chat — zastepuje standardowy padding .main (jak fb-shell). */
-.main:has(.chat-shell) { padding: 0 !important; overflow: hidden; }
-.main:has(.chat-shell) > * { height: 100%; }
-
-.chat-shell {
-  display: grid;
-  grid-template-columns: 296px 1fr;
-  height: 100%;
-  overflow: hidden;
-  position: relative;
-}
-
-.chat-sidebar {
-  background: var(--bg-2);
-  border-right: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  min-width: 0;
-}
-.chat-sidebar .sidebar-head {
-  padding: 14px 14px 10px;
-  border-bottom: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.chat-sidebar tf-searchbox { display: block; width: 100%; }
-.chat-sidebar .chat-new-btn { width: 100%; }
-.chat-sidebar .chat-new-btn tf-button,
-.chat-sidebar .chat-new-btn .tf-btn { width: 100%; justify-content: center; }
-
-.conv-list {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  overflow-y: auto;
-  flex: 1;
-  min-height: 0;
-  padding: 8px;
-}
-.conv-day {
-  font-size: 10px; font-weight: 700; color: var(--text-3);
-  letter-spacing: 0.1em; text-transform: uppercase;
-  padding: 12px 8px 6px;
-}
-.conv-item {
-  position: relative;
-  padding: 10px 12px;
-  border-radius: var(--radius);
-  cursor: pointer;
-  transition: background 0.12s;
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 4px 8px;
-}
-.conv-item:hover { background: var(--bg-3); }
-.conv-item.active {
-  background: rgba(99, 102, 241, 0.14);
-  outline: 1px solid rgba(99, 102, 241, 0.35);
-}
-.conv-item.active::before {
-  content: '';
-  position: absolute;
-  left: -8px; top: 12px; bottom: 12px;
-  width: 3px;
-  background: var(--gradient-accent, var(--accent-1));
-  border-radius: 0 3px 3px 0;
-}
-.conv-item .conv-title {
-  font-size: 13px; font-weight: 600; color: var(--text);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.conv-item .conv-time {
-  font-size: 10px; color: var(--text-3);
-  white-space: nowrap;
-}
-.conv-item .conv-snippet {
-  grid-column: 1 / -1;
-  font-size: 11px; color: var(--text-3);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.conv-empty {
-  color: var(--text-3); font-size: 12px;
-  padding: 12px; text-align: center;
-}
-
-.chat-main {
-  display: grid;
-  grid-template-rows: auto 1fr auto;
-  background: var(--bg);
-  overflow: hidden;
-  min-width: 0;
-  position: relative;
-}
-
-.chat-head {
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 20px;
-  border-bottom: 1px solid var(--border);
-  background: var(--bg-2);
-  min-width: 0;
-}
-.chat-head .chat-head-left {
-  display: flex; align-items: center; gap: 10px;
-  min-width: 0;
-}
-.chat-head .head-burger { display: none; }
-.chat-head .head-title {
-  display: flex; flex-direction: column;
-  min-width: 0;
-  padding: 0 8px;
-}
-.chat-head .head-title .title {
-  font-size: 13px; font-weight: 600; color: var(--text);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.chat-head .head-title .meta {
-  font-size: 11px; color: var(--text-3);
-  display: flex; align-items: center; gap: 8px;
-}
-.chat-head .dot-status {
-  width: 8px; height: 8px; border-radius: 50%;
-  background: var(--success); box-shadow: 0 0 8px currentColor;
-}
-.chat-head .head-actions {
-  display: flex; gap: 6px;
-}
-/* Anchor for the More button's tf-menu (it uses position:absolute inside
-   shadow DOM, so the host needs a positioned ancestor). */
-.chat-head .chat-more-wrap {
-  position: relative;
-  display: inline-flex;
-}
-.chat-head .chat-more-wrap > tf-menu {
-  position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
-  z-index: 200;
-}
-
-/* Scroll container + host VirtualList. Centrujemy kolumne 800px przez
-   poziomy padding-inline z `max(24px, calc((100% - 800px)/2))`, dzieki czemu
-   vlist host zostaje pelnowymiarowy a scrollbar przy krawedzi. */
-.chat-body {
-  overflow-y: auto;
-  background: var(--bg);
-  min-height: 0;
-  position: relative;
-  padding: 24px max(24px, calc((100% - 800px) / 2));
-}
-/* Odstęp między bąbelkami musi być REALNYM CSS, bo wirtualizator mierzy
-   offsetHeight itemu i koryguje nim wysokość slotu. Margin NIE wchodzi do
-   offsetHeight (sloty by się skurczyły o gap po pomiarze i wiadomości by się
-   skleiły), więc używamy padding-bottom. box-sizing:border-box wlicza padding
-   w wymiar — spójnie z min-height ustawianym przez render(). Scoped do
-   .chat-body, by nie ruszyć .transcript-list (meeting.js ma własne paddingi). */
-.chat-body .vlist-item {
-  padding-bottom: 20px;
-  box-sizing: border-box;
-}
 
 .msg-row {
   display: grid;
@@ -3091,13 +2950,6 @@ input, textarea, select {
 .msg-row.user .bubble-meta { justify-content: flex-end; }
 .bubble-meta .who { font-weight: 600; color: var(--text-2); }
 
-.bubble-perf {
-  font-size: 10px;
-  color: var(--text-3);
-  font-family: var(--font-mono, ui-monospace, monospace);
-  letter-spacing: 0.2px;
-}
-
 .bubble {
   padding: 12px 16px;
   border-radius: 14px;
@@ -3116,19 +2968,19 @@ input, textarea, select {
   background: var(--bg-card);
   border-bottom-left-radius: 4px;
 }
-.bubble p + p { margin-top: 10px; }
+:is(.bubble, .chat-msg__txt) p + p { margin-top: 10px; }
 /* Headings and lists come from the shared markdown renderer; without these the
    browser defaults would blow a bubble open with 2em type and 40px margins. */
-.bubble h1, .bubble h2, .bubble h3, .bubble h4, .bubble h5, .bubble h6 {
+:is(.bubble, .chat-msg__txt) h1, :is(.bubble, .chat-msg__txt) h2, :is(.bubble, .chat-msg__txt) h3, :is(.bubble, .chat-msg__txt) h4, :is(.bubble, .chat-msg__txt) h5, :is(.bubble, .chat-msg__txt) h6 {
   margin: 12px 0 6px; font-weight: 700; line-height: 1.35;
 }
-.bubble h1 { font-size: 17px; }
-.bubble h2 { font-size: 15.5px; }
-.bubble h3, .bubble h4, .bubble h5, .bubble h6 { font-size: 14px; }
-.bubble > :first-child { margin-top: 0; }
-.bubble ul, .bubble ol { margin: 6px 0 10px; padding-left: 22px; }
-.bubble li { margin: 2px 0; }
-.bubble code.inline {
+:is(.bubble, .chat-msg__txt) h1 { font-size: 17px; }
+:is(.bubble, .chat-msg__txt) h2 { font-size: 15.5px; }
+:is(.bubble, .chat-msg__txt) h3, :is(.bubble, .chat-msg__txt) h4, :is(.bubble, .chat-msg__txt) h5, :is(.bubble, .chat-msg__txt) h6 { font-size: 14px; }
+:is(.bubble, .chat-msg__txt) > :first-child { margin-top: 0; }
+:is(.bubble, .chat-msg__txt) ul, :is(.bubble, .chat-msg__txt) ol { margin: 6px 0 10px; padding-left: 22px; }
+:is(.bubble, .chat-msg__txt) li { margin: 2px 0; }
+:is(.bubble, .chat-msg__txt) code.inline {
   background: var(--code-bg, #07091a);
   border: 1px solid var(--code-border, var(--border));
   border-radius: 4px;
@@ -3139,36 +2991,36 @@ input, textarea, select {
 }
 
 /* ============ Thinking block (markdown <think>...</think>) ============ */
-.bubble .thinking {
+:is(.bubble, .chat-msg__txt) .thinking {
   border: 1px dashed rgba(167, 139, 250, 0.35);
   border-radius: 10px;
   background: rgba(167, 139, 250, 0.04);
   margin-bottom: 8px;
   overflow: hidden;
 }
-.bubble .thinking[open] { padding-bottom: 0; }
-.bubble .thinking-head {
+:is(.bubble, .chat-msg__txt) .thinking[open] { padding-bottom: 0; }
+:is(.bubble, .chat-msg__txt) .thinking-head {
   display: flex; align-items: center; gap: 10px;
   padding: 8px 12px;
   cursor: pointer;
   user-select: none;
   list-style: none;
 }
-.bubble .thinking-head::-webkit-details-marker { display: none; }
-.bubble .thinking-head .icon-think {
+:is(.bubble, .chat-msg__txt) .thinking-head::-webkit-details-marker { display: none; }
+:is(.bubble, .chat-msg__txt) .thinking-head .icon-think {
   width: 16px; height: 16px; color: var(--accent-2);
 }
-.bubble .thinking-head .label {
+:is(.bubble, .chat-msg__txt) .thinking-head .label {
   font-size: 12px; font-weight: 600; color: var(--accent-2);
   letter-spacing: 0.04em; text-transform: uppercase;
 }
-.bubble .thinking-head .meta { font-size: 11px; color: var(--text-3); }
-.bubble .thinking-head .chev {
+:is(.bubble, .chat-msg__txt) .thinking-head .meta { font-size: 11px; color: var(--text-3); }
+:is(.bubble, .chat-msg__txt) .thinking-head .chev {
   margin-left: auto; color: var(--text-3);
   transition: transform 0.15s;
 }
-.bubble .thinking[open] .thinking-head .chev { transform: rotate(180deg); }
-.bubble .thinking-body {
+:is(.bubble, .chat-msg__txt) .thinking[open] .thinking-head .chev { transform: rotate(180deg); }
+:is(.bubble, .chat-msg__txt) .thinking-body {
   padding: 10px 12px 12px 38px;
   font-size: 12.5px; line-height: 1.6;
   color: var(--text-2);
@@ -3177,42 +3029,38 @@ input, textarea, select {
 }
 
 /* ============ Code block (markdown ```fence```) ============ */
-.bubble .code-block {
+:is(.bubble, .chat-msg__txt) .code-block {
   margin: 12px 0;
   border-radius: 10px;
   overflow: hidden;
   background: var(--code-bg, #07091a);
   border: 1px solid var(--code-border, var(--border));
 }
-.bubble .code-head {
+:is(.bubble, .chat-msg__txt) .code-head {
   display: flex; align-items: center; gap: 10px;
   padding: 6px 12px;
   background: rgba(255, 255, 255, 0.02);
   border-bottom: 1px solid var(--code-border, var(--border));
 }
-.bubble .code-head .lang {
+:is(.bubble, .chat-msg__txt) .code-head .lang {
   font-family: 'JetBrains Mono', ui-monospace, monospace;
   font-size: 11px; font-weight: 700; letter-spacing: 0.04em;
   color: var(--accent-2);
   text-transform: uppercase;
 }
-.bubble .code-head .filename { font-size: 11px; color: var(--text-3); }
-.bubble .code-head .actions { margin-left: auto; display: flex; gap: 4px; }
-.bubble .code-head .icon-btn {
-  display: inline-flex; align-items: center; gap: 5px;
-  padding: 3px 8px; border-radius: 5px;
-  background: transparent;
-  border: 1px solid transparent;
-  color: var(--text-3);
-  font-family: inherit; font-size: 11px;
-  cursor: pointer;
+:is(.bubble, .chat-msg__txt) .code-head .filename { font-size: 11px; color: var(--text-3); }
+:is(.bubble, .chat-msg__txt) .code-head .actions { margin-left: auto; display: flex; gap: 4px; }
+:is(.bubble, .chat-msg__txt) .code-head .copy-btn .tf-btn {
+  padding: 3px 8px; min-height: 0; height: auto; border-radius: 5px;
+  background: transparent; border: 1px solid transparent;
+  color: var(--text-3); font-size: 11px;
 }
-.bubble .code-head .icon-btn:hover {
+:is(.bubble, .chat-msg__txt) .code-head .copy-btn .tf-btn:hover {
   color: var(--text);
   background: rgba(255, 255, 255, 0.05);
 }
-.bubble .code-head .icon-btn .icon { width: 12px; height: 12px; }
-.bubble .code-block pre {
+:is(.bubble, .chat-msg__txt) .code-head .copy-btn .tf-btn svg { width: 12px; height: 12px; }
+:is(.bubble, .chat-msg__txt) .code-block pre {
   margin: 0;
   padding: 14px 16px;
   overflow-x: auto;
@@ -3222,7 +3070,7 @@ input, textarea, select {
   color: #d8dcf0;
   white-space: pre;
 }
-.bubble .code-block code { font-family: inherit; }
+:is(.bubble, .chat-msg__txt) .code-block code { font-family: inherit; }
 
 /* ============ Streaming caret ============ */
 .streaming-caret {
@@ -3258,27 +3106,6 @@ input, textarea, select {
   color: var(--text);
 }
 .msg-actions .icon { width: 14px; height: 14px; }
-
-/* ============ "New messages" pill ============ */
-.chat-new-pill {
-  position: absolute;
-  left: 50%;
-  bottom: 16px;
-  transform: translateX(-50%);
-  padding: 6px 14px;
-  background: var(--bg-card);
-  border: 1px solid var(--border-strong, var(--border));
-  border-radius: 999px;
-  font-size: 12px; color: var(--text);
-  cursor: pointer;
-  box-shadow: var(--shadow);
-  display: none;
-  z-index: 5;
-  user-select: none;
-  align-items: center; gap: 6px;
-}
-.chat-new-pill.visible { display: inline-flex; }
-.chat-new-pill .icon { width: 12px; height: 12px; }
 
 /* ============ Composer ============ */
 .composer-wrap {
@@ -3369,36 +3196,7 @@ tf-chat-composer[compact] .composer textarea:focus {
 .composer-hints .counter { color: var(--text-3); }
 .composer-hints .counter.warn { color: var(--warning); }
 
-/* ============ Mobile drawer ============ */
-.chat-scrim {
-  display: none;
-  position: absolute;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.5);
-  z-index: 4;
-}
-
 @media (max-width: 720px) {
-  .chat-shell { grid-template-columns: 1fr; }
-  .chat-sidebar {
-    position: absolute;
-    top: 0; left: 0; bottom: 0;
-    width: 84%;
-    max-width: 320px;
-    z-index: 5;
-    transform: translateX(-100%);
-    transition: transform 0.2s ease-out;
-    box-shadow: 24px 0 48px rgba(0, 0, 0, 0.6);
-  }
-  .chat-shell.drawer-open .chat-sidebar { transform: translateX(0); }
-  .chat-shell.drawer-open .chat-scrim { display: block; }
-
-  .chat-head { padding: 10px 12px; }
-  .chat-head .head-burger { display: inline-flex; }
-  .chat-head .head-title { display: none; }
-  .chat-head .head-actions tf-button:nth-child(1) { display: none; }
-
-  .chat-body { padding: 16px 14px; }
   .composer-wrap { padding: 10px 12px calc(14px + env(safe-area-inset-bottom)); }
   .composer { border-radius: 14px; padding-left: 8px; }
   .composer-hints .kbd:nth-child(2) { display: none; }
@@ -5463,13 +5261,25 @@ tf-screen {
 .nd-detail-header .big-ico .live-dot {
   position: absolute; bottom: 2px; right: 2px; width: 12px; height: 12px;
   border-radius: 50%; background: var(--success); border: 2px solid var(--bg-2);
-  animation: nd-pulse 2s infinite;
 }
 .nd-detail-header .big-ico .live-dot.off { background: var(--text-3); animation: none; }
+/* The expanding ring is a scaled pseudo-element (compositor): animating a
+   box-shadow spread repaints on the main thread every frame. */
+.nd-detail-header .big-ico .live-dot::after,
+.nd-stat-pill.dot.live::after {
+  content: '';
+  position: absolute;
+  border-radius: 50%;
+  background: rgba(34, 197, 94, 0.55);
+  opacity: 0;
+  animation: nd-pulse 2s infinite;
+}
+.nd-detail-header .big-ico .live-dot::after { inset: 0; --nd-pulse-grow: 3.25; }
+.nd-detail-header .big-ico .live-dot.off::after { animation: none; }
 @keyframes nd-pulse {
-  0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.55); }
-  70% { box-shadow: 0 0 0 7px rgba(34, 197, 94, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+  0% { transform: scale(1); opacity: 1; }
+  70% { transform: scale(var(--nd-pulse-grow)); opacity: 0; }
+  100% { transform: scale(1); opacity: 0; }
 }
 .nd-detail-header .d-meta { flex: 1; min-width: 0; }
 .nd-detail-header .d-name { font-size: 20px; font-weight: 800; color: var(--text); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -5674,7 +5484,8 @@ tf-screen {
 .nd-stat-pill.danger { background: rgba(239, 68, 68, 0.14); color: var(--danger); }
 .nd-stat-pill.info { background: rgba(96, 165, 250, 0.14); color: var(--info); }
 .nd-stat-pill.dot::before { content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; margin-right: 5px; vertical-align: middle; }
-.nd-stat-pill.live::before { animation: nd-pulse 2s infinite; }
+.nd-stat-pill.dot.live { position: relative; }
+.nd-stat-pill.dot.live::after { left: 8px; top: calc(50% - 3px); width: 6px; height: 6px; --nd-pulse-grow: 3.33; }
 
 .nd-bw { display: flex; flex-direction: column; gap: 2px; font-family: 'JetBrains Mono', 'SF Mono', monospace; font-size: 11px; }
 .nd-bw .down { color: var(--info); }

@@ -95,20 +95,20 @@ const anna = { kind: 'user', id: 'u-anna' };
 const view = (at) => ({
   at,
   timezone: 'Europe/Warsaw',
-  units: [{ unit_id: 'unit-it', name: 'Dział IT', code: 'IT', type_id: 'ty-1', head_position_id: 'pos-1', deputy_head_position_ids: [] }],
+  units: [{ unitId: 'unit-it', name: 'Dział IT', code: 'IT', typeId: 'ty-1', headPositionId: 'pos-1', deputyHeadPositionIds: [] }],
   positions: [
-    { position_id: 'pos-1', unit_id: 'unit-it', name: 'Kierownik IT', primary_parent_position_id: null, is_staff: false, valid_from: '2026-01-01' },
-    { position_id: 'pos-2', unit_id: 'unit-it', name: 'Tester', primary_parent_position_id: 'pos-1', is_staff: false, valid_from: '2026-01-01' },
+    { positionId: 'pos-1', unitId: 'unit-it', name: 'Kierownik IT', primaryParentPositionId: null, isStaff: false, validFrom: '2026-01-01' },
+    { positionId: 'pos-2', unitId: 'unit-it', name: 'Tester', primaryParentPositionId: 'pos-1', isStaff: false, validFrom: '2026-01-01' },
   ],
-  assignments: [{ position_id: 'pos-1', subject: anna, display_name: 'Anna Nowak', share: 1 }],
+  assignments: [{ positionId: 'pos-1', subject: anna, displayName: 'Anna Nowak', share: 1 }],
   vacancies: ['pos-2'],
-  warnings: [{ kind: 'unit_without_head', unit_id: 'unit-it', from: at }],
+  warnings: [{ kind: 'unit_without_head', unitId: 'unit-it', from: at }],
 });
 
 const answer = (at) => ({
   view: view(at),
-  unit_types: [{ id: 'ty-1', name: 'Dział' }],
-  my_permissions: ['org.admin'],
+  unitTypes: [{ id: 'ty-1', name: 'Dział' }],
+  myPermissions: ['org.admin'],
 });
 
 async function mountScreen(over = {}, params = {}) {
@@ -175,7 +175,7 @@ test('the list tab shows a row per holder and per vacancy, with the manager abov
 });
 
 test('an empty structure still opens the list with the import, so a structure can begin from a file', async () => {
-  const empty = { view: { at: '2026-09-30', timezone: 'Europe/Warsaw', units: [], positions: [], assignments: [], vacancies: [], warnings: [] }, unit_types: [], my_permissions: ['org.admin'] };
+  const empty = { view: { at: '2026-09-30', timezone: 'Europe/Warsaw', units: [], positions: [], assignments: [], vacancies: [], warnings: [] }, unitTypes: [], myPermissions: ['org.admin'] };
   await mountScreen({ orgStructureRequest: empty }, { tab: 'list' });
   assert.ok(document.querySelector('.org-list-table'), 'the table is drawn, not an empty-state card');
   assert.equal(document.querySelector('#org-panel-list tf-empty-state'), null);
@@ -188,12 +188,12 @@ test('after an import the header and the list show the new structure', async () 
   const bigger = () => {
     const a = answer('2026-09-30');
     if (applied) {
-      a.view.positions.push({ position_id: 'pos-3', unit_id: 'unit-it', name: 'Analityk', primary_parent_position_id: 'pos-1', is_staff: false, valid_from: '2026-09-30' });
+      a.view.positions.push({ positionId: 'pos-3', unitId: 'unit-it', name: 'Analityk', primaryParentPositionId: 'pos-1', isStaff: false, validFrom: '2026-09-30' });
       a.view.vacancies.push('pos-3');
     }
     return a;
   };
-  const report = { mode: 'upsert', as_of: '2026-09-30', preview_at: '2026-09-30', applied: false, counts: { rows: 3, added: 1, errors: 0 }, errors: [], rows: [] };
+  const report = { mode: 'upsert', asOf: '2026-09-30', previewAt: '2026-09-30', applied: false, counts: { rows: 3, added: 1, errors: 0 }, errors: [], rows: [] };
   await mountScreen({
     orgStructureRequest: bigger,
     orgImportDryRunRequest: { report },
@@ -241,9 +241,9 @@ test('the role catalog tab navigates to its own screen and other tabs switch in 
 test('a day picked in the history tab is what the server is asked for, with the differences from today', async () => {
   await mountScreen({
     authMeRequest: { userId: 'u-anna' },
-    orgHistoryListRequest: { entries: [], total: 0, personal_visible: true, today: '2026-09-30' },
+    orgHistoryListRequest: { entries: [], total: 0, personalVisible: true, today: '2026-09-30' },
     orgChangeSetListRequest: { items: [], today: '2026-09-30' },
-    orgHistoryDiffRequest: { items: [], personal_visible: true },
+    orgHistoryDiffRequest: { items: [], personalVisible: true },
   }, { tab: 'history' });
 
   const input = document.querySelector('#org-panel-history [data-role="day"]');
@@ -268,7 +268,7 @@ test('a day picked in the history tab is what the server is asked for, with the 
 
 test('an empty structure says so, and a structure that never arrives is not drawn as zeros', async () => {
   await mountScreen({
-    orgStructureRequest: { view: { at: '2026-09-30', timezone: 'Europe/Warsaw', units: [], positions: [], assignments: [], vacancies: [], warnings: [] }, unit_types: [], my_permissions: [] },
+    orgStructureRequest: { view: { at: '2026-09-30', timezone: 'Europe/Warsaw', units: [], positions: [], assignments: [], vacancies: [], warnings: [] }, unitTypes: [], myPermissions: [] },
   });
   assert.equal(document.querySelector('#org-panel-tree tf-empty-state').getAttribute('title'), t('empty_title'));
   assert.equal(document.querySelector('#org-panel-tree tf-stat-card'), null);
@@ -287,20 +287,20 @@ const ME = { kind: 'user', id: '11223344-5566-7788-99aa-bbccddeeff00' };
 
 const chartAnswer = () => {
   const position = (id, name, parent, unit = 'unit-it', extra = {}) => ({
-    position_id: id, unit_id: unit, name, primary_parent_position_id: parent, is_staff: false, valid_from: '2026-01-01',
-    functional_parent_position_ids: [], ...extra,
+    positionId: id, unitId: unit, name, primaryParentPositionId: parent, isStaff: false, validFrom: '2026-01-01',
+    functionalParentPositionIds: [], ...extra,
   });
-  const holder = (positionId, subject, name) => ({ position_id: positionId, subject, display_name: name, share: 1, assignment_type: 'permanent', is_primary: true });
+  const holder = (positionId, subject, name) => ({ positionId: positionId, subject, displayName: name, share: 1, assignmentType: 'permanent', isPrimary: true });
   return {
     view: {
       at: '2026-09-30',
       timezone: 'Europe/Warsaw',
-      units: [{ unit_id: 'unit-it', name: 'Dział IT', code: 'IT', type_id: null, head_position_id: 'pos-cto', deputy_head_position_ids: [] }],
+      units: [{ unitId: 'unit-it', name: 'Dział IT', code: 'IT', typeId: null, headPositionId: 'pos-cto', deputyHeadPositionIds: [] }],
       positions: [
         position('pos-cto', 'Dyrektor IT', null),
         position('pos-dev-a', 'Developer', 'pos-cto'),
         position('pos-dev-b', 'Developer', 'pos-cto'),
-        position('pos-qa', 'Tester', 'pos-dev-a', 'unit-it', { functional_parent_position_ids: ['pos-dev-b'] }),
+        position('pos-qa', 'Tester', 'pos-dev-a', 'unit-it', { functionalParentPositionIds: ['pos-dev-b'] }),
       ],
       assignments: [
         holder('pos-cto', { kind: 'external', id: 'x-1' }, 'Zofia Żak'),
@@ -310,8 +310,8 @@ const chartAnswer = () => {
       vacancies: ['pos-qa'],
       warnings: [],
     },
-    unit_types: [],
-    my_permissions: [],
+    unitTypes: [],
+    myPermissions: [],
   };
 };
 
@@ -523,8 +523,8 @@ test('a structure that changed while another tab was shown is drawn when the tab
   tabs.dispatchEvent(new window.CustomEvent('change', { bubbles: true, detail: { value: 'list' } }));
   answer = chartAnswer();
   answer.view.positions.push({
-    position_id: 'pos-new', unit_id: 'unit-it', name: 'Analityk', primary_parent_position_id: 'pos-cto', is_staff: false,
-    valid_from: '2026-09-30', functional_parent_position_ids: [],
+    positionId: 'pos-new', unitId: 'unit-it', name: 'Analityk', primaryParentPositionId: 'pos-cto', isStaff: false,
+    validFrom: '2026-09-30', functionalParentPositionIds: [],
   });
   tabs.dispatchEvent(new window.CustomEvent('change', { bubbles: true, detail: { value: 'tree' } }));
   for (let i = 0; i < 4; i += 1) await flush();
@@ -561,11 +561,11 @@ test('"Edytuj strukturę" needs a registered edit mode and org.admin, and opens 
       return { dispose() {}, renderInspector() {}, actionsHtml: () => '<tf-button data-act="edit-exit">x</tf-button>', act() {}, canLeave: async () => true };
     },
   });
-  await mountScreen(chartFixtures({ orgStructureRequest: { ...chartAnswer(), my_permissions: [] } }));
+  await mountScreen(chartFixtures({ orgStructureRequest: { ...chartAnswer(), myPermissions: [] } }));
   assert.equal(document.querySelector('[data-act="edit"]'), null, 'a reader never sees it');
   OrgStructureScreen.unmount();
 
-  await mountScreen(chartFixtures({ orgStructureRequest: { ...chartAnswer(), my_permissions: ['org.admin'] } }));
+  await mountScreen(chartFixtures({ orgStructureRequest: { ...chartAnswer(), myPermissions: ['org.admin'] } }));
   const edit = document.querySelector('#org-header-actions [data-act="edit"]');
   assert.ok(edit);
   assert.equal(edit.hasAttribute('disabled'), false);
@@ -638,8 +638,8 @@ test('the horizontal layout is an entry of the view menu', async () => {
 const hv = (key, params) => I18n.t(`org_structure.handover.${key}`, params);
 
 const pendingPeople = [
-  { user_id: 'u-pz', display_name: 'Piotr Zieliński', count: 4, ended_on: '2026-09-25' },
-  { user_id: 'u-ew', display_name: 'Ewa Wiśniewska', count: 1, ended_on: '2026-09-20' },
+  { userId: 'u-pz', displayName: 'Piotr Zieliński', count: 4, endedOn: '2026-09-25' },
+  { userId: 'u-ew', displayName: 'Ewa Wiśniewska', count: 1, endedOn: '2026-09-20' },
 ];
 
 test('an administrator sees the counter of people who still hold work and it opens the handover screen', async () => {
@@ -658,7 +658,7 @@ test('with several people the counter offers each of them with how much they sti
   // The chart owns a tf-menu of its own (export); the counter's menu is the one opened last.
   const menu = [...document.querySelectorAll('tf-menu')].pop();
   const labels = [...menu.querySelectorAll('tf-menu-item')].map((i) => i.getAttribute('label'));
-  assert.deepEqual(labels, pendingPeople.map((p) => hv('pending_item', { name: p.display_name, count: p.count })));
+  assert.deepEqual(labels, pendingPeople.map((p) => hv('pending_item', { name: p.displayName, count: p.count })));
   OrgStructureScreen.unmount();
 });
 
@@ -666,14 +666,14 @@ test('nobody pending, no counter; a member never asks the server for the list', 
   await mountScreen({ orgHandoverPendingRequest: { people: [] } });
   assert.equal(document.querySelector('[data-act="handover-pending"]'), null);
   OrgStructureScreen.unmount();
-  await mountScreen({ orgStructureRequest: () => ({ ...answer('2026-09-30'), my_permissions: [] }) });
+  await mountScreen({ orgStructureRequest: () => ({ ...answer('2026-09-30'), myPermissions: [] }) });
   assert.equal(calls.filter((c) => c.kind === 'orgHandoverPendingRequest').length, 0);
   OrgStructureScreen.unmount();
 });
 
 test('route parameters open the handover screen in place of the list', async () => {
   const listing = {
-    user: { user_id: 'u-pz', display_name: 'Piotr Zieliński' }, reason: 'departure', date: '2026-09-30', assignment_ended_on: null,
+    user: { userId: 'u-pz', displayName: 'Piotr Zieliński' }, reason: 'departure', date: '2026-09-30', assignmentEndedOn: null,
     groups: [], takers: [],
   };
   await mountScreen(

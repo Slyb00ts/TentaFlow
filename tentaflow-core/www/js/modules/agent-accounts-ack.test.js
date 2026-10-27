@@ -74,7 +74,7 @@ const toastCount = () => document.querySelectorAll('.toast-container .toast').le
 test('a partial purge renders its key as a failure, never the caller’s sentence', () => {
   const before = toastCount();
   reportWriteOutcome(
-    { ok: false, message_key: 'agent_accounts.purge_incomplete' },
+    { ok: false, messageKey: 'agent_accounts.purge_incomplete' },
     'CALLER-SENTENCE-DISCONNECTED',
   );
   const [toast] = toastsAddedSince(before);
@@ -92,7 +92,7 @@ test('a no-op write renders its key too, not the caller’s success sentence', (
     ['agent_accounts.credential_absent', 'CALLER-SENTENCE-KEY-CLEARED'],
   ]) {
     const before = toastCount();
-    reportWriteOutcome({ ok: true, message_key: key }, sentence);
+    reportWriteOutcome({ ok: true, messageKey: key }, sentence);
     const [toast] = toastsAddedSince(before);
     assert.ok(toast, `${key} raised no toast at all`);
     assert.equal(toast.textContent, DICT[key.replace('agent_accounts.', '')], `${key}: the key was not rendered`);

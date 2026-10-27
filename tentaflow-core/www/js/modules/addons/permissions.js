@@ -40,11 +40,11 @@ export const PermissionsTab = {
     try {
       const client = await ApiBinary.client();
       unsubscribePush = client.addUnsolicitedListener(({ body }) => {
-        if (body?.variant !== 'AddonPermissionChangedEvent') return;
-        if ((body.addonId || body.addon_id) !== currentAddonId) return;
-        const st = body.subjectType ?? body.subject_type ?? '';
-        const sid = body.subjectId ?? body.subject_id ?? '';
-        const pid = body.permissionId ?? body.permission_id ?? '';
+        if (body?._variant !== 'AddonPermissionChangedEventBody') return;
+        if (body.addonId !== currentAddonId) return;
+        const st = body.subjectType ?? '';
+        const sid = body.subjectId ?? '';
+        const pid = body.permissionId ?? '';
         const key = `${st}:${sid}:${pid}`;
         // Skip the echo of our own mutation — we already patched the cell optimistically.
         if (echoGuard.isOwnEcho(key)) return;
@@ -81,28 +81,28 @@ async function loadAll() {
     ]);
 
     permissions = (catalog.entries || []).map((p) => ({
-      permissionId: p.permissionId ?? p.permission_id,
-      displayName: p.displayName ?? p.display_name,
+      permissionId: p.permissionId,
+      displayName: p.displayName,
       description: p.description,
       risk: p.risk || 'low',
-      sortOrder: p.sortOrder ?? p.sort_order ?? 0,
+      sortOrder: p.sortOrder ?? 0,
     })).sort((a, b) => a.sortOrder - b.sortOrder);
 
     groups = (visibility.rows || []).map((r) => ({
-      groupId: String(r.groupId ?? r.group_id),
-      groupName: r.groupName ?? r.group_name ?? `#${r.groupId ?? r.group_id}`,
+      groupId: String(r.groupId),
+      groupName: r.groupName ?? `#${r.groupId}`,
       visible: Boolean(r.visible),
-      userCount: Number(r.userCount ?? r.user_count ?? 0),
+      userCount: Number(r.userCount ?? 0),
     }));
 
     groupCells = new Map();
     userCells = new Map();
     overriddenUserIds = new Set();
     for (const r of (matrix.rows || [])) {
-      const st = r.subjectType ?? r.subject_type;
-      const sid = String(r.subjectId ?? r.subject_id);
-      const pid = r.permissionId ?? r.permission_id;
-      const gm = r.grantMode ?? r.grant_mode;
+      const st = r.subjectType;
+      const sid = String(r.subjectId);
+      const pid = r.permissionId;
+      const gm = r.grantMode;
       if (st === 'group') {
         groupCells.set(`${sid}::${pid}`, gm);
       } else if (st === 'user') {
@@ -113,12 +113,12 @@ async function loadAll() {
 
     defaults = new Map();
     for (const d of (matrix.defaults || [])) {
-      const pid = d.permissionId ?? d.permission_id;
-      defaults.set(pid, d.grantMode ?? d.grant_mode);
+      const pid = d.permissionId;
+      defaults.set(pid, d.grantMode);
     }
 
-    lastChangeBy = matrix.lastChangeBy ?? matrix.last_change_by ?? '';
-    lastChangeAtEpoch = Number(matrix.lastChangeAtEpoch ?? matrix.last_change_at_epoch ?? 0);
+    lastChangeBy = matrix.lastChangeBy ?? '';
+    lastChangeAtEpoch = Number(matrix.lastChangeAtEpoch ?? 0);
 
     renderShell();
   } catch (err) {
@@ -137,19 +137,19 @@ async function refreshMatrixFromRemote() {
       ApiBinary.one('addonPermissionMatrixRequest', { addonId: currentAddonId }),
     ]);
     groups = (visibility.rows || []).map((r) => ({
-      groupId: String(r.groupId ?? r.group_id),
-      groupName: r.groupName ?? r.group_name ?? `#${r.groupId ?? r.group_id}`,
+      groupId: String(r.groupId),
+      groupName: r.groupName ?? `#${r.groupId}`,
       visible: Boolean(r.visible),
-      userCount: Number(r.userCount ?? r.user_count ?? 0),
+      userCount: Number(r.userCount ?? 0),
     }));
     groupCells = new Map();
     userCells = new Map();
     overriddenUserIds = new Set();
     for (const r of (matrix.rows || [])) {
-      const st = r.subjectType ?? r.subject_type;
-      const sid = String(r.subjectId ?? r.subject_id);
-      const pid = r.permissionId ?? r.permission_id;
-      const gm = r.grantMode ?? r.grant_mode;
+      const st = r.subjectType;
+      const sid = String(r.subjectId);
+      const pid = r.permissionId;
+      const gm = r.grantMode;
       if (st === 'group') {
         groupCells.set(`${sid}::${pid}`, gm);
       } else if (st === 'user') {
@@ -159,11 +159,11 @@ async function refreshMatrixFromRemote() {
     }
     defaults = new Map();
     for (const d of (matrix.defaults || [])) {
-      const pid = d.permissionId ?? d.permission_id;
-      defaults.set(pid, d.grantMode ?? d.grant_mode);
+      const pid = d.permissionId;
+      defaults.set(pid, d.grantMode);
     }
-    lastChangeBy = matrix.lastChangeBy ?? matrix.last_change_by ?? '';
-    lastChangeAtEpoch = Number(matrix.lastChangeAtEpoch ?? matrix.last_change_at_epoch ?? 0);
+    lastChangeBy = matrix.lastChangeBy ?? '';
+    lastChangeAtEpoch = Number(matrix.lastChangeAtEpoch ?? 0);
     const body = currentContainer.querySelector('#perm-subtab-body');
     if (body) await switchSubtab(activeSubtab);
   } catch (_) { /* ignore */ }
@@ -174,8 +174,8 @@ async function ensureUsersCatalog() {
   try {
     const rows = await ApiBinary.list('usersListRequest', { arrayKey: 'users' });
     usersCatalog = rows.map((u) => ({
-      userId: String(u.userId ?? u.user_id ?? u.id),
-      username: u.username ?? u.name ?? `#${u.userId ?? u.user_id ?? u.id}`,
+      userId: String(u.id),
+      username: u.username,
     }));
   } catch (_) {
     usersCatalog = [];

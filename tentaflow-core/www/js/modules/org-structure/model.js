@@ -24,11 +24,11 @@ export function summarize(view) {
 
 /** A warning as one sentence, named by the unit or person it is about. */
 export function warningText(warning, view, t) {
-  const names = new Map((view.assignments ?? []).map((a) => [subjectKey(a.subject), a.display_name]));
+  const names = new Map((view.assignments ?? []).map((a) => [subjectKey(a.subject), a.displayName]));
   const person = () => names.get(subjectKey(warning.subject)) || t('unknown_person');
   switch (warning.kind) {
     case 'unit_without_head': {
-      const unit = (view.units ?? []).find((u) => u.unit_id === warning.unit_id);
+      const unit = (view.units ?? []).find((u) => u.unitId === warning.unitId);
       return t('warning_unit_without_head', { unit: unit?.name ?? t('unknown_unit') });
     }
     case 'share_overbooked':

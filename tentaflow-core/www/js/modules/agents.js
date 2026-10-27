@@ -13,7 +13,7 @@
 // tf-* components only.
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { byId, escapeHtml, escapeAttr, toast, fmtCompact } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast, fmtCompact, uuidFromBytes } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
 import { TfWindow } from '/js/components/tf-window.js';
@@ -301,7 +301,7 @@ const AgentsScreen = {
     // admin-only actions stay hidden for non-admins instead of failing on save.
     const me = await ApiBinary.one('authMeRequest').catch(() => null);
     state.isAdmin = (me?.role ?? 'user').toLowerCase() === 'admin';
-    state.myUserId = me?.id ?? me?.user_id ?? null;
+    state.myUserId = me?.userId ? uuidFromBytes(me.userId) : null;
     loadUserNames();
     if (!state.isAdmin) {
       byId('agents-new')?.setAttribute('hidden', '');
@@ -383,7 +383,7 @@ async function loadAgents() {
     // The list arrives as a JSON string inside AgentsListResponse, not a
     // native array — ApiBinary.list() would find no array key and yield [].
     const resp = await ApiBinary.one('agentsListRequest', {});
-    const rows = JSON.parse(resp.agentsJson ?? resp.agents_json ?? '[]');
+    const rows = JSON.parse(resp.agentsJson ?? '[]');
     state.agents = Array.isArray(rows) ? rows : [];
   } catch (err) {
     toast(`${t('load_failed')}: ${err.message}`, 'error');
@@ -641,7 +641,7 @@ function wireGridEvents() {
 
 async function fetchAgentDetail(agentId) {
   const resp = await ApiBinary.one('agentsDetailRequest', { agentId });
-  return JSON.parse(resp.agentJson ?? resp.agent_json ?? 'null');
+  return JSON.parse(resp.agentJson ?? 'null');
 }
 
 // A full upsert payload from a detail row — enable/disable and duplicate flows
@@ -946,7 +946,7 @@ function runtimeBadges(d) {
   const title = runtime.model ? `${application} · ${runtime.model}` : application;
   const global = runtime.account?.mode === 'global';
   const account = global
-    ? (d.globalAccounts.find((a) => (a.account_id ?? a.accountId) === runtime.account.account_id)?.display_name
+    ? (d.globalAccounts.find((a) => a.accountId === runtime.account.account_id)?.displayName
       || t('cli_account_global'))
     : t('cli_account_user');
   return [
@@ -1224,7 +1224,7 @@ async function loadModelOptions() {
   const aliases = Array.isArray(aliasesRaw) ? aliasesRaw : [];
   const modelByName = new Map();
   for (const m of models) {
-    const name = m.model_name || m.modelName;
+    const name = m.modelName;
     if (name) modelByName.set(name, m);
   }
   // A CLI application publishes its models as `<engine_id>/<model>` rows of the
@@ -1233,27 +1233,27 @@ async function loadModelOptions() {
   // stripped here rather than saved and stripped at every consumer.
   const cli = new Map();
   for (const m of models) {
-    const engine = m.engine_id || m.engineId;
-    const name = m.model_name || m.modelName || '';
+    const engine = m.engineId;
+    const name = m.modelName || '';
     const prefix = `${engine}/`;
     if (!engine || !name.startsWith(prefix)) continue;
     const value = name.slice(prefix.length);
-    const label = m.display_name || m.displayName || value;
+    const label = m.displayName || value;
     if (!cli.has(engine)) cli.set(engine, []);
     cli.get(engine).push({ value, label });
   }
   const opts = models
     .filter((m) => (m.category || '').toLowerCase() === 'llm')
     .map((m) => {
-      const value = m.model_name || m.modelName || '';
-      const display = m.display_name || m.displayName || value;
-      const engine = m.engine_id || m.engineId;
+      const value = m.modelName || '';
+      const display = m.displayName || value;
+      const engine = m.engineId;
       return { value, label: engine ? `${display} (${engine})` : display };
     })
     .filter((o) => o.value);
   for (const a of aliases) {
-    if (a.is_active === false || a.isActive === false) continue;
-    const target = a.target_model || a.targetModel;
+    if (a.isActive === false) continue;
+    const target = a.targetModel;
     const targetModel = target ? modelByName.get(target) : null;
     if (!targetModel) continue;
     if ((targetModel.category || '').toLowerCase() !== 'llm') continue;
@@ -1349,12 +1349,12 @@ function cliModelOptions(d) {
 
 function cliAccountOptions(d) {
   const c = d.cfg;
-  const forEngine = d.globalAccounts.filter((a) => (a.engine_id ?? a.engineId) === c.cli_engine);
+  const forEngine = d.globalAccounts.filter((a) => a.engineId === c.cli_engine);
   if (!forEngine.length) return [{ value: '', label: t('cli_account_none') }];
   return [{ value: '', label: t('cli_account_pick') }, ...forEngine.map((a) => {
-    const id = a.account_id ?? a.accountId;
-    const subject = a.provider_subject ?? a.providerSubject;
-    return { value: id, label: subject ? `${a.display_name} (${subject})` : String(a.display_name ?? id) };
+    const id = a.accountId;
+    const subject = a.providerSubject;
+    return { value: id, label: subject ? `${a.displayName} (${subject})` : String(a.displayName ?? id) };
   })];
 }
 
@@ -1376,7 +1376,7 @@ function renderCliRuntimeFields(d) {
         <tf-select data-cfg="cli_engine" label="${escapeAttr(t('label_cli_engine'))}">
           <option value="">${escapeHtml(t('cli_engine_pick'))}</option>
           ${engines.map((engine) => {
-            const id = engine.engine_id ?? engine.engineId;
+            const id = engine.engineId;
             return `<option value="${escapeAttr(id)}"${id === c.cli_engine ? ' selected' : ''}>${escapeHtml(engineName(id, engines))}</option>`;
           }).join('')}
         </tf-select>
@@ -1667,7 +1667,7 @@ function estimateTokens(text) {
 async function loadToolsCatalog() {
   try {
     const resp = await ApiBinary.one('toolsCatalogRequest', {});
-    const parsed = JSON.parse(resp.toolsJson ?? resp.tools_json ?? '{}');
+    const parsed = JSON.parse(resp.toolsJson ?? '{}');
     return {
       addons: Array.isArray(parsed?.addons) ? parsed.addons : [],
       core: Array.isArray(parsed?.core) ? parsed.core : [],
@@ -1680,7 +1680,7 @@ async function loadToolsCatalog() {
 async function loadSkillList() {
   try {
     const resp = await ApiBinary.one('skillsListRequest', {});
-    const rows = JSON.parse(resp.skillsJson ?? resp.skills_json ?? '[]');
+    const rows = JSON.parse(resp.skillsJson ?? '[]');
     return Array.isArray(rows) ? rows : [];
   } catch {
     return [];
@@ -2292,7 +2292,7 @@ async function startPlaygroundRun(prompt) {
   let runId = null;
   try {
     const resp = await ApiBinary.one('agentRunStartRequest', { agentId: pg.agentId, prompt });
-    runId = resp.runId ?? resp.run_id ?? null;
+    runId = resp.runId ?? null;
   } catch (err) {
     pg.busy = false;
     pg.messages.push({ role: 'assistant', content: `${t('pg_start_failed')}: ${err.message}`, time: nowTime() });
@@ -2321,7 +2321,7 @@ async function startPlaygroundRun(prompt) {
       { scopeKind: 'run', scopeId: runId },
       {
         onChunk: (body) => {
-          if (!body || body.variant !== 'AgentRunEvent') return;
+          if (!body || body._variant !== 'AgentsBody.RunEvent') return;
           if (state.pg !== pg || pg.runId !== runId) return;
           pg.widget?.applyEvent(body);
           const statusBefore = pg.status;
@@ -2335,7 +2335,7 @@ async function startPlaygroundRun(prompt) {
           // when the message list is redrawn — repainting just the timeline
           // left the line permanently empty.
           if (pg.status !== statusBefore) renderPlaygroundMessages();
-          const eventRunId = body.run_id || body.runId;
+          const eventRunId = body.runId;
           if (body.kind === 'child_finished' && eventRunId === runId) {
             finishPlaygroundRun(pg, runId);
           }
@@ -2357,7 +2357,7 @@ async function startPlaygroundRun(prompt) {
     }
     try {
       const resp = await ApiBinary.one('agentRunDetailRequest', { runId });
-      const run = JSON.parse(resp.runJson ?? resp.run_json ?? 'null');
+      const run = JSON.parse(resp.runJson ?? 'null');
       if (run && TERMINAL_RUN_STATUSES.includes(run.status)) {
         finishPlaygroundRun(pg, runId);
       }
@@ -2380,7 +2380,7 @@ async function pollPlaygroundRun(pg, runId) {
     let run = null;
     try {
       const resp = await ApiBinary.one('agentRunDetailRequest', { runId });
-      run = JSON.parse(resp.runJson ?? resp.run_json ?? 'null');
+      run = JSON.parse(resp.runJson ?? 'null');
     } catch {
       continue;
     }
@@ -2398,7 +2398,7 @@ async function finishPlaygroundRun(pg, runId) {
   let run = null;
   try {
     const resp = await ApiBinary.one('agentRunDetailRequest', { runId });
-    run = JSON.parse(resp.runJson ?? resp.run_json ?? 'null');
+    run = JSON.parse(resp.runJson ?? 'null');
   } catch (err) {
     pg.messages.push({ role: 'assistant', content: `${t('run_detail_failed')}: ${err.message}`, time: nowTime() });
     renderPlaygroundMessages();
@@ -2510,7 +2510,7 @@ async function renderAgentRunsTab(body) {
 
 async function fetchAgentRuns(agentId) {
   const resp = await ApiBinary.one('agentRunsListRequest', { agentId });
-  const rows = JSON.parse(resp.runsJson ?? resp.runs_json ?? '[]');
+  const rows = JSON.parse(resp.runsJson ?? '[]');
   return Array.isArray(rows) ? rows : [];
 }
 
@@ -2631,7 +2631,7 @@ async function openRunDetail(runId, hostId = 'runs-detail-host', scope = 'global
   let run = null;
   try {
     const resp = await ApiBinary.one('agentRunDetailRequest', { runId });
-    run = JSON.parse(resp.runJson ?? resp.run_json ?? 'null');
+    run = JSON.parse(resp.runJson ?? 'null');
   } catch (err) {
     const stale = scope === 'agent'
       ? (state.detail !== d || d.selectedAgentRunId !== runId || d.agentRunsToken !== token)
@@ -2678,7 +2678,7 @@ async function openRunDetail(runId, hostId = 'runs-detail-host', scope = 'global
       { scopeKind: 'run', scopeId: runId },
       {
         onChunk: (body) => {
-          if (!body || body.variant !== 'AgentRunEvent') return;
+          if (!body || body._variant !== 'AgentsBody.RunEvent') return;
           const stillCurrent = scope === 'agent'
             ? (state.detail === d && d.selectedAgentRunId === runId && d.agentRunsToken === token)
             : (state.selectedRunId === runId && state.runsSubToken === token);
@@ -2817,7 +2817,7 @@ async function loadUserNames() {
   try {
     const resp = await ApiBinary.action('iamListUsersRequest');
     for (const u of resp?.users ?? []) {
-      const label = u.display_name || u.displayName || u.full_name || u.username || u.email;
+      const label = u.displayName || u.username || u.email;
       if (u.id && label) state.userNames.set(u.id, label);
     }
   } catch { /* roster unavailable — the fallback labels stay */ }
@@ -2883,7 +2883,7 @@ async function loadRunsTab() {
   if (host) host.innerHTML = `<div class="agents-tree-empty">${escapeHtml(t('runs_loading'))}</div>`;
   try {
     const resp = await ApiBinary.one('agentRunsListRequest', {});
-    const rows = JSON.parse(resp.runsJson ?? resp.runs_json ?? '[]');
+    const rows = JSON.parse(resp.runsJson ?? '[]');
     state.runs = Array.isArray(rows) ? rows : [];
   } catch (err) {
     if (host) host.innerHTML = `<div class="agents-form-error">${escapeHtml(`${t('runs_failed')}: ${err.message}`)}</div>`;
@@ -3899,7 +3899,7 @@ async function requestAssistTurn() {
     const resp = await ApiBinary.one('agentBuilderAssistRequest', {
       messagesJson: JSON.stringify(as.messages),
     });
-    const result = JSON.parse(resp.resultJson ?? resp.result_json ?? '{}');
+    const result = JSON.parse(resp.resultJson ?? '{}');
     if (state.assist !== as) return;
     if (result.reply) as.messages.push({ role: 'assistant', content: String(result.reply) });
     as.proposal = result.proposal && typeof result.proposal === 'object' ? result.proposal : null;

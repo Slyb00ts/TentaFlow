@@ -228,7 +228,9 @@ function wire(screen) {
     }
     const more = e.target.closest('[data-more]');
     if (more) {
-      more.parentElement.querySelector('[data-lab-menu]').toggle();
+      const menu = more.parentElement.querySelector('[data-lab-menu]');
+      menu.anchor = more;
+      menu.toggle();
       return;
     }
     if (e.target.closest('[data-lab-menu]')) return;

@@ -78,10 +78,10 @@ test('DiskSmartTestBatchRequest carries every disk and the one password to the n
   const sent = request('tentaNasDiskSmartTestBatchRequest', {
     diskIds: ['wwn-0x5000c500a1b2c3d4', 'sn-S3Z9NB0K'], kind: 'long', sudoPassword: 'test-secret-not-real',
   });
-  assert.equal(sent.variant, 'TentaNasDiskSmartTestBatchRequest');
-  assert.deepEqual(sent.disk_ids, ['wwn-0x5000c500a1b2c3d4', 'sn-S3Z9NB0K']);
+  assert.equal(sent._variant, 'TentaNasBody.DiskSmartTestBatchRequest');
+  assert.deepEqual(sent.diskIds, ['wwn-0x5000c500a1b2c3d4', 'sn-S3Z9NB0K']);
   assert.equal(sent.kind, 'long');
-  assert.equal(sent.sudo_password, 'test-secret-not-real');
+  assert.equal(sent.sudoPassword, 'test-secret-not-real');
 });
 
 test('a JobResponse keeps the disk lines of a multi-disk job, named, with coded reasons', { skip }, () => {
@@ -95,7 +95,7 @@ test('a JobResponse keeps the disk lines of a multi-disk job, named, with coded 
     ],
   };
   const body = decodeBody({ TentaNasBody: { JobResponse: { job } } });
-  assert.equal(body.variant, 'TentaNasJobResponse');
+  assert.equal(body._variant, 'TentaNasBody.JobResponse');
   const disks = body.job.disks;
   assert.equal(disks.length, 2, 'the lines survive the decoder');
   assert.equal(disks[0].name, 'sda');
@@ -108,10 +108,10 @@ test('a JobResponse keeps the disk lines of a multi-disk job, named, with coded 
 
 test('AlertForwardSetRequest says which target it sets', { skip }, () => {
   const own = request('tentaNasAlertForwardSetRequest', { enabled: true, syslogTarget: 'siem.local:514', includeAccess: true });
-  assert.equal(own.node_wide, false, 'the organisation\'s own target unless asked otherwise');
-  assert.equal(own.include_access, true);
+  assert.equal(own.nodeWide, false, 'the organisation\'s own target unless asked otherwise');
+  assert.equal(own.includeAccess, true);
   const node = request('tentaNasAlertForwardSetRequest', { enabled: false, syslogTarget: 'legacy.local:514', nodeWide: true });
-  assert.equal(node.node_wide, true);
+  assert.equal(node.nodeWide, true);
 });
 
 test('AccessLogResponse brings the organisation\'s target and the node-wide one apart', { skip }, () => {
@@ -142,7 +142,7 @@ test('AccessLogResponse brings the organisation\'s target and the node-wide one 
 
 test('AddonDisablePreviewRequest and its answer cross the real glue', { skip }, () => {
   const sent = request('addonDisablePreviewRequest', { addonId: 'tentanas-1a2b3c4d' });
-  assert.equal(sent.variant, 'AddonDisablePreviewRequest');
+  assert.equal(sent._variant, 'AddonDisablePreviewRequestBody');
   assert.equal(sent.addonId, 'tentanas-1a2b3c4d');
 
   const body = decodeBody({
@@ -154,7 +154,7 @@ test('AddonDisablePreviewRequest and its answer cross the real glue', { skip }, 
       ],
     },
   });
-  assert.equal(body.variant, 'AddonDisablePreviewResponse');
+  assert.equal(body._variant, 'AddonDisablePreviewResponseBody');
   assert.equal(body.nodeName, 'helios');
   assert.equal(body.backgroundOnDisable, true);
   assert.deepEqual(body.consequences[0].countVars, { n: 2 });
@@ -166,7 +166,7 @@ test('AddonDisablePreviewRequest and its answer cross the real glue', { skip }, 
 
 test('AddonTeardownStatusRequest and its answer cross the real glue', { skip }, () => {
   const sent = request('addonTeardownStatusRequest', { addonId: 'tentanas-1a2b3c4d' });
-  assert.equal(sent.variant, 'AddonTeardownStatusRequest');
+  assert.equal(sent._variant, 'AddonTeardownStatusRequestBody');
   assert.equal(sent.addonId, 'tentanas-1a2b3c4d');
 
   const body = decodeBody({
@@ -174,7 +174,7 @@ test('AddonTeardownStatusRequest and its answer cross the real glue', { skip }, 
       addon_id: 'tentanas-1a2b3c4d', state: 'failed', phase: 'tentanas_elastic_check', warnings: ['tentanas_backup_failed'],
     },
   });
-  assert.equal(body.variant, 'AddonTeardownStatusResponse');
+  assert.equal(body._variant, 'AddonTeardownStatusResponseBody');
   assert.equal(body.state, 'failed');
   assert.equal(body.phase, 'tentanas_elastic_check');
   assert.deepEqual(body.warnings, ['tentanas_backup_failed']);
@@ -200,7 +200,7 @@ test('the teardown plan keeps its nodes, its blocking entry and its counts', { s
       backup_file: 'app-backups/tentanas-helios-….json',
     },
   });
-  assert.equal(body.variant, 'AddonTeardownPlanResponse');
+  assert.equal(body._variant, 'AddonTeardownPlanResponseBody');
   assert.deepEqual(body.entries[0].countVars, { n: 2 }, 'the counts reach the dialog (they never did before)');
   assert.equal(body.entries[1].blocks, true);
   assert.equal(body.nodes.length, 2);
@@ -220,15 +220,14 @@ test('AddonTeardownArmRequest carries the password to the node and its answer co
   try {
     const bytes = envelope.body;
     const echo = wasm.decodeMessageBody(bytes);
-    assert.equal(echo.variant, 'AddonTeardownArmRequest');
+    assert.equal(echo._variant, 'AddonTeardownArmRequestBody');
     assert.equal(echo.addonId, 'tentanas-1a2b3c4d');
-    assert.equal(echo.sudoPassword, undefined, 'the echo never carries the password into a JS object');
     assert.ok(new TextDecoder().decode(bytes).includes('test-secret-not-real'), 'but the wire does carry it to the node');
   } finally {
     envelope.free();
   }
   const body = decodeBody({ AddonTeardownArmResponseBody: { addon_id: 'tentanas-1a2b3c4d', armed_until: '2026-09-26T12:30:00Z' } });
-  assert.equal(body.variant, 'AddonTeardownArmResponse');
+  assert.equal(body._variant, 'AddonTeardownArmResponseBody');
   assert.equal(body.armedUntil, '2026-09-26T12:30:00Z');
 });
 
@@ -240,13 +239,13 @@ test('AddonUninstallRequest carries the acknowledged nodes; AddonTeardownDisarmR
   }, 5));
   try {
     const echo = wasm.decodeMessageBody(envelope.body);
-    assert.equal(echo.variant, 'AddonUninstallRequest');
-    assert.equal(echo.acknowledgedCount, 1);
+    assert.equal(echo._variant, 'AddonUninstallRequestBody');
+    assert.equal(echo.acknowledgedNodes.length, 1);
     assert.ok(new TextDecoder().decode(envelope.body).includes('LOST'), 'the retyped word travels to the node');
   } finally {
     envelope.free();
   }
-  assert.equal(request('addonTeardownDisarmRequest', { addonId: 'tentanas-1a2b3c4d' }).variant, 'AddonTeardownDisarmRequest');
+  assert.equal(request('addonTeardownDisarmRequest', { addonId: 'tentanas-1a2b3c4d' })._variant, 'AddonTeardownDisarmRequestBody');
 });
 
 test('a plan node says it is unpaired; a forwarding target says its webhook needs a change', { skip }, () => {

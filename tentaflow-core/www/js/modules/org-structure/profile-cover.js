@@ -55,7 +55,7 @@ function absenceRowHtml({ absence, phase, manual }, canEdit) {
 }
 
 function deputyRowHtml({ deputy, phase }, side, canEdit) {
-  const name = side === 'covering' ? deputy.user_name : deputy.deputy_name;
+  const name = side === 'covering' ? deputy.userName : deputy.deputyName;
   return `
     <div class="org-cover-row" data-kind="deputy" data-id="${escapeAttr(deputy.id)}">
       <tf-avatar initials="${escapeAttr(initials(name))}" size="sm"></tf-avatar>
@@ -77,7 +77,7 @@ function handoverRowHtml({ record, away, done, returned, kept, failed }) {
   return `
     <div class="org-cover-row" data-kind="handover" data-id="${escapeAttr(record.id)}">
       <div class="org-cover-main">
-        <div class="org-cover-title">${escapeHtml(hv('profile_until', { date: formatDay(record.return_date) }))}</div>
+        <div class="org-cover-title">${escapeHtml(hv('profile_until', { date: formatDay(record.returnDate) }))}</div>
         <div class="org-cover-meta">${escapeHtml(parts.join(' · '))}</div>
         <div class="org-cover-meta">${escapeHtml(record.note)}</div>
       </div>
@@ -118,16 +118,16 @@ export async function mountProfileCover(host) {
     if (disposed || !cover) return;
     const today = cover.today;
     const absences = absenceRows(cover.absences, today);
-    const isAdmin = Boolean(cover.is_admin);
-    const canEditDeputies = Boolean(cover.can_edit_deputies);
-    const canEditAbsence = (row) => Boolean(cover.can_edit_absences) && (row.manual || isAdmin);
-    const add = cover.can_edit_absences
+    const isAdmin = Boolean(cover.isAdmin);
+    const canEditDeputies = Boolean(cover.canEditDeputies);
+    const canEditAbsence = (row) => Boolean(cover.canEditAbsences) && (row.manual || isAdmin);
+    const add = cover.canEditAbsences
       ? `<tf-button size="sm" icon="plus" data-act="absence-add">${escapeHtml(ct('absence_add'))}</tf-button>` : '';
     const absenceBody = `
       <p class="org-cover-note">${escapeHtml(ct('absence_privacy_note'))}</p>
       ${absences.length ? absences.map((row) => absenceRowHtml(row, canEditAbsence(row))).join('') : empty(ct('absence_empty'))}`;
 
-    const covered = deputyRows(cover.covered_by, today);
+    const covered = deputyRows(cover.coveredBy, today);
     const covering = deputyRows(cover.covering, today);
     const addDeputy = canEditDeputies
       ? `<tf-button size="sm" icon="plus" data-act="deputy-add">${escapeHtml(ct('deputy_add'))}</tf-button>` : '';
@@ -156,7 +156,7 @@ export async function mountProfileCover(host) {
   }
 
   const findAbsence = (id) => cover?.absences.find((a) => a.id === id);
-  const findDeputy = (id) => [...cover.covered_by, ...cover.covering].find((d) => d.id === id);
+  const findDeputy = (id) => [...cover.coveredBy, ...cover.covering].find((d) => d.id === id);
 
   function onClick(e) {
     const button = e.target.closest('[data-act]');
@@ -174,7 +174,7 @@ export async function mountProfileCover(host) {
     };
     switch (button.dataset.act) {
       case 'absence-add':
-        actions.addAbsence({ subject: cover.display_name, today: cover.today, anchor });
+        actions.addAbsence({ subject: cover.displayName, today: cover.today, anchor });
         break;
       case 'absence-menu': {
         const absence = findAbsence(rowId);
@@ -188,15 +188,15 @@ export async function mountProfileCover(host) {
         break;
       }
       case 'handover-open':
-        openHandover({ userId: cover.user_id, reason: 'absence' });
+        openHandover({ userId: cover.userId, reason: 'absence' });
         break;
       case 'deputy-add':
-        actions.addDeputy({ userId: cover.user_id, userName: cover.display_name, today: cover.today, anchor });
+        actions.addDeputy({ userId: cover.userId, userName: cover.displayName, today: cover.today, anchor });
         break;
       case 'deputy-menu': {
         const deputy = findDeputy(rowId);
         if (!deputy) break;
-        const subject = ct('deputy_subject', { deputy: deputy.deputy_name, person: deputy.user_name });
+        const subject = ct('deputy_subject', { deputy: deputy.deputyName, person: deputy.userName });
         openActionMenu(button, [
           { label: ct('menu_edit'), icon: 'edit', run: () => actions.editDeputy(deputy, { anchor }) },
           { separator: true },

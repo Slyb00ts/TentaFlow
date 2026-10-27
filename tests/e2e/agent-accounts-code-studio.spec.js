@@ -380,6 +380,20 @@ async function pendingApprovals(page, workspace = workspaceId, session = session
   return body?.approvals ?? [];
 }
 
+/// A turn outlives the assertions that watched it: the build loop keeps
+/// spawning agents, and a later round of the implementer raises its own
+/// question. Left alone, that question is the one the NEXT test's click would
+/// answer, so a test that starts a turn first cancels whatever the session
+/// still runs and waits until nothing in it is open.
+async function settleSession(page, workspace = workspaceId, session = sessionId) {
+  await api(page, 'codeStudioSessionCancelRequest', scope(workspace, session));
+  await expect.poll(async () => {
+    const runs = (await api(page, 'codeStudioSessionRunsRequest', scope(workspace, session)))?.runs ?? [];
+    const open = runs.filter((r) => !['completed', 'failed', 'cancelled'].includes(r.status));
+    return open.length + (await pendingApprovals(page, workspace, session)).length;
+  }, { timeout: 60_000, message: 'the previous turn never settled' }).toBe(0);
+}
+
 /// The account cards a session has open.
 function pendingAccounts(page, workspace = workspaceId, session = sessionId) {
   return pendingApprovals(page, workspace, session)
@@ -404,7 +418,7 @@ async function installCodeStudio(page) {
   const existing = await page.evaluate(async () => {
     const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
     const rows = await ApiBinary.list('addonsListRequest', { arrayKey: 'addons' });
-    return (rows ?? []).find((a) => (a.packageId ?? a.package_id) === 'code-studio') ?? null;
+    return (rows ?? []).find((a) => (a.packageId) === 'code-studio') ?? null;
   });
   if (!existing) {
     await installAddonInstance(page, {
@@ -418,7 +432,7 @@ async function installCodeStudio(page) {
   // be a second definition of what "installed but off" looks like. An instance
   // lands disabled, and the app gate refuses a disabled app.
   await api(page, 'addonToggleRequest', {
-    addonId: existing.addonId ?? existing.addon_id, enabled: true,
+    addonId: existing.addonId, enabled: true,
   });
   return false;
 }
@@ -429,12 +443,12 @@ async function installCodeStudio(page) {
 async function provisionModel(page) {
   const listed = await api(page, 'serviceListRequest');
   const running = (listed?.services ?? []).some(
-    (s) => (s.engineId ?? s.engine_id) === 'openai-compatible'
+    (s) => (s.engineId) === 'openai-compatible'
       && /running|degraded/.test(String(s.status ?? '')),
   );
   if (!running) {
     const nodes = await api(page, 'meshNodeListRequest');
-    const nodeId = (nodes?.nodes ?? [])[0]?.nodeId ?? (nodes?.nodes ?? [])[0]?.node_id ?? '';
+    const nodeId = (nodes?.nodes ?? [])[0]?.nodeId ?? '';
     await api(page, 'serviceManifestDeployRequest', {
       engineId: 'openai-compatible',
       deployMethod: 'external',
@@ -446,7 +460,7 @@ async function provisionModel(page) {
     await expect.poll(async () => {
       const body = await api(page, 'serviceListRequest');
       return (body?.services ?? []).find(
-        (s) => (s.engineId ?? s.engine_id) === 'openai-compatible',
+        (s) => (s.engineId) === 'openai-compatible',
       )?.status ?? 'missing';
     }, { timeout: 60_000 }).toMatch(/running|degraded/);
   }
@@ -455,7 +469,7 @@ async function provisionModel(page) {
   await expect.poll(async () => {
     const models = await api(page, 'modelListRequest');
     modelName = (models?.models ?? [])
-      .map((m) => m.modelName ?? m.model_name)
+      .map((m) => m.modelName)
       .find((n) => String(n).includes('harness-test')) ?? '';
     return modelName;
   }, { timeout: 90_000, message: 'the scripted model never reached the catalogue' })
@@ -471,11 +485,11 @@ async function provisionModel(page) {
 /// implementer's run" is a filter by agent and not "the first child".
 async function bindAgents(page, { modelName, runtime, name = 'code-implementer' }) {
   const listResp = await api(page, 'agentsListRequest', {});
-  const agents = JSON.parse(listResp?.agentsJson ?? listResp?.agents_json ?? '[]');
+  const agents = JSON.parse(listResp?.agentsJson ?? '[]');
   let agentId = '';
   for (const a of agents.filter((x) => String(x.name ?? '').startsWith('code-'))) {
     const d = await api(page, 'agentsDetailRequest', { agentId: a.id });
-    const agent = JSON.parse(d?.agentJson ?? d?.agent_json ?? '{}');
+    const agent = JSON.parse(d?.agentJson ?? '{}');
     // `agents.model` is a NOT NULL-shaped field every agent carries and a fresh
     // install leaves empty.
     agent.model = modelName;
@@ -499,7 +513,7 @@ async function grantWorkspaceCreator(page) {
   const users = await api(page, 'usersListRequest');
   const mine = (users?.users ?? []).find((u) => (u.username ?? '') === (me?.username ?? 'admin'));
   await api(page, 'codeStudioWorkspaceCreatorGrantSetRequest', {
-    userId: mine?.id ?? mine?.userId ?? mine?.user_id, granted: true,
+    userId: mine?.id ?? mine?.userId, granted: true,
   });
 }
 
@@ -650,18 +664,18 @@ test.describe('C01 w Code Studio — brak konta zatrzymuje delegację', () => {
     expect(open, 'expected exactly one open account card').toHaveLength(1);
     const row = open[0];
     expect(row.capability).toBe('account_login');
-    expect(row.mandatory_interactive, 'the account card is not a permission').toBe(false);
-    // Field by field: the wasm decoder publishes every key twice, snake_case
-    // and camelCase, so `toEqual` on the object would compare the alias set too.
+    expect(row.mandatoryInteractive, 'the account card is not a permission').toBe(false);
+    // Field by field: the decoder yields exactly the wire fields, and the
+    // description is a nested struct, so each field is asserted on its own.
     expect(row.account, 'the card description did not travel on the row').toBeTruthy();
-    expect(row.account.engine_id).toBe('claude-code');
-    expect(row.account.engine_name).toBe('Claude Code');
+    expect(row.account.engineId).toBe('claude-code');
+    expect(row.account.engineName).toBe('Claude Code');
     expect(row.account.mode).toBe('user');
-    expect(row.account.agent_name).toBe('code-implementer');
+    expect(row.account.agentName).toBe('code-implementer');
     // No personal account exists, so there is no id and no name to offer —
     // that absence IS the difference between "connect one" and "sign in again".
-    expect(row.account.account_id ?? null).toBeNull();
-    expect(row.account.account_name ?? null).toBeNull();
+    expect(row.account.accountId ?? null).toBeNull();
+    expect(row.account.accountName ?? null).toBeNull();
 
     // ---------------------------------------------------------------------
     // 3. A grant is not an answer. `account_login` is answered by connecting
@@ -670,7 +684,7 @@ test.describe('C01 w Code Studio — brak konta zatrzymuje delegację', () => {
     // ---------------------------------------------------------------------
     for (const decision of ['allow_once', 'allow_for_run', 'allow_for_session', 'always']) {
       const refused = await api(page, 'codeStudioApprovalDecideRequest', {
-        ...scope(), approvalId: row.approval_id, decision,
+        ...scope(), approvalId: row.approvalId, decision,
       }).then(() => null, (err) => String(err?.message ?? err));
       expect(refused, `'${decision}' was accepted for an account card`).toBeTruthy();
       expect(refused).toContain('account_login');
@@ -708,8 +722,8 @@ test.describe('C01 w Code Studio — brak konta zatrzymuje delegację', () => {
     await expect.poll(async () => {
       const body = await api(page, 'codeStudioSessionRunsRequest', scope());
       child = (body?.runs ?? []).find(
-        (r) => (r.parentRunId ?? r.parent_run_id)
-          && (r.agentId ?? r.agent_id) === implementerAgentId,
+        (r) => (r.parentRunId)
+          && (r.agentId) === implementerAgentId,
       );
       return child?.status ?? 'missing';
     }, { timeout: 90_000, message: 'the delegated run never settled after the deny' })
@@ -844,11 +858,11 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     const open = await pendingAccounts(page, cliWorkspaceId, cliSessionId);
     expect(open, 'expected exactly one open account card').toHaveLength(1);
     expect(open[0].capability).toBe('account_login');
-    expect(open[0].account.engine_id).toBe(CLI_ENGINE);
+    expect(open[0].account.engineId).toBe(CLI_ENGINE);
     expect(open[0].account.mode).toBe('user');
-    expect(open[0].account.agent_name).toBe('code-implementer');
-    expect(open[0].account.account_id ?? null).toBeNull();
-    const approvalId = open[0].approval_id;
+    expect(open[0].account.agentName).toBe('code-implementer');
+    expect(open[0].account.accountId ?? null).toBeNull();
+    const approvalId = open[0].approvalId;
 
     // And the parked state itself: `delegate_cli` opens the CLI run row ONLY
     // after the account resolves, so its absence here is what the sign-in is
@@ -966,7 +980,7 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     // The words are the PEP's own (rule 10's summary), not the console's: the
     // card must say what is being asked before a person answers it.
     expect(asked[0].summary).toContain('cli_delegate');
-    expect(asked[0].mandatory_interactive,
+    expect(asked[0].mandatoryInteractive,
       'a permission the operator may switch off is not a mandatory question').toBe(false);
     expect(asked[0].account ?? null,
       'a permission carries no account description').toBeNull();
@@ -1015,8 +1029,10 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
 
     // The click landed on the durable row, and the scope is the narrow one: the
     // person allowed THIS run, so the question comes back for the next one.
+    // The graph's build loop may open another round the moment this run ends, and
+    // that round asks its own question; only the answered one is under test.
     const settled = dbApprovals(cliWorkspaceId)
-      .filter((a) => a.capability === 'cli_delegate');
+      .filter((a) => a.capability === 'cli_delegate' && a.status === 'decided');
     expect(settled).toHaveLength(1);
     expect(settled[0].status).toBe('decided');
     expect(settled[0].decision).toBe('allow_once');
@@ -1025,7 +1041,7 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     const body = await api(page, 'codeStudioSessionRunsRequest', sessions);
     const runs = body?.runs ?? [];
     const implementerRun = runs.find(
-      (r) => (r.parentRunId ?? r.parent_run_id) && (r.agentId ?? r.agent_id) === cliImplementerId,
+      (r) => (r.parentRunId) && (r.agentId) === cliImplementerId,
     );
     const cli = runs.find((r) => r.kind === 'cli');
     expect(implementerRun, 'the delegated run is not in the run list').toBeTruthy();
@@ -1033,8 +1049,8 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     // The CLI run is the CHILD of the delegated run: `delegate_cli` opens it
     // under the sub-agent it belongs to, so a run chain that shows it at the
     // top would be a different graph.
-    expect(cli.parentRunId ?? cli.parent_run_id)
-      .toBe(implementerRun.runId ?? implementerRun.run_id);
+    expect(cli.parentRunId)
+      .toBe(implementerRun.runId);
     // The model is written when the run SETTLES (`finish_run`), so a completed
     // CLI run is the only place the delegated model is a fact.
     expect(cli.model).toBe(CLI_MODEL);
@@ -1080,7 +1096,7 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     expect(instances, 'no CLI instance row for the resumed run').toHaveLength(1);
     expect(instances[0].engine_id).toBe(CLI_ENGINE);
     expect(instances[0].account_id).toBe(accountId);
-    expect(instances[0].run_id).toBe(cli.runId ?? cli.run_id);
+    expect(instances[0].run_id).toBe(cli.runId);
     // A closed instance, and both terminal states mean the same thing here: the
     // bridge marks a session it ended `ended`, and one it found already gone
     // `reaped`. Asserting either instead of the pair would be a claim about
@@ -1127,10 +1143,10 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     }, { timeout: 60_000, message: 'the session has no CLI run to chip' }).toBe('seen');
 
     expect(cliRun.account, 'the CLI run named no account').toBeTruthy();
-    expect(cliRun.account.engine_name).toBe('Codex');
+    expect(cliRun.account.engineName).toBe('Codex');
     expect(cliRun.account.mode).toBe('user');
-    expect(cliRun.account.account_name).toBe(ACCOUNT_NAME);
-    expect(cliRun.account.account_id).toBe(stand.accountIdForUser());
+    expect(cliRun.account.accountName).toBe(ACCOUNT_NAME);
+    expect(cliRun.account.accountId).toBe(stand.accountIdForUser());
 
     // The counterpart, so a chip everywhere would fail: a run with no CLI
     // instance names no account. The orchestrator runs on a language model.
@@ -1144,7 +1160,7 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     //    lists the run, and the chip on its row carries the engine, the scope
     //    word and the account name.
     // ---------------------------------------------------------------------
-    const runId = cliRun.runId ?? cliRun.run_id;
+    const runId = cliRun.runId;
     const row = page.locator(`#cs-session-view [data-activity="dock"] .tf-aa-run[data-run="${runId}"]`);
     await row.waitFor({ state: 'visible', timeout: 60_000 });
     await expect(row).toContainText(`${ACCOUNT_NAME}`);
@@ -1165,6 +1181,7 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     await loginAsAdmin(page, { port: PORT });
     await openStudio(page);
     await openWorkspace(page, WORKSPACE_CLI);
+    await settleSession(page, cliWorkspaceId, cliSessionId);
 
     // ---------------------------------------------------------------------
     // 1. The state this test is about: a credential the node can read that
@@ -1193,7 +1210,7 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     const sessions = scope(cliWorkspaceId, cliSessionId);
     const runsNow = async () => ((await api(page, 'codeStudioSessionRunsRequest', sessions))?.runs ?? []);
     const before = new Set(
-      (await runsNow()).filter((r) => r.kind === 'cli').map((r) => r.runId ?? r.run_id),
+      (await runsNow()).filter((r) => r.kind === 'cli').map((r) => r.runId),
     );
 
     const composer = page.locator('#cs-session-view textarea').first();
@@ -1212,13 +1229,13 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     let cli = null;
     await expect.poll(async () => {
       const fresh = (await runsNow()).filter(
-        (r) => r.kind === 'cli' && !before.has(r.runId ?? r.run_id),
+        (r) => r.kind === 'cli' && !before.has(r.runId),
       );
       cli = fresh[0] ?? null;
       return cli?.status ?? 'missing';
     }, { timeout: TURN_TIMEOUT, message: 'the refused delegation never reached a terminal state' })
       .toBe('failed');
-    const cliRunId = cli.runId ?? cli.run_id;
+    const cliRunId = cli.runId;
     expect(cli.note, 'the refused run carries no reason').toBe(
       'agent bridge /sessions: session_expired',
     );
@@ -1231,11 +1248,11 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     let events = [];
     await expect.poll(async () => {
       const timeline = await api(page, 'codeStudioSessionTimelineRequest', { ...sessions, limit: 500 });
-      events = (timeline?.events ?? []).filter((e) => e.run_id === cliRunId);
+      events = (timeline?.events ?? []).filter((e) => e.runId === cliRunId);
       return events.some((e) => e.kind === 'run_finished') ? 'closed' : '';
     }, { timeout: 60_000, message: 'the refused run has no closing event' }).toBe('closed');
     expect(events.map((e) => e.kind)).toContain('cli_delegation_authorized');
-    const finished = JSON.parse(events.find((e) => e.kind === 'run_finished').payload_json);
+    const finished = JSON.parse(events.find((e) => e.kind === 'run_finished').payloadJson);
     expect(finished.RunFinished.status).toBe('failed');
     expect(finished.RunFinished.error).toBe('agent bridge /sessions: session_expired');
 
@@ -1257,7 +1274,7 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     await expect.poll(async () => {
       const runs = await runsNow();
       const parent = runs.find(
-        (r) => (r.runId ?? r.run_id) === (cli.parentRunId ?? cli.parent_run_id),
+        (r) => (r.runId) === (cli.parentRunId),
       );
       return parent?.status ?? 'missing';
     }, { timeout: 60_000, message: 'the delegating run never settled' }).toBe('failed');
@@ -1363,11 +1380,12 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     // ---------------------------------------------------------------------
     await openStudio(page);
     await openWorkspace(page, WORKSPACE_CLI);
+    await settleSession(page, cliWorkspaceId, cliSessionId);
 
     const sessions = scope(cliWorkspaceId, cliSessionId);
     const runsNow = async () => ((await api(page, 'codeStudioSessionRunsRequest', sessions))?.runs ?? []);
     const before = new Set(
-      (await runsNow()).filter((r) => r.kind === 'cli').map((r) => r.runId ?? r.run_id),
+      (await runsNow()).filter((r) => r.kind === 'cli').map((r) => r.runId),
     );
 
     const composer = page.locator('#cs-session-view textarea').first();
@@ -1384,11 +1402,11 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     // the row is gone, so the question names no account to sign in again.
     const asked = await pendingAccounts(page, cliWorkspaceId, cliSessionId);
     expect(asked, 'the refused turn raised no account question').toHaveLength(1);
-    expect(asked[0].account.account_id ?? null).toBeNull();
+    expect(asked[0].account.accountId ?? null).toBeNull();
     expect(asked[0].account.mode).toBe('user');
 
     expect(
-      (await runsNow()).filter((r) => r.kind === 'cli' && !before.has(r.runId ?? r.run_id)),
+      (await runsNow()).filter((r) => r.kind === 'cli' && !before.has(r.runId)),
       'a CLI turn started on the account the purge removed',
     ).toHaveLength(0);
     // Nothing republished the credential while the turn waited on its question:
@@ -1409,6 +1427,7 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     await loginAsAdmin(page, { port: PORT });
     await openStudio(page);
     await openWorkspace(page, WORKSPACE_CLI);
+    await settleSession(page, cliWorkspaceId, cliSessionId);
 
     // ---------------------------------------------------------------------
     // 1. A working credential, produced the way the product produces one. The
@@ -1558,6 +1577,7 @@ test.describe('C01 resumowane przez logowanie i chip konta C02', () => {
     await loginAsAdmin(page, { port: PORT });
     await openStudio(page);
     await openWorkspace(page, WORKSPACE_CLI);
+    await settleSession(page, cliWorkspaceId, cliSessionId);
 
     // ---------------------------------------------------------------------
     // 1. A working credential, produced the way the product produces one. The
@@ -1927,8 +1947,8 @@ test.describe('C01 (konto wspólne) w Code Studio — administrator i zwykły u�
     expect(globalMemberUserId, 'the member user was not created').toBeTruthy();
 
     const addons = await api(page, 'addonsListRequest');
-    const csAddon = (addons?.addons ?? []).find((a) => (a.packageId ?? a.package_id) === 'code-studio');
-    const codeStudioAddonId = csAddon?.addonId ?? csAddon?.addon_id;
+    const csAddon = (addons?.addons ?? []).find((a) => (a.packageId) === 'code-studio');
+    const codeStudioAddonId = csAddon?.addonId;
     expect(codeStudioAddonId, 'code-studio addon instance not found').toBeTruthy();
     await api(page, 'addonPermissionSetRequest', {
       addonId: codeStudioAddonId,
@@ -1950,7 +1970,7 @@ test.describe('C01 (konto wspólne) w Code Studio — administrator i zwykły u�
       scope: 'global',
       credentialKind: 'provider_login',
     });
-    sharedAccountId = created?.account?.accountId ?? created?.account?.account_id;
+    sharedAccountId = created?.account?.accountId;
     expect(sharedAccountId, 'the shared account was not created').toBeTruthy();
     await api(page, 'providerAccountGrantsSetRequest', {
       accountId: sharedAccountId,
@@ -2066,13 +2086,13 @@ test.describe('C01 (konto wspólne) w Code Studio — administrator i zwykły u�
     expect(open, 'expected exactly one open account card').toHaveLength(1);
     const row = open[0];
     expect(row.capability).toBe('account_login');
-    expect(row.mandatory_interactive, 'the account card is not a permission').toBe(false);
-    expect(row.account.engine_id).toBe('claude-code');
-    expect(row.account.engine_name).toBe('Claude Code');
+    expect(row.mandatoryInteractive, 'the account card is not a permission').toBe(false);
+    expect(row.account.engineId).toBe('claude-code');
+    expect(row.account.engineName).toBe('Claude Code');
     expect(row.account.mode).toBe('global');
-    expect(row.account.agent_name).toBe('code-implementer');
-    expect(row.account.account_id).toBe(sharedAccountId);
-    expect(row.account.account_name).toBe(SHARED_ACCOUNT_NAME);
+    expect(row.account.agentName).toBe('code-implementer');
+    expect(row.account.accountId).toBe(sharedAccountId);
+    expect(row.account.accountName).toBe(SHARED_ACCOUNT_NAME);
 
     // ---------------------------------------------------------------------
     // 4. The admin ends the task too, so no run is left parked behind this
@@ -2091,7 +2111,7 @@ test.describe('C01 (konto wspólne) w Code Studio — administrator i zwykły u�
     await expect.poll(async () => {
       const body = await api(page, 'codeStudioSessionRunsRequest', scope(globalWorkspaceId, adminGlobalSessionId));
       adminChild = (body?.runs ?? []).find(
-        (r) => (r.parentRunId ?? r.parent_run_id) && (r.agentId ?? r.agent_id) === globalImplementerId,
+        (r) => (r.parentRunId) && (r.agentId) === globalImplementerId,
       );
       return adminChild?.status ?? 'missing';
     }, { timeout: 90_000, message: "the admin's delegated run never settled after the deny" })
@@ -2166,11 +2186,11 @@ test.describe('C01 (konto wspólne) w Code Studio — administrator i zwykły u�
     expect(open, 'expected exactly one open account card').toHaveLength(1);
     const row = open[0];
     expect(row.capability).toBe('account_login');
-    expect(row.account.engine_id).toBe('claude-code');
+    expect(row.account.engineId).toBe('claude-code');
     expect(row.account.mode).toBe('global');
-    expect(row.account.agent_name).toBe('code-implementer');
-    expect(row.account.account_id).toBe(sharedAccountId);
-    expect(row.account.account_name).toBe(SHARED_ACCOUNT_NAME);
+    expect(row.account.agentName).toBe('code-implementer');
+    expect(row.account.accountId).toBe(sharedAccountId);
+    expect(row.account.accountName).toBe(SHARED_ACCOUNT_NAME);
 
     // ---------------------------------------------------------------------
     // 3. The member stops the turn — the only action their card offers.
@@ -2185,7 +2205,7 @@ test.describe('C01 (konto wspólne) w Code Studio — administrator i zwykły u�
     await expect.poll(async () => {
       const body = await api(page, 'codeStudioSessionRunsRequest', scope(globalWorkspaceId, memberGlobalSessionId));
       memberChild = (body?.runs ?? []).find(
-        (r) => (r.parentRunId ?? r.parent_run_id) && (r.agentId ?? r.agent_id) === globalImplementerId,
+        (r) => (r.parentRunId) && (r.agentId) === globalImplementerId,
       );
       return memberChild?.status ?? 'missing';
     }, { timeout: 90_000, message: "the member's delegated run never settled after the deny" })

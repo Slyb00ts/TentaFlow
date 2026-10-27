@@ -78,8 +78,8 @@ impl Parse for HandlerArgs {
 /// Obsluguje zarowno `fn` (sync) jak i `async fn` (async) — macro generuje
 /// wrapper `__tentaflow_dispatch_<fn>` ktory zawsze zwraca boxed future
 /// o zunifikowanej signaturze `HandlerDispatchFn`. Sync fn sa wolane
-/// synchronicznie i owijane w `async move { ... }`; async fn sa po prostu
-/// `.await`-owane. Brak `block_on` / `Handle::current`.
+/// przez `run_sync_handler` (blokujace SQLite/mutexy nie zajmuja workera tokio)
+/// i owijane w `async move { ... }`; async fn sa po prostu `.await`-owane.
 ///
 /// Wymaga jednoczesnie obecnosci `#[policy]` i `#[observed]` na tej samej funkcji —
 /// bez nich expansion generuje referencje do nieistniejacych symboli (compile error).
@@ -104,7 +104,7 @@ pub fn handler(attr: TokenStream, item: TokenStream) -> TokenStream {
     let call_expr = if is_async {
         quote! { #fn_name(__req, __ctx).await }
     } else {
-        quote! { #fn_name(__req, __ctx) }
+        quote! { ::tentaflow_core::dispatch::run_sync_handler(|| #fn_name(__req, __ctx)) }
     };
 
     let output = quote! {

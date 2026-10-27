@@ -33,13 +33,13 @@ function normalise(id) {
 function build(entries) {
   const map = new Map();
   for (const e of entries || []) {
-    const id = normalise(e.id ?? e.model ?? '');
+    const id = normalise(e.id);
     if (!id) continue;
     map.set(id, {
-      input: new Set((e.inputModalities ?? e.input_modalities ?? []).map(normalise)),
-      output: new Set((e.outputModalities ?? e.output_modalities ?? []).map(normalise)),
+      input: new Set((e.inputModalities ?? []).map(normalise)),
+      output: new Set((e.outputModalities ?? []).map(normalise)),
       // Kolejność z katalogu jest znacząca (low → high), więc lista, nie zbiór.
-      reasoning: (e.reasoningLevels ?? e.reasoning_levels ?? []).map(normalise),
+      reasoning: (e.reasoningLevels ?? []).map(normalise),
     });
   }
   return map;
@@ -53,7 +53,7 @@ export const ModelModalities = {
     loading = (async () => {
       try {
         const body = await ApiBinary.action('catalogListRequest', {});
-        const entries = body?.entries ?? body?.models ?? [];
+        const entries = body?.entries ?? [];
         index = build(entries);
       } catch (_) {
         // No catalog: every port stays enabled. Dimming is help, not a gate —

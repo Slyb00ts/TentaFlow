@@ -3504,7 +3504,7 @@ impl BusService {
             return;
         }
         if let Some(entry) = self.org_stored_bytes.get(org_id) {
-            let _ = entry.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            let _ = entry.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_sub(bytes))
             });
         }

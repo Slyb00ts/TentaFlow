@@ -105,7 +105,7 @@ function sprite(id) {
 }
 
 function wsId(w) {
-  return String(w?.workspaceId ?? w?.workspace_id ?? '');
+  return String(w?.workspaceId ?? '');
 }
 
 function shortId(id) {
@@ -114,11 +114,11 @@ function shortId(id) {
 }
 
 function isNative(workspace) {
-  return (workspace?.execMode ?? workspace?.exec_mode) === 'trusted_native';
+  return workspace?.execMode === 'trusted_native';
 }
 
 function enforcementOf(workspace) {
-  return String(workspace?.egressEnforcement ?? workspace?.egress_enforcement ?? 'unrestricted');
+  return String(workspace?.egressEnforcement ?? 'unrestricted');
 }
 
 function statusOf(workspace) {
@@ -126,7 +126,7 @@ function statusOf(workspace) {
 }
 
 function myRole(workspace) {
-  return String(workspace?.myRole ?? workspace?.my_role ?? 'viewer');
+  return String(workspace?.myRole ?? 'viewer');
 }
 
 function canManage(workspace) {
@@ -134,7 +134,7 @@ function canManage(workspace) {
 }
 
 function quotaBytes(workspace) {
-  const raw = workspace?.quotaDiskBytes ?? workspace?.quota_disk_bytes;
+  const raw = workspace?.quotaDiskBytes;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : 0;
 }
@@ -183,10 +183,10 @@ async function fetchWorkspaces() {
   });
   state.workspaces = Array.isArray(body.workspaces) ? body.workspaces : [];
   state.nodes = Array.isArray(body.nodes) ? body.nodes : [];
-  state.canCreate = !!(body.canCreate ?? body.can_create);
+  state.canCreate = !!body.canCreate;
   // The registry names this machine; the disconnection overlay cannot ask for
   // that name when it is drawn, so it is handed over while the socket is alive.
-  const local = state.nodes.find((n) => (n.isLocal ?? n.is_local));
+  const local = state.nodes.find((n) => n.isLocal);
   if (local) rememberNodeName(local.name ?? local.hostname);
 }
 
@@ -282,21 +282,21 @@ async function openWorkspaceChat(workspaceId) {
     const sessions = await fetchSessions(workspaceId);
     if (state.workspaceId !== workspaceId || state.sessionId) return;
     const recent = [...sessions].sort((a, b) =>
-      String(b.updatedAt ?? b.updated_at ?? '').localeCompare(String(a.updatedAt ?? a.updated_at ?? '')));
+      String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')));
     const session = recent.find((s) => !['closing', 'closed', 'failed', 'cancelled'].includes(s.status))
       ?? (myRole(state.workspace) === 'viewer' ? recent[0] : null);
     if (session) {
-      await goto(workspaceId, String(session.sessionId ?? session.session_id));
+      await goto(workspaceId, String(session.sessionId));
       return;
     }
     if (myRole(state.workspace) === 'viewer') return;
     const response = await ApiBinary.action('codeStudioSessionOpenRequest', {
       workspaceId,
       title: String(state.workspace.name || t('session_untitled')),
-      autonomyMode: (state.workspace.autonomyCeiling ?? state.workspace.autonomy_ceiling) === 'plan' ? 'plan' : 'normal',
+      autonomyMode: state.workspace.autonomyCeiling === 'plan' ? 'plan' : 'normal',
     });
     if (state.workspaceId !== workspaceId || state.sessionId) return;
-    const sessionId = String(response.session?.sessionId ?? response.session?.session_id ?? '');
+    const sessionId = String(response.session?.sessionId ?? '');
     if (sessionId) await goto(workspaceId, sessionId);
   } catch (err) {
     reportError(err);
@@ -343,16 +343,16 @@ function filteredWorkspaces() {
     const status = statusOf(w);
     if (state.listFilter === 'archived' && status !== 'archived') return false;
     if (state.listFilter !== 'archived' && status === 'archived') return false;
-    if (state.listFilter === 'with_session' && Number(w.openSessions ?? w.open_sessions ?? 0) === 0) return false;
+    if (state.listFilter === 'with_session' && Number(w.openSessions ?? 0) === 0) return false;
     if (state.listFilter === 'attention' && status !== 'error' && status !== 'provisioning') return false;
-    if (state.listFilter === 'container' && (w.execMode ?? w.exec_mode) !== 'container') return false;
-    if (state.nodeFilter !== 'all' && String(w.nodeId ?? w.node_id) !== state.nodeFilter) return false;
+    if (state.listFilter === 'container' && w.execMode !== 'container') return false;
+    if (state.nodeFilter !== 'all' && String(w.nodeId) !== state.nodeFilter) return false;
     if (!query) return true;
     const haystack = [
       w.name,
       w.slug,
-      w.nodeName ?? w.node_name,
-      w.repoUrl ?? w.repo_url,
+      w.nodeName,
+      w.repoUrl,
       wsId(w),
     ].map((v) => String(v ?? '').toLowerCase()).join(' ');
     return haystack.includes(query);
@@ -365,8 +365,8 @@ function renderKpis() {
   const all = state.workspaces;
   const active = all.filter((w) => statusOf(w) === 'active').length;
   const archived = all.filter((w) => statusOf(w) === 'archived').length;
-  const sessions = all.reduce((sum, w) => sum + Number(w.openSessions ?? w.open_sessions ?? 0), 0);
-  const withSessions = all.filter((w) => Number(w.openSessions ?? w.open_sessions ?? 0) > 0).length;
+  const sessions = all.reduce((sum, w) => sum + Number(w.openSessions ?? 0), 0);
+  const withSessions = all.filter((w) => Number(w.openSessions ?? 0) > 0).length;
   const attention = all.filter((w) => statusOf(w) === 'error').length;
   const provisioning = all.filter((w) => statusOf(w) === 'provisioning').length;
   // Usage is not in the list payload (see quotaCell), so the tile reports the
@@ -424,7 +424,7 @@ function syncNodeFilter() {
   if (!select) return;
   const options = [{ value: 'all', label: t('filter_node_any') }];
   for (const node of state.nodes) {
-    const id = String(node.nodeId ?? node.node_id ?? '');
+    const id = String(node.nodeId ?? '');
     options.push({ value: id, label: String(node.name ?? id) });
   }
   select.setOptions(options, state.nodeFilter);
@@ -441,7 +441,7 @@ function syncFilterChips() {
 }
 
 function modeChip(workspace) {
-  if ((workspace?.execMode ?? workspace?.exec_mode) === 'process_sandbox') return { status: 'ok', label: t('mode_process'), dot: true };
+  if (workspace?.execMode === 'process_sandbox') return { status: 'ok', label: t('mode_process'), dot: true };
   return isNative(workspace)
     ? { status: 'warn', label: t('mode_native'), dot: true }
     : { status: 'ok', label: t('mode_container'), dot: true };
@@ -456,7 +456,7 @@ function modeChip(workspace) {
 // dash is dropped and the words carry it alone.
 function sessionCell(workspace) {
   const status = statusOf(workspace);
-  const open = Number(workspace.openSessions ?? workspace.open_sessions ?? 0);
+  const open = Number(workspace.openSessions ?? 0);
   const chip = (tone, label) => `<span class="tf-chip ${tone}"><span class="tf-chip-dot"></span>${escapeHtml(label)}</span>`;
   const muted = (text) => `<div class="tf-table__cell-sub">${escapeHtml(text)}</div>`;
   const lines = (title, sub) => `<div class="tf-table__cell-title">${escapeHtml(title)}</div>`
@@ -492,10 +492,10 @@ function repoPath(repoUrl) {
 // names the branch of a thing that does not exist, so the empty case is one
 // muted line and nothing else.
 function repoCell(workspace) {
-  const repoUrl = String(workspace.repoUrl ?? workspace.repo_url ?? '');
+  const repoUrl = String(workspace.repoUrl ?? '');
   if (!repoUrl) return `<div class="tf-table__cell-sub">${escapeHtml(t('repo_none'))}</div>`;
-  const branch = String(workspace.targetBranch ?? workspace.target_branch
-    ?? workspace.defaultBranch ?? workspace.default_branch ?? '');
+  const branch = String(workspace.targetBranch
+    ?? workspace.defaultBranch ?? '');
   // A path and a ref are SCANNED, not read: monospace keeps the segments in
   // fixed columns, which is what makes two similar remotes distinguishable.
   return `<div class="tf-table__cell--mono" title="${escapeAttr(repoUrl)}">`
@@ -508,8 +508,8 @@ function repoCell(workspace) {
 // With a single node in the mesh every row would repeat "this node", which
 // says nothing about the record it sits in.
 function nodeCell(workspace) {
-  const name = String(workspace.nodeName ?? workspace.node_name ?? '');
-  const local = !!(workspace.isLocal ?? workspace.is_local);
+  const name = String(workspace.nodeName ?? '');
+  const local = !!workspace.isLocal;
   const line = `<div class="tf-table__cell-title">${escapeHtml(name)}</div>`;
   if (local && state.nodes.length < 2) return line;
   return line + `<div class="tf-table__cell-sub">${escapeHtml(local ? t('node_local') : t('node_remote'))}</div>`;
@@ -521,10 +521,10 @@ function nodeCell(workspace) {
 // missing value.
 function summaryCell(workspace) {
   const status = statusOf(workspace);
-  const open = Number(workspace.openSessions ?? workspace.open_sessions ?? 0);
-  const repoUrl = String(workspace.repoUrl ?? workspace.repo_url ?? '');
-  const branch = String(workspace.targetBranch ?? workspace.target_branch
-    ?? workspace.defaultBranch ?? workspace.default_branch ?? '');
+  const open = Number(workspace.openSessions ?? 0);
+  const repoUrl = String(workspace.repoUrl ?? '');
+  const branch = String(workspace.targetBranch
+    ?? workspace.defaultBranch ?? '');
   const mode = modeChip(workspace);
 
   const sessions = status === 'error' ? t('status_error')
@@ -534,7 +534,7 @@ function summaryCell(workspace) {
   const repo = repoUrl
     ? `${repoLabel(repoUrl)}${branch ? ` · ${branch}` : ''}`
     : t('repo_none');
-  const parts = [sessions, repo, relativeTimestamp(workspace.updatedAt ?? workspace.updated_at)];
+  const parts = [sessions, repo, relativeTimestamp(workspace.updatedAt)];
 
   return `<div class="tf-table__cell-row">`
     + `<span class="tf-table__cell-title">${escapeHtml(String(workspace.name ?? ''))}</span>`
@@ -562,7 +562,7 @@ function workspaceRow(workspace) {
     mode: modeChip(workspace),
     sessions: sessionCell(workspace),
     quota: quotaCell(workspace),
-    activity: relativeTimestamp(workspace.updatedAt ?? workspace.updated_at),
+    activity: relativeTimestamp(workspace.updatedAt),
   };
 }
 
@@ -719,7 +719,7 @@ function renderListFooter() {
   const sub = byId('cs-list-sub');
   if (sub) {
     const sessions = state.workspaces.reduce(
-      (sum, w) => sum + Number(w.openSessions ?? w.open_sessions ?? 0), 0,
+      (sum, w) => sum + Number(w.openSessions ?? 0), 0,
     );
     sub.textContent = t('list_sub', { count: total, sessions });
   }
@@ -891,7 +891,7 @@ function closeAllWindows() {
 // =============================================================================
 
 function nodeById(nodeId) {
-  return state.nodes.find((n) => String(n.nodeId ?? n.node_id) === String(nodeId)) ?? null;
+  return state.nodes.find((n) => String(n.nodeId) === String(nodeId)) ?? null;
 }
 
 // Why the process-sandbox card is blocked, in the reader's language. The chosen
@@ -905,7 +905,7 @@ function nodeById(nodeId) {
 // only one an operator can still act on: start the node from a desktop session
 // rather than over SSH.
 function processSandboxNote(node) {
-  const cause = String(node?.processSandboxCause ?? node?.process_sandbox_cause ?? '');
+  const cause = String(node?.processSandboxCause ?? '');
   if (cause === 'gui_session_required') return t('mode_process_gui_session');
   // Any other cause names what the chosen node is missing, and it travels from
   // THAT node over the mesh — a remote refusal is as readable as a local one,
@@ -914,7 +914,7 @@ function processSandboxNote(node) {
   // No cause at all: the node reported nothing. Its availability is its OWN to
   // report — this Core cannot probe another node's launchd domain — so the
   // message names the owner instead of inventing a cause for it.
-  if ((node?.isLocal ?? node?.is_local) !== true) return t('mode_process_remote');
+  if (node?.isLocal !== true) return t('mode_process_remote');
   return t('mode_process_unavailable');
 }
 
@@ -940,7 +940,7 @@ function openWizard() {
   const wz = {
     step: 1,
     name: '',
-    nodeId: String(firstNode?.nodeId ?? firstNode?.node_id ?? ''),
+    nodeId: String(firstNode?.nodeId ?? ''),
     execMode: 'process_sandbox',
     containerImage: '',
     autonomyCeiling: 'normal',
@@ -1118,11 +1118,11 @@ function openWizard() {
   // silence into a missing runtime.
   const renderNodes = () => {
     byId('cs-wz-node').setOptions(state.nodes.map((n) => {
-      const id = String(n.nodeId ?? n.node_id ?? '');
-      const supports = n.supportsContainer ?? n.supports_container ?? null;
-      const enforcement = String(n.egressEnforcement ?? n.egress_enforcement ?? 'unrestricted');
+      const id = String(n.nodeId ?? '');
+      const supports = n.supportsContainer ?? null;
+      const enforcement = String(n.egressEnforcement ?? 'unrestricted');
       const facts = [
-        (n.isLocal ?? n.is_local) ? t('node_local') : t('node_remote'),
+        n.isLocal ? t('node_local') : t('node_remote'),
         t(containerFactKey(supports)),
         t(`enforcement_${enforcement}`),
       ];
@@ -1161,17 +1161,17 @@ function openWizard() {
   // the owner rather than the runtime.
   const renderModes = () => {
     const node = nodeById(wz.nodeId);
-    const supports = node?.supportsContainer ?? node?.supports_container ?? null;
+    const supports = node?.supportsContainer ?? null;
     const group = byId('cs-wz-modes');
     const container = group.querySelector('tf-choice-card[value="container"]');
     const process = group.querySelector('[value=process_sandbox]');
-    process.disabled = (node?.supportsProcessSandbox ?? node?.supports_process_sandbox) !== true;
+    process.disabled = node?.supportsProcessSandbox !== true;
     process.note = process.disabled ? processSandboxNote(node) : '';
     // The native `title` is this module's tooltip channel on a rendered card
     // (the choice card owns its own markup): the probe's sentence stays
     // reachable for a diagnosis without standing in for the message.
     process.title = process.disabled
-      ? String(node?.processSandboxReason ?? node?.process_sandbox_reason ?? '')
+      ? String(node?.processSandboxReason ?? '')
       : '';
     container.disabled = supports !== true || wz.repoKind === 'local';
     group.querySelector('[value=trusted_native]').disabled = wz.repoKind === 'local';
@@ -1181,7 +1181,7 @@ function openWizard() {
     // blocked card, not only named in its note.
     const repair = byId('cs-wz-sandbox-repair');
     const repairable = process.disabled
-      && sandboxRepairable(node?.processSandboxCause ?? node?.process_sandbox_cause);
+      && sandboxRepairable(node?.processSandboxCause);
     repair.hidden = !repairable;
     if (repairable) repair.setAttribute('message', sandboxRepairProblem(node?.name ?? ''));
   };
@@ -1247,7 +1247,7 @@ function openWizard() {
   byId('cs-wz-node').addEventListener('change', (e) => {
     wz.nodeId = String(e.detail?.value ?? '');
     const node = nodeById(wz.nodeId);
-    const supports = node?.supportsContainer ?? node?.supports_container ?? null;
+    const supports = node?.supportsContainer ?? null;
     if (supports !== true && wz.execMode === 'container') wz.execMode = 'process_sandbox';
     renderModes();
     renderPolicySelects();
@@ -1256,16 +1256,16 @@ function openWizard() {
     const node = nodeById(wz.nodeId);
     if (!node) return;
     const outcome = await repairProcessSandbox({
-      nodeId: node.nodeId ?? node.node_id,
+      nodeId: node.nodeId,
       nodeName: node.name ?? '',
-      isLocal: (node.isLocal ?? node.is_local) === true,
+      isLocal: node.isLocal === true,
     });
     if (!outcome) return;
     // The node's own measurement after the repair replaces what the picker
     // was told before it.
-    node.supportsProcessSandbox = node.supports_process_sandbox = true;
-    node.processSandboxCause = node.process_sandbox_cause = null;
-    node.processSandboxReason = node.process_sandbox_reason = null;
+    node.supportsProcessSandbox = true;
+    node.processSandboxCause = null;
+    node.processSandboxReason = null;
     toast(I18n.t('sandbox_repair.done'), 'success');
     renderModes();
   });
@@ -1310,8 +1310,8 @@ function openWizard() {
     }
     if (wz.step === 2) {
       const node = nodeById(wz.nodeId);
-      if (wz.execMode === 'process_sandbox' && (node?.supportsProcessSandbox ?? node?.supports_process_sandbox) !== true) {
-        showError(processSandboxNote(node), String(node?.processSandboxReason ?? node?.process_sandbox_reason ?? ''));
+      if (wz.execMode === 'process_sandbox' && node?.supportsProcessSandbox !== true) {
+        showError(processSandboxNote(node), String(node?.processSandboxReason ?? ''));
         return;
       }
       if (wz.execMode === 'container' && !wz.containerImage.trim()) {
@@ -1320,7 +1320,7 @@ function openWizard() {
       }
       wz.step = 3; paintStep(); return;
     }
-    if (wz.repoKind === 'local' && (nodeById(wz.nodeId)?.supportsProcessSandbox ?? nodeById(wz.nodeId)?.supports_process_sandbox) !== true) { showError(processSandboxNote(nodeById(wz.nodeId))); return; }
+    if (wz.repoKind === 'local' && nodeById(wz.nodeId)?.supportsProcessSandbox !== true) { showError(processSandboxNote(nodeById(wz.nodeId))); return; }
     if (wz.repoKind === 'local' && !wz.localPath.trim()) { showError(t('local_path_required')); return; }
     if (wz.repoKind === 'local' && wz.execMode !== 'process_sandbox') { showError(t('local_process_required')); return; }
     if (wz.repoKind === 'git' && !wz.repoUrl.trim()) { showError(t('err_repo_url_required')); return; }
@@ -1342,7 +1342,7 @@ function openWizard() {
         indexEnabled: wz.indexEnabled,
         members: [],
       });
-      const id = String(created.workspaceId ?? created.workspace_id ?? '');
+      const id = String(created.workspaceId ?? '');
       cleanup();
       await refreshList();
       if (id) await goto(id, null);
@@ -1395,9 +1395,9 @@ function renderWorkspaceView() {
       <tf-button variant="ghost" icon="chevron-left" id="cs-back">${escapeHtml(t('back_to_list'))}</tf-button>
       <div>
         <h1>${escapeHtml(String(w.name ?? ''))}</h1>
-        <div class="sub">${escapeHtml(shortId(wsId(w)))} · ${escapeHtml(String(w.nodeName ?? w.node_name ?? ''))}</div>
+        <div class="sub">${escapeHtml(shortId(wsId(w)))} · ${escapeHtml(String(w.nodeName ?? ''))}</div>
       </div>
-      <span class="cs-chip ${native ? 'warn' : 'ok'}" title="${escapeAttr((w.execMode ?? w.exec_mode) === 'process_sandbox' ? t('mode_process_lead') : native ? t('mode_native_tooltip') : t('mode_container_tooltip'))}">
+      <span class="cs-chip ${native ? 'warn' : 'ok'}" title="${escapeAttr(w.execMode === 'process_sandbox' ? t('mode_process_lead') : native ? t('mode_native_tooltip') : t('mode_container_tooltip'))}">
         ${sprite(native ? 'alert' : 'shield')}${escapeHtml(modeChip(w).label)}
       </span>
       <span class="cs-chip">${escapeHtml(t(`status_${status}`))}</span>
@@ -1406,7 +1406,7 @@ function renderWorkspaceView() {
     </div>
 
     ${native ? `<div class="cs-warnbox">${sprite('alert')}<div><b>${escapeHtml(t('native_banner_title'))}</b> ${escapeHtml(t('native_banner_body'))}</div></div>` : ''}
-    ${status === 'error' ? `<div class="cs-warnbox danger cs-mt-10">${sprite('alert')}<div><b>${escapeHtml(t('prov_error_title'))}</b> ${escapeHtml(String(w.statusDetail ?? w.status_detail ?? ''))}</div></div>` : ''}
+    ${status === 'error' ? `<div class="cs-warnbox danger cs-mt-10">${sprite('alert')}<div><b>${escapeHtml(t('prov_error_title'))}</b> ${escapeHtml(String(w.statusDetail ?? ''))}</div></div>` : ''}
 
     <div id="cs-prov-section"></div>
 
@@ -1443,7 +1443,7 @@ function renderWorkspaceView() {
       <div class="cs-form-row">
         <div class="cs-field">
           <tf-input id="cs-set-branch" label="${escapeAttr(t('set_target_branch'))}"
-            value="${escapeAttr(String(w.targetBranch ?? w.target_branch ?? ''))}"
+            value="${escapeAttr(String(w.targetBranch ?? ''))}"
             hint="${escapeAttr(t('set_target_branch_hint'))}" ${manage ? '' : 'readonly'}></tf-input>
         </div>
         <div class="cs-field">
@@ -1473,7 +1473,7 @@ function renderWorkspaceView() {
             <div class="sub plain">${escapeHtml(t('index_desc'))}</div>
           </div>
           <span class="spacer"></span>
-          <tf-toggle id="cs-set-index" ${(w.indexEnabled ?? w.index_enabled) ? 'checked' : ''} ${manage ? '' : 'disabled'}></tf-toggle>
+          <tf-toggle id="cs-set-index" ${w.indexEnabled ? 'checked' : ''} ${manage ? '' : 'disabled'}></tf-toggle>
         </div>
       </div>
       <div class="cs-actions-right">
@@ -1487,8 +1487,8 @@ function renderWorkspaceView() {
       <div class="desc">${escapeHtml(t('creds_desc'))}</div>
       <div class="cs-readonly-field">
         <div>
-          <div class="lbl">${escapeHtml((w.hasSecret ?? w.has_secret) ? t('creds_has_secret') : t('creds_no_secret'))}</div>
-          <div class="why">${escapeHtml(String(w.repoUrl ?? w.repo_url ?? t('repo_none')))}</div>
+          <div class="lbl">${escapeHtml(w.hasSecret ? t('creds_has_secret') : t('creds_no_secret'))}</div>
+          <div class="why">${escapeHtml(String(w.repoUrl ?? t('repo_none')))}</div>
         </div>
       </div>
       <div class="cs-form-row cs-mt-12">
@@ -1587,20 +1587,20 @@ function fillSettingsSelects(w, native) {
     const modes = AUTONOMY_MODES.filter((m) => !(native && m === NATIVE_BLOCKED_AUTONOMY));
     autonomy.setOptions(
       modes.map((m) => ({ value: m, label: t(`autonomy.${m}`) })),
-      String(w.autonomyCeiling ?? w.autonomy_ceiling ?? 'normal'),
+      String(w.autonomyCeiling ?? 'normal'),
     );
   }
   if (egress) {
     const policies = EGRESS_POLICIES.filter((p) => !(native && p === NATIVE_BLOCKED_EGRESS));
     egress.setOptions(
       policies.map((p) => ({ value: p, label: t(`egress_${p}`) })),
-      String(w.egressPolicy ?? w.egress_policy ?? 'org_approved'),
+      String(w.egressPolicy ?? 'org_approved'),
     );
   }
   if (kind) {
     kind.setOptions(
       AUTH_KINDS.map((k) => ({ value: k, label: t(`auth_${k}`) })),
-      String(w.repoAuthKind ?? w.repo_auth_kind ?? 'none'),
+      String(w.repoAuthKind ?? 'none'),
     );
   }
 }
@@ -1689,17 +1689,17 @@ function renderSessions() {
     return;
   }
   host.innerHTML = state.sessions.map((s) => {
-    const id = String(s.sessionId ?? s.session_id ?? '');
+    const id = String(s.sessionId ?? '');
     const open = !['closed', 'failed', 'cancelled'].includes(String(s.status ?? ''));
     return `
       <div class="cs-row" data-session="${escapeAttr(id)}">
         <span class="cs-dot ${open ? 'run' : 'idle'}"></span>
         <div>
           <div class="nm">${escapeHtml(String(s.title ?? t('session_untitled')))}</div>
-          <div class="sub">${escapeHtml(String(s.branch ?? ''))} · ${escapeHtml(t(`autonomy.${s.autonomyMode ?? s.autonomy_mode ?? 'normal'}`))}</div>
+          <div class="sub">${escapeHtml(String(s.branch ?? ''))} · ${escapeHtml(t(`autonomy.${s.autonomyMode ?? 'normal'}`))}</div>
         </div>
         <span class="spacer"></span>
-        <span class="cs-chip">${escapeHtml(formatTimestamp(s.updatedAt ?? s.updated_at))}</span>
+        <span class="cs-chip">${escapeHtml(formatTimestamp(s.updatedAt))}</span>
         <tf-button variant="ghost" size="sm" data-open-session="${escapeAttr(id)}">${escapeHtml(t('session_open'))}</tf-button>
         ${open ? `<tf-button variant="ghost" size="sm" data-close-session="${escapeAttr(id)}">${escapeHtml(t('session_close'))}</tf-button>` : ''}
       </div>
@@ -1728,7 +1728,7 @@ function renderSessions() {
 async function openSessionDialog() {
   const w = state.workspace;
   if (!w || myRole(w) === 'viewer') return;
-  const ceiling = String(w.autonomyCeiling ?? w.autonomy_ceiling ?? 'normal');
+  const ceiling = String(w.autonomyCeiling ?? 'normal');
   const allowed = AUTONOMY_MODES.slice(0, AUTONOMY_MODES.indexOf(ceiling) + 1);
   const { body, foot, cleanup } = openWindow({ title: t('session_new'), icon: 'play', width: 480 });
   body.innerHTML = `
@@ -1742,7 +1742,7 @@ async function openSessionDialog() {
       </tf-select>
       <div class="cs-field-hint">${escapeHtml(t('session_autonomy_hint', { ceiling: t(`autonomy.${ceiling}`) }))}</div>
     </div>
-    <div class="cs-step-note">${escapeHtml(t((w.repoKind ?? w.repo_kind) === 'local' ? 'local_session_note' : 'session_branch_note'))}</div>
+    <div class="cs-step-note">${escapeHtml(t(w.repoKind === 'local' ? 'local_session_note' : 'session_branch_note'))}</div>
     <div class="cs-form-error" id="cs-sess-error" hidden></div>
   `;
   foot.innerHTML = `
@@ -1771,7 +1771,7 @@ async function openSessionDialog() {
       });
       const session = resp.session ?? {};
       cleanup();
-      await goto(wsId(w), String(session.sessionId ?? session.session_id ?? ''));
+      await goto(wsId(w), String(session.sessionId ?? ''));
     } catch (e) {
       err.hidden = false;
       err.textContent = describeError(e);
@@ -1793,13 +1793,13 @@ function renderMembers() {
     return;
   }
   host.innerHTML = state.members.map((m) => {
-    const userId = String(m.userId ?? m.user_id ?? '');
+    const userId = String(m.userId ?? '');
     const role = String(m.role ?? 'viewer');
     return `
       <div class="cs-row">
         <div>
-          <div class="nm">${escapeHtml(String(m.displayName ?? m.display_name ?? userId))}</div>
-          <div class="sub">${escapeHtml(shortId(userId))} · ${escapeHtml(formatTimestamp(m.addedAt ?? m.added_at))}</div>
+          <div class="nm">${escapeHtml(String(m.displayName ?? userId))}</div>
+          <div class="sub">${escapeHtml(shortId(userId))} · ${escapeHtml(formatTimestamp(m.addedAt))}</div>
         </div>
         <span class="spacer"></span>
         <tf-select data-member-role="${escapeAttr(userId)}" value="${escapeAttr(role)}" ${manage && role !== 'owner' ? '' : 'disabled'}>
@@ -1890,7 +1890,7 @@ function renderIndexStatus() {
   const host = byId('cs-index-list');
   if (!host) return;
   const w = state.workspace;
-  const enabled = !!(w?.indexEnabled ?? w?.index_enabled);
+  const enabled = !!w?.indexEnabled;
   const branches = Array.isArray(state.indexStatus?.branches) ? state.indexStatus.branches : [];
   if (!enabled) {
     host.innerHTML = `<div class="cs-field-hint">${escapeHtml(t('index_disabled'))}</div>`;
@@ -1910,7 +1910,7 @@ function renderIndexStatus() {
         <div class="cs-row">
           <div>
             <div class="nm">${escapeHtml(branch)}</div>
-            <div class="sub">${escapeHtml(String(b.state ?? b.status ?? ''))} · ${escapeHtml(formatTimestamp(b.updatedAt ?? b.updated_at))}</div>
+            <div class="sub">${escapeHtml(String(b.state ?? b.status ?? ''))} · ${escapeHtml(formatTimestamp(b.updatedAt))}</div>
           </div>
           <span class="spacer"></span>
           <tf-button variant="ghost" size="sm" data-index-rebuild="${escapeAttr(branch)}">${escapeHtml(t('index_rebuild'))}</tf-button>
@@ -2026,19 +2026,19 @@ function wireWorkspaceEvents(w) {
       host.innerHTML = `<div class="cs-field-hint">${escapeHtml(describeError(err))}</div>`;
       return;
     }
-    const known = new Set(state.members.map((m) => String(m.userId ?? m.user_id)));
-    const rows = users.filter((u) => !known.has(String(u.userId ?? u.user_id)));
+    const known = new Set(state.members.map((m) => String(m.userId)));
+    const rows = users.filter((u) => !known.has(String(u.userId)));
     host.hidden = false;
     if (!rows.length) {
       host.innerHTML = `<div class="cs-field-hint">${escapeHtml(t('member_no_candidates'))}</div>`;
       return;
     }
     host.replaceChildren(...rows.map((u) => {
-      const userId = String(u.userId ?? u.user_id ?? '');
+      const userId = String(u.userId ?? '');
       const row = document.createElement('tf-option-row');
       row.className = 'cs-candidate';
       row.value = userId;
-      row.label = String(u.displayName ?? u.display_name ?? userId);
+      row.label = String(u.displayName ?? userId);
       row.sub = String(u.email ?? shortId(userId));
       row.addEventListener('option-select', async (e) => {
         await setMemberRole(e.detail.value, String(byId('cs-member-role')?.value ?? 'editor'));
@@ -2099,12 +2099,12 @@ function workspaceDotClass(workspace) {
   if (status === 'error') return 'err';
   if (status === 'provisioning') return 'run';
   if (status === 'archived') return 'idle';
-  return Number(workspace.openSessions ?? workspace.open_sessions ?? 0) > 0 ? 'run' : 'idle';
+  return Number(workspace.openSessions ?? 0) > 0 ? 'run' : 'idle';
 }
 
 function workspaceMetaText(workspace) {
-  const node = String(workspace.nodeName ?? workspace.node_name ?? '');
-  const open = Number(workspace.openSessions ?? workspace.open_sessions ?? 0);
+  const node = String(workspace.nodeName ?? '');
+  const open = Number(workspace.openSessions ?? 0);
   const status = statusOf(workspace);
   if (status === 'error') return `${node} · ${t('status_error')}`;
   if (status === 'provisioning') return `${node} · ${t('status_provisioning')}`;
@@ -2229,7 +2229,7 @@ async function enterSession(workspaceId, sessionId) {
   renderWorkspaceBar();
 
   const session = state.sessions.find(
-    (s) => String(s.sessionId ?? s.session_id) === sessionId,
+    (s) => String(s.sessionId) === sessionId,
   ) ?? null;
   const mtop = byId('cs-mtop');
   if (mtop) {
@@ -2264,7 +2264,7 @@ async function enterSession(workspaceId, sessionId) {
   // Owner-node reachability is a projection over the live console, never a
   // stored status (§3.5, §19): the watcher owns the session stream, hands every
   // event to the console and draws G01 when the node stops answering.
-  const nodeId = String(state.workspace?.nodeId ?? state.workspace?.node_id ?? '');
+  const nodeId = String(state.workspace?.nodeId ?? '');
   attachConnection({
     workspaceId,
     sessionId,

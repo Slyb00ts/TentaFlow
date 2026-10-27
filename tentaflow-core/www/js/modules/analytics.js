@@ -243,7 +243,7 @@ function partialHint(missing, usageMissing = 0) {
   if (num(usageMissing) > 0) parts.push(T('usage_missing_note', { count: num(usageMissing) }));
   return parts.length ? ` · ${escapeHtml(parts.join(' · '))}` : '';
 }
-function usageMissing(r) { return num(r?.usageMissingCount ?? r?.usage_missing_count); }
+function usageMissing(r) { return num(r?.usageMissingCount); }
 function sumUsageMissing(rows) { return rows.reduce((s, r) => s + usageMissing(r), 0); }
 
 function numTitle(v) { return `title="${escapeAttr(exact(v))}"`; }
@@ -358,7 +358,7 @@ function tileClassFor(modelId) {
 const NO_ACCOUNT_KEY = '(no account)';
 function rowName(r) {
   if (String(r.key || '') === NO_ACCOUNT_KEY) return T('no_account');
-  return r.displayName || r.display_name || String(r.key || '');
+  return r.displayName || String(r.key || '');
 }
 function rowSub(r, kind) {
   if (kind === 'model') return r.displayName ? String(r.key) : '';
@@ -446,7 +446,7 @@ async function fetchSummary(groupBy, extra = {}) {
   const resp = await cached('modelMetricsSummaryRequest', payload);
   return {
     rows: Array.isArray(resp?.rows) ? resp.rows : [],
-    grandTotal: resp?.grandTotal ?? resp?.grand_total ?? null,
+    grandTotal: resp?.grandTotal ?? null,
   };
 }
 
@@ -496,23 +496,23 @@ async function loadSubjects() {
     ApiBinary.action('iamListGroupsRequest').then((r) => r?.groups ?? []).catch(() => []),
   ]);
   state.catalog = (Array.isArray(models) ? models : []).map((m) => ({
-    modelName: m.modelName || m.model_name || '',
-    nodeId: m.nodeId || m.node_id || '',
-    engineId: m.engineId || m.engine_id || '',
+    modelName: m.modelName || '',
+    nodeId: m.nodeId || '',
+    engineId: m.engineId || '',
     transport: m.transport || '',
-    endpointUrl: m.endpointUrl || m.endpoint_url || '',
+    endpointUrl: m.endpointUrl || '',
   }));
   const seen = new Map();
   for (const m of Array.isArray(models) ? models : []) {
-    const value = m.modelName || m.model_name || '';
+    const value = m.modelName || '';
     if (!value || seen.has(value)) continue;
-    seen.set(value, { value, label: m.displayName || m.display_name || value, engineId: m.engineId || m.engine_id || '', category: m.category || '' });
+    seen.set(value, { value, label: m.displayName || value, engineId: m.engineId || '', category: m.category || '' });
   }
   state.models = [...seen.values()].sort((a, b) => a.label.localeCompare(b.label));
   for (const m of state.models) tileClassFor(m.value);
   try {
     const c = await cached('tokenCoordinatorStatusRequest');
-    state.coordinatorId = c?.coordinatorNodeId ?? c?.coordinator_node_id ?? null;
+    state.coordinatorId = c?.coordinatorNodeId ?? null;
   } catch {
     state.coordinatorId = null;
   }
@@ -1656,10 +1656,10 @@ async function renderDrill(panel, seq) {
 // ---------------------------------------------------------------------------
 
 function quotaStatus(q) {
-  const used = num(q.usedTokens ?? q.used_tokens);
-  const max = num(q.maxTotalTokens ?? q.max_total_tokens);
+  const used = num(q.usedTokens);
+  const max = num(q.maxTotalTokens);
   const ratio = max > 0 ? used / max : 0;
-  const active = !!(q.isActive ?? q.is_active);
+  const active = !!(q.isActive);
   if (!active) return { ratio, tone: 'ok', chip: chip('neutral', T('quota_disabled')) };
   if (ratio >= 0.95) return { ratio, tone: 'err', chip: chip('err', T('quota_alarm', { pct: pct(ratio, 0) })) };
   if (ratio >= 0.75) return { ratio, tone: 'warn', chip: chip('warn', T('quota_near')) };
@@ -1667,13 +1667,13 @@ function quotaStatus(q) {
 }
 
 function quotaSubjectCell(q) {
-  const scope = q.scopeType ?? q.scope_type;
+  const scope = q.scopeType;
   if (scope === 'org') return `<div class="tf-table__cell-title"><b>${escapeHtml(T('whole_org'))}</b></div>`;
   if (scope === 'model') return '<div class="tf-table__cell-title">—</div>';
-  const name = q.subjectDisplayName ?? q.subject_display_name;
-  const id = q.subjectId ?? q.subject_id ?? '';
-  let sub = q.subjectSubtitle ?? q.subject_subtitle ?? '';
-  const members = q.subjectMemberCount ?? q.subject_member_count;
+  const name = q.subjectDisplayName;
+  const id = q.subjectId ?? '';
+  let sub = q.subjectSubtitle ?? '';
+  const members = q.subjectMemberCount;
   if (scope === 'group' && members != null) sub = T('members_count', { count: num(members) });
   return entCell({ title: name || subjectLabel(scope, id), sub, mono: scope !== 'group' });
 }
@@ -1694,12 +1694,12 @@ function subjectLabel(scopeType, subjectId) {
 
 // Readable scope of a quota: "Marketing · miesięczny · Qwen 3.8 27B AWQ".
 function quotaLabel(q) {
-  const scope = q.scopeType ?? q.scope_type;
+  const scope = q.scopeType;
   const period = q.period === 'monthly' ? T('period_monthly_adj') : T('period_daily_adj');
-  const model = (q.modelDisplayName ?? q.model_display_name) || ((q.modelId ?? q.model_id) ? modelName(q.modelId ?? q.model_id) : '');
+  const model = (q.modelDisplayName) || ((q.modelId) ? modelName(q.modelId) : '');
   let who = T(`scope_${scope}`);
-  if (scope === 'user' || scope === 'group') who = (q.subjectDisplayName ?? q.subject_display_name) || subjectLabel(scope, q.subjectId ?? q.subject_id);
-  else if (scope === 'model') return `${model || modelName(q.subjectId ?? q.subject_id)} · ${period}`;
+  if (scope === 'user' || scope === 'group') who = (q.subjectDisplayName) || subjectLabel(scope, q.subjectId);
+  else if (scope === 'model') return `${model || modelName(q.subjectId)} · ${period}`;
   return [who, period, model].filter(Boolean).join(' · ');
 }
 
@@ -1732,7 +1732,7 @@ async function renderLimits(panel, seq) {
   let quotas = Array.isArray(qResp?.quotas) ? qResp.quotas : [];
   const all = quotas;
   if (state.limitsPeriod) quotas = quotas.filter((q) => q.period === state.limitsPeriod);
-  if (state.limitsScope) quotas = quotas.filter((q) => (q.scopeType ?? q.scope_type) === state.limitsScope);
+  if (state.limitsScope) quotas = quotas.filter((q) => (q.scopeType) === state.limitsScope);
   const byId2 = new Map(all.map((q) => [q.id, q]));
 
   const qTable = byId('an-quotas-table');
@@ -1752,29 +1752,29 @@ async function renderLimits(panel, seq) {
     };
   }
   setRows('an-quotas-table', quotas.map((q, i) => {
-    const scope = q.scopeType ?? q.scope_type ?? '';
-    const active = !!(q.isActive ?? q.is_active);
+    const scope = q.scopeType ?? '';
+    const active = !!(q.isActive);
     const st = quotaStatus(q);
-    const used = num(q.usedTokens ?? q.used_tokens);
-    const max = num(q.maxTotalTokens ?? q.max_total_tokens);
+    const used = num(q.usedTokens);
+    const max = num(q.maxTotalTokens);
     // A model-scoped quota carries the model as its subject.
-    const modelId = (q.modelId ?? q.model_id) || (scope === 'model' ? (q.subjectId ?? q.subject_id) : null);
+    const modelId = (q.modelId) || (scope === 'model' ? (q.subjectId) : null);
     const dim = active ? '' : ' tf-table__dim';
     return {
       _q: q,
       scope: `<span class="${dim}">${chip(active ? 'accent' : 'neutral', T(`scope_${scope}`))}</span>`,
       subject: `<div class="${dim}">${quotaSubjectCell(q)}</div>`,
-      model: `<div class="tf-table__cell-title${dim}"><b>${escapeHtml(modelId ? ((q.modelDisplayName ?? q.model_display_name) || modelName(modelId)) : T('all_models_short'))}</b></div>`,
+      model: `<div class="tf-table__cell-title${dim}"><b>${escapeHtml(modelId ? ((q.modelDisplayName) || modelName(modelId)) : T('all_models_short'))}</b></div>`,
       period: q.period === 'monthly' ? T('period_monthly_adj') : T('period_daily_adj'),
       usage: `<div class="tf-table__share${dim}"><div class="tf-table__bar tf-table__bar--thick"><i class="tf-table__bar-fill tf-table__bar-fill--${st.tone}" style="width:${(Math.min(1, st.ratio) * 100).toFixed(1)}%;animation-delay:${(i * 0.08).toFixed(2)}s"></i></div><span class="tf-table__share-nums" title="${escapeAttr(`${exact(used)} / ${exact(max)}`)}">${escapeHtml(`${compact(used)} / ${compact(max)} · ${pct(st.ratio, 0)}`)}</span></div>`,
       status: `<span class="${dim}">${st.chip}</span>`,
     };
   }), T('no_quotas'));
-  const activeCount = quotas.filter((q) => q.isActive ?? q.is_active).length;
+  const activeCount = quotas.filter((q) => q.isActive).length;
   setFoot('an-quotas-card', escapeHtml(`${T('quotas_count', { count: quotas.length })} · ${T('active_count', { count: activeCount })}`), escapeHtml(T('quotas_foot')));
 
-  const coordId = cResp?.coordinatorNodeId ?? cResp?.coordinator_node_id ?? null;
-  const coordName = cResp?.coordinatorDisplayName ?? cResp?.coordinator_display_name ?? null;
+  const coordId = cResp?.coordinatorNodeId ?? null;
+  const coordName = cResp?.coordinatorDisplayName ?? null;
   const leases = Array.isArray(cResp?.leases) ? cResp.leases : [];
   const chips = byId('an-coord-chips');
   if (chips) {
@@ -1785,22 +1785,22 @@ async function renderLimits(panel, seq) {
   }
   const nowTs = Date.now();
   const isExpired = (l) => {
-    const ts = new Date(l.expiresAt ?? l.expires_at ?? 0).getTime();
+    const ts = new Date(l.expiresAt ?? 0).getTime();
     return Number.isFinite(ts) && ts < nowTs;
   };
   setRows('an-leases-table', leases.map((l) => {
-    const qid = l.quotaId ?? l.quota_id ?? '';
+    const qid = l.quotaId ?? '';
     const q = byId2.get(qid);
-    const nodeId = l.nodeId ?? l.node_id ?? '';
+    const nodeId = l.nodeId ?? '';
     const expired = isExpired(l);
     const dim = expired ? ' tf-table__dim' : '';
-    const expiresAt = l.expiresAt ?? l.expires_at;
+    const expiresAt = l.expiresAt;
     return {
-      quota: `<div class="${dim}">${entCell({ title: q ? quotaLabel(q) : T('quota_unknown', { id: String(qid).slice(-6) }), sub: q && (q.scopeType ?? q.scope_type) !== 'org' ? T(`scope_${q.scopeType ?? q.scope_type}`) : '' })}</div>`,
-      node: `<div class="${dim}">${nodeCell(nodeId, l.nodeDisplayName ?? l.node_display_name, l.nodeLastSeenAt ?? l.node_last_seen_at, true)}</div>`,
-      period: l.periodKey ?? l.period_key ?? '',
-      base: `<span class="${dim}">${compactCell(l.baseUsed ?? l.base_used)}</span>`,
-      granted: `<span class="${dim}">${compactCell(l.grantedTokens ?? l.granted_tokens)}</span>`,
+      quota: `<div class="${dim}">${entCell({ title: q ? quotaLabel(q) : T('quota_unknown', { id: String(qid).slice(-6) }), sub: q && (q.scopeType) !== 'org' ? T(`scope_${q.scopeType}`) : '' })}</div>`,
+      node: `<div class="${dim}">${nodeCell(nodeId, l.nodeDisplayName, l.nodeLastSeenAt, true)}</div>`,
+      period: l.periodKey ?? '',
+      base: `<span class="${dim}">${compactCell(l.baseUsed)}</span>`,
+      granted: `<span class="${dim}">${compactCell(l.grantedTokens)}</span>`,
       expires: expired ? T('lease_expired_rel', { rel: relTime(expiresAt) }) : relTime(expiresAt),
     };
   }), T('no_leases'));
@@ -1808,7 +1808,7 @@ async function renderLimits(panel, seq) {
 
   state.exportCsv = () => downloadCsv('analytics-quotas.csv',
     [T('col_scope'), T('col_subject'), T('col_model'), T('col_period'), T('col_used'), T('col_limit'), T('col_status')],
-    quotas.map((q) => [q.scopeType ?? q.scope_type, (q.subjectDisplayName ?? q.subject_display_name) || (q.subjectId ?? q.subject_id) || '', (q.modelId ?? q.model_id) || '', q.period, num(q.usedTokens ?? q.used_tokens), num(q.maxTotalTokens ?? q.max_total_tokens), (q.isActive ?? q.is_active) ? T('quota_active') : T('quota_disabled')]));
+    quotas.map((q) => [q.scopeType, (q.subjectDisplayName) || (q.subjectId) || '', (q.modelId) || '', q.period, num(q.usedTokens), num(q.maxTotalTokens), (q.isActive) ? T('quota_active') : T('quota_disabled')]));
 }
 
 // Quota editor modal (create / edit / delete).
@@ -1816,12 +1816,12 @@ function openQuotaEditor(quota) {
   const isEdit = !!quota;
   const editor = {
     id: quota?.id ?? null,
-    scopeType: quota?.scopeType ?? quota?.scope_type ?? 'user',
-    subjectId: quota?.subjectId ?? quota?.subject_id ?? '',
-    modelId: quota?.modelId ?? quota?.model_id ?? '',
+    scopeType: quota?.scopeType ?? 'user',
+    subjectId: quota?.subjectId ?? '',
+    modelId: quota?.modelId ?? '',
     period: quota?.period ?? 'daily',
-    maxTokens: num(quota?.maxTotalTokens ?? quota?.max_total_tokens),
-    isActive: quota ? !!(quota.isActive ?? quota.is_active) : true,
+    maxTokens: num(quota?.maxTotalTokens),
+    isActive: quota ? !!(quota.isActive) : true,
   };
 
   const body = document.createElement('div');
@@ -1930,7 +1930,7 @@ function maxTokensHint(v, quota = null) {
   const n = num(v);
   const parts = [n > 0 ? T('approx_tokens', { value: compact(n) }) : T('max_tokens_hint')];
   if (quota) {
-    const used = num(quota.usedTokens ?? quota.used_tokens);
+    const used = num(quota.usedTokens);
     const ratio = n > 0 ? used / n : 0;
     parts.push(T('usage_current_period', { value: compact(used), pct: pct(ratio, 0) }));
   }
@@ -2092,7 +2092,7 @@ function renderPricing(pricing, modelRows) {
   if (!table) return;
   // Every model seen in the period is editable, even without a pricing row yet.
   const ids = new Map();
-  for (const p of pricing) ids.set(p.modelId ?? p.model_id, p);
+  for (const p of pricing) ids.set(p.modelId, p);
   for (const r of modelRows) if (!ids.has(String(r.key))) ids.set(String(r.key), null);
   const list = [...ids.entries()];
   // Rates that do not apply to a modality (audio for an LLM, tokens/images for
@@ -2122,11 +2122,11 @@ function renderPricing(pricing, modelRows) {
       _missing: missing,
       _class: missing ? 'tf-table__warn-row' : '',
       model: `<div class="tf-table__cell-title"><b>${escapeHtml(name)}</b>${missing ? ` ${chip('warn', T('missing_pricing'))}` : ''}</div>${name !== modelId ? `<div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(modelId)}</div>` : ''}`,
-      prompt: priceInput(modelId, 'prompt', p?.promptPer1k ?? p?.prompt_per_1k),
-      completion: priceInput(modelId, 'completion', p?.completionPer1k ?? p?.completion_per_1k),
-      audio: priceInput(modelId, 'audio', p?.audioPerMin ?? p?.audio_per_min),
-      image: priceInput(modelId, 'image', p?.imageEach ?? p?.image_each),
-      embedding: priceInput(modelId, 'embedding', p?.embeddingPer1k ?? p?.embedding_per_1k),
+      prompt: priceInput(modelId, 'prompt', p?.promptPer1k),
+      completion: priceInput(modelId, 'completion', p?.completionPer1k),
+      audio: priceInput(modelId, 'audio', p?.audioPerMin),
+      image: priceInput(modelId, 'image', p?.imageEach),
+      embedding: priceInput(modelId, 'embedding', p?.embeddingPer1k),
     };
   }), T('no_pricing'));
   setFoot('an-pricing-card', escapeHtml(T('models_in_catalog', { count: list.length })), escapeHtml(T('pricing_formula')));

@@ -179,7 +179,7 @@ export function openDeployProgressModal({ deployId, engineId, deployMethod }) {
   }
 
   function onChunk(chunk) {
-    if (!chunk || chunk.variant !== 'DeploymentStreamChunk') return;
+    if (!chunk || chunk._variant !== 'DeploymentBody.StreamChunk') return;
     if (chunk.deployId && chunk.deployId !== deployId) return;
     lastChunkAt = Date.now();
     resubscribeAttempt = 0;
@@ -215,7 +215,7 @@ export function openDeployProgressModal({ deployId, engineId, deployMethod }) {
    */
   function onEnd(endBody) {
     unsubscribe = null;
-    if (endBody && endBody.variant === 'DeploymentStreamEnd') {
+    if (endBody && endBody._variant === 'DeploymentBody.StreamEnd') {
       finish({
         status: endBody.finalStatus || 'ended',
         errorMessage: endBody.errorMessage,

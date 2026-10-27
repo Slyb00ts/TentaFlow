@@ -102,6 +102,21 @@ function requireInstanceId(instanceId) {
   return instanceId;
 }
 
+// `MessageBody::BusBody` wraps every answer in `BusEnvelope { instanceId,
+// payload: BusPayload }`; the payload is an externally tagged enum, so the
+// answer's fields sit under its variant name (`TopicListResponse`) and a
+// field-less answer arrives as the bare variant string. Callers get the
+// variant's own fields. A different variant than the request's counterpart
+// is a protocol fault, never a silent empty answer.
+async function busCall(kind, request, options) {
+  const body = await ApiBinary.action(kind, request, options);
+  const variant = kind.slice('bus'.length).replace(/Request$/, 'Response');
+  if (body.payload === variant) return {};
+  const reply = body.payload?.[variant];
+  if (reply === undefined) throw new Error(`protocol error in ${kind}: unexpected bus reply`);
+  return reply;
+}
+
 // Looks up one topic's row in `BusStatsSnapshotWire.topics` by name — `null`
 // when the snapshot has not loaded yet or predates this topic (a brand-new
 // topic can lag one poll behind `topics[]`, tor U task 3).
@@ -187,23 +202,15 @@ function mapBusErrorMessage(message, translate) {
 // but erring the opposite direction on failure).
 const NO_CAPABILITIES = { canRead: false, canWrite: false, canAdmin: false, isSiteAdmin: false, orgId: '', orgName: null };
 
-// `ApiBinary.one('busCapabilitiesRequest')` resolves to the raw dispatch
-// body, which is an ENVELOPE, not the capabilities object itself:
-// `{ variant: 'BusCapabilitiesResponse', capabilities: { canRead, canWrite,
-// canAdmin, isSiteAdmin } }` (`tentaflow-protocol-wasm/src/lib.rs`'s
-// `decode_bus_payload` for `BP::CapabilitiesResponse`, mirroring
-// `tentaflow-protocol/src/bus.rs`'s `BusPayload::CapabilitiesResponse {
-// capabilities: BusCapabilitiesWire }`). Reading the envelope flat (the
-// earlier bug) always yields `undefined` for every field, so every
-// `canAdmin()`/`isSiteAdmin()` check fails closed — hiding "Nowy topik",
-// edit/delete and moving leadership for EVERY
-// user including a site admin. This also accepts an already-flat shape
-// (`{ canRead, ... }` with no `.capabilities`) so a future wire
-// simplification degrades to "read the fields" instead of re-introducing
-// the same silent all-hidden failure. `isSiteAdmin` is still decoded here —
-// the wire field has not been retired — and gates only the keys of outside
-// systems on a topic's Dostęp: issuing, changing and revoking a key is the
-// server administrator's (see `canAdmin` for everything else).
+// `busCall('busCapabilitiesRequest')` resolves to `{ capabilities: { canRead,
+// canWrite, canAdmin, isSiteAdmin, ... } }` (`BusPayload::CapabilitiesResponse
+// { capabilities: BusCapabilitiesWire }`), not to the capabilities object
+// itself. Reading it flat yields `undefined` for every field, so every
+// `canAdmin()`/`isSiteAdmin()` check fails closed and hides "Nowy topik",
+// edit/delete and moving leadership for EVERY user including a site admin.
+// `isSiteAdmin` gates only the keys of outside systems on a topic's Dostęp:
+// issuing, changing and revoking a key is the server administrator's (see
+// `canAdmin` for everything else).
 function unwrapCapabilities(resp) {
   if (resp && typeof resp === 'object') {
     if (resp.capabilities && typeof resp.capabilities === 'object') return resp.capabilities;
@@ -399,10 +406,10 @@ async function fetchTentaBusInstances() {
     return [];
   }
   return (Array.isArray(apps) ? apps : [])
-    .filter((a) => (a.packageId ?? a.package_id) === PACKAGE_ID)
+    .filter((a) => a.packageId === PACKAGE_ID)
     .map((a) => ({
-      addonId: String(a.addonId ?? a.addon_id ?? ''),
-      title: String((a.titleKey && I18n.t(a.titleKey)) || a.title || a.addonId || a.addon_id || ''),
+      addonId: String(a.addonId ?? ''),
+      title: String((a.titleKey && I18n.t(a.titleKey)) || a.title || a.addonId || ''),
       enabled: a.enabled !== false,
     }))
     .filter((a) => a.addonId);
@@ -507,7 +514,7 @@ const TentaBusScreen = {
     state.tab = route.tab;
 
     try {
-      state.capabilities = unwrapCapabilities(await ApiBinary.one('busCapabilitiesRequest', { instanceId: requireInstanceId(state.instanceId) }));
+      state.capabilities = unwrapCapabilities(await busCall('busCapabilitiesRequest', { instanceId: requireInstanceId(state.instanceId) }));
     } catch {
       state.capabilities = NO_CAPABILITIES;
     }
@@ -773,7 +780,7 @@ async function loadSubjects() {
   const turn = ++subjectsTurn;
   const current = () => state.instanceId === instanceId && subjectsTurn === turn;
   try {
-    const subjects = await ApiBinary.list('busSchemaSubjectListRequest', { arrayKey: 'subjects', payload: { instanceId: requireInstanceId(instanceId) } });
+    const subjects = (await busCall('busSchemaSubjectListRequest', { instanceId: requireInstanceId(instanceId) })).subjects;
     if (!current()) return;
     state.shell.subjects = subjects || [];
     state.shell.subjectsError = null;
@@ -947,7 +954,7 @@ async function refreshStats() {
   const instanceId = state.instanceId;
   if (!instanceId) return;
   try {
-    const stats = await ApiBinary.one('busStatsSnapshotRequest', { instanceId: requireInstanceId(instanceId) });
+    const { snapshot: stats } = await busCall('busStatsSnapshotRequest', { instanceId: requireInstanceId(instanceId) });
     if (state.instanceId !== instanceId) return;
     state.stats = stats;
     state.shell.statsAt = Date.now();
@@ -999,7 +1006,7 @@ async function refreshLagSeries(instanceId) {
   const now = Date.now();
   const flagged = (state.stats?.groups || []).filter((g) => isLagging(g, now));
   const next = new Map();
-  await Promise.all(flagged.map((g) => ApiBinary.one('busLagHistoryRequest', {
+  await Promise.all(flagged.map((g) => busCall('busLagHistoryRequest', {
     instanceId: requireInstanceId(instanceId), group: g.group, topic: g.topic, sinceMs: now - 10 * 60_000,
   }).then((r) => {
     const series = (r?.groups || []).find((x) => x.group === g.group && x.topic === g.topic);
@@ -1013,12 +1020,12 @@ async function refreshReplicas() {
   if (!instanceId || !state.topicsLoaded) return;
   let all;
   try {
-    all = await ApiBinary.one('busReplicaListRequest', buildReplicaListRequest(instanceId, ''));
+    all = await busCall('busReplicaListRequest', buildReplicaListRequest(instanceId, ''));
   } catch {
     return;
   }
   const names = state.topics.map((t) => t.name);
-  const perTopic = await Promise.all(names.map((topic) => ApiBinary.one('busReplicaListRequest', buildReplicaListRequest(instanceId, topic))
+  const perTopic = await Promise.all(names.map((topic) => busCall('busReplicaListRequest', buildReplicaListRequest(instanceId, topic))
     .then((r) => ({ topic, partitions: r?.partitions || [] }), () => ({ topic, partitions: [] }))));
   if (state.instanceId !== instanceId) return;
   const nodes = all?.nodes || [];
@@ -1058,7 +1065,7 @@ async function loadTopics() {
   try {
     // The broker's own `__*` topics (unprocessed-message stores, metrics) are
     // never shown as topics: every list, count and picker reads this one.
-    const topics = userTopics(await ApiBinary.list('busTopicListRequest', { arrayKey: 'topics', payload: { instanceId: requireInstanceId(instanceId) } }));
+    const topics = userTopics((await busCall('busTopicListRequest', { instanceId: requireInstanceId(instanceId) })).topics);
     if (state.instanceId !== instanceId) return;
     state.topics = topics;
     state.topicsError = null;
@@ -1117,7 +1124,7 @@ function openCreator() {
       return state.shell.subjects || [];
     },
     existingNames: state.topics.map((t) => t.name),
-    create: (request) => ApiBinary.action('busTopicCreateRequest', request),
+    create: (request) => busCall('busTopicCreateRequest', request),
     describeError: describeBusError,
     onCreated: async ({ name, schemaId, plan }) => {
       if (state.instanceId !== instanceId) return;
@@ -1138,8 +1145,8 @@ function openTopicPreview(name) {
     instanceId: requireInstanceId(instanceId),
     topic: name,
     partitionCount: topic?.partitions ?? state.detail?.topic?.partitions ?? 1,
-    browse: (request) => ApiBinary.one('busMessagesBrowseRequest', request),
-    loadPartitions: async () => (await ApiBinary.one('busTopicDetailRequest', { instanceId, name }))?.partitions || [],
+    browse: async (request) => (await busCall('busMessagesBrowseRequest', request)).result,
+    loadPartitions: async () => (await busCall('busTopicDetailRequest', { instanceId, name }))?.partitions || [],
     describeError: describeBusError,
   });
 }
@@ -1155,15 +1162,15 @@ function openTopicDeleteWindow(name) {
     consumers,
     loadCounts: async () => {
       const [acl, policies] = await Promise.allSettled([
-        ApiBinary.one('busAclListRequest', { instanceId, topic: name }),
-        ApiBinary.one('busFieldPolicyListRequest', { instanceId, topic: name }),
+        busCall('busAclListRequest', { instanceId, topic: name }),
+        busCall('busFieldPolicyListRequest', { instanceId, topic: name }),
       ]);
       return {
         aclCount: acl.status === 'fulfilled' ? (acl.value?.entries || []).length : null,
         policyCount: policies.status === 'fulfilled' ? (policies.value?.policies || []).length : null,
       };
     },
-    remove: () => ApiBinary.action('busTopicDeleteRequest', { instanceId: requireInstanceId(instanceId), name }),
+    remove: () => busCall('busTopicDeleteRequest', { instanceId: requireInstanceId(instanceId), name }),
     describeError: describeBusError,
     onDeleted: async () => {
       if (state.instanceId !== instanceId) return;
@@ -1218,7 +1225,7 @@ function closeTopicDetail() {
 // A failed reload keeps the page it already shows (the header says the data
 // is old); only a topic never loaded, or one deleted since, shows the failure.
 const loadTopicDetail = topicDetailLoader({
-  fetch: (instanceId, name) => ApiBinary.one('busTopicDetailRequest', { instanceId: requireInstanceId(instanceId), name }),
+  fetch: (instanceId, name) => busCall('busTopicDetailRequest', { instanceId: requireInstanceId(instanceId), name }),
   context: () => ({ instanceId: state.instanceId, name: state.view?.name }),
   apply({ detail, error }) {
     if (!error) {
@@ -1256,7 +1263,7 @@ async function loadSchemaProblem(topic) {
   state.schemaCheck = { topic: topic.name, key: sameTopic ? state.schemaCheck.key : null, problem: sameTopic ? state.schemaCheck.problem : null };
   if (!topic.schemaId) return;
   try {
-    const got = await ApiBinary.one('busSchemaGetRequest', { instanceId: requireInstanceId(instanceId), subject: topic.schemaId });
+    const got = await busCall('busSchemaGetRequest', { instanceId: requireInstanceId(instanceId), subject: topic.schemaId });
     if (state.instanceId !== instanceId || state.schemaCheck.topic !== topic.name) return;
     // The version read, not the one the list promised, names what was judged; the kind comes from the list as it
     // stands now (the answer carries none).
@@ -1344,7 +1351,7 @@ function openTopicSettings(name, card) {
   openSettingsWindow(card, {
     instanceId: requireInstanceId(instanceId),
     view: { ...detailContext.view(), topic: detail.topic, partitions: detail.partitions || [] },
-    update: (request) => ApiBinary.action('busTopicUpdateRequest', request),
+    update: (request) => busCall('busTopicUpdateRequest', request),
     describeError: describeBusError,
     onSaved: async (notice) => {
       if (state.instanceId !== instanceId || state.view?.name !== name) return;
@@ -1384,7 +1391,7 @@ async function loadTopicAccess(name) {
   const current = () => accessTurn === turn && state.instanceId === instanceId && state.view?.name === name;
   const siteAdmin = state.capabilities?.isSiteAdmin === true;
   const [acl, keys] = await Promise.allSettled([
-    ApiBinary.one('busAclListRequest', { instanceId: requireInstanceId(instanceId), topic: name }),
+    busCall('busAclListRequest', { instanceId: requireInstanceId(instanceId), topic: name }),
     siteAdmin ? fetchKeys() : Promise.resolve(null),
   ]);
   if (!current()) return;
@@ -1428,8 +1435,8 @@ function openAccessWindow(name, action) {
     instanceId: where.instanceId,
     topic: name,
     rows,
-    directory: ({ kind, query }) => ApiBinary.one('busSubjectDirectoryRequest', { instanceId: where.instanceId, kind, query }),
-    setAcl: reloadAfter((request) => ApiBinary.action('busAclSetRequest', request)),
+    directory: ({ kind, query }) => busCall('busSubjectDirectoryRequest', { instanceId: where.instanceId, kind, query }),
+    setAcl: reloadAfter((request) => busCall('busAclSetRequest', request)),
     describeError: describeBusError,
     onSaved,
   };
@@ -1490,7 +1497,7 @@ async function fetchFieldSchema(instanceId, topic) {
   let schemaType = null;
   try {
     const subjects = state.shell.subjects
-      || await ApiBinary.list('busSchemaSubjectListRequest', { arrayKey: 'subjects', payload: { instanceId } });
+      || (await busCall('busSchemaSubjectListRequest', { instanceId })).subjects;
     schemaType = (subjects || []).find((s) => s.subject === topic.schemaId)?.schemaType ?? null;
   } catch {
     // The server still refuses a rule it cannot apply.
@@ -1498,7 +1505,7 @@ async function fetchFieldSchema(instanceId, topic) {
   if (schemaKind(schemaType) === 'binary') return { subject: topic.schemaId, schemaType };
   if (topicFormat(topic.contentType) !== 'json') return null;
   try {
-    const got = await ApiBinary.one('busSchemaGetRequest', { instanceId, subject: topic.schemaId });
+    const got = await busCall('busSchemaGetRequest', { instanceId, subject: topic.schemaId });
     return { subject: topic.schemaId, schemaType, version: got?.schema?.version ?? null, text: got?.schemaText ?? '' };
   } catch {
     return { failed: true };
@@ -1516,7 +1523,7 @@ async function loadTopicHiding(name) {
   const kept = state.hiding.topic === name && state.hiding.schemaSettled && state.hiding.schemaFor === schemaFor;
   const iid = requireInstanceId(instanceId);
   const [policies, schema] = await Promise.allSettled([
-    ApiBinary.one('busFieldPolicyListRequest', { instanceId: iid, topic: name }),
+    busCall('busFieldPolicyListRequest', { instanceId: iid, topic: name }),
     kept ? Promise.resolve(state.hiding.schema) : fetchFieldSchema(iid, topic),
   ]);
   if (!current()) return;
@@ -1543,7 +1550,7 @@ function openHidingWindow(name, action) {
   const format = topicFormat(detail.topic.contentType);
   const source = fieldSource({ format, schema: hiding.schema });
   const still = () => state.instanceId === instanceId && state.view?.name === name;
-  const directory = ({ kind, query }) => ApiBinary.one('busSubjectDirectoryRequest', { instanceId, kind, query });
+  const directory = ({ kind, query }) => busCall('busSubjectDirectoryRequest', { instanceId, kind, query });
   if (action.kind === 'hiding-preview') {
     if (!detail.access.canRead || source.mode === 'blocked') return;
     openHidingPreview({
@@ -1552,8 +1559,8 @@ function openHidingWindow(name, action) {
       partitionCount: detail.topic.partitions ?? 1,
       source,
       directory,
-      loadPartitions: async () => (await ApiBinary.one('busTopicDetailRequest', { instanceId, name }))?.partitions || [],
-      preview: (request) => ApiBinary.one('busFieldPolicyPreviewRequest', request),
+      loadPartitions: async () => (await busCall('busTopicDetailRequest', { instanceId, name }))?.partitions || [],
+      preview: (request) => busCall('busFieldPolicyPreviewRequest', request),
       describeError: describeBusError,
     });
     return;
@@ -1576,8 +1583,8 @@ function openHidingWindow(name, action) {
     source,
     rules,
     directory,
-    setPolicy: reloadAfter((request) => ApiBinary.action('busFieldPolicySetRequest', request)),
-    deleteRule: reloadAfter((request) => ApiBinary.action('busFieldPolicyDeleteRequest', request)),
+    setPolicy: reloadAfter((request) => busCall('busFieldPolicySetRequest', request)),
+    deleteRule: reloadAfter((request) => busCall('busFieldPolicyDeleteRequest', request)),
     describeError: describeBusError,
     onSaved: async (notice) => {
       if (!still()) return;
@@ -1608,7 +1615,7 @@ function openPartitionTransfer(topic, partition, from) {
     topic,
     partition,
     choices: transferChoices(replica, state.shell.nodes || []),
-    transfer: (target) => ApiBinary.action('busLeaderTransferRequest', buildLeaderTransferRequest(instanceId, topic, partition, target)),
+    transfer: (target) => busCall('busLeaderTransferRequest', buildLeaderTransferRequest(instanceId, topic, partition, target)),
     describeError: describeBusError,
     onDone: async ({ label }) => {
       if (state.instanceId !== instanceId) return;
@@ -1660,7 +1667,7 @@ const replicationContext = {
 async function loadGroups() {
   const instanceId = state.instanceId;
   try {
-    const groups = await ApiBinary.list('busGroupListRequest', { arrayKey: 'groups', payload: { instanceId: requireInstanceId(instanceId) } });
+    const groups = (await busCall('busGroupListRequest', { instanceId: requireInstanceId(instanceId) })).groups;
     if (state.instanceId !== instanceId) return;
     state.groups = (groups || []).filter((g) => !isInternalGroupId(g.group));
     state.groupsError = null;
@@ -1730,8 +1737,8 @@ let consumerDlqDue = true;
 async function fetchConsumer(instanceId, group, topic) {
   const iid = requireInstanceId(instanceId);
   const [groupResp, topicDetail] = await Promise.all([
-    ApiBinary.one('busGroupDetailRequest', { instanceId: iid, group, topic }),
-    ApiBinary.one('busTopicDetailRequest', { instanceId: iid, name: topic }).catch(() => null),
+    busCall('busGroupDetailRequest', { instanceId: iid, group, topic }),
+    busCall('busTopicDetailRequest', { instanceId: iid, name: topic }).catch(() => null),
   ]);
   const nowMs = Date.now();
   const readDlq = consumerDlqDue || !state.consumer?.dlq;
@@ -1739,14 +1746,14 @@ async function fetchConsumer(instanceId, group, topic) {
   const [dlqResp, history] = await Promise.allSettled([
     !readDlq ? Promise.resolve(null)
       : topicDetail?.access?.canRead
-      ? ApiBinary.one('busDlqListRequest', { instanceId: iid, sourceTopic: topic, limit: UNPROCESSED_PAGE, newestFirst: true })
+      ? busCall('busDlqListRequest', { instanceId: iid, sourceTopic: topic, limit: UNPROCESSED_PAGE, newestFirst: true })
       : Promise.reject(new Error('no read access')),
-    ApiBinary.one('busLagHistoryRequest', { instanceId: iid, group, topic, sinceMs: nowMs - 10 * 60_000 }),
+    busCall('busLagHistoryRequest', { instanceId: iid, group, topic, sinceMs: nowMs - 10 * 60_000 }),
   ]);
   let dlq = null;
   if (!readDlq) dlq = state.consumer?.dlq ?? null;
   else if (dlqResp.status === 'fulfilled') {
-    dlq = consumerDlq({ records: dlqResp.value?.records, hasMore: dlqResp.value?.hasMore, group, nowMs });
+    dlq = consumerDlq({ records: dlqResp.value?.result?.records, hasMore: dlqResp.value?.result?.hasMore, group, nowMs });
   } else if (busErrorCode(dlqResp.reason?.message) === 'topic_not_found') {
     // The topic has never had an unprocessed message: nothing is this consumer's.
     dlq = consumerDlq({ records: [], hasMore: false, group, nowMs });
@@ -1834,7 +1841,7 @@ async function toggleConsumerPause(group, topic, pause) {
   state.consumerBusy = true;
   renderPanel();
   try {
-    await ApiBinary.action(pause ? 'busGroupPauseRequest' : 'busGroupResumeRequest', { instanceId: requireInstanceId(instanceId), group, topic });
+    await busCall(pause ? 'busGroupPauseRequest' : 'busGroupResumeRequest', { instanceId: requireInstanceId(instanceId), group, topic });
   } catch (err) {
     state.consumerBusy = false;
     if (state.instanceId !== instanceId) return;
@@ -1882,8 +1889,8 @@ function openConsumerMove(partition) {
     partition,
     paused: live ? Boolean(live.paused) : Boolean(data.detail.paused),
     replicated: (Number(data.topicDetail.topic?.replicationFactor) || 1) > 1,
-    resolveTimestamp: async (p, tsMs) => (await ApiBinary.one('busOffsetForTimestampRequest', { instanceId: requireInstanceId(instanceId), topic, partition: p, tsMs }))?.offset,
-    move: async (req) => (await ApiBinary.action('busOffsetResetRequest', {
+    resolveTimestamp: async (p, tsMs) => (await busCall('busOffsetForTimestampRequest', { instanceId: requireInstanceId(instanceId), topic, partition: p, tsMs }))?.offset,
+    move: async (req) => (await busCall('busOffsetResetRequest', {
       instanceId: requireInstanceId(instanceId), group, topic, partition: req.partition, mode: req.mode, offset: req.offset, tsMs: req.tsMs,
     }))?.newOffset,
     describeError: describeBusError,
@@ -1945,7 +1952,7 @@ async function fetchUnprocessedTopic(topic, { more = false }) {
   const fromOffsets = more && prev ? buildFromOffsetsForNextPage(prev.partitions) : [];
   let entry;
   try {
-    const resp = await ApiBinary.one('busDlqListRequest', {
+    const { result: resp } = await busCall('busDlqListRequest', {
       instanceId: requireInstanceId(instanceId),
       sourceTopic: topic,
       limit: UNPROCESSED_PAGE,
@@ -1969,7 +1976,7 @@ async function fetchUnprocessedTopic(topic, { more = false }) {
 async function loadUnprocessedAccess(topic) {
   const instanceId = state.instanceId;
   try {
-    const d = await ApiBinary.one('busTopicDetailRequest', { instanceId: requireInstanceId(instanceId), name: topic });
+    const d = await busCall('busTopicDetailRequest', { instanceId: requireInstanceId(instanceId), name: topic });
     if (state.instanceId !== instanceId) return;
     state.unprocessed.access.set(topic, {
       canAdmin: d?.access?.canAdmin === true,
@@ -2118,7 +2125,7 @@ function openUnprocessedWindow(kind, topic, key) {
       consumers,
       maxAttempts,
       nowMs,
-      retry: async () => Number((await ApiBinary.action('busDlqRetryRequest', coords))?.accepted),
+      retry: async () => Number((await busCall('busDlqRetryRequest', coords))?.accepted),
       describeError: describeBusError,
       describeDetail: describeBusDetail,
       onDone: (accepted) => afterUnprocessedChange(topic, surface, accepted === 0
@@ -2129,7 +2136,7 @@ function openUnprocessedWindow(kind, topic, key) {
     openDiscardOne({
       rec,
       topic,
-      discard: () => ApiBinary.action('busDlqDiscardRequest', coords),
+      discard: () => busCall('busDlqDiscardRequest', coords),
       describeError: describeBusError,
       onDone: () => afterUnprocessedChange(topic, surface, { tone: 'success', title: T('unprocessed.discard.done_title'), text: T('unprocessed.discard.done_text', { what }) }),
     });
@@ -2151,7 +2158,7 @@ function openUnprocessedRetryAll(topic, from) {
     plan,
     consumers,
     maxAttempts: unprocessedMaxAttempts(topic),
-    retryAll: () => ApiBinary.action('busDlqRetryAllRequest', { instanceId: requireInstanceId(instanceId), sourceTopic: topic, maxRecords: plan.batch }, { timeoutMs: RETRY_ALL_TIMEOUT_MS }),
+    retryAll: () => busCall('busDlqRetryAllRequest', { instanceId: requireInstanceId(instanceId), sourceTopic: topic, maxRecords: plan.batch }, { timeoutMs: RETRY_ALL_TIMEOUT_MS }),
     describeError: describeBusError,
     describeDetail: describeBusDetail,
     onDone: (resp) => {
@@ -2223,8 +2230,8 @@ const loadSchemaPage = topicDetailLoader({
     const iid = requireInstanceId(instanceId);
     const selected = state.schema.selected;
     const [list, got] = await Promise.all([
-      ApiBinary.one('busSchemaVersionListRequest', { instanceId: iid, subject: name }),
-      ApiBinary.one('busSchemaGetRequest', { instanceId: iid, subject: name, version: selected ?? undefined })
+      busCall('busSchemaVersionListRequest', { instanceId: iid, subject: name }),
+      busCall('busSchemaGetRequest', { instanceId: iid, subject: name, version: selected ?? undefined })
         .then((r) => ({ version: r?.schema?.version ?? selected, text: r?.schemaText ?? '', error: null }), (error) => ({ version: selected, text: null, error })),
     ]);
     return { versions: list?.versions || [], shown: got, selected };
@@ -2253,7 +2260,7 @@ async function showSchemaVersion(version) {
   renderPanel();
   let shown;
   try {
-    const r = await ApiBinary.one('busSchemaGetRequest', { instanceId: requireInstanceId(instanceId), subject: name, version: version ?? undefined });
+    const r = await busCall('busSchemaGetRequest', { instanceId: requireInstanceId(instanceId), subject: name, version: version ?? undefined });
     shown = { version: r?.schema?.version ?? version, text: r?.schemaText ?? '', error: null };
   } catch (error) {
     shown = { version, text: null, error };
@@ -2347,7 +2354,7 @@ function openSchemaAddWindow() {
     instanceId: requireInstanceId(instanceId),
     schemaTypes: state.capabilities?.schemaTypes || [],
     existingNames: () => (state.shell.subjects || []).map((s) => s.subject),
-    register: (request) => ApiBinary.action('busSchemaRegisterRequest', request),
+    register: (request) => busCall('busSchemaRegisterRequest', request),
     describeError: describeBusError,
     onAdded: async (added) => {
       if (state.instanceId !== instanceId) return;
@@ -2370,7 +2377,7 @@ function openSchemaAddWindow() {
 async function loadRulesOfTopics(instanceId, topics) {
   const iid = requireInstanceId(instanceId);
   const answers = await Promise.allSettled((topics || []).map(async (topic) => {
-    const got = await ApiBinary.one('busFieldPolicyListRequest', { instanceId: iid, topic });
+    const got = await busCall('busFieldPolicyListRequest', { instanceId: iid, topic });
     return (got?.policies || []).map((p) => ({
       topic, subjectType: p.subjectType, subjectId: p.subjectId, direction: p.direction, fields: p.fields || [], requiredFields: p.requiredFields || [],
     }));
@@ -2389,7 +2396,7 @@ async function openNewVersionWindow(name) {
   if (latestText == null && info.latestVersion != null) {
     newVersionOpening = true;
     try {
-      latestText = (await ApiBinary.one('busSchemaGetRequest', { instanceId: requireInstanceId(instanceId), subject: name, version: info.latestVersion }))?.schemaText ?? null;
+      latestText = (await busCall('busSchemaGetRequest', { instanceId: requireInstanceId(instanceId), subject: name, version: info.latestVersion }))?.schemaText ?? null;
     } catch (err) {
       // Without the newest text the window would start empty and compare with nothing.
       toast(`${T('schemas.version.load_failed', { version: fmtCount(info.latestVersion) })} ${describeBusError(err)}`, 'error');
@@ -2404,7 +2411,7 @@ async function openNewVersionWindow(name) {
     subject: info,
     latestText,
     draftText: state.schemaDrafts.get(name) ?? null,
-    register: (request) => ApiBinary.action('busSchemaRegisterRequest', request),
+    register: (request) => busCall('busSchemaRegisterRequest', request),
     describeError: describeBusError,
     loadRules: () => loadRulesOfTopics(instanceId, info.usedByTopics),
     renameRules: async (renames) => {
@@ -2414,7 +2421,7 @@ async function openNewVersionWindow(name) {
         for (const rule of await loadRulesOfTopics(instanceId, info.usedByTopics)) {
           const request = renamedRuleRequest(iid, rule, renames);
           if (!request) continue;
-          await ApiBinary.action('busFieldPolicySetRequest', request);
+          await busCall('busFieldPolicySetRequest', request);
           changed += 1;
         }
         return changed;
@@ -2470,7 +2477,7 @@ function openSchemaCompatWindow(name) {
   openSchemaCompat({
     instanceId: requireInstanceId(instanceId),
     subject: info,
-    setCompatibility: (request) => ApiBinary.action('busSchemaCompatibilitySetRequest', request),
+    setCompatibility: (request) => busCall('busSchemaCompatibilitySetRequest', request),
     describeError: describeBusError,
     onSaved: (compatibility) => {
       if (state.instanceId !== instanceId) return;
@@ -2487,7 +2494,7 @@ function openSchemaWithdrawWindow(name) {
     instanceId: requireInstanceId(instanceId),
     subject: info,
     versions: state.schema.versions,
-    remove: (request) => ApiBinary.action('busSchemaDeleteRequest', request),
+    remove: (request) => busCall('busSchemaDeleteRequest', request),
     describeError: describeBusError,
     onDone: () => {
       state.schemaDrafts.delete(name);
@@ -2508,7 +2515,7 @@ function openVersionWithdrawWindow(name, version) {
     subject: info,
     version: row.version,
     versions,
-    remove: (request) => ApiBinary.action('busSchemaDeleteRequest', request),
+    remove: (request) => busCall('busSchemaDeleteRequest', request),
     describeError: describeBusError,
     onDone: () => {
       if (state.instanceId !== instanceId) return;
@@ -2526,7 +2533,7 @@ function openSchemaDeleteWindow(name) {
   openSchemaDelete({
     instanceId: requireInstanceId(instanceId),
     subject: info,
-    remove: (request) => ApiBinary.action('busSchemaDeleteRequest', request),
+    remove: (request) => busCall('busSchemaDeleteRequest', request),
     describeError: describeBusError,
     onDeleted: async () => {
       state.schemaDrafts.delete(name);

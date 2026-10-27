@@ -110,7 +110,7 @@ async function loadAll() {
       clusterData = null;
     }
     const nodesArr = Array.isArray(nodes) ? nodes : [];
-    nodesById = new Map(nodesArr.map(n => [n.node_id || n.id, n]));
+    nodesById = new Map(nodesArr.map(n => [n.nodeId, n]));
     unifiedModels = Array.isArray(unified) ? unified : [];
   } catch (err) {
     // zostaw stary stan, rerender pokaze ostatnie dane
@@ -194,7 +194,7 @@ function renderDetail() {
   }
 
   const nameEl = byId('cd-name');
-  if (nameEl) nameEl.textContent = c.name || c.id || c.cluster_id || '—';
+  if (nameEl) nameEl.textContent = c.name || c.id || '—';
   const statusEl = byId('cd-status');
   if (statusEl) statusEl.innerHTML = statusChip;
 
@@ -330,13 +330,13 @@ function renderNodeMini(member) {
   const online = memberOnline(member);
   const status = online ? 'online' : 'offline';
 
-  const cpuPct = live ? pctOr(live.cpu_usage ?? live.cpu_usage_percent) : null;
-  const ram = live && live.ram_total_mb
-    ? Math.round(((live.ram_used_mb || 0) / live.ram_total_mb) * 100)
+  const cpuPct = live ? pctOr(live.cpuUsagePercent) : null;
+  const ram = live && live.ramTotalMb
+    ? Math.round(((live.ramUsedMb || 0) / live.ramTotalMb) * 100)
     : null;
   const gpus = live && Array.isArray(live.gpus) ? live.gpus : [];
-  const vramUsed = gpus.reduce((s, g) => s + (g.vram_used_mb || 0), 0);
-  const vramTotal = gpus.reduce((s, g) => s + (g.vram_total_mb || 0), 0);
+  const vramUsed = gpus.reduce((s, g) => s + (g.vramUsedMb || 0), 0);
+  const vramTotal = gpus.reduce((s, g) => s + (g.vramTotalMb || 0), 0);
   const vramPct = vramTotal > 0 ? Math.round((vramUsed / vramTotal) * 100) : null;
 
   const asg = findAssignment(member.node_id);
@@ -388,14 +388,14 @@ function renderRdmaSummary(member) {
 /// IPv4. Karty RDMA na gorze — to one daja RoCE, reszta to fallback ethernet.
 function interconnectCandidates(nodeId) {
   const node = nodesById.get(nodeId);
-  const ifaces = (node && (node.networkInterfaces || node.network_interfaces)) || [];
+  const ifaces = (node && node.networkInterfaces) || [];
   return ifaces
-    .filter(i => (i.linkUp ?? i.link_up) && (i.ipv4Address || i.ipv4_address))
+    .filter(i => i.linkUp && i.ipv4Address)
     .map(i => ({
       name: i.name,
-      ip: i.ipv4Address || i.ipv4_address,
-      speed: i.speedMbps || i.speed_mbps || 0,
-      rdma: !!(i.rdmaAvailable ?? i.rdma_available),
+      ip: i.ipv4Address,
+      speed: i.speedMbps || 0,
+      rdma: !!i.rdmaAvailable,
     }))
     .sort((a, b) => (b.rdma - a.rdma) || (b.speed - a.speed) || a.name.localeCompare(b.name));
 }
@@ -544,11 +544,11 @@ function resolveLineStyle(probe, memberA, memberB) {
 function renderSummaryColumn(cluster, members) {
   const n = members.length;
   const onlineCnt = members.filter(m => memberOnline(m)).length;
-  const totalCpu = members.reduce((s, m) => s + (m.live?.cpu_count || 0), 0);
-  const totalRam = members.reduce((s, m) => s + (m.live?.ram_total_mb || 0), 0);
+  const totalCpu = members.reduce((s, m) => s + (m.live?.cpuCount || 0), 0);
+  const totalRam = members.reduce((s, m) => s + (m.live?.ramTotalMb || 0), 0);
   const totalVram = members.reduce((s, m) => {
     const g = Array.isArray(m.live?.gpus) ? m.live.gpus : [];
-    return s + g.reduce((x, gg) => x + (gg.vram_total_mb || 0), 0);
+    return s + g.reduce((x, gg) => x + (gg.vramTotalMb || 0), 0);
   }, 0);
 
   const rows = [
@@ -695,16 +695,16 @@ async function startClusterProbe() {
           // Pola End sa NOWE — starsze serwery (lub niezaktualizowany dekoder)
           // ich nie wysylaja, wiec czytamy defensywnie i pomijamy gdy brak.
           if (end && typeof end === 'object') {
-            const bn = end.bottleneckMbps ?? end.bottleneck_mbps;
+            const bn = end.bottleneckMbps;
             probeBottleneckMbps = (bn != null) ? bn : null;
-            probeAssignmentStatus = end.assignmentStatus ?? end.assignment_status ?? null;
+            probeAssignmentStatus = end.assignmentStatus ?? null;
             const asg = end.assignments;
             probeAssignments = Array.isArray(asg) ? asg.map(a => ({
-              node_id: a.nodeId ?? a.node_id ?? '',
-              interface_name: a.interfaceName ?? a.interface_name ?? '',
-              interface_ip: a.interfaceIp ?? a.interface_ip ?? '',
-              interface_speed_mbps: a.interfaceSpeedMbps ?? a.interface_speed_mbps ?? 0,
-              interface_type: a.interfaceType ?? a.interface_type ?? '',
+              node_id: a.nodeId ?? '',
+              interface_name: a.interfaceName ?? '',
+              interface_ip: a.interfaceIp ?? '',
+              interface_speed_mbps: a.interfaceSpeedMbps ?? 0,
+              interface_type: a.interfaceType ?? '',
             })) : [];
           }
           renderDetail();
@@ -807,9 +807,9 @@ function renderRdmaConfig(members) {
   const fromMembers = members
     .map(m => ({
       hostname: m.hostname,
-      rdmaDevices: m.rdmaDevices ?? m.rdma_devices ?? '',
-      rdmaIp: m.rdmaIp ?? m.rdma_ip ?? '',
-      rdmaSocketIfname: m.rdmaSocketIfname ?? m.rdma_socket_ifname ?? '',
+      rdmaDevices: m.rdma_devices ?? '',
+      rdmaIp: m.rdma_ip ?? '',
+      rdmaSocketIfname: m.rdma_socket_ifname ?? '',
     }))
     .filter(m => m.rdmaDevices || m.rdmaIp);
 
@@ -1009,8 +1009,8 @@ async function stopClusterDeploy() {
 
 function renderRouting(cluster) {
   const strategy = String(cluster.strategy || 'distributed');
-  const failoverEnabled = !!(cluster.failoverEnabled ?? cluster.failover_enabled);
-  const failoverTarget = cluster.failoverTarget || cluster.failover_target || '';
+  const failoverEnabled = !!cluster.failoverEnabled;
+  const failoverTarget = cluster.failoverTarget || '';
 
   return `
     <div class="cluster-routing-section">
@@ -1062,12 +1062,12 @@ function renderSharedModels(members) {
   const memberIds = new Set(members.map(m => m.node_id));
   const uniq = new Map();
   for (const entry of unifiedModels) {
-    const kindWrapper = entry && entry.kind;
-    if (!kindWrapper || kindWrapper.kind !== 'service_model') continue;
+    const serviceModel = entry && entry.kind && entry.kind.ServiceModel;
+    if (!serviceModel) continue;
     const alias = entry.id;
     if (!alias) continue;
-    const instances = Array.isArray(kindWrapper.instances) ? kindWrapper.instances : [];
-    const localInstances = instances.filter(i => memberIds.has(i.nodeId || i.node_id));
+    const instances = Array.isArray(serviceModel.instances) ? serviceModel.instances : [];
+    const localInstances = instances.filter(i => memberIds.has(i.nodeId));
     if (localInstances.length === 0) continue;
     const surfaces = Array.isArray(entry.serviceSurfaces) ? entry.serviceSurfaces : [];
     const kindLabel = surfaces[0] || 'service';
@@ -1101,24 +1101,23 @@ function renderSharedModels(members) {
 // ---- Helpers -------------------------------------------------------------
 
 function resolveMembers(cluster) {
-  const raw = cluster.members || cluster.nodes || [];
+  const raw = cluster.members || [];
   return raw.map(m => {
-    // Akceptujemy zarowno camelCase (binary) jak i snake_case (legacy).
-    const nodeId = m.nodeId || m.node_id || m.id;
+    const nodeId = m.nodeId;
     const live = nodesById.get(nodeId);
     return {
       node_id: nodeId,
       role: m.role || 'worker',
-      hostname: (live && live.hostname) || m.hostname || m.node_name || nodeId,
-      status: m.status || m.member_status || '',
-      interface_type: m.interfaceType || m.interface_type || '',
-      interface_speed_mbps: m.interfaceSpeedMbps || m.interface_speed_mbps || 0,
-      rdma_ip: m.rdmaIp || m.rdma_ip || '',
-      rdma_devices: m.rdmaDevices || m.rdma_devices || '',
-      rdma_socket_ifname: m.rdmaSocketIfname || m.rdma_socket_ifname || '',
-      interface_name: m.interfaceName || m.interface_name || '',
-      interface_ip: m.interfaceIp || m.interface_ip || '',
-      rdma_gid_index: m.rdmaGidIndex ?? m.rdma_gid_index ?? null,
+      hostname: (live && live.hostname) || m.hostname || nodeId,
+      status: m.status || '',
+      interface_type: m.interfaceType || '',
+      interface_speed_mbps: m.interfaceSpeedMbps || 0,
+      rdma_ip: m.rdmaIp || '',
+      rdma_devices: m.rdmaDevices || '',
+      rdma_socket_ifname: m.rdmaSocketIfname || '',
+      interface_name: m.interfaceName || '',
+      interface_ip: m.interfaceIp || '',
+      rdma_gid_index: m.rdmaGidIndex ?? null,
       live,
     };
   });

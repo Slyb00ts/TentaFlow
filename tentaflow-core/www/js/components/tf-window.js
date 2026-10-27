@@ -91,6 +91,7 @@ class TfWindow extends HTMLElement {
     this._onPointerDownFront = this._onPointerDownFront.bind(this);
     this._onViewportResize = this._onViewportResize.bind(this);
     this._onWinResize = this._onWinResize.bind(this);
+    this._onOpenAnimEnd = this._onOpenAnimEnd.bind(this);
     this._onKeyDown = this._onKeyDown.bind(this);
   }
 
@@ -111,7 +112,7 @@ class TfWindow extends HTMLElement {
     this._bringToFront();
     // animacja otwarcia
     this._win.classList.add('tf-window-opening');
-    this._win.addEventListener('animationend', this._onOpenAnimEnd, { once: true });
+    this._win.addEventListener('animationend', this._onOpenAnimEnd);
     Sfx.play('window-open');
 
     // Observe inner-size changes (content fills in, body loads async, etc.)
@@ -397,6 +398,14 @@ class TfWindow extends HTMLElement {
       const top = Math.max(pad, Math.floor((window.innerHeight - h) / 2));
       this._win.style.top = `${top}px`;
     }
+  }
+
+  // Animations of descendants bubble up here too; only the window's own entry
+  // animation ends the opening state.
+  _onOpenAnimEnd(e) {
+    if (e.target !== this._win) return;
+    this._win.classList.remove('tf-window-opening');
+    this._win.removeEventListener('animationend', this._onOpenAnimEnd);
   }
 
   _onWinResize() {

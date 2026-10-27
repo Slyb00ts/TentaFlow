@@ -92,45 +92,45 @@ function stubTransport(fixtures) {
 }
 
 const SITE = {
-  site_id: 'site-1',
+  siteId: 'site-1',
   name: 'Hala B',
   description: 'magazyn wysokiego składowania',
   address: 'ul. Przykładowa 4',
   lat: 52.1,
   lon: 21.0,
   alt: 110,
-  scene_count: 1,
-  devices_online: 2,
-  last_update_ms: 1_750_000_000_000,
-  created_by: 'admin',
-  created_at_ms: 1_749_000_000_000,
-  updated_at_ms: 1_750_000_000_000,
+  sceneCount: 1,
+  devicesOnline: 2,
+  lastUpdateMs: 1_750_000_000_000,
+  createdBy: 'admin',
+  createdAtMs: 1_749_000_000_000,
+  updatedAtMs: 1_750_000_000_000,
 };
 
 const SCENE = {
-  scene_id: 'scene-1',
-  site_id: 'site-1',
+  sceneId: 'scene-1',
+  siteId: 'site-1',
   name: 'Parter',
-  voxel_res_m: 0.05,
-  owner_node_id: 'node-local',
-  owner_epoch: 3,
-  geo_lat: null,
-  geo_lon: null,
-  geo_alt: null,
-  geo_heading: null,
-  max_voxels: 0,
+  voxelResM: 0.05,
+  ownerNodeId: 'node-local',
+  ownerEpoch: 3,
+  geoLat: null,
+  geoLon: null,
+  geoAlt: null,
+  geoHeading: null,
+  maxVoxels: 0,
   voxels: 1_200_000,
   chunks: 418,
-  last_update_ms: 1_750_000_000_000,
-  owner_online: true,
-  replica_state: 'in_sync',
+  lastUpdateMs: 1_750_000_000_000,
+  ownerOnline: true,
+  replicaState: 'in_sync',
 };
 
 const ALL_PERMS = ['map.read', 'map.write', 'map.admin'];
 
 const fixtures = (over = {}) => ({
-  meshNodeListRequest: { nodes: [{ node_id: 'node-local', hostname: 'helios', is_local: true }] },
-  mapSiteListRequest: { sites: [SITE], my_permissions: ALL_PERMS },
+  meshNodeListRequest: { nodes: [{ nodeId: 'node-local', hostname: 'helios', isLocal: true }] },
+  mapSiteListRequest: { sites: [SITE], myPermissions: ALL_PERMS },
   mapSceneListRequest: { scenes: [SCENE] },
   mapDeviceListRequest: { devices: [] },
   ...over,
@@ -166,7 +166,7 @@ test('the site list is drawn from what the wire returned', async () => {
 });
 
 test('map.admin in the reply is what puts the create button on screen', async () => {
-  await mountScreen({ mapSiteListRequest: { sites: [], my_permissions: ALL_PERMS } });
+  await mountScreen({ mapSiteListRequest: { sites: [], myPermissions: ALL_PERMS } });
 
   assert.ok(document.getElementById('maps-new'), 'the toolbar offers a new location');
   assert.ok(document.getElementById('maps-empty-new'), 'and so does the empty state');
@@ -178,7 +178,7 @@ test('map.admin in the reply is what puts the create button on screen', async ()
 });
 
 test('a viewer gets no create button and is told who can add a location', async () => {
-  await mountScreen({ mapSiteListRequest: { sites: [], my_permissions: ['map.read'] } });
+  await mountScreen({ mapSiteListRequest: { sites: [], myPermissions: ['map.read'] } });
 
   assert.equal(document.getElementById('maps-new'), null, 'no create button without map.admin');
   assert.equal(document.getElementById('maps-empty-new'), null, 'and none inside the empty state');

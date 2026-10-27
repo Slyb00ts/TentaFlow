@@ -25,7 +25,7 @@
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { Router } from '/js/router.js';
-import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast, uuidFromBytes } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import {
   T, sprite, chooseEntryLab, errMessage, has, isSolo, labIsReady, nodeStateLabel,
@@ -146,7 +146,8 @@ const TentaQuantScreen = {
 
     try {
       const me = await ApiBinary.one('authMeRequest');
-      this.userId = me?.userId ?? me?.user_id ?? '';
+      // `userId` is 16 raw bytes on the wire; runs and projects name their owner by UUID text.
+      this.userId = me?.userId ? uuidFromBytes(me.userId) : '';
     } catch {
       this.userId = '';
     }
@@ -362,7 +363,7 @@ const TentaQuantScreen = {
   /// "Otwórz w notatniku" on a run that came from one: the notebook the run was
   /// started in, with the project tabs back on screen.
   async openNotebookForRun(run) {
-    const notebookId = run && (run.notebookId ?? run.notebook_id);
+    const notebookId = run && run.notebookId;
     if (!notebookId) return;
     this.disposeRunView();
     this.resultRunId = null;

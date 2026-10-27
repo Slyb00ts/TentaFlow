@@ -408,7 +408,7 @@ function radToDeg(v) {
 
 function actionRisk(a) { return String(a.risk || 'medium').toLowerCase(); }
 function actionAcrobatic(a) { return !!a.acrobatic; }
-function actionReadOnly(a) { return !!(a.readOnly ?? a.read_only); }
+function actionReadOnly(a) { return !!a.readOnly; }
 function actionParams(a) { return Array.isArray(a.params) ? a.params : []; }
 // Union of the advertised risk and the authoritative known-dangerous set: an
 // advertised-low kind that is in KNOWN_HIGH_RISK_KINDS is STILL high-risk. Never
@@ -1310,7 +1310,7 @@ function updateDetailHeader(shell, r) {
       `${live.lastPointCount} pkt · ${timing.decodeMs.toFixed(1)} ms`);
   } else {
     const l = lidar(r);
-    const pts = l ? Number(l.pointCount ?? l.point_count ?? 0) : 0;
+    const pts = l ? Number(l.pointCount ?? 0) : 0;
     setDkpi(shell, 'lidar', l ? (lidarEnabled(r) ? '…' : 'wył.') : '—');
     setDkpi(shell, 'lidar-sub', l && pts > 0 ? `${pts} pkt` : (l ? 'oczekiwanie' : 'brak'));
   }
@@ -1786,7 +1786,7 @@ function updateLidarTile(host, r) {
   const offline = !isControllable(r.status || '');
   const enabled = lidarEnabled(r);
   const available = enabled && !!l.available;
-  const snapshotPoints = Number(l.pointCount ?? l.point_count ?? 0);
+  const snapshotPoints = Number(l.pointCount ?? 0);
   const resolution = l.resolution;
 
   const toggle = host.querySelector('[data-lidar-toggle]');
@@ -1895,8 +1895,8 @@ function applyRobotPose(id) {
   const r = findRobot(id);
   const t = r ? telemetry(r) : null;
   if (!t) return;
-  const p = t.posePosition ?? t.pose_position;
-  const q = t.poseOrientation ?? t.pose_orientation;
+  const p = t.posePosition;
+  const q = t.poseOrientation;
   if (!Array.isArray(p) || p.length < 3) return;
   const o = Array.isArray(q) && q.length >= 4 ? q : [0, 0, 0, 1];
   try { voxelView.setRobotPose(p[0], p[1], p[2], o[0], o[1], o[2], o[3]); } catch { /* ignore */ }
@@ -2485,7 +2485,7 @@ function telemetryRows(r) {
     if (imuTemp != null) rows.push(kvRow('Temp. IMU', `${imuTemp.toFixed(0)} °C`));
   }
 
-  const foot = Array.isArray(t.footForce ?? t.foot_force) ? t.footForce ?? t.foot_force : [];
+  const foot = Array.isArray(t.footForce) ? t.footForce : [];
   if (foot.length) {
     const vals = foot.map((f) => (Number.isFinite(Number(f)) ? Math.round(Number(f)) : '—'));
     rows.push(kvRow('Siły stóp (FL/FR/RL/RR)', vals.join('  ·  ')));
@@ -2724,7 +2724,7 @@ function openSceneSubscription(id, live) {
 // map with the authoritative deduplicated set (server is the source of truth).
 function onSceneChunk(id, live, body) {
   if (!body || typeof body !== 'object') return;
-  if (body.variant !== 'StreamFrame') return;
+  if (body._variant !== 'StreamBody.Frame') return;
   const data = body.data;
   if (!(data instanceof Uint8Array) || data.byteLength === 0) return;
   if (lidarLive.get(id) !== live || !live.lidarOn) return;
@@ -2746,7 +2746,7 @@ function onSceneChunk(id, live, body) {
 // rendered as the overlay layer (renderOverlay → setOverlayPoints).
 function onDepthSceneChunk(id, live, body) {
   if (!body || typeof body !== 'object') return;
-  if (body.variant !== 'StreamFrame') return;
+  if (body._variant !== 'StreamBody.Frame') return;
   const data = body.data;
   if (!(data instanceof Uint8Array) || data.byteLength === 0) return;
   if (lidarLive.get(id) !== live) return;
@@ -2958,7 +2958,7 @@ function decodeFrameAsync(streamKey, data, cb) {
 // refresh the open LiDAR status in place.
 function onLidarChunk(id, live, body) {
   if (!body || typeof body !== 'object') return;
-  if (body.variant !== 'StreamFrame') return;
+  if (body._variant !== 'StreamBody.Frame') return;
   const data = body.data;
   if (!(data instanceof Uint8Array) || data.byteLength === 0) return;
   if (lidarLive.get(id) !== live || !live.lidarOn) return;
@@ -2979,8 +2979,8 @@ function onLidarDecoded(id, live, f, tOnChunk, arrivalMs, intervalMs) {
   const cutoff = live.lastFrameAtMs - LIDAR_FPS_WINDOW_MS;
   while (live.frameTimes.length && live.frameTimes[0] < cutoff) live.frameTimes.shift();
 
-  const stampUs = Number(f.timestampUs ?? f.timestamp_us ?? 0);
-  const hostSendUs = Number(f.hostSendUs ?? f.host_send_us ?? 0);
+  const stampUs = Number(f.timestampUs ?? 0);
+  const hostSendUs = Number(f.hostSendUs ?? 0);
   const tDone = Date.now() * 1000;
   const plausible = (ms) => ms != null && ms >= 0 && ms <= LIDAR_E2E_MAX_MS;
   let hostMs = null;

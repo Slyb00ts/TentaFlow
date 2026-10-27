@@ -323,6 +323,23 @@ headers (HSTS unconditional). Production TLS 1.3 only, AEAD ciphers only.
 NEVER enable `RUST_LOG=hyper=debug` in production without a query-string scrubber — HMAC
 tokens in `/recordings/<ref>?token=...` URLs would leak to logs via the request line.
 
+## Browser protocol codec
+
+`tentaflow-codec-core` (pure Rust, no `js_sys`) owns the wire rules; `tentaflow-protocol-wasm` is a thin
+wasm-bindgen layer over it. The wasm links NO typed `Deserialize` of protocol types: `build.rs` of the
+codec crate derives a wire schema with `syn` from `tentaflow-protocol/src`, and one generic decoder
+(`decodeMessageBody`) and encoder (`encodeBody`, `encodeBodyWithBytes`) are driven by it. Requests are
+assembled in JS (`www/js/protocol/requests.js`, one function per request, called by `codec.js`); binary
+arguments travel as the `{"$bytes": n}` placeholder. Schema field flags: `REQUIRED`, `NULL_WHEN_ABSENT`,
+`KEEP_NULL` (`Option<Option<T>>` and `deserialize_with` fields keep an explicit null on the wire).
+
+Decoded body contract: `body._variant` is the wire tag path (`ServiceBody.ReqOauthStart`); struct fields
+sit on the object as camelCase of the Rust name (no snake_case twin); keys of maps and of
+`serde_json::Value` are never converted; non-struct content is under `body.value`; u64/i64 are Numbers up
+to 2^53-1, BigInt beyond; byte strings are `Uint8Array`. A new protocol variant needs no wasm change,
+only a `requests.js` entry. `codec-core` has a differential test (typed `from_value` == schema decode for
+every `MessageBody` leaf); `scripts/check-wasm-size.sh` enforces the size budget in CI.
+
 ## Flow engine
 
 `tentaflow-core/src/flow_engine/`. DAG of typed nodes; `FlowEnvelope` carries a `FlowValue`
@@ -347,6 +364,12 @@ The only active sync path is `sync/ledger` + `sync/runtime`; wire is binary CBOR
 nodes receive which resources. Startup runs `ensure_default_core_sync_policies` +
 `ensure_trusted_nodes_in_sync_identity` so Flow Builder, shared settings, identity and RBAC
 reach the outbox without hand-seeding policies.
+Ledger pending work is indexed, not scanned: `FjallStore` keeps an in-memory FIFO index of unacknowledged outbox rows and unapplied inbox rows (rebuilt on open and after a partition reset), because applied/acked rows are never pruned and a scan would grow with every op ever written. Every write path updates it under the same lock as the read-modify-write. A core write, an ACK and a repair request wake the push scheduler (`wake_push_scheduler`, 150 ms debounce) instead of waiting for the 5 s tick; the permission backfill runs single-flight off the scheduler task. An addon instance replicated disabled still gets its aliases materialized (`materialize_installed_instance`), since an alias has one owner and the enable path runs on one node only.
+Model aliases (`core.model_alias`) are keyed by NAME, never by the local `id`; every write goes through
+`repository` capture helpers, and the receiver refreshes the router cache after apply. An addon-owned alias
+(`model_alias_owners.owner_type = 'addon'`) is node-local: not captured, never overwritten or deleted by a
+peer. A platform-seeded alias (`db::seed::is_platform_seeded_alias`) replicates its binding but never its
+removal. `backfill_model_alias_captures` (startup, marker-guarded) seeds the ledger from pre-existing rows.
 
 ## Mesh
 

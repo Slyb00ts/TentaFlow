@@ -22,7 +22,7 @@ const { startBinary, stopBinary, waitForServer, binaryExists } = require('./help
 const { loginAsAdmin } = require('./helpers/auth');
 const { startScriptedModel, tool, say } = require('./helpers/scripted-model');
 const {
-  ensureCodeStudioApp, registerModelProvider, createWorkspace, openSession, drainApprovals,
+  ensureNativeApp, registerModelProvider, createWorkspace, openSession, drainApprovals,
   sessionRuns, acceptOpenReviews, readWorktreeFile,
 } = require('./helpers/code-studio');
 
@@ -177,7 +177,7 @@ function pipelineScripts() {
         say('Plan: jedno zadanie.'),
       ],
     },
-    { match: 'Jestes krytykiem', repeat: true, steps: [say('Sprawdziłem — BEZ UWAG.')] },
+    { match: 'Jesteś krytykiem', repeat: true, steps: [say('Sprawdziłem — BEZ UWAG.')] },
     {
       match: 'Piszesz kod',
       steps: [
@@ -319,7 +319,7 @@ async function assertConversationVisibleWhileAsking(page) {
 test.describe('Code Studio — program budowany w dwóch turach, widoczny na żywo', () => {
   test('przygotowanie: model i workspace', async ({ page }) => {
     await loginAsAdmin(page, { port: PORT });
-    await ensureCodeStudioApp(page);
+    await ensureNativeApp(page, 'code-studio');
     await registerModelProvider(page, model);
     // `trusted_native`: the default process sandbox needs unprivileged user
     // namespaces, which a stock Ubuntu 24.04 host denies to bwrap. This suite

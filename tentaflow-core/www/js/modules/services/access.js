@@ -80,13 +80,13 @@ export function visibilityIcon(v) {
 // An explicit grantStatus, when present, wins so a backend that later sends a
 // derived enum stays authoritative.
 function consumerState(c) {
-  const explicit = String(c.grantStatus || c.grant_status || '').toLowerCase();
+  const explicit = String(c.grant_status || '').toLowerCase();
   if (explicit === 'granted' || explicit === 'pending'
       || explicit === 'revoked' || explicit === 'denied') {
     return explicit;
   }
-  const revoked = c.revokedAt || c.revoked_at;
-  const granted = c.grantedAt || c.granted_at;
+  const revoked = c.revokedAt;
+  const granted = c.grantedAt;
   if (revoked) return 'revoked';
   if (granted) return 'granted';
   return 'pending';
@@ -101,17 +101,17 @@ function statePill(state) {
 }
 
 function consumerAddonId(c) {
-  return c.addonId || c.addon_id || '';
+  return c.addonId || '';
 }
 
 function consumerGrantedBy(c) {
-  const by = c.grantedByUserId || c.granted_by_user_id || '';
+  const by = c.grantedByUserId || '';
   return by || I18n.t('services.access_consumer_self');
 }
 
 function formatWhen(c) {
   // Prefer the most recent lifecycle timestamp for the "when" column.
-  const raw = c.revokedAt ?? c.revoked_at ?? c.grantedAt ?? c.granted_at;
+  const raw = c.revokedAt ?? c.grantedAt;
   if (raw === null || raw === undefined || raw === '') return '—';
   // The wire sends Unix SECONDS as a number; Date() expects ms, so numeric
   // values must be scaled. Optimistic updates write ISO strings, left as-is.
@@ -375,7 +375,7 @@ function applyTransitions(scope, id, transitions) {
   const cache = consumerCache.get(cacheKey(scope, id));
   if (!cache || !Array.isArray(cache.consumers)) return;
   for (const t of transitions) {
-    const addonId = t.addonId || t.addon_id;
+    const addonId = t.addonId;
     if (!addonId) continue;
     const row = cache.consumers.find((c) => consumerAddonId(c) === addonId);
     if (!row) continue;

@@ -175,5 +175,5 @@ test('the codec can encode a request for the output of a command', () => {
   assert.match(encoder, /exec_id:/);
   assert.match(encoder, /after_seq:/);
   assert.match(encoder, /limit:/);
-  assert.match(encoder, /_wasm\.encodeCodeStudioExecOutputRequest/);
+  assert.match(encoder, /requests\.encodeCodeStudioExecOutputRequest/);
 });

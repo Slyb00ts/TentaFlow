@@ -51,7 +51,7 @@ const {
   waitForServer,
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
-const { api, ensureCodeStudioApp } = require('./helpers/code-studio');
+const { api, ensureNativeApp } = require('./helpers/code-studio');
 
 const A_PORT = 18131;
 const PEER_PORT = 18132;
@@ -123,7 +123,7 @@ async function poll(fn, { timeoutMs = 90_000, what = 'condition' } = {}) {
 }
 
 function idOf(entry) {
-  return String(entry?.nodeId ?? entry?.node_id ?? '');
+  return String(entry?.nodeId ?? '');
 }
 
 async function selectNode(page, nodeId) {
@@ -196,8 +196,8 @@ test.describe('Code Studio — process_sandbox on a REMOTE node', () => {
 
     const identityA = await api(pageA, 'meshIdentityRequest');
     const identityB = await api(pagePeer, 'meshIdentityRequest');
-    const aId = String(identityA?.nodeId ?? identityA?.node_id ?? '');
-    const bId = String(identityB?.nodeId ?? identityB?.node_id ?? '');
+    const aId = String(identityA?.nodeId ?? '');
+    const bId = String(identityB?.nodeId ?? '');
     expect(aId, 'the dashboard node has no mesh identity').toHaveLength(64);
     expect(bId, 'the peer node has no mesh identity').toHaveLength(64);
 
@@ -224,15 +224,15 @@ test.describe('Code Studio — process_sandbox on a REMOTE node', () => {
     // it with the PIN, exactly like an operator reading the code aloud.
     const pending = await poll(async () => {
       const body = await api(pagePeer, 'meshPendingListRequest');
-      const row = (body?.pending ?? []).find((p) => String(p.remoteNodeId ?? p.remote_node_id) === aId);
+      const row = (body?.pending ?? []).find((p) => String(p.remoteNodeId) === aId);
       return row ?? null;
     }, { what: 'the pending pairing to reach the peer' });
 
     const confirmed = await api(pagePeer, 'meshPairingConfirmRequest', {
-      pairId: String(pending.remoteNodeId ?? pending.remote_node_id),
+      pairId: String(pending.remoteNodeId),
       pin,
     });
-    expect(confirmed?.ok ?? confirmed?.trustedNodeId ?? confirmed?.trusted_node_id).toBeTruthy();
+    expect(confirmed?.ok ?? confirmed?.trustedNodeId).toBeTruthy();
 
     await poll(async () => {
       const body = await api(pageA, 'meshTrustedListRequest');
@@ -246,14 +246,14 @@ test.describe('Code Studio — process_sandbox on a REMOTE node', () => {
 
   test('the wizard offers both isolation modes the remote node reports, and refuses the ones it does not', async ({ page }) => {
     await loginAsAdmin(page, { port: A_PORT });
-    await ensureCodeStudioApp(page);
+    await ensureNativeApp(page, 'code-studio');
 
     // Workspace creation is gated by a per-user grant, which a fresh database
     // does not carry — without it the wizard button renders disabled.
     const me = await api(page, 'authMeRequest');
     const users = await api(page, 'usersListRequest');
     const mine = (users?.users ?? []).find((u) => (u.username ?? '') === (me?.username ?? 'admin'));
-    const userId = mine?.id ?? mine?.userId ?? mine?.user_id ?? '';
+    const userId = mine?.id ?? mine?.userId ?? '';
     expect(userId, 'could not resolve the admin user id').toBeTruthy();
     await api(page, 'codeStudioWorkspaceCreatorGrantSetRequest', { userId, granted: true });
 
@@ -262,12 +262,12 @@ test.describe('Code Studio — process_sandbox on a REMOTE node', () => {
 
     const body = await api(page, 'codeStudioWorkspacesListRequest', { includeArchived: false });
     const nodes = body?.nodes ?? [];
-    const remote = nodes.find((n) => !(n.isLocal ?? n.is_local));
+    const remote = nodes.find((n) => !(n.isLocal));
     expect(remote, 'the paired peer did not reach the node catalog').toBeTruthy();
-    const advertised = remote.supportsProcessSandbox ?? remote.supports_process_sandbox ?? null;
-    const wireCause = remote.processSandboxCause ?? remote.process_sandbox_cause ?? null;
-    const advertisedContainer = remote.supportsContainer ?? remote.supports_container ?? null;
-    const wireEgress = String(remote.egressEnforcement ?? remote.egress_enforcement ?? '');
+    const advertised = remote.supportsProcessSandbox ?? null;
+    const wireCause = remote.processSandboxCause ?? null;
+    const advertisedContainer = remote.supportsContainer ?? null;
+    const wireEgress = String(remote.egressEnforcement ?? '');
 
     if (PEER_EXPECT === 'advertises') {
       expect(advertised, 'the peer built from this tree did not advertise its probe').toBe(true);
@@ -318,8 +318,8 @@ test.describe('Code Studio — process_sandbox on a REMOTE node', () => {
         ? { node: String(remote.name ?? '') } : null)
       : '';
 
-    const localNode = nodes.find((n) => (n.isLocal ?? n.is_local));
-    const localAdvertisedContainer = localNode?.supportsContainer ?? localNode?.supports_container ?? null;
+    const localNode = nodes.find((n) => (n.isLocal));
+    const localAdvertisedContainer = localNode?.supportsContainer ?? null;
     const localSteps = await (async () => {
       await page.locator('[data-action="back"]').first().click();
       await selectNode(page, idOf(localNode));
@@ -343,8 +343,8 @@ test.describe('Code Studio — process_sandbox on a REMOTE node', () => {
         remoteLabel,
         local: {
           nodeId: idOf(localNode),
-          advertised: localNode?.supportsProcessSandbox ?? localNode?.supports_process_sandbox ?? null,
-          cause: localNode?.processSandboxCause ?? localNode?.process_sandbox_cause ?? null,
+          advertised: localNode?.supportsProcessSandbox ?? null,
+          cause: localNode?.processSandboxCause ?? null,
           advertisedContainer: localAdvertisedContainer,
         },
         localCards: localSteps,
@@ -392,7 +392,7 @@ test.describe('Code Studio — process_sandbox on a REMOTE node', () => {
 
     // The local row is still measured HERE — the peer's report cannot turn this
     // node's own refusal into support, nor its silence into a runtime.
-    const localValue = localNode?.supportsProcessSandbox ?? localNode?.supports_process_sandbox ?? null;
+    const localValue = localNode?.supportsProcessSandbox ?? null;
     expect(typeof localValue, 'the local row lost its measured value').toBe('boolean');
     expect(localSteps.sandbox.disabled).toBe(localValue !== true);
     expect(typeof localAdvertisedContainer,

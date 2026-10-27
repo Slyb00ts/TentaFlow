@@ -1,20 +1,20 @@
 // ============ File: project-studio-tree.js — Authorized project tree and task-scope preferences ============
 
 export function projectAncestors(project, projects, breadcrumbs) {
-  const names = new Map([...breadcrumbs, ...projects].map((row) => [row.project_id, row]));
+  const names = new Map([...breadcrumbs, ...projects].map((row) => [row.projectId, row]));
   return project.path.split('/').filter(Boolean).slice(0, -1).map((id) => names.get(id)).filter(Boolean);
 }
 
 export function projectRoots(projects) {
-  const ids = new Set(projects.map((project) => project.project_id));
-  return projects.filter((project) => !ids.has(project.parent_id));
+  const ids = new Set(projects.map((project) => project.projectId));
+  return projects.filter((project) => !ids.has(project.parentId));
 }
 
 export function projectTreeNodes(projects, breadcrumbs, decorate = () => ({})) {
   const nodes = new Map();
   const referenced = new Set(projects.flatMap((project) => project.path.split('/').filter(Boolean)));
-  for (const row of breadcrumbs.filter((row) => referenced.has(row.project_id))) nodes.set(row.project_id, { id: row.project_id, label: row.name, disabled: true, children: [] });
-  for (const project of projects) nodes.set(project.project_id, { id: project.project_id, label: project.name, children: [], ...decorate(project) });
+  for (const row of breadcrumbs.filter((row) => referenced.has(row.projectId))) nodes.set(row.projectId, { id: row.projectId, label: row.name, disabled: true, children: [] });
+  for (const project of projects) nodes.set(project.projectId, { id: project.projectId, label: project.name, children: [], ...decorate(project) });
   const parents = new Map();
   for (const project of projects) {
     const path = project.path.split('/').filter(Boolean);

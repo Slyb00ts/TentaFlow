@@ -215,7 +215,7 @@ function drawTimeline() {
 function fillUnitFilter() {
   const select = q('unit-filter');
   const units = [...state.view.units].sort((a, b) => a.name.localeCompare(b.name));
-  select.setOptions([{ value: '', label: t('filter_unit_all') }, ...units.map((u) => ({ value: u.unit_id, label: u.name }))], state.unit);
+  select.setOptions([{ value: '', label: t('filter_unit_all') }, ...units.map((u) => ({ value: u.unitId, label: u.name }))], state.unit);
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +326,7 @@ async function setAt(day, { keepComparison = false } = {}) {
 async function exportFile(format, anchor) {
   try {
     const body = await ApiBinary.one('orgExportRequest', { format, at: state.at });
-    downloadBytes(body.file_name ?? body.fileName, body.bytes, body.mime);
+    downloadBytes(body.fileName, body.bytes, body.mime);
   } catch (err) {
     TfToast.show({ tone: 'danger', message: t('export_failed', { message: err.message || '' }) });
   }

@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use crate::db::models::DbModelAlias;
 use crate::db::{self, DbPool};
-use crate::mesh::iroh_manager::IrohMeshManager;
 use anyhow::Result;
 
 /// All aliases stored in the local DB.
@@ -94,6 +93,14 @@ pub fn delete_alias(pool: &DbPool, id: i64) -> Result<bool> {
     }
     db::repository::delete_model_alias(pool, id)?;
     Ok(true)
+}
+
+/// Reloads the router's alias cache and rebuilds the public catalog after a
+/// local alias mutation. Other nodes receive the change through the Sync
+/// Ledger, whose apply path performs the same refresh.
+pub fn refresh_router_aliases(router: &Arc<crate::routing::router::Router>) {
+    router.reload_alias_cache();
+    router.rebuild_catalog();
 }
 
 #[cfg(test)]
@@ -282,27 +289,5 @@ mod tests {
             !row.is_active,
             "alias with cleared target must be parked, got active"
         );
-    }
-}
-
-/// Reload local router alias cache, rebuild the public catalog snapshot, and
-/// broadcast the latest alias snapshot to the mesh after a successful
-/// create/update/delete.
-pub fn broadcast_alias_mutation(
-    pool: &DbPool,
-    router: &Arc<crate::routing::router::Router>,
-    quic_mesh: &Option<Arc<IrohMeshManager>>,
-) {
-    router.reload_alias_cache();
-    router.rebuild_catalog();
-    if let Some(qm) = quic_mesh {
-        if let Ok(aliases) = db::repository::list_model_aliases(pool) {
-            if let Ok(json) = serde_json::to_vec(&aliases) {
-                let qm = Arc::clone(qm);
-                tokio::spawn(async move {
-                    qm.broadcast_alias_sync(json).await;
-                });
-            }
-        }
     }
 }

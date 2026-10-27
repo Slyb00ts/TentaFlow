@@ -68,12 +68,11 @@ async function locale(lang) {
 test('a node with a name shows that name, and never its id', async () => {
   for (const lang of LOCALES) {
     await locale(lang);
-    assert.equal(nodeTitle({ node_id: NODE_ID, node_name: 'Helios' }), 'Helios', `${lang} snake_case`);
     assert.equal(nodeTitle({ nodeId: NODE_ID, nodeName: 'Helios' }), 'Helios', `${lang} camelCase`);
     // Whitespace around a name is not a name.
-    assert.equal(nodeTitle({ node_id: NODE_ID, node_name: '  Helios  ' }), 'Helios', `${lang} trimmed`);
-    // A short id is still an id: the wire's `node_name` may be any node id.
-    assert.equal(nodeTitle({ node_id: NODE_ID, node_name: 'helios' }), 'helios', `${lang} a real short name`);
+    assert.equal(nodeTitle({ nodeId: NODE_ID, nodeName: '  Helios  ' }), 'Helios', `${lang} trimmed`);
+    // A short id is still an id: the wire's `nodeName` may be any node id.
+    assert.equal(nodeTitle({ nodeId: NODE_ID, nodeName: 'helios' }), 'helios', `${lang} a real short name`);
   }
 });
 
@@ -89,10 +88,10 @@ test('a node with no usable name says so in the operator’s language, never as 
 
     const cases = {
       // Core sends the id BOTH ways when it has no name to send.
-      'name is the id': { node_id: NODE_ID, node_name: NODE_ID },
+      'name is the id': { nodeId: NODE_ID, nodeName: NODE_ID },
       'name is the id, camelCase': { nodeId: NODE_ID, nodeName: NODE_ID },
-      'no name field': { node_id: NODE_ID },
-      'blank name': { node_id: NODE_ID, node_name: '   ' },
+      'no name field': { nodeId: NODE_ID },
+      'blank name': { nodeId: NODE_ID, nodeName: '   ' },
       'no node at all': null,
       'no fields at all': {},
     };
@@ -110,7 +109,7 @@ test('the fallback is the locale’s own text, not one language for all five', a
   const seen = new Map();
   for (const lang of LOCALES) {
     const dict = await locale(lang);
-    const title = nodeTitle({ node_id: NODE_ID, node_name: NODE_ID });
+    const title = nodeTitle({ nodeId: NODE_ID, nodeName: NODE_ID });
     seen.set(lang, title);
     assert.equal(title, dict.node_unnamed, `${lang} fallback text`);
   }
@@ -128,13 +127,13 @@ test('"used on" names every node it holds, and joins them for one cell', async (
   for (const lang of LOCALES) {
     const dict = await locale(lang);
     assert.equal(
-      usedOnLabel({ used_on: [{ node_id: NODE_ID, node_name: 'Helios' }, { node_id: 'b', node_name: 'Selene' }] }),
+      usedOnLabel({ usedOn: [{ nodeId: NODE_ID, nodeName: 'Helios' }, { nodeId: 'b', nodeName: 'Selene' }] }),
       'Helios, Selene',
       `${lang} two named nodes`,
     );
     assert.equal(usedOnLabel({ usedOn: [{ nodeId: 'c', nodeName: 'Eos' }] }), 'Eos', `${lang} camelCase`);
     // Nothing reported here is an em dash, not an empty cell.
-    assert.equal(usedOnLabel({ used_on: [] }), dict.value_none, `${lang} empty list`);
+    assert.equal(usedOnLabel({ usedOn: [] }), dict.value_none, `${lang} empty list`);
     assert.equal(usedOnLabel({}), dict.value_none, `${lang} no list at all`);
   }
 });
@@ -143,7 +142,7 @@ test('an unnamed node in "used on" reads as the localized fallback, not as an id
   for (const lang of LOCALES) {
     const dict = await locale(lang);
     const label = usedOnLabel({
-      used_on: [{ node_id: NODE_ID, node_name: NODE_ID }, { node_id: 'b', node_name: 'Selene' }],
+      usedOn: [{ nodeId: NODE_ID, nodeName: NODE_ID }, { nodeId: 'b', nodeName: 'Selene' }],
     });
     assert.ok(label.includes(dict.node_unnamed), `${lang}: the unnamed node lost its fallback`);
     assert.ok(label.includes('Selene'), `${lang}: the named node lost its name`);

@@ -16,6 +16,7 @@ const LINE = 'rgba(99, 102, 241, ';          // accent-1 + dynamic alpha
 let rafId = null;
 let resizeObserver = null;
 let visibilityHandler = null;
+let intersectionObserver = null;
 
 export function mount(canvas) {
   if (!canvas || !(canvas instanceof HTMLCanvasElement)) return;
@@ -110,18 +111,32 @@ export function mount(canvas) {
   } else {
     window.addEventListener('resize', resize);
   }
-  visibilityHandler = () => {
-    if (document.hidden) {
-      if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
-    } else if (!rafId) {
+  // The loop runs only while the canvas is visible: a background tab or a hero
+  // scrolled out of the viewport must cost nothing.
+  let onScreen = true;
+  const sync = () => {
+    const shouldRun = onScreen && !document.hidden;
+    if (shouldRun && !rafId) {
       rafId = requestAnimationFrame(tick);
+    } else if (!shouldRun && rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = null;
     }
   };
+  visibilityHandler = sync;
   document.addEventListener('visibilitychange', visibilityHandler);
+  if (window.IntersectionObserver) {
+    intersectionObserver = new IntersectionObserver((entries) => {
+      onScreen = entries[entries.length - 1].isIntersecting;
+      sync();
+    });
+    intersectionObserver.observe(canvas);
+  }
 }
 
 export function unmount() {
   if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
   if (resizeObserver) { resizeObserver.disconnect(); resizeObserver = null; }
+  if (intersectionObserver) { intersectionObserver.disconnect(); intersectionObserver = null; }
   if (visibilityHandler) { document.removeEventListener('visibilitychange', visibilityHandler); visibilityHandler = null; }
 }

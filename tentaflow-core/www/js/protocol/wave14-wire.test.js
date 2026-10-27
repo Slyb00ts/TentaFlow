@@ -76,27 +76,28 @@ test('a closed target and a blocked one decode their wave-14 flags', { skip }, (
   const body = decodeBody({
     TentaNasBody: { TargetGetResponse: { target: { ...TARGET, allowlist_mode: true }, sessions: [], config_preview: '', open_blocked: true } },
   });
-  assert.equal(body.variant, 'TentaNasTargetGetResponse');
+  assert.equal(body._variant, 'TentaNasBody.TargetGetResponse');
   assert.equal(body.target.allowlistMode, true);
   assert.equal(body.openBlocked, true);
 });
 
-test('an older node\'s answer reads as not allowlisted by flag and not blocked', { skip }, () => {
+test('an older node\'s answer carries neither flag', { skip }, () => {
   const body = decodeBody({ TentaNasBody: { TargetGetResponse: { target: TARGET, sessions: [], config_preview: '' } } });
-  assert.equal(body.target.allowlistMode, false);
-  assert.equal(body.openBlocked, false);
+  // The generic decoder does not synthesize serde defaults: absent stays absent.
+  assert.equal(body.target.allowlistMode, undefined);
+  assert.equal(body.openBlocked, undefined);
 });
 
 // ----- "Otwórz dla wszystkich" --------------------------------------------------
 
 test('TargetOpenRequest crosses the real glue with the retyped name and the window reading, nothing else', { skip }, () => {
   const sent = request('tentaNasTargetOpenRequest', { targetId: 't1', confirmName: 'vm-store', expectedUpdatedAt: '2026-09-29T10:00:00Z', sudoPassword: 'sekret' });
-  assert.equal(sent.variant, 'TentaNasTargetOpenRequest');
+  assert.equal(sent._variant, 'TentaNasBody.TargetOpenRequest');
   assert.equal(sent.targetId, 't1');
   assert.equal(sent.confirmName, 'vm-store');
   assert.equal(sent.expectedUpdatedAt, '2026-09-29T10:00:00Z');
-  const fields = Object.keys(sent).filter((k) => k !== 'variant' && !/[A-Z]/.test(k)).sort();
-  assert.deepEqual(fields, ['confirm_name', 'expected_updated_at', 'sudo_password', 'target_id']);
+  const fields = Object.keys(sent).filter((k) => k !== '_variant').sort();
+  assert.deepEqual(fields, ['confirmName', 'expectedUpdatedAt', 'sudoPassword', 'targetId']);
   const plain = request('tentaNasTargetOpenRequest', { targetId: 't1', confirmName: 'vm-store' });
   assert.equal(plain.sudoPassword, null);
   assert.equal(plain.expectedUpdatedAt, '', 'an older window sends no reading: no check');

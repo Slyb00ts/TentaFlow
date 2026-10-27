@@ -1061,10 +1061,10 @@ export const FlamegraphView = {
     const mount = document.createElement('div');
     card.appendChild(mount);
 
-    // Aktywny CPU source = pierwszy kolektor z `primary_category === 'cpu_sample'`,
+    // Aktywny CPU source = pierwszy kolektor z `primary_category === 'CpuSample'`,
     // jezeli zaden nie zostal uzyty pokazujemy "—" zamiast hardcodowanego linux.perf.
     const cpuCollector = (Array.isArray(report.collectors) ? report.collectors : [])
-      .find((c) => (c.primary_category === 'cpu_sample' || c.primaryCategory === 'cpu_sample'));
+      .find((c) => c.primary_category === 'CpuSample');
     const cpuSource = cpuCollector ? (cpuCollector.id || '—') : '—';
 
     const fg = new CpuFlamegraph(mount, {

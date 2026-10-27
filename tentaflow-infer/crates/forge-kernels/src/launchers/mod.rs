@@ -1611,7 +1611,7 @@ static PREPARED_Q8_GEMM_LAUNCHES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 fn take_prepared_q8_fault(counter: &AtomicUsize) -> bool {
     counter
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
             value.checked_sub(1)
         })
         .is_ok()

@@ -389,7 +389,7 @@ test('presentation enlarges the cards', () => {
 
 test('the SVG export is standalone, fully expanded and escapes what the data says', () => {
   const view = sampleView();
-  view.assignments[0].display_name = '<script>alert(1)</script> & "Co"';
+  view.assignments[0].displayName = '<script>alert(1)</script> & "Co"';
   const el = mount(buildTreeModel(view, { t, meHex }));
   const out = el.toSvg({ theme: 'light' });
   assert.match(out.svg, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
@@ -527,14 +527,14 @@ test('new data keeps the expansion and the selection, and drops what no longer e
   click(el, el.querySelector('.ot-more[data-more="p-lead"] rect'));
   el.selectedId = 'p-dev1';
   const view = sampleView();
-  view.positions = view.positions.filter((p) => p.position_id !== 'p-tester');
+  view.positions = view.positions.filter((p) => p.positionId !== 'p-tester');
   el.updateModel(buildTreeModel(view, { t, meHex }));
   el._render();
   assert.ok(card(el, 'p-dev1'), 'still expanded');
   assert.equal(card(el, 'p-tester'), null);
   assert.equal(el.selectedId, 'p-dev1');
   const gone = sampleView();
-  gone.positions = gone.positions.filter((p) => p.position_id !== 'p-dev1');
+  gone.positions = gone.positions.filter((p) => p.positionId !== 'p-dev1');
   el.updateModel(buildTreeModel(gone, { t, meHex }));
   assert.equal(el.selectedId, null);
 });
@@ -696,9 +696,9 @@ const LONG_ROLE = 'Starszy Specjalista do spraw Rozwoju Współpracy Międzynaro
 
 function longModel() {
   const view = sampleView();
-  view.assignments.find((a) => a.position_id === 'p-cto').display_name = LONG_NAME;
-  view.positions.find((p) => p.position_id === 'p-cto').name = LONG_ROLE;
-  view.units.find((u) => u.unit_id === 'u-tech').name = 'Pion Technologii i Innowacji Cyfrowych Grupy Kapitałowej Solutio';
+  view.assignments.find((a) => a.positionId === 'p-cto').displayName = LONG_NAME;
+  view.positions.find((p) => p.positionId === 'p-cto').name = LONG_ROLE;
+  view.units.find((u) => u.unitId === 'u-tech').name = 'Pion Technologii i Innowacji Cyfrowych Grupy Kapitałowej Solutio';
   return buildTreeModel(view, { t, meHex });
 }
 
@@ -721,7 +721,7 @@ test('a very long Polish name and role wrap on the card: nothing is cut with an 
 
 test('a short name keeps the normal card, a longer one widens it before it wraps', () => {
   const view = sampleView();
-  view.assignments.find((a) => a.position_id === 'p-cto').display_name = 'Aleksandra Wojciechowska-Nowak';
+  view.assignments.find((a) => a.positionId === 'p-cto').displayName = 'Aleksandra Wojciechowska-Nowak';
   const el = mount(buildTreeModel(view, { t, meHex }));
   resizeTo(el, 3000, 1500);
   const wide = el._layout.byId.get('p-cto');
@@ -778,7 +778,7 @@ test('the edit mode gives every card a "⋯" handle, and no export or read-only 
 
 test('the handle takes room from the text: a card is wider in the edit mode, so nothing runs under it', () => {
   const view = sampleView();
-  view.assignments.find((a) => a.position_id === 'p-cto').display_name = 'Aleksandra Wojciechowska-Nowak';
+  view.assignments.find((a) => a.positionId === 'p-cto').displayName = 'Aleksandra Wojciechowska-Nowak';
   const el = mount(buildTreeModel(view, { t, meHex }));
   resizeTo(el, 3000, 1500);
   const before = el._layout.byId.get('p-cto');

@@ -73,9 +73,9 @@ function resolveIcon(raw) {
 // click: native -> Router screen (`target` = route id), wasm -> the addon-app
 // panel renderer (`target` = entry panel id). Native apps may carry i18n keys.
 function renderAddonTile(app) {
-  const addonId = app.addonId ?? app.addon_id ?? '';
+  const addonId = app.addonId ?? '';
   const kind = app.kind === 'native' ? 'native' : 'wasm';
-  const target = app.target ?? app.entryPanel ?? app.entry_panel ?? '';
+  const target = app.target ?? '';
   const title = escapeHtml(
     (app.titleKey && I18n.t(app.titleKey)) || app.title || addonId,
   );
@@ -103,11 +103,11 @@ function renderAddonTile(app) {
 
 function sortAddonApps(apps) {
   return apps.slice().sort((a, b) => {
-    const sa = Number(a.sortOrder ?? a.sort_order ?? 0);
-    const sb = Number(b.sortOrder ?? b.sort_order ?? 0);
+    const sa = Number(a.sortOrder ?? 0);
+    const sb = Number(b.sortOrder ?? 0);
     if (sa !== sb) return sa - sb;
-    const ta = String(a.title ?? a.addonId ?? a.addon_id ?? '').toLowerCase();
-    const tb = String(b.title ?? b.addonId ?? b.addon_id ?? '').toLowerCase();
+    const ta = String(a.title ?? a.addonId ?? '').toLowerCase();
+    const tb = String(b.title ?? b.addonId ?? '').toLowerCase();
     return ta.localeCompare(tb);
   });
 }

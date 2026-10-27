@@ -8,7 +8,7 @@
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { confirmDialog } from '/js/lib/confirm-dialog.js';
-import { byId, escapeHtml, escapeAttr, toast, bytesToHex } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast, bytesToHex, uuidFromBytes } from '/js/utils.js';
 import { Router } from '/js/router.js';
 import { I18n } from '/js/i18n.js';
 import '/js/components/tf-button.js';
@@ -323,18 +323,18 @@ function renderFilters() {
     id: t.slug,
     label: t.label,
     icon: typeIcon(t.slug),
-    count: projects.filter((p) => p.projectType === t.slug || p.project_type === t.slug).length,
+    count: projects.filter((p) => p.projectType === t.slug).length,
     active: activeTypeFilter === t.slug,
   }));
   el.filters = [all, ...typeFilters];
 }
 
 function projectType(p) {
-  return p.projectType ?? p.project_type ?? '';
+  return p.projectType ?? '';
 }
 
 function projectId(p) {
-  return p.projectId ?? p.project_id ?? '';
+  return p.projectId ?? '';
 }
 
 // Inicjały do awatara member-chip. Działa dla nazwy wyświetlanej z wielu słów
@@ -356,7 +356,6 @@ function initialsFromId(id) {
 // flag is absent so the split still works against older payloads.
 function isOwnerProject(p) {
   if (typeof p.isOwner === 'boolean') return p.isOwner;
-  if (typeof p.is_owner === 'boolean') return p.is_owner;
   return String(p.role || '').toLowerCase() === 'owner';
 }
 
@@ -377,20 +376,9 @@ async function ensureCurrentUser() {
 // authMe niesie userId jako 16 SUROWYCH BAJTÓW, a członkowie projektu mają
 // user_id jako kanoniczny string UUID — bez konwersji porównanie uid === selfId
 // nigdy by nie pasowało, więc tu zamieniamy bajty na kanoniczny UUID.
-function uuidFromBytes(bytes) {
-  const hex = Array.from(bytes, (b) => (b & 0xff).toString(16).padStart(2, '0'));
-  return [
-    hex.slice(0, 4).join(''),
-    hex.slice(4, 6).join(''),
-    hex.slice(6, 8).join(''),
-    hex.slice(8, 10).join(''),
-    hex.slice(10, 16).join(''),
-  ].join('-');
-}
-
 function currentUserId() {
   if (!currentUser) return '';
-  const raw = currentUser.userId ?? currentUser.user_id ?? '';
+  const raw = currentUser.userId ?? '';
   if (raw == null) return '';
   if (typeof raw === 'string') return raw.trim();
   let bytes = null;
@@ -495,10 +483,10 @@ function sectionHead(icon, title, count, tone, sub) {
 function projectCard(p, owned) {
   const id = projectId(p);
   const slug = projectType(p);
-  const datasetCount = p.datasetCount ?? p.dataset_count ?? 0;
-  const modelCount = p.modelCount ?? p.model_count ?? 0;
-  const trainingCount = p.trainingCount ?? p.training_count ?? 0;
-  const updated = formatRelative(p.updatedAt ?? p.updated_at);
+  const datasetCount = p.datasetCount ?? 0;
+  const modelCount = p.modelCount ?? 0;
+  const trainingCount = p.trainingCount ?? 0;
+  const updated = formatRelative(p.updatedAt);
 
   // Owner strip: "Właściciel: Ty" with a share action for my projects; the
   // guest role chip (Edytor/Przeglądający) for shared-with-me projects.
@@ -820,7 +808,7 @@ async function showCreateWizard() {
         projectType: state.type,
       });
       const created = resp.project || {};
-      const newId = created.projectId ?? created.project_id;
+      const newId = created.projectId;
       if (state.file && newId) {
         await uploadDataset(newId, state.file);
       }
@@ -882,7 +870,7 @@ async function showDetail(projectId, focus = {}) {
 }
 
 function renderDetail(host, p, focus = {}) {
-  const slug = p.projectType ?? p.project_type ?? '';
+  const slug = p.projectType ?? '';
   // Wejście „w szczegóły joba" z panelu Joby: przekazany runId ma otworzyć
   // zakładkę Trening i wznowić dla niego widok LIVE (zamiast formularza startu).
   // Konsumowane jednorazowo — kolejne ręczne wejścia w Trening pokażą już setup.
@@ -901,8 +889,8 @@ function renderDetail(host, p, focus = {}) {
 
   // Header badges: project type, created-at provenance, schema size and mesh
   // sync state. Synced is signalled by the backend `synced`/`isShared` flag.
-  const createdRel = formatRelative(p.createdAt ?? p.created_at);
-  const synced = p.synced === true || p.is_synced === true;
+  const createdRel = formatRelative(p.createdAt);
+  const synced = p.synced === true;
   const headerBadges = [
     `<tf-chip status="accent" icon="${escapeAttr(typeIcon(slug))}" label="typ: ${escapeAttr(typeLabel(slug))}"></tf-chip>`,
     createdRel !== '—' ? `<tf-chip icon="clock" label="utworzony ${escapeAttr(createdRel)}"></tf-chip>` : '',
@@ -1111,7 +1099,7 @@ function metricNum(m, ...keys) {
 // progress style; `metric` (if present) becomes the success chip text. Falls
 // back to a 0/100 % bar derived only from the run status when no numbers exist.
 function runProgressMeta(r) {
-  const m = parseMetrics(r.metricsJson ?? r.metrics_json);
+  const m = parseMetrics(r.metricsJson);
   const status = String(r.status ?? '').toLowerCase();
   const terminal = status === 'succeeded' || status === 'finished' || status === 'completed';
   let pct = metricNum({ ...r, ...m }, 'progress', 'progressPct', 'progress_pct');
@@ -1131,7 +1119,7 @@ function runProgressMeta(r) {
 // Metric tiles for a project model card (mAP@50 / mAP@50-95 / klasy). Missing
 // values render as an em-dash so the tile layout stays stable.
 function modelMetricTiles(model) {
-  const m = parseMetrics(model.metricsJson ?? model.metrics_json);
+  const m = parseMetrics(model.metricsJson);
   const fmt = (v) => (v == null ? '—' : v.toFixed(3));
   const map50 = metricNum(m, 'map50', 'mAP50', 'map_50', 'mAP@50');
   const map5095 = metricNum(m, 'map5095', 'map50_95', 'map_50_95', 'mAP50-95', 'mAP@50-95');
@@ -1153,10 +1141,10 @@ async function fetchRecogStats(pid) {
     const datasets = (Array.isArray(dsResp.datasets) ? dsResp.datasets : [])
       .filter((d) => (d.kind ?? '') === 'coco_path');
     if (!datasets.length) return { images: 0, classes: 0, annotated: 0 };
-    const datasetId = datasets[0].datasetId ?? datasets[0].dataset_id;
+    const datasetId = datasets[0].datasetId;
     const imgResp = await ApiBinary.one('mlStudioRecogImagesListRequest', { datasetId });
-    const images = JSON.parse(imgResp.imagesJson ?? imgResp.images_json ?? '[]');
-    const categories = JSON.parse(imgResp.categoriesJson ?? imgResp.categories_json ?? '[]');
+    const images = JSON.parse(imgResp.imagesJson ?? '[]');
+    const categories = JSON.parse(imgResp.categoriesJson ?? '[]');
     const classes = categories.filter((c) => c.id !== 0).length || categories.length;
     const annotated = images.filter((im) => Number(im.ann_count ?? 0) > 0).length;
     return { images: images.length, classes, annotated };
@@ -1170,9 +1158,9 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
   panel.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
 
   // KPI domenowe z payloadu projektu — liczba członków uzupełniana po pobraniu.
-  const datasetCount = p.datasetCount ?? p.dataset_count ?? 0;
-  const modelCount = p.modelCount ?? p.model_count ?? 0;
-  const trainingCount = p.trainingCount ?? p.training_count ?? 0;
+  const datasetCount = p.datasetCount ?? 0;
+  const modelCount = p.modelCount ?? 0;
+  const trainingCount = p.trainingCount ?? 0;
 
   // Członkowie — potrzebni także do KPI "Członkowie", więc pobieramy najpierw.
   let members = [];
@@ -1188,7 +1176,7 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
   const shareNav = () => Router.navigate('ml-studio', { projectId: pid, share: true });
   const adminNav = () => Router.navigate('ml-studio', { admin: 'resources' });
 
-  const slug = p.projectType ?? p.project_type ?? '';
+  const slug = p.projectType ?? '';
   const recognition = slug === 'recognition';
 
   // value can carry an inline <span class="small"> suffix (e.g. "42%"), so it is
@@ -1218,8 +1206,8 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
 
   // Mini-lista członków: awatar z inicjałów, nazwa = displayName (fallback userId), rola jako tf-chip.
   const memberChips = members.map((m) => {
-    const uid = String(m.userId ?? m.user_id ?? '');
-    const name = m.displayName ?? m.display_name ?? uid;
+    const uid = String(m.userId ?? '');
+    const name = m.displayName ?? uid;
     const role = String(m.role ?? '').toLowerCase();
     const isSelf = (selfId && uid === selfId) || role === 'owner' && !selfId;
     const tone = role === 'owner' ? 'accent' : 'info';
@@ -1228,7 +1216,7 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
         <div class="m-av">${escapeHtml(initialsFromId(name))}</div>
         <div>
           <div class="m-nm">${escapeHtml(name || '—')}${isSelf ? ' <span class="ml-studio-member-self">(Ty)</span>' : ''}</div>
-          <div class="m-rl">${escapeHtml(formatRelative(m.createdAt ?? m.created_at))}</div>
+          <div class="m-rl">${escapeHtml(formatRelative(m.createdAt))}</div>
         </div>
         <tf-chip status="${tone}" icon="${escapeAttr(ROLE_ICON[role] || 'eye')}" label="${escapeAttr(roleLabel(role))}"></tf-chip>
       </div>`;
@@ -1351,9 +1339,9 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
           <tf-column key="status" label="Status" renderer="html"></tf-column>
         `;
         table.rows = grants.map((g) => {
-          const resourceRef = String(g.resourceRef ?? g.resource_ref ?? '');
-          const resourceKind = String(g.resourceKind ?? g.resource_kind ?? '');
-          const nid = String(g.nodeId ?? g.node_id ?? '');
+          const resourceRef = String(g.resourceRef ?? '');
+          const resourceKind = String(g.resourceKind ?? '');
+          const nid = String(g.nodeId ?? '');
           return {
             resource: resourceRef || resourceKind || '—',
             node: g.hostname || (nid ? nid.slice(0, 12) : '—'),
@@ -1397,7 +1385,7 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
           <tf-column key="time" label="Czas"></tf-column>
         `;
         table.rows = runs.slice(0, 5).map((r) => {
-          const runId = String(r.runId ?? r.run_id ?? '');
+          const runId = String(r.runId ?? '');
           const b = runBadge(r.status);
           const meta = runProgressMeta(r);
           return {
@@ -1406,7 +1394,7 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
             result: meta.metric != null
               ? `<tf-chip status="ok" icon="check" label="${escapeAttr(meta.metric)}"></tf-chip>`
               : `<tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge>`,
-            time: formatRelative(r.finishedAt ?? r.finished_at ?? r.startedAt ?? r.started_at),
+            time: formatRelative(r.finishedAt ?? r.startedAt),
           };
         });
         host.appendChild(table);
@@ -1442,9 +1430,9 @@ async function renderOverviewTab(panel, p, { tabs, selectTab }) {
         grid.className = 'ml-studio-model-card-grid';
         grid.innerHTML = models.map((m) => {
           const b = runBadge(m.status);
-          const name = String(m.name ?? m.modelId ?? m.model_id ?? '—');
+          const name = String(m.name ?? m.modelId ?? '—');
           const framework = String(m.framework ?? '') || '—';
-          const base = String(m.baseModel ?? m.base_model ?? '').trim();
+          const base = String(m.baseModel ?? '').trim();
           const sub = base ? `${framework} · ${base}` : framework;
           const tiles = modelMetricTiles(m).map((t) =>
             `<div class="mc-metric"><div class="mm-val">${escapeHtml(t.val)}</div><div class="mm-lbl">${escapeHtml(t.lbl)}</div></div>`).join('');
@@ -1549,7 +1537,7 @@ const COLUMN_TYPE_STATUS = {
 };
 
 function columnTypeSlug(col) {
-  return String(col.columnType ?? col.column_type ?? 'text').toLowerCase();
+  return String(col.columnType ?? 'text').toLowerCase();
 }
 
 function datasetKindLabel(kind) {
@@ -1696,12 +1684,12 @@ function pollRecogBuild(pid, buildId, prog) {
         return;
       }
       const status = st.status || 'running';
-      const total = st.filesTotal ?? st.files_total ?? 0;
-      const doneN = st.filesDone ?? st.files_done ?? 0;
-      const frames = st.framesExtracted ?? st.frames_extracted ?? 0;
+      const total = st.filesTotal ?? 0;
+      const doneN = st.filesDone ?? 0;
+      const frames = st.framesExtracted ?? 0;
       if (status === 'succeeded') {
-        const imgs = st.imageCount ?? st.image_count ?? 0;
-        const cats = st.categoryCount ?? st.category_count ?? 0;
+        const imgs = st.imageCount ?? 0;
+        const cats = st.categoryCount ?? 0;
         if (prog) prog.textContent = '';
         toast(`Dataset zbudowany: ${imgs} obrazów, ${cats} klas.`, 'success');
         loadDatasets(pid);
@@ -1740,10 +1728,10 @@ function pollRecogAutolabel(jobId, prog, onDone) {
         return;
       }
       const status = st.status || 'running';
-      const total = st.imagesTotal ?? st.images_total ?? 0;
-      const doneN = st.imagesDone ?? st.images_done ?? 0;
+      const total = st.imagesTotal ?? 0;
+      const doneN = st.imagesDone ?? 0;
       const dets = st.detections ?? 0;
-      const skippedUnknown = st.skippedUnknown ?? st.skipped_unknown ?? 0;
+      const skippedUnknown = st.skippedUnknown ?? 0;
       if (status === 'succeeded') {
         if (prog) prog.textContent = '';
         if (dets === 0) {
@@ -1774,8 +1762,8 @@ function pollRecogAutolabel(jobId, prog, onDone) {
 async function onDatasetUploaded(pid, filename, resp) {
   toast(`Wgrano „${filename}" — sprofilowano`, 'success');
   await loadDatasets(pid);
-  const datasetId = resp?.datasetId ?? resp?.dataset_id
-    ?? resp?.dataset?.datasetId ?? resp?.dataset?.dataset_id;
+  const datasetId = resp?.datasetId
+    ?? resp?.dataset?.datasetId;
   if (resp?.profile) {
     renderProfile(resp.profile);
   } else if (datasetId) {
@@ -1822,14 +1810,14 @@ function renderDatasetsTable(host, datasets) {
     <tf-column key="createdAt" label="Data"></tf-column>
   `;
   table.rows = datasets.map((d) => {
-    const id = d.datasetId ?? d.dataset_id ?? '';
+    const id = d.datasetId ?? '';
     return {
       _datasetId: String(id),
       name: d.name || '(bez nazwy)',
       kind: `<span class="tf-chip info">${escapeHtml(datasetKindLabel(d.kind))}</span>`,
-      rowCount: formatNumber(d.rowCount ?? d.row_count),
-      columnCount: formatNumber(d.columnCount ?? d.column_count),
-      createdAt: formatDate(d.createdAt ?? d.created_at),
+      rowCount: formatNumber(d.rowCount),
+      columnCount: formatNumber(d.columnCount),
+      createdAt: formatDate(d.createdAt),
     };
   });
   table.addEventListener('row-click', (e) => {
@@ -1865,9 +1853,9 @@ function renderProfile(profile) {
   if (!host || !card) return;
   card.hidden = false;
 
-  const rowCount = profile.rowCount ?? profile.row_count ?? 0;
-  const columnCount = profile.columnCount ?? profile.column_count ?? 0;
-  const scannedRows = profile.scannedRows ?? profile.scanned_rows ?? 0;
+  const rowCount = profile.rowCount ?? 0;
+  const columnCount = profile.columnCount ?? 0;
+  const scannedRows = profile.scannedRows ?? 0;
   const truncated = profile.truncated ?? false;
   const format = profile.format ? datasetKindLabel(profile.format) : '—';
   const columns = Array.isArray(profile.columns) ? profile.columns : [];
@@ -1905,9 +1893,9 @@ function profileRow(col) {
   const slug = columnTypeSlug(col);
   const typeLabel = COLUMN_TYPE_LABEL[slug] || slug;
   const status = COLUMN_TYPE_STATUS[slug] || 'info';
-  const uniqueCount = col.uniqueCount ?? col.unique_count ?? 0;
-  const uniqueCapped = col.uniqueCapped ?? col.unique_capped ?? false;
-  const missingRatio = Number(col.missingRatio ?? col.missing_ratio ?? 0);
+  const uniqueCount = col.uniqueCount ?? 0;
+  const uniqueCapped = col.uniqueCapped ?? false;
+  const missingRatio = Number(col.missingRatio ?? 0);
   const examples = Array.isArray(col.examples) ? col.examples : [];
   const classes = Array.isArray(col.classes) ? col.classes : [];
 
@@ -2129,7 +2117,7 @@ async function renderDistillDataTab(panel, p) {
     // Modele generacyjne (kategoria 'llm') — teacher i model generujący pytania
     // odpowiadają na prompt. Datalist to PODPOWIEDZI; pole przyjmuje też dowolny
     // alias/model spoza listy (np. zewnętrzny endpoint).
-    const catOf = (m) => String(m.category || m.service_type || '').toLowerCase();
+    const catOf = (m) => String(m.category || '').toLowerCase();
     models = (Array.isArray(ml) ? ml : []).filter((m) => catOf(m) === 'llm');
     datasets = Array.isArray(dss) ? dss : [];
   } catch (e) {
@@ -2139,7 +2127,7 @@ async function renderDistillDataTab(panel, p) {
   const modelNames = [...new Set(models.map((m) => m.name || m.id).filter(Boolean))];
   const modelOptions = modelNames.map((n) => `<option value="${escapeAttr(n)}"></option>`).join('');
   const datasetOptions = datasets
-    .map((d) => `<option value="${escapeAttr(d.datasetId || d.dataset_id || d.id || '')}">${escapeHtml(d.name || '')}</option>`)
+    .map((d) => `<option value="${escapeAttr(d.datasetId || d.id || '')}">${escapeHtml(d.name || '')}</option>`)
     .join('');
 
   panel.innerHTML = `
@@ -2299,7 +2287,7 @@ async function renderDistillDataTab(panel, p) {
     byId('ml-distill-go')?.setAttribute('disabled', 'true');
     try {
       const resp = await ApiBinary.one('mlStudioDistillGenerateRequest', payload);
-      pollDistill(resp.datasetId || resp.dataset_id);
+      pollDistill(resp.datasetId);
     } catch (e) {
       toast(`Błąd startu: ${e.message}`, 'error');
       byId('ml-distill-go')?.removeAttribute('disabled');
@@ -2453,7 +2441,7 @@ async function renderDistillDataTab(panel, p) {
     editStatus.textContent = 'Zapisywanie…';
     try {
       const resp = await ApiBinary.one('mlStudioDatasetRowsSaveRequest', { datasetId: editDatasetId, rows });
-      editStatus.textContent = `Zapisano ${resp.rowCount ?? resp.row_count ?? rows.length} wierszy.`;
+      editStatus.textContent = `Zapisano ${resp.rowCount ?? rows.length} wierszy.`;
       toast('Dataset zapisany', 'success');
     } catch (e) {
       editStatus.textContent = 'Błąd zapisu: ' + (e.message || e);
@@ -2466,7 +2454,7 @@ async function renderDistillDataTab(panel, p) {
     [{ label: '— wybierz dataset —', value: '' }].concat(
       datasets.map((d) => ({
         label: d.name || '(bez nazwy)',
-        value: String(d.datasetId || d.dataset_id || d.id || ''),
+        value: String(d.datasetId || d.id || ''),
       })),
     ),
     '',
@@ -2480,7 +2468,7 @@ async function renderDistillDataTab(panel, p) {
 function renderFtModelTab(panel, p) {
   const pid = projectId(p);
   const cfg = getFtConfig(pid);
-  const isDistill = (p.projectType ?? p.project_type ?? '') === 'distillation';
+  const isDistill = (p.projectType ?? '') === 'distillation';
 
   const modelCards = FT_BASE_MODELS.map((m) => `
     <button type="button" class="ml-studio-train-engine-card ml-studio-ft-model-card${cfg.baseModel === m.id ? ' selected' : ''}"
@@ -2747,7 +2735,7 @@ function renderFtTrainContent(panel, p, pid, datasets, { selectTab }) {
 
   const cfg = ftConfig[pid];
   const datasetOptions = datasets.map((d) => ({
-    value: String(d.datasetId ?? d.dataset_id ?? ''),
+    value: String(d.datasetId ?? ''),
     label: d.name || '(bez nazwy)',
   }));
   const onlyOne = datasetOptions.length === 1;
@@ -2797,7 +2785,7 @@ function renderFtTrainContent(panel, p, pid, datasets, { selectTab }) {
     ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).then((nodes) => {
       const opts = [{ value: '', label: 'Lokalnie (ten node)' }];
       (nodes || []).forEach((n) => {
-        const id = n.nodeId || n.node_id;
+        const id = n.nodeId;
         if (!id) return;
         const host = n.hostname || n.host || '';
         opts.push({ value: id, label: `${host || id.slice(0, 12)} (${id.slice(0, 8)}…)` });
@@ -2862,7 +2850,7 @@ function renderFtTrainContent(panel, p, pid, datasets, { selectTab }) {
         },
       };
       const resp = await ApiBinary.one('mlStudioFtTrainStartRequest', payload);
-      const runId = resp.runId ?? resp.run_id;
+      const runId = resp.runId;
       if (!runId) throw new Error('Backend nie zwrócił runId.');
       // Po starcie chowamy konfigurację i pokazujemy widok LIVE z pollingiem.
       const setup = byId('ml-studio-ft-setup');
@@ -2909,10 +2897,10 @@ function startFtLive(host, runId, { selectTab }) {
     const status = String(st.status || 'running');
     // Faza transferu datasetu przez mesh (trening na zdalnym węźle) — pasek B/s.
     if (status === 'syncing') {
-      const syncPhase = String(st.syncPhase ?? st.sync_phase ?? 'syncing');
-      const sent = Number(st.syncBytesSent ?? st.sync_bytes_sent ?? 0);
-      const tot = Number(st.syncBytesTotal ?? st.sync_bytes_total ?? 0);
-      const rate = Number(st.syncRateBps ?? st.sync_rate_bps ?? 0);
+      const syncPhase = String(st.syncPhase ?? 'syncing');
+      const sent = Number(st.syncBytesSent ?? 0);
+      const tot = Number(st.syncBytesTotal ?? 0);
+      const rate = Number(st.syncRateBps ?? 0);
       const pct = tot > 0 ? Math.max(0, Math.min(100, Math.round((sent / tot) * 100))) : 0;
       const phaseLabel = syncPhase === 'zipping' ? 'pakowanie datasetu'
         : syncPhase === 'starting' ? 'uruchamianie treningu na nodzie'
@@ -2937,10 +2925,10 @@ function startFtLive(host, runId, { selectTab }) {
       return;
     }
     const step = Number(st.step ?? 0);
-    const totalSteps = Number(st.totalSteps ?? st.total_steps ?? 0);
-    const trainLoss = st.trainLoss ?? st.train_loss;
-    const evalLoss = st.evalLoss ?? st.eval_loss;
-    const curve = Array.isArray(st.lossCurve ?? st.loss_curve) ? (st.lossCurve ?? st.loss_curve) : [];
+    const totalSteps = Number(st.totalSteps ?? 0);
+    const trainLoss = st.trainLoss;
+    const evalLoss = st.evalLoss;
+    const curve = Array.isArray(st.lossCurve) ? (st.lossCurve) : [];
 
     // Pasek postępu — gdy znamy totalSteps liczymy procent, inaczej spinner.
     const meta = byId('ml-studio-ft-progress-meta');
@@ -3019,8 +3007,8 @@ function renderLossChart(curve) {
   const points = (curve || [])
     .map((c) => ({
       step: Number(c.step ?? 0),
-      train: c.trainLoss ?? c.train_loss,
-      evalv: c.evalLoss ?? c.eval_loss,
+      train: c.trainLoss,
+      evalv: c.evalLoss,
     }))
     .filter((c) => Number.isFinite(c.step));
   if (points.length < 2) {
@@ -3335,7 +3323,7 @@ function renderRecogDataTab(panel, p) {
       const resp = await ApiBinary.one('mlStudioRecogBuildDatasetRequest', {
         projectId: pid, datasetName: name, fps, sourceDir: sourceDir || undefined,
       });
-      const buildId = resp.buildId ?? resp.build_id ?? '';
+      const buildId = resp.buildId ?? '';
       if (resp.error || !buildId) {
         toast(`Budowa datasetu: ${resp.error || 'nie udało się uruchomić'}`, 'error');
         if (prog) prog.textContent = '';
@@ -3362,8 +3350,8 @@ function renderRecogDataTab(panel, p) {
     try {
       const resp = await ApiBinary.one('mlStudioRecogDatasetRegisterRequest', { projectId: pid, name, path });
       const d = resp.dataset || {};
-      const classes = d.columnCount ?? d.column_count ?? 0;
-      const imgs = d.rowCount ?? d.row_count ?? 0;
+      const classes = d.columnCount ?? 0;
+      const imgs = d.rowCount ?? 0;
       toast(`Dataset zarejestrowany: ${imgs} obrazów, ${classes} klas.`, 'success');
       loadDatasets(pid);
       loadDataPreview(pid);
@@ -3451,12 +3439,12 @@ async function loadDataPreview(pid) {
       return;
     }
     const ds = datasets[0];
-    const datasetId = ds.datasetId ?? ds.dataset_id;
+    const datasetId = ds.datasetId;
     const datasetName = ds.name || '';
     if (gallery) gallery.innerHTML = '<div class="ml-studio-loading"><tf-spinner></tf-spinner></div>';
 
     const imgResp = await ApiBinary.one('mlStudioRecogImagesListRequest', { datasetId });
-    const images = JSON.parse(imgResp.imagesJson ?? imgResp.images_json ?? '[]');
+    const images = JSON.parse(imgResp.imagesJson ?? '[]');
     const total = images.length;
     if (galleryMeta) galleryMeta.textContent = `${formatNumber(total)} obrazów${datasetName ? ' · ' + escapeHtml(datasetName) : ''}`;
     renderSplit(total, datasetName);
@@ -3477,7 +3465,7 @@ async function loadDataPreview(pid) {
         const cell = gallery.querySelector(`.ml-studio-thumb[data-image-id="${CSS.escape(String(im.image_id))}"]`);
         if (!cell) continue;
         ApiBinary.one('mlStudioRecogImageRequest', { datasetId, imageId: im.image_id }).then((r) => {
-          const b64 = r.imageB64 ?? r.image_b64;
+          const b64 = r.imageB64;
           if (!b64 || !cell.isConnected) return;
           cell.style.backgroundImage = `url(data:${r.mime || 'image/jpeg'};base64,${b64})`;
           cell.classList.add('has-img');
@@ -3532,14 +3520,14 @@ function openRecogImportRecordingsModal(pid) {
   // paths deliver it already hex-encoded. Normalize both to a hex string (mirrors
   // how the mesh/cluster UI keys peers by hex node id).
   const peerNodeIdHex = (p) => {
-    const raw = p?.nodeId ?? p?.node_id;
+    const raw = p?.nodeId;
     if (raw == null) return '';
     if (typeof raw === 'string') return raw;
     if (Array.isArray(raw) || raw instanceof Uint8Array) return bytesToHex(raw);
     return '';
   };
   const isTrustedPeer = (p) => {
-    const t = String(p?.trustState ?? p?.trust_state ?? '').toLowerCase();
+    const t = String(p?.trustState ?? '').toLowerCase();
     return t.includes('trusted');
   };
 
@@ -3549,8 +3537,8 @@ function openRecogImportRecordingsModal(pid) {
     publishing: 'Publikacja do zbioru…',
   };
 
-  const refKey = (r) => r.recordingRef ?? r.recording_ref ?? '';
-  const durationOf = (r) => r.durationMs ?? r.duration_ms ?? null;
+  const refKey = (r) => r.recordingRef ?? '';
+  const durationOf = (r) => r.durationMs ?? null;
 
   const formatDuration = (ms) => {
     const s = Math.round(Number(ms) / 1000);
@@ -3569,8 +3557,8 @@ function openRecogImportRecordingsModal(pid) {
   };
 
   const visibleRecordings = () => state.recordings.filter((r) => {
-    if (state.cameraFilter && String(r.cameraId ?? r.camera_id ?? '') !== state.cameraFilter) return false;
-    const created = Number(r.createdAt ?? r.created_at ?? 0);
+    if (state.cameraFilter && String(r.cameraId ?? '') !== state.cameraFilter) return false;
+    const created = Number(r.createdAt ?? 0);
     if (state.dateFrom) {
       const from = Date.parse(`${state.dateFrom}T00:00:00`);
       if (Number.isFinite(from) && created < from) return false;
@@ -3633,14 +3621,14 @@ function openRecogImportRecordingsModal(pid) {
     const vis = visibleRecordings();
     table.rows = vis.map((r) => {
       const ref = refKey(r);
-      const created = Number(r.createdAt ?? r.created_at ?? 0);
+      const created = Number(r.createdAt ?? 0);
       const dur = durationOf(r);
       const durText = dur == null ? 'nieznana długość' : formatDuration(dur);
       const f = estFrames(r, state.fps);
       const framesText = f == null ? 'nieznana długość' : `~${formatNumber(f)}`;
-      const plate = r.plateText ?? r.plate_text;
-      const adr = r.adrText ?? r.adr_text;
-      const thumbUrl = r.thumbUrl ?? r.thumb_url ?? '';
+      const plate = r.plateText;
+      const adr = r.adrText;
+      const thumbUrl = r.thumbUrl ?? '';
       const preview = thumbUrl
         ? `<img src="${escapeAttr(thumbUrl)}" loading="lazy" alt="" style="width:72px;height:44px;object-fit:cover;border-radius:6px;display:block;background:var(--surface-2)">`
         : `<div style="width:72px;height:44px;border-radius:6px;background:var(--surface-2);display:flex;align-items:center;justify-content:center;color:var(--text-3,#888);font-size:10px">brak</div>`;
@@ -3648,11 +3636,11 @@ function openRecogImportRecordingsModal(pid) {
         recordingRef: ref,
         sel: checkCell(selected.has(ref)),
         preview,
-        camera: String(r.cameraId ?? r.camera_id ?? '—'),
+        camera: String(r.cameraId ?? '—'),
         created: created ? new Date(created).toLocaleString('pl-PL') : '—',
         duration: durText,
         frames: framesText,
-        size: formatFileSize(r.fileSizeBytes ?? r.file_size_bytes),
+        size: formatFileSize(r.fileSizeBytes),
         plate: plate ? String(plate) : '—',
         adr: adr ? String(adr) : '—',
       };
@@ -3690,9 +3678,9 @@ function openRecogImportRecordingsModal(pid) {
   const renderOutcomes = (st) => {
     const failed = String(st.status || '') === 'failed';
     const outcomes = Array.isArray(st.outcomes) ? st.outcomes : [];
-    const framesExtracted = Number(st.framesExtracted ?? st.frames_extracted ?? 0);
-    const framesLabeled = Number(st.framesLabeled ?? st.frames_labeled ?? 0);
-    const imagesAdded = Number(st.imagesAdded ?? st.images_added ?? 0);
+    const framesExtracted = Number(st.framesExtracted ?? 0);
+    const framesLabeled = Number(st.framesLabeled ?? 0);
+    const imagesAdded = Number(st.imagesAdded ?? 0);
     const detections = Number(st.detections ?? 0);
     const errMsg = String(st.error ?? '');
     body.innerHTML = `
@@ -3742,10 +3730,10 @@ function openRecogImportRecordingsModal(pid) {
           const skipped = o.skipped ?? null;
           return {
             stan: skipped ? { status: 'warn', label: 'pominięto' } : { status: 'ok', label: 'ok' },
-            recording: String(o.recordingRef ?? o.recording_ref ?? '—'),
+            recording: String(o.recordingRef ?? '—'),
             frames: formatNumber(o.frames ?? 0),
             detections: formatNumber(o.detections ?? 0),
-            skippedFrames: formatNumber(o.skippedFrames ?? o.skipped_frames ?? 0),
+            skippedFrames: formatNumber(o.skippedFrames ?? 0),
             reason: skipped ? String(skipped) : '—',
           };
         });
@@ -3774,8 +3762,8 @@ function openRecogImportRecordingsModal(pid) {
         return;
       }
       const phase = String(st.phase ?? '');
-      const recTotal = Number(st.recordingsTotal ?? st.recordings_total ?? 0);
-      const recDone = Number(st.recordingsDone ?? st.recordings_done ?? 0);
+      const recTotal = Number(st.recordingsTotal ?? 0);
+      const recDone = Number(st.recordingsDone ?? 0);
       const phaseEl = body.querySelector('#ml-studio-rec-phase');
       // Known phases map to a friendly label; any other non-empty phase string
       // (e.g. "pobieranie z węzła NodeB") is shown verbatim, never blanked.
@@ -3786,9 +3774,9 @@ function openRecogImportRecordingsModal(pid) {
       if (kv) {
         kv.entries = [
           { key: 'Nagrania', value: `${formatNumber(recDone)} / ${formatNumber(recTotal)}` },
-          { key: 'Klatki wycięte', value: formatNumber(st.framesExtracted ?? st.frames_extracted ?? 0) },
-          { key: 'Klatki oznaczone', value: formatNumber(st.framesLabeled ?? st.frames_labeled ?? 0) },
-          { key: 'Obrazy dodane', value: formatNumber(st.imagesAdded ?? st.images_added ?? 0) },
+          { key: 'Klatki wycięte', value: formatNumber(st.framesExtracted ?? 0) },
+          { key: 'Klatki oznaczone', value: formatNumber(st.framesLabeled ?? 0) },
+          { key: 'Obrazy dodane', value: formatNumber(st.imagesAdded ?? 0) },
           { key: 'Wykrycia', value: formatNumber(st.detections ?? 0) },
         ];
       }
@@ -3815,7 +3803,7 @@ function openRecogImportRecordingsModal(pid) {
         collision: state.collision,
         sourceNodeId: state.sourceNodeId,
       });
-      jobId = resp.jobId ?? resp.job_id;
+      jobId = resp.jobId;
     } catch (err) {
       if (startBtn) startBtn.removeAttribute('disabled');
       toast(err.message || 'Nie udało się uruchomić importu.', 'error');
@@ -3835,7 +3823,7 @@ function openRecogImportRecordingsModal(pid) {
     const camSel = body.querySelector('#ml-studio-rec-camera');
     if (!camSel?.setOptions) return;
     const cams = Array.from(new Set(
-      state.recordings.map((r) => String(r.cameraId ?? r.camera_id ?? '')).filter(Boolean),
+      state.recordings.map((r) => String(r.cameraId ?? '')).filter(Boolean),
     ));
     const opts = [{ value: '', label: 'Wszystkie kamery' }, ...cams.map((c) => ({ value: c, label: c }))];
     camSel.setOptions(opts, state.cameraFilter || '');
@@ -3930,8 +3918,8 @@ function openRecogImportRecordingsModal(pid) {
     const dsSel = body.querySelector('#ml-studio-rec-dataset');
     if (dsSel?.setOptions) {
       const opts = state.datasets.map((d) => ({
-        value: String(d.datasetId ?? d.dataset_id ?? ''),
-        label: d.name || String(d.datasetId ?? d.dataset_id ?? ''),
+        value: String(d.datasetId ?? ''),
+        label: d.name || String(d.datasetId ?? ''),
       }));
       dsSel.setOptions(opts, opts.length ? opts[0].value : null);
       state.targetDatasetId = opts.length ? opts[0].value : '';
@@ -3952,7 +3940,7 @@ function openRecogImportRecordingsModal(pid) {
         { value: '', label: 'Ten node (lokalny)' },
         ...trusted.map((p) => ({
           value: peerNodeIdHex(p),
-          label: p.displayName || p.display_name || peerNodeIdHex(p).slice(0, 12),
+          label: p.displayName || peerNodeIdHex(p).slice(0, 12),
         })).filter((o) => o.value),
       ];
       srcSel.setOptions(opts, state.sourceNodeId || '');
@@ -4146,7 +4134,7 @@ function renderRecogAnnotateTab(panel, p) {
     try {
       const resp = await ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid });
       const list = (resp.datasets || []).filter((d) => (d.kind || '') === 'coco_path');
-      const opts = list.map((d) => ({ value: d.datasetId ?? d.dataset_id, label: `${d.name} (${d.rowCount ?? d.row_count ?? 0} obr.)` }));
+      const opts = list.map((d) => ({ value: d.datasetId, label: `${d.name} (${d.rowCount ?? 0} obr.)` }));
       if (sel?.setOptions) sel.setOptions(opts, opts.length ? opts[0].value : null);
       if (opts.length) { S.datasetId = opts[0].value; await loadImages(); }
       sel?.addEventListener('change', async (e) => { S.datasetId = e.detail?.value || sel.value; await loadImages(); });
@@ -4156,7 +4144,7 @@ function renderRecogAnnotateTab(panel, p) {
   async function loadSchema() {
     try {
       const resp = await ApiBinary.one('mlStudioSchemaGetRequest', { projectId: pid });
-      const schema = JSON.parse(resp.schemaJson ?? resp.schema_json ?? '{}');
+      const schema = JSON.parse(resp.schemaJson ?? '{}');
       S.schemaClasses = Array.isArray(schema.classes) ? schema.classes : [];
     } catch { S.schemaClasses = []; }
   }
@@ -4164,7 +4152,7 @@ function renderRecogAnnotateTab(panel, p) {
   async function loadDicts() {
     try {
       const resp = await ApiBinary.one('mlStudioLookupDictsListRequest', { projectId: pid });
-      S.dicts = JSON.parse(resp.dictsJson ?? resp.dicts_json ?? '[]');
+      S.dicts = JSON.parse(resp.dictsJson ?? '[]');
     } catch { S.dicts = []; }
   }
 
@@ -4223,7 +4211,7 @@ function renderRecogAnnotateTab(panel, p) {
     try {
       const resp = await ApiBinary.one('mlStudioRecogAutolabelRequest', { datasetId: S.datasetId, threshold: S.threshold, mode: 'only_empty' });
       if (resp.status === 'failed' || resp.error) throw new Error(resp.error || 'start nieudany');
-      const jobId = resp.jobId ?? resp.job_id;
+      const jobId = resp.jobId;
       if (prog) prog.textContent = 'Pre-oznaczanie…';
       await pollRecogAutolabel(jobId, prog, async () => {
         await loadImages();
@@ -4242,8 +4230,8 @@ function renderRecogAnnotateTab(panel, p) {
     host.innerHTML = '<tf-spinner></tf-spinner>';
     try {
       const resp = await ApiBinary.one('mlStudioRecogImagesListRequest', { datasetId: S.datasetId });
-      S.images = JSON.parse(resp.imagesJson ?? resp.images_json ?? '[]');
-      S.categories = JSON.parse(resp.categoriesJson ?? resp.categories_json ?? '[]');
+      S.images = JSON.parse(resp.imagesJson ?? '[]');
+      S.categories = JSON.parse(resp.categoriesJson ?? '[]');
       renderProgress();
       renderTaskList();
       renderClassPanel();
@@ -4341,16 +4329,16 @@ function renderRecogAnnotateTab(panel, p) {
       const im = S.images[idx];
       const resp = await ApiBinary.one('mlStudioRecogImageRequest', { datasetId: S.datasetId, imageId: im.image_id });
       if (resp.error) throw new Error(resp.error);
-      S.origW = resp.origWidth ?? resp.orig_width ?? im.width;
-      S.origH = resp.origHeight ?? resp.orig_height ?? im.height;
-      const anns = JSON.parse(resp.annotationsJson ?? resp.annotations_json ?? '[]');
+      S.origW = resp.origWidth ?? im.width;
+      S.origH = resp.origHeight ?? im.height;
+      const anns = JSON.parse(resp.annotationsJson ?? '[]');
       S.boxes = anns.map((a) => ({
         category_id: a.category_id, x: a.bbox[0], y: a.bbox[1], w: a.bbox[2], h: a.bbox[3],
         score: typeof a.score === 'number' ? a.score : null,
         predicted: a.predicted === true,
         attributes: a.attributes && typeof a.attributes === 'object' ? a.attributes : {},
       }));
-      renderStage(`data:${resp.mime || 'image/jpeg'};base64,${resp.imageB64 ?? resp.image_b64}`);
+      renderStage(`data:${resp.mime || 'image/jpeg'};base64,${resp.imageB64}`);
       renderToolbar();
       renderAttrPanel();
     } catch (err) { stage.innerHTML = `<div class="ml-studio-ft-done-msg error">${escapeHtml(err.message)}</div>`; }
@@ -4585,9 +4573,9 @@ function renderRecogAnnotateTab(panel, p) {
     if (!host) return;
     const dictId = attr.ocr?.lookup_dict_id;
     if (!dictId || !value) { host.innerHTML = ''; return; }
-    const dict = S.dicts.find((d) => d.dictId === dictId || d.dict_id === dictId);
+    const dict = S.dicts.find((d) => d.dictId === dictId);
     if (!dict) { host.innerHTML = ''; return; }
-    let body; try { body = JSON.parse(dict.rowsJson || dict.rows_json || '{}'); } catch { body = {}; }
+    let body; try { body = JSON.parse(dict.rowsJson || '{}'); } catch { body = {}; }
     const cols = body.columns || []; const rows = body.rows || [];
     if (!cols.length) { host.innerHTML = ''; return; }
     const keyCol = cols[0].key;
@@ -5238,7 +5226,7 @@ function renderRecogSchemaTab(panel, p, { selectTab }) {
         const resp = await ApiBinary.one('mlStudioLookupDictSaveRequest', {
           projectId: pid, dictId: dict.dictId || '', name, rowsJson: JSON.stringify(dict.body),
         });
-        const newId = resp.dictId ?? resp.dict_id ?? dict.dictId;
+        const newId = resp.dictId ?? dict.dictId;
         await loadDicts();
         toast('Słownik zapisany.', 'success');
         close();
@@ -5255,18 +5243,18 @@ function renderRecogSchemaTab(panel, p, { selectTab }) {
   async function loadDicts() {
     try {
       const resp = await ApiBinary.one('mlStudioLookupDictsListRequest', { projectId: pid });
-      S.dicts = JSON.parse(resp.dictsJson ?? resp.dicts_json ?? '[]');
+      S.dicts = JSON.parse(resp.dictsJson ?? '[]');
     } catch { S.dicts = []; }
   }
 
   async function loadModels() {
     try {
       const ocr = await ApiBinary.one('mlStudioServiceModelsListRequest', { capability: 'ocr' });
-      S.ocrModels = JSON.parse(ocr.modelsJson ?? ocr.models_json ?? '[]');
+      S.ocrModels = JSON.parse(ocr.modelsJson ?? '[]');
     } catch { S.ocrModels = []; }
     try {
       const cls = await ApiBinary.one('mlStudioServiceModelsListRequest', { capability: 'classifier' });
-      S.classifierModels = JSON.parse(cls.modelsJson ?? cls.models_json ?? '[]');
+      S.classifierModels = JSON.parse(cls.modelsJson ?? '[]');
     } catch { S.classifierModels = []; }
   }
 
@@ -5278,9 +5266,9 @@ function renderRecogSchemaTab(panel, p, { selectTab }) {
       const dsResp = await ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid });
       const list = (dsResp.datasets || []).filter((d) => (d.kind || '') === 'coco_path');
       if (!list.length) return [];
-      const datasetId = list[0].datasetId ?? list[0].dataset_id;
+      const datasetId = list[0].datasetId;
       const imgResp = await ApiBinary.one('mlStudioRecogImagesListRequest', { datasetId });
-      const cats = JSON.parse(imgResp.categoriesJson ?? imgResp.categories_json ?? '[]');
+      const cats = JSON.parse(imgResp.categoriesJson ?? '[]');
       const usable = cats.length > 1 ? cats.filter((c) => c.id !== 0) : cats;
       return usable.map((cat, i) => ({
         name: cat.name, color: RECOG_SCHEMA_PALETTE[i % RECOG_SCHEMA_PALETTE.length],
@@ -5317,7 +5305,7 @@ function renderRecogSchemaTab(panel, p, { selectTab }) {
     let schema = {};
     try {
       const resp = await ApiBinary.one('mlStudioSchemaGetRequest', { projectId: pid });
-      schema = JSON.parse(resp.schemaJson ?? resp.schema_json ?? '{}');
+      schema = JSON.parse(resp.schemaJson ?? '{}');
     } catch { schema = {}; }
     if (Array.isArray(schema.classes) && schema.classes.length) {
       S.classes = schema.classes.map((c) => ({
@@ -5356,7 +5344,7 @@ const ACTIVE_RUN_STATUSES = ['running', 'syncing'];
 // bez `kind` to stare runy detekcji, sprzed rozbicia na tory.
 function runKind(run) {
   try {
-    const cfg = JSON.parse(run.configJson ?? run.config_json ?? '{}');
+    const cfg = JSON.parse(run.configJson ?? '{}');
     return String(cfg.kind || 'detection');
   } catch (_) {
     return 'detection';
@@ -5455,7 +5443,7 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
     setup.hidden = true;
     startRecogLive(
       byId('ml-studio-recog-live'),
-      active.runId ?? active.run_id,
+      active.runId,
       liveOptsForKind(runKind(active), selectTab),
     );
   })();
@@ -5730,9 +5718,9 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
   // Liczności wartości atrybutu z profilu datasetu (gdy backend je udostępnia w
   // profileJson jako attributes[nazwa] = { wartość: liczba }). Brak → null.
   function attrCountsFromProfile(dsId, attribute) {
-    const d = datasetList.find((x) => (x.datasetId ?? x.dataset_id) === dsId);
+    const d = datasetList.find((x) => (x.datasetId) === dsId);
     if (!d) return null;
-    let prof = d.profileJson ?? d.profile_json;
+    let prof = d.profileJson;
     try { prof = typeof prof === 'string' ? JSON.parse(prof) : prof; } catch (_) { return null; }
     const c = prof && prof.attributes && prof.attributes[attribute];
     return c && typeof c === 'object' ? c : null;
@@ -5746,9 +5734,9 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
       datasetList = list;
       const sel = byId('ml-studio-recog-dataset');
       if (sel) {
-        sel.innerHTML = list.map((d) => `<option value="${escapeAttr(d.datasetId ?? d.dataset_id)}">${escapeHtml(d.name)} (${d.rowCount ?? d.row_count ?? 0} obr.)</option>`).join('');
+        sel.innerHTML = list.map((d) => `<option value="${escapeAttr(d.datasetId)}">${escapeHtml(d.name)} (${d.rowCount ?? 0} obr.)</option>`).join('');
         if (list.length) {
-          cfg.datasetId = cfg.datasetId || (list[0].datasetId ?? list[0].dataset_id);
+          cfg.datasetId = cfg.datasetId || (list[0].datasetId);
           sel.value = cfg.datasetId;
           showRecogClasses(list, cfg.datasetId);
         }
@@ -5762,10 +5750,10 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
   })();
 
   function showRecogClasses(list, dsId) {
-    const d = list.find((x) => (x.datasetId ?? x.dataset_id) === dsId);
+    const d = list.find((x) => (x.datasetId) === dsId);
     const box = byId('ml-studio-recog-classes');
     if (!box || !d) return;
-    let prof = d.profileJson ?? d.profile_json;
+    let prof = d.profileJson;
     try { prof = typeof prof === 'string' ? JSON.parse(prof) : prof; } catch (_) { prof = null; }
     const classes = (prof && prof.classes) || [];
     const splits = (prof && prof.splits) || [];
@@ -5782,7 +5770,7 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
     try {
       const resp = await ApiBinary.one('meshNodeListRequest');
       for (const n of (resp.nodes || [])) {
-        const id = String(n.nodeId ?? n.node_id ?? '');
+        const id = String(n.nodeId ?? '');
         if (id) opts.push({ value: id, label: `${n.hostname || id.slice(0, 12)} (zdalny)` });
       }
     } catch (_) { /* brak mesh — tylko lokalnie */ }
@@ -5797,14 +5785,14 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
     let cocoCategories = [];
     try {
       const resp = await ApiBinary.one('mlStudioSchemaGetRequest', { projectId: pid });
-      schema = JSON.parse(resp.schemaJson ?? resp.schema_json ?? '{}');
+      schema = JSON.parse(resp.schemaJson ?? '{}');
     } catch (_) { schema = {}; }
     try {
       const dsResp = await ApiBinary.one('mlStudioDatasetsListRequest', { projectId: pid });
       const first = (dsResp.datasets || []).find((d) => (d.kind || '') === 'coco_path');
       if (first) {
-        const imgResp = await ApiBinary.one('mlStudioRecogImagesListRequest', { datasetId: first.datasetId ?? first.dataset_id });
-        cocoCategories = JSON.parse(imgResp.categoriesJson ?? imgResp.categories_json ?? '[]');
+        const imgResp = await ApiBinary.one('mlStudioRecogImagesListRequest', { datasetId: first.datasetId });
+        cocoCategories = JSON.parse(imgResp.categoriesJson ?? '[]');
       }
     } catch (_) { cocoCategories = []; }
     trainTargets = deriveTrainTargets(schema, cocoCategories);
@@ -5845,7 +5833,7 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
           },
           targetNodeId: cfg.targetNodeId || '',
         });
-        runId = resp.runId ?? resp.run_id;
+        runId = resp.runId;
         liveOpts = liveOptsForKind('classifier', selectTab);
       } else if (cfg.target === 'ocr') {
         if (!cfg.ocrAttribute) throw new Error('Wybierz atrybut z odczytem OCR.');
@@ -5863,7 +5851,7 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
           },
           targetNodeId: cfg.targetNodeId || '',
         });
-        runId = resp.runId ?? resp.run_id;
+        runId = resp.runId;
         liveOpts = liveOptsForKind('ocr', selectTab);
       } else {
         const resp = await ApiBinary.one('mlStudioRecogTrainStartRequest', {
@@ -5880,7 +5868,7 @@ function renderRecogTrainTab(panel, p, { selectTab, focusRunId = '', focusKind =
             earlyStopping: cfg.earlyStopping,
           },
         });
-        runId = resp.runId ?? resp.run_id;
+        runId = resp.runId;
       }
       if (!runId) throw new Error('Backend nie zwrócił runId.');
       const setup = byId('ml-studio-recog-setup');
@@ -6031,10 +6019,10 @@ function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', status
     // Faza transferu datasetu przez mesh (trening na zdalnym węźle B): pasek
     // postępu z prędkością B/s. Błąd dopiero przy stallu (po stronie Core).
     if (status === 'syncing') {
-      const syncPhase = String(st.syncPhase ?? st.sync_phase ?? 'syncing');
-      const sent = Number(st.syncBytesSent ?? st.sync_bytes_sent ?? 0);
-      const tot = Number(st.syncBytesTotal ?? st.sync_bytes_total ?? 0);
-      const rate = Number(st.syncRateBps ?? st.sync_rate_bps ?? 0);
+      const syncPhase = String(st.syncPhase ?? 'syncing');
+      const sent = Number(st.syncBytesSent ?? 0);
+      const tot = Number(st.syncBytesTotal ?? 0);
+      const rate = Number(st.syncRateBps ?? 0);
       const pct = tot > 0 ? Math.max(0, Math.min(100, Math.round((sent / tot) * 100))) : 0;
       const phaseLabel = syncPhase === 'zipping' ? 'pakowanie datasetu'
         : syncPhase === 'starting' ? 'uruchamianie treningu na nodzie'
@@ -6062,7 +6050,7 @@ function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', status
       return;
     }
     const epoch = Number(st.epoch ?? 0);
-    const total = Number(st.totalEpochs ?? st.total_epochs ?? 0);
+    const total = Number(st.totalEpochs ?? 0);
     // Znormalizuj krzywą do wspólnego kształtu {epoch, loss, metric}. Detekcja ma
     // pola per-punkt (trainLoss/map50); generyczny status ma [{epoch,metricName,value}]
     // — punkty z metricName zawierającym „loss" idą na oś strat, reszta na metrykę.
@@ -6076,12 +6064,12 @@ function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', status
     if (isGeneric) {
       const byEpoch = new Map();
       for (const c of rawCurve) {
-        const metricName = String(c.metricName ?? c.metric_name ?? '').toLowerCase();
+        const metricName = String(c.metricName ?? '').toLowerCase();
         if (metricName) lastByName.set(metricName, Number(c.value));
         const e = Number(c.epoch ?? 0);
         if (!byEpoch.has(e)) byEpoch.set(e, { epoch: e, trainLoss: undefined, map50: undefined });
         const slot = byEpoch.get(e);
-        const name = String(c.metricName ?? c.metric_name ?? '').toLowerCase();
+        const name = String(c.metricName ?? '').toLowerCase();
         const val = Number(c.value);
         if (name.includes('loss')) slot.trainLoss = val;
         // Tor może raportować kilka metryk poza stratą (OCR: exact-match na
@@ -6097,7 +6085,7 @@ function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', status
       metricVal = last?.map50;
     } else {
       curve = rawCurve;
-      loss = st.trainLoss ?? st.train_loss;
+      loss = st.trainLoss;
       metricVal = st.map50;
     }
     const meta = byId('ml-studio-recog-meta');
@@ -6114,9 +6102,9 @@ function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', status
     // pamięć GPU joba. ETA bierzemy z `eta_s`, a gdy go nie ma — liczymy sami z
     // tempa zmian epoki mierzonego między pollami.
     const stage = stageLabel(st.stage);
-    const elapsedS = Number(st.elapsedS ?? st.elapsed_s);
-    const gpuMemMb = Number(st.gpuMemMb ?? st.gpu_mem_mb);
-    let etaS = Number(st.etaS ?? st.eta_s);
+    const elapsedS = Number(st.elapsedS);
+    const gpuMemMb = Number(st.gpuMemMb);
+    let etaS = Number(st.etaS);
     if (epoch !== etaTracker.lastEpoch) {
       const now = Date.now();
       if (etaTracker.lastEpoch >= 0 && epoch > etaTracker.lastEpoch) {
@@ -6246,7 +6234,7 @@ function startRecogLive(host, runId, { selectTab, metricLabel = 'mAP@50', status
 // Obie serie skalowane niezależnie do własnego min/max (różne jednostki).
 function renderRecogChart(curve) {
   const points = (curve || [])
-    .map((c) => ({ epoch: Number(c.epoch ?? 0), loss: c.trainLoss ?? c.train_loss, map: c.map50 }))
+    .map((c) => ({ epoch: Number(c.epoch ?? 0), loss: c.trainLoss, map: c.map50 }))
     .filter((c) => Number.isFinite(c.epoch));
   if (points.length < 2) {
     return '<div class="ml-studio-ft-chart-empty">Krzywa pojawi się po pierwszych epokach treningu.</div>';
@@ -6334,14 +6322,14 @@ async function showJobsOverview() {
   const renderGpu = (gpu) => {
     const box = byId('ml-studio-jobs-gpu');
     if (!box) return;
-    if (!gpu || !(gpu.name || gpu.memTotalMb || gpu.mem_total_mb)) {
+    if (!gpu || !(gpu.name || gpu.memTotalMb)) {
       box.innerHTML = '';
       return;
     }
     const name = gpu.name || 'GPU';
-    const used = Number(gpu.memUsedMb ?? gpu.mem_used_mb ?? 0);
-    const totalMem = Number(gpu.memTotalMb ?? gpu.mem_total_mb ?? 0);
-    const util = Number(gpu.utilPct ?? gpu.util_pct ?? 0);
+    const used = Number(gpu.memUsedMb ?? 0);
+    const totalMem = Number(gpu.memTotalMb ?? 0);
+    const util = Number(gpu.utilPct ?? 0);
     const memPct = totalMem > 0 ? Math.max(0, Math.min(100, Math.round((used / totalMem) * 100))) : 0;
     box.innerHTML = `
       <section class="ml-studio-gpu-card">
@@ -6392,13 +6380,13 @@ async function showJobsOverview() {
       <tf-column key="vram" label="VRAM"></tf-column>
     `;
     table.rows = jobs.map((j) => {
-      const runId = String(j.runId ?? j.run_id ?? '');
-      const pid = String(j.projectId ?? j.project_id ?? '');
+      const runId = String(j.runId ?? '');
+      const pid = String(j.projectId ?? '');
       const kind = j.kind ?? '';
       const epoch = Number(j.epoch ?? 0);
-      const total = Number(j.totalEpochs ?? j.total_epochs ?? 0);
-      const etaS = Number(j.etaS ?? j.eta_s);
-      const gpuMemMb = Number(j.gpuMemMb ?? j.gpu_mem_mb);
+      const total = Number(j.totalEpochs ?? 0);
+      const etaS = Number(j.etaS);
+      const gpuMemMb = Number(j.gpuMemMb);
       const b = runBadge(j.status);
       const stage = stageLabel(j.stage);
       const pct = total > 0 ? Math.max(0, Math.min(100, Math.round((epoch / total) * 100))) : 0;
@@ -6410,7 +6398,7 @@ async function showJobsOverview() {
         runId,
         projectId: pid,
         kind: jobKindLabel(kind),
-        project: `<div class="ml-studio-job-project"><span class="ml-studio-job-name">${escapeHtml(j.projectName ?? j.project_name ?? '(projekt)')}</span>${stage ? `<span class="ml-studio-job-stage">${escapeHtml(stage)}</span>` : ''}</div>`,
+        project: `<div class="ml-studio-job-project"><span class="ml-studio-job-name">${escapeHtml(j.projectName ?? '(projekt)')}</span>${stage ? `<span class="ml-studio-job-stage">${escapeHtml(stage)}</span>` : ''}</div>`,
         variant: escapeHtml(String(j.variant ?? '—')) || '—',
         status: `<tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge>`,
         progress: progressHtml,
@@ -6482,8 +6470,8 @@ function modelMetricsSummary(metricsJson) {
   const parts = [];
   const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
   const acc = num(m.accuracy ?? m.acc);
-  const f1 = num(m.f1 ?? m.f1_score ?? m.f1Score);
-  const loss = num(m.train_loss ?? m.trainLoss ?? m.eval_loss ?? m.evalLoss ?? m.loss);
+  const f1 = num(m.f1 ?? m.f1Score);
+  const loss = num(m.train_loss ?? m.eval_loss ?? m.loss);
   if (acc != null) parts.push(`acc ${acc.toFixed(2)}`);
   if (f1 != null) parts.push(`f1 ${f1.toFixed(2)}`);
   if (loss != null) parts.push(`loss ${formatLoss(loss)}`);
@@ -6540,9 +6528,9 @@ function renderModelsTab(panel, p) {
       `;
       table.rows = models.map((m) => {
         const b = runBadge(m.status);
-        const metrics = modelMetricsSummary(m.metricsJson ?? m.metrics_json);
-        const modelId = String(m.modelId ?? m.model_id ?? '');
-        const baseModel = String(m.baseModel ?? m.base_model ?? '');
+        const metrics = modelMetricsSummary(m.metricsJson);
+        const modelId = String(m.modelId ?? '');
+        const baseModel = String(m.baseModel ?? '');
         const modelName = String(m.name ?? (modelId || '—'));
         // Stan z metryk: wdrożony (`inference_model_name`) oraz wyeksportowany
         // do GGUF (`export_status=succeeded` + `gguf_path`).
@@ -6550,7 +6538,7 @@ function renderModelsTab(panel, p) {
         let deploying = false;
         let exported = false;
         try {
-          const mj = JSON.parse(m.metricsJson ?? m.metrics_json ?? '{}');
+          const mj = JSON.parse(m.metricsJson ?? '{}');
           // „Zapytaj" tylko gdy serwis REALNIE serwuje model — status jest
           // rekoncyliowany po żywym serwisie (patrz reconcile_local_inference_status).
           // Sama obecność `inference_model_name` nie wystarcza: serwis mógł paść
@@ -6567,7 +6555,7 @@ function renderModelsTab(panel, p) {
           baseModel: baseModel || '—',
           status: `<tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge>`,
           metrics: metrics || '—',
-          createdAt: formatRelative(m.createdAt ?? m.created_at),
+          createdAt: formatRelative(m.createdAt),
           // Pola pomocnicze do buildera akcji (nie kolumny — tf-table ich nie renderuje).
           _modelId: modelId,
           _modelName: modelName,
@@ -6740,13 +6728,13 @@ function renderVisionRegistrySection(panel, p) {
         <tf-column key="createdAt" label="Dodany"></tf-column>
       `;
       table.rows = models.map((m) => ({
-        name: String(m.modelName ?? m.model_name ?? ''),
+        name: String(m.modelName ?? ''),
         op: String(m.op ?? '') === 'detect' ? 'detekcja' : 'klasyfikacja',
         source: String(m.source ?? ''),
         classes: String((m.classes || []).length),
         sha: String(m.sha256 ?? '').slice(0, 12),
-        createdAt: formatRelative(m.createdAt ?? m.created_at),
-        _modelName: String(m.modelName ?? m.model_name ?? ''),
+        createdAt: formatRelative(m.createdAt),
+        _modelName: String(m.modelName ?? ''),
       }));
       table.rowActions = (row, idx, currentRow) => {
         if (!row) return null;
@@ -6952,7 +6940,7 @@ function openRecogDetectPanel(p, modelId, modelName) {
       const resp = await ApiBinary.one('mlStudioRecogDetectRequest', { modelId, threshold, imageB64: b64 });
       if (resp.error) throw new Error(resp.error);
       let dets = [];
-      try { dets = JSON.parse(resp.detectionsJson ?? resp.detections_json ?? '[]'); } catch (_) { dets = []; }
+      try { dets = JSON.parse(resp.detectionsJson ?? '[]'); } catch (_) { dets = []; }
       renderDetections(result, b64, mime, dets, resp.width, resp.height);
     } catch (err) {
       if (result) result.innerHTML = `<div class="ml-studio-ft-done-msg error">${sprite('alert')} Detekcja nieudana: ${escapeHtml(err.message || String(err))}</div>`;
@@ -6969,13 +6957,13 @@ function renderDetections(host, b64, mime, dets, width, height) {
   }
   const W = width || 1000, H = height || 1000;
   const boxes = dets.map((d, i) => {
-    const [x1, y1, x2, y2] = d.bbox_xyxy || d.bboxXyxy || [0, 0, 0, 0];
+    const [x1, y1, x2, y2] = d.bbox_xyxy || [0, 0, 0, 0];
     const hue = (i * 67) % 360;
     return `<rect x="${x1}" y="${y1}" width="${Math.max(0, x2 - x1)}" height="${Math.max(0, y2 - y1)}"
       fill="none" stroke="hsl(${hue} 90% 55%)" stroke-width="${Math.max(2, W / 300)}"/>
-      <text x="${x1}" y="${Math.max(12, y1 - 4)}" fill="hsl(${hue} 90% 55%)" font-size="${Math.max(12, W / 50)}" font-weight="700">${escapeHtml(d.class_name ?? d.className ?? '')} ${(Number(d.score) * 100).toFixed(0)}%</text>`;
+      <text x="${x1}" y="${Math.max(12, y1 - 4)}" fill="hsl(${hue} 90% 55%)" font-size="${Math.max(12, W / 50)}" font-weight="700">${escapeHtml(d.class_name ?? '')} ${(Number(d.score) * 100).toFixed(0)}%</text>`;
   }).join('');
-  const list = dets.map((d) => `<li><strong>${escapeHtml(d.class_name ?? d.className ?? '')}</strong> — ${(Number(d.score) * 100).toFixed(1)}%</li>`).join('');
+  const list = dets.map((d) => `<li><strong>${escapeHtml(d.class_name ?? '')}</strong> — ${(Number(d.score) * 100).toFixed(1)}%</li>`).join('');
   host.innerHTML = `
     <div style="position:relative;max-width:100%;border:1px solid var(--border);border-radius:var(--radius-sm);overflow:hidden">
       <img src="data:${mime || 'image/jpeg'};base64,${b64}" style="display:block;width:100%;height:auto"/>
@@ -7022,7 +7010,7 @@ async function deployFtModel(modelId, modelName, onDone, project) {
   ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).then((nodes) => {
     const opts = [{ value: '', label: 'Node modelu (domyślnie)' }];
     (nodes || []).forEach((n) => {
-      const id = n.nodeId ?? n.node_id ?? '';
+      const id = n.nodeId ?? '';
       const host = n.hostname ?? n.host ?? id.slice(0, 12);
       if (id) opts.push({ value: id, label: `${host} (${id.slice(0, 8)})` });
     });
@@ -7039,9 +7027,9 @@ async function deployFtModel(modelId, modelName, onDone, project) {
     try {
       const resp = await ApiBinary.one('mlStudioModelsListRequest', { projectId: pid });
       const models = Array.isArray(resp.models) ? resp.models : [];
-      const m = models.find((x) => String(x.modelId ?? x.model_id ?? '') === String(modelId));
+      const m = models.find((x) => String(x.modelId ?? '') === String(modelId));
       if (!m) return null;
-      return JSON.parse(m.metricsJson ?? m.metrics_json ?? '{}');
+      return JSON.parse(m.metricsJson ?? '{}');
     } catch (_) { return null; }
   };
 
@@ -7251,8 +7239,8 @@ function openFtExportPanel(p, modelId, modelName) {
 
   // Widok 3: wynik — ścieżka pliku na węźle + rozmiar + akcja deployu do inferencji.
   const renderResult = (st) => {
-    const ggufPath = String(st.ggufPath ?? st.gguf_path ?? '');
-    const size = formatFileSize(st.sizeBytes ?? st.size_bytes);
+    const ggufPath = String(st.ggufPath ?? '');
+    const size = formatFileSize(st.sizeBytes);
     body.innerHTML = `
       <div class="ml-studio-export-result">
         <div class="ml-studio-export-result-head">
@@ -7512,7 +7500,7 @@ function openProjectExportModal(project) {
 
   // Widok 3: archiwum gotowe — rozmiar + akcja pobrania natywnym downloaderem.
   const renderResult = (st, signedUrl) => {
-    const sizeText = formatFileSize(st.archiveBytes ?? st.archive_bytes);
+    const sizeText = formatFileSize(st.archiveBytes);
     body.innerHTML = `
       <div class="ml-studio-export-result">
         <div class="ml-studio-export-result-head">${sprite('check')} <span>Archiwum gotowe</span> <tf-badge tone="success" value="Gotowe"></tf-badge></div>
@@ -7552,10 +7540,10 @@ function openProjectExportModal(project) {
       if (!modal.isConnected) return;
       const status = String(st.status || 'running');
       const phase = String(st.phase ?? '') || 'Pakowanie projektu…';
-      const bytesTotal = Number(st.bytesTotal ?? st.bytes_total ?? 0);
-      const bytesDone = Number(st.bytesDone ?? st.bytes_done ?? 0);
-      const filesTotal = Number(st.filesTotal ?? st.files_total ?? 0);
-      const filesDone = Number(st.filesDone ?? st.files_done ?? 0);
+      const bytesTotal = Number(st.bytesTotal ?? 0);
+      const bytesDone = Number(st.bytesDone ?? 0);
+      const filesTotal = Number(st.filesTotal ?? 0);
+      const filesDone = Number(st.filesDone ?? 0);
       const pct = bytesTotal > 0
         ? Math.min(100, Math.round((bytesDone / bytesTotal) * 100))
         : (filesTotal > 0 ? Math.min(100, Math.round((filesDone / filesTotal) * 100)) : 0);
@@ -7566,7 +7554,7 @@ function openProjectExportModal(project) {
         renderError(String(st.error ?? '') || 'Eksport nie powiódł się.');
         return;
       }
-      const signedUrl = st.signedUrl ?? st.signed_url ?? '';
+      const signedUrl = st.signedUrl ?? '';
       if (signedUrl) {
         renderResult(st, signedUrl);
         return;
@@ -7591,7 +7579,7 @@ function openProjectExportModal(project) {
       const resp = await ApiBinary.one('mlStudioProjectExportStartRequest', {
         projectId: pid, includeModels, includeHistory,
       });
-      jobId = resp.jobId ?? resp.job_id;
+      jobId = resp.jobId;
     } catch (err) {
       if (startBtn) startBtn.removeAttribute('disabled');
       toast(err.message || 'Nie udało się uruchomić eksportu.', 'error');
@@ -7779,8 +7767,8 @@ function openProjectImportModal() {
         if (!modal.isConnected) return;
         // Postęp z prawdy serwera, nie z lokalnego licznika (ten może wyprzedzać
         // to, co faktycznie wylądowało po stronie serwera).
-        seq = resp.receivedChunks ?? resp.received_chunks ?? (seq + 1);
-        sentBytes = resp.receivedBytes ?? resp.received_bytes ?? end;
+        seq = resp.receivedChunks ?? (seq + 1);
+        sentBytes = resp.receivedBytes ?? end;
         complete = resp.complete === true;
         attempt = 0; // reset po każdym udanym chunku
         setUploadPhase('Wysyłanie archiwum…');
@@ -7799,7 +7787,7 @@ function openProjectImportModal() {
         }
         if (!modal.isConnected) return;
         if (st && st.complete === true) {
-          sentBytes = st.receivedBytes ?? st.received_bytes ?? file.size;
+          sentBytes = st.receivedBytes ?? file.size;
           setUploadProgress(pct(), bytesText());
           complete = true;
           break;
@@ -7814,10 +7802,10 @@ function openProjectImportModal() {
           continue;
         }
         let resumed = false;
-        if (st && (st.receivedChunks != null || st.received_chunks != null)) {
+        if (st && (st.receivedChunks != null)) {
           // Serwer zna postęp — wznów od jego pozycji i pokaż to uczciwie.
-          seq = st.receivedChunks ?? st.received_chunks ?? seq;
-          sentBytes = st.receivedBytes ?? st.received_bytes ?? seq * CHUNK_SIZE;
+          seq = st.receivedChunks ?? seq;
+          sentBytes = st.receivedBytes ?? seq * CHUNK_SIZE;
           setUploadProgress(pct(), bytesText());
           resumed = true;
         }
@@ -7863,16 +7851,16 @@ function openProjectImportModal() {
 
   // Etap 3: inwentarz paczki + wybór trybu importu (nowy projekt / scalenie).
   const renderPreview = (preview) => {
-    const projName = preview.projectName ?? preview.project_name ?? '(bez nazwy)';
-    const projTypeSlug = preview.projectType ?? preview.project_type ?? '—';
+    const projName = preview.projectName ?? '(bez nazwy)';
+    const projTypeSlug = preview.projectType ?? '—';
     const datasets = Array.isArray(preview.datasets) ? preview.datasets : [];
     const classes = Array.isArray(preview.classes) ? preview.classes : [];
-    const hasModels = preview.hasModels === true || preview.has_models === true;
-    const hasHistory = preview.hasHistory === true || preview.has_history === true;
-    const totalBytes = preview.totalUncompressedBytes ?? preview.total_uncompressed_bytes ?? 0;
-    const missing = Array.isArray(preview.missingArtifacts ?? preview.missing_artifacts)
-      ? (preview.missingArtifacts ?? preview.missing_artifacts) : [];
-    const archiveVersion = preview.archiveVersion ?? preview.archive_version ?? '—';
+    const hasModels = preview.hasModels === true;
+    const hasHistory = preview.hasHistory === true;
+    const totalBytes = preview.totalUncompressedBytes ?? 0;
+    const missing = Array.isArray(preview.missingArtifacts)
+      ? (preview.missingArtifacts) : [];
+    const archiveVersion = preview.archiveVersion ?? '—';
 
     const classChips = classes.length
       ? classes.map((c) => `<tf-chip label="${escapeAttr(String(c))}"></tf-chip>`).join('')
@@ -7929,9 +7917,9 @@ function openProjectImportModal() {
           <tf-column key="annotations" label="Anotacje" renderer="num"></tf-column>
         `;
         table.rows = datasets.map((d) => ({
-          name: String(d.name ?? d.datasetId ?? d.dataset_id ?? '—'),
-          images: Number(d.imageCount ?? d.image_count ?? 0),
-          annotations: Number(d.annotationCount ?? d.annotation_count ?? 0),
+          name: String(d.name ?? d.datasetId ?? '—'),
+          images: Number(d.imageCount ?? 0),
+          annotations: Number(d.annotationCount ?? 0),
         }));
         dsHost.appendChild(table);
       }
@@ -7957,8 +7945,8 @@ function openProjectImportModal() {
             const list = Array.isArray(resp.datasets) ? resp.datasets : [];
             if (!modal.isConnected) return;
             const opts = list.map((d) => ({
-              value: String(d.datasetId ?? d.dataset_id ?? ''),
-              label: String(d.name ?? d.datasetId ?? d.dataset_id ?? '—'),
+              value: String(d.datasetId ?? ''),
+              label: String(d.name ?? d.datasetId ?? '—'),
             }));
             dsSel?.setOptions(opts.length ? opts : [{ value: '', label: 'Brak datasetów w projekcie' }], opts.length ? opts[0].value : '');
           } catch (_) {
@@ -8016,10 +8004,10 @@ function openProjectImportModal() {
       if (!modal.isConnected) return;
       const status = String(st.status || 'running');
       const phase = String(st.phase ?? '') || 'Import w toku…';
-      const bytesTotal = Number(st.bytesTotal ?? st.bytes_total ?? 0);
-      const bytesDone = Number(st.bytesDone ?? st.bytes_done ?? 0);
-      const filesTotal = Number(st.filesTotal ?? st.files_total ?? 0);
-      const filesDone = Number(st.filesDone ?? st.files_done ?? 0);
+      const bytesTotal = Number(st.bytesTotal ?? 0);
+      const bytesDone = Number(st.bytesDone ?? 0);
+      const filesTotal = Number(st.filesTotal ?? 0);
+      const filesDone = Number(st.filesDone ?? 0);
       const pct = bytesTotal > 0
         ? Math.min(100, Math.round((bytesDone / bytesTotal) * 100))
         : (filesTotal > 0 ? Math.min(100, Math.round((filesDone / filesTotal) * 100)) : 0);
@@ -8072,7 +8060,7 @@ function openProjectImportModal() {
     let jobId;
     try {
       const resp = await ApiBinary.one('mlStudioProjectImportApplyRequest', payload);
-      jobId = resp.jobId ?? resp.job_id;
+      jobId = resp.jobId;
     } catch (err) {
       if (applyBtn) applyBtn.removeAttribute('disabled');
       // Uczciwość scalania: serwer odrzuca import, gdy archiwum deklaruje klasę,
@@ -8238,8 +8226,8 @@ function openProjectRemoteImportModal() {
       if (!modal.isConnected) return;
       const status = String(st.status || 'running');
       const phase = String(st.phase ?? '');
-      const bytesTotal = Number(st.bytesTotal ?? st.bytes_total ?? 0);
-      const bytesDone = Number(st.bytesDone ?? st.bytes_done ?? 0);
+      const bytesTotal = Number(st.bytesTotal ?? 0);
+      const bytesDone = Number(st.bytesDone ?? 0);
       const pct = bytesTotal > 0 ? Math.min(100, Math.round((bytesDone / bytesTotal) * 100)) : 0;
       const bytesText = bytesTotal > 0 ? `${formatFileSize(bytesDone)} / ${formatFileSize(bytesTotal)}` : '';
       if (status === 'failed') {
@@ -8297,7 +8285,7 @@ function openProjectRemoteImportModal() {
     let jobId;
     try {
       const resp = await ApiBinary.one('mlStudioRemoteImportStartRequest', payload);
-      jobId = resp.jobId ?? resp.job_id;
+      jobId = resp.jobId;
     } catch (err) {
       if (!modal.isConnected) return;
       if (importBtn) importBtn.removeAttribute('disabled');
@@ -8366,9 +8354,9 @@ function renderRunsTab(panel, p, { selectTab } = {}) {
         <tf-column key="actions" label="" renderer="html"></tf-column>
       `;
       table.rows = runs.map((r) => {
-        const runId = String(r.runId ?? r.run_id ?? '');
+        const runId = String(r.runId ?? '');
         const b = runBadge(r.status);
-        const finished = r.finishedAt ?? r.finished_at;
+        const finished = r.finishedAt;
         const kind = runKind(r);
         const activeRun = ACTIVE_RUN_STATUSES.includes(String(r.status || ''));
         // Trwający job: podgląd na żywo + anulowanie wprost z listy. Bez tego
@@ -8386,7 +8374,7 @@ function renderRunsTab(panel, p, { selectTab } = {}) {
           run: `<span class="ml-studio-mono">${escapeHtml(runId.slice(0, 8) || '—')}</span>`,
           kind: TRAIN_KIND_LABELS[kind] || kind,
           status: `<tf-badge tone="${b.tone}" value="${escapeAttr(b.label)}"></tf-badge>`,
-          started: formatRelative(r.startedAt ?? r.started_at),
+          started: formatRelative(r.startedAt),
           finished: finished ? formatRelative(finished) : '—',
           actions,
         };
@@ -8403,7 +8391,7 @@ function renderRunsTab(panel, p, { selectTab } = {}) {
         if (liveBtn) {
           e.stopPropagation();
           const runId = liveBtn.getAttribute('data-live');
-          const row = runs.find((r) => String(r.runId ?? r.run_id ?? '') === runId);
+          const row = runs.find((r) => String(r.runId ?? '') === runId);
           // Podgląd żyje w zakładce Trening — tam jest widok live i jego polling.
           if (selectTab) selectTab('Trening', { runId, kind: runKind(row || {}) });
           return;
@@ -8453,10 +8441,10 @@ function renderRunDetail(host, runId) {
     .then((st) => {
       const status = String(st.status || 'running');
       const step = Number(st.step ?? 0);
-      const totalSteps = Number(st.totalSteps ?? st.total_steps ?? 0);
-      const trainLoss = st.trainLoss ?? st.train_loss;
-      const evalLoss = st.evalLoss ?? st.eval_loss;
-      const curve = Array.isArray(st.lossCurve ?? st.loss_curve) ? (st.lossCurve ?? st.loss_curve) : [];
+      const totalSteps = Number(st.totalSteps ?? 0);
+      const trainLoss = st.trainLoss;
+      const evalLoss = st.evalLoss;
+      const curve = Array.isArray(st.lossCurve) ? (st.lossCurve) : [];
       const b = runBadge(status);
       host.innerHTML = `
         <div class="ml-studio-section-card">
@@ -8596,7 +8584,7 @@ function renderTrainContent(panel, pid, datasets) {
 
   datasetSel?.setOptions(
     datasets.map((d) => ({
-      value: String(d.datasetId ?? d.dataset_id ?? ''),
+      value: String(d.datasetId ?? ''),
       label: d.name || '(bez nazwy)',
     })),
     null,
@@ -8708,7 +8696,7 @@ async function setupEnginePicker(state) {
   try {
     const services = await ApiBinary.list('serviceListRequest', { arrayKey: 'services' });
     const running = (Array.isArray(services) ? services : []).some((s) =>
-      (s.engine_id || s.engineId || '') === 'autogluon-training'
+      (s.engineId || '') === 'autogluon-training'
       && (s.category || '') === 'training'
       && (s.status || '').toLowerCase() === 'running');
     if (running && autoCard) {
@@ -8757,7 +8745,7 @@ function renderTrainCallout(col, task) {
       <div class="ml-studio-train-callout-note">→ <strong>klasyfikacja</strong>. Liczba klas to policzone unikalne wartości w tej kolumnie — nie ustawienie systemu.</div>
     `;
   } else if (task === 'classification') {
-    const uniqueCount = col.uniqueCount ?? col.unique_count ?? 0;
+    const uniqueCount = col.uniqueCount ?? 0;
     body = `
       <div class="ml-studio-train-callout-title">${sprite('info')} Wykryto: <strong>${escapeHtml(typeLbl)}</strong>, ${formatNumber(uniqueCount)} unikalnych wartości</div>
       <div class="ml-studio-train-callout-note">→ <strong>klasyfikacja</strong>. Każda unikalna wartość kolumny-celu staje się klasą.</div>
@@ -8820,8 +8808,8 @@ function renderLeaderboard(resp, state) {
   card.hidden = false;
 
   const isRegression = state.task === 'regression';
-  const runId = String(resp.runId ?? resp.run_id ?? '');
-  const bestModelId = String(resp.bestModelId ?? resp.best_model_id ?? '');
+  const runId = String(resp.runId ?? '');
+  const bestModelId = String(resp.bestModelId ?? '');
   let rows = Array.isArray(resp.leaderboard) ? resp.leaderboard.slice() : [];
 
   // Sort best-first: by F1 (classification) or by lowest RMSE (regression).
@@ -8829,10 +8817,10 @@ function renderLeaderboard(resp, state) {
     if (isRegression) {
       return Number(a.rmse ?? a.RMSE ?? Infinity) - Number(b.rmse ?? b.RMSE ?? Infinity);
     }
-    return Number(b.f1Macro ?? b.f1_macro ?? 0) - Number(a.f1Macro ?? a.f1_macro ?? 0);
+    return Number(b.f1Macro ?? 0) - Number(a.f1Macro ?? 0);
   });
 
-  const modelId = (m) => String(m.modelId ?? m.model_id ?? m.modelName ?? m.model_name ?? '');
+  const modelId = (m) => String(m.modelId ?? m.modelName ?? '');
   const best = rows.find((m) => bestModelId && modelId(m) === bestModelId) || rows[0];
 
   if (meta) {
@@ -8844,15 +8832,15 @@ function renderLeaderboard(resp, state) {
   if (bestHost) {
     bestHost.innerHTML = '';
     if (best) {
-      const name = String(best.modelName ?? best.model_name ?? '—');
+      const name = String(best.modelName ?? '—');
       const cards = isRegression
         ? `<tf-stat-card label="Najlepszy model" value="${escapeAttr(name)}" icon="star"></tf-stat-card>
            <tf-stat-card label="RMSE" value="${escapeAttr(fmtMetric(best.rmse ?? best.RMSE))}" icon="bar-chart"></tf-stat-card>
-           <tf-stat-card label="Czas treningu" value="${escapeAttr(fmtSecs(best.trainSecs ?? best.train_secs))}" icon="clock"></tf-stat-card>`
+           <tf-stat-card label="Czas treningu" value="${escapeAttr(fmtSecs(best.trainSecs))}" icon="clock"></tf-stat-card>`
         : `<tf-stat-card label="Najlepszy model" value="${escapeAttr(name)}" icon="star"></tf-stat-card>
            <tf-stat-card label="Dokładność" value="${escapeAttr(fmtMetric(best.accuracy))}" icon="check"></tf-stat-card>
-           <tf-stat-card label="F1 (macro)" value="${escapeAttr(fmtMetric(best.f1Macro ?? best.f1_macro))}" icon="bar-chart"></tf-stat-card>
-           <tf-stat-card label="Czas treningu" value="${escapeAttr(fmtSecs(best.trainSecs ?? best.train_secs))}" icon="clock"></tf-stat-card>`;
+           <tf-stat-card label="F1 (macro)" value="${escapeAttr(fmtMetric(best.f1Macro))}" icon="bar-chart"></tf-stat-card>
+           <tf-stat-card label="Czas treningu" value="${escapeAttr(fmtSecs(best.trainSecs))}" icon="clock"></tf-stat-card>`;
       bestHost.innerHTML = cards;
     }
   }
@@ -8885,21 +8873,21 @@ function renderLeaderboard(resp, state) {
       <tf-column key="trainSecs" label="Czas" renderer="num"></tf-column>
     `;
   table.rows = rows.map((m) => {
-    const name = String(m.modelName ?? m.model_name ?? '—');
+    const name = String(m.modelName ?? '—');
     const isBest = bestId && modelId(m) === bestId;
     const nameHtml = isBest
       ? `<span class="ml-studio-train-best-row">${sprite('star')} <strong>${escapeHtml(name)}</strong> <tf-chip status="accent" label="najlepszy"></tf-chip></span>`
       : `<span>${escapeHtml(name)}</span>`;
     const row = {
       model: nameHtml,
-      framework: String(m.framework ?? m.framework_name ?? '—') || '—',
-      trainSecs: fmtSecs(m.trainSecs ?? m.train_secs),
+      framework: String(m.framework ?? '—') || '—',
+      trainSecs: fmtSecs(m.trainSecs),
     };
     if (isRegression) {
       row.rmse = fmtMetric(m.rmse ?? m.RMSE);
     } else {
       row.accuracy = fmtMetric(m.accuracy);
-      row.f1Macro = fmtMetric(m.f1Macro ?? m.f1_macro);
+      row.f1Macro = fmtMetric(m.f1Macro);
     }
     return row;
   });
@@ -9026,7 +9014,7 @@ function roleLegendItem(role, desc) {
 }
 
 function memberUserId(m) {
-  return String(m.userId ?? m.user_id ?? '');
+  return String(m.userId ?? '');
 }
 
 function renderMembersTable(pid, project, members, isOwner) {
@@ -9036,11 +9024,11 @@ function renderMembersTable(pid, project, members, isOwner) {
 
   table.rows = members.map((m) => {
     const uid = memberUserId(m);
-    const name = m.displayName ?? m.display_name ?? uid;
+    const name = m.displayName ?? uid;
     const role = String(m.role ?? '').toLowerCase();
     const status = String(m.status ?? 'active').toLowerCase();
     const isSelf = selfId && uid === selfId;
-    const invitedBy = m.invitedBy ?? m.invited_by;
+    const invitedBy = m.invitedBy;
 
     const userHtml = `
       <div class="ml-studio-member-cell">
@@ -9073,7 +9061,7 @@ function renderMembersTable(pid, project, members, isOwner) {
       role: roleHtml,
       status: statusHtml,
       invitedBy: invitedBy ? String(invitedBy) : (role === 'owner' ? '— (twórca)' : '—'),
-      createdAt: formatDate(m.createdAt ?? m.created_at),
+      createdAt: formatDate(m.createdAt),
     };
   });
 
@@ -9178,7 +9166,7 @@ const RESOURCE_KIND_LABEL = {
 // gpus[].name); the §11.3 contract documents camelCase. Read both so the screen
 // survives either casing.
 function nodeIdOf(n) {
-  return String(n.nodeId ?? n.node_id ?? '');
+  return String(n.nodeId ?? '');
 }
 function nodeHostname(n) {
   const id = nodeIdOf(n);
@@ -9191,13 +9179,13 @@ function gpuName(g) {
   return g.name || g.model || '(GPU)';
 }
 function gpuVramMb(g) {
-  return Number(g.vramTotalMb ?? g.vram_total_mb ?? 0);
+  return Number(g.vramTotalMb ?? 0);
 }
 function nodeCpuCount(n) {
-  return Number(n.cpuCount ?? n.cpu_count ?? 0);
+  return Number(n.cpuCount ?? 0);
 }
 function nodeRamMb(n) {
-  return Number(n.ramTotalMb ?? n.ram_total_mb ?? 0);
+  return Number(n.ramTotalMb ?? 0);
 }
 
 function formatMbGb(mb) {
@@ -9385,7 +9373,7 @@ function bindResourceForm(nodes) {
     const gpus = node ? nodeGpus(node) : [];
     if (resKind === 'gpu' && gpus.length) {
       const opts = gpus.map((g, i) => {
-        const ref = String(g.uuid ?? g.gpuId ?? g.gpu_id ?? g.index ?? i);
+        const ref = String(g.uuid ?? g.gpuId ?? g.index ?? i);
         return `<option value="${escapeAttr(ref)}">${escapeHtml(gpuName(g))} · ${escapeHtml(formatMbGb(gpuVramMb(g)))}</option>`;
       }).join('');
       field.innerHTML = `<tf-select id="ml-studio-res-ref" label="Karta GPU">${opts}</tf-select>`;
@@ -9431,7 +9419,7 @@ function bindResourceForm(nodes) {
 }
 
 function grantNodeLabel(g) {
-  const nid = String(g.nodeId ?? g.node_id ?? '');
+  const nid = String(g.nodeId ?? '');
   const node = resourceNodes.find((n) => nodeIdOf(n) === nid);
   return node ? nodeHostname(node) : (nid ? nid.slice(0, 12) : '—');
 }
@@ -9458,20 +9446,20 @@ function renderGrantsTable(host, grants) {
     <tf-column key="createdAt" label="Data"></tf-column>
   `;
   table.rows = grants.map((g) => {
-    const kind = String(g.subjectKind ?? g.subject_kind ?? '').toLowerCase();
-    const subjectId = String(g.subjectId ?? g.subject_id ?? '');
-    const resourceKind = String(g.resourceKind ?? g.resource_kind ?? '').toLowerCase();
-    const resourceRef = String(g.resourceRef ?? g.resource_ref ?? '');
+    const kind = String(g.subjectKind ?? '').toLowerCase();
+    const subjectId = String(g.subjectId ?? '');
+    const resourceKind = String(g.resourceKind ?? '').toLowerCase();
+    const resourceRef = String(g.resourceRef ?? '');
     const subjectHtml = `<span class="ml-studio-res-subject-cell"><tf-chip status="info" label="${escapeAttr(SUBJECT_KIND_LABEL[kind] || kind || '—')}"></tf-chip> ${escapeHtml(subjectId || '—')}</span>`;
     const resLabel = RESOURCE_KIND_LABEL[resourceKind] || resourceKind || '—';
     const resourceHtml = `<span class="ml-studio-res-resource-cell">${sprite('host')} ${escapeHtml(grantNodeLabel(g))} · <strong>${escapeHtml(resLabel)}</strong>${resourceRef ? ` · ${escapeHtml(resourceRef)}` : ''}</span>`;
     return {
-      _grantId: String(g.grantId ?? g.grant_id ?? ''),
+      _grantId: String(g.grantId ?? ''),
       subject: subjectHtml,
       resource: resourceHtml,
       quota: g.quota ? String(g.quota) : '—',
-      grantedBy: String(g.grantedBy ?? g.granted_by ?? '—'),
-      createdAt: formatDate(g.createdAt ?? g.created_at),
+      grantedBy: String(g.grantedBy ?? '—'),
+      createdAt: formatDate(g.createdAt),
     };
   });
   table.rowActions = (row, idx, currentRow) => {
@@ -9535,16 +9523,16 @@ function renderResourcesTab(panel, pid) {
         <tf-column key="createdAt" label="Data"></tf-column>
       `;
       table.rows = grants.map((g) => {
-        const resourceKind = String(g.resourceKind ?? g.resource_kind ?? '').toLowerCase();
-        const resourceRef = String(g.resourceRef ?? g.resource_ref ?? '');
-        const nid = String(g.nodeId ?? g.node_id ?? '');
+        const resourceKind = String(g.resourceKind ?? '').toLowerCase();
+        const resourceRef = String(g.resourceRef ?? '');
+        const nid = String(g.nodeId ?? '');
         const resLabel = RESOURCE_KIND_LABEL[resourceKind] || resourceKind || '—';
         const nodeLabel = g.hostname || (nid ? nid.slice(0, 12) : '—');
         return {
           resource: `<span class="ml-studio-res-resource-cell">${sprite('host')} ${escapeHtml(nodeLabel)} · <strong>${escapeHtml(resLabel)}</strong>${resourceRef ? ` · ${escapeHtml(resourceRef)}` : ''}</span>`,
           quota: g.quota ? String(g.quota) : '—',
-          grantedBy: String(g.grantedBy ?? g.granted_by ?? '—'),
-          createdAt: formatDate(g.createdAt ?? g.created_at),
+          grantedBy: String(g.grantedBy ?? '—'),
+          createdAt: formatDate(g.createdAt),
         };
       });
       panel.appendChild(table);

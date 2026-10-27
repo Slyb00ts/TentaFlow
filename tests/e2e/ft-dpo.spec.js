@@ -50,7 +50,7 @@ async function shotBoth(page, base) {
   const failedRequests = [];
 
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1440, height: 900 } });
+  const context = await browser.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: { width: 1440, height: 900 } });
   const page = await context.newPage();
 
   page.on('console', (msg) => { if (msg.type() === 'error') consoleErrors.push(msg.text()); });
@@ -86,8 +86,7 @@ async function shotBoth(page, base) {
       });
       let role = '';
       if (authMe.ok && authMe.raw) {
-        const u = authMe.raw.user || authMe.raw;
-        role = String(u.role ?? u.role_slug ?? authMe.raw.role ?? '');
+        role = String(authMe.raw.role ?? '');
       }
       facts.role = role;
 

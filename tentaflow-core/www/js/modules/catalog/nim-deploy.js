@@ -18,8 +18,8 @@ export async function openNimDeployModal(container, preselectedNode = null) {
   let nodes = [];
   try {
     const resp = await ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' });
-    // MeshNodeInfo proto nie ma `is_trusted` — uzywamy `source==="trusted"`.
-    nodes = (resp || []).filter((n) => n.is_local === true || n.source === 'trusted');
+    // MeshNodeInfo proto nie ma `isTrusted` — uzywamy `source==="trusted"`.
+    nodes = (resp || []).filter((n) => n.isLocal === true || n.source === 'trusted');
   } catch {
     // ignore
   }
@@ -54,7 +54,7 @@ export async function openNimDeployModal(container, preselectedNode = null) {
           <label>${escapeHtml(I18n.t('wizard.targetNode'))}</label>
           <tf-select id="nim-target-node" value="${escapeAttr(preselectedNode || '')}">
             ${nodes.map((n) => {
-              const nid = n.node_id || n.id;
+              const nid = n.nodeId;
               const label = n.hostname || nid;
               return `<option value="${escapeAttr(nid)}">${escapeHtml(label)}</option>`;
             }).join('')}
@@ -124,7 +124,7 @@ export async function openNimDeployModal(container, preselectedNode = null) {
   }
 
   if (preselectedNode) loadNodeGpus(preselectedNode);
-  else if (nodes.length > 0) loadNodeGpus(nodes[0].node_id || nodes[0].id);
+  else if (nodes.length > 0) loadNodeGpus(nodes[0].nodeId);
 
   nodeSelect?.addEventListener('change', (e) => loadNodeGpus(e.detail?.value ?? nodeSelect.value));
 

@@ -24,12 +24,11 @@
 // =============================================================================
 
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const { test, expect } = require('@playwright/test');
-const { startBinary, stopBinary, waitForServer, binaryExists } = require('./helpers/spawn');
+const { startBinary, stopBinary, waitForServer, binaryExists, homeForPort } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
 const { installAddonInstance, collectConsoleErrors, diagnostics } = require('./helpers/addon-setup');
 
@@ -90,7 +89,7 @@ test.afterAll(async () => {
 });
 
 function addonDbPath() {
-  return path.join(os.homedir(), '.tentaflow', 'orgs', ORG, 'addons', addonId, 'data.db');
+  return path.join(homeForPort(PORT), 'orgs', ORG, 'addons', addonId, 'data.db');
 }
 
 function sqlite(dbPath, sql) {

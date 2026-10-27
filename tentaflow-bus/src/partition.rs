@@ -1182,7 +1182,7 @@ fn handle_fence_command(dir: &Path, state: &PartitionState, op: FenceOp) -> Resu
         FenceOp::CloseLeaderWrites => {
             let _ = state
                 .leader_writes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
             Ok(())
         }
     }

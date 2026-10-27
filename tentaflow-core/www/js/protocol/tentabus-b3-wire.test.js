@@ -150,24 +150,28 @@ test('the directory answer decodes labels, group sizes and the truncation flag',
       },
     },
   });
-  assert.equal(body.variant, 'BusSubjectDirectoryResponse');
-  assert.equal(body.truncated, true);
-  assert.equal(body.entries[0].subjectType, 'group');
-  assert.equal(body.entries[0].label, 'Lekarze');
-  assert.equal(body.entries[0].memberCount, 12);
-  assert.equal(body.entries[1].subjectId, 'asystent');
-  assert.equal(body.entries[1].memberCount, null);
+  assert.equal(body._variant, 'BusBody');
+  assert.equal(body.instanceId, INSTANCE);
+  const answer = body.payload.SubjectDirectoryResponse;
+  assert.equal(answer.truncated, true);
+  assert.equal(answer.entries[0].subjectType, 'group');
+  assert.equal(answer.entries[0].label, 'Lekarze');
+  assert.equal(answer.entries[0].memberCount, 12);
+  assert.equal(answer.entries[1].subjectId, 'asystent');
+  assert.equal(answer.entries[1].memberCount, null);
 });
 
-test('a directory answer without the optional fields decodes as complete and sizeless', { skip }, () => {
+test('a directory answer without the optional fields decodes without them', { skip }, () => {
   const body = decodeBody({
     BusBody: {
       instance_id: INSTANCE,
       payload: { SubjectDirectoryResponse: { entries: [{ subject_type: 'user', subject_id: 'u-1', label: 'Anna Kowalska' }] } },
     },
   });
-  assert.equal(body.truncated, false);
-  assert.equal(body.entries[0].memberCount, null);
+  // The generic decoder does not synthesize serde defaults: absent stays absent.
+  const answer = body.payload.SubjectDirectoryResponse;
+  assert.equal(answer.truncated, undefined);
+  assert.equal(answer.entries[0].memberCount, undefined);
 });
 
 test('the preview answer decodes the record, the per-field actions and the caller limit', { skip }, () => {
@@ -187,11 +191,12 @@ test('the preview answer decodes the record, the per-field actions and the calle
       },
     },
   });
-  assert.equal(body.variant, 'BusFieldPolicyPreviewResponse');
-  assert.equal(body.record.offset, 41);
-  assert.equal(new TextDecoder().decode(body.record.payloadPreview), '{"id":"b-1"}');
-  assert.deepEqual(body.applied.map((a) => [a.field, a.action]), [['id', 'show'], ['pesel', 'hide']]);
-  assert.equal(body.limitedByCaller, true);
+  assert.equal(body._variant, 'BusBody');
+  const preview = body.payload.FieldPolicyPreviewResponse;
+  assert.equal(preview.record.offset, 41);
+  assert.equal(new TextDecoder().decode(preview.record.payloadPreview), '{"id":"b-1"}');
+  assert.deepEqual(preview.applied.map((a) => [a.field, a.action]), [['id', 'show'], ['pesel', 'hide']]);
+  assert.equal(preview.limitedByCaller, true);
 
   const older = decodeBody({
     BusBody: {
@@ -207,7 +212,7 @@ test('the preview answer decodes the record, the per-field actions and the calle
       },
     },
   });
-  assert.equal(older.limitedByCaller, false);
+  assert.equal(older.payload.FieldPolicyPreviewResponse.limitedByCaller, undefined);
 });
 
 test('an addon row of the access list keeps its own subject type and label', { skip }, () => {
@@ -224,9 +229,10 @@ test('an addon row of the access list keeps its own subject type and label', { s
       },
     },
   });
-  assert.equal(body.entries[0].subjectType, 'addon');
-  assert.equal(body.entries[0].subjectLabel, 'Asystent lekarza');
-  assert.equal(body.entries[0].memberCount, null);
+  const entries = body.payload.AclListResponse.entries;
+  assert.equal(entries[0].subjectType, 'addon');
+  assert.equal(entries[0].subjectLabel, 'Asystent lekarza');
+  assert.equal(entries[0].memberCount, null);
 });
 
 test('an access entry request names one right of one subject', { skip }, () => {
@@ -234,14 +240,14 @@ test('an access entry request names one right of one subject', { skip }, () => {
   assert.deepEqual(sent.payload, { AclSetRequest: { topic: 'wyniki', subject_type: 'addon', subject_id: 'asystent', access_level: 'deny', action: 'write' } });
 });
 
-test('the capabilities answer carries the caller\'s organisation, empty when an older server sends none', { skip }, () => {
+test('the capabilities answer carries the caller\'s organisation, absent when an older server sends none', { skip }, () => {
   const base = { can_read: true, can_write: true, can_admin: true, is_site_admin: true, default_replication_factor: 1, node_count: 1, content_types: [], schema_types: [], field_actions: [] };
   const body = decodeBody({ BusBody: { instance_id: INSTANCE, payload: { CapabilitiesResponse: { capabilities: { ...base, org_id: 'org-default', org_name: 'Przychodnia Zdrowie' } } } } });
-  assert.equal(body.capabilities.orgId, 'org-default');
-  assert.equal(body.capabilities.orgName, 'Przychodnia Zdrowie');
+  assert.equal(body.payload.CapabilitiesResponse.capabilities.orgId, 'org-default');
+  assert.equal(body.payload.CapabilitiesResponse.capabilities.orgName, 'Przychodnia Zdrowie');
   const older = decodeBody({ BusBody: { instance_id: INSTANCE, payload: { CapabilitiesResponse: { capabilities: base } } } });
-  assert.equal(older.capabilities.orgId, '');
-  assert.equal(older.capabilities.orgName, null);
+  assert.equal(older.payload.CapabilitiesResponse.capabilities.orgId, undefined);
+  assert.equal(older.payload.CapabilitiesResponse.capabilities.orgName, undefined);
 });
 
 test('consumer groups carry their key\'s name, or that the key is gone, and decode without both from an older server', { skip }, () => {
@@ -254,14 +260,14 @@ test('consumer groups carry their key\'s name, or that the key is gone, and deco
       { group: 'lekarze', topic: 'wyniki', lag_total: 3, paused: false },
     ],
   } } } } });
-  assert.deepEqual(stats.groups.map((g) => [g.keyName, g.keyGone]), [['Portal', false], [null, true], [null, false]]);
+  assert.deepEqual(stats.payload.StatsSnapshotResponse.snapshot.groups.map((g) => [g.keyName, g.keyGone]), [['Portal', false], [null, true], [undefined, undefined]]);
   const list = decodeBody({ BusBody: { instance_id: INSTANCE, payload: { GroupListResponse: { groups: [
     { group: 'k:0a1b2c3d-4e1a-4b3a-9a57-1d2e3f4a5b6c', topic: 'wyniki', commit_mode: 'explicit', paused: false, created_at_ms: 1, updated_at_ms: 2, key_gone: true },
   ] } } } });
-  assert.equal(list.groups[0].keyGone, true);
+  assert.equal(list.payload.GroupListResponse.groups[0].keyGone, true);
   const detail = decodeBody({ BusBody: { instance_id: INSTANCE, payload: { GroupDetailResponse: { detail: {
     group: 'k:6f1c0b52-4e1a-4b3a-9a57-1d2e3f4a5b6c', topic: 'wyniki', commit_mode: 'explicit', paused: false, partitions: [], key_name: 'Portal',
   } } } } });
-  assert.equal(detail.detail.keyName, 'Portal');
-  assert.equal(detail.detail.keyGone, false);
+  assert.equal(detail.payload.GroupDetailResponse.detail.keyName, 'Portal');
+  assert.equal(detail.payload.GroupDetailResponse.detail.keyGone, undefined);
 });

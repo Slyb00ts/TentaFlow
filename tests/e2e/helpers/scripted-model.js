@@ -183,7 +183,7 @@ function enforcedPipelineScripts() {
     {
       // Both critics share one agent, so one route serves the plan review and
       // the build review. `BEZ UWAG` is the marker the seeded gate matches.
-      match: 'Jestes krytykiem',
+      match: 'Jesteś krytykiem',
       // Both critics are the same agent and a review loop asks every round, so
       // this answer has to be available more than once.
       repeat: true,

@@ -58,9 +58,9 @@ export async function resolveSignedFrame(signedFrame) {
       cameraId: signedFrame.camera_id,
       ttlSecs: DEFAULT_TTL_SECS,
     });
-    const url = String(result?.signedUrl ?? result?.signed_url ?? '').trim();
+    const url = String(result?.signedUrl ?? '').trim();
     if (!url) return null;
-    const expiresMs = Number(result?.expiresAtMs ?? result?.expires_at_ms);
+    const expiresMs = Number(result?.expiresAtMs);
     const expiresAt = Number.isFinite(expiresMs) && expiresMs > 0
       ? expiresMs
       : Date.now() + DEFAULT_TTL_SECS * 1000;

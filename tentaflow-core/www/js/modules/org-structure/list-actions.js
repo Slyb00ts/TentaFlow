@@ -98,8 +98,8 @@ export function createListActions({ context, reload }) {
   // Accounts a person can be assigned from; read once per screen, and only when a window needs it.
   function people() {
     peoplePromise ??= ApiBinary.list('usersListRequest', { arrayKey: 'users' }).then((users) => users
-      .filter((u) => u.is_active !== false && u.isActive !== false)
-      .map((u) => ({ id: String(u.id), name: u.display_name || u.displayName || u.username, role: u.username })))
+      .filter((u) => u.isActive !== false)
+      .map((u) => ({ id: String(u.id), name: u.displayName || u.username, role: u.username })))
       .catch((err) => { peoplePromise = null; throw err; });
     return peoplePromise;
   }
@@ -358,13 +358,13 @@ export function createListActions({ context, reload }) {
       TfToast.show({ tone: 'danger', message: lt('people_failed', { message: err.message || '' }) });
       return;
     }
-    const units = (view.units ?? []).map((u) => ({ value: u.unit_id, label: u.name }));
+    const units = (view.units ?? []).map((u) => ({ value: u.unitId, label: u.name }));
     // A staff position cannot manage, so it is never offered as somebody's manager.
-    const parents = (view.positions ?? []).filter((p) => !p.is_staff).map((p) => {
-      const holders = rows.filter((r) => r.positionId === p.position_id && !r.vacant).map((r) => r.personName);
+    const parents = (view.positions ?? []).filter((p) => !p.isStaff).map((p) => {
+      const holders = rows.filter((r) => r.positionId === p.positionId && !r.vacant).map((r) => r.personName);
       const who = holders.length ? holders.join(', ') : ot('vacancy');
-      const unit = units.find((u) => u.value === p.unit_id)?.label ?? '';
-      return { value: p.position_id, label: `${p.name} — ${who} (${unit})` };
+      const unit = units.find((u) => u.value === p.unitId)?.label ?? '';
+      return { value: p.positionId, label: `${p.name} — ${who} (${unit})` };
     });
     openEditWindow({
       title: lt('add_title'),
@@ -390,7 +390,7 @@ export function createListActions({ context, reload }) {
         });
         const unitName = units.find((u) => u.value === values.unit)?.label ?? '';
         const message = lt('toast_position_added', { position: values.name, unit: unitName });
-        const positionId = created.result?.value?.position_id;
+        const positionId = created.result?.value?.positionId;
         // Ending the position on its first day removes it together with the person just assigned to it.
         const undo = async () => {
           await orgWrite('orgPositionEndRequest', { positionId, from: values.from, confirmBackdated: created.confirmedBackdated });

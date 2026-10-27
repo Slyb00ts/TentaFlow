@@ -96,7 +96,7 @@ class TfChatComposer extends HTMLElement {
     this._sendBtn.addEventListener('click', () => this._send());
 
     // Voice button
-    this.querySelector('.composer-voice').addEventListener('click', () => {
+    this.querySelector('.composer-voice')?.addEventListener('click', () => {
       this.dispatchEvent(new CustomEvent('voice', { bubbles: true }));
     });
 

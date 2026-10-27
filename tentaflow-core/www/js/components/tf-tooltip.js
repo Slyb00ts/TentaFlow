@@ -6,15 +6,26 @@
 //   <tf-tooltip text="Save changes" side="bottom">
 //     <tf-button>Save</tf-button>
 //   </tf-tooltip>
+//
+//   Rich bubble: a child marked slot="content" is moved into the bubble as it
+//   is (markup, live-updated values), so the text attribute is not used.
+//   `align="start|end"` pins the bubble to that edge of the trigger instead of
+//   centring it (a wide bubble under a narrow trigger would leave the screen),
+//   `block` lets the trigger fill its parent instead of shrinking to its content.
+//   <tf-tooltip side="bottom" align="start" block>
+//     <div tabindex="0">Decode</div>
+//     <div slot="content" id="tip">…</div>
+//   </tf-tooltip>
 // =============================================================================
 
 class TfTooltip extends HTMLElement {
-  static get observedAttributes() { return ['text', 'side', 'delay']; }
+  static get observedAttributes() { return ['text', 'side', 'delay', 'align', 'block']; }
 
   constructor() {
     super();
     this._wrap = null;
     this._bubble = null;
+    this._rich = false;
     this._timer = null;
     this._onEnter = this._onEnter.bind(this);
     this._onLeave = this._onLeave.bind(this);
@@ -39,21 +50,33 @@ class TfTooltip extends HTMLElement {
 
   attributeChangedCallback(name) {
     if (name === 'text' && this._bubble) this._updateText();
-    if (name === 'side' && this._bubble) this._updateSide();
+    if ((name === 'side' || name === 'align') && this._bubble) this._updateSide();
+    if (name === 'block' && this._wrap) this._wrap.classList.toggle('block', this.hasAttribute('block'));
   }
 
   get delay() { return parseInt(this.getAttribute('delay') || '400', 10); }
   get side() { return this.getAttribute('side') || 'top'; }
 
   _build() {
+    const content = this.querySelector(':scope > [slot="content"]');
     // Wrap existing children
     const wrap = document.createElement('span');
     wrap.className = 'tf-tooltip-wrap';
-    while (this.firstChild) wrap.appendChild(this.firstChild);
+    wrap.classList.toggle('block', this.hasAttribute('block'));
+    while (this.firstChild) {
+      if (this.firstChild === content) { this.removeChild(content); continue; }
+      wrap.appendChild(this.firstChild);
+    }
 
     const bubble = document.createElement('span');
     bubble.className = 'tf-tooltip-bubble';
     bubble.setAttribute('role', 'tooltip');
+    if (content) {
+      this._rich = true;
+      bubble.classList.add('rich');
+      content.removeAttribute('slot');
+      bubble.appendChild(content);
+    }
     this._updateSideClass(bubble);
     wrap.appendChild(bubble);
 
@@ -68,7 +91,7 @@ class TfTooltip extends HTMLElement {
   }
 
   _updateText() {
-    if (this._bubble) this._bubble.textContent = this.getAttribute('text') || '';
+    if (this._bubble && !this._rich) this._bubble.textContent = this.getAttribute('text') || '';
   }
 
   _updateSide() {
@@ -76,8 +99,10 @@ class TfTooltip extends HTMLElement {
   }
 
   _updateSideClass(el) {
-    el.classList.remove('side-top', 'side-bottom', 'side-left', 'side-right');
+    el.classList.remove('side-top', 'side-bottom', 'side-left', 'side-right', 'align-start', 'align-end');
     el.classList.add(`side-${this.side}`);
+    const align = this.getAttribute('align');
+    if (align === 'start' || align === 'end') el.classList.add(`align-${align}`);
   }
 
   _clearTimer() {

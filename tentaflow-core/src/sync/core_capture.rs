@@ -108,7 +108,21 @@ pub fn record_core_write_capture(
             &capture.hlc.node_id,
             capture.created_at_ms,
         ],
-    )?;
+    )
+    // The bare SQLite message ("FOREIGN KEY constraint failed") does not say which
+    // parent is missing; the org and actor are the two this table references.
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "core capture insert ({} {}, org {}, actor {:?}): {e}",
+            capture.table_name,
+            capture.resource_id,
+            capture.org_id,
+            capture.actor_user_id
+        )
+    })?;
+    // The journal row is not visible to the drain until this transaction commits;
+    // the scheduler's debounce covers that gap.
+    crate::sync::runtime::wake_push_scheduler();
     Ok(())
 }
 

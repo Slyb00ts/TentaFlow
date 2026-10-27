@@ -132,7 +132,7 @@ function setInput({ view, unitTypes, myPermissions }) {
   state.view = view;
   state.unitTypes = unitTypes;
   state.myPermissions = myPermissions;
-  state.units = new Map(view.units.map((u) => [u.unit_id, u]));
+  state.units = new Map(view.units.map((u) => [u.unitId, u]));
   state.rows = listRows(view, t);
 }
 
@@ -192,7 +192,7 @@ function openRowMenu(button, entry) {
 async function exportFile(format, anchor) {
   try {
     const body = await ApiBinary.one('orgExportRequest', { format, at: state.view.at });
-    downloadBytes(body.file_name ?? body.fileName, body.bytes, body.mime);
+    downloadBytes(body.fileName ?? body.fileName, body.bytes, body.mime);
   } catch (err) {
     TfToast.show({ tone: 'danger', message: lt('export_failed', { message: err.message || '' }) });
   }

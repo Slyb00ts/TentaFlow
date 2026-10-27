@@ -5,7 +5,7 @@ const BASE = 'https://localhost:8095';
 const PROJECT_ID = 'mlx-b2c-0001';
 (async () => {
   const b = await chromium.launch({ headless: true });
-  const ctx = await b.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1440, height: 900 } });
+  const ctx = await b.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: { width: 1440, height: 900 } });
   const page = await ctx.newPage();
   let answer = '', last = '';
   try {

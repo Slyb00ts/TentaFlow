@@ -1902,3 +1902,58 @@ fn begin_adopt_atomic_garbage_updated_at_treated_as_stale() {
     let st = load_adopt_state(&pool).unwrap().unwrap();
     assert_eq!(st.peer, "peer-b");
 }
+
+/// The post-commit reseed restates every row through the capture journal, whose
+/// `org_id` references `organizations`. A merged node must never hold a row the
+/// reseed cannot attribute to an existing organization.
+#[test]
+fn reseed_after_import_attributes_every_row_to_an_existing_org() {
+    let donor = new_pool();
+    let joiner = new_pool();
+    // Platform seeds (camera pipelines, ...) stay attached to the default org on
+    // every real node, which is also the single org a donor snapshot carries.
+    let org = crate::services::org::DEFAULT_ORG_ID;
+    seed_org(&donor, org, "default");
+    seed_org(&joiner, org, "default");
+    seed_role(&donor, "role-user", "user");
+    seed_user(&donor, "u-donor", "alice", Some("alice@x.io"));
+    seed_membership(&donor, org, "u-donor", "role-user");
+    seed_flow(&donor, "flow-donor", "donor flow", None);
+
+    seed_user(&joiner, "u-joiner", "bob", Some("bob@x.io"));
+    seed_membership(&joiner, org, "u-joiner", "role-user");
+    seed_flow(&joiner, "flow-joiner", "joiner flow", None);
+
+    let snap = donor_snapshot(&donor, 3);
+    import(&joiner, &snap, "donor-node").unwrap();
+
+    crate::db::repository::reseed_core_state_from_current_rows(&joiner)
+        .expect("reseed of a merged database");
+}
+
+/// A joiner that owned a different organization before the merge keeps that
+/// organization row but loses its memberships; the reseed must still restate
+/// every remaining row without a foreign-key miss.
+#[test]
+fn reseed_after_import_survives_a_joiner_with_its_own_organization() {
+    let donor = new_pool();
+    let joiner = new_pool();
+    let org = crate::services::org::DEFAULT_ORG_ID;
+    seed_org(&donor, org, "default");
+    seed_role(&donor, "role-user", "user");
+    seed_user(&donor, "u-donor", "alice", Some("alice@x.io"));
+    seed_membership(&donor, org, "u-donor", "role-user");
+
+    seed_org(&joiner, org, "default");
+    seed_org(&joiner, "org-joiner-own", "joiner-own");
+    seed_user(&joiner, "u-joiner", "bob", Some("bob@x.io"));
+    seed_membership(&joiner, "org-joiner-own", "u-joiner", "role-user");
+    seed_membership(&joiner, org, "u-joiner", "role-user");
+    seed_flow(&joiner, "flow-joiner", "joiner flow", None);
+
+    let snap = donor_snapshot(&donor, 3);
+    import(&joiner, &snap, "donor-node").unwrap();
+
+    crate::db::repository::reseed_core_state_from_current_rows(&joiner)
+        .expect("reseed of a merged database with a leftover joiner organization");
+}

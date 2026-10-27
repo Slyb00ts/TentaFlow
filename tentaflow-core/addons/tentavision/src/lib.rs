@@ -727,10 +727,28 @@ fn install_panic_hook() {
     ));
 }
 
+static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static ID_SCOPE: Mutex<String> = Mutex::new(String::new());
+
 fn next_id() -> String {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    alloc::format!("c{}", n)
+    let n = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let scope = ID_SCOPE.lock().map(|s| s.clone()).unwrap_or_default();
+    alloc::format!("c{}-{}", scope, n)
+}
+
+/// Restarts component numbering inside `scope` (the shell or one panel). The
+/// host patches a re-pushed fragment in place only where a component equals the
+/// one it already shows, and the id is part of that comparison: ids drawn from
+/// a counter that never rewinds made every push differ from the last, so each
+/// repaint replaced the whole tree and detached the button a user was about to
+/// press. The scope keeps the numbering of the shell, of the panel on screen and
+/// of a wizard re-sent into it from colliding in one document.
+fn begin_ids(scope: &str) {
+    ID_COUNTER.store(0, Ordering::Relaxed);
+    if let Ok(mut current) = ID_SCOPE.lock() {
+        current.clear();
+        current.push_str(scope);
+    }
 }
 
 fn send_ui(payload: &UiPayload) -> i32 {
@@ -3054,6 +3072,7 @@ fn write_guest_string(ptr: i32, cap: i32, s: &str) -> i32 {
 // =============================================================================
 
 fn send_initial_shell() {
+    begin_ids("shell");
     let layout = build_shell_layout();
     // "content" is the static main panel. The "Add camera" wizard's
     // `add_camera_body` / `add_camera_footer` slots are also declared here, but
@@ -3130,6 +3149,7 @@ fn build_shell_layout() -> Component {
 
 fn render_panel(panel_id: &str) {
     set_current_panel(panel_id);
+    begin_ids(panel_id);
     let content = match panel_id {
         "overview" => build_overview_content(),
         "live" => build_live_content(),

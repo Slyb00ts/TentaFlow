@@ -60,54 +60,54 @@ const CONF_LOW = OCR_MIN_SCORE + 0.05;
 const CONF_HIGH = Math.min(0.99, OCR_MIN_SCORE + 0.2);
 
 function plate(tekst, extra = {}) {
-  return { klasa: 'tablica_rejestracyjna', track_id: 7, tekst, ...extra };
+  return { klasa: 'tablica_rejestracyjna', trackId: 7, tekst, ...extra };
 }
 
 test('odczyt powyżej progu wygrywa i nie rzuca wyjątkiem', () => {
   const o = makeOverlay();
   // Regresja: pętla głosowania odwoływała się do nieistniejącej zmiennej `score`
-  // (miary nazywają się `conf`/`tekst_conf`), więc KAŻDA ramka z odczytaną
+  // (miary nazywają się `conf`/`tekstConf`), więc KAŻDA ramka z odczytaną
   // tablicą kończyła się `ReferenceError` w handlerze WS — a że rzut leciał
   // przed zapisem ramki do bufora, overlay przestawał się aktualizować.
-  o.zapiszGlosyOcr([plate('KR12345', { tekst_conf: CONF_HIGH })]);
+  o.zapiszGlosyOcr([plate('KR12345', { tekstConf: CONF_HIGH })]);
   assert.equal(o.zwyciezcaOcr(7), 'KR12345');
 });
 
 test('liczba głosów decyduje przed pewnością odczytu', () => {
   const o = makeOverlay();
-  o.zapiszGlosyOcr([plate('KR12345', { tekst_conf: CONF_LOW })]);
-  o.zapiszGlosyOcr([plate('KR12345', { tekst_conf: CONF_LOW })]);
-  o.zapiszGlosyOcr([plate('WX99999', { tekst_conf: CONF_HIGH })]);
+  o.zapiszGlosyOcr([plate('KR12345', { tekstConf: CONF_LOW })]);
+  o.zapiszGlosyOcr([plate('KR12345', { tekstConf: CONF_LOW })]);
+  o.zapiszGlosyOcr([plate('WX99999', { tekstConf: CONF_HIGH })]);
   assert.equal(o.zwyciezcaOcr(7), 'KR12345');
 });
 
 test('przy remisie wygrywa wyższa pewność ODCZYTU, nie ramki', () => {
   const o = makeOverlay();
   // Po jednym głosie na odczyt; `score` (pewność detektora ramki) jest celowo
-  // odwrotna do `tekst_conf`, żeby test wykrył użycie złej miary w tie-breaku.
-  o.zapiszGlosyOcr([plate('KR12345', { tekst_conf: CONF_HIGH, score: 0.51 })]);
-  o.zapiszGlosyOcr([plate('WX99999', { tekst_conf: CONF_LOW, score: 0.99 })]);
+  // odwrotna do `tekstConf`, żeby test wykrył użycie złej miary w tie-breaku.
+  o.zapiszGlosyOcr([plate('KR12345', { tekstConf: CONF_HIGH, score: 0.51 })]);
+  o.zapiszGlosyOcr([plate('WX99999', { tekstConf: CONF_LOW, score: 0.99 })]);
   assert.equal(o.zwyciezcaOcr(7), 'KR12345');
 });
 
 test('odczyt poniżej progu nie głosuje wcale', () => {
   const o = makeOverlay();
-  o.zapiszGlosyOcr([plate('KR12345', { tekst_conf: OCR_MIN_SCORE - 0.01 })]);
+  o.zapiszGlosyOcr([plate('KR12345', { tekstConf: OCR_MIN_SCORE - 0.01 })]);
   assert.equal(o.zwyciezcaOcr(7), null);
 });
 
-test('brak tekst_conf schodzi na score ramki', () => {
+test('brak tekstConf schodzi na score ramki', () => {
   const o = makeOverlay();
   o.zapiszGlosyOcr([plate('KR12345', { score: CONF_HIGH })]);
   assert.equal(o.zwyciezcaOcr(7), 'KR12345');
 });
 
-test('pusty tekst, obca klasa i brak track_id są pomijane', () => {
+test('pusty tekst, obca klasa i brak trackId są pomijane', () => {
   const o = makeOverlay();
   o.zapiszGlosyOcr([
-    plate('', { tekst_conf: CONF_HIGH }),
-    { klasa: 'tablica_adr', track_id: 7, tekst: '99/3257', tekst_conf: CONF_HIGH },
-    { klasa: 'tablica_rejestracyjna', track_id: 0, tekst: 'KR12345', tekst_conf: CONF_HIGH },
+    plate('', { tekstConf: CONF_HIGH }),
+    { klasa: 'tablica_adr', trackId: 7, tekst: '99/3257', tekstConf: CONF_HIGH },
+    { klasa: 'tablica_rejestracyjna', trackId: 0, tekst: 'KR12345', tekstConf: CONF_HIGH },
   ]);
   assert.equal(o.zwyciezcaOcr(7), null);
 });

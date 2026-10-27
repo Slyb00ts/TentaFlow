@@ -33,7 +33,7 @@ const UsersScreen = {
     } catch { me = null; }
     const root = byId('users-root');
     if (!root) return;
-    if (!me || (me.role !== 'admin' && !me.isAdmin)) {
+    if (!me || (me.role !== 'admin')) {
       root.innerHTML = `<div class="card"><p>${escapeHtml(I18n.t('users.admin_only'))}</p></div>`;
       return;
     }
@@ -941,8 +941,8 @@ async function loadSubjectPermissions(subjectType, subjectId, host) {
   try {
     const [permsResp, modelsResp, flowsResp, aliasesResp, addonsResp] = await Promise.all([
       ApiBinary.action('iamListPermsForSubjectRequest', { subjectType, subjectId }),
-      ApiBinary.list('modelListRequest').catch(() => []),
-      ApiBinary.list('flowListRequest').catch(() => []),
+      ApiBinary.list('modelListRequest', { arrayKey: 'models' }).catch(() => []),
+      ApiBinary.list('flowListRequest', { arrayKey: 'flows' }).catch(() => []),
       ApiBinary.list('modelAliasListRequest', { arrayKey: 'aliases' }).catch(() => []),
       ApiBinary.list('addonsListRequest', { arrayKey: 'addons' }).catch(() => []),
     ]);
@@ -954,9 +954,9 @@ async function loadSubjectPermissions(subjectType, subjectId, host) {
     }
 
     const modelItems = (modelsResp || []).map((m) => ({
-      id: String(m.id || m.name || m.alias || ''),
-      name: String(m.name || m.id || m.alias || ''),
-      descr: String(m.description || m.backend || ''),
+      id: String(m.id || ''),
+      name: String(m.id || ''),
+      descr: '',
     }));
     const flowItems = (flowsResp || []).map((f) => ({
       id: String(f.id || f.name || ''),
@@ -966,11 +966,11 @@ async function loadSubjectPermissions(subjectType, subjectId, host) {
     const aliasItems = (aliasesResp || []).map((a) => ({
       id: String(a.alias || a.id || ''),
       name: String(a.alias || a.id || ''),
-      descr: String(a.targetModel || a.target_model || a.target || ''),
+      descr: String(a.targetModel || ''),
     }));
     const addonItems = (addonsResp || []).map((a) => ({
-      id: String(a.id || a.addonId || ''),
-      name: String(a.name || a.displayName || a.id || ''),
+      id: String(a.addonId || ''),
+      name: String(a.name || a.displayName || a.addonId || ''),
       descr: String(a.description || ''),
     }));
 

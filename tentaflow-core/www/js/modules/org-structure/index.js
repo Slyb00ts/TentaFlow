@@ -85,8 +85,8 @@ async function fetchStructure(at) {
   const body = await ApiBinary.one('orgStructureRequest', at ? { at } : {});
   return {
     view: body.view,
-    unitTypes: body.unit_types ?? [],
-    myPermissions: body.my_permissions ?? [],
+    unitTypes: body.unitTypes ?? [],
+    myPermissions: body.myPermissions ?? [],
   };
 }
 
@@ -117,7 +117,7 @@ function renderHeader() {
   const header = byId('org-header');
   if (!header || !state.view) return;
   const s = summarize(state.view);
-  const roots = state.view.units.filter((u) => !u.parent_unit_id);
+  const roots = state.view.units.filter((u) => !u.parentUnitId);
   const parts = [
     roots.length === 1 ? roots[0].name : '',
     t('people_count', { count: s.people }),
@@ -155,13 +155,13 @@ async function refreshPending() {
 
 function openPendingMenu(anchor) {
   if (state.pending.length === 1) {
-    openHandover({ userId: state.pending[0].user_id, reason: 'departure' });
+    openHandover({ userId: state.pending[0].userId, reason: 'departure' });
     return;
   }
   openActionMenu(anchor, state.pending.map((person) => ({
-    label: t('handover.pending_item', { name: person.display_name || '—', count: person.count }),
+    label: t('handover.pending_item', { name: person.displayName || '—', count: person.count }),
     icon: 'user',
-    run: () => openHandover({ userId: person.user_id, reason: 'departure' }),
+    run: () => openHandover({ userId: person.userId, reason: 'departure' }),
   })), t('handover.pending_title'));
 }
 

@@ -316,6 +316,20 @@ pub(crate) fn seed_session_account(ctx: &HandlerContext) {
         .expect("seed fixture account");
 }
 
+/// Runs a synchronous handler body. Such handlers do blocking SQLite and mutex
+/// work; on a multi-thread runtime `block_in_place` hands the worker's queue to
+/// another thread meanwhile, so one slow handler cannot stall every other task
+/// (including the lightweight requests that must stay responsive). A
+/// current-thread runtime (tests) has nobody to hand over to and runs inline.
+pub fn run_sync_handler<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 /// Wybiera handler po wariancie MessageBody, sprawdza policy, wola dispatch_fn.
 /// Zwraca (response_body, is_error_flag_needed). Signatura jest async —
 /// sync handlery sa owijane w `async move` przez makro `#[handler]`.
@@ -5143,5 +5157,36 @@ mod visibility_enforcement_tests {
             MessageBody::Error(e) => assert_eq!(e.code, ProtocolErrorCode::NotFound),
             other => panic!("expected NotFound, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod run_sync_handler_tests {
+    use super::run_sync_handler;
+    use std::time::{Duration, Instant};
+
+    /// A blocking handler body on the only async worker must not delay other tasks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn blocking_handler_does_not_stall_other_tasks() {
+        let ticker = tokio::spawn(async {
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            started.elapsed()
+        });
+        let blocker = tokio::spawn(async {
+            run_sync_handler(|| std::thread::sleep(Duration::from_millis(600)));
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let elapsed = ticker.await.expect("ticker");
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "a 20 ms timer waited {elapsed:?} behind a blocking handler"
+        );
+        blocker.await.expect("blocker");
+    }
+
+    #[tokio::test]
+    async fn current_thread_runtime_runs_inline() {
+        assert_eq!(run_sync_handler(|| 7), 7);
     }
 }

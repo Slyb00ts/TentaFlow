@@ -591,27 +591,27 @@ class DetectionsOverlay {
 
   onChunk(body) {
     if (this.disposed) return;
-    if (!body || body.variant !== 'CameraDetectionsFrame') return;
+    if (!body || body._variant !== 'CameraAdminBody.DetectionsFrame') return;
     // Wiadomosci dla innej kamery ignorujemy (jeden strumien = jedna kamera,
     // ale strzezemy sie przed niespojnoscia po stronie backendu).
-    const cam = body.cameraId ?? body.camera_id;
+    const cam = body.cameraId;
     if (cam != null && String(cam) !== this.cameraId) return;
     if ((body.source ?? '') === 'pose') {
       this.pushPoseFrame({
         at: performance.now(),
-        tsMs: Number(body.tsMs ?? body.ts_ms ?? 0),
-        ptsNs: ptsToNumber(body.pts_ns ?? body.ptsNs),
+        tsMs: Number(body.tsMs ?? 0),
+        ptsNs: ptsToNumber(body.ptsNs),
         items: Array.isArray(body.items) ? body.items : [],
       });
       return;
     }
 
-    const tsMs = Number(body.tsMs ?? body.ts_ms ?? 0);
-    const ptsNs = ptsToNumber(body.pts_ns ?? body.ptsNs);
+    const tsMs = Number(body.tsMs ?? 0);
+    const ptsNs = ptsToNumber(body.ptsNs);
     const items = Array.isArray(body.items) ? body.items : [];
     // Calosciowy czas obrobki ramki po stronie backendu (detekcja+OCR+stan).
     // Pole opcjonalne — backend zaczyna je slac pozniej; do tego czasu null.
-    const rawProc = body.proc_ms ?? body.procMs;
+    const rawProc = body.procMs;
     const procMs = Number.isFinite(Number(rawProc)) ? Number(rawProc) : null;
     this.pushFrame(tsMs, ptsNs, items, procMs);
     this.lastMessageAt = performance.now();
@@ -698,7 +698,7 @@ class DetectionsOverlay {
     const now = performance.now();
     if (Array.isArray(items)) {
       for (const it of items) {
-        const id = it?.track_id ?? it?.trackId ?? 0;
+        const id = it?.trackId ?? 0;
         if (!(id > 0)) continue;
         const stanNiepusty = Array.isArray(it?.stan) && it.stan.length > 0;
         const tekstNiepusty = it?.tekst != null && String(it.tekst).length > 0;
@@ -725,15 +725,15 @@ class DetectionsOverlay {
     if (Array.isArray(items)) {
       for (const it of items) {
         if (it?.klasa !== 'tablica_rejestracyjna') continue;
-        const id = it?.track_id ?? it?.trackId ?? 0;
+        const id = it?.trackId ?? 0;
         if (!(id > 0)) continue;
         const tekst = it?.tekst != null ? String(it.tekst) : '';
         if (tekst.length === 0) continue;
         // `score` to pewnosc DETEKTORA ramki, nie odczytu. Pewnosc OCR jedzie na
-        // drucie jako `tekst_conf` — bez tego odlegla/skosna tablica odpadala
+        // drucie jako `tekstConf` — bez tego odlegla/skosna tablica odpadala
         // mimo poprawnego odczytu i pasek pokazywal "Rejestracja: —".
-        const conf = Number.isFinite(it?.tekst_conf)
-          ? it.tekst_conf
+        const conf = Number.isFinite(it?.tekstConf)
+          ? it.tekstConf
           : (Number.isFinite(it?.score) ? it.score : 0);
         if (conf < OCR_MIN_SCORE) continue;
         let wpis = this.ocrGlosy.get(id);
@@ -779,7 +779,7 @@ class DetectionsOverlay {
   // klasy zwraca bez zmian.
   detDoEtykiety(det) {
     if (det?.klasa !== 'tablica_rejestracyjna') return det;
-    const id = det?.track_id ?? det?.trackId ?? 0;
+    const id = det?.trackId ?? 0;
     const zwyciezca = id > 0 ? this.zwyciezcaOcr(id) : null;
     // Brak zwyciezcy glosowania nie znaczy "brak tablicy" — serwer mogl przyslac
     // ustabilizowany odczyt, ktorego nie wolno skasowac na null.
@@ -790,7 +790,7 @@ class DetectionsOverlay {
   // ramka ma je puste. Zwraca plytka kopie (nie mutuje itemu z bufora) lub
   // oryginal, gdy nic do uzupelnienia. Detekcje bez track_id zwraca bez zmian.
   wzbogacDet(det) {
-    const id = det?.track_id ?? det?.trackId ?? 0;
+    const id = det?.trackId ?? 0;
     if (!(id > 0)) return det;
     const meta = this.trackMeta.get(id);
     if (!meta) return det;
@@ -1027,7 +1027,7 @@ class DetectionsOverlay {
     let haveTracks = false;
     for (const f of buf) {
       for (const it of f.items) {
-        if ((it?.track_id ?? it?.trackId ?? 0) > 0) { haveTracks = true; break; }
+        if ((it?.trackId ?? 0) > 0) { haveTracks = true; break; }
       }
       if (haveTracks) break;
     }
@@ -1060,7 +1060,7 @@ class DetectionsOverlay {
       const c = this.frameCaptureMs(f, base);
       if (c == null) continue;
       for (const it of f.items) {
-        const id = it?.track_id ?? it?.trackId ?? 0;
+        const id = it?.trackId ?? 0;
         if (id <= 0) continue;
         if (!Array.isArray(it.bbox) || it.bbox.length < 4) continue;
         let e = tracks.get(id);
@@ -1138,7 +1138,7 @@ class DetectionsOverlay {
       const alphaRamki = this.alphaDlaWieku(sel.wiekMs);
       if (alphaRamki > 0) {
         for (const it of sel.frame.items) {
-          const id = it?.track_id ?? it?.trackId ?? 0;
+          const id = it?.trackId ?? 0;
           if (id > 0) continue;
           if (!Array.isArray(it.bbox) || it.bbox.length < 4) continue;
           out.push({ det: it, bbox: it.bbox, alpha: alphaRamki });
@@ -1233,9 +1233,9 @@ class DetectionsOverlay {
     const area = this.videoContentRect();
     const dpr = window.devicePixelRatio || 1;
     const px = (kp, i) => ({
-      x: area.x + kp[i * 3] * area.width,
-      y: area.y + kp[i * 3 + 1] * area.height,
-      ok: kp[i * 3 + 2] >= POSE_MIN_SCORE,
+      x: area.x + kp[i][0] * area.width,
+      y: area.y + kp[i][1] * area.height,
+      ok: kp[i][2] >= POSE_MIN_SCORE,
     });
     ctx.save();
     ctx.globalAlpha = Math.max(0.25, 1 - age / POSE_FADE_MS);
@@ -1251,7 +1251,7 @@ class DetectionsOverlay {
       if (!kp || !kp.length) continue;
       const hand = it.klasa === 'hand';
       const edges = hand ? HAND_EDGES : POSE_EDGES;
-      const n = kp.length / 3;
+      const n = kp.length;
       ctx.strokeStyle = hand ? HAND_COLOR : POSE_COLOR;
       ctx.fillStyle = ctx.strokeStyle;
       ctx.lineWidth = Math.max(2, Math.round((hand ? 1.5 : 3) * dpr));

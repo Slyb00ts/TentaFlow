@@ -12,6 +12,7 @@ import {
   profilingStop,
 } from '/js/protocol/profiling.js';
 import { I18n } from '/js/i18n.js';
+import { createRefresher } from '/js/lib/refresh.js';
 
 function fixtureMode() {
   return typeof window !== 'undefined' && window.__TF_PROFILING_FIXTURE === true;
@@ -35,7 +36,6 @@ function formatMS(seconds) {
 
 function normalizeActive(info) {
   if (info == null) return null;
-  if ('session_id' in info) return info;
   return {
     session_id: info.sessionId,
     label: info.label,
@@ -68,7 +68,7 @@ export class ProfileRecPill {
   constructor(opts = {}) {
     this.nodeId = opts.nodeId;
     this.root = null;
-    this.pollTimer = null;
+    this.poller = null;
     this.tickTimer = null;
     this.session = null;
   }
@@ -89,14 +89,22 @@ export class ProfileRecPill {
     this.session = null;
   }
 
+  // Poller pauses on a hidden tab; the countdown timer runs only during a session.
   _startPolling() {
-    this._poll();
-    this.pollTimer = setInterval(() => this._poll(), 1000);
-    this.tickTimer = setInterval(() => this._tick(), 1000);
+    this.poller = createRefresher({ run: () => this._poll(), intervalMs: 1000, immediate: true });
+    this.poller.start();
   }
 
   _stopPolling() {
-    if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = null; }
+    if (this.poller) { this.poller.dispose(); this.poller = null; }
+    this._stopTick();
+  }
+
+  _startTick() {
+    if (!this.tickTimer) this.tickTimer = setInterval(() => this._tick(), 1000);
+  }
+
+  _stopTick() {
     if (this.tickTimer) { clearInterval(this.tickTimer); this.tickTimer = null; }
   }
 
@@ -111,11 +119,13 @@ export class ProfileRecPill {
     if (!this.root) return;
     this.session = sess;
     if (!sess) {
+      this._stopTick();
       this.root.style.display = 'none';
       this.root.innerHTML = '';
       return;
     }
     this.root.style.display = '';
+    this._startTick();
     this._render();
   }
 

@@ -29,10 +29,10 @@ export function relativeDay(dayIso, todayIso) {
 export function markers(entries, changeSets, today) {
   const days = new Map();
   for (const entry of entries ?? []) {
-    if (isIsoDay(entry.effective_date)) days.set(entry.effective_date, entry.effective_date > today);
+    if (isIsoDay(entry.effectiveDate)) days.set(entry.effectiveDate, entry.effectiveDate > today);
   }
   for (const set of changeSets ?? []) {
-    if (['draft', 'pending'].includes(set.state) && isIsoDay(set.effective_date)) days.set(set.effective_date, true);
+    if (['draft', 'pending'].includes(set.state) && isIsoDay(set.effectiveDate)) days.set(set.effectiveDate, true);
   }
   return [...days.entries()]
     .map(([day, planned]) => ({ day, planned }))
@@ -125,8 +125,8 @@ function fieldChanges(entry, t) {
   return (entry.changes ?? []).map((change) => ({
     field: change.field,
     label: t(`field.${change.field}`),
-    before: valueText(change.field, change.before, change.before_label, t),
-    after: valueText(change.field, change.after, change.after_label, t),
+    before: valueText(change.field, change.before, change.beforeLabel, t),
+    after: valueText(change.field, change.after, change.afterLabel, t),
     // A creation states facts: there is nothing before it to show.
     created: String(entry.action ?? '').endsWith('.create'),
   }));
@@ -134,7 +134,7 @@ function fieldChanges(entry, t) {
 
 function opLines(entry, t, limit = 8) {
   const ops = entry.ops ?? [];
-  const lines = ops.slice(0, limit).map((op) => t(`op.${actionKey(op.action)}`, { name: op.target_name || '' }));
+  const lines = ops.slice(0, limit).map((op) => t(`op.${actionKey(op.action)}`, { name: op.targetName || '' }));
   if (ops.length > limit) lines.push(t('ops_more', { count: ops.length - limit }));
   return lines;
 }
@@ -142,13 +142,13 @@ function opLines(entry, t, limit = 8) {
 /** One audit entry as the timeline draws it. */
 export function entryModel(entry, { t, today }) {
   const key = actionKey(entry.action);
-  const day = isIsoDay(entry.effective_date) ? entry.effective_date : dayOfStamp(entry.at);
+  const day = isIsoDay(entry.effectiveDate) ? entry.effectiveDate : dayOfStamp(entry.at);
   const planned = day > today;
   const title = t(`action.${key}`, {
-    name: entry.target_name || '',
-    unit: entry.unit_name || '',
-    person: entry.subject_name || '',
-    position: entry.position_name || '',
+    name: entry.targetName || '',
+    unit: entry.unitName || '',
+    person: entry.subjectName || '',
+    position: entry.positionName || '',
     count: (entry.ops ?? []).length,
   });
   return {
@@ -160,9 +160,9 @@ export function entryModel(entry, { t, today }) {
     title,
     changes: fieldChanges(entry, t),
     ops: opLines(entry, t),
-    hiddenOps: entry.hidden_ops ?? 0,
-    unitId: entry.unit_id ?? null,
-    who: [entry.actor_name, entry.source ? t(`source.${entry.source}`) : null].filter(Boolean).join(' · '),
+    hiddenOps: entry.hiddenOps ?? 0,
+    unitId: entry.unitId ?? null,
+    who: [entry.actorName, entry.source ? t(`source.${entry.source}`) : null].filter(Boolean).join(' · '),
     writtenAt: dayOfStamp(entry.at),
   };
 }
@@ -189,22 +189,22 @@ export function diffCounts(items) {
 
 /** One difference as a sentence and (for a changed field) the value before and after. */
 export function diffLine(item, t) {
-  const person = item.subject_name || t('diff.someone');
+  const person = item.subjectName || t('diff.someone');
   if (item.entity === 'assignment') {
     if (item.change === 'added') return { text: t('diff.assignment_added', { person, name: item.name }) };
     if (item.change === 'removed') return { text: t('diff.assignment_removed', { person, name: item.name }) };
     return {
       text: t('diff.assignment_changed', { person, name: item.name, field: t(`field.${item.field}`) }),
-      before: valueText(item.field, item.before, item.before_label, t),
-      after: valueText(item.field, item.after, item.after_label, t),
+      before: valueText(item.field, item.before, item.beforeLabel, t),
+      after: valueText(item.field, item.after, item.afterLabel, t),
     };
   }
   if (item.change === 'added') return { text: t(`diff.${item.entity}_added`, { name: item.name }) };
   if (item.change === 'removed') return { text: t(`diff.${item.entity}_removed`, { name: item.name }) };
   return {
     text: t(`diff.${item.entity}_changed`, { name: item.name, field: t(`field.${item.field}`) }),
-    before: valueText(item.field, item.before, item.before_label, t),
-    after: valueText(item.field, item.after, item.after_label, t),
+    before: valueText(item.field, item.before, item.beforeLabel, t),
+    after: valueText(item.field, item.after, item.afterLabel, t),
   };
 }
 
@@ -227,7 +227,7 @@ export function diffMarks(items) {
     else if (item.entity === 'position') raise(positions, item.id, item.change);
     else raise(positions, item.id, 'changed');
     // A unit is touched by everything in it.
-    if (item.entity !== 'unit' && item.unit_id) raise(units, item.unit_id, 'changed');
+    if (item.entity !== 'unit' && item.unitId) raise(units, item.unitId, 'changed');
   }
   return { positions, units };
 }
@@ -254,9 +254,9 @@ export function decorateModel(model, marks, side) {
 export function subtreeUnitIds(view, rootId) {
   const children = new Map();
   for (const unit of view?.units ?? []) {
-    if (!unit.parent_unit_id) continue;
-    if (!children.has(unit.parent_unit_id)) children.set(unit.parent_unit_id, []);
-    children.get(unit.parent_unit_id).push(unit.unit_id);
+    if (!unit.parentUnitId) continue;
+    if (!children.has(unit.parentUnitId)) children.set(unit.parentUnitId, []);
+    children.get(unit.parentUnitId).push(unit.unitId);
   }
   const seen = new Set([rootId]);
   const stack = [rootId];
@@ -275,13 +275,13 @@ export function subtreeUnitIds(view, rootId) {
 export function viewSubset(view, unitId) {
   if (!unitId) return view;
   const within = subtreeUnitIds(view, unitId);
-  const positions = (view.positions ?? []).filter((p) => within.has(p.unit_id));
-  const ids = new Set(positions.map((p) => p.position_id));
+  const positions = (view.positions ?? []).filter((p) => within.has(p.unitId));
+  const ids = new Set(positions.map((p) => p.positionId));
   return {
     ...view,
-    units: (view.units ?? []).filter((u) => within.has(u.unit_id)),
+    units: (view.units ?? []).filter((u) => within.has(u.unitId)),
     positions,
-    assignments: (view.assignments ?? []).filter((a) => ids.has(a.position_id)),
+    assignments: (view.assignments ?? []).filter((a) => ids.has(a.positionId)),
     vacancies: (view.vacancies ?? []).filter((id) => ids.has(id)),
   };
 }
@@ -289,10 +289,10 @@ export function viewSubset(view, unitId) {
 /** The units of two states with how many differences each has, the busiest first. */
 export function unitChoices(before, after, items) {
   const names = new Map();
-  for (const view of [before, after]) for (const u of view?.units ?? []) names.set(u.unit_id, u.name);
+  for (const view of [before, after]) for (const u of view?.units ?? []) names.set(u.unitId, u.name);
   const counts = new Map();
   for (const item of items ?? []) {
-    if (item.unit_id) counts.set(item.unit_id, (counts.get(item.unit_id) ?? 0) + 1);
+    if (item.unitId) counts.set(item.unitId, (counts.get(item.unitId) ?? 0) + 1);
   }
   return [...names.entries()]
     .map(([id, name]) => ({ id, name, count: counts.get(id) ?? 0 }))
@@ -314,17 +314,17 @@ export function changeSetFlags(set, { me, today, soleAdmin = false }) {
     isPending: set.state === 'pending',
     isApplied: set.state === 'applied',
     isWithdrawn: set.state === 'withdrawn',
-    authorIsMe: Boolean(me) && plainId(set.author_user_id) === plainId(me),
+    authorIsMe: Boolean(me) && plainId(set.authorUserId) === plainId(me),
     canSubmit: set.state === 'draft',
-    canApprove: set.state === 'pending' && (soleAdmin || !(Boolean(me) && plainId(set.author_user_id) === plainId(me))),
-    approveBlockedByAuthor: set.state === 'pending' && !soleAdmin && Boolean(me) && plainId(set.author_user_id) === plainId(me),
+    canApprove: set.state === 'pending' && (soleAdmin || !(Boolean(me) && plainId(set.authorUserId) === plainId(me))),
+    approveBlockedByAuthor: set.state === 'pending' && !soleAdmin && Boolean(me) && plainId(set.authorUserId) === plainId(me),
     // The only administrator has nobody else to ask (owner decision 2026-09-30).
-    selfApproval: set.state === 'pending' && soleAdmin && Boolean(me) && plainId(set.author_user_id) === plainId(me),
+    selfApproval: set.state === 'pending' && soleAdmin && Boolean(me) && plainId(set.authorUserId) === plainId(me),
     canEdit: open,
     // An approved one until its day comes: its rows all start on that day, so they can be taken back whole.
-    canWithdraw: open || (set.state === 'applied' && set.effective_date > today),
-    datePassed: set.effective_date < today,
-    days: daysBetween(today, set.effective_date),
+    canWithdraw: open || (set.state === 'applied' && set.effectiveDate > today),
+    datePassed: set.effectiveDate < today,
+    days: daysBetween(today, set.effectiveDate),
   };
 }
 
@@ -335,13 +335,13 @@ export function changeSetFlags(set, { me, today, soleAdmin = false }) {
  */
 export function groupChangeSets(list, today) {
   const by = (states) => (list ?? []).filter((set) => states.includes(set.state));
-  const soonest = (a, b) => a.effective_date.localeCompare(b.effective_date);
-  const newest = (a, b) => b.effective_date.localeCompare(a.effective_date);
+  const soonest = (a, b) => a.effectiveDate.localeCompare(b.effectiveDate);
+  const newest = (a, b) => b.effectiveDate.localeCompare(a.effectiveDate);
   const applied = by(['applied']);
   return {
     open: by(['draft', 'pending']).sort(soonest),
-    upcoming: applied.filter((set) => set.effective_date >= today).sort(soonest),
-    applied: applied.filter((set) => set.effective_date < today).sort(newest),
+    upcoming: applied.filter((set) => set.effectiveDate >= today).sort(soonest),
+    applied: applied.filter((set) => set.effectiveDate < today).sort(newest),
     withdrawn: by(['withdrawn']).sort(newest),
   };
 }
@@ -373,7 +373,6 @@ export function failedOps(results, t) {
 // Operations: the wire's shape and the edit mode's
 // ---------------------------------------------------------------------------
 
-const camel = (name) => name.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
 const lowerFirst = (name) => name.charAt(0).toLowerCase() + name.slice(1);
 
 /**
@@ -386,10 +385,8 @@ export function opsFromWire(ops) {
     const request = op.request ?? {};
     const [variant, fields] = Object.entries(request)[0] ?? ['', {}];
     const out = { kind: lowerFirst(variant.replace(/Request$/, '')) };
-    const tempId = op.temp_id ?? op.tempId;
-    if (tempId) out.tempId = tempId;
-    for (const [key, value] of Object.entries(fields ?? {})) out[camel(key)] = value;
-    return out;
+    if (op.tempId) out.tempId = op.tempId;
+    return Object.assign(out, fields);
   });
 }
 
@@ -414,8 +411,8 @@ const OP_ACTIONS = {
 
 /** An operation of a reorganization as a line: what it does and to what, by name where the live structure knows it. */
 export function opSummary(op, view, t) {
-  const unit = (view?.units ?? []).find((u) => u.unit_id === op.unitId);
-  const position = (view?.positions ?? []).find((p) => p.position_id === op.positionId);
+  const unit = (view?.units ?? []).find((u) => u.unitId === op.unitId);
+  const position = (view?.positions ?? []).find((p) => p.positionId === op.positionId);
   const name = op.name || unit?.name || position?.name || '';
   return t(`op.${OP_ACTIONS[op.kind] ?? 'unknown'}`, { name });
 }

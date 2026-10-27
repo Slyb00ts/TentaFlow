@@ -4,6 +4,7 @@
 // =============================================================================
 
 use super::types::{
+    OperationSummary,
     decode, encode, partition_materialization_order, AppendResult, BaselineEpoch, CompactionPolicy,
     HybridLogicalTimestamp, InboxEntry, LedgerResult, NewSyncOperation, NodeChainEntry,
     NodeEnvironment, NodeFrontierEntry, NodeHead, NodeLogQuery, OperationId, OperationQuery,
@@ -13,7 +14,8 @@ use super::types::{
 };
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
 use parking_lot::Mutex;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::Hash;
 use std::path::Path;
 
 // Operations are content-addressed by op_id. `node_log` is the per-node chain
@@ -34,6 +36,7 @@ const NODE_FRONTIER: &str = "node_frontier";
 const REPAIR_QUEUE: &str = "repair_queue";
 const SNAPSHOTS: &str = "snapshots";
 const META: &str = "meta";
+const OPERATION_SUMMARIES: &str = "operation_summaries";
 const META_EPOCH_KEY: &[u8] = b"baseline_epoch";
 const META_ENVIRONMENT_KEY: &[u8] = b"node_environment";
 const META_HLC_KEY: &[u8] = b"hlc_state";
@@ -70,6 +73,9 @@ pub struct FjallSyncLedgerStore {
     repair_queue: Keyspace,
     snapshots: Keyspace,
     meta: Keyspace,
+    // Derived cache of per-operation routing summaries; rebuilt lazily from
+    // `operations`, so no mutation path has to keep it in step.
+    operation_summaries: Keyspace,
     // Guards only the LOCAL node's head: a node is single-writer over its own
     // chain, so this serializes node_seq minting without blocking reads.
     append_lock: Mutex<()>,
@@ -87,6 +93,170 @@ pub struct FjallSyncLedgerStore {
     // admission, per resolver request) — without this cache it hit Fjall +
     // CBOR decode on every one of those calls.
     environment_cache: parking_lot::RwLock<NodeEnvironment>,
+    // Group commit: one thread fsyncs everything written since the last tick, so
+    // the cost of the disk is paid once per interval and never on a request path.
+    flusher: Option<Flusher>,
+    // In-memory view of the work still owed: unacknowledged outbox entries per
+    // target and unapplied inbox entries, oldest first. Both keyspaces keep every
+    // entry forever (acknowledged/applied rows are compaction evidence), so
+    // scanning them per push or per drain cost O(all operations ever seen) and
+    // fed the replication lag. Every mutation of either keyspace updates the
+    // index under this lock.
+    pending: Mutex<PendingIndex>,
+}
+
+/// Insertion-ordered set: iteration yields the oldest key first, which keeps a
+/// backlog shipped and applied in the order it was queued. Shipping it in key
+/// (hash) order handed the receiver a random subset of one author's chain, which
+/// it could only answer with a gap and a slow repair round-trip.
+struct FifoSet<K> {
+    next: u64,
+    order: BTreeMap<u64, K>,
+    slot: HashMap<K, u64>,
+}
+
+impl<K: Clone + Eq + Hash> FifoSet<K> {
+    fn new() -> Self {
+        Self {
+            next: 0,
+            order: BTreeMap::new(),
+            slot: HashMap::new(),
+        }
+    }
+
+    fn insert(&mut self, key: K) {
+        if self.slot.contains_key(&key) {
+            return;
+        }
+        self.slot.insert(key.clone(), self.next);
+        self.order.insert(self.next, key);
+        self.next += 1;
+    }
+
+    fn remove(&mut self, key: &K) {
+        if let Some(position) = self.slot.remove(key) {
+            self.order.remove(&position);
+        }
+    }
+
+    fn oldest(&self, limit: usize) -> Vec<K> {
+        self.order.values().take(limit).cloned().collect()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.slot.len()
+    }
+}
+
+struct PendingIndex {
+    outbox: HashMap<String, FifoSet<OperationId>>,
+    /// Every target that ever held an outbox row. An operation's rows are found by
+    /// probing these few keys instead of scanning the whole outbox.
+    outbox_targets: HashSet<String>,
+    inbox: FifoSet<Vec<u8>>,
+    /// Inbox entries parked as `ordering_exhausted`, waiting to be reopened.
+    exhausted: HashSet<Vec<u8>>,
+}
+
+impl PendingIndex {
+    fn new() -> Self {
+        Self {
+            outbox: HashMap::new(),
+            outbox_targets: HashSet::new(),
+            inbox: FifoSet::new(),
+            exhausted: HashSet::new(),
+        }
+    }
+
+    fn track_outbox(&mut self, entry: &OutboxEntry) {
+        if !self.outbox_targets.contains(entry.target.as_str()) {
+            self.outbox_targets.insert(entry.target.as_str().to_string());
+        }
+        if entry.acknowledged {
+            if let Some(queue) = self.outbox.get_mut(entry.target.as_str()) {
+                queue.remove(&entry.op_id);
+            }
+        } else {
+            self.outbox
+                .entry(entry.target.as_str().to_string())
+                .or_insert_with(FifoSet::new)
+                .insert(entry.op_id);
+        }
+    }
+
+    fn track_inbox(&mut self, key: &[u8], entry: &InboxEntry) {
+        if entry.applied || entry.conflicted {
+            self.inbox.remove(&key.to_vec());
+        } else {
+            self.inbox.insert(key.to_vec());
+        }
+        if !entry.applied && entry.ordering_exhausted {
+            self.exhausted.insert(key.to_vec());
+        } else {
+            self.exhausted.remove(key);
+        }
+    }
+
+    /// Rebuilds the whole view from the keyspaces (open, and after a bulk reset).
+    fn scan(outbox: &Keyspace, inbox: &Keyspace) -> LedgerResult<Self> {
+        let mut index = Self::new();
+        for item in outbox.iter() {
+            let (_, value) = item.into_inner()?;
+            index.track_outbox(&decode::<OutboxEntry>(value.as_ref())?);
+        }
+        for item in inbox.iter() {
+            let (key, value) = item.into_inner()?;
+            index.track_inbox(key.as_ref(), &decode::<InboxEntry>(value.as_ref())?);
+        }
+        Ok(index)
+    }
+}
+
+/// Reopen budget of an ordering-exhausted inbox entry.
+const MAX_ORDERING_REOPEN_CYCLES: u8 = 3;
+
+const FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+struct Flusher {
+    stop: std::sync::mpsc::Sender<()>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Flusher {
+    fn spawn(db: Database) -> Self {
+        let (stop, rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::Builder::new()
+            .name("ledger-fsync".into())
+            .spawn(move || {
+                while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                    rx.recv_timeout(FLUSH_INTERVAL)
+                {
+                    if let Err(e) = db.persist(PersistMode::SyncAll) {
+                        tracing::warn!("sync ledger: background fsync failed: {e}");
+                    }
+                }
+                if let Err(e) = db.persist(PersistMode::SyncAll) {
+                    tracing::warn!("sync ledger: final fsync failed: {e}");
+                }
+            })
+            .expect("spawn ledger fsync thread");
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for FjallSyncLedgerStore {
+    fn drop(&mut self) {
+        if let Some(mut flusher) = self.flusher.take() {
+            let _ = flusher.stop.send(());
+            if let Some(handle) = flusher.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
 }
 
 impl FjallSyncLedgerStore {
@@ -141,7 +311,7 @@ impl FjallSyncLedgerStore {
                 store
                     .meta
                     .insert(META_NEEDS_BASELINE_RESET_KEY, encode(&true)?)?;
-                store.persist()?;
+                store.persist_durable()?;
                 store.needs_baseline_reset = true;
                 tracing::warn!(
                     "sync ledger: on-disk schema v{version} != v{LEDGER_SCHEMA_VERSION}, \
@@ -153,7 +323,7 @@ impl FjallSyncLedgerStore {
                 store
                     .meta
                     .insert(META_SCHEMA_KEY, encode(&LEDGER_SCHEMA_VERSION)?)?;
-                store.persist()?;
+                store.persist_durable()?;
             }
             None => {
                 // Populated but unversioned: predates the schema fence, so its
@@ -167,7 +337,7 @@ impl FjallSyncLedgerStore {
                 store
                     .meta
                     .insert(META_NEEDS_BASELINE_RESET_KEY, encode(&true)?)?;
-                store.persist()?;
+                store.persist_durable()?;
                 store.needs_baseline_reset = true;
                 tracing::warn!(
                     "sync ledger: unversioned on-disk schema, wiped ledger and forcing \
@@ -175,17 +345,62 @@ impl FjallSyncLedgerStore {
                 );
             }
         }
+        // Only a ledger that survived the schema fence has rows this build can
+        // decode, so the index is built here and not in `open_at`.
+        store.rebuild_pending_index()?;
         Ok(store)
+    }
+
+    fn rebuild_pending_index(&self) -> LedgerResult<()> {
+        let mut pending = self.pending.lock();
+        *pending = PendingIndex::scan(&self.outbox, &self.inbox)?;
+        Ok(())
+    }
+
+    /// Read-modify-write of one inbox row. The index lock spans the whole cycle so
+    /// two writers cannot leave the index disagreeing with the row they wrote.
+    fn modify_inbox_entry<R>(
+        &self,
+        source: &PeerId,
+        op_id: OperationId,
+        change: impl FnOnce(&mut InboxEntry) -> R,
+    ) -> LedgerResult<R> {
+        let mut pending = self.pending.lock();
+        let mut entry = load_inbox_entry(&self.inbox, source, op_id)?;
+        let result = change(&mut entry);
+        let key = inbox_key(source, op_id);
+        self.inbox.insert(&key, encode(&entry)?)?;
+        pending.track_inbox(&key, &entry);
+        drop(pending);
+        self.persist()?;
+        Ok(result)
+    }
+
+    fn modify_outbox_entry(
+        &self,
+        target: &SyncTarget,
+        op_id: OperationId,
+        change: impl FnOnce(&mut OutboxEntry),
+    ) -> LedgerResult<()> {
+        let mut pending = self.pending.lock();
+        let mut entry = load_outbox_entry(&self.outbox, target, op_id)?;
+        change(&mut entry);
+        self.outbox.insert(outbox_key(target, op_id), encode(&entry)?)?;
+        pending.track_outbox(&entry);
+        drop(pending);
+        self.persist()
     }
 
     fn open_at(path: &Path) -> LedgerResult<Self> {
         let db = Database::builder(path).open()?;
+        let db_for_flusher = db.clone();
         let meta = db.keyspace(META, KeyspaceCreateOptions::default)?;
         let environment = match meta.get(META_ENVIRONMENT_KEY)? {
             Some(value) => decode(value.as_ref())?,
             None => NodeEnvironment::default(),
         };
         Ok(Self {
+            operation_summaries: db.keyspace(OPERATION_SUMMARIES, KeyspaceCreateOptions::default)?,
             operations: db.keyspace(OPERATIONS, KeyspaceCreateOptions::default)?,
             redacted_log: db.keyspace(REDACTED_LOG, KeyspaceCreateOptions::default)?,
             node_log: db.keyspace(NODE_LOG, KeyspaceCreateOptions::default)?,
@@ -201,6 +416,8 @@ impl FjallSyncLedgerStore {
             append_lock: Mutex::new(()),
             needs_baseline_reset: false,
             environment_cache: parking_lot::RwLock::new(environment),
+            flusher: Some(Flusher::spawn(db_for_flusher)),
+            pending: Mutex::new(PendingIndex::new()),
         })
     }
 
@@ -216,10 +433,20 @@ impl FjallSyncLedgerStore {
     /// marker in place and the next boot repeats the idempotent reseed.
     pub fn clear_baseline_reset_marker(&self) -> LedgerResult<()> {
         self.meta.remove(META_NEEDS_BASELINE_RESET_KEY)?;
-        self.persist()
+        self.persist_durable()
     }
 
+    /// Hot-path persist: hands the journal to the OS (survives a process crash)
+    /// without waiting for the disk. A full fsync per mutation parked the async
+    /// workers for tens of milliseconds to seconds on a busy or slow disk; the
+    /// background flusher bounds the power-loss window instead.
     fn persist(&self) -> LedgerResult<()> {
+        Ok(self.db.persist(PersistMode::Buffer)?)
+    }
+
+    /// Full fsync for the rare markers that must outlive a power cut (schema
+    /// stamp, baseline-reset marker).
+    fn persist_durable(&self) -> LedgerResult<()> {
         Ok(self.db.persist(PersistMode::SyncAll)?)
     }
 
@@ -253,7 +480,7 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
             last_hash: operation.operation_hash,
         };
 
-        let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
+        let mut batch = self.db.batch().durability(Some(PersistMode::Buffer));
         batch.insert(
             &self.operations,
             operation.op_id.as_bytes().to_vec(),
@@ -299,13 +526,45 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         Ok(operations)
     }
 
-    fn list_all_operations(&self) -> LedgerResult<Vec<SyncOperation>> {
-        let mut operations = Vec::new();
+    fn list_operation_summaries(&self) -> LedgerResult<Vec<OperationSummary>> {
+        let mut live: HashSet<Vec<u8>> = HashSet::new();
+        let mut summaries = Vec::new();
         for item in self.operations.iter() {
-            let (_, value) = item.into_inner()?;
-            operations.push(decode(value.as_ref())?);
+            let (key, value) = item.into_inner()?;
+            let summary = match self.operation_summaries.get(key.as_ref())? {
+                Some(cached) => decode::<OperationSummary>(cached.as_ref())?,
+                None => {
+                    let operation: SyncOperation = decode(value.as_ref())?;
+                    let summary = OperationSummary::from_operation(&operation);
+                    self.operation_summaries
+                        .insert(key.as_ref(), encode(&summary)?)?;
+                    summary
+                }
+            };
+            live.insert(key.to_vec());
+            summaries.push(summary);
         }
-        Ok(operations)
+        // Compaction and partition resets drop operations; reap their summaries.
+        let mut stale = Vec::new();
+        for item in self.operation_summaries.iter() {
+            let key = item.key()?;
+            if !live.contains(key.as_ref()) {
+                stale.push(key.to_vec());
+            }
+        }
+        for key in stale {
+            self.operation_summaries.remove(key)?;
+        }
+        Ok(summaries)
+    }
+
+    fn count_operations(&self) -> LedgerResult<usize> {
+        let mut count = 0usize;
+        for item in self.operations.iter() {
+            item.key()?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     fn get_node_operations(&self, query: NodeLogQuery) -> LedgerResult<Vec<SyncOperation>> {
@@ -419,8 +678,11 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
             acknowledged: false,
             retry_count: 0,
         };
+        let mut pending = self.pending.lock();
         self.outbox
             .insert(outbox_key(&target, op_id), encode(&entry)?)?;
+        pending.track_outbox(&entry);
+        drop(pending);
         self.persist()
     }
 
@@ -437,29 +699,40 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         target: SyncTarget,
         limit: usize,
     ) -> LedgerResult<Vec<OutboxEntry>> {
-        let mut entries = Vec::new();
-        let prefix = scoped_prefix(target.as_str());
-        for item in self.outbox.prefix(&prefix) {
-            let (_, value) = item.into_inner()?;
-            let entry: OutboxEntry = decode(value.as_ref())?;
-            if entry.acknowledged {
-                continue;
+        let candidates = match self.pending.lock().outbox.get(target.as_str()) {
+            Some(queue) => queue.oldest(limit),
+            None => return Ok(Vec::new()),
+        };
+        let mut entries = Vec::with_capacity(candidates.len());
+        let mut stale = Vec::new();
+        for op_id in candidates {
+            match load_outbox_entry(&self.outbox, &target, op_id) {
+                Ok(entry) if !entry.acknowledged => entries.push(entry),
+                Ok(_) | Err(SyncLedgerError::OutboxEntryNotFound { .. }) => stale.push(op_id),
+                Err(e) => return Err(e),
             }
-            entries.push(entry);
-            if entries.len() >= limit {
-                break;
+        }
+        // A row that vanished or was acknowledged behind the index's back would
+        // otherwise hold a slot at the head of the queue forever.
+        if !stale.is_empty() {
+            if let Some(queue) = self.pending.lock().outbox.get_mut(target.as_str()) {
+                for op_id in &stale {
+                    queue.remove(op_id);
+                }
             }
         }
         Ok(entries)
     }
 
     fn list_outbox_for_operation(&self, op_id: OperationId) -> LedgerResult<Vec<OutboxEntry>> {
+        let targets: Vec<String> = self.pending.lock().outbox_targets.iter().cloned().collect();
         let mut entries = Vec::new();
-        for item in self.outbox.iter() {
-            let (_, value) = item.into_inner()?;
-            let entry: OutboxEntry = decode(value.as_ref())?;
-            if entry.op_id == op_id {
-                entries.push(entry);
+        for target in targets {
+            let target = SyncTarget::new(target)?;
+            match load_outbox_entry(&self.outbox, &target, op_id) {
+                Ok(entry) => entries.push(entry),
+                Err(SyncLedgerError::OutboxEntryNotFound { .. }) => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(entries)
@@ -499,6 +772,7 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         // conflict) or was deferred for ordering, reset it to a fresh retryable
         // state. A repair pull that finally brings the prerequisite INSERT relies
         // on this — otherwise the stuck UPDATE would never be retried again.
+        let mut pending = self.pending.lock();
         if let Some(existing) = self.inbox.get(inbox_key(&source, operation.op_id))? {
             let mut entry: InboxEntry = decode(existing.as_ref())?;
             if entry.applied || (!entry.conflicted && entry.deferred_count == 0) {
@@ -507,8 +781,10 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
             entry.conflicted = false;
             entry.conflict_message = None;
             entry.deferred_count = 0;
-            self.inbox
-                .insert(inbox_key(&source, entry.operation.op_id), encode(&entry)?)?;
+            let key = inbox_key(&source, entry.operation.op_id);
+            self.inbox.insert(&key, encode(&entry)?)?;
+            pending.track_inbox(&key, &entry);
+            drop(pending);
             return self.persist();
         }
         let entry = InboxEntry {
@@ -518,9 +794,13 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
             conflicted: false,
             conflict_message: None,
             deferred_count: 0,
+            ordering_exhausted: false,
+            reopen_cycles: 0,
         };
-        self.inbox
-            .insert(inbox_key(&source, entry.operation.op_id), encode(&entry)?)?;
+        let key = inbox_key(&source, entry.operation.op_id);
+        self.inbox.insert(&key, encode(&entry)?)?;
+        pending.track_inbox(&key, &entry);
+        drop(pending);
         self.persist()
     }
 
@@ -573,6 +853,7 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         // `put_verified_in_inbox` (a previously failed/deferred op becomes fresh
         // again), then commit it together with the frontier advance in one batch.
         let inbox_key = inbox_key(&source, op_id);
+        let mut pending = self.pending.lock();
         let entry = match self.inbox.get(&inbox_key)? {
             Some(existing) => {
                 let mut entry: InboxEntry = decode(existing.as_ref())?;
@@ -580,7 +861,7 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
                     // Already in a clean/applied state: nothing to rewrite for the
                     // inbox, but the frontier advance and the per-node axis must
                     // still be durable (a re-delivery of an op we hold).
-                    let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
+                    let mut batch = self.db.batch().durability(Some(PersistMode::Buffer));
                     batch.insert(&self.operations, op_id.as_bytes().to_vec(), operation_bytes);
                     // Upgrade redacted→full: if we previously held this position
                     // only as a redacted placeholder, the full body now supersedes
@@ -617,11 +898,13 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
                 conflicted: false,
                 conflict_message: None,
                 deferred_count: 0,
+                ordering_exhausted: false,
+            reopen_cycles: 0,
             },
         };
 
-        let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
-        batch.insert(&self.inbox, inbox_key, encode(&entry)?);
+        let mut batch = self.db.batch().durability(Some(PersistMode::Buffer));
+        batch.insert(&self.inbox, inbox_key.clone(), encode(&entry)?);
         batch.insert(&self.operations, op_id.as_bytes().to_vec(), operation_bytes);
         // Upgrade redacted→full: a placeholder previously held at this op_id is
         // superseded by the full body. Same op_id, so a completion, not a fork.
@@ -643,6 +926,7 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
             encode(&persisted)?,
         );
         batch.commit()?;
+        pending.track_inbox(&inbox_key, &entry);
         Ok(())
     }
 
@@ -672,7 +956,7 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         // upgrade), and it advances `node_frontier`. It NEVER touches `inbox`
         // (nothing to apply), `operations`/`partition_index` (no body to relay or
         // materialize), or `node_heads` (the local mint's chain only).
-        let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
+        let mut batch = self.db.batch().durability(Some(PersistMode::Buffer));
         batch.insert(
             &self.redacted_log,
             record.op_id.as_bytes().to_vec(),
@@ -704,30 +988,87 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
     }
 
     fn list_unapplied_inbox(&self, limit: usize) -> LedgerResult<Vec<InboxEntry>> {
-        let mut entries = Vec::new();
-        for item in self.inbox.iter() {
-            let (_, value) = item.into_inner()?;
-            let entry: InboxEntry = decode(value.as_ref())?;
+        let candidates = self.pending.lock().inbox.oldest(limit);
+        let mut entries = Vec::with_capacity(candidates.len());
+        let mut stale = Vec::new();
+        for key in candidates {
+            let entry = match self.inbox.get(&key)? {
+                Some(value) => decode::<InboxEntry>(value.as_ref())?,
+                None => {
+                    stale.push(key);
+                    continue;
+                }
+            };
             if entry.applied || entry.conflicted {
-                continue;
+                stale.push(key);
+            } else {
+                entries.push(entry);
             }
-            entries.push(entry);
-            if entries.len() >= limit {
-                break;
+        }
+        if !stale.is_empty() {
+            let mut pending = self.pending.lock();
+            for key in &stale {
+                pending.inbox.remove(key);
             }
         }
         Ok(entries)
     }
 
     fn mark_inbox_applied(&self, source: PeerId, op_id: OperationId) -> LedgerResult<()> {
-        let mut entry = load_inbox_entry(&self.inbox, &source, op_id)?;
-        entry.applied = true;
-        entry.conflicted = false;
-        entry.conflict_message = None;
-        entry.deferred_count = 0;
-        self.inbox
-            .insert(inbox_key(&source, op_id), encode(&entry)?)?;
-        self.persist()
+        self.modify_inbox_entry(&source, op_id, |entry| {
+            entry.applied = true;
+            entry.conflicted = false;
+            entry.ordering_exhausted = false;
+            entry.conflict_message = None;
+            entry.deferred_count = 0;
+        })
+    }
+
+    fn mark_inbox_ordering_exhausted(
+        &self,
+        source: PeerId,
+        op_id: OperationId,
+        message: String,
+    ) -> LedgerResult<u8> {
+        self.modify_inbox_entry(&source, op_id, |entry| {
+            entry.conflicted = true;
+            entry.ordering_exhausted = entry.reopen_cycles < MAX_ORDERING_REOPEN_CYCLES;
+            entry.deferred_count = 0;
+            entry.conflict_message = Some(message);
+            entry.reopen_cycles
+        })
+    }
+
+    fn reopen_ordering_exhausted(&self) -> LedgerResult<usize> {
+        let mut pending = self.pending.lock();
+        if pending.exhausted.is_empty() {
+            return Ok(0);
+        }
+        let keys: Vec<Vec<u8>> = pending.exhausted.iter().cloned().collect();
+        let mut reopened = 0usize;
+        for key in keys {
+            let Some(value) = self.inbox.get(&key)? else {
+                pending.exhausted.remove(&key);
+                continue;
+            };
+            let mut entry: InboxEntry = decode(value.as_ref())?;
+            if entry.applied || !entry.ordering_exhausted {
+                pending.track_inbox(&key, &entry);
+                continue;
+            }
+            entry.conflicted = false;
+            entry.ordering_exhausted = false;
+            entry.reopen_cycles += 1;
+            entry.deferred_count = 0;
+            self.inbox.insert(&key, encode(&entry)?)?;
+            pending.track_inbox(&key, &entry);
+            reopened += 1;
+        }
+        drop(pending);
+        if reopened > 0 {
+            self.persist()?;
+        }
+        Ok(reopened)
     }
 
     fn mark_inbox_conflicted(
@@ -736,13 +1077,11 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         op_id: OperationId,
         message: String,
     ) -> LedgerResult<()> {
-        let mut entry = load_inbox_entry(&self.inbox, &source, op_id)?;
-        entry.conflicted = true;
-        entry.deferred_count = 0;
-        entry.conflict_message = Some(message);
-        self.inbox
-            .insert(inbox_key(&source, op_id), encode(&entry)?)?;
-        self.persist()
+        self.modify_inbox_entry(&source, op_id, |entry| {
+            entry.conflicted = true;
+            entry.deferred_count = 0;
+            entry.conflict_message = Some(message);
+        })
     }
 
     fn mark_inbox_deferred(
@@ -751,36 +1090,32 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         op_id: OperationId,
         message: String,
     ) -> LedgerResult<u32> {
-        let mut entry = load_inbox_entry(&self.inbox, &source, op_id)?;
-        entry.conflicted = false;
-        entry.deferred_count = entry.deferred_count.saturating_add(1);
-        entry.conflict_message = Some(message);
-        let deferred_count = entry.deferred_count;
-        self.inbox
-            .insert(inbox_key(&source, op_id), encode(&entry)?)?;
-        self.persist()?;
-        Ok(deferred_count)
+        self.modify_inbox_entry(&source, op_id, |entry| {
+            entry.conflicted = false;
+            entry.deferred_count = entry.deferred_count.saturating_add(1);
+            entry.conflict_message = Some(message);
+            entry.deferred_count
+        })
     }
 
     fn mark_delivered(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()> {
-        let mut entry = load_outbox_entry(&self.outbox, &target, op_id)?;
-        entry.delivered = true;
-        self.outbox
-            .insert(outbox_key(&target, op_id), encode(&entry)?)?;
-        self.persist()
+        self.modify_outbox_entry(&target, op_id, |entry| entry.delivered = true)
     }
 
     fn mark_acknowledged(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()> {
-        let mut entry = load_outbox_entry(&self.outbox, &target, op_id)?;
-        entry.delivered = true;
-        entry.acknowledged = true;
-        self.outbox
-            .insert(outbox_key(&target, op_id), encode(&entry)?)?;
-        self.persist()
+        self.modify_outbox_entry(&target, op_id, |entry| {
+            entry.delivered = true;
+            entry.acknowledged = true;
+        })
     }
 
     fn remove_outbox_entry(&self, target: SyncTarget, op_id: OperationId) -> LedgerResult<()> {
+        let mut pending = self.pending.lock();
         self.outbox.remove(outbox_key(&target, op_id))?;
+        if let Some(queue) = pending.outbox.get_mut(target.as_str()) {
+            queue.remove(&op_id);
+        }
+        drop(pending);
         self.persist()
     }
 
@@ -802,7 +1137,10 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         let entry = match self.repair_queue.get(&key)? {
             Some(value) => {
                 let mut existing: RepairQueueEntry = decode(value.as_ref())?;
-                if entry.from_node_seq < existing.from_node_seq {
+                // The newest request wins: `from_node_seq` is the chain's current
+                // expected seq, which only grows as pulls land. Keeping the lowest
+                // value re-requested the same already-known window forever.
+                if entry.from_node_seq != existing.from_node_seq {
                     existing.from_node_seq = entry.from_node_seq;
                     existing.next_attempt_ms = entry.next_attempt_ms;
                     existing.retry_count = entry.retry_count;
@@ -972,7 +1310,7 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         }
         ordered.sort_by(partition_materialization_order);
 
-        let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
+        let mut batch = self.db.batch().durability(Some(PersistMode::Buffer));
         for operation in ordered.into_iter().take(keep_after) {
             batch.remove(
                 &self.partition_index,
@@ -1033,7 +1371,7 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         let _guard = self.append_lock.lock();
         let prefix_bytes = partition_prefix.as_bytes();
 
-        let mut batch = self.db.batch().durability(Some(PersistMode::SyncAll));
+        let mut batch = self.db.batch().durability(Some(PersistMode::Buffer));
 
         // Operations are content-addressed, so the partition_index (keyed by
         // partition_id || 0x00 || op_id) is the only way to attribute an op to a
@@ -1096,6 +1434,7 @@ impl SyncLedgerStore for FjallSyncLedgerStore {
         }
 
         batch.commit()?;
+        self.rebuild_pending_index()?;
 
         // A removal only writes a tombstone; the operation bodies stay readable in
         // the table files until those are rewritten. A reset is also how bodies
@@ -1310,6 +1649,44 @@ mod tests {
             policy_epoch: 1,
             encryption_info: None,
         }
+    }
+
+    #[test]
+    fn operation_summaries_are_cached_and_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+        let first = store
+            .append_operation(sample_operation(&signer, "person_1"), &signer)
+            .unwrap();
+
+        let summaries = store.list_operation_summaries().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].op_id, first.op_id);
+        assert_eq!(summaries[0].resource_id, "person_1");
+        assert_eq!(store.count_operations().unwrap(), 1);
+
+        // A cached summary is served from its own keyspace, not re-derived from the body.
+        assert!(store
+            .operation_summaries
+            .get(first.op_id.as_bytes())
+            .unwrap()
+            .is_some());
+
+        let second = store
+            .append_operation(sample_operation(&signer, "person_2"), &signer)
+            .unwrap();
+        assert_eq!(store.list_operation_summaries().unwrap().len(), 2);
+
+        // Dropping the content row must drop its summary on the next walk.
+        store.operations.remove(second.op_id.as_bytes()).unwrap();
+        let remaining = store.list_operation_summaries().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(store
+            .operation_summaries
+            .get(second.op_id.as_bytes())
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1711,6 +2088,217 @@ mod tests {
             .list_due_repair_requests(peer, 1_000, 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn ordering_exhausted_entry_is_reopened_a_bounded_number_of_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+        let append = store
+            .append_operation(sample_operation(&signer, "person_1"), &signer)
+            .unwrap();
+        let operation = store.get_operation(append.op_id).unwrap();
+        let source = PeerId::new("node_b").unwrap();
+        store
+            .put_verified_in_inbox(source.clone(), operation, &HexNodeIdOperationVerifier)
+            .unwrap();
+
+        for cycle in 0..MAX_ORDERING_REOPEN_CYCLES {
+            let used = store
+                .mark_inbox_ordering_exhausted(source.clone(), append.op_id, "gap".into())
+                .unwrap();
+            assert_eq!(used, cycle);
+            assert_eq!(store.reopen_ordering_exhausted().unwrap(), 1);
+        }
+        let used = store
+            .mark_inbox_ordering_exhausted(source.clone(), append.op_id, "gap".into())
+            .unwrap();
+        assert_eq!(used, MAX_ORDERING_REOPEN_CYCLES);
+        assert_eq!(store.reopen_ordering_exhausted().unwrap(), 0);
+        let entry = store.get_inbox_entry(source, append.op_id).unwrap();
+        assert!(entry.conflicted && !entry.ordering_exhausted);
+    }
+
+    #[test]
+    fn newer_repair_request_replaces_an_older_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let peer = PeerId::new("node_b").unwrap();
+        for from_node_seq in [4, 260] {
+            store
+                .upsert_repair_request(RepairQueueEntry {
+                    peer: peer.clone(),
+                    target_node_id: "node_author".to_string(),
+                    from_node_seq,
+                    next_attempt_ms: 100,
+                    retry_count: 3,
+                })
+                .unwrap();
+        }
+        let due = store.list_due_repair_requests(peer, 100, 10).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].from_node_seq, 260);
+    }
+
+    #[test]
+    fn parallel_repair_windows_for_one_author_leave_a_single_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(FjallSyncLedgerStore::open(dir.path()).unwrap());
+        let peer = PeerId::new("node_b").unwrap();
+        let windows: Vec<u64> = (1..=16).map(|n| n * 10).collect();
+        let handles: Vec<_> = windows
+            .iter()
+            .map(|&from_node_seq| {
+                let store = store.clone();
+                let peer = peer.clone();
+                std::thread::spawn(move || {
+                    store
+                        .upsert_repair_request(RepairQueueEntry {
+                            peer,
+                            target_node_id: "node_author".to_string(),
+                            from_node_seq,
+                            next_attempt_ms: 100,
+                            retry_count: 0,
+                        })
+                        .unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let due = store
+            .list_due_repair_requests(peer.clone(), 100, 10)
+            .unwrap();
+        assert_eq!(due.len(), 1, "one request per (peer, author)");
+        assert!(windows.contains(&due[0].from_node_seq));
+
+        // A later window for another author does not displace the first one.
+        store
+            .upsert_repair_request(RepairQueueEntry {
+                peer: peer.clone(),
+                target_node_id: "node_other".to_string(),
+                from_node_seq: 3,
+                next_attempt_ms: 100,
+                retry_count: 0,
+            })
+            .unwrap();
+        assert_eq!(store.list_due_repair_requests(peer, 100, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pending_outbox_is_served_oldest_first_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+        let target = SyncTarget::new("node_b").unwrap();
+        let ids: Vec<OperationId> = (0..6)
+            .map(|n| {
+                store
+                    .append_operation(sample_operation(&signer, &format!("person_{n}")), &signer)
+                    .unwrap()
+                    .op_id
+            })
+            .collect();
+        for id in &ids {
+            store.put_in_outbox(target.clone(), *id).unwrap();
+        }
+        let listed = |store: &FjallSyncLedgerStore, limit| -> Vec<OperationId> {
+            store
+                .list_pending_outbox(target.clone(), limit)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.op_id)
+                .collect()
+        };
+        assert_eq!(listed(&store, 4), ids[..4].to_vec(), "queue order, not key order");
+
+        store.mark_acknowledged(target.clone(), ids[1]).unwrap();
+        store.remove_outbox_entry(target.clone(), ids[2]).unwrap();
+        let expected: Vec<OperationId> = [0, 3, 4, 5].iter().map(|&n| ids[n]).collect();
+        assert_eq!(listed(&store, 10), expected);
+
+        // Re-queueing an acknowledged op makes it pending again, at the back.
+        store.put_in_outbox(target.clone(), ids[1]).unwrap();
+        assert_eq!(listed(&store, 10).last(), Some(&ids[1]));
+
+        drop(store);
+        let reopened = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let mut after: Vec<OperationId> = listed(&reopened, 10);
+        let mut before = expected.clone();
+        before.push(ids[1]);
+        after.sort();
+        before.sort();
+        assert_eq!(after, before, "the index is rebuilt from the keyspace");
+        assert!(reopened
+            .list_pending_outbox(SyncTarget::new("node_c").unwrap(), 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn unapplied_inbox_index_follows_every_state_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let signer = signer();
+        let source = PeerId::new("node_b").unwrap();
+        let ids: Vec<OperationId> = (0..4)
+            .map(|n| {
+                let append = store
+                    .append_operation(sample_operation(&signer, &format!("person_{n}")), &signer)
+                    .unwrap();
+                let operation = store.get_operation(append.op_id).unwrap();
+                store
+                    .put_verified_in_inbox(source.clone(), operation, &HexNodeIdOperationVerifier)
+                    .unwrap();
+                append.op_id
+            })
+            .collect();
+        let pending = |store: &FjallSyncLedgerStore| -> Vec<OperationId> {
+            store
+                .list_unapplied_inbox(100)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.operation.op_id)
+                .collect()
+        };
+        assert_eq!(pending(&store), ids);
+        assert_eq!(store.list_unapplied_inbox(2).unwrap().len(), 2);
+
+        store.mark_inbox_applied(source.clone(), ids[0]).unwrap();
+        store
+            .mark_inbox_conflicted(source.clone(), ids[1], "bad".into())
+            .unwrap();
+        store
+            .mark_inbox_deferred(source.clone(), ids[2], "wait".into())
+            .unwrap();
+        assert_eq!(pending(&store), vec![ids[2], ids[3]], "a deferred entry stays pending");
+
+        store
+            .mark_inbox_ordering_exhausted(source.clone(), ids[2], "gap".into())
+            .unwrap();
+        assert_eq!(pending(&store), vec![ids[3]]);
+        assert_eq!(store.pending.lock().exhausted.len(), 1);
+        assert_eq!(store.reopen_ordering_exhausted().unwrap(), 1);
+        assert_eq!(pending(&store), vec![ids[3], ids[2]]);
+        assert!(store.pending.lock().exhausted.is_empty());
+        assert_eq!(store.pending.lock().inbox.len(), 2);
+
+        // A re-delivery resets a conflicted entry to a fresh retryable one.
+        let redelivered = store.get_operation(ids[1]).unwrap();
+        store
+            .put_verified_in_inbox(source.clone(), redelivered, &HexNodeIdOperationVerifier)
+            .unwrap();
+        assert_eq!(pending(&store).len(), 3);
+
+        drop(store);
+        let reopened = FjallSyncLedgerStore::open(dir.path()).unwrap();
+        let mut after = pending(&reopened);
+        after.sort();
+        let mut expected = vec![ids[1], ids[2], ids[3]];
+        expected.sort();
+        assert_eq!(after, expected);
     }
 
     #[test]

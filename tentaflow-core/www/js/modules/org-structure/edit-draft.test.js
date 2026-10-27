@@ -26,10 +26,10 @@ function harness({ refuse = () => null, confirm = async () => true, warn = () =>
     calls.push({ kind, payload: { ...payload, ops: payload.ops.map((o) => ({ ...o })) } });
     const results = payload.ops.map((op, index) => {
       const error = refuse(op, index, payload);
-      return { index, ok: !error, error, temp_id: op.tempId ?? null, created_id: op.tempId ? `real-${calls.length}-${op.tempId}` : null };
+      return { index, ok: !error, error, tempId: op.tempId ?? null, createdId: op.tempId ? `real-${calls.length}-${op.tempId}` : null };
     });
     const ok = results.every((r) => r.ok);
-    return { ok, applied: ok && !payload.dryRun, error: null, results, warnings: warn(results), preview_at: DAY, preview: payload.dryRun ? sampleView() : null };
+    return { ok, applied: ok && !payload.dryRun, error: null, results, warnings: warn(results), previewAt: DAY, preview: payload.dryRun ? sampleView() : null };
   };
   const draft = createDraft({ send, getLive: () => live, askBackdated: confirm, day: DAY });
   return { draft, calls, live };
@@ -44,9 +44,9 @@ test('an empty draft asks nothing of the server and shows no preview', async () 
 });
 
 test('a warning of the dry run names what the draft created by its temporary id, never by the dry run\'s own', async () => {
-  const { draft } = harness({ warn: (results) => results.filter((r) => r.created_id).map((r) => ({ kind: 'unit_without_head', unit_id: r.created_id })) });
+  const { draft } = harness({ warn: (results) => results.filter((r) => r.createdId).map((r) => ({ kind: 'unit_without_head', unitId: r.createdId })) });
   await draft.addChecked([ops.createUnitOp({ name: 'Nowy dział' }, DAY)]);
-  assert.deepEqual(draft.preview.warnings, [{ kind: 'unit_without_head', unit_id: draft.ops[0].tempId }]);
+  assert.deepEqual(draft.preview.warnings, [{ kind: 'unit_without_head', unitId: draft.ops[0].tempId }]);
 });
 
 test('an action is checked with a dry run before it is kept, and the answer is the preview', async () => {
@@ -88,7 +88,7 @@ test('assigning a person without an account chains the two operations through a 
 
 test('an assignment of the preview is written as the live one, unless the draft made it', async () => {
   const { draft, live } = harness();
-  const anna = live.assignments.find((a) => a.position_id === 'p-lead');
+  const anna = live.assignments.find((a) => a.positionId === 'p-lead');
   await draft.addChecked([ops.endAssignmentOp({ id: anna.id }, DAY)]);
   assert.equal(draft.ops[0].assignmentId, anna.id);
 });

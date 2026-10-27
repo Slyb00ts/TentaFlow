@@ -70,7 +70,7 @@ test('a finished run is measured between its own two timestamps', () => {
 test('the persisted start replaces the moment the client first looked', () => {
   const el = mount();
   // A replayed event creates the row with "now" as its start…
-  el.applyEvent({ kind: 'child_spawned', run_id: 'r-2', agent: 'root' });
+  el.applyEvent({ kind: 'child_spawned', runId: 'r-2', agent: 'root' });
   assert.match(rows(el)[0].meta, /^0s · 0 tok$/);
   // …and the row it belongs to corrects it.
   el.setRunInfo('r-2', {
@@ -294,8 +294,8 @@ test('a status neither the host nor the widget has a word for prints as it arriv
 test('a finished child states its status in the operator’s language too', () => {
   const dict = localeDict('pl');
   const el = mount('tree', hostLabels(dict));
-  el.applyEvent({ kind: 'child_spawned', run_id: 'c-1', agent: 'sub #1' });
-  el.applyEvent({ kind: 'child_finished', run_id: 'c-1', agent: 'sub #1', status: 'cancelled' });
+  el.applyEvent({ kind: 'child_spawned', runId: 'c-1', agent: 'sub #1' });
+  el.applyEvent({ kind: 'child_finished', runId: 'c-1', agent: 'sub #1', status: 'cancelled' });
   el.querySelector('.tf-aa-run[data-run="c-1"] [data-action="open-run"]').click();
   const detail = el.querySelector('.tf-aa-detail').textContent;
   assert.ok(detail.includes(dict.run_status.cancelled), `the child status is not translated: ${detail}`);
@@ -350,7 +350,7 @@ test('a timed-out child is finished on every surface that reads the set', () => 
   // The lifecycle step reporting the same timeout must not be painted the `ok` a
   // child that finished its work takes.
   const step = mount();
-  step.applyEvent({ kind: 'child_finished', run_id: 'c-2', status: 'timed_out' });
+  step.applyEvent({ kind: 'child_finished', runId: 'c-2', status: 'timed_out' });
   step.querySelector('.tf-aa-run[data-run="c-2"] [data-action="open-run"]').click();
   const dot = step.querySelector('.tf-aa-detail .tf-aa-step-dot');
   assert.ok(

@@ -18,18 +18,18 @@ const item = (over) => ({
   title: '#1 Import OPC',
   role: 'assignee',
   state: 'todo',
-  project_id: 'p-1',
-  project_name: 'NextApp',
+  projectId: 'p-1',
+  projectName: 'NextApp',
   action: 'transfer',
-  suggestion: { user_id: 'u-anna', reason: 'deputy' },
-  eligible_user_ids: ['u-anna', 'u-marek'],
+  suggestion: { userId: 'u-anna', reason: 'deputy' },
+  eligibleUserIds: ['u-anna', 'u-marek'],
   ...over,
 });
 
 const groups = [
-  { category: 'task', items: [item({}), item({ key: 'task:p-2:t-2', title: '#2 Inne', project_id: 'p-2', suggestion: null, eligible_user_ids: ['u-marek'] })] },
-  { category: 'membership', items: [item({ key: 'member:p-1', title: 'NextApp', action: 'end', suggestion: null, eligible_user_ids: null })] },
-  { category: 'position', items: [item({ key: 'position:a-1', title: 'Programista', action: 'transfer_or_end', suggestion: null, eligible_user_ids: null })] },
+  { category: 'task', items: [item({}), item({ key: 'task:p-2:t-2', title: '#2 Inne', projectId: 'p-2', suggestion: null, eligibleUserIds: ['u-marek'] })] },
+  { category: 'membership', items: [item({ key: 'member:p-1', title: 'NextApp', action: 'end', suggestion: null, eligibleUserIds: null })] },
+  { category: 'position', items: [item({ key: 'position:a-1', title: 'Programista', action: 'transfer_or_end', suggestion: null, eligibleUserIds: null })] },
   { category: 'deputy', items: [item({ key: 'deputy:d-1', title: 'Anna', blocked: 'project_archived', action: 'transfer_or_end', suggestion: null })] },
 ];
 
@@ -61,9 +61,9 @@ test('who may take a row comes from the row, and a row that only ends takes nobo
   assert.equal(canTake(rows[2], 'u-ewa'), false, 'a membership ends, nobody takes it');
   assert.equal(canTake(rows[3], 'u-ewa'), true, 'no list = any member');
   assert.equal(canTake(rows[0], ''), false);
-  const takers = [{ user_id: 'u-anna', display_name: 'Anna' }, { user_id: 'u-ewa', display_name: 'Ewa' }, { user_id: 'u-marek', display_name: 'Marek' }];
-  assert.deepEqual(takerOptions(rows[0], takers).map((p) => p.user_id), ['u-anna', 'u-marek']);
-  assert.deepEqual(takerOptions(rows[3], takers).map((p) => p.user_id), ['u-anna', 'u-ewa', 'u-marek']);
+  const takers = [{ userId: 'u-anna', displayName: 'Anna' }, { userId: 'u-ewa', displayName: 'Ewa' }, { userId: 'u-marek', displayName: 'Marek' }];
+  assert.deepEqual(takerOptions(rows[0], takers).map((p) => p.userId), ['u-anna', 'u-marek']);
+  assert.deepEqual(takerOptions(rows[3], takers).map((p) => p.userId), ['u-anna', 'u-ewa', 'u-marek']);
 });
 
 test('"hand everything to" sets the taker of the selected rows that may take them and counts the others', () => {
@@ -119,7 +119,7 @@ test('the request carries the selected rows, a taker only where the row takes on
 
 test('the summary counts what became of every item and names what a retry would take', () => {
   const answer = {
-    handover_id: 'h-1',
+    handoverId: 'h-1',
     items: [
       { key: 'a', status: 'done' }, { key: 'b', status: 'scheduled' }, { key: 'c', status: 'failed' },
       { key: 'd', status: 'not_started' }, { key: 'e', status: 'skipped' },
@@ -127,13 +127,13 @@ test('the summary counts what became of every item and names what a retry would 
   };
   assert.deepEqual(summarize(answer), { done: 1, scheduled: 1, failed: 2, skipped: 1, failedKeys: ['c', 'd'], retryable: true, total: 5 });
   assert.equal(summarize({ items: answer.items }).retryable, false, 'without a record there is nothing to retry from');
-  assert.equal(summarize({ handover_id: 'h', items: [{ key: 'a', status: 'done' }] }).retryable, false);
+  assert.equal(summarize({ handoverId: 'h', items: [{ key: 'a', status: 'done' }] }).retryable, false);
   assert.equal(summarize(null).total, 0);
 });
 
 test('the records of absences say what is away, what came back and what stayed', () => {
   const record = (over) => ({
-    id: 'h', reason: 'absence', return_date: '2026-10-10', items: [{ status: 'done' }, { status: 'done' }, { status: 'returned' }, { status: 'kept' }, { status: 'failed' }], ...over,
+    id: 'h', reason: 'absence', returnDate: '2026-10-10', items: [{ status: 'done' }, { status: 'done' }, { status: 'returned' }, { status: 'kept' }, { status: 'failed' }], ...over,
   });
   const [away] = absenceRecords([record({}), record({ reason: 'departure' })], '2026-10-01');
   assert.deepEqual([away.away, away.done, away.returned, away.kept, away.failed], [true, 2, 1, 1, 1]);
@@ -142,7 +142,7 @@ test('the records of absences say what is away, what came back and what stayed',
 });
 
 test('small helpers: takers by name and initials', () => {
-  assert.deepEqual(sortedTakers([{ user_id: '2', display_name: 'Żaneta' }, { user_id: '1', display_name: 'anna' }]).map((p) => p.user_id), ['1', '2']);
+  assert.deepEqual(sortedTakers([{ userId: '2', displayName: 'Żaneta' }, { userId: '1', displayName: 'anna' }]).map((p) => p.userId), ['1', '2']);
   assert.equal(initials('Piotr Zieliński'), 'PZ');
   assert.equal(initials(''), '?');
 });

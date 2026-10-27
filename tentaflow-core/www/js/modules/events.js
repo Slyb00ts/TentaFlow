@@ -443,9 +443,9 @@ async function loadPage({ reset }) {
     const rawRows = body.rows ?? [];
     const rows = rawRows.map(normalizeRow);
     state.rows = reset ? rows : state.rows.concat(rows);
-    state.cursor = body.nextCursor ?? body.next_cursor ?? null;
+    state.cursor = body.nextCursor ?? null;
     state.hasMore = !!state.cursor && rawRows.length > 0;
-    state.scopedToSelf = !!(body.scopedToSelf ?? body.scoped_to_self);
+    state.scopedToSelf = !!body.scopedToSelf;
     state.loadError = null;
     applyRows();
   } catch (err) {

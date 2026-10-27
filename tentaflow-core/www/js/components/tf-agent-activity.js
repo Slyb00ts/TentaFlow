@@ -153,7 +153,7 @@ function eventToStep(ev, labels) {
     case 'map_element':
       return { tone: ev.status === 'ok' ? 'ok' : 'accent', kind: 'map', detail: `${ev.index + 1}/${ev.total} · ${ev.status}` };
     case 'compaction':
-      return { tone: 'info', kind: l.step_compaction, detail: ev.node_id };
+      return { tone: 'info', kind: l.step_compaction, detail: ev.nodeId };
     case 'router_decision':
       return { tone: 'info', kind: l.step_router, detail: `${ev.selected} — ${ev.reason}` };
     case 'child_spawned':
@@ -163,13 +163,13 @@ function eventToStep(ev, labels) {
     case 'user_question':
       return { tone: 'warn', kind: l.step_question, detail: ev.question };
     case 'permission_request':
-      return { tone: 'warn', kind: l.step_permission, detail: `${ev.addon_id}.${ev.tool_name}` };
+      return { tone: 'warn', kind: l.step_permission, detail: `${ev.addonId}.${ev.toolName}` };
     case 'interaction_resolved':
       return { tone: 'info', kind: l.step_resolved, detail: ev.outcome };
     case 'node_started':
-      return { tone: 'accent', kind: l.step_node, detail: ev.node_type || ev.node_id };
+      return { tone: 'accent', kind: l.step_node, detail: ev.nodeType || ev.nodeId };
     case 'node_finished':
-      return { tone: ev.status === 'error' ? 'err' : ev.status === 'skipped' ? 'info' : 'ok', kind: l.step_node, detail: `${ev.node_id} · ${ev.status}` };
+      return { tone: ev.status === 'error' ? 'err' : ev.status === 'skipped' ? 'info' : 'ok', kind: l.step_node, detail: `${ev.nodeId} · ${ev.status}` };
     default:
       return { tone: 'info', kind: ev.kind, detail: '' };
   }
@@ -337,7 +337,7 @@ class TfAgentActivity extends HTMLElement {
   // Apply one AgentRunEvent (decoded body). Updates the run model + re-renders.
   applyEvent(ev) {
     if (!ev || !ev.kind) return;
-    const runId = ev.run_id || ev.runId || ev.scope || '';
+    const runId = ev.runId || ev.scope || '';
     if (!runId) return;
     let run = this._runs.get(runId);
     if (!run) {
@@ -347,10 +347,10 @@ class TfAgentActivity extends HTMLElement {
 
     if (ev.kind === 'child_spawned') {
       // The child row is created above by the generic path (it is keyed by
-      // ev.run_id), so the parent link has to be written onto the EXISTING
+      // ev.runId), so the parent link has to be written onto the EXISTING
       // entry — the previous "create if missing" branch never fired and every
       // spawned run stayed a root, flattening the tree.
-      const childId = ev.run_id || ev.runId;
+      const childId = ev.runId;
       const parentId = ev.scope || '';
       const child = childId ? this._runs.get(childId) : null;
       // Only link to a run we already hold: the tree renders from roots down, so
@@ -365,27 +365,27 @@ class TfAgentActivity extends HTMLElement {
     }
 
     if (ev.kind === 'child_finished') {
-      const child = this._runs.get(ev.run_id || ev.runId);
+      const child = this._runs.get(ev.runId);
       if (child) child.status = ev.status || 'completed';
     }
 
     if (ev.kind === 'user_question') {
       run.status = 'waiting_user';
       run.question = {
-        interactionId: ev.interaction_id || ev.interactionId,
+        interactionId: ev.interactionId,
         question: ev.question || '',
         choices: Array.isArray(ev.choices) ? ev.choices : [],
       };
     } else if (ev.kind === 'permission_request') {
       run.status = 'waiting_user';
       run.permission = {
-        interactionId: ev.interaction_id || ev.interactionId,
-        addonId: ev.addon_id || ev.addonId || '',
-        toolName: ev.tool_name || ev.toolName || '',
+        interactionId: ev.interactionId,
+        addonId: ev.addonId || '',
+        toolName: ev.toolName || '',
         permission: ev.permission || '',
       };
     } else if (ev.kind === 'interaction_resolved') {
-      const iid = ev.interaction_id || ev.interactionId;
+      const iid = ev.interactionId;
       if (run.question && run.question.interactionId === iid) run.question = null;
       if (run.permission && run.permission.interactionId === iid) run.permission = null;
       if (run.status === 'waiting_user') run.status = 'running';

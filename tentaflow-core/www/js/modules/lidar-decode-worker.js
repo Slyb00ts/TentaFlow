@@ -35,7 +35,7 @@ function decode({ id, streamKey, bytes }) {
     self.postMessage({ id, streamKey, hasFrame: false, error: String((err && err.message) || err) });
     return;
   }
-  if (!f || !(f.hasFrame ?? f.has_frame)) {
+  if (!f || !(f.hasFrame)) {
     self.postMessage({ id, streamKey, hasFrame: false });
     return;
   }
@@ -48,10 +48,10 @@ function decode({ id, streamKey, bytes }) {
       streamKey,
       hasFrame: true,
       points,
-      pointCount: Number(f.pointCount ?? f.point_count ?? 0),
-      frameSeq: Number(f.frameSeq ?? f.frame_seq ?? 0),
-      timestampUs: Number(f.timestampUs ?? f.timestamp_us ?? 0),
-      hostSendUs: Number(f.hostSendUs ?? f.host_send_us ?? 0),
+      pointCount: Number(f.pointCount ?? 0),
+      frameSeq: Number(f.frameSeq ?? 0),
+      timestampUs: Number(f.timestampUs ?? 0),
+      hostSendUs: Number(f.hostSendUs ?? 0),
     },
     points ? [points.buffer] : [],
   );

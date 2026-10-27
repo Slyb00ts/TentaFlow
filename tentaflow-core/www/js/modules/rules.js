@@ -54,7 +54,7 @@ async function playTts(text, ttsModels) {
   if (!ttsModels.length) { toast(I18n.t('rules.no_tts_model'), 'error'); return; }
   try {
     const resp = await ApiBinary.action('ttsPreviewRequest', {
-      text: t, model: ttsModels[0].model_name, voice: '',
+      text: t, model: ttsModels[0].modelName, voice: '',
     });
     if (!resp || !resp.bytes || !resp.bytes.length) {
       toast(I18n.t('rules.error_prefix'), 'error');
@@ -69,11 +69,11 @@ async function playTts(text, ttsModels) {
 }
 
 async function loadTts(host) {
-  const rules = await ApiBinary.list('ttsRuleListRequest');
+  const rules = await ApiBinary.list('ttsRuleListRequest', { arrayKey: 'rules' });
   // Modele TTS (do podgladu play). Filtr po kategorii — jak chat.js.
   const allModels = (await ApiBinary.list('modelListRequest', { arrayKey: 'models' })) || [];
   const ttsModels = allModels.filter(
-    (m) => (m.category || m.service_type || '').toLowerCase() === 'tts',
+    (m) => (m.category || '').toLowerCase() === 'tts',
   );
   // Formularz dodawania substytucji (pattern -> zamiennik). Reguly sa
   // stosowane przed TTS (clean_cache): kazde wystapienie `pattern` w tekscie
@@ -140,7 +140,7 @@ async function loadTts(host) {
 }
 
 async function loadPii(host) {
-  const rules = await ApiBinary.list('piiRuleListRequest');
+  const rules = await ApiBinary.list('piiRuleListRequest', { arrayKey: 'rules' });
   host.innerHTML = rules.length === 0
     ? `<div class="empty-state"><div class="empty-state-text">${escapeHtml(I18n.t('rules.empty_pii'))}</div></div>`
     : `<table class="data-table">

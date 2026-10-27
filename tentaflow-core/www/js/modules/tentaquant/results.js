@@ -49,7 +49,7 @@ const PERIODS = { all: 0, day: 1, week: 7, month: 30 };
 /// document VERBATIM, so a tile written by a newer node with a kind this build
 /// does not draw is reported as unknown rather than mis-drawn.
 export function parseTile(run) {
-  const raw = run && (run.tileJson ?? run.tile_json);
+  const raw = run && run.tileJson;
   if (!raw) return null;
   let value = null;
   try {
@@ -61,7 +61,7 @@ export function parseTile(run) {
   const kind = String(value.kind || '');
   return {
     kind: TILE_KINDS.includes(kind) ? kind : '',
-    countsTop: (value.counts_top ?? value.countsTop ?? [])
+    countsTop: (value.counts_top ?? [])
       .map((row) => ({ bitstring: String(row[0]), probability: Number(row[1]) || 0 })),
     series: (value.series || []).map(Number).filter(Number.isFinite),
     bloch: (value.bloch || []).map((v) => Array.from(v || [], Number).slice(0, 3)),

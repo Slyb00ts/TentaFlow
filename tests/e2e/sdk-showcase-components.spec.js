@@ -12,10 +12,10 @@
 //              A structured per-component report is attached to the run.
 //
 //              The catalog emits one sample per implemented SDK component
-//              (138 implemented = 151 catalog tags - 13 known-missing). Six
+//              (140 implemented = 152 catalog tags - 12 known-missing). Six
 //              page-level overlay components (Modal/Drawer/Popover/Sheet/
 //              GateScreen/ConfirmationDialog) have renderers but are not sampled
-//              inline, so the inline catalog covers 132 samples; the overlay
+//              inline, so the inline catalog covers 134 samples; the overlay
 //              open/close round-trip is verified via the Refresh action and the
 //              "overlay never blocks the page" assertion.
 // =============================================================================
@@ -58,8 +58,8 @@ const PERMISSIONS = [
 const CATALOG_TABS = ['molecules', 'layout', 'data', 'form', 'action', 'feedback', 'specialized'];
 
 // Total implemented SDK components (catalog tags minus KNOWN_MISSING). Used for
-// the final rendered X/138 headline count.
-const TOTAL_IMPLEMENTED = 138;
+// the final rendered X/140 headline count.
+const TOTAL_IMPLEMENTED = 140;
 
 // Page-level overlay components that have renderers but are intentionally not
 // sampled inline (OVERLAY_NOT_SAMPLED in catalog.rs). They are counted as
@@ -373,7 +373,7 @@ test.describe('sdk-showcase — every catalog component renders', () => {
 
     expect(notUpgraded, `samples that did not upgrade:\n${notUpgraded.join('\n')}`).toEqual([]);
     expect(blank, `samples that rendered blank:\n${blank.join('\n')}`).toEqual([]);
-    // Inline catalog covers 138 implemented minus 6 page-level overlays = 132.
+    // Inline catalog covers 140 implemented minus 6 page-level overlays = 134.
     expect(totalRendered, 'unexpected rendered sample count').toBe(totalExpected);
     expect(totalExpected).toBe(TOTAL_IMPLEMENTED - OVERLAY_NOT_SAMPLED.length);
     assertNoConsoleErrors(errors, 'after rendering all catalog tabs');

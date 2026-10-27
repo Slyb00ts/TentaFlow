@@ -96,13 +96,12 @@ function decodeList(nodes) {
   const body = wasm.decodeMessageBody(Uint8Array.from(enc({
     MeshNodeListResponseBody: { nodes },
   })));
-  assert.equal(body.variant, 'MeshNodeListResponse');
+  assert.equal(body._variant, 'MeshNodeListResponseBody');
   return body.nodes;
 }
 
 test('node list carries the registry profile and environment mesh.js renders', { skip }, () => {
   const [node] = decodeList([nodeInfo({ node_kind: 'server', operator: true, environment: 'test' })]);
-  assert.equal(node.node_kind, 'server');
   assert.equal(node.nodeKind, 'server');
   assert.equal(node.operator, true);
   assert.equal(node.environment, 'test');
@@ -110,16 +109,17 @@ test('node list carries the registry profile and environment mesh.js renders', {
 
 test('an operator flag switched off arrives as false, not as a missing field', { skip }, () => {
   const [node] = decodeList([nodeInfo({ node_kind: 'phone', operator: false, environment: 'prod' })]);
-  assert.equal(node.node_kind, 'phone');
+  assert.equal(node.nodeKind, 'phone');
   assert.equal(Object.hasOwn(node, 'operator'), true);
   assert.equal(node.operator, false);
 });
 
-test('a peer that predates the registry decodes as unknown kind, no operator, unknown env', { skip }, () => {
+test('a peer that predates the registry decodes with no kind, no operator and no environment', { skip }, () => {
   const [node] = decodeList([nodeInfo({})]);
-  // serde's String default; mesh.js renders an empty kind as 'unknown'.
-  assert.equal(node.node_kind, '');
-  assert.equal(node.operator, false);
+  // The generic decoder does not synthesise serde defaults: absent stays absent,
+  // and mesh.js reads it as 'unknown' kind / operator off.
+  assert.equal(Object.hasOwn(node, 'nodeKind'), false);
+  assert.equal(Object.hasOwn(node, 'operator'), false);
   assert.equal(Object.hasOwn(node, 'environment'), false);
 });
 
@@ -127,7 +127,7 @@ test('node detail carries the same registry fields', { skip }, () => {
   const body = wasm.decodeMessageBody(Uint8Array.from(enc({
     MeshNodeDetailResponseBody: { node: nodeInfo({ node_kind: 'desktop', operator: true }) },
   })));
-  assert.equal(body.variant, 'MeshNodeDetailResponse');
-  assert.equal(body.node.node_kind, 'desktop');
+  assert.equal(body._variant, 'MeshNodeDetailResponseBody');
+  assert.equal(body.node.nodeKind, 'desktop');
   assert.equal(body.node.operator, true);
 });

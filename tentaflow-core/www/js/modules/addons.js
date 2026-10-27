@@ -27,8 +27,6 @@ import { openInstallSteps } from '/js/modules/addons/install-steps.js';
 import { openUninstallDialog } from '/js/modules/addons/uninstall-dialog.js';
 import { confirmDisable } from '/js/modules/addons/disable-dialog.js';
 import { openRobotCloudDialog, robotCloudFieldValues, robotCloudVendorName } from '/js/modules/addons/robot-cloud-dialog.js';
-// `openInstallWizard` reserved for the future "Install from ZIP" flow on the
-// addons list page; it is no longer triggered from the per-addon header.
 
 // The one package that finishes installing unable to do its job. TentaNas can
 // run nothing privileged until an admin picks a channel mode, and the install
@@ -243,9 +241,9 @@ function updateSubtitle() {
   const sub = byId('addons-sub');
   if (!sub) return;
   const total = addonsList.length;
-  const enabled = addonsList.filter((a) => !!(a.isEnabled ?? a.is_enabled)).length;
+  const enabled = addonsList.filter((a) => !!a.isEnabled).length;
   const oauth = addonsList.filter((a) => {
-    const mode = a.oauthMode ?? a.oauth_mode ?? null;
+    const mode = a.oauthMode ?? null;
     return mode !== null && mode !== 'none';
   }).length;
   const runtimes = [...new Set(
@@ -307,9 +305,9 @@ function showCatalog() {
 function openInstallFromRoute(packageId) {
   if (!packageId) return;
   showCatalog();
-  const pkg = catalogList.find((p) => (p.packageId ?? p.package_id) === packageId);
+  const pkg = catalogList.find((p) => p.packageId === packageId);
   if (!pkg || !isAdmin) return;
-  const installed = Number(pkg.installedInstances ?? pkg.installed_instances ?? 0);
+  const installed = Number(pkg.installedInstances ?? 0);
   if ((pkg.singleton ?? false) && installed > 0) return;
   openInstallInstanceModal(pkg);
 }
@@ -320,15 +318,15 @@ function renderList() {
 
   const filtered = addonsList.filter((a) => {
     if (filterSearch) {
-      const dn = a.displayName ?? a.display_name ?? '';
-      const hay = `${dn} ${a.name} ${a.addonId ?? a.addon_id} ${a.description || ''} ${a.category || ''} ${a.runtime || ''}`.toLowerCase();
+      const dn = a.displayName ?? '';
+      const hay = `${dn} ${a.name} ${a.addonId} ${a.description || ''} ${a.category || ''} ${a.runtime || ''}`.toLowerCase();
       if (!hay.includes(filterSearch)) return false;
     }
     const runtime = String(a.runtime || '').toLowerCase();
-    if (filterMode === 'enabled' && !(a.isEnabled ?? a.is_enabled)) return false;
-    if (filterMode === 'disabled' && (a.isEnabled ?? a.is_enabled)) return false;
-    if (filterMode === 'oauth_global' && (a.oauthMode ?? a.oauth_mode) !== 'global') return false;
-    if (filterMode === 'oauth_individual' && (a.oauthMode ?? a.oauth_mode) !== 'individual') return false;
+    if (filterMode === 'enabled' && !a.isEnabled) return false;
+    if (filterMode === 'disabled' && a.isEnabled) return false;
+    if (filterMode === 'oauth_global' && a.oauthMode !== 'global') return false;
+    if (filterMode === 'oauth_individual' && a.oauthMode !== 'individual') return false;
     if (filterMode.startsWith('runtime_') && runtime !== filterMode.slice('runtime_'.length)) return false;
     return true;
   });
@@ -359,11 +357,11 @@ function renderList() {
       // so does a parked "stop sharing" request (the node disables only
       // once a second admin releases it).
       if (!enabled) {
-        const entry = addonsList.find((a) => (a.addonId ?? a.addon_id) === addonId);
+        const entry = addonsList.find((a) => a.addonId === addonId);
         const ok = await confirmDisable({
           addonId,
-          displayName: entry?.displayName ?? entry?.display_name ?? '',
-          packageId: entry?.packageId ?? entry?.package_id ?? '',
+          displayName: entry?.displayName ?? '',
+          packageId: entry?.packageId ?? '',
         });
         if (!ok) {
           t.setAttribute('checked', '');
@@ -378,10 +376,9 @@ function renderList() {
         // without a reload, and a disabled one must stop being reachable.
         notifyAppsChanged();
         // Zaktualizuj lokalny model, zeby filtr enabled/disabled pokazal spojny stan.
-        const entry = addonsList.find((a) => (a.addonId ?? a.addon_id) === addonId);
+        const entry = addonsList.find((a) => a.addonId === addonId);
         if (entry) {
-          if ('isEnabled' in entry) entry.isEnabled = enabled;
-          else entry.is_enabled = enabled;
+          entry.isEnabled = enabled;
         }
       } catch (err) {
         // Rollback wizualny gdy backend odmowil.
@@ -411,7 +408,7 @@ function renderCatalog() {
   if (!grid) return;
   const filtered = catalogList.filter((p) => {
     if (!filterSearch) return true;
-    const hay = `${p.packageId ?? p.package_id} ${p.name || ''}`.toLowerCase();
+    const hay = `${p.packageId} ${p.name || ''}`.toLowerCase();
     return hay.includes(filterSearch);
   });
   const sub = byId('addons-sub');
@@ -424,17 +421,17 @@ function renderCatalog() {
   grid.querySelectorAll('tf-button[data-act="install"]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const pkgId = btn.dataset.pkg;
-      const pkg = catalogList.find((p) => (p.packageId ?? p.package_id) === pkgId);
+      const pkg = catalogList.find((p) => p.packageId === pkgId);
       if (pkg) openInstallInstanceModal(pkg);
     });
   });
 }
 
 function renderCatalogCard(p) {
-  const pkgId = p.packageId ?? p.package_id;
-  const latest = p.latestVersion ?? p.latest_version ?? '0.0.0';
+  const pkgId = p.packageId;
+  const latest = p.latestVersion ?? '0.0.0';
   const versions = Array.isArray(p.versions) ? p.versions : [];
-  const installed = Number(p.installedInstances ?? p.installed_instances ?? 0);
+  const installed = Number(p.installedInstances ?? 0);
   const source = p.source || 'bundled';
   const badges = [];
   badges.push(renderAddonBadge(`v${latest}`, { status: 'info', icon: 'chip', className: 'runtime' }));
@@ -473,21 +470,21 @@ function renderCatalogCard(p) {
 }
 
 function renderCard(a) {
-  const id = a.addonId ?? a.addon_id;
-  const enabled = !!(a.isEnabled ?? a.is_enabled);
-  const isSystem = !!(a.isSystem ?? a.is_system);
+  const id = a.addonId;
+  const enabled = !!a.isEnabled;
+  const isSystem = !!a.isSystem;
   const runtime = a.runtime || '';
-  const oauthMode = a.oauthMode ?? a.oauth_mode ?? null;
-  const visibilityScope = a.visibilityScope ?? a.visibility_scope ?? '';
-  const permissionsCount = Number(a.declaredPermissionsCount ?? a.declared_permissions_count ?? 0);
-  const usersWithOauth = Number(a.usersWithOauthCount ?? a.users_with_oauth_count ?? 0);
+  const oauthMode = a.oauthMode ?? null;
+  const visibilityScope = a.visibilityScope ?? '';
+  const permissionsCount = Number(a.declaredPermissionsCount ?? 0);
+  const usersWithOauth = Number(a.usersWithOauthCount ?? 0);
   const category = a.category ?? null;
   const iconId = a.icon || iconForCategory(category);
   const sizeBytes = Number(a.fileSizeBytes ?? 0);
   const sizeLabel = sizeBytes > 0 ? formatBytes(sizeBytes) : '';
 
   const metaParts = [];
-  const pkgVersion = a.packageVersion ?? a.package_version ?? a.version ?? '0.0.0';
+  const pkgVersion = a.packageVersion ?? a.version ?? '0.0.0';
   metaParts.push(`v${escapeHtml(pkgVersion)}`);
   if (sizeLabel) metaParts.push(escapeHtml(sizeLabel));
   if (runtime) metaParts.push(escapeHtml(runtime));
@@ -504,7 +501,7 @@ function renderCard(a) {
     const config = badgeConfig[oauthMode] || { status: 'info', icon: 'key', className: 'oauth-generic' };
     badges.push(renderAddonBadge(I18n.t('addons.badges.oauth_' + oauthMode), config));
   }
-  const updateAvailable = !!(a.updateAvailable ?? a.update_available);
+  const updateAvailable = !!a.updateAvailable;
   if (updateAvailable) {
     badges.push(renderAddonBadge('aktualizacja', {
       status: 'warn',
@@ -538,10 +535,10 @@ function renderCard(a) {
     }));
   }
   const footerText = footerTextForAddon({ enabled, usersWithOauth, oauthMode, runtime });
-  const displayName = a.displayName ?? a.display_name ?? a.name ?? id;
+  const displayName = a.displayName ?? a.name ?? id;
   // background_on_disable apps keep serving (shares, schedules) while
   // disabled: the toggle must not read as a full stop.
-  const backgroundOnDisable = !!(a.backgroundOnDisable ?? a.background_on_disable);
+  const backgroundOnDisable = !!a.backgroundOnDisable;
   const toggleHint = backgroundOnDisable ? I18n.t('addons.background_on_disable_hint') : '';
   // Wiersz akcji instancji (admin). stopPropagation w handlerze, zeby klik w
   // przycisk nie otwieral detalu.
@@ -618,16 +615,16 @@ function openModal({ title, icon = 'puzzle', bodyHtml, confirmLabel, confirmIcon
 
 // Katalog → "Zainstaluj": nazwa instancji + wybor wersji pakietu.
 function openInstallInstanceModal(pkg) {
-  const pkgId = pkg.packageId ?? pkg.package_id;
+  const pkgId = pkg.packageId;
   const versions = Array.isArray(pkg.versions) ? pkg.versions : [];
   const opts = versions.map((v) => `<option value="${escapeAttr(v)}">${escapeHtml(v)}</option>`).join('');
   // Connection params declared by the package ([[robot.connection_param]]).
   // Each renders a tf-input collected into the install request's config map, so
   // robot packages get a per-instance IP/serial instead of a hardcoded default.
-  const params = Array.isArray(pkg.connectionParams ?? pkg.connection_params)
-    ? (pkg.connectionParams ?? pkg.connection_params)
+  const params = Array.isArray(pkg.connectionParams)
+    ? pkg.connectionParams
     : [];
-  const paramType = (p) => (p.paramType ?? p.param_type ?? '').toLowerCase();
+  const paramType = (p) => (p.paramType ?? '').toLowerCase();
   const paramFields = params.map((p) => {
     const key = p.key;
     const label = p.label || key;
@@ -643,14 +640,14 @@ function openInstallInstanceModal(pkg) {
   // from the names already taken by this package's instances.
   // A package bound to a robot vendor account ([robot.cloud_account]) can fill
   // its connection params by signing into that account instead of by hand.
-  const cloudProvider = pkg.cloudAccountProvider ?? pkg.cloud_account_provider ?? '';
+  const cloudProvider = pkg.cloudAccountProvider ?? '';
   const cloudButton = cloudProvider && params.length > 0
     ? `<tf-button variant="secondary" icon="cloud" id="inst-robot-cloud">${escapeHtml(I18n.t('addons.robot_cloud.open', { vendor: robotCloudVendorName(cloudProvider) }))}</tf-button>`
     : '';
   const singleton = !!(pkg.singleton ?? false);
   const takenNames = addonsList
-    .filter((a) => (a.packageId ?? a.package_id) === pkgId)
-    .map((a) => String(a.displayName ?? a.display_name ?? a.name ?? '').trim().toLowerCase());
+    .filter((a) => a.packageId === pkgId)
+    .map((a) => String(a.displayName ?? a.name ?? '').trim().toLowerCase());
   const win = openModal({
     title: I18n.t('addons.install_title', { name: pkg.name || pkgId }),
     icon: 'download',
@@ -727,7 +724,7 @@ function openInstallInstanceModal(pkg) {
       // exists. A package without steps gets no extra window.
       const steps = pkg.installSteps ?? [];
       if (steps.length > 0) {
-        openInstallSteps({ addonId: res.addonId ?? res.addon_id, packageName: pkg.name || pkgId, steps });
+        openInstallSteps({ addonId: res.addonId, packageName: pkg.name || pkgId, steps });
       }
       return true;
     },
@@ -959,10 +956,10 @@ function renderDetail() {
 
   const tools = d.tools || [];
   const permissions = d.permissions || [];
-  const linkedCount = Number(d.linkedAccountsCount ?? d.linked_accounts_count ?? 0);
-  const visibleCount = Number(d.visibilityGroupsVisible ?? d.visibility_groups_visible ?? 0);
-  const totalCount = Number(d.visibilityGroupsTotal ?? d.visibility_groups_total ?? 0);
-  const oauthMode = d.oauthMode ?? d.oauth_mode ?? null;
+  const linkedCount = Number(d.linkedAccountsCount ?? 0);
+  const visibleCount = Number(d.visibilityGroupsVisible ?? 0);
+  const totalCount = Number(d.visibilityGroupsTotal ?? 0);
+  const oauthMode = d.oauthMode ?? null;
 
   const tabsHost = byId('addon-detail-tabs');
   if (!tabsHost) return;
@@ -1037,7 +1034,7 @@ function renderDetailHeader(d) {
   if (!host) return;
   const iconId = d.icon || iconForCategory(d.category || '');
   const version = d.version || '0.0.0';
-  const sizeBytes = Number(d.fileSizeBytes ?? d.file_size_bytes ?? 0);
+  const sizeBytes = Number(d.fileSizeBytes ?? 0);
   const sizeLabel = sizeBytes > 0 ? formatBytes(sizeBytes) : '';
   const runtime = d.runtime || '';
   const author = d.author || '';
@@ -1049,10 +1046,10 @@ function renderDetailHeader(d) {
   if (author) subParts.push(escapeHtml(I18n.t('addons.detail.by_author', { author })));
   if (license) subParts.push(escapeHtml(license));
 
-  const enabled = !!(d.isEnabled ?? d.is_enabled);
-  const oauthMode = d.oauthMode ?? d.oauth_mode ?? null;
-  const visibleCount = Number(d.visibilityGroupsVisible ?? d.visibility_groups_visible ?? 0);
-  const totalCount = Number(d.visibilityGroupsTotal ?? d.visibility_groups_total ?? 0);
+  const enabled = !!d.isEnabled;
+  const oauthMode = d.oauthMode ?? null;
+  const visibleCount = Number(d.visibilityGroupsVisible ?? 0);
+  const totalCount = Number(d.visibilityGroupsTotal ?? 0);
 
   const badges = [];
   badges.push(renderAddonBadge(enabled ? I18n.t('addons.enabled') : I18n.t('addons.disabled'), {
@@ -1077,7 +1074,7 @@ function renderDetailHeader(d) {
   // Native apps: per-node reconcile registry (plan §3.1) — one badge per
   // state so the admin sees at a glance which nodes are ready, unsupported
   // or failed; the failing node ids ride in the tooltip.
-  const nodeStatuses = d.nodeStatuses ?? d.node_statuses ?? [];
+  const nodeStatuses = d.nodeStatuses ?? [];
   if (nodeStatuses.length > 0) {
     const byState = new Map();
     for (const s of nodeStatuses) {
@@ -1089,7 +1086,7 @@ function renderDetailHeader(d) {
       const statusKind = stateKey === 'ready' ? 'ok' : stateKey === 'unsupported' ? 'info' : 'warn';
       const label = `${I18n.t('addons.badges.node_status_' + stateKey)}: ${entries.length}`;
       const title = entries
-        .map((s) => `${s.nodeId ?? s.node_id ?? ''}${s.detail ? ` — ${s.detail}` : ''}`)
+        .map((s) => `${s.nodeId ?? ''}${s.detail ? ` — ${s.detail}` : ''}`)
         .join('\n');
       badges.push(`<span title="${escapeAttr(title)}">${renderAddonBadge(label, {
         status: statusKind,
@@ -1146,7 +1143,7 @@ async function switchTab(tabId) {
   }
   if (tabId === 'visibility') {
     await VisibilityTab.mount(body, currentAddonId, {
-      adminOnlyInitial: !!(currentAddonDetail?.adminOnly ?? currentAddonDetail?.admin_only),
+      adminOnlyInitial: !!currentAddonDetail?.adminOnly,
     });
     activeTabController = VisibilityTab;
     return;
@@ -1164,7 +1161,7 @@ async function switchTab(tabId) {
     return;
   }
   if (tabId === 'oauth') {
-    const providers = currentAddonDetail?.oauthProviders || currentAddonDetail?.oauth_providers || [];
+    const providers = currentAddonDetail?.oauthProviders || [];
     if (providers.length === 0) {
       renderOAuthEmptyState(body);
       return;
@@ -1174,7 +1171,7 @@ async function switchTab(tabId) {
     return;
   }
   if (tabId === 'linked') {
-    const providers = currentAddonDetail?.oauthProviders || currentAddonDetail?.oauth_providers || [];
+    const providers = currentAddonDetail?.oauthProviders || [];
     if (providers.length === 0) {
       renderLinkedAccountsEmptyState(body);
       return;

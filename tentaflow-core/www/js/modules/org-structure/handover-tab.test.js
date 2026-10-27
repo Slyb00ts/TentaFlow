@@ -23,9 +23,9 @@ const { formatDay } = await import('/js/lib/date-format.js');
 
 const ht = (key, params) => I18n.t(`org_structure.handover.${key}`, params);
 
-const anna = { user_id: 'u-anna', display_name: 'Anna Kowalska' };
-const marek = { user_id: 'u-marek', display_name: 'Marek Nowak' };
-const ewa = { user_id: 'u-ewa', display_name: 'Ewa Wiśniewska' };
+const anna = { userId: 'u-anna', displayName: 'Anna Kowalska' };
+const marek = { userId: 'u-marek', displayName: 'Marek Nowak' };
+const ewa = { userId: 'u-ewa', displayName: 'Ewa Wiśniewska' };
 
 const groups = [
   {
@@ -33,46 +33,46 @@ const groups = [
     items: [
       {
         key: 'task:p-1:t-1', category: 'task', title: '#231 Import OPC zawiesza się', role: 'assignee', state: 'in_progress',
-        project_id: 'p-1', project_name: 'NextApp', action: 'transfer',
-        suggestion: { user_id: 'u-anna', reason: 'deputy' }, eligible_user_ids: ['u-anna', 'u-marek'],
+        projectId: 'p-1', projectName: 'NextApp', action: 'transfer',
+        suggestion: { userId: 'u-anna', reason: 'deputy' }, eligibleUserIds: ['u-anna', 'u-marek'],
       },
       {
         key: 'task:p-2:t-2', category: 'task', title: '#7 Inny projekt', role: 'assignee', state: 'todo',
-        project_id: 'p-2', project_name: 'Energetyka', action: 'transfer', suggestion: null, eligible_user_ids: ['u-marek'],
+        projectId: 'p-2', projectName: 'Energetyka', action: 'transfer', suggestion: null, eligibleUserIds: ['u-marek'],
       },
     ],
   },
   {
     category: 'membership',
     items: [{
-      key: 'member:p-1', category: 'membership', title: 'NextApp', role: 'editor', state: '', project_id: 'p-1', project_name: 'NextApp',
-      action: 'end', suggestion: null, eligible_user_ids: null,
+      key: 'member:p-1', category: 'membership', title: 'NextApp', role: 'editor', state: '', projectId: 'p-1', projectName: 'NextApp',
+      action: 'end', suggestion: null, eligibleUserIds: null,
     }],
   },
   {
     category: 'position',
     items: [{
-      key: 'position:a-1', category: 'position', title: 'Programista', role: 'member', state: '', unit_name: 'Dział IT',
-      action: 'transfer_or_end', suggestion: { user_id: 'u-ewa', reason: 'manager' }, eligible_user_ids: ['u-anna', 'u-marek', 'u-ewa'],
+      key: 'position:a-1', category: 'position', title: 'Programista', role: 'member', state: '', unitName: 'Dział IT',
+      action: 'transfer_or_end', suggestion: { userId: 'u-ewa', reason: 'manager' }, eligibleUserIds: ['u-anna', 'u-marek', 'u-ewa'],
     }],
   },
   {
     category: 'deputy',
     items: [{
       key: 'deputy:d-1', category: 'deputy', title: 'Ewa Wiśniewska', role: 'deputy', state: 'all', action: 'transfer_or_end',
-      suggestion: null, eligible_user_ids: ['u-anna'], valid_to: '2026-12-01', blocked: 'project_archived',
+      suggestion: null, eligibleUserIds: ['u-anna'], validTo: '2026-12-01', blocked: 'project_archived',
     }],
   },
 ];
 
 const listing = (over = {}) => ({
-  variant: 'OrgStructureHandoverListResponse',
-  user: { user_id: 'u-leaver', display_name: 'Piotr Zieliński' },
+  _variant: 'OrgStructureBody.HandoverListResponse',
+  user: { userId: 'u-leaver', displayName: 'Piotr Zieliński' },
   reason: 'departure',
   date: '2026-10-31',
-  return_date: null,
-  assignment_ended_on: null,
-  project_name: null,
+  returnDate: null,
+  assignmentEndedOn: null,
+  projectName: null,
   groups,
   takers: [marek, anna, ewa],
   ...over,
@@ -218,8 +218,8 @@ test('"hand everything to" changes the selected rows that person may take and te
 
 test('a complete apply sends exactly the ticked rows with their takers and reads the list again', async () => {
   answers.orgHandoverApplyRequest = (payload) => ({
-    ok: true, handover_id: 'h-1', error: null, applied: 4, scheduled: 0, failed: 0,
-    items: payload.items.map((i) => ({ key: i.key, category: 'task', title: i.key, status: 'done', reason: null, taker_user_id: i.takerUserId })),
+    ok: true, handoverId: 'h-1', error: null, applied: 4, scheduled: 0, failed: 0,
+    items: payload.items.map((i) => ({ key: i.key, category: 'task', title: i.key, status: 'done', reason: null, takerUserId: i.takerUserId })),
   });
   await mount();
   change(rowOf('task:p-2:t-2').querySelector('tf-select'), { value: 'u-marek' });
@@ -252,14 +252,14 @@ test('a complete apply sends exactly the ticked rows with their takers and reads
 
 test('a partial failure stays on screen per item with its rule, and retry sends only what failed', async () => {
   answers.orgHandoverApplyRequest = {
-    ok: false, handover_id: 'h-9', error: null, applied: 1, scheduled: 0, failed: 2,
+    ok: false, handoverId: 'h-9', error: null, applied: 1, scheduled: 0, failed: 2,
     items: [
-      { key: 'task:p-1:t-1', category: 'task', title: '#231 Import OPC zawiesza się', status: 'done', reason: null, taker_user_id: 'u-anna', project_name: 'NextApp' },
-      { key: 'task:p-2:t-2', category: 'task', title: '#7 Inny projekt', status: 'failed', reason: 'internal', taker_user_id: 'u-marek', project_name: 'Energetyka' },
-      { key: 'member:p-1', category: 'membership', title: 'NextApp', status: 'failed', reason: 'still_holds_work', taker_user_id: null, project_name: 'NextApp' },
+      { key: 'task:p-1:t-1', category: 'task', title: '#231 Import OPC zawiesza się', status: 'done', reason: null, takerUserId: 'u-anna', projectName: 'NextApp' },
+      { key: 'task:p-2:t-2', category: 'task', title: '#7 Inny projekt', status: 'failed', reason: 'internal', takerUserId: 'u-marek', projectName: 'Energetyka' },
+      { key: 'member:p-1', category: 'membership', title: 'NextApp', status: 'failed', reason: 'still_holds_work', takerUserId: null, projectName: 'NextApp' },
     ],
   };
-  answers.orgHandoverRetryRequest = { ok: true, handover_id: 'h-9', error: null, applied: 2, scheduled: 0, failed: 0, items: [] };
+  answers.orgHandoverRetryRequest = { ok: true, handoverId: 'h-9', error: null, applied: 2, scheduled: 0, failed: 0, items: [] };
   await mount();
   change(rowOf('task:p-2:t-2').querySelector('tf-select'), { value: 'u-marek' });
   $('[data-role="note"]').value = 'n';
@@ -278,7 +278,7 @@ test('a partial failure stays on screen per item with its rule, and retry sends 
 
 test('a refused request shows the rule and moves nothing', async () => {
   answers.orgHandoverApplyRequest = {
-    ok: false, handover_id: null, error: { code: 'empty_field', message: 'note' }, items: [], applied: 0, scheduled: 0, failed: 0,
+    ok: false, handoverId: null, error: { code: 'empty_field', message: 'note' }, items: [], applied: 0, scheduled: 0, failed: 0,
   };
   await mount();
   change(rowOf('task:p-2:t-2').querySelector('tf-select'), { value: 'u-marek' });
@@ -293,7 +293,7 @@ test('a refused request shows the rule and moves nothing', async () => {
 });
 
 test('an absence needs a return day, sends it, and asks the list for no date', async () => {
-  answers.orgHandoverApplyRequest = { ok: true, handover_id: 'h-2', error: null, applied: 1, scheduled: 0, failed: 0, items: [] };
+  answers.orgHandoverApplyRequest = { ok: true, handoverId: 'h-2', error: null, applied: 1, scheduled: 0, failed: 0, items: [] };
   await mount({ target: { userId: 'u-me', reason: 'absence', projectId: null }, isAdmin: false });
   assert.deepEqual(listCalls()[0].payload, { userId: 'u-me', reason: 'absence', projectId: null, date: null });
   assert.equal($('[data-role="reason"]') !== null, true);
@@ -348,7 +348,7 @@ test('a person with nothing to hand over gets an empty state, not an empty table
 });
 
 test('a project the server left out of the list is named on the screen', async () => {
-  answers.list = listing({ skipped_projects: ['Energetyka', 'NextApp'] });
+  answers.list = listing({ skippedProjects: ['Energetyka', 'NextApp'] });
   await mount();
   const message = $('[data-role="ctxnote"]').getAttribute('message');
   assert.ok(message.includes(ht('note_skipped_projects', { projects: 'Energetyka, NextApp' })), message);
@@ -377,7 +377,7 @@ test('a code the screen has no sentence for still names the org rule', () => {
 
 test('the surrounding screen is told when something moved, and not when nothing did', async () => {
   answers.orgHandoverApplyRequest = {
-    ok: false, handover_id: null, error: { code: 'empty_field', message: 'note' }, items: [], applied: 0, scheduled: 0, failed: 0,
+    ok: false, handoverId: null, error: { code: 'empty_field', message: 'note' }, items: [], applied: 0, scheduled: 0, failed: 0,
   };
   await mount();
   change(rowOf('task:p-2:t-2').querySelector('tf-select'), { value: 'u-marek' });
@@ -386,8 +386,8 @@ test('the surrounding screen is told when something moved, and not when nothing 
   await sleep(10);
   assert.equal(changes, 0, 'a refused request changed nothing');
   answers.orgHandoverApplyRequest = {
-    ok: true, handover_id: 'h-3', error: null, applied: 1, scheduled: 0, failed: 0,
-    items: [{ key: 'task:p-1:t-1', category: 'task', title: 't', status: 'done', reason: null, taker_user_id: 'u-anna' }],
+    ok: true, handoverId: 'h-3', error: null, applied: 1, scheduled: 0, failed: 0,
+    items: [{ key: 'task:p-1:t-1', category: 'task', title: 't', status: 'done', reason: null, takerUserId: 'u-anna' }],
   };
   change(rowOf('task:p-2:t-2').querySelector('tf-select'), { value: 'u-marek' });
   $('[data-role="note"]').value = 'y';

@@ -769,12 +769,20 @@ test('message preview: the busiest partition at its newest page, the newest mess
   expect(errors, errors.join('\n')).toEqual([]);
 });
 
-// One binary-protocol call from the page, as the screen itself makes it.
-function busCall(page, kind, payload) {
-  return page.evaluate(async ([k, p]) => {
+// One binary-protocol call from the page, as the screen itself makes it. The
+// answer is `BusEnvelope { instanceId, payload: BusPayload }` with the payload
+// externally tagged, so the reply's fields sit under its variant name and a
+// field-less reply is the bare variant string.
+async function busCall(page, kind, payload) {
+  const body = await page.evaluate(async ([k, p]) => {
     const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
     return k.endsWith('ListRequest') ? ApiBinary.one(k, p) : ApiBinary.action(k, p);
   }, [kind, payload]);
+  const variant = kind.slice('bus'.length).replace(/Request$/, 'Response');
+  if (body.payload === variant) return {};
+  const reply = body.payload?.[variant];
+  if (reply === undefined) throw new Error(`unexpected bus reply to ${kind}: ${JSON.stringify(body).slice(0, 200)}`);
+  return reply;
 }
 
 test('delete with the retyped name: what goes, what stays, the list without it', async ({ page }) => {
@@ -1273,16 +1281,16 @@ test('U2 without administration: no change buttons, who can change, reading stil
       const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
       return ApiBinary.action('iamCreateUserRequest', { username: 'tomasz', password: 'Tomasz-czyta-1', displayName: 'Tomasz Nowak', email: '', role: 'user', groupIds: [] });
     });
-    reader = { userId: created?.userId ?? created?.user_id };
+    reader = { id: created?.userId };
   }
-  const readerId = reader.userId ?? reader.user_id ?? reader.id;
+  const readerId = reader.id;
   expect(readerId).toBeTruthy();
   await page.evaluate(async ([addonId, subjectId]) => {
     const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
     await ApiBinary.action('addonPermissionSetRequest', { addonId, subjectType: 'user', subjectId, permissionId: 'bus.read', grantMode: 'allow' });
   }, [instanceId, readerId]);
   const admin = list.find((u) => u.username === 'admin');
-  const adminId = admin?.userId ?? admin?.user_id ?? admin?.id ?? 'admin';
+  const adminId = admin?.id ?? 'admin';
   await busCall(page, 'busAclSetRequest', { instanceId, topic: 'wyniki-badan', subjectType: 'user', subjectId: adminId, accessLevel: 'allow', action: 'admin' });
   await busCall(page, 'busAclSetRequest', { instanceId, topic: 'faktury', subjectType: 'user', subjectId: readerId, accessLevel: 'deny', action: 'read' });
 
@@ -1662,7 +1670,7 @@ test('U3 without rights: no pause or move, who can; a consumer of a topic the re
   });
   const reader = (users?.users || []).find((u) => u.username === 'tomasz');
   expect(reader, 'the reader created by the U2 test').toBeTruthy();
-  const readerId = reader.userId ?? reader.user_id ?? reader.id;
+  const readerId = reader.id;
   await busCall(page, 'busAclSetRequest', { instanceId, topic: 'faktury', subjectType: 'user', subjectId: readerId, accessLevel: 'deny', action: 'read' });
 
   const context = await browser.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: DESKTOP });
@@ -2477,9 +2485,9 @@ function iamCall(page, kind, payload) {
 async function ensureUser(page, username, password, displayName) {
   const users = (await iamCall(page, 'iamListUsersRequest', {}))?.users || [];
   const found = users.find((u) => u.username === username);
-  if (found) return found.userId ?? found.user_id ?? found.id;
+  if (found) return found.id;
   const created = await iamCall(page, 'iamCreateUserRequest', { username, password, displayName, email: '', role: 'user', groupIds: [] });
-  return created?.userId ?? created?.user_id;
+  return created?.userId;
 }
 
 async function serverEntries(page, instanceId, topic = 'wyniki-badan') {

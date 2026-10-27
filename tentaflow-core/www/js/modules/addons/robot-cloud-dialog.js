@@ -32,9 +32,9 @@ export function robotCloudVendorName(provider) {
 export function robotCloudFieldValues(device) {
   const out = {};
   if (device.serial) out.serial = device.serial;
-  const key = device.aesKey ?? device.aes_key ?? '';
+  const key = device.aesKey ?? '';
   if (key) out.aes_key = key;
-  const ip = device.lanIp ?? device.lan_ip ?? '';
+  const ip = device.lanIp ?? '';
   if (ip) out.ip = ip;
   return out;
 }
@@ -81,8 +81,8 @@ export function openRobotCloudDialog({ provider, onPick }) {
   const renderDevices = () => {
     const radios = devices.map((d, i) => {
       const name = d.alias || d.model || d.serial;
-      const key = d.aesKey ?? d.aes_key ?? '';
-      const ip = d.lanIp ?? d.lan_ip ?? '';
+      const key = d.aesKey ?? '';
+      const ip = d.lanIp ?? '';
       const hint = [
         `${t('serial')}: ${d.serial}`,
         key ? t('key_present') : t('key_absent'),
@@ -94,7 +94,7 @@ export function openRobotCloudDialog({ provider, onPick }) {
       <div style="display:flex;flex-direction:column;gap:12px;font-size:13px;">
         <div style="color:var(--text-2);">${escapeHtml(t('pick', { count: devices.length }))}</div>
         <tf-radio-group id="rc-device" name="rc-device" value="0">${radios}</tf-radio-group>
-        ${devices.some((d) => !(d.lanIp ?? d.lan_ip)) ? `<div style="color:var(--text-3);font-size:12px;">${escapeHtml(t('ip_hint'))}</div>` : ''}
+        ${devices.some((d) => !(d.lanIp)) ? `<div style="color:var(--text-3);font-size:12px;">${escapeHtml(t('ip_hint'))}</div>` : ''}
       </div>`;
     foot.innerHTML = `
       <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>

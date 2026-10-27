@@ -34,6 +34,7 @@ const os = require('os');
 const path = require('path');
 const { startBinary, stopBinary, waitForServer, binaryExists } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
+const { api } = require('./helpers/code-studio');
 
 const PORT = 18311;
 const WORK_DIR = path.join(os.tmpdir(), `tentaflow-e2e-tentaquant-${PORT}`);
@@ -68,9 +69,16 @@ test.afterAll(async () => {
 // ---------------------------------------------------------------------------
 
 // Collects console errors + uncaught exceptions; a test fails on any of them.
+// The self-signed test certificate makes the service-worker script fetch log an
+// SSL error that ignoreHTTPSErrors does not cover; it says nothing about the app.
+const SERVICE_WORKER_TLS_NOISE = /An SSL certificate error occurred when fetching the script/;
+
 function trackErrors(page) {
   const errors = [];
-  page.on('console', (m) => { if (m.type() === 'error') errors.push(`[console] ${m.text().slice(0, 400)}`); });
+  page.on('console', (m) => {
+    if (m.type() !== 'error' || SERVICE_WORKER_TLS_NOISE.test(m.text())) return;
+    errors.push(`[console] ${m.text().slice(0, 400)}`);
+  });
   page.on('pageerror', (e) => errors.push(`[pageerror] ${e.message.slice(0, 400)}`));
   return errors;
 }
@@ -103,8 +111,37 @@ async function expectNoHorizontalOverflow(page) {
       return m ? m.scrollWidth - m.clientWidth : 0;
     })(),
   }));
-  expect(overflow.doc, 'document does not scroll sideways').toBeLessThanOrEqual(1);
-  expect(overflow.main, '#main does not scroll sideways').toBeLessThanOrEqual(1);
+  // Name the boxes that stick out, so a failure points at the element and not
+  // only at a number. Anything inside a box that scrolls on its own is skipped.
+  const culprits = overflow.doc > 1 || overflow.main > 1
+    ? await page.evaluate(() => {
+      const width = document.documentElement.clientWidth;
+      const clipped = (el) => {
+        for (let n = el.assignedSlot || el.parentNode || el.host; n; n = n.assignedSlot || n.parentNode || n.host) {
+          if (!(n instanceof Element)) continue;
+          if (n.id === 'main') return false;
+          const style = getComputedStyle(n);
+          if (style.overflowX !== 'visible' && n.getBoundingClientRect().right <= width + 1) return true;
+        }
+        return false;
+      };
+      const out = [];
+      const walk = (root) => {
+        for (const el of root.querySelectorAll('*')) {
+          const r = el.getBoundingClientRect();
+          if (r.width > 0 && r.right > width + 1 && getComputedStyle(el).visibility === 'visible' && !clipped(el)) {
+            out.push(`<${el.localName}${el.id ? `#${el.id}` : ''} class="${String(el.getAttribute('class') || '').slice(0, 40)}"> right=${Math.round(r.right)}`);
+          }
+          if (el.shadowRoot) walk(el.shadowRoot);
+        }
+      };
+      walk(document);
+      return out.slice(0, 12);
+    })
+    : [];
+  const where = culprits.length ? ` (wider than the viewport: ${culprits.join('; ')})` : '';
+  expect(overflow.doc, `document does not scroll sideways${where}`).toBeLessThanOrEqual(1);
+  expect(overflow.main, `#main does not scroll sideways${where}`).toBeLessThanOrEqual(1);
 }
 
 // Opens the one project of the laboratory from the Projekty tab.
@@ -127,7 +164,22 @@ async function installLaboratory(page, name) {
   await expect(win).toBeVisible();
   await win.locator('#inst-name input').fill(name);
   await win.locator('[data-action="confirm"]').click();
-  await expect(win).toHaveCount(0, { timeout: 60000 });
+  // The package declares install steps (the Bell test), so the install is
+  // followed by the steps window; the laboratory exists already, finishing the
+  // window only dismisses the checklist.
+  const steps = page.locator('tf-window').filter({ has: page.locator('[data-role="finish"]') });
+  await steps.locator('[data-role="finish"]').click({ timeout: 60000 });
+  await expect(page.locator('tf-window')).toHaveCount(0, { timeout: 60000 });
+
+  // A native app instance is installed switched off; the route only opens the
+  // laboratory once an administrator enables it on its Addons card.
+  await page.locator('.addons-view-switch [data-view="installed"]').click();
+  const lab = page.locator('[data-addon-card]').filter({ hasText: name });
+  await lab.locator('tf-toggle[data-role="enabled"]').click();
+  await expect.poll(async () => {
+    const body = await api(page, 'addonsListRequest');
+    return (body?.addons ?? []).find((a) => a.displayName === name)?.isEnabled ?? false;
+  }, { timeout: 30000, message: 'the laboratory was never enabled' }).toBe(true);
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +187,9 @@ async function installLaboratory(page, name) {
 // ---------------------------------------------------------------------------
 
 test.describe.serial('TentaQuant', () => {
+  // The assertions below read the Polish catalog; the UI follows the browser language.
+  test.use({ locale: 'pl-PL' });
+
   test('Q01 shows the empty laboratory list with the install tile and the membership hint', async ({ page }) => {
     const errors = trackErrors(page);
     await open(page);
@@ -218,7 +273,7 @@ test.describe.serial('TentaQuant', () => {
 
     await page.locator('.tf-detail-header [data-act="new-project"]').click();
     const win = page.locator('tf-window.tq-modal');
-    await expect(win).toBeVisible();
+    await expect(win.locator('.tf-window')).toBeVisible();
     // Only "pusty" is offered: examples and templates do not exist yet.
     await expect(win.locator('tf-choice-group').first().locator('tf-choice-card')).toHaveCount(1);
     // Private is the default.
@@ -262,8 +317,10 @@ test.describe.serial('TentaQuant', () => {
     await page.locator('#tq-tabs tf-tab#projects').click();
     await page.locator('.q-card[data-project] [data-share]').click();
 
+    // The host is an inline element with an empty box (the dialog is a fixed
+    // layer inside it), so visibility is asserted on the content it shows.
     const win = page.locator('tf-window.tq-share');
-    await expect(win).toBeVisible();
+    await expect(win.locator('.tq-share-table')).toBeVisible();
     // The owner row is first and cannot be removed.
     const rows = win.locator('.tq-share-table tbody tr');
     await expect(rows).toHaveCount(1);
@@ -294,11 +351,14 @@ test.describe.serial('TentaQuant', () => {
     await gotoTentaQuant(page);
     await page.locator('#tq-tabs tf-tab#projects').click();
     await page.locator('.q-card[data-project] [data-share]').click();
-    await expect(page.locator('tf-window.tq-share')).toBeVisible();
+    await expect(page.locator('tf-window.tq-share .tf-window')).toBeVisible();
     await expectNoHorizontalOverflow(page);
     // On a phone the window is a bottom sheet: it sits on the bottom edge and
     // spans the full width instead of floating in the middle.
-    const box = await page.locator('tf-window.tq-share .tf-window').boundingBox();
+    // The sheet slides up by 24px while it opens; measure the settled box.
+    const sheet = page.locator('tf-window.tq-share .tf-window');
+    await expect(sheet).not.toHaveClass(/tf-window-opening/);
+    const box = await sheet.boundingBox();
     expect(Math.round(box.x)).toBe(0);
     expect(Math.round(box.width)).toBe(390);
     expect(Math.round(box.y + box.height)).toBe(820);
@@ -313,7 +373,7 @@ test.describe.serial('TentaQuant', () => {
     await page.locator('[data-project-menu] tf-menu-item[action="share"]').click();
     // The menu sits inside the card, so its click must stop there: the share
     // window opens and the screen stays on the project list.
-    await expect(page.locator('tf-window.tq-share')).toBeVisible();
+    await expect(page.locator('tf-window.tq-share .tf-window')).toBeVisible();
     await expect(page).not.toHaveURL(/project=/);
     await expect(page.locator('.q-card[data-project]')).toHaveCount(1);
 
@@ -355,7 +415,7 @@ test.describe.serial('TentaQuant', () => {
     await expect(page.locator('tf-empty-state')).toBeVisible();
     await page.locator('[data-act="create"]').click();
     const win = page.locator('tf-window.tq-modal');
-    await expect(win).toBeVisible();
+    await expect(win.locator('.tf-window')).toBeVisible();
     await win.locator('#tq-name-input input').fill(NOTEBOOK_NAME);
     await win.locator('[data-action="confirm"]').click();
     await expect(win).toHaveCount(0, { timeout: 30000 });
@@ -402,7 +462,7 @@ test.describe.serial('TentaQuant', () => {
     // Cancelling keeps the column exactly as it was.
     await page.locator('#tq-project-tabs tf-tab#studio').click();
     const leave = page.locator('tf-window.tq-modal');
-    await expect(leave).toBeVisible();
+    await expect(leave.locator('.tf-window')).toBeVisible();
     await leave.locator('[data-action="cancel"]').click();
     await expect(leave).toHaveCount(0);
     await expect(page.locator('.nb-layout .cells .cell')).toHaveCount(3);
@@ -429,13 +489,25 @@ test.describe.serial('TentaQuant', () => {
 
     const circuitCell = page.locator('.cells .cell').last();
     await expect(circuitCell.locator('tf-quantum-circuit')).toBeVisible();
-    // The state panel follows the last circuit cell without any run.
-    await expect(page.locator('#tq-nb-bloch tf-bloch-sphere')).toHaveCount(2, { timeout: 30000 });
+    // The panel follows the last circuit cell without any run. The starting
+    // program ends in a measurement, so there is no single state vector to draw
+    // and the panel says so instead of showing a stale or invented one.
+    await expect(page.locator('#tq-nb-panel-hint')).toContainText('pomiar', { timeout: 30000 });
+    await expect(page.locator('#tq-nb-bloch tf-bloch-sphere')).toHaveCount(0);
 
     await circuitCell.locator('[data-act="run"]').click();
     // T0: counts come from this browser, drawn by tf-mime-output.
     await expect(circuitCell.locator('[data-out] tf-bar-chart')).toBeVisible({ timeout: 30000 });
     await expect(circuitCell.locator('[data-out] .oh')).toContainText('T0');
+
+    // Without the measurement the same program has one state, and the panel
+    // follows the edit: a sphere per qubit.
+    await circuitCell.locator('[data-editor]').evaluate((editor) => {
+      const source = 'OPENQASM 3.0;\ninclude "stdgates.inc";\n\nqubit[2] q;\n\nh q[0];\ncx q[0], q[1];\n';
+      editor.value = source;
+      editor.dispatchEvent(new CustomEvent('change', { bubbles: true, detail: { value: source, dirty: true } }));
+    });
+    await expect(page.locator('#tq-nb-bloch tf-bloch-sphere')).toHaveCount(2, { timeout: 30000 });
 
     expect(errors, errors.join('\n')).toEqual([]);
   });
@@ -452,9 +524,12 @@ test.describe.serial('TentaQuant', () => {
     await expect(page.locator('#tq-studio-bloch tf-bloch-sphere')).toHaveCount(2, { timeout: 30000 });
     // H + CX + measure is a Clifford circuit and the badge says so.
     await expect(page.locator('#tq-studio-clifford tf-chip')).toBeVisible();
-    // Only the tier that exists is offered — no disabled QPU promises.
-    await expect(page.locator('#tq-studio-target option')).toHaveCount(1);
-    await expect(page.locator('#tq-studio-target')).toContainText('T0');
+    // Only the tiers that exist are offered: the `auto` rule, this browser and
+    // Core on this node — no disabled QPU promises.
+    await expect(page.locator('#tq-studio-target option')).toHaveCount(3, { timeout: 30000 });
+    await expect(page.locator('#tq-studio-target option[value="auto"]')).toHaveCount(1);
+    await expect(page.locator('#tq-studio-target option[value="browser"]')).toContainText('T0');
+    await expect(page.locator('#tq-studio-target option[value^="core:"]')).toContainText('T1');
     // The three textual/graphical exports of §6.1 sit together in the toolbar.
     await expect(page.locator('[data-act="export-qasm"]')).toBeVisible();
     await expect(page.locator('[data-act="export-qiskit"]')).toBeVisible();
@@ -538,11 +613,15 @@ test.describe.serial('TentaQuant', () => {
 
     await page.locator('[data-act="save-qasm"]').click();
     await page.locator('#tq-project-tabs tf-tab#files').click();
+    // The notebook saved by the Q06 scenarios is a project file as well, so the
+    // table holds it next to the circuit this scenario just saved.
     const rows = page.locator('#tq-file-table tbody tr');
-    await expect(rows).toHaveCount(1, { timeout: 30000 });
-    await expect(rows.first()).toContainText('.qasm');
-    await expect(rows.first()).toContainText('OpenQASM 3');
-    await expect(page.locator('.tq-table-footer')).toContainText('1 plik');
+    await expect(rows).toHaveCount(2, { timeout: 30000 });
+    const qasm = rows.filter({ hasText: '.qasm' });
+    await expect(qasm).toHaveCount(1);
+    await expect(qasm).toContainText('OpenQASM 3');
+    await expect(rows.filter({ hasText: '.ipynb' })).toContainText('notatnik');
+    await expect(page.locator('.tq-table-footer')).toContainText('2 pliki');
 
     expect(errors, errors.join('\n')).toEqual([]);
   });
@@ -892,19 +971,28 @@ test.describe.serial('TentaQuant', () => {
     await gotoTentaQuant(page);
     await page.locator('#tq-tabs tf-tab#settings').click();
 
+    // Saving disables the button at once and redraws the whole tab from the
+    // stored settings when the round trip ends; a field typed before that
+    // redraw is wiped. The marker on the old node tells the redraw happened.
+    const saveRanking = async () => {
+      await page.locator('#tq-set-ranking-toggle').evaluate((el) => { el.dataset.redrawn = 'no'; });
+      await page.locator('[data-act="save-ranking"]').click();
+      await expect(page.locator('#tq-set-ranking-toggle:not([data-redrawn])')).toHaveCount(1, { timeout: 30000 });
+    };
+
     await expect(page.locator('#tq-set-ranking-toggle')).toHaveAttribute('checked', '', { timeout: 30000 });
     await expect(page.locator('#tq-set-limits tf-input')).toHaveCount(3);
     await expect(page.locator('#tq-set-access .set-people tbody tr')).not.toHaveCount(0);
 
     await page.locator('#tq-set-ranking-toggle').click();
-    await page.locator('[data-act="save-ranking"]').click();
+    await saveRanking();
     await expect(page.locator('#tq-set-ranking-toggle')).not.toHaveAttribute('checked', '', { timeout: 30000 });
     await page.locator('#tq-tabs tf-tab#course').click();
     await expect(page.locator('.leader-row')).toHaveCount(0, { timeout: 30000 });
 
     await page.locator('#tq-tabs tf-tab#settings').click();
     await page.locator('#tq-set-ranking-toggle').click();
-    await page.locator('[data-act="save-ranking"]').click();
+    await saveRanking();
     await expect(page.locator('#tq-set-ranking-toggle')).toHaveAttribute('checked', '', { timeout: 30000 });
 
     await page.locator('#tq-set-maxConcurrentCoreRuns input').fill('3');
@@ -929,7 +1017,7 @@ test.describe.serial('TentaQuant', () => {
     await expect(page.locator('.tq-table-footer')).toContainText('2 laboratoria');
 
     // The list view renders the same rows through tf-table.
-    await page.locator('#tq-lab-view option[value="list"]').click();
+    await page.locator('#tq-lab-view [data-value="list"]').click();
     await expect(page.locator('#tq-lab-table tbody tr')).toHaveCount(2);
   });
 });

@@ -215,6 +215,12 @@ async function bootstrap() {
   }
   SystemEvents.init();
 
+  // A token that can no longer open a socket (expired while the node was
+  // unreachable) leaves nothing to retry with: back to the login screen.
+  ApiBinary.onLifecycle((ev) => {
+    if (ev.type === 'auth-rejected') renderLogin();
+  });
+
   if (!ApiBinary.hasJwt()) {
     renderLogin();
     return;
@@ -464,11 +470,11 @@ async function renderApp() {
 
     // Stabilny porzadek na dole sekcji Apps: sort_order ASC, potem title ASC.
     const sorted = apps.slice().sort((a, b) => {
-      const sa = Number(a.sortOrder ?? a.sort_order ?? 0);
-      const sb = Number(b.sortOrder ?? b.sort_order ?? 0);
+      const sa = Number(a.sortOrder ?? 0);
+      const sb = Number(b.sortOrder ?? 0);
       if (sa !== sb) return sa - sb;
-      const ta = String(a.title ?? a.addonId ?? a.addon_id ?? '').toLowerCase();
-      const tb = String(b.title ?? b.addonId ?? b.addon_id ?? '').toLowerCase();
+      const ta = String(a.title ?? a.addonId ?? '').toLowerCase();
+      const tb = String(b.title ?? b.addonId ?? '').toLowerCase();
       return ta.localeCompare(tb);
     });
 
@@ -485,9 +491,9 @@ async function renderApp() {
     if (!appsSection) return;
 
     for (const app of sorted) {
-      const addonId = String(app.addonId ?? app.addon_id ?? '');
+      const addonId = String(app.addonId ?? '');
       const kind = app.kind === 'native' ? 'native' : 'wasm';
-      const target = String(app.target ?? app.entryPanel ?? app.entry_panel ?? '');
+      const target = String(app.target ?? '');
       const title = String(
         (app.titleKey && I18n.t(app.titleKey)) || app.title || addonId,
       );
@@ -725,7 +731,7 @@ async function refreshNavCounts() {
   // would need one `busStatsSnapshotRequest` per installed instance and is
   // deliberately not built (no single "the bus" left to badge).
   const [svc, mesh, clusters, addons, users] = await Promise.all([
-    ApiBinary.list('serviceListRequest').catch(() => null),
+    ApiBinary.list('serviceListRequest', { arrayKey: 'services' }).catch(() => null),
     ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => null),
     ApiBinary.list('clusterListRequest', { arrayKey: 'clusters' }).catch(() => null),
     ApiBinary.list('addonsListRequest', { arrayKey: 'addons' }).catch(() => null),

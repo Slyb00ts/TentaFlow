@@ -180,7 +180,7 @@ export function attachAgentActivity(widget, sessionId, opts = {}) {
     { scopeKind: 'session', scopeId: sessionId },
     {
       onChunk: (body) => {
-        if (!body || body.variant !== 'AgentRunEvent') return;
+        if (!body || body._variant !== 'AgentsBody.RunEvent') return;
         widget.applyEvent(body);
         if (typeof opts.onStatus === 'function') {
           const status = activityStatusText(body);
@@ -188,8 +188,8 @@ export function attachAgentActivity(widget, sessionId, opts = {}) {
         }
         // A successfully finished background child → a subtle toast (§3.9).
         // Only `completed` claims completion; a failed/cancelled child must not.
-        if (body.kind === 'child_finished' && (body.run_id || body.runId)) {
-          const runId = body.run_id || body.runId;
+        if (body.kind === 'child_finished' && body.runId) {
+          const runId = body.runId;
           if (body.status === 'completed' && !toastedRuns.has(runId)) {
             toastedRuns.add(runId);
             const name = body.agent || runId.slice(0, 8);

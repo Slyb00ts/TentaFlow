@@ -14891,6 +14891,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tentaflow-codec-core"
+version = "0.1.0"
+dependencies = [
+ "ciborium",
+ "serde_json",
+ "syn 2.0.118",
+ "tentaflow-protocol",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "tentaflow-coding-agent-bridge"
 version = "0.1.0"
 dependencies = [
@@ -15183,6 +15194,7 @@ dependencies = [
 name = "tentaflow-protocol-wasm"
 version = "0.1.0"
 dependencies = [
+ "ciborium",
  "console_error_panic_hook",
  "ed25519-dalek 2.2.0",
  "getrandom 0.4.3",
@@ -15192,6 +15204,7 @@ dependencies = [
  "minicbor",
  "serde_json",
  "sha2 0.11.0",
+ "tentaflow-codec-core",
  "tentaflow-protocol",
  "tentaflow-sdk-spec",
  "wasm-bindgen",

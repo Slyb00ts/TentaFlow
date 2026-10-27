@@ -193,23 +193,9 @@ impl Router {
         }
     }
 
-    /// Mesh sync handler — replaces the in-memory alias cache after the
-    /// supervisor pushes a fresh `model_aliases` snapshot. Each entry is
-    /// pre-parsed via `CachedAlias::from_db` so the hot dispatch path
-    /// avoids serde-on-every-route.
-    pub fn update_alias_cache_from_sync(&self, aliases: Vec<crate::db::models::DbModelAlias>) {
-        let mut cache = self.alias_cache.write();
-        cache.clear();
-        for alias in aliases {
-            if alias.is_active {
-                cache.insert(alias.alias.clone(), CachedAlias::from_db(&alias));
-            }
-        }
-        tracing::debug!("Alias cache zaktualizowany z sync: {} wpisow", cache.len());
-    }
-
-    /// Laduje alias cache z bazy danych. Patrz `update_alias_cache_from_sync`
-    /// na temat pre-parsowania.
+    /// Laduje alias cache z bazy danych. Kazdy wpis jest pre-parsowany przez
+    /// `CachedAlias::from_db`, zeby goracy dispatch nie robil serde na kazdym
+    /// routingu.
     pub(crate) fn reload_alias_cache(&self) {
         let db = match &self.db {
             Some(db) => db,

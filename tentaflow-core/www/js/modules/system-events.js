@@ -36,18 +36,18 @@ export function init() {
   ApiBinary.client()
     .then((client) => {
       client.addUnsolicitedListener(({ body }) => {
-        if (!body || !body.variant) return;
-        if (body.variant === 'ServiceStatusChanged') handleServiceStatus(body);
-        else if (body.variant === 'MeshPeerStatusChanged') handleMeshPeerStatus(body);
+        if (!body || !body._variant) return;
+        if (body._variant === 'SystemEventBody.ServiceStatusChanged') handleServiceStatus(body);
+        else if (body._variant === 'SystemEventBody.MeshPeerStatusChanged') handleMeshPeerStatus(body);
       });
     })
     .catch((e) => console.warn('[system-events] client not ready:', e?.message));
 }
 
 function handleServiceStatus(ev) {
-  const name = ev.serviceName || ev.service_name || '?';
+  const name = ev.serviceName || '?';
   const status = String(ev.status || '').toLowerCase();
-  const type = ev.serviceType || ev.service_type || '';
+  const type = ev.serviceType || '';
 
   if (status === 'connected' && shouldToast('svc', name, status)) {
     toast(I18n.t('system_events.service_connected', { name, type }), 'success');
@@ -59,9 +59,9 @@ function handleServiceStatus(ev) {
 }
 
 function handleMeshPeerStatus(ev) {
-  const host = ev.hostname || (ev.nodeId || ev.node_id || '').slice(0, 12) || '?';
+  const host = ev.hostname || (ev.nodeId || '').slice(0, 12) || '?';
   const status = String(ev.status || '').toLowerCase();
-  const id = ev.nodeId || ev.node_id || host;
+  const id = ev.nodeId || host;
 
   if (status === 'online' && shouldToast('peer', id, status)) {
     toast(I18n.t('system_events.peer_online', { host }), 'success');

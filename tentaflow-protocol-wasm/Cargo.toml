@@ -11,13 +11,16 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # Core protocol types
 tentaflow-protocol = { workspace = true }
+# Wire-shape rules shared with native clients; decodes bodies without typed Deserialize.
+tentaflow-codec-core = { workspace = true }
+ciborium = { workspace = true }
 
 # WASM bindings. Trio (wasm-bindgen / js-sys / web-sys) is version-locked and MUST
 # match the wasm-bindgen-cli that build.rs runs — keep `setup.sh` WASM_BINDGEN_VERSION
 # in lockstep, else glue generation fails ("schema version mismatch" in the dashboard).
 wasm-bindgen = { workspace = true }
 js-sys = { workspace = true }
-web-sys = { workspace = true, features = ["Storage", "Window", "WebTransport", "WebTransportBidirectionalStream", "WebTransportReceiveStream", "WebTransportSendStream", "WritableStream", "WritableStreamDefaultWriter", "ReadableStream", "ReadableStreamDefaultReader"] }
+web-sys = { workspace = true, features = ["Storage", "Window"] }
 
 # SDK spec types for UI channel CBOR encode/decode
 tentaflow-sdk-spec = { workspace = true }

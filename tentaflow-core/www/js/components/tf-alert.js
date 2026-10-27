@@ -2,6 +2,9 @@
 // File: tf-alert.js
 // Opis: Inline notification component with tone variants (info, success,
 //       warning, danger), optional title, message, and dismiss button.
+//       `icon="<sprite-id>"` replaces the tone glyph with a sprite symbol,
+//       `inline-actions` puts the slotted actions beside the text (they wrap
+//       below it when the row is narrow).
 // =============================================================================
 
 const TONE_ICONS = {
@@ -15,7 +18,7 @@ const VALID_TONES = new Set(['info', 'success', 'warning', 'danger']);
 
 class TfAlert extends HTMLElement {
   static get observedAttributes() {
-    return ['tone', 'title', 'message', 'dismissable', 'live'];
+    return ['tone', 'title', 'message', 'dismissable', 'icon', 'inline-actions', 'live'];
   }
 
   constructor() {
@@ -95,6 +98,7 @@ class TfAlert extends HTMLElement {
     // `live` makes the alert a live region: a message that appears or changes after the page is read out, which a plain banner does not do.
     if (this.hasAttribute('live')) this._root.setAttribute('role', 'alert');
     else this._root.removeAttribute('role');
+    this._root.classList.toggle('inline-actions', this.hasAttribute('inline-actions'));
     this._root.textContent = '';
 
     // Icon path comes from the trusted TONE_ICONS map keyed by a validated
@@ -112,27 +116,42 @@ class TfAlert extends HTMLElement {
     icon.setAttribute('stroke-linecap', 'round');
     icon.setAttribute('stroke-linejoin', 'round');
     icon.setAttribute('aria-hidden', 'true');
-    const iconPathEl = document.createElementNS(svgNs, 'path');
-    iconPathEl.setAttribute('d', TONE_ICONS[tone]);
-    icon.appendChild(iconPathEl);
+    const spriteId = (this.getAttribute('icon') || '').replace(/[^a-z0-9_-]/gi, '');
+    if (spriteId) {
+      const use = document.createElementNS(svgNs, 'use');
+      use.setAttribute('href', `#i-${spriteId}`);
+      icon.appendChild(use);
+    } else {
+      const iconPathEl = document.createElementNS(svgNs, 'path');
+      iconPathEl.setAttribute('d', TONE_ICONS[tone]);
+      icon.appendChild(iconPathEl);
+    }
     this._root.appendChild(icon);
 
     // Title and message are attacker-reachable (foreign-node manifests, addon
     // state). Assign as textContent so any HTML in them is rendered inert.
     const content = document.createElement('div');
     content.className = 'tf-alert-content';
+    // With `inline-actions` the text is one flex item, so the actions sit beside
+    // it as a block instead of between the title and the message.
+    let text = content;
+    if (this.hasAttribute('inline-actions')) {
+      text = document.createElement('div');
+      text.className = 'tf-alert-text';
+      content.appendChild(text);
+    }
     if (title) {
       const titleEl = document.createElement('div');
       titleEl.className = 'tf-alert-title';
       titleEl.textContent = title;
-      content.appendChild(titleEl);
+      text.appendChild(titleEl);
     }
     if (message || this._messageEl) {
       const msgEl = document.createElement('div');
       msgEl.className = 'tf-alert-message';
       if (message) msgEl.textContent = message;
       else msgEl.appendChild(this._messageEl);
-      content.appendChild(msgEl);
+      text.appendChild(msgEl);
     }
     if (this._actionsEl) content.appendChild(this._actionsEl);
     this._root.appendChild(content);

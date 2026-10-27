@@ -201,7 +201,7 @@ test('mount koduje AuthMe jako unit przez rzeczywisty codec i WASM', {
   try {
     const root = await mountScreen({ node: LOCAL });
     assert.equal(encodingError, null);
-    assert.deepEqual(decoded, { correlationId: 71n, sequence: 9n, body: { variant: 'AuthMeRequest' } });
+    assert.deepEqual(decoded, { correlationId: 71n, sequence: 9n, body: { _variant: 'AuthMeRequest' } });
     assert.equal(Screen.isAdmin, true);
     assert.ok(root.querySelector('#nas-tabs'));
   } finally { Screen.unmount(); ApiBinary.one = transport; }

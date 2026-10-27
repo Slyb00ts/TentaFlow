@@ -97,7 +97,7 @@ function paintCards(node, wzOverrides = {}, onApi = null) {
   };
   api.elements['cs-wz-modes'] = group;
   api.state.nodes = [node];
-  api.wz.nodeId = String(node.nodeId ?? node.node_id);
+  api.wz.nodeId = String(node.nodeId);
   Object.assign(api.wz, wzOverrides);
   api.renderModes();
   onApi?.(api);
@@ -143,10 +143,10 @@ test('processSandboxNote: a remote node that reported NO cause is told its OWNER
 test('processSandboxNote: a remote refusal uses ITS cause, not "ask the owner"', () => {
   const api = build(['processSandboxNote']);
   assert.equal(api.processSandboxNote({
-    is_local: false, supports_process_sandbox: false, process_sandbox_cause: 'gui_session_required',
+    isLocal: false, supportsProcessSandbox: false, processSandboxCause: 'gui_session_required',
   }), 'mode_process_gui_session');
   assert.equal(api.processSandboxNote({
-    is_local: false, supports_process_sandbox: false, process_sandbox_cause: 'no_sandbox_binary',
+    isLocal: false, supportsProcessSandbox: false, processSandboxCause: 'no_sandbox_binary',
   }), 'mode_process_unavailable');
 });
 
@@ -157,12 +157,6 @@ test('processSandboxNote: an unknown cause never falls back to the raw English r
   });
   assert.equal(note, 'mode_process_unavailable');
   assert.doesNotMatch(note, /launchd/);
-});
-
-test('processSandboxNote: a cause is read off snake_case payloads too', () => {
-  const api = build(['processSandboxNote']);
-  assert.equal(api.processSandboxNote({ process_sandbox_cause: 'gui_session_required', is_local: true }),
-    'mode_process_gui_session');
 });
 
 // ---------------------------------------------------------------------------
@@ -228,10 +222,10 @@ test('renderModes: a missing sandbox binary blocks the card with the generic sen
 
 test('renderModes: a remote node that reported nothing is blocked as "the owner must answer"', () => {
   const card = paint({
-    node_id: 'gpu-01',
-    is_local: false,
-    supports_process_sandbox: null,
-    process_sandbox_cause: null,
+    nodeId: 'gpu-01',
+    isLocal: false,
+    supportsProcessSandbox: null,
+    processSandboxCause: null,
   });
   assert.equal(card.disabled, true);
   assert.equal(card.note, 'mode_process_remote');
@@ -244,9 +238,9 @@ test('renderModes: a remote node that reported nothing is blocked as "the owner 
 // value and was therefore read as a refusal.
 test('renderModes: a remote node that advertises support is selectable', () => {
   const card = paint({
-    node_id: 'gpu-01',
-    is_local: false,
-    supports_process_sandbox: true,
+    nodeId: 'gpu-01',
+    isLocal: false,
+    supportsProcessSandbox: true,
   });
   assert.equal(card.disabled, false);
   assert.equal(card.note, '');
@@ -257,19 +251,19 @@ test('renderModes: a remote node that advertises support is selectable', () => {
 // session" and "this machine will never do it" must not read alike.
 test('renderModes: a remote refusal is shown by ITS cause, and two causes differ', () => {
   const gui = paint({
-    node_id: 'gpu-01',
-    is_local: false,
-    supports_process_sandbox: false,
-    process_sandbox_cause: 'gui_session_required',
+    nodeId: 'gpu-01',
+    isLocal: false,
+    supportsProcessSandbox: false,
+    processSandboxCause: 'gui_session_required',
   });
   assert.equal(gui.disabled, true);
   assert.equal(gui.note, 'mode_process_gui_session');
 
   const binary = paint({
-    node_id: 'gpu-01',
-    is_local: false,
-    supports_process_sandbox: false,
-    process_sandbox_cause: 'no_sandbox_binary',
+    nodeId: 'gpu-01',
+    isLocal: false,
+    supportsProcessSandbox: false,
+    processSandboxCause: 'no_sandbox_binary',
   });
   assert.equal(binary.disabled, true);
   assert.equal(binary.note, 'mode_process_unavailable');
@@ -314,19 +308,19 @@ test('containerNote: only a node that reported NO runtime is told to install one
 });
 
 test('renderModes: a peer advertising a container runtime is offered the mode', () => {
-  const { container } = paintCards({ node_id: 'gpu-01', is_local: false, supports_container: true });
+  const { container } = paintCards({ nodeId: 'gpu-01', isLocal: false, supportsContainer: true });
   assert.equal(container.disabled, false);
   assert.equal(container.note, '');
 });
 
 test('renderModes: a peer advertising NO runtime is refused in the node-owner words', () => {
-  const { container } = paintCards({ node_id: 'gpu-01', is_local: false, supports_container: false });
+  const { container } = paintCards({ nodeId: 'gpu-01', isLocal: false, supportsContainer: false });
   assert.equal(container.disabled, true);
   assert.equal(container.note, 'mode_container_unavailable');
 });
 
 test('renderModes: a peer that advertised nothing is refused as "the owner must confirm"', () => {
-  const { container } = paintCards({ node_id: 'gpu-01', is_local: false, supports_container: null });
+  const { container } = paintCards({ nodeId: 'gpu-01', isLocal: false, supportsContainer: null });
   assert.equal(container.disabled, true);
   assert.equal(container.note, 'mode_container_remote');
   assert.notEqual(container.note, 'mode_container_unavailable',
@@ -335,11 +329,11 @@ test('renderModes: a peer that advertised nothing is refused as "the owner must 
 
 test('renderModes: both isolation modes are read off the one peer row, independently', () => {
   const { container, process_sandbox: process } = paintCards({
-    node_id: 'gpu-01',
-    is_local: false,
-    supports_container: true,
-    supports_process_sandbox: false,
-    process_sandbox_cause: 'gui_session_required',
+    nodeId: 'gpu-01',
+    isLocal: false,
+    supportsContainer: true,
+    supportsProcessSandbox: false,
+    processSandboxCause: 'gui_session_required',
   });
   assert.equal(container.disabled, false, 'the container answer must not be dragged down by the sandbox one');
   assert.equal(container.note, '');

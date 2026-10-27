@@ -541,6 +541,26 @@ export function uniqueDevices(events) {
   return Array.from(seen.keys()).sort((a, b) => a - b);
 }
 
+// The report is read under the Rust field names (snake_case, like the fixture),
+// while the decoder yields camelCase struct fields. Enum variant names (leading
+// capital: `Gpu`, `SkippedUnavailable`) are data and stay as sent; wide u64
+// values arrive as BigInt and are narrowed because every consumer does float math.
+function camelToSnake(name) {
+  return /^[A-Z]/.test(name) ? name : name.replace(/[A-Z]/g, (m) => '_' + m.toLowerCase());
+}
+export function deepSnakeKeys(value) {
+  if (typeof value === 'bigint') return Number(value);
+  if (Array.isArray(value)) return value.map(deepSnakeKeys);
+  if (value && typeof value === 'object' && value.constructor === Object) {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[camelToSnake(k)] = deepSnakeKeys(v);
+    }
+    return out;
+  }
+  return value;
+}
+
 // CBOR enums in JSON look like { Variant: { ...fields } } or { Variant: null }.
 // This helper unwraps to the inner object (or null) for the categories we use.
 export function unwrapPayload(payload) {

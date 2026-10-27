@@ -5,7 +5,7 @@ const TASK_NOTIFICATION_KINDS = ['task_assigned', 'task_reassigned', 'task_unass
 
 export function taskNotificationText(notification, translate) {
   if (!TASK_NOTIFICATION_KINDS.includes(notification.kind)) return null;
-  const link = JSON.parse(notification.link_json);
+  const link = JSON.parse(notification.linkJson);
   const fields = { key: link.task_key, title: link.task_title };
   if (notification.kind === 'task_status_changed') {
     fields.from = translate(`task_status_${link.from_status}`);
@@ -20,7 +20,7 @@ const ORG_NOTIFICATION_KINDS = ['work_handed_over', 'deputy_appointed', 'deputy_
 // here so it follows the reader's language, not the language of the node that wrote it.
 export function orgNotificationText(notification, translate) {
   if (!ORG_NOTIFICATION_KINDS.includes(notification.kind)) return null;
-  const link = JSON.parse(notification.link_json);
+  const link = JSON.parse(notification.linkJson);
   const title = translate(`nk_${notification.kind}`);
   if (notification.kind === 'work_handed_over') {
     const fields = { from: link.from_name, count: link.count, note: link.note, until: link.return_on };
@@ -38,11 +38,11 @@ export function projectKeySuggestion(name) {
 }
 
 export function taskTypeLabel(type, translate) {
-  return type.built_in ? translate(`task_type_${type.type_id}`) : type.name;
+  return type.builtIn ? translate(`task_type_${type.typeId}`) : type.name;
 }
 
 export function taskTypeDescription(type, translate) {
-  return type.built_in ? translate(`task_type_${type.type_id}_desc`) : type.description;
+  return type.builtIn ? translate(`task_type_${type.typeId}_desc`) : type.description;
 }
 
 export function taskDuration(seconds, translate) {
@@ -91,7 +91,7 @@ export function taskEventValue(json, { translate, memberName, taskName, projectN
 export function taskEventReferences(event) {
   const tasks = new Set();
   const projects = new Set();
-  for (const json of [event.before_json, event.after_json]) {
+  for (const json of [event.beforeJson, event.afterJson]) {
     const value = JSON.parse(json);
     if (event.kind === 'parent_task_id' && value) tasks.add(value);
     else if (value && typeof value === 'object') {
@@ -104,7 +104,7 @@ export function taskEventReferences(event) {
 
 export function taskEventAttachments(event) {
   const attachments = [];
-  for (const json of [event.before_json, event.after_json]) {
+  for (const json of [event.beforeJson, event.afterJson]) {
     const value = JSON.parse(json);
     const raw = event.kind === 'attachments_json' ? value : value?.attachments_json;
     if (typeof raw !== 'string') continue;
@@ -114,11 +114,11 @@ export function taskEventAttachments(event) {
 }
 
 export function activeTaskTypes(types, currentId = '') {
-  return types.filter((type) => type.active || type.type_id === currentId)
-    .slice().sort((a, b) => Number(a.sort_order) - Number(b.sort_order) || a.name.localeCompare(b.name));
+  return types.filter((type) => type.active || type.typeId === currentId)
+    .slice().sort((a, b) => Number(a.sortOrder) - Number(b.sortOrder) || a.name.localeCompare(b.name));
 }
 
 export function parentCandidates(tasks, type, ownId) {
-  return tasks.filter((task) => task.task_id !== ownId && !task.archived_at
-    && (type === 'subtask' ? task.task_type !== 'subtask' : type !== 'epic' && task.task_type === 'epic'));
+  return tasks.filter((task) => task.taskId !== ownId && !task.archivedAt
+    && (type === 'subtask' ? task.taskType !== 'subtask' : type !== 'epic' && task.taskType === 'epic'));
 }

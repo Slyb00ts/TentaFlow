@@ -113,7 +113,7 @@ const AuditScreen = {
     try {
       const client = await ApiBinary.client();
       unsubscribePush = client.addUnsolicitedListener(({ body }) => {
-        if (body?.variant === 'AuditEvent' && offset === 0 && filtersAreEmpty()) {
+        if (body?._variant === 'AuditEventBody' && offset === 0 && filtersAreEmpty()) {
           prependLiveEvent(body);
         }
       });
@@ -335,7 +335,7 @@ function openEntryDetail(entry) {
   const prettyDetails = entry.details ? tryPrettyJson(entry.details) : '—';
   // Written by events/audit_outbox.rs for flow-run rows only; an entry from
   // another writer has none and the row says so rather than inventing a link.
-  const correlationId = entry.correlationId ?? entry.correlation_id ?? null;
+  const correlationId = entry.correlationId ?? null;
   const rows = [
     ['id', entry.id],
     [I18n.t('audit.timestamp'), formatTimestamp(entry.timestamp)],

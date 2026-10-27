@@ -203,7 +203,7 @@ test('BPMN typed save retains mapping and variable business keys', { skip }, () 
     commandId: '7c865aaa-febd-4621-9ae6-35977200a0fd', definitionId: null,
     expectedRevision: 0, name: 'BPMN', description: '', model,
   });
-  assert.equal(body.variant, 'ProcessDefinitionSaveRequest');
+  assert.equal(body._variant, 'ProcessBody.DefinitionSaveRequest');
   assert.deepEqual(body.model.variables, model.variables);
   assert.deepEqual(body.model.nodes[1].kind.ServiceTask.inputMapping, { special_key: 'vars.user_id' });
   assert.deepEqual(body.model.nodes[1].kind.ServiceTask.outputMapping, { result_key: 'outputs.payload' });
@@ -811,7 +811,7 @@ test('pinned timer catalog decodes authored rule and matching persisted status',
           total_firings: 3, last_reason: 'calendar horizon exceeded',
         } } } }] },
   } })));
-  assert.equal(decoded.variant, 'ProcessDefinitionGetResponse');
+  assert.equal(decoded._variant, 'ProcessBody.DefinitionGetResponse');
   assert.equal(decoded.startCatalog[0].processId, 'P_1');
   assert.equal(decoded.startCatalog[0].processName, null);
   assert.equal(decoded.startCatalog[0].trigger.TimerStart.timer.Duration.seconds, 1);
@@ -824,14 +824,14 @@ test('pinned timer catalog decodes authored rule and matching persisted status',
 
 test('paged list request and response use canonical camel keys only', { skip }, () => {
   const requestBody = request('processDefinitionListRequest', { offset: 10, limit: 25 });
-  assert.equal(requestBody.variant, 'ProcessDefinitionListRequest');
+  assert.equal(requestBody._variant, 'ProcessBody.DefinitionListRequest');
   assert.equal(requestBody.offset, 10);
   assert.equal(requestBody.limit, 25);
   const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
     DefinitionListResponse: { definitions: [{ definition_id: 'd1', name: 'Test', description: '',
       owner_user_id: 'u1', draft_revision: 1, published_version: null, archived: false }], total: 1, has_more: false },
   } })));
-  assert.equal(decoded.variant, 'ProcessDefinitionListResponse');
+  assert.equal(decoded._variant, 'ProcessBody.DefinitionListResponse');
   assert.equal(decoded.definitions[0].definitionId, 'd1');
   assert.equal(decoded.hasMore, false);
   assert.equal(Object.hasOwn(decoded, 'has_more'), false);
@@ -839,7 +839,7 @@ test('paged list request and response use canonical camel keys only', { skip }, 
 
 test('user task detail request keeps explicit instance and task identity', { skip }, () => {
   const body = request('processUserTaskGetRequest', { instanceId: 'i1', userTaskId: 't1' });
-  assert.equal(body.variant, 'ProcessUserTaskGetRequest');
+  assert.equal(body._variant, 'ProcessBody.UserTaskGetRequest');
   assert.equal(body.instanceId, 'i1');
   assert.equal(body.userTaskId, 't1');
   assert.equal(Object.hasOwn(body, 'user_task_id'), false);
@@ -901,7 +901,7 @@ test('manual task uses a distinct acknowledgment request without work outputs', 
   /requires instructions and optional assignee/);
   const ack = request('processManualTaskAcknowledgeRequest', { commandId: 'ack', instanceId: 'i1',
     userTaskId: 't1', expectedRevision: 4 });
-  assert.equal(ack.variant, 'ProcessManualTaskAcknowledgeRequest');
+  assert.equal(ack._variant, 'ProcessBody.ManualTaskAcknowledgeRequest');
   assert.equal(ack.instanceId, 'i1');
   assert.equal(ack.userTaskId, 't1');
   assert.equal(ack.expectedRevision, 4);
@@ -977,7 +977,7 @@ test('user task detail response preserves opaque output keys', { skip }, () => {
       revision: 1, can_complete: true, scope_id: 'i1',
     } },
   } })));
-  assert.equal(decoded.variant, 'ProcessUserTaskGetResponse');
+  assert.equal(decoded._variant, 'ProcessBody.UserTaskGetResponse');
   assert.equal(decoded.task.userTaskId, 't1');
   assert.equal(decoded.task.scopeId, 'i1');
   assert.deepEqual(decoded.task.outputs, { business_key: { inner_value: 3 } });
@@ -990,7 +990,7 @@ test('simulation requests encode their typed fields and keep opaque variable key
     startNodeId: 'Start_1', variables: { customer_ID: { inner_value: 7 }, empty: null },
     startMs: 1000, horizonMs: 9000, tickDurationMs: 100,
   });
-  assert.equal(start.variant, 'ProcessSimulationStartRequest');
+  assert.equal(start._variant, 'ProcessBody.SimulationStartRequest');
   assert.equal(start.definitionId, 'definition-1');
   assert.equal(start.horizonMs, 9000);
   assert.deepEqual(start.variables, { customer_ID: { inner_value: 7 }, empty: null });
@@ -998,22 +998,22 @@ test('simulation requests encode their typed fields and keep opaque variable key
   const complete = request('processSimulationUserTaskCompleteRequest', {
     simulationId: 'simulation-1', userTaskId: 'task-1', outputs: { business_key: { inner_value: 3 } },
   });
-  assert.equal(complete.variant, 'ProcessSimulationUserTaskCompleteRequest');
+  assert.equal(complete._variant, 'ProcessBody.SimulationUserTaskCompleteRequest');
   assert.deepEqual(complete.outputs, { business_key: { inner_value: 3 } });
 
   for (const [name, variant] of [
-    ['processSimulationViewRequest', 'ProcessSimulationViewRequest'],
-    ['processSimulationAdvanceRequest', 'ProcessSimulationAdvanceRequest'],
-    ['processSimulationReleaseRequest', 'ProcessSimulationReleaseRequest'],
+    ['processSimulationViewRequest', 'ProcessBody.SimulationViewRequest'],
+    ['processSimulationAdvanceRequest', 'ProcessBody.SimulationAdvanceRequest'],
+    ['processSimulationReleaseRequest', 'ProcessBody.SimulationReleaseRequest'],
   ]) {
     const body = request(name, { simulationId: 'simulation-1' });
-    assert.equal(body.variant, variant);
+    assert.equal(body._variant, variant);
     assert.equal(body.simulationId, 'simulation-1');
   }
   const acknowledge = request('processSimulationManualTaskAcknowledgeRequest', {
     simulationId: 'simulation-1', userTaskId: 'task-2',
   });
-  assert.equal(acknowledge.variant, 'ProcessSimulationManualTaskAcknowledgeRequest');
+  assert.equal(acknowledge._variant, 'ProcessBody.SimulationManualTaskAcknowledgeRequest');
   assert.equal(acknowledge.userTaskId, 'task-2');
 });
 
@@ -1034,7 +1034,7 @@ test('simulation view response decodes its private clock, trace, and witnesses',
   const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
     SimulationViewResponse: { view },
   } })));
-  assert.equal(decoded.variant, 'ProcessSimulationViewResponse');
+  assert.equal(decoded._variant, 'ProcessBody.SimulationViewResponse');
   assert.equal(decoded.view.simulationId, 'simulation-1');
   assert.equal(decoded.view.clock.tickDurationMs, 10);
   assert.equal(decoded.view.events[0].kind, 'instance_started');
@@ -1052,19 +1052,19 @@ test('process options decode the block and tool catalogues and tolerate a server
     service_tools: [{ addon_id: 'notes-1', tool_name: 'search', description: 'Searches notes', addon_name: 'Notes' }],
     service_agents: [{ agent_id: 'agent-1', name: 'Reviewer', description: 'Reviews a case', max_iterations: 8 }],
   });
-  assert.equal(full.variant, 'ProcessOptionsResponse');
+  assert.equal(full._variant, 'ProcessBody.OptionsResponse');
   assert.deepEqual(full.serviceAgents, [{ agentId: 'agent-1', name: 'Reviewer', description: 'Reviews a case', maxIterations: 8 }]);
   assert.deepEqual(full.serviceBlocks, [{ nodeType: 'llm', label: 'Language model (LLM)', description: 'Generates text', category: 'service', requiredSettings: ['model'] }]);
   const noSettings = decode({ assignees: [], service_flows: [], service_blocks: [{ node_type: 'pii_filter', label: 'Filter', description: 'd', category: 'filter' }] });
-  assert.deepEqual(noSettings.serviceBlocks[0].requiredSettings, [], 'a server that omits the list means the block needs nothing');
+  assert.equal(noSettings.serviceBlocks[0].requiredSettings, undefined, 'a server that omits the list leaves it absent');
   assert.deepEqual(full.serviceTools, [{ addonId: 'notes-1', toolName: 'search', description: 'Searches notes', addonName: 'Notes' }]);
   assert.deepEqual(full.serviceFlows, [{ flowId: 'f1', name: 'Checker', description: 'Checks a contract' }]);
   const old = decode({ assignees: [], service_flows: [] });
   assert.deepEqual(old.serviceFlows, []);
-  assert.deepEqual(old.serviceBlocks, []);
-  assert.equal(decode({ assignees: [], service_flows: [{ flow_id: 'f1', name: 'Checker' }] }).serviceFlows[0].description, '');
-  assert.deepEqual(old.serviceTools, []);
-  assert.deepEqual(old.serviceAgents, [], 'a server that omits the agents offers none');
+  assert.equal(old.serviceBlocks, undefined);
+  assert.equal(decode({ assignees: [], service_flows: [{ flow_id: 'f1', name: 'Checker' }] }).serviceFlows[0].description, undefined);
+  assert.equal(old.serviceTools, undefined);
+  assert.equal(old.serviceAgents, undefined, 'a server that omits the agents offers none');
   const olderTool = decode({ assignees: [], service_flows: [], service_tools: [{ addon_id: 'notes-1', tool_name: 'search', description: 'd' }] });
-  assert.equal(olderTool.serviceTools[0].addonName, '');
+  assert.equal(olderTool.serviceTools[0].addonName, undefined);
 });

@@ -112,7 +112,7 @@ function filteredNotes() {
   const q = searchQuery;
   return notes.filter((n) => {
     const title = (n.title ?? '').toLowerCase();
-    const preview = (n.bodyPreview ?? n.body_preview ?? '').toLowerCase();
+    const preview = (n.bodyPreview ?? '').toLowerCase();
     return title.includes(q) || preview.includes(q);
   });
 }
@@ -155,8 +155,8 @@ function noteItemHtml(n) {
   const id = Number(n.id);
   const active = id === activeNoteId ? ' active' : '';
   const title = (n.title && n.title.trim()) || I18n.t('notes.title_placeholder');
-  const preview = n.bodyPreview ?? n.body_preview ?? '';
-  const updated = Number(n.updatedAtEpoch ?? n.updated_at_epoch ?? 0);
+  const preview = n.bodyPreview ?? '';
+  const updated = Number(n.updatedAtEpoch ?? 0);
   const pinIcon = n.pinned ? sprite('star') : '';
   return `
     <div class="note-item${active}" data-note-id="${id}">
@@ -180,7 +180,7 @@ async function openNote(noteId) {
       title: detail.title ?? '',
       body: detail.body ?? '',
       pinned: !!detail.pinned,
-      updatedAtEpoch: Number(detail.updatedAtEpoch ?? detail.updated_at_epoch ?? 0),
+      updatedAtEpoch: Number(detail.updatedAtEpoch ?? 0),
     };
     renderEditor();
     renderList();
@@ -260,7 +260,7 @@ async function persistActive() {
       title: activeDetail.title,
       body: activeDetail.body,
     });
-    const updated = Number(resp?.updatedAtEpoch ?? resp?.updated_at_epoch ?? 0);
+    const updated = Number(resp?.updatedAtEpoch ?? 0);
     if (updated) activeDetail.updatedAtEpoch = updated;
     const idx = notes.findIndex((n) => Number(n.id) === noteId);
     if (idx >= 0) {
@@ -268,9 +268,7 @@ async function persistActive() {
         ...notes[idx],
         title: activeDetail.title,
         bodyPreview: activeDetail.body.slice(0, 200),
-        body_preview: activeDetail.body.slice(0, 200),
         updatedAtEpoch: activeDetail.updatedAtEpoch,
-        updated_at_epoch: activeDetail.updatedAtEpoch,
       };
       sortNotes();
       renderList();
@@ -287,8 +285,8 @@ async function persistActive() {
 function sortNotes() {
   notes.sort((a, b) => {
     if (!!b.pinned - !!a.pinned !== 0) return (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0);
-    const bu = Number(b.updatedAtEpoch ?? b.updated_at_epoch ?? 0);
-    const au = Number(a.updatedAtEpoch ?? a.updated_at_epoch ?? 0);
+    const bu = Number(b.updatedAtEpoch ?? 0);
+    const au = Number(a.updatedAtEpoch ?? 0);
     return bu - au;
   });
 }

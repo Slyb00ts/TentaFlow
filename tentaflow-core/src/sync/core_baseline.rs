@@ -127,6 +127,54 @@ pub fn load_adopt_state(db: &DbPool) -> LedgerResult<Option<BaselineAdoptState>>
     Ok(Some(state))
 }
 
+/// Finishes a joiner adopt whose tables were merged (`Imported`) but whose
+/// epoch-adopt/reseed did not complete, e.g. because the reseed failed. Needs
+/// the live sync runtime: without it `finish_post_commit` would mark the phase
+/// `Completed` after a no-op. Returns whether a resume was performed.
+pub fn resume_imported_adopt(db: &DbPool) -> LedgerResult<bool> {
+    let Some(state) = load_adopt_state(db)? else {
+        return Ok(false);
+    };
+    if state.role != BaselineRole::Joiner || state.phase != BaselinePhase::Imported {
+        return Ok(false);
+    }
+    if !crate::sync::runtime::sync_runtime_ready() {
+        return Err(SyncLedgerError::Runtime("sync runtime not ready".into()));
+    }
+    finish_post_commit(db, &state.epoch, &state.peer)?;
+    Ok(true)
+}
+
+/// Drops an adopt state that is too old to resume and returns whether it did.
+/// A transfer pull armed at first pairing and never completed (the donor
+/// rejected it) must not come back at a restart hours later: by then the node
+/// holds its own data, and a baseline import on top of it is destructive.
+pub fn drop_stale_adopt_state(db: &DbPool) -> LedgerResult<bool> {
+    let conn = db::repository::acquire_for_baseline(db)
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+    let row: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT value, updated_at FROM settings WHERE key = ?1",
+            params![BASELINE_ADOPT_STATE_KEY],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+    drop(conn);
+    let Some((json, updated_at)) = row else {
+        return Ok(false);
+    };
+    let state: BaselineAdoptState = serde_json::from_str(&json)
+        .map_err(|e| SyncLedgerError::Decode(format!("baseline adopt state decode: {e}")))?;
+    let age = adopt_state_age_secs(updated_at.as_deref());
+    if !is_stale_adopt_state(state.phase, age) {
+        return Ok(false);
+    }
+    warn!(peer = %state.peer, phase = ?state.phase, "baseline adopt: dropping stale state instead of resuming");
+    clear_adopt_state(db)?;
+    Ok(true)
+}
+
 pub fn clear_adopt_state(db: &DbPool) -> LedgerResult<()> {
     db::repository::delete_setting(db, BASELINE_ADOPT_STATE_KEY)
         .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;

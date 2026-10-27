@@ -46,7 +46,7 @@ export function runTier(run) {
 /// since left the fleet keeps its id rather than disappearing.
 export function runNodeName(run, nodes) {
   if (runTier(run) === 'T0') return T('targets.node_browser');
-  const nodeId = run && (run.nodeId ?? run.node_id);
+  const nodeId = run && run.nodeId;
   if (!nodeId) return '';
   const node = (nodes || []).find((n) => n.nodeId === nodeId);
   return node ? node.nodeName : shortId(nodeId);
@@ -57,8 +57,8 @@ export function runNodeName(run, nodes) {
 /// falls back to the kind, which is never rendered raw.
 export function runSourceLabel(run) {
   const kind = String((run && run.kind) || '');
-  const cellId = run && (run.cellId ?? run.cell_id);
-  if (run && (run.notebookId ?? run.notebook_id)) {
+  const cellId = run && run.cellId;
+  if (run && run.notebookId) {
     return cellId ? T('runs.source_cell', { cell: shortId(cellId) }) : T('runs.source_notebook');
   }
   if (kind === 'circuit') return T('runs.source_circuit');
@@ -82,11 +82,11 @@ export function runStatusLabel(run) {
 /// and not a call — a table has to render the same way in a test twice.
 export function runDurationMs(run, now = Date.now()) {
   const metrics = run && run.metrics;
-  const measured = Number(metrics && (metrics.durationMs ?? metrics.duration_ms));
+  const measured = Number(metrics && metrics.durationMs);
   if (Number.isFinite(measured) && measured > 0) return measured;
-  const started = parseServerTs(run && (run.startedAt ?? run.started_at));
+  const started = parseServerTs(run && run.startedAt);
   if (!started) return null;
-  const ended = parseServerTs(run && (run.endedAt ?? run.ended_at));
+  const ended = parseServerTs(run && run.endedAt);
   return Math.max(0, (ended ? ended.getTime() : now) - started.getTime());
 }
 
@@ -117,12 +117,12 @@ export function runTimeline(run) {
   };
   const outcome = status === 'succeeded' ? 'succeeded' : (status === 'cancelled' ? 'cancelled' : 'failed');
   return [
-    { id: 'created', at: run && (run.startedAt ?? run.started_at), state: stageState(reached.created, status === 'created') },
+    { id: 'created', at: run && run.startedAt, state: stageState(reached.created, status === 'created') },
     { id: 'queued', at: null, state: stageState(reached.queued, status === 'queued') },
     { id: 'running', at: null, state: stageState(reached.running, status === 'running') },
     {
       id: 'done',
-      at: terminal ? (run.endedAt ?? run.ended_at) : null,
+      at: terminal ? run.endedAt : null,
       state: stageState(reached.done, false),
       outcome: terminal ? outcome : '',
     },

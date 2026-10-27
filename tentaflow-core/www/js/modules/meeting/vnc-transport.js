@@ -77,8 +77,8 @@ export class VncApiBinaryTransport {
 
   _handleChunk(body, onStatus) {
     if (this._closed) return;
-    const variant = body?.variant;
-    if (variant === 'VncTunnelOpenResponse') {
+    const variant = body?._variant;
+    if (variant === 'VncTunnelBody.ResOpen') {
       const status = body.status;
       if (status === VNC_STATUS_OK) {
         this._tunnelId = body.tunnelId;
@@ -98,7 +98,7 @@ export class VncApiBinaryTransport {
       }
       return;
     }
-    if (variant === 'VncTunnelChunk') {
+    if (variant === 'VncTunnelBody.Chunk') {
       if (!this._opened) return;
       const bytes = body.bytes;
       if (!(bytes instanceof Uint8Array) || bytes.length === 0) return;
@@ -110,7 +110,7 @@ export class VncApiBinaryTransport {
       }
       return;
     }
-    if (variant === 'VncTunnelStreamEnd') {
+    if (variant === 'VncTunnelBody.StreamEnd') {
       this._handleStreamEnd(body.reason || 'stream-end');
     }
   }

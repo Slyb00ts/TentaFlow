@@ -43,7 +43,6 @@ module.exports = defineConfig({
     { name: 'mesh-pairing', testMatch: 'mesh-pairing.spec.js' },
     { name: 'm16-aliases', testMatch: 'm16-services-aliases.spec.js' },
     { name: 'm14-bindings', testMatch: 'm14-bindings.spec.js' },
-    { name: 'm15-wizard', testMatch: 'm15-install-wizard.spec.js' },
     { name: 'f1c-addon-ui', testMatch: 'addon-ui-iframe.spec.js' },
     { name: 'sdk-showcase-panel', testMatch: 'sdk-showcase-panel.spec.js' },
     { name: 'sdk-showcase-components', testMatch: 'sdk-showcase-components.spec.js' },
@@ -68,6 +67,7 @@ module.exports = defineConfig({
     { name: 'tentavision-onboarding', testMatch: 'tentavision-onboarding.spec.js' },
     { name: 'tentavision-evidence', testMatch: 'tentavision-evidence.spec.js' },
     { name: 'analytics', testMatch: 'analytics.spec.js' },
+    { name: 'chat-redesign', testMatch: 'chat-redesign.spec.js' },
     { name: 'agents-ui', testMatch: 'agents-ui.spec.js' },
     { name: 'agent-accounts', testMatch: 'agent-accounts.spec.js' },
     // C01 inside Code Studio needs its own node: it seeds workspace state and
@@ -82,6 +82,7 @@ module.exports = defineConfig({
     { name: 'process-b3-palette', testMatch: 'process-b3-palette.spec.js' },
     { name: 'process-b3-inspector', testMatch: 'process-b3-inspector.spec.js' },
     { name: 'tentaquant', testMatch: 'tentaquant.spec.js' },
+    { name: 'flows-system-readonly', testMatch: 'flows-system-readonly.spec.js' },
     { name: 'tentabus-seed', testMatch: 'tentabus-seed.spec.js' },
     { name: 'tentabus-ui', testMatch: 'tentabus-ui.spec.js' },
     { name: 'access-keys-bus-schema', testMatch: 'access-keys-bus-schema.spec.js' },

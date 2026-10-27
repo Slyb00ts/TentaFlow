@@ -87,7 +87,7 @@ export function visibleEdges(pairs, threshold = 1e-4) {
       return {
         a: Math.min(qubits[0], qubits[1]),
         b: Math.max(qubits[0], qubits[1]),
-        mutualInformation: Number(pair.mutualInformation ?? pair.mutual_information) || 0,
+        mutualInformation: Number(pair.mutualInformation) || 0,
         concurrence: Number(pair.concurrence) || 0,
       };
     })

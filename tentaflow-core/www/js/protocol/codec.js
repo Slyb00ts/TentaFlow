@@ -14,6 +14,7 @@
 // Plik `wasm_glue.js` + `wasm_glue_bg.wasm` sa produkowane przez build.rs (#32)
 // i kopiowane do tego katalogu na release build.
 import initWasm, * as wasm from './wasm_glue.js';
+import { requests } from './requests.js';
 
 let _wasm = null;
 let _messageKind = null;
@@ -981,7 +982,7 @@ function processRequestBody(variant, payload) {
         : (name === 'target' ? processMessageTarget(value)
           : (value ?? null)));
   }
-  return _wasm.encodeProcessRequest(variant, JSON.stringify(fields));
+  return requests.encodeProcessRequest(variant, JSON.stringify(fields));
 }
 
 function processFrame(correlationId, sequence, variant, payload) {
@@ -1089,7 +1090,7 @@ export const encode = {
   /** MessageBody::ModelListRequest — publiczny katalog modeli (Anonymous). */
   modelListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelListRequest();
+    const body = requests.encodeModelListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1101,7 +1102,7 @@ export const encode = {
   /** MessageBody::MetaSchemaVersionCheck — pierwszy frame po WSS upgrade. */
   metaSchemaVersionCheck(correlationId, clientVersion, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMetaSchemaVersionCheck(clientVersion);
+    const body = requests.encodeMetaSchemaVersionCheck(clientVersion);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1113,7 +1114,7 @@ export const encode = {
   /** MessageBody::MetaHeartbeat — keepalive (liczy RTT na RTT). */
   metaHeartbeat(correlationId, sentAtEpoch, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMetaHeartbeat(BigInt(sentAtEpoch));
+    const body = requests.encodeMetaHeartbeat(BigInt(sentAtEpoch));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1125,7 +1126,7 @@ export const encode = {
   /** MessageBody::MetaCancelStream — anulacja aktywnego streama po correlation_id. */
   metaCancelStream(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMetaCancelStream();
+    const body = requests.encodeMetaCancelStream();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1137,7 +1138,7 @@ export const encode = {
   /** MessageBody::ApiKeyListRequest (unit). */
   apiKeyListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeApiKeyListRequest();
+    const body = requests.encodeApiKeyListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1152,35 +1153,35 @@ export const encode = {
     const types = scopeResources.map((r) => r.resourceType);
     const ids = scopeResources.map((r) => r.resourceId);
     const actions = scopeResources.map((r) => r.action ?? '');
-    const body = _wasm.encodeApiKeyCreateRequest(name, keyType, subjectId ?? undefined, types, ids, actions);
+    const body = requests.encodeApiKeyCreateRequest(name, keyType, subjectId ?? undefined, types, ids, actions);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ApiKeyScopeListRequest { keyUid } */
   apiKeyScopeListRequest(correlationId, { keyUid }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeApiKeyScopeListRequest(keyUid);
+    const body = requests.encodeApiKeyScopeListRequest(keyUid);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ApiKeyScopeSetRequest { keyUid, resourceType, resourceId, accessLevel, action? } */
   apiKeyScopeSetRequest(correlationId, { keyUid, resourceType, resourceId, accessLevel, action = null }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeApiKeyScopeSetRequest(keyUid, resourceType, resourceId, accessLevel, action ?? undefined);
+    const body = requests.encodeApiKeyScopeSetRequest(keyUid, resourceType, resourceId, accessLevel, action ?? undefined);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ApiKeyScopeClearRequest { keyUid, resourceType, resourceId, action? } */
   apiKeyScopeClearRequest(correlationId, { keyUid, resourceType, resourceId, action = null }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeApiKeyScopeClearRequest(keyUid, resourceType, resourceId, action ?? undefined);
+    const body = requests.encodeApiKeyScopeClearRequest(keyUid, resourceType, resourceId, action ?? undefined);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ApiKeyRotateRequest { keyUid } */
   apiKeyRotateRequest(correlationId, { keyUid }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeApiKeyRotateRequest(keyUid);
+    const body = requests.encodeApiKeyRotateRequest(keyUid);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -1190,7 +1191,7 @@ export const encode = {
    */
   translateRequest(correlationId, { sourceText, sourceLang, targetLang, tone = null }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTranslateRequest(sourceText, sourceLang, targetLang, tone ?? undefined);
+    const body = requests.encodeTranslateRequest(sourceText, sourceLang, targetLang, tone ?? undefined);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1202,7 +1203,7 @@ export const encode = {
   /** MessageBody::ApiKeyRevokeRequest { key_id } */
   apiKeyRevokeRequest(correlationId, { keyId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeApiKeyRevokeRequest(keyId);
+    const body = requests.encodeApiKeyRevokeRequest(keyId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1214,7 +1215,7 @@ export const encode = {
   /** MessageBody::AuthLoginRequest { username, password } */
   authLoginRequest(correlationId, { username, password }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAuthLoginRequest(username, password);
+    const body = requests.encodeAuthLoginRequest(username, password);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1225,14 +1226,14 @@ export const encode = {
 
   authPasswordChangeRequest(correlationId, { currentPassword, newPassword }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAuthPasswordChangeRequest(currentPassword, newPassword);
+    const body = requests.encodeAuthPasswordChangeRequest(currentPassword, newPassword);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::AuthMeRequest (unit). */
   authMeRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAuthMeRequest();
+    const body = requests.encodeAuthMeRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1244,7 +1245,7 @@ export const encode = {
   /** MessageBody::MePreferencesGetRequest (unit). */
   mePreferencesGetRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMePreferencesGetRequest();
+    const body = requests.encodeMePreferencesGetRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1256,7 +1257,7 @@ export const encode = {
   /** MessageBody::MePreferencesUpdateRequest { language }. */
   mePreferencesUpdateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMePreferencesUpdateRequest(payload?.language ?? null);
+    const body = requests.encodeMePreferencesUpdateRequest(payload?.language ?? null);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1268,7 +1269,7 @@ export const encode = {
   /** MessageBody::ChatStreamRequest (simplified: 1 user message). */
   chatStreamRequest(correlationId, { modelId, userMessage, flowId, sessionId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeChatStreamRequestSimple(modelId, userMessage, flowId ?? null, sessionId ?? null);
+    const body = requests.encodeChatStreamRequestSimple(modelId, userMessage, flowId ?? null, sessionId ?? null);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1290,7 +1291,7 @@ export const encode = {
     sequence = 1,
   ) {
     assertReady();
-    const body = _wasm.encodeFlowInvokeAudio(
+    const body = requests.encodeFlowInvokeAudio(
       flowId != null ? String(flowId) : undefined,
       model || '',
       serviceType || 'chat',
@@ -1314,7 +1315,7 @@ export const encode = {
   /** MessageBody::MeshNodeListRequest (unit). */
   meshNodeListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeshNodeListRequest();
+    const body = requests.encodeMeshNodeListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1326,7 +1327,7 @@ export const encode = {
   /** MessageBody::MeshNodeDetailRequest { nodeId } */
   meshNodeDetailRequest(correlationId, { nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeshNodeDetailRequest(nodeId);
+    const body = requests.encodeMeshNodeDetailRequest(nodeId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1338,7 +1339,7 @@ export const encode = {
   /** MessageBody::MeshPendingListRequest (unit). */
   meshPendingListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeshPendingListRequest();
+    const body = requests.encodeMeshPendingListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1350,7 +1351,7 @@ export const encode = {
   /** MessageBody::MeshIdentityRequest (unit). */
   meshIdentityRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeshIdentityRequest();
+    const body = requests.encodeMeshIdentityRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1362,7 +1363,7 @@ export const encode = {
   /** MessageBody::MeshServicesListRequest (unit). */
   meshServicesListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeshServicesListRequest();
+    const body = requests.encodeMeshServicesListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1374,7 +1375,7 @@ export const encode = {
   /** MessageBody::MeshTrustedListRequest (unit). */
   meshTrustedListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeshTrustedListRequest();
+    const body = requests.encodeMeshTrustedListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1397,7 +1398,7 @@ export const encode = {
   }, sequence = 1) {
     assertReady();
     const hint = pinHint || pin || '';
-    const body = _wasm.encodeMeshPairingStartRequest(
+    const body = requests.encodeMeshPairingStartRequest(
       remoteAddress,
       hint,
       remotePublicKey || '',
@@ -1416,7 +1417,7 @@ export const encode = {
   /** MeshPairingConfirmRequest { pairId, pin } */
   meshPairingConfirmRequest(correlationId, { pairId, pin }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeshPairingConfirmRequest(pairId, pin);
+    const body = requests.encodeMeshPairingConfirmRequest(pairId, pin);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1428,7 +1429,7 @@ export const encode = {
   /** MeshPairingRejectRequest { pairId } */
   meshPairingRejectRequest(correlationId, { pairId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeshPairingRejectRequest(pairId);
+    const body = requests.encodeMeshPairingRejectRequest(pairId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1440,7 +1441,7 @@ export const encode = {
   /** MeshTrustRevokeRequest { nodeId } */
   meshTrustRevokeRequest(correlationId, { nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeshTrustRevokeRequest(nodeId);
+    const body = requests.encodeMeshTrustRevokeRequest(nodeId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1458,7 +1459,7 @@ export const encode = {
    */
   meshNodeProfileSetRequest(correlationId, { nodeId, nodeKind, operator }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeshNodeProfileSetRequest(
+    const body = requests.encodeMeshNodeProfileSetRequest(
       nodeId,
       nodeKind || '',
       typeof operator === 'boolean' ? operator : undefined,
@@ -1474,7 +1475,7 @@ export const encode = {
   /** MeshTrustRetrustRequest { nodeId } */
   meshTrustRetrustRequest(correlationId, { nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeshTrustRetrustRequest(nodeId);
+    const body = requests.encodeMeshTrustRetrustRequest(nodeId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1488,7 +1489,7 @@ export const encode = {
   /** MessageBody::BaselineDonorListRequest (unit) — kandydaci na dawce. */
   baselineDonorListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBaselineDonorListRequest();
+    const body = requests.encodeBaselineDonorListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1500,7 +1501,7 @@ export const encode = {
   /** MessageBody::BaselineAdoptStartRequest { donorNodeId } */
   baselineAdoptStartRequest(correlationId, { donorNodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBaselineAdoptStartRequest(String(donorNodeId || ''));
+    const body = requests.encodeBaselineAdoptStartRequest(String(donorNodeId || ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1512,7 +1513,7 @@ export const encode = {
   /** MessageBody::BaselineAdoptStatusRequest (unit) — faza + raport. */
   baselineAdoptStatusRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBaselineAdoptStatusRequest();
+    const body = requests.encodeBaselineAdoptStatusRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1524,7 +1525,7 @@ export const encode = {
   /** MessageBody::BaselineAdoptClearRequest (unit) — odblokuj zawieszony stan. */
   baselineAdoptClearRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBaselineAdoptClearRequest();
+    const body = requests.encodeBaselineAdoptClearRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1536,7 +1537,7 @@ export const encode = {
   /** MeshConnectRequest { address } */
   meshConnectRequest(correlationId, { address }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeshConnectRequest(address);
+    const body = requests.encodeMeshConnectRequest(address);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1548,7 +1549,7 @@ export const encode = {
   /** MeshNodeCommandRequest { nodeId, command, args } */
   meshNodeCommandRequest(correlationId, { nodeId, command, args = [] }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeshNodeCommandRequest(nodeId, command, args);
+    const body = requests.encodeMeshNodeCommandRequest(nodeId, command, args);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1560,7 +1561,7 @@ export const encode = {
   /** MeshNodeNetworkConfigRequest { nodeId, interfaceName, configJson } */
   meshNodeNetworkConfigRequest(correlationId, { nodeId, interfaceName, configJson }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeshNodeNetworkConfigRequest(nodeId, interfaceName, configJson);
+    const body = requests.encodeMeshNodeNetworkConfigRequest(nodeId, interfaceName, configJson);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1572,7 +1573,7 @@ export const encode = {
   /** MessageBody::ClusterListRequest (unit). */
   clusterListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeClusterListRequest();
+    const body = requests.encodeClusterListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1584,7 +1585,7 @@ export const encode = {
   /** MessageBody::ClusterDetailRequest { clusterId } */
   clusterDetailRequest(correlationId, { clusterId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeClusterDetailRequest(clusterId);
+    const body = requests.encodeClusterDetailRequest(clusterId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1596,7 +1597,7 @@ export const encode = {
   /** MessageBody::ClusterCreateRequest. */
   clusterCreateRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeClusterCreateRequest(
+    const body = requests.encodeClusterCreateRequest(
       payload.name,
       payload.description ?? null,
       payload.strategy ?? 'distributed',
@@ -1616,7 +1617,7 @@ export const encode = {
   /** MessageBody::ClusterDeleteRequest { clusterId } */
   clusterDeleteRequest(correlationId, { clusterId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeClusterDeleteRequest(clusterId);
+    const body = requests.encodeClusterDeleteRequest(clusterId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1628,7 +1629,7 @@ export const encode = {
   /** MessageBody::ClusterAddMemberRequest. */
   clusterAddMemberRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeClusterAddMemberRequest(
+    const body = requests.encodeClusterAddMemberRequest(
       payload.clusterId,
       payload.nodeId,
       payload.interfaceType ?? null,
@@ -1647,7 +1648,7 @@ export const encode = {
   /** MessageBody::ClusterRemoveMemberRequest { clusterId, nodeId } */
   clusterRemoveMemberRequest(correlationId, { clusterId, nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeClusterRemoveMemberRequest(clusterId, nodeId);
+    const body = requests.encodeClusterRemoveMemberRequest(clusterId, nodeId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1659,7 +1660,7 @@ export const encode = {
   /** MessageBody::ClusterProbeStreamRequest { nodeIds: string[] } */
   clusterProbeStreamRequest(correlationId, { nodeIds }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeClusterProbeStreamRequest(nodeIds);
+    const body = requests.encodeClusterProbeStreamRequest(nodeIds);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1671,7 +1672,7 @@ export const encode = {
   /** MessageBody::ClusterRdmaConfigureRequest { clusterId, sudoPassword, mtu? } */
   clusterRdmaConfigureRequest(correlationId, { clusterId, sudoPassword, mtu }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeClusterRdmaConfigureRequest(
+    const body = requests.encodeClusterRdmaConfigureRequest(
       clusterId,
       sudoPassword,
       mtu ?? null,
@@ -1690,7 +1691,7 @@ export const encode = {
    */
   clusterDeployRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeClusterDeployRequest(
+    const body = requests.encodeClusterDeployRequest(
       payload.clusterId,
       payload.engineId,
       payload.modelRepo ?? null,
@@ -1720,7 +1721,7 @@ export const encode = {
   /** MessageBody::ClusterDeployStopRequest { clusterId, deploymentClusterId } */
   clusterDeployStopRequest(correlationId, { clusterId, deploymentClusterId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeClusterDeployStopRequest(clusterId, deploymentClusterId);
+    const body = requests.encodeClusterDeployStopRequest(clusterId, deploymentClusterId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1742,7 +1743,7 @@ export const encode = {
       healthCheckIntervalMs,
       timeoutMs,
     } = opts;
-    const body = _wasm.encodeClusterUpdateRequest(
+    const body = requests.encodeClusterUpdateRequest(
       clusterId,
       name ?? null,
       description ?? null,
@@ -1767,7 +1768,7 @@ export const encode = {
   /** MessageBody::DashboardMetricsRequest (unit). */
   dashboardMetricsRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeDashboardMetricsRequest();
+    const body = requests.encodeDashboardMetricsRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1783,7 +1784,7 @@ export const encode = {
   /** MessageBody::MeshPeersListRequest (unit). */
   meshPeersListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeshPeersListRequest();
+    const body = requests.encodeMeshPeersListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1795,7 +1796,7 @@ export const encode = {
   /** MessageBody::MeshPairInitRequest { nodeId: Uint8Array(32), pin } */
   meshPairInitRequest(correlationId, { nodeId, pin }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeshPairInitRequest(nodeId, pin);
+    const body = requests.encodeMeshPairInitRequest(nodeId, pin);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1811,7 +1812,7 @@ export const encode = {
   /** MessageBody::ModelDetailRequest { modelId } */
   modelDetailRequest(correlationId, { modelId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelDetailRequest(modelId);
+    const body = requests.encodeModelDetailRequest(modelId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1832,7 +1833,7 @@ export const encode = {
     const surfaceFilter =
       typeof opts.surfaceFilter === 'string' ? opts.surfaceFilter : undefined;
     const includeBlocking = !!opts.includeBlockingDiagnostics;
-    const body = _wasm.encodeCatalogListRequest(surfaceFilter, includeBlocking);
+    const body = requests.encodeCatalogListRequest(surfaceFilter, includeBlocking);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1844,7 +1845,7 @@ export const encode = {
   /** MessageBody::ModelAliasListRequest — lista aliasow modeli. */
   modelAliasListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelAliasListRequest();
+    const body = requests.encodeModelAliasListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1856,7 +1857,7 @@ export const encode = {
   /** MessageBody::ModelAliasCreateRequest { alias, targetModel, strategy?, fallbackTargets? } */
   modelAliasCreateRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelAliasCreateRequest(
+    const body = requests.encodeModelAliasCreateRequest(
       payload.alias,
       payload.targetModel,
       payload.strategy ?? null,
@@ -1873,7 +1874,7 @@ export const encode = {
   /** MessageBody::ModelAliasUpdateRequest { id, alias, targetModel, isActive?, strategy?, fallbackTargets? } */
   modelAliasUpdateRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelAliasUpdateRequest(
+    const body = requests.encodeModelAliasUpdateRequest(
       Number(payload.id),
       payload.alias,
       payload.targetModel,
@@ -1892,7 +1893,7 @@ export const encode = {
   /** MessageBody::ModelAliasDeleteRequest { id } */
   modelAliasDeleteRequest(correlationId, { id }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelAliasDeleteRequest(Number(id));
+    const body = requests.encodeModelAliasDeleteRequest(Number(id));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1904,7 +1905,7 @@ export const encode = {
   /** MessageBody::AliasConsumerListRequest { aliasId } */
   aliasConsumerListRequest(correlationId, { aliasId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAliasConsumerListRequest(Number(aliasId));
+    const body = requests.encodeAliasConsumerListRequest(Number(aliasId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1916,7 +1917,7 @@ export const encode = {
   /** MessageBody::AliasConsumerGrantRequest { aliasId, addonId } */
   aliasConsumerGrantRequest(correlationId, { aliasId, addonId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAliasConsumerGrantRequest(Number(aliasId), addonId);
+    const body = requests.encodeAliasConsumerGrantRequest(Number(aliasId), addonId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1928,7 +1929,7 @@ export const encode = {
   /** MessageBody::AliasConsumerRevokeRequest { aliasId, addonId } */
   aliasConsumerRevokeRequest(correlationId, { aliasId, addonId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAliasConsumerRevokeRequest(Number(aliasId), addonId);
+    const body = requests.encodeAliasConsumerRevokeRequest(Number(aliasId), addonId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1940,7 +1941,7 @@ export const encode = {
   /** MessageBody::AliasVisibilitySetRequest { aliasId, visibility } */
   aliasVisibilitySetRequest(correlationId, { aliasId, visibility }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAliasVisibilitySetRequest(Number(aliasId), visibility);
+    const body = requests.encodeAliasVisibilitySetRequest(Number(aliasId), visibility);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1952,7 +1953,7 @@ export const encode = {
   /** MessageBody::ModelVisibilityListRequest — all models with their visibility. */
   modelVisibilityListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelVisibilityListRequest();
+    const body = requests.encodeModelVisibilityListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1964,7 +1965,7 @@ export const encode = {
   /** MessageBody::ModelVisibilitySetRequest { modelId, visibility } */
   modelVisibilitySetRequest(correlationId, { modelId, visibility }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelVisibilitySetRequest(modelId, visibility);
+    const body = requests.encodeModelVisibilitySetRequest(modelId, visibility);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1976,7 +1977,7 @@ export const encode = {
   /** MessageBody::ModelConsumerListRequest { modelId } */
   modelConsumerListRequest(correlationId, { modelId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelConsumerListRequest(modelId);
+    const body = requests.encodeModelConsumerListRequest(modelId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -1988,7 +1989,7 @@ export const encode = {
   /** MessageBody::ModelConsumerGrantRequest { modelId, addonId } */
   modelConsumerGrantRequest(correlationId, { modelId, addonId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelConsumerGrantRequest(modelId, addonId);
+    const body = requests.encodeModelConsumerGrantRequest(modelId, addonId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2000,7 +2001,7 @@ export const encode = {
   /** MessageBody::ModelConsumerRevokeRequest { modelId, addonId } */
   modelConsumerRevokeRequest(correlationId, { modelId, addonId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelConsumerRevokeRequest(modelId, addonId);
+    const body = requests.encodeModelConsumerRevokeRequest(modelId, addonId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2012,7 +2013,7 @@ export const encode = {
   /** MessageBody::AddonAccessListRequest { addonId } */
   addonAccessListRequest(correlationId, { addonId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonAccessListRequest(addonId);
+    const body = requests.encodeAddonAccessListRequest(addonId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2024,7 +2025,7 @@ export const encode = {
   /** MessageBody::AddonAccessDecisionRequest { addonId, kind, target, decision } */
   addonAccessDecisionRequest(correlationId, { addonId, kind, target, decision }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonAccessDecisionRequest(addonId, kind, target, decision);
+    const body = requests.encodeAddonAccessDecisionRequest(addonId, kind, target, decision);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2036,7 +2037,7 @@ export const encode = {
   /** MessageBody::ModelInstallRequest { modelId, sourceRepo } */
   modelInstallRequest(correlationId, { modelId, sourceRepo }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelInstallRequest(modelId, sourceRepo);
+    const body = requests.encodeModelInstallRequest(modelId, sourceRepo);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2048,7 +2049,7 @@ export const encode = {
   /** MessageBody::ModelDeleteRequest { modelId } */
   modelDeleteRequest(correlationId, { modelId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelDeleteRequest(modelId);
+    const body = requests.encodeModelDeleteRequest(modelId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2064,7 +2065,7 @@ export const encode = {
   /** MessageBody::CameraAdminBody(DiscoverRequest) — start ONVIF WS-Discovery. */
   cameraDiscoverRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCameraDiscoverRequest();
+    const body = requests.encodeCameraDiscoverRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2081,7 +2082,7 @@ export const encode = {
    */
   cameraAddOnvifRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCameraAddOnvifRequest(
+    const body = requests.encodeCameraAddOnvifRequest(
       payload.displayName,
       payload.deviceServiceUrl,
       payload.username,
@@ -2103,7 +2104,7 @@ export const encode = {
    */
   cameraFrameUrlRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCameraFrameUrlRequest(
+    const body = requests.encodeCameraFrameUrlRequest(
       payload.cameraId,
       Number(payload.ttlSecs),
     );
@@ -2124,7 +2125,7 @@ export const encode = {
    */
   cameraDetectionsSubscribeRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCameraDetectionsSubscribeRequest(payload.cameraId);
+    const body = requests.encodeCameraDetectionsSubscribeRequest(payload.cameraId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2140,7 +2141,7 @@ export const encode = {
   /** MessageBody::RobotsBody(ListRequest) — org-scoped robot list (unit). */
   robotsListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeRobotsListRequest();
+    const body = requests.encodeRobotsListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2161,7 +2162,7 @@ export const encode = {
    */
   robotControlRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeRobotControlRequest(
+    const body = requests.encodeRobotControlRequest(
       payload.robotId,
       payload.kind,
       Number(payload.vx ?? 0),
@@ -2187,7 +2188,7 @@ export const encode = {
    */
   robotCameraShareRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeRobotCameraShareRequest(
+    const body = requests.encodeRobotCameraShareRequest(
       payload.robotId,
       payload.cameraId,
     );
@@ -2207,7 +2208,7 @@ export const encode = {
   robotGeoAnchorSetRequest(correlationId, payload, sequence = 1) {
     assertReady();
     const num = (v) => (v == null ? undefined : Number(v));
-    const body = _wasm.encodeRobotGeoAnchorSetRequest(
+    const body = requests.encodeRobotGeoAnchorSetRequest(
       payload.robotId,
       num(payload.lat),
       num(payload.lon),
@@ -2228,7 +2229,7 @@ export const encode = {
    */
   robotGeoAnchorGetRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeRobotGeoAnchorGetRequest(payload.robotId);
+    const body = requests.encodeRobotGeoAnchorGetRequest(payload.robotId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2244,7 +2245,7 @@ export const encode = {
   /** MessageBody::HubEngineListRequest (unit). */
   hubEngineListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeHubEngineListRequest();
+    const body = requests.encodeHubEngineListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2256,7 +2257,7 @@ export const encode = {
   /** MessageBody::HubModelSearchRequest { query } */
   hubModelSearchRequest(correlationId, { query }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeHubModelSearchRequest(query);
+    const body = requests.encodeHubModelSearchRequest(query);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2272,7 +2273,7 @@ export const encode = {
   /** MessageBody::FlowListRequest (unit). */
   flowListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeFlowListRequest();
+    const body = requests.encodeFlowListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2284,7 +2285,7 @@ export const encode = {
   /** MessageBody::FlowDetailRequest { flowId } */
   flowDetailRequest(correlationId, { flowId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeFlowDetailRequest(String(flowId));
+    const body = requests.encodeFlowDetailRequest(String(flowId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2305,7 +2306,7 @@ export const encode = {
     sequence = 1,
   ) {
     assertReady();
-    const body = _wasm.encodeFlowCreateRequest(
+    const body = requests.encodeFlowCreateRequest(
       name,
       description ?? null,
       graphJson,
@@ -2322,7 +2323,7 @@ export const encode = {
   /** MessageBody::FlowDeleteRequest { flowId } */
   flowDeleteRequest(correlationId, { flowId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeFlowDeleteRequest(String(flowId));
+    const body = requests.encodeFlowDeleteRequest(String(flowId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2334,7 +2335,7 @@ export const encode = {
   /** MessageBody::FlowExecutionsListRequest { flowId } */
   flowExecutionsListRequest(correlationId, { flowId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeFlowExecutionsListRequest(String(flowId));
+    const body = requests.encodeFlowExecutionsListRequest(String(flowId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2355,7 +2356,7 @@ export const encode = {
       payload,
       'publishedModelName',
     );
-    const body = _wasm.encodeFlowUpdateRequest(
+    const body = requests.encodeFlowUpdateRequest(
       String(payload.flowId),
       payload.name ?? null,
       payload.description ?? null,
@@ -2375,7 +2376,7 @@ export const encode = {
   /** MessageBody::FlowNodeTemplatesListRequest (unit). */
   flowNodeTemplatesListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeFlowNodeTemplatesListRequest();
+    const body = requests.encodeFlowNodeTemplatesListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2387,7 +2388,7 @@ export const encode = {
   /** MessageBody::FlowVersionListRequest { flowId } */
   flowVersionListRequest(correlationId, { flowId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeFlowVersionListRequest(String(flowId));
+    const body = requests.encodeFlowVersionListRequest(String(flowId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2399,7 +2400,7 @@ export const encode = {
   /** MessageBody::FlowVersionGetRequest { flowId, versionId } */
   flowVersionGetRequest(correlationId, { flowId, versionId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeFlowVersionGetRequest(String(flowId), String(versionId));
+    const body = requests.encodeFlowVersionGetRequest(String(flowId), String(versionId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2411,7 +2412,7 @@ export const encode = {
   /** MessageBody::FlowVersionRestoreRequest { flowId, versionId } */
   flowVersionRestoreRequest(correlationId, { flowId, versionId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeFlowVersionRestoreRequest(String(flowId), String(versionId));
+    const body = requests.encodeFlowVersionRestoreRequest(String(flowId), String(versionId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2423,7 +2424,7 @@ export const encode = {
   /** MessageBody::FlowFactoryRestoreRequest { flowId } */
   flowFactoryRestoreRequest(correlationId, { flowId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeFlowFactoryRestoreRequest(String(flowId));
+    const body = requests.encodeFlowFactoryRestoreRequest(String(flowId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2436,84 +2437,10 @@ export const encode = {
   // Services
   // -------------------------------------------------------------------------
 
-  /** MessageBody::ServiceFlagsUpdateRequest { serviceId, pinned?, paused? }
-   *  pinned/paused: undefined/null = nie zmieniaj, true/false = ustaw. */
-  serviceFlagsUpdateRequest(correlationId, { serviceId, pinned, paused }, sequence = 1) {
-    assertReady();
-    const pinnedI32 = pinned === undefined || pinned === null ? -1 : (pinned ? 1 : 0);
-    const pausedI32 = paused === undefined || paused === null ? -1 : (paused ? 1 : 0);
-    const body = _wasm.encodeServiceFlagsUpdateRequest(serviceId, pinnedI32, pausedI32);
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
   /** MessageBody::DeploymentBody(ReqRedeploy { serviceId }) */
   serviceRedeployRequest(correlationId, { serviceId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServiceRedeployRequest(Number(serviceId));
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
-  /** MessageBody::ServiceDeployRequest { engineId, modelId, deployMethod, nodeId: Uint8Array(32) } */
-  serviceDeployRequest(correlationId, { engineId, modelId, deployMethod, nodeId }, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeServiceDeployRequest(engineId, modelId, deployMethod, nodeId);
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
-  /**
-   * MessageBody::ServiceCreateRequest { name, serviceType, strategy, configJson,
-   *   nodeId?, clusterId? }
-   * `nodeId` jest hex-enkodowanym 64-znakowym ciagiem (32 bajty) lub pusty.
-   */
-  serviceCreateRequest(correlationId, payload, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeServiceCreateRequest(
-      payload.name,
-      payload.serviceType,
-      payload.strategy ?? 'single',
-      payload.configJson,
-      payload.nodeId ?? null,
-      payload.clusterId ?? null,
-    );
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
-    );
-  },
-
-  /**
-   * MessageBody::ServiceUpdateRequest { id, name, serviceType, strategy, status,
-   *   configJson, nodeId?, clusterId? }
-   */
-  serviceUpdateRequest(correlationId, payload, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeServiceUpdateRequest(
-      String(payload.id),
-      payload.name,
-      payload.serviceType,
-      payload.strategy ?? 'single',
-      payload.status ?? 'active',
-      payload.configJson,
-      payload.nodeId ?? null,
-      payload.clusterId ?? null,
-    );
+    const body = requests.encodeServiceRedeployRequest(Number(serviceId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2529,7 +2456,7 @@ export const encode = {
    */
   serviceConfigUpdateRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServiceConfigUpdateRequest(JSON.stringify(camelToSnakePayload(payload)));
+    const body = requests.encodeServiceConfigUpdateRequest(JSON.stringify(camelToSnakePayload(payload)));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
     );
@@ -2538,7 +2465,7 @@ export const encode = {
   /** MessageBody::ServiceBody(ServicePayload::ReqVramHint) */
   serviceVramHintRequest(correlationId, { gpuIndex, nodeId, excludeServiceId } = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServiceVramHintRequest(
+    const body = requests.encodeServiceVramHintRequest(
       gpuIndex == null ? undefined : Number(gpuIndex),
       nodeId ?? undefined,
       excludeServiceId == null ? undefined : Number(excludeServiceId),
@@ -2551,7 +2478,7 @@ export const encode = {
   /** MessageBody::ServiceBody(ServicePayload::ReqEnginePresets) */
   serviceEnginePresetsRequest(correlationId, { engineId } = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServiceEnginePresetsRequest(String(engineId || ''));
+    const body = requests.encodeServiceEnginePresetsRequest(String(engineId || ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
     );
@@ -2560,7 +2487,7 @@ export const encode = {
   /** MessageBody::ServiceBody(ServicePayload::ReqModelCatalog) */
   serviceModelCatalogRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServiceModelCatalogRequest(JSON.stringify(camelToSnakePayload(payload)));
+    const body = requests.encodeServiceModelCatalogRequest(JSON.stringify(camelToSnakePayload(payload)));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
     );
@@ -2569,7 +2496,7 @@ export const encode = {
   /** MessageBody::ServiceBody(ServicePayload::ReqModelSelection) */
   serviceModelSelectionRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServiceModelSelectionRequest(JSON.stringify(camelToSnakePayload(payload)));
+    const body = requests.encodeServiceModelSelectionRequest(JSON.stringify(camelToSnakePayload(payload)));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
     );
@@ -2578,7 +2505,7 @@ export const encode = {
   /** MessageBody::ServiceBody(ServicePayload::ReqOauthStart) */
   serviceOauthStartRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServiceOauthStartRequest(JSON.stringify(camelToSnakePayload(payload)));
+    const body = requests.encodeServiceOauthStartRequest(JSON.stringify(camelToSnakePayload(payload)));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
     );
@@ -2587,21 +2514,9 @@ export const encode = {
   /** MessageBody::ServiceBody(ServicePayload::ReqOauthPoll) */
   serviceOauthPollRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServiceOauthPollRequest(JSON.stringify(camelToSnakePayload(payload)));
+    const body = requests.encodeServiceOauthPollRequest(JSON.stringify(camelToSnakePayload(payload)));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body,
-    );
-  },
-
-  /** MessageBody::ServiceQuicStatusRequest (unit) */
-  serviceQuicStatusRequest(correlationId, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeServiceQuicStatusRequest();
-    return _wasm.encodeEnvelopeDirect(
-      BigInt(correlationId),
-      BigInt(sequence),
-      _messageKind.META_HEARTBEAT,
-      body,
     );
   },
 
@@ -2612,7 +2527,7 @@ export const encode = {
   /** MessageBody::PromptListRequest (unit). */
   promptListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodePromptListRequest();
+    const body = requests.encodePromptListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2624,7 +2539,7 @@ export const encode = {
   /** MessageBody::PromptDetailRequest { promptId } */
   promptDetailRequest(correlationId, { promptId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodePromptDetailRequest(promptId);
+    const body = requests.encodePromptDetailRequest(promptId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2640,54 +2555,54 @@ export const encode = {
   // Deployment status/list polling.
   deploymentStatusRequest(correlationId, { deployId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeDeploymentStatusRequest(String(deployId || ''));
+    const body = requests.encodeDeploymentStatusRequest(String(deployId || ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   deploymentListRequest(correlationId, { engineId = '', status = '', onlyMine = true, limit = 0 } = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeDeploymentListRequest(String(engineId), String(status), !!onlyMine, Number(limit));
+    const body = requests.encodeDeploymentListRequest(String(engineId), String(status), !!onlyMine, Number(limit));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** Subscribe streaming log/progress — wywołuj przez ApiBinary.subscribe(...) */
   deploymentLogStreamRequest(correlationId, { deployId, replayTail = true }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeDeploymentLogStreamRequest(String(deployId || ''), !!replayTail);
+    const body = requests.encodeDeploymentLogStreamRequest(String(deployId || ''), !!replayTail);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** Subscribe — otwiera tunel RFB dla sesji meeting, chunki to RFB bytes z kontenera. */
   vncTunnelOpenRequest(correlationId, { sessionId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeVncTunnelOpenRequest(Number(sessionId));
+    const body = requests.encodeVncTunnelOpenRequest(Number(sessionId));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** One-shot — wysyła RFB input (keyboard/mouse) z przeglądarki do kontenera. */
   vncTunnelSendRequest(correlationId, { tunnelId, bytes }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeVncTunnelSendRequest(String(tunnelId), bytes);
+    const body = requests.encodeVncTunnelSendRequest(String(tunnelId), bytes);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** One-shot — zamyka tunel RFB i zwalnia zasoby po stronie backendu. */
   vncTunnelCloseRequest(correlationId, { tunnelId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeVncTunnelCloseRequest(String(tunnelId));
+    const body = requests.encodeVncTunnelCloseRequest(String(tunnelId));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** One-shot — capture screenshot (PNG) or DOM (HTML) from the bot's Chromium page. */
   browserCaptureRequest(correlationId, { sessionId, kind, fullPage = false }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBrowserCaptureRequest(Number(sessionId), String(kind), !!fullPage);
+    const body = requests.encodeBrowserCaptureRequest(Number(sessionId), String(kind), !!fullPage);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   meetingSessionStartRequest(correlationId, { meetingUrl, title, platform, botName, sttAlias, ttsAlias, llmAlias }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeetingSessionStartRequest(
+    const body = requests.encodeMeetingSessionStartRequest(
       meetingUrl ?? '',
       title ?? '',
       platform ?? 'teams',
@@ -2701,37 +2616,37 @@ export const encode = {
 
   meetingSessionLeaveRequest(correlationId, { sessionId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeetingSessionLeaveRequest(Number(sessionId));
+    const body = requests.encodeMeetingSessionLeaveRequest(Number(sessionId));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   meetingSessionListRequest(correlationId, { onlyMine } = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeetingSessionListRequest(!!onlyMine);
+    const body = requests.encodeMeetingSessionListRequest(!!onlyMine);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   meetingSessionDetailRequest(correlationId, { sessionId, includeTranscripts }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeetingSessionDetailRequest(Number(sessionId), !!includeTranscripts);
+    const body = requests.encodeMeetingSessionDetailRequest(Number(sessionId), !!includeTranscripts);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   meetingTranscriptsListRequest(correlationId, { sessionId, sinceMs = 0 }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeetingTranscriptsListRequest(Number(sessionId), Number(sinceMs));
+    const body = requests.encodeMeetingTranscriptsListRequest(Number(sessionId), Number(sinceMs));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   meetingActiveSessionRequest(correlationId, _args, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeetingActiveSessionRequest();
+    const body = requests.encodeMeetingActiveSessionRequest();
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   meetingSettingsGetRequest(correlationId, _args, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeetingSettingsGetRequest();
+    const body = requests.encodeMeetingSettingsGetRequest();
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -2739,7 +2654,7 @@ export const encode = {
   meetingSettingsUpdateRequest(correlationId, { settings }, sequence = 1) {
     assertReady();
     const pairs = Array.isArray(settings) ? settings : Object.entries(settings ?? {});
-    const body = _wasm.encodeMeetingSettingsUpdateRequest(pairs);
+    const body = requests.encodeMeetingSettingsUpdateRequest(pairs);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -2747,7 +2662,7 @@ export const encode = {
   meetingSummariesListRequest(correlationId, { meetingKey, limit } = {}, sequence = 1) {
     assertReady();
     const lim = limit == null ? undefined : Number(limit);
-    const body = _wasm.encodeMeetingSummariesListRequest(String(meetingKey ?? ''), lim);
+    const body = requests.encodeMeetingSummariesListRequest(String(meetingKey ?? ''), lim);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -2755,21 +2670,21 @@ export const encode = {
   meetingActionItemsListRequest(correlationId, { meetingKey, statusFilter } = {}, sequence = 1) {
     assertReady();
     const sf = statusFilter == null || statusFilter === '' ? undefined : String(statusFilter);
-    const body = _wasm.encodeMeetingActionItemsListRequest(String(meetingKey ?? ''), sf);
+    const body = requests.encodeMeetingActionItemsListRequest(String(meetingKey ?? ''), sf);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MeetingActionItemStatusUpdateRequest { item_id, status } */
   meetingActionItemStatusUpdateRequest(correlationId, { itemId, status } = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeetingActionItemStatusUpdateRequest(Number(itemId), String(status ?? ''));
+    const body = requests.encodeMeetingActionItemStatusUpdateRequest(Number(itemId), String(status ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MeetingTranscriptExportRequest { meeting_key } — zwraca plain text w polu content. */
   meetingTranscriptExportRequest(correlationId, { meetingKey } = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMeetingTranscriptExportRequest(String(meetingKey ?? ''));
+    const body = requests.encodeMeetingTranscriptExportRequest(String(meetingKey ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -2780,7 +2695,7 @@ export const encode = {
   /** MessageBody::RegistryListRequest (unit). */
   registryListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeRegistryListRequest();
+    const body = requests.encodeRegistryListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2796,7 +2711,7 @@ export const encode = {
   /** MessageBody::TtsRuleListRequest (unit). */
   ttsRuleListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTtsRuleListRequest();
+    const body = requests.encodeTtsRuleListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2808,7 +2723,7 @@ export const encode = {
   /** MessageBody::TtsRuleCreateRequest(TtsRule) */
   ttsRuleCreateRequest(correlationId, { id, pattern, voiceId, priority }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTtsRuleCreateRequest(id, pattern, voiceId, priority);
+    const body = requests.encodeTtsRuleCreateRequest(id, pattern, voiceId, priority);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2820,7 +2735,7 @@ export const encode = {
   /** MessageBody::TtsRuleDeleteRequest { ruleId } */
   ttsRuleDeleteRequest(correlationId, { ruleId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTtsRuleDeleteRequest(ruleId);
+    const body = requests.encodeTtsRuleDeleteRequest(ruleId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2832,7 +2747,7 @@ export const encode = {
   /** MessageBody::TtsPreviewRequest { text, model, voice } — podglad audio TTS */
   ttsPreviewRequest(correlationId, { text, model, voice }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTtsPreviewRequest(text, model, voice);
+    const body = requests.encodeTtsPreviewRequest(text, model, voice);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2848,7 +2763,7 @@ export const encode = {
   /** MessageBody::PiiRuleListRequest (unit). */
   piiRuleListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodePiiRuleListRequest();
+    const body = requests.encodePiiRuleListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2868,7 +2783,7 @@ export const encode = {
    */
   visionInferRequest(correlationId, { serviceName, image, width, height }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeVisionInferRequest(
+    const body = requests.encodeVisionInferRequest(
       serviceName,
       image,
       typeof width === 'number' ? width : undefined,
@@ -2892,7 +2807,7 @@ export const encode = {
    */
   rerankRequest(correlationId, { model, query, documents, topN, returnDocuments }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeRerankRequest(
+    const body = requests.encodeRerankRequest(
       model,
       query,
       documents,
@@ -2914,7 +2829,7 @@ export const encode = {
   /** MessageBody::FastPathListRequest (unit). */
   fastPathListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeFastPathListRequest();
+    const body = requests.encodeFastPathListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2930,7 +2845,7 @@ export const encode = {
   /** MessageBody::SettingsListRequest (unit). */
   settingsListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSettingsListRequest();
+    const body = requests.encodeSettingsListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2948,7 +2863,7 @@ export const encode = {
     const keys = entries.map((e) => String(e.key));
     const values = entries.map((e) => String(e.value));
     const isSecrets = new Uint8Array(entries.map((e) => (e.isSecret ? 1 : 0)));
-    const body = _wasm.encodeSettingsUpdateBatch(keys, values, isSecrets);
+    const body = requests.encodeSettingsUpdateBatch(keys, values, isSecrets);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2964,7 +2879,7 @@ export const encode = {
   /** MessageBody::StorageAdminBody(OverviewRequest) — unit. */
   storageOverviewRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeStorageOverviewRequest();
+    const body = requests.encodeStorageOverviewRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2976,7 +2891,7 @@ export const encode = {
   /** MessageBody::StorageAdminBody(BrowseRequest { path }). */
   storageBrowseRequest(correlationId, { path }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeStorageBrowseRequest(String(path ?? ''));
+    const body = requests.encodeStorageBrowseRequest(String(path ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2988,7 +2903,7 @@ export const encode = {
   /** MessageBody::StorageAdminBody(CreateDirRequest { parent, name }). */
   storageCreateDirRequest(correlationId, { parent, name }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeStorageCreateDirRequest(String(parent), String(name));
+    const body = requests.encodeStorageCreateDirRequest(String(parent), String(name));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3000,7 +2915,7 @@ export const encode = {
   /** MessageBody::StorageAdminBody(MigrateRequest { key, newPath, moveData }). */
   storageMigrateRequest(correlationId, { key, newPath, moveData }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeStorageMigrateRequest(String(key), String(newPath), moveData === true);
+    const body = requests.encodeStorageMigrateRequest(String(key), String(newPath), moveData === true);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3045,7 +2960,7 @@ export const encode = {
       cursor,
       limit: payload?.limit ?? 0,
     };
-    const body = _wasm.encodeEventsBrowseRequest(JSON.stringify(filter));
+    const body = requests.encodeEventsBrowseRequest(JSON.stringify(filter));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3057,7 +2972,7 @@ export const encode = {
   /** MessageBody::EventsBody(RunRequest { runId, afterSeq, limit }) — one run's timeline. */
   eventsRunRequest(correlationId, { runId, afterSeq, limit } = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeEventsRunRequest(
+    const body = requests.encodeEventsRunRequest(
       String(runId ?? ''),
       Number(afterSeq ?? 0),
       Number(limit ?? 0),
@@ -3091,7 +3006,7 @@ export const encode = {
     sequence = 1,
   ) {
     assertReady();
-    const body = _wasm.encodeModelConversionStartRequest(
+    const body = requests.encodeModelConversionStartRequest(
       Number(serviceId ?? 0),
       String(sourcePath ?? ''),
       String(sourceFormat ?? ''),
@@ -3110,7 +3025,7 @@ export const encode = {
   /** MessageBody::ModelConversionBody(StatusRequest { serviceId }) — polls the conversion state. */
   modelConversionStatusRequest(correlationId, { serviceId } = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelConversionStatusRequest(Number(serviceId ?? 0));
+    const body = requests.encodeModelConversionStatusRequest(Number(serviceId ?? 0));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3126,7 +3041,7 @@ export const encode = {
   /** MessageBody::NetworkBody(NetworkPayload::ReqInterfacesList) — unit. */
   networkInterfacesListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeNetworkInterfacesListRequest();
+    const body = requests.encodeNetworkInterfacesListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3138,7 +3053,7 @@ export const encode = {
   /** MessageBody::NetworkBody(NetworkPayload::ReqConfigGet) — unit. */
   networkConfigGetRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeNetworkConfigGetRequest();
+    const body = requests.encodeNetworkConfigGetRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3150,7 +3065,7 @@ export const encode = {
   /** MessageBody::NetworkBody(NetworkPayload::ReqRelayStatus) — unit. */
   networkRelayStatusRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeNetworkRelayStatusRequest();
+    const body = requests.encodeNetworkRelayStatusRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3176,7 +3091,7 @@ export const encode = {
     const irohRelayUrl = String(payload.irohRelayUrl ?? payload.iroh_relay_url ?? '');
     const excludedRaw = payload.excludedInterfaces ?? payload.excluded_interfaces ?? [];
     const excludedInterfaces = Array.isArray(excludedRaw) ? excludedRaw.map(String) : [];
-    const body = _wasm.encodeNetworkConfigUpdateRequest(
+    const body = requests.encodeNetworkConfigUpdateRequest(
       bindMode,
       bindIpv4,
       hideDocker,
@@ -3210,7 +3125,7 @@ export const encode = {
     sequence = 1,
   ) {
     assertReady();
-    const body = _wasm.encodeProfilingStartRequest(
+    const body = requests.encodeProfilingStartRequest(
       String(nodeId),
       scope,
       String(label ?? ''),
@@ -3227,7 +3142,7 @@ export const encode = {
   /** MessageBody::ProfilingBody(ProfilingPayload::StopRequest). */
   profilingStopRequest(correlationId, { nodeId, sessionId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProfilingStopRequest(String(nodeId), String(sessionId));
+    const body = requests.encodeProfilingStopRequest(String(nodeId), String(sessionId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3239,7 +3154,7 @@ export const encode = {
   /** MessageBody::ProfilingBody(ProfilingPayload::SessionsRequest). */
   profilingSessionsRequest(correlationId, { nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProfilingSessionsRequest(String(nodeId));
+    const body = requests.encodeProfilingSessionsRequest(String(nodeId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3251,7 +3166,7 @@ export const encode = {
   /** MessageBody::ProfilingBody(ProfilingPayload::ReportRequest). */
   profilingReportRequest(correlationId, { nodeId, sessionId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProfilingReportRequest(String(nodeId), String(sessionId));
+    const body = requests.encodeProfilingReportRequest(String(nodeId), String(sessionId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3263,7 +3178,7 @@ export const encode = {
   /** MessageBody::ProfilingBody(ProfilingPayload::DeleteRequest). */
   profilingDeleteRequest(correlationId, { nodeId, sessionId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProfilingDeleteRequest(String(nodeId), String(sessionId));
+    const body = requests.encodeProfilingDeleteRequest(String(nodeId), String(sessionId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3275,7 +3190,7 @@ export const encode = {
   /** MessageBody::ProfilingBody(ProfilingPayload::DownloadRequest). */
   profilingDownloadRequest(correlationId, { nodeId, sessionId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProfilingDownloadRequest(String(nodeId), String(sessionId));
+    const body = requests.encodeProfilingDownloadRequest(String(nodeId), String(sessionId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3287,7 +3202,7 @@ export const encode = {
   /** MessageBody::ProfilingBody(ProfilingPayload::ActiveInfoRequest). */
   profilingActiveInfoRequest(correlationId, { nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProfilingActiveInfoRequest(String(nodeId));
+    const body = requests.encodeProfilingActiveInfoRequest(String(nodeId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3299,7 +3214,7 @@ export const encode = {
   /** ProfilingPayload::ValidateSudoRequest — sudo password (used once, never logged). */
   profilingValidateSudoRequest(correlationId, { nodeId, password }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProfilingValidateSudoRequest(
+    const body = requests.encodeProfilingValidateSudoRequest(
       String(nodeId ?? ''),
       String(password ?? ''),
     );
@@ -3314,7 +3229,7 @@ export const encode = {
   /** ProfilingPayload::CollectorsStatusRequest — list collectors + binary paths. */
   profilingCollectorsStatusRequest(correlationId, { nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProfilingCollectorsStatusRequest(String(nodeId ?? ''));
+    const body = requests.encodeProfilingCollectorsStatusRequest(String(nodeId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3330,7 +3245,7 @@ export const encode = {
   /** MessageBody::SsoProvidersListRequest (unit). */
   ssoProvidersListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSsoProvidersListRequest();
+    const body = requests.encodeSsoProvidersListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3342,7 +3257,7 @@ export const encode = {
   /** MessageBody::SsoProviderCreateRequest — pelne dane providera. */
   ssoProviderCreateRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSsoProviderCreateRequest(
+    const body = requests.encodeSsoProviderCreateRequest(
       String(payload.name ?? ''),
       String(payload.providerType ?? ''),
       String(payload.clientId ?? ''),
@@ -3362,7 +3277,7 @@ export const encode = {
   /** MessageBody::SsoProviderDeleteRequest { id }. */
   ssoProviderDeleteRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSsoProviderDeleteRequest(Number(payload.id));
+    const body = requests.encodeSsoProviderDeleteRequest(Number(payload.id));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3374,7 +3289,7 @@ export const encode = {
   /** MessageBody::TlsStatusRequest (unit). */
   tlsStatusRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTlsStatusRequest();
+    const body = requests.encodeTlsStatusRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3386,7 +3301,7 @@ export const encode = {
   /** MessageBody::NgcStatusRequest (unit). */
   ngcStatusRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeNgcStatusRequest();
+    const body = requests.encodeNgcStatusRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3402,7 +3317,7 @@ export const encode = {
   /** MessageBody::NimCatalogListRequest (unit). */
   nimCatalogListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeNimCatalogListRequest();
+    const body = requests.encodeNimCatalogListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3417,7 +3332,7 @@ export const encode = {
    */
   serviceManifestDeployRequest(correlationId, payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServiceManifestDeployRequest(
+    const body = requests.encodeServiceManifestDeployRequest(
       String(payload.engineId ?? ''),
       String(payload.deployMethod ?? ''),
       String(payload.nodeId ?? ''),
@@ -3434,7 +3349,7 @@ export const encode = {
   /** MessageBody::AddonsListRequest (unit) — lista zainstalowanych addonow. */
   addonsListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonsListRequest();
+    const body = requests.encodeAddonsListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3447,7 +3362,7 @@ export const encode = {
    *  przefiltrowana lista aplikacji (native + WASM) dla launchera i sidebara. */
   appsListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAppsListRequest();
+    const body = requests.encodeAppsListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3459,7 +3374,7 @@ export const encode = {
   /** MessageBody::AddonInstanceBody(ReqCatalogList) — lista pakietow w katalogu. */
   addonCatalogListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonCatalogListRequest();
+    const body = requests.encodeAddonCatalogListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3475,7 +3390,7 @@ export const encode = {
     sequence = 1,
   ) {
     assertReady();
-    const body = _wasm.encodeAddonInstanceInstallRequest(packageId, version, displayName, config);
+    const body = requests.encodeAddonInstanceInstallRequest(packageId, version, displayName, config);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3491,7 +3406,7 @@ export const encode = {
     sequence = 1,
   ) {
     assertReady();
-    const body = _wasm.encodeAddonInstanceDuplicateRequest(sourceAddonId, newDisplayName);
+    const body = requests.encodeAddonInstanceDuplicateRequest(sourceAddonId, newDisplayName);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3508,7 +3423,7 @@ export const encode = {
     sequence = 1,
   ) {
     assertReady();
-    const body = _wasm.encodeAddonInstanceInstallStepRequest(addonId, stepId, values);
+    const body = requests.encodeAddonInstanceInstallStepRequest(addonId, stepId, values);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3520,7 +3435,7 @@ export const encode = {
   /** MessageBody::AddonInstanceBody(ReqVersions) — wersje dostepne dla instancji. */
   addonInstanceVersionsRequest(correlationId, { addonId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonInstanceVersionsRequest(addonId);
+    const body = requests.encodeAddonInstanceVersionsRequest(addonId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3532,7 +3447,7 @@ export const encode = {
   /** MessageBody::AddonInstanceBody(ReqUpdate) — hot-update instancji do wersji. */
   addonInstanceUpdateRequest(correlationId, { addonId, targetVersion }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonInstanceUpdateRequest(addonId, targetVersion);
+    const body = requests.encodeAddonInstanceUpdateRequest(addonId, targetVersion);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3544,7 +3459,7 @@ export const encode = {
   /** MessageBody::AddonStorageBody(StatsRequest) — statystyki storage addona. */
   addonStorageStatsRequest(correlationId, { addonId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonStorageStatsRequest(addonId);
+    const body = requests.encodeAddonStorageStatsRequest(addonId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3556,7 +3471,7 @@ export const encode = {
   /** MessageBody::AddonVectorBody(GetConfigRequest) — config vector backendu. */
   addonVectorGetConfigRequest(correlationId, { addonId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonVectorGetConfigRequest(addonId);
+    const body = requests.encodeAddonVectorGetConfigRequest(addonId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3582,7 +3497,7 @@ export const encode = {
     sequence = 1,
   ) {
     assertReady();
-    const body = _wasm.encodeAddonVectorSetConfigRequest(
+    const body = requests.encodeAddonVectorSetConfigRequest(
       addonId,
       backend,
       milvusSource ?? undefined,
@@ -3605,7 +3520,7 @@ export const encode = {
   /** MessageBody::UsersListRequest (unit, Admin) — lista uzytkownikow. */
   usersListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeUsersListRequest();
+    const body = requests.encodeUsersListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3621,7 +3536,7 @@ export const encode = {
    */
   auditLogListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAuditLogListRequest(
+    const body = requests.encodeAuditLogListRequest(
       payload.userId == null ? null : String(payload.userId),
       payload.addonId ?? null,
       payload.action ?? null,
@@ -3641,7 +3556,7 @@ export const encode = {
 
   schedulerJobsListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSchedulerJobsListRequest();
+    const body = requests.encodeSchedulerJobsListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3652,7 +3567,7 @@ export const encode = {
 
   schedulerActionsListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSchedulerActionsListRequest();
+    const body = requests.encodeSchedulerActionsListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3663,7 +3578,7 @@ export const encode = {
 
   schedulerRunsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSchedulerRunsListRequest(
+    const body = requests.encodeSchedulerRunsListRequest(
       String(payload.jobId ?? payload.job_id ?? ''),
       Number(payload.limit ?? 20) >>> 0,
     );
@@ -3677,7 +3592,7 @@ export const encode = {
 
   schedulerJobUpsertRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSchedulerJobUpsertRequest(
+    const body = requests.encodeSchedulerJobUpsertRequest(
       typeof payload.jobJson === 'string' ? payload.jobJson : JSON.stringify(payload.job ?? payload),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -3690,7 +3605,7 @@ export const encode = {
 
   schedulerJobDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSchedulerJobDeleteRequest(String(payload.jobId ?? payload.job_id ?? ''));
+    const body = requests.encodeSchedulerJobDeleteRequest(String(payload.jobId ?? payload.job_id ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3701,7 +3616,7 @@ export const encode = {
 
   schedulerJobRunNowRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSchedulerJobRunNowRequest(String(payload.jobId ?? payload.job_id ?? ''));
+    const body = requests.encodeSchedulerJobRunNowRequest(String(payload.jobId ?? payload.job_id ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3713,7 +3628,7 @@ export const encode = {
   /** MessageBody::TokenUsageBody(UsageSummaryRequest) — agregat zuzycia tokenow. */
   tokenUsageSummaryRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTokenUsageSummaryRequest(
+    const body = requests.encodeTokenUsageSummaryRequest(
       String(payload.period ?? 'daily'),
       String(payload.periodKey ?? payload.period_key ?? ''),
       String(payload.groupBy ?? payload.group_by ?? 'user'),
@@ -3729,7 +3644,7 @@ export const encode = {
   /** MessageBody::TokenUsageBody(ListQuotasRequest) — lista limitow org. */
   tokenListQuotasRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTokenListQuotasRequest();
+    const body = requests.encodeTokenListQuotasRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3742,7 +3657,7 @@ export const encode = {
   tokenUpsertQuotaRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const quota = payload.quota ?? payload;
-    const body = _wasm.encodeTokenUpsertQuotaRequest(
+    const body = requests.encodeTokenUpsertQuotaRequest(
       quota.id ?? null,
       String(quota.scopeType ?? quota.scope_type ?? ''),
       quota.subjectId ?? quota.subject_id ?? null,
@@ -3762,7 +3677,7 @@ export const encode = {
   /** MessageBody::TokenUsageBody(DeleteQuotaRequest) — usun limit po id. */
   tokenDeleteQuotaRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTokenDeleteQuotaRequest(String(payload.id ?? ''));
+    const body = requests.encodeTokenDeleteQuotaRequest(String(payload.id ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3774,7 +3689,7 @@ export const encode = {
   /** MessageBody::TokenUsageBody(CoordinatorStatusRequest) — status koordynatora. */
   tokenCoordinatorStatusRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTokenCoordinatorStatusRequest();
+    const body = requests.encodeTokenCoordinatorStatusRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3790,7 +3705,7 @@ export const encode = {
       const s = v == null ? '' : String(v);
       return s === '' ? undefined : s;
     };
-    const body = _wasm.encodeModelMetricsSummaryRequest(
+    const body = requests.encodeModelMetricsSummaryRequest(
       String(payload.period ?? 'daily'),
       String(payload.periodKey ?? payload.period_key ?? ''),
       String(payload.groupBy ?? payload.group_by ?? 'user'),
@@ -3814,7 +3729,7 @@ export const encode = {
   /** MessageBody::ModelMetricsBody(NodeServiceRequest) — przekrój węzeł×serwis. */
   modelMetricsNodeServiceRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelMetricsNodeServiceRequest(
+    const body = requests.encodeModelMetricsNodeServiceRequest(
       String(payload.period ?? 'daily'),
       String(payload.periodKey ?? payload.period_key ?? ''),
     );
@@ -3829,7 +3744,7 @@ export const encode = {
   /** MessageBody::ModelMetricsBody(PricingGet) — odczyt cennika per-model. */
   modelMetricsPricingGet(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelMetricsPricingGet();
+    const body = requests.encodeModelMetricsPricingGet();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -3841,7 +3756,7 @@ export const encode = {
   /** MessageBody::ModelMetricsBody(PricingSet) — zapis cennika jednego modelu. */
   modelMetricsPricingSet(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeModelMetricsPricingSet(
+    const body = requests.encodeModelMetricsPricingSet(
       String(payload.modelId ?? payload.model_id ?? ''),
       Number(payload.promptPer1k ?? payload.prompt_per_1k ?? 0),
       Number(payload.completionPer1k ?? payload.completion_per_1k ?? 0),
@@ -3860,14 +3775,14 @@ export const encode = {
   /** MessageBody::BenchmarkBody(ListRequest) — Benchmark Studio overview. */
   benchmarkListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBenchmarkListRequest();
+    const body = requests.encodeBenchmarkListRequest();
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::BenchmarkBody(GetRequest) — full definition for the editor. payload: { id }. */
   benchmarkGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBenchmarkGetRequest(String(payload.id ?? ''));
+    const body = requests.encodeBenchmarkGetRequest(String(payload.id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -3876,7 +3791,7 @@ export const encode = {
     assertReady();
     const id = payload.id == null || payload.id === '' ? undefined : String(payload.id);
     const targets = Array.isArray(payload.targets) ? payload.targets : [];
-    const body = _wasm.encodeBenchmarkSaveRequest(
+    const body = requests.encodeBenchmarkSaveRequest(
       id,
       String(payload.name ?? ''),
       String(payload.configJson ?? payload.config_json ?? '{}'),
@@ -3888,56 +3803,56 @@ export const encode = {
   /** MessageBody::BenchmarkBody(DeleteRequest). payload: { id }. */
   benchmarkDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBenchmarkDeleteRequest(String(payload.id ?? ''));
+    const body = requests.encodeBenchmarkDeleteRequest(String(payload.id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::BenchmarkBody(StartRunRequest) — non-blocking, returns runId. payload: { benchmarkId }. */
   benchmarkStartRunRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBenchmarkStartRunRequest(String(payload.benchmarkId ?? payload.benchmark_id ?? ''));
+    const body = requests.encodeBenchmarkStartRunRequest(String(payload.benchmarkId ?? payload.benchmark_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::BenchmarkBody(RunStatusRequest). payload: { runId }. */
   benchmarkRunStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBenchmarkRunStatusRequest(String(payload.runId ?? payload.run_id ?? ''));
+    const body = requests.encodeBenchmarkRunStatusRequest(String(payload.runId ?? payload.run_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::BenchmarkBody(RunResultsRequest). payload: { runId }. */
   benchmarkRunResultsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBenchmarkRunResultsRequest(String(payload.runId ?? payload.run_id ?? ''));
+    const body = requests.encodeBenchmarkRunResultsRequest(String(payload.runId ?? payload.run_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::BenchmarkBody(ListRunsRequest) — run history for one benchmark. payload: { benchmarkId }. */
   benchmarkListRunsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBenchmarkListRunsRequest(String(payload.benchmarkId ?? payload.benchmark_id ?? ''));
+    const body = requests.encodeBenchmarkListRunsRequest(String(payload.benchmarkId ?? payload.benchmark_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::BenchmarkBody(RecentRunsRequest) — newest runs across all benchmarks. */
   benchmarkRecentRunsRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBenchmarkRecentRunsRequest();
+    const body = requests.encodeBenchmarkRecentRunsRequest();
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::BenchmarkBody(CancelRunRequest). payload: { runId }. */
   benchmarkCancelRunRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBenchmarkCancelRunRequest(String(payload.runId ?? payload.run_id ?? ''));
+    const body = requests.encodeBenchmarkCancelRunRequest(String(payload.runId ?? payload.run_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** Subscribe — live run progress. payload: { runId }. Chunks = BenchmarkRunStreamChunk. */
   benchmarkRunStreamRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBenchmarkRunStreamRequest(String(payload.runId ?? payload.run_id ?? ''));
+    const body = requests.encodeBenchmarkRunStreamRequest(String(payload.runId ?? payload.run_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -3976,7 +3891,7 @@ export const encode = {
    */
   busTopicListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusTopicListRequest(encode._busInstanceId(payload));
+    const body = requests.encodeBusTopicListRequest(encode._busInstanceId(payload));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -3998,7 +3913,7 @@ export const encode = {
    */
   busTopicCreateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusTopicCreateRequest(
+    const body = requests.encodeBusTopicCreateRequest(
       encode._busInstanceId(payload),
       String(payload.name ?? ''),
       JSON.stringify(camelToSnakePayload(payload.options ?? {})),
@@ -4048,7 +3963,7 @@ export const encode = {
    */
   busTopicUpdateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusTopicUpdateRequest(
+    const body = requests.encodeBusTopicUpdateRequest(
       encode._busInstanceId(payload),
       String(payload.name ?? ''),
       JSON.stringify(camelToSnakePayload(payload.options ?? {})),
@@ -4059,42 +3974,42 @@ export const encode = {
   /** BusPayload::TopicDeleteRequest. payload: { instanceId, name }. */
   busTopicDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusTopicDeleteRequest(encode._busInstanceId(payload), String(payload.name ?? ''));
+    const body = requests.encodeBusTopicDeleteRequest(encode._busInstanceId(payload), String(payload.name ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** BusPayload::TopicDetailRequest — config + partitions + group lag summary (M03). payload: { instanceId, name }. */
   busTopicDetailRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusTopicDetailRequest(encode._busInstanceId(payload), String(payload.name ?? ''));
+    const body = requests.encodeBusTopicDetailRequest(encode._busInstanceId(payload), String(payload.name ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** BusPayload::GroupListRequest — consumer groups list (M04). payload: { instanceId }. */
   busGroupListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusGroupListRequest(encode._busInstanceId(payload));
+    const body = requests.encodeBusGroupListRequest(encode._busInstanceId(payload));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** BusPayload::GroupDetailRequest — per-partition committed/lag (M04). payload: { instanceId, group, topic }. */
   busGroupDetailRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusGroupDetailRequest(encode._busInstanceId(payload), String(payload.group ?? ''), String(payload.topic ?? ''));
+    const body = requests.encodeBusGroupDetailRequest(encode._busInstanceId(payload), String(payload.group ?? ''), String(payload.topic ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** BusPayload::GroupPauseRequest. payload: { instanceId, group, topic }. */
   busGroupPauseRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusGroupPauseRequest(encode._busInstanceId(payload), String(payload.group ?? ''), String(payload.topic ?? ''));
+    const body = requests.encodeBusGroupPauseRequest(encode._busInstanceId(payload), String(payload.group ?? ''), String(payload.topic ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** BusPayload::GroupResumeRequest. payload: { instanceId, group, topic }. */
   busGroupResumeRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusGroupResumeRequest(encode._busInstanceId(payload), String(payload.group ?? ''), String(payload.topic ?? ''));
+    const body = requests.encodeBusGroupResumeRequest(encode._busInstanceId(payload), String(payload.group ?? ''), String(payload.topic ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -4108,7 +4023,7 @@ export const encode = {
     assertReady();
     const offset = payload.offset == null ? undefined : BigInt(payload.offset);
     const tsMs = (payload.tsMs ?? payload.ts_ms) == null ? undefined : BigInt(payload.tsMs ?? payload.ts_ms);
-    const body = _wasm.encodeBusOffsetResetRequest(
+    const body = requests.encodeBusOffsetResetRequest(
       encode._busInstanceId(payload),
       String(payload.group ?? ''),
       String(payload.topic ?? ''),
@@ -4129,7 +4044,7 @@ export const encode = {
    */
   busOffsetForTimestampRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusOffsetForTimestampRequest(
+    const body = requests.encodeBusOffsetForTimestampRequest(
       encode._busInstanceId(payload),
       String(payload.topic ?? ''),
       Number(payload.partition ?? 0),
@@ -4151,7 +4066,7 @@ export const encode = {
     assertReady();
     const fromOffset = payload.fromOffset ?? payload.from_offset;
     const fromOffsets = payload.fromOffsets ?? payload.from_offsets;
-    const body = _wasm.encodeBusMessagesBrowseRequest(
+    const body = requests.encodeBusMessagesBrowseRequest(
       encode._busInstanceId(payload),
       String(payload.topic ?? ''),
       fromOffset == null ? undefined : BigInt(fromOffset),
@@ -4176,7 +4091,7 @@ export const encode = {
     const fromOffset = payload.fromOffset ?? payload.from_offset;
     const fromOffsets = payload.fromOffsets ?? payload.from_offsets;
     const newestFirst = payload.newestFirst ?? payload.newest_first;
-    const body = _wasm.encodeBusDlqListRequest(
+    const body = requests.encodeBusDlqListRequest(
       encode._busInstanceId(payload),
       String(payload.sourceTopic ?? payload.source_topic ?? ''),
       fromOffset == null ? undefined : BigInt(fromOffset),
@@ -4191,7 +4106,7 @@ export const encode = {
   /** BusPayload::DlqRetryRequest ("Ponów", M05). payload: { sourceTopic, partition, offset }. */
   busDlqRetryRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusDlqRetryRequest(
+    const body = requests.encodeBusDlqRetryRequest(
       encode._busInstanceId(payload),
       String(payload.sourceTopic ?? payload.source_topic ?? ''),
       Number(payload.partition ?? 0),
@@ -4203,7 +4118,7 @@ export const encode = {
   /** BusPayload::DlqDiscardRequest ("Odrzuć", M05). payload: { sourceTopic, partition, offset }. */
   busDlqDiscardRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusDlqDiscardRequest(
+    const body = requests.encodeBusDlqDiscardRequest(
       encode._busInstanceId(payload),
       String(payload.sourceTopic ?? payload.source_topic ?? ''),
       Number(payload.partition ?? 0),
@@ -4215,7 +4130,7 @@ export const encode = {
   /** BusPayload::DlqRetryAllRequest ("Ponów wszystkie", M05, bounded batch). payload: { sourceTopic, maxRecords }. */
   busDlqRetryAllRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusDlqRetryAllRequest(
+    const body = requests.encodeBusDlqRetryAllRequest(
       encode._busInstanceId(payload),
       String(payload.sourceTopic ?? payload.source_topic ?? ''),
       Number(payload.maxRecords ?? payload.max_records ?? 100),
@@ -4226,7 +4141,7 @@ export const encode = {
   /** BusPayload::AclListRequest (a topic's Dostęp section). payload: { instanceId, topic }. */
   busAclListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusAclListRequest(encode._busInstanceId(payload), String(payload.topic ?? ''));
+    const body = requests.encodeBusAclListRequest(encode._busInstanceId(payload), String(payload.topic ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -4237,7 +4152,7 @@ export const encode = {
    */
   busAclSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusAclSetRequest(
+    const body = requests.encodeBusAclSetRequest(
       encode._busInstanceId(payload),
       String(payload.topic ?? ''),
       String(payload.subjectType ?? payload.subject_type ?? 'user'),
@@ -4257,7 +4172,7 @@ export const encode = {
    */
   busStatsSnapshotRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusStatsSnapshotRequest(encode._busInstanceId(payload));
+    const body = requests.encodeBusStatsSnapshotRequest(encode._busInstanceId(payload));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -4268,7 +4183,7 @@ export const encode = {
   busLagHistoryRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const sinceMs = payload.sinceMs ?? payload.since_ms;
-    const body = _wasm.encodeBusLagHistoryRequest(
+    const body = requests.encodeBusLagHistoryRequest(
       encode._busInstanceId(payload),
       payload.topic == null ? undefined : String(payload.topic),
       payload.group == null ? undefined : String(payload.group),
@@ -4280,7 +4195,7 @@ export const encode = {
   /** BusPayload::QuotaGetRequest (Admin, per org). payload: { instanceId }. */
   busQuotaGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusQuotaGetRequest(encode._busInstanceId(payload));
+    const body = requests.encodeBusQuotaGetRequest(encode._busInstanceId(payload));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -4293,7 +4208,7 @@ export const encode = {
   busQuotaSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const maxGroups = payload.maxGroups ?? payload.max_groups;
-    const body = _wasm.encodeBusQuotaSetRequest(
+    const body = requests.encodeBusQuotaSetRequest(
       encode._busInstanceId(payload),
       Number(payload.maxTopics ?? payload.max_topics ?? 100),
       Number(payload.maxPartitions ?? payload.max_partitions ?? 1024),
@@ -4312,7 +4227,7 @@ export const encode = {
    */
   busCapabilitiesRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusCapabilitiesRequest(encode._busInstanceId(payload));
+    const body = requests.encodeBusCapabilitiesRequest(encode._busInstanceId(payload));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -4325,7 +4240,7 @@ export const encode = {
    */
   busReplicaListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusReplicaListRequest(
+    const body = requests.encodeBusReplicaListRequest(
       encode._busInstanceId(payload),
       payload.topic == null ? undefined : String(payload.topic),
     );
@@ -4338,7 +4253,7 @@ export const encode = {
    */
   busLeaderTransferRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusLeaderTransferRequest(
+    const body = requests.encodeBusLeaderTransferRequest(
       encode._busInstanceId(payload),
       String(payload.topic ?? ''),
       Number(payload.partition ?? 0),
@@ -4352,7 +4267,7 @@ export const encode = {
   /** BusPayload::FieldPolicyListRequest — every field policy configured on `topic`. payload: { instanceId, topic }. */
   busFieldPolicyListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusFieldPolicyListRequest(encode._busInstanceId(payload), String(payload.topic ?? ''));
+    const body = requests.encodeBusFieldPolicyListRequest(encode._busInstanceId(payload), String(payload.topic ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -4366,7 +4281,7 @@ export const encode = {
    */
   busFieldPolicySetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusFieldPolicySetRequest(
+    const body = requests.encodeBusFieldPolicySetRequest(
       encode._busInstanceId(payload),
       String(payload.topic ?? ''),
       String(payload.subjectType ?? payload.subject_type ?? 'user'),
@@ -4383,7 +4298,7 @@ export const encode = {
   /** BusPayload::FieldPolicyDeleteRequest. payload: { topic, subjectType, subjectId, direction: 'write'|'read', expectedUpdatedAtMs? } (the rule's updated_at_ms the delete is based on). */
   busFieldPolicyDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusFieldPolicyDeleteRequest(
+    const body = requests.encodeBusFieldPolicyDeleteRequest(
       encode._busInstanceId(payload),
       String(payload.topic ?? ''),
       String(payload.subjectType ?? payload.subject_type ?? 'user'),
@@ -4403,7 +4318,7 @@ export const encode = {
    */
   busSubjectDirectoryRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusSubjectDirectoryRequest(
+    const body = requests.encodeBusSubjectDirectoryRequest(
       encode._busInstanceId(payload),
       String(payload.kind ?? 'user'),
       String(payload.query ?? ''),
@@ -4421,7 +4336,7 @@ export const encode = {
    */
   busFieldPolicyPreviewRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusFieldPolicyPreviewRequest(
+    const body = requests.encodeBusFieldPolicyPreviewRequest(
       encode._busInstanceId(payload),
       String(payload.topic ?? ''),
       Number(payload.partition ?? 0),
@@ -4437,21 +4352,21 @@ export const encode = {
   /** BusPayload::SchemaSubjectListRequest — every schema subject registered in the caller's org. payload: { instanceId }. */
   busSchemaSubjectListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusSchemaSubjectListRequest(encode._busInstanceId(payload));
+    const body = requests.encodeBusSchemaSubjectListRequest(encode._busInstanceId(payload));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** BusPayload::SchemaVersionListRequest — every immutable version registered under `subject`. payload: { instanceId, subject }. */
   busSchemaVersionListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusSchemaVersionListRequest(encode._busInstanceId(payload), String(payload.subject ?? ''));
+    const body = requests.encodeBusSchemaVersionListRequest(encode._busInstanceId(payload), String(payload.subject ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** BusPayload::SchemaGetRequest. payload: { subject, version? }. `version` omitted/null resolves to `subject`'s latest version. */
   busSchemaGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusSchemaGetRequest(
+    const body = requests.encodeBusSchemaGetRequest(
       encode._busInstanceId(payload),
       String(payload.subject ?? ''),
       payload.version == null ? undefined : Number(payload.version),
@@ -4466,7 +4381,7 @@ export const encode = {
    */
   busSchemaDerivedGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusSchemaDerivedGetRequest(
+    const body = requests.encodeBusSchemaDerivedGetRequest(
       encode._busInstanceId(payload),
       String(payload.subject ?? ''),
       payload.version == null ? undefined : Number(payload.version),
@@ -4487,7 +4402,7 @@ export const encode = {
   busSchemaRegisterRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const compatibility = payload.compatibility;
-    const body = _wasm.encodeBusSchemaRegisterRequest(
+    const body = requests.encodeBusSchemaRegisterRequest(
       encode._busInstanceId(payload),
       String(payload.subject ?? ''),
       String(payload.schemaType ?? payload.schema_type ?? 'json_schema'),
@@ -4500,7 +4415,7 @@ export const encode = {
   /** BusPayload::SchemaCompatibilitySetRequest. payload: { subject, compatibility: 'none'|'backward'|'forward'|'full' }. */
   busSchemaCompatibilitySetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusSchemaCompatibilitySetRequest(
+    const body = requests.encodeBusSchemaCompatibilitySetRequest(
       encode._busInstanceId(payload),
       String(payload.subject ?? ''),
       String(payload.compatibility ?? 'none'),
@@ -4515,7 +4430,7 @@ export const encode = {
    */
   busSchemaDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeBusSchemaDeleteRequest(
+    const body = requests.encodeBusSchemaDeleteRequest(
       encode._busInstanceId(payload),
       String(payload.subject ?? ''),
       payload.version == null ? undefined : Number(payload.version),
@@ -4527,7 +4442,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(ProjectsListRequest) — ML Studio projects list. */
   mlStudioProjectsListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioProjectsListRequest();
+    const body = requests.encodeMlStudioProjectsListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -4539,7 +4454,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(ProjectTypesListRequest) — six fixed project types. */
   mlStudioProjectTypesListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioProjectTypesListRequest();
+    const body = requests.encodeMlStudioProjectTypesListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -4551,7 +4466,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(ProjectCreateRequest). payload: { name, description, projectType }. */
   mlStudioProjectCreateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioProjectCreateRequest(
+    const body = requests.encodeMlStudioProjectCreateRequest(
       String(payload.name ?? ''),
       String(payload.description ?? ''),
       String(payload.projectType ?? payload.project_type ?? ''),
@@ -4567,7 +4482,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(ProjectDetailRequest). payload: { projectId }. */
   mlStudioProjectDetailRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioProjectDetailRequest(
+    const body = requests.encodeMlStudioProjectDetailRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -4581,7 +4496,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(ProjectMembersListRequest). payload: { projectId }. */
   mlStudioProjectMembersListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioProjectMembersListRequest(
+    const body = requests.encodeMlStudioProjectMembersListRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -4595,7 +4510,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(ProjectInviteRequest). payload: { projectId, inviteeUserId, role }. */
   mlStudioProjectInviteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioProjectInviteRequest(
+    const body = requests.encodeMlStudioProjectInviteRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.inviteeUserId ?? payload.invitee_user_id ?? ''),
       String(payload.role ?? ''),
@@ -4611,7 +4526,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(ProjectMemberRemoveRequest). payload: { projectId, userId }. */
   mlStudioProjectMemberRemoveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioProjectMemberRemoveRequest(
+    const body = requests.encodeMlStudioProjectMemberRemoveRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.userId ?? payload.user_id ?? ''),
     );
@@ -4626,7 +4541,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(ProjectMemberRoleSetRequest). payload: { projectId, userId, role }. */
   mlStudioProjectMemberRoleSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioProjectMemberRoleSetRequest(
+    const body = requests.encodeMlStudioProjectMemberRoleSetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.userId ?? payload.user_id ?? ''),
       String(payload.role ?? ''),
@@ -4649,7 +4564,7 @@ export const encode = {
     assertReady();
     const raw = payload.bytes;
     const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw ?? []);
-    const body = _wasm.encodeMlStudioDatasetUploadRequest(
+    const body = requests.encodeMlStudioDatasetUploadRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.name ?? ''),
       String(payload.filename ?? ''),
@@ -4673,7 +4588,7 @@ export const encode = {
     assertReady();
     const raw = payload.bytes;
     const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw ?? []);
-    const body = _wasm.encodeMlStudioDatasetUploadChunkRequest(
+    const body = requests.encodeMlStudioDatasetUploadChunkRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.name ?? ''),
       String(payload.filename ?? ''),
@@ -4701,7 +4616,7 @@ export const encode = {
     assertReady();
     const raw = payload.bytes;
     const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw ?? []);
-    const body = _wasm.encodeAddonDocumentUploadChunkRequest(
+    const body = requests.encodeAddonDocumentUploadChunkRequest(
       String(payload.addonId ?? payload.addon_id ?? ''),
       String(payload.uploadId ?? payload.upload_id ?? ''),
       String(payload.filename ?? ''),
@@ -4722,7 +4637,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(DatasetsListRequest). payload: { projectId }. */
   mlStudioDatasetsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioDatasetsListRequest(
+    const body = requests.encodeMlStudioDatasetsListRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -4736,7 +4651,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(DatasetProfileRequest). payload: { datasetId }. */
   mlStudioDatasetProfileRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioDatasetProfileRequest(
+    const body = requests.encodeMlStudioDatasetProfileRequest(
       String(payload.datasetId ?? payload.dataset_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -4753,7 +4668,7 @@ export const encode = {
    */
   mlStudioDatasetRowsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioDatasetRowsRequest(
+    const body = requests.encodeMlStudioDatasetRowsRequest(
       String(payload.datasetId ?? payload.dataset_id ?? ''),
       (payload.limit ?? 0) >>> 0,
     );
@@ -4772,7 +4687,7 @@ export const encode = {
   mlStudioDatasetRowsSaveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const rows = Array.isArray(payload.rows) ? payload.rows.map((r) => String(r)) : [];
-    const body = _wasm.encodeMlStudioDatasetRowsSaveRequest(
+    const body = requests.encodeMlStudioDatasetRowsSaveRequest(
       String(payload.datasetId ?? payload.dataset_id ?? ''),
       rows,
     );
@@ -4794,7 +4709,7 @@ export const encode = {
     // engine wybiera silnik treningu (rust domyślny / autogluon przez serwis);
     // pusty string gdy nie podano — backend potraktuje to jak silnik rust.
     const engine = payload.engine ?? payload.engine_id ?? '';
-    const body = _wasm.encodeMlStudioTabularTrainRequest(
+    const body = requests.encodeMlStudioTabularTrainRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.datasetId ?? payload.dataset_id ?? ''),
       String(payload.targetColumn ?? payload.target_column ?? ''),
@@ -4818,7 +4733,7 @@ export const encode = {
    */
   mlStudioResourceGrantCreateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioResourceGrantCreateRequest(
+    const body = requests.encodeMlStudioResourceGrantCreateRequest(
       String(payload.subjectKind ?? payload.subject_kind ?? ''),
       String(payload.subjectId ?? payload.subject_id ?? ''),
       String(payload.nodeId ?? payload.node_id ?? ''),
@@ -4837,7 +4752,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(ResourceGrantsListRequest) — Admin: all grants. */
   mlStudioResourceGrantsListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioResourceGrantsListRequest();
+    const body = requests.encodeMlStudioResourceGrantsListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -4849,7 +4764,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(ResourceGrantRevokeRequest). payload: { grantId }. */
   mlStudioResourceGrantRevokeRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioResourceGrantRevokeRequest(
+    const body = requests.encodeMlStudioResourceGrantRevokeRequest(
       String(payload.grantId ?? payload.grant_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -4866,7 +4781,7 @@ export const encode = {
    */
   mlStudioProjectResourcesRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioProjectResourcesRequest(
+    const body = requests.encodeMlStudioProjectResourcesRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -4883,7 +4798,7 @@ export const encode = {
    */
   mlStudioModelsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioModelsListRequest(
+    const body = requests.encodeMlStudioModelsListRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -4900,7 +4815,7 @@ export const encode = {
    */
   mlStudioTrainingRunsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioTrainingRunsListRequest(
+    const body = requests.encodeMlStudioTrainingRunsListRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -4917,7 +4832,7 @@ export const encode = {
    */
   mlStudioProjectGrantsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioProjectGrantsListRequest(
+    const body = requests.encodeMlStudioProjectGrantsListRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -4940,7 +4855,7 @@ export const encode = {
   mlStudioFtTrainStartRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const hp = payload.hyperparams ?? {};
-    const body = _wasm.encodeMlStudioFtTrainStartRequest(
+    const body = requests.encodeMlStudioFtTrainStartRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.datasetId ?? payload.dataset_id ?? ''),
       String(payload.baseModel ?? payload.base_model ?? ''),
@@ -4980,7 +4895,7 @@ export const encode = {
    */
   mlStudioDistillGenerateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioDistillGenerateRequest(
+    const body = requests.encodeMlStudioDistillGenerateRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.datasetName ?? payload.dataset_name ?? ''),
       String(payload.questionSource ?? payload.question_source ?? 'generate'),
@@ -5011,7 +4926,7 @@ export const encode = {
    */
   mlStudioDistillGenerateStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioDistillGenerateStatusRequest(
+    const body = requests.encodeMlStudioDistillGenerateStatusRequest(
       String(payload.datasetId ?? payload.dataset_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -5029,7 +4944,7 @@ export const encode = {
    */
   mlStudioFtTrainStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioFtTrainStatusRequest(
+    const body = requests.encodeMlStudioFtTrainStatusRequest(
       String(payload.runId ?? payload.run_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -5049,7 +4964,7 @@ export const encode = {
   mlStudioRecogTrainStartRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const hp = payload.hyperparams ?? {};
-    const body = _wasm.encodeMlStudioRecogTrainStartRequest(
+    const body = requests.encodeMlStudioRecogTrainStartRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.datasetId ?? payload.dataset_id ?? ''),
       String(payload.variant ?? 'base'),
@@ -5076,7 +4991,7 @@ export const encode = {
    */
   mlStudioRecogTrainStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioRecogTrainStatusRequest(
+    const body = requests.encodeMlStudioRecogTrainStatusRequest(
       String(payload.runId ?? payload.run_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -5100,7 +5015,7 @@ export const encode = {
   mlStudioOcrTrainStartRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const hp = payload.hyperparams ?? {};
-    const body = _wasm.encodeMlStudioOcrTrainStartRequest(
+    const body = requests.encodeMlStudioOcrTrainStartRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.datasetId ?? payload.dataset_id ?? ''),
       String(payload.attribute ?? ''),
@@ -5126,7 +5041,7 @@ export const encode = {
    */
   mlStudioTrainCancelRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioTrainCancelRequest(
+    const body = requests.encodeMlStudioTrainCancelRequest(
       String(payload.runId ?? payload.run_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -5150,7 +5065,7 @@ export const encode = {
     assertReady();
     const hp = payload.hyperparams ?? {};
     const values = (payload.values ?? []).map((v) => String(v));
-    const body = _wasm.encodeMlStudioClassifierTrainStartRequest(
+    const body = requests.encodeMlStudioClassifierTrainStartRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.datasetId ?? payload.dataset_id ?? ''),
       String(payload.attribute ?? ''),
@@ -5175,7 +5090,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(JobsOverviewRequest) (puste ciało). */
   mlStudioJobsOverviewRequest(correlationId, _payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioJobsOverviewRequest();
+    const body = requests.encodeMlStudioJobsOverviewRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -5191,7 +5106,7 @@ export const encode = {
    */
   mlStudioGenericTrainStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioGenericTrainStatusRequest(
+    const body = requests.encodeMlStudioGenericTrainStatusRequest(
       String(payload.runId ?? payload.run_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -5209,7 +5124,7 @@ export const encode = {
    */
   mlStudioRecogDetectRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioRecogDetectRequest(
+    const body = requests.encodeMlStudioRecogDetectRequest(
       String(payload.modelId ?? payload.model_id ?? ''),
       Number(payload.threshold ?? 0.5),
       String(payload.imageB64 ?? payload.image_b64 ?? ''),
@@ -5226,7 +5141,7 @@ export const encode = {
    * anotacji. payload: { datasetId }. Zwraca imagesJson + categoriesJson. */
   mlStudioRecogImagesListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioRecogImagesListRequest(
+    const body = requests.encodeMlStudioRecogImagesListRequest(
       String(payload.datasetId ?? payload.dataset_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -5236,7 +5151,7 @@ export const encode = {
    * payload: { datasetId, imageId }. */
   mlStudioRecogImageRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioRecogImageRequest(
+    const body = requests.encodeMlStudioRecogImageRequest(
       String(payload.datasetId ?? payload.dataset_id ?? ''),
       String(payload.imageId ?? payload.image_id ?? ''),
     );
@@ -5247,7 +5162,7 @@ export const encode = {
    * payload: { datasetId, imageId, annotationsJson, approve }. */
   mlStudioRecogSaveAnnotationsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioRecogSaveAnnotationsRequest(
+    const body = requests.encodeMlStudioRecogSaveAnnotationsRequest(
       String(payload.datasetId ?? payload.dataset_id ?? ''),
       String(payload.imageId ?? payload.image_id ?? ''),
       String(payload.annotationsJson ?? payload.annotations_json ?? '[]'),
@@ -5260,7 +5175,7 @@ export const encode = {
    * (JSON nieprzezroczysty dla Core). payload: { projectId }. Zwraca schemaJson. */
   mlStudioSchemaGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioSchemaGetRequest(
+    const body = requests.encodeMlStudioSchemaGetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -5270,7 +5185,7 @@ export const encode = {
    * Core zapisuje schemaJson dosłownie. payload: { projectId, schemaJson }. */
   mlStudioSchemaSaveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioSchemaSaveRequest(
+    const body = requests.encodeMlStudioSchemaSaveRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.schemaJson ?? payload.schema_json ?? '{}'),
     );
@@ -5281,7 +5196,7 @@ export const encode = {
    * payload: { projectId }. Zwraca dictsJson (tablica {dictId,name,rowsJson}). */
   mlStudioLookupDictsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioLookupDictsListRequest(
+    const body = requests.encodeMlStudioLookupDictsListRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -5291,7 +5206,7 @@ export const encode = {
    * = INSERT (zwraca nowe id). payload: { projectId, dictId, name, rowsJson }. */
   mlStudioLookupDictSaveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioLookupDictSaveRequest(
+    const body = requests.encodeMlStudioLookupDictSaveRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.dictId ?? payload.dict_id ?? ''),
       String(payload.name ?? ''),
@@ -5304,7 +5219,7 @@ export const encode = {
    * payload: { dictId }. */
   mlStudioLookupDictDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioLookupDictDeleteRequest(
+    const body = requests.encodeMlStudioLookupDictDeleteRequest(
       String(payload.dictId ?? payload.dict_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -5315,7 +5230,7 @@ export const encode = {
    * wszystkie. payload: { capability }. Zwraca modelsJson. */
   mlStudioServiceModelsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioServiceModelsListRequest(
+    const body = requests.encodeMlStudioServiceModelsListRequest(
       String(payload.capability ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -5330,7 +5245,7 @@ export const encode = {
     assertReady();
     const threshold = payload.threshold;
     const alias = payload.alias;
-    const body = _wasm.encodeMlStudioVisionModelPublishRequest(
+    const body = requests.encodeMlStudioVisionModelPublishRequest(
       String(payload.modelId ?? payload.model_id ?? ''),
       String(payload.modelName ?? payload.model_name ?? ''),
       String(payload.op ?? ''),
@@ -5344,7 +5259,7 @@ export const encode = {
    * (dynamiczne ONNX dla pipeline'ów kamer). Zwraca { models: [...] }. */
   mlStudioVisionModelsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioVisionModelsListRequest();
+    const body = requests.encodeMlStudioVisionModelsListRequest();
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -5353,7 +5268,7 @@ export const encode = {
    * apiKey }. Zwraca { bundle, files, model, error }. */
   visionImportFetchManifestRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeVisionImportFetchManifestRequest(
+    const body = requests.encodeVisionImportFetchManifestRequest(
       String(payload.manifestUrl ?? payload.manifest_url ?? ''),
       String(payload.apiKey ?? payload.api_key ?? ''),
     );
@@ -5366,7 +5281,7 @@ export const encode = {
   visionImportModelRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const alias = payload.alias;
-    const body = _wasm.encodeVisionImportModelRequest(
+    const body = requests.encodeVisionImportModelRequest(
       String(payload.manifestUrl ?? payload.manifest_url ?? ''),
       String(payload.apiKey ?? payload.api_key ?? ''),
       String(payload.modelName ?? payload.model_name ?? ''),
@@ -5379,7 +5294,7 @@ export const encode = {
    * payload: { modelName }. Zwraca { ok, error }. */
   mlStudioVisionModelDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioVisionModelDeleteRequest(
+    const body = requests.encodeMlStudioVisionModelDeleteRequest(
       String(payload.modelName ?? payload.model_name ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -5392,7 +5307,7 @@ export const encode = {
    */
   mlStudioRecogDatasetRegisterRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioRecogDatasetRegisterRequest(
+    const body = requests.encodeMlStudioRecogDatasetRegisterRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.name ?? ''),
       String(payload.path ?? ''),
@@ -5412,7 +5327,7 @@ export const encode = {
    */
   mlStudioRecogStageMediaRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioRecogStageMediaRequest(
+    const body = requests.encodeMlStudioRecogStageMediaRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.filename ?? ''),
       String(payload.uploadId ?? payload.upload_id ?? ''),
@@ -5438,7 +5353,7 @@ export const encode = {
   mlStudioRecogBuildDatasetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const sourceDir = payload.sourceDir ?? payload.source_dir ?? '';
-    const body = _wasm.encodeMlStudioRecogBuildDatasetRequest(
+    const body = requests.encodeMlStudioRecogBuildDatasetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.datasetName ?? payload.dataset_name ?? ''),
       Number(payload.fps ?? 5) >>> 0,
@@ -5459,7 +5374,7 @@ export const encode = {
    */
   mlStudioRecogBuildStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioRecogBuildStatusRequest(
+    const body = requests.encodeMlStudioRecogBuildStatusRequest(
       String(payload.buildId ?? payload.build_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -5477,7 +5392,7 @@ export const encode = {
    */
   mlStudioRecogAutolabelRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioRecogAutolabelRequest(
+    const body = requests.encodeMlStudioRecogAutolabelRequest(
       String(payload.datasetId ?? payload.dataset_id ?? ''),
       Number(payload.threshold ?? 0.5),
       String(payload.mode ?? 'only_empty'),
@@ -5497,7 +5412,7 @@ export const encode = {
    */
   mlStudioRecogAutolabelStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioRecogAutolabelStatusRequest(
+    const body = requests.encodeMlStudioRecogAutolabelStatusRequest(
       String(payload.jobId ?? payload.job_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -5516,7 +5431,7 @@ export const encode = {
    */
   mlStudioFtExportRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioFtExportRequest(
+    const body = requests.encodeMlStudioFtExportRequest(
       String(payload.modelId ?? payload.model_id ?? ''),
       String(payload.outtype ?? 'q8_0'),
     );
@@ -5535,7 +5450,7 @@ export const encode = {
    */
   mlStudioFtExportStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioFtExportStatusRequest(
+    const body = requests.encodeMlStudioFtExportStatusRequest(
       String(payload.modelId ?? payload.model_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -5555,7 +5470,7 @@ export const encode = {
    */
   mlStudioFtDeployRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioFtDeployRequest(
+    const body = requests.encodeMlStudioFtDeployRequest(
       String(payload.modelId ?? payload.model_id ?? ''),
       String(payload.targetNodeId ?? payload.target_node_id ?? ''),
     );
@@ -5574,7 +5489,7 @@ export const encode = {
    */
   mlStudioFtChatRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioFtChatRequest(
+    const body = requests.encodeMlStudioFtChatRequest(
       String(payload.modelId ?? payload.model_id ?? ''),
       String(payload.message ?? ''),
       Number(payload.maxTokens ?? payload.max_tokens ?? 256),
@@ -5595,7 +5510,7 @@ export const encode = {
    */
   mlStudioProjectExportStartRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioProjectExportStartRequest(
+    const body = requests.encodeMlStudioProjectExportStartRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       Boolean(payload.includeModels ?? payload.include_models ?? false),
       Boolean(payload.includeHistory ?? payload.include_history ?? false),
@@ -5611,7 +5526,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(ProjectExportStatusRequest). payload: { jobId }. */
   mlStudioProjectExportStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioProjectExportStatusRequest(
+    const body = requests.encodeMlStudioProjectExportStatusRequest(
       String(payload.jobId ?? payload.job_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -5631,7 +5546,7 @@ export const encode = {
     assertReady();
     const raw = payload.bytes;
     const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw ?? []);
-    const body = _wasm.encodeMlStudioProjectImportUploadChunkRequest(
+    const body = requests.encodeMlStudioProjectImportUploadChunkRequest(
       String(payload.uploadId ?? payload.upload_id ?? ''),
       (payload.seq ?? 0) >>> 0,
       (payload.totalChunks ?? payload.total_chunks ?? 0) >>> 0,
@@ -5649,7 +5564,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(ProjectImportUploadStatusRequest). payload: { uploadId }. */
   mlStudioProjectImportUploadStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioProjectImportUploadStatusRequest(
+    const body = requests.encodeMlStudioProjectImportUploadStatusRequest(
       String(payload.uploadId ?? payload.upload_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -5663,7 +5578,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(ProjectImportPreviewRequest). payload: { uploadId }. */
   mlStudioProjectImportPreviewRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioProjectImportPreviewRequest(
+    const body = requests.encodeMlStudioProjectImportPreviewRequest(
       String(payload.uploadId ?? payload.upload_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -5685,7 +5600,7 @@ export const encode = {
     const nameOverride = payload.nameOverride ?? payload.name_override;
     const targetProjectId = payload.targetProjectId ?? payload.target_project_id;
     const targetDatasetId = payload.targetDatasetId ?? payload.target_dataset_id;
-    const body = _wasm.encodeMlStudioProjectImportApplyRequest(
+    const body = requests.encodeMlStudioProjectImportApplyRequest(
       String(payload.uploadId ?? payload.upload_id ?? ''),
       String(payload.mode ?? ''),
       nameOverride != null && nameOverride !== '' ? String(nameOverride) : undefined,
@@ -5703,7 +5618,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(ProjectImportStatusRequest). payload: { jobId }. */
   mlStudioProjectImportStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioProjectImportStatusRequest(
+    const body = requests.encodeMlStudioProjectImportStatusRequest(
       String(payload.jobId ?? payload.job_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -5717,7 +5632,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(ProjectImportCancelRequest). payload: { uploadId }. */
   mlStudioProjectImportCancelRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioProjectImportCancelRequest(
+    const body = requests.encodeMlStudioProjectImportCancelRequest(
       String(payload.uploadId ?? payload.upload_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -5740,7 +5655,7 @@ export const encode = {
     const dateFromMs = payload.dateFromMs ?? payload.date_from_ms;
     const dateToMs = payload.dateToMs ?? payload.date_to_ms;
     const sourceNodeId = payload.sourceNodeId ?? payload.source_node_id;
-    const body = _wasm.encodeMlStudioRecordingsListRequest(
+    const body = requests.encodeMlStudioRecordingsListRequest(
       cameraId != null && cameraId !== '' ? String(cameraId) : undefined,
       dateFromMs != null ? Number(dateFromMs) : undefined,
       dateToMs != null ? Number(dateToMs) : undefined,
@@ -5768,7 +5683,7 @@ export const encode = {
       ? (payload.recordingRefs ?? payload.recording_refs).map((r) => String(r))
       : [];
     const sourceNodeId = payload.sourceNodeId ?? payload.source_node_id;
-    const body = _wasm.encodeMlStudioRecogImportRecordingsRequest(
+    const body = requests.encodeMlStudioRecogImportRecordingsRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.datasetId ?? payload.dataset_id ?? ''),
       refs,
@@ -5788,7 +5703,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(RecogImportRecordingsStatusRequest). payload: { jobId }. */
   mlStudioRecogImportRecordingsStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioRecogImportRecordingsStatusRequest(
+    const body = requests.encodeMlStudioRecogImportRecordingsStatusRequest(
       String(payload.jobId ?? payload.job_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -5806,7 +5721,7 @@ export const encode = {
    */
   mlStudioRemoteImportPreviewRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioRemoteImportPreviewRequest(
+    const body = requests.encodeMlStudioRemoteImportPreviewRequest(
       String(payload.url ?? ''),
       String(payload.apiKey ?? payload.api_key ?? ''),
     );
@@ -5825,7 +5740,7 @@ export const encode = {
   mlStudioRemoteImportStartRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const nameOverride = payload.nameOverride ?? payload.name_override;
-    const body = _wasm.encodeMlStudioRemoteImportStartRequest(
+    const body = requests.encodeMlStudioRemoteImportStartRequest(
       String(payload.url ?? ''),
       String(payload.apiKey ?? payload.api_key ?? ''),
       nameOverride == null ? undefined : String(nameOverride),
@@ -5841,7 +5756,7 @@ export const encode = {
   /** MessageBody::MlStudioBody(RemoteImportStatusRequest). payload: { jobId }. */
   mlStudioRemoteImportStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMlStudioRemoteImportStatusRequest(
+    const body = requests.encodeMlStudioRemoteImportStatusRequest(
       String(payload.jobId ?? payload.job_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -5859,7 +5774,7 @@ export const encode = {
    */
   skillsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSkillsListRequest(
+    const body = requests.encodeSkillsListRequest(
       payload.tag ?? null,
       payload.source ?? null,
       payload.status ?? null,
@@ -5874,7 +5789,7 @@ export const encode = {
 
   skillsDetailRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSkillsDetailRequest(String(payload.skillId ?? payload.skill_id ?? ''));
+    const body = requests.encodeSkillsDetailRequest(String(payload.skillId ?? payload.skill_id ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -5885,7 +5800,7 @@ export const encode = {
 
   skillsUpsertRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSkillsUpsertRequest(
+    const body = requests.encodeSkillsUpsertRequest(
       typeof payload.skillJson === 'string' ? payload.skillJson : JSON.stringify(payload.skill ?? payload),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -5898,7 +5813,7 @@ export const encode = {
 
   skillsDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSkillsDeleteRequest(String(payload.skillId ?? payload.skill_id ?? ''));
+    const body = requests.encodeSkillsDeleteRequest(String(payload.skillId ?? payload.skill_id ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -5909,7 +5824,7 @@ export const encode = {
 
   skillsForkRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSkillsForkRequest(
+    const body = requests.encodeSkillsForkRequest(
       String(payload.skillId ?? payload.skill_id ?? ''),
       String(payload.newName ?? payload.new_name ?? ''),
     );
@@ -5928,7 +5843,7 @@ export const encode = {
    */
   skillsHubSearchRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSkillsHubSearchRequest(
+    const body = requests.encodeSkillsHubSearchRequest(
       String(payload.query ?? ''),
       payload.source != null && payload.source !== '' ? String(payload.source) : null,
     );
@@ -5948,7 +5863,7 @@ export const encode = {
   skillsHubImportRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const ref = payload.gitRef ?? payload.git_ref;
-    const body = _wasm.encodeSkillsHubImportRequest(
+    const body = requests.encodeSkillsHubImportRequest(
       String(payload.source ?? ''),
       ref != null && ref !== '' ? String(ref) : null,
     );
@@ -5962,7 +5877,7 @@ export const encode = {
 
   skillsHubApproveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSkillsHubApproveRequest(String(payload.skillId ?? payload.skill_id ?? ''));
+    const body = requests.encodeSkillsHubApproveRequest(String(payload.skillId ?? payload.skill_id ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -5973,7 +5888,7 @@ export const encode = {
 
   skillsHubRejectRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSkillsHubRejectRequest(String(payload.skillId ?? payload.skill_id ?? ''));
+    const body = requests.encodeSkillsHubRejectRequest(String(payload.skillId ?? payload.skill_id ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -5989,7 +5904,7 @@ export const encode = {
    */
   skillsCuratorRunRequest(correlationId, _payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSkillsCuratorRunRequest();
+    const body = requests.encodeSkillsCuratorRunRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6006,7 +5921,7 @@ export const encode = {
   skillsCuratorApplyRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const approved = Array.isArray(payload.approvedActions) ? payload.approvedActions : [];
-    const body = _wasm.encodeSkillsCuratorApplyRequest(
+    const body = requests.encodeSkillsCuratorApplyRequest(
       String(payload.snapshotId ?? payload.snapshot_id ?? ''),
       JSON.stringify(approved),
     );
@@ -6025,7 +5940,7 @@ export const encode = {
    */
   skillsCuratorRollbackRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSkillsCuratorRollbackRequest(
+    const body = requests.encodeSkillsCuratorRollbackRequest(
       String(payload.snapshotId ?? payload.snapshot_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -6043,7 +5958,7 @@ export const encode = {
    */
   agentsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAgentsListRequest(
+    const body = requests.encodeAgentsListRequest(
       typeof payload.enabled === 'boolean' ? payload.enabled : null,
       typeof payload.routable === 'boolean' ? payload.routable : null,
     );
@@ -6057,7 +5972,7 @@ export const encode = {
 
   agentsDetailRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAgentsDetailRequest(String(payload.agentId ?? payload.agent_id ?? ''));
+    const body = requests.encodeAgentsDetailRequest(String(payload.agentId ?? payload.agent_id ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6068,7 +5983,7 @@ export const encode = {
 
   agentsUpsertRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAgentsUpsertRequest(
+    const body = requests.encodeAgentsUpsertRequest(
       typeof payload.agentJson === 'string' ? payload.agentJson : JSON.stringify(payload.agent ?? payload),
     );
     return _wasm.encodeEnvelopeDirect(
@@ -6081,7 +5996,7 @@ export const encode = {
 
   agentsDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAgentsDeleteRequest(String(payload.agentId ?? payload.agent_id ?? ''));
+    const body = requests.encodeAgentsDeleteRequest(String(payload.agentId ?? payload.agent_id ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6094,7 +6009,7 @@ export const encode = {
     assertReady();
     const agentId = payload.agentId ?? payload.agent_id;
     const parentRunId = payload.parentRunId ?? payload.parent_run_id;
-    const body = _wasm.encodeAgentRunsListRequest(
+    const body = requests.encodeAgentRunsListRequest(
       agentId ? String(agentId) : null,
       payload.status ? String(payload.status) : null,
       parentRunId ? String(parentRunId) : null,
@@ -6109,7 +6024,7 @@ export const encode = {
 
   agentRunDetailRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAgentRunDetailRequest(String(payload.runId ?? payload.run_id ?? ''));
+    const body = requests.encodeAgentRunDetailRequest(String(payload.runId ?? payload.run_id ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6120,7 +6035,7 @@ export const encode = {
 
   toolsCatalogRequest(correlationId, _payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeToolsCatalogRequest();
+    const body = requests.encodeToolsCatalogRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6135,7 +6050,7 @@ export const encode = {
    */
   agentRunCancelRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAgentRunCancelRequest(String(payload.runId ?? payload.run_id ?? ''));
+    const body = requests.encodeAgentRunCancelRequest(String(payload.runId ?? payload.run_id ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6151,7 +6066,7 @@ export const encode = {
    */
   agentRunStartRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAgentRunStartRequest(
+    const body = requests.encodeAgentRunStartRequest(
       String(payload.agentId ?? payload.agent_id ?? ''),
       String(payload.prompt ?? ''),
     );
@@ -6175,7 +6090,7 @@ export const encode = {
     const messagesJson = typeof payload.messagesJson === 'string'
       ? payload.messagesJson
       : JSON.stringify(payload.messages ?? []);
-    const body = _wasm.encodeAgentBuilderAssistRequest(messagesJson);
+    const body = requests.encodeAgentBuilderAssistRequest(messagesJson);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6192,7 +6107,7 @@ export const encode = {
    */
   agentRunEventsSubscribeRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAgentRunEventsSubscribeRequest(
+    const body = requests.encodeAgentRunEventsSubscribeRequest(
       String(payload.scopeKind ?? payload.scope_kind ?? 'session'),
       String(payload.scopeId ?? payload.scope_id ?? ''),
     );
@@ -6210,7 +6125,7 @@ export const encode = {
    */
   agentRunReplyRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAgentRunReplyRequest(
+    const body = requests.encodeAgentRunReplyRequest(
       String(payload.runId ?? payload.run_id ?? ''),
       String(payload.questionId ?? payload.question_id ?? ''),
       String(payload.answer ?? ''),
@@ -6229,7 +6144,7 @@ export const encode = {
    */
   agentPermissionReplyRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAgentPermissionReplyRequest(
+    const body = requests.encodeAgentPermissionReplyRequest(
       String(payload.runId ?? payload.run_id ?? ''),
       String(payload.requestId ?? payload.request_id ?? ''),
       String(payload.decision ?? ''),
@@ -6244,7 +6159,7 @@ export const encode = {
 
   syncConflictsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSyncConflictsListRequest(
+    const body = requests.encodeSyncConflictsListRequest(
       String(payload.orgId ?? payload.org_id ?? 'org-default'),
       String(payload.addonId ?? payload.addon_id ?? ''),
       String(payload.status ?? 'open'),
@@ -6260,7 +6175,7 @@ export const encode = {
 
   syncConflictResolveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSyncConflictResolveRequest(
+    const body = requests.encodeSyncConflictResolveRequest(
       String(payload.orgId ?? payload.org_id ?? 'org-default'),
       String(payload.addonId ?? payload.addon_id ?? ''),
       String(payload.operationId ?? payload.operation_id ?? ''),
@@ -6276,7 +6191,7 @@ export const encode = {
 
   syncStorageReportRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSyncStorageReportRequest();
+    const body = requests.encodeSyncStorageReportRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6291,7 +6206,7 @@ export const encode = {
    */
   auditLogExportRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAuditLogExportRequest(
+    const body = requests.encodeAuditLogExportRequest(
       payload.userId == null ? null : String(payload.userId),
       payload.addonId ?? null,
       payload.action ?? null,
@@ -6313,7 +6228,7 @@ export const encode = {
    */
   auditLogCleanupRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAuditLogCleanupRequest(Number(payload.keepDays ?? 90) >>> 0);
+    const body = requests.encodeAuditLogCleanupRequest(Number(payload.keepDays ?? 90) >>> 0);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6329,7 +6244,7 @@ export const encode = {
   /** MessageBody::AddonDetailRequest — szczegoly addona (perms + oauth providers). */
   addonDetailRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonDetailRequest(String(payload.addonId ?? ''));
+    const body = requests.encodeAddonDetailRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6341,7 +6256,7 @@ export const encode = {
   /** MessageBody::AddonVisibilityListRequest — widocznosc per grupa. */
   addonVisibilityListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonVisibilityListRequest(String(payload.addonId ?? ''));
+    const body = requests.encodeAddonVisibilityListRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6353,7 +6268,7 @@ export const encode = {
   /** MessageBody::AddonVisibilitySetRequest — ustawia widocznosc per grupa. */
   addonVisibilitySetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonVisibilitySetRequest(
+    const body = requests.encodeAddonVisibilitySetRequest(
       String(payload.addonId ?? ''),
       String(payload.groupId ?? ''),
       Boolean(payload.visible),
@@ -6369,7 +6284,7 @@ export const encode = {
   /** MessageBody::AddonAdminOnlySetRequest — przelacza admin_only dla addona. */
   addonAdminOnlySetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonAdminOnlySetRequest(
+    const body = requests.encodeAddonAdminOnlySetRequest(
       String(payload.addonId ?? ''),
       Boolean(payload.adminOnly),
     );
@@ -6384,7 +6299,7 @@ export const encode = {
   /** MessageBody::AddonShowInCatalogSetRequest — przelacza show_in_catalog. */
   addonShowInCatalogSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonShowInCatalogSetRequest(
+    const body = requests.encodeAddonShowInCatalogSetRequest(
       String(payload.addonId ?? ''),
       Boolean(payload.showInCatalog),
     );
@@ -6399,7 +6314,7 @@ export const encode = {
   /** MessageBody::AddonPermissionCatalogRequest — lista deklaracji uprawnien. */
   addonPermissionCatalogRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonPermissionCatalogRequest(String(payload.addonId ?? ''));
+    const body = requests.encodeAddonPermissionCatalogRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6411,7 +6326,7 @@ export const encode = {
   /** MessageBody::AddonPermissionMatrixRequest — aktualna macierz grantow + defaults. */
   addonPermissionMatrixRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonPermissionMatrixRequest(String(payload.addonId ?? ''));
+    const body = requests.encodeAddonPermissionMatrixRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6423,7 +6338,7 @@ export const encode = {
   /** MessageBody::AddonPermissionSetRequest — set grant dla (user|group). */
   addonPermissionSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonPermissionSetRequest(
+    const body = requests.encodeAddonPermissionSetRequest(
       String(payload.addonId ?? ''),
       String(payload.subjectType ?? 'user'),
       String(payload.subjectId ?? ''),
@@ -6441,7 +6356,7 @@ export const encode = {
   /** MessageBody::AddonPermissionDefaultSetRequest — domyslny grant dla addona. */
   addonPermissionDefaultSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonPermissionDefaultSetRequest(
+    const body = requests.encodeAddonPermissionDefaultSetRequest(
       String(payload.addonId ?? ''),
       String(payload.permissionId ?? ''),
       String(payload.grantMode ?? 'deny'),
@@ -6458,7 +6373,7 @@ export const encode = {
   addonPermissionCheckRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const userId = payload.userId == null ? null : String(payload.userId);
-    const body = _wasm.encodeAddonPermissionCheckRequest(
+    const body = requests.encodeAddonPermissionCheckRequest(
       String(payload.addonId ?? ''),
       String(payload.permissionId ?? ''),
       userId,
@@ -6474,7 +6389,7 @@ export const encode = {
   /** MessageBody::AddonOAuthConfigListRequest — lista konfiguracji (zero secretow). */
   addonOAuthConfigListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonOAuthConfigListRequest(String(payload.addonId ?? ''));
+    const body = requests.encodeAddonOAuthConfigListRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6487,7 +6402,7 @@ export const encode = {
   addonOAuthConfigSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const secret = payload.clientSecret == null ? null : String(payload.clientSecret);
-    const body = _wasm.encodeAddonOAuthConfigSetRequest(
+    const body = requests.encodeAddonOAuthConfigSetRequest(
       String(payload.addonId ?? ''),
       String(payload.providerId ?? ''),
       String(payload.clientId ?? ''),
@@ -6507,7 +6422,7 @@ export const encode = {
   /** MessageBody::AddonOAuthConfigClearSecretRequest — usun wylacznie secret. */
   addonOAuthConfigClearSecretRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonOAuthConfigClearSecretRequest(
+    const body = requests.encodeAddonOAuthConfigClearSecretRequest(
       String(payload.addonId ?? ''),
       String(payload.providerId ?? ''),
     );
@@ -6523,7 +6438,7 @@ export const encode = {
   addonOAuthAuthorizeStartRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const redirectAfter = payload.redirectAfter == null ? null : String(payload.redirectAfter);
-    const body = _wasm.encodeAddonOAuthAuthorizeStartRequest(
+    const body = requests.encodeAddonOAuthAuthorizeStartRequest(
       String(payload.addonId ?? ''),
       String(payload.providerId ?? ''),
       String(payload.mode ?? 'individual'),
@@ -6540,7 +6455,7 @@ export const encode = {
   /** MessageBody::AddonOAuthLinkedAccountsRequest — lista polaczonych kont. */
   addonOAuthLinkedAccountsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonOAuthLinkedAccountsRequest(
+    const body = requests.encodeAddonOAuthLinkedAccountsRequest(
       String(payload.addonId ?? ''),
       String(payload.scope ?? 'mine'),
     );
@@ -6555,7 +6470,7 @@ export const encode = {
   /** MessageBody::AddonOAuthRevokeRequest — unieważnij konto. */
   addonOAuthRevokeRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonOAuthRevokeRequest(Number(payload.accountId ?? 0));
+    const body = requests.encodeAddonOAuthRevokeRequest(Number(payload.accountId ?? 0));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6567,7 +6482,7 @@ export const encode = {
   /** MessageBody::AddonOAuthReauthorizeRequest — nowy flow dla istniejacego konta. */
   addonOAuthReauthorizeRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonOAuthReauthorizeRequest(Number(payload.accountId ?? 0));
+    const body = requests.encodeAddonOAuthReauthorizeRequest(Number(payload.accountId ?? 0));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6579,7 +6494,7 @@ export const encode = {
   /** MessageBody::AddonOAuthTestConnectionRequest — admin probes provider. */
   addonOAuthTestConnectionRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonOAuthTestConnectionRequest(
+    const body = requests.encodeAddonOAuthTestConnectionRequest(
       String(payload.addonId ?? payload.addon_id ?? ''),
       String(payload.providerId ?? payload.provider_id ?? ''),
     );
@@ -6594,7 +6509,7 @@ export const encode = {
   /** MessageBody::MyOAuthAccountsListRequest (unit) — konta biezacego usera. */
   myOAuthAccountsListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMyOAuthAccountsListRequest();
+    const body = requests.encodeMyOAuthAccountsListRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6610,7 +6525,7 @@ export const encode = {
   /** MessageBody::AddonToggleRequest — wlacza/wylacza addon. */
   addonToggleRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonToggleRequest(
+    const body = requests.encodeAddonToggleRequest(
       String(payload.addonId ?? ''),
       Boolean(payload.enabled),
     );
@@ -6625,7 +6540,7 @@ export const encode = {
   /** MessageBody::DeployVllmRecommendRequest — vLLM config recommend (CBOR passthrough). */
   deployVllmRecommendRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeDeployVllmRecommendRequest(JSON.stringify(payload));
+    const body = requests.encodeDeployVllmRecommendRequest(JSON.stringify(payload));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6637,7 +6552,7 @@ export const encode = {
   /** MessageBody::SuggestServicePortRequest — first free host port for the deploy form. */
   suggestServicePortRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeSuggestServicePortRequest(JSON.stringify(payload));
+    const body = requests.encodeSuggestServicePortRequest(JSON.stringify(payload));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6652,7 +6567,7 @@ export const encode = {
     const content = payload.content instanceof Uint8Array
       ? payload.content
       : new Uint8Array(payload.content ?? []);
-    const body = _wasm.encodeAddonInstallRequest(
+    const body = requests.encodeAddonInstallRequest(
       String(payload.filename ?? 'addon.zip'),
       content,
     );
@@ -6670,7 +6585,7 @@ export const encode = {
     // `acknowledgedNodes`: the peers the admin proceeds without, each with
     // its name retyped (wave-9b critic, MAJOR A).
     const acks = Array.isArray(payload.acknowledgedNodes) ? payload.acknowledgedNodes : [];
-    const body = _wasm.encodeAddonUninstallRequestJson(JSON.stringify({
+    const body = requests.encodeAddonUninstallRequestJson(JSON.stringify({
       addon_id: String(payload.addonId ?? ''),
       acknowledged_nodes: acks.map((a) => ({ node_id: String(a.nodeId ?? ''), confirm_name: String(a.confirmName ?? '') })),
     }));
@@ -6685,7 +6600,7 @@ export const encode = {
   /** MessageBody::AddonTeardownPlanRequest — podglad tego, co uninstall usunie. */
   addonTeardownPlanRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonTeardownPlanRequest(String(payload.addonId ?? ''));
+    const body = requests.encodeAddonTeardownPlanRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6697,7 +6612,7 @@ export const encode = {
   /** MessageBody::AddonTeardownStatusRequest — where the uninstall stands on the node that answers (forwarded per node). */
   addonTeardownStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonTeardownStatusRequest(String(payload.addonId ?? ''));
+    const body = requests.encodeAddonTeardownStatusRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6713,7 +6628,7 @@ export const encode = {
       addon_id: csText(payload.addonId ?? payload.addon_id),
       sudo_password: csText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeAddonTeardownArmRequest(JSON.stringify(request));
+    const body = requests.encodeAddonTeardownArmRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6725,7 +6640,7 @@ export const encode = {
   /** MessageBody::AddonTeardownDisarmRequest — drops the teardown password the answering node holds. payload: { addonId } */
   addonTeardownDisarmRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonTeardownDisarmRequest(String(payload.addonId ?? ''));
+    const body = requests.encodeAddonTeardownDisarmRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6737,7 +6652,7 @@ export const encode = {
   /** MessageBody::AddonDisablePreviewRequest — what disabling the instance does on the answering node (n18d). */
   addonDisablePreviewRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonDisablePreviewRequest(String(payload.addonId ?? ''));
+    const body = requests.encodeAddonDisablePreviewRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6749,7 +6664,7 @@ export const encode = {
   /** MessageBody::AddonConfigGetRequest — schema + values (secret pola puste). */
   addonConfigGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonConfigGetRequest(String(payload.addonId ?? ''));
+    const body = requests.encodeAddonConfigGetRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6763,7 +6678,7 @@ export const encode = {
   // wire: AddonRequirementInstallRequestBody
   addonRequirementInstallRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonRequirementInstallRequest(
+    const body = requests.encodeAddonRequirementInstallRequest(
       String(payload.addonId ?? payload.addon_id ?? ''),
       String(payload.engineId ?? payload.engine_id ?? ''),
     );
@@ -6778,7 +6693,7 @@ export const encode = {
       : Object.entries(payload.values ?? {});
     const keys = entries.map((e) => String(e[0]));
     const vals = entries.map((e) => String(e[1]));
-    const body = _wasm.encodeAddonConfigSetRequest(
+    const body = requests.encodeAddonConfigSetRequest(
       String(payload.addonId ?? ''),
       keys,
       vals,
@@ -6794,7 +6709,7 @@ export const encode = {
   /** MessageBody::AddonLogsRequest — per-addon wpisy audytu z paginacja. */
   addonLogsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonLogsRequest(
+    const body = requests.encodeAddonLogsRequest(
       String(payload.addonId ?? ''),
       Number(payload.limit ?? 50),
       Number(payload.offset ?? 0),
@@ -6812,7 +6727,7 @@ export const encode = {
   /** MessageBody::AddonToolsRequest — deklaracje narzedzi z manifestu. */
   addonToolsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonToolsRequest(String(payload.addonId ?? ''));
+    const body = requests.encodeAddonToolsRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6824,7 +6739,7 @@ export const encode = {
   /** MessageBody::AddonResourcesGetRequest — pobiera limity zasobow. */
   addonResourcesGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonResourcesGetRequest(String(payload.addonId ?? ''));
+    const body = requests.encodeAddonResourcesGetRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6836,7 +6751,7 @@ export const encode = {
   /** MessageBody::AddonResourcesSetRequest — zapisuje limity zasobow. */
   addonResourcesSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonResourcesSetRequest(
+    const body = requests.encodeAddonResourcesSetRequest(
       String(payload.addonId ?? ''),
       Number(payload.maxInstances ?? 0),
       Number(payload.cpuLimitPct ?? 0),
@@ -6856,7 +6771,7 @@ export const encode = {
   /** MessageBody::AddonNetworkRulesGetRequest — allowed/blocked + mode. */
   addonNetworkRulesGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonNetworkRulesGetRequest(String(payload.addonId ?? ''));
+    const body = requests.encodeAddonNetworkRulesGetRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6874,7 +6789,7 @@ export const encode = {
     const blocked = Array.isArray(payload.blockedHosts)
       ? payload.blockedHosts.map((h) => String(h))
       : [];
-    const body = _wasm.encodeAddonNetworkRulesSetRequest(
+    const body = requests.encodeAddonNetworkRulesSetRequest(
       String(payload.addonId ?? ''),
       allowed,
       blocked,
@@ -6891,7 +6806,7 @@ export const encode = {
   /** MessageBody::AddonReloadRequest — re-inicjalizuje instance pool addona. */
   addonReloadRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonReloadRequest(String(payload.addonId ?? ''));
+    const body = requests.encodeAddonReloadRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -6903,18 +6818,18 @@ export const encode = {
   // ==== IAM (users + groups + permissions) ====
   iamListUsersRequest(correlationId, _payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamListUsersRequest();
+    const body = requests.encodeIamListUsersRequest();
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamGetUserRequest(correlationId, { userId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamGetUserRequest(String(userId));
+    const body = requests.encodeIamGetUserRequest(String(userId));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamCreateUserRequest(correlationId, p, sequence = 1) {
     assertReady();
     const csv = Array.isArray(p.groupIds) ? p.groupIds.join(',') : String(p.groupIds ?? '');
-    const body = _wasm.encodeIamCreateUserRequest(
+    const body = requests.encodeIamCreateUserRequest(
       String(p.username ?? ''), String(p.password ?? ''), String(p.displayName ?? ''),
       String(p.email ?? ''), String(p.role ?? 'user'), csv,
     );
@@ -6922,7 +6837,7 @@ export const encode = {
   },
   iamUpdateUserRequest(correlationId, p, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamUpdateUserRequest(
+    const body = requests.encodeIamUpdateUserRequest(
       String(p.userId), String(p.displayName ?? ''), String(p.email ?? ''),
       !!p.isActive, String(p.role ?? 'user'),
     );
@@ -6930,54 +6845,54 @@ export const encode = {
   },
   iamDeleteUserRequest(correlationId, { userId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamDeleteUserRequest(String(userId));
+    const body = requests.encodeIamDeleteUserRequest(String(userId));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamSetUserGroupsRequest(correlationId, p, sequence = 1) {
     assertReady();
     const csv = Array.isArray(p.groupIds) ? p.groupIds.join(',') : String(p.groupIds ?? '');
-    const body = _wasm.encodeIamSetUserGroupsRequest(String(p.userId), csv);
+    const body = requests.encodeIamSetUserGroupsRequest(String(p.userId), csv);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamResetUserPasswordRequest(correlationId, p, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamResetUserPasswordRequest(String(p.userId), String(p.newPassword ?? ''));
+    const body = requests.encodeIamResetUserPasswordRequest(String(p.userId), String(p.newPassword ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamListGroupsRequest(correlationId, _payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamListGroupsRequest();
+    const body = requests.encodeIamListGroupsRequest();
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   /** MessageBody::IamBody(ReqListOrganizations) — every organisation on this node (admin). */
   iamListOrganizationsRequest(correlationId, _payload, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamListOrganizationsRequest();
+    const body = requests.encodeIamListOrganizationsRequest();
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamCreateGroupRequest(correlationId, p, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamCreateGroupRequest(String(p.name ?? ''), String(p.description ?? ''));
+    const body = requests.encodeIamCreateGroupRequest(String(p.name ?? ''), String(p.description ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamUpdateGroupRequest(correlationId, p, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamUpdateGroupRequest(String(p.groupId), String(p.name ?? ''), String(p.description ?? ''));
+    const body = requests.encodeIamUpdateGroupRequest(String(p.groupId), String(p.name ?? ''), String(p.description ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamDeleteGroupRequest(correlationId, { groupId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamDeleteGroupRequest(String(groupId));
+    const body = requests.encodeIamDeleteGroupRequest(String(groupId));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamGroupMembersRequest(correlationId, { groupId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamGroupMembersRequest(String(groupId));
+    const body = requests.encodeIamGroupMembersRequest(String(groupId));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamSetPermissionRequest(correlationId, p, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamSetPermissionRequest(
+    const body = requests.encodeIamSetPermissionRequest(
       String(p.resourceType), String(p.resourceId),
       String(p.subjectType), String(p.subjectId), String(p.accessLevel),
     );
@@ -6985,7 +6900,7 @@ export const encode = {
   },
   iamClearPermissionRequest(correlationId, p, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamClearPermissionRequest(
+    const body = requests.encodeIamClearPermissionRequest(
       String(p.resourceType), String(p.resourceId),
       String(p.subjectType), String(p.subjectId),
     );
@@ -6993,12 +6908,12 @@ export const encode = {
   },
   iamListPermsForResourceRequest(correlationId, p, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamListPermsForResourceRequest(String(p.resourceType), String(p.resourceId));
+    const body = requests.encodeIamListPermsForResourceRequest(String(p.resourceType), String(p.resourceId));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
   iamListPermsForSubjectRequest(correlationId, p, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeIamListPermsForSubjectRequest(String(p.subjectType), String(p.subjectId));
+    const body = requests.encodeIamListPermsForSubjectRequest(String(p.subjectType), String(p.subjectId));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -7020,7 +6935,7 @@ export const encode = {
     }
     const engineFilter = payload.engineIdFilter ? String(payload.engineIdFilter) : undefined;
     const categoryFilter = payload.categoryFilter ? String(payload.categoryFilter) : undefined;
-    const body = _wasm.encodeServiceListRequest(engineFilter, categoryFilter);
+    const body = requests.encodeServiceListRequest(engineFilter, categoryFilter);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(seq),
@@ -7032,7 +6947,7 @@ export const encode = {
   /** MessageBody::ServiceBody(ServicePayload::ReqDelete). */
   serviceDeleteRequest(correlationId, { serviceId, nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServiceDeleteRequest(Number(serviceId), nodeId ?? undefined);
+    const body = requests.encodeServiceDeleteRequest(Number(serviceId), nodeId ?? undefined);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -7044,7 +6959,7 @@ export const encode = {
   /** MessageBody::ServiceBody(ServicePayload::ReqPin). */
   servicePinRequest(correlationId, { serviceId, pinned, nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServicePinRequest(
+    const body = requests.encodeServicePinRequest(
       Number(serviceId),
       Boolean(pinned),
       nodeId ?? undefined,
@@ -7060,7 +6975,7 @@ export const encode = {
   /** MessageBody::ServiceBody(ServicePayload::ReqPause). */
   servicePauseRequest(correlationId, { serviceId, paused, nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServicePauseRequest(
+    const body = requests.encodeServicePauseRequest(
       Number(serviceId),
       Boolean(paused),
       nodeId ?? undefined,
@@ -7076,7 +6991,7 @@ export const encode = {
   /** MessageBody::ServiceBody(ServicePayload::ReqStart) — unpause + spawn. */
   serviceStartRequest(correlationId, { serviceId, nodeId }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeServiceStartRequest(Number(serviceId), nodeId ?? undefined);
+    const body = requests.encodeServiceStartRequest(Number(serviceId), nodeId ?? undefined);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -7093,7 +7008,7 @@ export const encode = {
    */
   legalDocumentsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeLegalDocumentsListRequest(Boolean(payload.includeRevoked));
+    const body = requests.encodeLegalDocumentsListRequest(Boolean(payload.includeRevoked));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -7108,7 +7023,7 @@ export const encode = {
    */
   legalDocumentGenerateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeLegalDocumentGenerateRequest(String(payload.variant ?? 'standard'));
+    const body = requests.encodeLegalDocumentGenerateRequest(String(payload.variant ?? 'standard'));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -7123,7 +7038,7 @@ export const encode = {
    */
   legalDocumentRevokeRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeLegalDocumentRevokeRequest(String(payload.docId ?? ''));
+    const body = requests.encodeLegalDocumentRevokeRequest(String(payload.docId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -7142,7 +7057,7 @@ export const encode = {
     assertReady();
     const streamId = String(payload?.streamId ?? payload?.stream_id ?? '');
     const preview = Boolean(payload?.preview ?? false);
-    const body = _wasm.encodeStreamSubscribeRequest(streamId, preview);
+    const body = requests.encodeStreamSubscribeRequest(streamId, preview);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -7157,7 +7072,7 @@ export const encode = {
   streamCloseRequest(correlationId, payload, sequence = 1) {
     assertReady();
     const streamId = String(payload?.streamId ?? payload?.stream_id ?? '');
-    const body = _wasm.encodeStreamCloseRequest(streamId);
+    const body = requests.encodeStreamCloseRequest(streamId);
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -7182,7 +7097,7 @@ export const encode = {
       limit: payload?.limit ?? null,
       offset: payload?.offset ?? null,
     };
-    const body = _wasm.encodeRoleCatalogListRequest(JSON.stringify(filter));
+    const body = requests.encodeRoleCatalogListRequest(JSON.stringify(filter));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -7194,7 +7109,7 @@ export const encode = {
   /** MessageBody::RoleCatalogBody(GetRequest). Payload: { id }. */
   roleCatalogGetRequest(correlationId, { id }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeRoleCatalogGetRequest(String(id));
+    const body = requests.encodeRoleCatalogGetRequest(String(id));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -7206,7 +7121,7 @@ export const encode = {
   /** MessageBody::RoleCatalogBody(GetBySlugRequest). Payload: { slug }. */
   roleCatalogGetBySlugRequest(correlationId, { slug }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeRoleCatalogGetBySlugRequest(String(slug));
+    const body = requests.encodeRoleCatalogGetBySlugRequest(String(slug));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -7218,7 +7133,7 @@ export const encode = {
   /** MessageBody::RoleCatalogBody(ListLocalesRequest) — unit. */
   roleCatalogListLocalesRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeRoleCatalogListLocalesRequest();
+    const body = requests.encodeRoleCatalogListLocalesRequest();
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -7244,7 +7159,7 @@ export const encode = {
         payload?.defaultVisibilityScope ?? payload?.default_visibility_scope ?? 'assigned',
       ),
     };
-    const body = _wasm.encodeRoleCatalogCreateRequest(JSON.stringify(req));
+    const body = requests.encodeRoleCatalogCreateRequest(JSON.stringify(req));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -7291,7 +7206,7 @@ export const encode = {
     ) {
       req.default_visibility_scope = String(payload.defaultVisibilityScope);
     }
-    const body = _wasm.encodeRoleCatalogUpdateRequest(JSON.stringify(req));
+    const body = requests.encodeRoleCatalogUpdateRequest(JSON.stringify(req));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -7303,7 +7218,7 @@ export const encode = {
   /** MessageBody::RoleCatalogBody(DeactivateRequest). Payload: { id }. */
   roleCatalogDeactivateRequest(correlationId, { id }, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeRoleCatalogDeactivateRequest(String(id));
+    const body = requests.encodeRoleCatalogDeactivateRequest(String(id));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -7324,7 +7239,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(ProjectsListRequest). payload: { includeArchived? }. */
   projectStudioProjectsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioProjectsListRequest(
+    const body = requests.encodeProjectStudioProjectsListRequest(
       !!(payload.includeArchived ?? payload.include_archived ?? false),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -7341,7 +7256,7 @@ export const encode = {
       project_admin: !!(m.projectAdmin ?? m.project_admin ?? false),
       expires_at: m.expiresAt ?? m.expires_at ?? null,
     }));
-    const body = _wasm.encodeProjectStudioProjectCreateRequest(
+    const body = requests.encodeProjectStudioProjectCreateRequest(
       String(payload.name ?? ''),
       String(payload.keyPrefix ?? payload.key_prefix ?? ''),
       String(payload.description ?? ''),
@@ -7359,14 +7274,14 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(ProjectGetRequest). payload: { projectId }. */
   projectStudioProjectGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioProjectGetRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    const body = requests.encodeProjectStudioProjectGetRequest(String(payload.projectId ?? payload.project_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(ProjectUpdateRequest). payload: { projectId, name, description, keyPrefix }. */
   projectStudioProjectUpdateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioProjectUpdateRequest(
+    const body = requests.encodeProjectStudioProjectUpdateRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.name ?? ''),
       String(payload.description ?? ''),
@@ -7378,7 +7293,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(ProjectArchiveRequest). payload: { projectId, archived }. */
   projectStudioProjectArchiveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioProjectArchiveRequest(
+    const body = requests.encodeProjectStudioProjectArchiveRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       !!payload.archived,
       String(payload.scope ?? 'node'),
@@ -7389,14 +7304,14 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(ProjectDeleteRequest). payload: { projectId }. */
   projectStudioProjectDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioProjectDeleteRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    const body = requests.encodeProjectStudioProjectDeleteRequest(String(payload.projectId ?? payload.project_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(MembersListRequest). payload: { projectId }. */
   projectStudioMembersListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioMembersListRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    const body = requests.encodeProjectStudioMembersListRequest(String(payload.projectId ?? payload.project_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -7404,7 +7319,7 @@ export const encode = {
   projectStudioMemberCandidatesRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const projectId = payload.projectId ?? payload.project_id;
-    const body = _wasm.encodeProjectStudioMemberCandidatesRequest(
+    const body = requests.encodeProjectStudioMemberCandidatesRequest(
       projectId == null || projectId === '' ? undefined : String(projectId),
       String(payload.query ?? ''),
       Number(payload.limit ?? 20),
@@ -7422,7 +7337,7 @@ export const encode = {
       project_admin: !!(m.projectAdmin ?? m.project_admin ?? false),
       expires_at: m.expiresAt ?? m.expires_at ?? null,
     }));
-    const body = _wasm.encodeProjectStudioMembersAddRequest(
+    const body = requests.encodeProjectStudioMembersAddRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       JSON.stringify(members),
     );
@@ -7432,7 +7347,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(MemberRoleSetRequest). payload: { projectId, userId, role }. */
   projectStudioMemberRoleSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioMemberRoleSetRequest(
+    const body = requests.encodeProjectStudioMemberRoleSetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.userId ?? payload.user_id ?? ''),
       String(payload.role ?? ''),
@@ -7442,7 +7357,7 @@ export const encode = {
 
   projectStudioCatalogueGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioCatalogueGetRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    const body = requests.encodeProjectStudioCatalogueGetRequest(String(payload.projectId ?? payload.project_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -7462,13 +7377,13 @@ export const encode = {
         })),
       },
     };
-    const body = _wasm.encodeProjectStudioFunctionSaveRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioFunctionSaveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   projectStudioFunctionDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioFunctionDeleteRequest(
+    const body = requests.encodeProjectStudioFunctionDeleteRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.functionId ?? payload.function_id ?? ''),
     );
@@ -7484,14 +7399,14 @@ export const encode = {
       project_admin: !!(payload.projectAdmin ?? payload.project_admin ?? false),
       expires_at: payload.expiresAt ?? payload.expires_at ?? null,
     };
-    const body = _wasm.encodeProjectStudioMemberAccessSetRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioMemberAccessSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(MemberRemoveRequest). payload: { projectId, userId }. */
   projectStudioMemberRemoveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioMemberRemoveRequest(
+    const body = requests.encodeProjectStudioMemberRemoveRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.userId ?? payload.user_id ?? ''),
     );
@@ -7501,7 +7416,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(OwnershipTransferRequest). payload: { projectId, newOwnerUserId }. */
   projectStudioOwnershipTransferRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioOwnershipTransferRequest(
+    const body = requests.encodeProjectStudioOwnershipTransferRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.newOwnerUserId ?? payload.new_owner_user_id ?? ''),
     );
@@ -7511,14 +7426,14 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(CreatorGrantsListRequest) — admin only. */
   projectStudioCreatorGrantsListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioCreatorGrantsListRequest();
+    const body = requests.encodeProjectStudioCreatorGrantsListRequest();
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(CreatorGrantSetRequest) — admin only. payload: { userId, granted }. */
   projectStudioCreatorGrantSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioCreatorGrantSetRequest(
+    const body = requests.encodeProjectStudioCreatorGrantSetRequest(
       String(payload.userId ?? payload.user_id ?? ''),
       !!payload.granted,
     );
@@ -7528,7 +7443,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(SourcesListRequest). payload: { projectId }. */
   projectStudioSourcesListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioSourcesListRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    const body = requests.encodeProjectStudioSourcesListRequest(String(payload.projectId ?? payload.project_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -7537,7 +7452,7 @@ export const encode = {
     assertReady();
     const raw = payload.bytes;
     const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw ?? []);
-    const body = _wasm.encodeProjectStudioSourceUploadChunkRequest(
+    const body = requests.encodeProjectStudioSourceUploadChunkRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.uploadId ?? payload.upload_id ?? ''),
       String(payload.filename ?? ''),
@@ -7555,7 +7470,7 @@ export const encode = {
     const fileRefs = Array.isArray(payload.fileRefs ?? payload.file_refs)
       ? (payload.fileRefs ?? payload.file_refs).map(String)
       : [];
-    const body = _wasm.encodeProjectStudioSourceCreateRequest(
+    const body = requests.encodeProjectStudioSourceCreateRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.kind ?? ''),
       String(payload.name ?? ''),
@@ -7568,7 +7483,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(SourceUpdateRequest). payload: { projectId, sourceId, name, configJson }. */
   projectStudioSourceUpdateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioSourceUpdateRequest(
+    const body = requests.encodeProjectStudioSourceUpdateRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.sourceId ?? payload.source_id ?? ''),
       String(payload.name ?? ''),
@@ -7580,7 +7495,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(SourceDeleteRequest). payload: { projectId, sourceId }. */
   projectStudioSourceDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioSourceDeleteRequest(
+    const body = requests.encodeProjectStudioSourceDeleteRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.sourceId ?? payload.source_id ?? ''),
     );
@@ -7591,7 +7506,7 @@ export const encode = {
   projectStudioSourceReingestRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const fileId = payload.fileId ?? payload.file_id;
-    const body = _wasm.encodeProjectStudioSourceReingestRequest(
+    const body = requests.encodeProjectStudioSourceReingestRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.sourceId ?? payload.source_id ?? ''),
       fileId == null || fileId === '' ? undefined : String(fileId),
@@ -7602,7 +7517,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(IngestCancelRequest). payload: { projectId, jobId }. */
   projectStudioIngestCancelRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioIngestCancelRequest(
+    const body = requests.encodeProjectStudioIngestCancelRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.jobId ?? payload.job_id ?? ''),
     );
@@ -7612,7 +7527,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(IngestStatusRequest) — poll 2-4 s, source of truth. payload: { projectId, jobId }. */
   projectStudioIngestStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioIngestStatusRequest(
+    const body = requests.encodeProjectStudioIngestStatusRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.jobId ?? payload.job_id ?? ''),
     );
@@ -7622,7 +7537,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(SourceFilesListRequest). payload: { projectId, sourceId, offset, limit, filter? }. */
   projectStudioSourceFilesListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioSourceFilesListRequest(
+    const body = requests.encodeProjectStudioSourceFilesListRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.sourceId ?? payload.source_id ?? ''),
       Number(payload.offset ?? 0),
@@ -7635,7 +7550,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(SourceFileDeleteRequest). payload: { projectId, fileId }. */
   projectStudioSourceFileDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioSourceFileDeleteRequest(
+    const body = requests.encodeProjectStudioSourceFileDeleteRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.fileId ?? payload.file_id ?? ''),
     );
@@ -7645,7 +7560,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(SourceFilePreviewRequest) — text-only, server clamps maxBytes. payload: { projectId, fileId, maxBytes }. */
   projectStudioSourceFilePreviewRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioSourceFilePreviewRequest(
+    const body = requests.encodeProjectStudioSourceFilePreviewRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.fileId ?? payload.file_id ?? ''),
       Number(payload.maxBytes ?? payload.max_bytes ?? 262144),
@@ -7659,7 +7574,7 @@ export const encode = {
     const sourceIds = Array.isArray(payload.sourceIds ?? payload.source_ids)
       ? (payload.sourceIds ?? payload.source_ids).map(String)
       : [];
-    const body = _wasm.encodeProjectStudioKbSearchRequest(
+    const body = requests.encodeProjectStudioKbSearchRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.query ?? ''),
       JSON.stringify(sourceIds),
@@ -7671,7 +7586,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(OverviewRequest) — KPIs + recent activity. payload: { projectId }. */
   projectStudioOverviewRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioOverviewRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    const body = requests.encodeProjectStudioOverviewRequest(String(payload.projectId ?? payload.project_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -7679,7 +7594,7 @@ export const encode = {
   projectStudioActivityListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const beforeId = payload.beforeId ?? payload.before_id;
-    const body = _wasm.encodeProjectStudioActivityListRequest(
+    const body = requests.encodeProjectStudioActivityListRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       beforeId == null || beforeId === '' ? undefined : String(beforeId),
       Number(payload.limit ?? 50),
@@ -7690,14 +7605,14 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(ChatsListRequest) — caller's own chats only. payload: { projectId }. */
   projectStudioChatsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioChatsListRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    const body = requests.encodeProjectStudioChatsListRequest(String(payload.projectId ?? payload.project_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(ChatCreateRequest). payload: { projectId, title }. */
   projectStudioChatCreateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioChatCreateRequest(
+    const body = requests.encodeProjectStudioChatCreateRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.title ?? ''),
     );
@@ -7707,7 +7622,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(ChatRenameRequest). payload: { projectId, chatId, title }. */
   projectStudioChatRenameRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioChatRenameRequest(
+    const body = requests.encodeProjectStudioChatRenameRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.chatId ?? payload.chat_id ?? ''),
       String(payload.title ?? ''),
@@ -7718,7 +7633,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(ChatDeleteRequest). payload: { projectId, chatId }. */
   projectStudioChatDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioChatDeleteRequest(
+    const body = requests.encodeProjectStudioChatDeleteRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.chatId ?? payload.chat_id ?? ''),
     );
@@ -7729,7 +7644,7 @@ export const encode = {
   projectStudioChatHistoryRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const beforeMessageId = payload.beforeMessageId ?? payload.before_message_id;
-    const body = _wasm.encodeProjectStudioChatHistoryRequest(
+    const body = requests.encodeProjectStudioChatHistoryRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.chatId ?? payload.chat_id ?? ''),
       beforeMessageId == null || beforeMessageId === '' ? undefined : String(beforeMessageId),
@@ -7741,7 +7656,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(SettingsGetRequest). payload: { projectId }. */
   projectStudioSettingsGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioSettingsGetRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    const body = requests.encodeProjectStudioSettingsGetRequest(String(payload.projectId ?? payload.project_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -7761,7 +7676,7 @@ export const encode = {
     // undefined so an unrelated save leaves the stored value alone.
     const rawGraph = payload.graphExtraction ?? payload.graph_extraction;
     const graphExtraction = rawGraph == null ? undefined : Boolean(rawGraph);
-    const body = _wasm.encodeProjectStudioSettingsSaveRequest(
+    const body = requests.encodeProjectStudioSettingsSaveRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       payload.name == null ? undefined : String(payload.name),
       payload.description == null ? undefined : String(payload.description),
@@ -7777,7 +7692,7 @@ export const encode = {
   projectStudioTagSaveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const tagId = payload.tagId ?? payload.tag_id;
-    const body = _wasm.encodeProjectStudioTagSaveRequest(
+    const body = requests.encodeProjectStudioTagSaveRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       tagId == null || tagId === '' ? undefined : String(tagId),
       String(payload.name ?? ''),
@@ -7788,7 +7703,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(TagDeleteRequest). payload: { projectId, tagId }. */
   projectStudioTagDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTagDeleteRequest(
+    const body = requests.encodeProjectStudioTagDeleteRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.tagId ?? payload.tag_id ?? ''),
     );
@@ -7798,7 +7713,7 @@ export const encode = {
   /** Subscribe — live ingest logs/progress. payload: { projectId, jobId }. Chunks = ProjectStudioIngestStreamChunk, end = ProjectStudioIngestStreamEnd. */
   projectStudioIngestStreamRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioIngestStreamRequest(
+    const body = requests.encodeProjectStudioIngestStreamRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.jobId ?? payload.job_id ?? ''),
     );
@@ -7808,7 +7723,7 @@ export const encode = {
   /** Subscribe — send one user message, stream the assistant reply. payload: { projectId, chatId, message }. Chunks = ProjectStudioChatStreamChunk, end = ProjectStudioChatStreamEnd. */
   projectStudioChatStreamRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioChatStreamRequest(
+    const body = requests.encodeProjectStudioChatStreamRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.chatId ?? payload.chat_id ?? ''),
       String(payload.message ?? ''),
@@ -7825,7 +7740,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(CasesListRequest). payload: { projectId, kind?, status?, priority?, tagId?, origin?, search?, offset?, limit? } — empty filters mean "all". */
   projectStudioCasesListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioCasesListRequest(
+    const body = requests.encodeProjectStudioCasesListRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.kind ?? ''),
       String(payload.status ?? ''),
@@ -7842,7 +7757,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(CaseGetRequest). payload: { projectId, caseId, includeVersions? }. */
   projectStudioCaseGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioCaseGetRequest(
+    const body = requests.encodeProjectStudioCaseGetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.caseId ?? payload.case_id ?? ''),
       !!(payload.includeVersions ?? payload.include_versions ?? false),
@@ -7871,14 +7786,14 @@ export const encode = {
       expected_version: expectedVersion == null ? null : Number(expectedVersion),
       change_note: String(payload.changeNote ?? payload.change_note ?? ''),
     };
-    const body = _wasm.encodeProjectStudioCaseSaveRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioCaseSaveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(CaseStatusSetRequest). payload: { projectId, caseId, status, reason? } — every downgrade requires reason. */
   projectStudioCaseStatusSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioCaseStatusSetRequest(
+    const body = requests.encodeProjectStudioCaseStatusSetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.caseId ?? payload.case_id ?? ''),
       String(payload.status ?? ''),
@@ -7896,14 +7811,14 @@ export const encode = {
       status: String(payload.status ?? ''),
       reason: String(payload.reason ?? ''),
     };
-    const body = _wasm.encodeProjectStudioCasesBulkStatusRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioCasesBulkStatusRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(CaseDuplicateRequest). payload: { projectId, caseId }. */
   projectStudioCaseDuplicateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioCaseDuplicateRequest(
+    const body = requests.encodeProjectStudioCaseDuplicateRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.caseId ?? payload.case_id ?? ''),
     );
@@ -7913,7 +7828,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(CaseDeleteRequest). payload: { projectId, caseId }. */
   projectStudioCaseDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioCaseDeleteRequest(
+    const body = requests.encodeProjectStudioCaseDeleteRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.caseId ?? payload.case_id ?? ''),
     );
@@ -7923,7 +7838,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(CaseVersionGetRequest). payload: { projectId, caseId, version }. */
   projectStudioCaseVersionGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioCaseVersionGetRequest(
+    const body = requests.encodeProjectStudioCaseVersionGetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.caseId ?? payload.case_id ?? ''),
       Number(payload.version ?? 0),
@@ -7934,7 +7849,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(CaseRestoreVersionRequest). payload: { projectId, caseId, version, expectedVersion } — restore = NEW version (append-only history). */
   projectStudioCaseRestoreVersionRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioCaseRestoreVersionRequest(
+    const body = requests.encodeProjectStudioCaseRestoreVersionRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.caseId ?? payload.case_id ?? ''),
       Number(payload.version ?? 0),
@@ -7951,7 +7866,7 @@ export const encode = {
       csv_text: String(payload.csvText ?? payload.csv_text ?? ''),
       dry_run: !!(payload.dryRun ?? payload.dry_run ?? false),
     };
-    const body = _wasm.encodeProjectStudioCasesImportCsvRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioCasesImportCsvRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -7959,7 +7874,7 @@ export const encode = {
   projectStudioAttachmentGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const stepIndex = payload.stepIndex ?? payload.step_index ?? null;
-    const body = _wasm.encodeProjectStudioAttachmentGetRequest(
+    const body = requests.encodeProjectStudioAttachmentGetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.ownerKind ?? payload.owner_kind ?? ''),
       String(payload.ownerId ?? payload.owner_id ?? ''),
@@ -7974,7 +7889,7 @@ export const encode = {
 
   projectStudioAttachmentUploadStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioAttachmentUploadStatusRequest(JSON.stringify({
+    const body = requests.encodeProjectStudioAttachmentUploadStatusRequest(JSON.stringify({
       project_id: String(payload.projectId ?? payload.project_id ?? ''),
       upload_id: String(payload.uploadId ?? payload.upload_id ?? ''),
     }));
@@ -7984,7 +7899,7 @@ export const encode = {
   projectStudioAttachmentUploadChunkRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const bytes = payload.bytes instanceof Uint8Array ? payload.bytes : new Uint8Array(payload.bytes ?? []);
-    const body = _wasm.encodeProjectStudioAttachmentUploadChunkRequest(
+    const body = requests.encodeProjectStudioAttachmentUploadChunkRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.uploadId ?? payload.upload_id ?? ''),
       String(payload.filename ?? ''),
@@ -7999,7 +7914,7 @@ export const encode = {
 
   projectStudioAttachmentUploadCancelRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioAttachmentUploadCancelRequest(JSON.stringify({
+    const body = requests.encodeProjectStudioAttachmentUploadCancelRequest(JSON.stringify({
       project_id: String(payload.projectId ?? payload.project_id ?? ''),
       upload_id: String(payload.uploadId ?? payload.upload_id ?? ''),
     }));
@@ -8008,7 +7923,7 @@ export const encode = {
 
   projectStudioAttachmentPreviewRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioAttachmentPreviewRequest(JSON.stringify({
+    const body = requests.encodeProjectStudioAttachmentPreviewRequest(JSON.stringify({
       project_id: String(payload.projectId ?? payload.project_id ?? ''),
       owner_kind: String(payload.ownerKind ?? payload.owner_kind ?? ''),
       owner_id: String(payload.ownerId ?? payload.owner_id ?? ''),
@@ -8021,7 +7936,7 @@ export const encode = {
 
   projectStudioAttachmentUsageRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioAttachmentUsageRequest(JSON.stringify({
+    const body = requests.encodeProjectStudioAttachmentUsageRequest(JSON.stringify({
       project_id: String(payload.projectId ?? payload.project_id ?? ''),
       offset: Number(payload.offset ?? 0),
       limit: Number(payload.limit ?? 25),
@@ -8032,14 +7947,14 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(SuitesListRequest). payload: { projectId }. */
   projectStudioSuitesListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioSuitesListRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    const body = requests.encodeProjectStudioSuitesListRequest(String(payload.projectId ?? payload.project_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(SuiteGetRequest). payload: { projectId, suiteId }. */
   projectStudioSuiteGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioSuiteGetRequest(
+    const body = requests.encodeProjectStudioSuiteGetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.suiteId ?? payload.suite_id ?? ''),
     );
@@ -8057,14 +7972,14 @@ export const encode = {
       description: String(payload.description ?? ''),
       case_ids: (Array.isArray(payload.caseIds ?? payload.case_ids) ? (payload.caseIds ?? payload.case_ids) : []).map(String),
     };
-    const body = _wasm.encodeProjectStudioSuiteSaveRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioSuiteSaveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(SuiteDeleteRequest). payload: { projectId, suiteId }. */
   projectStudioSuiteDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioSuiteDeleteRequest(
+    const body = requests.encodeProjectStudioSuiteDeleteRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.suiteId ?? payload.suite_id ?? ''),
     );
@@ -8074,7 +7989,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(RunsListRequest). payload: { projectId, status?, runType?, offset?, limit? }. */
   projectStudioRunsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioRunsListRequest(
+    const body = requests.encodeProjectStudioRunsListRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.status ?? ''),
       String(payload.runType ?? payload.run_type ?? ''),
@@ -8102,14 +8017,14 @@ export const encode = {
       single_assignee: String(payload.singleAssignee ?? payload.single_assignee ?? ''),
       assignments,
     };
-    const body = _wasm.encodeProjectStudioRunCreateRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioRunCreateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(RunGetRequest). payload: { projectId, runId }. */
   projectStudioRunGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioRunGetRequest(
+    const body = requests.encodeProjectStudioRunGetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.runId ?? payload.run_id ?? ''),
     );
@@ -8119,7 +8034,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(RunCloseRequest). payload: { projectId, runId, cancelled? }. */
   projectStudioRunCloseRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioRunCloseRequest(
+    const body = requests.encodeProjectStudioRunCloseRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.runId ?? payload.run_id ?? ''),
       !!payload.cancelled,
@@ -8130,7 +8045,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(RunDeleteRequest). payload: { projectId, runId }. */
   projectStudioRunDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioRunDeleteRequest(
+    const body = requests.encodeProjectStudioRunDeleteRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.runId ?? payload.run_id ?? ''),
     );
@@ -8141,7 +8056,7 @@ export const encode = {
   projectStudioRunItemClaimRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const itemId = payload.itemId ?? payload.item_id;
-    const body = _wasm.encodeProjectStudioRunItemClaimRequest(
+    const body = requests.encodeProjectStudioRunItemClaimRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.runId ?? payload.run_id ?? ''),
       itemId == null || itemId === '' ? undefined : String(itemId),
@@ -8152,7 +8067,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(RunItemReleaseRequest). payload: { projectId, itemId }. */
   projectStudioRunItemReleaseRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioRunItemReleaseRequest(
+    const body = requests.encodeProjectStudioRunItemReleaseRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.itemId ?? payload.item_id ?? ''),
     );
@@ -8162,7 +8077,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(RunItemGetRequest). payload: { projectId, itemId }. */
   projectStudioRunItemGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioRunItemGetRequest(
+    const body = requests.encodeProjectStudioRunItemGetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.itemId ?? payload.item_id ?? ''),
     );
@@ -8180,7 +8095,7 @@ export const encode = {
       note: String(payload.note ?? ''),
       attachments_json: String(payload.attachmentsJson ?? payload.attachments_json ?? ''),
     };
-    const body = _wasm.encodeProjectStudioRunStepSetRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioRunStepSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -8196,21 +8111,21 @@ export const encode = {
       duration_secs: Number(payload.durationSecs ?? payload.duration_secs ?? 0),
       attachments_json: String(payload.attachmentsJson ?? payload.attachments_json ?? ''),
     };
-    const body = _wasm.encodeProjectStudioRunItemFinishRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioRunItemFinishRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(MyTestWorkRequest) — cross-project, no payload. */
   projectStudioMyTestWorkRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioMyTestWorkRequest();
+    const body = requests.encodeProjectStudioMyTestWorkRequest();
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(TasksListRequest). payload: { projectId, taskType?, status?, assignedTo?, search?, offset?, limit? }. */
   projectStudioTasksListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTasksListRequest(
+    const body = requests.encodeProjectStudioTasksListRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.taskType ?? payload.task_type ?? ''),
       String(payload.status ?? ''),
@@ -8229,7 +8144,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(TaskGetRequest). payload: { projectId, taskId }. */
   projectStudioTaskGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTaskGetRequest(
+    const body = requests.encodeProjectStudioTaskGetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.taskId ?? payload.task_id ?? ''),
     );
@@ -8255,14 +8170,14 @@ export const encode = {
       links_json: String(payload.linksJson ?? payload.links_json ?? ''),
       attachments_json: String(payload.attachmentsJson ?? payload.attachments_json ?? ''),
     };
-    const body = _wasm.encodeProjectStudioTaskSaveRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioTaskSaveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(TaskDeleteRequest). payload: { projectId, taskId }. */
   projectStudioTaskDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTaskDeleteRequest(
+    const body = requests.encodeProjectStudioTaskDeleteRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.taskId ?? payload.task_id ?? ''),
     );
@@ -8272,7 +8187,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(TaskCommentAddRequest). payload: { projectId, taskId, bodyMd, mentionUserIds }. */
   projectStudioTaskCommentAddRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTaskCommentAddRequest(
+    const body = requests.encodeProjectStudioTaskCommentAddRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.taskId ?? payload.task_id ?? ''),
       String(payload.bodyMd ?? payload.body_md ?? ''),
@@ -8284,7 +8199,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(TaskCommentEditRequest). payload: { projectId, commentId, bodyMd, mentionUserIds }. */
   projectStudioTaskCommentEditRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTaskCommentEditRequest(
+    const body = requests.encodeProjectStudioTaskCommentEditRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.commentId ?? payload.comment_id ?? ''),
       String(payload.bodyMd ?? payload.body_md ?? ''),
@@ -8296,7 +8211,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(TaskCommentDeleteRequest). payload: { projectId, commentId }. */
   projectStudioTaskCommentDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTaskCommentDeleteRequest(
+    const body = requests.encodeProjectStudioTaskCommentDeleteRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.commentId ?? payload.comment_id ?? ''),
     );
@@ -8305,7 +8220,7 @@ export const encode = {
 
   projectStudioTaskArchiveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTaskArchiveRequest(JSON.stringify({
+    const body = requests.encodeProjectStudioTaskArchiveRequest(JSON.stringify({
       project_id: String(payload.projectId ?? payload.project_id ?? ''),
       task_id: String(payload.taskId ?? payload.task_id ?? ''),
       archived: !!payload.archived,
@@ -8315,7 +8230,7 @@ export const encode = {
 
   projectStudioTaskHandoverRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTaskHandoverRequest(JSON.stringify({
+    const body = requests.encodeProjectStudioTaskHandoverRequest(JSON.stringify({
       project_id: String(payload.projectId ?? payload.project_id ?? ''),
       task_id: String(payload.taskId ?? payload.task_id ?? ''),
       assigned_to: String(payload.assignedTo ?? payload.assigned_to ?? ''),
@@ -8327,7 +8242,7 @@ export const encode = {
 
   projectStudioTaskTypesListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTaskTypesListRequest(JSON.stringify({
+    const body = requests.encodeProjectStudioTaskTypesListRequest(JSON.stringify({
       project_id: String(payload.projectId ?? payload.project_id ?? ''),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -8335,7 +8250,7 @@ export const encode = {
 
   projectStudioTaskTypeSaveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTaskTypeSaveRequest(JSON.stringify({
+    const body = requests.encodeProjectStudioTaskTypeSaveRequest(JSON.stringify({
       project_id: String(payload.projectId ?? payload.project_id ?? ''),
       type_id: String(payload.typeId ?? payload.type_id ?? ''),
       name: String(payload.name ?? ''),
@@ -8349,7 +8264,7 @@ export const encode = {
   projectStudioTaskEventsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const beforeId = payload.beforeId ?? payload.before_id ?? null;
-    const body = _wasm.encodeProjectStudioTaskEventsRequest(JSON.stringify({
+    const body = requests.encodeProjectStudioTaskEventsRequest(JSON.stringify({
       project_id: String(payload.projectId ?? payload.project_id ?? ''),
       task_id: String(payload.taskId ?? payload.task_id ?? ''),
       before_id: beforeId == null ? null : Number(beforeId),
@@ -8360,7 +8275,7 @@ export const encode = {
 
   projectStudioTaskLinksListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTaskLinksListRequest(JSON.stringify({
+    const body = requests.encodeProjectStudioTaskLinksListRequest(JSON.stringify({
       project_id: String(payload.projectId ?? payload.project_id ?? ''),
       task_id: String(payload.taskId ?? payload.task_id ?? ''),
     }));
@@ -8369,7 +8284,7 @@ export const encode = {
 
   projectStudioTaskLinkSaveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTaskLinkSaveRequest(JSON.stringify({
+    const body = requests.encodeProjectStudioTaskLinkSaveRequest(JSON.stringify({
       project_id: String(payload.projectId ?? payload.project_id ?? ''),
       source_task_id: String(payload.sourceTaskId ?? payload.source_task_id ?? ''),
       target_task_id: String(payload.targetTaskId ?? payload.target_task_id ?? ''),
@@ -8381,7 +8296,7 @@ export const encode = {
 
   projectStudioTaskLinkDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTaskLinkDeleteRequest(JSON.stringify({
+    const body = requests.encodeProjectStudioTaskLinkDeleteRequest(JSON.stringify({
       project_id: String(payload.projectId ?? payload.project_id ?? ''),
       link_id: Number(payload.linkId ?? payload.link_id ?? 0),
     }));
@@ -8400,21 +8315,21 @@ export const encode = {
       instructions: String(payload.instructions ?? ''),
       agent_id: agentId == null || agentId === '' ? null : String(agentId),
     };
-    const body = _wasm.encodeProjectStudioGenerationStartRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioGenerationStartRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(GenerationsListRequest). payload: { projectId }. */
   projectStudioGenerationsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioGenerationsListRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    const body = requests.encodeProjectStudioGenerationsListRequest(String(payload.projectId ?? payload.project_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(GenerationGetRequest). payload: { projectId, genId } — polling is the progress source of truth. */
   projectStudioGenerationGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioGenerationGetRequest(
+    const body = requests.encodeProjectStudioGenerationGetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.genId ?? payload.gen_id ?? ''),
     );
@@ -8424,7 +8339,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(GenerationCancelRequest). payload: { projectId, genId }. */
   projectStudioGenerationCancelRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioGenerationCancelRequest(
+    const body = requests.encodeProjectStudioGenerationCancelRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.genId ?? payload.gen_id ?? ''),
     );
@@ -8446,14 +8361,14 @@ export const encode = {
         : []
       ).map(String),
     };
-    const body = _wasm.encodeProjectStudioGenerationReviewRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioGenerationReviewRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(GenerationDeleteRequest). payload: { projectId, genId }. */
   projectStudioGenerationDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioGenerationDeleteRequest(
+    const body = requests.encodeProjectStudioGenerationDeleteRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.genId ?? payload.gen_id ?? ''),
     );
@@ -8464,7 +8379,7 @@ export const encode = {
   projectStudioNotificationsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const beforeId = payload.beforeId ?? payload.before_id;
-    const body = _wasm.encodeProjectStudioNotificationsListRequest(
+    const body = requests.encodeProjectStudioNotificationsListRequest(
       !!(payload.onlyUnread ?? payload.only_unread ?? false),
       beforeId == null || beforeId === '' ? undefined : String(beforeId),
       Number(payload.limit ?? 50),
@@ -8481,7 +8396,7 @@ export const encode = {
         : []
       ).map(String),
     };
-    const body = _wasm.encodeProjectStudioNotificationsMarkReadRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioNotificationsMarkReadRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -8497,7 +8412,7 @@ export const encode = {
       suite_id: String(payload.suiteId ?? payload.suite_id ?? ''),
       run_ids: (Array.isArray(runIds) ? runIds : []).map(String),
     };
-    const body = _wasm.encodeProjectStudioReportQueryRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioReportQueryRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -8511,7 +8426,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(EnvironmentsListRequest). payload: { projectId }. */
   projectStudioEnvironmentsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioEnvironmentsListRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    const body = requests.encodeProjectStudioEnvironmentsListRequest(String(payload.projectId ?? payload.project_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -8535,14 +8450,14 @@ export const encode = {
       ).map(String),
       justification: String(payload.justification ?? ''),
     };
-    const body = _wasm.encodeProjectStudioEnvironmentSaveRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioEnvironmentSaveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(EnvironmentDeleteRequest). payload: { projectId, environmentId }. */
   projectStudioEnvironmentDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioEnvironmentDeleteRequest(
+    const body = requests.encodeProjectStudioEnvironmentDeleteRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.environmentId ?? payload.environment_id ?? ''),
     );
@@ -8552,14 +8467,14 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(EnvApprovalsListRequest) — admin only, cross-project pending approvals; no payload. */
   projectStudioEnvApprovalsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioEnvApprovalsListRequest();
+    const body = requests.encodeProjectStudioEnvApprovalsListRequest();
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(EnvApprovalDecideRequest). payload: { projectId, environmentId, approve, reason? } — rejection requires non-empty reason. */
   projectStudioEnvApprovalDecideRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioEnvApprovalDecideRequest(
+    const body = requests.encodeProjectStudioEnvApprovalDecideRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.environmentId ?? payload.environment_id ?? ''),
       !!(payload.approve ?? false),
@@ -8571,7 +8486,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(BuildProfileGetRequest). payload: { projectId, sourceId }. */
   projectStudioBuildProfileGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioBuildProfileGetRequest(
+    const body = requests.encodeProjectStudioBuildProfileGetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.sourceId ?? payload.source_id ?? ''),
     );
@@ -8590,14 +8505,14 @@ export const encode = {
       test_cmd: String(payload.testCmd ?? payload.test_cmd ?? ''),
       workdir: String(payload.workdir ?? ''),
     };
-    const body = _wasm.encodeProjectStudioBuildProfileSaveRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioBuildProfileSaveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(RunnersListRequest). payload: { projectId } — test-runner discovery. */
   projectStudioRunnersListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioRunnersListRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    const body = requests.encodeProjectStudioRunnersListRequest(String(payload.projectId ?? payload.project_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -8614,14 +8529,14 @@ export const encode = {
       runner_service_id: String(payload.runnerServiceId ?? payload.runner_service_id ?? ''),
       perf_profile_json: String(payload.perfProfileJson ?? payload.perf_profile_json ?? ''),
     };
-    const body = _wasm.encodeProjectStudioRunStartAutoRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioRunStartAutoRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(RunAutoGetRequest). payload: { projectId, runId } — polling snapshot, source of truth for automated-run progress. */
   projectStudioRunAutoGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioRunAutoGetRequest(
+    const body = requests.encodeProjectStudioRunAutoGetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.runId ?? payload.run_id ?? ''),
     );
@@ -8631,7 +8546,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(RunAutoCancelRequest). payload: { projectId, runId }. */
   projectStudioRunAutoCancelRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioRunAutoCancelRequest(
+    const body = requests.encodeProjectStudioRunAutoCancelRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.runId ?? payload.run_id ?? ''),
     );
@@ -8650,14 +8565,14 @@ export const encode = {
       language: String(payload.language ?? ''),
       perf_profile_json: String(payload.perfProfileJson ?? payload.perf_profile_json ?? ''),
     };
-    const body = _wasm.encodeProjectStudioTryRunStartRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioTryRunStartRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(TryRunCancelRequest). payload: { projectId, tryId } — addresses the ephemeral execution by the client-minted tryId. */
   projectStudioTryRunCancelRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTryRunCancelRequest(
+    const body = requests.encodeProjectStudioTryRunCancelRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.tryId ?? payload.try_id ?? ''),
     );
@@ -8667,7 +8582,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(SourceRefreshRequest). payload: { projectId, sourceId } — git sources only: fetch + delta re-index. */
   projectStudioSourceRefreshRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioSourceRefreshRequest(
+    const body = requests.encodeProjectStudioSourceRefreshRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.sourceId ?? payload.source_id ?? ''),
     );
@@ -8677,7 +8592,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(ApiSpecEndpointsRequest). payload: { projectId, sourceId } — parsed endpoint list of an api_spec source. */
   projectStudioApiSpecEndpointsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioApiSpecEndpointsRequest(
+    const body = requests.encodeProjectStudioApiSpecEndpointsRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.sourceId ?? payload.source_id ?? ''),
     );
@@ -8688,7 +8603,7 @@ export const encode = {
   projectStudioSourceSecretSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const token = payload.token;
-    const body = _wasm.encodeProjectStudioSourceSecretSetRequest(
+    const body = requests.encodeProjectStudioSourceSecretSetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.sourceId ?? payload.source_id ?? ''),
       token == null || token === '' ? undefined : String(token),
@@ -8699,7 +8614,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(RunArtifactGetRequest). payload: { projectId, artifactId, maxBytes? } — server clamps to 32 MiB, response.bytes arrives as Uint8Array. */
   projectStudioRunArtifactGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioRunArtifactGetRequest(
+    const body = requests.encodeProjectStudioRunArtifactGetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.artifactId ?? payload.artifact_id ?? ''),
       Number(payload.maxBytes ?? payload.max_bytes ?? 0),
@@ -8710,7 +8625,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(RunAutoStreamRequest). payload: { projectId, runId } — subscribe to the live view of an automated run (chunks = RunAutoStreamChunk, end = RunAutoStreamEnd). */
   projectStudioRunAutoStreamRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioRunAutoStreamRequest(
+    const body = requests.encodeProjectStudioRunAutoStreamRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.runId ?? payload.run_id ?? ''),
     );
@@ -8720,7 +8635,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(CodeAssistRequest) — STREAM-INITIATING: tokens via CodeAssistStreamChunk, final proposal in CodeAssistStreamEnd. payload: { projectId, caseId, kind, selection?, instruction, fullContent } — '' selection = whole script. */
   projectStudioCodeAssistRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioCodeAssistRequest(
+    const body = requests.encodeProjectStudioCodeAssistRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.caseId ?? payload.case_id ?? ''),
       String(payload.kind ?? ''),
@@ -8741,7 +8656,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(SchedulesListRequest). payload: { projectId } — response also carries the node's serverTimezone. */
   projectStudioSchedulesListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioSchedulesListRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    const body = requests.encodeProjectStudioSchedulesListRequest(String(payload.projectId ?? payload.project_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -8766,14 +8681,14 @@ export const encode = {
       timezone: String(payload.timezone ?? ''),
       enabled: !!(payload.enabled ?? false),
     };
-    const body = _wasm.encodeProjectStudioScheduleSaveRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioScheduleSaveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(ScheduleDeleteRequest). payload: { projectId, scheduleId }. */
   projectStudioScheduleDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioScheduleDeleteRequest(
+    const body = requests.encodeProjectStudioScheduleDeleteRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.scheduleId ?? payload.schedule_id ?? ''),
     );
@@ -8783,7 +8698,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(ScheduleSetEnabledRequest). payload: { projectId, scheduleId, enabled } — row toggle; re-enabling recomputes nextRunAt and clears the breaker. */
   projectStudioScheduleSetEnabledRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioScheduleSetEnabledRequest(
+    const body = requests.encodeProjectStudioScheduleSetEnabledRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.scheduleId ?? payload.schedule_id ?? ''),
       !!(payload.enabled ?? false),
@@ -8794,7 +8709,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(ScheduleRunNowRequest). payload: { projectId, scheduleId } — fires through the same gate chain as the loop, never moves nextRunAt. */
   projectStudioScheduleRunNowRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioScheduleRunNowRequest(
+    const body = requests.encodeProjectStudioScheduleRunNowRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.scheduleId ?? payload.schedule_id ?? ''),
     );
@@ -8804,7 +8719,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(ScheduleRunsListRequest). payload: { projectId, scheduleId, limit? } — trigger history of one schedule. */
   projectStudioScheduleRunsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioScheduleRunsListRequest(
+    const body = requests.encodeProjectStudioScheduleRunsListRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.scheduleId ?? payload.schedule_id ?? ''),
       Number(payload.limit ?? 0),
@@ -8815,7 +8730,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(MlLinksListRequest). payload: { projectId } — response carries canManage for the create/attach/detach actions. */
   projectStudioMlLinksListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioMlLinksListRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    const body = requests.encodeProjectStudioMlLinksListRequest(String(payload.projectId ?? payload.project_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -8834,14 +8749,14 @@ export const encode = {
       sync_permissions: !!(payload.syncPermissions ?? payload.sync_permissions ?? false),
       label: String(payload.label ?? ''),
     };
-    const body = _wasm.encodeProjectStudioMlProjectCreateFromProjectRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioMlProjectCreateFromProjectRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(MlProjectCandidatesRequest). payload: { projectId } — ML projects the caller OWNS and that are not linked yet. */
   projectStudioMlProjectCandidatesRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioMlProjectCandidatesRequest(String(payload.projectId ?? payload.project_id ?? ''));
+    const body = requests.encodeProjectStudioMlProjectCandidatesRequest(String(payload.projectId ?? payload.project_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -8859,7 +8774,7 @@ export const encode = {
         ml_role: String(r.mlRole ?? r.ml_role ?? ''),
       })),
     };
-    const body = _wasm.encodeProjectStudioMlLinkAttachRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioMlLinkAttachRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -8877,14 +8792,14 @@ export const encode = {
         ml_role: String(r.mlRole ?? r.ml_role ?? ''),
       })),
     };
-    const body = _wasm.encodeProjectStudioMlLinkUpdateRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioMlLinkUpdateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(MlLinkDetachRequest). payload: { projectId, linkId, revokeMembers } — revokeMembers also drops the ML memberships this link granted; the ML project is never deleted. */
   projectStudioMlLinkDetachRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioMlLinkDetachRequest(
+    const body = requests.encodeProjectStudioMlLinkDetachRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.linkId ?? payload.link_id ?? ''),
       !!(payload.revokeMembers ?? payload.revoke_members ?? false),
@@ -8895,7 +8810,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(MlLinkSyncNowRequest). payload: { projectId, linkId }. */
   projectStudioMlLinkSyncNowRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioMlLinkSyncNowRequest(
+    const body = requests.encodeProjectStudioMlLinkSyncNowRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.linkId ?? payload.link_id ?? ''),
     );
@@ -8905,7 +8820,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(TaskStatusSetRequest). payload: { projectId, taskId, status } — status-only kanban move; TaskSave would clear descriptionMd and attachments. */
   projectStudioTaskStatusSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTaskStatusSetRequest(
+    const body = requests.encodeProjectStudioTaskStatusSetRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.taskId ?? payload.task_id ?? ''),
       String(payload.status ?? ''),
@@ -8923,14 +8838,14 @@ export const encode = {
       include_user_names: !!(payload.includeUserNames ?? payload.include_user_names ?? false),
       scope: String(payload.scope ?? 'node'),
     };
-    const body = _wasm.encodeProjectStudioProjectExportStartRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioProjectExportStartRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(ProjectExportStatusRequest). payload: { projectId, jobId } — polling is the source of truth; the finished archive is downloaded over the returned signedUrl, not the binary protocol. */
   projectStudioProjectExportStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioProjectExportStatusRequest(
+    const body = requests.encodeProjectStudioProjectExportStatusRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       String(payload.jobId ?? payload.job_id ?? ''),
     );
@@ -8942,7 +8857,7 @@ export const encode = {
     assertReady();
     const raw = payload.bytes;
     const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw ?? []);
-    const body = _wasm.encodeProjectStudioProjectImportUploadChunkRequest(
+    const body = requests.encodeProjectStudioProjectImportUploadChunkRequest(
       String(payload.uploadId ?? payload.upload_id ?? ''),
       String(payload.filename ?? ''),
       Number(payload.seq ?? 0),
@@ -8955,7 +8870,7 @@ export const encode = {
   /** MessageBody::ProjectStudioBody(ProjectImportPreviewRequest). payload: { uploadId } — reads ONLY the archive manifest, nothing is unpacked before confirmation. */
   projectStudioProjectImportPreviewRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioProjectImportPreviewRequest(String(payload.uploadId ?? payload.upload_id ?? ''));
+    const body = requests.encodeProjectStudioProjectImportPreviewRequest(String(payload.uploadId ?? payload.upload_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -8968,21 +8883,21 @@ export const encode = {
       import_vectors: !!(payload.importVectors ?? payload.import_vectors ?? false),
       import_runs: !!(payload.importRuns ?? payload.import_runs ?? false),
     };
-    const body = _wasm.encodeProjectStudioProjectImportApplyRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioProjectImportApplyRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(ProjectImportStatusRequest). payload: { jobId } — addressed by jobId alone: the project row exists only once the import succeeds. */
   projectStudioProjectImportStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioProjectImportStatusRequest(String(payload.jobId ?? payload.job_id ?? ''));
+    const body = requests.encodeProjectStudioProjectImportStatusRequest(String(payload.jobId ?? payload.job_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::ProjectStudioBody(ArchiveStreamRequest) — STREAM-INITIATING (no plain response): chunks = ArchiveStreamChunk, end = ArchiveStreamEnd. payload: { jobId } — live progress of an export or import job, job owner only. */
   projectStudioArchiveStreamRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioArchiveStreamRequest(String(payload.jobId ?? payload.job_id ?? ''));
+    const body = requests.encodeProjectStudioArchiveStreamRequest(String(payload.jobId ?? payload.job_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -8993,7 +8908,7 @@ export const encode = {
       include_ended: !!(payload.includeEnded ?? payload.include_ended ?? false),
       include_archived: !!(payload.includeArchived ?? payload.include_archived ?? false),
     };
-    const body = _wasm.encodeProjectStudioProjectTreeRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioProjectTreeRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9003,7 +8918,7 @@ export const encode = {
       project_id: String(payload.projectId ?? payload.project_id ?? ''),
       new_parent_id: (payload.newParentId ?? payload.new_parent_id) == null ? null : String(payload.newParentId ?? payload.new_parent_id),
     };
-    const body = _wasm.encodeProjectStudioProjectMoveRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioProjectMoveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9014,7 +8929,7 @@ export const encode = {
       inherit_modules: !!(payload.inheritModules ?? payload.inherit_modules),
       inherit_task_types: !!(payload.inheritTaskTypes ?? payload.inherit_task_types),
     };
-    const body = _wasm.encodeProjectStudioProjectInheritancePreviewRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioProjectInheritancePreviewRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9027,13 +8942,13 @@ export const encode = {
       inherit_task_types: !!(payload.inheritTaskTypes ?? payload.inherit_task_types),
       modules: Array.isArray(payload.modules) ? payload.modules.map(String) : [],
     };
-    const body = _wasm.encodeProjectStudioProjectInheritanceSaveRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioProjectInheritanceSaveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   projectStudioProjectLifecyclePreviewRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioProjectLifecyclePreviewRequest(JSON.stringify({ project_id: String(payload.projectId ?? payload.project_id ?? '') }));
+    const body = requests.encodeProjectStudioProjectLifecyclePreviewRequest(JSON.stringify({ project_id: String(payload.projectId ?? payload.project_id ?? '') }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9045,7 +8960,7 @@ export const encode = {
       confirmation_key: String(payload.confirmationKey ?? payload.confirmation_key ?? ''),
       reason: String(payload.reason ?? ''),
     };
-    const body = _wasm.encodeProjectStudioProjectLifecycleRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioProjectLifecycleRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9056,7 +8971,7 @@ export const encode = {
       task_id: String(payload.taskId ?? payload.task_id ?? ''),
       reason: String(payload.reason ?? ''),
     };
-    const body = _wasm.encodeProjectStudioTaskNotPursuedRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioTaskNotPursuedRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9067,7 +8982,7 @@ export const encode = {
       destination_project_id: String(payload.destinationProjectId ?? payload.destination_project_id ?? ''),
       task_id: String(payload.taskId ?? payload.task_id ?? ''),
     };
-    const body = _wasm.encodeProjectStudioTaskTransferPreviewRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioTaskTransferPreviewRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9079,7 +8994,7 @@ export const encode = {
       task_id: String(payload.taskId ?? payload.task_id ?? ''),
       confirm_wider_access: !!(payload.confirmWiderAccess ?? payload.confirm_wider_access),
     };
-    const body = _wasm.encodeProjectStudioTaskTransferRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioTaskTransferRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9092,13 +9007,13 @@ export const encode = {
       origin_project_id: (payload.originProjectId ?? payload.origin_project_id) == null ? null : String(payload.originProjectId ?? payload.origin_project_id),
       origin_event_id: eventId == null ? null : String(eventId),
     };
-    const body = _wasm.encodeProjectStudioTaskKeyResolveRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioTaskKeyResolveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   projectStudioTaskIndexStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProjectStudioTaskIndexStatusRequest(JSON.stringify({ project_id: String(payload.projectId ?? payload.project_id ?? '') }));
+    const body = requests.encodeProjectStudioTaskIndexStatusRequest(JSON.stringify({ project_id: String(payload.projectId ?? payload.project_id ?? '') }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9109,7 +9024,7 @@ export const encode = {
       scope: String(payload.scope ?? 'node'),
       operation: String(payload.operation ?? 'export'),
     };
-    const body = _wasm.encodeProjectStudioProjectScopePreviewRequest(JSON.stringify(request));
+    const body = requests.encodeProjectStudioProjectScopePreviewRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9131,7 +9046,7 @@ export const encode = {
   /** MessageBody::CodeStudioBody(WorkspacesListRequest). payload: { includeArchived } — answers with workspaces + the caller's create grant + the node picker. */
   codeStudioWorkspacesListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCodeStudioWorkspacesListRequest(
+    const body = requests.encodeCodeStudioWorkspacesListRequest(
       !!(payload.includeArchived ?? payload.include_archived ?? false),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -9151,7 +9066,7 @@ export const encode = {
       user_id: csText(m.userId ?? m.user_id),
       role: csText(m.role, 'viewer'),
     })));
-    const body = _wasm.encodeCodeStudioWorkspaceCreateRequest(
+    const body = requests.encodeCodeStudioWorkspaceCreateRequest(
       csText(payload.name),
       csText(payload.nodeId ?? payload.node_id),
       csText(payload.execMode ?? payload.exec_mode, 'trusted_native'),
@@ -9173,21 +9088,21 @@ export const encode = {
   /** MessageBody::CodeStudioBody(WorkspaceGetRequest). payload: { workspaceId } — detail + members + provisioning steps. */
   codeStudioWorkspaceGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCodeStudioWorkspaceGetRequest(csText(payload.workspaceId ?? payload.workspace_id));
+    const body = requests.encodeCodeStudioWorkspaceGetRequest(csText(payload.workspaceId ?? payload.workspace_id));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::CodeStudioBody(WorkspaceRetryRequest). payload: { workspaceId } — resumes provisioning; `done` steps are skipped. */
   codeStudioWorkspaceRetryRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCodeStudioWorkspaceRetryRequest(csText(payload.workspaceId ?? payload.workspace_id));
+    const body = requests.encodeCodeStudioWorkspaceRetryRequest(csText(payload.workspaceId ?? payload.workspace_id));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::CodeStudioBody(WorkspaceArchiveRequest). payload: { workspaceId, archived }. */
   codeStudioWorkspaceArchiveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCodeStudioWorkspaceArchiveRequest(
+    const body = requests.encodeCodeStudioWorkspaceArchiveRequest(
       csText(payload.workspaceId ?? payload.workspace_id),
       !!(payload.archived ?? false),
     );
@@ -9197,7 +9112,7 @@ export const encode = {
   /** MessageBody::CodeStudioBody(WorkspaceMemberSetRequest). payload: { workspaceId, userId, role } — adds or re-roles a member. */
   codeStudioWorkspaceMemberSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCodeStudioWorkspaceMemberSetRequest(
+    const body = requests.encodeCodeStudioWorkspaceMemberSetRequest(
       csText(payload.workspaceId ?? payload.workspace_id),
       csText(payload.userId ?? payload.user_id),
       csText(payload.role, 'viewer'),
@@ -9208,7 +9123,7 @@ export const encode = {
   /** MessageBody::CodeStudioBody(WorkspaceMemberRemoveRequest). payload: { workspaceId, userId }. */
   codeStudioWorkspaceMemberRemoveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCodeStudioWorkspaceMemberRemoveRequest(
+    const body = requests.encodeCodeStudioWorkspaceMemberRemoveRequest(
       csText(payload.workspaceId ?? payload.workspace_id),
       csText(payload.userId ?? payload.user_id),
     );
@@ -9218,7 +9133,7 @@ export const encode = {
   /** MessageBody::CodeStudioBody(WorkspaceCreatorGrantSetRequest). payload: { userId, granted } — the per-user right to create workspaces. */
   codeStudioWorkspaceCreatorGrantSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCodeStudioWorkspaceCreatorGrantSetRequest(
+    const body = requests.encodeCodeStudioWorkspaceCreatorGrantSetRequest(
       csText(payload.userId ?? payload.user_id),
       !!(payload.granted ?? false),
     );
@@ -9228,14 +9143,14 @@ export const encode = {
   /** MessageBody::CodeStudioBody(SessionsListRequest). payload: { workspaceId } — the CALLER's sessions; the server filters by user with no admin bypass. */
   codeStudioSessionsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCodeStudioSessionsListRequest(csText(payload.workspaceId ?? payload.workspace_id));
+    const body = requests.encodeCodeStudioSessionsListRequest(csText(payload.workspaceId ?? payload.workspace_id));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::CodeStudioBody(SessionOpenRequest). payload: { workspaceId, title, autonomyMode } — the branch is derived server-side, never sent from the UI, and the account is the AGENT's, so no picker travels. */
   codeStudioSessionOpenRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCodeStudioSessionOpenRequest(
+    const body = requests.encodeCodeStudioSessionOpenRequest(
       csText(payload.workspaceId ?? payload.workspace_id),
       csText(payload.title),
       csText(payload.autonomyMode ?? payload.autonomy_mode, 'normal'),
@@ -9246,7 +9161,7 @@ export const encode = {
   /** MessageBody::CodeStudioBody(SessionCloseRequest). payload: { workspaceId, sessionId } — drops the worktree, keeps the branch. */
   codeStudioSessionCloseRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCodeStudioSessionCloseRequest(
+    const body = requests.encodeCodeStudioSessionCloseRequest(
       csText(payload.workspaceId ?? payload.workspace_id),
       csText(payload.sessionId ?? payload.session_id),
     );
@@ -9261,7 +9176,7 @@ export const encode = {
       path: csText(payload.path),
       depth: Number(payload.depth ?? 1),
     };
-    const body = _wasm.encodeCodeStudioFileTreeRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioFileTreeRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9276,7 +9191,7 @@ export const encode = {
       start_line: startLine == null || startLine === '' ? null : Number(startLine),
       end_line: endLine == null || endLine === '' ? null : Number(endLine),
     };
-    const body = _wasm.encodeCodeStudioFileReadRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioFileReadRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9289,7 +9204,7 @@ export const encode = {
       content: csText(payload.content),
       expected_blob_sha: csOptText(payload.expectedBlobSha ?? payload.expected_blob_sha),
     };
-    const body = _wasm.encodeCodeStudioFileWriteRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioFileWriteRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9301,7 +9216,7 @@ export const encode = {
       path: csText(payload.path),
       content: csText(payload.content),
     };
-    const body = _wasm.encodeCodeStudioFileCreateRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioFileCreateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9314,7 +9229,7 @@ export const encode = {
       recursive: !!(payload.recursive ?? false),
       expected_blob_sha: csOptText(payload.expectedBlobSha ?? payload.expected_blob_sha),
     };
-    const body = _wasm.encodeCodeStudioFileDeleteRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioFileDeleteRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9327,7 +9242,7 @@ export const encode = {
       to_path: csText(payload.toPath ?? payload.to_path),
       expected_blob_sha: csOptText(payload.expectedBlobSha ?? payload.expected_blob_sha),
     };
-    const body = _wasm.encodeCodeStudioFileRenameRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioFileRenameRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9335,7 +9250,7 @@ export const encode = {
   codeStudioFileMkdirRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { ...csScope(payload), path: csText(payload.path) };
-    const body = _wasm.encodeCodeStudioFileMkdirRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioFileMkdirRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9349,14 +9264,14 @@ export const encode = {
       regex: !!(payload.regex ?? false),
       max_results: Number(payload.maxResults ?? payload.max_results ?? 200),
     };
-    const body = _wasm.encodeCodeStudioFileGrepRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioFileGrepRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::CodeStudioBody(GitStatusRequest). payload: { workspaceId, sessionId }. */
   codeStudioGitStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCodeStudioGitStatusRequest(JSON.stringify(csScope(payload)));
+    const body = requests.encodeCodeStudioGitStatusRequest(JSON.stringify(csScope(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9368,14 +9283,14 @@ export const encode = {
       path: csText(payload.path),
       limit: Number(payload.limit ?? 50),
     };
-    const body = _wasm.encodeCodeStudioGitLogRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioGitLogRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::CodeStudioBody(GitBranchesRequest). payload: { workspaceId, sessionId }. */
   codeStudioGitBranchesRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCodeStudioGitBranchesRequest(JSON.stringify(csScope(payload)));
+    const body = requests.encodeCodeStudioGitBranchesRequest(JSON.stringify(csScope(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9388,7 +9303,7 @@ export const encode = {
       staged: !!(payload.staged ?? false),
       base: csText(payload.base),
     };
-    const body = _wasm.encodeCodeStudioGitDiffRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioGitDiffRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9400,7 +9315,7 @@ export const encode = {
       message: csText(payload.message),
       patch_set_id: csOptText(payload.patchSetId ?? payload.patch_set_id),
     };
-    const body = _wasm.encodeCodeStudioGitCommitRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioGitCommitRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9412,7 +9327,7 @@ export const encode = {
       remote: csText(payload.remote, 'origin'),
       set_upstream: !!(payload.setUpstream ?? payload.set_upstream ?? false),
     };
-    const body = _wasm.encodeCodeStudioGitPushRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioGitPushRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9420,7 +9335,7 @@ export const encode = {
   codeStudioGitSyncRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { ...csScope(payload), mode: csText(payload.mode, 'fetch') };
-    const body = _wasm.encodeCodeStudioGitSyncRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioGitSyncRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9432,7 +9347,7 @@ export const encode = {
       source_branch: csText(payload.sourceBranch ?? payload.source_branch),
       target_branch: csText(payload.targetBranch ?? payload.target_branch),
     };
-    const body = _wasm.encodeCodeStudioGitMergeRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioGitMergeRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9444,7 +9359,7 @@ export const encode = {
       op_id: csText(payload.opId ?? payload.op_id),
       patch_set_id: csText(payload.patchSetId ?? payload.patch_set_id),
     };
-    const body = _wasm.encodeCodeStudioGitMergeFinalizeRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioGitMergeFinalizeRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9452,14 +9367,14 @@ export const encode = {
   codeStudioGitMergeAbandonRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { ...csScope(payload), op_id: csText(payload.opId ?? payload.op_id) };
-    const body = _wasm.encodeCodeStudioGitMergeAbandonRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioGitMergeAbandonRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::CodeStudioBody(WorktreesListRequest). payload: { workspaceId, sessionId }. */
   codeStudioWorktreesListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCodeStudioWorktreesListRequest(JSON.stringify(csScope(payload)));
+    const body = requests.encodeCodeStudioWorktreesListRequest(JSON.stringify(csScope(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9467,7 +9382,7 @@ export const encode = {
   codeStudioPatchSetsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { ...csScope(payload), status: csText(payload.status) };
-    const body = _wasm.encodeCodeStudioPatchSetsListRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioPatchSetsListRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9478,7 +9393,7 @@ export const encode = {
       ...csScope(payload),
       patch_set_id: csText(payload.patchSetId ?? payload.patch_set_id),
     };
-    const body = _wasm.encodeCodeStudioPatchSetGetRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioPatchSetGetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9499,7 +9414,7 @@ export const encode = {
       patch_set_id: csText(payload.patchSetId ?? payload.patch_set_id),
       files,
     };
-    const body = _wasm.encodeCodeStudioPatchDecideRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioPatchDecideRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9510,7 +9425,7 @@ export const encode = {
       ...csScope(payload),
       patch_set_id: csText(payload.patchSetId ?? payload.patch_set_id),
     };
-    const body = _wasm.encodeCodeStudioPatchSetAbandonRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioPatchSetAbandonRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9522,7 +9437,7 @@ export const encode = {
       after_seq: Number(payload.afterSeq ?? payload.after_seq ?? 0),
       limit: Number(payload.limit ?? 100),
     };
-    const body = _wasm.encodeCodeStudioSessionTimelineRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioSessionTimelineRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9534,7 +9449,7 @@ export const encode = {
       status: csText(payload.status),
       limit: Number(payload.limit ?? 100),
     };
-    const body = _wasm.encodeCodeStudioSessionOperationsRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioSessionOperationsRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9547,7 +9462,7 @@ export const encode = {
       resolution: csText(payload.resolution),
       note: csText(payload.note),
     };
-    const body = _wasm.encodeCodeStudioOperationResolveRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioOperationResolveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9555,7 +9470,7 @@ export const encode = {
   codeStudioApprovalsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { ...csScope(payload), status: csText(payload.status) };
-    const body = _wasm.encodeCodeStudioApprovalsListRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioApprovalsListRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9567,14 +9482,14 @@ export const encode = {
       approval_id: csText(payload.approvalId ?? payload.approval_id),
       decision: csText(payload.decision),
     };
-    const body = _wasm.encodeCodeStudioApprovalDecideRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioApprovalDecideRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::CodeStudioBody(SessionGrantsListRequest). payload: { workspaceId, sessionId }. */
   codeStudioSessionGrantsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCodeStudioSessionGrantsListRequest(JSON.stringify(csScope(payload)));
+    const body = requests.encodeCodeStudioSessionGrantsListRequest(JSON.stringify(csScope(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9586,7 +9501,7 @@ export const encode = {
       capability: csText(payload.capability),
       pattern: csText(payload.pattern),
     };
-    const body = _wasm.encodeCodeStudioSessionGrantRevokeRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioSessionGrantRevokeRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9594,7 +9509,7 @@ export const encode = {
   codeStudioWorkspaceAllowlistListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { workspace_id: csText(payload.workspaceId ?? payload.workspace_id) };
-    const body = _wasm.encodeCodeStudioWorkspaceAllowlistListRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioWorkspaceAllowlistListRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9606,7 +9521,7 @@ export const encode = {
       capability: csText(payload.capability),
       pattern: csText(payload.pattern),
     };
-    const body = _wasm.encodeCodeStudioWorkspaceAllowlistSetRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioWorkspaceAllowlistSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9618,21 +9533,21 @@ export const encode = {
       capability: csText(payload.capability),
       pattern: csText(payload.pattern),
     };
-    const body = _wasm.encodeCodeStudioWorkspaceAllowlistRemoveRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioWorkspaceAllowlistRemoveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::CodeStudioBody(SessionRunsRequest). payload: { workspaceId, sessionId } — the revision chain with the trigger of every turn. */
   codeStudioSessionRunsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCodeStudioSessionRunsRequest(JSON.stringify(csScope(payload)));
+    const body = requests.encodeCodeStudioSessionRunsRequest(JSON.stringify(csScope(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::CodeStudioBody(SessionTasksRequest). payload: { workspaceId, sessionId } — the session's plan, the rows the build loop's gate checks. */
   codeStudioSessionTasksRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeCodeStudioSessionTasksRequest(JSON.stringify(csScope(payload)));
+    const body = requests.encodeCodeStudioSessionTasksRequest(JSON.stringify(csScope(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9640,7 +9555,7 @@ export const encode = {
   codeStudioSessionMessageSendRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { ...csScope(payload), message: csText(payload.message) };
-    const body = _wasm.encodeCodeStudioSessionMessageSendRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioSessionMessageSendRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9648,7 +9563,7 @@ export const encode = {
   codeStudioSessionCancelRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { ...csScope(payload), run_id: csOptText(payload.runId ?? payload.run_id) };
-    const body = _wasm.encodeCodeStudioSessionCancelRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioSessionCancelRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9659,7 +9574,7 @@ export const encode = {
       ...csScope(payload),
       autonomy_mode: csText(payload.autonomyMode ?? payload.autonomy_mode),
     };
-    const body = _wasm.encodeCodeStudioSessionAutonomySetRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioSessionAutonomySetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9676,7 +9591,7 @@ export const encode = {
       network_access: csText(payload.networkAccess ?? payload.network_access, 'none'),
       ephemeral: !!(payload.ephemeral ?? false),
     };
-    const body = _wasm.encodeCodeStudioExecStartRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioExecStartRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9684,7 +9599,7 @@ export const encode = {
   codeStudioExecCancelRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { ...csScope(payload), exec_id: csText(payload.execId ?? payload.exec_id) };
-    const body = _wasm.encodeCodeStudioExecCancelRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioExecCancelRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9697,7 +9612,7 @@ export const encode = {
       after_seq: Number(payload.afterSeq ?? payload.after_seq ?? 0),
       limit: Number(payload.limit ?? 200),
     };
-    const body = _wasm.encodeCodeStudioExecOutputRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioExecOutputRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9709,7 +9624,7 @@ export const encode = {
       rows: Number(payload.rows ?? 24),
       cols: Number(payload.cols ?? 80),
     };
-    const body = _wasm.encodeCodeStudioTerminalOpenRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioTerminalOpenRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9721,7 +9636,7 @@ export const encode = {
       terminal_id: csText(payload.terminalId ?? payload.terminal_id),
       data: csText(payload.data),
     };
-    const body = _wasm.encodeCodeStudioTerminalInputRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioTerminalInputRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9734,7 +9649,7 @@ export const encode = {
       rows: Number(payload.rows ?? 24),
       cols: Number(payload.cols ?? 80),
     };
-    const body = _wasm.encodeCodeStudioTerminalResizeRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioTerminalResizeRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9745,7 +9660,7 @@ export const encode = {
       ...csScope(payload),
       terminal_id: csText(payload.terminalId ?? payload.terminal_id),
     };
-    const body = _wasm.encodeCodeStudioTerminalCloseRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioTerminalCloseRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9756,7 +9671,7 @@ export const encode = {
       ...csScope(payload),
       terminal_id: csText(payload.terminalId ?? payload.terminal_id),
     };
-    const body = _wasm.encodeCodeStudioTerminalSnapshotRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioTerminalSnapshotRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9775,7 +9690,7 @@ export const encode = {
       quota_disk_bytes: quotaDisk == null || quotaDisk === '' ? null : Number(quotaDisk),
       quota_sessions: quotaSessions == null || quotaSessions === '' ? null : Number(quotaSessions),
     };
-    const body = _wasm.encodeCodeStudioWorkspaceSettingsUpdateRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioWorkspaceSettingsUpdateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9788,7 +9703,7 @@ export const encode = {
       secret_material: csOptText(payload.secretMaterial ?? payload.secret_material),
       ssh_host_fingerprint: csOptText(payload.sshHostFingerprint ?? payload.ssh_host_fingerprint),
     };
-    const body = _wasm.encodeCodeStudioWorkspaceSecretSetRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioWorkspaceSecretSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9796,7 +9711,7 @@ export const encode = {
   codeStudioWorkspaceDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { workspace_id: csText(payload.workspaceId ?? payload.workspace_id) };
-    const body = _wasm.encodeCodeStudioWorkspaceDeleteRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioWorkspaceDeleteRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9804,7 +9719,7 @@ export const encode = {
   codeStudioIndexStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { workspace_id: csText(payload.workspaceId ?? payload.workspace_id) };
-    const body = _wasm.encodeCodeStudioIndexStatusRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioIndexStatusRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9815,7 +9730,7 @@ export const encode = {
       workspace_id: csText(payload.workspaceId ?? payload.workspace_id),
       branch: csText(payload.branch),
     };
-    const body = _wasm.encodeCodeStudioIndexRebuildRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioIndexRebuildRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9829,7 +9744,7 @@ export const encode = {
       limit: Number(payload.limit ?? 20),
       mode: csText(payload.mode, 'semantic'),
     };
-    const body = _wasm.encodeCodeStudioCodeSearchRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioCodeSearchRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9840,7 +9755,7 @@ export const encode = {
       ...csScope(payload),
       after_seq: Number(payload.afterSeq ?? payload.after_seq ?? 0),
     };
-    const body = _wasm.encodeCodeStudioSessionStreamRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioSessionStreamRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9852,7 +9767,7 @@ export const encode = {
       terminal_id: csText(payload.terminalId ?? payload.terminal_id),
       after_revision: Number(payload.afterRevision ?? payload.after_revision ?? 0),
     };
-    const body = _wasm.encodeCodeStudioTerminalStreamRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioTerminalStreamRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9863,7 +9778,7 @@ export const encode = {
       workspace_id: csText(payload.workspaceId ?? payload.workspace_id),
       after_seq: Number(payload.afterSeq ?? payload.after_seq ?? 0),
     };
-    const body = _wasm.encodeCodeStudioIndexStreamRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioIndexStreamRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9874,7 +9789,7 @@ export const encode = {
       ...csScope(payload),
       blob_sha: csText(payload.blobSha ?? payload.blob_sha),
     };
-    const body = _wasm.encodeCodeStudioPatchBlobGetRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioPatchBlobGetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9882,7 +9797,7 @@ export const encode = {
   codeStudioTerminalsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = csScope(payload);
-    const body = _wasm.encodeCodeStudioTerminalsListRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioTerminalsListRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9894,7 +9809,7 @@ export const encode = {
       query: csText(payload.query),
       limit: Number(payload.limit ?? 20),
     };
-    const body = _wasm.encodeCodeStudioWorkspaceMemberCandidatesRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioWorkspaceMemberCandidatesRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9902,7 +9817,7 @@ export const encode = {
   codeStudioProjectLinkListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { workspace_id: csText(payload.workspaceId ?? payload.workspace_id) };
-    const body = _wasm.encodeCodeStudioProjectLinkListRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioProjectLinkListRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9914,7 +9829,7 @@ export const encode = {
       project_id: csText(payload.projectId ?? payload.project_id),
       linked: !!(payload.linked ?? false),
     };
-    const body = _wasm.encodeCodeStudioProjectLinkSetRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioProjectLinkSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9928,7 +9843,7 @@ export const encode = {
       path_prefix: csText(payload.pathPrefix ?? payload.path_prefix),
       limit: Number(payload.limit ?? 500),
     };
-    const body = _wasm.encodeCodeStudioRepoTreeRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioRepoTreeRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9940,7 +9855,7 @@ export const encode = {
   codeStudioProcessSandboxRepairRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { sudo_password: String(payload.sudoPassword ?? payload.sudo_password ?? '') };
-    const body = _wasm.encodeCodeStudioProcessSandboxRepairRequest(JSON.stringify(request));
+    const body = requests.encodeCodeStudioProcessSandboxRepairRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9951,7 +9866,7 @@ export const encode = {
   /** MessageBody::EnvironmentPromotionBody(GetKindRequest) (unit). */
   environmentGetKindRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeEnvironmentGetKindRequest();
+    const body = requests.encodeEnvironmentGetKindRequest();
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9963,7 +9878,7 @@ export const encode = {
    */
   environmentSetKindRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeEnvironmentSetKindRequest(
+    const body = requests.encodeEnvironmentSetKindRequest(
       String(payload.newKind ?? payload.new_kind ?? ''),
       payload.confirmEnvironmentName ?? payload.confirm_environment_name ?? null,
     );
@@ -9973,14 +9888,14 @@ export const encode = {
   /** MessageBody::EnvironmentPromotionBody(SetStrictIsolationRequest { strict }). */
   environmentSetStrictIsolationRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeEnvironmentSetStrictIsolationRequest(!!payload.strict);
+    const body = requests.encodeEnvironmentSetStrictIsolationRequest(!!payload.strict);
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::EnvironmentPromotionBody(ExportBundleRequest) (unit) — file-transport export of the local node's current config bundle. */
   environmentExportBundleRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeEnvironmentExportBundleRequest();
+    const body = requests.encodeEnvironmentExportBundleRequest();
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9993,21 +9908,21 @@ export const encode = {
   environmentImportFromFileRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const bytes = payload.archiveBytes ?? payload.archive_bytes;
-    const body = _wasm.encodeEnvironmentImportFromFileRequest(new Uint8Array(bytes));
+    const body = requests.encodeEnvironmentImportFromFileRequest(new Uint8Array(bytes));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::EnvironmentPromotionBody(PullDonorListRequest) (unit) — trusted peers eligible as a pull donor, with their declared environment. */
   environmentPullDonorListRequest(correlationId, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeEnvironmentPullDonorListRequest();
+    const body = requests.encodeEnvironmentPullDonorListRequest();
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::EnvironmentPromotionBody(PullStartRequest { donorNodeId }) — fetches the donor's bundle over QUIC, ready for preview/apply. */
   environmentPullStartRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeEnvironmentPullStartRequest(
+    const body = requests.encodeEnvironmentPullStartRequest(
       String(payload.donorNodeId ?? payload.donor_node_id ?? ''),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -10016,14 +9931,14 @@ export const encode = {
   /** MessageBody::EnvironmentPromotionBody(PullStatusRequest { pullId }). */
   environmentPullStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeEnvironmentPullStatusRequest(String(payload.pullId ?? payload.pull_id ?? ''));
+    const body = requests.encodeEnvironmentPullStatusRequest(String(payload.pullId ?? payload.pull_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::EnvironmentPromotionBody(ImportPreviewDiffRequest { pullId}) — diff a fetched pull against local state, before anything is written. */
   environmentImportPreviewDiffRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeEnvironmentImportPreviewDiffRequest(String(payload.pullId ?? payload.pull_id ?? ''));
+    const body = requests.encodeEnvironmentImportPreviewDiffRequest(String(payload.pullId ?? payload.pull_id ?? ''));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10036,7 +9951,7 @@ export const encode = {
    */
   environmentImportApplyRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeEnvironmentImportApplyRequest(
+    const body = requests.encodeEnvironmentImportApplyRequest(
       String(payload.pullId ?? payload.pull_id ?? ''),
       payload.confirmEnvironmentName ?? payload.confirm_environment_name ?? null,
       (payload.selectedResourceKeys ?? payload.selected_resource_keys ?? []).map(String),
@@ -10055,7 +9970,7 @@ export const encode = {
   // wire: MapBody::SiteListRequest
   mapSiteListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMapSiteListRequest(JSON.stringify({}));
+    const body = requests.encodeMapSiteListRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10064,7 +9979,7 @@ export const encode = {
   mapSiteUpsertRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const site = payload.site ?? payload;
-    const body = _wasm.encodeMapSiteUpsertRequest(JSON.stringify({
+    const body = requests.encodeMapSiteUpsertRequest(JSON.stringify({
       site: {
         site_id: String(site.siteId ?? site.site_id ?? ''),
         name: String(site.name ?? ''),
@@ -10081,7 +9996,7 @@ export const encode = {
   // wire: MapBody::SiteDeleteRequest
   mapSiteDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMapSiteDeleteRequest(JSON.stringify({
+    const body = requests.encodeMapSiteDeleteRequest(JSON.stringify({
       site_id: String(payload.siteId ?? payload.site_id ?? ''),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -10091,7 +10006,7 @@ export const encode = {
   // wire: MapBody::SceneListRequest
   mapSceneListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMapSceneListRequest(JSON.stringify({
+    const body = requests.encodeMapSceneListRequest(JSON.stringify({
       site_id: strOrNull(payload.siteId ?? payload.site_id),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -10102,7 +10017,7 @@ export const encode = {
   mapSceneUpsertRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const scene = payload.scene ?? payload;
-    const body = _wasm.encodeMapSceneUpsertRequest(JSON.stringify({
+    const body = requests.encodeMapSceneUpsertRequest(JSON.stringify({
       scene: {
         scene_id: String(scene.sceneId ?? scene.scene_id ?? ''),
         site_id: String(scene.siteId ?? scene.site_id ?? ''),
@@ -10122,7 +10037,7 @@ export const encode = {
   // wire: MapBody::SceneDeleteRequest — `force` also drops geometry on disk.
   mapSceneDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMapSceneDeleteRequest(JSON.stringify({
+    const body = requests.encodeMapSceneDeleteRequest(JSON.stringify({
       scene_id: String(payload.sceneId ?? payload.scene_id ?? ''),
       force: Boolean(payload.force ?? false),
     }));
@@ -10132,7 +10047,7 @@ export const encode = {
   // wire: MapBody::SceneSetOwnerRequest
   mapSceneSetOwnerRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMapSceneSetOwnerRequest(JSON.stringify({
+    const body = requests.encodeMapSceneSetOwnerRequest(JSON.stringify({
       scene_id: String(payload.sceneId ?? payload.scene_id ?? ''),
       node_id: String(payload.nodeId ?? payload.node_id ?? ''),
       accept_loss: Boolean(payload.acceptLoss ?? payload.accept_loss ?? false),
@@ -10143,7 +10058,7 @@ export const encode = {
   // wire: MapBody::SceneGeoAnchorSetRequest — a null component clears it.
   mapSceneGeoAnchorSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMapSceneGeoAnchorSetRequest(JSON.stringify({
+    const body = requests.encodeMapSceneGeoAnchorSetRequest(JSON.stringify({
       scene_id: String(payload.sceneId ?? payload.scene_id ?? ''),
       lat: numOrNull(payload.lat),
       lon: numOrNull(payload.lon),
@@ -10157,7 +10072,7 @@ export const encode = {
   // wire: MapBody::DeviceListRequest
   mapDeviceListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMapDeviceListRequest(JSON.stringify({
+    const body = requests.encodeMapDeviceListRequest(JSON.stringify({
       scene_id: strOrNull(payload.sceneId ?? payload.scene_id),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -10166,7 +10081,7 @@ export const encode = {
   // wire: MapBody::DeviceAssignRequest
   mapDeviceAssignRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMapDeviceAssignRequest(JSON.stringify({
+    const body = requests.encodeMapDeviceAssignRequest(JSON.stringify({
       scene_id: String(payload.sceneId ?? payload.scene_id ?? ''),
       node_id: String(payload.nodeId ?? payload.node_id ?? ''),
       device_id: String(payload.deviceId ?? payload.device_id ?? ''),
@@ -10177,7 +10092,7 @@ export const encode = {
   // wire: MapBody::DeviceUnassignRequest
   mapDeviceUnassignRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeMapDeviceUnassignRequest(JSON.stringify({
+    const body = requests.encodeMapDeviceUnassignRequest(JSON.stringify({
       node_id: String(payload.nodeId ?? payload.node_id ?? ''),
       device_id: String(payload.deviceId ?? payload.device_id ?? ''),
     }));
@@ -10197,7 +10112,7 @@ export const encode = {
   // wire: OrgStructureBody::StructureRequest
   orgStructureRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureStructureRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureStructureRequest(JSON.stringify({
       at: strOrNull(orgField(payload, 'at')),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -10207,7 +10122,7 @@ export const encode = {
   // wire: OrgStructureBody::ReportsChainRequest
   orgReportsChainRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureReportsChainRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureReportsChainRequest(JSON.stringify({
       target: orgRef(orgField(payload, 'target')),
       direction: String(orgField(payload, 'direction') ?? 'up'),
       seat_scope: String(orgField(payload, 'seatScope') ?? 'primary'),
@@ -10220,7 +10135,7 @@ export const encode = {
   // wire: OrgStructureBody::SubordinatesRequest
   orgSubordinatesRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureSubordinatesRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureSubordinatesRequest(JSON.stringify({
       target: orgRef(orgField(payload, 'target')),
       transitive: Boolean(orgField(payload, 'transitive')),
       seat_scope: String(orgField(payload, 'seatScope') ?? 'primary'),
@@ -10233,7 +10148,7 @@ export const encode = {
   // wire: OrgStructureBody::ManagerRequest
   orgManagerRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureManagerRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureManagerRequest(JSON.stringify({
       user_id: String(orgField(payload, 'userId') ?? ''),
       at: strOrNull(orgField(payload, 'at')),
     }));
@@ -10244,7 +10159,7 @@ export const encode = {
   // wire: OrgStructureBody::AssignmentRequest
   orgAssignmentRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureAssignmentRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureAssignmentRequest(JSON.stringify({
       user_id: String(orgField(payload, 'userId') ?? ''),
       at: strOrNull(orgField(payload, 'at')),
     }));
@@ -10255,7 +10170,7 @@ export const encode = {
   // wire: OrgStructureBody::IntegrityReportRequest
   orgIntegrityReportRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureIntegrityReportRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureIntegrityReportRequest(JSON.stringify({
       at: strOrNull(orgField(payload, 'at')),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -10264,7 +10179,7 @@ export const encode = {
   // wire: OrgStructureBody::UnitTypeCreateRequest
   orgUnitTypeCreateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureUnitTypeCreateRequest(JSON.stringify(ORG_WRITE_FIELDS.unitTypeCreate(payload)));
+    const body = requests.encodeOrgStructureUnitTypeCreateRequest(JSON.stringify(ORG_WRITE_FIELDS.unitTypeCreate(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10272,21 +10187,21 @@ export const encode = {
   // wire: OrgStructureBody::UnitTypeUpdateRequest
   orgUnitTypeUpdateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureUnitTypeUpdateRequest(JSON.stringify(ORG_WRITE_FIELDS.unitTypeUpdate(payload)));
+    const body = requests.encodeOrgStructureUnitTypeUpdateRequest(JSON.stringify(ORG_WRITE_FIELDS.unitTypeUpdate(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   // wire: OrgStructureBody::UnitTypeDeleteRequest
   orgUnitTypeDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureUnitTypeDeleteRequest(JSON.stringify(ORG_WRITE_FIELDS.unitTypeDelete(payload)));
+    const body = requests.encodeOrgStructureUnitTypeDeleteRequest(JSON.stringify(ORG_WRITE_FIELDS.unitTypeDelete(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   // wire: OrgStructureBody::UnitCreateRequest
   orgUnitCreateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureUnitCreateRequest(JSON.stringify(ORG_WRITE_FIELDS.unitCreate(payload)));
+    const body = requests.encodeOrgStructureUnitCreateRequest(JSON.stringify(ORG_WRITE_FIELDS.unitCreate(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10294,7 +10209,7 @@ export const encode = {
   // wire: OrgStructureBody::UnitUpdateRequest
   orgUnitUpdateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureUnitUpdateRequest(JSON.stringify(ORG_WRITE_FIELDS.unitUpdate(payload)));
+    const body = requests.encodeOrgStructureUnitUpdateRequest(JSON.stringify(ORG_WRITE_FIELDS.unitUpdate(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10302,14 +10217,14 @@ export const encode = {
   // wire: OrgStructureBody::UnitMoveRequest
   orgUnitMoveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureUnitMoveRequest(JSON.stringify(ORG_WRITE_FIELDS.unitMove(payload)));
+    const body = requests.encodeOrgStructureUnitMoveRequest(JSON.stringify(ORG_WRITE_FIELDS.unitMove(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   // wire: OrgStructureBody::UnitEndRequest
   orgUnitEndRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureUnitEndRequest(JSON.stringify(ORG_WRITE_FIELDS.unitEnd(payload)));
+    const body = requests.encodeOrgStructureUnitEndRequest(JSON.stringify(ORG_WRITE_FIELDS.unitEnd(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10317,7 +10232,7 @@ export const encode = {
   // wire: OrgStructureBody::HeadSetRequest
   orgHeadSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureHeadSetRequest(JSON.stringify(ORG_WRITE_FIELDS.headSet(payload)));
+    const body = requests.encodeOrgStructureHeadSetRequest(JSON.stringify(ORG_WRITE_FIELDS.headSet(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10325,14 +10240,14 @@ export const encode = {
   // wire: OrgStructureBody::DeputyHeadsSetRequest
   orgDeputyHeadsSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureDeputyHeadsSetRequest(JSON.stringify(ORG_WRITE_FIELDS.deputyHeadsSet(payload)));
+    const body = requests.encodeOrgStructureDeputyHeadsSetRequest(JSON.stringify(ORG_WRITE_FIELDS.deputyHeadsSet(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   // wire: OrgStructureBody::PositionCreateRequest
   orgPositionCreateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructurePositionCreateRequest(JSON.stringify(ORG_WRITE_FIELDS.positionCreate(payload)));
+    const body = requests.encodeOrgStructurePositionCreateRequest(JSON.stringify(ORG_WRITE_FIELDS.positionCreate(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10340,7 +10255,7 @@ export const encode = {
   // wire: OrgStructureBody::PositionUpdateRequest
   orgPositionUpdateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructurePositionUpdateRequest(JSON.stringify(ORG_WRITE_FIELDS.positionUpdate(payload)));
+    const body = requests.encodeOrgStructurePositionUpdateRequest(JSON.stringify(ORG_WRITE_FIELDS.positionUpdate(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10348,49 +10263,49 @@ export const encode = {
   // wire: OrgStructureBody::PositionMoveRequest
   orgPositionMoveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructurePositionMoveRequest(JSON.stringify(ORG_WRITE_FIELDS.positionMove(payload)));
+    const body = requests.encodeOrgStructurePositionMoveRequest(JSON.stringify(ORG_WRITE_FIELDS.positionMove(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   // wire: OrgStructureBody::PositionEndRequest
   orgPositionEndRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructurePositionEndRequest(JSON.stringify(ORG_WRITE_FIELDS.positionEnd(payload)));
+    const body = requests.encodeOrgStructurePositionEndRequest(JSON.stringify(ORG_WRITE_FIELDS.positionEnd(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   // wire: OrgStructureBody::ReportingLineSetRequest
   orgReportingLineSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureReportingLineSetRequest(JSON.stringify(ORG_WRITE_FIELDS.reportingLineSet(payload)));
+    const body = requests.encodeOrgStructureReportingLineSetRequest(JSON.stringify(ORG_WRITE_FIELDS.reportingLineSet(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   // wire: OrgStructureBody::ExternalPersonCreateRequest
   orgExternalPersonCreateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureExternalPersonCreateRequest(JSON.stringify(ORG_WRITE_FIELDS.externalPersonCreate(payload)));
+    const body = requests.encodeOrgStructureExternalPersonCreateRequest(JSON.stringify(ORG_WRITE_FIELDS.externalPersonCreate(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   // wire: OrgStructureBody::AssignRequest
   orgAssignRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureAssignRequest(JSON.stringify(ORG_WRITE_FIELDS.assign(payload)));
+    const body = requests.encodeOrgStructureAssignRequest(JSON.stringify(ORG_WRITE_FIELDS.assign(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   // wire: OrgStructureBody::AssignmentUpdateRequest
   orgAssignmentUpdateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureAssignmentUpdateRequest(JSON.stringify(ORG_WRITE_FIELDS.assignmentUpdate(payload)));
+    const body = requests.encodeOrgStructureAssignmentUpdateRequest(JSON.stringify(ORG_WRITE_FIELDS.assignmentUpdate(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   // wire: OrgStructureBody::AssignmentEndRequest
   orgAssignmentEndRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureAssignmentEndRequest(JSON.stringify(ORG_WRITE_FIELDS.assignmentEnd(payload)));
+    const body = requests.encodeOrgStructureAssignmentEndRequest(JSON.stringify(ORG_WRITE_FIELDS.assignmentEnd(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10418,7 +10333,7 @@ export const encode = {
       throw error;
     }
     const ops = orgWriteOpsToWire(list);
-    const body = _wasm.encodeOrgStructureBatchRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureBatchRequest(JSON.stringify({
       ops,
       dry_run: Boolean(orgField(payload, 'dryRun')),
       confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
@@ -10435,7 +10350,7 @@ export const encode = {
   // wire: OrgStructureBody::MemberListRequest
   orgMemberListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureMemberListRequest(JSON.stringify({}));
+    const body = requests.encodeOrgStructureMemberListRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10443,7 +10358,7 @@ export const encode = {
   // wire: OrgStructureBody::CoverRequest
   orgCoverRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureCoverRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureCoverRequest(JSON.stringify({
       user_id: strOrNull(orgField(payload, 'userId')),
       at: strOrNull(orgField(payload, 'at')),
       include_past: Boolean(orgField(payload, 'includePast')),
@@ -10455,7 +10370,7 @@ export const encode = {
   // wire: OrgStructureBody::AvailabilityRequest
   orgAvailabilityRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureAvailabilityRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureAvailabilityRequest(JSON.stringify({
       at: strOrNull(orgField(payload, 'at')),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -10465,7 +10380,7 @@ export const encode = {
   // wire: OrgStructureBody::EscalationChainRequest
   orgEscalationChainRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureEscalationChainRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureEscalationChainRequest(JSON.stringify({
       user_id: String(orgField(payload, 'userId') ?? ''),
       scope: strOrNull(orgField(payload, 'scope')),
       at: strOrNull(orgField(payload, 'at')),
@@ -10477,7 +10392,7 @@ export const encode = {
   // wire: OrgStructureBody::IsAvailableRequest
   orgIsAvailableRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureIsAvailableRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureIsAvailableRequest(JSON.stringify({
       user_id: String(orgField(payload, 'userId') ?? ''),
       at: strOrNull(orgField(payload, 'at')),
     }));
@@ -10488,7 +10403,7 @@ export const encode = {
   // wire: OrgStructureBody::CanViewPersonDataRequest
   orgCanViewPersonDataRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureCanViewPersonDataRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureCanViewPersonDataRequest(JSON.stringify({
       viewer_user_id: strOrNull(orgField(payload, 'viewerUserId')),
       subject_user_id: String(orgField(payload, 'subjectUserId') ?? ''),
       kind: String(orgField(payload, 'kind') ?? ''),
@@ -10501,7 +10416,7 @@ export const encode = {
   // wire: OrgStructureBody::VisibilityRequest
   orgVisibilityRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureVisibilityRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureVisibilityRequest(JSON.stringify({
       user_id: strOrNull(orgField(payload, 'userId')),
       at: strOrNull(orgField(payload, 'at')),
     }));
@@ -10512,7 +10427,7 @@ export const encode = {
   // wire: OrgStructureBody::WhoSeesRequest
   orgWhoSeesRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureWhoSeesRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureWhoSeesRequest(JSON.stringify({
       subject_user_id: strOrNull(orgField(payload, 'subjectUserId')),
       at: strOrNull(orgField(payload, 'at')),
     }));
@@ -10523,7 +10438,7 @@ export const encode = {
   // wire: OrgStructureBody::DeputySetRequest
   orgDeputySetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureDeputySetRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureDeputySetRequest(JSON.stringify({
       user_id: String(orgField(payload, 'userId') ?? ''),
       deputy_user_id: String(orgField(payload, 'deputyUserId') ?? ''),
       scope: String(orgField(payload, 'scope') ?? 'all'),
@@ -10538,7 +10453,7 @@ export const encode = {
   // wire: OrgStructureBody::DeputyUpdateRequest
   orgDeputyUpdateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureDeputyUpdateRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureDeputyUpdateRequest(JSON.stringify({
       id: String(orgField(payload, 'id') ?? ''),
       scope: strOrNull(orgField(payload, 'scope')),
       valid_from: strOrNull(orgField(payload, 'validFrom')),
@@ -10553,7 +10468,7 @@ export const encode = {
   // wire: OrgStructureBody::DeputyEndRequest
   orgDeputyEndRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureDeputyEndRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureDeputyEndRequest(JSON.stringify({
       id: String(orgField(payload, 'id') ?? ''),
       from: String(orgField(payload, 'from') ?? ''),
       confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
@@ -10565,7 +10480,7 @@ export const encode = {
   // wire: OrgStructureBody::AbsenceAddRequest
   orgAbsenceAddRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureAbsenceAddRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureAbsenceAddRequest(JSON.stringify({
       user_id: strOrNull(orgField(payload, 'userId')),
       valid_from: String(orgField(payload, 'validFrom') ?? ''),
       valid_to: strOrNull(orgField(payload, 'validTo')),
@@ -10580,7 +10495,7 @@ export const encode = {
   // wire: OrgStructureBody::AbsenceUpdateRequest
   orgAbsenceUpdateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureAbsenceUpdateRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureAbsenceUpdateRequest(JSON.stringify({
       id: String(orgField(payload, 'id') ?? ''),
       valid_from: strOrNull(orgField(payload, 'validFrom')),
       valid_to: strOrNull(orgField(payload, 'validTo')),
@@ -10596,7 +10511,7 @@ export const encode = {
   // wire: OrgStructureBody::AbsenceDeleteRequest
   orgAbsenceDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureAbsenceDeleteRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureAbsenceDeleteRequest(JSON.stringify({
       id: String(orgField(payload, 'id') ?? ''),
       confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
     }));
@@ -10607,7 +10522,7 @@ export const encode = {
   // wire: OrgStructureBody::HandoverListRequest
   orgHandoverListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureHandoverListRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureHandoverListRequest(JSON.stringify({
       user_id: String(orgField(payload, 'userId') ?? ''),
       reason: String(orgField(payload, 'reason') ?? ''),
       project_id: strOrNull(orgField(payload, 'projectId')),
@@ -10622,7 +10537,7 @@ export const encode = {
   orgHandoverApplyRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const items = orgField(payload, 'items');
-    const body = _wasm.encodeOrgStructureHandoverApplyRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureHandoverApplyRequest(JSON.stringify({
       user_id: String(orgField(payload, 'userId') ?? ''),
       reason: String(orgField(payload, 'reason') ?? ''),
       project_id: strOrNull(orgField(payload, 'projectId')),
@@ -10642,7 +10557,7 @@ export const encode = {
   orgHandoverRetryRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const keys = orgField(payload, 'keys');
-    const body = _wasm.encodeOrgStructureHandoverRetryRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureHandoverRetryRequest(JSON.stringify({
       handover_id: String(orgField(payload, 'handoverId') ?? ''),
       keys: Array.isArray(keys) ? keys.map(String) : [],
     }));
@@ -10653,7 +10568,7 @@ export const encode = {
   // wire: OrgStructureBody::HandoverPendingRequest
   orgHandoverPendingRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureHandoverPendingRequest(JSON.stringify({}));
+    const body = requests.encodeOrgStructureHandoverPendingRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10661,7 +10576,7 @@ export const encode = {
   // wire: OrgStructureBody::HandoverRecordsRequest
   orgHandoverRecordsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureHandoverRecordsRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureHandoverRecordsRequest(JSON.stringify({
       user_id: strOrNull(orgField(payload, 'userId')),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -10670,7 +10585,7 @@ export const encode = {
   // wire: OrgStructureBody::TimezoneSetRequest
   orgTimezoneSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureTimezoneSetRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureTimezoneSetRequest(JSON.stringify({
       timezone: String(orgField(payload, 'timezone') ?? ''),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -10680,7 +10595,7 @@ export const encode = {
   // wire: OrgStructureBody::RecomputeRequest
   orgRecomputeRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureRecomputeRequest(JSON.stringify({}));
+    const body = requests.encodeOrgStructureRecomputeRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10694,7 +10609,7 @@ export const encode = {
   // wire: OrgStructureBody::ImportDryRunRequest
   orgImportDryRunRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureImportDryRunRequest(orgFileRequestFields(payload), orgFileBytes(payload));
+    const body = requests.encodeOrgStructureImportDryRunRequest(orgFileRequestFields(payload), orgFileBytes(payload));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10702,7 +10617,7 @@ export const encode = {
   // wire: OrgStructureBody::ImportApplyRequest
   orgImportApplyRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureImportApplyRequest(orgFileRequestFields(payload), orgFileBytes(payload));
+    const body = requests.encodeOrgStructureImportApplyRequest(orgFileRequestFields(payload), orgFileBytes(payload));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10710,7 +10625,7 @@ export const encode = {
   // wire: OrgStructureBody::ExportErrorsRequest
   orgExportErrorsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureExportErrorsRequest(orgFileRequestFields(payload), orgFileBytes(payload));
+    const body = requests.encodeOrgStructureExportErrorsRequest(orgFileRequestFields(payload), orgFileBytes(payload));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10718,7 +10633,7 @@ export const encode = {
   // wire: OrgStructureBody::ExportRequest
   orgExportRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureExportRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureExportRequest(JSON.stringify({
       format: String(orgField(payload, 'format') ?? 'csv'),
       at: strOrNull(orgField(payload, 'at')),
     }));
@@ -10736,7 +10651,7 @@ export const encode = {
   // wire: OrgStructureBody::HistoryListRequest
   orgHistoryListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureHistoryListRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureHistoryListRequest(JSON.stringify({
       from: strOrNull(orgField(payload, 'from')),
       to: strOrNull(orgField(payload, 'to')),
       unit_id: strOrNull(orgField(payload, 'unitId')),
@@ -10750,7 +10665,7 @@ export const encode = {
   // wire: OrgStructureBody::HistoryDiffRequest
   orgHistoryDiffRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureHistoryDiffRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureHistoryDiffRequest(JSON.stringify({
       from: String(orgField(payload, 'from') ?? ''),
       to: String(orgField(payload, 'to') ?? ''),
       unit_id: strOrNull(orgField(payload, 'unitId')),
@@ -10762,7 +10677,7 @@ export const encode = {
   // wire: OrgStructureBody::ChangeSetListRequest
   orgChangeSetListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureChangeSetListRequest(JSON.stringify({}));
+    const body = requests.encodeOrgStructureChangeSetListRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10770,7 +10685,7 @@ export const encode = {
   // wire: OrgStructureBody::ChangeSetGetRequest
   orgChangeSetGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureChangeSetGetRequest(JSON.stringify({ id: String(orgField(payload, 'id') ?? '') }));
+    const body = requests.encodeOrgStructureChangeSetGetRequest(JSON.stringify({ id: String(orgField(payload, 'id') ?? '') }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10787,7 +10702,7 @@ export const encode = {
       error.code = 'too_many_ops';
       throw error;
     }
-    const body = _wasm.encodeOrgStructureChangeSetSaveRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureChangeSetSaveRequest(JSON.stringify({
       id: strOrNull(orgField(payload, 'id')),
       name: String(orgField(payload, 'name') ?? ''),
       effective_date: String(orgField(payload, 'effectiveDate') ?? ''),
@@ -10805,7 +10720,7 @@ export const encode = {
   // wire: OrgStructureBody::ChangeSetSubmitRequest
   orgChangeSetSubmitRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureChangeSetSubmitRequest(JSON.stringify({ id: String(orgField(payload, 'id') ?? '') }));
+    const body = requests.encodeOrgStructureChangeSetSubmitRequest(JSON.stringify({ id: String(orgField(payload, 'id') ?? '') }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10813,7 +10728,7 @@ export const encode = {
   // wire: OrgStructureBody::ChangeSetApproveRequest
   orgChangeSetApproveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureChangeSetApproveRequest(JSON.stringify({ id: String(orgField(payload, 'id') ?? '') }));
+    const body = requests.encodeOrgStructureChangeSetApproveRequest(JSON.stringify({ id: String(orgField(payload, 'id') ?? '') }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10821,7 +10736,7 @@ export const encode = {
   // wire: OrgStructureBody::ChangeSetWithdrawRequest
   orgChangeSetWithdrawRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureChangeSetWithdrawRequest(JSON.stringify({ id: String(orgField(payload, 'id') ?? '') }));
+    const body = requests.encodeOrgStructureChangeSetWithdrawRequest(JSON.stringify({ id: String(orgField(payload, 'id') ?? '') }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10829,7 +10744,7 @@ export const encode = {
   // wire: OrgStructureBody::ChangeSetPreviewRequest
   orgChangeSetPreviewRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeOrgStructureChangeSetPreviewRequest(JSON.stringify({
+    const body = requests.encodeOrgStructureChangeSetPreviewRequest(JSON.stringify({
       id: String(orgField(payload, 'id') ?? ''),
       unit_id: strOrNull(orgField(payload, 'unitId')),
     }));
@@ -10848,7 +10763,7 @@ export const encode = {
   // wire: RobotCloudBody::DevicesRequest — the password is never echoed back.
   robotCloudDevicesRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeRobotCloudDevicesRequest(JSON.stringify({
+    const body = requests.encodeRobotCloudDevicesRequest(JSON.stringify({
       provider: String(payload.provider ?? ''),
       region: String(payload.region ?? 'global'),
       email: String(payload.email ?? ''),
@@ -10861,7 +10776,7 @@ export const encode = {
   // wire: AccountListRequest
   providerAccountListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountListRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountListRequest(JSON.stringify({
       engine_id: csOptText(payload.engineId ?? payload.engine_id),
       scope: csOptText(payload.scope),
       query: csOptText(payload.query),
@@ -10873,7 +10788,7 @@ export const encode = {
   // wire: AccountGetRequest
   providerAccountGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountGetRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountGetRequest(JSON.stringify({
       account_id: csText(payload.accountId ?? payload.account_id),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -10883,7 +10798,7 @@ export const encode = {
   // wire: AccountCreateRequest
   providerAccountCreateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountCreateRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountCreateRequest(JSON.stringify({
       engine_id: csText(payload.engineId ?? payload.engine_id),
       display_name: csText(payload.displayName ?? payload.display_name),
       scope: csText(payload.scope),
@@ -10904,7 +10819,7 @@ export const encode = {
   // wire: AccountUpdateRequest
   providerAccountUpdateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountUpdateRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountUpdateRequest(JSON.stringify({
       account_id: csText(payload.accountId ?? payload.account_id),
       display_name: csOptText(payload.displayName ?? payload.display_name),
       status: csOptText(payload.status),
@@ -10917,7 +10832,7 @@ export const encode = {
   // wire: AccountDeleteRequest
   providerAccountDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountDeleteRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountDeleteRequest(JSON.stringify({
       account_id: csText(payload.accountId ?? payload.account_id),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -10927,7 +10842,7 @@ export const encode = {
   // wire: CredentialSetRequest
   providerAccountCredentialSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountCredentialSetRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountCredentialSetRequest(JSON.stringify({
       account_id: csText(payload.accountId ?? payload.account_id),
       material: csText(payload.material),
     }));
@@ -10938,7 +10853,7 @@ export const encode = {
   // wire: CredentialClearRequest
   providerAccountCredentialClearRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountCredentialClearRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountCredentialClearRequest(JSON.stringify({
       account_id: csText(payload.accountId ?? payload.account_id),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -10958,7 +10873,7 @@ export const encode = {
       display_name: csText(grant.displayName ?? grant.display_name),
       member_count: csOptNumber(grant.memberCount ?? grant.member_count),
     }));
-    const body = _wasm.encodeProviderAccountGrantsSetRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountGrantsSetRequest(JSON.stringify({
       account_id: csText(payload.accountId ?? payload.account_id),
       grants,
     }));
@@ -10969,7 +10884,7 @@ export const encode = {
   // wire: SessionListRequest
   providerAccountSessionListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountSessionListRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountSessionListRequest(JSON.stringify({
       account_id: csText(payload.accountId ?? payload.account_id),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -10979,7 +10894,7 @@ export const encode = {
   // wire: MyAccountListRequest
   providerAccountMyListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountMyListRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountMyListRequest(JSON.stringify({
       engine_id: csOptText(payload.engineId ?? payload.engine_id),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -10989,7 +10904,7 @@ export const encode = {
   // wire: RuntimeListRequest
   providerAccountRuntimeListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountRuntimeListRequest(JSON.stringify({}));
+    const body = requests.encodeProviderAccountRuntimeListRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10997,7 +10912,7 @@ export const encode = {
   // wire: RuntimeSetReceivesAccountsRequest
   providerAccountRuntimeSetReceivesAccountsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountRuntimeSetReceivesAccountsRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountRuntimeSetReceivesAccountsRequest(JSON.stringify({
       node_id: csText(payload.nodeId ?? payload.node_id),
       enabled: Boolean(payload.enabled),
     }));
@@ -11011,7 +10926,7 @@ export const encode = {
   // wire: LoginStartRequest
   providerAccountLoginStartRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountLoginStartRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountLoginStartRequest(JSON.stringify({
       account_id: csText(payload.accountId ?? payload.account_id),
       node_id: csOptText(payload.nodeId ?? payload.node_id),
     }));
@@ -11022,7 +10937,7 @@ export const encode = {
   // wire: LoginInputRequest
   providerAccountLoginInputRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountLoginInputRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountLoginInputRequest(JSON.stringify({
       login_id: csText(payload.loginId ?? payload.login_id),
       value: csText(payload.value),
     }));
@@ -11033,7 +10948,7 @@ export const encode = {
   // wire: LoginStatusRequest
   providerAccountLoginStatusRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountLoginStatusRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountLoginStatusRequest(JSON.stringify({
       login_id: csText(payload.loginId ?? payload.login_id),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -11043,7 +10958,7 @@ export const encode = {
   // wire: LoginCancelRequest
   providerAccountLoginCancelRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountLoginCancelRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountLoginCancelRequest(JSON.stringify({
       login_id: csText(payload.loginId ?? payload.login_id),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -11053,7 +10968,7 @@ export const encode = {
   // wire: SessionRevokeRequest
   providerAccountSessionRevokeRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountSessionRevokeRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountSessionRevokeRequest(JSON.stringify({
       account_id: csText(payload.accountId ?? payload.account_id),
       session_id: csText(payload.sessionId ?? payload.session_id),
     }));
@@ -11064,7 +10979,7 @@ export const encode = {
   // wire: RuntimeInstallRequest
   providerAccountRuntimeInstallRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountRuntimeInstallRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountRuntimeInstallRequest(JSON.stringify({
       node_id: csText(payload.nodeId ?? payload.node_id),
       engine_id: csText(payload.engineId ?? payload.engine_id),
     }));
@@ -11075,7 +10990,7 @@ export const encode = {
   // wire: RuntimeUninstallRequest
   providerAccountRuntimeUninstallRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeProviderAccountRuntimeUninstallRequest(JSON.stringify({
+    const body = requests.encodeProviderAccountRuntimeUninstallRequest(JSON.stringify({
       node_id: csText(payload.nodeId ?? payload.node_id),
       engine_id: csText(payload.engineId ?? payload.engine_id),
     }));
@@ -11092,7 +11007,7 @@ export const encode = {
   /** Odczytuje dostępne funkcje i wolne dyski Elastic. */
   tentaNasElasticCapabilitiesRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasElasticCapabilitiesRequest(JSON.stringify({}));
+    const body = requests.encodeTentaNasElasticCapabilitiesRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11106,7 +11021,7 @@ export const encode = {
       parity_disk_ids: payload.parityDiskIds ?? payload.parity_disk_ids ?? [],
       cache_disk_ids: payload.cacheDiskIds ?? payload.cache_disk_ids ?? [],
     };
-    const body = _wasm.encodeTentaNasElasticArrayPlanRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticArrayPlanRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11122,21 +11037,21 @@ export const encode = {
       confirm_name: csText(payload.confirmName ?? payload.confirm_name),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasElasticArrayCreateRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticArrayCreateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** Odczytuje macierze należące do bieżącej instancji. */
   tentaNasElasticArraysListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasElasticArraysListRequest(JSON.stringify({}));
+    const body = requests.encodeTentaNasElasticArraysListRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** Odczytuje jedną macierz wraz ze zmierzonym stanem. */
   tentaNasElasticArrayGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasElasticArrayGetRequest(JSON.stringify({ name: csText(payload.name) }));
+    const body = requests.encodeTentaNasElasticArrayGetRequest(JSON.stringify({ name: csText(payload.name) }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11147,7 +11062,7 @@ export const encode = {
       name: csText(payload.name),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasElasticArrayRestoreRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticArrayRestoreRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11164,14 +11079,14 @@ export const encode = {
       acknowledge_parity_fault: csOptText(payload.acknowledgeParityFault ?? payload.acknowledge_parity_fault),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasElasticArraySyncRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticArraySyncRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   tentaNasElasticArrayScrubRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { name: csText(payload.name), sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password) };
-    const body = _wasm.encodeTentaNasElasticArrayScrubRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticArrayScrubRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11179,7 +11094,7 @@ export const encode = {
   tentaNasElasticArrayMoverRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { name: csText(payload.name), sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password) };
-    const body = _wasm.encodeTentaNasElasticArrayMoverRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticArrayMoverRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11199,7 +11114,7 @@ export const encode = {
       cache_min_free_pct: csOptNumber(payload.cacheMinFreePct ?? payload.cache_min_free_pct),
       coupled_sync: csOptBool(payload.coupledSync ?? payload.coupled_sync),
     };
-    const body = _wasm.encodeTentaNasElasticMoverScheduleSetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticMoverScheduleSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11214,7 +11129,7 @@ export const encode = {
       folder: csText(payload.folder),
       cache_policy: csText(payload.cachePolicy ?? payload.cache_policy),
     };
-    const body = _wasm.encodeTentaNasElasticFolderCacheSetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticFolderCacheSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11225,7 +11140,7 @@ export const encode = {
    */
   tentaNasSharingStopRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasSharingStopRequest(JSON.stringify({}));
+    const body = requests.encodeTentaNasSharingStopRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11239,7 +11154,7 @@ export const encode = {
       disk_id: csText(payload.diskId ?? payload.disk_id),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasDiskWipePlanRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasDiskWipePlanRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11257,7 +11172,7 @@ export const encode = {
       release_journal_array: csText(payload.releaseJournalArray ?? payload.release_journal_array),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasDiskWipeRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasDiskWipeRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11267,7 +11182,7 @@ export const encode = {
     const request = {
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasElasticArrayImportScanRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticArrayImportScanRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11279,7 +11194,7 @@ export const encode = {
       confirm_name: csText(payload.confirmName ?? payload.confirm_name),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasElasticArrayImportRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticArrayImportRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11296,7 +11211,7 @@ export const encode = {
       confirm_disk: csText(payload.confirmDisk ?? payload.confirm_disk),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasElasticArrayFixRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticArrayFixRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11309,7 +11224,7 @@ export const encode = {
       confirm_name: csText(payload.confirmName ?? payload.confirm_name),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasElasticArrayAddDiskRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticArrayAddDiskRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11326,7 +11241,7 @@ export const encode = {
       confirm_name: csText(payload.confirmName ?? payload.confirm_name),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasElasticArrayAddDiskAbortRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticArrayAddDiskAbortRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11348,7 +11263,7 @@ export const encode = {
       accept_stale_parity: Boolean(payload.acceptStaleParity ?? payload.accept_stale_parity ?? false),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasElasticArrayReplaceDiskRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticArrayReplaceDiskRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11360,7 +11275,7 @@ export const encode = {
       confirm_name: csText(payload.confirmName ?? payload.confirm_name),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasElasticArrayDestroyRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticArrayDestroyRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11368,21 +11283,21 @@ export const encode = {
   tentaNasElasticSyncScheduleSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { name: csText(payload.name), enabled: Boolean(payload.enabled), schedule: csSchedule(payload.schedule) };
-    const body = _wasm.encodeTentaNasElasticSyncScheduleSetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticSyncScheduleSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   tentaNasElasticScrubScheduleSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { name: csText(payload.name), enabled: Boolean(payload.enabled), schedule: csSchedule(payload.schedule) };
-    const body = _wasm.encodeTentaNasElasticScrubScheduleSetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElasticScrubScheduleSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaNasBody(NodesListRequest). payload: {} */
   tentaNasNodesListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasNodesListRequest(JSON.stringify({}));
+    const body = requests.encodeTentaNasNodesListRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11390,14 +11305,14 @@ export const encode = {
   tentaNasEnvironmentRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { refresh: Boolean(payload.refresh) };
-    const body = _wasm.encodeTentaNasEnvironmentRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasEnvironmentRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaNasBody(ElevationPlanRequest). payload: {} */
   tentaNasElevationPlanRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasElevationPlanRequest(JSON.stringify({}));
+    const body = requests.encodeTentaNasElevationPlanRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11405,7 +11320,7 @@ export const encode = {
   tentaNasElevationProvisionRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { sudo_password: csText(payload.sudoPassword ?? payload.sudo_password) };
-    const body = _wasm.encodeTentaNasElevationProvisionRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElevationProvisionRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11416,14 +11331,14 @@ export const encode = {
       sudo_password: csText(payload.sudoPassword ?? payload.sudo_password),
       ttl_secs: Number(payload.ttlSecs ?? payload.ttl_secs ?? 0),
     };
-    const body = _wasm.encodeTentaNasElevationArmRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElevationArmRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaNasBody(ElevationDisarmRequest). payload: {} */
   tentaNasElevationDisarmRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasElevationDisarmRequest(JSON.stringify({}));
+    const body = requests.encodeTentaNasElevationDisarmRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11431,7 +11346,7 @@ export const encode = {
   tentaNasElevationRemoveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { sudo_password: csText(payload.sudoPassword ?? payload.sudo_password) };
-    const body = _wasm.encodeTentaNasElevationRemoveRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasElevationRemoveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11442,7 +11357,7 @@ export const encode = {
       feature_id: csText(payload.featureId ?? payload.feature_id),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasPackagesInstallRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPackagesInstallRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11450,7 +11365,7 @@ export const encode = {
   tentaNasJobsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { limit: Number(payload.limit ?? 0) };
-    const body = _wasm.encodeTentaNasJobsListRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasJobsListRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11458,7 +11373,7 @@ export const encode = {
   tentaNasJobGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { job_id: csText(payload.jobId ?? payload.job_id) };
-    const body = _wasm.encodeTentaNasJobGetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasJobGetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11466,14 +11381,14 @@ export const encode = {
   tentaNasJobCancelRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { job_id: csText(payload.jobId ?? payload.job_id) };
-    const body = _wasm.encodeTentaNasJobCancelRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasJobCancelRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaNasBody(DisksListRequest). payload: {} */
   tentaNasDisksListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasDisksListRequest(JSON.stringify({}));
+    const body = requests.encodeTentaNasDisksListRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11481,7 +11396,7 @@ export const encode = {
   tentaNasDiskGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { disk_id: csText(payload.diskId ?? payload.disk_id) };
-    const body = _wasm.encodeTentaNasDiskGetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasDiskGetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11493,7 +11408,7 @@ export const encode = {
       kind: csText(payload.kind, 'short'),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasDiskSmartTestRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasDiskSmartTestRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11506,7 +11421,7 @@ export const encode = {
       kind: csText(payload.kind, 'short'),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasDiskSmartTestBatchRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasDiskSmartTestBatchRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11517,7 +11432,7 @@ export const encode = {
       disk_id: csText(payload.diskId ?? payload.disk_id),
       enable: Boolean(payload.enable),
     };
-    const body = _wasm.encodeTentaNasDiskLocateRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasDiskLocateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11525,7 +11440,7 @@ export const encode = {
   tentaNasAlertsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { include_acked: Boolean(payload.includeAcked ?? payload.include_acked) };
-    const body = _wasm.encodeTentaNasAlertsListRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasAlertsListRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11533,14 +11448,14 @@ export const encode = {
   tentaNasAlertAckRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { alert_id: csText(payload.alertId ?? payload.alert_id) };
-    const body = _wasm.encodeTentaNasAlertAckRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasAlertAckRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaNasBody(PoolsListRequest). payload: {} */
   tentaNasPoolsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasPoolsListRequest(JSON.stringify({}));
+    const body = requests.encodeTentaNasPoolsListRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11548,7 +11463,7 @@ export const encode = {
   tentaNasPoolGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { name: csText(payload.name) };
-    const body = _wasm.encodeTentaNasPoolGetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPoolGetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11556,7 +11471,7 @@ export const encode = {
   tentaNasPoolPlanRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { disk_ids: csTextList(payload.diskIds ?? payload.disk_ids) };
-    const body = _wasm.encodeTentaNasPoolPlanRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPoolPlanRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11573,7 +11488,7 @@ export const encode = {
       autotrim: Boolean(payload.autotrim),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasPoolCreateRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPoolCreateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11585,7 +11500,7 @@ export const encode = {
       confirm_name: csText(payload.confirmName ?? payload.confirm_name),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasPoolDestroyRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPoolDestroyRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11597,7 +11512,7 @@ export const encode = {
       action: csText(payload.action, 'start'),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasPoolScrubRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPoolScrubRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11609,7 +11524,7 @@ export const encode = {
       force: Boolean(payload.force),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasPoolExportRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPoolExportRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11617,7 +11532,7 @@ export const encode = {
   tentaNasPoolImportScanRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password) };
-    const body = _wasm.encodeTentaNasPoolImportScanRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPoolImportScanRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11630,7 +11545,7 @@ export const encode = {
       force: Boolean(payload.force),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasPoolImportRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPoolImportRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11644,7 +11559,7 @@ export const encode = {
       disk_ids: csTextList(payload.diskIds ?? payload.disk_ids),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasPoolAddVdevRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPoolAddVdevRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11657,7 +11572,7 @@ export const encode = {
       disk_id: csText(payload.diskId ?? payload.disk_id),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasPoolExpandVdevRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPoolExpandVdevRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11669,7 +11584,7 @@ export const encode = {
       vdev_id: csText(payload.vdevId ?? payload.vdev_id),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasPoolRemoveVdevRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPoolRemoveVdevRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11682,7 +11597,7 @@ export const encode = {
       disk_id: csText(payload.diskId ?? payload.disk_id),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasPoolReplaceDiskRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPoolReplaceDiskRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11695,7 +11610,7 @@ export const encode = {
       action: csText(payload.action),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasPoolDeviceStateRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPoolDeviceStateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11708,7 +11623,7 @@ export const encode = {
       device: csText(payload.device),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasPoolDetachRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPoolDetachRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11720,7 +11635,7 @@ export const encode = {
       changes: csPropertyChanges(payload.changes),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasPoolSetPropertiesRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPoolSetPropertiesRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11732,7 +11647,7 @@ export const encode = {
       enabled: Boolean(payload.enabled),
       schedule: csSchedule(payload.schedule),
     };
-    const body = _wasm.encodeTentaNasScrubScheduleSetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasScrubScheduleSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11740,7 +11655,7 @@ export const encode = {
   tentaNasDatasetsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { pool: csText(payload.pool) };
-    const body = _wasm.encodeTentaNasDatasetsListRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasDatasetsListRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11748,7 +11663,7 @@ export const encode = {
   tentaNasDatasetGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { name: csText(payload.name) };
-    const body = _wasm.encodeTentaNasDatasetGetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasDatasetGetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11769,7 +11684,7 @@ export const encode = {
       mountpoint: csText(payload.mountpoint),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasDatasetCreateRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasDatasetCreateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11781,7 +11696,7 @@ export const encode = {
       changes: csPropertyChanges(payload.changes),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasDatasetSetPropertiesRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasDatasetSetPropertiesRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11794,7 +11709,7 @@ export const encode = {
       recursive: Boolean(payload.recursive),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasDatasetDestroyRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasDatasetDestroyRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11806,7 +11721,7 @@ export const encode = {
       action: csText(payload.action),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasDatasetKeyRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasDatasetKeyRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11818,7 +11733,7 @@ export const encode = {
       action: csText(payload.action),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasDatasetMountRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasDatasetMountRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11832,7 +11747,7 @@ export const encode = {
       origin: csText(payload.origin),
       limit: Number(payload.limit ?? 0),
     };
-    const body = _wasm.encodeTentaNasSnapshotsListRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasSnapshotsListRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11846,7 +11761,7 @@ export const encode = {
       protect_days: Number(payload.protectDays ?? payload.protect_days ?? 0),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasSnapshotCreateRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasSnapshotCreateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11857,7 +11772,7 @@ export const encode = {
       names: csTextList(payload.names),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasSnapshotDestroyRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasSnapshotDestroyRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11870,7 +11785,7 @@ export const encode = {
       destroy_newer: Boolean(payload.destroyNewer ?? payload.destroy_newer),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasSnapshotRollbackRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasSnapshotRollbackRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11882,7 +11797,7 @@ export const encode = {
       target: csText(payload.target),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasSnapshotCloneRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasSnapshotCloneRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11902,7 +11817,7 @@ export const encode = {
       keep_monthly: Number(payload.keepMonthly ?? payload.keep_monthly ?? 0),
       protect_days: Number(payload.protectDays ?? payload.protect_days ?? 0),
     };
-    const body = _wasm.encodeTentaNasSnapshotScheduleSetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasSnapshotScheduleSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11910,21 +11825,21 @@ export const encode = {
   tentaNasSnapshotScheduleDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { schedule_id: csText(payload.scheduleId ?? payload.schedule_id) };
-    const body = _wasm.encodeTentaNasSnapshotScheduleDeleteRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasSnapshotScheduleDeleteRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaNasBody(SnapshotSchedulesListRequest). payload: {} */
   tentaNasSnapshotSchedulesListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasSnapshotSchedulesListRequest(JSON.stringify({}));
+    const body = requests.encodeTentaNasSnapshotSchedulesListRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaNasBody(SchedulesListRequest). payload: {} */
   tentaNasSchedulesListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasSchedulesListRequest(JSON.stringify({}));
+    const body = requests.encodeTentaNasSchedulesListRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11936,14 +11851,14 @@ export const encode = {
       short: csSchedule(payload.short),
       long: csSchedule(payload.long),
     };
-    const body = _wasm.encodeTentaNasSmartScheduleSetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasSmartScheduleSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaNasBody(SharesListRequest). payload: {} */
   tentaNasSharesListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasSharesListRequest(JSON.stringify({}));
+    const body = requests.encodeTentaNasSharesListRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11951,7 +11866,7 @@ export const encode = {
   tentaNasShareGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { share_id: csText(payload.shareId ?? payload.share_id) };
-    const body = _wasm.encodeTentaNasShareGetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasShareGetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11968,7 +11883,7 @@ export const encode = {
       enabled: payload.enabled == null ? true : Boolean(payload.enabled),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasShareCreateRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasShareCreateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11983,7 +11898,7 @@ export const encode = {
       enabled: payload.enabled == null ? true : Boolean(payload.enabled),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasShareUpdateRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasShareUpdateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -11995,7 +11910,7 @@ export const encode = {
       confirm_name: csText(payload.confirmName ?? payload.confirm_name),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasShareDeleteRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasShareDeleteRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12003,7 +11918,7 @@ export const encode = {
   tentaNasShareBrowseRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { path: csText(payload.path) };
-    const body = _wasm.encodeTentaNasShareBrowseRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasShareBrowseRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12011,14 +11926,14 @@ export const encode = {
   tentaNasShareMountsRefreshRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { share_id: csText(payload.shareId ?? payload.share_id) };
-    const body = _wasm.encodeTentaNasShareMountsRefreshRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasShareMountsRefreshRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaNasBody(ShareUsersListRequest). payload: {} */
   tentaNasShareUsersListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasShareUsersListRequest(JSON.stringify({}));
+    const body = requests.encodeTentaNasShareUsersListRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12031,7 +11946,7 @@ export const encode = {
       description: csText(payload.description),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasShareUserSetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasShareUserSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12042,7 +11957,7 @@ export const encode = {
       name: csText(payload.name),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasShareUserDeleteRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasShareUserDeleteRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12052,7 +11967,7 @@ export const encode = {
    *  the fleet poll's light answer: targets and service rows, no capabilities. */
   tentaNasTargetsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasTargetsListRequest(JSON.stringify({ summary: payload.summary === true }));
+    const body = requests.encodeTentaNasTargetsListRequest(JSON.stringify({ summary: payload.summary === true }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12060,7 +11975,7 @@ export const encode = {
   tentaNasTargetGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { target_id: csText(payload.targetId ?? payload.target_id) };
-    const body = _wasm.encodeTentaNasTargetGetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasTargetGetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12090,7 +12005,7 @@ export const encode = {
       enabled: payload.enabled == null ? true : Boolean(payload.enabled),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasTargetCreateRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasTargetCreateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12120,7 +12035,7 @@ export const encode = {
       enabled: payload.enabled == null ? true : Boolean(payload.enabled),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasTargetUpdateRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasTargetUpdateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12135,7 +12050,7 @@ export const encode = {
       revoke: Boolean(payload.revoke),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasTargetSessionResetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasTargetSessionResetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12152,7 +12067,7 @@ export const encode = {
       expected_updated_at: csText(payload.expectedUpdatedAt ?? payload.expected_updated_at),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasTargetOpenRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasTargetOpenRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12164,14 +12079,14 @@ export const encode = {
       confirm_name: csText(payload.confirmName ?? payload.confirm_name),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasTargetDeleteRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasTargetDeleteRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaNasBody(FleetMountsListRequest). payload: {} */
   tentaNasFleetMountsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasFleetMountsListRequest(JSON.stringify({}));
+    const body = requests.encodeTentaNasFleetMountsListRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12182,14 +12097,14 @@ export const encode = {
       share_id: csText(payload.shareId ?? payload.share_id),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasFleetMountRetryRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasFleetMountRetryRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaNasBody(ConfigExportRequest). payload: {} */
   tentaNasConfigExportRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasConfigExportRequest(JSON.stringify({}));
+    const body = requests.encodeTentaNasConfigExportRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12197,7 +12112,7 @@ export const encode = {
   tentaNasConfigImportPlanRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { json: csText(payload.json) };
-    const body = _wasm.encodeTentaNasConfigImportPlanRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasConfigImportPlanRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12208,14 +12123,14 @@ export const encode = {
       json: csText(payload.json),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasConfigImportApplyRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasConfigImportApplyRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaNasBody(ArcStatsRequest). payload: {} */
   tentaNasArcStatsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasArcStatsRequest(JSON.stringify({}));
+    const body = requests.encodeTentaNasArcStatsRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12226,14 +12141,14 @@ export const encode = {
       max_bytes: Number(payload.maxBytes ?? payload.max_bytes ?? 0),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasArcLimitSetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasArcLimitSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaNasBody(ElevationCatalogRequest). payload: {} */
   tentaNasElevationCatalogRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasElevationCatalogRequest(JSON.stringify({}));
+    const body = requests.encodeTentaNasElevationCatalogRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12244,7 +12159,7 @@ export const encode = {
       snapshot: csText(payload.snapshot),
       path: csText(payload.path),
     };
-    const body = _wasm.encodeTentaNasSnapshotBrowseRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasSnapshotBrowseRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12264,7 +12179,7 @@ export const encode = {
       confirm_snapshot: csText(payload.confirmSnapshot ?? payload.confirm_snapshot),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasSnapshotProtectionReleaseRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasSnapshotProtectionReleaseRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12279,7 +12194,7 @@ export const encode = {
       since: csText(payload.since),
       limit: Number(payload.limit ?? 0),
     };
-    const body = _wasm.encodeTentaNasAccessLogRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasAccessLogRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12293,7 +12208,7 @@ export const encode = {
       include_access: Boolean(payload.includeAccess ?? payload.include_access),
       node_wide: Boolean(payload.nodeWide ?? payload.node_wide),
     };
-    const body = _wasm.encodeTentaNasAlertForwardSetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasAlertForwardSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12305,7 +12220,7 @@ export const encode = {
       action: csText(payload.action, 'start'),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasPoolTrimRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasPoolTrimRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12317,7 +12232,7 @@ export const encode = {
       enabled: Boolean(payload.enabled),
       schedule: csSchedule(payload.schedule),
     };
-    const body = _wasm.encodeTentaNasTrimScheduleSetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasTrimScheduleSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12325,7 +12240,7 @@ export const encode = {
   tentaNasApprovalsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { include_closed: Boolean(payload.includeClosed ?? payload.include_closed) };
-    const body = _wasm.encodeTentaNasApprovalsListRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasApprovalsListRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12338,7 +12253,7 @@ export const encode = {
       note: csText(payload.note),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
-    const body = _wasm.encodeTentaNasApprovalDecideRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasApprovalDecideRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12349,7 +12264,7 @@ export const encode = {
       enabled: Boolean(payload.enabled),
       ttl_hours: Number(payload.ttlHours ?? payload.ttl_hours ?? 0),
     };
-    const body = _wasm.encodeTentaNasApprovalSettingsSetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaNasApprovalSettingsSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12363,21 +12278,21 @@ export const encode = {
   /** MessageBody::TentaQuantBody(LabListRequest). payload: {} — the laboratories the caller may enter. */
   tentaQuantLabListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaQuantLabListRequest(JSON.stringify({}));
+    const body = requests.encodeTentaQuantLabListRequest(JSON.stringify({}));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaQuantBody(LabOverviewRequest). payload: { instanceId } — dashboard counters of one laboratory. */
   tentaQuantLabOverviewRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaQuantLabOverviewRequest(JSON.stringify(tqLab(payload)));
+    const body = requests.encodeTentaQuantLabOverviewRequest(JSON.stringify(tqLab(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaQuantBody(LabPeopleRequest). payload: { instanceId } — the matrix expansion; `quant.instruct` only. */
   tentaQuantLabPeopleRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaQuantLabPeopleRequest(JSON.stringify(tqLab(payload)));
+    const body = requests.encodeTentaQuantLabPeopleRequest(JSON.stringify(tqLab(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12396,14 +12311,14 @@ export const encode = {
       // maximum is decided.
       limit: Number(payload.limit ?? 0),
     };
-    const body = _wasm.encodeTentaQuantPeopleCandidatesRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantPeopleCandidatesRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaQuantBody(SettingsGetRequest). payload: { instanceId } */
   tentaQuantSettingsGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaQuantSettingsGetRequest(JSON.stringify(tqLab(payload)));
+    const body = requests.encodeTentaQuantSettingsGetRequest(JSON.stringify(tqLab(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12415,7 +12330,7 @@ export const encode = {
       settings: tqSettings(payload.settings),
       admin: tqAdminSettings(payload.admin),
     };
-    const body = _wasm.encodeTentaQuantSettingsSetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantSettingsSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12426,14 +12341,14 @@ export const encode = {
       ...tqLab(payload),
       include_archived: Boolean(payload.includeArchived ?? payload.include_archived),
     };
-    const body = _wasm.encodeTentaQuantProjectListRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantProjectListRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaQuantBody(ProjectGetRequest). payload: { instanceId, projectId } — the share list travels only to the owner. */
   tentaQuantProjectGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaQuantProjectGetRequest(JSON.stringify(tqProject(payload)));
+    const body = requests.encodeTentaQuantProjectGetRequest(JSON.stringify(tqProject(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12447,7 +12362,7 @@ export const encode = {
       visibility: csText(payload.visibility, 'private'),
       linked_project_id: csOptText(payload.linkedProjectId ?? payload.linked_project_id),
     };
-    const body = _wasm.encodeTentaQuantProjectCreateRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantProjectCreateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12461,7 +12376,7 @@ export const encode = {
       visibility: csText(payload.visibility, 'private'),
       linked_project_id: csOptText(payload.linkedProjectId ?? payload.linked_project_id),
     };
-    const body = _wasm.encodeTentaQuantProjectUpdateRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantProjectUpdateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12469,7 +12384,7 @@ export const encode = {
   tentaQuantProjectArchiveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { ...tqProject(payload), archived: Boolean(payload.archived) };
-    const body = _wasm.encodeTentaQuantProjectArchiveRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantProjectArchiveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12480,14 +12395,14 @@ export const encode = {
       ...tqProject(payload),
       new_owner_user_id: csText(payload.newOwnerUserId ?? payload.new_owner_user_id),
     };
-    const body = _wasm.encodeTentaQuantProjectTransferRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantProjectTransferRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaQuantBody(ProjectDeleteRequest). payload: { instanceId, projectId } — owner only. */
   tentaQuantProjectDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaQuantProjectDeleteRequest(JSON.stringify(tqProject(payload)));
+    const body = requests.encodeTentaQuantProjectDeleteRequest(JSON.stringify(tqProject(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12499,7 +12414,7 @@ export const encode = {
       user_id: csText(payload.userId ?? payload.user_id),
       role: csText(payload.role, 'viewer'),
     };
-    const body = _wasm.encodeTentaQuantProjectShareSetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantProjectShareSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12507,14 +12422,14 @@ export const encode = {
   tentaQuantProjectShareRemoveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { ...tqProject(payload), user_id: csText(payload.userId ?? payload.user_id) };
-    const body = _wasm.encodeTentaQuantProjectShareRemoveRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantProjectShareRemoveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaQuantBody(FileListRequest). payload: { instanceId, projectId } */
   tentaQuantFileListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaQuantFileListRequest(JSON.stringify(tqProject(payload)));
+    const body = requests.encodeTentaQuantFileListRequest(JSON.stringify(tqProject(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12522,7 +12437,7 @@ export const encode = {
   tentaQuantFileDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { ...tqProject(payload), file_id: csText(payload.fileId ?? payload.file_id) };
-    const body = _wasm.encodeTentaQuantFileDeleteRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantFileDeleteRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12536,7 +12451,7 @@ export const encode = {
     assertReady();
     const raw = payload.bytes;
     const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw ?? []);
-    const body = _wasm.encodeTentaQuantFileUploadChunkRequest(
+    const body = requests.encodeTentaQuantFileUploadChunkRequest(
       csText(payload.instanceId ?? payload.instance_id),
       csText(payload.projectId ?? payload.project_id),
       csText(payload.uploadId ?? payload.upload_id),
@@ -12552,7 +12467,7 @@ export const encode = {
   /** MessageBody::TentaQuantBody(NotebookListRequest). payload: { instanceId, projectId } */
   tentaQuantNotebookListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaQuantNotebookListRequest(JSON.stringify(tqProject(payload)));
+    const body = requests.encodeTentaQuantNotebookListRequest(JSON.stringify(tqProject(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12564,7 +12479,7 @@ export const encode = {
       name: csText(payload.name),
       cells_json: csText(payload.cellsJson ?? payload.cells_json),
     };
-    const body = _wasm.encodeTentaQuantNotebookCreateRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantNotebookCreateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12576,7 +12491,7 @@ export const encode = {
       ...tqNotebook(payload),
       version: version === null || version === '' ? null : Number(version),
     };
-    const body = _wasm.encodeTentaQuantNotebookGetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantNotebookGetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12588,14 +12503,14 @@ export const encode = {
       cells_json: csText(payload.cellsJson ?? payload.cells_json, '[]'),
       expected_version: Number(payload.expectedVersion ?? payload.expected_version ?? 0),
     };
-    const body = _wasm.encodeTentaQuantNotebookSaveRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantNotebookSaveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaQuantBody(NotebookVersionsRequest). payload: { instanceId, projectId, notebookId } — the append-only history. */
   tentaQuantNotebookVersionsRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaQuantNotebookVersionsRequest(JSON.stringify(tqNotebook(payload)));
+    const body = requests.encodeTentaQuantNotebookVersionsRequest(JSON.stringify(tqNotebook(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12607,7 +12522,7 @@ export const encode = {
       qasm3: csText(payload.qasm3),
       inputs_json: csText(payload.inputsJson ?? payload.inputs_json),
     };
-    const body = _wasm.encodeTentaQuantCircuitValidateRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantCircuitValidateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12620,7 +12535,7 @@ export const encode = {
       format: csText(payload.format, 'qasm3'),
       inputs_json: csText(payload.inputsJson ?? payload.inputs_json),
     };
-    const body = _wasm.encodeTentaQuantCircuitExportRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantCircuitExportRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12640,7 +12555,7 @@ export const encode = {
       notebook_id: csOptText(payload.notebookId ?? payload.notebook_id),
       cell_id: csOptText(payload.cellId ?? payload.cell_id),
     };
-    const body = _wasm.encodeTentaQuantCircuitSimulateRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantCircuitSimulateRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12653,21 +12568,21 @@ export const encode = {
       pinned_only: Boolean(payload.pinnedOnly ?? payload.pinned_only),
       limit: Number(payload.limit ?? 0),
     };
-    const body = _wasm.encodeTentaQuantRunListRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantRunListRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaQuantBody(RunGetRequest). payload: { instanceId, runId } — the row with its stored outputs. */
   tentaQuantRunGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaQuantRunGetRequest(JSON.stringify(tqRun(payload)));
+    const body = requests.encodeTentaQuantRunGetRequest(JSON.stringify(tqRun(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaQuantBody(RunCancelRequest). payload: { instanceId, runId } — stops a live run between gates or shots. */
   tentaQuantRunCancelRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaQuantRunCancelRequest(JSON.stringify(tqRun(payload)));
+    const body = requests.encodeTentaQuantRunCancelRequest(JSON.stringify(tqRun(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12675,14 +12590,14 @@ export const encode = {
   tentaQuantRunPinRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { ...tqRun(payload), pinned: Boolean(payload.pinned) };
-    const body = _wasm.encodeTentaQuantRunPinRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantRunPinRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaQuantBody(RunKeyframesRequest). payload: { instanceId, runId } — the recorded evolution. */
   tentaQuantRunKeyframesRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaQuantRunKeyframesRequest(JSON.stringify(tqRun(payload)));
+    const body = requests.encodeTentaQuantRunKeyframesRequest(JSON.stringify(tqRun(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12690,7 +12605,7 @@ export const encode = {
   tentaQuantRunArtifactRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { ...tqRun(payload), sha256: csText(payload.sha256) };
-    const body = _wasm.encodeTentaQuantRunArtifactRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantRunArtifactRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12706,7 +12621,7 @@ export const encode = {
       ...tqLab(payload),
       run_ids: (payload.runIds ?? payload.run_ids ?? []).map((id) => csText(id)),
     };
-    const body = _wasm.encodeTentaQuantRunCompareRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantRunCompareRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12721,7 +12636,7 @@ export const encode = {
       ...tqRun(payload),
       parts: (payload.parts ?? []).map((part) => csText(part)),
     };
-    const body = _wasm.encodeTentaQuantRunExportRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantRunExportRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12737,7 +12652,7 @@ export const encode = {
       pairs: (payload.pairs ?? []).map((pair) => [Number(pair[0]), Number(pair[1])]),
       top_k: Number(payload.topK ?? payload.top_k ?? 0),
     };
-    const body = _wasm.encodeTentaQuantRunStateQueryRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantRunStateQueryRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12745,14 +12660,14 @@ export const encode = {
   tentaQuantRunSubscribeRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { ...tqRun(payload), after_seq: Number(payload.afterSeq ?? payload.after_seq ?? 0) };
-    const body = _wasm.encodeTentaQuantRunSubscribeRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantRunSubscribeRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaQuantBody(TargetListRequest). payload: { instanceId } — tiers and nodes, with the reason a tier is missing. */
   tentaQuantTargetListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaQuantTargetListRequest(JSON.stringify(tqLab(payload)));
+    const body = requests.encodeTentaQuantTargetListRequest(JSON.stringify(tqLab(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12765,14 +12680,14 @@ export const encode = {
       from_browser: Boolean(payload.fromBrowser ?? payload.from_browser),
       needs_kernel: Boolean(payload.needsKernel ?? payload.needs_kernel),
     };
-    const body = _wasm.encodeTentaQuantTargetResolveRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantTargetResolveRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaQuantBody(KataListRequest). payload: { instanceId } — the course in its fixed order with the caller's progress. */
   tentaQuantKataListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaQuantKataListRequest(JSON.stringify(tqLab(payload)));
+    const body = requests.encodeTentaQuantKataListRequest(JSON.stringify(tqLab(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12780,7 +12695,7 @@ export const encode = {
   tentaQuantKataGetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = { ...tqLab(payload), kata_id: csText(payload.kataId ?? payload.kata_id) };
-    const body = _wasm.encodeTentaQuantKataGetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantKataGetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12792,21 +12707,21 @@ export const encode = {
       kata_id: csText(payload.kataId ?? payload.kata_id),
       qasm3: csText(payload.qasm3),
     };
-    const body = _wasm.encodeTentaQuantKataSubmitRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantKataSubmitRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaQuantBody(KataRankingRequest). payload: { instanceId } — top five with names plus the caller's own place; empty when a supervisor switched it off. */
   tentaQuantKataRankingRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaQuantKataRankingRequest(JSON.stringify(tqLab(payload)));
+    const body = requests.encodeTentaQuantKataRankingRequest(JSON.stringify(tqLab(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
   /** MessageBody::TentaQuantBody(ExampleListRequest). payload: { instanceId } — the shipped examples in their fixed order. */
   tentaQuantExampleListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaQuantExampleListRequest(JSON.stringify(tqLab(payload)));
+    const body = requests.encodeTentaQuantExampleListRequest(JSON.stringify(tqLab(payload)));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12818,7 +12733,7 @@ export const encode = {
       example_id: csText(payload.exampleId ?? payload.example_id),
       qubits: csOptNumber(payload.qubits),
     };
-    const body = _wasm.encodeTentaQuantExampleGetRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantExampleGetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -12831,7 +12746,7 @@ export const encode = {
       qubits: csOptNumber(payload.qubits),
       language: csText(payload.language),
     };
-    const body = _wasm.encodeTentaQuantExampleForkRequest(JSON.stringify(request));
+    const body = requests.encodeTentaQuantExampleForkRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 

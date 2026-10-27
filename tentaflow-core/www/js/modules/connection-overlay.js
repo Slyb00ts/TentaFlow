@@ -350,7 +350,7 @@ async function learnNodeName() {
   nameAttemptsLeft -= 1;
   try {
     const body = await ApiBinary.one('meshIdentityRequest');
-    const name = String(body?.hostname ?? body?.host_name ?? '').trim();
+    const name = String(body?.hostname ?? '').trim();
     if (name) {
       learnedNode = name;
       storeNodeName(name);

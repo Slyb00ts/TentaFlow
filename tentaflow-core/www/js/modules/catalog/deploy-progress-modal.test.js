@@ -111,7 +111,7 @@ function stripTags(html) {
 
 function chunk(deployId, line, kind = 'log', { phase = '', progressPct = 0 } = {}) {
   return {
-    variant: 'DeploymentStreamChunk',
+    _variant: 'DeploymentBody.StreamChunk',
     deployId,
     kind,
     line,
@@ -228,7 +228,7 @@ test('a non-deployment terminal frame is an interruption, not a verdict', async 
   const first = h.streams[0];
   first.handlers.onChunk(chunk('dep-1', 'building'));
   // Exactly what BinaryWsClient._endAllSubscriptions() delivers on socket death.
-  first.handlers.onEnd({ variant: 'StreamClosed', reason: 'transport_closed' });
+  first.handlers.onEnd({ _variant: 'StreamBody.Closed', reason: 'transport_closed' });
   assert.deepEqual(h.toasts, [], 'a cut stream must not report a deploy result');
   assert.equal(h.chip(), 'deploy.status_reconnecting');
   // Backoff is 1s for the first attempt.
@@ -274,7 +274,7 @@ test('DeploymentStreamEnd reports the failure and stops the stream', async (t) =
   t.after(() => h.dispose());
   await h.settle();
   h.streams[0].handlers.onEnd({
-    variant: 'DeploymentStreamEnd',
+    _variant: 'DeploymentBody.StreamEnd',
     deployId: 'dep-1',
     finalStatus: 'failed',
     errorMessage: 'build exited 1',

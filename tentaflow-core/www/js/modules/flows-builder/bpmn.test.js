@@ -124,7 +124,7 @@ function inspector(graph, readOnly = false) {
     onConfigChange: (id, value) => graph.updateNodeConfig(id, value), onEdgeChange: (id, value) => graph.updateEdge(id, value),
     onLabelChange: (id, value) => graph.updateNodeLabel(id, value), onDelete: (id) => graph.removeNodes([id]), onDuplicate: (id) => graph.duplicateNodes([id]) });
 }
-function userNode(graph) { graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_user_task'), 250, 300); return graph.nodes.at(-1); }
+function userNode(graph) { graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_user_task'), 250, 300); return graph.nodes.at(-1); }
 function boundaryModel() {
   const model = emptyProcessModel();
   model.timerTimezone = 'Europe/Warsaw';
@@ -289,7 +289,7 @@ test('undo and redo restore content in the scope on screen, never moving the aut
   const state = await mount(current);
   const toasts = watchToasts();
   dismissToast(I18n.t('bpmn.undo_elsewhere'));
-  const gateway = processTemplates().find((item) => item.node_type === 'bpmn_inclusive_gateway');
+  const gateway = processTemplates().find((item) => item.nodeType === 'bpmn_inclusive_gateway');
   const scopePath = () => state.root.querySelector('[data-role="scope-path"]');
   state.canvas.selectNode('Scope_Review');
   click(state.config.root.querySelector('[data-process-enter]'));
@@ -329,7 +329,7 @@ test('undo and redo restore content in the scope on screen, never moving the aut
 
 test('undoing the creation of the body on screen climbs to the nearest body that still exists', async () => {
   const state = await mount(definition('undo-vanishing-body'));
-  const subProcess = processTemplates().find((item) => item.node_type === 'bpmn_sub_process');
+  const subProcess = processTemplates().find((item) => item.nodeType === 'bpmn_sub_process');
   const created = state.canvas.addNodeFromTemplate(subProcess, 300, 300);
   state.canvas.navigateProcessBody([created.id]);
   state.config.renderEmpty();
@@ -479,7 +479,7 @@ test('BPMN canvas renders the official marker mapping for every supported templa
   assert.equal(processTemplates().length, expected.size);
   for (const [nodeType, marker] of expected) {
     const graph = canvas();
-    graph.addNodeFromTemplate(processTemplates().find((template) => template.node_type === nodeType), 250, 300);
+    graph.addNodeFromTemplate(processTemplates().find((template) => template.nodeType === nodeType), 250, 300);
     const node = graph.nodes.at(-1);
     const element = graph.nodesLayer.querySelector(`[data-node-id="${node.id}"]`);
     const use = element.querySelector('.fb-process-symbol use');
@@ -673,7 +673,7 @@ test('grid snapping canonicalizes negative-origin creation and drag without chan
   const graph = canvas();
   graph.root.getBoundingClientRect = () => ({ left: 0, top: 0, width: 900, height: 600 });
   graph.view = { x: 0, y: 0, zoom: 1 };
-  const template = processTemplates().find((row) => row.node_type === 'bpmn_user_task');
+  const template = processTemplates().find((row) => row.nodeType === 'bpmn_user_task');
   const added = graph.addNodeFromTemplate(template, template.width / 2 - 0.4, template.height / 2 + 30.4);
   assert.equal(added.x, 0);
   assert.equal(Object.is(added.x, -0), false);
@@ -1030,10 +1030,10 @@ test('pickers of the process settings and the boundary inspector show names, nev
 
   const graph = canvas();
   const config = inspector(graph);
-  const reviewer = (x) => { graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_user_task'), x, 300); const node = graph.nodes.at(-1); graph.updateNodeLabel(node.id, 'Review'); return node; };
+  const reviewer = (x) => { graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_user_task'), x, 300); const node = graph.nodes.at(-1); graph.updateNodeLabel(node.id, 'Review'); return node; };
   const first = reviewer(300); const second = reviewer(700);
-  const unnamed = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 1100, 300);
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_timer'), first.x + first.width / 2, first.y + first.height);
+  const unnamed = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 1100, 300);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_boundary_timer'), first.x + first.width / 2, first.y + first.height);
   const timer = graph.nodes.at(-1);
   config.show(timer, graph.templates.get(timer.type));
   await flush(2);
@@ -1918,7 +1918,7 @@ test('canvas connection and undo preserve identity and deletion clears an XOR de
   const connected = graph.getData();
   graph.undo(); assert.equal(graph.edges.some((row) => row.id === edge.id), false);
   graph.redo(); assert.deepEqual(graph.getData(), connected);
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_exclusive_gateway'), 280, 100);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_exclusive_gateway'), 280, 100);
   const choice = graph.nodes.at(-1); graph.connectNodes(choice.id, 'End');
   const defaultEdge = graph.edges.at(-1);
   graph.updateNodeConfig(choice.id, { defaultFlowId: defaultEdge.id });
@@ -1929,10 +1929,10 @@ test('canvas connection and undo preserve identity and deletion clears an XOR de
 
 test('inclusive gateway inspector saves every condition and a stable default through clone and deletion', async () => {
   const graph = canvas();
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_inclusive_gateway'), 220, 100);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_inclusive_gateway'), 220, 100);
   const split = graph.nodes.at(-1);
   const review = userNode(graph);
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_inclusive_gateway'), 520, 100);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_inclusive_gateway'), 520, 100);
   const join = graph.nodes.at(-1);
   graph.connectNodes(split.id, review.id);
   const conditional = graph.edges.at(-1);
@@ -2088,7 +2088,7 @@ test('manual acknowledgment stays unavailable without pinned instructions', asyn
 });
 
 test('service inspector edits actual flow, Human/Condition, mappings and timeout without changing mapping keys', async () => {
-  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 200, 200);
   const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
   await flush(2);
   assert.equal(node.config.verification, 'Human');
@@ -2112,7 +2112,7 @@ test('service inspector edits actual flow, Human/Condition, mappings and timeout
 });
 
 test('service inspector configures an addon tool and switches back to a flow', async () => {
-  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 200, 200);
   const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
   await flush(2);
   assert.equal(config.root.querySelector('[data-process="implementation"]').value, 'flow');
@@ -2140,7 +2140,7 @@ test('service inspector configures an addon tool and switches back to a flow', a
 });
 
 test('service inspector configures a block from a valid template and reports invalid settings inline', async () => {
-  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 200, 200);
   const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
   await flush(2);
   change(config.root.querySelector('[data-process="implementation"]'), 'block');
@@ -2357,10 +2357,10 @@ test('result routing fixture covers every route the table can show and pairs eac
 });
 
 test('result routing texts name both timeout codes, the caller catch, the kept task and working time', async () => {
-  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 200, 200);
   const node = graph.nodes.at(-1);
   graph.updateNodeConfig(node.id, { resultExpression: 'outputs.result', implementation: { AddonTool: { addonId: 'notes-1', toolName: 'search' } } });
-  const timer = processTemplates().find((row) => row.node_type === 'bpmn_boundary_timer');
+  const timer = processTemplates().find((row) => row.nodeType === 'bpmn_boundary_timer');
   graph.addNodeFromTemplate(timer, 200, 400);
   const boundary = graph.nodes.at(-1);
   graph.updateNodeConfig(boundary.id, { attachedToId: node.id, timer: { WorkingDuration: { seconds: 7200 } } });
@@ -2381,7 +2381,7 @@ test('result routing texts name both timeout codes, the caller catch, the kept t
 });
 
 test('result routing rows never show a dangling code and warnings name handlers, not their ids', async () => {
-  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 200, 200);
   const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
   await flush(2);
   config.root.querySelector('[data-service-tabs]').dispatchEvent(new CustomEvent('change', { detail: { value: 'result' } }));
@@ -2406,7 +2406,7 @@ test('the Service inspector reads in all five locales without keys, placeholders
       const model = emptyProcessModel();
       model.errors = [{ errorId: 'Err_A', name: 'A', errorCode: 'CODE_A' }];
       model.escalations = [{ escalationId: 'Esc_R', name: 'R', escalationCode: 'REVIEW' }];
-      const graph = canvas(model); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+      const graph = canvas(model); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 300, 300);
       const node = graph.nodes.at(-1);
       graph.updateNodeConfig(node.id, { resultExpression: 'outputs.result', verification: { Condition: { expression: ' ' } },
         implementation: { AddonTool: { addonId: 'notes-1', toolName: 'search' } }, flowId: '' });
@@ -2414,7 +2414,7 @@ test('the Service inspector reads in all five locales without keys, placeholders
       graph.addBoundaryNode(node.id, 'bpmn_boundary_error', 'Err_A');
       const keep = graph.addBoundaryNode(node.id, 'bpmn_boundary_escalation', 'Esc_R');
       graph.updateNodeConfig(keep.id, { cancelActivity: false });
-      graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_timer'), 300, 500);
+      graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_boundary_timer'), 300, 500);
       const timer = graph.nodes.at(-1);
       graph.updateNodeConfig(timer.id, { attachedToId: node.id, timer: { WorkingDuration: { seconds: 600 } } });
       const config = inspector(graph); config.show(node, graph.templates.get(node.type));
@@ -2443,7 +2443,7 @@ test('the Service inspector reads in all five locales without keys, placeholders
 test('boundary events added from the buttons sit on the bottom edge, spread left to right, clear of the icon and the ports', () => {
   const model = emptyProcessModel();
   model.errors = ['A', 'B', 'C', 'D', 'E'].map((code) => ({ errorId: `Err_${code}`, name: code, errorCode: `CODE_${code}` }));
-  const graph = canvas(model); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  const graph = canvas(model); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 300, 300);
   const task = graph.nodes.at(-1);
   graph.updateNodeConfig(task.id, { resultExpression: 'outputs.result' });
   const refs = [null, 'Err_A', 'Err_B', 'Err_C', 'Err_D', 'Err_E'];
@@ -2480,7 +2480,7 @@ test('a task with a full border says so on both add buttons, and room returns wh
   const model = emptyProcessModel();
   model.errors = ['A', 'B', 'C', 'D', 'E', 'F', 'G'].map((code) => ({ errorId: `Err_${code}`, name: code, errorCode: `CODE_${code}` }));
   model.escalations = [{ escalationId: 'Esc_R', name: 'R', escalationCode: 'REVIEW' }];
-  const graph = canvas(model); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  const graph = canvas(model); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 300, 300);
   const task = graph.nodes.at(-1);
   graph.updateNodeConfig(task.id, { resultExpression: 'outputs.result' });
   const added = ['Err_A', 'Err_B', 'Err_C', 'Err_D', 'Err_E', 'Err_F'].map((ref) => graph.addBoundaryNode(task.id, 'bpmn_boundary_error', ref));
@@ -2494,7 +2494,7 @@ test('a task with a full border says so on both add buttons, and room returns wh
 });
 
 test('a boundary event dropped from the palette attaches to the task it lands on, or says it did not', () => {
-  const graph = canvas(); const template = (type) => processTemplates().find((row) => row.node_type === type);
+  const graph = canvas(); const template = (type) => processTemplates().find((row) => row.nodeType === type);
   graph.addNodeFromTemplate(template('bpmn_service_task'), 300, 300);
   const task = graph.nodes.at(-1);
   const [x, y] = [task.x + task.width / 2, task.y + task.height + 10];
@@ -2517,13 +2517,13 @@ test('a boundary event dropped from the palette attaches to the task it lands on
 test('a boundary event dropped on a task with a full border is moved off it, covering neither the task nor its handlers', () => {
   const model = emptyProcessModel();
   model.errors = ['A', 'B', 'C', 'D', 'E', 'F'].map((code) => ({ errorId: `Err_${code}`, name: code, errorCode: `CODE_${code}` }));
-  const graph = canvas(model); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 600, 300);
+  const graph = canvas(model); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 600, 300);
   const task = graph.nodes.at(-1);
   const handlers = model.errors.map((entry) => graph.addBoundaryNode(task.id, 'bpmn_boundary_error', entry.errorId));
   assert.equal(graph.boundaryRoom(task.id), 0);
   const overlap = (a, b) => a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
   for (const type of ['bpmn_boundary_timer', 'bpmn_boundary_error']) {
-    const refused = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === type), task.x + task.width / 2, task.y + task.height - 4);
+    const refused = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === type), task.x + task.width / 2, task.y + task.height - 4);
     assert.ok(!refused.config.attachedToId, 'it stays unattached');
     for (const other of [task, ...handlers, ...graph.nodes.filter((node) => node !== refused && !handlers.includes(node) && node !== task)]) {
       assert.equal(overlap(refused, other), false, `${type} does not cover ${other.id}`);
@@ -2536,7 +2536,7 @@ test('a boundary event dropped on a task with a full border is moved off it, cov
 test('a long code in a canvas label may break after its separators and keeps its full text on hover', () => {
   const graph = canvas();
   const code = 'INVALID_CUSTOMER_ADDRESS_FORMAT_FOR_REGION_<b>';
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_end'), 300, 300);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_end'), 300, 300);
   const end = graph.nodes.at(-1);
   graph.updateNodeLabel(end.id, code);
   const label = graph.nodesLayer.querySelector(`[data-node-id="${end.id}"] .fb-process-label`);
@@ -2549,7 +2549,7 @@ test('a long code in a canvas label may break after its separators and keeps its
 
 test('an escalation handler the server would refuse carries a warning badge that follows its flows', () => {
   const graph = canvas();
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 300, 300);
   const task = graph.nodes.at(-1);
   graph.updateNodeConfig(task.id, { resultExpression: 'outputs.result' });
   const handler = graph.addBoundaryNode(task.id, 'bpmn_boundary_escalation', null);
@@ -2568,9 +2568,9 @@ test('an escalation handler the server would refuse carries a warning badge that
 });
 
 test('a boundary event is not put on top of a node below the task when a free slot exists', () => {
-  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 300, 300);
   const task = graph.nodes.at(-1);
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_end'), 0, 0);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_end'), 0, 0);
   const end = graph.nodes.at(-1);
   end.x = task.x + 20; end.y = task.y + task.height + 10;
   const added = graph.addBoundaryNode(task.id, 'bpmn_boundary_error', null);
@@ -2601,7 +2601,7 @@ test('the process settings row folds on a short window and the palette drawer cl
   click(opener);
   assert.equal(palette.classList.contains('open'), true);
   assert.equal(opener.dataset.expanded, 'true');
-  const template = processTemplates().find((row) => row.node_type === 'bpmn_service_task');
+  const template = processTemplates().find((row) => row.nodeType === 'bpmn_service_task');
   state.palette.opts.onAdd(template);
   assert.equal(palette.classList.contains('open'), false, 'adding a node puts the drawer away');
   click(opener);
@@ -2614,7 +2614,7 @@ test('the Service task tab and the routing table survive selecting its handler a
   const current = definition('routing-follow-definition');
   const state = await mount(current);
   const graph = state.canvas;
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 300, 300);
   const task = graph.nodes.at(-1);
   graph.updateNodeConfig(task.id, { resultExpression: 'outputs.result' });
   graph.selectNode(task.id);
@@ -2639,7 +2639,7 @@ test('the Service task tab and the routing table survive selecting its handler a
   assert.match(row.route, /Error: any/);
   assert.match(row.route, /then: End/);
   // Another task's handler does not carry the tab over.
-  graph.addNodeFromTemplate(processTemplates().find((candidate) => candidate.node_type === 'bpmn_service_task'), 600, 300);
+  graph.addNodeFromTemplate(processTemplates().find((candidate) => candidate.nodeType === 'bpmn_service_task'), 600, 300);
   const other = graph.nodes.at(-1);
   graph.selectNode(other.id);
   await flush(2);
@@ -2647,7 +2647,7 @@ test('the Service task tab and the routing table survive selecting its handler a
 });
 
 test('service tabs are labelled panels reachable at a glance with full names on hover', async () => {
-  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 200, 200);
   const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
   await flush(2);
   const tabs = config.root.querySelector('[data-service-tabs]');
@@ -2670,7 +2670,7 @@ test('an empty acceptance condition is named at save, flagged in the table and e
   const current = definition('empty-condition-definition');
   const state = await mount(current, { processDefinitionSaveRequest: (payload) => ({ definition: { ...current, model: payload.model, draftRevision: 5 } }) });
   const graph = state.canvas;
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 300, 300);
   const task = graph.nodes.at(-1);
   graph.updateNodeLabel(task.id, 'Check invoice');
   graph.updateNodeConfig(task.id, { verification: { Condition: { expression: '  ' } } });
@@ -2703,7 +2703,7 @@ test('saving a process says the process was saved, not a flow', async () => {
 test('a handler named after its code follows the code, a name the author wrote stays', async () => {
   const model = emptyProcessModel();
   model.errors = [{ errorId: 'Err_A', name: 'A', errorCode: 'CODE_A' }, { errorId: 'Err_B', name: 'B', errorCode: 'CODE_B' }];
-  const graph = canvas(model); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  const graph = canvas(model); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 300, 300);
   const task = graph.nodes.at(-1);
   graph.updateNodeConfig(task.id, { resultExpression: 'outputs.result' });
   const auto = graph.addBoundaryNode(task.id, 'bpmn_boundary_error', 'Err_A');
@@ -2722,7 +2722,7 @@ test('a handler named after its code follows the code, a name the author wrote s
 });
 
 test('the Call activity version warning leads its inspector', async () => {
-  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_call_activity'), 200, 200);
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_call_activity'), 200, 200);
   const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
   await flush(2);
   const body = config.root.querySelector('.fb-process-fields');
@@ -2741,7 +2741,7 @@ test('new block settings come from the server list, so a block that needs nothin
 });
 
 test('service inspector groups the task into tabs and keeps every control reachable', async () => {
-  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 200, 200);
   const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
   await flush(2);
   const tabs = config.root.querySelector('[data-service-tabs]');
@@ -2762,7 +2762,7 @@ test('service inspector groups the task into tabs and keeps every control reacha
   // The same node shown again keeps its tab; another node starts on the first one.
   config.show(node, graph.templates.get(node.type));
   assert.deepEqual(visible(), ['result']);
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 400, 300);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 400, 300);
   const other = graph.nodes.at(-1); config.show(other, graph.templates.get(other.type));
   assert.deepEqual(visible(), ['impl']);
   const hosts = 'tf-input, tf-textarea, tf-select, tf-keyvalue-editor, tf-table, tf-tabs, tf-button, tf-toggle, tf-person-picker, tf-alert';
@@ -2774,7 +2774,7 @@ test('service inspector groups the task into tabs and keeps every control reacha
 test('result tab shows the derived routing and its buttons add boundary events as one undo step', async () => {
   const model = emptyProcessModel();
   model.errors = [{ errorId: 'Err_A', name: 'A', errorCode: 'CODE_A' }];
-  const graph = canvas(model); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
+  const graph = canvas(model); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 200, 200);
   const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
   await flush(2);
   config.root.querySelector('[data-service-tabs]').dispatchEvent(new CustomEvent('change', { detail: { value: 'result' } }));
@@ -2825,7 +2825,7 @@ test('result tab shows the derived routing and its buttons add boundary events a
 
 test('canvas marks the kind of a Service task and an LLM block without a model', async () => {
   const graph = canvas();
-  const add = (preset, x, label = '') => { graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.node_type === 'bpmn_service_task'), preset, label }, x, 300); return graph.nodes.at(-1); };
+  const add = (preset, x, label = '') => { graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), preset, label }, x, 300); return graph.nodes.at(-1); };
   const element = (node) => graph.nodesLayer.querySelector(`[data-node-id="${node.id}"]`);
   const plain = add(undefined, 100);
   const flow = add({ flowId: 'flow-one' }, 300);
@@ -2863,7 +2863,7 @@ test('canvas marks the kind of a Service task and an LLM block without a model',
 test('an agent step is edited in the inspector, and every other control leaves its settings alone', async () => {
   const graph = canvas();
   const stored = { agentId: 'agent-1', goalExpression: '"Summarise"', allowedTools: ['core.skill_view'], maxIterations: 5 };
-  graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.node_type === 'bpmn_service_task'), preset: { implementation: { Agent: structuredClone(stored) } } }, 300, 300);
+  graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), preset: { implementation: { Agent: structuredClone(stored) } } }, 300, 300);
   const agent = graph.nodes.at(-1);
   assert.equal(processServiceKind(agent.config), 'agent');
   const marker = graph.nodesLayer.querySelector(`[data-node-id="${agent.id}"] .fb-process-kind`);
@@ -2921,7 +2921,7 @@ test('an agent step is edited in the inspector, and every other control leaves i
 test('an agent step keeps unsaved input visible and bounds the iteration limit', async () => {
   const graph = canvas();
   const stored = { agentId: 'agent-1', goalExpression: '"Summarise"', allowedTools: [], maxIterations: 5, outputSchema: { type: 'object' } };
-  graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.node_type === 'bpmn_service_task'), preset: { implementation: { Agent: structuredClone(stored) } } }, 300, 300);
+  graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), preset: { implementation: { Agent: structuredClone(stored) } } }, 300, 300);
   const agent = graph.nodes.at(-1);
   const config = inspector(graph); config.show(agent, graph.templates.get(agent.type));
   await flush(2);
@@ -2963,7 +2963,7 @@ test('an agent step keeps unsaved input visible and bounds the iteration limit',
 test('a step whose agent is no longer offered cannot raise its iteration limit', async () => {
   const graph = canvas();
   const stored = { agentId: 'gone-agent', goalExpression: '"Summarise"', allowedTools: [], maxIterations: 7, outputSchema: null };
-  graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.node_type === 'bpmn_service_task'), preset: { implementation: { Agent: stored } } }, 300, 300);
+  graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), preset: { implementation: { Agent: stored } } }, 300, 300);
   const agent = graph.nodes.at(-1);
   const config = inspector(graph); config.show(agent, graph.templates.get(agent.type));
   await flush(2);
@@ -2978,7 +2978,7 @@ test('a step whose agent is no longer offered cannot raise its iteration limit',
 test('an agent step keeps a refused draft across a node switch and publishing names it', async () => {
   const graph = canvas();
   const preset = { implementation: { Agent: { agentId: 'agent-1', goalExpression: '"Summarise"', allowedTools: [], maxIterations: 5, outputSchema: { type: 'object' } } } };
-  const template = processTemplates().find((row) => row.node_type === 'bpmn_service_task');
+  const template = processTemplates().find((row) => row.nodeType === 'bpmn_service_task');
   graph.addNodeFromTemplate({ ...template, preset: structuredClone(preset) }, 300, 300);
   const first = graph.nodes.at(-1);
   graph.addNodeFromTemplate({ ...template, preset: structuredClone(preset) }, 600, 300);
@@ -3010,11 +3010,11 @@ test('an agent step keeps a refused draft across a node switch and publishing na
 test('a refused draft left inside a sub-process still blocks publishing from the main body', async () => {
   const graph = canvas();
   const config = inspector(graph);
-  const sub = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_sub_process'), 300, 300);
+  const sub = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_sub_process'), 300, 300);
   graph.updateNodeLabel(sub.id, 'Review stage');
   graph.navigateProcessBody([sub.id]);
   const preset = { implementation: { Agent: { agentId: 'agent-1', goalExpression: '"Summarise"', allowedTools: [], maxIterations: 5, outputSchema: { type: 'object' } } } };
-  const agent = graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.node_type === 'bpmn_service_task'), preset }, 300, 300);
+  const agent = graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), preset }, 300, 300);
   agent.label = 'Nested summariser';
   config.show(agent, graph.templates.get(agent.type));
   await flush(2);
@@ -3040,7 +3040,7 @@ function wireDrafts(graph, config) {
 
 test('undoing a step back to a flow drops the refused agent draft that nothing can fix any more', async () => {
   const graph = canvas();
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 300, 300);
   const id = graph.nodes.at(-1).id;
   const config = inspector(graph); wireDrafts(graph, config);
   config.show(graph.nodes.at(-1), graph.templates.get('bpmn_service_task'));
@@ -3064,7 +3064,7 @@ test('undoing a step back to a flow drops the refused agent draft that nothing c
 
 test('processDraftProblems ignores a draft whose node is not an agent step, whatever dropped the hook', async () => {
   const graph = canvas();
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 300, 300);
   const node = graph.nodes.at(-1);
   const config = inspector(graph);
   config.show(node, graph.templates.get(node.type));
@@ -3081,7 +3081,7 @@ test('processDraftProblems ignores a draft whose node is not an agent step, what
 test('loading another model drops every refused draft, even for a node id the new model shares', async () => {
   const graph = canvas();
   const preset = { implementation: { Agent: { agentId: 'agent-1', goalExpression: '"Summarise"', allowedTools: [], maxIterations: 5, outputSchema: { type: 'object' } } } };
-  graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.node_type === 'bpmn_service_task'), preset }, 300, 300);
+  graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), preset }, 300, 300);
   const node = graph.nodes.at(-1);
   const config = inspector(graph); wireDrafts(graph, config);
   config.show(node, graph.templates.get(node.type));
@@ -3468,7 +3468,7 @@ test('the allowed tools field shows exactly what is stored', async () => {
 
 test('an escalation handler on an agent step speaks of the agent, not of a service task', async () => {
   const graph = canvas(agentStepModel());
-  const boundary = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_escalation'), 300, 300);
+  const boundary = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_boundary_escalation'), 300, 300);
   graph.updateNodeConfig(boundary.id, { attachedToId: 'Agent_1' });
   const config = inspector(graph);
   config.show(graph.nodes.find((candidate) => candidate.id === boundary.id), graph.templates.get('bpmn_boundary_escalation')); await flush(2);
@@ -3487,7 +3487,7 @@ test('an agent step can catch error and escalation events without a result rule'
   assert.equal(routing.add.escalationReason, null);
   assert.ok(routing.rows.some((row) => row.outcome === 'error' && row.route !== 'unavailable'));
   assert.ok(processBoundaryHosts(graph, 'BoundaryEscalation').some((host) => host.id === agent.id));
-  const plain = processTemplates().find((row) => row.node_type === 'bpmn_service_task');
+  const plain = processTemplates().find((row) => row.nodeType === 'bpmn_service_task');
   graph.addNodeFromTemplate(plain, 600, 300);
   const task = graph.nodes.at(-1);
   assert.equal(processResultRouting(graph, task.id).hasResult, false, 'a Flow task still needs its rule');
@@ -3496,7 +3496,7 @@ test('an agent step can catch error and escalation events without a result rule'
 });
 
 test('a new Call activity says it needs an exact version instead of failing at save', async () => {
-  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_call_activity'), 200, 200);
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_call_activity'), 200, 200);
   const node = graph.nodes.at(-1);
   assert.deepEqual(processNodeWarnings(node), ['call_version']);
   assert.equal(graph.nodesLayer.querySelector(`[data-node-id="${node.id}"] .fb-process-warn`).getAttribute('data-warning'), 'call_version');
@@ -3517,7 +3517,7 @@ test('a new Call activity says it needs an exact version instead of failing at s
 });
 
 test('service inspector offers the block types the server lists, not a built-in list', async () => {
-  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 200, 200);
   const node = graph.nodes.at(-1);
   const mountWith = async (blocks) => {
     const root = document.createElement('aside'); document.body.append(root);
@@ -3544,7 +3544,7 @@ test('service inspector offers the block types the server lists, not a built-in 
 });
 
 test('choosing a block keeps a payload mapping the author already wrote', async () => {
-  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 200, 200);
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 200, 200);
   const node = graph.nodes.at(-1); const config = inspector(graph); config.show(node, graph.templates.get(node.type));
   await flush(2);
   change(config.root.querySelector('[data-process="inputMapping"]'), { payload: 'vars.question' });
@@ -3960,7 +3960,7 @@ test('five locales explain the selected repeated activity without losing its ful
         ['bpmn_call_activity', 'call'],
       ]) {
         const graph = canvas();
-        graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === template), 250, 300);
+        graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === template), 250, 300);
         const node = graph.nodes.at(-1);
         const fullName = `R&D <Łódź> ${'Long activity '.repeat(12)}`;
         graph.updateNodeLabel(node.id, fullName);
@@ -3978,7 +3978,7 @@ test('five locales explain the selected repeated activity without losing its ful
         assert.equal(config.root.querySelector('.fb-config-title').querySelector('Łódź'), null);
         graph.updateNodeConfig(node.id, { repeat: { MultiInstance: { mode: 'Sequential',
           input: { Cardinality: { count: 2 } }, outputCollectionVariable: 'results' } } });
-        graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_timer'), 500, 300);
+        graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_boundary_timer'), 500, 300);
         const boundary = graph.nodes.at(-1);
         graph.updateNodeConfig(boundary.id, { attachedToId: node.id });
         config.show(boundary, graph.templates.get(boundary.type));
@@ -3991,7 +3991,7 @@ test('five locales explain the selected repeated activity without losing its ful
           assert.ok(target && !target.disabled, 'A repeated Script has one selectable outer Timer host');
           for (const [type, supported] of [['bpmn_boundary_message', true],
             ['bpmn_boundary_error', false], ['bpmn_boundary_escalation', false]]) {
-            graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === type), 500, 380);
+            graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === type), 500, 380);
             const candidate = graph.nodes.at(-1);
             config.show(candidate, graph.templates.get(candidate.type));
             const option = config.root.querySelector(`[data-process="attachedToId"] option[value="${node.id}"]`);
@@ -4576,7 +4576,7 @@ test('ordinary users have visible Workflows navigation and create their own BPMN
     return { role: 'user' };
   }, processDefinitionListRequest: { definitions: [], total: 0, hasMore: false }, flowListRequest: [], processDefinitionSaveRequest: (payload) => ({ definition: definition('own-created', { name: payload.name, model: payload.model }) }) });
   document.body.innerHTML = `<main>${flows.render()}</main>`; await flows.mount();
-  assert.equal(authRequest?.variant, 'AuthMeRequest');
+  assert.equal(authRequest?._variant, 'AuthMeRequest');
   assert.equal(document.querySelector('#flows-mode').value, 'bpmn');
   assert.equal(document.querySelector('#flows-subtitle').textContent, I18n.t('bpmn.list_description'));
   click(document.querySelector('#btn-new-flow')); await flush();
@@ -5108,19 +5108,19 @@ test('all five locales translate supported elements, current statuses and every 
     await I18n.setLanguage(language);
     assert.equal(processTemplates().length, 29);
     for (const kind of ['link_throw', 'link_catch']) {
-      const template = processTemplates().find((item) => item.node_type === `bpmn_${kind}`);
+      const template = processTemplates().find((item) => item.nodeType === `bpmn_${kind}`);
       assert.equal(template?.label, I18n.t(`bpmn.node_${kind}`));
       assert.equal(template?.description, I18n.t(`bpmn.node_${kind}_hint`));
       assert.doesNotMatch(`${template.label} ${template.description}`, /bpmn\.|LinkDefinition_/);
     }
-    assert.equal(processTemplates().find((template) => template.node_type === 'bpmn_manual_task')?.label,
+    assert.equal(processTemplates().find((template) => template.nodeType === 'bpmn_manual_task')?.label,
       I18n.t('bpmn.node_manual_task'));
-    assert.equal(processTemplates().find((template) => template.node_type === 'bpmn_send_task')?.label,
+    assert.equal(processTemplates().find((template) => template.nodeType === 'bpmn_send_task')?.label,
       I18n.t('bpmn.node_send_task'));
-    assert.equal(processTemplates().find((template) => template.node_type === 'bpmn_receive_task')?.label,
+    assert.equal(processTemplates().find((template) => template.nodeType === 'bpmn_receive_task')?.label,
       I18n.t('bpmn.node_receive_task'));
     for (const name of ['signal_throw', 'signal_catch']) assert.equal(
-      processTemplates().find((template) => template.node_type === `bpmn_${name}`)?.label,
+      processTemplates().find((template) => template.nodeType === `bpmn_${name}`)?.label,
       I18n.t(`bpmn.node_${name}`));
     for (const key of ['event_gateway_receive_message_mix', 'event_gateway_receive_boundary',
       'event_gateway_branch_incoming']) {
@@ -5184,12 +5184,12 @@ test('all five locales translate supported elements, current statuses and every 
 
 test('DAG mode preserves its graph serialization and a system flow remains read-only', async () => {
   const graphJson = JSON.stringify({ nodes: [{ id: 'trigger', type: 'trigger', position: { x: 20, y: 40 }, config: {} }], edges: [] });
-  fixtures({ flowDetailRequest: { id: 'system-flow', name: 'System pipeline', description: null, graphJson, status: 'active', enabled: true, isSystem: true }, flowNodeTemplatesListRequest: { templates: [{ node_type: 'trigger', label: 'Trigger', category: 'trigger', input_ports: [], output_ports: ['full'] }] }, catalogListRequest: { entries: [] } });
+  fixtures({ flowDetailRequest: { id: 'system-flow', name: 'System pipeline', description: null, graphJson, status: 'active', enabled: true, isSystem: true }, flowNodeTemplatesListRequest: { templates: [{ nodeType: 'trigger', label: 'Trigger', category: 'trigger', inputPorts: [], outputPorts: ['full'] }] }, catalogListRequest: { entries: [] } });
   document.body.innerHTML = builder.render(); await builder.mount({ flowId: 'system-flow' });
   assert.equal(builder._state.canvas.readOnly, true); assert.ok(document.querySelector('[data-role="save"]').hidden);
   assert.equal(await builder._save(), false); assert.equal(calls.some((row) => row.kind.includes('process')), false);
   await builder.unmount();
-  fixtures({ flowDetailRequest: { id: 'custom-flow', name: 'Custom pipeline', description: null, graphJson, status: 'draft', enabled: false, isSystem: false }, flowNodeTemplatesListRequest: { templates: [{ node_type: 'trigger', label: 'Trigger', category: 'trigger', input_ports: [], output_ports: ['full'] }] }, catalogListRequest: { entries: [] }, flowUpdateRequest: { updated: true } });
+  fixtures({ flowDetailRequest: { id: 'custom-flow', name: 'Custom pipeline', description: null, graphJson, status: 'draft', enabled: false, isSystem: false }, flowNodeTemplatesListRequest: { templates: [{ nodeType: 'trigger', label: 'Trigger', category: 'trigger', inputPorts: [], outputPorts: ['full'] }] }, catalogListRequest: { entries: [] }, flowUpdateRequest: { updated: true } });
   document.body.innerHTML = builder.render(); await builder.mount({ flowId: 'custom-flow' });
   builder._state.canvas.updateNodeLabel('trigger', 'Entry'); assert.equal(await builder._save(), true);
   const saved = calls.find((row) => row.kind === 'flowUpdateRequest').payload;
@@ -5480,7 +5480,7 @@ test('a timer without a process time zone refuses the save by name, shows the fo
     const field = state.root.querySelector('[data-role="timer-timezone"]');
     assert.ok(notice.classList.contains('fb-collapsed'), 'a short window starts with the settings row folded');
     const task = userNode(state.canvas);
-    const timer = state.canvas.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_timer'),
+    const timer = state.canvas.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_boundary_timer'),
       task.x + task.width / 2, task.y + task.height);
     assert.equal(timer.config.attachedToId, task.id);
     state.canvas.updateNodeLabel(timer.id, 'Deadline');
@@ -5525,7 +5525,7 @@ test('the server refusal for a missing time zone is rewritten and a timer in ano
 test('no validation message cites the internal id of an unnamed element of any type', () => {
   const graph = canvas();
   const templates = processTemplates();
-  const template = (type) => templates.find((row) => row.node_type === type);
+  const template = (type) => templates.find((row) => row.nodeType === type);
   const add = (type, x, y, config = {}) => {
     const node = graph.addNodeFromTemplate(template(type), x, y);
     node.label = '';
@@ -6350,14 +6350,14 @@ test('mounted body selector authors and publishes two exact executable process b
 test('activity result inspector edits the localized CEL result and exposes no output port', async () => {
   const expression = "{'outcome':'Completed','code':null,'summary':'Completed','outputs':payload,'evidence':[]}";
   const template = {
-    node_type: 'activity_result', category: 'output', label: 'Activity result',
-    default_config: JSON.stringify({ result_expression: expression }),
-    params_schema: JSON.stringify({ properties: { result_expression: {
+    nodeType: 'activity_result', category: 'output', label: 'Activity result',
+    defaultConfig: JSON.stringify({ result_expression: expression }),
+    paramsSchema: JSON.stringify({ properties: { result_expression: {
       type: 'string', title: 'Activity result (CEL)', title_key: 'flows_config.activity_result_expression',
       description: 'Return the complete result object.', description_key: 'flows_config.activity_result_expression_hint',
       format: 'textarea',
     } }, required: ['result_expression'], order: ['result_expression'] }),
-    input_ports: ['in'], output_ports: [],
+    inputPorts: ['in'], outputPorts: [],
   };
   const graphRoot = document.createElement('div'); document.body.append(graphRoot);
   const graph = new FlowCanvas(graphRoot, { mode: 'flow' });
@@ -6438,7 +6438,7 @@ test('TentaFlow palette group lists flows, blocks, agents and addon tools as rea
   assert.equal(templates.length, 29 + 1 + 2 + 1 + 2);
   const dynamic = templates.filter((row) => row.category === 'tentaflow');
   assert.deepEqual(dynamic.map((row) => row.subgroup), ['flows', 'blocks', 'blocks', 'agents', 'tools', 'tools']);
-  assert.ok(dynamic.every((row) => row.node_type === 'bpmn_service_task' && row.preset));
+  assert.ok(dynamic.every((row) => row.nodeType === 'bpmn_service_task' && row.preset));
   assert.deepEqual(dynamic.map((row) => row.label), ['Contract checker', 'Language model (LLM)', 'Personal data filter', 'Reviewer', 'Notes <b>A</b> › search', 'Notes B › search']);
 
   const root = document.createElement('aside'); document.body.append(root);
@@ -6478,7 +6478,7 @@ test('dropping a TentaFlow entry creates a configured, named Service task withou
   graph.addNodeFromTemplate(find('Personal data filter'), 200, 500);
   graph.addNodeFromTemplate(find('Notes B › search'), 200, 700);
   graph.addNodeFromTemplate(find('Reviewer'), 400, 100);
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 600, 100);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 600, 100);
   const [flow, llm, pii, tool, agent, plain] = graph.nodes.slice(-6);
   assert.equal(flow.label, 'Contract checker');
   assert.equal(flow.config.flowId, 'flow-one');
@@ -6593,7 +6593,7 @@ test('keyboard add keeps focus on the palette row after the palette re-renders',
 
 test('successive adds without a position cascade instead of stacking', () => {
   const graph = canvas();
-  const template = processTemplates().find((row) => row.node_type === 'bpmn_user_task');
+  const template = processTemplates().find((row) => row.nodeType === 'bpmn_user_task');
   const spots = [];
   for (let index = 0; index < 20; index += 1) {
     const node = graph.addNodeFromTemplate(template, 500, 400, { cascade: true });
@@ -6708,7 +6708,7 @@ const noOverlaps = (nodes, size) => nodes.every((a, i) => nodes.slice(i + 1).eve
 
 test('a click add on a crowded process canvas intersects no existing node', () => {
   const graph = canvas();
-  const template = processTemplates().find((row) => row.node_type === 'bpmn_service_task');
+  const template = processTemplates().find((row) => row.nodeType === 'bpmn_service_task');
   const size = (n) => ({ w: n.width, h: n.height });
   graph.nodes = [];
   for (let row = 0; row < 8; row += 1) for (let col = 0; col < 8; col += 1) {
@@ -6723,13 +6723,13 @@ test('a click add on a crowded process canvas intersects no existing node', () =
 
 test('twelve successive keyboard adds on an empty canvas never overlap, for BPMN and classic nodes', () => {
   const graph = canvas();
-  const template = processTemplates().find((row) => row.node_type === 'bpmn_user_task');
+  const template = processTemplates().find((row) => row.nodeType === 'bpmn_user_task');
   for (let index = 0; index < 12; index += 1) graph.addNodeFromTemplate(template, 500, 400, { cascade: true });
   assert.ok(noOverlaps(graph.nodes.slice(-12), (n) => ({ w: n.width, h: n.height })));
 
   const root = document.createElement('div'); document.body.append(root);
   const classic = new FlowCanvas(root, { mode: 'flow' });
-  const tpl = { node_type: 'activity_result', category: 'output', label: 'Result', default_config: '{}', input_ports: ['in'], output_ports: [] };
+  const tpl = { nodeType: 'activity_result', category: 'output', label: 'Result', defaultConfig: '{}', inputPorts: ['in'], outputPorts: [] };
   classic.setTemplates([tpl]);
   classic.setData([{ id: 'Seed', type: 'activity_result', label: '', position: { x: 380, y: 300 }, config: {} }], []);
   for (let index = 0; index < 12; index += 1) classic.addNodeFromTemplate(tpl, 520, 355, { cascade: true });
@@ -6761,7 +6761,7 @@ function classicCanvas(width, height) {
   const root = document.createElement('div'); document.body.append(root);
   root.getBoundingClientRect = () => ({ left: 0, top: 0, width, height, right: width, bottom: height });
   const graph = new FlowCanvas(root, { mode: 'flow' });
-  const tpl = { node_type: 'activity_result', category: 'output', label: 'Result', default_config: '{}', input_ports: ['in'], output_ports: [] };
+  const tpl = { nodeType: 'activity_result', category: 'output', label: 'Result', defaultConfig: '{}', inputPorts: ['in'], outputPorts: [] };
   graph.setTemplates([tpl]);
   return { graph, tpl, root };
 }
@@ -6811,7 +6811,7 @@ test('node rectangles take the rendered height as world units whatever the zoom'
 test('a click add into a full viewport pans so the whole new node is visible', () => {
   const graph = canvas();
   graph.root.getBoundingClientRect = () => ({ left: 0, top: 0, width: 800, height: 600, right: 800, bottom: 600 });
-  const template = processTemplates().find((row) => row.node_type === 'bpmn_service_task');
+  const template = processTemplates().find((row) => row.nodeType === 'bpmn_service_task');
   graph.nodes = [];
   for (let row = 0; row < 6; row += 1) for (let col = 0; col < 3; col += 1) {
     graph.nodes.push({ id: `d${row}_${col}`, type: 'bpmn_service_task', x: 10 + col * 270, y: 10 + row * 100, width: 240, height: 96, config: {} });
@@ -6884,7 +6884,7 @@ test('a service task with an external label keeps the label inside the canvas af
     graph.view = { x: 0, y: 0, zoom: 1 };
     // The content clamp counts labels too and would hide a placement that ignores them.
     graph._clampView = () => {};
-    const template = processTemplates().find((row) => row.node_type === 'bpmn_service_task');
+    const template = processTemplates().find((row) => row.nodeType === 'bpmn_service_task');
     const node = graph.addNodeFromTemplate({ ...template, label: 'A very long tool name' , preset: {} }, 400, 20, { cascade: true });
     const label = graph.nodesLayer.querySelector(`[data-node-id="${node.id}"] .fb-process-label`);
     assert.equal(label.hidden, false, 'the label is outside the box');
@@ -6905,7 +6905,7 @@ test('a spot found while zoomed out is visible without a further pan, and the pa
   // The content clamp (a separate 40 px rule) is not what is measured here.
   graph._clampView = () => {};
   graph.view = { x: -300, y: 150, zoom: 0.6 };
-  const template = processTemplates().find((row) => row.node_type === 'bpmn_service_task');
+  const template = processTemplates().find((row) => row.nodeType === 'bpmn_service_task');
   const node = graph.addNodeFromTemplate(template, 0, 0, { cascade: true });
   assert.deepEqual([graph.view.x, graph.view.y], [-300, 150], 'a visible spot never pans');
   const left = node.x * 0.6 - 300;
@@ -7141,7 +7141,7 @@ test('a server refusal is shown by name in the banner and the status, and a sile
 });
 
 test('a Call activity without an exact target blocks the save naming it, and the picker explains an empty list', async () => {
-  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_call_activity'), 200, 200);
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_call_activity'), 200, 200);
   const node = graph.nodes.at(-1); graph.updateNodeLabel(node.id, 'Ask the bank');
   assert.deepEqual(graph.validate(), [I18n.t('bpmn.call_target_required', { node: 'Ask the bank' })]);
   graph.updateNodeConfig(node.id, { calledDefinitionId: 'd1', calledVersion: 2, calledElement: { namespaceUri: 'urn:x', processId: '' } });
@@ -7152,7 +7152,7 @@ test('a Call activity without an exact target blocks the save naming it, and the
   assert.equal(graph.validate().length, 1, 'a local call needs its body');
   graph.destroy();
 
-  const empty = canvas(); empty.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_call_activity'), 200, 200);
+  const empty = canvas(); empty.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_call_activity'), 200, 200);
   const call = empty.nodes.at(-1);
   fixtures({ processDefinitionListRequest: { definitions: [{ definitionId: 'draft', name: 'Draft only', publishedVersion: null }], hasMore: false } });
   const config = inspector(empty); config.show(call, empty.templates.get(call.type));
@@ -7168,7 +7168,7 @@ test('a Call activity without an exact target blocks the save naming it, and the
 
 test('an unattached boundary event is flagged on the canvas, and the save names it', () => {
   const graph = canvas();
-  const timer = processTemplates().find((row) => row.node_type === 'bpmn_boundary_timer');
+  const timer = processTemplates().find((row) => row.nodeType === 'bpmn_boundary_timer');
   graph.addNodeFromTemplate(timer, 400, 400);
   const loose = graph.nodes.at(-1);
   assert.deepEqual(processNodeWarnings(loose), ['boundary_unattached']);
@@ -7184,7 +7184,7 @@ test('an unattached boundary event is flagged on the canvas, and the save names 
 });
 
 test('a new boundary event does not land on a handler of the task next to it', () => {
-  const graph = canvas(); const template = (type) => processTemplates().find((row) => row.node_type === type);
+  const graph = canvas(); const template = (type) => processTemplates().find((row) => row.nodeType === type);
   graph.addNodeFromTemplate(template('bpmn_service_task'), 300, 300);
   graph.addNodeFromTemplate(template('bpmn_service_task'), 300, 700);
   const [above, below] = graph.nodes.filter((node) => node.type === 'bpmn_service_task');
@@ -7204,7 +7204,7 @@ test('a new boundary event does not land on a handler of the task next to it', (
 });
 
 test('boundary slots follow the sizes the stylesheet gives the task decorations', () => {
-  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 300, 300);
   const task = graph.nodes.at(-1);
   const size = { width: 56, height: 56 };
   const before = graph._boundarySlots(task, size).filter(([, y]) => y === task.y).length;
@@ -7320,7 +7320,7 @@ test('the settings row follows the window until the author uses its toggle, a ph
 test('the lines from six handlers to their names never run through another name', () => {
   const model = emptyProcessModel();
   model.errors = ['A', 'B', 'C', 'D', 'E', 'F'].map((code) => ({ errorId: `Err_${code}`, name: code, errorCode: `CODE_${code}` }));
-  const graph = canvas(model); graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 600, 300);
+  const graph = canvas(model); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 600, 300);
   const task = graph.nodes.at(-1);
   graph.updateNodeConfig(task.id, { resultExpression: 'outputs.result' });
   model.errors.forEach((entry) => graph.addBoundaryNode(task.id, 'bpmn_boundary_error', entry.errorId));
@@ -7354,7 +7354,7 @@ test('the lines from six handlers to their names never run through another name'
 // declarations and time zones told before the server refuses them.
 // ---------------------------------------------------------------------------
 
-const userTemplate = () => processTemplates().find((row) => row.node_type === 'bpmn_user_task');
+const userTemplate = () => processTemplates().find((row) => row.nodeType === 'bpmn_user_task');
 const ID_SHAPE = /\b(?:n|e)_[0-9a-z]{6,}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|Process_[0-9a-f_]{12,}/i;
 
 function twoStartCatalog(model) {
@@ -7410,7 +7410,7 @@ test('the Simulate window says up front that a repeated step cannot be simulated
 test('every list of the inspector numbers elements that share a name, and a palette of two flows with one name does too', async () => {
   const graph = canvas();
   const config = inspector(graph);
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_exclusive_gateway'), 300, 300);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_exclusive_gateway'), 300, 300);
   const gateway = graph.nodes.at(-1);
   const first = graph.addNodeFromTemplate(userTemplate(), 600, 200);
   const second = graph.addNodeFromTemplate(userTemplate(), 600, 400);
@@ -7429,7 +7429,7 @@ test('every list of the inspector numbers elements that share a name, and a pale
   const flowGraph = canvas(); const flowConfig = new FlowConfig(document.body.appendChild(document.createElement('aside')), { mode: 'bpmn',
     processOptions: { ...options, serviceBlocks, serviceFlows: [{ flowId: 'a', name: 'Contract checker' }, { flowId: 'b', name: 'Contract checker' }] },
     getCanvas: () => flowGraph, onConfigChange: () => {}, onEdgeChange: () => {}, onLabelChange: () => {} });
-  const service = flowGraph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
+  const service = flowGraph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 300, 300);
   flowConfig.show(service, flowGraph.templates.get(service.type));
   await flush(2);
   assert.deepEqual([...flowConfig.root.querySelectorAll('[data-process="flowId"] option')].filter((option) => option.value).map((option) => option.textContent),
@@ -7439,7 +7439,7 @@ test('every list of the inspector numbers elements that share a name, and a pale
 
 test('the breadcrumb numbers sub-processes that share a name and keeps Leave after the path', async () => {
   const state = await mount(definition('nested-crumb'));
-  const sub = (x) => state.canvas.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_sub_process'), x, 300);
+  const sub = (x) => state.canvas.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_sub_process'), x, 300);
   const outer = sub(300);
   state.canvas.navigateProcessBody([outer.id]);
   const inner = sub(300);
@@ -7458,7 +7458,7 @@ test('the breadcrumb numbers sub-processes that share a name and keeps Leave aft
 test('Sub-process and Human task inspectors head each mapping, so the two Add buttons are told apart', async () => {
   const graph = canvas();
   const config = inspector(graph);
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_sub_process'), 300, 300);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_sub_process'), 300, 300);
   const sub = graph.nodes.at(-1);
   config.show(sub, graph.templates.get(sub.type));
   await flush(2);
@@ -7475,12 +7475,12 @@ test('no inspector of a typical process shows an element id, a UUID or a definit
   const model = emptyProcessModel();
   model.errors = [{ errorId: 'Err_x', name: 'Payment failed', errorCode: 'PAY' }];
   const graph = canvas(model); const config = inspector(graph);
-  const service = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 300);
-  const gateway = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_exclusive_gateway'), 600, 300);
+  const service = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 300, 300);
+  const gateway = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_exclusive_gateway'), 600, 300);
   graph.connectNodes(service.id, gateway.id);
   graph.addBoundaryNode(service.id, 'bpmn_boundary_error', 'Err_x');
   const boundary = graph.nodes.at(-1);
-  const call = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_call_activity'), 300, 600);
+  const call = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_call_activity'), 300, 600);
   fixtures({ processDefinitionListRequest: { definitions: [], hasMore: false } });
   for (const node of [service, gateway, boundary, call, graph.nodes[0]]) {
     config.show(node, graph.templates.get(node.type));
@@ -7523,7 +7523,7 @@ test('a saved Send target is named, not shown as an id pair, and a failed lookup
 test('a Send task lists the owned definitions without a click and keeps the target id and the called process id behind technical details', async () => {
   const definitionId = 'eeeeeeee-0000-4000-8000-00000000000e';
   const graph = canvas(emptyProcessModel()); const config = inspector(graph);
-  const send = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_send_task'), 300, 300);
+  const send = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_send_task'), 300, 300);
   fixtures({ processDefinitionListRequest: { definitions: [{ definitionId, name: 'Billing', publishedVersion: 1, archived: false }], hasMore: false } });
   config.show(send, graph.templates.get(send.type));
   await flush(3);
@@ -7533,7 +7533,7 @@ test('a Send task lists the owned definitions without a click and keeps the targ
   assert.ok(config.root.querySelector('tf-disclosure[data-technical] [data-process="targetDefinitionId"]'), 'the target id is a technical field');
   assert.equal(config.root.querySelector('tf-disclosure[data-technical]').hasAttribute('open'), false);
   assert.equal(config.root.querySelector('[data-load-targets]').hidden, true, 'nothing more to load');
-  const call = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_call_activity'), 300, 600);
+  const call = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_call_activity'), 300, 600);
   fixtures({ processDefinitionListRequest: { definitions: [], hasMore: false } });
   config.show(call, graph.templates.get(call.type));
   assert.ok(config.root.querySelector('tf-disclosure[data-technical] [data-process="calledElement"]'), 'the called namespace and id are technical details');
@@ -7736,7 +7736,7 @@ test('a press that opens the inspector on a phone is not closed by the click tha
 
 test('a boundary event not on an activity looks unattached, not attached', () => {
   const graph = canvas();
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_timer'), 400, 300);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_boundary_timer'), 400, 300);
   const element = graph.nodesLayer.querySelector('.fb-process-node.bpmn_boundary_timer');
   assert.equal(element.classList.contains('fb-unattached'), true);
   assert.equal(element.dataset.unattachedLabel, I18n.t('bpmn.boundary_not_attached'));
@@ -7745,9 +7745,9 @@ test('a boundary event not on an activity looks unattached, not attached', () =>
 
 test('the label of an unattached event keeps clear of its Not attached tag when the room below is taken', () => {
   const graph = canvas();
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_timer'), 400, 300);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_boundary_timer'), 400, 300);
   const event = graph.nodes.at(-1);
-  const task = processTemplates().find((row) => row.node_type === 'bpmn_user_task');
+  const task = processTemplates().find((row) => row.nodeType === 'bpmn_user_task');
   for (const [x, y] of [[event.x - 120, event.y + 90], [event.x + 120, event.y + 90], [event.x - 330, event.y - 20], [event.x + 330, event.y - 20]]) graph.addNodeFromTemplate(task, x, y);
   graph.nodes.filter((node) => node.type === 'bpmn_user_task').forEach((node, index) => { node.x = [event.x - 120, event.x + 120, event.x - 330, event.x + 330][index]; node.y = [event.y + 90, event.y + 90, event.y - 20, event.y - 20][index]; });
   for (const element of graph.nodesLayer.querySelectorAll('.fb-process-label')) {
@@ -7769,7 +7769,7 @@ test('leader lines of six handlers on one task never run through the task, and a
   const model = emptyProcessModel();
   model.errors = ['A', 'B', 'C', 'D', 'E', 'F'].map((code) => ({ errorId: `Err_${code}`, name: `Failure ${code}`, errorCode: `CODE_${code}` }));
   const graph = canvas(model);
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 600, 300);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 600, 300);
   const task = graph.nodes.at(-1);
   model.errors.forEach((entry) => graph.addBoundaryNode(task.id, 'bpmn_boundary_error', entry.errorId));
   for (const element of graph.nodesLayer.querySelectorAll('.fb-process-label')) {
@@ -7864,7 +7864,7 @@ test('a deferred label takes no part in bounds or footprints and no non-finite n
   for (const shape of saved.diagram.shapes) for (const value of [shape.x, shape.y, shape.width, shape.height]) assert.ok(Number.isFinite(value));
   assert.doesNotMatch(JSON.stringify(saved), /"(x|y|width|height)":null/);
 
-  const dropped = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_user_task'), Number.NaN, Number.NaN);
+  const dropped = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_user_task'), Number.NaN, Number.NaN);
   assert.ok(Number.isFinite(dropped.x) && Number.isFinite(dropped.y));
   graph.destroy();
 });
@@ -7893,7 +7893,7 @@ test('a drop under the minimap moves aside and a drop at the canvas edge is brou
   const graph = new FlowCanvas(root, { mode: 'bpmn', processOptions: { ...options, serviceBlocks }, obstacles: () => [minimap] });
   graph.setTemplates(processTemplates()); graph.setData(emptyProcessModel());
   graph.view = { x: 0, y: 0, zoom: 1 };
-  const task = processTemplates().find((row) => row.node_type === 'bpmn_user_task');
+  const task = processTemplates().find((row) => row.nodeType === 'bpmn_user_task');
   const under = graph.addNodeFromTemplate(task, 720, 540);
   const hidden = under.x < minimap.left + minimap.width && minimap.left < under.x + under.width
     && under.y < minimap.top + minimap.height && minimap.top < under.y + under.height;
@@ -7939,28 +7939,28 @@ test('the minimap pans the canvas on a press and folds to its title bar, remembe
 test('a boundary event refused on a repeating task names the real cause in the drop toast, the check before saving and the server message', async () => {
   const repeat = { MultiInstance: { mode: 'Sequential', input: { Cardinality: { count: 2 } }, outputCollectionVariable: 'parts' } };
   const graph = canvas();
-  const script = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_script_task'), 700, 300);
+  const script = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_script_task'), 700, 300);
   graph.updateNodeLabel(script.id, 'Compute each part');
   graph.updateNodeConfig(script.id, { repeat });
-  const manual = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_user_task'), 1100, 300);
+  const manual = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_user_task'), 1100, 300);
   graph.updateNodeLabel(manual.id, 'Review each part');
   graph.updateNodeConfig(manual.id, { repeat });
   const toasts = watchToasts();
   try {
     const point = (node) => [node.x + node.width / 2, node.y + node.height];
-    const error = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_error'), ...point(script));
+    const error = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_boundary_error'), ...point(script));
     assert.equal(error.config.attachedToId ?? '', '', 'a Script task takes no error event');
     assert.ok(toasts.texts().some((text) => text.includes('Compute each part') && /error event fits only a Service task/.test(text) && !/repeat/.test(text)),
       'the toast names the task and the kind of task as the reason, not the repetition');
-    const escalation = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_escalation'), ...point(manual));
+    const escalation = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_boundary_escalation'), ...point(manual));
     assert.equal(escalation.config.attachedToId ?? '', '');
     assert.ok(toasts.texts().some((text) => text.includes('Review each part') && /escalation event fits only a Service task/.test(text) && !/repeat/.test(text)),
       'an escalation dropped on a looping User task is explained too');
-    const service = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 300, 600);
+    const service = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 300, 600);
     graph.updateNodeLabel(service.id, 'Call each part');
     graph.updateNodeConfig(service.id, { repeat });
     graph.updateNodeConfig(service.id, { resultExpression: '{}' });
-    const timer = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_timer'), ...point(manual));
+    const timer = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_boundary_timer'), ...point(manual));
     assert.equal(timer.config.attachedToId, manual.id, 'a timer is welcome on a repeating task');
     const refusals = processBoundaryRefusals(graph, 'BoundaryError');
     assert.equal(refusals.get(service.id), null, 'an error event fits a repeating Service task');
@@ -7971,9 +7971,9 @@ test('a boundary event refused on a repeating task names the real cause in the d
 
   const config = inspector(graph);
   graph.updateNodeConfig(manual.id, { resultExpression: undefined });
-  const tail = graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_message'), 500, 700);
+  const tail = graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_boundary_message'), 500, 700);
   graph.updateNodeConfig(tail.id, { attachedToId: manual.id });
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_boundary_escalation'), 800, 800);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_boundary_escalation'), 800, 800);
   const escalation = graph.nodes.at(-1);
   config.show(escalation, graph.templates.get(escalation.type));
   await flush(2);
@@ -8053,7 +8053,7 @@ test('a repeating activity refuses a boundary event exactly as the engine does',
 
 test('a repeating Service task with no declared variable can declare its output collection in place', async () => {
   const graph = canvas();
-  graph.addNodeFromTemplate(processTemplates().find((row) => row.node_type === 'bpmn_service_task'), 250, 300);
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 250, 300);
   const node = graph.nodes.at(-1);
   const config = inspector(graph);
   config.show(node, graph.templates.get(node.type));
@@ -8155,7 +8155,7 @@ test('the classic builder asks the same three-way question through the same rout
   await builder.unmount();
   const graphJson = JSON.stringify({ nodes: [{ id: 'trigger', type: 'trigger', position: { x: 20, y: 40 }, config: {} }], edges: [] });
   fixtures({ flowDetailRequest: { id: 'classic-flow', name: 'Classic', description: null, graphJson, status: 'draft', enabled: false, isSystem: false },
-    flowNodeTemplatesListRequest: { templates: [{ node_type: 'trigger', label: 'Trigger', category: 'input', config_schema: {}, defaults: {} }] },
+    flowNodeTemplatesListRequest: { templates: [{ nodeType: 'trigger', label: 'Trigger', category: 'trigger', inputPorts: [], outputPorts: ['full'] }] },
     flowUpdateRequest: {} });
   document.body.innerHTML = builder.render(); await builder.mount({ flowId: 'classic-flow' });
   const state = builder._state;

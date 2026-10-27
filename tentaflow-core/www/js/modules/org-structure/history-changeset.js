@@ -63,7 +63,7 @@ export function createReorgPanel({
 
   // A preview is a dry run of the whole reorganization on the write connection: kept until the reorganization
   // changes, not redone each time the tab is shown.
-  const keyOf = (set) => [set.state, set.op_count, set.effective_date, set.name, set.author_user_id].join('|');
+  const keyOf = (set) => [set.state, set.opCount, set.effectiveDate, set.name, set.authorUserId].join('|');
 
   async function loadPreview(set) {
     const key = keyOf(set);
@@ -82,7 +82,7 @@ export function createReorgPanel({
   // The mockup opens "Przed i po" on the soonest planned reorganization: the page answers "what will change" at once.
   function autoCompare(set) {
     const soonest = sets.filter((s) => s.state === 'draft' || s.state === 'pending')
-      .sort((a, b) => a.effective_date.localeCompare(b.effective_date))[0];
+      .sort((a, b) => a.effectiveDate.localeCompare(b.effectiveDate))[0];
     const comparison = soonest?.id === set.id ? comparisonOf(set) : null;
     if (!comparison || autoCompared || isComparing()) return;
     autoCompared = true;
@@ -152,9 +152,9 @@ export function createReorgPanel({
   }
 
   function approvalHtml(set) {
-    const author = `<div class="org-reorg-row"><span>${escapeHtml(t('author', { name: set.author_name || '—' }))}</span></div>`;
+    const author = `<div class="org-reorg-row"><span>${escapeHtml(t('author', { name: set.authorName || '—' }))}</span></div>`;
     if (set.state === 'applied') {
-      return `${author}<div class="org-reorg-row"><span>${escapeHtml(t('approver', { name: set.approver_name || '—' }))}</span><tf-chip status="ok" icon="check">${escapeHtml(t('state.applied'))}</tf-chip></div>`;
+      return `${author}<div class="org-reorg-row"><span>${escapeHtml(t('approver', { name: set.approverName || '—' }))}</span><tf-chip status="ok" icon="check">${escapeHtml(t('state.applied'))}</tf-chip></div>`;
     }
     if (set.state === 'pending') {
       return `${author}<div class="org-reorg-row"><span>${escapeHtml(soleAdmin ? t('sole_admin_note') : t('appr_pending'))}</span><tf-chip status="warn" dot>${escapeHtml(t('state.pending'))}</tf-chip></div>`;
@@ -181,7 +181,7 @@ export function createReorgPanel({
     if (flags.canWithdraw) {
       buttons.push(`<tf-button variant="ghost" size="sm" icon="trash" data-act="withdraw">${escapeHtml(t('btn_withdraw'))}</tf-button>`);
     }
-    buttons.push(`<tf-button variant="ghost" size="sm" icon="calendar" data-act="show-day">${escapeHtml(t('btn_show_day', { date: formatDay(set.effective_date) }))}</tf-button>`);
+    buttons.push(`<tf-button variant="ghost" size="sm" icon="calendar" data-act="show-day">${escapeHtml(t('btn_show_day', { date: formatDay(set.effectiveDate) }))}</tf-button>`);
     if (flags.open) {
       buttons.push(`<tf-button variant="ghost" size="sm" icon="sitemap" data-act="compare">${escapeHtml(t('btn_compare'))}</tf-button>`);
     }
@@ -194,10 +194,10 @@ export function createReorgPanel({
   function cardHtml(set) {
     const { today, meHex } = context();
     const flags = changeSetFlags(set, { me: meHex, today, soleAdmin });
-    const date = formatDay(set.effective_date);
+    const date = formatDay(set.effectiveDate);
     const sub = flags.datePassed && flags.open
       ? t('sub_passed', { date })
-      : t('sub', { date, count: set.op_count });
+      : t('sub', { date, count: set.opCount });
     const note = flags.open
       ? `<div class="org-reorg-calm">${escapeHtml(t('calm_note', { date }))}</div>` : '';
     return `
@@ -240,7 +240,7 @@ export function createReorgPanel({
   }
 
   function openApprove(set, anchor) {
-    const date = formatDay(set.effective_date);
+    const date = formatDay(set.effectiveDate);
     openFormWindow({
       title: t('approve_title'),
       icon: 'check',
@@ -367,7 +367,7 @@ export function createReorgPanel({
         await afterChange();
         const saved = answer.changeSet;
         const taken = await openChangeSetInEditor({
-          id: saved.id, name: saved.name, effectiveDate: saved.effective_date, ops: saved.ops,
+          id: saved.id, name: saved.name, effectiveDate: saved.effectiveDate, ops: saved.ops,
         }).catch(() => false);
         return { message: taken ? t('new_done', { name }) : t('new_editor_missing', { name }) };
       },
@@ -389,7 +389,7 @@ export function createReorgPanel({
     }
     const full = answer.changeSet;
     const taken = await openChangeSetInEditor({
-      id: full.id, name: full.name, effectiveDate: full.effective_date, ops: full.ops,
+      id: full.id, name: full.name, effectiveDate: full.effectiveDate, ops: full.ops,
     });
     if (taken) return;
     openBasicEditor(full, anchor);
@@ -399,7 +399,7 @@ export function createReorgPanel({
   function openBasicEditor(full, anchor) {
     const { today, view } = context();
     let ops = full.ops;
-    const inputs = nameAndDateSections({ name: full.name, day: full.effective_date, minDay: today });
+    const inputs = nameAndDateSections({ name: full.name, day: full.effectiveDate, minDay: today });
     const list = document.createElement('div');
     list.className = 'org-reorg-ops';
     const drawOps = () => {
@@ -452,7 +452,7 @@ export function createReorgPanel({
       case 'withdraw': if (set) openWithdraw(set, target); break;
       case 'submit': if (set) submit(set); break;
       case 'edit': if (set) openEdit(set, target); break;
-      case 'show-day': if (set) onShowDay(set.effective_date); break;
+      case 'show-day': if (set) onShowDay(set.effectiveDate); break;
       case 'compare': if (set) compare(set); break;
       case 'toggle-closed':
         showClosed = !showClosed;

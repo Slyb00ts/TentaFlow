@@ -68,3 +68,14 @@ test('the sidebar preview strips markup rather than rendering it', () => {
   assert.equal(extractPlainText('**Grover** i `q[0]`'), 'Grover i q[0]');
   assert.equal(extractPlainText('```py\nprint(1)\n```'), '[code]');
 });
+
+test('a fence that is still streaming is already a code block, with a tf-button copy action', () => {
+  const html = renderMarkdown('Oto kod:\n\n```python\nprint(1)\nprint(2');
+  assert.match(html, /<div class="code-block">/);
+  assert.match(html, /<span class="lang mono">python<\/span>/);
+  assert.match(html, /<code>print\(1\)\nprint\(2<\/code>/);
+  assert.doesNotMatch(html, /```/);
+  assert.match(html, /<tf-button [^>]*class="copy-btn"/);
+  assert.doesNotMatch(html, /<button/);
+  assert.match(renderMarkdown('```py'), /<span class="lang mono">py<\/span>/);
+});

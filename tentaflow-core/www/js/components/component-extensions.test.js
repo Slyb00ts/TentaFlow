@@ -768,7 +768,7 @@ function activity(attrs = {}) {
 
 test('tf-agent-activity: level="tree" renders the tree without a synthetic click', () => {
   const w = activity({ level: 'tree' });
-  w.applyEvent({ kind: 'iteration_started', run_id: 'r1', agent: 'coder', n: 1 });
+  w.applyEvent({ kind: 'iteration_started', runId: 'r1', agent: 'coder', n: 1 });
   assert.equal(w.level, 'tree');
   assert.ok(w.querySelector('.tf-aa-tree'), 'tree body rendered');
   assert.equal(w.querySelector('.tf-aa-bar'), null, 'no collapsed bar');
@@ -796,7 +796,7 @@ test('tf-agent-activity: level="tree" keeps the panel visible with no runs', () 
 test('tf-agent-activity: without the attribute the widget still auto-hides and expands', () => {
   const w = activity();
   assert.equal(w.querySelector('.tf-agent-activity').hidden, true, 'auto-hidden when idle');
-  w.applyEvent({ kind: 'iteration_started', run_id: 'r1', agent: 'coder', n: 1 });
+  w.applyEvent({ kind: 'iteration_started', runId: 'r1', agent: 'coder', n: 1 });
   assert.ok(w.querySelector('.tf-aa-bar'), 'collapsed bar by default');
   assert.equal(w.hasAttribute('level'), false, 'no attribute is written for uncontrolled hosts');
   w.querySelector('[data-action="expand"]').click();
@@ -806,7 +806,7 @@ test('tf-agent-activity: without the attribute the widget still auto-hides and e
 
 test('tf-agent-activity: a controlled host sees internal navigation in the attribute', () => {
   const w = activity({ level: 'bar' });
-  w.applyEvent({ kind: 'iteration_started', run_id: 'r1', agent: 'coder', n: 1 });
+  w.applyEvent({ kind: 'iteration_started', runId: 'r1', agent: 'coder', n: 1 });
   w.querySelector('[data-action="expand"]').click();
   assert.equal(w.getAttribute('level'), 'tree');
   w.querySelector('[data-action="collapse"]').click();
@@ -815,8 +815,8 @@ test('tf-agent-activity: a controlled host sees internal navigation in the attri
 
 test('tf-agent-activity: child_spawned sets the parent and the tree is deeper than one level', () => {
   const w = activity({ level: 'tree' });
-  w.applyEvent({ kind: 'iteration_started', run_id: 'root', agent: 'lead', n: 1 });
-  w.applyEvent({ kind: 'child_spawned', run_id: 'kid', scope: 'root', agent: 'tester' });
+  w.applyEvent({ kind: 'iteration_started', runId: 'root', agent: 'lead', n: 1 });
+  w.applyEvent({ kind: 'child_spawned', runId: 'kid', scope: 'root', agent: 'tester' });
 
   const rows = [...w.querySelectorAll('.tf-aa-run')];
   assert.equal(rows.length, 2, 'both runs are in the tree');
@@ -830,9 +830,9 @@ test('tf-agent-activity: child_spawned sets the parent and the tree is deeper th
 
 test('tf-agent-activity: a grandchild nests two levels deep', () => {
   const w = activity({ level: 'tree' });
-  w.applyEvent({ kind: 'iteration_started', run_id: 'root', agent: 'lead', n: 1 });
-  w.applyEvent({ kind: 'child_spawned', run_id: 'kid', scope: 'root', agent: 'tester' });
-  w.applyEvent({ kind: 'child_spawned', run_id: 'grandkid', scope: 'kid', agent: 'fixer' });
+  w.applyEvent({ kind: 'iteration_started', runId: 'root', agent: 'lead', n: 1 });
+  w.applyEvent({ kind: 'child_spawned', runId: 'kid', scope: 'root', agent: 'tester' });
+  w.applyEvent({ kind: 'child_spawned', runId: 'grandkid', scope: 'kid', agent: 'fixer' });
 
   const rows = [...w.querySelectorAll('.tf-aa-run')];
   assert.equal(rows.length, 3);
@@ -844,7 +844,7 @@ test('tf-agent-activity: a child whose parent is unknown stays a visible root', 
   const w = activity({ level: 'tree' });
   // Joined mid-stream: no event ever introduced "unseen-root". Linking to it
   // would hide the child (the tree renders from roots down), so it stays a root.
-  w.applyEvent({ kind: 'child_spawned', run_id: 'kid', scope: 'unseen-root', agent: 'tester' });
+  w.applyEvent({ kind: 'child_spawned', runId: 'kid', scope: 'unseen-root', agent: 'tester' });
   const rows = [...w.querySelectorAll('.tf-aa-run')];
   assert.equal(rows.length, 1, 'no phantom parent row is invented');
   assert.equal(rows[0].dataset.run, 'kid', 'the child is not lost');
@@ -853,7 +853,7 @@ test('tf-agent-activity: a child whose parent is unknown stays a visible root', 
 
 test('tf-agent-activity: a scope-less child_spawned changes nothing (Code Studio feeds this)', () => {
   const w = activity({ level: 'tree' });
-  w.applyEvent({ kind: 'child_spawned', run_id: 'kid', agent: 'tester' });
+  w.applyEvent({ kind: 'child_spawned', runId: 'kid', agent: 'tester' });
   const rows = [...w.querySelectorAll('.tf-aa-run')];
   assert.equal(rows.length, 1);
   assert.ok(/--depth:\s*0/.test(rows[0].getAttribute('style')));
@@ -863,15 +863,15 @@ test('tf-agent-activity: spawned runs count as background work on the bar', () =
   // The background badge only exists in the narrow chat-audio bar.
   const w = activity();
   w.variant = 'chat-audio';   // variant is property-driven, not observed
-  w.applyEvent({ kind: 'iteration_started', run_id: 'root', agent: 'lead', n: 1 });
+  w.applyEvent({ kind: 'iteration_started', runId: 'root', agent: 'lead', n: 1 });
   assert.equal(w.querySelector('.tf-aa-badge'), null, 'a lone root run is not background work');
-  w.applyEvent({ kind: 'child_spawned', run_id: 'kid', scope: 'root', agent: 'tester' });
+  w.applyEvent({ kind: 'child_spawned', runId: 'kid', scope: 'root', agent: 'tester' });
   assert.match(w.querySelector('.tf-aa-badge').textContent, /1 in background/);
 });
 
 test('tf-agent-activity: a scope-less event still creates a root run (unchanged)', () => {
   const w = activity({ level: 'tree' });
-  w.applyEvent({ kind: 'tool_call_started', run_id: 'solo', name: 'fs_read' });
+  w.applyEvent({ kind: 'tool_call_started', runId: 'solo', name: 'fs_read' });
   const rows = [...w.querySelectorAll('.tf-aa-run')];
   assert.equal(rows.length, 1);
   assert.ok(/--depth:\s*0/.test(rows[0].getAttribute('style')));
@@ -879,7 +879,7 @@ test('tf-agent-activity: a scope-less event still creates a root run (unchanged)
 
 test('tf-agent-activity: cards="off" hides the question card but keeps the amber dot', () => {
   const w = activity({ cards: 'off' });
-  w.applyEvent({ kind: 'iteration_started', run_id: 'r1', agent: 'coder', n: 1 });
+  w.applyEvent({ kind: 'iteration_started', runId: 'r1', agent: 'coder', n: 1 });
   w.setRunStatus('r1', 'waiting_user');
 
   assert.equal(w.querySelector('.tf-aa-card-question'), null, 'no question card');
@@ -891,12 +891,12 @@ test('tf-agent-activity: cards="off" hides the question card but keeps the amber
 test('tf-agent-activity: cards="off" also suppresses a fed question and permission event', () => {
   const w = activity({ cards: 'off' });
   w.applyEvent({
-    kind: 'user_question', run_id: 'r1', agent: 'coder',
-    interaction_id: 'i1', question: 'Continue?', choices: ['yes', 'no'],
+    kind: 'user_question', runId: 'r1', agent: 'coder',
+    interactionId: 'i1', question: 'Continue?', choices: ['yes', 'no'],
   });
   w.applyEvent({
-    kind: 'permission_request', run_id: 'r2', agent: 'tester',
-    interaction_id: 'i2', addon_id: 'notes', tool_name: 'write',
+    kind: 'permission_request', runId: 'r2', agent: 'tester',
+    interactionId: 'i2', addonId: 'notes', toolName: 'write',
   });
   assert.equal(w.querySelector('.tf-aa-card-question'), null);
   assert.equal(w.querySelector('.tf-aa-card-perm'), null);
@@ -907,8 +907,8 @@ test('tf-agent-activity: cards="off" also suppresses a fed question and permissi
 test('tf-agent-activity: without cards="off" the cards still render (unchanged)', () => {
   const w = activity();
   w.applyEvent({
-    kind: 'user_question', run_id: 'r1', agent: 'coder',
-    interaction_id: 'i1', question: 'Continue?', choices: ['yes', 'no'],
+    kind: 'user_question', runId: 'r1', agent: 'coder',
+    interactionId: 'i1', question: 'Continue?', choices: ['yes', 'no'],
   });
   const card = w.querySelector('.tf-aa-card-question');
   assert.ok(card, 'question card renders by default');
@@ -924,8 +924,8 @@ test('tf-agent-activity: without cards="off" the cards still render (unchanged)'
 test('tf-agent-activity: cards can be re-enabled by dropping the attribute', () => {
   const w = activity({ cards: 'off' });
   w.applyEvent({
-    kind: 'user_question', run_id: 'r1', agent: 'coder',
-    interaction_id: 'i1', question: 'Q?', choices: [],
+    kind: 'user_question', runId: 'r1', agent: 'coder',
+    interactionId: 'i1', question: 'Q?', choices: [],
   });
   assert.equal(w.querySelector('.tf-aa-card-question'), null);
   w.removeAttribute('cards');
@@ -934,7 +934,7 @@ test('tf-agent-activity: cards can be re-enabled by dropping the attribute', () 
 
 test('tf-agent-activity: cancel and open-run still emit their events', () => {
   const w = activity({ level: 'tree' });
-  w.applyEvent({ kind: 'iteration_started', run_id: 'r1', agent: 'coder', n: 1 });
+  w.applyEvent({ kind: 'iteration_started', runId: 'r1', agent: 'coder', n: 1 });
   const cancels = [];
   const opens = [];
   w.addEventListener('agent-cancel', (e) => cancels.push(e.detail.runId));

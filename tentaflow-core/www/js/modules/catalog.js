@@ -66,8 +66,8 @@ async function loadTargets() {
         ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }),
         ApiBinary.list('clusterListRequest', { arrayKey: 'clusters' }).catch(() => []),
       ]);
-      // MeshNodeInfo proto nie ma `is_trusted` — patrz engine-deploy-wizard.
-      const list = (nodesResp || []).filter((n) => n?.is_local === true || n?.source === 'trusted');
+      // MeshNodeInfo proto nie ma `isTrusted` — patrz engine-deploy-wizard.
+      const list = (nodesResp || []).filter((n) => n?.isLocal === true || n?.source === 'trusted');
       if (list.length > 0) {
         nodes = list;
         clusters = clustersResp || [];
@@ -143,8 +143,8 @@ function iconSvg(id) {
 // ---- Target picker --------------------------------------------------------
 
 function renderTargetPicker() {
-  const localNode = nodes.find((n) => n.is_local);
-  const remoteNodes = nodes.filter((n) => !n.is_local);
+  const localNode = nodes.find((n) => n.isLocal);
+  const remoteNodes = nodes.filter((n) => !n.isLocal);
 
   return `
     <div class="page-header">
@@ -173,16 +173,16 @@ function renderTargetSection(title, list, kind) {
 }
 
 function renderTargetCard(node, kind) {
-  const nodeId = node.node_id || node.id;
+  const nodeId = node.nodeId;
   const hostname = node.hostname || nodeId?.slice(0, 12) || I18n.t('mesh.unknown_host');
-  const os = (node.platform || node.os || '').toLowerCase();
+  const os = (node.platform || '').toLowerCase();
   const gpus = Array.isArray(node.gpus) ? node.gpus : [];
   const gpuNames = gpus.map((g) => g.name || '').filter(Boolean);
   const hasNvidia = gpus.some((g) => /nvidia|geforce|rtx|gtx|tesla|a100|h100|h200|l40|dgx|grace|blackwell|hopper|gb10|gh200|b200|b100/i.test(g.name || ''));
 
   const online = isOnline(node);
-  const cpuCount = node.cpu_count ? `${node.cpu_count} cores` : '';
-  const ramTotal = node.ram_total_mb ? `${Math.round(node.ram_total_mb / 1024)} GB RAM` : '';
+  const cpuCount = node.cpuCount ? `${node.cpuCount} cores` : '';
+  const ramTotal = node.ramTotalMb ? `${Math.round(node.ramTotalMb / 1024)} GB RAM` : '';
 
   const badges = [];
   if (os) badges.push(`<span class="platform-badge">${escapeHtml(os)}</span>`);
@@ -219,9 +219,9 @@ function renderClustersSection(list) {
     <h4 class="target-section-title">${escapeHtml(I18n.t('catalog.target_clusters'))} <span class="section-count">${list.length}</span></h4>
     <div class="target-grid">
       ${list.map((c) => {
-        const id = c.id || c.cluster_id;
+        const id = c.id;
         const label = c.name || id;
-        const nodeCount = c.membersCount ?? c.members_count ?? c.members?.length ?? 0;
+        const nodeCount = c.membersCount ?? c.members?.length ?? 0;
         return `
           <div class="target-card cluster-card" data-target-kind="cluster" data-target-id="${escapeAttr(id)}">
             <div class="target-card-head">
@@ -239,7 +239,7 @@ function renderClustersSection(list) {
 }
 
 function nodeOs(n) {
-  return String(n?.platform || n?.os || '').toLowerCase();
+  return String(n?.platform || '').toLowerCase();
 }
 
 function nodeGpuNames(n) {
@@ -254,13 +254,12 @@ function isDgxSparkNode(n) {
   return nodeOs(n) === 'linux' && nodeGpuNames(n).some((name) => /GB10/i.test(name));
 }
 
-/// Member nodes of `c`, resolved against the loaded node list. Member ids arrive
-/// camelCase over the binary protocol and snake_case from the legacy shape.
+/// Member nodes of `c`, resolved against the loaded node list.
 function clusterMemberNodes(c) {
   return ((c?.members) || [])
-    .map((m) => m.nodeId || m.node_id || m.id)
+    .map((m) => m.nodeId)
     .filter(Boolean)
-    .map((nid) => nodes.find((n) => (n.node_id || n.id) === nid))
+    .map((nid) => nodes.find((n) => n.nodeId === nid))
     .filter(Boolean);
 }
 
@@ -273,7 +272,7 @@ function bindTargetPicker() {
     const kind = card.dataset.targetKind;
     const id = card.dataset.targetId;
     if (kind === 'cluster') {
-      const c = clusters.find((x) => (x.id || x.cluster_id) === id);
+      const c = clusters.find((x) => x.id === id);
       const memberNodes = clusterMemberNodes(c);
       const gpuNames = memberNodes.flatMap(nodeGpuNames);
       const oses = [...new Set(memberNodes.map(nodeOs).filter(Boolean))];
@@ -295,10 +294,10 @@ function bindTargetPicker() {
         isDgxSpark: memberNodes.length > 0 && memberNodes.every(isDgxSparkNode),
       };
     } else {
-      const n = nodes.find((x) => (x.node_id || x.id) === id);
+      const n = nodes.find((x) => x.nodeId === id);
       const gpus = Array.isArray(n?.gpus) ? n.gpus : [];
       target = {
-        kind: n?.is_local ? 'local' : 'node',
+        kind: n?.isLocal ? 'local' : 'node',
         id,
         label: n?.hostname || id,
         os: nodeOs(n),

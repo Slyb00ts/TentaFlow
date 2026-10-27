@@ -69,8 +69,8 @@ const fire = (target, type, detail) => target.dispatchEvent(new window.CustomEve
 const view = (at, positions) => ({
   at,
   timezone: 'Europe/Warsaw',
-  units: [{ unit_id: 'u-it', name: 'Dział IT', parent_unit_id: null, head_position_id: 'p-cto', deputy_head_position_ids: [] }],
-  positions: positions.map((id) => ({ position_id: id, unit_id: 'u-it', name: id, primary_parent_position_id: id === 'p-cto' ? null : 'p-cto', is_staff: false, valid_from: '2026-01-01' })),
+  units: [{ unitId: 'u-it', name: 'Dział IT', parentUnitId: null, headPositionId: 'p-cto', deputyHeadPositionIds: [] }],
+  positions: positions.map((id) => ({ positionId: id, unitId: 'u-it', name: id, primaryParentPositionId: id === 'p-cto' ? null : 'p-cto', isStaff: false, validFrom: '2026-01-01' })),
   assignments: [],
   vacancies: positions,
   warnings: [],
@@ -87,21 +87,21 @@ beforeEach(() => {
     if (kind === 'authMeRequest') return { userId: 'u-me', username: 'me' };
     if (kind === 'orgStructureRequest') {
       if (payload?.at && payload.at === failDay) throw new Error('boom');
-      return { view: view(payload?.at ?? TODAY, payload?.at === '2026-11-01' ? ['p-cto', 'p-dev', 'p-new'] : ['p-cto', 'p-dev']), unit_types: [], my_permissions: ['org.admin'] };
+      return { view: view(payload?.at ?? TODAY, payload?.at === '2026-11-01' ? ['p-cto', 'p-dev', 'p-new'] : ['p-cto', 'p-dev']), unitTypes: [], myPermissions: ['org.admin'] };
     }
-    if (kind === 'orgHistoryListRequest') return { entries: [], total: 0, personal_visible: true, today: TODAY };
+    if (kind === 'orgHistoryListRequest') return { entries: [], total: 0, personalVisible: true, today: TODAY };
     if (kind === 'orgChangeSetListRequest') {
-      return { items: [{ id: 'cs-1', name: 'Reorganizacja Q4', state: 'pending', effective_date: '2026-11-01', op_count: 2 }], today: TODAY };
+      return { items: [{ id: 'cs-1', name: 'Reorganizacja Q4', state: 'pending', effectiveDate: '2026-11-01', opCount: 2 }], today: TODAY };
     }
     if (kind === 'orgChangeSetPreviewRequest') {
       return {
         ok: true, valid: true, at: '2026-11-01', results: [], warnings: [], live: view('2026-11-01', ['p-cto', 'p-dev']),
         preview: view('2026-11-01', ['p-cto', 'p-dev', 'p-plan']),
-        items: [{ change: 'added', entity: 'position', id: 'p-plan', name: 'p-plan', unit_id: 'u-it' }],
+        items: [{ change: 'added', entity: 'position', id: 'p-plan', name: 'p-plan', unitId: 'u-it' }],
       };
     }
     if (kind === 'orgHistoryDiffRequest') {
-      return { items: [{ change: 'added', entity: 'position', id: 'p-new', name: 'p-new', unit_id: 'u-it' }], personal_visible: true };
+      return { items: [{ change: 'added', entity: 'position', id: 'p-new', name: 'p-new', unitId: 'u-it' }], personalVisible: true };
     }
     return {};
   };

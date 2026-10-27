@@ -2,8 +2,11 @@
 // File: tf-file-input.js
 // Description: <tf-file-input> — styled file upload component.
 //   Attributes: accept, multiple, label, disabled, capture (user/environment),
-//   no-drop (disables drag-and-drop, click-to-pick only).
+//   no-drop (disables drag-and-drop, click-to-pick only), variant="icon" with
+//   icon="<sprite-id>" (an icon-only trigger for a toolbar or composer; `label`
+//   becomes its accessible name and tooltip, there is no drop target).
 //   Events: change (detail: {files: FileList}).
+//   Imperative: clear() forgets the picked files so the same file can be picked again.
 // =============================================================================
 
 class TfFileInput extends HTMLElement {
@@ -40,6 +43,7 @@ class TfFileInput extends HTMLElement {
 
     const dropzone = document.createElement('div');
     dropzone.className = 'tf-file-input-dropzone';
+    this._iconOnly = this.getAttribute('variant') === 'icon';
     dropzone.setAttribute('role', 'button');
     dropzone.setAttribute('tabindex', '0');
     dropzone.addEventListener('click', this._onClick);
@@ -53,6 +57,11 @@ class TfFileInput extends HTMLElement {
     dropzone.addEventListener('dragleave', this._onDragLeave);
     dropzone.addEventListener('drop', this._onDrop);
 
+    if (this._iconOnly) {
+      dropzone.classList.add('tf-file-input-icon');
+      const icon = (this.getAttribute('icon') || '').replace(/[^a-z0-9_-]/gi, '');
+      dropzone.innerHTML = `<svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-${icon}"/></svg>`;
+    }
     const labelEl = document.createElement('span');
     labelEl.className = 'tf-file-input-label';
     dropzone.appendChild(labelEl);
@@ -105,6 +114,11 @@ class TfFileInput extends HTMLElement {
     else this._input.removeAttribute('capture');
 
     this._labelEl.textContent = label;
+    this._input.setAttribute('aria-label', label);
+    if (this._iconOnly) {
+      this._dropzone.setAttribute('aria-label', label);
+      this._dropzone.setAttribute('title', label);
+    }
     this._dropzone.classList.toggle('tf-file-input-disabled', disabled);
 
     if (disabled) {
@@ -121,8 +135,13 @@ class TfFileInput extends HTMLElement {
     this._input.click();
   }
 
+  clear() {
+    if (this._input) this._input.value = '';
+    this._showFiles(null);
+  }
+
   _onDragOver(e) {
-    if (this.hasAttribute('disabled') || this.hasAttribute('no-drop')) return;
+    if (this.hasAttribute('disabled') || this.hasAttribute('no-drop') || this._iconOnly) return;
     e.preventDefault();
     this._dropzone.classList.add('tf-file-input-over');
   }
@@ -132,7 +151,7 @@ class TfFileInput extends HTMLElement {
   }
 
   _onDrop(e) {
-    if (this.hasAttribute('disabled') || this.hasAttribute('no-drop')) return;
+    if (this.hasAttribute('disabled') || this.hasAttribute('no-drop') || this._iconOnly) return;
     e.preventDefault();
     this._dropzone.classList.remove('tf-file-input-over');
     if (e.dataTransfer?.files) {

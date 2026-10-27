@@ -5,7 +5,7 @@
 #       zwraca non-zero gdy zlamana. Zlozone z:
 #         1. Coverage (cargo-tarpaulin)
 #         2. Fuzz smoke (cargo-fuzz, 5 min harness na Envelope/MessageBody)
-#         3. WASM bundle size (codec.wasm <= 200 KB gzipped)
+#         3. WASM bundle size (wasm_glue_bg.wasm <= 4 MB raw / 800 KB gzipped)
 #         4. Observability check (kazdy #[handler] ma #[observed] — compile-gate)
 #         5. Hardcoded-value gates (no emoji, no hex colors w CSS, no outline:none)
 #       Uruchamiaj: ./scripts/ci-gates.sh
@@ -65,21 +65,13 @@ else
 fi
 
 # =============================================================================
-# Gate 3: WASM bundle size (<= 200 KB gzipped)
+# Gate 3: WASM bundle size (budget lives in check-wasm-size.sh)
 # =============================================================================
 log "Gate 3: WASM bundle size"
-WASM_FILE="$ROOT/tentaflow-core/wwwroot/js/protocol/wasm_glue_bg.wasm"
-MAX_GZIPPED_KB=200
-if [[ ! -f "$WASM_FILE" ]]; then
-  fail "brak $WASM_FILE — uruchom najpierw build.rs tentaflow-core"
+if SIZE_REPORT=$("$SCRIPT_DIR/check-wasm-size.sh" 2>&1); then
+  pass "$SIZE_REPORT"
 else
-  GZIPPED_BYTES=$(gzip -c "$WASM_FILE" | wc -c)
-  GZIPPED_KB=$((GZIPPED_BYTES / 1024))
-  if [[ $GZIPPED_KB -le $MAX_GZIPPED_KB ]]; then
-    pass "wasm_glue_bg.wasm gzipped = ${GZIPPED_KB} KB (<= ${MAX_GZIPPED_KB} KB)"
-  else
-    fail "wasm_glue_bg.wasm gzipped = ${GZIPPED_KB} KB (> ${MAX_GZIPPED_KB} KB)"
-  fi
+  fail "$SIZE_REPORT"
 fi
 
 # =============================================================================

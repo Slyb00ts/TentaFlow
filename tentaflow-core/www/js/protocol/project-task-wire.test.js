@@ -28,7 +28,7 @@ test('task writes carry key-related fields and canonical mention IDs', { skip },
     projectId: 'p1', taskType: 'subtask', title: 'Child', priority: 'medium', status: 'todo',
     parentTaskId: 'parent',
   });
-  assert.equal(saved.variant, 'ProjectStudioTaskSaveRequest');
+  assert.equal(saved._variant, 'ProjectStudioBody.TaskSaveRequest');
   assert.equal(saved.parentTaskId, 'parent');
   const comment = request('projectStudioTaskCommentAddRequest', {
     projectId: 'p1', taskId: 't1', bodyMd: 'Review this', mentionUserIds: ['u2', 'u3'],

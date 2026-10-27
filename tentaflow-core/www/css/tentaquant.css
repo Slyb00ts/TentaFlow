@@ -137,7 +137,7 @@
 .tq-root .section-card-head .title { font-size: 14px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
 .tq-root .section-card-head .title .icon { width: 16px; height: 16px; color: var(--accent-1); }
 .tq-root .section-card-head .hint { font-size: 11.5px; color: var(--text-3); }
-.tq-root .section-card-head .actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.tq-root .section-card-head .actions { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-wrap: wrap; max-width: 100%; }
 
 .tq-root .start-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
 .tq-root .start-card {
@@ -221,7 +221,10 @@
 /* ----- One project: notebook (Q06) and Studio (Q07) ---------------------- */
 .tq-root .tq-project-header { padding: 14px 18px; }
 .tq-root .tq-project-header .big-ico { width: 48px; height: 48px; }
-.tq-root .tq-project-header .d-name { font-size: 17px; }
+.tq-root .tq-project-header { flex-wrap: wrap; }
+.tq-root .tq-project-header .d-meta { flex: 1 1 240px; min-width: 0; }
+.tq-root .tq-project-header .d-name { font-size: 17px; display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; overflow-wrap: anywhere; }
+.tq-root .tq-project-header .d-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .tq-root .tq-toolbar-title { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 800; }
 .tq-root .tq-toolbar-title .icon { width: 15px; height: 15px; color: var(--accent-1); }
 .tq-root .tq-empty-actions { display: flex; justify-content: center; margin-top: 12px; }

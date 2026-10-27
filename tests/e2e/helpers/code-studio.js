@@ -28,7 +28,7 @@ async function registerModelProvider(page, model, { repo = 'harness-test' } = {}
   const res = await api(page, 'serviceManifestDeployRequest', {
     engineId: 'openai-compatible',
     deployMethod: 'external',
-    nodeId: first.nodeId ?? first.node_id ?? '',
+    nodeId: first.nodeId ?? '',
     configJson: JSON.stringify({
       base_url: model.baseUrl,
       api_key: 'harness-test-key',
@@ -36,41 +36,42 @@ async function registerModelProvider(page, model, { repo = 'harness-test' } = {}
       model_repo: repo,
     }),
   });
-  expect(res?.deployId || res?.deploy_id, 'provider deploy returned no id').toBeTruthy();
+  expect(res?.deployId, 'provider deploy returned no id').toBeTruthy();
   await expect.poll(async () => {
     const body = await api(page, 'serviceListRequest');
     const svc = (body?.services ?? []).find(
-      (s) => (s.engineId ?? s.engine_id) === 'openai-compatible',
+      (s) => (s.engineId) === 'openai-compatible',
     );
     return svc?.status ?? 'missing';
   }, { timeout: 60_000, message: 'model provider never came up' }).toMatch(/running|degraded/);
 }
 
-/// Code Studio is a native APP: every request family passes the app gate, and a
+/// A native APP (code-studio, projekty, …): every request family passes the app gate, and a
 /// node where the instance is missing or disabled answers `AppUnavailable`
 /// before any handler runs. Installs and enables it from the node catalog — the
 /// path the Addons screen takes — instead of writing a row the dashboard would
 /// never create.
-async function ensureCodeStudioApp(page) {
+async function ensureNativeApp(page, packageId) {
   const catalog = await api(page, 'addonCatalogListRequest');
   const pkg = (catalog?.packages ?? []).find(
-    (p) => (p.packageId ?? p.package_id) === 'code-studio',
+    (p) => (p.packageId) === packageId,
   );
-  expect(pkg, 'the code-studio app is missing from the node catalog').toBeTruthy();
+  expect(pkg, `the ${packageId} app is missing from the node catalog`).toBeTruthy();
   const installed = await api(page, 'addonInstanceInstallRequest', {
-    packageId: 'code-studio',
-    version: String(pkg.latestVersion ?? pkg.latest_version ?? ''),
-    displayName: String(pkg.name ?? 'Code Studio'),
+    packageId,
+    version: String(pkg.latestVersion ?? ''),
+    displayName: String(pkg.name ?? packageId),
     config: [],
   });
-  expect(installed?.ok, `installing the code-studio app failed: ${installed?.error}`).toBe(true);
-  const addonId = String(installed.addonId ?? installed.addon_id ?? '');
+  expect(installed?.ok, `installing the ${packageId} app failed: ${installed?.error}`).toBe(true);
+  const addonId = String(installed.addonId ?? '');
   expect(addonId, 'the install returned no instance id').toBeTruthy();
   const toggled = await api(page, 'addonToggleRequest', { addonId, enabled: true });
-  expect(toggled?.ok, `enabling the code-studio app failed: ${toggled?.message}`).toBe(true);
+  expect(toggled?.ok, `enabling the ${packageId} app failed: ${toggled?.message}`).toBe(true);
 }
 
-/// Opens Code Studio by its deep link, falling back to the All apps tile.
+/// Opens Code Studio by its deep link, falling back to the All apps tile (a
+/// server-driven native tile: `data-target` = route id, not a `data-route` one).
 async function gotoCodeStudio(page, port) {
   await page.goto(`${baseUrl(port)}/#/code-studio`);
   const direct = page.locator('#cs-new, #cs-empty-new, #cs-table-host').first();
@@ -79,7 +80,7 @@ async function gotoCodeStudio(page, port) {
   } catch {
     await page.goto(`${baseUrl(port)}/`);
     await page.locator('[data-view="apps-home"]').first().click();
-    await page.locator('[data-route="code-studio"]').first().click();
+    await page.locator('[data-target="code-studio"][data-kind="native"]').first().click();
     await page.waitForSelector('#cs-new, #cs-empty-new, #cs-table-host', { timeout: 30_000 });
   }
 }
@@ -92,7 +93,7 @@ async function createWorkspace(page, port, name, { execMode } = {}) {
   const me = await api(page, 'authMeRequest');
   const users = await api(page, 'usersListRequest');
   const mine = (users?.users ?? []).find((u) => (u.username ?? '') === (me?.username ?? 'admin'));
-  const userId = mine?.id ?? mine?.userId ?? mine?.user_id ?? '';
+  const userId = mine?.id ?? '';
   expect(userId, 'could not resolve the signed-in user id').toBeTruthy();
   await api(page, 'codeStudioWorkspaceCreatorGrantSetRequest', { userId, granted: true });
 
@@ -137,7 +138,7 @@ async function drainApprovals(page, scope, { decision = 'allow_for_run' } = {}) 
   for (const a of pending) {
     await api(page, 'codeStudioApprovalDecideRequest', {
       ...scope,
-      approvalId: a.id ?? a.approvalId ?? a.approval_id,
+      approvalId: a.id ?? a.approvalId,
       decision,
     }).catch(() => null);
   }
@@ -154,17 +155,17 @@ async function sessionRuns(page, scope) {
 /// Changes pane makes. Returns the paths it accepted.
 async function acceptOpenReviews(page, scope) {
   const body = await api(page, 'codeStudioPatchSetsListRequest', scope).catch(() => null);
-  const sets = (body?.patchSets ?? body?.patch_sets ?? [])
+  const sets = (body?.patchSets ?? [])
     .filter((s) => ['open', 'in_review'].includes(s.status ?? ''));
   const accepted = [];
   for (const set of sets) {
-    const patchSetId = set.patchSetId ?? set.patch_set_id;
+    const patchSetId = set.patchSetId;
     const detail = await api(page, 'codeStudioPatchSetGetRequest', { ...scope, patchSetId });
     const files = (detail?.files ?? []).map((f) => ({
-      patchFileId: f.patch_file_id ?? f.patchFileId,
+      patchFileId: f.patchFileId,
       decision: 'accept',
       hunks: (f.hunks ?? []).map((h) => ({
-        patchHunkId: h.patch_hunk_id ?? h.patchHunkId,
+        patchHunkId: h.patchHunkId,
         decision: 'accept',
       })),
     }));
@@ -183,7 +184,7 @@ async function readWorktreeFile(page, scope, path) {
 
 module.exports = {
   api,
-  ensureCodeStudioApp,
+  ensureNativeApp,
   registerModelProvider,
   gotoCodeStudio,
   createWorkspace,

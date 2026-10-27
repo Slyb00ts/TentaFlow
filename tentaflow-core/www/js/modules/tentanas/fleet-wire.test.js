@@ -148,7 +148,7 @@ test('the fleet\'s summary flag reaches the node through the real encoder', { sk
     return wasm.decodeMessageBody(wasm.decodeEnvelope(frame).body);
   };
   const light = decodeRequest({ summary: true });
-  assert.equal(light.variant, 'TentaNasTargetsListRequest');
+  assert.equal(light._variant, 'TentaNasBody.TargetsListRequest');
   assert.equal(light.summary, true);
   assert.equal(decodeRequest({}).summary, false, 'the Sharing tab keeps the full answer');
 });
@@ -158,6 +158,6 @@ test('the fleet\'s summary flag reaches the node through the real encoder', { sk
 test('the detach request survives the real encoder', { skip }, async () => {
   const frame = codec.encode.tentaNasPoolDetachRequest(1n, { name: 'tank', device: 'sdb', sudoPassword: 'x' });
   const sent = wasm.decodeMessageBody(wasm.decodeEnvelope(frame).body);
-  assert.equal(sent.variant, 'TentaNasPoolDetachRequest');
+  assert.equal(sent._variant, 'TentaNasBody.PoolDetachRequest');
   assert.deepEqual([sent.name, sent.device], ['tank', 'sdb']);
 });

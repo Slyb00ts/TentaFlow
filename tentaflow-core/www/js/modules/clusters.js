@@ -101,7 +101,7 @@ async function loadAll() {
     ]);
     clusters = Array.isArray(clustersBody?.clusters) ? clustersBody.clusters : [];
     const nodes = Array.isArray(nodesResp) ? nodesResp : [];
-    nodesById = new Map(nodes.map(n => [n.node_id || n.id, n]));
+    nodesById = new Map(nodes.map(n => [n.nodeId, n]));
     updateSubheader();
   } catch (err) {
     toast(`${I18n.t('clusters.title')}: ${err.message}`, 'error');
@@ -141,7 +141,7 @@ function renderList() {
 }
 
 function renderClusterCard(cluster) {
-  const clusterId = cluster.id || cluster.cluster_id;
+  const clusterId = cluster.id;
   const members = resolveMembers(cluster);
   const memberCount = memberCountOf(cluster);
   const status = clusterStatus(cluster);
@@ -204,17 +204,15 @@ function renderClusterCard(cluster) {
 function resolveMembers(cluster) {
   const raw = cluster.members || cluster.nodes || [];
   return raw.map(m => {
-    // ClusterMember dekoduje sie do camelCase (nodeId/interfaceType/...); akceptujemy
-    // tez snake_case dla zgodnosci z ewentualnymi starszymi ksztaltami.
-    const nodeId = m.nodeId || m.node_id || m.id;
+    const nodeId = m.nodeId;
     const live = nodesById.get(nodeId);
     return {
       node_id: nodeId,
       role: m.role || 'worker',
-      hostname: (live && live.hostname) || m.hostname || m.node_name || nodeId,
+      hostname: (live && live.hostname) || m.hostname || nodeId,
       status: m.status || '',
-      interface_type: m.interfaceType || m.interface_type || '',
-      interface_speed_mbps: m.interfaceSpeedMbps || m.interface_speed_mbps || 0,
+      interface_type: m.interfaceType || '',
+      interface_speed_mbps: m.interfaceSpeedMbps || 0,
       live,
     };
   });
@@ -223,15 +221,15 @@ function resolveMembers(cluster) {
 function memberCountOf(cluster) {
   const members = resolveMembers(cluster);
   if (members.length > 0) return members.length;
-  return cluster.membersCount ?? cluster.members_count ?? 0;
+  return cluster.membersCount ?? 0;
 }
 
 function clusterStatus(cluster) {
   const members = resolveMembers(cluster);
   if (members.length === 0) {
     // Brak members[] (np. dekoder nie wysyla listy) — degraduj na podstawie licznikow.
-    const total = cluster.membersCount ?? cluster.members_count ?? 0;
-    const online = cluster.membersOnline ?? cluster.members_online ?? 0;
+    const total = cluster.membersCount ?? 0;
+    const online = cluster.membersOnline ?? 0;
     if (total === 0 || online === 0) return 'offline';
     if (online < total) return 'degraded';
     return 'healthy';
@@ -268,17 +266,17 @@ function aggregateMetrics(members) {
   // CPU: srednia z uzyciem, suma corsow
   let cpuSum = 0, cpuCnt = 0, coresTotal = 0;
   for (const x of live) {
-    const v = x.cpu_usage ?? x.cpu_usage_percent;
+    const v = x.cpuUsagePercent;
     if (v != null && !isNaN(v)) { cpuSum += v; cpuCnt++; }
-    if (x.cpu_count) coresTotal += x.cpu_count;
+    if (x.cpuCount) coresTotal += x.cpuCount;
   }
   const cpuPct = cpuCnt > 0 ? Math.round(cpuSum / cpuCnt) : null;
 
   // RAM — suma used / suma total
   let ramUsed = 0, ramTotal = 0;
   for (const x of live) {
-    if (x.ram_used_mb) ramUsed += x.ram_used_mb;
-    if (x.ram_total_mb) ramTotal += x.ram_total_mb;
+    if (x.ramUsedMb) ramUsed += x.ramUsedMb;
+    if (x.ramTotalMb) ramTotal += x.ramTotalMb;
   }
   const ramPct = ramTotal > 0 ? Math.round((ramUsed / ramTotal) * 100) : null;
 
@@ -287,9 +285,9 @@ function aggregateMetrics(members) {
   for (const x of live) {
     const gpus = Array.isArray(x.gpus) ? x.gpus : [];
     for (const g of gpus) {
-      if (g.vram_used_mb) vramUsed += g.vram_used_mb;
-      if (g.vram_total_mb) vramTotal += g.vram_total_mb;
-      if (g.usage_percent != null) { gpuUsageSum += g.usage_percent; gpuUsageCnt++; }
+      if (g.vramUsedMb) vramUsed += g.vramUsedMb;
+      if (g.vramTotalMb) vramTotal += g.vramTotalMb;
+      if (g.utilizationPercent != null) { gpuUsageSum += g.utilizationPercent; gpuUsageCnt++; }
       gpuCount++;
     }
   }
@@ -409,7 +407,7 @@ function handleListClick(e) {
   if (editBtn) {
     e.stopPropagation();
     const id = editBtn.dataset.editCluster;
-    const cluster = clusters.find(c => String(c.id || c.cluster_id) === id);
+    const cluster = clusters.find(c => String(c.id) === id);
     if (cluster) openWizard(cluster);
     return;
   }
@@ -426,7 +424,7 @@ function handleListClick(e) {
   if (delBtn) {
     e.stopPropagation();
     const id = delBtn.dataset.deleteCluster;
-    const cluster = clusters.find(c => String(c.id || c.cluster_id) === id);
+    const cluster = clusters.find(c => String(c.id) === id);
     if (cluster) confirmDelete(cluster);
     return;
   }
@@ -440,7 +438,7 @@ function handleListClick(e) {
 
 async function confirmDelete(cluster) {
   const { TfWindow } = await import('/js/components/tf-window.js');
-  const name = cluster.name || cluster.id || cluster.cluster_id;
+  const name = cluster.name || cluster.id;
   const ok = await TfWindow.confirm({
     title: I18n.t('clusters.delete_title'),
     message: I18n.t('clusters.delete_confirm').replace('{name}', name),
@@ -451,7 +449,7 @@ async function confirmDelete(cluster) {
   if (!ok) return;
 
   try {
-    const id = cluster.id || cluster.cluster_id;
+    const id = cluster.id;
     await ApiBinary.action('clusterDeleteRequest', { clusterId: id });
     toast(I18n.t('clusters.delete_success').replace('{name}', name), 'success');
     await loadAll();
