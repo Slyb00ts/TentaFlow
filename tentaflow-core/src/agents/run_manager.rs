@@ -2620,6 +2620,7 @@ mod tests {
             fence: 1,
             allowed_tools: vec!["core.skill_view".into()],
             output_schema: None,
+            role: crate::processes::agent_sink::BindingRole::Work,
         };
         assert_eq!(
             caller_of(Some(binding.meta_entry().1)),

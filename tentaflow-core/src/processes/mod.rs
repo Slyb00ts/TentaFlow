@@ -15,6 +15,7 @@ pub mod simulation;
 pub mod simulation_schema;
 pub mod timers;
 pub mod tool_host;
+pub mod verification;
 
 #[cfg(test)]
 mod activity_result_tests;
@@ -77,6 +78,8 @@ mod block_task_tests;
 pub(crate) mod agent_sink_tests;
 #[cfg(test)]
 mod agent_exec_tests;
+#[cfg(test)]
+mod verification_tests;
 #[cfg(test)]
 mod result_routing_tests;
 #[cfg(test)]

@@ -36,6 +36,19 @@ pub fn validate_process_result_binding(graph_json: &str, expression: Option<&str
     Ok(())
 }
 
+/// A verification flow: its verdict is the activity result it ends with, so it
+/// must have the activity result block, bound to `outputs.payload` like a service
+/// flow that has one.
+pub fn validate_verification_flow(graph_json: &str) -> Result<()> {
+    validate_process_result_binding(graph_json, Some("outputs.payload"))?;
+    let definition: FlowDefinition = serde_json::from_str(graph_json)?;
+    ensure!(
+        definition.nodes.iter().any(|node| node.node_type == NODE_TYPE),
+        "a verification flow must end with the activity result block"
+    );
+    Ok(())
+}
+
 pub fn validate_graph(definition: &FlowDefinition) -> Result<()> {
     let results: Vec<_> = definition
         .nodes

@@ -492,6 +492,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   rodzaj zadania, nie powtarzanie; strefa czasowa `utc`/`gmt`/`est` jest naprawiana
   do pisowni silnika; zadanie z powtarzaniem może zadeklarować zmienną na zebrane
   wyniki w swojej sekcji.
+- Weryfikacja wyniku zadania usługi testem albo krytykiem (B3.5). `ActivityVerification`
+  dostało dopisane warianty `Test { flow_id, on_failure }` i `Critic { agent_id,
+  criteria, on_failure }` z `on_failure` w `Error` (domyślny: błąd do obsłużenia w
+  procesie, `VERIFICATION_FAILED`) albo `NeedsHuman`; `Human` i `Condition` mają te
+  same bajty co dotąd, `SCHEMA_VERSION` zostaje 32. Weryfikacja jest drugim etapem
+  tego samego joba (`processes/verification.rs`): wynik pracy `Completed` idzie do
+  przypiętego przepływu weryfikującego (wejście: wyjścia wyniku i efektywne
+  zmienne, werdykt: blok „Wynik aktywności”) albo do drugiego agenta (przebieg pod
+  własnym identyfikatorem, wiązanie `role = verification`, tylko narzędzia do
+  odczytu plus ujście `core.task_complete`, kryteria i wynik pracy jako ogrodzone
+  DANE). Zatwierdzenie zostawia `Completed` i dopisuje `verified:test:<przepływ>` /
+  `verified:critic:<agent>`; odrzucenie zamienia wynik w `Error` albo `NeedsHuman`
+  `VERIFICATION_FAILED` z pochodzeniem `Contract` i oryginalnymi wyjściami, więc
+  łapie je zdarzenie brzegowe (eskalację można założyć także na kroku bez reguły
+  wyniku). Weryfikator, który nie wydał werdyktu (błąd przepływu, krytyk bez
+  zgłoszenia, anulowanie, limit czasu), daje `NeedsHuman("VERIFICATION_UNAVAILABLE")`,
+  nigdy zatwierdzenia. Wynik `Completed` bez dowodu weryfikatora (np. zgłoszenie
+  agenta przyjęte po restarcie) planner oddaje człowiekowi. Migracja 204 dodaje
+  `bpmn_verification_completions` (werdykt krytyka, jeden niezmienny wiersz na
+  wywołanie); publikacja przypina weryfikator obok pracy
+  (`PinnedServiceRole::Verification`) i odrzuca krytyka będącego agentem pracy,
+  wyłączonego agenta albo przepływ bez bloku wyniku. Projektant: zakładka wyniku
+  oferuje Test i Krytyka (wybór przepływu lub agenta, kryteria, skutek odrzucenia)
+  w pięciu językach.
 
 ### TentaNas
 

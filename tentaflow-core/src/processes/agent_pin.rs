@@ -10,6 +10,7 @@ use rusqlite::Connection;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use super::agent_sink::critic_tools;
 use crate::agents::{allowlist_admits_entry, AgentRuntime};
 use crate::db::{models::DbAgent, repository, DbPool};
 
@@ -127,4 +128,14 @@ pub fn pin_agent(
     let conn = pool.read().map_err(|_| AgentPinError::Unavailable)?;
     let agent = check_agent(&conn, agent_id, allowed_tools, max_iterations)?;
     agent_pin(&agent, allowed_tools).map_err(|_| AgentPinError::Unavailable)
+}
+
+/// The pin publication stores for the critic of a step: the agent as it runs as
+/// a critic, which means with the read-only tools of [`critic_tools`] (the
+/// intersection with its own tools is taken at run time, so the critic needs no
+/// particular tool of its own, only to be runnable).
+pub fn pin_critic(pool: &DbPool, agent_id: &str) -> Result<AgentPin, AgentPinError> {
+    let conn = pool.read().map_err(|_| AgentPinError::Unavailable)?;
+    let agent = runnable_agent(&conn, agent_id)?;
+    agent_pin(&agent, &critic_tools()).map_err(|_| AgentPinError::Unavailable)
 }

@@ -60,6 +60,21 @@ const DEFAULT_TOOL_TIMEOUT_SECS: usize = 120;
 /// kazde trzyma bufor wyniku, wiec pula ma sufit.
 const DEFAULT_MAX_PARALLEL_TOOL_CALLS: usize = 4;
 
+/// Core tools that only read. They may run alongside the other calls of a turn
+/// and are the whole of what a critic of a process step may use.
+pub const READ_ONLY_CORE_TOOLS: [CoreToolName; 10] = [
+    CoreToolName::FsRead,
+    CoreToolName::FsList,
+    CoreToolName::FsGlob,
+    CoreToolName::FsGrep,
+    CoreToolName::GitRead,
+    CoreToolName::CodeSearch,
+    CoreToolName::WorkspaceInfo,
+    CoreToolName::AgentList,
+    CoreToolName::ProjectSearch,
+    CoreToolName::ProjectListSources,
+];
+
 const DEFAULT_PERMISSION_TIMEOUT: Duration = Duration::from_secs(DEFAULT_INTERACTION_TIMEOUT_SECS);
 
 /// Shapes a failed tool call into a recoverable `[TOOL_ERROR]`-style result the
@@ -851,21 +866,9 @@ impl ToolExecNodeAdapter {
     /// strictly one after another, because every addon tool fell through to the
     /// sequential path.
     fn is_parallel_safe(name: &str, addon_tools: &[crate::addon::ToolDefinition]) -> bool {
-        if matches!(
-            CoreToolName::from_public_name(name),
-            Some(
-                CoreToolName::FsRead
-                    | CoreToolName::FsList
-                    | CoreToolName::FsGlob
-                    | CoreToolName::FsGrep
-                    | CoreToolName::GitRead
-                    | CoreToolName::CodeSearch
-                    | CoreToolName::WorkspaceInfo
-                    | CoreToolName::AgentList
-                    | CoreToolName::ProjectSearch
-                    | CoreToolName::ProjectListSources
-            )
-        ) {
+        if CoreToolName::from_public_name(name)
+            .is_some_and(|tool| READ_ONLY_CORE_TOOLS.contains(&tool))
+        {
             return true;
         }
         crate::addon::tool_dispatch::resolve_tool(addon_tools, name)

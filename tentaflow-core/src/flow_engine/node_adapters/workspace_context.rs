@@ -506,6 +506,7 @@ mod tests {
             fence: 1,
             allowed_tools: vec!["core.fs_read".into()],
             output_schema: None,
+            role: crate::processes::agent_sink::BindingRole::Work,
         };
 
         assert_eq!(

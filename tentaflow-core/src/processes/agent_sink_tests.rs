@@ -203,6 +203,7 @@ pub(crate) fn step_past_the_boundary(
         fence: claimed.job.fence,
         allowed_tools,
         output_schema,
+        role: crate::processes::agent_sink::BindingRole::Work,
     };
     (claimed, binding)
 }
@@ -433,6 +434,7 @@ fn nothing_is_recorded_before_the_dispatch_boundary() {
         fence: claimed.job.fence,
         allowed_tools: Vec::new(),
         output_schema: None,
+        role: crate::processes::agent_sink::BindingRole::Work,
     };
     let refusal = report(&fixture, &binding, finished("early", json!({}))).unwrap_err();
     assert!(refusal.contains("no longer running"), "{refusal}");
@@ -573,6 +575,7 @@ fn the_binding_round_trips_through_run_meta_and_a_forged_one_is_refused() {
         fence: 7,
         allowed_tools: vec!["core.skill_view".into()],
         output_schema: Some(json!({"type": "object"})),
+        role: crate::processes::agent_sink::BindingRole::Work,
     };
     let (key, value) = binding.meta_entry();
     assert_eq!(key, PROCESS_ACTIVITY_META_KEY);
@@ -1305,6 +1308,7 @@ fn a_recorded_report_that_does_not_fit_the_published_step_is_never_accepted() {
         result: violating,
         origin: repository::ActivityResultOrigin::Contract,
         expression_observation: None,
+        verification: None,
     };
     repository::record_job_observation(&fixture.db, &claimed, "agent-worker", &observed, now_ms())
         .unwrap();

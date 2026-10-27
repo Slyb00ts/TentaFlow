@@ -2,7 +2,11 @@
 //
 // An agent step ends when the agent reports through `core.task_complete`, never
 // by what its last message says. The report is written to
-// `bpmn_agent_completions`, one final row per invocation. Which invocation a
+// `bpmn_agent_completions`, one final row per invocation. A critic that verifies
+// a step's result reports through the same tool into its own table,
+// `bpmn_verification_completions`, under its own run id and the binding role
+// `verification`: the two reports of one invocation never share a row or a run.
+// Which invocation a
 // call belongs to is not a tool argument: the process layer mints a binding into
 // `envelope.meta["process_activity"]` when it spawns the run (as Project Studio
 // does with `ps_generation`), so a model cannot report for another activity.
@@ -45,6 +49,9 @@ pub const PROCESS_STEP_TOOLS_META_KEY: &str = "process_step_tools";
 pub struct AgentStepContract {
     pub binding: ProcessActivityBinding,
     pub max_iterations: u32,
+    /// The agent the model says may run under this contract: the step's own, or
+    /// its critic.
+    pub pinned_agent: String,
 }
 
 /// The contract of the step `run_id` was spawned for, `None` when the run is not
@@ -117,6 +124,22 @@ const NOT_THIS_RUN: &str = "this run was not started for the step it reports on"
 
 const REPORT_KEYS: [&str; 5] = ["outcome", "code", "summary", "outputs", "evidence"];
 
+/// Which report of an invocation a bound run makes: the work of the step, or the
+/// verdict of its critic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingRole {
+    #[default]
+    Work,
+    Verification,
+}
+
+impl BindingRole {
+    fn is_work(&self) -> bool {
+        matches!(self, Self::Work)
+    }
+}
+
 /// What a run of an agent step is bound to. Everything but `allowed_tools` and
 /// `output_schema` identifies the invocation and the attempt the run was
 /// spawned for. Those two travel with it as a convenience for the spawn; every
@@ -124,6 +147,8 @@ const REPORT_KEYS: [&str; 5] = ["outcome", "code", "summary", "outputs", "eviden
 /// ([`sealed_meta`], [`step_contract`]), because meta can be rewritten.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessActivityBinding {
+    #[serde(default, skip_serializing_if = "BindingRole::is_work")]
+    pub role: BindingRole,
     pub invocation_id: String,
     pub instance_id: String,
     pub node_id: String,
@@ -143,9 +168,12 @@ impl ProcessActivityBinding {
         )
     }
 
-    /// The run id this invocation is allowed to report from.
+    /// The run id this invocation is allowed to report from in this role.
     pub fn agent_run_id(&self) -> String {
-        agent_run_id(&self.invocation_id)
+        match self.role {
+            BindingRole::Work => agent_run_id(&self.invocation_id),
+            BindingRole::Verification => verification_run_id(&self.invocation_id),
+        }
     }
 
     /// The agent's own allow-list shaped as a node allow-list, for the
@@ -171,6 +199,29 @@ pub fn agent_run_id(invocation_id: &str) -> String {
     ]);
     Uuid::new_v5(&NAMESPACE, invocation_id.as_bytes()).to_string()
 }
+
+/// Run id of the critic run an invocation spawns to verify its result. Derived
+/// under another namespace than [`agent_run_id`], so the two runs of one
+/// invocation have different ids and neither can report as the other.
+pub fn verification_run_id(invocation_id: &str) -> String {
+    const NAMESPACE: Uuid = Uuid::from_bytes([
+        0x2e, 0x91, 0xc4, 0x6a, 0x08, 0xd3, 0x4b, 0x75, 0xa6, 0x1f, 0x53, 0xb0, 0x7d, 0xe2, 0x94,
+        0x1c,
+    ]);
+    Uuid::new_v5(&NAMESPACE, invocation_id.as_bytes()).to_string()
+}
+
+/// Core tools a critic may use: the read-only ones. A critic checks, it never
+/// changes anything, and the completion tool is added by the binding.
+pub fn critic_tools() -> Vec<String> {
+    crate::flow_engine::node_adapters::tool_exec::READ_ONLY_CORE_TOOLS
+        .iter()
+        .map(|tool| tool.public_name().to_owned())
+        .collect()
+}
+
+/// Iteration budget of a critic run; the critic agent's own budget still caps it.
+pub const CRITIC_MAX_ITERATIONS: u32 = 12;
 
 /// What run meta says about a process step. A malformed entry is its own case:
 /// it must narrow a run to nothing, never read as "no step" and hand back the
@@ -266,15 +317,23 @@ fn record_completion(
 ) -> std::result::Result<(), CompletionError> {
     let mut conn = pool.write().map_err(|error| anyhow::anyhow!(error))?;
     let tx = conn.transaction()?;
+    // A critic reports after the work was dispatched, whatever the work ran on;
+    // the report of an agent step is the work itself and needs an agent step.
+    let kind_filter = match binding.role {
+        BindingRole::Work => "AND v.implementation_kind='agent'",
+        BindingRole::Verification => "",
+    };
     let live: Option<(String, String)> = tx
         .query_row(
-            "SELECT v.job_id, v.flow_id FROM bpmn_service_invocations v \
-             JOIN bpmn_jobs j ON j.job_id=v.job_id \
-             WHERE v.invocation_id=?1 AND v.instance_id=?2 AND v.node_id=?3 \
-               AND v.implementation_kind='agent' AND v.phase='may_have_executed' \
-               AND v.dispatch_evidence='committed_boundary' \
-               AND v.dispatch_attempt=?4 AND v.dispatch_fence=?5 \
-               AND j.status='running' AND j.attempt=?4 AND j.fence=?5",
+            &format!(
+                "SELECT v.job_id, v.flow_id FROM bpmn_service_invocations v \
+                 JOIN bpmn_jobs j ON j.job_id=v.job_id \
+                 WHERE v.invocation_id=?1 AND v.instance_id=?2 AND v.node_id=?3 \
+                   {kind_filter} AND v.phase='may_have_executed' \
+                   AND v.dispatch_evidence='committed_boundary' \
+                   AND v.dispatch_attempt=?4 AND v.dispatch_fence=?5 \
+                   AND j.status='running' AND j.attempt=?4 AND j.fence=?5"
+            ),
             params![
                 binding.invocation_id,
                 binding.instance_id,
@@ -291,7 +350,15 @@ fn record_completion(
     if !job_activation_live_on(&tx, &job_id)? {
         return Err(CompletionError::NotLive);
     }
-    let pinned_agent = parse_agent_source_ref(&source_ref);
+    // The agent whose run may report: the step's own agent, or the critic the
+    // model names. The contract below reads the same from the model by run id.
+    let contract = super::repository::agent_step_contract_for_run_on(&tx, run_id)?
+        .filter(|contract| contract.binding.role == binding.role)
+        .ok_or(CompletionError::NotThisRun)?;
+    let pinned_agent = match binding.role {
+        BindingRole::Work => parse_agent_source_ref(&source_ref).map(str::to_owned),
+        BindingRole::Verification => Some(contract.pinned_agent.clone()),
+    };
     let run_matches: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE id=?1 AND agent_id=?2 \
          AND status='running' AND parent_run_id IS NULL AND correlation_id=?3)",
@@ -301,21 +368,25 @@ fn record_completion(
     if !run_matches {
         return Err(CompletionError::NotThisRun);
     }
+    let table = match binding.role {
+        BindingRole::Work => "bpmn_agent_completions",
+        BindingRole::Verification => "bpmn_verification_completions",
+    };
     let taken: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM bpmn_agent_completions WHERE invocation_id=?1)",
+        &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE invocation_id=?1)"),
         [&binding.invocation_id],
         |row| row.get(0),
     )?;
     if taken {
         return Err(CompletionError::AlreadyCompleted);
     }
-    let contract = super::repository::agent_step_contract_for_run_on(&tx, run_id)?
-        .ok_or(CompletionError::NotThisRun)?;
     check_report_outputs(result, contract.binding.output_schema.as_ref())
         .map_err(CompletionError::Invalid)?;
     tx.execute(
-        "INSERT INTO bpmn_agent_completions(invocation_id,run_id,result_json,created_at_ms) \
-         VALUES(?1,?2,?3,?4)",
+        &format!(
+            "INSERT INTO {table}(invocation_id,run_id,result_json,created_at_ms) \
+             VALUES(?1,?2,?3,?4)"
+        ),
         params![
             binding.invocation_id,
             run_id,
@@ -334,9 +405,29 @@ pub fn recorded_completion(
     conn: &rusqlite::Connection,
     invocation_id: &str,
 ) -> Result<Option<ActivityResult>> {
+    recorded_report(conn, BindingRole::Work, invocation_id)
+}
+
+/// The verdict a critic recorded for an invocation, if any.
+pub fn recorded_verdict(
+    conn: &rusqlite::Connection,
+    invocation_id: &str,
+) -> Result<Option<ActivityResult>> {
+    recorded_report(conn, BindingRole::Verification, invocation_id)
+}
+
+pub fn recorded_report(
+    conn: &rusqlite::Connection,
+    role: BindingRole,
+    invocation_id: &str,
+) -> Result<Option<ActivityResult>> {
+    let table = match role {
+        BindingRole::Work => "bpmn_agent_completions",
+        BindingRole::Verification => "bpmn_verification_completions",
+    };
     let stored: Option<String> = conn
         .query_row(
-            "SELECT result_json FROM bpmn_agent_completions WHERE invocation_id=?1",
+            &format!("SELECT result_json FROM {table} WHERE invocation_id=?1"),
             [invocation_id],
             |row| row.get(0),
         )
@@ -479,6 +570,13 @@ pub fn complete_task(
         return Err(NOT_THIS_RUN.into());
     }
     let result = report_from_arguments(arguments)?;
+    // A verdict approves or rejects; a critic that cannot decide has no third
+    // answer to give here, and not reporting is how it says so.
+    if binding.role == BindingRole::Verification && result.outcome == ActivityOutcome::NeedsHuman {
+        return Err("a verdict is 'completed' (approved) or 'error' (rejected, with the reason \
+                    in 'summary')"
+            .into());
+    }
     match record_completion(pool, binding, run_id, &result, at_ms) {
         Ok(()) => Ok(json!({ "recorded": true })),
         Err(CompletionError::NotThisRun) => Err(NOT_THIS_RUN.into()),

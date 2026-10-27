@@ -5,7 +5,7 @@ use tentaflow_protocol::processes::{
     PinnedFlowInfo, ProcessNodeKind, ProcessOptionAgent, ProcessOptionBlock, ProcessOptionFlow,
     ProcessOptionTool, ProcessOptionUser, ProcessPayload as P, ProcessSimulationClock, ProcessSimulationEvent,
     ProcessSimulationSource, ProcessSimulationTraceStep, ProcessSimulationView,
-    ServiceImplementation,
+    ServiceImplementation, ServiceImplementationKind,
 };
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth};
 
@@ -364,6 +364,7 @@ pub(crate) fn pin_service_snapshots(
         let ProcessNodeKind::ServiceTask {
             flow_id,
             implementation,
+            verification,
             ..
         } = &node.kind
         else {
@@ -436,11 +437,83 @@ pub(crate) fn pin_service_snapshots(
             role: Default::default(),
             implementation_kind: implementation.kind(),
         });
+        // A machine verification is pinned like the source it runs on, beside the
+        // pin of the work: the process publishes with the verifier it was checked
+        // against.
+        if let Some(pinned) = pin_verifier(
+            executor, actor, verification, &node.id, &mut refused_agents,
+        )? {
+            snapshots.push(pinned);
+        }
     }
     if !refused_agents.is_empty() {
         return Err(ProtocolError::bad_request(refused_agents.join("\n")));
     }
     Ok(snapshots)
+}
+
+/// The pin of the test flow or critic agent of a node, `None` when the node asks
+/// for no machine verification or its critic was refused (the refusal is then in
+/// `refused`, reported with the other refused agents).
+fn pin_verifier(
+    executor: &FlowDispatcher,
+    actor: &repository::ProcessActor,
+    verification: &tentaflow_protocol::processes::ActivityVerification,
+    node_id: &str,
+    refused: &mut Vec<String>,
+) -> Result<Option<PinnedServiceSnapshot>, ProtocolError> {
+    use tentaflow_protocol::processes::VerificationKind;
+    let Some((kind, reference, _)) = verification.automatic() else {
+        return Ok(None);
+    };
+    let (pinned, implementation_kind) = match kind {
+        VerificationKind::Test => {
+            let meta = executor
+                .authorize_process_flow(reference, &actor.user_id, &actor.org_id)
+                .map_err(|error| {
+                    ProtocolError::new(ProtocolErrorCode::PolicyDenied, error.to_string())
+                })?;
+            let pinned = executor
+                .snapshot_flow(reference, &meta)
+                .map_err(|error| ProtocolError::bad_request(error.to_string()))?;
+            crate::flow_engine::node_adapters::activity_result::validate_verification_flow(
+                &pinned.graph_json,
+            )
+            .map_err(|error| {
+                ProtocolError::bad_request(format!("service task {node_id}: {error}"))
+            })?;
+            (pinned, ServiceImplementationKind::Flow)
+        }
+        VerificationKind::Critic => {
+            match executor.snapshot_process_critic(reference, &actor.user_id, &actor.org_id) {
+                Ok(pinned) => (pinned, ServiceImplementationKind::Agent),
+                Err(error @ AgentPinError::Refused(_)) => {
+                    refused.push(format!("service task {node_id} critic: {error}"));
+                    return Ok(None);
+                }
+                Err(error @ AgentPinError::Initiator) => {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::PolicyDenied,
+                        error.to_string(),
+                    ));
+                }
+                Err(error @ AgentPinError::Unavailable) => {
+                    return Err(ProtocolError::internal(error.to_string()));
+                }
+            }
+        }
+    };
+    Ok(Some(PinnedServiceSnapshot {
+        info: PinnedFlowInfo {
+            node_id: node_id.to_owned(),
+            flow_id: pinned.flow_id,
+            source_version: pinned.source_version,
+            graph_sha256: pinned.graph_sha256,
+        },
+        graph_json: pinned.graph_json,
+        role: repository::PinnedServiceRole::Verification,
+        implementation_kind,
+    }))
 }
 
 #[handler(variant = "ProcessBody", since = (1, 0))]

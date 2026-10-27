@@ -29,7 +29,7 @@ use crate::flow_engine::progress_broker::ProgressBroker;
 
 /// What the scripted model does once its run starts.
 #[derive(Clone)]
-enum Script {
+pub(super) enum Script {
     /// Reports through `core.task_complete` and answers.
     Report(Value),
     /// Answers without ever reporting.
@@ -45,15 +45,18 @@ enum Script {
     DelegateAndHold,
     /// Starts a sub-agent that works until cancelled, then ends without a report.
     DelegateAndFinish,
+    /// One script for the run of the step's own agent, another for the run of
+    /// its critic.
+    Roles(Box<Script>, Box<Script>),
 }
 
 #[derive(Default)]
-struct Seen {
-    flows: Vec<FlowRef>,
-    meta: Vec<BTreeMap<String, Value>>,
-    scopes: Vec<String>,
-    prompts: Vec<String>,
-    principals: Vec<AgentPrincipal>,
+pub(super) struct Seen {
+    pub(super) flows: Vec<FlowRef>,
+    pub(super) meta: Vec<BTreeMap<String, Value>>,
+    pub(super) scopes: Vec<String>,
+    pub(super) prompts: Vec<String>,
+    pub(super) principals: Vec<AgentPrincipal>,
 }
 
 struct ScriptedRunner {
@@ -87,7 +90,14 @@ impl BackgroundFlowRunner for ScriptedRunner {
             seen.principals.push(principal.clone());
         }
         self.started.fetch_add(1, Ordering::AcqRel);
-        match &self.script {
+        let script = match &self.script {
+            Script::Roles(work, verdict) => match binding_from_meta(&initial.meta).map(|binding| binding.role) {
+                Some(super::agent_sink::BindingRole::Verification) => verdict.as_ref(),
+                _ => work.as_ref(),
+            },
+            other => other,
+        };
+        match script {
             Script::Report(arguments) => {
                 let binding =
                     binding_from_meta(&initial.meta).expect("the spawn carried the binding");
@@ -95,6 +105,7 @@ impl BackgroundFlowRunner for ScriptedRunner {
                     .expect("the report is recorded");
             }
             Script::Silent => {}
+            Script::Roles(..) => unreachable!("a role script is resolved to one of its parts"),
             Script::Hold => {
                 cancel.cancelled().await;
                 self.cancelled.store(true, Ordering::Release);
@@ -176,16 +187,16 @@ impl BackgroundFlowRunner for ScriptedRunner {
     }
 }
 
-struct Rig {
-    manager: Arc<AgentRunManager>,
-    seen: Arc<Mutex<Seen>>,
-    started: Arc<AtomicUsize>,
-    cancelled: Arc<AtomicBool>,
+pub(super) struct Rig {
+    pub(super) manager: Arc<AgentRunManager>,
+    pub(super) seen: Arc<Mutex<Seen>>,
+    pub(super) started: Arc<AtomicUsize>,
+    pub(super) cancelled: Arc<AtomicBool>,
 }
 
 const HELPER_ID: &str = "helper-agent";
 
-fn install(fixture: &Fixture, script: Script) -> Rig {
+pub(super) fn install(fixture: &Fixture, script: Script) -> Rig {
     let seen = Arc::new(Mutex::new(Seen::default()));
     let started = Arc::new(AtomicUsize::new(0));
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -214,11 +225,11 @@ fn install(fixture: &Fixture, script: Script) -> Rig {
     }
 }
 
-fn report(summary: &str, outputs: Value) -> Value {
+pub(super) fn report(summary: &str, outputs: Value) -> Value {
     json!({"outcome": "completed", "summary": summary, "outputs": outputs})
 }
 
-async fn claim_and_execute(fixture: &Fixture) -> ClaimedProcessJob {
+pub(super) async fn claim_and_execute(fixture: &Fixture) -> ClaimedProcessJob {
     let claimed = repository::claim_job(&fixture.db, "agent-worker", now_ms())
         .unwrap()
         .expect("claim the queued agent step");
@@ -234,11 +245,11 @@ async fn claim_and_execute(fixture: &Fixture) -> ClaimedProcessJob {
     claimed
 }
 
-fn snapshot(fixture: &Fixture, instance_id: &str) -> repository::RuntimeSnapshot {
+pub(super) fn snapshot(fixture: &Fixture, instance_id: &str) -> repository::RuntimeSnapshot {
     repository::runtime_snapshot(&fixture.db, &fixture.owner, instance_id).unwrap()
 }
 
-fn user_task_nodes(snapshot: &repository::RuntimeSnapshot) -> Vec<String> {
+pub(super) fn user_task_nodes(snapshot: &repository::RuntimeSnapshot) -> Vec<String> {
     snapshot
         .user_tasks
         .iter()
@@ -246,7 +257,7 @@ fn user_task_nodes(snapshot: &repository::RuntimeSnapshot) -> Vec<String> {
         .collect()
 }
 
-fn with_handler(mut model: ProcessModel, boundary: ProcessNodeKind, id: &str) -> ProcessModel {
+pub(super) fn with_handler(mut model: ProcessModel, boundary: ProcessNodeKind, id: &str) -> ProcessModel {
     model.nodes.push(ProcessNode {
         id: id.into(),
         name: format!("Handle {id}"),
@@ -677,7 +688,7 @@ fn a_report_recorded_before_a_restart_is_adopted_without_running_the_agent_again
     );
 }
 
-fn interrupt_run(fixture: &Fixture, binding: &super::agent_sink::ProcessActivityBinding) {
+pub(super) fn interrupt_run(fixture: &Fixture, binding: &super::agent_sink::ProcessActivityBinding) {
     crate::db::repository::update_agent_run_status(
         &fixture.db,
         &binding.agent_run_id(),
@@ -689,7 +700,7 @@ fn interrupt_run(fixture: &Fixture, binding: &super::agent_sink::ProcessActivity
     .unwrap();
 }
 
-fn incident_codes(fixture: &Fixture, job_id: &str) -> Vec<String> {
+pub(super) fn incident_codes(fixture: &Fixture, job_id: &str) -> Vec<String> {
     let conn = fixture.db.read().unwrap();
     let mut statement = conn
         .prepare("SELECT code FROM bpmn_incidents WHERE job_id=?1 ORDER BY at_ms,incident_id")
@@ -908,6 +919,7 @@ fn an_agent_result_that_is_not_the_recorded_report_is_never_accepted() {
         },
         origin: ActivityResultOrigin::Contract,
         expression_observation: None,
+        verification: None,
     };
     repository::record_job_observation(&fixture.db, &claimed, "agent-worker", &forged, now_ms())
         .unwrap();
@@ -1046,6 +1058,7 @@ async fn drive_abandoned(
         cancel: &cancel,
         timeout,
         result_expression: None,
+        verification: &tentaflow_protocol::processes::ActivityVerification::Human,
         effective: &effective,
         repeat_extra: &[],
     };
@@ -1075,6 +1088,7 @@ async fn an_abandoned_step_still_ends_with_the_report_on_record() {
                 result,
                 origin: ActivityResultOrigin::Contract,
                 expression_observation: None,
+                verification: None,
             })
     };
     let nothing = || None;

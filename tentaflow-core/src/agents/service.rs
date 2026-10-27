@@ -684,6 +684,7 @@ mod tests {
             fence: 1,
             allowed_tools: allowed_tools.iter().map(|tool| (*tool).to_owned()).collect(),
             output_schema: None,
+            role: crate::processes::agent_sink::BindingRole::Work,
         };
         let (key, value) = binding.meta_entry();
         BTreeMap::from([(key.to_owned(), value)])

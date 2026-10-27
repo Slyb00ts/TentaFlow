@@ -940,12 +940,71 @@ impl ServiceImplementationKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub enum ActivityVerification {
     Condition {
         expression: String,
     },
     #[default]
     Human,
+    /// A pinned verification flow decides: the work result is its input, and
+    /// the activity result it ends with is the verdict (`Completed` approves).
+    Test {
+        flow_id: String,
+        #[serde(default)]
+        on_failure: VerificationOnFailure,
+    },
+    /// A second agent, other than the one that did the work, judges the result
+    /// against `criteria` and reports a verdict through `core.task_complete`.
+    Critic {
+        agent_id: String,
+        criteria: String,
+        #[serde(default)]
+        on_failure: VerificationOnFailure,
+    },
+}
+
+/// What a rejection by a `Test` or `Critic` verification turns the result into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub enum VerificationOnFailure {
+    /// A business error `VERIFICATION_FAILED` that boundary events can handle.
+    #[default]
+    Error,
+    /// A `NeedsHuman` result `VERIFICATION_FAILED` that opens a verification task.
+    NeedsHuman,
+}
+
+impl ActivityVerification {
+    /// The mode by which a machine decides, with its failure handling.
+    pub fn automatic(&self) -> Option<(VerificationKind, &str, VerificationOnFailure)> {
+        match self {
+            Self::Test { flow_id, on_failure } => {
+                Some((VerificationKind::Test, flow_id, *on_failure))
+            }
+            Self::Critic { agent_id, on_failure, .. } => {
+                Some((VerificationKind::Critic, agent_id, *on_failure))
+            }
+            Self::Human | Self::Condition { .. } => None,
+        }
+    }
+}
+
+/// Which machine verified a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationKind {
+    Test,
+    Critic,
+}
+
+impl VerificationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::Critic => "critic",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -3183,6 +3242,74 @@ mod tests {
                 config,
             },
         }
+    }
+
+    fn verified_service_task(verification: ActivityVerification) -> ProcessNodeKind {
+        ProcessNodeKind::ServiceTask {
+            flow_id: "flow-1".into(),
+            input_mapping: BTreeMap::new(),
+            output_mapping: BTreeMap::new(),
+            verification,
+            timeout_seconds: 30,
+            result_expression: None,
+            implementation: ServiceImplementation::Flow,
+        }
+    }
+
+    #[test]
+    fn machine_verification_modes_round_trip_by_variant_name() {
+        let test = ActivityVerification::Test {
+            flow_id: "check-1".into(),
+            on_failure: VerificationOnFailure::NeedsHuman,
+        };
+        let critic = ActivityVerification::Critic {
+            agent_id: "critic-1".into(),
+            criteria: "must cite a source".into(),
+            on_failure: VerificationOnFailure::Error,
+        };
+        for mode in [test, critic] {
+            let task = verified_service_task(mode);
+            let json = serde_json::to_value(&task).unwrap();
+            assert_eq!(serde_json::from_value::<ProcessNodeKind>(json).unwrap(), task);
+            assert_eq!(
+                crate::cbor::decode::<ProcessNodeKind>(&crate::cbor::encode(&task).unwrap()).unwrap(),
+                task
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(verified_service_task(ActivityVerification::Test {
+                flow_id: "check-1".into(),
+                on_failure: VerificationOnFailure::NeedsHuman,
+            })).unwrap()["ServiceTask"]["verification"],
+            serde_json::json!({"Test":{"flow_id":"check-1","on_failure":"NeedsHuman"}})
+        );
+        assert_eq!(
+            serde_json::to_value(verified_service_task(ActivityVerification::Critic {
+                agent_id: "critic-1".into(),
+                criteria: "c".into(),
+                on_failure: VerificationOnFailure::Error,
+            })).unwrap()["ServiceTask"]["verification"],
+            serde_json::json!({"Critic":{"agent_id":"critic-1","criteria":"c","on_failure":"Error"}})
+        );
+    }
+
+    #[test]
+    fn machine_verification_defaults_a_missing_failure_choice_and_keeps_old_bytes() {
+        let decoded: ActivityVerification =
+            serde_json::from_str(r#"{"Test":{"flow_id":"check-1"}}"#).unwrap();
+        assert_eq!(decoded, ActivityVerification::Test {
+            flow_id: "check-1".into(),
+            on_failure: VerificationOnFailure::Error,
+        });
+        assert!(serde_json::from_str::<ActivityVerification>(
+            r#"{"Test":{"flow_id":"c","extra":1}}"#).is_err());
+        assert_eq!(serde_json::to_string(&ActivityVerification::Human).unwrap(), r#""Human""#);
+        assert_eq!(
+            serde_json::to_string(&ActivityVerification::Condition { expression: "true".into() })
+                .unwrap(),
+            r#"{"Condition":{"expression":"true"}}"#
+        );
+        assert_eq!(ActivityVerification::default(), ActivityVerification::Human);
     }
 
     #[test]

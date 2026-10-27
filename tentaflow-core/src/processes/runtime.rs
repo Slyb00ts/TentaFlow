@@ -6747,6 +6747,16 @@ pub(super) fn unhandled_repeated_result(
     }
 }
 
+/// The data of a `verification_passed` event. A condition keeps the bytes it
+/// always had; a machine mode names who approved.
+fn verification_passed_data(verification: &ActivityVerification) -> Value {
+    match (verification, verification.automatic()) {
+        (ActivityVerification::Condition { expression }, _) => json!({"expression": expression}),
+        (_, Some((kind, reference, _))) => json!({"mode": kind.as_str(), "reference": reference}),
+        (_, None) => json!({}),
+    }
+}
+
 pub fn plan_user_completion(
     snapshot: &RuntimeSnapshot,
     task_id: &str,
@@ -7251,6 +7261,13 @@ pub fn plan_job_result(
     else {
         anyhow::bail!("job node is not a service task");
     };
+    // A machine verification approves only through the proof the job recorded
+    // with its result; a completed result without it (a report adopted after a
+    // restart) goes to a person instead.
+    let unverified = result.outcome == ActivityOutcome::Completed
+        && verification
+            .automatic()
+            .is_some_and(|(kind, reference, _)| !observed.approved_by(kind, reference));
     transition.plan.complete_job_ids.push(job.job_id.clone());
     transition
         .jobs
@@ -7327,6 +7344,7 @@ pub fn plan_job_result(
         }
         if result.outcome == ActivityOutcome::NeedsHuman
             || matches!(verification, ActivityVerification::Human)
+            || unverified
         {
             let task_inputs = transition.activity_inputs_for_user_task(
                 &node, &token.token_id,
@@ -7344,9 +7362,6 @@ pub fn plan_job_result(
             transition.write_repetition_occurrence(occurrence)?;
             return transition.finish();
         }
-        let ActivityVerification::Condition { expression } = verification else {
-            anyhow::bail!("repeated Service verification mode is invalid");
-        };
         if node.activity_io.is_some() {
             let repeat_extra = Transition::repeat_extra(
                 &group.group_id, occurrence.ordinal, occurrence.item.clone());
@@ -7374,7 +7389,7 @@ pub fn plan_job_result(
         transition.resolve_boundary_incidents(&token.token_id);
         transition.consume(&token.token_id);
         transition.event("verification_passed", Some(node.id.clone()),
-            json!({"expression":expression}));
+            verification_passed_data(verification));
         let before_mapping = transition.clone();
         if let Err(error) = transition.complete_repetition_occurrence(&token, &result.outputs,
             result_event_id, None, Some(observed.origin.clone())) {
@@ -7703,11 +7718,35 @@ pub fn plan_job_result(
             )?;
             verification_opened = true;
         }
-        ActivityVerification::Condition { expression } => {
+        _ if unverified => {
+            let task_inputs = transition.activity_inputs_for_user_task(
+                &node, &token.token_id,
+            )?;
+            transition.user_task(
+                &node,
+                ProcessUserTaskKind::Verification,
+                transition.initiator.to_owned(),
+                serde_json::to_value(result)?,
+                task_inputs,
+                &token.token_id,
+            )?;
+            verification_opened = true;
+        }
+        ActivityVerification::Condition { .. }
+        | ActivityVerification::Test { .. }
+        | ActivityVerification::Critic { .. } => {
             let activity_input_extra = transition.activity_inputs_extra_for_activation(
                 &node.id, &token.token_id,
             )?;
-            match condition(expression, &transition.effective()?, &result.outputs) {
+            // A machine verdict was given before the result was recorded; only a
+            // condition is evaluated here.
+            let accepted = match verification {
+                ActivityVerification::Condition { expression } => {
+                    condition(expression, &transition.effective()?, &result.outputs)
+                }
+                _ => Ok(true),
+            };
+            match accepted {
                 Ok(true) => match patch_variables(
                     output_mapping,
                     transition.local()?,
@@ -7744,7 +7783,7 @@ pub fn plan_job_result(
                         transition.event(
                             "verification_passed",
                             Some(node.id.clone()),
-                            json!({"expression": expression}),
+                            verification_passed_data(verification),
                         );
                         for edge in transition.outgoing(&node.id) {
                             transition.follow(&token, &edge)?;

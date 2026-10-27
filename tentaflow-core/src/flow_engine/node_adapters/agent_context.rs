@@ -731,6 +731,7 @@ mod tests {
                 fence: 1,
                 allowed_tools: allowed.iter().map(|tool| (*tool).to_owned()).collect(),
                 output_schema: None,
+                role: crate::processes::agent_sink::BindingRole::Work,
             }
             .meta_entry()
         };

@@ -99,11 +99,13 @@ pub struct PinnedServiceSnapshot {
     pub implementation_kind: ServiceImplementationKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PinnedServiceRole {
     #[default]
     Implementation,
+    /// The flow (test) or agent (critic) that verifies the node's result.
+    Verification,
 }
 
 impl PinnedServiceRole {
@@ -294,6 +296,10 @@ pub struct ObservedActivityResult {
     pub origin: ActivityResultOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expression_observation: Option<ExpressionObservation>,
+    /// Present exactly when a test or critic judged the work result: `result` is
+    /// then the result after that verdict, and the record keeps what the work was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<super::verification::VerificationRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4304,10 +4310,14 @@ pub fn publish_definition(
         "publication needs a Current verified calendar pin"
     );
     let mut service_nodes = HashSet::new();
+    // The node ids that ask for a machine verification, with the reference the
+    // verifier's pin must carry and the kind of source it is.
+    let mut verifier_nodes = HashMap::new();
     for node in super::model::all_nodes(&prepared_model) {
         if let tentaflow_protocol::processes::ProcessNodeKind::ServiceTask {
             flow_id,
             implementation,
+            verification,
             ..
         } = &node.kind
         {
@@ -4316,25 +4326,36 @@ pub fn publish_definition(
                 implementation.source_ref(flow_id),
                 implementation.kind(),
             ));
+            if let Some(pin) = super::verification::verifier_pin_target(verification) {
+                verifier_nodes.insert(node.id.as_str(), pin);
+            }
         }
     }
     ensure!(
-        snapshots.len() == service_nodes.len(),
+        snapshots.len() == service_nodes.len() + verifier_nodes.len(),
         "every service task requires one server-minted flow snapshot"
     );
     let mut covered = HashSet::new();
     for snapshot in snapshots {
-        ensure!(
-            snapshot.role == PinnedServiceRole::Implementation
-                && service_nodes.contains(&(
-                    snapshot.info.node_id.as_str(),
+        let node_id = snapshot.info.node_id.as_str();
+        match snapshot.role {
+            PinnedServiceRole::Implementation => ensure!(
+                service_nodes.contains(&(
+                    node_id,
                     snapshot.info.flow_id.clone(),
                     snapshot.implementation_kind
                 )),
-            "flow snapshot does not match service task"
-        );
+                "flow snapshot does not match service task"
+            ),
+            PinnedServiceRole::Verification => ensure!(
+                verifier_nodes.get(node_id).is_some_and(|(source_ref, kind)| {
+                    *source_ref == snapshot.info.flow_id && *kind == snapshot.implementation_kind
+                }),
+                "verification snapshot does not match service task"
+            ),
+        }
         ensure!(
-            covered.insert(snapshot.info.node_id.as_str()),
+            covered.insert((node_id, snapshot.role)),
             "duplicate service task snapshot"
         );
         ensure!(
@@ -4350,8 +4371,14 @@ pub fn publish_definition(
         let service_node = super::model::all_nodes(&prepared_model).into_iter()
             .find(|node| node.id == snapshot.info.node_id)
             .context("pinned service task missing")?;
-        let tentaflow_protocol::processes::ProcessNodeKind::ServiceTask { result_expression, implementation, .. } = &service_node.kind
+        let tentaflow_protocol::processes::ProcessNodeKind::ServiceTask {
+            result_expression, implementation, verification, ..
+        } = &service_node.kind
         else { bail!("pinned node is not a service task"); };
+        if snapshot.role == PinnedServiceRole::Verification {
+            super::verification::check_verifier_pin(&tx, snapshot, verification)?;
+            continue;
+        }
         if let tentaflow_protocol::processes::ServiceImplementation::Block { node_type, config } = implementation {
             // The pin must be the graph of THIS task's block, not any valid block graph.
             ensure!(
@@ -26364,35 +26391,22 @@ fn validate_escalation_result_plan_on(
     Ok(())
 }
 
-/// The agent step an invocation belongs to, read from the pinned process model:
-/// the tool list, iteration budget and output schema the author published, with
-/// the identity of the dispatch the invocation committed. `None` when the
-/// invocation is not an agent step or its dispatch boundary was never committed.
+/// The contract of the work step an agent invocation belongs to: the tool list,
+/// iteration budget and output schema the author published, with the identity of
+/// the dispatch the invocation committed. `None` when the invocation is not an
+/// agent step or its dispatch boundary was never committed.
 fn agent_step_of_invocation_on(
     conn: &Connection,
     invocation_id: &str,
 ) -> Result<Option<super::agent_sink::AgentStepContract>> {
-    let row: Option<(String, String, String, Option<u32>, Option<u64>)> = conn
-        .query_row(
-            "SELECT instance_id,scope_id,node_id,dispatch_attempt,dispatch_fence \
-             FROM bpmn_service_invocations WHERE invocation_id=?1 AND implementation_kind='agent'",
-            [invocation_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row_optional_u64(row, 4)?)),
-        )
-        .optional()?;
-    let Some((instance_id, scope_id, node_id, Some(attempt), Some(fence))) = row else {
+    let Some((node, instance_id, node_id, attempt, fence)) =
+        dispatched_node_of_invocation_on(conn, invocation_id, "AND implementation_kind='agent'")?
+    else {
         return Ok(None);
     };
-    let (definition_id, version): (String, u32) = conn.query_row(
-        "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1",
-        [&instance_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let model = current_version_model_on(conn, &definition_id, version)?;
-    let node = scoped_node_on(conn, &instance_id, &scope_id, &model, &node_id)?;
     let ProcessNodeKind::ServiceTask {
         implementation: tentaflow_protocol::processes::ServiceImplementation::Agent {
-            allowed_tools, max_iterations, output_schema, ..
+            agent_id, allowed_tools, max_iterations, output_schema, ..
         },
         ..
     } = &node.kind
@@ -26408,14 +26422,84 @@ fn agent_step_of_invocation_on(
             fence,
             allowed_tools: allowed_tools.clone(),
             output_schema: output_schema.clone(),
+            role: super::agent_sink::BindingRole::Work,
         },
         max_iterations: *max_iterations,
+        pinned_agent: agent_id.clone(),
     }))
 }
 
+/// The contract of the critic run an invocation spawns to verify its result:
+/// read-only tools and the node's critic as the only agent allowed to report.
+/// `None` when the node asks for no critic or its dispatch boundary was never
+/// committed.
+fn critic_step_of_invocation_on(
+    conn: &Connection,
+    invocation_id: &str,
+) -> Result<Option<super::agent_sink::AgentStepContract>> {
+    let Some((node, instance_id, node_id, attempt, fence)) =
+        dispatched_node_of_invocation_on(conn, invocation_id, "")?
+    else {
+        return Ok(None);
+    };
+    let ProcessNodeKind::ServiceTask {
+        verification: tentaflow_protocol::processes::ActivityVerification::Critic { agent_id, .. },
+        ..
+    } = &node.kind
+    else {
+        return Ok(None);
+    };
+    Ok(Some(super::agent_sink::AgentStepContract {
+        binding: super::agent_sink::ProcessActivityBinding {
+            invocation_id: invocation_id.to_owned(),
+            instance_id,
+            node_id,
+            attempt,
+            fence,
+            allowed_tools: super::agent_sink::critic_tools(),
+            output_schema: None,
+            role: super::agent_sink::BindingRole::Verification,
+        },
+        max_iterations: super::agent_sink::CRITIC_MAX_ITERATIONS,
+        pinned_agent: agent_id.clone(),
+    }))
+}
+
+/// The published node an invocation belongs to and the identity of the dispatch
+/// it committed; `None` when the boundary was never committed. `extra` narrows
+/// the invocation row (a SQL condition on its columns).
+fn dispatched_node_of_invocation_on(
+    conn: &Connection,
+    invocation_id: &str,
+    extra: &str,
+) -> Result<Option<(ProcessNode, String, String, u32, u64)>> {
+    let row: Option<(String, String, String, Option<u32>, Option<u64>)> = conn
+        .query_row(
+            &format!(
+                "SELECT instance_id,scope_id,node_id,dispatch_attempt,dispatch_fence \
+                 FROM bpmn_service_invocations WHERE invocation_id=?1 {extra}"
+            ),
+            [invocation_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row_optional_u64(row, 4)?)),
+        )
+        .optional()?;
+    let Some((instance_id, scope_id, node_id, Some(attempt), Some(fence))) = row else {
+        return Ok(None);
+    };
+    let (definition_id, version): (String, u32) = conn.query_row(
+        "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1",
+        [&instance_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let model = current_version_model_on(conn, &definition_id, version)?;
+    let node = scoped_node_on(conn, &instance_id, &scope_id, &model, &node_id)?.clone();
+    Ok(Some((node, instance_id, node_id, attempt, fence)))
+}
+
 /// The contract of the step an agent run was spawned for. The run proves it by
-/// being the top-level run under the id derived from its invocation, for the
-/// agent that invocation pinned; nothing in run meta is consulted.
+/// being the top-level run under the id derived from its invocation (the work
+/// run id for the step's agent, the verification run id for its critic); nothing
+/// in run meta is consulted.
 pub(super) fn agent_step_contract_for_run_on(
     conn: &Connection,
     run_id: &str,
@@ -26430,22 +26514,26 @@ pub(super) fn agent_step_contract_for_run_on(
     let Some((agent_id, Some(invocation_id))) = run else {
         return Ok(None);
     };
-    if super::agent_sink::agent_run_id(&invocation_id) != run_id {
+    let contract = if super::agent_sink::agent_run_id(&invocation_id) == run_id {
+        let pinned: Option<String> = conn
+            .query_row(
+                "SELECT flow_id FROM bpmn_service_invocations WHERE invocation_id=?1",
+                [&invocation_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if pinned.as_deref().and_then(tentaflow_protocol::processes::parse_agent_source_ref)
+            != Some(agent_id.as_str())
+        {
+            return Ok(None);
+        }
+        agent_step_of_invocation_on(conn, &invocation_id)?
+    } else if super::agent_sink::verification_run_id(&invocation_id) == run_id {
+        critic_step_of_invocation_on(conn, &invocation_id)?
+    } else {
         return Ok(None);
-    }
-    let pinned: Option<String> = conn
-        .query_row(
-            "SELECT flow_id FROM bpmn_service_invocations WHERE invocation_id=?1",
-            [&invocation_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if pinned.as_deref().and_then(tentaflow_protocol::processes::parse_agent_source_ref)
-        != Some(agent_id.as_str())
-    {
-        return Ok(None);
-    }
-    agent_step_of_invocation_on(conn, &invocation_id)
+    };
+    Ok(contract.filter(|contract| contract.pinned_agent == agent_id))
 }
 
 /// A Contract result of an agent step must be exactly the report the agent
@@ -26570,6 +26658,7 @@ fn validate_job_result_plan_on(
     let ProcessNodeKind::ServiceTask {
         result_expression,
         implementation,
+        verification,
         ..
     } = &node.kind
     else {
@@ -26581,15 +26670,20 @@ fn validate_job_result_plan_on(
         implementation,
         tentaflow_protocol::processes::ServiceImplementation::Agent { .. }
     );
+    super::verification::validate_record_on(tx, job_id, observed, verification)?;
+    // A verdict can make the result a Contract one whatever the work was; the
+    // contract of the work itself is held to the result the work gave.
+    let work = observed.work_result();
+    let work_origin = observed.work_origin();
     if observed.origin == ActivityResultOrigin::Contract {
         ensure!(
-            result_expression.is_some() || agent_report,
+            result_expression.is_some() || agent_report || observed.verification.is_some(),
             "business result requires an explicit pinned output contract"
         );
         super::jobs::parse_contract_result(serde_json::to_value(&observed.result)?)?;
-        if agent_report {
-            ensure_matches_agent_report(tx, job_id, &observed.result)?;
-        }
+    }
+    if *work_origin == ActivityResultOrigin::Contract && agent_report {
+        ensure_matches_agent_report(tx, job_id, &work)?;
     }
     let body_path = scope_path(&scopes, &instance.instance_id, &source_scope)?;
     if let Some(occurrence) = repetition_occurrences_on(tx, &instance.instance_id)?
@@ -26613,7 +26707,7 @@ fn validate_job_result_plan_on(
                 &job_scope, &job_node, &job_token, attempt, fence, &group, &occurrence,
             )?.as_str()),
             "repeated Service claim differs from its immutable occurrence and fence");
-        if observed.origin == ActivityResultOrigin::Contract && !agent_report {
+        if *work_origin == ActivityResultOrigin::Contract && !agent_report {
             let observation = observed.expression_observation.as_ref()
                 .context("repeated Contract result lacks its original observation")?;
             let expected = if group.mode == ProcessRepetitionGroupMode::StructuredLoop {
@@ -26631,7 +26725,7 @@ fn validate_job_result_plan_on(
                     "group_id":group.group_id,"index":occurrence.ordinal,"item":occurrence.item
                 }))],
             )?)?;
-            ensure!(actual == observed.result,
+            ensure!(actual == *work,
                 "repeated Contract result differs from its pinned expression and source observation");
         }
     }
@@ -26642,7 +26736,7 @@ fn validate_job_result_plan_on(
             matches!(&candidate.kind,
             ProcessNodeKind::BoundaryEscalation { attached_to_id, .. } if attached_to_id == node_id)
         });
-    if has_escalation && observed.origin == ActivityResultOrigin::Contract && !agent_report {
+    if has_escalation && *work_origin == ActivityResultOrigin::Contract && !agent_report {
         let observation = observed
             .expression_observation
             .as_ref()
@@ -26685,7 +26779,7 @@ fn validate_job_result_plan_on(
             &repeat_extra,
         )?)?;
         ensure!(
-            actual == observed.result,
+            actual == *work,
             "accepted escalation result differs from its pinned expression observation"
         );
     }
@@ -27593,6 +27687,7 @@ fn adopt_agent_report(
         result,
         origin: ActivityResultOrigin::Contract,
         expression_observation: None,
+        verification: None,
     };
     match record_job_observation(pool, &claimed, &original_worker, &observed, now_ms)? {
         JobObservationState::Blocked | JobObservationState::Accepted => {
@@ -28089,6 +28184,7 @@ fn observe_agent_report(
         result: report,
         origin: ActivityResultOrigin::Contract,
         expression_observation: None,
+        verification: None,
     };
     record_job_observation_on(tx, &target, worker_id, &reported, now_ms)?;
     Ok(())

@@ -7,7 +7,7 @@ use quick_xml::events::Event;
 use quick_xml::name::{QName, ResolveResult};
 use quick_xml::{NsReader, XmlVersion};
 use tentaflow_protocol::processes::{
-    ActivityVerification, ProcessActivityIo, ProcessAssociation, ProcessBodyModeling,
+    ActivityVerification, VerificationOnFailure, ProcessActivityIo, ProcessAssociation, ProcessBodyModeling,
     ProcessCalendarPin, ProcessCallActivity, ProcessCallTarget, ProcessCallableReference,
     ProcessCollaboration, ProcessCoordinatorOutputIo, ProcessDataObject, ProcessDataObjectReference, ProcessDataStore,
     ProcessDataStoreReference, ProcessDiagnostic,
@@ -2525,11 +2525,15 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                 "maxIterations",
                 "timeoutSeconds",
                 "verification",
+                "verificationFlowId",
+                "verificationAgentId",
+                "onFailure",
             ])?;
             service.children_only(&[
                 (TF, "inputMapping"),
                 (TF, "outputMapping"),
                 (TF, "condition"),
+                (TF, "criteria"),
                 (TF, "resultExpression"),
                 (TF, "blockConfig"),
                 (TF, "agentConfig"),
@@ -2557,15 +2561,50 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                         expression: condition.text.clone(),
                     }
                 }
+                "test" => ActivityVerification::Test {
+                    flow_id: service.required("verificationFlowId")?,
+                    on_failure: verification_failure(service)?,
+                },
+                "critic" => {
+                    let criteria = service
+                        .child(TF, "criteria")?
+                        .context("critic verification requires criteria")?;
+                    criteria.attrs_only(&[])?;
+                    ensure!(criteria.children.is_empty(), "critic criteria must be text");
+                    ActivityVerification::Critic {
+                        agent_id: service.required("verificationAgentId")?,
+                        criteria: criteria.text.clone(),
+                        on_failure: verification_failure(service)?,
+                    }
+                }
                 other => bail!(
                     "unsupported verification {other} at byte {}",
                     service.offset
                 ),
             };
-            if matches!(verification, ActivityVerification::Human) {
+            if !matches!(verification, ActivityVerification::Condition { .. }) {
                 ensure!(
                     service.child(TF, "condition")?.is_none(),
-                    "human verification cannot have condition"
+                    "only condition verification can have a condition"
+                );
+            }
+            if !matches!(verification, ActivityVerification::Test { .. }) {
+                ensure!(
+                    service.attr("verificationFlowId").is_none(),
+                    "only test verification can name a verification flow"
+                );
+            }
+            if !matches!(verification, ActivityVerification::Critic { .. }) {
+                ensure!(
+                    service.attr("verificationAgentId").is_none()
+                        && service.child(TF, "criteria")?.is_none(),
+                    "only critic verification can name a critic or criteria"
+                );
+            }
+            if verification.automatic().is_none() {
+                ensure!(
+                    service.attr("onFailure").is_none(),
+                    "only test and critic verification can choose what a rejection becomes"
                 );
             }
             let (flow_id, implementation) = match service.attr("implementation").unwrap_or("flow") {
@@ -3962,6 +4001,24 @@ pub fn import_xml(xml: &str) -> (Option<ProcessModel>, Vec<ProcessDiagnostic>) {
     }
 }
 
+fn verification_failure(service: &Element) -> Result<VerificationOnFailure> {
+    match service.attr("onFailure").unwrap_or("error") {
+        "error" => Ok(VerificationOnFailure::Error),
+        "needs_human" => Ok(VerificationOnFailure::NeedsHuman),
+        other => bail!(
+            "unsupported verification failure handling {other} at byte {}",
+            service.offset
+        ),
+    }
+}
+
+fn failure_text(on_failure: VerificationOnFailure) -> &'static str {
+    match on_failure {
+        VerificationOnFailure::Error => "error",
+        VerificationOnFailure::NeedsHuman => "needs_human",
+    }
+}
+
 fn escaped(text: &str) -> String {
     quick_xml::escape::escape(text).replace('\r', "&#13;")
 }
@@ -4729,10 +4786,11 @@ fn write_graph(
                 result_expression,
                 implementation,
             } => {
-                let verify = if matches!(verification, ActivityVerification::Human) {
-                    "human"
-                } else {
-                    "condition"
+                let verify = match verification {
+                    ActivityVerification::Human => "human",
+                    ActivityVerification::Condition { .. } => "condition",
+                    ActivityVerification::Test { .. } => "test",
+                    ActivityVerification::Critic { .. } => "critic",
                 };
                 let source = match implementation {
                     ServiceImplementation::Flow => format!("flowId=\"{}\"", escaped(flow_id)),
@@ -4750,7 +4808,22 @@ fn write_graph(
                         escaped(agent_id)
                     ),
                 };
-                xml.push_str(&format!("><bpmn:extensionElements><tentaflow:service {source} timeoutSeconds=\"{timeout_seconds}\" verification=\"{verify}\">"));
+                let verification_attrs = match verification {
+                    ActivityVerification::Test { flow_id, on_failure } => format!(
+                        " verificationFlowId=\"{}\" onFailure=\"{}\"",
+                        escaped(flow_id),
+                        failure_text(*on_failure)
+                    ),
+                    ActivityVerification::Critic { agent_id, on_failure, .. } => format!(
+                        " verificationAgentId=\"{}\" onFailure=\"{}\"",
+                        escaped(agent_id),
+                        failure_text(*on_failure)
+                    ),
+                    ActivityVerification::Human | ActivityVerification::Condition { .. } => {
+                        String::new()
+                    }
+                };
+                xml.push_str(&format!("><bpmn:extensionElements><tentaflow:service {source} timeoutSeconds=\"{timeout_seconds}\" verification=\"{verify}\"{verification_attrs}>"));
                 if !input_mapping.is_empty() {
                     xml.push_str(&format!(
                         "<tentaflow:inputMapping>{}</tentaflow:inputMapping>",
@@ -4767,6 +4840,12 @@ fn write_graph(
                     xml.push_str(&format!(
                         "<tentaflow:condition>{}</tentaflow:condition>",
                         escaped(expression)
+                    ));
+                }
+                if let ActivityVerification::Critic { criteria, .. } = verification {
+                    xml.push_str(&format!(
+                        "<tentaflow:criteria>{}</tentaflow:criteria>",
+                        escaped(criteria)
                     ));
                 }
                 if let Some(expression) = result_expression {
@@ -6551,6 +6630,75 @@ mod tests {
             ] {
                 assert!(crate::flow_engine::expr::evaluate_bool(condition, &scope, None).unwrap());
             }
+        }
+    }
+
+    #[test]
+    fn machine_verification_round_trips_through_xml_and_rejects_stray_attributes() {
+        use tentaflow_protocol::processes::VerificationOnFailure;
+        for (mode, marker) in [
+            (
+                ActivityVerification::Test {
+                    flow_id: "check-flow".into(),
+                    on_failure: VerificationOnFailure::NeedsHuman,
+                },
+                "verificationFlowId=\"check-flow\" onFailure=\"needs_human\"",
+            ),
+            (
+                ActivityVerification::Critic {
+                    agent_id: "critic-1".into(),
+                    criteria: "cite <a> source & \"quote\"".into(),
+                    on_failure: VerificationOnFailure::Error,
+                },
+                "verificationAgentId=\"critic-1\" onFailure=\"error\"",
+            ),
+        ] {
+            let mut model = super::super::model::starter_model();
+            model.nodes.push(ProcessNode {
+                activity_io: None,
+                repeat: None,
+                id: "Service_1".into(),
+                name: "Check".into(),
+                kind: ProcessNodeKind::ServiceTask {
+                    flow_id: "flow-123".into(),
+                    input_mapping: BTreeMap::new(),
+                    output_mapping: BTreeMap::new(),
+                    verification: mode.clone(),
+                    timeout_seconds: 60,
+                    result_expression: None,
+                    implementation: Default::default(),
+                },
+            });
+            model.sequence_flows[0].target_id = "Service_1".into();
+            model.sequence_flows.push(ProcessSequenceFlow {
+                call_start_node_id: None,
+                id: "Flow_9".into(),
+                source_id: "Service_1".into(),
+                target_id: "End_1".into(),
+                condition: None,
+            });
+            let xml = export_xml(&model).unwrap();
+            assert!(xml.contains(marker), "{xml}");
+            let (parsed, diagnostics) = import_xml(&xml);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            assert_eq!(parsed.as_ref(), Some(&model));
+
+            // A mode's attributes belong to that mode only.
+            let human = xml
+                .replace(
+                    &format!(
+                        "verification=\"{}\"",
+                        if marker.contains("FlowId") { "test" } else { "critic" }
+                    ),
+                    "verification=\"human\"",
+                )
+                .replace(" onFailure=\"needs_human\"", "")
+                .replace(" onFailure=\"error\"", "");
+            let (parsed, diagnostics) = import_xml(&human);
+            assert!(parsed.is_none(), "stray verifier attributes are refused");
+            assert!(diagnostics.iter().any(|diagnostic| diagnostic.fatal));
+            let unknown = xml.replace("onFailure=\"", "onFailure=\"retry");
+            assert!(import_xml(&unknown).0.is_none());
         }
     }
 

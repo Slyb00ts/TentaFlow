@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use tentaflow_protocol::processes::{
-    ActivityOutcome, ActivityResult, ProcessNodeKind, ServiceImplementation,
+    ActivityOutcome, ActivityResult, ActivityVerification, ProcessNodeKind, ServiceImplementation,
     ServiceImplementationKind,
 };
 use tokio_util::sync::CancellationToken;
@@ -84,7 +84,7 @@ fn normalize_outcome(outcome: FlowExecutionOutcome) -> Result<ActivityResult> {
     })
 }
 
-fn observed_result(
+pub(super) fn observed_result(
     outcome: FlowExecutionOutcome,
     expression: Option<&str>,
     variables: &Value,
@@ -102,6 +102,7 @@ fn output_limit_result(error: anyhow::Error) -> ObservedActivityResult {
         result: failure("OUTPUT_LIMIT", error.to_string()),
         origin: ActivityResultOrigin::Platform,
         expression_observation: None,
+        verification: None,
     }
 }
 
@@ -152,6 +153,7 @@ fn classify_result(
             result,
             origin: ActivityResultOrigin::Platform,
             expression_observation: None,
+            verification: None,
         };
     }
     let Some(expression) = expression else {
@@ -159,6 +161,7 @@ fn classify_result(
             result,
             origin: ActivityResultOrigin::Envelope,
             expression_observation: None,
+            verification: None,
         };
     };
     let expression_observation = ExpressionObservation {
@@ -172,11 +175,13 @@ fn classify_result(
             result,
             origin: ActivityResultOrigin::Contract,
             expression_observation: Some(expression_observation),
+            verification: None,
         },
         Err(error) => ObservedActivityResult {
             result: failure("RESULT_EXPRESSION_ERROR", format!("{error:#}")),
             origin: ActivityResultOrigin::Platform,
             expression_observation: None,
+            verification: None,
         },
     }
 }
@@ -276,6 +281,7 @@ pub(super) struct ServiceJob<'a> {
     pub(super) cancel: &'a CancellationToken,
     pub(super) timeout: Duration,
     pub(super) result_expression: Option<&'a str>,
+    pub(super) verification: &'a ActivityVerification,
     pub(super) effective: &'a Value,
     pub(super) repeat_extra: &'a [(String, Value)],
 }
@@ -367,6 +373,7 @@ pub async fn execute_claimed(
         timeout_seconds,
         result_expression,
         implementation,
+        verification,
         ..
     } = &node.kind
     else {
@@ -399,9 +406,13 @@ pub async fn execute_claimed(
         cancel: &cancel,
         timeout: Duration::from_secs(u64::from(*timeout_seconds)),
         result_expression: result_expression.as_deref(),
+        verification,
         effective: &effective,
         repeat_extra: &repeat_extra,
     };
+    if !super::verification::verifier_ready(&job)? {
+        return Ok(());
+    }
     match implementation {
         ServiceImplementation::Flow => execute_flow(&job, snapshot, flow_id).await,
         ServiceImplementation::AddonTool { addon_id, tool_name } => {
@@ -524,7 +535,7 @@ async fn execute_flow(
     let Some(result) = drive_dispatch(job, &authorize, None, execution).await? else {
         return Ok(());
     };
-    finish_observed(job, &authorize, result)
+    super::verification::finish_verified(job, &authorize, result).await
 }
 
 /// What a pinned graph's dispatch means for the job, whether the graph is a
@@ -650,7 +661,7 @@ async fn execute_block(
     let Some(result) = drive_dispatch(job, &authorize, None, execution).await? else {
         return Ok(());
     };
-    finish_observed(job, &authorize, result)
+    super::verification::finish_verified(job, &authorize, result).await
 }
 
 /// Runs an addon tool on the instance initiator's behalf.
@@ -753,7 +764,7 @@ async fn execute_tool(
     let Some(result) = drive_dispatch(job, &authorize, None, execution).await? else {
         return Ok(());
     };
-    finish_observed(job, &authorize, result)
+    super::verification::finish_verified(job, &authorize, result).await
 }
 
 /// Compares the pinned tool with the one about to run.
@@ -798,6 +809,7 @@ fn report_denied_tool(
         },
         origin: ActivityResultOrigin::Platform,
         expression_observation: None,
+        verification: None,
     };
     if repository::commit_boundary_and_observe(pool, claimed, worker_id, &result, now_ms())?
         .is_none()
@@ -1262,6 +1274,7 @@ mod tests {
             result: observe_effect(&fixture, &claim).await,
             origin: ActivityResultOrigin::Envelope,
             expression_observation: None,
+            verification: None,
         };
         assert_eq!(repository::record_job_observation(&fixture.db, &claim, worker,
             &observed, now_ms()).unwrap(), repository::JobObservationState::Observed);
@@ -1329,6 +1342,7 @@ mod tests {
             result: observe_effect(&fixture, &claim).await,
             origin: ActivityResultOrigin::Envelope,
             expression_observation: None,
+            verification: None,
         };
         assert_eq!(repository::record_job_observation(&fixture.db, &claim, worker,
             &observed, now_ms()).unwrap(), repository::JobObservationState::Observed);
@@ -1517,6 +1531,7 @@ mod tests {
                 result: (result).clone(),
                 origin: crate::processes::repository::ActivityResultOrigin::Envelope,
                 expression_observation: None,
+                verification: None,
             },
             claim.snapshot.instance.revision,
             repository::ProcessPlanInput::Canonical,
@@ -1772,6 +1787,7 @@ mod tests {
             result: observed,
             origin: crate::processes::repository::ActivityResultOrigin::Envelope,
             expression_observation: None,
+            verification: None,
         };
         assert!(matches!(repository::record_job_observation(&fixture.db, &claim,
             "lost-worker", &observed, now_ms()).unwrap(),
@@ -1854,6 +1870,7 @@ mod tests {
             result: observe_effect(&fixture, &claim).await,
             origin: repository::ActivityResultOrigin::Envelope,
             expression_observation: None,
+            verification: None,
         };
         if observed_before_cancel {
             assert!(matches!(repository::record_job_observation(&fixture.db, &claim,
@@ -1928,6 +1945,7 @@ mod tests {
             result: observe_effect(&fixture, &claim).await,
             origin: repository::ActivityResultOrigin::Envelope,
             expression_observation: None,
+            verification: None,
         };
         assert!(repository::fail_job(&fixture.db, &claim.job.job_id,
             claim.job.attempt, claim.job.fence, "original-worker", "INTERRUPTED",
@@ -1981,6 +1999,7 @@ mod tests {
             result: observe_effect(&fixture, &claim).await,
             origin: repository::ActivityResultOrigin::Envelope,
             expression_observation: None,
+            verification: None,
         };
         assert!(repository::fail_job(&fixture.db, &claim.job.job_id, claim.job.attempt,
             claim.job.fence, worker, "INTERRUPTED", "original worker stopped",
@@ -2061,6 +2080,7 @@ mod tests {
             result: observe_effect(&fixture, &claim).await,
             origin: repository::ActivityResultOrigin::Envelope,
             expression_observation: None,
+            verification: None,
         };
         let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
             &started.instance_id).unwrap();
@@ -2144,6 +2164,7 @@ mod tests {
             result: observe_effect(&fixture, &claim).await,
             origin: repository::ActivityResultOrigin::Envelope,
             expression_observation: None,
+            verification: None,
         };
         assert!(matches!(repository::record_job_observation(&fixture.db, &claim,
             worker, &observed, now_ms()).unwrap(),
@@ -2218,6 +2239,7 @@ mod tests {
             result: observe_effect(&fixture, &claim).await,
             origin: repository::ActivityResultOrigin::Envelope,
             expression_observation: None,
+            verification: None,
         };
         assert!(repository::fail_job(&fixture.db, &claim.job.job_id, claim.job.attempt,
             claim.job.fence, worker, "INTERRUPTED", "original worker stopped",
@@ -2396,12 +2418,14 @@ mod tests {
             result: observed.clone(),
             origin: ActivityResultOrigin::Envelope,
             expression_observation: None,
+            verification: None,
         });
         let plan = plan_recorded_result(&fixture, &claim,
             &ObservedActivityResult {
                 result: observed.clone(),
                 origin: ActivityResultOrigin::Envelope,
                 expression_observation: None,
+                verification: None,
             }, at_ms).unwrap();
         let current =
             repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None)
@@ -2439,6 +2463,7 @@ mod tests {
                 result: (observed).clone(),
                 origin: crate::processes::repository::ActivityResultOrigin::Envelope,
                 expression_observation: None,
+                verification: None,
             },
             current.revision,
             repository::ProcessPlanInput::Supplied(&plan),
@@ -2807,6 +2832,7 @@ mod tests {
             result: observe_effect(&fixture, &claim).await,
             origin: ActivityResultOrigin::Envelope,
             expression_observation: None,
+            verification: None,
         };
         record_observed_effect(&fixture, &claim, worker, &observed);
         let executions_before = crate::db::repository::list_flow_executions_for_flow(
@@ -2920,6 +2946,7 @@ mod tests {
                     result: result.clone(),
                     origin: ActivityResultOrigin::Envelope,
                     expression_observation: None,
+                    verification: None,
                 };
                 record_observed_effect(&fixture, claim, "late-worker", &observed);
                 Some(result)
@@ -2934,6 +2961,7 @@ mod tests {
                         result: (result).clone(),
                         origin: ActivityResultOrigin::Envelope,
                         expression_observation: None,
+                        verification: None,
                     },
                     now_ms())
                 .unwrap()
@@ -2996,6 +3024,7 @@ mod tests {
                             result: (result).clone(),
                             origin: crate::processes::repository::ActivityResultOrigin::Envelope,
                             expression_observation: None,
+                            verification: None,
                         },
                         claim.snapshot.instance.revision,
                         repository::ProcessPlanInput::Supplied(late_plan.as_ref().unwrap()),
@@ -3544,6 +3573,7 @@ mod tests {
                 normalized_outputs: normalized.outputs,
                 evaluation_variables: effective,
             }),
+            verification: None,
         };
         record_observed_effect(&fixture, &claimed, "incident-escalation-worker", &observed);
         let at = due + 1;
@@ -3676,6 +3706,7 @@ mod tests {
                 normalized_outputs: normalized.outputs,
                 evaluation_variables: effective,
             }),
+            verification: None,
         };
         record_observed_effect(&fixture, &claim, "fenced-escalation-worker", &observed);
         let at = now_ms();
@@ -3991,7 +4022,8 @@ mod tests {
             let observed = ObservedActivityResult { result: serde_json::from_value(body).unwrap(),
                 origin: ActivityResultOrigin::Contract,
                 expression_observation: Some(ExpressionObservation {
-                    normalized_outputs: normalized.outputs, evaluation_variables: effective }) };
+                    normalized_outputs: normalized.outputs, evaluation_variables: effective }),
+                verification: None, };
             record_observed_effect(&fixture, &claim, "pinned-wait-worker", &observed);
             let at = now_ms();
             let plan = plan_recorded_result(&fixture, &claim, &observed, at).unwrap();
@@ -4086,7 +4118,8 @@ mod tests {
         let observed = ObservedActivityResult { result: serde_json::from_value(body).unwrap(),
             origin: ActivityResultOrigin::Contract,
             expression_observation: Some(ExpressionObservation {
-                normalized_outputs: normalized.outputs, evaluation_variables: effective }) };
+                normalized_outputs: normalized.outputs, evaluation_variables: effective }),
+            verification: None, };
         record_observed_effect(&fixture, &claim, "throw-worker", &observed);
         let at = now_ms();
         let plan = plan_recorded_result(&fixture, &claim, &observed, at).unwrap();
@@ -4225,6 +4258,7 @@ mod tests {
                 normalized_outputs: normalized.outputs,
                 evaluation_variables: effective,
             }),
+            verification: None,
         };
         record_observed_effect(&fixture, &claim, "inclusive-escalation-worker", &observed);
         let at = now_ms();
@@ -4474,6 +4508,7 @@ mod tests {
                 normalized_outputs: normalized.outputs,
                 evaluation_variables: effective,
             }),
+            verification: None,
         };
         record_observed_effect(&fixture, &claim, "embedded-escalation-worker", &observed);
         let at = now_ms();
@@ -4809,6 +4844,7 @@ mod tests {
                 outputs: Value::Null,
                 evidence: Vec::new(),
             },
+            verification: None,
         };
         assert!(repository::commit_job_dispatch_boundary(&fixture.db, &claim,
             "forged-result", now_ms()).unwrap());
@@ -4864,6 +4900,7 @@ mod tests {
                 normalized_outputs: outputs,
                 evaluation_variables: variables,
             }),
+            verification: None,
         };
         record_observed_effect(&fixture, &claim, "unselected-escalation-worker", &observed);
         let at = now_ms();
@@ -5234,6 +5271,7 @@ mod tests {
             result: begin_observed_effect(&fixture, &claimed, worker).await,
             origin: ActivityResultOrigin::Envelope,
             expression_observation: None,
+            verification: None,
         };
         record_observed_effect(&fixture, &claimed, worker, &observed);
         let at = now_ms();

@@ -21,10 +21,11 @@ use serde_json::{json, Value};
 use tentaflow_protocol::processes::ActivityResult;
 
 use super::agent_pin::AgentPinError;
-use super::agent_sink::{agent_run_id, recorded_completion, ProcessActivityBinding};
+use super::agent_sink::{
+    agent_run_id, critic_tools, recorded_report, BindingRole, ProcessActivityBinding,
+};
 use super::jobs::{
-    begin_dispatch, drive_dispatch, fail_claim, finish_observed, now_ms, AccessCheck, ExecutionEnd,
-    ServiceJob,
+    begin_dispatch, drive_dispatch, fail_claim, now_ms, AccessCheck, ExecutionEnd, ServiceJob,
 };
 use super::repository::{self, ActivityResultOrigin, ObservedActivityResult};
 use crate::agents::{AgentPrincipal, AgentRunManager};
@@ -271,6 +272,7 @@ pub(super) async fn execute_agent(
         fence: claimed.job.fence,
         allowed_tools: step.allowed_tools.to_vec(),
         output_schema: step.output_schema.cloned(),
+        role: BindingRole::Work,
     };
     let principal = AgentPrincipal::new(
         Some(user_id.clone()),
@@ -303,7 +305,7 @@ pub(super) async fn execute_agent(
     let Some(result) = drive_dispatch(job, &authorize, Some(&salvage), execution).await? else {
         return Ok(());
     };
-    finish_observed(job, &authorize, result)
+    super::verification::finish_verified(job, &authorize, result).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -343,31 +345,127 @@ async fn run_step(
         run_id: run_id.clone(),
     };
     let deadline = tokio::time::Instant::now() + job.timeout + RUN_WAIT_SLACK;
-    // The first of two things ends the wait: the run settles, or its report
-    // lands. In the second case the run may still be working, and the guard
-    // cancels it (and what it started) when this function returns.
-    let status = tokio::select! {
-        report = report_arrived(job.pool, &binding.invocation_id) => {
-            return observed(report);
-        }
-        settled = settle(&manager, &run_id, deadline) => settled,
-    };
-    let status = status.unwrap_or_else(|| "unsettled".to_owned());
-    // The report is read whatever became of the run: it is durable on its own,
-    // and an agent that reported and was then interrupted has still decided.
-    match read_report(job.pool, &binding.invocation_id).await {
-        Ok(Some(report)) => observed(report),
-        Ok(None) => ExecutionEnd::Failed {
+    match wait_for_report(job.pool, &manager, BindingRole::Work, &run_id, &binding.invocation_id, deadline)
+        .await
+    {
+        Ok(report) => observed(report),
+        Err(ReportMissing::NoReport(status)) => ExecutionEnd::Failed {
             code: "AGENT_NO_RESULT",
             message: format!(
                 "the agent run ended as '{status}' without reporting through core.task_complete"
             ),
         },
-        Err(error) => ExecutionEnd::Failed {
+        Err(ReportMissing::Unreadable(error)) => ExecutionEnd::Failed {
             code: "AGENT_RESULT_UNREADABLE",
             message: format!("{error:#}"),
         },
     }
+}
+
+/// Why a run left no report to act on.
+enum ReportMissing {
+    /// The run ended (or was given up) as this status without reporting.
+    NoReport(String),
+    Unreadable(anyhow::Error),
+}
+
+/// Waits for the report of a bound run. The first of two things ends the wait:
+/// the run settles, or its report lands (the caller's guard then cancels the run,
+/// which may still be working, and what it started). The report is read whatever
+/// became of the run: it is durable on its own, and an agent that reported and was
+/// then interrupted has still decided.
+async fn wait_for_report(
+    pool: &DbPool,
+    manager: &AgentRunManager,
+    role: BindingRole,
+    run_id: &str,
+    invocation_id: &str,
+    deadline: tokio::time::Instant,
+) -> std::result::Result<ActivityResult, ReportMissing> {
+    let status = tokio::select! {
+        report = report_arrived(pool, role, invocation_id) => {
+            return Ok(report);
+        }
+        settled = settle(manager, run_id, deadline) => settled,
+    };
+    let status = status.unwrap_or_else(|| "unsettled".to_owned());
+    match read_report(pool, role, invocation_id).await {
+        Ok(Some(report)) => Ok(report),
+        Ok(None) => Err(ReportMissing::NoReport(status)),
+        Err(error) => Err(ReportMissing::Unreadable(error)),
+    }
+}
+
+/// What a critic is asked to do and who it is.
+pub(super) struct VerifierAgent<'a> {
+    pub agent_id: &'a str,
+    pub prompt: &'a str,
+}
+
+/// Runs the critic of a step: a second agent run under the verification run id,
+/// bound with the role `verification` (read-only tools and a sink of its own).
+/// The text of an `Err` is the reason no verdict exists; it never means
+/// approval. Whatever the critic started is cancelled when this returns.
+pub(super) async fn run_verifier_agent(
+    job: &ServiceJob<'_>,
+    verifier: VerifierAgent<'_>,
+) -> std::result::Result<ActivityResult, String> {
+    let ServiceJob { pool, dispatcher, claimed, .. } = *job;
+    let (user_id, org_id) = (&claimed.actor.user_id, &claimed.actor.org_id);
+    let agent = dispatcher
+        .authorize_process_agent(verifier.agent_id, user_id, org_id)
+        .map_err(|error| format!("the critic is unavailable: {error}"))?;
+    let manager = dispatcher
+        .process_agent_runs()
+        .ok_or_else(|| "the critic cannot run: no agent run manager".to_owned())?;
+    let (flow, _harness_hold) = pinned_harness(pool, &agent).map_err(|error| match error {
+        HarnessError::Missing(error) | HarnessError::Transient(error) => {
+            format!("the critic harness cannot be pinned: {error:#}")
+        }
+    })?;
+    let binding = ProcessActivityBinding {
+        role: BindingRole::Verification,
+        invocation_id: claimed.invocation_id.clone(),
+        instance_id: claimed.job.instance_id.clone(),
+        node_id: claimed.job.node_id.clone(),
+        attempt: claimed.job.attempt,
+        fence: claimed.job.fence,
+        allowed_tools: critic_tools(),
+        output_schema: None,
+    };
+    let principal = AgentPrincipal::new(
+        Some(user_id.clone()),
+        Some(org_id.clone()),
+        FlowOrigin::Process,
+        FlowActor::user(user_id.clone()),
+    )
+    .with_correlation_id(Some(claimed.invocation_id.clone()));
+    let run_id = binding.agent_run_id();
+    let extra_meta = [binding.meta_entry()];
+    manager
+        .spawn_with_run_id(
+            &run_id,
+            &agent.id,
+            verifier.prompt,
+            None,
+            &principal,
+            &[],
+            &extra_meta,
+            None,
+            Some(flow),
+        )
+        .await
+        .map_err(|error| format!("the critic could not be started: {error:#}"))?;
+    let _guard = CancelRunOnDrop { manager: manager.clone(), run_id: run_id.clone() };
+    let deadline = tokio::time::Instant::now() + job.timeout + RUN_WAIT_SLACK;
+    wait_for_report(pool, &manager, BindingRole::Verification, &run_id, &claimed.invocation_id, deadline)
+        .await
+        .map_err(|missing| match missing {
+            ReportMissing::NoReport(status) => format!(
+                "the critic run ended as '{status}' without reporting a verdict"
+            ),
+            ReportMissing::Unreadable(error) => format!("the critic's verdict is unreadable: {error:#}"),
+        })
 }
 
 fn observed(result: ActivityResult) -> ExecutionEnd {
@@ -382,6 +480,7 @@ fn contract_result(result: ActivityResult) -> ObservedActivityResult {
         result,
         origin: ActivityResultOrigin::Contract,
         expression_observation: None,
+        verification: None,
     }
 }
 
@@ -429,9 +528,9 @@ where
 
 /// Resolves when the sink table holds the step's report. A failed read is tried
 /// again at the next poll; the step's own timeout bounds the wait.
-async fn report_arrived(pool: &DbPool, invocation_id: &str) -> ActivityResult {
+async fn report_arrived(pool: &DbPool, role: BindingRole, invocation_id: &str) -> ActivityResult {
     loop {
-        if let Ok(Some(report)) = recorded_completion_of(pool, invocation_id) {
+        if let Ok(Some(report)) = recorded_report_of(pool, role, invocation_id) {
             return report;
         }
         tokio::time::sleep(REPORT_POLL).await;
@@ -440,8 +539,12 @@ async fn report_arrived(pool: &DbPool, invocation_id: &str) -> ActivityResult {
 
 /// The report, with a failed read retried a bounded number of times: a store
 /// that is busy for a moment must not turn a settled run into an incident.
-async fn read_report(pool: &DbPool, invocation_id: &str) -> Result<Option<ActivityResult>> {
-    read_report_with(|| recorded_completion_of(pool, invocation_id)).await
+async fn read_report(
+    pool: &DbPool,
+    role: BindingRole,
+    invocation_id: &str,
+) -> Result<Option<ActivityResult>> {
+    read_report_with(|| recorded_report_of(pool, role, invocation_id)).await
 }
 
 pub(super) async fn read_report_with(
@@ -461,10 +564,14 @@ pub(super) async fn read_report_with(
 }
 
 fn observed_report(pool: &DbPool, invocation_id: &str) -> Result<Option<ObservedActivityResult>> {
-    Ok(recorded_completion_of(pool, invocation_id)?.map(contract_result))
+    Ok(recorded_report_of(pool, BindingRole::Work, invocation_id)?.map(contract_result))
 }
 
-fn recorded_completion_of(pool: &DbPool, invocation_id: &str) -> Result<Option<ActivityResult>> {
+fn recorded_report_of(
+    pool: &DbPool,
+    role: BindingRole,
+    invocation_id: &str,
+) -> Result<Option<ActivityResult>> {
     let conn = pool.read()?;
-    recorded_completion(&conn, invocation_id)
+    recorded_report(&conn, role, invocation_id)
 }

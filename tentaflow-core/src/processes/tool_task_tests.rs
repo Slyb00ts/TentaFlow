@@ -636,6 +636,7 @@ async fn observed_but_unaccepted_in(
         },
         origin: ActivityResultOrigin::Envelope,
         expression_observation: None,
+        verification: None,
     };
     assert_eq!(
         repository::record_job_observation(
@@ -1758,6 +1759,7 @@ async fn a_flow_result_that_cannot_be_recovered_shows_up_on_the_first_start() {
         },
         origin: ActivityResultOrigin::Envelope,
         expression_observation: None,
+        verification: None,
     };
     repository::record_job_observation(&fixture.db, &claimed, "flow-worker", &observed, now_ms())
         .unwrap();

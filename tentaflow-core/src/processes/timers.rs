@@ -2740,6 +2740,7 @@ mod tests {
                 result: (accepted_result).clone(),
                 origin: crate::processes::repository::ActivityResultOrigin::Envelope,
                 expression_observation: None,
+                verification: None,
             },
             after.instance.revision,
             repository::ProcessPlanInput::Supplied(&repository::RuntimePlan::initial(json!({}))),

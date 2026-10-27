@@ -613,6 +613,7 @@ mod tests {
             fence: 1,
             allowed_tools: vec!["core.skill_view".into(), "core.fs_read".into()],
             output_schema: None,
+            role: crate::processes::agent_sink::BindingRole::Work,
         }
         .meta_entry();
         env.meta.insert(key.into(), binding);

@@ -841,6 +841,7 @@ fn validate_draft_body<'a>(
                 {
                     expr::validate_syntax(expression, None)?;
                 }
+                validate_verification(&node.id, verification, implementation, false)?;
                 if let Some(expression) = result_expression {
                     validate_expression(expression, "service result expression", false)?;
                 }
@@ -1445,6 +1446,7 @@ fn validate_body<'a>(
                     expr::validate_syntax(expression, None)
                         .with_context(|| format!("service task {} verification", node.id))?;
                 }
+                validate_verification(&node.id, verification, implementation, true)?;
                 if let Some(expression) = result_expression {
                     validate_expression(expression, "service result expression", true)?;
                 }
@@ -1802,7 +1804,8 @@ fn validate_body<'a>(
                 );
                 if matches!(node.kind, ProcessNodeKind::BoundaryEscalation { .. }) {
                     // Only a business (Contract) result can be escalated: it comes
-                    // from a result expression or from the report of an agent.
+                    // from a result expression, from the report of an agent or from
+                    // the verdict of a test or critic.
                     ensure!(
                         matches!(nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
                         Some(ProcessNodeKind::ServiceTask { result_expression: Some(expression), .. })
@@ -1810,8 +1813,11 @@ fn validate_body<'a>(
                             || matches!(nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
                         Some(ProcessNodeKind::ServiceTask {
                             implementation: ServiceImplementation::Agent { .. }, ..
-                        })),
-                        "boundary escalation {} requires a ServiceTask with result expression or an agent",
+                        }))
+                            || matches!(nodes.get(attached_to_id.as_str()).map(|node| &node.kind),
+                        Some(ProcessNodeKind::ServiceTask { verification, .. })
+                            if verification.automatic().is_some()),
+                        "boundary escalation {} requires a ServiceTask with result expression, an agent or a test or critic verification",
                         node.id
                     );
                 }
@@ -2586,6 +2592,61 @@ fn service_timeout_ceiling(implementation: &ServiceImplementation) -> u32 {
 /// The agent-specific rules of a Service task. Whether the agent exists, is
 /// enabled and runs on a model is a fact of the live registry and is decided at
 /// pinning; this checks only what the model itself can state.
+/// Longest criteria text a critic is given; it travels in every verification run.
+pub const MAX_CRITIC_CRITERIA_BYTES: usize = 8 * 1024;
+
+/// The shape of a `Test` or `Critic` verification. A draft may still be missing
+/// its flow, agent or criteria (`complete == false`); a publishable step may not.
+/// A critic that is the agent of the step would grade its own work, which is
+/// the one thing the mode exists to prevent, so that is refused in drafts too.
+fn validate_verification(
+    node_id: &str,
+    verification: &tentaflow_protocol::processes::ActivityVerification,
+    implementation: &ServiceImplementation,
+    complete: bool,
+) -> Result<()> {
+    use tentaflow_protocol::processes::ActivityVerification as V;
+    match verification {
+        V::Human => {}
+        V::Condition { .. } => {}
+        V::Test { flow_id, .. } => {
+            ensure!(
+                !complete || !flow_id.is_empty(),
+                "service task {node_id} verifies with a test but names no flow"
+            );
+            ensure!(
+                flow_id.len() <= 256
+                    && !["tool:", "block:", "agent:"].iter().any(|prefix| flow_id.starts_with(prefix)),
+                "service task {node_id} names a test flow that is not a flow"
+            );
+        }
+        V::Critic { agent_id, criteria, .. } => {
+            ensure!(
+                !complete || !agent_id.is_empty(),
+                "service task {node_id} verifies with a critic but names no agent"
+            );
+            if !agent_id.is_empty() {
+                validate_tool_identifier(agent_id, "critic agent id", node_id)?;
+            }
+            ensure!(
+                !complete || !criteria.trim().is_empty(),
+                "service task {node_id} verifies with a critic but gives it no criteria"
+            );
+            ensure!(
+                criteria.len() <= MAX_CRITIC_CRITERIA_BYTES,
+                "service task {node_id} critic criteria exceed {MAX_CRITIC_CRITERIA_BYTES} bytes"
+            );
+            if let ServiceImplementation::Agent { agent_id: worker, .. } = implementation {
+                ensure!(
+                    worker != agent_id,
+                    "service task {node_id} is verified by the agent that does its work"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_agent_implementation(
     implementation: &ServiceImplementation,
     node_id: &str,

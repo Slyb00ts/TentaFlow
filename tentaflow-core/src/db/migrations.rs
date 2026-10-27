@@ -1302,8 +1302,39 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bpmn_agent_completions_and_invocation_kinds",
             MigrationStep::RustSelfManaged(bpmn_agent_completions_and_invocation_kinds),
         ),
+        (
+            204,
+            "bpmn_verification_completions",
+            MigrationStep::Rust(bpmn_verification_completions),
+        ),
     ]
 }
+
+/// The verdict of a critic that verifies the result of a Service step: the second
+/// report an invocation can have next to the work report of an agent step.
+/// It is a table of its own, not a column or a second row of
+/// `bpmn_agent_completions`, because that table is keyed by invocation (one work
+/// report per invocation) and the work may not be an agent's at all. Same
+/// guarantees: one final row per invocation, no updates, gone with its invocation.
+fn bpmn_verification_completions(conn: &Connection) -> Result<()> {
+    conn.execute_batch(BPMN_VERIFICATION_COMPLETIONS)?;
+    Ok(())
+}
+
+const BPMN_VERIFICATION_COMPLETIONS: &str = r#"
+CREATE TABLE bpmn_verification_completions (
+    invocation_id TEXT PRIMARY KEY
+        REFERENCES bpmn_service_invocations(invocation_id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL CHECK (length(run_id) > 0),
+    result_json TEXT NOT NULL CHECK (
+        json_valid(result_json) AND json_type(result_json) = 'object' AND
+        length(CAST(result_json AS BLOB)) <= 393216),
+    created_at_ms INTEGER NOT NULL CHECK (typeof(created_at_ms) = 'integer')
+);
+CREATE TRIGGER bpmn_verification_completions_immutable
+BEFORE UPDATE ON bpmn_verification_completions
+BEGIN SELECT RAISE(ABORT, 'verification completion is immutable'); END;
+"#;
 
 /// Agent steps and a proper `block` kind for Service invocations.
 ///
@@ -16792,7 +16823,7 @@ mod tests {
             assert_eq!(*version, index as i64 + 1, "the ladder must stay contiguous");
         }
         let head = ladder.last().unwrap().0;
-        assert_eq!(head, 203);
+        assert_eq!(head, 204);
 
         let fresh = Connection::open_in_memory().unwrap();
         run(&fresh).unwrap();
@@ -16811,7 +16842,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(applied_after_179.len(), 24);
+        assert_eq!(applied_after_179.len(), 25);
         assert_eq!(applied_after_179[0], "org_structure");
         assert_eq!(applied_after_179[19], "bpmn_activity_io_witnesses");
         assert_eq!(applied_after_179[20], "org_absences_drop_reason");
@@ -16821,6 +16852,7 @@ mod tests {
         );
         assert_eq!(applied_after_179[22], "bpmn_deferred_jobs_and_result_recovery");
         assert_eq!(applied_after_179[23], "bpmn_agent_completions_and_invocation_kinds");
+        assert_eq!(applied_after_179[24], "bpmn_verification_completions");
         let tables = |conn: &Connection| -> Vec<String> {
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap()
@@ -17130,7 +17162,7 @@ mod tests {
         assert_eq!(conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0)).unwrap(), "ok");
         assert_eq!(
             conn.query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get::<_, i64>(0)).unwrap(),
-            203
+            204
         );
 
         // The widened rule: each kind only with its own prefix, in both directions.
@@ -17197,6 +17229,55 @@ mod tests {
         assert_eq!(
             conn.query_row("SELECT COUNT(*) FROM bpmn_agent_completions", [], |r| r.get::<_, i64>(0)).unwrap(),
             0
+        );
+    }
+
+    /// v204 sink table of the critic's verdict: independent of the work report of
+    /// the same invocation, one immutable row per invocation, gone with it.
+    #[test]
+    fn migration_204_verification_completions_are_unique_immutable_and_cascade() {
+        let conn = agent_invocation_fixture();
+        run(&conn).unwrap();
+        insert_invocation(&conn, "inv-flow", "flow-1", "flow").unwrap();
+        insert_invocation(&conn, "inv-agent", "agent:a-1", "agent").unwrap();
+        let record = |invocation: &str, run_id: &str| {
+            conn.execute(
+                "INSERT INTO bpmn_verification_completions(invocation_id,run_id,result_json,created_at_ms) \
+                 VALUES(?1,?2,'{\"outcome\":\"Completed\"}',1)",
+                [invocation, run_id],
+            )
+        };
+        record("inv-agent", "run-1").unwrap();
+        assert!(record("inv-agent", "run-2").is_err());
+        // The verdict does not take the place of the work report of the invocation.
+        conn.execute(
+            "INSERT INTO bpmn_agent_completions(invocation_id,run_id,result_json,created_at_ms) \
+             VALUES('inv-agent','run-0','{\"outcome\":\"Completed\"}',1)",
+            [],
+        )
+        .unwrap();
+        record("inv-flow", "run-3").unwrap();
+        let edit = conn
+            .execute("UPDATE bpmn_verification_completions SET run_id='run-9'", [])
+            .unwrap_err();
+        assert!(edit.to_string().contains("verification completion is immutable"), "{edit}");
+        for (run_id, json) in [("", "{}"), ("r", "not json"), ("r", "[]")] {
+            assert!(
+                conn.execute(
+                    "INSERT INTO bpmn_verification_completions(invocation_id,run_id,result_json,created_at_ms) \
+                     VALUES('inv-flow',?1,?2,1)",
+                    [run_id, json],
+                )
+                .is_err(),
+                "{run_id:?} {json:?}"
+            );
+        }
+        conn.execute("DELETE FROM bpmn_service_invocations WHERE invocation_id='inv-agent'", [])
+            .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM bpmn_verification_completions", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
         );
     }
 

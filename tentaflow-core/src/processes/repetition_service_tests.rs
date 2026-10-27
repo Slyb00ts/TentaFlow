@@ -113,6 +113,7 @@ pub(super) async fn original_flow_result(fixture: &Fixture, claim: &ClaimedProce
                 normalized_outputs: outputs,
                 evaluation_variables: variables,
             }),
+            verification: None,
         };
         return observed;
     }
@@ -126,6 +127,7 @@ pub(super) async fn original_flow_result(fixture: &Fixture, claim: &ClaimedProce
         },
         origin: ActivityResultOrigin::Envelope,
         expression_observation: None,
+        verification: None,
     };
     observed
 }
