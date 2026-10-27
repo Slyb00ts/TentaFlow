@@ -52,6 +52,10 @@ pub struct AgentStepContract {
     /// The agent the model says may run under this contract: the step's own, or
     /// its critic.
     pub pinned_agent: String,
+    /// Whether the node has a test or critic, which is what makes a report that
+    /// reads like a verdict ambiguous: such a report is refused. A critic's own
+    /// verdict is never held to it.
+    pub machine_verified: bool,
 }
 
 /// The contract of the step `run_id` was spawned for, `None` when the run is not
@@ -397,6 +401,11 @@ fn record_completion(
     }
     check_report_outputs(result, contract.binding.output_schema.as_ref())
         .map_err(CompletionError::Invalid)?;
+    // Only a verifier's decision carries these codes and markers.
+    if binding.role == BindingRole::Work && contract.machine_verified {
+        super::verification::reject_verdict_imitation(result)
+            .map_err(|error| CompletionError::Invalid(format!("invalid report: {error:#}")))?;
+    }
     tx.execute(
         &format!(
             "INSERT INTO {table}(invocation_id,run_id,result_json,created_at_ms) \
@@ -525,9 +534,6 @@ fn report_from_arguments(arguments: &Value) -> std::result::Result<ActivityResul
         object.get("evidence").cloned().unwrap_or_else(|| json!([])),
     );
     let result = parse_contract_result(Value::Object(report))
-        .map_err(|error| format!("invalid report: {error:#}"))?;
-    // Only a verifier's decision carries these codes and markers.
-    super::verification::reject_verdict_imitation(&result)
         .map_err(|error| format!("invalid report: {error:#}"))?;
     Ok(result)
 }

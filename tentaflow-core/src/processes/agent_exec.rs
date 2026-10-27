@@ -413,7 +413,7 @@ pub(super) async fn run_verifier_agent(
     let ServiceJob { pool, dispatcher, claimed, .. } = *job;
     let (user_id, org_id) = (&claimed.actor.user_id, &claimed.actor.org_id);
     let agent = dispatcher
-        .authorize_process_agent(verifier.agent_id, user_id, org_id)
+        .authorize_process_critic(verifier.agent_id, user_id, org_id)
         .map_err(|error| format!("the critic is unavailable: {error}"))?;
     let manager = dispatcher
         .process_agent_runs()
@@ -433,7 +433,13 @@ pub(super) async fn run_verifier_agent(
         .flatten()
         .and_then(|version| version.flow_json)
         .ok_or_else(|| "the critic harness cannot be read".to_owned())?;
-    super::agent_pin::critic_harness_refusal(&harness_graph)?;
+    {
+        let conn = pool
+            .read()
+            .map_err(|_| "the critic harness cannot be read".to_owned())?;
+        super::agent_pin::critic_harness_refusal(&conn, &flow.flow_id, &harness_graph)
+            .map_err(|error| error.to_string())?;
+    }
     let binding = ProcessActivityBinding {
         role: BindingRole::Verification,
         invocation_id: claimed.invocation_id.clone(),

@@ -1488,7 +1488,7 @@ async fn repeated_service_error_interrupts_both_ordinals_from_its_fenced_result(
         .iter()
         .find(|job| job.job_id == first.job.job_id)
         .unwrap();
-    let plan = runtime::plan_job_result(&snapshot, job, &observed, at, None).unwrap();
+    let plan = runtime::plan_job_result(&snapshot, job, &observed, false, at, None).unwrap();
     assert!(plan
         .events
         .iter()
@@ -1677,7 +1677,7 @@ async fn repeated_service_contract_error_maps_outer_handler_from_fenced_ordinal_
         let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
             &started.instance_id).unwrap();
         let job = snapshot.jobs.iter().find(|job| job.job_id == first.job.job_id).unwrap();
-        let plan = runtime::plan_job_result(&snapshot, job, &observed, at, None).unwrap();
+        let plan = runtime::plan_job_result(&snapshot, job, &observed, false, at, None).unwrap();
         let coordinator = &snapshot.repetition_groups[0].parent_token_id;
         let effect = plan.variable_effects.iter().find(|effect| matches!(effect,
             repository::VariableEffect::Mapped { node_id, .. } if node_id == "HandleError"));
@@ -1846,7 +1846,7 @@ async fn repeated_service_escalation_binds_ordinal_source_to_outer_handler() {
         .iter()
         .find(|job| job.job_id == claim.job.job_id)
         .unwrap();
-    let plan = runtime::plan_job_result(&snapshot, job, &observed, at, None).unwrap();
+    let plan = runtime::plan_job_result(&snapshot, job, &observed, false, at, None).unwrap();
     let source = snapshot
         .repetition_occurrences
         .iter()
@@ -2020,7 +2020,7 @@ async fn repeated_needs_human_maps_outer_escalation_from_fenced_ordinal_once() {
         let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
             &started.instance_id).unwrap();
         let job = snapshot.jobs.iter().find(|job| job.job_id == claim.job.job_id).unwrap();
-        let plan = runtime::plan_job_result(&snapshot, job, &observed, at, None).unwrap();
+        let plan = runtime::plan_job_result(&snapshot, job, &observed, false, at, None).unwrap();
         let coordinator = &snapshot.repetition_groups[0].parent_token_id;
         let caught = plan.events.iter().find(|event| event.kind == "escalation_caught").unwrap();
         assert_eq!(caught.data["source_token_id"], claim.job.token_id);
@@ -2190,7 +2190,7 @@ async fn noninterrupting_outer_escalation_keeps_both_ordinals_and_factual_verifi
         .iter()
         .find(|job| job.job_id == claim.job.job_id)
         .unwrap();
-    let plan = runtime::plan_job_result(&snapshot, job, &observed, at, None).unwrap();
+    let plan = runtime::plan_job_result(&snapshot, job, &observed, false, at, None).unwrap();
     assert!(plan.cancel_token_ids.is_empty());
     assert!(plan.cancel_job_ids.is_empty());
     assert!(plan
@@ -2353,7 +2353,7 @@ async fn error_of_a_task_inside_a_repeated_subprocess_is_caught_by_the_boundary_
         let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
             &started.instance_id).unwrap();
         let job = snapshot.jobs.iter().find(|job| job.job_id == claim.job.job_id).unwrap();
-        let plan = runtime::plan_job_result(&snapshot, job, &observed, at, None).unwrap();
+        let plan = runtime::plan_job_result(&snapshot, job, &observed, false, at, None).unwrap();
         assert!(plan.events.iter().any(|event| event.kind == "business_error_caught"
             && event.node_id.as_deref() == Some("HandleError")),
             "the engine hands the inner Error to the handler on the repeated sub-process");
@@ -2437,7 +2437,7 @@ async fn error_of_a_task_inside_a_repeated_subprocess_climbs_past_it_to_an_outer
         let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner,
             &started.instance_id).unwrap();
         let job = snapshot.jobs.iter().find(|job| job.job_id == claim.job.job_id).unwrap();
-        let plan = runtime::plan_job_result(&snapshot, job, &observed, at, None).unwrap();
+        let plan = runtime::plan_job_result(&snapshot, job, &observed, false, at, None).unwrap();
         assert!(plan.events.iter().any(|event| event.kind == "business_error_caught"
             && event.node_id.as_deref() == Some("HandleError")),
             "{count} ordinals: the Error climbs past the repeated sub-process to Outer");

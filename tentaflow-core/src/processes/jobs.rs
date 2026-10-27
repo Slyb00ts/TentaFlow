@@ -170,10 +170,6 @@ fn classify_result(
     };
     match super::runtime::evaluate(expression, variables, &result.outputs, extra)
         .and_then(parse_contract_result)
-        .and_then(|result| {
-            super::verification::reject_verdict_imitation(&result)?;
-            Ok(result)
-        })
     {
         Ok(result) => ObservedActivityResult {
             result,
@@ -189,6 +185,28 @@ fn classify_result(
         },
     }
 }
+
+/// The work result of a step with a test or critic, unless it reads like a
+/// verdict (a code or evidence only a verifier writes): then it is the failed
+/// result expression it effectively is. Any other step may say what it likes.
+pub(super) fn refuse_verdict_imitation(
+    verification: &ActivityVerification,
+    work: ObservedActivityResult,
+) -> ObservedActivityResult {
+    if verification.automatic().is_none() || work.origin != ActivityResultOrigin::Contract {
+        return work;
+    }
+    match super::verification::reject_verdict_imitation(&work.result) {
+        Ok(()) => work,
+        Err(error) => ObservedActivityResult {
+            result: failure("RESULT_EXPRESSION_ERROR", format!("{error:#}")),
+            origin: ActivityResultOrigin::Platform,
+            expression_observation: None,
+            verification: None,
+        },
+    }
+}
+
 pub(crate) fn parse_contract_result(value: Value) -> Result<ActivityResult> {
     let object = value
         .as_object()
@@ -1081,7 +1099,7 @@ pub(super) fn finish_observed(
         } else {
             None
         };
-        let (plan, retained_escalation_failure) = match plan_job_result(&current, job, &result, at_ms, None) {
+        let (plan, retained_escalation_failure) = match plan_job_result(&current, job, &result, false, at_ms, None) {
             Ok(plan) => (plan, false),
             Err(error) if script_infrastructure(&error) => {
                 repository::record_observed_script_infrastructure_failure(

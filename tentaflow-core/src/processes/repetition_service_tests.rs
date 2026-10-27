@@ -294,9 +294,9 @@ async fn parallel_needs_human_results_replan_a_stale_sibling_and_approve_both() 
         .find(|job| job.job_id == claim_one.job.job_id).unwrap();
     let at = chrono::Utc::now().timestamp_millis();
     let stale_plan = runtime::plan_job_result(&observed_snapshot, observed_zero_job,
-        &observed_zero, at, None).unwrap();
+        &observed_zero, false, at, None).unwrap();
     let first_plan = runtime::plan_job_result(&observed_snapshot, observed_one_job,
-        &observed_one, at, None).unwrap();
+        &observed_one, false, at, None).unwrap();
     assert_eq!(stale_plan.status, ProcessInstanceStatus::Running);
     assert_eq!(first_plan.status, ProcessInstanceStatus::Running);
     repository::accept_job_result(&fixture.db, &fixture.owner,
@@ -323,7 +323,7 @@ async fn parallel_needs_human_results_replan_a_stale_sibling_and_approve_both() 
         &started.instance_id).unwrap();
     let fresh_job = fresh.jobs.iter().find(|job| job.job_id == claim_zero.job.job_id).unwrap();
     assert_eq!(fresh_job.status, "running");
-    let fresh_plan = runtime::plan_job_result(&fresh, fresh_job, &observed_zero, at, None).unwrap();
+    let fresh_plan = runtime::plan_job_result(&fresh, fresh_job, &observed_zero, false, at, None).unwrap();
     assert_eq!(fresh_plan.status, ProcessInstanceStatus::Waiting);
     repository::accept_job_result(&fixture.db, &fixture.owner,
         &claim_zero.job.job_id, claim_zero.job.attempt, claim_zero.job.fence, worker_zero,

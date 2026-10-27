@@ -376,7 +376,7 @@ async fn observed_service_result_survives_joined_script_infrastructure_failure_w
     let observed: repository::ObservedActivityResult =
         serde_json::from_str(&observed_json).unwrap();
     let mut forged = runtime::plan_job_result(&recovered_snapshot, recovered_job,
-        &observed, chrono::Utc::now().timestamp_millis(), None).unwrap();
+        &observed, false, chrono::Utc::now().timestamp_millis(), None).unwrap();
     let forged_token = Uuid::new_v4().to_string();
     forged.recovered_service_incidents[0].source_token_id = forged_token.clone();
     let resolved = forged.events.iter_mut()
@@ -479,7 +479,7 @@ async fn cancelling_recoverable_script_failure_closes_only_its_original_observed
             serde_json::from_str(&invocation.1).unwrap();
         let original_plan = runtime::plan_job_result(&snapshot,
             snapshot.jobs.iter().find(|job| job.job_id == claimed.job.job_id).unwrap(),
-            &observed, chrono::Utc::now().timestamp_millis(), None).unwrap();
+            &observed, false, chrono::Utc::now().timestamp_millis(), None).unwrap();
         let before = super::signal_proof_tests::all_transition_rows(&fixture);
         if interrupting_boundary {
             let timer = snapshot.timers.iter().find(|timer|

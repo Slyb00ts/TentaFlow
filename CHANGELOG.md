@@ -502,8 +502,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   zmienne, werdykt: blok „Wynik aktywności”) albo do drugiego agenta (przebieg pod
   własnym identyfikatorem, wiązanie `role = verification`, tylko narzędzia do
   odczytu plus ujście `core.task_complete`, kryteria i wynik pracy jako ogrodzone
-  DANE). Zatwierdzenie zostawia `Completed` i dopisuje `verified:test:<przepływ>` /
-  `verified:critic:<agent>`; odrzucenie zamienia wynik w `Error` albo `NeedsHuman`
+  DANE). Zatwierdzenie zostawia `Completed` i dopisuje
+  `tentaflow.verification:approved:test:<przepływ>` /
+  `tentaflow.verification:approved:critic:<agent>`; odrzucenie zamienia wynik w `Error` albo `NeedsHuman`
   `VERIFICATION_FAILED` z pochodzeniem `Contract` i oryginalnymi wyjściami, więc
   łapie je zdarzenie brzegowe (eskalację można założyć także na kroku bez reguły
   wyniku). Weryfikator, który nie wydał werdyktu (błąd przepływu, krytyk bez
@@ -521,22 +522,38 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   weryfikatorze, `dropped_evidence` tylko dla 64. wpisu), więc odrzucenie dużego
   wyniku mieści się w obserwacji; werdykt, którego obserwacja się nie mieści,
   zapisuje się jako `VERIFICATION_UNAVAILABLE`, a wynik bez miejsca nawet na taki
-  zapis kończy się incydentem `OUTPUT_LIMIT` przed uruchomieniem weryfikatora.
+  zapis idzie do człowieka bez uruchamiania weryfikatora (`OUTPUT_LIMIT` tylko,
+  gdy nie mieści się sama praca).
   Po wykonaniu pracy odmowa weryfikatora (wyłączony agent, flow poza ACL, błąd
   odczytu, wycofanie w trakcie oceny) oddaje pracę człowiekowi jako
   `VERIFICATION_UNAVAILABLE` zamiast `SOURCE_ACCESS_REVOKED`; tylko utrata dostępu
-  do źródła pracy blokuje krok, a przyjęcie sprawdza ponownie dostęp do
-  weryfikatora (przypięty weryfikator nie wstrzymuje już przejść całej instancji,
-  tylko krok, który z niego korzysta). Zgłoszenie agenta przyjęte po restarcie przy trybie Test albo
+  do źródła pracy blokuje krok (przypięty weryfikator nie wstrzymuje już przejść
+  całej instancji, tylko krok, który z niego korzysta). Zgłoszenie agenta przyjęte po restarcie przy trybie Test albo
   Krytyk jest zapisywane jako niezweryfikowane (`VERIFICATION_UNAVAILABLE`), nie
   jako zwykłe `Completed`. Krok z krytykiem zajmuje slot klasy agentów
   (migracja 205, kolumna `critic_verified`, zapytanie claim). Krytyk dostaje
   przecięcie narzędzi do odczytu z `allowed_tools` kroku agenta, a jego przepływ
   harnessu nie może zawierać bloków ze skutkami (publikacja i uruchomienie).
-  Wynik pracy nie może udawać werdyktu (kody `VERIFICATION_*`, dowody
-  `verified:` / `verification_rejected:` / `verification_unavailable:`), a przepływ
+  Wynik pracy kroku z Testem albo Krytykiem nie może udawać werdyktu (kody
+  `VERIFICATION_*`, dowody w przestrzeni `tentaflow.verification:`), a przepływ
   nie może być własnym testem. Tekst podpowiedzi o skutku odrzucenia opisuje
   restart zgodnie z zachowaniem w pięciu językach.
+- Druga runda poprawek przeglądu B3.5. Zatwierdzenie, którego weryfikator został
+  wycofany między werdyktem a przyjęciem, nie blokuje już przyjęcia (dawało
+  nierozwiązywalny incydent `SOURCE_ACCESS_REVOKED` nad skończoną pracą): planner
+  traktuje je jak wynik bez dowodu i oddaje pracę człowiekowi; odrzucenie i
+  niedostępna weryfikacja przechodzą tak, jak zapisano. Harness krytyka ma listę
+  dozwolonych bloków (zamiast listy zabronionych) i sprawdzanie schodzi w ciała
+  `loop`, `map` i `subflow` (do 4 przepływów w głąb), więc `loop` z ciałem
+  zawierającym `exec_command` nie omija kontroli; kontrola działa też przed pracą,
+  nie tylko po niej. Zastrzeżone kody i dowody werdyktu obowiązują tylko kroki z
+  Testem albo Krytykiem (pozostałe kroki mogą ich używać jako zwykłego tekstu), nie
+  dotyczą wyniku samego przepływu testowego, a znaczniki mają przestrzeń nazw
+  `tentaflow.verification:{approved|rejected|unavailable}:<tryb>:<odwołanie>`.
+  Wynik pracy bez miejsca na werdykt trafia do człowieka bez uruchamiania
+  weryfikatora zamiast zamieniać się w `OUTPUT_LIMIT`. Migracja 205 uzupełnia
+  `critic_verified` dla istniejących wywołań z przypiętych migawek, a adopcja
+  zgłoszenia agenta używa werdyktu krytyka, jeśli ten zdążył go zapisać.
 
 ### TentaNas
 

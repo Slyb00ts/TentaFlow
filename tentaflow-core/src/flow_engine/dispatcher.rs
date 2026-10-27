@@ -960,7 +960,38 @@ impl FlowDispatcher {
         org_id: &str,
     ) -> std::result::Result<crate::db::models::DbAgent, crate::processes::agent_pin::AgentPinError>
     {
-        use crate::processes::agent_pin::{runnable_agent, AgentPinError};
+        self.authorize_process_agent_with(user_id, org_id, |conn| {
+            crate::processes::agent_pin::runnable_agent(conn, agent_id)
+        })
+    }
+
+    /// [`authorize_process_agent`] for the critic of a step: the agent must also
+    /// be one whose harness can run a critic.
+    pub fn authorize_process_critic(
+        &self,
+        agent_id: &str,
+        user_id: &str,
+        org_id: &str,
+    ) -> std::result::Result<crate::db::models::DbAgent, crate::processes::agent_pin::AgentPinError>
+    {
+        self.authorize_process_agent_with(user_id, org_id, |conn| {
+            crate::processes::agent_pin::runnable_critic(conn, agent_id)
+        })
+    }
+
+    fn authorize_process_agent_with(
+        &self,
+        user_id: &str,
+        org_id: &str,
+        runnable: impl FnOnce(
+            &rusqlite::Connection,
+        ) -> std::result::Result<
+            crate::db::models::DbAgent,
+            crate::processes::agent_pin::AgentPinError,
+        >,
+    ) -> std::result::Result<crate::db::models::DbAgent, crate::processes::agent_pin::AgentPinError>
+    {
+        use crate::processes::agent_pin::AgentPinError;
         use crate::processes::tool_host::ToolAccessError;
         self.check_process_initiator(user_id, org_id)
             .map_err(|error| match error {
@@ -968,7 +999,7 @@ impl FlowDispatcher {
                 _ => AgentPinError::Initiator,
             })?;
         let conn = self.db.read().map_err(|_| AgentPinError::Unavailable)?;
-        runnable_agent(&conn, agent_id)
+        runnable(&conn)
     }
 
     /// Process counterpart of [`authorize_process_flow`] for an addon tool: the

@@ -7191,6 +7191,7 @@ pub fn plan_job_result(
     snapshot: &RuntimeSnapshot,
     job: &ProcessJob,
     observed: &super::repository::ObservedActivityResult,
+    approval_withdrawn: bool,
     now_ms: i64,
     signal_admission: Option<&SignalAdmissionResolver<'_>>,
 ) -> Result<RuntimePlan> {
@@ -7263,11 +7264,12 @@ pub fn plan_job_result(
     };
     // A machine verification approves only through the proof the job recorded
     // with its result; a completed result without it (a report adopted after a
-    // restart) goes to a person instead.
+    // restart), or whose approving verifier was withdrawn since, goes to a
+    // person instead.
     let unverified = result.outcome == ActivityOutcome::Completed
-        && verification
-            .automatic()
-            .is_some_and(|(kind, reference, _)| !observed.approved_by(kind, reference));
+        && verification.automatic().is_some_and(|(kind, reference, _)| {
+            approval_withdrawn || !observed.approved_by(kind, reference)
+        });
     transition.plan.complete_job_ids.push(job.job_id.clone());
     transition
         .jobs
@@ -8703,7 +8705,7 @@ pub(crate) mod test_support {
             && job.fence == claim.job.fence
             && job.observed_result_event_id.is_some(),
             "observed Service job lost its original fence or result event");
-        super::plan_job_result(&snapshot, job, observed, at_ms, None)
+        super::plan_job_result(&snapshot, job, observed, false, at_ms, None)
     }
 
     pub fn actor(pool: &DbPool, name: &str) -> super::super::repository::ProcessActor {
@@ -12550,6 +12552,7 @@ mod tests {
             &observed_snapshot,
             observed_job,
             &observed,
+            false,
             chrono::Utc::now().timestamp_millis(),
         None)
         .unwrap();

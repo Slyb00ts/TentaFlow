@@ -127,7 +127,7 @@ async fn a_result_the_engine_cannot_plan_raises_an_incident() {
     let snapshot = group.snapshot();
     let job = snapshot.jobs.iter().find(|job| job.job_id == member.claim.job.job_id).unwrap();
     let error = super::super::runtime::plan_job_result(&snapshot, job, &member.observed,
-        chrono::Utc::now().timestamp_millis(), None).unwrap_err();
+        false, chrono::Utc::now().timestamp_millis(), None).unwrap_err();
     assert!(!repository::is_result_refusal(&error), "the planner's own error is not typed");
 
     let polls = AtomicUsize::new(0);

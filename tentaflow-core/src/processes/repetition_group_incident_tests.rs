@@ -96,7 +96,7 @@ impl ParallelGroup {
         let member = &self.members[ordinal];
         let job = snapshot.jobs.iter().find(|job| job.job_id == member.claim.job.job_id).unwrap();
         let at = chrono::Utc::now().timestamp_millis();
-        let plan = runtime::plan_job_result(&snapshot, job, &member.observed, at, None)?;
+        let plan = runtime::plan_job_result(&snapshot, job, &member.observed, false, at, None)?;
         repository::accept_job_result(&self.fixture.db, &self.fixture.owner,
             &member.claim.job.job_id, member.claim.job.attempt, member.claim.job.fence,
             &member.worker, &member.observed, snapshot.instance.revision,
@@ -115,7 +115,7 @@ impl ParallelGroup {
         *pinned = verification;
         let member = &self.members[ordinal];
         let job = snapshot.jobs.iter().find(|job| job.job_id == member.claim.job.job_id).unwrap();
-        runtime::plan_job_result(&snapshot, job, &member.observed, at, None).unwrap()
+        runtime::plan_job_result(&snapshot, job, &member.observed, false, at, None).unwrap()
     }
 
     pub(super) fn accept_plan(
@@ -610,7 +610,7 @@ async fn a_capacity_closed_group_is_not_parked_again_by_an_envelope_result() {
     let mut observed = group.members[0].observed.clone();
     observed.origin = repository::ActivityResultOrigin::Envelope;
     let error = runtime::plan_job_result(&snapshot, job, &observed,
-        chrono::Utc::now().timestamp_millis(), None).unwrap_err();
+        false, chrono::Utc::now().timestamp_millis(), None).unwrap_err();
     assert!(format!("{error:#}").contains("capacity-closed"), "{error:#}");
 }
 

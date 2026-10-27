@@ -26,8 +26,8 @@ use super::agent_exec::{run_verifier_agent, VerifierAgent};
 use super::agent_pin::AgentPinError;
 use super::agent_sink::verification_run_id;
 use super::jobs::{
-    drive_dispatch, fail_claim, finish_observed, now_ms, output_limit_result, AccessCheck,
-    Authorize, ExecutionEnd, ServiceJob,
+    drive_dispatch, fail_claim, finish_observed, now_ms, output_limit_result,
+    refuse_verdict_imitation, AccessCheck, Authorize, ExecutionEnd, ServiceJob,
 };
 use super::repository::{
     self, ActivityResultOrigin, ObservedActivityResult, PinnedServiceRole, PinnedServiceSnapshot,
@@ -52,13 +52,12 @@ const MAX_EVIDENCE: usize = 64;
 pub(super) const BUDGET_REASON: &str =
     "the verdict does not fit the size an observed result may have";
 /// Reason of a work result recorded without its verifier having judged it.
-const INTERRUPTED_REASON: &str = "the verification was interrupted before it gave a verdict";
-/// Prefixes only a verdict writes into the evidence of a result.
-const VERDICT_EVIDENCE_PREFIXES: [&str; 3] = [
-    "verified:",
-    "verification_rejected:",
-    "verification_unavailable:",
-];
+const INTERRUPTED_REASON: &str =
+    "the verification was not started, or was interrupted before it gave a verdict";
+/// Namespace of the evidence only a verdict writes into a result. It cannot be
+/// met in business text by accident, which is what lets a step with a machine
+/// verification refuse a work result that carries it.
+const VERDICT_EVIDENCE_PREFIX: &str = "tentaflow.verification:";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -116,12 +115,16 @@ impl VerificationRecord {
 
     /// The evidence entry the final result ends with.
     fn marker(&self) -> String {
-        let tag = format!("{}:{}", self.kind.as_str(), self.reference);
-        match self.verdict {
-            VerificationVerdict::Approved => format!("verified:{tag}"),
-            VerificationVerdict::Rejected => format!("verification_rejected:{tag}"),
-            VerificationVerdict::Unavailable => format!("verification_unavailable:{tag}"),
-        }
+        let verdict = match self.verdict {
+            VerificationVerdict::Approved => "approved",
+            VerificationVerdict::Rejected => "rejected",
+            VerificationVerdict::Unavailable => "unavailable",
+        };
+        format!(
+            "{VERDICT_EVIDENCE_PREFIX}{verdict}:{}:{}",
+            self.kind.as_str(),
+            self.reference
+        )
     }
 
     /// The work result this record was made for, given the final result.
@@ -195,7 +198,9 @@ impl VerificationRecord {
 
 /// Refuses a work result that reads like a verdict: the codes and evidence a
 /// result carries only when a verifier decided, so a work cannot pass for one
-/// that was judged, or for a rejection.
+/// that was judged, or for a rejection. Only a step with a test or critic needs
+/// this (the caller decides); for any other step these are ordinary business
+/// text, and the verdict of a verification flow is not a work result.
 pub fn reject_verdict_imitation(result: &ActivityResult) -> Result<()> {
     anyhow::ensure!(
         !matches!(
@@ -205,9 +210,10 @@ pub fn reject_verdict_imitation(result: &ActivityResult) -> Result<()> {
         "a work result cannot carry a verification code"
     );
     anyhow::ensure!(
-        !result.evidence.iter().any(|entry| VERDICT_EVIDENCE_PREFIXES
+        !result
+            .evidence
             .iter()
-            .any(|prefix| entry.starts_with(prefix))),
+            .any(|entry| entry.starts_with(VERDICT_EVIDENCE_PREFIX)),
         "a work result cannot carry verification evidence"
     );
     Ok(())
@@ -401,12 +407,16 @@ pub(super) fn validate_record_on(
 
 /// A completed work result recorded without its verifier having judged it (the
 /// worker was gone before the verdict): the result of an unavailable
-/// verification, which is never an approval. A result that is not completed, a
-/// step that asks for no machine verification, or a result with no room for the
-/// record stays as it is, and the planner gives a completed one to a person.
+/// verification, which is never an approval. A critic that did write its verdict
+/// before the worker was gone (`critic_verdict`) is the exception: that verdict
+/// is the one the critic gave, so it is recorded as such. A result that is not
+/// completed, a step that asks for no machine verification, or a result with no
+/// room for the record stays as it is, and the planner gives a completed one to
+/// a person.
 pub(super) fn interrupted(
     verification: &ActivityVerification,
     work: ObservedActivityResult,
+    critic_verdict: Option<&ActivityResult>,
 ) -> ObservedActivityResult {
     let Some((kind, reference, on_failure)) = verification.automatic() else {
         return work;
@@ -414,36 +424,45 @@ pub(super) fn interrupted(
     if work.result.outcome != ActivityOutcome::Completed {
         return work;
     }
-    let record = VerificationRecord::new(
-        kind,
-        reference,
-        VerificationVerdict::Unavailable,
-        INTERRUPTED_REASON,
-        &work,
-    );
-    let observed = verified(work.clone(), record, on_failure);
-    if fits_budget(&observed) {
-        observed
-    } else {
-        work
+    let recorded = critic_verdict.filter(|_| kind == VerificationKind::Critic);
+    let (verdict, reason) = match recorded.map(|verdict| (&verdict.outcome, &verdict.summary)) {
+        Some((ActivityOutcome::Completed, summary)) => {
+            (VerificationVerdict::Approved, summary.as_str())
+        }
+        Some((ActivityOutcome::Error, summary)) => {
+            (VerificationVerdict::Rejected, summary.as_str())
+        }
+        _ => (VerificationVerdict::Unavailable, INTERRUPTED_REASON),
+    };
+    for (verdict, reason) in [
+        (verdict, reason),
+        (VerificationVerdict::Unavailable, BUDGET_REASON),
+    ] {
+        let record = VerificationRecord::new(kind, reference, verdict, reason, &work);
+        let observed = verified(work.clone(), record, on_failure);
+        if fits_budget(&observed) {
+            return observed;
+        }
     }
+    work
 }
 
-/// A recorded verdict stands only while the initiator may still use the verifier
-/// that gave it: a verifier withdrawn between the verdict and its acceptance is a
-/// denial like a withdrawn source. A failed read is not one (the result stays
-/// recorded and is accepted later), and an unavailable verification relied on
-/// nobody.
-pub(super) fn require_verifier_current(
+/// Whether the verdict an observation relies on is one nobody may rely on any
+/// more: an approval whose verifier was withdrawn from the initiator between the
+/// verdict and its acceptance. The result stays as recorded (it cannot be
+/// rewritten) and the planner gives it to a person like any approval nobody
+/// proved. A rejection or an unavailable verification approves nothing, so they
+/// stand; a failed read is not a denial and is reported as the failure it is.
+pub(super) fn approval_withdrawn(
     conn: &rusqlite::Connection,
     actor: &repository::ProcessActor,
     observed: &ObservedActivityResult,
-) -> Result<()> {
+) -> Result<bool> {
     let Some(record) = &observed.verification else {
-        return Ok(());
+        return Ok(false);
     };
-    if record.verdict == VerificationVerdict::Unavailable {
-        return Ok(());
+    if record.verdict != VerificationVerdict::Approved {
+        return Ok(false);
     }
     let source_ref = match record.kind {
         VerificationKind::Test => record.reference.clone(),
@@ -451,7 +470,11 @@ pub(super) fn require_verifier_current(
             tentaflow_protocol::processes::agent_source_ref(&record.reference)
         }
     };
-    repository::require_source_current(conn, actor, &source_ref, None)
+    match repository::require_source_current(conn, actor, &source_ref, None) {
+        Ok(()) => Ok(false),
+        Err(error) if repository::is_authority_denied(&error) => Ok(true),
+        Err(error) => Err(error),
+    }
 }
 
 /// What the verification stage needs, resolved from the model and the pins.
@@ -528,7 +551,7 @@ impl Stage<'_> {
             VerificationKind::Critic => {
                 match job
                     .dispatcher
-                    .authorize_process_agent(self.reference, user_id, org_id)
+                    .authorize_process_critic(self.reference, user_id, org_id)
                 {
                     Ok(_) => Ok(()),
                     Err(AgentPinError::Unavailable) => Err(Refusal::Unknown),
@@ -650,6 +673,7 @@ pub(super) async fn finish_verified(
     authorize: Authorize<'_>,
     work: ObservedActivityResult,
 ) -> Result<()> {
+    let work = refuse_verdict_imitation(job.verification, work);
     if work.result.outcome != ActivityOutcome::Completed {
         return finish_observed(job, authorize, work);
     }
@@ -658,15 +682,20 @@ pub(super) async fn finish_verified(
     };
     // Checked before the verifier is started: a work that leaves no room for
     // even the smallest verdict cannot be recorded with one, and a critic's
-    // time would be spent on a verdict nobody can keep.
+    // time would be spent on a verdict nobody can keep. The work has run, so it
+    // is recorded as it is (unverified, in the hands of a person) unless it does
+    // not fit either.
     if !fits_budget(&stage.observation(&work, VerificationVerdict::Unavailable, BUDGET_REASON)) {
-        return finish_observed(
-            job,
-            authorize,
-            output_limit_result(anyhow::anyhow!(
-                "the work result leaves no room for a verification verdict"
-            )),
-        );
+        if !fits_budget(&work) {
+            return finish_observed(
+                job,
+                authorize,
+                output_limit_result(anyhow::anyhow!(
+                    "the work result exceeds the size an observed result may have"
+                )),
+            );
+        }
+        return finish_observed(job, authorize, work);
     }
     let salvage_result = stage.verdict(&work, VerificationVerdict::Unavailable, INTERRUPTED_REASON);
     // An abandoned verification (cancellation, timeout, lost lease) still ends

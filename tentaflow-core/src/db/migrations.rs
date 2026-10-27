@@ -1320,7 +1320,10 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
 /// an agent step does, and the claim query has to tell the two classes apart from
 /// the row itself: the verifier of a step is not part of the invocation identity.
 /// A plain column with a CHECK, so no rebuild is needed; it is as immutable as
-/// the other identity columns of the invocation.
+/// the other identity columns of the invocation. Invocations that exist already
+/// are marked from the pins of the version they run (a node with a pinned agent
+/// in the verification role has a critic), so a queued one is claimed into the
+/// slot class its executor will take.
 fn bpmn_service_invocation_critic_verified(conn: &Connection) -> Result<()> {
     use anyhow::{ensure, Context};
 
@@ -1341,11 +1344,21 @@ fn bpmn_service_invocation_critic_verified(conn: &Connection) -> Result<()> {
         ANCHOR,
         &format!("{ANCHOR}\n        NEW.critic_verified IS NOT OLD.critic_verified OR"),
     );
+    // The mark is written while the trigger is gone: it also guards the phase
+    // machine, which a backfill that changes no phase would otherwise violate.
     conn.execute_batch(&format!(
         "ALTER TABLE bpmn_service_invocations
              ADD COLUMN critic_verified INTEGER NOT NULL DEFAULT 0
              CHECK (critic_verified IN (0,1));
          DROP TRIGGER {TRIGGER};
+         UPDATE bpmn_service_invocations SET critic_verified=1
+             WHERE EXISTS (
+                 SELECT 1 FROM bpmn_versions v, json_each(v.service_snapshots_json) pin
+                 WHERE v.definition_id=bpmn_service_invocations.definition_id
+                   AND v.version=bpmn_service_invocations.version
+                   AND json_extract(pin.value,'$.info.node_id')=bpmn_service_invocations.node_id
+                   AND json_extract(pin.value,'$.role')='verification'
+                   AND json_extract(pin.value,'$.implementation_kind')='agent');
          {widened};"
     ))?;
     Ok(())
@@ -17309,6 +17322,50 @@ mod tests {
             [],
         )
         .expect_err("the mark is a flag");
+    }
+
+    /// v205 marks the invocations that exist already from the pins of their
+    /// version: only a node with an agent pinned in the verification role has a
+    /// critic (a test verifier is a flow, an agent step's own pin is the work).
+    #[test]
+    fn migration_205_marks_existing_invocations_of_a_step_with_a_critic_pin() {
+        let pin = |role: Option<&str>, kind: &str| {
+            let mut pin = serde_json::json!({
+                "info": {"node_id": "Service", "flow_id": "f", "source_version": 1,
+                    "graph_sha256": "a".repeat(64)},
+                "graph_json": "{}",
+            });
+            if let Some(role) = role {
+                pin["role"] = role.into();
+            }
+            if kind != "flow" {
+                pin["implementation_kind"] = kind.into();
+            }
+            pin
+        };
+        for (pins, expected, why) in [
+            (vec![pin(None, "flow"), pin(Some("verification"), "agent")], 1, "a critic"),
+            (vec![pin(None, "flow"), pin(Some("verification"), "flow")], 0, "a test flow"),
+            (vec![pin(None, "agent")], 0, "an agent doing the work"),
+            (vec![], 0, "no pins at all"),
+        ] {
+            let conn = agent_invocation_fixture();
+            conn.execute(
+                "UPDATE bpmn_versions SET service_snapshots_json=?1 WHERE definition_id='selected-definition'",
+                [serde_json::to_string(&pins).unwrap()],
+            )
+            .unwrap();
+            insert_invocation(&conn, "inv-old", "flow-1", "flow").unwrap();
+            run(&conn).unwrap();
+            let marked: i64 = conn
+                .query_row(
+                    "SELECT critic_verified FROM bpmn_service_invocations WHERE invocation_id='inv-old'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(marked, expected, "{why}");
+        }
     }
 
     /// v204 sink table of the critic's verdict: independent of the work report of

@@ -296,8 +296,9 @@ pub struct ObservedActivityResult {
     pub origin: ActivityResultOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expression_observation: Option<ExpressionObservation>,
-    /// Present exactly when a test or critic judged the work result: `result` is
-    /// then the result after that verdict, and the record keeps what the work was.
+    /// Present when the verification of a step with a test or critic ended in a
+    /// verdict (approved or rejected) or in none (unavailable): `result` is then
+    /// the result after that outcome, and the record keeps what the work was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<super::verification::VerificationRecord>,
 }
@@ -26445,6 +26446,7 @@ fn agent_step_of_invocation_on(
         implementation: tentaflow_protocol::processes::ServiceImplementation::Agent {
             agent_id, allowed_tools, max_iterations, output_schema, ..
         },
+        verification,
         ..
     } = &node.kind
     else {
@@ -26463,6 +26465,7 @@ fn agent_step_of_invocation_on(
         },
         max_iterations: *max_iterations,
         pinned_agent: agent_id.clone(),
+        machine_verified: verification.automatic().is_some(),
     }))
 }
 
@@ -26500,6 +26503,7 @@ fn critic_step_of_invocation_on(
         },
         max_iterations: super::agent_sink::CRITIC_MAX_ITERATIONS,
         pinned_agent: agent_id.clone(),
+        machine_verified: false,
     }))
 }
 
@@ -26709,7 +26713,7 @@ fn validate_job_result_plan_on(
         tentaflow_protocol::processes::ServiceImplementation::Agent { .. }
     );
     super::verification::validate_record_on(tx, job_id, observed, verification)?;
-    if observed.verification.is_none() {
+    if observed.verification.is_none() && verification.automatic().is_some() {
         super::verification::reject_verdict_imitation(&observed.result)?;
     }
     // A verdict can make the result a Contract one whatever the work was; the
@@ -27373,6 +27377,10 @@ pub fn accept_job_result(
         "SELECT EXISTS(SELECT 1 FROM bpmn_incidents WHERE job_id=?1 AND resolved_at_ms IS NULL AND code IN ('TOOL_RESULT_UNDECIDED','RESULT_RECOVERY_FAILED'))",
         [job_id], |row| row.get(0))?;
     ensure!(!still_open, "a recovery incident stayed open across Service acceptance");
+    // The verifier of an approval may have been withdrawn since the verdict. The
+    // work is finished and the observation cannot be rewritten, so the approval
+    // is not relied on: the planner hands the result to a person.
+    let approval_withdrawn = super::verification::approval_withdrawn(&tx, actor, observed)?;
     let (mut composite, retained_failure, result_index) = if let Some(prepared) = precomposed {
         prepared
     } else {
@@ -27383,8 +27391,8 @@ pub fn accept_job_result(
             accepted: Option<&AcceptedInputRef>| {
             signal_admission_on(&tx, actor, &instance_id, prefix, signal, accepted)
         };
-        let planned = super::runtime::plan_job_result(&snapshot, job, observed, at_ms,
-            Some(&resolve)).map_err(refuse_result)?;
+        let planned = super::runtime::plan_job_result(&snapshot, job, observed,
+            approval_withdrawn, at_ms, Some(&resolve)).map_err(refuse_result)?;
         prepare_service_result_plan(&planned, observed, job_id, attempt, fence,
             selected_escalation, repeated_source, &reserved_result_event_id)
             .map_err(refuse_result)?
@@ -27405,7 +27413,6 @@ pub fn accept_job_result(
     require_call_control_authority_on(&tx, actor, &instance_id)?;
     let flow_id = job_source_ref_on(&tx, job_id)?;
     require_source_current(&tx, actor, &flow_id, None)?;
-    super::verification::require_verifier_current(&tx, actor, observed)?;
     ensure!(
         composite.complete_job_ids.iter().any(|id| id == job_id),
         "result plan does not consume service job"
@@ -28192,9 +28199,10 @@ pub(super) fn record_observed_script_infrastructure_failure(
 }
 
 /// An agent report adopted after the step was abandoned never reached the test
-/// or critic its node asks for. It is recorded as work whose verification was
-/// interrupted, so the person who gets it reads that the result was not checked
-/// instead of a plain completed result.
+/// or critic its node asks for, unless the critic had already written its
+/// verdict. It is recorded as work whose verification was not completed, so the
+/// person who gets it reads that the result was not checked instead of a plain
+/// completed result.
 fn unproven_report_on(
     conn: &Connection,
     invocation_id: &str,
@@ -28206,7 +28214,11 @@ fn unproven_report_on(
     let ProcessNodeKind::ServiceTask { verification, .. } = &node.kind else {
         return Ok(report);
     };
-    Ok(super::verification::interrupted(verification, report))
+    // A critic that wrote its verdict before the worker was gone did judge this
+    // work: its row, which the acceptance holds the record to, is the verdict. A
+    // row that cannot be read is no verdict, which is the safe reading.
+    let verdict = super::agent_sink::recorded_verdict(conn, invocation_id).ok().flatten();
+    Ok(super::verification::interrupted(verification, report, verdict.as_ref()))
 }
 
 /// Records an agent's stored report as the observed result of its step.
