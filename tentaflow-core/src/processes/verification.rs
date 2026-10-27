@@ -681,14 +681,14 @@ pub(super) fn verifier_ready(job: &ServiceJob<'_>) -> Result<bool> {
     };
     match stage.access(job) {
         AccessCheck::Revoked(denial) => {
-            fail_claim(
-                pool,
-                worker_id,
-                claimed,
-                "SOURCE_ACCESS_REVOKED",
-                denial,
-                None,
-            )?;
+            // A critic is refused for what it is (disabled, a CLI engine, a harness
+            // with blocks that may act), which is a configuration fault, not a
+            // revocation of the initiator's access.
+            let code = match stage.kind {
+                VerificationKind::Test => "SOURCE_ACCESS_REVOKED",
+                VerificationKind::Critic => "VERIFICATION_AGENT_REFUSED",
+            };
+            fail_claim(pool, worker_id, claimed, code, denial, None)?;
             Ok(false)
         }
         AccessCheck::Undecided => {

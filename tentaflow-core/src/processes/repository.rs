@@ -6058,6 +6058,16 @@ pub fn runtime_snapshot(
     })
 }
 
+/// Whether the approval an observation carries has been withdrawn since the
+/// verdict, as the acceptance will judge it.
+pub fn observation_approval_withdrawn(
+    pool: &DbPool,
+    actor: &ProcessActor,
+    observed: &ObservedActivityResult,
+) -> Result<bool> {
+    read_snapshot(pool, |conn| super::verification::approval_withdrawn(conn, actor, observed))
+}
+
 fn repetition_groups_on(conn: &Connection, instance_id: &str) -> Result<Vec<RepetitionGroup>> {
     let mut statement = conn.prepare("SELECT group_id,instance_id,scope_id,definition_id,version,node_id,mode,status,source_token_id,parent_token_id,entry_source_event_id,output_collection_variable,entry_variables_json,frozen_collection_json,total_count,created_count,completed_count,max_iterations,loop_state_json,loop_state_revision,next_ordinal,retained_bytes,terminal_capacity,terminal_incident_id,terminal_event_id,revision,created_at_ms,updated_at_ms FROM bpmn_repetition_groups WHERE instance_id=?1 ORDER BY created_at_ms,group_id")?;
     let mut rows = statement.query([instance_id])?;
@@ -26640,6 +26650,7 @@ fn validate_job_result_plan_on(
     job_id: &str,
     acceptance_owner_id: &str,
     observed: &ObservedActivityResult,
+    approval_withdrawn: bool,
     plan: &RuntimePlan,
 ) -> Result<()> {
     let model = current_version_model_on(tx, &instance.definition_id, instance.version)?;
@@ -26744,6 +26755,26 @@ fn validate_job_result_plan_on(
     super::verification::validate_record_on(tx, job_id, observed, verification)?;
     if observed.verification.is_none() && verification.automatic().is_some() {
         super::verification::reject_verdict_imitation(&observed.result)?;
+    }
+    // The decision the planner takes is not the plan's to omit: a completed
+    // result nobody proved goes to a person whatever events a supplied plan
+    // chose to carry. A proved one may fail to map and so need not carry its
+    // event, but an unproved one may never carry it.
+    if let Some((kind, reference, _)) = verification.automatic().filter(|_|
+        observed.result.outcome == tentaflow_protocol::processes::ActivityOutcome::Completed)
+    {
+        let unverified = approval_withdrawn || !observed.approved_by(kind, reference);
+        let passed = plan.events.iter().filter(|event| event.kind == "verification_passed").count();
+        let tasks = plan.create_user_tasks.iter().filter(|task|
+            task.kind == ProcessUserTaskKind::Verification
+                && task.token_id.as_deref() == Some(token_id.as_str())).count();
+        if unverified {
+            ensure!(passed == 0 && tasks == 1,
+                "an unproved machine verification must go to a person, not pass");
+        } else {
+            ensure!(passed <= 1 && tasks == 0,
+                "a proved machine verification must not also wait for a person");
+        }
     }
     // A verdict can make the result a Contract one whatever the work was; the
     // contract of the work itself is held to the result the work gave.
@@ -27447,7 +27478,7 @@ pub fn accept_job_result(
         "result plan does not consume service job"
     );
     validate_job_result_plan_on(&tx, &instance, &node_id, job_id, worker_id, observed,
-        &composite).map_err(refuse_result)?;
+        approval_withdrawn, &composite).map_err(refuse_result)?;
     if retained_failure {
         ensure!(composite.call_steps.is_empty()
             && composite.termination_attempts.is_empty(),

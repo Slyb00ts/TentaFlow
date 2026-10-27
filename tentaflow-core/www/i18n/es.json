@@ -14750,7 +14750,7 @@
     "verification_critic_agent": "Agente crítico",
     "verification_critic_choose": "Elige un agente",
     "verification_criteria": "Criterios",
-    "verification_critic_hint": "El crítico debe ser otro agente distinto del que hace el trabajo. Ve los criterios y el resultado como datos, solo usa herramientas de lectura y aprueba o rechaza el resultado con un motivo. Es una segunda opinión de un modelo, no una prueba.",
+    "verification_critic_hint": "El crítico debe ser otro agente distinto del que hace el trabajo. Ve los criterios y el resultado como datos, solo usa herramientas de lectura y aprueba o rechaza el resultado con un motivo. Es una segunda opinión de un modelo, no una prueba. El flujo de arnés del crítico solo puede contener los bloques del arnés estándar y transformaciones de texto puras; los bloques loop, map, subflow y de addons se rechazan.",
     "verification_on_failure": "Cuando la comprobación rechaza el resultado",
     "verification_on_failure_error": "Error que el proceso puede gestionar",
     "verification_on_failure_human": "Enviar a una persona",

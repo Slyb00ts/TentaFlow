@@ -566,6 +566,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   ani `subflow` (silnik nie przypina ciał, więc sprawdzenie ciała nie mogłoby
   obowiązywać). Odrzucenie od wycofanego weryfikatora stoi tak samo w trakcie
   wykonania i przy przyjęciu; tylko zatwierdzenie trafia wtedy do człowieka.
+- Czwarta runda poprawek przeglądu B3.5. Walidator przyjęcia wyniku sam wylicza
+  decyzję planera dla ukończonego wyniku z Testem albo Krytykiem: wynik, któremu
+  nikt nie dowiódł zatwierdzenia (albo którego weryfikator wycofano), musi mieć
+  dokładnie jedno zadanie weryfikacji na tokenie zadania i nie może mieć
+  `verification_passed`, więc plan dostarczony nie obejdzie człowieka, pomijając
+  zdarzenie. Próbny plan wykonawcy widzi wycofanie zatwierdzenia tak jak przyjęcie
+  (zatwierdzenie wycofane między sprawdzeniem etapu a przyjęciem trafia do
+  człowieka zamiast do incydentu `TRANSITION_ERROR`). Odmowa krytyka przed pracą
+  ma własny kod `VERIFICATION_AGENT_REFUSED` (nie `SOURCE_ACCESS_REVOKED`), a
+  komunikat dla `loop`, `map` i `subflow` mówi, że ich ciało nie jest przypięte;
+  podpowiedź krytyka w pięciu językach opisuje ograniczenia harnessu.
 
 ### TentaNas
 

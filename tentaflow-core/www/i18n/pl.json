@@ -15888,7 +15888,7 @@
     "verification_critic_agent": "Agent krytyk",
     "verification_critic_choose": "Wybierz agenta",
     "verification_criteria": "Kryteria",
-    "verification_critic_hint": "Krytyk musi być innym agentem niż ten, który wykonuje pracę. Widzi kryteria i wynik jako dane, używa wyłącznie narzędzi tylko do odczytu i zatwierdza albo odrzuca wynik z uzasadnieniem. To druga opinia modelu, nie dowód.",
+    "verification_critic_hint": "Krytyk musi być innym agentem niż ten, który wykonuje pracę. Widzi kryteria i wynik jako dane, używa wyłącznie narzędzi tylko do odczytu i zatwierdza albo odrzuca wynik z uzasadnieniem. To druga opinia modelu, nie dowód. Przepływ harnessu krytyka może zawierać wyłącznie bloki standardowego harnessu i czyste przekształcenia tekstu; bloki loop, map, subflow i bloki dodatków są odrzucane.",
     "verification_on_failure": "Gdy sprawdzenie odrzuci wynik",
     "verification_on_failure_error": "Błąd do obsłużenia w procesie",
     "verification_on_failure_human": "Skieruj do człowieka",

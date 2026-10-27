@@ -315,7 +315,7 @@ async fn execute_if_claimed(fixture: &Fixture, claimed: Option<ClaimedProcessJob
     }
 }
 
-async fn assert_stopped_before_the_work(fixture: &Fixture, instance_id: &str) {
+async fn assert_stopped_before_the_work(fixture: &Fixture, instance_id: &str, code: &str) {
     let current = snapshot(fixture, instance_id);
     assert_eq!(current.instance.status, ProcessInstanceStatus::Incident);
     let job_id = &current.jobs[0].job_id;
@@ -324,7 +324,7 @@ async fn assert_stopped_before_the_work(fixture: &Fixture, instance_id: &str) {
         "proved_no_effect",
         "nothing was dispatched"
     );
-    assert_eq!(incident_codes(fixture, job_id), ["SOURCE_ACCESS_REVOKED"]);
+    assert_eq!(incident_codes(fixture, job_id), [code]);
     assert_eq!(
         current.instance.variables.get("answer"),
         None,
@@ -362,7 +362,7 @@ async fn a_verification_flow_that_is_gone_stops_the_step_before_the_work_runs() 
             );
         }
         execute_if_claimed(&rig.fixture, claimed).await;
-        assert_stopped_before_the_work(&rig.fixture, &started.instance_id).await;
+        assert_stopped_before_the_work(&rig.fixture, &started.instance_id, "SOURCE_ACCESS_REVOKED").await;
     }
 }
 
@@ -590,7 +590,10 @@ async fn a_critic_that_is_disabled_before_the_work_stops_the_step() {
             );
         }
         execute_if_claimed(&rig.fixture, claimed).await;
-        assert_stopped_before_the_work(&rig.fixture, &started.instance_id).await;
+        // Refused by the claim, the access it checks is the initiator's; refused by
+        // the stage, the critic itself is what is wrong.
+        let code = if after_claim { "VERIFICATION_AGENT_REFUSED" } else { "SOURCE_ACCESS_REVOKED" };
+        assert_stopped_before_the_work(&rig.fixture, &started.instance_id, code).await;
     }
 }
 
@@ -2023,7 +2026,8 @@ fn a_critic_harness_cannot_run_another_flow_because_a_body_is_not_pinned() {
         let refused = critic_refusal_with(&rig, &harness)
             .unwrap_or_else(|| panic!("a {wrapper} over a clean body was published"));
         assert!(
-            refused.contains(&format!("may have an effect ({wrapper})")),
+            refused.contains(&format!("has a {wrapper} block, whose body flow is not pinned"))
+                && !refused.contains("may have an effect"),
             "{wrapper}: {refused}"
         );
     }
@@ -2123,7 +2127,7 @@ async fn a_harness_edited_after_publication_stops_a_critic_step_before_the_work_
     let claimed = repository::claim_job(&rig.fixture.db, "agent-worker", now_ms()).unwrap();
     execute_if_claimed(&rig.fixture, claimed).await;
 
-    assert_stopped_before_the_work(&rig.fixture, &started.instance_id).await;
+    assert_stopped_before_the_work(&rig.fixture, &started.instance_id, "VERIFICATION_AGENT_REFUSED").await;
     assert_eq!(
         runner.started.load(std::sync::atomic::Ordering::Acquire),
         0,
@@ -3082,6 +3086,7 @@ async fn a_repeated_step_tells_the_person_why_a_withdrawn_approval_was_not_relie
 /// `verifier`, ready to be accepted.
 fn observed_approval_before_a_script(
     rig: &Rigged,
+    tail: Option<Tail>,
 ) -> (
     String,
     ClaimedProcessJob,
@@ -3089,11 +3094,11 @@ fn observed_approval_before_a_script(
 ) {
     use super::verification::VerificationVerdict::Approved;
     let verifier = test_verifier(rig, "Completed", "fine");
-    let model = service_then(
-        &rig.work_flow,
-        test_mode(&verifier, VerificationOnFailure::Error),
-        Tail::Script,
-    );
+    let mode = test_mode(&verifier, VerificationOnFailure::Error);
+    let model = match tail {
+        Some(tail) => service_then(&rig.work_flow, mode, tail),
+        None => service_model(&rig.work_flow, mode),
+    };
     start_model(&rig.fixture, &model);
     let claimed = repository::claim_job(&rig.fixture.db, "agent-worker", now_ms())
         .unwrap()
@@ -3123,6 +3128,7 @@ fn accept_supplied(
     rig: &Rigged,
     claimed: &ClaimedProcessJob,
     observed: &repository::ObservedActivityResult,
+    planned_as_withdrawn: bool,
     forge: impl FnOnce(&mut repository::RuntimePlan),
 ) -> anyhow::Result<repository::ProcessTransitionOutcome> {
     let current = snapshot(&rig.fixture, &claimed.job.instance_id);
@@ -3132,7 +3138,8 @@ fn accept_supplied(
         .find(|job| job.job_id == claimed.job.job_id)
         .unwrap();
     let mut plan =
-        super::runtime::plan_job_result(&current, job, observed, false, now_ms(), None).unwrap();
+        super::runtime::plan_job_result(&current, job, observed, planned_as_withdrawn, now_ms(), None)
+            .unwrap();
     forge(&mut plan);
     repository::accept_job_result(
         &rig.fixture.db,
@@ -3151,14 +3158,14 @@ fn accept_supplied(
 #[test]
 fn a_supplied_plan_that_approves_is_accepted_only_for_the_verifier_the_observation_names() {
     let rig = rigged();
-    let (verifier, claimed, observed) = observed_approval_before_a_script(&rig);
+    let (verifier, claimed, observed) = observed_approval_before_a_script(&rig, Some(Tail::Script));
     for forged in [
         json!({"mode": "test", "reference": "another-flow"}),
         json!({"mode": "critic", "reference": verifier}),
         json!({"expression": "true"}),
         json!({}),
     ] {
-        let rejected = accept_supplied(&rig, &claimed, &observed, |plan| {
+        let rejected = accept_supplied(&rig, &claimed, &observed, false, |plan| {
             plan.events
                 .iter_mut()
                 .find(|event| event.kind == "verification_passed")
@@ -3174,32 +3181,143 @@ fn a_supplied_plan_that_approves_is_accepted_only_for_the_verifier_the_observati
     let current = snapshot(&rig.fixture, &claimed.job.instance_id);
     assert_eq!(current.instance.status, ProcessInstanceStatus::Running);
 
-    accept_supplied(&rig, &claimed, &observed, |_| {}).unwrap();
+    accept_supplied(&rig, &claimed, &observed, false, |_| {}).unwrap();
     let current = snapshot(&rig.fixture, &claimed.job.instance_id);
     assert_eq!(current.instance.status, ProcessInstanceStatus::Completed);
 }
 
 #[test]
 fn a_supplied_plan_cannot_approve_what_a_withdrawn_verifier_approved() {
+    // With and without the event the planner would have written, and before a
+    // Script as well as a plain End: omitting the event must not be a way past.
+    for tail in [Some(Tail::Script), None] {
+        for drop_event in [false, true] {
+            let rig = rigged();
+            let (verifier, claimed, observed) = observed_approval_before_a_script(&rig, tail);
+            rig.fixture
+                .db
+                .write()
+                .unwrap()
+                .execute("UPDATE flows SET status='draft' WHERE id=?1", [&verifier])
+                .unwrap();
+            let rejected = accept_supplied(&rig, &claimed, &observed, false, |plan| {
+                if drop_event {
+                    plan.events.retain(|event| event.kind != "verification_passed");
+                }
+            })
+            .unwrap_err();
+            assert!(
+                repository::is_result_refusal(&rejected),
+                "{drop_event}: {rejected:#}"
+            );
+            let current = snapshot(&rig.fixture, &claimed.job.instance_id);
+            assert_eq!(current.instance.status, ProcessInstanceStatus::Running);
+            assert_eq!(current.instance.variables.get("answer"), None);
+
+            // The recorded work is not stranded: the restart pass hands it to a person.
+            let authority = super::runtime::tool_authority(rig.fixture.dispatcher());
+            repository::recover_jobs(&rig.fixture.db, None, now_ms(), &authority).unwrap();
+            let current = snapshot(&rig.fixture, &claimed.job.instance_id);
+            assert_eq!(current.instance.status, ProcessInstanceStatus::Waiting);
+            assert_eq!(current.user_tasks.len(), 1);
+            assert!(current.incidents.is_empty(), "{:?}", current.incidents);
+        }
+    }
+}
+
+#[test]
+fn a_supplied_plan_that_hands_a_withdrawn_approval_to_a_person_is_accepted() {
     let rig = rigged();
-    let (verifier, claimed, observed) = observed_approval_before_a_script(&rig);
+    let (verifier, claimed, observed) = observed_approval_before_a_script(&rig, None);
     rig.fixture
         .db
         .write()
         .unwrap()
         .execute("UPDATE flows SET status='draft' WHERE id=?1", [&verifier])
         .unwrap();
-    let rejected = accept_supplied(&rig, &claimed, &observed, |_| {}).unwrap_err();
-    assert!(repository::is_result_refusal(&rejected), "{rejected:#}");
-    let current = snapshot(&rig.fixture, &claimed.job.instance_id);
-    assert_eq!(current.instance.status, ProcessInstanceStatus::Running);
-    assert_eq!(current.instance.variables.get("answer"), None);
-
-    // The recorded work is not stranded: the restart pass hands it to a person.
-    let authority = super::runtime::tool_authority(rig.fixture.dispatcher());
-    repository::recover_jobs(&rig.fixture.db, None, now_ms(), &authority).unwrap();
+    accept_supplied(&rig, &claimed, &observed, true, |_| {}).unwrap();
     let current = snapshot(&rig.fixture, &claimed.job.instance_id);
     assert_eq!(current.instance.status, ProcessInstanceStatus::Waiting);
     assert_eq!(current.user_tasks.len(), 1);
-    assert!(current.incidents.is_empty(), "{:?}", current.incidents);
+}
+
+#[test]
+fn a_supplied_plan_that_waits_for_a_person_cannot_hold_a_proved_approval() {
+    let rig = rigged();
+    let (_, claimed, observed) = observed_approval_before_a_script(&rig, None);
+    let rejected = accept_supplied(&rig, &claimed, &observed, true, |_| {}).unwrap_err();
+    assert!(repository::is_result_refusal(&rejected), "{rejected:#}");
+    let current = snapshot(&rig.fixture, &claimed.job.instance_id);
+    assert_eq!(current.instance.status, ProcessInstanceStatus::Running);
+}
+
+#[test]
+fn an_approval_withdrawn_after_the_stage_checked_goes_to_a_person_not_to_an_incident() {
+    use super::jobs::{AccessCheck, ServiceJob};
+    use super::verification::VerificationVerdict::Approved;
+    let rig = rigged();
+    let verifier = test_verifier(&rig, "Completed", "fine");
+    let verification = test_mode(&verifier, VerificationOnFailure::Error);
+    // Only the approved branch reaches the Script, and the Script's infrastructure
+    // fails once: the person branch never evaluates it.
+    let probe = "'b4-withdrawn-approval-probe'";
+    let mut model = service_then(&rig.work_flow, verification.clone(), Tail::Script);
+    let ProcessNodeKind::ScriptTask { script, .. } = &mut model
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == "Tail")
+        .unwrap()
+        .kind
+    else {
+        unreachable!("the tail is a script")
+    };
+    *script = probe.into();
+    let started = start_model(&rig.fixture, &model);
+    let claimed = repository::claim_job(&rig.fixture.db, "agent-worker", now_ms())
+        .unwrap()
+        .unwrap();
+    assert!(repository::commit_job_dispatch_boundary(
+        &rig.fixture.db,
+        &claimed,
+        "agent-worker",
+        now_ms()
+    )
+    .unwrap());
+    let observed = judged(&verifier, Approved);
+    crate::flow_engine::expr::inject_script_infrastructure_failure(probe);
+    let cancel = CancellationToken::new();
+    let job = ServiceJob {
+        pool: &rig.fixture.db,
+        dispatcher: rig.fixture.dispatcher(),
+        worker_id: "agent-worker",
+        claimed: &claimed,
+        cancel: &cancel,
+        timeout: Duration::from_secs(10),
+        result_expression: None,
+        verification: &verification,
+        implementation: &Default::default(),
+        effective: &json!({}),
+        repeat_extra: &[],
+    };
+    // The stage found the verifier usable; it is withdrawn before acceptance.
+    let withdraw = || {
+        rig.fixture
+            .db
+            .write()
+            .unwrap()
+            .execute("UPDATE flows SET status='draft' WHERE id=?1", [&verifier])
+            .unwrap();
+        AccessCheck::Allowed
+    };
+    super::jobs::finish_observed(&job, &withdraw, observed).unwrap();
+
+    let current = snapshot(&rig.fixture, &started.instance_id);
+    assert!(
+        incident_codes(&rig.fixture, &claimed.job.job_id).is_empty(),
+        "{:?}",
+        current.incidents
+    );
+    assert_eq!(current.instance.status, ProcessInstanceStatus::Waiting);
+    assert_eq!(current.user_tasks.len(), 1);
+    assert_eq!(current.user_tasks[0].kind, ProcessUserTaskKind::Verification);
 }

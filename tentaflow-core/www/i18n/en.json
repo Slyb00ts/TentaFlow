@@ -15888,7 +15888,7 @@
     "verification_critic_agent": "Critic agent",
     "verification_critic_choose": "Choose an agent",
     "verification_criteria": "Criteria",
-    "verification_critic_hint": "The critic must be another agent than the one doing the work. It sees the criteria and the result as data, may use read-only tools only, and approves or rejects the result with a reason. It is a second opinion from a model, not a proof.",
+    "verification_critic_hint": "The critic must be another agent than the one doing the work. It sees the criteria and the result as data, may use read-only tools only, and approves or rejects the result with a reason. It is a second opinion from a model, not a proof. The harness flow of the critic may contain only the blocks of the standard harness and pure text transforms; loop, map, subflow and addon blocks are refused.",
     "verification_on_failure": "When the check rejects the result",
     "verification_on_failure_error": "Error the process can handle",
     "verification_on_failure_human": "Send to a person",

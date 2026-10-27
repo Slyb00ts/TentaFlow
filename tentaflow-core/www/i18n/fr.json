@@ -14750,7 +14750,7 @@
     "verification_critic_agent": "Agent critique",
     "verification_critic_choose": "Choisir un agent",
     "verification_criteria": "Critères",
-    "verification_critic_hint": "Le critique doit être un autre agent que celui qui fait le travail. Il voit les critères et le résultat comme des données, n’utilise que des outils en lecture seule et approuve ou rejette le résultat en donnant une raison. C’est un second avis d’un modèle, pas une preuve.",
+    "verification_critic_hint": "Le critique doit être un autre agent que celui qui fait le travail. Il voit les critères et le résultat comme des données, n’utilise que des outils en lecture seule et approuve ou rejette le résultat en donnant une raison. C’est un second avis d’un modèle, pas une preuve. Le flux de harnais du critique ne peut contenir que les blocs du harnais standard et des transformations de texte pures ; les blocs loop, map, subflow et d’addon sont refusés.",
     "verification_on_failure": "Quand la vérification rejette le résultat",
     "verification_on_failure_error": "Erreur que le processus peut traiter",
     "verification_on_failure_human": "Confier à une personne",

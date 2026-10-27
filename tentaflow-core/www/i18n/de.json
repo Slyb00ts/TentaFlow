@@ -14750,7 +14750,7 @@
     "verification_critic_agent": "Kritiker-Agent",
     "verification_critic_choose": "Agent wählen",
     "verification_criteria": "Kriterien",
-    "verification_critic_hint": "Der Kritiker muss ein anderer Agent sein als der, der die Arbeit erledigt. Er sieht Kriterien und Ergebnis als Daten, nutzt nur lesende Werkzeuge und genehmigt oder lehnt das Ergebnis mit einer Begründung ab. Das ist eine zweite Meinung eines Modells, kein Beweis.",
+    "verification_critic_hint": "Der Kritiker muss ein anderer Agent sein als der, der die Arbeit erledigt. Er sieht Kriterien und Ergebnis als Daten, nutzt nur lesende Werkzeuge und genehmigt oder lehnt das Ergebnis mit einer Begründung ab. Das ist eine zweite Meinung eines Modells, kein Beweis. Der Harness-Ablauf des Kritikers darf nur die Blöcke des Standard-Harness und reine Textumwandlungen enthalten; loop-, map-, subflow- und Addon-Blöcke werden abgelehnt.",
     "verification_on_failure": "Wenn die Prüfung das Ergebnis ablehnt",
     "verification_on_failure_error": "Fehler, den der Prozess behandeln kann",
     "verification_on_failure_human": "An eine Person weiterleiten",

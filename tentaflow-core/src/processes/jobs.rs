@@ -1099,7 +1099,19 @@ pub(super) fn finish_observed(
         } else {
             None
         };
-        let (plan, retained_escalation_failure) = match plan_job_result(&current, job, &result, false, at_ms, None) {
+        // The trial plan must see the approval as the acceptance will, or an
+        // approval withdrawn since the verdict fails to map instead of going
+        // to a person.
+        let approval_withdrawn = match repository::observation_approval_withdrawn(
+            pool, &claimed.actor, &result) {
+            Ok(withdrawn) => withdrawn,
+            Err(error) if repository::is_retryable_acceptance(&error) => {
+                store_busy = repository::is_store_busy(&error);
+                continue;
+            }
+            Err(error) => return fail_acceptance(pool, worker_id, claimed, &result, error),
+        };
+        let (plan, retained_escalation_failure) = match plan_job_result(&current, job, &result, approval_withdrawn, at_ms, None) {
             Ok(plan) => (plan, false),
             Err(error) if script_infrastructure(&error) => {
                 repository::record_observed_script_infrastructure_failure(

@@ -166,6 +166,12 @@ pub fn critic_harness_refusal(graph_json: &str) -> Result<(), AgentPinError> {
         .iter()
         .find(|node| !HARNESS_BLOCKS.contains(&node.node_type.as_str()))
     {
+        Some(node) if matches!(node.node_type.as_str(), "loop" | "map" | "subflow") => {
+            Err(AgentPinError::Refused(format!(
+                "the harness flow of the critic has a {} block, whose body flow is not pinned for the run",
+                node.node_type
+            )))
+        }
         Some(node) => Err(AgentPinError::Refused(format!(
             "the harness flow of the critic has a block that may have an effect ({})",
             node.node_type
