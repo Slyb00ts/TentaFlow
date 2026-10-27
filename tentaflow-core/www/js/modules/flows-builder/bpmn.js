@@ -707,11 +707,32 @@ export function processExplainError(message, model) {
   });
 }
 
+// The verification mode of a Service task's `verification` value: `'Human'`, or
+// the single variant of an object (Condition, Test, Critic).
+export function processVerificationMode(verification) {
+  if (verification == null || typeof verification === 'string') return 'Human';
+  return ['Condition', 'Test', 'Critic'].find((mode) => verification[mode] != null) ?? 'Human';
+}
+
+// A new verification of `mode`, keeping what the author already typed for that
+// mode. A rejection becomes an error the process can handle unless the author
+// sends it to a person.
+export function processVerificationFor(mode, previous) {
+  const same = processVerificationMode(previous) === mode && typeof previous === 'object' ? previous[mode] : null;
+  if (mode === 'Condition') return { Condition: { expression: same?.expression ?? '' } };
+  const carried = typeof previous === 'object' && previous
+    ? (previous.Test ?? previous.Critic)?.onFailure : null;
+  const onFailure = same?.onFailure ?? carried ?? 'Error';
+  if (mode === 'Test') return { Test: { flowId: same?.flowId ?? '', onFailure } };
+  if (mode === 'Critic') return { Critic: { agentId: same?.agentId ?? '', criteria: same?.criteria ?? '', onFailure } };
+  return 'Human';
+}
+
 // Which i18n texts a row of the routing table shows; the parameters they need
 // (targets, handler, code, timer) come from the row itself.
 export function processRoutingTextKeys(row, verification) {
   const outcome = row.outcome === 'timeout' ? 'bpmn.routing_outcome_timeout'
-    : row.outcome === 'rejected' ? `bpmn.routing_outcome_rejected_${verification === 'Human' ? 'human' : 'condition'}`
+    : row.outcome === 'rejected' ? `bpmn.routing_outcome_rejected_${verification === 'Condition' ? 'condition' : 'human'}`
       : (row.outcome === 'error' || row.outcome === 'needs_human') && row.route !== 'unavailable'
         ? `bpmn.routing_outcome_${row.outcome}_${row.other ? 'other' : 'code'}`
         : `bpmn.routing_outcome_${row.outcome}`;
@@ -803,13 +824,18 @@ export function processResultRouting(graph, nodeId) {
   }));
   const catchAll = (list) => list.find((entry) => entry.catchAll) || null;
   const specific = (list) => list.filter((entry) => !entry.catchAll && !entry.undeclared);
-  const human = typeof config.verification === 'string';
+  const mode = processVerificationMode(config.verification);
+  const machine = mode === 'Test' || mode === 'Critic' ? config.verification[mode] : null;
+  // A machine verdict is a business result too: a rejection is an Error or a
+  // NeedsHuman as chosen, and a verifier that gave no verdict is a NeedsHuman.
+  const canError = hasResult || machine?.onFailure === 'Error';
+  const canEscalate = hasResult || machine != null;
   const enclosing = nested && !repeated ? enclosingErrorHandlers(model, graph.selectedProcessId, graph.processPath) : [];
   const rows = [];
-  rows.push({ outcome: 'completed', route: 'next', gate: human ? 'human' : 'condition', targets: targetsOf(nodeId) });
-  rows.push({ outcome: 'rejected', route: 'incident', code: human ? 'HUMAN_REJECTED' : 'VERIFICATION_FAILED' });
+  rows.push({ outcome: 'completed', route: 'next', gate: mode.toLowerCase(), targets: targetsOf(nodeId) });
+  rows.push({ outcome: 'rejected', route: 'incident', code: mode === 'Condition' ? 'VERIFICATION_FAILED' : 'HUMAN_REJECTED' });
   const escalationRoute = (entry) => (entry.interrupting ? 'boundary' : 'boundary_keep');
-  if (hasResult) {
+  if (canError) {
     for (const entry of specific(errors)) rows.push({ outcome: 'error', route: 'boundary', code: entry.code, boundary: entry, targets: entry.targets });
     const otherError = catchAll(errors);
     const taskCodes = new Set(specific(errors).map((entry) => entry.code));
@@ -823,14 +849,14 @@ export function processResultRouting(graph, nodeId) {
     const climbed = otherError ? null : climbingHandler(enclosing, null);
     rows.push({ outcome: 'error', route: otherError ? 'boundary' : repeated ? 'incident' : climbed ? 'parent' : 'caller', other: true,
       code: null, boundary: otherError, parent: climbed, targets: otherError ? otherError.targets : [] });
+  } else rows.push({ outcome: 'error', route: 'unavailable' });
+  if (canEscalate) {
     for (const entry of specific(escalations)) rows.push({ outcome: 'needs_human', route: escalationRoute(entry), code: entry.code, boundary: entry, targets: entry.targets });
     const otherEscalation = catchAll(escalations);
     rows.push({ outcome: 'needs_human', route: otherEscalation ? escalationRoute(otherEscalation) : 'review', other: true,
       code: null, boundary: otherEscalation, targets: otherEscalation ? otherEscalation.targets : [] });
-    rows.push({ outcome: 'cancelled', route: 'incident' });
-  } else {
-    for (const outcome of ['error', 'needs_human', 'cancelled']) rows.push({ outcome, route: 'unavailable' });
-  }
+  } else rows.push({ outcome: 'needs_human', route: 'unavailable' });
+  rows.push(hasResult ? { outcome: 'cancelled', route: 'incident' } : { outcome: 'cancelled', route: 'unavailable' });
   if (serviceKind === 'tool') rows.push({ outcome: 'denied', route: 'review', code: 'TOOL_PERMISSION_DENIED' });
   rows.push({ outcome: 'platform', route: 'incident' });
   rows.push({ outcome: 'timeout', route: 'incident', code: 'EXTERNAL_OUTCOME_UNCERTAIN', reason: 'SERVICE_TIMEOUT', seconds: config.timeoutSeconds });
@@ -844,10 +870,16 @@ export function processResultRouting(graph, nodeId) {
     if (!entry) warnings.push(entry = { key, tone, names: [] });
     if (name !== undefined && !entry.names.includes(name)) entry.names.push(name);
   };
-  if (!human && !(config.verification?.Condition?.expression || '').trim()) warn('empty_condition');
+  if (mode === 'Condition' && !(config.verification.Condition.expression || '').trim()) warn('empty_condition');
+  if (mode === 'Test' && !machine.flowId) warn('empty_test_flow');
+  if (mode === 'Critic') {
+    if (!machine.agentId) warn('empty_critic_agent');
+    else if (machine.agentId === config.implementation?.Agent?.agentId) warn('critic_same_agent');
+    if (!(machine.criteria || '').trim()) warn('empty_criteria');
+  }
   if (!rows[0].targets.length) warn('no_outgoing');
-  if (!hasResult && errors.length) warn('error_boundary_without_result');
-  if (!hasResult && escalations.length) warn('escalation_boundary_without_result');
+  if (!canError && errors.length) warn('error_boundary_without_result');
+  if (!canEscalate && escalations.length) warn('escalation_boundary_without_result');
   for (const entry of [...errors, ...escalations, ...timers]) {
     if (!entry.targets.length) warn('boundary_no_flow', entry.name);
     if (entry.undeclared) warn('undeclared_reference', entry.name);
@@ -886,13 +918,13 @@ export function processResultRouting(graph, nodeId) {
   // Both buttons need a result rule: only a rule can return an error or ask a
   // person. The task also has a finite number of places on its border.
   const room = typeof graph.boundaryRoom === 'function' ? graph.boundaryRoom(nodeId) : Infinity;
-  const addError = hasResult ? nextRef(errors, model.errors, 'errorId', 'errorCode') : null;
-  const addEscalation = hasResult ? nextRef(escalations, model.escalations, 'escalationId', 'escalationCode') : null;
-  const reason = (ref) => (!hasResult ? 'no_result' : !ref ? 'all_taken' : room < 1 ? 'no_room' : null);
-  const errorReason = reason(addError);
-  const escalationReason = reason(addEscalation);
+  const addError = canError ? nextRef(errors, model.errors, 'errorId', 'errorCode') : null;
+  const addEscalation = canEscalate ? nextRef(escalations, model.escalations, 'escalationId', 'escalationCode') : null;
+  const reason = (ref, possible) => (!possible ? 'no_result' : !ref ? 'all_taken' : room < 1 ? 'no_room' : null);
+  const errorReason = reason(addError, canError);
+  const escalationReason = reason(addEscalation, canEscalate);
   return {
-    node, hasResult, kind: serviceKind, verification: human ? 'Human' : 'Condition', rows, warnings,
+    node, hasResult, kind: serviceKind, verification: mode, rows, warnings,
     boundaries: { errors, escalations, timers },
     add: { error: errorReason ? null : addError, escalation: escalationReason ? null : addEscalation, errorReason, escalationReason },
   };
@@ -932,7 +964,8 @@ export function processBoundaryHosts(graph, kind) {
       && ['bpmn_send_task', 'bpmn_manual_task', 'bpmn_receive_task', 'bpmn_script_task'].includes(candidate.type)))
     && (kind !== 'BoundaryError' || candidate.type !== 'bpmn_user_task')
     && (kind !== 'BoundaryEscalation' || (candidate.type === 'bpmn_service_task'
-      && (!!candidate.config.resultExpression || processServiceKind(candidate.config) === 'agent')))
+      && (!!candidate.config.resultExpression || processServiceKind(candidate.config) === 'agent'
+        || ['Test', 'Critic'].includes(processVerificationMode(candidate.config.verification)))))
     && !(candidate.type === 'bpmn_receive_task' && graph.edges.some((edge) =>
       edge.to_node === candidate.id && graph.nodes.some((source) =>
         source.id === edge.from_node && source.type === 'bpmn_event_based_gateway'))));

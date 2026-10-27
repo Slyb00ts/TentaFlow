@@ -211,6 +211,27 @@ test('BPMN typed save retains mapping and variable business keys', { skip }, () 
   assert.equal(Object.hasOwn(body.model.nodes[1].kind.ServiceTask, 'timeout_seconds'), false);
 });
 
+test('machine verification modes round trip through the Wasm codec and Human keeps its bytes', { skip }, () => {
+  const task = (verification) => ({ id: 'Service_1', name: 'Service', kind: { ServiceTask: {
+    flowId: 'f1', inputMapping: {}, outputMapping: {}, verification, timeoutSeconds: 60 } } });
+  const model = (node) => ({ schemaVersion: 1, processId: 'P_1', variables: {}, nodes: [node],
+    sequenceFlows: [], diagram: { shapes: [], edges: [] } });
+  const save = (verification) => request('processDefinitionSaveRequest', { commandId: 'cmd',
+    definitionId: null, expectedRevision: 0, name: 'V', description: '', model: model(task(verification)) });
+  const encode = (verification) => codec.encode.processDefinitionSaveRequest(17, { commandId: 'cmd',
+    definitionId: null, expectedRevision: 0, name: 'V', description: '', model: model(task(verification)) });
+  const test = { Test: { flowId: 'check-1', onFailure: 'NeedsHuman' } };
+  const critic = { Critic: { agentId: 'critic-1', criteria: 'cite a source', onFailure: 'Error' } };
+  assert.deepEqual(save(test).model.nodes[0].kind.ServiceTask.verification, test);
+  assert.deepEqual(save(critic).model.nodes[0].kind.ServiceTask.verification, critic);
+  assert.deepEqual(encode(undefined), encode('Human'));
+  assert.throws(() => encode({ Test: { flowId: 'c' } }), /requires a flow and a failure handling/);
+  assert.throws(() => encode({ Test: { flowId: 'c', onFailure: 'Retry' } }), /failure handling/);
+  assert.throws(() => encode({ Critic: { agentId: 'a', criteria: 'c', onFailure: 'Error', extra: 1 } }),
+    /unsupported critic verification field/);
+  assert.throws(() => encode({ Judge: {} }), /unsupported verification mode/);
+});
+
 test('service task implementation is sent only for tools and a Flow task keeps its bytes', { skip }, () => {
   const task = (extra) => ({ id: 'Service_1', name: 'Service', kind: { ServiceTask: {
     flowId: 'f1', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60, ...extra } } });

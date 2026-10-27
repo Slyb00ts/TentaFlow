@@ -568,6 +568,17 @@ export class FlowCanvas {
         if (condition && !(condition.expression || '').trim()) {
           errors.push(I18n.t('bpmn.verification_expression_required', { node: this._nodeName(node) }));
         }
+        if (node.config.verification?.Test && !node.config.verification.Test.flowId) {
+          errors.push(I18n.t('bpmn.verification_flow_required', { node: this._nodeName(node) }));
+        }
+        if (node.config.verification?.Critic) {
+          const critic = node.config.verification.Critic;
+          if (!critic.agentId) errors.push(I18n.t('bpmn.verification_agent_required', { node: this._nodeName(node) }));
+          else if (critic.agentId === node.config.implementation?.Agent?.agentId) {
+            errors.push(I18n.t('bpmn.verification_critic_same_agent', { node: this._nodeName(node) }));
+          }
+          if (!(critic.criteria || '').trim()) errors.push(I18n.t('bpmn.verification_criteria_required', { node: this._nodeName(node) }));
+        }
         const timeoutCeiling = node.type === 'bpmn_service_task' ? processTimeoutProblem(node.config) : null;
         if (timeoutCeiling) errors.push(I18n.t('bpmn.timeout_out_of_range', { node: this._nodeName(node), max: timeoutCeiling }));
         const called = node.type === 'bpmn_call_activity' ? node.config : null;

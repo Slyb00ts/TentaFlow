@@ -922,6 +922,57 @@ test('an agent step is saved and read back by the codec with its output schema k
   expect(errors, diagnostics(errors, proc)).toEqual([]);
 });
 
+test('a test and a critic verification are saved and read back by the codec, and the designer opens them with their pickers', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors = collectConsoleErrors(page);
+  await loginAsAdmin(page, { port: PORT });
+  const id = await createDefinition(page, 'Verified step', { errors: [], escalations: [] });
+  const modes = [
+    { Test: { flowId: 'check-flow', onFailure: 'NeedsHuman' } },
+    { Critic: { agentId: 'critic-agent', criteria: 'Cite a source for every claim.', onFailure: 'Error' } },
+  ];
+  const saved = await page.evaluate(async ({ definitionId, verifications }) => {
+    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+    const readBack = [];
+    for (const verification of verifications) {
+      const current = (await ApiBinary.one('processDefinitionGetRequest', { definitionId })).definition;
+      const model = current.model;
+      model.nodes = model.nodes.filter((node) => node.id !== 'Service_1');
+      model.nodes.splice(1, 0, { id: 'Service_1', name: 'Check', kind: { ServiceTask: {
+        flowId: 'any-flow', inputMapping: {}, outputMapping: {}, verification, timeoutSeconds: 60 } } });
+      model.sequenceFlows = [
+        { id: 'Sequence_start_service', sourceId: 'Start', targetId: 'Service_1', condition: null },
+        { id: 'Sequence_service_end', sourceId: 'Service_1', targetId: 'End', condition: null },
+      ];
+      model.diagram = { shapes: [
+        { elementId: 'Start', x: 80, y: 160, width: 56, height: 56 },
+        { elementId: 'Service_1', x: 220, y: 148, width: 120, height: 80 },
+        { elementId: 'End', x: 440, y: 160, width: 56, height: 56 },
+      ], edges: [
+        { sequenceFlowId: 'Sequence_start_service', waypoints: [{ x: 136, y: 188 }, { x: 220, y: 188 }] },
+        { sequenceFlowId: 'Sequence_service_end', waypoints: [{ x: 340, y: 188 }, { x: 440, y: 188 }] },
+      ] };
+      await ApiBinary.one('processDefinitionSaveRequest', {
+        commandId: crypto.randomUUID(), definitionId, expectedRevision: current.draftRevision,
+        name: current.name, description: '', model,
+      });
+      const reread = (await ApiBinary.one('processDefinitionGetRequest', { definitionId })).definition;
+      readBack.push(reread.model.nodes.find((node) => node.id === 'Service_1').kind.ServiceTask.verification);
+    }
+    return readBack;
+  }, { definitionId: id, verifications: modes });
+  expect(saved).toEqual(modes);
+
+  await openDesigner(page, { login: false, id });
+  await page.locator('.fb-canvas .fb-node.bpmn_service_task').click({ position: { x: 20, y: 20 } });
+  await page.getByRole('tab', { name: 'Result' }).click();
+  await expect(page.locator('[data-process="verification"]')).toBeVisible();
+  await expect(page.locator('[data-process="verifyAgentId"]')).toBeVisible();
+  await expect(page.locator('[data-process="verifyCriteria"]')).toBeVisible();
+  await expect(page.locator('[data-process="verifyOnFailure"]')).toBeVisible();
+  expect(errors, diagnostics(errors, proc)).toEqual([]);
+});
+
 test.describe('refusals on a laptop window', () => {
   test.use({ viewport: { width: 1024, height: 700 } });
 

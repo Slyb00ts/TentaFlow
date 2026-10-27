@@ -3495,6 +3495,65 @@ test('an agent step can catch error and escalation events without a result rule'
   graph.destroy();
 });
 
+test('verification modes: Test and Critic keep what was typed, start with an error the process can handle and the critic is never the worker', async () => {
+  const graph = canvas(agentStepModel());
+  const node = graph.nodes.find((candidate) => candidate.id === 'Agent_1');
+  const config = inspector(graph); config.show(node, graph.templates.get(node.type)); await flush(2);
+  const control = (key) => config.root.querySelector(`[data-process="${key}"]`);
+  assert.deepEqual([...control('verification').querySelectorAll('option')].map((option) => option.value), ['Human', 'Condition', 'Test', 'Critic']);
+  change(control('verification'), 'Critic'); await flush(2);
+  assert.deepEqual(node.config.verification, { Critic: { agentId: '', criteria: '', onFailure: 'Error' } });
+  assert.deepEqual([...control('verifyAgentId').querySelectorAll('option')].map((option) => option.value).filter(Boolean), ['agent-2'],
+    'the agent of the step is not offered as its critic');
+  assert.equal(control('verifyOnFailure').getAttribute('value'), 'Error');
+  assert.ok(graph.validate().some((text) => text.includes(I18n.t('bpmn.verification_agent_required', { node: 'Review case' }))));
+  change(control('verifyAgentId'), 'agent-2');
+  change(control('verifyCriteria'), 'must cite a source');
+  change(control('verifyOnFailure'), 'NeedsHuman');
+  assert.deepEqual(node.config.verification, { Critic: { agentId: 'agent-2', criteria: 'must cite a source', onFailure: 'NeedsHuman' } });
+  assert.deepEqual(graph.validate(), []);
+  change(control('verification'), 'Test'); await flush(2);
+  assert.deepEqual(node.config.verification, { Test: { flowId: '', onFailure: 'NeedsHuman' } }, 'the failure handling is carried over');
+  assert.ok(graph.validate().some((text) => text.includes(I18n.t('bpmn.verification_flow_required', { node: 'Review case' }))));
+  change(control('verifyFlowId'), 'flow-one');
+  assert.deepEqual(node.config.verification, { Test: { flowId: 'flow-one', onFailure: 'NeedsHuman' } });
+  change(control('verification'), 'Critic'); await flush(2);
+  assert.deepEqual(node.config.verification, { Critic: { agentId: '', criteria: '', onFailure: 'NeedsHuman' } });
+  change(control('verification'), 'Human');
+  assert.equal(node.config.verification, 'Human');
+  graph.updateNodeConfig(node.id, { verification: { Critic: { agentId: 'agent-1', criteria: 'c', onFailure: 'Error' } } });
+  assert.ok(graph.validate().some((text) => text.includes(I18n.t('bpmn.verification_critic_same_agent', { node: 'Review case' }))));
+  graph.destroy(); config.destroy();
+});
+
+test('verification modes: a machine verdict gives a Flow task error and escalation handling without a result rule', () => {
+  const graph = canvas();
+  graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_service_task'), 300, 300);
+  const task = graph.nodes.at(-1);
+  const plain = processResultRouting(graph, task.id);
+  assert.equal(plain.add.errorReason, 'no_result');
+  assert.ok(!processBoundaryHosts(graph, 'BoundaryEscalation').some((host) => host.id === task.id));
+  graph.updateNodeConfig(task.id, { verification: { Test: { flowId: 'flow-one', onFailure: 'Error' } } });
+  const handled = processResultRouting(graph, task.id);
+  assert.equal(handled.verification, 'Test');
+  assert.equal(handled.hasResult, false, 'the work has no result rule, the verdict is the business result');
+  assert.equal(handled.add.errorReason, null);
+  assert.equal(handled.add.escalationReason, null);
+  assert.ok(handled.rows.some((row) => row.outcome === 'error' && row.route !== 'unavailable'));
+  assert.deepEqual(processRowFor(handled, 'completed').gate, 'test');
+  assert.ok(processBoundaryHosts(graph, 'BoundaryEscalation').some((host) => host.id === task.id));
+  graph.updateNodeConfig(task.id, { verification: { Critic: { agentId: 'agent-2', criteria: 'c', onFailure: 'NeedsHuman' } } });
+  const human = processResultRouting(graph, task.id);
+  assert.equal(human.add.errorReason, 'no_result', 'a rejection sent to a person is not an error');
+  assert.equal(human.add.escalationReason, null);
+  assert.equal(processRowFor(human, 'completed').gate, 'critic');
+  assert.deepEqual(processRoutingTextKeys(processRowFor(human, 'rejected'), human.verification).outcome, 'bpmn.routing_outcome_rejected_human');
+  graph.updateNodeConfig(task.id, { verification: { Critic: { agentId: '', criteria: ' ', onFailure: 'Error' } } });
+  assert.deepEqual(processResultRouting(graph, task.id).warnings.map((warning) => warning.key).filter((key) => key.startsWith('empty')),
+    ['empty_critic_agent', 'empty_criteria']);
+  graph.destroy();
+});
+
 test('a new Call activity says it needs an exact version instead of failing at save', async () => {
   const graph = canvas(); graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_call_activity'), 200, 200);
   const node = graph.nodes.at(-1);

@@ -347,6 +347,39 @@ function processServiceImplementation(implementation) {
   return { implementation: { AddonTool: { addon_id: tool.addonId, tool_name: tool.toolName } } };
 }
 
+const PROCESS_VERIFICATION_FAILURES = ['Error', 'NeedsHuman'];
+
+// Human is the default and travels as the bare variant name; the machine modes
+// carry their own fields, and a rejection must say what it turns into.
+function processVerification(verification) {
+  if (verification == null) return 'Human';
+  if (verification === 'Human') return verification;
+  const variants = typeof verification === 'object' && !Array.isArray(verification)
+    ? Object.keys(verification) : [];
+  if (variants.length !== 1) throw new TypeError('unsupported verification mode');
+  const [tag] = variants;
+  const body = verification[tag];
+  if (tag === 'Condition') {
+    return { Condition: { expression: String(body?.expression ?? '') } };
+  }
+  if (tag === 'Test') {
+    processKnownFields(body, ['flowId', 'onFailure'], 'test verification');
+    if (typeof body.flowId !== 'string' || !PROCESS_VERIFICATION_FAILURES.includes(body.onFailure)) {
+      throw new TypeError('test verification requires a flow and a failure handling');
+    }
+    return { Test: { flow_id: body.flowId, on_failure: body.onFailure } };
+  }
+  if (tag === 'Critic') {
+    processKnownFields(body, ['agentId', 'criteria', 'onFailure'], 'critic verification');
+    if (typeof body.agentId !== 'string' || typeof body.criteria !== 'string'
+        || !PROCESS_VERIFICATION_FAILURES.includes(body.onFailure)) {
+      throw new TypeError('critic verification requires an agent, criteria and a failure handling');
+    }
+    return { Critic: { agent_id: body.agentId, criteria: body.criteria, on_failure: body.onFailure } };
+  }
+  throw new TypeError('unsupported verification mode');
+}
+
 function processKnownFields(value, names, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value) ||
       Object.keys(value).some((key) => !names.includes(key))) {
@@ -709,10 +742,7 @@ function processModel(model, bodyType = 'primary') {
       fields = { assignee_user_id: processField(body, 'assigneeUserId') ?? null,
         output_mapping: processField(body, 'outputMapping') ?? {} };
     } else if (tag === 'ServiceTask') {
-      const verification = body.verification;
-      const verified = typeof verification === 'object' && verification !== null && verification.Condition
-        ? { Condition: { expression: String(verification.Condition.expression ?? '') } }
-        : verification;
+      const verified = processVerification(body.verification);
       fields = { flow_id: String(processField(body, 'flowId') ?? ''),
         input_mapping: processField(body, 'inputMapping') ?? {},
         output_mapping: processField(body, 'outputMapping') ?? {},
