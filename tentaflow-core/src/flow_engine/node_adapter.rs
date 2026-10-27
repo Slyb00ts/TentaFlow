@@ -157,6 +157,12 @@ pub struct ExecutionContext {
     /// dzielił tę samą listę bez kopiowania; `SubflowRunner` rozszerza ją o
     /// flow dziecka przed zejściem w głąb.
     pub subflow_visited: Arc<Vec<String>>,
+    /// True under an `agent` block: the nested agent runs under its caller's
+    /// request id (and run row), so the id alone cannot tell the step's own
+    /// model from the model of an agent the harness delegated to. Held HERE for
+    /// the reason `subflow_depth` is; clones of the context (every body below
+    /// the block) inherit it, and nothing resets it.
+    pub nested_agent: bool,
 
     /// Seed envelope dostarczony przez routing (request_id, model, payload,
     /// initial messages). Plan v4.2 D2: używa go TYLKO trigger.execute().
@@ -897,6 +903,7 @@ pub mod test_support {
             cancel_token: CancellationToken::new(),
             subflow_depth: 0,
             subflow_visited: Arc::new(Vec::new()),
+            nested_agent: false,
             initial_envelope: Arc::new(FlowEnvelope::empty()),
             clock: Arc::new(SystemClock),
             blobs: Arc::new(InMemoryBlobStore::new()) as Arc<dyn BlobStore>,

@@ -13,7 +13,7 @@ use tentaflow_protocol::processes::{
 use tokio_util::sync::CancellationToken;
 
 use super::agent_sink::{
-    agent_run_id, binding_from_meta, complete_task, sealed_meta, step_iteration_cap,
+    agent_run_id, binding_from_meta, complete_task, sealed_meta, step_iteration_cap, step_tool_list,
     ProcessActivityBinding, PROCESS_ACTIVITY_META_KEY,
 };
 use super::repository::{self, ClaimedProcessJob};
@@ -1313,14 +1313,72 @@ fn the_tool_list_and_iteration_budget_of_a_step_come_from_the_process_model_not_
     let mut widened = binding.clone();
     widened.allowed_tools = vec!["core.skill_view".into(), "core.fs_read".into()];
     let forged = BTreeMap::from([widened.meta_entry()].map(|(key, value)| (key.to_owned(), value)));
-    let sealed = sealed_meta(&fixture.db, &run_id, &forged);
+    let sealed = sealed_meta(&fixture.db, &run_id, false, &forged);
     assert_eq!(
         binding_from_meta(&sealed).unwrap().allowed_tools,
         ["core.skill_view"]
     );
     // A node dropped the binding altogether: the step is still a step.
-    let restored = sealed_meta(&fixture.db, &run_id, &BTreeMap::new());
+    let restored = sealed_meta(&fixture.db, &run_id, false, &BTreeMap::new());
     assert_eq!(binding_from_meta(&restored), Some(binding.clone()));
     // A run that is not a step keeps exactly the meta it has.
-    assert_eq!(sealed_meta(&fixture.db, "another-run", &forged), forged);
+    assert_eq!(sealed_meta(&fixture.db, "another-run", false, &forged), forged);
+}
+
+#[test]
+fn a_nested_agent_gets_the_step_list_as_a_marker_and_never_the_binding() {
+    let fixture = Fixture::new();
+    seed_agent(
+        &fixture,
+        AGENT_ID,
+        r#"["core.skill_view","core.fs_read"]"#,
+        10,
+        true,
+    );
+    let (_, binding) = running_step(
+        &fixture,
+        agent_implementation(AGENT_ID, &["core.skill_view"], None),
+    );
+    let run_id = binding.agent_run_id();
+    // The nested run carries a forged, widened claim and nothing else.
+    let mut widened = binding.clone();
+    widened.allowed_tools = vec!["core.skill_view".into(), "core.fs_read".into()];
+    let forged = BTreeMap::from([widened.meta_entry()].map(|(key, value)| (key.to_owned(), value)));
+    for meta in [&forged, &BTreeMap::new()] {
+        let sealed = sealed_meta(&fixture.db, &run_id, true, meta);
+        assert_eq!(binding_from_meta(&sealed), None, "no claim on the step");
+        assert_eq!(
+            step_tool_list(&sealed),
+            Some(vec!["core.skill_view".to_owned()]),
+            "narrowed to the step's list from the process model"
+        );
+    }
+}
+
+#[test]
+fn a_contract_that_cannot_be_read_strips_only_the_runs_that_claim_a_step() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    let (_, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute_batch("ALTER TABLE agent_runs RENAME TO agent_runs_unreadable")
+        .unwrap();
+    let run_id = binding.agent_run_id();
+
+    // An ordinary run keeps exactly the meta it has.
+    let ordinary = BTreeMap::from([("agent_id".to_owned(), json!("chat-agent"))]);
+    assert_eq!(sealed_meta(&fixture.db, &run_id, false, &ordinary), ordinary);
+    let marked = BTreeMap::from([("keep".to_owned(), json!(1))]);
+    assert_eq!(sealed_meta(&fixture.db, &run_id, true, &marked), marked);
+
+    // A run that claims a step admits nothing.
+    let claiming = BTreeMap::from([binding.meta_entry()].map(|(key, value)| (key.to_owned(), value)));
+    for nested in [false, true] {
+        let sealed = sealed_meta(&fixture.db, &run_id, nested, &claiming);
+        assert_eq!(binding_from_meta(&sealed), None);
+        assert_eq!(step_tool_list(&sealed), Some(Vec::new()), "nested={nested}");
+    }
 }

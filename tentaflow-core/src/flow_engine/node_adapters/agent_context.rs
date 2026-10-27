@@ -308,6 +308,7 @@ impl NodeAdapter for AgentContextNodeAdapter {
             &crate::processes::agent_sink::sealed_meta(
                 service.db(),
                 &ctx.request_id,
+                ctx.nested_agent,
                 &envelope.meta,
             ),
         );

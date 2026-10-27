@@ -34,6 +34,7 @@ use crate::db::models::{AgentRunStatusUpdate, DbAgentRun, NewAgentRun};
 use crate::db::{repository, DbPool};
 use crate::flow_engine::dispatchers::{ProgressEvent, ProgressSink};
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, TokenUsage};
+use crate::flow_engine::node_adapter::ExecutionContext;
 use crate::flow_engine::progress_broker::ProgressBroker;
 
 use super::catalog::{allowlist_admits_entry, tool_in_allowlist};
@@ -1143,25 +1144,35 @@ impl AgentRunManager {
         true
     }
 
-    /// Cancels a run and every run below it, deepest first. The tree is read from
+    /// Cancels a run and every run below it, parents first. The tree is read from
     /// the rows, not from the live registry: a descendant whose parent already
-    /// settled is still a run somebody started on this one's behalf. Returns how
-    /// many live runs were signalled.
+    /// settled is still a run somebody started on this one's behalf. A parent is
+    /// stopped before its children are listed so it starts nothing new, and the
+    /// walk is repeated until a pass finds no run it has not already signalled,
+    /// so a child created while the walk was running is not left behind. Returns
+    /// how many live runs were signalled. The row reads are blocking: call from
+    /// a blocking context.
     pub fn cancel_tree(&self, run_id: &str) -> usize {
-        // Bounds the walk against a cycle or an absurdly wide tree; a row set that
-        // large is cancelled as far as it goes.
+        // Bounds the walk against a cycle or an absurdly wide tree.
         const MAX_TREE_RUNS: usize = 1024;
-        let mut order = vec![run_id.to_string()];
         let mut seen = std::collections::HashSet::from([run_id.to_string()]);
-        let mut next = 0;
-        while next < order.len() && order.len() < MAX_TREE_RUNS {
-            let parent = order[next].clone();
-            next += 1;
-            match repository::list_agent_runs_by_parent(&self.db, &parent) {
+        let mut pending = vec![run_id.to_string()];
+        let mut signalled = 0;
+        // Lists the children of `parent` that the walk has not met yet. `false`
+        // when the tree outgrew the bound.
+        let discover = |parent: &str,
+                        seen: &mut std::collections::HashSet<String>,
+                        pending: &mut Vec<String>|
+         -> bool {
+            match repository::list_agent_runs_by_parent(&self.db, parent) {
                 Ok(children) => {
                     for child in children {
+                        if seen.len() >= MAX_TREE_RUNS {
+                            tracing::warn!(run_id, "the run tree is larger than {MAX_TREE_RUNS}; runs beyond that are not cancelled");
+                            return false;
+                        }
                         if seen.insert(child.id.clone()) {
-                            order.push(child.id);
+                            pending.push(child.id);
                         }
                     }
                 }
@@ -1169,12 +1180,32 @@ impl AgentRunManager {
                     tracing::warn!(run_id = %parent, "cannot list the children of a run to cancel: {error}");
                 }
             }
+            true
+        };
+        loop {
+            while let Some(id) = pending.pop() {
+                if self.cancel(&id) {
+                    signalled += 1;
+                }
+                if !discover(&id, &mut seen, &mut pending) {
+                    return signalled;
+                }
+            }
+            // A run that was already listed may have gained a child since.
+            let walked: Vec<String> = seen.iter().cloned().collect();
+            for id in walked {
+                if !discover(&id, &mut seen, &mut pending) {
+                    return signalled;
+                }
+            }
+            if pending.is_empty() {
+                return signalled;
+            }
         }
-        order
-            .iter()
-            .rev()
-            .filter(|id| self.cancel(id))
-            .count()
+    }
+
+    pub fn db(&self) -> &DbPool {
+        &self.db
     }
 
     /// Number of currently registered (in-flight) runs — test/diagnostic hook.
@@ -1273,17 +1304,36 @@ impl CallerRun {
     /// and the deterministic `spawn`/`await_subagents`/`subagent_status` blocks so
     /// both paths derive the caller the same way. An absent id is an empty string
     /// (the handlers reject an empty `run_id` as "not a managed run context").
+    ///
+    /// Meta is writable by every node of the harness, so for a run that belongs
+    /// to a process step neither its tool list nor its run id is read from it:
+    /// the list comes from the process model ([`sealed_meta`]) and the id is the
+    /// one the engine executes the run under. Otherwise a node could widen the
+    /// list a delegation inherits, or name another run as the parent and so keep
+    /// a child out of the step's `cancel_tree`.
     pub fn from_envelope(
+        db: &DbPool,
+        ctx: &ExecutionContext,
         envelope: &FlowEnvelope,
         principal: AgentPrincipal,
-        session_id: Option<String>,
     ) -> Self {
-        let run_id = envelope
-            .meta
-            .get("agent_run_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
+        let sealed = crate::processes::agent_sink::sealed_meta(
+            db,
+            &ctx.request_id,
+            ctx.nested_agent,
+            &envelope.meta,
+        );
+        let step_tools = crate::processes::agent_sink::step_tool_list(&sealed);
+        let run_id = if step_tools.is_some() {
+            ctx.request_id.clone()
+        } else {
+            envelope
+                .meta
+                .get("agent_run_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
         let agent_id = envelope
             .meta
             .get("agent_id")
@@ -1298,9 +1348,9 @@ impl CallerRun {
             run_id,
             agent_id,
             principal,
-            session_id,
+            session_id: ctx.session_id.clone(),
             code_session,
-            step_tools: crate::processes::agent_sink::step_tool_list(&envelope.meta),
+            step_tools,
         }
     }
 }
@@ -2506,7 +2556,13 @@ mod tests {
             if let Some(binding) = binding {
                 envelope.meta.insert("process_activity".into(), binding);
             }
-            CallerRun::from_envelope(&envelope, AgentPrincipal::user("u1"), None).step_tools
+            CallerRun::from_envelope(
+                &db(),
+                &crate::flow_engine::node_adapter::test_support::stub_ctx(),
+                &envelope,
+                AgentPrincipal::user("u1"),
+            )
+            .step_tools
         };
         assert_eq!(caller_of(None), None);
         assert_eq!(
@@ -3268,5 +3324,73 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(mgr.cancel_tree(&top), 0, "nothing is left to signal");
+    }
+
+    /// A run that joins the tree while the walk is under way is not left behind:
+    /// one that appears under a parent as soon as that parent is cancelled (a
+    /// parent is stopped before its children are listed), and one that appears
+    /// under a parent the walk has already listed (a final pass looks again).
+    #[tokio::test]
+    async fn cancel_tree_catches_runs_that_join_the_tree_during_the_walk() {
+        let pool = db();
+        seed_agent_with_continue(&pool, "top", "top", 4, "notify");
+        seed_agent_with_continue(&pool, "mid", "mid", 4, "notify");
+        seed_agent(&pool, "leaf", "leaf", "[]", 0, 1);
+        let mgr = manager(
+            pool.clone(),
+            Arc::new(GatedRunner {
+                gate: Gate::new(),
+                honor_cancel: true,
+            }),
+            8,
+        );
+        let principal = AgentPrincipal::user("u1");
+        let top = mgr
+            .spawn("top", "lead", None, &principal, &[], &[], None, None)
+            .await
+            .expect("spawn top");
+        let mid = mgr
+            .handle_agent_spawn(
+                &CallerRun {
+                    run_id: top.clone(),
+                    agent_id: "top".into(),
+                    principal: principal.clone(),
+                    session_id: None,
+                    code_session: None,
+                    step_tools: None,
+                },
+                &json!({"agent_name": "mid", "task": "middle"}),
+            )
+            .await
+            .expect("spawn mid")["run_ids"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let early = mgr
+            .spawn("leaf", "early", None, &principal, &[], &[], None, None)
+            .await
+            .expect("spawn early");
+        let late = mgr
+            .spawn("leaf", "late", None, &principal, &[], &[], None, None)
+            .await
+            .expect("spawn late");
+        // The database plays the part of the race: cancelling `top` hands `early`
+        // to it at once, cancelling `mid` (after `top` was listed) hands it `late`.
+        pool.write()
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TRIGGER adopt_early AFTER UPDATE OF status ON agent_runs \
+                 WHEN NEW.id='{top}' AND NEW.status='cancelled' \
+                 BEGIN UPDATE agent_runs SET parent_run_id='{top}' WHERE id='{early}'; END; \
+                 CREATE TRIGGER adopt_late AFTER UPDATE OF status ON agent_runs \
+                 WHEN NEW.id='{mid}' AND NEW.status='cancelled' \
+                 BEGIN UPDATE agent_runs SET parent_run_id='{top}' WHERE id='{late}'; END;"
+            ))
+            .unwrap();
+
+        assert_eq!(mgr.cancel_tree(&top), 4);
+        for id in [&top, &mid, &early, &late] {
+            wait_until_status(&pool, id, "cancelled").await;
+        }
     }
 }

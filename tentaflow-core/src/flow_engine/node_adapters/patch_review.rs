@@ -354,6 +354,7 @@ impl NodeAdapter for PatchReviewNodeAdapter {
             .clone()
             .ok_or_else(|| anyhow!("patch_review: AgentService slot not wired"))?;
         service.require_core_tool(
+            ctx,
             &envelope.meta,
             crate::agents::CoreToolName::GitCommit,
         )?;

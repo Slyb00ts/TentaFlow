@@ -2952,6 +2952,56 @@ test('an agent step keeps unsaved input visible and bounds the iteration limit',
   assert.equal(processAgentIterationLimit({ maxIterations: 5000 }), 100);
   assert.equal(processAgentIterationLimit({ maxIterations: 7 }), 7);
   assert.equal(processAgentPreset({ agentId: 'a', maxIterations: 0 }).implementation.Agent.maxIterations, 10);
+  // An agent that is gone states no limit: the step keeps what it has and cannot ask for more.
+  assert.equal(processAgentIterationLimit(undefined, 7), 7);
+  assert.equal(processAgentIterationLimit(undefined, 500), 100);
+  graph.destroy(); config.destroy();
+});
+
+test('a step whose agent is no longer offered cannot raise its iteration limit', async () => {
+  const graph = canvas();
+  const stored = { agentId: 'gone-agent', goalExpression: '"Summarise"', allowedTools: [], maxIterations: 7, outputSchema: null };
+  graph.addNodeFromTemplate({ ...processTemplates().find((row) => row.node_type === 'bpmn_service_task'), preset: { implementation: { Agent: stored } } }, 300, 300);
+  const agent = graph.nodes.at(-1);
+  const config = inspector(graph); config.show(agent, graph.templates.get(agent.type));
+  await flush(2);
+  const control = (key) => config.root.querySelector(`[data-process="${key}"]`);
+  assert.equal(control('agentIterations').getAttribute('max'), '7');
+  assert.ok(control('agentId').innerHTML.includes(I18n.t('bpmn.agent_unavailable')), 'the agent shows as unavailable');
+  change(control('agentIterations'), '50');
+  assert.equal(agent.config.implementation.Agent.maxIterations, 7, 'more than the step had is cut');
+  graph.destroy(); config.destroy();
+});
+
+test('an agent step keeps a refused draft across a node switch and publishing names it', async () => {
+  const graph = canvas();
+  const preset = { implementation: { Agent: { agentId: 'agent-1', goalExpression: '"Summarise"', allowedTools: [], maxIterations: 5, outputSchema: { type: 'object' } } } };
+  const template = processTemplates().find((row) => row.node_type === 'bpmn_service_task');
+  graph.addNodeFromTemplate({ ...template, preset: structuredClone(preset) }, 300, 300);
+  const first = graph.nodes.at(-1);
+  graph.addNodeFromTemplate({ ...template, preset: structuredClone(preset) }, 600, 300);
+  const second = graph.nodes.at(-1);
+  const config = inspector(graph); config.show(first, graph.templates.get(first.type));
+  await flush(2);
+  const control = (key) => config.root.querySelector(`[data-process="${key}"]`);
+  assert.deepEqual(config.processDraftProblems(), []);
+
+  change(control('agentSchema'), '{broken');
+  change(control('agentIterations'), '');
+  config.show(second, graph.templates.get(second.type));
+  await flush(2);
+  assert.equal(control('agentSchema').getAttribute('error'), null, 'the other node is not marked');
+  config.show(first, graph.templates.get(first.type));
+  await flush(2);
+  assert.equal(control('agentSchema').getAttribute('value'), '{broken', 'the text survives leaving the node');
+  assert.equal(control('agentSchema').getAttribute('error'), I18n.t('bpmn.agent_output_schema_invalid'));
+  assert.equal(control('agentIterations').getAttribute('error'), I18n.t('bpmn.agent_iterations_invalid'));
+  assert.equal(config.processDraftProblems().length, 2, 'publishing is told about both');
+  assert.ok(config.processDraftProblems().every((line) => line.includes(I18n.t('bpmn.agent_iterations_invalid')) || line.includes(I18n.t('bpmn.agent_output_schema_invalid'))));
+
+  change(control('agentSchema'), '{"type":"string"}');
+  change(control('agentIterations'), '4');
+  assert.equal(config.processDraftProblems().length, 0, 'a fixed field no longer blocks');
   graph.destroy(); config.destroy();
 });
 

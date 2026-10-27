@@ -244,6 +244,7 @@ impl ToolExecNodeAdapter {
     async fn run_task_complete_call(
         service: &Arc<AgentService>,
         run_id: &str,
+        nested: bool,
         envelope: &FlowEnvelope,
         call: &LlmToolCall,
     ) -> ToolCallResult {
@@ -255,7 +256,7 @@ impl ToolExecNodeAdapter {
         let run_id = run_id.to_owned();
         let meta = envelope.meta.clone();
         let outcome = tokio::task::spawn_blocking(move || {
-            let sealed = process_sink::sealed_meta(&db, &run_id, &meta);
+            let sealed = process_sink::sealed_meta(&db, &run_id, nested, &meta);
             let Some(binding) = process_sink::binding_from_meta(&sealed) else {
                 return Err("this run is not a process step \
                      (core.task_complete works only inside a process agent step)"
@@ -973,11 +974,17 @@ impl ToolExecNodeAdapter {
         tools_json: &str,
         call: &LlmToolCall,
     ) -> ToolCallResult {
-        let meta = process_sink::sealed_meta(service.db(), &ctx.request_id, &envelope.meta);
+        let meta = process_sink::sealed_meta(
+            service.db(),
+            &ctx.request_id,
+            ctx.nested_agent,
+            &envelope.meta,
+        );
         if !service.tool_allowed_in_run(&tools_json, &meta, &call.name) {
             error_result(call, format!("tool '{}' not in agent allowlist", call.name))
         } else if Self::is_process_sink(&call.name) {
-            Self::run_task_complete_call(service, &ctx.request_id, envelope, call).await
+            Self::run_task_complete_call(service, &ctx.request_id, ctx.nested_agent, envelope, call)
+                .await
         } else if CoreToolName::from_public_name(&call.name)
             .map(|c| c.is_ask_user())
             .unwrap_or(false)
@@ -1163,7 +1170,7 @@ impl NodeAdapter for ToolExecNodeAdapter {
         let manager = crate::agents::agent_run_manager_global();
         let mut results: Vec<ToolCallResult> = Vec::with_capacity(calls.len());
 
-        let caller = CallerRun::from_envelope(envelope, principal.clone(), ctx.session_id.clone());
+        let caller = CallerRun::from_envelope(service.db(), ctx, envelope, principal.clone());
         // Parent chain for bubbling a child's question to the same principal
         // (§3.13 A): the dashboard sees the parent_run_id so the ask is visibly
         // attributed up the spawn tree.
@@ -2167,6 +2174,18 @@ mod process_sink_tests {
         request_id: &str,
         calls: Vec<LlmToolCall>,
     ) -> Vec<String> {
+        answers_in(fixture, binding, meta_run_id, request_id, false, calls).await
+    }
+
+    /// Like [`answers_as`], for a run under an `agent` block when `nested`.
+    async fn answers_in(
+        fixture: &Fixture,
+        binding: Option<&ProcessActivityBinding>,
+        meta_run_id: &str,
+        request_id: &str,
+        nested: bool,
+        calls: Vec<LlmToolCall>,
+    ) -> Vec<String> {
         let mut env = FlowEnvelope::empty();
         env.meta.insert("agent_id".into(), json!(AGENT_ID));
         env.meta.insert("agent_run_id".into(), json!(meta_run_id));
@@ -2192,6 +2211,7 @@ mod process_sink_tests {
         };
         let mut ctx = stub_ctx();
         ctx.request_id = request_id.to_owned();
+        ctx.nested_agent = nested;
         let out = adapter(fixture)
             .execute(&node, &[input], &ctx)
             .await
@@ -2335,6 +2355,7 @@ mod process_sink_tests {
         let answered = ToolExecNodeAdapter::run_task_complete_call(
             &service(&fixture),
             &binding.agent_run_id(),
+            false,
             &envelope,
             &report,
         )
@@ -2392,7 +2413,7 @@ mod process_sink_tests {
     }
 
     #[tokio::test]
-    async fn without_the_binding_the_sink_is_not_a_process_step() {
+    async fn the_sink_follows_the_run_the_engine_executes_not_the_binding_in_meta() {
         let fixture = Fixture::new();
         seed_agent(&fixture, AGENT_ID, r#"["core.task_complete"]"#, 10, true);
         let (_, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
@@ -2408,10 +2429,133 @@ mod process_sink_tests {
         assert_eq!(rows(&fixture), 0);
 
         // A node that deleted the binding of a genuine step does not unmake the
-        // step: the process model still says which step this run belongs to.
+        // step for its own model: the process model still says which step the
+        // run the engine executes belongs to (a nested agent is another matter,
+        // see `a_nested_agent_under_the_step_run_cannot_finish_the_step`).
         let restored = answers(&fixture, None, &binding.agent_run_id(), report()).await;
         assert!(restored[0].contains("recorded"), "{restored:?}");
         assert_eq!(rows(&fixture), 1);
+    }
+
+    /// A nested `agent` block runs under the step run's request id, so the id is
+    /// not enough to tell its model from the step's own: it must not be able to
+    /// finish the step, with or without a binding in the meta it carries.
+    #[tokio::test]
+    async fn a_nested_agent_under_the_step_run_cannot_finish_the_step() {
+        let fixture = Fixture::new();
+        seed_agent(&fixture, AGENT_ID, r#"["core.task_complete"]"#, 10, true);
+        let (_, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+        let run_id = binding.agent_run_id();
+        let report = |id: &str| {
+            vec![call(
+                id,
+                "core.task_complete",
+                json!({"outcome": "completed", "summary": "done"}),
+            )]
+        };
+        for carried in [Some(&binding), None] {
+            let nested = answers_in(&fixture, carried, &run_id, &run_id, true, report("c1")).await;
+            assert!(
+                nested[0].contains("not in agent allowlist") || nested[0].contains("not a process step"),
+                "{nested:?}"
+            );
+            assert_eq!(rows(&fixture), 0);
+        }
+        // Even a call that gets past the tool gate meets a sink that sees no claim.
+        let mut env = FlowEnvelope::empty();
+        let (key, value) = binding.meta_entry();
+        env.meta.insert(key.into(), value);
+        let direct = ToolExecNodeAdapter::run_task_complete_call(
+            &service(&fixture),
+            &run_id,
+            true,
+            &env,
+            &report("c3")[0],
+        )
+        .await;
+        assert!(direct.content.contains("not a process step"), "{}", direct.content);
+        assert_eq!(rows(&fixture), 0);
+        // The step's own model, on the very same run id, still reports.
+        let own = answers_in(&fixture, None, &run_id, &run_id, false, report("c2")).await;
+        assert!(own[0].contains("recorded"), "{own:?}");
+        assert_eq!(rows(&fixture), 1);
+    }
+
+    /// A nested agent keeps the step's narrowing even though it holds no claim.
+    #[tokio::test]
+    async fn a_nested_agent_keeps_the_step_tool_list() {
+        let skill = call("c1", "core.skill_view", json!({"name": "missing"}));
+        let other = call("c2", "core.fs_read", json!({"path": "a"}));
+        let fixture = Fixture::new();
+        seed_agent(
+            &fixture,
+            AGENT_ID,
+            r#"["core.skill_view","core.fs_read"]"#,
+            10,
+            true,
+        );
+        let (_, binding) = running_step(
+            &fixture,
+            agent_implementation(AGENT_ID, &["core.skill_view"], None),
+        );
+        let run_id = binding.agent_run_id();
+        let answered = answers_in(&fixture, None, &run_id, &run_id, true, vec![skill, other]).await;
+        assert!(!answered[0].contains("not in agent allowlist"), "{answered:?}");
+        assert!(answered[1].contains("not in agent allowlist"), "{answered:?}");
+    }
+
+    /// Delegation and graph-block verbs read the step from the process model:
+    /// meta that names another run, or widens the list, changes neither.
+    #[tokio::test]
+    async fn delegation_identity_and_limits_come_from_the_step_not_from_meta() {
+        let fixture = Fixture::new();
+        seed_agent(
+            &fixture,
+            AGENT_ID,
+            r#"["core.skill_view","core.fs_read","core.exec"]"#,
+            10,
+            true,
+        );
+        let (_, binding) = running_step(
+            &fixture,
+            agent_implementation(AGENT_ID, &["core.skill_view"], None),
+        );
+        let run_id = binding.agent_run_id();
+        let mut forged = FlowEnvelope::empty();
+        forged.meta.insert("agent_id".into(), json!(AGENT_ID));
+        forged.meta.insert("agent_run_id".into(), json!("another-run"));
+        let mut widened = binding.clone();
+        widened.allowed_tools = vec!["core.skill_view".into(), "core.fs_read".into()];
+        let (key, value) = widened.meta_entry();
+        forged.meta.insert(key.into(), value);
+        let mut ctx = stub_ctx();
+        ctx.request_id = run_id.clone();
+
+        let caller = CallerRun::from_envelope(
+            &fixture.db,
+            &ctx,
+            &forged,
+            AgentPrincipal::user("u1"),
+        );
+        assert_eq!(caller.run_id, run_id);
+        assert_eq!(caller.step_tools, Some(vec!["core.skill_view".to_owned()]));
+
+        // Even with the binding dropped altogether the step is still a step.
+        forged.meta.remove("process_activity");
+        let caller = CallerRun::from_envelope(
+            &fixture.db,
+            &ctx,
+            &forged,
+            AgentPrincipal::user("u1"),
+        );
+        assert_eq!(caller.run_id, run_id);
+        assert_eq!(caller.step_tools, Some(vec!["core.skill_view".to_owned()]));
+
+        // The graph-block sieve: the step lists no exec verb.
+        let svc = service(&fixture);
+        assert!(svc
+            .require_core_tool(&ctx, &forged.meta, crate::agents::CoreToolName::Exec)
+            .is_err());
     }
 
     #[tokio::test]

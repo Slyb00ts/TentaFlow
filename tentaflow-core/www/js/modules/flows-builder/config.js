@@ -272,6 +272,8 @@ export class FlowConfig {
     this.processTabNode = null;
     // Text of a field the author typed that cannot be saved yet, keyed by node and
     // field: a re-render must show it with its error, not the last valid value.
+    // Leaving the node does not discard it, and publishing refuses while one is
+    // left (`processDraftProblems`), so a typed value never vanishes unseen.
     this.processDrafts = new Map();
     this.readOnly = !!opts.readOnly;
     this.mode = opts.mode || 'flow';
@@ -280,6 +282,19 @@ export class FlowConfig {
   }
 
   setTemplate(tpl) { this.template = tpl; }
+
+  /** One line per field whose typed text was refused and is still unfixed, named by its node. */
+  processDraftProblems() {
+    const canvas = this.opts.getCanvas?.();
+    const nodes = canvas?.nodes || [];
+    const labels = processNodeLabels(nodes, canvas?.templates);
+    const problems = [];
+    for (const [key, draft] of this.processDrafts) {
+      const nodeId = key.slice(0, key.lastIndexOf(':'));
+      if (nodes.some((node) => node.id === nodeId)) problems.push(`${labels.get(nodeId)}: ${I18n.t(draft.errorKey)}`);
+    }
+    return problems;
+  }
 
   show(node, template) {
     this.node = node;
@@ -293,7 +308,6 @@ export class FlowConfig {
     const owner = processBoundaryKind(node.type) ? node.config.attachedToId : node.id;
     if (owner !== this.processTabNode) {
       this.processTab = 'impl';
-      this.processDrafts.clear();
     }
     this.processTabNode = owner;
     if (this.mode === 'bpmn') this._renderProcess();
@@ -693,7 +707,7 @@ export class FlowConfig {
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.agent_goal_hint'))}</p>
         ${textarea('agentTools', 'agent_tools', agentTask.allowedTools.join('\n'), 3)}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.agent_tools_hint'))}</p>
-        ${input('agentIterations', 'agent_iterations', draftOf('agentIterations')?.text ?? agentTask.maxIterations, `type="number" min="1" max="${processAgentIterationLimit(agents.find((agent) => agent.agentId === agentTask.agentId))}" step="1" ${draftError('agentIterations')}`)}
+        ${input('agentIterations', 'agent_iterations', draftOf('agentIterations')?.text ?? agentTask.maxIterations, `type="number" min="1" max="${processAgentIterationLimit(agents.find((agent) => agent.agentId === agentTask.agentId), agentTask.maxIterations)}" step="1" ${draftError('agentIterations')}`)}
         ${textarea('agentSchema', 'agent_output_schema', draftOf('agentSchema')?.text ?? (agentTask.outputSchema == null ? '' : JSON.stringify(agentTask.outputSchema, null, 2)), 4, draftError('agentSchema'))}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.agent_hint'))}</p>`
         : blockTask
@@ -1342,12 +1356,13 @@ export class FlowConfig {
               : { implementation: 'Flow' };
         // Only an agent may work longer than ten minutes.
         if (node.config.implementation?.Agent && node.config.timeoutSeconds > 600) next.timeoutSeconds = 600;
+        for (const field of ['agentIterations', 'agentSchema']) this.processDrafts.delete(`${node.id}:${field}`);
         this.opts.onConfigChange(node.id, next);
         this._renderProcess();
       } else if (key === 'agentId' || key === 'agentGoal' || key === 'agentIterations') {
         const current = node.config.implementation.Agent;
         const chosenId = key === 'agentId' ? control.value : current.agentId;
-        const limit = processAgentIterationLimit((this.opts.processOptions.serviceAgents || []).find((agent) => agent.agentId === chosenId));
+        const limit = processAgentIterationLimit((this.opts.processOptions.serviceAgents || []).find((agent) => agent.agentId === chosenId), current.maxIterations);
         const next = { ...current };
         if (key === 'agentIterations') {
           // An empty field reads as 0 and a typed number ignores the input's own

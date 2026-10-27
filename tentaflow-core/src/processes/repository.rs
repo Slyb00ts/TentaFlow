@@ -24811,7 +24811,7 @@ pub fn record_job_observation(
 ) -> Result<JobObservationState> {
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
-    let state = record_job_observation_on(&tx, claimed, worker_id, observed, at_ms)?;
+    let state = record_job_observation_on(&tx, &ObservationTarget::from(claimed), worker_id, observed, at_ms)?;
     tx.commit()?;
     Ok(state)
 }
@@ -24833,14 +24833,47 @@ pub fn commit_boundary_and_observe(
     if !commit_job_dispatch_boundary_on(&tx, claimed, worker_id, at_ms)? {
         return Ok(None);
     }
-    let state = record_job_observation_on(&tx, claimed, worker_id, observed, at_ms)?;
+    let state = record_job_observation_on(&tx, &ObservationTarget::from(claimed), worker_id, observed, at_ms)?;
     tx.commit()?;
     Ok(Some(state))
 }
 
+/// What an observation is recorded against: the identity of one dispatched
+/// invocation. A claimed job carries it; so can a bare invocation row, which is
+/// all a failure handler has when it finds the agent's report already stored.
+struct ObservationTarget {
+    actor: ProcessActor,
+    job_id: String,
+    instance_id: String,
+    scope_id: String,
+    node_id: String,
+    attempt: u32,
+    fence: u64,
+    invocation_id: String,
+    request_id: String,
+    result_event_id: String,
+}
+
+impl From<&ClaimedProcessJob> for ObservationTarget {
+    fn from(claimed: &ClaimedProcessJob) -> Self {
+        Self {
+            actor: claimed.actor.clone(),
+            job_id: claimed.job.job_id.clone(),
+            instance_id: claimed.job.instance_id.clone(),
+            scope_id: claimed.job.scope_id.clone(),
+            node_id: claimed.job.node_id.clone(),
+            attempt: claimed.job.attempt,
+            fence: claimed.job.fence,
+            invocation_id: claimed.invocation_id.clone(),
+            request_id: claimed.request_id.clone(),
+            result_event_id: claimed.result_event_id.clone(),
+        }
+    }
+}
+
 fn record_job_observation_on(
     tx: &Transaction<'_>,
-    claimed: &ClaimedProcessJob,
+    target: &ObservationTarget,
     worker_id: &str,
     observed: &ObservedActivityResult,
     at_ms: i64,
@@ -24857,17 +24890,17 @@ fn record_job_observation_on(
             Option<String>,Option<String>,Option<String>,String,String,String,Option<String>) =
         tx.query_row(
             "SELECT phase,dispatch_evidence,dispatch_attempt,dispatch_fence,dispatch_worker_id,stable_request_id,observed_result_json,observed_result_sha256,uncertainty_incident_id,instance_id,scope_id,node_id,reserved_result_event_id FROM bpmn_service_invocations WHERE invocation_id=?1 AND job_id=?2",
-            params![claimed.invocation_id,claimed.job.job_id],
+            params![target.invocation_id,target.job_id],
             |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row_optional_u64(row, 3)?,row.get(4)?,
                 row.get(5)?,row.get(6)?,row.get(7)?,row.get(8)?,row.get(9)?,
                 row.get(10)?,row.get(11)?,row.get(12)?)))?;
     ensure!(evidence == "committed_boundary"
-        && attempt == Some(claimed.job.attempt)
-        && fence == Some(claimed.job.fence)
+        && attempt == Some(target.attempt)
+        && fence == Some(target.fence)
         && original_worker.as_deref() == Some(worker_id)
-        && request_id.as_deref() == Some(claimed.request_id.as_str())
-        && instance_id == claimed.job.instance_id
-        && scope_id == claimed.job.scope_id && node_id == claimed.job.node_id,
+        && request_id.as_deref() == Some(target.request_id.as_str())
+        && instance_id == target.instance_id
+        && scope_id == target.scope_id && node_id == target.node_id,
         "observed Service result lacks its original dispatch identity");
     if matches!(phase.as_str(), "observed" | "observed_blocked" | "accepted") {
         ensure!(stored_result.as_deref() == Some(bytes.as_str())
@@ -24882,39 +24915,39 @@ fn record_job_observation_on(
     }
     ensure!(matches!(phase.as_str(), "may_have_executed" | "uncertain"),
         "Service observation arrived before its dispatch boundary");
-    let live = job_activation_live_on(&tx, &claimed.job.job_id)?;
+    let live = job_activation_live_on(&tx, &target.job_id)?;
     let authority = if live {
-        require_call_control_authority_on(&tx, &claimed.actor, &instance_id)
-            .and_then(|_| job_source_ref_on(&tx, &claimed.job.job_id))
-            .and_then(|flow| require_source_current(&tx, &claimed.actor, &flow, None))
+        require_call_control_authority_on(&tx, &target.actor, &instance_id)
+            .and_then(|_| job_source_ref_on(&tx, &target.job_id))
+            .and_then(|flow| require_source_current(&tx, &target.actor, &flow, None))
     } else { Ok(()) };
     let blocked_reason = if !live { Some("activation_closed") }
         else if authority_denied(&authority) { Some("execution_authority_revoked") }
         else { None };
-    let reserved = claimed.result_event_id.clone();
+    let reserved = target.result_event_id.clone();
     let changed = tx.execute(
         "UPDATE bpmn_service_invocations SET phase='observed',observed_result_json=?1,observed_result_origin=?2,observed_result_sha256=?3,reserved_result_event_id=?4,observed_at_ms=?5,phase_revision=phase_revision+1,updated_at_ms=?5 WHERE invocation_id=?6 AND phase=?7 AND dispatch_evidence='committed_boundary' AND dispatch_attempt=?8 AND dispatch_fence=?9 AND dispatch_worker_id=?10",
         params![bytes,result_origin_text(&observed.origin),result_hash,reserved,
-            at_ms,claimed.invocation_id,phase,claimed.job.attempt,
-            sql_integer(claimed.job.fence)?,worker_id])?;
+            at_ms,target.invocation_id,phase,target.attempt,
+            sql_integer(target.fence)?,worker_id])?;
     ensure!(changed == 1, "Service observation changed before durable capture");
     if let Some(incident_id) = incident_id {
         let resolved_at_ms: Option<i64> = tx.query_row(
             "SELECT resolved_at_ms FROM bpmn_incidents WHERE incident_id=?1 AND instance_id=?2 AND scope_id=?3 AND job_id=?4 AND code='EXTERNAL_OUTCOME_UNCERTAIN'",
-            params![incident_id,instance_id,scope_id,claimed.job.job_id],
+            params![incident_id,instance_id,scope_id,target.job_id],
             |row| row.get(0))?;
         if resolved_at_ms.is_some() {
             let matching_event: u32 = tx.query_row(
                 "SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND kind IN ('incident','incident_resolved') AND json_extract(data_json,'$.incident_id')=?4 AND json_extract(data_json,'$.invocation_id')=?5 AND json_extract(data_json,'$.job_id')=?6 AND json_extract(data_json,'$.reason')='activity_cancelled_after_dispatch' AND json_extract(data_json,'$.resolution_reason')='activity_cancelled_after_dispatch' AND json_extract(data_json,'$.dispatch_attempt')=?7 AND json_extract(data_json,'$.dispatch_fence')=?8",
-                params![instance_id,scope_id,node_id,incident_id,claimed.invocation_id,
-                    claimed.job.job_id,claimed.job.attempt,sql_integer(claimed.job.fence)?],
+                params![instance_id,scope_id,node_id,incident_id,target.invocation_id,
+                    target.job_id,target.attempt,sql_integer(target.fence)?],
                 |row| row.get(0))?;
             ensure!(blocked_reason == Some("activation_closed") && matching_event == 1,
                 "resolved Service uncertainty lacks its exact cancelled activation history");
         } else {
             let changed = tx.execute(
                 "UPDATE bpmn_incidents SET resolved_at_ms=?1 WHERE incident_id=?2 AND instance_id=?3 AND scope_id=?4 AND job_id=?5 AND code='EXTERNAL_OUTCOME_UNCERTAIN' AND resolved_at_ms IS NULL",
-                params![at_ms,incident_id,instance_id,scope_id,claimed.job.job_id])?;
+                params![at_ms,incident_id,instance_id,scope_id,target.job_id])?;
             ensure!(changed == 1, "original uncertainty incident was not open");
         }
         if blocked_reason.is_none() {
@@ -24925,13 +24958,13 @@ fn record_job_observation_on(
         }
     }
     if let Some(reason) = blocked_reason {
-        block_observed_invocation_on(&tx, &claimed.invocation_id, &claimed.job.job_id,
-            &instance_id, &scope_id, &node_id, claimed.job.attempt,
-            claimed.job.fence, &reserved, reason, at_ms)?;
+        block_observed_invocation_on(&tx, &target.invocation_id, &target.job_id,
+            &instance_id, &scope_id, &node_id, target.attempt,
+            target.fence, &reserved, reason, at_ms)?;
     }
     if let Some(group_id) = tx.query_row(
         "SELECT group_id FROM bpmn_repetition_occurrences WHERE instance_id=?1 AND job_id=?2",
-        params![instance_id,claimed.job.job_id], |row| row.get::<_, String>(0)).optional()? {
+        params![instance_id,target.job_id], |row| row.get::<_, String>(0)).optional()? {
         refresh_repetition_retained_bytes_on(&tx, &instance_id, &group_id)?;
     }
     Ok(if blocked_reason.is_some() { JobObservationState::Blocked }
@@ -27391,6 +27424,13 @@ pub const RECOVERY_FAILURES_BEFORE_INCIDENT: i64 = 5;
 /// The periodic scan over observed addon tool results (`?1` is the page size).
 pub const DEFERRED_SCAN_SQL: &str = "SELECT j.job_id,j.attempt,j.fence,COALESCE(v.dispatch_worker_id,j.worker_id),j.instance_id,i.org_id,i.initiator_user_id,v.observed_result_json FROM bpmn_service_invocations v JOIN bpmn_jobs j ON j.job_id=v.job_id JOIN bpmn_instances i ON i.instance_id=j.instance_id LEFT JOIN bpmn_result_recovery r ON r.invocation_id=v.invocation_id WHERE v.phase='observed' AND v.implementation_kind='addon_tool' ORDER BY COALESCE(r.last_checked_ms,0),j.created_at_ms,j.job_id LIMIT ?1";
 
+/// Observed agent results, read from the running jobs: an agent result waits
+/// (its access check was undecided, a salvaged report is not yet accepted) on a
+/// job that still holds `running`, so the job status index narrows the scan to
+/// the queue's live jobs instead of every invocation row. A result with an open
+/// recovery incident belongs to `OPEN_INCIDENT_SCAN_SQL`, never to both.
+pub const AGENT_DEFERRED_SCAN_SQL: &str = "SELECT j.job_id,j.attempt,j.fence,COALESCE(v.dispatch_worker_id,j.worker_id),j.instance_id,i.org_id,i.initiator_user_id,v.observed_result_json FROM bpmn_jobs j JOIN bpmn_service_invocations v ON v.job_id=j.job_id JOIN bpmn_instances i ON i.instance_id=j.instance_id LEFT JOIN bpmn_result_recovery r ON r.invocation_id=v.invocation_id WHERE j.status='running' AND v.phase='observed' AND v.implementation_kind='agent' AND r.incident_id IS NULL ORDER BY COALESCE(r.last_checked_ms,0),j.created_at_ms,j.job_id LIMIT ?1";
+
 /// The periodic scan over observed flow and block results whose acceptance failed and
 /// shows a recovery incident (`?1` is the page size, `?2` the current time, `?3` the
 /// first retry delay and `?4` the longest one). Such a result was correct but could not
@@ -27582,6 +27622,7 @@ pub fn recover_deferred_results(
         Ok(rows)
     };
     let mut rows = read_rows(DEFERRED_SCAN_SQL, &[&page])?;
+    rows.extend(read_rows(AGENT_DEFERRED_SCAN_SQL, &[&page])?);
     rows.extend(read_rows(OPEN_INCIDENT_SCAN_SQL,
         &[&page, &now_ms, &OPEN_INCIDENT_RETRY_AFTER_MS, &OPEN_INCIDENT_RETRY_MAX_MS])?);
     drop(conn);
@@ -28067,6 +28108,40 @@ pub fn fail_job_with_authority(
     if phase == "may_have_executed" {
         ensure!(observed.is_none(),
             "observed Service result must be persisted before failure handling");
+        // An agent that reported before the step was abandoned has its result on
+        // record, and the report can land between the caller's look and this
+        // transaction. Failing the row now would strand a valid report behind an
+        // incident, so the report is observed instead and accepted like any other
+        // observed result. A revocation still blocks: the report is then recorded
+        // as observed and blocked by the observation itself.
+        if !authority_revoked {
+            if let Some(report) = super::agent_sink::recorded_completion(&tx, &invocation_id)? {
+                let (org_id, user_id, request_id): (String, String, String) = tx.query_row(
+                    "SELECT i.org_id,i.initiator_user_id,v.stable_request_id FROM bpmn_instances i JOIN bpmn_service_invocations v ON v.instance_id=i.instance_id WHERE i.instance_id=?1 AND v.invocation_id=?2",
+                    params![instance_id,invocation_id],
+                    |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+                let target = ObservationTarget {
+                    actor: ProcessActor { org_id, user_id },
+                    job_id: job_id.to_owned(),
+                    instance_id: instance_id.clone(),
+                    scope_id: scope_id.clone(),
+                    node_id: node_id.clone(),
+                    attempt,
+                    fence,
+                    invocation_id: invocation_id.clone(),
+                    request_id,
+                    result_event_id: Uuid::new_v4().to_string(),
+                };
+                let reported = ObservedActivityResult {
+                    result: report,
+                    origin: ActivityResultOrigin::Contract,
+                    expression_observation: None,
+                };
+                record_job_observation_on(&tx, &target, worker_id, &reported, now_ms)?;
+                tx.commit()?;
+                return Ok(false);
+            }
+        }
         // This failure carries its own incident; a recovery incident raised for
         // the same row earlier must not stay open next to it.
         resolve_recovery_incident_on(&tx, job_id, now_ms, false)?;

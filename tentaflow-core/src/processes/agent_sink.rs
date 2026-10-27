@@ -63,24 +63,47 @@ pub fn step_iteration_cap(pool: &DbPool, run_id: &str) -> Result<Option<i64>> {
 }
 
 /// Run meta as the process layer vouches for it: for a run that really belongs to
-/// a step, the binding comes from the process model whatever meta says; any other
-/// run keeps its meta. A step whose contract cannot be read gets an unreadable
-/// binding, which admits no tool at all.
+/// a step, the step's tool list comes from the process model whatever meta says;
+/// any other run keeps its meta.
+///
+/// `nested` is `ExecutionContext::nested_agent`. A nested agent shares the step
+/// run's id, so the id alone would hand it the step's binding (and with it
+/// `core.task_complete`); it gets the narrowing marker instead, never the claim.
+///
+/// A step whose contract cannot be read gets an unreadable entry, which admits
+/// no tool at all. The read can fail for reasons that have nothing to do with a
+/// step, so only a run whose meta claims one fails closed; any other run keeps
+/// its meta rather than losing its tools to a transient database error.
 pub fn sealed_meta(
     pool: &DbPool,
     run_id: &str,
+    nested: bool,
     meta: &BTreeMap<String, Value>,
 ) -> BTreeMap<String, Value> {
     let mut sealed = meta.clone();
     match step_contract(pool, run_id) {
         Ok(None) => {}
+        Ok(Some(contract)) if nested => {
+            sealed.remove(PROCESS_ACTIVITY_META_KEY);
+            sealed.insert(
+                PROCESS_STEP_TOOLS_META_KEY.to_owned(),
+                json!(contract.binding.allowed_tools),
+            );
+        }
         Ok(Some(contract)) => {
             let (key, value) = contract.binding.meta_entry();
             sealed.insert(key.to_owned(), value);
         }
         Err(error) => {
             tracing::error!(run_id, error = %error, "cannot read the contract of an agent step");
-            sealed.insert(PROCESS_ACTIVITY_META_KEY.to_owned(), Value::Null);
+            if meta.contains_key(PROCESS_ACTIVITY_META_KEY) && !nested {
+                sealed.insert(PROCESS_ACTIVITY_META_KEY.to_owned(), Value::Null);
+            } else if meta.contains_key(PROCESS_ACTIVITY_META_KEY)
+                || meta.contains_key(PROCESS_STEP_TOOLS_META_KEY)
+            {
+                sealed.remove(PROCESS_ACTIVITY_META_KEY);
+                sealed.insert(PROCESS_STEP_TOOLS_META_KEY.to_owned(), Value::Null);
+            }
         }
     }
     sealed

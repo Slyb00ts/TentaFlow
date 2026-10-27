@@ -1586,6 +1586,9 @@ fn the_production_claim_and_scan_queries_use_their_indexes() {
         scan.contains("idx_bpmn_invocations_observed_tool"),
         "{scan}"
     );
+    let agent_scan = plan(repository::AGENT_DEFERRED_SCAN_SQL, &[5]);
+    assert!(agent_scan.contains("SEARCH j USING INDEX"), "{agent_scan}");
+    assert!(!agent_scan.contains("SCAN"), "{agent_scan}");
 }
 
 fn incident_rows(fixture: &Fixture, instance_id: &str) -> Vec<(String, bool)> {

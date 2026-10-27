@@ -191,9 +191,14 @@ const AGENT_STEP_DEFAULT_ITERATIONS = 10;
 // The model accepts 1..=100 iterations whatever the agent allows.
 const AGENT_STEP_MAX_ITERATIONS = 100;
 
-/** The most iterations a step of `agent` may ask for: the agent's own limit, never above the model's. */
-export function processAgentIterationLimit(agent) {
-  return agent?.maxIterations > 0 ? Math.min(agent.maxIterations, AGENT_STEP_MAX_ITERATIONS) : AGENT_STEP_MAX_ITERATIONS;
+/**
+ * The most iterations a step of `agent` may ask for: the agent's own limit, never
+ * above the model's. An agent that is not in the list (disabled, removed) states
+ * no limit, so the step may keep what it has (`current`) and ask for no more.
+ */
+export function processAgentIterationLimit(agent, current = AGENT_STEP_MAX_ITERATIONS) {
+  if (!agent) return Math.min(current, AGENT_STEP_MAX_ITERATIONS);
+  return agent.maxIterations > 0 ? Math.min(agent.maxIterations, AGENT_STEP_MAX_ITERATIONS) : AGENT_STEP_MAX_ITERATIONS;
 }
 
 /**

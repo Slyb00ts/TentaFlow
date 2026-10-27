@@ -55,7 +55,7 @@ impl SubagentStatusNodeAdapter {
             ctx.actor(),
         )
         .with_correlation_id(ctx.correlation_id.clone());
-        let caller = CallerRun::from_envelope(envelope, principal, ctx.session_id.clone());
+        let caller = CallerRun::from_envelope(manager.db(), ctx, envelope, principal);
         if caller.run_id.is_empty() {
             return Err(anyhow!(
                 "subagent_status: requires a managed run context (place after agent_context)"

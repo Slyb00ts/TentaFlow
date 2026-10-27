@@ -104,6 +104,7 @@ impl NodeAdapter for ExecCommandNodeAdapter {
             .clone()
             .ok_or_else(|| anyhow!("exec_command: AgentService slot not wired"))?;
         service.require_core_tool(
+            ctx,
             &envelope.meta,
             crate::agents::CoreToolName::Exec,
         )?;

@@ -178,7 +178,7 @@ impl SpawnNodeAdapter {
             ctx.actor(),
         )
         .with_correlation_id(ctx.correlation_id.clone());
-        let caller = CallerRun::from_envelope(envelope, principal, ctx.session_id.clone());
+        let caller = CallerRun::from_envelope(manager.db(), ctx, envelope, principal);
         if caller.run_id.is_empty() {
             return Err(anyhow!(
                 "spawn: requires a managed run context (place after agent_context)"
@@ -191,7 +191,7 @@ impl SpawnNodeAdapter {
             .read()
             .clone()
             .ok_or_else(|| anyhow!("spawn: AgentService slot not wired"))?;
-        service.require_core_tool(&envelope.meta, CoreToolName::AgentSpawn)?;
+        service.require_core_tool(ctx, &envelope.meta, CoreToolName::AgentSpawn)?;
 
         let mut args = json!({ "agent_name": agent_name, "task": task });
         if let Some(context) = context {

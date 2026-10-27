@@ -43,6 +43,8 @@ enum Script {
     /// Starts a sub-agent and works until cancelled; the sub-agent works until
     /// cancelled too.
     DelegateAndHold,
+    /// Starts a sub-agent that works until cancelled, then ends without a report.
+    DelegateAndFinish,
 }
 
 #[derive(Default)]
@@ -116,6 +118,30 @@ impl BackgroundFlowRunner for ScriptedRunner {
                 cancel.cancelled().await;
                 self.cancelled.store(true, Ordering::Release);
                 anyhow::bail!("cancelled");
+            }
+            Script::DelegateAndFinish => {
+                if let Some(binding) = binding_from_meta(&initial.meta) {
+                    let manager = self.manager.lock().unwrap().clone().expect("a manager");
+                    let caller = crate::agents::CallerRun {
+                        run_id: scope.clone(),
+                        agent_id: AGENT_ID.into(),
+                        principal,
+                        session_id: None,
+                        code_session: None,
+                        step_tools: Some(binding.allowed_tools.clone()),
+                    };
+                    manager
+                        .handle_agent_spawn(
+                            &caller,
+                            &json!({"agent_name": HELPER_ID, "task": "help"}),
+                        )
+                        .await
+                        .expect("the step delegates");
+                } else {
+                    cancel.cancelled().await;
+                    self.cancelled.store(true, Ordering::Release);
+                    anyhow::bail!("cancelled");
+                }
             }
             Script::DelegateAndHold => {
                 if let Some(binding) = binding_from_meta(&initial.meta) {
@@ -966,10 +992,13 @@ async fn an_abandoned_step_still_ends_with_the_report_on_record() {
         "nothing was failed on the way"
     );
 
-    // Without a report to salvage the abandonment is the incident it always was.
+    // Without a report on record the abandonment is the incident it always was.
+    let bare = Fixture::new();
+    seed_agent(&bare, AGENT_ID, "[]", 10, true);
+    let (unreported, _) = running_step(&bare, agent_implementation(AGENT_ID, &[], None));
     assert!(drive_abandoned(
-        &fixture,
-        &claimed,
+        &bare,
+        &unreported,
         "agent-worker",
         Duration::from_secs(1),
         false,
@@ -978,7 +1007,7 @@ async fn an_abandoned_step_still_ends_with_the_report_on_record() {
     .await
     .unwrap()
     .is_none());
-    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "uncertain");
+    assert_eq!(invocation(&bare, &unreported.job.job_id).2, "uncertain");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1141,4 +1170,124 @@ async fn a_worker_stopped_right_after_the_report_still_ends_the_step_with_it() {
         current.jobs[0].result.as_ref().unwrap().outputs,
         json!({"n": 4})
     );
+}
+
+#[tokio::test]
+async fn a_run_that_settles_on_its_own_does_not_leave_its_sub_agents_working() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    seed_agent(&fixture, HELPER_ID, "[]", 10, true);
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute(
+            "UPDATE agents SET max_subagents=2,max_spawn_depth=2 WHERE id=?1",
+            [AGENT_ID],
+        )
+        .unwrap();
+    let rig = install(&fixture, Script::DelegateAndFinish);
+    let started = start_model(
+        &fixture,
+        &agent_model(agent_implementation(AGENT_ID, &[], None)),
+    );
+    let claimed = claim_and_execute(&fixture).await;
+
+    // The step run ended by itself without a report: an incident, as ever.
+    let step_run = agent_run_id(&claimed.invocation_id);
+    assert_eq!(
+        snapshot(&fixture, &started.instance_id).instance.status,
+        ProcessInstanceStatus::Incident
+    );
+    // Nothing the run started may outlive the step.
+    wait_for(|| rig.cancelled.load(Ordering::Acquire)).await;
+    let delegate = crate::db::repository::list_agent_runs_by_parent(&fixture.db, &step_run)
+        .unwrap()
+        .pop()
+        .expect("the step run delegated");
+    let (db, id) = (fixture.db.clone(), delegate.id.clone());
+    wait_for(move || {
+        crate::db::repository::get_agent_run(&db, &id)
+            .unwrap()
+            .is_some_and(|run| run.status == "cancelled")
+    })
+    .await;
+    drop(rig.manager);
+}
+
+#[tokio::test]
+async fn a_report_that_lands_while_the_claim_is_being_failed_is_observed_not_stranded() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    let (claimed, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+    // The salvage looked before the report existed; the report commits, then the
+    // claim is failed.
+    complete_task(
+        &fixture.db,
+        &binding,
+        &binding.agent_run_id(),
+        &report("landed in the gap", json!({"n": 4})),
+        now_ms(),
+    )
+    .unwrap();
+    super::jobs::fail_claim(
+        &fixture.db,
+        "agent-worker",
+        &claimed,
+        "SERVICE_TIMEOUT",
+        "the service task exceeded its configured timeout after dispatch",
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        invocation(&fixture, &claimed.job.job_id).2,
+        "observed",
+        "a valid report is not buried under an uncertainty incident"
+    );
+
+    // The deferred pass accepts it like any other recorded result.
+    let authority = super::runtime::tool_authority(fixture.dispatcher());
+    let nobody = |_: &str| false;
+    assert_eq!(
+        repository::recover_deferred_results(
+            &fixture.db,
+            now_ms(),
+            &authority,
+            &nobody,
+            repository::RECOVERY_PAGE
+        )
+        .unwrap(),
+        1
+    );
+    let current = snapshot(&fixture, &claimed.job.instance_id);
+    assert_eq!(current.instance.status, ProcessInstanceStatus::Completed);
+    assert_eq!(
+        current.jobs[0].result.as_ref().unwrap().outputs,
+        json!({"n": 4})
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_authority_still_fails_the_claim_even_with_a_report_on_record() {
+    let fixture = Fixture::new();
+    seed_agent(&fixture, AGENT_ID, "[]", 10, true);
+    let (claimed, binding) = running_step(&fixture, agent_implementation(AGENT_ID, &[], None));
+    complete_task(
+        &fixture.db,
+        &binding,
+        &binding.agent_run_id(),
+        &report("reported", json!({"n": 1})),
+        now_ms(),
+    )
+    .unwrap();
+    super::jobs::fail_claim(
+        &fixture.db,
+        "agent-worker",
+        &claimed,
+        "SOURCE_ACCESS_REVOKED",
+        "the agent was disabled",
+        None,
+    )
+    .unwrap();
+    assert_eq!(invocation(&fixture, &claimed.job.job_id).2, "uncertain");
 }

@@ -658,6 +658,7 @@ impl ContextFactory {
             cancel_token: meta.cancel_token.clone(),
             subflow_depth: meta.flow_depth,
             subflow_visited: Arc::new(Vec::new()),
+            nested_agent: false,
             initial_envelope: Arc::new(FlowEnvelope::empty()),
             clock: self.clock.clone(),
             blobs: self.blobs.clone(),

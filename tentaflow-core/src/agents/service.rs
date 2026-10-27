@@ -15,7 +15,10 @@ use crate::compliance::ai_gateway::{AiGateway, ToolExecution};
 use crate::db::{models::DbAgent, repository, DbPool};
 use crate::flow_engine::dispatchers::LlmToolSpec;
 use crate::flow_engine::envelope::LlmToolCall;
-use crate::processes::agent_sink::{allow_list_json, binding_in_meta, step_tool_list, MetaBinding};
+use crate::flow_engine::node_adapter::ExecutionContext;
+use crate::processes::agent_sink::{
+    allow_list_json, binding_in_meta, sealed_meta, step_tool_list, MetaBinding,
+};
 
 use super::builtins::{execute_core_tool, is_core_tool, CoreToolName};
 use super::catalog::{tool_in_allowlist, ToolCatalog};
@@ -429,15 +432,19 @@ impl AgentService {
     /// therefore passes exactly the sieve a model-issued call passes.
     ///
     /// The sieve is the run's own ([`Self::tool_allowed_in_run`]): inside a
-    /// process step a graph block may not out-run the step's tool list either.
+    /// process step a graph block may not out-run the step's tool list either,
+    /// and the step is read from the process model for the run the engine
+    /// executes (`ctx`), not from meta that any node may have rewritten.
     pub fn require_core_tool(
         &self,
+        ctx: &ExecutionContext,
         meta: &BTreeMap<String, serde_json::Value>,
         tool: CoreToolName,
     ) -> Result<()> {
         let name = tool.public_name();
         let agent_id = meta.get("agent_id").and_then(|v| v.as_str());
-        if self.tool_allowed_in_run(&self.agent_tools_json(agent_id), meta, name) {
+        let sealed = sealed_meta(&self.db, &ctx.request_id, ctx.nested_agent, meta);
+        if self.tool_allowed_in_run(&self.agent_tools_json(agent_id), &sealed, name) {
             return Ok(());
         }
         let who = match agent_id {
@@ -818,6 +825,7 @@ mod tests {
         )
         .expect("seed agent");
         let svc = service(pool);
+        let ctx = crate::flow_engine::node_adapter::test_support::stub_ctx();
         let with_meta = |extra: Option<BTreeMap<String, serde_json::Value>>| {
             let mut meta = extra.unwrap_or_default();
             meta.insert("agent_id".into(), serde_json::json!(agent_id));
@@ -826,18 +834,18 @@ mod tests {
 
         // Outside a step the agent's own list decides.
         assert!(svc
-            .require_core_tool(&with_meta(None), CoreToolName::Exec)
+            .require_core_tool(&ctx, &with_meta(None), CoreToolName::Exec)
             .is_ok());
         // A step that lists only the commit verb takes exec away from the block.
         let step = with_meta(Some(binding(&["core.git_commit"])));
-        assert!(svc.require_core_tool(&step, CoreToolName::Exec).is_err());
+        assert!(svc.require_core_tool(&ctx, &step, CoreToolName::Exec).is_err());
         assert!(svc
-            .require_core_tool(&step, CoreToolName::GitCommit)
+            .require_core_tool(&ctx, &step, CoreToolName::GitCommit)
             .is_ok());
         // An unreadable binding takes everything away.
         let broken = with_meta(Some(malformed_binding()));
         assert!(svc
-            .require_core_tool(&broken, CoreToolName::GitCommit)
+            .require_core_tool(&ctx, &broken, CoreToolName::GitCommit)
             .is_err());
     }
 

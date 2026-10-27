@@ -180,6 +180,7 @@ impl AgentNodeAdapter {
         // Clamp the harness flow's deadline to the agent's own budget (§3.7).
         let mut child_ctx = ctx.clone();
         child_ctx.deadline = Self::clamp_deadline(agent.timeout_secs, ctx.deadline);
+        child_ctx.nested_agent = true;
 
         Ok((flow_id, child_input, runner, child_ctx))
     }
@@ -618,7 +619,7 @@ mod tests {
         env.meta.insert("unrelated".into(), json!("kept"));
 
         let adapter = AgentNodeAdapter::new(svc.clone(), runner);
-        let (_, child, _, _) = adapter
+        let (_, child, _, child_ctx) = adapter
             .prepare(
                 &node(json!({"agent_id": agent_id})),
                 &[input(env.clone())],
@@ -626,6 +627,7 @@ mod tests {
             )
             .await
             .expect("prepare");
+        assert!(child_ctx.nested_agent, "the nested run is marked as nested");
         assert_eq!(child.meta.get("agent_run_id"), Some(&json!("caller-run")));
         assert!(child.meta.get(PROCESS_ACTIVITY_META_KEY).is_none());
         assert!(crate::processes::agent_sink::binding_from_meta(&child.meta).is_none());
@@ -634,9 +636,10 @@ mod tests {
         // Delegation from the nested run stays inside the step's list.
         assert_eq!(
             crate::agents::run_manager::CallerRun::from_envelope(
+                &pool,
+                &stub_ctx(),
                 &child,
                 crate::agents::AgentPrincipal::user("u1"),
-                None
             )
             .step_tools,
             Some(vec![

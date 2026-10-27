@@ -141,19 +141,29 @@ fn pinned_harness(
     ))
 }
 
-/// Cancels the run and every run it started when the wait for it is abandoned
-/// (timeout, cancellation, lost lease) or the step has its report, so no agent
-/// keeps working for a step the process has finished with or given up.
+/// Cancels the run and every run it started whenever the step stops waiting for
+/// it: abandoned (timeout, cancellation, lost lease), reported, or settled. A run
+/// that settled on its own may still have left sub-agents working, and none may
+/// outlive the step.
 struct CancelRunOnDrop {
     manager: Arc<AgentRunManager>,
     run_id: String,
-    armed: bool,
 }
 
 impl Drop for CancelRunOnDrop {
     fn drop(&mut self) {
-        if self.armed {
-            self.manager.cancel_tree(&self.run_id);
+        // The walk reads rows, so it must not run on the async worker that is
+        // dropping this guard. The cancellation is still signalled on every exit:
+        // a run that settled may have left sub-agents behind, and `cancel_tree`
+        // skips what is already settled by itself.
+        let (manager, run_id) = (self.manager.clone(), self.run_id.clone());
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || manager.cancel_tree(&run_id));
+            }
+            Err(_) => {
+                manager.cancel_tree(&run_id);
+            }
         }
     }
 }
@@ -325,10 +335,9 @@ async fn run_step(
             message: format!("{error:#}"),
         };
     }
-    let mut guard = CancelRunOnDrop {
+    let _guard = CancelRunOnDrop {
         manager: manager.clone(),
         run_id: run_id.clone(),
-        armed: true,
     };
     let deadline = tokio::time::Instant::now() + job.timeout + RUN_WAIT_SLACK;
     // The first of two things ends the wait: the run settles, or its report
@@ -340,9 +349,6 @@ async fn run_step(
         }
         settled = settle(&manager, &run_id, deadline) => settled,
     };
-    if status.is_some() {
-        guard.armed = false;
-    }
     let status = status.unwrap_or_else(|| "unsettled".to_owned());
     // The report is read whatever became of the run: it is durable on its own,
     // and an agent that reported and was then interrupted has still decided.

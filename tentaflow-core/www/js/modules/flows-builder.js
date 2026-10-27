@@ -775,7 +775,7 @@ const FlowBuilderScreen = {
     if (state.dirty && !await this._save()) return;
     if (!this._current(state) || state.dirty) return;
     // What the server would refuse is told here, by name, before it is asked.
-    const problems = processPublishProblems(state.canvas.getData());
+    const problems = [...state.config.processDraftProblems(), ...processPublishProblems(state.canvas.getData())];
     if (problems.length) {
       this._reportSaveProblem(state, problems.join(' '), false);
       return;

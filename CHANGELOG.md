@@ -150,6 +150,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   najwyżej 100 i najwyżej limit agenta, puste pole jest odrzucane, nieważny schemat
   wyniku zostaje widoczny z błędem po ponownym narysowaniu, a podpowiedzi celu i
   narzędzi opisują to, co system naprawdę robi.
+- Druga runda poprawek po przeglądzie kroku agenta (B3.4b). Zagnieżdżony blok
+  `agent` działa pod identyfikatorem przebiegu kroku, więc samo `request_id` nie
+  odróżniało go od modelu kroku i `core.task_complete` mógł zakończyć krok:
+  `ExecutionContext::nested_agent` (nieresetowalne, dziedziczone przez klony
+  kontekstu) każe `sealed_meta` oddać zagnieżdżonemu agentowi tylko znacznik
+  zawężenia odtworzony z modelu, nigdy wiązanie. Czasowniki delegowania i bloki
+  grafu (`spawn`, `await_subagents`, `subagent_status`, `exec_command`,
+  `patch_review`) budują wywołującego (`CallerRun::from_envelope`) i sito
+  (`require_core_tool`) z zapieczętowanych metadanych, a dla kroku bierzemy
+  identyfikator przebiegu z silnika, nie z metadanych: węzeł nie rozszerzy listy
+  narzędzi dziecka ani nie wyprowadzi go spod `cancel_tree`. Zgłoszenie, które
+  trafi do bazy między odczytem a `fail_claim`, jest obserwowane zamiast
+  pogrzebane pod incydentem niepewności (cofnięcie dostępu nadal blokuje), a
+  odroczone odzyskiwanie obejmuje też wyniki agentów. Strażnik anulowania
+  uzbraja się przy każdym wyjściu (przebieg, który sam się zakończył, mógł zostawić
+  podagentów), `cancel_tree` zatrzymuje rodziców przed dziećmi, powtarza przejście,
+  aż nic nowego nie przybywa, ostrzega o ucięciu i nie blokuje wątku asynchronicznego.
+  Błąd odczytu kontraktu odbiera narzędzia tylko przebiegowi, który deklaruje krok,
+  nie zwykłemu agentowi czatu. Projektant: odrzucony szkic limitu iteracji lub
+  schematu przeżywa zmianę zaznaczenia, a publikacja go wymienia; agent spoza listy
+  nie pozwala podnieść limitu ponad obecny.
 - Paleta projektanta BPMN ma grupę „Bloki TentaFlow” (B3.3a): przepływy, bloki
   Flow Buildera (`llm`, `embeddings`, `pii_filter`) i narzędzia addonów
   upuszcza się na płótno jako gotowe zadania usługi, z nazwą pozycji i bez pytania
