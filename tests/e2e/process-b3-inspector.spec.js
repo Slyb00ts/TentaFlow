@@ -866,7 +866,7 @@ test.describe('toolbar, refusals, drops and labels', () => {
   });
 });
 
-test('an agent step is saved and read back by the codec with its output schema keys untouched, opens as an agent and is refused at publication', async ({ page }) => {
+test('an agent step is saved and read back by the codec with its output schema keys untouched, opens as an agent and is refused at publication while its agent does not exist', async ({ page }) => {
   test.setTimeout(180000);
   const errors = collectConsoleErrors(page);
   await loginAsAdmin(page, { port: PORT });
@@ -910,13 +910,15 @@ test('an agent step is saved and read back by the codec with its output schema k
     };
   }, { definitionId: id, step: agent });
   expect(outcome.implementation).toEqual({ Agent: agent });
-  expect(outcome.refusal).toMatch(/agent steps are not runnable yet/);
+  expect(outcome.refusal).toMatch(/service task Agent_1/);
+  expect(outcome.refusal).toMatch(/agent-1/);
 
   await openDesigner(page, { login: false, id });
   const node = page.locator('.fb-canvas .fb-node.bpmn_service_task');
   await expect(node.locator('.fb-process-kind[data-kind="agent"]')).toHaveCount(1);
   await node.click({ position: { x: 20, y: 20 } });
-  await expect(page.locator('[data-agent-summary]')).toContainText('agent-1');
+  await expect(page.locator('[data-process="agentId"]')).toBeVisible();
+  await expect(page.locator('[data-agent-warning]')).toBeVisible();
   expect(errors, diagnostics(errors, proc)).toEqual([]);
 });
 
