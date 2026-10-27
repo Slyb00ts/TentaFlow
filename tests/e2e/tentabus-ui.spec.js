@@ -1746,7 +1746,7 @@ async function openUnprocessed(page) {
 // number of the topic itself — where a retried message lands.
 async function serverUnprocessed(page, instanceId, topic) {
   const r = await busCall(page, 'busDlqListRequest', { instanceId, sourceTopic: topic, limit: 100, newestFirst: true });
-  return r.records || [];
+  return r.result?.records || [];
 }
 async function topicEnd(page, instanceId, topic) {
   const d = await busCall(page, 'busTopicDetailRequest', { instanceId, name: topic });

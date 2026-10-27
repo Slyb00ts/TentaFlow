@@ -117,7 +117,12 @@ test('a flow, a block and an addon tool dropped from the palette survive save an
   await openDesigner(page);
 
   const group = page.locator('.fb-palette-category[data-cat="tentaflow"]');
-  await expect(group.locator('[data-subgroup]')).toHaveCount(3);
+  await expect(group.locator('[data-subgroup]')).toHaveCount(4);
+  const order = await group.locator('[data-subgroup]').evaluateAll((all) => all.map((node) => node.dataset.subgroup));
+  expect(order).toEqual(['flows', 'blocks', 'agents', 'tools']);
+  // The node ships system agents, so the Agents subgroup lists rows and shows no empty hint.
+  await expect(group.locator('[data-subgroup="agents"] + .fb-node-item')).toHaveCount(1);
+  await expect(group.locator('.fb-palette-note')).toHaveCount(0);
   await expect(group.locator('.fb-node-item', { hasText: FLOW_NAME })).toHaveCount(1);
   await expect(group.locator('.fb-node-item', { hasText: 'Language model' })).toHaveCount(1);
   await expect(group.locator('.fb-node-item', { hasText: 'search_notes' })).toHaveCount(1);
