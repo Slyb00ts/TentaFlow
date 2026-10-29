@@ -60,7 +60,8 @@ export function schemaKindMismatchText(message) {
 
 /**
  * Refusals the server words with a stable sentence (`bus/mod.rs`
- * `STORED_SCHEMA_UNREADABLE`, `field_policies.rs` `BINARY_TOPIC_NO_POLICY`),
+ * `STORED_SCHEMA_UNREADABLE`, `field_policies.rs` `BINARY_TOPIC_NO_POLICY`,
+ * `MASK_HASH_*`),
  * in plain words; `''` for any other message.
  */
 export function busRefusalText(message) {
@@ -71,6 +72,10 @@ export function busRefusalText(message) {
   if (binary) return T('errors.field_policy_binary_topic', { topic: binary[1], format: schemaFormatLabel(binary[2]), name: binary[3] });
   const bind = /field policies cannot apply to a topic whose messages are binary: cannot bind the (\w+) pattern '([^']*)' to topic '([^']*)' while field policies exist/.exec(text);
   if (bind) return T('errors.field_policy_binary_bind', { topic: bind[3], format: schemaFormatLabel(bind[1]), name: bind[2] });
+  // `field_policies.rs` MASK_HASH_READ_ONLY / MASK_HASH_NOT_SHOWN / MASK_HASH_OVERLAP.
+  if (/masking and hashing apply to read rules only/.test(text)) return T('errors.mask_hash_read_only');
+  if (/masked_fields and hashed_fields must be subsets of fields/.test(text)) return T('errors.mask_hash_not_shown');
+  if (/a field cannot be both masked and hashed/.test(text)) return T('errors.mask_hash_overlap');
   return '';
 }
 

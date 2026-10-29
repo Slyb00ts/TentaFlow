@@ -525,3 +525,14 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
 .tb-hiding-preview [data-role="result"] { display: flex; flex-direction: column; gap: 14px; }
 .tb-hiding-preview .tb-preview-record-head { justify-content: space-between; }
 .tb-hiding-preview [data-role="applied"] { max-height: 220px; overflow-y: auto; }
+/* A masked or hashed value in the previewed message: the value is not the real one, and the text says so by its colour. */
+.tb-hiding-preview mark.tb-marked { color: var(--tf-warning); background: rgba(245, 158, 11, 0.12); border-radius: 3px; }
+.tb-hiding-preview mark.tb-marked[data-action="hash"] { color: var(--tf-accent-3); background: rgba(167, 139, 250, 0.12); }
+/* ...and not by colour alone: the word follows the value (generated content: read out by screen readers, never copied with the message). */
+.tb-hiding-preview mark.tb-marked::after { content: " ⟨" attr(data-label) "⟩"; font-size: 11px; opacity: 0.85; user-select: none; }
+.tb-hiding-window [data-role="actions-note"] { display: flex; flex-direction: column; gap: 6px; }
+.tb-hiding-window [data-role="actions-note"][hidden] { display: none; }
+.tb-hiding-window [data-role="actions-note"] b { color: var(--tf-text); }
+.tb-hash-key-window .tb-impact-note .icon { color: var(--tf-text-3); }
+.tb-hash-key-window .tb-kept-box .icon { width: 13px; height: 13px; vertical-align: -2px; margin-right: 4px; }
+.tb-section .section-card .section-sub[data-role="key-text"] { display: flex; flex-direction: column; gap: 4px; margin-bottom: 0; font-size: 12.5px; color: var(--tf-text-2); }

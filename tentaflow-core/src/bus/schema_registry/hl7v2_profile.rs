@@ -593,7 +593,7 @@ mod tests {
             .unwrap();
         let projected = PayloadFormat::Hl7V2
             .codec()
-            .project(ADT.as_bytes(), &allowed)
+            .project(ADT.as_bytes(), &allowed, None)
             .unwrap();
         // The original profile rejects the projection (PID-3 is blanked) ...
         assert!(HL7V2_PROFILE_OPS

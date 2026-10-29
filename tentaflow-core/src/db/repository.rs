@@ -32709,14 +32709,25 @@ pub struct DbBusFieldPolicy {
     pub subject_type: String,
     pub subject_id: String,
     pub direction: String,
+    /// The fields the rule shows as they are. Fields it shows masked or hashed
+    /// are named only in the two columns below, so a node that predates them
+    /// hides those fields instead of showing them; `bus::field_policies::decode`
+    /// joins the three into the rule's visible fields.
     pub fields_json: String,
     pub required_fields_json: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Fields the rule shows masked / hashed (JSON arrays, `NULL` = none).
+    /// Absent in a row replicated from a node that predates them.
+    #[serde(default)]
+    pub masked_fields_json: Option<String>,
+    #[serde(default)]
+    pub hashed_fields_json: Option<String>,
 }
 
 const BUS_FIELD_POLICY_COLUMNS: &str = "instance_id, org_id, topic, subject_type, subject_id, \
-     direction, fields_json, required_fields_json, created_at_ms, updated_at_ms";
+     direction, fields_json, required_fields_json, created_at_ms, updated_at_ms, \
+     masked_fields_json, hashed_fields_json";
 
 fn map_bus_field_policy_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusFieldPolicy> {
     Ok(DbBusFieldPolicy {
@@ -32730,6 +32741,8 @@ fn map_bus_field_policy_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusFi
         required_fields_json: row.get(7)?,
         created_at_ms: row.get(8)?,
         updated_at_ms: row.get(9)?,
+        masked_fields_json: row.get(10)?,
+        hashed_fields_json: row.get(11)?,
     })
 }
 
@@ -32912,11 +32925,13 @@ pub fn bus_field_policy_set(
         tx.execute(
             &format!(
                 "INSERT INTO bus_field_policies ({BUS_FIELD_POLICY_COLUMNS}) VALUES \
-                 (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+                 (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) \
                  ON CONFLICT(instance_id, org_id, topic, subject_type, subject_id, direction) \
                  DO UPDATE SET \
                  fields_json = excluded.fields_json, \
                  required_fields_json = excluded.required_fields_json, \
+                 masked_fields_json = excluded.masked_fields_json, \
+                 hashed_fields_json = excluded.hashed_fields_json, \
                  updated_at_ms = excluded.updated_at_ms"
             ),
             rusqlite::params![
@@ -32930,6 +32945,8 @@ pub fn bus_field_policy_set(
                 stored.required_fields_json,
                 stored.created_at_ms,
                 stored.updated_at_ms,
+                stored.masked_fields_json,
+                stored.hashed_fields_json,
             ],
         )?;
         Ok((BusFieldPolicyWrite::Written, stored))
@@ -33161,6 +33178,134 @@ pub fn bus_field_policies_delete_by_instance(pool: &DbPool, instance_id: &str) -
         }
     }
     Ok(rows.len())
+}
+
+// =============================================================================
+// TentaBus F4 B7 — `bus_field_hash_keys` (migration v206): the key of the
+// hashed fields of an organization's read rules, one row per organization.
+// NOT a sync-ledger materialization: a ledger operation body is stored and
+// relayed in plaintext, so the key replicates sealed per recipient over
+// `SharedSecretsSync` (`mesh::shared_secrets`). `bus::field_hash_key` owns the
+// encryption and the versioning rules; this layer stores rows.
+// =============================================================================
+
+/// One row of `bus_field_hash_keys`. `encrypted_key` is never decrypted here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbBusFieldHashKey {
+    pub org_id: String,
+    pub key_version: i64,
+    pub encrypted_key: String,
+    pub created_at_ms: i64,
+    pub rotated_at_ms: i64,
+}
+
+fn map_bus_field_hash_key_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusFieldHashKey> {
+    Ok(DbBusFieldHashKey {
+        org_id: row.get(0)?,
+        key_version: row.get(1)?,
+        encrypted_key: row.get(2)?,
+        created_at_ms: row.get(3)?,
+        rotated_at_ms: row.get(4)?,
+    })
+}
+
+const BUS_FIELD_HASH_KEY_COLUMNS: &str =
+    "org_id, key_version, encrypted_key, created_at_ms, rotated_at_ms";
+
+pub fn bus_field_hash_key_get(pool: &DbPool, org_id: &str) -> Result<Option<DbBusFieldHashKey>> {
+    let conn = acquire_read(pool)?;
+    conn.query_row(
+        &format!("SELECT {BUS_FIELD_HASH_KEY_COLUMNS} FROM bus_field_hash_keys WHERE org_id = ?1"),
+        rusqlite::params![org_id],
+        map_bus_field_hash_key_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn bus_field_hash_key_list(pool: &DbPool) -> Result<Vec<DbBusFieldHashKey>> {
+    let conn = acquire_read(pool)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BUS_FIELD_HASH_KEY_COLUMNS} FROM bus_field_hash_keys ORDER BY org_id"
+    ))?;
+    let rows = stmt
+        .query_map([], map_bus_field_hash_key_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Writes the row `decide` returns for `org_id`, in one writer transaction
+/// with the read of the stored row `decide` is shown — so two writers (a
+/// rotation, an adoption from a peer, a lazy creation on a read) cannot both
+/// decide against the same stored key. `decide` returns `None` to leave the
+/// row alone. Reports the row that was written.
+pub fn bus_field_hash_key_write(
+    pool: &DbPool,
+    org_id: &str,
+    decide: impl FnOnce(Option<&DbBusFieldHashKey>) -> Result<Option<DbBusFieldHashKey>>,
+) -> Result<Option<DbBusFieldHashKey>> {
+    with_writer_tx(pool, |tx| {
+        let current = tx
+            .query_row(
+                &format!(
+                    "SELECT {BUS_FIELD_HASH_KEY_COLUMNS} FROM bus_field_hash_keys WHERE org_id = ?1"
+                ),
+                rusqlite::params![org_id],
+                map_bus_field_hash_key_row,
+            )
+            .optional()?;
+        let Some(next) = decide(current.as_ref())? else {
+            return Ok(None);
+        };
+        tx.execute(
+            &format!(
+                "INSERT INTO bus_field_hash_keys ({BUS_FIELD_HASH_KEY_COLUMNS}) \
+                 VALUES (?1,?2,?3,?4,?5) \
+                 ON CONFLICT(org_id) DO UPDATE SET \
+                 key_version = excluded.key_version, \
+                 encrypted_key = excluded.encrypted_key, \
+                 created_at_ms = excluded.created_at_ms, \
+                 rotated_at_ms = excluded.rotated_at_ms"
+            ),
+            rusqlite::params![
+                next.org_id,
+                next.key_version,
+                next.encrypted_key,
+                next.created_at_ms,
+                next.rotated_at_ms,
+            ],
+        )?;
+        Ok(Some(next))
+    })
+}
+
+/// What hashing costs an organization if its key changes, as THIS node sees
+/// it: the read rules that hash a field, the topics and the TentaBus
+/// instances they sit on. Rules of an instance hosted on another node are not
+/// materialized here and are not counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BusFieldHashUsage {
+    pub rules: u32,
+    pub topics: u32,
+    pub instances: u32,
+}
+
+pub fn bus_field_hash_usage(pool: &DbPool, org_id: &str) -> Result<BusFieldHashUsage> {
+    let conn = acquire_read(pool)?;
+    let (rules, topics, instances): (i64, i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COUNT(DISTINCT instance_id || char(31) || topic), \
+                COUNT(DISTINCT instance_id) \
+         FROM bus_field_policies \
+         WHERE org_id = ?1 AND direction = 'read' \
+           AND hashed_fields_json IS NOT NULL AND hashed_fields_json != '[]'",
+        rusqlite::params![org_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok(BusFieldHashUsage {
+        rules: rules as u32,
+        topics: topics as u32,
+        instances: instances as u32,
+    })
 }
 
 // =============================================================================
@@ -34284,10 +34429,19 @@ pub mod bus_test_support {
                 required_fields_json TEXT,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
+                masked_fields_json TEXT,
+                hashed_fields_json TEXT,
                 PRIMARY KEY (instance_id, org_id, topic, subject_type, subject_id, direction)
             );
             CREATE INDEX IF NOT EXISTS idx_bus_field_policies_lookup
                 ON bus_field_policies(instance_id, org_id, topic, direction);
+            CREATE TABLE IF NOT EXISTS bus_field_hash_keys (
+                org_id TEXT PRIMARY KEY,
+                key_version INTEGER NOT NULL CHECK(key_version >= 1),
+                encrypted_key TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                rotated_at_ms INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS bus_schema_subjects (
                 instance_id TEXT NOT NULL,
                 org_id TEXT NOT NULL,
@@ -34415,6 +34569,8 @@ mod bus_repository_tests {
             required_fields_json: None,
             created_at_ms: 1_000,
             updated_at_ms: 1_000,
+            masked_fields_json: None,
+            hashed_fields_json: None,
         }
     }
 
@@ -35004,7 +35160,7 @@ mod bus_repository_tests {
                 &format!(
                     "INSERT INTO bus_field_policies ({BUS_FIELD_POLICY_COLUMNS}) VALUES \
                      (?1, 'org-1', 'orders.created', 'user', 'anna', 'read', '[\"pesel\"]', \
-                      NULL, 1, 1)"
+                      NULL, 1, 1, NULL, NULL)"
                 ),
                 rusqlite::params![T1],
             )

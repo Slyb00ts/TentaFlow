@@ -2521,6 +2521,10 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Bp::SubjectDirectoryResponse { .. } => "BusSubjectDirectoryResponse",
                 Bp::FieldPolicyPreviewRequest { .. } => "BusFieldPolicyPreviewRequest",
                 Bp::FieldPolicyPreviewResponse { .. } => "BusFieldPolicyPreviewResponse",
+                Bp::FieldHashKeyInfoRequest {} => "BusFieldHashKeyInfoRequest",
+                Bp::FieldHashKeyInfoResponse { .. } => "BusFieldHashKeyInfoResponse",
+                Bp::FieldHashKeyRotateRequest { .. } => "BusFieldHashKeyRotateRequest",
+                Bp::FieldHashKeyRotateResponse { .. } => "BusFieldHashKeyRotateResponse",
             }
         }
         MessageBody::TentaNasBody(p) => {

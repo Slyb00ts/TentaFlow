@@ -21,7 +21,7 @@ if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Do
 const {
   policyRows, policyKey, whoTitle, whoSub, hidingCount, topicFormat, readJsonSchema, fieldSource, fieldLabel, fieldPhrase, fieldNameProblem, hl7Suggestion,
   ruleFacts, ruleTableRow, typedProblems, actionOptions, blankForm, formFromRule, serializeForm, parseForm, buildPolicyRequest, formProblem,
-  ruleImpact, legendHtml, directionsClosedToKeys, closesTopicToKeys, paintHidingSection,
+  ruleImpact, legendHtml, directionsClosedToKeys, closesTopicToKeys, paintHidingSection, readXsdFields, keyNote, keyAwaited, keyButtonProblem,
 } = await import('./topic-hiding.js');
 
 // A form's action map has no prototype (a field may be called `__proto__`); compare it as a plain object.
@@ -97,7 +97,10 @@ test('a rule\'s row: who, what it hides with the plain name of each field, when 
 test('a cell names three fields and counts the rest; a rule that hides nothing says so; without a list it names what stays', () => {
   const many = { ...policyRows(POLICIES)[3], fields: [] };
   const what = ruleTableRow(many, json, NOW).what;
-  assert.equal(words(what), 'pacjent Ukryj dane pacjenta lekarz Ukryj Lekarz prowadzący wizytę termin Ukryj i jeszcze 1 pole Pola spoza listy: ukryj');
+  assert.equal(words(what), 'pacjent Ukryj dane pacjenta lekarz Ukryj Lekarz prowadzący wizytę termin Ukryj powod Ukryj powód wizyty Pola spoza listy: ukryj', 'a fourth field is named rather than counted as "one more"');
+  const five = { ...many, fields: ['x'], maskedFields: ['x'] };
+  // The cell cuts the plain "Ukryj" lines, never the masked or hashed ones.
+  assert.equal(words(ruleTableRow(five, json, NOW).what), 'x Zamaskuj pacjent Ukryj dane pacjenta lekarz Ukryj Lekarz prowadzący wizytę i jeszcze 2 pola Pola spoza listy: ukryj');
   const none = { ...many, fields: ['pacjent', 'lekarz', 'termin', 'powod'] };
   assert.equal(words(ruleTableRow(none, json, NOW).what), 'Nie ukrywa żadnego ze znanych pól Pola spoza listy: ukryj');
   assert.equal(words(ruleTableRow(many, typed, NOW).what), 'Nie widzi żadnego pola');
@@ -190,7 +193,7 @@ test('where the known fields come from: the pattern, the HL7 dictionary, or nowh
   assert.equal(hl7.mode, 'dictionary');
   assert.ok(hl7.fields.length >= 55);
   assert.deepEqual(hl7.fields.find((f) => f.name === 'PID-5'), { name: 'PID-5', label: 'Imię i nazwisko pacjenta' });
-  assert.deepEqual(typed, { mode: 'manual', fields: [], implicit: [], complete: false, failed: false, complex: false });
+  assert.deepEqual(typed, { mode: 'manual', fields: [], implicit: [], complete: false, failed: false, complex: false, xsd: false });
   assert.equal(fieldSource({ format: 'json', schema: null }).mode, 'manual');
   assert.equal(fieldSource({ format: 'json', schema: { failed: true } }).failed, true, 'a pattern that could not be read is said so');
   assert.equal(fieldSource({ format: 'json', schema: { subject: 's', version: 1, text: '{"type":"object"}' } }).mode, 'manual', 'a pattern without properties lists nothing');
@@ -236,20 +239,22 @@ test('a new reading rule shows every known field; a stored one is read back as h
   assert.deepEqual(plain(blankForm('read', json)).actions, { pacjent: 'show', lekarz: 'show', termin: 'show', powod: 'show' });
   assert.deepEqual(plain(blankForm('write', json)).actions, { pacjent: 'allow', lekarz: 'allow', termin: 'allow', powod: 'allow' });
   const rule = { ...policyRows(POLICIES)[3], fields: ['lekarz', 'pacjent', 'powod', 'telefon'] };
-  assert.deepEqual(plain(formFromRule(rule, json)), { actions: { pacjent: 'show', lekarz: 'show', termin: 'hide', powod: 'show' }, extraShown: ['telefon'], extraRequired: [], hiddenImplicit: [] });
+  assert.deepEqual(plain(formFromRule(rule, json)), { actions: { pacjent: 'show', lekarz: 'show', termin: 'hide', powod: 'show' }, extraShown: ['telefon'], extraMasked: [], extraHashed: [], extraRequired: [], hiddenImplicit: [] });
   const writeRule = { ...policyRows(POLICIES)[0], fields: ['lekarz', 'pacjent', 'termin', 'x', 'y'], requiredFields: ['pacjent', 'y'] };
   assert.deepEqual(plain(formFromRule(writeRule, json)), {
     actions: { pacjent: 'require', lekarz: 'allow', termin: 'allow', powod: 'forbid' },
     extraShown: ['x'],
+    extraMasked: [],
+    extraHashed: [],
     extraRequired: ['y'],
     hiddenImplicit: [],
   });
 });
 
 test('a form travels as one string and comes back; text that is not a form is refused', () => {
-  const form = { actions: { pacjent: 'show', lekarz: 'hide', termin: 'show', powod: 'show' }, extraShown: ['b', 'a', 'a'], extraRequired: [], hiddenImplicit: ['PID-4'] };
+  const form = { actions: { pacjent: 'show', lekarz: 'hide', termin: 'mask', powod: 'hash' }, extraShown: ['b', 'a', 'a'], extraMasked: ['m'], extraHashed: ['h2', 'h1'], extraRequired: [], hiddenImplicit: ['PID-4'] };
   const text = serializeForm(form, json);
-  assert.deepEqual(plain(parseForm(text, json)), { actions: form.actions, extraShown: ['a', 'b'], extraRequired: [], hiddenImplicit: ['PID-4'] });
+  assert.deepEqual(plain(parseForm(text, json)), { actions: form.actions, extraShown: ['a', 'b'], extraMasked: ['m'], extraHashed: ['h1', 'h2'], extraRequired: [], hiddenImplicit: ['PID-4'] });
   assert.equal(serializeForm(blankForm('read', json), json), serializeForm(blankForm('read', json), json));
   assert.notEqual(serializeForm(blankForm('read', json), json), serializeForm(blankForm('write', json), json));
   assert.equal(parseForm('nope', json), null);
@@ -261,12 +266,12 @@ test('FieldPolicySet carries the ALLOWED fields: hidden ones left out, required 
   const read = { actions: { pacjent: 'show', lekarz: 'show', termin: 'show', powod: 'hide' }, extraShown: [' telefon ', 'pacjent'], extraRequired: ['ignored'] };
   assert.deepEqual(buildPolicyRequest({ ...where, direction: 'read', form: read, source: json }), {
     instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-rej', direction: 'read',
-    fields: ['lekarz', 'pacjent', 'telefon', 'termin'], requiredFields: [],
+    fields: ['lekarz', 'pacjent', 'telefon', 'termin'], requiredFields: [], maskedFields: [], hashedFields: [],
   });
   const write = { actions: { pacjent: 'require', lekarz: 'allow', termin: 'forbid', powod: 'allow' }, extraShown: ['x'], extraRequired: ['y'] };
   assert.deepEqual(buildPolicyRequest({ ...where, subject: { subjectType: 'any', subjectId: '*' }, direction: 'write', form: write, source: json }), {
     instanceId: INSTANCE, topic: TOPIC, subjectType: 'any', subjectId: '*', direction: 'write',
-    fields: ['lekarz', 'pacjent', 'powod', 'x', 'y'], requiredFields: ['pacjent', 'y'],
+    fields: ['lekarz', 'pacjent', 'powod', 'x', 'y'], requiredFields: ['pacjent', 'y'], maskedFields: [], hashedFields: [],
   });
   // A topic whose fields nobody listed: only what is typed in is allowed.
   assert.deepEqual(buildPolicyRequest({ ...where, direction: 'read', form: { actions: {}, extraShown: ['id'], extraRequired: [] }, source: typed }).fields, ['id']);
@@ -289,7 +294,7 @@ const closedJson = fieldSource({ format: 'json', schema: { ...SCHEMA, text: JSON
 test('a rule needs something to do: one hidden field (or a required or refused one), or typed fields when none are listed', () => {
   const ok = (direction, form, source, format) => formProblem({ direction, form, source, format });
   const blank = blankForm('read', closedJson);
-  assert.match(ok('read', blank, closedJson, 'json'), /Ustaw co najmniej jedno pole na „Ukryj”\. Lista zawiera wszystkie pola tego topiku/);
+  assert.match(ok('read', blank, closedJson, 'json'), /Ustaw co najmniej jedno pole na „Ukryj”, „Zamaskuj” albo „Zahaszuj”\. Lista zawiera wszystkie pola tego topiku/);
   assert.equal(ok('read', { ...blank, actions: { ...blank.actions, powod: 'hide' } }, closedJson, 'json'), null);
   assert.match(ok('read', { actions: {}, extraShown: [], extraRequired: [] }, typed, 'xml'), /Wpisz co najmniej jedno pole, które ma zostać widoczne/);
   assert.equal(ok('read', { actions: {}, extraShown: ['id'], extraRequired: [] }, typed, 'xml'), null);
@@ -504,20 +509,148 @@ test('changing a writing rule says what changes: what is newly refused, newly ac
 });
 
 // ---------------------------------------------------------------------------
+// Zamaskuj and Zahaszuj (F4 B7)
+// ---------------------------------------------------------------------------
+
+const CAPABILITIES = ['hide', 'mask', 'hash'];
+// What the server stores for "pacjent masked, lekarz hashed, powod hidden, termin as it is": every field it shows, and the two subsets.
+const MASKING = {
+  subjectType: 'group', subjectId: 'g-ksieg', direction: 'read', subjectLabel: 'Księgowość', memberCount: 4,
+  fields: ['lekarz', 'pacjent', 'termin'], requiredFields: [], maskedFields: ['pacjent'], hashedFields: ['lekarz'], createdAtMs: 1, updatedAtMs: NOW,
+};
+
+test('a rule from an older server has no masked or hashed fields', () => {
+  const [row] = policyRows([{ ...MASKING, maskedFields: undefined, hashedFields: undefined }]);
+  assert.deepEqual([row.maskedFields, row.hashedFields], [[], []]);
+  assert.deepEqual(policyRows([MASKING]).map((r) => [r.maskedFields, r.hashedFields]), [[['pacjent'], ['lekarz']]]);
+});
+
+test('a masking rule is read back by field: masked and hashed fields stay in the shown list and are marked, in the order of the pattern', () => {
+  const [row] = policyRows([MASKING]);
+  const facts = ruleFacts(row, json);
+  assert.deepEqual(facts.marks, [['pacjent', 'mask'], ['lekarz', 'hash'], ['powod', 'hide']]);
+  assert.deepEqual([facts.hidden, facts.plain, facts.visible], [['powod'], ['termin'], ['lekarz', 'pacjent', 'termin']]);
+  assert.deepEqual(facts.visibleOutside, []);
+  const what = ruleTableRow(row, json, NOW).what;
+  assert.equal(words(what), 'pacjent Zamaskuj dane pacjenta lekarz Zahaszuj Lekarz prowadzący wizytę powod Ukryj powód wizyty Pola spoza listy: ukryj');
+  const chips = [...Object.assign(document.createElement('div'), { innerHTML: what }).querySelectorAll('.tf-chip')].map((c) => [c.textContent, c.className.replace('tf-chip tf-chip--outline ', '')]);
+  assert.deepEqual(chips, [['Zamaskuj', 'info'], ['Zahaszuj', 'accent'], ['Ukryj', 'neutral']], 'each action has its own tone');
+});
+
+test('over typed fields a masking rule says what stays as it is, then each masked or hashed field with its chip', () => {
+  const [row] = policyRows([{ ...MASKING, fields: ['id', 'nazwisko', 'pesel'], maskedFields: ['pesel'], hashedFields: ['nazwisko'] }]);
+  assert.equal(words(ruleTableRow(row, typed, NOW).what), 'Widzi tylko: id oraz pola poniżej nazwisko Zahaszuj pesel Zamaskuj');
+  const onlyMarked = policyRows([{ ...MASKING, fields: ['pesel'], maskedFields: ['pesel'], hashedFields: [] }])[0];
+  assert.equal(words(ruleTableRow(onlyMarked, typed, NOW).what), 'Widzi tylko pola poniżej pesel Zamaskuj');
+  // A masked field outside the list of a topic that has one is still named, after the listed ones.
+  const outside = policyRows([{ ...MASKING, fields: ['pacjent', 'lekarz', 'termin', 'powod', 'pesel'], maskedFields: ['pesel'], hashedFields: [] }])[0];
+  assert.equal(words(ruleTableRow(outside, json, NOW).what), 'pesel Zamaskuj Pola spoza listy: ukryj');
+});
+
+test('a writing rule never carries masked or hashed fields, whatever the row holds', () => {
+  const write = policyRows([{ ...MASKING, direction: 'write', requiredFields: ['pacjent'] }])[0];
+  const facts = ruleFacts(write, json);
+  assert.deepEqual([facts.marks, facts.plain.length], [[], 3]);
+  assert.deepEqual(plain(formFromRule(write, json)).actions, { pacjent: 'require', lekarz: 'allow', termin: 'allow', powod: 'forbid' });
+});
+
+test('the form of a masking rule: a row per field, the typed fields in the list of what happens to them, and back into the exact request', () => {
+  const [row] = policyRows([{ ...MASKING, fields: ['lekarz', 'pacjent', 'telefon', 'termin', 'pesel'], maskedFields: ['pacjent', 'telefon'], hashedFields: ['lekarz', 'pesel'] }]);
+  const form = formFromRule(row, json);
+  assert.deepEqual(plain(form), {
+    actions: { pacjent: 'mask', lekarz: 'hash', termin: 'show', powod: 'hide' },
+    extraShown: [], extraMasked: ['telefon'], extraHashed: ['pesel'], extraRequired: [], hiddenImplicit: [],
+  });
+  const request = buildPolicyRequest({ instanceId: INSTANCE, topic: TOPIC, subject: { subjectType: 'group', subjectId: 'g-ksieg' }, direction: 'read', form, source: json });
+  assert.deepEqual(request, {
+    instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-ksieg', direction: 'read',
+    fields: ['lekarz', 'pacjent', 'pesel', 'telefon', 'termin'],
+    requiredFields: [],
+    maskedFields: ['pacjent', 'telefon'],
+    hashedFields: ['lekarz', 'pesel'],
+  }, 'a masked or hashed field is also in the shown list; the hidden one is in none');
+  assert.equal(serializeForm(parseForm(serializeForm(form, json), json), json), serializeForm(form, json));
+  // A field typed into the "masked" list that has a row still shown makes that row masked.
+  const typedOnRow = { ...blankForm('read', json), extraMasked: [' termin '], extraHashed: ['powod'] };
+  const sent = buildPolicyRequest({ instanceId: INSTANCE, topic: TOPIC, subject: { subjectType: 'user', subjectId: 'u' }, direction: 'read', form: typedOnRow, source: json });
+  assert.deepEqual([sent.maskedFields, sent.hashedFields], [['termin'], ['powod']]);
+  assert.deepEqual(sent.fields, ['lekarz', 'pacjent', 'powod', 'termin']);
+  // A writing form that still holds masked entries sends none.
+  const write = buildPolicyRequest({ instanceId: INSTANCE, topic: TOPIC, subject: { subjectType: 'user', subjectId: 'u' }, direction: 'write', form: { ...blankForm('write', json), extraMasked: ['x'], extraHashed: ['y'] }, source: json });
+  assert.deepEqual([write.fields.includes('x'), write.maskedFields, write.hashedFields], [false, [], []]);
+});
+
+test('a masking form is a rule worth storing when it masks or hashes something; a name may not sit in two lists or contradict its row', () => {
+  const ok = (form, source = closedJson, format = 'json') => formProblem({ direction: 'read', form, source, format });
+  const blank = blankForm('read', closedJson);
+  assert.match(ok(blank), /Ustaw co najmniej jedno pole na „Ukryj”, „Zamaskuj” albo „Zahaszuj”/);
+  assert.equal(ok({ ...blank, actions: { ...blank.actions, pacjent: 'mask' } }), null, 'masking is something');
+  assert.equal(ok({ ...blank, actions: { ...blank.actions, pacjent: 'hash' } }), null, 'so is hashing');
+  assert.equal(ok({ actions: {}, extraShown: [], extraMasked: ['pesel'], extraHashed: [] }, typed, 'xml'), null, 'a typed masked field is a visible field');
+  assert.match(ok({ actions: {}, extraShown: [], extraMasked: [], extraHashed: [] }, typed, 'xml'), /Wpisz co najmniej jedno pole, które ma zostać widoczne \(bez zmian, zamaskowane albo zahaszowane\)/);
+  assert.match(ok({ actions: {}, extraShown: ['id'], extraMasked: ['id'], extraHashed: [] }, typed, 'xml'), /„id” wpisano w więcej niż jednej liście/);
+  assert.match(ok({ actions: {}, extraShown: [], extraMasked: ['id'], extraHashed: ['id'] }, typed, 'xml'), /„id” wpisano w więcej niż jednej liście/);
+  // A typed name that is a listed field: fine on a shown row (it makes it masked), refused against a different action.
+  assert.equal(ok({ ...blank, extraMasked: ['pacjent'] }), null);
+  assert.match(ok({ ...blank, actions: { ...blank.actions, pacjent: 'hide' }, extraMasked: ['pacjent'] }), /„pacjent” jest na liście pól i ma tam inne ustawienie/);
+  assert.match(ok({ ...blank, actions: { ...blank.actions, pacjent: 'hash' }, extraMasked: ['pacjent'] }), /„pacjent” jest na liście pól i ma tam inne ustawienie/);
+  assert.match(ok({ ...blank, actions: { ...blank.actions, pacjent: 'mask' }, extraShown: ['pacjent'] }), /„pacjent” jest na liście pól i ma tam inne ustawienie/);
+  assert.equal(ok({ ...blank, actions: { ...blank.actions, pacjent: 'mask' }, extraMasked: ['pacjent'] }), null, 'the same thing said twice is not a contradiction');
+  // The format checks the typed addresses of the masked and hashed lists too.
+  assert.match(ok({ ...blankForm('read', hl7), extraHashed: ['PID-0'] }, hl7, 'hl7v2'), /„PID-0” nie jest adresem pola HL7/);
+  assert.match(ok({ ...blankForm('read', hl7), extraMasked: ['MSH-2'] }, hl7, 'hl7v2'), /MSH-2 to separatory samej wiadomości/);
+});
+
+test('"Co się stanie" names what is masked and what is hashed, and moves between actions say what changed', () => {
+  const form = { ...blankForm('read', json), actions: { pacjent: 'mask', lekarz: 'hash', termin: 'hide', powod: 'show' } };
+  assert.deepEqual(ruleImpact({ who: 'Księgowość', direction: 'read', form, current: null, source: json }), [
+    'Dla „Księgowość” znikną z wiadomości pola: termin.',
+    'Dla „Księgowość” pole dane pacjenta (pacjent) będzie widoczne tylko jako gwiazdki z 3 ostatnimi znakami.',
+    'Dla „Księgowość” zamiast wartości pola Lekarz prowadzący wizytę (lekarz) pojawi się hasz — stały ciąg znaków, taki sam dla tej samej wartości w całej organizacji.',
+    'Pozostałe pola z listy bez zmian.',
+    'Pola spoza listy też znikną, chyba że je dopiszesz.',
+  ]);
+  const current = formFromRule(policyRows([MASKING])[0], json);
+  const next = { ...current, actions: { ...current.actions, pacjent: 'hash', lekarz: 'show', powod: 'mask' } };
+  assert.deepEqual(ruleImpact({ who: 'Księgowość', direction: 'read', form: next, current, source: closedJson }), [
+    'Dla „Księgowość” pole powód wizyty (powod) będzie widoczne tylko jako gwiazdki z 3 ostatnimi znakami.',
+    'Dla „Księgowość” zamiast wartości pola dane pacjenta (pacjent) pojawi się hasz — stały ciąg znaków, taki sam dla tej samej wartości w całej organizacji.',
+    'Dla „Księgowość” pojawią się w wiadomościach pola: Lekarz prowadzący wizytę (lekarz).',
+    'Pozostałe pola z listy bez zmian.',
+  ]);
+  assert.deepEqual(ruleImpact({ who: 'Księgowość', direction: 'read', form: current, current, source: json }), [], 'nothing changed, nothing to say');
+  // Over typed fields: the visible ones, then what is masked and what is hashed.
+  const typedForm = { actions: {}, extraShown: ['id'], extraMasked: ['pesel'], extraHashed: ['nazwisko'], extraRequired: [], hiddenImplicit: [] };
+  assert.deepEqual(ruleImpact({ who: 'Wszyscy', everyone: true, direction: 'read', form: typedForm, current: null, source: typed }), [
+    'Dla wszystkich widoczne będą tylko pola: id, nazwisko, pesel. Wszystkie inne zostaną ukryte.',
+    'Dla wszystkich pole pesel będzie widoczne tylko jako gwiazdki z 3 ostatnimi znakami.',
+    'Dla wszystkich zamiast wartości pola nazwisko pojawi się hasz — stały ciąg znaków, taki sam dla tej samej wartości w całej organizacji.',
+  ]);
+});
+
+// ---------------------------------------------------------------------------
 // What the server offers
 // ---------------------------------------------------------------------------
 
-test('reading offers "Pokaż" and "Ukryj" only: the wire has no per-field action to carry "Zamaskuj" or "Zahaszuj"', () => {
-  assert.deepEqual(actionOptions('read').map((o) => [o.value, o.label]), [['show', 'Pokaż'], ['hide', 'Ukryj']]);
-  assert.deepEqual(actionOptions('write').map((o) => o.label), ['Dozwolone', 'Wymagane', 'Niedozwolone'], 'writing has no hiding action');
+test('reading offers "Pokaż" and "Ukryj", and "Zamaskuj" / "Zahaszuj" only where the server\'s capabilities list them', () => {
+  const labels = (actions) => actionOptions('read', actions).map((o) => [o.value, o.label]);
+  assert.deepEqual(labels(undefined), [['show', 'Pokaż'], ['hide', 'Ukryj']], 'a server that does not say offers hiding only');
+  assert.deepEqual(labels(['hide']), [['show', 'Pokaż'], ['hide', 'Ukryj']]);
+  assert.deepEqual(labels(['hide', 'mask', 'hash']), [['show', 'Pokaż'], ['hide', 'Ukryj'], ['mask', 'Zamaskuj'], ['hash', 'Zahaszuj']]);
+  assert.deepEqual(labels(['hash']), [['show', 'Pokaż'], ['hide', 'Ukryj'], ['hash', 'Zahaszuj']], 'hiding is always there; each other action only when listed');
+  assert.deepEqual(actionOptions('write', ['hide', 'mask', 'hash']).map((o) => o.label), ['Dozwolone', 'Wymagane', 'Niedozwolone'], 'writing has no masking or hashing');
 });
 
-test('the legend explains "ukryj", "odrzuć wiadomość" and which rule wins — and nothing the screen cannot do', () => {
-  const plain = words(legendHtml());
-  assert.match(plain, /Ukryj — Pole znika z wiadomości\./);
-  assert.match(plain, /Odrzuć wiadomość — Przy zapisie: wiadomość z niedozwolonym polem albo bez wymaganego nie trafi do topiku\./);
-  assert.match(plain, /Zasada osoby wygrywa z zasadą jej grupy/);
-  assert.doesNotMatch(plain, /Zamaskuj|Zahaszuj/);
+test('the legend explains "ukryj", "odrzuć wiadomość" and which rule wins; "zamaskuj" and "zahaszuj" join it only where the server offers them', () => {
+  const hideOnly = words(legendHtml());
+  assert.match(hideOnly, /Ukryj — Pole znika z wiadomości\./);
+  assert.match(hideOnly, /Odrzuć wiadomość — Przy zapisie: wiadomość z niedozwolonym polem albo bez wymaganego nie trafi do topiku\./);
+  assert.match(hideOnly, /Zasada osoby wygrywa z zasadą jej grupy/);
+  assert.doesNotMatch(hideOnly, /Zamaskuj|Zahaszuj/);
+  const all = words(legendHtml(['hide', 'mask', 'hash']));
+  assert.match(all, /Zamaskuj — Widać 3 ostatnie znaki, reszta to gwiazdki \(wartość krótsza niż 5 znaków jest zamaskowana w całości\), np\. \*{8}359\./);
+  assert.match(all, /Zahaszuj — Zamiast wartości widać stały ciąg znaków: ta sama wartość daje zawsze ten sam hasz w całej organizacji/);
+  assert.ok(all.indexOf('Ukryj —') < all.indexOf('Zamaskuj —') && all.indexOf('Zamaskuj —') < all.indexOf('Zahaszuj —') && all.indexOf('Zahaszuj —') < all.indexOf('Odrzuć wiadomość —'));
 });
 
 test('a direction with rules for chosen subjects and none for everyone is closed to API keys', () => {
@@ -531,10 +664,10 @@ test('a direction with rules for chosen subjects and none for everyone is closed
 // The section
 // ---------------------------------------------------------------------------
 
-function paint({ hidingData, contentType = 'application/json', access = { canRead: true, canAdmin: true }, notice = null, host = document.createElement('div') }) {
+function paint({ hidingData, contentType = 'application/json', access = { canRead: true, canAdmin: true }, notice = null, capabilities, host = document.createElement('div') }) {
   document.body.appendChild(host);
   const moves = [];
-  paintHidingSection(host, { topic: { name: TOPIC, contentType }, access, notice, nowMs: NOW, hidingData }, { go: (a) => moves.push(a) });
+  paintHidingSection(host, { topic: { name: TOPIC, contentType }, access, notice, capabilities, nowMs: NOW, hidingData }, { go: (a) => moves.push(a) });
   return { host, moves };
 }
 
@@ -576,9 +709,9 @@ const THRIFT = { subject: 'zamowienie', schemaType: 'thrift' };
 test('a topic checked with a binary pattern has no fields to name: the section says so and "Dodaj zasadę" is closed', () => {
   const { host } = paint({ contentType: 'application/octet-stream', hidingData: { policies: [], policiesError: null, schema: THRIFT, schemaSettled: true } });
   const empty = host.querySelector('[data-role="state"] tf-empty-state');
-  assert.equal(empty.getAttribute('title'), 'Zasady tego topiku nie są tu edytowane');
-  assert.match(empty.getAttribute('message'), /nie edytuje się na tym ekranie, bo jego treść jest binarna i nie da się jej odczytać jako pól/);
-  assert.doesNotMatch(empty.getAttribute('message'), /nie działają/, 'the server does apply rules to such a topic; the screen just does not edit them');
+  assert.equal(empty.getAttribute('title'), 'Treść binarna nie ma ukrywania danych');
+  assert.match(empty.getAttribute('message'), /nie podlega ukrywaniu pól.*każdy, kto ma prawo czytania topiku, widzi ją w całości/);
+  assert.doesNotMatch(empty.getAttribute('message'), /na tym ekranie/, 'there is no other screen where it could be done');
   const open = empty.querySelector('[data-go="section"]');
   assert.equal(open.getAttribute('data-section'), 'settings');
   assert.equal(open.textContent, 'Otwórz ustawienia topiku', 'the button opens the settings, it does not promise a change of content type');
@@ -608,6 +741,57 @@ test('the filled section: count, columns, one row per rule with Zmień and Usuń
   assert.match(norm(host.querySelector('[data-role="legend"]').textContent), /^Ukryj — Pole znika z wiadomości\.Odrzuć wiadomość/);
   assert.match(norm(host.querySelector('[data-role="keys-note"]').textContent), /Systemy zewnętrzne z kluczem API mają zamknięty ten topik w zakresie odczytu: są w nim zasady tylko dla wybranych osób, grup lub addonów, a nie ma zasady dla wszystkich\./);
   assert.equal(host.querySelector('[data-role="state"]').textContent.trim(), '');
+});
+
+test('the legend follows the server: masking and hashing appear with the capabilities that offer them', () => {
+  const data = { policies: POLICIES, policiesError: null, schema: SCHEMA, schemaSettled: true };
+  const legend = (capabilities) => norm(paint({ hidingData: data, capabilities }).host.querySelector('[data-role="legend"]').textContent);
+  assert.doesNotMatch(legend(undefined), /Zamaskuj|Zahaszuj/);
+  assert.doesNotMatch(legend({ fieldActions: ['hide'] }), /Zamaskuj|Zahaszuj/);
+  assert.match(legend({ fieldActions: ['hide', 'mask', 'hash'] }), /^Ukryj — Pole znika z wiadomości\.Zamaskuj — Widać 3 ostatnie znaki.*Zahaszuj — Zamiast wartości widać stały ciąg znaków.*Odrzuć wiadomość/);
+});
+
+test('Klucz haszowania: the explanation for everybody, the date and the button only for the instance administrator, the button waits for a key', () => {
+  const data = (hashKey) => ({ policies: POLICIES, policiesError: null, schema: SCHEMA, schemaSettled: true, hashKey });
+  const key = (host) => ({
+    text: norm(host.querySelector('[data-role="key-text"]').textContent),
+    button: host.querySelector('[data-role="key-button"]'),
+    card: host.querySelector('[data-role="key-card"]'),
+  });
+  const info = { exists: true, keyVersion: 3, createdAtMs: new Date(2026, 7, 12).getTime(), rotatedAtMs: new Date(2026, 7, 12).getTime(), hashingRules: 3, hashingTopics: 2, hashingInstances: 1 };
+
+  // Instance administrator, a key exists.
+  const admin = paint({ hidingData: data({ info, error: null }), capabilities: { canAdmin: true, orgName: 'Przychodnia Zdrowie' } });
+  const shown = key(admin.host);
+  assert.match(shown.text, /^Klucz haszowania to tajny ciąg znaków, z którego liczy się hasz\. Dzięki niemu nikt spoza organizacji nie odgadnie wartości z hasza\. Klucz jest wspólny dla całej organizacji Przychodnia Zdrowie\.Obecny klucz ustawiono 12\.08\.2026 \(wersja 3\)\.$/);
+  assert.equal(shown.button.hidden, false);
+  assert.ok(!shown.button.hasAttribute('disabled'));
+  shown.button.click();
+  assert.equal(shown.button.getAttribute('data-go'), 'hiding-key');
+
+  // No key yet: nothing to change, and the reason is on the button.
+  const none = key(paint({ hidingData: data({ info: { exists: false, keyVersion: 0, createdAtMs: 0, rotatedAtMs: 0, hashingRules: 0, hashingTopics: 0, hashingInstances: 0 }, error: null }), capabilities: { canAdmin: true } }).host);
+  assert.match(none.text, /Klucz powstanie przy pierwszej zasadzie „Zahaszuj” w organizacji — dopóki żadnej nie ma, nie ma czego zmieniać\.$/);
+  assert.match(none.text, /wspólny dla całej organizacji\.Klucz powstanie/, 'without a name the sentence has no organization to quote');
+  assert.ok(none.button.hasAttribute('disabled'));
+  assert.equal(none.button.getAttribute('title'), 'Klucz powstanie dopiero przy pierwszej zasadzie „Zahaszuj”.');
+
+  // Still loading, and a failed load.
+  const loading = key(paint({ hidingData: data(null), capabilities: { canAdmin: true } }).host);
+  assert.ok(loading.button.hasAttribute('disabled'));
+  assert.equal(loading.button.getAttribute('title'), null);
+  const failed = key(paint({ hidingData: data({ info: null, error: 'Brak uprawnień do tej operacji.' }), capabilities: { canAdmin: true } }).host);
+  assert.match(failed.text, /Nie udało się wczytać informacji o kluczu: Brak uprawnień do tej operacji\.$/);
+
+  // A topic administrator who is not the instance administrator reads the explanation and who changes the key; no button.
+  const reader = key(paint({ hidingData: data(null), capabilities: { canAdmin: false, orgName: 'Przychodnia Zdrowie' } }).host);
+  assert.match(reader.text, /Klucz zmienia administrator instancji\.$/);
+  assert.doesNotMatch(reader.text, /Obecny klucz/, 'the date of the key is not shown to who cannot ask for it');
+  assert.equal(reader.button.hidden, true);
+
+  // A topic that cannot have rules has no key card.
+  const blocked = paint({ hidingData: { policies: [], policiesError: null, schema: { subject: 'p', schemaType: 'protobuf' }, schemaSettled: true }, capabilities: { canAdmin: true } });
+  assert.equal(key(blocked.host).card.hidden, true);
 });
 
 test('a repaint with unchanged rules keeps the table\'s buttons', () => {
@@ -664,4 +848,105 @@ test('a topic with Avro content and an Avro pattern is blocked; the same content
   assert.match(avro.host.querySelector('[data-role="add"]').getAttribute('title'), /binarna/);
   const json = paint({ contentType: 'avro/binary', hidingData: { policies: [], policiesError: null, schema: null, schemaSettled: true } });
   assert.equal(json.host.querySelector('[data-role="add"]').hasAttribute('disabled'), false);
+});
+
+// ---------------------------------------------------------------------------
+// F4 B7 R2 + critic: XSD fields, the key without a rule or a node, doubled names
+// ---------------------------------------------------------------------------
+
+const INVOICE_XSD = `<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <!-- faktura -->
+  <xs:element name="faktura" type="Faktura"/>
+  <xs:complexType name="Faktura">
+    <xs:sequence>
+      <xs:element name="numer" type="xs:string"/>
+      <xs:element name="nabywca"><xs:complexType><xs:sequence><xs:element name="nip" type="xs:string"/></xs:sequence></xs:complexType></xs:element>
+      <xs:choice><xs:element name="gotowka" type="xs:string"/><xs:element name="przelew" type="xs:string"/></xs:choice>
+    </xs:sequence>
+    <xs:attribute name="id" type="xs:string"/>
+  </xs:complexType>
+</xs:schema>`;
+
+test('an XSD pattern lists the children of its root, through sequence, choice and a named type; what it cannot list it says', () => {
+  assert.deepEqual(readXsdFields(INVOICE_XSD), { fields: ['numer', 'nabywca', 'gotowka', 'przelew'].map((name) => ({ name, label: '' })), complex: false });
+  const inline = '<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"><xsd:element name="r"><xsd:complexType><xsd:all><xsd:element name="a" type="xsd:int"/><xsd:element ref="b"/></xsd:all></xsd:complexType></xsd:element></xsd:schema>';
+  assert.deepEqual(readXsdFields(inline).fields.map((f) => f.name), ['a', 'b']);
+  // Things whose children cannot be written out.
+  assert.equal(readXsdFields('<xs:schema xmlns:xs="x"><xs:element name="r"><xs:complexType><xs:sequence><xs:any/></xs:sequence></xs:complexType></xs:element></xs:schema>').complex, true);
+  assert.equal(readXsdFields('<xs:schema xmlns:xs="x"><xs:element name="r" type="Missing"/></xs:schema>').complex, true, 'a type that is not in the file');
+  assert.equal(readXsdFields('<xs:schema xmlns:xs="x" targetNamespace="urn:a" elementFormDefault="qualified"><xs:element name="r"/></xs:schema>').complex, true, 'the prefix of a namespaced child is anybody\'s guess');
+  assert.deepEqual(readXsdFields('<xs:schema'), { fields: [], complex: false }, 'text that is not a pattern lists nothing');
+  assert.deepEqual(readXsdFields('<a><b></a>'), { fields: [], complex: false });
+});
+
+test('an XML topic with an XSD gets its fields from it; one it cannot read is told as an XSD, never as "no pattern"', () => {
+  const xsd = { subject: 'faktura', schemaType: 'xsd', version: 2, text: INVOICE_XSD };
+  const source = fieldSource({ format: 'xml', schema: xsd });
+  assert.equal(source.mode, 'schema');
+  assert.deepEqual(source.fields.map((f) => f.name), ['numer', 'nabywca', 'gotowka', 'przelew']);
+  assert.deepEqual([source.subject, source.version], ['faktura', 2]);
+  const hard = fieldSource({ format: 'xml', schema: { ...xsd, text: '<xs:schema xmlns:xs="x"><xs:element name="r"><xs:complexType><xs:group ref="g"/></xs:complexType></xs:element></xs:schema>' } });
+  assert.equal(hard.mode, 'manual');
+  assert.equal(hard.xsd, true);
+  assert.equal(fieldSource({ format: 'xml', schema: null }).xsd, false, 'no pattern at all is a different sentence');
+  // A request over such a field is the usual one.
+  const form = { ...blankForm('read', source), actions: { numer: 'show', nabywca: 'hash', gotowka: 'mask', przelew: 'hide' } };
+  const request = buildPolicyRequest({ instanceId: INSTANCE, topic: 'faktury', subject: { subjectType: 'any', subjectId: '*' }, direction: 'read', form, source });
+  assert.deepEqual([request.fields, request.maskedFields, request.hashedFields], [['gotowka', 'nabywca', 'numer'], ['gotowka'], ['nabywca']]);
+});
+
+test('the key card tells the three states apart: no rules, rules without the key on this node, and a node that is not an operator', () => {
+  const base = { exists: false, keyVersion: 0, createdAtMs: 0, rotatedAtMs: 0, hashingRules: 0, hashingTopics: 0, hashingInstances: 0 };
+  const last = (info, extra = {}) => keyNote({ canAdmin: true, orgName: null, key: { info: { ...base, ...info }, error: null }, ...extra }).slice(1);
+
+  assert.deepEqual(last({}), ['Klucz powstanie przy pierwszej zasadzie „Zahaszuj” w organizacji — dopóki żadnej nie ma, nie ma czego zmieniać.']);
+  // Rules that hash and no key: the key is on its way, and the hashed fields are hidden meanwhile.
+  assert.deepEqual(last({ hashingRules: 2 }), ['Ten node ma zasady „Zahaszuj”, ale klucz organizacji jeszcze na niego nie dotarł — pola haszowane są tymczasowo ukryte. Klucz przychodzi z node\'a operatora; jeśli tak się nie dzieje, sprawdź połączenie z nim.']);
+  assert.equal(keyAwaited({ ...base, hashingRules: 2 }), true);
+  assert.equal(keyAwaited({ ...base }), false);
+  assert.equal(keyAwaited({ ...base, exists: true, hashingRules: 2 }), false);
+  // A key, on a node that may not change it.
+  const held = { exists: true, keyVersion: 2, rotatedAtMs: new Date(2026, 7, 12).getTime(), hashingRules: 2 };
+  assert.deepEqual(last({ ...held, canRotateHere: false }), ['Obecny klucz ustawiono 12.08.2026 (wersja 2).', 'Ten node nie jest operatorem organizacji, więc klucza tu nie zmienisz — zrób to na node\'zie operatora.']);
+  assert.deepEqual(last({ ...held }), ['Obecny klucz ustawiono 12.08.2026 (wersja 2).'], 'a server that does not say is taken to allow it');
+  assert.deepEqual(last({ ...held, canRotateHere: true }), ['Obecny klucz ustawiono 12.08.2026 (wersja 2).']);
+
+  assert.equal(keyButtonProblem(null), null);
+  assert.equal(keyButtonProblem({ ...base }), 'Klucz powstanie dopiero przy pierwszej zasadzie „Zahaszuj”.');
+  assert.equal(keyButtonProblem({ ...base, hashingRules: 1 }), 'Klucz jeszcze nie dotarł na ten node, więc nie ma czego zmieniać.');
+  assert.match(keyButtonProblem({ ...held, canRotateHere: false }), /nie jest operatorem organizacji/);
+  assert.equal(keyButtonProblem({ ...held, canRotateHere: true }), null);
+});
+
+test('the key button is closed on a node that is not an operator, with the reason, and open on one that is', () => {
+  const data = (info) => ({ policies: POLICIES, policiesError: null, schema: SCHEMA, schemaSettled: true, hashKey: { info, error: null } });
+  const held = { exists: true, keyVersion: 2, createdAtMs: 1, rotatedAtMs: new Date(2026, 7, 12).getTime(), hashingRules: 1, hashingTopics: 1, hashingInstances: 1 };
+  const button = (info) => paint({ hidingData: data(info), capabilities: { canAdmin: true } }).host.querySelector('[data-role="key-button"]');
+  const closed = button({ ...held, canRotateHere: false });
+  assert.ok(closed.hasAttribute('disabled'));
+  assert.match(closed.getAttribute('title'), /nie jest operatorem organizacji/);
+  const open = button({ ...held, canRotateHere: true });
+  assert.ok(!open.hasAttribute('disabled'));
+  assert.equal(open.getAttribute('title'), null);
+  const waiting = button({ exists: false, keyVersion: 0, createdAtMs: 0, rotatedAtMs: 0, hashingRules: 3, hashingTopics: 1, hashingInstances: 1, canRotateHere: true });
+  assert.ok(waiting.hasAttribute('disabled'));
+  assert.equal(waiting.getAttribute('title'), 'Klucz jeszcze nie dotarł na ten node, więc nie ma czego zmieniać.');
+});
+
+test('every doubled name is named at once, not one by the next fix', () => {
+  const form = { ...blankForm('read', typed), extraShown: ['aktywny', 'pesel'], extraMasked: ['pesel', 'aktywny'], extraHashed: ['lekarz', 'pesel'] };
+  const text = formProblem({ direction: 'read', form, source: typed, format: 'json' });
+  assert.match(text, /„aktywny” wpisano w więcej niż jednej liście/);
+  assert.match(text, /„pesel” wpisano w więcej niż jednej liście/);
+  assert.doesNotMatch(text, /lekarz/);
+});
+
+test('one masked or hashed field is "pole … będzie", several are "pola … będą": the sentence agrees with the number', () => {
+  const form = (actions) => ({ ...blankForm('read', json), actions: { pacjent: 'show', lekarz: 'show', termin: 'show', powod: 'show', ...actions } });
+  const lines = (actions) => ruleImpact({ who: 'Księgowość', direction: 'read', form: form(actions), current: null, source: json });
+  assert.match(lines({ pacjent: 'mask' })[0], /^Dla „Księgowość” pole dane pacjenta \(pacjent\) będzie widoczne tylko jako gwiazdki/);
+  assert.match(lines({ pacjent: 'mask', termin: 'mask' })[0], /^Dla „Księgowość” pola dane pacjenta \(pacjent\), termin będą widoczne tylko jako gwiazdki/);
+  assert.match(lines({ pacjent: 'hash' })[0], /zamiast wartości pola dane pacjenta \(pacjent\) pojawi się hasz/);
+  assert.match(lines({ pacjent: 'hash', lekarz: 'hash' })[0], /zamiast wartości pól dane pacjenta \(pacjent\), Lekarz prowadzący wizytę \(lekarz\) pojawi się hasz/);
 });

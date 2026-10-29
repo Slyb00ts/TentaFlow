@@ -258,7 +258,9 @@ const ERROR_CODES = [
   'blocking_task_failed', 'max_groups_exceeded',
   'key_needs_topic_wide_rule', 'subject_is_addon', 'subject_not_found', 'org_mismatch',
   // What a data-hiding rule or its preview can be refused with.
-  'record_not_found', 'partition_out_of_range', 'field_not_allowed', 'required_field_missing', 'field_policy_payload_malformed', 'field_policy_changed',
+  'record_not_found', 'partition_out_of_range', 'field_not_allowed', 'required_field_missing', 'field_policy_payload_malformed', 'field_policy_changed', 'field_hash_key_not_found', 'field_hash_key_changed',
+  // The hash key can be made or rotated on an operator node only, and not before it has reached this one.
+  'operator_node_required', 'hash_key_not_synced',
 ];
 
 for (const [locName, dict] of [['pl', pl], ['en', en], ['de', de], ['es', es], ['fr', fr]]) {
@@ -271,6 +273,17 @@ for (const [locName, dict] of [['pl', pl], ['en', en], ['de', de], ['es', es], [
     }
   });
 }
+
+test('the refusal of a node that is no operator is in words, names no node, and tells it from a key that has not arrived', () => {
+  const translate = makeTranslate(pl);
+  const node = 'a'.repeat(64);
+  const noOperator = helpers.mapBusErrorMessage(`protocol error PolicyDenied: bus.operator_node_required: rotating the hash key needs an operator node of the organization and this node is not one`, translate);
+  assert.match(noOperator, /node operatora organizacji, a ten node nim nie jest/);
+  assert.doesNotMatch(noOperator, new RegExp(node));
+  const notSynced = helpers.mapBusErrorMessage('protocol error PolicyDenied: bus.hash_key_not_synced: the organization already hashes fields with a key that has not reached this node yet', translate);
+  assert.match(notSynced, /klucz[^.]*jeszcze nie dotarł na ten node/);
+  assert.notEqual(noOperator, notSynced);
+});
 
 test('mapBusErrorMessage falls back to the raw server message for an unknown code', () => {
   const translate = makeTranslate(pl);
@@ -476,6 +489,7 @@ function makeHidingLoader(world) {
   // eslint-disable-next-line no-new-func
   return new Function('world', `
     const { state, ApiBinary, requireInstanceId, describeBusError, renderPanel, topicFormat } = world;
+    const canAdmin = () => world.canAdmin();
     let hidingTurn = 0;
     async ${cut(source, 'busCall')}
     ${cut(source, 'freshHiding')}
@@ -493,6 +507,7 @@ function hidingWorld(answers) {
     describeBusError: (e) => `błąd: ${e.message}`,
     renderPanel: () => painted.push(world.state.hiding),
     topicFormat: () => 'json',
+    canAdmin: () => false,
   };
   return { world, painted };
 }
@@ -545,6 +560,112 @@ test('loadTopicHiding: a failed reload keeps the rules the section showed; a fir
   await load('wizyty');
   assert.equal(world.state.hiding.policies, null);
   assert.equal(world.state.hiding.policiesError, 'błąd: Unavailable');
+});
+
+const KEY_INFO = { exists: true, keyVersion: 3, createdAtMs: 1, rotatedAtMs: 2, hashingRules: 3, hashingTopics: 2, hashingInstances: 1 };
+const keyAnswer = (key) => ({ payload: { FieldHashKeyInfoResponse: { key } } });
+
+test('loadTopicHiding: the organization\'s hash key is asked for the instance administrator only, and kept when a reload cannot read it', async () => {
+  const asked = [];
+  const answers = {
+    busFieldPolicyListRequest: async () => ({ payload: { FieldPolicyListResponse: { policies: [] } } }),
+    busFieldHashKeyInfoRequest: async (req) => { asked.push(req); if (answers.failKey) throw new Error('Unavailable'); return keyAnswer(KEY_INFO); },
+  };
+  const { world } = hidingWorld(answers);
+  const { load } = makeHidingLoader(world);
+  await load('wizyty');
+  assert.deepEqual(asked, [], 'a topic administrator who is not the instance administrator never asks');
+  assert.equal(world.state.hiding.hashKey, null);
+
+  world.canAdmin = () => true;
+  await load('wizyty');
+  assert.deepEqual(asked, [{ instanceId: 'tentabus-a1b2c3d4' }]);
+  assert.deepEqual(world.state.hiding.hashKey, { info: KEY_INFO, error: null });
+
+  answers.failKey = true;
+  await load('wizyty');
+  assert.deepEqual(world.state.hiding.hashKey, { info: KEY_INFO, error: null }, 'a failed reload keeps the key the section showed');
+  world.state.hiding = { topic: 'other', policies: null };
+  await load('wizyty');
+  assert.deepEqual(world.state.hiding.hashKey, { info: null, error: 'błąd: Unavailable' }, 'a first failure shows the reason');
+  assert.deepEqual(world.state.hiding.policies, [], 'and does not stop the rules from loading');
+});
+
+function makeKeyWindow(world) {
+  // eslint-disable-next-line no-new-func
+  return new Function('world', `
+    const { state, requireInstanceId, describeBusError, renderPanel, canAdmin, busCall, T, openHashKeyRotate, rotatedNotice, loadTopicHiding } = world;
+    async ${cut(source, 'openHashKeyWindow')}
+    return openHashKeyWindow;`)(world);
+}
+
+function keyWorld({ info = KEY_INFO, infoError = null, admin = true } = {}) {
+  const calls = { opened: [], loaded: 0, painted: 0, rotated: [] };
+  const world = {
+    state: { instanceId: 'tentabus-a1b2c3d4', view: { name: 'wizyty' }, capabilities: { orgName: 'Przychodnia Zdrowie' }, detailNotice: null },
+    requireInstanceId: (id) => id,
+    describeBusError: (e) => `błąd: ${e.message}`,
+    renderPanel: () => { calls.painted += 1; },
+    canAdmin: () => admin,
+    busCall: async (kind, request) => {
+      if (kind === 'busFieldHashKeyInfoRequest') {
+        if (infoError) throw new Error(infoError);
+        return { key: info };
+      }
+      calls.rotated.push({ kind, request });
+      return { key: { ...KEY_INFO, keyVersion: request.expectedKeyVersion + 1 } };
+    },
+    T: (key) => key,
+    openHashKeyRotate: (args) => { calls.opened.push(args); },
+    rotatedNotice: ({ key, orgName }) => ({ title: `rotated ${key.keyVersion}`, text: orgName }),
+    loadTopicHiding: async () => { calls.loaded += 1; },
+  };
+  return { world, calls };
+}
+
+test('"Zmień klucz haszowania": the key is read fresh, the window gets it with the organization, and rotating names its version', async () => {
+  const { world, calls } = keyWorld();
+  await makeKeyWindow(world)('wizyty');
+  assert.equal(calls.opened.length, 1);
+  const [args] = calls.opened;
+  assert.deepEqual([args.info, args.orgName], [KEY_INFO, 'Przychodnia Zdrowie']);
+  await args.rotate(3);
+  assert.deepEqual(calls.rotated, [{ kind: 'busFieldHashKeyRotateRequest', request: { instanceId: 'tentabus-a1b2c3d4', expectedKeyVersion: 3 } }]);
+  await args.onRotated({ ...KEY_INFO, keyVersion: 4 });
+  assert.deepEqual(world.state.detailNotice, { section: 'hiding', tone: 'success', title: 'rotated 4', text: 'Przychodnia Zdrowie' });
+  assert.equal(calls.loaded, 1, 'the section reloads to show the new key');
+});
+
+test('"Zmień klucz haszowania": somebody rotating first reloads the section; nobody but the instance administrator gets a window', async () => {
+  const { world, calls } = keyWorld();
+  await makeKeyWindow(world)('wizyty');
+  const [args] = calls.opened;
+  assert.equal(args.describeError(new Error('protocol error Conflict: bus.field_hash_key_changed: organization')), 'błąd: protocol error Conflict: bus.field_hash_key_changed: organization');
+  assert.equal(calls.loaded, 1, 'a refusal because the key changed shows the key as it is now');
+  args.describeError(new Error('bus.permission_denied'));
+  assert.equal(calls.loaded, 1, 'any other refusal changes nothing');
+
+  const notAdmin = keyWorld({ admin: false });
+  await makeKeyWindow(notAdmin.world)('wizyty');
+  assert.deepEqual(notAdmin.calls.opened, []);
+
+  const left = keyWorld();
+  left.world.state.view = { name: 'inny' };
+  await makeKeyWindow(left.world)('wizyty');
+  assert.deepEqual(left.calls.opened, [], 'a page that is no longer open gets no window');
+});
+
+test('"Zmień klucz haszowania": a key that cannot be read is told on the section; a missing key opens nothing and reloads the section', async () => {
+  const failed = keyWorld({ infoError: 'Unavailable' });
+  await makeKeyWindow(failed.world)('wizyty');
+  assert.deepEqual(failed.calls.opened, []);
+  assert.deepEqual(failed.world.state.detailNotice, { section: 'hiding', tone: 'danger', title: 'hiding.key.failed_title', text: 'błąd: Unavailable' });
+  assert.equal(failed.calls.painted, 1);
+
+  const none = keyWorld({ info: { ...KEY_INFO, exists: false } });
+  await makeKeyWindow(none.world)('wizyty');
+  assert.deepEqual(none.calls.opened, [], 'there is nothing to rotate before the first hash rule');
+  assert.equal(none.calls.loaded, 1);
 });
 
 test('every failure the screen words goes through the plain-word refusals first (stored pattern, rule on a binary topic, pattern kind)', () => {

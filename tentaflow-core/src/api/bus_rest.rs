@@ -1341,6 +1341,7 @@ pub(crate) mod test_support {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("bus init_instance");
         (dir, id, svc)
@@ -2191,6 +2192,8 @@ mod tests {
                 field_policies::Direction::Read,
                 &fields(allowed),
                 &fields(&[]),
+                &std::collections::BTreeSet::new(),
+                &std::collections::BTreeSet::new(),
                 field_policies::BusFieldPolicyExpect::Any,
             )
             .expect("set policy")
@@ -2232,6 +2235,120 @@ mod tests {
             payloads(&wildcard),
             vec![serde_json::json!({"id": 1, "name": "Jan"})]
         );
+    }
+
+    /// F4 B7: the records REST reads through the same projection — a key's
+    /// consume carries masked and hashed values, the hash being the
+    /// organization's, and a key never sees the raw value.
+    #[test]
+    fn key_reads_carry_masked_and_hashed_values() {
+        let fx = key_fixture("cccc3016");
+        let key = fx.key(&["read"]);
+        let fields = |names: &[&str]| -> std::collections::BTreeSet<String> {
+            names.iter().map(|n| n.to_string()).collect()
+        };
+        field_policies::set_policy(
+            &fx.state.db,
+            fx.instance.as_str(),
+            ORG,
+            TOPIC,
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read,
+            &fields(&["id", "name", "pesel"]),
+            &fields(&[]),
+            &fields(&["pesel"]),
+            &fields(&["name"]),
+            field_policies::BusFieldPolicyExpect::Any,
+        )
+        .expect("set policy");
+        // The writer of the first rule that hashes makes the key; a read never does.
+        let hash = fx
+            .svc
+            .field_hash_keys()
+            .get_or_create(ORG)
+            .expect("org key")
+            .hash_hex(b"Jan");
+        fx.svc
+            .publish(
+                &fx.user_ctx("u-admin"),
+                TOPIC,
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![PublishRecord {
+                        key: None,
+                        headers: vec![],
+                        payload: Bytes::from_static(
+                            br#"{"id":1,"name":"Jan","pesel":"44051401359","ssn":"x"}"#,
+                        ),
+                        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                        schema_id: 0,
+                    }],
+                },
+            )
+            .expect("publish");
+
+        let read = fx.consume_as(key_principal(&key), &own_group_query(&key));
+        assert_eq!(read.status, StatusCode::OK, "{}", read.json);
+        assert_eq!(
+            payloads(&read),
+            vec![serde_json::json!({"id": 1, "name": hash, "pesel": "********359"})]
+        );
+        assert!(!read.json.to_string().contains("44051401359"));
+    }
+
+    /// F4 B7 review R1 P2-1: the key of the organization has not reached this
+    /// node (a rule that arrived by the ledger makes none, and a read makes
+    /// none either): the records REST hides the hashed field — it does not hash
+    /// with a key of this node's own — and shows the rest.
+    #[test]
+    fn key_reads_hide_a_hashed_field_this_node_holds_no_key_for() {
+        let fx = key_fixture("cccc3017");
+        let key = fx.key(&["read"]);
+        let fields = |names: &[&str]| -> std::collections::BTreeSet<String> {
+            names.iter().map(|n| n.to_string()).collect()
+        };
+        field_policies::set_policy(
+            &fx.state.db,
+            fx.instance.as_str(),
+            ORG,
+            TOPIC,
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read,
+            &fields(&["id", "name", "pesel"]),
+            &fields(&[]),
+            &fields(&["pesel"]),
+            &fields(&["name"]),
+            field_policies::BusFieldPolicyExpect::Any,
+        )
+        .expect("set policy");
+        fx.svc
+            .publish(
+                &fx.user_ctx("u-admin"),
+                TOPIC,
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![PublishRecord {
+                        key: None,
+                        headers: vec![],
+                        payload: Bytes::from_static(br#"{"id":1,"name":"Jan","pesel":"44051401359"}"#),
+                        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                        schema_id: 0,
+                    }],
+                },
+            )
+            .expect("publish");
+
+        let read = fx.consume_as(key_principal(&key), &own_group_query(&key));
+        assert_eq!(read.status, StatusCode::OK, "{}", read.json);
+        assert_eq!(
+            payloads(&read),
+            vec![serde_json::json!({"id": 1, "pesel": "********359"})]
+        );
+        assert!(fx.svc.field_hash_keys().info(ORG).unwrap().is_none());
     }
 
     /// Sum of `requests` and `records` over the key's rows of one action.
@@ -2419,6 +2536,8 @@ mod tests {
                 direction,
                 &fields(allowed),
                 &fields(&[]),
+                &std::collections::BTreeSet::new(),
+                &std::collections::BTreeSet::new(),
                 field_policies::BusFieldPolicyExpect::Any,
             )
             .expect("set policy")

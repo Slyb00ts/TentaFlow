@@ -19,7 +19,7 @@ import assert from 'node:assert/strict';
 
 if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Document = window.Document;
 
-const { openHidingAdd, openHidingChange, openHidingRemove, removeLead, removeImpact } = await import('./topic-hiding-windows.js');
+const { openHidingAdd, openHidingChange, openHidingRemove, removeLead, removeImpact, actionsNoteHtml } = await import('./topic-hiding-windows.js');
 const { policyRows, fieldSource } = await import('./topic-hiding.js');
 
 const norm = (s) => String(s).replace(/[  ]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -110,7 +110,7 @@ test('"Dodaj zasadę" for a group: only groups without a reading rule, a row per
   await tick();
   assert.deepEqual(sent, [{
     instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-ksieg', direction: 'read',
-    fields: ['lekarz', 'pacjent', 'termin'], requiredFields: [], expectAbsent: true,
+    fields: ['lekarz', 'pacjent', 'termin'], requiredFields: [], maskedFields: [], hashedFields: [], expectAbsent: true,
   }], 'an add says there must be no such rule yet');
   assert.equal(saved[0].title, 'Zapisano zasadę');
   assert.match(saved[0].text, /^Dla „Księgowość” znikną z wiadomości pola: powód wizyty \(powod\)\./);
@@ -136,7 +136,7 @@ test('the same group is offered again for writing; switching the direction redra
   await tick();
   assert.deepEqual(sent, [{
     instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-rej', direction: 'write',
-    fields: ['lekarz', 'nr', 'pacjent', 'termin'], requiredFields: ['nr', 'pacjent'], expectAbsent: true,
+    fields: ['lekarz', 'nr', 'pacjent', 'termin'], requiredFields: ['nr', 'pacjent'], maskedFields: [], hashedFields: [], expectAbsent: true,
   }]);
 });
 
@@ -368,6 +368,23 @@ test('the close button and Escape ask once before dropping a changed draft; an u
   assert.equal(win.isConnected, false);
 });
 
+test('the question about dropping a draft is brought into view: in a long window it sits below the fold and "Anuluj" would look dead', async () => {
+  closeAll();
+  const later = () => new Promise((r) => setTimeout(r, 300));
+  const { ctx } = addContext();
+  const win = openHidingAdd(ctx);
+  await tick();
+  const asked = win.querySelector('[data-role="discard"]');
+  const scrolled = [];
+  asked.scrollIntoView = (options) => scrolled.push(options);
+  pick(rowFor(win, 'powod'), 'hide');
+  win.querySelector('[data-act="cancel"]').click();
+  await later();
+  assert.equal(asked.hidden, false);
+  assert.deepEqual(scrolled, [{ block: 'nearest' }], 'the window scrolls to the question, like it does to a refusal');
+  assert.equal(win.isConnected, true);
+});
+
 test('the first rule for chosen subjects in a direction warns before saving that API-key systems lose the topic', async () => {
   closeAll();
   const warning = /Systemy zewnętrzne z kluczem API nie będą mogły czytać tego topiku, dopóki nie dodasz zasady dla wszystkich\./;
@@ -463,6 +480,126 @@ test('"Anuluj" asks once like the close button and Escape when the draft is chan
 });
 
 // ---------------------------------------------------------------------------
+// Zamaskuj and Zahaszuj (F4 B7)
+// ---------------------------------------------------------------------------
+
+const MASKING_CAPS = ['hide', 'mask', 'hash'];
+const extraRoles = (win) => [...win.querySelectorAll('[data-role="extras"] tf-tag-input')].map((t) => t.getAttribute('data-role'));
+
+test('with masking offered every reading row has four choices, the window explains them once, and the request carries the masked and hashed fields', async () => {
+  closeAll();
+  const { ctx, sent, saved } = addContext({ fieldActions: MASKING_CAPS });
+  const win = openHidingAdd(ctx);
+  await tick();
+  chooseSubject(win, 'group:g-ksieg');
+  assert.deepEqual(optionLabels(rowFor(win, 'pacjent')), ['Pokaż', 'Ukryj', 'Zamaskuj', 'Zahaszuj']);
+  const note = win.querySelector('[data-role="actions-note"]');
+  assert.equal(note.hidden, false);
+  assert.match(norm(note.textContent), /^Ukryj — Pole znika z wiadomości\.\s*Zamaskuj — Widać 3 ostatnie znaki, reszta to gwiazdki \(wartość krótsza niż 5 znaków jest zamaskowana w całości\), np\. \*{8}359\.\s*Zahaszuj — Zamiast wartości widać stały ciąg znaków: ta sama wartość daje zawsze ten sam hasz w całej organizacji, a wartości nie da się z niego odczytać\.\s*W JSON zamaskowane lub zahaszowane pole staje się tekstem/);
+  assert.deepEqual(extraRoles(win), ['extra-shown', 'extra-masked', 'extra-hashed']);
+  assert.equal(norm(win.querySelector('[data-role="extra-masked"]').closest('.field').querySelector('label').textContent), 'Inne pola, które mają być widoczne jako maska');
+  pick(rowFor(win, 'pacjent'), 'mask');
+  pick(rowFor(win, 'lekarz'), 'hash');
+  pick(rowFor(win, 'powod'), 'hide');
+  assert.equal(norm(win.querySelector('[data-role="impact"]').textContent),
+    'Co się stanie po zapisaniu: Dla „Księgowość” znikną z wiadomości pola: powód wizyty (powod). '
+    + 'Dla „Księgowość” pole dane pacjenta (pacjent) będzie widoczne tylko jako gwiazdki z 3 ostatnimi znakami. '
+    + 'Dla „Księgowość” zamiast wartości pola lekarz pojawi się hasz — stały ciąg znaków, taki sam dla tej samej wartości w całej organizacji. '
+    + 'Pozostałe pola z listy bez zmian.');
+  setTags(win, 'extra-masked', ['telefon']);
+  setTags(win, 'extra-hashed', ['pesel']);
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.deepEqual(sent, [{
+    instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-ksieg', direction: 'read',
+    fields: ['lekarz', 'pacjent', 'pesel', 'telefon', 'termin'], requiredFields: [], maskedFields: ['pacjent', 'telefon'], hashedFields: ['lekarz', 'pesel'], expectAbsent: true,
+  }]);
+  assert.match(saved[0].text, /będą widoczne tylko jako gwiazdki z 3 ostatnimi znakami/);
+});
+
+test('a name typed into two lists, or against its own row, is refused before the request and named', async () => {
+  closeAll();
+  const { ctx } = addContext({ fieldActions: MASKING_CAPS });
+  const win = openHidingAdd(ctx);
+  await tick();
+  chooseSubject(win, 'group:g-ksieg');
+  pick(rowFor(win, 'powod'), 'hide');
+  setTags(win, 'extra-masked', ['pesel']);
+  setTags(win, 'extra-hashed', ['pesel']);
+  assert.match(win.querySelector('[data-role="impact"]').textContent, /„pesel” wpisano w więcej niż jednej liście/);
+  assert.ok(win.querySelector('[data-act="save"]').hasAttribute('disabled'));
+  setTags(win, 'extra-hashed', []);
+  assert.ok(!win.querySelector('[data-act="save"]').hasAttribute('disabled'));
+  setTags(win, 'extra-masked', ['powod']);
+  assert.match(win.querySelector('[data-role="impact"]').textContent, /„powod” jest na liście pól i ma tam inne ustawienie/);
+});
+
+test('without masking offered the window is as before: two choices, no explanation, no lists of masked or hashed fields', async () => {
+  closeAll();
+  const { ctx } = addContext({ fieldActions: ['hide'] });
+  const win = openHidingAdd(ctx);
+  await tick();
+  chooseSubject(win, 'group:g-ksieg');
+  assert.deepEqual(optionLabels(rowFor(win, 'pacjent')), ['Pokaż', 'Ukryj']);
+  assert.equal(win.querySelector('[data-role="actions-note"]').hidden, true);
+  assert.deepEqual(extraRoles(win), ['extra-shown']);
+});
+
+test('a writing rule has no masking: three choices, no explanation, no masked lists, even where masking is offered', async () => {
+  closeAll();
+  const { ctx } = addContext({ fieldActions: MASKING_CAPS });
+  const win = openHidingAdd(ctx);
+  await tick();
+  pick(win.querySelector('[data-role="direction"]'), 'write');
+  chooseSubject(win, 'group:g-rej');
+  assert.deepEqual(optionLabels(rowFor(win, 'pacjent')), ['Dozwolone', 'Wymagane', 'Niedozwolone']);
+  assert.equal(win.querySelector('[data-role="actions-note"]').hidden, true);
+  assert.deepEqual(extraRoles(win), ['extra-shown', 'extra-required']);
+  pick(win.querySelector('[data-role="direction"]'), 'read');
+  assert.deepEqual(extraRoles(win), ['extra-shown', 'extra-masked', 'extra-hashed'], 'back to reading, the lists are back');
+});
+
+test('the note names what a masked or hashed value becomes in the format of the topic', () => {
+  const [json_, xml, hl7_] = ['json', 'xml', 'hl7v2'].map((f) => norm(actionsNoteHtml(MASKING_CAPS, f).replace(/<[^>]+>/g, ' ')));
+  assert.match(json_, /W JSON zamaskowane lub zahaszowane pole staje się tekstem, np\. liczba 12345 daje „\*\*345”\. Wartość logiczna, obiekt i lista są maskowane jako „\*\*\*”\. Puste pole i null zostają bez zmian\.$/);
+  assert.match(xml, /W XML zamaskowany lub zahaszowany element traci atrybuty i elementy zagnieżdżone — zostaje sam tekst\./);
+  assert.match(hl7_, /W HL7 v2 maska i hasz obejmują całe pole razem z jego komponentami/);
+  assert.equal(actionsNoteHtml(['show', 'hide'], 'json'), '', 'nothing to explain while hiding is all there is');
+  assert.equal(actionsNoteHtml([], 'json'), '');
+});
+
+test('"Zmień" of a masking rule reads each field back as it is and sends the change with the version it started from', async () => {
+  closeAll();
+  const rule = policyRows([{ subjectType: 'group', subjectId: 'g-ksieg', direction: 'read', fields: ['lekarz', 'pacjent', 'termin', 'pesel'], requiredFields: [], maskedFields: ['pacjent', 'pesel'], hashedFields: ['lekarz'], updatedAtMs: NOW, subjectLabel: 'Księgowość', memberCount: 4 }])[0];
+  const { ctx, sent } = addContext({ fieldActions: MASKING_CAPS });
+  const win = openHidingChange(rule, ctx);
+  assert.deepEqual(['pacjent', 'lekarz', 'termin', 'powod'].map((f) => rowFor(win, f).value), ['mask', 'hash', 'show', 'hide']);
+  assert.deepEqual(win.querySelector('[data-role="extra-masked"]').tags, ['pesel']);
+  assert.deepEqual(win.querySelector('[data-role="extra-hashed"]').tags, []);
+  assert.ok(win.querySelector('[data-act="save"]').hasAttribute('disabled'), 'nothing changed yet');
+  pick(rowFor(win, 'pacjent'), 'hash');
+  assert.equal(norm(win.querySelector('[data-role="impact"]').textContent),
+    'Co się stanie po zapisaniu: Dla „Księgowość” zamiast wartości pola dane pacjenta (pacjent) pojawi się hasz — stały ciąg znaków, taki sam dla tej samej wartości w całej organizacji. Pozostałe pola z listy bez zmian.');
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.deepEqual(sent, [{
+    instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-ksieg', direction: 'read',
+    fields: ['lekarz', 'pacjent', 'pesel', 'termin'], requiredFields: [], maskedFields: ['pesel'], hashedFields: ['lekarz', 'pacjent'], expectedUpdatedAtMs: NOW,
+  }]);
+});
+
+test('the refusals of the server that concern masking are told in plain words', async () => {
+  const { busRefusalText } = await import('./schemas.js');
+  assert.equal(busRefusalText('protocol error BadRequest: bus.invalid_argument: masking and hashing apply to read rules only'),
+    'Zamaskować albo zahaszować można tylko pole w zasadzie odczytu — zasada zapisu może pole tylko dopuścić, wymagać albo zabronić.');
+  assert.equal(busRefusalText('bus.invalid_argument: masked_fields and hashed_fields must be subsets of fields'),
+    'Zamaskowane i zahaszowane pole musi być też na liście pól, które zasada pokazuje.');
+  assert.equal(busRefusalText('bus.invalid_argument: a field cannot be both masked and hashed'),
+    'Jedno pole nie może być jednocześnie zamaskowane i zahaszowane.');
+  assert.equal(busRefusalText('bus.invalid_argument: something else'), '');
+});
+
+// ---------------------------------------------------------------------------
 // Zmień
 // ---------------------------------------------------------------------------
 
@@ -487,7 +624,7 @@ test('"Zmień": subject and direction fixed, the stored rule read back as hidden
   await tick();
   assert.deepEqual(sent, [{
     instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-rej', direction: 'read',
-    fields: ['lekarz', 'pacjent', 'powod'], requiredFields: [], expectedUpdatedAtMs: NOW,
+    fields: ['lekarz', 'pacjent', 'powod'], requiredFields: [], maskedFields: [], hashedFields: [], expectedUpdatedAtMs: NOW,
   }], 'a change says which version of the rule it was made from');
   assert.equal(saved[0].title, 'Zapisano zmianę zasady');
   assert.doesNotMatch(saved[0].text, /niżej/, 'the note outlives the window, so it points at nothing below');
@@ -550,6 +687,10 @@ test('"Usuń": what the rule does now, what follows, then one FieldPolicyDelete'
   assert.equal(removeLead(group, json), 'Zasada odczytu dla: Rejestracja. Ukrywa pola: powód wizyty (powod).');
   assert.equal(removeLead(everyone, json), 'Zasada zapisu dla: Wszyscy — niedozwolone pola: powód wizyty (powod); wymagane pola: dane pacjenta (pacjent), termin.');
   assert.equal(removeLead({ ...group, fields: ['lekarz'] }, typed), 'Zasada odczytu dla: Rejestracja. Zostawia widoczne tylko pola: lekarz.');
+  const masking = { ...group, fields: ['lekarz', 'pacjent', 'termin'], maskedFields: ['pacjent'], hashedFields: ['lekarz'] };
+  assert.equal(removeLead(masking, json), 'Zasada odczytu dla: Rejestracja. Ukrywa pola: powód wizyty (powod). Maskuje pola: dane pacjenta (pacjent). Haszuje pola: lekarz.');
+  assert.equal(removeLead({ ...masking, fields: ['lekarz', 'pacjent', 'termin', 'powod'] }, json), 'Zasada odczytu dla: Rejestracja. Maskuje pola: dane pacjenta (pacjent). Haszuje pola: lekarz.');
+  assert.equal(removeLead({ ...group, fields: ['id', 'pesel'], maskedFields: ['pesel'], hashedFields: [] }, typed), 'Zasada odczytu dla: Rejestracja. Zostawia widoczne tylko pola: id, pesel. Maskuje pola: pesel.');
   assert.deepEqual(removeImpact(group, json, TOPIC, rows), ['Osoby z grupy „Rejestracja” w topiku wizyty będą czytać według zasady odczytu swojej innej grupy, a gdy jej nie mają — według zasady dla wszystkich; gdy nie ma żadnej, zobaczą całe wiadomości.']);
   const person = { ...group, key: 'user:u-1:read', subjectType: 'user', subjectId: 'u-1', label: 'Jan Nowak' };
   assert.deepEqual(removeImpact(person, json, TOPIC, rows), ['Dla użytkownika „Jan Nowak” w topiku wizyty zacznie obowiązywać zasada odczytu jednej z jego grup, a gdy żadna z nich jej nie ma — zasada dla wszystkich; gdy nie ma żadnej, zobaczy całe wiadomości.']);

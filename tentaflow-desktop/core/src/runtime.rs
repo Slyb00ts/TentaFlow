@@ -125,6 +125,10 @@ pub async fn start_services(config: NodeConfig, state: SharedAppState) -> Result
     let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(
         &file_master_key,
     ));
+    // The same cipher for the lifecycle hooks of native apps (TentaBus seals its
+    // hashing keys with it): the master key lives in this data dir, not in the
+    // default location a hook would look at.
+    tentaflow_core::addon::native_apps::set_global_settings_cipher(&settings_cipher);
 
     // Store pakietow addonow obok bazy desktopowej (jeden korzen danych).
     tentaflow_core::addon::bundled::set_packages_base(data_dir.clone());

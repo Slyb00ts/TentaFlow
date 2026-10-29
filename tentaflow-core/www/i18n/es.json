@@ -10166,7 +10166,14 @@
       "schema_kind_mismatch": "El patrón {name} es para contenido {schemaKind}, pero este tópico acepta contenido {topicKind}.",
       "stored_schema_unreadable": "El patrón {name}, versión {version}, se guardó con reglas más laxas y el registro ya no puede leerlo, así que el tópico no puede comprobar mensajes con él. Añade una versión corregida del patrón.",
       "field_policy_binary_topic": "El tópico {topic} lleva mensajes binarios (patrón {name}, {format}). Las reglas para ocultar datos funcionan con JSON, XML y HL7 v2, así que no se puede añadir ninguna.",
-      "field_policy_binary_bind": "El tópico {topic} tiene reglas para ocultar datos, así que no se le puede asociar el patrón binario {name} ({format}). Las reglas funcionan con JSON, XML y HL7 v2: elimínalas primero."
+      "field_policy_binary_bind": "El tópico {topic} tiene reglas para ocultar datos, así que no se le puede asociar el patrón binario {name} ({format}). Las reglas funcionan con JSON, XML y HL7 v2: elimínalas primero.",
+      "mask_hash_read_only": "Solo una regla de lectura puede enmascarar o aplicar hash a un campo; una regla de escritura solo puede permitirlo, exigirlo o prohibirlo.",
+      "mask_hash_not_shown": "Un campo enmascarado o con hash debe estar también entre los campos que muestra la regla.",
+      "mask_hash_overlap": "Un campo no puede estar enmascarado y con hash a la vez.",
+      "field_hash_key_not_found": "La organización aún no tiene clave de hash: se crea con la primera regla «Hashear», así que no hay nada que cambiar.",
+      "field_hash_key_changed": "La clave de hash cambió mientras tanto (alguien la cambió antes que tú), así que no se cambió nada. Cierra esta ventana y ábrela de nuevo para ver la versión actual de la clave.",
+      "operator_node_required": "Esto solo puede hacerlo un nodo operador de la organización y este nodo no lo es. Hazlo en un nodo operador (lista: nodos de la malla).",
+      "hash_key_not_synced": "La organización ya hashea campos con una clave que aún no ha llegado a este nodo, así que ahora no se puede añadir otro campo «Hashear». Espera a la sincronización con el nodo operador o comprueba la conexión con él."
     },
     "shell": {
       "instance": "Instancia",
@@ -11850,7 +11857,9 @@
       "and_more": "y {count} {n|campo más|campos más}",
       "action": {
         "show": "Mostrar",
-        "hide": "Ocultar"
+        "hide": "Ocultar",
+        "mask": "Enmascarar",
+        "hash": "Hashear"
       },
       "write": {
         "allow": "Permitido",
@@ -11877,8 +11886,8 @@
       "col_changed": "Modificado",
       "empty_title": "Este topic no tiene reglas para ocultar datos",
       "empty_text": "Cualquiera que pueda leer este topic ve los mensajes completos. Añade una regla para ocultar campos concretos.",
-      "blocked_title": "Las reglas de este topic no se editan aquí",
-      "blocked_text": "Las reglas de este topic no se editan en esta pantalla porque su contenido es binario y no se puede leer como campos. Esta pantalla funciona con mensajes JSON, XML y HL7 v2. El tipo de contenido se fija al crear el topic.",
+      "blocked_title": "El contenido binario no admite ocultar datos",
+      "blocked_text": "En un contenido binario no se pueden ocultar campos: no se puede leer como campos, así que quien puede leer el topic lo ve entero. Ocultar datos funciona con mensajes JSON, XML y HL7 v2. El tipo de contenido se fija al crear el topic.",
       "blocked_with_rules": "Este tópico tiene reglas para ocultar datos, pero su contenido es binario: las reglas no funcionarán. Elimínalas o crea un tópico JSON/XML/HL7.",
       "keys_closed": "Los sistemas externos con clave de API tienen cerrado este topic para {directions}: solo hay reglas para personas, grupos o addons elegidos y ninguna para todos.",
       "sees_only": "Ve solo: {fields}",
@@ -11891,7 +11900,10 @@
         "hide": "El campo desaparece del mensaje.",
         "reject_name": "Rechazar el mensaje",
         "reject": "Al escribir: un mensaje con un campo no permitido, o sin uno obligatorio, no llega al topic.",
-        "precedence": "La regla de una persona gana a la de su grupo, y esta a la de todos — las reglas no se suman."
+        "precedence": "La regla de una persona gana a la de su grupo, y esta a la de todos — las reglas no se suman.",
+        "mask": "Se ven los 3 últimos caracteres y el resto son asteriscos (un valor de menos de 5 caracteres se enmascara por completo), p. ej. {example}.",
+        "hash": "En lugar del valor se ve una cadena fija: el mismo valor da siempre el mismo hash en toda la organización, y el valor no se puede leer a partir de él.",
+        "mask_example": "********359"
       },
       "field_problem": {
         "empty": "Escribe el nombre de un campo.",
@@ -11899,11 +11911,12 @@
         "hl7_shape": "«{name}» no es una dirección de campo HL7. Una dirección tiene la forma SEGMENTO-número, p. ej. PID-5.",
         "xml_name": "«{name}» no es un nombre de elemento XML. Un nombre empieza por una letra o _ y no tiene espacios.",
         "hl7_case": "«{name}» parece una errata. ¿Querías decir {suggestion}? La dirección se escribe en mayúsculas y con guion.",
-        "typed_known": "«{name}» está en la lista de campos con un ajuste distinto al escrito abajo. Déjalo en un solo sitio."
+        "typed_known": "«{name}» está en la lista de campos con un ajuste distinto al escrito abajo. Déjalo en un solo sitio.",
+        "typed_twice": "«{name}» está escrito en más de una lista. Déjalo en una sola."
       },
       "need": {
-        "read": "Pon al menos un campo en «Ocultar». La lista contiene todos los campos de este topic, así que una regla que los muestra todos no cambia nada: para detenerla, elimínala.",
-        "read_typed": "Escribe al menos un campo que siga visible. Sin ningún campo visible, la regla ocultaría todo el mensaje.",
+        "read": "Pon al menos un campo en «Ocultar», «Enmascarar» o «Hashear». La lista contiene todos los campos de este topic, así que una regla que los muestra todos no cambia nada: para detenerla, elimínala.",
+        "read_typed": "Escribe al menos un campo que siga visible (tal cual, enmascarado o con hash). Sin ningún campo visible, la regla ocultaría todo el mensaje.",
         "write": "Pon al menos un campo en «Obligatorio» o «No permitido». La lista contiene todos los campos de este topic, así que una regla que lo permite todo no comprueba nada: para detenerla, elimínala.",
         "write_typed": "Escribe al menos un campo que se pueda escribir. Sin ningún campo permitido, la regla rechazaría todos los mensajes."
       },
@@ -11927,7 +11940,9 @@
         "write_unlisted_hl7_saved": "Las demás posiciones de los segmentos de la lista (p. ej. PID-1, PID-4, PV1-1) se aceptan. Un mensaje con otro segmento se rechaza.",
         "write_unlisted_only_hl7": "Se aceptan los mensajes de {whoFrom} con los segmentos de la lista, también en sus demás posiciones (p. ej. PID-4, PV1-1). Un mensaje con otro segmento, p. ej. un segmento Z, se rechaza.",
         "read_unlisted_saved": "Los campos que no están en la lista también desaparecen.",
-        "write_unlisted_saved": "Un mensaje con un campo fuera de la lista también se rechaza."
+        "write_unlisted_saved": "Un mensaje con un campo fuera de la lista también se rechaza.",
+        "read_masked": "Para {who}, {n|el campo|los campos} {fields} se verá{n||n} solo como asteriscos con los 3 últimos caracteres visibles.",
+        "read_hashed": "Para {who}, en {n|el campo|los campos} {fields} se verá un hash en lugar del valor: una cadena fija, igual para el mismo valor en toda la organización."
       },
       "fields_label": "Campos",
       "source": {
@@ -11935,7 +11950,8 @@
         "dictionary": "La lista contiene los campos HL7 v2 más habituales. Añade otro campo más abajo escribiendo su dirección.",
         "failed": "No se pudo leer el patrón de mensaje de este topic, así que no se conocen sus campos. Escribe abajo los campos que siguen visibles.",
         "manual": "No se conocen los campos de este topic: ningún patrón de mensaje los enumera. Escribe abajo los campos que siguen visibles.",
-        "complex": "El patrón de mensaje de este topic contiene campos que no se pueden enumerar a partir de él (una referencia a otro archivo o nombres de campo libres), así que no se conoce la lista completa. Escribe abajo los campos que siguen visibles."
+        "complex": "El patrón de mensaje de este topic contiene campos que no se pueden enumerar a partir de él (una referencia a otro archivo o nombres de campo libres), así que no se conoce la lista completa. Escribe abajo los campos que siguen visibles.",
+        "xsd": "Los campos de este topic se escriben a mano: no se pueden listar a partir de su patrón XSD. Escribe abajo los campos que deben seguir visibles."
       },
       "extra": {
         "shown": "Otros campos que siguen visibles",
@@ -11945,7 +11961,11 @@
         "required": "Campos obligatorios",
         "hint_hl7": "Escribe una dirección de campo, p. ej. PID-5, y pulsa Intro.",
         "hint_xml": "Escribe un nombre de elemento, p. ej. patient, y pulsa Intro.",
-        "hint_json": "Escribe un nombre de campo, p. ej. patient, y pulsa Intro."
+        "hint_json": "Escribe un nombre de campo, p. ej. patient, y pulsa Intro.",
+        "masked": "Otros campos que siguen visibles como máscara",
+        "masked_typed": "Campos que siguen visibles como máscara",
+        "hashed": "Otros campos que siguen visibles como hash",
+        "hashed_typed": "Campos que siguen visibles como hash"
       },
       "unlisted": {
         "read": "Los campos que no están en la lista también se ocultan (incluso los que aparezcan más tarde), salvo que los escribas abajo.",
@@ -11982,7 +12002,7 @@
       "remove": {
         "button": "Eliminar",
         "window_title": "Eliminar la regla para ocultar datos — {name}",
-        "lead_read": "Regla de lectura para: {who}. Oculta los campos: {fields}.",
+        "lead_read": "Regla de lectura para: {who}. {parts}",
         "lead_read_none": "Regla de lectura para: {who}. No oculta ninguno de los campos conocidos.",
         "lead_read_only": "Regla de lectura para: {who}. Deja visibles solo estos campos: {fields}.",
         "lead_read_nothing": "Regla de lectura para: {who}. No deja visible ningún campo.",
@@ -12004,7 +12024,10 @@
         "impact_read_addon": "El addon «{who}» lee el topic {topic} según la regla para todos; si no la hay, ve los mensajes completos.",
         "impact_write_user": "Los mensajes del usuario «{who}» al topic {topic} se comprueban con la regla de escritura de uno de sus grupos y, si ninguno la tiene, con la regla para todos; si no hay ninguna, no se comprueban en absoluto.",
         "impact_write_group": "Los mensajes de las personas del grupo «{who}» al topic {topic} se comprueban con la regla de escritura de otro de sus grupos y, si no la tienen, con la regla para todos; si no hay ninguna, no se comprueban en absoluto.",
-        "impact_write_addon": "Los mensajes del addon «{who}» al topic {topic} se comprueban con la regla para todos; si no la hay, no se comprueban en absoluto."
+        "impact_write_addon": "Los mensajes del addon «{who}» al topic {topic} se comprueban con la regla para todos; si no la hay, no se comprueban en absoluto.",
+        "part_hide": "Oculta los campos: {fields}.",
+        "part_mask": "Enmascara los campos: {fields}.",
+        "part_hash": "Aplica hash a los campos: {fields}."
       },
       "preview": {
         "button": "Vista previa de lo que ve…",
@@ -12026,15 +12049,22 @@
         "hidden": "oculto",
         "shown": "visible",
         "rules_title": "Qué hicieron las reglas",
-        "summary_hidden": "Las reglas ocultaron {count} {n|campo|campos}: {fields}.",
-        "summary_none": "Las reglas no ocultaron ningún campo de este mensaje.",
+        "summary_none": "Las reglas no cambiaron ningún campo de este mensaje.",
         "limited_title": "Esta vista previa es más estrecha que la vista de la persona, el grupo o el addon elegido",
-        "limited_text": "Una regla de lectura que también se aplica a ti (la tuya, la de tu grupo o la de todos) oculta campos que verá la persona, el grupo o el addon elegido: {who}. Una vista previa nunca muestra más de lo que ves tú mismo, por eso faltan esos campos. La vista completa aparece cuando no te afecta ninguna regla de lectura.",
+        "limited_text": "Una regla de lectura que también se aplica a ti (la tuya, la de tu grupo o la de todos) oculta o modifica (enmascara, aplica hash a) campos que verá la persona, el grupo o el addon elegido: {who}. Una vista previa nunca muestra más de lo que ves tú mismo, por eso esos campos faltan o aparecen enmascarados o con hash. La vista completa aparece cuando no te afecta ninguna regla de lectura.",
         "limited_missing": "Estos campos del patrón no aparecen en esta vista previa: {fields}. Los ocultó una regla que también se aplica a ti, o el mensaje no los tiene.",
         "who_user": "usuario {name}",
         "who_group": "grupo {name}",
         "who_addon": "addon {name}",
-        "summary_limited": "No se citan los campos que ya oculta una regla que también se aplica a ti."
+        "summary_limited": "No se citan los campos que ya oculta una regla que también se aplica a ti.",
+        "masked": "enmascarado",
+        "hashed": "con hash",
+        "summary_hide": "Las reglas ocultaron {count} {n|campo|campos}: {fields}.",
+        "summary_mask": "Las reglas enmascararon {count} {n|campo|campos}: {fields}.",
+        "summary_hash": "Las reglas aplicaron hash a {count} {n|campo|campos}: {fields}.",
+        "key_missing_title": "Este nodo aún no tiene la clave de hash de la organización",
+        "key_missing_text": "Una regla hashea campos, pero la clave de la organización aún no ha llegado a este nodo (llega desde un nodo operador), así que los campos hasheados aparecen ocultos en la vista previa en lugar de hasheados. No es efecto de tu propia regla de lectura.",
+        "unchanged": "Resto de campos sin cambios: {count}."
       },
       "hl7": {
         "msh_3": "Aplicación emisora",
@@ -12135,6 +12165,47 @@
         "obx": "resultado",
         "dg1": "diagnóstico",
         "al1": "alergia"
+      },
+      "sees_only_and": "Ve solo: {fields} y los campos de abajo",
+      "sees_only_below": "Ve solo los campos de abajo",
+      "explain_action": {
+        "format_json": "En JSON, un campo enmascarado o con hash pasa a ser texto; por ejemplo, el número 12345 da «**345». Un valor booleano, un objeto y una lista se enmascaran como «***». Un campo vacío y null no cambian.",
+        "format_xml": "En XML, un elemento enmascarado o con hash pierde sus atributos y elementos anidados: solo queda el texto. Un elemento vacío sigue vacío.",
+        "format_hl7v2": "En HL7 v2, la máscara y el hash abarcan todo el campo con sus componentes (los caracteres ^, ~, \\ y &): el resultado es un único texto. Un campo vacío sigue vacío."
+      },
+      "key": {
+        "title": "Clave de hash",
+        "button": "Cambiar la clave de hash",
+        "explain": "La clave de hash es una cadena secreta con la que se calcula el hash. Gracias a ella nadie ajeno a la organización puede adivinar el valor a partir del hash. La clave es común a toda la organización {org}.",
+        "explain_org": "La clave de hash es una cadena secreta con la que se calcula el hash. Gracias a ella nadie ajeno a la organización puede adivinar el valor a partir del hash. La clave es común a toda la organización.",
+        "admin_only": "La clave la cambia el administrador de la instancia.",
+        "current": "La clave actual se estableció el {date} (versión {version}).",
+        "none": "La clave se crea con la primera regla «Hashear» de la organización; mientras no haya ninguna, no hay nada que cambiar.",
+        "none_title": "La clave se crea con la primera regla «Hashear».",
+        "load_failed": "No se pudo cargar la información de la clave: {error}",
+        "failed_title": "No se pudo cargar la clave de hash",
+        "window_title": "Cambiar la clave de hash",
+        "irreversible": "Tras el cambio, los hashes antiguos dejarán de coincidir.",
+        "explain_change": "El mismo valor dará un hash distinto al de hasta ahora, así que los programas que unen datos por el hash no unirán los mensajes anteriores al cambio con los nuevos. La clave anterior no se puede recuperar.",
+        "impact_title": "Qué pasará tras el cambio:",
+        "scope": "La clave es común a toda la organización {org}: el cambio afecta a todas sus instancias de TentaBus, no solo a esta.",
+        "scope_org": "La clave es común a toda la organización: el cambio afecta a todas sus instancias de TentaBus, no solo a esta.",
+        "stale": "Los hashes calculados con la clave actual dejarán de coincidir con los nuevos, en todas las instancias de la organización.",
+        "reach": "Este node ve al menos {rules} {r|regla|reglas} «Hashear» en {topics} {t|topic|topics} ({instances} {i|instancia|instancias}).",
+        "reach_none": "Este node no ve ninguna regla «Hashear», pero las instancias de esta organización en otros nodes pueden tenerlas.",
+        "reach_note": "Son datos de este node: las reglas de instancias en otros nodes no se cuentan aquí, así que puede haber más reglas afectadas.",
+        "version_step": "La clave actual tiene la versión {from} (establecida el {date}); la nueva tendrá la versión {to}.",
+        "audit": "El cambio de clave quedará registrado en el registro de auditoría.",
+        "retype": "Escribe las palabras para confirmar:",
+        "retype_word": "cambiar clave",
+        "confirm": "Cambiar la clave",
+        "rotated_title": "Clave de hash cambiada",
+        "rotated_text": "La clave de la organización {org} tiene ahora una versión nueva ({version}). Los hashes calculados con la clave anterior ya no coinciden con los nuevos en ninguna instancia de esta organización. {reach}",
+        "rotated_text_org": "La clave de la organización tiene ahora una versión nueva ({version}). Los hashes calculados con la clave anterior ya no coinciden con los nuevos en ninguna instancia de esta organización. {reach}",
+        "none_rules": "Este nodo tiene reglas «Hashear», pero la clave de la organización aún no ha llegado a él: los campos hasheados están ocultos temporalmente. La clave llega desde un nodo operador; si no llega, comprueba la conexión con él.",
+        "none_rules_title": "La clave aún no ha llegado a este nodo, así que no hay nada que cambiar.",
+        "not_operator": "Este nodo no es operador de la organización, así que aquí no se puede cambiar la clave: hazlo en un nodo operador.",
+        "changed_reloaded": "La clave de hash cambió mientras tanto (alguien la cambió antes que tú), así que no se cambió nada. La ventana muestra ya la versión actual ({version}). Si aún quieres cambiar la clave, confirma de nuevo."
       }
     }
   },

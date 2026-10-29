@@ -19,6 +19,10 @@
 // field, and below them the typed-in ones — the server keeps only what is
 // allowed, so a field the window does not list is hidden too, and the fields
 // of a topic nobody listed are typed in as "the ones that stay visible".
+// A reading rule can also mask or hash a field ("Zamaskuj", "Zahaszuj", where
+// the server's capabilities offer them): a typed-in field then goes into the
+// list of what happens to it, and the window says in one place what each
+// action does and what it does to a value of this format.
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { showHidden } from '/js/modules/tentabus/hidden-characters.js';
@@ -27,7 +31,7 @@ import { openChangeWindow, openConfirmWindow } from '/js/modules/tentabus/window
 import { directoryLoader, pickLabel } from '/js/modules/tentabus/topic-access.js';
 import {
   SUBJECT_KINDS, DIRECTIONS, ANY_ID, whoTitle, whoSub, fieldPhrase, ruleFacts, actionOptions, blankForm, formFromRule, serializeForm,
-  parseForm, formProblem, typedProblems, buildPolicyRequest, ruleImpact, policyKey, closesTopicToKeys,
+  parseForm, formProblem, typedProblems, readActionList, buildPolicyRequest, ruleImpact, policyKey, closesTopicToKeys,
 } from '/js/modules/tentabus/topic-hiding.js';
 import '/js/components/tf-segmented.js';
 import '/js/components/tf-select.js';
@@ -44,6 +48,7 @@ const typedHint = { hl7v2: 'hiding.extra.hint_hl7', xml: 'hiding.extra.hint_xml'
 // ---------------------------------------------------------------------------
 
 function sourceNote(source) {
+  if (source.xsd && source.mode === 'manual') return T('hiding.source.xsd');
   if (source.complex) return T('hiding.source.complex');
   if (source.mode === 'schema') return T('hiding.source.schema', { name: source.subject, version: source.version });
   if (source.mode === 'dictionary') return T('hiding.source.dictionary');
@@ -68,6 +73,7 @@ function fieldsHtml(source) {
       <div class="muted" data-role="rows-none" hidden>${escapeHtml(T('hiding.fields_none'))}</div>
     </div>
     <div class="muted" data-role="source-note">${escapeHtml(sourceNote(source))}</div>
+    <div class="tb-explain-box" data-role="actions-note" hidden></div>
     <div data-role="extras"></div>
     <div class="muted" data-role="unlisted-note"></div>`;
 }
@@ -86,24 +92,31 @@ function extraHtml(role, label, hint) {
  * Draws the rows and the typed-in lists of `direction` with the values of
  * `form`; `sync` is called on every change.
  */
-function paintFields(win, { direction, form, source, format, sync }) {
+function paintFields(win, { direction, form, source, format, fieldActions, sync }) {
   const rows = win.querySelector('[data-role="rows"]');
   rows.innerHTML = source.fields.map(rowHtml).join('');
   for (const seg of rows.querySelectorAll('tf-segmented[data-field]')) {
-    seg.setOptions(actionOptions(direction), form.actions[seg.getAttribute('data-field')]);
+    seg.setOptions(actionOptions(direction, fieldActions), form.actions[seg.getAttribute('data-field')]);
     seg.addEventListener('change', sync);
   }
   filterRows(win);
   const listed = source.fields.length > 0;
   const read = direction === 'read';
+  const offered = read ? readActionList(fieldActions) : [];
   const hint = T(typedHint[format]);
   const extras = [extraHtml('extra-shown', T(`hiding.extra.${read ? 'shown' : 'allowed'}${listed ? '' : '_typed'}`), hint)];
+  if (offered.includes('mask')) extras.push(extraHtml('extra-masked', T(`hiding.extra.masked${listed ? '' : '_typed'}`), hint));
+  if (offered.includes('hash')) extras.push(extraHtml('extra-hashed', T(`hiding.extra.hashed${listed ? '' : '_typed'}`), hint));
   if (!read) extras.push(extraHtml('extra-required', T('hiding.extra.required'), hint));
   const host = win.querySelector('[data-role="extras"]');
   host.innerHTML = extras.join('');
-  host.querySelector('[data-role="extra-shown"]').tags = form.extraShown;
-  const required = host.querySelector('[data-role="extra-required"]');
-  if (required) required.tags = form.extraRequired;
+  for (const [role, tags] of [['extra-shown', form.extraShown], ['extra-masked', form.extraMasked], ['extra-hashed', form.extraHashed], ['extra-required', form.extraRequired]]) {
+    const input = host.querySelector(`[data-role="${role}"]`);
+    if (input) input.tags = tags;
+  }
+  const note = win.querySelector('[data-role="actions-note"]');
+  note.innerHTML = actionsNoteHtml(offered, format);
+  note.hidden = !note.innerHTML;
   const typedChanged = () => {
     markTyped(win, format);
     sync();
@@ -114,6 +127,21 @@ function paintFields(win, { direction, form, source, format, sync }) {
   const unlisted = direction === 'write' && source.implicit.length ? 'write_hl7' : direction;
   // A pattern that closes itself has no fields outside the list to warn about.
   win.querySelector('[data-role="unlisted-note"]').textContent = listed && !source.complete ? T(`hiding.unlisted.${unlisted}`) : '';
+}
+
+/**
+ * What "Ukryj", "Zamaskuj" and "Zahaszuj" do, said once above the typed-in
+ * lists, with what masking or hashing makes of a value in this format (markup).
+ * Only a reading rule has it, and only the actions the server offers: nothing
+ * to say while "Ukryj" is all there is.
+ */
+export function actionsNoteHtml(offered, format) {
+  if (!offered.includes('mask') && !offered.includes('hash')) return '';
+  const items = offered
+    .filter((action) => action !== 'show')
+    .map((action) => `<div><b>${escapeHtml(T(`hiding.action.${action}`))}</b> — ${escapeHtml(T(`hiding.legend.${action}`, { example: T('hiding.legend.mask_example') }))}</div>`);
+  items.push(`<div class="muted">${escapeHtml(T(`hiding.explain_action.format_${format}`))}</div>`);
+  return items.join('');
 }
 
 /**
@@ -153,7 +181,14 @@ function readSerialized(win, source, hiddenImplicit = []) {
   const actions = Object.create(null);
   for (const seg of win.querySelectorAll('tf-segmented[data-field]')) actions[seg.getAttribute('data-field')] = seg.value || '';
   const tags = (role) => win.querySelector(`[data-role="${role}"]`)?.tags || [];
-  return serializeForm({ actions, extraShown: tags('extra-shown'), extraRequired: tags('extra-required'), hiddenImplicit }, source);
+  return serializeForm({
+    actions,
+    extraShown: tags('extra-shown'),
+    extraMasked: tags('extra-masked'),
+    extraHashed: tags('extra-hashed'),
+    extraRequired: tags('extra-required'),
+    hiddenImplicit,
+  }, source);
 }
 
 /** Whether the server refused a write because the stored rule is no longer the one the window started from. */
@@ -184,7 +219,8 @@ const savedNotice = (result, title, text) => (result.changed
 
 /**
  * "Dodaj zasadę". `ctx` = `{ instanceId, topic, format, source, rules (the
- * stored rows), directory({ kind, query }), setPolicy(request),
+ * stored rows), fieldActions (what the server's capabilities offer),
+ * directory({ kind, query }), setPolicy(request),
  * describeError, onSaved(notice) }`; the notice carries a `tone` when it is
  * not a success.
  */
@@ -278,10 +314,10 @@ export function openHidingAdd(ctx) {
       w.querySelector('[data-role="field-search"]')?.addEventListener('search', () => filterRows(w));
       dirSeg.addEventListener('change', () => {
         direction = dirSeg.value;
-        paintFields(w, { direction, form: blankForm(direction, source), source, format, sync });
+        paintFields(w, { direction, form: blankForm(direction, source), source, format, fieldActions: ctx.fieldActions, sync });
         paintPick();
       });
-      paintFields(w, { direction, form: blankForm(direction, source), source, format, sync });
+      paintFields(w, { direction, form: blankForm(direction, source), source, format, fieldActions: ctx.fieldActions, sync });
       ask();
     },
     draft: (w) => ({
@@ -351,7 +387,7 @@ export function openHidingChange(row, ctx) {
       </div>
       ${fieldsHtml(source)}`,
     wire: (w, sync) => {
-      paintFields(w, { direction: row.direction, form: stored, source, format, sync });
+      paintFields(w, { direction: row.direction, form: stored, source, format, fieldActions: ctx.fieldActions, sync });
       w.querySelector('[data-role="field-search"]')?.addEventListener('search', () => filterRows(w));
     },
     draft: (w) => ({ form: readSerialized(w, source, stored.hiddenImplicit) }),
@@ -386,8 +422,14 @@ export function removeLead(row, source) {
   // A rule written elsewhere can leave out every unnamed position of a segment: name the first few, count the rest.
   const names = (list) => `${list.slice(0, LEAD_FIELDS).map((n) => fieldPhrase(source, n)).join(', ')}${list.length > LEAD_FIELDS ? ` ${T('hiding.and_more', { count: fmtCount(list.length - LEAD_FIELDS), n: list.length - LEAD_FIELDS })}` : ''}`;
   if (row.direction === 'read') {
-    if (!facts.known) return facts.visible.length ? T('hiding.remove.lead_read_only', { who, fields: facts.visible.map(showHidden).join(', ') }) : T('hiding.remove.lead_read_nothing', { who });
-    return facts.hidden.length ? T('hiding.remove.lead_read', { who, fields: names(facts.hidden) }) : T('hiding.remove.lead_read_none', { who });
+    const marks = (action) => facts.marks.filter(([, a]) => a === action).map(([n]) => n);
+    const changed = ['mask', 'hash'].filter((a) => marks(a).length).map((a) => T(`hiding.remove.part_${a}`, { fields: names(marks(a)) }));
+    if (!facts.known) {
+      if (!facts.visible.length) return T('hiding.remove.lead_read_nothing', { who });
+      return [T('hiding.remove.lead_read_only', { who, fields: facts.visible.map(showHidden).join(', ') }), ...changed].join(' ');
+    }
+    const acted = [...(facts.hidden.length ? [T('hiding.remove.part_hide', { fields: names(facts.hidden) })] : []), ...changed];
+    return acted.length ? T('hiding.remove.lead_read', { who, parts: acted.join(' ') }) : T('hiding.remove.lead_read_none', { who });
   }
   const parts = [];
   if (facts.known && facts.forbidden.length) parts.push(T('hiding.remove.part_forbidden', { fields: names(facts.forbidden) }));

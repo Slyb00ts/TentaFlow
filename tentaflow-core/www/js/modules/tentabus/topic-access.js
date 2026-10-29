@@ -876,6 +876,7 @@ export function openKeyIssued({ where, instanceLabel, orgName, origin, name, rig
     if (keyCopied || !discard.hidden) return;
     e.preventDefault();
     discard.hidden = false;
+    discard.scrollIntoView?.({ block: 'nearest' });
   });
   const texts = {
     'copy-key': ['access.keys.issued.copied_key', () => token],

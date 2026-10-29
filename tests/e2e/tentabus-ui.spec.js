@@ -40,8 +40,14 @@
 //              a writing rule, a rule for everyone, every rule deleted; an HL7
 //              topic with the dictionary and a refused address; a binary topic
 //              that cannot get a rule; the phone layout; no section without
-//              administration); and, last because it stops the node, the
-//              list kept under the connection notice (T12). Stateful: run the whole project, never `-g`.
+//              administration); then F4 B7: "Zamaskuj" and "Zahaszuj" in a
+//              topic's rules (JSON, HL7 and XML, the typed lists, the preview
+//              marking the masked and the hashed value, the legend and the
+//              phone layout) and "Zmień klucz haszowania" (the date and the
+//              version of the key, the window with its consequence and the
+//              retyped words, a changed hash after the rotation, a rotation
+//              someone else made first, the audit entry); and, last because it
+//              stops the node, the list kept under the connection notice (T12). Stateful: run the whole project, never `-g`.
 //              The runtime lives under the repo's `.runtime/` — on macOS a
 //              rig under /tmp (a symlink to /private/tmp) is not reliable.
 // =============================================================================
@@ -3624,7 +3630,8 @@ test('U7 Ukrywanie danych at 1440: a group rule added, changed, previewed as the
     await expect(written).toContainText('Niedozwolone');
     expect((await serverRules(page, instanceId, 'wizyty'))[`group:${groupId}:write`]).toEqual({ fields: ['lekarz', 'pacjent', 'termin'], required: ['pacjent'] });
     await expect(s.locator('[data-role="legend"]')).toContainText('Odrzuć wiadomość');
-    await expect(s.locator('[data-role="legend"]')).not.toContainText('Zahaszuj');
+    await expect(s.locator('[data-role="legend"]')).toContainText('Zamaskuj');
+    await expect(s.locator('[data-role="legend"]')).toContainText('Zahaszuj');
     await assertNoBannedWords(page);
     await assertNoOverflow(page);
     await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-wizyty.png'), fullPage: true });
@@ -3722,8 +3729,11 @@ test('U7 HL7 topic: the dictionary with plain names, a wrong address refused bef
     await expect(preview.locator('[data-role="summary"]')).toContainText('Zasady ukryły', { timeout: 15000 });
     const hiddenFields = await preview.locator('[data-role="applied"] .tb-right-row[data-field-action="hide"] .mono').allInnerTexts();
     expect(hiddenFields).toEqual(expect.arrayContaining(['PID-1', 'PID-4', 'PID-5', 'PID-8']));
-    await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="show"]')).not.toHaveCount(0);
-    await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="show"]', { hasText: 'PID-5' })).toHaveCount(0);
+    // The list holds only what the rules changed; the dozens of fields that stayed are counted, not listed.
+    await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="show"]')).toHaveCount(0);
+    await expect(preview.locator('[data-role="unchanged"]')).toContainText(/Pozostałe pola bez zmian: \d+\./);
+    expect(hiddenFields).toEqual([...hiddenFields].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })));
+    await expect(preview.locator('[data-role="applied"] .tb-right-row')).toHaveCount(hiddenFields.length + (await preview.locator('[data-role="applied"] .tb-right-row[data-field-action="mask"], [data-role="applied"] .tb-right-row[data-field-action="hash"]').count()));
     await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="hide"]', { hasText: 'PID-5' })).toContainText('Imię i nazwisko pacjenta');
     const message = await preview.locator('[data-role="payload"]').innerText();
     expect(message).toContain('MSH|');
@@ -3750,8 +3760,8 @@ test('U7 a topic checked with a binary pattern cannot get a rule and the section
   try {
     await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=${name}&section=hiding`);
     const s = hidingSection(page);
-    await expect(s.locator('tf-empty-state')).toHaveAttribute('title', 'Zasady tego topiku nie są tu edytowane', { timeout: 20000 });
-    await expect(s.locator('tf-empty-state')).toHaveAttribute('message', /nie edytuje się na tym ekranie/);
+    await expect(s.locator('tf-empty-state')).toHaveAttribute('title', 'Treść binarna nie ma ukrywania danych', { timeout: 20000 });
+    await expect(s.locator('tf-empty-state')).toHaveAttribute('message', /każdy, kto ma prawo czytania topiku, widzi ją w całości/);
     await expect(s.locator('[data-role="add"]')).toHaveAttribute('disabled', '');
     await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-powiadomienia.png'), fullPage: true });
 
@@ -3843,6 +3853,612 @@ test('U7 without administration: no Ukrywanie danych in the menu or the section 
   } finally {
     await context.close();
   }
+});
+
+// ----------------------------------------------------------------------------
+// F4 B7 — "Zamaskuj" and "Zahaszuj" in a reading rule, and the organization's
+// hash key. What the screen writes is checked against the server's own list of
+// rules, and what the preview shows against the values the server really made.
+// ----------------------------------------------------------------------------
+
+const HASH_HEX = /^[0-9a-f]{64}$/;
+
+async function serverRuleDetail(page, instanceId, topic, key) {
+  const res = await busCall(page, 'busFieldPolicyListRequest', { instanceId, topic });
+  const p = (res?.policies || []).find((x) => `${x.subjectType}:${x.subjectId}:${x.direction}` === key);
+  return p ? { fields: [...p.fields].sort(), masked: [...(p.maskedFields || [])].sort(), hashed: [...(p.hashedFields || [])].sort() } : null;
+}
+
+// A group whose only member is the reader: its rule does not cover the administrator, so the preview is the group's real view.
+async function groupWithReader(page, name) {
+  const readerId = await ensureUser(page, 'tomasz', 'Tomasz-czyta-1', 'Tomasz Nowak');
+  const groupId = (await iamCall(page, 'iamCreateGroupRequest', { name, description: '' }))?.groupId;
+  expect(groupId).toBeTruthy();
+  await iamCall(page, 'iamSetUserGroupsRequest', { userId: readerId, groupIds: [groupId] });
+  return groupId;
+}
+
+async function previewAs(page, groupName) {
+  const preview = previewWindow(page);
+  await expect(preview).toHaveCount(1);
+  await expect(preview.locator('[data-role="offset"] input')).not.toHaveValue('', { timeout: 15000 });
+  await expect(preview.locator('[data-role="subject"] select option', { hasText: groupName })).toHaveCount(1, { timeout: 15000 });
+  await preview.locator('[data-role="subject"] select').selectOption({ label: `${groupName} (1 osoba)` });
+  await preview.locator('[data-act="show"]').click();
+  await expect(preview.locator('[data-role="summary"]')).not.toHaveText('', { timeout: 15000 });
+  return preview;
+}
+
+test('B7 Zamaskuj and Zahaszuj on a JSON topic: four choices with their explanation, the rule saved and read back, the preview marks the masked and the hashed value', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const groupName = `Księgowość B7 ${RUN}`;
+  const groupId = await groupWithReader(page, groupName);
+  await clearRules(page, instanceId, 'wizyty');
+  try {
+    // The server says what it can do; the window follows.
+    const caps = (await busCall(page, 'busCapabilitiesRequest', { instanceId })).capabilities;
+    expect(caps.fieldActions).toEqual(['hide', 'mask', 'hash']);
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wizyty&section=hiding`);
+    const s = hidingSection(page);
+    await expect(s.locator('tf-empty-state')).toBeVisible({ timeout: 20000 });
+    await s.locator('tf-empty-state [data-go="hiding-add"]').click();
+    const win = hidingWindow(page);
+    await expect(win.locator('[data-role="subject"] select option', { hasText: `${groupName} (1 osoba)` })).toHaveCount(1, { timeout: 15000 });
+    await win.locator('[data-role="subject"] select').selectOption({ label: `${groupName} (1 osoba)` });
+    await expect(fieldSeg(win, 'pacjent').locator('.tf-seg-opt')).toHaveText(['Pokaż', 'Ukryj', 'Zamaskuj', 'Zahaszuj']);
+    const note = win.locator('[data-role="actions-note"]');
+    await expect(note).toContainText('Zamaskuj — Widać 3 ostatnie znaki, reszta to gwiazdki');
+    await expect(note).toContainText('np. ********359');
+    await expect(note).toContainText('Zahaszuj — Zamiast wartości widać stały ciąg znaków: ta sama wartość daje zawsze ten sam hasz w całej organizacji');
+    await expect(note).toContainText('W JSON zamaskowane lub zahaszowane pole staje się tekstem');
+    await expect(win.locator('tf-tag-input[data-role="extra-masked"]')).toHaveCount(1);
+    await expect(win.locator('tf-tag-input[data-role="extra-hashed"]')).toHaveCount(1);
+    await pickSegment(win, 'tf-segmented[data-field="pacjent"]', 'Zamaskuj');
+    await pickSegment(win, 'tf-segmented[data-field="lekarz"]', 'Zahaszuj');
+    await pickSegment(win, 'tf-segmented[data-field="termin"]', 'Ukryj');
+    const impact = win.locator('[data-role="impact"]');
+    await expect(impact).toContainText(`Dla „${groupName}” znikną z wiadomości pola: termin.`);
+    await expect(impact).toContainText(`Dla „${groupName}” pole pacjent będzie widoczne tylko jako gwiazdki z 3 ostatnimi znakami.`);
+    await expect(impact).toContainText(`Dla „${groupName}” zamiast wartości pola lekarz pojawi się hasz — stały ciąg znaków, taki sam dla tej samej wartości w całej organizacji.`);
+    await windowFits(page, 'tf-window.tb-hiding-window', DESKTOP.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-dodaj-maska-wizyty.png') });
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(s.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Zapisano zasadę');
+    expect(await serverRuleDetail(page, instanceId, 'wizyty', `group:${groupId}:read`)).toEqual({
+      fields: ['gabinet', 'lekarz', 'pacjent'], masked: ['pacjent'], hashed: ['lekarz'],
+    });
+    // The table names each field with the action, the legend explains all four.
+    const row = ruleRow(page, groupName);
+    await expect(row).toContainText('pacjent');
+    await expect(row.locator('.tf-chip', { hasText: 'Zamaskuj' })).toHaveCount(1);
+    await expect(row.locator('.tf-chip', { hasText: 'Zahaszuj' })).toHaveCount(1);
+    await expect(row.locator('.tf-chip', { hasText: 'Ukryj' })).toHaveCount(1);
+    const legend = s.locator('[data-role="legend"]');
+    await expect(legend).toContainText('Zamaskuj — Widać 3 ostatnie znaki');
+    await expect(legend).toContainText('Zahaszuj — Zamiast wartości widać stały ciąg znaków');
+    await assertNoBannedWords(page);
+    await assertNoOverflow(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-maska-wizyty.png'), fullPage: true });
+
+    // Zmień reads each field back as it is and sends the change.
+    await row.locator('tf-button[data-act="change"]').click();
+    await expect(fieldSeg(win, 'pacjent')).toHaveAttribute('value', 'mask');
+    await expect(fieldSeg(win, 'lekarz')).toHaveAttribute('value', 'hash');
+    await expect(fieldSeg(win, 'termin')).toHaveAttribute('value', 'hide');
+    await expect(win.locator('[data-act="save"]')).toHaveAttribute('disabled', '');
+    await pickSegment(win, 'tf-segmented[data-field="pacjent"]', 'Zahaszuj');
+    await expect(win.locator('[data-role="impact"]')).toContainText('zamiast wartości pola pacjent pojawi się hasz');
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    expect(await serverRuleDetail(page, instanceId, 'wizyty', `group:${groupId}:read`)).toEqual({
+      fields: ['gabinet', 'lekarz', 'pacjent'], masked: [], hashed: ['lekarz', 'pacjent'],
+    });
+    await ruleRow(page, groupName).locator('tf-button[data-act="change"]').click();
+    await pickSegment(win, 'tf-segmented[data-field="pacjent"]', 'Zamaskuj');
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    expect(await serverRuleDetail(page, instanceId, 'wizyty', `group:${groupId}:read`)).toEqual({
+      fields: ['gabinet', 'lekarz', 'pacjent'], masked: ['pacjent'], hashed: ['lekarz'],
+    });
+
+    // The preview as the group: the patient masked down to its last three characters, the doctor a hash, the date gone.
+    const audits = auditCount('bus.field_policy.preview');
+    await s.locator('tf-button[data-go="hiding-preview"]').click();
+    const preview = await previewAs(page, groupName);
+    await expect(preview.locator('[data-role="summary"]')).toHaveText('Zasady ukryły 1 pole: termin. Zasady zamaskowały 1 pole: pacjent. Zasady zahaszowały 1 pole: lekarz.');
+    const shown = JSON.parse(await preview.locator('[data-role="payload"]').innerText());
+    expect(shown.pacjent).toMatch(/^\*{3}\d{3}$/);
+    expect(shown.lekarz).toMatch(HASH_HEX);
+    expect(shown).not.toHaveProperty('termin');
+    await expect(preview.locator('mark.tb-marked[data-action="mask"]')).toHaveCount(1);
+    await expect(preview.locator('mark.tb-marked[data-action="hash"]')).toHaveCount(1);
+    await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="mask"]')).toContainText('zamaskowane');
+    await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="hash"]')).toContainText('zahaszowane');
+    await expect(preview.locator('[data-role="limited"]')).toHaveCount(0);
+    expect(auditCount('bus.field_policy.preview')).toBe(audits + 1);
+    await windowFits(page, 'tf-window.tb-hiding-preview', DESKTOP.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-podglad-maska-wizyty.png') });
+    // The same value always gives the same hash.
+    await preview.locator('[data-act="show"]').click();
+    await expect(async () => {
+      expect(JSON.parse(await preview.locator('[data-role="payload"]').innerText()).lekarz).toBe(shown.lekarz);
+    }).toPass({ timeout: 15000 });
+    await preview.locator('[data-act="close"]').click();
+
+    // Usuń says what the rule does to the field, in the same words.
+    await ruleRow(page, groupName).locator('tf-button[data-act="remove"]').click();
+    const confirm = page.locator('tf-window.tb-access-window');
+    await expect(confirm.locator('.tb-explain-box')).toContainText('Ukrywa pola: termin. Maskuje pola: pacjent. Haszuje pola: lekarz.');
+    await confirm.locator('[data-act="cancel"]').click();
+  } finally {
+    await clearRules(page, instanceId, 'wizyty');
+    await iamCall(page, 'iamDeleteGroupRequest', { groupId });
+  }
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('B7 Zamaskuj and Zahaszuj on an HL7 topic: the dictionary rows, a typed address in the masked list, a wrong one refused, the segment field marked in the preview', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const groupName = `Księgowość HL7 ${RUN}`;
+  const groupId = await groupWithReader(page, groupName);
+  await clearRules(page, instanceId, 'wyniki-badan');
+  try {
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wyniki-badan&section=hiding`);
+    const s = hidingSection(page);
+    await expect(s.locator('tf-empty-state')).toBeVisible({ timeout: 20000 });
+    await s.locator('tf-empty-state [data-go="hiding-add"]').click();
+    const win = hidingWindow(page);
+    await expect(win.locator('[data-role="subject"] select option', { hasText: `${groupName} (1 osoba)` })).toHaveCount(1, { timeout: 15000 });
+    await win.locator('[data-role="subject"] select').selectOption({ label: `${groupName} (1 osoba)` });
+    await expect(fieldSeg(win, 'PID-3').locator('.tf-seg-opt')).toHaveText(['Pokaż', 'Ukryj', 'Zamaskuj', 'Zahaszuj']);
+    await expect(win.locator('[data-role="actions-note"]')).toContainText('W HL7 v2 maska i hasz obejmują całe pole razem z jego komponentami');
+    await pickSegment(win, 'tf-segmented[data-field="PID-3"]', 'Zahaszuj');
+    await pickSegment(win, 'tf-segmented[data-field="PID-5"]', 'Zamaskuj');
+    await pickSegment(win, 'tf-segmented[data-field="PID-8"]', 'Ukryj');
+    // An address the format refuses is refused in the masked list as well, before the request.
+    const masked = win.locator('tf-tag-input[data-role="extra-masked"] input');
+    await masked.fill('PID-0');
+    await masked.press('Enter');
+    await expect(win.locator('[data-role="extra-masked-problems"]')).toContainText('„PID-0” nie jest adresem pola HL7.');
+    await expect(win.locator('[data-act="save"]')).toHaveAttribute('disabled', '');
+    await win.locator('tf-tag-input[data-role="extra-masked"] tf-chip').first().evaluate((chip) => chip.dispatchEvent(new CustomEvent('remove')));
+    await masked.fill('PID-13');
+    await masked.press('Enter');
+    await expect(win.locator('[data-role="extra-masked-problems"]')).toBeHidden();
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-dodaj-maska-hl7.png') });
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    const stored = await serverRuleDetail(page, instanceId, 'wyniki-badan', `group:${groupId}:read`);
+    expect(stored.masked).toEqual(['PID-13', 'PID-5']);
+    expect(stored.hashed).toEqual(['PID-3']);
+    expect(stored.fields).toEqual(expect.arrayContaining(['PID-3', 'PID-5', 'PID-13']));
+    expect(stored.fields).not.toContain('PID-8');
+    const row = ruleRow(page, groupName);
+    await expect(row.locator('.tf-chip', { hasText: 'Zahaszuj' })).toHaveCount(1);
+    await expect(row.locator('.tf-chip', { hasText: 'Zamaskuj' })).toHaveCount(2);
+
+    await s.locator('tf-button[data-go="hiding-preview"]').click();
+    const preview = await previewAs(page, groupName);
+    const message = await preview.locator('[data-role="payload"]').innerText();
+    expect(message).toContain('MSH|');
+    expect(message).not.toContain('Kowalski');
+    // The whole field is one text: the name with its component separator, masked down to its last three characters.
+    await expect(preview.locator('mark.tb-marked[data-action="mask"]').first()).toHaveText(/^\*+Jan$/);
+    await expect(preview.locator('mark.tb-marked[data-action="hash"]')).toHaveText(HASH_HEX);
+    await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="hash"]', { hasText: 'PID-3' })).toContainText('zahaszowane');
+    await expect(preview.locator('[data-role="summary"]')).toContainText('Zasady zahaszowały 1 pole: PID-3.');
+    await preview.locator('[data-act="close"]').click();
+  } finally {
+    await clearRules(page, instanceId, 'wyniki-badan');
+    await iamCall(page, 'iamDeleteGroupRequest', { groupId });
+  }
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('B7 Zamaskuj and Zahaszuj on an XML topic without a list of fields: the fields are typed in, each into the list of what happens to it', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const groupName = `Księgowość XML ${RUN}`;
+  const groupId = await groupWithReader(page, groupName);
+  await clearRules(page, instanceId, 'faktury');
+  try {
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=faktury&section=hiding`);
+    const s = hidingSection(page);
+    await expect(s.locator('tf-empty-state')).toBeVisible({ timeout: 20000 });
+    await s.locator('tf-empty-state [data-go="hiding-add"]').click();
+    const win = hidingWindow(page);
+    await expect(win.locator('[data-role="subject"] select option', { hasText: `${groupName} (1 osoba)` })).toHaveCount(1, { timeout: 15000 });
+    await win.locator('[data-role="subject"] select').selectOption({ label: `${groupName} (1 osoba)` });
+    await expect(win.locator('tf-segmented[data-field]')).toHaveCount(0);
+    await expect(win.locator('[data-role="actions-note"]')).toContainText('W XML zamaskowany lub zahaszowany element traci atrybuty i elementy zagnieżdżone');
+    for (const [role, name] of [['extra-shown', 'kwota'], ['extra-masked', 'pacjent'], ['extra-hashed', 'numer']]) {
+      const input = win.locator(`tf-tag-input[data-role="${role}"] input`);
+      await input.fill(name);
+      await input.press('Enter');
+    }
+    await expect(win.locator('[data-role="impact"]')).toContainText('widoczne będą tylko pola: kwota, numer, pacjent.');
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    expect(await serverRuleDetail(page, instanceId, 'faktury', `group:${groupId}:read`)).toEqual({ fields: ['kwota', 'numer', 'pacjent'], masked: ['pacjent'], hashed: ['numer'] });
+    await expect(ruleRow(page, groupName)).toContainText('Widzi tylko: kwota oraz pola poniżej');
+
+    await s.locator('tf-button[data-go="hiding-preview"]').click();
+    const preview = await previewAs(page, groupName);
+    const xml = await preview.locator('[data-role="payload"]').innerText();
+    expect(xml).toMatch(/<pacjent>\*{3}\d{3}<\/pacjent>/);
+    expect(xml).toMatch(/<numer>[0-9a-f]{64}<\/numer>/);
+    expect(xml).toMatch(/<kwota>\d+\.00<\/kwota>/);
+    await preview.locator('[data-act="close"]').click();
+  } finally {
+    await clearRules(page, instanceId, 'faktury');
+    await iamCall(page, 'iamDeleteGroupRequest', { groupId });
+  }
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('B7 Klucz haszowania: the date and version of the key, the window with its consequence and the retyped words, the hash changes after the change, a change someone else made first is refused', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const groupName = `Hasz B7 ${RUN}`;
+  const groupId = await groupWithReader(page, groupName);
+  await clearRules(page, instanceId, 'wizyty');
+  // A hashing rule makes the organization's key if there is none yet.
+  await busCall(page, 'busFieldPolicySetRequest', {
+    instanceId, topic: 'wizyty', subjectType: 'group', subjectId: groupId, direction: 'read',
+    fields: ['lekarz', 'pacjent', 'termin'], requiredFields: [], maskedFields: [], hashedFields: ['lekarz'], expectAbsent: true,
+  });
+  try {
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wizyty&section=hiding`);
+    const d = detailSlot(page);
+    await expect(d.locator('.tb-title')).toHaveText('wizyty', { timeout: 20000 });
+    const s = hidingSection(page);
+    await expect(ruleRow(page, groupName)).toBeVisible({ timeout: 20000 });
+    const card = s.locator('[data-role="key-card"]');
+    await expect(card).toContainText('Klucz haszowania to tajny ciąg znaków, z którego liczy się hasz.');
+    await expect(card).toContainText('Klucz jest wspólny dla całej organizacji');
+    const info = (await busCall(page, 'busFieldHashKeyInfoRequest', { instanceId })).key;
+    expect(info.exists).toBe(true);
+    expect(info.hashingRules).toBeGreaterThanOrEqual(1);
+    const before = info.keyVersion;
+    await expect(card.locator('[data-role="key-text"]')).toContainText(`(wersja ${before})`);
+    await expect(card.locator('[data-role="key-text"]')).toContainText(/Obecny klucz ustawiono \d{2}\.\d{2}\.\d{4}/);
+    await assertNoBannedWords(page);
+
+    // The hash of the doctor before the change.
+    await s.locator('tf-button[data-go="hiding-preview"]').click();
+    let preview = await previewAs(page, groupName);
+    const hashBefore = JSON.parse(await preview.locator('[data-role="payload"]').innerText()).lekarz;
+    expect(hashBefore).toMatch(HASH_HEX);
+    await preview.locator('[data-act="close"]').click();
+    await expect(preview).toHaveCount(0);
+
+    // The window: what it does to every instance of the organization, at least how many rules this node sees, the words to retype.
+    const audits = auditCount('bus.field_policy.hash_key.rotate');
+    await card.locator('[data-role="key-button"]').click();
+    const win = page.locator('tf-window.tb-hash-key-window');
+    await expect(win).toHaveCount(1);
+    await expect(win).toContainText('Po zmianie stare hasze przestaną pasować.');
+    await expect(win).toContainText('programy, które łączą dane po haszu, nie połączą wiadomości sprzed zmiany z nowymi');
+    await expect(win).toContainText('zmiana dotyczy wszystkich jej instancji TentaBus, nie tylko tej');
+    await expect(win.locator('[data-role="impact"]')).toContainText(/Ten node widzi co najmniej \d+ (zasadę|zasady|zasad) „Zahaszuj” w \d+ (topiku|topikach)/);
+    await expect(win.locator('[data-role="impact"]')).toContainText('To dane z tego noda');
+    await expect(win.locator('[data-role="impact"]')).toContainText(`Obecny klucz ma wersję ${before}`);
+    await expect(win.locator('[data-role="impact"]')).toContainText(`nowy dostanie wersję ${before + 1}`);
+    await expect(win).toContainText('Zmiana klucza zapisze się w dzienniku audytu.');
+    const confirmBtn = win.locator('[data-action="confirm"]');
+    await expect(confirmBtn).toHaveAttribute('disabled', '');
+    await win.locator('#retype-input input').fill('zmień');
+    await expect(confirmBtn).toHaveAttribute('disabled', '');
+    await windowFits(page, 'tf-window.tb-hash-key-window', DESKTOP.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-klucz-okno.png') });
+
+    // Someone else rotates while the window is open: the window's request names the old version and is refused.
+    await busCall(page, 'busFieldHashKeyRotateRequest', { instanceId, expectedKeyVersion: before });
+    await win.locator('#retype-input input').fill('zmień klucz');
+    await expect(confirmBtn).not.toHaveAttribute('disabled', '');
+    await confirmBtn.click();
+    await expect(win.locator('#retype-error')).toContainText('Klucz haszowania zmienił się w międzyczasie', { timeout: 15000 });
+    await expect(win).toHaveCount(1);
+    expect((await busCall(page, 'busFieldHashKeyInfoRequest', { instanceId })).key.keyVersion).toBe(before + 1);
+    await expect.poll(() => auditCount('bus.field_policy.hash_key.rotate')).toBe(audits + 2);
+    // The window takes the key as it is now by itself: it says so, lists the new version, and the second confirmation names it.
+    await expect(win.locator('#retype-error')).toContainText(`Okno pokazuje już aktualną wersję (${before + 1})`);
+    await expect(win.locator('[data-role="impact"]')).toContainText(`nowy dostanie wersję ${before + 2}`);
+    await expect(card.locator('[data-role="key-text"]')).toContainText(`(wersja ${before + 1})`, { timeout: 15000 });
+    await expect(confirmBtn).not.toHaveAttribute('disabled', '');
+    await confirmBtn.click();
+    await expect(win).toHaveCount(0);
+    const notice = s.locator('[data-role="notice"] tf-alert');
+    await expect(notice).toHaveAttribute('title', 'Zmieniono klucz haszowania', { timeout: 15000 });
+    await expect(notice).toHaveAttribute('message', new RegExp(`ma teraz nową wersję \\(${before + 2}\\)`));
+    await expect(notice).toHaveAttribute('message', /Ten node widzi co najmniej/);
+    await expect(card.locator('[data-role="key-text"]')).toContainText(`(wersja ${before + 2})`, { timeout: 15000 });
+    expect((await busCall(page, 'busFieldHashKeyInfoRequest', { instanceId })).key.keyVersion).toBe(before + 2);
+    await expect.poll(() => auditCount('bus.field_policy.hash_key.rotate')).toBe(audits + 3);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-klucz-zmieniony.png'), fullPage: true });
+
+    // The old hashes no longer match.
+    await s.locator('tf-button[data-go="hiding-preview"]').click();
+    preview = await previewAs(page, groupName);
+    const hashAfter = JSON.parse(await preview.locator('[data-role="payload"]').innerText()).lekarz;
+    expect(hashAfter).toMatch(HASH_HEX);
+    expect(hashAfter).not.toBe(hashBefore);
+    await preview.locator('[data-act="close"]').click();
+  } finally {
+    await clearRules(page, instanceId, 'wizyty');
+    await iamCall(page, 'iamDeleteGroupRequest', { groupId });
+  }
+  expect(errors.filter((e) => !/field_hash_key_changed/i.test(e)), errors.join('\n')).toEqual([]);
+});
+
+// The key of the organization is parked (its row renamed) to play a node the key has not reached yet, and put back afterwards.
+const parkKey = () => sqliteWrite("UPDATE bus_field_hash_keys SET org_id = 'parked-' || org_id WHERE org_id NOT LIKE 'parked-%';");
+const unparkKey = () => sqliteWrite("UPDATE bus_field_hash_keys SET org_id = substr(org_id, 8) WHERE org_id LIKE 'parked-%';");
+
+test('B7 R2 a hashing rule whose key has not reached this node: the card, the preview and a refusal say so, an edit that keeps its hashes still goes through', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const groupName = `Bez klucza B7 ${RUN}`;
+  const groupId = await groupWithReader(page, groupName);
+  await clearRules(page, instanceId, 'wizyty');
+  await busCall(page, 'busFieldPolicySetRequest', {
+    instanceId, topic: 'wizyty', subjectType: 'group', subjectId: groupId, direction: 'read',
+    fields: ['lekarz', 'pacjent', 'termin'], requiredFields: [], maskedFields: [], hashedFields: ['lekarz'], expectAbsent: true,
+  });
+  try {
+    parkKey();
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wizyty&section=hiding`);
+    const s = hidingSection(page);
+    await expect(ruleRow(page, groupName)).toBeVisible({ timeout: 20000 });
+    const card = s.locator('[data-role="key-card"]');
+    // Rules hash and there is no key: not "the key will be made with the first rule".
+    await expect(card.locator('[data-role="key-text"]')).toContainText('Ten node ma zasady „Zahaszuj”, ale klucz organizacji jeszcze na niego nie dotarł', { timeout: 15000 });
+    await expect(card.locator('[data-role="key-text"]')).toContainText('pola haszowane są tymczasowo ukryte');
+    await expect(card.locator('[data-role="key-text"]')).not.toContainText('Klucz powstanie przy pierwszej zasadzie');
+    await expect(card.locator('[data-role="key-button"]')).toHaveAttribute('disabled', '');
+    await expect(card.locator('[data-role="key-button"]')).toHaveAttribute('title', 'Klucz jeszcze nie dotarł na ten node, więc nie ma czego zmieniać.');
+    const info = (await busCall(page, 'busFieldHashKeyInfoRequest', { instanceId })).key;
+    expect(info.exists).toBe(false);
+    expect(info.hashingRules).toBeGreaterThanOrEqual(1);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-klucz-nie-dotarl.png'), fullPage: true });
+
+    // The preview names the cause, and the field is hidden, not hashed.
+    await s.locator('tf-button[data-go="hiding-preview"]').click();
+    const preview = await previewAs(page, groupName);
+    await expect(preview.locator('[data-role="key-missing"]')).toHaveAttribute('title', 'Ten node nie ma jeszcze klucza haszowania organizacji');
+    await expect(preview.locator('[data-role="key-missing"]')).toHaveAttribute('message', /klucz organizacji jeszcze nie dotarł na ten node/);
+    expect(JSON.parse(await preview.locator('[data-role="payload"]').innerText())).not.toHaveProperty('lekarz');
+    await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="hide"]', { hasText: 'lekarz' })).toHaveCount(1);
+    await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="hash"]')).toHaveCount(0);
+    await expect(preview.locator('[data-role="limited"]')).toHaveCount(0);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-podglad-bez-klucza.png') });
+    await preview.locator('[data-act="close"]').click();
+
+    // An edit of something else keeps the hash the rule has: the UI sends it again, and it is not held up.
+    const win = hidingWindow(page);
+    await ruleRow(page, groupName).locator('tf-button[data-act="change"]').click();
+    await pickSegment(win, 'tf-segmented[data-field="pacjent"]', 'Ukryj');
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    expect(await serverRuleDetail(page, instanceId, 'wizyty', `group:${groupId}:read`)).toEqual({
+      fields: ['lekarz', 'termin'], masked: [], hashed: ['lekarz'],
+    });
+
+    // A NEW hashed field needs the key: refused in words, as "on its way", with no node id in the text.
+    await ruleRow(page, groupName).locator('tf-button[data-act="change"]').click();
+    await pickSegment(win, 'tf-segmented[data-field="termin"]', 'Zahaszuj');
+    await win.locator('[data-act="save"]').click();
+    const refusal = win.locator('[data-role="error-text"]');
+    await expect(refusal).toContainText('jeszcze nie dotarł na ten node', { timeout: 15000 });
+    await expect(refusal).not.toContainText(/[0-9a-f]{64}/);
+    await expect(refusal).not.toContainText('bus.hash_key_not_synced');
+    expect((await busCall(page, 'busFieldHashKeyInfoRequest', { instanceId })).key.exists).toBe(false);
+    await win.locator('[data-act="cancel"]').click();
+    await win.locator('[data-act="cancel"]').click();
+    await expect(win).toHaveCount(0);
+  } finally {
+    unparkKey();
+    await clearRules(page, instanceId, 'wizyty');
+    await iamCall(page, 'iamDeleteGroupRequest', { groupId });
+  }
+  // Back: the card is the usual one and the button works.
+  await page.reload();
+  expect(errors.filter((e) => !/hash_key_not_synced|PolicyDenied/i.test(e)), errors.join('\n')).toEqual([]);
+});
+
+test('B7 R2 a node that is not an operator: the card says so, the button is closed, rotating is refused in words without the node id', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const groupName = `Nieoperator B7 ${RUN}`;
+  const groupId = await groupWithReader(page, groupName);
+  await clearRules(page, instanceId, 'wizyty');
+  await busCall(page, 'busFieldPolicySetRequest', {
+    instanceId, topic: 'wizyty', subjectType: 'group', subjectId: groupId, direction: 'read',
+    fields: ['lekarz', 'pacjent', 'termin'], requiredFields: [], maskedFields: [], hashedFields: ['lekarz'], expectAbsent: true,
+  });
+  const operators = execFileSync('/usr/bin/sqlite3', [DB, 'SELECT node_id FROM sync_nodes WHERE operator = 1;'], { encoding: 'utf8' }).trim().split('\n').filter(Boolean);
+  expect(operators.length).toBeGreaterThan(0);
+  try {
+    expect((await busCall(page, 'busFieldHashKeyInfoRequest', { instanceId })).key.canRotateHere).toBe(true);
+    sqliteWrite('UPDATE sync_nodes SET operator = 0;');
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wizyty&section=hiding`);
+    const s = hidingSection(page);
+    await expect(ruleRow(page, groupName)).toBeVisible({ timeout: 20000 });
+    const card = s.locator('[data-role="key-card"]');
+    await expect(card.locator('[data-role="key-text"]')).toContainText('Ten node nie jest operatorem organizacji, więc klucza tu nie zmienisz', { timeout: 15000 });
+    await expect(card.locator('[data-role="key-button"]')).toHaveAttribute('disabled', '');
+    await expect(card.locator('[data-role="key-button"]')).toHaveAttribute('title', /nie jest operatorem organizacji/);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-klucz-nieoperator.png'), fullPage: true });
+    const info = (await busCall(page, 'busFieldHashKeyInfoRequest', { instanceId })).key;
+    expect(info.canRotateHere).toBe(false);
+    const refused = await busCall(page, 'busFieldHashKeyRotateRequest', { instanceId, expectedKeyVersion: info.keyVersion }).then(() => '', (err) => String(err?.message || err));
+    expect(refused).toContain('bus.operator_node_required');
+    expect(refused).not.toMatch(/[0-9a-f]{64}/);
+    expect((await busCall(page, 'busFieldHashKeyInfoRequest', { instanceId })).key.keyVersion).toBe(info.keyVersion);
+  } finally {
+    for (const id of operators) sqliteWrite(`UPDATE sync_nodes SET operator = 1 WHERE node_id = '${id}';`);
+    await clearRules(page, instanceId, 'wizyty');
+    await iamCall(page, 'iamDeleteGroupRequest', { groupId });
+  }
+  await page.reload();
+  await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wizyty&section=hiding`);
+  await expect(hidingSection(page).locator('[data-role="key-card"] [data-role="key-text"]')).not.toContainText('nie jest operatorem', { timeout: 15000 });
+  expect(errors.filter((e) => !/operator_node_required|PolicyDenied/i.test(e)), errors.join('\n')).toEqual([]);
+});
+
+test('B7 R2 "Anuluj" over a changed draft brings the question into view even in a long window, and the preview lists only what the rules changed', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize({ width: 1440, height: 640 });
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  await clearRules(page, instanceId, 'wizyty');
+  try {
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wizyty&section=hiding`);
+    const s = hidingSection(page);
+    await expect(s.locator('tf-empty-state')).toBeVisible({ timeout: 20000 });
+    await s.locator('tf-empty-state [data-go="hiding-add"]').click();
+    const win = hidingWindow(page);
+    await pickSegment(win, '[data-role="kind"]', 'Wszyscy');
+    await pickSegment(win, 'tf-segmented[data-field="pacjent"]', 'Zamaskuj');
+    await pickSegment(win, 'tf-segmented[data-field="lekarz"]', 'Zahaszuj');
+    await pickSegment(win, 'tf-segmented[data-field="termin"]', 'Ukryj');
+    // The window is longer than the screen: the foot of it is out of sight until it is scrolled to.
+    await win.locator('[data-act="cancel"]').click();
+    const asked = win.locator('[data-role="discard"]');
+    await expect(asked).toContainText('Zmiany nie są zapisane');
+    await expect(asked).toBeInViewport({ ratio: 0.9 });
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-porzucenie-szkicu.png') });
+    // Another click drops the draft.
+    await win.locator('[data-act="cancel"]').click();
+    await expect(win).toHaveCount(0);
+    expect(await serverRuleDetail(page, instanceId, 'wizyty', 'any:*:read')).toBeNull();
+
+    // A rule for everyone, then the preview as everyone: the list holds the three changed fields and counts the rest.
+    await busCall(page, 'busFieldPolicySetRequest', {
+      instanceId, topic: 'wizyty', subjectType: 'any', subjectId: '*', direction: 'read',
+      fields: ['gabinet', 'lekarz', 'pacjent'], requiredFields: [], maskedFields: ['pacjent'], hashedFields: ['lekarz'],
+    });
+    await page.reload();
+    await s.locator('tf-button[data-go="hiding-preview"]').click();
+    const preview = previewWindow(page);
+    await pickSegment(preview, '[data-role="kind"]', 'Wszyscy');
+    await expect(preview.locator('[data-role="offset"] input')).not.toHaveValue('', { timeout: 15000 });
+    await preview.locator('[data-act="show"]').click();
+    await expect(preview.locator('[data-role="summary"]')).toContainText('Zasady', { timeout: 15000 });
+    await expect(preview.locator('[data-role="applied"] .tb-right-row[data-field-action="show"]')).toHaveCount(0);
+    await expect(preview.locator('[data-role="applied"] .tb-right-row')).toHaveCount(await preview.locator('[data-role="applied"] .tb-right-row:not([data-field-action="show"])').count());
+    // Not by colour alone: each marked value names what happened.
+    await expect(preview.locator('mark.tb-marked[data-action="mask"]')).toHaveAttribute('aria-label', 'zamaskowane');
+    await expect(preview.locator('mark.tb-marked[data-action="hash"]')).toHaveAttribute('title', 'zahaszowane');
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-podglad-tylko-zmiany.png') });
+    await preview.locator('[data-act="close"]').click();
+  } finally {
+    await clearRules(page, instanceId, 'wizyty');
+  }
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('B7 R2 an XML topic with an XSD offers the fields of the XSD; none of it says "no pattern"', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const subject = `e2e-faktura-xsd-${RUN}`;
+  const topic = `e2e-faktury-xsd-${RUN}`;
+  await busCall(page, 'busSchemaRegisterRequest', {
+    instanceId, subject, schemaType: 'xsd',
+    schemaText: `<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:element name="faktura">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="numer" type="xs:string"/>
+        <xs:element name="nabywca" type="xs:string"/>
+        <xs:choice><xs:element name="gotowka" type="xs:string"/><xs:element name="przelew" type="xs:string"/></xs:choice>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>`,
+  });
+  await busCall(page, 'busTopicCreateRequest', { instanceId, name: topic, options: { partitions: 1, contentType: 'application/xml', schemaId: subject, validation: 'dlq' } });
+  try {
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=${topic}&section=hiding`);
+    const s = hidingSection(page);
+    await expect(s.locator('tf-empty-state')).toBeVisible({ timeout: 20000 });
+    await s.locator('tf-empty-state [data-go="hiding-add"]').click();
+    const win = hidingWindow(page);
+    await expect(win.locator('[data-role="source-note"]')).toContainText(`Pola pochodzą ze wzoru wiadomości ${subject}`, { timeout: 15000 });
+    await expect(win.locator('[data-role="source-note"]')).not.toContainText('nie ma wzoru wiadomości');
+    for (const field of ['numer', 'nabywca', 'gotowka', 'przelew']) await expect(fieldSeg(win, field)).toHaveCount(1);
+    await expect(fieldSeg(win, 'nabywca').locator('.tf-seg-opt')).toHaveText(['Pokaż', 'Ukryj', 'Zamaskuj', 'Zahaszuj']);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-xsd-pola.png') });
+    await win.locator('[data-act="cancel"]').click();
+    await expect(win).toHaveCount(0);
+  } finally {
+    await busCall(page, 'busTopicDeleteRequest', { instanceId, name: topic }).catch(() => {});
+    await busCall(page, 'busSchemaDeleteRequest', { instanceId, subject, deprecateOnly: false }).catch(() => {});
+  }
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('B7 at 390x844: the four choices, the explanation and the key window fit the phone', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(PHONE);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  await clearRules(page, instanceId, 'wizyty');
+  await busCall(page, 'busFieldPolicySetRequest', {
+    instanceId, topic: 'wizyty', subjectType: 'any', subjectId: '*', direction: 'read',
+    fields: ['lekarz', 'pacjent'], requiredFields: [], maskedFields: ['pacjent'], hashedFields: ['lekarz'], expectAbsent: true,
+  });
+  try {
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wizyty&section=hiding`);
+    const s = hidingSection(page);
+    await expect(s.locator('[data-role="rules"] tbody tr').first()).toBeVisible({ timeout: 20000 });
+    await expect(s.locator('[data-role="rules"] tbody tr').first()).toContainText('Zamaskuj');
+    await expect(s.locator('[data-role="key-card"]')).toBeVisible();
+    await assertNoOverflow(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-maska-390.png'), fullPage: true });
+    await s.locator('[data-role="rules"] tbody tr tf-button[data-act="change"]').first().click();
+    const win = hidingWindow(page);
+    await expect(fieldSeg(win, 'pacjent')).toHaveAttribute('value', 'mask');
+    await windowFits(page, 'tf-window.tb-hiding-window', PHONE.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-zmien-maska-390.png') });
+    await cancelOut(win);
+    await expect(win).toHaveCount(0);
+    await s.locator('[data-role="key-button"]').click();
+    const key = page.locator('tf-window.tb-hash-key-window');
+    await expect(key).toHaveCount(1);
+    await windowFits(page, 'tf-window.tb-hash-key-window', PHONE.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-ukrywanie-klucz-390.png') });
+    await key.locator('[data-action="cancel"]').click();
+    await expect(key).toHaveCount(0);
+  } finally {
+    await clearRules(page, instanceId, 'wizyty');
+  }
+  expect(errors, errors.join('\n')).toEqual([]);
 });
 
 test('T12: when the node stops, the list keeps its last data under the connection notice', async ({ page }) => {

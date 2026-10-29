@@ -10157,7 +10157,7 @@
       "dlq_retry_deduplicated": "Le topic ne livre un message qu’une fois par fenêtre et celui-ci y a déjà été livré — il pourra être relancé une fois la fenêtre passée. Le message reste dans la liste.",
       "dlq_retry_source_not_leader": "Ce node ne dirige pas la partition du topic vers laquelle le message retourne — relancez-le sur le node qui la dirige.",
       "dlq_retry_requarantine_failed": "Le modèle du topic a de nouveau rejeté le message et sa nouvelle copie n’a pas pu être enregistrée parmi les messages non traités — le message reste dans la liste.",
-      "key_needs_topic_wide_rule": "Une clé ne peut ni lire ni envoyer les messages de ce topic tant que le topic n’a pas de règle de masquage des données pour tous — les règles réservées à des personnes choisies ne couvrent pas les clés.",
+      "key_needs_topic_wide_rule": "Une clé ne peut ni lire ni envoyer les messages de ce topic tant que le topic n’a pas de règle de dissimulation des données pour tous — les règles réservées à des personnes choisies ne couvrent pas les clés.",
       "subject_is_addon": "Cet identifiant appartient à un addon, pas à un utilisateur. Supprimez cette entrée et accordez l’accès à l’addon (À qui : Addon).",
       "subject_not_found": "Cette personne, cette clé ou cet addon est introuvable — elle a peut-être été supprimée ou n'appartient pas à cette organisation. Actualisez la page.",
       "org_mismatch": "Un droit sur un topic ne peut être accordé que depuis sa propre organisation.",
@@ -10165,8 +10165,15 @@
       "field_policy_changed": "La règle a changé entre-temps, donc rien n’a été enregistré. Actualisez la liste des règles et refaites la modification.",
       "schema_kind_mismatch": "Le modèle {name} est destiné à un contenu {schemaKind}, mais ce topic accepte un contenu {topicKind}.",
       "stored_schema_unreadable": "Le modèle {name}, version {version}, a été enregistré selon des règles plus souples et le registre ne peut plus le lire ; le topic ne peut donc plus vérifier de messages avec lui. Ajoutez une version corrigée du modèle.",
-      "field_policy_binary_topic": "Le topic {topic} contient des messages binaires (modèle {name}, {format}). Les règles de masquage fonctionnent sur JSON, XML et HL7 v2 ; on ne peut donc pas en ajouter.",
-      "field_policy_binary_bind": "Le topic {topic} a des règles de masquage, on ne peut donc pas lui associer le modèle binaire {name} ({format}). Les règles fonctionnent sur JSON, XML et HL7 v2 — supprimez-les d’abord."
+      "field_policy_binary_topic": "Le topic {topic} contient des messages binaires (modèle {name}, {format}). Les règles de dissimulation fonctionnent sur JSON, XML et HL7 v2 ; on ne peut donc pas en ajouter.",
+      "field_policy_binary_bind": "Le topic {topic} a des règles de dissimulation, on ne peut donc pas lui associer le modèle binaire {name} ({format}). Les règles fonctionnent sur JSON, XML et HL7 v2 — supprimez-les d’abord.",
+      "mask_hash_read_only": "Seule une règle de lecture peut caviarder ou hacher un champ : une règle d’écriture peut seulement l’autoriser, l’exiger ou l’interdire.",
+      "mask_hash_not_shown": "Un champ caviardé ou haché doit aussi figurer parmi les champs que la règle montre.",
+      "mask_hash_overlap": "Un champ ne peut pas être à la fois caviardé et haché.",
+      "field_hash_key_not_found": "L’organisation n’a pas encore de clé de hachage : elle est créée avec la première règle « Hacher », il n’y a donc rien à changer.",
+      "field_hash_key_changed": "La clé de hachage a changé entre-temps (quelqu’un l’a changée avant vous), rien n’a donc été modifié. Fermez cette fenêtre et rouvrez-la pour voir la version actuelle de la clé.",
+      "operator_node_required": "Seul un node opérateur de l’organisation peut le faire, et ce node n’en est pas un. Faites-le sur un node opérateur (liste : nodes du mesh).",
+      "hash_key_not_synced": "L’organisation hache déjà des champs avec une clé qui n’est pas encore arrivée sur ce node ; on ne peut donc pas ajouter maintenant un autre champ « Hacher ». Attendez la synchronisation avec le node opérateur ou vérifiez la connexion avec lui."
     },
     "shell": {
       "instance": "Instance",
@@ -10651,13 +10658,13 @@
         "stan_title": "Le modèle « {subject} » contient un caractère invisible",
         "stan_text": "La version {version}, selon laquelle le topic vérifie les messages, contient un caractère invisible, donc le topic n’en accepte aucun. Ajoutez une version corrigée du modèle.",
         "stan_button": "Ouvrir le modèle",
-        "rules_gone": "Les règles de masquage des données sur {topics} nomment des champs que la nouvelle version n’a pas : {fields}. Un champ que sa règle ne nomme pas est masqué pour les lecteurs.",
+        "rules_gone": "Les règles de dissimulation des données sur {topics} nomment des champs que la nouvelle version n’a pas : {fields}. Un champ que sa règle ne nomme pas est dissimulé pour les lecteurs.",
         "rules_rename": "Renommez aussi dans ces règles les champs qui ne diffèrent que par un caractère invisible : {pairs}.",
         "rules_rename_off": "Case non cochée, les règles restent inchangées : les lecteurs de {topicCount|ce topic|ces topics} cesseront de voir {count|le champ|les champs} {from} dans les nouveaux messages.",
         "rules_rename_on": "Case cochée, les règles autoriseront {count|le champ|les champs} {to} au lieu de {from} : les lecteurs de {topicCount|ce topic|ces topics} continueront de les voir dans les nouveaux messages comme avant.",
-        "rules_renamed": "Champs renommés dans {count} {count|règle|règles} de masquage des données.",
-        "rules_rename_failed": "La version a été ajoutée, mais le renommage des champs dans les règles de masquage des données a échoué : {error}. Corrigez-les dans la section « Masquage des données ».",
-        "rules_rename_partial": "La version a été ajoutée et les champs ont été renommés dans {count} {count|règle|règles} de masquage des données, puis le renommage a échoué : {error}. Corrigez le reste dans la section « Masquage des données ».",
+        "rules_renamed": "Champs renommés dans {count} {count|règle|règles} de dissimulation des données.",
+        "rules_rename_failed": "La version a été ajoutée, mais le renommage des champs dans les règles de dissimulation des données a échoué : {error}. Corrigez-les dans la section « Dissimulation des données ».",
+        "rules_rename_partial": "La version a été ajoutée et les champs ont été renommés dans {count} {count|règle|règles} de dissimulation des données, puis le renommage a échoué : {error}. Corrigez le reste dans la section « Dissimulation des données ».",
         "diff_only_removal": "Différence avec la version {version} : seuls les caractères invisibles sont supprimés ; champs et exigences inchangés.",
         "diff_only_removal_names": "Différence avec la version {version} : seuls les caractères invisibles sont supprimés, mais ils se trouvaient dans {count} {count|nom ou valeur|noms ou valeurs} : {pairs}.",
         "old_spelling_kept": "Les messages déjà écrits gardent l'ancienne graphie de {count} {count|nom ou valeur|noms ou valeurs} : {names}.",
@@ -10666,7 +10673,7 @@
         "escape_places_line": "Caractères invisibles écrits sous forme de séquence d’échappement (« Supprimer les caractères invisibles » ne les retire pas) : {places}.",
         "preview_title_escape": "Lignes à corriger (la séquence d’échappement d’un caractère invisible est surlignée) :",
         "rules_renamed_effect": "Les règles autorisent maintenant {count|le champ|les champs} {to} au lieu de {from} : les lecteurs de {topicCount|topic|topics} {topics} continuent de les voir dans les nouveaux messages.",
-        "rules_unchanged": "Les règles de masquage des données n’ont pas été modifiées : les lecteurs de {topicCount|topic|topics} {topics} ne verront pas {count|le champ|les champs} {from} dans les nouveaux messages. Vous pouvez le changer dans la section « Dissimulation des données ».",
+        "rules_unchanged": "Les règles de dissimulation des données n’ont pas été modifiées : les lecteurs de {topicCount|topic|topics} {topics} ne verront pas {count|le champ|les champs} {from} dans les nouveaux messages. Vous pouvez le changer dans la section « Dissimulation des données ».",
         "rules_open": "Dissimulation des données du topic « {topic} »",
         "topic_quoted": "« {topic} »"
       },
@@ -10842,7 +10849,7 @@
       "created_text_single": "Les programmes peuvent déjà y envoyer des messages ; il a 1 copie, car l’instance a un seul node.",
       "created_text_plain": "Les programmes peuvent déjà y envoyer des messages.",
       "deleted_title": "Topic {name} supprimé.",
-      "deleted_text": "Ses messages, messages non traités, entrées d’accès et règles de masquage des données ont été supprimés.",
+      "deleted_text": "Ses messages, messages non traités, entrées d’accès et règles de dissimulation des données ont été supprimés.",
       "creator": {
         "title": "Nouveau topic",
         "step_1": "Nom, contenu et partitions",
@@ -10933,8 +10940,8 @@
         "lost_messages": "{size} de messages dans {count} {n|partition|partitions|partitions}",
         "lost_dlq": "{count} {n|message non traité|messages non traités|messages non traités}",
         "lost_dlq_first": "Les messages non traités sont supprimés en premier : ils disparaissent même si le topic lui-même ne peut pas être supprimé.",
-        "lost_rules_and_access": "{rules} {r|règle|règles|règles} de masquage des données et {entries} {n|entrée|entrées|entrées} d’accès de personnes, groupes et addons",
-        "lost_rules": "{count} {n|règle|règles|règles} de masquage des données",
+        "lost_rules_and_access": "{rules} {r|règle|règles|règles} de dissimulation des données et {entries} {n|entrée|entrées|entrées} d’accès de personnes, groupes et addons",
+        "lost_rules": "{count} {n|règle|règles|règles} de dissimulation des données",
         "lost_access": "{count} {n|entrée|entrées|entrées} d’accès de personnes, groupes et addons",
         "lost_consumers": "{n|le destinataire|les destinataires|les destinataires} {names} {n|cesse|cessent|cessent} de recevoir des messages",
         "kept_schema": "Restent : le modèle de message {name} et les clés API des systèmes externes — ils appartiennent à l’instance et à l’organisation ; ils perdent seulement leurs droits sur ce topic.",
@@ -10942,12 +10949,12 @@
         "retype": "Saisissez le nom du topic pour confirmer :",
         "confirm": "Supprimer le topic {name}",
         "lost_empty_partitions": "{count} {n|partition vide|partitions vides|partitions vides}",
-        "lost_rules_unknown": "Les règles de masquage des données de ce topic n’ont pas pu être comptées ; s’il en a, elles sont supprimées aussi."
+        "lost_rules_unknown": "Les règles de dissimulation des données de ce topic n’ont pas pu être comptées ; s’il en a, elles sont supprimées aussi."
       },
       "preview": {
         "title": "Aperçu des messages — {topic}",
         "audit_title": "Cet aperçu est consigné dans le journal d’audit.",
-        "audit_text": "Chaque chargement montre au plus 50 messages (1 Mo au total), comme le permettent les règles de masquage des données définies pour vous. Ce n’est qu’un aperçu — les destinataires continuent de lire à leur manière.",
+        "audit_text": "Chaque chargement montre au plus 50 messages (1 Mo au total), comme le permettent les règles de dissimulation des données définies pour vous. Ce n’est qu’un aperçu — les destinataires continuent de lire à leur manière.",
         "partition_label": "Partition",
         "partition_n": "Partition {n}",
         "from_label": "À partir du numéro",
@@ -11153,7 +11160,7 @@
       "delete": {
         "title": "Supprimer le topic",
         "lead": "Supprimer le topic {name}",
-        "text": "— tous ses messages, messages non traités, entrées d’accès et règles de masquage des données disparaissent. C’est irréversible.",
+        "text": "— tous ses messages, messages non traités, entrées d’accès et règles de dissimulation des données disparaissent. C’est irréversible.",
         "button": "Supprimer le topic…"
       },
       "about": {
@@ -11424,7 +11431,7 @@
     },
     "unprocessed": {
       "where_title": "Où se trouvent les messages non traités",
-      "explain": "Les messages non traités sont des messages que leur destinataire n'a pas traités malgré les nouvelles tentatives, ou qui ne correspondaient pas au modèle de message à l'écriture. Les mêmes règles de masquage des données s'appliquent ici que dans le topic d'où provient le message.",
+      "explain": "Les messages non traités sont des messages que leur destinataire n'a pas traités malgré les nouvelles tentatives, ou qui ne correspondaient pas au modèle de message à l'écriture. Les mêmes règles de dissimulation des données s'appliquent ici que dans le topic d'où provient le message.",
       "list_title": "Messages",
       "list_hint": "Cliquez sur une ligne pour relancer ou rejeter le message dans son topic.",
       "list_hint_read": "Cliquez sur une ligne pour aller aux messages non traités de son topic.",
@@ -11507,8 +11514,8 @@
         "body_empty": "(vide)",
         "truncated": "le début du contenu est affiché",
         "blob": "Le contenu est un fichier joint : {size}, {mime}.",
-        "rules": "Les mêmes règles de masquage des données s'appliquent ici que dans le topic d'où provient le message.",
-        "error_hidden": "masqué par les règles de masquage des données de ce topic",
+        "rules": "Les mêmes règles de dissimulation des données s'appliquent ici que dans le topic d'où provient le message.",
+        "error_hidden": "dissimulé par les règles de dissimulation des données de ce topic",
         "audit": "La lecture des messages non traités est inscrite au journal d'audit.",
         "close": "Fermer"
       },
@@ -11646,7 +11653,7 @@
     },
     "access": {
       "subjects_title": "Personnes, groupes et addons",
-      "explain": "Lecture — récupérer les messages. Écriture — envoyer des messages. Administration — modifier les réglages, l’accès et le masquage des données de ce topic.",
+      "explain": "Lecture — récupérer les messages. Écriture — envoyer des messages. Administration — modifier les réglages, l’accès et le dissimulation des données de ce topic.",
       "col_who": "Qui",
       "right_title": {
         "read": "Lecture",
@@ -11656,7 +11663,7 @@
       "right_hint": {
         "read": "récupérer les messages",
         "write": "envoyer des messages",
-        "admin": "réglages, accès et masquage des données"
+        "admin": "réglages, accès et dissimulation des données"
       },
       "right": {
         "read": "lecture",
@@ -11671,7 +11678,7 @@
       "can": {
         "read": "lire les messages",
         "write": "envoyer des messages",
-        "admin": "modifier les réglages, l’accès et le masquage des données"
+        "admin": "modifier les réglages, l’accès et le dissimulation des données"
       },
       "allowed": "autorisé",
       "denied": "interdit",
@@ -11850,7 +11857,9 @@
       "and_more": "et {count} {n|autre champ|autres champs}",
       "action": {
         "show": "Afficher",
-        "hide": "Dissimuler"
+        "hide": "Dissimuler",
+        "mask": "Caviarder",
+        "hash": "Hacher"
       },
       "write": {
         "allow": "Autorisé",
@@ -11877,9 +11886,9 @@
       "col_changed": "Modifié",
       "empty_title": "Ce topic n'a aucune règle de dissimulation des données",
       "empty_text": "Toute personne qui peut lire ce topic voit les messages entiers. Ajoutez une règle pour dissimuler certains champs.",
-      "blocked_title": "Les règles de ce topic ne sont pas modifiées ici",
-      "blocked_text": "Les règles de ce topic ne se modifient pas sur cet écran, car son contenu est binaire et ne peut pas être lu comme des champs. Cet écran prend en charge les messages JSON, XML et HL7 v2. Le type de contenu est fixé à la création du topic.",
-      "blocked_with_rules": "Ce topic a des règles de masquage, mais son contenu est binaire — les règles ne fonctionneront pas. Supprimez-les ou créez un topic JSON/XML/HL7.",
+      "blocked_title": "Un contenu binaire n’a pas de dissimulation des données",
+      "blocked_text": "Dans un contenu binaire, on ne peut pas dissimuler de champs : il ne se lit pas comme des champs, donc toute personne qui peut lire le topic le voit en entier. La dissimulation des données fonctionne pour les messages JSON, XML et HL7 v2. Le type de contenu est fixé à la création du topic.",
+      "blocked_with_rules": "Ce topic a des règles de dissimulation, mais son contenu est binaire — les règles ne fonctionneront pas. Supprimez-les ou créez un topic JSON/XML/HL7.",
       "keys_closed": "Les systèmes externes avec une clé d’API n’ont pas accès à ce topic en {directions} : il n’a de règles que pour des personnes, groupes ou addons choisis et aucune pour tout le monde.",
       "sees_only": "Voit seulement : {fields}",
       "sees_nothing": "Ne voit aucun champ",
@@ -11891,7 +11900,10 @@
         "hide": "Le champ disparaît du message.",
         "reject_name": "Rejeter le message",
         "reject": "À l'écriture : un message avec un champ interdit, ou sans champ obligatoire, n'arrive pas dans le topic.",
-        "precedence": "La règle d'une personne l'emporte sur celle de son groupe, qui l'emporte sur celle pour tout le monde — les règles ne s'additionnent pas."
+        "precedence": "La règle d'une personne l'emporte sur celle de son groupe, qui l'emporte sur celle pour tout le monde — les règles ne s'additionnent pas.",
+        "mask": "Les 3 derniers caractères restent visibles, le reste devient des astérisques (une valeur de moins de 5 caractères est caviardée en entier), p. ex. {example}.",
+        "hash": "À la place de la valeur, on voit une chaîne fixe : la même valeur donne toujours le même hash dans toute l’organisation, et la valeur ne peut pas en être relue.",
+        "mask_example": "********359"
       },
       "field_problem": {
         "empty": "Saisissez le nom d'un champ.",
@@ -11899,11 +11911,12 @@
         "hl7_shape": "« {name} » n'est pas une adresse de champ HL7. Une adresse a la forme SEGMENT-numéro, p. ex. PID-5.",
         "xml_name": "« {name} » n'est pas un nom d'élément XML. Un nom commence par une lettre ou _ et ne contient pas d'espace.",
         "hl7_case": "« {name} » ressemble à une faute de frappe. Vouliez-vous dire {suggestion} ? Une adresse s’écrit en majuscules, avec un tiret.",
-        "typed_known": "« {name} » figure dans la liste des champs avec un réglage différent de celui saisi ci-dessous. Ne le gardez qu’à un seul endroit."
+        "typed_known": "« {name} » figure dans la liste des champs avec un réglage différent de celui saisi ci-dessous. Ne le gardez qu’à un seul endroit.",
+        "typed_twice": "« {name} » est saisi dans plus d’une liste. Ne le gardez que dans une seule."
       },
       "need": {
-        "read": "Réglez au moins un champ sur « Masquer ». La liste contient tous les champs de ce topic : une règle qui les montre tous ne change rien. Pour l’arrêter, supprimez-la.",
-        "read_typed": "Saisissez au moins un champ qui reste visible. Sans champ visible, la règle dissimulerait tout le message.",
+        "read": "Réglez au moins un champ sur « Dissimuler », « Caviarder » ou « Hacher ». La liste contient tous les champs de ce topic : une règle qui les montre tous ne change rien. Pour l’arrêter, supprimez-la.",
+        "read_typed": "Saisissez au moins un champ qui reste visible (tel quel, caviardé ou haché). Sans champ visible, la règle dissimulerait tout le message.",
         "write": "Réglez au moins un champ sur « Obligatoire » ou « Interdit ». La liste contient tous les champs de ce topic : une règle qui autorise tout ne vérifie rien. Pour l’arrêter, supprimez-la.",
         "write_typed": "Saisissez au moins un champ qu'il est permis d'écrire. Sans champ autorisé, la règle rejetterait chaque message."
       },
@@ -11927,7 +11940,9 @@
         "write_unlisted_hl7_saved": "Les autres positions des segments de la liste (p. ex. PID-1, PID-4, PV1-1) sont acceptées. Un message avec un autre segment est rejeté.",
         "write_unlisted_only_hl7": "Les messages de {whoFrom} sont acceptés avec les segments de la liste, y compris leurs autres positions (p. ex. PID-4, PV1-1). Un message avec un autre segment, p. ex. un segment Z, est rejeté.",
         "read_unlisted_saved": "Les champs absents de la liste disparaissent aussi.",
-        "write_unlisted_saved": "Un message avec un champ absent de la liste est aussi rejeté."
+        "write_unlisted_saved": "Un message avec un champ absent de la liste est aussi rejeté.",
+        "read_masked": "Pour {who}, {n|le champ|les champs} {fields} n’apparaîtr{n|a|ont} que sous forme d’astérisques, avec les 3 derniers caractères visibles.",
+        "read_hashed": "Pour {who}, {n|le champ|les champs} {fields} afficher{n|a|ont} un hash à la place de la valeur : une chaîne fixe, identique pour la même valeur dans toute l’organisation."
       },
       "fields_label": "Champs",
       "source": {
@@ -11935,7 +11950,8 @@
         "dictionary": "La liste contient les champs HL7 v2 les plus courants. Ajoutez un autre champ ci-dessous en saisissant son adresse.",
         "failed": "Le modèle de message de ce topic n'a pas pu être lu, ses champs ne sont donc pas connus. Saisissez ci-dessous les champs qui restent visibles.",
         "manual": "Les champs de ce topic ne sont pas connus — aucun modèle de message ne les énumère. Saisissez ci-dessous les champs qui restent visibles.",
-        "complex": "Le modèle de message de ce topic contient des champs qu’on ne peut pas en extraire (renvoi vers un autre fichier ou noms de champs libres), la liste complète n’est donc pas connue. Saisissez ci-dessous les champs qui restent visibles."
+        "complex": "Le modèle de message de ce topic contient des champs qu’on ne peut pas en extraire (renvoi vers un autre fichier ou noms de champs libres), la liste complète n’est donc pas connue. Saisissez ci-dessous les champs qui restent visibles.",
+        "xsd": "Les champs de ce topic se saisissent à la main : on ne peut pas les lister à partir de son modèle XSD. Saisissez ci-dessous les champs qui restent visibles."
       },
       "extra": {
         "shown": "Autres champs qui restent visibles",
@@ -11945,7 +11961,11 @@
         "required": "Champs obligatoires",
         "hint_hl7": "Saisissez une adresse de champ, p. ex. PID-5, puis appuyez sur Entrée.",
         "hint_xml": "Saisissez un nom d'élément, p. ex. patient, puis appuyez sur Entrée.",
-        "hint_json": "Saisissez un nom de champ, p. ex. patient, puis appuyez sur Entrée."
+        "hint_json": "Saisissez un nom de champ, p. ex. patient, puis appuyez sur Entrée.",
+        "masked": "Autres champs qui restent visibles sous forme caviardée",
+        "masked_typed": "Champs qui restent visibles sous forme caviardée",
+        "hashed": "Autres champs qui restent visibles sous forme de hash",
+        "hashed_typed": "Champs qui restent visibles sous forme de hash"
       },
       "unlisted": {
         "read": "Les champs absents de la liste sont dissimulés aussi (y compris ceux qui apparaîtront plus tard), sauf si vous les saisissez ci-dessous.",
@@ -11982,7 +12002,7 @@
       "remove": {
         "button": "Supprimer",
         "window_title": "Supprimer la règle de dissimulation des données — {name}",
-        "lead_read": "Règle de lecture pour : {who}. Elle dissimule les champs : {fields}.",
+        "lead_read": "Règle de lecture pour : {who}. {parts}",
         "lead_read_none": "Règle de lecture pour : {who}. Elle ne dissimule aucun des champs connus.",
         "lead_read_only": "Règle de lecture pour : {who}. Elle ne laisse visibles que ces champs : {fields}.",
         "lead_read_nothing": "Règle de lecture pour : {who}. Elle ne laisse aucun champ visible.",
@@ -12004,7 +12024,10 @@
         "impact_read_addon": "L’addon « {who} » lit le topic {topic} selon la règle pour tout le monde ; s’il n’y en a pas, il voit les messages entiers.",
         "impact_write_user": "Les messages de l’utilisateur « {who} » vers le topic {topic} sont vérifiés selon la règle d’écriture de l’un de ses groupes, à défaut la règle pour tout le monde ; s’il n’y en a aucune, ils ne sont pas vérifiés du tout.",
         "impact_write_group": "Les messages des membres du groupe « {who} » vers le topic {topic} sont vérifiés selon la règle d’écriture d’un autre de leurs groupes, à défaut la règle pour tout le monde ; s’il n’y en a aucune, ils ne sont pas vérifiés du tout.",
-        "impact_write_addon": "Les messages de l’addon « {who} » vers le topic {topic} sont vérifiés selon la règle pour tout le monde ; s’il n’y en a pas, ils ne sont pas vérifiés du tout."
+        "impact_write_addon": "Les messages de l’addon « {who} » vers le topic {topic} sont vérifiés selon la règle pour tout le monde ; s’il n’y en a pas, ils ne sont pas vérifiés du tout.",
+        "part_hide": "Elle dissimule les champs : {fields}.",
+        "part_mask": "Elle caviarde les champs : {fields}.",
+        "part_hash": "Elle hache les champs : {fields}."
       },
       "preview": {
         "button": "Aperçu de ce que voit…",
@@ -12026,15 +12049,22 @@
         "hidden": "dissimulé",
         "shown": "visible",
         "rules_title": "Ce que les règles ont fait",
-        "summary_hidden": "Les règles ont dissimulé {count} {n|champ|champs} : {fields}.",
-        "summary_none": "Les règles n'ont dissimulé aucun champ de ce message.",
+        "summary_none": "Les règles n’ont modifié aucun champ de ce message.",
         "limited_title": "Cet aperçu est plus étroit que la vue de la personne, du groupe ou de l’addon choisi",
-        "limited_text": "Une règle de lecture qui s'applique aussi à vous (la vôtre, celle de votre groupe ou celle pour tout le monde) dissimule des champs que verra la personne, le groupe ou l'addon choisi : {who}. Un aperçu ne montre jamais plus que ce que vous voyez vous-même, ces champs y manquent donc. La vue complète apparaît quand aucune règle de lecture ne vous concerne.",
-        "limited_missing": "Ces champs du modèle ne figurent pas dans cet aperçu : {fields}. Une règle qui s’applique aussi à vous les a masqués, ou le message ne les contient pas.",
+        "limited_text": "Une règle de lecture qui s'applique aussi à vous (la vôtre, celle de votre groupe ou celle pour tout le monde) dissimule ou modifie (caviarde, hache) des champs que verra la personne, le groupe ou l'addon choisi : {who}. Un aperçu ne montre jamais plus que ce que vous voyez vous-même, ces champs y manquent donc ou y apparaissent caviardés ou hachés. La vue complète apparaît quand aucune règle de lecture ne vous concerne.",
+        "limited_missing": "Ces champs du modèle ne figurent pas dans cet aperçu : {fields}. Une règle qui s’applique aussi à vous les a dissimulés, ou le message ne les contient pas.",
         "who_user": "utilisateur {name}",
         "who_group": "groupe {name}",
         "who_addon": "addon {name}",
-        "summary_limited": "Les champs qu’une règle valable aussi pour vous masque déjà ne sont pas cités."
+        "summary_limited": "Les champs qu’une règle valable aussi pour vous dissimule déjà ne sont pas cités.",
+        "masked": "caviardé",
+        "hashed": "haché",
+        "summary_hide": "Les règles ont dissimulé {count} {n|champ|champs} : {fields}.",
+        "summary_mask": "Les règles ont caviardé {count} {n|champ|champs} : {fields}.",
+        "summary_hash": "Les règles ont haché {count} {n|champ|champs} : {fields}.",
+        "key_missing_title": "Ce node n’a pas encore la clé de hachage de l’organisation",
+        "key_missing_text": "Une règle hache des champs, mais la clé de l’organisation n’est pas encore arrivée sur ce node (elle vient d’un node opérateur) : dans l’aperçu, les champs hachés sont dissimulés au lieu d’être hachés. Ce n’est pas l’effet de votre propre règle de lecture.",
+        "unchanged": "Autres champs inchangés : {count}."
       },
       "hl7": {
         "msh_3": "Application émettrice",
@@ -12105,7 +12135,7 @@
       "blocked_settings": "Ouvrir les paramètres du topic",
       "blocked_preview": "L’aperçu n’est pas disponible : le contenu de ce topic ne peut pas être lu comme des champs.",
       "writes_rest": "Autres champs ou champ obligatoire manquant : rejeter le message",
-      "reads_rest": "Champs hors de la liste : masqués",
+      "reads_rest": "Champs hors de la liste : dissimulés",
       "fields_search": "Rechercher un champ",
       "fields_none": "Aucun champ ne correspond à la recherche.",
       "who": {
@@ -12135,6 +12165,47 @@
         "obx": "résultat",
         "dg1": "diagnostic",
         "al1": "allergie"
+      },
+      "sees_only_and": "Voit seulement : {fields} et les champs ci-dessous",
+      "sees_only_below": "Voit seulement les champs ci-dessous",
+      "explain_action": {
+        "format_json": "En JSON, un champ caviardé ou haché devient du texte ; par exemple, le nombre 12345 donne « **345 ». Un booléen, un objet et une liste sont caviardés en « *** ». Un champ vide et null restent inchangés.",
+        "format_xml": "En XML, un élément caviardé ou haché perd ses attributs et ses éléments imbriqués : seul le texte reste. Un élément vide reste vide.",
+        "format_hl7v2": "En HL7 v2, le caviardage et le hachage portent sur tout le champ avec ses composants (les caractères ^, ~, \\ et &) : le résultat est un seul texte. Un champ vide reste vide."
+      },
+      "key": {
+        "title": "Clé de hachage",
+        "button": "Changer la clé de hachage",
+        "explain": "La clé de hachage est une chaîne secrète à partir de laquelle le hash est calculé. Grâce à elle, personne en dehors de l’organisation ne peut deviner la valeur à partir du hash. La clé est commune à toute l’organisation {org}.",
+        "explain_org": "La clé de hachage est une chaîne secrète à partir de laquelle le hash est calculé. Grâce à elle, personne en dehors de l’organisation ne peut deviner la valeur à partir du hash. La clé est commune à toute l’organisation.",
+        "admin_only": "La clé est changée par l’administrateur de l’instance.",
+        "current": "La clé actuelle a été définie le {date} (version {version}).",
+        "none": "La clé est créée avec la première règle « Hacher » de l’organisation ; tant qu’il n’y en a aucune, il n’y a rien à changer.",
+        "none_title": "La clé n’est créée qu’avec la première règle « Hacher ».",
+        "load_failed": "Impossible de charger les informations sur la clé : {error}",
+        "failed_title": "Impossible de charger la clé de hachage",
+        "window_title": "Changer la clé de hachage",
+        "irreversible": "Après le changement, les anciens hashes ne correspondront plus.",
+        "explain_change": "La même valeur donnera un autre hash qu’auparavant : les programmes qui relient des données par le hash ne relieront pas les messages d’avant le changement aux nouveaux. L’ancienne clé ne peut pas être rétablie.",
+        "impact_title": "Ce qui se passera après le changement :",
+        "scope": "La clé est commune à toute l’organisation {org} : le changement concerne toutes ses instances TentaBus, pas seulement celle-ci.",
+        "scope_org": "La clé est commune à toute l’organisation : le changement concerne toutes ses instances TentaBus, pas seulement celle-ci.",
+        "stale": "Les hashes calculés avec la clé actuelle ne correspondront plus aux nouveaux, dans chaque instance de l’organisation.",
+        "reach": "Ce node voit au moins {rules} {r|règle|règles} « Hacher » dans {topics} {t|topic|topics} ({instances} {i|instance|instances}).",
+        "reach_none": "Ce node ne voit aucune règle « Hacher », mais les instances de cette organisation sur d’autres nodes peuvent en avoir.",
+        "reach_note": "Ce sont des données de ce node : les règles des instances sur d’autres nodes ne sont pas comptées ici, il peut donc y en avoir davantage.",
+        "version_step": "La clé actuelle a la version {from} (définie le {date}) ; la nouvelle aura la version {to}.",
+        "audit": "Le changement de clé sera consigné dans le journal d’audit.",
+        "retype": "Saisissez les mots pour confirmer :",
+        "retype_word": "changer la clé",
+        "confirm": "Changer la clé",
+        "rotated_title": "Clé de hachage changée",
+        "rotated_text": "La clé de l’organisation {org} a maintenant une nouvelle version ({version}). Les hashes calculés avec la clé précédente ne correspondent plus aux nouveaux dans aucune instance de cette organisation. {reach}",
+        "rotated_text_org": "La clé de l’organisation a maintenant une nouvelle version ({version}). Les hashes calculés avec la clé précédente ne correspondent plus aux nouveaux dans aucune instance de cette organisation. {reach}",
+        "none_rules": "Ce node a des règles « Hacher », mais la clé de l’organisation n’est pas encore arrivée : les champs hachés sont provisoirement dissimulés. La clé vient d’un node opérateur ; si elle n’arrive pas, vérifiez la connexion avec lui.",
+        "none_rules_title": "La clé n’est pas encore arrivée sur ce node, il n’y a donc rien à changer.",
+        "not_operator": "Ce node n’est pas un opérateur de l’organisation : la clé ne peut pas être changée ici, faites-le sur un node opérateur.",
+        "changed_reloaded": "La clé de hachage a changé entre-temps (quelqu’un l’a changée avant vous), rien n’a donc été modifié. La fenêtre affiche maintenant la version actuelle ({version}). Si vous voulez toujours changer la clé, confirmez à nouveau."
       }
     }
   },

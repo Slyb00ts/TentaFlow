@@ -1367,9 +1367,20 @@ test('rules naming fields a new version lacks are found, the ones that differ on
 
 test('a renamed rule keeps everything but the name, a rule without the name is left alone', () => {
   const renames = [{ from: `pac${RLO}jent`, to: 'pacjent' }];
-  assert.deepEqual(renamedRuleRequest('i', RULES[0], renames), { instanceId: 'i', topic: 'wizyty', subjectType: 'any', subjectId: '*', direction: 'read', fields: ['pacjent', 'termin'], requiredFields: [] });
-  assert.deepEqual(renamedRuleRequest('i', RULES[1], renames), { instanceId: 'i', topic: 'wizyty', subjectType: 'group', subjectId: 'g1', direction: 'write', fields: ['pacjent'], requiredFields: ['pacjent'] });
+  assert.deepEqual(renamedRuleRequest('i', RULES[0], renames), { instanceId: 'i', topic: 'wizyty', subjectType: 'any', subjectId: '*', direction: 'read', fields: ['pacjent', 'termin'], requiredFields: [], maskedFields: [], hashedFields: [] });
+  assert.deepEqual(renamedRuleRequest('i', RULES[1], renames), { instanceId: 'i', topic: 'wizyty', subjectType: 'group', subjectId: 'g1', direction: 'write', fields: ['pacjent'], requiredFields: ['pacjent'], maskedFields: [], hashedFields: [] });
   assert.equal(renamedRuleRequest('i', RULES[2], renames), null);
+});
+
+test('a renamed rule keeps a masked or hashed field masked or hashed under its new name — it is never shown as it is', () => {
+  const renames = [{ from: `pac${RLO}jent`, to: 'pacjent' }, { from: `ter${RLO}min`, to: 'termin' }];
+  const rule = { topic: 'wizyty', subjectType: 'group', subjectId: 'g1', direction: 'read', fields: [`pac${RLO}jent`, `ter${RLO}min`, 'lekarz'], requiredFields: [], maskedFields: [`pac${RLO}jent`], hashedFields: [`ter${RLO}min`, 'lekarz'] };
+  assert.deepEqual(renamedRuleRequest('i', rule, renames), {
+    instanceId: 'i', topic: 'wizyty', subjectType: 'group', subjectId: 'g1', direction: 'read',
+    fields: ['lekarz', 'pacjent', 'termin'], requiredFields: [], maskedFields: ['pacjent'], hashedFields: ['lekarz', 'termin'],
+  });
+  const old = { ...rule, maskedFields: undefined, hashedFields: undefined };
+  assert.deepEqual([renamedRuleRequest('i', old, renames).maskedFields, renamedRuleRequest('i', old, renames).hashedFields], [[], []], 'a rule from an older server has none');
 });
 
 test('"Nowa wersja" warns about the rules whose fields the new text lacks and renames the ones a correction only respelled — only when asked, and says so', async () => {

@@ -10166,7 +10166,14 @@
       "schema_kind_mismatch": "Das Muster {name} ist für {schemaKind}-Inhalt, dieses Topic nimmt aber {topicKind}-Inhalt an.",
       "stored_schema_unreadable": "Das Muster {name}, Version {version}, wurde nach lockereren Regeln gespeichert und die Registry kann es nicht mehr lesen, daher kann das Topic damit keine Nachrichten prüfen. Fügen Sie eine korrigierte Version des Musters hinzu.",
       "field_policy_binary_topic": "Das Topic {topic} enthält binäre Nachrichten (Muster {name}, {format}). Regeln zum Ausblenden von Daten arbeiten mit JSON, XML und HL7 v2, daher können keine hinzugefügt werden.",
-      "field_policy_binary_bind": "Das Topic {topic} hat Regeln zum Ausblenden von Daten, daher lässt sich das binäre Muster {name} ({format}) nicht daran binden. Regeln arbeiten mit JSON, XML und HL7 v2 — löschen Sie sie zuerst."
+      "field_policy_binary_bind": "Das Topic {topic} hat Regeln zum Ausblenden von Daten, daher lässt sich das binäre Muster {name} ({format}) nicht daran binden. Regeln arbeiten mit JSON, XML und HL7 v2 — löschen Sie sie zuerst.",
+      "mask_hash_read_only": "Nur eine Leseregel kann ein Feld maskieren oder hashen – eine Schreibregel kann es nur erlauben, verlangen oder verbieten.",
+      "mask_hash_not_shown": "Ein maskiertes oder gehashtes Feld muss auch zu den Feldern gehören, die die Regel anzeigt.",
+      "mask_hash_overlap": "Ein Feld kann nicht gleichzeitig maskiert und gehasht sein.",
+      "field_hash_key_not_found": "Die Organisation hat noch keinen Hash-Schlüssel – er entsteht mit der ersten „Hashen“-Regel, daher gibt es nichts zu ändern.",
+      "field_hash_key_changed": "Der Hash-Schlüssel hat sich zwischenzeitlich geändert (jemand hat ihn vor Ihnen geändert), daher wurde nichts geändert. Schließen Sie dieses Fenster und öffnen Sie es erneut, um die aktuelle Version des Schlüssels zu sehen.",
+      "operator_node_required": "Das kann nur ein Operator-Node der Organisation, und dieser Node ist keiner. Führen Sie es auf einem Operator-Node aus (Liste: Mesh-Nodes).",
+      "hash_key_not_synced": "Die Organisation hasht bereits Felder mit einem Schlüssel, der diesen Node noch nicht erreicht hat; ein weiteres „Hashen“-Feld kann daher jetzt nicht hinzugefügt werden. Warten Sie auf die Synchronisierung mit dem Operator-Node oder prüfen Sie die Verbindung zu ihm."
     },
     "shell": {
       "instance": "Instanz",
@@ -11850,7 +11857,9 @@
       "and_more": "und {count} weitere {n|Feld|Felder}",
       "action": {
         "show": "Anzeigen",
-        "hide": "Ausblenden"
+        "hide": "Ausblenden",
+        "mask": "Maskieren",
+        "hash": "Hashen"
       },
       "write": {
         "allow": "Erlaubt",
@@ -11877,8 +11886,8 @@
       "col_changed": "Geändert",
       "empty_title": "Dieses Topic hat keine Regeln zum Ausblenden von Daten",
       "empty_text": "Wer dieses Topic lesen darf, sieht die vollständigen Nachrichten. Fügen Sie eine Regel hinzu, um bestimmte Felder auszublenden.",
-      "blocked_title": "Regeln für dieses Topic werden hier nicht bearbeitet",
-      "blocked_text": "Regeln für dieses Topic werden auf diesem Bildschirm nicht bearbeitet, weil sein Inhalt binär ist und sich nicht als Felder lesen lässt. Dieser Bildschirm unterstützt JSON-, XML- und HL7-v2-Nachrichten. Die Art des Inhalts wird beim Erstellen des Topics festgelegt.",
+      "blocked_title": "Binärer Inhalt hat kein Ausblenden von Daten",
+      "blocked_text": "Bei binärem Inhalt lassen sich keine Felder ausblenden: Er lässt sich nicht als Felder lesen, daher sieht ihn jeder, der das Topic lesen darf, vollständig. Das Ausblenden von Daten funktioniert bei JSON-, XML- und HL7-v2-Nachrichten. Die Art des Inhalts wird beim Erstellen des Topics festgelegt.",
       "blocked_with_rules": "Dieses Topic hat Regeln zum Ausblenden von Daten, sein Inhalt ist aber binär — die Regeln wirken nicht. Löschen Sie sie oder legen Sie ein JSON-/XML-/HL7-Topic an.",
       "keys_closed": "Externe Systeme mit API-Schlüssel sind für dieses Topic im Bereich {directions} gesperrt: Es gibt nur Regeln für ausgewählte Personen, Gruppen oder Addons und keine Regel für alle.",
       "sees_only": "Sieht nur: {fields}",
@@ -11891,7 +11900,10 @@
         "hide": "Das Feld verschwindet aus der Nachricht.",
         "reject_name": "Nachricht ablehnen",
         "reject": "Beim Schreiben: Eine Nachricht mit einem nicht erlaubten Feld oder ohne ein erforderliches Feld gelangt nicht in das Topic.",
-        "precedence": "Die Regel einer Person geht vor der Regel ihrer Gruppe, diese vor der Regel für alle — Regeln werden nicht addiert."
+        "precedence": "Die Regel einer Person geht vor der Regel ihrer Gruppe, diese vor der Regel für alle — Regeln werden nicht addiert.",
+        "mask": "Die letzten 3 Zeichen bleiben sichtbar, der Rest wird zu Sternchen (ein Wert mit weniger als 5 Zeichen wird vollständig maskiert), z. B. {example}.",
+        "hash": "Statt des Werts sieht man eine feste Zeichenfolge: Derselbe Wert ergibt in der ganzen Organisation immer denselben Hash, und der Wert lässt sich daraus nicht auslesen.",
+        "mask_example": "********359"
       },
       "field_problem": {
         "empty": "Geben Sie den Namen eines Felds ein.",
@@ -11899,11 +11911,12 @@
         "hl7_shape": "„{name}“ ist keine HL7-Feldadresse. Eine Adresse hat die Form SEGMENT-Nummer, z. B. PID-5.",
         "xml_name": "„{name}“ ist kein XML-Elementname. Ein Name beginnt mit einem Buchstaben oder _ und enthält keine Leerzeichen.",
         "hl7_case": "„{name}“ sieht nach einem Tippfehler aus. Meinten Sie {suggestion}? Eine Adresse wird in Großbuchstaben und mit Bindestrich geschrieben.",
-        "typed_known": "„{name}“ steht in der Feldliste mit einer anderen Einstellung als der unten eingegebenen. Behalten Sie es nur an einer Stelle."
+        "typed_known": "„{name}“ steht in der Feldliste mit einer anderen Einstellung als der unten eingegebenen. Behalten Sie es nur an einer Stelle.",
+        "typed_twice": "„{name}“ steht in mehr als einer Liste. Behalten Sie es nur in einer."
       },
       "need": {
-        "read": "Setzen Sie mindestens ein Feld auf „Ausblenden“. Die Liste enthält alle Felder dieses Topics, daher ändert eine Regel, die alle anzeigt, nichts – löschen Sie sie, um sie zu beenden.",
-        "read_typed": "Geben Sie mindestens ein Feld ein, das sichtbar bleibt. Ohne sichtbares Feld würde die Regel die ganze Nachricht ausblenden.",
+        "read": "Setzen Sie mindestens ein Feld auf „Ausblenden“, „Maskieren“ oder „Hashen“. Die Liste enthält alle Felder dieses Topics, daher ändert eine Regel, die alle anzeigt, nichts – löschen Sie sie, um sie zu beenden.",
+        "read_typed": "Geben Sie mindestens ein Feld ein, das sichtbar bleibt (unverändert, maskiert oder gehasht). Ohne sichtbares Feld würde die Regel die ganze Nachricht ausblenden.",
         "write": "Setzen Sie mindestens ein Feld auf „Erforderlich“ oder „Nicht erlaubt“. Die Liste enthält alle Felder dieses Topics, daher prüft eine Regel, die alles erlaubt, nichts – löschen Sie sie, um sie zu beenden.",
         "write_typed": "Geben Sie mindestens ein Feld ein, das geschrieben werden darf. Ohne erlaubtes Feld würde die Regel jede Nachricht ablehnen."
       },
@@ -11927,7 +11940,9 @@
         "write_unlisted_hl7_saved": "Die übrigen Positionen der Segmente auf der Liste (z. B. PID-1, PID-4, PV1-1) werden angenommen. Eine Nachricht mit einem anderen Segment wird abgelehnt.",
         "write_unlisted_only_hl7": "Nachrichten von {whoFrom} werden mit den Segmenten der Liste angenommen, auch in deren übrigen Positionen (z. B. PID-4, PV1-1). Eine Nachricht mit einem anderen Segment, z. B. einem Z-Segment, wird abgelehnt.",
         "read_unlisted_saved": "Felder außerhalb der Liste verschwinden ebenfalls.",
-        "write_unlisted_saved": "Eine Nachricht mit einem Feld außerhalb der Liste wird ebenfalls abgelehnt."
+        "write_unlisted_saved": "Eine Nachricht mit einem Feld außerhalb der Liste wird ebenfalls abgelehnt.",
+        "read_masked": "Für {who} erscheint {n|das Feld|die Felder} {fields} nur als Sternchen mit den letzten 3 sichtbaren Zeichen.",
+        "read_hashed": "Für {who} erscheint bei {n|dem Feld|den Feldern} {fields} statt des Werts ein Hash – eine feste Zeichenfolge, in der ganzen Organisation gleich für denselben Wert."
       },
       "fields_label": "Felder",
       "source": {
@@ -11935,7 +11950,8 @@
         "dictionary": "Die Liste enthält die häufigsten HL7-v2-Felder. Weitere Felder fügen Sie unten über ihre Adresse hinzu.",
         "failed": "Das Nachrichtenmuster dieses Topics konnte nicht gelesen werden, daher sind seine Felder nicht bekannt. Geben Sie unten die Felder ein, die sichtbar bleiben.",
         "manual": "Die Felder dieses Topics sind nicht bekannt — kein Nachrichtenmuster nennt sie. Geben Sie unten die Felder ein, die sichtbar bleiben.",
-        "complex": "Das Nachrichtenmuster dieses Topics enthält Felder, die sich daraus nicht auflisten lassen (Verweis auf eine andere Datei oder frei gewählte Feldnamen), daher ist die vollständige Liste nicht bekannt. Geben Sie unten die Felder ein, die sichtbar bleiben."
+        "complex": "Das Nachrichtenmuster dieses Topics enthält Felder, die sich daraus nicht auflisten lassen (Verweis auf eine andere Datei oder frei gewählte Feldnamen), daher ist die vollständige Liste nicht bekannt. Geben Sie unten die Felder ein, die sichtbar bleiben.",
+        "xsd": "Die Felder dieses Topics tragen Sie selbst ein – aus seinem XSD-Muster lassen sie sich nicht ablesen. Tragen Sie unten die Felder ein, die sichtbar bleiben sollen."
       },
       "extra": {
         "shown": "Weitere Felder, die sichtbar bleiben",
@@ -11945,7 +11961,11 @@
         "required": "Erforderliche Felder",
         "hint_hl7": "Geben Sie eine Feldadresse ein, z. B. PID-5, und drücken Sie die Eingabetaste.",
         "hint_xml": "Geben Sie einen Elementnamen ein, z. B. patient, und drücken Sie die Eingabetaste.",
-        "hint_json": "Geben Sie einen Feldnamen ein, z. B. patient, und drücken Sie die Eingabetaste."
+        "hint_json": "Geben Sie einen Feldnamen ein, z. B. patient, und drücken Sie die Eingabetaste.",
+        "masked": "Weitere Felder, die maskiert sichtbar bleiben",
+        "masked_typed": "Felder, die maskiert sichtbar bleiben",
+        "hashed": "Weitere Felder, die als Hash sichtbar bleiben",
+        "hashed_typed": "Felder, die als Hash sichtbar bleiben"
       },
       "unlisted": {
         "read": "Felder, die nicht in der Liste stehen, werden ebenfalls ausgeblendet (auch solche, die später hinzukommen), außer Sie geben sie unten ein.",
@@ -11982,7 +12002,7 @@
       "remove": {
         "button": "Löschen",
         "window_title": "Regel zum Ausblenden von Daten löschen — {name}",
-        "lead_read": "Leseregel für: {who}. Sie blendet die Felder aus: {fields}.",
+        "lead_read": "Leseregel für: {who}. {parts}",
         "lead_read_none": "Leseregel für: {who}. Sie blendet keines der bekannten Felder aus.",
         "lead_read_only": "Leseregel für: {who}. Sie lässt nur diese Felder sichtbar: {fields}.",
         "lead_read_nothing": "Leseregel für: {who}. Sie lässt kein Feld sichtbar.",
@@ -12004,7 +12024,10 @@
         "impact_read_addon": "Das Addon „{who}“ liest das Topic {topic} nach der Regel für alle; gibt es keine, sieht es ganze Nachrichten.",
         "impact_write_user": "Nachrichten des Benutzers „{who}“ an das Topic {topic} werden nach der Schreibregel einer seiner Gruppen geprüft, hat keine eine, nach der Regel für alle; gibt es keine, werden sie gar nicht geprüft.",
         "impact_write_group": "Nachrichten von Personen der Gruppe „{who}“ an das Topic {topic} werden nach der Schreibregel einer ihrer anderen Gruppen geprüft, haben sie keine, nach der Regel für alle; gibt es keine, werden sie gar nicht geprüft.",
-        "impact_write_addon": "Nachrichten des Addons „{who}“ an das Topic {topic} werden nach der Regel für alle geprüft; gibt es keine, werden sie gar nicht geprüft."
+        "impact_write_addon": "Nachrichten des Addons „{who}“ an das Topic {topic} werden nach der Regel für alle geprüft; gibt es keine, werden sie gar nicht geprüft.",
+        "part_hide": "Sie blendet die Felder aus: {fields}.",
+        "part_mask": "Sie maskiert die Felder: {fields}.",
+        "part_hash": "Sie hasht die Felder: {fields}."
       },
       "preview": {
         "button": "Vorschau: So sieht es …",
@@ -12026,15 +12049,22 @@
         "hidden": "ausgeblendet",
         "shown": "sichtbar",
         "rules_title": "Was die Regeln bewirkt haben",
-        "summary_hidden": "Die Regeln haben {count} {n|Feld|Felder} ausgeblendet: {fields}.",
-        "summary_none": "Die Regeln haben kein Feld dieser Nachricht ausgeblendet.",
+        "summary_none": "Die Regeln haben kein Feld dieser Nachricht verändert.",
         "limited_title": "Diese Vorschau ist enger als die Ansicht der gewählten Person, Gruppe oder des gewählten Addons",
-        "limited_text": "Eine Leseregel, die auch für Sie gilt (Ihre eigene, die Ihrer Gruppe oder die für alle), blendet Felder aus, die die gewählte Person, Gruppe oder das gewählte Addon sieht: {who}. Eine Vorschau zeigt nie mehr, als Sie selbst sehen können, daher fehlen diese Felder hier. Die vollständige Sicht erscheint, wenn für Sie keine Leseregel gilt.",
+        "limited_text": "Eine Leseregel, die auch für Sie gilt (Ihre eigene, die Ihrer Gruppe oder die für alle), blendet Felder aus oder verändert sie (Maske, Hash), die die gewählte Person, Gruppe oder das gewählte Addon sieht: {who}. Eine Vorschau zeigt nie mehr, als Sie selbst sehen können, daher fehlen diese Felder hier oder erscheinen maskiert oder gehasht. Die vollständige Sicht erscheint, wenn für Sie keine Leseregel gilt.",
         "limited_missing": "Diese Felder des Musters fehlen in dieser Vorschau: {fields}. Entweder hat sie eine Regel ausgeblendet, die auch für Sie gilt, oder die Nachricht enthält sie nicht.",
         "who_user": "Benutzer {name}",
         "who_group": "Gruppe {name}",
         "who_addon": "Addon {name}",
-        "summary_limited": "Felder, die eine auch für Sie geltende Regel bereits ausblendet, werden nicht aufgeführt."
+        "summary_limited": "Felder, die eine auch für Sie geltende Regel bereits ausblendet, werden nicht aufgeführt.",
+        "masked": "maskiert",
+        "hashed": "gehasht",
+        "summary_hide": "Die Regeln haben {count} {n|Feld|Felder} ausgeblendet: {fields}.",
+        "summary_mask": "Die Regeln haben {count} {n|Feld|Felder} maskiert: {fields}.",
+        "summary_hash": "Die Regeln haben {count} {n|Feld|Felder} gehasht: {fields}.",
+        "key_missing_title": "Dieser Node hat den Hash-Schlüssel der Organisation noch nicht",
+        "key_missing_text": "Eine Regel hasht Felder, aber der Schlüssel der Organisation ist noch nicht auf diesem Node angekommen (er kommt von einem Operator-Node). Gehashte Felder sind in der Vorschau daher ausgeblendet statt gehasht. Das ist keine Folge Ihrer eigenen Leseregel.",
+        "unchanged": "Übrige Felder unverändert: {count}."
       },
       "hl7": {
         "msh_3": "Sendende Anwendung",
@@ -12135,6 +12165,47 @@
         "obx": "Ergebnis",
         "dg1": "Diagnose",
         "al1": "Allergie"
+      },
+      "sees_only_and": "Sieht nur: {fields} und die Felder darunter",
+      "sees_only_below": "Sieht nur die Felder darunter",
+      "explain_action": {
+        "format_json": "In JSON wird ein maskiertes oder gehashtes Feld zu Text, z. B. ergibt die Zahl 12345 „**345“. Ein Wahrheitswert, ein Objekt und eine Liste werden als „***“ maskiert. Ein leeres Feld und null bleiben unverändert.",
+        "format_xml": "In XML verliert ein maskiertes oder gehashtes Element seine Attribute und verschachtelten Elemente – es bleibt nur der Text. Ein leeres Element bleibt leer.",
+        "format_hl7v2": "In HL7 v2 gelten Maske und Hash für das ganze Feld mit allen Komponenten (die Zeichen ^, ~, \\ und &) – das Ergebnis ist ein einziger Text. Ein leeres Feld bleibt leer."
+      },
+      "key": {
+        "title": "Hash-Schlüssel",
+        "button": "Hash-Schlüssel ändern",
+        "explain": "Der Hash-Schlüssel ist eine geheime Zeichenfolge, aus der der Hash berechnet wird. Dank ihm kann niemand außerhalb der Organisation den Wert aus dem Hash erraten. Der Schlüssel gilt gemeinsam für die ganze Organisation {org}.",
+        "explain_org": "Der Hash-Schlüssel ist eine geheime Zeichenfolge, aus der der Hash berechnet wird. Dank ihm kann niemand außerhalb der Organisation den Wert aus dem Hash erraten. Der Schlüssel gilt gemeinsam für die ganze Organisation.",
+        "admin_only": "Den Schlüssel ändert der Administrator der Instanz.",
+        "current": "Der aktuelle Schlüssel wurde am {date} gesetzt (Version {version}).",
+        "none": "Der Schlüssel entsteht mit der ersten „Hashen“-Regel der Organisation – solange es keine gibt, gibt es nichts zu ändern.",
+        "none_title": "Der Schlüssel entsteht erst mit der ersten „Hashen“-Regel.",
+        "load_failed": "Die Schlüsselinformationen konnten nicht geladen werden: {error}",
+        "failed_title": "Der Hash-Schlüssel konnte nicht geladen werden",
+        "window_title": "Hash-Schlüssel ändern",
+        "irreversible": "Nach der Änderung passen alte Hashes nicht mehr.",
+        "explain_change": "Derselbe Wert ergibt einen anderen Hash als bisher, daher verbinden Programme, die Daten über den Hash zusammenführen, Nachrichten von vor der Änderung nicht mit neuen. Der alte Schlüssel lässt sich nicht wiederherstellen.",
+        "impact_title": "Was nach der Änderung geschieht:",
+        "scope": "Der Schlüssel gilt gemeinsam für die ganze Organisation {org} – die Änderung betrifft alle ihre TentaBus-Instanzen, nicht nur diese.",
+        "scope_org": "Der Schlüssel gilt gemeinsam für die ganze Organisation – die Änderung betrifft alle ihre TentaBus-Instanzen, nicht nur diese.",
+        "stale": "Mit dem bisherigen Schlüssel berechnete Hashes passen nicht mehr zu neuen – in jeder Instanz der Organisation.",
+        "reach": "Dieser Node sieht mindestens {rules} {r|Regel|Regeln} „Hashen“ in {topics} {t|Topic|Topics} ({instances} {i|Instanz|Instanzen}).",
+        "reach_none": "Dieser Node sieht keine „Hashen“-Regel, aber Instanzen dieser Organisation auf anderen Nodes können welche haben.",
+        "reach_note": "Das sind Angaben dieses Nodes: Regeln von Instanzen auf anderen Nodes sind hier nicht mitgezählt, es können also mehr Regeln betroffen sein.",
+        "version_step": "Der aktuelle Schlüssel hat Version {from} (gesetzt am {date}); der neue erhält Version {to}.",
+        "audit": "Die Änderung des Schlüssels wird im Audit-Protokoll festgehalten.",
+        "retype": "Geben Sie zur Bestätigung die Wörter ein:",
+        "retype_word": "schlüssel ändern",
+        "confirm": "Schlüssel ändern",
+        "rotated_title": "Hash-Schlüssel geändert",
+        "rotated_text": "Der Schlüssel der Organisation {org} hat jetzt eine neue Version ({version}). Mit dem vorherigen Schlüssel berechnete Hashes passen in keiner Instanz dieser Organisation mehr zu neuen. {reach}",
+        "rotated_text_org": "Der Schlüssel der Organisation hat jetzt eine neue Version ({version}). Mit dem vorherigen Schlüssel berechnete Hashes passen in keiner Instanz dieser Organisation mehr zu neuen. {reach}",
+        "none_rules": "Dieser Node hat „Hashen“-Regeln, aber der Schlüssel der Organisation ist noch nicht bei ihm angekommen – gehashte Felder sind vorübergehend ausgeblendet. Der Schlüssel kommt von einem Operator-Node; falls er nicht eintrifft, prüfen Sie die Verbindung zu ihm.",
+        "none_rules_title": "Der Schlüssel ist noch nicht auf diesem Node angekommen, daher gibt es nichts zu ändern.",
+        "not_operator": "Dieser Node ist kein Operator der Organisation, daher lässt sich der Schlüssel hier nicht ändern – tun Sie es auf einem Operator-Node.",
+        "changed_reloaded": "Der Hash-Schlüssel hat sich zwischenzeitlich geändert (jemand hat ihn vor Ihnen geändert), daher wurde nichts geändert. Das Fenster zeigt jetzt die aktuelle Version ({version}). Wenn Sie den Schlüssel weiterhin ändern möchten, bestätigen Sie erneut."
       }
     }
   },

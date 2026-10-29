@@ -11304,7 +11304,14 @@
       "schema_kind_mismatch": "Pattern {name} is for {schemaKind} content, but this topic takes {topicKind} content.",
       "stored_schema_unreadable": "Pattern {name}, version {version}, was stored under looser rules and the registry can no longer read it, so the topic cannot check messages with it. Add a corrected version of the pattern.",
       "field_policy_binary_topic": "Topic {topic} carries binary messages (pattern {name}, {format}). Data-hiding rules work on JSON, XML and HL7 v2, so none can be added.",
-      "field_policy_binary_bind": "Topic {topic} has data-hiding rules, so the binary pattern {name} ({format}) cannot be attached to it. Rules work on JSON, XML and HL7 v2 — delete them first."
+      "field_policy_binary_bind": "Topic {topic} has data-hiding rules, so the binary pattern {name} ({format}) cannot be attached to it. Rules work on JSON, XML and HL7 v2 — delete them first.",
+      "mask_hash_read_only": "Only a reading rule can mask or hash a field — a writing rule can only allow, require or forbid it.",
+      "mask_hash_not_shown": "A masked or hashed field must also be among the fields the rule shows.",
+      "mask_hash_overlap": "A field cannot be both masked and hashed.",
+      "field_hash_key_not_found": "The organization has no hash key yet — it is created with the first “Hash” rule, so there is nothing to change.",
+      "field_hash_key_changed": "The hash key changed in the meantime (somebody changed it before you), so nothing was changed. Close this window and open it again to see the current version of the key.",
+      "operator_node_required": "Only an operator node of the organization can do this, and this node is not one. Do it on an operator node (see the mesh nodes list).",
+      "hash_key_not_synced": "The organization already hashes fields with a key that has not reached this node yet, so another “Hash” field cannot be added now. Wait for synchronization with the operator node or check the connection to it."
     },
     "shell": {
       "instance": "Instance",
@@ -12988,7 +12995,9 @@
       "and_more": "and {count} more {n|field|fields}",
       "action": {
         "show": "Show",
-        "hide": "Hide"
+        "hide": "Hide",
+        "mask": "Mask",
+        "hash": "Hash"
       },
       "write": {
         "allow": "Allowed",
@@ -13015,8 +13024,8 @@
       "col_changed": "Changed",
       "empty_title": "This topic has no data hiding rules",
       "empty_text": "Anyone who can read this topic sees whole messages. Add a rule to hide chosen fields.",
-      "blocked_title": "Rules for this topic are not edited here",
-      "blocked_text": "Rules for this topic are not edited on this screen because its content is binary and cannot be read as fields. This screen works with JSON, XML and HL7 v2 messages. The kind of content is set when the topic is created.",
+      "blocked_title": "Binary content has no data hiding",
+      "blocked_text": "Binary content cannot have fields hidden: it cannot be read as fields, so anyone who may read the topic sees it whole. Data hiding works for JSON, XML and HL7 v2 messages. The kind of content is set when the topic is created.",
       "blocked_with_rules": "This topic has data-hiding rules, but its content is binary — the rules will not work. Delete them or create a JSON/XML/HL7 topic.",
       "keys_closed": "Outside systems with an API key are shut out of this topic for {directions}: it has rules for chosen people, groups or addons only and none for everyone.",
       "sees_only": "Sees only: {fields}",
@@ -13029,7 +13038,10 @@
         "hide": "The field disappears from the message.",
         "reject_name": "Reject the message",
         "reject": "When writing: a message with a field that is not allowed, or without a required one, does not reach the topic.",
-        "precedence": "A person's own rule beats the rule of their group, which beats the rule for everyone — rules are never added together."
+        "precedence": "A person's own rule beats the rule of their group, which beats the rule for everyone — rules are never added together.",
+        "mask": "The last 3 characters stay visible, the rest become asterisks (a value shorter than 5 characters is masked entirely), e.g. {example}.",
+        "hash": "Instead of the value you see a fixed string of characters: the same value always gives the same hash across the whole organization, and the value cannot be read back from it.",
+        "mask_example": "********359"
       },
       "field_problem": {
         "empty": "Type the name of a field.",
@@ -13037,11 +13049,12 @@
         "hl7_shape": "“{name}” is not an HL7 field address. An address looks like SEGMENT-number, e.g. PID-5.",
         "xml_name": "“{name}” is not an XML element name. A name starts with a letter or _ and has no spaces.",
         "hl7_case": "“{name}” looks like a typo. Did you mean {suggestion}? An address is written in capital letters, with a dash.",
-        "typed_known": "“{name}” is on the field list with a different setting than the one typed below. Keep it in one place only."
+        "typed_known": "“{name}” is on the field list with a different setting than the one typed below. Keep it in one place only.",
+        "typed_twice": "“{name}” is typed in more than one list. Keep it in one only."
       },
       "need": {
-        "read": "Set at least one field to “Hide”. The list holds every field of this topic, so a rule that shows them all changes nothing — to stop it, delete it.",
-        "read_typed": "Type at least one field that stays visible. With no visible field the rule would hide the whole message.",
+        "read": "Set at least one field to “Hide”, “Mask” or “Hash”. The list holds every field of this topic, so a rule that shows them all changes nothing — to stop it, delete it.",
+        "read_typed": "Type at least one field that stays visible (as it is, masked or hashed). With no visible field the rule would hide the whole message.",
         "write": "Set at least one field to “Required” or “Not allowed”. The list holds every field of this topic, so a rule that allows everything checks nothing — to stop it, delete it.",
         "write_typed": "Type at least one field that may be written. With no allowed field the rule would reject every message."
       },
@@ -13065,7 +13078,9 @@
         "write_unlisted_hl7_saved": "The remaining positions of the segments on the list (e.g. PID-1, PID-4, PV1-1) are accepted. A message with another segment is rejected.",
         "write_unlisted_only_hl7": "Messages from {whoFrom} are accepted with the segments on the list, including their remaining positions (e.g. PID-4, PV1-1). A message with another segment, e.g. a Z segment, is rejected.",
         "read_unlisted_saved": "Fields outside the list disappear too.",
-        "write_unlisted_saved": "A message with a field outside the list is rejected too."
+        "write_unlisted_saved": "A message with a field outside the list is rejected too.",
+        "read_masked": "For {who} the {n|field|fields} {fields} will show only as asterisks with the last 3 characters visible.",
+        "read_hashed": "For {who} the {n|field|fields} {fields} will show a hash instead of the value — a fixed string, the same for the same value across the whole organization."
       },
       "fields_label": "Fields",
       "source": {
@@ -13073,7 +13088,8 @@
         "dictionary": "The list holds the most common HL7 v2 fields. Add another field below by typing its address.",
         "failed": "The message pattern of this topic could not be read, so its fields are not known. Type below the fields that stay visible.",
         "manual": "The fields of this topic are not known — no message pattern lists them. Type below the fields that stay visible.",
-        "complex": "The message pattern of this topic holds fields that cannot be listed from it (a reference to another file or free-form field names), so the full list is not known. Type below the fields that stay visible."
+        "complex": "The message pattern of this topic holds fields that cannot be listed from it (a reference to another file or free-form field names), so the full list is not known. Type below the fields that stay visible.",
+        "xsd": "You type this topic's fields by hand — they cannot be listed from its XSD pattern. Type below the fields that stay visible."
       },
       "extra": {
         "shown": "Other fields that stay visible",
@@ -13083,7 +13099,11 @@
         "required": "Required fields",
         "hint_hl7": "Type a field address, e.g. PID-5, and press Enter.",
         "hint_xml": "Type an element name, e.g. patient, and press Enter.",
-        "hint_json": "Type a field name, e.g. patient, and press Enter."
+        "hint_json": "Type a field name, e.g. patient, and press Enter.",
+        "masked": "Other fields that stay visible as a mask",
+        "masked_typed": "Fields that stay visible as a mask",
+        "hashed": "Other fields that stay visible as a hash",
+        "hashed_typed": "Fields that stay visible as a hash"
       },
       "unlisted": {
         "read": "Fields that are not on the list are hidden too (also those that appear later), unless you type them below.",
@@ -13120,7 +13140,7 @@
       "remove": {
         "button": "Delete",
         "window_title": "Delete the data hiding rule — {name}",
-        "lead_read": "Reading rule for: {who}. It hides the fields: {fields}.",
+        "lead_read": "Reading rule for: {who}. {parts}",
         "lead_read_none": "Reading rule for: {who}. It hides none of the known fields.",
         "lead_read_only": "Reading rule for: {who}. It leaves only these fields visible: {fields}.",
         "lead_read_nothing": "Reading rule for: {who}. It leaves no field visible.",
@@ -13142,7 +13162,10 @@
         "impact_read_addon": "The addon “{who}” reads the topic {topic} by the rule for everyone; if there is none, it sees whole messages.",
         "impact_write_user": "Messages from the user “{who}” to the topic {topic} are checked against the writing rule of one of their groups, and if none of them has one, the rule for everyone; if there is none, they are not checked at all.",
         "impact_write_group": "Messages from people in the group “{who}” to the topic {topic} are checked against the writing rule of another group of theirs, and if they have none, the rule for everyone; if there is none, they are not checked at all.",
-        "impact_write_addon": "Messages from the addon “{who}” to the topic {topic} are checked against the rule for everyone; if there is none, they are not checked at all."
+        "impact_write_addon": "Messages from the addon “{who}” to the topic {topic} are checked against the rule for everyone; if there is none, they are not checked at all.",
+        "part_hide": "It hides the fields: {fields}.",
+        "part_mask": "It masks the fields: {fields}.",
+        "part_hash": "It hashes the fields: {fields}."
       },
       "preview": {
         "button": "Preview what they see…",
@@ -13164,15 +13187,22 @@
         "hidden": "hidden",
         "shown": "visible",
         "rules_title": "What the rules did",
-        "summary_hidden": "The rules hid {count} {n|field|fields}: {fields}.",
-        "summary_none": "The rules hid no field of this message.",
+        "summary_none": "The rules changed no field of this message.",
         "limited_title": "This preview is narrower than what the chosen person, group or addon sees",
-        "limited_text": "A reading rule that applies to you too (your own, your group's or the one for everyone) hides fields that the chosen person, group or addon will see: {who}. A preview never shows more than you can see yourself, so those fields are missing here. The full view appears when no reading rule applies to you.",
+        "limited_text": "A reading rule that applies to you too (your own, your group's or the one for everyone) hides or alters (masks, hashes) fields that the chosen person, group or addon will see: {who}. A preview never shows more than you can see yourself, so those fields are missing here or appear masked or hashed. The full view appears when no reading rule applies to you.",
         "limited_missing": "These fields of the pattern are not in this preview: {fields}. A rule that applies to you too hid them, or the message does not have them.",
         "who_user": "user {name}",
         "who_group": "group {name}",
         "who_addon": "addon {name}",
-        "summary_limited": "Fields that a rule applying to you too already hides are not listed."
+        "summary_limited": "Fields that a rule applying to you too already hides are not listed.",
+        "masked": "masked",
+        "hashed": "hashed",
+        "summary_hide": "The rules hid {count} {n|field|fields}: {fields}.",
+        "summary_mask": "The rules masked {count} {n|field|fields}: {fields}.",
+        "summary_hash": "The rules hashed {count} {n|field|fields}: {fields}.",
+        "key_missing_title": "This node does not have the organization's hash key yet",
+        "key_missing_text": "A rule hashes fields, but the organization's key has not reached this node yet (it comes from an operator node), so the hashed fields are hidden in the preview instead of hashed. This is not an effect of your own reading rule.",
+        "unchanged": "Other fields unchanged: {count}."
       },
       "hl7": {
         "msh_3": "Sending application",
@@ -13273,6 +13303,47 @@
         "obx": "result",
         "dg1": "diagnosis",
         "al1": "allergy"
+      },
+      "sees_only_and": "Sees only: {fields} and the fields below",
+      "sees_only_below": "Sees only the fields below",
+      "explain_action": {
+        "format_json": "In JSON a masked or hashed field becomes text, e.g. the number 12345 gives “**345”. A boolean, an object and a list are masked as “***”. An empty field and null stay as they are.",
+        "format_xml": "In XML a masked or hashed element loses its attributes and nested elements — only the text stays. An empty element stays empty.",
+        "format_hl7v2": "In HL7 v2 masking and hashing cover the whole field with all its components (the ^, ~, \\ and & characters) — the result is one piece of text. An empty field stays empty."
+      },
+      "key": {
+        "title": "Hash key",
+        "button": "Change the hash key",
+        "explain": "The hash key is a secret string the hash is computed from. Thanks to it nobody outside the organization can guess the value from a hash. The key is shared by the whole organization {org}.",
+        "explain_org": "The hash key is a secret string the hash is computed from. Thanks to it nobody outside the organization can guess the value from a hash. The key is shared by the whole organization.",
+        "admin_only": "The key is changed by the instance administrator.",
+        "current": "The current key was set on {date} (version {version}).",
+        "none": "The key is created with the first “Hash” rule of the organization — until there is one, there is nothing to change.",
+        "none_title": "The key is only created with the first “Hash” rule.",
+        "load_failed": "The key information could not be loaded: {error}",
+        "failed_title": "The hash key could not be loaded",
+        "window_title": "Change the hash key",
+        "irreversible": "After the change the old hashes will stop matching.",
+        "explain_change": "The same value will give a different hash than before, so programs that join data by hash will not join messages from before the change with new ones. The old key cannot be restored.",
+        "impact_title": "What happens after the change:",
+        "scope": "The key is shared by the whole organization {org} — the change affects all its TentaBus instances, not only this one.",
+        "scope_org": "The key is shared by the whole organization — the change affects all its TentaBus instances, not only this one.",
+        "stale": "Hashes computed with the current key will stop matching new ones — in every instance of the organization.",
+        "reach": "This node sees at least {rules} “Hash” {r|rule|rules} in {topics} {t|topic|topics} ({instances} {i|instance|instances}).",
+        "reach_none": "This node sees no “Hash” rule, but instances of this organization on other nodes may have some.",
+        "reach_note": "These are figures from this node: rules of instances running on other nodes are not counted here, so more rules may be affected.",
+        "version_step": "The current key is version {from} (set on {date}); the new one will be version {to}.",
+        "audit": "The key change will be written to the audit log.",
+        "retype": "Retype the words to confirm:",
+        "retype_word": "change key",
+        "confirm": "Change the key",
+        "rotated_title": "The hash key was changed",
+        "rotated_text": "The key of the organization {org} now has a new version ({version}). Hashes computed with the previous key no longer match new ones in any instance of this organization. {reach}",
+        "rotated_text_org": "The key of the organization now has a new version ({version}). Hashes computed with the previous key no longer match new ones in any instance of this organization. {reach}",
+        "none_rules": "This node has “Hash” rules, but the organization's key has not reached it yet — hashed fields are temporarily hidden. The key comes from an operator node; if it does not arrive, check the connection to it.",
+        "none_rules_title": "The key has not reached this node yet, so there is nothing to change.",
+        "not_operator": "This node is not an operator of the organization, so the key cannot be changed here — do it on an operator node.",
+        "changed_reloaded": "The hash key changed in the meantime (somebody changed it before you), so nothing was changed. The window now shows the current version ({version}). If you still want to change the key, confirm again."
       }
     }
   },

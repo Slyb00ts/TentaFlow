@@ -44,6 +44,7 @@ import { subjectRows, keyRows, openAccessGrant, openAccessChange, openAccessRemo
 import { policyRows, topicFormat, fieldSource } from '/js/modules/tentabus/topic-hiding.js';
 import { openHidingAdd, openHidingChange, openHidingRemove } from '/js/modules/tentabus/topic-hiding-windows.js';
 import { openHidingPreview } from '/js/modules/tentabus/hiding-preview.js';
+import { openHashKeyRotate, rotatedNotice } from '/js/modules/tentabus/topic-hiding-key.js';
 import { openLeaderTransfer, transferChoices } from '/js/modules/tentabus/partitions.js';
 import { drawReplication } from '/js/modules/tentabus/replication.js';
 import { drawConsumers, consumerKey } from '/js/modules/tentabus/consumers.js';
@@ -341,9 +342,11 @@ function freshAccess(topic = null) {
 // the failed load, and the pattern its fields are read from: `{ subject,
 // version, text }`, `{ failed: true }` when it could not be read, `null` for
 // a topic without one; `schemaFor` names the pattern it was read for and
-// `schemaSettled` says that the read is over.
+// `schemaSettled` says that the read is over; `hashKey` is the organization's
+// hash key as `FieldHashKeyInfo` reports it (`{ info, error }`, only asked for
+// the instance administrator, `null` until it answers).
 function freshHiding(topic = null) {
-  return { topic, policies: null, policiesError: null, schema: null, schemaFor: null, schemaSettled: false };
+  return { topic, policies: null, policiesError: null, schema: null, schemaFor: null, schemaSettled: false, hashKey: null };
 }
 
 // The open pattern's versions (`null` until they answer) and the failed
@@ -1503,7 +1506,9 @@ async function fetchFieldSchema(instanceId, topic) {
     // The server still refuses a rule it cannot apply.
   }
   if (schemaKind(schemaType) === 'binary') return { subject: topic.schemaId, schemaType };
-  if (topicFormat(topic.contentType) !== 'json') return null;
+  // A JSON pattern names the fields; so does an XSD of an XML topic (its root's children, `readXsdFields`).
+  const format = topicFormat(topic.contentType);
+  if (format !== 'json' && !(format === 'xml' && schemaType === 'xsd')) return null;
   try {
     const got = await busCall('busSchemaGetRequest', { instanceId, subject: topic.schemaId });
     return { subject: topic.schemaId, schemaType, version: got?.schema?.version ?? null, text: got?.schemaText ?? '' };
@@ -1522,9 +1527,11 @@ async function loadTopicHiding(name) {
   const schemaFor = topic?.schemaId || '';
   const kept = state.hiding.topic === name && state.hiding.schemaSettled && state.hiding.schemaFor === schemaFor;
   const iid = requireInstanceId(instanceId);
-  const [policies, schema] = await Promise.allSettled([
+  const [policies, schema, key] = await Promise.allSettled([
     busCall('busFieldPolicyListRequest', { instanceId: iid, topic: name }),
     kept ? Promise.resolve(state.hiding.schema) : fetchFieldSchema(iid, topic),
+    // Only the instance administrator may read the organization's hash key.
+    canAdmin() ? busCall('busFieldHashKeyInfoRequest', { instanceId: iid }) : Promise.resolve(null),
   ]);
   if (!current()) return;
   const next = freshHiding(name);
@@ -1533,11 +1540,14 @@ async function loadTopicHiding(name) {
   next.schemaSettled = true;
   if (policies.status === 'fulfilled') next.policies = policies.value?.policies || [];
   else next.policiesError = describeBusError(policies.reason);
+  if (key.status === 'fulfilled') next.hashKey = key.value ? { info: key.value.key ?? null, error: null } : null;
+  else next.hashKey = { info: null, error: describeBusError(key.reason) };
   // A failed reload keeps what the section showed.
   if (!next.policies && state.hiding.topic === name && state.hiding.policies) {
     next.policies = state.hiding.policies;
     next.policiesError = null;
   }
+  if (next.hashKey?.error && state.hiding.topic === name && state.hiding.hashKey?.info) next.hashKey = state.hiding.hashKey;
   state.hiding = next;
   renderPanel();
 }
@@ -1561,8 +1571,13 @@ function openHidingWindow(name, action) {
       directory,
       loadPartitions: async () => (await busCall('busTopicDetailRequest', { instanceId, name }))?.partitions || [],
       preview: (request) => busCall('busFieldPolicyPreviewRequest', request),
+      format,
       describeError: describeBusError,
     });
+    return;
+  }
+  if (action.kind === 'hiding-key') {
+    openHashKeyWindow(name);
     return;
   }
   if (!hiding.schemaSettled) return;
@@ -1582,6 +1597,7 @@ function openHidingWindow(name, action) {
     format,
     source,
     rules,
+    fieldActions: state.capabilities?.fieldActions || [],
     directory,
     setPolicy: reloadAfter((request) => busCall('busFieldPolicySetRequest', request)),
     deleteRule: reloadAfter((request) => busCall('busFieldPolicyDeleteRequest', request)),
@@ -1600,6 +1616,56 @@ function openHidingWindow(name, action) {
   if (!row) return;
   if (action.kind === 'hiding-change') openHidingChange(row, ctx);
   else if (action.kind === 'hiding-remove') openHidingRemove(row, ctx);
+}
+
+// "Zmień klucz haszowania" (instance administrator only, like the server's
+// `gate_admin`): the key is read fresh so the window shows - and the request
+// names - the version that is stored now, and a key that cannot be read is
+// told on the section instead of opening a window about a key nobody saw.
+async function openHashKeyWindow(name) {
+  if (!canAdmin() || state.view?.name !== name) return;
+  const instanceId = requireInstanceId(state.instanceId);
+  const still = () => state.instanceId === instanceId && state.view?.name === name;
+  const orgName = state.capabilities?.orgName || null;
+  const fail = (err) => {
+    if (!still()) return;
+    state.detailNotice = { section: 'hiding', tone: 'danger', title: T('hiding.key.failed_title'), text: describeBusError(err) };
+    renderPanel();
+  };
+  let info;
+  try {
+    info = (await busCall('busFieldHashKeyInfoRequest', { instanceId }))?.key;
+  } catch (err) {
+    fail(err);
+    return;
+  }
+  if (!still()) return;
+  if (!info?.exists) {
+    loadTopicHiding(name);
+    return;
+  }
+  openHashKeyRotate({
+    info,
+    orgName,
+    rotate: (expectedKeyVersion) => busCall('busFieldHashKeyRotateRequest', { instanceId, expectedKeyVersion }),
+    // Somebody rotated first: the window takes the key as it is now, and so does the section behind it.
+    reload: async () => {
+      const key = (await busCall('busFieldHashKeyInfoRequest', { instanceId }))?.key;
+      if (still()) loadTopicHiding(name);
+      return key;
+    },
+    describeError: (err) => {
+      // Somebody rotated first (or the button was pressed twice): the section shows the key as it is now.
+      if (/\bbus\.field_hash_key_changed\b/.test(String(err?.message ?? '')) && still()) loadTopicHiding(name);
+      return describeBusError(err);
+    },
+    onRotated: async (key) => {
+      if (!still()) return;
+      const notice = rotatedNotice({ key, orgName });
+      state.detailNotice = { section: 'hiding', tone: 'success', title: notice.title, text: notice.text };
+      await loadTopicHiding(name);
+    },
+  });
 }
 
 // "Przenieś prowadzenie" from a topic's Partycje i kopie (`from = 'topic'`)
@@ -2380,6 +2446,7 @@ async function loadRulesOfTopics(instanceId, topics) {
     const got = await busCall('busFieldPolicyListRequest', { instanceId: iid, topic });
     return (got?.policies || []).map((p) => ({
       topic, subjectType: p.subjectType, subjectId: p.subjectId, direction: p.direction, fields: p.fields || [], requiredFields: p.requiredFields || [],
+      maskedFields: p.maskedFields || [], hashedFields: p.hashedFields || [],
     }));
   }));
   return answers.flatMap((a) => (a.status === 'fulfilled' ? a.value : []));

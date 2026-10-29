@@ -65,6 +65,10 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
     let settings_cipher = Arc::new(tentaflow_core::crypto::SettingsCipher::new(
         &file_master_key,
     ));
+    // The same cipher for the lifecycle hooks of native apps (TentaBus seals its
+    // hashing keys with it): the master key lives in this data dir, not in the
+    // default location a hook would look at.
+    tentaflow_core::addon::native_apps::set_global_settings_cipher(&settings_cipher);
 
     // Mesh services registry — agregator widokow `services` ze wszystkich
     // zaufanych peerow (single source of truth po N7). Pisze do niego pipeline

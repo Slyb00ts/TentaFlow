@@ -519,7 +519,9 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
     if (state.discard || !dirty()) return;
     e.preventDefault();
     state.discard = true;
-    win.querySelector('[data-role="discard"]').hidden = false;
+    const asked = win.querySelector('[data-role="discard"]');
+    asked.hidden = false;
+    asked.scrollIntoView?.({ block: 'nearest' });
   });
   // Any further edit withdraws the question: the next close asks again.
   function withdrawDiscard() {

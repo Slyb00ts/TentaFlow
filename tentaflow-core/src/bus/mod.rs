@@ -91,6 +91,7 @@ pub mod codec;
 pub mod db;
 pub mod dedup;
 pub mod dlq;
+pub mod field_hash_key;
 pub mod field_policies;
 pub mod groups;
 pub mod instance;
@@ -980,6 +981,15 @@ pub enum BusServiceError {
         topic: String,
         direction: &'static str,
     },
+    /// F4 B7: the organization has no hash key yet — no rule of it ever
+    /// hashed a field, so there is nothing to rotate.
+    #[error("organization '{org_id}' has no field hash key")]
+    FieldHashKeyNotFound { org_id: String },
+    /// F4 B7: the key is no longer the version the rotation named — another
+    /// administrator rotated it (or a peer's newer key arrived) since the
+    /// confirmation was shown.
+    #[error("the field hash key of organization '{org_id}' changed since it was read")]
+    FieldHashKeyChanged { org_id: String },
     /// SUM/tentabus/PLAN-F3.md §4: a record failed schema validation and no
     /// per-record disposition (`warn` accept, `dlq` quarantine) applied —
     /// reserved for a `SchemaError` variant `publish`'s validation loop does
@@ -1347,11 +1357,64 @@ struct ReadProjection {
     policy: field_policies::FieldPolicy,
     format: payload_format::PayloadFormat,
     dlq: bool,
+    /// The organization's key, resolved once when the policy hashes a field.
+    hash_key: Option<Arc<field_hash_key::FieldHashKey>>,
 }
 
 impl ReadProjection {
+    /// The reader's projection of `topic`, `None` when no rule restricts this
+    /// reader (one indexed point lookup). A DLQ topic is created without its
+    /// source's content type (`dlq_topic_options`), and its policy IS the
+    /// source's (`field_policies::resolve`): the payload is read in the
+    /// source's format, or an HL7 or XML record would be parsed as JSON and
+    /// come back empty. `content_type_of` names the content type of the topic
+    /// whose format applies. Its error text falls under the same rule
+    /// (`dlq::hide_error_message`).
+    #[allow(clippy::too_many_arguments)]
+    fn resolve(
+        db: &DbPool,
+        hash_keys: &field_hash_key::FieldHashKeys,
+        instance_id: &str,
+        org_id: &str,
+        actor_kind: crate::auth::actor::ActorKind,
+        actor: &str,
+        topic: &str,
+        content_type_of: impl FnOnce(&str) -> Result<String, BusServiceError>,
+    ) -> Result<Option<ReadProjection>, BusServiceError> {
+        let Some(policy) = field_policies::resolve(
+            db,
+            instance_id,
+            org_id,
+            topic,
+            field_policies::PolicySubject::Actor(actor_kind, actor),
+            field_policies::Direction::Read,
+        )?
+        else {
+            return Ok(None);
+        };
+        let dlq_source = topic.strip_prefix(dlq::DLQ_TOPIC_PREFIX);
+        let content_type = content_type_of(dlq_source.unwrap_or(topic))?;
+        let hash_key = policy.hash_key(hash_keys, org_id);
+        Ok(Some(ReadProjection {
+            policy,
+            format: payload_format::PayloadFormat::from_content_type(&content_type),
+            dlq: dlq_source.is_some(),
+            hash_key,
+        }))
+    }
+
     fn apply(&self, rec: &mut FetchedRecordMeta) {
-        rec.payload = field_policies::project_read(&self.policy, self.format, &rec.payload);
+        rec.payload = field_policies::project_read(
+            &self.policy,
+            self.format,
+            &rec.payload,
+            self.hash_key.as_deref(),
+        );
+        self.apply_headers(rec);
+    }
+
+    /// What the rule does to a record besides its payload.
+    fn apply_headers(&self, rec: &mut FetchedRecordMeta) {
         if self.dlq {
             dlq::hide_error_message(&mut rec.headers);
         }
@@ -2247,6 +2310,11 @@ pub struct BusInitConfig {
     /// installs a coordinator can pass that constant without it affecting
     /// anything it exercises.
     pub publish_ack_timeout: Duration,
+    /// Seals the organization's field hash key (`field_hash_key`): the node's
+    /// own settings cipher, the one the mesh uses, or `None` when the node
+    /// has none to give. Only used by a rule that hashes a field; without it
+    /// such a rule hides the hashed fields and nothing else changes.
+    pub settings_cipher: Option<Arc<crate::crypto::SettingsCipher>>,
 }
 
 /// PLAN-M2 §1e's own default for `BusInitConfig::publish_ack_timeout`.
@@ -2725,6 +2793,9 @@ pub struct BusService {
     /// Copied from `BusInitConfig::publish_ack_timeout` at `new()` — see
     /// that field's doc.
     publish_ack_timeout: Duration,
+    /// The organizations' keys of hashed fields, shared with every
+    /// `ConsumerHandle` this service opens.
+    field_hash_keys: Arc<field_hash_key::FieldHashKeys>,
     /// `lag_history::TrendState` per (org, group, topic): rebuilt from the
     /// persisted samples once when the sampler starts (so a restarted node
     /// reports its trend straight away), then advanced by each new sample —
@@ -3021,6 +3092,10 @@ impl BusService {
                 "bus init: failed to restore persisted org quotas; orgs fall back to defaults"
             ),
         }
+        let field_hash_keys = Arc::new(field_hash_key::FieldHashKeys::with_cipher(
+            cfg.db.clone(),
+            cfg.settings_cipher.clone(),
+        ));
         let svc = Self {
             instance_id: cfg.instance_id.to_string(),
             bus_dir: cfg.bus_dir,
@@ -3072,6 +3147,7 @@ impl BusService {
             partition_access_clock: AtomicU64::new(0),
             partition_handle_lru: cfg.partition_handle_lru,
             publish_ack_timeout: cfg.publish_ack_timeout,
+            field_hash_keys,
             lag_trends: DashMap::new(),
             lag_history_lock: parking_lot::Mutex::new(()),
             #[cfg(test)]
@@ -3228,6 +3304,13 @@ impl BusService {
     /// that first started this engine.
     pub fn db(&self) -> &DbPool {
         &self.db
+    }
+
+    /// The organizations' keys of hashed fields (`field_hash_key`): a read
+    /// through a rule that hashes needs one, and an administrator's preview,
+    /// key information and rotation act on it.
+    pub fn field_hash_keys(&self) -> &Arc<field_hash_key::FieldHashKeys> {
+        &self.field_hash_keys
     }
 
     /// This instance's on-disk log root (`<instance data dir>/log/` once a
@@ -7046,6 +7129,7 @@ impl BusService {
             purge_epoch: purge_epoch_before,
             replication: Arc::clone(&self.replication),
             consume_msgs_total: Arc::clone(&self.consume_msgs_total),
+            field_hash_keys: Arc::clone(&self.field_hash_keys),
         })
     }
 
@@ -7178,7 +7262,13 @@ impl BusService {
                         }
                         cursor = rec.offset + 1;
                         if let Some(projection) = &projection {
-                            projection.apply(&mut rec);
+                            // Nothing of the payload is kept at 0: the
+                            // projection (parsing, hashing) would be thrown away.
+                            if payload_keep == 0 {
+                                projection.apply_headers(&mut rec);
+                            } else {
+                                projection.apply(&mut rec);
+                            }
                         }
                         if rec.payload.len() > payload_keep {
                             rec.payload = Bytes::copy_from_slice(&rec.payload[..payload_keep]);
@@ -7257,43 +7347,30 @@ impl BusService {
         );
     }
 
-    /// The reader's field-policy READ projection of `topic`, `None` when no
-    /// rule restricts this reader (one indexed point lookup). A DLQ topic is
-    /// created without its source's content type (`dlq_topic_options`), and
-    /// its policy IS the source's (`field_policies::resolve`): the payload
-    /// is read in the source's format, or an HL7 or XML record would be
-    /// parsed as JSON and come back empty. Its error text falls under the
-    /// same rule (`dlq::hide_error_message`).
+    /// The reader's field-policy READ projection of `topic` (`ReadProjection::
+    /// resolve`), `None` when no rule restricts this reader.
     fn read_projection(
         &self,
         ctx: &BusCallContext,
         topic: &str,
         cfg: &topics::TopicConfig,
     ) -> Result<Option<ReadProjection>, BusServiceError> {
-        let Some(policy) = field_policies::resolve(
+        ReadProjection::resolve(
             &self.db,
+            &self.field_hash_keys,
             &self.instance_id,
             &ctx.org_id,
+            ctx.actor_kind,
+            ctx.actor.as_deref().unwrap_or(""),
             topic,
-            field_policies::PolicySubject::Actor(
-                ctx.actor_kind,
-                ctx.actor.as_deref().unwrap_or(""),
-            ),
-            field_policies::Direction::Read,
-        )?
-        else {
-            return Ok(None);
-        };
-        let dlq_source = topic.strip_prefix(dlq::DLQ_TOPIC_PREFIX);
-        let content_type = match dlq_source {
-            Some(source) => self.topic_config(&ctx.org_id, source)?.content_type,
-            None => cfg.content_type.clone(),
-        };
-        Ok(Some(ReadProjection {
-            policy,
-            format: payload_format::PayloadFormat::from_content_type(&content_type),
-            dlq: dlq_source.is_some(),
-        }))
+            |named| {
+                if named == topic {
+                    Ok(cfg.content_type.clone())
+                } else {
+                    Ok(self.topic_config(&ctx.org_id, named)?.content_type)
+                }
+            },
+        )
     }
 
     // ---- DLQ (PLAN §3.3) --------------------------------------------------
@@ -7472,21 +7549,32 @@ impl BusService {
         }
 
         self.ensure_dlq_topic(ctx, topic, &cfg)?;
-        let original = PublishRecord {
-            key: record.key.clone(),
-            // `PublishRecord::headers` keys are `String` (the public
-            // publish-side API); `FetchedRecordMeta::headers` keys are raw
-            // `Bytes` (fetch's hot path avoids the UTF-8 decode). This is
-            // the DLQ-send path, not a hot one, so paying the decode here
-            // is the right trade.
-            headers: record
-                .headers
-                .iter()
-                .map(|(k, v)| (String::from_utf8_lossy(k).into_owned(), v.clone()))
-                .collect(),
-            payload: record.payload.clone(),
-            timestamp_ms: record.timestamp_ms,
-            schema_id: record.schema_id,
+        // The DLQ keeps the record AS PUBLISHED. `record` is what a reader saw,
+        // which a field-policy rule may have narrowed, masked or hashed (the
+        // flow of the reactor reads through `ConsumerHandle::fetch`): written
+        // as the original it would make `dlq_retry` republish a degraded
+        // payload, and a DLQ read would mask or hash a value a second time.
+        // So the record is read again from the log by its coordinates, as
+        // `dlq_retry` does; only a record the log no longer holds (retention
+        // moved past it) is taken from the caller.
+        let original = match self.raw_record(&ctx.org_id, topic, partition, offset, &cfg)? {
+            Some(raw) => raw,
+            None => PublishRecord {
+                key: record.key.clone(),
+                // `PublishRecord::headers` keys are `String` (the public
+                // publish-side API); `FetchedRecordMeta::headers` keys are raw
+                // `Bytes` (fetch's hot path avoids the UTF-8 decode). This is
+                // the DLQ-send path, not a hot one, so paying the decode here
+                // is the right trade.
+                headers: record
+                    .headers
+                    .iter()
+                    .map(|(k, v)| (String::from_utf8_lossy(k).into_owned(), v.clone()))
+                    .collect(),
+                payload: record.payload.clone(),
+                timestamp_ms: record.timestamp_ms,
+                schema_id: record.schema_id,
+            },
         };
         let dlq_record = dlq::build_dlq_record(
             topic,
@@ -7548,6 +7636,52 @@ impl BusService {
                 committed_offset: committed,
             })
         }
+    }
+
+    /// The record of `topic`/`partition` at `offset` exactly as the log holds
+    /// it — no field-policy projection, no authorization: for the internal
+    /// callers that have authorized already (`note_delivery_failure`). `None`
+    /// when the log has no such record any more.
+    fn raw_record(
+        &self,
+        org_id: &str,
+        topic: &str,
+        partition: u32,
+        offset: u64,
+        cfg: &topics::TopicConfig,
+    ) -> Result<Option<PublishRecord>, BusServiceError> {
+        if partition >= cfg.partitions {
+            return Ok(None);
+        }
+        let part = self.partition_handle(org_id, topic, partition, cfg)?;
+        let reader = part.open_reader();
+        if offset < reader.earliest_offset() || offset >= reader.high_watermark() {
+            return Ok(None);
+        }
+        let batches = reader
+            .fetch_from_offset(offset, PEEK_MAX_BYTES)
+            .map_err(|e| map_engine_error(e, topic, partition))?;
+        let Some(view) = batches.first() else {
+            return Ok(None);
+        };
+        let Some(rv) = view.records_from(offset).next() else {
+            return Ok(None);
+        };
+        let rv = rv?;
+        if view.header().base_offset + rv.offset_delta as u64 != offset {
+            return Ok(None);
+        }
+        Ok(Some(PublishRecord {
+            key: rv.key.clone(),
+            headers: rv
+                .headers
+                .iter()
+                .map(|(k, v)| (String::from_utf8_lossy(k).into_owned(), v.clone()))
+                .collect(),
+            payload: rv.payload.clone(),
+            timestamp_ms: view.header().base_timestamp_ms + rv.ts_delta_ms as i64,
+            schema_id: rv.schema_id,
+        }))
     }
 
     /// Republishes a DLQ record to its source topic with `dlq.retry_of` set
@@ -8634,6 +8768,9 @@ pub struct ConsumerHandle {
     replication: Arc<parking_lot::RwLock<Option<Arc<dyn ReplicationCoordinator>>>>,
     /// Shared with `BusService::consume_msgs_total` — see that field's doc.
     consume_msgs_total: Arc<AtomicU64>,
+    /// Shared with `BusService::field_hash_keys`: `fetch` hashes with it when
+    /// a read rule hashes a field.
+    field_hash_keys: Arc<field_hash_key::FieldHashKeys>,
 }
 
 impl ConsumerHandle {
@@ -8922,55 +9059,41 @@ impl ConsumerHandle {
                     // M2 (PLAN §8.4): feeds `tentaflow_bus_consume_msgs_total`.
                     self.consume_msgs_total
                         .fetch_add(records.len() as u64, Ordering::Relaxed);
-                    // Field policy read projection (SUM/tentabus/POLITYKI-POL.md,
-                    // "hide only"), keyed per-record by ITS OWN topic — a
-                    // single consumer can subscribe to more than one topic.
-                    // Resolved once per distinct topic in this batch, not
-                    // once per record, since a batch can hold many records
-                    // from the same partition. The topic's `content_type`
-                    // (-> payload_format::PayloadFormat) is only looked up
-                    // when a policy actually exists — the common no-policy
-                    // case pays for the policy lookup alone.
-                    let mut policy_cache: std::collections::HashMap<
-                        String,
-                        Option<(field_policies::FieldPolicy, payload_format::PayloadFormat)>,
-                    > = std::collections::HashMap::new();
+                    // Field policy read projection (SUM/tentabus/POLITYKI-POL.md),
+                    // keyed per-record by ITS OWN topic — a single consumer can
+                    // subscribe to more than one topic. Resolved once per
+                    // distinct topic in this batch, not once per record, since a
+                    // batch can hold many records from the same partition. The
+                    // topic's `content_type` is only looked up when a policy
+                    // actually exists — the common no-policy case pays for the
+                    // policy lookup alone.
+                    let mut projections: std::collections::HashMap<String, Option<ReadProjection>> =
+                        std::collections::HashMap::new();
                     for rec in &mut records {
-                        if !policy_cache.contains_key(&rec.topic) {
-                            let resolved = field_policies::resolve(
+                        if !projections.contains_key(&rec.topic) {
+                            let resolved = ReadProjection::resolve(
                                 &self.db,
+                                &self.field_hash_keys,
                                 &self.instance_id,
                                 &self.org_id,
+                                self.ctx.actor_kind,
+                                self.ctx.actor.as_deref().unwrap_or(""),
                                 &rec.topic,
-                                field_policies::PolicySubject::Actor(
-                                    self.ctx.actor_kind,
-                                    self.ctx.actor.as_deref().unwrap_or(""),
-                                ),
-                                field_policies::Direction::Read,
-                            )?;
-                            let resolved = match resolved {
-                                Some(policy) => {
-                                    let format = topics::get_topic(
+                                |named| {
+                                    Ok(topics::get_topic(
                                         &self.db,
                                         &self.instance_id,
                                         &self.org_id,
-                                        &rec.topic,
+                                        named,
                                     )?
-                                    .map(|cfg| {
-                                        payload_format::PayloadFormat::from_content_type(
-                                            &cfg.content_type,
-                                        )
-                                    })
-                                    .unwrap_or(payload_format::PayloadFormat::Json);
-                                    Some((policy, format))
-                                }
-                                None => None,
-                            };
-                            policy_cache.insert(rec.topic.clone(), resolved);
+                                    .map(|cfg| cfg.content_type)
+                                    .unwrap_or_default())
+                                },
+                            )?;
+                            projections.insert(rec.topic.clone(), resolved);
                         }
-                        if let Some((policy, format)) = policy_cache.get(&rec.topic).unwrap() {
-                            rec.payload =
-                                field_policies::project_read(policy, *format, &rec.payload);
+                        if let Some(projection) = projections.get(&rec.topic).unwrap() {
+                            projection.apply(rec);
                         }
                     }
                 }
@@ -9679,6 +9802,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("bus service");
         (dir, svc)
@@ -10333,6 +10457,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("bus service");
 
@@ -10397,6 +10522,7 @@ mod tests {
                 dedup_expected_rate_per_sec: 10_000,
                 partition_handle_lru: None,
                 publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
             })
             .expect("bus service")
         };
@@ -10676,6 +10802,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("bus service");
 
@@ -10739,6 +10866,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .unwrap();
         let ctx = test_ctx("org-1");
@@ -10811,6 +10939,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .unwrap();
         let ctx = test_ctx("org-1");
@@ -11078,6 +11207,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .unwrap();
         let ctx = test_ctx("org-1");
@@ -11212,6 +11342,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .unwrap();
         let ctx = test_ctx("org-1");
@@ -11326,6 +11457,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .unwrap();
         let ctx = test_ctx("org-1");
@@ -12152,9 +12284,11 @@ mod tests {
         assert_eq!(lens, vec![8, 5]);
     }
 
-    /// A topic with `validation = dlq` whose one record (`{"id":"a"}` on
-    /// partition 0) a consumer gave up on with `failed_payload`, which the
-    /// topic's schema rejects: a retry republishes the invalid payload.
+    /// A topic with `validation = dlq` whose one record (`failed_payload`, on
+    /// partition 0) a consumer gave up on. The topic's schema rejects it — it
+    /// was bound after the record was published — so a retry republishes an
+    /// invalid payload. The DLQ keeps the record as the log holds it, so the
+    /// invalid payload is what is published, not only what the consumer says.
     fn topic_with_an_invalid_failure(
         svc: &BusService,
         ctx: &BusCallContext,
@@ -12169,8 +12303,6 @@ mod tests {
             topics::TopicOptions {
                 partitions: Some(partitions),
                 max_delivery_attempts: Some(1),
-                schema_id: Some("wynik".to_string()),
-                validation: Some(topics::ValidationMode::Dlq),
                 ..Default::default()
             },
         )
@@ -12181,7 +12313,17 @@ mod tests {
             PublishBatch {
                 partition: Some(0),
                 producer: None,
-                records: vec![record(r#"{"id":"a"}"#)],
+                records: vec![record(failed_payload)],
+            },
+        )
+        .unwrap();
+        svc.update_topic(
+            ctx,
+            topic,
+            topics::TopicOptions {
+                schema_id: Some("wynik".to_string()),
+                validation: Some(topics::ValidationMode::Dlq),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -12379,6 +12521,8 @@ mod tests {
             field_policies::Direction::Read,
             &set_field_set(&["MSH-9", "PID-3"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -12480,6 +12624,7 @@ mod tests {
                 dedup_expected_rate_per_sec: 10_000,
                 partition_handle_lru: None,
                 publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
             })
             .expect("bus service (first open)");
             svc.create_topic(
@@ -12544,6 +12689,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("bus service (reopen)");
         assert!(
@@ -12609,6 +12755,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("bus service");
 
@@ -13146,6 +13293,7 @@ mod tests {
                 dedup_expected_rate_per_sec: rate,
                 partition_handle_lru: None,
                 publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
             })
             .expect("bus service")
         };
@@ -13651,6 +13799,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .unwrap();
         let ctx = test_ctx("org-1");
@@ -13690,6 +13839,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .unwrap();
         svc.audit_windows
@@ -13749,6 +13899,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .unwrap();
         let ctx = test_ctx("org-audit-1");
@@ -13795,6 +13946,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .unwrap();
         let ctx = test_ctx("org-1");
@@ -13863,6 +14015,7 @@ mod tests {
                 dedup_expected_rate_per_sec: 10_000,
                 partition_handle_lru: None,
                 publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
             })
             .unwrap();
             let ctx = test_ctx("org-1");
@@ -15222,6 +15375,8 @@ mod tests {
             field_policies::Direction::Read,
             &set_field_set(&["id"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -15235,6 +15390,8 @@ mod tests {
             field_policies::Direction::Read,
             &set_field_set(&["id"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -15901,6 +16058,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .unwrap();
         let ctx = test_ctx("org-1");
@@ -16839,6 +16997,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("bus service");
 
@@ -16903,6 +17062,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("bus service");
         let coord = FakeCoordinator::leader(1);
@@ -16968,6 +17128,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("bus service");
         let coord = FakeCoordinator::leader(1);
@@ -17115,6 +17276,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("bus service");
 
@@ -17749,6 +17911,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: Some(1),
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("bus service");
         let ctx = test_ctx("org-1");
@@ -17825,6 +17988,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: Some(1),
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("bus service");
         let ctx = test_ctx("org-1");
@@ -17907,6 +18071,8 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["patient_id", "status"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -17961,6 +18127,8 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["patient_id", "status"]),
             &set_field_set(&["status"]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -17995,6 +18163,8 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["patient_id", "status"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -18039,6 +18209,8 @@ mod tests {
             field_policies::Direction::Read,
             &set_field_set(&["patient_id"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -18092,6 +18264,8 @@ mod tests {
             field_policies::Direction::Read,
             &set_field_set(&["patient_id"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -18141,6 +18315,8 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["patient_id"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -18155,6 +18331,8 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["patient_id", "status"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -18191,6 +18369,8 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["patient_id"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -18237,6 +18417,8 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["patient_id"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap_err();
@@ -18275,6 +18457,8 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["id", "status"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -18325,6 +18509,8 @@ mod tests {
             field_policies::Direction::Read,
             &set_field_set(&["id", "name"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -18353,6 +18539,8 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["1st-element"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap_err();
@@ -18384,6 +18572,8 @@ mod tests {
                 "MSH-12", "PID-1", "PID-2", "PID-3", "PID-4", "PID-6", "PID-7", "PID-8",
             ]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -18432,6 +18622,8 @@ mod tests {
             field_policies::Direction::Read,
             &set_field_set(&["MSH-9", "PID-3"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -18463,6 +18655,8 @@ mod tests {
                 field_policies::Direction::Read,
                 &set_field_set(&[bad]),
                 &set_field_set(&[]),
+                &std::collections::BTreeSet::new(),
+                &std::collections::BTreeSet::new(),
                 field_policies::BusFieldPolicyExpect::Any,
             )
             .unwrap_err();
@@ -18471,6 +18665,501 @@ mod tests {
                 "{bad}: {err:?}"
             );
         }
+    }
+
+    // ---- TentaBus F4 B7: mask and hash through every read path -----------
+
+    /// Writes a read rule the way the dashboard handler does: the first rule
+    /// that hashes also makes the organization's key (a read never does).
+    fn set_read_rule(
+        svc: &BusService,
+        org: &str,
+        topic: &str,
+        fields: &[&str],
+        masked: &[&str],
+        hashed: &[&str],
+    ) {
+        set_read_rule_without_key(svc, org, topic, fields, masked, hashed);
+        if !hashed.is_empty() {
+            svc.field_hash_keys().get_or_create(org).unwrap();
+        }
+    }
+
+    /// A rule as a peer's ledger operation lands it: no key comes with it.
+    fn set_read_rule_without_key(
+        svc: &BusService,
+        org: &str,
+        topic: &str,
+        fields: &[&str],
+        masked: &[&str],
+        hashed: &[&str],
+    ) {
+        field_policies::set_policy(
+            &svc.db,
+            svc.instance_id(),
+            org,
+            topic,
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read,
+            &set_field_set(fields),
+            &set_field_set(&[]),
+            &set_field_set(masked),
+            &set_field_set(hashed),
+            field_policies::BusFieldPolicyExpect::Any,
+        )
+        .unwrap();
+    }
+
+    fn publish_one(svc: &BusService, ctx: &BusCallContext, topic: &str, payload: &str) {
+        svc.publish(
+            ctx,
+            topic,
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![record(payload)],
+            },
+        )
+        .unwrap();
+    }
+
+    fn peek_text(svc: &BusService, ctx: &BusCallContext, topic: &str) -> String {
+        let result = svc.peek(ctx, topic, 0, 0, 10, 4096).unwrap();
+        assert_eq!(result.records.len(), 1);
+        String::from_utf8(result.records[0].payload.to_vec()).unwrap()
+    }
+
+    fn org_hash(svc: &BusService, org: &str, value: &str) -> String {
+        svc.field_hash_keys()
+            .get_or_create(org)
+            .unwrap()
+            .hash_hex(value.as_bytes())
+    }
+
+    const CARD_PAYLOAD: &str =
+        r#"{"id":"7","ssn":"123-45-6789","card":"4111111111111111","name":"Jan"}"#;
+
+    #[test]
+    fn peek_and_fetch_show_the_four_kinds_of_json_field() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        create_typed_topic(&svc, &ctx, "patients.json", "application/json");
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "g1",
+                &["patients.json".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        publish_one(&svc, &ctx, "patients.json", CARD_PAYLOAD);
+        set_read_rule(
+            &svc,
+            "org-1",
+            "patients.json",
+            &["id", "card", "name"],
+            &["card"],
+            &["name"],
+        );
+        let expected = serde_json::json!({
+            "id": "7",
+            "card": "*************111",
+            "name": org_hash(&svc, "org-1", "Jan"),
+        });
+
+        let peeked: serde_json::Value =
+            serde_json::from_str(&peek_text(&svc, &ctx, "patients.json")).unwrap();
+        assert_eq!(peeked, expected);
+
+        let batch = handle.fetch(4096, 50).unwrap();
+        let fetched: serde_json::Value =
+            serde_json::from_slice(&batch.records[0].payload).unwrap();
+        assert_eq!(fetched, expected);
+    }
+
+    #[test]
+    fn peek_shows_the_four_kinds_of_xml_field() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        create_typed_topic(&svc, &ctx, "patients.xml", "application/xml");
+        publish_one(
+            &svc,
+            &ctx,
+            "patients.xml",
+            "<P><id>7</id><ssn>123</ssn><card>4111111111111111</card><name>Jan</name></P>",
+        );
+        set_read_rule(
+            &svc,
+            "org-1",
+            "patients.xml",
+            &["id", "card", "name"],
+            &["card"],
+            &["name"],
+        );
+        assert_eq!(
+            peek_text(&svc, &ctx, "patients.xml"),
+            format!(
+                "<P><id>7</id><card>*************111</card><name>{}</name></P>",
+                org_hash(&svc, "org-1", "Jan")
+            )
+        );
+    }
+
+    #[test]
+    fn peek_shows_the_four_kinds_of_hl7_field() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        create_typed_topic(&svc, &ctx, "adt.hl7", "application/hl7-v2");
+        publish_one(&svc, &ctx, "adt.hl7", HL7_SAMPLE);
+        set_read_rule(
+            &svc,
+            "org-1",
+            "adt.hl7",
+            &["MSH-9", "PID-3", "PID-5"],
+            &["PID-5"],
+            &["PID-3"],
+        );
+        assert_eq!(
+            peek_text(&svc, &ctx, "adt.hl7"),
+            format!(
+                "MSH|^~\\&|||||||ADT^A01|||\rPID|||{}||****Jan|||\r",
+                org_hash(&svc, "org-1", "MRN123")
+            )
+        );
+    }
+
+    #[test]
+    fn a_hash_is_the_same_in_every_instance_of_an_organization_and_differs_between_organizations() {
+        let (_tmp, svc) = test_service();
+        let (ctx1, ctx2) = (test_ctx("org-1"), test_ctx("org-2"));
+        for (ctx, org) in [(&ctx1, "org-1"), (&ctx2, "org-2")] {
+            create_typed_topic(&svc, ctx, "p.json", "application/json");
+            publish_one(&svc, ctx, "p.json", r#"{"name":"Jan"}"#);
+            set_read_rule(&svc, org, "p.json", &["name"], &[], &["name"]);
+        }
+        let hash = |ctx: &BusCallContext| {
+            let v: serde_json::Value =
+                serde_json::from_str(&peek_text(&svc, ctx, "p.json")).unwrap();
+            v["name"].as_str().unwrap().to_string()
+        };
+        assert_ne!(hash(&ctx1), hash(&ctx2));
+        assert_eq!(hash(&ctx1), hash(&ctx1));
+        // A second service over the same database — another instance of the
+        // organization on this node — hashes the same value the same way.
+        let dir = tempfile::tempdir().unwrap();
+        let other = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
+            bus_dir: dir.path().join("bus"),
+            db: svc.db.clone(),
+            authorizer: Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
+        })
+        .unwrap();
+        assert_eq!(org_hash(&other, "org-1", "Jan"), hash(&ctx1));
+    }
+
+    #[test]
+    fn a_rotation_changes_the_hash_a_read_returns() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        create_typed_topic(&svc, &ctx, "p.json", "application/json");
+        publish_one(&svc, &ctx, "p.json", r#"{"name":"Jan"}"#);
+        set_read_rule(&svc, "org-1", "p.json", &["name"], &[], &["name"]);
+        let before = peek_text(&svc, &ctx, "p.json");
+        svc.field_hash_keys().rotate("org-1", 1).unwrap();
+        let after = peek_text(&svc, &ctx, "p.json");
+        assert_ne!(before, after);
+        assert_eq!(after, peek_text(&svc, &ctx, "p.json"));
+    }
+
+    #[test]
+    fn a_key_is_made_by_the_rule_that_hashes_and_a_mask_needs_none() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        create_typed_topic(&svc, &ctx, "p.json", "application/json");
+        publish_one(&svc, &ctx, "p.json", r#"{"name":"Jan Kowalski"}"#);
+        set_read_rule(&svc, "org-1", "p.json", &["name"], &["name"], &[]);
+        assert_eq!(peek_text(&svc, &ctx, "p.json"), r#"{"name":"*********ski"}"#);
+        assert!(svc.field_hash_keys().info("org-1").unwrap().is_none());
+
+        set_read_rule(&svc, "org-1", "p.json", &["name"], &[], &["name"]);
+        peek_text(&svc, &ctx, "p.json");
+        assert_eq!(
+            svc.field_hash_keys().info("org-1").unwrap().unwrap().key_version,
+            1
+        );
+    }
+
+    /// F4 B7 review R1 P2-1: a node that meets a hashing rule before the
+    /// organization's key has reached it (it has just joined, or was cut off)
+    /// must not make a key of its own — it would hash differently from the
+    /// rest of the organization for good. It hides the hashed field, shows the
+    /// rest, and picks the key up when the mesh brings it.
+    #[test]
+    fn a_read_never_makes_the_key_and_hides_the_hashed_field_until_it_arrives() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        create_typed_topic(&svc, &ctx, "p.json", "application/json");
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "g1",
+                &["p.json".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        publish_one(&svc, &ctx, "p.json", r#"{"id":"7","name":"Jan","card":"4111111111111111"}"#);
+        set_read_rule_without_key(&svc, "org-1", "p.json", &["id", "name", "card"], &["card"], &["name"]);
+
+        let hidden = serde_json::json!({"id": "7", "card": "*************111"});
+        let peeked: serde_json::Value =
+            serde_json::from_str(&peek_text(&svc, &ctx, "p.json")).unwrap();
+        assert_eq!(peeked, hidden);
+        let batch = handle.fetch(4096, 50).unwrap();
+        let fetched: serde_json::Value =
+            serde_json::from_slice(&batch.records[0].payload).unwrap();
+        assert_eq!(fetched, hidden);
+        let runs = svc.peek_runs(&ctx, "p.json", 0, &[0..1], 4096).unwrap();
+        let listed: serde_json::Value = serde_json::from_slice(&runs.records[0].payload).unwrap();
+        assert_eq!(listed, hidden);
+        assert!(
+            svc.field_hash_keys().info("org-1").unwrap().is_none(),
+            "no read made a key"
+        );
+
+        // The key of the fleet arrives (the mesh adopts it): the very next
+        // read hashes with it.
+        let fleet = field_hash_key::FieldHashKeyVersion {
+            org_id: "org-1".to_string(),
+            key_version: 1,
+            created_at_ms: 1_000,
+            rotated_at_ms: 1_000,
+            key_hex: zeroize::Zeroizing::new("5a".repeat(32)),
+        };
+        assert!(svc.field_hash_keys().adopt(&fleet).unwrap());
+        let expected = org_hash(&svc, "org-1", "Jan");
+        assert_eq!(
+            expected,
+            blake3::keyed_hash(&[0x5a; 32], b"Jan").to_hex().to_string(),
+            "the adopted key, not one made here"
+        );
+        let peeked: serde_json::Value =
+            serde_json::from_str(&peek_text(&svc, &ctx, "p.json")).unwrap();
+        assert_eq!(peeked["name"], expected);
+    }
+
+    /// F4 B7 review R1 P2-4: a bus whose node gave it no settings cipher still
+    /// starts and serves; only the rules that hash a field are affected, and
+    /// they hide it (fail closed).
+    #[test]
+    fn a_bus_without_a_cipher_serves_and_hides_what_it_would_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
+            bus_dir: dir.path().join("bus"),
+            db: crate::db::init(std::path::Path::new(":memory:")).unwrap(),
+            authorizer: Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: None,
+        })
+        .expect("the bus starts without a cipher");
+        let ctx = test_ctx("org-1");
+        create_typed_topic(&bare, &ctx, "p.json", "application/json");
+        publish_one(&bare, &ctx, "p.json", r#"{"id":"7","name":"Jan","card":"4111111111111111"}"#);
+        set_read_rule_without_key(&bare, "org-1", "p.json", &["id", "name", "card"], &["card"], &["name"]);
+        // A key made by a node that has a cipher is in the table, and this bus
+        // cannot open it: the hashed field is not shown, nothing fails.
+        field_hash_key::FieldHashKeys::new(
+            bare.db.clone(),
+            Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32])),
+        )
+        .get_or_create("org-1")
+        .unwrap();
+        let seen: serde_json::Value = serde_json::from_str(&peek_text(&bare, &ctx, "p.json")).unwrap();
+        assert_eq!(seen, serde_json::json!({"id": "7", "card": "*************111"}));
+        // Nothing can be made without a cipher either.
+        assert!(bare.field_hash_keys().get_or_create("org-9").is_err());
+        assert!(bare.field_hash_keys().for_read("org-1").is_none());
+    }
+
+    /// F4 B7 review R1 P2-2: the DLQ keeps the record as it was published.
+    /// A caller (the reactor's flow) passes what it READ — masked and hashed
+    /// by the reader's rule — and that must not become the "original".
+    #[test]
+    fn a_dlq_entry_is_the_published_record_not_what_the_reader_saw() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "cards.json",
+            topics::TopicOptions {
+                partitions: Some(1),
+                max_delivery_attempts: Some(1),
+                content_type: Some("application/json".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let raw = r#"{"id":"7","card":"4111111111111111","name":"Jan"}"#;
+        publish_one(&svc, &ctx, "cards.json", raw);
+        set_read_rule(&svc, "org-1", "cards.json", &["id", "card", "name"], &["card"], &["name"]);
+
+        let seen = svc.peek(&ctx, "cards.json", 0, 0, 1, 4096).unwrap().records.remove(0);
+        assert_ne!(seen.payload.as_ref(), raw.as_bytes(), "the reader's view is narrowed");
+        assert!(matches!(
+            svc.note_delivery_failure(
+                &ctx,
+                "g",
+                "cards.json",
+                0,
+                0,
+                &seen,
+                dlq::DlqReason::ConsumerError,
+                "boom",
+            )
+            .unwrap(),
+            dlq::DlqOutcome::SentToDlq { .. }
+        ));
+
+        // With no rule in the way the DLQ holds the published bytes.
+        field_policies::delete_policy(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "cards.json",
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read,
+            None,
+        )
+        .unwrap();
+        assert_eq!(peek_text(&svc, &ctx, "__dlq.cards.json"), raw);
+    }
+
+    /// F4 B7 review R1 P3-12: "retry all" reads coordinates and headers only,
+    /// so no payload is projected (no parsing, no hashing) while the DLQ error
+    /// text is still hidden from a restricted reader.
+    #[test]
+    fn peek_runs_that_keeps_no_payload_projects_none_but_still_hides_the_error_text() {
+        let (_tmp, svc, ctx, _expected) = xml_dlq_fixture();
+        let read = svc.peek_runs(&ctx, "__dlq.labs.xml", 0, &[0..1], 0).unwrap();
+        assert_eq!(read.records.len(), 1);
+        assert!(read.records[0].payload.is_empty());
+        let header = |name: &str| {
+            read.records[0]
+                .headers
+                .iter()
+                .find(|(k, _)| k.as_ref() == name.as_bytes())
+                .map(|(_, v)| v.clone())
+        };
+        assert!(header("dlq.source_offset").is_some(), "coordinates stay");
+        assert_eq!(
+            header("dlq.error_message").as_deref(),
+            Some(b"".as_ref()),
+            "the error text is hidden from a restricted reader"
+        );
+        // The same call that keeps the payload still returns it projected.
+        let kept = svc.peek_runs(&ctx, "__dlq.labs.xml", 0, &[0..1], 4096).unwrap();
+        assert!(!kept.records[0].payload.is_empty());
+    }
+
+    fn xml_dlq_fixture() -> (tempfile::TempDir, BusService, BusCallContext, String) {
+        let (tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(
+            &ctx,
+            "labs.xml",
+            topics::TopicOptions {
+                partitions: Some(1),
+                max_delivery_attempts: Some(1),
+                retry_backoff_ms: Some(100),
+                content_type: Some("application/xml".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let payload = "<L><id>7</id><ssn>123</ssn><card>4111111111111111</card><name>Jan</name></L>";
+        publish_one(&svc, &ctx, "labs.xml", payload);
+        set_read_rule(
+            &svc,
+            "org-1",
+            "labs.xml",
+            &["id", "card", "name"],
+            &["card"],
+            &["name"],
+        );
+        let failed = FetchedRecordMeta {
+            topic: "labs.xml".to_string(),
+            partition: 0,
+            offset: 0,
+            timestamp_ms: now_ms(),
+            key: None,
+            headers: vec![],
+            payload: Bytes::from(payload.to_string()),
+            schema_id: 0,
+        };
+        match svc
+            .note_delivery_failure(
+                &ctx,
+                "g",
+                "labs.xml",
+                0,
+                0,
+                &failed,
+                dlq::DlqReason::ConsumerError,
+                "boom",
+            )
+            .unwrap()
+        {
+            dlq::DlqOutcome::SentToDlq { .. } => {}
+            other => panic!("expected the record in the DLQ, got {other:?}"),
+        }
+        let expected = format!(
+            "<L><id>7</id><card>*************111</card><name>{}</name></L>",
+            org_hash(&svc, "org-1", "Jan")
+        );
+        (tmp, svc, ctx, expected)
+    }
+
+    #[test]
+    fn a_dlq_record_is_masked_and_hashed_like_the_source_topic_on_peek() {
+        let (_tmp, svc, ctx, expected) = xml_dlq_fixture();
+        assert_eq!(peek_text(&svc, &ctx, "__dlq.labs.xml"), expected);
+    }
+
+    #[test]
+    fn a_dlq_record_is_masked_and_hashed_like_the_source_topic_on_fetch() {
+        let (_tmp, svc, ctx, expected) = xml_dlq_fixture();
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "dlq-reader",
+                &["__dlq.labs.xml".to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let batch = handle.fetch(4096, 20).unwrap();
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(
+            String::from_utf8(batch.records[0].payload.to_vec()).unwrap(),
+            expected
+        );
     }
 
     // ---- SUM/tentabus/PLAN-F3.md: schema registry enforcement ------------
@@ -18830,6 +19519,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("bus service");
         (tmp, svc, checker)
@@ -20869,6 +21559,8 @@ mod tests {
                 field_policies::Direction::Read,
                 &set_field_set(&fields),
                 &set_field_set(&[]),
+                &std::collections::BTreeSet::new(),
+                &std::collections::BTreeSet::new(),
                 field_policies::BusFieldPolicyExpect::Any,
             )
             .unwrap();
@@ -21048,6 +21740,8 @@ mod tests {
             field_policies::Direction::Read,
             &set_field_set(&["a", "b"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -21102,6 +21796,8 @@ mod tests {
             field_policies::Direction::Write,
             &set_field_set(&["id"]),
             &set_field_set(&[]),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )
         .unwrap();
@@ -21154,6 +21850,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         }
     }
 
@@ -21307,6 +22004,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         });
         // `BusService` does not implement `Debug` (it owns a live fjall
         // handle, background timers, ...), so `Result::expect_err` (which
@@ -21362,6 +22060,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("bus service A");
 
@@ -21380,6 +22079,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("bus service B");
 
@@ -21945,6 +22645,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         };
         let no_dlq = BusService::new(config(
             Arc::new(DenyConsumePrefixAuthorizer { prefix: "__dlq." }),
@@ -22083,6 +22784,7 @@ mod tests {
                 dedup_expected_rate_per_sec: 10_000,
                 partition_handle_lru: None,
                 publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
             })
             .unwrap(),
         );
@@ -22185,6 +22887,8 @@ mod tests {
                 required_fields_json: None,
                 created_at_ms: 1,
                 updated_at_ms: 1,
+                masked_fields_json: None,
+                hashed_fields_json: None,
             },
             crate::db::repository::BusFieldPolicyExpect::Any,
         )

@@ -329,6 +329,9 @@ fn start_engine(db: &DbPool, instance_id: &BusInstanceId) -> (Arc<BusService>, D
         dedup_expected_rate_per_sec: 10_000,
         partition_handle_lru: None,
         publish_ack_timeout: bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+        settings_cipher: Some(std::sync::Arc::new(tentaflow_core::crypto::SettingsCipher::new(
+            &[7u8; 32],
+        ))),
     })
     .expect("bus::init_instance");
     (svc, local_db)

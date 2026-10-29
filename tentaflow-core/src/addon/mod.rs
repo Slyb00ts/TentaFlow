@@ -1084,6 +1084,8 @@ impl AddonManager {
         // own doc explains why this must be a `Weak`-backed cell overwritten on
         // every call, not a `OnceLock::set`.
         permissions::set_global_permission_checker(&permission_checker);
+        // The node's cipher for the same hooks (`native_apps::global_settings_cipher`).
+        native_apps::set_global_settings_cipher(&settings_cipher);
 
         // A2: spawn the write-behind state flusher once. It drains the shared
         // `AddonStateStore` Durable tier into the `addon_state` SQLite table on

@@ -118,6 +118,8 @@ export function openChangeWindow({
     if (!discardEl.hidden || !dirty()) return;
     e.preventDefault();
     discardEl.hidden = false;
+    // A long form keeps the question below the fold, and the button looks dead: bring it into view like a refusal.
+    discardEl.scrollIntoView?.({ block: 'nearest' });
   });
   win.addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-act]');

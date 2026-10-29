@@ -926,6 +926,7 @@ mod tests {
             dedup_expected_rate_per_sec: 1_000,
             partition_handle_lru: None,
             publish_ack_timeout: std::time::Duration::from_secs(5),
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("start test bus instance");
         let _guard = TestBusInstanceGuard(instance_id.clone());

@@ -43,6 +43,34 @@ impl std::fmt::Display for FormatError {
     }
 }
 
+/// How a read rule alters a visible field's value instead of hiding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceAction {
+    Mask,
+    Hash,
+}
+
+/// Whether a value's text length carries meaning. A JSON boolean or a nested
+/// object/array is `Opaque`: a length-preserving mask would tell `true` from
+/// `false` (or size a hidden structure), so a mask of it is constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueShape {
+    Text,
+    Opaque,
+}
+
+/// Decides which visible fields a projection replaces and with what.
+/// Implemented by `field_policies` (mask rule, keyed hash); a codec only asks.
+pub trait FieldReplacer {
+    /// The action for the field at `field`, `None` when it stays as it is.
+    fn action(&self, field: &str) -> Option<ReplaceAction>;
+
+    /// The replacement for one value, given as its text. An empty value is
+    /// never passed: it carries nothing to hide and stays empty. The result
+    /// is plain text; the codec makes it safe for its own syntax.
+    fn replace(&self, action: ReplaceAction, text: &str, shape: ValueShape) -> String;
+}
+
 /// Implemented once per wire format `bus_field_policies` can enforce
 /// against. See this module's header for why there is no shared
 /// intermediate representation between implementations.
@@ -53,8 +81,16 @@ pub trait PayloadFieldFormat: Send + Sync {
     fn list_fields(&self, payload: &[u8]) -> Result<BTreeSet<String>, FormatError>;
 
     /// Re-emits `payload` in the SAME wire format, containing only the
-    /// fields in `allowed` (read-path projection).
-    fn project(&self, payload: &[u8], allowed: &BTreeSet<String>) -> Result<Bytes, FormatError>;
+    /// fields in `visible` (read-path projection). A visible field the
+    /// `replacer` names keeps its place and address but carries the
+    /// replacement value instead of its own; the codec never learns how a
+    /// replacement is computed (a hash key stays out of this layer).
+    fn project(
+        &self,
+        payload: &[u8],
+        visible: &BTreeSet<String>,
+        replacer: Option<&dyn FieldReplacer>,
+    ) -> Result<Bytes, FormatError>;
 
     /// Fail-closed replacement payload for a read that cannot be projected
     /// at all (malformed payload, or a shape this format's `list_fields`/
@@ -132,6 +168,51 @@ impl PayloadFormat {
             PayloadFormat::Xml => &xml::XML_FORMAT,
             PayloadFormat::Hl7V2 => &hl7v2::HL7V2_FORMAT,
         }
+    }
+}
+
+/// A replacer for the codec tests: names its masked and hashed fields and
+/// turns a value into text with `output`, so a codec is tested without a key.
+#[cfg(test)]
+pub(crate) struct TestReplacer<'a> {
+    pub masked: &'a [&'a str],
+    pub hashed: &'a [&'a str],
+    pub output: &'a dyn Fn(ReplaceAction, &str, ValueShape) -> String,
+}
+
+#[cfg(test)]
+impl TestReplacer<'_> {
+    /// `M[value]` for a mask, `H[value]` for a hash, `M[*]` for an opaque mask.
+    pub(crate) fn tagging(
+        masked: &'static [&'static str],
+        hashed: &'static [&'static str],
+    ) -> TestReplacer<'static> {
+        TestReplacer {
+            masked,
+            hashed,
+            output: &|action, text, shape| match (action, shape) {
+                (ReplaceAction::Mask, ValueShape::Opaque) => "M[*]".to_string(),
+                (ReplaceAction::Mask, ValueShape::Text) => format!("M[{text}]"),
+                (ReplaceAction::Hash, _) => format!("H[{text}]"),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+impl FieldReplacer for TestReplacer<'_> {
+    fn action(&self, field: &str) -> Option<ReplaceAction> {
+        if self.hashed.contains(&field) {
+            Some(ReplaceAction::Hash)
+        } else if self.masked.contains(&field) {
+            Some(ReplaceAction::Mask)
+        } else {
+            None
+        }
+    }
+
+    fn replace(&self, action: ReplaceAction, text: &str, shape: ValueShape) -> String {
+        (self.output)(action, text, shape)
     }
 }
 

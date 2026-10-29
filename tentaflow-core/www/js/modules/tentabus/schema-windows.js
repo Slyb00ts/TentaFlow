@@ -952,7 +952,7 @@ const TEXT_ERRORS = { empty: 'schemas.text_empty', too_big: 'schemas.text_too_bi
  * the rule names but the new version lacks is a field the new version's
  * readers lose or, when the new version spells it differently, a new field the
  * rule does not name and therefore hides. `rules` = `[{ topic, subjectType,
- * subjectId, direction, fields, requiredFields }]`. Returns `null` when there is
+ * subjectId, direction, fields, requiredFields, maskedFields, hashedFields }]`. Returns `null` when there is
  * nothing to say (another format, no rules, a text that lists no fields);
  * else `{ gone: [{ name, topics }], renames: [{ from, to }] }` where `renames`
  * are the gone names whose only difference from a field of the new version is
@@ -990,15 +990,20 @@ export function ruleFieldIssues({ rules, newText, oldText = '', schemaType }) {
   };
 }
 
-/** `FieldPolicySetRequest` of `rule` with the renamed fields swapped in, or `null` when the rule names none of them. */
+/**
+ * `FieldPolicySetRequest` of `rule` with the renamed fields swapped in, or `null` when the rule names none of them.
+ * A masked or hashed field keeps its action under the new name: a request without them would show the field as it is.
+ */
 export function renamedRuleRequest(instanceId, rule, renames) {
   const map = new Map(renames.map((x) => [x.from, x.to]));
   const swap = (list) => [...new Set((list || []).map((n) => map.get(n) ?? n))].sort();
   const fields = swap(rule.fields);
   const requiredFields = swap(rule.requiredFields);
+  const maskedFields = swap(rule.maskedFields);
+  const hashedFields = swap(rule.hashedFields);
   const touched = (rule.fields || []).some((n) => map.has(n)) || (rule.requiredFields || []).some((n) => map.has(n));
   return touched
-    ? { instanceId, topic: rule.topic, subjectType: rule.subjectType, subjectId: rule.subjectId, direction: rule.direction, fields, requiredFields }
+    ? { instanceId, topic: rule.topic, subjectType: rule.subjectType, subjectId: rule.subjectId, direction: rule.direction, fields, requiredFields, maskedFields, hashedFields }
     : null;
 }
 

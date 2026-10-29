@@ -19,7 +19,13 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 
 const artifact = new URL('./wasm_glue_bg.wasm', import.meta.url);
-const skip = existsSync(artifact) ? false : 'wasm_glue_bg.wasm is absent — build tentaflow-core once to generate the glue';
+// The glue is built by `tentaflow-core`. Without it these tests prove nothing, so CI (which builds the core before `npm test`) fails
+// instead of showing a green run of skipped tests; a checkout that never built it skips them, loudly.
+if (!existsSync(artifact) && process.env.CI) {
+  throw new Error('wasm_glue_bg.wasm is absent in CI: build tentaflow-core before `npm test`, the wire tests would otherwise be skipped silently');
+}
+const skip = existsSync(artifact) ? false : 'wasm_glue_bg.wasm is absent — build tentaflow-core once to generate the glue (CI fails here instead of skipping)';
+if (skip) console.warn(`SKIPPED ${new URL(import.meta.url).pathname.split('/').pop()}: ${skip}`);
 const wasm = skip ? null : await import('./wasm_glue.js');
 let codec;
 if (!skip) {

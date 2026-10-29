@@ -632,6 +632,137 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ### TentaBus
 
+- Zasada odczytu może pokazać pole **zamaskowane** albo **zahaszowane** (F4 B7;
+  tylko JSON, XML i HL7 v2 — w Avro, Protobuf i Thrift zasada nadal jest
+  odmawiana, więc maska i hasz też). Maska zostawia ostatnie 3 znaki, resztę
+  zastępuje gwiazdkami z zachowaniem długości, a wartość krótszą niż 5 znaków
+  maskuje w całości (liczone są znaki Unicode, nie bajty). Hasz to
+  `blake3::keyed_hash(klucz organizacji, wartość)`, pełne 256 bitów w hex; ta
+  sama wartość ma ten sam hasz we wszystkich instancjach organizacji. Klucz
+  (32 losowe bajty) powstaje przy pierwszej zasadzie, która haszuje, leży w
+  bazie zaszyfrowany i związany z identyfikatorem organizacji (migracja 206:
+  `bus_field_hash_keys` oraz kolumny `masked_fields_json` i `hashed_fields_json`
+  zasad), a między węzłami jedzie zapieczętowany dla każdego odbiorcy w
+  `SharedSecretsSync` (nigdy w księdze synchronizacji, której treść jest
+  jawna); wygrywa wyższa wersja klucza, a przy równej wersji wcześniej
+  utworzony klucz (patrz poprawki R1 niżej). Rotacja klucza to osobne, jawne
+  żądanie administratora instancji busa (`FieldHashKeyRotateRequest` z wersją
+  klucza z okna potwierdzenia, audyt `bus.field_policy.hash_key.rotate`): po niej
+  stare hasze przestają pasować w każdej instancji organizacji. Pola `masked_fields`
+  i `hashed_fields` (podzbiory `fields`, rozłączne, tylko zasada odczytu) doszły
+  do zapisu i listy zasad; `FieldHashKeyInfoRequest` zwraca wersję klucza i liczbę
+  zasad, topików i instancji, których zmiana klucza dotyczy (na tym węźle).
+  Wartość inna niż tekst w JSON staje się tekstem (`12345` → `**345`),
+  `null` i pusty tekst zostają, wartość logiczna i obiekt/tablica dostają stałą
+  maskę `***`; w HL7 całe pole (z `^`, `~`) jest jednym tekstem, a znak
+  rozdzielający wiadomość nie może trafić do maski; w XML element zostaje, a jego
+  tekst (bez atrybutów i znaczników potomnych) zostaje zastąpiony. Węzeł sprzed
+  zmiany ukrywa takie pole zamiast je pokazać, bo kolumna `fields_json` zawiera
+  tylko pola pokazywane bez zmian. Podgląd „jak widzi X” i `capabilities`
+  (`field_actions`) znają akcje `mask` i `hash`. `SCHEMA_VERSION` bez zmian.
+
+- Poprawki recenzji F4 B7 (runda 1), zmiany zachowania:
+  - **Klucz haszowania nie powstaje przy odczycie.** Tworzy go zapis pierwszej
+    zasady, która haszuje, i tylko na węźle będącym operatorem (inne węzły
+    biorą klucz wyłącznie od operatorów, więc klucz zrobiony gdzie indziej
+    nigdy by do nich nie dotarł). Odczyt przez zasadę haszującą na węźle, który
+    klucza jeszcze nie ma (nowo dołączony, odcięty), **ukrywa pole haszowane**
+    do czasu synchronizacji (pozostałe pola i maski działają). Zapis pierwszej
+    zasady haszującej i rotacja na węźle, który nie jest operatorem, są
+    odmawiane kodem `bus.operator_node_required` zamiast „ok”, po którym węzeł
+    haszowałby własnym kluczem. Adopcja klucza od peera: wyższa wersja wygrywa
+    zawsze (wersja nie cofa się), przy równej wersji wcześniej utworzony klucz,
+    przy równym czasie mniejszy klucz; wersja spoza `u32` jest odrzucana.
+    Klucz powstający przy zapisie zasady jest tworzony przed zapisem zasady.
+  - **Bus używa klucza głównego węzła.** Szyfr kluczy haszowania pochodzi z
+    `AddonManager` (ten sam co w mesh, także na desktopie i mobile, gdzie
+    `master.key` leży w katalogu danych), a bus nie czyta już sam pliku, więc
+    nie tworzy zbędnego `master.key` w domyślnej lokalizacji. Brak szyfru nie
+    zatrzymuje busa: reguły haszujące ukrywają pole (`BusInitConfig.settings_cipher`
+    jest teraz `Option`).
+  - **DLQ trzyma rekord taki, jaki opublikowano.** `note_delivery_failure`
+    czyta surowy rekord z logu po `(temat, partycja, offset)` zamiast ufać
+    ładunkowi od wołającego (reaktor przekazywał rzut przez zasadę czytającego:
+    zamaskowany i zahaszowany, więc „Ponów” republikował zepsute dane, a odczyt
+    DLQ haszował hasz). Rekord podany przez wołającego służy tylko wtedy, gdy
+    log go już nie ma (retencja).
+  - **Zmiana zachowania odczytu DLQ w `fetch`** (z F4 B7): konsument czytający
+    `__dlq.<temat>` widzi teraz zasady i format ładunku tematu źródłowego
+    (maska, hasz, XML/HL7 zamiast `{}`) oraz ma ukryty `dlq.error_message`,
+    tak samo jak przy `peek`.
+  - **Klient sprzed B7 nie zdejmuje masek.** `masked_fields` i `hashed_fields`
+    w `FieldPolicySetRequest` to `Option`: brak pola = zachowaj zapisane maski
+    i hasze (przecięte z `fields`), `[]` = usuń. Nowy UI wysyła zawsze listy;
+    koder JS (`codec.js`) pomija brakujące zamiast wysyłać `[]`.
+  - **Podgląd „jak widzi X”** nie haszuje ani nie maskuje drugi raz tego, co
+    wywołujący już czyta zamaskowane lub zahaszowane: jego hasz jest prawdziwym
+    haszem, a para „maska wywołującego, hasz podmiotu” zostaje maską i jest
+    oznaczona `limited_by_caller` (podobnie brak klucza na tym węźle).
+  - Drobne: „ponów wszystkie” (`peek_runs` bez ładunku) nie liczy projekcji;
+    migracja 206 dostała `CHECK(json_valid ... 'array')` na obu nowych kolumnach
+    (istniejące wiersze mają NULL), a materializer odrzuca zasadę z listą, która
+    nie jest tablicą nazw; biały znak na brzegach tekstu maskowanego/haszowanego
+    elementu XML jest układem dokumentu i jest obcinany; awaria listy kluczy nie
+    psuje ramki pozostałych sekretów floty; audyt utworzenia klucza niesie id węzła.
+  - **Świadome ograniczenia** (bez zmian kodu): maska liczy znaki Unicode
+    (`char`), nie grafemy (ZWJ, NFD i NFC dają różną liczbę odsłoniętych liter;
+    wartość nadal pozostaje pod maską); liczby zmiennoprzecinkowe i całkowite
+    powyżej u64 są maskowane/haszowane z tekstu zwróconego przez `serde_json`
+    (`1.50` → `1.5`), więc ich hasz różni się od haszu tego samego napisu jako
+    string; maska i hasz dotyczą tylko pól ładunku, nie klucza rekordu ani
+    nagłówków; klucze haszowania jadą do wszystkich zaufanych peerów
+    (założenie: jedna flota, jeden operator — mesh nie zna przynależności węzła
+    do organizacji); `SCHEMA_VERSION` nie jest podbity (decyzja właściciela:
+    węzeł sprzed B7 ukrywa pola maskowane/haszowane, ale nie odrzuca ramek).
+
+- Poprawki recenzji F4 B7 (runda 2 + krytyk GUI), zmiany zachowania:
+  - **Edycja zreplikowanej zasady haszującej nie wymaga klucza ani operatora**,
+    dopóki nie dodaje nowego pola haszowanego (panel zawsze odsyła pola, które
+    zasada już haszuje). Klucz i operator są potrzebne dopiero przy nowym polu
+    „Zahaszuj”. Odmowa ma teraz dwa kody: `bus.operator_node_required` (organizacja
+    nie ma jeszcze żadnej zasady haszującej, a ten node nie jest operatorem) i
+    `bus.hash_key_not_synced` (organizacja już haszuje, a klucz jeszcze nie dotarł
+    na ten node; dotyczy też operatora, bo drugi klucz zostałby zastąpiony starszym
+    kluczem floty). Tekst odmowy nie zawiera id węzła (trafia do logu).
+    `BusFieldHashKeyWire.can_rotate_here` mówi, czy ten node może zmienić klucz.
+  - Odczyt przez zasadę haszującą bez klucza loguje ostrzeżenie (raz na minutę na
+    organizację), a podgląd „jak widzi…” zwraca `hash_key_missing` osobno od
+    `limited_by_caller`; lista `applied` podglądu opisuje to, co faktycznie jest w
+    ładunku (para wywołujący-maska/podmiot-hasz, hasz bez klucza = ukryte).
+  - Klucz haszowania nie powstaje przed walidacją żądania (`prepare_policy` /
+    `commit_policy`). Porządek adopcji klucza ufa znacznikowi czasu tylko w oknie
+    wokół zegara lokalnego (zegar z przyszłości albo sprzed 2020 liczy się jak
+    „przyszedł przed chwilą”), a klucz z przesuniętym zegarem nie jest już
+    odrzucany; klucz, którego węzeł nie umie odszyfrować, nie jest zastępowany
+    kluczem starszej wersji.
+  - Panel: „Co zrobiły zasady” w podglądzie wymienia tylko pola zmienione (reszta
+    jest policzona), w naturalnej kolejności; znaczniki maski i hasza mają etykietę
+    tekstową; pytanie o porzucenie szkicu przewija okno do siebie; okno klucza po
+    „klucz zmienił się w międzyczasie” bierze aktualną wersję; wzór XSD topiku XML
+    podaje pola (dzieci korzenia); francuskie „Caviarder” (maska) odróżnione od
+    „Dissimuler” (ukryj).
+
+- Ukrywanie danych w panelu: przy każdym polu zasady odczytu dochodzą „Zamaskuj”
+  i „Zahaszuj” obok „Pokaż” i „Ukryj” (F4 B7, UI). Okno Dodaj/Zmień zasadę
+  wyjaśnia każdą akcję jednym zdaniem z przykładem maski i mówi, co maska albo
+  hasz robi z wartością w formacie tego topiku (JSON, XML, HL7 v2); pola
+  wpisywane ręcznie (XML, JSON bez wzoru, dodatkowe adresy HL7) mają osobne listy
+  pól zamaskowanych i zahaszowanych. Dostępność akcji bierze się z
+  `capabilities.field_actions` serwera — bez niej zostaje samo „Ukryj”; zasada
+  zapisu masek nie ma. Tabela zasad pokazuje je jako chipy (zamaskuj, zahaszuj
+  obok ukryj), legenda i okno usuwania opisują je tak samo, a „Podgląd, jak
+  widzi…” oznacza zamaskowane i zahaszowane wartości w treści (JSON i HL7) i na
+  liście pól. Sekcja ma kartę „Klucz haszowania” z datą i wersją klucza organizacji
+  oraz — tylko dla administratora instancji — przyciskiem „Zmień klucz
+  haszowania”: okno z przepisaniem słów mówi, że stare hasze przestaną pasować
+  w każdej instancji organizacji i ile zasad „Zahaszuj” widzi ten node („co
+  najmniej”, bo reguły instancji na innych nodach nie są tu liczone); żądanie
+  niesie wersję klucza z okna, więc zmiana, którą ktoś zrobił wcześniej, jest
+  odmawiana i niczego nie nadpisuje. Przemianowanie pola przy nowej wersji wzoru
+  zachowuje maskę i hasz pod nową nazwą. Odmowy serwera (maska na zasadzie zapisu,
+  pole zamaskowane poza listą pokazywanych, pole i zamaskowane, i zahaszowane,
+  brak klucza, klucz zmieniony w międzyczasie) mają polskie komunikaty w 5 językach.
+
 - Rejestr wzorców waliduje Protobuf (F4 B2; bez nowego crate'a w lockfile:
   `protobuf` i `protobuf-parse` 3.7.2 były w nim już (przez `onnx-ir` z Burn),
   teraz są też bezpośrednimi zależnościami `tentaflow-core`; parser w trybie

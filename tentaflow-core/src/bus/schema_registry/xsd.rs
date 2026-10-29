@@ -5187,7 +5187,10 @@ mod tests {
             set(&["mrn", "name", "birthDate", "sex", "phone", "email", "visit"]),
         ] {
             let derived = XSD_OPS.derive_subschema(&source, &allowed).unwrap();
-            let projected = PayloadFormat::Xml.codec().project(&doc, &allowed).unwrap();
+            let projected = PayloadFormat::Xml
+                .codec()
+                .project(&doc, &allowed, None)
+                .unwrap();
             let got = XSD_OPS.validate(&compiled(&derived), &projected);
             assert!(
                 got.is_ok(),
@@ -5936,7 +5939,7 @@ mod tests {
         let allowed = set(allowed);
         let projected = PayloadFormat::Xml
             .codec()
-            .project(doc.as_bytes(), &allowed)
+            .project(doc.as_bytes(), &allowed, None)
             .unwrap();
         let derived = XSD_OPS.derive_subschema(schema_text, &allowed).unwrap();
         XSD_OPS.validate(&compiled(&derived), &projected)

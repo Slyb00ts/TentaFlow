@@ -64,6 +64,11 @@ export function setForwardTarget(frame, nodeIdHex) {
 
 /** Optional wire string: an absent value is `null`, never `''` — the core
  * treats `Some("")` as a filter that matches nothing. */
+/** A list of names, or `undefined` (an Option the server reads as "not given") when it was omitted. */
+function _optionalNames(value) {
+  return value == null ? undefined : value.map(String);
+}
+
 function strOrNull(v) {
   return v === undefined || v === null || v === '' ? null : String(v);
 }
@@ -4303,9 +4308,14 @@ export const encode = {
 
   /**
    * BusPayload::FieldPolicySetRequest. payload: { topic, subjectType, subjectId, direction:
-   * 'write'|'read', fields: string[], requiredFields: string[], expectedUpdatedAtMs?: number,
-   * expectAbsent?: boolean }. `requiredFields` must be a subset of `fields` (validated
-   * server-side). `expectedUpdatedAtMs` is the `updatedAtMs` of the rule being changed and
+   * 'write'|'read', fields: string[], requiredFields: string[], maskedFields?: string[],
+   * hashedFields?: string[], expectedUpdatedAtMs?: number, expectAbsent?: boolean }.
+   * `fields` is every field the rule shows (as it is, masked or hashed). `requiredFields`,
+   * `maskedFields` and `hashedFields` must be subsets of `fields`, the last two disjoint and
+   * only on a 'read' rule, never on a binary topic (all validated server-side). OMITTED (not
+   * `[]`), a list tells the server to KEEP the stored rule's masks / hashes (what an editor
+   * that does not know them must mean); `[]` removes them. Send both lists whenever the
+   * editor knows them. `expectedUpdatedAtMs` is the `updatedAtMs` of the rule being changed and
    * `expectAbsent` marks an add; the server refuses with `bus.field_policy_changed` when the
    * stored rule is no longer that. Neither set writes unconditionally.
    */
@@ -4319,6 +4329,8 @@ export const encode = {
       String(payload.direction ?? 'write'),
       (payload.fields ?? []).map(String),
       (payload.requiredFields ?? payload.required_fields ?? []).map(String),
+      _optionalNames(payload.maskedFields ?? payload.masked_fields),
+      _optionalNames(payload.hashedFields ?? payload.hashed_fields),
       payload.expectedUpdatedAtMs == null ? undefined : BigInt(payload.expectedUpdatedAtMs),
       payload.expectAbsent === true,
     );
@@ -4361,7 +4373,7 @@ export const encode = {
    * (topic, partition, offset) as the subject would read it, never more than the caller
    * may read. payload: { instanceId, topic, partition, offset, subjectType:
    * 'user'|'group'|'addon'|'any', subjectId ('*' for 'any') }. Answers
-   * BusFieldPolicyPreviewResponse { record, applied: [{ field, action: 'show'|'hide' }],
+   * BusFieldPolicyPreviewResponse { record, applied: [{ field, action: 'show'|'hide'|'mask'|'hash' }],
    * limitedByCaller }.
    */
   busFieldPolicyPreviewRequest(correlationId, payload = {}, sequence = 1) {
@@ -4373,6 +4385,37 @@ export const encode = {
       BigInt(payload.offset ?? 0),
       String(payload.subjectType ?? payload.subject_type ?? 'any'),
       String(payload.subjectId ?? payload.subject_id ?? '*'),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::FieldHashKeyInfoRequest (admin tier: bus.admin + organization Admin) — the
+   * organization's key of hashed fields, without the key. payload: { instanceId }. Answers
+   * BusFieldHashKeyInfoResponse { key: { exists, keyVersion, createdAtMs, rotatedAtMs,
+   * hashingRules, hashingTopics, hashingInstances } } — the counters are what THIS node
+   * knows; instances hosted on other nodes of the mesh are not counted.
+   */
+  busFieldHashKeyInfoRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = requests.encodeBusFieldHashKeyInfoRequest(encode._busInstanceId(payload));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::FieldHashKeyRotateRequest (admin tier: bus.admin + organization Admin; audit
+   * bus.field_policy.hash_key.rotate) — replaces the organization's hash key: every hash made
+   * before stops matching, in EVERY instance of the organization. payload: { instanceId,
+   * expectedKeyVersion } — the `keyVersion` the confirmation window showed; another version
+   * (or none) is refused with bus.field_hash_key_changed and rotates nothing. Without a key:
+   * bus.field_hash_key_not_found. Answers BusFieldHashKeyRotateResponse { key } (same shape as
+   * the info answer, the new version).
+   */
+  busFieldHashKeyRotateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = requests.encodeBusFieldHashKeyRotateRequest(
+      encode._busInstanceId(payload),
+      Number(payload.expectedKeyVersion ?? payload.expected_key_version ?? 0),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },

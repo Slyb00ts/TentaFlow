@@ -1312,8 +1312,47 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bpmn_service_invocation_critic_verified",
             MigrationStep::Rust(bpmn_service_invocation_critic_verified),
         ),
+        (
+            206,
+            "bus_field_policy_mask_hash",
+            MigrationStep::Sql(BUS_FIELD_POLICY_MASK_HASH),
+        ),
     ]
 }
+
+/// v206 — a read rule can mask or hash a field it shows (TentaBus F4 B7,
+/// SUM/tentabus/DECYZJE-2026-09-22.md). `masked_fields_json` and
+/// `hashed_fields_json` are JSON arrays of top-level field names, disjoint
+/// from each other and from `fields_json`: the fields a rule shows as they
+/// are stay in `fields_json`, so a node that predates this migration and
+/// ignores the new columns hides a masked or hashed field instead of showing
+/// it. `NULL` is today's behaviour (nothing masked, nothing hashed). A
+/// non-NULL value must be a JSON array: the existing rows hold NULL, so the
+/// check touches no stored data, and a row that is not an array — which would
+/// fail every read of its topic — cannot be stored. (The names inside are
+/// checked by `field_policies::decode` and by the materializer.)
+///
+/// `bus_field_hash_keys` holds the key of the hashed fields, one per
+/// organization: the same hash of a value in every instance of the
+/// organization. `encrypted_key` is `SettingsCipher::encrypt_bound` of the 32
+/// key bytes in hex, bound to the org id. The table never replicates through
+/// the sync ledger, whose operation bodies are stored in plaintext; the key
+/// travels sealed per recipient over `SharedSecretsSync`. No FK to
+/// `organizations`, like the other bus tables: a key can arrive before the
+/// organization's own row.
+const BUS_FIELD_POLICY_MASK_HASH: &str = r#"
+ALTER TABLE bus_field_policies ADD COLUMN masked_fields_json TEXT
+    CHECK(masked_fields_json IS NULL OR (json_valid(masked_fields_json) AND json_type(masked_fields_json) = 'array'));
+ALTER TABLE bus_field_policies ADD COLUMN hashed_fields_json TEXT
+    CHECK(hashed_fields_json IS NULL OR (json_valid(hashed_fields_json) AND json_type(hashed_fields_json) = 'array'));
+CREATE TABLE IF NOT EXISTS bus_field_hash_keys (
+    org_id         TEXT PRIMARY KEY,
+    key_version    INTEGER NOT NULL CHECK(key_version >= 1),
+    encrypted_key  TEXT NOT NULL,
+    created_at_ms  INTEGER NOT NULL,
+    rotated_at_ms  INTEGER NOT NULL
+);
+"#;
 
 /// Marks the invocations whose step is verified by a critic agent. A critic is an
 /// agent run of up to an hour, so such a job takes a slot of the agent class like
@@ -16877,7 +16916,7 @@ mod tests {
             assert_eq!(*version, index as i64 + 1, "the ladder must stay contiguous");
         }
         let head = ladder.last().unwrap().0;
-        assert_eq!(head, 205);
+        assert_eq!(head, 206);
 
         let fresh = Connection::open_in_memory().unwrap();
         run(&fresh).unwrap();
@@ -16896,7 +16935,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(applied_after_179.len(), 26);
+        assert_eq!(applied_after_179.len(), 27);
         assert_eq!(applied_after_179[0], "org_structure");
         assert_eq!(applied_after_179[19], "bpmn_activity_io_witnesses");
         assert_eq!(applied_after_179[20], "org_absences_drop_reason");
@@ -16911,6 +16950,7 @@ mod tests {
             applied_after_179[25],
             "bpmn_service_invocation_critic_verified"
         );
+        assert_eq!(applied_after_179[26], "bus_field_policy_mask_hash");
         let tables = |conn: &Connection| -> Vec<String> {
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap()
@@ -17288,6 +17328,71 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM bpmn_agent_completions", [], |r| r.get::<_, i64>(0)).unwrap(),
             0
         );
+    }
+
+    /// v206: a rule from before the migration keeps its fields and gains NULL
+    /// mask/hash columns (today's behaviour), and the per-organization hash key
+    /// table accepts one key per organization with a version of at least 1.
+    #[test]
+    fn migration_206_adds_mask_hash_columns_and_the_hash_key_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 205);
+        conn.execute(
+            "INSERT INTO bus_field_policies \
+                (instance_id, org_id, topic, subject_type, subject_id, direction, fields_json, \
+                 required_fields_json, created_at_ms, updated_at_ms) \
+             VALUES ('tentabus-00000001', 'org-1', 'orders', 'any', '*', 'read', '[\"a\"]', NULL, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        run(&conn).unwrap();
+
+        let (fields, masked, hashed): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT fields_json, masked_fields_json, hashed_fields_json \
+                 FROM bus_field_policies WHERE topic = 'orders'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(fields, "[\"a\"]");
+        assert_eq!((masked, hashed), (None, None));
+
+        let insert = |org: &str, version: i64| {
+            conn.execute(
+                "INSERT INTO bus_field_hash_keys \
+                    (org_id, key_version, encrypted_key, created_at_ms, rotated_at_ms) \
+                 VALUES (?1, ?2, 'encb:x', 1, 1)",
+                rusqlite::params![org, version],
+            )
+        };
+        insert("org-1", 1).unwrap();
+        assert!(insert("org-1", 2).is_err(), "one key per organization");
+        assert!(insert("org-2", 0).is_err(), "versions start at 1");
+        insert("org-2", 1).unwrap();
+
+        // The lists of a rule are JSON arrays or NULL: anything else would make
+        // every read of the topic fail.
+        let set_masked = |value: Option<&str>| {
+            conn.execute(
+                "UPDATE bus_field_policies SET masked_fields_json = ?1 WHERE topic = 'orders'",
+                rusqlite::params![value],
+            )
+        };
+        let set_hashed = |value: Option<&str>| {
+            conn.execute(
+                "UPDATE bus_field_policies SET hashed_fields_json = ?1 WHERE topic = 'orders'",
+                rusqlite::params![value],
+            )
+        };
+        set_masked(Some("[\"a\"]")).unwrap();
+        set_hashed(Some("[]")).unwrap();
+        set_masked(None).unwrap();
+        for bad in ["not json", "{\"a\":1}", "\"a\"", "1", ""] {
+            assert!(set_masked(Some(bad)).is_err(), "masked {bad:?}");
+            assert!(set_hashed(Some(bad)).is_err(), "hashed {bad:?}");
+        }
     }
 
     /// v205: an invocation records whether a critic verifies its step, the claim

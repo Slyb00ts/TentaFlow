@@ -11304,7 +11304,14 @@
       "schema_kind_mismatch": "Wzór {name} jest dla treści {schemaKind}, a ten topik przyjmuje treść {topicKind}.",
       "stored_schema_unreadable": "Wzór {name} w wersji {version} został zapisany według luźniejszych zasad i rejestr nie może go już odczytać, więc topik nie sprawdzi nim wiadomości. Dodaj poprawioną wersję wzoru.",
       "field_policy_binary_topic": "Topik {topic} przyjmuje wiadomości binarne (wzór {name}, {format}). Zasady ukrywania danych działają na JSON, XML i HL7 v2, więc nie można ich dodać.",
-      "field_policy_binary_bind": "Topik {topic} ma zasady ukrywania danych, więc nie można do niego przypiąć wzoru binarnego {name} ({format}). Zasady działają na JSON, XML i HL7 v2 — usuń je najpierw."
+      "field_policy_binary_bind": "Topik {topic} ma zasady ukrywania danych, więc nie można do niego przypiąć wzoru binarnego {name} ({format}). Zasady działają na JSON, XML i HL7 v2 — usuń je najpierw.",
+      "mask_hash_read_only": "Zamaskować albo zahaszować można tylko pole w zasadzie odczytu — zasada zapisu może pole tylko dopuścić, wymagać albo zabronić.",
+      "mask_hash_not_shown": "Zamaskowane i zahaszowane pole musi być też na liście pól, które zasada pokazuje.",
+      "mask_hash_overlap": "Jedno pole nie może być jednocześnie zamaskowane i zahaszowane.",
+      "field_hash_key_not_found": "Organizacja nie ma jeszcze klucza haszowania — powstaje przy pierwszej zasadzie „Zahaszuj”, więc nie ma czego zmieniać.",
+      "field_hash_key_changed": "Klucz haszowania zmienił się w międzyczasie (ktoś zmienił go przed Tobą), więc nic nie zmieniono. Zamknij to okno i otwórz je ponownie, żeby zobaczyć aktualną wersję klucza.",
+      "operator_node_required": "Tę czynność wykonuje tylko node operatora organizacji, a ten node nim nie jest. Zrób to na node'zie operatora (lista: Nody mesh).",
+      "hash_key_not_synced": "Organizacja haszuje już pola kluczem, który jeszcze nie dotarł na ten node, więc teraz nie można dodać kolejnego pola „Zahaszuj”. Poczekaj na synchronizację z node'em operatora albo sprawdź połączenie z nim."
     },
     "shell": {
       "instance": "Instancja",
@@ -12988,7 +12995,9 @@
       "and_more": "i jeszcze {count} {n|pole|pola|pól}",
       "action": {
         "show": "Pokaż",
-        "hide": "Ukryj"
+        "hide": "Ukryj",
+        "mask": "Zamaskuj",
+        "hash": "Zahaszuj"
       },
       "write": {
         "allow": "Dozwolone",
@@ -13015,8 +13024,8 @@
       "col_changed": "Zmieniono",
       "empty_title": "Ten topik nie ma zasad ukrywania danych",
       "empty_text": "Każdy, kto może czytać ten topik, widzi całe wiadomości. Dodaj zasadę, aby ukryć wybrane pola.",
-      "blocked_title": "Zasady tego topiku nie są tu edytowane",
-      "blocked_text": "Zasad tego topiku nie edytuje się na tym ekranie, bo jego treść jest binarna i nie da się jej odczytać jako pól. Ten ekran obsługuje wiadomości JSON, XML i HL7 v2. Rodzaj treści ustala się przy tworzeniu topiku.",
+      "blocked_title": "Treść binarna nie ma ukrywania danych",
+      "blocked_text": "Treść binarna nie podlega ukrywaniu pól: nie da się jej odczytać jako pól, więc każdy, kto ma prawo czytania topiku, widzi ją w całości. Ukrywanie danych działa dla wiadomości JSON, XML i HL7 v2. Rodzaj treści ustala się przy tworzeniu topiku.",
       "blocked_with_rules": "Ten topik ma zasady ukrywania danych, ale jego treść jest binarna — zasady nie zadziałają. Usuń je albo utwórz topik JSON/XML/HL7.",
       "keys_closed": "Systemy zewnętrzne z kluczem API mają zamknięty ten topik w zakresie {directions}: są w nim zasady tylko dla wybranych osób, grup lub addonów, a nie ma zasady dla wszystkich.",
       "sees_only": "Widzi tylko: {fields}",
@@ -13029,7 +13038,10 @@
         "hide": "Pole znika z wiadomości.",
         "reject_name": "Odrzuć wiadomość",
         "reject": "Przy zapisie: wiadomość z niedozwolonym polem albo bez wymaganego nie trafi do topiku.",
-        "precedence": "Zasada osoby wygrywa z zasadą jej grupy, a ta z zasadą dla wszystkich — zasady się nie sumują."
+        "precedence": "Zasada osoby wygrywa z zasadą jej grupy, a ta z zasadą dla wszystkich — zasady się nie sumują.",
+        "mask": "Widać 3 ostatnie znaki, reszta to gwiazdki (wartość krótsza niż 5 znaków jest zamaskowana w całości), np. {example}.",
+        "hash": "Zamiast wartości widać stały ciąg znaków: ta sama wartość daje zawsze ten sam hasz w całej organizacji, a wartości nie da się z niego odczytać.",
+        "mask_example": "********359"
       },
       "field_problem": {
         "empty": "Wpisz nazwę pola.",
@@ -13037,11 +13049,12 @@
         "hl7_shape": "„{name}” nie jest adresem pola HL7. Adres ma postać SEGMENT-numer, np. PID-5.",
         "xml_name": "„{name}” nie jest nazwą elementu XML. Nazwa zaczyna się od litery albo znaku _ i nie ma spacji.",
         "hl7_case": "„{name}” wygląda na literówkę. Czy chodziło o {suggestion}? Adres pisze się wielkimi literami, z myślnikiem.",
-        "typed_known": "„{name}” jest na liście pól i ma tam inne ustawienie niż wpisane niżej. Zostaw je tylko w jednym miejscu."
+        "typed_known": "„{name}” jest na liście pól i ma tam inne ustawienie niż wpisane niżej. Zostaw je tylko w jednym miejscu.",
+        "typed_twice": "„{name}” wpisano w więcej niż jednej liście. Zostaw je tylko w jednej."
       },
       "need": {
-        "read": "Ustaw co najmniej jedno pole na „Ukryj”. Lista zawiera wszystkie pola tego topiku, więc zasada, która pokazuje je wszystkie, niczego nie zmienia — żeby przestała działać, usuń ją.",
-        "read_typed": "Wpisz co najmniej jedno pole, które ma zostać widoczne. Bez żadnego widocznego pola zasada ukryłaby całą wiadomość.",
+        "read": "Ustaw co najmniej jedno pole na „Ukryj”, „Zamaskuj” albo „Zahaszuj”. Lista zawiera wszystkie pola tego topiku, więc zasada, która pokazuje je wszystkie, niczego nie zmienia — żeby przestała działać, usuń ją.",
+        "read_typed": "Wpisz co najmniej jedno pole, które ma zostać widoczne (bez zmian, zamaskowane albo zahaszowane). Bez żadnego widocznego pola zasada ukryłaby całą wiadomość.",
         "write": "Ustaw co najmniej jedno pole na „Wymagane” albo „Niedozwolone”. Lista zawiera wszystkie pola tego topiku, więc zasada, która wszystko dopuszcza, niczego nie sprawdza — żeby przestała działać, usuń ją.",
         "write_typed": "Wpisz co najmniej jedno pole, które wolno zapisać. Bez żadnego dozwolonego pola zasada odrzucałaby każdą wiadomość."
       },
@@ -13065,7 +13078,9 @@
         "write_unlisted_hl7_saved": "Pozostałe pozycje segmentów z listy (np. PID-1, PID-4, PV1-1) są przyjmowane. Wiadomość z innym segmentem zostanie odrzucona.",
         "write_unlisted_only_hl7": "Od {whoFrom} będą przyjmowane wiadomości z segmentami z listy, także w ich pozostałych pozycjach (np. PID-4, PV1-1). Wiadomość z innym segmentem, np. segmentem Z, zostanie odrzucona.",
         "read_unlisted_saved": "Pola spoza listy też znikną.",
-        "write_unlisted_saved": "Wiadomość z polem spoza listy też zostanie odrzucona."
+        "write_unlisted_saved": "Wiadomość z polem spoza listy też zostanie odrzucona.",
+        "read_masked": "Dla {who} {n|pole|pola|pola} {fields} {n|będzie|będą|będą} widoczne tylko jako gwiazdki z 3 ostatnimi znakami.",
+        "read_hashed": "Dla {who} zamiast wartości {n|pola|pól|pól} {fields} pojawi się hasz — stały ciąg znaków, taki sam dla tej samej wartości w całej organizacji."
       },
       "fields_label": "Pola",
       "source": {
@@ -13073,7 +13088,8 @@
         "dictionary": "Lista to najczęstsze pola HL7 v2. Inne pole dopiszesz niżej, podając jego adres.",
         "failed": "Nie udało się wczytać wzoru wiadomości tego topiku, więc nie znamy jego pól. Wpisz niżej pola, które mają zostać widoczne.",
         "manual": "Nie znamy pól tego topiku — nie ma wzoru wiadomości, który by je wymieniał. Wpisz niżej pola, które mają zostać widoczne.",
-        "complex": "Wzór wiadomości tego topiku zawiera pola, których nie da się z niego wypisać (odwołanie do innego pliku albo dowolne nazwy pól), więc nie znamy pełnej listy. Wpisz niżej pola, które mają zostać widoczne."
+        "complex": "Wzór wiadomości tego topiku zawiera pola, których nie da się z niego wypisać (odwołanie do innego pliku albo dowolne nazwy pól), więc nie znamy pełnej listy. Wpisz niżej pola, które mają zostać widoczne.",
+        "xsd": "Pola tego topiku wpisujesz ręcznie — z wzoru XSD tego topiku nie umiemy ich wypisać. Wpisz niżej pola, które mają zostać widoczne."
       },
       "extra": {
         "shown": "Inne pola, które mają zostać widoczne",
@@ -13083,7 +13099,11 @@
         "required": "Pola wymagane",
         "hint_hl7": "Wpisz adres pola, np. PID-5, i naciśnij Enter.",
         "hint_xml": "Wpisz nazwę elementu, np. pacjent, i naciśnij Enter.",
-        "hint_json": "Wpisz nazwę pola, np. pacjent, i naciśnij Enter."
+        "hint_json": "Wpisz nazwę pola, np. pacjent, i naciśnij Enter.",
+        "masked": "Inne pola, które mają być widoczne jako maska",
+        "masked_typed": "Pola, które mają być widoczne jako maska",
+        "hashed": "Inne pola, które mają być widoczne jako hasz",
+        "hashed_typed": "Pola, które mają być widoczne jako hasz"
       },
       "unlisted": {
         "read": "Pola, których nie ma na liście, też zostaną ukryte (także te, które pojawią się później), chyba że wpiszesz je niżej.",
@@ -13120,7 +13140,7 @@
       "remove": {
         "button": "Usuń",
         "window_title": "Usuń zasadę ukrywania danych — {name}",
-        "lead_read": "Zasada odczytu dla: {who}. Ukrywa pola: {fields}.",
+        "lead_read": "Zasada odczytu dla: {who}. {parts}",
         "lead_read_none": "Zasada odczytu dla: {who}. Nie ukrywa żadnego ze znanych pól.",
         "lead_read_only": "Zasada odczytu dla: {who}. Zostawia widoczne tylko pola: {fields}.",
         "lead_read_nothing": "Zasada odczytu dla: {who}. Nie zostawia widocznego żadnego pola.",
@@ -13142,7 +13162,10 @@
         "impact_read_addon": "Addon „{who}” w topiku {topic} będzie czytał według zasady dla wszystkich; gdy jej nie ma, zobaczy całe wiadomości.",
         "impact_write_user": "Wiadomości użytkownika „{who}” do topiku {topic} będą sprawdzane według zasady zapisu jednej z jego grup, a gdy żadna z nich jej nie ma — według zasady dla wszystkich; gdy nie ma żadnej, nie będą sprawdzane wcale.",
         "impact_write_group": "Wiadomości osób z grupy „{who}” do topiku {topic} będą sprawdzane według zasady zapisu ich innej grupy, a gdy jej nie mają — według zasady dla wszystkich; gdy nie ma żadnej, nie będą sprawdzane wcale.",
-        "impact_write_addon": "Wiadomości addonu „{who}” do topiku {topic} będą sprawdzane według zasady dla wszystkich; gdy jej nie ma, nie będą sprawdzane wcale."
+        "impact_write_addon": "Wiadomości addonu „{who}” do topiku {topic} będą sprawdzane według zasady dla wszystkich; gdy jej nie ma, nie będą sprawdzane wcale.",
+        "part_hide": "Ukrywa pola: {fields}.",
+        "part_mask": "Maskuje pola: {fields}.",
+        "part_hash": "Haszuje pola: {fields}."
       },
       "preview": {
         "button": "Podgląd, jak widzi…",
@@ -13164,15 +13187,22 @@
         "hidden": "ukryte",
         "shown": "widoczne",
         "rules_title": "Co zrobiły zasady",
-        "summary_hidden": "Zasady ukryły {count} {n|pole|pola|pól}: {fields}.",
-        "summary_none": "Zasady nie ukryły żadnego pola tej wiadomości.",
+        "summary_none": "Zasady nie zmieniły żadnego pola tej wiadomości.",
         "limited_title": "Ten podgląd jest węższy niż widok wybranej osoby, grupy lub addonu",
-        "limited_text": "Zasada odczytu, która obowiązuje także Ciebie (Twoja własna, Twojej grupy albo dla wszystkich), ukrywa pola, które zobaczy: {who}. Podgląd nigdy nie pokazuje więcej, niż widzisz sam, więc tych pól w nim brakuje. Pełny widok pokaże się, gdy Ciebie nie obejmuje żadna zasada odczytu.",
+        "limited_text": "Zasada odczytu, która obowiązuje także Ciebie (Twoja własna, Twojej grupy albo dla wszystkich), ukrywa albo zmienia (maskuje, haszuje) pola, które zobaczy: {who}. Podgląd nigdy nie pokazuje więcej, niż widzisz sam, więc tych pól w nim brakuje albo są zamaskowane lub zahaszowane. Pełny widok pokaże się, gdy Ciebie nie obejmuje żadna zasada odczytu.",
         "limited_missing": "W tym podglądzie nie ma pól wzoru: {fields}. Ukryła je zasada, która obowiązuje także Ciebie, albo wiadomość ich nie zawiera.",
         "who_user": "użytkownik {name}",
         "who_group": "grupa {name}",
         "who_addon": "addon {name}",
-        "summary_limited": "Nie wymieniamy pól, które ukrywa już zasada obowiązująca także Ciebie."
+        "summary_limited": "Nie wymieniamy pól, które ukrywa już zasada obowiązująca także Ciebie.",
+        "masked": "zamaskowane",
+        "hashed": "zahaszowane",
+        "summary_hide": "Zasady ukryły {count} {n|pole|pola|pól}: {fields}.",
+        "summary_mask": "Zasady zamaskowały {count} {n|pole|pola|pól}: {fields}.",
+        "summary_hash": "Zasady zahaszowały {count} {n|pole|pola|pól}: {fields}.",
+        "key_missing_title": "Ten node nie ma jeszcze klucza haszowania organizacji",
+        "key_missing_text": "Zasada haszuje pola, ale klucz organizacji jeszcze nie dotarł na ten node (przychodzi z node'a operatora), więc pola haszowane są w podglądzie ukryte, a nie zahaszowane. To nie jest skutek Twojej własnej zasady odczytu.",
+        "unchanged": "Pozostałe pola bez zmian: {count}."
       },
       "hl7": {
         "msh_3": "Aplikacja wysyłająca",
@@ -13273,6 +13303,47 @@
         "obx": "wynik",
         "dg1": "rozpoznanie",
         "al1": "alergia"
+      },
+      "sees_only_and": "Widzi tylko: {fields} oraz pola poniżej",
+      "sees_only_below": "Widzi tylko pola poniżej",
+      "explain_action": {
+        "format_json": "W JSON zamaskowane lub zahaszowane pole staje się tekstem, np. liczba 12345 daje „**345”. Wartość logiczna, obiekt i lista są maskowane jako „***”. Puste pole i null zostają bez zmian.",
+        "format_xml": "W XML zamaskowany lub zahaszowany element traci atrybuty i elementy zagnieżdżone — zostaje sam tekst. Pusty element zostaje pusty.",
+        "format_hl7v2": "W HL7 v2 maska i hasz obejmują całe pole razem z jego komponentami (znaki ^, ~, \\ i &) — wynik jest jednym tekstem. Puste pole zostaje puste."
+      },
+      "key": {
+        "title": "Klucz haszowania",
+        "button": "Zmień klucz haszowania",
+        "explain": "Klucz haszowania to tajny ciąg znaków, z którego liczy się hasz. Dzięki niemu nikt spoza organizacji nie odgadnie wartości z hasza. Klucz jest wspólny dla całej organizacji {org}.",
+        "explain_org": "Klucz haszowania to tajny ciąg znaków, z którego liczy się hasz. Dzięki niemu nikt spoza organizacji nie odgadnie wartości z hasza. Klucz jest wspólny dla całej organizacji.",
+        "admin_only": "Klucz zmienia administrator instancji.",
+        "current": "Obecny klucz ustawiono {date} (wersja {version}).",
+        "none": "Klucz powstanie przy pierwszej zasadzie „Zahaszuj” w organizacji — dopóki żadnej nie ma, nie ma czego zmieniać.",
+        "none_title": "Klucz powstanie dopiero przy pierwszej zasadzie „Zahaszuj”.",
+        "load_failed": "Nie udało się wczytać informacji o kluczu: {error}",
+        "failed_title": "Nie udało się wczytać klucza haszowania",
+        "window_title": "Zmień klucz haszowania",
+        "irreversible": "Po zmianie stare hasze przestaną pasować.",
+        "explain_change": "Ta sama wartość da inny hasz niż dotąd, więc programy, które łączą dane po haszu, nie połączą wiadomości sprzed zmiany z nowymi. Starego klucza nie da się przywrócić.",
+        "impact_title": "Co się stanie po zmianie:",
+        "scope": "Klucz jest wspólny dla całej organizacji {org} — zmiana dotyczy wszystkich jej instancji TentaBus, nie tylko tej.",
+        "scope_org": "Klucz jest wspólny dla całej organizacji — zmiana dotyczy wszystkich jej instancji TentaBus, nie tylko tej.",
+        "stale": "Hasze policzone dotychczasowym kluczem przestaną pasować do nowych — w każdej instancji organizacji.",
+        "reach": "Ten node widzi co najmniej {rules} {r|zasadę|zasady|zasad} „Zahaszuj” w {topics} {t|topiku|topikach|topikach} ({instances} {i|instancji|instancjach|instancjach}).",
+        "reach_none": "Ten node nie widzi żadnej zasady „Zahaszuj”, ale mogą ją mieć instancje tej organizacji na innych nodach.",
+        "reach_note": "To dane z tego noda: zasady instancji działających na innych nodach nie są tu policzone, więc dotkniętych zasad może być więcej.",
+        "version_step": "Obecny klucz ma wersję {from} (ustawiony {date}); nowy dostanie wersję {to}.",
+        "audit": "Zmiana klucza zapisze się w dzienniku audytu.",
+        "retype": "Przepisz słowa, aby potwierdzić:",
+        "retype_word": "zmień klucz",
+        "confirm": "Zmień klucz",
+        "rotated_title": "Zmieniono klucz haszowania",
+        "rotated_text": "Klucz organizacji {org} ma teraz nową wersję ({version}). Hasze policzone poprzednim kluczem nie pasują już do nowych w żadnej instancji tej organizacji. {reach}",
+        "rotated_text_org": "Klucz organizacji ma teraz nową wersję ({version}). Hasze policzone poprzednim kluczem nie pasują już do nowych w żadnej instancji tej organizacji. {reach}",
+        "none_rules": "Ten node ma zasady „Zahaszuj”, ale klucz organizacji jeszcze na niego nie dotarł — pola haszowane są tymczasowo ukryte. Klucz przychodzi z node'a operatora; jeśli tak się nie dzieje, sprawdź połączenie z nim.",
+        "none_rules_title": "Klucz jeszcze nie dotarł na ten node, więc nie ma czego zmieniać.",
+        "not_operator": "Ten node nie jest operatorem organizacji, więc klucza tu nie zmienisz — zrób to na node'zie operatora.",
+        "changed_reloaded": "Klucz haszowania zmienił się w międzyczasie (ktoś zmienił go przed Tobą), więc nic nie zmieniono. Okno pokazuje już aktualną wersję ({version}). Jeśli nadal chcesz zmienić klucz, potwierdź jeszcze raz."
       }
     }
   },

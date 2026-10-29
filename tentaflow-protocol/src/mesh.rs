@@ -1842,6 +1842,25 @@ pub struct SharedSecretEntry {
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct SharedSecretsSyncPayload {
     pub entries: Vec<SharedSecretEntry>,
+    /// The per-organization keys of hashed bus fields the sender holds
+    /// (TentaBus F4 B7). Absent from a peer built before they existed.
+    #[serde(default)]
+    pub bus_hash_keys: Vec<BusHashKeyEntry>,
+}
+
+/// One organization's hash key inside `SharedSecretsSyncPayload`. The version
+/// of the key is `(rotated_at_ms, key_version)`; the receiver keeps the entry
+/// only when it is newer than the key it holds. `sealed` opens only on the
+/// addressed peer and is bound to the organization and the version, so an
+/// entry cannot be replanted under another organization or version.
+#[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
+pub struct BusHashKeyEntry {
+    pub org_id: String,
+    pub key_version: i64,
+    pub created_at_ms: i64,
+    pub rotated_at_ms: i64,
+    #[serde(with = "serde_bytes")]
+    pub sealed: Vec<u8>,
 }
 
 /// One agent-account credential inside `ProviderCredentialsSyncPayload`.

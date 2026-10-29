@@ -1246,6 +1246,9 @@ mod tests {
                 dedup_expected_rate_per_sec: 10_000,
                 partition_handle_lru: None,
                 publish_ack_timeout: crate::bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(
+                    &[7u8; 32],
+                ))),
             })
             .expect("bus service"),
         );
@@ -1301,6 +1304,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: crate::bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("init registry instance");
         (dir, svc)
@@ -1494,6 +1498,98 @@ mod tests {
         let dlq_topic = crate::bus::dlq::dlq_topic_name("orders.raw");
         let dlq_records = fetch_once(&svc, &ctx, "dlq-reader", &dlq_topic).await;
         assert_eq!(dlq_records.len(), 1, "one record landed in the DLQ");
+    }
+
+    /// F4 B7 review R1 P2-2: the flow reads through the reader's field-policy
+    /// rule (masked and hashed), but the DLQ keeps the record AS PUBLISHED —
+    /// otherwise "retry" would republish `*************111` and a hash as the
+    /// card and the name.
+    #[tokio::test]
+    async fn run_cycle_dlq_keeps_the_published_record_not_the_masked_and_hashed_one() {
+        use crate::bus::field_policies as fp;
+        let (_dir, svc) = test_bus_service();
+        let ctx = test_ctx("org-default");
+        create_topic(
+            &svc,
+            &ctx,
+            "cards.raw",
+            TopicOptions {
+                max_delivery_attempts: Some(1),
+                content_type: Some("application/json".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        let raw = r#"{"id":"7","card":"4111111111111111","name":"Jan"}"#;
+        publish_one(&svc, &ctx, "cards.raw", raw).await;
+        let set = |masked: &[&str], hashed: &[&str]| {
+            let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<std::collections::BTreeSet<_>>();
+            fp::set_policy(
+                svc.db(),
+                svc.instance_id(),
+                "org-default",
+                "cards.raw",
+                "any",
+                fp::SUBJECT_ANY,
+                fp::Direction::Read,
+                &names(&["id", "card", "name"]),
+                &names(&[]),
+                &names(masked),
+                &names(hashed),
+                crate::db::repository::BusFieldPolicyExpect::Any,
+            )
+            .expect("rule");
+        };
+        set(&["card"], &["name"]);
+        let hash = svc
+            .field_hash_keys()
+            .get_or_create("org-default")
+            .unwrap()
+            .hash_hex(b"Jan");
+
+        let scripted = Arc::new(ScriptedDispatch::new());
+        scripted
+            .fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let dispatch: Arc<dyn ReactorFlowDispatch> = scripted.clone();
+        let config = ConsumeConfig::from_config(&json!({
+            "instance_id": "tentabus-00000001", "topic": "cards.raw", "group": "g1", "max_wait_ms": 20, "on_error": "dlq"
+        }))
+        .unwrap();
+        let after = run_cycle(&svc, "flow-1", &config, &dispatch).await;
+        assert!(matches!(after, AfterFailure::Continue));
+        assert_eq!(
+            scripted.calls.lock().unwrap()[0].1,
+            json!({"id": "7", "card": "*************111", "name": hash}),
+            "the flow itself reads through the rule"
+        );
+
+        // What the DLQ holds is read with no rule in the way.
+        {
+            let svc = svc.clone();
+            blocking(move || {
+                fp::delete_policy(
+                    svc.db(),
+                    svc.instance_id(),
+                    "org-default",
+                    "cards.raw",
+                    "any",
+                    fp::SUBJECT_ANY,
+                    fp::Direction::Read,
+                    None,
+                )
+            })
+            .await
+            .expect("delete rule");
+        }
+        let dlq_topic = crate::bus::dlq::dlq_topic_name("cards.raw");
+        let dlq_records = fetch_once(&svc, &ctx, "dlq-reader", &dlq_topic).await;
+        assert_eq!(dlq_records.len(), 1);
+        assert_eq!(
+            String::from_utf8(dlq_records[0].payload.to_vec()).unwrap(),
+            raw,
+            "the DLQ entry is the published record"
+        );
     }
 
     /// THE regression test for finding F4 (plan-app-platform §3.5): a

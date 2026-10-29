@@ -7,6 +7,11 @@
 // to each field. Every preview is written to the audit log, and the window
 // says so before anyone asks.
 //
+// A field the rule masks (the last 3 characters behind asterisks) or hashes
+// (a keyed hash of the value) is marked in the list of what the rules did and,
+// in a JSON or HL7 message, in the text itself, so a changed value is never
+// taken for the real one.
+//
 // The server applies the subject's rule on top of the administrator's own, so
 // it never shows more than the administrator can read. When the
 // administrator's own rule hides fields the subject would see, the answer says
@@ -19,7 +24,7 @@ import { windowEl } from '/js/modules/tentabus/windows.js';
 import { bytesToPreviewText } from '/js/modules/tentabus/payload.js';
 import { pickPartition, newestOffset, rangeText } from '/js/modules/tentabus/message-preview.js';
 import { directoryLoader, pickLabel } from '/js/modules/tentabus/topic-access.js';
-import { SUBJECT_KINDS, ANY_ID, fieldLabel } from '/js/modules/tentabus/topic-hiding.js';
+import { SUBJECT_KINDS, ANY_ID, fieldLabel, compareFieldNames } from '/js/modules/tentabus/topic-hiding.js';
 import { showHidden } from '/js/modules/tentabus/hidden-characters.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
@@ -75,21 +80,69 @@ export function displayPayload(bytes, cut = false) {
   }
 }
 
+const MARKED = new Set(['mask', 'hash']);
+const ACTION_TONE = { show: 'ok', hide: 'warn', mask: 'info', hash: 'accent' };
+const ACTION_LABEL = { show: 'shown', hide: 'hidden', mask: 'masked', hash: 'hashed' };
+
+/**
+ * The record as markup with the value of every masked or hashed field
+ * wrapped in `<mark class="tb-marked" data-action=…>`: the whole line of a
+ * top-level JSON key, the field of an HL7 segment (by its address, `MSH`
+ * counted from its separator). Other formats, and text the server cut, come
+ * out unmarked.
+ */
+export function payloadHtml(bytes, cut, applied, format) {
+  const text = displayPayload(bytes, cut);
+  const marked = new Map((applied || []).filter((a) => MARKED.has(a.action)).map((a) => [a.field, a.action]));
+  const plain = escapeHtml(text);
+  if (!marked.size) return plain;
+  // The colour is not the only sign: the text says what happened (read out by a screen reader, and shown after the value).
+  const mark = (action, html) => {
+    const label = T(`hiding.preview.${ACTION_LABEL[action]}`);
+    return `<mark class="tb-marked" data-action="${escapeAttr(action)}" data-label="${escapeAttr(label)}" title="${escapeAttr(label)}" aria-label="${escapeAttr(label)}">${html}</mark>`;
+  };
+  if (format === 'json') {
+    return text.split('\n').map((line) => {
+      const m = /^ {2}("(?:[^"\\]|\\.)*"):/.exec(line);
+      let key = null;
+      try { key = m ? JSON.parse(m[1]) : null; } catch { key = null; }
+      return key != null && marked.has(key) ? mark(marked.get(key), escapeHtml(line)) : escapeHtml(line);
+    }).join('\n');
+  }
+  if (format === 'hl7v2') {
+    return text.split('\n').map((line) => {
+      const parts = line.split('|');
+      const segment = parts[0];
+      parts.forEach((part, i) => {
+        const number = segment === 'MSH' ? i + 1 : i;
+        const action = i > 0 ? marked.get(`${segment}-${number}`) : null;
+        parts[i] = action ? mark(action, escapeHtml(part)) : escapeHtml(part);
+      });
+      return parts.join('|');
+    }).join('\n');
+  }
+  return plain;
+}
+
 /**
  * The answer of one preview as markup. `resp` = `{ record, applied,
  * limitedByCaller }`, `subject` = `{ subjectType, label }`, `source` as in
- * `fieldSource` (names the fields). The hidden fields are named and counted;
- * a limit set by the administrator's own rule is explained.
+ * `fieldSource` (names the fields), `format` = `json` / `xml` / `hl7v2`. The
+ * fields the rules hid, masked or hashed are named and counted; a limit set
+ * by the administrator's own rule is explained.
  */
-export function previewResultHtml({ resp, subject, source, nowMs = Date.now() }) {
+export function previewResultHtml({ resp, subject, source, format = 'json', nowMs = Date.now() }) {
   const { record, applied } = resp;
-  const hidden = (applied || []).filter((a) => a.action === 'hide').map((a) => a.field);
+  const named = (action) => (applied || []).filter((a) => a.action === action).map((a) => a.field).sort(compareFieldNames);
   const title = T('hiding.preview.record_title', { number: fmtCount(record.offset), partition: fmtCount(record.partition), when: fmtWhen(record.timestampMs, nowMs) });
-  const rows = (applied || []).map((a) => {
+  // Only what the rules did is listed: a message of an HL7 dictionary has dozens of fields, and the few that changed would be lost among those that did not.
+  const changedRows = (applied || []).filter((a) => a.action !== 'show').sort((a, b) => compareFieldNames(a.field, b.field));
+  const unchanged = (applied || []).length - changedRows.length;
+  const rows = changedRows.map((a) => {
     const label = source ? fieldLabel(source, a.field) : '';
     return `<div class="tb-right-row" data-field-action="${escapeAttr(a.action)}">
       <div class="tb-right-name"><b class="mono">${escapeHtml(showHidden(a.field))}</b>${label ? `<span>${escapeHtml(showHidden(label))}</span>` : ''}</div>
-      <span class="tf-chip tf-chip--outline ${a.action === 'hide' ? 'warn' : 'ok'}">${escapeHtml(T(a.action === 'hide' ? 'hiding.preview.hidden' : 'hiding.preview.shown'))}</span>
+      <span class="tf-chip tf-chip--outline ${ACTION_TONE[a.action] ?? 'ok'}">${escapeHtml(T(`hiding.preview.${ACTION_LABEL[a.action] ?? 'shown'}`))}</span>
     </div>`;
   }).join('');
   const missing = resp.limitedByCaller ? missingFields({ resp, source }) : [];
@@ -98,28 +151,32 @@ export function previewResultHtml({ resp, subject, source, nowMs = Date.now() })
     missing.length ? T('hiding.preview.limited_missing', { fields: missing.map(showHidden).join(', ') }) : '',
   ].filter(Boolean).join(' ');
   // Fields the administrator's own rule already took out of the record are not in `applied` at all.
+  const changes = ['hide', 'mask', 'hash']
+    .map((action) => [action, named(action)])
+    .filter(([, fields]) => fields.length)
+    .map(([action, fields]) => T(`hiding.preview.summary_${action}`, { count: fmtCount(fields.length), n: fields.length, fields: fields.map(showHidden).join(', ') }));
   const summary = [
-    hidden.length
-      ? T('hiding.preview.summary_hidden', { count: fmtCount(hidden.length), n: hidden.length, fields: hidden.map(showHidden).join(', ') })
-      : T('hiding.preview.summary_none'),
+    ...(changes.length ? changes : [T('hiding.preview.summary_none')]),
     resp.limitedByCaller ? T('hiding.preview.summary_limited') : '',
   ].filter(Boolean).join(' ');
   return `
+    ${resp.hashKeyMissing ? `<tf-alert tone="warning" data-role="key-missing" title="${escapeAttr(T('hiding.preview.key_missing_title'))}" message="${escapeAttr(T('hiding.preview.key_missing_text'))}"></tf-alert>` : ''}
     ${resp.limitedByCaller ? `<tf-alert tone="warning" data-role="limited" title="${escapeAttr(T('hiding.preview.limited_title'))}" message="${escapeAttr(limitedText)}"></tf-alert>` : ''}
     <div class="tb-preview-record">
       <div class="tb-preview-record-head"><span>${escapeHtml(T('hiding.preview.sees', { who: whoPhrase(subject) }))}</span> <span class="muted">${escapeHtml(title)}</span></div>
-      <pre class="tb-payload" data-role="payload">${escapeHtml(displayPayload(record.payloadPreview, Boolean(record.truncated))) || escapeHtml(T('topics.preview.payload_empty'))}</pre>
+      <pre class="tb-payload" data-role="payload">${payloadHtml(record.payloadPreview, Boolean(record.truncated), applied, format) || escapeHtml(T('topics.preview.payload_empty'))}</pre>
     </div>
     <div class="field">
       <label>${escapeHtml(T('hiding.preview.rules_title'))}</label>
       <div class="muted" data-role="summary">${escapeHtml(summary)}</div>
       ${rows ? `<div class="tb-rights" data-role="applied">${rows}</div>` : ''}
+      ${unchanged > 0 ? `<div class="muted" data-role="unchanged">${escapeHtml(T('hiding.preview.unchanged', { count: fmtCount(unchanged) }))}</div>` : ''}
     </div>`;
 }
 
 /**
  * Opens the window. `ctx` = `{ instanceId, topic, partitionCount, source,
- * directory({ kind, query }), loadPartitions(), preview(request),
+ * format (`json` / `xml` / `hl7v2`), directory({ kind, query }), loadPartitions(), preview(request),
  * describeError }`; `loadPartitions` may reject (the window then starts on
  * partition 0 without a number).
  */
@@ -245,7 +302,7 @@ export function openHidingPreview(ctx) {
     $('result').innerHTML = `<div class="tb-state"><tf-spinner size="sm"></tf-spinner>${escapeHtml(T('shell.loading'))}</div>`;
     try {
       const resp = await ctx.preview({ instanceId: ctx.instanceId, topic, partition: state.partition, offset, subjectType: subject.subjectType, subjectId: subject.subjectId });
-      if (turn === state.turn && win.isConnected) $('result').innerHTML = previewResultHtml({ resp, subject, source });
+      if (turn === state.turn && win.isConnected) $('result').innerHTML = previewResultHtml({ resp, subject, source, format: ctx.format });
     } catch (err) {
       if (turn === state.turn && win.isConnected) {
         $('result').innerHTML = '';

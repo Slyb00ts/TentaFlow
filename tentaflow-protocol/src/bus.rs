@@ -550,10 +550,21 @@ pub struct BusFieldPolicyWire {
     pub subject_id: String,
     /// 'write' | 'read'.
     pub direction: String,
+    /// Every field the rule shows: as it is, masked or hashed.
     pub fields: Vec<String>,
     pub required_fields: Vec<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// The members of `fields` a read rule shows MASKED (last 3 characters
+    /// visible, the rest asterisks, a value shorter than 5 characters masked
+    /// whole). Disjoint from `hashed_fields`. Empty on a write rule and on a
+    /// peer built before this field existed.
+    #[serde(default)]
+    pub masked_fields: Vec<String>,
+    /// The members of `fields` a read rule shows HASHED (`blake3` keyed with
+    /// the organization's key, 64 hex characters).
+    #[serde(default)]
+    pub hashed_fields: Vec<String>,
     /// See `BusAclEntryWire::subject_label`'s doc. `None` for `any`.
     #[serde(default)]
     pub subject_label: Option<String>,
@@ -582,8 +593,37 @@ pub struct BusSubjectWire {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct BusFieldActionWire {
     pub field: String,
-    /// 'show' | 'hide'.
+    /// 'show' | 'hide' | 'mask' | 'hash'.
     pub action: String,
+}
+
+/// The organization's key of hashed fields as the rotation window needs it
+/// (`FieldHashKeyInfoResponse`, `FieldHashKeyRotateResponse`): which key it
+/// is and what changing it affects. The key itself never crosses the wire.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusFieldHashKeyWire {
+    /// `false` while no read rule of the organization has hashed a field yet:
+    /// there is no key to rotate, and the three counters of the usage are 0.
+    pub exists: bool,
+    /// Starts at 1 and grows by one with every rotation; 0 without a key.
+    pub key_version: u32,
+    pub created_at_ms: i64,
+    /// When the current key was made: creation, or the last rotation.
+    pub rotated_at_ms: i64,
+    /// Read rules hashing a field, the topics and the TentaBus instances they
+    /// sit on, as THIS node knows them. A rotation changes the hash of EVERY
+    /// instance of the organization; instances hosted on other nodes of the
+    /// mesh are not counted here.
+    pub hashing_rules: u32,
+    pub hashing_topics: u32,
+    pub hashing_instances: u32,
+    /// Whether THIS node may rotate the key: only an operator node of the
+    /// organization can hand a new key to the others, so on any other node the
+    /// rotation is refused (`bus.operator_node_required`) and the window should
+    /// say so before it is opened. Absent from an older server (the dashboard
+    /// then assumes it may, as it always did).
+    #[serde(default)]
+    pub can_rotate_here: bool,
 }
 
 // =============================================================================
@@ -825,8 +865,8 @@ pub struct BusCapabilitiesWire {
     /// (every `SchemaType`) — "Dodaj wzór" offers exactly these.
     #[serde(default)]
     pub schema_types: Vec<String>,
-    /// Read-side field policy actions this server applies ('hide' today;
-    /// 'mask'/'hash' once implemented).
+    /// Read-side field policy actions this server applies beyond showing a
+    /// field as it is: 'hide', 'mask' and 'hash'.
     #[serde(default)]
     pub field_actions: Vec<String>,
     /// The caller's organisation every call of this session runs in — the
@@ -1275,9 +1315,21 @@ pub enum BusPayload {
         subject_id: String,
         /// 'write' | 'read'.
         direction: String,
+        /// Every field the rule shows — as it is, masked or hashed.
         fields: Vec<String>,
         #[serde(default)]
         required_fields: Vec<String>,
+        /// Fields of `fields` a READ rule shows masked / hashed (JSON, XML and
+        /// HL7 v2 topics only; refused on a write rule, on a binary topic and
+        /// for a field in both lists or outside `fields`). `None` — a client
+        /// from before masking, which sends only `fields` — keeps the masks
+        /// and hashes the stored rule already has (narrowed to `fields`);
+        /// `Some(vec![])` removes them. A client that knows the fields sends
+        /// `Some` always.
+        #[serde(default)]
+        masked_fields: Option<Vec<String>>,
+        #[serde(default)]
+        hashed_fields: Option<Vec<String>>,
         /// Compare-and-set against the stored row, checked in the same
         /// transaction as the write. `Some(ts)`: the rule must exist and
         /// carry exactly this `updated_at_ms` (what the list returned),
@@ -1487,6 +1539,36 @@ pub enum BusPayload {
         /// real view.
         #[serde(default)]
         limited_by_caller: bool,
+        /// `true` when a rule in play hashes a field and this node holds no key
+        /// of the organization yet (it comes from an operator node), so that
+        /// field is hidden in the preview instead of hashed — a different cause
+        /// than `limited_by_caller`, and a different way out.
+        #[serde(default)]
+        hash_key_missing: bool,
+    },
+    /// The organization's key of hashed fields, without the key: version,
+    /// age and how many rules, topics and instances hash with it (admin tier,
+    /// `bus.admin` + organization Admin). For the rotation window.
+    FieldHashKeyInfoRequest {},
+    FieldHashKeyInfoResponse {
+        key: BusFieldHashKeyWire,
+    },
+    /// Replaces the organization's hash key with a new one (admin tier,
+    /// `bus.admin` + organization Admin; audit
+    /// `bus.field_policy.hash_key.rotate`). Every hash made with the old key
+    /// stops matching, in EVERY instance of the organization. Explicit:
+    /// `expected_key_version` must be the version the confirmation named
+    /// (`FieldHashKeyInfoResponse::key.key_version`), else
+    /// `bus.field_hash_key_changed`; the default 0 never matches a key, so a
+    /// request that omits it rotates nothing. Without a key:
+    /// `bus.field_hash_key_not_found`.
+    FieldHashKeyRotateRequest {
+        #[serde(default)]
+        expected_key_version: u32,
+    },
+    FieldHashKeyRotateResponse {
+        /// The new key, with the counters as they were when it replaced the old.
+        key: BusFieldHashKeyWire,
     },
 }
 
@@ -2319,7 +2401,7 @@ mod tests {
                     "application/hl7-v2".to_string(),
                 ],
                 schema_types: vec!["json_schema".to_string()],
-                field_actions: vec!["hide".to_string()],
+                field_actions: vec!["hide".to_string(), "mask".to_string(), "hash".to_string()],
                 org_id: "org-default".to_string(),
                 org_name: Some("Przychodnia Zdrowie".to_string()),
             },
@@ -2491,8 +2573,25 @@ mod tests {
                 required_fields: vec!["patient_id".to_string()],
                 created_at_ms: 1000,
                 updated_at_ms: 2000,
+                masked_fields: vec![],
+                hashed_fields: vec![],
                 subject_label: None,
                 member_count: None,
+            }],
+        });
+        round_trip(BusPayload::FieldPolicyListResponse {
+            policies: vec![BusFieldPolicyWire {
+                subject_type: "group".to_string(),
+                subject_id: "g-1".to_string(),
+                direction: "read".to_string(),
+                fields: vec!["name".to_string(), "pesel".to_string(), "ward".to_string()],
+                required_fields: vec![],
+                created_at_ms: 1000,
+                updated_at_ms: 2000,
+                masked_fields: vec!["pesel".to_string()],
+                hashed_fields: vec!["name".to_string()],
+                subject_label: Some("Nurses".to_string()),
+                member_count: Some(4),
             }],
         });
         round_trip(BusPayload::FieldPolicySetRequest {
@@ -2502,8 +2601,22 @@ mod tests {
             direction: "read".to_string(),
             fields: vec!["patient_id".to_string()],
             required_fields: vec![],
+            masked_fields: Some(vec![]),
+            hashed_fields: Some(vec![]),
             expected_updated_at_ms: Some(2000),
             expect_absent: false,
+        });
+        round_trip(BusPayload::FieldPolicySetRequest {
+            topic: "patients.updated".to_string(),
+            subject_type: "group".to_string(),
+            subject_id: "g-1".to_string(),
+            direction: "read".to_string(),
+            fields: vec!["name".to_string(), "pesel".to_string()],
+            required_fields: vec![],
+            masked_fields: Some(vec!["pesel".to_string()]),
+            hashed_fields: Some(vec!["name".to_string()]),
+            expected_updated_at_ms: None,
+            expect_absent: true,
         });
         round_trip(BusPayload::FieldPolicySetRequest {
             topic: "patients.updated".to_string(),
@@ -2512,8 +2625,23 @@ mod tests {
             direction: "write".to_string(),
             fields: vec![],
             required_fields: vec![],
+            masked_fields: Some(vec![]),
+            hashed_fields: Some(vec![]),
             expected_updated_at_ms: None,
             expect_absent: true,
+        });
+        // "Not named" survives the wire as such, apart from an empty list.
+        round_trip(BusPayload::FieldPolicySetRequest {
+            topic: "patients.updated".to_string(),
+            subject_type: "group".to_string(),
+            subject_id: "g-1".to_string(),
+            direction: "read".to_string(),
+            fields: vec!["name".to_string()],
+            required_fields: vec![],
+            masked_fields: None,
+            hashed_fields: None,
+            expected_updated_at_ms: None,
+            expect_absent: false,
         });
         round_trip(BusPayload::FieldPolicySetResponse);
         round_trip(BusPayload::FieldPolicyDeleteRequest {
@@ -2635,6 +2763,40 @@ mod tests {
         });
     }
 
+    /// F4 B7: the hash key window's requests and answers, and an older
+    /// `FieldHashKeyRotateRequest` without a version (it rotates nothing).
+    #[test]
+    fn field_hash_key_round_trip() {
+        round_trip(BusPayload::FieldHashKeyInfoRequest {});
+        let key = BusFieldHashKeyWire {
+            exists: true,
+            key_version: 3,
+            created_at_ms: 1_000,
+            rotated_at_ms: 5_000,
+            hashing_rules: 4,
+            hashing_topics: 3,
+            hashing_instances: 2,
+            can_rotate_here: true,
+        };
+        round_trip(BusPayload::FieldHashKeyInfoResponse { key: key.clone() });
+        round_trip(BusPayload::FieldHashKeyRotateRequest {
+            expected_key_version: 3,
+        });
+        round_trip(BusPayload::FieldHashKeyRotateResponse { key });
+
+        #[derive(SerdeSerialize)]
+        enum Bare {
+            FieldHashKeyRotateRequest {},
+        }
+        let bytes = crate::cbor::encode(&Bare::FieldHashKeyRotateRequest {}).expect("encode");
+        match crate::cbor::decode::<BusPayload>(&bytes).expect("decode") {
+            BusPayload::FieldHashKeyRotateRequest {
+                expected_key_version,
+            } => assert_eq!(expected_key_version, 0),
+            other => panic!("expected FieldHashKeyRotateRequest, got {other:?}"),
+        }
+    }
+
     /// A peer built before `FieldPolicySetRequest.required_fields` existed
     /// must still decode a message that omits it, as `"leave/omit ==
     /// empty"` rather than a hard decode failure — same additive-field
@@ -2663,11 +2825,16 @@ mod tests {
         match decoded {
             BusPayload::FieldPolicySetRequest {
                 required_fields,
+                masked_fields,
+                hashed_fields,
                 expected_updated_at_ms,
                 expect_absent,
                 ..
             } => {
                 assert!(required_fields.is_empty());
+                // Older clients do not name masks and hashes: the server keeps
+                // the stored rule's (never "none", which would unmask a field).
+                assert_eq!((masked_fields, hashed_fields), (None, None));
                 // Older clients write unconditionally.
                 assert_eq!(expected_updated_at_ms, None);
                 assert!(!expect_absent);
@@ -3020,6 +3187,7 @@ mod tests {
                 },
             ],
             limited_by_caller: true,
+            hash_key_missing: true,
         });
     }
 
@@ -3466,6 +3634,10 @@ mod tests {
             "SubjectDirectoryResponse",
             "FieldPolicyPreviewRequest",
             "FieldPolicyPreviewResponse",
+            "FieldHashKeyInfoRequest",
+            "FieldHashKeyInfoResponse",
+            "FieldHashKeyRotateRequest",
+            "FieldHashKeyRotateResponse",
         ];
         assert_eq!(
             live, pinned,

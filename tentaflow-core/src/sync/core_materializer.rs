@@ -4460,6 +4460,25 @@ fn apply_bus_field_policy(
             operation.body.resource_id, expected_id
         )));
     }
+    if operation.body.action != ActionType::Delete {
+        // Every list of a rule is a JSON array of names. A row that stores
+        // anything else would make each read of its topic fail (`decode`), so
+        // it is refused here, like any other malformed payload.
+        for (column, json) in [
+            ("fields_json", Some(&row.fields_json)),
+            ("required_fields_json", row.required_fields_json.as_ref()),
+            ("masked_fields_json", row.masked_fields_json.as_ref()),
+            ("hashed_fields_json", row.hashed_fields_json.as_ref()),
+        ] {
+            if let Some(json) = json {
+                if serde_json::from_str::<Vec<String>>(json).is_err() {
+                    return Err(SyncLedgerError::Runtime(format!(
+                        "invalid bus_field_policy payload: {column} is not a JSON array of names"
+                    )));
+                }
+            }
+        }
+    }
     if operation.body.action != ActionType::Delete
         && topic_rule_write_is_stale(
             tx,
@@ -4476,12 +4495,15 @@ fn apply_bus_field_policy(
             .execute(
                 "INSERT INTO bus_field_policies \
                  (instance_id, org_id, topic, subject_type, subject_id, direction, fields_json, \
-                  required_fields_json, created_at_ms, updated_at_ms) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+                  required_fields_json, created_at_ms, updated_at_ms, masked_fields_json, \
+                  hashed_fields_json) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) \
                  ON CONFLICT(instance_id, org_id, topic, subject_type, subject_id, direction) \
                  DO UPDATE SET \
                  fields_json = excluded.fields_json, \
                  required_fields_json = excluded.required_fields_json, \
+                 masked_fields_json = excluded.masked_fields_json, \
+                 hashed_fields_json = excluded.hashed_fields_json, \
                  updated_at_ms = excluded.updated_at_ms",
                 rusqlite::params![
                     row.instance_id,
@@ -4494,6 +4516,8 @@ fn apply_bus_field_policy(
                     row.required_fields_json,
                     row.created_at_ms,
                     row.updated_at_ms,
+                    row.masked_fields_json,
+                    row.hashed_fields_json,
                 ],
             )
             .map_err(sql_error),
@@ -8260,6 +8284,8 @@ mod tests {
             required_fields_json: None,
             created_at_ms: 1,
             updated_at_ms: 1,
+            masked_fields_json: None,
+            hashed_fields_json: None,
         }
     }
 
@@ -8433,6 +8459,83 @@ mod tests {
                 .map(|r| r.generation);
             assert_eq!(row, Some(second.generation));
             assert_eq!(topic_rules(&db), (Vec::<String>::new(), Vec::<String>::new()));
+        }
+    }
+
+    /// F4 B7: a replicated read rule lands with the fields it masks and hashes
+    /// (the key never travels with it), and a row from a peer that predates
+    /// them lands with neither.
+    #[test]
+    fn a_replicated_rule_lands_with_its_masked_and_hashed_fields() {
+        let db = bus_db();
+        let create = at(bus_topic_op(&incarnation(1_000), ActionType::Insert), 1_000);
+        let mut rule = topic_policy("anna");
+        rule.fields_json = r#"["id"]"#.to_string();
+        rule.masked_fields_json = Some(r#"["pesel"]"#.to_string());
+        rule.hashed_fields_json = Some(r#"["name"]"#.to_string());
+        apply_like_the_inbox(
+            &db,
+            &[create, at(topic_policy_op(&rule, ActionType::Update), 1_500)],
+        );
+        let stored = repository::bus_field_policy_get(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+            "user",
+            "anna",
+            "read",
+        )
+        .unwrap()
+        .expect("the rule landed");
+        assert_eq!(stored.fields_json, r#"["id"]"#);
+        assert_eq!(stored.masked_fields_json.as_deref(), Some(r#"["pesel"]"#));
+        assert_eq!(stored.hashed_fields_json.as_deref(), Some(r#"["name"]"#));
+
+        let older_peer = r#"{"instance_id":"tentabus-00000001","org_id":"org-1","topic":"orders","subject_type":"user","subject_id":"bob","direction":"read","fields_json":"[\"pesel\"]","required_fields_json":null,"created_at_ms":1,"updated_at_ms":1}"#;
+        let decoded: repository::DbBusFieldPolicy = serde_json::from_str(older_peer).unwrap();
+        assert!(decoded.masked_fields_json.is_none() && decoded.hashed_fields_json.is_none());
+    }
+
+    /// F4 B7 review R1 P3-10: a replicated rule whose lists are not JSON arrays
+    /// of names would fail every read of its topic; it is refused and nothing
+    /// is stored.
+    #[test]
+    fn a_replicated_rule_with_a_malformed_list_is_refused() {
+        let create = at(bus_topic_op(&incarnation(1_000), ActionType::Insert), 1_000);
+        for (column, bad) in [
+            ("masked_fields_json", "not json"),
+            ("hashed_fields_json", r#"{"a":1}"#),
+            ("masked_fields_json", "[1,2]"),
+            ("required_fields_json", "\"x\""),
+            ("fields_json", "{"),
+        ] {
+            let db = bus_db();
+            apply_like_the_inbox(&db, &[create.clone()]);
+            let mut rule = topic_policy("anna");
+            let bad = Some(bad.to_string());
+            match column {
+                "masked_fields_json" => rule.masked_fields_json = bad,
+                "hashed_fields_json" => rule.hashed_fields_json = bad,
+                "required_fields_json" => rule.required_fields_json = bad,
+                _ => rule.fields_json = bad.unwrap(),
+            }
+            let op = at(topic_policy_op(&rule, ActionType::Update), 1_500);
+            assert!(
+                matches!(apply_core_operation(&db, &op), Err(SyncLedgerError::Runtime(_))),
+                "{column}"
+            );
+            assert!(repository::bus_field_policy_get(
+                &db,
+                "tentabus-00000001",
+                "org-1",
+                "orders",
+                "user",
+                "anna",
+                "read",
+            )
+            .unwrap()
+            .is_none());
         }
     }
 
@@ -8648,6 +8751,7 @@ mod tests {
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: crate::bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+            settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .unwrap();
         let ctx = BusCallContext {

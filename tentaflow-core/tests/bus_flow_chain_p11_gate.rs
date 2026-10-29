@@ -141,6 +141,9 @@ fn init_bus(bus_dir: PathBuf, db: DbPool) {
         dedup_expected_rate_per_sec: 200_000,
         partition_handle_lru: None,
         publish_ack_timeout: bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+        settings_cipher: Some(std::sync::Arc::new(tentaflow_core::crypto::SettingsCipher::new(
+            &[7u8; 32],
+        ))),
     })
     .expect("bus::init");
 }

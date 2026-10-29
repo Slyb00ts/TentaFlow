@@ -639,6 +639,7 @@ fn build_node(
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
             publish_ack_timeout: Duration::from_secs(5),
+            settings_cipher: Some(Arc::new(tentaflow_core::crypto::SettingsCipher::new(&[7u8; 32]))),
         })
         .expect("BusService::new"),
     );

@@ -28,6 +28,17 @@
 // rejects "MSH-1"/"MSH-2" outright; `project` always copies them through
 // untouched regardless of the policy's allow-list.
 //
+// A replaced field (mask/hash, F4 B7) is replaced as ONE text: the raw field
+// as it stands on the wire, repetitions (`~`), components (`^`) and escape
+// sequences included, goes through the replacer, and its result takes the
+// field's place. Per-component masking was rejected: it would keep the
+// component count and every short component's boundaries visible, and a
+// per-component hash could not be matched against a hash of the whole field
+// taken elsewhere. The replacement never carries a separator: any character
+// of it that is the field separator or one of the encoding characters of this
+// message (MSH-2) is swapped for a filler, so a mask cannot add a field,
+// component or escape sequence. An empty field stays empty.
+//
 // Segment terminator: the spec mandates bare CR (0x0D), but real-world
 // producers routinely use LF or CRLF — this parser treats any of CR, LF,
 // or CRLF as a segment boundary (`split_segments`) and always normalizes
@@ -39,7 +50,7 @@ use std::collections::BTreeSet;
 
 use bytes::Bytes;
 
-use super::{FormatError, PayloadFieldFormat};
+use super::{FieldReplacer, FormatError, PayloadFieldFormat, ValueShape};
 
 const SEGMENT_TERMINATOR: char = '\r';
 
@@ -57,6 +68,23 @@ fn first_field_number(id: &str) -> usize {
     } else {
         1
     }
+}
+
+/// The replacement with every separator character of the message swapped for
+/// a filler that is not one, so it cannot be read as structure.
+fn separator_safe(replacement: String, separators: &[char]) -> String {
+    if !replacement.chars().any(|c| separators.contains(&c)) {
+        return replacement;
+    }
+    // At most six separators exist (field separator + MSH-2), the list has seven.
+    let filler = ['*', '#', '_', 'x', 'X', 'z', 'Z']
+        .into_iter()
+        .find(|c| !separators.contains(c))
+        .unwrap_or('x');
+    replacement
+        .chars()
+        .map(|c| if separators.contains(&c) { filler } else { c })
+        .collect()
 }
 
 fn split_segments(text: &str) -> Vec<&str> {
@@ -163,7 +191,12 @@ impl PayloadFieldFormat for Hl7V2Format {
         Ok(out)
     }
 
-    fn project(&self, payload: &[u8], allowed: &BTreeSet<String>) -> Result<Bytes, FormatError> {
+    fn project(
+        &self,
+        payload: &[u8],
+        visible: &BTreeSet<String>,
+        replacer: Option<&dyn FieldReplacer>,
+    ) -> Result<Bytes, FormatError> {
         let text = std::str::from_utf8(payload)
             .map_err(|e| FormatError(format!("hl7: not valid utf-8: {e}")))?;
         let segments = split_segments(text);
@@ -172,6 +205,23 @@ impl PayloadFieldFormat for Hl7V2Format {
         };
         let (fsep, msh_fields) = parse_msh(first)?;
 
+        let separators: Vec<char> = std::iter::once(fsep)
+            .chain(msh_fields.first().copied().unwrap_or("").chars())
+            .collect();
+        // A visible field's text as the projection shows it.
+        let render = |addr: &str, value: &str| -> String {
+            if !visible.contains(addr) {
+                return String::new();
+            }
+            match replacer.and_then(|r| r.action(addr).map(|action| (r, action))) {
+                Some((replacer, action)) if !value.is_empty() => separator_safe(
+                    replacer.replace(action, value, ValueShape::Text),
+                    &separators,
+                ),
+                _ => value.to_string(),
+            }
+        };
+
         let mut out_segments: Vec<String> = Vec::with_capacity(segments.len());
 
         // MSH-1/MSH-2 are structural, never filtered (see module header).
@@ -179,11 +229,10 @@ impl PayloadFieldFormat for Hl7V2Format {
             .iter()
             .enumerate()
             .map(|(idx, v)| {
-                let addr = format!("MSH-{}", idx + 2);
-                if idx == 0 || allowed.contains(&addr) {
+                if idx == 0 {
                     v.to_string()
                 } else {
-                    String::new()
+                    render(&format!("MSH-{}", idx + 2), v)
                 }
             })
             .collect();
@@ -196,11 +245,10 @@ impl PayloadFieldFormat for Hl7V2Format {
                 .iter()
                 .enumerate()
                 .map(|(idx, v)| {
-                    let addr = format!("{id}-{}", first + idx);
-                    if (id == "MSH" && idx == 0) || allowed.contains(&addr) {
+                    if id == "MSH" && idx == 0 {
                         v.to_string()
                     } else {
-                        String::new()
+                        render(&format!("{id}-{}", first + idx), v)
                     }
                 })
                 .collect();
@@ -267,6 +315,7 @@ pub(super) static HL7V2_FORMAT: Hl7V2Format = Hl7V2Format;
 
 #[cfg(test)]
 mod tests {
+    use super::super::TestReplacer;
     use super::*;
 
     const SAMPLE: &str =
@@ -306,7 +355,9 @@ mod tests {
     #[test]
     fn project_blanks_disallowed_fields_in_place_without_shifting() {
         let allowed = fields(&["PID-1", "PID-3"]);
-        let out = HL7V2_FORMAT.project(SAMPLE.as_bytes(), &allowed).unwrap();
+        let out = HL7V2_FORMAT
+            .project(SAMPLE.as_bytes(), &allowed, None)
+            .unwrap();
         let text = String::from_utf8(out.to_vec()).unwrap();
         // Output uses bare CR as the segment terminator, which
         // `str::lines` does not split on.
@@ -330,7 +381,9 @@ mod tests {
     #[test]
     fn project_always_preserves_msh_1_and_msh_2_regardless_of_policy() {
         let allowed: BTreeSet<String> = BTreeSet::new(); // nothing allowed
-        let out = HL7V2_FORMAT.project(SAMPLE.as_bytes(), &allowed).unwrap();
+        let out = HL7V2_FORMAT
+            .project(SAMPLE.as_bytes(), &allowed, None)
+            .unwrap();
         let text = String::from_utf8(out.to_vec()).unwrap();
         let msh_line = split_segments(&text)[0];
         assert!(msh_line.starts_with("MSH|^~\\&|"));
@@ -377,6 +430,74 @@ mod tests {
         }
     }
 
+    fn project_hl7(message: &str, shown: &[&str], replacer: &TestReplacer<'_>) -> String {
+        let out = HL7V2_FORMAT
+            .project(message.as_bytes(), &fields(shown), Some(replacer))
+            .expect("project");
+        String::from_utf8(out.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn four_kinds_of_field_in_one_hl7_message() {
+        let replacer = TestReplacer::tagging(&["PID-5"], &["PID-3"]);
+        let got = project_hl7(SAMPLE, &["MSH-9", "PID-1", "PID-3", "PID-5"], &replacer);
+        // MSH-9 and PID-1 stay, PID-3 is hashed and PID-5 masked as ONE text
+        // (the test replacer echoes the whole `Doe^Jan`, whose `^` the codec
+        // then swaps for a filler), every other field is blanked in place.
+        assert_eq!(
+            got,
+            "MSH|^~\\&|||||||ADT^A01|||\rPID|1||H[MRN123]||M[Doe*Jan]|||\r"
+        );
+    }
+
+    #[test]
+    fn an_empty_field_stays_empty_and_every_occurrence_is_replaced() {
+        let replacer = TestReplacer::tagging(&["OBX-5"], &[]);
+        let msg = "MSH|^~\\&|A|B|C|D|2026||ORU^R01|1|P|2.5\rOBX|1|ST|A||v1\rOBX|2|ST|B||\rOBX|3|ST|C||v3\r";
+        let got = project_hl7(msg, &["OBX-1", "OBX-5"], &replacer);
+        assert_eq!(
+            split_segments(&got)[1..],
+            ["OBX|1||||M[v1]", "OBX|2||||", "OBX|3||||M[v3]"]
+        );
+    }
+
+    #[test]
+    fn a_replacement_never_carries_a_separator_of_the_message() {
+        let leaky = TestReplacer {
+            masked: &["PID-5"],
+            hashed: &["PID-3"],
+            output: &|_, _, _| "a^b~c\\d&e|f#g".to_string(),
+        };
+        let got = project_hl7(SAMPLE, &["PID-3", "PID-5"], &leaky);
+        let pid = split_segments(&got)[1].to_string();
+        // `|` `^` `~` `\` `&` swapped for `*`; `#` (not a separator here) stays.
+        assert_eq!(pid, "PID|||a*b*c*d*e*f#g||a*b*c*d*e*f#g|||");
+        assert_eq!(
+            pid.split('|').count(),
+            split_segments(SAMPLE)[1].split('|').count(),
+            "no field was added"
+        );
+
+        // A message whose own separators include `*` gets another filler.
+        let star = "MSH*^~\\&*A*B\rPID*1**x\r";
+        let mask = TestReplacer {
+            masked: &["PID-3"],
+            hashed: &[],
+            output: &|_, _, _| "***".to_string(),
+        };
+        let got = project_hl7(star, &["PID-3"], &mask);
+        assert_eq!(split_segments(&got)[1], "PID***###");
+    }
+
+    #[test]
+    fn a_replaced_msh_field_is_replaced_and_the_structural_ones_are_not() {
+        let replacer = TestReplacer::tagging(&["MSH-3", "MSH-2"], &["MSH-10"]);
+        let got = project_hl7(SAMPLE, &["MSH-3", "MSH-10"], &replacer);
+        let msh = split_segments(&got)[0].to_string();
+        assert!(msh.starts_with("MSH|^~\\&|M[APP]|"), "{msh}");
+        assert!(msh.contains("|H[MSG1]|"), "{msh}");
+    }
+
     #[test]
     fn a_repeated_msh_is_addressed_like_the_first() {
         let msg = "MSH|^~\\&|A|B|C|D|2026||ADT^A01|1\rMSH|^~\\&|A|B|C|D|2026||ADT^A01|2\r";
@@ -385,7 +506,7 @@ mod tests {
         assert!(got.contains("MSH-10"));
         // The encoding characters of the second MSH survive an empty policy.
         let out = HL7V2_FORMAT
-            .project(msg.as_bytes(), &BTreeSet::new())
+            .project(msg.as_bytes(), &BTreeSet::new(), None)
             .unwrap();
         let text = String::from_utf8(out.to_vec()).unwrap();
         assert!(split_segments(&text)[1].starts_with("MSH|^~\\&|"));

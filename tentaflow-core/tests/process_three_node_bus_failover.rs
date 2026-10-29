@@ -1837,6 +1837,7 @@ async fn child_main() {
         // into "the new leader never replied".
         publish_ack_timeout: Duration::from_millis(1500),
         partition_handle_lru: None,
+        settings_cipher: Some(Arc::new(tentaflow_core::crypto::SettingsCipher::new(&[7u8; 32]))),
     })
     .expect("bus init");
 

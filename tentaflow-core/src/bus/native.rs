@@ -210,6 +210,15 @@ fn guard_fleet_identity(ctx: &NativeAppContext, node_id: Option<String>) -> Resu
 /// the `REPLICATION_MANAGERS` guard above only blocks a redundant SECOND
 /// attempt, not every attempt after the first one skipped.
 pub fn native_on_enable(ctx: &NativeAppContext) -> Result<()> {
+    native_on_enable_with(ctx, crate::addon::native_apps::global_settings_cipher())
+}
+
+/// `native_on_enable` with the node's settings cipher given (`None`: the node
+/// has none to give, a bare test or tooling context).
+fn native_on_enable_with(
+    ctx: &NativeAppContext,
+    settings_cipher: Option<Arc<crate::crypto::SettingsCipher>>,
+) -> Result<()> {
     let _guard = ENABLE_DISABLE_LOCK.lock();
 
     // Re-provisions the content db — cheap and idempotent (`native_init`'s
@@ -275,6 +284,20 @@ pub fn native_on_enable(ctx: &NativeAppContext) -> Result<()> {
         checker,
     ));
 
+    // The node's own settings cipher — the one `AddonManager::new` was given
+    // and the mesh seals with (the master key of the entry point's data dir:
+    // desktop and mobile keep it elsewhere than the default location, and
+    // reading the default one would create a stray file). The bus is not
+    // refused without it: only the rules that hash a field are, and those
+    // hide the field (`field_hash_key`).
+    if settings_cipher.is_none() {
+        tracing::warn!(
+            "native_on_enable '{}': the node's settings cipher is not available — hashed \
+             fields stay hidden on this bus until it is",
+            ctx.addon_id
+        );
+    }
+
     let service = crate::bus::init_instance(BusInitConfig {
         instance_id: instance_id.clone(),
         bus_dir,
@@ -285,6 +308,7 @@ pub fn native_on_enable(ctx: &NativeAppContext) -> Result<()> {
         dedup_expected_rate_per_sec: DEFAULT_DEDUP_RATE_PER_SEC,
         partition_handle_lru: None,
         publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+        settings_cipher,
     })?;
 
     if replication_managers().contains_key(&instance_id) {
@@ -1189,6 +1213,59 @@ mod tests {
         );
 
         native_on_disable(&ctx_b);
+    }
+
+    /// F4 B7 review R1 P2-4: the bus seals the organization's hash key with
+    /// the node's own settings cipher (the one the mesh uses), never with a
+    /// master key it reads from the default location itself — on desktop and
+    /// mobile the master key lives in the data dir, and the default lookup
+    /// would also create a stray `master.key`. A node that gives no cipher
+    /// still gets a running bus.
+    #[test]
+    fn enable_seals_the_hash_key_with_the_nodes_cipher_and_starts_without_one() {
+        let _home = locked_test_home();
+        let key_file = crate::crypto::master_key_path(None).expect("master key path");
+        let existed = key_file.exists();
+        let db = test_db();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let node_cipher = Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
+
+        let addon_id = unique_addon_id();
+        install_row(&db, &addon_id);
+        let c = ctx(&db, &addon_id, tmp.path().to_path_buf());
+        let id = BusInstanceId::parse(&addon_id).expect("valid id");
+        native_on_enable_with(&c, Some(node_cipher.clone())).expect("enable with the cipher");
+        let svc = crate::bus::instance(&id).expect("engine running");
+        svc.field_hash_keys().get_or_create("org-1").expect("key");
+        let row = crate::db::repository::bus_field_hash_key_get(&db, "org-1")
+            .unwrap()
+            .expect("stored key");
+        let opened = node_cipher
+            .decrypt_bound(&row.encrypted_key, b"bus-field-hash-key|org-1")
+            .expect("the node's cipher opens it");
+        assert!(opened.bound);
+        // The mesh side (same cipher) reads what the bus stored.
+        assert!(crate::bus::field_hash_key::FieldHashKeys::new(db.clone(), node_cipher.clone())
+            .get("org-1")
+            .unwrap()
+            .is_some());
+        native_on_disable(&c);
+
+        let bare_id = unique_addon_id();
+        install_row(&db, &bare_id);
+        let bare = ctx(&db, &bare_id, tmp.path().join("bare"));
+        native_on_enable_with(&bare, None).expect("enable without a cipher");
+        let id = BusInstanceId::parse(&bare_id).expect("valid id");
+        let svc = crate::bus::instance(&id).expect("engine running");
+        assert!(svc.field_hash_keys().get_or_create("org-2").is_err());
+        assert!(svc.field_hash_keys().for_read("org-1").is_none());
+        native_on_disable(&bare);
+
+        assert_eq!(
+            key_file.exists(),
+            existed,
+            "enabling the bus did not create a master key file"
+        );
     }
 
     #[test]

@@ -63,8 +63,8 @@ use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     BusAclEntryWire, BusBrowsePartitionInfoWire, BusCapabilitiesWire, BusDlqListResultWire,
     BusDlqRecordWire, BusDlqSampleWire, BusFailoverEventWire, BusFieldActionWire,
-    BusFieldPolicyWire, BusGroupDetailWire, BusGroupLagSeriesWire, BusGroupLagSummaryWire,
-    BusGroupPartitionDetailWire, BusGroupStatsWire, BusGroupSummaryWire, BusHeaderWire,
+    BusFieldHashKeyWire, BusFieldPolicyWire, BusGroupDetailWire, BusGroupLagSeriesWire,
+    BusGroupLagSummaryWire, BusGroupPartitionDetailWire, BusGroupStatsWire, BusGroupSummaryWire, BusHeaderWire,
     BusLagSampleWire, BusMessagePreviewWire, BusMessagesBrowseResultWire, BusOffsetResetMode,
     BusPartitionInfoWire, BusPartitionOffsetWire, BusPartitionReplicaWire, BusPayload,
     BusQuotaWire, BusReplicaLagWire, BusReplicaNodeWire, BusSchemaSubjectWire,
@@ -502,6 +502,13 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
         BusServiceError::KeyNeedsTopicWideRule { topic, direction } => ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
             format!("bus.key_needs_topic_wide_rule: topic '{topic}' direction={direction}"),
+        ),
+        BusServiceError::FieldHashKeyNotFound { org_id } => {
+            ProtocolError::not_found(format!("bus.field_hash_key_not_found: organization '{org_id}'"))
+        }
+        BusServiceError::FieldHashKeyChanged { org_id } => ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            format!("bus.field_hash_key_changed: organization '{org_id}'"),
         ),
         // SUM/tentabus/PLAN-F3.md §4.7/§6 — schema registry errors.
         // `SchemaViolation`/`SchemaIncompatible`/`SchemaRefIdCollision` are
@@ -1500,6 +1507,8 @@ pub async fn bus_dispatch(
             direction,
             fields,
             required_fields,
+            masked_fields,
+            hashed_fields,
             expected_updated_at_ms,
             expect_absent,
         } => {
@@ -1512,6 +1521,8 @@ pub async fn bus_dispatch(
                 direction.clone(),
                 fields.clone(),
                 required_fields.clone(),
+                masked_fields.clone(),
+                hashed_fields.clone(),
                 *expected_updated_at_ms,
                 *expect_absent,
             )
@@ -1654,6 +1665,10 @@ pub async fn bus_dispatch(
         BusPayload::SubjectDirectoryRequest { kind, query } => {
             subject_directory_v1(ctx, instance_id, kind.clone(), query.clone()).await?
         }
+        BusPayload::FieldHashKeyInfoRequest {} => field_hash_key_info_v1(ctx, instance_id).await?,
+        BusPayload::FieldHashKeyRotateRequest {
+            expected_key_version,
+        } => field_hash_key_rotate_v1(ctx, instance_id, *expected_key_version).await?,
         BusPayload::FieldPolicyPreviewRequest {
             topic,
             partition,
@@ -1710,7 +1725,9 @@ pub async fn bus_dispatch(
         | BusPayload::LagHistoryResponse { .. }
         | BusPayload::OffsetForTimestampResponse { .. }
         | BusPayload::SubjectDirectoryResponse { .. }
-        | BusPayload::FieldPolicyPreviewResponse { .. } => {
+        | BusPayload::FieldPolicyPreviewResponse { .. }
+        | BusPayload::FieldHashKeyInfoResponse { .. }
+        | BusPayload::FieldHashKeyRotateResponse { .. } => {
             return Err(ProtocolError::bad_request(
                 "variant is not routed through bus_dispatch (UserSession tier)",
             ))
@@ -1829,6 +1846,14 @@ register_bus_variant!(
 register_bus_variant!(
     "BusFieldPolicyPreviewRequest",
     "tentaflow_ws_handler_bus_field_policy_preview"
+);
+register_bus_variant!(
+    "BusFieldHashKeyInfoRequest",
+    "tentaflow_ws_handler_bus_field_hash_key_info"
+);
+register_bus_variant!(
+    "BusFieldHashKeyRotateRequest",
+    "tentaflow_ws_handler_bus_field_hash_key_rotate"
 );
 
 // plan-app-platform §4.2/§7 W7: the 11 variants formerly routed through
@@ -3237,6 +3262,8 @@ async fn field_policy_list_v1(
                         required_fields: p.required_fields.into_iter().collect(),
                         created_at_ms,
                         updated_at_ms,
+                        masked_fields: p.masked_fields.into_iter().collect(),
+                        hashed_fields: p.hashed_fields.into_iter().collect(),
                         subject_label,
                         member_count,
                     })
@@ -3258,6 +3285,8 @@ async fn field_policy_set_v1(
     direction: String,
     fields: Vec<String>,
     required_fields: Vec<String>,
+    masked_fields: Option<Vec<String>>,
+    hashed_fields: Option<Vec<String>>,
     expected_updated_at_ms: Option<i64>,
     expect_absent: bool,
 ) -> Result<BusPayload, ProtocolError> {
@@ -3286,8 +3315,23 @@ async fn field_policy_set_v1(
         (topic.clone(), subject_type.clone(), subject_id.clone());
     let fields_set: std::collections::BTreeSet<String> = fields.into_iter().collect();
     let required_set: std::collections::BTreeSet<String> = required_fields.into_iter().collect();
-    run_blocking(move || {
-        field_policies::set_policy(
+    // `None`: a client from before masking — the stored rule's marks stay
+    // (`field_policies::set_policy_marks`).
+    let masked_set: Option<std::collections::BTreeSet<String>> =
+        masked_fields.map(|v| v.into_iter().collect());
+    let hashed_set: Option<std::collections::BTreeSet<String>> =
+        hashed_fields.map(|v| v.into_iter().collect());
+    let mask_count = |set: &Option<std::collections::BTreeSet<String>>| {
+        set.as_ref().map_or_else(|| "kept".to_string(), |set| set.len().to_string())
+    };
+    let (masks, hashed_count) = (mask_count(&masked_set), mask_count(&hashed_set));
+    let svc = g.svc.clone();
+    let key_org = g.org_id.clone();
+    let node_id = ctx.state.local_node_id.to_string();
+    let adds_hash = run_blocking(move || {
+        // Every check of the rule comes first and writes nothing: a request
+        // that is refused makes no key.
+        let prepared = field_policies::prepare_policy(
             &db,
             &instance,
             &org_id,
@@ -3297,11 +3341,33 @@ async fn field_policy_set_v1(
             dir,
             &fields_set,
             &required_set,
+            masked_set.as_ref(),
+            hashed_set.as_ref(),
             expect,
         )
-        .map_err(map_bus_error)
+        .map_err(map_bus_error)?;
+        // The organization's key exists, and starts to replicate, from the
+        // first rule that hashes — a read never makes it. Only a rule that
+        // hashes a field the stored one did not needs it now: an edit that
+        // keeps its hashes (the UI always sends them) is not held up by a key
+        // that has not reached this node yet. Made BEFORE the rule is written,
+        // so a key that cannot be made or opened leaves no rule behind that
+        // every read would then hide.
+        let adds_hash = prepared.adds_hashed_fields();
+        if adds_hash {
+            let keys = svc.field_hash_keys();
+            if keys.info(&key_org).map_err(map_bus_error)?.is_none() {
+                require_key_maker(&db, &node_id, &key_org)?;
+            }
+            keys.get_or_create(&key_org).map_err(map_bus_error)?;
+        }
+        field_policies::commit_policy(&db, prepared).map_err(map_bus_error)?;
+        Ok(adds_hash)
     })
     .await?;
+    if adds_hash {
+        push_shared_secrets(ctx);
+    }
     let _ = repository::log_audit(
         &ctx.state.db,
         Some(&actor),
@@ -3309,12 +3375,180 @@ async fn field_policy_set_v1(
         "bus.field_policy.set",
         Some(&topic),
         Some(&format!(
-            "subject_type={subject_type} subject_id={subject_id} direction={direction}"
+            "subject_type={subject_type} subject_id={subject_id} direction={direction} \
+             masked={masks} hashed={hashed_count}"
         )),
         None,
         Some(&ctx.state.local_node_id),
     );
     Ok(BusPayload::FieldPolicySetResponse)
+}
+
+/// The code of a refusal on a node that is not an operator.
+const OPERATOR_NODE_REQUIRED: &str = "bus.operator_node_required";
+
+/// The code of a refusal on a node whose organization already hashes with a
+/// key that has not reached it yet.
+const HASH_KEY_NOT_SYNCED: &str = "bus.hash_key_not_synced";
+
+/// Whether this node is on its organization's operator list.
+fn node_is_operator(db: &crate::db::DbPool, node_id: &str) -> Result<bool, ProtocolError> {
+    repository::node_is_operator(db, node_id).map_err(|e| db_err("node_is_operator", e))
+}
+
+/// Rotating an organization's hash key is allowed on an operator node only:
+/// the other nodes take a key from operators alone
+/// (`mesh::shared_secrets::ingest`), so a key made anywhere else would never
+/// reach them. The refusal does not name the node (the text is for the person
+/// at the screen; the node id goes to the log).
+fn require_operator_node(
+    db: &crate::db::DbPool,
+    node_id: &str,
+    what: &str,
+) -> Result<(), ProtocolError> {
+    if node_is_operator(db, node_id)? {
+        return Ok(());
+    }
+    tracing::info!(node = %node_id, "refused: {what} needs an operator node");
+    Err(ProtocolError::new(
+        ProtocolErrorCode::PolicyDenied,
+        format!(
+            "{OPERATOR_NODE_REQUIRED}: {what} needs an operator node of the organization and \
+             this node is not one; do it from an operator node"
+        ),
+    ))
+}
+
+/// Whether this node may make the organization's FIRST hash key now. Two
+/// different refusals, because they have different ways out:
+/// - the organization already has rules that hash (so its key exists on some
+///   node) and this node has not received it yet: `bus.hash_key_not_synced` —
+///   a key made here would be a second key, and the fleet's older one would
+///   replace it, leaving the hashes made meanwhile matching nothing. Wait for
+///   the synchronization (or check the connection to the operator node);
+/// - the organization has no key anywhere and this node is not an operator:
+///   `bus.operator_node_required` — it could not hand the key to the others.
+fn require_key_maker(
+    db: &crate::db::DbPool,
+    node_id: &str,
+    org_id: &str,
+) -> Result<(), ProtocolError> {
+    let usage = repository::bus_field_hash_usage(db, org_id)
+        .map_err(|e| db_err("bus_field_hash_usage", e))?;
+    if usage.rules > 0 {
+        tracing::info!(node = %node_id, org = %org_id, "refused: the organization's hash key has not reached this node yet");
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            format!(
+                "{HASH_KEY_NOT_SYNCED}: the organization already hashes fields with a key that \
+                 has not reached this node yet; wait for the synchronization or check the \
+                 connection to the operator node"
+            ),
+        ));
+    }
+    require_operator_node(db, node_id, "the first rule that hashes a field")
+}
+
+/// Sends the node's shared secrets, which include the organizations' hash
+/// keys, to the trusted peers now instead of at their next connect.
+fn push_shared_secrets(ctx: &HandlerContext) {
+    if let Some(mesh) = ctx.state.quic_mesh.clone() {
+        tokio::spawn(async move { mesh.push_shared_secrets_to_trusted(None).await });
+    }
+}
+
+fn field_hash_key_wire(
+    info: Option<bus::field_hash_key::FieldHashKeyInfo>,
+    usage: repository::BusFieldHashUsage,
+    can_rotate_here: bool,
+) -> BusFieldHashKeyWire {
+    BusFieldHashKeyWire {
+        can_rotate_here,
+        exists: info.is_some(),
+        key_version: info.map_or(0, |i| i.key_version),
+        created_at_ms: info.map_or(0, |i| i.created_at_ms),
+        rotated_at_ms: info.map_or(0, |i| i.rotated_at_ms),
+        hashing_rules: usage.rules,
+        hashing_topics: usage.topics,
+        hashing_instances: usage.instances,
+    }
+}
+
+/// The organization's hash key without the key: what the rotation window
+/// shows before it asks for the confirmation. Admin tier (`bus.admin` and the
+/// organization Admin role), like the rotation itself.
+async fn field_hash_key_info_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
+    let svc = g.svc.clone();
+    let db = ctx.state.db.clone();
+    let org_id = g.org_id.clone();
+    let node_id = ctx.state.local_node_id.to_string();
+    let key = run_blocking(move || {
+        let info = svc.field_hash_keys().info(&org_id).map_err(map_bus_error)?;
+        let usage = repository::bus_field_hash_usage(&db, &org_id)
+            .map_err(|e| db_err("bus_field_hash_usage", e))?;
+        let operator = node_is_operator(&db, &node_id)?;
+        Ok(field_hash_key_wire(info, usage, operator))
+    })
+    .await?;
+    Ok(BusPayload::FieldHashKeyInfoResponse { key })
+}
+
+/// Replaces the organization's hash key. Only an administrator of the bus
+/// instance (`bus.admin` and the organization Admin role), only with the
+/// version the confirmation named: every hash made with the old key stops
+/// matching, in EVERY instance of the organization. Audited as
+/// `bus.field_policy.hash_key.rotate` — the versions and the counters of what
+/// the rotation affects, never the key. The new key goes to the trusted peers
+/// at once.
+async fn field_hash_key_rotate_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    expected_key_version: u32,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
+    let svc = g.svc.clone();
+    let db = ctx.state.db.clone();
+    let org_id = g.org_id.clone();
+    let node_id = ctx.state.local_node_id.to_string();
+    let result = run_blocking(move || {
+        require_operator_node(&db, &node_id, "rotating the hash key")?;
+        let usage = repository::bus_field_hash_usage(&db, &org_id)
+            .map_err(|e| db_err("bus_field_hash_usage", e))?;
+        let info = svc
+            .field_hash_keys()
+            .rotate(&org_id, expected_key_version)
+            .map_err(map_bus_error)?;
+        Ok(field_hash_key_wire(Some(info), usage, true))
+    })
+    .await;
+    let outcome = match &result {
+        Ok(key) => format!(
+            "outcome=ok from_version={expected_key_version} to_version={} rules={} topics={} \
+             instances={}",
+            key.key_version, key.hashing_rules, key.hashing_topics, key.hashing_instances
+        ),
+        Err(e) => format!(
+            "outcome=refused:{} from_version={expected_key_version}",
+            audit_error_code(e)
+        ),
+    };
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        Some(&g.user_id),
+        None,
+        "bus.field_policy.hash_key.rotate",
+        Some(&g.org_id),
+        Some(&outcome),
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+    let key = result?;
+    push_shared_secrets(ctx);
+    Ok(BusPayload::FieldHashKeyRotateResponse { key })
 }
 
 async fn field_policy_delete_v1(
@@ -3554,6 +3788,84 @@ async fn field_policy_preview_v1(
     result
 }
 
+/// Whether the caller's own rule leaves the record narrower than the subject
+/// would see it: some field the subject is shown reaches the preview with
+/// less (hidden) or as another form of its value (masked or hashed by the
+/// caller's rule), because the preview applies the subject's rule on top of
+/// what the caller already reads. A field the caller sees as it is, or that
+/// the subject does not see at all, makes no difference.
+fn preview_is_limited(
+    caller: &field_policies::FieldPolicy,
+    subject: &field_policies::FieldPolicy,
+) -> bool {
+    subject.fields.iter().any(|field| {
+        let seen_by_caller = caller.action(field);
+        seen_by_caller != field_policies::FieldAction::Show
+            && seen_by_caller != subject.action(field)
+    })
+}
+
+/// The subject's rule as the preview applies it over the record the caller
+/// already reads through its own rule. A field the caller reads masked or
+/// hashed is already that value: masking it again is harmless (`mask_text` is
+/// idempotent) but hashing it again — or masking a hash, or hashing a mask —
+/// would show something no real read ever returns. Such a field is therefore
+/// passed on as the caller reads it. When the subject's form of it is the
+/// same one that IS the subject's value (the caller's hash is the hash under
+/// the organization's key, as the subject's would be); when it differs the
+/// view is narrower, which `preview_is_limited` reports.
+fn preview_rule_over(
+    caller: Option<&field_policies::FieldPolicy>,
+    subject: &field_policies::FieldPolicy,
+) -> field_policies::FieldPolicy {
+    let mut rule = subject.clone();
+    let Some(caller) = caller else {
+        return rule;
+    };
+    for field in &subject.fields {
+        if matches!(
+            caller.action(field),
+            field_policies::FieldAction::Mask | field_policies::FieldAction::Hash
+        ) {
+            rule.masked_fields.remove(field);
+            rule.hashed_fields.remove(field);
+        }
+    }
+    rule
+}
+
+/// What the preview shows for one field once the subject's rule (`rule`, as
+/// `preview_rule_over` composed it) is applied over the caller's own: the
+/// caller's mask or hash when the field was already one (it is passed on as
+/// read), else the rule's action, with a hash that cannot be made for want of
+/// the organization's key shown as the hiding it really is.
+fn preview_effective_action(
+    caller: Option<&field_policies::FieldPolicy>,
+    rule: Option<&field_policies::FieldPolicy>,
+    field: &str,
+    have_key: bool,
+) -> field_policies::FieldAction {
+    use field_policies::FieldAction;
+    let by_rule = rule.map_or(FieldAction::Show, |rule| rule.action(field));
+    if by_rule == FieldAction::Hide {
+        return FieldAction::Hide;
+    }
+    // Already in the payload as the caller reads it (`preview_rule_over` took
+    // the rule's own mark off it). A caller's hash without the key never gets
+    // here: it was hidden before the preview saw the record.
+    if let Some(caller_action) = caller
+        .map(|c| c.action(field))
+        .filter(|a| matches!(a, FieldAction::Mask | FieldAction::Hash))
+    {
+        return caller_action;
+    }
+    if by_rule == FieldAction::Hash && !have_key {
+        FieldAction::Hide
+    } else {
+        by_rule
+    }
+}
+
 /// The stable code a refusal carries as the first token of its message
 /// (`bus.permission_denied`, …), else the coarse protocol code.
 fn audit_error_code(e: &ProtocolError) -> String {
@@ -3635,7 +3947,7 @@ async fn field_policy_preview(
     let instance = g.instance.as_str().to_string();
     let (topic2, subject_type2, subject_id2) =
         (topic.clone(), subject_type.clone(), subject_id.clone());
-    let (record, applied, limited_by_caller) = run_blocking(move || {
+    let (record, applied, limited_by_caller, hash_key_missing) = run_blocking(move || {
         let topic = topic2;
         let subject = field_policies::PolicySubject::parse(&subject_type2, &subject_id2)
             .expect("validated before the blocking task");
@@ -3677,38 +3989,64 @@ async fn field_policy_preview(
         )
         .map_err(map_bus_error)?;
         let format = bus::payload_format::PayloadFormat::from_content_type(&cfg.content_type);
+        let mut key_missing = false;
+        // The subject's rule as it is applied over what the caller already
+        // reads: the caller's own mask or hash is already in the payload and is
+        // composed over, never applied twice (`preview_rule_over`).
+        let rule = subject_rule
+            .as_ref()
+            .map(|rule| preview_rule_over(caller_rule.as_ref(), rule));
+        let hash_key = rule.as_ref().and_then(|rule| rule.hash_key(svc.field_hash_keys(), &org_id));
+        if let Some(rule) = &rule {
+            key_missing |= !rule.hashed_fields.is_empty() && hash_key.is_none();
+        }
         // Fields of the record as the caller already sees it: a field the
-        // caller's own rule hides is not named here either.
+        // caller's own rule hides is not named here either. What each one
+        // became is what the payload below shows, not what the subject's rule
+        // alone would say: a field the caller reads masked stays that for a
+        // subject who hashes it, and a field that should be hashed but cannot
+        // be (this node has no key) is hidden.
         let applied = format
             .codec()
             .list_fields(&rec.payload)
             .unwrap_or_default()
             .into_iter()
             .map(|field| {
-                let shown = subject_rule
-                    .as_ref()
-                    .is_none_or(|rule| rule.fields.contains(&field));
+                let action = preview_effective_action(
+                    caller_rule.as_ref(),
+                    rule.as_ref(),
+                    &field,
+                    hash_key.is_some(),
+                );
                 BusFieldActionWire {
                     field,
-                    action: if shown { "show" } else { "hide" }.to_string(),
+                    action: action.as_str().to_string(),
                 }
             })
             .collect::<Vec<_>>();
-        if let Some(rule) = &subject_rule {
-            rec.payload = field_policies::project_read(rule, format, &rec.payload);
+        if let Some(rule) = &rule {
+            rec.payload =
+                field_policies::project_read(rule, format, &rec.payload, hash_key.as_deref());
         }
+        // A hashed field of the caller's own rule is hidden when this node
+        // holds no key (yet): the view is narrower than the subject's.
+        key_missing |= caller_rule.as_ref().is_some_and(|rule| {
+            !rule.hashed_fields.is_empty()
+                && rule.hash_key(svc.field_hash_keys(), &org_id).is_none()
+        });
         let limited_by_caller = match (&caller_rule, &subject_rule) {
             (None, _) => false,
             (Some(_), None) => true,
-            (Some(caller), Some(subject)) => !subject.fields.is_subset(&caller.fields),
+            (Some(caller), Some(subject)) => preview_is_limited(caller, subject),
         };
-        Ok((record_to_preview(&rec), applied, limited_by_caller))
+        Ok((record_to_preview(&rec), applied, limited_by_caller, key_missing))
     })
     .await?;
     Ok(BusPayload::FieldPolicyPreviewResponse {
         record,
         applied,
         limited_by_caller,
+        hash_key_missing,
     })
 }
 
@@ -4323,9 +4661,14 @@ async fn lag_history_v1(
 // toru P task 5)
 // =============================================================================
 
-/// The one read-side field policy action implemented today: a field outside
-/// the policy's allow-list is removed (`field_policies::project_read`).
-const FIELD_ACTION_HIDE: &str = "hide";
+/// The read-side actions beyond showing a field as it is, which
+/// `field_policies::project_read` applies: a field outside the policy's
+/// allow-list is removed, a shown one can be masked or hashed.
+const FIELD_ACTIONS: [field_policies::FieldAction; 3] = [
+    field_policies::FieldAction::Hide,
+    field_policies::FieldAction::Mask,
+    field_policies::FieldAction::Hash,
+];
 
 /// The content type of a topic that carries Avro, Protobuf or Thrift bytes.
 const BINARY_CONTENT_TYPE: &str = "application/octet-stream";
@@ -4386,7 +4729,7 @@ async fn capabilities_v1(
             .iter()
             .map(|t| t.as_str().to_string())
             .collect(),
-        field_actions: vec![FIELD_ACTION_HIDE.to_string()],
+        field_actions: FIELD_ACTIONS.iter().map(|a| a.as_str().to_string()).collect(),
         org_id: g.org_id.clone(),
         org_name,
     };
@@ -5172,7 +5515,18 @@ mod tests {
             .get_or_init(|| {
                 let conn = rusqlite::Connection::open_in_memory().expect("open db");
                 crate::db::migrations::run(&conn).expect("run migrations");
-                std::sync::Arc::new(crate::db::Db::from_connection(conn))
+                let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+                // The node of `AppState::for_test` is an operator, as the node
+                // of a fresh install is (`ensure_local_node_in_sync_identity`):
+                // the first hashing rule and a key rotation need one.
+                repository::ensure_local_node_in_sync_identity(
+                    &db,
+                    "test-node",
+                    "test-node-public-key",
+                    "macos",
+                )
+                .expect("local node row");
+                db
             })
             .clone();
         if bus::instance(&fixture_instance_id()).is_none() {
@@ -5197,6 +5551,7 @@ mod tests {
                 dedup_expected_rate_per_sec: 10_000,
                 partition_handle_lru: None,
                 publish_ack_timeout: bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+                settings_cipher: Some(std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[7u8; 32]))),
             })
             .expect("bus init");
             // Kept alive for the process (mirrors `locked_env_fixture`'s own
@@ -6131,7 +6486,7 @@ mod tests {
                         "hl7v2_profile"
                     ]
                 );
-                assert_eq!(capabilities.field_actions, vec!["hide"]);
+                assert_eq!(capabilities.field_actions, vec!["hide", "mask", "hash"]);
                 // `handler_ctx` always mints an "admin"-role `UserSession`
                 // (see its own doc) — this is the SEPARATE
                 // `SessionAuthKind::Admin` site-admin tier, independent of
@@ -7573,6 +7928,8 @@ mod tests {
             "read".to_string(),
             vec!["a".to_string()],
             vec![],
+            Some(vec![]),
+            Some(vec![]),
             None,
             false,
         )
@@ -7609,6 +7966,8 @@ mod tests {
                 "write".to_string(),
                 vec!["a".to_string()],
                 vec![],
+                Some(vec![]),
+                Some(vec![]),
                 None,
                 false,
             )
@@ -7846,6 +8205,8 @@ mod tests {
             "read".to_string(),
             vec!["a".to_string()],
             vec![],
+            Some(vec![]),
+            Some(vec![]),
             None,
             false,
         )
@@ -7923,6 +8284,8 @@ mod tests {
                     "read".to_string(),
                     fields,
                     vec![],
+                    Some(vec![]),
+                    Some(vec![]),
                     expected,
                     absent,
                 )
@@ -8022,6 +8385,8 @@ mod tests {
                     "read".to_string(),
                     fields,
                     vec![],
+                    Some(vec![]),
+                    Some(vec![]),
                     expected,
                     expected.is_none(),
                 )
@@ -8117,6 +8482,8 @@ mod tests {
             "write".to_string(),
             vec!["patient_id".to_string(), "status".to_string()],
             vec!["patient_id".to_string()],
+            Some(vec![]),
+            Some(vec![]),
             None,
             false,
         )
@@ -8196,6 +8563,8 @@ mod tests {
             "sideways".to_string(),
             vec!["patient_id".to_string()],
             vec![],
+            Some(vec![]),
+            Some(vec![]),
             None,
             false,
         )
@@ -8221,6 +8590,8 @@ mod tests {
             "write".to_string(),
             vec!["patient_id".to_string()],
             vec![],
+            Some(vec![]),
+            Some(vec![]),
             None,
             false,
         )
@@ -8553,6 +8924,8 @@ mod tests {
             "read".to_string(),
             vec!["patient_id".to_string(), "status".to_string()],
             vec![],
+            Some(vec![]),
+            Some(vec![]),
             None,
             false,
         )
@@ -9273,6 +9646,8 @@ mod tests {
             "read".to_string(),
             vec!["id".to_string()],
             vec![],
+            Some(vec![]),
+            Some(vec![]),
             None,
             false,
         )
@@ -9729,6 +10104,11 @@ mod tests {
     ) -> String {
         let inst = fixture_instance_id();
         let topic = format!("wyniki.{}", uuid::Uuid::new_v4().simple());
+        // The DLQ keeps the record as the log holds it, so a record the
+        // topic's schema rejects is one that was published before the schema
+        // was bound: the schema and its validation are bound after the
+        // records are in.
+        let (schema_id, validation) = (options.schema_id.clone(), options.validation.clone());
         topic_create_v1(
             ctx,
             inst.as_str(),
@@ -9736,6 +10116,8 @@ mod tests {
             BusTopicOptionsWire {
                 partitions: Some(2),
                 max_delivery_attempts: Some(1),
+                schema_id: None,
+                validation: None,
                 ..options
             },
         )
@@ -9756,7 +10138,7 @@ mod tests {
                             records: vec![bus::PublishRecord {
                                 key: Some(key.clone()),
                                 headers: vec![],
-                                payload: Bytes::from_static(br#"{"id":"ok"}"#),
+                                payload: Bytes::from_static(failed_payload.as_bytes()),
                                 timestamp_ms: bus::now_ms(),
                                 schema_id: 0,
                             }],
@@ -9787,6 +10169,18 @@ mod tests {
                 )
                 .expect("to the DLQ");
                 std::thread::sleep(std::time::Duration::from_millis(3));
+            }
+            if schema_id.is_some() || validation.is_some() {
+                svc.update_topic(
+                    &bctx,
+                    &t,
+                    topics::TopicOptions {
+                        schema_id,
+                        validation: validation.as_deref().and_then(topics::ValidationMode::parse),
+                        ..Default::default()
+                    },
+                )
+                .expect("bind the schema");
             }
         })
         .await
@@ -11460,6 +11854,8 @@ mod tests {
                 "read".to_string(),
                 fields.into_iter().map(str::to_string).collect(),
                 vec![],
+                Some(vec![]),
+                Some(vec![]),
                 None,
                 false,
             )
@@ -11481,6 +11877,17 @@ mod tests {
         subject_type: &str,
         subject_id: &str,
     ) -> Result<(serde_json::Value, Vec<(String, String)>, bool), ProtocolError> {
+        preview_with_key_flag(f, subject_type, subject_id)
+            .await
+            .map(|(payload, applied, limited, _)| (payload, applied, limited))
+    }
+
+    /// `preview` and the `hash_key_missing` flag of the answer.
+    async fn preview_with_key_flag(
+        f: &PreviewFixture,
+        subject_type: &str,
+        subject_id: &str,
+    ) -> Result<(serde_json::Value, Vec<(String, String)>, bool, bool), ProtocolError> {
         match field_policy_preview_v1(
             &f.ctx,
             fixture_instance_id().as_str(),
@@ -11496,12 +11903,14 @@ mod tests {
                 record,
                 applied,
                 limited_by_caller,
+                hash_key_missing,
             } => {
                 assert_eq!((record.partition, record.offset), (0, 0));
                 Ok((
                     serde_json::from_slice(&record.payload_preview).expect("json payload"),
                     applied.into_iter().map(|a| (a.field, a.action)).collect(),
                     limited_by_caller,
+                    hash_key_missing,
                 ))
             }
             other => panic!("unexpected response: {other:?}"),
@@ -11602,6 +12011,8 @@ mod tests {
             "read".to_string(),
             vec!["id".to_string(), "name".to_string()],
             vec![],
+            Some(vec![]),
+            Some(vec![]),
             None,
             false,
         )
@@ -11620,6 +12031,739 @@ mod tests {
             !limited,
             "the topic-wide rule shows nothing the caller cannot read"
         );
+    }
+
+    async fn set_rule(
+        f: &PreviewFixture,
+        subject_type: &str,
+        subject_id: &str,
+        fields: &[&str],
+        masked: &[&str],
+        hashed: &[&str],
+    ) -> Result<BusPayload, ProtocolError> {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        field_policy_set_v1(
+            &f.ctx,
+            fixture_instance_id().as_str(),
+            f.topic.clone(),
+            subject_type.to_string(),
+            subject_id.to_string(),
+            "read".to_string(),
+            names(fields),
+            vec![],
+            Some(names(masked)),
+            Some(names(hashed)),
+            None,
+            false,
+        )
+        .await
+    }
+
+    fn org_key_hash(org_id: &str, value: &str) -> String {
+        bus::instance(&fixture_instance_id())
+            .expect("fixture instance")
+            .field_hash_keys()
+            .get_or_create(org_id)
+            .expect("org key")
+            .hash_hex(value.as_bytes())
+    }
+
+    /// F4 B7: the preview applies the subject's mask and hash exactly as a
+    /// real read would, and names them in `applied`.
+    #[tokio::test]
+    async fn field_policy_preview_shows_masked_and_hashed_fields() {
+        let (_guard, db) = bus_fixture();
+        let f = preview_fixture(&db).await;
+        set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &["pesel"], &["name"])
+            .await
+            .expect("group rule");
+
+        let (payload, applied, limited) = preview(&f, "group", &f.group).await.unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "id": "b-1",
+                "name": org_key_hash(&f.org_id, "Anna Kowalska"),
+                "pesel": "********345",
+            })
+        );
+        assert_eq!(
+            applied,
+            actions(&[("id", "show"), ("name", "hash"), ("pesel", "mask")])
+        );
+        assert!(!limited);
+        // A member of the group reads through that rule.
+        assert_eq!(preview(&f, "user", &f.member).await.unwrap().0, payload);
+    }
+
+    /// The preview still never exceeds the caller: a field the caller reads
+    /// masked is not shown clear to a subject whose rule shows it, and the view
+    /// is flagged as narrowed — but equal forms, and forms a caller reads clear,
+    /// do not flag it.
+    #[tokio::test]
+    async fn field_policy_preview_is_limited_by_the_callers_mask_and_hash() {
+        let (_guard, db) = bus_fixture();
+        let f = preview_fixture(&db).await;
+        let caller = f.ctx.org_context.as_ref().unwrap().user_id.clone();
+        set_rule(&f, "user", &caller, &["id", "name", "pesel"], &["pesel"], &["name"])
+            .await
+            .expect("caller's own rule");
+
+        // The subject sees every field clear, the caller only masked/hashed.
+        let (payload, applied, limited) = preview(&f, "user", &f.own_rule).await.unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "id": "b-1",
+                "name": org_key_hash(&f.org_id, "Anna Kowalska"),
+                "pesel": "********345",
+            }),
+            "never more than the caller reads"
+        );
+        // `applied` names what the payload shows, not what the subject's rule alone says.
+        assert_eq!(
+            applied,
+            actions(&[("id", "show"), ("name", "hash"), ("pesel", "mask")])
+        );
+        assert!(limited);
+
+        // The same forms as the caller's: not limited, and the caller's own
+        // hash and mask ARE the subject's value — never hashed or masked a
+        // second time (a hash of a hash matches no hash anywhere).
+        set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &["pesel"], &["name"])
+            .await
+            .unwrap();
+        let (payload, applied, limited) = preview(&f, "group", &f.group).await.unwrap();
+        assert!(!limited);
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "id": "b-1",
+                "name": org_key_hash(&f.org_id, "Anna Kowalska"),
+                "pesel": "********345",
+            }),
+            "one hash of the name, as a real read returns it"
+        );
+        assert_eq!(
+            applied,
+            actions(&[("id", "show"), ("name", "hash"), ("pesel", "mask")])
+        );
+        // A hash where the caller reads a mask: a hash of a mask is no hash,
+        // so the mask stays and the view is flagged.
+        set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &[], &["name", "pesel"])
+            .await
+            .unwrap();
+        let (payload, _, limited) = preview(&f, "group", &f.group).await.unwrap();
+        assert!(limited);
+        assert_eq!(payload["pesel"], "********345", "not a hash of the mask");
+        assert_eq!(payload["name"], org_key_hash(&f.org_id, "Anna Kowalska"));
+        // A mask where the caller reads a hash: the hash stays, not a mask of it.
+        set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &["name", "pesel"], &[])
+            .await
+            .unwrap();
+        let (payload, _, limited) = preview(&f, "group", &f.group).await.unwrap();
+        assert!(limited);
+        assert_eq!(payload["name"], org_key_hash(&f.org_id, "Anna Kowalska"));
+        assert_eq!(payload["pesel"], "********345");
+        // A subject that sees less than the caller is never limited by it.
+        set_rule(&f, "group", &f.group, &["id"], &[], &[]).await.unwrap();
+        assert!(!preview(&f, "group", &f.group).await.unwrap().2);
+    }
+
+    #[tokio::test]
+    async fn field_policy_list_returns_the_masked_and_hashed_fields() {
+        let (_guard, db) = bus_fixture();
+        let f = preview_fixture(&db).await;
+        set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &["pesel"], &["name"])
+            .await
+            .unwrap();
+        match field_policy_list_v1(&f.ctx, fixture_instance_id().as_str(), f.topic.clone())
+            .await
+            .unwrap()
+        {
+            BusPayload::FieldPolicyListResponse { policies } => {
+                let group = policies
+                    .iter()
+                    .find(|p| p.subject_type == "group" && p.subject_id == f.group)
+                    .expect("the group rule");
+                assert_eq!(group.fields, ["id", "name", "pesel"]);
+                assert_eq!(group.masked_fields, ["pesel"]);
+                assert_eq!(group.hashed_fields, ["name"]);
+                let any = policies.iter().find(|p| p.subject_type == "any").unwrap();
+                assert!(any.masked_fields.is_empty() && any.hashed_fields.is_empty());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn field_policy_set_refuses_masks_the_rule_cannot_carry() {
+        let (_guard, db) = bus_fixture();
+        let f = preview_fixture(&db).await;
+        let refusal = |err: ProtocolError| {
+            assert_eq!(err.code, ProtocolErrorCode::BadRequest, "{}", err.message);
+            err.message
+        };
+        assert!(refusal(
+            set_rule(&f, "group", &f.group, &["id"], &["pesel"], &[])
+                .await
+                .unwrap_err()
+        )
+        .ends_with(field_policies::MASK_HASH_NOT_SHOWN));
+        assert!(refusal(
+            set_rule(&f, "group", &f.group, &["id"], &["id"], &["id"])
+                .await
+                .unwrap_err()
+        )
+        .ends_with(field_policies::MASK_HASH_OVERLAP));
+        let write = field_policy_set_v1(
+            &f.ctx,
+            fixture_instance_id().as_str(),
+            f.topic.clone(),
+            "any".to_string(),
+            "*".to_string(),
+            "write".to_string(),
+            vec!["id".to_string()],
+            vec![],
+            Some(vec!["id".to_string()]),
+            Some(vec![]),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(refusal(write).ends_with(field_policies::MASK_HASH_READ_ONLY));
+    }
+
+    async fn rotate_request(
+        ctx: &HandlerContext,
+        version: u32,
+    ) -> Result<BusPayload, ProtocolError> {
+        field_hash_key_rotate_v1(ctx, fixture_instance_id().as_str(), version).await
+    }
+
+    async fn key_info(ctx: &HandlerContext) -> BusFieldHashKeyWire {
+        match field_hash_key_info_v1(ctx, fixture_instance_id().as_str())
+            .await
+            .unwrap()
+        {
+            BusPayload::FieldHashKeyInfoResponse { key } => key,
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// F4 B7: the first rule that hashes makes the organization's key; the
+    /// rotation needs the version the confirmation named and is audited with
+    /// what it affects, never with a key. Its name sorts before
+    /// `replica_dispatch_rf1_fallback_then_coordinator_path`, like the other
+    /// preview tests: it reads records, which a coordinator installed on the
+    /// shared instance would refuse.
+    #[tokio::test]
+    async fn field_policy_hash_key_is_made_by_the_first_hashing_rule_and_rotated_on_request() {
+        let (_guard, db) = bus_fixture();
+        let f = preview_fixture(&db).await;
+        let before = key_info(&f.ctx).await;
+        assert!(!before.exists, "{before:?}");
+        assert_eq!((before.key_version, before.hashing_rules), (0, 0));
+        let err = rotate_request(&f.ctx, 1).await.unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::NotFound, "{}", err.message);
+        assert!(err.message.starts_with("bus.field_hash_key_not_found"));
+
+        // A mask alone makes no key.
+        set_rule(&f, "group", &f.group, &["id", "pesel"], &["pesel"], &[]).await.unwrap();
+        assert!(!key_info(&f.ctx).await.exists);
+
+        set_rule(&f, "group", &f.group, &["id", "name"], &[], &["name"]).await.unwrap();
+        set_rule(&f, "user", &f.own_rule, &["id", "name"], &[], &["name"]).await.unwrap();
+        let info = key_info(&f.ctx).await;
+        assert!(info.exists);
+        assert_eq!(info.key_version, 1);
+        assert_eq!(
+            (info.hashing_rules, info.hashing_topics, info.hashing_instances),
+            (2, 1, 1)
+        );
+        let hash = preview(&f, "group", &f.group).await.unwrap().0["name"].clone();
+
+        // Only with the version the confirmation named.
+        for stale in [0, 2] {
+            let err = rotate_request(&f.ctx, stale).await.unwrap_err();
+            assert_eq!(err.code, ProtocolErrorCode::Conflict, "{}", err.message);
+            assert!(err.message.starts_with("bus.field_hash_key_changed"));
+        }
+        assert_eq!(key_info(&f.ctx).await.key_version, 1);
+
+        let rotated = match rotate_request(&f.ctx, 1).await.unwrap() {
+            BusPayload::FieldHashKeyRotateResponse { key } => key,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(rotated.key_version, 2);
+        assert!(rotated.rotated_at_ms > info.rotated_at_ms);
+        assert_eq!(rotated.hashing_rules, 2);
+        assert_ne!(
+            preview(&f, "group", &f.group).await.unwrap().0["name"],
+            hash,
+            "old hashes stop matching"
+        );
+        // Used up: the same confirmation does not rotate twice.
+        assert_eq!(
+            rotate_request(&f.ctx, 1).await.unwrap_err().code,
+            ProtocolErrorCode::Conflict
+        );
+
+        let rows = repository::list_audit_logs(
+            &db,
+            &AuditLogFilters {
+                action: Some("bus.field_policy.hash_key.rotate".to_string()),
+                ..Default::default()
+            },
+            0,
+            500,
+        )
+        .expect("audit");
+        let ours: Vec<_> = rows
+            .iter()
+            .filter(|r| r.resource.as_deref() == Some(f.org_id.as_str()))
+            .collect();
+        assert_eq!(ours.len(), 5, "the refused attempts leave a row too");
+        let ok = ours
+            .iter()
+            .filter(|r| r.details.as_deref().is_some_and(|d| d.starts_with("outcome=ok")))
+            .count();
+        assert_eq!(ok, 1);
+        let done = ours
+            .iter()
+            .find(|r| r.details.as_deref().is_some_and(|d| d.starts_with("outcome=ok")))
+            .unwrap();
+        assert_eq!(
+            done.details.as_deref(),
+            Some("outcome=ok from_version=1 to_version=2 rules=2 topics=1 instances=1")
+        );
+        let key_hex = bus::instance(&fixture_instance_id())
+            .unwrap()
+            .field_hash_keys()
+            .export()
+            .unwrap()
+            .into_iter()
+            .find(|k| k.org_id == f.org_id)
+            .unwrap()
+            .key_hex;
+        assert!(rows.iter().all(|r| {
+            !r.details.as_deref().unwrap_or_default().contains(key_hex.as_str())
+        }));
+    }
+
+    /// The key information and the rotation are for the bus administrator
+    /// (`bus.admin` and the organization Admin role), not for a reader or an
+    /// instance administrator who is not an organization administrator.
+    #[tokio::test]
+    async fn field_policy_hash_key_window_needs_the_bus_administrator() {
+        let (_guard, db) = bus_fixture();
+        let reader_id = format!("u-hk-reader-{}", uuid::Uuid::new_v4());
+        let reader_org = seed_bus_permissions(&db, &reader_id, &["bus.read"]);
+        let reader = handler_ctx(db.clone(), org_context(&reader_org, &reader_id, &[]));
+        let matrix_id = format!("u-hk-matrix-{}", uuid::Uuid::new_v4());
+        let matrix_org = seed_membership(&db, &matrix_id, "org_admin");
+        let matrix_only = handler_ctx(db.clone(), org_context(&matrix_org, &matrix_id, &[]));
+        for ctx in [&reader, &matrix_only] {
+            let info = field_hash_key_info_v1(ctx, fixture_instance_id().as_str())
+                .await
+                .unwrap_err();
+            assert_eq!(info.code, ProtocolErrorCode::PolicyDenied);
+            assert_eq!(
+                rotate_request(ctx, 1).await.unwrap_err().code,
+                ProtocolErrorCode::PolicyDenied
+            );
+        }
+    }
+
+    /// While alive, the node of the fixture is not an operator.
+    struct DemotedNode(DbPool);
+
+    impl DemotedNode {
+        fn new(db: &DbPool) -> Self {
+            db.write()
+                .unwrap()
+                .execute("UPDATE sync_nodes SET operator = 0 WHERE node_id = 'test-node'", [])
+                .unwrap();
+            Self(db.clone())
+        }
+    }
+
+    impl Drop for DemotedNode {
+        fn drop(&mut self) {
+            let _ = self
+                .0
+                .write()
+                .unwrap()
+                .execute("UPDATE sync_nodes SET operator = 1 WHERE node_id = 'test-node'", []);
+        }
+    }
+
+    async fn rule_on(f: &PreviewFixture, subject_type: &str, subject_id: &str) -> BusFieldPolicyWire {
+        match field_policy_list_v1(&f.ctx, fixture_instance_id().as_str(), f.topic.clone())
+            .await
+            .unwrap()
+        {
+            BusPayload::FieldPolicyListResponse { policies } => policies
+                .into_iter()
+                .find(|p| p.subject_type == subject_type && p.subject_id == subject_id && p.direction == "read")
+                .expect("the rule"),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// What a client sends that knows no masks: `fields` only.
+    async fn set_rule_marks(
+        f: &PreviewFixture,
+        subject_id: &str,
+        fields: &[&str],
+        masked: Option<&[&str]>,
+        hashed: Option<&[&str]>,
+    ) -> Result<BusPayload, ProtocolError> {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        field_policy_set_v1(
+            &f.ctx,
+            fixture_instance_id().as_str(),
+            f.topic.clone(),
+            "group".to_string(),
+            subject_id.to_string(),
+            "read".to_string(),
+            names(fields),
+            vec![],
+            masked.map(names),
+            hashed.map(names),
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// F4 B7 review R1 P2-5: a client from before masking (a stale dashboard
+    /// tab) edits a rule by sending `fields` alone. That is not "show them as
+    /// they are": the masks and hashes the rule has stay, narrowed to `fields`.
+    /// Only an explicit empty list removes them.
+    #[tokio::test]
+    async fn field_policy_set_from_a_client_that_knows_no_masks_keeps_the_stored_ones() {
+        let (_guard, db) = bus_fixture();
+        let f = preview_fixture(&db).await;
+        set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &["pesel"], &["name"])
+            .await
+            .unwrap();
+
+        // The stale editor re-saves the same fields.
+        set_rule_marks(&f, &f.group, &["id", "name", "pesel"], None, None)
+            .await
+            .unwrap();
+        let rule = rule_on(&f, "group", &f.group).await;
+        assert_eq!(rule.fields, ["id", "name", "pesel"]);
+        assert_eq!((rule.masked_fields, rule.hashed_fields), (vec!["pesel".to_string()], vec!["name".to_string()]));
+        assert_eq!(
+            preview(&f, "group", &f.group).await.unwrap().0["pesel"],
+            "********345",
+            "the field is still masked when read"
+        );
+
+        // It narrows the rule: a field it drops takes its mark along; a field
+        // it adds is shown as it is.
+        set_rule_marks(&f, &f.group, &["id", "pesel", "extra"], None, None)
+            .await
+            .unwrap();
+        let rule = rule_on(&f, "group", &f.group).await;
+        assert_eq!(rule.fields, ["extra", "id", "pesel"]);
+        assert_eq!((rule.masked_fields, rule.hashed_fields), (vec!["pesel".to_string()], vec![]));
+
+        // A client that names one list keeps the other.
+        set_rule_marks(&f, &f.group, &["id", "pesel", "extra"], Some(&["extra"]), None)
+            .await
+            .unwrap();
+        let rule = rule_on(&f, "group", &f.group).await;
+        assert_eq!(rule.masked_fields, ["extra"]);
+
+        // Only `Some(empty)` removes them.
+        set_rule_marks(&f, &f.group, &["id", "pesel", "extra"], Some(&[]), Some(&[]))
+            .await
+            .unwrap();
+        let rule = rule_on(&f, "group", &f.group).await;
+        assert!(rule.masked_fields.is_empty() && rule.hashed_fields.is_empty());
+        assert_eq!(rule.fields, ["extra", "id", "pesel"]);
+
+        // A rule that is new to the stale client has nothing to keep.
+        set_rule_marks(&f, "g-new", &["id"], None, None).await.unwrap();
+        let new_rule = rule_on(&f, "group", "g-new").await;
+        assert!(new_rule.masked_fields.is_empty() && new_rule.hashed_fields.is_empty());
+    }
+
+    /// F4 B7 review R1 P3-2: only an operator node can hand a new key to the
+    /// others, so a node that is none neither makes the key (with the first
+    /// hashing rule) nor rotates it — a clear refusal, not a silent "ok" that
+    /// leaves the node hashing with a key of its own.
+    #[tokio::test]
+    async fn a_node_that_is_not_an_operator_neither_makes_nor_rotates_the_hash_key() {
+        let (_guard, db) = bus_fixture();
+        let f = preview_fixture(&db).await;
+        let demoted = DemotedNode::new(&db);
+
+        let err = set_rule(&f, "group", &f.group, &["id", "name"], &[], &["name"])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied, "{}", err.message);
+        assert!(err.message.starts_with("bus.operator_node_required"), "{}", err.message);
+        assert!(!err.message.contains("test-node"), "the text names no node: {}", err.message);
+        assert!(!key_info(&f.ctx).await.exists, "no key was made");
+        assert!(!key_info(&f.ctx).await.can_rotate_here, "the window is told this node cannot rotate");
+        assert!(
+            rule_on(&f, "group", &f.group).await.hashed_fields.is_empty(),
+            "no rule was left behind"
+        );
+        // A mask needs no key, so it is not refused.
+        set_rule(&f, "group", &f.group, &["id", "pesel"], &["pesel"], &[])
+            .await
+            .unwrap();
+
+        // The organization's key arrives from an operator (the mesh adopts it).
+        let svc = bus::instance(&fixture_instance_id()).expect("fixture instance");
+        assert!(svc
+            .field_hash_keys()
+            .adopt(&bus::field_hash_key::FieldHashKeyVersion {
+                org_id: f.org_id.clone(),
+                key_version: 1,
+                created_at_ms: 1,
+                rotated_at_ms: 1,
+                key_hex: zeroize::Zeroizing::new("ab".repeat(32)),
+            })
+            .unwrap());
+        // Now a hashing rule only reads the key it has.
+        set_rule(&f, "group", &f.group, &["id", "name"], &[], &["name"])
+            .await
+            .unwrap();
+        assert_eq!(key_info(&f.ctx).await.key_version, 1);
+
+        let err = rotate_request(&f.ctx, 1).await.unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied, "{}", err.message);
+        assert!(err.message.starts_with("bus.operator_node_required"), "{}", err.message);
+        assert_eq!(key_info(&f.ctx).await.key_version, 1, "nothing rotated");
+
+        drop(demoted);
+        assert!(key_info(&f.ctx).await.can_rotate_here);
+        assert_eq!(
+            match rotate_request(&f.ctx, 1).await.unwrap() {
+                BusPayload::FieldHashKeyRotateResponse { key } => key.key_version,
+                other => panic!("unexpected response: {other:?}"),
+            },
+            2
+        );
+    }
+
+    /// F4 B7 review R2 P2-1: the dashboard sends the hashes a rule already has
+    /// with every edit. An edit that adds no hashed field is not held up by a
+    /// key that has not reached this node; one that adds a field is, and says
+    /// the key is on its way (not that the node is no operator) because the
+    /// organization already hashes with one.
+    #[tokio::test]
+    async fn field_policy_an_edit_keeping_its_hashes_is_not_held_up_by_a_key_that_has_not_arrived() {
+        let (_guard, db) = bus_fixture();
+        let f = preview_fixture(&db).await;
+        set_rule(&f, "group", &f.group, &["id", "name"], &[], &["name"])
+            .await
+            .expect("an operator node makes the key");
+        // The key has not reached this node (a replicated rule, no key).
+        db.write().unwrap().execute("DELETE FROM bus_field_hash_keys", []).unwrap();
+        let demoted = DemotedNode::new(&db);
+
+        // Another field of the same rule changes; the hash stays.
+        set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &[], &["name"])
+            .await
+            .expect("an edit that adds no hashed field goes through");
+        assert_eq!(rule_on(&f, "group", &f.group).await.fields, ["id", "name", "pesel"]);
+
+        // A new hashed field needs the key: refused as "not synced", not as "no operator".
+        let err = set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &[], &["name", "pesel"])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied, "{}", err.message);
+        assert!(err.message.starts_with("bus.hash_key_not_synced"), "{}", err.message);
+        assert!(!err.message.contains("test-node"), "{}", err.message);
+        // The same on an operator node: a key made here would be a second key.
+        drop(demoted);
+        let err = set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &[], &["name", "pesel"])
+            .await
+            .unwrap_err();
+        assert!(err.message.starts_with("bus.hash_key_not_synced"), "{}", err.message);
+        assert!(!key_info(&f.ctx).await.exists, "no key was made");
+
+        // What the screen learns: rules hash, no key, so the key is on its way.
+        let info = key_info(&f.ctx).await;
+        assert!(!info.exists && info.hashing_rules == 1, "{info:?}");
+        let (payload, applied, _, key_missing) =
+            preview_with_key_flag(&f, "group", &f.group).await.unwrap();
+        assert!(key_missing);
+        assert!(payload.get("name").is_none(), "the hashed field is hidden: {payload}");
+        assert!(applied.contains(&("name".to_string(), "hide".to_string())), "{applied:?}");
+
+        // Once the key arrives the field can be added.
+        let svc = bus::instance(&fixture_instance_id()).expect("fixture instance");
+        assert!(svc
+            .field_hash_keys()
+            .adopt(&bus::field_hash_key::FieldHashKeyVersion {
+                org_id: f.org_id.clone(),
+                key_version: 1,
+                created_at_ms: 1,
+                rotated_at_ms: 1,
+                key_hex: zeroize::Zeroizing::new("cd".repeat(32)),
+            })
+            .unwrap());
+        set_rule(&f, "group", &f.group, &["id", "name", "pesel"], &[], &["name", "pesel"])
+            .await
+            .unwrap();
+        let (_, applied, _, key_missing) = preview_with_key_flag(&f, "group", &f.group).await.unwrap();
+        assert!(!key_missing);
+        assert!(applied.contains(&("name".to_string(), "hash".to_string())), "{applied:?}");
+    }
+
+    /// F4 B7 review R2 P3-6: a request that is refused makes no key.
+    #[tokio::test]
+    async fn field_policy_a_refused_request_makes_no_hash_key() {
+        let (_guard, db) = bus_fixture();
+        let f = preview_fixture(&db).await;
+        // A hash on a WRITING rule is refused by the rule's own checks.
+        let err = field_policy_set_v1(
+            &f.ctx,
+            fixture_instance_id().as_str(),
+            f.topic.clone(),
+            "group".to_string(),
+            f.group.clone(),
+            "write".to_string(),
+            vec!["id".to_string(), "name".to_string()],
+            vec![],
+            Some(vec![]),
+            Some(vec!["name".to_string()]),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest, "{}", err.message);
+        assert!(!key_info(&f.ctx).await.exists, "a refused request left a key behind");
+        // Nor does a hashed field outside the shown ones.
+        let err = set_rule(&f, "group", &f.group, &["id"], &[], &["name"]).await.unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest, "{}", err.message);
+        assert!(!key_info(&f.ctx).await.exists);
+        // A valid one does.
+        set_rule(&f, "group", &f.group, &["id", "name"], &[], &["name"]).await.unwrap();
+        assert!(key_info(&f.ctx).await.exists);
+    }
+
+    async fn dlq_list_payloads(f: &PreviewFixture) -> Vec<serde_json::Value> {
+        match dlq_list_v1(
+            &f.ctx,
+            fixture_instance_id().as_str(),
+            f.topic.clone(),
+            None,
+            vec![],
+            10,
+            None,
+            false,
+        )
+        .await
+        .expect("dlq list")
+        {
+            BusPayload::DlqListResponse { result } => result
+                .records
+                .into_iter()
+                .map(|r| serde_json::from_slice(&r.payload_preview).unwrap())
+                .collect(),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// F4 B7 review R1: the DLQ list (`peek_runs`) reads a failed record
+    /// through the reader's rule, hash included — the same value a read of the
+    /// source topic returns.
+    #[tokio::test]
+    async fn field_policy_dlq_list_hashes_and_masks_like_the_source_topic() {
+        let (_guard, db) = bus_fixture();
+        let f = preview_fixture(&db).await;
+        let caller = f.ctx.org_context.as_ref().unwrap().user_id.clone();
+        let g = gate_read(&f.ctx, fixture_instance_id().as_str()).expect("gate");
+        let (svc, bctx, topic) = (g.svc.clone(), bus_ctx(&f.ctx, &g), f.topic.clone());
+        tokio::task::spawn_blocking(move || {
+            let cfg = topics::get_topic(svc.db(), bctx.instance_id.as_str(), &bctx.org_id, &topic)
+                .unwrap()
+                .unwrap();
+            let failed = bus::FetchedRecordMeta {
+                topic: topic.clone(),
+                partition: 0,
+                offset: 0,
+                timestamp_ms: bus::now_ms(),
+                key: None,
+                headers: vec![],
+                payload: Bytes::from_static(b"{}"),
+                schema_id: 0,
+            };
+            for _ in 0..cfg.max_delivery_attempts {
+                svc.note_delivery_failure(
+                    &bctx,
+                    "g",
+                    &topic,
+                    0,
+                    0,
+                    &failed,
+                    dlq::DlqReason::ConsumerError,
+                    "boom",
+                )
+                .expect("failure");
+            }
+        })
+        .await
+        .unwrap();
+        set_rule(&f, "user", &caller, &["id", "name", "pesel"], &["pesel"], &["name"])
+            .await
+            .unwrap();
+
+        let listed = dlq_list_payloads(&f).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0],
+            serde_json::json!({
+                "id": "b-1",
+                "name": org_key_hash(&f.org_id, "Anna Kowalska"),
+                "pesel": "********345",
+            }),
+            "the stored record is the published one, read through the rule once"
+        );
+    }
+
+    /// F4 B7 review R1 P2-3: a caller whose own rule hashes a field is
+    /// limited when this node holds no key for it, and a read of a hashing
+    /// rule without its key shows no hash.
+    #[tokio::test]
+    async fn field_policy_preview_without_the_key_hides_the_hashed_field_and_flags_it() {
+        let (_guard, db) = bus_fixture();
+        let f = preview_fixture(&db).await;
+        let caller = f.ctx.org_context.as_ref().unwrap().user_id.clone();
+        // Written under the service, as a peer's ledger operation lands: no
+        // key is made with it.
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<std::collections::BTreeSet<_>>();
+        field_policies::set_policy(
+            &db,
+            fixture_instance_id().as_str(),
+            &f.org_id,
+            &f.topic,
+            "user",
+            &caller,
+            field_policies::Direction::Read,
+            &names(&["id", "name"]),
+            &names(&[]),
+            &names(&[]),
+            &names(&["name"]),
+            field_policies::BusFieldPolicyExpect::Any,
+        )
+        .unwrap();
+        assert!(!key_info(&f.ctx).await.exists);
+        let (payload, _, _, key_missing) = preview_with_key_flag(&f, "any", "*").await.unwrap();
+        assert_eq!(payload, serde_json::json!({"id": "b-1"}));
+        assert!(key_missing, "the caller's hashed field is not readable here yet, and the answer says why");
+        assert!(!key_info(&f.ctx).await.exists, "a read made no key");
     }
 
     /// Refusals: no org Admin role, no admin right on the topic itself, a
@@ -11785,6 +12929,8 @@ mod tests {
             "legacy id",
             field_policies::Direction::Read,
             &["id".to_string()].into_iter().collect(),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             &std::collections::BTreeSet::new(),
             field_policies::BusFieldPolicyExpect::Any,
         )

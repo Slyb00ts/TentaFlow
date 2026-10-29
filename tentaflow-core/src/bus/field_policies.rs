@@ -5,8 +5,12 @@
 // on 01.09.2026:
 //   - write violation -> mode=reject: the WHOLE batch is rejected on any
 //     disallowed or missing-required field, never stripped.
-//   - read violation  -> hide only: a restricted field is simply omitted
-//     from the projected payload, no pseudonymization integration.
+//   - read violation  -> hide: a restricted field is simply omitted from the
+//     projected payload. F4 B7 (DECYZJE-2026-09-22.md, 23.09) adds two more
+//     read actions for a field the rule shows: MASK (last 3 characters kept,
+//     the rest `*`, a value shorter than 5 characters masked whole) and HASH
+//     (`blake3::keyed_hash` under the organization's key, 256 bit hex) — JSON,
+//     XML and HL7 v2 only, never a binary format.
 //   - granularity     -> top-level JSON object keys only, v1 has no nested
 //     dotted-path support (e.g. `patient.address.street`).
 //   - enforcement     -> external AND internal: a policy applies to EVERY
@@ -36,6 +40,7 @@
 // =============================================================================
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use bytes::Bytes;
 
@@ -45,7 +50,8 @@ use crate::db::repository::{self, BusFieldPolicyWrite, DbBusFieldPolicy};
 use crate::db::DbPool;
 
 use super::dlq;
-use super::payload_format::PayloadFormat;
+use super::field_hash_key::{FieldHashKey, FieldHashKeys};
+use super::payload_format::{FieldReplacer, PayloadFormat, ReplaceAction, ValueShape};
 use super::{topics, BusServiceError};
 
 /// Sentinel `subject_id` for the topic-wide wildcard row. Chosen over
@@ -111,27 +117,99 @@ impl Direction {
 /// Resolved, decoded policy for one `(org_id, topic, subject, direction)`.
 #[derive(Debug, Clone)]
 pub struct FieldPolicy {
+    /// Every field the rule shows, as it is or masked or hashed.
     pub fields: BTreeSet<String>,
     pub required_fields: BTreeSet<String>,
+    /// Shown fields whose value a read replaces by its mask. A subset of
+    /// `fields`, disjoint from `hashed_fields`; empty for a write rule.
+    pub masked_fields: BTreeSet<String>,
+    /// Shown fields whose value a read replaces by its keyed hash.
+    pub hashed_fields: BTreeSet<String>,
+}
+
+/// What a read rule does to one field (`FieldPolicy::action`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldAction {
+    Show,
+    Hide,
+    Mask,
+    Hash,
+}
+
+impl FieldAction {
+    /// The spelling of `BusFieldActionWire::action` and `capabilities`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FieldAction::Show => "show",
+            FieldAction::Hide => "hide",
+            FieldAction::Mask => "mask",
+            FieldAction::Hash => "hash",
+        }
+    }
+}
+
+impl FieldPolicy {
+    pub fn action(&self, field: &str) -> FieldAction {
+        if !self.fields.contains(field) {
+            FieldAction::Hide
+        } else if self.hashed_fields.contains(field) {
+            FieldAction::Hash
+        } else if self.masked_fields.contains(field) {
+            FieldAction::Mask
+        } else {
+            FieldAction::Show
+        }
+    }
+
+    /// The key a read through this rule hashes with: `None` when the rule
+    /// hashes nothing (no key is looked up for it), and also when the node
+    /// holds no usable key — `project_read` then hides the hashed fields. A
+    /// read never creates the key (`FieldHashKeys::for_read`).
+    pub fn hash_key(&self, keys: &FieldHashKeys, org_id: &str) -> Option<Arc<FieldHashKey>> {
+        if self.hashed_fields.is_empty() {
+            return None;
+        }
+        keys.for_read(org_id)
+    }
+}
+
+fn decode_names(
+    json: &str,
+    column: &str,
+    topic: &str,
+) -> Result<BTreeSet<String>, BusServiceError> {
+    serde_json::from_str(json).map_err(|e| {
+        BusServiceError::Db(format!(
+            "corrupt bus_field_policies.{column} for topic '{topic}': {e}"
+        ))
+    })
 }
 
 pub(crate) fn decode(row: DbBusFieldPolicy, topic: &str) -> Result<FieldPolicy, BusServiceError> {
-    let fields: BTreeSet<String> = serde_json::from_str(&row.fields_json).map_err(|e| {
-        BusServiceError::Db(format!(
-            "corrupt bus_field_policies.fields_json for topic '{topic}': {e}"
-        ))
-    })?;
-    let required_fields: BTreeSet<String> = match row.required_fields_json {
-        Some(json) => serde_json::from_str(&json).map_err(|e| {
-            BusServiceError::Db(format!(
-                "corrupt bus_field_policies.required_fields_json for topic '{topic}': {e}"
-            ))
-        })?,
+    let mut fields = decode_names(&row.fields_json, "fields_json", topic)?;
+    let required_fields = match row.required_fields_json {
+        Some(json) => decode_names(&json, "required_fields_json", topic)?,
         None => BTreeSet::new(),
     };
+    let hashed_fields = match row.hashed_fields_json {
+        Some(json) => decode_names(&json, "hashed_fields_json", topic)?,
+        None => BTreeSet::new(),
+    };
+    let mut masked_fields = match row.masked_fields_json {
+        Some(json) => decode_names(&json, "masked_fields_json", topic)?,
+        None => BTreeSet::new(),
+    };
+    // `set_policy` keeps the two disjoint; a stored row that is not (a peer's)
+    // gets the stricter of the two, the hash.
+    masked_fields.retain(|f| !hashed_fields.contains(f));
+    // The stored `fields_json` names only the fields shown as they are.
+    fields.extend(masked_fields.iter().cloned());
+    fields.extend(hashed_fields.iter().cloned());
     Ok(FieldPolicy {
         fields,
         required_fields,
+        masked_fields,
+        hashed_fields,
     })
 }
 
@@ -300,16 +378,102 @@ pub fn validate_write(
     Ok(())
 }
 
-/// Projects one record's payload through a resolved READ policy.
-/// "Hide only" (the owner's choice): a restricted field is simply absent
-/// from the result, re-emitted in the SAME wire format. Fails CLOSED — any
-/// payload the format's codec cannot parse becomes that format's empty
-/// projection (e.g. `{}` for JSON) rather than being returned verbatim,
-/// since a policy that cannot parse the payload cannot prove what is safe
-/// to show.
-pub fn project_read(policy: &FieldPolicy, format: PayloadFormat, payload: &Bytes) -> Bytes {
+/// Visible characters a mask keeps at the end of a value.
+const MASK_KEPT_TAIL: usize = 3;
+/// A value shorter than this is masked whole.
+const MASK_MIN_LEN_FOR_TAIL: usize = 5;
+/// The mask of a value whose length says nothing worth keeping (JSON boolean,
+/// object, array): constant, so it cannot tell `true` from `false`.
+const MASK_OPAQUE: &str = "***";
+
+/// The mask of a value: its last 3 characters visible, every other character
+/// an asterisk — the length is kept — and a value of fewer than 5 characters
+/// masked whole. Characters are Unicode scalar values (`char`), not bytes: a
+/// 5-character value of 4-byte emoji keeps its last 3 emoji. A combining mark
+/// or a joiner counts as its own character, so a tail can start on one.
+pub fn mask_text(value: &str) -> String {
+    let len = value.chars().count();
+    if len < MASK_MIN_LEN_FOR_TAIL {
+        return "*".repeat(len);
+    }
+    let tail_start = value
+        .char_indices()
+        .nth(len - MASK_KEPT_TAIL)
+        .map_or(value.len(), |(index, _)| index);
+    let mut masked = "*".repeat(len - MASK_KEPT_TAIL);
+    masked.push_str(&value[tail_start..]);
+    masked
+}
+
+/// A rule's masks and hashes as a codec asks for them.
+struct PolicyReplacer<'a> {
+    policy: &'a FieldPolicy,
+    hash_key: Option<&'a FieldHashKey>,
+}
+
+impl FieldReplacer for PolicyReplacer<'_> {
+    fn action(&self, field: &str) -> Option<ReplaceAction> {
+        match self.policy.action(field) {
+            FieldAction::Hash => Some(ReplaceAction::Hash),
+            FieldAction::Mask => Some(ReplaceAction::Mask),
+            FieldAction::Show | FieldAction::Hide => None,
+        }
+    }
+
+    fn replace(&self, action: ReplaceAction, text: &str, shape: ValueShape) -> String {
+        match (action, shape) {
+            (ReplaceAction::Hash, _) => match self.hash_key {
+                Some(key) => key.hash_hex(text.as_bytes()),
+                // `project_read` never lets a hashed field through without its key.
+                None => MASK_OPAQUE.to_string(),
+            },
+            (ReplaceAction::Mask, ValueShape::Text) => mask_text(text),
+            (ReplaceAction::Mask, ValueShape::Opaque) => MASK_OPAQUE.to_string(),
+        }
+    }
+}
+
+/// Projects one record's payload through a resolved READ policy: a field the
+/// rule does not show is absent, one it masks or hashes carries the mask or
+/// the hash of its value, every other shown field is as published. The result
+/// is in the SAME wire format. Fails CLOSED — any payload the format's codec
+/// cannot parse becomes that format's empty projection (e.g. `{}` for JSON)
+/// rather than being returned verbatim, since a policy that cannot parse the
+/// payload cannot prove what is safe to show.
+///
+/// `hash_key` is `FieldPolicy::hash_key` of the same rule. A rule that hashes
+/// without being given its key hides the fields it would hash.
+pub fn project_read(
+    policy: &FieldPolicy,
+    format: PayloadFormat,
+    payload: &Bytes,
+    hash_key: Option<&FieldHashKey>,
+) -> Bytes {
     let codec = format.codec();
-    match codec.project(payload, &policy.fields) {
+    let projected = if policy.masked_fields.is_empty() && policy.hashed_fields.is_empty() {
+        codec.project(payload, &policy.fields, None)
+    } else if policy.hashed_fields.is_empty() || hash_key.is_some() {
+        codec.project(
+            payload,
+            &policy.fields,
+            Some(&PolicyReplacer { policy, hash_key }),
+        )
+    } else {
+        let shown: BTreeSet<String> = policy
+            .fields
+            .difference(&policy.hashed_fields)
+            .cloned()
+            .collect();
+        codec.project(
+            payload,
+            &shown,
+            Some(&PolicyReplacer {
+                policy,
+                hash_key: None,
+            }),
+        )
+    };
+    match projected {
         Ok(bytes) => bytes,
         Err(_) => codec.empty_projection(),
     }
@@ -319,6 +483,17 @@ pub fn project_read(policy: &FieldPolicy, format: PayloadFormat, payload: &Bytes
 /// recognizes the sentence (`schemas.js` `busRefusalText`): reword both together.
 pub const BINARY_TOPIC_NO_POLICY: &str =
     "field policies cannot apply to a topic whose messages are binary";
+
+/// What a rule that masks or hashes is refused with when it is not a read
+/// rule. The dashboard recognizes the sentence (`schemas.js` `busRefusalText`):
+/// reword both together.
+pub const MASK_HASH_READ_ONLY: &str = "masking and hashing apply to read rules only";
+
+/// What a rule naming a masked or hashed field it does not show is refused with.
+pub const MASK_HASH_NOT_SHOWN: &str = "masked_fields and hashed_fields must be subsets of fields";
+
+/// What a rule masking and hashing the same field is refused with.
+pub const MASK_HASH_OVERLAP: &str = "a field cannot be both masked and hashed";
 
 /// Creates or replaces the policy row for `(org_id, topic, subject_type,
 /// subject_id, direction)`. `subject_type` must be one of `"user"`,
@@ -331,7 +506,10 @@ pub const BINARY_TOPIC_NO_POLICY: &str =
 /// this feature is opt-in and tolerates a row naming a subject that has not
 /// been created (or has since been deleted) yet.
 /// `required_fields` must be a subset of `fields` — a field cannot be
-/// required if it is not even allowed. A `__`-prefixed reserved topic is
+/// required if it is not even allowed. `masked_fields` and `hashed_fields`
+/// are the fields of `fields` a READ rule shows masked or hashed: subsets of
+/// `fields`, disjoint, and empty for a write rule. A binary topic, which takes
+/// no rule at all, takes no mask or hash either. A `__`-prefixed reserved topic is
 /// refused outright, since `resolve` never applies a policy to one.
 /// `expect` is checked atomically with the write: a stored rule that is not
 /// what it names is `FieldPolicyChanged` and nothing is written.
@@ -346,8 +524,149 @@ pub fn set_policy(
     direction: Direction,
     fields: &BTreeSet<String>,
     required_fields: &BTreeSet<String>,
+    masked_fields: &BTreeSet<String>,
+    hashed_fields: &BTreeSet<String>,
     expect: BusFieldPolicyExpect,
 ) -> Result<(), BusServiceError> {
+    set_policy_marks(
+        pool,
+        instance_id,
+        org_id,
+        topic,
+        subject_type,
+        subject_id,
+        direction,
+        fields,
+        required_fields,
+        Some(masked_fields),
+        Some(hashed_fields),
+        expect,
+    )
+}
+
+/// `set_policy` for a caller that may not know masks and hashes exist (a
+/// client from before F4 B7 that sends only `fields`). `None` for
+/// `masked_fields`/`hashed_fields` means "keep what the stored rule has,
+/// narrowed to `fields`" — never "show them as they are": a stale editor must
+/// not turn a masked field into a clear one. `Some` (even empty) is the new
+/// list. Kept marks are written against the stored row's `updated_at_ms`
+/// (`expect` is tightened to it when it was `Any`), so a rule changed meanwhile
+/// is `FieldPolicyChanged` instead of being overwritten with stale marks.
+#[allow(clippy::too_many_arguments)]
+pub fn set_policy_marks(
+    pool: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    topic: &str,
+    subject_type: &str,
+    subject_id: &str,
+    direction: Direction,
+    fields: &BTreeSet<String>,
+    required_fields: &BTreeSet<String>,
+    masked_fields: Option<&BTreeSet<String>>,
+    hashed_fields: Option<&BTreeSet<String>>,
+    expect: BusFieldPolicyExpect,
+) -> Result<(), BusServiceError> {
+    let prepared = prepare_policy(
+        pool,
+        instance_id,
+        org_id,
+        topic,
+        subject_type,
+        subject_id,
+        direction,
+        fields,
+        required_fields,
+        masked_fields,
+        hashed_fields,
+        expect,
+    )?;
+    commit_policy(pool, prepared)
+}
+
+/// A rule that passed every check of `set_policy_marks` and waits to be
+/// written (`commit_policy`). The step between the two is for a caller that
+/// must do something only a VALID request deserves — the dispatcher makes the
+/// organization's hash key here, so a request that is refused leaves no key
+/// behind.
+#[derive(Debug)]
+pub struct PreparedPolicy {
+    row: DbBusFieldPolicy,
+    expect: BusFieldPolicyExpect,
+    adds_hashed_fields: bool,
+}
+
+impl PreparedPolicy {
+    /// Whether the rule hashes a field the stored rule did not: only then does
+    /// it need the organization's key now. A rule that keeps the hashes it
+    /// already has (an edit of something else) needs nothing the rule that
+    /// introduced them did not.
+    pub fn adds_hashed_fields(&self) -> bool {
+        self.adds_hashed_fields
+    }
+}
+
+/// Everything `set_policy_marks` checks, without writing.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_policy(
+    pool: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    topic: &str,
+    subject_type: &str,
+    subject_id: &str,
+    direction: Direction,
+    fields: &BTreeSet<String>,
+    required_fields: &BTreeSet<String>,
+    masked_fields: Option<&BTreeSet<String>>,
+    hashed_fields: Option<&BTreeSet<String>>,
+    expect: BusFieldPolicyExpect,
+) -> Result<PreparedPolicy, BusServiceError> {
+    let kept;
+    let (masked_fields, hashed_fields, expect) = match (masked_fields, hashed_fields) {
+        (Some(masked), Some(hashed)) => (masked, hashed, expect),
+        (masked, hashed) => {
+            let stored = repository::bus_field_policy_get(
+                pool,
+                instance_id,
+                org_id,
+                topic,
+                subject_type,
+                subject_id,
+                direction.as_str(),
+            )?;
+            let keep = |column: &Option<String>, name: &str| -> Result<BTreeSet<String>, BusServiceError> {
+                let names = match column {
+                    Some(json) => decode_names(json, name, topic)?,
+                    None => BTreeSet::new(),
+                };
+                Ok(names.intersection(fields).cloned().collect())
+            };
+            let stored_hashed = stored.as_ref().map(|r| &r.hashed_fields_json);
+            let stored_masked = stored.as_ref().map(|r| &r.masked_fields_json);
+            let hashed_kept = match hashed {
+                Some(given) => given.clone(),
+                None => keep(stored_hashed.unwrap_or(&None), "hashed_fields_json")?,
+            };
+            let mut masked_kept = match masked {
+                Some(given) => given.clone(),
+                None => keep(stored_masked.unwrap_or(&None), "masked_fields_json")?,
+            };
+            // A kept mark never overrides a given one: the stricter hash wins.
+            if masked.is_none() {
+                masked_kept.retain(|f| !hashed_kept.contains(f));
+            }
+            let expect = match (expect, &stored) {
+                (BusFieldPolicyExpect::Any, Some(row)) => {
+                    BusFieldPolicyExpect::UpdatedAt(row.updated_at_ms)
+                }
+                (BusFieldPolicyExpect::Any, None) => BusFieldPolicyExpect::Absent,
+                (other, _) => other,
+            };
+            kept = (masked_kept, hashed_kept);
+            (&kept.0, &kept.1, expect)
+        }
+    };
     if !["user", "group", "addon", "any"].contains(&subject_type) {
         return Err(BusServiceError::InvalidArgument(format!(
             "subject_type must be one of 'user', 'group', 'addon', 'any', got '{subject_type}'"
@@ -361,6 +680,21 @@ pub fn set_policy(
     if !required_fields.is_subset(fields) {
         return Err(BusServiceError::InvalidArgument(
             "required_fields must be a subset of fields".to_string(),
+        ));
+    }
+    if direction == Direction::Write && !(masked_fields.is_empty() && hashed_fields.is_empty()) {
+        return Err(BusServiceError::InvalidArgument(
+            MASK_HASH_READ_ONLY.to_string(),
+        ));
+    }
+    if !masked_fields.is_subset(fields) || !hashed_fields.is_subset(fields) {
+        return Err(BusServiceError::InvalidArgument(
+            MASK_HASH_NOT_SHOWN.to_string(),
+        ));
+    }
+    if !masked_fields.is_disjoint(hashed_fields) {
+        return Err(BusServiceError::InvalidArgument(
+            MASK_HASH_OVERLAP.to_string(),
         ));
     }
     // `resolve` forces "unrestricted" for every reserved topic, so a row
@@ -420,7 +754,12 @@ pub fn set_policy(
         subject_id,
         direction.as_str(),
     )?;
-    let created_at_ms = existing.map(|r| r.created_at_ms).unwrap_or(now);
+    let created_at_ms = existing.as_ref().map(|r| r.created_at_ms).unwrap_or(now);
+    let stored_hashed = match existing.as_ref().and_then(|r| r.hashed_fields_json.as_deref()) {
+        Some(json) => decode_names(json, "hashed_fields_json", topic)?,
+        None => BTreeSet::new(),
+    };
+    let adds_hashed_fields = !hashed_fields.is_subset(&stored_hashed);
     let row = DbBusFieldPolicy {
         instance_id: instance_id.to_string(),
         org_id: org_id.to_string(),
@@ -428,19 +767,31 @@ pub fn set_policy(
         subject_type: subject_type.to_string(),
         subject_id: subject_id.to_string(),
         direction: direction.as_str().to_string(),
-        fields_json: serde_json::to_string(fields)
-            .map_err(|e| BusServiceError::Db(e.to_string()))?,
-        required_fields_json: if required_fields.is_empty() {
-            None
-        } else {
-            Some(
-                serde_json::to_string(required_fields)
-                    .map_err(|e| BusServiceError::Db(e.to_string()))?,
-            )
-        },
+        // Only the fields shown as they are: see `DbBusFieldPolicy::fields_json`.
+        fields_json: serde_json::to_string(
+            &fields
+                .iter()
+                .filter(|f| !masked_fields.contains(*f) && !hashed_fields.contains(*f))
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| BusServiceError::Db(e.to_string()))?,
+        required_fields_json: names_json(required_fields)?,
         created_at_ms,
         updated_at_ms: now,
+        masked_fields_json: names_json(masked_fields)?,
+        hashed_fields_json: names_json(hashed_fields)?,
     };
+    Ok(PreparedPolicy {
+        row,
+        expect,
+        adds_hashed_fields,
+    })
+}
+
+/// Writes a rule `prepare_policy` accepted.
+pub fn commit_policy(pool: &DbPool, prepared: PreparedPolicy) -> Result<(), BusServiceError> {
+    let PreparedPolicy { row, expect, .. } = prepared;
+    let topic = row.topic.as_str();
     // The topic and `expect` are checked again where the rule is written: the
     // topic may have been deleted, or the rule changed, since they were read.
     match repository::bus_field_policy_set(pool, &row, expect)? {
@@ -458,6 +809,17 @@ pub fn set_policy(
             topic: topic.to_string(),
         }),
     }
+}
+
+/// A set of field names as the JSON array a rule column stores, `None` for an
+/// empty set.
+fn names_json(names: &BTreeSet<String>) -> Result<Option<String>, BusServiceError> {
+    if names.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(names)
+        .map(Some)
+        .map_err(|e| BusServiceError::Db(e.to_string()))
 }
 
 /// Removes a rule; with `expected_updated_at_ms` only while it still carries
@@ -527,6 +889,8 @@ mod tests {
         FieldPolicy {
             fields: fields.iter().map(|s| s.to_string()).collect(),
             required_fields: required.iter().map(|s| s.to_string()).collect(),
+            masked_fields: BTreeSet::new(),
+            hashed_fields: BTreeSet::new(),
         }
     }
 
@@ -587,7 +951,7 @@ mod tests {
     fn project_read_filters_to_allowed_fields_only() {
         let p = policy(&["patient_id"], &[]);
         let payload = Bytes::from_static(br#"{"patient_id":"123","ssn":"999-99-9999"}"#);
-        let out = project_read(&p, PayloadFormat::Json, &payload);
+        let out = project_read(&p, PayloadFormat::Json, &payload, None);
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v, serde_json::json!({"patient_id": "123"}));
     }
@@ -596,7 +960,7 @@ mod tests {
     fn project_read_fails_closed_on_non_object_payload() {
         let p = policy(&["a"], &[]);
         let payload = Bytes::from_static(b"not json");
-        let out = project_read(&p, PayloadFormat::Json, &payload);
+        let out = project_read(&p, PayloadFormat::Json, &payload, None);
         assert_eq!(out.as_ref(), b"{}");
     }
 
@@ -604,7 +968,7 @@ mod tests {
     fn project_read_fails_closed_on_top_level_array() {
         let p = policy(&["a"], &[]);
         let payload = Bytes::from_static(b"[1,2,3]");
-        let out = project_read(&p, PayloadFormat::Json, &payload);
+        let out = project_read(&p, PayloadFormat::Json, &payload, None);
         assert_eq!(out.as_ref(), b"{}");
     }
 
@@ -648,6 +1012,8 @@ mod tests {
             Direction::Read,
             &field_set(&["patient_id"]),
             &BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             BusFieldPolicyExpect::Any,
         )
         .expect_err("a reserved topic must not accept a field policy");
@@ -696,6 +1062,8 @@ mod tests {
             Direction::Read,
             &field_set(&["patient_id"]),
             &BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             BusFieldPolicyExpect::Any,
         )
         .expect("an ordinary topic still accepts a field policy");
@@ -748,6 +1116,8 @@ mod tests {
             Direction::Read,
             &field_set(&["patient_id"]),
             &BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             BusFieldPolicyExpect::Any,
         )
         .expect("set a read policy on the source topic");
@@ -864,6 +1234,8 @@ mod tests {
             Direction::Read,
             &field_set(&["patient_id"]),
             &BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             BusFieldPolicyExpect::Any,
         )
         .expect("set an addon-scoped read policy");
@@ -944,6 +1316,8 @@ mod tests {
             Direction::Read,
             &field_set(&["patient_id"]),
             &BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             BusFieldPolicyExpect::Any,
         )
         .expect("set a group-scoped read policy");
@@ -1014,6 +1388,8 @@ mod tests {
             Direction::Read,
             &field_set(&["patient_id", "status"]),
             &BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             BusFieldPolicyExpect::Any,
         )
         .expect("set a group-scoped read policy");
@@ -1027,6 +1403,8 @@ mod tests {
             Direction::Read,
             &field_set(&["patient_id"]),
             &BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             BusFieldPolicyExpect::Any,
         )
         .expect("set a user-scoped read policy");
@@ -1101,6 +1479,8 @@ mod tests {
                 Direction::Read,
                 &field_set(&["a"]),
                 &BTreeSet::new(),
+                &std::collections::BTreeSet::new(),
+                &std::collections::BTreeSet::new(),
                 BusFieldPolicyExpect::Any,
             )
             .expect_err("a binary topic has no fields to hide");
@@ -1153,6 +1533,8 @@ mod tests {
             Direction::Read,
             &field_set(&["a"]),
             &BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             BusFieldPolicyExpect::Any,
         )
         .expect("a default topic takes a rule");
@@ -1232,6 +1614,8 @@ mod tests {
             required_fields_json: None,
             created_at_ms: 1,
             updated_at_ms: 1,
+            masked_fields_json: None,
+            hashed_fields_json: None,
         };
         assert_eq!(
             repository::bus_field_policy_set(&db, &row, BusFieldPolicyExpect::Any).expect("write"),
@@ -1280,6 +1664,8 @@ mod tests {
             Direction::Read,
             &field_set(&["a"]),
             &BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             BusFieldPolicyExpect::Any,
         )
         .expect("rule");
@@ -1341,6 +1727,8 @@ mod tests {
             Direction::Read,
             &field_set(&["a"]),
             &BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             BusFieldPolicyExpect::Any,
         )
         .expect("a JSON pattern allows a rule");
@@ -1371,6 +1759,8 @@ mod tests {
             Direction::Read,
             &field_set(&["patient_id"]),
             &BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
             BusFieldPolicyExpect::Any,
         )
         .expect_err("an unknown subject_type must be rejected");
@@ -1416,6 +1806,8 @@ mod tests {
                 Direction::Read,
                 &field_set(&fields),
                 &BTreeSet::new(),
+                &std::collections::BTreeSet::new(),
+                &std::collections::BTreeSet::new(),
                 BusFieldPolicyExpect::Any,
             )
             .expect("set policy");
@@ -1467,5 +1859,463 @@ mod tests {
         );
         assert_eq!(PolicySubject::parse("any", "u-1"), None);
         assert_eq!(PolicySubject::parse("api_key", "k"), None);
+    }
+
+    // ---- F4 B7: mask and hash ----------------------------------------------
+
+    fn node_keys() -> FieldHashKeys {
+        FieldHashKeys::new(
+            test_db(),
+            Arc::new(crate::crypto::SettingsCipher::new(&[5u8; 32])),
+        )
+    }
+
+    fn rule(fields: &[&str], masked: &[&str], hashed: &[&str]) -> FieldPolicy {
+        FieldPolicy {
+            fields: field_set(fields),
+            required_fields: BTreeSet::new(),
+            masked_fields: field_set(masked),
+            hashed_fields: field_set(hashed),
+        }
+    }
+
+    fn create_topic_of(db: &DbPool, topic: &str, content_type: &str) {
+        topics::create_topic(
+            db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            topics::TopicOptions {
+                content_type: Some(content_type.to_string()),
+                ..Default::default()
+            },
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create topic");
+    }
+
+    fn read_rule(
+        db: &DbPool,
+        topic: &str,
+        fields: &[&str],
+        masked: &[&str],
+        hashed: &[&str],
+    ) -> Result<(), BusServiceError> {
+        set_policy(
+            db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            "any",
+            SUBJECT_ANY,
+            Direction::Read,
+            &field_set(fields),
+            &BTreeSet::new(),
+            &field_set(masked),
+            &field_set(hashed),
+            BusFieldPolicyExpect::Any,
+        )
+    }
+
+    #[test]
+    fn the_mask_keeps_the_last_three_characters_and_hides_short_values_whole() {
+        for (value, masked) in [
+            ("", ""),
+            ("a", "*"),
+            ("ab", "**"),
+            ("abc", "***"),
+            ("abcd", "****"),
+            ("abcde", "**cde"),
+            ("abcdef", "***def"),
+            ("4111111111111111", "*************111"),
+        ] {
+            assert_eq!(mask_text(value), masked, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn the_mask_counts_unicode_characters_not_bytes() {
+        // 4 characters, 8 bytes: masked whole.
+        assert_eq!(mask_text("żółć"), "****");
+        // 6 characters, 12 bytes: three kept, intact.
+        assert_eq!(mask_text("zażółć"), "***ółć");
+        // CJK: 3 bytes a character.
+        assert_eq!(mask_text("山田太郎花子"), "***郎花子");
+        // Emoji are 4 bytes; five of them keep the last three.
+        assert_eq!(mask_text("😀😀😀😀😀"), "**😀😀😀");
+        assert_eq!(mask_text("😀😀😀😀"), "****");
+        // Combining marks and joiners count as characters of their own.
+        assert_eq!(mask_text("e\u{301}e\u{301}x"), "**e\u{301}x");
+    }
+
+    #[test]
+    fn four_kinds_of_field_in_one_json_payload() {
+        let keys = node_keys();
+        let policy = rule(&["id", "card", "name", "age"], &["card", "age"], &["name"]);
+        keys.get_or_create(TEST_ORG).unwrap();
+        let key = policy.hash_key(&keys, TEST_ORG);
+        let payload = Bytes::from_static(
+            br#"{"id":"7","ssn":"123-45-6789","card":"4111111111111111","name":"Jan","age":42}"#,
+        );
+        let out = project_read(&policy, PayloadFormat::Json, &payload, key.as_deref());
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let expected_hash = key.as_ref().unwrap().hash_hex(b"Jan");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "id": "7",
+                "card": "*************111",
+                "name": expected_hash,
+                "age": "**"
+            })
+        );
+        assert!(value.get("ssn").is_none());
+    }
+
+    #[test]
+    fn four_kinds_of_field_in_one_xml_payload() {
+        let keys = node_keys();
+        let policy = rule(&["id", "card", "name"], &["card"], &["name"]);
+        keys.get_or_create(TEST_ORG).unwrap();
+        let key = policy.hash_key(&keys, TEST_ORG);
+        let payload = Bytes::from_static(
+            b"<P><id>7</id><ssn>123</ssn><card>4111111111111111</card><name>Jan</name></P>",
+        );
+        let out = project_read(&policy, PayloadFormat::Xml, &payload, key.as_deref());
+        let hash = key.as_ref().unwrap().hash_hex(b"Jan");
+        assert_eq!(
+            String::from_utf8(out.to_vec()).unwrap(),
+            format!("<P><id>7</id><card>*************111</card><name>{hash}</name></P>")
+        );
+    }
+
+    #[test]
+    fn four_kinds_of_field_in_one_hl7_message() {
+        let keys = node_keys();
+        let policy = rule(&["PID-1", "PID-3", "PID-5"], &["PID-5"], &["PID-3"]);
+        keys.get_or_create(TEST_ORG).unwrap();
+        let key = policy.hash_key(&keys, TEST_ORG);
+        let message = Bytes::from_static(
+            b"MSH|^~\\&|APP|FAC|RAPP|RFAC|20260902||ADT^A01|MSG1|P|2.5\rPID|1||MRN123||Kowalski^Jan||19800101|M\r",
+        );
+        let out = project_read(&policy, PayloadFormat::Hl7V2, &message, key.as_deref());
+        let hash = key.as_ref().unwrap().hash_hex(b"MRN123");
+        assert_eq!(
+            String::from_utf8(out.to_vec()).unwrap(),
+            // The name is masked as one text: `Kowalski^Jan` -> 9 asterisks and
+            // the last three characters, whose `^` position is long gone.
+            format!("MSH|^~\\&||||||||||\rPID|1||{hash}||*********Jan|||\r")
+        );
+    }
+
+    #[test]
+    fn a_policy_without_masks_or_hashes_never_touches_the_key() {
+        let keys = node_keys();
+        let policy = rule(&["a"], &[], &[]);
+        assert!(policy.hash_key(&keys, TEST_ORG).is_none());
+        // Not even a mask-only rule makes one.
+        assert!(rule(&["a"], &["a"], &[])
+            .hash_key(&keys, TEST_ORG)
+            .is_none());
+        // Nor does a rule that hashes: a read never creates the key.
+        assert!(rule(&["a"], &[], &["a"])
+            .hash_key(&keys, TEST_ORG)
+            .is_none());
+        assert!(keys.info(TEST_ORG).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_rule_that_hashes_without_its_key_hides_the_hashed_fields() {
+        let policy = rule(&["a", "b", "c"], &["b"], &["c"]);
+        let payload = Bytes::from_static(br#"{"a":"keep","b":"masked-value","c":"secret"}"#);
+        let out = project_read(&policy, PayloadFormat::Json, &payload, None);
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value, serde_json::json!({"a": "keep", "b": "*********lue"}));
+    }
+
+    #[test]
+    fn hashes_are_stable_per_organization_and_change_with_the_key() {
+        let keys = node_keys();
+        let policy = rule(&["name"], &[], &["name"]);
+        let payload = Bytes::from_static(br#"{"name":"Jan"}"#);
+        let hash_in = |org: &str| {
+            keys.get_or_create(org).unwrap();
+            let key = policy.hash_key(&keys, org);
+            let out = project_read(&policy, PayloadFormat::Json, &payload, key.as_deref());
+            serde_json::from_slice::<serde_json::Value>(&out).unwrap()["name"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let first = hash_in("org-1");
+        assert_eq!(first, hash_in("org-1"), "deterministic");
+        assert_ne!(first, hash_in("org-2"), "isolated between organizations");
+
+        keys.rotate("org-1", 1).unwrap();
+        assert_ne!(first, hash_in("org-1"), "a rotation changes the hash");
+    }
+
+    #[test]
+    fn decode_joins_shown_masked_and_hashed_fields_and_prefers_the_hash() {
+        let db = test_db();
+        create_topic_of(&db, "p.json", "application/json");
+        read_rule(&db, "p.json", &["a", "b", "c"], &["b"], &["c"]).unwrap();
+        let row = repository::bus_field_policy_get(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "p.json",
+            "any",
+            SUBJECT_ANY,
+            "read",
+        )
+        .unwrap()
+        .unwrap();
+        // A node that ignores the new columns sees only what is shown as it is.
+        assert_eq!(row.fields_json, r#"["a"]"#);
+        assert_eq!(row.masked_fields_json.as_deref(), Some(r#"["b"]"#));
+        assert_eq!(row.hashed_fields_json.as_deref(), Some(r#"["c"]"#));
+
+        let policy = decode(row.clone(), "p.json").unwrap();
+        assert_eq!(policy.fields, field_set(&["a", "b", "c"]));
+        assert_eq!(policy.action("a"), FieldAction::Show);
+        assert_eq!(policy.action("b"), FieldAction::Mask);
+        assert_eq!(policy.action("c"), FieldAction::Hash);
+        assert_eq!(policy.action("zzz"), FieldAction::Hide);
+
+        // A row from a peer that names a field as both gets the stricter one.
+        let both = DbBusFieldPolicy {
+            masked_fields_json: Some(r#"["b","c"]"#.to_string()),
+            ..row.clone()
+        };
+        let policy = decode(both, "p.json").unwrap();
+        assert_eq!(policy.action("c"), FieldAction::Hash);
+        assert_eq!(policy.action("b"), FieldAction::Mask);
+
+        // A row from before the migration masks and hashes nothing.
+        let old = DbBusFieldPolicy {
+            fields_json: r#"["a","b"]"#.to_string(),
+            masked_fields_json: None,
+            hashed_fields_json: None,
+            ..row
+        };
+        let policy = decode(old, "p.json").unwrap();
+        assert!(policy.masked_fields.is_empty() && policy.hashed_fields.is_empty());
+        assert_eq!(policy.action("b"), FieldAction::Show);
+    }
+
+    #[test]
+    fn a_rule_without_masks_is_stored_as_before() {
+        let db = test_db();
+        create_topic_of(&db, "p.json", "application/json");
+        read_rule(&db, "p.json", &["a", "b"], &[], &[]).unwrap();
+        let row = repository::bus_field_policy_get(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "p.json",
+            "any",
+            SUBJECT_ANY,
+            "read",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(row.fields_json, r#"["a","b"]"#);
+        assert_eq!(
+            (row.masked_fields_json, row.hashed_fields_json),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn set_policy_refuses_masks_that_are_not_a_read_rule_over_shown_fields() {
+        let db = test_db();
+        create_topic_of(&db, "p.json", "application/json");
+        let refusal = |result: Result<(), BusServiceError>| match result {
+            Err(BusServiceError::InvalidArgument(message)) => message,
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        };
+        // A mask on a field the rule does not show.
+        assert_eq!(
+            refusal(read_rule(&db, "p.json", &["a"], &["b"], &[])),
+            MASK_HASH_NOT_SHOWN
+        );
+        assert_eq!(
+            refusal(read_rule(&db, "p.json", &["a"], &[], &["b"])),
+            MASK_HASH_NOT_SHOWN
+        );
+        // Masked and hashed at once.
+        assert_eq!(
+            refusal(read_rule(&db, "p.json", &["a"], &["a"], &["a"])),
+            MASK_HASH_OVERLAP
+        );
+        // A write rule has no mask.
+        assert_eq!(
+            refusal(set_policy(
+                &db,
+                TEST_INSTANCE,
+                TEST_ORG,
+                "p.json",
+                "any",
+                SUBJECT_ANY,
+                Direction::Write,
+                &field_set(&["a"]),
+                &BTreeSet::new(),
+                &field_set(&["a"]),
+                &BTreeSet::new(),
+                BusFieldPolicyExpect::Any,
+            )),
+            MASK_HASH_READ_ONLY
+        );
+        assert!(list_policies(&db, TEST_INSTANCE, TEST_ORG, "p.json")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn set_policy_refuses_the_structural_msh_fields_as_masked_or_hashed() {
+        let db = test_db();
+        create_topic_of(&db, "adt.hl7", "application/hl7-v2");
+        for structural in ["MSH-1", "MSH-2"] {
+            for (masked, hashed) in [(&[structural][..], &[][..]), (&[][..], &[structural][..])] {
+                let err = read_rule(&db, "adt.hl7", &[structural], masked, hashed)
+                    .expect_err("MSH-1 and MSH-2 can never be replaced");
+                assert!(
+                    matches!(&err, BusServiceError::InvalidArgument(m) if m.contains(structural)),
+                    "{err:?}"
+                );
+            }
+        }
+        read_rule(&db, "adt.hl7", &["PID-3", "PID-5"], &["PID-5"], &["PID-3"]).unwrap();
+    }
+
+    #[test]
+    fn set_policy_refuses_masks_on_a_topic_checked_with_a_binary_pattern() {
+        use super::super::schema_registry::{registry, Compatibility, SchemaType};
+        let db = test_db();
+        registry::register(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "events.avro",
+            SchemaType::Avro,
+            r#"{"type":"record","name":"X","fields":[]}"#,
+            Some(Compatibility::None),
+            None,
+        )
+        .expect("register");
+        topics::create_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "bytes.avro",
+            topics::TopicOptions {
+                content_type: Some("application/octet-stream".to_string()),
+                schema_id: Some("events.avro".to_string()),
+                ..Default::default()
+            },
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create topic");
+        for (masked, hashed) in [(&["a"][..], &[][..]), (&[][..], &["a"][..])] {
+            let err = read_rule(&db, "bytes.avro", &["a"], masked, hashed)
+                .expect_err("a binary topic takes no mask or hash");
+            assert!(
+                matches!(&err, BusServiceError::InvalidArgument(m)
+                    if m.starts_with(BINARY_TOPIC_NO_POLICY)),
+                "{err:?}"
+            );
+        }
+        assert!(list_policies(&db, TEST_INSTANCE, TEST_ORG, "bytes.avro")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_dlq_topic_resolves_the_masks_and_hashes_of_its_source() {
+        let db = test_db();
+        let source = "orders.created";
+        let cfg = topics::create_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            source,
+            topics::TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create source topic")
+        .0;
+        let dlq_topic = dlq::dlq_topic_name(source);
+        topics::create_internal_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            &dlq_topic,
+            dlq::dlq_topic_options(&cfg),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create DLQ topic");
+        read_rule(&db, source, &["id", "card", "name"], &["card"], &["name"]).unwrap();
+
+        let resolved = resolve(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            &dlq_topic,
+            PolicySubject::Actor(ActorKind::User, "reader"),
+            Direction::Read,
+        )
+        .unwrap()
+        .expect("the DLQ topic inherits the source's rule");
+        assert_eq!(resolved.masked_fields, field_set(&["card"]));
+        assert_eq!(resolved.hashed_fields, field_set(&["name"]));
+        assert_eq!(resolved.fields, field_set(&["id", "card", "name"]));
+    }
+
+    #[test]
+    fn hashing_usage_counts_the_read_rules_topics_and_instances_that_hash() {
+        let db = test_db();
+        for topic in ["a.json", "b.json", "c.json"] {
+            create_topic_of(&db, topic, "application/json");
+        }
+        assert_eq!(
+            repository::bus_field_hash_usage(&db, TEST_ORG).unwrap(),
+            repository::BusFieldHashUsage::default()
+        );
+        read_rule(&db, "a.json", &["x", "y"], &[], &["x"]).unwrap();
+        // A second subject on the same topic is a second rule, not a second topic.
+        set_policy(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "a.json",
+            "user",
+            "u-1",
+            Direction::Read,
+            &field_set(&["x"]),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &field_set(&["x"]),
+            BusFieldPolicyExpect::Any,
+        )
+        .unwrap();
+        read_rule(&db, "b.json", &["x"], &["x"], &[]).unwrap(); // masks only
+        read_rule(&db, "c.json", &["x"], &[], &["x"]).unwrap();
+        assert_eq!(
+            repository::bus_field_hash_usage(&db, TEST_ORG).unwrap(),
+            repository::BusFieldHashUsage {
+                rules: 3,
+                topics: 2,
+                instances: 1
+            }
+        );
+        assert_eq!(
+            repository::bus_field_hash_usage(&db, "org-other").unwrap(),
+            repository::BusFieldHashUsage::default()
+        );
     }
 }

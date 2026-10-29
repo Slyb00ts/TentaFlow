@@ -11,6 +11,33 @@ use anyhow::Result;
 
 use crate::addon::install_steps::{InstallStepOutcome, InstallStepRun};
 
+/// Process-global handle to the node's settings cipher — the one made from the
+/// master key the entry point loaded (`load_or_create_master_key_in` with the
+/// desktop/mobile `data_dir`, or the default location). `AddonManager::new`
+/// publishes it, as it does the permission checker, so a lifecycle hook that is
+/// handed only a `NativeAppContext` uses the node's own cipher instead of
+/// reading a master key file itself: on desktop and mobile the file is not
+/// where the default lookup would go, and the default lookup would create one.
+/// `Weak`, overwritten on every call: the manager holds the `Arc`.
+static GLOBAL_SETTINGS_CIPHER: std::sync::OnceLock<
+    parking_lot::RwLock<std::sync::Weak<crate::crypto::SettingsCipher>>,
+> = std::sync::OnceLock::new();
+
+fn global_settings_cipher_cell(
+) -> &'static parking_lot::RwLock<std::sync::Weak<crate::crypto::SettingsCipher>> {
+    GLOBAL_SETTINGS_CIPHER.get_or_init(|| parking_lot::RwLock::new(std::sync::Weak::new()))
+}
+
+/// Called from `AddonManager::new`, before any native app can be enabled.
+pub fn set_global_settings_cipher(cipher: &std::sync::Arc<crate::crypto::SettingsCipher>) {
+    *global_settings_cipher_cell().write() = std::sync::Arc::downgrade(cipher);
+}
+
+/// `None`: no `AddonManager` exists in this process (a bare test context).
+pub fn global_settings_cipher() -> Option<std::sync::Arc<crate::crypto::SettingsCipher>> {
+    global_settings_cipher_cell().read().upgrade()
+}
+
 /// Instance-scoped context handed to lifecycle hooks. `data_dir` is the
 /// instance's own directory (orgs/<org>/addons/<addon_id>/) — the same
 /// containment every addon instance gets. `db` is the MAIN database (platform
