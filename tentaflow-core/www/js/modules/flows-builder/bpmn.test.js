@@ -3518,7 +3518,8 @@ test('verification modes: Test and Critic keep what was typed, start with an err
   change(control('verifyFlowId'), 'flow-one');
   assert.deepEqual(node.config.verification, { Test: { flowId: 'flow-one', onFailure: 'NeedsHuman' } });
   change(control('verification'), 'Critic'); await flush(2);
-  assert.deepEqual(node.config.verification, { Critic: { agentId: '', criteria: '', onFailure: 'NeedsHuman' } });
+  assert.deepEqual(node.config.verification, { Critic: { agentId: 'agent-2', criteria: 'must cite a source', onFailure: 'NeedsHuman' } },
+    'what was typed for the mode comes back when the author returns to it');
   change(control('verification'), 'Human');
   assert.equal(node.config.verification, 'Human');
   graph.updateNodeConfig(node.id, { verification: { Critic: { agentId: 'agent-1', criteria: 'c', onFailure: 'Error' } } });
@@ -3539,7 +3540,7 @@ test('verification modes: a machine verdict gives a Flow task error and escalati
   assert.equal(handled.hasResult, false, 'the work has no result rule, the verdict is the business result');
   assert.equal(handled.add.errorReason, null);
   assert.equal(handled.add.escalationReason, null);
-  assert.ok(handled.rows.some((row) => row.outcome === 'error' && row.route !== 'unavailable'));
+  assert.ok(handled.rows.some((row) => row.outcome === 'verdict' && row.route !== 'unavailable'), 'the rejection is the one error this task raises');
   assert.deepEqual(processRowFor(handled, 'completed').gate, 'test');
   assert.ok(processBoundaryHosts(graph, 'BoundaryEscalation').some((host) => host.id === task.id));
   graph.updateNodeConfig(task.id, { verification: { Critic: { agentId: 'agent-2', criteria: 'c', onFailure: 'NeedsHuman' } } });
@@ -3547,7 +3548,7 @@ test('verification modes: a machine verdict gives a Flow task error and escalati
   assert.equal(human.add.errorReason, 'no_result', 'a rejection sent to a person is not an error');
   assert.equal(human.add.escalationReason, null);
   assert.equal(processRowFor(human, 'completed').gate, 'critic');
-  assert.deepEqual(processRoutingTextKeys(processRowFor(human, 'rejected'), human.verification).outcome, 'bpmn.routing_outcome_rejected_human');
+  assert.deepEqual(processRoutingTextKeys(processRowFor(human, 'rejected'), human.verification).outcome, 'bpmn.routing_outcome_rejected_check');
   graph.updateNodeConfig(task.id, { verification: { Critic: { agentId: '', criteria: ' ', onFailure: 'Error' } } });
   assert.deepEqual(processResultRouting(graph, task.id).warnings.map((warning) => warning.key).filter((key) => key.startsWith('empty')),
     ['empty_critic_agent', 'empty_criteria']);
@@ -8304,4 +8305,192 @@ test('Export keeps the refused-fields banner, the error chip and tells which fie
   assert.equal(state.saveProblem, 'draftsSave');
   assert.equal(state.root.querySelector('[data-role="autosave-text"]').textContent, I18n.t('flows_builder.autosave_error'));
   assert.ok(texts.some((text) => text.startsWith(I18n.t('bpmn.operation_drafts_ignored')) && text.includes('“Review case”')), texts.join(' | '));
+});
+
+// ---------------------------------------------------------------- B3.5 review of the verification modes
+
+const { CRITIC_CRITERIA_MAX_BYTES, processCriteriaBytes, processVerdictReason, processVerificationOrigin, processVerificationSentence } = await import('./bpmn.js');
+
+// A Flow step "Check invoice" working on flow-one, with a second step of another name.
+function flowStepModel(verification, name = 'Check invoice') {
+  const model = emptyProcessModel();
+  model.nodes.splice(1, 0, { id: 'Svc_1', name, kind: { ServiceTask: { flowId: 'flow-one', inputMapping: {}, outputMapping: {}, verification,
+    timeoutSeconds: 60, resultExpression: null, implementation: 'Flow' } } });
+  model.sequenceFlows = [{ id: 'F_a', sourceId: 'Start', targetId: 'Svc_1', condition: null }, { id: 'F_b', sourceId: 'Svc_1', targetId: 'End', condition: null }];
+  return model;
+}
+
+test('every refusal of a verifier names the step and the flow or agent in the author\'s words', () => {
+  const model = flowStepModel('Human');
+  model.nodes.splice(2, 0, { ...structuredClone(model.nodes[1]), id: 'Svc_2', name: 'Check totals' });
+  const withOptions = { serviceFlows: [{ flowId: 'flow-two', name: 'Totals test' }], serviceAgents: [{ agentId: 'agent-2', name: 'Writer' }] };
+  const cases = [
+    ['service task Svc_2 test flow flow-two: a verification flow must end with the activity result block', 'bpmn.verify_flow_no_result', { node: 'Check totals', flow: '“Totals test”' }],
+    ['service task Svc_1 test flow 0000-dead does not exist', 'bpmn.verify_flow_missing', { node: 'Check invoice', flow: I18n.t('bpmn.verify_flow_generic') }],
+    ['service task Svc_1 test flow flow-two is not active', 'bpmn.verify_flow_inactive', { node: 'Check invoice', flow: '“Totals test”' }],
+    ['service task Svc_1 test flow flow-two is not available to you', 'bpmn.verify_flow_denied', { node: 'Check invoice', flow: '“Totals test”' }],
+    ['service task Svc_1 test flow flow-two cannot be used: flow flow-two compile failed: x', 'bpmn.verify_flow_unusable', { node: 'Check invoice', flow: '“Totals test”' }],
+    ['service task Svc_1 is verified by the flow that does its work', 'bpmn.verify_flow_own', { node: 'Check invoice' }],
+    ['service task Svc_1 critic: the agent "Disabled critic" is disabled', 'bpmn.publish_critic_disabled', { node: 'Check invoice', agent: 'Disabled critic' }],
+    ['service task Svc_1 critic: the agent agent-2 does not exist', 'bpmn.publish_critic_missing', { node: 'Check invoice', agent: '“Writer”' }],
+    ['service task Svc_1 critic: the agent agent-9 does not exist', 'bpmn.publish_critic_missing', { node: 'Check invoice', agent: I18n.t('bpmn.verify_agent_generic') }],
+    ['service task Svc_1 critic: an agent that runs on a CLI engine cannot be a process step', 'bpmn.publish_critic_unfit', { node: 'Check invoice' }],
+    ['service task Svc_1 critic: the harness flow of the critic does not exist', 'bpmn.publish_critic_unfit', { node: 'Check invoice' }],
+    ['service task Svc_1 critic criteria exceed 8192 bytes', 'bpmn.verify_criteria_over_server', { node: 'Check invoice', max: 8192 }],
+    ['service task Svc_1 is verified by the agent that does its work', 'bpmn.verification_critic_same_agent', { node: 'Check invoice' }],
+  ];
+  for (const [raw, key, values] of cases) {
+    const text = processExplainError(`protocol error BadRequest: ${raw}`, model, withOptions);
+    assert.equal(text, I18n.t(key, values), raw);
+    assert.doesNotMatch(text, /service task|ACL denied|does not exist\b.*uuid|verification flow must/, raw);
+  }
+  // Several refused steps are told one per line, each in its own words.
+  const several = processExplainError([
+    'service task Svc_1 test flow flow-two: a verification flow must end with the activity result block',
+    'service task Svc_2 test flow 0000-dead does not exist',
+    'service task Svc_2 critic: the agent "Disabled critic" is disabled',
+  ].join('\n'), model, withOptions).split('\n');
+  assert.deepEqual(several, [
+    I18n.t('bpmn.verify_flow_no_result', { node: 'Check invoice', flow: '“Totals test”' }),
+    I18n.t('bpmn.verify_flow_missing', { node: 'Check totals', flow: I18n.t('bpmn.verify_flow_generic') }),
+    I18n.t('bpmn.publish_critic_disabled', { node: 'Check totals', agent: 'Disabled critic' }),
+  ]);
+  // The worker agent's own refusal keeps its words.
+  assert.equal(processExplainError('service task Svc_1: the agent "Night shift" is disabled', model),
+    I18n.t('bpmn.publish_agent_disabled', { node: 'Check invoice', agent: 'Night shift' }));
+});
+
+test('runtime refusals about agents and flows of a process are translated', () => {
+  assert.equal(processExplainError('protocol error BadRequest: source agent is no longer enabled', emptyProcessModel()), I18n.t('bpmn.error_source_agent'));
+  assert.equal(processExplainError('source flow is no longer active', emptyProcessModel()), I18n.t('bpmn.error_source_flow'));
+  assert.equal(processVerdictReason("the critic run ended as 'failed' without reporting a verdict"), I18n.t('bpmn.verdict_reason_critic_no_verdict', { status: 'failed' }));
+  assert.equal(processVerdictReason('the critic said no'), 'the critic said no', 'a verifier\'s own words are kept');
+});
+
+test('the history and the review task say in a sentence that a check produced the result', () => {
+  const rejected = { outcome: 'NeedsHuman', code: 'VERIFICATION_FAILED', summary: 'No source cited.', outputs: {}, evidence: ['tentaflow.verification:rejected:critic:agent-2'] };
+  assert.equal(processVerificationOrigin(rejected).mode, 'critic');
+  assert.equal(processVerificationSentence(rejected), I18n.t('bpmn.verification_origin_rejected_critic', { reason: 'No source cited.' }));
+  const silent = { outcome: 'NeedsHuman', code: 'VERIFICATION_UNAVAILABLE', summary: "the critic run ended as 'failed' without reporting a verdict", outputs: {}, evidence: [] };
+  assert.equal(processVerificationSentence(silent), I18n.t('bpmn.verification_origin_unavailable', { reason: I18n.t('bpmn.verdict_reason_critic_no_verdict', { status: 'failed' }) }));
+  assert.equal(processVerificationSentence({ outcome: 'Completed', code: null, summary: 'ok', outputs: {}, evidence: [] }), null);
+  const text = processEventText({ kind: 'service_result', nodeName: 'Check invoice', nodeId: 'Svc_1', data: silent, atMs: 1, seq: 1, scopeId: 's' });
+  assert.ok(!text.includes('without reporting a verdict'), text);
+});
+
+test('a flow cannot be its own test and the critic criteria have a byte limit the editor counts', () => {
+  const own = canvas(flowStepModel({ Test: { flowId: 'flow-one', onFailure: 'Error' } }));
+  assert.deepEqual(own.validate(), [I18n.t('bpmn.verification_test_own_flow', { node: 'Check invoice' })]);
+  assert.ok(processResultRouting(own, 'Svc_1').warnings.some((warning) => warning.key === 'own_test_flow'));
+  own.destroy();
+  assert.equal(processCriteriaBytes('ą'), 2);
+  const critic = (criteria) => canvas(flowStepModel({ Critic: { agentId: 'agent-2', criteria, onFailure: 'Error' } }));
+  for (const [criteria, refused] of [['a'.repeat(CRITIC_CRITERIA_MAX_BYTES), false], ['a'.repeat(CRITIC_CRITERIA_MAX_BYTES + 1), true], ['ą'.repeat(4097), true]]) {
+    const graph = critic(criteria);
+    const errors = graph.validate();
+    assert.equal(errors.length, refused ? 1 : 0, `${criteria.length} characters`);
+    if (refused) assert.equal(errors[0], I18n.t('bpmn.verification_criteria_over', { node: 'Check invoice', used: processCriteriaBytes(criteria), max: CRITIC_CRITERIA_MAX_BYTES }));
+    graph.destroy();
+  }
+});
+
+test('the Test and Critic pickers keep the worker out, flag what is gone and count the criteria', async () => {
+  const model = flowStepModel({ Test: { flowId: 'flow-one', onFailure: 'Error' } });
+  const graph = canvas(model);
+  const node = graph.nodes.find((candidate) => candidate.id === 'Svc_1');
+  const config = inspector(graph); config.show(node, graph.templates.get(node.type)); await flush(2);
+  const control = (key) => config.root.querySelector(`[data-process="${key}"]`);
+  assert.deepEqual([...control('verifyFlowId').querySelectorAll('option')].map((option) => option.value).filter(Boolean), ['flow-one'],
+    'a saved own flow stays visible, disabled');
+  assert.equal(control('verifyFlowId').querySelector('option[value="flow-one"]').disabled, true);
+  assert.equal(config.root.querySelector('[data-test-warning]').getAttribute('message'), I18n.t('bpmn.verification_test_own_warning'));
+  assert.ok(config.root.textContent.includes(I18n.t('bpmn.verification_test_own_hint')));
+  assert.equal(config.root.querySelector('.fb-field-hint:not([data-criteria-counter])') !== null, true);
+  graph.updateNodeConfig('Svc_1', { verification: { Test: { flowId: '', onFailure: 'Error' } } }); config.show(node, graph.templates.get(node.type)); await flush(2);
+  assert.ok(!config.root.querySelector('[data-test-warning]'), 'an empty choice raises no warning');
+  assert.deepEqual([...control('verifyFlowId').querySelectorAll('option')].map((option) => option.value).filter(Boolean), [],
+    'the only flow is the worker, so none is offered');
+  assert.ok(!config.root.textContent.includes(I18n.t('bpmn.verification_hint')), 'the human-review sentence is not shown for a machine check');
+  graph.updateNodeConfig('Svc_1', { verification: { Test: { flowId: 'flow-gone', onFailure: 'Error' } } }); config.show(node, graph.templates.get(node.type)); await flush(2);
+  assert.equal(config.root.querySelector('[data-test-warning]').getAttribute('message'), I18n.t('bpmn.verification_test_unavailable_warning'));
+
+  graph.updateNodeConfig('Svc_1', { verification: { Critic: { agentId: 'agent-gone', criteria: 'ą'.repeat(10), onFailure: 'Error' } } }); config.show(node, graph.templates.get(node.type)); await flush(2);
+  assert.equal(config.root.querySelector('[data-critic-warning]').getAttribute('message'), I18n.t('bpmn.verification_critic_unavailable_warning'));
+  assert.equal(config.root.querySelector('[data-criteria-counter]').textContent, I18n.t('bpmn.verification_criteria_counter', { used: 20, max: CRITIC_CRITERIA_MAX_BYTES }));
+  const criteria = control('verifyCriteria');
+  criteria.value = 'ą'.repeat(4097);
+  criteria.dispatchEvent(new window.Event('input', { bubbles: true }));
+  assert.equal(criteria.getAttribute('error'), I18n.t('bpmn.verification_criteria_over_field', { max: CRITIC_CRITERIA_MAX_BYTES }));
+  assert.ok(config.root.querySelector('[data-criteria-counter]').textContent.includes('8194'));
+  criteria.value = 'short';
+  criteria.dispatchEvent(new window.Event('input', { bubbles: true }));
+  assert.equal(criteria.getAttribute('error'), null);
+  graph.destroy(); config.destroy();
+
+  const agentGraph = canvas(agentStepModel({ agentId: 'agent-1' }));
+  const agentNode = agentGraph.nodes.find((candidate) => candidate.id === 'Agent_1');
+  agentGraph.updateNodeConfig('Agent_1', { verification: { Critic: { agentId: 'agent-1', criteria: 'c', onFailure: 'Error' } } });
+  const agentConfig = inspector(agentGraph); agentConfig.show(agentNode, agentGraph.templates.get(agentNode.type)); await flush(2);
+  assert.equal(agentConfig.root.querySelector('[data-process="verifyAgentId"] option[value="agent-1"]').textContent, I18n.t('bpmn.verification_critic_is_worker'));
+  assert.equal(agentConfig.root.querySelector('[data-critic-warning]').getAttribute('message'), I18n.t('bpmn.verification_critic_is_worker_warning'));
+  agentGraph.destroy(); agentConfig.destroy();
+});
+
+test('what was typed for a verification mode survives a visit to another mode', async () => {
+  const graph = canvas(flowStepModel('Human'));
+  const node = graph.nodes.find((candidate) => candidate.id === 'Svc_1');
+  const config = inspector(graph); config.show(node, graph.templates.get(node.type)); await flush(2);
+  const control = (key) => config.root.querySelector(`[data-process="${key}"]`);
+  change(control('verification'), 'Critic'); await flush(2);
+  change(control('verifyAgentId'), 'agent-2'); change(control('verifyCriteria'), 'must cite a source');
+  change(control('verification'), 'Condition'); await flush(2);
+  change(control('verification'), 'Critic'); await flush(2);
+  assert.deepEqual(node.config.verification, { Critic: { agentId: 'agent-2', criteria: 'must cite a source', onFailure: 'Error' } });
+  graph.destroy(); config.destroy();
+});
+
+test('the routing table of a machine check names the rejection code and only the handlers that can fire', () => {
+  const declared = (graph, code) => { const model = graph.processModel; model.errors = [{ errorId: 'Err_1', errorCode: code, name: code }]; return model; };
+  const graph = canvas(flowStepModel({ Test: { flowId: 'flow-two', onFailure: 'Error' } }));
+  const plain = processResultRouting(graph, 'Svc_1');
+  const verdict = processRowFor(plain, 'verdict');
+  assert.equal(verdict.code, 'VERIFICATION_FAILED');
+  assert.equal(processRoutingTextKeys(verdict, 'Test').outcome, 'bpmn.routing_outcome_verdict_error');
+  assert.equal(processRoutingTextKeys(verdict, 'Test').route, 'bpmn.routing_caller_code', 'no handler: the incident carries the rejection code');
+  assert.ok(!plain.rows.some((row) => row.outcome === 'error' && row.other), 'without a result rule there is no "any other error" row');
+  assert.equal(processRoutingTextKeys(processRowFor(plain, 'rejected'), 'Test').outcome, 'bpmn.routing_outcome_rejected_check');
+  // Only the rejection code is offered for a new handler, and a boundary for any other code is flagged.
+  const model = declared(graph, 'BAD'); model.errors.push({ errorId: 'Err_2', errorCode: 'VERIFICATION_FAILED', name: 'x' });
+  graph.setData(model);
+  assert.equal(processResultRouting(graph, 'Svc_1').add.error.ref, 'Err_2');
+  graph.addBoundaryNode('Svc_1', 'bpmn_boundary_error', 'Err_1');
+  assert.ok(processResultRouting(graph, 'Svc_1').warnings.some((warning) => warning.key === 'verdict_code_never_fires'));
+  graph.destroy();
+
+  const human = canvas(flowStepModel({ Test: { flowId: 'flow-two', onFailure: 'NeedsHuman' } }));
+  const sent = processRowFor(processResultRouting(human, 'Svc_1'), 'verdict');
+  assert.equal(sent.route, 'review');
+  assert.equal(processRoutingTextKeys(sent, 'Test').outcome, 'bpmn.routing_outcome_verdict_human');
+  human.destroy();
+});
+
+test('the save banner follows the model: it goes away with its cause and is rewritten while a problem remains', async () => {
+  const model = agentStepModel();
+  const state = await mount(definition('banner-follows', { model }), saveFixtures('banner-follows'));
+  state.canvas.selectNode('Agent_1'); await flush(2);
+  const control = (key) => state.root.querySelector(`[data-process="${key}"]`);
+  change(control('verification'), 'Critic'); await flush(2);
+  assert.equal(await builder._save({ silent: true }), false);
+  const banner = state.root.querySelector('[data-role="error"]');
+  assert.equal(banner.hidden, false);
+  assert.ok(banner.getAttribute('message').includes(I18n.t('bpmn.verification_agent_required', { node: 'Review case' }).slice(0, 30)));
+  // A fix of one problem rewrites the banner, it does not leave the old one.
+  change(control('verifyAgentId'), 'agent-2'); await flush(2);
+  assert.equal(banner.getAttribute('message'), I18n.t('bpmn.verification_criteria_required', { node: 'Review case' }));
+  assert.equal(state.root.querySelector('[data-role="autosave-text"]').textContent, I18n.t('flows_builder.autosave_error'));
+  // The last fix, a mode change away from the check, removes it and the chip says what is true.
+  change(control('verification'), 'Human'); await flush(2);
+  assert.equal(banner.hidden, true);
+  assert.equal(state.saveProblem, false);
+  assert.equal(state.root.querySelector('[data-role="autosave-text"]').textContent, I18n.t('flows_builder.autosave_pending'));
 });

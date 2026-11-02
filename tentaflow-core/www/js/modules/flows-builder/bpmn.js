@@ -639,7 +639,50 @@ export function processPlainError(message) {
   const text = String(message ?? '');
   if (/process draft revision conflict or archived definition/.test(text)) return I18n.t('bpmn.error_draft_conflict');
   if (/publication needs a Current verified calendar pin/.test(text)) return I18n.t('bpmn.error_calendar_pin');
+  if (/source agent (is no longer enabled|no longer runs on a model)/.test(text)) return I18n.t('bpmn.error_source_agent');
+  if (/source flow is no longer active/.test(text)) return I18n.t('bpmn.error_source_flow');
   return null;
+}
+
+// The longest critic criteria the server accepts, counted in UTF-8 bytes the
+// way it counts them (`MAX_CRITIC_CRITERIA_BYTES`).
+export const CRITIC_CRITERIA_MAX_BYTES = 8 * 1024;
+
+export function processCriteriaBytes(criteria) {
+  return new TextEncoder().encode(String(criteria ?? '')).length;
+}
+
+// The fixed reasons the platform gives when a check could not reach a verdict;
+// a critic's or a test flow's own words are the author's and stay as written.
+export function processVerdictReason(summary) {
+  const reason = String(summary ?? '');
+  const ended = /^the critic run ended as '(\w+)' without reporting a verdict/.exec(reason);
+  if (ended) return I18n.t('bpmn.verdict_reason_critic_no_verdict', { status: ended[1] });
+  if (/^the critic could not be started/.test(reason)) return I18n.t('bpmn.verdict_reason_critic_not_started');
+  if (/^the critic's verdict is unreadable/.test(reason)) return I18n.t('bpmn.verdict_reason_critic_unreadable');
+  if (/^the verification flow cannot be started/.test(reason)) return I18n.t('bpmn.verdict_reason_flow_not_started');
+  if (/^the verification flow failed/.test(reason)) return I18n.t('bpmn.verdict_reason_flow_failed');
+  return reason;
+}
+
+// What a result that came out of a verification says about itself: a rejection
+// (`VERIFICATION_FAILED`, by a test, a critic or an acceptance condition) or a
+// check that gave no verdict (`VERIFICATION_UNAVAILABLE`). `null` for any other
+// result.
+export function processVerificationOrigin(result) {
+  const code = result?.code;
+  if (code !== 'VERIFICATION_FAILED' && code !== 'VERIFICATION_UNAVAILABLE') return null;
+  const marker = (result.evidence || []).find((entry) => typeof entry === 'string' && entry.startsWith('tentaflow.verification:'));
+  const mode = marker ? marker.split(':')[2] : 'condition';
+  return { kind: code === 'VERIFICATION_FAILED' ? 'rejected' : 'unavailable', mode, reason: processVerdictReason(result.summary) };
+}
+
+// One plain sentence for a result that a verification produced, `null` otherwise.
+export function processVerificationSentence(result) {
+  const origin = processVerificationOrigin(result);
+  if (!origin) return null;
+  if (origin.kind === 'unavailable') return I18n.t('bpmn.verification_origin_unavailable', { reason: origin.reason });
+  return I18n.t(`bpmn.verification_origin_rejected_${['test', 'critic'].includes(origin.mode) ? origin.mode : 'condition'}`, { reason: origin.reason });
 }
 
 /**
@@ -652,7 +695,7 @@ export function processPlainError(message) {
  * the noun the message puts in front of it, so an imported element called
  * "Start" never rewrites the ordinary word.
  */
-export function processExplainError(message, model) {
+export function processExplainError(message, model, options = null) {
   const names = processElementNames(model);
   const bodies = [model, ...(model?.additionalProcesses || [])];
   const flows = new Map();
@@ -678,14 +721,12 @@ export function processExplainError(message, model) {
   }
   const timeout = /service task ([\w.-]+) timeout is outside 1\.\.=(\d+) seconds/.exec(text);
   if (timeout && names.has(timeout[1])) return I18n.t('bpmn.timeout_out_of_range', { node: names.get(timeout[1]), max: Number(timeout[2]) });
-  // A publication names every refused agent step, one per line; two steps of one name carry their occurrence number.
-  const agentLines = [...text.matchAll(/service task ([\w.-]+): the agent (?:"(.*?)" is disabled|\S+ does not exist)/gs)]
-    .filter((line) => names.has(line[1]));
-  if (agentLines.length) {
-    const labels = processDistinctLabels([...names]);
-    return agentLines.map((line) => (line[2] === undefined
-      ? I18n.t('bpmn.publish_agent_missing', { node: labels.get(line[1]) })
-      : I18n.t('bpmn.publish_agent_disabled', { node: labels.get(line[1]), agent: line[2] }))).join('\n');
+  // A publication names every refused step, one per line; two steps of one name carry their occurrence number.
+  const lines = text.split('\n');
+  const labels = processDistinctLabels([...names]);
+  const translated = lines.map((line) => processVerificationRefusal(line, labels, model, options));
+  if (translated.some((line) => line !== null)) {
+    return lines.map((line, index) => translated[index] ?? processReplaceIds(line, names, flows)).join('\n');
   }
   const unsimulated = /repetition is unsupported in simulation \(([\w.-]+)\)/.exec(text);
   if (unsimulated && names.has(unsimulated[1])) return I18n.t('bpmn.simulation_repeat_unsupported', { names: names.get(unsimulated[1]) });
@@ -698,6 +739,10 @@ export function processExplainError(message, model) {
     const key = ESCALATION_PATH_REASONS.includes(path[2]) ? path[2] : 'other';
     return I18n.t(`bpmn.routing_warning_escalation_path_${key}`, { names: names.get(path[1]) });
   }
+  return processReplaceIds(text, names, flows);
+}
+
+function processReplaceIds(text, names, flows) {
   const citesId = (token, offset) => /[\d_-]/.test(token) || ID_SLOT.test(text.slice(0, offset));
   return text.replace(/[\w-]+/g, (token, offset) => {
     if (!citesId(token, offset)) return token;
@@ -705,6 +750,57 @@ export function processExplainError(message, model) {
     const flow = flows.get(token);
     return flow ? I18n.t('bpmn.error_flow', { from: names.get(flow.sourceId) ?? flow.sourceId, to: names.get(flow.targetId) ?? flow.targetId }) : token;
   });
+}
+
+// One line of a save or publication refusal that concerns the agent, test flow
+// or critic of a Service step, in the author's words, or `null` for any other
+// line. The server cites the step by id and the flow or agent by id; the name of
+// a flow or agent comes from the options the editor already holds.
+function processVerificationRefusal(line, labels, model, options) {
+  const step = (id) => labels.get(id);
+  const flowText = (id) => {
+    const flow = options?.serviceFlows?.find((candidate) => candidate.flowId === id);
+    return flow ? `\u201c${flow.name}\u201d` : I18n.t('bpmn.verify_flow_generic');
+  };
+  const agentText = (id) => {
+    const agent = options?.serviceAgents?.find((candidate) => candidate.agentId === id);
+    return agent ? `\u201c${agent.name}\u201d` : I18n.t('bpmn.verify_agent_generic');
+  };
+  const known = (id) => labels.has(id);
+  let found = /^service task ([\w.-]+) test flow ([\w-]+) (does not exist|is not active|is not available to you)$/.exec(line);
+  if (found && known(found[1])) {
+    const key = { 'does not exist': 'missing', 'is not active': 'inactive', 'is not available to you': 'denied' }[found[3]];
+    return I18n.t(`bpmn.verify_flow_${key}`, { node: step(found[1]), flow: flowText(found[2]) });
+  }
+  found = /^service task ([\w.-]+) test flow ([\w-]+)( cannot be used|: a verification flow must end with the activity result block|:)/.exec(line);
+  if (found && known(found[1])) {
+    const key = found[3].includes('activity result block') ? 'no_result' : 'unusable';
+    return I18n.t(`bpmn.verify_flow_${key}`, { node: step(found[1]), flow: flowText(found[2]) });
+  }
+  found = /^service task ([\w.-]+) is verified by the flow that does its work$/.exec(line);
+  if (found && known(found[1])) return I18n.t('bpmn.verify_flow_own', { node: step(found[1]) });
+  found = /^service task ([\w.-]+) is verified by the agent that does its work$/.exec(line);
+  if (found && known(found[1])) return I18n.t('bpmn.verification_critic_same_agent', { node: step(found[1]) });
+  found = /^service task ([\w.-]+) critic criteria exceed (\d+) bytes$/.exec(line);
+  if (found && known(found[1])) return I18n.t('bpmn.verify_criteria_over_server', { node: step(found[1]), max: Number(found[2]) });
+  found = /^service task ([\w.-]+) verifies with a test but names no flow$/.exec(line);
+  if (found && known(found[1])) return I18n.t('bpmn.verification_flow_required', { node: step(found[1]) });
+  found = /^service task ([\w.-]+) verifies with a critic but names no agent$/.exec(line);
+  if (found && known(found[1])) return I18n.t('bpmn.verification_agent_required', { node: step(found[1]) });
+  found = /^service task ([\w.-]+) verifies with a critic but gives it no criteria$/.exec(line);
+  if (found && known(found[1])) return I18n.t('bpmn.verification_criteria_required', { node: step(found[1]) });
+  found = /^service task ([\w.-]+)( critic)?: the agent (?:"(.*?)" is disabled|(\S+) does not exist)$/.exec(line);
+  if (found && known(found[1])) {
+    const critic = found[2] !== undefined;
+    if (found[3] !== undefined) {
+      return I18n.t(critic ? 'bpmn.publish_critic_disabled' : 'bpmn.publish_agent_disabled', { node: step(found[1]), agent: found[3] });
+    }
+    return critic ? I18n.t('bpmn.publish_critic_missing', { node: step(found[1]), agent: agentText(found[4]) })
+      : I18n.t('bpmn.publish_agent_missing', { node: step(found[1]) });
+  }
+  found = /^service task ([\w.-]+) critic: (?:an agent that|the harness flow of the critic)/.exec(line);
+  if (found && known(found[1])) return I18n.t('bpmn.publish_critic_unfit', { node: step(found[1]) });
+  return null;
 }
 
 // The verification mode of a Service task's `verification` value: `'Human'`, or
@@ -732,12 +828,14 @@ export function processVerificationFor(mode, previous) {
 // (targets, handler, code, timer) come from the row itself.
 export function processRoutingTextKeys(row, verification) {
   const outcome = row.outcome === 'timeout' ? 'bpmn.routing_outcome_timeout'
-    : row.outcome === 'rejected' ? `bpmn.routing_outcome_rejected_${verification === 'Condition' ? 'condition' : 'human'}`
+    : row.outcome === 'verdict' ? `bpmn.routing_outcome_verdict_${row.onFailure === 'Error' ? 'error' : 'human'}`
+    : row.outcome === 'rejected' ? `bpmn.routing_outcome_rejected_${verification === 'Condition' ? 'condition' : verification === 'Test' || verification === 'Critic' ? 'check' : 'human'}`
       : (row.outcome === 'error' || row.outcome === 'needs_human') && row.route !== 'unavailable'
         ? `bpmn.routing_outcome_${row.outcome}_${row.other ? 'other' : 'code'}`
         : `bpmn.routing_outcome_${row.outcome}`;
   let route = `bpmn.routing_${row.route}`;
   if (row.route === 'next') route = `bpmn.routing_next_${row.gate}`;
+  else if (row.route === 'caller_code') route = 'bpmn.routing_caller_code';
   else if (row.route === 'boundary' && row.outcome === 'timer') route = row.boundary.interrupting ? 'bpmn.routing_timer_interrupting' : 'bpmn.routing_timer_parallel';
   else if (row.route === 'incident') {
     route = row.outcome === 'error' && row.other ? 'bpmn.routing_incident_repeated'
@@ -831,12 +929,29 @@ export function processResultRouting(graph, nodeId) {
   const canError = hasResult || machine?.onFailure === 'Error';
   const canEscalate = hasResult || machine != null;
   const enclosing = nested && !repeated ? enclosingErrorHandlers(model, graph.selectedProcessId, graph.processPath) : [];
+  // Without a result rule the only error or escalation the task can raise is a
+  // verdict: a rejection (VERIFICATION_FAILED) or a check that gave none
+  // (VERIFICATION_UNAVAILABLE). The handlers are matched on exactly those codes.
+  const verdictOnly = machine != null && !hasResult;
+  const rejection = 'VERIFICATION_FAILED';
+  const verdictCodes = [rejection, 'VERIFICATION_UNAVAILABLE'];
   const rows = [];
   rows.push({ outcome: 'completed', route: 'next', gate: mode.toLowerCase(), targets: targetsOf(nodeId) });
-  rows.push({ outcome: 'rejected', route: 'incident', code: mode === 'Condition' ? 'VERIFICATION_FAILED' : 'HUMAN_REJECTED' });
   const escalationRoute = (entry) => (entry.interrupting ? 'boundary' : 'boundary_keep');
-  if (canError) {
-    for (const entry of specific(errors)) rows.push({ outcome: 'error', route: 'boundary', code: entry.code, boundary: entry, targets: entry.targets });
+  if (machine) {
+    const handler = machine.onFailure === 'Error'
+      ? specific(errors).find((entry) => entry.code === rejection) || catchAll(errors)
+      : specific(escalations).find((entry) => entry.code === rejection) || catchAll(escalations);
+    const climbed = machine.onFailure === 'Error' && !handler && !repeated ? climbingHandler(enclosing, rejection) : null;
+    const route = handler ? (machine.onFailure === 'Error' ? 'boundary' : escalationRoute(handler))
+      : machine.onFailure === 'Error' ? (repeated ? 'incident' : climbed ? 'parent' : 'caller_code') : 'review';
+    rows.push({ outcome: 'verdict', onFailure: machine.onFailure, route, code: rejection, boundary: handler, parent: climbed, targets: handler ? handler.targets : [] });
+  }
+  rows.push({ outcome: 'rejected', route: 'incident', code: mode === 'Condition' ? 'VERIFICATION_FAILED' : 'HUMAN_REJECTED' });
+  const handledByVerdict = (entry) => machine != null && entry.code === rejection;
+  // With only a verdict to raise, the verdict row above is the whole of what can come back as an error.
+  if (canError && !verdictOnly) {
+    for (const entry of specific(errors).filter((candidate) => !(machine?.onFailure === 'Error' && handledByVerdict(candidate)))) rows.push({ outcome: 'error', route: 'boundary', code: entry.code, boundary: entry, targets: entry.targets });
     const otherError = catchAll(errors);
     const taskCodes = new Set(specific(errors).map((entry) => entry.code));
     for (const code of otherError ? [] : [...new Set(enclosing.filter((handler) => !handler.catchAll).map((handler) => handler.code))]) {
@@ -849,9 +964,10 @@ export function processResultRouting(graph, nodeId) {
     const climbed = otherError ? null : climbingHandler(enclosing, null);
     rows.push({ outcome: 'error', route: otherError ? 'boundary' : repeated ? 'incident' : climbed ? 'parent' : 'caller', other: true,
       code: null, boundary: otherError, parent: climbed, targets: otherError ? otherError.targets : [] });
-  } else rows.push({ outcome: 'error', route: 'unavailable' });
+  } else if (!canError) rows.push({ outcome: 'error', route: 'unavailable' });
   if (canEscalate) {
-    for (const entry of specific(escalations)) rows.push({ outcome: 'needs_human', route: escalationRoute(entry), code: entry.code, boundary: entry, targets: entry.targets });
+    for (const entry of specific(escalations).filter((candidate) => !(machine?.onFailure === 'NeedsHuman' && handledByVerdict(candidate))
+      && (!verdictOnly || verdictCodes.includes(candidate.code)))) rows.push({ outcome: 'needs_human', route: escalationRoute(entry), code: entry.code, boundary: entry, targets: entry.targets });
     const otherEscalation = catchAll(escalations);
     rows.push({ outcome: 'needs_human', route: otherEscalation ? escalationRoute(otherEscalation) : 'review', other: true,
       code: null, boundary: otherEscalation, targets: otherEscalation ? otherEscalation.targets : [] });
@@ -872,6 +988,7 @@ export function processResultRouting(graph, nodeId) {
   };
   if (mode === 'Condition' && !(config.verification.Condition.expression || '').trim()) warn('empty_condition');
   if (mode === 'Test' && !machine.flowId) warn('empty_test_flow');
+  if (mode === 'Test' && machine.flowId && machine.flowId === config.flowId) warn('own_test_flow');
   if (mode === 'Critic') {
     if (!machine.agentId) warn('empty_critic_agent');
     else if (machine.agentId === config.implementation?.Agent?.agentId) warn('critic_same_agent');
@@ -879,6 +996,10 @@ export function processResultRouting(graph, nodeId) {
   }
   if (!rows[0].targets.length) warn('no_outgoing');
   if (!canError && errors.length) warn('error_boundary_without_result');
+  if (verdictOnly) {
+    for (const entry of specific(errors).filter((candidate) => canError && candidate.code !== rejection)) warn('verdict_code_never_fires', entry.name);
+    for (const entry of specific(escalations).filter((candidate) => !verdictCodes.includes(candidate.code))) warn('verdict_code_never_fires', entry.name);
+  }
   if (!canEscalate && escalations.length) warn('escalation_boundary_without_result');
   for (const entry of [...errors, ...escalations, ...timers]) {
     if (!entry.targets.length) warn('boundary_no_flow', entry.name);
@@ -909,17 +1030,19 @@ export function processResultRouting(graph, nodeId) {
 
   // The first catch-all, then each declared code, that has no handler yet: a
   // second handler for one code is refused at publication.
-  const nextRef = (list, declarations, idKey, codeKey) => {
+  const nextRef = (list, declarations, idKey, codeKey, only = null) => {
     const used = new Set(list.map((entry) => (entry.catchAll ? null : entry.undeclared ? undefined : entry.code)));
+    const free = (declarations || []).find((entry) => !used.has(entry[codeKey]) && (!only || only.includes(entry[codeKey])));
+    // A task that can only raise a verdict offers the code of that verdict before the catch-all.
+    if (only && free) return { ref: free[idKey] };
     if (!used.has(null)) return { ref: null };
-    const free = (declarations || []).find((entry) => !used.has(entry[codeKey]));
-    return free ? { ref: free[idKey] } : null;
+    return !only && free ? { ref: free[idKey] } : null;
   };
   // Both buttons need a result rule: only a rule can return an error or ask a
   // person. The task also has a finite number of places on its border.
   const room = typeof graph.boundaryRoom === 'function' ? graph.boundaryRoom(nodeId) : Infinity;
-  const addError = canError ? nextRef(errors, model.errors, 'errorId', 'errorCode') : null;
-  const addEscalation = canEscalate ? nextRef(escalations, model.escalations, 'escalationId', 'escalationCode') : null;
+  const addError = canError ? nextRef(errors, model.errors, 'errorId', 'errorCode', verdictOnly ? [rejection] : null) : null;
+  const addEscalation = canEscalate ? nextRef(escalations, model.escalations, 'escalationId', 'escalationCode', verdictOnly ? verdictCodes : null) : null;
   const reason = (ref, possible) => (!possible ? 'no_result' : !ref ? 'all_taken' : room < 1 ? 'no_room' : null);
   const errorReason = reason(addError, canError);
   const escalationReason = reason(addEscalation, canEscalate);

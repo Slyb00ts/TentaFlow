@@ -20,7 +20,7 @@ import '/js/components/tf-person-picker.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-alert.js';
-import { processNodeKind, processAgentPreset, processAgentIterationLimit, processTimeoutCeiling, processTimeoutProblem, processSortedAgents, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processVerificationMode, processVerificationFor, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processElementNames, processStartEntryLabels, processItemLabels } from './bpmn.js';
+import { CRITIC_CRITERIA_MAX_BYTES, processCriteriaBytes, processNodeKind, processAgentPreset, processAgentIterationLimit, processTimeoutCeiling, processTimeoutProblem, processSortedAgents, processBoundaryKind, processBoundaryHosts, processBody, processBlockTemplate, processBlockLabel, processNodeWarnings, processWarningText, processResultRouting, processRoutingTextKeys, processVerificationMode, processVerificationFor, processHandlerName, processBodyLabels, processDistinctLabels, processExplainError, processNodeLabels, processElementNames, processStartEntryLabels, processItemLabels } from './bpmn.js';
 import { openProcessCallPreview } from './process-monitor.js';
 
 // Hardcoded prompt/config fields per harness node type (Part 4-5). Backend reads
@@ -439,7 +439,7 @@ export class FlowConfig {
 
   // Server messages cite elements by id; the author reads their names.
   _explain(error) {
-    return processExplainError(error.message, this.opts.getCanvas().getData());
+    return processExplainError(error.message, this.opts.getCanvas().getData(), this.opts.processOptions);
   }
 
   _activityIoReferences() {
@@ -795,6 +795,20 @@ export class FlowConfig {
       // The critic must be another agent than the one that does the work.
       const criticAgents = agents.filter((agent) => agent.agentId !== agentTask?.agentId);
       const criticLabels = processDistinctLabels(criticAgents.map((agent) => [agent.agentId, agent.name]));
+      // The flow that does the work is never offered as its own test; a saved model that names it keeps the choice visible and flagged.
+      const testFlowId = testVerification?.flowId;
+      const testFlowOwn = !!testFlowId && testFlowId === config.flowId;
+      const testFlowGone = !!testFlowId && !testFlowOwn && !flows.some((flow) => flow.flowId === testFlowId);
+      const testFlowOption = testFlowOwn ? `<option value="${escapeAttr(testFlowId)}" disabled>${escapeHtml(I18n.t('bpmn.verification_test_own_option'))}</option>`
+        : testFlowGone ? `<option value="${escapeAttr(testFlowId)}" disabled>${escapeHtml(I18n.t('bpmn.flow_unavailable'))}</option>` : '';
+      const testFlowWarning = testFlowOwn ? 'bpmn.verification_test_own_warning' : testFlowGone ? 'bpmn.verification_test_unavailable_warning' : null;
+      const criticId = criticVerification?.agentId;
+      const criticIsWorker = !!criticId && criticId === agentTask?.agentId;
+      const criticGone = !!criticId && !criticIsWorker && !criticAgents.some((agent) => agent.agentId === criticId);
+      const criticOption = criticIsWorker ? `<option value="${escapeAttr(criticId)}" disabled>${escapeHtml(I18n.t('bpmn.verification_critic_is_worker'))}</option>`
+        : criticGone ? `<option value="${escapeAttr(criticId)}" disabled>${escapeHtml(I18n.t('bpmn.agent_unavailable'))}</option>` : '';
+      const criticWarning = criticIsWorker ? 'bpmn.verification_critic_is_worker_warning' : criticGone ? 'bpmn.verification_critic_unavailable_warning' : null;
+      const criteriaBytes = processCriteriaBytes(criticVerification?.criteria);
       const routing = processResultRouting(this.opts.getCanvas(), node.id);
       const tabs = [['impl', 'tab_implementation', 'puzzle'], ['io', 'tab_io', 'transform'], ['result', 'tab_result', 'check-circle'],
         ['time', 'tab_time', 'clock'], ['advanced', 'tab_advanced', 'settings']];
@@ -821,12 +835,16 @@ export class FlowConfig {
         </tf-select>
         <div data-process-condition ${verificationMode === 'Condition' ? '' : 'hidden'}>${input('expression', 'verification_expression', config.verification?.Condition?.expression)}</div>
         <div data-process-test ${verificationMode === 'Test' ? '' : 'hidden'}>
-          <tf-select data-process="verifyFlowId" wrap-selected label="${escapeAttr(I18n.t('bpmn.verification_test_flow'))}" value="${escapeAttr(testVerification?.flowId || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.choose_flow'))}</option>${flows.map((flow) => `<option value="${escapeAttr(flow.flowId)}">${escapeHtml(flowLabels.get(flow.flowId))}</option>`).join('')}${testVerification?.flowId && !flows.some((flow) => flow.flowId === testVerification.flowId) ? `<option value="${escapeAttr(testVerification.flowId)}" disabled>${escapeHtml(I18n.t('bpmn.flow_unavailable'))}</option>` : ''}</tf-select>
+          <tf-select data-process="verifyFlowId" wrap-selected label="${escapeAttr(I18n.t('bpmn.verification_test_flow'))}" value="${escapeAttr(testVerification?.flowId || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.choose_flow'))}</option>${flows.filter((flow) => flow.flowId !== config.flowId).map((flow) => `<option value="${escapeAttr(flow.flowId)}">${escapeHtml(flowLabels.get(flow.flowId))}</option>`).join('')}${testFlowOption}</tf-select>
+          ${testFlowWarning ? `<tf-alert tone="warning" live data-test-warning message="${escapeAttr(I18n.t(testFlowWarning))}"></tf-alert>` : ''}
           <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_test_hint'))}</p>
+          ${config.flowId ? `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_test_own_hint'))}</p>` : ''}
         </div>
         <div data-process-critic ${verificationMode === 'Critic' ? '' : 'hidden'}>
-          <tf-select data-process="verifyAgentId" wrap-selected label="${escapeAttr(I18n.t('bpmn.verification_critic_agent'))}" value="${escapeAttr(criticVerification?.agentId || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.verification_critic_choose'))}</option>${criticAgents.map((agent) => `<option value="${escapeAttr(agent.agentId)}">${escapeHtml(criticLabels.get(agent.agentId))}</option>`).join('')}${criticVerification?.agentId && !criticAgents.some((agent) => agent.agentId === criticVerification.agentId) ? `<option value="${escapeAttr(criticVerification.agentId)}" disabled>${escapeHtml(I18n.t('bpmn.agent_unavailable'))}</option>` : ''}</tf-select>
-          ${textarea('verifyCriteria', 'verification_criteria', criticVerification?.criteria, 3)}
+          <tf-select data-process="verifyAgentId" wrap-selected label="${escapeAttr(I18n.t('bpmn.verification_critic_agent'))}" value="${escapeAttr(criticVerification?.agentId || '')}" ${disabled}><option value="">${escapeHtml(I18n.t('bpmn.verification_critic_choose'))}</option>${criticAgents.map((agent) => `<option value="${escapeAttr(agent.agentId)}">${escapeHtml(criticLabels.get(agent.agentId))}</option>`).join('')}${criticOption}</tf-select>
+          ${criticWarning ? `<tf-alert tone="warning" live data-critic-warning message="${escapeAttr(I18n.t(criticWarning))}"></tf-alert>` : ''}
+          ${textarea('verifyCriteria', 'verification_criteria', criticVerification?.criteria, 3, criteriaBytes > CRITIC_CRITERIA_MAX_BYTES ? `error="${escapeAttr(I18n.t('bpmn.verification_criteria_over_field', { max: CRITIC_CRITERIA_MAX_BYTES }))}"` : '')}
+          <p class="fb-field-hint" data-criteria-counter>${escapeHtml(I18n.t('bpmn.verification_criteria_counter', { used: criteriaBytes, max: CRITIC_CRITERIA_MAX_BYTES }))}</p>
           <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_critic_hint'))}</p>
         </div>
         <div data-process-failure ${testVerification || criticVerification ? '' : 'hidden'}>
@@ -836,7 +854,7 @@ export class FlowConfig {
           </tf-select>
           <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_on_failure_hint'))}</p>
         </div>
-        <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_hint'))}</p>
+        ${verificationMode === 'Test' || verificationMode === 'Critic' ? '' : `<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.verification_hint'))}</p>`}
         <div data-routing-view></div>`)
         + panel('time', `${input('timeoutSeconds', 'timeout', config.timeoutSeconds, `type="number" min="1" max="${processTimeoutCeiling(config)}" step="1" ${processTimeoutProblem(config) ? `error="${escapeAttr(I18n.t('bpmn.timeout_invalid', { max: processTimeoutCeiling(config) }))}"` : ''}`)}
         <p class="fb-field-hint" data-timeout-hint>${escapeHtml(reduced('timeout') ?? I18n.t(agentTask ? 'bpmn.timeout_agent_hint' : 'bpmn.timeout_hint'))}</p>`);
@@ -1341,6 +1359,7 @@ export class FlowConfig {
     }
     this.root.querySelector('[data-repeat-declare-output]')?.addEventListener('click', () => this._declareRepeatOutput());
     this.root.querySelector('[data-repeat-new-output]')?.addEventListener('input', (event) => event.currentTarget.removeAttribute('error'));
+    this.root.querySelector('[data-process="verifyCriteria"]')?.addEventListener('input', (event) => this._syncCriteriaCounter(event.currentTarget));
     this.root.querySelector('.fb-process-fields').addEventListener('change', (event) => {
       const control = event.target.closest('[data-process]');
       if (!control || control !== event.target || !this.root.contains(control)) return;
@@ -1363,7 +1382,14 @@ export class FlowConfig {
           ? targetLabels.get(selected.id) : I18n.t('bpmn.boundary_required');
       } else if (key === 'verification') {
         const mode = control.value;
-        this.opts.onConfigChange(node.id, { verification: processVerificationFor(mode, node.config.verification) });
+        // What was typed for a mode survives a visit to another one within this session.
+        const previous = node.config.verification;
+        const previousMode = processVerificationMode(previous);
+        this.verificationDrafts ??= new Map();
+        const drafts = this.verificationDrafts.get(node.id) ?? {};
+        if (previousMode !== 'Human') drafts[previousMode] = previous[previousMode];
+        this.verificationDrafts.set(node.id, drafts);
+        this.opts.onConfigChange(node.id, { verification: processVerificationFor(mode, drafts[mode] ? { [mode]: drafts[mode] } : previous) });
         this._renderProcess();
         this.root.querySelector('[data-process="verification"]')?.focus();
       } else if (['verifyFlowId', 'verifyAgentId', 'verifyCriteria', 'verifyOnFailure'].includes(key)) {
@@ -1608,6 +1634,16 @@ export class FlowConfig {
       if (this.processTab === 'result') this._renderRouting(node);
     });
     this._renderRouting(node);
+  }
+
+  // The criteria limit is in bytes, which no length attribute counts: the
+  // counter and the field's error follow what is typed.
+  _syncCriteriaCounter(control) {
+    const used = processCriteriaBytes(control.value);
+    const counter = this.root.querySelector('[data-criteria-counter]');
+    if (counter) counter.textContent = I18n.t('bpmn.verification_criteria_counter', { used, max: CRITIC_CRITERIA_MAX_BYTES });
+    if (used > CRITIC_CRITERIA_MAX_BYTES) control.setAttribute('error', I18n.t('bpmn.verification_criteria_over_field', { max: CRITIC_CRITERIA_MAX_BYTES }));
+    else control.removeAttribute('error');
   }
 
   // The canvas changed while the inspector stays on the same task (an edge was

@@ -767,6 +767,73 @@ fn publication_pins_the_verifier_beside_the_work_and_checks_it() {
     assert!(format!("{refused:?}").contains("disabled"), "{refused:?}");
 }
 
+/// A copy of the Service step under another id, with its own verification.
+fn with_second_step(
+    model: &mut ProcessModel,
+    id: &str,
+    verification: ActivityVerification,
+) {
+    let mut copy = model
+        .nodes
+        .iter()
+        .find(|node| node.id == "Service")
+        .unwrap()
+        .clone();
+    copy.id = id.into();
+    let ProcessNodeKind::ServiceTask {
+        verification: slot, ..
+    } = &mut copy.kind
+    else {
+        panic!("a service task is needed");
+    };
+    *slot = verification;
+    model.nodes.push(copy);
+}
+
+#[test]
+fn publication_names_every_refused_verifier_one_line_per_step() {
+    let rig = rigged();
+    let plain = flow(&rig.fixture.db, &rig.fixture.owner, &graph("x", None));
+    let archived = test_verifier(&rig, "Completed", "fine");
+    rig.fixture
+        .db
+        .write()
+        .unwrap()
+        .execute("UPDATE flows SET status='draft' WHERE id=?1", [&archived])
+        .unwrap();
+    rig.fixture
+        .db
+        .write()
+        .unwrap()
+        .execute("UPDATE agents SET is_enabled=0 WHERE id=?1", [CRITIC_ID])
+        .unwrap();
+    let missing = "00000000-0000-4000-8000-00000000dead";
+    let mut model = service_model(
+        &rig.work_flow,
+        test_mode(&plain, VerificationOnFailure::Error),
+    );
+    with_second_step(&mut model, "Second", test_mode(missing, VerificationOnFailure::Error));
+    with_second_step(&mut model, "Third", test_mode(&archived, VerificationOnFailure::Error));
+    with_second_step(&mut model, "Fourth", critic_mode(VerificationOnFailure::Error));
+    let refused = crate::dispatch::processes::pin_service_snapshots(
+        rig.fixture.dispatcher(),
+        &rig.fixture.owner,
+        &model,
+    )
+    .unwrap_err()
+    .message;
+    let lines: Vec<&str> = refused.lines().collect();
+    assert_eq!(lines.len(), 4, "{refused}");
+    assert!(lines.iter().any(|line| line.starts_with(&format!(
+        "service task Service test flow {plain}: a verification flow must end with the activity result block"
+    ))), "{refused}");
+    assert!(lines.contains(&format!("service task Second test flow {missing} does not exist").as_str()), "{refused}");
+    assert!(lines.contains(&format!("service task Third test flow {archived} is not active").as_str()), "{refused}");
+    assert!(lines.iter().any(|line| line.starts_with("service task Fourth critic: the agent \"")
+        && line.ends_with("\" is disabled")), "{refused}");
+    assert!(!refused.contains("ACL"), "{refused}");
+}
+
 #[test]
 fn publication_refuses_a_missing_or_swapped_verification_pin() {
     let rig = rigged();

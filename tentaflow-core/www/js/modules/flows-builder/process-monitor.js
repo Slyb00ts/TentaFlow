@@ -4,7 +4,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeAttr, escapeHtml } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
-import { checkProcessValue, processBody, processBodyLabels, processCommand, processDistinctLabels, processEditorLabels, processElementNames, processJson, processPlainError, processStartEntryLabels, processStatusLabel, processUnusedDeclarations } from './bpmn.js';
+import { checkProcessValue, processBody, processBodyLabels, processCommand, processDistinctLabels, processEditorLabels, processElementNames, processJson, processPlainError, processVerdictReason, processVerificationOrigin, processVerificationSentence, processStartEntryLabels, processStatusLabel, processUnusedDeclarations } from './bpmn.js';
 import '/js/components/tf-code-editor.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-table.js';
@@ -198,7 +198,7 @@ export function processEventText(event) {
   }
   if (event.kind === 'timer_blocked') return text('event_timer_blocked', { node, message: event.data.reason, retry: date(event.data.next_check_at_ms) });
   if (event.kind === 'timer_error') return text('event_timer_error', { node, message: event.data.reason });
-  if (event.kind === 'service_result') return text('event_service_result', { node, summary: event.data.summary });
+  if (event.kind === 'service_result') return text('event_service_result', { node, summary: processVerificationOrigin(event.data) ? processVerdictReason(event.data.summary) : event.data.summary });
   if (event.kind === 'script_completed') return text('event_script_completed', { node });
   if (event.kind === 'manual_task_opened') return text('event_manual_task_opened', { node });
   if (event.kind === 'manual_task_acknowledged') return text('event_manual_task_acknowledged', { node });
@@ -388,7 +388,7 @@ function processIncidentText(incident) {
   if (incident.code === 'SCRIPT_EVALUATION_FAILED' || incident.code === 'SCRIPT_MAPPING_FAILED') {
     return `${text(`incident_${incident.code.toLowerCase()}`)} ${text('incident_script_guidance')}`;
   }
-  const codes = ['EXPRESSION_ERROR', 'AMBIGUOUS_GATEWAY', 'NO_MATCHING_FLOW', 'HUMAN_REJECTED', 'SERVICE_ERROR', 'VERIFICATION_FAILED', 'WORKER_ERROR', 'FLOW_ERROR', 'INVALID_SERVICE_JOB', 'SOURCE_ACCESS_REVOKED', 'INTERRUPTED', 'LEASE_LOST', 'SERVICE_TIMEOUT', 'OUTPUT_LIMIT', 'TRANSITION_ERROR', 'RESULT_REJECTED', 'REVISION_CONFLICT', 'SCOPE_LIMIT', 'REPETITION_INPUT_ERROR', 'REPETITION_LIMIT', 'REPETITION_AGGREGATE_LIMIT', 'REPETITION_MAPPING_FAILED', 'SCRIPT_INFRASTRUCTURE_FAILED', 'MESSAGE_EXPRESSION_ERROR', 'SEND_ADMISSION_AUTHORITY_DENIED', 'SEND_ADMISSION_TARGET_UNAVAILABLE', 'IMMEDIATE_TRANSITION_LIMIT'];
+  const codes = ['EXPRESSION_ERROR', 'AMBIGUOUS_GATEWAY', 'NO_MATCHING_FLOW', 'HUMAN_REJECTED', 'SERVICE_ERROR', 'VERIFICATION_FAILED', 'VERIFICATION_AGENT_REFUSED', 'WORKER_ERROR', 'FLOW_ERROR', 'INVALID_SERVICE_JOB', 'SOURCE_ACCESS_REVOKED', 'INTERRUPTED', 'LEASE_LOST', 'SERVICE_TIMEOUT', 'OUTPUT_LIMIT', 'TRANSITION_ERROR', 'RESULT_REJECTED', 'REVISION_CONFLICT', 'SCOPE_LIMIT', 'REPETITION_INPUT_ERROR', 'REPETITION_LIMIT', 'REPETITION_AGGREGATE_LIMIT', 'REPETITION_MAPPING_FAILED', 'SCRIPT_INFRASTRUCTURE_FAILED', 'MESSAGE_EXPRESSION_ERROR', 'SEND_ADMISSION_AUTHORITY_DENIED', 'SEND_ADMISSION_TARGET_UNAVAILABLE', 'IMMEDIATE_TRANSITION_LIMIT'];
   return codes.includes(incident.code) ? text(`incident_${incident.code.toLowerCase()}`) : (incident.message || text('incident_generic'));
 }
 
@@ -502,7 +502,17 @@ export async function openProcessInstance(instanceId, initial = null) {
         at.dateTime = new Date(event.atMs).toISOString();
         at.textContent = date(event.atMs);
         item.append(description, at);
-        if (event.kind === 'service_result') item.append(jsonSection(text('actual_outputs'), event.data, false));
+        if (event.kind === 'service_result') {
+          const sentence = processVerificationSentence(event.data);
+          if (sentence) {
+            const explanation = document.createElement('p');
+            explanation.className = 'fb-field-hint';
+            explanation.dataset.verificationOrigin = '';
+            explanation.textContent = sentence;
+            item.append(explanation);
+          }
+          item.append(jsonSection(text(sentence ? 'actual_outputs_verification' : 'actual_outputs'), event.data, false));
+        }
         if (event.kind === 'script_completed') item.append(jsonSection(text('script_result'), event.data.outputs, false));
         if (event.kind.startsWith('repetition_')) {
           item.append(repetitionFacts(event, instance?.repetitionGroups.find((group) => group.groupId === event.data.group_id)?.total ?? null));
@@ -574,7 +584,10 @@ export async function openProcessInstance(instanceId, initial = null) {
       workWindow.addEventListener('closed', () => { workWindows.delete(workWindow); if (selectedUserTaskId === task.userTaskId) selectedUserTaskId = null; }, { once: true });
       return;
     }
-    const outputs = jsonSection(text(task.kind === 'Verification' ? 'actual_outputs' : 'outputs'), task.outputs, task.kind !== 'Verification');
+    const origin = task.kind === 'Verification' ? processVerificationSentence(task.outputs) : null;
+    const outputs = jsonSection(text(task.kind === 'Verification' ? (origin ? 'actual_outputs_verification' : 'actual_outputs') : 'outputs'), task.outputs, task.kind !== 'Verification');
+    const originNote = origin ? Object.assign(document.createElement('p'), { className: 'fb-field-hint', textContent: origin }) : null;
+    originNote?.setAttribute('data-verification-origin', '');
     const approval = document.createElement('div');
     if (task.kind === 'Verification') approval.innerHTML = `<tf-select label="${escapeAttr(text('review_result'))}" data-approved>
       <option value="">${escapeHtml(text('choose_review'))}</option><option value="true">${escapeHtml(text('approve_result'))}</option><option value="false">${escapeHtml(text('reject_result'))}</option></tf-select>`;
@@ -582,7 +595,7 @@ export async function openProcessInstance(instanceId, initial = null) {
     const inputSection = activityInputsSection(task);
     const workWindow = openFormWindow({ title: text(task.kind === 'Verification' ? 'verification_human' : 'complete_work'), icon: 'check', subject: task.name,
       note: { text: text(task.kind === 'Verification' ? 'review_hint' : 'work_hint') },
-      sections: [inputSection, outputs, approval].filter(Boolean), submitLabel: text('complete_work'),
+      sections: [inputSection, originNote, outputs, approval].filter(Boolean), submitLabel: text('complete_work'),
       validate: () => task.kind === 'Verification' || validateJson(outputs),
       canSubmit: () => available && win.isConnected && [instance.selectedUserTask, ...instance.userTasks].some((current) => current?.userTaskId === task.userTaskId && current.canComplete && current.status === 'Open')
         && (task.kind !== 'Verification' || approval.querySelector('tf-select').value !== ''),

@@ -10,7 +10,7 @@ import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
-import { processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processWarningText, processHandlerName, processBoundaryHosts, processBoundaryRefusals, processEscalationPathProblem, processTimeoutProblem, processHasTimer, processTimezoneCanonical, processTimezoneGaps, processTimezoneProblem, processTimezoneText } from './bpmn.js';
+import { CRITIC_CRITERIA_MAX_BYTES, processCriteriaBytes, processToCanvas, canvasToProcess, processBody, cloneProcessBody, cloneProcessActivityIo, processNodeKind, processNodeConfig, processBoundaryKind, processServiceKind, processNodeWarnings, processWarningText, processHandlerName, processBoundaryHosts, processBoundaryRefusals, processEscalationPathProblem, processTimeoutProblem, processHasTimer, processTimezoneCanonical, processTimezoneGaps, processTimezoneProblem, processTimezoneText } from './bpmn.js';
 import { planProcessLabels } from './label-layout.js';
 import '/js/components/tf-menu.js';
 
@@ -570,6 +570,8 @@ export class FlowCanvas {
         }
         if (node.config.verification?.Test && !node.config.verification.Test.flowId) {
           errors.push(I18n.t('bpmn.verification_flow_required', { node: this._nodeName(node) }));
+        } else if (node.config.verification?.Test && node.config.verification.Test.flowId === node.config.flowId) {
+          errors.push(I18n.t('bpmn.verification_test_own_flow', { node: this._nodeName(node) }));
         }
         if (node.config.verification?.Critic) {
           const critic = node.config.verification.Critic;
@@ -578,6 +580,9 @@ export class FlowCanvas {
             errors.push(I18n.t('bpmn.verification_critic_same_agent', { node: this._nodeName(node) }));
           }
           if (!(critic.criteria || '').trim()) errors.push(I18n.t('bpmn.verification_criteria_required', { node: this._nodeName(node) }));
+          else if (processCriteriaBytes(critic.criteria) > CRITIC_CRITERIA_MAX_BYTES) {
+            errors.push(I18n.t('bpmn.verification_criteria_over', { node: this._nodeName(node), used: processCriteriaBytes(critic.criteria), max: CRITIC_CRITERIA_MAX_BYTES }));
+          }
         }
         const timeoutCeiling = node.type === 'bpmn_service_task' ? processTimeoutProblem(node.config) : null;
         if (timeoutCeiling) errors.push(I18n.t('bpmn.timeout_out_of_range', { node: this._nodeName(node), max: timeoutCeiling }));

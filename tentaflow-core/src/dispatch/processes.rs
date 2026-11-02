@@ -469,20 +469,48 @@ fn pin_verifier(
     };
     let (pinned, implementation_kind) = match kind {
         VerificationKind::Test => {
-            let meta = executor
-                .authorize_process_flow(reference, &actor.user_id, &actor.org_id)
-                .map_err(|error| {
-                    ProtocolError::new(ProtocolErrorCode::PolicyDenied, error.to_string())
-                })?;
+            // Each refusal names the step and the flow, one line per step, like
+            // the refused agents: the author fixes them in one pass.
+            let status = executor
+                .process_flow_status(reference)
+                .map_err(|error| ProtocolError::internal(error.to_string()))?;
+            let unusable = |why: &str| format!("service task {node_id} test flow {reference} {why}");
+            match status.as_deref() {
+                None => {
+                    refused.push(unusable("does not exist"));
+                    return Ok(None);
+                }
+                Some("active") => {}
+                Some(_) => {
+                    refused.push(unusable("is not active"));
+                    return Ok(None);
+                }
+            }
             let pinned = executor
-                .snapshot_flow(reference, &meta)
-                .map_err(|error| ProtocolError::bad_request(error.to_string()))?;
-            crate::flow_engine::node_adapters::activity_result::validate_verification_flow(
-                &pinned.graph_json,
-            )
-            .map_err(|error| {
-                ProtocolError::bad_request(format!("service task {node_id}: {error}"))
-            })?;
+                .authorize_process_flow(reference, &actor.user_id, &actor.org_id)
+                .and_then(|meta| executor.snapshot_flow(reference, &meta));
+            let pinned = match pinned {
+                Ok(pinned) => pinned,
+                Err(DispatchError::Denied { .. }) => {
+                    refused.push(unusable("is not available to you"));
+                    return Ok(None);
+                }
+                Err(error @ DispatchError::Internal(_)) => {
+                    return Err(ProtocolError::internal(error.to_string()));
+                }
+                Err(error) => {
+                    refused.push(unusable(&format!("cannot be used: {error}")));
+                    return Ok(None);
+                }
+            };
+            if let Err(error) =
+                crate::flow_engine::node_adapters::activity_result::validate_verification_flow(
+                    &pinned.graph_json,
+                )
+            {
+                refused.push(format!("service task {node_id} test flow {reference}: {error}"));
+                return Ok(None);
+            }
             (pinned, ServiceImplementationKind::Flow)
         }
         VerificationKind::Critic => {

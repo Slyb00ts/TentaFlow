@@ -1503,6 +1503,17 @@ impl FlowDispatcher {
         .map_err(DispatchError::from)
     }
 
+    /// The stored status of a flow (`None` when no such flow exists), so a
+    /// publication can tell a flow that is gone from one it may not use.
+    pub fn process_flow_status(
+        &self,
+        flow_id: &str,
+    ) -> std::result::Result<Option<String>, DispatchError> {
+        repository::get_flow(&self.db, flow_id)
+            .map(|flow| flow.map(|flow| flow.status))
+            .map_err(|e| DispatchError::Internal(e.to_string()))
+    }
+
     pub fn authorize_process_flow(
         &self,
         flow_id: &str,

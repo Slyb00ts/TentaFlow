@@ -244,7 +244,7 @@ const FlowBuilderScreen = {
       readOnly: state.readOnly,
       mode: state.mode,
       processOptions: state.processOptions,
-      onModelReplace: (restored) => { state.config?.modelReplaced(restored); this._syncDraftBanner(state); },
+      onModelReplace: (restored) => { state.config?.modelReplaced(restored); this._syncDraftBanner(state); this._syncSaveBanner(state); },
       onChange: () => {
         this._markDirty();
         this._updateStats();
@@ -254,6 +254,7 @@ const FlowBuilderScreen = {
           this._syncProcessControls();
           state.config.refreshRouting();
           this._syncDraftBanner(state);
+          this._syncSaveBanner(state);
         }
       },
       onSelect: (node, edge) => {
@@ -1341,7 +1342,7 @@ const FlowBuilderScreen = {
   // Messages from the server and the codec cite elements by internal id; the
   // author sees their names.
   _explain(state, message) {
-    return state.mode === 'bpmn' ? processExplainError(message, state.canvas.getData()) : message;
+    return state.mode === 'bpmn' ? processExplainError(message, state.canvas.getData(), state.processOptions) : message;
   },
 
   // A save that cannot go through says so where the author looks: the status
@@ -1395,6 +1396,23 @@ const FlowBuilderScreen = {
   _warnIgnoredDrafts(state) {
     const text = this._draftSaveProblem(state, 'bpmn.operation_drafts_ignored');
     if (text) toast(text, 'warning');
+  },
+
+  // A refusal of the save follows the model: after an edit, a mode change or an
+  // undo the banner lists the problems the editor still finds, and goes away when
+  // there are none, so it never outlives its cause next to "Unsaved changes". A
+  // refusal only the server can judge returns with the next save if it still holds.
+  _syncSaveBanner(state) {
+    if (state.saveProblem !== 'save' || state.mode !== 'bpmn') return;
+    const errors = state.canvas.validate();
+    if (!errors.length) {
+      this._clearSaveProblem(state);
+      this._setAutosave(state.dirty ? 'pending' : 'ok');
+      return;
+    }
+    const text = errors.length > 1 ? I18n.t('flows_builder.save_blocked_more', { first: errors[0], count: errors.length - 1 }) : errors[0];
+    state.root.querySelector('[data-role="error"]')?.setAttribute('message', text);
+    this._setAutosave('error', text);
   },
 
   // The banner for refused fields lists what is still refused: it follows the
