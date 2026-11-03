@@ -30,8 +30,8 @@ use tentaflow_protocol::processes::{
 };
 
 use super::{
-    model_from_tree, node_from_xml, parse_tree_with, Element, EscalationPathError, XmlElementError,
-    BPMN, BPMNDI, DC, DI, TF, XSI,
+    model_from_tree, node_from_xml, parse_tree_with, timer_spec, Element, EscalationPathError,
+    XmlElementError, BPMN, BPMNDI, DC, DI, TF, XSI,
 };
 use crate::flow_engine::expr;
 use crate::processes::expression_translate::{
@@ -70,6 +70,10 @@ const FLOW_NODES: [&str; 22] = [
     "complexGateway",
 ];
 const MAX_LITERAL_CHARS: usize = 400;
+const MAX_NAME_CHARS: usize = 200;
+/// Zone assumed for a Camunda timer; Camunda files carry none and TentaFlow
+/// requires an explicit IANA name.
+const DEFAULT_TIMER_ZONE: &str = "UTC";
 /// Foreign text can carry any amount of text into a diagnostic message.
 const MAX_MESSAGE_CHARS: usize = 1000;
 /// An import may look up this many logins; the rest stay unresolved, so a
@@ -112,7 +116,7 @@ pub fn import_camunda_xml_resolving(
     xml: &str,
     resolve_login: &dyn Fn(&str) -> Option<String>,
 ) -> CamundaImport {
-    let mut importer = Importer::new(resolve_login);
+    let mut importer = Importer::new(resolve_login, xml);
     let model = importer.run(xml);
     importer.finish(model)
 }
@@ -125,6 +129,11 @@ struct RepeatPatch {
 
 struct Importer<'a> {
     resolve_login: &'a dyn Fn(&str) -> Option<String>,
+    source: &'a str,
+    /// `name` of every element that has an id, to label diagnostics.
+    names: HashMap<String, String>,
+    /// Timer events seen in the process being rewritten: (id, offset).
+    timers: Vec<(String, usize)>,
     diagnostics: Vec<ProcessDiagnostic>,
     translations: Vec<ProcessImportTranslation>,
     repeats: Vec<RepeatPatch>,
@@ -141,9 +150,12 @@ struct Importer<'a> {
 }
 
 impl<'a> Importer<'a> {
-    fn new(resolve_login: &'a dyn Fn(&str) -> Option<String>) -> Self {
+    fn new(resolve_login: &'a dyn Fn(&str) -> Option<String>, source: &'a str) -> Self {
         Self {
             resolve_login,
+            source,
+            names: HashMap::new(),
+            timers: Vec::new(),
             diagnostics: Vec::new(),
             translations: Vec::new(),
             repeats: Vec::new(),
@@ -171,7 +183,9 @@ impl<'a> Importer<'a> {
             return self.build(root);
         }
         let namespace = root.attr("targetNamespace").unwrap_or(TF).to_string();
+        collect_element_names(&root, &mut self.names);
         self.rewrite_definitions(&mut root);
+        self.check_ids(&root);
         self.verify_xsi_types(&root);
         let mut nodes_failed = false;
         for process in root
@@ -358,8 +372,36 @@ impl<'a> Importer<'a> {
             }
         }
         self.fatal_listed |= severity == Severity::Fatal;
-        self.diagnostics
-            .push(diagnostic(severity, code, element_id, offset, message));
+        let message = match offset {
+            Some(offset) if severity == Severity::Fatal => self.with_position(message, offset),
+            _ => message,
+        };
+        let mut entry = diagnostic(severity, code, element_id, offset, message);
+        entry.element_name = self.name_of(entry.element_id.as_deref());
+        self.diagnostics.push(entry);
+    }
+
+    fn name_of(&self, element_id: Option<&str>) -> Option<String> {
+        element_id
+            .and_then(|id| self.names.get(id))
+            .filter(|name| !name.is_empty())
+            .map(|name| clip_to(name, MAX_NAME_CHARS))
+    }
+
+    /// "line L, column C" of a byte offset, appended to a refusal.
+    fn with_position(&self, message: String, offset: usize) -> String {
+        let mut end = offset.min(self.source.len());
+        while !self.source.is_char_boundary(end) {
+            end -= 1;
+        }
+        let before = &self.source[..end];
+        let line = before.matches('\n').count() + 1;
+        let column = before
+            .rsplit('\n')
+            .next()
+            .map_or(0, |last| last.chars().count())
+            + 1;
+        format!("{message} (line {line}, column {column})")
     }
 
     fn report(&mut self, severity: Severity, code: &str, element: &Element, message: String) {
@@ -376,13 +418,18 @@ impl<'a> Importer<'a> {
     fn report_error(&mut self, error: &anyhow::Error) {
         let element = error.downcast_ref::<XmlElementError>();
         let path = error.downcast_ref::<EscalationPathError>();
+        let mut message = error.to_string();
+        if let Some(element) = element {
+            message = self.with_position(message, element.offset);
+        }
         let mut entry = diagnostic(
             Severity::Fatal,
             "CAMUNDA_INVALID_DOCUMENT",
             element.and_then(|element| element.element_id.clone()),
             element.map(|element| element.offset),
-            error.to_string(),
+            message,
         );
+        entry.element_name = self.name_of(entry.element_id.as_deref());
         if let Some(path) = path {
             entry.boundary_id = Some(path.boundary_id.clone());
             entry.flow_id = path.flow_id.clone();
@@ -464,20 +511,18 @@ impl<'a> Importer<'a> {
     // ----- document -----
 
     fn rewrite_definitions(&mut self, root: &mut Element) {
-        self.drop_unprefixed(
-            root,
-            &[
-                "exporter",
-                "exporterVersion",
-                "expressionLanguage",
-                "typeLanguage",
-            ],
-        );
+        // Editor metadata, not part of the process: dropped without a word.
+        root.attrs.remove(&(String::new(), "exporter".to_string()));
+        root.attrs
+            .remove(&(String::new(), "exporterVersion".to_string()));
+        self.drop_unprefixed(root, &["expressionLanguage", "typeLanguage"]);
         self.rewrite_foreign_attributes(root);
         let mut kept = Vec::new();
+        let mut processes = 0;
         for mut child in std::mem::take(&mut root.children) {
             if child.ns == BPMN && child.local == "process" {
-                self.rewrite_process(&mut child);
+                self.rewrite_process(&mut child, processes == 0);
+                processes += 1;
             } else if child.ns == BPMNDI && child.local == "BPMNDiagram" {
                 self.rewrite_diagram(&mut child);
             } else if child.ns == BPMN
@@ -507,7 +552,8 @@ impl<'a> Importer<'a> {
         root.children = kept;
     }
 
-    fn rewrite_process(&mut self, process: &mut Element) {
+    fn rewrite_process(&mut self, process: &mut Element, primary: bool) {
+        self.timers.clear();
         self.drop_unprefixed(
             process,
             &["processType", "isClosed", "definitionalCollaborationRef"],
@@ -520,6 +566,63 @@ impl<'a> Importer<'a> {
             self.finish_extension(process, ext);
         }
         self.rewrite_graph(process);
+        if primary {
+            self.default_timer_zone(process);
+        }
+        self.timers.clear();
+    }
+
+    /// Camunda timers carry no time zone; TentaFlow wants an explicit one on the
+    /// process. A document that already names a zone keeps it.
+    fn default_timer_zone(&mut self, process: &mut Element) {
+        if self.timers.is_empty() {
+            return;
+        }
+        let offset = process.offset;
+        let at = process
+            .children
+            .iter()
+            .position(|c| c.is(BPMN, "extensionElements"));
+        let at = match at {
+            Some(at) => at,
+            None => {
+                let at = leading_documentation(&process.children);
+                process.children.insert(
+                    at,
+                    element(BPMN, "extensionElements", &[], Vec::new(), "", offset),
+                );
+                at
+            }
+        };
+        let extension = &mut process.children[at];
+        if extension.children.iter().any(|c| c.is(TF, "timerTimezone")) {
+            return;
+        }
+        if !extension.children.iter().any(|c| c.is(TF, "variables")) {
+            extension
+                .children
+                .push(element(TF, "variables", &[], Vec::new(), "{}", offset));
+        }
+        extension.children.push(element(
+            TF,
+            "timerTimezone",
+            &[],
+            Vec::new(),
+            DEFAULT_TIMER_ZONE,
+            offset,
+        ));
+        for (id, at) in std::mem::take(&mut self.timers) {
+            self.push(
+                Severity::Warning,
+                "CAMUNDA_TIMER_TIMEZONE_DEFAULTED",
+                Some(id.clone()),
+                Some(at),
+                format!(
+                    "timer {id} has no time zone in Camunda; {DEFAULT_TIMER_ZONE} was assumed \
+                     for the process"
+                ),
+            );
+        }
     }
 
     /// The flow nodes and flows of a process or an embedded subprocess.
@@ -570,7 +673,18 @@ impl<'a> Importer<'a> {
     // ----- sequence flows -----
 
     fn rewrite_flow(&mut self, flow: &mut Element) {
-        self.drop_unprefixed(flow, &["name", "isImmediate"]);
+        if let Some(label) = flow.attrs.remove(&(String::new(), "name".to_string())) {
+            self.report(
+                Severity::Info,
+                "CAMUNDA_FLOW_LABEL_IGNORED",
+                flow,
+                format!(
+                    "the label \"{}\" of this sequence flow is not kept; flows have no label",
+                    clip(&label)
+                ),
+            );
+        }
+        self.drop_unprefixed(flow, &["isImmediate"]);
         self.rewrite_foreign_attributes(flow);
         self.drop_xsi_type(flow);
         self.strip_annotations(flow, false);
@@ -699,6 +813,7 @@ impl<'a> Importer<'a> {
         self.drop_xsi_type(node);
         let keep_documentation = local == "manualTask";
         self.strip_annotations(node, keep_documentation);
+        self.rewrite_event_definitions(node);
 
         let mut ext = self.take_extension(node);
         let mut parameters = Parameters::default();
@@ -725,6 +840,53 @@ impl<'a> Importer<'a> {
         // the element variable is looked up in them.
         if !repeat_bound {
             self.rewrite_multi_instance(node);
+        }
+    }
+
+    /// Event definitions carry an id in Camunda files, and timer rules a formal
+    /// expression type; neither means anything to the strict reader. Timer rules
+    /// it cannot read are refused here with the Camunda value.
+    fn rewrite_event_definitions(&mut self, node: &mut Element) {
+        let mut has_timer = false;
+        for definition in node.children.iter_mut() {
+            if definition.ns != BPMN || !definition.local.ends_with("EventDefinition") {
+                continue;
+            }
+            definition.attrs.remove(&(String::new(), "id".to_string()));
+            if definition.local != "timerEventDefinition" {
+                continue;
+            }
+            has_timer = true;
+            let formal = format!("{{{BPMN}}}tFormalExpression");
+            for rule in definition.children.iter_mut() {
+                let key = (XSI.to_string(), "type".to_string());
+                if rule.attrs.get(&key) == Some(&formal) {
+                    rule.attrs.remove(&key);
+                }
+            }
+        }
+        if !has_timer {
+            return;
+        }
+        let id = node.attr("id").unwrap_or_default().to_string();
+        let value = node
+            .children
+            .iter()
+            .find(|c| c.is(BPMN, "timerEventDefinition"))
+            .and_then(|d| d.children.first())
+            .map(|rule| clip(rule.text.trim()))
+            .unwrap_or_default();
+        match timer_spec(node, &id) {
+            Ok(_) => self.timers.push((id, node.offset)),
+            Err(error) => self.report(
+                Severity::Fatal,
+                "CAMUNDA_TIMER_UNSUPPORTED",
+                node,
+                format!(
+                    "the timer value \"{value}\" cannot be imported: {error}. Supported: a \
+                     date, a duration of days, hours, minutes and seconds, or R[n]/PT<seconds>S"
+                ),
+            ),
         }
     }
 
@@ -1024,9 +1186,39 @@ impl<'a> Importer<'a> {
         }
         let mut user_id = None;
         if let Some(login) = assignee {
-            let lookup = !login.contains("${")
-                && !login.contains("#{")
-                && self.login_lookups < MAX_LOGIN_LOOKUPS;
+            if has_wrapper(&login) {
+                let per_item = node
+                    .children
+                    .iter()
+                    .find(|c| c.is(BPMN, "multiInstanceLoopCharacteristics"))
+                    .and_then(|mi| {
+                        mi.attrs
+                            .get(&(CAMUNDA_NAMESPACE.to_string(), "elementVariable".to_string()))
+                    })
+                    .filter(|variable| {
+                        read_variables(&login, SourceLanguage::Juel)
+                            .is_some_and(|names| names.contains(variable.as_str()))
+                    });
+                let message = match per_item {
+                    Some(variable) => format!(
+                        "assignee {login} reads the element variable {variable}; an expression \
+                         cannot be resolved to a user at import, so the per-item assignment is \
+                         lost and the task goes to the process initiator"
+                    ),
+                    None => format!(
+                        "assignee {login} is an expression; an expression cannot be resolved to \
+                         a user at import, so the task goes to the process initiator"
+                    ),
+                };
+                self.report(
+                    Severity::Warning,
+                    "CAMUNDA_ASSIGNEE_EXPRESSION",
+                    node,
+                    message,
+                );
+                return self.finish_user_task(node, ext, None, parameters);
+            }
+            let lookup = self.login_lookups < MAX_LOGIN_LOOKUPS;
             if lookup {
                 self.login_lookups += 1;
             }
@@ -1039,11 +1231,21 @@ impl<'a> Importer<'a> {
                     node,
                     format!(
                         "assignee {login} is not a TentaFlow user of this organization; the task \
-                         is left unassigned"
+                         is assigned to the process initiator"
                     ),
                 ),
             }
         }
+        self.finish_user_task(node, ext, user_id, parameters);
+    }
+
+    fn finish_user_task(
+        &mut self,
+        node: &mut Element,
+        ext: &mut Option<Element>,
+        user_id: Option<String>,
+        parameters: Parameters,
+    ) {
         if user_id.is_none() && parameters.output.is_empty() {
             return;
         }
@@ -1670,6 +1872,33 @@ impl<'a> Importer<'a> {
         element.children = kept;
     }
 
+    /// The ids TentaFlow keeps are limited; say which rule an id breaks, on the
+    /// element, instead of leaving it to the model check.
+    fn check_ids(&mut self, root: &Element) {
+        let mut pending: Vec<&Element> = root.children.iter().collect();
+        while let Some(element) = pending.pop() {
+            if element.ns != BPMN {
+                continue;
+            }
+            let checked = element.local == "process"
+                || element.local == "sequenceFlow"
+                || FLOW_NODES.contains(&element.local.as_str());
+            if checked {
+                if let Some(id) = element.attr("id") {
+                    if let Some(reason) = id_problem(id) {
+                        self.report(
+                            Severity::Fatal,
+                            "CAMUNDA_ID_INVALID",
+                            element,
+                            format!("the id \"{}\" of this {} {reason}", clip(id), element.local),
+                        );
+                    }
+                }
+            }
+            pending.extend(element.children.iter());
+        }
+    }
+
     /// Every `xsi:type` left after the rewrite must be a BPMN formal expression;
     /// the tolerant reader kept the others so they could be judged here.
     fn verify_xsi_types(&mut self, root: &Element) {
@@ -1839,6 +2068,7 @@ fn diagnostic(
         node_id: None,
         reason: None,
         severity: Some(severity),
+        element_name: None,
     }
 }
 
@@ -1997,6 +2227,35 @@ fn cel_string(text: &str) -> String {
     }
     literal.push('"');
     literal
+}
+
+fn id_problem(id: &str) -> Option<String> {
+    if id.is_empty() {
+        return Some("is empty".into());
+    }
+    if id.len() > 128 {
+        return Some(format!("is too long ({} bytes; at most 128)", id.len()));
+    }
+    if !id.as_bytes()[0].is_ascii_alphabetic() {
+        return Some("must start with a letter".into());
+    }
+    if !id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return Some("contains invalid characters (allowed: letters, digits, _, - and .)".into());
+    }
+    None
+}
+
+fn collect_element_names(root: &Element, names: &mut HashMap<String, String>) {
+    let mut pending = vec![root];
+    while let Some(element) = pending.pop() {
+        if let (Some(id), Some(name)) = (element.attr("id"), element.attr("name")) {
+            names.insert(id.to_string(), name.to_string());
+        }
+        pending.extend(element.children.iter());
+    }
 }
 
 /// Number of `documentation` children at the front, where the strict reader

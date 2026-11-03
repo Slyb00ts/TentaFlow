@@ -1878,6 +1878,11 @@ pub struct ProcessDiagnostic {
     /// `severity == Fatal`, so a reader that ignores this field stays correct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub severity: Option<ProcessDiagnosticSeverity>,
+    /// The `name` of the element the diagnostic is about (at most 200
+    /// characters), so a refused import can still show a readable label.
+    /// Filled by the tolerant Camunda import only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2488,6 +2493,7 @@ mod tests {
             node_id: Some("End_1".into()),
             reason: Some(ProcessEscalationPathReason::TerminalBeforeWait),
             severity: None,
+            element_name: None,
         };
         assert_eq!(
             crate::cbor::decode::<ProcessDiagnostic>(&crate::cbor::encode(&diagnostic).unwrap())
@@ -3451,8 +3457,11 @@ mod tests {
             node_id: None,
             reason: None,
             severity: Some(ProcessDiagnosticSeverity::Info),
+            element_name: Some("Approve".into()),
         };
-        assert!(serde_json::to_string(&graded).unwrap().ends_with(r#""severity":"info"}"#));
+        assert!(serde_json::to_string(&graded)
+            .unwrap()
+            .ends_with(r#""severity":"info","element_name":"Approve"}"#));
         assert_eq!(
             crate::cbor::decode::<ProcessDiagnostic>(&crate::cbor::encode(&graded).unwrap()).unwrap(),
             graded

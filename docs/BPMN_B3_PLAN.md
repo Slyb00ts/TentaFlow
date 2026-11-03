@@ -565,6 +565,78 @@ Kod: `www/js/modules/flows-builder/process-import.js` (okno wyniku), `bpmn.js` (
 - **Uwaga.** Element wymaga uwagi, gdy jest zadaniem usługi `Unbound` (stan wyliczany z modelu, więc przeżywa zapis i ponowne otwarcie) albo miał ostrzeżenie importu, którego autor jeszcze nie przejrzał (stan tylko w pamięci edytora; diagnostyka na przepływie wskazuje jego źródło). Baner „N elementów wymaga uwagi” skacze do kolejnego w kolejności dokumentu (podprocesy zaraz po swoim węźle, potem dodatkowe procesy) i znika z ostatnim. Ostrzeżenie zdejmuje „Oznacz jako sprawdzony” w inspektorze; `Unbound` tylko wybór implementacji.
 - **Nie zrobione:** teksty `diag_*` mają tylko ok. 18 kodów, reszta pokazuje komunikat serwera (po angielsku); tłumaczenia z ostrzeżeniami `EXPR_*` nie oznaczają elementu same, robi to towarzyszące im `CAMUNDA_EXPRESSION_WARNING`.
 
+- **Zadanie użytkownika bez rozwiązanego loginu** trafia do inicjatora procesu: ostrzeżenie `CAMUNDA_ASSIGNEE_UNRESOLVED` (zwykły login spoza organizacji) albo `CAMUNDA_ASSIGNEE_EXPRESSION` (wyrażenie `${…}`; gdy czyta `elementVariable`, komunikat mówi, że przypisanie per element ginie).
+- **Zegary.** Pliki Camundy nie mają strefy czasowej, a TentaFlow wymaga jawnej nazwy IANA na procesie: importer wpisuje `UTC` i zgłasza `CAMUNDA_TIMER_TIMEZONE_DEFAULTED` dla każdego zegara. Obsługiwane są wartości, które rozumie ścisły czytnik (data, czas trwania D/H/M/S, `R[n]/PT<sekundy>S`); inne (`${…}`, `R3/PT10M`, cron) to fatal `CAMUNDA_TIMER_UNSUPPORTED` z wartością Camundy. Podproces zdarzeniowy jest nieobsługiwany (fatal `CAMUNDA_ELEMENT_UNSUPPORTED`).
+- **Pole `element_name`** w `ProcessDiagnostic` (addytywne, ≤ 200 znaków) niesie `name` elementu, żeby odmowa całego importu nadal pokazywała czytelną etykietę. Wypełnia je tylko tryb tolerancyjny.
+
+#### Kody diagnostyk (dla tekstów w GUI)
+
+Stopień: F = fatal, W = warning, I = info. Pole `element_id` wskazuje element, a `element_name` jego nazwę; poniżej tylko argumenty w treści komunikatu. Fatal dopisuje do komunikatu „(line L, column C)”.
+
+| Kod | Stopień | Znaczenie | Argumenty w komunikacie |
+|---|---|---|---|
+| `CAMUNDA_INVALID_DOCUMENT` | F | dokument nie daje się wczytać (składnia XML, duplikat id, zbyt głębokie zagnieżdżenie, błąd modelu z ścisłego czytnika) | tekst błędu czytnika; pola `boundary_id`/`flow_id`/`node_id`/`reason` dla ścieżek eskalacji |
+| `CAMUNDA_ELEMENT_UNSUPPORTED` | F | ścisły czytnik odrzucił element (np. `businessRuleTask`, podproces zdarzeniowy) | lokalna nazwa elementu, powód |
+| `CAMUNDA_MODEL_INVALID` | F | wynik nie jest poprawnym modelem (limity, 128 kluczy mapowania podprocesu, brak aktywności dla powtórzenia) | powód; nazwa podprocesu |
+| `CAMUNDA_ID_INVALID` | F | identyfikator łamie regułę TentaFlow | id, powód: pusty / za długi (max 128 B) / musi zaczynać się literą / niedozwolone znaki |
+| `CAMUNDA_UNSUPPORTED_XSI_TYPE` | F | `xsi:type` spoza wyrażeń BPMN | element, typ |
+| `CAMUNDA_XSI_TYPE_IGNORED` | W | `xsi:type` na elemencie, gdzie nic nie znaczy | typ |
+| `CAMUNDA_SCRIPT_UNSUPPORTED` | F | skrypt obcego języka, z zasobu zewnętrznego, bez treści, poza profilem skryptu lub z nieprawidłową `resultVariable` | język / powód |
+| `CAMUNDA_EXPRESSION_REFUSED` | F (warunek, skrypt, kolekcja) / W (parametr) | tłumacz odmówił | opis, potem „EXPR_… : powód (at character N)” |
+| `CAMUNDA_EXPRESSION_WARNING` | W | tłumaczenie z różnicą semantyczną | „EXPR_… : opis” |
+| `CAMUNDA_CONDITION_LANGUAGE` | F | język warunku inny niż JUEL/FEEL | język |
+| `CAMUNDA_CONDITION_RESOURCE` | F | warunek z zasobu zewnętrznego | – |
+| `CAMUNDA_CONDITION_UNTYPED` | F | warunek bez języka i bez `${…}` | – |
+| `CAMUNDA_INVALID_CONDITION` | F | warunek z elementami potomnymi | – |
+| `CAMUNDA_GATEWAY_EVAL_SEMANTICS` | W | bramka z ≥ 2 przepływami niedomyślnymi: inna ocena niż w Camundzie | – |
+| `CAMUNDA_TIMER_UNSUPPORTED` | F | wartość zegara poza obsługiwanym zakresem | wartość, szczegół, lista obsługiwanych |
+| `CAMUNDA_TIMER_TIMEZONE_DEFAULTED` | W | zegar bez strefy: przyjęto strefę | id zegara, strefa (`UTC`) |
+| `CAMUNDA_SERVICE_UNBOUND` | W | zadanie usługi bez odpowiednika, krok `Unbound` | pochodzenie (`class:…`, `delegateExpression:…`, `expression:…`, `external:<temat>`, `connector:<id>`, `type:<typ>`) |
+| `CAMUNDA_SERVICE_NO_IMPLEMENTATION` | W | zadanie usługi bez żadnej implementacji | – |
+| `CAMUNDA_RESULT_VARIABLE_SKIPPED` | W | `resultVariable` nie jest poprawną nazwą zmiennej | nazwa |
+| `CAMUNDA_NATIVE_STEP_ATTRIBUTE_IGNORED` | W | atrybut Camundy na kroku, który ma już definicję TentaFlow | atrybut, wartość |
+| `CAMUNDA_ASSIGNEE_UNRESOLVED` | W | login nie jest użytkownikiem organizacji: zadanie do inicjatora | login |
+| `CAMUNDA_ASSIGNEE_EXPRESSION` | W | wykonawca to wyrażenie: zadanie do inicjatora (ew. utrata przypisania per element) | wyrażenie, zmienna elementu |
+| `CAMUNDA_CANDIDATES_SKIPPED` | W | kandydaci (użytkownicy/grupy) pominięci | atrybut, wartość |
+| `CAMUNDA_FORM_SKIPPED` | W | formularz pominięty | atrybut lub „form definition” |
+| `CAMUNDA_USER_TASK_ATTRIBUTE_SKIPPED` | W | termin, przypomnienie lub priorytet zadania pominięte | atrybut, wartość |
+| `CAMUNDA_PARAMETERS_SKIPPED` | W | parametry wejścia/wyjścia bez miejsca (zadanie użytkownika nie ma wejść itp.) | powód |
+| `CAMUNDA_PARAMETER_SKIPPED` | W | parametr pominięty: bez nazwy, zła nazwa, duplikat, pusty, za długi | nazwa, powód |
+| `CAMUNDA_PARAMETER_STRUCTURE_SKIPPED` | W | lista lub mapa jako parametr | nazwa |
+| `CAMUNDA_PARAMETER_SCRIPT_SKIPPED` | W | skrypt jako parametr | nazwa |
+| `CAMUNDA_OUTPUT_PARAMETER_SCOPE` | W | parametr wyjściowy liczony w innym zakresie niż w Camundzie | nazwa |
+| `CAMUNDA_CONNECTOR_SKIPPED` | W | konektor nie zaimportowany | id konektora |
+| `CAMUNDA_CONNECTOR_PARAMETERS_SKIPPED` | W | parametry konektora nie trafiają do kroku | id konektora |
+| `CAMUNDA_CALL_MAPPING_SKIPPED` | W | mapowanie zmiennych `callActivity` (`in`/`out`) pominięte | – |
+| `CAMUNDA_LISTENER_SKIPPED` | W | listener wykonania lub zadania pominięty (mógł mieć skutki uboczne) | rodzaj, zdarzenie, klasa/wyrażenie |
+| `CAMUNDA_RETRY_CYCLE_SKIPPED` | W | cykl ponowień pominięty | wartość |
+| `CAMUNDA_MULTI_INSTANCE_CARDINALITY` | F | liczność wyrażeniowa lub > 16 | tekst |
+| `CAMUNDA_MULTI_INSTANCE_COLLECTION` | F | kolekcja nie jest zmienną ani wyrażeniem | tekst |
+| `CAMUNDA_MULTI_INSTANCE_INPUT` | F | brak wejścia albo kolekcja razem z licznością | – |
+| `CAMUNDA_MULTI_INSTANCE_COMPLETION` | F | warunek zakończenia (zmienia zachowanie) | – |
+| `CAMUNDA_MULTI_INSTANCE_ELEMENT_VARIABLE` | F (czytana) / W (nieużywana) | zmienna elementu nie jest wiązana (w TentaFlow: `repeat.item`) | nazwa |
+| `CAMUNDA_MULTI_INSTANCE_DATA_SKIPPED` | W | wiązanie danych powtórzenia pominięte | element |
+| `CAMUNDA_MULTI_INSTANCE_OUTPUT_VARIABLE` | W | zadeklarowano zmienną na wyniki powtórzenia | ostateczna nazwa, ewentualnie „X był zajęty” |
+| `CAMUNDA_SUBPROCESS_SCOPE` | W | podproces z krokami o nieznanej implementacji: ich zapisów nie da się wyprowadzić | nazwa podprocesu |
+| `CAMUNDA_ATTRIBUTE_LOST` | W | atrybut o wartości innej niż domyślna zgubiony | atrybut, wartość |
+| `CAMUNDA_ATTRIBUTE_IGNORED` | I | atrybut bez odpowiednika, wartość domyślna | atrybut, wartość |
+| `CAMUNDA_FOREIGN_ATTRIBUTE` | I | atrybut z obcej przestrzeni nazw | atrybut, wartość |
+| `CAMUNDA_UNKNOWN_ATTRIBUTE` | W | nieznany atrybut `camunda:` | atrybut, wartość |
+| `CAMUNDA_UNKNOWN_ELEMENT` | W | nieznany element `camunda:` | nazwa |
+| `CAMUNDA_FOREIGN_ELEMENT` | W | element z obcej przestrzeni nazw | przestrzeń, nazwa |
+| `CAMUNDA_ELEMENT_IGNORED` | I | element najwyższego poziomu bez odpowiednika | nazwa |
+| `CAMUNDA_ASYNC_IGNORED` | I | `asyncBefore`/`asyncAfter`/`exclusive` | atrybut, wartość |
+| `CAMUNDA_PRIORITY_IGNORED` | I | `jobPriority`/`taskPriority` | atrybut, wartość |
+| `CAMUNDA_HISTORY_TTL_IGNORED` | I | `historyTimeToLive` | wartość |
+| `CAMUNDA_PROPERTIES_IGNORED` | I | `camunda:properties` | – |
+| `CAMUNDA_FIELD_IGNORED` | I | wstrzykiwanie pól | nazwa pola |
+| `CAMUNDA_DOCUMENTATION_IGNORED` | I | dokumentacja poza zadaniem ręcznym | – |
+| `CAMUNDA_FLOW_LABEL_IGNORED` | I | etykieta przepływu nie jest przechowywana | etykieta |
+| `CAMUNDA_DIAGRAM_DETAIL_IGNORED` | I | etykiety i znaczniki diagramu pominięte | – |
+| `CAMUNDA_DIAGNOSTICS_TRUNCATED` | I | lista lub tłumaczenia obcięte do 1000 | limit |
+
+Kody tłumacza (w treści `CAMUNDA_EXPRESSION_*`, wszystkie ze stałą pozycją znaku w odmowie): `EXPR_TOO_LONG` (> 512 znaków), `EXPR_TOO_DEEP`, `EXPR_EMPTY`, `EXPR_SYNTAX`, `EXPR_INVALID_LITERAL`, `EXPR_UNKNOWN_LANGUAGE`, `EXPR_COMPOSITE_TEMPLATE`, `EXPR_UNSUPPORTED_CONSTRUCT` (nazwa konstrukcji), `EXPR_INVALID_RESULT`, `EXPR_INTEGER_OVERFLOW` to odmowy; `EXPR_TYPE_COERCION`, `EXPR_DIVISION_SEMANTICS`, `EXPR_EMPTY_SEMANTICS`, `EXPR_MISSING_VALUE` to ostrzeżenia (z nazwą operandu). Kody spoza importera Camundy, które widzi ten sam ekran: `UNSUPPORTED_OR_INVALID_BPMN` i `ESCALATION_IMMEDIATE_PATH_UNSUPPORTED` (ścisły czytnik, F, bez `severity`), `UNBOUND_IMPLEMENTATION` (odmowa publikacji, symulacji i uruchomienia kroku bez implementacji; w komunikacie id kroku i pochodzenie).
+
 ## 7. Pozycja 6: symulacja poza profilem `script_user_manual`
 
 ### Stan

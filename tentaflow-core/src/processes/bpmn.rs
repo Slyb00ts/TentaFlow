@@ -224,7 +224,19 @@ fn parse_tree_with(xml: &str, tolerant: bool) -> Result<Element> {
     let mut buffer = Vec::new();
     loop {
         let offset = reader.buffer_position() as usize;
-        let (namespace, event) = reader.read_resolved_event_into(&mut buffer)?;
+        let (namespace, event) = match reader.read_resolved_event_into(&mut buffer) {
+            Ok(read) => read,
+            // A foreign document gets the position of its syntax error.
+            Err(error) if tolerant => {
+                return Err(XmlElementError {
+                    message: error.to_string(),
+                    element_id: None,
+                    offset: usize::try_from(reader.error_position()).unwrap_or_default(),
+                }
+                .into())
+            }
+            Err(error) => return Err(error.into()),
+        };
         let is_empty = matches!(&event, Event::Empty(_));
         match event {
             Event::Start(start) | Event::Empty(start) => {
@@ -233,7 +245,19 @@ fn parse_tree_with(xml: &str, tolerant: bool) -> Result<Element> {
                 let mut attrs = HashMap::new();
                 let mut qnames = HashMap::new();
                 for attr in start.attributes().with_checks(true) {
-                    let attr = attr?;
+                    let attr = match attr {
+                        Ok(attr) => attr,
+                        // Malformed attributes are reported at their tag.
+                        Err(error) if tolerant => {
+                            return Err(XmlElementError {
+                                message: error.to_string(),
+                                element_id: None,
+                                offset,
+                            }
+                            .into())
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
                     let raw = attr.key.as_ref();
                     if raw == b"xmlns" || raw.starts_with(b"xmlns:") {
                         continue;
@@ -4059,6 +4083,7 @@ pub fn import_xml(xml: &str) -> (Option<ProcessModel>, Vec<ProcessDiagnostic>) {
                     node_id: path.and_then(|path| path.node_id.clone()),
                     reason: path.map(|path| path.reason),
                     severity: None,
+                    element_name: None,
                 }],
             )
         }

@@ -144,6 +144,7 @@ fn strict_diagnostics_stay_ungraded() {
     assert_eq!(diagnostics.len(), 1);
     assert!(diagnostics[0].fatal);
     assert_eq!(diagnostics[0].severity, None);
+    assert_eq!(diagnostics[0].element_name, None);
 }
 
 // ----- namespace detection and dispatch -----
@@ -229,10 +230,43 @@ fn assignee_that_does_not_resolve_is_a_warning_naming_the_login() {
 }
 
 #[test]
-fn an_expression_assignee_is_never_looked_up() {
-    let xml = linear(r#"<bpmn:userTask id="Task_1" camunda:assignee="${initiator}"/>"#);
+fn an_expression_assignee_is_never_looked_up_and_gets_its_own_warning() {
+    let xml = linear(r#"<bpmn:userTask id="Task_1" camunda:assignee="${approver}"/>"#);
     let imported = import_camunda_xml_resolving(&xml, &|_| panic!("an expression is not a login"));
-    only(&imported, "CAMUNDA_ASSIGNEE_UNRESOLVED");
+    assert_clean_import(&imported);
+    assert!(diagnostics(&imported, "CAMUNDA_ASSIGNEE_UNRESOLVED").is_empty());
+    let warning = only(&imported, "CAMUNDA_ASSIGNEE_EXPRESSION");
+    assert_eq!(warning.severity, Some(Severity::Warning));
+    assert_eq!(warning.element_id.as_deref(), Some("Task_1"));
+    assert!(
+        warning.message.contains("process initiator"),
+        "{}",
+        warning.message
+    );
+}
+
+#[test]
+fn an_assignee_expression_reading_the_element_variable_says_the_per_item_assignment_is_lost() {
+    let imported = import_camunda_xml(&linear(
+        r#"<bpmn:userTask id="Task_1" camunda:assignee="${approver}"><bpmn:multiInstanceLoopCharacteristics camunda:collection="approvers" camunda:elementVariable="approver"/></bpmn:userTask>"#,
+    ));
+    assert_clean_import(&imported);
+    let warning = only(&imported, "CAMUNDA_ASSIGNEE_EXPRESSION");
+    assert!(warning.message.contains("per-item"), "{}", warning.message);
+}
+
+#[test]
+fn an_unresolved_login_says_the_task_goes_to_the_process_initiator() {
+    let imported = import_camunda_xml(&linear(
+        r#"<bpmn:userTask id="Task_1" camunda:assignee="ghost"/>"#,
+    ));
+    let warning = only(&imported, "CAMUNDA_ASSIGNEE_UNRESOLVED");
+    assert!(
+        warning.message.contains("process initiator"),
+        "{}",
+        warning.message
+    );
+    assert!(!warning.message.contains("unassigned"));
 }
 
 #[test]
@@ -1906,4 +1940,206 @@ fn the_element_variable_check_reads_identifiers_not_text() {
     let read = import_camunda_xml(&activity("${items}", "item", "${item.name}"));
     assert!(read.model.is_none());
     only(&read, "CAMUNDA_MULTI_INSTANCE_ELEMENT_VARIABLE");
+}
+
+// ----- timers, labels, positions, ids, names -----
+
+fn timer_task(event: &str, flows: &str) -> String {
+    process(&format!(
+        r#"<bpmn:startEvent id="Start_1"/>
+        <bpmn:userTask id="Task_1" name="Review"/>
+        <bpmn:endEvent id="End_1"/>
+        <bpmn:endEvent id="EndB_1"/>
+        {event}
+        <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="Task_1"/>
+        <bpmn:sequenceFlow id="Flow_2" sourceRef="Task_1" targetRef="End_1"/>
+        {flows}"#
+    ))
+}
+
+fn boundary_timer(rule: &str) -> String {
+    timer_task(
+        &format!(
+            r#"<bpmn:boundaryEvent id="Timer_1" name="Too slow" attachedToRef="Task_1"><bpmn:timerEventDefinition id="TimerEventDefinition_9">{rule}</bpmn:timerEventDefinition></bpmn:boundaryEvent>"#
+        ),
+        r#"<bpmn:sequenceFlow id="Flow_3" sourceRef="Timer_1" targetRef="EndB_1"/>"#,
+    )
+}
+
+#[test]
+fn a_boundary_timer_gets_a_defaulted_zone_and_a_warning_naming_the_timer() {
+    let imported = import_camunda_xml(&boundary_timer(
+        r#"<bpmn:timeDuration xsi:type="bpmn:tFormalExpression">PT1H</bpmn:timeDuration>"#,
+    ));
+    let model = assert_clean_import(&imported);
+    assert_eq!(model.timer_timezone.as_deref(), Some("UTC"));
+    let warning = only(&imported, "CAMUNDA_TIMER_TIMEZONE_DEFAULTED");
+    assert_eq!(warning.severity, Some(Severity::Warning));
+    assert_eq!(warning.element_id.as_deref(), Some("Timer_1"));
+    assert_eq!(warning.element_name.as_deref(), Some("Too slow"));
+    assert!(warning.message.contains("UTC"));
+    // The draft exports and reads back.
+    let xml = export_xml(model).unwrap();
+    let (again, diagnostics) = import_xml(&xml);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    assert_eq!(again.as_ref(), Some(model));
+    let declared_again = import_camunda_xml(&declared(xml));
+    assert!(
+        declared_again.diagnostics.is_empty(),
+        "{:#?}",
+        declared_again.diagnostics
+    );
+}
+
+#[test]
+fn start_and_intermediate_timers_are_imported_too() {
+    let cycle = import_camunda_xml(&process(
+        r#"<bpmn:startEvent id="Start_1"><bpmn:timerEventDefinition><bpmn:timeCycle xsi:type="bpmn:tFormalExpression">R3/PT600S</bpmn:timeCycle></bpmn:timerEventDefinition></bpmn:startEvent>
+        <bpmn:endEvent id="End_1"/>
+        <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="End_1"/>"#,
+    ));
+    let model = assert_clean_import(&cycle);
+    assert!(matches!(
+        &node(model, "Start_1").kind,
+        ProcessNodeKind::TimerStart { .. }
+    ));
+    only(&cycle, "CAMUNDA_TIMER_TIMEZONE_DEFAULTED");
+    let date = import_camunda_xml(&process(
+        r#"<bpmn:startEvent id="Start_1"><bpmn:timerEventDefinition><bpmn:timeDate xsi:type="bpmn:tFormalExpression">2030-01-01T10:00:00Z</bpmn:timeDate></bpmn:timerEventDefinition></bpmn:startEvent>
+        <bpmn:endEvent id="End_1"/>
+        <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="End_1"/>"#,
+    ));
+    assert_clean_import(&date);
+    let wait = import_camunda_xml(&process(
+        r#"<bpmn:startEvent id="Start_1"/>
+        <bpmn:intermediateCatchEvent id="Wait_1"><bpmn:timerEventDefinition><bpmn:timeDuration xsi:type="bpmn:tFormalExpression">P1DT2H</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent>
+        <bpmn:endEvent id="End_1"/>
+        <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="Wait_1"/>
+        <bpmn:sequenceFlow id="Flow_2" sourceRef="Wait_1" targetRef="End_1"/>"#,
+    ));
+    let model = assert_clean_import(&wait);
+    assert!(matches!(
+        &node(model, "Wait_1").kind,
+        ProcessNodeKind::TimerCatch { .. }
+    ));
+    assert_eq!(
+        only(&wait, "CAMUNDA_TIMER_TIMEZONE_DEFAULTED")
+            .element_id
+            .as_deref(),
+        Some("Wait_1")
+    );
+}
+
+#[test]
+fn a_document_without_timers_gets_no_zone() {
+    let imported = import_camunda_xml(&linear(r#"<bpmn:userTask id="Task_1"/>"#));
+    assert_eq!(assert_clean_import(&imported).timer_timezone, None);
+    assert!(diagnostics(&imported, "CAMUNDA_TIMER_TIMEZONE_DEFAULTED").is_empty());
+}
+
+#[test]
+fn a_timer_value_that_cannot_be_mapped_is_fatal_and_names_the_timer() {
+    for rule in [
+        r#"<bpmn:timeCycle xsi:type="bpmn:tFormalExpression">R3/PT10M</bpmn:timeCycle>"#,
+        r#"<bpmn:timeDuration xsi:type="bpmn:tFormalExpression">${deadline}</bpmn:timeDuration>"#,
+        r#"<bpmn:timeCycle xsi:type="bpmn:tFormalExpression">0 0 12 * * ?</bpmn:timeCycle>"#,
+    ] {
+        let imported = import_camunda_xml(&boundary_timer(rule));
+        assert!(imported.model.is_none(), "{rule}");
+        let fatal = only(&imported, "CAMUNDA_TIMER_UNSUPPORTED");
+        assert_eq!(fatal.severity, Some(Severity::Fatal));
+        assert_eq!(fatal.element_id.as_deref(), Some("Timer_1"));
+        assert_eq!(fatal.element_name.as_deref(), Some("Too slow"));
+        assert!(fatal.message.contains("Supported"), "{}", fatal.message);
+    }
+}
+
+#[test]
+fn an_event_subprocess_is_refused_naming_it() {
+    let imported = import_camunda_xml(&process(
+        r#"<bpmn:startEvent id="Start_1"/>
+        <bpmn:subProcess id="Ev_1" triggeredByEvent="true"><bpmn:startEvent id="EvStart_1"/><bpmn:endEvent id="EvEnd_1"/><bpmn:sequenceFlow id="EF_1" sourceRef="EvStart_1" targetRef="EvEnd_1"/></bpmn:subProcess>
+        <bpmn:endEvent id="End_1"/>
+        <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="End_1"/>"#,
+    ));
+    assert!(imported.model.is_none());
+    assert_eq!(
+        only(&imported, "CAMUNDA_ELEMENT_UNSUPPORTED")
+            .element_id
+            .as_deref(),
+        Some("Ev_1")
+    );
+}
+
+#[test]
+fn the_tool_attributes_are_silent_and_a_flow_label_gets_one_readable_info() {
+    let imported = import_camunda_xml(&gateway(&formal("", "${true}"), &formal("", "${false}")));
+    assert!(
+        imported
+            .diagnostics
+            .iter()
+            .all(|d| !d.message.contains("exporter")),
+        "{:#?}",
+        imported.diagnostics
+    );
+    let label = only(&imported, "CAMUNDA_FLOW_LABEL_IGNORED");
+    assert_eq!(label.severity, Some(Severity::Info));
+    assert_eq!(label.element_id.as_deref(), Some("Flow_A"));
+    assert!(label.message.contains("yes"));
+    assert!(diagnostics(&imported, "CAMUNDA_ATTRIBUTE_IGNORED")
+        .iter()
+        .all(|d| !d.message.contains("name=")));
+}
+
+#[test]
+fn a_syntax_error_carries_line_and_column() {
+    let xml = format!("{HEAD}\n<bpmn:process id=\"P\" bad>\n</bpmn:process></bpmn:definitions>");
+    let imported = import_camunda_xml(&xml);
+    assert!(imported.model.is_none());
+    let fatal = imported.diagnostics.iter().find(|d| d.fatal).unwrap();
+    assert!(
+        fatal.message.contains("(line 3, column"),
+        "{}",
+        fatal.message
+    );
+    // So does a refusal of a single element.
+    let element = import_camunda_xml(&process(
+        "<bpmn:startEvent id=\"Start_1\"/>\n<bpmn:businessRuleTask id=\"Rule_1\"/>\n<bpmn:endEvent id=\"End_1\"/>",
+    ));
+    let fatal = only(&element, "CAMUNDA_ELEMENT_UNSUPPORTED");
+    assert!(
+        fatal.message.contains("(line 3, column"),
+        "{}",
+        fatal.message
+    );
+}
+
+#[test]
+fn an_invalid_id_names_the_rule_it_breaks_and_its_element() {
+    for (id, expected) in [
+        ("1abc", "must start with a letter"),
+        ("a b", "invalid characters"),
+        (&"x".repeat(130), "at most 128"),
+    ] {
+        let xml = process(&format!(
+            r#"<bpmn:startEvent id="Start_1"/><bpmn:userTask id="{id}" name="Check"/><bpmn:endEvent id="End_1"/>
+            <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="{id}"/>
+            <bpmn:sequenceFlow id="Flow_2" sourceRef="{id}" targetRef="End_1"/>"#
+        ));
+        let imported = import_camunda_xml(&xml);
+        assert!(imported.model.is_none(), "{id}");
+        let fatal = only(&imported, "CAMUNDA_ID_INVALID");
+        assert_eq!(fatal.element_id.as_deref(), Some(id), "{id}");
+        assert_eq!(fatal.element_name.as_deref(), Some("Check"));
+        assert!(fatal.message.contains(expected), "{}", fatal.message);
+    }
+}
+
+#[test]
+fn a_refused_element_keeps_its_name_for_the_listing() {
+    let imported = import_camunda_xml(&linear(
+        r#"<bpmn:scriptTask id="Task_1" name="Calculate tax" scriptFormat="javascript"><bpmn:script>1</bpmn:script></bpmn:scriptTask>"#,
+    ));
+    let fatal = only(&imported, "CAMUNDA_SCRIPT_UNSUPPORTED");
+    assert_eq!(fatal.element_name.as_deref(), Some("Calculate tax"));
 }
