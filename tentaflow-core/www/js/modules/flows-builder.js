@@ -102,7 +102,7 @@ const FlowBuilderScreen = {
         </header>
         ${process ? `<div class="fb-process-notice" id="fb-process-notice"><tf-chip status="info" data-role="publication">${escapeHtml(I18n.t('bpmn.draft'))}</tf-chip><tf-button variant="ghost" size="sm" icon="chevron-down" data-role="notice-toggle" aria-controls="fb-process-notice">${escapeHtml(I18n.t('bpmn.process_settings'))}</tf-button><span data-role="process-hint">${escapeHtml(I18n.t('bpmn.supported_hint'))}</span><tf-select data-role="body-select" wrap-selected label="${escapeAttr(I18n.t('bpmn.process_body'))}"></tf-select><tf-select data-role="start-entry" wrap-selected label="${escapeAttr(I18n.t('bpmn.start_entry'))}"></tf-select><tf-button variant="secondary" size="sm" data-role="add-body">${escapeHtml(I18n.t('bpmn.add_process_body'))}</tf-button><tf-input data-role="body-name" label="${escapeAttr(I18n.t('bpmn.process_body_name'))}"></tf-input><tf-chip status="info" data-role="calendar-state" hidden></tf-chip><tf-input class="fb-timer-timezone" data-role="timer-timezone" label="${escapeAttr(I18n.t('bpmn.timer_timezone'))}" hint="${escapeAttr(I18n.t('bpmn.timer_timezone_hint'))}" placeholder="${escapeAttr(I18n.t('bpmn.timer_timezone_placeholder'))}" hidden></tf-input><tf-button variant="ghost" size="sm" data-role="draft" hidden>${escapeHtml(I18n.t('bpmn.return_draft'))}</tf-button><tf-button variant="ghost" size="sm" data-role="archive">${escapeHtml(I18n.t('bpmn.archive'))}</tf-button><span data-role="timer-summary" hidden></span></div>` : ''}
         <tf-alert data-role="error" tone="danger" live hidden><div slot="actions"><tf-button variant="secondary" size="sm" data-role="next-draft" hidden>${escapeHtml(I18n.t('bpmn.drafts_next'))}</tf-button></div></tf-alert>
-        ${process ? `<tf-alert data-role="attention" tone="warning" inline-actions hidden><div slot="actions"><tf-button variant="secondary" size="sm" icon="arrow-right" data-role="next-attention">${escapeHtml(I18n.t('bpmn.attention_next'))}</tf-button></div></tf-alert>` : ''}
+        ${process ? `<tf-alert data-role="attention" tone="warning" inline-actions live hidden><div slot="actions"><tf-button variant="secondary" size="sm" icon="chevron-right" data-role="next-attention">${escapeHtml(I18n.t('bpmn.attention_next'))}</tf-button></div></tf-alert><span class="fb-sr-only" role="status" aria-live="polite" data-role="attention-status"></span>` : ''}
 
         <div class="fb-body" data-role="body">
           <aside class="fb-palette" id="fb-palette" data-role="palette"></aside>
@@ -309,7 +309,8 @@ const FlowBuilderScreen = {
       // (entry/exit/member) so region-level loop config renders on the entry node.
       getCanvas: () => state.canvas,
       onConfigChange: (id, patch) => { state.canvas.updateNodeConfig(id, patch); },
-      getAttentionNotes: (id) => (state.attention.flagged.has(id) ? state.attention.notes.get(id) ?? [] : []),
+      getAttentionNotes: (id) => (state.attention.flagged.has(id) ? state.attention.notes.get(id) ?? [] : [])
+        .map((diagnostic) => ({ text: processDiagnosticText(diagnostic), detail: String(diagnostic.message ?? '') })),
       onAttentionDismiss: (id) => this._dismissAttention(state, id),
       onEdgeChange: (id, patch) => state.canvas.updateEdge(id, patch),
       onLabelChange: (id, label) => {
@@ -1037,7 +1038,7 @@ const FlowBuilderScreen = {
     for (const diagnostic of response.diagnostics || []) {
       if (processDiagnosticSeverity(diagnostic) !== 'warning') continue;
       const where = processElementNode(response.model, diagnostic.elementId);
-      if (where) notes.set(where.nodeId, [...(notes.get(where.nodeId) ?? []), processDiagnosticText(diagnostic)]);
+      if (where) notes.set(where.nodeId, [...(notes.get(where.nodeId) ?? []), diagnostic]);
     }
     state.attention = { flagged: processImportFlagged(response.model, response.diagnostics), notes };
     this._syncAttention(state, state.canvas.getData());
@@ -1067,7 +1068,12 @@ const FlowBuilderScreen = {
     const targets = processAttentionTargets(state.canvas.getData(), state.attention.flagged);
     const selected = state.canvas.nodes.find((node) => state.canvas.selectedIds.has(node.id));
     const target = processNextAttention(targets, selected?.id);
-    if (target) this._revealElement(state, target.nodeId);
+    if (!target) return;
+    this._revealElement(state, target.nodeId);
+    // Focus stays on the button so the next press works from the keyboard; the status says where the jump went.
+    const names = processElementNames(state.canvas.getData());
+    state.root.querySelector('[data-role="attention-status"]').textContent = I18n.t('bpmn.attention_selected',
+      { name: names.get(target.nodeId) ?? target.nodeId, position: targets.indexOf(target) + 1, total: targets.length });
   },
 
   // Enters the body that holds the element and selects it, as the jump to a refused field does.

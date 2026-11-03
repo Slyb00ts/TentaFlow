@@ -16790,7 +16790,8 @@
     "diag_CAMUNDA_ELEMENT_UNSUPPORTED": "This element has no TentaFlow equivalent, so the document cannot be imported.",
     "diag_CAMUNDA_DIAGNOSTICS_TRUNCATED": "Only the first diagnostics and translations are listed.",
     "diag_EXPR_MISSING_VALUE": "A missing variable, key or index counts as empty in Camunda but is an evaluation error in TentaFlow; a gateway then raises an incident.",
-    "diag_EXPR_TYPE_COERCION": "Camunda converts operand types (for example the text “7” to the number 7). TentaFlow is strict and fails on a mismatch."
+    "diag_EXPR_TYPE_COERCION": "Camunda converts operand types (for example the text “7” to the number 7). TentaFlow is strict and fails on a mismatch.",
+    "attention_selected": "{name}: element {position} of {total}"
   },
   "gestures": {
     "wave": "wave",

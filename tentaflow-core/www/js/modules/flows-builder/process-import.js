@@ -1,6 +1,6 @@
 // ===== File: process-import.js — the window that reports what a Camunda import found before anything is loaded =====
 
-import { escapeAttr, escapeHtml } from '/js/utils.js';
+import { escapeAttr, escapeHtml, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-table.js';
@@ -119,10 +119,14 @@ export function openProcessImportReview({ response, onImport, onReveal }) {
     busy = true;
     renderFooter();
     try { loaded = !!await onImport(); }
-    finally { busy = false; }
+    catch {
+      loaded = false;
+      toast(I18n.t('bpmn.import_not_loaded'), 'error');
+    } finally { busy = false; }
     if (!win.isConnected) return;
+    // A refused replacement leaves the result open so the author can still read it or try again.
     if (loaded) render();
-    else win.close(true);
+    else renderFooter();
   });
   render();
   document.body.appendChild(win);

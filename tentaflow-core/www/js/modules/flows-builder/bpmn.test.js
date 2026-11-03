@@ -8704,18 +8704,29 @@ test('a line of the result shows its element on the canvas once the draft is loa
   assert.ok(!reviewWindow(), 'the window gives way to the canvas');
 });
 
-test('an import over unsaved work asks first and a refusal leaves the draft as it was', async () => {
-  const asked = []; const original = TfWindow.confirm;
-  TfWindow.confirm = async (options) => { asked.push(options.title); return false; };
+test('an import over unsaved work asks first; a refusal keeps the result open and the draft, a confirmation replaces it', async () => {
+  const asked = []; const original = TfWindow.confirm; let answer = false;
+  TfWindow.confirm = async (options) => { asked.push(options.title); if (answer === 'throw') throw new Error('dialog failed'); return answer; };
   try {
     const state = await mount(definition(), { processXmlImportRequest: camundaResponse(), processDefinitionSaveRequest: (payload) => ({ definition: definition('definition-one', { model: payload.model, draftRevision: 5 }) }) });
     state.dirty = true; const before = state.canvas.getData();
     builder._importProcess(); await flush();
     const form = document.querySelector('.tf-act-window'); form.querySelector('tf-code-editor').value = '<x/>'; form.querySelector('tf-code-editor').dispatchEvent(new Event('input', { bubbles: true }));
     click(form.querySelector('[data-act="submit"]')); await flush();
-    click(reviewWindow().querySelector('[data-act="import"]')); await flush();
+    const review = reviewWindow();
+    click(review.querySelector('[data-act="import"]')); await flush();
     assert.deepEqual(asked, [I18n.t('bpmn.import_replace_title')]);
-    assert.deepEqual(state.canvas.getData(), before); assert.ok(!reviewWindow());
+    assert.deepEqual(state.canvas.getData(), before);
+    assert.ok(reviewWindow() === review, 'a refusal leaves the result window open');
+    assert.equal(review.querySelector('[data-act="import"]').hasAttribute('disabled'), false, 'and the import can be tried again');
+    answer = 'throw';
+    click(review.querySelector('[data-act="import"]')); await flush();
+    assert.ok(reviewWindow() === review); assert.equal(review.querySelector('[data-act="import"]').hasAttribute('disabled'), false, 'a failure frees the button');
+    assert.deepEqual(state.canvas.getData(), before);
+    answer = true;
+    click(review.querySelector('[data-act="import"]')); await flush();
+    assert.equal(asked.length, 3); assert.notDeepEqual(state.canvas.getData(), before);
+    assert.match(review.querySelector('[data-consent]').getAttribute('message'), /Loaded as a draft/);
   } finally { TfWindow.confirm = original; }
 });
 
@@ -8743,4 +8754,57 @@ test('a response that carries a model next to a fatal diagnostic still loads not
   assert.ok(review); assert.equal(review.querySelector('[data-act="import"]'), null);
   assert.match(review.querySelector('[data-consent]').getAttribute('message'), /Nothing was imported/);
   assert.deepEqual(state.canvas.getData(), before); assert.equal(attentionBanner().hidden, true);
+});
+
+test('an inspector note keeps the server text under the localized one and is translated again when it is drawn', async () => {
+  const state = await runImport(camundaResponse());
+  click(reviewWindow().querySelector('[data-act="import"]')); await flush();
+  state.canvas.selectNode('Gate');
+  const note = () => state.config.root.querySelector('[data-import-attention]');
+  assert.match(note().querySelector('tf-alert').getAttribute('message'), /Camunda takes the first true condition/);
+  assert.equal(note().querySelector('[data-note-detail]').textContent, 'gateway may behave differently');
+  await I18n.setLanguage('pl');
+  try {
+    state.canvas.selectNode('Review'); state.canvas.selectNode('Gate');
+    assert.match(note().querySelector('tf-alert').getAttribute('message'), /Camunda bierze pierwszy prawdziwy warunek/);
+    assert.equal(note().querySelector('[data-note-detail]').textContent, 'gateway may behave differently');
+  } finally { await I18n.setLanguage('en'); }
+});
+
+test('the attention banner is a live region and the jump says where it went without taking focus off the button', async () => {
+  const state = await runImport(camundaResponse());
+  click(reviewWindow().querySelector('[data-act="import"]')); await flush();
+  const banner = attentionBanner();
+  assert.equal(banner.hasAttribute('live'), true);
+  const status = state.root.querySelector('[data-role="attention-status"]');
+  assert.equal(status.getAttribute('aria-live'), 'polite');
+  const next = banner.querySelector('[data-role="next-attention"]'); next.focus?.();
+  click(next);
+  assert.equal(status.textContent, 'Charge card: element 1 of 4');
+  click(next);
+  assert.equal(status.textContent, 'Big order?: element 2 of 4');
+});
+
+test('the jump goes through a sub-process body and the main body in document order, which no single canvas shows', async () => {
+  const model = camundaModel();
+  const inner = { id: 'Inner_Bean', name: 'Inner', kind: { ServiceTask: { flowId: '', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60, implementation: { Unbound: { origin: 'class:a.I' } } } } };
+  const subBody = { nodes: [inner], sequenceFlows: [], diagram: { shapes: [{ elementId: 'Inner_Bean', x: 40, y: 40, width: 240, height: 96 }], edges: [] }, variables: {} };
+  model.nodes.splice(3, 0, { id: 'Sub', name: 'Notify', kind: { SubProcess: { body: subBody } } });
+  model.diagram.shapes.push({ elementId: 'Sub', x: 300, y: 400, width: 240, height: 96 });
+  const state = await runImport({ model, diagnostics: [{ code: 'CAMUNDA_GATEWAY_EVAL_SEMANTICS', message: 'm', elementId: 'Gate', offset: 1, fatal: false, severity: 'warning' }], translations: [] });
+  click(reviewWindow().querySelector('[data-act="import"]')); await flush();
+  const next = attentionBanner().querySelector('[data-role="next-attention"]');
+  const visited = [];
+  for (let step = 0; step < 6; step += 1) {
+    click(next); visited.push([...state.canvas.selectedIds][0]);
+  }
+  assert.deepEqual(visited, ['Task_Bean', 'Gate', 'Inner_Bean', 'Task_Second', 'Task_Bean', 'Gate']);
+  click(next); click(next);
+  assert.deepEqual(state.canvas.processPath, [], 'back in the main body after leaving the sub-process');
+  assert.equal(state.canvas.nodes.some((node) => node.id === 'Inner_Bean'), false);
+});
+
+test('the Polish wording of the listener diagnostic uses the masculine past form', () => {
+  const text = JSON.parse(readFileSync(new URL('../../../i18n/pl.json', import.meta.url), 'utf8')).bpmn.diag_CAMUNDA_LISTENER_SKIPPED;
+  assert.match(text, /Mógł mieć skutki uboczne/); assert.doesNotMatch(text, /Mogł/);
 });

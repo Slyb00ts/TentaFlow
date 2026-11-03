@@ -29,14 +29,33 @@ const CAMUNDA_XML = `<?xml version="1.0" encoding="UTF-8"?>
     <bpmn:serviceTask id="Task_Charge" name="Charge card" camunda:delegateExpression="\${chargeBean}"/>
     <bpmn:exclusiveGateway id="Gate_1" name="Big order?" default="Flow_small"/>
     <bpmn:userTask id="Task_Review" name="Review order" camunda:candidateGroups="finance"/>
+    <bpmn:subProcess id="Sub_1" name="Notify">
+      <bpmn:startEvent id="SubStart_1"/>
+      <bpmn:serviceTask id="Task_Inner" name="Send mail" camunda:delegateExpression="\${mailer}"/>
+      <bpmn:endEvent id="SubEnd_1"/>
+      <bpmn:sequenceFlow id="SubFlow_a" sourceRef="SubStart_1" targetRef="Task_Inner"/>
+      <bpmn:sequenceFlow id="SubFlow_b" sourceRef="Task_Inner" targetRef="SubEnd_1"/>
+    </bpmn:subProcess>
     <bpmn:endEvent id="End_1"/>
     <bpmn:sequenceFlow id="Flow_a" sourceRef="Start_1" targetRef="Task_Charge"/>
     <bpmn:sequenceFlow id="Flow_b" sourceRef="Task_Charge" targetRef="Gate_1"/>
     <bpmn:sequenceFlow id="Flow_big" name="big" sourceRef="Gate_1" targetRef="Task_Review">
       <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\${amount > 100}</bpmn:conditionExpression>
     </bpmn:sequenceFlow>
-    <bpmn:sequenceFlow id="Flow_small" sourceRef="Gate_1" targetRef="End_1"/>
+    <bpmn:sequenceFlow id="Flow_small" sourceRef="Gate_1" targetRef="Sub_1"/>
+    <bpmn:sequenceFlow id="Flow_sub" sourceRef="Sub_1" targetRef="End_1"/>
     <bpmn:sequenceFlow id="Flow_c" sourceRef="Task_Review" targetRef="End_1"/>
+  </bpmn:process>
+</bpmn:definitions>`;
+
+const SECOND_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:camunda="http://camunda.org/schema/1.0/bpmn" id="Definitions_2" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="Process_Second" name="Second" isExecutable="true">
+    <bpmn:startEvent id="Start_1"/>
+    <bpmn:serviceTask id="Task_Second" name="Second step" camunda:delegateExpression="\${secondBean}"/>
+    <bpmn:endEvent id="End_1"/>
+    <bpmn:sequenceFlow id="Flow_a" sourceRef="Start_1" targetRef="Task_Second"/>
+    <bpmn:sequenceFlow id="Flow_b" sourceRef="Task_Second" targetRef="End_1"/>
   </bpmn:process>
 </bpmn:definitions>`;
 
@@ -185,9 +204,10 @@ test('a Camunda document is read first, imported as a draft with its placeholder
   // The banner lists what needs the author and jumps through it.
   const banner = page.locator('[data-role="attention"]');
   await expect(banner).toBeVisible();
-  const total = await marked(page).count();
-  expect(total).toBeGreaterThanOrEqual(3);
-  await expect(banner).toHaveAttribute('message', new RegExp(`^${total} elements need your attention`));
+  const count = async () => Number(/^(\d+) element/.exec(await banner.getAttribute('message'))[1]);
+  const total = await count();
+  expect(total).toBeGreaterThanOrEqual(4);
+  await expect(banner).toHaveAttribute('live', '');
   const selectedId = () => page.evaluate(() => document.querySelector('.fb-canvas .fb-node.selected')?.dataset.nodeId ?? null);
   await page.keyboard.press('Escape');
   await expect(page.locator('.fb-canvas .fb-node.selected')).toHaveCount(0);
@@ -196,16 +216,24 @@ test('a Camunda document is read first, imported as a draft with its placeholder
     await page.locator('[data-role="next-attention"]').click();
     await expect.poll(selectedId).not.toBeNull();
     visited.push(await selectedId());
+    await expect(page.locator('[data-role="attention-status"]')).toContainText(`${step + 1} of ${total}`);
   }
   expect(new Set(visited).size).toBe(total);
-  const documentOrder = await marked(page).evaluateAll((elements) => elements.map((element) => element.dataset.nodeId));
-  expect(visited).toEqual(documentOrder);
-  expect(documentOrder[0]).toBe('Task_Charge');
+  expect(visited[0]).toBe('Task_Charge');
+  // Document order puts the step inside the sub-process after the main-body review task and last overall.
+  expect(visited.indexOf('Task_Inner')).toBeGreaterThan(visited.indexOf('Task_Review'));
+  expect(visited[total - 1]).toBe('Task_Inner');
+  // From inside the sub-process the jump wraps back out to the main body.
+  await page.locator('[data-role="next-attention"]').click();
+  await expect.poll(selectedId).toBe('Task_Charge');
+  await expect(page.locator('[data-role="next-attention"]')).toBeEnabled();
 
   // The draft saves with the placeholder and reloads with it.
   await page.locator('[data-role="save"]').click();
   await expect.poll(async () => (await storedModel(page)).nodes.some((row) => row.kind.ServiceTask?.implementation?.Unbound), { timeout: 15000 }).toBe(true);
   const stored = await storedModel(page);
+  const inner = stored.nodes.find((row) => row.kind.SubProcess).kind.SubProcess.body.nodes.find((row) => row.id === 'Task_Inner');
+  expect(inner.kind.ServiceTask.implementation.Unbound.origin).toBe('delegateExpression:${mailer}');
   expect(stored.nodes.find((row) => row.id === 'Task_Charge').kind.ServiceTask.implementation.Unbound.origin).toBe('delegateExpression:${chargeBean}');
   await page.reload();
   await expect(page.locator('#sidebar, .sidebar, nav').first()).toBeVisible({ timeout: 15000 });
@@ -213,8 +241,7 @@ test('a Camunda document is read first, imported as a draft with its placeholder
   await expect(page.locator('.fb-canvas .fb-node[data-node-id="Task_Charge"]')).toHaveClass(/fb-needs-attention/);
   await expect(page.locator('[data-role="attention"]')).toBeVisible();
   // Only the placeholder survives a reload: what the import warned about is not stored.
-  const unboundOnly = await marked(page).count();
-  expect(unboundOnly).toBe(1);
+  await expect(page.locator('[data-role="attention"]')).toHaveAttribute('message', /^2 elements need/);
 
   // Publication is refused by name, before the server is asked.
   await page.locator('[data-role="publish"]').click();
@@ -229,7 +256,40 @@ test('a Camunda document is read first, imported as a draft with its placeholder
   await page.locator('tf-select[data-process="implementation"] select').selectOption('flow');
   await expect(page.locator('.fb-canvas .fb-node[data-node-id="Task_Charge"]')).not.toHaveClass(/fb-needs-attention/);
   await expect(page.locator('[data-unbound-notice]')).toHaveCount(0);
-  await expect(marked(page)).toHaveCount(unboundOnly - 1);
-  await expect(page.locator('[data-role="attention"]')).toBeHidden();
+  await expect(page.locator('[data-role="attention"]')).toHaveAttribute('message', /^1 element needs/);
+  await expect(marked(page)).toHaveCount(0);
+  expect(errors, diagnostics(errors, proc)).toEqual([]);
+});
+
+test('importing over unsaved work asks first: cancelling keeps the result and the draft, confirming replaces the draft', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors = collectConsoleErrors(page);
+  await openDesigner(page);
+  await submitImport(page, CAMUNDA_XML);
+  const review = page.locator('tf-window .fb-import-review');
+  await expect(review).toBeVisible({ timeout: 15000 });
+  await page.locator('[data-act="import"]').click();
+  await expect(review.locator('[data-consent]')).toContainText('Loaded as a draft');
+  await page.locator('[data-act="close"]').click();
+  await expect(review).toHaveCount(0);
+  await expect(page.locator('.fb-canvas .fb-node[data-node-id="Task_Charge"]')).toBeVisible();
+
+  // The draft is unsaved now, so a second import asks before replacing it.
+  await submitImport(page, SECOND_XML);
+  await expect(review).toBeVisible({ timeout: 15000 });
+  await page.locator('[data-act="import"]').click();
+  await expect(page.locator('tf-button[data-action="confirm"]')).toBeVisible();
+  await page.locator('tf-button[data-action="cancel"]').click();
+  await expect(page.locator('tf-button[data-action="confirm"]')).toHaveCount(0);
+  await expect(review).toBeVisible();
+  await expect(page.locator('[data-act="import"]')).not.toHaveAttribute('disabled', '');
+  await expect(page.locator('.fb-canvas .fb-node[data-node-id="Task_Charge"]')).toBeVisible();
+  await expect(page.locator('.fb-canvas .fb-node[data-node-id="Task_Second"]')).toHaveCount(0);
+
+  await page.locator('[data-act="import"]').click();
+  await page.locator('tf-button[data-action="confirm"]').click();
+  await expect(review.locator('[data-consent]')).toContainText('Loaded as a draft');
+  await expect(page.locator('.fb-canvas .fb-node[data-node-id="Task_Second"]')).toBeVisible();
+  await expect(page.locator('.fb-canvas .fb-node[data-node-id="Task_Charge"]')).toHaveCount(0);
   expect(errors, diagnostics(errors, proc)).toEqual([]);
 });

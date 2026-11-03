@@ -15652,7 +15652,8 @@
     "diag_CAMUNDA_ELEMENT_UNSUPPORTED": "Dieses Element hat in TentaFlow keine Entsprechung, daher kann das Dokument nicht importiert werden.",
     "diag_CAMUNDA_DIAGNOSTICS_TRUNCATED": "Nur die ersten Diagnosen und Übersetzungen werden aufgelistet.",
     "diag_EXPR_MISSING_VALUE": "Eine fehlende Variable, ein fehlender Schlüssel oder Index gilt in Camunda als leer, ist in TentaFlow aber ein Auswertungsfehler; ein Gateway meldet dann einen Vorfall.",
-    "diag_EXPR_TYPE_COERCION": "Camunda wandelt Operandentypen um (etwa den Text „7“ in die Zahl 7). TentaFlow ist streng und scheitert bei einer Abweichung."
+    "diag_EXPR_TYPE_COERCION": "Camunda wandelt Operandentypen um (etwa den Text „7“ in die Zahl 7). TentaFlow ist streng und scheitert bei einer Abweichung.",
+    "attention_selected": "{name}: Element {position} von {total}"
   },
   "gestures": {
     "wave": "Winken",

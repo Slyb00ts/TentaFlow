@@ -16779,7 +16779,7 @@
     "diag_CAMUNDA_ASSIGNEE_UNRESOLVED": "Wykonawca z Camundy nie jest użytkownikiem tej organizacji, więc zadanie nie ma wykonawcy. Wybierz wykonawcę.",
     "diag_CAMUNDA_CANDIDATES_SKIPPED": "Użytkownicy i grupy kandydackie nie są importowani. Wybierz, kto wykonuje to zadanie.",
     "diag_CAMUNDA_FORM_SKIPPED": "Formularz tego elementu nie został zaimportowany.",
-    "diag_CAMUNDA_LISTENER_SKIPPED": "Nasłuchiwacz nie został zaimportowany. Mogł mieć skutki uboczne, na których polegał proces.",
+    "diag_CAMUNDA_LISTENER_SKIPPED": "Nasłuchiwacz nie został zaimportowany. Mógł mieć skutki uboczne, na których polegał proces.",
     "diag_CAMUNDA_SUBPROCESS_SCOPE": "Camunda przekazuje zmienne zapisane w podprocesie do procesu nadrzędnego. Ten podproces zawiera kroki o nieznanej implementacji, więc tego, co zapisują, nie da się wyprowadzić. Sprawdź zmienne, które wytwarza.",
     "diag_CAMUNDA_OUTPUT_PARAMETER_SCOPE": "Parametr wyjściowy jest oceniany względem wyniku kroku i zmiennych procesu, a nie lokalnych zmiennych zadania z Camundy. Sprawdź wyrażenie.",
     "diag_CAMUNDA_EXPRESSION_WARNING": "Wyrażenie przetłumaczono z różnicą w zachowaniu. Zobacz przetłumaczone wyrażenia.",
@@ -16790,7 +16790,8 @@
     "diag_CAMUNDA_ELEMENT_UNSUPPORTED": "Ten element nie ma odpowiednika w TentaFlow, więc dokumentu nie można zaimportować.",
     "diag_CAMUNDA_DIAGNOSTICS_TRUNCATED": "Wyświetlono tylko pierwsze diagnostyki i tłumaczenia.",
     "diag_EXPR_MISSING_VALUE": "Brakująca zmienna, klucz lub indeks to w Camundzie wartość pusta, ale w TentaFlow błąd oceny; bramka zgłasza wtedy incydent.",
-    "diag_EXPR_TYPE_COERCION": "Camunda konwertuje typy argumentów (na przykład tekst „7” na liczbę 7). TentaFlow jest ścisły i przy niezgodności zgłasza błąd."
+    "diag_EXPR_TYPE_COERCION": "Camunda konwertuje typy argumentów (na przykład tekst „7” na liczbę 7). TentaFlow jest ścisły i przy niezgodności zgłasza błąd.",
+    "attention_selected": "{name}: element {position} z {total}"
   },
   "gestures": {
     "wave": "machanie",

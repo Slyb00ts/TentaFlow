@@ -718,7 +718,7 @@ export class FlowConfig {
   _attentionHtml(node) {
     const notes = this.opts.getAttentionNotes?.(node.id) ?? [];
     if (!notes.length) return '';
-    return `<div class="fb-import-notes" data-import-attention>${notes.map((text) => `<tf-alert tone="warning" message="${escapeAttr(text)}"></tf-alert>`).join('')}
+    return `<div class="fb-import-notes" data-import-attention>${notes.map(({ text, detail }) => `<tf-alert tone="warning" message="${escapeAttr(text)}"></tf-alert>${detail && detail !== text ? `<p class="fb-field-hint" data-note-detail>${escapeHtml(detail)}</p>` : ''}`).join('')}
       ${this.readOnly ? '' : `<tf-button variant="secondary" size="sm" icon="check" data-attention-dismiss>${escapeHtml(I18n.t('bpmn.attention_dismiss'))}</tf-button>`}</div>`;
   }
 
