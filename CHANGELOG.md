@@ -594,6 +594,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   ma własny kod `VERIFICATION_AGENT_REFUSED` (nie `SOURCE_ACCESS_REVOKED`), a
   komunikat dla `loop`, `map` i `subflow` mówi, że ich ciało nie jest przypięte;
   podpowiedź krytyka w pięciu językach opisuje ograniczenia harnessu.
+- Tłumacz wyrażeń JUEL/FEEL → CEL (B3.6a). Warunki z plików Camundy są
+  tłumaczone na CEL z ostrzeżeniami (`EXPR_*`) albo odmową z kodem i pozycją;
+  nic nie jest zgadywane po cichu.
+- Import plików Camundy (B3.6b). Okno „Importuj” czyta tolerancyjnie pliki
+  z przestrzenią `http://camunda.org/schema/1.0/bpmn`: tłumaczy warunki,
+  przypisania, timery i podprocesy, a to, czego nie da się przenieść, zgłasza
+  jako diagnozy z kodami `CAMUNDA_*` (błąd, ostrzeżenie, informacja). Import
+  niczego nie zapisuje; wynik trafia do szkicu dopiero po „Importuj jako
+  szkic”. Zadania usługi bez znanej implementacji dostają stan „bez
+  implementacji”: szkic się zapisze, ale publikacja jest odrzucana
+  (`UNBOUND_IMPLEMENTATION`), dopóki nie wybierzesz bloku, narzędzia albo
+  agenta. Plik z jakimkolwiek błędem krytycznym nie daje modelu. Zadanie
+  użytkownika z wielokrotnym wykonaniem, którego zmienna elementu jest też
+  używana w przypisaniu, jest odrzucane. Przerywające zdarzenie brzegowe na
+  podprocesie, który kopiuje zmienne na zewnątrz, daje ostrzeżenie, bo po
+  przerwaniu kopiowanie nie następuje. Ostrzeżenia importu żyją tylko w bieżącej
+  sesji okna (przycisk „Kopiuj raport”).
 
 ### TentaNas
 
