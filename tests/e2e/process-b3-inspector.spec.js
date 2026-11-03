@@ -928,7 +928,7 @@ test('a test and a critic verification are saved and read back by the codec, and
   await loginAsAdmin(page, { port: PORT });
   const id = await createDefinition(page, 'Verified step', { errors: [], escalations: [] });
   const agentStep = {
-    agentId: 'agent-1', goalExpression: '"Triage the ticket"', allowedTools: [], maxIterations: 8, outputSchema: null,
+    agentId: 'agent-1', goalExpression: '"Triage the ticket"', allowedTools: [], maxIterations: 8,
   };
   const scenarios = [
     { name: 'test', implementation: null, verification: { Test: { flowId: 'check-flow', onFailure: 'NeedsHuman' } } },
