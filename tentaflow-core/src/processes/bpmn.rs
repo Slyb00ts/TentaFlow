@@ -24,8 +24,13 @@ use tentaflow_protocol::processes::{
 };
 
 use super::model::{
-    validate_model, validate_timer_spec, validate_variables, EscalationPathError,
+    validate_interchange_model, validate_timer_spec, validate_variables, EscalationPathError,
     EventGatewayProfileError, MAX_DATA_STORE_CAPACITY, MAX_MODEL_BYTES, MAX_VARIABLE_BYTES,
+};
+
+mod camunda;
+pub use camunda::{
+    declares_camunda_namespace, import_camunda_xml, import_camunda_xml_resolving, CamundaImport,
 };
 
 const BPMN: &str = "http://www.omg.org/spec/BPMN/20100524/MODEL";
@@ -190,7 +195,20 @@ fn ns_text(result: ResolveResult<'_>) -> Result<String> {
     }
 }
 
+/// Deepest element nesting the tolerant reader accepts. Real BPMN stays far
+/// below it (definitions > process > three subprocess levels > task >
+/// extension > parameter); the cap keeps a hostile document from building a
+/// tree whose recursive drop or walk could exhaust a worker thread's stack.
+const MAX_TOLERANT_DEPTH: usize = 64;
+
 fn parse_tree(xml: &str) -> Result<Element> {
+    parse_tree_with(xml, false)
+}
+
+/// `tolerant` is the foreign-document reader: an `xsi:type` outside
+/// `bpmn:tFormalExpression` is kept (as `{namespace}local`) for the caller to
+/// judge instead of aborting the read, and nesting is bounded.
+fn parse_tree_with(xml: &str, tolerant: bool) -> Result<Element> {
     ensure!(xml.len() <= MAX_MODEL_BYTES, "BPMN XML exceeds 512 KiB");
     let mut reader = NsReader::from_str(xml);
     reader.config_mut().trim_text(false);
@@ -265,14 +283,23 @@ fn parse_tree(xml: &str) -> Result<Element> {
                         }
                         qnames.insert(attr_local.clone(), (uri, local));
                     }
+                    let mut value = value;
                     if attr_ns == XSI && attr_local == "type" {
                         let (type_ns, type_local) =
                             reader.resolver().resolve_element(QName(value.as_bytes()));
-                        ensure!(
-                            ns_text(type_ns)? == BPMN
-                                && type_local.as_ref() == b"tFormalExpression",
-                            "unsupported condition expression type at byte {offset}"
-                        );
+                        if tolerant {
+                            value = format!(
+                                "{{{}}}{}",
+                                ns_text(type_ns)?,
+                                String::from_utf8_lossy(type_local.as_ref())
+                            );
+                        } else {
+                            ensure!(
+                                ns_text(type_ns)? == BPMN
+                                    && type_local.as_ref() == b"tFormalExpression",
+                                "unsupported condition expression type at byte {offset}"
+                            );
+                        }
                     }
                     ensure!(
                         attrs.insert((attr_ns, attr_local), value).is_none(),
@@ -300,6 +327,10 @@ fn parse_tree(xml: &str) -> Result<Element> {
                     text: String::new(),
                     offset,
                 };
+                ensure!(
+                    !tolerant || stack.len() < MAX_TOLERANT_DEPTH,
+                    "XML nesting deeper than {MAX_TOLERANT_DEPTH} levels at byte {offset}"
+                );
                 if is_empty {
                     if let Some(parent) = stack.last_mut() {
                         parent.children.push(element);
@@ -2523,6 +2554,7 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                 "nodeType",
                 "agentId",
                 "maxIterations",
+                "origin",
                 "timeoutSeconds",
                 "verification",
                 "verificationFlowId",
@@ -2690,6 +2722,24 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                                 .parse()
                                 .context("invalid agent iteration budget")?,
                             output_schema: config.output_schema,
+                        },
+                    )
+                }
+                "unbound" => {
+                    ensure!(
+                        service.attr("flowId").is_none()
+                            && service.attr("addonId").is_none()
+                            && service.attr("toolName").is_none()
+                            && service.attr("nodeType").is_none()
+                            && service.attr("agentId").is_none()
+                            && service.child(TF, "blockConfig")?.is_none()
+                            && service.child(TF, "agentConfig")?.is_none(),
+                        "unbound service cannot name a flow, an addon tool, a block or an agent"
+                    );
+                    (
+                        String::new(),
+                        ServiceImplementation::Unbound {
+                            origin: service.required("origin")?,
                         },
                     )
                 }
@@ -3605,7 +3655,10 @@ fn collaboration_from_xml(
 }
 
 fn parse_model(xml: &str) -> Result<ProcessModel> {
-    let root = parse_tree(xml)?;
+    model_from_tree(parse_tree(xml)?)
+}
+
+fn model_from_tree(root: Element) -> Result<ProcessModel> {
     ensure!(
         root.is(BPMN, "definitions"),
         "BPMN root must use the BPMN model namespace"
@@ -3934,7 +3987,7 @@ fn parse_model(xml: &str) -> Result<ProcessModel> {
         }
         pending.extend(&element.children);
     }
-    validate_model(&model).map_err(|error| {
+    validate_interchange_model(&model).map_err(|error| {
         if let Some(profile) = error.downcast_ref::<EventGatewayProfileError>() {
             let offset = root
                 .find_id(&profile.node_id)
@@ -3995,10 +4048,25 @@ pub fn import_xml(xml: &str) -> (Option<ProcessModel>, Vec<ProcessDiagnostic>) {
                     flow_id: path.and_then(|path| path.flow_id.clone()),
                     node_id: path.and_then(|path| path.node_id.clone()),
                     reason: path.map(|path| path.reason),
+                    severity: None,
                 }],
             )
         }
     }
+}
+
+/// The import entry the dispatcher serves: a document that declares the
+/// Camunda namespace goes through the tolerant reader, every other document
+/// through the strict one, whose result is returned unchanged.
+pub fn import_document(
+    xml: &str,
+    resolve_login: &dyn Fn(&str) -> Option<String>,
+) -> CamundaImport {
+    if declares_camunda_namespace(xml) {
+        return import_camunda_xml_resolving(xml, resolve_login);
+    }
+    let (model, diagnostics) = import_xml(xml);
+    CamundaImport { model, diagnostics, translations: Vec::new() }
 }
 
 fn verification_failure(service: &Element) -> Result<VerificationOnFailure> {
@@ -4807,6 +4875,10 @@ fn write_graph(
                         "implementation=\"agent\" agentId=\"{}\" maxIterations=\"{max_iterations}\"",
                         escaped(agent_id)
                     ),
+                    ServiceImplementation::Unbound { origin } => format!(
+                        "implementation=\"unbound\" origin=\"{}\"",
+                        escaped(origin)
+                    ),
                 };
                 let verification_attrs = match verification {
                     ActivityVerification::Test { flow_id, on_failure } => format!(
@@ -5043,7 +5115,7 @@ fn write_graph(
 }
 
 pub fn export_xml(model: &ProcessModel) -> Result<String> {
-    validate_model(model)?;
+    validate_interchange_model(model)?;
     let namespace = model.target_namespace.as_deref().unwrap_or(TF);
     let has_repeat = super::model::all_nodes(model)
         .iter()

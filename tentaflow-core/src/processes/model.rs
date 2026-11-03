@@ -223,7 +223,7 @@ fn is_bidi_control(c: char) -> bool {
     matches!(u32::from(c), 0x61C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069)
 }
 
-fn valid_id(id: &str) -> bool {
+pub(super) fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id.as_bytes()[0].is_ascii_alphabetic()
@@ -648,6 +648,14 @@ fn validate_repeat(
     Ok(())
 }
 
+/// Stable code of the refusal to publish (or run) a service task that an
+/// import left without an implementation.
+pub const UNBOUND_IMPLEMENTATION: &str = "UNBOUND_IMPLEMENTATION";
+
+/// Longest foreign form an unbound step remembers; it is a hint for the person
+/// who picks the real implementation, not data to run.
+pub const MAX_UNBOUND_ORIGIN_BYTES: usize = 512;
+
 pub fn validate_draft(model: &ProcessModel) -> Result<()> {
     ensure!(
         model.schema_version == 1 && valid_id(&model.process_id),
@@ -828,6 +836,16 @@ fn validate_draft_body<'a>(
                 flow_id,
                 ..
             } => {
+                if let ServiceImplementation::Unbound { origin } = implementation {
+                    ensure!(
+                        flow_id.is_empty()
+                            && !origin.is_empty()
+                            && origin.len() <= MAX_UNBOUND_ORIGIN_BYTES
+                            && !origin.chars().any(char::is_control),
+                        "service task {} has an invalid unbound origin",
+                        node.id
+                    );
+                }
                 let max_timeout = service_timeout_ceiling(implementation);
                 ensure!(
                     (1..=max_timeout).contains(timeout_seconds),
@@ -1048,7 +1066,20 @@ fn validate_draft_body<'a>(
     validate_modeling(modeling, diagram, nodes, variables, data_stores, all_ids)
 }
 
+/// Publication-grade validation: the model must be runnable as it stands.
 pub fn validate_model(model: &ProcessModel) -> Result<()> {
+    validate_model_policy(model, false)
+}
+
+/// Validation for XML exchange: as [`validate_model`], except that a service
+/// task left without an implementation by an import is accepted, so a draft
+/// can be exported and read back. Publication still goes through
+/// [`validate_model`].
+pub fn validate_interchange_model(model: &ProcessModel) -> Result<()> {
+    validate_model_policy(model, true)
+}
+
+fn validate_model_policy(model: &ProcessModel, allow_unbound: bool) -> Result<()> {
     validate_draft(model)?;
     let message_ids: HashSet<_> = model
         .messages
@@ -1088,6 +1119,7 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
         &mut used_errors,
         &mut used_escalations,
         &mut used_signals,
+        allow_unbound,
     )?;
     validate_complete_io(&model.nodes, model.modeling.as_ref(), &model.variables)?;
     for process in &model.additional_processes {
@@ -1105,6 +1137,7 @@ pub fn validate_model(model: &ProcessModel) -> Result<()> {
             &mut used_errors,
             &mut used_escalations,
             &mut used_signals,
+            allow_unbound,
         )
         .with_context(|| format!("process {}", process.process_id))?;
         validate_complete_io(
@@ -1308,6 +1341,7 @@ fn validate_body<'a>(
     used_errors: &mut HashSet<&'a str>,
     used_escalations: &mut HashSet<&'a str>,
     used_signals: &mut HashSet<&'a str>,
+    allow_unbound: bool,
 ) -> Result<()> {
     ensure!(
         !graph_nodes.is_empty() && !graph_flows.is_empty(),
@@ -1437,6 +1471,13 @@ fn validate_body<'a>(
                         );
                         validate_agent_implementation(implementation, &node.id)?;
                     }
+                    ServiceImplementation::Unbound { origin } => ensure!(
+                        allow_unbound,
+                        "{UNBOUND_IMPLEMENTATION}: service task {} has no implementation yet \
+                         (imported as {origin}); choose a flow, tool, block or agent before \
+                         publishing",
+                        node.id
+                    ),
                 }
                 let max_timeout = service_timeout_ceiling(implementation);
                 ensure!(
@@ -1643,6 +1684,7 @@ fn validate_body<'a>(
                     used_errors,
                     used_escalations,
                     used_signals,
+                    allow_unbound,
                 )
                 .with_context(|| format!("embedded subprocess {}", node.id))?;
             }

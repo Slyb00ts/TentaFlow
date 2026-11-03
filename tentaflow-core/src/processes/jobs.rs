@@ -410,6 +410,9 @@ pub async fn execute_claimed(
             None,
         );
     };
+    if let ServiceImplementation::Unbound { origin } = implementation {
+        return refuse_unbound(pool, worker_id, &claimed, &node.id, origin);
+    }
     let source_ref = implementation.source_ref(flow_id);
     let snapshot = claimed
         .snapshot
@@ -446,6 +449,9 @@ pub async fn execute_claimed(
         ServiceImplementation::Block { node_type, config } => {
             execute_block(&job, snapshot, node_type, config).await
         }
+        ServiceImplementation::Unbound { origin } => {
+            refuse_unbound(pool, worker_id, &claimed, &node.id, origin)
+        }
         ServiceImplementation::Agent {
             agent_id,
             goal_expression,
@@ -466,6 +472,25 @@ pub async fn execute_claimed(
             .await
         }
     }
+}
+
+/// An unbound step has no pin, so it is refused before the pin lookup; the
+/// match arm repeats the refusal rather than assume that ordering.
+fn refuse_unbound(
+    pool: &DbPool,
+    worker_id: &str,
+    claimed: &ClaimedProcessJob,
+    node_id: &str,
+    origin: &str,
+) -> Result<()> {
+    fail_claim(
+        pool,
+        worker_id,
+        claimed,
+        super::model::UNBOUND_IMPLEMENTATION,
+        format!("service task {node_id} has no implementation (imported as {origin})"),
+        None,
+    )
 }
 
 /// Whether a claimed job runs an agent, as its work or as its critic, which

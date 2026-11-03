@@ -159,6 +159,27 @@ fn simulation_view(view: simulation::SimulationView) -> Result<ProcessSimulation
     })
 }
 
+/// Resolves a foreign login to an active user of the caller's organization.
+/// Anyone else stays unresolved, so an import cannot probe other organizations.
+fn assignee_resolver<'a>(
+    ctx: &'a HandlerContext,
+    actor: &'a ProcessActor,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    let members = std::cell::OnceCell::new();
+    move |login: &str| {
+        let user = crate::db::repository::get_user_account_by_username(&ctx.state.db, login)
+            .ok()
+            .flatten()
+            .filter(|user| user.is_active)?;
+        let members = members.get_or_init(|| {
+            crate::services::org::repo::list_memberships_for_org(&ctx.state.db, &actor.org_id)
+                .map(|rows| rows.into_iter().map(|(id, _)| id).collect::<Vec<_>>())
+                .unwrap_or_default()
+        });
+        members.contains(&user.id).then_some(user.id)
+    }
+}
+
 fn options(ctx: &HandlerContext, actor: &ProcessActor) -> Result<P, ProtocolError> {
     let members =
         crate::services::org::repo::list_memberships_for_org(&ctx.state.db, &actor.org_id)
@@ -396,6 +417,13 @@ pub(crate) fn pin_service_snapshots(
                     }
                     other => ProtocolError::bad_request(other.to_string()),
                 })?,
+            ServiceImplementation::Unbound { origin } => {
+                return Err(ProtocolError::bad_request(format!(
+                    "{}: service task {} has no implementation (imported as {origin})",
+                    crate::processes::model::UNBOUND_IMPLEMENTATION,
+                    node.id
+                )))
+            }
             ServiceImplementation::Agent {
                 agent_id,
                 allowed_tools,
@@ -687,9 +715,15 @@ pub fn process_dispatch(
                 pool, &actor, definition_id, *version).map_err(error)?;
             P::VersionGetResponse { version, start_catalog }
         },
+        // Nothing is stored here: the caller reviews the diagnostics and
+        // translations and saves the draft through a separate request.
         P::XmlImportRequest { xml } => {
-            let (model, diagnostics) = bpmn::import_xml(xml);
-            P::XmlImportResponse { model, diagnostics }
+            let imported = bpmn::import_document(xml, &assignee_resolver(ctx, &actor));
+            P::XmlImportResponse {
+                model: imported.model,
+                diagnostics: imported.diagnostics,
+                translations: imported.translations,
+            }
         }
         P::XmlExportRequest {
             definition_id,
@@ -1557,6 +1591,75 @@ mod tests {
         assert_eq!(error.code, ProtocolErrorCode::BadRequest);
         assert!(
             error.message.contains("service task Service:") && error.message.contains("\"sleeper\" is disabled"),
+            "{}",
+            error.message
+        );
+    }
+
+    const CAMUNDA_UNBOUND_PROCESS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:camunda="http://camunda.org/schema/1.0/bpmn" id="Definitions_1" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="Process_1" isExecutable="true">
+    <bpmn:startEvent id="Start_1"/>
+    <bpmn:userTask id="Review_1" camunda:assignee="colleague"/>
+    <bpmn:userTask id="Review_2" camunda:assignee="outsider"/>
+    <bpmn:serviceTask id="Task_1" camunda:delegateExpression="${mailer}"/>
+    <bpmn:endEvent id="End_1"/>
+    <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="Review_1"/>
+    <bpmn:sequenceFlow id="Flow_2" sourceRef="Review_1" targetRef="Review_2"/>
+    <bpmn:sequenceFlow id="Flow_3" sourceRef="Review_2" targetRef="Task_1"/>
+    <bpmn:sequenceFlow id="Flow_4" sourceRef="Task_1" targetRef="End_1"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+    #[tokio::test]
+    async fn a_camunda_import_stores_nothing_resolves_org_logins_and_cannot_be_published_unbound() {
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "camunda-importer");
+        let colleague = test_support::actor(&state.db, "colleague");
+        // A user outside the caller's organization must not be probed by login.
+        crate::db::repository::create_user_account(
+            &state.db, "outsider", "test-password-hash", "outsider", "outsider@example.test",
+        )
+        .unwrap();
+        let ctx = context(&state, &actor);
+        let before = production_row_counts(&state);
+        let P::XmlImportResponse { model, diagnostics, translations } = request(
+            &ctx,
+            P::XmlImportRequest { xml: CAMUNDA_UNBOUND_PROCESS.to_owned() },
+        )
+        .await
+        else {
+            panic!("import response expected")
+        };
+        assert_eq!(production_row_counts(&state), before, "an import request must not persist");
+        assert!(translations.is_empty());
+        let model = model.expect("the import yields a draft model");
+        let assignee = |id: &str| match &model.nodes.iter().find(|n| n.id == id).unwrap().kind {
+            ProcessNodeKind::UserTask { assignee_user_id, .. } => assignee_user_id.clone(),
+            other => panic!("user task expected: {other:?}"),
+        };
+        assert_eq!(assignee("Review_1"), Some(colleague.user_id.clone()));
+        assert_eq!(assignee("Review_2"), None);
+        let unresolved: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.code == "CAMUNDA_ASSIGNEE_UNRESOLVED")
+            .collect();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].element_id.as_deref(), Some("Review_2"));
+
+        let definition = save(&ctx, model).await;
+        let error = refused(
+            &ctx,
+            P::DefinitionPublishRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: definition.definition_id.clone(),
+                expected_revision: definition.draft_revision,
+                repin_calendar: None,
+            },
+        )
+        .await;
+        assert!(
+            error.message.contains("UNBOUND_IMPLEMENTATION") && error.message.contains("Task_1"),
             "{}",
             error.message
         );

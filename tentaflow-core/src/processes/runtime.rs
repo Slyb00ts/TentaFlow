@@ -16,7 +16,7 @@ use tentaflow_protocol::processes::{
     ProcessNodeKind, ProcessRepeatSpec, ProcessRepetitionGroupMode,
     ProcessRepetitionGroupStatus, ProcessRepetitionOccurrenceStatus, ProcessScopeSummary, ProcessTimerKind,
     ProcessTimerStatus, ProcessUserTask, ProcessUserTaskInput, ProcessUserTaskInputValue,
-    ProcessUserTaskKind, ProcessUserTaskStatus, ProcessPayload,
+    ProcessUserTaskKind, ProcessUserTaskStatus, ProcessPayload, ServiceImplementation,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -4922,8 +4922,29 @@ impl<'a> Transition<'a> {
                 | ProcessNodeKind::BoundaryEscalation { .. } => {
                     anyhow::bail!("boundary events are entered only by their attached timer")
                 }
-                ProcessNodeKind::ServiceTask { input_mapping, .. } => {
+                ProcessNodeKind::ServiceTask { input_mapping, implementation, .. } => {
                     let repeated = self.repetition_for_token(&id);
+                    if let ServiceImplementation::Unbound { origin } = &implementation {
+                        // Publication refuses an unbound step, so reaching one means a
+                        // model bypassed it; park the token under an incident instead
+                        // of queueing a job nobody can run.
+                        let waiting = self.wait(&token, "waiting");
+                        self.incident(&node.id, None, super::model::UNBOUND_IMPLEMENTATION,
+                            format!("service task {} has no implementation (imported as {origin})", node.id));
+                        if let Some((mut group, mut occurrence)) = repeated {
+                            let incident_id = self.plan.add_incidents.last()
+                                .context("unbound repeated Service has no incident")?.incident_id.clone();
+                            group.status = ProcessRepetitionGroupStatus::Incident;
+                            group.terminal_incident_id = Some(incident_id);
+                            group.terminal_event_id = None;
+                            group.updated_at_ms = self.now_ms;
+                            self.write_repetition_group(group)?;
+                            occurrence.token_id = waiting;
+                            occurrence.updated_at_ms = self.now_ms;
+                            self.write_repetition_occurrence(occurrence)?;
+                        }
+                        break;
+                    }
                     if let Some((group, _)) = &repeated {
                         if self.active_repetition_service_jobs() >= 32 {
                             let retained_bytes = self.projected_repetition_retained_bytes()?;
@@ -9681,6 +9702,29 @@ mod tests {
         let events = all_history(&fixture.db, &fixture.owner, &instance_id);
         assert_eq!(events.iter().filter(|event| event.kind == "incident"
             && event.data["code"] == "IMMEDIATE_TRANSITION_LIMIT").count(), 1);
+    }
+
+    #[test]
+    fn an_unbound_service_step_raises_an_incident_instead_of_queueing_a_job() {
+        let fixture = Fixture::new();
+        let mut model = service_model("unused", ActivityVerification::Human);
+        let service = model.nodes.iter_mut().find(|node| node.id == "Service").unwrap();
+        let ProcessNodeKind::ServiceTask { flow_id, implementation, .. } = &mut service.kind else {
+            unreachable!()
+        };
+        flow_id.clear();
+        *implementation = ServiceImplementation::Unbound { origin: "class:a.B".into() };
+        let command = stamp("start through an unbound step");
+        let plan = plan_start(&model, &model.process_id, "Start_1", &Uuid::new_v4().to_string(),
+            &fixture.owner, "definition-unbound", 1, json!({}), StartCause::Manual,
+            chrono::Utc::now().timestamp_millis(), manual_input(&command), None).unwrap();
+        assert!(plan.create_jobs.is_empty());
+        let incidents = plan.add_incidents.iter()
+            .filter(|incident| incident.code == "UNBOUND_IMPLEMENTATION").collect::<Vec<_>>();
+        assert_eq!(incidents.len(), 1);
+        assert_eq!(incidents[0].node_id.as_deref(), Some("Service"));
+        assert!(!incidents[0].can_retry);
+        assert!(plan.events.iter().all(|event| event.kind != "service_queued"));
     }
 
     #[test]

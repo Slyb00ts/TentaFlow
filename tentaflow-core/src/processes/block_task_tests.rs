@@ -469,6 +469,57 @@ async fn a_lost_initiator_stops_the_block_before_it_runs() {
 }
 
 #[tokio::test]
+async fn a_claimed_job_of_an_unbound_step_is_refused_with_its_stable_code() {
+    let fixture = Fixture::new();
+    let started = start_model(&fixture, &pii_model("\"x\""));
+    let mut claimed = repository::claim_job(&fixture.db, "unbound-worker", now_ms())
+        .unwrap()
+        .expect("claim the queued block task");
+    // Publication cannot produce such a job, so the claim is forged.
+    let node_id = claimed.job.node_id.clone();
+    for node in claimed.snapshot.model.nodes.iter_mut().filter(|node| node.id == node_id) {
+        let tentaflow_protocol::processes::ProcessNodeKind::ServiceTask {
+            flow_id,
+            implementation,
+            ..
+        } = &mut node.kind
+        else {
+            panic!("service task expected")
+        };
+        flow_id.clear();
+        *implementation = tentaflow_protocol::processes::ServiceImplementation::Unbound {
+            origin: "class:a.B".into(),
+        };
+    }
+    super::jobs::execute_claimed(
+        &fixture.db,
+        fixture.dispatcher(),
+        "unbound-worker",
+        claimed.clone(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let incident_code: String = fixture
+        .db
+        .read()
+        .unwrap()
+        .query_row(
+            "SELECT code FROM bpmn_incidents WHERE instance_id=?1",
+            [&started.instance_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(incident_code, "UNBOUND_IMPLEMENTATION");
+    assert_eq!(
+        repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None)
+            .unwrap()
+            .status,
+        ProcessInstanceStatus::Incident
+    );
+}
+
+#[tokio::test]
 async fn the_dispatcher_runs_only_the_exact_pin_of_an_allowed_block() {
     use crate::flow_engine::dispatcher::{DispatchError, PinnedFlowSnapshot};
     use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};

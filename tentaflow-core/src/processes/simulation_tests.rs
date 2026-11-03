@@ -1935,6 +1935,26 @@ fn simulation_service_refuses_before_claim_dispatch_and_result() {
 }
 
 #[test]
+fn simulation_refuses_an_unbound_service_step_with_its_stable_code() {
+    let model = linear_activity_model(ProcessNodeKind::ServiceTask {
+        flow_id: String::new(),
+        input_mapping: BTreeMap::new(),
+        output_mapping: BTreeMap::new(),
+        verification: ActivityVerification::Human,
+        timeout_seconds: 30,
+        result_expression: None,
+        implementation: tentaflow_protocol::processes::ServiceImplementation::Unbound {
+            origin: "delegateExpression:${bean}".into(),
+        },
+    });
+    let error = create_store(source_input_for(model))
+        .expect_err("an unbound step has nothing to simulate");
+    let message = format!("{error:#}");
+    assert!(message.contains("UNBOUND_IMPLEMENTATION"), "{message}");
+    assert!(message.contains("Script_1"), "{message}");
+}
+
+#[test]
 fn simulation_reader_rejects_actor_outside_captured_acl() {
     let mut store = create_store(source_input()).expect("capture source pin");
     let simulation_id = store.simulation_id().to_owned();

@@ -88,3 +88,5 @@ mod repetition_group_incident_tests;
 
 #[cfg(test)]
 mod expression_translate_tests;
+#[cfg(test)]
+mod camunda_import_tests;

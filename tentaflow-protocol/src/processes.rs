@@ -850,6 +850,13 @@ pub enum ServiceImplementation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_schema: Option<serde_json::Value>,
     },
+    /// A draft-only placeholder left by an import of a foreign process engine's
+    /// service task (`origin` records the foreign form, e.g.
+    /// `delegateExpression:${bean}`). It can be saved and exported but never
+    /// published, simulated or run: a person has to pick a real implementation.
+    Unbound {
+        origin: String,
+    },
 }
 
 impl ServiceImplementation {
@@ -863,6 +870,7 @@ impl ServiceImplementation {
             Self::AddonTool { .. } => ServiceImplementationKind::AddonTool,
             Self::Block { .. } => ServiceImplementationKind::Block,
             Self::Agent { .. } => ServiceImplementationKind::Agent,
+            Self::Unbound { .. } => ServiceImplementationKind::Unbound,
         }
     }
 
@@ -877,9 +885,14 @@ impl ServiceImplementation {
             Self::AddonTool { addon_id, tool_name } => tool_source_ref(addon_id, tool_name),
             Self::Block { node_type, .. } => block_source_ref(node_type),
             Self::Agent { agent_id, .. } => agent_source_ref(agent_id),
+            Self::Unbound { .. } => UNBOUND_SOURCE_REF.to_owned(),
         }
     }
 }
+
+/// Source reference of an unbound step. It names nothing: no pin, invocation
+/// or verification can ever resolve it.
+pub const UNBOUND_SOURCE_REF: &str = "unbound:";
 
 /// `agent:<agent_id>` — see [`ServiceImplementation::source_ref`].
 pub fn agent_source_ref(agent_id: &str) -> String {
@@ -922,6 +935,7 @@ pub enum ServiceImplementationKind {
     AddonTool,
     Block,
     Agent,
+    Unbound,
 }
 
 impl ServiceImplementationKind {
@@ -935,6 +949,7 @@ impl ServiceImplementationKind {
             Self::AddonTool => "addon_tool",
             Self::Block => "block",
             Self::Agent => "agent",
+            Self::Unbound => "unbound",
         }
     }
 }
@@ -1858,6 +1873,36 @@ pub struct ProcessDiagnostic {
     pub node_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<ProcessEscalationPathReason>,
+    /// Absent on strict-import diagnostics, which are fatal or nothing. The
+    /// tolerant Camunda import sets it, and `fatal` then equals
+    /// `severity == Fatal`, so a reader that ignores this field stays correct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<ProcessDiagnosticSeverity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessDiagnosticSeverity {
+    /// The element cannot be imported.
+    Fatal,
+    /// The element was imported but some meaning was lost.
+    Warning,
+    /// A foreign detail was ignored without any effect on behavior.
+    Info,
+}
+
+/// One expression rewritten by the Camunda import, shown as "before -> after".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProcessImportTranslation {
+    pub element_id: String,
+    /// `condition`, `input_parameter`, `output_parameter`, `script`,
+    /// `multi_instance_collection`.
+    pub kind: String,
+    pub original: String,
+    pub translated: String,
+    /// Codes (`EXPR_*`) of the translator's warnings for this expression.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2075,6 +2120,8 @@ pub enum ProcessPayload {
     XmlImportResponse {
         model: Option<ProcessModel>,
         diagnostics: Vec<ProcessDiagnostic>,
+        #[serde(default)]
+        translations: Vec<ProcessImportTranslation>,
     },
     XmlExportRequest {
         definition_id: String,
@@ -2440,6 +2487,7 @@ mod tests {
             flow_id: Some("Flow_1".into()),
             node_id: Some("End_1".into()),
             reason: Some(ProcessEscalationPathReason::TerminalBeforeWait),
+            severity: None,
         };
         assert_eq!(
             crate::cbor::decode::<ProcessDiagnostic>(&crate::cbor::encode(&diagnostic).unwrap())
@@ -3371,6 +3419,68 @@ mod tests {
         assert_eq!(parse_tool_source_ref("agent:agent-1"), None);
         assert_eq!(agent.kind(), ServiceImplementationKind::Agent);
         assert_eq!(ServiceImplementationKind::Agent.as_str(), "agent");
+    }
+
+    #[test]
+    fn unbound_is_appended_by_name_and_resolves_no_reference() {
+        let unbound = ServiceImplementation::Unbound { origin: "class:a.B".into() };
+        assert_eq!(
+            serde_json::to_string(&unbound).unwrap(),
+            r#"{"Unbound":{"origin":"class:a.B"}}"#
+        );
+        assert_eq!(unbound.kind(), ServiceImplementationKind::Unbound);
+        assert_eq!(ServiceImplementationKind::Unbound.as_str(), "unbound");
+        assert_eq!(unbound.source_ref("ignored"), UNBOUND_SOURCE_REF);
+        assert_eq!(parse_tool_source_ref(UNBOUND_SOURCE_REF), None);
+        assert_eq!(parse_agent_source_ref(UNBOUND_SOURCE_REF), None);
+        assert_eq!(parse_block_source_ref(UNBOUND_SOURCE_REF), None);
+        // The default and every older variant keep their bytes.
+        assert_eq!(serde_json::to_string(&ServiceImplementation::Flow).unwrap(), r#""Flow""#);
+    }
+
+    #[test]
+    fn import_severity_and_translations_are_additive_on_the_wire() {
+        let graded = ProcessDiagnostic {
+            code: "CAMUNDA_ASYNC_IGNORED".into(),
+            message: "ignored".into(),
+            element_id: None,
+            offset: None,
+            fatal: false,
+            boundary_id: None,
+            flow_id: None,
+            node_id: None,
+            reason: None,
+            severity: Some(ProcessDiagnosticSeverity::Info),
+        };
+        assert!(serde_json::to_string(&graded).unwrap().ends_with(r#""severity":"info"}"#));
+        assert_eq!(
+            crate::cbor::decode::<ProcessDiagnostic>(&crate::cbor::encode(&graded).unwrap()).unwrap(),
+            graded
+        );
+        let old: ProcessPayload = serde_json::from_value(serde_json::json!(
+            {"XmlImportResponse": {"model": null, "diagnostics": []}}
+        ))
+        .unwrap();
+        assert!(matches!(
+            old,
+            ProcessPayload::XmlImportResponse { translations, .. } if translations.is_empty()
+        ));
+        let translation = ProcessImportTranslation {
+            element_id: "Flow_1".into(),
+            kind: "condition".into(),
+            original: "${a}".into(),
+            translated: "vars.a".into(),
+            warnings: vec!["EXPR_MISSING_VALUE".into()],
+        };
+        let response = ProcessPayload::XmlImportResponse {
+            model: None,
+            diagnostics: vec![graded],
+            translations: vec![translation],
+        };
+        assert_eq!(
+            crate::cbor::decode::<ProcessPayload>(&crate::cbor::encode(&response).unwrap()).unwrap(),
+            response
+        );
     }
 
     fn agent_service_implementation() -> ServiceImplementation {
