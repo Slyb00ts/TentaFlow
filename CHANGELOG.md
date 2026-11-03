@@ -259,6 +259,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   odrzucone; toast mówi, które pola pomijają. Po francusku cudzysłowy « » mają
   twarde spacje w całym pliku, a odmowa publikacji agenta używa półpauzy zamiast
   drugiego dwukropka we wszystkich językach.
+- Weryfikacja kroku zadania usługi (B3.5): obok „Warunku” i „Człowieka” krok może
+  mieć weryfikację „Test” (osobny przepływ sprawdzający wynik) albo „Krytyk”
+  (osobny agent z kryteriami, tylko narzędzia odczytu, które krok i tak ma
+  dozwolone). Odrzucenie kończy się błędem kroku (`VERIFICATION_FAILED`) albo
+  zadaniem dla człowieka (`on_failure`). Wynik testu lub krytyka jest drugim etapem
+  tego samego zadania; werdykt krytyka ma własny wiersz w
+  `bpmn_verification_completions` (migracja 204 i 205) i znaczniki
+  `tentaflow.verification:`, a historia dostaje zdarzenia `verification_passed` i
+  `verification_withdrawn`. Krok nie przechodzi do „Zakończony” bez dowodu swojego
+  weryfikatora: planista otwiera zadanie „niezweryfikowane” dla człowieka, a
+  cofnięte zatwierdzenie jest wyliczane w tej samej transakcji akceptacji.
+  Niedostępny weryfikator (`VERIFICATION_UNAVAILABLE`) i krytyk odmawiający pracy
+  (`VERIFICATION_AGENT_REFUSED`) mają osobne kody incydentów. Flow nie może być
+  własnym testem, a krytyk nie może być wykonawcą kroku. Projektant ma wybór flow
+  testowego i agenta-krytyka, kryteria liczone w bajtach, tabelę tras Test/Krytyk
+  z kodem odrzucenia, a odmowa publikacji wymienia każdy odrzucony weryfikator z
+  nazwą kroku. Teksty w pięciu językach. `SCHEMA_VERSION` nadal 32.
 - Paleta projektanta BPMN ma grupę „Bloki TentaFlow” (B3.3a): przepływy, bloki
   Flow Buildera (`llm`, `embeddings`, `pii_filter`) i narzędzia addonów
   upuszcza się na płótno jako gotowe zadania usługi, z nazwą pozycji i bez pytania
