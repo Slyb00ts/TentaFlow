@@ -1720,3 +1720,190 @@ fn nesting_just_under_the_cap_reaches_the_rewriter_and_the_strict_reader_without
         imported.diagnostics.first()
     );
 }
+
+// ----- hand-in of parent values, nested scopes, gateway race, depth, element variable -----
+
+#[test]
+fn a_synthesized_subprocess_hands_the_parent_value_in_and_copies_it_out_plainly() {
+    let imported = import_camunda_xml(&subprocess_process(
+        r#"<bpmn:scriptTask id="Inner_1" scriptFormat="juel" camunda:resultVariable="amount"><bpmn:script>${5}</bpmn:script></bpmn:scriptTask>"#,
+        r#"<bpmn:endEvent id="End_1"/><bpmn:sequenceFlow id="Flow_2" sourceRef="Sub_1" targetRef="End_1"/>"#,
+    ));
+    let model = assert_clean_import(&imported);
+    let ProcessNodeKind::SubProcess {
+        input_mapping,
+        output_mapping,
+        ..
+    } = &node(model, "Sub_1").kind
+    else {
+        panic!("subprocess expected");
+    };
+    assert_eq!(input_mapping["amount"], "vars.amount");
+    assert_eq!(output_mapping["amount"], "outputs.amount");
+}
+
+#[test]
+fn a_subprocess_writing_more_names_than_a_mapping_holds_is_fatal_and_named() {
+    let task = |id: &str, from: usize| {
+        let params: String = (from..from + 70)
+            .map(|i| format!(r#"<camunda:outputParameter name="v{i}">x</camunda:outputParameter>"#))
+            .collect();
+        format!(
+            r#"<bpmn:userTask id="{id}"><bpmn:extensionElements><camunda:inputOutput>{params}</camunda:inputOutput></bpmn:extensionElements></bpmn:userTask>"#
+        )
+    };
+    let xml = process(&format!(
+        r#"<bpmn:startEvent id="Start_1"/>
+        <bpmn:subProcess id="Sub_1">
+          <bpmn:startEvent id="SubStart_1"/>{}{}<bpmn:endEvent id="SubEnd_1"/>
+          <bpmn:sequenceFlow id="SF_1" sourceRef="SubStart_1" targetRef="A_1"/>
+          <bpmn:sequenceFlow id="SF_2" sourceRef="A_1" targetRef="B_1"/>
+          <bpmn:sequenceFlow id="SF_3" sourceRef="B_1" targetRef="SubEnd_1"/>
+        </bpmn:subProcess>
+        <bpmn:endEvent id="End_1"/>
+        <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="Sub_1"/>
+        <bpmn:sequenceFlow id="Flow_2" sourceRef="Sub_1" targetRef="End_1"/>"#,
+        task("A_1", 0),
+        task("B_1", 70)
+    ));
+    let imported = import_camunda_xml(&xml);
+    assert!(imported.model.is_none());
+    let fatal = only(&imported, "CAMUNDA_MODEL_INVALID");
+    assert_eq!(fatal.element_id.as_deref(), Some("Sub_1"));
+    assert!(fatal.message.contains("Sub_1") && fatal.message.contains("128"));
+}
+
+#[tokio::test]
+async fn the_body_reads_the_parent_value_until_it_overwrites_it_and_nested_scopes_copy_out() {
+    // `amount` is 500 before the subprocess. The body's gateway reads it, a step
+    // then sets it to 5, and a nested subprocess sets `deep`. The gateway after
+    // the subprocess sees the new `amount` and the nested `deep`.
+    let xml = process(
+        r#"<bpmn:startEvent id="Start_1"/>
+        <bpmn:scriptTask id="Seed_1" scriptFormat="juel" camunda:resultVariable="amount"><bpmn:script>${500}</bpmn:script></bpmn:scriptTask>
+        <bpmn:subProcess id="Sub_1">
+          <bpmn:startEvent id="SubStart_1"/>
+          <bpmn:exclusiveGateway id="Gate_1"/>
+          <bpmn:scriptTask id="Mark_1" scriptFormat="juel" camunda:resultVariable="sawOld"><bpmn:script>${true}</bpmn:script></bpmn:scriptTask>
+          <bpmn:scriptTask id="Set_1" scriptFormat="juel" camunda:resultVariable="amount"><bpmn:script>${5}</bpmn:script></bpmn:scriptTask>
+          <bpmn:scriptTask id="Low_1" scriptFormat="juel" camunda:resultVariable="sawLow"><bpmn:script>${true}</bpmn:script></bpmn:scriptTask>
+          <bpmn:exclusiveGateway id="GateJoin_1"/>
+          <bpmn:subProcess id="Sub_2">
+            <bpmn:startEvent id="InStart_1"/>
+            <bpmn:scriptTask id="Deep_1" scriptFormat="juel" camunda:resultVariable="deep"><bpmn:script>${'x'}</bpmn:script></bpmn:scriptTask>
+            <bpmn:endEvent id="InEnd_1"/>
+            <bpmn:sequenceFlow id="IF_1" sourceRef="InStart_1" targetRef="Deep_1"/>
+            <bpmn:sequenceFlow id="IF_2" sourceRef="Deep_1" targetRef="InEnd_1"/>
+          </bpmn:subProcess>
+          <bpmn:endEvent id="SubEnd_1"/>
+          <bpmn:sequenceFlow id="SF_0" sourceRef="SubStart_1" targetRef="Gate_1"/>
+          <bpmn:sequenceFlow id="SF_Hi" sourceRef="Gate_1" targetRef="Mark_1"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${amount &gt; 100}</bpmn:conditionExpression></bpmn:sequenceFlow>
+          <bpmn:sequenceFlow id="SF_Lo" sourceRef="Gate_1" targetRef="Low_1"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${amount &lt;= 100}</bpmn:conditionExpression></bpmn:sequenceFlow>
+          <bpmn:sequenceFlow id="SF_Mark" sourceRef="Mark_1" targetRef="Set_1"/>
+          <bpmn:sequenceFlow id="SF_J1" sourceRef="Set_1" targetRef="GateJoin_1"/>
+          <bpmn:sequenceFlow id="SF_J2" sourceRef="Low_1" targetRef="GateJoin_1"/>
+          <bpmn:sequenceFlow id="SF_Sub2" sourceRef="GateJoin_1" targetRef="Sub_2"/>
+          <bpmn:sequenceFlow id="SF_End" sourceRef="Sub_2" targetRef="SubEnd_1"/>
+        </bpmn:subProcess>
+        <bpmn:exclusiveGateway id="After_1"/>
+        <bpmn:scriptTask id="New_1" scriptFormat="juel" camunda:resultVariable="path"><bpmn:script>${'new'}</bpmn:script></bpmn:scriptTask>
+        <bpmn:scriptTask id="Old_1" scriptFormat="juel" camunda:resultVariable="path"><bpmn:script>${'old'}</bpmn:script></bpmn:scriptTask>
+        <bpmn:exclusiveGateway id="Join_1"/>
+        <bpmn:endEvent id="End_1"/>
+        <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="Seed_1"/>
+        <bpmn:sequenceFlow id="Flow_2" sourceRef="Seed_1" targetRef="Sub_1"/>
+        <bpmn:sequenceFlow id="Flow_3" sourceRef="Sub_1" targetRef="After_1"/>
+        <bpmn:sequenceFlow id="Flow_New" sourceRef="After_1" targetRef="New_1"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${amount &lt; 100 &amp;&amp; deep == 'x'}</bpmn:conditionExpression></bpmn:sequenceFlow>
+        <bpmn:sequenceFlow id="Flow_Old" sourceRef="After_1" targetRef="Old_1"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${amount &gt;= 100 || deep != 'x'}</bpmn:conditionExpression></bpmn:sequenceFlow>
+        <bpmn:sequenceFlow id="Flow_4" sourceRef="New_1" targetRef="Join_1"/>
+        <bpmn:sequenceFlow id="Flow_5" sourceRef="Old_1" targetRef="Join_1"/>
+        <bpmn:sequenceFlow id="Flow_6" sourceRef="Join_1" targetRef="End_1"/>"#,
+    );
+    let imported = import_camunda_xml(&xml);
+    let model = assert_clean_import(&imported);
+    let fixture = Fixture::new();
+    let done = start_model(&fixture, model);
+    assert_eq!(
+        done.status,
+        tentaflow_protocol::processes::ProcessInstanceStatus::Completed,
+        "{done:#?}"
+    );
+    // The gateway inside the body read the parent's 500, not a shadowing null.
+    assert_eq!(done.variables["sawOld"], true);
+    assert_eq!(done.variables["sawLow"], serde_json::Value::Null);
+    assert_eq!(done.variables["amount"], 5);
+    assert_eq!(done.variables["deep"], "x");
+    assert_eq!(done.variables["path"], "new");
+}
+
+#[test]
+fn a_gateway_race_counts_an_unconditional_non_default_flow() {
+    let imported = import_camunda_xml(&gateway(&formal("", "${a > 1}"), ""));
+    let warning = only(&imported, "CAMUNDA_GATEWAY_EVAL_SEMANTICS");
+    assert_eq!(warning.element_id.as_deref(), Some("Split_1"));
+    // The default flow stays out of the count.
+    let with_default = gateway(&formal("", "${a > 1}"), "").replace(
+        "<bpmn:exclusiveGateway id=\"Split_1\"/>",
+        "<bpmn:exclusiveGateway id=\"Split_1\" default=\"Flow_B\"/>",
+    );
+    assert!(diagnostics(
+        &import_camunda_xml(&with_default),
+        "CAMUNDA_GATEWAY_EVAL_SEMANTICS"
+    )
+    .is_empty());
+}
+
+#[test]
+fn deeply_nested_documents_are_refused_on_the_strict_path_without_a_stack_overflow() {
+    for depth in [70usize, 200, 25_000] {
+        let xml = format!(
+            "{HEAD}{}{}</bpmn:definitions>",
+            "<bpmn:x>".repeat(depth),
+            "</bpmn:x>".repeat(depth)
+        );
+        let (model, diagnostics) = import_xml(&xml);
+        assert!(model.is_none() && diagnostics[0].fatal, "{depth}");
+        assert!(
+            diagnostics[0].message.contains("nesting"),
+            "{depth}: {}",
+            diagnostics[0].message
+        );
+        let tolerant = import_camunda_xml(&xml);
+        assert!(tolerant.model.is_none());
+    }
+}
+
+#[test]
+fn the_strict_path_survives_the_deepest_nesting_it_still_reads() {
+    let depth = 40;
+    let open: String = (0..depth)
+        .map(|i| format!("<bpmn:subProcess id=\"S{i}\">"))
+        .collect();
+    let close = "</bpmn:subProcess>".repeat(depth);
+    let xml = format!(
+        "{HEAD}<bpmn:process id=\"Process_1\">{open}<bpmn:startEvent id=\"Deep_1\"/>{close}</bpmn:process></bpmn:definitions>"
+    );
+    let (model, diagnostics) = import_xml(&xml);
+    assert!(model.is_none() && !diagnostics.is_empty());
+}
+
+#[test]
+fn the_element_variable_check_reads_identifiers_not_text() {
+    let activity = |collection: &str, variable: &str, parameter: &str| {
+        linear(&format!(
+            r#"<bpmn:userTask id="Task_1"><bpmn:extensionElements><camunda:inputOutput><camunda:outputParameter name="seen">{parameter}</camunda:outputParameter></camunda:inputOutput></bpmn:extensionElements><bpmn:multiInstanceLoopCharacteristics camunda:collection="{collection}" camunda:elementVariable="{variable}"/></bpmn:userTask>"#
+        ))
+    };
+    // The collection's own source is not a read of the element variable.
+    let own = import_camunda_xml(&activity("${lines}", "lines", "${total}"));
+    assert_clean_import(&own);
+    // Neither is a string literal nor a property name.
+    let literal = import_camunda_xml(&activity("${items}", "item", "${kind == 'item'}"));
+    assert_clean_import(&literal);
+    let property = import_camunda_xml(&activity("${items}", "item", "${order.item}"));
+    assert_clean_import(&property);
+    // A real read is.
+    let read = import_camunda_xml(&activity("${items}", "item", "${item.name}"));
+    assert!(read.model.is_none());
+    only(&read, "CAMUNDA_MULTI_INSTANCE_ELEMENT_VARIABLE");
+}

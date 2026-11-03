@@ -195,12 +195,15 @@ fn ns_text(result: ResolveResult<'_>) -> Result<String> {
     }
 }
 
-/// Deepest element nesting the tolerant reader accepts. Real BPMN stays far
-/// below it (definitions > process > three subprocess levels > task >
-/// extension > parameter); the cap keeps a hostile document from building a
-/// tree whose recursive drop or walk could exhaust a worker thread's stack.
-/// Measured: with ids on every level, a debug build on a 2 MiB test thread
-/// overflows at 58 nested subprocesses, so 64 was too generous.
+/// Deepest element nesting the readers accept. Real BPMN stays far below it
+/// (definitions > process > three subprocess levels > task > extension >
+/// parameter); the cap keeps a hostile document from building a tree whose
+/// recursive drop or walk could exhaust a worker thread's stack, and it is
+/// checked as an element opens, before the deep tree exists. The tolerant
+/// reader walks the tree more times and with larger frames, so its cap is
+/// lower: with ids on every level a debug build on a 2 MiB test thread
+/// overflowed at 58 nested subprocesses there.
+const MAX_STRICT_DEPTH: usize = 64;
 const MAX_TOLERANT_DEPTH: usize = 32;
 
 fn parse_tree(xml: &str) -> Result<Element> {
@@ -212,6 +215,7 @@ fn parse_tree(xml: &str) -> Result<Element> {
 /// judge instead of aborting the read, and nesting is bounded.
 fn parse_tree_with(xml: &str, tolerant: bool) -> Result<Element> {
     ensure!(xml.len() <= MAX_MODEL_BYTES, "BPMN XML exceeds 512 KiB");
+    let max_depth = if tolerant { MAX_TOLERANT_DEPTH } else { MAX_STRICT_DEPTH };
     let mut reader = NsReader::from_str(xml);
     reader.config_mut().trim_text(false);
     let mut stack: Vec<Element> = Vec::new();
@@ -330,8 +334,8 @@ fn parse_tree_with(xml: &str, tolerant: bool) -> Result<Element> {
                     offset,
                 };
                 ensure!(
-                    !tolerant || stack.len() < MAX_TOLERANT_DEPTH,
-                    "XML nesting deeper than {MAX_TOLERANT_DEPTH} levels at byte {offset}"
+                    stack.len() < max_depth,
+                    "XML nesting deeper than {max_depth} levels at byte {offset}"
                 );
                 if is_empty {
                     if let Some(parent) = stack.last_mut() {

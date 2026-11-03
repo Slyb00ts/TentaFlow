@@ -34,8 +34,10 @@ use super::{
     BPMN, BPMNDI, DC, DI, TF, XSI,
 };
 use crate::flow_engine::expr;
-use crate::processes::expression_translate::{translate, SourceLanguage, TranslationRefusal};
-use crate::processes::model::{valid_id, validate_interchange_model};
+use crate::processes::expression_translate::{
+    read_variables, translate, SourceLanguage, TranslationRefusal,
+};
+use crate::processes::model::{valid_id, validate_interchange_model, MAX_VARIABLE_KEYS};
 
 pub const CAMUNDA_NAMESPACE: &str = "http://camunda.org/schema/1.0/bpmn";
 const CEL_LANGUAGE: &str = "https://cel.dev/spec";
@@ -127,7 +129,7 @@ struct Importer<'a> {
     translations: Vec<ProcessImportTranslation>,
     repeats: Vec<RepeatPatch>,
     /// Expression texts read per element id, to find a name an activity uses.
-    sources: HashMap<String, Vec<String>>,
+    reads: HashMap<String, BTreeSet<String>>,
     /// Embedded subprocesses whose extension this importer wrote.
     synthesized_subprocesses: HashSet<String>,
     login_lookups: usize,
@@ -145,7 +147,7 @@ impl<'a> Importer<'a> {
             diagnostics: Vec::new(),
             translations: Vec::new(),
             repeats: Vec::new(),
-            sources: HashMap::new(),
+            reads: HashMap::new(),
             synthesized_subprocesses: HashSet::new(),
             login_lookups: 0,
             fatal: false,
@@ -246,22 +248,34 @@ impl<'a> Importer<'a> {
                 );
             }
         }
-        let mut uncertain = Vec::new();
+        let mut propagation = Propagation::default();
         propagate_subprocess_outputs(
             &mut model.nodes,
             &mut model.variables,
             &self.synthesized_subprocesses,
-            &mut uncertain,
+            &mut propagation,
         );
         for process in &mut model.additional_processes {
             propagate_subprocess_outputs(
                 &mut process.nodes,
                 &mut process.variables,
                 &self.synthesized_subprocesses,
-                &mut uncertain,
+                &mut propagation,
             );
         }
-        for id in uncertain {
+        for id in propagation.too_many {
+            self.push(
+                Severity::Fatal,
+                "CAMUNDA_MODEL_INVALID",
+                Some(id.clone()),
+                None,
+                format!(
+                    "subprocess {id} writes more variables than a TentaFlow subprocess can hand \
+                     in and out ({MAX_VARIABLE_KEYS} at most)"
+                ),
+            );
+        }
+        for id in propagation.uncertain {
             self.push(
                 Severity::Warning,
                 "CAMUNDA_SUBPROCESS_SCOPE",
@@ -392,11 +406,17 @@ impl<'a> Importer<'a> {
         language: SourceLanguage,
     ) -> Result<String, TranslationRefusal> {
         let element_id = owner.attr("id").unwrap_or_default().to_string();
-        self.sources
-            .entry(element_id.clone())
-            .or_default()
-            .push(source.to_string());
         let translation = translate(source, language)?;
+        // The collection expression is evaluated outside the repeated activity,
+        // so its own reads are not reads of the element variable.
+        if kind != "multi_instance_collection" {
+            if let Some(names) = read_variables(source, language) {
+                self.reads
+                    .entry(element_id.clone())
+                    .or_default()
+                    .extend(names);
+            }
+        }
         let mut codes = Vec::new();
         for warning in &translation.warnings {
             codes.push(warning.code.to_string());
@@ -520,18 +540,18 @@ impl<'a> Importer<'a> {
             .filter(|child| child.is(BPMN, "exclusiveGateway"))
         {
             let id = gateway.attr("id").unwrap_or_default();
-            let conditional = children
+            // An outgoing flow without a condition that is not the default
+            // evaluates as true in TentaFlow, so it takes part in the race too.
+            let default = gateway.attr("default");
+            let competing = children
                 .iter()
                 .filter(|flow| {
                     flow.is(BPMN, "sequenceFlow")
                         && flow.attr("sourceRef") == Some(id)
-                        && flow
-                            .children
-                            .iter()
-                            .any(|c| c.is(BPMN, "conditionExpression"))
+                        && flow.attr("id") != default
                 })
                 .count();
-            if conditional >= 2 {
+            if competing >= 2 {
                 let message = "TentaFlow raises an incident on the first condition evaluation \
                     error and when more than one condition is true, while Camunda takes the \
                     first true flow in document order; this gateway can behave differently"
@@ -1244,11 +1264,8 @@ impl<'a> Importer<'a> {
     fn uses_name(&self, node: &Element, name: &str) -> bool {
         let mut ids = Vec::new();
         collect_ids(node, &mut ids);
-        ids.iter().any(|id| {
-            self.sources
-                .get(id)
-                .is_some_and(|sources| sources.iter().any(|text| mentions_name(text, name)))
-        })
+        ids.iter()
+            .any(|id| self.reads.get(id).is_some_and(|names| names.contains(name)))
     }
 
     // ----- extension elements and attributes -----
@@ -2000,16 +2017,6 @@ fn collect_ids(element: &Element, ids: &mut Vec<String>) {
     }
 }
 
-/// Whether `name` occurs in `text` as a whole identifier.
-fn mentions_name(text: &str, name: &str) -> bool {
-    let is_part = |c: char| c.is_alphanumeric() || c == '_';
-    text.match_indices(name).any(|(at, _)| {
-        let before = text[..at].chars().next_back();
-        let after = text[at + name.len()..].chars().next();
-        !before.is_some_and(is_part) && !after.is_some_and(is_part)
-    })
-}
-
 /// Every variable name a node set declares or writes, at any depth.
 fn collect_names(
     nodes: &[ProcessNode],
@@ -2084,29 +2091,37 @@ fn vars_reference(name: &str) -> String {
     outputs_reference(name).replacen("outputs", "vars", 1)
 }
 
+/// What `propagate_subprocess_outputs` could not settle by itself.
+#[derive(Default)]
+struct Propagation {
+    /// Subprocesses holding steps whose real implementation is unknown.
+    uncertain: Vec<String>,
+    /// Subprocesses that would need more mapping keys than a model allows.
+    too_many: Vec<String>,
+}
+
 /// Camunda lets a variable set inside an embedded subprocess flow up the scope
-/// chain; TentaFlow keeps it local unless the subprocess maps it out. For every
-/// subprocess this importer created, each name written inside the body is
-/// declared on both sides and copied out, keeping the parent's value when the
-/// body never set one. Subprocesses that hold steps with an unknown real
-/// implementation are collected in `uncertain`.
+/// chain; TentaFlow keeps the body's variables local. For every subprocess this
+/// importer created, each name written inside the body is declared on both
+/// sides, handed in (`input_mapping`, so the body reads the parent's value
+/// until it overwrites it; a local null would shadow it) and copied out.
 fn propagate_subprocess_outputs(
     nodes: &mut [ProcessNode],
     variables: &mut BTreeMap<String, serde_json::Value>,
     synthesized: &HashSet<String>,
-    uncertain: &mut Vec<String>,
+    result: &mut Propagation,
 ) {
     for node in nodes.iter_mut() {
         let id = node.id.clone();
         let ProcessNodeKind::SubProcess {
             body,
+            input_mapping,
             output_mapping,
-            ..
         } = &mut node.kind
         else {
             continue;
         };
-        propagate_subprocess_outputs(&mut body.nodes, &mut body.variables, synthesized, uncertain);
+        propagate_subprocess_outputs(&mut body.nodes, &mut body.variables, synthesized, result);
         if !synthesized.contains(&id) {
             continue;
         }
@@ -2121,13 +2136,21 @@ fn propagate_subprocess_outputs(
             variables
                 .entry(name.clone())
                 .or_insert(serde_json::Value::Null);
-            let out = outputs_reference(&name);
+            input_mapping
+                .entry(name.clone())
+                .or_insert_with(|| vars_reference(&name));
             output_mapping
                 .entry(name.clone())
-                .or_insert_with(|| format!("{out} != null ? {out} : {}", vars_reference(&name)));
+                .or_insert_with(|| outputs_reference(&name));
+        }
+        if input_mapping.len() > MAX_VARIABLE_KEYS
+            || output_mapping.len() > MAX_VARIABLE_KEYS
+            || body.variables.len() > MAX_VARIABLE_KEYS
+        {
+            result.too_many.push(id.clone());
         }
         if holds_unknown_steps(&body.nodes) {
-            uncertain.push(id);
+            result.uncertain.push(id);
         }
     }
 }

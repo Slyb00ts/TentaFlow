@@ -239,6 +239,50 @@ pub fn translate(
     })
 }
 
+/// Names of the process variables an expression reads, as free identifiers:
+/// string literals and property names after `.` are not reads. `None` when the
+/// expression does not parse.
+pub(crate) fn read_variables(
+    source: &str,
+    language: SourceLanguage,
+) -> Option<std::collections::BTreeSet<String>> {
+    fn walk(expr: &Expr, names: &mut std::collections::BTreeSet<String>) {
+        match expr {
+            Expr::Var(name) | Expr::ContextVar(name) => {
+                names.insert(name.clone());
+            }
+            Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => {}
+            Expr::Member(inner, _) | Expr::Not(inner) | Expr::Neg(inner) | Expr::Empty(inner) => {
+                walk(inner, names)
+            }
+            Expr::Index(a, b) | Expr::Binary(_, a, b) => {
+                walk(a, names);
+                walk(b, names);
+            }
+            Expr::Ternary(a, b, c) => {
+                walk(a, names);
+                walk(b, names);
+                walk(c, names);
+            }
+            Expr::Range {
+                subject, lo, hi, ..
+            } => {
+                walk(subject, names);
+                walk(lo, names);
+                walk(hi, names);
+            }
+            Expr::InList(subject, items) => {
+                walk(subject, names);
+                items.iter().for_each(|item| walk(item, names));
+            }
+        }
+    }
+    let parsed = parse(source, language).ok()?;
+    let mut names = std::collections::BTreeSet::new();
+    walk(&parsed.expr, &mut names);
+    Some(names)
+}
+
 pub(crate) fn parse(source: &str, language: SourceLanguage) -> Result<Parsed, TranslationRefusal> {
     if source.chars().count() > MAX_EXPR_CHARS {
         return refuse(
