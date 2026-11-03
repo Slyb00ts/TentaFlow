@@ -714,6 +714,14 @@ export class FlowConfig {
     this.root.querySelector('[data-process="repeatOutput"]')?.focus();
   }
 
+  // What the import said about this element and the author has not yet settled; the way out is a review, which only the author can give.
+  _attentionHtml(node) {
+    const notes = this.opts.getAttentionNotes?.(node.id) ?? [];
+    if (!notes.length) return '';
+    return `<div class="fb-import-notes" data-import-attention>${notes.map((text) => `<tf-alert tone="warning" message="${escapeAttr(text)}"></tf-alert>`).join('')}
+      ${this.readOnly ? '' : `<tf-button variant="secondary" size="sm" icon="check" data-attention-dismiss>${escapeHtml(I18n.t('bpmn.attention_dismiss'))}</tf-button>`}</div>`;
+  }
+
   _renderProcess() {
     const node = this.node;
     const kind = processNodeKind(node.type);
@@ -766,6 +774,7 @@ export class FlowConfig {
       const tool = config.implementation?.AddonTool;
       const blockTask = config.implementation?.Block;
       const agentTask = config.implementation?.Agent;
+      const unboundTask = config.implementation?.Unbound;
       const agents = processSortedAgents(this.opts.processOptions.serviceAgents);
       const agentLabels = processDistinctLabels(agents.map((agent) => [agent.agentId, agent.name]));
       const listedAgent = agentTask && agents.find((agent) => agent.agentId === agentTask.agentId);
@@ -788,6 +797,7 @@ export class FlowConfig {
         : tool
         ? `${input('addonId', 'tool_addon_id', tool.addonId)}${input('toolName', 'tool_name', tool.toolName)}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.tool_hint'))}</p>`
+        : unboundTask ? ''
         : `<tf-select data-process="flowId" wrap-selected label="${escapeAttr(I18n.t('bpmn.service_flow'))}" value="${escapeAttr(config.flowId)}" ${disabled}>${options}${unavailable ? `<option value="${escapeAttr(config.flowId)}" disabled>${escapeHtml(I18n.t('bpmn.flow_unavailable'))}</option>` : ''}</tf-select>`;
       const verificationMode = processVerificationMode(config.verification);
       const testVerification = config.verification?.Test;
@@ -815,7 +825,8 @@ export class FlowConfig {
       if (!tabs.some(([id]) => id === this.processTab)) this.processTab = 'impl';
       const panel = servicePanel = (id, html) => `<section class="fb-process-panel" role="tabpanel" id="svc-panel-${id}" aria-labelledby="${id}" data-service-panel="${id}" ${this.processTab === id ? '' : 'hidden'}>${html}</section>`;
       servicePanels = `<tf-tabs variant="bar" layout="stacked" value="${this.processTab}" data-service-tabs>${tabs.map(([id, label, icon]) => `<tf-tab id="${id}" icon="${icon}" panel="svc-panel-${id}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" title="${escapeAttr(I18n.t(`bpmn.${label}_title`))}"></tf-tab>`).join('')}</tf-tabs>`
-        + panel('impl', `${blockTask ? `<tf-alert tone="warning" data-service-warning="empty_setting" message="${escapeAttr(processWarningText(node, 'empty_setting', blocks))}" ${processNodeWarnings(node, blocks).includes('empty_setting') ? '' : 'hidden'}></tf-alert>` : ''}<tf-select data-process="implementation" label="${escapeAttr(I18n.t('bpmn.service_implementation'))}" value="${agentTask ? 'agent' : blockTask ? 'block' : tool ? 'tool' : 'flow'}" ${disabled}>
+        + panel('impl', `${blockTask ? `<tf-alert tone="warning" data-service-warning="empty_setting" message="${escapeAttr(processWarningText(node, 'empty_setting', blocks))}" ${processNodeWarnings(node, blocks).includes('empty_setting') ? '' : 'hidden'}></tf-alert>` : ''}${unboundTask ? `<tf-alert tone="warning" data-unbound-notice message="${escapeAttr(I18n.t('bpmn.unbound_notice', { origin: unboundTask.origin }))}"></tf-alert>` : ''}<tf-select data-process="implementation" label="${escapeAttr(I18n.t('bpmn.service_implementation'))}" value="${agentTask ? 'agent' : blockTask ? 'block' : tool ? 'tool' : unboundTask ? '' : 'flow'}" ${disabled}>
+          ${unboundTask ? `<option value="" disabled>${escapeHtml(I18n.t('bpmn.implementation_choose'))}</option>` : ''}
           <option value="flow">${escapeHtml(I18n.t('bpmn.implementation_flow'))}</option>
           <option value="tool">${escapeHtml(I18n.t('bpmn.implementation_tool'))}</option>
           ${blocks.length || blockTask ? `<option value="block">${escapeHtml(I18n.t('bpmn.implementation_block'))}</option>` : ''}
@@ -1037,13 +1048,16 @@ export class FlowConfig {
       ? `${servicePanels}${servicePanel('advanced', repeatHtml + elementIdHtml)}${sequenceHtml}`
       : `${repeatHtml}${sequenceHtml}${elementIdHtml}`;
     this.root.innerHTML = `<div class="fb-config-header"><div class="fb-config-title-wrap"><div class="fb-config-title">${escapeHtml(getNodeDisplayTitle(node, this.template))}</div><div class="fb-config-subtitle">${escapeHtml(getNodeName(node.type))}</div></div></div>
-      <div class="fb-config-body fb-process-fields">${fields}<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.mapping_hint'))}</p></div>
+      <div class="fb-config-body fb-process-fields">${this._attentionHtml(node)}${fields}<p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.mapping_hint'))}</p></div>
       ${this.readOnly ? '' : `<footer class="fb-config-footer"><tf-button variant="secondary" icon="copy" data-process="duplicate">${escapeHtml(I18n.t('flows_config.duplicate'))}</tf-button><tf-button variant="danger" icon="trash" data-process="delete">${escapeHtml(I18n.t('flows_config.delete'))}</tf-button></footer>`}`;
     const repeatModeChoice = this.root.querySelector('[data-process="repeatMode"]');
     if (repeatModeChoice) repeatModeChoice.setOptions(['off', 'mi_sequential', 'mi_parallel', 'loop'].map((value) => ({
       value, label: I18n.t(`bpmn.repeat_${value}`),
     })), repeatModeChoice.getAttribute('value'));
     this.root.querySelectorAll('tf-keyvalue-editor').forEach((editor) => { editor.value = config[editor.dataset.process]; });
+    this.root.querySelector('[data-attention-dismiss]')?.addEventListener('click', () => {
+      if (!this.readOnly) this.opts.onAttentionDismiss?.(node.id);
+    });
     this._bindActivityIo(node);
     if (serviceRouting) this._bindServiceTabs(node);
     this.root.querySelector('[data-process-enter]')?.addEventListener('click', () => this.opts.onEnterProcess?.(node.id));

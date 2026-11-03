@@ -299,9 +299,11 @@ export function processNodeConfig(kind) {
 }
 
 // Which implementation a Service task runs; a task without the field is a flow.
+// 'unbound' is the placeholder an import leaves for a foreign engine's step.
 export function processServiceKind(config) {
   const implementation = config?.implementation;
-  return implementation?.Block ? 'block' : implementation?.AddonTool ? 'tool' : implementation?.Agent ? 'agent' : 'flow';
+  return implementation?.Block ? 'block' : implementation?.AddonTool ? 'tool' : implementation?.Agent ? 'agent'
+    : implementation?.Unbound ? 'unbound' : 'flow';
 }
 
 // The settings the server lists as required that a block task has left empty.
@@ -323,6 +325,7 @@ export function processMissingSettings(node, blocks = []) {
 export function processNodeWarnings(node, blocks = []) {
   const warnings = [];
   if (processMissingSettings(node, blocks).length) warnings.push('empty_setting');
+  if (node.type === 'bpmn_service_task' && processServiceKind(node.config) === 'unbound') warnings.push('unbound');
   if (processBoundaryKind(node.type) && !node.config?.attachedToId) warnings.push('boundary_unattached');
   if (node.type === 'bpmn_script_task' && node.repeat
     && (node.activityIo?.dataOutputs?.length || node.activityIo?.outputAssociations?.length)) warnings.push('repeated_script_io');
@@ -334,7 +337,8 @@ export function processNodeWarnings(node, blocks = []) {
 }
 
 export function processWarningText(node, key, blocks = []) {
-  return I18n.t(`bpmn.warning_${key}`, { names: processMissingSettings(node, blocks).join(', ') });
+  return I18n.t(`bpmn.warning_${key}`, { names: processMissingSettings(node, blocks).join(', '),
+    origin: node.config?.implementation?.Unbound?.origin ?? '' });
 }
 
 // Name of an error or escalation handler added from the result tab: the code it
@@ -583,7 +587,172 @@ export function processPublishProblems(model) {
   return [
     ...processUnusedDeclarations(model).map(({ kind, name }) => I18n.t(`bpmn.unused_${kind}`, { name })),
     ...processRepeatOutputGaps(model).map(({ name }) => I18n.t('bpmn.repeat_output_missing', { node: name })),
+    ...processUnboundSteps(model).map(({ name }) => I18n.t('bpmn.unbound_publish_refused', { node: name })),
   ];
+}
+
+// Every node of every body in document order, a sub-process' own nodes right
+// after it. `path` is the chain of sub-process ids that leads to the node's body.
+function processWalk(model) {
+  const found = [];
+  const visit = (body, processId, path) => {
+    for (const node of body?.nodes || []) {
+      found.push({ node, processId, path });
+      if (node.kind?.SubProcess) visit(node.kind.SubProcess.body, processId, [...path, node.id]);
+    }
+  };
+  visit(model, model?.processId, []);
+  for (const extra of model?.additionalProcesses || []) visit(extra, extra.processId, []);
+  return found;
+}
+
+// The Service tasks an import left without an implementation. Publishing
+// refuses them; the author is told which, by name.
+export function processUnboundSteps(model) {
+  const labels = processDistinctLabels([...processElementNames(model)]);
+  return processWalk(model)
+    .filter(({ node }) => node.kind?.ServiceTask?.implementation?.Unbound)
+    .map(({ node, processId, path }) => ({ nodeId: node.id, name: labels.get(node.id) ?? node.id, processId, path,
+      origin: node.kind.ServiceTask.implementation.Unbound.origin }));
+}
+
+/**
+ * Where an element id of an import diagnostic lives: the node itself, or the
+ * source of a sequence flow (a condition belongs to the step it leaves).
+ * Null when the model has no such element, for instance a fatal import.
+ */
+export function processElementNode(model, elementId) {
+  if (!model || elementId == null) return null;
+  const nodes = processWalk(model);
+  const own = nodes.find(({ node }) => node.id === elementId);
+  if (own) return { nodeId: own.node.id, processId: own.processId, path: own.path, flow: false };
+  const bodies = [];
+  const collect = (body, processId, path) => {
+    bodies.push({ body, processId, path });
+    for (const node of body?.nodes || []) if (node.kind?.SubProcess) collect(node.kind.SubProcess.body, processId, [...path, node.id]);
+  };
+  collect(model, model.processId, []);
+  for (const extra of model.additionalProcesses || []) collect(extra, extra.processId, []);
+  for (const { body, processId, path } of bodies) {
+    const flow = (body.sequenceFlows || []).find((candidate) => candidate.id === elementId);
+    if (flow) return { nodeId: flow.sourceId, processId, path, flow: true };
+  }
+  return null;
+}
+
+export const PROCESS_SEVERITIES = ['fatal', 'warning', 'info'];
+
+// A diagnostic from the strict importer carries no severity: it is fatal, which
+// the flag says. A fatal flag always wins, so a refusal is never shown as a note.
+export function processDiagnosticSeverity(diagnostic) {
+  if (diagnostic?.fatal) return 'fatal';
+  const severity = String(diagnostic?.severity ?? '').toLowerCase();
+  return PROCESS_SEVERITIES.includes(severity) ? severity : 'warning';
+}
+
+export function processImportCounts(response) {
+  const counts = { fatal: 0, warning: 0, info: 0, translations: (response?.translations || []).length };
+  for (const diagnostic of response?.diagnostics || []) counts[processDiagnosticSeverity(diagnostic)] += 1;
+  return counts;
+}
+
+// The model is only ever loaded when the server sent one and nothing in the
+// import is fatal.
+export function processImportLoadable(response) {
+  return !!response?.model && processImportCounts(response).fatal === 0;
+}
+
+// A clean strict import goes straight into the editor; anything else is read first.
+export function processImportNeedsReview(response) {
+  return !!(response?.diagnostics?.length || response?.translations?.length || !response?.model);
+}
+
+export function processImportSummaryText(counts) {
+  const parts = [...PROCESS_SEVERITIES.filter((severity) => counts[severity] > 0)
+    .map((severity) => I18n.t(`bpmn.import_count_${severity}`, { count: counts[severity] })),
+  ...(counts.translations > 0 ? [I18n.t('bpmn.import_count_translation', { count: counts.translations })] : [])];
+  return parts.length ? I18n.t('bpmn.import_summary', { parts: parts.join(', ') }) : I18n.t('bpmn.import_summary_empty');
+}
+
+// The words an author reads for a code; the server's own text for any code
+// that has no translation here.
+export function processDiagnosticText(diagnostic) {
+  const key = `bpmn.diag_${diagnostic.code}`;
+  const text = I18n.t(key);
+  return text === key ? String(diagnostic.message ?? '') : text;
+}
+
+function processImportElement(model, names, elementId) {
+  if (elementId == null || elementId === '') return { element: '', nodeId: null };
+  const where = processElementNode(model, elementId);
+  const named = where && !where.flow ? names.get(where.nodeId) : null;
+  return { element: named && named !== elementId ? `${named} (${elementId})` : String(elementId), nodeId: where?.nodeId ?? null };
+}
+
+/**
+ * The diagnostics of an import by severity, fatal first, each group in the
+ * order of the document (a diagnostic without a position last). A row names its
+ * element as "name (id)" when the model has one and carries `nodeId` for the
+ * jump to the canvas.
+ */
+export function processImportGroups(diagnostics, model = null) {
+  const names = model ? processElementNames(model) : new Map();
+  const rows = (diagnostics || []).map((diagnostic, order) => ({
+    severity: processDiagnosticSeverity(diagnostic), code: diagnostic.code, order,
+    offset: diagnostic.offset ?? null, text: processDiagnosticText(diagnostic),
+    detail: String(diagnostic.message ?? ''), elementId: diagnostic.elementId ?? null,
+    ...processImportElement(model, names, diagnostic.elementId),
+  }));
+  return PROCESS_SEVERITIES.map((severity) => ({ severity, rows: rows.filter((row) => row.severity === severity)
+    .sort((a, b) => (a.offset ?? Infinity) - (b.offset ?? Infinity) || a.order - b.order) }))
+    .filter((group) => group.rows.length);
+}
+
+// The "before -> after" lines of an import, in the order the server lists them.
+export function processImportTranslations(translations, model = null) {
+  const names = model ? processElementNames(model) : new Map();
+  return (translations || []).map((translation) => {
+    const kindKey = `bpmn.translation_kind_${translation.kind}`;
+    const kindLabel = I18n.t(kindKey);
+    return { elementId: translation.elementId, original: translation.original, translated: translation.translated,
+      kind: translation.kind, kindLabel: kindLabel === kindKey ? String(translation.kind) : kindLabel,
+      warnings: (translation.warnings || []).map((code) => ({ code, text: processDiagnosticText({ code, message: code }) })),
+      ...processImportElement(model, names, translation.elementId) };
+  });
+}
+
+// The nodes of an imported model whose diagnostics were warnings: they lost
+// some meaning and a person has to look at them.
+export function processImportFlagged(model, diagnostics) {
+  const flagged = new Set();
+  for (const diagnostic of diagnostics || []) {
+    if (processDiagnosticSeverity(diagnostic) !== 'warning') continue;
+    const where = processElementNode(model, diagnostic.elementId);
+    if (where) flagged.add(where.nodeId);
+  }
+  return flagged;
+}
+
+/**
+ * The elements that need the author, in document order: a Service task that is
+ * still unbound (resolved only by choosing an implementation) and a flagged
+ * element not yet reviewed (`flagged` holds only the ones still open).
+ */
+export function processAttentionTargets(model, flagged = new Set()) {
+  if (!model) return [];
+  return processWalk(model).flatMap(({ node, processId, path }) => {
+    const reasons = [...(node.kind?.ServiceTask?.implementation?.Unbound ? ['unbound'] : []),
+      ...(flagged.has(node.id) ? ['warning'] : [])];
+    return reasons.length ? [{ nodeId: node.id, processId, path, reasons }] : [];
+  });
+}
+
+// The target after the selected element, wrapping; the first one when the
+// selection is not on the list.
+export function processNextAttention(targets, selectedNodeId) {
+  if (!targets.length) return null;
+  const index = targets.findIndex((target) => target.nodeId === selectedNodeId);
+  return targets[(index + 1) % targets.length];
 }
 
 // Names that tell two entries apart without showing an internal id: a name two
@@ -719,6 +888,8 @@ export function processExplainError(message, model, options = null) {
     return named.length ? named.map(({ kind, name }) => I18n.t(`bpmn.unused_${kind}`, { name })).join(' ')
       : I18n.t(`bpmn.unused_${unused[1]}_any`);
   }
+  const unbound = /UNBOUND_IMPLEMENTATION: service task ([\w.-]+) has no implementation/.exec(text);
+  if (unbound && names.has(unbound[1])) return I18n.t('bpmn.unbound_publish_refused', { node: names.get(unbound[1]) });
   const timeout = /service task ([\w.-]+) timeout is outside 1\.\.=(\d+) seconds/.exec(text);
   if (timeout && names.has(timeout[1])) return I18n.t('bpmn.timeout_out_of_range', { node: names.get(timeout[1]), max: Number(timeout[2]) });
   // A publication names every refused step, one per line; two steps of one name carry their occurrence number.

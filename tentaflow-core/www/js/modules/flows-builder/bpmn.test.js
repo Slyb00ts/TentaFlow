@@ -28,7 +28,7 @@ const { processAgentIterationLimit, processAgentPreset, emptyProcessModel, proce
 const { FlowCanvas, UNATTACHED_TAG } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
-const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processRowFor, processRoutingTextKeys, processEscalationPathProblem, processExplainError, processMissingSettings, processNodeWarnings, processServiceKind, processBlockTemplate, processStartEntryLabels, processTimezoneProblem, processPublishProblems, processNodeLabels, processTimezoneGaps, processTimezoneText, processTimezoneCanonical, processRepeatedElements, processBoundaryRefusals, processBoundaryHosts, processRepeatOutputGaps, processPlainError } = await import('./bpmn.js');
+const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processRowFor, processRoutingTextKeys, processEscalationPathProblem, processExplainError, processMissingSettings, processNodeWarnings, processServiceKind, processBlockTemplate, processStartEntryLabels, processTimezoneProblem, processPublishProblems, processNodeLabels, processTimezoneGaps, processTimezoneText, processTimezoneCanonical, processRepeatedElements, processBoundaryRefusals, processBoundaryHosts, processRepeatOutputGaps, processPlainError, processDiagnosticSeverity, processImportGroups, processImportCounts, processImportLoadable, processImportNeedsReview, processImportTranslations, processAttentionTargets, processNextAttention, processImportFlagged } = await import('./bpmn.js');
 const { openProcessCalendar, openProcessInstance, openProcessInstances, openProcessMessageDetail, openProcessMessageSend, openProcessRun, openProcessSchedule, processEventText, processLifecycleReasonText, processTimerText } = await import('./process-monitor.js');
 const { simulationWindow, openProcessSimulation } = await import('./process-simulation.js');
 const { default: builder } = await import('../flows-builder.js');
@@ -124,6 +124,44 @@ function inspector(graph, readOnly = false) {
     onConfigChange: (id, value) => graph.updateNodeConfig(id, value), onEdgeChange: (id, value) => graph.updateEdge(id, value),
     onLabelChange: (id, value) => graph.updateNodeLabel(id, value), onDelete: (id) => graph.removeNodes([id]), onDuplicate: (id) => graph.duplicateNodes([id]) });
 }
+// A window that is closing is still in the document for its fade-out; it no longer counts.
+const reviewWindow = () => [...document.querySelectorAll('tf-window .fb-import-review')].map((element) => element.closest('tf-window')).find((win) => !win._closing);
+async function runImport(response, { current = definition(), additions = {} } = {}) {
+  // A draft left dirty is saved when the next test unmounts the editor.
+  const state = await mount(current, { processXmlImportRequest: response, processDefinitionSaveRequest: (payload) => ({ definition: definition(current.definitionId, { model: payload.model, draftRevision: 5 }) }), ...additions });
+  builder._importProcess(); await flush();
+  const form = document.querySelector('.tf-act-window'); const editor = form.querySelector('tf-code-editor');
+  editor.value = '<bpmn:definitions xmlns:camunda="http://camunda.org/schema/1.0/bpmn"/>'; editor.dispatchEvent(new Event('input', { bubbles: true }));
+  click(form.querySelector('[data-act="submit"]')); await flush();
+  return state;
+}
+function camundaModel() {
+  const model = emptyProcessModel();
+  model.nodes.splice(1, 0,
+    { id: 'Task_Bean', name: 'Charge card', kind: { ServiceTask: { flowId: '', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60, implementation: { Unbound: { origin: 'delegateExpression:${bean}' } } } } },
+    { id: 'Gate', name: 'Big order?', kind: { ExclusiveGateway: { defaultFlowId: 'Flow_small' } } },
+    { id: 'Review', name: 'Review order', kind: { UserTask: { assigneeUserId: null, outputMapping: {} } } },
+    { id: 'Task_Second', name: 'Notify', kind: { ServiceTask: { flowId: '', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60, implementation: { Unbound: { origin: 'class:a.Notify' } } } } });
+  model.sequenceFlows = [
+    { id: 'Flow_a', sourceId: 'Start', targetId: 'Task_Bean', condition: null },
+    { id: 'Flow_b', sourceId: 'Task_Bean', targetId: 'Gate', condition: null },
+    { id: 'Flow_big', sourceId: 'Gate', targetId: 'Review', condition: 'vars.amount > 100' },
+    { id: 'Flow_small', sourceId: 'Gate', targetId: 'Task_Second', condition: null },
+    { id: 'Flow_c', sourceId: 'Review', targetId: 'End', condition: null },
+    { id: 'Flow_d', sourceId: 'Task_Second', targetId: 'End', condition: null }];
+  const at = (id, x, y, size = [240, 96]) => ({ elementId: id, x, y, width: size[0], height: size[1] });
+  model.diagram = { shapes: [at('Start', 40, 160, [56, 56]), at('Task_Bean', 140, 140), at('Gate', 420, 150, [72, 72]), at('Review', 560, 60),
+    at('Task_Second', 560, 260), at('End', 860, 160, [56, 56])], edges: model.sequenceFlows.map((flow) => ({ sequenceFlowId: flow.id, waypoints: [] })) };
+  return model;
+}
+const camundaResponse = (overrides = {}) => ({ model: camundaModel(), diagnostics: [
+  { code: 'CAMUNDA_SERVICE_UNBOUND', message: 'delegateExpression has no counterpart', elementId: 'Task_Bean', offset: 300, fatal: false, severity: 'warning' },
+  { code: 'CAMUNDA_GATEWAY_EVAL_SEMANTICS', message: 'gateway may behave differently', elementId: 'Gate', offset: 500, fatal: false, severity: 'warning' },
+  { code: 'CAMUNDA_ASSIGNEE_UNRESOLVED', message: 'assignee jan is not a user', elementId: 'Review', offset: 700, fatal: false, severity: 'warning' },
+  { code: 'CAMUNDA_ASYNC_IGNORED', message: 'job settings do not apply', elementId: 'Task_Bean', offset: 310, fatal: false, severity: 'info' }],
+translations: [{ elementId: 'Flow_big', kind: 'condition', original: '${amount > 100}', translated: 'vars.amount > 100', warnings: ['EXPR_MISSING_VALUE'] }], ...overrides });
+const attentionBanner = () => document.querySelector('[data-role="attention"]');
+
 function userNode(graph) { graph.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_user_task'), 250, 300); return graph.nodes.at(-1); }
 function boundaryModel() {
   const model = emptyProcessModel();
@@ -4717,7 +4755,11 @@ test('XML import uses actual diagnostics and rejects unsupported input without r
   const before = state.canvas.getData(); builder._importProcess(); await flush();
   const form = document.querySelector('tf-window'); const editor = form.querySelector('tf-code-editor'); editor.value = '<unsupported />'; editor.dispatchEvent(new Event('input', { bubbles: true }));
   click(form.querySelector('[data-act="submit"]')); await flush();
-  assert.deepEqual(state.canvas.getData(), before); assert.match(form.querySelector('.tf-act__error').getAttribute('message'), /Loop/);
+  const review = reviewWindow();
+  assert.deepEqual(state.canvas.getData(), before); assert.match(review.textContent, /Nothing was imported/);
+  const rows = review.querySelector('section[data-severity="fatal"] tf-table').rows;
+  assert.equal(rows.length, 1); assert.match(rows[0].message, /Loop is unsupported/);
+  assert.equal(review.querySelector('[data-act="import"]'), null, 'a fatal import offers no way to load anything');
   assert.equal(calls.some((row) => row.kind === 'processDefinitionSaveRequest'), false);
 });
 
@@ -8493,4 +8535,212 @@ test('the save banner follows the model: it goes away with its cause and is rewr
   assert.equal(banner.hidden, true);
   assert.equal(state.saveProblem, false);
   assert.equal(state.root.querySelector('[data-role="autosave-text"]').textContent, I18n.t('flows_builder.autosave_pending'));
+});
+
+// ----- B3.6b: the Camunda import window, unbound steps and the attention banner -----
+
+test('an unbound service task is its own kind, is marked on the canvas and is never offered as a choice', async () => {
+  const task = { id: 'Task_Bean', name: 'Charge card', kind: { ServiceTask: { flowId: '', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60, implementation: { Unbound: { origin: 'class:a.B' } } } } };
+  assert.equal(processServiceKind(task.kind.ServiceTask), 'unbound');
+  assert.equal(processServiceKind({ implementation: { Agent: {} } }), 'agent');
+  assert.equal(processServiceKind({}), 'flow');
+  assert.deepEqual(processNodeWarnings({ type: 'bpmn_service_task', config: task.kind.ServiceTask }), ['unbound']);
+  assert.deepEqual(processNodeWarnings({ type: 'bpmn_service_task', config: { flowId: 'f' } }), []);
+  const model = emptyProcessModel(); model.nodes.splice(1, 0, task);
+  const graph = canvas(model);
+  const element = graph.nodesLayer.querySelector('[data-node-id="Task_Bean"]');
+  assert.ok(element.classList.contains('fb-needs-attention'));
+  assert.match(element.querySelector('.fb-process-warn').getAttribute('aria-label'), /Not bound yet.*class:a\.B/);
+  assert.equal(element.querySelector('.fb-process-kind').dataset.kind, 'unbound');
+  const config = inspector(graph); config.show(graph.nodes.find((node) => node.id === 'Task_Bean'));
+  assert.match(config.root.querySelector('[data-unbound-notice]').getAttribute('message'), /Not bound yet — imported from Camunda: class:a\.B/);
+  const picker = config.root.querySelector('[data-process="implementation"]');
+  assert.deepEqual([...picker.querySelectorAll('option')].filter((option) => !option.disabled).map((option) => option.value), ['flow', 'tool', 'block', 'agent']);
+  assert.equal(processTemplates({}).some((row) => JSON.stringify(row).includes('Unbound')), false, 'the palette never offers a placeholder');
+});
+
+test('choosing an implementation replaces the unbound one through the existing per-kind fields', async () => {
+  for (const [choice, expected] of [['tool', 'AddonTool'], ['block', 'Block'], ['agent', 'Agent'], ['flow', undefined]]) {
+    const model = emptyProcessModel();
+    model.nodes.splice(1, 0, { id: 'Task_Bean', name: 'Charge card', kind: { ServiceTask: { flowId: '', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60, implementation: { Unbound: { origin: 'class:a.B' } } } } });
+    const graph = canvas(model); const config = inspector(graph);
+    config.show(graph.nodes.find((node) => node.id === 'Task_Bean')); await flush(2);
+    change(config.root.querySelector('[data-process="implementation"]'), choice);
+    const implementation = graph.nodes.find((node) => node.id === 'Task_Bean').config.implementation;
+    assert.equal(implementation?.Unbound, undefined, `${choice} replaces the placeholder`);
+    assert.equal(typeof implementation === 'string' ? implementation : Object.keys(implementation)[0], expected ?? 'Flow');
+    assert.equal(graph.nodesLayer.querySelector('[data-node-id="Task_Bean"]').classList.contains('fb-needs-attention'), false);
+  }
+});
+
+test('an unbound step survives the codec in both directions and is refused by name on publication', async () => {
+  const model = emptyProcessModel();
+  model.nodes.splice(1, 0, { id: 'Task_Bean', name: 'Charge card', kind: { ServiceTask: { flowId: '', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60, implementation: { Unbound: { origin: 'external:topic-1' } } } } });
+  const envelope = wasm.decodeEnvelope(encode.processDefinitionSaveRequest(3, { commandId: 'c', definitionId: null, expectedRevision: 0, name: 'x', description: '', model }));
+  const saved = wasm.decodeMessageBody(envelope.body); envelope.free();
+  assert.deepEqual(saved.model.nodes[1].kind.ServiceTask.implementation, { Unbound: { origin: 'external:topic-1' } });
+  assert.deepEqual(processPublishProblems(saved.model), [I18n.t('bpmn.unbound_publish_refused', { node: 'Charge card' })]);
+  assert.match(processPublishProblems(saved.model)[0], /“Charge card” is not bound to an implementation/);
+  const server = 'UNBOUND_IMPLEMENTATION: service task Task_Bean has no implementation yet (imported as external:topic-1); choose a flow, tool, block or agent before publishing';
+  assert.equal(processExplainError(server, saved.model), processPublishProblems(saved.model)[0]);
+});
+
+test('diagnostics group by severity with the fatal flag winning, in document order, and name their elements', () => {
+  const model = camundaModel();
+  assert.equal(processDiagnosticSeverity({ fatal: true, severity: 'info' }), 'fatal');
+  assert.equal(processDiagnosticSeverity({ fatal: false }), 'warning', 'a diagnostic without severity that is not fatal is a warning');
+  assert.equal(processDiagnosticSeverity({ fatal: false, severity: 'info' }), 'info');
+  const groups = processImportGroups([
+    { code: 'CAMUNDA_ASYNC_IGNORED', message: 'm', elementId: 'Task_Bean', offset: 310, fatal: false, severity: 'info' },
+    { code: 'B', message: 'late', elementId: 'Review', offset: 900, fatal: false, severity: 'warning' },
+    { code: 'A', message: 'early', elementId: 'Flow_big', offset: 100, fatal: false, severity: 'warning' },
+    { code: 'N', message: 'nowhere', elementId: null, offset: null, fatal: false, severity: 'warning' },
+    { code: 'F', message: 'broken', elementId: 'Gate', offset: 50, fatal: true }], model);
+  assert.deepEqual(groups.map((group) => group.severity), ['fatal', 'warning', 'info']);
+  assert.deepEqual(groups[1].rows.map((row) => row.code), ['A', 'B', 'N']);
+  assert.equal(groups[1].rows[0].element, 'Flow_big');
+  assert.equal(groups[1].rows[0].nodeId, 'Gate', 'a condition belongs to the step it leaves');
+  assert.equal(groups[1].rows[1].element, 'Review order (Review)');
+  assert.equal(groups[1].rows[2].nodeId, null);
+  assert.equal(groups[2].rows[0].text, I18n.t('bpmn.diag_CAMUNDA_ASYNC_IGNORED'));
+  assert.equal(groups[1].rows[0].text, 'early', 'a code with no wording here shows the server text');
+  assert.deepEqual(processImportCounts({ diagnostics: [{ fatal: true }, { fatal: false, severity: 'info' }, {}], translations: [{}] }), { fatal: 1, warning: 1, info: 1, translations: 1 });
+  assert.equal(processImportLoadable({ model, diagnostics: [{ fatal: true }] }), false);
+  assert.equal(processImportLoadable({ model: null, diagnostics: [] }), false);
+  assert.equal(processImportLoadable({ model, diagnostics: [{ fatal: false, severity: 'warning' }] }), true);
+  assert.equal(processImportNeedsReview({ model, diagnostics: [], translations: [] }), false, 'a clean import loads directly');
+  assert.equal(processImportNeedsReview({ model, diagnostics: [], translations: [{}] }), true);
+  const [translation] = processImportTranslations([{ elementId: 'Flow_big', kind: 'condition', original: '${a}', translated: 'vars.a', warnings: ['EXPR_MISSING_VALUE'] }], model);
+  assert.equal(translation.kindLabel, 'Condition'); assert.equal(translation.warnings[0].code, 'EXPR_MISSING_VALUE');
+  assert.match(translation.warnings[0].text, /missing variable/);
+});
+
+test('the attention list follows document order through sub-processes and bodies, and the jump wraps', () => {
+  const model = camundaModel();
+  const inner = { id: 'Inner_Bean', name: 'Inner', kind: { ServiceTask: { flowId: '', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60, implementation: { Unbound: { origin: 'class:a.I' } } } } };
+  model.nodes.splice(3, 0, { id: 'Sub', name: 'Sub', kind: { SubProcess: { body: { nodes: [inner], sequenceFlows: [], diagram: { shapes: [], edges: [] }, variables: {} } } } });
+  model.additionalProcesses = [{ processId: 'Other', nodes: [{ ...inner, id: 'Other_Bean' }], sequenceFlows: [], diagram: { shapes: [], edges: [] }, variables: {} }];
+  const targets = processAttentionTargets(model, new Set(['Gate', 'Review', 'Missing']));
+  assert.deepEqual(targets.map((target) => [target.nodeId, target.reasons.join('+')]),
+    [['Task_Bean', 'unbound'], ['Gate', 'warning'], ['Inner_Bean', 'unbound'], ['Review', 'warning'], ['Task_Second', 'unbound'], ['Other_Bean', 'unbound']]);
+  assert.deepEqual(targets[2].path, ['Sub']); assert.equal(targets[5].processId, 'Other');
+  assert.equal(processNextAttention(targets, null).nodeId, 'Task_Bean');
+  assert.equal(processNextAttention(targets, 'Gate').nodeId, 'Inner_Bean');
+  assert.equal(processNextAttention(targets, 'Other_Bean').nodeId, 'Task_Bean', 'after the last one it wraps');
+  assert.equal(processNextAttention(targets, 'Not_Listed').nodeId, 'Task_Bean');
+  assert.equal(processNextAttention([], 'Gate'), null);
+  assert.deepEqual([...processImportFlagged(model, [{ elementId: 'Flow_big', severity: 'warning', fatal: false }, { elementId: 'Review', severity: 'info', fatal: false }])], ['Gate']);
+});
+
+test('a diagnosed import is read first: nothing is loaded until the author imports, which is the consent', async () => {
+  const state = await runImport(camundaResponse());
+  const before = state.canvas.getData(); const review = reviewWindow();
+  assert.ok(review, 'the result window opened');
+  assert.match(review.querySelector('[data-summary]').getAttribute('message'), /Import check: 3 warnings, 1 note, 1 expression translated\./);
+  assert.match(review.querySelector('[data-consent]').getAttribute('message'), /accepts the translated expressions below as yours/);
+  assert.deepEqual([...review.querySelectorAll('section[data-severity]')].map((section) => section.dataset.severity), ['warning', 'info']);
+  const warnings = review.querySelector('section[data-severity="warning"] tf-table').rows;
+  assert.deepEqual(warnings.map((row) => [row.code, row.element]), [['CAMUNDA_SERVICE_UNBOUND', 'Charge card (Task_Bean)'], ['CAMUNDA_GATEWAY_EVAL_SEMANTICS', 'Big order? (Gate)'], ['CAMUNDA_ASSIGNEE_UNRESOLVED', 'Review order (Review)']]);
+  assert.match(warnings[0].message, /no TentaFlow counterpart/); assert.match(warnings[0].message, /delegateExpression has no counterpart/);
+  const translations = review.querySelector('section[data-translations] tf-table').rows;
+  assert.deepEqual(translations.map((row) => [row.original, row.translated, row.kindLabel]), [['${amount > 100}', 'vars.amount > 100', 'Condition']]);
+  assert.match(translations[0].warningChips, /EXPR_MISSING_VALUE/);
+  assert.deepEqual(state.canvas.getData(), before, 'reading the result changes nothing');
+  assert.equal(state.dirty, false); assert.equal(attentionBanner().hidden, true);
+  click(review.querySelector('[data-act="import"]')); await flush();
+  assert.equal(state.dirty, true); assert.equal(state.canvas.getData().nodes.some((node) => node.id === 'Task_Bean'), true);
+  assert.match(review.querySelector('[data-consent]').getAttribute('message'), /Loaded as a draft/);
+  assert.equal(review.querySelector('[data-act="import"]'), null);
+});
+
+test('after the import the unbound and flagged elements are marked and a banner jumps through them until they are settled', async () => {
+  const state = await runImport(camundaResponse());
+  click(reviewWindow().querySelector('[data-act="import"]')); await flush();
+  const banner = attentionBanner();
+  assert.equal(banner.hidden, false);
+  assert.equal(banner.getAttribute('message'), '4 elements need your attention after the import: bind imported steps to an implementation and review the marked elements.');
+  const marked = () => [...state.canvas.nodesLayer.querySelectorAll('.fb-needs-attention')].map((element) => element.dataset.nodeId).sort();
+  assert.deepEqual(marked(), ['Gate', 'Review', 'Task_Bean', 'Task_Second']);
+  assert.deepEqual([...state.canvas.nodesLayer.querySelectorAll('.fb-needs-attention')].map((element) => element.dataset.attention).sort(), ['import', 'import', 'unbound', 'unbound']);
+  const selected = () => [...state.canvas.selectedIds];
+  click(banner.querySelector('[data-role="next-attention"]')); assert.deepEqual(selected(), ['Task_Bean']);
+  click(banner.querySelector('[data-role="next-attention"]')); assert.deepEqual(selected(), ['Gate']);
+  click(banner.querySelector('[data-role="next-attention"]')); assert.deepEqual(selected(), ['Review']);
+  click(banner.querySelector('[data-role="next-attention"]')); assert.deepEqual(selected(), ['Task_Second']);
+  click(banner.querySelector('[data-role="next-attention"]')); assert.deepEqual(selected(), ['Task_Bean'], 'the jump wraps');
+
+  // A warning-only element is settled by the author's review, an unbound one only by an implementation.
+  state.canvas.selectNode('Gate');
+  const notes = state.config.root.querySelector('[data-import-attention]');
+  assert.match(notes.textContent + [...notes.querySelectorAll('tf-alert')].map((alert) => alert.getAttribute('message')).join(' '), /Camunda takes the first true condition/);
+  click(notes.querySelector('[data-attention-dismiss]'));
+  assert.equal(state.canvas.nodesLayer.querySelector('[data-node-id="Gate"]').classList.contains('fb-needs-attention'), false);
+  assert.match(banner.getAttribute('message'), /^3 elements need/);
+  state.canvas.selectNode('Task_Bean');
+  assert.equal(state.config.root.querySelector('[data-attention-dismiss]')?.closest('[data-import-attention]') != null, true, 'its warning is still open');
+  click(state.config.root.querySelector('[data-attention-dismiss]'));
+  assert.equal(state.canvas.nodesLayer.querySelector('[data-node-id="Task_Bean"]').classList.contains('fb-needs-attention'), true, 'an unbound step stays marked after its warning is reviewed');
+  change(state.config.root.querySelector('[data-process="implementation"]'), 'flow');
+  assert.equal(state.canvas.nodesLayer.querySelector('[data-node-id="Task_Bean"]').classList.contains('fb-needs-attention'), false);
+  assert.match(banner.getAttribute('message'), /^2 elements need/);
+  state.canvas.selectNode('Review'); click(state.config.root.querySelector('[data-attention-dismiss]'));
+  assert.match(banner.getAttribute('message'), /^1 element needs/);
+  state.canvas.selectNode('Task_Second'); change(state.config.root.querySelector('[data-process="implementation"]'), 'flow');
+  assert.equal(banner.hidden, true, 'the banner goes with the last element');
+});
+
+test('a line of the result shows its element on the canvas once the draft is loaded, and not before', async () => {
+  const state = await runImport(camundaResponse());
+  const review = reviewWindow();
+  const table = review.querySelector('section[data-severity="warning"] tf-table');
+  const row = table.rows[2];
+  table.dispatchEvent(new CustomEvent('row-click', { detail: { row, index: 2, selected: false } }));
+  assert.equal(state.canvas.selectedIds.size, 0, 'before the import there is no element to show');
+  assert.ok(reviewWindow().isConnected);
+  click(review.querySelector('[data-act="import"]')); await flush();
+  const loaded = reviewWindow().querySelector('section[data-severity="warning"] tf-table');
+  loaded.dispatchEvent(new CustomEvent('row-click', { detail: { row: loaded.rows[2], index: 2, selected: false } }));
+  assert.deepEqual([...state.canvas.selectedIds], ['Review']);
+  assert.ok(!reviewWindow(), 'the window gives way to the canvas');
+});
+
+test('an import over unsaved work asks first and a refusal leaves the draft as it was', async () => {
+  const asked = []; const original = TfWindow.confirm;
+  TfWindow.confirm = async (options) => { asked.push(options.title); return false; };
+  try {
+    const state = await mount(definition(), { processXmlImportRequest: camundaResponse(), processDefinitionSaveRequest: (payload) => ({ definition: definition('definition-one', { model: payload.model, draftRevision: 5 }) }) });
+    state.dirty = true; const before = state.canvas.getData();
+    builder._importProcess(); await flush();
+    const form = document.querySelector('.tf-act-window'); form.querySelector('tf-code-editor').value = '<x/>'; form.querySelector('tf-code-editor').dispatchEvent(new Event('input', { bubbles: true }));
+    click(form.querySelector('[data-act="submit"]')); await flush();
+    click(reviewWindow().querySelector('[data-act="import"]')); await flush();
+    assert.deepEqual(asked, [I18n.t('bpmn.import_replace_title')]);
+    assert.deepEqual(state.canvas.getData(), before); assert.ok(!reviewWindow());
+  } finally { TfWindow.confirm = original; }
+});
+
+test('a clean strict import still loads directly with no result window', async () => {
+  const imported = emptyProcessModel(); imported.nodes[0].name = 'Imported start';
+  const state = await runImport({ model: imported, diagnostics: [], translations: [] });
+  assert.ok(!reviewWindow()); assert.deepEqual(state.canvas.getData(), imported);
+  assert.equal(attentionBanner().hidden, true); assert.equal(state.dirty, true);
+});
+
+test('an unbound step in a reopened draft raises the banner, and publication names the step without asking the server', async () => {
+  const unbound = camundaModel();
+  const state = await mount(definition('with-unbound', { model: unbound }));
+  assert.equal(attentionBanner().hidden, false);
+  assert.match(attentionBanner().getAttribute('message'), /^2 elements need/);
+  await builder._publish(); await flush();
+  assert.equal(calls.some((row) => row.kind === 'processDefinitionPublishRequest'), false);
+  assert.match(state.root.querySelector('[data-role="error"]').getAttribute('message'), /“Charge card” is not bound to an implementation yet/);
+  assert.match(state.root.querySelector('[data-role="error"]').getAttribute('message'), /“Notify” is not bound/);
+});
+
+test('a response that carries a model next to a fatal diagnostic still loads nothing', async () => {
+  const state = await runImport(camundaResponse({ diagnostics: [{ code: 'CAMUNDA_ELEMENT_UNSUPPORTED', message: 'broken', elementId: 'Gate', offset: 10, fatal: true, severity: 'fatal' }] }));
+  const before = state.canvas.getData(); const review = reviewWindow();
+  assert.ok(review); assert.equal(review.querySelector('[data-act="import"]'), null);
+  assert.match(review.querySelector('[data-consent]').getAttribute('message'), /Nothing was imported/);
+  assert.deepEqual(state.canvas.getData(), before); assert.equal(attentionBanner().hidden, true);
 });

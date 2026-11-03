@@ -216,6 +216,7 @@ export class FlowCanvas {
     this.nodes = [];
     this.edges = [];
     this.selectedIds = new Set();
+    this.attentionIds = new Set();
     this.selectedEdgeId = null;
     this.view = { x: 0, y: 0, zoom: 1 };
     this._pendingFitMinZoom = null;
@@ -1852,13 +1853,18 @@ export class FlowCanvas {
           : n.repeat?.MultiInstance?.mode === 'Parallel' ? 'parallel' : null;
       const serviceKind = n.type === 'bpmn_service_task' ? processServiceKind(n.config) : null;
       const showKind = serviceKind && (serviceKind !== 'flow' || !!n.config.flowId);
-      const kindIcon = { flow: 'flow', block: 'chip', tool: 'puzzle', agent: 'bot' }[serviceKind];
+      const kindIcon = { flow: 'flow', block: 'chip', tool: 'puzzle', agent: 'bot', unbound: 'question' }[serviceKind];
       const warnings = this._processWarnings(n);
       // An event that is not on an activity sits on the canvas like one that is;
       // a dashed outline and its own tag say it is waiting for a host.
       if (warnings.includes('boundary_unattached')) {
         div.classList.add('fb-unattached');
         div.dataset.unattachedLabel = I18n.t('bpmn.boundary_not_attached');
+      }
+      // An imported element a person still has to settle is marked the way a problem is, and told apart by its outline.
+      if (warnings.includes('unbound') || warnings.includes('import_attention')) {
+        div.classList.add('fb-needs-attention');
+        div.dataset.attention = warnings.includes('unbound') ? 'unbound' : 'import';
       }
       const warningText = warnings.map((key) => this._processWarningText(n, key)).join(' ');
       div.innerHTML = `
@@ -2286,7 +2292,15 @@ export class FlowCanvas {
     const agent = node.type === 'bpmn_service_task' ? node.config?.implementation?.Agent : null;
     if (agent && Array.isArray(agents) && !agents.some((candidate) => candidate.agentId === agent.agentId)) warnings.push('agent_unavailable');
     if (node.type === 'bpmn_boundary_escalation' && processEscalationPathProblem(this, node.id)) warnings.push('escalation_path');
+    if (this.attentionIds.has(node.id)) warnings.push('import_attention');
     return warnings;
+  }
+
+  /** The imported elements whose warnings are still open; each is marked on the canvas until it is reviewed. */
+  setAttentionIds(ids) {
+    const changed = this.nodes.filter((node) => this.attentionIds.has(node.id) !== ids.has(node.id));
+    this.attentionIds = new Set(ids);
+    if (this.mode === 'bpmn') for (const node of changed) this._renderSingleNode(node);
   }
 
   _processWarningText(node, key) {

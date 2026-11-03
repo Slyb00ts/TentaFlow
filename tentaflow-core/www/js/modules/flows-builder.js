@@ -16,9 +16,10 @@ import { TfWindow } from '/js/components/tf-window.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
-import { checkProcessDocument, processBody, processCommand, processDistinctLabels, processEditorLabels, processElementNames, processExplainError, processHasTimer, processHasTimerStart, processNodeLabels, processPublishProblems, processStartEntryLabels, processTimezoneCanonical, processTimezoneGaps, processTimezoneText, processBodyLabels } from '/js/modules/flows-builder/bpmn.js';
+import { checkProcessDocument, processAttentionTargets, processBody, processCommand, processDistinctLabels, processEditorLabels, processElementNames, processExplainError, processHasTimer, processHasTimerStart, processImportFlagged, processImportNeedsReview, processNextAttention, processDiagnosticSeverity, processDiagnosticText, processElementNode, processNodeLabels, processPublishProblems, processStartEntryLabels, processTimezoneCanonical, processTimezoneGaps, processTimezoneText, processBodyLabels } from '/js/modules/flows-builder/bpmn.js';
 import { openProcessCalendar, openProcessDeclarations, openProcessInstances, openProcessMessageSend, openProcessMessages, openProcessModeling, openProcessRun, openProcessSchedule, openProcessVariables, processLifecycleReasonText, processTimerText } from '/js/modules/flows-builder/process-monitor.js';
 import { openProcessSimulation } from '/js/modules/flows-builder/process-simulation.js';
+import { openProcessImportReview } from '/js/modules/flows-builder/process-import.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-textarea.js';
@@ -101,6 +102,7 @@ const FlowBuilderScreen = {
         </header>
         ${process ? `<div class="fb-process-notice" id="fb-process-notice"><tf-chip status="info" data-role="publication">${escapeHtml(I18n.t('bpmn.draft'))}</tf-chip><tf-button variant="ghost" size="sm" icon="chevron-down" data-role="notice-toggle" aria-controls="fb-process-notice">${escapeHtml(I18n.t('bpmn.process_settings'))}</tf-button><span data-role="process-hint">${escapeHtml(I18n.t('bpmn.supported_hint'))}</span><tf-select data-role="body-select" wrap-selected label="${escapeAttr(I18n.t('bpmn.process_body'))}"></tf-select><tf-select data-role="start-entry" wrap-selected label="${escapeAttr(I18n.t('bpmn.start_entry'))}"></tf-select><tf-button variant="secondary" size="sm" data-role="add-body">${escapeHtml(I18n.t('bpmn.add_process_body'))}</tf-button><tf-input data-role="body-name" label="${escapeAttr(I18n.t('bpmn.process_body_name'))}"></tf-input><tf-chip status="info" data-role="calendar-state" hidden></tf-chip><tf-input class="fb-timer-timezone" data-role="timer-timezone" label="${escapeAttr(I18n.t('bpmn.timer_timezone'))}" hint="${escapeAttr(I18n.t('bpmn.timer_timezone_hint'))}" placeholder="${escapeAttr(I18n.t('bpmn.timer_timezone_placeholder'))}" hidden></tf-input><tf-button variant="ghost" size="sm" data-role="draft" hidden>${escapeHtml(I18n.t('bpmn.return_draft'))}</tf-button><tf-button variant="ghost" size="sm" data-role="archive">${escapeHtml(I18n.t('bpmn.archive'))}</tf-button><span data-role="timer-summary" hidden></span></div>` : ''}
         <tf-alert data-role="error" tone="danger" live hidden><div slot="actions"><tf-button variant="secondary" size="sm" data-role="next-draft" hidden>${escapeHtml(I18n.t('bpmn.drafts_next'))}</tf-button></div></tf-alert>
+        ${process ? `<tf-alert data-role="attention" tone="warning" inline-actions hidden><div slot="actions"><tf-button variant="secondary" size="sm" icon="arrow-right" data-role="next-attention">${escapeHtml(I18n.t('bpmn.attention_next'))}</tf-button></div></tf-alert>` : ''}
 
         <div class="fb-body" data-role="body">
           <aside class="fb-palette" id="fb-palette" data-role="palette"></aside>
@@ -174,6 +176,9 @@ const FlowBuilderScreen = {
       // Deklaracje zmiennych flow (§3.12 / R10). Wczytane z flow_json i
       // dopisywane z powrotem przy zapisie — bez tego save gubilby sekcje.
       flowVariables: [],
+      // What an import left for the author: the elements with warnings not yet reviewed, and the lines to tell why.
+      attention: { flagged: new Set(), notes: new Map() },
+      attentionLive: false,
       cleanupFns: [],
     };
     this._state = state;
@@ -244,7 +249,13 @@ const FlowBuilderScreen = {
       readOnly: state.readOnly,
       mode: state.mode,
       processOptions: state.processOptions,
-      onModelReplace: (restored) => { state.config?.modelReplaced(restored); this._syncDraftBanner(state); this._syncSaveBanner(state); },
+      onModelReplace: (restored) => {
+        state.config?.modelReplaced(restored);
+        // A load or an import sets the flags itself afterwards; an undo keeps the ones still open.
+        if (!restored) state.attention = { flagged: new Set(), notes: new Map() };
+        this._syncAttention(state, state.canvas?.processModel);
+        this._syncDraftBanner(state); this._syncSaveBanner(state);
+      },
       onChange: () => {
         this._markDirty();
         this._updateStats();
@@ -253,6 +264,7 @@ const FlowBuilderScreen = {
           this._syncProcessPath();
           this._syncProcessControls();
           state.config.refreshRouting();
+          if (state.attentionLive) this._syncAttention(state, state.canvas.getData());
           this._syncDraftBanner(state);
           this._syncSaveBanner(state);
         }
@@ -297,6 +309,8 @@ const FlowBuilderScreen = {
       // (entry/exit/member) so region-level loop config renders on the entry node.
       getCanvas: () => state.canvas,
       onConfigChange: (id, patch) => { state.canvas.updateNodeConfig(id, patch); },
+      getAttentionNotes: (id) => (state.attention.flagged.has(id) ? state.attention.notes.get(id) ?? [] : []),
+      onAttentionDismiss: (id) => this._dismissAttention(state, id),
       onEdgeChange: (id, patch) => state.canvas.updateEdge(id, patch),
       onLabelChange: (id, label) => {
         state.canvas.updateNodeLabel(id, label);
@@ -366,6 +380,7 @@ const FlowBuilderScreen = {
     root.querySelector('[data-role="back"]').addEventListener('click', () => Router.navigate('flows'));
     // With several refused fields the banner offers the way to the next one.
     root.querySelector('[data-role="next-draft"]').addEventListener('click', () => this._revealDraft(state, (state.draftCursor ?? 0) + 1));
+    root.querySelector('[data-role="next-attention"]')?.addEventListener('click', () => this._revealAttention(state));
 
     root.querySelector('[data-role="zoom-in"]').addEventListener('click', () => state.canvas.zoomBy(1.2));
     root.querySelector('[data-role="zoom-out"]').addEventListener('click', () => state.canvas.zoomBy(1 / 1.2));
@@ -967,14 +982,14 @@ const FlowBuilderScreen = {
         checkProcessDocument(xml);
         const response = await ApiBinary.one('processXmlImportRequest', { xml });
         if (!this._current(state) || !win.isConnected || state.readOnly) throw new Error(I18n.t('bpmn.editor_changed'));
-        const fatal = response.diagnostics.filter((diagnostic) => diagnostic.fatal);
-        if (fatal.length) throw new Error(I18n.t('bpmn.import_rejected', { error: fatal.map((diagnostic) => diagnostic.message).join('\n') }));
-        state.canvas.setData(response.model);
-        this._syncProcessBodySelect();
-        this._markDirty();
-        this._updateStats();
-        this._renderMinimap();
-        this._syncProcessControls();
+        // A clean import has nothing to read; anything else is shown before a single element is loaded.
+        if (processImportNeedsReview(response)) {
+          openProcessImportReview({ response,
+            onImport: () => this._loadImport(state, response),
+            onReveal: (row) => this._revealElement(state, row.nodeId) });
+          return undefined;
+        }
+        if (!await this._loadImport(state, response)) throw new Error(I18n.t('bpmn.import_not_loaded'));
         return { message: I18n.t('bpmn.imported_draft') };
       },
     });
@@ -1000,6 +1015,85 @@ const FlowBuilderScreen = {
         if (generation === fileGeneration) { fileBusy = false; section.dispatchEvent(new CustomEvent('change', { bubbles: true })); }
       }
     });
+  },
+
+  // Replaces the draft with an imported model. The import is the author's
+  // consent to what it translated, so the elements it flagged are marked
+  // afterwards; the replaced draft cannot be undone, hence the question when
+  // it holds unsaved work.
+  async _loadImport(state, response) {
+    if (!this._current(state) || state.readOnly) {
+      toast(I18n.t('bpmn.editor_changed'), 'warning');
+      return false;
+    }
+    if (state.dirty && !await TfWindow.confirm({ title: I18n.t('bpmn.import_replace_title'), message: I18n.t('bpmn.import_replace_hint'),
+      confirmLabel: I18n.t('bpmn.import_as_draft'), cancelLabel: I18n.t('common.cancel') })) return false;
+    if (!this._current(state) || state.readOnly) {
+      toast(I18n.t('bpmn.editor_changed'), 'warning');
+      return false;
+    }
+    state.canvas.setData(response.model);
+    const notes = new Map();
+    for (const diagnostic of response.diagnostics || []) {
+      if (processDiagnosticSeverity(diagnostic) !== 'warning') continue;
+      const where = processElementNode(response.model, diagnostic.elementId);
+      if (where) notes.set(where.nodeId, [...(notes.get(where.nodeId) ?? []), processDiagnosticText(diagnostic)]);
+    }
+    state.attention = { flagged: processImportFlagged(response.model, response.diagnostics), notes };
+    this._syncAttention(state, state.canvas.getData());
+    this._syncProcessBodySelect();
+    this._markDirty();
+    this._updateStats();
+    this._renderMinimap();
+    this._syncProcessControls();
+    return true;
+  },
+
+  // The banner and the canvas marks follow the model: an element leaves the
+  // list when its Service task gets an implementation or the author reviews it,
+  // and the banner goes with the last one.
+  _syncAttention(state, model) {
+    if (state.mode !== 'bpmn' || !state.canvas) return;
+    const targets = processAttentionTargets(model, state.attention.flagged);
+    state.canvas.setAttentionIds(new Set(targets.filter((target) => target.reasons.includes('warning')).map((target) => target.nodeId)));
+    state.attentionLive = targets.length > 0;
+    const banner = state.root.querySelector('[data-role="attention"]');
+    if (!banner) return;
+    banner.hidden = !targets.length;
+    banner.setAttribute('message', I18n.t('bpmn.attention_banner', { count: targets.length }));
+  },
+
+  _revealAttention(state) {
+    const targets = processAttentionTargets(state.canvas.getData(), state.attention.flagged);
+    const selected = state.canvas.nodes.find((node) => state.canvas.selectedIds.has(node.id));
+    const target = processNextAttention(targets, selected?.id);
+    if (target) this._revealElement(state, target.nodeId);
+  },
+
+  // Enters the body that holds the element and selects it, as the jump to a refused field does.
+  _revealElement(state, nodeId) {
+    if (!this._current(state)) return;
+    const where = processElementNode(state.canvas.getData(), nodeId);
+    if (!where) return;
+    const canvas = state.canvas;
+    const here = canvas.selectedProcessId === where.processId && canvas.processPath.join('/') === where.path.join('/');
+    if (!here) {
+      canvas.navigateProcessBody(where.path, where.processId);
+      state.config.renderEmpty();
+      this._syncProcessPath();
+      this._updateStats();
+      this._renderMinimap();
+    }
+    canvas.selectNode(nodeId);
+  },
+
+  _dismissAttention(state, nodeId) {
+    if (!this._current(state) || state.readOnly) return;
+    state.attention.flagged.delete(nodeId);
+    state.attention.notes.delete(nodeId);
+    this._syncAttention(state, state.canvas.getData());
+    const node = state.canvas.nodes.find((candidate) => candidate.id === nodeId);
+    if (node && state.canvas.selectedIds.has(nodeId)) state.config.show(node, state.templatesMap.get(node.type));
   },
 
   async _exportProcess() {

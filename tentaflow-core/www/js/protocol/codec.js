@@ -314,8 +314,15 @@ function processServiceImplementation(implementation) {
   if (implementation == null || implementation === 'Flow') return {};
   const variants = typeof implementation === 'object' && !Array.isArray(implementation)
     ? Object.keys(implementation) : [];
-  if (variants.length !== 1 || !(implementation.AddonTool || implementation.Block || implementation.Agent)) {
+  if (variants.length !== 1 || !(implementation.AddonTool || implementation.Block || implementation.Agent
+      || implementation.Unbound)) {
     throw new TypeError('unsupported service implementation');
+  }
+  if (implementation.Unbound) {
+    const unbound = implementation.Unbound;
+    processKnownFields(unbound, ['origin'], 'unbound implementation');
+    if (typeof unbound.origin !== 'string') throw new TypeError('unbound implementation requires an origin');
+    return { implementation: { Unbound: { origin: unbound.origin } } };
   }
   if (implementation.Agent) {
     const agent = implementation.Agent;

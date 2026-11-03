@@ -555,6 +555,15 @@ Kod: `processes/bpmn/camunda.rs` (testy: `camunda_import_tests.rs`). Okno import
 - **Parametry.** Tekst bez `${}` to literał tekstowy CEL (Camunda traktuje go jako String); `${…}` idzie przez tłumacz; listy, mapy, skrypty, puste, o złej nazwie, złożone szablony → ostrzeżenie i pominięcie. Parametr wyjściowy zawsze niesie ostrzeżenie o innym zakresie ewaluacji (`outputs` i zmienne procesu, nie zmienne lokalne zadania Camundy).
 - **Znane ograniczenia.** (1) Ścisły `parse_tree` nie ma limitu zagnieżdżenia; limit jest tylko w trybie tolerancyjnym. (2) Elementy, których ścisły czytnik nie zna (`businessRuleTask`, `sendTask` bez konfiguracji TentaFlow, zdarzenia komunikatów bez konfiguracji, `callActivity`) są fatal per element; nie ma mapowania ich na odpowiedniki. (3) Próbki z NextApp nie były dostępne; fixtury odzwierciedlają to, co pisze Camunda Modeler. (4) Etykiety i znaczniki diagramu są pomijane (jedna informacja).
 
+### Status B3.6b-GUI: okno importu i zadania niepowiązane (2026-11-03)
+
+Kod: `www/js/modules/flows-builder/process-import.js` (okno wyniku), `bpmn.js` (czyste funkcje `processImport*`, `processAttention*`, `processUnboundSteps`), `flows-builder.js` (`_loadImport`, baner uwagi), `config.js` (inspektor), `canvas.js` (oznaczenie). Testy: `bpmn.test.js`, `process-wire.test.js`, `tests/e2e/process-b3-camunda-import.spec.js`.
+
+- **Kiedy okno.** Odpowiedź bez diagnostyk i tłumaczeń (ścisły import) ładuje się wprost jak dotąd. Każda inna, także z `model: null`, otwiera okno wyniku PRZED załadowaniem czegokolwiek. Diagnostyka z flagą `fatal` wygrywa z `severity`; bez `severity` i bez `fatal` traktujemy ją jako ostrzeżenie. Fatal albo brak modelu: okno tylko wyjaśnia i zamyka, bez przycisku importu.
+- **Zgoda.** „Import jako szkic” jest zgodą na przetłumaczone wyrażenia (tekst w oknie to mówi). Po załadowaniu okno zostaje, a wiersz z elementem zaznacza go na kanwie i zamyka okno; przed załadowaniem wiersze nic nie robią. Szkic z niezapisanymi zmianami najpierw pyta o zastąpienie (import zeruje historię cofania).
+- **Uwaga.** Element wymaga uwagi, gdy jest zadaniem usługi `Unbound` (stan wyliczany z modelu, więc przeżywa zapis i ponowne otwarcie) albo miał ostrzeżenie importu, którego autor jeszcze nie przejrzał (stan tylko w pamięci edytora; diagnostyka na przepływie wskazuje jego źródło). Baner „N elementów wymaga uwagi” skacze do kolejnego w kolejności dokumentu (podprocesy zaraz po swoim węźle, potem dodatkowe procesy) i znika z ostatnim. Ostrzeżenie zdejmuje „Oznacz jako sprawdzony” w inspektorze; `Unbound` tylko wybór implementacji.
+- **Nie zrobione:** teksty `diag_*` mają tylko ok. 18 kodów, reszta pokazuje komunikat serwera (po angielsku); tłumaczenia z ostrzeżeniami `EXPR_*` nie oznaczają elementu same, robi to towarzyszące im `CAMUNDA_EXPRESSION_WARNING`.
+
 ## 7. Pozycja 6: symulacja poza profilem `script_user_manual`
 
 ### Stan

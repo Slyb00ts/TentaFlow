@@ -54,8 +54,8 @@
 
 .fb-shell {
   display: grid;
-  grid-template-areas: 'toolbar' 'notice' 'error' 'body' 'footer';
-  grid-template-rows: auto auto auto minmax(0, 1fr) 44px;
+  grid-template-areas: 'toolbar' 'notice' 'error' 'attention' 'body' 'footer';
+  grid-template-rows: auto auto auto auto minmax(0, 1fr) 44px;
   height: 100%;
   width: 100%;
   background: var(--tf-bg, #050818);
@@ -67,6 +67,7 @@
 .fb-topbar { grid-area: toolbar; }
 .fb-process-notice { grid-area: notice; }
 .fb-shell > [data-role='error'] { grid-area: error; }
+.fb-shell > [data-role='attention'] { grid-area: attention; }
 .fb-body { grid-area: body; }
 .fb-bottombar { grid-area: footer; }
 
@@ -1231,7 +1232,7 @@
      żadnej wskazówki, że tam jest. Zamiast tego pasek się zawija, a wiersz
      shella rośnie razem z nim. */
   .fb-shell {
-    grid-template-rows: auto auto auto minmax(0, 1fr) 52px;
+    grid-template-rows: auto auto auto auto minmax(0, 1fr) 52px;
   }
   .fb-topbar {
     flex-wrap: wrap;
@@ -1408,6 +1409,7 @@
    instead of squeezing the canvas and inspector. */
 .fb-process-shell {
   grid-template-rows:
+    max-content
     max-content
     max-content
     max-content
@@ -1595,6 +1597,14 @@ body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transf
 .fb-process-kind svg, .fb-process-warn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; }
 .fb-process-kind[data-kind="block"] { color: var(--tf-accent-3, var(--tf-accent-2)); }
 .fb-process-kind[data-kind="tool"] { color: var(--tf-success, #16a34a); }
+.fb-process-kind[data-kind="unbound"] { color: var(--tf-warning, #d97706); }
+/* An imported element a person still has to settle: a solid outline, apart from the dashed one of a boundary event with no host. */
+.fb-process-node.fb-needs-attention { outline: 2px solid var(--tf-warning, #d97706); outline-offset: 4px; }
+.fb-import-notes { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.fb-import-notes tf-alert { align-self: stretch; }
+.fb-import-review { display: flex; flex-direction: column; gap: 16px; min-width: 0; overflow-wrap: anywhere; }
+.fb-import-review h3 { margin: 0; font-size: 13px; }
+.fb-import-review section { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .fb-routing-warnings { display: flex; flex-direction: column; gap: 8px; margin: 8px 0; }
 .fb-routing-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
 .fb-process-panel[hidden], .fb-process-fields tf-alert[hidden] { display: none; }

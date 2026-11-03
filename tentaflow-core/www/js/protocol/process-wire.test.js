@@ -284,6 +284,22 @@ test('service task implementation is sent only for tools and a Flow task keeps i
     /requires an addon id and a tool name/);
 });
 
+test('an unbound import placeholder is saved and read back, and nothing else rides along', { skip }, () => {
+  const task = (implementation) => ({ id: 'Service_1', name: 'Imported', kind: { ServiceTask: {
+    flowId: '', inputMapping: {}, outputMapping: {}, verification: 'Human', timeoutSeconds: 60, implementation } } });
+  const payload = (node) => ({ commandId: 'cmd', definitionId: null, expectedRevision: 0, name: 'Unbound',
+    description: '', model: { schemaVersion: 1, processId: 'P_1', variables: {}, nodes: [node],
+      sequenceFlows: [], diagram: { shapes: [], edges: [] } } });
+  const decoded = request('processDefinitionSaveRequest', payload(task({ Unbound: { origin: 'delegateExpression:${bean}' } })));
+  assert.deepEqual(decoded.model.nodes[0].kind.ServiceTask.implementation,
+    { Unbound: { origin: 'delegateExpression:${bean}' } });
+  const encode = (implementation) => codec.encode.processDefinitionSaveRequest(17, payload(task(implementation)));
+  assert.throws(() => encode({ Unbound: { origin: 'x', extra: 1 } }), /unsupported unbound implementation field/);
+  assert.throws(() => encode({ Unbound: {} }), /requires an origin/);
+  assert.throws(() => encode({ Unbound: { origin: 'x' }, Block: { nodeType: 'llm', config: {} } }),
+    /unsupported service implementation/);
+});
+
 test('block service task sends its settings as authored and reads them back unchanged', { skip }, () => {
   const task = (implementation) => ({ id: 'Service_1', name: 'Block', kind: { ServiceTask: {
     flowId: '', inputMapping: { payload: 'vars.text' }, outputMapping: {}, verification: 'Human',
