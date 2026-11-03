@@ -19,14 +19,14 @@
 // - A document that merely declares the Camunda namespace but holds no Camunda
 //   constructs is rewritten to itself and imports exactly like the strict path.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use tentaflow_protocol::processes::{
     ProcessDiagnostic, ProcessDiagnosticSeverity as Severity, ProcessExecutableProcess,
     ProcessImportTranslation, ProcessModel, ProcessMultiInstanceInput, ProcessMultiInstanceMode,
-    ProcessNode, ProcessNodeKind, ProcessRepeatSpec,
+    ProcessNode, ProcessNodeKind, ProcessRepeatSpec, ServiceImplementation,
 };
 
 use super::{
@@ -68,6 +68,11 @@ const FLOW_NODES: [&str; 22] = [
     "complexGateway",
 ];
 const MAX_LITERAL_CHARS: usize = 400;
+/// Foreign text can carry any amount of text into a diagnostic message.
+const MAX_MESSAGE_CHARS: usize = 1000;
+/// An import may look up this many logins; the rest stay unresolved, so a
+/// document cannot turn the import into an account scanner.
+const MAX_LOGIN_LOOKUPS: usize = 200;
 
 pub struct CamundaImport {
     /// `None` whenever a fatal diagnostic exists.
@@ -112,6 +117,7 @@ pub fn import_camunda_xml_resolving(
 
 struct RepeatPatch {
     node_id: String,
+    base_name: String,
     spec: ProcessRepeatSpec,
 }
 
@@ -120,7 +126,11 @@ struct Importer<'a> {
     diagnostics: Vec<ProcessDiagnostic>,
     translations: Vec<ProcessImportTranslation>,
     repeats: Vec<RepeatPatch>,
-    flows_with_warnings: HashSet<String>,
+    /// Expression texts read per element id, to find a name an activity uses.
+    sources: HashMap<String, Vec<String>>,
+    /// Embedded subprocesses whose extension this importer wrote.
+    synthesized_subprocesses: HashSet<String>,
+    login_lookups: usize,
     fatal: bool,
     fatal_listed: bool,
     fatal_elements: HashSet<String>,
@@ -135,7 +145,9 @@ impl<'a> Importer<'a> {
             diagnostics: Vec::new(),
             translations: Vec::new(),
             repeats: Vec::new(),
-            flows_with_warnings: HashSet::new(),
+            sources: HashMap::new(),
+            synthesized_subprocesses: HashSet::new(),
+            login_lookups: 0,
             fatal: false,
             fatal_listed: false,
             fatal_elements: HashSet::new(),
@@ -158,6 +170,7 @@ impl<'a> Importer<'a> {
         }
         let namespace = root.attr("targetNamespace").unwrap_or(TF).to_string();
         self.rewrite_definitions(&mut root);
+        self.verify_xsi_types(&root);
         let mut nodes_failed = false;
         for process in root
             .children
@@ -180,8 +193,23 @@ impl<'a> Importer<'a> {
                 return None;
             }
         };
+        let mut taken = BTreeSet::new();
+        collect_names(&model.nodes, &model.variables, &mut taken);
+        for process in &model.additional_processes {
+            collect_names(&process.nodes, &process.variables, &mut taken);
+        }
         let repeats = std::mem::take(&mut self.repeats);
-        for patch in repeats {
+        for mut patch in repeats {
+            let final_name = free_name(&patch.base_name, &taken);
+            taken.insert(final_name.clone());
+            let suffixed = final_name != patch.base_name;
+            if let ProcessRepeatSpec::MultiInstance {
+                output_collection_variable,
+                ..
+            } = &mut patch.spec
+            {
+                *output_collection_variable = final_name.clone();
+            }
             let mut applied = patch_repeat(&mut model.nodes, &mut model.variables, &patch);
             for process in &mut model.additional_processes {
                 if applied {
@@ -189,7 +217,23 @@ impl<'a> Importer<'a> {
                 }
                 applied = patch_process_repeat(process, &patch);
             }
-            if !applied {
+            if applied {
+                let why = if suffixed {
+                    format!(" ({} was already in use)", patch.base_name)
+                } else {
+                    String::new()
+                };
+                self.push(
+                    Severity::Warning,
+                    "CAMUNDA_MULTI_INSTANCE_OUTPUT_VARIABLE",
+                    Some(patch.node_id.clone()),
+                    None,
+                    format!(
+                        "TentaFlow collects the results of a repeat into a variable; \
+                         {final_name}{why} was declared for it"
+                    ),
+                );
+            } else {
                 self.push(
                     Severity::Fatal,
                     "CAMUNDA_MODEL_INVALID",
@@ -201,6 +245,34 @@ impl<'a> Importer<'a> {
                     ),
                 );
             }
+        }
+        let mut uncertain = Vec::new();
+        propagate_subprocess_outputs(
+            &mut model.nodes,
+            &mut model.variables,
+            &self.synthesized_subprocesses,
+            &mut uncertain,
+        );
+        for process in &mut model.additional_processes {
+            propagate_subprocess_outputs(
+                &mut process.nodes,
+                &mut process.variables,
+                &self.synthesized_subprocesses,
+                &mut uncertain,
+            );
+        }
+        for id in uncertain {
+            self.push(
+                Severity::Warning,
+                "CAMUNDA_SUBPROCESS_SCOPE",
+                Some(id.clone()),
+                None,
+                format!(
+                    "subprocess {id} contains steps whose real implementation is unknown, so the \
+                     variables they write cannot be copied out of the subprocess; Camunda would \
+                     have propagated them"
+                ),
+            );
         }
         if self.fatal {
             return None;
@@ -237,7 +309,7 @@ impl<'a> Importer<'a> {
                 "CAMUNDA_DIAGNOSTICS_TRUNCATED",
                 None,
                 None,
-                format!("only the first {MAX_DIAGNOSTICS} diagnostics are listed"),
+                format!("only the first {MAX_DIAGNOSTICS} diagnostics and translations are listed"),
             ));
         }
         let model = if self.fatal { None } else { model };
@@ -319,8 +391,12 @@ impl<'a> Importer<'a> {
         source: &str,
         language: SourceLanguage,
     ) -> Result<String, TranslationRefusal> {
-        let translation = translate(source, language)?;
         let element_id = owner.attr("id").unwrap_or_default().to_string();
+        self.sources
+            .entry(element_id.clone())
+            .or_default()
+            .push(source.to_string());
+        let translation = translate(source, language)?;
         let mut codes = Vec::new();
         for warning in &translation.warnings {
             codes.push(warning.code.to_string());
@@ -331,10 +407,7 @@ impl<'a> Importer<'a> {
                 format!("{}: {}", warning.code, warning.message),
             );
         }
-        if !translation.warnings.is_empty() {
-            self.flows_with_warnings.insert(element_id.clone());
-        }
-        self.translations.push(ProcessImportTranslation {
+        self.record_translation(ProcessImportTranslation {
             element_id,
             kind: kind.into(),
             original: source.into(),
@@ -342,6 +415,15 @@ impl<'a> Importer<'a> {
             warnings: codes,
         });
         Ok(translation.cel)
+    }
+
+    /// Translations are capped like diagnostics, for the same reason.
+    fn record_translation(&mut self, translation: ProcessImportTranslation) {
+        if self.translations.len() >= MAX_DIAGNOSTICS {
+            self.truncated = true;
+            return;
+        }
+        self.translations.push(translation);
     }
 
     fn refusal(
@@ -438,18 +520,21 @@ impl<'a> Importer<'a> {
             .filter(|child| child.is(BPMN, "exclusiveGateway"))
         {
             let id = gateway.attr("id").unwrap_or_default();
-            let warned = children.iter().any(|flow| {
-                flow.is(BPMN, "sequenceFlow")
-                    && flow.attr("sourceRef") == Some(id)
-                    && flow
-                        .attr("id")
-                        .is_some_and(|flow_id| self.flows_with_warnings.contains(flow_id))
-            });
-            if warned {
+            let conditional = children
+                .iter()
+                .filter(|flow| {
+                    flow.is(BPMN, "sequenceFlow")
+                        && flow.attr("sourceRef") == Some(id)
+                        && flow
+                            .children
+                            .iter()
+                            .any(|c| c.is(BPMN, "conditionExpression"))
+                })
+                .count();
+            if conditional >= 2 {
                 let message = "TentaFlow raises an incident on the first condition evaluation \
                     error and when more than one condition is true, while Camunda takes the \
-                    first true flow in document order; a translated condition here can behave \
-                    differently"
+                    first true flow in document order; this gateway can behave differently"
                     .to_string();
                 self.report(
                     Severity::Warning,
@@ -535,7 +620,17 @@ impl<'a> Importer<'a> {
         let language = condition.attr("language").map(str::to_string);
         let mode = match language.as_deref() {
             Some(CEL_LANGUAGE) => return,
-            None if !has_wrapper(&source) => return,
+            None if !has_wrapper(&source) => {
+                self.report(
+                    Severity::Fatal,
+                    "CAMUNDA_CONDITION_UNTYPED",
+                    flow,
+                    "a condition without a language and without ${...} is a plain string in \
+                     Camunda, not a boolean test; it is not guessed to be CEL"
+                        .into(),
+                );
+                return;
+            }
             None => SourceLanguage::Juel,
             Some(other) => match other.to_ascii_lowercase().as_str() {
                 "juel" | "el" | "http://www.omg.org/spec/el/20100524" => SourceLanguage::Juel,
@@ -600,14 +695,16 @@ impl<'a> Importer<'a> {
             "userTask" => self.rewrite_user_task(node, &mut ext, parameters),
             _ => self.skip_parameters(node, parameters, "this element has no mapping"),
         }
-        if !repeat_bound {
-            self.rewrite_multi_instance(node);
-        }
         self.rewrite_foreign_attributes(node);
         self.finish_extension(node, ext);
         if local == "subProcess" {
             self.prepare_subprocess(node);
             self.rewrite_graph(node);
+        }
+        // Last, so the expressions of a subprocess body are already read when
+        // the element variable is looked up in them.
+        if !repeat_bound {
+            self.rewrite_multi_instance(node);
         }
     }
 
@@ -615,6 +712,13 @@ impl<'a> Importer<'a> {
     /// foreign document cannot have.
     fn prepare_subprocess(&mut self, node: &mut Element) {
         let offset = node.offset;
+        if let Some(id) = node.attr("id") {
+            if !node.children.iter().any(|c| {
+                c.is(BPMN, "extensionElements") && c.children.iter().any(|e| e.is(TF, "subProcess"))
+            }) {
+                self.synthesized_subprocesses.insert(id.to_string());
+            }
+        }
         let position = node
             .children
             .iter()
@@ -622,11 +726,12 @@ impl<'a> Importer<'a> {
         let extension = match position {
             Some(position) => &mut node.children[position],
             None => {
+                let at = leading_documentation(&node.children);
                 node.children.insert(
-                    0,
+                    at,
                     element(BPMN, "extensionElements", &[], Vec::new(), "", offset),
                 );
-                &mut node.children[0]
+                &mut node.children[at]
             }
         };
         if !extension.children.iter().any(|c| c.is(TF, "subProcess")) {
@@ -658,6 +763,18 @@ impl<'a> Importer<'a> {
             .as_ref()
             .is_some_and(|extension| extension.children.iter().any(|c| c.is(TF, "service")));
         if native {
+            for (name, value) in [
+                ("class", &class),
+                ("delegateExpression", &delegate),
+                ("expression", &expression),
+                ("type", &kind),
+                ("topic", &topic),
+                ("resultVariable", &result_variable),
+            ] {
+                if let Some(value) = value {
+                    self.native_attribute_ignored(node, name, value);
+                }
+            }
             self.skip_parameters(
                 node,
                 parameters,
@@ -753,6 +870,14 @@ impl<'a> Importer<'a> {
             "a script task has no input or output mapping",
         );
         if format.as_deref() == Some(CEL_SCRIPT_FORMAT) {
+            for (name, value) in [
+                ("resource", &resource),
+                ("resultVariable", &result_variable),
+            ] {
+                if let Some(value) = value {
+                    self.native_attribute_ignored(node, name, value);
+                }
+            }
             return;
         }
         if resource.is_some() {
@@ -862,13 +987,30 @@ impl<'a> Importer<'a> {
             .is_some_and(|extension| extension.children.iter().any(|c| c.is(TF, "user")));
         self.skip_parameters_input(node, &parameters);
         if native {
+            if let Some(login) = &assignee {
+                self.native_attribute_ignored(node, "assignee", login);
+            }
+            if !parameters.output.is_empty() {
+                self.report(
+                    Severity::Warning,
+                    "CAMUNDA_PARAMETERS_SKIPPED",
+                    node,
+                    "output parameters were not imported: the step already has a TentaFlow \
+                     output mapping"
+                        .into(),
+                );
+            }
             return;
         }
         let mut user_id = None;
         if let Some(login) = assignee {
-            let resolved = (!login.contains("${") && !login.contains("#{"))
-                .then(|| (self.resolve_login)(&login))
-                .flatten();
+            let lookup = !login.contains("${")
+                && !login.contains("#{")
+                && self.login_lookups < MAX_LOGIN_LOOKUPS;
+            if lookup {
+                self.login_lookups += 1;
+            }
+            let resolved = lookup.then(|| (self.resolve_login)(&login)).flatten();
             match resolved {
                 Some(id) => user_id = Some(id),
                 None => self.report(
@@ -898,6 +1040,19 @@ impl<'a> Importer<'a> {
         ext.get_or_insert_with(|| element(BPMN, "extensionElements", &[], Vec::new(), "", offset))
             .children
             .insert(0, user);
+    }
+
+    fn native_attribute_ignored(&mut self, node: &Element, name: &str, value: &str) {
+        self.report(
+            Severity::Warning,
+            "CAMUNDA_NATIVE_STEP_ATTRIBUTE_IGNORED",
+            node,
+            format!(
+                "camunda:{name}=\"{}\" was not imported: the step already carries its \
+                 TentaFlow definition",
+                clip(value)
+            ),
+        );
     }
 
     fn skip_parameters(&mut self, node: &Element, parameters: Parameters, reason: &str) {
@@ -941,6 +1096,7 @@ impl<'a> Importer<'a> {
         let id = node.attr("id").unwrap_or_default().to_string();
 
         let mut cardinality = None;
+        let mut invalid = false;
         for child in &mut mi.children {
             if child.is(BPMN, "extensionElements") {
                 let _ = self.camunda_extension_children(node, child);
@@ -960,14 +1116,30 @@ impl<'a> Importer<'a> {
             } else if child.is(BPMN, "loopCardinality") {
                 cardinality = Some(child.text.trim().to_string());
             } else if child.is(BPMN, "completionCondition") {
+                invalid = true;
                 self.report(
-                    Severity::Warning,
-                    "CAMUNDA_MULTI_INSTANCE_COMPLETION_SKIPPED",
+                    Severity::Fatal,
+                    "CAMUNDA_MULTI_INSTANCE_COMPLETION",
                     node,
-                    "the completion condition was not imported; every instance runs to the end"
+                    "a completion condition ends the activity early; TentaFlow runs every \
+                     instance to the end, so the behavior would change"
                         .into(),
                 );
             }
+        }
+        if invalid {
+            return;
+        }
+        if collection.is_some() && cardinality.is_some() {
+            self.report(
+                Severity::Fatal,
+                "CAMUNDA_MULTI_INSTANCE_INPUT",
+                node,
+                "the activity names both a collection and a loop cardinality; which one wins is \
+                 not carried over"
+                    .into(),
+            );
+            return;
         }
         let input = if let Some(collection) = collection {
             let source = if has_wrapper(&collection) {
@@ -1025,29 +1197,36 @@ impl<'a> Importer<'a> {
             return;
         };
         if let Some(variable) = element_variable {
+            let used = self.uses_name(node, &variable);
             self.report(
-                Severity::Warning,
+                if used {
+                    Severity::Fatal
+                } else {
+                    Severity::Warning
+                },
                 "CAMUNDA_MULTI_INSTANCE_ELEMENT_VARIABLE",
                 node,
-                format!(
-                    "element variable {variable} is not bound; an expression of this activity \
-                     that reads it sees the process variable of that name, while TentaFlow \
-                     exposes the current item as repeat.item"
-                ),
+                if used {
+                    format!(
+                        "element variable {variable} is read by an expression of this activity, \
+                         but TentaFlow exposes the current item as repeat.item, so the \
+                         expression would read another variable"
+                    )
+                } else {
+                    format!(
+                        "element variable {variable} is not bound; TentaFlow exposes the \
+                         current item as repeat.item"
+                    )
+                },
             );
+            if used {
+                return;
+            }
         }
         let output_collection_variable = results_variable(&id);
-        self.report(
-            Severity::Warning,
-            "CAMUNDA_MULTI_INSTANCE_OUTPUT_VARIABLE",
-            node,
-            format!(
-                "TentaFlow collects the results of a repeat into a variable; {output_collection_variable} \
-                 was declared for it"
-            ),
-        );
         self.repeats.push(RepeatPatch {
             node_id: id,
+            base_name: output_collection_variable.clone(),
             spec: ProcessRepeatSpec::MultiInstance {
                 mode: if sequential {
                     ProcessMultiInstanceMode::Sequential
@@ -1058,6 +1237,18 @@ impl<'a> Importer<'a> {
                 output_collection_variable,
             },
         });
+    }
+
+    /// Whether an expression read inside `node` (or a step nested in it) names
+    /// the variable as a free identifier.
+    fn uses_name(&self, node: &Element, name: &str) -> bool {
+        let mut ids = Vec::new();
+        collect_ids(node, &mut ids);
+        ids.iter().any(|id| {
+            self.sources
+                .get(id)
+                .is_some_and(|sources| sources.iter().any(|text| mentions_name(text, name)))
+        })
     }
 
     // ----- extension elements and attributes -----
@@ -1074,7 +1265,9 @@ impl<'a> Importer<'a> {
     fn finish_extension(&mut self, owner: &mut Element, extension: Option<Element>) {
         if let Some(extension) = extension {
             if !extension.children.is_empty() {
-                owner.children.insert(0, extension);
+                // The strict reader wants documentation before the extension.
+                let at = leading_documentation(&owner.children);
+                owner.children.insert(at, extension);
             }
         }
     }
@@ -1152,10 +1345,17 @@ impl<'a> Importer<'a> {
                         .map(|c| c.text.trim().to_string())
                         .unwrap_or_default();
                     parameters.connector = Some(connector.clone());
-                    for inner in &child.children {
-                        if inner.is(CAMUNDA_NAMESPACE, "inputOutput") {
-                            self.read_parameters(owner, inner, &mut parameters);
-                        }
+                    if child
+                        .children
+                        .iter()
+                        .any(|inner| inner.is(CAMUNDA_NAMESPACE, "inputOutput"))
+                    {
+                        self.report(
+                            Severity::Warning,
+                            "CAMUNDA_CONNECTOR_PARAMETERS_SKIPPED",
+                            owner,
+                            format!("the parameters of connector {connector} belong to it and were not imported"),
+                        );
                     }
                     self.report(
                         Severity::Warning,
@@ -1278,7 +1478,7 @@ impl<'a> Importer<'a> {
                 continue;
             } else {
                 let cel = cel_string(&raw);
-                self.translations.push(ProcessImportTranslation {
+                self.record_translation(ProcessImportTranslation {
                     element_id: owner.attr("id").unwrap_or_default().to_string(),
                     kind: kind.into(),
                     original: raw.clone(),
@@ -1306,9 +1506,25 @@ impl<'a> Importer<'a> {
     fn drop_unprefixed(&mut self, element: &mut Element, names: &[&str]) {
         for name in names {
             if let Some(value) = element.attrs.remove(&(String::new(), (*name).to_string())) {
+                // Only a value that differs from the BPMN default carries meaning.
+                let lost = matches!(
+                    (*name, value.as_str()),
+                    ("isForCompensation", v) | ("parallelMultiple", v) if v != "false"
+                ) || matches!(
+                    (*name, value.as_str()),
+                    ("startQuantity", v) | ("completionQuantity", v) if v != "1"
+                );
                 self.report(
-                    Severity::Info,
-                    "CAMUNDA_ATTRIBUTE_IGNORED",
+                    if lost {
+                        Severity::Warning
+                    } else {
+                        Severity::Info
+                    },
+                    if lost {
+                        "CAMUNDA_ATTRIBUTE_LOST"
+                    } else {
+                        "CAMUNDA_ATTRIBUTE_IGNORED"
+                    },
                     element,
                     format!(
                         "attribute {name}=\"{}\" has no TentaFlow counterpart",
@@ -1435,6 +1651,38 @@ impl<'a> Importer<'a> {
             kept.push(child);
         }
         element.children = kept;
+    }
+
+    /// Every `xsi:type` left after the rewrite must be a BPMN formal expression;
+    /// the tolerant reader kept the others so they could be judged here.
+    fn verify_xsi_types(&mut self, root: &Element) {
+        let known = [
+            format!("{{{BPMN}}}tFormalExpression"),
+            format!("{{{BPMN}}}tExpression"),
+        ];
+        let mut pending = vec![(root, root)];
+        while let Some((element, nearest)) = pending.pop() {
+            let owner = if element.attr("id").is_some() {
+                element
+            } else {
+                nearest
+            };
+            if let Some(value) = element.attrs.get(&(XSI.to_string(), "type".to_string())) {
+                // A condition already refused for this reason is not listed twice.
+                let reported = owner
+                    .attr("id")
+                    .is_some_and(|id| self.fatal_elements.contains(id));
+                if !known.contains(value) && !reported {
+                    self.report(
+                        Severity::Fatal,
+                        "CAMUNDA_UNSUPPORTED_XSI_TYPE",
+                        owner,
+                        format!("{} has the unsupported type {value}", element.local),
+                    );
+                }
+            }
+            pending.extend(element.children.iter().map(|child| (child, owner)));
+        }
     }
 
     // ----- diagram -----
@@ -1565,7 +1813,7 @@ fn diagnostic(
 ) -> ProcessDiagnostic {
     ProcessDiagnostic {
         code: code.into(),
-        message,
+        message: clip_to(&message, MAX_MESSAGE_CHARS),
         element_id,
         offset,
         fatal: severity == Severity::Fatal,
@@ -1683,6 +1931,15 @@ fn bounded_origin(origin: &str) -> String {
     clean
 }
 
+fn clip_to(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut clipped: String = text.chars().take(limit).collect();
+    clipped.push('…');
+    clipped
+}
+
 fn clip(text: &str) -> String {
     const LIMIT: usize = 80;
     if text.chars().count() <= LIMIT {
@@ -1723,4 +1980,166 @@ fn cel_string(text: &str) -> String {
     }
     literal.push('"');
     literal
+}
+
+/// Number of `documentation` children at the front, where the strict reader
+/// expects them ahead of the extension.
+fn leading_documentation(children: &[Element]) -> usize {
+    children
+        .iter()
+        .take_while(|child| child.is(BPMN, "documentation"))
+        .count()
+}
+
+fn collect_ids(element: &Element, ids: &mut Vec<String>) {
+    if let Some(id) = element.attr("id") {
+        ids.push(id.to_string());
+    }
+    for child in &element.children {
+        collect_ids(child, ids);
+    }
+}
+
+/// Whether `name` occurs in `text` as a whole identifier.
+fn mentions_name(text: &str, name: &str) -> bool {
+    let is_part = |c: char| c.is_alphanumeric() || c == '_';
+    text.match_indices(name).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + name.len()..].chars().next();
+        !before.is_some_and(is_part) && !after.is_some_and(is_part)
+    })
+}
+
+/// Every variable name a node set declares or writes, at any depth.
+fn collect_names(
+    nodes: &[ProcessNode],
+    variables: &BTreeMap<String, serde_json::Value>,
+    taken: &mut BTreeSet<String>,
+) {
+    taken.extend(variables.keys().cloned());
+    for node in nodes {
+        written_names(node, taken);
+        if let ProcessNodeKind::SubProcess { body, .. } = &node.kind {
+            collect_names(&body.nodes, &body.variables, taken);
+        }
+    }
+}
+
+/// Names a node writes into its scope, nested subprocess bodies excluded.
+fn written_names(node: &ProcessNode, names: &mut BTreeSet<String>) {
+    let mapping = match &node.kind {
+        ProcessNodeKind::UserTask { output_mapping, .. }
+        | ProcessNodeKind::ServiceTask { output_mapping, .. }
+        | ProcessNodeKind::ScriptTask { output_mapping, .. }
+        | ProcessNodeKind::SubProcess { output_mapping, .. }
+        | ProcessNodeKind::MessageStart { output_mapping, .. }
+        | ProcessNodeKind::MessageCatch { output_mapping, .. }
+        | ProcessNodeKind::ReceiveTask { output_mapping, .. }
+        | ProcessNodeKind::SignalCatch { output_mapping, .. }
+        | ProcessNodeKind::BoundaryMessage { output_mapping, .. }
+        | ProcessNodeKind::BoundaryError { output_mapping, .. }
+        | ProcessNodeKind::BoundaryEscalation { output_mapping, .. } => Some(output_mapping),
+        _ => None,
+    };
+    if let Some(mapping) = mapping {
+        names.extend(mapping.keys().cloned());
+    }
+    if let Some(
+        ProcessRepeatSpec::MultiInstance {
+            output_collection_variable,
+            ..
+        }
+        | ProcessRepeatSpec::StructuredLoop {
+            output_collection_variable,
+            ..
+        },
+    ) = &node.repeat
+    {
+        names.insert(output_collection_variable.clone());
+    }
+}
+
+/// `base`, or `base_2`, `base_3`, ... — the first not in `taken`.
+fn free_name(base: &str, taken: &BTreeSet<String>) -> String {
+    if !taken.contains(base) {
+        return base.to_string();
+    }
+    (2..)
+        .map(|n| format!("{base}_{n}"))
+        .find(|candidate| !taken.contains(candidate))
+        .expect("an unbounded counter finds a free name")
+}
+
+fn outputs_reference(name: &str) -> String {
+    let plain = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if plain {
+        format!("outputs.{name}")
+    } else {
+        format!("outputs[{}]", cel_string(name))
+    }
+}
+
+fn vars_reference(name: &str) -> String {
+    outputs_reference(name).replacen("outputs", "vars", 1)
+}
+
+/// Camunda lets a variable set inside an embedded subprocess flow up the scope
+/// chain; TentaFlow keeps it local unless the subprocess maps it out. For every
+/// subprocess this importer created, each name written inside the body is
+/// declared on both sides and copied out, keeping the parent's value when the
+/// body never set one. Subprocesses that hold steps with an unknown real
+/// implementation are collected in `uncertain`.
+fn propagate_subprocess_outputs(
+    nodes: &mut [ProcessNode],
+    variables: &mut BTreeMap<String, serde_json::Value>,
+    synthesized: &HashSet<String>,
+    uncertain: &mut Vec<String>,
+) {
+    for node in nodes.iter_mut() {
+        let id = node.id.clone();
+        let ProcessNodeKind::SubProcess {
+            body,
+            output_mapping,
+            ..
+        } = &mut node.kind
+        else {
+            continue;
+        };
+        propagate_subprocess_outputs(&mut body.nodes, &mut body.variables, synthesized, uncertain);
+        if !synthesized.contains(&id) {
+            continue;
+        }
+        let mut written = BTreeSet::new();
+        for inner in &body.nodes {
+            written_names(inner, &mut written);
+        }
+        for name in written {
+            body.variables
+                .entry(name.clone())
+                .or_insert(serde_json::Value::Null);
+            variables
+                .entry(name.clone())
+                .or_insert(serde_json::Value::Null);
+            let out = outputs_reference(&name);
+            output_mapping
+                .entry(name.clone())
+                .or_insert_with(|| format!("{out} != null ? {out} : {}", vars_reference(&name)));
+        }
+        if holds_unknown_steps(&body.nodes) {
+            uncertain.push(id);
+        }
+    }
+}
+
+fn holds_unknown_steps(nodes: &[ProcessNode]) -> bool {
+    nodes.iter().any(|node| match &node.kind {
+        ProcessNodeKind::ServiceTask {
+            implementation: ServiceImplementation::Unbound { .. },
+            ..
+        }
+        | ProcessNodeKind::CallActivity(_) => true,
+        ProcessNodeKind::SubProcess { body, .. } => holds_unknown_steps(&body.nodes),
+        _ => false,
+    })
 }

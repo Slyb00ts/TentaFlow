@@ -199,7 +199,9 @@ fn ns_text(result: ResolveResult<'_>) -> Result<String> {
 /// below it (definitions > process > three subprocess levels > task >
 /// extension > parameter); the cap keeps a hostile document from building a
 /// tree whose recursive drop or walk could exhaust a worker thread's stack.
-const MAX_TOLERANT_DEPTH: usize = 64;
+/// Measured: with ids on every level, a debug build on a 2 MiB test thread
+/// overflows at 58 nested subprocesses, so 64 was too generous.
+const MAX_TOLERANT_DEPTH: usize = 32;
 
 fn parse_tree(xml: &str) -> Result<Element> {
     parse_tree_with(xml, false)
@@ -2647,7 +2649,8 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                             && service.attr("nodeType").is_none()
                             && service.attr("agentId").is_none()
                             && service.child(TF, "blockConfig")?.is_none()
-                            && service.child(TF, "agentConfig")?.is_none(),
+                            && service.child(TF, "agentConfig")?.is_none()
+                            && service.attr("origin").is_none(),
                         "flow service cannot name an addon tool, a block or an agent"
                     );
                     (service.required("flowId")?, ServiceImplementation::Flow)
@@ -2658,7 +2661,8 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                             && service.attr("addonId").is_none()
                             && service.attr("toolName").is_none()
                             && service.attr("agentId").is_none()
-                            && service.child(TF, "agentConfig")?.is_none(),
+                            && service.child(TF, "agentConfig")?.is_none()
+                            && service.attr("origin").is_none(),
                         "block service cannot name a flow, an addon tool or an agent"
                     );
                     let config = match service.child(TF, "blockConfig")? {
@@ -2684,7 +2688,8 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                             && service.attr("nodeType").is_none()
                             && service.attr("agentId").is_none()
                             && service.child(TF, "blockConfig")?.is_none()
-                            && service.child(TF, "agentConfig")?.is_none(),
+                            && service.child(TF, "agentConfig")?.is_none()
+                            && service.attr("origin").is_none(),
                         "tool service cannot name a flow, a block or an agent"
                     );
                     (
@@ -2701,7 +2706,8 @@ fn node_from_xml(element: &Element, target_namespace: &str) -> Result<ProcessNod
                             && service.attr("addonId").is_none()
                             && service.attr("toolName").is_none()
                             && service.attr("nodeType").is_none()
-                            && service.child(TF, "blockConfig")?.is_none(),
+                            && service.child(TF, "blockConfig")?.is_none()
+                            && service.attr("origin").is_none(),
                         "agent service cannot name a flow, an addon tool or a block"
                     );
                     let config = service

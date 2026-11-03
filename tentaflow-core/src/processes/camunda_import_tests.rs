@@ -13,6 +13,7 @@ use super::bpmn::{
     import_document, import_xml, CamundaImport,
 };
 use super::model::{all_nodes, starter_model, validate_draft, validate_model};
+use super::runtime::test_support::{start_model, Fixture};
 
 const HEAD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:camunda="http://camunda.org/schema/1.0/bpmn" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" id="Definitions_1" targetNamespace="http://bpmn.io/schema/bpmn" exporter="Camunda Modeler" exporterVersion="5.0.0">"#;
@@ -642,7 +643,7 @@ fn a_plain_variable_name_collection_and_a_literal_cardinality_are_supported() {
             if expression.contains("vars.items")
     ));
     let counted = import_camunda_xml(&linear(
-        r#"<bpmn:userTask id="Task_1"><bpmn:multiInstanceLoopCharacteristics><bpmn:loopCardinality>3</bpmn:loopCardinality><bpmn:completionCondition xsi:type="bpmn:tFormalExpression">${nrOfCompletedInstances &gt;= 2}</bpmn:completionCondition></bpmn:multiInstanceLoopCharacteristics></bpmn:userTask>"#,
+        r#"<bpmn:userTask id="Task_1"><bpmn:multiInstanceLoopCharacteristics><bpmn:loopCardinality>3</bpmn:loopCardinality></bpmn:multiInstanceLoopCharacteristics></bpmn:userTask>"#,
     ));
     let model = assert_clean_import(&counted);
     assert!(matches!(
@@ -652,8 +653,87 @@ fn a_plain_variable_name_collection_and_a_literal_cardinality_are_supported() {
             ..
         })
     ));
-    // Dropping the early-exit rule changes behavior, so it is not silent.
-    only(&counted, "CAMUNDA_MULTI_INSTANCE_COMPLETION_SKIPPED");
+}
+
+#[test]
+fn a_completion_condition_is_fatal_because_it_changes_behavior() {
+    let imported = import_camunda_xml(&linear(
+        r#"<bpmn:userTask id="Task_1"><bpmn:multiInstanceLoopCharacteristics camunda:collection="items"><bpmn:completionCondition xsi:type="bpmn:tFormalExpression">${nrOfCompletedInstances &gt;= 2}</bpmn:completionCondition></bpmn:multiInstanceLoopCharacteristics></bpmn:userTask>"#,
+    ));
+    assert!(imported.model.is_none());
+    let fatal = only(&imported, "CAMUNDA_MULTI_INSTANCE_COMPLETION");
+    assert_eq!(fatal.severity, Some(Severity::Fatal));
+    assert_eq!(fatal.element_id.as_deref(), Some("Task_1"));
+}
+
+#[test]
+fn a_collection_together_with_a_cardinality_is_fatal() {
+    let imported = import_camunda_xml(&linear(
+        r#"<bpmn:userTask id="Task_1"><bpmn:multiInstanceLoopCharacteristics camunda:collection="items"><bpmn:loopCardinality>3</bpmn:loopCardinality></bpmn:multiInstanceLoopCharacteristics></bpmn:userTask>"#,
+    ));
+    assert!(imported.model.is_none());
+    let fatal = only(&imported, "CAMUNDA_MULTI_INSTANCE_INPUT");
+    assert_eq!(fatal.element_id.as_deref(), Some("Task_1"));
+}
+
+#[test]
+fn an_element_variable_read_by_the_activity_is_fatal_and_an_unused_one_a_warning() {
+    let read = import_camunda_xml(&linear(
+        r#"<bpmn:userTask id="Task_1"><bpmn:extensionElements><camunda:inputOutput><camunda:outputParameter name="seen">${item.name}</camunda:outputParameter></camunda:inputOutput></bpmn:extensionElements><bpmn:multiInstanceLoopCharacteristics camunda:collection="items" camunda:elementVariable="item"/></bpmn:userTask>"#,
+    ));
+    assert!(read.model.is_none());
+    let fatal = only(&read, "CAMUNDA_MULTI_INSTANCE_ELEMENT_VARIABLE");
+    assert_eq!(fatal.severity, Some(Severity::Fatal));
+    assert_eq!(fatal.element_id.as_deref(), Some("Task_1"));
+    // A longer name that merely contains it is not a read of it.
+    let other = import_camunda_xml(&linear(
+        r#"<bpmn:userTask id="Task_1"><bpmn:extensionElements><camunda:inputOutput><camunda:outputParameter name="seen">${items.size}</camunda:outputParameter></camunda:inputOutput></bpmn:extensionElements><bpmn:multiInstanceLoopCharacteristics camunda:collection="items" camunda:elementVariable="item"/></bpmn:userTask>"#,
+    ));
+    assert_clean_import(&other);
+    assert_eq!(
+        only(&other, "CAMUNDA_MULTI_INSTANCE_ELEMENT_VARIABLE").severity,
+        Some(Severity::Warning)
+    );
+}
+
+#[test]
+fn colliding_results_variables_get_deterministic_suffixes_and_are_reported() {
+    let xml = process(
+        r#"<bpmn:startEvent id="Start_1"/>
+        <bpmn:userTask id="Task-1"><bpmn:multiInstanceLoopCharacteristics camunda:collection="items"/></bpmn:userTask>
+        <bpmn:userTask id="Task.1"><bpmn:multiInstanceLoopCharacteristics camunda:collection="items"/></bpmn:userTask>
+        <bpmn:serviceTask id="Task_9" camunda:class="x.Y" camunda:resultVariable="Task_1_results"/>
+        <bpmn:endEvent id="End_1"/>
+        <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="Task-1"/>
+        <bpmn:sequenceFlow id="Flow_2" sourceRef="Task-1" targetRef="Task.1"/>
+        <bpmn:sequenceFlow id="Flow_3" sourceRef="Task.1" targetRef="Task_9"/>
+        <bpmn:sequenceFlow id="Flow_4" sourceRef="Task_9" targetRef="End_1"/>"#,
+    );
+    let imported = import_camunda_xml(&xml);
+    let model = assert_clean_import(&imported);
+    let output = |id: &str| match &node(model, id).repeat {
+        Some(ProcessRepeatSpec::MultiInstance {
+            output_collection_variable,
+            ..
+        }) => output_collection_variable.clone(),
+        other => panic!("{id}: {other:?}"),
+    };
+    // The step's own result variable owns the plain name; the two repeats that
+    // sanitize identically take the next free ones, in document order.
+    assert_eq!(output("Task-1"), "Task_1_results_2");
+    assert_eq!(output("Task.1"), "Task_1_results_3");
+    for name in ["Task_1_results_2", "Task_1_results_3"] {
+        assert!(model.variables.contains_key(name));
+    }
+    let reports = diagnostics(&imported, "CAMUNDA_MULTI_INSTANCE_OUTPUT_VARIABLE");
+    assert_eq!(reports.len(), 2);
+    assert!(
+        reports[0].message.contains("Task_1_results_2")
+            && reports[0].message.contains("already in use")
+    );
+    assert_eq!(reports[1].element_id.as_deref(), Some("Task.1"));
+    // And the whole thing is deterministic.
+    assert_eq!(import_camunda_xml(&xml).model.as_ref(), Some(model));
 }
 
 #[test]
@@ -866,23 +946,48 @@ fn a_gateway_with_a_warned_condition_gets_one_evaluation_semantics_warning() {
 }
 
 #[test]
-fn a_gateway_without_warned_conditions_gets_no_evaluation_semantics_warning() {
+fn every_gateway_with_two_conditions_is_warned_even_when_nothing_else_is() {
     let imported = import_camunda_xml(&gateway(&formal("", "${true}"), &formal("", "${false}")));
     assert_clean_import(&imported);
-    assert!(diagnostics(&imported, "CAMUNDA_GATEWAY_EVAL_SEMANTICS").is_empty());
     assert!(diagnostics(&imported, "CAMUNDA_EXPRESSION_WARNING").is_empty());
+    let warning = only(&imported, "CAMUNDA_GATEWAY_EVAL_SEMANTICS");
+    assert_eq!(warning.severity, Some(Severity::Warning));
+    assert_eq!(warning.element_id.as_deref(), Some("Split_1"));
+}
+
+#[test]
+fn a_gateway_with_one_condition_and_a_default_is_not_warned() {
+    let xml = gateway(&formal("", "${true}"), "").replace(
+        "<bpmn:exclusiveGateway id=\"Split_1\"/>",
+        "<bpmn:exclusiveGateway id=\"Split_1\" default=\"Flow_B\"/>",
+    );
+    let imported = import_camunda_xml(&xml);
+    assert_clean_import(&imported);
+    assert!(diagnostics(&imported, "CAMUNDA_GATEWAY_EVAL_SEMANTICS").is_empty());
 }
 
 #[test]
 fn a_condition_already_in_cel_passes_through() {
     let cel = import_camunda_xml(&gateway(
         &formal("https://cel.dev/spec", "vars.amount > 100"),
-        "<bpmn:conditionExpression>vars.amount &lt;= 100</bpmn:conditionExpression>",
+        &formal("https://cel.dev/spec", "vars.amount &lt;= 100"),
     ));
     let model = assert_clean_import(&cel);
     assert_eq!(condition_of(model, "Flow_A"), Some("vars.amount > 100"));
     assert_eq!(condition_of(model, "Flow_B"), Some("vars.amount <= 100"));
     assert!(cel.translations.is_empty());
+}
+
+#[test]
+fn a_condition_without_a_language_or_wrapper_is_fatal_not_guessed_as_cel() {
+    let imported = import_camunda_xml(&gateway(
+        &formal("", "vars.amount > 100"),
+        &formal("", "${true}"),
+    ));
+    assert!(imported.model.is_none());
+    let fatal = only(&imported, "CAMUNDA_CONDITION_UNTYPED");
+    assert_eq!(fatal.severity, Some(Severity::Fatal));
+    assert_eq!(fatal.element_id.as_deref(), Some("Flow_A"));
 }
 
 #[test]
@@ -1099,7 +1204,7 @@ fn mixed_process() -> String {
           </bpmn:extensionElements>
           <bpmn:incoming>Flow_0</bpmn:incoming><bpmn:outgoing>Flow_1</bpmn:outgoing>
         </bpmn:userTask>
-        <bpmn:exclusiveGateway id="Split_1" default="Flow_Low"/>
+        <bpmn:exclusiveGateway id="Split_1"/>
         <bpmn:serviceTask id="Charge_1" name="Charge card" camunda:type="external" camunda:topic="charge-card" camunda:exclusive="false"/>
         <bpmn:serviceTask id="Notify_1" camunda:delegateExpression="${mailer}" camunda:resultVariable="mailId">
           <bpmn:extensionElements><camunda:failedJobRetryTimeCycle>R3/PT5M</camunda:failedJobRetryTimeCycle></bpmn:extensionElements>
@@ -1115,7 +1220,9 @@ fn mixed_process() -> String {
         <bpmn:sequenceFlow id="Flow_High" name="over 100" sourceRef="Split_1" targetRef="Charge_1">
           <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${total &gt; 100 &amp;&amp; approved}</bpmn:conditionExpression>
         </bpmn:sequenceFlow>
-        <bpmn:sequenceFlow id="Flow_Low" sourceRef="Split_1" targetRef="Calc_1"/>
+        <bpmn:sequenceFlow id="Flow_Low" sourceRef="Split_1" targetRef="Calc_1">
+          <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${total &lt;= 100}</bpmn:conditionExpression>
+        </bpmn:sequenceFlow>
         <bpmn:sequenceFlow id="Flow_2" sourceRef="Charge_1" targetRef="Notify_1"/>
         <bpmn:sequenceFlow id="Flow_3" sourceRef="Notify_1" targetRef="Each_1"/>
         <bpmn:sequenceFlow id="Flow_4" sourceRef="Each_1" targetRef="Join_1"/>
@@ -1152,33 +1259,67 @@ fn a_realistic_mixed_process_imports_with_the_expected_diagnostics() {
         &node(model, "Calc_1").kind,
         ProcessNodeKind::ScriptTask { .. }
     ));
-    for code in [
-        "CAMUNDA_CANDIDATES_SKIPPED",
-        "CAMUNDA_FORM_SKIPPED",
-        "CAMUNDA_LISTENER_SKIPPED",
-        "CAMUNDA_RETRY_CYCLE_SKIPPED",
-        "CAMUNDA_GATEWAY_EVAL_SEMANTICS",
-        "CAMUNDA_MULTI_INSTANCE_ELEMENT_VARIABLE",
-    ] {
-        only(&imported, code);
+    // Code, owner and grade of every diagnostic the process must raise.
+    let expect = [
+        ("CAMUNDA_CANDIDATES_SKIPPED", "Review_1", Severity::Warning),
+        ("CAMUNDA_FORM_SKIPPED", "Start_1", Severity::Warning),
+        ("CAMUNDA_LISTENER_SKIPPED", "Review_1", Severity::Warning),
+        ("CAMUNDA_RETRY_CYCLE_SKIPPED", "Notify_1", Severity::Warning),
+        (
+            "CAMUNDA_GATEWAY_EVAL_SEMANTICS",
+            "Split_1",
+            Severity::Warning,
+        ),
+        (
+            "CAMUNDA_MULTI_INSTANCE_ELEMENT_VARIABLE",
+            "Each_1",
+            Severity::Warning,
+        ),
+        (
+            "CAMUNDA_MULTI_INSTANCE_OUTPUT_VARIABLE",
+            "Each_1",
+            Severity::Warning,
+        ),
+        ("CAMUNDA_HISTORY_TTL_IGNORED", "Process_1", Severity::Info),
+    ];
+    assert!(diagnostics(&imported, "CAMUNDA_ASSIGNEE_UNRESOLVED").is_empty());
+    for (code, element, severity) in expect {
+        let found = only(&imported, code);
+        assert_eq!(found.element_id.as_deref(), Some(element), "{code}");
+        assert_eq!(found.severity, Some(severity), "{code}");
     }
-    assert_eq!(diagnostics(&imported, "CAMUNDA_SERVICE_UNBOUND").len(), 3);
-    assert_eq!(diagnostics(&imported, "CAMUNDA_ASYNC_IGNORED").len(), 2);
-    only(&imported, "CAMUNDA_HISTORY_TTL_IGNORED");
+    let unbound = diagnostics(&imported, "CAMUNDA_SERVICE_UNBOUND");
+    let mut owners: Vec<_> = unbound
+        .iter()
+        .map(|d| d.element_id.clone().unwrap())
+        .collect();
+    owners.sort();
+    assert_eq!(owners, ["Charge_1", "Each_1", "Notify_1"]);
+    assert!(unbound
+        .iter()
+        .all(|d| d.severity == Some(Severity::Warning)));
+    let asyncs = diagnostics(&imported, "CAMUNDA_ASYNC_IGNORED");
+    let mut owners: Vec<_> = asyncs
+        .iter()
+        .map(|d| d.element_id.clone().unwrap())
+        .collect();
+    owners.sort();
+    assert_eq!(owners, ["Charge_1", "Review_1"]);
+    assert!(asyncs.iter().all(|d| d.severity == Some(Severity::Info)));
     let kinds: Vec<_> = imported
         .translations
         .iter()
         .map(|t| t.kind.as_str())
         .collect();
-    for kind in [
-        "condition",
-        "script",
-        "multi_instance_collection",
-        "output_parameter",
+    for (kind, count) in [
+        ("condition", 2),
+        ("script", 1),
+        ("multi_instance_collection", 1),
+        ("output_parameter", 1),
     ] {
         assert_eq!(
             kinds.iter().filter(|k| **k == kind).count(),
-            1,
+            count,
             "{kind} in {kinds:?}"
         );
     }
@@ -1215,4 +1356,367 @@ fn the_exported_draft_re_enters_the_tolerant_path_unchanged() {
         tolerant.diagnostics
     );
     assert_eq!(tolerant.model.as_ref(), Some(&model));
+}
+
+// ----- scope of variables written inside an embedded subprocess -----
+
+fn subprocess_process(inner: &str, after: &str) -> String {
+    process(&format!(
+        r#"<bpmn:startEvent id="Start_1"/>
+        <bpmn:subProcess id="Sub_1">
+          <bpmn:startEvent id="SubStart_1"/>
+          {inner}
+          <bpmn:endEvent id="SubEnd_1"/>
+          <bpmn:sequenceFlow id="SubFlow_1" sourceRef="SubStart_1" targetRef="Inner_1"/>
+          <bpmn:sequenceFlow id="SubFlow_2" sourceRef="Inner_1" targetRef="SubEnd_1"/>
+        </bpmn:subProcess>
+        {after}
+        <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="Sub_1"/>"#
+    ))
+}
+
+fn subprocess_mapping(model: &ProcessModel) -> BTreeMap<String, String> {
+    match &node(model, "Sub_1").kind {
+        ProcessNodeKind::SubProcess { output_mapping, .. } => output_mapping.clone(),
+        other => panic!("subprocess expected: {other:?}"),
+    }
+}
+
+#[test]
+fn variables_written_inside_a_subprocess_are_mapped_out_by_name() {
+    let imported = import_camunda_xml(&subprocess_process(
+        r#"<bpmn:userTask id="Inner_1"><bpmn:extensionElements><camunda:inputOutput><camunda:outputParameter name="verdict">${approved}</camunda:outputParameter></camunda:inputOutput></bpmn:extensionElements></bpmn:userTask>"#,
+        r#"<bpmn:endEvent id="End_1"/><bpmn:sequenceFlow id="Flow_2" sourceRef="Sub_1" targetRef="End_1"/>"#,
+    ));
+    let model = assert_clean_import(&imported);
+    let mapping = subprocess_mapping(model);
+    assert_eq!(
+        mapping.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["verdict"]
+    );
+    assert!(mapping["verdict"].contains("outputs.verdict"));
+    assert!(model.variables.contains_key("verdict"));
+    assert!(diagnostics(&imported, "CAMUNDA_SUBPROCESS_SCOPE").is_empty());
+}
+
+#[test]
+fn a_subprocess_with_unknown_steps_warns_that_their_writes_cannot_be_mapped() {
+    let imported = import_camunda_xml(&subprocess_process(
+        r#"<bpmn:serviceTask id="Inner_1" camunda:delegateExpression="${bean}"/>"#,
+        r#"<bpmn:endEvent id="End_1"/><bpmn:sequenceFlow id="Flow_2" sourceRef="Sub_1" targetRef="End_1"/>"#,
+    ));
+    assert_clean_import(&imported);
+    let warning = only(&imported, "CAMUNDA_SUBPROCESS_SCOPE");
+    assert_eq!(warning.severity, Some(Severity::Warning));
+    assert_eq!(warning.element_id.as_deref(), Some("Sub_1"));
+}
+
+#[test]
+fn a_native_subprocess_keeps_its_own_mapping() {
+    let imported = import_camunda_xml(&subprocess_process(
+        r#"<bpmn:userTask id="Inner_1"><bpmn:extensionElements><camunda:inputOutput><camunda:outputParameter name="verdict">${approved}</camunda:outputParameter></camunda:inputOutput></bpmn:extensionElements></bpmn:userTask>"#,
+        r#"<bpmn:endEvent id="End_1"/><bpmn:sequenceFlow id="Flow_2" sourceRef="Sub_1" targetRef="End_1"/>"#,
+    ));
+    let model = assert_clean_import(&imported);
+    // Exported, the subprocess is TentaFlow's own: reading it again must not add to it.
+    let xml = export_xml(model).unwrap().replacen(
+        "<bpmn:definitions",
+        "<bpmn:definitions xmlns:camunda=\"http://camunda.org/schema/1.0/bpmn\"",
+        1,
+    );
+    let again = import_camunda_xml(&xml);
+    assert!(again.diagnostics.is_empty(), "{:#?}", again.diagnostics);
+    assert_eq!(again.model.as_ref(), Some(model));
+}
+
+#[tokio::test]
+async fn a_value_set_inside_a_subprocess_reaches_the_gateway_after_it_at_runtime() {
+    let split = r#"<bpmn:exclusiveGateway id="Split_1"/>
+        <bpmn:scriptTask id="Left_1" scriptFormat="juel" camunda:resultVariable="path"><bpmn:script>${'A'}</bpmn:script></bpmn:scriptTask>
+        <bpmn:scriptTask id="Right_1" scriptFormat="juel" camunda:resultVariable="path"><bpmn:script>${'B'}</bpmn:script></bpmn:scriptTask>
+        <bpmn:exclusiveGateway id="Join_1"/>
+        <bpmn:endEvent id="End_1"/>
+        <bpmn:sequenceFlow id="Flow_2" sourceRef="Sub_1" targetRef="Split_1"/>
+        <bpmn:sequenceFlow id="Flow_A" sourceRef="Split_1" targetRef="Left_1"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${verdict == 'approved'}</bpmn:conditionExpression></bpmn:sequenceFlow>
+        <bpmn:sequenceFlow id="Flow_B" sourceRef="Split_1" targetRef="Right_1"><bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">${verdict != 'approved'}</bpmn:conditionExpression></bpmn:sequenceFlow>
+        <bpmn:sequenceFlow id="Flow_A2" sourceRef="Left_1" targetRef="Join_1"/>
+        <bpmn:sequenceFlow id="Flow_B2" sourceRef="Right_1" targetRef="Join_1"/>
+        <bpmn:sequenceFlow id="Flow_E" sourceRef="Join_1" targetRef="End_1"/>"#;
+    let xml = subprocess_process(
+        r#"<bpmn:scriptTask id="Inner_1" scriptFormat="juel" camunda:resultVariable="verdict"><bpmn:script>${'approved'}</bpmn:script></bpmn:scriptTask>"#,
+        split,
+    );
+    let imported = import_camunda_xml(&xml);
+    let model = assert_clean_import(&imported);
+    let fixture = Fixture::new();
+    let started = start_model(&fixture, model);
+    assert_eq!(
+        started.status,
+        tentaflow_protocol::processes::ProcessInstanceStatus::Completed,
+        "{started:#?}"
+    );
+    assert_eq!(started.variables["verdict"], "approved");
+    // The branch that tests `verdict` ran, so the subprocess value crossed its scope.
+    assert_eq!(started.variables["path"], "A");
+
+    // Without the generated mapping the gateway cannot see the value at all.
+    let mut broken = model.clone();
+    if let ProcessNodeKind::SubProcess { output_mapping, .. } = &mut broken
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == "Sub_1")
+        .unwrap()
+        .kind
+    {
+        output_mapping.clear();
+    }
+    let blocked = start_model(&fixture, &broken);
+    assert_eq!(blocked.variables["verdict"], serde_json::Value::Null);
+    assert_eq!(blocked.variables["path"], "B");
+}
+
+// ----- strict reader and native steps -----
+
+fn declared(xml: String) -> String {
+    xml.replacen(
+        "<bpmn:definitions",
+        "<bpmn:definitions xmlns:camunda=\"http://camunda.org/schema/1.0/bpmn\"",
+        1,
+    )
+}
+
+#[test]
+fn strict_import_still_refuses_origin_on_a_step_that_is_not_unbound() {
+    let xml = export_xml(&unbound_model()).unwrap();
+    let base = r#"implementation="unbound" origin="delegateExpression:${bean}""#;
+    assert!(xml.contains(base));
+    for replacement in [
+        r#"flowId="f" origin="x""#,
+        r#"implementation="tool" addonId="a" toolName="t" origin="x""#,
+        r#"implementation="block" nodeType="n" origin="x""#,
+        r#"implementation="agent" agentId="a" maxIterations="3" origin="x""#,
+    ] {
+        let (model, diagnostics) = import_xml(&xml.replace(base, replacement));
+        assert!(model.is_none(), "{replacement}");
+        assert!(
+            diagnostics[0].fatal && diagnostics[0].severity.is_none(),
+            "{replacement}"
+        );
+    }
+}
+
+#[test]
+fn a_native_documented_manual_task_reimports_unchanged_when_the_namespace_is_declared() {
+    let mut model = starter_model();
+    model.nodes.insert(
+        1,
+        ProcessNode {
+            id: "Manual_1".into(),
+            name: "Prepare".into(),
+            kind: ProcessNodeKind::ManualTask {
+                assignee_user_id: None,
+                instructions: "Bring the form".into(),
+            },
+            repeat: None,
+            activity_io: None,
+        },
+    );
+    model.sequence_flows[0].target_id = "Manual_1".into();
+    model
+        .sequence_flows
+        .push(tentaflow_protocol::processes::ProcessSequenceFlow {
+            id: "Flow_M".into(),
+            source_id: "Manual_1".into(),
+            target_id: "End_1".into(),
+            condition: None,
+            call_start_node_id: None,
+        });
+    let xml = export_xml(&model).unwrap();
+    assert!(xml.contains("Bring the form"));
+    let (strict, diagnostics) = import_xml(&xml);
+    assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+    let tolerant = import_camunda_xml(&declared(xml));
+    assert!(
+        tolerant.diagnostics.is_empty(),
+        "{:#?}",
+        tolerant.diagnostics
+    );
+    assert_eq!(tolerant.model, strict);
+}
+
+#[test]
+fn camunda_attributes_on_a_step_that_already_has_a_tentaflow_definition_are_reported() {
+    let service = declared(export_xml(&unbound_model()).unwrap()).replacen(
+        "<bpmn:serviceTask ",
+        "<bpmn:serviceTask camunda:class=\"x.Y\" camunda:resultVariable=\"r\" ",
+        1,
+    );
+    let imported = import_camunda_xml(&service);
+    assert_eq!(imported.model.as_ref(), Some(&unbound_model()));
+    let ignored = diagnostics(&imported, "CAMUNDA_NATIVE_STEP_ATTRIBUTE_IGNORED");
+    assert_eq!(ignored.len(), 2);
+    assert!(ignored.iter().all(
+        |d| d.severity == Some(Severity::Warning) && d.element_id.as_deref() == Some("Task_1")
+    ));
+
+    let user = import_camunda_xml_resolving(
+        &linear(r#"<bpmn:userTask id="Task_1" camunda:assignee="jk"/>"#),
+        &|_| Some("user-1".into()),
+    );
+    let user_xml = declared(export_xml(user.model.as_ref().unwrap()).unwrap()).replacen(
+        "<bpmn:userTask ",
+        "<bpmn:userTask camunda:assignee=\"other\" ",
+        1,
+    );
+    let again = import_camunda_xml(&user_xml);
+    assert_eq!(again.model, user.model);
+    assert_eq!(
+        only(&again, "CAMUNDA_NATIVE_STEP_ATTRIBUTE_IGNORED")
+            .element_id
+            .as_deref(),
+        Some("Task_1")
+    );
+}
+
+#[test]
+fn script_resource_and_result_variable_on_a_native_script_are_reported() {
+    let imported = import_camunda_xml(&linear(
+        r#"<bpmn:scriptTask id="Task_1" scriptFormat="application/vnd.tentaflow.cel" camunda:resultVariable="r" camunda:resource="x"><bpmn:script>vars.a + 1</bpmn:script></bpmn:scriptTask>"#,
+    ));
+    assert_clean_import(&imported);
+    assert_eq!(
+        diagnostics(&imported, "CAMUNDA_NATIVE_STEP_ATTRIBUTE_IGNORED").len(),
+        2
+    );
+}
+
+#[test]
+fn non_default_activity_attributes_are_warnings_and_defaults_are_info() {
+    let imported = import_camunda_xml(&linear(
+        r#"<bpmn:userTask id="Task_1" isForCompensation="true" startQuantity="2" completionQuantity="1"/>"#,
+    ));
+    assert_clean_import(&imported);
+    let lost = diagnostics(&imported, "CAMUNDA_ATTRIBUTE_LOST");
+    assert_eq!(lost.len(), 2);
+    assert!(lost.iter().all(|d| d.severity == Some(Severity::Warning)));
+    let ignored: Vec<_> = diagnostics(&imported, "CAMUNDA_ATTRIBUTE_IGNORED")
+        .into_iter()
+        .filter(|d| d.element_id.as_deref() == Some("Task_1"))
+        .collect();
+    assert_eq!(ignored.len(), 1);
+    assert_eq!(ignored[0].severity, Some(Severity::Info));
+}
+
+#[test]
+fn connector_parameters_are_reported_not_merged_into_the_step() {
+    let imported = import_camunda_xml(&linear(
+        r#"<bpmn:serviceTask id="Task_1"><bpmn:extensionElements><camunda:connector>
+            <camunda:inputOutput><camunda:inputParameter name="url">http://x</camunda:inputParameter></camunda:inputOutput>
+            <camunda:connectorId>http-connector</camunda:connectorId>
+        </camunda:connector></bpmn:extensionElements></bpmn:serviceTask>"#,
+    ));
+    let model = assert_clean_import(&imported);
+    let ProcessNodeKind::ServiceTask { input_mapping, .. } = &node(model, "Task_1").kind else {
+        panic!("service task expected");
+    };
+    assert!(input_mapping.is_empty());
+    assert_eq!(
+        only(&imported, "CAMUNDA_CONNECTOR_PARAMETERS_SKIPPED").severity,
+        Some(Severity::Warning)
+    );
+}
+
+#[test]
+fn a_foreign_type_on_a_loop_condition_is_fatal() {
+    let imported = import_camunda_xml(&linear(
+        r#"<bpmn:userTask id="Task_1"><bpmn:standardLoopCharacteristics testBefore="true" loopMaximum="3"><bpmn:loopCondition xmlns:x="urn:other" xsi:type="x:tOdd" language="https://cel.dev/spec">true</bpmn:loopCondition></bpmn:standardLoopCharacteristics></bpmn:userTask>"#,
+    ));
+    assert!(imported.model.is_none());
+    assert!(diagnostics(&imported, "CAMUNDA_UNSUPPORTED_XSI_TYPE")
+        .iter()
+        .any(|d| d.fatal && d.element_id.as_deref() == Some("Task_1")));
+}
+
+// ----- bounds -----
+
+#[test]
+fn translations_are_capped_like_diagnostics() {
+    let parameters: String = (0..1_100)
+        .map(|i| format!(r#"<camunda:inputParameter name="p{i}">v{i}</camunda:inputParameter>"#))
+        .collect();
+    let imported = import_camunda_xml(&linear(&format!(
+        r#"<bpmn:serviceTask id="Task_1" camunda:class="x.Y"><bpmn:extensionElements><camunda:inputOutput>{parameters}</camunda:inputOutput></bpmn:extensionElements></bpmn:serviceTask>"#
+    )));
+    assert_eq!(imported.translations.len(), 1000);
+    only(&imported, "CAMUNDA_DIAGNOSTICS_TRUNCATED");
+}
+
+#[test]
+fn diagnostic_messages_are_bounded() {
+    let long = "x".repeat(5_000);
+    let imported = import_camunda_xml(&linear(&format!(
+        r#"<bpmn:userTask id="Task_1" camunda:mystery="{long}"/>"#
+    )));
+    assert!(imported
+        .diagnostics
+        .iter()
+        .all(|d| d.message.chars().count() <= 1001));
+}
+
+#[test]
+fn login_lookups_are_capped_per_import_and_the_rest_stay_unresolved() {
+    let tasks: String = (0..250)
+        .map(|i| format!(r#"<bpmn:userTask id="T{i}" camunda:assignee="user{i}"/>"#))
+        .collect();
+    let flows: String = (0..250)
+        .map(|i| {
+            let from = if i == 0 {
+                "Start_1".to_string()
+            } else {
+                format!("T{}", i - 1)
+            };
+            format!(r#"<bpmn:sequenceFlow id="F{i}" sourceRef="{from}" targetRef="T{i}"/>"#)
+        })
+        .collect();
+    let xml = process(&format!(
+        r#"<bpmn:startEvent id="Start_1"/>{tasks}<bpmn:endEvent id="End_1"/>{flows}<bpmn:sequenceFlow id="F_end" sourceRef="T249" targetRef="End_1"/>"#
+    ));
+    let calls = std::cell::Cell::new(0);
+    let imported = import_camunda_xml_resolving(&xml, &|login| {
+        calls.set(calls.get() + 1);
+        Some(format!("id-{login}"))
+    });
+    // A model holds at most 128 nodes, so the document is refused afterwards;
+    // the lookups, which happen while reading, are what is bounded.
+    assert!(imported.model.is_none());
+    assert_eq!(calls.get(), 200);
+    assert_eq!(
+        diagnostics(&imported, "CAMUNDA_ASSIGNEE_UNRESOLVED").len(),
+        50
+    );
+}
+
+#[test]
+fn nesting_just_under_the_cap_reaches_the_rewriter_and_the_strict_reader_without_overflow() {
+    // Each level carries an id, so the document passes the reader and the
+    // rewrite, per-node check and strict builder all recurse to the bottom.
+    let depth = 28;
+    let open: String = (0..depth)
+        .map(|i| format!("<bpmn:subProcess id=\"S{i}\">"))
+        .collect();
+    let close = "</bpmn:subProcess>".repeat(depth);
+    let xml = format!(
+        "{HEAD}<bpmn:process id=\"Process_1\">{open}<bpmn:startEvent id=\"Deep_1\"/>{close}</bpmn:process></bpmn:definitions>"
+    );
+    let imported = import_camunda_xml(&xml);
+    assert!(imported.model.is_none());
+    assert!(imported.diagnostics.iter().any(|d| d.fatal));
+    assert!(
+        !imported
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("nesting deeper")),
+        "{:#?}",
+        imported.diagnostics.first()
+    );
 }

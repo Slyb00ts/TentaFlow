@@ -167,15 +167,17 @@ fn assignee_resolver<'a>(
 ) -> impl Fn(&str) -> Option<String> + 'a {
     let members = std::cell::OnceCell::new();
     move |login: &str| {
-        let user = crate::db::repository::get_user_account_by_username(&ctx.state.db, login)
-            .ok()
-            .flatten()
-            .filter(|user| user.is_active)?;
+        // Membership is read before the login is looked up, so a login that does
+        // not exist costs the same as one that does.
         let members = members.get_or_init(|| {
             crate::services::org::repo::list_memberships_for_org(&ctx.state.db, &actor.org_id)
                 .map(|rows| rows.into_iter().map(|(id, _)| id).collect::<Vec<_>>())
                 .unwrap_or_default()
         });
+        let user = crate::db::repository::get_user_account_by_username(&ctx.state.db, login)
+            .ok()
+            .flatten()
+            .filter(|user| user.is_active)?;
         members.contains(&user.id).then_some(user.id)
     }
 }
