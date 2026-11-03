@@ -208,6 +208,13 @@ test('a Camunda document is read first, imported as a draft with its placeholder
   expect(condition.translated).toContain('vars.amount > 100');
   expect(condition.kindLabel).toBe('Condition');
 
+  // Escape on a result nobody has acted on asks before dropping it.
+  await page.keyboard.press('Escape');
+  await expect(page.locator('tf-button[data-action="confirm"]')).toBeVisible();
+  await page.locator('tf-button[data-action="cancel"]').click();
+  await expect(page.locator('tf-button[data-action="confirm"]')).toHaveCount(0);
+  await expect(review).toBeVisible();
+
   // Importing is the consent; only then is the draft in the editor.
   await review.locator('xpath=ancestor::tf-window').locator('[data-act="import"]').click();
   await expect(review.locator('[data-consent]')).toContainText('Loaded as a draft');

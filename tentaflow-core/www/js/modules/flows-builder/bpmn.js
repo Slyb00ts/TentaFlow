@@ -705,8 +705,8 @@ export function processDiagnosticDetail(diagnostic) {
 function processImportElement(model, names, elementId, elementName = null) {
   if (elementId == null || elementId === '') return { element: '', nodeId: null };
   const where = processElementNode(model, elementId);
-  // With the model withheld the server's own name for the element is all there is.
-  const named = where && !where.flow ? names.get(where.nodeId) : (!model && elementName ? String(elementName).trim() : null);
+  // Anything that is not a node of the model (a flow, a process, an id the model dropped) is named by the server.
+  const named = (where && !where.flow ? names.get(where.nodeId) : null) || (elementName ? String(elementName).trim() : null);
   return { element: named && named !== elementId ? `${named} (${elementId})` : String(elementId), nodeId: where?.nodeId ?? null };
 }
 
@@ -804,7 +804,8 @@ export function processIsPristine(model) {
   return !(model.additionalProcesses?.length) && model.nodes?.length === 2
     && model.nodes[0].kind === 'Start' && model.nodes[1].kind === 'End' && !model.nodes[0].name && !model.nodes[1].name
     && model.sequenceFlows?.length === 1 && !Object.keys(model.variables || {}).length
-    && !model.workCalendar && !model.timerTimezone
+    && !model.workCalendar && !model.timerTimezone && !model.collaboration && !model.modeling && !model.processName
+    && !(model.dataStores?.length)
     && !['messages', 'errors', 'escalations', 'signals'].some((key) => model[key]?.length);
 }
 

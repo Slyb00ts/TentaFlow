@@ -33,6 +33,8 @@ import '/js/components/tf-menu.js';
 // themselves (text fields, pickers, open dialogs and menus) swallow them.
 // What an import left for the author: elements with warnings not yet reviewed, the diagnostics behind them,
 // and the unbound steps seen so far (a step leaving that set was bound, which settles it).
+// The import warnings that a bound implementation settles; any other note on the same element stays open.
+const UNBOUND_RELATED_CODES = new Set(['CAMUNDA_SERVICE_UNBOUND', 'CAMUNDA_SERVICE_NO_IMPLEMENTATION', 'CAMUNDA_SUBPROCESS_SCOPE']);
 const emptyAttention = () => ({ flagged: new Set(), notes: new Map(), unbound: new Set() });
 const MINIMAP_COLLAPSED_KEY = 'tf_fb_minimap_collapsed';
 const TEXT_ENTRY_TAGS = new Set(['INPUT', 'TEXTAREA', 'SELECT', 'TF-INPUT', 'TF-TEXTAREA', 'TF-SEARCHBOX',
@@ -155,8 +157,12 @@ const FlowBuilderScreen = {
     }
 
     const root = document.querySelector('[data-role="shell"]');
+    // Whatever an earlier screen left to carry over belongs to its own process only.
+    if (this._carry?.flowId !== flowId) this._carry = null;
+    if (this._review?.flowId !== flowId) this._review = null;
     const state = {
       flowId,
+      generation: this._mounts = (this._mounts ?? 0) + 1,
       mode,
       flow: null,
       root,
@@ -215,9 +221,9 @@ const FlowBuilderScreen = {
       return;
     }
 
-    // After a language switch the editor comes back as it was, not as the server last saw it.
+    // After a language switch the editor comes back as it was, not as the server last saw it. What is carried is
+    // consumed only once this mount has a canvas: a mount torn down before that (a second switch) leaves it for the next.
     const carried = state.mode === 'bpmn' && this._carry?.flowId === flowId ? this._carry : null;
-    this._carry = null;
     let parsed = { nodes: [], edges: [] };
     try {
       if (state.mode === 'bpmn') parsed = carried ? carried.model : state.definition.model;
@@ -307,6 +313,7 @@ const FlowBuilderScreen = {
       this._syncAttention(state, state.canvas.getData());
       if (carried.dirty) this._markDirty();
     }
+    this._carry = null;
     if (state.mode === 'bpmn' && this._review) {
       const { response, xml, loaded } = this._review;
       this._openImportReview(state, response, xml, loaded);
@@ -665,9 +672,15 @@ const FlowBuilderScreen = {
   async unmount() {
     const s = this._state;
     if (!s) return;
-    this._carry = s.mode === 'bpmn' && s.canvas && I18n.getLanguage() !== s.language
-      ? { flowId: s.flowId, model: s.canvas.getData(), dirty: s.dirty, attention: s.attention } : null;
-    if (!this._carry) this._review = null;
+    // A shell repaint remounts straight away and reads the server's draft, which must already hold a save in flight;
+    // leaving for good does not wait, and no wait lasts longer than a few seconds.
+    if (s.inflight && I18n.getLanguage() !== s.language) await Promise.race([s.inflight, new Promise((resolve) => setTimeout(resolve, 5000))]);
+    // A mount that never got a canvas has nothing to carry and must not wipe what an earlier one left for the next.
+    if (s.canvas) {
+      this._carry = s.mode === 'bpmn' && I18n.getLanguage() !== s.language
+        ? { flowId: s.flowId, model: s.canvas.getData(), dirty: s.dirty, attention: s.attention } : null;
+      if (!this._carry) this._review = null;
+    }
     // The window belongs to this screen's state: a fresh one is drawn after a remount, never a stale one kept.
     if (this._reviewWindow?.isConnected) this._reviewWindow.close(true);
     this._reviewWindow = null;
@@ -1058,7 +1071,7 @@ const FlowBuilderScreen = {
   },
 
   _openImportReview(state, response, xml, loaded) {
-    this._review = { response, xml, loaded };
+    this._review = { flowId: state.flowId, response, xml, loaded };
     this._reviewWindow = openProcessImportReview({ response, loaded,
       returnFocus: state.root.querySelector('[data-role="more"]'),
       onImport: async () => {
@@ -1068,7 +1081,7 @@ const FlowBuilderScreen = {
       },
       onReveal: (row) => this._revealElement(state, row.nodeId),
       onBack: () => this._importProcess(xml),
-      onDismiss: () => { if (this._review?.response === response) this._review = null; } });
+      onDismiss: () => { if (state.generation === this._mounts && this._review?.response === response) this._review = null; } });
   },
 
   // Replaces the draft with an imported model. The import is the author's
@@ -1116,7 +1129,11 @@ const FlowBuilderScreen = {
     let settled = false;
     for (const id of state.attention.unbound) {
       if (unboundNow.has(id)) continue;
-      state.attention.unbound.delete(id); state.attention.flagged.delete(id); state.attention.notes.delete(id); settled = true;
+      state.attention.unbound.delete(id); settled = true;
+      // Binding answers what was said about the missing implementation, and only that.
+      const rest = (state.attention.notes.get(id) ?? []).filter((diagnostic) => !UNBOUND_RELATED_CODES.has(diagnostic.code));
+      if (rest.length) state.attention.notes.set(id, rest);
+      else { state.attention.flagged.delete(id); state.attention.notes.delete(id); }
     }
     for (const id of unboundNow) state.attention.unbound.add(id);
     if (settled) targets = processAttentionTargets(model, state.attention.flagged);
@@ -1431,6 +1448,7 @@ const FlowBuilderScreen = {
       return false;
     }
     s.saving = true;
+    s.inflight = new Promise((resolve) => { s.finishSave = resolve; });
     const editRevision = s.editRevision;
     try {
       const nameEl = s.root.querySelector('[data-role="name"]');
@@ -1486,6 +1504,8 @@ const FlowBuilderScreen = {
       return false;
     } finally {
       s.saving = false;
+      s.finishSave?.();
+      s.inflight = null;
     }
   },
 

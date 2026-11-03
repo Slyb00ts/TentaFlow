@@ -16861,7 +16861,12 @@
     "import_discard_hint": "The pasted XML has not been imported. Closing the window discards it.",
     "import_discard": "Discard",
     "import_keep_editing": "Keep editing",
-    "unbound_publish_heading": "Not published. {count|This step has|These steps have} no implementation yet; choose a flow, addon tool, block or agent first:"
+    "unbound_publish_heading": "Not published. {count|This step has|These steps have} no implementation yet; choose a flow, addon tool, block or agent first:",
+    "diag_CAMUNDA_SUBPROCESS_INTERRUPTED_SCOPE": "A boundary event (timer, error, escalation or message) can interrupt this sub-process. TentaFlow copies its variables out only when it finishes, so values written before an interruption are lost, while Camunda would already have passed them on.",
+    "diag_CAMUNDA_TIMER_DAY_DURATION": "The timer waits a number of days. TentaFlow counts a day as 86400 seconds, Camunda as a calendar day, so the two differ across daylight-saving changes.",
+    "import_result_discard_title": "Discard the import result?",
+    "import_result_discard_hint": "The XML was read but nothing was imported. Closing the window drops this result; you can import the XML again.",
+    "import_keep_result": "Keep the result"
   },
   "gestures": {
     "wave": "wave",

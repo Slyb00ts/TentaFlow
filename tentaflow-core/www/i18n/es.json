@@ -15723,7 +15723,12 @@
     "import_discard_hint": "El XML pegado no se ha importado. Al cerrar la ventana se descarta.",
     "import_discard": "Descartar",
     "import_keep_editing": "Seguir editando",
-    "unbound_publish_heading": "No se publicó. {count|Este paso aún no tiene|Estos pasos aún no tienen} implementación; elige antes un flujo, una herramienta de complemento, un bloque o un agente:"
+    "unbound_publish_heading": "No se publicó. {count|Este paso aún no tiene|Estos pasos aún no tienen} implementación; elige antes un flujo, una herramienta de complemento, un bloque o un agente:",
+    "diag_CAMUNDA_SUBPROCESS_INTERRUPTED_SCOPE": "Un evento de borde (temporizador, error, escalado o mensaje) puede interrumpir este subproceso. TentaFlow copia sus variables hacia fuera solo al terminar, así que los valores escritos antes de una interrupción se pierden, mientras que Camunda ya los habría propagado.",
+    "diag_CAMUNDA_TIMER_DAY_DURATION": "El temporizador espera un número de días. TentaFlow cuenta un día como 86400 segundos y Camunda como un día natural, así que difieren en los cambios de horario de verano.",
+    "import_result_discard_title": "¿Descartar el resultado de la importación?",
+    "import_result_discard_hint": "Se leyó el XML, pero no se importó nada. Al cerrar la ventana se pierde este resultado; puedes importar el XML de nuevo.",
+    "import_keep_result": "Conservar el resultado"
   },
   "gestures": {
     "wave": "saludo",

@@ -3,7 +3,7 @@
 import { window } from '../../sdk-runtime/_dom-test-harness.js';
 import test, { after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 
 for (const name of ['MutationObserver', 'ResizeObserver', 'Document', 'CSS', 'navigator']) {
@@ -28,7 +28,7 @@ const { processAgentIterationLimit, processAgentPreset, emptyProcessModel, proce
 const { FlowCanvas, UNATTACHED_TAG } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
-const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processRowFor, processRoutingTextKeys, processEscalationPathProblem, processExplainError, processMissingSettings, processNodeWarnings, processServiceKind, processBlockTemplate, processStartEntryLabels, processTimezoneProblem, processPublishProblems, processNodeLabels, processTimezoneGaps, processTimezoneText, processTimezoneCanonical, processRepeatedElements, processBoundaryRefusals, processBoundaryHosts, processRepeatOutputGaps, processPlainError, processDiagnosticSeverity, processImportGroups, processImportCounts, processImportLoadable, processImportNeedsReview, processImportTranslations, processAttentionTargets, processNextAttention, processImportFlagged } = await import('./bpmn.js');
+const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processRowFor, processRoutingTextKeys, processEscalationPathProblem, processExplainError, processMissingSettings, processNodeWarnings, processServiceKind, processBlockTemplate, processStartEntryLabels, processTimezoneProblem, processPublishProblems, processNodeLabels, processTimezoneGaps, processTimezoneText, processTimezoneCanonical, processRepeatedElements, processBoundaryRefusals, processBoundaryHosts, processRepeatOutputGaps, processPlainError, processDiagnosticSeverity, processIsPristine, processImportGroups, processImportCounts, processImportLoadable, processImportNeedsReview, processImportTranslations, processAttentionTargets, processNextAttention, processImportFlagged } = await import('./bpmn.js');
 const { openProcessCalendar, openProcessInstance, openProcessInstances, openProcessMessageDetail, openProcessMessageSend, openProcessRun, openProcessSchedule, processEventText, processLifecycleReasonText, processTimerText } = await import('./process-monitor.js');
 const { simulationWindow, openProcessSimulation } = await import('./process-simulation.js');
 const { default: builder } = await import('../flows-builder.js');
@@ -8871,6 +8871,7 @@ test('the editor, its warnings and the result window survive a language switch',
     document.body.innerHTML = `<main>${builder.render({ mode: 'bpmn' })}</main>`;
     await builder.mount({ flowId: 'definition-one', mode: 'bpmn' }); await flush();
     const again = builder._state;
+    assert.equal(builder._carry, null, 'what was carried is used up once the screen has its canvas');
     assert.deepEqual(again.canvas.getData().nodes.map((node) => node.id), before.nodes.map((node) => node.id));
     assert.equal(again.dirty, true, 'the unsaved import is still unsaved work');
     assert.equal(attentionBanner().hidden, false); assert.equal(attentionBanner().getAttribute('message').slice(0, 2), open);
@@ -8952,18 +8953,24 @@ test('the result window reads message first and code last, can copy a plain repo
 
 test('every diagnostic code the backend can send has a sentence in all five locales', () => {
   const read = (path) => readFileSync(new URL(path, import.meta.url), 'utf8');
-  const sources = ['../../../../src/processes/bpmn/camunda.rs', '../../../../src/processes/expression_translate.rs', '../../../../src/processes/bpmn.rs'];
+  // Every non-test source of the process engine is scanned, so a code added in any file is found; a missing
+  // directory is a failure, not a pass.
+  const root = new URL('../../../../src/processes/', import.meta.url);
+  const files = [];
+  const walk = (dir) => { for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = new URL(entry.name + (entry.isDirectory() ? '/' : ''), dir);
+    if (entry.isDirectory()) walk(path); else if (entry.name.endsWith('.rs') && !/tests?\.rs$/.test(entry.name)) files.push(path); } };
+  walk(root);
+  assert.ok(files.length > 5, 'the engine sources were found');
   const codes = new Set();
-  for (const path of sources) {
-    let text; try { text = read(path); } catch { continue; }
-    for (const [code] of text.matchAll(/"((?:CAMUNDA|EXPR)_[A-Z_]*[A-Z])"/g)) codes.add(code.slice(1, -1));
-  }
-  codes.add('UNSUPPORTED_OR_INVALID_BPMN'); codes.add('ESCALATION_IMMEDIATE_PATH_UNSUPPORTED'); codes.add('UNBOUND_IMPLEMENTATION');
-  assert.ok(codes.size > 55, 'the code list was read from the backend');
+  for (const file of files) for (const [, code] of readFileSync(file, 'utf8').matchAll(/"((?:CAMUNDA|EXPR)_[A-Z_]*[A-Z])"/g)) codes.add(code);
+  for (const code of ['UNSUPPORTED_OR_INVALID_BPMN', 'ESCALATION_IMMEDIATE_PATH_UNSUPPORTED', 'UNBOUND_IMPLEMENTATION']) codes.add(code);
+  for (const code of ['CAMUNDA_SUBPROCESS_INTERRUPTED_SCOPE', 'CAMUNDA_TIMER_DAY_DURATION', 'CAMUNDA_TIMER_TIMEZONE_DEFAULTED']) assert.ok(codes.has(code), `${code} is read from the backend`);
+  assert.ok(codes.size > 60, 'the code list was read from the backend');
   for (const locale of ['pl', 'en', 'de', 'es', 'fr']) {
     const table = JSON.parse(read(`../../../i18n/${locale}.json`)).bpmn;
-    const missing = [...codes].filter((code) => typeof table[`diag_${code}`] !== 'string' || table[`diag_${code}`].includes('_'.repeat(2)) || /^[A-Z_]+$/.test(table[`diag_${code}`]));
-    assert.deepEqual(missing.filter((code) => !['CAMUNDA_MULTI_INSTANCE_'].includes(code)), [], `${locale} lacks a sentence`);
+    const missing = [...codes].filter((code) => typeof table[`diag_${code}`] !== 'string' || table[`diag_${code}`].length < 20 || /^[A-Z_]+$/.test(table[`diag_${code}`]));
+    assert.deepEqual(missing, [], `${locale} lacks a sentence`);
   }
 });
 
@@ -9025,4 +9032,125 @@ test('the consent and loaded texts of every locale tell the truth about autosave
     assert.match(table.import_consent, word, `${locale} consent`); assert.match(table.import_loaded, word, `${locale} loaded`);
     assert.doesNotMatch(table.import_consent, /nothing is saved|Nic nie jest zapisywane|Nichts wird gespeichert|No se guarda nada|Rien n.est enregistr/i, `${locale} no longer says nothing is saved`);
   }
+});
+
+const remount = async (flowId = 'definition-one') => {
+  await builder.unmount(); document.body.innerHTML = `<main>${builder.render({ mode: 'bpmn' })}</main>`;
+  await builder.mount({ flowId, mode: 'bpmn' }); await flush();
+};
+
+test('a second language switch while the screen is still loading keeps what the first one carried', async () => {
+  const state = await runImport(camundaResponse());
+  click(reviewWindow().querySelector('[data-act="import"]')); await flush();
+  const ids = state.canvas.getData().nodes.map((node) => node.id);
+  await I18n.setLanguage('pl');
+  try {
+    await builder.unmount();
+    document.body.innerHTML = `<main>${builder.render({ mode: 'bpmn' })}</main>`;
+    const unfinished = builder.mount({ flowId: 'definition-one', mode: 'bpmn' });
+    await builder.unmount();
+    await unfinished;
+    assert.ok(builder._carry, 'a mount that never had a canvas leaves the carry alone');
+    await I18n.setLanguage('de');
+    await remount(); const again = builder._state;
+    assert.deepEqual(again.canvas.getData().nodes.map((node) => node.id), ids, 'the imported draft is still there');
+    assert.equal(again.dirty, true);
+    assert.equal(attentionBanner().hidden, false); assert.ok(reviewWindow(), 'and so is the result window');
+  } finally { await I18n.setLanguage('en'); }
+});
+
+test('a carried import result never appears in another process', async () => {
+  await runImport(camundaResponse());
+  assert.equal(builder._review.flowId, 'definition-one');
+  await I18n.setLanguage('pl');
+  try {
+    await builder.unmount(); document.body.innerHTML = `<main>${builder.render({ mode: 'bpmn' })}</main>`;
+    fixtures({ processDefinitionGetRequest: { definition: definition('other-flow'), startCatalog: [] }, processOptionsRequest: options });
+    await builder.mount({ flowId: 'other-flow', mode: 'bpmn' }); await flush();
+    assert.ok(!reviewWindow(), 'the result belongs to the process it was made for');
+    assert.equal(builder._state.canvas.nodes.length, 2, 'and so does the carried draft');
+    assert.equal(builder._carry, null); assert.equal(builder._review, null);
+  } finally { await I18n.setLanguage('en'); }
+});
+
+test('binding an unbound step clears only what was said about the missing implementation', async () => {
+  const response = camundaResponse({ diagnostics: [
+    { code: 'CAMUNDA_SERVICE_UNBOUND', message: 'm', elementId: 'Task_Bean', offset: 1, fatal: false, severity: 'warning' },
+    { code: 'CAMUNDA_CANDIDATES_SKIPPED', message: 'candidateGroups', elementId: 'Task_Bean', offset: 2, fatal: false, severity: 'warning' }] });
+  const state = await runImport(response);
+  click(reviewWindow().querySelector('[data-act="import"]')); await flush();
+  state.canvas.selectNode('Task_Bean'); await flush(2);
+  change(state.config.root.querySelector('[data-process="implementation"]'), 'flow'); await flush(2);
+  change(state.config.root.querySelector('[data-process="flowId"]'), 'flow-one'); await flush(2);
+  const element = state.canvas.nodesLayer.querySelector('[data-node-id="Task_Bean"]');
+  assert.ok(element.classList.contains('fb-needs-attention'), 'the other warning keeps the element marked');
+  assert.equal(element.dataset.attention, 'import');
+  const notes = state.config.root.querySelector('[data-import-attention]');
+  assert.match(notes.textContent + [...notes.querySelectorAll('tf-alert')].map((alert) => alert.getAttribute('message')).join(' '), /Candidate users and groups/);
+  assert.doesNotMatch(notes.innerHTML, /no TentaFlow counterpart/, 'the unbound note is gone');
+  assert.match(attentionBanner().getAttribute('message'), /^2 elements need/, 'Task_Bean (its other warning) and the still unbound Task_Second');
+});
+
+test('a drawing that only has lanes, annotations or data stores is not a starter process', () => {
+  const starter = emptyProcessModel();
+  assert.equal(processIsPristine(starter), true);
+  for (const extra of [{ collaboration: { lanes: [] } }, { modeling: { textAnnotations: [] } }, { dataStores: [{ id: 'D' }] }, { processName: 'Order' }]) {
+    assert.equal(processIsPristine({ ...starter, ...extra }), false, JSON.stringify(extra));
+  }
+});
+
+test('a flow or an unknown id is named by the server even when the model is loaded', () => {
+  const model = camundaModel();
+  const [group] = processImportGroups([{ code: 'X', message: 'm', elementId: 'Flow_big', elementName: 'big order', fatal: false, severity: 'warning' },
+    { code: 'Y', message: 'm', elementId: 'Process_gone', elementName: 'Order process', fatal: false, severity: 'warning' }], model);
+  assert.deepEqual(group.rows.map((row) => row.element), ['big order (Flow_big)', 'Order process (Process_gone)']);
+});
+
+test('Escape on a result nobody acted on asks before dropping it, and a loaded one just closes', async () => {
+  const asked = []; const original = TfWindow.confirm; let answer = false;
+  TfWindow.confirm = async (options) => { asked.push(options.title); return answer; };
+  try {
+    await runImport(camundaResponse());
+    const review = reviewWindow();
+    review.dispatchEvent(new CustomEvent('close-request', { cancelable: true })); await flush();
+    assert.deepEqual(asked, [I18n.t('bpmn.import_result_discard_title')]); assert.ok(reviewWindow() === review, 'keeping the result keeps the window');
+    answer = true; review.close(); await flush();
+    assert.equal(asked.length, 2); await new Promise((resolve) => setTimeout(resolve, 300)); assert.ok(!reviewWindow(), 'discarding closes it');
+    await runImport(camundaResponse()); const second = reviewWindow(); click(second.querySelector('[data-act="import"]')); await flush();
+    const before = asked.length; second.close(); await flush();
+    assert.equal(asked.length, before, 'once imported there is nothing to lose');
+  } finally { TfWindow.confirm = original; }
+});
+
+test('leaving for a language switch waits for a save in flight, so the remount reads the draft it wrote', async () => {
+  const gate = deferred(); const order = [];
+  const state = await mount(definition(), { processDefinitionSaveRequest: async (payload) => { order.push('save started'); await gate.promise; order.push('save done'); return { definition: definition('definition-one', { model: payload.model, draftRevision: 5 }) }; } });
+  state.canvas.addNodeFromTemplate(processTemplates().find((row) => row.nodeType === 'bpmn_user_task'), 250, 300);
+  const saving = builder._save(); await flush();
+  assert.deepEqual(order, ['save started']);
+  await I18n.setLanguage('pl');
+  const leaving = builder.unmount().then(() => order.push('unmounted')); await flush();
+  assert.deepEqual(order, ['save started'], 'the screen is not torn down under the save');
+  gate.resolve(); await saving; await leaving;
+  assert.deepEqual(order, ['save started', 'save done', 'unmounted']);
+  await I18n.setLanguage('en');
+});
+
+test('a mount torn down after it read the carry but before it had a canvas leaves it for the next, and one for another process drops it', async () => {
+  await runImport(camundaResponse());
+  await I18n.setLanguage('pl');
+  const original = FlowPalette.prototype.init;
+  const interrupt = () => { FlowPalette.prototype.init = async function init(...args) { const done = original.apply(this, args); builder.unmount(); return done; }; };
+  try {
+    await builder.unmount(); document.body.innerHTML = `<main>${builder.render({ mode: 'bpmn' })}</main>`;
+    interrupt();
+    await builder.mount({ flowId: 'definition-one', mode: 'bpmn' });
+    assert.ok(builder._carry && builder._carry.flowId === 'definition-one', 'the second switch finds the carry where the first left it');
+    assert.ok(builder._review, 'and the pending result');
+    document.body.innerHTML = `<main>${builder.render({ mode: 'bpmn' })}</main>`;
+    fixtures({ processDefinitionGetRequest: { definition: definition('other-flow'), startCatalog: [] }, processOptionsRequest: options });
+    await builder.mount({ flowId: 'other-flow', mode: 'bpmn' });
+    assert.equal(builder._carry, null, 'a mount of another process starts with nothing carried');
+    assert.equal(builder._review, null);
+  } finally { FlowPalette.prototype.init = original; await I18n.setLanguage('en'); }
 });

@@ -2,7 +2,7 @@
 
 import { escapeAttr, escapeHtml, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import '/js/components/tf-window.js';
+import { TfWindow } from '/js/components/tf-window.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-alert.js';
 import '/js/components/tf-button.js';
@@ -146,6 +146,17 @@ export function openProcessImportReview({ response, onImport, onReveal, onBack, 
     // A refused replacement leaves the result open so the author can still read it or try again.
     if (loaded) render();
     else renderFooter();
+  });
+  // Escape or the backdrop would drop a result nobody has acted on; the buttons are the explicit ways out.
+  let asking = false;
+  win.addEventListener('close-request', async (event) => {
+    if (!loadable || loaded || asking) return;
+    event.preventDefault();
+    asking = true;
+    const discard = await TfWindow.confirm({ title: I18n.t('bpmn.import_result_discard_title'), message: I18n.t('bpmn.import_result_discard_hint'),
+      confirmLabel: I18n.t('bpmn.import_discard'), cancelLabel: I18n.t('bpmn.import_keep_result'), danger: true });
+    asking = false;
+    if (discard && win.isConnected) win.close(true);
   });
   // A language switch remounts the screen and closes every overlay; the pending import is the caller's to reopen.
   win.addEventListener('closed', () => {

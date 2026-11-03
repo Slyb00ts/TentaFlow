@@ -15723,7 +15723,12 @@
     "import_discard_hint": "Le XML collé n’a pas été importé. Fermer la fenêtre l’abandonne.",
     "import_discard": "Abandonner",
     "import_keep_editing": "Continuer à modifier",
-    "unbound_publish_heading": "Non publié. {count|Cette étape n’a|Ces étapes n’ont} pas encore d’implémentation ; choisissez d’abord un flux, un outil de module, un bloc ou un agent :"
+    "unbound_publish_heading": "Non publié. {count|Cette étape n’a|Ces étapes n’ont} pas encore d’implémentation ; choisissez d’abord un flux, un outil de module, un bloc ou un agent :",
+    "diag_CAMUNDA_SUBPROCESS_INTERRUPTED_SCOPE": "Un événement de bordure (minuteur, erreur, escalade ou message) peut interrompre ce sous-processus. TentaFlow ne recopie ses variables qu’à la fin ; les valeurs écrites avant une interruption sont donc perdues, alors que Camunda les aurait déjà propagées.",
+    "diag_CAMUNDA_TIMER_DAY_DURATION": "Le minuteur attend un certain nombre de jours. TentaFlow compte un jour comme 86400 secondes, Camunda comme un jour calendaire ; les deux diffèrent donc lors des changements d’heure.",
+    "import_result_discard_title": "Abandonner le résultat de l’import ?",
+    "import_result_discard_hint": "Le XML a été lu, mais rien n’a été importé. Fermer la fenêtre abandonne ce résultat ; vous pouvez réimporter le XML.",
+    "import_keep_result": "Garder le résultat"
   },
   "gestures": {
     "wave": "salut de la main",

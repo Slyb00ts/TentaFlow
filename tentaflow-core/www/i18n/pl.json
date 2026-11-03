@@ -16861,7 +16861,12 @@
     "import_discard_hint": "Wklejony XML nie został zaimportowany. Zamknięcie okna go odrzuci.",
     "import_discard": "Odrzuć",
     "import_keep_editing": "Wróć do edycji",
-    "unbound_publish_heading": "Nie opublikowano. {count|Ten krok nie ma|Te kroki nie mają|Tych kroków nie ma} jeszcze implementacji; najpierw wybierz przepływ, narzędzie dodatku, blok lub agenta:"
+    "unbound_publish_heading": "Nie opublikowano. {count|Ten krok nie ma|Te kroki nie mają|Tych kroków nie ma} jeszcze implementacji; najpierw wybierz przepływ, narzędzie dodatku, blok lub agenta:",
+    "diag_CAMUNDA_SUBPROCESS_INTERRUPTED_SCOPE": "Zdarzenie brzegowe (timer, błąd, eskalacja lub komunikat) może przerwać ten podproces. TentaFlow wyprowadza jego zmienne dopiero po zakończeniu, więc wartości zapisane przed przerwaniem giną, a Camunda przekazałaby je już wcześniej.",
+    "diag_CAMUNDA_TIMER_DAY_DURATION": "Timer czeka określoną liczbę dni. TentaFlow liczy dobę jako 86400 sekund, a Camunda jako dzień kalendarzowy, więc wyniki różnią się przy zmianie czasu letniego.",
+    "import_result_discard_title": "Odrzucić wynik importu?",
+    "import_result_discard_hint": "XML został odczytany, ale nic nie zaimportowano. Zamknięcie okna odrzuci ten wynik; XML można zaimportować ponownie.",
+    "import_keep_result": "Zostaw wynik"
   },
   "gestures": {
     "wave": "machanie",
