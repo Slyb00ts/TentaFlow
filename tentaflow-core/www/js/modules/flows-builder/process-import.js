@@ -7,7 +7,7 @@ import '/js/components/tf-table.js';
 import '/js/components/tf-alert.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
-import { processImportCounts, processImportGroups, processImportLoadable, processImportSummaryText, processImportTranslations } from './bpmn.js';
+import { processImportReport, processImportCounts, processImportGroups, processImportLoadable, processImportSummaryText, processImportTranslations } from './bpmn.js';
 
 const SEVERITY_CHIP = { fatal: 'err', warning: 'warn', info: 'info' };
 
@@ -22,10 +22,11 @@ const twoLines = (title, sub) => `<div class="tf-table__cell-title">${escapeHtml
  * `onImport()` loads the model and answers whether it did, and from then on a
  * line with an element shows it on the canvas through `onReveal(row)`.
  */
-export function openProcessImportReview({ response, onImport, onReveal }) {
+export function openProcessImportReview({ response, onImport, onReveal, onBack, onDismiss, loaded: alreadyLoaded = false, returnFocus = null }) {
   const loadable = processImportLoadable(response);
   const counts = processImportCounts(response);
-  let loaded = false;
+  const language = I18n.getLanguage();
+  let loaded = alreadyLoaded;
   let busy = false;
   const win = document.createElement('tf-window');
   win.setAttribute('title', I18n.t('bpmn.import_review_title'));
@@ -39,6 +40,10 @@ export function openProcessImportReview({ response, onImport, onReveal }) {
   win.classList.add('fb-process-window');
   win.innerHTML = '<div slot="body" class="fb-import-review" data-review></div><div slot="footer" data-footer></div>';
   const body = win.querySelector('[data-review]');
+  // The body takes focus when the window opens and scrolls from the keyboard; "Show" buttons and the footer follow in Tab order.
+  body.tabIndex = 0;
+  body.setAttribute('role', 'region');
+  body.setAttribute('aria-label', I18n.t('bpmn.import_review_title'));
   const footer = win.querySelector('[data-footer]');
 
   const revealButton = (row) => {
@@ -81,8 +86,8 @@ export function openProcessImportReview({ response, onImport, onReveal }) {
       section.dataset.severity = group.severity;
       section.innerHTML = `<h3><tf-chip status="${SEVERITY_CHIP[group.severity]}">${escapeHtml(I18n.t(`bpmn.import_severity_${group.severity}`))}</tf-chip> ${escapeHtml(I18n.t('bpmn.import_group_count', { count: group.rows.length }))}</h3>`;
       section.append(table(group.rows.map((row) => ({ ...row, message: twoLines(row.text, row.text === row.detail ? '' : row.detail) })),
-        [['code', 'bpmn.import_column_code', 'width="26%"'], ['element', 'bpmn.import_column_element', 'width="24%"'],
-          ['message', 'bpmn.import_column_message', 'renderer="html" fill']], 'bpmn.import_no_diagnostics'));
+        [['message', 'bpmn.import_column_message', 'renderer="html" fill'], ['element', 'bpmn.import_column_element', 'width="22%"'],
+          ['code', 'bpmn.import_column_code', 'width="30%"']], 'bpmn.import_no_diagnostics'));
       sections.push(section);
     }
     const translations = processImportTranslations(response.translations, model);
@@ -92,10 +97,11 @@ export function openProcessImportReview({ response, onImport, onReveal }) {
       section.innerHTML = `<h3>${escapeHtml(I18n.t('bpmn.import_translations_title'))}</h3>
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.import_translations_hint'))}</p>`;
       section.append(table(translations.map((row) => ({ ...row,
-        warningChips: row.warnings.map((warning) => `<tf-chip status="warn" title="${escapeAttr(warning.text)}">${escapeHtml(warning.code)}</tf-chip>`).join(' ') })),
+        // The explanation is written out, not behind a tooltip: touch and keyboard readers get it too.
+        differences: row.warnings.map((warning) => `<div class="tf-table__cell-sub">${escapeHtml(warning.text)}</div>`).join('') })),
       [['original', 'bpmn.import_column_before', 'width="26%"'], ['translated', 'bpmn.import_column_after', 'width="26%"'],
         ['kindLabel', 'bpmn.import_column_kind'], ['element', 'bpmn.import_column_element'],
-        ['warningChips', 'bpmn.import_column_warnings', 'renderer="html"']], 'bpmn.import_no_translations'));
+        ['differences', 'bpmn.import_column_warnings', 'renderer="html"']], 'bpmn.import_no_translations'));
       sections.push(section);
     }
     body.replaceChildren(...sections);
@@ -103,11 +109,22 @@ export function openProcessImportReview({ response, onImport, onReveal }) {
   }
 
   function renderFooter() {
+    const copy = `<tf-button variant="ghost" icon="copy" data-act="copy">${escapeHtml(I18n.t('bpmn.import_copy_report'))}</tf-button>`;
+    const back = !loaded && onBack ? `<tf-button variant="ghost" icon="arrow-left" data-act="back">${escapeHtml(I18n.t('bpmn.import_back_to_xml'))}</tf-button>` : '';
     if (!loadable || loaded) {
-      footer.innerHTML = `<tf-button variant="primary" data-act="close">${escapeHtml(I18n.t('bpmn.import_close'))}</tf-button>`;
+      footer.innerHTML = `${copy}${back}<tf-button variant="primary" data-act="close">${escapeHtml(I18n.t('bpmn.import_close'))}</tf-button>`;
     } else {
-      footer.innerHTML = `<tf-button variant="ghost" data-act="close">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+      footer.innerHTML = `${copy}${back}<tf-button variant="ghost" data-act="close">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
         <tf-button variant="primary" icon="check" data-act="import" ${busy ? 'disabled' : ''}>${escapeHtml(I18n.t('bpmn.import_as_draft'))}</tf-button>`;
+    }
+  }
+
+  async function copyReport() {
+    try {
+      await navigator.clipboard.writeText(processImportReport(response));
+      toast(I18n.t('bpmn.import_report_copied'), 'success');
+    } catch {
+      toast(I18n.t('bpmn.import_report_copy_failed'), 'error');
     }
   }
 
@@ -115,6 +132,8 @@ export function openProcessImportReview({ response, onImport, onReveal }) {
     const button = event.target.closest?.('[data-act]');
     if (!button || !win.contains(button)) return;
     if (button.dataset.act === 'close') { win.close(true); return; }
+    if (button.dataset.act === 'copy') { copyReport(); return; }
+    if (button.dataset.act === 'back') { win.close(true); onBack(); return; }
     if (button.dataset.act !== 'import' || busy || !loadable || loaded) return;
     busy = true;
     renderFooter();
@@ -128,7 +147,13 @@ export function openProcessImportReview({ response, onImport, onReveal }) {
     if (loaded) render();
     else renderFooter();
   });
+  // A language switch remounts the screen and closes every overlay; the pending import is the caller's to reopen.
+  win.addEventListener('closed', () => {
+    if (I18n.getLanguage() === language) onDismiss?.();
+    if (returnFocus?.isConnected) returnFocus.focus?.();
+  });
   render();
   document.body.appendChild(win);
+  body.focus({ preventScroll: true });
   return win;
 }

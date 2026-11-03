@@ -43,6 +43,8 @@ const PORT_LABEL_LANE = 52;
 // dopasowaniu widoku i przy ograniczeniu panoramy, wiec blok nigdy nie stoi
 // przycięty przez paletę albo inspektora.
 const CONTENT_MARGIN = 40;
+// Longest condition shown on a flow before the rest goes into its tooltip.
+const EDGE_LABEL_CHARS = 40;
 
 // Kategoria -> krótka etykieta na nodzie
 const TYPE_CATEGORY = {
@@ -217,6 +219,7 @@ export class FlowCanvas {
     this.edges = [];
     this.selectedIds = new Set();
     this.attentionIds = new Set();
+    this.attentionContainerIds = new Set();
     this.selectedEdgeId = null;
     this.view = { x: 0, y: 0, zoom: 1 };
     this._pendingFitMinZoom = null;
@@ -1862,9 +1865,9 @@ export class FlowCanvas {
         div.dataset.unattachedLabel = I18n.t('bpmn.boundary_not_attached');
       }
       // An imported element a person still has to settle is marked the way a problem is, and told apart by its outline.
-      if (warnings.includes('unbound') || warnings.includes('import_attention')) {
+      if (warnings.some((key) => ['unbound', 'import_attention', 'attention_inside'].includes(key))) {
         div.classList.add('fb-needs-attention');
-        div.dataset.attention = warnings.includes('unbound') ? 'unbound' : 'import';
+        div.dataset.attention = warnings.includes('unbound') ? 'unbound' : warnings.includes('import_attention') ? 'import' : 'inside';
       }
       const warningText = warnings.map((key) => this._processWarningText(n, key)).join(' ');
       div.innerHTML = `
@@ -2188,7 +2191,15 @@ export class FlowCanvas {
         text.setAttribute('x', String((fp.x + middle.x) / 2));
         text.setAttribute('y', String((fp.y + middle.y) / 2 - 12));
         text.setAttribute('class', 'fb-process-edge-label');
-        text.textContent = from.config.defaultFlowId === e.id ? I18n.t('bpmn.default_path') : (e.condition || '');
+        const label = from.config.defaultFlowId === e.id ? I18n.t('bpmn.default_path') : (e.condition || '');
+        // A long condition would run across the drawing; the whole text stays in the tooltip.
+        const shown = [...label].length > EDGE_LABEL_CHARS ? `${[...label].slice(0, EDGE_LABEL_CHARS - 1).join('')}…` : label;
+        text.textContent = shown;
+        if (shown !== label) {
+          const title = document.createElementNS(svgNs, 'title');
+          title.textContent = label;
+          text.appendChild(title);
+        }
         this.svg.appendChild(text);
       }
       if (isLoopBack) {
@@ -2293,13 +2304,16 @@ export class FlowCanvas {
     if (agent && Array.isArray(agents) && !agents.some((candidate) => candidate.agentId === agent.agentId)) warnings.push('agent_unavailable');
     if (node.type === 'bpmn_boundary_escalation' && processEscalationPathProblem(this, node.id)) warnings.push('escalation_path');
     if (this.attentionIds.has(node.id)) warnings.push('import_attention');
+    if (this.attentionContainerIds.has(node.id)) warnings.push('attention_inside');
     return warnings;
   }
 
   /** The imported elements whose warnings are still open; each is marked on the canvas until it is reviewed. */
-  setAttentionIds(ids) {
-    const changed = this.nodes.filter((node) => this.attentionIds.has(node.id) !== ids.has(node.id));
+  setAttentionIds(ids, containerIds = new Set()) {
+    const changed = this.nodes.filter((node) => this.attentionIds.has(node.id) !== ids.has(node.id)
+      || this.attentionContainerIds.has(node.id) !== containerIds.has(node.id));
     this.attentionIds = new Set(ids);
+    this.attentionContainerIds = new Set(containerIds);
     if (this.mode === 'bpmn') for (const node of changed) this._renderSingleNode(node);
   }
 
@@ -2441,6 +2455,12 @@ export class FlowCanvas {
     this.view.zoom = z;
     this._pendingFitMinZoom = null;
     this._applyView();
+  }
+
+  /** Brings a node into view: the canvas pans to its middle at the current zoom. */
+  revealNode(id) {
+    const node = this.nodes.find((candidate) => candidate.id === id);
+    if (node) this.centerOn(node.x + node.width / 2, node.y + node.height / 2);
   }
 
   // Puts a point of the drawing at the middle of the canvas (the minimap's pan).

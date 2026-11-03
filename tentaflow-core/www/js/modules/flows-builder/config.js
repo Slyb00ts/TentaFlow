@@ -277,6 +277,7 @@ export class FlowConfig {
     // not mark the flow dirty, so replacing the model (version preview, import,
     // draft load) or an undo that removes its node discards it without a prompt.
     this.processDrafts = new Map();
+    this.pendingImpl = null;
     // What the inspector cut back for one node ({ nodeId, iterations, timeout }): the toast passes, the field hint stays.
     this.reduction = null;
     this.readOnly = !!opts.readOnly;
@@ -302,7 +303,7 @@ export class FlowConfig {
   _clearDraft(node, field) { this.processDrafts.delete(this._draftScope(node, field).key); }
 
   /** Forget every refused draft: the model was replaced, so no node of it is the one the text was typed for. */
-  clearProcessDrafts() { this.processDrafts.clear(); }
+  clearProcessDrafts() { this.processDrafts.clear(); this.pendingImpl = null; }
 
   /** The canvas swapped its model: `restored` is undo/redo, otherwise a load, whose selection no longer exists. */
   modelReplaced(restored) {
@@ -714,12 +715,41 @@ export class FlowConfig {
     this.root.querySelector('[data-process="repeatOutput"]')?.focus();
   }
 
+  // An unbound step stays unbound until the author has chosen a COMPLETE implementation: a bare category
+  // (a flow not picked yet, a tool without its names) is kept here, so the not-bound state and its named
+  // refusal stay true. Returns true when the change was taken here.
+  _pendingImplementation(node, key, control) {
+    if (!['implementation', 'flowId', 'addonId', 'toolName'].includes(key)) return false;
+    if (key === 'implementation' && !['flow', 'tool'].includes(control.value)) return false;
+    const pending = this.pendingImpl?.nodeId === node.id ? this.pendingImpl : { nodeId: node.id, kind: null, tool: { addonId: '', toolName: '' } };
+    this.pendingImpl = pending;
+    if (key === 'implementation') {
+      pending.kind = control.value;
+      this._renderProcess();
+      return true;
+    }
+    if (key === 'flowId') {
+      if (!control.value) return true;
+      this.pendingImpl = null;
+      this.opts.onConfigChange(node.id, { flowId: control.value, implementation: 'Flow' });
+      this._renderProcess();
+      return true;
+    }
+    pending.tool[key] = control.value.trim();
+    if (pending.tool.addonId && pending.tool.toolName) {
+      this.pendingImpl = null;
+      this.opts.onConfigChange(node.id, { flowId: '', implementation: { AddonTool: { ...pending.tool } } });
+      this._renderProcess();
+    }
+    return true;
+  }
+
   // What the import said about this element and the author has not yet settled; the way out is a review, which only the author can give.
   _attentionHtml(node) {
     const notes = this.opts.getAttentionNotes?.(node.id) ?? [];
     if (!notes.length) return '';
     return `<div class="fb-import-notes" data-import-attention>${notes.map(({ text, detail }) => `<tf-alert tone="warning" message="${escapeAttr(text)}"></tf-alert>${detail && detail !== text ? `<p class="fb-field-hint" data-note-detail>${escapeHtml(detail)}</p>` : ''}`).join('')}
-      ${this.readOnly ? '' : `<tf-button variant="secondary" size="sm" icon="check" data-attention-dismiss>${escapeHtml(I18n.t('bpmn.attention_dismiss'))}</tf-button>`}</div>`;
+      ${this.readOnly || node.config?.implementation?.Unbound ? '' : `<tf-button variant="secondary" size="sm" icon="check" data-attention-dismiss>${escapeHtml(I18n.t('bpmn.attention_dismiss'))}</tf-button>`}</div>`;
   }
 
   _renderProcess() {
@@ -779,7 +809,14 @@ export class FlowConfig {
       const agentLabels = processDistinctLabels(agents.map((agent) => [agent.agentId, agent.name]));
       const listedAgent = agentTask && agents.find((agent) => agent.agentId === agentTask.agentId);
       const iterationLimit = agentTask ? processAgentIterationLimit(listedAgent, agentTask.maxIterations) : 0;
-      const source = agentTask
+      // A category chosen for an unbound step is held here until it is complete; the model keeps the placeholder meanwhile.
+      if (this.pendingImpl && (this.pendingImpl.nodeId !== node.id || !unboundTask)) this.pendingImpl = null;
+      const pendingKind = unboundTask && this.pendingImpl?.nodeId === node.id ? this.pendingImpl.kind : null;
+      const flowPicker = `<tf-select data-process="flowId" wrap-selected label="${escapeAttr(I18n.t('bpmn.service_flow'))}" value="${escapeAttr(config.flowId)}" ${disabled}>${options}${unavailable ? `<option value="${escapeAttr(config.flowId)}" disabled>${escapeHtml(I18n.t('bpmn.flow_unavailable'))}</option>` : ''}</tf-select>`;
+      const source = pendingKind === 'flow' ? flowPicker
+        : pendingKind === 'tool' ? `${input('addonId', 'tool_addon_id', this.pendingImpl.tool.addonId)}${input('toolName', 'tool_name', this.pendingImpl.tool.toolName)}
+        <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.tool_hint'))}</p>`
+        : agentTask
         ? `<tf-select data-process="agentId" wrap-selected label="${escapeAttr(I18n.t('bpmn.agent_label'))}" value="${escapeAttr(agentTask.agentId)}" ${disabled}>${agents.map((agent) => `<option value="${escapeAttr(agent.agentId)}">${escapeHtml(agentLabels.get(agent.agentId))}</option>`).join('')}${agents.some((agent) => agent.agentId === agentTask.agentId) ? '' : `<option value="${escapeAttr(agentTask.agentId)}" disabled>${escapeHtml(I18n.t('bpmn.agent_unavailable'))}</option>`}</tf-select>
         ${listedAgent ? '' : `<tf-alert tone="warning" live data-agent-warning message="${escapeAttr(I18n.t('bpmn.agent_unavailable_warning'))}"></tf-alert>`}
         ${textarea('agentGoal', 'agent_goal', agentTask.goalExpression, 3)}
@@ -798,7 +835,7 @@ export class FlowConfig {
         ? `${input('addonId', 'tool_addon_id', tool.addonId)}${input('toolName', 'tool_name', tool.toolName)}
         <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.tool_hint'))}</p>`
         : unboundTask ? ''
-        : `<tf-select data-process="flowId" wrap-selected label="${escapeAttr(I18n.t('bpmn.service_flow'))}" value="${escapeAttr(config.flowId)}" ${disabled}>${options}${unavailable ? `<option value="${escapeAttr(config.flowId)}" disabled>${escapeHtml(I18n.t('bpmn.flow_unavailable'))}</option>` : ''}</tf-select>`;
+        : flowPicker;
       const verificationMode = processVerificationMode(config.verification);
       const testVerification = config.verification?.Test;
       const criticVerification = config.verification?.Critic;
@@ -825,7 +862,7 @@ export class FlowConfig {
       if (!tabs.some(([id]) => id === this.processTab)) this.processTab = 'impl';
       const panel = servicePanel = (id, html) => `<section class="fb-process-panel" role="tabpanel" id="svc-panel-${id}" aria-labelledby="${id}" data-service-panel="${id}" ${this.processTab === id ? '' : 'hidden'}>${html}</section>`;
       servicePanels = `<tf-tabs variant="bar" layout="stacked" value="${this.processTab}" data-service-tabs>${tabs.map(([id, label, icon]) => `<tf-tab id="${id}" icon="${icon}" panel="svc-panel-${id}" label="${escapeAttr(I18n.t(`bpmn.${label}`))}" title="${escapeAttr(I18n.t(`bpmn.${label}_title`))}"></tf-tab>`).join('')}</tf-tabs>`
-        + panel('impl', `${blockTask ? `<tf-alert tone="warning" data-service-warning="empty_setting" message="${escapeAttr(processWarningText(node, 'empty_setting', blocks))}" ${processNodeWarnings(node, blocks).includes('empty_setting') ? '' : 'hidden'}></tf-alert>` : ''}${unboundTask ? `<tf-alert tone="warning" data-unbound-notice message="${escapeAttr(I18n.t('bpmn.unbound_notice', { origin: unboundTask.origin }))}"></tf-alert>` : ''}<tf-select data-process="implementation" label="${escapeAttr(I18n.t('bpmn.service_implementation'))}" value="${agentTask ? 'agent' : blockTask ? 'block' : tool ? 'tool' : unboundTask ? '' : 'flow'}" ${disabled}>
+        + panel('impl', `${blockTask ? `<tf-alert tone="warning" data-service-warning="empty_setting" message="${escapeAttr(processWarningText(node, 'empty_setting', blocks))}" ${processNodeWarnings(node, blocks).includes('empty_setting') ? '' : 'hidden'}></tf-alert>` : ''}${unboundTask ? `<tf-alert tone="warning" data-unbound-notice message="${escapeAttr(I18n.t('bpmn.unbound_notice', { origin: unboundTask.origin }))}"></tf-alert>` : ''}<tf-select data-process="implementation" label="${escapeAttr(I18n.t('bpmn.service_implementation'))}" value="${agentTask ? 'agent' : blockTask ? 'block' : tool ? 'tool' : unboundTask ? (pendingKind ?? '') : 'flow'}" ${disabled}>
           ${unboundTask ? `<option value="" disabled>${escapeHtml(I18n.t('bpmn.implementation_choose'))}</option>` : ''}
           <option value="flow">${escapeHtml(I18n.t('bpmn.implementation_flow'))}</option>
           <option value="tool">${escapeHtml(I18n.t('bpmn.implementation_tool'))}</option>
@@ -1383,6 +1420,7 @@ export class FlowConfig {
       if (key === 'callTargetMode' || key === 'localBodyChoice'
         || key === 'calledDefinitionChoice' || key === 'calledVersionChoice' || key === 'calledProcessChoice'
         || key === 'calledElement') return;
+      if (node.config.implementation?.Unbound && this._pendingImplementation(node, key, control)) return;
       if (key === 'name') {
         this.opts.onLabelChange(node.id, control.value);
         this.root.querySelector('.fb-config-title').textContent = getNodeDisplayTitle(node, this.template);

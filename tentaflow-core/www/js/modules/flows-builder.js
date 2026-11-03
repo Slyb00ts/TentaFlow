@@ -16,7 +16,7 @@ import { TfWindow } from '/js/components/tf-window.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
-import { checkProcessDocument, processAttentionTargets, processBody, processCommand, processDistinctLabels, processEditorLabels, processElementNames, processExplainError, processHasTimer, processHasTimerStart, processImportFlagged, processImportNeedsReview, processNextAttention, processDiagnosticSeverity, processDiagnosticText, processElementNode, processNodeLabels, processPublishProblems, processStartEntryLabels, processTimezoneCanonical, processTimezoneGaps, processTimezoneText, processBodyLabels } from '/js/modules/flows-builder/bpmn.js';
+import { checkProcessDocument, processAttentionTargets, processBody, processCommand, processDistinctLabels, processEditorLabels, processElementNames, processExplainError, processHasTimer, processHasTimerStart, processAttentionContainers, processIsPristine, processImportFlagged, processImportNeedsReview, processNextAttention, processDiagnosticSeverity, processDiagnosticText, processDiagnosticDetail, processElementNode, processNodeLabels, processPublishProblems, processStartEntryLabels, processTimezoneCanonical, processTimezoneGaps, processTimezoneText, processBodyLabels } from '/js/modules/flows-builder/bpmn.js';
 import { openProcessCalendar, openProcessDeclarations, openProcessInstances, openProcessMessageSend, openProcessMessages, openProcessModeling, openProcessRun, openProcessSchedule, openProcessVariables, processLifecycleReasonText, processTimerText } from '/js/modules/flows-builder/process-monitor.js';
 import { openProcessSimulation } from '/js/modules/flows-builder/process-simulation.js';
 import { openProcessImportReview } from '/js/modules/flows-builder/process-import.js';
@@ -31,6 +31,9 @@ import '/js/components/tf-menu.js';
 // Delete and undo must keep working after a click on Save or a palette Enter
 // leaves focus on a button, so only elements that consume these keys
 // themselves (text fields, pickers, open dialogs and menus) swallow them.
+// What an import left for the author: elements with warnings not yet reviewed, the diagnostics behind them,
+// and the unbound steps seen so far (a step leaving that set was bound, which settles it).
+const emptyAttention = () => ({ flagged: new Set(), notes: new Map(), unbound: new Set() });
 const MINIMAP_COLLAPSED_KEY = 'tf_fb_minimap_collapsed';
 const TEXT_ENTRY_TAGS = new Set(['INPUT', 'TEXTAREA', 'SELECT', 'TF-INPUT', 'TF-TEXTAREA', 'TF-SEARCHBOX',
   'TF-COMBOBOX', 'TF-SELECT', 'TF-DATEPICKER', 'TF-MENU', 'TF-MODAL', 'TF-WINDOW', 'DIALOG']);
@@ -177,8 +180,10 @@ const FlowBuilderScreen = {
       // dopisywane z powrotem przy zapisie — bez tego save gubilby sekcje.
       flowVariables: [],
       // What an import left for the author: the elements with warnings not yet reviewed, and the lines to tell why.
-      attention: { flagged: new Set(), notes: new Map() },
+      attention: emptyAttention(),
       attentionLive: false,
+      // The language the screen was drawn in: a different one at unmount means the shell is repainting, not the author leaving.
+      language: I18n.getLanguage(),
       cleanupFns: [],
     };
     this._state = state;
@@ -210,9 +215,12 @@ const FlowBuilderScreen = {
       return;
     }
 
+    // After a language switch the editor comes back as it was, not as the server last saw it.
+    const carried = state.mode === 'bpmn' && this._carry?.flowId === flowId ? this._carry : null;
+    this._carry = null;
     let parsed = { nodes: [], edges: [] };
     try {
-      if (state.mode === 'bpmn') parsed = state.definition.model;
+      if (state.mode === 'bpmn') parsed = carried ? carried.model : state.definition.model;
       else
       parsed = JSON.parse(state.flow.flow_json || '{"nodes":[],"edges":[]}');
     } catch (_) { parsed = { nodes: [], edges: [] }; }
@@ -252,7 +260,7 @@ const FlowBuilderScreen = {
       onModelReplace: (restored) => {
         state.config?.modelReplaced(restored);
         // A load or an import sets the flags itself afterwards; an undo keeps the ones still open.
-        if (!restored) state.attention = { flagged: new Set(), notes: new Map() };
+        if (!restored) state.attention = emptyAttention();
         this._syncAttention(state, state.canvas?.processModel);
         this._syncDraftBanner(state); this._syncSaveBanner(state);
       },
@@ -294,6 +302,15 @@ const FlowBuilderScreen = {
       this._syncProcessBodySelect();
       this._syncStartCatalog();
     }
+    if (carried) {
+      state.attention = carried.attention;
+      this._syncAttention(state, state.canvas.getData());
+      if (carried.dirty) this._markDirty();
+    }
+    if (state.mode === 'bpmn' && this._review) {
+      const { response, xml, loaded } = this._review;
+      this._openImportReview(state, response, xml, loaded);
+    }
 
     this._bindMinimap(state);
 
@@ -310,7 +327,7 @@ const FlowBuilderScreen = {
       getCanvas: () => state.canvas,
       onConfigChange: (id, patch) => { state.canvas.updateNodeConfig(id, patch); },
       getAttentionNotes: (id) => (state.attention.flagged.has(id) ? state.attention.notes.get(id) ?? [] : [])
-        .map((diagnostic) => ({ text: processDiagnosticText(diagnostic), detail: String(diagnostic.message ?? '') })),
+        .map((diagnostic) => ({ text: processDiagnosticText(diagnostic), detail: processDiagnosticDetail(diagnostic) })),
       onAttentionDismiss: (id) => this._dismissAttention(state, id),
       onEdgeChange: (id, patch) => state.canvas.updateEdge(id, patch),
       onLabelChange: (id, label) => {
@@ -648,6 +665,12 @@ const FlowBuilderScreen = {
   async unmount() {
     const s = this._state;
     if (!s) return;
+    this._carry = s.mode === 'bpmn' && s.canvas && I18n.getLanguage() !== s.language
+      ? { flowId: s.flowId, model: s.canvas.getData(), dirty: s.dirty, attention: s.attention } : null;
+    if (!this._carry) this._review = null;
+    // The window belongs to this screen's state: a fresh one is drawn after a remount, never a stale one kept.
+    if (this._reviewWindow?.isConnected) this._reviewWindow.close(true);
+    this._reviewWindow = null;
     if (s.autosaveTimer) clearInterval(s.autosaveTimer);
     for (const fn of s.cleanupFns) { try { fn(); } catch (_) {} }
     s.palette?.destroy();
@@ -964,17 +987,23 @@ const FlowBuilderScreen = {
     });
   },
 
-  _importProcess() {
+  _importProcess(initialXml = '') {
     const state = this._state;
     if (!state || state.readOnly) return;
     const section = document.createElement('div');
     section.className = 'fb-process-import';
     section.innerHTML = `<tf-file-input accept=".bpmn,.xml" label="${escapeAttr(I18n.t('bpmn.xml_file'))}"></tf-file-input>
       <tf-code-editor language="html" aria-label="${escapeAttr(I18n.t('bpmn.xml_document'))}"></tf-code-editor>
+      <p class="fb-field-hint">${escapeHtml(I18n.t('bpmn.import_editor_hint'))}</p>
       <tf-alert data-file-error tone="danger" hidden></tf-alert>`;
-    section.querySelector('tf-code-editor').labels = processEditorLabels();
+    const editor = section.querySelector('tf-code-editor');
+    editor.labels = processEditorLabels();
+    if (initialXml) editor.value = initialXml;
+    // Escape inside the editor is its way out of the Tab trap (Escape, then Tab); it must not also close the window.
+    editor.addEventListener('keydown', (event) => { if (event.key === 'Escape') event.stopPropagation(); });
     let fileGeneration = 0;
     let fileBusy = false;
+    let submitted = false;
     const win = openFormWindow({ title: I18n.t('bpmn.import_xml'), icon: 'arrow-up', subject: state.definition.name,
       note: { text: I18n.t('bpmn.import_hint') }, sections: [section], submitLabel: I18n.t('bpmn.import_apply'),
       canSubmit: () => !fileBusy && !!section.querySelector('tf-code-editor').value.trim() && this._current(state) && !state.readOnly,
@@ -985,14 +1014,24 @@ const FlowBuilderScreen = {
         if (!this._current(state) || !win.isConnected || state.readOnly) throw new Error(I18n.t('bpmn.editor_changed'));
         // A clean import has nothing to read; anything else is shown before a single element is loaded.
         if (processImportNeedsReview(response)) {
-          openProcessImportReview({ response,
-            onImport: () => this._loadImport(state, response),
-            onReveal: (row) => this._revealElement(state, row.nodeId) });
+          submitted = true;
+          this._openImportReview(state, response, xml, false);
           return undefined;
         }
         if (!await this._loadImport(state, response)) throw new Error(I18n.t('bpmn.import_not_loaded'));
+        submitted = true;
         return { message: I18n.t('bpmn.imported_draft') };
       },
+    });
+    // Dismissing the form with pasted text in it (Escape, the backdrop) asks first; Cancel is the explicit way out.
+    win.addEventListener('close-request', async (event) => {
+      if (submitted || win._asking || !editor.value.trim()) return;
+      event.preventDefault();
+      win._asking = true;
+      const discard = await TfWindow.confirm({ title: I18n.t('bpmn.import_discard_title'), message: I18n.t('bpmn.import_discard_hint'),
+        confirmLabel: I18n.t('bpmn.import_discard'), cancelLabel: I18n.t('bpmn.import_keep_editing'), danger: true });
+      win._asking = false;
+      if (discard && win.isConnected) win.close(true);
     });
     section.querySelector('tf-file-input').addEventListener('change', async (event) => {
       if (event.target.tagName !== 'TF-FILE-INPUT') return;
@@ -1018,6 +1057,20 @@ const FlowBuilderScreen = {
     });
   },
 
+  _openImportReview(state, response, xml, loaded) {
+    this._review = { response, xml, loaded };
+    this._reviewWindow = openProcessImportReview({ response, loaded,
+      returnFocus: state.root.querySelector('[data-role="more"]'),
+      onImport: async () => {
+        const done = await this._loadImport(state, response);
+        if (done && this._review?.response === response) this._review.loaded = true;
+        return done;
+      },
+      onReveal: (row) => this._revealElement(state, row.nodeId),
+      onBack: () => this._importProcess(xml),
+      onDismiss: () => { if (this._review?.response === response) this._review = null; } });
+  },
+
   // Replaces the draft with an imported model. The import is the author's
   // consent to what it translated, so the elements it flagged are marked
   // afterwards; the replaced draft cannot be undone, hence the question when
@@ -1027,7 +1080,8 @@ const FlowBuilderScreen = {
       toast(I18n.t('bpmn.editor_changed'), 'warning');
       return false;
     }
-    if (state.dirty && !await TfWindow.confirm({ title: I18n.t('bpmn.import_replace_title'), message: I18n.t('bpmn.import_replace_hint'),
+    // Autosave clears the dirty flag within seconds, so what counts is whether the editor holds a drawing at all.
+    if ((state.dirty || !processIsPristine(state.canvas.getData())) && !await TfWindow.confirm({ title: I18n.t('bpmn.import_replace_title'), message: I18n.t('bpmn.import_replace_hint'),
       confirmLabel: I18n.t('bpmn.import_as_draft'), cancelLabel: I18n.t('common.cancel') })) return false;
     if (!this._current(state) || state.readOnly) {
       toast(I18n.t('bpmn.editor_changed'), 'warning');
@@ -1040,13 +1094,14 @@ const FlowBuilderScreen = {
       const where = processElementNode(response.model, diagnostic.elementId);
       if (where) notes.set(where.nodeId, [...(notes.get(where.nodeId) ?? []), diagnostic]);
     }
-    state.attention = { flagged: processImportFlagged(response.model, response.diagnostics), notes };
+    state.attention = { flagged: processImportFlagged(response.model, response.diagnostics), notes, unbound: new Set() };
     this._syncAttention(state, state.canvas.getData());
     this._syncProcessBodySelect();
     this._markDirty();
     this._updateStats();
     this._renderMinimap();
     this._syncProcessControls();
+    state.canvas.fitToContent();
     return true;
   },
 
@@ -1055,13 +1110,25 @@ const FlowBuilderScreen = {
   // and the banner goes with the last one.
   _syncAttention(state, model) {
     if (state.mode !== 'bpmn' || !state.canvas) return;
-    const targets = processAttentionTargets(model, state.attention.flagged);
-    state.canvas.setAttentionIds(new Set(targets.filter((target) => target.reasons.includes('warning')).map((target) => target.nodeId)));
+    let targets = processAttentionTargets(model, state.attention.flagged);
+    // The warning about an unbound step is the unboundness: once the step is bound it is settled, whatever else was said.
+    const unboundNow = new Set(targets.filter((target) => target.reasons.includes('unbound')).map((target) => target.nodeId));
+    let settled = false;
+    for (const id of state.attention.unbound) {
+      if (unboundNow.has(id)) continue;
+      state.attention.unbound.delete(id); state.attention.flagged.delete(id); state.attention.notes.delete(id); settled = true;
+    }
+    for (const id of unboundNow) state.attention.unbound.add(id);
+    if (settled) targets = processAttentionTargets(model, state.attention.flagged);
+    state.canvas.setAttentionIds(new Set(targets.filter((target) => target.reasons.includes('warning')).map((target) => target.nodeId)),
+      processAttentionContainers(targets));
     state.attentionLive = targets.length > 0;
     const banner = state.root.querySelector('[data-role="attention"]');
     if (!banner) return;
     banner.hidden = !targets.length;
-    banner.setAttribute('message', I18n.t('bpmn.attention_banner', { count: targets.length }));
+    // The warnings of an import are not part of the model: they are listed only until the editor is left.
+    const session = state.attention.flagged.size ? ` ${I18n.t('bpmn.attention_session_note')}` : '';
+    banner.setAttribute('message', I18n.t('bpmn.attention_banner', { count: targets.length }) + session);
   },
 
   _revealAttention(state) {
@@ -1091,6 +1158,7 @@ const FlowBuilderScreen = {
       this._renderMinimap();
     }
     canvas.selectNode(nodeId);
+    canvas.revealNode(nodeId);
   },
 
   _dismissAttention(state, nodeId) {

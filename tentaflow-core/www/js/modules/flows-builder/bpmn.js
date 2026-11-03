@@ -583,11 +583,17 @@ export function processRepeatOutputGaps(model) {
 
 // What would make the server refuse a publication, told by name before it is
 // asked: the texts are the ones the author reads in the banner.
+// One heading, then one line per step: the refusal is said once, not on every line.
+function processUnboundRefusal(stepNames) {
+  return stepNames.length ? [I18n.t('bpmn.unbound_publish_heading', { count: stepNames.length }),
+    ...stepNames.map((name) => I18n.t('bpmn.unbound_publish_refused', { node: name }))] : [];
+}
+
 export function processPublishProblems(model) {
   return [
     ...processUnusedDeclarations(model).map(({ kind, name }) => I18n.t(`bpmn.unused_${kind}`, { name })),
     ...processRepeatOutputGaps(model).map(({ name }) => I18n.t('bpmn.repeat_output_missing', { node: name })),
-    ...processUnboundSteps(model).map(({ name }) => I18n.t('bpmn.unbound_publish_refused', { node: name })),
+    ...processUnboundRefusal(processUnboundSteps(model).map(({ name }) => name)),
   ];
 }
 
@@ -682,10 +688,25 @@ export function processDiagnosticText(diagnostic) {
   return text === key ? String(diagnostic.message ?? '') : text;
 }
 
-function processImportElement(model, names, elementId) {
+// Codes whose localized sentence already says everything the server's message
+// does (they carry no argument); for every other code the server's message is
+// the second line, because it names the attribute, value or expression.
+const SELF_CONTAINED_CODES = new Set(['CAMUNDA_GATEWAY_EVAL_SEMANTICS', 'CAMUNDA_SERVICE_NO_IMPLEMENTATION',
+  'CAMUNDA_CONDITION_RESOURCE', 'CAMUNDA_CONDITION_UNTYPED', 'CAMUNDA_INVALID_CONDITION', 'CAMUNDA_CALL_MAPPING_SKIPPED',
+  'CAMUNDA_MULTI_INSTANCE_INPUT', 'CAMUNDA_MULTI_INSTANCE_COMPLETION', 'CAMUNDA_PROPERTIES_IGNORED',
+  'CAMUNDA_DOCUMENTATION_IGNORED', 'CAMUNDA_DIAGRAM_DETAIL_IGNORED']);
+
+export function processDiagnosticDetail(diagnostic) {
+  const message = String(diagnostic?.message ?? '');
+  const key = `bpmn.diag_${diagnostic?.code}`;
+  return I18n.t(key) === key || SELF_CONTAINED_CODES.has(diagnostic?.code) || message === I18n.t(key) ? '' : message;
+}
+
+function processImportElement(model, names, elementId, elementName = null) {
   if (elementId == null || elementId === '') return { element: '', nodeId: null };
   const where = processElementNode(model, elementId);
-  const named = where && !where.flow ? names.get(where.nodeId) : null;
+  // With the model withheld the server's own name for the element is all there is.
+  const named = where && !where.flow ? names.get(where.nodeId) : (!model && elementName ? String(elementName).trim() : null);
   return { element: named && named !== elementId ? `${named} (${elementId})` : String(elementId), nodeId: where?.nodeId ?? null };
 }
 
@@ -700,8 +721,8 @@ export function processImportGroups(diagnostics, model = null) {
   const rows = (diagnostics || []).map((diagnostic, order) => ({
     severity: processDiagnosticSeverity(diagnostic), code: diagnostic.code, order,
     offset: diagnostic.offset ?? null, text: processDiagnosticText(diagnostic),
-    detail: String(diagnostic.message ?? ''), elementId: diagnostic.elementId ?? null,
-    ...processImportElement(model, names, diagnostic.elementId),
+    detail: processDiagnosticDetail(diagnostic), elementId: diagnostic.elementId ?? null,
+    ...processImportElement(model, names, diagnostic.elementId, diagnostic.elementName),
   }));
   return PROCESS_SEVERITIES.map((severity) => ({ severity, rows: rows.filter((row) => row.severity === severity)
     .sort((a, b) => (a.offset ?? Infinity) - (b.offset ?? Infinity) || a.order - b.order) }))
@@ -716,9 +737,34 @@ export function processImportTranslations(translations, model = null) {
     const kindLabel = I18n.t(kindKey);
     return { elementId: translation.elementId, original: translation.original, translated: translation.translated,
       kind: translation.kind, kindLabel: kindLabel === kindKey ? String(translation.kind) : kindLabel,
-      warnings: (translation.warnings || []).map((code) => ({ code, text: processDiagnosticText({ code, message: code }) })),
+      warnings: [...new Set(translation.warnings || [])].map((code) => ({ code, text: processDiagnosticText({ code, message: code }) })),
       ...processImportElement(model, names, translation.elementId) };
   });
+}
+
+/**
+ * The result of an import as plain text, to keep: the warning list lives only
+ * in the editor session, so the author can copy it out.
+ */
+export function processImportReport(response) {
+  const model = response?.model ?? null;
+  const lines = [I18n.t('bpmn.import_review_title'), processImportSummaryText(processImportCounts(response)), ''];
+  for (const group of processImportGroups(response?.diagnostics, model)) {
+    lines.push(`${I18n.t(`bpmn.import_severity_${group.severity}`)}:`);
+    for (const row of group.rows) {
+      lines.push(`- [${row.code}] ${row.element ? `${row.element}: ` : ''}${row.text}${row.detail ? ` (${row.detail})` : ''}`);
+    }
+    lines.push('');
+  }
+  const translations = processImportTranslations(response?.translations, model);
+  if (translations.length) {
+    lines.push(`${I18n.t('bpmn.import_translations_title')}:`);
+    for (const row of translations) {
+      lines.push(`- ${row.element ? `${row.element} · ` : ''}${row.kindLabel}: ${row.original} -> ${row.translated}`);
+      for (const warning of row.warnings) lines.push(`    ! ${warning.text}`);
+    }
+  }
+  return lines.join('\n').trimEnd();
 }
 
 // The nodes of an imported model whose diagnostics were warnings: they lost
@@ -745,6 +791,21 @@ export function processAttentionTargets(model, flagged = new Set()) {
       ...(flagged.has(node.id) ? ['warning'] : [])];
     return reasons.length ? [{ nodeId: node.id, processId, path, reasons }] : [];
   });
+}
+
+// The sub-processes (by id) that hold an element of the list: they carry a marker of their own so the
+// main canvas shows where the work is, while the list counts only the elements themselves.
+export function processAttentionContainers(targets) {
+  return new Set(targets.flatMap((target) => target.path));
+}
+
+// A model nothing was drawn in: the starter Start -> End, no names, variables or declarations.
+export function processIsPristine(model) {
+  return !(model.additionalProcesses?.length) && model.nodes?.length === 2
+    && model.nodes[0].kind === 'Start' && model.nodes[1].kind === 'End' && !model.nodes[0].name && !model.nodes[1].name
+    && model.sequenceFlows?.length === 1 && !Object.keys(model.variables || {}).length
+    && !model.workCalendar && !model.timerTimezone
+    && !['messages', 'errors', 'escalations', 'signals'].some((key) => model[key]?.length);
 }
 
 // The target after the selected element, wrapping; the first one when the
@@ -889,7 +950,7 @@ export function processExplainError(message, model, options = null) {
       : I18n.t(`bpmn.unused_${unused[1]}_any`);
   }
   const unbound = /UNBOUND_IMPLEMENTATION: service task ([\w.-]+) has no implementation/.exec(text);
-  if (unbound && names.has(unbound[1])) return I18n.t('bpmn.unbound_publish_refused', { node: names.get(unbound[1]) });
+  if (unbound && names.has(unbound[1])) return processUnboundRefusal([names.get(unbound[1])]).join('\n');
   const timeout = /service task ([\w.-]+) timeout is outside 1\.\.=(\d+) seconds/.exec(text);
   if (timeout && names.has(timeout[1])) return I18n.t('bpmn.timeout_out_of_range', { node: names.get(timeout[1]), max: Number(timeout[2]) });
   // A publication names every refused step, one per line; two steps of one name carry their occurrence number.
