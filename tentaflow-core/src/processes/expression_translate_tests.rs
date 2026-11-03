@@ -4,7 +4,7 @@ use super::expression_translate::*;
 use crate::flow_engine::envelope::FlowValue;
 use crate::flow_engine::expr::{self, ExprScope};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const C: &str = EXPR_TYPE_COERCION;
 const D: &str = EXPR_DIVISION_SEMANTICS;
@@ -89,8 +89,8 @@ fn juel_golden_table() {
         ("${true == false}", "true == false", &[]),
         ("${'a' == 'a'}", "\"a\" == \"a\"", &[]),
         ("${x == 1}", "vars.x == 1", &[C]),
-        ("${x == null}", "vars.x == null", &[M]),
-        ("${null != x}", "null != vars.x", &[M]),
+        ("${x == null}", "vars.x == null", &[]),
+        ("${null != x}", "null != vars.x", &[]),
         ("${1 == null}", "1 == null", &[]),
         ("${'a' != null}", "\"a\" != null", &[]),
         ("${a.b == null}", "vars.a.b == null", &[M]),
@@ -155,10 +155,17 @@ fn juel_golden_table() {
         ("${(!a).b}", "(!vars.a).b", &[M, C]),
         ("${(!a)[0]}", "(!vars.a)[0]", &[M, C]),
         ("${(-x).y}", "(-vars.x).y", &[M, C]),
-        ("${(-5).x}", "(-5).x", &[M]),
+        ("${empty ''}", "(size(\"\") == 0)", &[]),
+        ("${a || b || c}", "vars.a || vars.b || vars.c", &[C, C, C]),
+        ("${a - b - c}", "vars.a - vars.b - vars.c", &[C, C]),
+        ("${a - (b - c)}", "vars.a - (vars.b - vars.c)", &[C, C]),
+        ("${1 + 2 + 3 * 4 * 5}", "1 + 2 + (3 * 4 * 5)", &[]),
+        ("${a == b == c}", "(vars.a == vars.b) == vars.c", &[C, C]),
+        ("${s < '\u{e000}'}", "vars.s < \"\u{e000}\"", &[C, C]),
+        ("${s < 'abc'}", "vars.s < \"abc\"", &[C]),
         ("${1 + 2 * 3}", "1 + (2 * 3)", &[]),
         ("${(1 + 2) * 3}", "(1 + 2) * 3", &[]),
-        ("${1 - 2 - 3}", "(1 - 2) - 3", &[]),
+        ("${1 - 2 - 3}", "1 - 2 - 3", &[]),
         ("${1 - (2 - 3)}", "1 - (2 - 3)", &[]),
         ("${8 mod 3}", "8 % 3", &[]),
         ("${8 % 3}", "8 % 3", &[]),
@@ -367,6 +374,7 @@ fn constant_integer_overflow_is_refused() {
         "${(9223372036854775807 + 0) + 1}",
         "${9223372036854775807 * 9223372036854775807}",
         "${3037000500 * 3037000500}",
+        "${-(-9223372036854775807 - 1)}",
     ] {
         let r = refusal(source, SourceLanguage::Juel);
         assert_eq!(r.code, EXPR_INTEGER_OVERFLOW, "{source}: {r}");
@@ -377,6 +385,9 @@ fn constant_integer_overflow_is_refused() {
         "${3037000499 * 3037000499}",
         "${x + 9223372036854775807 + 1}",
         "${9223372036854775807 + 1.0}",
+        "${-(-9223372036854775807)}",
+        "${- -9223372036854775807}",
+        "${execution.getVariable('task')}",
     ] {
         assert!(juel(source).is_ok(), "{source}");
     }
@@ -410,6 +421,67 @@ fn java_trim_and_whitespace_rules_apply() {
     );
     assert_eq!(juel("${a\u{2003}+\u{b}b}").unwrap().cel, "vars.a + vars.b");
     assert_eq!(juel("\u{0}\t\n ${x} \r").unwrap().cel, "vars.x");
+}
+
+#[test]
+fn long_left_associative_chains_stay_within_the_cel_nesting_cap() {
+    let names: Vec<String> = (0..34).map(|i| format!("v{i}")).collect();
+    let source = format!("${{{}}}", names.join("||"));
+    let translation = juel(&source).unwrap();
+    assert!(!translation.cel.contains('('), "{}", translation.cel);
+    for hot in [None, Some(0), Some(17), Some(33)] {
+        let vars: BTreeMap<String, V> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), V::Bool(hot == Some(i))))
+            .collect();
+        assert_eq!(
+            evaluate_cel(&translation.cel, &vars).unwrap(),
+            json!(hot.is_some())
+        );
+    }
+    let sum = format!("${{{}}}", ["1"; 60].join("+"));
+    assert_eq!(
+        evaluate_cel(&juel(&sum).unwrap().cel, &BTreeMap::new()).unwrap(),
+        json!(60)
+    );
+    let difference = format!("${{100{}}}", "-1".repeat(60));
+    assert_eq!(
+        evaluate_cel(&juel(&difference).unwrap().cel, &BTreeMap::new()).unwrap(),
+        json!(40)
+    );
+    // Only the left operand loses its parentheses; a right operand keeps them.
+    assert_eq!(juel("${1 - (2 - 3)}").unwrap().cel, "1 - (2 - 3)");
+    assert_eq!(
+        juel("${a || (b || c)}").unwrap().cel,
+        "vars.a || (vars.b || vars.c)"
+    );
+    assert_eq!(
+        juel("${a + b - c}").unwrap().cel,
+        "(vars.a + vars.b) - vars.c"
+    );
+}
+
+#[test]
+fn warning_texts_follow_the_language_and_the_operand() {
+    let has = |t: &Translation, needle: &str| t.warnings.iter().any(|w| w.message.contains(needle));
+    let feel_if = translate("= if a then 1 else 2", SourceLanguage::Feel).unwrap();
+    assert!(
+        has(&feel_if, "takes the else branch"),
+        "{:?}",
+        feel_if.warnings
+    );
+    let feel_and = translate("= a and b", SourceLanguage::Feel).unwrap();
+    assert!(has(&feel_and, "treats a non-boolean operand as null"));
+    assert!(!has(&feel_and, "else branch"));
+    assert!(has(&juel("${s < '\u{e000}'}").unwrap(), "UTF-16"));
+    assert!(!has(&juel("${s < 'abc'}").unwrap(), "UTF-16"));
+    assert!(juel("${empty ''}").unwrap().warnings.is_empty());
+    assert!(juel("${x == null}").unwrap().warnings.is_empty());
+    assert_eq!(
+        codes(&translate("= x = null", SourceLanguage::Feel).unwrap()),
+        vec![M]
+    );
 }
 
 #[test]
@@ -472,6 +544,50 @@ fn same(expected: &V, actual: &Value) -> bool {
 
 type Outcome = Result<V, ()>;
 
+/// Why a JUEL result may legitimately differ from the CEL result. Every
+/// reason names the warning code the translation owes the reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Why {
+    /// Unset context variable, missing key, out-of-range index or null base/key.
+    MissingValue,
+    /// Null operand coerced to false or 0.
+    NullCoercion,
+    /// Operands of different runtime kinds, numeric strings, float modulo.
+    MixedKinds,
+    /// Null or text used as a boolean.
+    BoolCoercion,
+    /// `/` where the operands are not both floats.
+    IntegerDivision,
+    /// `empty` on null or on a number or boolean.
+    EmptyOnScalar,
+    /// Strings whose UTF-16 and code point orders disagree.
+    StringOrder,
+}
+
+impl Why {
+    fn code(self) -> &'static str {
+        match self {
+            Why::MissingValue => M,
+            Why::NullCoercion | Why::MixedKinds | Why::BoolCoercion | Why::StringOrder => C,
+            Why::IntegerDivision => D,
+            Why::EmptyOnScalar => E,
+        }
+    }
+
+    fn message_hint(self) -> &'static str {
+        match self {
+            Why::MissingValue => "evaluation error in CEL",
+            Why::NullCoercion | Why::MixedKinds => "operand types",
+            Why::BoolCoercion => "boolean",
+            Why::IntegerDivision => "floating-point",
+            Why::EmptyOnScalar => "null or unset value as empty",
+            Why::StringOrder => "UTF-16",
+        }
+    }
+}
+
+type Reasons = BTreeSet<Why>;
+
 #[derive(Clone, Copy)]
 enum Num {
     I(i64),
@@ -487,92 +603,123 @@ impl Num {
     }
 }
 
+fn same_kind(a: &V, b: &V) -> bool {
+    std::mem::discriminant(a) == std::mem::discriminant(b)
+}
+
 /// EL 3.0 section 1.8 coercions, restricted to the value kinds the grid uses.
-fn to_bool(v: &V) -> Result<bool, ()> {
+fn to_bool(v: &V, r: &mut Reasons) -> Result<bool, ()> {
     match v {
-        V::Null => Ok(false),
         V::Bool(b) => Ok(*b),
-        V::Str(s) => Ok(s.eq_ignore_ascii_case("true")),
+        V::Null => {
+            r.insert(Why::BoolCoercion);
+            Ok(false)
+        }
+        V::Str(s) => {
+            r.insert(Why::BoolCoercion);
+            Ok(s.eq_ignore_ascii_case("true"))
+        }
         _ => Err(()),
     }
 }
 
-fn to_num(v: &V) -> Result<Num, ()> {
+fn to_num(v: &V, r: &mut Reasons) -> Result<Num, ()> {
     match v {
-        V::Null => Ok(Num::I(0)),
         V::Int(i) => Ok(Num::I(*i)),
         V::Float(f) => Ok(Num::F(*f)),
-        V::Str(s) => s
-            .parse::<i64>()
-            .map(Num::I)
-            .or_else(|_| s.parse::<f64>().map(Num::F))
-            .map_err(|_| ()),
+        V::Null => {
+            r.insert(Why::NullCoercion);
+            Ok(Num::I(0))
+        }
+        V::Str(s) => {
+            r.insert(Why::MixedKinds);
+            if s.is_empty() {
+                return Ok(Num::I(0));
+            }
+            s.parse::<i64>()
+                .map(Num::I)
+                .or_else(|_| s.parse::<f64>().map(Num::F))
+                .map_err(|_| ())
+        }
         _ => Err(()),
     }
 }
 
-fn is_float(v: &V) -> bool {
-    matches!(v, V::Float(_))
-}
-
-fn is_int(v: &V) -> bool {
-    matches!(v, V::Int(_))
-}
-
-fn el_eq(a: &V, b: &V) -> Result<bool, ()> {
+fn el_eq(a: &V, b: &V, r: &mut Reasons) -> Result<bool, ()> {
     if a == b {
         return Ok(true);
     }
-    if *a == V::Null || *b == V::Null {
+    if *a == V::Null || *b == V::Null || same_kind(a, b) {
         return Ok(false);
     }
-    if is_float(a) || is_float(b) {
-        return Ok(to_num(a)?.f() == to_num(b)?.f());
+    r.insert(Why::MixedKinds);
+    let (float, int) = (
+        matches!(a, V::Float(_)) || matches!(b, V::Float(_)),
+        matches!(a, V::Int(_)) || matches!(b, V::Int(_)),
+    );
+    if float {
+        return Ok(to_num(a, r)?.f() == to_num(b, r)?.f());
     }
-    if is_int(a) || is_int(b) {
-        return match (to_num(a)?, to_num(b)?) {
+    if int {
+        return match (to_num(a, r)?, to_num(b, r)?) {
             (Num::I(x), Num::I(y)) => Ok(x == y),
             _ => Err(()),
         };
     }
     if matches!(a, V::Bool(_)) || matches!(b, V::Bool(_)) {
-        return Ok(to_bool(a)? == to_bool(b)?);
+        // The mismatch itself is the reason; the text-to-boolean step is part of it.
+        let mut ignored = Reasons::new();
+        return Ok(to_bool(a, &mut ignored)? == to_bool(b, &mut ignored)?);
     }
-    match (a, b) {
-        (V::Str(x), V::Str(y)) => Ok(x == y),
-        (V::Str(_), _) | (_, V::Str(_)) => Err(()),
-        _ => Ok(a == b),
-    }
+    Err(())
 }
 
-fn el_cmp(a: &V, b: &V) -> Result<Option<std::cmp::Ordering>, ()> {
-    use std::cmp::Ordering;
-    if a == b {
-        return Ok(Some(Ordering::Equal));
+fn el_cmp(a: &V, b: &V, r: &mut Reasons) -> Result<Option<std::cmp::Ordering>, ()> {
+    use std::cmp::Ordering::Equal;
+    if *a == V::Null && *b == V::Null {
+        r.insert(Why::NullCoercion);
+        return Ok(Some(Equal));
     }
     if *a == V::Null || *b == V::Null {
+        r.insert(Why::NullCoercion);
         return Ok(None);
     }
-    if is_float(a) || is_float(b) {
-        return Ok(to_num(a)?.f().partial_cmp(&to_num(b)?.f()));
-    }
-    if is_int(a) || is_int(b) {
-        return match (to_num(a)?, to_num(b)?) {
+    if !same_kind(a, b) {
+        r.insert(Why::MixedKinds);
+        if matches!(a, V::Float(_)) || matches!(b, V::Float(_)) {
+            return Ok(to_num(a, r)?.f().partial_cmp(&to_num(b, r)?.f()));
+        }
+        return match (to_num(a, r)?, to_num(b, r)?) {
             (Num::I(x), Num::I(y)) => Ok(Some(x.cmp(&y))),
             _ => Err(()),
         };
     }
     match (a, b) {
-        (V::Str(x), V::Str(y)) => Ok(Some(x.cmp(y))),
+        (V::Int(x), V::Int(y)) => Ok(Some(x.cmp(y))),
+        (V::Float(x), V::Float(y)) => Ok(x.partial_cmp(y)),
+        (V::Str(x), V::Str(y)) => {
+            let utf16 = x.encode_utf16().cmp(y.encode_utf16());
+            if utf16 != x.cmp(y) {
+                r.insert(Why::StringOrder);
+            }
+            Ok(Some(utf16))
+        }
         _ => Err(()),
     }
 }
 
-fn el_arith(op: &BinOp, a: &V, b: &V) -> Outcome {
-    if *op == BinOp::Div {
-        return Ok(V::Float(to_num(a)?.f() / to_num(b)?.f()));
+fn el_arith(op: &BinOp, a: &V, b: &V, r: &mut Reasons) -> Outcome {
+    if *a == V::Null && *b == V::Null {
+        r.insert(Why::NullCoercion);
+        return Ok(V::Int(0));
     }
-    let (x, y) = (to_num(a)?, to_num(b)?);
+    if *op == BinOp::Div {
+        if !(matches!(a, V::Float(_)) && matches!(b, V::Float(_))) {
+            r.insert(Why::IntegerDivision);
+        }
+        return Ok(V::Float(to_num(a, r)?.f() / to_num(b, r)?.f()));
+    }
+    let (x, y) = (to_num(a, r)?, to_num(b, r)?);
     match (x, y) {
         (Num::I(x), Num::I(y)) => Ok(V::Int(match op {
             BinOp::Add => x.wrapping_add(y),
@@ -581,18 +728,24 @@ fn el_arith(op: &BinOp, a: &V, b: &V) -> Outcome {
             _ if y == 0 => return Err(()),
             _ => x.wrapping_rem(y),
         })),
-        (x, y) => Ok(V::Float(match op {
-            BinOp::Add => x.f() + y.f(),
-            BinOp::Sub => x.f() - y.f(),
-            BinOp::Mul => x.f() * y.f(),
-            _ => x.f() % y.f(),
-        })),
+        (x, y) => {
+            if !(matches!(a, V::Float(_)) && matches!(b, V::Float(_))) || *op == BinOp::Mod {
+                r.insert(Why::MixedKinds);
+            }
+            Ok(V::Float(match op {
+                BinOp::Add => x.f() + y.f(),
+                BinOp::Sub => x.f() - y.f(),
+                BinOp::Mul => x.f() * y.f(),
+                _ => x.f() % y.f(),
+            }))
+        }
     }
 }
 
 /// JUEL model: a missing map key or out-of-range index is null, an unset
-/// `execution` variable is null, an unresolved top-level identifier is an error.
-fn reference(expr: &Expr, vars: &BTreeMap<String, V>) -> Outcome {
+/// `execution` variable is null, an unresolved top-level identifier is an
+/// error. `r` collects the reasons the evaluated path could diverge from CEL.
+fn reference(expr: &Expr, vars: &BTreeMap<String, V>, r: &mut Reasons) -> Outcome {
     Ok(match expr {
         Expr::Int(n) => V::Int(*n),
         Expr::Float(f) => V::Float(*f),
@@ -600,63 +753,115 @@ fn reference(expr: &Expr, vars: &BTreeMap<String, V>) -> Outcome {
         Expr::Bool(b) => V::Bool(*b),
         Expr::Null => V::Null,
         Expr::Var(name) => vars.get(name).cloned().ok_or(())?,
-        Expr::ContextVar(name) => vars.get(name).cloned().unwrap_or(V::Null),
-        Expr::Member(base, name) => match reference(base, vars)? {
-            V::Null => V::Null,
-            V::Map(map) => map.get(name).cloned().unwrap_or(V::Null),
+        Expr::ContextVar(name) => match vars.get(name) {
+            Some(value) => value.clone(),
+            None => {
+                r.insert(Why::MissingValue);
+                V::Null
+            }
+        },
+        Expr::Member(base, name) => match reference(base, vars, r)? {
+            V::Null => {
+                r.insert(Why::MissingValue);
+                V::Null
+            }
+            V::Map(map) => map.get(name).cloned().unwrap_or_else(|| {
+                r.insert(Why::MissingValue);
+                V::Null
+            }),
             _ => return Err(()),
         },
-        Expr::Index(base, key) => match (reference(base, vars)?, reference(key, vars)?) {
-            (V::Null, _) => V::Null,
-            (V::List(items), key) => match to_num(&key)? {
-                Num::I(i) => usize::try_from(i)
-                    .ok()
-                    .and_then(|i| items.get(i).cloned())
-                    .unwrap_or(V::Null),
-                Num::F(_) => return Err(()),
-            },
-            (V::Map(map), V::Str(key)) => map.get(&key).cloned().unwrap_or(V::Null),
-            _ => return Err(()),
-        },
-        Expr::Not(inner) => V::Bool(!to_bool(&reference(inner, vars)?)?),
-        Expr::Neg(inner) => match to_num(&reference(inner, vars)?)? {
+        Expr::Index(base, key) => {
+            let base = reference(base, vars, r)?;
+            let key = reference(key, vars, r)?;
+            match (base, key) {
+                (V::Null, _) | (_, V::Null) => {
+                    r.insert(Why::MissingValue);
+                    V::Null
+                }
+                (V::List(items), key) => {
+                    if !matches!(key, V::Int(_)) {
+                        r.insert(Why::MixedKinds);
+                    }
+                    let index = match to_num(&key, r)? {
+                        Num::I(i) => i,
+                        Num::F(f) => f.trunc() as i64,
+                    };
+                    match usize::try_from(index)
+                        .ok()
+                        .and_then(|i| items.get(i).cloned())
+                    {
+                        Some(item) => item,
+                        None => {
+                            r.insert(Why::MissingValue);
+                            V::Null
+                        }
+                    }
+                }
+                (V::Map(map), V::Str(key)) => map.get(&key).cloned().unwrap_or_else(|| {
+                    r.insert(Why::MissingValue);
+                    V::Null
+                }),
+                _ => return Err(()),
+            }
+        }
+        Expr::Not(inner) => V::Bool(!to_bool(&reference(inner, vars, r)?, r)?),
+        Expr::Neg(inner) => match to_num(&reference(inner, vars, r)?, r)? {
             Num::I(i) => V::Int(i.wrapping_neg()),
             Num::F(f) => V::Float(-f),
         },
-        Expr::Empty(inner) => V::Bool(match reference(inner, vars)? {
-            V::Null => true,
+        Expr::Empty(inner) => V::Bool(match reference(inner, vars, r)? {
             V::Str(s) => s.is_empty(),
             V::List(l) => l.is_empty(),
             V::Map(m) => m.is_empty(),
-            _ => false,
+            V::Null => {
+                r.insert(Why::EmptyOnScalar);
+                true
+            }
+            _ => {
+                r.insert(Why::EmptyOnScalar);
+                false
+            }
         }),
         Expr::Ternary(c, t, e) => {
-            if to_bool(&reference(c, vars)?)? {
-                reference(t, vars)?
+            let condition = reference(c, vars, r)?;
+            if to_bool(&condition, r)? {
+                reference(t, vars, r)?
             } else {
-                reference(e, vars)?
+                reference(e, vars, r)?
             }
         }
-        Expr::Binary(BinOp::And, l, r) => {
-            V::Bool(to_bool(&reference(l, vars)?)? && to_bool(&reference(r, vars)?)?)
+        Expr::Binary(BinOp::And, l, rhs) => {
+            let left = reference(l, vars, r)?;
+            if !to_bool(&left, r)? {
+                V::Bool(false)
+            } else {
+                let right = reference(rhs, vars, r)?;
+                V::Bool(to_bool(&right, r)?)
+            }
         }
-        Expr::Binary(BinOp::Or, l, r) => {
-            V::Bool(to_bool(&reference(l, vars)?)? || to_bool(&reference(r, vars)?)?)
+        Expr::Binary(BinOp::Or, l, rhs) => {
+            let left = reference(l, vars, r)?;
+            if to_bool(&left, r)? {
+                V::Bool(true)
+            } else {
+                let right = reference(rhs, vars, r)?;
+                V::Bool(to_bool(&right, r)?)
+            }
         }
-        Expr::Binary(op, l, r) => {
-            let (a, b) = (reference(l, vars)?, reference(r, vars)?);
+        Expr::Binary(op, l, rhs) => {
+            let (a, b) = (reference(l, vars, r)?, reference(rhs, vars, r)?);
+            let ordering = |wanted: fn(std::cmp::Ordering) -> bool, r: &mut Reasons| {
+                Ok::<_, ()>(V::Bool(el_cmp(&a, &b, r)?.is_some_and(wanted)))
+            };
             match op {
-                BinOp::Eq => V::Bool(el_eq(&a, &b)?),
-                BinOp::Ne => V::Bool(!el_eq(&a, &b)?),
-                BinOp::Lt => V::Bool(el_cmp(&a, &b)? == Some(std::cmp::Ordering::Less)),
-                BinOp::Gt => V::Bool(el_cmp(&a, &b)? == Some(std::cmp::Ordering::Greater)),
-                BinOp::Le => {
-                    V::Bool(matches!(el_cmp(&a, &b)?, Some(o) if o != std::cmp::Ordering::Greater))
-                }
-                BinOp::Ge => {
-                    V::Bool(matches!(el_cmp(&a, &b)?, Some(o) if o != std::cmp::Ordering::Less))
-                }
-                _ => el_arith(op, &a, &b)?,
+                BinOp::Eq => V::Bool(el_eq(&a, &b, r)?),
+                BinOp::Ne => V::Bool(!el_eq(&a, &b, r)?),
+                BinOp::Lt => ordering(|o| o.is_lt(), r)?,
+                BinOp::Gt => ordering(|o| o.is_gt(), r)?,
+                BinOp::Le => ordering(|o| o.is_le(), r)?,
+                BinOp::Ge => ordering(|o| o.is_ge(), r)?,
+                _ => el_arith(op, &a, &b, r)?,
             }
         }
         Expr::Range { .. } | Expr::InList(..) => return Err(()),
@@ -693,6 +898,7 @@ fn grid() -> Vec<BTreeMap<String, V>> {
                                 ("l".to_owned(), V::List(list)),
                                 ("m".to_owned(), V::Map(map)),
                                 ("z".to_owned(), V::Null),
+                                ("w".to_owned(), V::Str("😀".to_owned())),
                             ]));
                         }
                     }
@@ -723,7 +929,7 @@ fn evaluate_cel(cel: &str, vars: &BTreeMap<String, V>) -> Result<Value, String> 
 
 /// Sources span the coercion-free subset and every known JUEL/CEL divergence
 /// (null, absent variable, missing key, floats, numeric strings, booleans as
-/// text); `u` is never bound, `z` is bound to null.
+/// text, UTF-16 ordering); `u` is never bound, `z` is bound to null.
 const PROPERTY_SOURCES: &[&str] = &[
     "${a == b}",
     "${a != b}",
@@ -776,6 +982,9 @@ const PROPERTY_SOURCES: &[&str] = &[
     "${s != null && p}",
     "${p || l[5] == 1}",
     "${!p && l[5] == 1}",
+    "${a + b + a - b - a}",
+    "${p || q || p && q}",
+    "${a * b * a % 5 % 3}",
     // null, unset and missing values
     "${z}",
     "${u}",
@@ -811,6 +1020,13 @@ const PROPERTY_SOURCES: &[&str] = &[
     "${z < a}",
     "${z <= z}",
     "${z >= null}",
+    "${null / null}",
+    "${z / z}",
+    "${l[null]}",
+    "${m[null]}",
+    "${l[z]}",
+    "${empty a}",
+    "${empty p}",
     // numeric strings, floats, int/float mixes
     "${a == n}",
     "${n == 7}",
@@ -833,14 +1049,23 @@ const PROPERTY_SOURCES: &[&str] = &[
     "${a / 2}",
     "${a div 2}",
     "${f / 2.0}",
+    "${f / f}",
     "${7 / 2}",
     "${7.0 / 2.0}",
     "${a / 2.0}",
+    "${l[f - 1.5]}",
+    "${a + ''}",
+    "${'' + ''}",
     // booleans as text
     "${p == 'true'}",
     "${p == n}",
     "${p && n}",
     "${n || p}",
+    // UTF-16 against code point ordering (one side is always a literal)
+    "${w < '\u{e000}'}",
+    "${'\u{e000}' >= w}",
+    "${w < 'a'}",
+    "${w > 'a'}",
     // literal-only and bare-variable forms stay silent
     "${a}",
     "${f}",
@@ -855,8 +1080,10 @@ const PROPERTY_SOURCES: &[&str] = &[
 #[test]
 fn juel_and_cel_never_diverge_silently() {
     let grid = grid();
-    let mut agreed = 0usize;
+    let mut agreed_clean = 0usize;
+    let mut clean_with_warnings = 0usize;
     let mut diverged = 0usize;
+    let mut per_reason: BTreeMap<Why, usize> = BTreeMap::new();
     let mut silent_sources = 0usize;
     for source in PROPERTY_SOURCES {
         let translation = juel(source).unwrap_or_else(|r| panic!("`{source}` refused: {r}"));
@@ -865,34 +1092,162 @@ fn juel_and_cel_never_diverge_silently() {
             silent_sources += 1;
         }
         for vars in &grid {
-            let expected = reference(&parsed.expr, vars);
+            let mut reasons = Reasons::new();
+            let expected = reference(&parsed.expr, vars, &mut reasons);
             let actual = evaluate_cel(&translation.cel, vars);
             let agree = match (&expected, &actual) {
                 (Ok(e), Ok(a)) => same(e, a),
                 (Err(()), Err(_)) => true,
                 _ => false,
             };
-            if agree {
-                agreed += 1;
-            } else {
-                diverged += 1;
+            if reasons.is_empty() {
                 assert!(
-                    !translation.warnings.is_empty(),
-                    "silent divergence for `{source}` -> `{}` with {vars:?}: JUEL {expected:?}, CEL {actual:?}",
+                    agree,
+                    "unexplained divergence for `{source}` -> `{}` with {vars:?}: JUEL {expected:?}, CEL {actual:?}",
                     translation.cel
+                );
+                agreed_clean += 1;
+                clean_with_warnings += usize::from(!translation.warnings.is_empty());
+                continue;
+            }
+            if !agree {
+                diverged += 1;
+            }
+            for why in &reasons {
+                *per_reason.entry(*why).or_default() += 1;
+                assert!(
+                    translation
+                        .warnings
+                        .iter()
+                        .any(|w| w.code == why.code() && w.message.contains(why.message_hint())),
+                    "`{source}` -> `{}` owes {why:?} ({}) with {vars:?}: {:?}",
+                    translation.cel,
+                    why.code(),
+                    translation.warnings
                 );
             }
         }
     }
-    assert!(agreed > 5000, "only {agreed} agreeing evaluations");
+    assert!(agreed_clean > 3000, "only {agreed_clean} reason-free rows");
     assert!(
-        diverged > 1000,
-        "only {diverged} diverging evaluations: the property would be vacuous"
+        clean_with_warnings > 1000,
+        "only {clean_with_warnings} reason-free rows that carry warnings"
     );
+    assert!(diverged > 800, "only {diverged} diverging rows");
+    for why in [
+        Why::MissingValue,
+        Why::NullCoercion,
+        Why::MixedKinds,
+        Why::BoolCoercion,
+        Why::IntegerDivision,
+        Why::EmptyOnScalar,
+        Why::StringOrder,
+    ] {
+        assert!(
+            per_reason.get(&why).copied().unwrap_or(0) > 0,
+            "{why:?} was never exercised: {per_reason:?}"
+        );
+    }
     assert!(
         silent_sources >= 8,
         "only {silent_sources} warning-free sources"
     );
+}
+
+/// Every variable holds the kind the expression needs: JUEL and CEL must agree
+/// exactly no matter how many warnings the translation carries.
+#[test]
+fn well_typed_expressions_agree_regardless_of_warnings() {
+    let sources = [
+        "${a + b}",
+        "${a - b - 1}",
+        "${a * b + 2}",
+        "${(a + b) * 2}",
+        "${-a}",
+        "${a % b}",
+        "${a < b}",
+        "${a >= b}",
+        "${a == b}",
+        "${a != 2}",
+        "${p && q}",
+        "${p || q && !p}",
+        "${!p}",
+        "${p ? a : b}",
+        "${a > b ? s : t}",
+        "${s == t}",
+        "${s < t}",
+        "${s != 'x'}",
+        "${empty s}",
+        "${empty l}",
+        "${empty m}",
+        "${l[0] + l[1]}",
+        "${l[1] == 2}",
+        "${m.w + m.k}",
+        "${m['w'] > 1}",
+        "${f + f}",
+        "${f * 2.0}",
+        "${f < 2.0}",
+        "${f == f}",
+        "${f / f}",
+        "${p == q}",
+        "${execution.getVariable('a') + b}",
+        "${a + b + a - b - a}",
+        "${p || q || p && q}",
+        "${a * b * a % 5 % 3}",
+        "${w < 'a'}",
+        "${s != null}",
+        "${!(a < b) || p}",
+    ];
+    let mut rows = 0usize;
+    for source in sources {
+        let translation = juel(source).unwrap();
+        let parsed = parse(source, SourceLanguage::Juel).unwrap();
+        for a in [-3, 0, 2, 7] {
+            for b in [2, 3] {
+                for p in [false, true] {
+                    for (s, t) in [("x", "abc"), ("abc", "abc")] {
+                        for f in [1.5, 2.0] {
+                            let vars = BTreeMap::from([
+                                ("a".to_owned(), V::Int(a)),
+                                ("b".to_owned(), V::Int(b)),
+                                ("p".to_owned(), V::Bool(p)),
+                                ("q".to_owned(), V::Bool(!p || a > 0)),
+                                ("s".to_owned(), V::Str(s.to_owned())),
+                                ("t".to_owned(), V::Str(t.to_owned())),
+                                ("f".to_owned(), V::Float(f)),
+                                ("w".to_owned(), V::Str("😀".to_owned())),
+                                ("l".to_owned(), V::List(vec![V::Int(1), V::Int(2)])),
+                                (
+                                    "m".to_owned(),
+                                    V::Map(BTreeMap::from([
+                                        ("w".to_owned(), V::Int(5)),
+                                        ("k".to_owned(), V::Int(1)),
+                                    ])),
+                                ),
+                            ]);
+                            let mut reasons = Reasons::new();
+                            let expected = reference(&parsed.expr, &vars, &mut reasons).unwrap();
+                            let actual =
+                                evaluate_cel(&translation.cel, &vars).unwrap_or_else(|e| {
+                                    panic!("`{source}` -> `{}` with {vars:?}: {e}", translation.cel)
+                                });
+                            assert!(
+                                reasons.is_empty(),
+                                "`{source}` is not well typed here: {reasons:?}"
+                            );
+                            assert!(
+                                same(&expected, &actual),
+                                "`{source}` -> `{}` with {vars:?}: {expected:?} vs {actual}",
+                                translation.cel
+                            );
+                            rows += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(rows > 2000);
 }
 
 #[test]
@@ -902,6 +1257,7 @@ fn known_divergences_carry_their_specific_warning() {
             ("a".to_owned(), V::Int(7)),
             ("n".to_owned(), V::Str("7".to_owned())),
             ("z".to_owned(), V::Null),
+            ("w".to_owned(), V::Str("😀".to_owned())),
             (
                 "m".to_owned(),
                 V::Map(BTreeMap::from([("w".to_owned(), V::Int(5))])),
@@ -921,15 +1277,25 @@ fn known_divergences_carry_their_specific_warning() {
         ("${!z}", V::Bool(true), C),
         ("${z ? 1 : 2}", V::Int(2), C),
         ("${p == 'false'}", V::Bool(true), C),
+        ("${w < '\u{e000}'}", V::Bool(true), C),
+        ("${empty z}", V::Bool(true), E),
+        ("${a / 2}", V::Float(3.5), D),
+        ("${a + ''}", V::Int(7), C),
+        ("${null / null}", V::Int(0), C),
     ];
     for (source, juel_result, code) in cases {
         let vars = base();
         let translation = juel(source).unwrap();
         let parsed = parse(source, SourceLanguage::Juel).unwrap();
+        let mut reasons = Reasons::new();
         assert_eq!(
-            reference(&parsed.expr, &vars),
+            reference(&parsed.expr, &vars, &mut reasons),
             Ok(juel_result.clone()),
             "JUEL model for `{source}`"
+        );
+        assert!(
+            !reasons.is_empty(),
+            "`{source}` should be explained by a reason"
         );
         let cel = evaluate_cel(&translation.cel, &vars);
         assert!(
@@ -943,12 +1309,16 @@ fn known_divergences_carry_their_specific_warning() {
         );
     }
     let vars = base();
-    let guard = juel("${z == null}").unwrap();
-    assert_eq!(evaluate_cel(&guard.cel, &vars).unwrap(), json!(true));
+    for source in ["${z == null}", "${u == null}"] {
+        let guard = juel(source).unwrap();
+        assert!(
+            guard.warnings.is_empty(),
+            "a bare-identifier null guard errors in both languages: {source}"
+        );
+    }
     assert_eq!(
-        codes(&guard),
-        vec![M],
-        "a null guard is reported even when it happens to work"
+        evaluate_cel(&juel("${z == null}").unwrap().cel, &vars).unwrap(),
+        json!(true)
     );
 }
 
@@ -1230,6 +1600,20 @@ fn constant_expressions_match_hand_worked_el_results() {
         ("${2 + 3 * 4 - 5}", json!(9), false),
         ("${(2 + 3) * (4 - 5)}", json!(-5), false),
         ("${1 - (2 - 3)}", json!(2), false),
+        ("${100 - 30 - 20 - 5}", json!(45), false),
+        ("${2 * 3 * 4 * 5}", json!(120), false),
+        ("${100 % 7 % 4}", json!(2), false),
+        ("${true && false && true || true}", json!(true), false),
+        (
+            "${false || false || true && true && false}",
+            json!(false),
+            false,
+        ),
+        ("${1 + 2 + 3 * 4 * 5 - 6 - 7}", json!(50), false),
+        ("${10 - 2 - (3 - 1)}", json!(6), false),
+        ("${2 * (3 * 4) * 5}", json!(120), false),
+        ("${100 - (30 - 20) - 5}", json!(85), false),
+        ("${true && (false || true) && true}", json!(true), false),
         ("${7.0 / 2.0}", json!(3.5), false),
         ("${7 / 2}", json!(3.5), true),
         ("${7 div 2}", json!(3.5), true),
@@ -1417,6 +1801,15 @@ fn unsupported_constructs_are_refused_with_name_and_position() {
         ("${5.x}", "literal", 4),
         ("${a.and}", "reserved word", 4),
         ("${x.y(1)}", "x.y", 4),
+        ("${task}", "resolver", 2),
+        ("${externalTask.x}", "resolver", 2),
+        ("${caseExecution}", "resolver", 2),
+        ("${authenticatedUserId == 'x'}", "resolver", 2),
+        ("${a.class}", "introspection", 4),
+        ("${a['class']}", "introspection", 3),
+        ("${(-5).x}", "literal", 7),
+        ("${(-1.5)[0]}", "literal", 8),
+        ("${'\u{1f600}' < '\u{e000}'}", "UTF-16", 6),
     ];
     for (source, needle, position) in cases {
         let r = refusal(source, SourceLanguage::Juel);
@@ -1576,7 +1969,7 @@ fn hostile_inputs_are_refused_without_panicking() {
         refusal(&ternaries, SourceLanguage::Juel).code,
         EXPR_INVALID_RESULT
     );
-    let chain = format!("${{{}1}}", "1+".repeat(40));
+    let chain = format!("${{{}1{}}}", "1-(".repeat(40), ")".repeat(40));
     assert_eq!(
         refusal(&chain, SourceLanguage::Juel).code,
         EXPR_INVALID_RESULT

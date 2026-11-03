@@ -703,6 +703,7 @@ impl Parser {
                 self.juel_level(level + 1)?
             };
             reject_constant_overflow(op, &left, &right, op_pos)?;
+            reject_ambiguous_string_order(op, &left, &right, op_pos)?;
             left = Expr::Binary(op, Box::new(left), Box::new(right));
         }
         Ok(left)
@@ -718,8 +719,19 @@ impl Parser {
         };
         match wrap {
             Some(wrap) => {
+                let op_pos = self.pos();
+                let is_negation = self.is_sym("-");
                 self.at += 1;
                 let operand = self.nested(Self::juel_unary)?;
+                if is_negation && constant_int(&operand) == Some(i64::MIN) {
+                    // cel 0.13 negates unchecked (panics in debug, wraps in release) and
+                    // Java wraps as well, so the constant has no faithful translation.
+                    return refuse(
+                        EXPR_INTEGER_OVERFLOW,
+                        "negating the smallest 64-bit integer overflows",
+                        op_pos,
+                    );
+                }
                 Ok(wrap(Box::new(operand)))
             }
             None => self.juel_postfix(),
@@ -738,6 +750,13 @@ impl Parser {
                         return refuse(
                             EXPR_UNSUPPORTED_CONSTRUCT,
                             format!("reserved word `{w}` used as a property name"),
+                            name_pos,
+                        );
+                    }
+                    Some(Tok::Word(w)) if w == "class" => {
+                        return refuse(
+                            EXPR_UNSUPPORTED_CONSTRUCT,
+                            "bean introspection through `.class`",
                             name_pos,
                         );
                     }
@@ -772,6 +791,13 @@ impl Parser {
                     },
                     Chain::Value(base) => {
                         reject_literal_base(&base, open)?;
+                        if index == Expr::Str("class".to_owned()) {
+                            return refuse(
+                                EXPR_UNSUPPORTED_CONSTRUCT,
+                                "bean introspection through ['class']",
+                                open,
+                            );
+                        }
                         Chain::Value(Expr::Index(Box::new(base), Box::new(index)))
                     }
                 };
@@ -899,6 +925,18 @@ impl Parser {
                     return refuse(
                         EXPR_UNSUPPORTED_CONSTRUCT,
                         format!("namespaced function `{word}:{function}(...)`"),
+                        token.pos,
+                    );
+                }
+                if matches!(
+                    word.as_str(),
+                    "task" | "externalTask" | "caseExecution" | "authenticatedUserId"
+                ) {
+                    return refuse(
+                        EXPR_UNSUPPORTED_CONSTRUCT,
+                        format!(
+                            "`{word}` is a Camunda built-in resolver name, not a process variable"
+                        ),
                         token.pos,
                     );
                 }
@@ -1207,9 +1245,38 @@ fn reject_constant_overflow(
     Ok(())
 }
 
+/// JUEL compares strings by UTF-16 code units, CEL by code points; the two
+/// orders differ for characters at or above U+E000, so a constant comparison
+/// where they disagree has no faithful translation.
+fn reject_ambiguous_string_order(
+    op: BinOp,
+    left: &Expr,
+    right: &Expr,
+    pos: usize,
+) -> Result<(), TranslationRefusal> {
+    let (BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge, Expr::Str(a), Expr::Str(b)) =
+        (op, left, right)
+    else {
+        return Ok(());
+    };
+    if a.encode_utf16().cmp(b.encode_utf16()) != a.cmp(b) {
+        return refuse(
+            EXPR_UNSUPPORTED_CONSTRUCT,
+            "string ordering differs between UTF-16 code units (JUEL) and code points (CEL) for these literals",
+            pos,
+        );
+    }
+    Ok(())
+}
+
 fn reject_literal_base(base: &Expr, pos: usize) -> Result<(), TranslationRefusal> {
     match base {
         Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => refuse(
+            EXPR_UNSUPPORTED_CONSTRUCT,
+            "member or index access on a literal",
+            pos,
+        ),
+        Expr::Neg(inner) if matches!(**inner, Expr::Int(_) | Expr::Float(_)) => refuse(
             EXPR_UNSUPPORTED_CONSTRUCT,
             "member or index access on a literal",
             pos,
@@ -1385,11 +1452,25 @@ impl Generator {
                 return;
             }
             if is_path(other.expr) {
-                self.missing(other.text);
+                // An unset bare identifier is an error in JUEL as well as in CEL.
+                if !(matches!(other.expr, Expr::Var(_)) && self.language == Lang::Juel) {
+                    self.missing(other.text);
+                }
             } else {
                 self.coercion(&format!("comparison `{op}`"), at);
             }
             return;
+        }
+        if ordering {
+            let beyond_bmp = |operand: &Operand| matches!(operand.expr, Expr::Str(text) if text.chars().any(|c| c >= '\u{e000}'));
+            if (beyond_bmp(left) && !is_literal(right.expr))
+                || (beyond_bmp(right) && !is_literal(left.expr))
+            {
+                self.coercion(
+                    "string ordering (JUEL compares UTF-16 code units, CEL code points, which differ above U+E000)",
+                    at,
+                );
+            }
         }
         let same_known = left.ty == right.ty && left.ty != Ty::Unknown && left.ty != Ty::Null;
         let orderable = !ordering || matches!(left.ty, Ty::Int | Ty::Float | Ty::Str);
@@ -1402,9 +1483,10 @@ impl Generator {
         if ty == Ty::Bool {
             return;
         }
-        let reason = match self.language {
-            Lang::Juel => "JUEL coerces null and the texts \"true\" and \"false\" to boolean while CEL is strict and fails on a non-boolean",
-            Lang::Feel => "FEEL treats a non-boolean condition as null while CEL fails on it",
+        let reason = match (self.language, op) {
+            (Lang::Juel, _) => "JUEL coerces null and the texts \"true\" and \"false\" to boolean while CEL is strict and fails on a non-boolean",
+            (Lang::Feel, "?:") => "in FEEL a condition that is not true (including null or a non-boolean) takes the else branch while CEL fails on a non-boolean",
+            (Lang::Feel, _) => "FEEL treats a non-boolean operand as null while CEL fails on it",
         };
         self.warn(
             EXPR_TYPE_COERCION,
@@ -1503,13 +1585,15 @@ impl Generator {
             Expr::Empty(operand) => {
                 let (text, _) = self.generate(operand, false);
                 let language = self.language_name();
-                self.warn(
+                if !matches!(**operand, Expr::Str(_)) {
+                    self.warn(
                     EXPR_EMPTY_SEMANTICS,
                     format!(
                         "`empty {}` is translated to size(...) == 0: {language} also treats a null or unset value as empty, while size(null) and a missing key are errors in CEL",
                         clip(&text)
                     ),
                 );
+                }
                 (format!("(size({text}) == 0)"), Ty::Bool)
             }
             Expr::Binary(op, left, right) => self.binary(*op, left, right, top),
@@ -1610,7 +1694,17 @@ impl Generator {
     }
 
     fn binary(&mut self, op: BinOp, left: &Expr, right: &Expr, top: bool) -> (String, Ty) {
-        let (left_text, left_ty) = self.generate(left, false);
+        // A left operand with the same left-associative operator parses identically
+        // without parentheses, which keeps long chains inside the CEL nesting cap.
+        let chained = matches!(
+            left,
+            Expr::Binary(inner, ..) if *inner == op
+                && matches!(
+                    op,
+                    BinOp::Or | BinOp::And | BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                )
+        );
+        let (left_text, left_ty) = self.generate(left, chained);
         let (right_text, right_ty) = self.generate(right, false);
         let symbol = op.cel();
         let at = format!("{left_text} {symbol} {right_text}");
