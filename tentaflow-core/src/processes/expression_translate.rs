@@ -34,6 +34,8 @@ pub const EXPR_INVALID_RESULT: &str = "EXPR_INVALID_RESULT";
 pub const EXPR_TYPE_COERCION: &str = "EXPR_TYPE_COERCION";
 pub const EXPR_DIVISION_SEMANTICS: &str = "EXPR_DIVISION_SEMANTICS";
 pub const EXPR_EMPTY_SEMANTICS: &str = "EXPR_EMPTY_SEMANTICS";
+pub const EXPR_MISSING_VALUE: &str = "EXPR_MISSING_VALUE";
+pub const EXPR_INTEGER_OVERFLOW: &str = "EXPR_INTEGER_OVERFLOW";
 
 /// Bounds parser recursion independently of the 512-character cap, which still
 /// admits a few hundred nested brackets or prefix operators.
@@ -177,8 +179,10 @@ pub(crate) enum Expr {
     Str(String),
     Bool(bool),
     Null,
-    /// A process variable, whether named directly or through the execution API.
+    /// A process variable named directly; an unresolved name is an error in JUEL.
     Var(String),
+    /// A variable read through the execution API, which yields null when unset.
+    ContextVar(String),
     Member(Box<Expr>, String),
     Index(Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
@@ -244,13 +248,14 @@ pub(crate) fn parse(source: &str, language: SourceLanguage) -> Result<Parsed, Tr
         );
     }
     let chars: Vec<char> = source.chars().collect();
-    let start = chars.iter().position(|c| !c.is_whitespace());
+    // Java String.trim: every character up to and including U+0020, and nothing else.
+    let start = chars.iter().position(|c| *c > ' ');
     let Some(start) = start else {
         return refuse(EXPR_EMPTY, "the expression is empty", 0);
     };
     let end = chars
         .iter()
-        .rposition(|c| !c.is_whitespace())
+        .rposition(|c| *c > ' ')
         .map_or(start, |i| i + 1);
     let juel_wrapper = chars[start..end].len() >= 2
         && matches!(chars[start], '$' | '#')
@@ -334,6 +339,12 @@ const ONE_CHAR_SYMBOLS: &[&str] = &[
     "=",
 ];
 
+/// Java `Character.isWhitespace`: the no-break spaces are deliberately not whitespace.
+fn java_whitespace(c: char) -> bool {
+    matches!(c, '\t'..='\r' | '\u{1c}'..='\u{1f}')
+        || (c.is_whitespace() && !matches!(c, '\u{85}' | '\u{a0}' | '\u{2007}' | '\u{202f}'))
+}
+
 fn is_word_start(c: char) -> bool {
     c.is_alphabetic() || c == '_' || c == '$'
 }
@@ -352,10 +363,10 @@ fn lex(
     let mut i = start;
     while i < end {
         let c = chars[i];
-        if c.is_whitespace() {
+        if java_whitespace(c) {
             i += 1;
         } else if c.is_ascii_digit() {
-            let (tok, next) = lex_number(chars, i, end)?;
+            let (tok, next) = lex_number(chars, i, end, lang == Lang::Juel)?;
             tokens.push(Token { tok, pos: i });
             i = next;
         } else if c == '"' || (c == '\'' && lang == Lang::Juel) {
@@ -403,6 +414,7 @@ fn lex_number(
     chars: &[char],
     start: usize,
     end: usize,
+    allow_exponent: bool,
 ) -> Result<(Tok, usize), TranslationRefusal> {
     let digits_from = |mut i: usize| {
         while i < end && chars[i].is_ascii_digit() {
@@ -416,7 +428,7 @@ fn lex_number(
         is_float = true;
         i = digits_from(i + 1);
     }
-    if i < end && matches!(chars[i], 'e' | 'E') {
+    if allow_exponent && i < end && matches!(chars[i], 'e' | 'E') {
         let sign = usize::from(i + 1 < end && matches!(chars[i + 1], '+' | '-'));
         if i + 1 + sign < end && chars[i + 1 + sign].is_ascii_digit() {
             is_float = true;
@@ -489,8 +501,8 @@ fn lex_string(
     refuse(EXPR_SYNTAX, "unterminated string literal", start)
 }
 
-/// Which part of the `execution` / `variables` context API a postfix chain is
-/// still standing on; only a resolved value can leave the chain.
+/// Which part of the `execution` context API a postfix chain is still
+/// standing on (`variables` is only a member of `execution`); only a resolved value can leave the chain.
 enum Chain {
     Execution,
     Variables,
@@ -683,12 +695,14 @@ impl Parser {
             self.juel_level(level + 1)?
         };
         while let Some(op) = self.juel_op(level) {
+            let op_pos = self.pos();
             self.at += 1;
             let right = if level == 5 {
                 self.juel_unary()?
             } else {
                 self.juel_level(level + 1)?
             };
+            reject_constant_overflow(op, &left, &right, op_pos)?;
             left = Expr::Binary(op, Box::new(left), Box::new(right));
         }
         Ok(left)
@@ -747,7 +761,7 @@ impl Parser {
                         )
                     }
                     Chain::Variables => match index {
-                        Expr::Str(name) => Chain::Value(Expr::Var(name)),
+                        Expr::Str(name) => Chain::Value(Expr::ContextVar(name)),
                         _ => {
                             return refuse(
                                 EXPR_UNSUPPORTED_CONSTRUCT,
@@ -775,7 +789,7 @@ impl Parser {
             Chain::Value(expr) => Ok(expr),
             Chain::Execution | Chain::Variables => refuse(
                 EXPR_UNSUPPORTED_CONSTRUCT,
-                "the `execution` / `variables` context used as a value",
+                "the `execution` context used as a value",
                 start,
             ),
         }
@@ -795,7 +809,7 @@ impl Parser {
                 let argument = self.expr()?;
                 self.expect_sym(")")?;
                 match argument {
-                    Expr::Str(variable) => Ok(Chain::Value(Expr::Var(variable))),
+                    Expr::Str(variable) => Ok(Chain::Value(Expr::ContextVar(variable))),
                     _ => refuse(
                         EXPR_UNSUPPORTED_CONSTRUCT,
                         "execution.getVariable with a name that is not a string literal",
@@ -816,10 +830,10 @@ impl Parser {
             ),
             Chain::Variables if is_call => refuse(
                 EXPR_UNSUPPORTED_CONSTRUCT,
-                format!("method call `variables.{name}(...)`"),
+                format!("method call `execution.variables.{name}(...)`"),
                 name_pos,
             ),
-            Chain::Variables => Ok(Chain::Value(Expr::Var(name))),
+            Chain::Variables => Ok(Chain::Value(Expr::ContextVar(name))),
             Chain::Value(base) if is_call => refuse(
                 EXPR_UNSUPPORTED_CONSTRUCT,
                 format!("bean method call `{}.{name}(...)`", path_text(&base)),
@@ -891,7 +905,6 @@ impl Parser {
                 self.at += 1;
                 Ok(match word.as_str() {
                     "execution" => Chain::Execution,
-                    "variables" => Chain::Variables,
                     _ => Chain::Value(Expr::Var(word)),
                 })
             }
@@ -1147,6 +1160,53 @@ impl Parser {
     }
 }
 
+fn constant_int(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Int(n) => Some(*n),
+        Expr::Neg(inner) => constant_int(inner)?.checked_neg(),
+        Expr::Binary(op, left, right) => {
+            checked_int_op(*op, constant_int(left)?, constant_int(right)?)
+        }
+        _ => None,
+    }
+}
+
+fn checked_int_op(op: BinOp, left: i64, right: i64) -> Option<i64> {
+    match op {
+        BinOp::Add => left.checked_add(right),
+        BinOp::Sub => left.checked_sub(right),
+        BinOp::Mul => left.checked_mul(right),
+        BinOp::Mod => left.checked_rem(right),
+        _ => None,
+    }
+}
+
+/// Java `long` arithmetic wraps while CEL fails on overflow, so a constant
+/// operation that overflows has no faithful translation.
+fn reject_constant_overflow(
+    op: BinOp,
+    left: &Expr,
+    right: &Expr,
+    pos: usize,
+) -> Result<(), TranslationRefusal> {
+    let (Some(a), Some(b)) = (constant_int(left), constant_int(right)) else {
+        return Ok(());
+    };
+    let overflows = match op {
+        BinOp::Add | BinOp::Sub | BinOp::Mul => checked_int_op(op, a, b).is_none(),
+        BinOp::Mod => b != 0 && a.checked_rem(b).is_none(),
+        _ => false,
+    };
+    if overflows {
+        return refuse(
+            EXPR_INTEGER_OVERFLOW,
+            format!("the constant integer operation `{a} {} {b}` overflows 64 bits: Java wraps around, CEL fails", op.cel()),
+            pos,
+        );
+    }
+    Ok(())
+}
+
 fn reject_literal_base(base: &Expr, pos: usize) -> Result<(), TranslationRefusal> {
     match base {
         Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => refuse(
@@ -1170,7 +1230,7 @@ fn describe(tok: &Tok) -> String {
 
 fn path_text(expr: &Expr) -> String {
     match expr {
-        Expr::Var(name) => name.clone(),
+        Expr::Var(name) | Expr::ContextVar(name) => name.clone(),
         Expr::Member(base, name) => format!("{}.{name}", path_text(base)),
         _ => "…".to_owned(),
     }
@@ -1190,6 +1250,12 @@ impl Ty {
     fn is_numeric(self) -> bool {
         matches!(self, Ty::Int | Ty::Float)
     }
+}
+
+struct Operand<'a> {
+    expr: &'a Expr,
+    text: &'a str,
+    ty: Ty,
 }
 
 struct Generator {
@@ -1238,7 +1304,34 @@ fn group(text: String, top: bool) -> String {
     }
 }
 
+fn is_path(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Var(_) | Expr::ContextVar(_) | Expr::Member(..) | Expr::Index(..)
+    )
+}
+
+fn is_literal(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null
+    )
+}
+
+/// Keeps warning messages readable; the dedup key is the clipped text, which
+/// is still unique for any realistic gateway condition.
+fn clip(text: &str) -> String {
+    if text.chars().count() <= 80 {
+        text.to_owned()
+    } else {
+        format!("{}...", text.chars().take(77).collect::<String>())
+    }
+}
+
 impl Generator {
+    /// Warnings are keyed by (code, message) and every message names its
+    /// operand or fragment, so two comparisons are reported separately while
+    /// the same fragment is reported once.
     fn warn(&mut self, code: &'static str, message: String) {
         let warning = TranslationWarning { code, message };
         if !self.warnings.contains(&warning) {
@@ -1246,29 +1339,115 @@ impl Generator {
         }
     }
 
-    fn coercion(&mut self, what: &str) {
+    fn language_name(&self) -> &'static str {
+        match self.language {
+            Lang::Juel => "JUEL",
+            Lang::Feel => "FEEL",
+        }
+    }
+
+    fn coercion(&mut self, what: &str, at: &str) {
         let reason = match self.language {
             Lang::Juel => "JUEL coerces operand types (for example the text \"7\" to the number 7) while CEL is strict and fails on a mismatch",
             Lang::Feel => "FEEL yields null on a type mismatch while CEL fails on it",
         };
         self.warn(
             EXPR_TYPE_COERCION,
-            format!("{what}: operand types are not both known to match; {reason}"),
+            format!(
+                "{what} in `{}`: operand types are not both known to match; {reason}",
+                clip(at)
+            ),
         );
     }
 
-    fn check_comparison(&mut self, op: &str, left: Ty, right: Ty, ordering: bool) {
-        let null_equality = !ordering && (left == Ty::Null || right == Ty::Null);
-        let same_known = left == right && left != Ty::Unknown && left != Ty::Null;
-        let orderable = !ordering || matches!(left, Ty::Int | Ty::Float | Ty::Str);
-        if !null_equality && !(same_known && orderable) {
-            self.coercion(&format!("comparison `{op}`"));
+    fn missing(&mut self, path: &str) {
+        let language = self.language_name();
+        self.warn(
+            EXPR_MISSING_VALUE,
+            format!(
+                "`{}` may be an unset variable, a missing key or an out-of-range index: that is null in {language} but an evaluation error in CEL; the gateway raises an incident",
+                clip(path)
+            ),
+        );
+    }
+
+    fn check_comparison(
+        &mut self,
+        op: &str,
+        at: &str,
+        left: &Operand,
+        right: &Operand,
+        ordering: bool,
+    ) {
+        if !ordering && (left.ty == Ty::Null || right.ty == Ty::Null) {
+            let other = if left.ty == Ty::Null { right } else { left };
+            if is_literal(other.expr) {
+                return;
+            }
+            if is_path(other.expr) {
+                self.missing(other.text);
+            } else {
+                self.coercion(&format!("comparison `{op}`"), at);
+            }
+            return;
+        }
+        let same_known = left.ty == right.ty && left.ty != Ty::Unknown && left.ty != Ty::Null;
+        let orderable = !ordering || matches!(left.ty, Ty::Int | Ty::Float | Ty::Str);
+        if !(same_known && orderable) {
+            self.coercion(&format!("comparison `{op}`"), at);
         }
     }
 
-    fn check_boolean(&mut self, op: &str, ty: Ty) {
-        if !matches!(ty, Ty::Bool | Ty::Unknown) {
-            self.coercion(&format!("boolean operator `{op}` on a non-boolean operand"));
+    fn check_boolean(&mut self, op: &str, operand: &str, ty: Ty) {
+        if ty == Ty::Bool {
+            return;
+        }
+        let reason = match self.language {
+            Lang::Juel => "JUEL coerces null and the texts \"true\" and \"false\" to boolean while CEL is strict and fails on a non-boolean",
+            Lang::Feel => "FEEL treats a non-boolean condition as null while CEL fails on it",
+        };
+        self.warn(
+            EXPR_TYPE_COERCION,
+            format!(
+                "operand `{}` of `{op}` is not known to be boolean; {reason}",
+                clip(operand)
+            ),
+        );
+    }
+
+    /// CEL text of a variable path. A missing value is reported once per
+    /// outermost path by the caller, not for every prefix.
+    fn path(&mut self, expr: &Expr) -> String {
+        match expr {
+            Expr::Var(name) | Expr::ContextVar(name) => select("vars", name),
+            Expr::Member(base, name) => {
+                let base = self.path_base(base);
+                select(&base, name)
+            }
+            Expr::Index(base, key) => {
+                let base = self.path_base(base);
+                match key.as_ref() {
+                    Expr::Str(name) => select(&base, name),
+                    key => {
+                        let (key, _) = self.generate(key, true);
+                        format!("{base}[{key}]")
+                    }
+                }
+            }
+            other => self.generate(other, false).0,
+        }
+    }
+
+    fn path_base(&mut self, base: &Expr) -> String {
+        if is_path(base) {
+            return self.path(base);
+        }
+        let (text, _) = self.generate(base, false);
+        // `(!a).b` must not become `!a.b`, which negates the member instead.
+        if text.starts_with('!') || text.starts_with('-') {
+            format!("({text})")
+        } else {
+            text
         }
     }
 
@@ -1279,24 +1458,20 @@ impl Generator {
             Expr::Str(s) => (cel_string(s), Ty::Str),
             Expr::Bool(b) => (b.to_string(), Ty::Bool),
             Expr::Null => ("null".to_owned(), Ty::Null),
-            Expr::Var(name) => (select("vars", name), Ty::Unknown),
-            Expr::Member(base, name) => {
-                let (base, _) = self.generate(base, false);
-                (select(&base, name), Ty::Unknown)
-            }
-            Expr::Index(base, key) => {
-                let (base, _) = self.generate(base, false);
-                match key.as_ref() {
-                    Expr::Str(name) => (select(&base, name), Ty::Unknown),
-                    key => {
-                        let (key, _) = self.generate(key, true);
-                        (format!("{base}[{key}]"), Ty::Unknown)
-                    }
+            Expr::Var(_) | Expr::ContextVar(_) | Expr::Member(..) | Expr::Index(..) => {
+                let text = self.path(expr);
+                let may_be_missing = match expr {
+                    Expr::Var(_) => self.language == Lang::Feel,
+                    _ => true,
+                };
+                if may_be_missing {
+                    self.missing(&text);
                 }
+                (text, Ty::Unknown)
             }
             Expr::Not(operand) => {
                 let (text, ty) = self.generate(operand, false);
-                self.check_boolean("!", ty);
+                self.check_boolean("!", &text, ty);
                 // cel 0.13 evaluates a bare `!!x` as a single negation, so a nested
                 // negation is always parenthesised.
                 let text = if text.starts_with('!') {
@@ -1312,7 +1487,7 @@ impl Generator {
                 operand => {
                     let (text, ty) = self.generate(operand, false);
                     if !ty.is_numeric() {
-                        self.coercion("unary minus");
+                        self.coercion("unary minus", &format!("-{text}"));
                     }
                     let text = if text.starts_with('-') {
                         format!("({text})")
@@ -1327,17 +1502,20 @@ impl Generator {
             },
             Expr::Empty(operand) => {
                 let (text, _) = self.generate(operand, false);
+                let language = self.language_name();
                 self.warn(
                     EXPR_EMPTY_SEMANTICS,
-                    "`empty` is translated to size(...) == 0: JUEL also treats null and an unset variable as empty, CEL fails on them"
-                        .to_owned(),
+                    format!(
+                        "`empty {}` is translated to size(...) == 0: {language} also treats a null or unset value as empty, while size(null) and a missing key are errors in CEL",
+                        clip(&text)
+                    ),
                 );
                 (format!("(size({text}) == 0)"), Ty::Bool)
             }
             Expr::Binary(op, left, right) => self.binary(*op, left, right, top),
             Expr::Ternary(condition, then, otherwise) => {
                 let (condition, condition_ty) = self.generate(condition, false);
-                self.check_boolean("?:", condition_ty);
+                self.check_boolean("?:", &condition, condition_ty);
                 let (then, then_ty) = self.generate(then, false);
                 let (otherwise, otherwise_ty) = self.generate(otherwise, false);
                 let ty = if then_ty == otherwise_ty {
@@ -1351,19 +1529,46 @@ impl Generator {
                 )
             }
             Expr::Range {
-                subject,
-                lo,
-                hi,
+                subject: subject_expr,
+                lo: lo_expr,
+                hi: hi_expr,
                 lo_inclusive,
                 hi_inclusive,
             } => {
-                let (subject, subject_ty) = self.generate(subject, false);
-                let (lo, lo_ty) = self.generate(lo, false);
-                let (hi, hi_ty) = self.generate(hi, false);
-                self.check_comparison("in range", subject_ty, lo_ty, true);
-                self.check_comparison("in range", subject_ty, hi_ty, true);
+                let (subject, subject_ty) = self.generate(subject_expr, false);
+                let (lo, lo_ty) = self.generate(lo_expr, false);
+                let (hi, hi_ty) = self.generate(hi_expr, false);
                 let lo_op = if *lo_inclusive { ">=" } else { ">" };
                 let hi_op = if *hi_inclusive { "<=" } else { "<" };
+                let subject_operand = Operand {
+                    expr: subject_expr,
+                    text: &subject,
+                    ty: subject_ty,
+                };
+                let lo_operand = Operand {
+                    expr: lo_expr,
+                    text: &lo,
+                    ty: lo_ty,
+                };
+                let hi_operand = Operand {
+                    expr: hi_expr,
+                    text: &hi,
+                    ty: hi_ty,
+                };
+                self.check_comparison(
+                    "in range",
+                    &format!("{subject} {lo_op} {lo}"),
+                    &subject_operand,
+                    &lo_operand,
+                    true,
+                );
+                self.check_comparison(
+                    "in range",
+                    &format!("{subject} {hi_op} {hi}"),
+                    &subject_operand,
+                    &hi_operand,
+                    true,
+                );
                 (
                     group(
                         format!("{subject} {lo_op} {lo} && {subject} {hi_op} {hi}"),
@@ -1372,12 +1577,28 @@ impl Generator {
                     Ty::Bool,
                 )
             }
-            Expr::InList(subject, items) => {
-                let (subject, subject_ty) = self.generate(subject, false);
+            Expr::InList(subject_expr, items) => {
+                let (subject, subject_ty) = self.generate(subject_expr, false);
                 let mut texts = Vec::with_capacity(items.len());
                 for item in items {
                     let (text, ty) = self.generate(item, true);
-                    self.check_comparison("in list", subject_ty, ty, false);
+                    let subject_operand = Operand {
+                        expr: subject_expr,
+                        text: &subject,
+                        ty: subject_ty,
+                    };
+                    let item_operand = Operand {
+                        expr: item,
+                        text: &text,
+                        ty,
+                    };
+                    self.check_comparison(
+                        "in list",
+                        &format!("{subject} in {text}"),
+                        &subject_operand,
+                        &item_operand,
+                        false,
+                    );
                     texts.push(text);
                 }
                 (
@@ -1392,18 +1613,29 @@ impl Generator {
         let (left_text, left_ty) = self.generate(left, false);
         let (right_text, right_ty) = self.generate(right, false);
         let symbol = op.cel();
+        let at = format!("{left_text} {symbol} {right_text}");
+        let left_operand = Operand {
+            expr: left,
+            text: &left_text,
+            ty: left_ty,
+        };
+        let right_operand = Operand {
+            expr: right,
+            text: &right_text,
+            ty: right_ty,
+        };
         let ty = match op {
             BinOp::Or | BinOp::And => {
-                self.check_boolean(symbol, left_ty);
-                self.check_boolean(symbol, right_ty);
+                self.check_boolean(symbol, &left_text, left_ty);
+                self.check_boolean(symbol, &right_text, right_ty);
                 Ty::Bool
             }
             BinOp::Eq | BinOp::Ne => {
-                self.check_comparison(symbol, left_ty, right_ty, false);
+                self.check_comparison(symbol, &at, &left_operand, &right_operand, false);
                 Ty::Bool
             }
             BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
-                self.check_comparison(symbol, left_ty, right_ty, true);
+                self.check_comparison(symbol, &at, &left_operand, &right_operand, true);
                 Ty::Bool
             }
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod => {
@@ -1415,7 +1647,7 @@ impl Generator {
                     } else {
                         ""
                     };
-                    self.coercion(&format!("arithmetic `{symbol}`{note}"));
+                    self.coercion(&format!("arithmetic `{symbol}`{note}"), &at);
                     Ty::Unknown
                 } else {
                     left_ty
@@ -1425,11 +1657,11 @@ impl Generator {
                 if !(left_ty == Ty::Float && right_ty == Ty::Float) {
                     self.warn(
                         EXPR_DIVISION_SEMANTICS,
-                        "JUEL `/` and `div` are always floating-point division while CEL divides two integers as integers (7 / 2 is 3)".to_owned(),
+                        format!("`{}`: JUEL `/` and `div` are always floating-point division while CEL divides two integers as integers (7 / 2 is 3)", clip(&at)),
                     );
                 }
                 if !(left_ty.is_numeric() && right_ty.is_numeric()) {
-                    self.coercion("arithmetic `/`");
+                    self.coercion("arithmetic `/`", &at);
                 }
                 if left_ty == Ty::Float && right_ty == Ty::Float {
                     Ty::Float
@@ -1438,6 +1670,6 @@ impl Generator {
                 }
             }
         };
-        (group(format!("{left_text} {symbol} {right_text}"), top), ty)
+        (group(at, top), ty)
     }
 }
