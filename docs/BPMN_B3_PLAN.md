@@ -522,6 +522,19 @@ Brak. Parser jest ścisły (§0.9). Referencyjny plik w repo: `docs/flows/projec
 ### Ryzyka
 Zakres JUEL łatwo rośnie. Trzymać się listy i ostrzeżeń. Błędny tłumacz jest groźniejszy niż jawna odmowa, bo cicho zmienia warunki bramek. Tłumaczenie uruchamiamy tylko ze zgodą użytkownika w oknie importu.
 
+### Status B3.6a: tłumacz JUEL/FEEL → CEL (2026-11-03)
+
+`tentaflow-core/src/processes/expression_translate.rs` (testy: `expression_translate_tests.rs`). Czysta funkcja `translate(źródło, Juel|Feel|Auto) -> Result<Translation{cel, warnings}, TranslationRefusal{code, message, position}>`, bez zależności. Importer (B3.6b) nie jest częścią pakietu. Wynik przechodzi przez `expr::validate_syntax`; błąd to odmowa `EXPR_INVALID_RESULT`.
+
+- **Obsługiwane (JUEL):** opakowanie `${…}` / `#{…}`; literały (liczby, teksty w `'` i `"`, `true`/`false`/`null`); `== != < > <= >= && || !` i słowa `eq ne lt gt le ge and or not`; `+ - * / % div mod`; minus jednoargumentowy; `?:`; `empty x`; `a.b`, `a['b']`, `a[i]`; wolny identyfikator → `vars.x` (nazwa spoza `[A-Za-z_][A-Za-z0-9_]*` lub słowo zastrzeżone CEL → `vars["nazwa"]`); `execution.getVariable('x')`, `variables.x`, `execution.variables.x` → `vars.x`.
+- **Obsługiwane (FEEL):** wiodące `=`, `=`/`!=` jako równość, `< > <= >=`, `and or not(…)`, literały, ścieżki, `if … then … else`, `x in [a..b]` (cztery formy nawiasów), `x in [1,2,3]`, `null`.
+- **Odmowy:** wywołania metod beanów, `execution.setVariable`, własności `execution.*`, funkcje `fn:`, lambdy, przypisania, `;`, literały list/map, `instanceof`, szablony złożone (tekst z kilkoma `${}`), w FEEL arytmetyka, wywołania funkcji, filtry, nazwy z spacjami, `for/some/every/between`. Kody: `EXPR_UNSUPPORTED_CONSTRUCT` (z nazwą konstrukcji i pozycją znaku), `EXPR_COMPOSITE_TEMPLATE`, `EXPR_UNKNOWN_LANGUAGE`, `EXPR_SYNTAX`, `EXPR_INVALID_LITERAL`, `EXPR_EMPTY`, `EXPR_TOO_LONG` (512 znaków źródła i wyniku), `EXPR_TOO_DEEP` (zagnieżdżenie parsera 64), `EXPR_INVALID_RESULT` (m.in. limit zagnieżdżenia CEL 32).
+- **Nawiasy:** każdy podwyraz dwuargumentowy lub warunkowy dostaje jawne nawiasy, więc CEL nie może połączyć operandów inaczej niż JUEL. Zagnieżdżone `!` jest nawiasowane (`!(!x)`), bo `cel` 0.13 liczy gołe `!!x` jako jedną negację.
+- **Dzielenie (`EXPR_DIVISION_SEMANTICS`):** `/` i `div` w JUEL to zawsze dzielenie zmiennoprzecinkowe, a `7 / 2` w CEL daje 3. Operator jest przepisany bez rzutowania, ostrzeżenie pomijamy tylko, gdy oba operandy mają znany typ float.
+- **`empty` (`EXPR_EMPTY_SEMANTICS`):** tłumaczone na `(size(x) == 0)`. JUEL uznaje też `null` i niezdefiniowaną zmienną za puste, a w CEL `size(null)` i brakujące pole kończą się błędem. Nie generujemy `x == null || …`, bo na brakującym polu też zawodzi, więc ostrzeżenie jest jedyną ochroną.
+- **Koercja (`EXPR_TYPE_COERCION`):** każde porównanie lub działanie, którego operandy nie są obu znanymi literałami (lub wynikami o znanym typie) tego samego rodzaju, dostaje ostrzeżenie; porównania z `null` są bez ostrzeżenia. `+` na tekstach ostrzega, bo w JUEL jest tylko numeryczny, a w CEL łączy teksty. Brak cichych rzutowań. Odwołanie do niezdefiniowanej zmiennej w CEL jest błędem wykonania (JUEL zwraca `null`).
+- **Testy:** tabele złote (>= 60 JUEL, FEEL), test różnicowy z interpreterem referencyjnym na siatce zmiennych, tabela odmów, wejścia wrogie, obieg tekstów przez CEL.
+
 ## 7. Pozycja 6: symulacja poza profilem `script_user_manual`
 
 ### Stan

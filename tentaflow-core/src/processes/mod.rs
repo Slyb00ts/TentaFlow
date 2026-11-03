@@ -6,6 +6,7 @@ pub mod agent_sink;
 pub mod blocks;
 pub mod bpmn;
 pub mod calendar;
+pub mod expression_translate;
 pub mod jobs;
 pub mod model;
 pub mod messages;
@@ -84,3 +85,6 @@ mod verification_tests;
 mod result_routing_tests;
 #[cfg(test)]
 mod repetition_group_incident_tests;
+
+#[cfg(test)]
+mod expression_translate_tests;
