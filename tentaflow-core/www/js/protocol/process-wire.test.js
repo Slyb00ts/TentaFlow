@@ -94,11 +94,13 @@ test('escalation wire preserves typed declarations, boundary mapping and diagnos
 test('camunda import response carries diagnostic severity and expression translations', { skip }, () => {
   const response = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
     XmlImportResponse: { model: null, diagnostics: [{ code: 'CAMUNDA_ASYNC_IGNORED',
-      message: 'ignored', element_id: 'Task_1', offset: null, fatal: false, severity: 'info' }],
+      message: 'ignored', element_id: 'Task_1', offset: null, fatal: false, severity: 'info',
+      element_name: 'Approve order' }],
     translations: [{ element_id: 'Flow_1', kind: 'condition', original: '${a}', translated: 'vars.a',
       warnings: ['EXPR_MISSING_VALUE'] }] },
   } })));
   assert.equal(response.diagnostics[0].severity, 'info');
+  assert.equal(response.diagnostics[0].elementName, 'Approve order');
   assert.equal(response.translations[0].elementId, 'Flow_1');
   assert.equal(response.translations[0].translated, 'vars.a');
   assert.deepEqual(response.translations[0].warnings, ['EXPR_MISSING_VALUE']);

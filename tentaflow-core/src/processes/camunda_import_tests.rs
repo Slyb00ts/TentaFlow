@@ -246,13 +246,43 @@ fn an_expression_assignee_is_never_looked_up_and_gets_its_own_warning() {
 }
 
 #[test]
-fn an_assignee_expression_reading_the_element_variable_says_the_per_item_assignment_is_lost() {
+fn an_assignee_expression_reading_the_element_variable_is_a_read_and_says_the_per_item_assignment_is_lost(
+) {
     let imported = import_camunda_xml(&linear(
         r#"<bpmn:userTask id="Task_1" camunda:assignee="${approver}"><bpmn:multiInstanceLoopCharacteristics camunda:collection="approvers" camunda:elementVariable="approver"/></bpmn:userTask>"#,
     ));
-    assert_clean_import(&imported);
     let warning = only(&imported, "CAMUNDA_ASSIGNEE_EXPRESSION");
     assert!(warning.message.contains("per-item"), "{}", warning.message);
+    // The same expression is a read of the element variable, so the two agree.
+    assert!(imported.model.is_none());
+    assert_eq!(
+        only(&imported, "CAMUNDA_MULTI_INSTANCE_ELEMENT_VARIABLE").severity,
+        Some(Severity::Fatal)
+    );
+}
+
+#[test]
+fn an_assignee_reading_the_variable_of_an_enclosing_multi_instance_subprocess_is_found() {
+    let imported = import_camunda_xml(&process(
+        r#"<bpmn:startEvent id="Start_1"/>
+        <bpmn:subProcess id="Sub_1">
+          <bpmn:multiInstanceLoopCharacteristics camunda:collection="approvers" camunda:elementVariable="approver"/>
+          <bpmn:startEvent id="SubStart_1"/>
+          <bpmn:userTask id="Inner_1" camunda:assignee="${approver}"/>
+          <bpmn:endEvent id="SubEnd_1"/>
+          <bpmn:sequenceFlow id="SF_1" sourceRef="SubStart_1" targetRef="Inner_1"/>
+          <bpmn:sequenceFlow id="SF_2" sourceRef="Inner_1" targetRef="SubEnd_1"/>
+        </bpmn:subProcess>
+        <bpmn:endEvent id="End_1"/>
+        <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="Sub_1"/>
+        <bpmn:sequenceFlow id="Flow_2" sourceRef="Sub_1" targetRef="End_1"/>"#,
+    ));
+    assert!(only(&imported, "CAMUNDA_ASSIGNEE_EXPRESSION")
+        .message
+        .contains("per-item"));
+    let fatal = only(&imported, "CAMUNDA_MULTI_INSTANCE_ELEMENT_VARIABLE");
+    assert_eq!(fatal.severity, Some(Severity::Fatal));
+    assert_eq!(fatal.element_id.as_deref(), Some("Sub_1"));
 }
 
 #[test]
@@ -1974,7 +2004,8 @@ fn a_boundary_timer_gets_a_defaulted_zone_and_a_warning_naming_the_timer() {
     let model = assert_clean_import(&imported);
     assert_eq!(model.timer_timezone.as_deref(), Some("UTC"));
     let warning = only(&imported, "CAMUNDA_TIMER_TIMEZONE_DEFAULTED");
-    assert_eq!(warning.severity, Some(Severity::Warning));
+    // A duration in hours fires at the same instant in any zone.
+    assert_eq!(warning.severity, Some(Severity::Info));
     assert_eq!(warning.element_id.as_deref(), Some("Timer_1"));
     assert_eq!(warning.element_name.as_deref(), Some("Too slow"));
     assert!(warning.message.contains("UTC"));
@@ -2142,4 +2173,187 @@ fn a_refused_element_keeps_its_name_for_the_listing() {
     ));
     let fatal = only(&imported, "CAMUNDA_SCRIPT_UNSUPPORTED");
     assert_eq!(fatal.element_name.as_deref(), Some("Calculate tax"));
+}
+
+// ----- zones per process, dates, interruptions, names -----
+
+fn two_pools(first_timer: bool, second_timer: bool) -> String {
+    let body = |suffix: &str, timer: bool| {
+        if timer {
+            format!(
+                r#"<bpmn:startEvent id="Start_{suffix}"/>
+                <bpmn:intermediateCatchEvent id="Wait_{suffix}"><bpmn:timerEventDefinition><bpmn:timeDuration xsi:type="bpmn:tFormalExpression">PT30M</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:intermediateCatchEvent>
+                <bpmn:endEvent id="End_{suffix}"/>
+                <bpmn:sequenceFlow id="F1_{suffix}" sourceRef="Start_{suffix}" targetRef="Wait_{suffix}"/>
+                <bpmn:sequenceFlow id="F2_{suffix}" sourceRef="Wait_{suffix}" targetRef="End_{suffix}"/>"#
+            )
+        } else {
+            format!(
+                r#"<bpmn:startEvent id="Start_{suffix}"/><bpmn:endEvent id="End_{suffix}"/>
+                <bpmn:sequenceFlow id="F1_{suffix}" sourceRef="Start_{suffix}" targetRef="End_{suffix}"/>"#
+            )
+        }
+    };
+    format!(
+        r#"{HEAD}<bpmn:collaboration id="Collab_1">
+          <bpmn:participant id="Part_1" name="Sales" processRef="Process_1"/>
+          <bpmn:participant id="Part_2" name="Billing" processRef="Process_2"/>
+        </bpmn:collaboration>
+        <bpmn:process id="Process_1" isExecutable="true">{}</bpmn:process>
+        <bpmn:process id="Process_2" isExecutable="true">{}</bpmn:process>
+        </bpmn:definitions>"#,
+        body("1", first_timer),
+        body("2", second_timer)
+    )
+}
+
+#[test]
+fn every_process_with_timers_gets_its_own_zone_and_none_without() {
+    let both = import_camunda_xml(&two_pools(true, true));
+    let model = assert_clean_import(&both);
+    assert_eq!(model.timer_timezone.as_deref(), Some("UTC"));
+    assert_eq!(
+        model.additional_processes[0].timer_timezone.as_deref(),
+        Some("UTC")
+    );
+    let mut owners: Vec<_> = diagnostics(&both, "CAMUNDA_TIMER_TIMEZONE_DEFAULTED")
+        .iter()
+        .map(|d| d.element_id.clone().unwrap())
+        .collect();
+    owners.sort();
+    assert_eq!(owners, ["Wait_1", "Wait_2"]);
+
+    let second_only = import_camunda_xml(&two_pools(false, true));
+    let model = assert_clean_import(&second_only);
+    assert_eq!(model.timer_timezone, None);
+    assert_eq!(
+        model.additional_processes[0].timer_timezone.as_deref(),
+        Some("UTC")
+    );
+
+    let first_only = import_camunda_xml(&two_pools(true, false));
+    let model = assert_clean_import(&first_only);
+    assert_eq!(model.timer_timezone.as_deref(), Some("UTC"));
+    assert_eq!(model.additional_processes[0].timer_timezone, None);
+    only(&first_only, "CAMUNDA_TIMER_TIMEZONE_DEFAULTED");
+}
+
+#[test]
+fn a_date_the_model_would_refuse_is_refused_naming_the_timer() {
+    let date = |rule: &str| {
+        process(&format!(
+            r#"<bpmn:startEvent id="Start_1"><bpmn:timerEventDefinition>{rule}</bpmn:timerEventDefinition></bpmn:startEvent>
+            <bpmn:endEvent id="End_1"/>
+            <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="End_1"/>"#
+        ))
+    };
+    for rule in [
+        r#"<bpmn:timeDate xsi:type="bpmn:tFormalExpression">${dueDate}</bpmn:timeDate>"#,
+        r#"<bpmn:timeDate xsi:type="bpmn:tFormalExpression">2030-01-01T10:00:00</bpmn:timeDate>"#,
+        r#"<bpmn:timeDate xsi:type="bpmn:tFormalExpression">${deadline}</bpmn:timeDate><bpmn:timeCycle xsi:type="bpmn:tFormalExpression">R3/PT60S</bpmn:timeCycle>"#,
+    ] {
+        let imported = import_camunda_xml(&date(rule));
+        assert!(imported.model.is_none(), "{rule}");
+        let fatal = only(&imported, "CAMUNDA_TIMER_UNSUPPORTED");
+        assert_eq!(fatal.element_id.as_deref(), Some("Start_1"), "{rule}");
+        assert!(
+            diagnostics(&imported, "CAMUNDA_TIMER_TIMEZONE_DEFAULTED").is_empty(),
+            "{rule}"
+        );
+        assert!(
+            diagnostics(&imported, "CAMUNDA_MODEL_INVALID").is_empty(),
+            "{rule}"
+        );
+    }
+}
+
+#[test]
+fn the_zone_warning_is_graded_by_whether_the_zone_matters() {
+    let with = |rule: &str| {
+        let imported = import_camunda_xml(&boundary_timer(rule));
+        assert_clean_import(&imported);
+        imported
+    };
+    let hours =
+        with(r#"<bpmn:timeDuration xsi:type="bpmn:tFormalExpression">PT90M</bpmn:timeDuration>"#);
+    assert_eq!(
+        only(&hours, "CAMUNDA_TIMER_TIMEZONE_DEFAULTED").severity,
+        Some(Severity::Info)
+    );
+    assert!(diagnostics(&hours, "CAMUNDA_TIMER_DAY_DURATION").is_empty());
+    let cycle = import_camunda_xml(&process(
+        r#"<bpmn:startEvent id="Start_1"><bpmn:timerEventDefinition><bpmn:timeCycle xsi:type="bpmn:tFormalExpression">R3/PT600S</bpmn:timeCycle></bpmn:timerEventDefinition></bpmn:startEvent>
+        <bpmn:endEvent id="End_1"/>
+        <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="End_1"/>"#,
+    ));
+    assert_clean_import(&cycle);
+    assert_eq!(
+        only(&cycle, "CAMUNDA_TIMER_TIMEZONE_DEFAULTED").severity,
+        Some(Severity::Info)
+    );
+    let days =
+        with(r#"<bpmn:timeDuration xsi:type="bpmn:tFormalExpression">P1DT2H</bpmn:timeDuration>"#);
+    let day = only(&days, "CAMUNDA_TIMER_DAY_DURATION");
+    assert_eq!(day.severity, Some(Severity::Warning));
+    assert_eq!(day.element_id.as_deref(), Some("Timer_1"));
+    assert!(day.message.contains("P1DT2H") && day.message.contains("86400"));
+}
+
+#[test]
+fn a_subprocess_that_copies_variables_out_and_can_be_interrupted_is_warned() {
+    let sub = |cancel: &str| {
+        process(&format!(
+            r#"<bpmn:startEvent id="Start_1"/>
+            <bpmn:subProcess id="Sub_1">
+              <bpmn:startEvent id="SubStart_1"/>
+              <bpmn:scriptTask id="Inner_1" scriptFormat="juel" camunda:resultVariable="partial"><bpmn:script>${{1}}</bpmn:script></bpmn:scriptTask>
+              <bpmn:endEvent id="SubEnd_1"/>
+              <bpmn:sequenceFlow id="SF_1" sourceRef="SubStart_1" targetRef="Inner_1"/>
+              <bpmn:sequenceFlow id="SF_2" sourceRef="Inner_1" targetRef="SubEnd_1"/>
+            </bpmn:subProcess>
+            <bpmn:boundaryEvent id="Guard_1" attachedToRef="Sub_1"{cancel}><bpmn:timerEventDefinition><bpmn:timeDuration xsi:type="bpmn:tFormalExpression">PT1H</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+            <bpmn:endEvent id="End_1"/>
+            <bpmn:endEvent id="EndB_1"/>
+            <bpmn:sequenceFlow id="Flow_1" sourceRef="Start_1" targetRef="Sub_1"/>
+            <bpmn:sequenceFlow id="Flow_2" sourceRef="Sub_1" targetRef="End_1"/>
+            <bpmn:sequenceFlow id="Flow_3" sourceRef="Guard_1" targetRef="EndB_1"/>"#
+        ))
+    };
+    let interrupting = import_camunda_xml(&sub(""));
+    assert_clean_import(&interrupting);
+    let warning = only(&interrupting, "CAMUNDA_SUBPROCESS_INTERRUPTED_SCOPE");
+    assert_eq!(warning.severity, Some(Severity::Warning));
+    assert_eq!(warning.element_id.as_deref(), Some("Sub_1"));
+    let non_interrupting = import_camunda_xml(&sub(r#" cancelActivity="false""#));
+    assert!(diagnostics(&non_interrupting, "CAMUNDA_SUBPROCESS_INTERRUPTED_SCOPE").is_empty());
+}
+
+#[test]
+fn element_names_are_cleaned_and_capped_at_two_hundred_characters() {
+    let name = format!("a\u{202E}b&#10;c{}", "x".repeat(300));
+    let imported = import_camunda_xml(&linear(&format!(
+        r#"<bpmn:scriptTask id="Task_1" name="{name}" scriptFormat="javascript"><bpmn:script>1</bpmn:script></bpmn:scriptTask>"#
+    )));
+    let label = only(&imported, "CAMUNDA_SCRIPT_UNSUPPORTED")
+        .element_name
+        .clone()
+        .unwrap();
+    assert_eq!(label.chars().count(), 200);
+    assert!(
+        label.starts_with("abcxxx") && label.ends_with('…'),
+        "{label}"
+    );
+    assert!(!label.chars().any(|c| c.is_control() || c == '\u{202E}'));
+}
+
+#[test]
+fn a_leading_byte_order_mark_is_not_a_column() {
+    let xml = "\u{feff}<?xml version=\"1.0\"?><definitions bad>";
+    let imported = import_camunda_xml(xml);
+    let fatal = imported.diagnostics.iter().find(|d| d.fatal).unwrap();
+    assert!(
+        fatal.message.contains("(line 1, column 22)"),
+        "{}",
+        fatal.message
+    );
 }

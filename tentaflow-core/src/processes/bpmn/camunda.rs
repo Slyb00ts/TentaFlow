@@ -26,7 +26,7 @@ use quick_xml::Reader;
 use tentaflow_protocol::processes::{
     ProcessDiagnostic, ProcessDiagnosticSeverity as Severity, ProcessExecutableProcess,
     ProcessImportTranslation, ProcessModel, ProcessMultiInstanceInput, ProcessMultiInstanceMode,
-    ProcessNode, ProcessNodeKind, ProcessRepeatSpec, ServiceImplementation,
+    ProcessNode, ProcessNodeKind, ProcessRepeatSpec, ProcessTimerSpec, ServiceImplementation,
 };
 
 use super::{
@@ -37,7 +37,9 @@ use crate::flow_engine::expr;
 use crate::processes::expression_translate::{
     read_variables, translate, SourceLanguage, TranslationRefusal,
 };
-use crate::processes::model::{valid_id, validate_interchange_model, MAX_VARIABLE_KEYS};
+use crate::processes::model::{
+    valid_id, validate_interchange_model, validate_timer_spec, MAX_VARIABLE_KEYS,
+};
 
 pub const CAMUNDA_NAMESPACE: &str = "http://camunda.org/schema/1.0/bpmn";
 const CEL_LANGUAGE: &str = "https://cel.dev/spec";
@@ -121,6 +123,17 @@ pub fn import_camunda_xml_resolving(
     importer.finish(model)
 }
 
+/// A timer the rewrite found, with what decides how much the zone matters.
+struct TimerNote {
+    id: String,
+    offset: usize,
+    /// Whether the time zone changes when the timer fires.
+    zone_matters: bool,
+    /// The day component of a duration (`P1D`), counted in calendar days by
+    /// Camunda and as 86400 s by TentaFlow.
+    days: Option<String>,
+}
+
 struct RepeatPatch {
     node_id: String,
     base_name: String,
@@ -133,7 +146,11 @@ struct Importer<'a> {
     /// `name` of every element that has an id, to label diagnostics.
     names: HashMap<String, String>,
     /// Timer events seen in the process being rewritten: (id, offset).
-    timers: Vec<(String, usize)>,
+    timers: Vec<TimerNote>,
+    /// `elementVariable` of the multi-instance subprocesses being rewritten.
+    element_variables: Vec<String>,
+    /// Activities that an interrupting boundary event is attached to.
+    interrupted: HashSet<String>,
     diagnostics: Vec<ProcessDiagnostic>,
     translations: Vec<ProcessImportTranslation>,
     repeats: Vec<RepeatPatch>,
@@ -156,6 +173,8 @@ impl<'a> Importer<'a> {
             source,
             names: HashMap::new(),
             timers: Vec::new(),
+            element_variables: Vec::new(),
+            interrupted: HashSet::new(),
             diagnostics: Vec::new(),
             translations: Vec::new(),
             repeats: Vec::new(),
@@ -289,6 +308,22 @@ impl<'a> Importer<'a> {
                 ),
             );
         }
+        for id in propagation.copies_out {
+            if self.interrupted.contains(&id) {
+                self.push(
+                    Severity::Warning,
+                    "CAMUNDA_SUBPROCESS_INTERRUPTED_SCOPE",
+                    Some(id.clone()),
+                    None,
+                    format!(
+                        "subprocess {id} can be interrupted by a boundary event (timer, error, \
+                         escalation or message); TentaFlow copies its variables out only when it \
+                         finishes, so values written before an interruption are lost, while \
+                         Camunda would already have propagated them"
+                    ),
+                );
+            }
+        }
         for id in propagation.uncertain {
             self.push(
                 Severity::Warning,
@@ -384,17 +419,19 @@ impl<'a> Importer<'a> {
     fn name_of(&self, element_id: Option<&str>) -> Option<String> {
         element_id
             .and_then(|id| self.names.get(id))
+            .map(|name| printable_name(name))
             .filter(|name| !name.is_empty())
-            .map(|name| clip_to(name, MAX_NAME_CHARS))
     }
 
     /// "line L, column C" of a byte offset, appended to a refusal.
     fn with_position(&self, message: String, offset: usize) -> String {
-        let mut end = offset.min(self.source.len());
-        while !self.source.is_char_boundary(end) {
+        // The reader's offsets do not count a leading byte order mark.
+        let source = self.source.strip_prefix('\u{feff}').unwrap_or(self.source);
+        let mut end = offset.min(source.len());
+        while !source.is_char_boundary(end) {
             end -= 1;
         }
-        let before = &self.source[..end];
+        let before = &source[..end];
         let line = before.matches('\n').count() + 1;
         let column = before
             .rsplit('\n')
@@ -518,11 +555,9 @@ impl<'a> Importer<'a> {
         self.drop_unprefixed(root, &["expressionLanguage", "typeLanguage"]);
         self.rewrite_foreign_attributes(root);
         let mut kept = Vec::new();
-        let mut processes = 0;
         for mut child in std::mem::take(&mut root.children) {
             if child.ns == BPMN && child.local == "process" {
-                self.rewrite_process(&mut child, processes == 0);
-                processes += 1;
+                self.rewrite_process(&mut child);
             } else if child.ns == BPMNDI && child.local == "BPMNDiagram" {
                 self.rewrite_diagram(&mut child);
             } else if child.ns == BPMN
@@ -552,7 +587,7 @@ impl<'a> Importer<'a> {
         root.children = kept;
     }
 
-    fn rewrite_process(&mut self, process: &mut Element, primary: bool) {
+    fn rewrite_process(&mut self, process: &mut Element) {
         self.timers.clear();
         self.drop_unprefixed(
             process,
@@ -566,9 +601,7 @@ impl<'a> Importer<'a> {
             self.finish_extension(process, ext);
         }
         self.rewrite_graph(process);
-        if primary {
-            self.default_timer_zone(process);
-        }
+        self.default_timer_zone(process);
         self.timers.clear();
     }
 
@@ -611,23 +644,48 @@ impl<'a> Importer<'a> {
             DEFAULT_TIMER_ZONE,
             offset,
         ));
-        for (id, at) in std::mem::take(&mut self.timers) {
+        for timer in std::mem::take(&mut self.timers) {
+            let id = timer.id;
+            let (severity, why) = if timer.zone_matters {
+                (Severity::Warning, "it decides when the timer fires")
+            } else {
+                (Severity::Info, "it does not change when this timer fires")
+            };
             self.push(
-                Severity::Warning,
+                severity,
                 "CAMUNDA_TIMER_TIMEZONE_DEFAULTED",
                 Some(id.clone()),
-                Some(at),
+                Some(timer.offset),
                 format!(
                     "timer {id} has no time zone in Camunda; {DEFAULT_TIMER_ZONE} was assumed \
-                     for the process"
+                     for the process ({why})"
                 ),
             );
+            if let Some(days) = timer.days {
+                self.push(
+                    Severity::Warning,
+                    "CAMUNDA_TIMER_DAY_DURATION",
+                    Some(id.clone()),
+                    Some(timer.offset),
+                    format!(
+                        "timer {id} waits \"{days}\": TentaFlow counts a day as 86400 seconds, \
+                         Camunda as a calendar day, which differs across daylight-saving changes"
+                    ),
+                );
+            }
         }
     }
 
     /// The flow nodes and flows of a process or an embedded subprocess.
     fn rewrite_graph(&mut self, container: &mut Element) {
         let mut children = std::mem::take(&mut container.children);
+        for child in &children {
+            if child.is(BPMN, "boundaryEvent") && child.attr("cancelActivity") != Some("false") {
+                if let Some(attached) = child.attr("attachedToRef") {
+                    self.interrupted.insert(attached.to_string());
+                }
+            }
+        }
         for child in &mut children {
             if child.ns != BPMN {
                 continue;
@@ -834,7 +892,19 @@ impl<'a> Importer<'a> {
         self.finish_extension(node, ext);
         if local == "subProcess" {
             self.prepare_subprocess(node);
+            let enclosing = node
+                .children
+                .iter()
+                .find(|c| c.is(BPMN, "multiInstanceLoopCharacteristics"))
+                .and_then(|mi| {
+                    mi.attrs
+                        .get(&(CAMUNDA_NAMESPACE.to_string(), "elementVariable".to_string()))
+                })
+                .cloned();
+            let depth = self.element_variables.len();
+            self.element_variables.extend(enclosing);
             self.rewrite_graph(node);
+            self.element_variables.truncate(depth);
         }
         // Last, so the expressions of a subprocess body are already read when
         // the element variable is looked up in them.
@@ -876,8 +946,36 @@ impl<'a> Importer<'a> {
             .and_then(|d| d.children.first())
             .map(|rule| clip(rule.text.trim()))
             .unwrap_or_default();
-        match timer_spec(node, &id) {
-            Ok(_) => self.timers.push((id, node.offset)),
+        let is_start = node.local == "startEvent";
+        let spec = timer_spec(node, &id).and_then(|spec| {
+            // The same rules the model applies later, so a value the model
+            // would refuse is refused here, naming the timer.
+            validate_timer_spec(&spec, is_start)?;
+            Ok(spec)
+        });
+        match spec {
+            Ok(spec) => {
+                let days = match &spec {
+                    ProcessTimerSpec::Duration { .. } => value
+                        .strip_prefix('P')
+                        .and_then(|rest| rest.split('T').next())
+                        .filter(|days| !days.is_empty())
+                        .map(|_| value.clone()),
+                    _ => None,
+                };
+                let zone_matters = !matches!(
+                    spec,
+                    ProcessTimerSpec::Date { .. }
+                        | ProcessTimerSpec::Duration { .. }
+                        | ProcessTimerSpec::Cycle { .. }
+                );
+                self.timers.push(TimerNote {
+                    id,
+                    offset: node.offset,
+                    zone_matters,
+                    days,
+                });
+            }
             Err(error) => self.report(
                 Severity::Fatal,
                 "CAMUNDA_TIMER_UNSUPPORTED",
@@ -1187,18 +1285,25 @@ impl<'a> Importer<'a> {
         let mut user_id = None;
         if let Some(login) = assignee {
             if has_wrapper(&login) {
-                let per_item = node
+                let read = read_variables(&login, SourceLanguage::Juel).unwrap_or_default();
+                // The expression counts as one the activity evaluates, so the
+                // element-variable check and this warning agree.
+                self.reads
+                    .entry(node.attr("id").unwrap_or_default().to_string())
+                    .or_default()
+                    .extend(read.iter().cloned());
+                let own = node
                     .children
                     .iter()
                     .find(|c| c.is(BPMN, "multiInstanceLoopCharacteristics"))
                     .and_then(|mi| {
                         mi.attrs
                             .get(&(CAMUNDA_NAMESPACE.to_string(), "elementVariable".to_string()))
-                    })
-                    .filter(|variable| {
-                        read_variables(&login, SourceLanguage::Juel)
-                            .is_some_and(|names| names.contains(variable.as_str()))
                     });
+                let per_item = own
+                    .into_iter()
+                    .chain(self.element_variables.iter())
+                    .find(|variable| read.contains(variable.as_str()));
                 let message = match per_item {
                     Some(variable) => format!(
                         "assignee {login} reads the element variable {variable}; an expression \
@@ -2178,6 +2283,23 @@ fn bounded_origin(origin: &str) -> String {
     clean
 }
 
+/// An element name for a label: no control or bidirectional-override
+/// characters, at most 200 characters (199 and an ellipsis when cut).
+fn printable_name(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(u32::from(*c), 0x61C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069)
+        })
+        .collect();
+    if clean.chars().count() <= MAX_NAME_CHARS {
+        clean
+    } else {
+        clip_to(&clean, MAX_NAME_CHARS - 1)
+    }
+}
+
 fn clip_to(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_string();
@@ -2357,6 +2479,8 @@ struct Propagation {
     uncertain: Vec<String>,
     /// Subprocesses that would need more mapping keys than a model allows.
     too_many: Vec<String>,
+    /// Subprocesses that copy at least one variable out when they finish.
+    copies_out: Vec<String>,
 }
 
 /// Camunda lets a variable set inside an embedded subprocess flow up the scope
@@ -2407,6 +2531,9 @@ fn propagate_subprocess_outputs(
             || body.variables.len() > MAX_VARIABLE_KEYS
         {
             result.too_many.push(id.clone());
+        }
+        if !output_mapping.is_empty() {
+            result.copies_out.push(id.clone());
         }
         if holds_unknown_steps(&body.nodes) {
             result.uncertain.push(id);
