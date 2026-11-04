@@ -157,6 +157,18 @@ test('the operator answers a waiting Service step, approves its verification and
   expect(await win.locator('[data-simulation-wait] [data-answer-field="verdict"]').count()).toBe(0);
   const eventsBefore = await win.locator('.fb-simulation-events li').count();
 
+  // Escape inside the editor is the editor's own; Escape elsewhere asks before the open run is dropped.
+  await wait.locator('[data-answer-field="outputs"]').evaluate((editor) => editor.focus());
+  expect(await page.evaluate(() => document.activeElement?.tagName)).toBe('TF-CODE-EDITOR');
+  await page.keyboard.press('Escape');
+  await expect(win.locator('[data-simulation-content]')).toBeVisible();
+  await expect(page.locator('tf-button[data-action="cancel"]')).toHaveCount(0);
+  await win.locator('.fb-simulation-toolbar').click();
+  await page.keyboard.press('Escape');
+  await expect(page.locator('tf-button[data-action="cancel"]')).toBeVisible();
+  await page.locator('tf-button[data-action="cancel"]').click();
+  await expect(win.locator('[data-simulation-wait]')).toHaveCount(1);
+
   // Invalid JSON is told in the form and nothing is sent: the step still waits.
   await setEditor(wait.locator('[data-answer-field="outputs"]'), '{"answer":');
   await wait.locator('[data-simulation-resolve]').click();
@@ -179,6 +191,10 @@ test('the operator answers a waiting Service step, approves its verification and
   await expect(decision.locator('tf-code-editor')).toHaveCount(0);
   await expect(decision.locator('tf-button')).toHaveText(['Approve', 'Reject']);
   await decision.locator('[data-simulation-decide="true"]').click();
+  // A decided task stays as a record: no buttons, the decision in words.
+  const decided = win.locator('[data-simulation-done-task] [data-simulation-decision="approved"]');
+  await expect(decided).toBeVisible({ timeout: 15000 });
+  await expect(win.locator('[data-simulation-decide]')).toHaveCount(0);
 
   const work = win.locator('.fb-simulation-task', { hasText: 'Sign off' });
   await expect(work).toBeVisible({ timeout: 15000 });
@@ -214,8 +230,44 @@ test('a prepared result is chosen at start, applies on advance and never waits f
   await expect(win.locator('[data-simulation-wait]')).toHaveCount(0);
   await expect(win.locator('.fb-simulation-events')).toContainText('Check contract');
   await win.locator('[data-simulation-decide="false"]').click();
-  // A rejected verification is an incident of the run, not a crash of the window.
+  // A rejected verification is an incident the window shows in words; the run cannot be advanced any more.
   await expect(win.locator('[data-error]')).toBeHidden();
-  await expect(win.locator('[data-simulation-content]')).toBeVisible();
+  await expect(win.locator('[data-simulation-incident]').first()).toHaveAttribute('message', /The verifier rejected the result\./);
+  await expect(win.locator('[data-simulation-status]')).toHaveText('Incident');
+  await expect(win.locator('[data-simulation-advance]')).toHaveAttribute('disabled', '');
+  await expect(win.locator('[data-simulation-done-task] [data-simulation-decision="rejected"]')).toBeVisible();
+  await expect(win.locator('.fb-simulation-events')).toContainText('Prepared result applied');
+  expect(errors, diagnostics(errors, proc)).toEqual([]);
+});
+
+test('a language switch keeps the run and what was typed in it', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors = collectConsoleErrors(page);
+  const form = await openSimulationForm(page);
+  await form.locator('[data-act="submit"]').click();
+  const win = simulation(page);
+  await advanceUntil(page, async (current) => (await current.locator('[data-simulation-wait]').count()) === 1);
+  await win.locator('[data-simulation-wait] [data-answer-field="summary"] input').fill('half typed');
+  await page.evaluate(async () => {
+    const { I18n } = await import('/js/i18n.js');
+    await I18n.setLanguage('pl');
+  });
+  try {
+    const back = simulation(page);
+    await expect(back.locator('[data-simulation-wait]')).toHaveCount(1, { timeout: 20000 });
+    await expect(back.locator('[data-simulation-wait] [data-answer-field="summary"] input')).toHaveValue('half typed');
+    await expect(back.locator('[data-simulation-resolve]')).toContainText('Wyślij wynik');
+    await expect(back.locator('[data-simulation-status]')).toHaveText('W toku');
+    // The run is still the server's: it answers.
+    await back.locator('[data-simulation-wait] [data-answer-field="outputs"]').evaluate((editor) => { editor.value = '{"answer": 1}'; });
+    await back.locator('[data-simulation-resolve]').click();
+    await expect(back.locator('[data-simulation-wait]')).toHaveCount(0, { timeout: 15000 });
+    await expect(back.locator('[data-error]')).toBeHidden();
+  } finally {
+    await page.evaluate(async () => {
+      const { I18n } = await import('/js/i18n.js');
+      await I18n.setLanguage('en');
+    });
+  }
   expect(errors, diagnostics(errors, proc)).toEqual([]);
 });

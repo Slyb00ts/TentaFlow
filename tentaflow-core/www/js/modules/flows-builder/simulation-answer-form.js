@@ -21,14 +21,14 @@ const field = (container, name) => container.querySelector(`[data-answer-field="
  */
 export function answerFormHtml(step, draft) {
   const outcomes = simulationServiceOutcomes(step);
-  const verdict = step.machineVerdict ? `
+  const verdict = step.machineVerdict ? `<div data-answer-verdict>
     <tf-select data-answer-field="verdict" wrap-selected label="${escapeAttr(text('simulation_verdict'))}" hint="${escapeAttr(text('simulation_verdict_hint'))}" value="${escapeAttr(draft.verdict)}">
       <option value="">${escapeHtml(text('simulation_verdict_choose'))}</option>
       ${SERVICE_VERDICTS.map((value) => `<option value="${value}">${escapeHtml(text(`simulation_verdict_${value.toLowerCase()}`))}</option>`).join('')}
     </tf-select>
-    <tf-alert data-answer-error="verdict" tone="danger" hidden></tf-alert>` : '';
-  return `<div class="fb-simulation-answer">
-    <tf-select data-answer-field="outcome" wrap-selected label="${escapeAttr(text('simulation_outcome'))}" value="${escapeAttr(draft.outcome)}">
+    <tf-alert data-answer-error="verdict" tone="danger" hidden></tf-alert></div>` : '';
+  return `<div class="fb-simulation-answer" data-has-expression="${step.hasResultExpression ? 'true' : 'false'}">
+    <tf-select data-answer-field="outcome" wrap-selected label="${escapeAttr(text('simulation_outcome'))}"${step.hasResultExpression ? ` hint="${escapeAttr(text('simulation_outcome_expression_hint'))}"` : ''} value="${escapeAttr(draft.outcome)}">
       ${outcomes.map((value) => `<option value="${value}">${escapeHtml(text(`simulation_outcome_${OUTCOME_KEYS[value]}`))}</option>`).join('')}
     </tf-select>
     <tf-alert data-answer-error="outcome" tone="danger" hidden></tf-alert>
@@ -38,15 +38,28 @@ export function answerFormHtml(step, draft) {
     <tf-alert data-answer-error="summary" tone="danger" hidden></tf-alert>
     <section class="fb-process-json"><h4>${escapeHtml(text('simulation_result_outputs'))}</h4>
       <tf-code-editor data-answer-field="outputs" language="json" aria-label="${escapeAttr(text('simulation_result_outputs'))}"></tf-code-editor>
+      <p class="fb-field-hint">${escapeHtml(text('simulation_editor_escape_hint'))}</p>
       <tf-alert data-answer-error="outputs" tone="danger" hidden></tf-alert>
     </section>
     ${verdict}
   </div>`;
 }
 
+// A step without a result expression only ever reaches its check with a result that
+// completes, so the verdict is asked for only then; with an expression the engine decides.
+export function syncAnswerForm(container) {
+  const form = container.querySelector('.fb-simulation-answer');
+  const verdict = container.querySelector('[data-answer-verdict]');
+  if (!form || !verdict) return;
+  const select = field(container, 'outcome');
+  const outcome = select?.value || select?.getAttribute('value');
+  verdict.hidden = form.dataset.hasExpression !== 'true' && outcome !== 'Completed';
+}
+
 export function fillAnswerForm(container, draft) {
   const outputs = field(container, 'outputs');
   if (outputs) outputs.value = draft.outputs;
+  syncAnswerForm(container);
 }
 
 export function readAnswerDraft(container) {
@@ -62,9 +75,21 @@ export function readAnswerDraft(container) {
 // `errors` maps a field to the i18n key of what is wrong with it; fields not in
 // it are cleared.
 export function showAnswerErrors(container, errors = {}) {
+  let first = null;
   container.querySelectorAll('[data-answer-error]').forEach((alert) => {
-    const key = errors[alert.dataset.answerError];
-    if (key) alert.setAttribute('message', text(key));
-    alert.hidden = !key;
+    const error = errors[alert.dataset.answerError];
+    if (error) {
+      const { key, values } = typeof error === 'string' ? { key: error } : error;
+      alert.setAttribute('message', text(key, values));
+      first ??= alert;
+    }
+    alert.hidden = !error;
   });
+  // The problem may sit below the fold of a tall window.
+  first?.scrollIntoView?.({ block: 'center' });
+}
+
+export function errorMessage(error) {
+  const { key, values } = typeof error === 'string' ? { key: error } : error;
+  return text(key, values);
 }

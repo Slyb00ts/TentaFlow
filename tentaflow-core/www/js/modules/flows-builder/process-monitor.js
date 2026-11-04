@@ -381,7 +381,7 @@ export async function openProcessSchedule(definitionId) {
   return win;
 }
 
-function processIncidentText(incident) {
+export function processIncidentText(incident) {
   if (incident.code === 'TIMER_ERROR') return text('incident_timer_error', { reason: incident.message });
   if (incident.code === 'INCLUSIVE_GATEWAY_ERROR') return `${text('incident_inclusive_gateway_error')} ${text('incident_inclusive_guidance')}`;
   if (incident.code === 'ESCALATION_HANDLER_FAILED') return `${text('incident_escalation_handler_failed')} ${text('incident_escalation_guidance')}`;

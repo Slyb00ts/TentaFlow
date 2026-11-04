@@ -18,7 +18,7 @@ import { getNodeDisplayTitle } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import { checkProcessDocument, processAttentionTargets, processBody, processCommand, processDistinctLabels, processEditorLabels, processElementNames, processExplainError, processHasTimer, processHasTimerStart, processAttentionContainers, processIsPristine, processImportFlagged, processImportNeedsReview, processNextAttention, processDiagnosticSeverity, processDiagnosticText, processDiagnosticDetail, processElementNode, processNodeLabels, processPublishProblems, processStartEntryLabels, processTimezoneCanonical, processTimezoneGaps, processTimezoneText, processBodyLabels } from '/js/modules/flows-builder/bpmn.js';
 import { openProcessCalendar, openProcessDeclarations, openProcessInstances, openProcessMessageSend, openProcessMessages, openProcessModeling, openProcessRun, openProcessSchedule, openProcessVariables, processLifecycleReasonText, processTimerText } from '/js/modules/flows-builder/process-monitor.js';
-import { openProcessSimulation } from '/js/modules/flows-builder/process-simulation.js';
+import { openProcessSimulation, resumeProcessSimulation } from '/js/modules/flows-builder/process-simulation.js';
 import { openProcessImportReview } from '/js/modules/flows-builder/process-import.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
 import '/js/components/tf-input.js';
@@ -318,6 +318,8 @@ const FlowBuilderScreen = {
       const { response, xml, loaded } = this._review;
       this._openImportReview(state, response, xml, loaded);
     }
+    // A run a language switch closed comes back as it was, for the same process only.
+    if (state.mode === 'bpmn') void resumeProcessSimulation(state.flowId);
 
     this._bindMinimap(state);
 

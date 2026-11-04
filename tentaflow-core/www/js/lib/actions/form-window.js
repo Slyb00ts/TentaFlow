@@ -37,12 +37,13 @@ const describeError = (err) => String(err?.message || '').trim() || t('error_gen
  * with `undo` the window ends in an "Undo" toast, with only `message` in a plain
  * one. A rejection is shown inside the window (`errorMessage(err)` may turn a
  * typed server error into text; otherwise `err.message` is used).
+ * `busyLabel` replaces the generic "saving" text on the submit button while the request runs.
  * `anchor` is the element focus returns to when the window closes.
  */
 export function openFormWindow({
   title, icon, subject, note = null, width = 560, sections = [], fields = [],
   validate = null, collect, canSubmit = null, submitLabel, submitVariant = 'primary',
-  submitIcon = 'check', onSubmit, errorMessage = describeError, anchor = null,
+  submitIcon = 'check', busyLabel = null, onSubmit, errorMessage = describeError, anchor = null,
 }) {
   const win = document.createElement('tf-window');
   win.setAttribute('title', title);
@@ -86,7 +87,7 @@ export function openFormWindow({
     body.toggleAttribute('inert', on);
     body.setAttribute('aria-busy', String(on));
     cancelBtn.toggleAttribute('disabled', on);
-    submitBtn.setAttribute('label', on ? t('saving') : submitLabel);
+    submitBtn.setAttribute('label', on ? (busyLabel ?? t('saving')) : submitLabel);
     syncSubmit();
   };
 

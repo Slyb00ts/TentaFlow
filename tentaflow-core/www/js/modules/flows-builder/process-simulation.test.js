@@ -19,21 +19,25 @@ globalThis.fetch = (url, options) => {
 const { I18n } = await import('../../i18n.js');
 const { ApiBinary } = await import('../../protocol/api-binary-shim.js');
 const { emptyProcessModel, processExplainError } = await import('./bpmn.js');
-const { simulationWindow, openProcessSimulation } = await import('./process-simulation.js');
-const { SERVICE_OUTCOMES, readServiceAnswer, readServiceFixtures, simulationServiceOutcomes, simulationServiceSteps, simulationWaitSteps } = await import('./simulation-service.js');
+const { simulationWindow, openProcessSimulation, resumeProcessSimulation, simulationErrorText } = await import('./process-simulation.js');
+const { TfWindow } = await import('../../components/tf-window.js');
+const { TfToast } = await import('../../components/tf-toast.js');
+const { OUTPUTS_MAX_KIB, SERVICE_OUTCOMES, readOutputs, readServiceAnswer, readServiceFixtures, simulationServiceOutcomes, simulationServiceSteps, simulationWaitSteps } = await import('./simulation-service.js');
 localStorage.setItem('tentaflow_lang', 'en');
 await I18n.init();
 
 const calls = [];
 let responder = () => { throw new Error('no responder'); };
 // The language switch and the release of a closed window are not under test.
-const SILENT = ['mePreferencesUpdateRequest', 'processSimulationReleaseRequest'];
+const releases = [];
 ApiBinary.one = async (kind, payload) => {
-  if (SILENT.includes(kind)) return {};
+  if (kind === 'mePreferencesUpdateRequest') return {};
+  if (kind === 'processSimulationReleaseRequest') { releases.push(payload.simulationId); return {}; }
   calls.push({ kind, payload: structuredClone(payload) });
   return responder(kind, payload);
 };
 ApiBinary.action = ApiBinary.one;
+const deferred = () => { let resolve; const promise = new Promise((yes) => { resolve = yes; }); return { promise, resolve }; };
 const flush = async (count = 5) => { for (let i = 0; i < count; i += 1) await new Promise((resolve) => setTimeout(resolve, 0)); };
 const click = (element) => { assert.ok(element, 'the actual control exists'); element.dispatchEvent(new MouseEvent('click', { bubbles: true })); };
 const change = (control, value) => { control.value = value; control.dispatchEvent(new CustomEvent('change', { bubbles: true, detail: { value } })); };
@@ -42,6 +46,8 @@ afterEach(async () => {
   document.body.replaceChildren();
   await flush(2);
   calls.length = 0;
+  releases.length = 0;
+  await I18n.setLanguage('en');
 });
 after(async () => { await window.happyDOM.close(); });
 
@@ -132,19 +138,28 @@ test('a waiting step shows its name and input, offers the outcomes its model all
   const win = simulationWindow(baseView({ serviceWaits: [
     wait(),
     wait({ jobId: 'job-2', nodeId: 'Checked', verdictApplicable: true, input: { other: true } }),
-    wait({ jobId: 'job-3', nodeId: 'Expr', mode: 'Fixture' }),
-  ] }), MODEL);
+    wait({ jobId: 'job-3', nodeId: 'Expr' }),
+    wait({ jobId: 'job-4', nodeId: 'Plain', mode: 'Fixture' }),
+  ] }), MODEL, { fixtures: new Map([['Plain', { nodeId: 'Plain', mode: 'Fixture',
+    result: { outcome: 'Completed', code: null, summary: 'prepared summary', outputs: { ready: 1 }, evidence: [] } }]]) });
   await flush(2);
   const articles = [...win.querySelectorAll('[data-simulation-wait]')];
-  assert.equal(win.querySelector('[data-simulation-waits] h3').textContent, 'Waiting for a result: 3 steps');
-  assert.deepEqual(articles.map((article) => article.querySelector('strong').textContent), ['Plain step', 'Checked step', 'Expression step']);
+  assert.equal(win.querySelector('[data-simulation-waits] h3').textContent, 'Waiting for a result: 4 steps');
+  assert.deepEqual(articles.map((article) => article.querySelector('strong').textContent), ['Plain step', 'Checked step', 'Expression step', 'Plain step']);
   assert.deepEqual(JSON.parse(articles[0].querySelector('[data-simulation-wait-input]').value), { seed: 7 });
   const outcomes = (article) => [...article.querySelectorAll('[data-answer-field="outcome"] option')].map((option) => option.value);
   assert.deepEqual(outcomes(articles[0]), ['Completed', 'Error']);
   assert.deepEqual(outcomes(articles[2]), ['Completed', 'Error', 'NeedsHuman', 'Cancelled']);
   assert.equal(articles[0].querySelector('[data-answer-field="verdict"]'), null);
   assert.ok(articles[1].querySelector('[data-answer-field="verdict"]'));
-  assert.match(articles[2].querySelector('tf-chip').textContent, /prepared result applies/);
+  assert.equal(articles[2].querySelector('[data-answer-field="outcome"]').getAttribute('hint'), I18n.t('bpmn.simulation_outcome_expression_hint'));
+  assert.equal(articles[0].querySelector('[data-answer-field="outcome"]').hasAttribute('hint'), false);
+  // A prepared step shows its values read-only: no form, no button to send anything.
+  assert.match(articles[3].querySelector('tf-chip').textContent, /prepared result applies/);
+  assert.equal(articles[3].querySelector('[data-simulation-resolve]'), null);
+  assert.equal(articles[3].querySelector('[data-answer-field]'), null);
+  assert.match(articles[3].querySelector('[data-simulation-prepared]').textContent, /prepared summary/);
+  assert.deepEqual(JSON.parse(articles[3].querySelector('[data-simulation-prepared-outputs]').value), { ready: 1 });
   assert.doesNotMatch(win.textContent, /job-\d/, 'jobs are never cited by id');
   const none = simulationWindow(baseView(), MODEL);
   assert.equal(none.querySelector('[data-simulation-waits]'), null);
@@ -204,7 +219,7 @@ test('a refusal from the engine is told in the author\'s words and the typed ans
   click(article.querySelector('[data-simulation-resolve]'));
   await flush(5);
   assert.equal(calls.length, 1);
-  assert.equal(win.querySelector('[data-error]').getAttribute('message'), 'The result for “Plain step” is not valid. Check the code, the summary and the outputs.');
+  assert.equal(win.querySelector('[data-error]').getAttribute('message'), I18n.t('bpmn.simulation_error_answer_invalid', { node: 'Plain step' }));
   const again = win.querySelector('[data-simulation-wait]');
   assert.equal(again.querySelector('[data-answer-field="summary"]').value, 'kept text');
   assert.equal(again.querySelector('[data-answer-field="outputs"]').value, '{"keep": true}');
@@ -213,8 +228,8 @@ test('a refusal from the engine is told in the author\'s words and the typed ans
 test('a verification task is decided with approved, a work task never sends it', async () => {
   responder = () => ({ view: baseView() });
   const tasks = [
-    { userTaskId: 'ut-v', nodeId: 'Plain', name: 'Check it', kind: 'Verification', instructions: '', canComplete: true },
-    { userTaskId: 'ut-w', nodeId: 'Plain', name: 'Do it', kind: 'Work', instructions: '', canComplete: true },
+    { userTaskId: 'ut-v', nodeId: 'Plain', name: 'Check it', kind: 'Verification', status: 'Open', instructions: '', canComplete: true },
+    { userTaskId: 'ut-w', nodeId: 'Plain', name: 'Do it', kind: 'Work', status: 'Open', instructions: '', canComplete: true },
   ];
   const win = simulationWindow(baseView({ userTasks: tasks }), MODEL);
   await flush(2);
@@ -337,4 +352,353 @@ test('agent steps and service steps with activity IO are refused in the author\'
   assert.equal(processExplainError('agent steps need the report sink; not simulated yet (Svc_2)', model),
     '“Ask agent” is run by an agent, which a simulation cannot run yet.');
   assert.match(processExplainError('UNBOUND_IMPLEMENTATION: service task Svc_1 has no implementation yet (imported from Camunda)', model), /Charge card/);
+});
+
+const gone = (win) => !win.isConnected || win._closing === true;
+const taskOf = (overrides = {}) => ({ userTaskId: 'ut-1', nodeId: 'Plain', name: 'Check it', kind: 'Verification', status: 'Open', instructions: '', canComplete: true, ...overrides });
+const event = (kind, nodeId = null, data = null, atMs = 1000) => ({ atMs, kind, nodeId, data });
+
+test('only an open task has buttons; a finished one is read-only with the decision the events carry', async () => {
+  const win = simulationWindow(baseView({
+    userTasks: [taskOf({ userTaskId: 'ut-done', status: 'Completed', name: 'Decided' }), taskOf({ userTaskId: 'ut-no', status: 'Completed', name: 'Refused' }),
+      taskOf({ userTaskId: 'ut-open', name: 'Pending' }), taskOf({ userTaskId: 'ut-cancel', status: 'Cancelled', kind: 'Work', name: 'Dropped' })],
+    events: [event('verification_approved', 'Plain', { user_task_id: 'ut-done' }), event('verification_rejected', 'Plain', { user_task_id: 'ut-no' })],
+  }), MODEL);
+  await flush(2);
+  assert.deepEqual([...win.querySelectorAll('[data-simulation-open-task]')].map((row) => row.dataset.simulationOpenTask), ['ut-open']);
+  assert.equal(win.querySelectorAll('[data-simulation-task]').length, 2, 'only the open verification has its two buttons');
+  const done = (id) => win.querySelector(`[data-simulation-done-task="${id}"]`);
+  assert.equal(done('ut-done').querySelector('tf-button'), null);
+  assert.equal(done('ut-done').querySelector('[data-simulation-decision]').dataset.simulationDecision, 'approved');
+  assert.equal(done('ut-no').querySelector('[data-simulation-decision]').dataset.simulationDecision, 'rejected');
+  assert.equal(done('ut-cancel').querySelector('[data-simulation-decision]'), null);
+  assert.match(done('ut-done').textContent, /Completed/);
+  assert.match(done('ut-cancel').textContent, /Cancelled/);
+  assert.equal(win.querySelectorAll('tf-button[data-simulation-decide]').length, 2);
+});
+
+test('a decision cannot be taken twice: the buttons go busy, and a task that finished meanwhile sends nothing', async () => {
+  const gate = deferred();
+  responder = () => gate.promise;
+  const win = simulationWindow(baseView({ userTasks: [taskOf()] }), MODEL);
+  await flush(2);
+  const approve = win.querySelector('[data-simulation-decide="true"]');
+  click(approve);
+  click(win.querySelector('[data-simulation-decide="true"]'));
+  click(win.querySelector('[data-simulation-decide="false"]'));
+  await flush(2);
+  assert.equal(calls.length, 1, 'the second and third press are dropped while the first is in flight');
+  gate.resolve({ view: baseView({ userTasks: [taskOf({ status: 'Completed' })], events: [event('verification_approved', 'Plain', { user_task_id: 'ut-1' })] }) });
+  await flush(5);
+  assert.equal(win.querySelector('[data-simulation-decide]'), null);
+  assert.equal(win.querySelector('[data-simulation-decision]').dataset.simulationDecision, 'approved');
+});
+
+test('incidents are shown in words with their cause, and a finished run cannot be advanced', async () => {
+  const incident = (code, message = '') => ({ incidentId: code, nodeId: 'Plain', nodeName: '', jobId: null, code, message, atMs: 1, canRetry: false, scopeId: 's' });
+  const view = (incidents, status = 'Incident') => baseView({ instance: { status }, incidents });
+  const text = async (incidents) => {
+    const win = simulationWindow(view(incidents), MODEL);
+    await flush(2);
+    const lines = [...win.querySelectorAll('[data-simulation-incident]')].map((alert) => alert.getAttribute('message'));
+    assert.equal(win.querySelector('[data-simulation-advance]').hasAttribute('disabled'), true, 'an incident ends the run');
+    win.remove();
+    return lines;
+  };
+  assert.deepEqual(await text([incident('HUMAN_REJECTED', 'the activity result was rejected by its verifier')]), ['Plain step: The verifier rejected the result. (HUMAN_REJECTED)']);
+  assert.deepEqual(await text([incident('UMOWA_ZLA')]), ['Plain step: The step reported the error code UMOWA_ZLA. (UMOWA_ZLA)']);
+  assert.deepEqual(await text([incident('SERVICE_ERROR')]), ['Plain step: The service step failed. (SERVICE_ERROR)']);
+  const [mapping] = await text([incident('TRANSITION_ERROR')]);
+  assert.match(mapping, /output mapping needs a value the result did not provide/);
+  assert.match((await text([incident('RESULT_EXPRESSION_ERROR')]))[0], /result expression of the step could not be evaluated/);
+  const win = simulationWindow(view([incident('VERIFICATION_FAILED', 'The simulation operator chose this verdict')]), MODEL);
+  await flush(2);
+  assert.doesNotMatch(win.querySelector('[data-simulation-incidents]').textContent, /simulation operator chose/, 'a known code is told in the platform\'s words, not the engine\'s');
+  assert.equal(win.querySelector('[data-simulation-status]').getAttribute('status'), 'err');
+  const running = simulationWindow(baseView({ instance: { status: 'Running' } }), MODEL);
+  assert.equal(running.querySelector('[data-simulation-incidents]'), null);
+  assert.equal(running.querySelector('[data-simulation-advance]').hasAttribute('disabled'), false);
+  for (const status of ['Completed', 'Cancelled', 'Error']) {
+    const done = simulationWindow(baseView({ instance: { status } }), MODEL);
+    assert.equal(done.querySelector('[data-simulation-advance]').hasAttribute('disabled'), true, status);
+  }
+});
+
+test('outputs are limited to what the engine keeps, in the service form, the fixture and the work task', async () => {
+  const limit = OUTPUTS_MAX_KIB * 1024;
+  const padded = (bytes) => JSON.stringify({ blob: 'x'.repeat(bytes - 11) });
+  assert.equal(new TextEncoder().encode(padded(limit)).length, limit);
+  assert.deepEqual(Object.keys(readOutputs(padded(limit))), ['value']);
+  assert.deepEqual(readOutputs(padded(limit + 1)).error, { key: 'simulation_outputs_too_large', values: { max: 240 } });
+  assert.deepEqual(readOutputs('x'.repeat(5 * 1024 * 1024)).error.key, 'simulation_outputs_too_large');
+  const manyKeys = JSON.stringify(Object.fromEntries(Array.from({ length: 129 }, (_, index) => [`k${index}`, 1])));
+  assert.equal(readOutputs(manyKeys).error.key, 'simulation_outputs_too_many_keys');
+  assert.equal(readServiceAnswer({ hasResultExpression: false }, { outcome: 'Completed', code: '', summary: '', outputs: padded(limit + 1), verdict: '' }).errors.outputs.key, 'simulation_outputs_too_large');
+
+  responder = () => ({ view: baseView() });
+  const win = simulationWindow(baseView({ serviceWaits: [wait()], userTasks: [taskOf({ kind: 'Work' })] }), MODEL);
+  await flush(2);
+  const article = win.querySelector('[data-simulation-wait]');
+  article.querySelector('[data-answer-field="outputs"]').value = padded(limit + 1);
+  click(article.querySelector('[data-simulation-resolve]'));
+  await flush(2);
+  assert.equal(calls.length, 0, 'nothing above the limit is sent');
+  assert.equal(article.querySelector('[data-answer-error="outputs"]').getAttribute('message'), 'The outputs are too large: at most 240 KiB.');
+
+  const work = win.querySelector('[data-simulation-open-task]');
+  work.querySelector('[data-simulation-output]').value = '[1]';
+  click(work.querySelector('[data-simulation-task]'));
+  await flush(2);
+  assert.equal(calls.length, 0);
+  assert.equal(work.querySelector('[data-task-error]').getAttribute('message'), I18n.t('bpmn.object_required'));
+  work.querySelector('[data-simulation-output]').value = '{bad';
+  click(work.querySelector('[data-simulation-task]'));
+  assert.equal(work.querySelector('[data-task-error]').getAttribute('message'), I18n.t('bpmn.json_invalid'));
+  work.querySelector('[data-simulation-output]').value = padded(limit + 1);
+  click(work.querySelector('[data-simulation-task]'));
+  assert.match(work.querySelector('[data-task-error]').getAttribute('message'), /at most 240 KiB/);
+  assert.equal(calls.length, 0);
+  assert.equal(win.querySelector('[data-error]').hidden, true, 'the problem is at the field, not in the window alert');
+  work.querySelector('[data-simulation-output]').value = '{"ok": 1}';
+  click(work.querySelector('[data-simulation-task]'));
+  await flush(3);
+  assert.deepEqual(calls[0].payload.outputs, { ok: 1 });
+
+  const form = await startWindow(MODEL);
+  const plain = form.querySelector('[data-fixture-step="Plain"]');
+  change(plain.querySelector('[data-fixture-mode]'), 'Fixture');
+  plain.querySelector('[data-answer-field="outputs"]').value = padded(limit + 1);
+  calls.length = 0;
+  click(form.querySelector('[data-act="submit"]'));
+  await flush(3);
+  assert.equal(calls.length, 0);
+  assert.match(plain.querySelector('[data-answer-error="outputs"]').getAttribute('message'), /at most 240 KiB/);
+});
+
+test('a message too big, a closed run and a vanished simulation are told in words', () => {
+  assert.equal(simulationErrorText('transport closed: message too big', MODEL), I18n.t('bpmn.simulation_error_too_big', { max: OUTPUTS_MAX_KIB }));
+  assert.equal(simulationErrorText('process instance revision conflict or closed instance', MODEL), I18n.t('bpmn.simulation_error_closed'));
+  assert.equal(simulationErrorText('simulation task is assigned to another actor', MODEL), I18n.t('bpmn.simulation_error_task_unavailable'));
+  assert.equal(simulationErrorText('protocol error NotFound: process resource not found', MODEL), I18n.t('bpmn.simulation_error_gone'));
+});
+
+test('Escape in the JSON editor stays in the editor, and Escape or Close on an open run asks before dropping it', async () => {
+  const seen = [];
+  const listener = (keyEvent) => seen.push(keyEvent.key);
+  document.addEventListener('keydown', listener);
+  const win = simulationWindow(baseView({ instance: { status: 'Waiting' }, serviceWaits: [wait()] }), MODEL);
+  await flush(2);
+  const editor = win.querySelector('[data-simulation-wait] [data-answer-field="outputs"]');
+  editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+  editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'a', bubbles: true }));
+  document.removeEventListener('keydown', listener);
+  assert.deepEqual(seen, ['a'], 'Escape from the editor never reaches the window');
+  assert.match(win.textContent, /Press Esc, then Tab, to leave the editor/);
+
+  const asked = [];
+  const confirmOriginal = TfWindow.confirm;
+  let answer = false;
+  TfWindow.confirm = async (options) => { asked.push(options); return answer; };
+  try {
+    win.close();
+    await flush(3);
+    assert.equal(asked.length, 1);
+    assert.equal(asked[0].cancelLabel, 'Keep it');
+    assert.equal(asked[0].confirmLabel, 'End simulation');
+    assert.equal(gone(win), false, 'declining keeps the run');
+    assert.equal(releases.length, 0);
+    answer = true;
+    win.close();
+    await flush(3);
+    assert.equal(gone(win), true);
+    const finished = simulationWindow(baseView({ instance: { status: 'Completed' } }), MODEL);
+    await flush(2);
+    finished.close();
+    await flush(3);
+    assert.equal(asked.length, 2, 'a finished run closes without a question');
+    assert.equal(gone(finished), true);
+    const explicit = simulationWindow(baseView({ instance: { status: 'Waiting' } }), MODEL);
+    await flush(2);
+    click(explicit.querySelector('[data-simulation-end]'));
+    await flush(3);
+    assert.equal(asked.length, 2, 'the End button is the explicit way out');
+    assert.equal(gone(explicit), true);
+  } finally {
+    TfWindow.confirm = confirmOriginal;
+  }
+});
+
+test('a language switch carries the run and the unsent drafts to the remounted screen, for the same process only', async () => {
+  const live = baseView({ instance: { status: 'Waiting' }, serviceWaits: [wait()] });
+  responder = (kind) => {
+    if (kind === 'processSimulationViewRequest') return { view: live };
+    throw new Error(`unexpected ${kind}`);
+  };
+  const open = async () => {
+    const win = simulationWindow(live, MODEL, { flowId: 'flow-1' });
+    await flush(2);
+    change(win.querySelector('[data-answer-field="summary"]'), 'half typed');
+    win.querySelector('[data-answer-field="outputs"]').value = '{"keep": 1}';
+    return win;
+  };
+  const first = await open();
+  await I18n.setLanguage('pl');
+  first.remove();
+  await flush(3);
+  const resumed = await resumeProcessSimulation('flow-1');
+  await flush(3);
+  assert.ok(resumed?.isConnected, 'the run comes back');
+  assert.equal(resumed.querySelector('[data-answer-field="summary"]').value, 'half typed');
+  assert.equal(resumed.querySelector('[data-answer-field="outputs"]').value, '{"keep": 1}');
+  assert.equal(resumed.querySelector('[data-simulation-resolve]').textContent.trim(), 'Wyślij wynik');
+  assert.equal(calls.filter((call) => call.kind === 'processSimulationViewRequest').length, 1);
+  assert.equal(releases.length, 0, 'a language switch releases nothing');
+  assert.equal(await resumeProcessSimulation('flow-1'), null, 'it is carried once');
+  resumed.remove();
+  await flush(3);
+  await I18n.setLanguage('en');
+
+  // The window may still be up when the new screen asks (the router closes it with an animation).
+  releases.length = 0;
+  const lingering = await open();
+  await I18n.setLanguage('pl');
+  const early = await resumeProcessSimulation('flow-1');
+  await flush(3);
+  assert.equal(early.querySelector('[data-answer-field="summary"]').value, 'half typed');
+  lingering.remove();
+  await flush(3);
+  assert.equal(releases.length, 0, 'the old window closing late releases nothing');
+  early.remove();
+  await flush(3);
+  await I18n.setLanguage('en');
+
+  // Another process mounts: the orphan is released, not shown.
+  releases.length = 0;
+  const second = simulationWindow(live, MODEL, { flowId: 'flow-1' });
+  await flush(2);
+  await I18n.setLanguage('pl');
+  second.remove();
+  await flush(3);
+  assert.equal(await resumeProcessSimulation('flow-2'), null);
+  await flush(2);
+  assert.equal(releases.length, 1);
+  await I18n.setLanguage('en');
+  // A plain close in the same language still releases the run.
+  const plain = simulationWindow(live, MODEL, { flowId: 'flow-1' });
+  await flush(2);
+  const before = releases.length;
+  plain.remove();
+  await flush(3);
+  assert.equal(releases.length, before + 1);
+});
+
+test('a result applied from a fixture is said to be prepared in the trace', async () => {
+  const fixtures = new Map([['Plain', { nodeId: 'Plain', mode: 'Fixture', result: { outcome: 'Completed', code: null, summary: '', outputs: {}, evidence: [] } }]]);
+  const view = baseView({ events: [event('service_result', 'Plain'), event('service_result', 'Expr')] });
+  const win = simulationWindow(view, MODEL, { fixtures });
+  await flush(2);
+  const lines = [...win.querySelectorAll('.fb-simulation-events li')].map((row) => row.textContent.replace(/\s+/g, ' ').trim());
+  assert.match(lines[0], /Prepared result applied · Plain step$/);
+  assert.match(lines[1], /Result from the operator · Expression step$/);
+});
+
+test('run state, task kind, event kinds and the clock are told in the interface language, unknown kinds by name', async () => {
+  const view = baseView({ instance: { status: 'Waiting' }, clock: { nowMs: Date.UTC(2026, 10, 4, 10, 0, 0), horizonMs: Date.UTC(2026, 10, 4, 11, 0, 0), stepIndex: 3 },
+    userTasks: [taskOf({ kind: 'Work' })], events: [event('instance_started'), event('service_queued', 'Plain'), event('verification_rejected', 'Plain'), event('incident', 'Plain'), event('brand_new_kind', 'Plain')] });
+  const win = simulationWindow(view, MODEL);
+  await flush(2);
+  const toolbar = win.querySelector('.fb-simulation-toolbar').textContent;
+  assert.match(toolbar, /Waiting/);
+  assert.doesNotMatch(toolbar, /\d{13}/, 'the clock is a date and time, not an epoch');
+  assert.match(toolbar, /2026/);
+  assert.match(toolbar, /step 3/);
+  assert.match(win.querySelector('.fb-simulation-task').textContent, /Work/);
+  const lines = [...win.querySelectorAll('.fb-simulation-events li')].map((row) => row.textContent.replace(/\s+/g, ' ').trim());
+  assert.ok(lines[0].endsWith('Run started'));
+  assert.ok(lines[1].endsWith('Service step queued · Plain step'));
+  assert.ok(lines[2].endsWith('Verification rejected · Plain step'));
+  assert.ok(lines[3].endsWith('Incident raised · Plain step'));
+  assert.ok(lines[4].endsWith('brand_new_kind · Plain step'));
+  await I18n.setLanguage('pl');
+  try {
+    const polish = simulationWindow(view, MODEL);
+    await flush(2);
+    const text = polish.textContent;
+    assert.match(text, /Czeka/);
+    assert.match(text, /Praca/);
+    assert.match(text, /Uruchomiono przebieg/);
+    assert.match(text, /Krok usługi w kolejce/);
+    assert.match(text, /Weryfikacja odrzucona/);
+    assert.doesNotMatch(text, /service_queued|instance_started|Waiting|Running/);
+  } finally {
+    await I18n.setLanguage('en');
+  }
+});
+
+test('a verdict is asked for only where it can matter, and a verdict the engine still wants is shown at its field', async () => {
+  const model = serviceModel([
+    ['Checked', 'Checked step', serviceTask({ verification: { Critic: { agentId: 'a', criteria: 'x', onFailure: 'Error' } }, resultExpression: "{'outcome':'Completed','code':null,'summary':'','outputs':{},'evidence':[]}" })],
+    ['Plain', 'Plain step', serviceTask({ verification: { Test: { flowId: 't', onFailure: 'Error' } } })],
+  ]);
+  responder = () => { throw new Error('SIMULATION_VERDICT_REQUIRED: Checked has a machine verification and needs a verdict for a completed result'); };
+  const win = simulationWindow(baseView({ serviceWaits: [
+    wait({ jobId: 'job-a', nodeId: 'Plain', verdictApplicable: true }), wait({ jobId: 'job-b', nodeId: 'Checked', verdictApplicable: true })] }), model);
+  await flush(2);
+  const [plain, expression] = [...win.querySelectorAll('[data-simulation-wait]')];
+  const shown = (article) => !article.querySelector('[data-answer-verdict]').hidden;
+  assert.equal(shown(plain), true);
+  change(plain.querySelector('[data-answer-field="outcome"]'), 'Error');
+  assert.equal(shown(plain), false, 'a failed result never reaches the check');
+  change(plain.querySelector('[data-answer-field="outcome"]'), 'Completed');
+  assert.equal(shown(plain), true);
+  change(expression.querySelector('[data-answer-field="outcome"]'), 'Error');
+  assert.equal(shown(expression), true, 'with an expression the engine decides the outcome');
+  click(expression.querySelector('[data-simulation-resolve]'));
+  await flush(5);
+  const after = win.querySelector('[data-simulation-wait="job-b"]');
+  const alert = after.querySelector('[data-answer-error="verdict"]');
+  assert.equal(alert.hidden, false);
+  assert.equal(alert.getAttribute('message'), I18n.t('bpmn.simulation_verdict_required'));
+});
+
+test('the start window lists the steps it cannot simulate with the reason, scrolls to a bad field and names its busy state', async () => {
+  const model = serviceModel([
+    ['Plain', 'Plain step', serviceTask()],
+    ['Agent', 'Agent step', serviceTask({ implementation: { Agent: { agentId: 'a-1' } } })],
+    ['WithIo', 'Io step', serviceTask(), { activityIo: { dataOutputs: [{ id: 'o' }] } }],
+    ['Unbound', 'Unbound step', serviceTask({ implementation: { Unbound: { origin: 'x' } } })],
+  ]);
+  const gate = deferred();
+  responder = () => gate.promise;
+  const toasts = [];
+  const showOriginal = TfToast.show;
+  TfToast.show = (options) => { toasts.push(options); };
+  const form = await startWindow(model);
+  const notes = [...form.querySelectorAll('[data-fixture-unsupported]')];
+  assert.deepEqual(notes.map((note) => note.dataset.fixtureUnsupported), ['Agent', 'WithIo', 'Unbound']);
+  assert.match(notes[0].textContent, /run by an agent/);
+  assert.match(notes[1].textContent, /data inputs or outputs/);
+  assert.match(notes[2].textContent, /no implementation yet/);
+  assert.deepEqual([...form.querySelectorAll('[data-fixture-step]')].map((row) => row.dataset.fixtureStep), ['Plain']);
+  const scrolled = [];
+  const original = window.HTMLElement.prototype.scrollIntoView;
+  window.HTMLElement.prototype.scrollIntoView = function scroll() { scrolled.push(this.dataset.answerError); };
+  try {
+    const plain = form.querySelector('[data-fixture-step="Plain"]');
+    change(plain.querySelector('[data-fixture-mode]'), 'Fixture');
+    plain.querySelector('[data-answer-field="outputs"]').value = '{bad';
+    click(form.querySelector('[data-act="submit"]'));
+    await flush(3);
+    assert.deepEqual(scrolled, ['outputs'], 'the first bad field is brought into view');
+    plain.querySelector('[data-answer-field="outputs"]').value = '{}';
+    click(form.querySelector('[data-act="submit"]'));
+    await flush(3);
+    assert.equal(form.querySelector('[data-act="submit"]').getAttribute('label'), 'Starting…');
+  } finally {
+    window.HTMLElement.prototype.scrollIntoView = original;
+    gate.resolve({ view: baseView() });
+    await flush(3);
+  }
+  TfToast.show = showOriginal;
+  assert.deepEqual(toasts, [], 'starting leaves no toast behind to go stale in another language');
 });
