@@ -2020,6 +2020,64 @@ pub struct ProcessSimulationTraceStep {
     pub data: Value,
 }
 
+/// How a simulated Service step gets its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ProcessSimulationServiceMode {
+    /// The step waits until the operator resolves it.
+    #[default]
+    Result,
+    /// The step takes its prepared result when the simulation advances.
+    Fixture,
+    /// The step would really run its flow, agent, tool or block. Needs the
+    /// explicit confirmation of side effects and costs, and is refused by the
+    /// error code `SIMULATION_REAL_EXECUTION_UNSUPPORTED`.
+    RealExecution,
+}
+
+/// The verdict a simulation operator gives for a Test or Critic verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProcessSimulationVerdict {
+    Approved,
+    Rejected,
+    Unavailable,
+}
+
+/// A prepared answer for one Service step, given when the simulation starts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSimulationServiceFixture {
+    pub node_id: String,
+    #[serde(default)]
+    pub mode: ProcessSimulationServiceMode,
+    /// Required for `Fixture`, absent for the other modes.
+    #[serde(default)]
+    pub result: Option<ActivityResult>,
+    /// Required for `Fixture` on a step with a Test or Critic verification whose
+    /// result completes.
+    #[serde(default)]
+    pub verdict: Option<ProcessSimulationVerdict>,
+    /// The operator's acknowledgement that a real execution has side effects and
+    /// costs. Only meaningful for `RealExecution`.
+    #[serde(default)]
+    pub confirm_side_effects: bool,
+}
+
+/// A Service step waiting in a simulation for its result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSimulationServiceWait {
+    pub job_id: String,
+    pub node_id: String,
+    pub scope_id: String,
+    pub token_id: String,
+    /// The input the step would have been given.
+    pub input: Value,
+    pub mode: ProcessSimulationServiceMode,
+    /// The step has a Test or Critic verification: a result that completes needs
+    /// a verdict from the operator.
+    pub verdict_applicable: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessSimulationView {
@@ -2033,6 +2091,9 @@ pub struct ProcessSimulationView {
     pub events: Vec<ProcessSimulationEvent>,
     pub trace_steps: Vec<ProcessSimulationTraceStep>,
     pub activity_io_witnesses: Vec<Value>,
+    /// Service steps waiting for a result, oldest first.
+    #[serde(default)]
+    pub service_waits: Vec<ProcessSimulationServiceWait>,
     /// Oldest events dropped from `events` to keep the response within one frame.
     #[serde(default)]
     pub events_omitted: u64,
@@ -2286,6 +2347,8 @@ pub enum ProcessPayload {
         start_ms: i64,
         horizon_ms: i64,
         tick_duration_ms: i64,
+        #[serde(default)]
+        service_fixtures: Vec<ProcessSimulationServiceFixture>,
     },
     SimulationStartResponse {
         view: ProcessSimulationView,
@@ -2306,6 +2369,9 @@ pub enum ProcessPayload {
         simulation_id: String,
         user_task_id: String,
         outputs: Value,
+        /// Decides a Verification task; absent for a Work task.
+        #[serde(default)]
+        approved: Option<bool>,
     },
     SimulationUserTaskCompleteResponse {
         view: ProcessSimulationView,
@@ -2322,6 +2388,18 @@ pub enum ProcessPayload {
     },
     SimulationReleaseResponse {
         simulation_id: String,
+    },
+    SimulationServiceResolveRequest {
+        simulation_id: String,
+        node_id: String,
+        result: ActivityResult,
+        /// Required when the step has a Test or Critic verification and the
+        /// result completes.
+        #[serde(default)]
+        verdict: Option<ProcessSimulationVerdict>,
+    },
+    SimulationServiceResolveResponse {
+        view: ProcessSimulationView,
     },
 }
 

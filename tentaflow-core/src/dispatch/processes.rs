@@ -149,6 +149,7 @@ fn simulation_view(view: simulation::SimulationView) -> Result<ProcessSimulation
                 data: step.data,
             })
             .collect(),
+        service_waits: view.service_waits,
         activity_io_witnesses: view
             .activity_io_witnesses
             .into_iter()
@@ -1041,6 +1042,7 @@ pub fn process_dispatch(
             start_ms,
             horizon_ms,
             tick_duration_ms,
+            service_fixtures,
         } => {
             let source = repository::capture_simulation_source(
                 pool,
@@ -1069,6 +1071,7 @@ pub fn process_dispatch(
                     .reserve_start(&source.input().org_id, &source.input().owner_user_id)
                     .map_err(error)?;
                 let mut store = simulation::SimulationStore::create(source).map_err(error)?;
+                store.set_service_fixtures(service_fixtures).map_err(error)?;
                 let source_pin = store.source().clone();
                 let authorization = repository::authorize_simulation_action(
                     pool,
@@ -1115,12 +1118,13 @@ pub fn process_dispatch(
             simulation_id,
             user_task_id,
             outputs,
+            approved,
         } => {
             let view = ctx
                 .state
                 .simulation_registry
                 .with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
-                    store.complete_user_task(authorization, user_task_id, outputs.clone())
+                    store.complete_user_task(authorization, user_task_id, outputs.clone(), *approved)
                 })
                 .map_err(error)?;
             P::SimulationUserTaskCompleteResponse {
@@ -1139,6 +1143,23 @@ pub fn process_dispatch(
                 })
                 .map_err(error)?;
             P::SimulationManualTaskAcknowledgeResponse {
+                view: simulation_view(view).map_err(error)?,
+            }
+        }
+        P::SimulationServiceResolveRequest {
+            simulation_id,
+            node_id,
+            result,
+            verdict,
+        } => {
+            let view = ctx
+                .state
+                .simulation_registry
+                .with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
+                    store.resolve_service(authorization, node_id, result.clone(), *verdict)
+                })
+                .map_err(error)?;
+            P::SimulationServiceResolveResponse {
                 view: simulation_view(view).map_err(error)?,
             }
         }
@@ -1181,6 +1202,7 @@ pub fn process_dispatch(
         | P::SimulationAdvanceResponse { .. }
         | P::SimulationUserTaskCompleteResponse { .. }
         | P::SimulationManualTaskAcknowledgeResponse { .. }
+        | P::SimulationServiceResolveResponse { .. }
         | P::SimulationReleaseResponse { .. } => {
             return Err(ProtocolError::bad_request(
                 "process responses are not accepted as requests",
@@ -1236,6 +1258,7 @@ register_request!("ProcessSimulationViewRequest");
 register_request!("ProcessSimulationAdvanceRequest");
 register_request!("ProcessSimulationUserTaskCompleteRequest");
 register_request!("ProcessSimulationManualTaskAcknowledgeRequest");
+register_request!("ProcessSimulationServiceResolveRequest");
 register_request!("ProcessSimulationReleaseRequest");
 
 #[cfg(test)]
@@ -1348,6 +1371,7 @@ mod tests {
             start_ms: 10_000,
             horizon_ms: 20_000,
             tick_duration_ms: 500,
+            service_fixtures: Vec::new(),
         };
         let P::SimulationStartResponse { view: first } = request(&ctx, start.clone()).await else {
             panic!("first private simulation start expected")
@@ -1698,6 +1722,7 @@ mod tests {
             start_ms: 10_000,
             horizon_ms: 20_000,
             tick_duration_ms: 500,
+            service_fixtures: Vec::new(),
         }
     }
 
@@ -1754,6 +1779,7 @@ mod tests {
                 simulation_id: view.simulation_id.clone(),
                 user_task_id: task_id,
                 outputs: json!({"answer": "yes"}),
+                approved: None,
             },
         )
         .await
@@ -1773,6 +1799,101 @@ mod tests {
             production_row_counts(&state),
             before,
             "a private run must not write a production process or audit row"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_simulated_service_step_waits_privately_and_no_production_worker_ever_sees_it() {
+        use tentaflow_protocol::processes::{
+            ActivityOutcome, ActivityResult, ActivityVerification, ProcessSimulationServiceFixture,
+            ProcessSimulationServiceMode,
+        };
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "simulation-service-owner");
+        let ctx = context(&state, &actor);
+        let flow_id = test_support::flow(&state.db, &actor, &test_support::graph("sim", None));
+        let published = save_and_publish(
+            &ctx,
+            test_support::service_model(&flow_id, ActivityVerification::Human),
+        )
+        .await;
+        let before = production_row_counts(&state);
+
+        // A real execution is refused at Start, before any private run is kept.
+        let mut real_start = simulation_start(&published.definition_id);
+        if let P::SimulationStartRequest { service_fixtures, .. } = &mut real_start {
+            *service_fixtures = vec![ProcessSimulationServiceFixture {
+                node_id: "Service".into(),
+                mode: ProcessSimulationServiceMode::RealExecution,
+                result: None,
+                verdict: None,
+                confirm_side_effects: true,
+            }];
+        }
+        let refused_real = refused(&ctx, real_start).await;
+        assert!(
+            refused_real.message.starts_with("SIMULATION_REAL_EXECUTION_UNSUPPORTED"),
+            "{}",
+            refused_real.message
+        );
+
+        let P::SimulationStartResponse { view } =
+            request(&ctx, simulation_start(&published.definition_id)).await
+        else {
+            panic!("private simulation start expected")
+        };
+        let mut view = view;
+        for _ in 0..4 {
+            if !view.service_waits.is_empty() {
+                break;
+            }
+            let P::SimulationAdvanceResponse { view: next } = request(
+                &ctx,
+                P::SimulationAdvanceRequest { simulation_id: view.simulation_id.clone() },
+            )
+            .await
+            else {
+                panic!("private simulation advance expected")
+            };
+            view = next;
+        }
+        assert_eq!(view.service_waits.len(), 1, "the Service step waits for an answer");
+        // The production queue holds nothing a worker could claim.
+        assert!(
+            repository::claim_job(&state.db, "production-worker", chrono::Utc::now().timestamp_millis())
+                .unwrap()
+                .is_none()
+        );
+        let P::SimulationServiceResolveResponse { view: resolved } = request(
+            &ctx,
+            P::SimulationServiceResolveRequest {
+                simulation_id: view.simulation_id.clone(),
+                node_id: "Service".into(),
+                result: ActivityResult {
+                    outcome: ActivityOutcome::Completed,
+                    code: None,
+                    summary: "answered".into(),
+                    outputs: json!({"variables": {"marker": "m"}}),
+                    evidence: Vec::new(),
+                },
+                verdict: None,
+            },
+        )
+        .await
+        else {
+            panic!("private simulation resolution expected")
+        };
+        assert!(resolved.service_waits.is_empty());
+        assert!(resolved.events.iter().any(|event| event.kind == "service_result"));
+        request(
+            &ctx,
+            P::SimulationReleaseRequest { simulation_id: view.simulation_id.clone() },
+        )
+        .await;
+        assert_eq!(
+            production_row_counts(&state),
+            before,
+            "a simulated Service answer must not write a production job, invocation or event"
         );
     }
 

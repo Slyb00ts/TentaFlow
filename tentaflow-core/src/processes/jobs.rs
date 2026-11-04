@@ -141,7 +141,7 @@ fn observed_tool_result(
 /// Decides the origin of a normalized result: anything the platform produced
 /// is `Platform`, an unexpressed success is `Envelope`, and only a
 /// `result_expression` can yield a `Contract` result.
-fn classify_result(
+pub(super) fn classify_result(
     result: ActivityResult,
     platform_error: bool,
     expression: Option<&str>,

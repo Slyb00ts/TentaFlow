@@ -51,6 +51,8 @@ const MAX_EVIDENCE: usize = 64;
 /// it would not fit the history budget of an observed result.
 pub(super) const BUDGET_REASON: &str =
     "the verdict does not fit the size an observed result may have";
+/// The justification stored with a verdict the simulation operator chose.
+const SIMULATED_VERDICT_REASON: &str = "The simulation operator chose this verdict";
 /// Reason of a work result recorded without its verifier having judged it.
 const INTERRUPTED_REASON: &str =
     "the verification was not started, or was interrupted before it gave a verdict";
@@ -281,6 +283,48 @@ fn verified(
     }
 }
 
+/// What a simulated verification made of a work result.
+pub(super) enum SimulatedVerification {
+    /// The step asks for no machine verdict on this result (a human or condition
+    /// verification, or a work that did not complete): it stands as it is.
+    NotApplicable(ObservedActivityResult),
+    /// A machine verification applies but the operator chose no verdict.
+    VerdictRequired,
+    /// The result after the operator's verdict, with the proof a machine decided.
+    Judged(ObservedActivityResult),
+}
+
+/// The simulation's counterpart of `finish_verified`: the operator's verdict
+/// takes the place of the test flow or critic run, and everything after it (the
+/// record, the final result, its origin) is the production construction.
+pub(super) fn simulated_verification(
+    verification: &ActivityVerification,
+    work: ObservedActivityResult,
+    verdict: Option<VerificationVerdict>,
+) -> SimulatedVerification {
+    let work = refuse_verdict_imitation(verification, work);
+    let Some((kind, reference, on_failure)) = verification.automatic() else {
+        return SimulatedVerification::NotApplicable(work);
+    };
+    if work.result.outcome != ActivityOutcome::Completed {
+        return SimulatedVerification::NotApplicable(work);
+    }
+    let Some(verdict) = verdict else {
+        return SimulatedVerification::VerdictRequired;
+    };
+    for (verdict, reason) in [
+        (verdict, SIMULATED_VERDICT_REASON),
+        (VerificationVerdict::Unavailable, BUDGET_REASON),
+    ] {
+        let record = VerificationRecord::new(kind, reference, verdict, reason, &work);
+        let observed = verified(work.clone(), record, on_failure);
+        if fits_budget(&observed) {
+            return SimulatedVerification::Judged(observed);
+        }
+    }
+    SimulatedVerification::NotApplicable(work)
+}
+
 /// How a verification flow's activity result reads as a verdict. Only a
 /// completed result approves; an error rejects; anything else is no verdict.
 fn flow_verdict(result: &ObservedActivityResult) -> (VerificationVerdict, String) {
@@ -363,6 +407,7 @@ pub(super) fn validate_record_on(
     job_id: &str,
     observed: &ObservedActivityResult,
     verification: &ActivityVerification,
+    mode: repository::ExecutionMode,
 ) -> Result<()> {
     let Some(record) = &observed.verification else {
         return Ok(());
@@ -384,7 +429,12 @@ pub(super) fn validate_record_on(
         expected == observed.result && origin == observed.origin,
         "the verified result differs from what its verdict makes of the work"
     );
-    if kind == VerificationKind::Critic && record.verdict != VerificationVerdict::Unavailable {
+    // A simulated critic has no agent run behind its verdict; the operator's
+    // choice is the whole proof.
+    if kind == VerificationKind::Critic
+        && record.verdict != VerificationVerdict::Unavailable
+        && mode == repository::ExecutionMode::Durable
+    {
         let invocation_id: String = tx.query_row(
             "SELECT invocation_id FROM bpmn_service_invocations WHERE job_id=?1",
             [job_id],

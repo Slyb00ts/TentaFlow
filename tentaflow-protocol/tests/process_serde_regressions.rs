@@ -323,6 +323,7 @@ fn simulation_payloads_round_trip_by_variant_name_through_json_and_cbor() {
             request_sha256: "b".repeat(64), result_sha256: "c".repeat(64), data: json!({}),
         }],
         activity_io_witnesses: vec![json!({"phase": "output_applied"})],
+        service_waits: Vec::new(),
         events_omitted: 7,
         trace_steps_omitted: 3,
     };
@@ -330,11 +331,18 @@ fn simulation_payloads_round_trip_by_variant_name_through_json_and_cbor() {
         json!({"SimulationStartRequest": {"definition_id": "definition-1", "version": 3,
             "selected_process_id": "Process_1", "start_node_id": "Start_1",
             "variables": {"value": null}, "start_ms": 1_000, "horizon_ms": 9_000,
-            "tick_duration_ms": 100}}),
+            "tick_duration_ms": 100, "service_fixtures": [{"node_id": "Service_1",
+                "mode": "Fixture", "result": {"outcome": "Completed", "code": null,
+                    "summary": "prepared", "outputs": {"answer": 1}, "evidence": []},
+                "verdict": "Approved", "confirm_side_effects": false}]}}),
+        json!({"SimulationServiceResolveRequest": {"simulation_id": "simulation-1",
+            "node_id": "Service_1", "result": {"outcome": "Error", "code": "FLOW_ERROR",
+                "summary": "failed", "outputs": null, "evidence": []}, "verdict": null}}),
+        json!({"SimulationServiceResolveResponse": {"view": serde_json::to_value(&view).unwrap()}}),
         json!({"SimulationViewRequest": {"simulation_id": "simulation-1"}}),
         json!({"SimulationAdvanceRequest": {"simulation_id": "simulation-1"}}),
         json!({"SimulationUserTaskCompleteRequest": {"simulation_id": "simulation-1",
-            "user_task_id": "task-1", "outputs": {"decision": "yes"}}}),
+            "user_task_id": "task-1", "outputs": {"decision": "yes"}, "approved": true}}),
         json!({"SimulationManualTaskAcknowledgeRequest": {"simulation_id": "simulation-1",
             "user_task_id": "task-1"}}),
         json!({"SimulationReleaseRequest": {"simulation_id": "simulation-1"}}),
@@ -370,4 +378,35 @@ fn simulation_view_without_omitted_counts_decodes_with_zero_defaults() {
     });
     let view: ProcessSimulationView = serde_json::from_value(legacy).unwrap();
     assert_eq!((view.events_omitted, view.trace_steps_omitted), (0, 0));
+}
+
+#[test]
+fn simulation_requests_from_before_service_support_decode_with_empty_defaults() {
+    use tentaflow_protocol::processes::{ProcessPayload, ProcessSimulationView};
+
+    let start: ProcessPayload = serde_json::from_value(json!({"SimulationStartRequest": {
+        "definition_id": "definition-1", "version": 3, "selected_process_id": "Process_1",
+        "start_node_id": "Start_1", "variables": {}, "start_ms": 1, "horizon_ms": 9,
+        "tick_duration_ms": 1}}))
+    .unwrap();
+    assert!(matches!(start, ProcessPayload::SimulationStartRequest { service_fixtures, .. }
+        if service_fixtures.is_empty()));
+    let complete: ProcessPayload = serde_json::from_value(json!({
+        "SimulationUserTaskCompleteRequest": {"simulation_id": "s", "user_task_id": "t",
+            "outputs": {}}}))
+    .unwrap();
+    assert!(matches!(complete, ProcessPayload::SimulationUserTaskCompleteRequest {
+        approved: None, .. }));
+    let view: ProcessSimulationView = serde_json::from_value(json!({
+        "simulation_id": "simulation-1",
+        "source": {"simulation_id": "simulation-1", "definition_id": "definition-1",
+            "version": 3, "model_sha256": "a".repeat(64),
+            "selected_process_id": "Process_1", "start_node_id": "Start_1"},
+        "clock": {"start_ms": 1, "now_ms": 1, "horizon_ms": 9, "tick_duration_ms": 1,
+            "step_index": 0, "revision": 1},
+        "instance": null, "user_tasks": [], "timers": [], "incidents": [],
+        "events": [], "trace_steps": [], "activity_io_witnesses": [],
+    }))
+    .unwrap();
+    assert!(view.service_waits.is_empty());
 }

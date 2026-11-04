@@ -22,7 +22,7 @@ use tentaflow_protocol::processes::{
     ProcessTimerStatus, ProcessUserTaskStatus,
 };
 
-fn linear_activity_model(kind: ProcessNodeKind) -> tentaflow_protocol::processes::ProcessModel {
+pub(super) fn linear_activity_model(kind: ProcessNodeKind) -> tentaflow_protocol::processes::ProcessModel {
     let mut model = starter_model();
     model.nodes.insert(
         1,
@@ -445,7 +445,7 @@ fn configured_script_input_model() -> tentaflow_protocol::processes::ProcessMode
     model
 }
 
-fn source_input_for(model: tentaflow_protocol::processes::ProcessModel) -> SimulationSourceInput {
+pub(super) fn source_input_for(model: tentaflow_protocol::processes::ProcessModel) -> SimulationSourceInput {
     let model_json = serde_json::to_string(&model).expect("simulation model serializes");
     let model_sha256 = hex::encode(Sha256::digest(model_json.as_bytes()));
     SimulationSourceInput {
@@ -470,11 +470,11 @@ fn source_input() -> SimulationSourceInput {
     source_input_for(script_model())
 }
 
-fn create_store(input: SimulationSourceInput) -> anyhow::Result<SimulationStore> {
+pub(super) fn create_store(input: SimulationSourceInput) -> anyhow::Result<SimulationStore> {
     SimulationStore::create(AuthenticatedSimulationSource::from_test(input))
 }
 
-fn test_authorization(store: &SimulationStore) -> AuthenticatedSimulationAction {
+pub(super) fn test_authorization(store: &SimulationStore) -> AuthenticatedSimulationAction {
     let source = store.source();
     AuthenticatedSimulationAction::for_test(
         source,
@@ -485,7 +485,7 @@ fn test_authorization(store: &SimulationStore) -> AuthenticatedSimulationAction 
     )
 }
 
-fn reopen_store(
+pub(super) fn reopen_store(
     database: SimulationDatabase,
     simulation_id: &str,
     actor: ProcessActor,
@@ -611,6 +611,7 @@ fn retained_registry_footprints(
                     test_authorization(&store),
                     &task_id,
                     json!({"decision": "approved"}),
+                    None,
                 )?;
             }
             2 => {
@@ -721,7 +722,7 @@ fn simulation_private_schema_initializes_without_global_pool_or_scheduler() {
             |row| row.get(0),
         )
         .expect("read private schema table count");
-    assert_eq!(table_count, 6);
+    assert_eq!(table_count, 7);
     simulation_schema::initialize(&connection).expect("reopen private schema");
 }
 
@@ -1371,6 +1372,7 @@ fn simulation_timer_catch_does_not_block_parallel_work_before_its_due_time() {
             test_authorization(&store),
             &task_id,
             json!({"answer":"approved"}),
+            None,
         )
         .expect("complete normal Work branch while timer waits");
     assert_eq!(completed.timers[0].status, ProcessTimerStatus::Pending);
@@ -1724,6 +1726,7 @@ fn simulation_user_task_reopens_with_ordered_missing_present_null_inputs() {
             test_authorization(&store),
             &task_id,
             json!({"decision": "yes"}),
+            None,
         )
         .expect("complete user task");
     assert!(completed
@@ -1843,6 +1846,7 @@ fn simulation_writer_rolls_back_every_transition_row_on_late_command_conflict() 
             test_authorization(&reopened),
             &task_id,
             json!({"decision": "yes"}),
+            None,
         )
         .expect_err("duplicate command must roll back the transition");
     assert!(format!("{error:#}").contains("simulation_commands"));
@@ -1921,17 +1925,6 @@ fn simulation_source_pin_is_immutable_after_capture() {
         },
     )
     .expect("reopen unchanged source pin");
-}
-
-#[test]
-fn simulation_service_refuses_before_claim_dispatch_and_result() {
-    let error = create_store(source_input_for(service_model()))
-        .expect_err("ServiceTask must be rejected by the initial profile");
-    let message = format!("{error:#}");
-    assert!(
-        message.contains("ServiceTask is unsupported in simulation"),
-        "{message}"
-    );
 }
 
 #[test]
@@ -2353,7 +2346,7 @@ fn simulation_parallel_join_completes_when_each_branch_arrives_in_its_own_reques
     let mut store = reopen_store(store.into_database(), &simulation_id, actor())
         .expect("reopen after Start");
     store
-        .complete_user_task(test_authorization(&store), &task_id, json!({"answer": "ok"}))
+        .complete_user_task(test_authorization(&store), &task_id, json!({"answer": "ok"}), None)
         .expect("the Work branch reaches the join in its own request");
     let mut completed = false;
     for _ in 0..4 {

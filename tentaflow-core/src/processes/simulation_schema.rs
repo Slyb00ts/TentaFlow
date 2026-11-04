@@ -3,7 +3,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use rusqlite::Connection;
 
-pub const SIMULATION_SCHEMA_VERSION: i64 = 2;
+pub const SIMULATION_SCHEMA_VERSION: i64 = 3;
 
 const EXPECTED_TABLES: &[&str] = &[
     "simulation_schema_meta",
@@ -12,6 +12,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "simulation_clock",
     "simulation_commands",
     "simulation_trace_steps",
+    "simulation_service_fixtures",
 ];
 
 const EXPECTED_PROCESS_TABLES: &[&str] = &[
@@ -32,12 +33,12 @@ const EXPECTED_PROCESS_TABLES: &[&str] = &[
 
 const SCHEMA_DDL: &str = r#"
 CREATE TABLE simulation_schema_meta (
-    schema_version INTEGER PRIMARY KEY CHECK(schema_version = 2)
+    schema_version INTEGER PRIMARY KEY CHECK(schema_version = 3)
 );
 CREATE TABLE simulation_meta (
     simulation_id TEXT PRIMARY KEY CHECK(length(simulation_id) = 36),
     scenario_sha256 TEXT NOT NULL CHECK(length(scenario_sha256) = 64 AND scenario_sha256 NOT GLOB '*[^0-9a-f]*'),
-    profile TEXT NOT NULL CHECK(profile = 'script_user_manual'),
+    profile TEXT NOT NULL CHECK(profile IN ('script_user_manual','script_user_manual_service')),
     org_id TEXT NOT NULL,
     actor_user_id TEXT NOT NULL,
     definition_id TEXT NOT NULL,
@@ -96,6 +97,15 @@ CREATE TABLE simulation_trace_steps (
     result_sha256 TEXT NOT NULL CHECK(length(result_sha256) = 64 AND result_sha256 NOT GLOB '*[^0-9a-f]*'),
     data_json TEXT NOT NULL CHECK(json_valid(data_json) AND length(CAST(data_json AS BLOB)) <= 4194304),
     UNIQUE(simulation_id, ordinal)
+);
+CREATE TABLE simulation_service_fixtures (
+    simulation_id TEXT NOT NULL REFERENCES simulation_meta(simulation_id) ON DELETE CASCADE,
+    node_id TEXT NOT NULL CHECK(length(node_id) > 0),
+    mode TEXT NOT NULL CHECK(mode IN ('result','fixture')),
+    result_json TEXT CHECK(result_json IS NULL OR json_valid(result_json)),
+    verdict TEXT CHECK(verdict IS NULL OR verdict IN ('approved','rejected','unavailable')),
+    CHECK((mode = 'fixture') = (result_json IS NOT NULL)),
+    PRIMARY KEY(simulation_id, node_id)
 );
 CREATE INDEX idx_simulation_commands_order
     ON simulation_commands(simulation_id, at_ms, command_id);

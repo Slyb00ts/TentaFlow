@@ -13,27 +13,36 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tentaflow_protocol::processes::{
-    ProcessIncident, ProcessInstance, ProcessInstanceStatus, ProcessModel, ProcessNodeKind,
-    ProcessTimerSpec, ProcessTimerStatus, ProcessTimerSummary, ProcessUserTask,
-    ProcessUserTaskKind,
+    ActivityOutcome, ActivityResult, ProcessIncident, ProcessInstance,
+    ProcessInstanceStatus, ProcessModel, ProcessNode, ProcessNodeKind,
+    ProcessSimulationServiceFixture, ProcessSimulationServiceMode, ProcessSimulationServiceWait,
+    ProcessSimulationVerdict, ProcessTimerSpec, ProcessTimerStatus, ProcessTimerSummary,
+    ProcessSubscriptionKind, ProcessUserTask, ProcessUserTaskKind, ServiceImplementation,
 };
 use uuid::Uuid;
 
 use super::model::{selected_body, validate_model, validate_variables};
+use super::jobs::classify_result;
 use super::repository::{
     self, AcceptedInputRef, ActivityIoInputFact, ActivityIoWitness, DueTimer, GatewayReceipt,
-    ProcessActor, ProcessToken, RuntimePlan, RuntimeSnapshot, StartInputRef, TimerSnapshot,
+    ObservedActivityResult, ProcessActor, ProcessJob, ProcessToken, RuntimePlan, RuntimeSnapshot,
+    StartInputRef, TimerSnapshot,
 };
 use super::runtime::{
-    plan_advance_with_id_source, plan_manual_acknowledgment_with_id_source,
-    plan_start_with_id_source, plan_user_completion_with_id_source, RuntimeIdSource,
-    RuntimeIdSourceHandle, StartCause,
+    plan_advance_with_id_source, plan_job_result_with_id_source,
+    plan_manual_acknowledgment_with_id_source, plan_start_with_id_source,
+    plan_user_completion_with_id_source, RuntimeIdSource, RuntimeIdSourceHandle, StartCause,
 };
+use super::verification::{simulated_verification, SimulatedVerification, VerificationVerdict};
 
 use super::simulation_schema;
 use crate::db::DbPool;
 
 const PROFILE_NAME: &str = "script_user_manual";
+// A model with Service tasks is a different profile: its runs wait for answers
+// that nothing in the private database can produce by itself.
+const SERVICE_PROFILE_NAME: &str = "script_user_manual_service";
+const MAX_SERVICE_FIXTURES: usize = 256;
 const MAX_ACL_BYTES: usize = 256 * 1024;
 const MAX_JSON_BYTES: usize = 256 * 1024;
 const MAX_TRACE_BYTES: usize = 4 * 1024 * 1024;
@@ -1210,7 +1219,6 @@ impl RuntimeIdSource for SimulationIdSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SimulationUnsupportedActivity {
-    ServiceTask { node_id: String },
     CallActivity { node_id: String },
     SubProcess { node_id: String },
     ExternalActivity { node_id: String, kind: String },
@@ -1221,9 +1229,6 @@ pub enum SimulationUnsupportedActivity {
 impl fmt::Display for SimulationUnsupportedActivity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ServiceTask { node_id } => {
-                write!(f, "ServiceTask is unsupported in simulation ({node_id})")
-            }
             Self::CallActivity { node_id } => {
                 write!(f, "CallActivity is unsupported in simulation ({node_id})")
             }
@@ -1245,6 +1250,41 @@ impl fmt::Display for SimulationUnsupportedActivity {
 
 impl std::error::Error for SimulationUnsupportedActivity {}
 
+pub const SERVICE_REAL_EXECUTION_UNSUPPORTED: &str = "SIMULATION_REAL_EXECUTION_UNSUPPORTED";
+pub const SERVICE_SIDE_EFFECTS_NOT_CONFIRMED: &str = "SIMULATION_SIDE_EFFECTS_NOT_CONFIRMED";
+pub const SERVICE_FIXTURE_INVALID: &str = "SIMULATION_FIXTURE_INVALID";
+pub const SERVICE_NOT_WAITING: &str = "SIMULATION_SERVICE_NOT_WAITING";
+pub const SERVICE_VERDICT_REQUIRED: &str = "SIMULATION_VERDICT_REQUIRED";
+
+/// A refusal of a Service step the operator can act on. The message starts with
+/// the stable `code`, which is what a caller keys on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SimulationServiceError {
+    pub code: &'static str,
+    pub detail: String,
+}
+
+impl SimulationServiceError {
+    fn new(code: &'static str, detail: impl Into<String>) -> anyhow::Error {
+        Self { code, detail: detail.into() }.into()
+    }
+}
+
+impl fmt::Display for SimulationServiceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code, self.detail)
+    }
+}
+
+impl std::error::Error for SimulationServiceError {}
+
+/// A prepared answer as the private database keeps it.
+#[derive(Debug, Clone, PartialEq)]
+struct StoredFixture {
+    result: Option<ActivityResult>,
+    verdict: Option<ProcessSimulationVerdict>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulationView {
     pub simulation_id: String,
@@ -1259,6 +1299,7 @@ pub struct SimulationView {
     pub events: Vec<SimulationEventView>,
     pub trace_steps: Vec<SimulationTraceStep>,
     pub activity_io_witnesses: Vec<ActivityIoWitness>,
+    pub service_waits: Vec<ProcessSimulationServiceWait>,
     pub events_omitted: u64,
     pub trace_steps_omitted: u64,
 }
@@ -1284,6 +1325,15 @@ pub struct SimulationTraceStep {
     pub request_sha256: String,
     pub result_sha256: String,
     pub data: Value,
+}
+
+/// One Service answer on its way into the private run.
+struct ServiceSettlement {
+    job_id: String,
+    result_event_id: String,
+    claim_event_id: String,
+    observed: ObservedActivityResult,
+    event_ids: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -1521,6 +1571,7 @@ impl SimulationStore {
             Some(accepted),
             None,
             None,
+            None,
         )?;
         self.view_authorized()
     }
@@ -1564,6 +1615,14 @@ impl SimulationStore {
                 revision: timer.revision,
                 due_at_ms,
             });
+        if due_timer.is_none() && !snapshot.tokens.iter().any(|token| token.status == "ready") {
+            if let Some((job, fixture)) = self.next_fixture_job(&snapshot)? {
+                let result = fixture
+                    .result
+                    .context("a prepared Service fixture lost its result")?;
+                return self.settle_service(snapshot, job, result, fixture.verdict, "fixture");
+            }
+        }
         let plan = if let Some(timer) = due_timer.as_ref() {
             let timer = snapshot
                 .timers
@@ -1594,6 +1653,7 @@ impl SimulationStore {
             None,
             None,
             due_timer.as_ref(),
+            None,
         )?;
         self.view_authorized()
     }
@@ -1603,6 +1663,7 @@ impl SimulationStore {
         authorization: AuthenticatedSimulationAction,
         task_id: &str,
         outputs: Value,
+        approved: Option<bool>,
     ) -> Result<SimulationView> {
         authorization.verify(&self.source, &self.actor)?;
         let snapshot = self
@@ -1617,10 +1678,16 @@ impl SimulationStore {
             task.can_complete,
             "simulation task is assigned to another actor"
         );
-        ensure!(
-            task.kind == ProcessUserTaskKind::Work,
-            "task is not a Work user task"
-        );
+        match (&task.kind, approved) {
+            (ProcessUserTaskKind::Work, None) | (ProcessUserTaskKind::Verification, Some(_)) => {}
+            (ProcessUserTaskKind::Work, Some(_)) => {
+                bail!("approved is only valid for verification tasks")
+            }
+            (ProcessUserTaskKind::Verification, None) => {
+                bail!("verification requires approved")
+            }
+            (ProcessUserTaskKind::Manual, _) => bail!("task is not a Work user task"),
+        }
         ensure!(
             self.acl
                 .permitted_user_ids
@@ -1631,8 +1698,9 @@ impl SimulationStore {
         let now = self.clock.next_time()?;
         self.prepare_ids();
         let command_id = self.next_id("command");
-        let request_hash =
-            hash_json(&json!({"action":"complete_user_task","task_id":task_id,"outputs":outputs}))?;
+        let request_hash = hash_json(
+            &json!({"action":"complete_user_task","task_id":task_id,"outputs":outputs,"approved":approved}),
+        )?;
         let accepted = AcceptedInputRef::Human {
             task_id: task_id.to_owned(),
             expected_task_revision: task.revision,
@@ -1644,7 +1712,7 @@ impl SimulationStore {
             &snapshot,
             task_id,
             &outputs,
-            None,
+            approved,
             now,
             accepted.clone(),
             None,
@@ -1658,6 +1726,7 @@ impl SimulationStore {
             now,
             Some(accepted),
             Some(outputs),
+            None,
             None,
         )?;
         self.view_authorized()
@@ -1722,8 +1791,354 @@ impl SimulationStore {
             Some(accepted),
             None,
             None,
+            None,
         )?;
         self.view_authorized()
+    }
+
+    /// Records the prepared answers for Service steps before the run starts. The
+    /// real-execution mode is modelled so a client can ask for it, but nothing
+    /// here can run a flow, agent, tool or block against the private database
+    /// without leaving it, so it is refused with its own code and never stored.
+    pub(crate) fn set_service_fixtures(
+        &mut self,
+        fixtures: &[ProcessSimulationServiceFixture],
+    ) -> Result<()> {
+        ensure!(
+            load_instance_id(&self.conn, &self.simulation_id)?.is_none(),
+            "service fixtures can only be set before the simulation starts"
+        );
+        ensure!(
+            fixtures.len() <= MAX_SERVICE_FIXTURES,
+            SimulationServiceError::new(SERVICE_FIXTURE_INVALID, "too many service fixtures")
+        );
+        let nodes = selected_body(&self.model, &self.source.selected_process_id, &[])?.nodes;
+        let mut seen = HashSet::new();
+        let mut rows = Vec::new();
+        for fixture in fixtures {
+            let node = nodes
+                .iter()
+                .find(|node| node.id == fixture.node_id)
+                .filter(|node| matches!(node.kind, ProcessNodeKind::ServiceTask { .. }))
+                .ok_or_else(|| {
+                    SimulationServiceError::new(
+                        SERVICE_FIXTURE_INVALID,
+                        format!("{} is not a Service task of this process", fixture.node_id),
+                    )
+                })?;
+            ensure!(
+                seen.insert(node.id.as_str()),
+                SimulationServiceError::new(
+                    SERVICE_FIXTURE_INVALID,
+                    format!("{} has more than one fixture", node.id),
+                )
+            );
+            match fixture.mode {
+                ProcessSimulationServiceMode::RealExecution => {
+                    ensure!(
+                        fixture.confirm_side_effects,
+                        SimulationServiceError::new(
+                            SERVICE_SIDE_EFFECTS_NOT_CONFIRMED,
+                            format!(
+                                "running {} for real has side effects and costs and needs an explicit confirmation",
+                                node.id
+                            ),
+                        )
+                    );
+                    return Err(SimulationServiceError::new(
+                        SERVICE_REAL_EXECUTION_UNSUPPORTED,
+                        format!(
+                            "{} cannot run for real: a simulation keeps every write in its private database and has no isolated executor for flows, agents, tools or blocks",
+                            node.id
+                        ),
+                    ));
+                }
+                ProcessSimulationServiceMode::Result => ensure!(
+                    fixture.result.is_none() && fixture.verdict.is_none(),
+                    SimulationServiceError::new(
+                        SERVICE_FIXTURE_INVALID,
+                        format!("{} waits for the operator and carries no prepared result", node.id),
+                    )
+                ),
+                ProcessSimulationServiceMode::Fixture => {
+                    let result = fixture.result.as_ref().ok_or_else(|| {
+                        SimulationServiceError::new(
+                            SERVICE_FIXTURE_INVALID,
+                            format!("{} is a fixture without a result", node.id),
+                        )
+                    })?;
+                    super::jobs::parse_contract_result(serde_json::to_value(result)?).map_err(
+                        |error| {
+                            SimulationServiceError::new(
+                                SERVICE_FIXTURE_INVALID,
+                                format!("the result of {} is invalid: {error:#}", node.id),
+                            )
+                        },
+                    )?;
+                }
+            }
+            rows.push(fixture);
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin simulation fixture transaction")?;
+        for fixture in rows {
+            let (mode, result_json) = match fixture.mode {
+                ProcessSimulationServiceMode::Fixture => {
+                    ("fixture", Some(json_string(&fixture.result)?))
+                }
+                _ => ("result", None),
+            };
+            tx.execute(
+                "INSERT INTO simulation_service_fixtures(simulation_id,node_id,mode,result_json,verdict) VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    self.simulation_id,
+                    fixture.node_id,
+                    mode,
+                    result_json,
+                    fixture.verdict.map(verdict_text),
+                ],
+            )?;
+        }
+        tx.commit().context("commit simulation fixtures")?;
+        Ok(())
+    }
+
+    /// Resolves the oldest queued job of a Service step with the operator's
+    /// answer. The answer goes through the production result pipeline, so a
+    /// `result_expression`, a verification and the boundary events of the step
+    /// decide what it means.
+    pub(crate) fn resolve_service(
+        &mut self,
+        authorization: AuthenticatedSimulationAction,
+        node_id: &str,
+        result: ActivityResult,
+        verdict: Option<ProcessSimulationVerdict>,
+    ) -> Result<SimulationView> {
+        authorization.verify(&self.source, &self.actor)?;
+        ensure!(
+            self.acl
+                .permitted_user_ids
+                .iter()
+                .any(|id| id == &self.actor.user_id),
+            "actor is outside the captured simulation ACL"
+        );
+        let snapshot = self
+            .load_snapshot()?
+            .context("simulation has not been started")?;
+        let job = snapshot
+            .jobs
+            .iter()
+            .find(|job| job.node_id == node_id && job.status == "queued")
+            .cloned()
+            .ok_or_else(|| {
+                SimulationServiceError::new(
+                    SERVICE_NOT_WAITING,
+                    format!("{node_id} is not waiting for a result"),
+                )
+            })?;
+        self.settle_service(snapshot, job, result, verdict, "operator")?;
+        self.view_authorized()
+    }
+
+    fn settle_service(
+        &mut self,
+        snapshot: RuntimeSnapshot,
+        job: ProcessJob,
+        result: ActivityResult,
+        verdict: Option<ProcessSimulationVerdict>,
+        source: &str,
+    ) -> Result<SimulationView> {
+        let expected_revision = snapshot.instance.revision;
+        let now = self.clock.next_time()?;
+        self.prepare_ids();
+        let node = repository::scope_node(
+            &snapshot.model,
+            &snapshot.instance.process_id,
+            &snapshot.scopes,
+            &job.instance_id,
+            &job.scope_id,
+            &job.node_id,
+        )?;
+        let ProcessNodeKind::ServiceTask {
+            result_expression,
+            verification,
+            ..
+        } = &node.kind
+        else {
+            bail!("simulation job node is not a Service task");
+        };
+        let effective = repository::effective_scope_variables(
+            &snapshot.scopes,
+            &snapshot.scope_variables,
+            &job.instance_id,
+            &snapshot.instance.variables,
+            &job.scope_id,
+        )?;
+        // An executor that failed is a platform error; anything else is what the
+        // step's own contract (its result expression) turns into a business result.
+        let platform_error = result.outcome == ActivityOutcome::Error;
+        let work = classify_result(
+            result.clone(),
+            platform_error,
+            result_expression.as_deref(),
+            &effective,
+            &[],
+        );
+        let observed = match simulated_verification(verification, work, verdict.map(machine_verdict))
+        {
+            SimulatedVerification::NotApplicable(observed)
+            | SimulatedVerification::Judged(observed) => observed,
+            SimulatedVerification::VerdictRequired => {
+                return Err(SimulationServiceError::new(
+                    SERVICE_VERDICT_REQUIRED,
+                    format!(
+                        "{} has a machine verification and needs a verdict for a completed result",
+                        job.node_id
+                    ),
+                ))
+            }
+        };
+        let command_id = self.next_id("command");
+        let result_event_id = self.next_id("service_result_event");
+        let claim_event_id = self.next_id("service_claim_event");
+        let running = repository::simulated_running_job(&job, &result_event_id);
+        let plan = plan_job_result_with_id_source(
+            &snapshot,
+            &running,
+            &observed,
+            false,
+            now,
+            None,
+            self.id_handle(),
+        )?;
+        let event_ids = (0..plan.events.len())
+            .map(|_| self.next_id("event"))
+            .collect::<Vec<_>>();
+        let request_hash = hash_json(&json!({
+            "action": "resolve_service",
+            "source": source,
+            "node_id": job.node_id,
+            "job_id": job.job_id,
+            "result": result,
+            "verdict": verdict.map(verdict_text),
+            "revision": expected_revision,
+        }))?;
+        self.apply_plan(
+            command_id,
+            request_hash,
+            expected_revision,
+            plan,
+            now,
+            None,
+            None,
+            None,
+            Some(ServiceSettlement {
+                job_id: job.job_id.clone(),
+                result_event_id,
+                claim_event_id,
+                observed,
+                event_ids,
+            }),
+        )?;
+        self.view_authorized()
+    }
+
+    /// The oldest queued job whose step has a prepared answer.
+    fn next_fixture_job(
+        &self,
+        snapshot: &RuntimeSnapshot,
+    ) -> Result<Option<(ProcessJob, StoredFixture)>> {
+        let fixtures = self.load_fixtures()?;
+        Ok(snapshot.jobs.iter().filter(|job| job.status == "queued").find_map(|job| {
+            fixtures
+                .get(&job.node_id)
+                .filter(|fixture| fixture.result.is_some())
+                .map(|fixture| (job.clone(), fixture.clone()))
+        }))
+    }
+
+    fn load_fixtures(&self) -> Result<BTreeMap<String, StoredFixture>> {
+        let mut statement = self.conn.prepare(
+            "SELECT node_id,result_json,verdict FROM simulation_service_fixtures WHERE simulation_id=?1",
+        )?;
+        let rows = statement
+            .query_map([&self.simulation_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(node_id, result_json, verdict)| {
+                Ok((
+                    node_id,
+                    StoredFixture {
+                        result: result_json
+                            .map(|text| serde_json::from_str(&text))
+                            .transpose()
+                            .context("decode stored service fixture")?,
+                        verdict: verdict.as_deref().map(parse_verdict).transpose()?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn service_waits(&self, snapshot: &RuntimeSnapshot) -> Result<Vec<ProcessSimulationServiceWait>> {
+        let fixtures = self.load_fixtures()?;
+        snapshot
+            .jobs
+            .iter()
+            .filter(|job| job.status == "queued")
+            .map(|job| {
+                let node = repository::scope_node(
+                    &snapshot.model,
+                    &snapshot.instance.process_id,
+                    &snapshot.scopes,
+                    &job.instance_id,
+                    &job.scope_id,
+                    &job.node_id,
+                )?;
+                let verification_is_machine = matches!(
+                    &node.kind,
+                    ProcessNodeKind::ServiceTask { verification, .. }
+                        if verification.automatic().is_some()
+                );
+                Ok(ProcessSimulationServiceWait {
+                    job_id: job.job_id.clone(),
+                    node_id: job.node_id.clone(),
+                    scope_id: job.scope_id.clone(),
+                    token_id: job.token_id.clone(),
+                    input: job.input.clone(),
+                    mode: if fixtures
+                        .get(&job.node_id)
+                        .is_some_and(|fixture| fixture.result.is_some())
+                    {
+                        ProcessSimulationServiceMode::Fixture
+                    } else {
+                        ProcessSimulationServiceMode::Result
+                    },
+                    verdict_applicable: verification_is_machine,
+                })
+            })
+            .collect()
+    }
+
+    fn profile_name(&self) -> Result<&'static str> {
+        let body = selected_body(&self.model, &self.source.selected_process_id, &[])?;
+        Ok(if body
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, ProcessNodeKind::ServiceTask { .. }))
+        {
+            SERVICE_PROFILE_NAME
+        } else {
+            PROFILE_NAME
+        })
     }
 
     pub(crate) fn view(
@@ -1778,6 +2193,10 @@ impl SimulationStore {
                 .as_ref()
                 .map(|snapshot| snapshot.activity_io_witnesses.clone())
                 .unwrap_or_default(),
+            service_waits: match snapshot.as_ref() {
+                Some(snapshot) => self.service_waits(snapshot)?,
+                None => Vec::new(),
+            },
             events_omitted: 0,
             trace_steps_omitted: 0,
         };
@@ -1811,7 +2230,7 @@ impl SimulationStore {
             .context("begin simulation identity transaction")?;
         tx.execute(
             "INSERT INTO simulation_meta(simulation_id,scenario_sha256,profile,org_id,actor_user_id,definition_id,version,model_sha256,status,revision,instance_id,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'running',1,NULL,?9,?9)",
-            params![self.simulation_id, input.scenario_sha256, PROFILE_NAME, input.org_id, input.actor_user_id, input.definition_id, input.version, input.model_sha256, input.start_ms],
+            params![self.simulation_id, input.scenario_sha256, self.profile_name()?, input.org_id, input.actor_user_id, input.definition_id, input.version, input.model_sha256, input.start_ms],
         )?;
         tx.execute(
             "INSERT INTO simulation_source_pins(simulation_id,org_id,owner_user_id,actor_user_id,definition_id,version,model_sha256,model_json,selected_process_id,start_node_id,acl_snapshot_json,captured_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
@@ -1847,6 +2266,7 @@ impl SimulationStore {
         accepted: Option<AcceptedInputRef>,
         human_outputs: Option<Value>,
         timer_candidate: Option<&DueTimer>,
+        service: Option<ServiceSettlement>,
     ) -> Result<()> {
         ensure!(
             self.clock.now_ms <= at_ms && at_ms <= self.clock.horizon_ms,
@@ -1865,10 +2285,14 @@ impl SimulationStore {
             "simulation identifier allocation failed"
         );
         let mut plan = plan;
-        for event_index in 0..plan.events.len() {
-            if !plan.event_ids.contains_key(&event_index) {
-                let event_id = self.next_id("event");
-                plan.event_ids.insert(event_index, event_id);
+        // A Service answer is finished by the repository (the result event keeps
+        // its reserved identity), so its plan is held to the profile there.
+        if service.is_none() {
+            for event_index in 0..plan.events.len() {
+                if !plan.event_ids.contains_key(&event_index) {
+                    let event_id = self.next_id("event");
+                    plan.event_ids.insert(event_index, event_id);
+                }
             }
         }
         ensure!(
@@ -1893,8 +2317,12 @@ impl SimulationStore {
                     .collect::<HashSet<_>>()
             })
             .unwrap_or_default();
-        validate_plan_ids(&plan, &self.ids.borrow(), &persisted_activations)?;
-        validate_supported_plan(&plan)?;
+        let body_nodes = selected_body(&self.model, &self.source.selected_process_id, &[])?.nodes;
+        if service.is_none() {
+            validate_plan_ids(&plan, &self.ids.borrow(), &persisted_activations)?;
+            validate_supported_plan(&plan, body_nodes)?;
+        }
+        let mut settled_event_ids = None;
 
         let tx = self
             .conn
@@ -1926,6 +2354,33 @@ impl SimulationStore {
                 at_ms,
                 accepted,
             )?
+        } else if let Some(settlement) = service.as_ref() {
+            let instance_id = load_instance_id_tx(&tx, &self.simulation_id)?
+                .context("simulation service plan has no instance")?;
+            let ids = self.ids.borrow();
+            let (instance, event_ids) = repository::settle_simulation_service_on(
+                &tx,
+                PrivateSimulationMode::prove(&self.conn)?,
+                &self.actor,
+                &settlement.job_id,
+                expected_revision,
+                &settlement.result_event_id,
+                &settlement.claim_event_id,
+                &settlement.observed,
+                &plan,
+                settlement.event_ids.clone(),
+                at_ms,
+                &|prepared| {
+                    validate_plan_ids(prepared, &ids, &persisted_activations)?;
+                    validate_supported_plan(prepared, body_nodes)
+                },
+            )?;
+            ensure!(
+                instance.instance_id == instance_id,
+                "simulation service answer changed another instance"
+            );
+            settled_event_ids = Some(event_ids);
+            instance
         } else if let Some(candidate) = timer_candidate {
             let instance_id = load_instance_id_tx(&tx, &self.simulation_id)?
                 .context("simulation timer plan has no instance")?;
@@ -1979,11 +2434,12 @@ impl SimulationStore {
         )?;
         ensure!(tx.changes() == 1, "simulation clock changed before commit");
 
-        let event_ids = plan
-            .event_ids
-            .iter()
-            .map(|(index, event_id)| (*index, event_id.clone()))
-            .collect::<BTreeMap<_, _>>();
+        let event_ids = settled_event_ids.unwrap_or_else(|| {
+            plan.event_ids
+                .iter()
+                .map(|(index, event_id)| (*index, event_id.clone()))
+                .collect::<BTreeMap<_, _>>()
+        });
         let result_json = json!({
             "status": simulation_meta_status(&result.status),
             "revision": result.revision,
@@ -2150,6 +2606,31 @@ impl SimulationStore {
     }
 }
 
+fn verdict_text(verdict: ProcessSimulationVerdict) -> &'static str {
+    match verdict {
+        ProcessSimulationVerdict::Approved => "approved",
+        ProcessSimulationVerdict::Rejected => "rejected",
+        ProcessSimulationVerdict::Unavailable => "unavailable",
+    }
+}
+
+fn parse_verdict(text: &str) -> Result<ProcessSimulationVerdict> {
+    Ok(match text {
+        "approved" => ProcessSimulationVerdict::Approved,
+        "rejected" => ProcessSimulationVerdict::Rejected,
+        "unavailable" => ProcessSimulationVerdict::Unavailable,
+        other => bail!("unknown stored simulation verdict {other:?}"),
+    })
+}
+
+fn machine_verdict(verdict: ProcessSimulationVerdict) -> VerificationVerdict {
+    match verdict {
+        ProcessSimulationVerdict::Approved => VerificationVerdict::Approved,
+        ProcessSimulationVerdict::Rejected => VerificationVerdict::Rejected,
+        ProcessSimulationVerdict::Unavailable => VerificationVerdict::Unavailable,
+    }
+}
+
 fn ensure_actor_allowed(
     source: &SimulationSourcePin,
     acl: &SimulationAclSnapshot,
@@ -2287,12 +2768,12 @@ fn validate_captured_source(
                     );
                 }
             }
-            ProcessNodeKind::ServiceTask { .. } => {
-                return Err(SimulationUnsupportedActivity::ServiceTask {
-                    node_id: node.id.clone(),
-                }
-                .into())
-            }
+            // `validate_model` above already refuses an unbound step, which has
+            // nothing a simulation could wait for.
+            ProcessNodeKind::ServiceTask { .. }
+            | ProcessNodeKind::BoundaryError { .. }
+            | ProcessNodeKind::BoundaryEscalation { .. }
+            | ProcessNodeKind::ErrorEnd { .. } => {}
             ProcessNodeKind::CallActivity(_) => {
                 return Err(SimulationUnsupportedActivity::CallActivity {
                     node_id: node.id.clone(),
@@ -2359,6 +2840,19 @@ fn validate_plan_ids(
                 .iter()
                 .map(|timer| ("timer", timer.timer_id.as_str())),
         )
+        .chain(
+            plan.create_jobs
+                .iter()
+                .map(|job| ("service job", job.job_id.as_str())),
+        )
+        .chain(
+            plan.service_invocation_ids
+                .values()
+                .map(|id| ("service invocation", id.as_str())),
+        )
+        .chain(plan.create_subscriptions.iter().map(|subscription| {
+            ("subscription", subscription.subscription_id.as_str())
+        }))
         .chain(plan.activity_io_inputs.iter().map(|fact| match fact {
             ActivityIoInputFact::Captured { witness_id, .. }
             | ActivityIoInputFact::Failed { witness_id, .. } => {
@@ -2388,33 +2882,61 @@ fn validate_plan_ids(
     Ok(())
 }
 
-fn validate_supported_plan(plan: &RuntimePlan) -> Result<()> {
+/// Holds a finished plan to what a private run can honour. A Service job is
+/// accepted only as a job that waits: nothing in a simulation claims, dispatches
+/// or executes one, so a plan that carries a started job, a message, a signal or
+/// any other outgoing dispatch is refused before it is written.
+pub(super) fn validate_supported_plan(plan: &RuntimePlan, nodes: &[ProcessNode]) -> Result<()> {
     ensure!(
-        plan.create_jobs.is_empty()
-            && plan.create_messages.is_empty()
-            && plan.create_signals.is_empty(),
+        plan.create_messages.is_empty() && plan.create_signals.is_empty(),
         "simulation plan contains an external dispatch"
     );
+    for job in &plan.create_jobs {
+        ensure!(
+            job.status == "queued"
+                && job.attempt == 0
+                && job.fence == 0
+                && job.worker_id.is_none()
+                && job.lease_until_ms.is_none()
+                && job.result.is_none()
+                && job.observed_result_event_id.is_none(),
+            "simulation plan contains a started Service job"
+        );
+        ensure!(
+            nodes.iter().any(|node| node.id == job.node_id
+                && matches!(&node.kind, ProcessNodeKind::ServiceTask { implementation, .. }
+                    if !matches!(implementation, ServiceImplementation::Unbound { .. }))),
+            "simulation plan queues a job for a node that is not a bound Service task"
+        );
+    }
     ensure!(
-        plan.service_invocation_ids.is_empty()
-            && plan.closed_service_dispatches.is_empty()
-            && plan.complete_job_ids.is_empty()
-            && plan.cancel_job_ids.is_empty(),
-        "simulation plan contains a Service dispatch"
+        plan.service_invocation_ids.len() == plan.create_jobs.len()
+            && plan
+                .create_jobs
+                .iter()
+                .all(|job| plan.service_invocation_ids.contains_key(&job.job_id)),
+        "simulation plan reserves Service invocations that differ from its queued jobs"
     );
     ensure!(
-        plan.activity_io_continuations.is_empty() && plan.recovered_service_incidents.is_empty(),
+        plan.closed_service_dispatches.is_empty()
+            && plan.activity_io_continuations.is_empty()
+            && plan.recovered_service_incidents.is_empty(),
         "simulation plan contains a deferred external continuation"
     );
     ensure!(
         plan.create_timers
             .iter()
             .all(|timer| timer.kind == tentaflow_protocol::processes::ProcessTimerKind::Catch)
-            && plan.subscription_updates.is_empty()
-            && plan.create_subscriptions.is_empty()
+            && plan.create_subscriptions.iter().all(|subscription| {
+                matches!(
+                    subscription.kind,
+                    ProcessSubscriptionKind::BoundaryError
+                        | ProcessSubscriptionKind::BoundaryEscalation
+                )
+            })
             && plan.race_updates.is_empty()
             && plan.create_event_races.is_empty(),
-        "the simulation profile only supports Catch timers and no event subscriptions"
+        "the simulation profile only supports Catch timers and error or escalation boundary subscriptions"
     );
     ensure!(
         plan.call_requests.is_empty()
@@ -2432,17 +2954,6 @@ fn validate_supported_plan(plan: &RuntimePlan) -> Result<()> {
         "repetition is unsupported in the initial simulation profile"
     );
     ensure!(
-        plan.business_error.is_none() && plan.terminal_error.is_none(),
-        "business and terminal errors are unsupported in the initial simulation profile"
-    );
-    ensure!(
-        plan.create_user_tasks.iter().all(|task| matches!(
-            task.kind,
-            ProcessUserTaskKind::Work | ProcessUserTaskKind::Manual
-        )),
-        "verification tasks are unsupported in the initial simulation profile"
-    );
-    ensure!(
         plan.termination_attempts.iter().all(|attempt| {
             let accepted = match attempt {
                 super::repository::TerminationAttempt::Success(source) => &source.accepted_input,
@@ -2457,9 +2968,10 @@ fn validate_supported_plan(plan: &RuntimePlan) -> Result<()> {
                     | AcceptedInputRef::Human { .. }
                     | AcceptedInputRef::ManualAcknowledgment { .. }
                     | AcceptedInputRef::Timer { .. }
+                    | AcceptedInputRef::Service { .. }
             )
         }),
-        "termination source is outside the initial simulation profile"
+        "termination source is outside the simulation profile"
     );
     Ok(())
 }

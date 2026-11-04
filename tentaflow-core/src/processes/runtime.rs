@@ -7216,9 +7216,25 @@ pub fn plan_job_result(
     now_ms: i64,
     signal_admission: Option<&SignalAdmissionResolver<'_>>,
 ) -> Result<RuntimePlan> {
+    plan_job_result_with_id_source(
+        snapshot, job, observed, approval_withdrawn, now_ms, signal_admission,
+        random_runtime_id_source(),
+    )
+}
+
+pub(super) fn plan_job_result_with_id_source(
+    snapshot: &RuntimeSnapshot,
+    job: &ProcessJob,
+    observed: &super::repository::ObservedActivityResult,
+    approval_withdrawn: bool,
+    now_ms: i64,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
+    id_source: RuntimeIdSourceHandle,
+) -> Result<RuntimePlan> {
     let result = &observed.result;
     validate_output(&result.outputs)?;
-    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
+    let mut transition =
+        Transition::from_snapshot_with_id_source(snapshot, now_ms, signal_admission, id_source)?;
     transition.accepted_input = Some(AcceptedInputRef::Service {
         job_id: job.job_id.clone(), attempt: job.attempt, fence: job.fence,
         result_event_id: job.observed_result_event_id.clone()

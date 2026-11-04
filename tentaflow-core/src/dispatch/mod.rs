@@ -2925,6 +2925,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 }
                 P::SimulationReleaseRequest { .. } => "ProcessSimulationReleaseRequest",
                 P::SimulationReleaseResponse { .. } => "ProcessSimulationReleaseResponse",
+                P::SimulationServiceResolveRequest { .. } => {
+                    "ProcessSimulationServiceResolveRequest"
+                }
+                P::SimulationServiceResolveResponse { .. } => {
+                    "ProcessSimulationServiceResolveResponse"
+                }
             }
         }
         MessageBody::MapBody(p) => {

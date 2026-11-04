@@ -2795,8 +2795,8 @@ pub(crate) fn fire_timer_on(
         let entry = AcceptedInputRef::Timer { timer_id: timer.timer_id.clone(),
             expected_timer_revision: timer.revision,
             fired_occurrence: advance.selected_occurrence };
-        cancelled_claims = apply_plan_on(tx, instance_id, &actor.user_id, expected,
-            plan, at_ms, None, EntryAuthority::Accepted(&entry), &[])?;
+        cancelled_claims = apply_plan_with_mode_on(tx, instance_id, &actor.user_id, expected,
+            plan, at_ms, None, EntryAuthority::Accepted(&entry), &[], mode)?;
         instance_on(tx, actor, instance_id, None)?
     };
     if apply_canonical_call_steps {
@@ -21136,7 +21136,7 @@ pub(crate) fn apply_simulation_plan_on(
     if human_outputs.is_some() {
         persist_simulation_human_task_outputs_on(tx, instance_id, plan, entry, human_outputs)?;
     }
-    apply_plan_on(
+    apply_plan_with_mode_on(
         tx,
         instance_id,
         &actor.user_id,
@@ -21146,8 +21146,139 @@ pub(crate) fn apply_simulation_plan_on(
         None,
         entry,
         &[],
+        ExecutionMode::Simulation(mode),
     )?;
     instance_on(tx, actor, instance_id, None)
+}
+
+/// The worker identity a private simulation gives to the answer it plays back.
+const SIMULATION_SERVICE_WORKER: &str = "simulation";
+
+/// The job as the planner sees it once the simulation has taken it: the first
+/// attempt and fence, owned by the simulated worker, with the result event the
+/// observation will be recorded under.
+pub(crate) fn simulated_running_job(job: &ProcessJob, result_event_id: &str) -> ProcessJob {
+    ProcessJob {
+        status: "running".into(),
+        attempt: 1,
+        fence: 1,
+        worker_id: Some(SIMULATION_SERVICE_WORKER.into()),
+        observed_result_event_id: Some(result_event_id.to_owned()),
+        ..job.clone()
+    }
+}
+
+/// Plays one operator-supplied Service answer through the production job
+/// lifecycle inside the caller's transaction: claim, dispatch boundary,
+/// observation, acceptance. `plan` is the production planner's transition for
+/// that answer; `event_ids` are the identities the caller reserved for its events
+/// other than the result, and `validate` holds the finished plan to the
+/// simulation profile before anything is written.
+pub(crate) fn settle_simulation_service_on(
+    tx: &Transaction<'_>,
+    mode: PrivateSimulationMode,
+    actor: &ProcessActor,
+    job_id: &str,
+    expected_revision: u64,
+    result_event_id: &str,
+    claim_event_id: &str,
+    observed: &ObservedActivityResult,
+    plan: &RuntimePlan,
+    event_ids: Vec<String>,
+    at_ms: i64,
+    validate: &dyn Fn(&RuntimePlan) -> Result<()>,
+) -> Result<(ProcessInstance, BTreeMap<usize, String>)> {
+    mode.verify_on(tx)?;
+    require_actor(tx, actor)?;
+    let (instance_id, scope_id, node_id, token_id): (String, String, String, String) = tx
+        .query_row(
+            "SELECT instance_id,scope_id,node_id,token_id FROM bpmn_jobs WHERE job_id=?1 AND status='queued'",
+            [job_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .context("simulation service job is not waiting for a result")?;
+    ensure!(
+        require_instance_reader(tx, actor, &instance_id)?,
+        "simulation actor is not the process initiator"
+    );
+    let claimed = claim_queued_job_on(
+        tx,
+        actor.clone(),
+        job_id,
+        &instance_id,
+        &scope_id,
+        node_id.clone(),
+        SIMULATION_SERVICE_WORKER,
+        at_ms,
+        result_event_id.to_owned(),
+        Some(claim_event_id),
+    )?
+    .context("simulation service job was claimed concurrently")?;
+    ensure!(
+        claimed.job.attempt == 1 && claimed.job.fence == 1,
+        "simulation service job was not at its first generation"
+    );
+    ensure!(
+        commit_simulation_dispatch_boundary_on(tx, mode, &claimed, SIMULATION_SERVICE_WORKER, at_ms)?,
+        "simulation service activation closed before its answer"
+    );
+    ensure!(
+        record_simulation_observation_on(tx, mode, &claimed, SIMULATION_SERVICE_WORKER, observed, at_ms)?
+            == JobObservationState::Observed,
+        "simulation service answer was not observed"
+    );
+    let selected_escalation = observed.origin == ActivityResultOrigin::Contract
+        && observed.result.outcome == tentaflow_protocol::processes::ActivityOutcome::NeedsHuman
+        && selected_escalation_subscription_on(
+            tx,
+            &instance_id,
+            &scope_id,
+            &node_id,
+            &token_id,
+            job_id,
+            observed.result.code.as_deref(),
+        )?
+        .is_some();
+    let (mut prepared, retained_failure, result_index) = prepare_service_result_plan(
+        plan,
+        observed,
+        job_id,
+        claimed.job.attempt,
+        claimed.job.fence,
+        selected_escalation,
+        false,
+        result_event_id,
+    )
+    .map_err(refuse_result)?;
+    let mut spare = event_ids.into_iter();
+    for index in 0..prepared.events.len() {
+        if !prepared.event_ids.contains_key(&index) {
+            prepared.event_ids.insert(
+                index,
+                spare.next().context("simulation reserved too few event identities")?,
+            );
+        }
+    }
+    validate(&prepared)?;
+    let applied_event_ids = prepared.event_ids.clone();
+    accept_job_result_in_tx(
+        tx,
+        actor,
+        job_id,
+        claimed.job.attempt,
+        claimed.job.fence,
+        SIMULATION_SERVICE_WORKER,
+        observed,
+        expected_revision,
+        Some((prepared, retained_failure, result_index)),
+        result_event_id,
+        selected_escalation,
+        false,
+        &json(observed)?,
+        at_ms,
+        ExecutionMode::Simulation(mode),
+    )
+    .map(|outcome| (outcome.instance, applied_event_ids))
 }
 
 fn persist_simulation_human_task_outputs_on(
@@ -21204,6 +21335,36 @@ fn apply_plan_on(
     call_source: Option<&BusinessErrorSource>,
     entry: EntryAuthority<'_>,
     staged_requests: &[CallRequest],
+) -> Result<Vec<CancelledJobClaim>> {
+    apply_plan_with_mode_on(
+        tx,
+        instance_id,
+        actor_id,
+        expected_revision,
+        plan,
+        at_ms,
+        call_source,
+        entry,
+        staged_requests,
+        ExecutionMode::Durable,
+    )
+}
+
+/// The one plan writer. A private simulation database holds no live flows,
+/// agents or addon tools, so under `Simulation` a queued Service job is not held
+/// to the currency of its source or to a publication pin: the job is only ever
+/// waiting for an answer the operator gives.
+fn apply_plan_with_mode_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    actor_id: &str,
+    expected_revision: u64,
+    plan: &RuntimePlan,
+    at_ms: i64,
+    call_source: Option<&BusinessErrorSource>,
+    entry: EntryAuthority<'_>,
+    staged_requests: &[CallRequest],
+    mode: ExecutionMode,
 ) -> Result<Vec<CancelledJobClaim>> {
     ensure!(plan.recovered_service_incidents.is_empty()
         || matches!(&entry, EntryAuthority::Accepted(AcceptedInputRef::Service { .. })),
@@ -21492,15 +21653,19 @@ fn apply_plan_on(
             bail!("queued job node is not a service in its scope body")
         };
         let source_ref = implementation.source_ref(flow_id);
-        require_source_current(
-            tx,
-            &ProcessActor {
-                org_id: org_id.clone(),
-                user_id: initiator.clone(),
-            },
-            &source_ref,
-            None,
-        )?;
+        if let ExecutionMode::Simulation(proof) = mode {
+            proof.verify_on(tx)?;
+        } else {
+            require_source_current(
+                tx,
+                &ProcessActor {
+                    org_id: org_id.clone(),
+                    user_id: initiator.clone(),
+                },
+                &source_ref,
+                None,
+            )?;
+        }
         validate_output(&job.input)?;
         let waiting:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3 AND node_id=?4 AND status='waiting')",params![instance_id,job.scope_id,job.token_id,job.node_id],|row|row.get(0))?;
         ensure!(
@@ -21518,9 +21683,17 @@ fn apply_plan_on(
             && snapshot.role == PinnedServiceRole::Implementation
             && snapshot.implementation_kind == implementation.kind()
             && snapshot.info.flow_id == source_ref).collect::<Vec<_>>();
-        ensure!(pins.len() == 1
-            && pins[0].info.graph_sha256 == hex::encode(Sha256::digest(pins[0].graph_json.as_bytes())),
-            "new Service job has no unique immutable flow snapshot");
+        // A simulation never executes the source, so the digest it records is the
+        // reference itself: nothing is pinned that could drift.
+        let pinned_flow_digest = if matches!(mode, ExecutionMode::Simulation(_)) {
+            ensure!(pins.is_empty(), "a private simulation holds no publication pins");
+            hex::encode(Sha256::digest(source_ref.as_bytes()))
+        } else {
+            ensure!(pins.len() == 1
+                && pins[0].info.graph_sha256 == hex::encode(Sha256::digest(pins[0].graph_json.as_bytes())),
+                "new Service job has no unique immutable flow snapshot");
+            pins[0].info.graph_sha256.clone()
+        };
         let invocation_id = plan.service_invocation_ids.get(&job.job_id)
             .context("queued Service job has no reserved invocation identity")?;
         ensure!(invocation_id != &job.job_id,
@@ -21528,7 +21701,7 @@ fn apply_plan_on(
         tx.execute("INSERT INTO bpmn_service_invocations(invocation_id,job_id,instance_id,scope_id,node_id,token_id,definition_id,version,selected_process_id,whole_document_sha256,flow_id,pinned_flow_digest,input_sha256,stable_request_id,phase,dispatch_evidence,phase_revision,acceptance_revision,created_at_ms,updated_at_ms,implementation_kind,critic_verified) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?1,'prepared','no_boundary',1,0,?14,?14,?15,?16)",
             params![invocation_id,job.job_id,instance_id,job.scope_id,
                 job.node_id,job.token_id,definition_id,version,selected_process_id,
-                model_sha256,source_ref,pins[0].info.graph_sha256,
+                model_sha256,source_ref,pinned_flow_digest,
                 hex::encode(Sha256::digest(input_json.as_bytes())),at_ms,
                 implementation.kind().as_str(),
                 matches!(verification, tentaflow_protocol::processes::ActivityVerification::Critic { .. })])?;
@@ -23341,8 +23514,8 @@ fn start_instance_on(
         "INSERT INTO bpmn_scopes(scope_id,instance_id) VALUES(?1,?1)",
         [instance_id],
     )?;
-    apply_plan_on(tx, instance_id, &actor.user_id, 1, plan, at_ms, None,
-        EntryAuthority::Accepted(entry), &[])?;
+    apply_plan_with_mode_on(tx, instance_id, &actor.user_id, 1, plan, at_ms, None,
+        EntryAuthority::Accepted(entry), &[], mode)?;
     instance_on(tx, actor, instance_id, None)
 }
 
@@ -24423,10 +24596,33 @@ pub fn claim_job_where(
         tx.commit()?;
         return Ok(None);
     }
-    let affected=tx.execute("UPDATE bpmn_jobs SET status='running',attempt=attempt+1,fence=fence+1,worker_id=?1,lease_until_ms=?2,updated_at_ms=?3 WHERE job_id=?4 AND status='queued'",params![worker_id,now_ms+30_000,now_ms,job_id])?;
-    if affected != 1 {
+    let Some(claimed) = claim_queued_job_on(&tx, actor, &job_id, &instance_id, &scope_id,
+        node_id, worker_id, now_ms, Uuid::new_v4().to_string(), None)? else {
         // Another claimer took it between the read and this write.
         tx.commit()?;
+        return Ok(None);
+    };
+    tx.commit()?;
+    Ok(Some(claimed))
+}
+
+/// Takes a queued job: a fresh attempt and fence, the lease, and the
+/// `service_claimed` fact. `None` means another claimer won. The caller owns the
+/// transaction and the checks that make this job claimable at all.
+fn claim_queued_job_on(
+    tx: &Transaction<'_>,
+    actor: ProcessActor,
+    job_id: &str,
+    instance_id: &str,
+    scope_id: &str,
+    node_id: String,
+    worker_id: &str,
+    now_ms: i64,
+    result_event_id: String,
+    claim_event_id: Option<&str>,
+) -> Result<Option<ClaimedProcessJob>> {
+    let affected=tx.execute("UPDATE bpmn_jobs SET status='running',attempt=attempt+1,fence=fence+1,worker_id=?1,lease_until_ms=?2,updated_at_ms=?3 WHERE job_id=?4 AND status='queued'",params![worker_id,now_ms+30_000,now_ms,job_id])?;
+    if affected != 1 {
         return Ok(None);
     }
     let (attempt, fence): (u32, u64) = tx.query_row(
@@ -24434,7 +24630,7 @@ pub fn claim_job_where(
         [&job_id],
         |row| Ok((row.get(0)?, row_u64(row, 1)?)),
     )?;
-    let claimed_before_event = runtime_snapshot_on(&tx, &actor, &instance_id)?;
+    let claimed_before_event = runtime_snapshot_on(tx, &actor, &instance_id)?;
     let claimed_node = scope_node(
         &claimed_before_event.model,
         &claimed_before_event.instance.process_id,
@@ -24467,7 +24663,7 @@ pub fn claim_job_where(
         None
     };
     let repeated_claim = claimed_before_event.repetition_occurrences.iter()
-        .find(|row| row.job_id.as_deref() == Some(job_id.as_str()));
+        .find(|row| row.job_id.as_deref() == Some(job_id));
     let repeat_context_sha256 = if let Some(occurrence) = repeated_claim {
         let group = claimed_before_event.repetition_groups.iter()
             .find(|row| row.group_id == occurrence.group_id)
@@ -24495,23 +24691,23 @@ pub fn claim_job_where(
         claim_data["repeat_context_sha256"] = serde_json::json!(hash);
     }
     insert_event_on(
-        &tx,
+        tx,
         &instance_id,
         next_seq,
         Some(&actor.user_id),
         &PlannedEvent {
-            scope_id: scope_id.clone(),
+            scope_id: scope_id.to_owned(),
             kind: "service_claimed".into(),
             node_id: Some(node_id),
             data: claim_data,
         },
         now_ms,
-        None,
+        claim_event_id,
     )?;
     if let Some(occurrence) = repeated_claim {
-        refresh_repetition_retained_bytes_on(&tx, &instance_id, &occurrence.group_id)?;
+        refresh_repetition_retained_bytes_on(tx, &instance_id, &occurrence.group_id)?;
     }
-    let snapshot = runtime_snapshot_on(&tx, &actor, &instance_id)?;
+    let snapshot = runtime_snapshot_on(tx, &actor, &instance_id)?;
     let job = snapshot
         .jobs
         .iter()
@@ -24535,14 +24731,13 @@ pub fn claim_job_where(
         "SELECT invocation_id,stable_request_id FROM bpmn_service_invocations WHERE job_id=?1 AND instance_id=?2 AND scope_id=?3 AND phase='prepared' AND dispatch_evidence='no_boundary'",
         params![job_id,instance_id,scope_id],
         |row| Ok((row.get(0)?,row.get(1)?)))?;
-    tx.commit()?;
     Ok(Some(ClaimedProcessJob {
         actor,
         job,
         snapshot,
         invocation_id,
         request_id,
-        result_event_id: Uuid::new_v4().to_string(),
+        result_event_id,
     }))
 }
 
@@ -24769,7 +24964,31 @@ fn commit_job_dispatch_boundary_on(
     let flow_id = job_source_ref_on(&tx, &claimed.job.job_id)?;
     require_source_current(&tx, &claimed.actor, &flow_id, None)?;
     require_job_verifier_current_on(&tx, &claimed.actor, &claimed.job.job_id)?;
-    if !job_activation_live_on(&tx, &claimed.job.job_id)? {
+    commit_dispatch_boundary_checked_on(tx, claimed, worker_id, at_ms)
+}
+
+/// The dispatch boundary of a private simulation: nothing is dispatched, so the
+/// live source and verifier checks have nothing to hold the job to.
+fn commit_simulation_dispatch_boundary_on(
+    tx: &Transaction<'_>,
+    mode: PrivateSimulationMode,
+    claimed: &ClaimedProcessJob,
+    worker_id: &str,
+    at_ms: i64,
+) -> Result<bool> {
+    mode.verify_on(tx)?;
+    require_actor(tx, &claimed.actor)?;
+    commit_dispatch_boundary_checked_on(tx, claimed, worker_id, at_ms)
+}
+
+fn commit_dispatch_boundary_checked_on(
+    tx: &Transaction<'_>,
+    claimed: &ClaimedProcessJob,
+    worker_id: &str,
+    at_ms: i64,
+) -> Result<bool> {
+    let flow_id = job_source_ref_on(tx, &claimed.job.job_id)?;
+    if !job_activation_live_on(tx, &claimed.job.job_id)? {
         return Ok(false);
     }
     let (input_json, pinned_flow_id, pinned_input_hash, pinned_request):
@@ -24784,11 +25003,11 @@ fn commit_job_dispatch_boundary_on(
     if tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM bpmn_repetition_occurrences WHERE instance_id=?1 AND job_id=?2)",
         params![claimed.job.instance_id,claimed.job.job_id], |row| row.get::<_, bool>(0))? {
-        let snapshot = runtime_snapshot_on(&tx, &claimed.actor, &claimed.job.instance_id)?;
+        let snapshot = runtime_snapshot_on(tx, &claimed.actor, &claimed.job.instance_id)?;
         let retained = snapshot.repetition_groups.iter().try_fold(0_u64, |sum, group|
             sum.checked_add(group.retained_bytes)
                 .context("repetition retained byte count overflow"))?;
-        let reserved = repetition_admission_reservation_on(&tx,
+        let reserved = repetition_admission_reservation_on(tx,
             &claimed.job.instance_id, &snapshot.model, &snapshot.scopes,
             &RuntimePlan::initial(Value::Null), &snapshot.repetition_groups,
             &snapshot.repetition_occurrences)?;
@@ -24915,7 +25134,7 @@ pub fn record_job_observation(
 ) -> Result<JobObservationState> {
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
-    let state = record_job_observation_on(&tx, &ObservationTarget::from(claimed), worker_id, observed, at_ms)?;
+    let state = record_job_observation_on(&tx, &ObservationTarget::from(claimed), worker_id, observed, at_ms, ExecutionMode::Durable)?;
     tx.commit()?;
     Ok(state)
 }
@@ -24937,7 +25156,7 @@ pub fn commit_boundary_and_observe(
     if !commit_job_dispatch_boundary_on(&tx, claimed, worker_id, at_ms)? {
         return Ok(None);
     }
-    let state = record_job_observation_on(&tx, &ObservationTarget::from(claimed), worker_id, observed, at_ms)?;
+    let state = record_job_observation_on(&tx, &ObservationTarget::from(claimed), worker_id, observed, at_ms, ExecutionMode::Durable)?;
     tx.commit()?;
     Ok(Some(state))
 }
@@ -24975,12 +25194,28 @@ impl From<&ClaimedProcessJob> for ObservationTarget {
     }
 }
 
+/// Records the operator's answer for a simulated step. No source is called, so
+/// no authority over one can be lost between the dispatch and the answer.
+fn record_simulation_observation_on(
+    tx: &Transaction<'_>,
+    mode: PrivateSimulationMode,
+    claimed: &ClaimedProcessJob,
+    worker_id: &str,
+    observed: &ObservedActivityResult,
+    at_ms: i64,
+) -> Result<JobObservationState> {
+    mode.verify_on(tx)?;
+    record_job_observation_on(tx, &ObservationTarget::from(claimed), worker_id, observed,
+        at_ms, ExecutionMode::Simulation(mode))
+}
+
 fn record_job_observation_on(
     tx: &Transaction<'_>,
     target: &ObservationTarget,
     worker_id: &str,
     observed: &ObservedActivityResult,
     at_ms: i64,
+    mode: ExecutionMode,
 ) -> Result<JobObservationState> {
     validate_output(&observed.result.outputs)?;
     let bytes = json(observed)?;
@@ -25020,7 +25255,7 @@ fn record_job_observation_on(
     ensure!(matches!(phase.as_str(), "may_have_executed" | "uncertain"),
         "Service observation arrived before its dispatch boundary");
     let live = job_activation_live_on(&tx, &target.job_id)?;
-    let authority = if live {
+    let authority = if live && mode == ExecutionMode::Durable {
         require_call_control_authority_on(&tx, &target.actor, &instance_id)
             .and_then(|_| job_source_ref_on(&tx, &target.job_id))
             .and_then(|flow| require_source_current(&tx, &target.actor, &flow, None))
@@ -25986,6 +26221,7 @@ fn validate_escalation_result_plan_on(
     observed: &ObservedActivityResult,
     plan: &RuntimePlan,
     has_escalation: bool,
+    mode: ExecutionMode,
 ) -> Result<()> {
     let caught = plan
         .events
@@ -26065,6 +26301,10 @@ fn validate_escalation_result_plan_on(
                 "SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3 AND node_id=?4 AND status='waiting')",
                 params![instance.instance_id,source_scope,source_token_id,source_node_id],
                 |row| row.get(0))?;
+            // A simulation names every event up front so its ids are repeatable;
+            // production leaves all but the result event to the writer.
+            let ids_exactly = |count: usize| plan.event_ids.len() == count
+                || matches!(mode, ExecutionMode::Simulation(_)) && plan.event_ids.len() >= count;
             ensure!(plan.create_user_tasks.len() == 1,
                 "unselected NeedsHuman result differs from its factual Verification wait");
             let task = &plan.create_user_tasks[0];
@@ -26090,7 +26330,7 @@ fn validate_escalation_result_plan_on(
                     "assignee_user_id":instance.initiator_user_id.as_str(),
                     "kind":ProcessUserTaskKind::Verification})
                 && if node.activity_io.is_some() {
-                    plan.event_ids.len() == 2
+                    ids_exactly(2)
                         && plan.event_ids.contains_key(&0)
                         && plan.event_ids.contains_key(&1)
                         && plan.activity_io_results.iter().any(|fact|
@@ -26101,7 +26341,7 @@ fn validate_escalation_result_plan_on(
                                             user_task_id }, route_event_index: 1,
                                     } if user_task_id == &task.user_task_id))
                 } else {
-                    plan.event_ids.len() == 1 && plan.event_ids.contains_key(&0)
+                    ids_exactly(1) && plan.event_ids.contains_key(&0)
                 }
                 && plan.termination_attempts.is_empty()
                 && plan.variable_effects.is_empty()
@@ -26652,6 +26892,7 @@ fn validate_job_result_plan_on(
     observed: &ObservedActivityResult,
     approval_withdrawn: bool,
     plan: &RuntimePlan,
+    mode: ExecutionMode,
 ) -> Result<()> {
     let model = current_version_model_on(tx, &instance.definition_id, instance.version)?;
     let (source_scope, token_id): (String, String) = tx.query_row(
@@ -26752,7 +26993,7 @@ fn validate_job_result_plan_on(
         implementation,
         tentaflow_protocol::processes::ServiceImplementation::Agent { .. }
     );
-    super::verification::validate_record_on(tx, job_id, observed, verification)?;
+    super::verification::validate_record_on(tx, job_id, observed, verification, mode)?;
     if observed.verification.is_none() && verification.automatic().is_some() {
         super::verification::reject_verdict_imitation(&observed.result)?;
     }
@@ -27075,6 +27316,7 @@ fn validate_job_result_plan_on(
         observed,
         plan,
         has_escalation,
+        mode,
     )?;
     Ok(())
 }
@@ -27379,9 +27621,42 @@ pub fn accept_job_result(
         (None, pool.write()?)
     };
     let tx = conn.transaction()?;
-    require_actor(&tx, actor)?;
+    let outcome = accept_job_result_in_tx(
+        &tx, actor, job_id, attempt, fence, worker_id, observed, expected_revision, precomposed,
+        &reserved_result_event_id, selected_escalation, repeated_source, &observed_bytes,
+        at_ms, ExecutionMode::Durable,
+    )?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
+/// The acceptance of an observed Service result inside the caller's transaction.
+/// `precomposed` is a plan that was made outside it (a supplied plan, or the
+/// simulation's); without one the canonical plan is made here and its call steps
+/// are applied. Under `Simulation` nothing is held to a live source: the private
+/// database has none, and the answer came from the operator.
+fn accept_job_result_in_tx(
+    tx: &Transaction<'_>,
+    actor: &ProcessActor,
+    job_id: &str,
+    attempt: u32,
+    fence: u64,
+    worker_id: &str,
+    observed: &ObservedActivityResult,
+    expected_revision: u64,
+    precomposed: Option<(RuntimePlan, bool, usize)>,
+    reserved_result_event_id: &str,
+    selected_escalation: bool,
+    repeated_source: bool,
+    observed_bytes: &str,
+    at_ms: i64,
+    mode: ExecutionMode,
+) -> Result<ProcessTransitionOutcome> {
+    let result = &observed.result;
+    let supplied_plan = precomposed.is_some();
+    require_actor(tx, actor)?;
     let (instance_id,node_id,status,current_attempt,current_fence,_current_worker,_lease_until_ms,stored_result):(String,String,String,u32,u64,Option<String>,Option<i64>,Option<String>)=tx.query_row("SELECT instance_id,node_id,status,attempt,fence,worker_id,lease_until_ms,result_json FROM bpmn_jobs WHERE job_id=?1",[job_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row_u64(row,4)?,row.get(5)?,row.get(6)?,row.get(7)?))).context("process job not found")?;
-    let instance = instance_on(&tx, actor, &instance_id, None)?;
+    let instance = instance_on(tx, actor, &instance_id, None)?;
     ensure!(
         instance.initiator_user_id == actor.user_id,
         "process job actor is not the initiator"
@@ -27414,9 +27689,12 @@ pub fn accept_job_result(
             ProcessInstanceStatus::Completed | ProcessInstanceStatus::Cancelled
                 | ProcessInstanceStatus::Error),
         RevisionConflict("process instance revision conflict or closed instance"));
-    let commit_now_ms = now_ms()?;
+    let commit_now_ms = match mode {
+        ExecutionMode::Durable => now_ms()?,
+        ExecutionMode::Simulation(_) => at_ms,
+    };
     ensure!(status == "running" && current_attempt == attempt
-        && current_fence == fence && job_activation_live_on(&tx, job_id)?,
+        && current_fence == fence && job_activation_live_on(tx, job_id)?,
         "Service acceptance lost its waiting job generation");
     let acquired = tx.execute(
         "UPDATE bpmn_service_invocations SET acceptance_owner_id=?1,acceptance_lease_until_ms=?2,acceptance_revision=acceptance_revision+1,phase_revision=phase_revision+1,updated_at_ms=?3 WHERE job_id=?4 AND instance_id=?5 AND phase='observed' AND dispatch_evidence='committed_boundary' AND dispatch_attempt=?6 AND dispatch_fence=?7 AND observed_result_json=?8 AND reserved_result_event_id=?9 AND (acceptance_owner_id IS NULL OR acceptance_owner_id=?1 OR acceptance_lease_until_ms<?3)",
@@ -27430,7 +27708,7 @@ pub fn accept_job_result(
     // instance, and an acceptance that fails rolls the close back with it. The
     // instance revision is left alone because the caller's expected revision
     // guards the plan.
-    resolve_recovery_incident_on(&tx, job_id, at_ms, false)?;
+    resolve_recovery_incident_on(tx, job_id, at_ms, false)?;
     // Both the canonical and the supplied plan are made from here on, and neither
     // may meet a recovery incident that is still open.
     let still_open: bool = tx.query_row(
@@ -27440,16 +27718,20 @@ pub fn accept_job_result(
     // The verifier of an approval may have been withdrawn since the verdict. The
     // work is finished and the observation cannot be rewritten, so the approval
     // is not relied on: the planner hands the result to a person.
-    let approval_withdrawn = super::verification::approval_withdrawn(&tx, actor, observed)?;
+    let approval_withdrawn = match mode {
+        ExecutionMode::Durable => super::verification::approval_withdrawn(tx, actor, observed)?,
+        // The verifier is the operator's verdict; there is no registry to withdraw it.
+        ExecutionMode::Simulation(_) => false,
+    };
     let (mut composite, retained_failure, result_index) = if let Some(prepared) = precomposed {
         prepared
     } else {
-        let snapshot = runtime_snapshot_on(&tx, actor, &instance_id)?;
+        let snapshot = runtime_snapshot_on(tx, actor, &instance_id)?;
         let job = snapshot.jobs.iter().find(|job| job.job_id == job_id)
             .context("fenced Service job is missing from its actual snapshot")?;
         let resolve = |prefix: &RuntimePlan, signal: &PlannedSignal,
             accepted: Option<&AcceptedInputRef>| {
-            signal_admission_on(&tx, actor, &instance_id, prefix, signal, accepted)
+            signal_admission_on(tx, actor, &instance_id, prefix, signal, accepted)
         };
         let planned = super::runtime::plan_job_result(&snapshot, job, observed,
             approval_withdrawn, at_ms, Some(&resolve)).map_err(refuse_result)?;
@@ -27470,20 +27752,22 @@ pub fn accept_job_result(
                 "terminating service input differs from its accepted job generation")));
         }
     }
-    require_call_control_authority_on(&tx, actor, &instance_id)?;
-    let flow_id = job_source_ref_on(&tx, job_id)?;
-    require_source_current(&tx, actor, &flow_id, None)?;
+    if mode == ExecutionMode::Durable {
+        require_call_control_authority_on(tx, actor, &instance_id)?;
+        let flow_id = job_source_ref_on(tx, job_id)?;
+        require_source_current(tx, actor, &flow_id, None)?;
+    }
     ensure!(
         composite.complete_job_ids.iter().any(|id| id == job_id),
         "result plan does not consume service job"
     );
-    validate_job_result_plan_on(&tx, &instance, &node_id, job_id, worker_id, observed,
-        approval_withdrawn, &composite).map_err(refuse_result)?;
+    validate_job_result_plan_on(tx, &instance, &node_id, job_id, worker_id, observed,
+        approval_withdrawn, &composite, mode).map_err(refuse_result)?;
     if retained_failure {
         ensure!(composite.call_steps.is_empty()
             && composite.termination_attempts.is_empty(),
             "retained service failure cannot add a call or termination");
-        composite.event_ids.insert(result_index, reserved_result_event_id.clone());
+        composite.event_ids.insert(result_index, reserved_result_event_id.to_owned());
     }
     let plan = &composite;
     tx.execute(
@@ -27492,12 +27776,12 @@ pub fn accept_job_result(
     )?;
     let result_event_id = plan.event_ids.get(&result_index)
         .context("accepted service result has no event identity")?;
-    ensure!(result_event_id == &reserved_result_event_id,
+    ensure!(result_event_id.as_str() == reserved_result_event_id,
         "accepted Service result differs from its reserved event UUID");
     let entry = AcceptedInputRef::Service { job_id: job_id.to_owned(), attempt, fence,
         result_event_id: result_event_id.clone() };
-    let mut cancelled_claims = apply_plan_on(
-        &tx,
+    let mut cancelled_claims = apply_plan_with_mode_on(
+        tx,
         &instance_id,
         &actor.user_id,
         expected_revision,
@@ -27505,19 +27789,20 @@ pub fn accept_job_result(
         at_ms,
         None,
         EntryAuthority::Accepted(&entry),
-    &[]).map_err(refuse_result)?;
+        &[],
+        mode,
+    ).map_err(refuse_result)?;
     let terminal = terminal_job_status(&result.outcome);
     tx.execute("UPDATE bpmn_jobs SET status=?1,result_json=?2,lease_until_ms=NULL,updated_at_ms=?3,result_origin=?5 WHERE job_id=?4",params![terminal,json(result)?,at_ms,job_id,result_origin_text(&observed.origin)])?;
     let accepted = tx.execute(
         "UPDATE bpmn_service_invocations SET phase='accepted',acceptance_owner_id=NULL,acceptance_lease_until_ms=NULL,acceptance_revision=acceptance_revision+1,phase_revision=phase_revision+1,updated_at_ms=?1 WHERE job_id=?2 AND instance_id=?3 AND phase='observed' AND acceptance_owner_id=?4 AND reserved_result_event_id=?5 AND observed_result_json=?6",
         params![at_ms.max(commit_now_ms),job_id,instance_id,worker_id,reserved_result_event_id,observed_bytes])?;
     ensure!(accepted == 1, "Service acceptance lost its independent CAS owner");
-    if supplied_plan.is_none() {
-        cancelled_claims.extend(apply_canonical_call_steps_on(&tx, &instance_id,
+    if !supplied_plan {
+        cancelled_claims.extend(apply_canonical_call_steps_on(tx, &instance_id,
             &actor.user_id, plan, at_ms)?);
     }
-    let result_instance = instance_on(&tx, actor, &instance_id, None)?;
-    tx.commit()?;
+    let result_instance = instance_on(tx, actor, &instance_id, None)?;
     Ok(ProcessTransitionOutcome {
         instance: result_instance,
         cancelled_claims,
@@ -28318,7 +28603,7 @@ fn observe_agent_report(
         expression_observation: None,
         verification: None,
     })?;
-    record_job_observation_on(tx, &target, worker_id, &reported, now_ms)?;
+    record_job_observation_on(tx, &target, worker_id, &reported, now_ms, ExecutionMode::Durable)?;
     Ok(())
 }
 
