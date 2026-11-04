@@ -1057,6 +1057,8 @@ pub fn process_dispatch(
                 *tick_duration_ms,
             )
             .map_err(error)?;
+            // Prepared answers are held to the model before anything is reserved.
+            simulation::check_start_fixtures(&source, service_fixtures).map_err(error)?;
             // Reclaiming scans every retained run and the first Start builds the
             // schema template, so the section runs where the runtime may move other
             // tasks off this worker.
@@ -1149,6 +1151,7 @@ pub fn process_dispatch(
         P::SimulationServiceResolveRequest {
             simulation_id,
             node_id,
+            job_id,
             result,
             verdict,
         } => {
@@ -1156,7 +1159,7 @@ pub fn process_dispatch(
                 .state
                 .simulation_registry
                 .with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
-                    store.resolve_service(authorization, node_id, result.clone(), *verdict)
+                    store.resolve_service(authorization, node_id, job_id.as_deref(), result.clone(), *verdict)
                 })
                 .map_err(error)?;
             P::SimulationServiceResolveResponse {
@@ -1869,6 +1872,7 @@ mod tests {
             P::SimulationServiceResolveRequest {
                 simulation_id: view.simulation_id.clone(),
                 node_id: "Service".into(),
+                job_id: None,
                 result: ActivityResult {
                     outcome: ActivityOutcome::Completed,
                     code: None,
@@ -1895,6 +1899,50 @@ mod tests {
             before,
             "a simulated Service answer must not write a production job, invocation or event"
         );
+    }
+
+    #[tokio::test]
+    async fn refused_fixtures_are_reported_before_a_run_is_reserved_and_keep_their_code() {
+        use tentaflow_protocol::processes::{
+            ActivityVerification, ProcessSimulationServiceFixture, ProcessSimulationServiceMode,
+        };
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "simulation-fixture-order");
+        let ctx = context(&state, &actor);
+        let flow_id = test_support::flow(&state.db, &actor, &test_support::graph("order", None));
+        let published = save_and_publish(
+            &ctx,
+            test_support::service_model(&flow_id, ActivityVerification::Human),
+        )
+        .await;
+        // The owner holds every run slot it may have.
+        for _ in 0..4 {
+            request(&ctx, simulation_start(&published.definition_id)).await;
+        }
+        let refused_start = |node_id: &str| {
+            let mut start = simulation_start(&published.definition_id);
+            if let P::SimulationStartRequest { service_fixtures, .. } = &mut start {
+                *service_fixtures = vec![ProcessSimulationServiceFixture {
+                    node_id: node_id.into(),
+                    mode: ProcessSimulationServiceMode::Fixture,
+                    result: None,
+                    verdict: None,
+                    confirm_side_effects: false,
+                }];
+            }
+            start
+        };
+        // With every slot taken, a reservation would answer "run limit"; the
+        // fixture code shows the check came first.
+        let error = refused(&ctx, refused_start("Nope")).await;
+        assert!(error.message.starts_with("SIMULATION_FIXTURE_INVALID"), "{}", error.message);
+        // A node id that would match the not-found mapping keeps its code.
+        let error = refused(&ctx, refused_start("not found")).await;
+        assert_eq!(error.code, ProtocolErrorCode::BadRequest);
+        assert!(error.message.starts_with("SIMULATION_FIXTURE_INVALID"), "{}", error.message);
+        // The same start without fixtures is what hits the limit.
+        let error = refused(&ctx, simulation_start(&published.definition_id)).await;
+        assert!(error.message.contains("run limit"), "{}", error.message);
     }
 
     #[tokio::test]

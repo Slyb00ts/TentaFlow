@@ -7233,6 +7233,9 @@ pub(super) fn plan_job_result_with_id_source(
 ) -> Result<RuntimePlan> {
     let result = &observed.result;
     validate_output(&result.outputs)?;
+    // A handler that cannot run falls back to a retained incident, which must mint
+    // its identifiers from the same source as the plan it replaces.
+    let fallback_ids = id_source.clone();
     let mut transition =
         Transition::from_snapshot_with_id_source(snapshot, now_ms, signal_admission, id_source)?;
     transition.accepted_input = Some(AcceptedInputRef::Service {
@@ -7602,13 +7605,14 @@ pub(super) fn plan_job_result_with_id_source(
             })();
             return match planned {
                 Ok(plan) => Ok(plan),
-                Err(error) => plan_retained_escalation_incident(
+                Err(error) => plan_retained_escalation_incident_with_id_source(
                     snapshot,
                     job,
                     observed,
                     &boundary_id,
                     &error.to_string(),
                     now_ms,
+                    fallback_ids,
                 ),
             };
         }
@@ -7881,12 +7885,26 @@ pub(super) fn plan_retained_escalation_incident(
     reason: &str,
     now_ms: i64,
 ) -> Result<RuntimePlan> {
+    plan_retained_escalation_incident_with_id_source(
+        snapshot, job, observed, boundary_id, reason, now_ms, random_runtime_id_source(),
+    )
+}
+
+pub(super) fn plan_retained_escalation_incident_with_id_source(
+    snapshot: &RuntimeSnapshot,
+    job: &ProcessJob,
+    observed: &super::repository::ObservedActivityResult,
+    boundary_id: &str,
+    reason: &str,
+    now_ms: i64,
+    id_source: RuntimeIdSourceHandle,
+) -> Result<RuntimePlan> {
     ensure!(
         observed.origin == super::repository::ActivityResultOrigin::Contract
             && observed.result.outcome == ActivityOutcome::NeedsHuman,
         "retained escalation incident requires an accepted Contract NeedsHuman result"
     );
-    let mut transition = Transition::from_snapshot(snapshot, now_ms, None)?;
+    let mut transition = Transition::from_snapshot_with_id_source(snapshot, now_ms, None, id_source)?;
     transition.current_scope = job.scope_id.clone();
     let node = transition.node(&job.node_id)?.clone();
     ensure!(

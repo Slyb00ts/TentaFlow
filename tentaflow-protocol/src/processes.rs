@@ -2392,6 +2392,9 @@ pub enum ProcessPayload {
     SimulationServiceResolveRequest {
         simulation_id: String,
         node_id: String,
+        /// Names the job when several wait on `node_id`.
+        #[serde(default)]
+        job_id: Option<String>,
         result: ActivityResult,
         /// Required when the step has a Test or Critic verification and the
         /// result completes.

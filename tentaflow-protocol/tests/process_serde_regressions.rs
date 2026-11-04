@@ -336,7 +336,7 @@ fn simulation_payloads_round_trip_by_variant_name_through_json_and_cbor() {
                     "summary": "prepared", "outputs": {"answer": 1}, "evidence": []},
                 "verdict": "Approved", "confirm_side_effects": false}]}}),
         json!({"SimulationServiceResolveRequest": {"simulation_id": "simulation-1",
-            "node_id": "Service_1", "result": {"outcome": "Error", "code": "FLOW_ERROR",
+            "node_id": "Service_1", "job_id": null, "result": {"outcome": "Error", "code": "FLOW_ERROR",
                 "summary": "failed", "outputs": null, "evidence": []}, "verdict": null}}),
         json!({"SimulationServiceResolveResponse": {"view": serde_json::to_value(&view).unwrap()}}),
         json!({"SimulationViewRequest": {"simulation_id": "simulation-1"}}),

@@ -167,7 +167,7 @@ fn a_service_step_waits_and_the_operator_answer_continues_the_run_like_productio
     );
 
     let resolved = store
-        .resolve_service(authorize(&store), SERVICE, completed(json!({"answer": 42})), None)
+        .resolve_service(authorize(&store), SERVICE, None, completed(json!({"answer": 42})), None)
         .expect("resolve the waiting step");
     assert!(resolved.service_waits.is_empty());
     let trail = kinds(&resolved);
@@ -205,7 +205,7 @@ fn a_repeated_run_has_the_same_ids_and_trace() {
         let mut store = started(human_chain());
         drive_to_service(&mut store);
         let view = store
-            .resolve_service(authorize(&store), SERVICE, completed(json!({"answer": 7})), None)
+            .resolve_service(authorize(&store), SERVICE, None, completed(json!({"answer": 7})), None)
             .expect("resolve");
         let events = view
             .events
@@ -301,7 +301,7 @@ fn resolving_a_step_that_does_not_wait_is_a_typed_refusal_and_changes_nothing() 
     drive_to_service(&mut store);
     let before = store.view(authorize(&store)).expect("view");
     let error = store
-        .resolve_service(authorize(&store), "User_1", completed(json!({})), None)
+        .resolve_service(authorize(&store), "User_1", None, completed(json!({})), None)
         .expect_err("a user task is not a Service step");
     assert_eq!(service_error(&error), SERVICE_NOT_WAITING);
     let after = store.view(authorize(&store)).expect("view");
@@ -323,7 +323,7 @@ fn a_test_verification_needs_the_operators_verdict_and_follows_its_failure_polic
     let waiting = drive_to_service(&mut store);
     assert!(waiting.service_waits[0].verdict_applicable);
     let error = store
-        .resolve_service(authorize(&store), SERVICE, completed(json!({"answer": 1})), None)
+        .resolve_service(authorize(&store), SERVICE, None, completed(json!({"answer": 1})), None)
         .expect_err("a completed result under a test needs a verdict");
     assert_eq!(service_error(&error), SERVICE_VERDICT_REQUIRED);
     assert_eq!(
@@ -334,7 +334,7 @@ fn a_test_verification_needs_the_operators_verdict_and_follows_its_failure_polic
     let approved = store
         .resolve_service(
             authorize(&store),
-            SERVICE,
+            SERVICE, None,
             completed(json!({"answer": 1})),
             Some(ProcessSimulationVerdict::Approved),
         )
@@ -355,7 +355,7 @@ fn a_test_verification_needs_the_operators_verdict_and_follows_its_failure_polic
     let rejected = store
         .resolve_service(
             authorize(&store),
-            SERVICE,
+            SERVICE, None,
             completed(json!({"answer": 1})),
             Some(ProcessSimulationVerdict::Rejected),
         )
@@ -376,7 +376,7 @@ fn a_test_verification_needs_the_operators_verdict_and_follows_its_failure_polic
     let failed = store
         .resolve_service(
             authorize(&store),
-            SERVICE,
+            SERVICE, None,
             ActivityResult {
                 outcome: ActivityOutcome::Error,
                 code: Some("FLOW_ERROR".into()),
@@ -398,7 +398,7 @@ fn a_rejected_human_verification_raises_the_production_incident() {
     let mut store = started(human_chain());
     drive_to_service(&mut store);
     let resolved = store
-        .resolve_service(authorize(&store), SERVICE, completed(json!({"answer": 3})), None)
+        .resolve_service(authorize(&store), SERVICE, None, completed(json!({"answer": 3})), None)
         .expect("resolve");
     let task_id = resolved
         .user_tasks
@@ -415,7 +415,7 @@ fn a_rejected_human_verification_raises_the_production_incident() {
     let mut other = started(human_chain());
     drive_to_service(&mut other);
     let resolved = other
-        .resolve_service(authorize(&other), SERVICE, completed(json!({"answer": 3})), None)
+        .resolve_service(authorize(&other), SERVICE, None, completed(json!({"answer": 3})), None)
         .expect("resolve");
     let id = resolved.user_tasks[0].user_task_id.clone();
     let error = other
@@ -446,7 +446,7 @@ fn a_business_error_is_caught_by_the_error_boundary_of_the_step() {
     let mut store = started(model);
     drive_to_service(&mut store);
     let caught = store
-        .resolve_service(authorize(&store), SERVICE, completed(json!({"answer": 1})), None)
+        .resolve_service(authorize(&store), SERVICE, None, completed(json!({"answer": 1})), None)
         .expect("resolve");
     assert!(
         kinds(&caught).contains(&"business_error_caught@Boundary_1".to_owned()),
@@ -471,14 +471,16 @@ fn an_uncaught_business_error_ends_the_run_in_error_like_production() {
     let mut store = started(model);
     drive_to_service(&mut store);
     let ended = store
-        .resolve_service(authorize(&store), SERVICE, completed(json!({"answer": 1})), None)
+        .resolve_service(authorize(&store), SERVICE, None, completed(json!({"answer": 1})), None)
         .expect("resolve");
-    let status = ended.instance.as_ref().expect("instance").status.clone();
-    assert!(
-        matches!(status, ProcessInstanceStatus::Error | ProcessInstanceStatus::Incident),
-        "{status:?} {:?}",
+    // Without a handler the business error parks the step as an incident.
+    assert_eq!(
+        ended.instance.as_ref().expect("instance").status,
+        ProcessInstanceStatus::Incident,
+        "{:?}",
         kinds(&ended)
     );
+    assert_eq!(kinds(&ended).last().map(String::as_str), Some("incident@Service_1"));
 }
 
 #[test]
@@ -580,26 +582,50 @@ async fn the_simulated_trace_equals_the_production_execution_on_the_same_answer(
         }
     }
 
+    // Every identifier becomes the ordinal of its first appearance, so the links
+    // between events (the job that was queued, claimed and answered; the task that
+    // was opened and completed) are compared, not just the shapes.
     let normalized = |events: Vec<(String, Option<String>, Value)>| {
-        fn mask(value: &Value) -> Value {
+        fn relabel(value: &Value, seen: &mut Vec<String>, users: &mut Vec<String>) -> Value {
+            fn ordinal(list: &mut Vec<String>, text: &str, label: &str) -> Value {
+                let position = list.iter().position(|known| known == text).unwrap_or_else(|| {
+                    list.push(text.to_owned());
+                    list.len() - 1
+                });
+                json!(format!("<{label}#{position}>"))
+            }
             match value {
-                Value::String(text) if uuid::Uuid::parse_str(text).is_ok() => json!("<uuid>"),
-                Value::Array(items) => Value::Array(items.iter().map(mask).collect()),
+                Value::String(text) if uuid::Uuid::parse_str(text).is_ok() => {
+                    ordinal(seen, text, "id")
+                }
+                Value::Array(items) => {
+                    Value::Array(items.iter().map(|item| relabel(item, seen, users)).collect())
+                }
                 Value::Object(map) => Value::Object(
                     map.iter()
                         .map(|(key, value)| {
-                            // Account identities differ between a live organization and a private one.
-                            let masked = if key.ends_with("_user_id") { json!("<user>") } else { mask(value) };
-                            (key.clone(), masked)
+                            // A private organization names its accounts with a fixed
+                            // string where production has a UUID.
+                            let relabelled = match value {
+                                Value::String(text) if key.ends_with("_user_id") => {
+                                    ordinal(users, text, "user")
+                                }
+                                other => relabel(other, seen, users),
+                            };
+                            (key.clone(), relabelled)
                         })
                         .collect(),
                 ),
                 other => other.clone(),
             }
         }
+        let (mut seen, mut users) = (Vec::new(), Vec::new());
         events
             .into_iter()
-            .map(|(kind, node, data)| (kind, node, mask(&data)))
+            .map(|(kind, node, data)| {
+                let data = relabel(&data, &mut seen, &mut users);
+                (kind, node, data)
+            })
             .collect::<Vec<_>>()
     };
 
@@ -682,7 +708,7 @@ async fn the_simulated_trace_equals_the_production_execution_on_the_same_answer(
         evidence: vec![format!("addon_tool:{}", tentaflow_protocol::processes::tool_source_ref(ADDON, TOOL))],
     };
     let waiting = store
-        .resolve_service(authorize(&store), SERVICE, answer, None)
+        .resolve_service(authorize(&store), SERVICE, None, answer, None)
         .expect("resolve the simulated step");
     let task_id = waiting.user_tasks.iter().find(|task| task.kind == ProcessUserTaskKind::Work)
         .expect("the simulation opens the user task")
@@ -705,4 +731,294 @@ async fn the_simulated_trace_equals_the_production_execution_on_the_same_answer(
             .expect("production instance")
             .variables
     );
+}
+
+fn expression_for(outcome: &str, code: &str) -> String {
+    format!(
+        r#"{{"outcome":"{outcome}","code":"{code}","summary":"decided","outputs":{{}},"evidence":[]}}"#
+    )
+}
+
+fn with_escalation(mapping: BTreeMap<String, String>) -> ProcessModel {
+    let mut model = chain_model(
+        ActivityVerification::Condition { expression: "true".into() },
+        Some(&expression_for("NeedsHuman", "ESC")),
+        ServiceImplementation::default(),
+    );
+    model.escalations.push(tentaflow_protocol::processes::ProcessEscalationDeclaration {
+        escalation_id: "Esc_1".into(),
+        name: "Help".into(),
+        escalation_code: "ESC".into(),
+    });
+    model.nodes.push(node(
+        "Boundary_E",
+        ProcessNodeKind::BoundaryEscalation {
+            attached_to_id: SERVICE.into(),
+            escalation_ref: Some("Esc_1".into()),
+            cancel_activity: false,
+            output_mapping: mapping,
+        },
+    ));
+    // A handler must wait for a person before it may end.
+    model.nodes.push(node(
+        "Esc_User",
+        ProcessNodeKind::UserTask {
+            assignee_user_id: Some("user-simulation".into()),
+            output_mapping: BTreeMap::new(),
+        },
+    ));
+    model.nodes.push(node("End_Esc", ProcessNodeKind::End));
+    model.sequence_flows.push(edge("ToEsc", "Boundary_E", "Esc_User"));
+    model.sequence_flows.push(edge("EscEnd", "Esc_User", "End_Esc"));
+    model
+}
+
+#[test]
+fn an_escalation_boundary_catches_a_business_needs_human_result() {
+    let mut store = started(with_escalation(BTreeMap::new()));
+    drive_to_service(&mut store);
+    let view = store
+        .resolve_service(authorize(&store), SERVICE, None, completed(json!({"answer": 1})), None)
+        .expect("resolve");
+    assert!(kinds(&view).contains(&"escalation_caught@Boundary_E".to_owned()), "{:?}", kinds(&view));
+}
+
+#[test]
+fn a_failing_escalation_handler_leaves_an_incident_and_names_the_ids_it_wrote() {
+    let mut store = started(with_escalation(BTreeMap::from([(
+        "x".to_owned(),
+        "outputs.missing.deeper.still".to_owned(),
+    )])));
+    drive_to_service(&mut store);
+    let view = store
+        .resolve_service(authorize(&store), SERVICE, None, completed(json!({"answer": 1})), None)
+        .expect("a handler that cannot run is an incident, not a failed answer");
+    assert!(view.incidents.iter().any(|incident| incident.code == "ESCALATION_HANDLER_FAILED"));
+    // The trace names the result event under the identity it was written with.
+    let result_event = view
+        .events
+        .iter()
+        .find(|event| event.kind == "service_result")
+        .expect("result event");
+    let step = view.trace_steps.last().expect("trace step");
+    assert_eq!(step.data["result"]["events"]["0"], json!(result_event.event_id));
+}
+
+#[test]
+fn activity_io_on_a_service_step_and_agent_steps_are_refused_by_name() {
+    let mut model = human_chain();
+    model.nodes[2].activity_io = Some(tentaflow_protocol::processes::ProcessActivityIo {
+        data_inputs: Vec::new(),
+        data_outputs: Vec::new(),
+        input_set_id: "InputSet".into(),
+        input_set: Vec::new(),
+        output_set_id: "OutputSet".into(),
+        output_set: Vec::new(),
+        input_associations: Vec::new(),
+        output_associations: Vec::new(),
+        coordinator_output: None,
+    });
+    let message = format!("{:#}", create_store(source_input_for(model)).expect_err("activity IO"));
+    assert!(message.contains("activity IO is unsupported") && message.contains(SERVICE), "{message}");
+
+    let agent = chain_model(
+        ActivityVerification::Condition { expression: "true".into() },
+        None,
+        super::agent_sink_tests::agent_implementation("11111111-2222-4333-8444-555555555555", &[], None),
+    );
+    let error = create_store(source_input_for(agent)).expect_err("agent step");
+    let message = format!("{error:#}");
+    assert!(message.contains("agent steps need the report sink") && message.contains(SERVICE), "{message}");
+    assert!(error
+        .downcast_ref::<super::simulation::SimulationUnsupportedActivity>()
+        .is_some());
+}
+
+#[test]
+fn fixture_verdicts_are_held_to_the_verification_of_the_step() {
+    let test_step = |on| ActivityVerification::Test { flow_id: "flow-verifier".into(), on_failure: on };
+    let model_with = |verification| chain_model(verification, None, ServiceImplementation::default());
+    let fixture_of = |result: ActivityResult, verdict| ProcessSimulationServiceFixture {
+        result: Some(result),
+        verdict,
+        ..fixture(SERVICE, ProcessSimulationServiceMode::Fixture)
+    };
+    let failed = ActivityResult {
+        outcome: ActivityOutcome::Error,
+        code: Some("FLOW_ERROR".into()),
+        summary: "failed".into(),
+        outputs: Value::Null,
+        evidence: Vec::new(),
+    };
+    let cases = [
+        // a machine verification needs the verdict of a completing fixture
+        (test_step(VerificationOnFailure::Error), fixture_of(completed(json!({})), None)),
+        // a human or condition step takes none
+        (ActivityVerification::Human, fixture_of(completed(json!({})), Some(ProcessSimulationVerdict::Approved))),
+        // and neither does a result that never reaches the verifier
+        (test_step(VerificationOnFailure::Error), fixture_of(failed, Some(ProcessSimulationVerdict::Approved))),
+    ];
+    for (verification, fixture) in cases {
+        let mut store = create_store(source_input_for(model_with(verification))).expect("capture");
+        let error = store.set_service_fixtures(&[fixture]).expect_err("refused at Start");
+        assert_eq!(service_error(&error), SERVICE_FIXTURE_INVALID, "{error:#}");
+    }
+    // A fixture with its verdict applies on advance.
+    let mut store = create_store(source_input_for(model_with(test_step(VerificationOnFailure::Error))))
+        .expect("capture");
+    store
+        .set_service_fixtures(&[fixture_of(completed(json!({"answer": 4})), Some(ProcessSimulationVerdict::Approved))])
+        .expect("complete fixture");
+    store.start(authorize(&store), json!({"value": 1})).expect("start");
+    drive_to_service(&mut store);
+    let view = store.advance(authorize(&store)).expect("fixture applies");
+    assert!(kinds(&view).contains(&"verification_passed@Service_1".to_owned()));
+}
+
+#[test]
+fn a_fixture_that_cannot_be_applied_does_not_stop_the_clock() {
+    // The result expression decides at run time that the work completes, which a
+    // Start check cannot see, so the verdict is missing only when the step is reached.
+    let expression = expression_for("Completed", "");
+    let expression = expression.replace(r#""code":"""#, r#""code":null"#);
+    let model = chain_model(
+        ActivityVerification::Test { flow_id: "flow-verifier".into(), on_failure: VerificationOnFailure::Error },
+        Some(&expression),
+        ServiceImplementation::default(),
+    );
+    let mut store = create_store(source_input_for(model)).expect("capture");
+    store
+        .set_service_fixtures(&[ProcessSimulationServiceFixture {
+            result: Some(completed(json!({"answer": 1}))),
+            ..fixture(SERVICE, ProcessSimulationServiceMode::Fixture)
+        }])
+        .expect("accepted: the final outcome is not known at Start");
+    store.start(authorize(&store), json!({"value": 1})).expect("start");
+    let waiting = drive_to_service(&mut store);
+    let before = waiting.clock.step_index;
+    let after = store.advance(authorize(&store)).expect("advance goes on");
+    assert_eq!(after.clock.step_index, before + 1, "the virtual clock still ticks");
+    assert_eq!(after.service_waits.len(), 1, "the step still waits for the operator");
+}
+
+#[test]
+fn the_operators_answer_is_checked_like_a_fixture() {
+    let mut store = started(human_chain());
+    drive_to_service(&mut store);
+    let mut bad_code = completed(json!({}));
+    bad_code.code = Some("not a valid code!".into());
+    let error = store
+        .resolve_service(authorize(&store), SERVICE, None, bad_code, None)
+        .expect_err("code charset");
+    assert_eq!(service_error(&error), super::simulation::SERVICE_ANSWER_INVALID);
+    let mut needs_human = completed(json!({}));
+    needs_human.outcome = ActivityOutcome::NeedsHuman;
+    needs_human.code = Some("ESC".into());
+    let error = store
+        .resolve_service(authorize(&store), SERVICE, None, needs_human.clone(), None)
+        .expect_err("a plain step cannot ask for a person");
+    assert_eq!(service_error(&error), super::simulation::SERVICE_OUTCOME_NOT_PRODUCIBLE);
+    assert_eq!(store.view(authorize(&store)).expect("view").service_waits.len(), 1);
+    let mut fixture_store = create_store(source_input_for(human_chain())).expect("capture");
+    let error = fixture_store
+        .set_service_fixtures(&[ProcessSimulationServiceFixture {
+            result: Some(needs_human),
+            ..fixture(SERVICE, ProcessSimulationServiceMode::Fixture)
+        }])
+        .expect_err("fixtures follow the same rule");
+    assert_eq!(service_error(&error), SERVICE_FIXTURE_INVALID);
+}
+
+#[test]
+fn node_ids_are_checked_before_they_reach_a_message() {
+    let hostile = "node not found";
+    let mut store = create_store(source_input_for(human_chain())).expect("capture");
+    let error = store
+        .set_service_fixtures(&[fixture(hostile, ProcessSimulationServiceMode::Result)])
+        .expect_err("invalid id");
+    assert_eq!(service_error(&error), SERVICE_FIXTURE_INVALID);
+    assert!(!format!("{error:#}").contains("not found"));
+    store.start(authorize(&store), json!({"value": 1})).expect("start");
+    let error = store
+        .resolve_service(authorize(&store), hostile, None, completed(json!({})), None)
+        .expect_err("invalid id");
+    assert_eq!(service_error(&error), SERVICE_NOT_WAITING);
+    assert!(!format!("{error:#}").contains("not found"));
+}
+
+#[test]
+fn several_jobs_on_one_node_need_a_job_id() {
+    use super::repository::ProcessJob;
+    use super::simulation::pick_waiting_job;
+
+    // A model cannot send two tokens into one activity (it has one incoming
+    // flow), so the selection rule is held on the jobs it chooses from.
+    let job = |id: &str, node_id: &str, status: &str| ProcessJob {
+        job_id: id.into(),
+        instance_id: "i".into(),
+        scope_id: "i".into(),
+        node_id: node_id.into(),
+        token_id: format!("token-{id}"),
+        input: json!({}),
+        status: status.into(),
+        attempt: 0,
+        fence: 0,
+        worker_id: None,
+        lease_until_ms: None,
+        result: None,
+        result_origin: None,
+        observed_result_event_id: None,
+    };
+    let jobs = [
+        job("job-a", SERVICE, "queued"),
+        job("job-b", SERVICE, "queued"),
+        job("job-c", SERVICE, "completed"),
+        job("job-d", "Other_1", "queued"),
+    ];
+    let error = pick_waiting_job(&jobs, SERVICE, None).expect_err("two jobs wait");
+    assert_eq!(service_error(&error), super::simulation::SERVICE_AMBIGUOUS);
+    assert_eq!(pick_waiting_job(&jobs, SERVICE, Some("job-b")).expect("named").job_id, "job-b");
+    let error = pick_waiting_job(&jobs, SERVICE, Some("job-c")).expect_err("not queued");
+    assert_eq!(service_error(&error), SERVICE_NOT_WAITING);
+    assert_eq!(pick_waiting_job(&jobs[3..], "Other_1", None).expect("single").job_id, "job-d");
+}
+
+#[test]
+fn a_critic_verdict_and_an_unavailable_verdict_follow_the_production_construction() {
+    let critic = || ActivityVerification::Critic {
+        agent_id: "11111111-2222-4333-8444-555555555555".into(),
+        criteria: "Is it right?".into(),
+        on_failure: VerificationOnFailure::Error,
+    };
+    let mut store = started(chain_model(critic(), None, ServiceImplementation::default()));
+    let waiting = drive_to_service(&mut store);
+    assert!(waiting.service_waits[0].verdict_applicable);
+    let approved = store
+        .resolve_service(
+            authorize(&store),
+            SERVICE,
+            None,
+            completed(json!({"answer": 1})),
+            Some(ProcessSimulationVerdict::Approved),
+        )
+        .expect("a critic approves by the operator's choice");
+    assert!(kinds(&approved).contains(&"verification_passed@Service_1".to_owned()));
+
+    let mut store = started(chain_model(critic(), None, ServiceImplementation::default()));
+    drive_to_service(&mut store);
+    let unavailable = store
+        .resolve_service(
+            authorize(&store),
+            SERVICE,
+            None,
+            completed(json!({"answer": 1})),
+            Some(ProcessSimulationVerdict::Unavailable),
+        )
+        .expect("unavailable verifier");
+    let task = unavailable
+        .user_tasks
+        .iter()
+        .find(|task| task.kind == ProcessUserTaskKind::Verification)
+        .expect("an unavailable verifier hands the result to a person");
+    assert_eq!(task.outputs["code"], "VERIFICATION_UNAVAILABLE");
 }

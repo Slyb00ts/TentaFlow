@@ -21250,6 +21250,9 @@ pub(crate) fn settle_simulation_service_on(
         result_event_id,
     )
     .map_err(refuse_result)?;
+    if retained_failure {
+        prepared.event_ids.insert(result_index, result_event_id.to_owned());
+    }
     let mut spare = event_ids.into_iter();
     for index in 0..prepared.events.len() {
         if !prepared.event_ids.contains_key(&index) {
@@ -26223,6 +26226,10 @@ fn validate_escalation_result_plan_on(
     has_escalation: bool,
     mode: ExecutionMode,
 ) -> Result<()> {
+    // A simulation names every event up front so its ids are repeatable;
+    // production leaves all but the result event to the writer.
+    let ids_exactly = |count: usize| plan.event_ids.len() == count
+        || matches!(mode, ExecutionMode::Simulation(_)) && plan.event_ids.len() >= count;
     let caught = plan
         .events
         .iter()
@@ -26301,10 +26308,6 @@ fn validate_escalation_result_plan_on(
                 "SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3 AND node_id=?4 AND status='waiting')",
                 params![instance.instance_id,source_scope,source_token_id,source_node_id],
                 |row| row.get(0))?;
-            // A simulation names every event up front so its ids are repeatable;
-            // production leaves all but the result event to the writer.
-            let ids_exactly = |count: usize| plan.event_ids.len() == count
-                || matches!(mode, ExecutionMode::Simulation(_)) && plan.event_ids.len() >= count;
             ensure!(plan.create_user_tasks.len() == 1,
                 "unselected NeedsHuman result differs from its factual Verification wait");
             let task = &plan.create_user_tasks[0];
@@ -26447,7 +26450,7 @@ fn validate_escalation_result_plan_on(
                 && plan.add_incidents[0].job_id.as_deref() == Some(job_id)
                 && plan.add_incidents[0].code == "ESCALATION_HANDLER_FAILED"
                 && !plan.add_incidents[0].can_retry
-                && plan.event_ids.is_empty()
+                && (plan.event_ids.is_empty() || matches!(mode, ExecutionMode::Simulation(_)))
                 && plan.events.len() == 2
                 && plan.events[result_index].kind == "service_result"
                 && plan.events.iter().any(|event| event.kind == "incident"
@@ -26466,7 +26469,7 @@ fn validate_escalation_result_plan_on(
     let source_node = scope_node(model, &instance.process_id, scopes,
         &instance.instance_id, source_scope, source_node_id)?;
     ensure!(if source_node.activity_io.is_some() {
-            plan.event_ids.len() == 2
+            ids_exactly(2)
                 && plan.activity_io_results.len() == 1
                 && plan.activity_io_results[0].result_event_index == result_index
                 && matches!(&plan.activity_io_results[0].disposition,
@@ -26474,7 +26477,7 @@ fn validate_escalation_result_plan_on(
                         fate: ActivityIoRetainedFate::AwaitingVerification { .. }
                             | ActivityIoRetainedFate::BoundaryEscalation { .. }, .. })
         } else {
-            plan.event_ids.len() == 1
+            ids_exactly(1)
         }, "escalation catch assigned an unrelated event identity");
     let event = caught[0];
     let expected = serde_json::json!({
