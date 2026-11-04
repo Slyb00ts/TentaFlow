@@ -70,11 +70,13 @@ fn advance(store: &mut SimulationStore) -> SimulationView {
     store.advance(authorize(store)).expect("advance the run")
 }
 
-/// Advances up to `times` ticks; a finished run accepts no more.
+/// Advances up to `times` steps; a finished run and a clock on its horizon accept no more.
 fn advance_times(store: &mut SimulationStore, times: usize) -> SimulationView {
     let mut latest = view(store);
     for _ in 0..times {
-        if status(&latest) == ProcessInstanceStatus::Completed {
+        if status(&latest) == ProcessInstanceStatus::Completed
+            || latest.clock.now_ms >= latest.clock.horizon_ms
+        {
             break;
         }
         latest = advance(store);
@@ -352,17 +354,14 @@ fn a_message_expires_on_the_simulation_clock_not_the_wall_clock() {
         .expect("queue the message with a one second lifetime");
     let queued_at = sent.messages[0].received_at_ms;
     assert_eq!(sent.messages[0].expires_at_ms - queued_at, 1_000);
-    // Five ticks of 100 ms are half the lifetime: still alive, however long it
-    // took to run them.
-    let alive = advance_times(&mut store, 5);
-    assert_eq!(alive.messages[0].status, ProcessMessageStatus::Pending);
     assert!(
-        alive.messages[0].can_cancel,
-        "the lifetime is judged on the virtual clock"
+        sent.messages[0].can_cancel,
+        "alive on the virtual clock, however long the test took"
     );
-    let expired = advance_times(&mut store, 6);
+    // Nothing else is waiting on time: one advance goes straight to the expiry.
+    let expired = advance(&mut store);
     assert_eq!(expired.messages[0].status, ProcessMessageStatus::Expired);
-    assert!(expired.clock.now_ms >= queued_at + 1_000);
+    assert_eq!(expired.clock.now_ms, queued_at + 1_000);
     assert!(!expired.messages[0].can_cancel);
     assert_eq!(count(&expired, "message_delivered"), 0);
     let trace = expired
@@ -371,6 +370,30 @@ fn a_message_expires_on_the_simulation_clock_not_the_wall_clock() {
         .filter(|step| step.data["result"].get("expired_messages").is_some())
         .count();
     assert_eq!(trace, 1, "the expiry is part of exactly one traced step");
+}
+
+#[test]
+fn a_far_away_expiry_is_reached_by_one_advance() {
+    let mut input = input_for(receiving_model(false, false));
+    input.horizon_ms = input.start_ms + 4 * 60 * 60 * 1_000;
+    let mut store = create_store(input).expect("capture the source");
+    store
+        .start(authorize(&store), json!({}))
+        .expect("start the run");
+    let sent = store
+        .send_message(
+            authorize(&store),
+            "EvidenceReady",
+            "case-2",
+            json!({}),
+            Some(7_200),
+            None,
+        )
+        .expect("queue a message that lives two hours");
+    let expired = advance(&mut store);
+    assert_eq!(expired.messages[0].status, ProcessMessageStatus::Expired);
+    assert_eq!(expired.clock.now_ms, sent.messages[0].expires_at_ms);
+    assert_eq!(expired.clock.step_index, sent.clock.step_index + 1);
 }
 
 #[test]
@@ -475,7 +498,7 @@ fn a_message_that_matches_two_waits_is_recorded_ambiguous_and_never_delivered_by
     let waits = advance_times(&mut store, 1).subscriptions;
     assert_eq!(waits.len(), 2, "both branches are waiting");
     send(&mut store, "EvidenceReady", "case-1").expect("ambiguous message");
-    let ambiguous = advance_times(&mut store, 2);
+    let ambiguous = advance_times(&mut store, 1);
     assert_eq!(
         count(&ambiguous, "message_delivered"),
         0,
@@ -1003,7 +1026,7 @@ fn comparable(
     normalize_events(
         events
             .into_iter()
-            .filter(|(kind, _, _)| kind != "simulation_message_sent")
+            .filter(|(kind, _, _)| !kind.starts_with("simulation_"))
             .collect(),
     )
 }
@@ -1379,11 +1402,12 @@ fn a_message_that_arrived_before_a_due_timer_is_delivered_before_it() {
 #[test]
 fn a_timer_and_a_message_due_at_the_same_instant_go_timer_first() {
     let mut store = started_with_tick(timer_then_work_race_model(), 1_000);
-    advance(&mut store);
-    // The message is queued exactly when the two second timer falls due.
+    // A stray message takes one tick, so the real one is queued exactly when the
+    // two second timer falls due.
+    send(&mut store, "EvidenceReady", "stray").expect("queue a stray message");
     let queued = send(&mut store, "EvidenceReady", "case-1").expect("queue the message");
     assert_eq!(
-        queued.messages[0].received_at_ms,
+        queued.messages[1].received_at_ms,
         queued.timers[0].due_at_ms.expect("due")
     );
     let latest = advance(&mut store);
@@ -1393,8 +1417,8 @@ fn a_timer_and_a_message_due_at_the_same_instant_go_timer_first() {
 
 #[test]
 fn a_message_addressed_to_a_wait_that_lost_its_race_is_cancelled_like_production() {
-    let mut store = started_with_tick(timer_then_work_race_model(), 1_000);
-    advance(&mut store);
+    // A 2.5 s tick queues the message at +3.5 s, after the two second timer is due.
+    let mut store = started_with_tick(timer_then_work_race_model(), 2_500);
     let wait = view(&store).subscriptions[0].subscription_id.clone();
     store
         .send_message(
@@ -1766,4 +1790,297 @@ fn a_boundary_handler_script_whose_activity_io_input_fails_keeps_its_incident_in
             .count(),
         0
     );
+}
+
+/// Start, a catch that maps `amount = outputs.amount + 1`, a person step, end.
+fn paid_then_work_model() -> ProcessModel {
+    let mut model = mapping_failure_model();
+    model.nodes.insert(2, user_task("Work_1"));
+    model.sequence_flows = vec![
+        edge("ToCatch", "Start_1", "Catch_1"),
+        edge("CatchWork", "Catch_1", "Work_1"),
+        edge("WorkEnd", "Work_1", "End_1"),
+    ];
+    model
+}
+
+#[test]
+fn a_second_message_for_a_consumed_wait_makes_no_incident_in_a_simulation() {
+    let mut store = started(paid_then_work_model());
+    store
+        .send_message(
+            authorize(&store),
+            "EvidenceReady",
+            "case-1",
+            json!({"amount": 5}),
+            None,
+            None,
+        )
+        .expect("first message");
+    let delivered = advance(&mut store);
+    assert_eq!(count(&delivered, "message_delivered"), 1);
+    store
+        .send_message(
+            authorize(&store),
+            "EvidenceReady",
+            "case-1",
+            json!({"amount": 5}),
+            None,
+            None,
+        )
+        .expect("second message");
+    let latest = advance_times(&mut store, 3);
+    assert_eq!(
+        status(&latest),
+        ProcessInstanceStatus::Waiting,
+        "{:?}",
+        latest.incidents
+    );
+    assert!(latest.incidents.is_empty());
+    assert_eq!(latest.messages[1].status, ProcessMessageStatus::Pending);
+}
+
+#[test]
+fn a_second_message_for_a_consumed_wait_makes_no_incident_in_production() {
+    use super::messages::drain_pending;
+    use super::repository;
+    use super::runtime::test_support::{publish_model, stamp, Fixture};
+
+    let production = Fixture::new();
+    let version = publish_model(&production, &paid_then_work_model());
+    let instance = super::messages::test_support::start_version(&production, &version);
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut first = production_message(&version, &instance.instance_id);
+    first.payload = json!({"amount": 5});
+    let mut second = production_message(&version, &instance.instance_id);
+    second.payload = json!({"amount": 5});
+    repository::send_message(
+        &production.db,
+        &production.owner,
+        &stamp("first"),
+        &first,
+        now,
+    )
+    .unwrap();
+    drain_pending(&production.db, now + 1).completion.unwrap();
+    repository::send_message(
+        &production.db,
+        &production.owner,
+        &stamp("second"),
+        &second,
+        now + 2,
+    )
+    .unwrap();
+    drain_pending(&production.db, now + 3).completion.unwrap();
+    let events = repository::list_events(
+        &production.db,
+        &production.owner,
+        &instance.instance_id,
+        0,
+        100,
+    )
+    .unwrap()
+    .0;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "message_error")
+            .count(),
+        0
+    );
+    let state = repository::get_message(
+        &production.db,
+        &production.owner,
+        &production.owner.user_id,
+        &second.message_id,
+    )
+    .unwrap()
+    .message
+    .status;
+    assert_eq!(state, ProcessMessageStatus::Pending);
+}
+
+fn started_with_horizon(model: ProcessModel, horizon_ms: i64) -> SimulationStore {
+    let mut input = input_for(model);
+    input.horizon_ms = horizon_ms;
+    let mut store = create_store(input).expect("capture the source");
+    store
+        .start(authorize(&store), json!({}))
+        .expect("start the run");
+    store
+}
+
+#[test]
+fn a_two_minute_interrupting_timer_fires_on_one_advance_and_names_the_cancelled_task() {
+    let model = super::simulation_event_tests::boundary_model(
+        ProcessTimerSpec::Duration { seconds: 120 },
+        true,
+        Some(OWNER),
+    );
+    let mut store = started_with_horizon(model, 1_000 + 3_600_000);
+    let before = view(&store);
+    let fired = advance(&mut store);
+    assert_eq!(count(&fired, "timer_fired"), 1);
+    assert_eq!(fired.clock.now_ms - before.clock.start_ms, 120_000);
+    assert_eq!(fired.clock.step_index, before.clock.step_index + 1);
+    let cancelled = fired
+        .events
+        .iter()
+        .filter(|event| event.kind == "simulation_user_task_cancelled")
+        .collect::<Vec<_>>();
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(cancelled[0].node_id.as_deref(), Some("User_1"));
+    assert_eq!(cancelled[0].data["node_id"], "User_1");
+}
+
+#[test]
+fn an_interrupting_timer_names_the_waiting_service_job_it_cancels() {
+    use tentaflow_protocol::processes::{ActivityVerification, ServiceImplementation};
+    let mut model = super::simulation_event_tests::boundary_model(
+        ProcessTimerSpec::Duration { seconds: 120 },
+        true,
+        Some(OWNER),
+    );
+    model.nodes[1] = node(
+        "User_1",
+        ProcessNodeKind::ServiceTask {
+            flow_id: "flow-simulation-service".into(),
+            input_mapping: BTreeMap::new(),
+            output_mapping: BTreeMap::new(),
+            verification: ActivityVerification::Human,
+            timeout_seconds: 30,
+            result_expression: None,
+            implementation: ServiceImplementation::default(),
+        },
+    );
+    let mut store = started_with_horizon(model, 1_000 + 3_600_000);
+    let job_id = view(&store).service_waits[0].job_id.clone();
+    let fired = advance(&mut store);
+    assert!(fired.service_waits.is_empty());
+    let cancelled = fired
+        .events
+        .iter()
+        .filter(|event| event.kind == "simulation_service_cancelled")
+        .collect::<Vec<_>>();
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(cancelled[0].node_id.as_deref(), Some("User_1"));
+    assert_eq!(cancelled[0].data["job_id"], job_id);
+}
+
+#[test]
+fn a_run_that_jumps_over_minutes_repeats_with_the_same_ids_and_trace() {
+    let run = || {
+        let model = super::simulation_event_tests::boundary_model(
+            ProcessTimerSpec::Duration { seconds: 120 },
+            true,
+            Some(OWNER),
+        );
+        let mut store = started_with_horizon(model, 1_000 + 3_600_000);
+        let fired = advance(&mut store);
+        (
+            fired
+                .events
+                .iter()
+                .map(|event| {
+                    (
+                        event.event_id.clone(),
+                        event.kind.clone(),
+                        event.data.clone(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            fired
+                .trace_steps
+                .iter()
+                .map(|step| (step.trace_step_id.clone(), step.result_sha256.clone()))
+                .collect::<Vec<_>>(),
+            fired.clock.clone(),
+        )
+    };
+    assert_eq!(run(), run());
+}
+
+#[test]
+fn a_clock_on_its_horizon_refuses_with_a_stable_code_and_the_view_shows_the_horizon() {
+    let mut store = started(receiving_model(false, false));
+    // Nothing is waiting on time, so each advance is one idle tick until the
+    // clock stands on the horizon.
+    let mut at_horizon = view(&store);
+    for _ in 0..200 {
+        if at_horizon.clock.now_ms >= at_horizon.clock.horizon_ms {
+            break;
+        }
+        at_horizon = advance(&mut store);
+    }
+    assert_eq!(at_horizon.clock.now_ms, at_horizon.clock.horizon_ms);
+    let refusal = store
+        .advance(authorize(&store))
+        .expect_err("past the horizon");
+    let text = format!("{refusal:#}");
+    assert!(
+        text.starts_with(super::simulation::SIMULATION_HORIZON_REACHED),
+        "{text}"
+    );
+    assert!(
+        text.contains(&at_horizon.clock.horizon_ms.to_string()),
+        "{text}"
+    );
+    assert_eq!(view(&store).clock, at_horizon.clock);
+}
+
+#[test]
+fn two_messages_addressed_to_the_same_wait_deliver_once_and_cancel_the_second_without_an_incident()
+{
+    let mut model = receiving_model(false, false);
+    model.nodes = vec![
+        model.nodes[0].clone(),
+        node("Split", ProcessNodeKind::ParallelGateway),
+        message_catch("Catch_1", "case-1"),
+        message_catch("Catch_2", "case-1"),
+        node("Join", ProcessNodeKind::ParallelGateway),
+        node("End_1", ProcessNodeKind::End),
+    ];
+    model.sequence_flows = vec![
+        edge("ToSplit", "Start_1", "Split"),
+        edge("ToOne", "Split", "Catch_1"),
+        edge("ToTwo", "Split", "Catch_2"),
+        edge("OneJoin", "Catch_1", "Join"),
+        edge("TwoJoin", "Catch_2", "Join"),
+        edge("JoinEnd", "Join", "End_1"),
+    ];
+    let mut store = started(model);
+    let waits = advance(&mut store).subscriptions;
+    let wait_b = waits
+        .iter()
+        .find(|wait| wait.node_id == "Catch_2")
+        .expect("wait B")
+        .subscription_id
+        .clone();
+    for _ in 0..2 {
+        store
+            .send_message(
+                authorize(&store),
+                "EvidenceReady",
+                "case-1",
+                json!({}),
+                None,
+                Some(&wait_b),
+            )
+            .expect("addressed to wait B");
+    }
+    let latest = advance_times(&mut store, 3);
+    assert!(latest.incidents.is_empty(), "{:?}", latest.incidents);
+    assert_eq!(count(&latest, "message_delivered"), 1);
+    assert_eq!(
+        latest
+            .messages
+            .iter()
+            .map(|message| message.status.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            ProcessMessageStatus::Delivered,
+            ProcessMessageStatus::Cancelled
+        ]
+    );
+    assert_eq!(status(&latest), ProcessInstanceStatus::Waiting);
 }

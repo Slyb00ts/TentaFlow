@@ -1025,20 +1025,26 @@ fn simulation_clock_is_monotonic_and_horizon_bounded() {
         .accept_transition(10)
         .expect("accept initial transition");
     assert_eq!(clock.step_index, 1);
+    // The tick is the smallest step; a longer one is a jump to the next due item.
     assert!(clock.accept_transition(19).is_err());
-    assert!(clock.accept_transition(25).is_err());
-    clock
-        .accept_transition(20)
-        .expect("accept configured virtual tick");
+    assert_eq!(clock.time_toward(0).expect("never before the tick"), 20);
+    assert_eq!(clock.time_toward(25).expect("a jump"), 25);
+    assert_eq!(clock.time_toward(500).expect("never past the horizon"), 30);
     assert!(clock.accept_transition(31).is_err());
+    clock.accept_transition(25).expect("accept a jump");
+    // Less than a tick remains: the clock may land exactly on the horizon.
+    assert_eq!(clock.time_toward(27).expect("clamped to the horizon"), 30);
     clock
         .accept_transition(30)
-        .expect("accept final virtual tick");
+        .expect("accept the horizon itself");
     assert!(clock.next_time().is_err());
+    let refusal = clock.time_toward(40).expect_err("a clock on its horizon cannot move");
+    assert!(format!("{refusal:#}").starts_with(super::simulation::SIMULATION_HORIZON_REACHED));
+    assert!(format!("{refusal:#}").contains("30"));
 }
 
 #[test]
-fn simulation_timer_catch_waits_for_due_tick_and_reopens_with_injected_event_ids() {
+fn simulation_timer_catch_fires_at_its_due_time_in_one_advance_and_reopens_with_injected_event_ids() {
     let mut input = source_input_for(timer_catch_model(ProcessTimerSpec::Duration { seconds: 2 }));
     input.tick_duration_ms = 1_000;
     input.horizon_ms = 5_000;
@@ -1054,21 +1060,13 @@ fn simulation_timer_catch_waits_for_due_tick_and_reopens_with_injected_event_ids
         .iter()
         .all(|event| uuid::Uuid::parse_str(&event.event_id).is_ok()));
 
-    let before_due = store
-        .advance(test_authorization(&store))
-        .expect("advance before the timer due tick");
-    assert_eq!(before_due.clock.now_ms, 2_000);
-    assert_eq!(before_due.events, started.events);
-    assert_eq!(
-        before_due.timers[0].status,
-        ProcessTimerStatus::Pending,
-        "a waiting-only tick must preserve the factual timer"
-    );
-
+    // With nothing else to do the clock jumps straight to the due time: one
+    // advance, not one per tick.
     let fired = store
         .advance(test_authorization(&store))
         .expect("fire TimerCatch at its due tick");
     assert_eq!(fired.clock.now_ms, 3_000);
+    assert_eq!(fired.clock.step_index, started.clock.step_index + 1);
     assert_eq!(
         fired
             .events
@@ -1171,13 +1169,6 @@ fn simulation_timer_catch_date_and_working_duration_fire_from_pinned_rules_and_r
         "Simulation working hours"
     );
 
-    let date_before_due = date_store
-        .advance(test_authorization(&date_store))
-        .expect("advance Date TimerCatch before its due tick");
-    assert!(date_before_due
-        .events
-        .iter()
-        .all(|event| event.kind != "timer_fired"));
     let date_fired = date_store
         .advance(test_authorization(&date_store))
         .expect("fire Date TimerCatch at its due tick");
@@ -1396,7 +1387,7 @@ fn simulation_timer_catch_does_not_block_parallel_work_before_its_due_time() {
 }
 
 #[test]
-fn simulation_timer_catch_refuses_only_the_tick_beyond_horizon() {
+fn simulation_timer_catch_jumps_to_the_horizon_and_refuses_to_pass_it_with_a_stable_code() {
     let mut input = source_input_for(timer_catch_model(ProcessTimerSpec::Duration {
         seconds: 60,
     }));
@@ -1406,17 +1397,18 @@ fn simulation_timer_catch_refuses_only_the_tick_beyond_horizon() {
     store
         .start(test_authorization(&store), json!({}))
         .expect("start horizon TimerCatch simulation");
-    store
+    // The timer is due far beyond the horizon: the clock goes as far as it may.
+    let at_horizon = store
         .advance(test_authorization(&store))
-        .expect("advance to the first in-horizon tick");
-    store
-        .advance(test_authorization(&store))
-        .expect("advance to the final in-horizon tick");
-    assert_eq!(store.clock().now_ms, 3_000);
+        .expect("advance to the horizon");
+    assert_eq!(at_horizon.clock.now_ms, 3_000);
+    assert_eq!(at_horizon.clock.horizon_ms, 3_000);
     let error = store
         .advance(test_authorization(&store))
-        .expect_err("a tick beyond the configured horizon must be refused");
-    assert!(format!("{error:#}").contains("horizon"));
+        .expect_err("a clock on its horizon must be refused");
+    let text = format!("{error:#}");
+    assert!(text.starts_with(super::simulation::SIMULATION_HORIZON_REACHED), "{text}");
+    assert!(text.contains("3000"), "{text}");
     assert_eq!(store.clock().now_ms, 3_000);
 }
 
@@ -1441,9 +1433,6 @@ fn simulation_timer_catch_rolls_back_every_private_row_on_late_command_conflict(
     store
         .start(test_authorization(&store), json!({}))
         .expect("start TimerCatch simulation");
-    store
-        .advance(test_authorization(&store))
-        .expect("advance to the pre-due tick");
     let simulation_id = store.simulation_id().to_owned();
     let injected_command_id = Arc::new(Mutex::new(None));
     let injected_command_id_for_hook = Arc::clone(&injected_command_id);
@@ -2039,16 +2028,26 @@ fn simulation_view_returns_a_bounded_window_with_omitted_counts_and_stays_encoda
     }));
     input.tick_duration_ms = 10;
     input.horizon_ms = 20_000;
+    input.definition_id = "5f1c2a40-0000-4000-8000-000000000001".into();
     let mut store = create_store(input).expect("capture long TimerCatch source pin");
     store
         .start(test_authorization(&store), json!({}))
         .expect("start long simulation");
     let mut last = None;
     for _ in 0..260 {
+        // An advance jumps to the timer, so the history is built from operator
+        // messages: each is one traced transition.
         last = Some(
             store
-                .advance(test_authorization(&store))
-                .expect("advance the long simulation"),
+                .send_message(
+                    test_authorization(&store),
+                    "Progress",
+                    "case",
+                    json!({}),
+                    None,
+                    None,
+                )
+                .expect("step the long simulation"),
         );
     }
     let view = last.expect("at least one advance");

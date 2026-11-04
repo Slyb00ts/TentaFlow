@@ -3,7 +3,7 @@
 use anyhow::{bail, ensure, Context, Result};
 use rusqlite::Connection;
 
-pub const SIMULATION_SCHEMA_VERSION: i64 = 3;
+pub const SIMULATION_SCHEMA_VERSION: i64 = 4;
 
 const EXPECTED_TABLES: &[&str] = &[
     "simulation_schema_meta",
@@ -33,7 +33,7 @@ const EXPECTED_PROCESS_TABLES: &[&str] = &[
 
 const SCHEMA_DDL: &str = r#"
 CREATE TABLE simulation_schema_meta (
-    schema_version INTEGER PRIMARY KEY CHECK(schema_version = 3)
+    schema_version INTEGER PRIMARY KEY CHECK(schema_version = 4)
 );
 CREATE TABLE simulation_meta (
     simulation_id TEXT PRIMARY KEY CHECK(length(simulation_id) = 36),
@@ -140,7 +140,7 @@ WHEN NEW.simulation_id IS NOT OLD.simulation_id OR NEW.start_ms IS NOT OLD.start
   OR NEW.now_ms < OLD.now_ms OR NEW.now_ms > NEW.horizon_ms
   OR NEW.step_index <> OLD.step_index + 1 OR NEW.revision <> OLD.revision + 1
   OR (OLD.step_index = 0 AND NEW.now_ms <> OLD.now_ms)
-  OR (OLD.step_index > 0 AND NEW.now_ms <> OLD.now_ms + OLD.tick_duration_ms)
+  OR (OLD.step_index > 0 AND NEW.now_ms < OLD.now_ms + OLD.tick_duration_ms AND NEW.now_ms <> NEW.horizon_ms)
 BEGIN SELECT RAISE(ABORT, 'simulation clock must advance monotonically'); END;
 "#;
 

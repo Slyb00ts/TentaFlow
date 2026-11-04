@@ -182,6 +182,8 @@ fn a_simulated_boundary_timer_path_equals_the_production_execution() {
     let simulated_events = normalize_events(
         view.events
             .iter()
+            // The simulation also names the work an interrupting timer cancelled.
+            .filter(|event| !event.kind.starts_with("simulation_"))
             .map(|event| (event.kind.clone(), event.node_id.clone(), event.data.clone()))
             .collect::<Vec<(String, Option<String>, Value)>>(),
     );

@@ -1110,15 +1110,36 @@ impl SimulationClock {
             .now_ms
             .checked_add(self.tick_duration_ms)
             .context("simulation virtual clock overflow")?;
-        ensure!(
-            now <= self.horizon_ms,
-            "simulation virtual clock exceeded its horizon"
-        );
+        ensure!(now <= self.horizon_ms, self.horizon_error());
         Ok(now)
     }
 
+    /// The time an `advance` that is heading for `target` lands on: never before
+    /// the next tick, never beyond the horizon. A clock that already stands on
+    /// its horizon cannot move.
+    pub fn time_toward(&self, target: i64) -> Result<i64> {
+        ensure!(self.now_ms < self.horizon_ms, self.horizon_error());
+        let tick = self
+            .now_ms
+            .checked_add(self.tick_duration_ms)
+            .context("simulation virtual clock overflow")?;
+        Ok(target.max(tick).min(self.horizon_ms))
+    }
+
+    fn horizon_error(&self) -> anyhow::Error {
+        SimulationServiceError::new(
+            SIMULATION_HORIZON_REACHED,
+            format!(
+                "the virtual clock is at {} ms and cannot pass the horizon at {} ms",
+                self.now_ms, self.horizon_ms
+            ),
+        )
+    }
+
+    /// A transition lands at least one tick after the previous one, or exactly on
+    /// the horizon when less than a tick remains.
     pub fn accept_transition(&mut self, now_ms: i64) -> Result<()> {
-        let expected_now = if self.step_index == 0 {
+        let earliest = if self.step_index == 0 {
             self.now_ms
         } else {
             self.now_ms
@@ -1126,8 +1147,8 @@ impl SimulationClock {
                 .context("simulation virtual clock overflow")?
         };
         ensure!(
-            now_ms == expected_now,
-            "simulation transition does not match the configured virtual tick"
+            now_ms >= earliest || self.step_index > 0 && now_ms == self.horizon_ms && now_ms > self.now_ms,
+            "simulation transition is earlier than the configured virtual tick"
         );
         ensure!(
             now_ms <= self.horizon_ms,
@@ -1288,6 +1309,8 @@ pub const SIMULATION_MESSAGE_INVALID: &str = "SIMULATION_MESSAGE_INVALID";
 /// The message names a wait that is not an open message wait of the run.
 pub const SIMULATION_MESSAGE_SUBSCRIPTION_UNKNOWN: &str =
     "SIMULATION_MESSAGE_SUBSCRIPTION_UNKNOWN";
+/// The virtual clock stands on, or would pass, the horizon of the run.
+pub const SIMULATION_HORIZON_REACHED: &str = "SIMULATION_HORIZON_REACHED";
 pub const SERVICE_AMBIGUOUS: &str = "SIMULATION_SERVICE_AMBIGUOUS";
 pub const SERVICE_ANSWER_INVALID: &str = "SIMULATION_ANSWER_INVALID";
 pub const SERVICE_OUTCOME_NOT_PRODUCIBLE: &str = "SIMULATION_OUTCOME_NOT_PRODUCIBLE";
@@ -1640,7 +1663,7 @@ impl SimulationStore {
             .load_snapshot()?
             .context("simulation has not been started")?;
         let expected_revision = snapshot.instance.revision;
-        let now = self.clock.next_time()?;
+        let now = self.advance_target(&snapshot)?;
         self.prepare_ids();
         let due_timer = snapshot
             .timers
@@ -2105,6 +2128,52 @@ impl SimulationStore {
             None,
         )?;
         self.view_authorized()
+    }
+
+    /// Where `advance` lands. With a token ready the run is busy and the clock
+    /// moves one tick; otherwise it jumps to the earliest thing that is waiting
+    /// on time (a timer, a queued message or signal receipt, a message about to
+    /// expire, a prepared Service answer), and to one tick when nothing is. It
+    /// never passes the horizon.
+    fn advance_target(&self, snapshot: &RuntimeSnapshot) -> Result<i64> {
+        let tick = self
+            .clock
+            .now_ms
+            .checked_add(self.clock.tick_duration_ms)
+            .context("simulation virtual clock overflow")?;
+        if snapshot.tokens.iter().any(|token| token.status == "ready") {
+            return self.clock.time_toward(tick);
+        }
+        let mode = PrivateSimulationMode::prove(&self.conn)?;
+        let timers = snapshot
+            .timers
+            .iter()
+            .filter(|timer| {
+                matches!(
+                    timer.kind,
+                    tentaflow_protocol::processes::ProcessTimerKind::Catch
+                        | tentaflow_protocol::processes::ProcessTimerKind::Boundary
+                ) && matches!(
+                    timer.status,
+                    ProcessTimerStatus::Pending | ProcessTimerStatus::Blocked
+                )
+            })
+            .filter_map(|timer| Some(timer.due_at_ms?.max(timer.next_check_at_ms)))
+            .min();
+        let fixture = self
+            .next_fixture_job(snapshot)?
+            .is_some()
+            .then_some(self.clock.now_ms);
+        let target = [
+            timers,
+            repository::simulation_earliest_event_on(&self.conn, mode)?,
+            fixture,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(tick);
+        self.clock.time_toward(target.max(tick))
     }
 
     /// The next message or signal receipt the environment delivers at `now`:
@@ -2748,6 +2817,16 @@ impl SimulationStore {
                         {
                             tx.execute_batch("ROLLBACK TO simulated_delivery")?;
                             tx.execute_batch("RELEASE simulated_delivery")?;
+                            // Only a delivery that could be made and still failed is a
+                            // mapping failure; anything else is a fault of the run itself
+                            // and is not dressed up as the sender's incident.
+                            if !repository::simulation_message_still_ready_on(
+                                &tx,
+                                mode,
+                                &snapshot.candidate,
+                            )? {
+                                return Err(error);
+                            }
                             recorded_event_ids.borrow_mut().clear();
                             repository::record_message_failed_in_tx(
                                 &tx,
@@ -2876,6 +2955,16 @@ impl SimulationStore {
             )?
         };
 
+        if let Some(instance_id) = load_instance_id_tx(&tx, &self.simulation_id)? {
+            repository::simulation_record_cancelled_work_on(
+                &tx,
+                PrivateSimulationMode::prove(&self.conn)?,
+                &self.actor,
+                &instance_id,
+                at_ms,
+                &mut || self.ids.borrow_mut().next_id("event"),
+            )?;
+        }
         let mut next_clock = self.clock.clone();
         next_clock.accept_transition(at_ms)?;
         tx.execute(

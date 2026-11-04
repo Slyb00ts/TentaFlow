@@ -21397,6 +21397,141 @@ pub(crate) fn simulation_next_signal_receipt_on(
     .map_err(Into::into)
 }
 
+/// The earliest moment something already queued in the private database becomes
+/// actionable on the simulation clock: a message that matches, is ambiguous or
+/// has a closed target (when it became due), a signal receipt (when it falls
+/// due), or any live message at its expiry. A message with no match is not an
+/// event until it expires.
+pub(crate) fn simulation_earliest_event_on(
+    conn: &Connection,
+    mode: PrivateSimulationMode,
+) -> Result<Option<i64>> {
+    mode.verify_on(conn)?;
+    let mut earliest: Option<i64> = None;
+    let mut note = |at_ms: i64| earliest = Some(earliest.map_or(at_ms, |known| known.min(at_ms)));
+    let expiry: Option<i64> = conn.query_row(
+        "SELECT MIN(expires_at_ms) FROM bpmn_messages
+         WHERE status IN ('pending','blocked','ambiguous')",
+        [],
+        |row| row.get(0),
+    )?;
+    if let Some(at_ms) = expiry {
+        note(at_ms);
+    }
+    let receipt: Option<i64> = conn.query_row(
+        "SELECT MIN(COALESCE(next_check_at_ms,lease_until_ms)) FROM bpmn_signal_receipts
+         WHERE status IN ('pending','claimed')",
+        [],
+        |row| row.get(0),
+    )?;
+    if let Some(at_ms) = receipt {
+        note(at_ms);
+    }
+    let mut query = conn.prepare(
+        "SELECT org_id,sender_user_id,message_id,revision,next_check_at_ms FROM bpmn_messages
+         WHERE status IN ('pending','blocked') AND expires_at_ms>next_check_at_ms
+         ORDER BY next_check_at_ms,received_at_ms,sender_user_id,message_id",
+    )?;
+    let candidates = query
+        .query_map([], |row| {
+            Ok(MessageCandidate {
+                key: MessageKey {
+                    org_id: row.get(0)?,
+                    sender_user_id: row.get(1)?,
+                    message_id: row.get(2)?,
+                },
+                revision: row_u64(row, 3)?,
+                next_check_at_ms: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for candidate in candidates {
+        let actionable = match message_selection_on(conn, &candidate) {
+            Ok(MessageSelection::Ready(_) | MessageSelection::Ambiguous) => true,
+            Ok(_) => false,
+            Err(error) => error.downcast_ref::<MessageClosed>().is_some(),
+        };
+        if actionable {
+            note(candidate.next_check_at_ms);
+            break;
+        }
+    }
+    Ok(earliest)
+}
+
+/// Whether the message still matches exactly one open wait of the run. A failed
+/// delivery is a mapping failure only if it was a delivery that could be made.
+pub(crate) fn simulation_message_still_ready_on(
+    conn: &Connection,
+    mode: PrivateSimulationMode,
+    candidate: &MessageCandidate,
+) -> Result<bool> {
+    mode.verify_on(conn)?;
+    Ok(matches!(
+        message_selection_on(conn, candidate),
+        Ok(MessageSelection::Ready(_))
+    ))
+}
+
+/// Work the transition at `at_ms` took away from the run: a waiting Service job
+/// or an open person step whose activity was interrupted. Production keeps the
+/// ids in the interrupting event (`cancelled_job_ids`, `cancelled_user_task_ids`);
+/// the simulation also names the step, one event per job or task.
+pub(crate) fn simulation_record_cancelled_work_on(
+    tx: &Transaction<'_>,
+    mode: PrivateSimulationMode,
+    actor: &ProcessActor,
+    instance_id: &str,
+    at_ms: i64,
+    next_event_id: &mut dyn FnMut() -> String,
+) -> Result<usize> {
+    mode.verify_on(tx)?;
+    let mut work = Vec::new();
+    {
+        let mut jobs = tx.prepare(
+            "SELECT job_id,node_id,scope_id FROM bpmn_jobs
+             WHERE instance_id=?1 AND status='cancelled' AND updated_at_ms=?2 ORDER BY job_id",
+        )?;
+        for row in jobs.query_map(params![instance_id, at_ms], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })? {
+            let (job_id, node_id, scope_id) = row?;
+            work.push(PlannedEvent {
+                scope_id,
+                kind: "simulation_service_cancelled".into(),
+                node_id: Some(node_id.clone()),
+                data: serde_json::json!({"job_id":job_id,"node_id":node_id}),
+            });
+        }
+        let mut tasks = tx.prepare(
+            "SELECT user_task_id,node_id,scope_id FROM bpmn_user_tasks
+             WHERE instance_id=?1 AND status='cancelled' AND updated_at_ms=?2 ORDER BY user_task_id",
+        )?;
+        for row in tasks.query_map(params![instance_id, at_ms], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })? {
+            let (task_id, node_id, scope_id) = row?;
+            work.push(PlannedEvent {
+                scope_id,
+                kind: "simulation_user_task_cancelled".into(),
+                node_id: Some(node_id.clone()),
+                data: serde_json::json!({"user_task_id":task_id,"node_id":node_id}),
+            });
+        }
+    }
+    let count = work.len();
+    for event in work {
+        let seq = tx.query_row(
+            "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+            [instance_id],
+            |row| row_u64(row, 0),
+        )?;
+        let event_id = next_event_id();
+        insert_event_on(tx, instance_id, seq, Some(&actor.user_id), &event, at_ms, Some(&event_id))?;
+    }
+    Ok(count)
+}
+
 /// What one simulated signal receipt did.
 pub(crate) enum SimulatedSignalStep {
     Delivered(Box<ProcessInstance>),
