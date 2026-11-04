@@ -1596,3 +1596,174 @@ fn a_simulation_proof_does_not_open_a_production_transaction() {
     )
     .contains("private simulation database"));
 }
+
+/// A non-interrupting boundary timer whose handler is a Script step with
+/// authored activity IO: `input` is a CEL input association (none when absent),
+/// `output` the expression its output association evaluates.
+fn boundary_script_io_model(input: Option<&str>, output: &str) -> ProcessModel {
+    use tentaflow_protocol::processes::{
+        ProcessActivityIo, ProcessBodyModeling, ProcessDataObject, ProcessDataObjectReference,
+        ProcessInputAssociation, ProcessIoDataInput, ProcessIoDataOutput, ProcessOutputAssociation,
+    };
+    let mut model = super::simulation_event_tests::boundary_model(
+        ProcessTimerSpec::Duration { seconds: 1 },
+        false,
+        None,
+    );
+    model.variables.insert("answer".into(), Value::Null);
+    model.variables.insert("mapped".into(), Value::Null);
+    model.modeling = Some(ProcessBodyModeling {
+        data_objects: vec![ProcessDataObject {
+            id: "Object_Script".into(),
+            name: None,
+        }],
+        data_object_references: vec![ProcessDataObjectReference {
+            id: "Ref_Script".into(),
+            name: None,
+            data_object_ref: "Object_Script".into(),
+            variable_binding_key: Some("mapped".into()),
+        }],
+        ..ProcessBodyModeling::default()
+    });
+    let mut handler = node(
+        "Handler_1",
+        ProcessNodeKind::ScriptTask {
+            script: "1 + 1".into(),
+            output_mapping: BTreeMap::from([("answer".into(), "outputs".into())]),
+        },
+    );
+    handler.activity_io = Some(ProcessActivityIo {
+        data_inputs: input
+            .map(|_| {
+                vec![ProcessIoDataInput {
+                    id: "Input_Script".into(),
+                    name: None,
+                }]
+            })
+            .unwrap_or_default(),
+        data_outputs: vec![ProcessIoDataOutput {
+            id: "Output_Script".into(),
+            name: None,
+            value_expression: output.into(),
+        }],
+        input_set_id: "InputSet_Script".into(),
+        input_set: input
+            .map(|_| vec!["Input_Script".into()])
+            .unwrap_or_default(),
+        output_set_id: "OutputSet_Script".into(),
+        output_set: vec!["Output_Script".into()],
+        input_associations: input
+            .map(|expression| {
+                vec![ProcessInputAssociation::CelAssignment {
+                    id: "Association_Input".into(),
+                    from_expression: expression.into(),
+                    target_input_id: "Input_Script".into(),
+                }]
+            })
+            .unwrap_or_default(),
+        output_associations: vec![ProcessOutputAssociation {
+            id: "Association_Script".into(),
+            source_output_id: "Output_Script".into(),
+            target_object_ref_id: "Ref_Script".into(),
+        }],
+        coordinator_output: None,
+    });
+    model.nodes[3] = handler;
+    model
+}
+
+/// Fires the boundary timer of `model` through the production drain and returns
+/// the instance history.
+fn drained_boundary_history(
+    model: &ProcessModel,
+) -> Vec<tentaflow_protocol::processes::ProcessEvent> {
+    use super::repository;
+    use super::runtime::test_support::{start_model, Fixture};
+    use super::timers::drain_due;
+
+    let production = Fixture::new();
+    let instance = start_model(&production, model);
+    let now = chrono::Utc::now().timestamp_millis();
+    let drained = drain_due(&production.db, now + 5_000);
+    drained.completion.expect("the boundary drain");
+    assert_eq!(
+        drained.fired, 1,
+        "the boundary timer fires and its handler path is written"
+    );
+    repository::list_events(
+        &production.db,
+        &production.owner,
+        &instance.instance_id,
+        0,
+        100,
+    )
+    .expect("history")
+    .0
+}
+
+// The timer event is inserted in front of the plan, so every fact that names a
+// plan event by position has to move with it. A boundary timer plan can carry
+// an activity IO input capture or failure, and a result with its disposition,
+// from a Script handler that runs inside the same plan. It cannot carry a
+// continuation fact: those are written when a person approves a verification,
+// never by a timer firing. Return failures of a nested scope and the repetition
+// capacity or aggregate indexes need a sub-process or a repeated step on the
+// handler path and are covered by their own shift only by inspection.
+
+#[test]
+fn a_boundary_handler_script_with_activity_io_applies_its_input_and_output_in_production() {
+    let events = drained_boundary_history(&boundary_script_io_model(Some("1"), "outputs"));
+    let kinds = events
+        .iter()
+        .map(|event| event.kind.as_str())
+        .collect::<Vec<_>>();
+    let position = |kind: &str| {
+        kinds
+            .iter()
+            .position(|candidate| *candidate == kind)
+            .expect(kind)
+    };
+    assert!(position("timer_fired") < position("activity_io_input_captured"));
+    assert!(position("activity_io_input_captured") < position("activity_io_output_applied"));
+    assert!(position("activity_io_output_applied") < position("script_completed"));
+}
+
+#[test]
+fn a_boundary_handler_script_whose_activity_io_output_blocks_keeps_its_incident_in_production() {
+    let events = drained_boundary_history(&boundary_script_io_model(Some("1"), "1 / 0"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "incident"
+                && event.data["code"] == "ACTIVITY_IO_OUTPUT_FAILED")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "script_completed")
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn a_boundary_handler_script_whose_activity_io_input_fails_keeps_its_incident_in_production() {
+    let events = drained_boundary_history(&boundary_script_io_model(Some("1 / 0"), "outputs"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "incident"
+                && event.data["code"] == "ACTIVITY_IO_INPUT_FAILED")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "script_completed")
+            .count(),
+        0
+    );
+}
