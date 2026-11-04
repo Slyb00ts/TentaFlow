@@ -2078,6 +2078,34 @@ pub struct ProcessSimulationServiceWait {
     pub verdict_applicable: bool,
 }
 
+/// A message or signal wait of a simulated run that the operator can answer
+/// (a message) or that only the model itself can release (a signal).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSimulationSubscription {
+    pub subscription_id: String,
+    pub kind: ProcessSubscriptionKind,
+    pub node_id: String,
+    pub node_name: String,
+    pub scope_id: String,
+    pub token_id: String,
+    #[serde(default)]
+    pub message_name: Option<String>,
+    #[serde(default)]
+    pub correlation_key: Option<String>,
+    #[serde(default)]
+    pub signal_namespace_uri: Option<String>,
+    #[serde(default)]
+    pub signal_declaration_id: Option<String>,
+    /// The event-based gateway race this wait belongs to.
+    #[serde(default)]
+    pub race_id: Option<String>,
+    /// Virtual time at which a timer of the same activation or race fires: the
+    /// moment the wait stops being the only way forward.
+    #[serde(default)]
+    pub due_at_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessSimulationView {
@@ -2094,6 +2122,13 @@ pub struct ProcessSimulationView {
     /// Service steps waiting for a result, oldest first.
     #[serde(default)]
     pub service_waits: Vec<ProcessSimulationServiceWait>,
+    /// Open message and signal waits of the run, oldest first.
+    #[serde(default)]
+    pub subscriptions: Vec<ProcessSimulationSubscription>,
+    /// Every message the run sent or received, oldest first, with its lifetime
+    /// judged on the simulation clock.
+    #[serde(default)]
+    pub messages: Vec<ProcessMessageSummary>,
     /// Oldest events dropped from `events` to keep the response within one frame.
     #[serde(default)]
     pub events_omitted: u64,
@@ -2402,6 +2437,22 @@ pub enum ProcessPayload {
         verdict: Option<ProcessSimulationVerdict>,
     },
     SimulationServiceResolveResponse {
+        view: ProcessSimulationView,
+    },
+    SimulationMessageSendRequest {
+        simulation_id: String,
+        message_name: String,
+        correlation_key: String,
+        #[serde(default)]
+        payload: Value,
+        /// Lifetime on the simulation clock; the default is one hour.
+        #[serde(default)]
+        ttl_seconds: Option<u32>,
+        /// Addresses one wait exactly when several share a name and key.
+        #[serde(default)]
+        subscription_id: Option<String>,
+    },
+    SimulationMessageSendResponse {
         view: ProcessSimulationView,
     },
 }

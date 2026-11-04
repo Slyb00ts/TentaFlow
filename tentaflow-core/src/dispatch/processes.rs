@@ -150,6 +150,8 @@ fn simulation_view(view: simulation::SimulationView) -> Result<ProcessSimulation
             })
             .collect(),
         service_waits: view.service_waits,
+        subscriptions: view.subscriptions,
+        messages: view.messages,
         activity_io_witnesses: view
             .activity_io_witnesses
             .into_iter()
@@ -1166,6 +1168,32 @@ pub fn process_dispatch(
                 view: simulation_view(view).map_err(error)?,
             }
         }
+        P::SimulationMessageSendRequest {
+            simulation_id,
+            message_name,
+            correlation_key,
+            payload,
+            ttl_seconds,
+            subscription_id,
+        } => {
+            let view = ctx
+                .state
+                .simulation_registry
+                .with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
+                    store.send_message(
+                        authorization,
+                        message_name,
+                        correlation_key,
+                        payload.clone(),
+                        *ttl_seconds,
+                        subscription_id.as_deref(),
+                    )
+                })
+                .map_err(error)?;
+            P::SimulationMessageSendResponse {
+                view: simulation_view(view).map_err(error)?,
+            }
+        }
         P::SimulationReleaseRequest { simulation_id } => {
             ctx.state
                 .simulation_registry
@@ -1206,6 +1234,7 @@ pub fn process_dispatch(
         | P::SimulationUserTaskCompleteResponse { .. }
         | P::SimulationManualTaskAcknowledgeResponse { .. }
         | P::SimulationServiceResolveResponse { .. }
+        | P::SimulationMessageSendResponse { .. }
         | P::SimulationReleaseResponse { .. } => {
             return Err(ProtocolError::bad_request(
                 "process responses are not accepted as requests",
@@ -1262,6 +1291,7 @@ register_request!("ProcessSimulationAdvanceRequest");
 register_request!("ProcessSimulationUserTaskCompleteRequest");
 register_request!("ProcessSimulationManualTaskAcknowledgeRequest");
 register_request!("ProcessSimulationServiceResolveRequest");
+register_request!("ProcessSimulationMessageSendRequest");
 register_request!("ProcessSimulationReleaseRequest");
 
 #[cfg(test)]
@@ -1944,6 +1974,174 @@ mod tests {
         )
         .await;
         assert_eq!(production_row_counts(&state), before);
+    }
+
+    async fn send_simulated_message(
+        ctx: &HandlerContext,
+        simulation_id: &str,
+        subscription_id: Option<String>,
+    ) -> tentaflow_protocol::processes::ProcessSimulationView {
+        let P::SimulationMessageSendResponse { view } = request(
+            ctx,
+            P::SimulationMessageSendRequest {
+                simulation_id: simulation_id.to_owned(),
+                message_name: "EvidenceReady".into(),
+                correlation_key: "case-1".into(),
+                payload: json!({"value": 42}),
+                ttl_seconds: None,
+                subscription_id,
+            },
+        )
+        .await
+        else {
+            panic!("private simulation message response expected")
+        };
+        view
+    }
+
+    async fn advance_simulation(
+        ctx: &HandlerContext,
+        simulation_id: &str,
+    ) -> tentaflow_protocol::processes::ProcessSimulationView {
+        let P::SimulationAdvanceResponse { view } = request(
+            ctx,
+            P::SimulationAdvanceRequest { simulation_id: simulation_id.to_owned() },
+        )
+        .await
+        else {
+            panic!("private simulation advance expected")
+        };
+        view
+    }
+
+    #[tokio::test]
+    async fn a_simulated_message_reaches_only_its_own_run_and_writes_no_production_row() {
+        use crate::processes::messages::{drain_pending, test_support::receiving_model};
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "simulation-message-owner");
+        let ctx = context(&state, &actor);
+        let published = save_and_publish(&ctx, receiving_model(false, false)).await;
+        // A production instance of the same definition waits on the same name and key.
+        let P::InstanceStartResponse { instance } = request(
+            &ctx,
+            P::InstanceStartRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: published.definition_id.clone(),
+                version: 1,
+                variables: json!({}),
+                process_id: None,
+                start_node_id: None,
+            },
+        )
+        .await
+        else {
+            panic!("production instance expected")
+        };
+        assert_eq!(instance.subscriptions.len(), 1);
+        let before = production_row_counts(&state);
+
+        let P::SimulationStartResponse { view } =
+            request(&ctx, simulation_start(&published.definition_id)).await
+        else {
+            panic!("private simulation start expected")
+        };
+        assert_eq!(view.subscriptions.len(), 1, "the run lists its own wait");
+        let queued = send_simulated_message(&ctx, &view.simulation_id, None).await;
+        assert_eq!(queued.messages.len(), 1);
+        let mut latest = queued;
+        for _ in 0..6 {
+            if latest.instance.as_ref().map(|instance| instance.status.clone())
+                == Some(ProcessInstanceStatus::Completed)
+            {
+                break;
+            }
+            latest = advance_simulation(&ctx, &view.simulation_id).await;
+        }
+        assert!(latest.events.iter().any(|event| event.kind == "message_delivered"));
+        assert_eq!(
+            latest.instance.as_ref().expect("private instance").status,
+            ProcessInstanceStatus::Completed
+        );
+        // The production worker finds nothing to deliver and the production wait is untouched.
+        let drained = drain_pending(&state.db, i64::MAX / 4);
+        drained.completion.expect("production drain");
+        assert_eq!(drained.delivered, 0);
+        request(
+            &ctx,
+            P::SimulationReleaseRequest { simulation_id: view.simulation_id.clone() },
+        )
+        .await;
+        assert_eq!(
+            production_row_counts(&state),
+            before,
+            "a simulated message must not write a production message, receipt or event"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_production_message_never_reaches_a_simulated_run() {
+        use crate::processes::messages::{drain_pending, test_support::receiving_model};
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "simulation-reverse-owner");
+        let ctx = context(&state, &actor);
+        let published = save_and_publish(&ctx, receiving_model(false, false)).await;
+        let P::InstanceStartResponse { instance } = request(
+            &ctx,
+            P::InstanceStartRequest {
+                command_id: uuid::Uuid::new_v4().to_string(),
+                definition_id: published.definition_id.clone(),
+                version: 1,
+                variables: json!({}),
+                process_id: None,
+                start_node_id: None,
+            },
+        )
+        .await
+        else {
+            panic!("production instance expected")
+        };
+        let P::SimulationStartResponse { view } =
+            request(&ctx, simulation_start(&published.definition_id)).await
+        else {
+            panic!("private simulation start expected")
+        };
+
+        let now = chrono::Utc::now().timestamp_millis();
+        repository::send_message(
+            &state.db,
+            &actor,
+            &test_support::stamp("production message beside a simulation"),
+            &repository::PreparedMessage {
+                message_id: uuid::Uuid::new_v4().to_string(),
+                target: tentaflow_protocol::processes::ProcessMessageTarget::Catch {
+                    definition_id: published.definition_id.clone(),
+                    instance_id: Some(instance.instance_id.clone()),
+                    subscription_id: None,
+                },
+                message_name: "EvidenceReady".into(),
+                correlation_key: "case-1".into(),
+                payload: json!({"value": 1}),
+                ttl_seconds: 120,
+            },
+            now,
+        )
+        .expect("production send");
+        let drained = drain_pending(&state.db, now + 1);
+        drained.completion.expect("production drain");
+        assert_eq!(drained.delivered, 1, "the production instance received its message");
+
+        let mut latest = view;
+        for _ in 0..4 {
+            latest = advance_simulation(&ctx, &latest.simulation_id).await;
+        }
+        assert!(latest.messages.is_empty(), "the run saw no production message");
+        assert_eq!(latest.subscriptions.len(), 1, "the run still waits");
+        assert!(!latest.events.iter().any(|event| event.kind == "message_delivered"));
+        request(
+            &ctx,
+            P::SimulationReleaseRequest { simulation_id: latest.simulation_id.clone() },
+        )
+        .await;
     }
 
     #[tokio::test]

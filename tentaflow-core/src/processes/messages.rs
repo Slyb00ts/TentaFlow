@@ -219,6 +219,14 @@ pub(super) fn mapped_variables(
 pub fn plan_message_delivery(prepared: &MessageSnapshot, at_ms: i64,
     signal_admission: Option<&super::runtime::SignalAdmissionResolver<'_>>,
 ) -> Result<RuntimePlan> {
+    plan_message_delivery_with_id_source(prepared, at_ms, signal_admission,
+        super::runtime::random_runtime_id_source())
+}
+
+pub fn plan_message_delivery_with_id_source(prepared: &MessageSnapshot, at_ms: i64,
+    signal_admission: Option<&super::runtime::SignalAdmissionResolver<'_>>,
+    id_source: super::runtime::RuntimeIdSourceHandle,
+) -> Result<RuntimePlan> {
     let m = &prepared.message;
     let payload = m
         .payload
@@ -289,7 +297,7 @@ pub fn plan_message_delivery(prepared: &MessageSnapshot, at_ms: i64,
                 expected_message_revision: m.revision,
                 target_subscription_id: Some(subscription.subscription_id.clone()),
                 expected_subscription_revision: Some(subscription.revision),
-            }, signal_admission),
+            }, signal_admission, id_source),
     }
 }
 #[derive(Debug)]

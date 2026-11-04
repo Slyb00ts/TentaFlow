@@ -3893,8 +3893,11 @@ impl<'a> Transition<'a> {
             &repeat_extra,
             self.captured_activity_inputs(&node.id, &token.token_id)?.as_deref(),
         )?;
-        let prepared = super::messages::prepare_throw(self.model, node, &variables,
+        let mut prepared = super::messages::prepare_throw(self.model, node, &variables,
             &body_extra)?;
+        // The message id comes from the transition's source so a private simulation
+        // names it repeatably; production draws a random one exactly as before.
+        prepared.message_id = self.next_id("message");
         let event_index = self.plan.events.len();
         let repeated = self.repetition_for_token(&token.token_id);
         let event_id = self.next_id("runtime");
@@ -7943,8 +7946,10 @@ pub(super) fn plan_message_catch(
     now_ms: i64,
     accepted_input: AcceptedInputRef,
     signal_admission: Option<&SignalAdmissionResolver<'_>>,
+    id_source: RuntimeIdSourceHandle,
 ) -> Result<RuntimePlan> {
-    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
+    let mut transition = Transition::from_snapshot_with_id_source(
+        snapshot, now_ms, signal_admission, id_source)?;
     transition.accepted_input = Some(accepted_input);
     transition.current_scope = subscription.scope_id.clone();
     let node = transition.node(&subscription.node_id)?.clone();
@@ -8151,9 +8156,26 @@ pub(super) fn plan_signal_catch(
     accepted_input: AcceptedInputRef,
     signal_admission: Option<&SignalAdmissionResolver<'_>>,
 ) -> Result<RuntimePlan> {
+    plan_signal_catch_with_id_source(snapshot, subscription, payload, signal_id,
+        source_event_id, now_ms, accepted_input, signal_admission,
+        random_runtime_id_source())
+}
+
+pub(super) fn plan_signal_catch_with_id_source(
+    snapshot: &RuntimeSnapshot,
+    subscription: &super::repository::EventSubscription,
+    payload: &Value,
+    signal_id: &str,
+    source_event_id: &str,
+    now_ms: i64,
+    accepted_input: AcceptedInputRef,
+    signal_admission: Option<&SignalAdmissionResolver<'_>>,
+    id_source: RuntimeIdSourceHandle,
+) -> Result<RuntimePlan> {
     ensure!(subscription.kind == tentaflow_protocol::processes::ProcessSubscriptionKind::SignalCatch,
         "signal receipt requires its exact SignalCatch subscription");
-    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
+    let mut transition = Transition::from_snapshot_with_id_source(
+        snapshot, now_ms, signal_admission, id_source)?;
     transition.accepted_input = Some(accepted_input);
     transition.current_scope = subscription.scope_id.clone();
     let node = transition.node(&subscription.node_id)?.clone();

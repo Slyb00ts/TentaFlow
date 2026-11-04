@@ -4609,6 +4609,7 @@ pub fn archive_definition(
                     now,
                     None,
                     None,
+                    None,
                 )?;
             }
         }
@@ -21151,6 +21152,248 @@ pub(crate) fn apply_simulation_plan_on(
     instance_on(tx, actor, instance_id, None)
 }
 
+/// Advances the instance revision for a simulated transition that changes no
+/// instance state of its own (an operator's message that is only queued, a
+/// signal receipt that ended without reaching its wait), so one revision keeps
+/// fencing every transition of the run. The optional event is appended to the
+/// instance history under the given identity.
+pub(crate) fn simulation_touch_instance_on(
+    tx: &Transaction<'_>,
+    mode: PrivateSimulationMode,
+    actor: &ProcessActor,
+    instance_id: &str,
+    expected_revision: u64,
+    at_ms: i64,
+    event: Option<(PlannedEvent, &str)>,
+) -> Result<ProcessInstance> {
+    mode.verify_on(tx)?;
+    require_instance_reader(tx, actor, instance_id)?;
+    let touched = tx.execute(
+        "UPDATE bpmn_instances SET revision=revision+1,updated_at_ms=?1
+         WHERE instance_id=?2 AND revision=?3 AND status NOT IN ('completed','cancelled','error')",
+        params![at_ms, instance_id, sql_incrementable(expected_revision)?],
+    )?;
+    ensure!(
+        touched == 1,
+        RevisionConflict("process instance revision conflict or closed instance")
+    );
+    if let Some((event, event_id)) = event {
+        let seq = tx.query_row(
+            "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+            [instance_id],
+            |row| row_u64(row, 0),
+        )?;
+        insert_event_on(tx, instance_id, seq, Some(&actor.user_id), &event, at_ms, Some(event_id))?;
+    }
+    instance_on(tx, actor, instance_id, None)
+}
+
+/// Fence of a simulated signal claim: derived from the receipt and the attempt,
+/// so a repeated run claims with the same fences.
+pub(crate) fn simulation_signal_fence(receipt_id: &str, attempt: u32) -> String {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_OID,
+        format!("tentaflow.simulation.v1/signal-fence/{receipt_id}/{attempt}").as_bytes(),
+    )
+    .to_string()
+}
+
+/// Queues a message an operator sends into a private simulation. The message is
+/// addressed to the simulation's own instance, so no other row of the database
+/// (and no production row at all) can ever be its recipient.
+pub(crate) fn simulation_send_message_on(
+    tx: &Transaction<'_>,
+    mode: PrivateSimulationMode,
+    actor: &ProcessActor,
+    prepared: &PreparedMessage,
+    at_ms: i64,
+) -> Result<MessageRecord> {
+    mode.verify_on(tx)?;
+    ensure!(
+        matches!(&prepared.target, ProcessMessageTarget::Catch { instance_id: Some(_), .. }),
+        "a simulated message must address the simulated instance"
+    );
+    insert_message_on(tx, actor, prepared, None, PendingEntryDebit::default(), at_ms)
+}
+
+/// The next message whose address matches exactly one open wait of the run, in
+/// the order production drains them. A message with no match, an ambiguous match
+/// or a closed target is left untouched: it keeps waiting until it expires on the
+/// simulation clock.
+pub(crate) fn simulation_next_message_on(
+    conn: &Connection,
+    mode: PrivateSimulationMode,
+    at_ms: i64,
+) -> Result<Option<MessageSnapshot>> {
+    mode.verify_on(conn)?;
+    let mut query = conn.prepare(
+        "SELECT org_id,sender_user_id,message_id,revision,next_check_at_ms FROM bpmn_messages
+         WHERE status IN ('pending','blocked') AND next_check_at_ms<=?1 AND expires_at_ms>?1
+         ORDER BY received_at_ms,sender_user_id,message_id",
+    )?;
+    let candidates = query
+        .query_map([at_ms], |row| {
+            Ok(MessageCandidate {
+                key: MessageKey {
+                    org_id: row.get(0)?,
+                    sender_user_id: row.get(1)?,
+                    message_id: row.get(2)?,
+                },
+                revision: row_u64(row, 3)?,
+                next_check_at_ms: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for candidate in candidates {
+        match message_selection_on(conn, &candidate) {
+            Ok(MessageSelection::Ready(snapshot)) => {
+                ensure!(
+                    matches!(snapshot.target, MessageDeliveryTarget::Catch { .. }),
+                    "a simulation never starts an instance from a message"
+                );
+                return Ok(Some(snapshot));
+            }
+            Ok(_) => {}
+            Err(error) if error.downcast_ref::<MessageClosed>().is_some() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+/// Expires every message whose lifetime ended on the simulation clock, exactly
+/// as the production drain does before it delivers anything. `receipt_event_id`
+/// names the receipt event each expiry appends to the sender's history.
+pub(crate) fn simulation_expire_messages_on(
+    tx: &Transaction<'_>,
+    mode: PrivateSimulationMode,
+    at_ms: i64,
+    receipt_event_id: &mut dyn FnMut() -> String,
+) -> Result<Vec<String>> {
+    mode.verify_on(tx)?;
+    let mut query = tx.prepare(
+        "SELECT org_id,sender_user_id,message_id FROM bpmn_messages
+         WHERE status IN ('pending','blocked','ambiguous') AND expires_at_ms<=?1
+         ORDER BY expires_at_ms,message_id",
+    )?;
+    let keys = query
+        .query_map([at_ms], |row| {
+            Ok(MessageKey {
+                org_id: row.get(0)?,
+                sender_user_id: row.get(1)?,
+                message_id: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(query);
+    let mut expired = Vec::new();
+    for key in keys {
+        let message = message_on(tx, &key, true)?;
+        let event_id = receipt_event_id();
+        if update_message_state_on(
+            tx,
+            &message,
+            ProcessMessageStatus::Expired,
+            Some("ttl_expired"),
+            at_ms,
+            at_ms,
+            None,
+            None,
+            Some(&event_id),
+        )? {
+            expired.push(key.message_id);
+        }
+    }
+    Ok(expired)
+}
+
+/// The oldest signal receipt that is due on the simulation clock.
+pub(crate) fn simulation_next_signal_receipt_on(
+    conn: &Connection,
+    mode: PrivateSimulationMode,
+    at_ms: i64,
+) -> Result<Option<String>> {
+    mode.verify_on(conn)?;
+    conn.query_row(
+        "SELECT receipt_id FROM bpmn_signal_receipts
+         WHERE (status='pending' AND next_check_at_ms<=?1)
+            OR (status='claimed' AND lease_until_ms<=?1)
+         ORDER BY COALESCE(next_check_at_ms,lease_until_ms),receipt_id LIMIT 1",
+        [at_ms],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// What one simulated signal receipt did.
+pub(crate) enum SimulatedSignalStep {
+    Delivered(Box<ProcessInstance>),
+    /// The receipt ended without reaching its recipient (expired, recipient
+    /// closed); the run's instance is as it was.
+    Settled,
+    Untouched,
+}
+
+/// Claims and delivers one signal receipt in the caller's transaction. Production
+/// commits the claim before it delivers so a crash between them is recoverable;
+/// a private run has no crash to recover from, so both happen in one step.
+pub(crate) fn simulation_deliver_signal_on(
+    tx: &Transaction<'_>,
+    simulated: &SimulatedDelivery<'_>,
+    receipt_id: &str,
+    at_ms: i64,
+) -> Result<SimulatedSignalStep> {
+    simulated.mode.verify_on(tx)?;
+    let attempt = claim_signal_receipt_in_tx(tx, receipt_id, at_ms, &simulation_signal_fence)?;
+    let Some(claim) = attempt.claim else {
+        return Ok(if attempt.write {
+            SimulatedSignalStep::Settled
+        } else {
+            SimulatedSignalStep::Untouched
+        });
+    };
+    let delivery = deliver_signal_receipt_in_tx(tx, &claim, None, at_ms, Some(simulated))?;
+    match delivery.outcome {
+        Some(outcome) => {
+            ensure!(
+                outcome.cancelled_claims.is_empty(),
+                "a simulated signal cancelled a worker claim"
+            );
+            Ok(SimulatedSignalStep::Delivered(Box::new(outcome.instance)))
+        }
+        None if delivery.write => Ok(SimulatedSignalStep::Settled),
+        None => Ok(SimulatedSignalStep::Untouched),
+    }
+}
+
+/// Every message of a private run, oldest first, with its lifetime judged on the
+/// simulation clock.
+pub(crate) fn simulation_message_summaries_on(
+    conn: &Connection,
+    mode: PrivateSimulationMode,
+    actor: &ProcessActor,
+    now_ms: i64,
+) -> Result<Vec<ProcessMessageSummary>> {
+    mode.verify_on(conn)?;
+    let mut query = conn.prepare(
+        "SELECT org_id,sender_user_id,message_id FROM bpmn_messages
+         ORDER BY received_at_ms,sender_user_id,message_id",
+    )?;
+    let keys = query
+        .query_map([], |row| {
+            Ok(MessageKey {
+                org_id: row.get(0)?,
+                sender_user_id: row.get(1)?,
+                message_id: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    keys.iter()
+        .map(|key| message_summary_at(conn, actor, &message_on(conn, key, false)?, &|| Ok(now_ms)))
+        .collect()
+}
+
 /// The worker identity a private simulation gives to the answer it plays back.
 const SIMULATION_SERVICE_WORKER: &str = "simulation";
 
@@ -21907,7 +22150,7 @@ fn apply_plan_with_mode_on(
                 signal_cohorts.get(&signal.signal_id)
                     .context("signal admission lacks its source-time recipient cohort")?,
                 *admission_debits.get(&event_index)
-                    .context("Signal admission has no source-time pending debit")?, at_ms)?;
+                    .context("Signal admission has no source-time pending debit")?, at_ms, mode)?;
         }
     }
     for request in &plan.call_requests {
@@ -29930,6 +30173,17 @@ fn message_summary_on(
     actor: &ProcessActor,
     m: &MessageRecord,
 ) -> Result<ProcessMessageSummary> {
+    message_summary_at(conn, actor, m, &now_ms)
+}
+
+/// The summary against an explicit clock: a private simulation measures message
+/// expiry on its virtual time, never on the wall clock.
+fn message_summary_at(
+    conn: &Connection,
+    actor: &ProcessActor,
+    m: &MessageRecord,
+    clock: &dyn Fn() -> Result<i64>,
+) -> Result<ProcessMessageSummary> {
     require_message_target_on(conn, actor, &m.target)?;
     let owns_namespace = actor.user_id == m.key.sender_user_id;
     let mutable = matches!(
@@ -29937,7 +30191,7 @@ fn message_summary_on(
         ProcessMessageStatus::Pending
             | ProcessMessageStatus::Blocked
             | ProcessMessageStatus::Ambiguous
-    ) && m.expires_at_ms > now_ms()?;
+    ) && m.expires_at_ms > clock()?;
     let source_readable = match &m.source_instance_id {
         Some(id) => match require_instance_reader(conn, actor, id) {
             Ok(_) => true,
@@ -30137,6 +30391,7 @@ fn insert_signal_on(
     recipients: &[EventSubscription],
     debit: PendingEntryDebit,
     at_ms: i64,
+    mode: ExecutionMode,
 ) -> Result<()> {
     ensure!(Uuid::parse_str(&signal.signal_id).is_ok()
         && Uuid::parse_str(source_event_id).is_ok()
@@ -30242,7 +30497,8 @@ fn insert_signal_on(
              terminal_reason,revision,attempt_count,claim_fence,claim_owner,lease_until_ms,
              next_check_at_ms,delivered_at_ms,terminal_at_ms,incident_id)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'pending',NULL,1,0,NULL,NULL,NULL,?14,NULL,NULL,NULL)",
-            params![Uuid::new_v4().to_string(),signal.signal_id,recipient.org_id,
+            params![simulation_derived_id(mode, "signal-receipt",
+                    &format!("{}/{ordinal}", signal.signal_id)),signal.signal_id,recipient.org_id,
                 recipient.instance_id,recipient.definition_id,recipient.version,
                 recipient_pin.model_sha256,recipient.scope_id,recipient.node_id,
                 recipient.token_id,recipient.subscription_id,recipient.token_id,
@@ -30250,6 +30506,16 @@ fn insert_signal_on(
     }
     signal_receipt_ordinals_on(tx, &signal.signal_id)?;
     Ok(())
+}
+
+/// A row identity that is random for a durable run and derived from its parent
+/// for a private simulation, so the same input produces the same rows.
+fn simulation_derived_id(mode: ExecutionMode, kind: &str, parent: &str) -> String {
+    match mode {
+        ExecutionMode::Durable => Uuid::new_v4().to_string(),
+        ExecutionMode::Simulation(_) => Uuid::new_v5(&Uuid::NAMESPACE_OID,
+            format!("tentaflow.simulation.v1/{kind}/{parent}").as_bytes()).to_string(),
+    }
 }
 
 fn signal_receipt_ordinals_on(conn: &Connection, signal_id: &str) -> Result<()> {
@@ -30448,6 +30714,35 @@ pub fn claim_signal_receipt(
 ) -> Result<Option<SignalClaim>> {
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
+    let attempt = claim_signal_receipt_in_tx(&tx, receipt_id, at_ms,
+        &|_, _| Uuid::new_v4().to_string())?;
+    if attempt.write {
+        tx.commit()?;
+    }
+    Ok(attempt.claim)
+}
+
+/// What one claim attempt did to its transaction: a settled or claimed receipt
+/// must be committed by the caller, an untouched one may be dropped.
+pub(crate) struct SignalClaimAttempt {
+    pub claim: Option<SignalClaim>,
+    pub write: bool,
+}
+
+impl SignalClaimAttempt {
+    fn unchanged() -> Self { Self { claim: None, write: false } }
+    fn settled() -> Self { Self { claim: None, write: true } }
+}
+
+/// The transaction part of a signal receipt claim. `fence` names the claim from
+/// the receipt and its attempt number: random in production, derived in a
+/// private simulation so a repeated run claims with the same fences.
+pub(crate) fn claim_signal_receipt_in_tx(
+    tx: &Transaction<'_>,
+    receipt_id: &str,
+    at_ms: i64,
+    fence: &dyn Fn(&str, u32) -> String,
+) -> Result<SignalClaimAttempt> {
     let row: Option<(String, String, String, String, u64, u32, Option<String>, i64,
         String, String, String, String, u64, Option<String>, Option<String>, Option<i64>)> = tx.query_row(
         "SELECT r.signal_id,r.recipient_subscription_id,r.recipient_instance_id,
@@ -30466,18 +30761,17 @@ pub fn claim_signal_receipt(
         attempts, payload_json, expires_at_ms, payload_sha256, source_event_id,
         org_id, sender_user_id, subscription_revision, current_fence,
         current_owner, current_lease)) = row else {
-        return Ok(None);
+        return Ok(SignalClaimAttempt::unchanged());
     };
-    signal_receipt_ordinals_on(&tx, &signal_id)?;
-    if status != "pending" && status != "claimed" { return Ok(None); }
-    let subscription = subscription_on(&tx, &subscription_id)?;
+    signal_receipt_ordinals_on(tx, &signal_id)?;
+    if status != "pending" && status != "claimed" { return Ok(SignalClaimAttempt::unchanged()); }
+    let subscription = subscription_on(tx, &subscription_id)?;
     if at_ms >= expires_at_ms {
-        settle_signal_receipt_on(&tx, receipt_id, &signal_id, revision,
+        settle_signal_receipt_on(tx, receipt_id, &signal_id, revision,
             "expired", Some("ttl_expired"), None, at_ms)?;
-        tx.commit()?;
-        return Ok(None);
+        return Ok(SignalClaimAttempt::settled());
     }
-    if !subscription_live_on(&tx, &subscription)?
+    if !subscription_live_on(tx, &subscription)?
         || subscription.status != ProcessSubscriptionStatus::Open {
         let reason = if subscription.status == ProcessSubscriptionStatus::Error {
             "activation_error"
@@ -30486,18 +30780,16 @@ pub fn claim_signal_receipt(
         } else {
             "recipient_closed"
         };
-        settle_signal_receipt_on(&tx, receipt_id, &signal_id, revision,
+        settle_signal_receipt_on(tx, receipt_id, &signal_id, revision,
             "cancelled", Some(reason), None, at_ms)?;
-        tx.commit()?;
-        return Ok(None);
+        return Ok(SignalClaimAttempt::settled());
     }
     let sender = ProcessActor { org_id: org_id.clone(), user_id: sender_user_id };
-    if let Err(error) = require_instance_reader(&tx, &sender, &recipient_instance_id) {
+    if let Err(error) = require_instance_reader(tx, &sender, &recipient_instance_id) {
         if error.downcast_ref::<ProcessAuthorityDenied>().is_none() { return Err(error); }
-        settle_signal_receipt_on(&tx, receipt_id, &signal_id, revision,
+        settle_signal_receipt_on(tx, receipt_id, &signal_id, revision,
             "denied", Some("recipient_access_revoked"), None, at_ms)?;
-        tx.commit()?;
-        return Ok(None);
+        return Ok(SignalClaimAttempt::settled());
     }
     let payload_json = payload_json.context("live signal receipt has no retained payload")?;
     ensure!(hex::encode(Sha256::digest(payload_json.as_bytes())) == payload_sha256,
@@ -30508,20 +30800,19 @@ pub fn claim_signal_receipt(
         [&recipient_instance_id], |row| row.get(0))?;
     let actor = ProcessActor { org_id, user_id: recipient };
     let recipient_authority = require_call_control_authority_on(
-        &tx, &actor, &recipient_instance_id)
-        .and_then(|()| require_version_execution_on(&tx, &actor,
+        tx, &actor, &recipient_instance_id)
+        .and_then(|()| require_version_execution_on(tx, &actor,
             &subscription.definition_id, subscription.version));
     if let Err(error) = recipient_authority {
         if error.downcast_ref::<ProcessAuthorityDenied>().is_none() { return Err(error); }
-        settle_signal_receipt_on(&tx, receipt_id, &signal_id, revision,
+        settle_signal_receipt_on(tx, receipt_id, &signal_id, revision,
             "denied", Some("recipient_access_revoked"), None, at_ms)?;
-        tx.commit()?;
-        return Ok(None);
+        return Ok(SignalClaimAttempt::settled());
     }
     if status == "claimed" && attempts < 5 {
         ensure!(attempts >= 1, "claimed signal receipt has no factual attempt");
         let lease = current_lease.context("claimed signal receipt has no lease")?;
-        if lease > at_ms { return Ok(None); }
+        if lease > at_ms { return Ok(SignalClaimAttempt::unchanged()); }
         let fence = current_fence.context("claimed signal receipt has no fence")?;
         let owner = current_owner.context("claimed signal receipt has no owner")?;
         ensure!(owner == actor.user_id,
@@ -30538,8 +30829,7 @@ pub fn claim_signal_receipt(
             params![next_check,receipt_id,signal_id,sql_integer(revision)?,
                 fence,owner,lease,at_ms,attempts])?;
         ensure!(changed == 1, "expired signal receipt changed before recovery");
-        tx.commit()?;
-        return Ok(None);
+        return Ok(SignalClaimAttempt::settled());
     }
     if attempts >= 5 {
         ensure!(status == "claimed"
@@ -30547,15 +30837,14 @@ pub fn claim_signal_receipt(
             && current_owner.as_deref() == Some(actor.user_id.as_str()),
             "exhausted signal receipt lacks its fifth expired claim");
         let fence = current_fence.context("exhausted signal receipt lacks its fifth fence")?;
-        let snapshot = runtime_snapshot_on(&tx, &actor, &recipient_instance_id)?;
+        let snapshot = runtime_snapshot_on(tx, &actor, &recipient_instance_id)?;
         let claim = SignalClaim { receipt_id: receipt_id.to_owned(), signal_id,
             revision, fence, subscription, actor, snapshot, payload,
             source_event_id };
-        finalize_signal_delivery_failure_on(&tx, &claim, at_ms)?;
-        tx.commit()?;
-        return Ok(None);
+        finalize_signal_delivery_failure_on(tx, &claim, at_ms)?;
+        return Ok(SignalClaimAttempt::settled());
     }
-    let fence = Uuid::new_v4().to_string();
+    let fence = fence(receipt_id, attempts + 1);
     let lease_until_ms = at_ms.checked_add(30_000)
         .context("signal receipt lease overflow")?;
     let affected = tx.execute(
@@ -30568,15 +30857,14 @@ pub fn claim_signal_receipt(
             OR (status='claimed' AND lease_until_ms<=?6))",
         params![fence,actor.user_id,lease_until_ms,receipt_id,
             sql_integer(revision)?,at_ms])?;
-    if affected == 0 { return Ok(None); }
+    if affected == 0 { return Ok(SignalClaimAttempt::unchanged()); }
     ensure!(subscription.revision == subscription_revision,
         "signal subscription changed during claim");
-    let snapshot = runtime_snapshot_on(&tx, &actor, &recipient_instance_id)?;
+    let snapshot = runtime_snapshot_on(tx, &actor, &recipient_instance_id)?;
     let claim = SignalClaim { receipt_id: receipt_id.to_owned(), signal_id,
         revision: revision + 1, fence, subscription, actor, snapshot,
         payload, source_event_id };
-    tx.commit()?;
-    Ok(Some(claim))
+    Ok(SignalClaimAttempt { claim: Some(claim), write: true })
 }
 
 fn finalize_signal_delivery_failure_on(
@@ -30644,7 +30932,35 @@ pub fn deliver_signal_receipt(
         ProcessPlanInput::Canonical => (None, pool.write()?),
     };
     let tx = conn.transaction()?;
-    if !signal_claim_provenance_on(&tx, claim)? { return Ok(None); }
+    let delivery = deliver_signal_receipt_in_tx(&tx, claim, composite.as_ref(), at_ms, None)?;
+    if delivery.write {
+        tx.commit()?;
+    }
+    Ok(delivery.outcome)
+}
+
+/// What one signal delivery attempt did to its transaction.
+pub(crate) struct SignalDelivery {
+    pub outcome: Option<ProcessTransitionOutcome>,
+    pub write: bool,
+}
+
+impl SignalDelivery {
+    fn unchanged() -> Self { Self { outcome: None, write: false } }
+    fn settled() -> Self { Self { outcome: None, write: true } }
+}
+
+/// The transaction part of a signal delivery: the caller owns the transaction
+/// and commits it when `write` is set.
+pub(crate) fn deliver_signal_receipt_in_tx(
+    tx: &Transaction<'_>,
+    claim: &SignalClaim,
+    composite: Option<&RuntimePlan>,
+    at_ms: i64,
+    simulated: Option<&SimulatedDelivery<'_>>,
+) -> Result<SignalDelivery> {
+    let instance_id = &claim.subscription.instance_id;
+    if !signal_claim_provenance_on(tx, claim)? { return Ok(SignalDelivery::unchanged()); }
     let state: Option<(String, u64, Option<String>, String, String, String)> = tx.query_row(
         "SELECT r.status,r.revision,r.claim_fence,r.recipient_subscription_id,
                 e.payload_sha256,e.source_event_id
@@ -30653,41 +30969,39 @@ pub fn deliver_signal_receipt(
         params![claim.receipt_id,claim.signal_id], |row| Ok((row.get(0)?,
             row_u64(row,1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional()?;
     let Some((status, revision, fence, subscription_id, payload_sha256,
-        source_event_id)) = state else { return Ok(None) };
+        source_event_id)) = state else { return Ok(SignalDelivery::unchanged()) };
     if status != "claimed" || revision != claim.revision
         || fence.as_deref() != Some(claim.fence.as_str())
         || subscription_id != claim.subscription.subscription_id
         || source_event_id != claim.source_event_id
         || hex::encode(Sha256::digest(json(&claim.payload)?.as_bytes())) != payload_sha256 {
-        return Ok(None);
+        return Ok(SignalDelivery::unchanged());
     }
-    let subscription = subscription_on(&tx, &subscription_id)?;
-    if !subscription_live_on(&tx, &subscription)?
+    let subscription = subscription_on(tx, &subscription_id)?;
+    if !subscription_live_on(tx, &subscription)?
         || subscription.status != ProcessSubscriptionStatus::Open {
         let reason = match subscription.status {
             ProcessSubscriptionStatus::Error => "activation_error",
             ProcessSubscriptionStatus::Consumed => "activation_consumed",
             _ => "recipient_closed",
         };
-        settle_signal_receipt_on(&tx, &claim.receipt_id, &claim.signal_id,
+        settle_signal_receipt_on(tx, &claim.receipt_id, &claim.signal_id,
             claim.revision, "cancelled", Some(reason), None, at_ms)?;
-        tx.commit()?;
-        return Ok(None);
+        return Ok(SignalDelivery::settled());
     }
-    if subscription.revision != claim.subscription.revision { return Ok(None); }
-    if !signal_claim_authority_on(&tx, claim)? {
-        settle_signal_receipt_on(&tx, &claim.receipt_id, &claim.signal_id,
+    if subscription.revision != claim.subscription.revision { return Ok(SignalDelivery::unchanged()); }
+    if !signal_claim_authority_on(tx, claim)? {
+        settle_signal_receipt_on(tx, &claim.receipt_id, &claim.signal_id,
             claim.revision, "denied", Some("recipient_access_revoked"), None, at_ms)?;
-        tx.commit()?;
-        return Ok(None);
+        return Ok(SignalDelivery::settled());
     }
     let canonical;
     let expected_revision;
-    let plan = if let Some(composite) = composite.as_ref() {
+    let plan = if let Some(composite) = composite {
         expected_revision = claim.snapshot.instance.revision;
         composite
     } else {
-        let snapshot = runtime_snapshot_on(&tx, &claim.actor, instance_id)?;
+        let snapshot = runtime_snapshot_on(tx, &claim.actor, instance_id)?;
         expected_revision = snapshot.instance.revision;
         let input = AcceptedInputRef::Signal {
             signal_id: claim.signal_id.clone(), receipt_id: claim.receipt_id.clone(),
@@ -30697,11 +31011,17 @@ pub fn deliver_signal_receipt(
         };
         let resolve = |prefix: &RuntimePlan, signal: &PlannedSignal,
             accepted: Option<&AcceptedInputRef>| {
-            signal_admission_on(&tx, &claim.actor, instance_id, prefix, signal, accepted)
+            signal_admission_on(tx, &claim.actor, instance_id, prefix, signal, accepted)
         };
-        canonical = super::runtime::plan_signal_catch(&snapshot, &subscription,
-            &claim.payload, &claim.signal_id, &claim.source_event_id,
-            at_ms, input, Some(&resolve))?;
+        let mut planned = super::runtime::plan_signal_catch_with_id_source(&snapshot,
+            &subscription, &claim.payload, &claim.signal_id, &claim.source_event_id,
+            at_ms, input, Some(&resolve),
+            simulated.map_or_else(super::runtime::random_runtime_id_source,
+                |sim| sim.ids.clone()))?;
+        if let Some(sim) = simulated {
+            (sim.finish_plan)(&mut planned)?;
+        }
+        canonical = planned;
         &canonical
     };
     let expected = AcceptedInputRef::Signal {
@@ -30733,11 +31053,12 @@ pub fn deliver_signal_receipt(
     ensure!(((delivered == 1 && !mapping_failed)
             || (delivered == 0 && mapping_failed)),
         "signal receipt plan differs from its fenced source and subscription");
-    let mut cancelled_claims = apply_plan_on(&tx, instance_id, &claim.actor.user_id,
+    let mut cancelled_claims = apply_plan_with_mode_on(tx, instance_id, &claim.actor.user_id,
         expected_revision,
         plan, at_ms, None,
-        EntryAuthority::Accepted(&expected), &[])?;
-    settle_signal_receipt_on(&tx, &claim.receipt_id, &claim.signal_id,
+        EntryAuthority::Accepted(&expected), &[],
+        SimulatedDelivery::execution_mode(simulated))?;
+    settle_signal_receipt_on(tx, &claim.receipt_id, &claim.signal_id,
         claim.revision, if mapping_failed { "error" } else { "delivered" },
         if mapping_failed { Some("recipient_mapping_failed") } else { None },
         if mapping_failed { plan.add_incidents.iter().find(|incident|
@@ -30746,12 +31067,14 @@ pub fn deliver_signal_receipt(
                 && incident.node_id.as_deref() == Some(subscription.node_id.as_str()))
             .map(|incident| incident.incident_id.as_str()) } else { None }, at_ms)?;
     if composite.is_none() {
-        cancelled_claims.extend(apply_canonical_call_steps_on(&tx, instance_id,
+        cancelled_claims.extend(apply_canonical_call_steps_on(tx, instance_id,
             &claim.actor.user_id, plan, at_ms)?);
     }
-    let instance = instance_on(&tx, &claim.actor, instance_id, None)?;
-    tx.commit()?;
-    Ok(Some(ProcessTransitionOutcome { instance, cancelled_claims }))
+    let instance = instance_on(tx, &claim.actor, instance_id, None)?;
+    Ok(SignalDelivery {
+        outcome: Some(ProcessTransitionOutcome { instance, cancelled_claims }),
+        write: true,
+    })
 }
 
 pub fn record_signal_attempt_failed(
@@ -31668,6 +31991,7 @@ fn message_receipt_on(
     kind: &str,
     data: Value,
     at_ms: i64,
+    event_id: Option<&str>,
 ) -> Result<()> {
     if let Some(id) = &m.source_instance_id {
         let seq: u64 = tx.query_row(
@@ -31690,7 +32014,7 @@ fn message_receipt_on(
                 data,
             },
             at_ms,
-            None,
+            event_id,
         )?;
     } else {
         crate::db::repository::log_audit_scoped_tx(
@@ -31718,6 +32042,7 @@ fn update_message_state_on(
     at_ms: i64,
     termination: Option<&TerminationSource>,
     capacity: Option<&RepetitionCapacitySource>,
+    receipt_event_id: Option<&str>,
 ) -> Result<bool> {
     if termination.is_some() || capacity.is_some() {
         ensure!(matches!(&status, ProcessMessageStatus::Cancelled) && reason.is_some(),
@@ -31758,6 +32083,7 @@ fn update_message_state_on(
             kind,
             data,
             at_ms,
+            receipt_event_id,
         )?;
     }
     Ok(count == 1)
@@ -31828,6 +32154,7 @@ pub fn resolve_message(
         "message_resolved",
         serde_json::json!({"message_id":message_id,"instance_id":instance_id,"subscription_id":subscription_id}),
         at_ms,
+        None,
     )?;
     let result = message_summary_on(&tx, actor, &message_on(&tx, &key, true)?)?;
     store_command(&tx, actor, stamp, &result, at_ms)?;
@@ -31875,6 +32202,7 @@ pub fn cancel_message(
             at_ms,
             None,
             None,
+            None,
         )?,
         "message revision conflict"
     );
@@ -31920,6 +32248,7 @@ fn record_message_selection(
         at_ms,
         None,
         None,
+        None,
     )?;
     tx.commit()?;
     Ok(result)
@@ -31951,6 +32280,7 @@ pub fn record_message_blocked(
         Some(reason),
         next,
         at_ms,
+        None,
         None,
         None,
     )?;
@@ -31986,6 +32316,7 @@ pub fn record_message_failed(
                 Some(reason),
                 at_ms,
                 at_ms,
+                None,
                 None,
                 None,
             )?;
@@ -32045,6 +32376,7 @@ pub fn record_message_failed(
         at_ms,
         None,
         None,
+        None,
     )?;
     tx.commit()?;
     Ok(result)
@@ -32081,15 +32413,53 @@ pub fn deliver_message(
         ProcessPlanInput::Canonical => (None, pool.write()?),
     };
     let tx = conn.transaction()?;
-    let fresh = match message_selection_on(&tx, &prepared.candidate)? {
+    let delivered = deliver_message_in_tx(&tx, prepared, composite.as_ref(), at_ms,
+        &now_ms, None)?;
+    if delivered.is_some() {
+        tx.commit()?;
+    }
+    Ok(delivered)
+}
+
+/// Collaborators a private simulation supplies to the delivery writers. A
+/// production caller passes none and gets the durable mode, random ids and the
+/// plan exactly as the planner produced it.
+pub(crate) struct SimulatedDelivery<'a> {
+    pub mode: PrivateSimulationMode,
+    pub ids: super::runtime::RuntimeIdSourceHandle,
+    /// Names the plan's events and holds it to the simulation profile, after it
+    /// is planned and before anything is written.
+    pub finish_plan: &'a dyn Fn(&mut RuntimePlan) -> Result<()>,
+    /// Identity of the receipt event the delivery appends to the sender's history.
+    pub receipt_event_id: String,
+}
+
+impl SimulatedDelivery<'_> {
+    fn execution_mode(simulated: Option<&Self>) -> ExecutionMode {
+        simulated.map_or(ExecutionMode::Durable, |sim| ExecutionMode::Simulation(sim.mode))
+    }
+}
+
+/// The transaction part of a message delivery: the caller owns the transaction
+/// and commits it when this returns a delivery. `clock` is the time against
+/// which the message's expiry is judged.
+pub(crate) fn deliver_message_in_tx(
+    tx: &Transaction<'_>,
+    prepared: &MessageSnapshot,
+    composite: Option<&RuntimePlan>,
+    at_ms: i64,
+    clock: &dyn Fn() -> Result<i64>,
+    simulated: Option<&SimulatedDelivery<'_>>,
+) -> Result<Option<MessageDeliveryOutcome>> {
+    let fresh = match message_selection_on(tx, &prepared.candidate)? {
         MessageSelection::Ready(s) => s,
         _ => return Ok(None),
     };
-    if fresh.message.expires_at_ms <= now_ms()? {
+    if fresh.message.expires_at_ms <= clock()? {
         return Ok(None);
     }
     let canonical;
-    let plan = if let Some(composite) = composite.as_ref() {
+    let plan = if let Some(composite) = composite {
         composite
     } else {
         let (actor, source_instance) = match &fresh.target {
@@ -32100,10 +32470,17 @@ pub fn deliver_message(
         };
         let resolve = |prefix: &RuntimePlan, signal: &PlannedSignal,
             accepted: Option<&AcceptedInputRef>| {
-            signal_admission_on(&tx, actor, source_instance, prefix, signal, accepted)
+            signal_admission_on(tx, actor, source_instance, prefix, signal, accepted)
         };
-        canonical = super::messages::plan_message_delivery(&fresh, at_ms,
-            Some(&resolve))?;
+        let mut planned = match simulated {
+            Some(sim) => super::messages::plan_message_delivery_with_id_source(&fresh,
+                at_ms, Some(&resolve), sim.ids.clone())?,
+            None => super::messages::plan_message_delivery(&fresh, at_ms, Some(&resolve))?,
+        };
+        if let Some(sim) = simulated {
+            (sim.finish_plan)(&mut planned)?;
+        }
+        canonical = planned;
         &canonical
     };
     let delivered = plan
@@ -32191,7 +32568,7 @@ pub fn deliver_message(
                     expected_message_revision: fresh.message.revision,
                 } };
             let instance = start_instance_on(
-                &tx,
+                tx,
                 actor,
                 instance_id,
                 &version.definition_id,
@@ -32298,7 +32675,7 @@ pub fn deliver_message(
             }
             if subscription.kind == ProcessSubscriptionKind::BoundaryMessage {
                 validate_boundary_plan_on(
-                    &tx,
+                    tx,
                     &BoundaryActivationId::Subscription(subscription.subscription_id.clone()),
                     None,
                     plan,
@@ -32344,8 +32721,8 @@ pub fn deliver_message(
                 target_subscription_id: Some(subscription.subscription_id.clone()),
                 expected_subscription_revision: Some(subscription.revision),
             };
-            let claims = apply_plan_on(
-                &tx,
+            let claims = apply_plan_with_mode_on(
+                tx,
                 &snapshot.instance.instance_id,
                 &actor.user_id,
                 snapshot.instance.revision,
@@ -32353,10 +32730,12 @@ pub fn deliver_message(
                 at_ms,
                 None,
                 EntryAuthority::Accepted(&entry),
-            &[])?;
+                &[],
+                SimulatedDelivery::execution_mode(simulated),
+            )?;
             (
                 actor.clone(),
-                instance_on(&tx, actor, &snapshot.instance.instance_id, None)?,
+                instance_on(tx, actor, &snapshot.instance.instance_id, None)?,
                 snapshot.instance.version,
                 subscription.node_id.clone(),
                 Some(subscription.subscription_id.clone()),
@@ -32369,23 +32748,23 @@ pub fn deliver_message(
     let count=tx.execute("UPDATE bpmn_messages SET status='delivered',revision=revision+1,last_reason=NULL,updated_at_ms=?1,matched_instance_id=?2,matched_version=?3,matched_node_id=?4,matched_subscription_id=?5,delivered_at_ms=?1 WHERE org_id=?6 AND sender_user_id=?7 AND message_id=?8 AND revision=?9 AND status IN ('pending','blocked')",params![at_ms,instance.instance_id,version,node_id,subscription_id,m.key.org_id,m.key.sender_user_id,m.key.message_id,sql_incrementable(m.revision)?])?;
     ensure!(count == 1, "message delivery revision conflict");
     message_receipt_on(
-        &tx,
+        tx,
         m,
         "message_delivered",
         serde_json::json!({"message_id":m.key.message_id,"sender_user_id":m.key.sender_user_id,"instance_id":instance.instance_id,"subscription_id":subscription_id,"version":version}),
         at_ms,
+        simulated.map(|sim| sim.receipt_event_id.as_str()),
     )?;
     if composite.is_none() {
-        claims.extend(apply_canonical_call_steps_on(&tx, &instance.instance_id,
+        claims.extend(apply_canonical_call_steps_on(tx, &instance.instance_id,
             &actor.user_id, plan, at_ms)?);
     }
     let sender = ProcessActor {
         org_id: m.key.org_id.clone(),
         user_id: m.key.sender_user_id.clone(),
     };
-    let message = message_summary_on(&tx, &sender, &message_on(&tx, &m.key, true)?)?;
-    let instance = instance_on(&tx, &actor, &instance.instance_id, None)?;
-    tx.commit()?;
+    let message = message_summary_at(tx, &sender, &message_on(tx, &m.key, true)?, clock)?;
+    let instance = instance_on(tx, &actor, &instance.instance_id, None)?;
     Ok(Some(MessageDeliveryOutcome {
         message,
         transition: ProcessTransitionOutcome {
@@ -32424,6 +32803,7 @@ pub fn expire_messages(pool: &DbPool, at_ms: i64, limit: u32) -> Result<u32> {
             at_ms,
             None,
             None,
+            None,
         )?);
     }
     tx.commit()?;
@@ -32460,6 +32840,7 @@ pub fn prune_message_payloads(pool: &DbPool, at_ms: i64, limit: u32) -> Result<u
             "message_payload_pruned",
             serde_json::json!({"message_id":key.message_id,"reason":"payload_retention_elapsed"}),
             at_ms,
+            None,
         )?;
     }
     tx.commit()?;

@@ -292,7 +292,8 @@ fn simulation_payloads_round_trip_by_variant_name_through_json_and_cbor() {
     use tentaflow_protocol::message_body::MessageBody;
     use tentaflow_protocol::processes::{
         ProcessPayload, ProcessSimulationClock, ProcessSimulationEvent, ProcessSimulationSource,
-        ProcessSimulationTraceStep, ProcessSimulationView,
+        ProcessSimulationSubscription, ProcessSimulationTraceStep, ProcessSimulationView,
+        ProcessSubscriptionKind,
     };
 
     let view = ProcessSimulationView {
@@ -324,6 +325,21 @@ fn simulation_payloads_round_trip_by_variant_name_through_json_and_cbor() {
         }],
         activity_io_witnesses: vec![json!({"phase": "output_applied"})],
         service_waits: Vec::new(),
+        subscriptions: vec![ProcessSimulationSubscription {
+            subscription_id: "subscription-1".into(),
+            kind: ProcessSubscriptionKind::MessageCatch,
+            node_id: "Catch_1".into(),
+            node_name: "Receive evidence".into(),
+            scope_id: "scope-1".into(),
+            token_id: "token-1".into(),
+            message_name: Some("EvidenceReady".into()),
+            correlation_key: Some("case-1".into()),
+            signal_namespace_uri: None,
+            signal_declaration_id: None,
+            race_id: Some("race-1".into()),
+            due_at_ms: Some(3_000),
+        }],
+        messages: Vec::new(),
         events_omitted: 7,
         trace_steps_omitted: 3,
     };
@@ -339,6 +355,10 @@ fn simulation_payloads_round_trip_by_variant_name_through_json_and_cbor() {
             "node_id": "Service_1", "job_id": null, "result": {"outcome": "Error", "code": "FLOW_ERROR",
                 "summary": "failed", "outputs": null, "evidence": []}, "verdict": null}}),
         json!({"SimulationServiceResolveResponse": {"view": serde_json::to_value(&view).unwrap()}}),
+        json!({"SimulationMessageSendRequest": {"simulation_id": "simulation-1",
+            "message_name": "EvidenceReady", "correlation_key": "case-1",
+            "payload": {"value": 42}, "ttl_seconds": 60, "subscription_id": "subscription-1"}}),
+        json!({"SimulationMessageSendResponse": {"view": serde_json::to_value(&view).unwrap()}}),
         json!({"SimulationViewRequest": {"simulation_id": "simulation-1"}}),
         json!({"SimulationAdvanceRequest": {"simulation_id": "simulation-1"}}),
         json!({"SimulationUserTaskCompleteRequest": {"simulation_id": "simulation-1",
@@ -409,4 +429,27 @@ fn simulation_requests_from_before_service_support_decode_with_empty_defaults() 
     }))
     .unwrap();
     assert!(view.service_waits.is_empty());
+}
+
+#[test]
+fn simulation_messages_and_waits_from_before_event_support_decode_with_empty_defaults() {
+    use tentaflow_protocol::processes::{ProcessPayload, ProcessSimulationView};
+
+    let send: ProcessPayload = serde_json::from_value(json!({"SimulationMessageSendRequest": {
+        "simulation_id": "s", "message_name": "EvidenceReady", "correlation_key": "case-1"}}))
+    .unwrap();
+    assert!(matches!(send, ProcessPayload::SimulationMessageSendRequest {
+        payload: serde_json::Value::Null, ttl_seconds: None, subscription_id: None, .. }));
+    let view: ProcessSimulationView = serde_json::from_value(json!({
+        "simulation_id": "simulation-1",
+        "source": {"simulation_id": "simulation-1", "definition_id": "definition-1",
+            "version": 3, "model_sha256": "a".repeat(64),
+            "selected_process_id": "Process_1", "start_node_id": "Start_1"},
+        "clock": {"start_ms": 1, "now_ms": 1, "horizon_ms": 9, "tick_duration_ms": 1,
+            "step_index": 0, "revision": 1},
+        "instance": null, "user_tasks": [], "timers": [], "incidents": [],
+        "events": [], "trace_steps": [], "activity_io_witnesses": [],
+    }))
+    .unwrap();
+    assert!(view.subscriptions.is_empty() && view.messages.is_empty());
 }

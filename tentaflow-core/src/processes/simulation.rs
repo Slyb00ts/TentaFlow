@@ -14,10 +14,12 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tentaflow_protocol::processes::{
     ActivityOutcome, ActivityResult, ProcessIncident, ProcessInstance,
-    ProcessInstanceStatus, ProcessModel, ProcessNode, ProcessNodeKind,
-    ProcessSimulationServiceFixture, ProcessSimulationServiceMode, ProcessSimulationServiceWait,
-    ProcessSimulationVerdict, ProcessTimerSpec, ProcessTimerStatus, ProcessTimerSummary,
-    ProcessSubscriptionKind, ProcessUserTask, ProcessUserTaskKind, ServiceImplementation,
+    ProcessInstanceStatus, ProcessMessageSummary, ProcessMessageTarget, ProcessMessageTargetSpec,
+    ProcessModel, ProcessNode, ProcessNodeKind, ProcessSimulationServiceFixture,
+    ProcessSimulationServiceMode, ProcessSimulationServiceWait, ProcessSimulationSubscription,
+    ProcessSimulationVerdict, ProcessSubscriptionKind, ProcessSubscriptionStatus,
+    ProcessTimerSpec, ProcessTimerStatus, ProcessTimerSummary, ProcessUserTask,
+    ProcessUserTaskKind, ServiceImplementation,
 };
 use uuid::Uuid;
 
@@ -43,6 +45,7 @@ const PROFILE_NAME: &str = "script_user_manual";
 // that nothing in the private database can produce by itself.
 const SERVICE_PROFILE_NAME: &str = "script_user_manual_service";
 const MAX_SERVICE_FIXTURES: usize = 256;
+const DEFAULT_MESSAGE_TTL_SECONDS: u32 = 3600;
 const MAX_ACL_BYTES: usize = 256 * 1024;
 const MAX_JSON_BYTES: usize = 256 * 1024;
 const MAX_TRACE_BYTES: usize = 4 * 1024 * 1024;
@@ -1223,6 +1226,7 @@ pub enum SimulationUnsupportedActivity {
     ServiceActivityIo { node_id: String },
     AgentStep { node_id: String },
     EventDelivery { node_id: String, kind: &'static str },
+    MessageTarget { node_id: String },
     SubProcess { node_id: String },
     ExternalActivity { node_id: String, kind: String },
     Repetition { node_id: String },
@@ -1241,7 +1245,11 @@ impl fmt::Display for SimulationUnsupportedActivity {
             ),
             Self::EventDelivery { node_id, kind } => write!(
                 f,
-                "{SIMULATION_EVENT_DELIVERY_UNSUPPORTED}: {kind} needs message or signal delivery, which a simulation does not run yet ({node_id})"
+                "{SIMULATION_EVENT_DELIVERY_UNSUPPORTED}: {kind} is not simulated: a message start would create another instance and an event step with activity IO continues through a deferred external step ({node_id})"
+            ),
+            Self::MessageTarget { node_id } => write!(
+                f,
+                "{SIMULATION_MESSAGE_TARGET_UNSUPPORTED}: a simulation runs one process, so a message must address a catch of this same definition without an address expression ({node_id})"
             ),
             Self::AgentStep { node_id } => write!(
                 f,
@@ -1270,8 +1278,16 @@ pub const SERVICE_SIDE_EFFECTS_NOT_CONFIRMED: &str = "SIMULATION_SIDE_EFFECTS_NO
 pub const SERVICE_FIXTURE_INVALID: &str = "SIMULATION_FIXTURE_INVALID";
 pub const SERVICE_NOT_WAITING: &str = "SIMULATION_SERVICE_NOT_WAITING";
 pub const SERVICE_VERDICT_REQUIRED: &str = "SIMULATION_VERDICT_REQUIRED";
-/// Stable code of the refusal of every message, signal and event-gateway node.
+/// Stable code of the refusal of a message start and of an event step with activity IO.
 pub const SIMULATION_EVENT_DELIVERY_UNSUPPORTED: &str = "SIMULATION_EVENT_DELIVERY_UNSUPPORTED";
+/// Stable code of the refusal of a message that addresses anything but a catch
+/// of the simulated definition.
+pub const SIMULATION_MESSAGE_TARGET_UNSUPPORTED: &str = "SIMULATION_MESSAGE_TARGET_UNSUPPORTED";
+/// The operator's message is malformed (empty name or key, payload or lifetime out of bounds).
+pub const SIMULATION_MESSAGE_INVALID: &str = "SIMULATION_MESSAGE_INVALID";
+/// The message names a wait that is not an open message wait of the run.
+pub const SIMULATION_MESSAGE_SUBSCRIPTION_UNKNOWN: &str =
+    "SIMULATION_MESSAGE_SUBSCRIPTION_UNKNOWN";
 pub const SERVICE_AMBIGUOUS: &str = "SIMULATION_SERVICE_AMBIGUOUS";
 pub const SERVICE_ANSWER_INVALID: &str = "SIMULATION_ANSWER_INVALID";
 pub const SERVICE_OUTCOME_NOT_PRODUCIBLE: &str = "SIMULATION_OUTCOME_NOT_PRODUCIBLE";
@@ -1320,6 +1336,8 @@ pub struct SimulationView {
     pub trace_steps: Vec<SimulationTraceStep>,
     pub activity_io_witnesses: Vec<ActivityIoWitness>,
     pub service_waits: Vec<ProcessSimulationServiceWait>,
+    pub subscriptions: Vec<ProcessSimulationSubscription>,
+    pub messages: Vec<ProcessMessageSummary>,
     pub events_omitted: u64,
     pub trace_steps_omitted: u64,
 }
@@ -1345,6 +1363,17 @@ pub struct SimulationTraceStep {
     pub request_sha256: String,
     pub result_sha256: String,
     pub data: Value,
+}
+
+/// A transition the simulated environment drives rather than a plan the store
+/// computed up front: the repository plans it inside its own transaction.
+enum EventStep {
+    /// The operator's message, queued at this step.
+    Send(repository::PreparedMessage),
+    /// A queued message that matches exactly one open wait of the run.
+    Message(Box<repository::MessageSnapshot>),
+    /// A signal receipt that is due.
+    Signal(String),
 }
 
 /// One Service answer on its way into the private run.
@@ -1592,6 +1621,7 @@ impl SimulationStore {
             None,
             None,
             None,
+            None,
         )?;
         self.view_authorized()
     }
@@ -1639,6 +1669,33 @@ impl SimulationStore {
                 due_at_ms,
             });
         if due_timer.is_none() && !snapshot.tokens.iter().any(|token| token.status == "ready") {
+            if let Some(step) = self.next_event_step(now)? {
+                let command_id = self.next_id("command");
+                let request_hash = hash_json(&json!({
+                    "action": "advance",
+                    "revision": expected_revision,
+                    "at_ms": now,
+                    "delivery": match &step {
+                        EventStep::Message(snapshot) => snapshot.message.key.message_id.clone(),
+                        EventStep::Signal(receipt_id) => receipt_id.clone(),
+                        EventStep::Send(_) => String::new(),
+                    },
+                }))?;
+                let plan = RuntimePlan::initial(snapshot.instance.variables.clone());
+                self.apply_plan(
+                    command_id,
+                    request_hash,
+                    expected_revision,
+                    plan,
+                    now,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(step),
+                )?;
+                return self.view_authorized();
+            }
             if let Some((job, fixture)) = self.next_fixture_job(&snapshot)? {
                 let result = fixture
                     .result
@@ -1697,6 +1754,7 @@ impl SimulationStore {
             None,
             None,
             due_timer.as_ref(),
+            None,
             None,
         )?;
         self.view_authorized()
@@ -1772,6 +1830,7 @@ impl SimulationStore {
             Some(outputs),
             None,
             None,
+            None,
         )?;
         self.view_authorized()
     }
@@ -1833,6 +1892,7 @@ impl SimulationStore {
             plan,
             now,
             Some(accepted),
+            None,
             None,
             None,
             None,
@@ -2017,6 +2077,100 @@ impl SimulationStore {
                 observed,
                 event_ids,
             }),
+            None,
+        )?;
+        self.view_authorized()
+    }
+
+    /// The next message or signal receipt the environment delivers at `now`:
+    /// messages first, as the production drain does.
+    fn next_event_step(&self, now: i64) -> Result<Option<EventStep>> {
+        let mode = PrivateSimulationMode::prove(&self.conn)?;
+        if let Some(message) = repository::simulation_next_message_on(&self.conn, mode, now)? {
+            return Ok(Some(EventStep::Message(Box::new(message))));
+        }
+        Ok(repository::simulation_next_signal_receipt_on(&self.conn, mode, now)?
+            .map(EventStep::Signal))
+    }
+
+    /// Sends a message into the run. It is queued at the next tick of the
+    /// virtual clock and delivered to the one wait it matches by the following
+    /// `advance`, exactly as a message sent to a production instance waits for
+    /// the drain.
+    pub(crate) fn send_message(
+        &mut self,
+        authorization: AuthenticatedSimulationAction,
+        message_name: &str,
+        correlation_key: &str,
+        payload: Value,
+        ttl_seconds: Option<u32>,
+        subscription_id: Option<&str>,
+    ) -> Result<SimulationView> {
+        authorization.verify(&self.source, &self.actor)?;
+        ensure_actor_allowed(&self.source, &self.acl, &self.actor)?;
+        let snapshot = self
+            .load_snapshot()?
+            .context("simulation has not been started")?;
+        if let Some(id) = subscription_id {
+            ensure!(
+                snapshot.subscriptions.iter().any(|subscription| subscription.subscription_id == id
+                    && subscription.status == ProcessSubscriptionStatus::Open
+                    && matches!(
+                        subscription.kind,
+                        ProcessSubscriptionKind::MessageCatch
+                            | ProcessSubscriptionKind::ReceiveTask
+                            | ProcessSubscriptionKind::BoundaryMessage
+                    )
+                    && subscription.message_name.as_deref() == Some(message_name)
+                    && subscription.correlation_key.as_deref() == Some(correlation_key)),
+                SimulationServiceError::new(
+                    SIMULATION_MESSAGE_SUBSCRIPTION_UNKNOWN,
+                    "no open message wait of this run has that id, name and correlation key",
+                )
+            );
+        }
+        let expected_revision = snapshot.instance.revision;
+        let now = self.clock.next_time()?;
+        self.prepare_ids();
+        let message_id = self.next_id("message");
+        let prepared = repository::PreparedMessage {
+            message_id,
+            target: ProcessMessageTarget::Catch {
+                definition_id: self.source.definition_id.clone(),
+                instance_id: Some(snapshot.instance.instance_id.clone()),
+                subscription_id: subscription_id.map(str::to_owned),
+            },
+            message_name: message_name.to_owned(),
+            correlation_key: correlation_key.to_owned(),
+            payload,
+            ttl_seconds: ttl_seconds.unwrap_or(DEFAULT_MESSAGE_TTL_SECONDS),
+        };
+        super::messages::validate_message(&prepared).map_err(|error| {
+            SimulationServiceError::new(SIMULATION_MESSAGE_INVALID, format!("{error:#}"))
+        })?;
+        let command_id = self.next_id("command");
+        let request_hash = hash_json(&json!({
+            "action": "send_message",
+            "message_name": prepared.message_name,
+            "correlation_key": prepared.correlation_key,
+            "payload": prepared.payload,
+            "ttl_seconds": prepared.ttl_seconds,
+            "subscription_id": subscription_id,
+            "revision": expected_revision,
+            "at_ms": now,
+        }))?;
+        let plan = RuntimePlan::initial(snapshot.instance.variables.clone());
+        self.apply_plan(
+            command_id,
+            request_hash,
+            expected_revision,
+            plan,
+            now,
+            None,
+            None,
+            None,
+            None,
+            Some(EventStep::Send(prepared)),
         )?;
         self.view_authorized()
     }
@@ -2104,6 +2258,61 @@ impl SimulationStore {
             .collect()
     }
 
+    /// The open message and signal waits of the run, with the moment a timer of
+    /// the same activation or race fires.
+    fn event_waits(&self, snapshot: &RuntimeSnapshot) -> Result<Vec<ProcessSimulationSubscription>> {
+        snapshot
+            .subscriptions
+            .iter()
+            .filter(|subscription| {
+                subscription.status == ProcessSubscriptionStatus::Open
+                    && matches!(
+                        subscription.kind,
+                        ProcessSubscriptionKind::MessageCatch
+                            | ProcessSubscriptionKind::ReceiveTask
+                            | ProcessSubscriptionKind::BoundaryMessage
+                            | ProcessSubscriptionKind::SignalCatch
+                    )
+            })
+            .map(|subscription| {
+                let node = repository::scope_node(
+                    &snapshot.model,
+                    &snapshot.instance.process_id,
+                    &snapshot.scopes,
+                    &subscription.instance_id,
+                    &subscription.scope_id,
+                    &subscription.node_id,
+                )?;
+                let due_at_ms = snapshot
+                    .timers
+                    .iter()
+                    .filter(|timer| {
+                        matches!(
+                            timer.status,
+                            ProcessTimerStatus::Pending | ProcessTimerStatus::Blocked
+                        ) && (timer.token_id.as_deref() == Some(subscription.token_id.as_str())
+                            || subscription.race_id.is_some() && timer.race_id == subscription.race_id)
+                    })
+                    .filter_map(|timer| timer.due_at_ms)
+                    .min();
+                Ok(ProcessSimulationSubscription {
+                    subscription_id: subscription.subscription_id.clone(),
+                    kind: subscription.kind.clone(),
+                    node_id: subscription.node_id.clone(),
+                    node_name: node.name.clone(),
+                    scope_id: subscription.scope_id.clone(),
+                    token_id: subscription.token_id.clone(),
+                    message_name: subscription.message_name.clone(),
+                    correlation_key: subscription.correlation_key.clone(),
+                    signal_namespace_uri: subscription.signal_namespace_uri.clone(),
+                    signal_declaration_id: subscription.signal_declaration_id.clone(),
+                    race_id: subscription.race_id.clone(),
+                    due_at_ms,
+                })
+            })
+            .collect()
+    }
+
     fn profile_name(&self) -> Result<&'static str> {
         let body = selected_body(&self.model, &self.source.selected_process_id, &[])?;
         Ok(if body
@@ -2173,6 +2382,16 @@ impl SimulationStore {
                 Some(snapshot) => self.service_waits(snapshot)?,
                 None => Vec::new(),
             },
+            subscriptions: match snapshot.as_ref() {
+                Some(snapshot) => self.event_waits(snapshot)?,
+                None => Vec::new(),
+            },
+            messages: repository::simulation_message_summaries_on(
+                &self.conn,
+                PrivateSimulationMode::prove(&self.conn)?,
+                &self.actor,
+                self.clock.now_ms,
+            )?,
             events_omitted: 0,
             trace_steps_omitted: 0,
         };
@@ -2243,6 +2462,7 @@ impl SimulationStore {
         human_outputs: Option<Value>,
         timer_candidate: Option<&DueTimer>,
         service: Option<ServiceSettlement>,
+        event: Option<EventStep>,
     ) -> Result<()> {
         ensure!(
             self.clock.now_ms <= at_ms && at_ms <= self.clock.horizon_ms,
@@ -2262,8 +2482,11 @@ impl SimulationStore {
         );
         let mut plan = plan;
         // A Service answer is finished by the repository (the result event keeps
-        // its reserved identity), so its plan is held to the profile there.
-        if service.is_none() {
+        // its reserved identity), and so is a delivery (its plan is only known
+        // inside the transaction), so their plans are held to the profile there.
+        let plans_inside_writer = service.is_some()
+            || matches!(event, Some(EventStep::Message(_) | EventStep::Signal(_)));
+        if !plans_inside_writer {
             for event_index in 0..plan.events.len() {
                 if !plan.event_ids.contains_key(&event_index) {
                     let event_id = self.next_id("event");
@@ -2294,16 +2517,42 @@ impl SimulationStore {
             })
             .unwrap_or_default();
         let body_nodes = selected_body(&self.model, &self.source.selected_process_id, &[])?.nodes;
-        if service.is_none() {
+        if !plans_inside_writer {
             validate_plan_ids(&plan, &self.ids.borrow(), &persisted_activations)?;
             validate_supported_plan(&plan, body_nodes)?;
         }
         let mut settled_event_ids = None;
+        // A delivery names and checks its plan here, once the writer has planned it.
+        let recorded_event_ids = RefCell::new(BTreeMap::<usize, String>::new());
+        let name_and_check_plan = |planned: &mut RuntimePlan| -> Result<()> {
+            for event_index in 0..planned.events.len() {
+                planned
+                    .event_ids
+                    .entry(event_index)
+                    .or_insert_with(|| self.ids.borrow_mut().next_id("event"));
+            }
+            ensure!(
+                self.ids.borrow().error().is_none(),
+                "simulation event identifier allocation failed"
+            );
+            validate_plan_ids(planned, &self.ids.borrow(), &persisted_activations)?;
+            validate_supported_plan(planned, body_nodes)?;
+            *recorded_event_ids.borrow_mut() = planned.event_ids.clone();
+            Ok(())
+        };
 
         let tx = self
             .conn
             .unchecked_transaction()
             .context("begin simulation transition")?;
+        // As the production drain does before it delivers anything: a message whose
+        // lifetime ended on the virtual clock can no longer be matched.
+        let expired_messages = repository::simulation_expire_messages_on(
+            &tx,
+            PrivateSimulationMode::prove(&self.conn)?,
+            at_ms,
+            &mut || self.ids.borrow_mut().next_id("message_expiry_event"),
+        )?;
         let result = if let Some(instance_id) = plan.start_instance_id.as_deref() {
             ensure!(
                 load_instance_id_tx(&tx, &self.simulation_id)?.is_none(),
@@ -2380,6 +2629,95 @@ impl SimulationStore {
                 "simulation TimerCatch produced unsupported cancelled worker claims"
             );
             timer_outcome.instance
+        } else if let Some(step) = event.as_ref() {
+            let instance_id = load_instance_id_tx(&tx, &self.simulation_id)?
+                .context("simulation event step has no instance")?;
+            let mode = PrivateSimulationMode::prove(&self.conn)?;
+            match step {
+                EventStep::Send(prepared) => {
+                    let message =
+                        repository::simulation_send_message_on(&tx, mode, &self.actor, prepared, at_ms)?;
+                    let event_id = self.ids.borrow_mut().next_id("event");
+                    settled_event_ids = Some(BTreeMap::from([(0, event_id.clone())]));
+                    repository::simulation_touch_instance_on(
+                        &tx,
+                        mode,
+                        &self.actor,
+                        &instance_id,
+                        expected_revision,
+                        at_ms,
+                        Some((
+                            repository::PlannedEvent {
+                                scope_id: instance_id.clone(),
+                                kind: "simulation_message_sent".into(),
+                                node_id: None,
+                                data: json!({
+                                    "message_id": message.key.message_id,
+                                    "message_name": message.message_name,
+                                    "correlation_key": message.correlation_key,
+                                }),
+                            },
+                            &event_id,
+                        )),
+                    )?
+                }
+                EventStep::Message(snapshot) => {
+                    let receipt_event_id = self.ids.borrow_mut().next_id("message_receipt_event");
+                    let simulated = repository::SimulatedDelivery {
+                        mode,
+                        ids: self.id_handle(),
+                        finish_plan: &name_and_check_plan,
+                        receipt_event_id,
+                    };
+                    let delivered = repository::deliver_message_in_tx(
+                        &tx,
+                        snapshot,
+                        None,
+                        at_ms,
+                        &|| Ok(at_ms),
+                        Some(&simulated),
+                    )?
+                    .context("simulated message changed before its private delivery")?;
+                    ensure!(
+                        delivered.transition.cancelled_claims.is_empty(),
+                        "simulated message delivery produced unsupported cancelled worker claims"
+                    );
+                    settled_event_ids = Some(recorded_event_ids.borrow().clone());
+                    delivered.transition.instance
+                }
+                EventStep::Signal(receipt_id) => {
+                    let receipt_event_id = self.ids.borrow_mut().next_id("message_receipt_event");
+                    let simulated = repository::SimulatedDelivery {
+                        mode,
+                        ids: self.id_handle(),
+                        finish_plan: &name_and_check_plan,
+                        receipt_event_id,
+                    };
+                    match repository::simulation_deliver_signal_on(
+                        &tx,
+                        &simulated,
+                        receipt_id,
+                        at_ms,
+                    )? {
+                        repository::SimulatedSignalStep::Delivered(instance) => {
+                            settled_event_ids = Some(recorded_event_ids.borrow().clone());
+                            *instance
+                        }
+                        repository::SimulatedSignalStep::Settled
+                        | repository::SimulatedSignalStep::Untouched => {
+                            repository::simulation_touch_instance_on(
+                                &tx,
+                                mode,
+                                &self.actor,
+                                &instance_id,
+                                expected_revision,
+                                at_ms,
+                                None,
+                            )?
+                        }
+                    }
+                }
+            }
         } else {
             let instance_id = load_instance_id_tx(&tx, &self.simulation_id)?
                 .context("simulation plan has no instance")?;
@@ -2416,11 +2754,14 @@ impl SimulationStore {
                 .map(|(index, event_id)| (*index, event_id.clone()))
                 .collect::<BTreeMap<_, _>>()
         });
-        let result_json = json!({
+        let mut result_json = json!({
             "status": simulation_meta_status(&result.status),
             "revision": result.revision,
             "events": event_ids,
         });
+        if !expired_messages.is_empty() {
+            result_json["expired_messages"] = json!(expired_messages);
+        }
         let result_json_text = json_string(&result_json)?;
         tx.execute(
             "UPDATE simulation_meta SET instance_id=?1,status=?2,revision=?3,updated_at_ms=?4 WHERE simulation_id=?5 AND revision=?6",
@@ -2957,31 +3298,41 @@ fn validate_captured_source(
             ProcessNodeKind::BoundaryError { .. }
             | ProcessNodeKind::BoundaryEscalation { .. }
             | ProcessNodeKind::ErrorEnd { .. } => {}
-            // Production delivers messages and signals through tables shared by the
-            // whole organization, with wall-clock expiry and admission quotas; none of
-            // that can run against a private database without leaving it.
+            // Messages, signals and event races are delivered on the private
+            // database against the virtual clock. What stays out is anything that
+            // reaches beyond the one simulated instance or hands its result to a
+            // deferred external step.
             ProcessNodeKind::MessageCatch { .. }
-            | ProcessNodeKind::MessageThrow { .. }
             | ProcessNodeKind::BoundaryMessage { .. }
             | ProcessNodeKind::EventBasedGateway
             | ProcessNodeKind::ReceiveTask { .. }
-            | ProcessNodeKind::SendTask { .. }
             | ProcessNodeKind::SignalThrow { .. }
-            | ProcessNodeKind::SignalCatch { .. }
-            | ProcessNodeKind::MessageStart { .. } => {
+            | ProcessNodeKind::SignalCatch { .. } => {
+                refuse_event_activity_io(node)?;
+            }
+            ProcessNodeKind::MessageThrow { target, .. }
+            | ProcessNodeKind::SendTask { target, .. } => {
+                refuse_event_activity_io(node)?;
+                // One simulated instance cannot reach another process, and an
+                // address expression would name a production instance or wait.
+                ensure!(
+                    matches!(
+                        target,
+                        ProcessMessageTargetSpec::Catch {
+                            definition_id,
+                            instance_id_expression: None,
+                            subscription_id_expression: None,
+                        } if definition_id == &input.definition_id
+                    ),
+                    SimulationUnsupportedActivity::MessageTarget {
+                        node_id: node.id.clone(),
+                    }
+                );
+            }
+            ProcessNodeKind::MessageStart { .. } => {
                 return Err(SimulationUnsupportedActivity::EventDelivery {
                     node_id: node.id.clone(),
-                    kind: match &node.kind {
-                        ProcessNodeKind::MessageCatch { .. } => "MessageCatch",
-                        ProcessNodeKind::MessageThrow { .. } => "MessageThrow",
-                        ProcessNodeKind::BoundaryMessage { .. } => "BoundaryMessage",
-                        ProcessNodeKind::EventBasedGateway => "EventBasedGateway",
-                        ProcessNodeKind::ReceiveTask { .. } => "ReceiveTask",
-                        ProcessNodeKind::SendTask { .. } => "SendTask",
-                        ProcessNodeKind::SignalThrow { .. } => "SignalThrow",
-                        ProcessNodeKind::SignalCatch { .. } => "SignalCatch",
-                        _ => "MessageStart",
-                    },
+                    kind: "MessageStart",
                 }
                 .into());
             }
@@ -3007,6 +3358,28 @@ fn validate_captured_source(
         }
     }
     Ok((model, acl))
+}
+
+/// A message or signal step whose result flows through authored activity IO
+/// continues through a deferred external step, which a simulation does not run.
+pub(super) fn refuse_event_activity_io(node: &ProcessNode) -> Result<()> {
+    if node.activity_io.is_none() {
+        return Ok(());
+    }
+    let kind = match &node.kind {
+        ProcessNodeKind::MessageCatch { .. } => "MessageCatch with activity IO",
+        ProcessNodeKind::MessageThrow { .. } => "MessageThrow with activity IO",
+        ProcessNodeKind::ReceiveTask { .. } => "ReceiveTask with activity IO",
+        ProcessNodeKind::SendTask { .. } => "SendTask with activity IO",
+        ProcessNodeKind::SignalThrow { .. } => "SignalThrow with activity IO",
+        ProcessNodeKind::SignalCatch { .. } => "SignalCatch with activity IO",
+        _ => "event step with activity IO",
+    };
+    Err(SimulationUnsupportedActivity::EventDelivery {
+        node_id: node.id.clone(),
+        kind,
+    }
+    .into())
 }
 
 fn validate_plan_ids(
@@ -3064,6 +3437,21 @@ fn validate_plan_ids(
         .chain(plan.create_subscriptions.iter().map(|subscription| {
             ("subscription", subscription.subscription_id.as_str())
         }))
+        .chain(
+            plan.create_messages
+                .iter()
+                .map(|message| ("message", message.message.message_id.as_str())),
+        )
+        .chain(
+            plan.create_signals
+                .iter()
+                .map(|signal| ("signal", signal.signal_id.as_str())),
+        )
+        .chain(
+            plan.create_event_races
+                .iter()
+                .map(|race| ("event race", race.race_id.as_str())),
+        )
         .chain(plan.activity_io_inputs.iter().map(|fact| match fact {
             ActivityIoInputFact::Captured { witness_id, .. }
             | ActivityIoInputFact::Failed { witness_id, .. } => {
@@ -3098,9 +3486,19 @@ fn validate_plan_ids(
 /// or executes one, so a plan that carries a started job, a message, a signal or
 /// any other outgoing dispatch is refused before it is written.
 pub(super) fn validate_supported_plan(plan: &RuntimePlan, nodes: &[ProcessNode]) -> Result<()> {
+    // A message or signal a run throws is queued on its own private database and
+    // can only ever reach the waits of that run; a message that names another
+    // instance or a start would reach beyond it.
     ensure!(
-        plan.create_messages.is_empty() && plan.create_signals.is_empty(),
-        "simulation plan contains an external dispatch"
+        plan.create_messages.iter().all(|message| matches!(
+            &message.message.target,
+            ProcessMessageTarget::Catch {
+                instance_id: None,
+                subscription_id: None,
+                ..
+            }
+        )),
+        "simulation plan sends a message beyond the simulated process"
     );
     for job in &plan.create_jobs {
         ensure!(
@@ -3145,11 +3543,13 @@ pub(super) fn validate_supported_plan(plan: &RuntimePlan, nodes: &[ProcessNode])
                     subscription.kind,
                     ProcessSubscriptionKind::BoundaryError
                         | ProcessSubscriptionKind::BoundaryEscalation
+                        | ProcessSubscriptionKind::MessageCatch
+                        | ProcessSubscriptionKind::ReceiveTask
+                        | ProcessSubscriptionKind::BoundaryMessage
+                        | ProcessSubscriptionKind::SignalCatch
                 )
-            })
-            && plan.race_updates.is_empty()
-            && plan.create_event_races.is_empty(),
-        "the simulation profile only supports Catch and Boundary timers and error or escalation boundary subscriptions"
+            }),
+        "the simulation profile only supports Catch and Boundary timers and error, escalation, message and signal subscriptions"
     );
     ensure!(
         plan.call_requests.is_empty()
@@ -3182,6 +3582,8 @@ pub(super) fn validate_supported_plan(plan: &RuntimePlan, nodes: &[ProcessNode])
                     | AcceptedInputRef::ManualAcknowledgment { .. }
                     | AcceptedInputRef::Timer { .. }
                     | AcceptedInputRef::Service { .. }
+                    | AcceptedInputRef::Message { .. }
+                    | AcceptedInputRef::Signal { .. }
             )
         }),
         "termination source is outside the simulation profile"

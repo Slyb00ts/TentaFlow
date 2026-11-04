@@ -189,22 +189,6 @@ fn a_simulated_boundary_timer_path_equals_the_production_execution() {
 }
 
 #[test]
-fn message_catch_nodes_are_refused_with_the_stable_event_delivery_code() {
-    let model = super::messages::test_support::receiving_model(false, false);
-    let error = create_store(source_input_for(model)).expect_err("no message delivery yet");
-    let message = format!("{error:#}");
-    assert!(
-        message.starts_with(super::simulation::SIMULATION_EVENT_DELIVERY_UNSUPPORTED)
-            && message.contains("Catch_1")
-            && message.contains("MessageCatch"),
-        "{message}"
-    );
-    assert!(error
-        .downcast_ref::<super::simulation::SimulationUnsupportedActivity>()
-        .is_some());
-}
-
-#[test]
 fn an_interrupting_timer_on_a_waiting_service_step_cancels_its_job() {
     use tentaflow_protocol::processes::{ActivityVerification, ServiceImplementation};
 
