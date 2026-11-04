@@ -1902,6 +1902,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_simulated_boundary_timer_fires_on_the_virtual_clock_and_writes_no_production_row() {
+        use tentaflow_protocol::processes::ProcessTimerSpec;
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "simulation-timer-owner");
+        let ctx = context(&state, &actor);
+        let model = crate::processes::simulation_event_tests::boundary_model(
+            ProcessTimerSpec::Duration { seconds: 1 },
+            true,
+            Some(&actor.user_id),
+        );
+        let published = save_and_publish(&ctx, model).await;
+        let before = production_row_counts(&state);
+        let P::SimulationStartResponse { mut view } =
+            request(&ctx, simulation_start(&published.definition_id)).await
+        else {
+            panic!("private simulation start expected")
+        };
+        for _ in 0..40 {
+            if view.events.iter().any(|event| event.kind == "timer_fired") {
+                break;
+            }
+            let P::SimulationAdvanceResponse { view: next } = request(
+                &ctx,
+                P::SimulationAdvanceRequest { simulation_id: view.simulation_id.clone() },
+            )
+            .await
+            else {
+                panic!("private simulation advance expected")
+            };
+            view = next;
+        }
+        assert!(view.events.iter().any(|event| event.kind == "timer_fired"));
+        assert_eq!(view.clock.now_ms - view.clock.start_ms, 1_000);
+        // The production timer worker finds no timer of a private run.
+        let drained = crate::processes::timers::drain_due(&state.db, i64::MAX / 4);
+        assert_eq!(drained.fired, 0);
+        request(
+            &ctx,
+            P::SimulationReleaseRequest { simulation_id: view.simulation_id.clone() },
+        )
+        .await;
+        assert_eq!(production_row_counts(&state), before);
+    }
+
+    #[tokio::test]
     async fn refused_fixtures_are_reported_before_a_run_is_reserved_and_keep_their_code() {
         use tentaflow_protocol::processes::{
             ActivityVerification, ProcessSimulationServiceFixture, ProcessSimulationServiceMode,

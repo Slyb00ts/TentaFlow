@@ -1222,6 +1222,7 @@ pub enum SimulationUnsupportedActivity {
     CallActivity { node_id: String },
     ServiceActivityIo { node_id: String },
     AgentStep { node_id: String },
+    EventDelivery { node_id: String, kind: &'static str },
     SubProcess { node_id: String },
     ExternalActivity { node_id: String, kind: String },
     Repetition { node_id: String },
@@ -1237,6 +1238,10 @@ impl fmt::Display for SimulationUnsupportedActivity {
             Self::ServiceActivityIo { node_id } => write!(
                 f,
                 "a Service task with activity IO is unsupported in simulation ({node_id}): its result continues through a deferred external step"
+            ),
+            Self::EventDelivery { node_id, kind } => write!(
+                f,
+                "{SIMULATION_EVENT_DELIVERY_UNSUPPORTED}: {kind} needs message or signal delivery, which a simulation does not run yet ({node_id})"
             ),
             Self::AgentStep { node_id } => write!(
                 f,
@@ -1265,6 +1270,8 @@ pub const SERVICE_SIDE_EFFECTS_NOT_CONFIRMED: &str = "SIMULATION_SIDE_EFFECTS_NO
 pub const SERVICE_FIXTURE_INVALID: &str = "SIMULATION_FIXTURE_INVALID";
 pub const SERVICE_NOT_WAITING: &str = "SIMULATION_SERVICE_NOT_WAITING";
 pub const SERVICE_VERDICT_REQUIRED: &str = "SIMULATION_VERDICT_REQUIRED";
+/// Stable code of the refusal of every message, signal and event-gateway node.
+pub const SIMULATION_EVENT_DELIVERY_UNSUPPORTED: &str = "SIMULATION_EVENT_DELIVERY_UNSUPPORTED";
 pub const SERVICE_AMBIGUOUS: &str = "SIMULATION_SERVICE_AMBIGUOUS";
 pub const SERVICE_ANSWER_INVALID: &str = "SIMULATION_ANSWER_INVALID";
 pub const SERVICE_OUTCOME_NOT_PRODUCIBLE: &str = "SIMULATION_OUTCOME_NOT_PRODUCIBLE";
@@ -1605,8 +1612,11 @@ impl SimulationStore {
             .iter()
             .filter_map(|timer| {
                 let due_at_ms = timer.due_at_ms?;
-                (timer.kind == tentaflow_protocol::processes::ProcessTimerKind::Catch
-                    && matches!(
+                (matches!(
+                    timer.kind,
+                    tentaflow_protocol::processes::ProcessTimerKind::Catch
+                        | tentaflow_protocol::processes::ProcessTimerKind::Boundary
+                ) && matches!(
                         timer.status,
                         ProcessTimerStatus::Pending | ProcessTimerStatus::Blocked
                     )
@@ -1654,10 +1664,20 @@ impl SimulationStore {
                 .find(|candidate| candidate.timer_id == timer.timer_id)
                 .cloned()
                 .context("selected simulation timer disappeared from its snapshot")?;
-            let timer_snapshot = TimerSnapshot::Catch {
-                actor: self.actor.clone(),
-                timer,
-                snapshot: snapshot.clone(),
+            let timer_snapshot = if timer.kind
+                == tentaflow_protocol::processes::ProcessTimerKind::Boundary
+            {
+                TimerSnapshot::Boundary {
+                    actor: self.actor.clone(),
+                    timer,
+                    snapshot: snapshot.clone(),
+                }
+            } else {
+                TimerSnapshot::Catch {
+                    actor: self.actor.clone(),
+                    timer,
+                    snapshot: snapshot.clone(),
+                }
             };
             super::timers::plan_timer_fire(&timer_snapshot, now, None, Some(self.id_handle()))?
         } else {
@@ -2745,6 +2765,25 @@ pub(super) fn pick_waiting_job(
     }
 }
 
+/// A timer rule needs the published zone (and calendar for working time) to
+/// resolve its due time on the virtual clock.
+fn check_simulated_timer(model: &ProcessModel, timer: &ProcessTimerSpec, label: &str) -> Result<()> {
+    ensure!(
+        model
+            .timer_timezone
+            .as_deref()
+            .is_some_and(|zone| !zone.is_empty()),
+        "{label} simulation requires the published IANA timer timezone"
+    );
+    if matches!(timer, ProcessTimerSpec::WorkingDuration { .. }) {
+        ensure!(
+            model.calendar_pin.is_some(),
+            "WorkingDuration {label} simulation requires the published calendar pin"
+        );
+    }
+    Ok(())
+}
+
 fn verdict_text(verdict: ProcessSimulationVerdict) -> &'static str {
     match verdict {
         ProcessSimulationVerdict::Approved => "approved",
@@ -2893,20 +2932,12 @@ fn validate_captured_source(
                     ),
                     "simulation supports Date, Duration, and WorkingDuration TimerCatch rules"
                 );
-                ensure!(
-                    model
-                        .timer_timezone
-                        .as_deref()
-                        .is_some_and(|zone| !zone.is_empty()),
-                    "TimerCatch simulation requires the published IANA timer timezone"
-                );
-                if matches!(timer, ProcessTimerSpec::WorkingDuration { .. }) {
-                    ensure!(
-                        model.calendar_pin.is_some(),
-                        "WorkingDuration TimerCatch simulation requires the published calendar pin"
-                    );
-                }
+                check_simulated_timer(&model, timer, "TimerCatch")?;
             }
+            // A boundary timer runs on the virtual clock exactly as a catch timer
+            // does. `validate_model` already holds its rule to the production
+            // limits (no repeating boundary timers, an explicit zone and calendar).
+            ProcessNodeKind::BoundaryTimer { .. } => {}
             // `validate_model` above already refuses an unbound step, which has
             // nothing a simulation could wait for.
             ProcessNodeKind::ServiceTask { implementation, .. } => {
@@ -2926,6 +2957,34 @@ fn validate_captured_source(
             ProcessNodeKind::BoundaryError { .. }
             | ProcessNodeKind::BoundaryEscalation { .. }
             | ProcessNodeKind::ErrorEnd { .. } => {}
+            // Production delivers messages and signals through tables shared by the
+            // whole organization, with wall-clock expiry and admission quotas; none of
+            // that can run against a private database without leaving it.
+            ProcessNodeKind::MessageCatch { .. }
+            | ProcessNodeKind::MessageThrow { .. }
+            | ProcessNodeKind::BoundaryMessage { .. }
+            | ProcessNodeKind::EventBasedGateway
+            | ProcessNodeKind::ReceiveTask { .. }
+            | ProcessNodeKind::SendTask { .. }
+            | ProcessNodeKind::SignalThrow { .. }
+            | ProcessNodeKind::SignalCatch { .. }
+            | ProcessNodeKind::MessageStart { .. } => {
+                return Err(SimulationUnsupportedActivity::EventDelivery {
+                    node_id: node.id.clone(),
+                    kind: match &node.kind {
+                        ProcessNodeKind::MessageCatch { .. } => "MessageCatch",
+                        ProcessNodeKind::MessageThrow { .. } => "MessageThrow",
+                        ProcessNodeKind::BoundaryMessage { .. } => "BoundaryMessage",
+                        ProcessNodeKind::EventBasedGateway => "EventBasedGateway",
+                        ProcessNodeKind::ReceiveTask { .. } => "ReceiveTask",
+                        ProcessNodeKind::SendTask { .. } => "SendTask",
+                        ProcessNodeKind::SignalThrow { .. } => "SignalThrow",
+                        ProcessNodeKind::SignalCatch { .. } => "SignalCatch",
+                        _ => "MessageStart",
+                    },
+                }
+                .into());
+            }
             ProcessNodeKind::CallActivity(_) => {
                 return Err(SimulationUnsupportedActivity::CallActivity {
                     node_id: node.id.clone(),
@@ -3076,9 +3135,11 @@ pub(super) fn validate_supported_plan(plan: &RuntimePlan, nodes: &[ProcessNode])
         "simulation plan contains a deferred external continuation"
     );
     ensure!(
-        plan.create_timers
-            .iter()
-            .all(|timer| timer.kind == tentaflow_protocol::processes::ProcessTimerKind::Catch)
+        plan.create_timers.iter().all(|timer| matches!(
+            timer.kind,
+            tentaflow_protocol::processes::ProcessTimerKind::Catch
+                | tentaflow_protocol::processes::ProcessTimerKind::Boundary
+        ))
             && plan.create_subscriptions.iter().all(|subscription| {
                 matches!(
                     subscription.kind,
@@ -3088,7 +3149,7 @@ pub(super) fn validate_supported_plan(plan: &RuntimePlan, nodes: &[ProcessNode])
             })
             && plan.race_updates.is_empty()
             && plan.create_event_races.is_empty(),
-        "the simulation profile only supports Catch timers and error or escalation boundary subscriptions"
+        "the simulation profile only supports Catch and Boundary timers and error or escalation boundary subscriptions"
     );
     ensure!(
         plan.call_requests.is_empty()

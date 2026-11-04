@@ -582,52 +582,7 @@ async fn the_simulated_trace_equals_the_production_execution_on_the_same_answer(
         }
     }
 
-    // Every identifier becomes the ordinal of its first appearance, so the links
-    // between events (the job that was queued, claimed and answered; the task that
-    // was opened and completed) are compared, not just the shapes.
-    let normalized = |events: Vec<(String, Option<String>, Value)>| {
-        fn relabel(value: &Value, seen: &mut Vec<String>, users: &mut Vec<String>) -> Value {
-            fn ordinal(list: &mut Vec<String>, text: &str, label: &str) -> Value {
-                let position = list.iter().position(|known| known == text).unwrap_or_else(|| {
-                    list.push(text.to_owned());
-                    list.len() - 1
-                });
-                json!(format!("<{label}#{position}>"))
-            }
-            match value {
-                Value::String(text) if uuid::Uuid::parse_str(text).is_ok() => {
-                    ordinal(seen, text, "id")
-                }
-                Value::Array(items) => {
-                    Value::Array(items.iter().map(|item| relabel(item, seen, users)).collect())
-                }
-                Value::Object(map) => Value::Object(
-                    map.iter()
-                        .map(|(key, value)| {
-                            // A private organization names its accounts with a fixed
-                            // string where production has a UUID.
-                            let relabelled = match value {
-                                Value::String(text) if key.ends_with("_user_id") => {
-                                    ordinal(users, text, "user")
-                                }
-                                other => relabel(other, seen, users),
-                            };
-                            (key.clone(), relabelled)
-                        })
-                        .collect(),
-                ),
-                other => other.clone(),
-            }
-        }
-        let (mut seen, mut users) = (Vec::new(), Vec::new());
-        events
-            .into_iter()
-            .map(|(kind, node, data)| {
-                let data = relabel(&data, &mut seen, &mut users);
-                (kind, node, data)
-            })
-            .collect::<Vec<_>>()
-    };
+    let normalized = normalize_events;
 
     // Production: the real worker pipeline around a scripted addon tool.
     let host = ScriptedToolHost::new(json!({"hits": 3}));
@@ -731,6 +686,55 @@ async fn the_simulated_trace_equals_the_production_execution_on_the_same_answer(
             .expect("production instance")
             .variables
     );
+}
+
+/// Every identifier becomes the ordinal of its first appearance, so the links
+/// between events (the job that was queued, claimed and answered; the task that
+/// was opened and completed) are compared, not just the shapes. Times are masked:
+/// production runs on the wall clock and the simulation on its virtual one.
+pub(super) fn normalize_events(
+    events: Vec<(String, Option<String>, Value)>,
+) -> Vec<(String, Option<String>, Value)> {
+    fn relabel(value: &Value, seen: &mut Vec<String>, users: &mut Vec<String>) -> Value {
+        fn ordinal(list: &mut Vec<String>, text: &str, label: &str) -> Value {
+            let position = list.iter().position(|known| known == text).unwrap_or_else(|| {
+                list.push(text.to_owned());
+                list.len() - 1
+            });
+            json!(format!("<{label}#{position}>"))
+        }
+        match value {
+            Value::String(text) if uuid::Uuid::parse_str(text).is_ok() => ordinal(seen, text, "id"),
+            Value::Array(items) => {
+                Value::Array(items.iter().map(|item| relabel(item, seen, users)).collect())
+            }
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(key, value)| {
+                        // A private organization names its accounts with a fixed
+                        // string where production has a UUID.
+                        let relabelled = match value {
+                            Value::String(text) if key.ends_with("_user_id") => {
+                                ordinal(users, text, "user")
+                            }
+                            _ if key.ends_with("_ms") || key.ends_with("_at") => json!("<time>"),
+                            other => relabel(other, seen, users),
+                        };
+                        (key.clone(), relabelled)
+                    })
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    let (mut seen, mut users) = (Vec::new(), Vec::new());
+    events
+        .into_iter()
+        .map(|(kind, node, data)| {
+            let data = relabel(&data, &mut seen, &mut users);
+            (kind, node, data)
+        })
+        .collect()
 }
 
 fn expression_for(outcome: &str, code: &str) -> String {

@@ -8278,6 +8278,7 @@ pub(super) fn plan_timer_boundary(
     now_ms: i64,
     accepted_input: AcceptedInputRef,
     signal_admission: Option<&SignalAdmissionResolver<'_>>,
+    id_source: RuntimeIdSourceHandle,
 ) -> Result<RuntimePlan> {
     ensure!(
         timer.kind == ProcessTimerKind::Boundary
@@ -8287,7 +8288,7 @@ pub(super) fn plan_timer_boundary(
             && timer.version == snapshot.instance.version,
         "boundary timer does not match its pinned instance"
     );
-    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
+    let mut transition = Transition::from_snapshot_with_id_source(snapshot, now_ms, signal_admission, id_source)?;
     transition.accepted_input = Some(accepted_input);
     transition.current_scope = timer
         .scope_id

@@ -455,7 +455,7 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64,
                 timer_id: timer.timer_id.clone(),
                 expected_timer_revision: timer.revision,
                 fired_occurrence: advance.selected_occurrence,
-            }, signal_admission)?,
+            }, signal_admission, id_source.clone())?,
     };
     let skipped_from = (advance.skipped_count > 0).then_some(timer.occurrence);
     let skipped_through = (advance.skipped_count > 0).then(|| advance.selected_occurrence - 1);

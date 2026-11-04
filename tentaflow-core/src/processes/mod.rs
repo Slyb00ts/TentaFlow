@@ -74,6 +74,8 @@ mod simulation_tests;
 #[cfg(test)]
 mod simulation_service_tests;
 #[cfg(test)]
+pub(crate) mod simulation_event_tests;
+#[cfg(test)]
 mod tool_task_tests;
 #[cfg(test)]
 mod block_task_tests;
