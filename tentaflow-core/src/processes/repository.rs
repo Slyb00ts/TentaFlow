@@ -6788,6 +6788,41 @@ pub(crate) fn simulation_timer_summaries_on(
         .collect()
 }
 
+/// Whether the connection is the private database of a simulation: the one
+/// place a process row is never a production fact.
+fn is_private_simulation(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='simulation_meta')",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+/// The audit row of a process fact. A private simulation keeps no audit trail:
+/// the row would carry the wall clock and a random id into a run that is
+/// otherwise repeatable, and nothing reads it.
+fn audit_scoped_tx(
+    tx: &Connection,
+    user_id: Option<&str>,
+    action: &str,
+    resource: &str,
+    resource_type: &str,
+    resource_id: &str,
+    details: Option<&str>,
+    severity: &str,
+    risk_class: &str,
+    org_id: Option<&str>,
+    node_id: Option<&str>,
+) -> Result<()> {
+    if is_private_simulation(tx)? {
+        return Ok(());
+    }
+    crate::db::repository::log_audit_scoped_tx(
+        tx, user_id, action, resource, resource_type, resource_id, details, severity,
+        risk_class, org_id, node_id,
+    )
+}
+
 fn insert_event_on(
     tx: &Connection,
     instance_id: &str,
@@ -6823,7 +6858,7 @@ fn insert_event_on(
         "node_id": event.node_id,
     })
     .to_string();
-    crate::db::repository::log_audit_scoped_tx(
+    audit_scoped_tx(
         tx,
         actor,
         &format!("process.{}", event.kind),
@@ -21188,6 +21223,17 @@ pub(crate) fn simulation_touch_instance_on(
     instance_on(tx, actor, instance_id, None)
 }
 
+/// The instance of a private run as it stands now.
+pub(crate) fn simulation_instance_on(
+    conn: &Connection,
+    mode: PrivateSimulationMode,
+    actor: &ProcessActor,
+    instance_id: &str,
+) -> Result<ProcessInstance> {
+    mode.verify_on(conn)?;
+    instance_on(conn, actor, instance_id, None)
+}
+
 /// Fence of a simulated signal claim: derived from the receipt and the attempt,
 /// so a repeated run claims with the same fences.
 pub(crate) fn simulation_signal_fence(receipt_id: &str, attempt: u32) -> String {
@@ -21216,15 +21262,35 @@ pub(crate) fn simulation_send_message_on(
     insert_message_on(tx, actor, prepared, None, PendingEntryDebit::default(), at_ms)
 }
 
-/// The next message whose address matches exactly one open wait of the run, in
-/// the order production drains them. A message with no match, an ambiguous match
-/// or a closed target is left untouched: it keeps waiting until it expires on the
-/// simulation clock.
+/// What the next message due on the simulation clock needs.
+pub(crate) enum SimulatedMessageStep {
+    /// Its address matches exactly one open wait.
+    Deliver(MessageSnapshot),
+    /// Its address matches several waits: production records it as ambiguous and
+    /// never delivers it by itself.
+    Ambiguous(MessageCandidate),
+    /// Its target instance or activation is closed: production cancels it.
+    Closed(MessageCandidate),
+}
+
+impl SimulatedMessageStep {
+    /// When the message became due, which orders it against timers.
+    pub(crate) fn ready_at_ms(&self) -> i64 {
+        match self {
+            Self::Deliver(snapshot) => snapshot.candidate.next_check_at_ms,
+            Self::Ambiguous(candidate) | Self::Closed(candidate) => candidate.next_check_at_ms,
+        }
+    }
+}
+
+/// The next due message the drain would act on, in the order production drains
+/// them. A message with no match yet is left untouched and keeps waiting until
+/// it expires on the simulation clock.
 pub(crate) fn simulation_next_message_on(
     conn: &Connection,
     mode: PrivateSimulationMode,
     at_ms: i64,
-) -> Result<Option<MessageSnapshot>> {
+) -> Result<Option<SimulatedMessageStep>> {
     mode.verify_on(conn)?;
     let mut query = conn.prepare(
         "SELECT org_id,sender_user_id,message_id,revision,next_check_at_ms FROM bpmn_messages
@@ -21251,10 +21317,15 @@ pub(crate) fn simulation_next_message_on(
                     matches!(snapshot.target, MessageDeliveryTarget::Catch { .. }),
                     "a simulation never starts an instance from a message"
                 );
-                return Ok(Some(snapshot));
+                return Ok(Some(SimulatedMessageStep::Deliver(snapshot)));
+            }
+            Ok(MessageSelection::Ambiguous) => {
+                return Ok(Some(SimulatedMessageStep::Ambiguous(candidate)));
             }
             Ok(_) => {}
-            Err(error) if error.downcast_ref::<MessageClosed>().is_some() => {}
+            Err(error) if error.downcast_ref::<MessageClosed>().is_some() => {
+                return Ok(Some(SimulatedMessageStep::Closed(candidate)));
+            }
             Err(error) => return Err(error),
         }
     }
@@ -21312,15 +21383,15 @@ pub(crate) fn simulation_next_signal_receipt_on(
     conn: &Connection,
     mode: PrivateSimulationMode,
     at_ms: i64,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, i64)>> {
     mode.verify_on(conn)?;
     conn.query_row(
-        "SELECT receipt_id FROM bpmn_signal_receipts
+        "SELECT receipt_id,COALESCE(next_check_at_ms,lease_until_ms) FROM bpmn_signal_receipts
          WHERE (status='pending' AND next_check_at_ms<=?1)
             OR (status='claimed' AND lease_until_ms<=?1)
          ORDER BY COALESCE(next_check_at_ms,lease_until_ms),receipt_id LIMIT 1",
         [at_ms],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .optional()
     .map_err(Into::into)
@@ -30393,6 +30464,9 @@ fn insert_signal_on(
     at_ms: i64,
     mode: ExecutionMode,
 ) -> Result<()> {
+    if let ExecutionMode::Simulation(proof) = mode {
+        proof.verify_on(tx)?;
+    }
     ensure!(Uuid::parse_str(&signal.signal_id).is_ok()
         && Uuid::parse_str(source_event_id).is_ok()
         && (1..=604800).contains(&signal.ttl_seconds),
@@ -30959,6 +31033,9 @@ pub(crate) fn deliver_signal_receipt_in_tx(
     at_ms: i64,
     simulated: Option<&SimulatedDelivery<'_>>,
 ) -> Result<SignalDelivery> {
+    if let Some(sim) = simulated {
+        sim.mode.verify_on(tx)?;
+    }
     let instance_id = &claim.subscription.instance_id;
     if !signal_claim_provenance_on(tx, claim)? { return Ok(SignalDelivery::unchanged()); }
     let state: Option<(String, u64, Option<String>, String, String, String)> = tx.query_row(
@@ -32017,7 +32094,7 @@ fn message_receipt_on(
             event_id,
         )?;
     } else {
-        crate::db::repository::log_audit_scoped_tx(
+        audit_scoped_tx(
             tx,
             Some(&m.key.sender_user_id),
             &format!("process.{kind}"),
@@ -32225,22 +32302,39 @@ fn record_message_selection(
 ) -> Result<bool> {
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
-    let selection = message_selection_on(&tx, c)?;
+    let recorded = record_message_selection_in_tx(&tx, c, state, at_ms, &now_ms, None)?;
+    if recorded.write {
+        tx.commit()?;
+    }
+    Ok(recorded.result)
+}
+
+/// The transaction part of recording that a message has no match yet or matches
+/// several waits (`state` Some(Ambiguous)).
+pub(crate) fn record_message_selection_in_tx(
+    tx: &Transaction<'_>,
+    c: &MessageCandidate,
+    state: Option<ProcessMessageStatus>,
+    at_ms: i64,
+    clock: &dyn Fn() -> Result<i64>,
+    receipt_event_id: Option<&str>,
+) -> Result<MessageRecording> {
+    let selection = message_selection_on(tx, c)?;
     let valid = match (&selection, &state) {
         (MessageSelection::NoMatch, None)
         | (MessageSelection::Ambiguous, Some(ProcessMessageStatus::Ambiguous)) => true,
         _ => false,
     };
     if !valid {
-        return Ok(false);
+        return Ok(MessageRecording::unchanged());
     }
-    let m = message_on(&tx, &c.key, true)?;
-    if m.expires_at_ms <= now_ms()? {
-        return Ok(false);
+    let m = message_on(tx, &c.key, true)?;
+    if m.expires_at_ms <= clock()? {
+        return Ok(MessageRecording::unchanged());
     }
     let next = at_ms.checked_add(1000).context("message wait overflow")?;
     let result = update_message_state_on(
-        &tx,
+        tx,
         &m,
         state.unwrap_or(ProcessMessageStatus::Pending),
         None,
@@ -32248,10 +32342,9 @@ fn record_message_selection(
         at_ms,
         None,
         None,
-        None,
+        receipt_event_id,
     )?;
-    tx.commit()?;
-    Ok(result)
+    Ok(MessageRecording::written(result))
 }
 pub fn record_message_blocked(
     pool: &DbPool,
@@ -32295,14 +32388,54 @@ pub fn record_message_failed(
 ) -> Result<bool> {
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
-    let m = message_on(&tx, &c.key, true)?;
-    if !message_candidate_matches(&m, c) || m.expires_at_ms <= now_ms()? {
-        return Ok(false);
+    let recorded = record_message_failed_in_tx(&tx, c, reason, at_ms, &now_ms, None)?;
+    if recorded.write {
+        tx.commit()?;
     }
-    let ready = match message_selection_on(&tx, c) {
+    Ok(recorded.result)
+}
+
+/// What recording a message outcome did to its transaction: `write` tells the
+/// caller to commit it.
+pub(crate) struct MessageRecording {
+    pub result: bool,
+    pub write: bool,
+}
+
+impl MessageRecording {
+    fn unchanged() -> Self {
+        Self { result: false, write: false }
+    }
+    fn written(result: bool) -> Self {
+        Self { result, write: true }
+    }
+}
+
+/// The transaction part of `record_message_failed`: a failed delivery ends in a
+/// mapping incident on the waiting activation and an errored message, a closed
+/// target in a cancelled message.
+pub(crate) fn record_message_failed_in_tx(
+    tx: &Transaction<'_>,
+    c: &MessageCandidate,
+    reason: &str,
+    at_ms: i64,
+    clock: &dyn Fn() -> Result<i64>,
+    simulated: Option<&SimulatedDelivery<'_>>,
+) -> Result<MessageRecording> {
+    if let Some(sim) = simulated {
+        sim.mode.verify_on(tx)?;
+    }
+    let receipt_event_id = simulated.map(|sim| sim.receipt_event_id.as_str());
+    let m = message_on(tx, &c.key, true)?;
+    if !message_candidate_matches(&m, c) || m.expires_at_ms <= clock()? {
+        return Ok(MessageRecording::unchanged());
+    }
+    let ready = match message_selection_on(tx, c) {
         Ok(MessageSelection::Ready(snapshot)) => Some(snapshot),
-        Ok(MessageSelection::Stale) => return Ok(false),
-        Err(e) if e.downcast_ref::<ProcessAuthorityDenied>().is_some() => return Ok(false),
+        Ok(MessageSelection::Stale) => return Ok(MessageRecording::unchanged()),
+        Err(e) if e.downcast_ref::<ProcessAuthorityDenied>().is_some() => {
+            return Ok(MessageRecording::unchanged())
+        }
         Err(e) if e.downcast_ref::<rusqlite::Error>().is_some() => return Err(e),
         Err(e) if e.downcast_ref::<MessageClosed>().is_some() => {
             let reason = e
@@ -32310,7 +32443,7 @@ pub fn record_message_failed(
                 .context("message closure reason is missing")?
                 .reason();
             let result = update_message_state_on(
-                &tx,
+                tx,
                 &m,
                 ProcessMessageStatus::Cancelled,
                 Some(reason),
@@ -32318,10 +32451,9 @@ pub fn record_message_failed(
                 at_ms,
                 None,
                 None,
-                None,
+                receipt_event_id,
             )?;
-            tx.commit()?;
-            return Ok(result);
+            return Ok(MessageRecording::written(result));
         }
         _ => None,
     };
@@ -32337,7 +32469,10 @@ pub fn record_message_failed(
     {
         let incident = ProcessIncident {
             scope_id: subscription.scope_id.clone(),
-            incident_id: Uuid::new_v4().to_string(),
+            incident_id: simulated.map_or_else(
+                || Uuid::new_v4().to_string(),
+                |sim| sim.ids.borrow_mut().next_id("runtime"),
+            ),
             node_id: Some(subscription.node_id.clone()),
             node_name: None,
             job_id: None,
@@ -32350,14 +32485,17 @@ pub fn record_message_failed(
         plan.status = ProcessInstanceStatus::Incident;
         plan.events.push(PlannedEvent{scope_id:subscription.scope_id.clone(),kind:"message_error".into(),node_id:Some(subscription.node_id.clone()),data:serde_json::json!({"message_id":m.key.message_id,"subscription_id":subscription.subscription_id,"attached_token_id":subscription.token_id,"incident_id":incident.incident_id,"reason":bounded_failure_message(reason)})});
         plan.add_incidents.push(incident);
+        if let Some(sim) = simulated {
+            (sim.finish_plan)(&mut plan)?;
+        }
         let entry = AcceptedInputRef::Message {
             org_id: m.key.org_id.clone(), sender_user_id: m.key.sender_user_id.clone(),
             message_id: m.key.message_id.clone(), expected_message_revision: m.revision,
             target_subscription_id: Some(subscription.subscription_id.clone()),
             expected_subscription_revision: Some(subscription.revision),
         };
-        apply_plan_on(
-            &tx,
+        apply_plan_with_mode_on(
+            tx,
             &snapshot.instance.instance_id,
             &actor.user_id,
             snapshot.instance.revision,
@@ -32365,10 +32503,12 @@ pub fn record_message_failed(
             at_ms,
             None,
             EntryAuthority::Accepted(&entry),
-        &[])?;
+            &[],
+            SimulatedDelivery::execution_mode(simulated),
+        )?;
     }
     let result = update_message_state_on(
-        &tx,
+        tx,
         &m,
         ProcessMessageStatus::Error,
         Some(reason),
@@ -32376,10 +32516,9 @@ pub fn record_message_failed(
         at_ms,
         None,
         None,
-        None,
+        receipt_event_id,
     )?;
-    tx.commit()?;
-    Ok(result)
+    Ok(MessageRecording::written(result))
 }
 pub fn deliver_message(
     pool: &DbPool,
@@ -32451,6 +32590,9 @@ pub(crate) fn deliver_message_in_tx(
     clock: &dyn Fn() -> Result<i64>,
     simulated: Option<&SimulatedDelivery<'_>>,
 ) -> Result<Option<MessageDeliveryOutcome>> {
+    if let Some(sim) = simulated {
+        sim.mode.verify_on(tx)?;
+    }
     let fresh = match message_selection_on(tx, &prepared.candidate)? {
         MessageSelection::Ready(s) => s,
         _ => return Ok(None),

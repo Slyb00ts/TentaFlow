@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tentaflow_protocol::processes::{
     ActivityOutcome, ActivityResult, ProcessIncident, ProcessInstance,
-    ProcessInstanceStatus, ProcessMessageSummary, ProcessMessageTarget, ProcessMessageTargetSpec,
+    ProcessInstanceStatus, ProcessMessageStatus, ProcessMessageSummary, ProcessMessageTarget, ProcessMessageTargetSpec,
     ProcessModel, ProcessNode, ProcessNodeKind, ProcessSimulationServiceFixture,
     ProcessSimulationServiceMode, ProcessSimulationServiceWait, ProcessSimulationSubscription,
     ProcessSimulationVerdict, ProcessSubscriptionKind, ProcessSubscriptionStatus,
@@ -1372,6 +1372,11 @@ enum EventStep {
     Send(repository::PreparedMessage),
     /// A queued message that matches exactly one open wait of the run.
     Message(Box<repository::MessageSnapshot>),
+    /// A queued message that matches several waits; it is recorded as ambiguous.
+    MessageAmbiguous(repository::MessageCandidate),
+    /// A queued message whose target instance or activation is closed; it is
+    /// cancelled.
+    MessageClosed(repository::MessageCandidate),
     /// A signal receipt that is due.
     Signal(String),
 }
@@ -1668,8 +1673,24 @@ impl SimulationStore {
                 revision: timer.revision,
                 due_at_ms,
             });
-        if due_timer.is_none() && !snapshot.tokens.iter().any(|token| token.status == "ready") {
-            if let Some(step) = self.next_event_step(now)? {
+        // A timer and a message (or signal receipt) that are both due go in the
+        // order they became due; at the same instant the timer goes first, as it
+        // does inside a production plan.
+        let ready_tokens = snapshot.tokens.iter().any(|token| token.status == "ready");
+        let mut due_timer = due_timer;
+        let mut event_step = None;
+        if let Some(timer) = due_timer.as_ref() {
+            if let Some((step, ready_at_ms)) = self.next_event_step(now)? {
+                if ready_at_ms < timer.due_at_ms {
+                    due_timer = None;
+                    event_step = Some(step);
+                }
+            }
+        } else if !ready_tokens {
+            event_step = self.next_event_step(now)?.map(|(step, _)| step);
+        }
+        {
+            if let Some(step) = event_step.take() {
                 let command_id = self.next_id("command");
                 let request_hash = hash_json(&json!({
                     "action": "advance",
@@ -1677,6 +1698,8 @@ impl SimulationStore {
                     "at_ms": now,
                     "delivery": match &step {
                         EventStep::Message(snapshot) => snapshot.message.key.message_id.clone(),
+                        EventStep::MessageAmbiguous(candidate)
+                        | EventStep::MessageClosed(candidate) => candidate.key.message_id.clone(),
                         EventStep::Signal(receipt_id) => receipt_id.clone(),
                         EventStep::Send(_) => String::new(),
                     },
@@ -1696,6 +1719,8 @@ impl SimulationStore {
                 )?;
                 return self.view_authorized();
             }
+        }
+        if due_timer.is_none() && !ready_tokens {
             if let Some((job, fixture)) = self.next_fixture_job(&snapshot)? {
                 let result = fixture
                     .result
@@ -2084,13 +2109,27 @@ impl SimulationStore {
 
     /// The next message or signal receipt the environment delivers at `now`:
     /// messages first, as the production drain does.
-    fn next_event_step(&self, now: i64) -> Result<Option<EventStep>> {
+    fn next_event_step(&self, now: i64) -> Result<Option<(EventStep, i64)>> {
         let mode = PrivateSimulationMode::prove(&self.conn)?;
         if let Some(message) = repository::simulation_next_message_on(&self.conn, mode, now)? {
-            return Ok(Some(EventStep::Message(Box::new(message))));
+            let ready_at_ms = message.ready_at_ms();
+            return Ok(Some((
+                match message {
+                    repository::SimulatedMessageStep::Deliver(snapshot) => {
+                        EventStep::Message(Box::new(snapshot))
+                    }
+                    repository::SimulatedMessageStep::Ambiguous(candidate) => {
+                        EventStep::MessageAmbiguous(candidate)
+                    }
+                    repository::SimulatedMessageStep::Closed(candidate) => {
+                        EventStep::MessageClosed(candidate)
+                    }
+                },
+                ready_at_ms,
+            )));
         }
         Ok(repository::simulation_next_signal_receipt_on(&self.conn, mode, now)?
-            .map(EventStep::Signal))
+            .map(|(receipt_id, ready_at_ms)| (EventStep::Signal(receipt_id), ready_at_ms)))
     }
 
     /// Sends a message into the run. It is queued at the next tick of the
@@ -2111,24 +2150,6 @@ impl SimulationStore {
         let snapshot = self
             .load_snapshot()?
             .context("simulation has not been started")?;
-        if let Some(id) = subscription_id {
-            ensure!(
-                snapshot.subscriptions.iter().any(|subscription| subscription.subscription_id == id
-                    && subscription.status == ProcessSubscriptionStatus::Open
-                    && matches!(
-                        subscription.kind,
-                        ProcessSubscriptionKind::MessageCatch
-                            | ProcessSubscriptionKind::ReceiveTask
-                            | ProcessSubscriptionKind::BoundaryMessage
-                    )
-                    && subscription.message_name.as_deref() == Some(message_name)
-                    && subscription.correlation_key.as_deref() == Some(correlation_key)),
-                SimulationServiceError::new(
-                    SIMULATION_MESSAGE_SUBSCRIPTION_UNKNOWN,
-                    "no open message wait of this run has that id, name and correlation key",
-                )
-            );
-        }
         let expected_revision = snapshot.instance.revision;
         let now = self.clock.next_time()?;
         self.prepare_ids();
@@ -2148,6 +2169,24 @@ impl SimulationStore {
         super::messages::validate_message(&prepared).map_err(|error| {
             SimulationServiceError::new(SIMULATION_MESSAGE_INVALID, format!("{error:#}"))
         })?;
+        if let Some(id) = subscription_id {
+            ensure!(
+                snapshot.subscriptions.iter().any(|subscription| subscription.subscription_id == id
+                    && subscription.status == ProcessSubscriptionStatus::Open
+                    && matches!(
+                        subscription.kind,
+                        ProcessSubscriptionKind::MessageCatch
+                            | ProcessSubscriptionKind::ReceiveTask
+                            | ProcessSubscriptionKind::BoundaryMessage
+                    )
+                    && subscription.message_name.as_deref() == Some(message_name)
+                    && subscription.correlation_key.as_deref() == Some(correlation_key)),
+                SimulationServiceError::new(
+                    SIMULATION_MESSAGE_SUBSCRIPTION_UNKNOWN,
+                    "no open message wait of this run has that id, name and correlation key",
+                )
+            );
+        }
         let command_id = self.next_id("command");
         let request_hash = hash_json(&json!({
             "action": "send_message",
@@ -2485,7 +2524,15 @@ impl SimulationStore {
         // its reserved identity), and so is a delivery (its plan is only known
         // inside the transaction), so their plans are held to the profile there.
         let plans_inside_writer = service.is_some()
-            || matches!(event, Some(EventStep::Message(_) | EventStep::Signal(_)));
+            || matches!(
+                event,
+                Some(
+                    EventStep::Message(_)
+                        | EventStep::MessageAmbiguous(_)
+                        | EventStep::MessageClosed(_)
+                        | EventStep::Signal(_)
+                )
+            );
         if !plans_inside_writer {
             for event_index in 0..plan.events.len() {
                 if !plan.event_ids.contains_key(&event_index) {
@@ -2669,21 +2716,116 @@ impl SimulationStore {
                         finish_plan: &name_and_check_plan,
                         receipt_event_id,
                     };
-                    let delivered = repository::deliver_message_in_tx(
+                    tx.execute_batch("SAVEPOINT simulated_delivery")?;
+                    match repository::deliver_message_in_tx(
                         &tx,
                         snapshot,
                         None,
                         at_ms,
                         &|| Ok(at_ms),
                         Some(&simulated),
+                    ) {
+                        Ok(delivered) => {
+                            tx.execute_batch("RELEASE simulated_delivery")?;
+                            let delivered = delivered
+                                .context("simulated message changed before its private delivery")?;
+                            ensure!(
+                                delivered.transition.cancelled_claims.is_empty(),
+                                "simulated message delivery produced unsupported cancelled worker claims"
+                            );
+                            settled_event_ids = Some(recorded_event_ids.borrow().clone());
+                            delivered.transition.instance
+                        }
+                        // A delivery the planner cannot honour (an output mapping that
+                        // fails on this payload) ends as it does in production: the
+                        // message errors and the waiting activation gets an incident.
+                        // Anything the delivery wrote before it failed is undone first.
+                        Err(error)
+                            if error.downcast_ref::<rusqlite::Error>().is_none()
+                                && error
+                                    .downcast_ref::<repository::ProcessAuthorityDenied>()
+                                    .is_none() =>
+                        {
+                            tx.execute_batch("ROLLBACK TO simulated_delivery")?;
+                            tx.execute_batch("RELEASE simulated_delivery")?;
+                            recorded_event_ids.borrow_mut().clear();
+                            repository::record_message_failed_in_tx(
+                                &tx,
+                                &snapshot.candidate,
+                                &format!("{error:#}"),
+                                at_ms,
+                                &|| Ok(at_ms),
+                                Some(&simulated),
+                            )?;
+                            settled_event_ids = Some(recorded_event_ids.borrow().clone());
+                            let instance = repository::simulation_instance_on(
+                                &tx,
+                                mode,
+                                &self.actor,
+                                &instance_id,
+                            )?;
+                            if instance.revision == expected_revision {
+                                repository::simulation_touch_instance_on(
+                                    &tx,
+                                    mode,
+                                    &self.actor,
+                                    &instance_id,
+                                    expected_revision,
+                                    at_ms,
+                                    None,
+                                )?
+                            } else {
+                                instance
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                EventStep::MessageAmbiguous(candidate) => {
+                    let receipt_event_id = self.ids.borrow_mut().next_id("message_receipt_event");
+                    repository::record_message_selection_in_tx(
+                        &tx,
+                        candidate,
+                        Some(ProcessMessageStatus::Ambiguous),
+                        at_ms,
+                        &|| Ok(at_ms),
+                        Some(&receipt_event_id),
+                    )?;
+                    repository::simulation_touch_instance_on(
+                        &tx,
+                        mode,
+                        &self.actor,
+                        &instance_id,
+                        expected_revision,
+                        at_ms,
+                        None,
                     )?
-                    .context("simulated message changed before its private delivery")?;
-                    ensure!(
-                        delivered.transition.cancelled_claims.is_empty(),
-                        "simulated message delivery produced unsupported cancelled worker claims"
-                    );
-                    settled_event_ids = Some(recorded_event_ids.borrow().clone());
-                    delivered.transition.instance
+                }
+                EventStep::MessageClosed(candidate) => {
+                    let receipt_event_id = self.ids.borrow_mut().next_id("message_receipt_event");
+                    let simulated = repository::SimulatedDelivery {
+                        mode,
+                        ids: self.id_handle(),
+                        finish_plan: &name_and_check_plan,
+                        receipt_event_id,
+                    };
+                    repository::record_message_failed_in_tx(
+                        &tx,
+                        candidate,
+                        "message target closed",
+                        at_ms,
+                        &|| Ok(at_ms),
+                        Some(&simulated),
+                    )?;
+                    repository::simulation_touch_instance_on(
+                        &tx,
+                        mode,
+                        &self.actor,
+                        &instance_id,
+                        expected_revision,
+                        at_ms,
+                        None,
+                    )?
                 }
                 EventStep::Signal(receipt_id) => {
                     let receipt_event_id = self.ids.borrow_mut().next_id("message_receipt_event");
@@ -3278,7 +3420,9 @@ fn validate_captured_source(
             // A boundary timer runs on the virtual clock exactly as a catch timer
             // does. `validate_model` already holds its rule to the production
             // limits (no repeating boundary timers, an explicit zone and calendar).
-            ProcessNodeKind::BoundaryTimer { .. } => {}
+            ProcessNodeKind::BoundaryTimer { timer, .. } => {
+                check_simulated_timer(&model, timer, "BoundaryTimer")?;
+            }
             // `validate_model` above already refuses an unbound step, which has
             // nothing a simulation could wait for.
             ProcessNodeKind::ServiceTask { implementation, .. } => {
@@ -3351,7 +3495,12 @@ fn validate_captured_source(
             kind => {
                 return Err(SimulationUnsupportedActivity::ExternalActivity {
                     node_id: node.id.clone(),
-                    kind: format!("{kind:?}"),
+                    // Only the variant name: the rest of the Debug text carries
+                    // authored free text, which dispatch would route on.
+                    kind: format!("{kind:?}")
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric())
+                        .collect(),
                 }
                 .into())
             }

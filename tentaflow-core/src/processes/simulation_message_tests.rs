@@ -40,6 +40,16 @@ fn input_for(model: ProcessModel) -> super::simulation::SimulationSourceInput {
     input
 }
 
+fn started_with_tick(model: ProcessModel, tick_duration_ms: i64) -> SimulationStore {
+    let mut input = input_for(model);
+    input.tick_duration_ms = tick_duration_ms;
+    let mut store = create_store(input).expect("capture the source");
+    store
+        .start(authorize(&store), json!({}))
+        .expect("start the run");
+    store
+}
+
 fn authorize(store: &SimulationStore) -> AuthenticatedSimulationAction {
     test_authorization(store)
 }
@@ -261,6 +271,7 @@ fn event_rows(store: &SimulationStore) -> Vec<Vec<Vec<String>>> {
         "bpmn_signal_emissions",
         "bpmn_signal_receipts",
         "bpmn_event_subscriptions",
+        "audit_log",
     ]
     .iter()
     .map(|table| rows[*table].clone())
@@ -442,7 +453,7 @@ fn an_unknown_subscription_and_a_malformed_message_are_refused_with_stable_codes
 }
 
 #[test]
-fn a_message_that_matches_two_waits_waits_until_one_is_addressed_exactly() {
+fn a_message_that_matches_two_waits_is_recorded_ambiguous_and_never_delivered_by_itself() {
     let mut model = receiving_model(false, false);
     model.nodes = vec![
         model.nodes[0].clone(),
@@ -464,13 +475,19 @@ fn a_message_that_matches_two_waits_waits_until_one_is_addressed_exactly() {
     let waits = advance_times(&mut store, 1).subscriptions;
     assert_eq!(waits.len(), 2, "both branches are waiting");
     send(&mut store, "EvidenceReady", "case-1").expect("ambiguous message");
-    let ambiguous = advance_times(&mut store, 4);
+    let ambiguous = advance_times(&mut store, 2);
     assert_eq!(
         count(&ambiguous, "message_delivered"),
         0,
         "an ambiguous address is never guessed"
     );
+    assert_eq!(
+        ambiguous.messages[0].status,
+        ProcessMessageStatus::Ambiguous
+    );
+    assert!(ambiguous.messages[0].can_resolve && ambiguous.messages[0].can_cancel);
 
+    // The operator answers one wait exactly with a message of its own.
     let second = waits
         .iter()
         .find(|wait| wait.node_id == "Catch_2")
@@ -490,17 +507,32 @@ fn a_message_that_matches_two_waits_waits_until_one_is_addressed_exactly() {
         .events
         .iter()
         .filter(|event| event.kind == "message_delivered")
-        .map(|event| (event.node_id.clone().unwrap_or_default(), event.data["payload"].clone()))
+        .map(|event| {
+            (
+                event.node_id.clone().unwrap_or_default(),
+                event.data["payload"].clone(),
+            )
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         deliveries,
+        vec![("Catch_2".to_owned(), json!({"value": "exact"}))]
+    );
+    // With one wait gone the first message is still ambiguous in production's
+    // sense: only an explicit resolution delivers it.
+    let statuses = delivered
+        .messages
+        .iter()
+        .map(|message| message.status.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
         vec![
-            ("Catch_2".to_owned(), json!({"value": "exact"})),
-            // With one wait gone the earlier message is no longer ambiguous.
-            ("Catch_1".to_owned(), json!({"value": 42})),
+            ProcessMessageStatus::Ambiguous,
+            ProcessMessageStatus::Delivered
         ]
     );
-    assert!(delivered.subscriptions.is_empty());
+    assert_eq!(delivered.subscriptions.len(), 1);
 }
 
 #[test]
@@ -857,6 +889,10 @@ fn nothing_a_message_run_does_leaves_the_private_database() {
         "the run queued its message in its own database"
     );
     assert_eq!(after["bpmn_signal_emissions"].len(), 0);
+    assert!(
+        after["audit_log"].is_empty(),
+        "a private run keeps no audit row (it would carry the wall clock)"
+    );
 }
 
 #[test]
@@ -1173,4 +1209,390 @@ fn a_plan_that_sends_beyond_the_run_is_refused_before_it_is_written() {
         start_node_id: None,
     };
     assert!(super::simulation::validate_supported_plan(&start_target, &[]).is_err());
+}
+
+fn mapping_failure_model() -> ProcessModel {
+    let mut model = receiving_model(false, false);
+    model.variables.insert("amount".into(), Value::Null);
+    model.nodes[1] = node(
+        "Catch_1",
+        ProcessNodeKind::MessageCatch {
+            message_ref: "Message_1".into(),
+            correlation_expression: "'case-1'".into(),
+            output_mapping: BTreeMap::from([("amount".into(), "outputs.amount + 1".into())]),
+        },
+    );
+    model
+}
+
+#[test]
+fn a_message_whose_output_mapping_fails_ends_in_an_incident_and_the_run_goes_on() {
+    let mut store = started(mapping_failure_model());
+    store
+        .send_message(
+            authorize(&store),
+            "EvidenceReady",
+            "case-1",
+            json!({}),
+            None,
+            None,
+        )
+        .expect("queue the message");
+    let failed = advance(&mut store);
+    assert_eq!(failed.messages[0].status, ProcessMessageStatus::Error);
+    assert_eq!(status(&failed), ProcessInstanceStatus::Incident);
+    assert_eq!(
+        failed
+            .incidents
+            .iter()
+            .map(|incident| incident.code.as_str())
+            .collect::<Vec<_>>(),
+        vec!["MESSAGE_MAPPING_ERROR"]
+    );
+    assert_eq!(count(&failed, "message_error"), 1);
+    // The run is not wedged on the same delivery: the clock keeps moving.
+    let later = advance(&mut store);
+    assert!(later.clock.now_ms > failed.clock.now_ms);
+}
+
+#[test]
+fn a_simulated_mapping_failure_equals_the_production_outcome() {
+    use super::messages::drain_pending;
+    use super::repository;
+    use super::runtime::test_support::{publish_model, stamp, Fixture};
+
+    let model = mapping_failure_model();
+    let production = Fixture::new();
+    let version = publish_model(&production, &model);
+    let instance = super::messages::test_support::start_version(&production, &version);
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut message = production_message(&version, &instance.instance_id);
+    message.payload = json!({});
+    repository::send_message(
+        &production.db,
+        &production.owner,
+        &stamp("mapping"),
+        &message,
+        now,
+    )
+    .expect("production send");
+    drain_pending(&production.db, now + 1)
+        .completion
+        .expect("production drain");
+    let production_events = comparable(
+        repository::list_events(
+            &production.db,
+            &production.owner,
+            &instance.instance_id,
+            0,
+            100,
+        )
+        .expect("production history")
+        .0
+        .into_iter()
+        .map(|event| (event.kind, event.node_id, event.data))
+        .collect(),
+    );
+    let production_status = repository::get_message(
+        &production.db,
+        &production.owner,
+        &production.owner.user_id,
+        &message.message_id,
+    )
+    .expect("production message")
+    .message
+    .status;
+
+    let mut store = started(model);
+    store
+        .send_message(
+            authorize(&store),
+            "EvidenceReady",
+            "case-1",
+            json!({}),
+            None,
+            None,
+        )
+        .expect("queue the message");
+    let latest = advance(&mut store);
+    let simulated = comparable(
+        latest
+            .events
+            .iter()
+            .map(|event| {
+                (
+                    event.kind.clone(),
+                    event.node_id.clone(),
+                    event.data.clone(),
+                )
+            })
+            .collect(),
+    );
+    assert_eq!(simulated, production_events);
+    assert_eq!(latest.messages[0].status, production_status);
+}
+
+fn timer_then_work_race_model() -> ProcessModel {
+    let mut model = message_race_model();
+    model.nodes.insert(4, user_task("Work_1"));
+    model.sequence_flows = vec![
+        edge("ToRace", "Start_1", "Race_1"),
+        edge("ToMessage", "Race_1", "Catch_1"),
+        edge("ToTimer", "Race_1", "Timer_1"),
+        edge("MessageEnd", "Catch_1", "End_1"),
+        edge("TimerWork", "Timer_1", "Work_1"),
+        edge("WorkEnd", "Work_1", "End_1"),
+    ];
+    model
+}
+
+#[test]
+fn a_message_that_arrived_before_a_due_timer_is_delivered_before_it() {
+    // The message is queued at +1.5 s and the two second timer falls due at +2 s;
+    // the next advance (+3 s) finds both due, and the message arrived first.
+    let model = message_race_model();
+    let mut store = started_with_tick(model.clone(), 1_500);
+    send(&mut store, "EvidenceReady", "case-1").expect("queue the message");
+    let latest = advance_times(&mut store, 2);
+    assert_eq!(count(&latest, "message_delivered"), 1);
+    assert_eq!(
+        count(&latest, "timer_fired"),
+        0,
+        "the earlier message won the race"
+    );
+    assert_eq!(
+        comparable(
+            latest
+                .events
+                .iter()
+                .map(|event| (
+                    event.kind.clone(),
+                    event.node_id.clone(),
+                    event.data.clone()
+                ))
+                .collect()
+        ),
+        race_history(&model, true)
+    );
+}
+
+#[test]
+fn a_timer_and_a_message_due_at_the_same_instant_go_timer_first() {
+    let mut store = started_with_tick(timer_then_work_race_model(), 1_000);
+    advance(&mut store);
+    // The message is queued exactly when the two second timer falls due.
+    let queued = send(&mut store, "EvidenceReady", "case-1").expect("queue the message");
+    assert_eq!(
+        queued.messages[0].received_at_ms,
+        queued.timers[0].due_at_ms.expect("due")
+    );
+    let latest = advance(&mut store);
+    assert_eq!(count(&latest, "timer_fired"), 1);
+    assert_eq!(count(&latest, "message_delivered"), 0);
+}
+
+#[test]
+fn a_message_addressed_to_a_wait_that_lost_its_race_is_cancelled_like_production() {
+    let mut store = started_with_tick(timer_then_work_race_model(), 1_000);
+    advance(&mut store);
+    let wait = view(&store).subscriptions[0].subscription_id.clone();
+    store
+        .send_message(
+            authorize(&store),
+            "EvidenceReady",
+            "case-1",
+            json!({}),
+            None,
+            Some(&wait),
+        )
+        .expect("addressed while the wait is still open");
+    // The timer fires first and the activation the message names is gone.
+    let after_timer = advance(&mut store);
+    assert_eq!(count(&after_timer, "timer_fired"), 1);
+    let cancelled = advance(&mut store);
+    assert_eq!(
+        cancelled.messages[0].status,
+        ProcessMessageStatus::Cancelled
+    );
+    assert_eq!(count(&cancelled, "message_delivered"), 0);
+    assert_eq!(status(&cancelled), ProcessInstanceStatus::Waiting);
+}
+
+fn boundary_signal_model() -> ProcessModel {
+    use super::simulation_event_tests::boundary_model;
+    let mut model = boundary_model(ProcessTimerSpec::Duration { seconds: 1 }, false, None);
+    model.signals = signal_catch_model().signals;
+    model.target_namespace = signal_catch_model().target_namespace;
+    model.nodes[3] = node(
+        "Handler_1",
+        ProcessNodeKind::SignalThrow {
+            signal_ref: "Signal_1".into(),
+            payload_expression: "{'k': 1}".into(),
+            ttl_seconds: 120,
+        },
+    );
+    model
+}
+
+#[test]
+fn a_non_interrupting_boundary_timer_may_throw_a_signal_in_production() {
+    use super::repository;
+    use super::runtime::test_support::{start_model, Fixture};
+    use super::timers::drain_due;
+
+    let production = Fixture::new();
+    let instance = start_model(&production, &boundary_signal_model());
+    let now = chrono::Utc::now().timestamp_millis();
+    let drained = drain_due(&production.db, now + 5_000);
+    drained
+        .completion
+        .expect("the boundary path with a Signal throw drains");
+    assert_eq!(drained.fired, 1);
+    let events = repository::list_events(
+        &production.db,
+        &production.owner,
+        &instance.instance_id,
+        0,
+        100,
+    )
+    .expect("history")
+    .0;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "signal_admitted")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events[events
+            .iter()
+            .position(|event| event.kind == "timer_fired")
+            .unwrap()
+            + 1]
+        .kind,
+        "signal_admitted"
+    );
+}
+
+#[test]
+fn a_non_interrupting_boundary_timer_may_throw_a_signal_in_a_simulation() {
+    let mut store = started(boundary_signal_model());
+    let mut latest = view(&store);
+    for _ in 0..40 {
+        if count(&latest, "signal_admitted") > 0 {
+            break;
+        }
+        latest = advance(&mut store);
+    }
+    assert_eq!(count(&latest, "timer_fired"), 1);
+    assert_eq!(count(&latest, "signal_admitted"), 1);
+}
+
+#[test]
+fn production_delivery_keeps_random_receipt_ids_and_claim_fences() {
+    use super::messages::test_support::start_version;
+    use super::repository;
+    use super::runtime::test_support::{publish_model, start_model, Fixture};
+    use super::signal_tests::signal_throw_model;
+
+    let production = Fixture::new();
+    let recipient = start_version(
+        &production,
+        &publish_model(&production, &signal_catch_model()),
+    );
+    start_model(&production, &signal_throw_model());
+    let now = chrono::Utc::now().timestamp_millis();
+    let receipts = repository::due_signal_receipts(&production.db, now + 1).expect("due receipts");
+    assert_eq!(receipts.len(), 1, "{recipient:?}");
+    let version_of = |id: &str| uuid::Uuid::parse_str(id).expect("a UUID").get_version_num();
+    assert_eq!(
+        version_of(&receipts[0]),
+        4,
+        "a production receipt id is random"
+    );
+    let claim = repository::claim_signal_receipt(&production.db, &receipts[0], now + 1)
+        .expect("claim")
+        .expect("a pending receipt is claimable");
+    assert_eq!(
+        version_of(&claim.fence),
+        4,
+        "a production claim fence is random"
+    );
+}
+
+#[test]
+fn a_simulation_proof_does_not_open_a_production_transaction() {
+    use super::messages::test_support::start_version;
+    use super::repository::{self, MessageSelection, SimulatedDelivery};
+    use super::runtime::test_support::{publish_model, stamp, Fixture};
+    use super::runtime::RuntimeIdSourceHandle;
+    use super::simulation::{PrivateSimulationMode, SimulationDatabase, SimulationIdSource};
+
+    // A proof minted on a private database…
+    let private = SimulationDatabase::open()
+        .expect("private database")
+        .into_connection_for_test();
+    let mode =
+        PrivateSimulationMode::prove_for_test(&private).expect("a private database proves itself");
+    let ids: RuntimeIdSourceHandle = std::rc::Rc::new(std::cell::RefCell::new(
+        SimulationIdSource::new(&"a".repeat(64)).unwrap(),
+    ));
+    let finish = |_: &mut repository::RuntimePlan| -> anyhow::Result<()> { Ok(()) };
+    let simulated = SimulatedDelivery {
+        mode,
+        ids,
+        finish_plan: &finish,
+        receipt_event_id: uuid::Uuid::new_v4().to_string(),
+    };
+
+    // …is refused by every writer when it meets a production transaction.
+    let model = receiving_model(false, false);
+    let production = Fixture::new();
+    let version = publish_model(&production, &model);
+    let instance = start_version(&production, &version);
+    let now = chrono::Utc::now().timestamp_millis();
+    repository::send_message(
+        &production.db,
+        &production.owner,
+        &stamp("proof"),
+        &production_message(&version, &instance.instance_id),
+        now,
+    )
+    .expect("production send");
+    let candidate = repository::due_messages(&production.db, now + 1, 32)
+        .unwrap()
+        .remove(0);
+    let MessageSelection::Ready(snapshot) =
+        repository::message_snapshot(&production.db, &candidate).unwrap()
+    else {
+        panic!("a deliverable production message")
+    };
+    let mut connection = production.db.write().unwrap();
+    let tx = connection.transaction().unwrap();
+    let refusal = |error: anyhow::Error| format!("{error:#}");
+    assert!(refusal(
+        repository::deliver_message_in_tx(&tx, &snapshot, None, now, &|| Ok(now), Some(&simulated))
+            .expect_err("delivery")
+    )
+    .contains("private simulation database"));
+    assert!(refusal(
+        repository::record_message_failed_in_tx(
+            &tx,
+            &candidate,
+            "x",
+            now,
+            &|| Ok(now),
+            Some(&simulated)
+        )
+        .err()
+        .expect("failure record")
+    )
+    .contains("private simulation database"));
+    assert!(refusal(
+        repository::simulation_deliver_signal_on(&tx, &simulated, "receipt", now)
+            .err()
+            .expect("signal")
+    )
+    .contains("private simulation database"));
 }

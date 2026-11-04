@@ -370,6 +370,22 @@ pub fn next_timer_occurrence(
     })
 }
 
+/// The timer event is inserted in front of the plan's events, so every index a
+/// result disposition carries moves with them.
+fn shift_io_disposition(disposition: &mut repository::ActivityIoResultDisposition) {
+    match disposition {
+        repository::ActivityIoResultDisposition::Applied { output_event_index, .. } => {
+            *output_event_index += 1
+        }
+        repository::ActivityIoResultDisposition::Blocked { incident_event_index, .. } => {
+            *incident_event_index += 1
+        }
+        repository::ActivityIoResultDisposition::Retained { route_event_index, .. } => {
+            *route_event_index += 1
+        }
+    }
+}
+
 pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64,
     signal_admission: Option<&runtime::SignalAdmissionResolver<'_>>,
     id_source: Option<RuntimeIdSourceHandle>,
@@ -529,8 +545,17 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64,
             match effect {
                 repository::VariableEffect::Mapped { event_index, .. }
                 | repository::VariableEffect::ScopeEntry { event_index, .. }
-                | repository::VariableEffect::RepetitionEntry { event_index, .. }
-                | repository::VariableEffect::RepetitionAggregate { event_index, .. } => *event_index += 1,
+                | repository::VariableEffect::RepetitionEntry { event_index, .. } => *event_index += 1,
+                repository::VariableEffect::RepetitionAggregate {
+                    event_index,
+                    output_event_index,
+                    ..
+                } => {
+                    *event_index += 1;
+                    if let Some(index) = output_event_index {
+                        *index += 1;
+                    }
+                }
             }
         }
         for message in &mut plan.create_messages {
@@ -538,6 +563,34 @@ pub fn plan_timer_fire(snapshot: &TimerSnapshot, at_ms: i64,
         }
         for closed in &mut plan.closed_service_dispatches {
             closed.event_index += 1;
+        }
+        for signal in &mut plan.create_signals {
+            signal.source_event_index += 1;
+        }
+        for fact in &mut plan.activity_io_inputs {
+            match fact {
+                repository::ActivityIoInputFact::Captured { event_index, .. } => *event_index += 1,
+                repository::ActivityIoInputFact::Failed { incident_event_index, .. } => {
+                    *incident_event_index += 1
+                }
+            }
+        }
+        for fact in &mut plan.activity_io_results {
+            fact.result_event_index += 1;
+            shift_io_disposition(&mut fact.disposition);
+        }
+        for fact in &mut plan.activity_io_continuations {
+            fact.approval_event_index += 1;
+            shift_io_disposition(&mut fact.disposition);
+        }
+        for failure in &mut plan.scope_return_failures {
+            failure.incident_event_index += 1;
+            for index in &mut failure.end_event_indices {
+                *index += 1;
+            }
+        }
+        if let Some(capacity) = plan.repetition_capacity.as_mut() {
+            capacity.event_index += 1;
         }
         0
     } else {
