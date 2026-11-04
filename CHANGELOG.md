@@ -611,6 +611,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   podprocesie, który kopiuje zmienne na zewnątrz, daje ostrzeżenie, bo po
   przerwaniu kopiowanie nie następuje. Ostrzeżenia importu żyją tylko w bieżącej
   sesji okna (przycisk „Kopiuj raport”).
+- Symulacja zadań usługi i weryfikacji (B3.7a). Krok usługi w symulacji czeka na
+  wynik podany przez operatora (Zakończony albo Błąd z kodem; pozostałe wyniki
+  tylko przy kroku z wyrażeniem wyniku) albo na wynik przygotowany przy starcie.
+  Przejścia po wyniku, werdykty Testu i Krytyka oraz decyzje człowieka w
+  weryfikacji idą tym samym kodem co produkcja; wszystko zostaje w prywatnej
+  bazie symulacji. Okno pokazuje wejście kroku, formularz wyniku, incydenty
+  słowami i ślad ze zlokalizowanymi zdarzeniami. Wykonanie kroku „naprawdę” jest
+  w protokole, ale odrzucane (`SIMULATION_REAL_EXECUTION_UNSUPPORTED`); kroki
+  agenta i zadania usługi z wejściem/wyjściem działania są w symulacji
+  odrzucane z nazwą kroku. Wiadomości, sygnały, podprocesy, wywołania i
+  powtórzenia nadal poza symulacją (B3.7b/c).
 
 ### TentaNas
 
