@@ -13,7 +13,8 @@ import { answerFormHtml, errorMessage, fillAnswerForm, readAnswerDraft, showAnsw
 import {
   OUTPUTS_MAX_KIB, SIMULATION_EVENT_INCIDENT_CODES, SIMULATION_EVENT_KINDS, SIMULATION_MESSAGE_STATUSES,
   SIMULATION_STATUSES, SIMULATION_SUBSCRIPTION_KINDS, SIMULATION_TASK_KINDS, blankMessageDraft, blankServiceDraft,
-  readMessageDraft, readOutputs, readServiceAnswer, readServiceFixtures, simulationFinished, simulationMessageWaits,
+  readMessageDraft, readOutputs, readServiceAnswer, readServiceFixtures, simulationFinished, simulationHorizonReached,
+  simulationMessageCandidates, simulationMessageWaits,
   simulationOpen, simulationServiceSteps, simulationTaskDecision, simulationUnsupportedSteps, simulationWaitSteps,
 } from './simulation-service.js';
 import '/js/components/tf-alert.js';
@@ -59,6 +60,20 @@ let carried = null;
 // `closed` can arrive after the new screen has already asked for the run back.
 const live = new Set();
 
+const clockText = (ms) => new Date(ms).toLocaleString(I18n.getLanguage());
+const timeText = (ms) => new Date(ms).toLocaleTimeString(I18n.getLanguage());
+
+// A server reason in words when the platform's wording is known; anything else is told as a
+// problem of that kind, and the raw text goes to a secondary line for support.
+export function simulationReasonText(reason) {
+  const raw = String(reason ?? '');
+  if (/mapping|mapped/i.test(raw)) return text('simulation_reason_mapping');
+  if (/activation is closed|target instance is closed|is closed|not found/i.test(raw)) return text('simulation_reason_closed');
+  if (/ambiguous/i.test(raw)) return text('simulation_reason_ambiguous');
+  if (/expired/i.test(raw)) return text('simulation_reason_expired');
+  return text('simulation_reason_other');
+}
+
 const known = (list, value, prefix) => (list.includes(value) ? text(`${prefix}_${value.toLowerCase()}`) : String(value ?? ''));
 
 // An incident in words: the platform's sentence for the codes it knows, the cause of the
@@ -68,15 +83,16 @@ export function simulationIncidentText(incident) {
   if (code === 'RESULT_EXPRESSION_ERROR') return text('simulation_incident_result_expression');
   if (SIMULATION_EVENT_INCIDENT_CODES.includes(code)) return text(`simulation_incident_${code.toLowerCase()}`);
   const sentence = processIncidentText({ code, message: '' });
-  if (sentence === text('incident_generic') && code !== '') {
-    return incident.message || text('simulation_incident_service_code', { code });
-  }
+  if (sentence === text('incident_generic') && code !== '') return text('simulation_incident_service_code', { code });
   return MAPPING_CODES.includes(code) ? `${sentence} ${text('simulation_incident_mapping_hint')}` : sentence;
 }
 
 // The refusals of a run that moved on while the window was open, then the model-aware ones.
-export function simulationErrorText(message, model) {
+export function simulationErrorText(message, model, context = {}) {
   const raw = String(message ?? '');
+  if (/SIMULATION_HORIZON_REACHED/.test(raw)) {
+    return text('simulation_error_horizon', { horizon: context.horizonMs == null ? '' : clockText(context.horizonMs) });
+  }
   if (/message too big/.test(raw)) return text('simulation_error_too_big', { max: OUTPUTS_MAX_KIB });
   if (/target instance is closed/.test(raw)) return text('simulation_error_target_closed');
   if (/revision conflict or closed instance/.test(raw)) return text('simulation_error_closed');
@@ -84,9 +100,6 @@ export function simulationErrorText(message, model) {
   if (/process resource not found/.test(raw)) return text('simulation_error_gone');
   return model ? processExplainError(raw, model) : raw;
 }
-
-const clockText = (ms) => new Date(ms).toLocaleString(I18n.getLanguage());
-const timeText = (ms) => new Date(ms).toLocaleTimeString(I18n.getLanguage());
 
 export function simulationWindow(view, model = null, options = {}) {
   const win = document.createElement('tf-window');
@@ -120,26 +133,34 @@ export function simulationWindow(view, model = null, options = {}) {
   const fieldErrors = new Map();
   // The message form is one form for the whole run, so it has one draft.
   let messageDraft = { ...blankMessageDraft(), ...(options.messageDraft ?? {}) };
+  // Shown beside Send after a message went out, until the author touches the form or sends another.
+  let messageSentNote = false;
 
   const setError = (error) => {
     const alert = win.querySelector('[data-error]');
     const message = error?.message || String(error);
-    alert.setAttribute('message', simulationErrorText(message, model));
+    alert.setAttribute('message', simulationErrorText(message, model, { horizonMs: current.clock?.horizonMs }));
     alert.hidden = false;
     alert.scrollIntoView?.({ block: 'nearest' });
   };
 
-  const run = async (action, onFail = null) => {
+  const run = async (action, hooks = {}) => {
     if (busy || !win.isConnected) return;
     busy = true;
     win.querySelectorAll('tf-button').forEach((button) => button.setAttribute('disabled', ''));
     win.querySelector('[data-error]').hidden = true;
     try {
       current = await action();
+      hooks.onDone?.();
       render();
+      hooks.afterRender?.();
     } catch (error) {
       setError(error);
-      onFail?.(error);
+      hooks.onFail?.(error);
+      // A refusal that says the run moved on is answered with the run as it is now, so the clock shown is its clock.
+      if (/SIMULATION_HORIZON_REACHED|revision conflict or closed instance|target instance is closed/.test(error?.message || '')) {
+        try { current = (await ApiBinary.one('processSimulationViewRequest', { simulationId: current.simulationId })).view; } catch (_) { /* the run may be gone */ }
+      }
     } finally {
       busy = false;
       if (win.isConnected) render();
@@ -187,6 +208,7 @@ export function simulationWindow(view, model = null, options = {}) {
     const finished = simulationFinished(status);
     const eventLabel = (event) => {
       if (event.kind === 'service_result' && fixtures.has(event.nodeId)) return text('simulation_event_service_result_fixture');
+      if (event.kind === 'event_race_won' && event.data?.winner_node_id) return text('simulation_event_event_race_won_by', { node: elementName(event.data.winner_node_id) });
       return known(SIMULATION_EVENT_KINDS, event.kind, 'simulation_event');
     };
     const decision = (task) => simulationTaskDecision(events, task.userTaskId);
@@ -194,43 +216,71 @@ export function simulationWindow(view, model = null, options = {}) {
     const messages = current.messages || [];
     const messageWaits = simulationMessageWaits(subscriptions);
     const waitLabel = (subscription) => `${elementName(subscription.nodeId, subscription.nodeName)} · ${subscription.messageName} · ${subscription.correlationKey}`;
+    // What the arming event says about a wait: the step it hangs on, which the wait itself does not carry.
+    const armEvent = (subscriptionId) => events.find((candidate) => candidate.data?.subscription_id === subscriptionId
+      && ['message_armed', 'receive_task_opened', 'signal_catch_opened'].includes(candidate.kind));
+    const signalName = (subscription) => {
+      const declared = (model?.signals || []).find((signal) => signal.signalId === subscription.signalDeclarationId);
+      return declared?.name || subscription.signalDeclarationId || subscription.signalNamespaceUri || '';
+    };
     const subscriptionRow = (subscription) => `<li data-simulation-subscription="${escapeAttr(subscription.subscriptionId)}" data-subscription-kind="${escapeAttr(subscription.kind)}">
         <strong>${escapeHtml(elementName(subscription.nodeId, subscription.nodeName))}</strong> · ${escapeHtml(known(SIMULATION_SUBSCRIPTION_KINDS, subscription.kind, 'simulation_subscription_kind'))}
         ${subscription.messageName != null ? `<div>${escapeHtml(text('simulation_sub_message'))}: ${escapeHtml(subscription.messageName)} · ${escapeHtml(text('simulation_sub_key'))}: ${escapeHtml(subscription.correlationKey ?? '')}</div>` : ''}
-        ${subscription.kind === 'SignalCatch' ? `<div>${escapeHtml(text('simulation_sub_signal'))}: ${escapeHtml(subscription.signalDeclarationId || subscription.signalNamespaceUri || '')}</div>` : ''}
+        ${subscription.kind === 'SignalCatch' ? `<div>${escapeHtml(text('simulation_sub_signal'))}: ${escapeHtml(signalName(subscription))}</div>` : ''}
+        ${subscription.kind === 'BoundaryMessage' && armEvent(subscription.subscriptionId)?.data?.attached_to_id ? `<div>${escapeHtml(text('simulation_timer_attached', { node: elementName(armEvent(subscription.subscriptionId).data.attached_to_id) }))}</div>` : ''}
         ${subscription.dueAtMs != null ? `<div>${escapeHtml(text('simulation_sub_timer_due', { time: clockText(subscription.dueAtMs) }))}</div>` : ''}
       </li>`;
+    const pendingTimers = timers.filter((timer) => String(timer.status).toLowerCase() === 'pending');
+    const raceTimers = (group) => pendingTimers.filter((timer) => group.some((subscription) => subscription.scopeId === timer.scopeId
+      && subscription.dueAtMs != null && subscription.dueAtMs === timer.dueAtMs));
     const races = new Map();
     for (const subscription of subscriptions) {
       if (subscription.raceId) races.set(subscription.raceId, [...(races.get(subscription.raceId) ?? []), subscription]);
     }
+    const incidentCodes = incidents.map((incident) => incident.code);
     const messageRow = (message) => {
       const state = message.status;
       const when = state === 'Delivered' && message.deliveredAtMs != null ? text('simulation_message_delivered_at', { time: clockText(message.deliveredAtMs) })
         : state === 'Expired' ? text('simulation_message_expired_at', { time: clockText(message.expiresAtMs) })
           : ['Pending', 'Ambiguous', 'Blocked'].includes(state) ? text('simulation_message_expires_at', { time: clockText(message.expiresAtMs) }) : '';
+      const candidates = simulationMessageCandidates(subscriptions, message);
+      const reached = state === 'Delivered' && message.matchedSubscriptionId ? armEvent(message.matchedSubscriptionId) : null;
+      // A pending message tells what will happen to it: it waits for a wait that matches, or it never will be delivered.
+      const over = finished || horizonReached;
+      const pendingHint = over ? 'simulation_message_never_delivered' : candidates.length ? 'simulation_message_pending_hint' : 'simulation_message_no_wait';
+      // A failure is told as a mapping problem only when the run holds that incident; the platform's own words go to a secondary line.
+      const failureText = ['Error', 'Blocked', 'Cancelled'].includes(state) && message.lastReason
+        ? (/mapping|mapped/i.test(message.lastReason) && !incidentCodes.includes('MESSAGE_MAPPING_ERROR') ? text('simulation_reason_other') : simulationReasonText(message.lastReason)) : '';
       return `<li data-simulation-message="${escapeAttr(message.messageId)}" data-message-status="${escapeAttr(state)}">
         <strong>${escapeHtml(message.messageName)}</strong> · ${escapeHtml(text('simulation_sub_key'))}: ${escapeHtml(message.correlationKey)}
         <tf-chip status="${state === 'Delivered' ? 'ok' : state === 'Error' ? 'err' : state === 'Pending' ? 'info' : 'warn'}">${escapeHtml(known(SIMULATION_MESSAGE_STATUSES, state, 'simulation_message_status'))}</tf-chip>
         ${when ? `<div>${escapeHtml(when)}</div>` : ''}
-        ${state === 'Pending' ? `<div class="fb-field-hint">${escapeHtml(text('simulation_message_pending_hint'))}</div>` : ''}
+        ${reached ? `<div data-message-reached>${escapeHtml(text('simulation_message_reached', { node: elementName(reached.nodeId) }))}</div>` : ''}
+        ${state === 'Pending' ? `<div class="fb-field-hint" data-message-pending-hint="${over ? 'finished' : candidates.length ? 'match' : 'none'}">${escapeHtml(text(pendingHint))}</div>` : ''}
         ${state === 'Ambiguous' ? `<div class="fb-field-hint" data-message-ambiguous-hint>${escapeHtml(text('simulation_message_ambiguous_hint'))}</div>
+          ${candidates.length > 1 ? `<tf-select data-message-candidate="${escapeAttr(message.messageId)}" wrap-selected label="${escapeAttr(text('simulation_message_candidate'))}" value="${escapeAttr(candidates[0].subscriptionId)}" ${busy || finished ? 'disabled' : ''}>
+            ${candidates.map((subscription) => `<option value="${escapeAttr(subscription.subscriptionId)}">${escapeHtml(elementName(subscription.nodeId, subscription.nodeName))}</option>`).join('')}</tf-select>` : ''}
           <tf-button variant="secondary" size="sm" data-message-address="${escapeAttr(message.messageId)}" ${busy || finished ? 'disabled' : ''}>${escapeHtml(text('simulation_message_address'))}</tf-button>` : ''}
-        ${['Error', 'Blocked'].includes(state) && message.lastReason ? `<div class="fb-field-hint">${escapeHtml(message.lastReason)}</div>` : ''}
+        ${failureText ? `<div class="fb-field-hint" data-message-failure>${escapeHtml(failureText)}</div>` : ''}
+        ${['Error', 'Blocked', 'Cancelled'].includes(state) && message.lastReason ? `<tf-disclosure label="${escapeAttr(text('simulation_support_details'))}"><code>${escapeHtml(message.lastReason)}</code></tf-disclosure>` : ''}
       </li>`;
     };
+    // A service step or person step the engine interrupted is named in the trace and kept in the lists as cancelled.
+    const cancelledServices = events.filter((candidate) => candidate.kind === 'simulation_service_cancelled');
     const lock = busy || finished ? 'disabled' : '';
+    const horizonReached = simulationHorizonReached(clock);
     content.innerHTML = `
       <div class="fb-simulation-toolbar">
         <div><strong>${escapeHtml(text('simulation_clock'))}</strong>: ${escapeHtml(text('simulation_clock_value', { now: clockText(clock.nowMs), end: clockText(clock.horizonMs), step: clock.stepIndex }))}</div>
         <div><span>${escapeHtml(text('status'))}: <tf-chip status="${status === 'Incident' || status === 'Error' ? 'err' : status === 'Completed' ? 'ok' : 'info'}" data-simulation-status="${escapeAttr(status)}">${escapeHtml(known(SIMULATION_STATUSES, status, 'simulation_status'))}</tf-chip></span>
-          <tf-button variant="secondary" size="sm" icon="plus" data-simulation-advance ${busy || finished ? 'disabled' : ''}>${escapeHtml(text('simulation_advance'))}</tf-button>
+          <tf-button variant="secondary" size="sm" icon="plus" data-simulation-advance ${busy || finished || horizonReached ? 'disabled' : ''}>${escapeHtml(text('simulation_advance'))}</tf-button>
           <tf-button variant="ghost" size="sm" data-simulation-end ${busy ? 'disabled' : ''}>${escapeHtml(text('simulation_end'))}</tf-button></div>
       </div>
-      <p class="fb-field-hint" data-simulation-advance-hint>${escapeHtml(text('simulation_advance_hint'))}</p>
+      <p class="fb-field-hint" data-simulation-advance-hint>${escapeHtml(text('simulation_advance_hint', { tick: Math.max(1, Math.round((clock.tickDurationMs ?? 1000) / 1000)), now: clockText(clock.nowMs), end: clockText(clock.horizonMs) }))}</p>
+      ${horizonReached && !finished ? `<tf-alert tone="warning" data-simulation-horizon message="${escapeAttr(text('simulation_horizon_note', { horizon: clockText(clock.horizonMs) }))}"></tf-alert>` : ''}
       ${incidents.length || status === 'Incident' ? `<section class="fb-simulation-section" data-simulation-incidents><h3>${escapeHtml(text('simulation_incidents'))}</h3>
         <p>${escapeHtml(text('simulation_incident_stopped'))}</p>
-        ${incidents.map((incident) => `<tf-alert tone="danger" data-simulation-incident message="${escapeAttr(`${elementName(incident.nodeId, incident.nodeName)}: ${simulationIncidentText(incident)} (${incident.code})`)}"></tf-alert>`).join('')}
+        ${incidents.map((incident) => `<tf-alert tone="danger" data-simulation-incident message="${escapeAttr(`${elementName(incident.nodeId, incident.nodeName)}: ${simulationIncidentText(incident)} (${incident.code})`)}"></tf-alert>${incident.message ? `<tf-disclosure label="${escapeAttr(text('simulation_support_details'))}"><code>${escapeHtml(incident.message)}</code></tf-disclosure>` : ''}`).join('')}
       </section>` : ''}
       ${waits.length ? `<section class="fb-simulation-section" data-simulation-waits><h3>${escapeHtml(text('simulation_waits', { count: waits.length }))}</h3>
         ${waits.map(({ wait, step }) => {
@@ -251,6 +301,8 @@ export function simulationWindow(view, model = null, options = {}) {
         </article>`;
         }).join('')}
       </section>` : ''}
+      ${cancelledServices.length ? `<section class="fb-simulation-section" data-simulation-cancelled-services><h3>${escapeHtml(text('simulation_services_cancelled'))}</h3>
+        ${cancelledServices.map((entry) => `<article class="fb-simulation-task"><strong>${escapeHtml(elementName(entry.nodeId))}</strong> <tf-chip status="warn">${escapeHtml(text('simulation_task_cancelled'))}</tf-chip></article>`).join('')}</section>` : ''}
       <section class="fb-simulation-section"><h3>${escapeHtml(text('simulation_tasks'))}</h3>
         ${openTasks.length ? openTasks.map((task) => {
           const manual = task.kind === 'Manual';
@@ -283,12 +335,14 @@ export function simulationWindow(view, model = null, options = {}) {
         <ul class="fb-simulation-awaited">
           ${subscriptions.filter((subscription) => !subscription.raceId).map(subscriptionRow).join('')}
           ${[...races.entries()].map(([raceId, group]) => `<li data-simulation-race="${escapeAttr(raceId)}"><em>${escapeHtml(text('simulation_race', { count: group.length }))}</em>
-            <ul>${group.map(subscriptionRow).join('')}</ul></li>`).join('')}
+            <ul>${group.map(subscriptionRow).join('')}
+              ${raceTimers(group).map((timer) => `<li data-simulation-race-timer="${escapeAttr(timer.timerId)}"><strong>${escapeHtml(elementName(timer.nodeId, timer.nodeName))}</strong> · ${escapeHtml(text('simulation_timer_kind_catch'))}
+                <div>${escapeHtml(text('simulation_sub_timer_due', { time: clockText(timer.dueAtMs) }))}</div></li>`).join('')}</ul></li>`).join('')}
         </ul>
         ${subscriptions.some((subscription) => subscription.kind === 'SignalCatch') ? `<p class="fb-field-hint" data-simulation-signal-note>${escapeHtml(text('simulation_signal_note'))}</p>` : ''}
       </section>` : ''}
       <section class="fb-simulation-section" data-simulation-message-form><h3>${escapeHtml(text('simulation_send_message'))}</h3>
-        ${finished ? `<p data-message-finished>${escapeHtml(text('simulation_message_finished'))}</p>` : ''}
+        ${finished ? `<p data-message-finished>${escapeHtml(text(status === 'Incident' ? 'simulation_message_stopped' : 'simulation_message_finished'))}</p>` : ''}
         <div class="fb-simulation-answer">
           <tf-select data-message-field="pick" wrap-selected label="${escapeAttr(text('simulation_message_pick'))}" hint="${escapeAttr(text('simulation_message_pick_hint'))}" value="${escapeAttr(messageDraft.pick)}" ${lock}>
             <option value="">${escapeHtml(text('simulation_message_free'))}</option>
@@ -307,6 +361,7 @@ export function simulationWindow(view, model = null, options = {}) {
           <tf-alert data-message-error="ttl" tone="danger" hidden></tf-alert>
           <tf-alert data-message-error="pick" tone="danger" hidden></tf-alert>
           <tf-button variant="primary" size="sm" data-simulation-message-send ${lock}>${escapeHtml(text('simulation_message_send'))}</tf-button>
+          ${messageSentNote ? `<p class="fb-field-hint" data-message-confirmation role="status">${escapeHtml(text('simulation_message_queued_note'))}</p>` : ''}
         </div>
       </section>
       ${messages.length ? `<section class="fb-simulation-section" data-simulation-messages><h3>${escapeHtml(text('simulation_messages', { count: messages.length }))}</h3>
@@ -368,6 +423,10 @@ export function simulationWindow(view, model = null, options = {}) {
     const article = event.target.closest?.('[data-simulation-wait]');
     if (article) syncAnswerForm(article);
     // Choosing a wait fills the name and key it waits for and addresses exactly that wait.
+    if (event.target.closest?.('[data-message-field]') && messageSentNote) {
+      messageSentNote = false;
+      content.querySelector('[data-message-confirmation]')?.remove();
+    }
     const pick = event.target.closest?.('[data-message-field="pick"]');
     if (pick) {
       const chosen = simulationMessageWaits(current.subscriptions).find((subscription) => subscription.subscriptionId === pick.value);
@@ -395,10 +454,13 @@ export function simulationWindow(view, model = null, options = {}) {
     if (address) {
       const message = (current.messages || []).find((entry) => entry.messageId === address.dataset.messageAddress);
       if (!message || busy) return;
-      messageField('pick').value = '';
+      // The new message addresses one of the waits the ambiguous one matched.
+      const candidates = simulationMessageCandidates(current.subscriptions, message);
+      const chosen = content.querySelector(`[data-message-candidate="${CSS.escape(message.messageId)}"]`)?.value || candidates[0]?.subscriptionId || '';
+      messageField('pick').value = chosen;
       messageField('name').value = message.messageName;
       messageField('key').value = message.correlationKey;
-      messageField('exact').checked = false;
+      messageField('exact').checked = !!chosen;
       messageField('pick').scrollIntoView?.({ block: 'center' });
       return;
     }
@@ -409,7 +471,15 @@ export function simulationWindow(view, model = null, options = {}) {
       showMessageErrors(read.errors);
       if (read.errors) return;
       const simulationId = current.simulationId;
-      run(async () => (await ApiBinary.one('processSimulationMessageSendRequest', { simulationId, ...read.request })).view);
+      run(async () => (await ApiBinary.one('processSimulationMessageSendRequest', { simulationId, ...read.request })).view, {
+        // What went out is not sent twice by a second press: the wait chosen is released, the name and key stay.
+        onDone: () => {
+          messageField('pick').value = '';
+          messageField('exact').checked = false;
+          messageSentNote = true;
+        },
+        afterRender: () => content.querySelector('[data-simulation-messages]')?.scrollIntoView?.({ block: 'nearest' }),
+      });
       return;
     }
     const resolve = event.target.closest('[data-simulation-resolve]');
@@ -424,10 +494,10 @@ export function simulationWindow(view, model = null, options = {}) {
       const simulationId = current.simulationId;
       run(async () => (await ApiBinary.one('processSimulationServiceResolveRequest', {
         simulationId, nodeId: wait.nodeId, jobId: wait.jobId, result: answer.result, verdict: answer.verdict,
-      })).view, (error) => {
+      })).view, { onFail: (error) => {
         // The engine alone knows when an expression made a verdict necessary; it belongs at the verdict field.
         if (/SIMULATION_VERDICT_REQUIRED/.test(error?.message || '')) fieldErrors.set(wait.jobId, { verdict: 'simulation_verdict_required' });
-      });
+      } });
       return;
     }
     const taskButton = event.target.closest('[data-simulation-task]');
@@ -577,9 +647,13 @@ export function openProcessSimulation(definition, version, startCatalog, selecte
   // The simulation clock cannot run a repetition, so the window says so before
   // the author starts it instead of after the server refuses.
   const repeated = [...new Set(processRepeatedElements(definition.model))];
+  // The engine refuses these steps whatever else is chosen, so the start is held back and says which steps are why.
+  const elementNames = processElementNames(definition.model);
+  const blocking = [...new Set(simulationUnsupportedSteps(definition.model).map((step) => elementNames.get(step.nodeId)))];
   return openFormWindow({
     title: text('simulation'), icon: 'play', subject: definition.name,
-    note: repeated.length ? { tone: 'warning', text: text('simulation_repeat_unsupported', { names: repeated.join(', ') }) } : { text: text('simulation_hint') },
+    note: repeated.length ? { tone: 'warning', text: text('simulation_repeat_unsupported', { names: repeated.join(', ') }) }
+      : blocking.length ? { tone: 'warning', text: text('simulation_blocked_by_steps', { names: blocking.join(', ') }) } : { text: text('simulation_hint') },
     sections: [selection, variables, ...(fixtures ? [fixtures] : [])],
     width: 720,
     submitLabel: text('simulation_start'), busyLabel: text('simulation_starting'), anchor,
@@ -597,7 +671,7 @@ export function openProcessSimulation(definition, version, startCatalog, selecte
       selection.querySelector('[data-simulation-start]').setAttribute('error', text('start_entry_changed'));
       return false;
     },
-    canSubmit: () => selection.querySelector('[data-simulation-start]').value !== '' && !definition.archived && repeated.length === 0,
+    canSubmit: () => selection.querySelector('[data-simulation-start]').value !== '' && !definition.archived && repeated.length === 0 && blocking.length === 0,
     collect: () => {
       const entry = manualStarts[Number(selection.querySelector('[data-simulation-start]').value)];
       if (!entry) throw new Error(text('start_entry_changed'));

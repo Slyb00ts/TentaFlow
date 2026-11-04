@@ -6062,6 +6062,31 @@ test('published timer start cannot submit a manual run even with a direct helper
   assert.equal(calls.some((call) => call.kind === 'processInstanceStartRequest'), false);
 });
 
+test('Simulate follows the manual starts of the version, not the toolbar entry: it picks the only one, and says why when there is none', async () => {
+  const current = definition('two-starts', { model: timedModel(), publishedVersion: 2 });
+  const manual = { processId: current.model.processId, processName: null, startNodeId: 'Manual_start', startNodeName: 'By hand', version: 2, trigger: { Start: { canStart: true } } };
+  const catalog = [...timerStartCatalog(current, savedTimer()), manual];
+  const state = await mount(current, { processDefinitionGetRequest: { definition: current, startCatalog: catalog },
+    processVersionGetRequest: { version: { version: 2, model: current.model }, startCatalog: catalog } });
+  change(state.root.querySelector('[data-role="start-entry"]'), '0');
+  const simulate = state.root.querySelector('[data-role="simulate"]');
+  assert.equal(simulate.hasAttribute('disabled'), false, 'a timer entry in the toolbar does not switch Simulate off');
+  await builder._simulateProcess();
+  await flush(3);
+  const form = document.querySelector('.tf-act-window');
+  assert.ok(form, 'the simulation window opens');
+  assert.equal(form.querySelector('[data-simulation-start]').value, '0', 'the only manual start is chosen');
+  form.remove();
+
+  const timerOnly = definition('timer-only', { model: timedModel(), publishedVersion: 2 });
+  const only = timerStartCatalog(timerOnly, savedTimer());
+  const second = await mount(timerOnly, { processDefinitionGetRequest: { definition: timerOnly, startCatalog: only },
+    processVersionGetRequest: { version: { version: 2, model: timerOnly.model }, startCatalog: only } });
+  const off = second.root.querySelector('[data-role="simulate"]');
+  assert.equal(off.hasAttribute('disabled'), true);
+  assert.equal(off.getAttribute('title'), I18n.t('bpmn.simulation_reason_no_manual_start'), 'the reason is on the item');
+});
+
 test('published message start offers the current authorized send and never invokes manual start', async () => {
   const model = emptyProcessModel();
   model.messages = [{ messageId: 'Message_1', name: 'order.received' }];

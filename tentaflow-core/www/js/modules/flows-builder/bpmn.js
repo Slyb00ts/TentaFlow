@@ -954,7 +954,9 @@ export function processExplainError(message, model, options = null) {
   if (refusal && SIMULATION_REFUSALS.includes(refusal[1].toLowerCase())) {
     // The refusal cites the step by id; the first id the model knows is the step it is about.
     const cited = refusal[2].split(/[^\w.-]+/).find((token) => names.has(token));
-    return I18n.t(`bpmn.simulation_error_${refusal[1].toLowerCase()}`,
+    // A message start and an event step with data are different causes with different remedies.
+    const cause = refusal[1] === 'EVENT_DELIVERY_UNSUPPORTED' ? (/MessageStart/.test(refusal[2]) ? '_message_start' : '_event_io') : '';
+    return I18n.t(`bpmn.simulation_error_${refusal[1].toLowerCase()}${cause}`,
       { node: cited ? names.get(cited) : I18n.t('bpmn.simulation_this_step') });
   }
   const unused = /unreferenced (message|error|escalation|signal) declaration/.exec(text);

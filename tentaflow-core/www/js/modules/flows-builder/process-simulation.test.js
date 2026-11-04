@@ -69,6 +69,8 @@ const MODEL = serviceModel([
   ['Script', 'Script step', { ScriptTask: { script: '1', outputMapping: {} } }],
 ]);
 
+// The same steps without the ones a simulation refuses, so a run can start.
+const RUNNABLE = { ...MODEL, nodes: MODEL.nodes.filter((node) => ['Plain', 'Expr', 'Checked'].includes(node.id) || !node.kind?.ServiceTask) };
 const baseView = (overrides = {}) => ({
   simulationId: 'sim-1', clock: { nowMs: 5, horizonMs: 100, stepIndex: 1 }, instance: null,
   userTasks: [], timers: [], events: [], serviceWaits: [], eventsOmitted: 0, traceStepsOmitted: 0, ...overrides,
@@ -284,7 +286,7 @@ test('the start window offers each runnable Service step a result source and a d
 
 test('start sends no fixture for a step left to the operator and the prepared result for a step set to one', async () => {
   responder = () => ({ view: baseView() });
-  const form = await startWindow(MODEL);
+  const form = await startWindow(RUNNABLE);
   click(form.querySelector('[data-act="submit"]'));
   await flush(5);
   assert.equal(calls.length, 1);
@@ -292,7 +294,7 @@ test('start sends no fixture for a step left to the operator and the prepared re
   form.remove();
   calls.length = 0;
 
-  const prepared = await startWindow(MODEL);
+  const prepared = await startWindow(RUNNABLE);
   const checked = prepared.querySelector('[data-fixture-step="Checked"]');
   change(checked.querySelector('[data-fixture-mode]'), 'Fixture');
   change(checked.querySelector('[data-answer-field="summary"]'), 'prepared');
@@ -306,7 +308,7 @@ test('start sends no fixture for a step left to the operator and the prepared re
 });
 
 test('a prepared result with invalid JSON blocks the start and marks the field', async () => {
-  const form = await startWindow(MODEL);
+  const form = await startWindow(RUNNABLE);
   const plain = form.querySelector('[data-fixture-step="Plain"]');
   change(plain.querySelector('[data-fixture-mode]'), 'Fixture');
   plain.querySelector('[data-answer-field="outputs"]').value = '{"broken":';
@@ -413,7 +415,12 @@ test('incidents are shown in words with their cause, and a finished run cannot b
   assert.match((await text([incident('RESULT_EXPRESSION_ERROR')]))[0], /result expression of the step could not be evaluated/);
   const win = simulationWindow(view([incident('VERIFICATION_FAILED', 'The simulation operator chose this verdict')]), MODEL);
   await flush(2);
-  assert.doesNotMatch(win.querySelector('[data-simulation-incidents]').textContent, /simulation operator chose/, 'a known code is told in the platform\'s words, not the engine\'s');
+  assert.doesNotMatch(win.querySelector('[data-simulation-incident]').getAttribute('message'), /simulation operator chose/, 'the headline is the platform\'s words, not the engine\'s');
+  assert.match(win.querySelector('[data-simulation-incidents] tf-disclosure').textContent, /simulation operator chose/, 'the engine\'s text stays on a secondary line for support');
+  const unknown = simulationWindow(view([incident('SOMETHING_NEW', 'subscription activation is closed')]), MODEL);
+  await flush(2);
+  assert.equal(unknown.querySelector('[data-simulation-incident]').getAttribute('message'), 'Plain step: The step reported the error code SOMETHING_NEW. (SOMETHING_NEW)');
+  assert.doesNotMatch(unknown.querySelector('[data-simulation-incident]').getAttribute('message'), /activation is closed/);
   assert.equal(win.querySelector('[data-simulation-status]').getAttribute('status'), 'err');
   const running = simulationWindow(baseView({ instance: { status: 'Running' } }), MODEL);
   assert.equal(running.querySelector('[data-simulation-incidents]'), null);
@@ -464,7 +471,7 @@ test('outputs are limited to what the engine keeps, in the service form, the fix
   await flush(3);
   assert.deepEqual(calls[0].payload.outputs, { ok: 1 });
 
-  const form = await startWindow(MODEL);
+  const form = await startWindow(RUNNABLE);
   const plain = form.querySelector('[data-fixture-step="Plain"]');
   change(plain.querySelector('[data-fixture-mode]'), 'Fixture');
   plain.querySelector('[data-answer-field="outputs"]').value = padded(limit + 1);
@@ -661,18 +668,13 @@ test('a verdict is asked for only where it can matter, and a verdict the engine 
   assert.equal(alert.getAttribute('message'), I18n.t('bpmn.simulation_verdict_required'));
 });
 
-test('the start window lists the steps it cannot simulate with the reason, scrolls to a bad field and names its busy state', async () => {
+test('the start window lists the steps it cannot simulate with the reason and holds the start back, naming them', async () => {
   const model = serviceModel([
     ['Plain', 'Plain step', serviceTask()],
     ['Agent', 'Agent step', serviceTask({ implementation: { Agent: { agentId: 'a-1' } } })],
     ['WithIo', 'Io step', serviceTask(), { activityIo: { dataOutputs: [{ id: 'o' }] } }],
     ['Unbound', 'Unbound step', serviceTask({ implementation: { Unbound: { origin: 'x' } } })],
   ]);
-  const gate = deferred();
-  responder = () => gate.promise;
-  const toasts = [];
-  const showOriginal = TfToast.show;
-  TfToast.show = (options) => { toasts.push(options); };
   const form = await startWindow(model);
   const notes = [...form.querySelectorAll('[data-fixture-unsupported]')];
   assert.deepEqual(notes.map((note) => note.dataset.fixtureUnsupported), ['Agent', 'WithIo', 'Unbound']);
@@ -680,6 +682,23 @@ test('the start window lists the steps it cannot simulate with the reason, scrol
   assert.match(notes[1].textContent, /data inputs or outputs/);
   assert.match(notes[2].textContent, /no implementation yet/);
   assert.deepEqual([...form.querySelectorAll('[data-fixture-step]')].map((row) => row.dataset.fixtureStep), ['Plain']);
+  assert.equal(form.querySelector('[data-act="submit"]').hasAttribute('disabled'), true, 'the engine would refuse this run');
+  assert.equal(form.querySelector('.tf-act__note').getAttribute('message'), I18n.t('bpmn.simulation_blocked_by_steps', { names: 'Agent step, Io step, Unbound step' }));
+  click(form.querySelector('[data-act="submit"]'));
+  await flush(3);
+  assert.equal(calls.length, 0);
+  const free = await startWindow(serviceModel([['Plain', 'Plain step', serviceTask()]]));
+  assert.equal(free.querySelector('[data-act="submit"]').hasAttribute('disabled'), false);
+  assert.equal(free.querySelector('.tf-act__note').getAttribute('message'), I18n.t('bpmn.simulation_hint'));
+});
+
+test('a bad prepared field is scrolled to, the start button says it is starting and no toast is left behind', async () => {
+  const gate = deferred();
+  responder = () => gate.promise;
+  const toasts = [];
+  const showOriginal = TfToast.show;
+  TfToast.show = (options) => { toasts.push(options); };
+  const form = await startWindow(serviceModel([['Plain', 'Plain step', serviceTask()]]));
   const scrolled = [];
   const original = window.HTMLElement.prototype.scrollIntoView;
   window.HTMLElement.prototype.scrollIntoView = function scroll() { scrolled.push(this.dataset.answerError); };
@@ -725,7 +744,7 @@ test('a message form is read into the request, and every wrong field is named', 
   assert.equal(readMessageDraft(draftOf({ ttl: '604800' }), waits).errors, undefined);
   assert.equal(readMessageDraft(draftOf({ payload: '{bad' }), waits).errors.payload, 'json_invalid');
   assert.equal(readMessageDraft(draftOf({ payload: '[1]' }), waits).errors.payload, 'object_required');
-  assert.equal(readMessageDraft(draftOf({ payload: JSON.stringify({ blob: 'x'.repeat(OUTPUTS_MAX_KIB * 1024) }) }), waits).errors.payload.key, 'simulation_outputs_too_large');
+  assert.equal(readMessageDraft(draftOf({ payload: JSON.stringify({ blob: 'x'.repeat(OUTPUTS_MAX_KIB * 1024) }) }), waits).errors.payload.key, 'simulation_payload_too_large');
   assert.equal(readMessageDraft(draftOf({ pick: 'gone', exact: true }), waits).errors.pick, 'simulation_message_pick_gone');
   assert.equal(readMessageDraft(draftOf({ pick: 'sub-sig', exact: true }), waits).errors.pick, 'simulation_message_pick_gone', 'a signal wait cannot be addressed');
   assert.equal(readMessageDraft(draftOf({ pick: 'sub-1', exact: true, key: 'PO-8' }), waits).errors.pick, 'simulation_message_pick_mismatch');
@@ -839,7 +858,8 @@ test('messages are listed with a localized status and their expiry on the virtua
   click(item('m-2').querySelector('[data-message-address]'));
   assert.equal(win.querySelector('[data-message-field="name"]').value, 'order_paid');
   assert.equal(win.querySelector('[data-message-field="key"]').value, 'PO-7');
-  assert.equal(win.querySelector('[data-message-field="exact"]').checked, false, 'the author picks which wait');
+  assert.equal(win.querySelector('[data-message-field="pick"]').value, 'sub-1', 'one of the candidate waits is chosen');
+  assert.equal(win.querySelector('[data-message-field="exact"]').checked, true);
 });
 
 test('a finished run takes no more messages', async () => {
@@ -930,4 +950,200 @@ test('what was typed into the message form survives a redraw caused by something
   assert.equal(win.querySelector('[data-message-field="key"]').value, 'typed_key');
   assert.equal(win.querySelector('[data-message-field="payload"]').value, '{"typed": 1}');
   assert.equal(win.querySelector('[data-message-field="ttl"]').value, '77');
+});
+
+const clockOf = (nowMs, horizonMs, stepIndex = 1, tickDurationMs = 1000) => ({ nowMs, horizonMs, stepIndex, tickDurationMs });
+
+test('a clock on the horizon switches Advance off and says so, and the refusal names the horizon and refreshes the clock', async () => {
+  const horizon = Date.UTC(2026, 10, 4, 11, 0, 0);
+  const win = simulationWindow(baseView({ instance: { status: 'Waiting' }, clock: clockOf(horizon, horizon, 7) }), MODEL);
+  await flush(2);
+  assert.equal(win.querySelector('[data-simulation-advance]').hasAttribute('disabled'), true);
+  assert.match(win.querySelector('[data-simulation-horizon]').getAttribute('message'), /reached the end of the simulation \(.*2026.*\)/);
+  const away = simulationWindow(baseView({ instance: { status: 'Waiting' }, clock: clockOf(horizon - 5000, horizon) }), MODEL);
+  assert.equal(away.querySelector('[data-simulation-advance]').hasAttribute('disabled'), false);
+  assert.equal(away.querySelector('[data-simulation-horizon]'), null);
+  // The hint tells what Advance does and where the clock stands.
+  const hint = away.querySelector('[data-simulation-advance-hint]').textContent;
+  assert.match(hint, /jumps the virtual clock to the next due item/);
+  assert.match(hint, /one tick \(1 s\)/);
+  assert.match(hint, /Now: .*2026.*the simulation ends: .*2026/);
+
+  // A refusal for the horizon is told with its date, and the window then shows the run's own clock.
+  const stale = baseView({ instance: { status: 'Waiting' }, clock: clockOf(horizon - 1000, horizon, 2) });
+  const fresh = baseView({ instance: { status: 'Waiting' }, clock: clockOf(horizon, horizon, 3) });
+  responder = (kind) => {
+    if (kind === 'processSimulationAdvanceRequest') throw new Error('SIMULATION_HORIZON_REACHED: the clock is at 2026-11-04T11:00:00Z, the horizon is 2026-11-04T11:00:00Z');
+    if (kind === 'processSimulationViewRequest') return { view: fresh };
+    throw new Error(`unexpected ${kind}`);
+  };
+  const run = simulationWindow(stale, MODEL);
+  await flush(2);
+  assert.match(run.querySelector('.fb-simulation-toolbar').textContent, /step 2/);
+  click(run.querySelector('[data-simulation-advance]'));
+  await flush(5);
+  assert.match(run.querySelector('[data-error]').getAttribute('message'), /end of the simulation \(.*2026.*\): there is nothing left to advance to/);
+  assert.match(run.querySelector('.fb-simulation-toolbar').textContent, /step 3/, 'the clock shown is the run\'s clock after the refusal');
+  assert.equal(run.querySelector('[data-simulation-advance]').hasAttribute('disabled'), true);
+});
+
+test('a pending message says whether a wait matches it, and that it will never arrive once the run is over', async () => {
+  const view = (status, subscriptions) => baseView({ instance: { status }, subscriptions,
+    messages: [message({ messageId: 'm-match', correlationKey: 'PO-7' }), message({ messageId: 'm-none', correlationKey: 'PO-9' })] });
+  const open = simulationWindow(view('Waiting', [sub()]), MODEL);
+  await flush(2);
+  const hint = (win, id) => win.querySelector(`[data-simulation-message="${id}"] [data-message-pending-hint]`);
+  assert.equal(hint(open, 'm-match').dataset.messagePendingHint, 'match');
+  assert.match(hint(open, 'm-match').textContent, /next Advance delivers it/);
+  assert.equal(hint(open, 'm-none').dataset.messagePendingHint, 'none');
+  assert.match(hint(open, 'm-none').textContent, /No open wait matches this name and key/);
+  assert.doesNotMatch(hint(open, 'm-none').textContent, /delivers it/);
+  const over = simulationWindow(view('Completed', []), MODEL);
+  await flush(2);
+  assert.equal(hint(over, 'm-match').dataset.messagePendingHint, 'finished');
+  assert.match(hint(over, 'm-match').textContent, /will never be delivered/);
+  const horizon = Date.UTC(2026, 10, 4, 11, 0, 0);
+  const atEnd = simulationWindow(baseView({ instance: { status: 'Waiting' }, clock: clockOf(horizon, horizon), subscriptions: [sub()], messages: [message({ messageId: 'm-match' })] }), MODEL);
+  await flush(2);
+  assert.equal(hint(atEnd, 'm-match').dataset.messagePendingHint, 'finished', 'a clock on the horizon delivers nothing more');
+  assert.match(hint(atEnd, 'm-match').textContent, /will never be delivered/);
+});
+
+test('an ambiguous message is re-prepared for one of its candidate waits, chosen from a small list when there are several', async () => {
+  const two = simulationWindow(baseView({ instance: { status: 'Waiting' },
+    subscriptions: [sub({ subscriptionId: 'sub-a', nodeId: 'Plain' }), sub({ subscriptionId: 'sub-b', nodeId: 'Expr' }), sub({ subscriptionId: 'sub-c', nodeId: 'Checked', correlationKey: 'OTHER' })],
+    messages: [message({ status: 'Ambiguous' })] }), MODEL);
+  await flush(2);
+  const candidates = two.querySelector('[data-message-candidate]');
+  assert.deepEqual([...candidates.querySelectorAll('option')].map((option) => option.textContent), ['Plain step', 'Expression step'], 'only the waits it matches');
+  change(candidates, 'sub-b');
+  click(two.querySelector('[data-message-address]'));
+  const field = (name) => two.querySelector(`[data-message-field="${name}"]`);
+  assert.equal(field('pick').value, 'sub-b');
+  assert.equal(field('name').value, 'order_paid');
+  assert.equal(field('key').value, 'PO-7');
+  assert.equal(field('exact').checked, true, 'the new message addresses exactly that wait');
+  const one = simulationWindow(baseView({ instance: { status: 'Waiting' }, subscriptions: [sub({ subscriptionId: 'sub-a' })], messages: [message({ status: 'Ambiguous' })] }), MODEL);
+  await flush(2);
+  assert.equal(one.querySelector('[data-message-candidate]'), null);
+  click(one.querySelector('[data-message-address]'));
+  assert.equal(one.querySelector('[data-message-field="pick"]').value, 'sub-a');
+  assert.equal(one.querySelector('[data-message-field="exact"]').checked, true);
+});
+
+test('a failed or cancelled message is told in the interface language and claims a mapping problem only when the run holds that incident', async () => {
+  const incident = (code) => ({ incidentId: code, nodeId: 'Plain', nodeName: '', jobId: null, code, message: 'engine text', atMs: 1, canRetry: false, scopeId: 's' });
+  const failing = (extra) => baseView({ instance: { status: 'Waiting' }, ...extra,
+    messages: [message({ messageId: 'm-map', status: 'Error', lastReason: 'message mapping failed: missing outputs.amount' }),
+      message({ messageId: 'm-closed', status: 'Cancelled', lastReason: 'subscription activation is closed' }),
+      message({ messageId: 'm-odd', status: 'Error', lastReason: 'some unforeseen engine words' })] });
+  const failure = (win, id) => win.querySelector(`[data-simulation-message="${id}"] [data-message-failure]`).textContent;
+  const bare = simulationWindow(failing({}), MODEL);
+  await flush(2);
+  assert.doesNotMatch(failure(bare, 'm-map'), /output mapping/, 'no mapping incident in the run: no mapping claim');
+  assert.equal(failure(bare, 'm-map'), I18n.t('bpmn.simulation_reason_other'));
+  assert.equal(failure(bare, 'm-closed'), I18n.t('bpmn.simulation_reason_closed'));
+  assert.equal(failure(bare, 'm-odd'), I18n.t('bpmn.simulation_reason_other'));
+  const withIncident = simulationWindow(failing({ incidents: [incident('MESSAGE_MAPPING_ERROR')] }), MODEL);
+  await flush(2);
+  assert.equal(failure(withIncident, 'm-map'), I18n.t('bpmn.simulation_reason_mapping'));
+  // The engine's words stay on a secondary line for support, never as the headline.
+  const raw = withIncident.querySelector('[data-simulation-message="m-odd"] tf-disclosure');
+  assert.equal(raw.getAttribute('label'), 'Details for support');
+  assert.match(raw.textContent, /some unforeseen engine words/);
+  assert.doesNotMatch(failure(withIncident, 'm-odd'), /unforeseen/);
+  await I18n.setLanguage('pl');
+  const polish = simulationWindow(failing({}), MODEL);
+  await flush(2);
+  assert.equal(failure(polish, 'm-closed'), 'Oczekiwanie, do którego wiadomość była adresowana, jest już zamknięte.');
+  assert.doesNotMatch(polish.querySelector('[data-message-failure]').textContent, /[a-z]+ [a-z]+ [a-z]+ (is|was|closed|failed)/);
+});
+
+test('signal waits show the signal name from the model, a boundary says which step it hangs on, and a delivered message names its wait', async () => {
+  const model = { ...MODEL, signals: [{ signalId: 'Signal_stop', namespaceUri: 'urn:x', name: 'Stop the line' }] };
+  const win = simulationWindow(baseView({ instance: { status: 'Waiting' },
+    subscriptions: [sub({ subscriptionId: 's1', kind: 'SignalCatch', messageName: null, correlationKey: null, signalDeclarationId: 'Signal_stop' }),
+      sub({ subscriptionId: 's2', kind: 'SignalCatch', messageName: null, correlationKey: null, signalDeclarationId: 'Signal_unknown' }),
+      sub({ subscriptionId: 's3', kind: 'BoundaryMessage', nodeId: 'Expr' })],
+    events: [event('message_armed', 'Expr', { subscription_id: 's3', attached_to_id: 'Plain' }), event('message_armed', 'Checked', { subscription_id: 'gone' })],
+    messages: [message({ status: 'Delivered', deliveredAtMs: T0, matchedSubscriptionId: 'gone' })] }), model);
+  await flush(2);
+  const row = (id) => win.querySelector(`[data-simulation-subscription="${id}"]`).textContent;
+  assert.match(row('s1'), /Signal: Stop the line/);
+  assert.match(row('s2'), /Signal: Signal_unknown/, 'an undeclared id falls back to itself');
+  assert.match(row('s3'), /attached to Plain step/);
+  assert.match(win.querySelector('[data-message-reached]').textContent, /Delivered to: Checked step/);
+});
+
+test('an interrupted service step and an interrupted task are named in the trace, and the service step is kept as cancelled', async () => {
+  const view = baseView({ instance: { status: 'Waiting' }, events: [event('simulation_service_cancelled', 'Plain', { job_id: 'j', node_id: 'Plain' }), event('simulation_user_task_cancelled', 'Expr', { user_task_id: 'u', node_id: 'Expr' }), event('message_armed', 'Expr')],
+    userTasks: [taskOf({ status: 'Cancelled', name: 'Interrupted task' })] });
+  const win = simulationWindow(view, MODEL);
+  await flush(2);
+  const lines = [...win.querySelectorAll('.fb-simulation-events li')].map((row) => row.textContent.replace(/\s+/g, ' ').trim().replace(/^\d+:\d+:\d+( [AP]M)? /, ''));
+  assert.deepEqual(lines, ['Service step interrupted · Plain step', 'Task interrupted · Expression step', 'Message wait opened · Expression step']);
+  const cancelled = win.querySelector('[data-simulation-cancelled-services]');
+  assert.match(cancelled.textContent, /Plain step/);
+  assert.match(cancelled.textContent, /Cancelled/);
+  assert.match(win.querySelector('[data-simulation-done-task]').textContent, /Cancelled/);
+});
+
+test('after Send the message list is shown, the wait is released and a confirmation stands until the form is touched', async () => {
+  const sent = baseView({ instance: { status: 'Waiting' }, subscriptions: [sub()], messages: [message()] });
+  responder = () => ({ view: sent });
+  const scrolled = [];
+  const original = window.HTMLElement.prototype.scrollIntoView;
+  window.HTMLElement.prototype.scrollIntoView = function scroll() { scrolled.push(this.dataset.simulationMessages !== undefined ? 'messages' : this.tagName); };
+  try {
+    const win = simulationWindow(baseView({ instance: { status: 'Waiting' }, subscriptions: [sub()] }), MODEL);
+    await flush(2);
+    const field = (name) => win.querySelector(`[data-message-field="${name}"]`);
+    change(field('pick'), 'sub-1');
+    assert.equal(field('exact').checked, true);
+    assert.equal(win.querySelector('[data-message-confirmation]'), null);
+    click(win.querySelector('[data-simulation-message-send]'));
+    await flush(5);
+    assert.equal(calls[0].payload.subscriptionId, 'sub-1');
+    assert.match(win.querySelector('[data-message-confirmation]').textContent, /Message queued; the next time step delivers it\./);
+    assert.equal(field('pick').value, '', 'the chosen wait is released');
+    assert.equal(field('exact').checked, false);
+    assert.equal(field('name').value, 'order_paid');
+    assert.equal(field('key').value, 'PO-7');
+    assert.ok(scrolled.includes('messages'), 'the list of messages is brought into view');
+    // A second press now sends a free message, never silently the same addressed one again.
+    click(win.querySelector('[data-simulation-message-send]'));
+    await flush(5);
+    assert.equal(calls[1].payload.subscriptionId, null);
+    change(field('key'), 'PO-8');
+    assert.equal(win.querySelector('[data-message-confirmation]'), null, 'touching the form clears the confirmation');
+  } finally {
+    window.HTMLElement.prototype.scrollIntoView = original;
+  }
+});
+
+test('a race group lists its timer, and a won race names the winner', async () => {
+  const view = baseView({ instance: { status: 'Waiting' }, clock: clockOf(T0, T0 + 3600000),
+    subscriptions: [sub({ raceId: 'race-1', scopeId: 'scope-1', dueAtMs: T0 + 5000 })],
+    timers: [{ timerId: 't1', nodeId: 'Expr', nodeName: 'Deadline', kind: 'Catch', status: 'Pending', dueAtMs: T0 + 5000, timezone: 'UTC', occurrence: 0, scopeId: 'scope-1' },
+      { timerId: 't2', nodeId: 'Checked', nodeName: 'Elsewhere', kind: 'Catch', status: 'Pending', dueAtMs: T0 + 9000, timezone: 'UTC', occurrence: 0, scopeId: 'scope-2' }],
+    events: [event('event_race_won', 'Plain', { race_id: 'race-1', winner_node_id: 'Expr' }), event('event_race_won', 'Plain', {})] });
+  const win = simulationWindow(view, MODEL);
+  await flush(2);
+  const race = win.querySelector('[data-simulation-race="race-1"]');
+  assert.deepEqual([...race.querySelectorAll('[data-simulation-race-timer]')].map((row) => row.dataset.simulationRaceTimer), ['t1'], 'only the timer of this race');
+  assert.match(race.textContent, /Deadline.*fires at/s);
+  const lines = [...win.querySelectorAll('.fb-simulation-events li')].map((row) => row.textContent.replace(/\s+/g, ' ').trim());
+  assert.match(lines[0], /Event race won by Expression step/);
+  assert.match(lines[1], /Event race won · Plain step/, 'without the winner the plain sentence stays');
+});
+
+test('a message start and an event step with data are refused with different sentences, and a payload that is too large is called a payload', () => {
+  const model = serviceModel([['Svc_1', 'Order arrives', serviceTask()]]);
+  const start = simulationErrorText('SIMULATION_EVENT_DELIVERY_UNSUPPORTED: MessageStart is not simulated: a message start would create another instance (Svc_1)', model);
+  const io = simulationErrorText('SIMULATION_EVENT_DELIVERY_UNSUPPORTED: MessageCatch with activity IO is not simulated: a message start would create another instance and an event step with activity IO continues (Svc_1)', model);
+  assert.notEqual(start, io);
+  assert.match(start, /starts the process with a message/);
+  assert.match(io, /data inputs or outputs/);
+  assert.equal(readMessageDraft({ pick: '', name: 'n', key: 'k', payload: JSON.stringify({ b: 'x'.repeat(OUTPUTS_MAX_KIB * 1024) }), ttl: '60', exact: false }, []).errors.payload.key, 'simulation_payload_too_large');
+  assert.equal(I18n.t('bpmn.simulation_payload_too_large', { max: 240 }), 'The payload is too large: at most 240 KiB.');
 });

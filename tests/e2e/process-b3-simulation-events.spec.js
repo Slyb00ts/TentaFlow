@@ -24,6 +24,7 @@ let PORT;
 let proc;
 let messageId;
 let raceId;
+let timerId;
 
 test.beforeAll(async ({ browser }, testInfo) => {
   test.skip(!binaryExists(), 'tentaflow binary not built (set TENTAFLOW_E2E_BINARY)');
@@ -42,10 +43,10 @@ test.beforeAll(async ({ browser }, testInfo) => {
     const { emptyProcessModel } = await import('/js/modules/flows-builder/bpmn.js');
     const catchNode = { id: 'Catch_1', name: 'Wait for payment', kind: { MessageCatch: {
       messageRef: 'Message_1', correlationExpression: "'PO-7'", outputMapping: {} } } };
-    const build = (nodes, flows, timed = false) => {
+    const build = (nodes, flows, timed = false, messaged = true) => {
       const model = emptyProcessModel();
       if (timed) model.timerTimezone = 'UTC';
-      model.messages = [{ messageId: 'Message_1', name: 'order_paid' }];
+      if (messaged) model.messages = [{ messageId: 'Message_1', name: 'order_paid' }];
       model.nodes = [model.nodes[0], ...nodes, model.nodes[1]];
       model.sequenceFlows = flows.map(([id, from, to]) => ({ id, sourceId: from, targetId: to, condition: null }));
       const x = new Map(model.nodes.map((node, index) => [node.id, 40 + index * 150]));
@@ -71,10 +72,14 @@ test.beforeAll(async ({ browser }, testInfo) => {
       { id: 'Race_1', name: 'First event', kind: 'EventBasedGateway' }, catchNode,
       { id: 'Timer_1', name: 'Deadline', kind: { TimerCatch: { timer: { Duration: { seconds: 5 } } } } },
     ], [['F_1', 'Start', 'Race_1'], ['F_2', 'Race_1', 'Catch_1'], ['F_3', 'Race_1', 'Timer_1'], ['F_4', 'Catch_1', 'End'], ['F_5', 'Timer_1', 'End']], true));
-    return { message, race };
+    const timer = await create('B3 simulation timer', build([
+      { id: 'Timer_1', name: 'Two minutes', kind: { TimerCatch: { timer: { Duration: { seconds: 120 } } } } },
+    ], [['F_1', 'Start', 'Timer_1'], ['F_2', 'Timer_1', 'End']], true, false));
+    return { message, race, timer };
   });
   messageId = ids.message;
   raceId = ids.race;
+  timerId = ids.timer;
   await page.close();
 });
 
@@ -172,11 +177,17 @@ test('a message with the wrong correlation key stays queued and the wait stays o
   await win.locator('[data-message-field="key"] input').fill('PO-WRONG');
   await win.locator('[data-simulation-message-send]').click();
   await expect(win.locator('[data-simulation-message]')).toHaveCount(1, { timeout: 15000 });
-  for (let tick = 0; tick < 3; tick += 1) {
-    await win.locator('[data-simulation-advance]:not([disabled])').click();
-    await page.waitForTimeout(500);
-  }
   await expect(win.locator('[data-simulation-message]')).toHaveAttribute('data-message-status', 'Pending');
+  // Nothing waits for this key: the message says so instead of promising a delivery.
+  await expect(win.locator('[data-message-pending-hint="none"]')).toContainText('No open wait matches this name and key');
+  await expect(win.locator('[data-message-pending-hint="none"]')).not.toContainText('delivers it');
+  await expect(win.locator('[data-simulation-subscription]')).toHaveCount(1);
+  // The message's lifetime ends with the simulation, so one Advance jumps the clock to the end: Advance is
+  // off with its reason, the message can no longer arrive, and the wait is still open.
+  await win.locator('[data-simulation-advance]:not([disabled])').click();
+  await expect(win.locator('[data-simulation-horizon]')).toBeVisible({ timeout: 15000 });
+  await expect(win.locator('[data-simulation-advance]')).toHaveAttribute('disabled', '');
+  await expect(win.locator('[data-message-pending-hint="finished"]')).toContainText('will never be delivered');
   await expect(win.locator('[data-simulation-subscription]')).toHaveCount(1);
   await expect(win.locator('[data-simulation-status]')).not.toHaveText('Completed');
   expect(errors, diagnostics(errors, proc)).toEqual([]);
@@ -196,5 +207,26 @@ test('in a race between a message and a timer the timer wins when the virtual cl
   await expect(win.locator('.fb-simulation-events')).toContainText('Timer fired');
   await expect(win.locator('.fb-simulation-events')).toContainText('Event race won');
   await expect(win.locator('[data-simulation-race]')).toHaveCount(0);
+  expect(errors, diagnostics(errors, proc)).toEqual([]);
+});
+
+test('one Advance jumps the virtual clock over a two-minute timer', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors = collectConsoleErrors(page);
+  const win = await startSimulation(page, timerId);
+  const pending = win.locator('.fb-simulation-timer tf-chip', { hasText: 'Pending' });
+  await advanceUntil(page, async () => (await pending.count()) === 1);
+  const before = await win.locator('.fb-simulation-toolbar').innerText();
+  await expect(win.locator('[data-simulation-status="Completed"]')).toHaveCount(0);
+  // One press: the clock goes straight to the timer, however far that is.
+  await win.locator('[data-simulation-advance]:not([disabled])').click();
+  await expect(win.locator('[data-simulation-status="Completed"]')).toHaveCount(1, { timeout: 15000 });
+  await expect(win.locator('.fb-simulation-events')).toContainText('Timer fired');
+  const after = await win.locator('.fb-simulation-toolbar').innerText();
+  expect(after).not.toBe(before);
+  const timeOf = (label) => win.locator('.fb-simulation-events li', { hasText: label }).first().locator('span').textContent();
+  expect(await timeOf('Timer fired')).not.toBe(await timeOf('Timer set'));
+  // The run is over: nothing left to advance, nothing left to send.
+  await expect(win.locator('[data-simulation-advance]')).toHaveAttribute('disabled', '');
   expect(errors, diagnostics(errors, proc)).toEqual([]);
 });

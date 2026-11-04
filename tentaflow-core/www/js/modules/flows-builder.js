@@ -792,9 +792,14 @@ const FlowBuilderScreen = {
     state.root.querySelector('[data-role="run-wrap"]').setAttribute('title', runText);
     state.root.querySelector('[data-role="run-reason"]').textContent = runText;
     const simulate = state.root.querySelector('[data-role="simulate"]');
-    simulate.toggleAttribute('disabled', !state.definition.publishedVersion || state.definition.archived
-      || state.previewVersion !== null || !!state.operationBusy || !entry?.trigger?.Start?.canStart);
-    simulate.setAttribute('title', I18n.t('bpmn.simulation_hint'));
+    // Any manual start can be simulated, whichever entry the toolbar has selected; the window offers the choice.
+    const simulateReason = !state.definition.publishedVersion ? 'bpmn.run_reason_unpublished'
+      : state.definition.archived ? 'bpmn.run_reason_archived'
+        : state.previewVersion !== null ? 'bpmn.simulation_reason_preview'
+          : state.operationBusy ? null
+            : !state.startCatalog?.some((candidate) => candidate.trigger?.Start?.canStart) ? 'bpmn.simulation_reason_no_manual_start' : null;
+    simulate.toggleAttribute('disabled', !!simulateReason || !!state.operationBusy);
+    simulate.setAttribute('title', I18n.t(simulateReason ?? 'bpmn.simulation_hint'));
     const sendStart = state.root.querySelector('[data-role="send-start"]');
     sendStart.hidden = !messageVersion || state.previewVersion !== null;
     sendStart.toggleAttribute('disabled', !!state.operationBusy || state.definition.archived
@@ -956,10 +961,11 @@ const FlowBuilderScreen = {
       const response = await ApiBinary.one('processVersionGetRequest', { definitionId: current.flowId, version });
       if (!this._current(current)) return;
       const entry = this._selectedStartEntry(current);
-      const selected = response.startCatalog.find((candidate) =>
-        candidate.processId === entry?.processId
-          && candidate.startNodeId === entry?.startNodeId);
-      if (!selected?.trigger?.Start?.canStart) throw new Error(I18n.t('bpmn.start_entry_changed'));
+      const manual = response.startCatalog.filter((candidate) => candidate.trigger?.Start?.canStart);
+      // The chosen entry when it can be simulated, else the only one that can; with several the window asks.
+      const selected = manual.find((candidate) => candidate.processId === entry?.processId
+        && candidate.startNodeId === entry?.startNodeId) ?? (manual.length === 1 ? manual[0] : null);
+      if (!manual.length) throw new Error(I18n.t('bpmn.start_entry_changed'));
       openProcessSimulation({ ...current.definition, model: response.version.model },
         response.version, response.startCatalog, selected,
         current.root.querySelector('[data-role="more"]'));

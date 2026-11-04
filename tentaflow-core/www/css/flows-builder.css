@@ -1733,3 +1733,9 @@ body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transf
 @media (max-height: 500px) and (min-width: 768px) and (max-width: 1439px) {
   .fb-process-shell .fb-body { grid-template-columns: minmax(0, 1fr) 280px; }
 }
+
+/* Lists in the simulation window keep their markers inside the window's padding. */
+.fb-simulation-events { padding-inline-start: 2.2em; margin-block: 6px; }
+.fb-simulation-awaited { list-style: none; padding-inline-start: 0; margin-block: 6px; }
+.fb-simulation-awaited > li { border-left: 2px solid var(--tf-border); padding: 4px 0 8px 12px; overflow-wrap: anywhere; }
+.fb-simulation-awaited ul { list-style: none; padding-inline-start: 12px; }

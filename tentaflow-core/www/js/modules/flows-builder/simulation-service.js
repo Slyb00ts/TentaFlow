@@ -26,7 +26,8 @@ export const SIMULATION_EVENT_KINDS = ['instance_started', 'instance_completed',
   'message_cancelled', 'message_error', 'message_expired', 'message_resolved', 'receive_task_opened',
   'receive_task_completed', 'send_task_admitted', 'send_task_pending', 'send_admission_failed', 'signal_admitted',
   'signal_catch_opened', 'signal_received', 'event_race_armed', 'event_race_won', 'event_race_lost',
-  'event_race_cancelled', 'subscription_cancelled', 'timer_blocked', 'link_thrown', 'link_caught'];
+  'event_race_cancelled', 'subscription_cancelled', 'timer_blocked', 'link_thrown', 'link_caught', 'message_armed',
+  'error_boundary_armed', 'cancelled', 'job_failed', 'job_denied', 'simulation_service_cancelled', 'simulation_user_task_cancelled'];
 export const SIMULATION_MESSAGE_STATUSES = ['Pending', 'Blocked', 'Ambiguous', 'Delivered', 'Expired', 'Cancelled', 'Error'];
 export const SIMULATION_SUBSCRIPTION_KINDS = ['MessageCatch', 'BoundaryMessage', 'ReceiveTask', 'SignalCatch', 'BoundaryError', 'BoundaryEscalation'];
 const MESSAGE_WAIT_KINDS = ['MessageCatch', 'BoundaryMessage', 'ReceiveTask'];
@@ -70,10 +71,10 @@ export function simulationServiceOutcomes(step) {
  * `{ value }` or `{ error }`, the error being an i18n key (under `bpmn.`) or
  * `{ key, values }`.
  */
-export function readOutputs(raw) {
+export function readOutputs(raw, kind = 'outputs') {
   const textValue = String(raw ?? '');
   const bytes = new TextEncoder().encode(textValue).length;
-  const tooLarge = { key: 'simulation_outputs_too_large', values: { max: OUTPUTS_MAX_KIB } };
+  const tooLarge = { key: `simulation_${kind}_too_large`, values: { max: OUTPUTS_MAX_KIB } };
   if (bytes > OUTPUTS_MAX_BYTES * 4) return { error: tooLarge };
   let parsed;
   try {
@@ -84,7 +85,7 @@ export function readOutputs(raw) {
   if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') return { error: 'object_required' };
   if (new TextEncoder().encode(JSON.stringify(parsed)).length > OUTPUTS_MAX_BYTES) return { error: tooLarge };
   if (Object.keys(parsed).length > OUTPUTS_MAX_KEYS) {
-    return { error: { key: 'simulation_outputs_too_many_keys', values: { max: OUTPUTS_MAX_KEYS } } };
+    return { error: { key: `simulation_${kind}_too_many_keys`, values: { max: OUTPUTS_MAX_KEYS } } };
   }
   return { value: parsed };
 }
@@ -221,7 +222,7 @@ export function readMessageDraft(draft, subscriptions) {
   const ttl = String(draft.ttl ?? '').trim();
   const ttlSeconds = /^\d+$/.test(ttl) ? Number(ttl) : NaN;
   if (!(ttlSeconds >= 1 && ttlSeconds <= MESSAGE_TTL_MAX)) errors.ttl = 'simulation_message_ttl_invalid';
-  const payload = readOutputs(draft.payload);
+  const payload = readOutputs(draft.payload, 'payload');
   if (payload.error) errors.payload = payload.error;
   let subscriptionId = null;
   if (draft.exact && draft.pick) {
@@ -232,4 +233,15 @@ export function readMessageDraft(draft, subscriptions) {
   }
   if (Object.keys(errors).length) return { errors };
   return { request: { messageName: name, correlationKey: key, payload: payload.value, ttlSeconds, subscriptionId } };
+}
+
+// The open message waits a message would reach by its name and key.
+export function simulationMessageCandidates(subscriptions, message) {
+  return simulationMessageWaits(subscriptions).filter((subscription) => subscription.messageName === message.messageName
+    && subscription.correlationKey === message.correlationKey);
+}
+
+// The clock stands on the end of the simulation: there is nothing to advance to.
+export function simulationHorizonReached(clock) {
+  return clock != null && clock.nowMs >= clock.horizonMs;
 }
