@@ -919,7 +919,8 @@ export function processVerificationSentence(result) {
 // The codes (lower-cased) of the refusals a simulated Service step gives; each
 // has a sentence under `bpmn.simulation_error_<code>`.
 const SIMULATION_REFUSALS = ['real_execution_unsupported', 'side_effects_not_confirmed', 'fixture_invalid',
-  'service_not_waiting', 'service_ambiguous', 'verdict_required', 'answer_invalid', 'outcome_not_producible'];
+  'service_not_waiting', 'service_ambiguous', 'verdict_required', 'answer_invalid', 'outcome_not_producible',
+  'message_invalid', 'message_subscription_unknown', 'message_target_unsupported', 'event_delivery_unsupported'];
 
 /**
  * Server and codec messages cite elements by internal id; the author knows them

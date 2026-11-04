@@ -7,11 +7,14 @@ import { openFormWindow } from '/js/lib/actions/form-window.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { processDistinctLabels, processElementNames, processExplainError, processRepeatedElements, processStartEntryLabels } from './bpmn.js';
 import { processIncidentText } from './process-monitor.js';
+import '/js/components/tf-checkbox.js';
+import '/js/components/tf-input.js';
 import { answerFormHtml, errorMessage, fillAnswerForm, readAnswerDraft, showAnswerErrors, syncAnswerForm } from './simulation-answer-form.js';
 import {
-  OUTPUTS_MAX_KIB, SIMULATION_EVENT_KINDS, SIMULATION_STATUSES, SIMULATION_TASK_KINDS, blankServiceDraft, readOutputs, readServiceAnswer,
-  readServiceFixtures, simulationFinished, simulationOpen, simulationServiceSteps, simulationTaskDecision,
-  simulationUnsupportedSteps, simulationWaitSteps,
+  OUTPUTS_MAX_KIB, SIMULATION_EVENT_INCIDENT_CODES, SIMULATION_EVENT_KINDS, SIMULATION_MESSAGE_STATUSES,
+  SIMULATION_STATUSES, SIMULATION_SUBSCRIPTION_KINDS, SIMULATION_TASK_KINDS, blankMessageDraft, blankServiceDraft,
+  readMessageDraft, readOutputs, readServiceAnswer, readServiceFixtures, simulationFinished, simulationMessageWaits,
+  simulationOpen, simulationServiceSteps, simulationTaskDecision, simulationUnsupportedSteps, simulationWaitSteps,
 } from './simulation-service.js';
 import '/js/components/tf-alert.js';
 import '/js/components/tf-button.js';
@@ -63,6 +66,7 @@ const known = (list, value, prefix) => (list.includes(value) ? text(`${prefix}_$
 export function simulationIncidentText(incident) {
   const code = String(incident.code || '');
   if (code === 'RESULT_EXPRESSION_ERROR') return text('simulation_incident_result_expression');
+  if (SIMULATION_EVENT_INCIDENT_CODES.includes(code)) return text(`simulation_incident_${code.toLowerCase()}`);
   const sentence = processIncidentText({ code, message: '' });
   if (sentence === text('incident_generic') && code !== '') {
     return incident.message || text('simulation_incident_service_code', { code });
@@ -74,6 +78,7 @@ export function simulationIncidentText(incident) {
 export function simulationErrorText(message, model) {
   const raw = String(message ?? '');
   if (/message too big/.test(raw)) return text('simulation_error_too_big', { max: OUTPUTS_MAX_KIB });
+  if (/target instance is closed/.test(raw)) return text('simulation_error_target_closed');
   if (/revision conflict or closed instance/.test(raw)) return text('simulation_error_closed');
   if (/simulation task is assigned to another actor|simulation user task was not found/.test(raw)) return text('simulation_error_task_unavailable');
   if (/process resource not found/.test(raw)) return text('simulation_error_gone');
@@ -113,6 +118,8 @@ export function simulationWindow(view, model = null, options = {}) {
   const taskDrafts = new Map(options.taskDrafts ?? []);
   // Errors for a field that only the server could judge, shown once after the redraw.
   const fieldErrors = new Map();
+  // The message form is one form for the whole run, so it has one draft.
+  let messageDraft = { ...blankMessageDraft(), ...(options.messageDraft ?? {}) };
 
   const setError = (error) => {
     const alert = win.querySelector('[data-error]');
@@ -139,7 +146,14 @@ export function simulationWindow(view, model = null, options = {}) {
     }
   };
 
+  const messageField = (name) => content.querySelector(`[data-message-field="${name}"]`);
+  const readMessageForm = () => ({
+    pick: messageField('pick')?.value ?? '', name: messageField('name')?.value ?? '', key: messageField('key')?.value ?? '',
+    payload: messageField('payload')?.value ?? '', ttl: messageField('ttl')?.value ?? '', exact: messageField('exact')?.checked === true,
+  });
+
   const captureDrafts = () => {
+    if (messageField('name')) messageDraft = readMessageForm();
     content.querySelectorAll('[data-simulation-wait]').forEach((article) => {
       if (article.querySelector('[data-answer-field]')) drafts.set(article.dataset.simulationWait, readAnswerDraft(article));
     });
@@ -176,6 +190,36 @@ export function simulationWindow(view, model = null, options = {}) {
       return known(SIMULATION_EVENT_KINDS, event.kind, 'simulation_event');
     };
     const decision = (task) => simulationTaskDecision(events, task.userTaskId);
+    const subscriptions = current.subscriptions || [];
+    const messages = current.messages || [];
+    const messageWaits = simulationMessageWaits(subscriptions);
+    const waitLabel = (subscription) => `${elementName(subscription.nodeId, subscription.nodeName)} · ${subscription.messageName} · ${subscription.correlationKey}`;
+    const subscriptionRow = (subscription) => `<li data-simulation-subscription="${escapeAttr(subscription.subscriptionId)}" data-subscription-kind="${escapeAttr(subscription.kind)}">
+        <strong>${escapeHtml(elementName(subscription.nodeId, subscription.nodeName))}</strong> · ${escapeHtml(known(SIMULATION_SUBSCRIPTION_KINDS, subscription.kind, 'simulation_subscription_kind'))}
+        ${subscription.messageName != null ? `<div>${escapeHtml(text('simulation_sub_message'))}: ${escapeHtml(subscription.messageName)} · ${escapeHtml(text('simulation_sub_key'))}: ${escapeHtml(subscription.correlationKey ?? '')}</div>` : ''}
+        ${subscription.kind === 'SignalCatch' ? `<div>${escapeHtml(text('simulation_sub_signal'))}: ${escapeHtml(subscription.signalDeclarationId || subscription.signalNamespaceUri || '')}</div>` : ''}
+        ${subscription.dueAtMs != null ? `<div>${escapeHtml(text('simulation_sub_timer_due', { time: clockText(subscription.dueAtMs) }))}</div>` : ''}
+      </li>`;
+    const races = new Map();
+    for (const subscription of subscriptions) {
+      if (subscription.raceId) races.set(subscription.raceId, [...(races.get(subscription.raceId) ?? []), subscription]);
+    }
+    const messageRow = (message) => {
+      const state = message.status;
+      const when = state === 'Delivered' && message.deliveredAtMs != null ? text('simulation_message_delivered_at', { time: clockText(message.deliveredAtMs) })
+        : state === 'Expired' ? text('simulation_message_expired_at', { time: clockText(message.expiresAtMs) })
+          : ['Pending', 'Ambiguous', 'Blocked'].includes(state) ? text('simulation_message_expires_at', { time: clockText(message.expiresAtMs) }) : '';
+      return `<li data-simulation-message="${escapeAttr(message.messageId)}" data-message-status="${escapeAttr(state)}">
+        <strong>${escapeHtml(message.messageName)}</strong> · ${escapeHtml(text('simulation_sub_key'))}: ${escapeHtml(message.correlationKey)}
+        <tf-chip status="${state === 'Delivered' ? 'ok' : state === 'Error' ? 'err' : state === 'Pending' ? 'info' : 'warn'}">${escapeHtml(known(SIMULATION_MESSAGE_STATUSES, state, 'simulation_message_status'))}</tf-chip>
+        ${when ? `<div>${escapeHtml(when)}</div>` : ''}
+        ${state === 'Pending' ? `<div class="fb-field-hint">${escapeHtml(text('simulation_message_pending_hint'))}</div>` : ''}
+        ${state === 'Ambiguous' ? `<div class="fb-field-hint" data-message-ambiguous-hint>${escapeHtml(text('simulation_message_ambiguous_hint'))}</div>
+          <tf-button variant="secondary" size="sm" data-message-address="${escapeAttr(message.messageId)}" ${busy || finished ? 'disabled' : ''}>${escapeHtml(text('simulation_message_address'))}</tf-button>` : ''}
+        ${['Error', 'Blocked'].includes(state) && message.lastReason ? `<div class="fb-field-hint">${escapeHtml(message.lastReason)}</div>` : ''}
+      </li>`;
+    };
+    const lock = busy || finished ? 'disabled' : '';
     content.innerHTML = `
       <div class="fb-simulation-toolbar">
         <div><strong>${escapeHtml(text('simulation_clock'))}</strong>: ${escapeHtml(text('simulation_clock_value', { now: clockText(clock.nowMs), end: clockText(clock.horizonMs), step: clock.stepIndex }))}</div>
@@ -183,6 +227,7 @@ export function simulationWindow(view, model = null, options = {}) {
           <tf-button variant="secondary" size="sm" icon="plus" data-simulation-advance ${busy || finished ? 'disabled' : ''}>${escapeHtml(text('simulation_advance'))}</tf-button>
           <tf-button variant="ghost" size="sm" data-simulation-end ${busy ? 'disabled' : ''}>${escapeHtml(text('simulation_end'))}</tf-button></div>
       </div>
+      <p class="fb-field-hint" data-simulation-advance-hint>${escapeHtml(text('simulation_advance_hint'))}</p>
       ${incidents.length || status === 'Incident' ? `<section class="fb-simulation-section" data-simulation-incidents><h3>${escapeHtml(text('simulation_incidents'))}</h3>
         <p>${escapeHtml(text('simulation_incident_stopped'))}</p>
         ${incidents.map((incident) => `<tf-alert tone="danger" data-simulation-incident message="${escapeAttr(`${elementName(incident.nodeId, incident.nodeName)}: ${simulationIncidentText(incident)} (${incident.code})`)}"></tf-alert>`).join('')}
@@ -234,13 +279,45 @@ export function simulationWindow(view, model = null, options = {}) {
             ${decided ? `<tf-chip status="${decided === 'approved' ? 'ok' : 'err'}" data-simulation-decision="${decided}">${escapeHtml(text(decided === 'approved' ? 'simulation_decision_approved' : 'simulation_decision_rejected'))}</tf-chip>` : ''}</div></article>`;
         }).join('')}` : ''}
       </section>
+      ${subscriptions.length ? `<section class="fb-simulation-section" data-simulation-awaited><h3>${escapeHtml(text('simulation_awaited'))}</h3>
+        <ul class="fb-simulation-awaited">
+          ${subscriptions.filter((subscription) => !subscription.raceId).map(subscriptionRow).join('')}
+          ${[...races.entries()].map(([raceId, group]) => `<li data-simulation-race="${escapeAttr(raceId)}"><em>${escapeHtml(text('simulation_race', { count: group.length }))}</em>
+            <ul>${group.map(subscriptionRow).join('')}</ul></li>`).join('')}
+        </ul>
+        ${subscriptions.some((subscription) => subscription.kind === 'SignalCatch') ? `<p class="fb-field-hint" data-simulation-signal-note>${escapeHtml(text('simulation_signal_note'))}</p>` : ''}
+      </section>` : ''}
+      <section class="fb-simulation-section" data-simulation-message-form><h3>${escapeHtml(text('simulation_send_message'))}</h3>
+        ${finished ? `<p data-message-finished>${escapeHtml(text('simulation_message_finished'))}</p>` : ''}
+        <div class="fb-simulation-answer">
+          <tf-select data-message-field="pick" wrap-selected label="${escapeAttr(text('simulation_message_pick'))}" hint="${escapeAttr(text('simulation_message_pick_hint'))}" value="${escapeAttr(messageDraft.pick)}" ${lock}>
+            <option value="">${escapeHtml(text('simulation_message_free'))}</option>
+            ${messageWaits.map((subscription) => `<option value="${escapeAttr(subscription.subscriptionId)}">${escapeHtml(waitLabel(subscription))}</option>`).join('')}
+          </tf-select>
+          <tf-checkbox data-message-field="exact" label="${escapeAttr(text('simulation_message_exact'))}" ${messageDraft.exact ? 'checked' : ''} ${lock}></tf-checkbox>
+          <tf-input data-message-field="name" label="${escapeAttr(text('simulation_message_name'))}" value="${escapeAttr(messageDraft.name)}" ${lock}></tf-input>
+          <tf-alert data-message-error="name" tone="danger" hidden></tf-alert>
+          <tf-input data-message-field="key" label="${escapeAttr(text('simulation_message_key'))}" value="${escapeAttr(messageDraft.key)}" ${lock}></tf-input>
+          <tf-alert data-message-error="key" tone="danger" hidden></tf-alert>
+          <section class="fb-process-json"><h4>${escapeHtml(text('simulation_message_payload'))}</h4>
+            <tf-code-editor data-message-field="payload" language="json" ${finished ? 'readonly' : ''} aria-label="${escapeAttr(text('simulation_message_payload'))}"></tf-code-editor>
+            <p class="fb-field-hint">${escapeHtml(text('simulation_editor_escape_hint'))}</p>
+            <tf-alert data-message-error="payload" tone="danger" hidden></tf-alert></section>
+          <tf-input data-message-field="ttl" type="number" min="1" max="604800" label="${escapeAttr(text('simulation_message_ttl'))}" hint="${escapeAttr(text('simulation_message_ttl_hint'))}" value="${escapeAttr(messageDraft.ttl)}" ${lock}></tf-input>
+          <tf-alert data-message-error="ttl" tone="danger" hidden></tf-alert>
+          <tf-alert data-message-error="pick" tone="danger" hidden></tf-alert>
+          <tf-button variant="primary" size="sm" data-simulation-message-send ${lock}>${escapeHtml(text('simulation_message_send'))}</tf-button>
+        </div>
+      </section>
+      ${messages.length ? `<section class="fb-simulation-section" data-simulation-messages><h3>${escapeHtml(text('simulation_messages', { count: messages.length }))}</h3>
+        <ul class="fb-simulation-awaited">${messages.map(messageRow).join('')}</ul></section>` : ''}
       <section class="fb-simulation-section"><h3>${escapeHtml(text('simulation_timers'))}</h3>
         ${timers.length ? timers.map((timer) => {
           const timerStatus = String(timer.status || '').toLowerCase();
-          const statusKey = ['pending', 'fired', 'blocked'].includes(timerStatus)
+          const statusKey = ['pending', 'fired', 'blocked', 'cancelled', 'missed', 'error'].includes(timerStatus)
             ? `simulation_timer_${timerStatus}` : null;
           const due = timer.dueAtMs == null ? '—' : clockText(timer.dueAtMs);
-          return `<article class="fb-simulation-timer"><div><strong>${escapeHtml(elementName(timer.nodeId, timer.nodeName))}</strong> · ${escapeHtml(String(timer.kind || ''))}
+          return `<article class="fb-simulation-timer"><div><strong>${escapeHtml(elementName(timer.nodeId, timer.nodeName))}</strong> · ${escapeHtml(known(['Start', 'Catch', 'Boundary'], String(timer.kind || ''), 'simulation_timer_kind'))}${timer.attachedToId ? ` · ${escapeHtml(text('simulation_timer_attached', { node: elementName(timer.attachedToId) }))}` : ''}
             <tf-chip status="info">${escapeHtml(statusKey ? text(statusKey) : String(timer.status || ''))}</tf-chip></div>
             <div>${escapeHtml(text('simulation_timer_due'))}: ${escapeHtml(due)} · ${escapeHtml(text('simulation_timer_occurrence'))}: ${escapeHtml(String(timer.occurrence ?? 0))}</div>
           </article>`;
@@ -266,6 +343,21 @@ export function simulationWindow(view, model = null, options = {}) {
       }
     });
     fieldErrors.clear();
+    const payloadEditor = messageField('payload');
+    if (payloadEditor) payloadEditor.value = messageDraft.payload;
+  };
+
+  const showMessageErrors = (errors = {}) => {
+    let first = null;
+    content.querySelectorAll('[data-message-error]').forEach((alert) => {
+      const error = errors[alert.dataset.messageError];
+      if (error) {
+        alert.setAttribute('message', errorMessage(error));
+        first ??= alert;
+      }
+      alert.hidden = !error;
+    });
+    first?.scrollIntoView?.({ block: 'center' });
   };
 
   // The editor keeps Escape for itself (Escape, then Tab, leaves it); the window must not also see it.
@@ -275,6 +367,16 @@ export function simulationWindow(view, model = null, options = {}) {
   content.addEventListener('change', (event) => {
     const article = event.target.closest?.('[data-simulation-wait]');
     if (article) syncAnswerForm(article);
+    // Choosing a wait fills the name and key it waits for and addresses exactly that wait.
+    const pick = event.target.closest?.('[data-message-field="pick"]');
+    if (pick) {
+      const chosen = simulationMessageWaits(current.subscriptions).find((subscription) => subscription.subscriptionId === pick.value);
+      if (chosen) {
+        messageField('name').value = chosen.messageName;
+        messageField('key').value = chosen.correlationKey;
+      }
+      messageField('exact').checked = !!chosen;
+    }
   });
 
   content.addEventListener('click', (event) => {
@@ -287,6 +389,27 @@ export function simulationWindow(view, model = null, options = {}) {
     if (advance) {
       if (simulationFinished(current.instance?.status)) return;
       run(async () => (await ApiBinary.one('processSimulationAdvanceRequest', { simulationId: current.simulationId })).view);
+      return;
+    }
+    const address = event.target.closest('[data-message-address]');
+    if (address) {
+      const message = (current.messages || []).find((entry) => entry.messageId === address.dataset.messageAddress);
+      if (!message || busy) return;
+      messageField('pick').value = '';
+      messageField('name').value = message.messageName;
+      messageField('key').value = message.correlationKey;
+      messageField('exact').checked = false;
+      messageField('pick').scrollIntoView?.({ block: 'center' });
+      return;
+    }
+    if (event.target.closest('[data-simulation-message-send]')) {
+      if (busy || simulationFinished(current.instance?.status)) return;
+      messageDraft = readMessageForm();
+      const read = readMessageDraft(messageDraft, current.subscriptions);
+      showMessageErrors(read.errors);
+      if (read.errors) return;
+      const simulationId = current.simulationId;
+      run(async () => (await ApiBinary.one('processSimulationMessageSendRequest', { simulationId, ...read.request })).view);
       return;
     }
     const resolve = event.target.closest('[data-simulation-resolve]');
@@ -351,7 +474,7 @@ export function simulationWindow(view, model = null, options = {}) {
   if (options.flowId) {
     entry.snapshot = () => {
       captureDrafts();
-      return { flowId: options.flowId, simulationId: current.simulationId, model, fixtures, drafts: [...drafts], taskDrafts: [...taskDrafts] };
+      return { flowId: options.flowId, simulationId: current.simulationId, model, fixtures, drafts: [...drafts], taskDrafts: [...taskDrafts], messageDraft };
     };
     live.add(entry);
   }
@@ -389,7 +512,7 @@ export async function resumeProcessSimulation(flowId) {
   try {
     if (kept.flowId !== flowId) throw new Error('another process');
     const { view } = await ApiBinary.one('processSimulationViewRequest', { simulationId: kept.simulationId });
-    return simulationWindow(view, kept.model, { flowId, fixtures: kept.fixtures, drafts: kept.drafts, taskDrafts: kept.taskDrafts });
+    return simulationWindow(view, kept.model, { flowId, fixtures: kept.fixtures, drafts: kept.drafts, taskDrafts: kept.taskDrafts, messageDraft: kept.messageDraft });
   } catch (error) {
     if (kept.flowId === flowId) console.warn('[simulation] could not resume the run:', error);
     void ApiBinary.one('processSimulationReleaseRequest', { simulationId: kept.simulationId }).catch(() => {});
@@ -408,7 +531,7 @@ function fixturesSection(model) {
   const labels = processDistinctLabels([...steps.map((step) => step.nodeId), ...unsupported.map((step) => step.nodeId)].map((id) => [id, names.get(id)]));
   const section = document.createElement('section');
   section.className = 'fb-simulation-fixtures';
-  section.innerHTML = `<h3>${escapeHtml(text('simulation_fixtures'))}</h3><p>${escapeHtml(text('simulation_fixtures_hint'))}</p>
+  section.innerHTML = `<h3>${escapeHtml(text(steps.length ? 'simulation_fixtures' : 'simulation_not_simulated_heading'))}</h3>${steps.length ? `<p>${escapeHtml(text('simulation_fixtures_hint'))}</p>` : ''}
     ${unsupported.map((step) => `<article class="fb-simulation-fixture" data-fixture-unsupported="${escapeAttr(step.nodeId)}">
       <div><strong>${escapeHtml(labels.get(step.nodeId))}</strong> <tf-chip status="warn">${escapeHtml(text('simulation_not_simulated'))}</tf-chip></div>
       <p>${escapeHtml(text(`simulation_unsupported_${step.reason}`))}</p></article>`).join('')}

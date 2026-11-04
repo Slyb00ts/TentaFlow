@@ -83,6 +83,7 @@ module.exports = defineConfig({
     { name: 'process-b3-inspector', testMatch: 'process-b3-inspector.spec.js' },
     { name: 'process-b3-camunda-import', testMatch: 'process-b3-camunda-import.spec.js' },
     { name: 'process-b3-simulation-service', testMatch: 'process-b3-simulation-service.spec.js' },
+    { name: 'process-b3-simulation-events', testMatch: 'process-b3-simulation-events.spec.js' },
     { name: 'tentaquant', testMatch: 'tentaquant.spec.js' },
     { name: 'flows-system-readonly', testMatch: 'flows-system-readonly.spec.js' },
     { name: 'tentabus-seed', testMatch: 'tentabus-seed.spec.js' },

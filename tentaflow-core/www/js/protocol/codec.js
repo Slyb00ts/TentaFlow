@@ -1043,6 +1043,7 @@ function processRequestBody(variant, payload) {
     SimulationAdvanceRequest: ['simulationId'],
     SimulationUserTaskCompleteRequest: ['simulationId', 'userTaskId', 'outputs', 'approved'],
     SimulationServiceResolveRequest: ['simulationId', 'nodeId', 'result', 'verdict', 'jobId'],
+    SimulationMessageSendRequest: ['simulationId', 'messageName', 'correlationKey', 'payload', 'ttlSeconds', 'subscriptionId'],
     SimulationManualTaskAcknowledgeRequest: ['simulationId', 'userTaskId'],
     SimulationReleaseRequest: ['simulationId'],
   }[variant];
@@ -1055,6 +1056,7 @@ function processRequestBody(variant, payload) {
       && !(variant === 'InstanceGetRequest' && name === 'pages')
       && !(variant === 'SimulationStartRequest' && name === 'serviceFixtures')
       && !(variant === 'SimulationServiceResolveRequest' && ['verdict', 'jobId'].includes(name))
+      && !(variant === 'SimulationMessageSendRequest' && ['payload', 'ttlSeconds', 'subscriptionId'].includes(name))
       && !(variant === 'MessageListRequest' && name === 'instanceId')) {
       throw new TypeError(`process request ${variant} requires ${name}`);
     }
@@ -1176,6 +1178,9 @@ export const encode = {
   },
   processSimulationServiceResolveRequest(correlationId, payload, sequence = 1) {
     return processFrame(correlationId, sequence, 'SimulationServiceResolveRequest', payload);
+  },
+  processSimulationMessageSendRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'SimulationMessageSendRequest', payload);
   },
   processSimulationManualTaskAcknowledgeRequest(correlationId, payload, sequence = 1) {
     return processFrame(correlationId, sequence, 'SimulationManualTaskAcknowledgeRequest', payload);

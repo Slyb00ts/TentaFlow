@@ -21,7 +21,21 @@ export const SIMULATION_EVENT_KINDS = ['instance_started', 'instance_completed',
   'manual_result_accepted', 'verification_created', 'verification_passed', 'verification_approved',
   'verification_rejected', 'verification_withdrawn', 'timer_armed', 'timer_fired', 'timer_cancelled', 'timer_error',
   'end_reached', 'error_end_reached', 'terminate_end_reached', 'incident', 'incident_resolved', 'job_retried',
-  'business_error_caught', 'boundary_error', 'boundary_escalation', 'escalation_caught', 'escalation_boundary_armed'];
+  'business_error_caught', 'boundary_error', 'boundary_escalation', 'escalation_caught', 'escalation_boundary_armed',
+  'simulation_message_sent', 'message_queued', 'message_delivered', 'message_ambiguous', 'message_blocked',
+  'message_cancelled', 'message_error', 'message_expired', 'message_resolved', 'receive_task_opened',
+  'receive_task_completed', 'send_task_admitted', 'send_task_pending', 'send_admission_failed', 'signal_admitted',
+  'signal_catch_opened', 'signal_received', 'event_race_armed', 'event_race_won', 'event_race_lost',
+  'event_race_cancelled', 'subscription_cancelled', 'timer_blocked', 'link_thrown', 'link_caught'];
+export const SIMULATION_MESSAGE_STATUSES = ['Pending', 'Blocked', 'Ambiguous', 'Delivered', 'Expired', 'Cancelled', 'Error'];
+export const SIMULATION_SUBSCRIPTION_KINDS = ['MessageCatch', 'BoundaryMessage', 'ReceiveTask', 'SignalCatch', 'BoundaryError', 'BoundaryEscalation'];
+const MESSAGE_WAIT_KINDS = ['MessageCatch', 'BoundaryMessage', 'ReceiveTask'];
+const MESSAGE_KEY_MAX_BYTES = 256;
+export const MESSAGE_TTL_DEFAULT = 3600;
+const MESSAGE_TTL_MAX = 604800;
+// The incident codes a message or a signal can leave behind, each with a sentence of its own.
+export const SIMULATION_EVENT_INCIDENT_CODES = ['MESSAGE_MAPPING_ERROR', 'MESSAGE_PREDICATE_ERROR', 'SIGNAL_DELIVERY_FAILED',
+  'SIGNAL_MAPPING_FAILED', 'SIGNAL_PAYLOAD_FAILED', 'SIGNAL_PAYLOAD_LIMIT', 'SIGNAL_PENDING_LIMIT', 'SIGNAL_RECIPIENT_LIMIT'];
 export const SIMULATION_STATUSES = ['Running', 'Waiting', 'Completed', 'Incident', 'Cancelled', 'Error'];
 export const SIMULATION_TASK_KINDS = ['Work', 'Verification', 'Manual'];
 
@@ -156,10 +170,17 @@ export function simulationOpen(view) {
 // The steps the engine refuses when the run is created, with the reason, so the start
 // window can say why they get no result source.
 export function simulationUnsupportedSteps(model) {
-  return (model?.nodes || []).filter((node) => node.kind?.ServiceTask).flatMap((node) => {
-    const implementation = node.kind.ServiceTask.implementation;
-    const reason = implementation?.Agent ? 'agent' : implementation?.Unbound ? 'unbound' : node.activityIo != null ? 'io' : null;
-    return reason ? [{ nodeId: node.id, reason }] : [];
+  const eventWithIo = ['MessageCatch', 'MessageThrow', 'ReceiveTask', 'SendTask', 'SignalThrow', 'SignalCatch'];
+  return (model?.nodes || []).flatMap((node) => {
+    const kind = typeof node.kind === 'object' ? Object.keys(node.kind)[0] : node.kind;
+    if (kind === 'ServiceTask') {
+      const implementation = node.kind.ServiceTask.implementation;
+      const reason = implementation?.Agent ? 'agent' : implementation?.Unbound ? 'unbound' : node.activityIo != null ? 'io' : null;
+      return reason ? [{ nodeId: node.id, reason }] : [];
+    }
+    if (kind === 'MessageStart') return [{ nodeId: node.id, reason: 'message_start' }];
+    if (eventWithIo.includes(kind) && node.activityIo != null) return [{ nodeId: node.id, reason: 'event_io' }];
+    return [];
   });
 }
 
@@ -169,4 +190,46 @@ export function simulationTaskDecision(events, userTaskId) {
   const event = (events || []).find((candidate) => candidate.data?.user_task_id === userTaskId
     && ['verification_approved', 'verification_rejected'].includes(candidate.kind));
   return event ? (event.kind === 'verification_approved' ? 'approved' : 'rejected') : null;
+}
+
+// The open waits an operator message can address: the ones that take a message.
+export function simulationMessageWaits(subscriptions) {
+  return (subscriptions || []).filter((subscription) => MESSAGE_WAIT_KINDS.includes(subscription.kind));
+}
+
+export function blankMessageDraft() {
+  return { pick: '', name: '', key: '', payload: '{}', ttl: String(MESSAGE_TTL_DEFAULT), exact: false };
+}
+
+const validKey = (value) => {
+  const bytes = new TextEncoder().encode(value).length;
+  return bytes > 0 && bytes <= MESSAGE_KEY_MAX_BYTES && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+};
+
+/**
+ * Reads the message form into the request fields, or names each wrong field with an i18n
+ * key under `bpmn.`. The engine judges the same rules (a literal non-empty name and key of at
+ * most 256 bytes, a payload object within the output limits, a lifetime of 1..604800 seconds);
+ * `subscriptions` are the waits of the view, against which a chosen wait is checked.
+ */
+export function readMessageDraft(draft, subscriptions) {
+  const errors = {};
+  const name = String(draft.name ?? '');
+  const key = String(draft.key ?? '');
+  if (!validKey(name)) errors.name = 'simulation_message_name_invalid';
+  if (!validKey(key)) errors.key = 'simulation_message_key_invalid';
+  const ttl = String(draft.ttl ?? '').trim();
+  const ttlSeconds = /^\d+$/.test(ttl) ? Number(ttl) : NaN;
+  if (!(ttlSeconds >= 1 && ttlSeconds <= MESSAGE_TTL_MAX)) errors.ttl = 'simulation_message_ttl_invalid';
+  const payload = readOutputs(draft.payload);
+  if (payload.error) errors.payload = payload.error;
+  let subscriptionId = null;
+  if (draft.exact && draft.pick) {
+    const chosen = simulationMessageWaits(subscriptions).find((subscription) => subscription.subscriptionId === draft.pick);
+    if (!chosen) errors.pick = 'simulation_message_pick_gone';
+    else if (chosen.messageName !== name || chosen.correlationKey !== key) errors.pick = 'simulation_message_pick_mismatch';
+    else subscriptionId = chosen.subscriptionId;
+  }
+  if (Object.keys(errors).length) return { errors };
+  return { request: { messageName: name, correlationKey: key, payload: payload.value, ttlSeconds, subscriptionId } };
 }

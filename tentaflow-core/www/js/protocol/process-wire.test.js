@@ -1186,6 +1186,54 @@ test('simulation view decodes the Service steps that wait for a result', { skip 
   assert.equal(waiting.mode, 'Fixture');
 });
 
+test('a simulation message request carries its name, key, payload, lifetime and the wait it addresses', { skip }, () => {
+  const sent = request('processSimulationMessageSendRequest', {
+    simulationId: 'simulation-1', messageName: 'order_paid', correlationKey: 'PO-7',
+    payload: { inner_key: { a_b: 1 } }, ttlSeconds: 90, subscriptionId: 'sub-1',
+  });
+  assert.equal(sent._variant, 'ProcessBody.SimulationMessageSendRequest');
+  assert.equal(sent.simulationId, 'simulation-1');
+  assert.equal(sent.messageName, 'order_paid');
+  assert.equal(sent.correlationKey, 'PO-7');
+  assert.deepEqual(sent.payload, { inner_key: { a_b: 1 } }, 'the payload keeps its own keys');
+  assert.equal(sent.ttlSeconds, 90);
+  assert.equal(sent.subscriptionId, 'sub-1');
+  const bare = request('processSimulationMessageSendRequest', { simulationId: 'simulation-1', messageName: 'n', correlationKey: 'k' });
+  assert.equal(bare.ttlSeconds ?? null, null);
+  assert.equal(bare.subscriptionId ?? null, null);
+  assert.throws(() => codec.encode.processSimulationMessageSendRequest(17, { simulationId: 'simulation-1', correlationKey: 'k' }), /requires messageName/);
+});
+
+test('a simulation view decodes the open waits and the messages of the run', { skip }, () => {
+  const view = {
+    simulation_id: 'simulation-1',
+    source: { simulation_id: 'simulation-1', definition_id: 'definition-1', version: 3,
+      model_sha256: 'a'.repeat(64), selected_process_id: 'Process_1', start_node_id: 'Start_1' },
+    clock: { start_ms: 10, now_ms: 20, horizon_ms: 90, tick_duration_ms: 10, step_index: 1, revision: 2 },
+    instance: null, user_tasks: [], timers: [], incidents: [], events: [], trace_steps: [], activity_io_witnesses: [],
+    subscriptions: [{ subscription_id: 'sub-1', kind: 'MessageCatch', node_id: 'Catch_1', node_name: 'Wait for payment',
+      scope_id: 'scope-1', token_id: 'token-1', message_name: 'order_paid', correlation_key: 'PO-7',
+      signal_namespace_uri: null, signal_declaration_id: null, race_id: 'race-1', due_at_ms: 200 }],
+    messages: [{ message_id: 'm-1', sender_user_id: 'u', origin: 'Api', target: { Catch: { definition_id: 'd', instance_id: 'i', subscription_id: null } },
+      message_name: 'order_paid', correlation_key: 'PO-7', revision: 1, status: 'Ambiguous', received_at_ms: 10, expires_at_ms: 250,
+      updated_at_ms: 10, delivered_at_ms: null, matched_instance_id: null, matched_version: null, matched_subscription_id: null,
+      source_instance_id: null, source_node_id: null, last_reason: null, payload_sha256: 'b'.repeat(64), payload_bytes: 2,
+      payload_available: true, can_resolve: false, can_cancel: false }],
+  };
+  const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: { SimulationMessageSendResponse: { view } } })));
+  assert.equal(decoded._variant, 'ProcessBody.SimulationMessageSendResponse');
+  const [subscription] = decoded.view.subscriptions;
+  assert.equal(subscription.subscriptionId, 'sub-1');
+  assert.equal(subscription.kind, 'MessageCatch');
+  assert.equal(subscription.messageName, 'order_paid');
+  assert.equal(subscription.raceId, 'race-1');
+  assert.equal(subscription.dueAtMs, 200);
+  const [message] = decoded.view.messages;
+  assert.equal(message.status, 'Ambiguous');
+  assert.equal(message.expiresAtMs, 250);
+  assert.equal(message.correlationKey, 'PO-7');
+});
+
 test('process options decode the block and tool catalogues and tolerate a server that omits them', { skip }, () => {
   const decode = (response) => wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: { OptionsResponse: response } })));
   const full = decode({

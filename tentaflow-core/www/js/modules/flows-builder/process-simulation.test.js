@@ -22,7 +22,7 @@ const { emptyProcessModel, processExplainError } = await import('./bpmn.js');
 const { simulationWindow, openProcessSimulation, resumeProcessSimulation, simulationErrorText } = await import('./process-simulation.js');
 const { TfWindow } = await import('../../components/tf-window.js');
 const { TfToast } = await import('../../components/tf-toast.js');
-const { OUTPUTS_MAX_KIB, SERVICE_OUTCOMES, readOutputs, readServiceAnswer, readServiceFixtures, simulationServiceOutcomes, simulationServiceSteps, simulationWaitSteps } = await import('./simulation-service.js');
+const { OUTPUTS_MAX_KIB, SERVICE_OUTCOMES, readMessageDraft, readOutputs, readServiceAnswer, readServiceFixtures, simulationServiceOutcomes, simulationServiceSteps, simulationWaitSteps } = await import('./simulation-service.js');
 localStorage.setItem('tentaflow_lang', 'en');
 await I18n.init();
 
@@ -701,4 +701,233 @@ test('the start window lists the steps it cannot simulate with the reason, scrol
   }
   TfToast.show = showOriginal;
   assert.deepEqual(toasts, [], 'starting leaves no toast behind to go stale in another language');
+});
+
+const sub = (overrides = {}) => ({ subscriptionId: 'sub-1', kind: 'MessageCatch', nodeId: 'Plain', nodeName: '', scopeId: 's', tokenId: 't',
+  messageName: 'order_paid', correlationKey: 'PO-7', signalNamespaceUri: null, signalDeclarationId: null, raceId: null, dueAtMs: null, ...overrides });
+const message = (overrides = {}) => ({ messageId: 'm-1', messageName: 'order_paid', correlationKey: 'PO-7', status: 'Pending',
+  receivedAtMs: 1, expiresAtMs: Date.UTC(2026, 10, 4, 12, 0, 0), deliveredAtMs: null, lastReason: null, ...overrides });
+const T0 = Date.UTC(2026, 10, 4, 10, 0, 0);
+const draftOf = (overrides = {}) => ({ pick: '', name: 'order_paid', key: 'PO-7', payload: '{}', ttl: '3600', exact: false, ...overrides });
+
+test('a message form is read into the request, and every wrong field is named', () => {
+  const waits = [sub(), sub({ subscriptionId: 'sub-sig', kind: 'SignalCatch', messageName: null, correlationKey: null })];
+  assert.deepEqual(readMessageDraft(draftOf({ payload: '{"a": {"b_c": 1}}', ttl: ' 90 ' }), waits).request,
+    { messageName: 'order_paid', correlationKey: 'PO-7', payload: { a: { b_c: 1 } }, ttlSeconds: 90, subscriptionId: null });
+  assert.equal(readMessageDraft(draftOf({ pick: 'sub-1', exact: true }), waits).request.subscriptionId, 'sub-1');
+  assert.equal(readMessageDraft(draftOf({ pick: 'sub-1', exact: false }), waits).request.subscriptionId, null);
+  assert.equal(readMessageDraft(draftOf({ pick: '', exact: true }), waits).request.subscriptionId, null, 'a free entry has no wait to address');
+  assert.equal(readMessageDraft(draftOf({ name: '' }), waits).errors.name, 'simulation_message_name_invalid');
+  assert.equal(readMessageDraft(draftOf({ key: 'a\u0007b' }), waits).errors.key, 'simulation_message_key_invalid');
+  assert.equal(readMessageDraft(draftOf({ name: 'x'.repeat(257) }), waits).errors.name, 'simulation_message_name_invalid');
+  assert.equal(readMessageDraft(draftOf({ name: 'x'.repeat(256) }), waits).errors, undefined);
+  for (const ttl of ['0', '604801', 'abc', '1.5', '', '-3']) assert.equal(readMessageDraft(draftOf({ ttl }), waits).errors.ttl, 'simulation_message_ttl_invalid', ttl);
+  assert.equal(readMessageDraft(draftOf({ ttl: '604800' }), waits).errors, undefined);
+  assert.equal(readMessageDraft(draftOf({ payload: '{bad' }), waits).errors.payload, 'json_invalid');
+  assert.equal(readMessageDraft(draftOf({ payload: '[1]' }), waits).errors.payload, 'object_required');
+  assert.equal(readMessageDraft(draftOf({ payload: JSON.stringify({ blob: 'x'.repeat(OUTPUTS_MAX_KIB * 1024) }) }), waits).errors.payload.key, 'simulation_outputs_too_large');
+  assert.equal(readMessageDraft(draftOf({ pick: 'gone', exact: true }), waits).errors.pick, 'simulation_message_pick_gone');
+  assert.equal(readMessageDraft(draftOf({ pick: 'sub-sig', exact: true }), waits).errors.pick, 'simulation_message_pick_gone', 'a signal wait cannot be addressed');
+  assert.equal(readMessageDraft(draftOf({ pick: 'sub-1', exact: true, key: 'PO-8' }), waits).errors.pick, 'simulation_message_pick_mismatch');
+});
+
+test('open waits are listed with names, keys, race groups and due times; a signal wait is read-only with its reason', async () => {
+  const win = simulationWindow(baseView({ instance: { status: 'Waiting' }, clock: { nowMs: T0, horizonMs: T0 + 3600000, stepIndex: 1 },
+    subscriptions: [sub({ nodeName: 'Wait for payment' }),
+      sub({ subscriptionId: 'sub-2', kind: 'ReceiveTask', nodeId: 'Expr', nodeName: '', messageName: 'ship', correlationKey: 'S-1', raceId: 'race-1', dueAtMs: T0 + 60000 }),
+      sub({ subscriptionId: 'sub-3', kind: 'SignalCatch', nodeId: 'Checked', messageName: null, correlationKey: null, signalDeclarationId: 'Signal_stop', raceId: 'race-1', dueAtMs: T0 + 60000 })] }), MODEL);
+  await flush(2);
+  const panel = win.querySelector('[data-simulation-awaited]');
+  assert.ok(panel);
+  const rows = (root) => [...root.querySelectorAll('[data-simulation-subscription]')].map((row) => row.dataset.simulationSubscription);
+  assert.deepEqual(rows(panel), ['sub-1', 'sub-2', 'sub-3']);
+  assert.match(panel.querySelector('[data-simulation-subscription="sub-1"]').textContent, /Wait for payment.*Message catch/s);
+  assert.match(panel.querySelector('[data-simulation-subscription="sub-1"]').textContent, /Message: order_paid · Key: PO-7/);
+  assert.deepEqual(rows(panel.querySelector('[data-simulation-race="race-1"]')), ['sub-2', 'sub-3'], 'a race groups its waits');
+  assert.match(panel.querySelector('[data-simulation-race="race-1"]').textContent, /first event to happen wins/);
+  const due = panel.querySelector('[data-simulation-subscription="sub-2"]').textContent;
+  assert.match(due, /fires at .*2026/);
+  assert.doesNotMatch(due, /\d{13}/);
+  assert.match(panel.querySelector('[data-simulation-subscription="sub-3"]').textContent, /Signal: Signal_stop/);
+  assert.match(panel.querySelector('[data-simulation-signal-note]').textContent, /A simulation cannot send a signal/);
+  const picks = [...win.querySelectorAll('[data-message-field="pick"] option')].map((option) => option.value);
+  assert.deepEqual(picks, ['', 'sub-1', 'sub-2'], 'only message waits can be answered');
+  assert.match(win.querySelector('[data-simulation-advance-hint]').textContent, /next due item/);
+  const bare = simulationWindow(baseView({ instance: { status: 'Waiting' } }), MODEL);
+  assert.equal(bare.querySelector('[data-simulation-awaited]'), null);
+});
+
+test('choosing a wait fills the form and addresses it exactly; a free entry addresses by name and key only', async () => {
+  responder = () => ({ view: baseView({ instance: { status: 'Waiting' } }) });
+  const win = simulationWindow(baseView({ instance: { status: 'Waiting' }, subscriptions: [sub({ nodeName: 'Wait for payment' })] }), MODEL);
+  await flush(2);
+  const field = (name) => win.querySelector(`[data-message-field="${name}"]`);
+  change(field('pick'), 'sub-1');
+  assert.equal(field('name').value, 'order_paid');
+  assert.equal(field('key').value, 'PO-7');
+  assert.equal(field('exact').checked, true);
+  field('payload').value = '{"paid": true}';
+  change(field('ttl'), '120');
+  click(win.querySelector('[data-simulation-message-send]'));
+  await flush(5);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].kind, 'processSimulationMessageSendRequest');
+  assert.deepEqual(calls[0].payload, { simulationId: 'sim-1', messageName: 'order_paid', correlationKey: 'PO-7', payload: { paid: true }, ttlSeconds: 120, subscriptionId: 'sub-1' });
+  calls.length = 0;
+  change(field('pick'), '');
+  assert.equal(field('exact').checked, false);
+  change(field('name'), 'nobody_waits');
+  change(field('key'), 'K');
+  click(win.querySelector('[data-simulation-message-send]'));
+  await flush(5);
+  assert.equal(calls[0].payload.subscriptionId, null);
+  assert.equal(calls[0].payload.messageName, 'nobody_waits');
+});
+
+test('a bad message stays in the form with its errors at the fields and sends nothing; the draft survives a redraw', async () => {
+  responder = () => { throw new Error('SIMULATION_MESSAGE_INVALID: message TTL must be 1..604800 seconds'); };
+  const win = simulationWindow(baseView({ instance: { status: 'Waiting' } }), MODEL);
+  await flush(2);
+  const field = (name) => win.querySelector(`[data-message-field="${name}"]`);
+  const error = (name) => win.querySelector(`[data-message-error="${name}"]`);
+  click(win.querySelector('[data-simulation-message-send]'));
+  assert.equal(error('name').hidden, false);
+  assert.equal(error('key').hidden, false);
+  assert.equal(error('name').getAttribute('message'), I18n.t('bpmn.simulation_message_name_invalid'));
+  change(field('name'), 'order_paid');
+  change(field('key'), 'PO-7');
+  field('payload').value = '{"half":';
+  click(win.querySelector('[data-simulation-message-send]'));
+  assert.equal(error('name').hidden, true);
+  assert.equal(error('payload').getAttribute('message'), I18n.t('bpmn.json_invalid'));
+  field('payload').value = JSON.stringify({ blob: 'x'.repeat(OUTPUTS_MAX_KIB * 1024) });
+  click(win.querySelector('[data-simulation-message-send]'));
+  assert.match(error('payload').getAttribute('message'), /at most 240 KiB/);
+  change(field('ttl'), '0');
+  click(win.querySelector('[data-simulation-message-send]'));
+  assert.equal(error('ttl').getAttribute('message'), I18n.t('bpmn.simulation_message_ttl_invalid'));
+  assert.equal(calls.length, 0, 'nothing is sent while a field is wrong');
+  assert.match(win.querySelector('[data-simulation-message-form]').textContent, /Press Esc, then Tab/);
+  // The engine's own refusal is told in words, and what was typed is still there.
+  field('payload').value = '{"keep": 1}';
+  change(field('ttl'), '5');
+  click(win.querySelector('[data-simulation-message-send]'));
+  await flush(5);
+  assert.equal(calls.length, 1);
+  assert.match(win.querySelector('[data-error]').getAttribute('message'), /The message is not valid/);
+  assert.equal(win.querySelector('[data-message-field="name"]').value, 'order_paid');
+  assert.equal(win.querySelector('[data-message-field="payload"]').value, '{"keep": 1}');
+  assert.equal(win.querySelector('[data-message-field="ttl"]').value, '5');
+});
+
+test('messages are listed with a localized status and their expiry on the virtual clock; an ambiguous one says how to address it', async () => {
+  const win = simulationWindow(baseView({ instance: { status: 'Waiting' }, subscriptions: [sub(), sub({ subscriptionId: 'sub-2', nodeId: 'Expr' })],
+    messages: [message(), message({ messageId: 'm-2', status: 'Ambiguous' }), message({ messageId: 'm-3', status: 'Delivered', deliveredAtMs: T0 }),
+      message({ messageId: 'm-4', status: 'Expired' }), message({ messageId: 'm-5', status: 'Error', lastReason: 'mapping failed' }), message({ messageId: 'm-6', status: 'Cancelled' })] }), MODEL);
+  await flush(2);
+  const item = (id) => win.querySelector(`[data-simulation-message="${id}"]`);
+  assert.equal(win.querySelector('[data-simulation-messages] h3').textContent, '6 messages');
+  assert.match(item('m-1').textContent, /Pending/);
+  assert.match(item('m-1').textContent, /Expires .*2026/);
+  assert.match(item('m-1').textContent, /next Advance delivers it/);
+  assert.match(item('m-3').textContent, /Delivered .*2026/);
+  assert.match(item('m-4').textContent, /Expired .*2026/);
+  assert.match(item('m-5').textContent, /Failed/);
+  assert.match(item('m-6').textContent, /Cancelled/);
+  assert.equal(item('m-1').querySelector('[data-message-ambiguous-hint]'), null);
+  assert.match(item('m-2').querySelector('[data-message-ambiguous-hint]').textContent, /not delivered.*exactly one wait/);
+  click(item('m-2').querySelector('[data-message-address]'));
+  assert.equal(win.querySelector('[data-message-field="name"]').value, 'order_paid');
+  assert.equal(win.querySelector('[data-message-field="key"]').value, 'PO-7');
+  assert.equal(win.querySelector('[data-message-field="exact"]').checked, false, 'the author picks which wait');
+});
+
+test('a finished run takes no more messages', async () => {
+  const win = simulationWindow(baseView({ instance: { status: 'Completed' }, messages: [message({ status: 'Ambiguous' })] }), MODEL);
+  await flush(2);
+  assert.ok(win.querySelector('[data-message-finished]'));
+  assert.equal(win.querySelector('[data-simulation-message-send]').hasAttribute('disabled'), true);
+  assert.equal(win.querySelector('[data-message-field="name"]').hasAttribute('disabled'), true);
+  assert.equal(win.querySelector('[data-message-field="payload"]').hasAttribute('readonly'), true);
+  assert.equal(win.querySelector('[data-message-address]').hasAttribute('disabled'), true);
+  win.querySelector('[data-message-field="name"]').value = 'order_paid';
+  win.querySelector('[data-message-field="key"]').value = 'PO-7';
+  win.querySelector('[data-simulation-message-send]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await flush(2);
+  assert.equal(calls.length, 0, 'a complete form still sends nothing into a finished run');
+  const open = simulationWindow(baseView({ instance: { status: 'Waiting' } }), MODEL);
+  assert.equal(open.querySelector('[data-message-finished]'), null);
+  assert.equal(open.querySelector('[data-simulation-message-send]').hasAttribute('disabled'), false);
+});
+
+test('message refusals, new trace events, incident codes and timer attachments are told in words, unknown kinds by name', async () => {
+  const model = serviceModel([['Svc_1', 'Await payment', serviceTask()]]);
+  const refusals = {
+    SIMULATION_MESSAGE_INVALID: 'message TTL must be 1..604800 seconds',
+    SIMULATION_MESSAGE_SUBSCRIPTION_UNKNOWN: 'no open message wait of this run has that id, name and correlation key',
+    SIMULATION_MESSAGE_TARGET_UNSUPPORTED: 'a simulation runs one process, so a message must address a catch of this same definition (Svc_1)',
+    SIMULATION_EVENT_DELIVERY_UNSUPPORTED: 'MessageStart is not simulated: a message start would create another instance (Svc_1)',
+  };
+  for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+    await I18n.setLanguage(language);
+    const lines = Object.entries(refusals).map(([code, detail]) => simulationErrorText(`protocol error ProcessBody: ${code}: ${detail}`, model));
+    assert.equal(new Set(lines).size, 4, language);
+    assert.ok(lines.every((line) => !line.includes('SIMULATION_') && !line.includes('bpmn.')), `${language}: ${lines.join(' | ')}`);
+    assert.ok(lines[2].includes('Await payment') && lines[3].includes('Await payment'), language);
+    assert.notEqual(simulationErrorText('target instance is closed', model), 'target instance is closed', language);
+  }
+  await I18n.setLanguage('en');
+  assert.equal(simulationErrorText('target instance is closed', model), I18n.t('bpmn.simulation_error_target_closed'));
+
+  const kinds = ['simulation_message_sent', 'message_queued', 'message_delivered', 'message_ambiguous', 'message_expired', 'signal_received', 'event_race_won', 'event_race_lost',
+    'receive_task_opened', 'timer_fired', 'subscription_cancelled', 'brand_new_kind'];
+  const view = baseView({ instance: { status: 'Incident' }, events: kinds.map((kind) => event(kind, 'Plain')),
+    incidents: [{ incidentId: 'i', nodeId: 'Plain', nodeName: '', jobId: null, code: 'MESSAGE_MAPPING_ERROR', message: 'x', atMs: 1, canRetry: false, scopeId: 's' }],
+    timers: [{ timerId: 't', nodeId: 'Expr', nodeName: '', kind: 'Boundary', status: 'Pending', dueAtMs: T0, timezone: 'UTC', occurrence: 0, attachedToId: 'Plain' }] });
+  const english = simulationWindow(view, MODEL);
+  await flush(2);
+  const lines = [...english.querySelectorAll('.fb-simulation-events li')].map((row) => row.textContent.replace(/\s+/g, ' ').trim().replace(/^\d+:\d+:\d+( [AP]M)? /, ''));
+  assert.deepEqual(lines.map((line) => line.replace(/ · Plain step$/, '')), ['Message sent', 'Message queued', 'Message delivered', 'Message is ambiguous', 'Message expired', 'Signal received',
+    'Event race won', 'Event race lost', 'Receive task opened', 'Timer fired', 'Wait cancelled', 'brand_new_kind']);
+  assert.match(english.querySelector('[data-simulation-incident]').getAttribute('message'), /output mapping needs a value the message did not carry/);
+  assert.match(english.querySelector('.fb-simulation-timer').textContent, /Boundary · attached to Plain step/);
+  await I18n.setLanguage('pl');
+  const polish = simulationWindow(view, MODEL);
+  await flush(2);
+  assert.doesNotMatch(polish.querySelector('.fb-simulation-events').textContent, /message_queued|event_race_won|signal_received/);
+  assert.match(polish.querySelector('.fb-simulation-events').textContent, /Wyścig zdarzeń wygrany/);
+  assert.doesNotMatch(polish.textContent, /węzeł/);
+});
+
+test('the start window names the steps whose events a simulation cannot run', async () => {
+  const model = serviceModel([
+    ['Msg_start', 'Order arrives', { MessageStart: { messageRef: 'm', outputMapping: {} } }],
+    ['Catch_io', 'Wait with data', { MessageCatch: { messageRef: 'm', correlationExpression: '', outputMapping: {} } }, { activityIo: { dataOutputs: [{ id: 'o' }] } }],
+    ['Catch_ok', 'Plain wait', { MessageCatch: { messageRef: 'm', correlationExpression: '', outputMapping: {} } }],
+  ]);
+  const form = await startWindow(model);
+  const notes = [...form.querySelectorAll('[data-fixture-unsupported]')];
+  assert.deepEqual(notes.map((note) => note.dataset.fixtureUnsupported), ['Msg_start', 'Catch_io']);
+  assert.match(notes[0].textContent, /Order arrives/);
+  assert.match(notes[0].textContent, /message start would create another run/);
+  assert.match(notes[1].textContent, /data inputs or outputs/);
+  assert.match(form.querySelector('.fb-simulation-fixtures h3').textContent, /Steps that are not simulated/);
+  assert.equal(form.querySelectorAll('[data-fixture-step]').length, 0);
+});
+
+test('what was typed into the message form survives a redraw caused by something else', async () => {
+  responder = () => ({ view: baseView({ instance: { status: 'Waiting' }, clock: { nowMs: 2, horizonMs: 100, stepIndex: 2 } }) });
+  const win = simulationWindow(baseView({ instance: { status: 'Waiting' } }), MODEL);
+  await flush(2);
+  change(win.querySelector('[data-message-field="name"]'), 'typed_name');
+  change(win.querySelector('[data-message-field="key"]'), 'typed_key');
+  win.querySelector('[data-message-field="payload"]').value = '{"typed": 1}';
+  change(win.querySelector('[data-message-field="ttl"]'), '77');
+  click(win.querySelector('[data-simulation-advance]'));
+  await flush(5);
+  assert.equal(calls[0].kind, 'processSimulationAdvanceRequest');
+  assert.equal(win.querySelector('[data-message-field="name"]').value, 'typed_name');
+  assert.equal(win.querySelector('[data-message-field="key"]').value, 'typed_key');
+  assert.equal(win.querySelector('[data-message-field="payload"]').value, '{"typed": 1}');
+  assert.equal(win.querySelector('[data-message-field="ttl"]').value, '77');
 });
