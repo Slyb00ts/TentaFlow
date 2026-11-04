@@ -622,6 +622,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   agenta i zadania usługi z wejściem/wyjściem działania są w symulacji
   odrzucane z nazwą kroku. Wiadomości, sygnały, podprocesy, wywołania i
   powtórzenia nadal poza symulacją (B3.7b/c).
+- Symulacja zdarzeń (B3.7b). Symulacja obsługuje timery brzegowe
+  (przerywające i nieprzerywające), wiadomości (catch, throw, zadania wysyłania
+  i odbioru, zdarzenia brzegowe), sygnały rzucane przez sam model oraz wyścigi
+  bramki zdarzeń, wszystko na prywatnej bazie i wirtualnym zegarze. Operator
+  wysyła wiadomość z kluczem korelacji z listy oczekujących kroków (albo
+  wpisuje nazwę), a niejednoznaczną wiadomość adresuje dokładnie jednym
+  oczekiwaniem. „Przesuń czas wirtualny” skacze do najbliższego terminu
+  (timer, wiadomość, wygaśnięcie), nie dalej niż horyzont (kod
+  `SIMULATION_HORIZON_REACHED`). Sygnału nie da się wysłać z zewnątrz do
+  symulacji, a start wiadomością jest odrzucany. Przy okazji naprawiono błąd
+  produkcyjny: nieprzerywający timer brzegowy, na którego ścieżce jest rzucenie
+  sygnału, nigdy się nie odpalał.
 
 ### TentaNas
 
