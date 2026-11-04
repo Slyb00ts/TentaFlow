@@ -975,6 +975,44 @@ function processModel(model, bodyType = 'primary') {
   };
 }
 
+const ACTIVITY_OUTCOMES = ['Completed', 'Error', 'NeedsHuman', 'Cancelled'];
+const SIMULATION_VERDICTS = ['Approved', 'Rejected', 'Unavailable'];
+const SIMULATION_SERVICE_MODES = ['Result', 'Fixture', 'RealExecution'];
+
+function processSimulationVerdict(verdict) {
+  if (!SIMULATION_VERDICTS.includes(verdict)) throw new TypeError('unsupported simulation verdict');
+  return verdict;
+}
+
+// The result of a Service step as an operator or a fixture states it; the
+// outputs keep their own keys.
+function processActivityResult(result) {
+  processKnownFields(result, ['outcome', 'code', 'summary', 'outputs', 'evidence'], 'activity result');
+  if (!ACTIVITY_OUTCOMES.includes(result.outcome)) throw new TypeError('unsupported activity outcome');
+  if (result.code != null && typeof result.code !== 'string') throw new TypeError('activity result code must be text');
+  if (typeof result.summary !== 'string') throw new TypeError('activity result summary must be text');
+  if (result.outputs == null || typeof result.outputs !== 'object') throw new TypeError('activity result outputs must be a value');
+  if (!Array.isArray(result.evidence) || result.evidence.some((entry) => typeof entry !== 'string')) {
+    throw new TypeError('activity result evidence must be a list of text');
+  }
+  return { outcome: result.outcome, code: result.code ?? null, summary: result.summary,
+    outputs: result.outputs, evidence: result.evidence };
+}
+
+function processServiceFixture(fixture) {
+  processKnownFields(fixture, ['nodeId', 'mode', 'result', 'verdict', 'confirmSideEffects'], 'service fixture');
+  if (typeof fixture.nodeId !== 'string' || !SIMULATION_SERVICE_MODES.includes(fixture.mode)) {
+    throw new TypeError('invalid service fixture');
+  }
+  return {
+    node_id: fixture.nodeId,
+    mode: fixture.mode,
+    ...(fixture.result == null ? {} : { result: processActivityResult(fixture.result) }),
+    ...(fixture.verdict == null ? {} : { verdict: processSimulationVerdict(fixture.verdict) }),
+    confirm_side_effects: fixture.confirmSideEffects === true,
+  };
+}
+
 function processRequestBody(variant, payload) {
   const fields = {};
   const fieldNames = {
@@ -1000,10 +1038,11 @@ function processRequestBody(variant, payload) {
     MessageCancelRequest: ['commandId', 'messageId', 'expectedRevision'],
     ScopeGetRequest: ['instanceId', 'scopeId'],
     SimulationStartRequest: ['definitionId', 'version', 'selectedProcessId', 'startNodeId', 'variables',
-      'startMs', 'horizonMs', 'tickDurationMs'],
+      'startMs', 'horizonMs', 'tickDurationMs', 'serviceFixtures'],
     SimulationViewRequest: ['simulationId'],
     SimulationAdvanceRequest: ['simulationId'],
-    SimulationUserTaskCompleteRequest: ['simulationId', 'userTaskId', 'outputs'],
+    SimulationUserTaskCompleteRequest: ['simulationId', 'userTaskId', 'outputs', 'approved'],
+    SimulationServiceResolveRequest: ['simulationId', 'nodeId', 'result', 'verdict', 'jobId'],
     SimulationManualTaskAcknowledgeRequest: ['simulationId', 'userTaskId'],
     SimulationReleaseRequest: ['simulationId'],
   }[variant];
@@ -1014,11 +1053,23 @@ function processRequestBody(variant, payload) {
     if (value === undefined && !['definitionId', 'version', 'approved', 'repinCalendar'].includes(name)
       && !(variant === 'InstanceStartRequest' && ['processId', 'startNodeId'].includes(name))
       && !(variant === 'InstanceGetRequest' && name === 'pages')
+      && !(variant === 'SimulationStartRequest' && name === 'serviceFixtures')
+      && !(variant === 'SimulationServiceResolveRequest' && ['verdict', 'jobId'].includes(name))
       && !(variant === 'MessageListRequest' && name === 'instanceId')) {
       throw new TypeError(`process request ${variant} requires ${name}`);
     }
     if (variant === 'InstanceStartRequest' && ['processId', 'startNodeId'].includes(name)
       && value == null) continue;
+    // A prepared answer travels only when there is one; an absent list is the empty one.
+    if (name === 'serviceFixtures') {
+      fields[key] = (value ?? []).map(processServiceFixture);
+      continue;
+    }
+    if (variant === 'SimulationServiceResolveRequest' && name === 'result') {
+      fields[key] = processActivityResult(value);
+      continue;
+    }
+    if (name === 'verdict' && value != null) processSimulationVerdict(value);
     fields[key] = name === 'model' ? processModel(value)
       : (name === 'pages' ? processInstancePages(value)
         : (name === 'target' ? processMessageTarget(value)
@@ -1122,6 +1173,9 @@ export const encode = {
   },
   processSimulationUserTaskCompleteRequest(correlationId, payload, sequence = 1) {
     return processFrame(correlationId, sequence, 'SimulationUserTaskCompleteRequest', payload);
+  },
+  processSimulationServiceResolveRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'SimulationServiceResolveRequest', payload);
   },
   processSimulationManualTaskAcknowledgeRequest(correlationId, payload, sequence = 1) {
     return processFrame(correlationId, sequence, 'SimulationManualTaskAcknowledgeRequest', payload);

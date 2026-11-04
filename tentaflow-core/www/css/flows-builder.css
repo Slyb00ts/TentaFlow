@@ -1662,6 +1662,12 @@ body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transf
 .fb-process-facts dt { color: var(--tf-text-3); }
 .fb-process-facts dd { margin: 0; overflow-wrap: anywhere; }
 .fb-process-json tf-code-editor { display: block; height: 200px; max-width: 100%; border: 1px solid var(--tf-border); border-radius: var(--tf-radius); }
+.fb-simulation-wait, .fb-simulation-fixture, .fb-simulation-answer { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.fb-simulation-wait, .fb-simulation-fixture { border: 1px solid var(--tf-border); border-radius: var(--tf-radius); padding: 12px; margin-block: 8px; }
+.fb-simulation-wait .fb-process-json h4, .fb-simulation-answer .fb-process-json h4 { margin: 0 0 6px; }
+.fb-simulation-wait tf-code-editor[readonly] { height: 140px; }
+.fb-simulation-fixtures h3 { margin-block: 12px 4px; }
+.fb-simulation-fixtures p { color: var(--tf-text-2); margin: 0 0 8px; line-height: 1.5; }
 .fb-process-activity-inputs { min-width: 0; width: 100%; }
 .fb-process-activity-inputs h3 { margin-block: 0 4px; }
 .fb-process-activity-inputs-hint { color: var(--tf-text-2); margin: 0 0 10px; line-height: 1.5; }

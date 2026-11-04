@@ -916,6 +916,11 @@ export function processVerificationSentence(result) {
   return I18n.t(`bpmn.verification_origin_rejected_${['test', 'critic'].includes(origin.mode) ? origin.mode : 'condition'}`, { reason: origin.reason });
 }
 
+// The codes (lower-cased) of the refusals a simulated Service step gives; each
+// has a sentence under `bpmn.simulation_error_<code>`.
+const SIMULATION_REFUSALS = ['real_execution_unsupported', 'side_effects_not_confirmed', 'fixture_invalid',
+  'service_not_waiting', 'service_ambiguous', 'verdict_required', 'answer_invalid', 'outcome_not_producible'];
+
 /**
  * Server and codec messages cite elements by internal id; the author knows them
  * by name. An id of `model` found in `message` becomes the element's name (or
@@ -944,6 +949,13 @@ export function processExplainError(message, model, options = null) {
     const zone = [model, ...(model?.additionalProcesses || [])].map((body) => body?.timerTimezone).find(Boolean);
     return zone ? I18n.t('bpmn.timer_timezone_invalid', { zone }) : I18n.t('bpmn.timer_timezone_server');
   }
+  const refusal = /\bSIMULATION_([A-Z_]+):\s*([^]*)$/.exec(text);
+  if (refusal && SIMULATION_REFUSALS.includes(refusal[1].toLowerCase())) {
+    // The refusal cites the step by id; the first id the model knows is the step it is about.
+    const cited = refusal[2].split(/[^\w.-]+/).find((token) => names.has(token));
+    return I18n.t(`bpmn.simulation_error_${refusal[1].toLowerCase()}`,
+      { node: cited ? names.get(cited) : I18n.t('bpmn.simulation_this_step') });
+  }
   const unused = /unreferenced (message|error|escalation|signal) declaration/.exec(text);
   if (unused) {
     const named = processUnusedDeclarations(model).filter((declaration) => declaration.kind === unused[1]);
@@ -963,6 +975,10 @@ export function processExplainError(message, model, options = null) {
   }
   const unsimulated = /repetition is unsupported in simulation \(([\w.-]+)\)/.exec(text);
   if (unsimulated && names.has(unsimulated[1])) return I18n.t('bpmn.simulation_repeat_unsupported', { names: names.get(unsimulated[1]) });
+  const serviceIo = /a Service task with activity IO is unsupported in simulation \(([\w.-]+)\)/.exec(text);
+  if (serviceIo && names.has(serviceIo[1])) return I18n.t('bpmn.simulation_error_activity_io', { node: names.get(serviceIo[1]) });
+  const agentStep = /agent steps need the report sink; not simulated yet \(([\w.-]+)\)/.exec(text);
+  if (agentStep && names.has(agentStep[1])) return I18n.t('bpmn.simulation_error_agent_step', { node: names.get(agentStep[1]) });
   const repeatedBoundary = /repeat ([\w.-]+) has an unsupported boundary event/.exec(text);
   if (repeatedBoundary && names.has(repeatedBoundary[1])) return I18n.t('bpmn.repeat_boundary_unsupported', { node: names.get(repeatedBoundary[1]) });
   const repeated = /repeat ([\w.-]+) has invalid output collection variable/.exec(text);

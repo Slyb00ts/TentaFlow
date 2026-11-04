@@ -1101,6 +1101,91 @@ test('simulation view response decodes its private clock, trace, and witnesses',
   assert.equal(decoded.view.traceStepsOmitted, 3);
 });
 
+test('simulation Service requests carry the operator answer, the verdict, the fixtures and the verification decision', { skip }, () => {
+  const result = { outcome: 'NeedsHuman', code: 'REVIEW', summary: 'check', outputs: { inner_key: { a_b: 1 } }, evidence: ['proof'] };
+  const resolve = request('processSimulationServiceResolveRequest', {
+    simulationId: 'simulation-1', nodeId: 'Service_1', result, verdict: 'Rejected', jobId: 'job-1',
+  });
+  assert.equal(resolve._variant, 'ProcessBody.SimulationServiceResolveRequest');
+  assert.equal(resolve.simulationId, 'simulation-1');
+  assert.equal(resolve.nodeId, 'Service_1');
+  assert.equal(resolve.jobId, 'job-1');
+  assert.equal(resolve.verdict, 'Rejected');
+  assert.equal(resolve.result.code, 'REVIEW');
+  assert.deepEqual(resolve.result.evidence, ['proof']);
+  assert.deepEqual(resolve.result.outputs, { inner_key: { a_b: 1 } }, 'the outputs keep their own keys');
+
+  const plain = request('processSimulationServiceResolveRequest', {
+    simulationId: 'simulation-1', nodeId: 'Service_1',
+    result: { outcome: 'Completed', code: null, summary: '', outputs: {}, evidence: [] },
+  });
+  assert.equal(plain.jobId ?? null, null);
+  assert.equal(plain.verdict ?? null, null);
+  assert.throws(() => codec.encode.processSimulationServiceResolveRequest(17, {
+    simulationId: 'simulation-1', nodeId: 'Service_1', result: { ...result, outcome: 'Skipped' },
+  }), /outcome/);
+  assert.throws(() => codec.encode.processSimulationServiceResolveRequest(17, {
+    simulationId: 'simulation-1', nodeId: 'Service_1', result, verdict: 'Maybe',
+  }), /verdict/);
+  assert.throws(() => codec.encode.processSimulationServiceResolveRequest(17, {
+    simulationId: 'simulation-1', result,
+  }), /requires nodeId/);
+
+  const start = request('processSimulationStartRequest', {
+    definitionId: 'definition-1', version: 3, selectedProcessId: 'Process_1', startNodeId: 'Start_1', variables: {},
+    startMs: 1000, horizonMs: 9000, tickDurationMs: 100,
+    serviceFixtures: [{ nodeId: 'Service_1', mode: 'Fixture', result, verdict: 'Approved' },
+      { nodeId: 'Service_2', mode: 'Result' }],
+  });
+  assert.equal(start.serviceFixtures.length, 2);
+  assert.equal(start.serviceFixtures[0].nodeId, 'Service_1');
+  assert.equal(start.serviceFixtures[0].result.outputs.inner_key.a_b, 1);
+  assert.equal(start.serviceFixtures[0].verdict, 'Approved');
+  assert.equal(start.serviceFixtures[1].confirmSideEffects, false);
+  const none = request('processSimulationStartRequest', {
+    definitionId: 'definition-1', version: 3, selectedProcessId: 'Process_1', startNodeId: 'Start_1', variables: {},
+    startMs: 1000, horizonMs: 9000, tickDurationMs: 100,
+  });
+  assert.deepEqual(none.serviceFixtures, []);
+  assert.throws(() => codec.encode.processSimulationStartRequest(17, {
+    definitionId: 'definition-1', version: 3, selectedProcessId: 'Process_1', startNodeId: 'Start_1', variables: {},
+    startMs: 1, horizonMs: 2, tickDurationMs: 1, serviceFixtures: [{ nodeId: 'Service_1', mode: 'Warp' }],
+  }), /service fixture/);
+
+  for (const approved of [true, false]) {
+    const decided = request('processSimulationUserTaskCompleteRequest', {
+      simulationId: 'simulation-1', userTaskId: 'task-1', outputs: {}, approved,
+    });
+    assert.equal(decided.approved, approved);
+  }
+  const work = request('processSimulationUserTaskCompleteRequest', {
+    simulationId: 'simulation-1', userTaskId: 'task-1', outputs: {},
+  });
+  assert.equal(work.approved ?? null, null);
+});
+
+test('simulation view decodes the Service steps that wait for a result', { skip }, () => {
+  const view = {
+    simulation_id: 'simulation-1',
+    source: { simulation_id: 'simulation-1', definition_id: 'definition-1', version: 3,
+      model_sha256: 'a'.repeat(64), selected_process_id: 'Process_1', start_node_id: 'Start_1' },
+    clock: { start_ms: 10, now_ms: 20, horizon_ms: 90, tick_duration_ms: 10, step_index: 1, revision: 2 },
+    instance: null, user_tasks: [], timers: [], incidents: [], events: [], trace_steps: [], activity_io_witnesses: [],
+    service_waits: [{ job_id: 'job-1', node_id: 'Service_1', scope_id: 'scope-1', token_id: 'token-1',
+      input: { seed_key: { inner_value: 2 } }, mode: 'Fixture', verdict_applicable: true }],
+  };
+  const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    SimulationServiceResolveResponse: { view },
+  } })));
+  assert.equal(decoded._variant, 'ProcessBody.SimulationServiceResolveResponse');
+  const [waiting] = decoded.view.serviceWaits;
+  assert.equal(waiting.jobId, 'job-1');
+  assert.equal(waiting.nodeId, 'Service_1');
+  assert.equal(waiting.verdictApplicable, true);
+  assert.deepEqual(waiting.input, { seed_key: { inner_value: 2 } });
+  assert.equal(waiting.mode, 'Fixture');
+});
+
 test('process options decode the block and tool catalogues and tolerate a server that omits them', { skip }, () => {
   const decode = (response) => wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: { OptionsResponse: response } })));
   const full = decode({

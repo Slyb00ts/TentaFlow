@@ -4,7 +4,9 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { escapeAttr, escapeHtml } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
-import { processElementNames, processExplainError, processRepeatedElements, processStartEntryLabels } from './bpmn.js';
+import { processDistinctLabels, processElementNames, processExplainError, processRepeatedElements, processStartEntryLabels } from './bpmn.js';
+import { answerFormHtml, fillAnswerForm, readAnswerDraft, showAnswerErrors } from './simulation-answer-form.js';
+import { blankServiceDraft, readServiceAnswer, readServiceFixtures, simulationServiceSteps, simulationWaitSteps } from './simulation-service.js';
 import '/js/components/tf-alert.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-code-editor.js';
@@ -61,6 +63,9 @@ export function simulationWindow(view, model = null) {
   // model that was started.
   const elementNames = model ? processElementNames(model) : new Map();
   const elementName = (nodeId, name) => String(name || '').trim() || elementNames.get(nodeId) || text('element_unavailable');
+  // What the author typed into a result form survives the next re-render, which
+  // rebuilds every control.
+  const drafts = new Map();
 
   const setError = (error) => {
     const alert = win.querySelector('[data-error]');
@@ -87,6 +92,13 @@ export function simulationWindow(view, model = null) {
 
   const render = () => {
     if (!win.isConnected) return;
+    content.querySelectorAll('[data-simulation-wait]').forEach((article) => {
+      drafts.set(article.dataset.simulationWait, readAnswerDraft(article));
+    });
+    const waits = simulationWaitSteps(current.serviceWaits, model);
+    for (const jobId of [...drafts.keys()]) {
+      if (!waits.some(({ wait }) => wait.jobId === jobId)) drafts.delete(jobId);
+    }
     const clock = current.clock;
     const instanceStatus = current.instance?.status || text('status_running');
     const tasks = current.userTasks || [];
@@ -102,13 +114,33 @@ export function simulationWindow(view, model = null) {
         <div><span>${escapeHtml(text('status'))}: ${escapeHtml(instanceStatus)}</span>
           <tf-button variant="secondary" size="sm" icon="plus" data-simulation-advance ${busy ? 'disabled' : ''}>${escapeHtml(text('simulation_advance'))}</tf-button></div>
       </div>
+      ${waits.length ? `<section class="fb-simulation-section" data-simulation-waits><h3>${escapeHtml(text('simulation_waits', { count: waits.length }))}</h3>
+        ${waits.map(({ wait, step }) => `<article class="fb-simulation-wait" data-simulation-wait="${escapeAttr(wait.jobId)}" data-node-id="${escapeAttr(wait.nodeId)}">
+          <div><strong>${escapeHtml(elementName(wait.nodeId))}</strong>
+            <tf-chip status="info">${escapeHtml(text(wait.mode === 'Fixture' ? 'simulation_wait_fixture' : 'simulation_wait_result'))}</tf-chip></div>
+          <section class="fb-process-json"><h4>${escapeHtml(text('simulation_wait_input'))}</h4>
+            <tf-code-editor readonly data-simulation-wait-input language="json" aria-label="${escapeAttr(text('simulation_wait_input'))}"></tf-code-editor></section>
+          ${answerFormHtml(step, drafts.get(wait.jobId) ?? blankServiceDraft())}
+          <tf-button variant="primary" size="sm" data-simulation-resolve="${escapeAttr(wait.jobId)}" ${busy ? 'disabled' : ''}>${escapeHtml(text('simulation_resolve'))}</tf-button>
+        </article>`).join('')}
+      </section>` : ''}
       <section class="fb-simulation-section"><h3>${escapeHtml(text('simulation_tasks'))}</h3>
         ${tasks.length ? tasks.map((task) => {
           const manual = task.kind === 'Manual';
+          const verification = task.kind === 'Verification';
+          const id = escapeAttr(task.userTaskId);
+          // A verification task has one question, and its answer is the decision.
+          const controls = manual
+            ? `<tf-button variant="secondary" size="sm" data-simulation-task="${id}" data-simulation-manual="true" ${busy ? 'disabled' : ''}>${escapeHtml(text('simulation_acknowledge_task'))}</tf-button>`
+            : verification
+              ? `<p>${escapeHtml(text('simulation_verification_hint'))}</p>
+                <tf-button variant="primary" size="sm" data-simulation-decide="true" data-simulation-task="${id}" data-simulation-manual="false" ${busy ? 'disabled' : ''}>${escapeHtml(text('simulation_approve_task'))}</tf-button>
+                <tf-button variant="danger" size="sm" data-simulation-decide="false" data-simulation-task="${id}" data-simulation-manual="false" ${busy ? 'disabled' : ''}>${escapeHtml(text('simulation_reject_task'))}</tf-button>`
+              : `<tf-code-editor data-simulation-output="${id}" language="json" aria-label="${escapeAttr(text('simulation_outputs'))}"></tf-code-editor>
+                <tf-button variant="primary" size="sm" data-simulation-task="${id}" data-simulation-manual="false" ${busy ? 'disabled' : ''}>${escapeHtml(text('simulation_complete_task'))}</tf-button>`;
           return `<article class="fb-simulation-task"><div><strong>${escapeHtml(elementName(task.nodeId, task.name))}</strong> · ${escapeHtml(task.kind || '')}</div>
             <div>${escapeHtml(task.instructions || '')}</div>
-            ${manual ? '' : `<tf-code-editor data-simulation-output="${escapeAttr(task.userTaskId)}" language="json" aria-label="${escapeAttr(text('simulation_outputs'))}"></tf-code-editor>`}
-            <tf-button variant="${manual ? 'secondary' : 'primary'}" size="sm" data-simulation-task="${escapeAttr(task.userTaskId)}" data-simulation-manual="${manual ? 'true' : 'false'}" ${busy ? 'disabled' : ''}>${escapeHtml(text(manual ? 'simulation_acknowledge_task' : 'simulation_complete_task'))}</tf-button>
+            ${controls}
           </article>`;
         }).join('') : `<p>${escapeHtml(text('simulation_empty_tasks'))}</p>`}
       </section>
@@ -132,6 +164,11 @@ export function simulationWindow(view, model = null) {
     content.querySelectorAll('tf-code-editor[data-simulation-output]').forEach((editor) => {
       editor.value = '{}';
     });
+    content.querySelectorAll('[data-simulation-wait]').forEach((article) => {
+      const wait = waits.find((entry) => entry.wait.jobId === article.dataset.simulationWait).wait;
+      article.querySelector('[data-simulation-wait-input]').value = JSON.stringify(wait.input ?? null, null, 2);
+      fillAnswerForm(article, drafts.get(wait.jobId) ?? blankServiceDraft());
+    });
   };
 
   content.addEventListener('click', (event) => {
@@ -140,10 +177,30 @@ export function simulationWindow(view, model = null) {
       run(async () => (await ApiBinary.one('processSimulationAdvanceRequest', { simulationId: current.simulationId })).view);
       return;
     }
+    const resolve = event.target.closest('[data-simulation-resolve]');
+    if (resolve) {
+      const article = resolve.closest('[data-simulation-wait]');
+      const wait = (current.serviceWaits || []).find((entry) => entry.jobId === resolve.dataset.simulationResolve);
+      if (!wait || busy) return;
+      const [{ step }] = simulationWaitSteps([wait], model);
+      const answer = readServiceAnswer(step, readAnswerDraft(article));
+      showAnswerErrors(article, answer.errors);
+      if (answer.errors) return;
+      const simulationId = current.simulationId;
+      run(async () => (await ApiBinary.one('processSimulationServiceResolveRequest', {
+        simulationId, nodeId: wait.nodeId, jobId: wait.jobId, result: answer.result, verdict: answer.verdict,
+      })).view);
+      return;
+    }
     const taskButton = event.target.closest('[data-simulation-task]');
     if (!taskButton) return;
     const simulationId = current.simulationId;
     const userTaskId = taskButton.dataset.simulationTask;
+    if (taskButton.dataset.simulationDecide) {
+      const approved = taskButton.dataset.simulationDecide === 'true';
+      run(async () => (await ApiBinary.one('processSimulationUserTaskCompleteRequest', { simulationId, userTaskId, outputs: {}, approved })).view);
+      return;
+    }
     if (taskButton.dataset.simulationManual === 'true') {
       run(async () => (await ApiBinary.one('processSimulationManualTaskAcknowledgeRequest', { simulationId, userTaskId })).view);
       return;
@@ -171,6 +228,43 @@ export function simulationWindow(view, model = null) {
   return win;
 }
 
+// One row per Service step the simulation can run: the operator answers when
+// the step is reached, or a prepared result applies by itself. Running the
+// step for real is listed but cannot be chosen, because the engine refuses it.
+function fixturesSection(model) {
+  const steps = simulationServiceSteps(model);
+  if (!steps.length) return null;
+  const names = processElementNames(model);
+  const labels = processDistinctLabels(steps.map((step) => [step.nodeId, names.get(step.nodeId)]));
+  const section = document.createElement('section');
+  section.className = 'fb-simulation-fixtures';
+  section.innerHTML = `<h3>${escapeHtml(text('simulation_fixtures'))}</h3><p>${escapeHtml(text('simulation_fixtures_hint'))}</p>
+    ${steps.map((step) => `<article class="fb-simulation-fixture" data-fixture-step="${escapeAttr(step.nodeId)}">
+      <strong>${escapeHtml(labels.get(step.nodeId))}</strong>
+      <tf-select data-fixture-mode wrap-selected label="${escapeAttr(text('simulation_fixture_mode'))}" hint="${escapeAttr(text('simulation_mode_real_unavailable'))}" value="Result">
+        <option value="Result">${escapeHtml(text('simulation_mode_result'))}</option>
+        <option value="Fixture">${escapeHtml(text('simulation_mode_fixture'))}</option>
+        <option value="RealExecution" disabled>${escapeHtml(text('simulation_mode_real'))}</option>
+      </tf-select>
+      <div data-fixture-form hidden>${answerFormHtml(step, blankServiceDraft())}</div>
+    </article>`).join('')}`;
+  section.querySelectorAll('[data-fixture-step]').forEach((article) => fillAnswerForm(article, blankServiceDraft()));
+  section.addEventListener('change', (event) => {
+    const mode = event.target.closest('[data-fixture-mode]');
+    if (mode) mode.closest('[data-fixture-step]').querySelector('[data-fixture-form]').hidden = mode.value !== 'Fixture';
+  });
+  // The fixtures to send, or the first problems marked inside the forms.
+  section.readFixtures = () => {
+    const articles = [...section.querySelectorAll('[data-fixture-step]')];
+    const choices = new Map(articles.map((article) => [article.dataset.fixtureStep,
+      { mode: article.querySelector('[data-fixture-mode]').value, draft: readAnswerDraft(article) }]));
+    const read = readServiceFixtures(steps, choices);
+    articles.forEach((article) => showAnswerErrors(article, read.errors.get(article.dataset.fixtureStep) ?? {}));
+    return read;
+  };
+  return section;
+}
+
 export function openProcessSimulation(definition, version, startCatalog, selectedStart, anchor = null) {
   const manualStarts = startCatalog.filter((entry) => entry.trigger?.Start?.canStart);
   const selection = document.createElement('section');
@@ -178,6 +272,7 @@ export function openProcessSimulation(definition, version, startCatalog, selecte
   const startLabels = processStartEntryLabels(manualStarts, definition.model);
   selection.innerHTML = `<tf-select data-simulation-start wrap-selected label="${escapeAttr(text('start_entry'))}"><option value="">${escapeHtml(text('start_entry'))}</option>${manualStarts.map((entry, index) => `<option value="${index}">${escapeHtml(startLabels.get(index))}</option>`).join('')}</tf-select>`;
   const variables = jsonSection(text('simulation_variables'), definition.model.variables || {});
+  const fixtures = fixturesSection(definition.model);
   const selectedIndex = manualStarts.findIndex((entry) => entry.processId === selectedStart?.processId
     && entry.startNodeId === selectedStart?.startNodeId);
   selection.querySelector('[data-simulation-start]').value = selectedIndex < 0 ? '' : String(selectedIndex);
@@ -187,7 +282,8 @@ export function openProcessSimulation(definition, version, startCatalog, selecte
   return openFormWindow({
     title: text('simulation'), icon: 'play', subject: definition.name,
     note: repeated.length ? { tone: 'warning', text: text('simulation_repeat_unsupported', { names: repeated.join(', ') }) } : { text: text('simulation_hint') },
-    sections: [selection, variables],
+    sections: [selection, variables, ...(fixtures ? [fixtures] : [])],
+    width: 720,
     submitLabel: text('simulation_start'), anchor,
     errorMessage: (error) => processExplainError(error?.message, definition.model),
     validate: () => {
@@ -195,10 +291,10 @@ export function openProcessSimulation(definition, version, startCatalog, selecte
       if (selected !== '') {
         try {
           variables.readValue();
-          return true;
         } catch (_) {
           return false;
         }
+        return !fixtures || fixtures.readFixtures().errors.size === 0;
       }
       selection.querySelector('[data-simulation-start]').setAttribute('error', text('start_entry_changed'));
       return false;
@@ -207,9 +303,9 @@ export function openProcessSimulation(definition, version, startCatalog, selecte
     collect: () => {
       const entry = manualStarts[Number(selection.querySelector('[data-simulation-start]').value)];
       if (!entry) throw new Error(text('start_entry_changed'));
-      return { entry, variables: variables.readValue() };
+      return { entry, variables: variables.readValue(), serviceFixtures: fixtures ? fixtures.readFixtures().fixtures : [] };
     },
-    onSubmit: async ({ entry, variables: initialVariables }) => {
+    onSubmit: async ({ entry, variables: initialVariables, serviceFixtures }) => {
       const startMs = Date.now();
       const response = await ApiBinary.one('processSimulationStartRequest', {
         definitionId: definition.definitionId,
@@ -220,6 +316,7 @@ export function openProcessSimulation(definition, version, startCatalog, selecte
         startMs,
         horizonMs: startMs + 60 * 60 * 1000,
         tickDurationMs: 1000,
+        serviceFixtures,
       });
       simulationWindow(response.view, definition.model);
       return { message: text('simulation_started') };
