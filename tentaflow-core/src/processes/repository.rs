@@ -4057,43 +4057,98 @@ fn simulation_call_closure_on(
     {
         return Ok(simulation::SimulationCallClosure::default());
     }
-    let unavailable = |detail: String| {
-        simulation::SimulationServiceError::new(simulation::SIMULATION_CALL_PIN_UNAVAILABLE, detail)
-    };
-    let pinned = pinned_call_versions_on(conn, actor, &version.definition_id, version.version, &version.model)
-        .map_err(|error| unavailable(format!("{error:#}")))?;
+    // The refusal says what failed in fixed words: a raw cause (a missing row, a
+    // definition that is not found) would be routed by its text, and it can name
+    // definitions the caller may not read.
+    let collected = collect_simulation_call_closure(conn, actor, version).map_err(|error| {
+        tracing::debug!("simulation call closure refused: {error:#}");
+        simulation::SimulationServiceError::new(
+            simulation::SIMULATION_CALL_PIN_UNAVAILABLE,
+            "a called process version cannot be pinned into the simulation: it is not published, production would not admit the call, or its dependencies are inconsistent",
+        )
+    })?;
+    Ok(collected)
+}
+
+fn called_version_row_on(
+    conn: &Connection,
+    definition_id: &str,
+    version: u32,
+    name: String,
+    published_at_ms: i64,
+    model_sha256: String,
+) -> Result<simulation::SimulationCalledVersion> {
+    let model_json: String = conn.query_row(
+        "SELECT model_json FROM bpmn_versions WHERE definition_id=?1 AND version=?2",
+        params![definition_id, version],
+        |row| row.get(0),
+    )?;
+    let (pins, dependencies) = call_pin_rows_on(conn, definition_id, version)?;
+    Ok(simulation::SimulationCalledVersion {
+        definition_id: definition_id.to_owned(),
+        version,
+        name,
+        model_json,
+        model_sha256,
+        published_at_ms,
+        pins,
+        dependencies,
+    })
+}
+
+/// The versions the simulated version enters through its calls, plus every version
+/// those versions depend on: production records the dependencies of a document
+/// (all of its processes), and the private copy must satisfy the same pin checks.
+fn collect_simulation_call_closure(
+    conn: &Connection,
+    actor: &ProcessActor,
+    version: &ProcessVersion,
+) -> Result<simulation::SimulationCallClosure> {
+    let pinned = pinned_call_versions_on(conn, actor, &version.definition_id, version.version, &version.model)?;
     let mut versions = Vec::with_capacity(pinned.len());
-    let mut bytes = 0_usize;
     for target in pinned {
         if let Some(reason) = target.admission_error {
-            return Err(unavailable(format!(
+            bail!(
                 "production would refuse the call to version {} of {}: {reason}",
                 target.version.version, target.version.definition_id
-            )));
+            );
         }
-        let model_json: String = conn.query_row(
-            "SELECT model_json FROM bpmn_versions WHERE definition_id=?1 AND version=?2",
-            params![target.version.definition_id, target.version.version],
-            |row| row.get(0),
-        )?;
-        bytes = bytes.saturating_add(model_json.len());
-        ensure!(
-            bytes <= 4 * 1024 * 1024,
-            unavailable("the called versions exceed the 4 MiB closure limit".into())
-        );
-        let (pins, dependencies) =
-            call_pin_rows_on(conn, &target.version.definition_id, target.version.version)?;
-        versions.push(simulation::SimulationCalledVersion {
-            definition_id: target.version.definition_id.clone(),
-            version: target.version.version,
-            name: target.name,
-            model_json,
-            model_sha256: target.version.model_sha256.clone(),
-            published_at_ms: target.version.published_at_ms,
-            pins,
-            dependencies,
-        });
+        versions.push(called_version_row_on(
+            conn,
+            &target.version.definition_id,
+            target.version.version,
+            target.name,
+            target.version.published_at_ms,
+            target.version.model_sha256.clone(),
+        )?);
     }
+    let mut index = 0;
+    while index < versions.len() {
+        for dependency in versions[index].dependencies.clone() {
+            if versions.iter().any(|known| {
+                known.definition_id == dependency.called_definition_id
+                    && known.version == dependency.called_version
+            }) {
+                continue;
+            }
+            ensure!(versions.len() < 32, "process call dependencies exceed 32 distinct versions");
+            let target = version_on(conn, &dependency.called_definition_id, dependency.called_version)?;
+            ensure!(target.model_sha256 == dependency.model_sha256, "dependency hash mismatch");
+            versions.push(called_version_row_on(
+                conn,
+                &target.definition_id,
+                target.version,
+                definition_on(conn, &target.definition_id)?.name,
+                target.published_at_ms,
+                target.model_sha256.clone(),
+            )?);
+        }
+        index += 1;
+    }
+    let bytes = versions.iter().fold(0_usize, |total, known| {
+        total.saturating_add(known.model_json.len())
+    });
+    ensure!(bytes <= 4 * 1024 * 1024, "the called versions exceed the 4 MiB closure limit");
     versions.sort_by(|a, b| (&a.definition_id, a.version).cmp(&(&b.definition_id, b.version)));
     let (source_pins, source_dependencies) =
         call_pin_rows_on(conn, &version.definition_id, version.version)?;
@@ -6968,13 +7023,18 @@ pub(crate) fn simulation_timer_summaries_on(
 }
 
 /// Whether the connection is the private database of a simulation: the one
-/// place a process row is never a production fact.
+/// place a process row is never a production fact. It is the same test, in one
+/// query, as the proof `PrivateSimulationMode::verify_on` demands, so a database
+/// that merely has a table of that name is not taken for a private run. Row
+/// identities and the audit trail are decided here because the helpers that write
+/// them are reached from far more places than carry an `ExecutionMode`.
 fn is_private_simulation(conn: &Connection) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='simulation_meta')",
+    let tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('simulation_meta','simulation_clock','simulation_source_pins')",
         [],
         |row| row.get(0),
-    )?)
+    )?;
+    Ok(tables == 3)
 }
 
 /// The audit row of a process fact. A private simulation keeps no audit trail:
@@ -23234,6 +23294,18 @@ fn record_call_step(
         ensure!(plan.event_ids.insert(indices[0], event_id).is_none(),
             "Call admission incident event identity was already assigned");
     }
+    if matches!(mode, ExecutionMode::Simulation(_)) {
+        let (CallStep::Start { plan, .. }
+        | CallStep::Return { plan, .. }
+        | CallStep::Advance { plan, .. }) = &step;
+        let target = snapshots
+            .get(projection_instance_id)
+            .context("a call step plan has no instance in the run")?;
+        simulation::vet_call_step_plan(
+            plan,
+            super::model::selected_body(&target.model, &target.instance.process_id, &[])?.nodes,
+        )?;
+    }
     let index = steps.len();
     steps.push(step);
     if let Some((tx, root_instance_id, actor_id)) = execution {
@@ -23305,6 +23377,14 @@ fn prepare_call_steps(
                     && t.status == "waiting")
             {
                 continue;
+            }
+            // A private run holds few instances and takes a snapshot of every one after
+            // each call step, so the cap is enforced before a child is started, not
+            // after the whole transition has built them.
+            if matches!(mode, ExecutionMode::Simulation(_))
+                && snapshots.len() >= simulation::MAX_SIMULATION_INSTANCES
+            {
+                return Err(simulation::call_limit_error(snapshots.len() + 1));
             }
             let node = scope_node(
                 &parent.model,

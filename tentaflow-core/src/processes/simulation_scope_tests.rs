@@ -707,3 +707,61 @@ fn an_escalation_raised_by_a_step_inside_a_scope_is_caught_by_its_boundary_insid
     let handler = open_work(&view)[0];
     assert_eq!(handler.scope_id, child_scopes(&view)[0].scope_id);
 }
+
+#[test]
+fn an_interrupting_timer_on_a_sub_process_cancels_a_waiting_service_job_inside() {
+    use tentaflow_protocol::processes::{
+        ActivityVerification, ProcessTimerSpec, ServiceImplementation,
+    };
+    let mut model = guarded_scope_model(ProcessNodeKind::BoundaryTimer {
+        attached_to_id: "Scope_1".into(),
+        cancel_activity: true,
+        timer: ProcessTimerSpec::Duration { seconds: 1 },
+    });
+    model.timer_timezone = Some("UTC".into());
+    for step in &mut model.nodes {
+        if let ProcessNodeKind::SubProcess { body, .. } = &mut step.kind {
+            for inner in &mut body.nodes {
+                if inner.id == "InnerWork" {
+                    inner.kind = ProcessNodeKind::ServiceTask {
+                        flow_id: "flow-simulation-service".into(),
+                        input_mapping: BTreeMap::new(),
+                        output_mapping: BTreeMap::new(),
+                        verification: ActivityVerification::Condition {
+                            expression: "true".into(),
+                        },
+                        timeout_seconds: 30,
+                        result_expression: None,
+                        implementation: ServiceImplementation::default(),
+                    };
+                }
+            }
+        }
+    }
+    let mut store = started(model);
+    let waiting = advance_until(&mut store, "the Service wait", |view| {
+        !view.service_waits.is_empty()
+    });
+    assert_eq!(
+        waiting.service_waits[0].instance_id,
+        waiting.instance.as_ref().expect("instance").instance_id
+    );
+    let view = advance_until(&mut store, "the handler's task", |view| {
+        open_work(view)
+            .iter()
+            .any(|task| task.node_id == "Handler_1")
+    });
+    assert!(
+        view.service_waits.is_empty(),
+        "the job closed with its scope"
+    );
+    assert_eq!(
+        child_scopes(&view)[0].status,
+        ProcessInstanceStatus::Cancelled
+    );
+    assert!(view
+        .events
+        .iter()
+        .any(|event| event.kind == "simulation_service_cancelled"
+            && event.node_id.as_deref() == Some("InnerWork")));
+}

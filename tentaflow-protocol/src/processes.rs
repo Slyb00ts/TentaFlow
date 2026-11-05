@@ -2106,6 +2106,11 @@ pub struct ProcessSimulationServiceFixture {
 #[serde(deny_unknown_fields)]
 pub struct ProcessSimulationServiceWait {
     pub job_id: String,
+    /// The instance of the run that owns the step; a called process can wait on a
+    /// node with the same id as the caller's. Empty in a frame from before calls
+    /// were simulated.
+    #[serde(default)]
+    pub instance_id: String,
     pub node_id: String,
     pub scope_id: String,
     pub token_id: String,

@@ -98,6 +98,28 @@ fn started_from(
     Ok(store)
 }
 
+/// The contents of every process table of production plus the audit trail, authoring,
+/// call-pin and signal tables included: a private run may read them, never write them.
+fn all_production_rows(fixture: &Fixture) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+    let conn = fixture.db.read().expect("production connection");
+    let tables = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'bpmn\\_%' ESCAPE '\\' OR name='audit_log') ORDER BY name")
+        .expect("list tables")
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("tables")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("table names");
+    assert!(tables.iter().any(|name| name == "audit_log"));
+    assert!(tables.iter().any(|name| name == "bpmn_signal_emissions"));
+    tables
+        .into_iter()
+        .map(|table| {
+            let rows = super::call_pin_tests::table_rows(&conn, &table, "rowid");
+            (table, rows)
+        })
+        .collect()
+}
+
 fn call_of(view: &SimulationView) -> &tentaflow_protocol::processes::ProcessSimulationCall {
     view.calls.first().expect("the run made a call")
 }
@@ -296,7 +318,7 @@ fn a_simulated_call_writes_nothing_to_production_and_pins_only_by_reading() {
     let fixture = Fixture::new();
     let callee = publish_model(&fixture, &user_model(Some(&fixture.owner.user_id)));
     let caller = publish_model(&fixture, &caller_of(&callee));
-    let before = super::call_tests::transition_rows(&fixture);
+    let before = all_production_rows(&fixture);
 
     let mut store = started_from(&fixture, &caller).expect("start the run");
     advance_until(&mut store, "the callee's task", |view| {
@@ -305,7 +327,7 @@ fn a_simulated_call_writes_nothing_to_production_and_pins_only_by_reading() {
     complete_open_work(&mut store, json!({"answer": "x"}));
 
     // Production holds no instance, call, event or audit row of the run.
-    assert_eq!(super::call_tests::transition_rows(&fixture), before);
+    assert_eq!(all_production_rows(&fixture), before);
     let rows: (i64, i64) = fixture
         .db
         .read()
@@ -533,11 +555,10 @@ fn a_run_cannot_start_more_instances_than_the_simulation_limit() {
     let callee = publish_model(&fixture, &user_model(Some(&fixture.owner.user_id)));
     let mut caller_model = caller_of(&callee);
     caller_model.variables = BTreeMap::from([("results".into(), json!([]))]);
+    // Sixteen children where eight instances are the most a run holds.
     caller_model.nodes[1].repeat = Some(ProcessRepeatSpec::MultiInstance {
         mode: ProcessMultiInstanceMode::Parallel,
-        input: ProcessMultiInstanceInput::Cardinality {
-            count: MAX_SIMULATION_INSTANCES as u8,
-        },
+        input: ProcessMultiInstanceInput::Cardinality { count: 16 },
         output_collection_variable: "results".into(),
     });
     // A person's task ahead of the call keeps the start apart from the call, so the
@@ -551,27 +572,27 @@ fn a_run_cannot_start_more_instances_than_the_simulation_limit() {
         edge("CallEnd", "Call_1", "End_1"),
     ];
     let caller = publish_model(&fixture, &caller_model);
-    let mut store = started_from(&fixture, &caller).expect("start the run");
-    advance_until(&mut store, "the first task", |view| {
-        !open_work(view).is_empty()
-    });
-    // The caller plus eight children is one instance past the limit, so the
-    // transition that makes the calls is refused as a whole.
-    let view = store
-        .view(test_authorization(&store))
-        .expect("read the run");
-    let task_id = open_work(&view)[0].user_task_id.clone();
-    let error = store
-        .complete_user_task(
-            test_authorization(&store),
+    let complete_ask = |store: &mut SimulationStore| {
+        let view = store.view(test_authorization(store)).expect("read the run");
+        let task_id = open_work(&view)[0].user_task_id.clone();
+        store.complete_user_task(
+            test_authorization(store),
             &task_id,
             json!({"answer": 1}),
             None,
         )
-        .expect_err("the calls are refused");
+    };
+
+    let mut refused = started_from(&fixture, &caller).expect("start the run");
+    advance_until(&mut refused, "the first task", |view| {
+        !open_work(view).is_empty()
+    });
+    let error = complete_ask(&mut refused).expect_err("the calls are refused");
     assert_eq!(refusal_code(&error), SIMULATION_CALL_LIMIT, "{error:#}");
-    let view = store
-        .view(test_authorization(&store))
+    // Refused before the ninth child was started, not after all sixteen were built.
+    assert!(format!("{error:#}").contains("instance 9,"), "{error:#}");
+    let view = refused
+        .view(test_authorization(&refused))
         .expect("read the run");
     assert_eq!(
         view.instances.len(),
@@ -584,6 +605,32 @@ fn a_run_cannot_start_more_instances_than_the_simulation_limit() {
         1,
         "the task is still open: nothing was applied"
     );
+
+    // The refusal left no trace: the next step mints exactly what it would have
+    // minted had the refused one never been asked for.
+    let after_refusal = refused
+        .advance(test_authorization(&refused))
+        .expect("the run is usable");
+    let mut untouched = started_from(&fixture, &caller).expect("start the run");
+    advance_until(&mut untouched, "the first task", |view| {
+        !open_work(view).is_empty()
+    });
+    let direct = untouched
+        .advance(test_authorization(&untouched))
+        .expect("advance");
+    let last = |view: &SimulationView| {
+        (
+            view.trace_steps
+                .last()
+                .map(|step| (step.trace_step_id.clone(), step.result_sha256.clone())),
+            view.clock.step_index,
+            view.events
+                .iter()
+                .map(|event| event.event_id.clone())
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(last(&after_refusal), last(&direct));
 }
 
 #[test]
@@ -905,4 +952,640 @@ fn a_boundary_timer_inside_a_called_process_fires_on_the_virtual_clock() {
     let done = complete_open_work(&mut store, json!({"answer": "late"}));
     assert_eq!(done.instances[1].status, ProcessInstanceStatus::Completed);
     assert_eq!(call_of(&done).status, ProcessCallStatus::Returned);
+}
+
+/// A document that calls its own additional process `Child_Process`, whose body is
+/// `nodes` and `flows`; `decorate` declares whatever the body needs.
+fn local_call_with_body(
+    nodes: Vec<tentaflow_protocol::processes::ProcessNode>,
+    flows: Vec<tentaflow_protocol::processes::ProcessSequenceFlow>,
+    decorate: impl FnOnce(&mut ProcessModel),
+) -> ProcessModel {
+    let mut model = local_call_model();
+    model.additional_processes[0].nodes = nodes;
+    model.additional_processes[0].sequence_flows = flows;
+    decorate(&mut model);
+    model
+}
+
+#[test]
+fn a_local_body_that_waits_for_an_event_is_refused_like_a_published_one() {
+    use super::simulation_tests::{create_store, source_input_for};
+    use tentaflow_protocol::processes::{
+        ProcessMessageDeclaration, ProcessSignalDeclaration, ProcessTimerSpec,
+    };
+    let message_catch = || {
+        node(
+            "Child_Catch",
+            ProcessNodeKind::MessageCatch {
+                message_ref: "Message_1".into(),
+                correlation_expression: "'case-1'".into(),
+                output_mapping: BTreeMap::new(),
+            },
+        )
+    };
+    let declare_message = |model: &mut ProcessModel| {
+        model.messages.push(ProcessMessageDeclaration {
+            message_id: "Message_1".into(),
+            name: "EvidenceReady".into(),
+        });
+    };
+    let cases: Vec<(&str, ProcessModel)> = vec![
+        (
+            "MessageCatch",
+            local_call_with_body(
+                vec![
+                    node("Child_Start", ProcessNodeKind::Start),
+                    message_catch(),
+                    node("Child_End", ProcessNodeKind::End),
+                ],
+                vec![
+                    edge("Child_Flow1", "Child_Start", "Child_Catch"),
+                    edge("Child_Flow2", "Child_Catch", "Child_End"),
+                ],
+                declare_message,
+            ),
+        ),
+        (
+            "SignalCatch",
+            local_call_with_body(
+                vec![
+                    node("Child_Start", ProcessNodeKind::Start),
+                    node(
+                        "Child_Catch",
+                        ProcessNodeKind::SignalCatch {
+                            signal_ref: "Signal_1".into(),
+                            output_mapping: BTreeMap::new(),
+                        },
+                    ),
+                    node("Child_End", ProcessNodeKind::End),
+                ],
+                vec![
+                    edge("Child_Flow1", "Child_Start", "Child_Catch"),
+                    edge("Child_Flow2", "Child_Catch", "Child_End"),
+                ],
+                |model| {
+                    model.target_namespace = Some(NAMESPACE.into());
+                    model.signals.push(ProcessSignalDeclaration {
+                        signal_id: "Signal_1".into(),
+                        namespace_uri: NAMESPACE.into(),
+                        name: "Evidence".into(),
+                    });
+                },
+            ),
+        ),
+        (
+            "EventBasedGateway",
+            local_call_with_body(
+                vec![
+                    node("Child_Start", ProcessNodeKind::Start),
+                    node("Child_Race", ProcessNodeKind::EventBasedGateway),
+                    message_catch(),
+                    node(
+                        "Child_Timer",
+                        ProcessNodeKind::TimerCatch {
+                            timer: ProcessTimerSpec::Duration { seconds: 2 },
+                        },
+                    ),
+                    node("Child_End", ProcessNodeKind::End),
+                ],
+                vec![
+                    edge("Child_Flow1", "Child_Start", "Child_Race"),
+                    edge("Child_Flow2", "Child_Race", "Child_Catch"),
+                    edge("Child_Flow3", "Child_Race", "Child_Timer"),
+                    edge("Child_Flow4", "Child_Catch", "Child_End"),
+                    edge("Child_Flow5", "Child_Timer", "Child_End"),
+                ],
+                |model| {
+                    declare_message(model);
+                    model.additional_processes[0].timer_timezone = Some("UTC".into());
+                },
+            ),
+        ),
+    ];
+    for (name, model) in cases {
+        let error = create_store(source_input_for(model))
+            .err()
+            .unwrap_or_else(|| panic!("{name} in a local body must be refused"));
+        assert!(
+            format!("{error:#}").starts_with(SIMULATION_CALL_UNSUPPORTED),
+            "{name}: {error:#}"
+        );
+    }
+}
+
+#[test]
+fn a_callee_document_whose_other_process_calls_a_third_version_still_starts() {
+    let fixture = Fixture::new();
+    let third = publish_model(&fixture, &user_model(Some(&fixture.owner.user_id)));
+    // D2's main process is the one D1 calls; its additional process Q2 calls D3,
+    // which D1 never reaches but production recorded as a dependency of D2.
+    let mut second_model = user_model(Some(&fixture.owner.user_id));
+    second_model
+        .additional_processes
+        .push(ProcessExecutableProcess {
+            process_id: "Q2".into(),
+            process_name: None,
+            nodes: vec![
+                node("Q2_Start", ProcessNodeKind::Start),
+                call_node(
+                    "Q2_Call",
+                    ProcessCallTarget::PublishedBody {
+                        definition_id: third.definition_id.clone(),
+                        version: third.version,
+                        called_element: reference(&third.model.process_id),
+                    },
+                    &[],
+                ),
+                node("Q2_End", ProcessNodeKind::End),
+            ],
+            sequence_flows: vec![
+                edge("Q2_Flow1", "Q2_Start", "Q2_Call"),
+                edge("Q2_Flow2", "Q2_Call", "Q2_End"),
+            ],
+            variables: BTreeMap::new(),
+            diagram: Default::default(),
+            timer_timezone: None,
+            work_calendar: None,
+            calendar_pin: None,
+            modeling: None,
+        });
+    let second = publish_model(&fixture, &second_model);
+    let first = publish_model(&fixture, &caller_of(&second));
+    let mut store = started_from(&fixture, &first).expect("the run starts");
+    let view = advance_until(&mut store, "the callee's task", |view| {
+        !open_work(view).is_empty()
+    });
+    assert_eq!(view.instances.len(), 2, "D3 is pinned but never entered");
+    let private = store.private_row_snapshot().expect("private rows");
+    assert_eq!(
+        private["bpmn_versions"].len(),
+        3,
+        "D1, D2 and the dependency D3"
+    );
+    let done = complete_open_work(&mut store, json!({"answer": "x"}));
+    assert_eq!(
+        done.instance.as_ref().expect("instance").status,
+        ProcessInstanceStatus::Completed
+    );
+}
+
+#[test]
+fn a_callee_task_for_another_member_cannot_be_completed_by_the_simulating_owner() {
+    use super::runtime::test_support::actor;
+    let fixture = Fixture::new();
+    let other = actor(&fixture.db, "other-assignee");
+    let callee = publish_model(&fixture, &user_model(Some(&other.user_id)));
+    let caller = publish_model(&fixture, &caller_of(&callee));
+    let mut store = started_from(&fixture, &caller).expect("the run starts");
+    let view = advance_until(&mut store, "the callee's task", |view| {
+        view.user_tasks.iter().any(|task| task.node_id == "Work")
+    });
+    let task = view
+        .user_tasks
+        .iter()
+        .find(|task| task.node_id == "Work")
+        .expect("task");
+    assert_eq!(task.assignee_user_id, other.user_id);
+    // Only the assignee completes a task, in a call exactly as in a root step: the
+    // simulation does not impersonate another member, so such a task waits. The
+    // private organisation making every installed identity an admin gives no
+    // shortcut either: completion is decided by the assignee, not by role.
+    assert!(!task.can_complete);
+    let error = store
+        .complete_user_task(
+            test_authorization(&store),
+            &task.user_task_id,
+            json!({"answer": "x"}),
+            None,
+        )
+        .expect_err("the owner is not the assignee");
+    assert!(
+        format!("{error:#}").contains("assigned to another actor"),
+        "{error:#}"
+    );
+    store
+        .advance(test_authorization(&store))
+        .expect("the run is not wedged");
+    let root = super::simulation_tests::create_store(super::simulation_tests::source_input_for(
+        user_model(Some("user-other")),
+    ))
+    .and_then(|mut root| {
+        let authorization = test_authorization(&root);
+        root.start(authorization, json!({}))?;
+        Ok(root)
+    })
+    .expect("a root step for another member");
+    let view = root.view(test_authorization(&root)).expect("view");
+    assert!(!open_work(&view).is_empty() && !view.user_tasks[0].can_complete);
+}
+
+#[test]
+fn a_childs_events_come_between_the_calls_entry_and_its_return() {
+    let fixture = Fixture::new();
+    let caller = publish_model(&fixture, &local_call_model());
+    let variables = json!({"value": 1});
+    let source = repository::capture_simulation_source(
+        &fixture.db,
+        &fixture.owner,
+        &caller.definition_id,
+        caller.version,
+        &caller.model.process_id,
+        "Start_1",
+        &variables,
+        1_000,
+        20_000,
+        100,
+    )
+    .expect("capture");
+    let mut store = SimulationStore::create(source).expect("create");
+    store
+        .start(test_authorization(&store), variables)
+        .expect("start");
+    let done = advance_until(&mut store, "the run to finish", |view| {
+        view.instance
+            .as_ref()
+            .is_some_and(|instance| instance.status == ProcessInstanceStatus::Completed)
+    });
+    let (parent, child) = (
+        &done.instances[0].instance_id,
+        &done.instances[1].instance_id,
+    );
+    let position = |kind: &str, instance: &str| {
+        done.events
+            .iter()
+            .position(|event| event.kind == kind && event.instance_id == instance)
+            .unwrap_or_else(|| panic!("no {kind} of {instance}"))
+    };
+    let entered = position("call_entered", parent);
+    let started = position("instance_started", child);
+    let completed = position("instance_completed", child);
+    let returned = position("call_returned", parent);
+    // The writer records the parent's `call_entered` after the child it started
+    // (which here runs to its end within the same step); what must never happen is
+    // the return shown before the child it returns from.
+    assert!(
+        started < completed && completed < returned && entered < returned,
+        "the history is in the order the run wrote it: {entered} {started} {completed} {returned}"
+    );
+}
+
+#[test]
+fn an_interrupting_boundary_on_a_sub_process_with_a_call_cancels_the_whole_call_tree() {
+    use super::simulation_scope_tests::{body, sub_process};
+    use tentaflow_protocol::processes::ProcessTimerSpec;
+
+    let fixture = Fixture::new();
+    let callee = publish_model(&fixture, &user_model(Some(&fixture.owner.user_id)));
+    let inner = body(
+        vec![
+            node("InnerStart", ProcessNodeKind::Start),
+            call_node(
+                "Call_1",
+                ProcessCallTarget::PublishedBody {
+                    definition_id: callee.definition_id.clone(),
+                    version: callee.version,
+                    called_element: reference(&callee.model.process_id),
+                },
+                &[],
+            ),
+            node("InnerEnd", ProcessNodeKind::End),
+        ],
+        vec![
+            edge("InnerFlow1", "InnerStart", "Call_1"),
+            edge("InnerFlow2", "Call_1", "InnerEnd"),
+        ],
+    );
+    let mut model = starter_model();
+    model.timer_timezone = Some("UTC".into());
+    model.nodes = vec![
+        model.nodes[0].clone(),
+        node("Scope_1", sub_process(inner, &[], &[])),
+        node(
+            "Guard_1",
+            ProcessNodeKind::BoundaryTimer {
+                attached_to_id: "Scope_1".into(),
+                cancel_activity: true,
+                timer: ProcessTimerSpec::Duration { seconds: 1 },
+            },
+        ),
+        node("End_H", ProcessNodeKind::End),
+        model.nodes.last().expect("starter End").clone(),
+    ];
+    model.sequence_flows = vec![
+        edge("ToScope", "Start_1", "Scope_1"),
+        edge("ScopeEnd", "Scope_1", "End_1"),
+        edge("ToHandler", "Guard_1", "End_H"),
+    ];
+    let caller = publish_model(&fixture, &model);
+    let mut store = started_from(&fixture, &caller).expect("start the run");
+    advance_until(&mut store, "the callee's task", |view| {
+        !open_work(view).is_empty()
+    });
+    let done = advance_until(&mut store, "the timer to end the run", |view| {
+        view.instance
+            .as_ref()
+            .is_some_and(|instance| instance.status == ProcessInstanceStatus::Completed)
+    });
+    assert_eq!(call_of(&done).status, ProcessCallStatus::Cancelled);
+    assert_eq!(done.instances[1].status, ProcessInstanceStatus::Cancelled);
+    assert!(
+        open_work(&done).is_empty(),
+        "nothing of the cancelled tree stays open"
+    );
+    assert!(done
+        .scopes
+        .iter()
+        .filter(|scope| scope.parent_scope_id.is_some())
+        .all(|scope| scope.status == ProcessInstanceStatus::Cancelled));
+}
+
+#[test]
+fn an_error_crossing_two_call_levels_is_caught_by_the_outermost_boundary() {
+    let fixture = Fixture::new();
+    let rejected = || ProcessErrorDeclaration {
+        error_id: "Rejected".into(),
+        name: "Rejected".into(),
+        error_code: "REJECTED".into(),
+    };
+    let mut inner_model = user_model(Some(&fixture.owner.user_id));
+    inner_model.errors.push(rejected());
+    inner_model.nodes.last_mut().expect("End").kind = ProcessNodeKind::ErrorEnd {
+        error_ref: "Rejected".into(),
+    };
+    let inner = publish_model(&fixture, &inner_model);
+    let middle = publish_model(&fixture, &caller_of(&inner));
+    let mut outer_model = caller_of(&middle);
+    outer_model.errors.push(rejected());
+    outer_model.nodes.push(node(
+        "Guard_1",
+        ProcessNodeKind::BoundaryError {
+            attached_to_id: "Call_1".into(),
+            error_ref: Some("Rejected".into()),
+            output_mapping: BTreeMap::from([("caught".into(), "outputs.answer".into())]),
+        },
+    ));
+    outer_model.nodes.push(node("End_H", ProcessNodeKind::End));
+    outer_model
+        .sequence_flows
+        .push(edge("ToHandlerEnd", "Guard_1", "End_H"));
+    let outer = publish_model(&fixture, &outer_model);
+    let mut store = started_from(&fixture, &outer).expect("start the run");
+    advance_until(&mut store, "the innermost task", |view| {
+        !open_work(view).is_empty()
+    });
+    complete_open_work(&mut store, json!({"answer": "no"}));
+    let done = advance_until(&mut store, "the outer run to finish", |view| {
+        view.instance
+            .as_ref()
+            .is_some_and(|instance| instance.status == ProcessInstanceStatus::Completed)
+    });
+    assert_eq!(done.instances.len(), 3);
+    assert!(done
+        .events
+        .iter()
+        .any(|event| event.kind == "business_error_caught"));
+    assert_eq!(
+        done.instance.as_ref().expect("instance").variables["caught"],
+        json!("no")
+    );
+    assert_eq!(done.instances[2].status, ProcessInstanceStatus::Error);
+}
+
+#[test]
+fn a_repetition_inside_a_called_process_runs_in_the_child() {
+    use super::simulation_repetition_tests::repeated_task_model;
+    let fixture = Fixture::new();
+    let callee = publish_model(
+        &fixture,
+        &repeated_task_model(
+            Some(&fixture.owner.user_id),
+            ProcessRepeatSpec::MultiInstance {
+                mode: ProcessMultiInstanceMode::Parallel,
+                input: ProcessMultiInstanceInput::Cardinality { count: 2 },
+                output_collection_variable: "results".into(),
+            },
+        ),
+    );
+    let mut caller_model = caller_of(&callee);
+    if let ProcessNodeKind::CallActivity(call) = &mut caller_model.nodes[1].kind {
+        call.output_mapping = BTreeMap::from([("collected".into(), "outputs.results".into())]);
+    }
+    let caller = publish_model(&fixture, &caller_model);
+    let mut store = started_from(&fixture, &caller).expect("start the run");
+    let view = advance_until(&mut store, "two tasks of the child", |view| {
+        open_work(view).len() == 2
+    });
+    assert_eq!(view.repetition_groups.len(), 1);
+    assert_eq!(view.repetition_occurrences.len(), 2);
+    assert_eq!(view.instances.len(), 2);
+    let mut view = view;
+    for _ in 0..2 {
+        view = complete_open_work(&mut store, json!({"answer": "x"}));
+    }
+    let instance = view.instance.as_ref().expect("instance");
+    assert_eq!(
+        instance.status,
+        ProcessInstanceStatus::Completed,
+        "{:?}",
+        view.incidents
+    );
+    assert_eq!(
+        instance.variables["collected"].as_array().map(Vec::len),
+        Some(2)
+    );
+}
+
+#[test]
+fn the_same_service_node_waiting_in_two_instances_is_told_apart_by_job() {
+    use super::runtime::test_support::{flow, graph, service_model};
+    use super::simulation::SERVICE_AMBIGUOUS;
+    use tentaflow_protocol::processes::{ActivityOutcome, ActivityResult, ActivityVerification};
+
+    let fixture = Fixture::new();
+    let flow_id = flow(&fixture.db, &fixture.owner, &graph("marker", None));
+    let verification = || ActivityVerification::Condition {
+        expression: "true".into(),
+    };
+    let callee = publish_model(&fixture, &service_model(&flow_id, verification()));
+    // The caller runs the same node id ("Service") beside its call.
+    let mut model = service_model(&flow_id, verification());
+    let service = model.nodes[1].clone();
+    model.nodes = vec![
+        model.nodes[0].clone(),
+        node("Split", ProcessNodeKind::ParallelGateway),
+        service,
+        call_node(
+            "Call_1",
+            ProcessCallTarget::PublishedBody {
+                definition_id: callee.definition_id.clone(),
+                version: callee.version,
+                called_element: reference(&callee.model.process_id),
+            },
+            &[("result", "outputs.answer")],
+        ),
+        node("Join", ProcessNodeKind::ParallelGateway),
+        model.nodes.last().expect("End").clone(),
+    ];
+    model.sequence_flows = vec![
+        edge("A", "Start_1", "Split"),
+        edge("B", "Split", "Service"),
+        edge("C", "Split", "Call_1"),
+        edge("D", "Service", "Join"),
+        edge("E", "Call_1", "Join"),
+        edge("F", "Join", "End_1"),
+    ];
+    let caller = publish_model(&fixture, &model);
+    let mut store = started_from(&fixture, &caller).expect("start the run");
+    let view = advance_until(&mut store, "two Service waits", |view| {
+        view.service_waits.len() == 2
+    });
+    assert_eq!(view.service_waits[0].node_id, view.service_waits[1].node_id);
+    assert_ne!(
+        view.service_waits[0].instance_id,
+        view.service_waits[1].instance_id
+    );
+    let answer = || ActivityResult {
+        outcome: ActivityOutcome::Completed,
+        code: None,
+        summary: "answered".into(),
+        outputs: json!({"variables": {"marker": "m"}}),
+        evidence: Vec::new(),
+    };
+    let error = store
+        .resolve_service(test_authorization(&store), "Service", None, answer(), None)
+        .expect_err("two jobs wait on that node id");
+    assert_eq!(refusal_code(&error), SERVICE_AMBIGUOUS, "{error:#}");
+    let child = view.instances[1].instance_id.clone();
+    for wait in [&view.service_waits[0], &view.service_waits[1]] {
+        let _ = &child;
+        store
+            .resolve_service(
+                test_authorization(&store),
+                "Service",
+                Some(&wait.job_id),
+                answer(),
+                None,
+            )
+            .expect("resolve by job id");
+    }
+    let done = advance_until(&mut store, "the run to finish", |view| {
+        view.instance
+            .as_ref()
+            .is_some_and(|instance| instance.status == ProcessInstanceStatus::Completed)
+    });
+    assert!(done.service_waits.is_empty());
+}
+
+#[test]
+fn a_process_that_calls_itself_cannot_be_published_so_the_simulation_never_sees_it() {
+    let fixture = Fixture::new();
+    // Two local bodies that call each other.
+    let mut model = local_call_model();
+    model.additional_processes[0].nodes = vec![
+        node("Child_Start", ProcessNodeKind::Start),
+        call_node(
+            "Back_Call",
+            ProcessCallTarget::LocalBody {
+                called_element: reference(&model.process_id),
+            },
+            &[],
+        ),
+        node("Child_End", ProcessNodeKind::End),
+    ];
+    model.additional_processes[0].sequence_flows = vec![
+        edge("Child_Flow1", "Child_Start", "Back_Call"),
+        edge("Child_Flow2", "Back_Call", "Child_End"),
+    ];
+    let definition = repository::save_definition(
+        &fixture.db,
+        &fixture.owner,
+        &stamp("create"),
+        None,
+        0,
+        "Recursive",
+        "",
+        &model,
+    );
+    let published = definition.and_then(|definition| {
+        let snapshots = crate::dispatch::processes::pin_service_snapshots(
+            fixture.dispatcher(),
+            &fixture.owner,
+            &model,
+        )?;
+        repository::publish_definition(
+            &fixture.db,
+            &fixture.owner,
+            &stamp("publish"),
+            &definition.definition_id,
+            definition.draft_revision,
+            &snapshots,
+            None,
+        )
+    });
+    assert!(
+        published.is_err(),
+        "a cyclic local call must not be publishable"
+    );
+    let listed = repository::list_definitions(&fixture.db, &fixture.owner, 0, 50)
+        .expect("definitions")
+        .0;
+    for summary in listed {
+        let error = repository::capture_simulation_source(
+            &fixture.db,
+            &fixture.owner,
+            &summary.definition_id,
+            1,
+            &model.process_id,
+            "Start_1",
+            &json!({}),
+            1_000,
+            20_000,
+            100,
+        )
+        .err()
+        .expect("an unpublished process cannot be simulated");
+        let _ = error;
+    }
+}
+
+#[test]
+fn a_plan_naming_a_call_or_child_the_allocator_never_issued_is_refused() {
+    use super::repository::{CallRequest, RuntimePlan};
+    use super::simulation::{validate_plan_ids, vet_call_step_plan, SimulationIdSource};
+    use std::collections::HashSet;
+
+    let mut ids = SimulationIdSource::new(&"c".repeat(64)).expect("allocator");
+    let mut issue = || super::runtime::RuntimeIdSource::next_id(&mut ids, "runtime");
+    let (call_id, child_id) = (issue(), issue());
+    let request = |call: &str, child: &str| CallRequest {
+        call_id: call.into(),
+        parent_scope_id: "scope".into(),
+        parent_token_id: "token".into(),
+        parent_arrival_edge_id: "edge".into(),
+        call_node_id: "Call_1".into(),
+        child_instance_id: child.into(),
+        variables: json!({}),
+    };
+    let planned = |call: &str, child: &str| {
+        let mut plan = RuntimePlan::initial(json!({}));
+        plan.call_requests.push(request(call, child));
+        plan
+    };
+    validate_plan_ids(&planned(&call_id, &child_id), &ids, &HashSet::new()).expect("issued ids");
+    let random = uuid::Uuid::new_v4().to_string();
+    for (case, plan) in [
+        ("call", planned(&random, &child_id)),
+        ("called instance", planned(&call_id, &random)),
+    ] {
+        let error = validate_plan_ids(&plan, &ids, &HashSet::new()).expect_err(case);
+        assert!(
+            format!("{error:#}").contains(&format!("{case} identifier not issued")),
+            "{error:#}"
+        );
+    }
+    // A plan the repository made itself must carry derived (v5) identifiers only.
+    vet_call_step_plan(&planned(&call_id, &child_id), &[]).expect("derived ids");
+    let error = vet_call_step_plan(&planned(&call_id, &random), &[]).expect_err("a random id");
+    assert!(format!("{error:#}").contains("not derived"), "{error:#}");
 }

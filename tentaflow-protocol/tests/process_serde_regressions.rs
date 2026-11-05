@@ -459,3 +459,22 @@ fn simulation_messages_and_waits_from_before_event_support_decode_with_empty_def
     .unwrap();
     assert!(view.subscriptions.is_empty() && view.messages.is_empty());
 }
+
+#[test]
+fn a_simulation_service_wait_names_its_instance_and_still_decodes_without_it() {
+    use tentaflow_protocol::processes::ProcessSimulationServiceWait;
+
+    let wait = json!({
+        "job_id": "job-1", "node_id": "Service", "scope_id": "scope-1", "token_id": "token-1",
+        "input": {}, "mode": "Result", "verdict_applicable": false
+    });
+    let older: ProcessSimulationServiceWait =
+        serde_json::from_value(wait.clone()).expect("a frame from before calls were simulated");
+    assert_eq!(older.instance_id, "");
+    let mut current = wait;
+    current["instance_id"] = json!("instance-2");
+    let decoded: ProcessSimulationServiceWait =
+        serde_json::from_value(current.clone()).expect("a frame that names its instance");
+    assert_eq!(decoded.instance_id, "instance-2");
+    assert_eq!(serde_json::to_value(&decoded).expect("encode"), current);
+}

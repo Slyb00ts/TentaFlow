@@ -17,6 +17,13 @@ use repository::{CommandStamp, PinnedServiceSnapshot, ProcessActor};
 
 fn error(error: anyhow::Error) -> ProtocolError {
     let message = error.to_string();
+    // A refusal of the simulation carries its stable code at the start of the message;
+    // routing it by the words of its detail would lose the code.
+    if error.downcast_ref::<simulation::SimulationServiceError>().is_some()
+        || error.downcast_ref::<simulation::SimulationUnsupportedActivity>().is_some()
+    {
+        return ProtocolError::bad_request(message);
+    }
     if message.contains("not found") || message.contains("Query returned no rows") {
         return ProtocolError::not_found("process resource not found");
     }
@@ -1113,12 +1120,12 @@ pub fn process_dispatch(
             }
         }
         P::SimulationAdvanceRequest { simulation_id } => {
-            let view = ctx
-                .state
-                .simulation_registry
-                .with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
+            // A step can run a whole call tree, so it must not park an async worker.
+            let view = super::ui_channel::run_blocking(|| {
+                ctx.state.simulation_registry.with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
                     store.advance(authorization)
                 })
+            })
                 .map_err(error)?;
             P::SimulationAdvanceResponse {
                 view: simulation_view(view).map_err(error)?,
@@ -1130,12 +1137,12 @@ pub fn process_dispatch(
             outputs,
             approved,
         } => {
-            let view = ctx
-                .state
-                .simulation_registry
-                .with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
+            // A step can run a whole call tree, so it must not park an async worker.
+            let view = super::ui_channel::run_blocking(|| {
+                ctx.state.simulation_registry.with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
                     store.complete_user_task(authorization, user_task_id, outputs.clone(), *approved)
                 })
+            })
                 .map_err(error)?;
             P::SimulationUserTaskCompleteResponse {
                 view: simulation_view(view).map_err(error)?,
@@ -1145,12 +1152,12 @@ pub fn process_dispatch(
             simulation_id,
             user_task_id,
         } => {
-            let view = ctx
-                .state
-                .simulation_registry
-                .with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
+            // A step can run a whole call tree, so it must not park an async worker.
+            let view = super::ui_channel::run_blocking(|| {
+                ctx.state.simulation_registry.with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
                     store.acknowledge_manual_task(authorization, user_task_id)
                 })
+            })
                 .map_err(error)?;
             P::SimulationManualTaskAcknowledgeResponse {
                 view: simulation_view(view).map_err(error)?,
@@ -1163,12 +1170,12 @@ pub fn process_dispatch(
             result,
             verdict,
         } => {
-            let view = ctx
-                .state
-                .simulation_registry
-                .with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
+            // A step can run a whole call tree, so it must not park an async worker.
+            let view = super::ui_channel::run_blocking(|| {
+                ctx.state.simulation_registry.with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
                     store.resolve_service(authorization, node_id, job_id.as_deref(), result.clone(), *verdict)
                 })
+            })
                 .map_err(error)?;
             P::SimulationServiceResolveResponse {
                 view: simulation_view(view).map_err(error)?,
@@ -1182,10 +1189,9 @@ pub fn process_dispatch(
             ttl_seconds,
             subscription_id,
         } => {
-            let view = ctx
-                .state
-                .simulation_registry
-                .with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
+            // A step can run a whole call tree, so it must not park an async worker.
+            let view = super::ui_channel::run_blocking(|| {
+                ctx.state.simulation_registry.with_authorized_store(pool, &actor, simulation_id, |store, authorization| {
                     store.send_message(
                         authorization,
                         message_name,
@@ -1195,6 +1201,7 @@ pub fn process_dispatch(
                         subscription_id.as_deref(),
                     )
                 })
+            })
                 .map_err(error)?;
             P::SimulationMessageSendResponse {
                 view: simulation_view(view).map_err(error)?,
@@ -1971,6 +1978,78 @@ mod tests {
         )
         .await;
         assert_eq!(production_row_counts(&state), before);
+    }
+
+    #[test]
+    fn a_simulation_refusal_keeps_its_code_whatever_words_its_detail_holds() {
+        let refusal = anyhow::Error::from(simulation::SimulationUnsupportedActivity::CalledBodyEvent {
+            node_id: "Catch_not found".into(),
+            kind: "MessageCatch",
+        });
+        let routed = error(refusal);
+        assert_eq!(routed.code, ProtocolErrorCode::BadRequest);
+        assert!(routed.message.starts_with("SIMULATION_CALL_UNSUPPORTED"), "{}", routed.message);
+    }
+
+    #[tokio::test]
+    async fn a_refused_call_pin_keeps_its_stable_code_whatever_the_cause_says() {
+        use crate::processes::runtime::test_support::{edge, user_model};
+        use tentaflow_protocol::processes::{
+            ProcessCallActivity, ProcessCallTarget, ProcessCallableReference, ProcessNodeKind,
+        };
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "simulation-pin-owner");
+        let stranger = test_support::actor(&state.db, "simulation-pin-stranger");
+        let ctx = context(&state, &actor);
+        let callee_model = user_model(Some(&actor.user_id));
+        let callee_process_id = callee_model.process_id.clone();
+        let callee = save_and_publish(&ctx, callee_model).await;
+        let mut caller_model = crate::processes::model::starter_model();
+        caller_model.nodes.insert(
+            1,
+            ProcessNode {
+                id: "Call_1".into(),
+                name: "Call the callee".into(),
+                kind: ProcessNodeKind::CallActivity(ProcessCallActivity {
+                    target: ProcessCallTarget::PublishedBody {
+                        definition_id: callee.definition_id.clone(),
+                        version: 1,
+                        called_element: ProcessCallableReference {
+                            namespace_uri: "https://tentaflow.app/bpmn/1".into(),
+                            process_id: callee_process_id,
+                        },
+                    },
+                    input_mapping: Default::default(),
+                    output_mapping: Default::default(),
+                }),
+                repeat: None,
+                activity_io: None,
+            },
+        );
+        caller_model.sequence_flows =
+            vec![edge("ToCall", "Start_1", "Call_1"), edge("CallEnd", "Call_1", "End_1")];
+        let caller = save_and_publish(&ctx, caller_model).await;
+        // The callee now belongs to someone else: production would answer "process
+        // definition not found" at the call, a text that used to turn the refusal
+        // into a plain NotFound and lose its code.
+        state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "UPDATE bpmn_definitions SET owner_user_id=?1 WHERE definition_id=?2",
+                rusqlite::params![stranger.user_id, callee.definition_id],
+            )
+            .unwrap();
+        let error = refused(&ctx, simulation_start(&caller.definition_id)).await;
+        assert!(
+            error.message.starts_with("SIMULATION_CALL_PIN_UNAVAILABLE"),
+            "{}",
+            error.message
+        );
+        assert_eq!(error.code, ProtocolErrorCode::BadRequest);
+        // The refusal says what failed in fixed words, not the raw cause.
+        assert!(!error.message.contains("not found"), "{}", error.message);
     }
 
     #[tokio::test]

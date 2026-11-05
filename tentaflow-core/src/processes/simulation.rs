@@ -2496,6 +2496,7 @@ impl SimulationStore {
                 );
                 Ok(ProcessSimulationServiceWait {
                     job_id: job.job_id.clone(),
+                    instance_id: job.instance_id.clone(),
                     node_id: job.node_id.clone(),
                     scope_id: job.scope_id.clone(),
                     token_id: job.token_id.clone(),
@@ -3274,25 +3275,18 @@ impl SimulationStore {
         if ids.is_empty() {
             return Ok((Vec::new(), 0));
         }
-        // Newest first until the budget is spent; the events of one instant are
-        // ordered by where their instance sits in the call tree, then by sequence.
+        // Newest first until the budget is spent.
         let marks = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
-        let rank = (0..ids.len())
-            .map(|i| format!("WHEN ?{} THEN {i}", i + 1))
-            .collect::<Vec<_>>()
-            .join(" ");
         let total: i64 = self.conn.query_row(
             &format!("SELECT COUNT(*) FROM bpmn_events WHERE instance_id IN ({marks})"),
             rusqlite::params_from_iter(ids.iter()),
             |row| row.get(0),
         )?;
-        // One instance is ordered by its own sequence; several are interleaved by
-        // the virtual instant, which agrees with each instance's sequence.
-        let order = if ids.len() == 1 {
-            "seq DESC".to_owned()
-        } else {
-            format!("at_ms DESC, CASE instance_id {rank} END DESC, seq DESC")
-        };
+        // One instance is ordered by its own sequence. Several are ordered by when the
+        // run wrote them: the private database never deletes an event, so the row id
+        // is the run-wide write order, which the virtual instant and the per-instance
+        // sequence cannot give (a child starts and returns within one instant).
+        let order = if ids.len() == 1 { "seq DESC" } else { "rowid DESC" };
         let mut stmt = self.conn.prepare(&format!(
             "SELECT event_id,seq,at_ms,kind,node_id,actor_user_id,data_json,scope_id,instance_id
              FROM bpmn_events WHERE instance_id IN ({marks}) ORDER BY {order}"
@@ -3706,19 +3700,21 @@ fn check_simulated_profile(model: &ProcessModel, input: &SimulationSourceInput) 
         validate_model(&called_model).context("validate a pinned called version")?;
         called.push((version.definition_id.as_str(), version.version, called_model));
     }
-    // Bodies are keyed by the document they live in (None = the simulated one) and
-    // their process id; a local call stays in its document.
+    // Bodies are keyed by the document they live in (None = the simulated one), their
+    // process id and whether a call entered them; a local call stays in its document
+    // but still enters a second instance, so it is held to the called-body rules.
     let mut seen = HashSet::new();
-    let mut pending = vec![(None::<usize>, input.selected_process_id.as_str())];
-    while let Some((document, process_id)) = pending.pop() {
-        if !seen.insert((document, process_id)) {
+    let mut pending = vec![(None::<usize>, input.selected_process_id.as_str(), false)];
+    while let Some((document, process_id, entered_by_call)) = pending.pop() {
+        if !seen.insert((document, process_id, entered_by_call)) {
             continue;
         }
         let document_model = document.map_or(model, |index| &called[index].2);
         let body = selected_body(document_model, process_id, &[])?;
-        match document {
-            None => check_simulated_nodes(model, &input.definition_id, body.nodes)?,
-            Some(_) => check_called_body(document_model, body.nodes)?,
+        if entered_by_call {
+            check_called_body(document_model, body.nodes)?;
+        } else {
+            check_simulated_nodes(model, &input.definition_id, body.nodes)?;
         }
         for node in deep_nodes(body.nodes) {
             let ProcessNodeKind::CallActivity(call) = &node.kind else {
@@ -3732,7 +3728,7 @@ fn check_simulated_profile(model: &ProcessModel, input: &SimulationSourceInput) 
             }
             match &call.target {
                 ProcessCallTarget::LocalBody { called_element } => {
-                    pending.push((document, called_element.process_id.as_str()));
+                    pending.push((document, called_element.process_id.as_str(), true));
                 }
                 ProcessCallTarget::PublishedBody {
                     definition_id,
@@ -3751,7 +3747,7 @@ fn check_simulated_profile(model: &ProcessModel, input: &SimulationSourceInput) 
                                 ),
                             )
                         })?;
-                    pending.push((Some(index), called_element.process_id.as_str()));
+                    pending.push((Some(index), called_element.process_id.as_str(), true));
                 }
             }
         }
@@ -3923,23 +3919,9 @@ pub(super) fn refuse_event_activity_io(node: &ProcessNode) -> Result<()> {
     .into())
 }
 
-pub(super) fn validate_plan_ids(
-    plan: &RuntimePlan,
-    ids: &SimulationIdSource,
-    persisted_ids: &HashSet<String>,
-) -> Result<()> {
-    ensure!(
-        plan.event_ids.len() == plan.events.len()
-            && (0..plan.events.len()).all(|index| plan.event_ids.contains_key(&index)),
-        "simulation plan must provide a deterministic UUID for every event"
-    );
-    for index in plan.event_ids.keys() {
-        ensure!(
-            *index < plan.events.len(),
-            "simulation plan contains an event identifier outside its event ledger"
-        );
-    }
-    let issued = plan
+/// Every identifier a finished plan introduces, with what it names.
+fn plan_identifiers(plan: &RuntimePlan) -> Vec<(&'static str, &str)> {
+    plan
         .create_tokens
         .iter()
         .map(|token| ("token", token.token_id.as_str()))
@@ -3970,6 +3952,12 @@ pub(super) fn validate_plan_ids(
                 .iter()
                 .map(|scope| ("scope", scope.scope_id.as_str())),
         )
+        .chain(plan.call_requests.iter().flat_map(|request| {
+            [
+                ("call", request.call_id.as_str()),
+                ("called instance", request.child_instance_id.as_str()),
+            ]
+        }))
         .chain(
             plan.repetition_groups
                 .iter()
@@ -4018,7 +4006,27 @@ pub(super) fn validate_plan_ids(
             | ActivityIoInputFact::Failed { witness_id, .. } => {
                 ("activity IO witness", witness_id.as_str())
             }
-        }));
+        }))
+        .collect()
+}
+
+pub(super) fn validate_plan_ids(
+    plan: &RuntimePlan,
+    ids: &SimulationIdSource,
+    persisted_ids: &HashSet<String>,
+) -> Result<()> {
+    ensure!(
+        plan.event_ids.len() == plan.events.len()
+            && (0..plan.events.len()).all(|index| plan.event_ids.contains_key(&index)),
+        "simulation plan must provide a deterministic UUID for every event"
+    );
+    for index in plan.event_ids.keys() {
+        ensure!(
+            *index < plan.events.len(),
+            "simulation plan contains an event identifier outside its event ledger"
+        );
+    }
+    let issued = plan_identifiers(plan);
     for (kind, id) in issued {
         ensure!(
             Uuid::parse_str(id).is_ok(),
@@ -4044,6 +4052,20 @@ pub(super) fn validate_plan_ids(
         );
     }
     Ok(())
+}
+
+/// Holds a plan the repository made on its own in a private run (a called child's
+/// start, a call return, an admission incident) to the profile and to
+/// deterministic identifiers. Its ids come from a derived source, not the run's
+/// allocator, so the test is that none of them is random: every id is a UUID v5.
+pub(super) fn vet_call_step_plan(plan: &RuntimePlan, nodes: &[ProcessNode]) -> Result<()> {
+    for (kind, id) in plan_identifiers(plan) {
+        ensure!(
+            Uuid::parse_str(id).is_ok_and(|uuid| uuid.get_version() == Some(uuid::Version::Sha1)),
+            "a call step plan contains a {kind} identifier that is not derived: {id}"
+        );
+    }
+    validate_supported_plan(plan, nodes)
 }
 
 /// Holds a finished plan to what a private run can honour. A Service job is
@@ -4235,6 +4257,16 @@ pub(super) fn check_simulation_capacity(plan: &RuntimePlan, usage: &SimulationUs
     Ok(())
 }
 
+/// The refusal of a transition that would start more instances than a run holds.
+pub(super) fn call_limit_error(instance: usize) -> anyhow::Error {
+    SimulationServiceError::new(
+        SIMULATION_CALL_LIMIT,
+        format!(
+            "the transition would start instance {instance}, and a simulation starts at most {MAX_SIMULATION_INSTANCES}"
+        ),
+    )
+}
+
 /// The totals of a run's whole call tree, read back inside the transition that
 /// grew them. The plan-level check sees only the plan it is given; a called
 /// child's own plans are made by the repository, so this is the net that holds
@@ -4242,13 +4274,7 @@ pub(super) fn check_simulation_capacity(plan: &RuntimePlan, usage: &SimulationUs
 /// back.
 fn check_tree_capacity(tx: &Transaction<'_>, instance_ids: &[String]) -> Result<()> {
     if instance_ids.len() > MAX_SIMULATION_INSTANCES {
-        return Err(SimulationServiceError::new(
-            SIMULATION_CALL_LIMIT,
-            format!(
-                "the transition would start instance {}, and a simulation starts at most {MAX_SIMULATION_INSTANCES}",
-                instance_ids.len()
-            ),
-        ));
+        return Err(call_limit_error(instance_ids.len()));
     }
     let count = |table: &str, condition: &str| -> Result<usize> {
         let marks = vec!["?"; instance_ids.len()].join(",");
