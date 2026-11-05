@@ -645,6 +645,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   (32 zakresy, 32 grupy powtórzeń, 128 wystąpień, 8 instancji w drzewie
   wywołań) kończą się zrozumiałym komunikatem w pięciu językach. Przebieg
   z kodem wykonawczym `RealExecution` nadal jest odrzucany.
+- Bramka AI i limity tokenów. Wyczerpany limit tokenów zatrzymuje teraz wywołanie
+  modelu w każdym przepływie (zwykłym, systemowym i strumieniowym), a nie tylko w
+  kroku procesu; wcześniej zwykły przepływ tylko logował odmowę i działał dalej bez
+  wpisu audytu. Odmowa wewnątrz przepływu dociera do klienta jako HTTP 429, nie 500.
+  Embeddingi z przepływów przechodzą przez bramkę (limit i audyt), księgują tokeny
+  embeddingów dokładnie raz i nie zwiększają puli tokenów czatu; audyt zapisuje
+  tylko podsumowanie wejścia, nie jego treść. Bramka używa identyfikatora noda z
+  mesh (jak dzierżawy tokenów) zamiast nazwy hosta; wcześniejsze wiersze zostają
+  pod nazwą hosta. Znane luki: `/v1/embeddings` bez sprawdzenia limitu na poziomie
+  sesji, indeksowanie Projektów i embeddingi aliasu z `service_call` poza bramką,
+  możliwe podwójne księgowanie zużycia w przepływie opublikowanym jako model czatu.
 
 ### TentaNas
 
