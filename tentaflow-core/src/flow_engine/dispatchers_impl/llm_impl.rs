@@ -135,6 +135,15 @@ impl LlmDispatcherImpl {
     }
 }
 
+/// Closes an opened audit event as failed on an early-error path, so the row
+/// never stays `started` forever. A write failure is not worth masking the
+/// original error for.
+fn fail_event(event: Option<&crate::compliance::ai_gateway::AiEventHandle>, message: &str) {
+    if let Some(event) = event {
+        let _ = event.finish_failed(message);
+    }
+}
+
 /// Builds a minimal `ChatCompletionResponse` from the flow-engine `LlmResponse`
 /// so the AiGateway records the real response text, usage and tool calls per
 /// call. The gateway only reads content/usage/tool_calls, so the synthetic
@@ -209,7 +218,13 @@ impl LlmDispatcher for LlmDispatcherImpl {
         // select! w pierwszej kolejności sprawdza cancel/deadline, więc
         // klient disconnect / timeout abort'uje request natychmiast nawet
         // jeśli backend nie odpowiada.
-        let runtime = self.runtime()?;
+        let runtime = match self.runtime() {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                fail_event(audit_event.as_ref(), &e.to_string());
+                return Err(e);
+            }
+        };
         let response = match run_with_deadline_and_cancel(
             runtime.execute_chat(api_req, &mut rctx),
             deadline,
@@ -338,14 +353,27 @@ impl LlmDispatcher for LlmDispatcherImpl {
         // Pre-handoff: budowa streamu też podlega cancel/deadline. Gdy
         // resolver/strategy się zacina lub backend nie zdąży otworzyć
         // strumienia w czasie, abort'ujemy zanim zwrócimy stream do callera.
-        let runtime = self.runtime()?;
-        let stream = run_with_deadline_and_cancel(
+        let runtime = match self.runtime() {
+            Ok(runtime) => runtime,
+            Err(e) => {
+                fail_event(audit_event.as_ref(), &e.to_string());
+                return Err(e);
+            }
+        };
+        let stream = match run_with_deadline_and_cancel(
             runtime.stream_chat(api_req, &mut rctx),
             deadline,
             cancel.clone(),
         )
         .await
-        .map_err(|e| anyhow!("LlmDispatcher stream_chat: {e}"))?;
+        {
+            Ok(stream) => stream,
+            Err(e) => {
+                let message = format!("LlmDispatcher stream_chat: {e}");
+                fail_event(audit_event.as_ref(), &message);
+                return Err(anyhow!(message));
+            }
+        };
 
         // Post-handoff: każdy chunk podlega cancel + deadline. Gdy executor
         // (lub klient) anuluje request, stream kończy się przy najbliższym
@@ -789,7 +817,12 @@ mod tests {
     fn dispatcher_with_db(db: DbPool) -> LlmDispatcherImpl {
         let runtime: ModelRuntimeSlot = Arc::new(parking_lot::RwLock::new(None));
         let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
-        LlmDispatcherImpl::new(runtime, blobs, Some(db), Arc::new(|| "node-test".to_string()))
+        LlmDispatcherImpl::new(
+            runtime,
+            blobs,
+            Some(db),
+            Arc::new(|| "node-test".to_string()),
+        )
     }
 
     /// Harness §3.4: the gateway-aware dispatcher opens one compliance_ai_events
@@ -896,7 +929,8 @@ mod tests {
     async fn no_db_skips_audit() {
         let runtime: ModelRuntimeSlot = Arc::new(parking_lot::RwLock::new(None));
         let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
-        let dispatcher = LlmDispatcherImpl::new(runtime, blobs, None, Arc::new(|| "node-test".to_string()));
+        let dispatcher =
+            LlmDispatcherImpl::new(runtime, blobs, None, Arc::new(|| "node-test".to_string()));
         let mut req = LlmRequest::new("m", CallProvenance::system());
         req.messages = vec![ChatMessage::user("hi")];
         let api_req = build_chat_request(&req, false, dispatcher.blobs.as_ref())
@@ -1001,17 +1035,29 @@ mod tests {
             let error = dispatcher.execute_chat(req.clone()).await.unwrap_err();
             let text = format!("{error:#}");
             assert!(text.contains("token quota exceeded"), "{text}");
-            assert!(!text.contains("not wired"), "the backend must not be reached: {text}");
+            assert!(
+                !text.contains("not wired"),
+                "the backend must not be reached: {text}"
+            );
 
-            let error = dispatcher.stream_chat(req).await.err().expect("stream refused");
+            let error = dispatcher
+                .stream_chat(req)
+                .await
+                .err()
+                .expect("stream refused");
             let text = format!("{error:#}");
             assert!(text.contains("token quota exceeded"), "{text}");
-            assert!(!text.contains("not wired"), "the backend must not be reached: {text}");
+            assert!(
+                !text.contains("not wired"),
+                "the backend must not be reached: {text}"
+            );
         }
         let events: i64 = db
             .read()
             .unwrap()
-            .query_row("SELECT COUNT(*) FROM compliance_ai_events", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM compliance_ai_events", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(events, 0);
     }
@@ -1023,7 +1069,13 @@ mod tests {
         let db = audit_db();
         seed_user(&db);
         let org = crate::services::org::repo::create_organization(
-            &db, "Process org", "process-org", None, None, None, None,
+            &db,
+            "Process org",
+            "process-org",
+            None,
+            None,
+            None,
+            None,
         )
         .expect("organization")
         .org_id;
@@ -1040,13 +1092,20 @@ mod tests {
         let mut process = process_request(&org);
         process.provenance = process.provenance.with_org(None);
         let process_error = dispatcher.execute_chat(process).await.unwrap_err();
-        assert!(!format!("{process_error:#}").contains("not wired"), "{process_error:#}");
+        assert!(
+            format!("{process_error:#}").contains("odczyt organizacji"),
+            "{process_error:#}"
+        );
 
         let mut ordinary = process_request(&org);
         ordinary.provenance = CallProvenance::system();
         let error = dispatcher.execute_chat(ordinary.clone()).await.unwrap_err();
         assert!(format!("{error:#}").contains("not wired"), "{error:#}");
-        let error = dispatcher.stream_chat(ordinary).await.err().expect("no runtime");
+        let error = dispatcher
+            .stream_chat(ordinary)
+            .await
+            .err()
+            .expect("no runtime");
         assert!(format!("{error:#}").contains("not wired"), "{error:#}");
     }
 
@@ -1114,7 +1173,48 @@ mod tests {
         )
         .unwrap();
         let error = dispatcher.execute_chat(req).await.unwrap_err();
-        assert!(format!("{error:#}").contains("token quota exceeded"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("token quota exceeded"),
+            "{error:#}"
+        );
+    }
+
+    /// An event opened before the runtime was reached must not stay `started`
+    /// when the call ends there, blocking or streaming.
+    #[tokio::test]
+    async fn an_early_error_finishes_the_opened_event_as_failed() {
+        let db = audit_db();
+        seed_user(&db);
+        let org = crate::services::org::repo::create_organization(
+            &db,
+            "Process org",
+            "process-org",
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("organization")
+        .org_id;
+        let dispatcher = dispatcher_with_db(db.clone());
+        let mut req = process_request(&org);
+        req.provenance = CallProvenance::system();
+
+        dispatcher.execute_chat(req.clone()).await.unwrap_err();
+        dispatcher.stream_chat(req).await.err().expect("no runtime");
+
+        let statuses: Vec<String> = {
+            let conn = db.read().unwrap();
+            let mut statement = conn
+                .prepare("SELECT status FROM compliance_ai_events")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(statuses, vec!["failed".to_string(), "failed".to_string()]);
     }
 
     #[test]

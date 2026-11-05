@@ -189,7 +189,10 @@ impl AiGateway {
     }
 
     /// The embeddings counterpart of [`start_chat_event`]: the same quota rule,
-    /// the same audit row (backend `embeddings`), the inputs as the prompt.
+    /// the same audit row (backend `embeddings`). The prompt payload is a
+    /// summary, never the texts: embedded documents can be large and are
+    /// personal data, and a marker says all a reviewer can act on (like the
+    /// audio marker of a chat prompt).
     pub fn start_embeddings_event(
         &self,
         model: &str,
@@ -197,7 +200,9 @@ impl AiGateway {
         user: Option<&UserContext>,
         context: Option<&AiGatewayContext>,
     ) -> Result<AiEventHandle> {
-        self.start_event("embeddings", model, inputs.join("\n"), user, context)
+        let chars: usize = inputs.iter().map(|text| text.chars().count()).sum();
+        let summary = format!("[embeddings: {} inputs, {chars} chars]", inputs.len());
+        self.start_event("embeddings", model, summary, user, context)
     }
 
     fn start_event(
@@ -508,6 +513,30 @@ impl AiEventHandle {
         usage: Option<&Usage>,
         tool_calls: &[ToolCall],
     ) -> Result<()> {
+        self.finish_success_booking(
+            response_text,
+            usage.cloned().map(UsageBooking::Chat),
+            tool_calls,
+        )
+    }
+
+    /// Closes an embeddings event. The tokens go to the embedding counter, which
+    /// quotas do not add to `total_tokens`; booking them as chat usage would
+    /// charge a vector lookup like a completion.
+    pub fn finish_embeddings_success(&self, summary: &str, embedding_tokens: i64) -> Result<()> {
+        self.finish_success_booking(
+            summary,
+            Some(UsageBooking::Embedding(embedding_tokens)),
+            &[],
+        )
+    }
+
+    fn finish_success_booking(
+        &self,
+        response_text: &str,
+        usage: Option<UsageBooking>,
+        tool_calls: &[ToolCall],
+    ) -> Result<()> {
         let db = self.db.clone();
         let event_id = self.event_id.clone();
         let node_id = self.node_id.clone();
@@ -516,7 +545,6 @@ impl AiEventHandle {
         let model_id = self.model_id.clone();
         let quota_enabled = self.quota_enabled;
         let response_text = response_text.to_string();
-        let usage = usage.cloned();
         let tool_calls = tool_calls.to_vec();
         dispatch_write(move || {
             // Token accounting only touches the in-memory usage cache (no DB
@@ -537,7 +565,7 @@ impl AiEventHandle {
                     payload_kind: AiPayloadKind::Response,
                     content_text: &response_text,
                     content_redacted: false,
-                    token_count: usage.as_ref().map(|u| i64::from(u.completion_tokens)),
+                    token_count: usage.as_ref().and_then(UsageBooking::response_tokens),
                 },
             )?;
             for call in &tool_calls {
@@ -691,7 +719,7 @@ fn bump_token_usage_for(
     org_id: &str,
     user_id: &str,
     model_id: &str,
-    usage: Option<&Usage>,
+    usage: Option<&UsageBooking>,
 ) {
     if !quota_enabled {
         return;
@@ -702,14 +730,39 @@ fn bump_token_usage_for(
     if model_id.trim().is_empty() {
         return;
     }
-    crate::services::runtime::token_usage_cache::record_chat_usage(
-        node_id,
-        org_id,
-        user_id,
-        model_id,
-        i64::from(usage.prompt_tokens),
-        i64::from(usage.completion_tokens),
-    );
+    match usage {
+        UsageBooking::Chat(usage) => {
+            crate::services::runtime::token_usage_cache::record_chat_usage(
+                node_id,
+                org_id,
+                user_id,
+                model_id,
+                i64::from(usage.prompt_tokens),
+                i64::from(usage.completion_tokens),
+            )
+        }
+        UsageBooking::Embedding(tokens) => {
+            crate::services::runtime::token_usage_cache::record_embedding_tokens(
+                node_id, org_id, user_id, model_id, *tokens,
+            )
+        }
+    }
+}
+
+/// What a finished call books against the quota counters: chat tokens count
+/// toward `total_tokens`, embedding tokens have their own column.
+enum UsageBooking {
+    Chat(Usage),
+    Embedding(i64),
+}
+
+impl UsageBooking {
+    fn response_tokens(&self) -> Option<i64> {
+        match self {
+            Self::Chat(usage) => Some(i64::from(usage.completion_tokens)),
+            Self::Embedding(_) => None,
+        }
+    }
 }
 
 fn insert_ai_audit_row(
@@ -1324,6 +1377,47 @@ pub(crate) mod tests {
         assert!(
             error.downcast_ref::<QuotaReadError>().is_some(),
             "{error:#}"
+        );
+    }
+
+    #[test]
+    fn embeddings_are_audited_as_a_summary_and_booked_once_as_embedding_tokens() {
+        let db = db();
+        let gateway = AiGateway::new(db.clone(), "embedding-booking-node", true);
+        let inputs = vec!["alpha".to_string(), "beta!".to_string()];
+        let handle = gateway
+            .start_embeddings_event("embedding-booking-model", &inputs, None, None)
+            .expect("event");
+        let prompt: String = db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT content_text FROM compliance_ai_payloads WHERE event_id = ?1",
+                [handle.event_id()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompt, "[embeddings: 2 inputs, 10 chars]");
+
+        handle
+            .finish_embeddings_success("2 embedding vectors", 7)
+            .unwrap();
+
+        let rows: Vec<_> = crate::services::runtime::token_usage_cache::global()
+            .pending_deltas_snapshot()
+            .into_iter()
+            .filter(|(key, _)| key.node_id == "embedding-booking-node")
+            .collect();
+        assert_eq!(rows.len(), 1);
+        let totals = &rows[0].1;
+        assert_eq!(
+            (
+                totals.embedding_tokens,
+                totals.prompt_tokens,
+                totals.completion_tokens,
+                totals.request_count
+            ),
+            (7, 0, 0, 1)
         );
     }
 }

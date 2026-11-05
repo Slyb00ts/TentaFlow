@@ -67,6 +67,17 @@ pub(crate) fn is_quota_refusal(error: &anyhow::Error) -> bool {
     )
 }
 
+/// Wraps a dispatcher failure with the adapter's prefix. A quota refusal keeps
+/// its type (so `DispatchError::from` can still downcast it and the edge answers
+/// 429); every other failure becomes plain text, as before.
+pub(crate) fn dispatcher_failure(prefix: &str, error: anyhow::Error) -> anyhow::Error {
+    if is_quota_refusal(&error) {
+        error.context(prefix.to_string())
+    } else {
+        anyhow::anyhow!("{prefix}: {error}")
+    }
+}
+
 pub use audit_impl::AuditSinkImpl;
 pub use conversation_impl::ConversationHistoryImpl;
 pub use documents_impl::DocumentsDispatcherImpl;

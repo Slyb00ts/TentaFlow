@@ -10,6 +10,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use crate::flow_engine::dispatchers::{LlmRequest, LlmToolSpec};
+use crate::flow_engine::dispatchers_impl::dispatcher_failure;
 use crate::flow_engine::envelope::{
     audio_format_from_mime, ChatMessage, ChatRole, EnvelopeDelta, FinishReason, FlowEnvelope,
     FlowValue, LlmToolCall, MessagePart, NodeInput,
@@ -635,7 +636,7 @@ impl LlmNodeAdapter {
             };
             let last = attempt >= max_attempts;
             if last || !is_retryable_llm_error(&err) || ctx.cancel_token.is_cancelled() {
-                return Err(anyhow!("llm adapter: dispatcher failed: {err}"));
+                return Err(dispatcher_failure("llm adapter: dispatcher failed", err));
             }
             let backoff =
                 std::time::Duration::from_millis(LLM_RETRY_BACKOFF_MS << (attempt - 1) as u32);
@@ -903,7 +904,7 @@ impl StreamProducerAdapter for LlmNodeAdapter {
             .llm
             .stream_chat(request)
             .await
-            .map_err(|e| anyhow!("stream_chat failed: {e}"))?;
+            .map_err(|e| dispatcher_failure("stream_chat failed", e))?;
         Ok(adapter_stream
             .map(|res| res.map(EnvelopeDelta::Llm))
             .boxed())

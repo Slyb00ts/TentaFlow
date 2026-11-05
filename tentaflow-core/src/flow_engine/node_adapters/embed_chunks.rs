@@ -13,6 +13,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use crate::flow_engine::dispatchers::EmbeddingsRequest;
+use crate::flow_engine::dispatchers_impl::dispatcher_failure;
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
@@ -165,7 +166,7 @@ impl NodeAdapter for EmbedChunksNodeAdapter {
             .embeddings
             .embed(req)
             .await
-            .map_err(|e| anyhow!("embed_chunks: dispatcher failed: {e}"))?;
+            .map_err(|e| dispatcher_failure("embed_chunks: dispatcher failed", e))?;
 
         if response.vectors.len() != chunks.len() {
             return Err(anyhow!(

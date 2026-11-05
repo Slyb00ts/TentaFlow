@@ -11,6 +11,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use crate::flow_engine::dispatchers::EmbeddingsRequest;
+use crate::flow_engine::dispatchers_impl::dispatcher_failure;
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
@@ -125,7 +126,7 @@ impl ProjectKnowledgeNodeAdapter {
                 provenance: ctx.provenance(),
             })
             .await
-            .map_err(|e| anyhow!("project_knowledge: query embedding: {e}"))?;
+            .map_err(|e| dispatcher_failure("project_knowledge: query embedding", e))?;
         let query_vec = response
             .vectors
             .into_iter()
@@ -650,7 +651,11 @@ mod tests {
             ctx.user_id = Some(actor.clone());
             ctx.org_id = Some("org-1".into());
             ctx.vectors = vectors.clone();
-            ctx.embeddings = Arc::new(EmbeddingsDispatcherImpl::new(state.router.executor.clone(), None, Arc::new(String::new)));
+            ctx.embeddings = Arc::new(EmbeddingsDispatcherImpl::new(
+                state.router.executor.clone(),
+                None,
+                Arc::new(String::new),
+            ));
             let selected = node(json!({"project_id":project_id,"operation":"search"}));
             let request = input(FlowValue::Text("private project specification".into()));
             let search = tokio::spawn(async move {

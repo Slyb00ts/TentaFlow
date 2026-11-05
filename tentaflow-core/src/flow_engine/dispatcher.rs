@@ -97,6 +97,10 @@ pub enum DispatchError {
     /// No running STT service on this node (typed so the edge answers 503).
     #[error("{}", crate::error::CoreError::SttServiceUnavailable)]
     SttServiceUnavailable,
+    /// A node's model call was refused because a token quota is spent; typed so
+    /// the edge answers 429 instead of a generic 500. Carries the gateway's text.
+    #[error("{0}")]
+    QuotaExceeded(String),
 }
 
 impl From<anyhow::Error> for DispatchError {
@@ -104,6 +108,9 @@ impl From<anyhow::Error> for DispatchError {
         match e.downcast_ref::<crate::error::CoreError>() {
             Some(crate::error::CoreError::SttServiceUnavailable) => {
                 DispatchError::SttServiceUnavailable
+            }
+            Some(crate::error::CoreError::RateLimitExceeded { message }) => {
+                DispatchError::QuotaExceeded(message.clone())
             }
             _ => DispatchError::Internal(format!("{e:#}")),
         }

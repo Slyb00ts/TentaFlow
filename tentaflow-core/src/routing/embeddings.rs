@@ -45,48 +45,10 @@ impl Router {
                 }
             }
         }
-        let model = request.model.clone();
-        let user_id = user.as_ref().map(|u| u.user_id.clone());
-        let result = self
-            .route_embeddings_inner(request, user, origin, actor)
-            .await;
-        if let Ok(ref outcome) = result {
-            self.bump_embedding_usage_best_effort(
-                &model,
-                user_id.as_deref(),
-                outcome.response.usage.prompt_tokens,
-                outcome.response.usage.total_tokens,
-            );
-        }
-        result
-    }
-
-    /// Best-effort doliczenie tokenow embeddingow do dziennego licznika tego
-    /// wezla. Inkrement idzie do in-memory `token_usage_cache` (metrics-worker
-    /// flushuje delty batchowo), wiec nic nie blokuje odpowiedzi. Liczymy
-    /// `prompt_tokens` (gdy 0 — fallback na `total_tokens`), bo embeddingi nie
-    /// maja completion.
-    fn bump_embedding_usage_best_effort(
-        &self,
-        model: &str,
-        user_id: Option<&str>,
-        prompt_tokens: u32,
-        total_tokens: u32,
-    ) {
-        let Some(ref db) = self.db else {
-            return;
-        };
-        let tokens = i64::from(if prompt_tokens > 0 {
-            prompt_tokens
-        } else {
-            total_tokens
-        });
-        let node_id = self.local_node_id();
-        let org_id = crate::db::repository::primary_org_for_user(db, user_id);
-        let user_id = user_id.unwrap_or(crate::db::repository::TOKEN_USAGE_SYSTEM_USER);
-        crate::services::runtime::token_usage_cache::record_embedding_tokens(
-            &node_id, &org_id, user_id, model, tokens,
-        );
+        // Usage is booked by the embeddings dispatcher through the AI gateway,
+        // once per backend call; booking it here as well would count it twice.
+        self.route_embeddings_inner(request, user, origin, actor)
+            .await
     }
 
     /// Obsluguje zarowno Single jak i Multiple input przez flow_engine.
@@ -361,5 +323,161 @@ pub(crate) fn executor_err_to_core(
         ExecutorError::TransportPendingCutover(_) => CoreError::AllBackendsUnavailable {
             model_name: model.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::api::openai::types::EmbeddingInput;
+    use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin};
+
+    fn request(model: &str) -> EmbeddingRequest {
+        EmbeddingRequest {
+            model: model.to_string(),
+            input: EmbeddingInput::Single("hello".to_string()),
+            encoding_format: None,
+            dimensions: None,
+            user: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn router() -> (tempfile::TempDir, crate::db::DbPool, Router) {
+        let directory = tempfile::tempdir().expect("test directory");
+        let db = crate::db::init(&directory.path().join("embeddings.db")).expect("migrate");
+        let router =
+            Router::new(crate::config::RouterConfig::default(), Some(db.clone())).expect("router");
+        (directory, db, router)
+    }
+
+    /// A spent quota inside the embeddings flow reaches the edge as the typed
+    /// 429, not as a generic internal error wrapped around its text. A caller
+    /// without a user is accounted to the default organization.
+    #[tokio::test]
+    async fn a_spent_quota_reaches_the_edge_as_rate_limit_exceeded() {
+        let (_directory, db, router) = router();
+        crate::db::repository::create_token_quota(
+            &db,
+            &crate::db::models::NewTokenQuota {
+                org_id: crate::services::org::DEFAULT_ORG_ID,
+                scope_type: "org",
+                subject_id: None,
+                model_id: None,
+                period: "daily",
+                max_total_tokens: 0,
+                is_active: true,
+            },
+        )
+        .unwrap();
+        let error = router
+            .route_embeddings_for_user(
+                request("quota-embed"),
+                None,
+                FlowOrigin::Dashboard,
+                FlowActor::system(),
+            )
+            .await
+            .err()
+            .expect("refused");
+        match error.downcast_ref::<CoreError>() {
+            Some(CoreError::RateLimitExceeded { message }) => {
+                assert!(message.contains("token quota exceeded"), "{message}")
+            }
+            other => panic!("expected RateLimitExceeded, got {other:?} / {error:#}"),
+        }
+    }
+
+    /// The dispatchers built inside `Router::new` stamp the mesh node id that is
+    /// registered AFTER they were built, and a call that failed books no usage.
+    #[tokio::test]
+    async fn the_real_wiring_stamps_the_registered_mesh_node_id() {
+        let (_directory, db, router) = router();
+        let registry = Arc::new(crate::services::mesh_registry::MeshServicesRegistry::new());
+        registry.replace_local("mesh-wired-node".to_string(), Vec::new());
+        router
+            .service_manager()
+            .set_mesh_services_registry(registry);
+
+        router
+            .route_embeddings_for_user(
+                request("wired-embed"),
+                None,
+                FlowOrigin::Dashboard,
+                FlowActor::system(),
+            )
+            .await
+            .err()
+            .expect("no backend serves this model");
+
+        let node_ids: Vec<(String, String)> = {
+            let conn = db.read().unwrap();
+            let mut statement = conn
+                .prepare("SELECT node_id, backend FROM compliance_ai_events")
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            node_ids,
+            vec![("mesh-wired-node".to_string(), "embeddings".to_string())]
+        );
+        assert!(crate::services::runtime::token_usage_cache::global()
+            .pending_deltas_snapshot()
+            .iter()
+            .all(|(key, _)| key.node_id != "mesh-wired-node"));
+    }
+
+    /// One successful call through the whole stack is booked exactly once, as
+    /// embedding tokens: no chat tokens (which quotas count toward
+    /// `total_tokens`) and no second booking from the routing edge.
+    #[tokio::test]
+    async fn a_served_call_books_embedding_tokens_exactly_once() {
+        use crate::project_studio::ingest::access_test_support::{
+            advertise_model, DelayedModel, ModelReply,
+        };
+        const MODEL: &str = "booking-once-embed";
+        let state = crate::dispatch::state::AppState::for_test();
+        let mut backend = DelayedModel::new(MODEL, ModelReply::Embedding);
+        advertise_model(&state, "embeddings", MODEL, &backend.endpoint);
+
+        let router = state.router.clone();
+        let call = tokio::spawn(async move {
+            router
+                .route_embeddings_for_user(
+                    request(MODEL),
+                    None,
+                    FlowOrigin::Dashboard,
+                    FlowActor::system(),
+                )
+                .await
+        });
+        backend.wait_request().await;
+        backend.release();
+        call.await.expect("call task").expect("embeddings served");
+        backend.finish();
+
+        let rows: Vec<_> = crate::services::runtime::token_usage_cache::global()
+            .pending_deltas_snapshot()
+            .into_iter()
+            .filter(|(key, _)| key.model_id == MODEL)
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let totals = &rows[0].1;
+        assert_eq!(
+            (
+                totals.embedding_tokens,
+                totals.prompt_tokens,
+                totals.completion_tokens,
+                totals.request_count
+            ),
+            (1, 0, 0, 1),
+            "{totals:?}"
+        );
     }
 }

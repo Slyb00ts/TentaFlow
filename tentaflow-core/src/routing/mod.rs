@@ -52,6 +52,9 @@ pub(crate) fn dispatch_error_to_core(
             source: None,
         },
         DispatchError::SttServiceUnavailable => crate::error::CoreError::SttServiceUnavailable,
+        DispatchError::QuotaExceeded(message) => {
+            crate::error::CoreError::RateLimitExceeded { message }
+        }
     }
 }
 pub use router::{

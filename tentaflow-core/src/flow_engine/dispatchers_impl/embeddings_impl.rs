@@ -37,7 +37,11 @@ pub struct EmbeddingsDispatcherImpl {
 }
 
 impl EmbeddingsDispatcherImpl {
-    pub fn new(runtime: ModelRuntimeSlot, db: Option<DbPool>, node_id: LocalNodeIdProvider) -> Self {
+    pub fn new(
+        runtime: ModelRuntimeSlot,
+        db: Option<DbPool>,
+        node_id: LocalNodeIdProvider,
+    ) -> Self {
         Self {
             runtime,
             db,
@@ -140,13 +144,15 @@ impl EmbeddingsDispatcher for EmbeddingsDispatcherImpl {
             }
         };
         if let Some(event) = audit_event.as_ref() {
-            let usage = crate::api::openai::types::Usage {
-                prompt_tokens: response.usage.prompt_tokens,
-                completion_tokens: 0,
-                total_tokens: response.usage.total_tokens,
+            // Same fallback the edge always used: embeddings have no completion
+            // tokens, so a backend that reports only a total still gets counted.
+            let tokens = if response.usage.prompt_tokens > 0 {
+                response.usage.prompt_tokens
+            } else {
+                response.usage.total_tokens
             };
             let summary = format!("{} embedding vectors", response.data.len());
-            let _ = event.finish_stream_success(&summary, Some(&usage), &[]);
+            let _ = event.finish_embeddings_success(&summary, i64::from(tokens));
         }
 
         // Cardinality 1:1 z input — sortujemy po `index` żeby kolejność była
@@ -221,7 +227,11 @@ mod tests {
         .unwrap()
         .org_id;
         let runtime: ModelRuntimeSlot = Arc::new(parking_lot::RwLock::new(None));
-        let dispatcher = EmbeddingsDispatcherImpl::new(runtime, Some(db.clone()), Arc::new(|| "node-test".to_string()));
+        let dispatcher = EmbeddingsDispatcherImpl::new(
+            runtime,
+            Some(db.clone()),
+            Arc::new(|| "node-test".to_string()),
+        );
         (db, org, dispatcher)
     }
 
@@ -249,7 +259,10 @@ mod tests {
         assert!(error.to_string().contains("not wired"));
         let rows = events(&db);
         assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].1.as_str(), rows[0].2.as_str()), ("embeddings", "failed"));
+        assert_eq!(
+            (rows[0].1.as_str(), rows[0].2.as_str()),
+            ("embeddings", "failed")
+        );
     }
 
     fn spend_quota(db: &DbPool, org: &str) {
@@ -294,7 +307,10 @@ mod tests {
             .unwrap();
         let no_org = CallProvenance::new(FlowOrigin::Process, FlowActor::user("u-proc"));
         let error = dispatcher.embed(request(no_org)).await.unwrap_err();
-        assert!(!error.to_string().contains("not wired"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("odczyt organizacji"),
+            "{error:#}"
+        );
         let ordinary = CallProvenance::new(FlowOrigin::Dashboard, FlowActor::user("u-proc"));
         let error = dispatcher.embed(request(ordinary)).await.unwrap_err();
         assert!(error.to_string().contains("not wired"), "{error:#}");

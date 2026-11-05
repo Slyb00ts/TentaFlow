@@ -10,6 +10,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use crate::flow_engine::dispatchers::EmbeddingsRequest;
+use crate::flow_engine::dispatchers_impl::dispatcher_failure;
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
@@ -156,7 +157,7 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
             .embeddings
             .embed(req)
             .await
-            .map_err(|e| anyhow!("embeddings adapter: dispatcher failed: {e}"))?;
+            .map_err(|e| dispatcher_failure("embeddings adapter: dispatcher failed", e))?;
 
         if response.vectors.is_empty() {
             return Err(anyhow!("embeddings adapter: backend returned 0 vectors"));
