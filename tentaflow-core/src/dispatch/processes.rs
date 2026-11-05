@@ -152,6 +152,7 @@ fn simulation_view(view: simulation::SimulationView) -> Result<ProcessSimulation
         service_waits: view.service_waits,
         subscriptions: view.subscriptions,
         messages: view.messages,
+        scopes: view.scopes,
         activity_io_witnesses: view
             .activity_io_witnesses
             .into_iter()
@@ -1833,6 +1834,56 @@ mod tests {
             before,
             "a private run must not write a production process or audit row"
         );
+    }
+
+    #[tokio::test]
+    async fn a_simulated_sub_process_opens_its_scope_privately_and_writes_no_production_row() {
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "simulation-scope-owner");
+        let ctx = context(&state, &actor);
+        let model = crate::processes::simulation_scope_tests::scope_model(Some(&actor.user_id));
+        let published = save_and_publish(&ctx, model).await;
+        let before = production_row_counts(&state);
+
+        let P::SimulationStartResponse { mut view } = request(&ctx, {
+            let P::SimulationStartRequest {
+                definition_id, version, selected_process_id, start_node_id, start_ms, horizon_ms,
+                tick_duration_ms, service_fixtures, ..
+            } = simulation_start(&published.definition_id) else {
+                unreachable!("simulation_start builds a start request")
+            };
+            P::SimulationStartRequest {
+                definition_id, version, selected_process_id, start_node_id,
+                variables: json!({"value": 1}), start_ms, horizon_ms, tick_duration_ms,
+                service_fixtures,
+            }
+        })
+        .await
+        else {
+            panic!("private simulation start expected")
+        };
+        for _ in 0..10 {
+            if view.user_tasks.iter().any(|task| {
+                task.status == tentaflow_protocol::processes::ProcessUserTaskStatus::Open
+            }) {
+                break;
+            }
+            view = advance_simulation(&ctx, &view.simulation_id).await;
+        }
+        let child = view
+            .scopes
+            .iter()
+            .find(|scope| scope.parent_scope_id.is_some())
+            .expect("the private run opened an embedded scope");
+        assert_eq!(child.subprocess_node_id.as_deref(), Some("Scope_1"));
+        // The scope lives in the private run only: production sees no scope row.
+        assert_eq!(production_row_counts(&state), before);
+        request(
+            &ctx,
+            P::SimulationReleaseRequest { simulation_id: view.simulation_id.clone() },
+        )
+        .await;
+        assert_eq!(production_row_counts(&state), before);
     }
 
     #[tokio::test]

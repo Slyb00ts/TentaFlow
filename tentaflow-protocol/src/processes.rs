@@ -2129,6 +2129,10 @@ pub struct ProcessSimulationView {
     /// judged on the simulation clock.
     #[serde(default)]
     pub messages: Vec<ProcessMessageSummary>,
+    /// Every embedded scope the run has opened, root first, with the sub-process
+    /// that opened it, its parent and its status.
+    #[serde(default)]
+    pub scopes: Vec<ProcessScopeSummary>,
     /// Oldest events dropped from `events` to keep the response within one frame.
     #[serde(default)]
     pub events_omitted: u64,

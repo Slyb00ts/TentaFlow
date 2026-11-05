@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use tentaflow_protocol::processes::{
     ActivityOutcome, ActivityResult, ProcessIncident, ProcessInstance,
     ProcessInstanceStatus, ProcessMessageStatus, ProcessMessageSummary, ProcessMessageTarget, ProcessMessageTargetSpec,
-    ProcessModel, ProcessNode, ProcessNodeKind, ProcessSimulationServiceFixture,
+    ProcessModel, ProcessNode, ProcessNodeKind, ProcessScopeSummary, ProcessSimulationServiceFixture,
     ProcessSimulationServiceMode, ProcessSimulationServiceWait, ProcessSimulationSubscription,
     ProcessSimulationVerdict, ProcessSubscriptionKind, ProcessSubscriptionStatus,
     ProcessTimerSpec, ProcessTimerStatus, ProcessTimerSummary, ProcessUserTask,
@@ -1248,7 +1248,6 @@ pub enum SimulationUnsupportedActivity {
     AgentStep { node_id: String },
     EventDelivery { node_id: String, kind: &'static str },
     MessageTarget { node_id: String },
-    SubProcess { node_id: String },
     ExternalActivity { node_id: String, kind: String },
     Repetition { node_id: String },
     AdditionalProcess,
@@ -1276,9 +1275,6 @@ impl fmt::Display for SimulationUnsupportedActivity {
                 f,
                 "agent steps need the report sink; not simulated yet ({node_id})"
             ),
-            Self::SubProcess { node_id } => {
-                write!(f, "SubProcess is unsupported in simulation ({node_id})")
-            }
             Self::ExternalActivity { node_id, kind } => {
                 write!(f, "{kind} is unsupported in simulation ({node_id})")
             }
@@ -1311,6 +1307,13 @@ pub const SIMULATION_MESSAGE_SUBSCRIPTION_UNKNOWN: &str =
     "SIMULATION_MESSAGE_SUBSCRIPTION_UNKNOWN";
 /// The virtual clock stands on, or would pass, the horizon of the run.
 pub const SIMULATION_HORIZON_REACHED: &str = "SIMULATION_HORIZON_REACHED";
+/// A transition would open more embedded scopes than one simulation holds.
+pub const SIMULATION_SCOPE_LIMIT: &str = "SIMULATION_SCOPE_LIMIT";
+/// The most embedded scopes (the root scope excluded) a simulation may have opened in
+/// its whole life, closed ones included. Production allows 129 per instance; a private
+/// in-memory run is held to a quarter of that so a looping model cannot fill the
+/// 16 MiB budget with scope rows before the horizon stops it.
+pub(crate) const MAX_SIMULATION_SCOPES: usize = 32;
 pub const SERVICE_AMBIGUOUS: &str = "SIMULATION_SERVICE_AMBIGUOUS";
 pub const SERVICE_ANSWER_INVALID: &str = "SIMULATION_ANSWER_INVALID";
 pub const SERVICE_OUTCOME_NOT_PRODUCIBLE: &str = "SIMULATION_OUTCOME_NOT_PRODUCIBLE";
@@ -1361,6 +1364,7 @@ pub struct SimulationView {
     pub service_waits: Vec<ProcessSimulationServiceWait>,
     pub subscriptions: Vec<ProcessSimulationSubscription>,
     pub messages: Vec<ProcessMessageSummary>,
+    pub scopes: Vec<ProcessScopeSummary>,
     pub events_omitted: u64,
     pub trace_steps_omitted: u64,
 }
@@ -2423,8 +2427,7 @@ impl SimulationStore {
 
     fn profile_name(&self) -> Result<&'static str> {
         let body = selected_body(&self.model, &self.source.selected_process_id, &[])?;
-        Ok(if body
-            .nodes
+        Ok(if deep_nodes(body.nodes)
             .iter()
             .any(|node| matches!(node.kind, ProcessNodeKind::ServiceTask { .. }))
         {
@@ -2500,6 +2503,10 @@ impl SimulationStore {
                 &self.actor,
                 self.clock.now_ms,
             )?,
+            scopes: snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.scopes.clone())
+                .unwrap_or_default(),
             events_omitted: 0,
             trace_steps_omitted: 0,
         };
@@ -2616,8 +2623,9 @@ impl SimulationStore {
         );
         // Every request reopens the store with a fresh allocator, so a fork activation
         // minted by an earlier request is known only through the persisted run.
-        let persisted_activations = self
-            .load_snapshot()?
+        let persisted_snapshot = self.load_snapshot()?;
+        let usage = SimulationUsage::of(persisted_snapshot.as_ref());
+        let persisted_activations = persisted_snapshot
             .map(|snapshot| {
                 snapshot
                     .tokens
@@ -2636,6 +2644,7 @@ impl SimulationStore {
         if !plans_inside_writer {
             validate_plan_ids(&plan, &self.ids.borrow(), &persisted_activations)?;
             validate_supported_plan(&plan, body_nodes)?;
+            check_simulation_capacity(&plan, usage)?;
         }
         let mut settled_event_ids = None;
         // A delivery names and checks its plan here, once the writer has planned it.
@@ -2653,6 +2662,7 @@ impl SimulationStore {
             );
             validate_plan_ids(planned, &self.ids.borrow(), &persisted_activations)?;
             validate_supported_plan(planned, body_nodes)?;
+            check_simulation_capacity(planned, usage)?;
             *recorded_event_ids.borrow_mut() = planned.event_ids.clone();
             Ok(())
         };
@@ -2713,7 +2723,8 @@ impl SimulationStore {
                 at_ms,
                 &|prepared| {
                     validate_plan_ids(prepared, &ids, &persisted_activations)?;
-                    validate_supported_plan(prepared, body_nodes)
+                    validate_supported_plan(prepared, body_nodes)?;
+                    check_simulation_capacity(prepared, usage)
                 },
             )?;
             ensure!(
@@ -3194,7 +3205,7 @@ pub(crate) fn validate_service_fixtures(
         fixtures.len() <= MAX_SERVICE_FIXTURES,
         SimulationServiceError::new(SERVICE_FIXTURE_INVALID, "too many service fixtures")
     );
-    let nodes = selected_body(model, process_id, &[])?.nodes;
+    let nodes = deep_nodes(selected_body(model, process_id, &[])?.nodes);
     let mut seen = HashSet::new();
     for fixture in fixtures {
         ensure!(
@@ -3478,7 +3489,18 @@ fn validate_captured_source(
             .any(|node| matches!(&node.kind, ProcessNodeKind::End)),
         "simulation initial profile requires an End event"
     );
-    for node in body.nodes {
+    check_simulated_nodes(&model, &input.definition_id, body.nodes)?;
+    Ok((model, acl))
+}
+
+/// Holds every node of a body, and of the embedded bodies below it, to the
+/// profile a simulation can run.
+fn check_simulated_nodes(
+    model: &ProcessModel,
+    source_definition_id: &str,
+    nodes: &[ProcessNode],
+) -> Result<()> {
+    for node in nodes {
         if node.repeat.is_some() {
             return Err(SimulationUnsupportedActivity::Repetition {
                 node_id: node.id.clone(),
@@ -3555,7 +3577,7 @@ fn validate_captured_source(
                             definition_id,
                             instance_id_expression: None,
                             subscription_id_expression: None,
-                        } if definition_id == &input.definition_id
+                        } if definition_id == source_definition_id
                     ),
                     SimulationUnsupportedActivity::MessageTarget {
                         node_id: node.id.clone(),
@@ -3575,11 +3597,10 @@ fn validate_captured_source(
                 }
                 .into())
             }
-            ProcessNodeKind::SubProcess { .. } => {
-                return Err(SimulationUnsupportedActivity::SubProcess {
-                    node_id: node.id.clone(),
-                }
-                .into())
+            // An embedded body runs in a scope of the same instance; its nodes are
+            // held to the same profile as the root body's.
+            ProcessNodeKind::SubProcess { body, .. } => {
+                check_simulated_nodes(model, source_definition_id, &body.nodes)?;
             }
             kind => {
                 return Err(SimulationUnsupportedActivity::ExternalActivity {
@@ -3595,7 +3616,7 @@ fn validate_captured_source(
             }
         }
     }
-    Ok((model, acl))
+    Ok(())
 }
 
 /// A message or signal step whose result flows through authored activity IO
@@ -3620,7 +3641,7 @@ pub(super) fn refuse_event_activity_io(node: &ProcessNode) -> Result<()> {
     .into())
 }
 
-fn validate_plan_ids(
+pub(super) fn validate_plan_ids(
     plan: &RuntimePlan,
     ids: &SimulationIdSource,
     persisted_activations: &HashSet<String>,
@@ -3661,6 +3682,11 @@ fn validate_plan_ids(
             plan.create_timers
                 .iter()
                 .map(|timer| ("timer", timer.timer_id.as_str())),
+        )
+        .chain(
+            plan.create_scopes
+                .iter()
+                .map(|scope| ("scope", scope.scope_id.as_str())),
         )
         .chain(
             plan.create_jobs
@@ -3724,6 +3750,7 @@ fn validate_plan_ids(
 /// or executes one, so a plan that carries a started job, a message, a signal or
 /// any other outgoing dispatch is refused before it is written.
 pub(super) fn validate_supported_plan(plan: &RuntimePlan, nodes: &[ProcessNode]) -> Result<()> {
+    let nodes = deep_nodes(nodes);
     // A message or signal a run throws is queued on its own private database and
     // can only ever reach the waits of that run; a message that names another
     // instance or a start would reach beyond it.
@@ -3790,13 +3817,8 @@ pub(super) fn validate_supported_plan(plan: &RuntimePlan, nodes: &[ProcessNode])
         "the simulation profile only supports Catch and Boundary timers and error, escalation, message and signal subscriptions"
     );
     ensure!(
-        plan.call_requests.is_empty()
-            && plan.call_steps.is_empty()
-            && plan.create_scopes.is_empty()
-            && plan.scope_updates.is_empty()
-            && plan.cancel_scope_roots.is_empty()
-            && plan.scope_terminal_errors.is_empty(),
-        "nested process execution is unsupported in the initial simulation profile"
+        plan.call_requests.is_empty() && plan.call_steps.is_empty(),
+        "process calls are unsupported in the simulation profile"
     );
     ensure!(
         plan.repetition_groups.is_empty()
@@ -3826,6 +3848,54 @@ pub(super) fn validate_supported_plan(plan: &RuntimePlan, nodes: &[ProcessNode])
         }),
         "termination source is outside the simulation profile"
     );
+    Ok(())
+}
+
+/// Every node of a body together with the nodes of the embedded bodies below it:
+/// a step inside a scope is addressed by its own id exactly like a root step.
+pub(super) fn deep_nodes(nodes: &[ProcessNode]) -> Vec<&ProcessNode> {
+    let mut all = Vec::new();
+    let mut pending = nodes.iter().rev().collect::<Vec<_>>();
+    while let Some(node) = pending.pop() {
+        all.push(node);
+        if let ProcessNodeKind::SubProcess { body, .. } = &node.kind {
+            pending.extend(body.nodes.iter().rev());
+        }
+    }
+    all
+}
+
+/// What a run has already opened, which a finished plan adds to.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct SimulationUsage {
+    pub(super) scopes: usize,
+}
+
+impl SimulationUsage {
+    fn of(snapshot: Option<&RuntimeSnapshot>) -> Self {
+        Self {
+            scopes: snapshot.map_or(0, |snapshot| {
+                snapshot
+                    .scopes
+                    .iter()
+                    .filter(|scope| scope.parent_scope_id.is_some())
+                    .count()
+            }),
+        }
+    }
+}
+
+/// Holds a finished plan to the number of scopes one simulation may open.
+pub(super) fn check_simulation_capacity(plan: &RuntimePlan, usage: SimulationUsage) -> Result<()> {
+    let scopes = usage.scopes.saturating_add(plan.create_scopes.len());
+    if scopes > MAX_SIMULATION_SCOPES {
+        return Err(SimulationServiceError::new(
+            SIMULATION_SCOPE_LIMIT,
+            format!(
+                "the transition would open scope {scopes}, and a simulation opens at most {MAX_SIMULATION_SCOPES}"
+            ),
+        ));
+    }
     Ok(())
 }
 

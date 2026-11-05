@@ -340,6 +340,7 @@ fn simulation_payloads_round_trip_by_variant_name_through_json_and_cbor() {
             due_at_ms: Some(3_000),
         }],
         messages: Vec::new(),
+        scopes: Vec::new(),
         events_omitted: 7,
         trace_steps_omitted: 3,
     };
