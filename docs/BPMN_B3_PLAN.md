@@ -736,8 +736,8 @@ Szacunki dotyczą jednej osoby i przeglądu. Każdy pakiet ma być wdrażalny i 
 | **B3.6b** Import Camundy | tryb tolerancyjny, mapowanie konstrukcji, `Unbound`, `translations`, okno importu | B3.6a, B3.1 | 3 dni | brak |
 | **B3.7a** Symulacja S1 (usługi, weryfikacja) | nowe żądania, fixtury, panel UI | B3.1 (pełna po B3.5) | 3 dni | brak |
 | **B3.7b** Symulacja S2 (wiadomości, sygnały, brzegowe) | jak wyżej | B3.7a | 3 dni | brak |
-| **B3.7c** Symulacja S3 (podproces, wywołanie, powtórzenia) | jak wyżej | B3.7b | 3 dni | brak |
-| **B3.8** Dokumentacja | aktualizacja `docs/BPMN_PROCESS_PLAN.md` §10 i `CLAUDE.md` (sekcja o procesach) po faktycznym wdrożeniu | wszystkie | 0,5 dnia | brak |
+| **B3.7c** Symulacja S3 (podproces, wywołanie, powtórzenia) — **wdrożone 2026-11-05** (`edf7b39f4`..`01c8aa853`) | jak wyżej | B3.7b | 3 dni | brak |
+| **B3.8** Dokumentacja — **wdrożone 2026-11-05** | aktualizacja `docs/BPMN_PROCESS_PLAN.md` §10 i `CLAUDE.md` (sekcja o procesach) po faktycznym wdrożeniu | wszystkie | 0,5 dnia | brak |
 
 **Ścieżki równoległe:** (B3.1 → B3.2 → B3.3a/B3.3b → B3.4a → B3.4b → B3.5 → B3.7a) oraz niezależnie B3.6a → B3.6b. Drugi wykonawca może prowadzić ścieżkę importu bez kolizji, jeśli B3.1 jest już scalone (potrzebny `Unbound`).
 

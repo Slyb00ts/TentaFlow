@@ -242,7 +242,7 @@ Odpowiednik Camunda Cockpit, dostępny w samym Flow Builderze:
 
 ---
 
-## 10. Stan realizacji (2026-10-08)
+## 10. Stan realizacji (zaktualizowany 2026-11-05)
 
 Źródłem prawdy jest kod: `tentaflow-core/src/processes/` (model, parser, runtime, repozytorium,
 symulacja), migracje 183–199 w `db/migrations.rs`, protokół `tentaflow-protocol/src/processes.rs`
@@ -258,6 +258,9 @@ symulacja), migracje 183–199 w `db/migrations.rs`, protokół `tentaflow-proto
 | B2 — struktura | podproces osadzony, call activity i koniec błędu, bramka inkluzywna, wielokrotne wykonanie (równoległe, sekwencyjne, pętla) | `42e4ba938`, `2607deacd`, `f739d3eb3`, `068e37617` |
 | B2/B3 — zadania | skrypt CEL, zadanie ręczne, wysłanie i odbiór wiadomości, granice zadania wysłania, bramka oparta na zdarzeniach i oczekiwania w zakresach | `2eeeb9213`, `c16ae5922`, `cf1c9c144`, `6fa372f21`, `1f494159f` |
 | B2/B3 — wynik aktywności, IO, symulacja | patrz 10.2 | `a7ca170bf` |
+| B3 — implementacje usług i weryfikacja | usługa jako blok, agent z ujściem `task.complete`, narzędzie addonu, paleta „Bloki TentaFlow”, inspektor „Wynik i błędy”, weryfikacja „test” i „krytyk” | B3.1–B3.5, szczegóły w `docs/BPMN_B3_PLAN.md` |
+| B3 — import Camundy | tolerancyjny importer `camunda:`, tłumacz JUEL/FEEL → CEL, diagnostyka `Unbound`, okno importu | B3.6a, B3.6b |
+| B3 — symulacja | prywatna baza w pamięci i wirtualny zegar: zadania usługi (wyniki operatora i fixtury), weryfikacja, timery brzegowe, wiadomości, sygnały modelu, wyścigi bramki zdarzeń, podprocesy, powtórzenia, wywołania procesów z przypiętymi wersjami | B3.7a, B3.7b, B3.7c |
 
 ### 10.2 Co dostarcza ostatni krok
 
@@ -432,13 +435,11 @@ spójnie bez nowej migracji i nowej gałęzi walidatora:
 
 ### 10.3 Co zostaje
 
-- **B3**: kategoria „Bloki TentaFlow” i upuszczanie bloku/agenta jako zadania usługi,
-  implementacje zadania usługi inne niż przepływ (blok, agent z ujściem `task.complete`,
-  narzędzie addonu), tryby weryfikacji „test” i „krytyk” (dziś: warunek CEL lub człowiek),
-  zakładka inspektora „Wynik i błędy”, import rozszerzeń `camunda:` (dziś kończy się jawną diagnostyką) wraz z tłumaczeniem
-  wyrażeń JUEL/FEEL,
-  symulacja poza profilem `script_user_manual` (usługi, wiadomości,
-  sygnały, podprocesy, powtórzenia).
+- **B3**: zamknięte. Poza zakresem pozostaje tryb `RealExecution` symulacji (rzeczywiste
+  wykonanie kroków: wykonawcy produkcyjni są związani z produkcyjną bazą, potrzebny osobny
+  pakiet; decyzja właściciela 2026-11-05: odrzucane, nie wracać bez prośby), wysyłanie
+  sygnałów z zewnątrz do symulacji, start wiadomością w symulacji oraz fixtury per proces
+  wywoływany. Przebiegi i limity symulacji: `docs/BPMN_B3_PLAN.md` (Status B3.7a/b/c).
 - **B4**: nakładka tokenów na diagramie instancji, ponowienia i powiadomienia o incydentach,
   migracja instancji do nowej wersji definicji.
 - **B5**: podprocesy zdarzeniowe, kompensacja, zdarzenia warunkowe, bramka złożona,

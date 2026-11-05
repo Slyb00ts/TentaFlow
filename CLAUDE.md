@@ -757,6 +757,37 @@ this" from "nobody watches this", with no time heuristics.
   przebiegów (VM, UUID, SHA, receipt) żyją w `tests/infra/tentanas-vm/README.md`
   i powiązanych raportach, nie w tym pliku.
 
+## BPMN processes
+
+`tentaflow-core/src/processes/` (model, parser, runtime, repository, simulation), wire in
+`tentaflow-protocol/src/processes.rs` (`ProcessPayload`, append-only, tags by variant name, new
+fields `#[serde(default)]`), editor in `www/js/modules/flows-builder/`. Plans and per-package
+status: `docs/BPMN_PROCESS_PLAN.md` §10, `docs/BPMN_B3_PLAN.md`.
+
+- A service task never counts as done without an explicit activity result: a run whose result
+  block did not execute is an error (`ACTIVITY_RESULT_NOT_PRODUCED`). Service invocations are
+  durable (`bpmn_service_invocations`: prepared → may_have_executed/uncertain → observed →
+  accepted), so a result observed after the activity closed is neither re-executed nor lost.
+- Process requests are assembled in `www/js/protocol/codec.js` through `processFrame`, not in
+  `requests.js`.
+- **Simulation** runs on a PRIVATE in-memory database built from a per-process template, with a
+  virtual clock and deterministic ids (`SimulationIdSource`); it writes no `audit_log` rows and
+  never touches production state. Production functions used by it are split into `*_in_tx`
+  parts that take an injected clock, id source and `SimulatedDelivery`; the production wrappers
+  must stay behaviourally unchanged. Published versions of called processes are read from
+  production ONCE at Start and pinned into the private DB. `ExecutionMode::RealExecution` is
+  deliberately refused (`SIMULATION_REAL_EXECUTION_UNSUPPORTED`) — the production executors are
+  bound to the production DB; do not add it without an owner request.
+- Simulation limits have stable codes: scopes 32, repetition groups 32, occurrences 128,
+  instances per call tree 8 (`SIMULATION_SCOPE_LIMIT`, `_REPETITION_LIMIT`, `_CALL_LIMIT`,
+  `_CALL_PIN_UNAVAILABLE`, `_CALL_UNSUPPORTED`); `SIMULATION_HORIZON_REACHED` bounds Advance.
+- TRAP: `dispatch/processes.rs::error()` routes by message substrings ("not found", "Query
+  returned no rows"); a simulation refusal whose text contains them loses its code. Downcast
+  simulation error types FIRST.
+- TRAP: `timers.rs` inserts `timer_fired` at event index 0 and must shift every stored event
+  index (`create_signals[].source_event_index`, activity IO index fields); a new stored index
+  needs the shift and a test.
+
 ## Analytics (dashboard)
 
 `www/js/modules/analytics.js` + `www/css/analytics.css` (screen id `analytics`, nav `nav.analytics`) is
