@@ -236,12 +236,7 @@ impl AgentService {
     /// (§3.10). Best-effort: a missing run event or an audit write error is
     /// logged and swallowed — the tool loop must never abort on audit failure.
     pub fn record_tool_execution(&self, agent_run_id: &str, execution: &ToolExecution<'_>) {
-        let gateway = AiGateway::new(
-            self.db.clone(),
-            crate::mesh::node_info_collector::local_hostname(),
-            crate::compliance::ai_gateway::token_quota_enabled(),
-        );
-        if let Err(e) = gateway.record_run_tool_execution(agent_run_id, execution) {
+        if let Err(e) = AiGateway::record_run_tool_execution(&self.db, agent_run_id, execution) {
             tracing::warn!("agent tool-execution audit failed (skipping): {e}");
         }
     }

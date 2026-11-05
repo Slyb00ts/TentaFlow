@@ -14,7 +14,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
-use super::{build_user_context, ModelRuntimeSlot};
+use super::{build_user_context, gateway_node_id, is_quota_refusal, ModelRuntimeSlot};
 use crate::api::openai::types::{EmbeddingInput, EmbeddingRequest};
 use crate::flow_engine::dispatchers::{
     EmbeddingsDispatcher, EmbeddingsRequest, EmbeddingsResponse,
@@ -25,42 +25,46 @@ use crate::db::DbPool;
 use crate::flow_engine::dispatcher::FlowOrigin;
 use crate::flow_engine::envelope::TokenUsage;
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
+use crate::services::runtime::resolver::LocalNodeIdProvider;
 
 pub struct EmbeddingsDispatcherImpl {
     runtime: ModelRuntimeSlot,
-    /// Backs the AI gateway for BPMN process calls (quota and audit). `None` in
-    /// tests and DB-less bootstraps, where there is nothing to record.
+    /// Backs the AI gateway (quota and audit). `None` in tests and DB-less
+    /// bootstraps, where there is nothing to record.
     db: Option<DbPool>,
-    node_id: String,
+    /// Mesh node id for the gateway, resolved per call (see [`gateway_node_id`]).
+    node_id: LocalNodeIdProvider,
 }
 
 impl EmbeddingsDispatcherImpl {
-    pub fn new(runtime: ModelRuntimeSlot, db: Option<DbPool>, node_id: impl Into<String>) -> Self {
+    pub fn new(runtime: ModelRuntimeSlot, db: Option<DbPool>, node_id: LocalNodeIdProvider) -> Self {
         Self {
             runtime,
             db,
-            node_id: node_id.into(),
+            node_id,
         }
     }
 
-    /// Opens the audit event of a process step's embeddings call, applying the
-    /// token quota first. Any other origin is not audited here (as before).
-    fn start_process_event(
+    /// Opens the audit event of an embeddings call, applying the token quota
+    /// first. A spent quota refuses the call for every origin. A BPMN process
+    /// step also refuses on an unreadable quota or a failed audit start; for any
+    /// other origin that failure is logged and the call goes on without an event.
+    fn start_audit_event(
         &self,
         req: &EmbeddingsRequest,
     ) -> Result<Option<crate::compliance::ai_gateway::AiEventHandle>> {
         let Some(db) = self.db.as_ref() else {
             return Ok(None);
         };
-        if req.provenance.origin != FlowOrigin::Process {
-            return Ok(None);
-        }
-        let gateway = AiGateway::new(
+        let is_process = req.provenance.origin == FlowOrigin::Process;
+        let mut gateway = AiGateway::new(
             db.clone(),
-            self.node_id.clone(),
+            gateway_node_id(&self.node_id),
             crate::compliance::ai_gateway::token_quota_enabled(),
-        )
-        .with_strict_quota_reads();
+        );
+        if is_process {
+            gateway = gateway.with_strict_quota_reads();
+        }
         let user = req.user_id.as_ref().map(|uid| UserContext {
             user_id: uid.clone(),
             role: req.user_role.clone().unwrap_or_else(|| "user".to_string()),
@@ -69,9 +73,15 @@ impl EmbeddingsDispatcherImpl {
             org_id: req.provenance.org_id.clone(),
             ..Default::default()
         };
-        gateway
-            .start_embeddings_event(&req.model, &req.inputs, user.as_ref(), Some(&context))
-            .map(Some)
+        match gateway.start_embeddings_event(&req.model, &req.inputs, user.as_ref(), Some(&context))
+        {
+            Ok(handle) => Ok(Some(handle)),
+            Err(error) if is_process || is_quota_refusal(&error) => Err(error),
+            Err(error) => {
+                tracing::warn!("embeddings audit start failed (skipping event): {error}");
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -88,7 +98,7 @@ impl EmbeddingsDispatcher for EmbeddingsDispatcherImpl {
             EmbeddingInput::Multiple(req.inputs.clone())
         };
 
-        let audit_event = self.start_process_event(&req)?;
+        let audit_event = self.start_audit_event(&req)?;
         let flow_depth = req.flow_depth;
         let provenance = req.provenance.clone();
         let user = build_user_context(req.user_id, req.user_role.as_deref());
@@ -211,7 +221,7 @@ mod tests {
         .unwrap()
         .org_id;
         let runtime: ModelRuntimeSlot = Arc::new(parking_lot::RwLock::new(None));
-        let dispatcher = EmbeddingsDispatcherImpl::new(runtime, Some(db.clone()), "node-test");
+        let dispatcher = EmbeddingsDispatcherImpl::new(runtime, Some(db.clone()), Arc::new(|| "node-test".to_string()));
         (db, org, dispatcher)
     }
 
@@ -231,11 +241,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn other_origins_are_not_audited_here_as_before() {
+    async fn an_ordinary_embeddings_call_is_audited_through_the_gateway() {
         let (db, _org, dispatcher) = setup();
         let ordinary = CallProvenance::new(FlowOrigin::Dashboard, FlowActor::user("u-proc"));
-        dispatcher.embed(request(ordinary)).await.unwrap_err();
-        assert!(events(&db).is_empty());
+        // The runtime is not wired, so the call fails after its event was opened.
+        let error = dispatcher.embed(request(ordinary)).await.unwrap_err();
+        assert!(error.to_string().contains("not wired"));
+        let rows = events(&db);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].1.as_str(), rows[0].2.as_str()), ("embeddings", "failed"));
+    }
+
+    fn spend_quota(db: &DbPool, org: &str) {
+        for org_id in [org, crate::services::org::DEFAULT_ORG_ID] {
+            crate::db::repository::create_token_quota(
+                db,
+                &crate::db::models::NewTokenQuota {
+                    org_id,
+                    scope_type: "org",
+                    subject_id: None,
+                    model_id: None,
+                    period: "daily",
+                    max_total_tokens: 0,
+                    is_active: true,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spent_quota_refuses_an_ordinary_embeddings_call_before_the_backend() {
+        let (db, org, dispatcher) = setup();
+        spend_quota(&db, &org);
+        let ordinary = CallProvenance::new(FlowOrigin::Dashboard, FlowActor::user("u-proc"));
+        let error = dispatcher.embed(request(ordinary)).await.unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("token quota exceeded"), "{text}");
+        assert!(!text.contains("not wired"), "{text}");
+        assert!(events(&db).is_empty(), "a refused call opens no event");
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_start_stops_only_a_process_embeddings_call() {
+        let (db, _org, dispatcher) = setup();
+        // Without a process organization the gateway reads the user's memberships;
+        // with that table gone the audit start fails for a reason unrelated to
+        // the quota.
+        db.write()
+            .unwrap()
+            .execute("DROP TABLE org_memberships", [])
+            .unwrap();
+        let no_org = CallProvenance::new(FlowOrigin::Process, FlowActor::user("u-proc"));
+        let error = dispatcher.embed(request(no_org)).await.unwrap_err();
+        assert!(!error.to_string().contains("not wired"), "{error:#}");
+        let ordinary = CallProvenance::new(FlowOrigin::Dashboard, FlowActor::user("u-proc"));
+        let error = dispatcher.embed(request(ordinary)).await.unwrap_err();
+        assert!(error.to_string().contains("not wired"), "{error:#}");
     }
 
     #[tokio::test]

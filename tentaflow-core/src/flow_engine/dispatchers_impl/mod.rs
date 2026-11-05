@@ -43,6 +43,30 @@ pub(crate) fn build_user_context(
     })
 }
 
+/// Node id the AI gateway stamps on events and uses to find token leases. It is
+/// the mesh node id (leases are keyed by it), resolved per call because the mesh
+/// registry is still empty when the dispatchers are built. Before the registry
+/// is wired the id is `local`, like the routing layer's gateway.
+pub(crate) fn gateway_node_id(
+    provider: &crate::services::runtime::resolver::LocalNodeIdProvider,
+) -> String {
+    let id = provider();
+    if id.is_empty() {
+        "local".to_string()
+    } else {
+        id
+    }
+}
+
+/// Whether a gateway refusal is a spent token quota (as opposed to an
+/// infrastructure failure while opening the audit event).
+pub(crate) fn is_quota_refusal(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<crate::error::CoreError>(),
+        Some(crate::error::CoreError::RateLimitExceeded { .. })
+    )
+}
+
 pub use audit_impl::AuditSinkImpl;
 pub use conversation_impl::ConversationHistoryImpl;
 pub use documents_impl::DocumentsDispatcherImpl;

@@ -400,11 +400,11 @@ impl AiGateway {
     /// hash and timing (§3.10). Returns `Ok(None)` when the run has no event yet
     /// (audit then no-ops — never blocks the tool loop).
     pub fn record_run_tool_execution(
-        &self,
+        db: &DbPool,
         agent_run_id: &str,
         execution: &ToolExecution<'_>,
     ) -> Result<Option<String>> {
-        let conn = self.db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
+        let conn = db.write().map_err(|_| anyhow!("blokada DB zatruta"))?;
         let Some(event_id) = super::repository::latest_ai_event_id_for_run(&conn, agent_run_id)?
         else {
             return Ok(None);
@@ -1100,8 +1100,8 @@ pub(crate) mod tests {
             .start_chat_event(&request, None, Some(&run_ctx))
             .expect("second event");
 
-        let row = gateway
-            .record_run_tool_execution(
+        let row = AiGateway::record_run_tool_execution(
+                &db,
                 "run-77",
                 &ToolExecution {
                     tool_call_id: "call-x",
@@ -1132,8 +1132,8 @@ pub(crate) mod tests {
         }
 
         // A run with no events records nothing (audit no-op).
-        let none = gateway
-            .record_run_tool_execution(
+        let none = AiGateway::record_run_tool_execution(
+                &db,
                 "run-unknown",
                 &ToolExecution {
                     tool_call_id: "c",

@@ -600,6 +600,9 @@ pub struct FlowDispatcher {
     frame_blobs: Arc<dyn BlobStore>,
     pub(crate) process_runtime:
         parking_lot::Mutex<Option<Arc<crate::processes::runtime::ProcessRuntime>>>,
+    /// Mesh node id for the AI gateway, resolved per call (the registry is
+    /// filled after construction).
+    local_node_id: crate::services::runtime::resolver::LocalNodeIdProvider,
 }
 
 /// Pre-zbudowane Arc'i wszystkich capability dispatcherów + clock + blobs.
@@ -713,8 +716,9 @@ impl FlowDispatcher {
         // Harness §3.4: the LLM dispatcher is gateway-aware — it gets the
         // DbPool so it can open one compliance_ai_events row per `execute_chat`,
         // auditing every `llm` node in every flow per call. The node id matches
-        // the routing layer's gateway (local hostname; the mesh registry isn't
-        // populated yet at FlowDispatcher::new).
+        // the routing layer's gateway (the mesh node id, which the token leases are
+        // keyed by; resolved per call because the registry isn't populated yet at
+        // FlowDispatcher::new).
         // Ephemeral frame layer for the camera cold path: nodes read frames via
         // the composite `ctx.blobs`, but durable node-produced blobs still write
         // to (and GC from) the original persistent store. Built BEFORE the
@@ -730,18 +734,19 @@ impl FlowDispatcher {
                 blobs.clone(),
             ));
 
-        let audit_node_id = crate::mesh::node_info_collector::local_hostname();
+        let local_node_id =
+            crate::services::runtime::resolver::local_node_id_provider_for_router(&service_manager);
         let llm: Arc<dyn LlmDispatcher> = Arc::new(LlmDispatcherImpl::new(
             runtime_slot.clone(),
             ctx_blobs.clone(),
             Some(db.clone()),
-            audit_node_id,
+            local_node_id.clone(),
         ));
         let embeddings: Arc<dyn EmbeddingsDispatcher> =
             Arc::new(EmbeddingsDispatcherImpl::new(
                 runtime_slot.clone(),
                 Some(db.clone()),
-                crate::mesh::node_info_collector::local_hostname(),
+                local_node_id.clone(),
             ));
         let reranker: Arc<dyn RerankDispatcher> =
             Arc::new(RerankDispatcherImpl::new(runtime_slot.clone()));
@@ -818,6 +823,7 @@ impl FlowDispatcher {
             subflow_runner,
             frame_blobs,
             process_runtime: parking_lot::Mutex::new(None),
+            local_node_id,
         }
     }
 
@@ -1210,7 +1216,7 @@ impl FlowDispatcher {
         };
         let gateway = crate::compliance::ai_gateway::AiGateway::new(
             self.db.clone(),
-            crate::mesh::node_info_collector::local_hostname(),
+            super::dispatchers_impl::gateway_node_id(&self.local_node_id),
             crate::compliance::ai_gateway::token_quota_enabled(),
         );
         let user = crate::auth::acl::UserContext {

@@ -15,7 +15,7 @@ use std::time::Instant;
 use tokio::time::sleep_until;
 use tokio_util::sync::CancellationToken;
 
-use super::{build_user_context, ModelRuntimeSlot};
+use super::{build_user_context, gateway_node_id, is_quota_refusal, ModelRuntimeSlot};
 use crate::api::openai::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Choice, ContentPart,
     FunctionCall, FunctionDefinition, ImageUrl, Message, MessageContent, Tool, ToolCall,
@@ -32,6 +32,7 @@ use crate::flow_engine::envelope::{
     MessagePart, TokenUsage, ToolCallDelta,
 };
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
+use crate::services::runtime::resolver::LocalNodeIdProvider;
 use base64::Engine;
 use std::sync::Arc;
 
@@ -44,9 +45,9 @@ pub struct LlmDispatcherImpl {
     /// `execute_chat` opens/finishes one `compliance_ai_events` row. `None` in
     /// tests / DB-less bootstraps — audit is then skipped, generation unchanged.
     db: Option<DbPool>,
-    /// Node id stamped on AI audit events (the local node, like the routing
-    /// layer's gateway).
-    node_id: String,
+    /// Mesh node id stamped on AI audit events and used to find token leases,
+    /// resolved per call (see [`gateway_node_id`]).
+    node_id: LocalNodeIdProvider,
 }
 
 impl LlmDispatcherImpl {
@@ -54,13 +55,13 @@ impl LlmDispatcherImpl {
         runtime: ModelRuntimeSlot,
         blobs: Arc<dyn BlobStore>,
         db: Option<DbPool>,
-        node_id: impl Into<String>,
+        node_id: LocalNodeIdProvider,
     ) -> Self {
         Self {
             runtime,
             blobs,
             db,
-            node_id: node_id.into(),
+            node_id,
         }
     }
 
@@ -74,33 +75,21 @@ impl LlmDispatcherImpl {
             .ok_or_else(|| anyhow!("LlmDispatcher: ModelRuntimeExecutor not wired"))
     }
 
-    /// Opens a `compliance_ai_events` row for one blocking chat call. Returns
-    /// `None` when there is no DB (tests) — audit is then a no-op. The gateway
-    /// mints a fresh per-call `request_id` (distinct so it never collides with
-    /// the routing-layer session event on `UNIQUE(org_id, request_id)`), while
-    /// `correlation_id` carries the turn's shared key from `envelope.meta` so
-    /// the session row and every per-call row of one user turn link (§3.4). A
-    /// failed audit-start must NOT block generation, so the error is logged and
-    /// treated as "no event".
+    /// Opens a `compliance_ai_events` row for one chat call (blocking or
+    /// streaming). Returns `None` when there is no DB (tests) — audit is then a
+    /// no-op. The gateway mints a fresh per-call `request_id` (distinct so it
+    /// never collides with the routing-layer session event on
+    /// `UNIQUE(org_id, request_id)`), while `correlation_id` carries the turn's
+    /// shared key from `envelope.meta` so the session row and every per-call row
+    /// of one user turn link (§3.4).
+    ///
+    /// A spent token quota refuses the call for EVERY origin: the error is the
+    /// gateway's own `RateLimitExceeded`, so the caller sees a quota error and
+    /// nothing is sent to the backend. A BPMN process step additionally must not
+    /// run without its audit row or on a quota nobody could read. For any other
+    /// origin a failed audit start (e.g. a DB error) must NOT block generation,
+    /// so it is logged and treated as "no event".
     fn start_audit_event(
-        &self,
-        req: &LlmRequest,
-        api_req: &ChatCompletionRequest,
-    ) -> Option<crate::compliance::ai_gateway::AiEventHandle> {
-        match self.try_start_audit_event(req, api_req) {
-            Ok(handle) => handle,
-            Err(e) => {
-                tracing::warn!("gateway-aware LLM audit start failed (skipping event): {e}");
-                None
-            }
-        }
-    }
-
-    /// The same event, but a refusal is returned. A BPMN process step must not
-    /// run past a spent token quota or without its audit row, so
-    /// `execute_chat` uses this for `FlowOrigin::Process`; every other origin
-    /// keeps the log-and-continue rule of [`start_audit_event`].
-    fn try_start_audit_event(
         &self,
         req: &LlmRequest,
         api_req: &ChatCompletionRequest,
@@ -108,13 +97,13 @@ impl LlmDispatcherImpl {
         let Some(db) = self.db.as_ref() else {
             return Ok(None);
         };
+        let is_process = req.provenance.origin == FlowOrigin::Process;
         let mut gateway = AiGateway::new(
             db.clone(),
-            self.node_id.clone(),
+            gateway_node_id(&self.node_id),
             crate::compliance::ai_gateway::token_quota_enabled(),
         );
-        // A process step must not run on a quota nobody could read.
-        if req.provenance.origin == FlowOrigin::Process {
+        if is_process {
             gateway = gateway.with_strict_quota_reads();
         }
         let user = req.user_id.as_ref().map(|uid| UserContext {
@@ -135,9 +124,14 @@ impl LlmDispatcherImpl {
         };
         let mut per_call = api_req.clone();
         per_call.user = None;
-        gateway
-            .start_chat_event(&per_call, user.as_ref(), Some(&context))
-            .map(Some)
+        match gateway.start_chat_event(&per_call, user.as_ref(), Some(&context)) {
+            Ok(handle) => Ok(Some(handle)),
+            Err(error) if is_process || is_quota_refusal(&error) => Err(error),
+            Err(error) => {
+                tracing::warn!("gateway-aware LLM audit start failed (skipping event): {error}");
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -203,11 +197,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
         // Harness §3.4: open one compliance_ai_events row per call BEFORE
         // dispatch so the prompt is recorded even if the backend hangs / the
         // request is cancelled mid-flight (the event then finishes failed).
-        let audit_event = if req.provenance.origin == FlowOrigin::Process {
-            self.try_start_audit_event(&req, &api_req)?
-        } else {
-            self.start_audit_event(&req, &api_req)
-        };
+        let audit_event = self.start_audit_event(&req, &api_req)?;
         let model = api_req.model.clone();
         let provenance = req.provenance.clone();
         let user = build_user_context(req.user_id, req.user_role.as_deref());
@@ -339,7 +329,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
         // Without it the only token bump came from the session-level chat event,
         // whose model is empty for flow chats → usage mis-attributed to "".
         // AuditFinishStream finishes it with the streamed usage (incl reasoning).
-        let audit_event = self.start_audit_event(&req, &api_req);
+        let audit_event = self.start_audit_event(&req, &api_req)?;
         let provenance = req.provenance.clone();
         let user = build_user_context(req.user_id, req.user_role.as_deref());
         // §2.5 — the calling flow's stamp travels with the request; a fresh
@@ -799,7 +789,7 @@ mod tests {
     fn dispatcher_with_db(db: DbPool) -> LlmDispatcherImpl {
         let runtime: ModelRuntimeSlot = Arc::new(parking_lot::RwLock::new(None));
         let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
-        LlmDispatcherImpl::new(runtime, blobs, Some(db), "node-test")
+        LlmDispatcherImpl::new(runtime, blobs, Some(db), Arc::new(|| "node-test".to_string()))
     }
 
     /// Harness §3.4: the gateway-aware dispatcher opens one compliance_ai_events
@@ -837,6 +827,7 @@ mod tests {
             .expect("build chat request");
         let event = dispatcher
             .start_audit_event(&req, &api_req)
+            .expect("audit start")
             .expect("audit event opened");
 
         let response = LlmResponse {
@@ -900,18 +891,21 @@ mod tests {
     }
 
     /// Without a DB the dispatcher must still work — audit is simply skipped
-    /// (start_audit_event returns None), generation is unaffected.
+    /// (start_audit_event returns Ok(None)), generation is unaffected.
     #[tokio::test]
     async fn no_db_skips_audit() {
         let runtime: ModelRuntimeSlot = Arc::new(parking_lot::RwLock::new(None));
         let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
-        let dispatcher = LlmDispatcherImpl::new(runtime, blobs, None, "node-test");
+        let dispatcher = LlmDispatcherImpl::new(runtime, blobs, None, Arc::new(|| "node-test".to_string()));
         let mut req = LlmRequest::new("m", CallProvenance::system());
         req.messages = vec![ChatMessage::user("hi")];
         let api_req = build_chat_request(&req, false, dispatcher.blobs.as_ref())
             .await
             .expect("build");
-        assert!(dispatcher.start_audit_event(&req, &api_req).is_none());
+        assert!(dispatcher
+            .start_audit_event(&req, &api_req)
+            .unwrap()
+            .is_none());
     }
 
     fn org_with_quota_spent(db: &DbPool) -> String {
@@ -975,7 +969,7 @@ mod tests {
         let req = process_request(&org);
         let api_req = build_chat_request(&req, false, dispatcher.blobs.as_ref()).await.unwrap();
         let event = dispatcher
-            .try_start_audit_event(&req, &api_req)
+            .start_audit_event(&req, &api_req)
             .unwrap()
             .expect("event opened");
         let stored: String = db
@@ -991,44 +985,142 @@ mod tests {
         assert_ne!(stored, crate::services::org::DEFAULT_ORG_ID);
     }
 
-    /// A spent quota ends a process call before anything is sent; an ordinary
-    /// flow's call keeps its log-and-continue rule (it reaches the runtime).
+    /// A spent quota ends a call before anything is sent, whatever its origin:
+    /// the same quota error reaches the caller of the blocking and the streaming
+    /// path, and no audit row is opened.
     #[tokio::test]
-    async fn a_spent_quota_is_fatal_for_a_process_call_and_only_logged_elsewhere() {
+    async fn a_spent_quota_refuses_every_origin_before_the_backend() {
         let db = audit_db();
         seed_user(&db);
         let org = org_with_quota_spent(&db);
         let dispatcher = dispatcher_with_db(db.clone());
 
-        let error = dispatcher.execute_chat(process_request(&org)).await.unwrap_err();
-        assert!(format!("{error:#}").contains("token quota exceeded"), "{error:#}");
+        let mut ordinary = process_request(&org);
+        ordinary.provenance = CallProvenance::system();
+        for req in [process_request(&org), ordinary] {
+            let error = dispatcher.execute_chat(req.clone()).await.unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains("token quota exceeded"), "{text}");
+            assert!(!text.contains("not wired"), "the backend must not be reached: {text}");
+
+            let error = dispatcher.stream_chat(req).await.err().expect("stream refused");
+            let text = format!("{error:#}");
+            assert!(text.contains("token quota exceeded"), "{text}");
+            assert!(!text.contains("not wired"), "the backend must not be reached: {text}");
+        }
+        let events: i64 = db
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM compliance_ai_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(events, 0);
+    }
+
+    /// An audit start that fails for a reason other than the quota only stops a
+    /// process step; an ordinary call still reaches the backend.
+    #[tokio::test]
+    async fn a_failed_audit_start_stops_only_a_process_call() {
+        let db = audit_db();
+        seed_user(&db);
+        let org = crate::services::org::repo::create_organization(
+            &db, "Process org", "process-org", None, None, None, None,
+        )
+        .expect("organization")
+        .org_id;
+        // Without a process organization the gateway reads the user's memberships;
+        // with that table gone the audit start fails for a reason unrelated to
+        // the quota. (A failed audit WRITE never reaches the caller: it runs on
+        // the async worker.)
+        db.write()
+            .unwrap()
+            .execute("DROP TABLE org_memberships", [])
+            .expect("break the membership lookup");
+        let dispatcher = dispatcher_with_db(db.clone());
+
+        let mut process = process_request(&org);
+        process.provenance = process.provenance.with_org(None);
+        let process_error = dispatcher.execute_chat(process).await.unwrap_err();
+        assert!(!format!("{process_error:#}").contains("not wired"), "{process_error:#}");
 
         let mut ordinary = process_request(&org);
         ordinary.provenance = CallProvenance::system();
-        let error = dispatcher.execute_chat(ordinary).await.unwrap_err();
+        let error = dispatcher.execute_chat(ordinary.clone()).await.unwrap_err();
+        assert!(format!("{error:#}").contains("not wired"), "{error:#}");
+        let error = dispatcher.stream_chat(ordinary).await.err().expect("no runtime");
         assert!(format!("{error:#}").contains("not wired"), "{error:#}");
     }
 
-    /// A quota nobody could read ends a process call before anything is sent;
-    /// an ordinary flow's call is not stopped by it.
+    /// The token lease of THIS node is found through the mesh node id the
+    /// dispatcher was given: a lease that grants nothing refuses the call even
+    /// though the global quota is far from spent, and the audit row carries the
+    /// same id. Under the hostname the lease would never be found.
     #[tokio::test]
-    async fn an_unreadable_quota_is_fatal_for_a_process_call_and_not_elsewhere() {
+    async fn the_gateway_uses_the_mesh_node_id_for_leases_and_audit() {
         let db = audit_db();
-        seed_user(&db);
-        let org = org_with_quota_spent(&db);
-        db.write()
-            .unwrap()
-            .execute("UPDATE token_quota SET max_total_tokens = X'00'", [])
+        let quota = crate::db::repository::create_token_quota(
+            &db,
+            &crate::db::models::NewTokenQuota {
+                org_id: crate::services::org::DEFAULT_ORG_ID,
+                scope_type: "org",
+                subject_id: None,
+                model_id: None,
+                period: "daily",
+                max_total_tokens: 1_000_000,
+                is_active: true,
+            },
+        )
+        .unwrap();
+        let runtime: ModelRuntimeSlot = Arc::new(parking_lot::RwLock::new(None));
+        let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
+        let dispatcher = LlmDispatcherImpl::new(
+            runtime,
+            blobs,
+            Some(db.clone()),
+            Arc::new(|| "mesh-node-1".to_string()),
+        );
+        let mut req = LlmRequest::new("bielik", CallProvenance::system());
+        req.messages = vec![ChatMessage::user("hi")];
+        let api_req = build_chat_request(&req, false, dispatcher.blobs.as_ref())
+            .await
             .unwrap();
-        let dispatcher = dispatcher_with_db(db.clone());
 
-        let error = dispatcher.execute_chat(process_request(&org)).await.unwrap_err();
-        assert!(format!("{error:#}").contains("quota unreadable"), "{error:#}");
+        let event = dispatcher
+            .start_audit_event(&req, &api_req)
+            .unwrap()
+            .expect("event opened");
+        let stored: String = db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT node_id FROM compliance_ai_events WHERE event_id = ?1",
+                [event.event_id()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "mesh-node-1");
 
-        let mut ordinary = process_request(&org);
-        ordinary.provenance = CallProvenance::system();
-        let error = dispatcher.execute_chat(ordinary).await.unwrap_err();
-        assert!(format!("{error:#}").contains("not wired"), "{error:#}");
+        crate::db::repository::upsert_token_lease(
+            &db,
+            &crate::db::models::TokenLeaseUpsert {
+                org_id: crate::services::org::DEFAULT_ORG_ID,
+                quota_id: &quota,
+                node_id: "mesh-node-1",
+                period_key: &chrono::Utc::now().format("%Y-%m-%d").to_string(),
+                base_used: 0,
+                granted_tokens: 0,
+                coordinator_node_id: "mesh-node-1",
+                expires_at: &(chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            },
+        )
+        .unwrap();
+        let error = dispatcher.execute_chat(req).await.unwrap_err();
+        assert!(format!("{error:#}").contains("token quota exceeded"), "{error:#}");
+    }
+
+    #[test]
+    fn an_unwired_mesh_registry_stamps_local() {
+        let unwired: LocalNodeIdProvider = Arc::new(String::new);
+        assert_eq!(gateway_node_id(&unwired), "local");
     }
 
     #[test]
