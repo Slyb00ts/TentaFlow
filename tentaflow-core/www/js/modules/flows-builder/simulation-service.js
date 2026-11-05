@@ -173,12 +173,14 @@ export function blankServiceDraft() {
   return { outcome: 'Completed', code: '', summary: '', outputs: '{}', verdict: '' };
 }
 
-// The steps the view lists as waiting, with what the model knows about each.
+// The steps the view lists as waiting. A step of a called process can share its node id with one
+// of the model, so what the wait itself carries wins over a lookup of the model by node id.
 export function simulationWaitSteps(waits, model) {
   const known = new Map(simulationServiceSteps(model).map((step) => [step.nodeId, step]));
   return (waits || []).map((wait) => ({
     wait,
-    step: { nodeId: wait.nodeId, hasResultExpression: known.get(wait.nodeId)?.hasResultExpression ?? false,
+    step: { nodeId: wait.nodeId,
+      hasResultExpression: wait.hasResultExpression ?? known.get(wait.nodeId)?.hasResultExpression ?? false,
       machineVerdict: wait.verdictApplicable === true },
   }));
 }
@@ -290,9 +292,15 @@ export function simulationStructure(view) {
   const root = instances[0].instanceId;
   const owner = simulationScopeInstances(view);
   const instanceOf = (scopeId) => owner.get(scopeId) ?? root;
+  const occurrenceOf = (instance) => {
+    const entered = (view.events || []).find((event) => event.kind === 'call_entered' && event.data?.child_instance_id === instance.instanceId);
+    const tokenId = entered?.data?.parent_token_id;
+    return tokenId ? (view.repetitionOccurrences || []).find((occurrence) => occurrence.tokenId === tokenId) ?? null : null;
+  };
   return instances.map((instance) => ({
     instance,
     depth: instance.depth ?? 0,
+    occurrence: occurrenceOf(instance),
     call: (view.calls || []).find((call) => call.childInstanceId === instance.instanceId) ?? null,
     scopes: (view.scopes || []).filter((scope) => scope.subprocessNodeId != null && instanceOf(scope.scopeId) === instance.instanceId),
     groups: (view.repetitionGroups || []).filter((group) => instanceOf(group.scopeId) === instance.instanceId).map((group) => ({
@@ -305,4 +313,22 @@ export function simulationStructure(view) {
 // A run with more than one instance names the instance on what belongs to one.
 export function simulationInstanceLabel(instance) {
   return instance ? `${instance.definitionName} v${instance.version}` : '';
+}
+
+/**
+ * The tasks with the repetition occurrence each belongs to, in reading order: tasks of one
+ * repetition group stay together, by occurrence ordinal, whatever order the engine listed them in.
+ */
+export function simulationTasksByOccurrence(tasks, occurrences) {
+  const byTask = new Map((occurrences || []).filter((occurrence) => occurrence.userTaskId || occurrence.verificationUserTaskId)
+    .flatMap((occurrence) => [[occurrence.userTaskId, occurrence], [occurrence.verificationUserTaskId, occurrence]]
+      .filter(([id]) => id)));
+  const firstOfGroup = new Map();
+  const rows = (tasks || []).map((task, index) => {
+    const occurrence = byTask.get(task.userTaskId) ?? null;
+    if (occurrence && !firstOfGroup.has(occurrence.groupId)) firstOfGroup.set(occurrence.groupId, index);
+    return { task, occurrence, index };
+  });
+  const place = (row) => (row.occurrence ? firstOfGroup.get(row.occurrence.groupId) : row.index);
+  return rows.sort((a, b) => place(a) - place(b) || (a.occurrence?.ordinal ?? 0) - (b.occurrence?.ordinal ?? 0) || a.index - b.index);
 }

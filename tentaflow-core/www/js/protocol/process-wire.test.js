@@ -1170,9 +1170,12 @@ test('simulation view decodes the Service steps that wait for a result', { skip 
     source: { simulation_id: 'simulation-1', definition_id: 'definition-1', version: 3,
       model_sha256: 'a'.repeat(64), selected_process_id: 'Process_1', start_node_id: 'Start_1' },
     clock: { start_ms: 10, now_ms: 20, horizon_ms: 90, tick_duration_ms: 10, step_index: 1, revision: 2 },
-    instance: null, user_tasks: [], timers: [], incidents: [], events: [], trace_steps: [], activity_io_witnesses: [],
-    service_waits: [{ job_id: 'job-1', node_id: 'Service_1', scope_id: 'scope-1', token_id: 'token-1',
-      input: { seed_key: { inner_value: 2 } }, mode: 'Fixture', verdict_applicable: true }],
+    instance: null, user_tasks: [], timers: [], incidents: [], trace_steps: [], activity_io_witnesses: [],
+    events: [{ event_id: 'event-1', seq: 1, at_ms: 20, kind: 'service_queued', node_id: 'Service_1', actor_user_id: null,
+      data: {}, scope_id: 'scope-1', instance_id: 'instance-2', node_name: 'Child step' }],
+    service_waits: [{ job_id: 'job-1', instance_id: 'instance-2', node_id: 'Service_1', node_name: 'Child step',
+      scope_id: 'scope-1', token_id: 'token-1', input: { seed_key: { inner_value: 2 } }, mode: 'Fixture',
+      verdict_applicable: true, has_result_expression: true }],
   };
   const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
     SimulationServiceResolveResponse: { view },
@@ -1182,6 +1185,9 @@ test('simulation view decodes the Service steps that wait for a result', { skip 
   assert.equal(waiting.jobId, 'job-1');
   assert.equal(waiting.nodeId, 'Service_1');
   assert.equal(waiting.verdictApplicable, true);
+  assert.equal(waiting.nodeName, 'Child step');
+  assert.equal(waiting.hasResultExpression, true);
+  assert.equal(decoded.view.events[0].nodeName, 'Child step');
   assert.deepEqual(waiting.input, { seed_key: { inner_value: 2 } });
   assert.equal(waiting.mode, 'Fixture');
 });

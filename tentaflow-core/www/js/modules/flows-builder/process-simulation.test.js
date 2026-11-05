@@ -22,7 +22,7 @@ const { emptyProcessModel, processExplainError } = await import('./bpmn.js');
 const { simulationWindow, openProcessSimulation, resumeProcessSimulation, simulationErrorText } = await import('./process-simulation.js');
 const { TfWindow } = await import('../../components/tf-window.js');
 const { TfToast } = await import('../../components/tf-toast.js');
-const { OUTPUTS_MAX_KIB, SIMULATION_EVENT_KINDS, SERVICE_OUTCOMES, simulationStructure, simulationUnsupportedSteps, readMessageDraft, readOutputs, readServiceAnswer, readServiceFixtures, simulationServiceOutcomes, simulationServiceSteps, simulationWaitSteps } = await import('./simulation-service.js');
+const { OUTPUTS_MAX_KIB, SIMULATION_EVENT_KINDS, SERVICE_OUTCOMES, simulationStructure, simulationTasksByOccurrence, simulationUnsupportedSteps, readMessageDraft, readOutputs, readServiceAnswer, readServiceFixtures, simulationServiceOutcomes, simulationServiceSteps, simulationWaitSteps } = await import('./simulation-service.js');
 localStorage.setItem('tentaflow_lang', 'en');
 await I18n.init();
 
@@ -1179,7 +1179,7 @@ test('the run structure lists the call tree with the call that made each child, 
   assert.match(items[0].querySelector('[data-simulation-scope]').textContent, /Expression step.*Sub-process.*Running/s);
   const group = items[1].querySelector('[data-simulation-group]');
   assert.match(group.textContent, /Review each.*Multiple instances, in parallel.*Open/s);
-  assert.match(group.querySelector('[data-group-progress]').textContent, /1 of 3 occurrences done · now: occurrence 2/);
+  assert.match(group.querySelector('[data-group-progress]').textContent, /1 of 3 occurrences done · now running: occurrence 2/);
   assert.equal(group.querySelectorAll('[data-simulation-occurrence]').length, 2);
   const loop = simulationWindow(treeView({ instances: [inst()], calls: [], repetitionGroups: [{ groupId: 'g-1', nodeId: 'Checked', nodeName: 'Retry', scopeId: 'sc-1', mode: 'structured_loop', status: 'open', total: null, createdCount: 2, completed: 1, maxIterations: 5 }], repetitionOccurrences: [] }), MODEL);
   await flush(2);
@@ -1310,4 +1310,123 @@ test('steps inside a sub-process get prepared-result rows, a call with data is h
   const held = await startWindow(withIo);
   assert.match(held.querySelector('[data-fixture-unsupported="Call_2"]').textContent, /This call has data inputs or outputs/);
   assert.equal(held.querySelector('[data-act="submit"]').hasAttribute('disabled'), true);
+});
+
+test('a step of a called process is named and judged from the called process, not from the caller\'s step of the same id', async () => {
+  const sameId = wait({ jobId: 'job-child', nodeId: 'Plain', nodeName: 'Child check', instanceId: 'inst-2', hasResultExpression: true, verdictApplicable: false });
+  const [{ step }] = simulationWaitSteps([sameId], MODEL);
+  assert.equal(step.hasResultExpression, true, 'the flag comes from the wait, not from the model\'s node of the same id');
+  const [{ step: older }] = simulationWaitSteps([wait({ nodeId: 'Expr' })], MODEL);
+  assert.equal(older.hasResultExpression, true, 'a wait without the flag falls back to the model');
+  const view = treeView({
+    serviceWaits: [sameId],
+    events: [{ ...event('service_queued', 'Plain'), nodeName: 'Child check', scopeId: 'sc-2', instanceId: 'inst-2' }, { ...event('service_queued', 'Plain'), scopeId: 'sc-0', instanceId: 'inst-1' }],
+  });
+  const win = simulationWindow(view, MODEL);
+  await flush(2);
+  const card = win.querySelector('[data-simulation-wait="job-child"]');
+  assert.match(card.querySelector('strong').textContent, /Child check/);
+  assert.deepEqual([...card.querySelectorAll('[data-answer-field="outcome"] option')].map((option) => option.value), ['Completed', 'Error', 'NeedsHuman', 'Cancelled'],
+    'the child step decides its outcome by an expression, which the caller\'s step of that id does not');
+  const rows = [...win.querySelectorAll('.fb-simulation-events li')].map((row) => row.textContent);
+  assert.ok(rows.some((row) => row.includes('Child check')), rows.join(' | '));
+  assert.ok(rows.some((row) => !row.includes('Child check') && row.includes('·')), 'the event of the caller still reads the model');
+});
+
+test('tasks of a multi-instance group show their occurrence and stay in ordinal order, and a child of a repeated call says which occurrence started it', async () => {
+  const occurrence = (ordinal, userTaskId, tokenId) => ({ occurrenceId: `o-${ordinal}`, groupId: 'g-1', ordinal, status: 'active', tokenId, userTaskId });
+  const view = treeView({
+    userTasks: [taskOf({ userTaskId: 'ut-c', kind: 'Work', scopeId: 'sc-2' }), taskOf({ userTaskId: 'ut-a', kind: 'Work', scopeId: 'sc-2' }), taskOf({ userTaskId: 'ut-b', kind: 'Work', scopeId: 'sc-2' })],
+    repetitionOccurrences: [occurrence(2, 'ut-c', 'tok-2'), occurrence(0, 'ut-a', 'tok-0'), occurrence(1, 'ut-b', 'tok-1')],
+    events: [{ ...event('call_entered', 'Plain', { child_instance_id: 'inst-2', parent_token_id: 'tok-1' }), scopeId: 'sc-0', instanceId: 'inst-1' }],
+  });
+  assert.deepEqual(simulationTasksByOccurrence(view.userTasks, view.repetitionOccurrences).map(({ task }) => task.userTaskId), ['ut-a', 'ut-b', 'ut-c']);
+  const win = simulationWindow(view, MODEL);
+  await flush(2);
+  const cards = [...win.querySelectorAll('[data-simulation-open-task]')];
+  assert.deepEqual(cards.map((card) => card.dataset.simulationOpenTask), ['ut-a', 'ut-b', 'ut-c']);
+  assert.deepEqual(cards.map((card) => card.querySelector('[data-task-occurrence]').textContent.trim()), ['Occurrence 1', 'Occurrence 2', 'Occurrence 3']);
+  assert.match(win.querySelector('[data-simulation-instance="inst-2"] [data-call-occurrence]').textContent, /Occurrence 2/);
+  const plain = simulationWindow(baseView({ instance: { status: 'Waiting' }, userTasks: [taskOf({ kind: 'Work' })] }), MODEL);
+  await flush(2);
+  assert.ok(plain.querySelector('[data-task-occurrence]') === null, 'a task outside a group names no occurrence');
+});
+
+test('the control that had the keyboard keeps it after an action redraws the window', async () => {
+  const fresh = baseView({ instance: { status: 'Waiting' }, clock: clockOf(6, 100, 2) });
+  responder = () => ({ view: fresh });
+  const win = simulationWindow(baseView({ instance: { status: 'Waiting' }, userTasks: [taskOf({ userTaskId: 'ut-1', kind: 'Work' })] }), MODEL);
+  await flush(2);
+  const advance = win.querySelector('[data-simulation-advance] button');
+  advance.focus();
+  assert.equal(document.activeElement, advance, 'the harness gives the button the focus');
+  click(win.querySelector('[data-simulation-advance]'));
+  await flush(6);
+  const redrawn = win.querySelector('[data-simulation-advance] button');
+  assert.notEqual(redrawn, advance, 'the redraw rebuilt the control');
+  assert.equal(document.activeElement, redrawn, 'the keyboard stays on the control that was used');
+});
+
+test('a group that failed on entry, a parallel group and a finished group are told without an empty number, without a false "now" and collapsed', async () => {
+  const group = (overrides) => ({ groupId: 'g-1', nodeId: 'Checked', nodeName: 'Review each', scopeId: 'sc-2', parentTokenId: 't', mode: 'multi_instance_sequential', status: 'open', total: 3, createdCount: 1, completed: 0, maxIterations: null, ...overrides });
+  const occ = (ordinal, status) => ({ occurrenceId: `o-${ordinal}`, groupId: 'g-1', ordinal, status });
+  const progress = async (overrides, occurrences) => {
+    const win = simulationWindow(treeView({ repetitionGroups: [group(overrides)], repetitionOccurrences: occurrences }), MODEL);
+    await flush(2);
+    const row = win.querySelector('[data-simulation-instance="inst-2"] [data-simulation-group]');
+    return { row, text: row.querySelector('[data-group-progress]').textContent.replace(/\s+/g, ' ').trim() };
+  };
+  const failed = await progress({ total: null, status: 'incident', createdCount: 0, completed: 0 }, []);
+  assert.doesNotMatch(failed.text, /at most|rounds|\s{2}/);
+  assert.match(failed.text, /number of occurrences is not known/);
+  const unbounded = await progress({ mode: 'structured_loop', total: null, maxIterations: null }, [occ(0, 'active')]);
+  assert.match(unbounded.text, /^0 done; the loop ends by its condition · now: occurrence 1$/);
+  assert.doesNotMatch(unbounded.text, /at most|rounds/);
+  const sequential = await progress({}, [occ(0, 'completed'), occ(1, 'active')]);
+  assert.match(sequential.text, /now: occurrence 2/);
+  const parallel = await progress({ mode: 'multi_instance_parallel', total: 3, createdCount: 3 }, [occ(0, 'active'), occ(1, 'completed'), occ(2, 'active')]);
+  assert.match(parallel.text, /now running: occurrences 1, 3/);
+  assert.doesNotMatch(parallel.text, /now: occurrence/);
+  assert.ok(parallel.row.querySelector('tf-disclosure') === null, 'a running group lists its occurrences');
+  const done = await progress({ status: 'completed', completed: 3, createdCount: 3 }, [occ(0, 'completed'), occ(1, 'completed'), occ(2, 'completed')]);
+  const folded = done.row.querySelector('tf-disclosure[data-group-occurrences]');
+  assert.ok(folded, 'a finished group collapses its occurrences');
+  assert.equal(folded.querySelectorAll('[data-simulation-occurrence]').length, 3);
+  assert.doesNotMatch(done.text, /now/);
+});
+
+test('a limit refusal at Start says nothing was started; mid-run it says the run cannot go on and points to End simulation; an unpinnable call says archived', async () => {
+  const model = serviceModel([['Call_1', 'Take payment', serviceTask()]]);
+  const raw = 'protocol error ProcessBody: SIMULATION_REPETITION_LIMIT: the transition would reach 33 repetition groups and 4 occurrences, and a simulation holds at most 32 groups and 128 occurrences';
+  const pin = 'protocol error ProcessBody: SIMULATION_CALL_PIN_UNAVAILABLE: a called process version cannot be pinned into the simulation';
+  const expected = {
+    en: { start: /not started/, run: /cannot continue past this step\. Use “End simulation”/, pin: /archived or unpublished/ },
+    pl: { start: /nie została uruchomiona/, run: /„Zakończ symulację”/, pin: /zarchiwizowany lub wycofany/ },
+    de: { start: /nicht gestartet/, run: /„Simulation beenden“/, pin: /archiviert oder zurückgezogen/ },
+    es: { start: /no se inició/, run: /«Terminar simulación»/, pin: /archivado o retirado/ },
+    fr: { start: /n’a pas démarré/, run: /« Terminer la simulation »/, pin: /archivé ou dépublié/ },
+  };
+  for (const [language, want] of Object.entries(expected)) {
+    await I18n.setLanguage(language);
+    const atStart = simulationErrorText(raw, model, { atStart: true });
+    const midRun = simulationErrorText(raw, model);
+    assert.match(atStart, want.start, language);
+    assert.match(midRun, want.run, language);
+    assert.doesNotMatch(atStart, /unchanged|unverändert|bez zmian|inchangée|no cambia|Zakończ|End simulation/i, `${language}: no run exists at Start`);
+    assert.match(simulationErrorText(pin, model, { atStart: true }), want.pin, language);
+    assert.doesNotMatch(simulationErrorText(pin, model, { atStart: true }), /Publish the called process|Opublikuj wywoływany/, language);
+  }
+  await I18n.setLanguage('pl');
+  assert.doesNotMatch(I18n.t('bpmn.simulation_error_scope_limit'), /został bez zmian/);
+  await I18n.setLanguage('en');
+});
+
+test('the start window explains a limit refusal as a start that did not happen', async () => {
+  responder = () => { throw new Error('SIMULATION_CALL_LIMIT: the transition would start instance 9, and a simulation starts at most 8'); };
+  const form = await startWindow(RUNNABLE);
+  click(form.querySelector('[data-act="submit"]'));
+  await flush(5);
+  const shown = [...form.querySelectorAll('tf-alert')].map((alert) => alert.getAttribute('message') ?? alert.textContent).join(' | ');
+  assert.match(shown, /at most 8 processes in one call tree.*The simulation was not started\./);
+  assert.doesNotMatch(shown, /unchanged/);
 });

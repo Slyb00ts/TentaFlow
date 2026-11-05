@@ -92,6 +92,9 @@ test.beforeAll(async ({ browser }, testInfo) => {
     { items: ['a', 'b', 'c'], results: [] }));
     const child = await create('B3 structure child', build([user('Approve', 'Approve payment')]));
     const parent = await create('B3 structure parent', build([call('Call_1', 'Take payment', child), user('After', 'Confirm order')]));
+    // The child reuses the node id of a step in its caller: the wait must carry the child's own name.
+    const sameChild = await create('B3 structure same-id child', build([service('Svc', 'Child service check')]));
+    const sameParent = await create('B3 structure same-id parent', build([call('Call_1', 'Run child', sameChild), service('Svc', 'Parent service check')]));
     const lost = await create('B3 structure callee gone', build([user('Approve', 'Approve payment')]));
     const caller = await create('B3 structure caller of a gone callee', build([call('Call_1', 'Take payment', lost)]));
     await ApiBinary.one('processDefinitionArchiveRequest', { commandId: crypto.randomUUID(), definitionId: lost.id, expectedRevision: 0, archived: true })
@@ -100,7 +103,7 @@ test.beforeAll(async ({ browser }, testInfo) => {
         await ApiBinary.one('processDefinitionArchiveRequest', { commandId: crypto.randomUUID(), definitionId: lost.id,
           expectedRevision: current.definition.draftRevision, archived: true });
       });
-    return { scope: scope.id, repeated: repeated.id, parent: parent.id, caller: caller.id };
+    return { scope: scope.id, repeated: repeated.id, parent: parent.id, caller: caller.id, sameParent: sameParent.id };
   }, FLOW_GRAPH);
   await page.close();
 });
@@ -190,6 +193,8 @@ test('a parallel multi-instance task shows its occurrences and counts them off',
   await expect(group.locator('[data-group-progress]')).toContainText('0 of 3 occurrences done');
   await expect(group.locator('[data-simulation-occurrence]')).toHaveCount(3);
   await expect(win.locator('[data-simulation-open-task]')).toHaveCount(3);
+  // Three identical cards told apart, in ordinal order whatever order the engine listed them in.
+  await expect(win.locator('[data-simulation-open-task] [data-task-occurrence]')).toHaveText(['Occurrence 1', 'Occurrence 2', 'Occurrence 3']);
   await win.locator('[data-simulation-open-task]').first().locator('[data-simulation-task]').click();
   await expect(group.locator('[data-group-progress]')).toContainText('1 of 3 occurrences done', { timeout: 15000 });
   for (let remaining = 2; remaining > 0; remaining -= 1) {
@@ -224,6 +229,19 @@ test('a process call runs the child in the same window, its task is completed th
   await confirm.locator('[data-simulation-task]').click();
   await expect(confirm).toHaveCount(0, { timeout: 15000 });
   await advanceUntil(page, async (current) => (await current.locator('[data-simulation-status="Completed"]').count()) === 1);
+  await expect(win.locator('[data-error]')).toBeHidden();
+  expect(errors, diagnostics(errors, proc)).toEqual([]);
+});
+
+test('a Service step of a called process that reuses its caller\'s node id is named after the called process', async ({ page }) => {
+  test.setTimeout(180000);
+  const errors = collectConsoleErrors(page);
+  const win = await startSimulation(page, ids.sameParent);
+  await advanceUntil(page, async (current) => (await current.locator('[data-simulation-wait]').count()) === 1);
+  const wait = win.locator('[data-simulation-wait]');
+  await expect(wait.locator('strong').first()).toHaveText('Child service check');
+  await expect(wait.locator('[data-instance-label]')).toHaveText('B3 structure same-id child v1');
+  await expect(win.locator('.fb-simulation-events')).not.toContainText('Parent service check');
   await expect(win.locator('[data-error]')).toBeHidden();
   expect(errors, diagnostics(errors, proc)).toEqual([]);
 });

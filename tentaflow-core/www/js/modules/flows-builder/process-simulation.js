@@ -15,7 +15,7 @@ import {
   SIMULATION_STATUSES, SIMULATION_SUBSCRIPTION_KINDS, SIMULATION_TASK_KINDS, blankMessageDraft, blankServiceDraft,
   readMessageDraft, readOutputs, readServiceAnswer, readServiceFixtures, simulationFinished, simulationHorizonReached,
   simulationCallsOtherProcesses, simulationInstanceLabel, simulationMessageCandidates, simulationMessageWaits, simulationScopeInstances, simulationStructure,
-  simulationOpen, simulationServiceSteps, simulationTaskDecision, simulationUnsupportedSteps, simulationWaitSteps,
+  simulationOpen, simulationServiceSteps, simulationTaskDecision, simulationTasksByOccurrence, simulationUnsupportedSteps, simulationWaitSteps,
 } from './simulation-service.js';
 import '/js/components/tf-alert.js';
 import '/js/components/tf-button.js';
@@ -107,7 +107,13 @@ export function simulationErrorText(message, model, context = {}) {
   if (/revision conflict or closed instance/.test(raw)) return text('simulation_error_closed');
   if (/simulation task is assigned to another actor|simulation user task was not found/.test(raw)) return text('simulation_error_task_unavailable');
   if (/process resource not found/.test(raw)) return text('simulation_error_gone');
-  return model ? processExplainError(raw, model) : raw;
+  const explained = model ? processExplainError(raw, model) : raw;
+  // A limit refusal rolls the step back, so the run is as it was; at Start there is no run yet,
+  // and mid-run the same step would hit the same limit again.
+  if (model && /SIMULATION_(?:SCOPE|REPETITION|CALL)_LIMIT/.test(raw)) {
+    return `${explained} ${context.atStart ? text('simulation_error_limit_start') : text('simulation_error_limit_stuck', { end: text('simulation_end') })}`;
+  }
+  return explained;
 }
 
 export function simulationWindow(view, model = null, options = {}) {
@@ -153,8 +159,27 @@ export function simulationWindow(view, model = null, options = {}) {
     alert.scrollIntoView?.({ block: 'nearest' });
   };
 
+  // Every redraw rebuilds the controls, so the one that had the keyboard is found again by its data attributes.
+  let focusKey = null;
+  const focusKeyOf = () => {
+    let el = document.activeElement;
+    while (el && el !== content && content.contains(el)) {
+      const attrs = [...el.attributes].filter((attr) => attr.name.startsWith('data-'));
+      if (attrs.length) return attrs.map((attr) => `[${attr.name}="${CSS.escape(attr.value)}"]`).join('');
+      el = el.parentElement;
+    }
+    return null;
+  };
+  const restoreFocus = (key) => {
+    const host = key ? content.querySelector(key) : null;
+    if (!host) return;
+    const control = host.matches('button,input,textarea,select') ? host : host.querySelector('button:not([disabled]),input,textarea,select,[tabindex]');
+    (control ?? host).focus?.();
+  };
+
   const run = async (action, hooks = {}) => {
     if (busy || !win.isConnected) return;
+    focusKey = focusKeyOf() ?? focusKey;
     busy = true;
     win.querySelectorAll('tf-button').forEach((button) => button.setAttribute('disabled', ''));
     win.querySelector('[data-error]').hidden = true;
@@ -173,6 +198,7 @@ export function simulationWindow(view, model = null, options = {}) {
     } finally {
       busy = false;
       if (win.isConnected) render();
+      focusKey = null;
     }
   };
 
@@ -194,6 +220,7 @@ export function simulationWindow(view, model = null, options = {}) {
 
   const render = () => {
     if (!win.isConnected) return;
+    const refocus = focusKey ?? focusKeyOf();
     captureDrafts();
     const waits = simulationWaitSteps(current.serviceWaits, model);
     for (const jobId of [...drafts.keys()]) {
@@ -230,6 +257,8 @@ export function simulationWindow(view, model = null, options = {}) {
     // A run with one instance looks as it always did; with several, each item names the process it belongs to.
     const chipFor = (label) => (label ? `<tf-chip status="info" data-instance-label>${escapeHtml(label)}</tf-chip>` : '');
     const structure = simulationStructure(current);
+    const occurrences = current.repetitionOccurrences || [];
+    const occurrenceChip = (occurrence) => (occurrence ? ` <tf-chip status="info" data-task-occurrence>${escapeHtml(text('simulation_occurrence', { ordinal: occurrence.ordinal + 1 }))}</tf-chip>` : '');
     const hasStructure = multi || structure.some((row) => row.scopes.length || row.groups.length);
     const subscriptions = current.subscriptions || [];
     const messages = current.messages || [];
@@ -305,17 +334,26 @@ export function simulationWindow(view, model = null, options = {}) {
         <ul class="fb-simulation-awaited">${structure.map((row) => `<li data-simulation-instance="${escapeAttr(row.instance.instanceId)}" data-depth="${row.depth}" style="margin-inline-start: ${row.depth * 20}px">
           <strong>${escapeHtml(row.instance.definitionName)}</strong> v${row.instance.version}
           <tf-chip status="${row.instance.status === 'Completed' ? 'ok' : ['Incident', 'Error'].includes(row.instance.status) ? 'err' : 'info'}">${escapeHtml(known(SIMULATION_STATUSES, row.instance.status, 'simulation_status'))}</tf-chip>
-          ${row.call ? `<div data-simulation-call>${escapeHtml(text('simulation_called_by', { node: elementName(row.call.callNodeId, row.call.callNodeName) }))}${row.call.local ? ` · ${escapeHtml(text('simulation_call_local'))}` : ''}
+          ${row.call ? `<div data-simulation-call>${escapeHtml(text('simulation_called_by', { node: elementName(row.call.callNodeId, row.call.callNodeName) }))}${row.occurrence ? ` · <span data-call-occurrence>${escapeHtml(text('simulation_occurrence', { ordinal: row.occurrence.ordinal + 1 }))}</span>` : ''}${row.call.local ? ` · ${escapeHtml(text('simulation_call_local'))}` : ''}
             <tf-chip status="${row.call.status === 'Returned' ? 'ok' : row.call.status === 'Waiting' ? 'info' : 'warn'}">${escapeHtml(known(CALL_STATUSES, row.call.status, 'simulation_call_status'))}</tf-chip></div>` : ''}
           ${row.scopes.length ? `<ul>${row.scopes.map((scope) => `<li data-simulation-scope="${escapeAttr(scope.scopeId)}"><strong>${escapeHtml(elementName(scope.subprocessNodeId, scope.subprocessNodeName))}</strong> · ${escapeHtml(text('simulation_scope'))}
             <tf-chip status="${scope.status === 'Completed' ? 'ok' : ['Incident', 'Error'].includes(scope.status) ? 'err' : 'info'}">${escapeHtml(known(SIMULATION_STATUSES, scope.status, 'simulation_status'))}</tf-chip></li>`).join('')}</ul>` : ''}
           ${row.groups.length ? `<ul>${row.groups.map(({ group, occurrences: items }) => {
-            const open = items.find((occurrence) => !OCCURRENCE_DONE.includes(looseKey(occurrence.status)));
-            return `<li data-simulation-group="${escapeAttr(group.groupId)}"><strong>${escapeHtml(elementName(group.nodeId, group.nodeName))}</strong> · ${escapeHtml(knownLoose(GROUP_MODES, group.mode, 'simulation_group_mode'))}
+            const finishedGroup = ['completed', 'cancelled'].includes(looseKey(group.status));
+            const sequential = looseKey(group.mode) !== 'multiinstanceparallel';
+            const running = items.filter((occurrence) => !OCCURRENCE_DONE.includes(looseKey(occurrence.status)));
+            const current = running.length
+              ? ` · ${escapeHtml(sequential ? text('simulation_group_current', { ordinal: running[0].ordinal + 1 })
+                : text('simulation_group_running', { count: running.length, list: running.map((occurrence) => occurrence.ordinal + 1).join(', ') }))}` : '';
+            const progressKey = group.total != null ? 'simulation_group_progress'
+              : looseKey(group.mode) !== 'structuredloop' ? 'simulation_group_progress_unknown'
+                : group.maxIterations != null ? 'simulation_group_progress_open' : 'simulation_group_progress_loop';
+            const list = `<ul>${items.map((occurrence) => `<li data-simulation-occurrence="${escapeAttr(occurrence.occurrenceId)}">${escapeHtml(text('simulation_occurrence', { ordinal: occurrence.ordinal + 1 }))}
+                <tf-chip status="${looseKey(occurrence.status) === 'completed' ? 'ok' : 'info'}">${escapeHtml(knownLoose(OCCURRENCE_STATUSES, occurrence.status, 'simulation_occurrence_status'))}</tf-chip></li>`).join('')}</ul>`;
+            return `<li data-simulation-group="${escapeAttr(group.groupId)}" data-group-finished="${finishedGroup}"><strong>${escapeHtml(elementName(group.nodeId, group.nodeName))}</strong> · ${escapeHtml(knownLoose(GROUP_MODES, group.mode, 'simulation_group_mode'))}
               <tf-chip status="${looseKey(group.status) === 'completed' ? 'ok' : looseKey(group.status) === 'incident' ? 'err' : 'info'}">${escapeHtml(knownLoose(GROUP_STATUSES, group.status, 'simulation_group_status'))}</tf-chip>
-              <div data-group-progress>${escapeHtml(text(group.total == null ? 'simulation_group_progress_open' : 'simulation_group_progress', { done: group.completed, total: group.total ?? '', max: group.maxIterations ?? '' }))}${open ? ` · ${escapeHtml(text('simulation_group_current', { ordinal: open.ordinal + 1 }))}` : ''}</div>
-              <ul>${items.map((occurrence) => `<li data-simulation-occurrence="${escapeAttr(occurrence.occurrenceId)}">${escapeHtml(text('simulation_occurrence', { ordinal: occurrence.ordinal + 1 }))}
-                <tf-chip status="${looseKey(occurrence.status) === 'completed' ? 'ok' : 'info'}">${escapeHtml(knownLoose(OCCURRENCE_STATUSES, occurrence.status, 'simulation_occurrence_status'))}</tf-chip></li>`).join('')}</ul></li>`;
+              <div data-group-progress>${escapeHtml(text(progressKey, { done: group.completed, total: group.total ?? 0, max: group.maxIterations ?? 0 }))}${finishedGroup ? '' : current}</div>
+              ${finishedGroup ? `<tf-disclosure data-group-occurrences label="${escapeAttr(text('simulation_group_occurrences', { count: items.length }))}">${list}</tf-disclosure>` : list}</li>`;
           }).join('')}</ul>` : ''}
         </li>`).join('')}</ul>
       </section>` : ''}
@@ -324,7 +362,7 @@ export function simulationWindow(view, model = null, options = {}) {
           const prepared = wait.mode === 'Fixture';
           const fixture = prepared ? fixtures.get(wait.nodeId) : null;
           return `<article class="fb-simulation-wait" data-simulation-wait="${escapeAttr(wait.jobId)}" data-node-id="${escapeAttr(wait.nodeId)}">
-          <div><strong>${escapeHtml(elementName(wait.nodeId))}</strong> ${chipFor(instanceText(wait.instanceId))}
+          <div><strong>${escapeHtml(elementName(wait.nodeId, wait.nodeName))}</strong> ${chipFor(instanceText(wait.instanceId))}
             <tf-chip status="info">${escapeHtml(text(prepared ? 'simulation_wait_fixture' : 'simulation_wait_result'))}</tf-chip></div>
           <section class="fb-process-json"><h4>${escapeHtml(text('simulation_wait_input'))}</h4>
             <tf-code-editor readonly data-simulation-wait-input language="json" aria-label="${escapeAttr(text('simulation_wait_input'))}"></tf-code-editor></section>
@@ -339,9 +377,9 @@ export function simulationWindow(view, model = null, options = {}) {
         }).join('')}
       </section>` : ''}
       ${cancelledServices.length ? `<section class="fb-simulation-section" data-simulation-cancelled-services><h3>${escapeHtml(text('simulation_services_cancelled'))}</h3>
-        ${cancelledServices.map((entry) => `<article class="fb-simulation-task"><strong>${escapeHtml(elementName(entry.nodeId))}</strong> <tf-chip status="warn">${escapeHtml(text('simulation_task_cancelled'))}</tf-chip></article>`).join('')}</section>` : ''}
+        ${cancelledServices.map((entry) => `<article class="fb-simulation-task"><strong>${escapeHtml(elementName(entry.nodeId, entry.nodeName))}</strong> <tf-chip status="warn">${escapeHtml(text('simulation_task_cancelled'))}</tf-chip></article>`).join('')}</section>` : ''}
       <section class="fb-simulation-section"><h3>${escapeHtml(text('simulation_tasks'))}</h3>
-        ${openTasks.length ? openTasks.map((task) => {
+        ${openTasks.length ? simulationTasksByOccurrence(openTasks, occurrences).map(({ task, occurrence }) => {
           const manual = task.kind === 'Manual';
           const verification = task.kind === 'Verification';
           const id = escapeAttr(task.userTaskId);
@@ -358,14 +396,14 @@ export function simulationWindow(view, model = null, options = {}) {
                 <p class="fb-field-hint">${escapeHtml(text('simulation_editor_escape_hint'))}</p>
                 <tf-alert data-task-error tone="danger" hidden></tf-alert>
                 <tf-button variant="primary" size="sm" data-simulation-task="${id}" data-simulation-manual="false" ${busy ? 'disabled' : ''}>${escapeHtml(text('simulation_complete_task'))}</tf-button>`;
-          return `<article class="fb-simulation-task" data-simulation-open-task="${id}"><div><strong>${escapeHtml(elementName(task.nodeId, task.name))}</strong> ${chipFor(scopeInstanceText(task.scopeId))} · ${escapeHtml(known(SIMULATION_TASK_KINDS, task.kind, 'simulation_task_kind'))}</div>
+          return `<article class="fb-simulation-task" data-simulation-open-task="${id}"><div><strong>${escapeHtml(elementName(task.nodeId, task.name))}</strong> ${chipFor(scopeInstanceText(task.scopeId))}${occurrenceChip(occurrence)} · ${escapeHtml(known(SIMULATION_TASK_KINDS, task.kind, 'simulation_task_kind'))}</div>
             <div>${escapeHtml(task.instructions || '')}</div>
             ${controls}
           </article>`;
         }).join('') : `<p>${escapeHtml(text('simulation_empty_tasks'))}</p>`}
-        ${doneTasks.length ? `<h3>${escapeHtml(text('simulation_tasks_done'))}</h3>${doneTasks.map((task) => {
+        ${doneTasks.length ? `<h3>${escapeHtml(text('simulation_tasks_done'))}</h3>${simulationTasksByOccurrence(doneTasks, occurrences).map(({ task, occurrence }) => {
           const decided = decision(task);
-          return `<article class="fb-simulation-task" data-simulation-done-task="${escapeAttr(task.userTaskId)}"><div><strong>${escapeHtml(elementName(task.nodeId, task.name))}</strong> ${chipFor(scopeInstanceText(task.scopeId))} · ${escapeHtml(known(SIMULATION_TASK_KINDS, task.kind, 'simulation_task_kind'))}
+          return `<article class="fb-simulation-task" data-simulation-done-task="${escapeAttr(task.userTaskId)}"><div><strong>${escapeHtml(elementName(task.nodeId, task.name))}</strong> ${chipFor(scopeInstanceText(task.scopeId))}${occurrenceChip(occurrence)} · ${escapeHtml(known(SIMULATION_TASK_KINDS, task.kind, 'simulation_task_kind'))}
             <tf-chip status="${task.status === 'Completed' ? 'ok' : 'warn'}">${escapeHtml(text(task.status === 'Completed' ? 'simulation_task_completed' : 'simulation_task_cancelled'))}</tf-chip>
             ${decided ? `<tf-chip status="${decided === 'approved' ? 'ok' : 'err'}" data-simulation-decision="${decided}">${escapeHtml(text(decided === 'approved' ? 'simulation_decision_approved' : 'simulation_decision_rejected'))}</tf-chip>` : ''}</div></article>`;
         }).join('')}` : ''}
@@ -418,7 +456,7 @@ export function simulationWindow(view, model = null, options = {}) {
         }).join('') : `<p>${escapeHtml(text('simulation_empty_timers'))}</p>`}
       </section>
       <section class="fb-simulation-section"><h3>${escapeHtml(text('simulation_events'))}</h3>
-        ${events.length ? `<ol class="fb-simulation-events">${shownEvents.map((event) => `<li><span>${escapeHtml(timeText(event.atMs))}</span> ${escapeHtml(eventLabel(event))}${event.nodeId ? ` · ${escapeHtml(elementName(event.nodeId))}` : ''}${multi && instanceText(event.instanceId) ? ` · <em data-event-instance>${escapeHtml(instanceText(event.instanceId))}</em>` : ''}</li>`).join('')}</ol>` : `<p>${escapeHtml(text('simulation_empty_events'))}</p>`}
+        ${events.length ? `<ol class="fb-simulation-events">${shownEvents.map((event) => `<li><span>${escapeHtml(timeText(event.atMs))}</span> ${escapeHtml(eventLabel(event))}${event.nodeId ? ` · ${escapeHtml(elementName(event.nodeId, event.nodeName))}` : ''}${multi && instanceText(event.instanceId) ? ` · <em data-event-instance>${escapeHtml(instanceText(event.instanceId))}</em>` : ''}</li>`).join('')}</ol>` : `<p>${escapeHtml(text('simulation_empty_events'))}</p>`}
         ${hiddenEvents > 0 ? `<p data-simulation-events-omitted>${escapeHtml(text('simulation_events_omitted', { count: hiddenEvents }))}</p>` : ''}
         ${current.traceStepsOmitted > 0 ? `<p data-simulation-trace-omitted>${escapeHtml(text('simulation_trace_steps_omitted', { count: current.traceStepsOmitted }))}</p>` : ''}
       </section>`;
@@ -439,6 +477,7 @@ export function simulationWindow(view, model = null, options = {}) {
     fieldErrors.clear();
     const payloadEditor = messageField('payload');
     if (payloadEditor) payloadEditor.value = messageDraft.payload;
+    restoreFocus(refocus);
   };
 
   const showMessageErrors = (errors = {}) => {
@@ -692,7 +731,7 @@ export function openProcessSimulation(definition, version, startCatalog, selecte
     sections: [selection, variables, ...(fixtures ? [fixtures] : [])],
     width: 720,
     submitLabel: text('simulation_start'), busyLabel: text('simulation_starting'), anchor,
-    errorMessage: (error) => simulationErrorText(error?.message, definition.model),
+    errorMessage: (error) => simulationErrorText(error?.message, definition.model, { atStart: true }),
     validate: () => {
       const selected = selection.querySelector('[data-simulation-start]').value;
       if (selected !== '') {
