@@ -634,6 +634,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   symulacji, a start wiadomością jest odrzucany. Przy okazji naprawiono błąd
   produkcyjny: nieprzerywający timer brzegowy, na którego ścieżce jest rzucenie
   sygnału, nigdy się nie odpalał.
+- Symulacja struktury (B3.7c). Symulacja obsługuje podprocesy osadzone,
+  powtórzenia (wielokrotne instancje równoległe i sekwencyjne oraz pętle) i
+  wywołania procesów. Opublikowane wersje wywoływanych procesów są czytane
+  z produkcji jednorazowo przy starcie i przypinane w prywatnej bazie, więc
+  późniejsza archiwizacja nie zmienia trwającego przebiegu. Okno pokazuje
+  panel struktury (drzewo wywołań, zakresy, grupy powtórzeń z licznikami),
+  numer wystąpienia na kartach zadań, nazwy kroków wywoływanego procesu z jego
+  własnego modelu oraz zadania innych wykonawców tylko do odczytu. Limity
+  (32 zakresy, 32 grupy powtórzeń, 128 wystąpień, 8 instancji w drzewie
+  wywołań) kończą się zrozumiałym komunikatem w pięciu językach. Przebieg
+  z kodem wykonawczym `RealExecution` nadal jest odrzucany.
 
 ### TentaNas
 
