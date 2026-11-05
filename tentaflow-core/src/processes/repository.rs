@@ -28,7 +28,9 @@ use tentaflow_protocol::processes::{
 use uuid::Uuid;
 
 use super::model::{starter_model, validate_model, validate_variables, GatewayKind, MAX_MODEL_BYTES};
-use super::runtime::validate_output;
+use super::runtime::{
+    derived_runtime_id_source, random_runtime_id_source, validate_output, RuntimeIdSourceHandle,
+};
 use super::simulation::{
     self, AuthenticatedSimulationAction, AuthenticatedSimulationSource, PrivateSimulationMode,
     SimulationSourcePin,
@@ -2801,7 +2803,7 @@ pub(crate) fn fire_timer_on(
     };
     if apply_canonical_call_steps {
         cancelled_claims.extend(apply_canonical_call_steps_on(tx,
-            &result.instance_id, &actor.user_id, plan, at_ms)?);
+            &result.instance_id, &actor.user_id, plan, at_ms, mode)?);
         result = instance_on(tx, actor, &result.instance_id, None)?;
     }
     Ok(Some(ProcessTransitionOutcome {
@@ -3946,6 +3948,7 @@ pub(crate) fn capture_simulation_source(
         );
         let version = version_on(conn, definition_id, version_number)?;
         require_version_execution_on(conn, actor, definition_id, version_number)?;
+        let call_closure = simulation_call_closure_on(conn, actor, &version)?;
         let body = super::model::selected_body(&version.model, selected_process_id, &[])?;
         let start = body
             .nodes
@@ -4000,8 +4003,101 @@ pub(crate) fn capture_simulation_source(
             start_ms,
             horizon_ms,
             tick_duration_ms,
+            call_closure,
         )
     })
+}
+
+fn call_pin_rows_on(
+    conn: &Connection,
+    definition_id: &str,
+    version: u32,
+) -> Result<(Vec<simulation::SimulationCallPin>, Vec<simulation::SimulationCallDependency>)> {
+    let mut pins = conn.prepare(
+        "SELECT node_id,called_definition_id,called_version,called_element_json,model_sha256 FROM bpmn_call_pins WHERE definition_id=?1 AND version=?2 ORDER BY node_id",
+    )?;
+    let pins = pins
+        .query_map(params![definition_id, version], |row| {
+            Ok(simulation::SimulationCallPin {
+                node_id: row.get(0)?,
+                called_definition_id: row.get(1)?,
+                called_version: row.get(2)?,
+                called_element_json: row.get(3)?,
+                model_sha256: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut dependencies = conn.prepare(
+        "SELECT called_definition_id,called_version,model_sha256 FROM bpmn_call_dependencies WHERE definition_id=?1 AND version=?2 ORDER BY called_definition_id,called_version",
+    )?;
+    let dependencies = dependencies
+        .query_map(params![definition_id, version], |row| {
+            Ok(simulation::SimulationCallDependency {
+                called_definition_id: row.get(0)?,
+                called_version: row.get(1)?,
+                model_sha256: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((pins, dependencies))
+}
+
+/// Reads, once and without writing, the published versions a simulated version calls
+/// together with the call pins production holds for them. A call production would
+/// refuse (a target that is not published, archived, or not the actor's) is refused
+/// here with a named code instead of becoming an incident in the middle of a run.
+fn simulation_call_closure_on(
+    conn: &Connection,
+    actor: &ProcessActor,
+    version: &ProcessVersion,
+) -> Result<simulation::SimulationCallClosure> {
+    if !super::model::all_nodes(&version.model)
+        .iter()
+        .any(|node| matches!(node.kind, ProcessNodeKind::CallActivity(_)))
+    {
+        return Ok(simulation::SimulationCallClosure::default());
+    }
+    let unavailable = |detail: String| {
+        simulation::SimulationServiceError::new(simulation::SIMULATION_CALL_PIN_UNAVAILABLE, detail)
+    };
+    let pinned = pinned_call_versions_on(conn, actor, &version.definition_id, version.version, &version.model)
+        .map_err(|error| unavailable(format!("{error:#}")))?;
+    let mut versions = Vec::with_capacity(pinned.len());
+    let mut bytes = 0_usize;
+    for target in pinned {
+        if let Some(reason) = target.admission_error {
+            return Err(unavailable(format!(
+                "production would refuse the call to version {} of {}: {reason}",
+                target.version.version, target.version.definition_id
+            )));
+        }
+        let model_json: String = conn.query_row(
+            "SELECT model_json FROM bpmn_versions WHERE definition_id=?1 AND version=?2",
+            params![target.version.definition_id, target.version.version],
+            |row| row.get(0),
+        )?;
+        bytes = bytes.saturating_add(model_json.len());
+        ensure!(
+            bytes <= 4 * 1024 * 1024,
+            unavailable("the called versions exceed the 4 MiB closure limit".into())
+        );
+        let (pins, dependencies) =
+            call_pin_rows_on(conn, &target.version.definition_id, target.version.version)?;
+        versions.push(simulation::SimulationCalledVersion {
+            definition_id: target.version.definition_id.clone(),
+            version: target.version.version,
+            name: target.name,
+            model_json,
+            model_sha256: target.version.model_sha256.clone(),
+            published_at_ms: target.version.published_at_ms,
+            pins,
+            dependencies,
+        });
+    }
+    versions.sort_by(|a, b| (&a.definition_id, a.version).cmp(&(&b.definition_id, b.version)));
+    let (source_pins, source_dependencies) =
+        call_pin_rows_on(conn, &version.definition_id, version.version)?;
+    Ok(simulation::SimulationCallClosure { versions, source_pins, source_dependencies })
 }
 
 /// Rechecks the live publication and execution ACL before one simulator read
@@ -4171,10 +4267,22 @@ pub(crate) fn install_simulation_source(
         params![input.org_id, process_name, org_slug],
     )?;
 
+    let called_models = input
+        .call_closure
+        .versions
+        .iter()
+        .map(|version| {
+            serde_json::from_str::<ProcessModel>(&version.model_json)
+                .context("decode a pinned called version")
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut identities = HashSet::new();
     identities.insert(input.owner_user_id.clone());
     identities.insert(input.actor_user_id.clone());
-    for node in super::model::all_nodes(model) {
+    for node in std::iter::once(model)
+        .chain(called_models.iter())
+        .flat_map(super::model::all_nodes)
+    {
         match &node.kind {
             ProcessNodeKind::UserTask {
                 assignee_user_id: Some(user_id),
@@ -4230,6 +4338,77 @@ pub(crate) fn install_simulation_source(
             input.owner_user_id,
         ],
     )?;
+    // The versions the source calls are pinned as production holds them, so a call
+    // resolves inside the private database and never reads production again. Their
+    // service snapshots are left out: nothing in a simulation runs a flow, tool or
+    // agent for real.
+    for version in &input.call_closure.versions {
+        tx.execute(
+            "INSERT INTO bpmn_definitions(definition_id,org_id,owner_user_id,name,description,draft_revision,model_json,published_version,archived,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,'',1,?5,?6,0,?7,?7) ON CONFLICT(definition_id) DO UPDATE SET published_version=MAX(published_version,excluded.published_version)",
+            params![
+                version.definition_id,
+                input.org_id,
+                input.owner_user_id,
+                version.name,
+                version.model_json,
+                version.version,
+                input.start_ms,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO bpmn_versions(definition_id,version,model_json,model_sha256,service_snapshots_json,published_at_ms,published_by) VALUES(?1,?2,?3,?4,'[]',?5,?6)",
+            params![
+                version.definition_id,
+                version.version,
+                version.model_json,
+                version.model_sha256,
+                version.published_at_ms,
+                input.owner_user_id,
+            ],
+        )?;
+    }
+    let pinned_rows = std::iter::once((
+        input.definition_id.as_str(),
+        input.version,
+        &input.call_closure.source_pins,
+        &input.call_closure.source_dependencies,
+    ))
+    .chain(input.call_closure.versions.iter().map(|version| {
+        (
+            version.definition_id.as_str(),
+            version.version,
+            &version.pins,
+            &version.dependencies,
+        )
+    }));
+    for (definition_id, version, pins, dependencies) in pinned_rows {
+        for dependency in dependencies {
+            tx.execute(
+                "INSERT INTO bpmn_call_dependencies(definition_id,version,called_definition_id,called_version,model_sha256) VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    definition_id,
+                    version,
+                    dependency.called_definition_id,
+                    dependency.called_version,
+                    dependency.model_sha256,
+                ],
+            )?;
+        }
+        for pin in pins {
+            tx.execute(
+                "INSERT INTO bpmn_call_pins(definition_id,version,node_id,called_definition_id,called_version,called_element_json,model_sha256) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    definition_id,
+                    version,
+                    pin.node_id,
+                    pin.called_definition_id,
+                    pin.called_version,
+                    pin.called_element_json,
+                    pin.model_sha256,
+                ],
+            )?;
+        }
+    }
     tx.commit()
         .context("commit private published process source")?;
     Ok(())
@@ -6836,9 +7015,10 @@ fn insert_event_on(
         json(&event.data)?.len() <= 384 * 1024,
         "process event data exceeds 384 KiB"
     );
-    let event_id = planned_event_id
-        .map(str::to_owned)
-        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let event_id = match planned_event_id {
+        Some(id) => id.to_owned(),
+        None => writer_row_id(tx, "event", &format!("{instance_id}/{seq}"))?,
+    };
     ensure!(
         Uuid::parse_str(&event_id).is_ok(),
         "process event identity must be a UUID"
@@ -7684,14 +7864,18 @@ fn call_incident_on(
     message: &str,
     at_ms: i64,
 ) -> Result<()> {
-    let incident_id = Uuid::new_v4().to_string();
-    let full = bounded_failure_message(message);
-    tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms,resolved_at_ms) VALUES(?1,?2,?3,?4,NULL,?5,?6,?7,NULL)",params![incident_id,call.parent_instance_id,call.parent_scope_id,call.call_node_id,code,incident_message(&full),at_ms])?;
     let seq = tx.query_row(
         "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
         [&call.parent_instance_id],
         |r| row_u64(r, 0),
     )?;
+    let incident_id = writer_row_id(
+        tx,
+        "call_incident",
+        &format!("{}/{}/{code}", call.call_id, seq),
+    )?;
+    let full = bounded_failure_message(message);
+    tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms,resolved_at_ms) VALUES(?1,?2,?3,?4,NULL,?5,?6,?7,NULL)",params![incident_id,call.parent_instance_id,call.parent_scope_id,call.call_node_id,code,incident_message(&full),at_ms])?;
     insert_event_on(
         tx,
         &call.parent_instance_id,
@@ -7965,6 +8149,7 @@ fn apply_call_steps_on(
     skipped: &mut HashSet<String>,
     staged_requests: &mut BTreeMap<String, Vec<CallRequest>>,
     failed_requests: &mut HashMap<(String, String), String>,
+    mode: ExecutionMode,
 ) -> Result<Vec<CancelledJobClaim>> {
     let mut claims = Vec::new();
     for (offset, step) in steps.iter().enumerate() {
@@ -8199,13 +8384,29 @@ fn apply_call_steps_on(
                         },
                     };
                     tx.execute("INSERT INTO bpmn_calls(call_id,parent_instance_id,parent_scope_id,parent_token_id,parent_arrival_edge_id,call_node_id,child_instance_id,definition_id,version,called_definition_id,called_version,called_process_id,child_start_node_id,model_sha256,revision,status,created_at_ms,updated_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,1,'waiting',?15,?15)",params![actual.call_id,actual.parent_instance_id,actual.parent_scope_id,actual.parent_token_id,actual.parent_arrival_edge_id,actual.call_node_id,actual.child_instance_id,actual.definition_id,actual.version,actual.called_definition_id,actual.called_version,actual.called_process_id,actual.child_start_node_id,actual.model_sha256,at_ms])?;
+                    // A durable start overlays the inputs on the called body's defaults
+                    // itself; a private simulation starts from exactly what it is given,
+                    // so a called child is handed the overlay already made.
+                    let child_inputs = match mode {
+                        ExecutionMode::Durable => call.variables.clone(),
+                        ExecutionMode::Simulation(_) => {
+                            let mut merged = serde_json::to_value(&called_body.variables)?;
+                            for (key, value) in call.variables.as_object()
+                                .context("called child inputs are not an object")? {
+                                merged.as_object_mut()
+                                    .context("called body defaults are not an object")?
+                                    .insert(key.clone(), value.clone());
+                            }
+                            merged
+                        }
+                    };
                     start_instance_on(
                         tx,
                         &actor,
                         &actual.child_instance_id,
                         &actual.called_definition_id,
                         actual.called_version,
-                        &call.variables,
+                        &child_inputs,
                         Some(&actual.called_process_id),
                         Some(&actual.child_start_node_id),
                         plan,
@@ -8213,7 +8414,7 @@ fn apply_call_steps_on(
                         None,
                         None,
                         &entry,
-                        ExecutionMode::Durable,
+                        mode,
                     )?;
                     let repeated_group: Option<String> = tx.query_row(
                         "SELECT group_id FROM bpmn_repetition_occurrences WHERE instance_id=?1 AND scope_id=?2 AND token_id=?3",
@@ -8348,7 +8549,7 @@ fn apply_call_steps_on(
                         require_call_control_authority_on(tx, &actor, &actual.parent_instance_id)?;
                     }
                     tx.execute("UPDATE bpmn_calls SET status=?1,revision=revision+1,updated_at_ms=?2 WHERE call_id=?3 AND revision=?4",params![call_status_text(status),at_ms,actual.call_id,sql_incrementable(actual.revision)?])?;
-                    let claims = apply_plan_on(
+                    let claims = apply_plan_with_mode_on(
                         tx,
                         &actual.parent_instance_id,
                         actor_id,
@@ -8359,6 +8560,7 @@ fn apply_call_steps_on(
                         EntryAuthority::Accepted(&entry),
                         staged_requests.get(&actual.parent_instance_id)
                             .map(Vec::as_slice).unwrap_or(&[]),
+                        mode,
                     )?;
                     validate_call_tree_budget_on(tx, &actual.parent_instance_id)?;
                     Ok(claims)
@@ -8395,8 +8597,9 @@ fn apply_call_steps_on(
                         "Call admission lacks its unique same-plan incident event");
                     let event_id = plan.event_ids.get(&events[0].0)
                         .context("Call admission event lacks its producer-minted identity")?;
-                    let claims = apply_plan_on(tx, instance_id, actor_id, *expected_revision,
-                        plan, at_ms, None, EntryAuthority::CallAdmission, requests)?;
+                    let claims = apply_plan_with_mode_on(tx, instance_id, actor_id,
+                        *expected_revision, plan, at_ms, None, EntryAuthority::CallAdmission,
+                        requests, mode)?;
                     let facts: u32 = tx.query_row(
                         "SELECT COUNT(*) FROM bpmn_events e JOIN bpmn_incidents i ON i.instance_id=e.instance_id AND i.scope_id=e.scope_id AND i.node_id=e.node_id WHERE e.event_id=?1 AND e.instance_id=?2 AND e.scope_id=?3 AND e.node_id=?4 AND e.kind='incident' AND e.data_json=?5 AND i.incident_id=?6 AND i.code='CALL_ADMISSION_ERROR' AND i.message=?7 AND i.resolved_at_ms IS NULL",
                         params![event_id,instance_id,request.parent_scope_id,
@@ -21123,7 +21326,7 @@ pub(crate) fn start_simulation_plan_on(
             if started == instance_id),
         "simulation start entry does not match its instance"
     );
-    start_instance_on(
+    let started = start_instance_on(
         tx,
         actor,
         instance_id,
@@ -21140,7 +21343,18 @@ pub(crate) fn start_simulation_plan_on(
         None,
         accepted,
         ExecutionMode::Simulation(mode),
-    )
+    )?;
+    // A Start that goes straight into a call starts the called child in the same
+    // transition, as a production start does.
+    apply_canonical_call_steps_on(
+        tx,
+        instance_id,
+        &actor.user_id,
+        plan,
+        at_ms,
+        ExecutionMode::Simulation(mode),
+    )?;
+    Ok(started)
 }
 
 pub(crate) fn apply_simulation_plan_on(
@@ -21184,7 +21398,44 @@ pub(crate) fn apply_simulation_plan_on(
         &[],
         ExecutionMode::Simulation(mode),
     )?;
+    apply_canonical_call_steps_on(
+        tx,
+        instance_id,
+        &actor.user_id,
+        plan,
+        at_ms,
+        ExecutionMode::Simulation(mode),
+    )?;
     instance_on(tx, actor, instance_id, None)
+}
+
+/// The instances of the call tree a private run has started so far: the simulated
+/// instance first, then everything it called, parents before their children.
+pub(crate) fn simulation_call_tree_on(
+    conn: &Connection,
+    mode: PrivateSimulationMode,
+    instance_id: &str,
+) -> Result<Vec<String>> {
+    mode.verify_on(conn)?;
+    call_tree_ids_on(conn, instance_id)
+}
+
+/// The calls of the private run, one row per call, in the order they were made.
+pub(crate) fn simulation_calls_on(
+    conn: &Connection,
+    mode: PrivateSimulationMode,
+    instance_ids: &[String],
+) -> Result<Vec<CallActivation>> {
+    mode.verify_on(conn)?;
+    let mut calls = Vec::new();
+    for instance_id in instance_ids {
+        calls.extend(
+            calls_on(conn, instance_id)?
+                .into_iter()
+                .filter(|call| &call.parent_instance_id == instance_id),
+        );
+    }
+    Ok(calls)
 }
 
 /// Advances the instance revision for a simulated transition that changes no
@@ -22547,9 +22798,11 @@ fn apply_plan_with_mode_on(
     let mut staged_call_requests = BTreeMap::new();
     staged_call_requests.insert(instance_id.to_owned(), plan.call_requests.clone());
     let mut failed_call_requests = HashMap::new();
+    ensure!(plan.call_steps.is_empty() || mode == ExecutionMode::Durable,
+        "a private simulation derives its call steps itself");
     cancelled_claims.extend(apply_call_steps_on(tx, instance_id, actor_id,
         &plan.call_steps, at_ms, 0, &mut HashSet::new(),
-        &mut staged_call_requests, &mut failed_call_requests)?);
+        &mut staged_call_requests, &mut failed_call_requests, mode)?);
     if !plan.call_steps.is_empty() {
         validate_staged_call_requests_on(tx, &staged_call_requests, &failed_call_requests)?;
     }
@@ -22925,6 +23178,32 @@ fn append_call_plan(
     Ok(())
 }
 
+/// Row identities the call machinery mints for the plans it makes on its own:
+/// random for a durable run, derived from the call that asks for them in a private
+/// simulation, so the same input produces the same rows.
+fn call_id_source(mode: ExecutionMode, seed: String) -> RuntimeIdSourceHandle {
+    match mode {
+        ExecutionMode::Durable => random_runtime_id_source(),
+        ExecutionMode::Simulation(_) => derived_runtime_id_source(seed),
+    }
+}
+
+/// A row identity the writer itself mints. A private simulation derives it from the
+/// row it belongs to, so a repeated run writes the same rows; anywhere else it is
+/// random. The private database is recognised by its schema, as it is for the
+/// audit trail.
+fn writer_row_id(conn: &Connection, kind: &str, parent: &str) -> Result<String> {
+    Ok(if is_private_simulation(conn)? {
+        Uuid::new_v5(
+            &Uuid::NAMESPACE_OID,
+            format!("tentaflow.simulation.v1/writer/{kind}/{parent}").as_bytes(),
+        )
+        .to_string()
+    } else {
+        Uuid::new_v4().to_string()
+    })
+}
+
 fn record_call_step(
     snapshots: &mut BTreeMap<String, RuntimeSnapshot>,
     steps: &mut Vec<CallStep>,
@@ -22937,22 +23216,29 @@ fn record_call_step(
     skipped: &mut HashSet<String>,
     staged_requests: &mut BTreeMap<String, Vec<CallRequest>>,
     failed_requests: &mut HashMap<(String, String), String>,
+    mode: ExecutionMode,
 ) -> Result<()> {
-    if let CallStep::Advance { plan, .. } = &mut step {
+    if let CallStep::Advance { plan, request, .. } = &mut step {
         let indices = plan.events.iter().enumerate().filter_map(|(index, event)|
             (event.kind == "incident"
                 && event.data["code"].as_str() == Some("CALL_ADMISSION_ERROR"))
                 .then_some(index)).collect::<Vec<_>>();
         ensure!(indices.len() == 1,
             "Call admission producer must identify one incident event");
-        ensure!(plan.event_ids.insert(indices[0], Uuid::new_v4().to_string()).is_none(),
+        let event_id = match mode {
+            ExecutionMode::Durable => Uuid::new_v4().to_string(),
+            ExecutionMode::Simulation(_) => {
+                simulation_derived_id(mode, "call_admission_event", &request.call_id)
+            }
+        };
+        ensure!(plan.event_ids.insert(indices[0], event_id).is_none(),
             "Call admission incident event identity was already assigned");
     }
     let index = steps.len();
     steps.push(step);
     if let Some((tx, root_instance_id, actor_id)) = execution {
         cancelled_claims.extend(apply_call_steps_on(tx, root_instance_id, actor_id,
-            &steps[index..], at_ms, index, skipped, staged_requests, failed_requests)?);
+            &steps[index..], at_ms, index, skipped, staged_requests, failed_requests, mode)?);
         let mut persisted = BTreeMap::new();
         for instance_id in call_tree_ids_on(tx, root_instance_id)? {
             let initiator = call_initiator_on(tx, &instance_id)?;
@@ -22981,6 +23267,7 @@ fn prepare_call_steps(
     cancelled_claims: &mut Vec<CancelledJobClaim>,
     staged_requests: &mut BTreeMap<String, Vec<CallRequest>>,
     failed_requests: &mut HashMap<(String, String), String>,
+    mode: ExecutionMode,
 ) -> Result<()> {
     let mut pending = vec![(instance_id.to_owned(), Box::new(local_plan.clone()), 0usize)];
     let mut skipped = HashSet::new();
@@ -23102,7 +23389,7 @@ fn prepare_call_steps(
                     signal_admission_on(tx, &actor, &request.child_instance_id, prefix,
                         signal, accepted)
                 };
-                let plan = super::runtime::plan_start(
+                let plan = super::runtime::plan_start_with_id_source(
                     &target.version.model,
                     &called_element.process_id,
                     &child_start_node_id,
@@ -23129,7 +23416,8 @@ fn prepare_call_steps(
                         child_start_node_id: child_start_node_id.clone(),
                         child_model_sha256: target.version.model_sha256.clone(),
                     },
-                    execution.map(|_| &resolve as &super::runtime::SignalAdmissionResolver<'_>))?;
+                    execution.map(|_| &resolve as &super::runtime::SignalAdmissionResolver<'_>),
+                    call_id_source(mode, format!("{}/start", request.child_instance_id)))?;
                 Ok((child, plan))
             })();
             let (child, plan) = match prepared {
@@ -23142,13 +23430,14 @@ fn prepare_call_steps(
                         "CALL_ADMISSION_ERROR",
                         &format!("{error:#}"),
                         at_ms,
+                        call_id_source(mode, format!("{}/admission", request.call_id)),
                     )?;
                     record_call_step(snapshots, steps, CallStep::Advance {
                         instance_id: instance_id.to_owned(),
                         expected_revision: parent.instance.revision,
                         request: request.clone(),
                         plan: Box::new(incident.clone()),
-                    }, &instance_id, &incident, at_ms, execution, cancelled_claims, &mut skipped, staged_requests, failed_requests)?;
+                    }, &instance_id, &incident, at_ms, execution, cancelled_claims, &mut skipped, staged_requests, failed_requests, mode)?;
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -23179,13 +23468,14 @@ fn prepare_call_steps(
                     "CALL_ADMISSION_ERROR",
                     &reason,
                     at_ms,
+                    call_id_source(mode, format!("{}/admission-reason", request.call_id)),
                 )?;
                 record_call_step(snapshots, steps, CallStep::Advance {
                     instance_id: instance_id.to_owned(),
                     expected_revision: parent.instance.revision,
                     request: request.clone(),
                     plan: Box::new(incident.clone()),
-                }, &instance_id, &incident, at_ms, execution, cancelled_claims, &mut skipped, staged_requests, failed_requests)?;
+                }, &instance_id, &incident, at_ms, execution, cancelled_claims, &mut skipped, staged_requests, failed_requests, mode)?;
                 continue;
             }
             let call = CallActivation {
@@ -23223,7 +23513,7 @@ fn prepare_call_steps(
                 },
                 plan: Box::new(plan.clone()),
             }, &request.child_instance_id, &plan, at_ms, execution, cancelled_claims,
-                &mut skipped, staged_requests, failed_requests)?;
+                &mut skipped, staged_requests, failed_requests, mode)?;
             if snapshots.contains_key(&request.child_instance_id) {
                 pending.push((request.child_instance_id.clone(), Box::new(plan), 0));
             }
@@ -23265,7 +23555,8 @@ fn prepare_call_steps(
                 };
                 if let Some(plan) = super::runtime::plan_call_error(&parent, &call, source,
                     at_ms, child_revision,
-                    execution.map(|_| &resolve as &super::runtime::SignalAdmissionResolver<'_>))?
+                    execution.map(|_| &resolve as &super::runtime::SignalAdmissionResolver<'_>),
+                    call_id_source(mode, format!("{}/business-error", call.call_id)))?
                 {
                     let status = if matches!(source,BusinessErrorSource::ErrorEnd {instance_id,..} if instance_id==&call.child_instance_id)
                     {
@@ -23280,7 +23571,7 @@ fn prepare_call_steps(
                         source: Some(source.clone()),
                         plan: Box::new(plan.clone()),
                     }, &call.parent_instance_id, &plan, at_ms, execution, cancelled_claims,
-                        &mut skipped, staged_requests, failed_requests)?;
+                        &mut skipped, staged_requests, failed_requests, mode)?;
                     pending.push((call.parent_instance_id.clone(), Box::new(plan), 0));
                     continue 'pending;
                 }
@@ -23298,6 +23589,7 @@ fn prepare_call_steps(
                     "CALL_CHILD_ERROR",
                     "the called process ended with an uncaught business error",
                     at_ms,
+                    call_id_source(mode, format!("{}/child-error", call.call_id)),
                 )?;
                 record_call_step(snapshots, steps, CallStep::Return {
                     call: call.clone(),
@@ -23306,7 +23598,7 @@ fn prepare_call_steps(
                     source: Some(source.clone()),
                     plan: Box::new(plan.clone()),
                 }, &call.parent_instance_id, &plan, at_ms, execution, cancelled_claims,
-                    &mut skipped, staged_requests, failed_requests)?;
+                    &mut skipped, staged_requests, failed_requests, mode)?;
             }
             continue 'pending;
         }
@@ -23340,7 +23632,9 @@ fn prepare_call_steps(
                 let (plan, status) = if let Some(reason) = authority.get(&call.parent_instance_id) {
                     (super::runtime::plan_call_incident(
                         &parent, &call.call_node_id, &call.parent_scope_id,
-                        "CALL_RETURN_ERROR", reason, at_ms)?, ProcessCallStatus::ReturnIncident)
+                        "CALL_RETURN_ERROR", reason, at_ms,
+                        call_id_source(mode, format!("{}/return-authority", call.call_id)))?,
+                        ProcessCallStatus::ReturnIncident)
                 } else {
                     let child_completed_event_id = if let Some((tx, _, _)) = execution {
                         let completed_events = tx.query_row(
@@ -23372,7 +23666,8 @@ fn prepare_call_steps(
                         at_ms,
                         child.instance.revision,
                         &child_completed_event_id,
-                        execution.map(|_| &resolve as &super::runtime::SignalAdmissionResolver<'_>));
+                        execution.map(|_| &resolve as &super::runtime::SignalAdmissionResolver<'_>),
+                        call_id_source(mode, format!("{}/return", call.call_id)));
                     match candidate {
                         Ok(plan) => {
                             let mut proposed = snapshots.clone();
@@ -23400,6 +23695,7 @@ fn prepare_call_steps(
                                         "CALL_RETURN_ERROR",
                                         &format!("{error:#}"),
                                         at_ms,
+                                        call_id_source(mode, format!("{}/return-budget", call.call_id)),
                                     )?,
                                     ProcessCallStatus::ReturnIncident,
                                 ),
@@ -23414,6 +23710,7 @@ fn prepare_call_steps(
                                 "CALL_RETURN_ERROR",
                                 &format!("{error:#}"),
                                 at_ms,
+                                call_id_source(mode, format!("{}/return-mapping", call.call_id)),
                             )?,
                             ProcessCallStatus::ReturnIncident,
                         ),
@@ -23436,7 +23733,7 @@ fn prepare_call_steps(
                     }
                 }
                 record_call_step(snapshots, steps, step, &call.parent_instance_id,
-                    &plan, at_ms, execution, cancelled_claims, &mut skipped, staged_requests, failed_requests)?;
+                    &plan, at_ms, execution, cancelled_claims, &mut skipped, staged_requests, failed_requests, mode)?;
                 pending.push((call.parent_instance_id.clone(), Box::new(plan), 0));
             }
         }
@@ -23520,6 +23817,7 @@ fn apply_canonical_call_steps_on(
     actor_id: &str,
     plan: &RuntimePlan,
     at_ms: i64,
+    mode: ExecutionMode,
 ) -> Result<Vec<CancelledJobClaim>> {
     ensure!(plan.call_steps.is_empty(),
         "canonical Call steps must be derived from persisted source facts");
@@ -23546,7 +23844,7 @@ fn apply_canonical_call_steps_on(
     let mut failed_requests = HashMap::new();
     prepare_call_steps(instance_id, plan, &mut snapshots, &authority,
         &mut steps, at_ms, Some((tx, instance_id, actor_id)),
-        &mut cancelled_claims, &mut staged_requests, &mut failed_requests)?;
+        &mut cancelled_claims, &mut staged_requests, &mut failed_requests, mode)?;
     validate_staged_call_requests_on(tx, &staged_requests, &failed_requests)?;
     Ok(cancelled_claims)
 }
@@ -23664,6 +23962,7 @@ fn prepare_call_plan<'pool>(
             &mut Vec::new(),
             &mut BTreeMap::new(),
             &mut HashMap::new(),
+            ExecutionMode::Durable,
         )?;
         composite.call_steps = steps;
         #[cfg(test)]
@@ -23816,7 +24115,7 @@ pub fn start_instance(
     )?;
     if composite.is_none() {
         apply_canonical_call_steps_on(&tx, instance_id, &actor.user_id,
-            plan, at_ms)?;
+            plan, at_ms, ExecutionMode::Durable)?;
         result = instance_on(&tx, actor, instance_id, None)?;
     }
     store_command(&tx, actor, stamp, &result, at_ms)?;
@@ -24045,7 +24344,7 @@ pub fn apply_transition(
     &[])?;
     if composite.is_none() {
         cancelled_claims.extend(apply_canonical_call_steps_on(&tx, instance_id,
-            &actor.user_id, plan, at_ms)?);
+            &actor.user_id, plan, at_ms, ExecutionMode::Durable)?);
     }
     let result = instance_on(&tx, actor, instance_id, None)?;
     tx.commit()?;
@@ -24247,7 +24546,7 @@ pub(super) fn admit_pending_send(
         snapshot.instance.revision, plan, at_ms, None, EntryAuthority::Accepted(&entry), &[])?;
     if canonical_mode {
         cancelled_claims.extend(apply_canonical_call_steps_on(&tx, &instance_id,
-            &actor.user_id, plan, at_ms)?);
+            &actor.user_id, plan, at_ms, ExecutionMode::Durable)?);
     }
     let instance = instance_on(&tx, &actor, &instance_id, None)?;
     tx.commit()?;
@@ -24376,7 +24675,7 @@ pub fn acknowledge_manual_task(
         expected_revision, plan, at_ms, None, EntryAuthority::Accepted(&entry), &[])?;
     if composite.is_none() {
         cancelled_claims.extend(apply_canonical_call_steps_on(&tx, instance_id,
-            &actor.user_id, plan, at_ms)?);
+            &actor.user_id, plan, at_ms, ExecutionMode::Durable)?);
     }
     let result = instance_on(&tx, actor, instance_id, None)?;
     store_command(&tx, actor, stamp, &result, at_ms)?;
@@ -24547,7 +24846,7 @@ pub fn complete_user_task(
     &[])?;
     if composite.is_none() {
         cancelled_claims.extend(apply_canonical_call_steps_on(&tx, instance_id,
-            &actor.user_id, plan, at_ms)?);
+            &actor.user_id, plan, at_ms, ExecutionMode::Durable)?);
     }
     let result = instance_on(&tx, actor, instance_id, None)?;
     store_command(&tx, actor, stamp, &result, at_ms)?;
@@ -28250,9 +28549,12 @@ fn accept_job_result_in_tx(
         "UPDATE bpmn_service_invocations SET phase='accepted',acceptance_owner_id=NULL,acceptance_lease_until_ms=NULL,acceptance_revision=acceptance_revision+1,phase_revision=phase_revision+1,updated_at_ms=?1 WHERE job_id=?2 AND instance_id=?3 AND phase='observed' AND acceptance_owner_id=?4 AND reserved_result_event_id=?5 AND observed_result_json=?6",
         params![at_ms.max(commit_now_ms),job_id,instance_id,worker_id,reserved_result_event_id,observed_bytes])?;
     ensure!(accepted == 1, "Service acceptance lost its independent CAS owner");
-    if !supplied_plan {
+    // A durable caller that supplies a plan has already composed its call steps into
+    // it; a private simulation always supplies a bare plan and lets the repository
+    // derive the steps from the persisted run.
+    if !supplied_plan || matches!(mode, ExecutionMode::Simulation(_)) {
         cancelled_claims.extend(apply_canonical_call_steps_on(tx, &instance_id,
-            &actor.user_id, plan, at_ms)?);
+            &actor.user_id, plan, at_ms, mode)?);
     }
     let result_instance = instance_on(tx, actor, &instance_id, None)?;
     Ok(ProcessTransitionOutcome {
@@ -31280,7 +31582,7 @@ pub(crate) fn deliver_signal_receipt_in_tx(
             .map(|incident| incident.incident_id.as_str()) } else { None }, at_ms)?;
     if composite.is_none() {
         cancelled_claims.extend(apply_canonical_call_steps_on(tx, instance_id,
-            &claim.actor.user_id, plan, at_ms)?);
+            &claim.actor.user_id, plan, at_ms, SimulatedDelivery::execution_mode(simulated))?);
     }
     let instance = instance_on(tx, &claim.actor, instance_id, None)?;
     Ok(SignalDelivery {
@@ -33034,7 +33336,7 @@ pub(crate) fn deliver_message_in_tx(
     )?;
     if composite.is_none() {
         claims.extend(apply_canonical_call_steps_on(tx, &instance.instance_id,
-            &actor.user_id, plan, at_ms)?);
+            &actor.user_id, plan, at_ms, SimulatedDelivery::execution_mode(simulated))?);
     }
     let sender = ProcessActor {
         org_id: m.key.org_id.clone(),

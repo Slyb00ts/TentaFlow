@@ -623,3 +623,87 @@ fn a_plan_that_opens_a_scope_the_allocator_never_issued_is_refused() {
         "{error:#}"
     );
 }
+
+#[test]
+fn an_escalation_raised_by_a_step_inside_a_scope_is_caught_by_its_boundary_inside_the_scope() {
+    use tentaflow_protocol::processes::{
+        ActivityOutcome, ActivityResult, ActivityVerification, ProcessEscalationDeclaration,
+        ServiceImplementation,
+    };
+    let escalate =
+        r#"{"outcome":"NeedsHuman","code":"ESC","summary":"decided","outputs":{},"evidence":[]}"#;
+    let inner = body(
+        vec![
+            node("InnerStart", ProcessNodeKind::Start),
+            node(
+                "InnerWork",
+                ProcessNodeKind::ServiceTask {
+                    flow_id: "flow-simulation-service".into(),
+                    input_mapping: BTreeMap::new(),
+                    output_mapping: BTreeMap::new(),
+                    verification: ActivityVerification::Condition {
+                        expression: "true".into(),
+                    },
+                    timeout_seconds: 30,
+                    result_expression: Some(escalate.into()),
+                    implementation: ServiceImplementation::default(),
+                },
+            ),
+            node("InnerEnd", ProcessNodeKind::End),
+            node(
+                "Guard_E",
+                ProcessNodeKind::BoundaryEscalation {
+                    attached_to_id: "InnerWork".into(),
+                    escalation_ref: Some("Esc_1".into()),
+                    cancel_activity: false,
+                    output_mapping: BTreeMap::new(),
+                },
+            ),
+            node("EscUser", user_task(Some("user-simulation"))),
+            node("EscEnd", ProcessNodeKind::End),
+        ],
+        vec![
+            edge("InnerFlow1", "InnerStart", "InnerWork"),
+            edge("InnerFlow2", "InnerWork", "InnerEnd"),
+            edge("EscFlow1", "Guard_E", "EscUser"),
+            edge("EscFlow2", "EscUser", "EscEnd"),
+        ],
+    );
+    let mut model = starter_model();
+    model.escalations.push(ProcessEscalationDeclaration {
+        escalation_id: "Esc_1".into(),
+        name: "Help".into(),
+        escalation_code: "ESC".into(),
+    });
+    model.nodes = vec![
+        model.nodes[0].clone(),
+        node("Scope_1", sub_process(inner, &[], &[])),
+        model.nodes.last().expect("starter End").clone(),
+    ];
+    model.sequence_flows = vec![
+        edge("ToScope", "Start_1", "Scope_1"),
+        edge("ScopeEnd", "Scope_1", "End_1"),
+    ];
+    let mut store = started(model);
+    advance_until(&mut store, "the Service wait", |view| {
+        !view.service_waits.is_empty()
+    });
+    let answer = ActivityResult {
+        outcome: ActivityOutcome::Completed,
+        code: None,
+        summary: "answered".into(),
+        outputs: json!({}),
+        evidence: Vec::new(),
+    };
+    store
+        .resolve_service(authorize(&store), "InnerWork", None, answer, None)
+        .expect("answer the step inside the scope");
+    let view = advance_until(&mut store, "the handler's task", |view| {
+        open_work(view).iter().any(|task| task.node_id == "EscUser")
+    });
+    assert!(view.events.iter().any(|event| {
+        event.kind == "escalation_caught" && event.node_id.as_deref() == Some("Guard_E")
+    }));
+    let handler = open_work(&view)[0];
+    assert_eq!(handler.scope_id, child_scopes(&view)[0].scope_id);
+}

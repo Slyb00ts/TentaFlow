@@ -2006,6 +2006,45 @@ pub struct ProcessSimulationEvent {
     pub actor_user_id: Option<String>,
     pub data: Value,
     pub scope_id: String,
+    /// The instance of the run the event belongs to; a run that calls other
+    /// processes has one per call. Empty in a frame from before calls were simulated.
+    #[serde(default)]
+    pub instance_id: String,
+}
+
+/// One process instance of a simulated run: the simulated one and every one it called.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSimulationInstance {
+    pub instance_id: String,
+    pub definition_id: String,
+    pub definition_name: String,
+    pub version: u32,
+    pub process_id: String,
+    pub status: ProcessInstanceStatus,
+    /// The calling instance; `None` for the simulated one.
+    pub parent_instance_id: Option<String>,
+    /// 0 for the simulated instance, 1 for what it calls, and so on.
+    pub depth: u32,
+}
+
+/// One call of a simulated run, from the activity that made it to the child it started.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSimulationCall {
+    pub call_id: String,
+    pub parent_instance_id: String,
+    pub parent_scope_id: String,
+    pub call_node_id: String,
+    pub call_node_name: String,
+    pub child_instance_id: String,
+    pub called_definition_id: String,
+    pub called_definition_name: String,
+    pub called_version: u32,
+    pub called_process_id: String,
+    /// The body belongs to the same document as the caller (a local call).
+    pub local: bool,
+    pub status: ProcessCallStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2140,6 +2179,12 @@ pub struct ProcessSimulationView {
     /// The occurrences of those groups, by group and ordinal.
     #[serde(default)]
     pub repetition_occurrences: Vec<ProcessRepetitionOccurrenceSummary>,
+    /// The simulated instance first, then every instance it called, parents before children.
+    #[serde(default)]
+    pub instances: Vec<ProcessSimulationInstance>,
+    /// The calls the run made, in the order they were made.
+    #[serde(default)]
+    pub calls: Vec<ProcessSimulationCall>,
     /// Oldest events dropped from `events` to keep the response within one frame.
     #[serde(default)]
     pub events_omitted: u64,

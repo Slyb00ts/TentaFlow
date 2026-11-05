@@ -69,6 +69,32 @@ pub fn random_runtime_id_source() -> RuntimeIdSourceHandle {
     Rc::new(RefCell::new(RandomRuntimeIdSource::default()))
 }
 
+/// Row identifiers derived from a seed and a per-kind counter, for a plan the
+/// repository makes on its own inside a private simulation (a called child's start,
+/// a call return): the same seed and the same planning order give the same rows.
+#[derive(Debug)]
+pub struct DerivedRuntimeIdSource {
+    seed: String,
+    ordinals: BTreeMap<String, u64>,
+}
+
+impl RuntimeIdSource for DerivedRuntimeIdSource {
+    fn next_id(&mut self, kind: &str) -> String {
+        let ordinal = self.ordinals.entry(kind.to_owned()).or_insert(0);
+        let name = format!("tentaflow.simulation.v1/derived/{}/{kind}/{ordinal}", self.seed);
+        *ordinal += 1;
+        Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes()).to_string()
+    }
+
+    fn error(&self) -> Option<String> {
+        None
+    }
+}
+
+pub fn derived_runtime_id_source(seed: String) -> RuntimeIdSourceHandle {
+    Rc::new(RefCell::new(DerivedRuntimeIdSource { seed, ordinals: BTreeMap::new() }))
+}
+
 pub fn validate_output(value: &Value) -> Result<()> {
     ensure!(
         serde_json::to_vec(value)?.len() <= MAX_VARIABLE_BYTES,
@@ -6026,8 +6052,9 @@ pub(super) fn plan_call_incident(
     code: &str,
     message: &str,
     now_ms: i64,
+    ids: RuntimeIdSourceHandle,
 ) -> Result<RuntimePlan> {
-    let mut transition = Transition::from_snapshot(snapshot, now_ms, None)?;
+    let mut transition = Transition::from_snapshot_with_id_source(snapshot, now_ms, None, ids)?;
     transition.current_scope = scope_id.to_owned();
     transition.node(call_node_id)?;
     transition.incident(
@@ -6047,10 +6074,12 @@ pub(super) fn plan_call_return(
     expected_child_revision: u64,
     child_completed_event_id: &str,
     signal_admission: Option<&SignalAdmissionResolver<'_>>,
+    ids: RuntimeIdSourceHandle,
 ) -> Result<RuntimePlan> {
     ensure!(Uuid::parse_str(child_completed_event_id).is_ok(),
         "completed Call child source is not a UUID");
-    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
+    let mut transition =
+        Transition::from_snapshot_with_id_source(snapshot, now_ms, signal_admission, ids)?;
     transition.accepted_input = Some(AcceptedInputRef::CallReturn {
         call_id: call.call_id.clone(),
         child_instance_id: call.child_instance_id.clone(),
@@ -6208,8 +6237,10 @@ pub(super) fn plan_call_error(
     now_ms: i64,
     expected_child_revision: u64,
     signal_admission: Option<&SignalAdmissionResolver<'_>>,
+    ids: RuntimeIdSourceHandle,
 ) -> Result<Option<RuntimePlan>> {
-    let mut transition = Transition::from_snapshot(snapshot, now_ms, signal_admission)?;
+    let mut transition =
+        Transition::from_snapshot_with_id_source(snapshot, now_ms, signal_admission, ids)?;
     transition.accepted_input = Some(AcceptedInputRef::CallReturn {
         call_id: call.call_id.clone(),
         child_instance_id: call.child_instance_id.clone(),

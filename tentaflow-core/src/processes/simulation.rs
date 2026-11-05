@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tentaflow_protocol::processes::{
-    ActivityOutcome, ActivityResult, ProcessIncident, ProcessInstance,
+    ActivityOutcome, ActivityResult, ProcessCallTarget, ProcessIncident, ProcessInstance,
     ProcessInstanceStatus, ProcessMessageStatus, ProcessMessageSummary, ProcessMessageTarget, ProcessMessageTargetSpec,
     ProcessModel, ProcessNode, ProcessNodeKind, ProcessRepetitionGroupSummary, ProcessRepetitionOccurrenceSummary, ProcessScopeSummary,
-    ProcessSimulationServiceFixture,
+    ProcessSimulationCall, ProcessSimulationInstance, ProcessSimulationServiceFixture,
     ProcessSimulationServiceMode, ProcessSimulationServiceWait, ProcessSimulationSubscription,
     ProcessSimulationVerdict, ProcessSubscriptionKind, ProcessSubscriptionStatus,
     ProcessTimerSpec, ProcessTimerStatus, ProcessTimerSummary, ProcessUserTask,
@@ -128,6 +128,54 @@ pub(crate) struct SimulationSourceInput {
     pub start_ms: i64,
     pub horizon_ms: i64,
     pub tick_duration_ms: i64,
+    /// The published versions the source calls, pinned as production holds them.
+    pub call_closure: SimulationCallClosure,
+}
+
+/// A row of `bpmn_call_pins`: where one call node of a published version points.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SimulationCallPin {
+    pub node_id: String,
+    pub called_definition_id: String,
+    pub called_version: u32,
+    pub called_element_json: String,
+    pub model_sha256: String,
+}
+
+/// A row of `bpmn_call_dependencies`: a version a published version depends on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SimulationCallDependency {
+    pub called_definition_id: String,
+    pub called_version: u32,
+    pub model_sha256: String,
+}
+
+/// One published version a simulated process calls, read from production once at
+/// Start and copied into the private database with its own call pins.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SimulationCalledVersion {
+    pub definition_id: String,
+    pub version: u32,
+    pub name: String,
+    pub model_json: String,
+    pub model_sha256: String,
+    pub published_at_ms: i64,
+    pub pins: Vec<SimulationCallPin>,
+    pub dependencies: Vec<SimulationCallDependency>,
+}
+
+/// Everything a simulation needs to resolve its calls without reading production
+/// again: the transitive closure of the called versions and the call pins of the
+/// simulated version itself.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SimulationCallClosure {
+    pub versions: Vec<SimulationCalledVersion>,
+    pub source_pins: Vec<SimulationCallPin>,
+    pub source_dependencies: Vec<SimulationCallDependency>,
 }
 
 /// A source snapshot that was captured by the authenticated process repository.
@@ -219,9 +267,10 @@ pub(crate) fn capture_authenticated_source(
     start_ms: i64,
     horizon_ms: i64,
     tick_duration_ms: i64,
+    call_closure: SimulationCallClosure,
 ) -> Result<AuthenticatedSimulationSource> {
     let model_json = serde_json::to_string(model).context("encode published simulation model")?;
-    let scenario_sha256 = simulation_scenario_sha256(
+    let mut scenario_sha256 = simulation_scenario_sha256(
         definition_id,
         version,
         model_sha256,
@@ -232,6 +281,20 @@ pub(crate) fn capture_authenticated_source(
         horizon_ms,
         tick_duration_ms,
     )?;
+    if !call_closure.versions.is_empty() {
+        // The versions a run calls are part of what it is: the same input pinned to
+        // other callee versions is another scenario with other identifiers.
+        let mut hash = Sha256::new();
+        hash.update(scenario_sha256.as_bytes());
+        hash.update(b":call-closure:");
+        for version in &call_closure.versions {
+            hash.update(format!(
+                "{}/{}/{};",
+                version.definition_id, version.version, version.model_sha256
+            ));
+        }
+        scenario_sha256 = hex::encode(hash.finalize());
+    }
     let acl_snapshot_json = serde_json::to_string(&SimulationAclSnapshot {
         permitted_user_ids: permitted_user_ids.to_vec(),
     })?;
@@ -250,6 +313,7 @@ pub(crate) fn capture_authenticated_source(
         start_ms,
         horizon_ms,
         tick_duration_ms,
+        call_closure,
     };
     validate_captured_source(&input)?;
     Ok(AuthenticatedSimulationSource { input })
@@ -1244,21 +1308,26 @@ impl RuntimeIdSource for SimulationIdSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SimulationUnsupportedActivity {
-    CallActivity { node_id: String },
+    CallActivityIo { node_id: String },
+    CalledBodyEvent { node_id: String, kind: &'static str },
     ServiceActivityIo { node_id: String },
     AgentStep { node_id: String },
     EventDelivery { node_id: String, kind: &'static str },
     MessageTarget { node_id: String },
     ExternalActivity { node_id: String, kind: String },
-    AdditionalProcess,
 }
 
 impl fmt::Display for SimulationUnsupportedActivity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CallActivity { node_id } => {
-                write!(f, "CallActivity is unsupported in simulation ({node_id})")
-            }
+            Self::CallActivityIo { node_id } => write!(
+                f,
+                "{SIMULATION_CALL_UNSUPPORTED}: a call with activity IO is not simulated: its result continues through a deferred external step ({node_id})"
+            ),
+            Self::CalledBodyEvent { node_id, kind } => write!(
+                f,
+                "{SIMULATION_CALL_UNSUPPORTED}: {kind} inside a called process is not simulated: a simulation delivers messages and signals to the one instance it started ({node_id})"
+            ),
             Self::ServiceActivityIo { node_id } => write!(
                 f,
                 "a Service task with activity IO is unsupported in simulation ({node_id}): its result continues through a deferred external step"
@@ -1277,9 +1346,6 @@ impl fmt::Display for SimulationUnsupportedActivity {
             ),
             Self::ExternalActivity { node_id, kind } => {
                 write!(f, "{kind} is unsupported in simulation ({node_id})")
-            }
-            Self::AdditionalProcess => {
-                write!(f, "additional process bodies are unsupported in simulation")
             }
         }
     }
@@ -1311,6 +1377,16 @@ pub const SIMULATION_SCOPE_LIMIT: &str = "SIMULATION_SCOPE_LIMIT";
 /// in-memory run is held to a quarter of that so a looping model cannot fill the
 /// 16 MiB budget with scope rows before the horizon stops it.
 pub(crate) const MAX_SIMULATION_SCOPES: usize = 32;
+/// A called version cannot be pinned into the simulation: it is not published, or
+/// production would not admit the call.
+pub const SIMULATION_CALL_PIN_UNAVAILABLE: &str = "SIMULATION_CALL_PIN_UNAVAILABLE";
+/// The call construct is outside what a simulation runs.
+pub const SIMULATION_CALL_UNSUPPORTED: &str = "SIMULATION_CALL_UNSUPPORTED";
+/// A transition would start more process instances than one simulation holds.
+pub const SIMULATION_CALL_LIMIT: &str = "SIMULATION_CALL_LIMIT";
+/// The most process instances (the simulated one and everything it calls) a
+/// simulation may start in its whole life. Production allows 129 per call tree.
+pub(crate) const MAX_SIMULATION_INSTANCES: usize = 8;
 /// A transition would reach more repetition groups or occurrences than one simulation holds.
 pub const SIMULATION_REPETITION_LIMIT: &str = "SIMULATION_REPETITION_LIMIT";
 /// The most repetition groups a simulation may open in its whole life. Production
@@ -1332,7 +1408,7 @@ pub struct SimulationServiceError {
 }
 
 impl SimulationServiceError {
-    fn new(code: &'static str, detail: impl Into<String>) -> anyhow::Error {
+    pub(super) fn new(code: &'static str, detail: impl Into<String>) -> anyhow::Error {
         Self { code, detail: detail.into() }.into()
     }
 }
@@ -1372,6 +1448,8 @@ pub struct SimulationView {
     pub scopes: Vec<ProcessScopeSummary>,
     pub repetition_groups: Vec<ProcessRepetitionGroupSummary>,
     pub repetition_occurrences: Vec<ProcessRepetitionOccurrenceSummary>,
+    pub instances: Vec<ProcessSimulationInstance>,
+    pub calls: Vec<ProcessSimulationCall>,
     pub events_omitted: u64,
     pub trace_steps_omitted: u64,
 }
@@ -1386,6 +1464,7 @@ pub struct SimulationEventView {
     pub actor_user_id: Option<String>,
     pub data: Value,
     pub scope_id: String,
+    pub instance_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1422,6 +1501,23 @@ struct ServiceSettlement {
     claim_event_id: String,
     observed: ObservedActivityResult,
     event_ids: Vec<String>,
+}
+
+/// The instance a transition acts on and the revision it expects of it. A run that
+/// calls other processes has several instances, and a step belongs to one.
+#[derive(Debug, Clone)]
+struct TransitionTarget {
+    instance_id: String,
+    revision: u64,
+}
+
+impl TransitionTarget {
+    fn of(snapshot: &RuntimeSnapshot) -> Self {
+        Self {
+            instance_id: snapshot.instance.instance_id.clone(),
+            revision: snapshot.instance.revision,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1531,8 +1627,9 @@ impl SimulationStore {
             start_ms: 0,
             horizon_ms: 1,
             tick_duration_ms: 1,
+            call_closure: SimulationCallClosure::default(),
         };
-        let (model, acl) = retain_database!(validate_captured_source(&input));
+        let (model, acl) = retain_database!(decode_captured_source(&input));
         retain_database!(ensure_actor_allowed(&source, &acl, &actor));
         let clock = retain_database!(load_clock(&database.conn, simulation_id));
         let mut ids = retain_database!(SimulationIdSource::new(&input.scenario_sha256));
@@ -1653,7 +1750,7 @@ impl SimulationStore {
         self.apply_plan(
             command_id,
             request_hash,
-            1,
+            TransitionTarget { instance_id, revision: 1 },
             plan,
             now,
             Some(accepted),
@@ -1670,50 +1767,56 @@ impl SimulationStore {
         authorization: AuthenticatedSimulationAction,
     ) -> Result<SimulationView> {
         authorization.verify(&self.source, &self.actor)?;
-        let snapshot = self
-            .load_snapshot()?
-            .context("simulation has not been started")?;
-        let expected_revision = snapshot.instance.revision;
-        let now = self.advance_target(&snapshot)?;
+        let tree = self.load_tree()?;
+        ensure!(!tree.is_empty(), "simulation has not been started");
+        let root = TransitionTarget::of(&tree[0]);
+        let now = self.advance_target(&tree)?;
         self.prepare_ids();
-        let due_timer = snapshot
-            .timers
+        // The earliest due timer of any instance of the run; the same instant is
+        // settled by the timer id so the choice never depends on row order.
+        let due = tree
             .iter()
-            .filter_map(|timer| {
+            .flat_map(|snapshot| snapshot.timers.iter().map(move |timer| (snapshot, timer)))
+            .filter_map(|(snapshot, timer)| {
                 let due_at_ms = timer.due_at_ms?;
                 (matches!(
                     timer.kind,
                     tentaflow_protocol::processes::ProcessTimerKind::Catch
                         | tentaflow_protocol::processes::ProcessTimerKind::Boundary
                 ) && matches!(
-                        timer.status,
-                        ProcessTimerStatus::Pending | ProcessTimerStatus::Blocked
-                    )
-                    && due_at_ms <= now
+                    timer.status,
+                    ProcessTimerStatus::Pending | ProcessTimerStatus::Blocked
+                ) && due_at_ms <= now
                     && timer.next_check_at_ms <= now)
-                    .then_some((due_at_ms, timer))
+                    .then_some((due_at_ms, snapshot, timer))
             })
-            .min_by_key(|(due_at_ms, timer)| (*due_at_ms, timer.timer_id.clone()))
-            .map(|(due_at_ms, timer)| DueTimer {
-                timer_id: timer.timer_id.clone(),
-                kind: timer.kind.clone(),
-                org_id: timer.org_id.clone(),
-                definition_id: timer.definition_id.clone(),
-                version: timer.version,
-                start_process_id: timer.start_process_id.clone(),
-                instance_id: timer.instance_id.clone(),
-                token_id: timer.token_id.clone(),
-                occurrence: timer.occurrence,
-                revision: timer.revision,
-                due_at_ms,
-            });
+            .min_by_key(|(due_at_ms, _, timer)| (*due_at_ms, timer.timer_id.clone()));
+        let mut due_timer = due.map(|(due_at_ms, snapshot, timer)| {
+            (
+                DueTimer {
+                    timer_id: timer.timer_id.clone(),
+                    kind: timer.kind.clone(),
+                    org_id: timer.org_id.clone(),
+                    definition_id: timer.definition_id.clone(),
+                    version: timer.version,
+                    start_process_id: timer.start_process_id.clone(),
+                    instance_id: timer.instance_id.clone(),
+                    token_id: timer.token_id.clone(),
+                    occurrence: timer.occurrence,
+                    revision: timer.revision,
+                    due_at_ms,
+                },
+                snapshot,
+            )
+        });
         // A timer and a message (or signal receipt) that are both due go in the
         // order they became due; at the same instant the timer goes first, as it
         // does inside a production plan.
-        let ready_tokens = snapshot.tokens.iter().any(|token| token.status == "ready");
-        let mut due_timer = due_timer;
+        let ready_tokens = tree
+            .iter()
+            .any(|snapshot| snapshot.tokens.iter().any(|token| token.status == "ready"));
         let mut event_step = None;
-        if let Some(timer) = due_timer.as_ref() {
+        if let Some((timer, _)) = due_timer.as_ref() {
             if let Some((step, ready_at_ms)) = self.next_event_step(now)? {
                 if ready_at_ms < timer.due_at_ms {
                     due_timer = None;
@@ -1723,39 +1826,37 @@ impl SimulationStore {
         } else if !ready_tokens {
             event_step = self.next_event_step(now)?.map(|(step, _)| step);
         }
-        {
-            if let Some(step) = event_step.take() {
-                let command_id = self.next_id("command");
-                let request_hash = hash_json(&json!({
-                    "action": "advance",
-                    "revision": expected_revision,
-                    "at_ms": now,
-                    "delivery": match &step {
-                        EventStep::Message(snapshot) => snapshot.message.key.message_id.clone(),
-                        EventStep::MessageAmbiguous(candidate)
-                        | EventStep::MessageClosed(candidate) => candidate.key.message_id.clone(),
-                        EventStep::Signal(receipt_id) => receipt_id.clone(),
-                        EventStep::Send(_) => String::new(),
-                    },
-                }))?;
-                let plan = RuntimePlan::initial(snapshot.instance.variables.clone());
-                self.apply_plan(
-                    command_id,
-                    request_hash,
-                    expected_revision,
-                    plan,
-                    now,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(step),
-                )?;
-                return self.view_authorized();
-            }
+        if let Some(step) = event_step.take() {
+            let command_id = self.next_id("command");
+            let request_hash = hash_json(&json!({
+                "action": "advance",
+                "revision": root.revision,
+                "at_ms": now,
+                "delivery": match &step {
+                    EventStep::Message(snapshot) => snapshot.message.key.message_id.clone(),
+                    EventStep::MessageAmbiguous(candidate)
+                    | EventStep::MessageClosed(candidate) => candidate.key.message_id.clone(),
+                    EventStep::Signal(receipt_id) => receipt_id.clone(),
+                    EventStep::Send(_) => String::new(),
+                },
+            }))?;
+            let plan = RuntimePlan::initial(tree[0].instance.variables.clone());
+            self.apply_plan(
+                command_id,
+                request_hash,
+                root,
+                plan,
+                now,
+                None,
+                None,
+                None,
+                None,
+                Some(step),
+            )?;
+            return self.view_authorized();
         }
         if due_timer.is_none() && !ready_tokens {
-            if let Some((job, fixture)) = self.next_fixture_job(&snapshot)? {
+            if let Some((snapshot, job, fixture)) = self.next_fixture_job(&tree)? {
                 let result = fixture
                     .result
                     .context("a prepared Service fixture lost its result")?;
@@ -1773,8 +1874,14 @@ impl SimulationStore {
                 }
             }
         }
-        let plan = if let Some(timer) = due_timer.as_ref() {
-            let timer = snapshot
+        // The instance a plain advance moves: the first one in tree order with a
+        // token to move, else the simulated one (the clock still ticks).
+        let mover = tree
+            .iter()
+            .find(|snapshot| snapshot.tokens.iter().any(|token| token.status == "ready"))
+            .unwrap_or(&tree[0]);
+        let (plan, target) = if let Some((timer, owner)) = due_timer.as_ref() {
+            let timer = owner
                 .timers
                 .iter()
                 .find(|candidate| candidate.timer_id == timer.timer_id)
@@ -1786,33 +1893,40 @@ impl SimulationStore {
                 TimerSnapshot::Boundary {
                     actor: self.actor.clone(),
                     timer,
-                    snapshot: snapshot.clone(),
+                    snapshot: (*owner).clone(),
                 }
             } else {
                 TimerSnapshot::Catch {
                     actor: self.actor.clone(),
                     timer,
-                    snapshot: snapshot.clone(),
+                    snapshot: (*owner).clone(),
                 }
             };
-            super::timers::plan_timer_fire(&timer_snapshot, now, None, Some(self.id_handle()))?
+            (
+                super::timers::plan_timer_fire(&timer_snapshot, now, None, Some(self.id_handle()))?,
+                TransitionTarget::of(owner),
+            )
         } else {
-            plan_advance_with_id_source(&snapshot, now, None, self.id_handle())?
+            (
+                plan_advance_with_id_source(mover, now, None, self.id_handle())?,
+                TransitionTarget::of(mover),
+            )
         };
         let command_id = self.next_id("command");
         #[cfg(test)]
         run_simulation_transition_preflight(&self.conn, &command_id)?;
-        let request_hash =
-            hash_json(&json!({"action":"advance","revision":expected_revision,"at_ms":now}))?;
+        let request_hash = hash_json(
+            &json!({"action":"advance","revision":target.revision,"instance":target.instance_id,"at_ms":now}),
+        )?;
         self.apply_plan(
             command_id,
             request_hash,
-            expected_revision,
+            target,
             plan,
             now,
             None,
             None,
-            due_timer.as_ref(),
+            due_timer.as_ref().map(|(timer, _)| timer),
             None,
             None,
         )?;
@@ -1827,13 +1941,17 @@ impl SimulationStore {
         approved: Option<bool>,
     ) -> Result<SimulationView> {
         authorization.verify(&self.source, &self.actor)?;
-        let snapshot = self
-            .load_snapshot()?
-            .context("simulation has not been started")?;
-        let task = snapshot
-            .user_tasks
+        let tree = self.load_tree()?;
+        ensure!(!tree.is_empty(), "simulation has not been started");
+        let (snapshot, task) = tree
             .iter()
-            .find(|task| task.user_task_id == task_id)
+            .find_map(|snapshot| {
+                snapshot
+                    .user_tasks
+                    .iter()
+                    .find(|task| task.user_task_id == task_id)
+                    .map(|task| (snapshot, task))
+            })
             .context("simulation user task was not found")?;
         ensure!(
             task.can_complete,
@@ -1870,7 +1988,7 @@ impl SimulationStore {
             request_hash: request_hash.clone(),
         };
         let plan = plan_user_completion_with_id_source(
-            &snapshot,
+            snapshot,
             task_id,
             &outputs,
             approved,
@@ -1882,7 +2000,7 @@ impl SimulationStore {
         self.apply_plan(
             command_id,
             request_hash,
-            snapshot.instance.revision,
+            TransitionTarget::of(snapshot),
             plan,
             now,
             Some(accepted),
@@ -1900,13 +2018,17 @@ impl SimulationStore {
         task_id: &str,
     ) -> Result<SimulationView> {
         authorization.verify(&self.source, &self.actor)?;
-        let snapshot = self
-            .load_snapshot()?
-            .context("simulation has not been started")?;
-        let task = snapshot
-            .user_tasks
+        let tree = self.load_tree()?;
+        ensure!(!tree.is_empty(), "simulation has not been started");
+        let (snapshot, task) = tree
             .iter()
-            .find(|task| task.user_task_id == task_id)
+            .find_map(|snapshot| {
+                snapshot
+                    .user_tasks
+                    .iter()
+                    .find(|task| task.user_task_id == task_id)
+                    .map(|task| (snapshot, task))
+            })
             .context("simulation manual task was not found")?;
         ensure!(
             task.can_complete,
@@ -1936,7 +2058,7 @@ impl SimulationStore {
             request_hash: request_hash.clone(),
         };
         let plan = plan_manual_acknowledgment_with_id_source(
-            &snapshot,
+            snapshot,
             task_id,
             &self.actor.user_id,
             now,
@@ -1947,7 +2069,7 @@ impl SimulationStore {
         self.apply_plan(
             command_id,
             request_hash,
-            snapshot.instance.revision,
+            TransitionTarget::of(snapshot),
             plan,
             now,
             Some(accepted),
@@ -2028,10 +2150,17 @@ impl SimulationStore {
                 "the node or job id is not a valid id",
             )
         );
-        let snapshot = self
-            .load_snapshot()?
-            .context("simulation has not been started")?;
-        let job = pick_waiting_job(&snapshot.jobs, node_id, job_id)?;
+        let tree = self.load_tree()?;
+        ensure!(!tree.is_empty(), "simulation has not been started");
+        let jobs = tree
+            .iter()
+            .flat_map(|snapshot| snapshot.jobs.iter().cloned())
+            .collect::<Vec<_>>();
+        let job = pick_waiting_job(&jobs, node_id, job_id)?;
+        let snapshot = tree
+            .into_iter()
+            .find(|snapshot| snapshot.instance.instance_id == job.instance_id)
+            .context("the waiting Service job belongs to no instance of the run")?;
         self.settle_service(snapshot, job, result, verdict, "operator")?;
         self.view_authorized()
     }
@@ -2123,7 +2252,7 @@ impl SimulationStore {
         self.apply_plan(
             command_id,
             request_hash,
-            expected_revision,
+            TransitionTarget { instance_id: job.instance_id.clone(), revision: expected_revision },
             plan,
             now,
             None,
@@ -2146,19 +2275,22 @@ impl SimulationStore {
     /// on time (a timer, a queued message or signal receipt, a message about to
     /// expire, a prepared Service answer), and to one tick when nothing is. It
     /// never passes the horizon.
-    fn advance_target(&self, snapshot: &RuntimeSnapshot) -> Result<i64> {
+    fn advance_target(&self, tree: &[RuntimeSnapshot]) -> Result<i64> {
         let tick = self
             .clock
             .now_ms
             .checked_add(self.clock.tick_duration_ms)
             .context("simulation virtual clock overflow")?;
-        if snapshot.tokens.iter().any(|token| token.status == "ready") {
+        if tree
+            .iter()
+            .any(|snapshot| snapshot.tokens.iter().any(|token| token.status == "ready"))
+        {
             return self.clock.time_toward(tick);
         }
         let mode = PrivateSimulationMode::prove(&self.conn)?;
-        let timers = snapshot
-            .timers
+        let timers = tree
             .iter()
+            .flat_map(|snapshot| snapshot.timers.iter())
             .filter(|timer| {
                 matches!(
                     timer.kind,
@@ -2172,7 +2304,7 @@ impl SimulationStore {
             .filter_map(|timer| Some(timer.due_at_ms?.max(timer.next_check_at_ms)))
             .min();
         let fixture = self
-            .next_fixture_job(snapshot)?
+            .next_fixture_job(tree)?
             .is_some()
             .then_some(self.clock.now_ms);
         let target = [
@@ -2282,7 +2414,7 @@ impl SimulationStore {
         self.apply_plan(
             command_id,
             request_hash,
-            expected_revision,
+            TransitionTarget::of(&snapshot),
             plan,
             now,
             None,
@@ -2295,16 +2427,21 @@ impl SimulationStore {
     }
 
     /// The oldest queued job whose step has a prepared answer.
-    fn next_fixture_job(
+    fn next_fixture_job<'a>(
         &self,
-        snapshot: &RuntimeSnapshot,
-    ) -> Result<Option<(ProcessJob, StoredFixture)>> {
+        tree: &'a [RuntimeSnapshot],
+    ) -> Result<Option<(&'a RuntimeSnapshot, ProcessJob, StoredFixture)>> {
         let fixtures = self.load_fixtures()?;
-        Ok(snapshot.jobs.iter().filter(|job| job.status == "queued").find_map(|job| {
+        // A fixture is prepared for a node of the simulated process; a called
+        // process may reuse a node id, and its steps wait for the operator.
+        let Some(root) = tree.first() else {
+            return Ok(None);
+        };
+        Ok(root.jobs.iter().filter(|job| job.status == "queued").find_map(|job| {
             fixtures
                 .get(&job.node_id)
                 .filter(|fixture| fixture.result.is_some())
-                .map(|fixture| (job.clone(), fixture.clone()))
+                .map(|fixture| (root, job.clone(), fixture.clone()))
         }))
     }
 
@@ -2454,72 +2591,68 @@ impl SimulationStore {
 
     fn view_authorized(&self) -> Result<SimulationView> {
         ensure_actor_allowed(&self.source, &self.acl, &self.actor)?;
-        let snapshot = self.load_snapshot()?;
-        let user_tasks = match snapshot.as_ref() {
-            Some(snapshot) => repository::simulation_user_tasks_on(
+        let tree = self.load_tree()?;
+        let mode = PrivateSimulationMode::prove(&self.conn)?;
+        let mut user_tasks = Vec::new();
+        let mut timers = Vec::new();
+        let mut repetition_groups = Vec::new();
+        let mut repetition_occurrences = Vec::new();
+        let mut service_waits = Vec::new();
+        let mut subscriptions = Vec::new();
+        for snapshot in &tree {
+            let instance_id = &snapshot.instance.instance_id;
+            user_tasks.extend(repository::simulation_user_tasks_on(
                 &self.conn,
                 &self.actor,
-                &snapshot.instance.instance_id,
-            )?,
-            None => Vec::new(),
-        };
-        let timers = match snapshot.as_ref() {
-            Some(snapshot) => repository::simulation_timer_summaries_on(
+                instance_id,
+            )?);
+            timers.extend(repository::simulation_timer_summaries_on(
                 &self.conn,
                 &self.actor,
-                &snapshot.instance.instance_id,
-            )?,
-            None => Vec::new(),
-        };
-        let (repetition_groups, repetition_occurrences) = match snapshot.as_ref() {
-            Some(snapshot) => repetition_views(snapshot)?,
-            None => (Vec::new(), Vec::new()),
-        };
+                instance_id,
+            )?);
+            let (groups, occurrences) = repetition_views(snapshot)?;
+            repetition_groups.extend(groups);
+            repetition_occurrences.extend(occurrences);
+            service_waits.extend(self.service_waits(snapshot)?);
+            subscriptions.extend(self.event_waits(snapshot)?);
+        }
+        let tree_ids = tree
+            .iter()
+            .map(|snapshot| snapshot.instance.instance_id.clone())
+            .collect::<Vec<_>>();
+        let calls = repository::simulation_calls_on(&self.conn, mode, &tree_ids)?;
+        let instances = instance_views(&tree, &calls);
+        let call_views = call_views(&tree, &calls)?;
         let mut view = SimulationView {
             simulation_id: self.simulation_id.clone(),
             source: self.source.clone(),
             clock: self.clock.clone(),
-            instance: snapshot.as_ref().map(|snapshot| snapshot.instance.clone()),
+            instance: tree.first().map(|snapshot| snapshot.instance.clone()),
             user_tasks,
             timers,
-            tokens: snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.tokens.clone())
-                .unwrap_or_default(),
-            gateway_receipts: snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.receipts.clone())
-                .unwrap_or_default(),
-            incidents: snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.incidents.clone())
-                .unwrap_or_default(),
+            tokens: tree.iter().flat_map(|snapshot| snapshot.tokens.clone()).collect(),
+            gateway_receipts: tree.iter().flat_map(|snapshot| snapshot.receipts.clone()).collect(),
+            incidents: tree.iter().flat_map(|snapshot| snapshot.incidents.clone()).collect(),
             events: Vec::new(),
             trace_steps: Vec::new(),
-            activity_io_witnesses: snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.activity_io_witnesses.clone())
-                .unwrap_or_default(),
-            service_waits: match snapshot.as_ref() {
-                Some(snapshot) => self.service_waits(snapshot)?,
-                None => Vec::new(),
-            },
-            subscriptions: match snapshot.as_ref() {
-                Some(snapshot) => self.event_waits(snapshot)?,
-                None => Vec::new(),
-            },
+            activity_io_witnesses: tree
+                .iter()
+                .flat_map(|snapshot| snapshot.activity_io_witnesses.clone())
+                .collect(),
+            service_waits,
+            subscriptions,
             messages: repository::simulation_message_summaries_on(
                 &self.conn,
-                PrivateSimulationMode::prove(&self.conn)?,
+                mode,
                 &self.actor,
                 self.clock.now_ms,
             )?,
-            scopes: snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.scopes.clone())
-                .unwrap_or_default(),
+            scopes: tree.iter().flat_map(|snapshot| snapshot.scopes.clone()).collect(),
             repetition_groups,
             repetition_occurrences,
+            instances,
+            calls: call_views,
             events_omitted: 0,
             trace_steps_omitted: 0,
         };
@@ -2583,7 +2716,7 @@ impl SimulationStore {
         &mut self,
         command_id: String,
         request_hash: String,
-        expected_revision: u64,
+        target: TransitionTarget,
         plan: RuntimePlan,
         at_ms: i64,
         accepted: Option<AcceptedInputRef>,
@@ -2596,10 +2729,7 @@ impl SimulationStore {
             self.clock.now_ms <= at_ms && at_ms <= self.clock.horizon_ms,
             "simulation transition timestamp is outside the virtual clock"
         );
-        ensure!(
-            expected_revision == self.clock.revision,
-            "simulation revision conflict"
-        );
+        let expected_revision = target.revision;
         ensure!(
             self.ids.borrow().accepts(&command_id),
             "simulation command id was not issued by its allocator"
@@ -2636,9 +2766,9 @@ impl SimulationStore {
         );
         // Every request reopens the store with a fresh allocator, so a fork activation
         // minted by an earlier request is known only through the persisted run.
-        let persisted_snapshot = self.load_snapshot()?;
-        let usage = SimulationUsage::of(persisted_snapshot.as_ref());
-        let persisted_activations = persisted_snapshot
+        let tree = self.load_tree()?;
+        let usage = SimulationUsage::of_tree(&tree);
+        let persisted_activations = tree
             .iter()
             .flat_map(|snapshot| {
                 snapshot
@@ -2654,7 +2784,17 @@ impl SimulationStore {
             })
             .chain(usage.persisted_ids().cloned())
             .collect::<HashSet<_>>();
-        let body_nodes = selected_body(&self.model, &self.source.selected_process_id, &[])?.nodes;
+        // The plan is held to the body of the instance it acts on, which is the
+        // called process's own for a child.
+        let body_nodes = match tree
+            .iter()
+            .find(|snapshot| snapshot.instance.instance_id == target.instance_id)
+        {
+            Some(snapshot) => {
+                selected_body(&snapshot.model, &snapshot.instance.process_id, &[])?.nodes
+            }
+            None => selected_body(&self.model, &self.source.selected_process_id, &[])?.nodes,
+        };
         if !plans_inside_writer {
             validate_plan_ids(&plan, &self.ids.borrow(), &persisted_activations)?;
             validate_supported_plan(&plan, body_nodes)?;
@@ -2720,8 +2860,7 @@ impl SimulationStore {
                 accepted,
             )?
         } else if let Some(settlement) = service.as_ref() {
-            let instance_id = load_instance_id_tx(&tx, &self.simulation_id)?
-                .context("simulation service plan has no instance")?;
+            let instance_id = target.instance_id.clone();
             let ids = self.ids.borrow();
             let (instance, event_ids) = repository::settle_simulation_service_on(
                 &tx,
@@ -2748,8 +2887,7 @@ impl SimulationStore {
             settled_event_ids = Some(event_ids);
             instance
         } else if let Some(candidate) = timer_candidate {
-            let instance_id = load_instance_id_tx(&tx, &self.simulation_id)?
-                .context("simulation timer plan has no instance")?;
+            let instance_id = target.instance_id.clone();
             ensure!(
                 candidate.instance_id.as_deref() == Some(instance_id.as_str()),
                 "simulation timer candidate belongs to another instance"
@@ -2761,7 +2899,7 @@ impl SimulationStore {
                 Some(expected_revision),
                 &plan,
                 at_ms,
-                false,
+                true,
                 repository::ExecutionMode::Simulation(PrivateSimulationMode::prove(&self.conn)?),
             )?
             .context("simulation timer changed before its private commit")?;
@@ -2771,8 +2909,8 @@ impl SimulationStore {
             );
             timer_outcome.instance
         } else if let Some(step) = event.as_ref() {
-            let instance_id = load_instance_id_tx(&tx, &self.simulation_id)?
-                .context("simulation event step has no instance")?;
+            // Messages and signals are delivered to the instance the run started.
+            let instance_id = target.instance_id.clone();
             let mode = PrivateSimulationMode::prove(&self.conn)?;
             match step {
                 EventStep::Send(prepared) => {
@@ -2965,8 +3103,7 @@ impl SimulationStore {
                 }
             }
         } else {
-            let instance_id = load_instance_id_tx(&tx, &self.simulation_id)?
-                .context("simulation plan has no instance")?;
+            let instance_id = target.instance_id.clone();
             repository::apply_simulation_plan_on(
                 &tx,
                 PrivateSimulationMode::prove(&self.conn)?,
@@ -2980,16 +3117,24 @@ impl SimulationStore {
             )?
         };
 
-        if let Some(instance_id) = load_instance_id_tx(&tx, &self.simulation_id)? {
+        // The meta row learns the instance only when the start commits.
+        let root_id = load_instance_id_tx(&tx, &self.simulation_id)?
+            .or_else(|| plan.start_instance_id.clone())
+            .context("simulation transition left no instance")?;
+        let mode = PrivateSimulationMode::prove(&self.conn)?;
+        let tree_ids = repository::simulation_call_tree_on(&tx, mode, &root_id)?;
+        for instance_id in &tree_ids {
             repository::simulation_record_cancelled_work_on(
                 &tx,
-                PrivateSimulationMode::prove(&self.conn)?,
+                mode,
                 &self.actor,
-                &instance_id,
+                instance_id,
                 at_ms,
                 &mut || self.ids.borrow_mut().next_id("event"),
             )?;
         }
+        check_tree_capacity(&tx, &tree_ids)?;
+        let root = repository::simulation_instance_on(&tx, mode, &self.actor, &root_id)?;
         let mut next_clock = self.clock.clone();
         next_clock.accept_transition(at_ms)?;
         tx.execute(
@@ -3022,9 +3167,9 @@ impl SimulationStore {
         tx.execute(
             "UPDATE simulation_meta SET instance_id=?1,status=?2,revision=?3,updated_at_ms=?4 WHERE simulation_id=?5 AND revision=?6",
             params![
-                result.instance_id,
-                simulation_meta_status(&result.status),
-                result.revision as i64,
+                root.instance_id,
+                simulation_meta_status(&root.status),
+                next_clock.revision as i64,
                 at_ms,
                 self.simulation_id,
                 self.clock.revision as i64
@@ -3096,6 +3241,25 @@ impl SimulationStore {
         Ok(())
     }
 
+    /// The instances of the run, the simulated one first and then what it called.
+    fn tree_ids(&self) -> Result<Vec<String>> {
+        let Some(root) = load_instance_id(&self.conn, &self.simulation_id)? else {
+            return Ok(Vec::new());
+        };
+        repository::simulation_call_tree_on(
+            &self.conn,
+            PrivateSimulationMode::prove(&self.conn)?,
+            &root,
+        )
+    }
+
+    fn load_tree(&self) -> Result<Vec<RuntimeSnapshot>> {
+        self.tree_ids()?
+            .iter()
+            .map(|instance_id| repository::runtime_snapshot_on(&self.conn, &self.actor, instance_id))
+            .collect()
+    }
+
     fn load_snapshot(&self) -> Result<Option<RuntimeSnapshot>> {
         let Some(instance_id) = load_instance_id(&self.conn, &self.simulation_id)? else {
             return Ok(None);
@@ -3106,19 +3270,34 @@ impl SimulationStore {
     /// Newest events first until the count or byte budget is spent, returned in
     /// ascending order with the number of older events that were left out.
     fn load_events(&self, byte_budget: usize) -> Result<(Vec<SimulationEventView>, u64)> {
-        let Some(instance_id) = load_instance_id(&self.conn, &self.simulation_id)? else {
+        let ids = self.tree_ids()?;
+        if ids.is_empty() {
             return Ok((Vec::new(), 0));
-        };
+        }
+        // Newest first until the budget is spent; the events of one instant are
+        // ordered by where their instance sits in the call tree, then by sequence.
+        let marks = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+        let rank = (0..ids.len())
+            .map(|i| format!("WHEN ?{} THEN {i}", i + 1))
+            .collect::<Vec<_>>()
+            .join(" ");
         let total: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1",
-            [&instance_id],
+            &format!("SELECT COUNT(*) FROM bpmn_events WHERE instance_id IN ({marks})"),
+            rusqlite::params_from_iter(ids.iter()),
             |row| row.get(0),
         )?;
-        let mut stmt = self.conn.prepare(
-            "SELECT event_id,seq,at_ms,kind,node_id,actor_user_id,data_json,scope_id
-             FROM bpmn_events WHERE instance_id=?1 ORDER BY seq DESC",
-        )?;
-        let mut rows = stmt.query([&instance_id])?;
+        // One instance is ordered by its own sequence; several are interleaved by
+        // the virtual instant, which agrees with each instance's sequence.
+        let order = if ids.len() == 1 {
+            "seq DESC".to_owned()
+        } else {
+            format!("at_ms DESC, CASE instance_id {rank} END DESC, seq DESC")
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT event_id,seq,at_ms,kind,node_id,actor_user_id,data_json,scope_id,instance_id
+             FROM bpmn_events WHERE instance_id IN ({marks}) ORDER BY {order}"
+        ))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(ids.iter()))?;
         let mut events = Vec::new();
         let mut used = 0_usize;
         while events.len() < MAX_VIEW_EVENTS {
@@ -3138,6 +3317,7 @@ impl SimulationStore {
                 data: serde_json::from_str(&data_json)
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?,
                 scope_id: row.get(7)?,
+                instance_id: row.get(8)?,
             });
         }
         events.reverse();
@@ -3422,7 +3602,9 @@ fn ensure_actor_allowed(
     Ok(())
 }
 
-fn validate_captured_source(
+/// Decodes a captured source and checks its identity, hashes and ACL. Opening a
+/// retained run does only this: the profile was held when the run was created.
+fn decode_captured_source(
     input: &SimulationSourceInput,
 ) -> Result<(ProcessModel, SimulationAclSnapshot)> {
     ensure!(
@@ -3475,11 +3657,21 @@ fn validate_captured_source(
             .any(|id| id == &input.owner_user_id),
         "simulation owner is outside captured ACL"
     );
-    ensure!(
-        model.additional_processes.is_empty(),
-        SimulationUnsupportedActivity::AdditionalProcess
-    );
-    let body = selected_body(&model, &input.selected_process_id, &[])?;
+    Ok((model, acl))
+}
+
+fn validate_captured_source(
+    input: &SimulationSourceInput,
+) -> Result<(ProcessModel, SimulationAclSnapshot)> {
+    let (model, acl) = decode_captured_source(input)?;
+    check_simulated_profile(&model, input)?;
+    Ok((model, acl))
+}
+
+/// Holds the simulated body, and every body a call can enter, to the profile a
+/// simulation can run.
+fn check_simulated_profile(model: &ProcessModel, input: &SimulationSourceInput) -> Result<()> {
+    let body = selected_body(model, &input.selected_process_id, &[])?;
     let start = body
         .nodes
         .iter()
@@ -3503,8 +3695,94 @@ fn validate_captured_source(
             .any(|node| matches!(&node.kind, ProcessNodeKind::End)),
         "simulation initial profile requires an End event"
     );
-    check_simulated_nodes(&model, &input.definition_id, body.nodes)?;
-    Ok((model, acl))
+    let mut called = Vec::with_capacity(input.call_closure.versions.len());
+    for version in &input.call_closure.versions {
+        ensure!(
+            hex::encode(Sha256::digest(version.model_json.as_bytes())) == version.model_sha256,
+            "a pinned called version differs from its captured hash"
+        );
+        let called_model: ProcessModel = serde_json::from_str(&version.model_json)
+            .context("decode a pinned called version")?;
+        validate_model(&called_model).context("validate a pinned called version")?;
+        called.push((version.definition_id.as_str(), version.version, called_model));
+    }
+    // Bodies are keyed by the document they live in (None = the simulated one) and
+    // their process id; a local call stays in its document.
+    let mut seen = HashSet::new();
+    let mut pending = vec![(None::<usize>, input.selected_process_id.as_str())];
+    while let Some((document, process_id)) = pending.pop() {
+        if !seen.insert((document, process_id)) {
+            continue;
+        }
+        let document_model = document.map_or(model, |index| &called[index].2);
+        let body = selected_body(document_model, process_id, &[])?;
+        match document {
+            None => check_simulated_nodes(model, &input.definition_id, body.nodes)?,
+            Some(_) => check_called_body(document_model, body.nodes)?,
+        }
+        for node in deep_nodes(body.nodes) {
+            let ProcessNodeKind::CallActivity(call) = &node.kind else {
+                continue;
+            };
+            if node.activity_io.is_some() {
+                return Err(SimulationUnsupportedActivity::CallActivityIo {
+                    node_id: node.id.clone(),
+                }
+                .into());
+            }
+            match &call.target {
+                ProcessCallTarget::LocalBody { called_element } => {
+                    pending.push((document, called_element.process_id.as_str()));
+                }
+                ProcessCallTarget::PublishedBody {
+                    definition_id,
+                    version,
+                    called_element,
+                } => {
+                    let index = called
+                        .iter()
+                        .position(|(id, number, _)| id == definition_id && number == version)
+                        .ok_or_else(|| {
+                            SimulationServiceError::new(
+                                SIMULATION_CALL_PIN_UNAVAILABLE,
+                                format!(
+                                    "{} calls version {version} of {definition_id}, which was not pinned into the simulation",
+                                    node.id
+                                ),
+                            )
+                        })?;
+                    pending.push((Some(index), called_element.process_id.as_str()));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A body a call enters is a second instance of the private run, and this
+/// simulation delivers messages and signals to the one instance it started, so a
+/// called body may not wait for an event.
+fn check_called_body(model: &ProcessModel, nodes: &[ProcessNode]) -> Result<()> {
+    for node in deep_nodes(nodes) {
+        let kind = match &node.kind {
+            ProcessNodeKind::MessageCatch { .. } => "MessageCatch",
+            ProcessNodeKind::MessageThrow { .. } => "MessageThrow",
+            ProcessNodeKind::MessageStart { .. } => "MessageStart",
+            ProcessNodeKind::ReceiveTask { .. } => "ReceiveTask",
+            ProcessNodeKind::SendTask { .. } => "SendTask",
+            ProcessNodeKind::BoundaryMessage { .. } => "BoundaryMessage",
+            ProcessNodeKind::SignalThrow { .. } => "SignalThrow",
+            ProcessNodeKind::SignalCatch { .. } => "SignalCatch",
+            ProcessNodeKind::EventBasedGateway => "EventBasedGateway",
+            _ => continue,
+        };
+        return Err(SimulationUnsupportedActivity::CalledBodyEvent {
+            node_id: node.id.clone(),
+            kind,
+        }
+        .into());
+    }
+    check_simulated_nodes(model, "", nodes)
 }
 
 /// Holds every node of a body, and of the embedded bodies below it, to the
@@ -3534,13 +3812,13 @@ fn check_simulated_nodes(
                     ),
                     "simulation supports Date, Duration, and WorkingDuration TimerCatch rules"
                 );
-                check_simulated_timer(&model, timer, "TimerCatch")?;
+                check_simulated_timer(model, timer, "TimerCatch")?;
             }
             // A boundary timer runs on the virtual clock exactly as a catch timer
             // does. `validate_model` already holds its rule to the production
             // limits (no repeating boundary timers, an explicit zone and calendar).
             ProcessNodeKind::BoundaryTimer { timer, .. } => {
-                check_simulated_timer(&model, timer, "BoundaryTimer")?;
+                check_simulated_timer(model, timer, "BoundaryTimer")?;
             }
             // `validate_model` above already refuses an unbound step, which has
             // nothing a simulation could wait for.
@@ -3599,12 +3877,8 @@ fn check_simulated_nodes(
                 }
                 .into());
             }
-            ProcessNodeKind::CallActivity(_) => {
-                return Err(SimulationUnsupportedActivity::CallActivity {
-                    node_id: node.id.clone(),
-                }
-                .into())
-            }
+            // The call target is pinned and walked by `check_simulated_profile`.
+            ProcessNodeKind::CallActivity(_) => {}
             // An embedded body runs in a scope of the same instance; its nodes are
             // held to the same profile as the root body's.
             ProcessNodeKind::SubProcess { body, .. } => {
@@ -3843,9 +4117,11 @@ pub(super) fn validate_supported_plan(plan: &RuntimePlan, nodes: &[ProcessNode])
             }),
         "the simulation profile only supports Catch and Boundary timers and error, escalation, message and signal subscriptions"
     );
+    // A call is requested by the plan and started by the repository, which derives
+    // its steps from the persisted run; a plan that arrives with steps was not.
     ensure!(
-        plan.call_requests.is_empty() && plan.call_steps.is_empty(),
-        "process calls are unsupported in the simulation profile"
+        plan.call_steps.is_empty(),
+        "a simulation derives its call steps itself"
     );
     ensure!(
         plan.termination_attempts.iter().all(|attempt| {
@@ -3895,24 +4171,22 @@ pub(super) struct SimulationUsage {
 }
 
 impl SimulationUsage {
-    fn of(snapshot: Option<&RuntimeSnapshot>) -> Self {
-        let Some(snapshot) = snapshot else {
-            return Self::default();
-        };
+    /// What the instances of a run's call tree have opened between them.
+    fn of_tree(tree: &[RuntimeSnapshot]) -> Self {
         Self {
-            scopes: snapshot
-                .scopes
+            scopes: tree
                 .iter()
+                .flat_map(|snapshot| snapshot.scopes.iter())
                 .filter(|scope| scope.parent_scope_id.is_some())
                 .count(),
-            group_ids: snapshot
-                .repetition_groups
+            group_ids: tree
                 .iter()
+                .flat_map(|snapshot| snapshot.repetition_groups.iter())
                 .map(|group| group.group_id.clone())
                 .collect(),
-            occurrence_ids: snapshot
-                .repetition_occurrences
+            occurrence_ids: tree
                 .iter()
+                .flat_map(|snapshot| snapshot.repetition_occurrences.iter())
                 .map(|occurrence| occurrence.occurrence_id.clone())
                 .collect(),
         }
@@ -3959,6 +4233,133 @@ pub(super) fn check_simulation_capacity(plan: &RuntimePlan, usage: &SimulationUs
         ));
     }
     Ok(())
+}
+
+/// The totals of a run's whole call tree, read back inside the transition that
+/// grew them. The plan-level check sees only the plan it is given; a called
+/// child's own plans are made by the repository, so this is the net that holds
+/// the tree to the caps whatever made the rows. Refusing here rolls the transition
+/// back.
+fn check_tree_capacity(tx: &Transaction<'_>, instance_ids: &[String]) -> Result<()> {
+    if instance_ids.len() > MAX_SIMULATION_INSTANCES {
+        return Err(SimulationServiceError::new(
+            SIMULATION_CALL_LIMIT,
+            format!(
+                "the transition would start instance {}, and a simulation starts at most {MAX_SIMULATION_INSTANCES}",
+                instance_ids.len()
+            ),
+        ));
+    }
+    let count = |table: &str, condition: &str| -> Result<usize> {
+        let marks = vec!["?"; instance_ids.len()].join(",");
+        let query = format!(
+            "SELECT COUNT(*) FROM {table} WHERE instance_id IN ({marks}){condition}"
+        );
+        let total: i64 = tx.query_row(
+            &query,
+            rusqlite::params_from_iter(instance_ids.iter()),
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(total)?)
+    };
+    let scopes = count("bpmn_scopes", " AND parent_scope_id IS NOT NULL")?;
+    if scopes > MAX_SIMULATION_SCOPES {
+        return Err(SimulationServiceError::new(
+            SIMULATION_SCOPE_LIMIT,
+            format!(
+                "the transition would open scope {scopes}, and a simulation opens at most {MAX_SIMULATION_SCOPES}"
+            ),
+        ));
+    }
+    let groups = count("bpmn_repetition_groups", "")?;
+    let occurrences = count("bpmn_repetition_occurrences", "")?;
+    if groups > MAX_SIMULATION_REPETITION_GROUPS || occurrences > MAX_SIMULATION_OCCURRENCES {
+        return Err(SimulationServiceError::new(
+            SIMULATION_REPETITION_LIMIT,
+            format!(
+                "the transition would reach {groups} repetition groups and {occurrences} occurrences, and a simulation holds at most {MAX_SIMULATION_REPETITION_GROUPS} groups and {MAX_SIMULATION_OCCURRENCES} occurrences"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The instances of the run with their place in the call tree.
+fn instance_views(
+    tree: &[RuntimeSnapshot],
+    calls: &[repository::CallActivation],
+) -> Vec<ProcessSimulationInstance> {
+    tree.iter()
+        .map(|snapshot| {
+            let instance = &snapshot.instance;
+            let mut parent = calls
+                .iter()
+                .find(|call| call.child_instance_id == instance.instance_id)
+                .map(|call| call.parent_instance_id.clone());
+            let mut depth = 0;
+            let mut cursor = parent.clone();
+            while let Some(id) = cursor {
+                depth += 1;
+                cursor = calls
+                    .iter()
+                    .find(|call| call.child_instance_id == id)
+                    .map(|call| call.parent_instance_id.clone());
+            }
+            ProcessSimulationInstance {
+                instance_id: instance.instance_id.clone(),
+                definition_id: instance.definition_id.clone(),
+                definition_name: instance.definition_name.clone(),
+                version: instance.version,
+                process_id: instance.process_id.clone(),
+                status: instance.status.clone(),
+                parent_instance_id: parent.take(),
+                depth,
+            }
+        })
+        .collect()
+}
+
+/// The calls of the run, each told from the activity that made it.
+fn call_views(
+    tree: &[RuntimeSnapshot],
+    calls: &[repository::CallActivation],
+) -> Result<Vec<ProcessSimulationCall>> {
+    calls
+        .iter()
+        .map(|call| {
+            let caller = tree
+                .iter()
+                .find(|snapshot| snapshot.instance.instance_id == call.parent_instance_id)
+                .context("a call names a caller outside the run")?;
+            let child = tree
+                .iter()
+                .find(|snapshot| snapshot.instance.instance_id == call.child_instance_id)
+                .context("a call names a child outside the run")?;
+            let node = repository::scope_node(
+                &caller.model,
+                &caller.instance.process_id,
+                &caller.scopes,
+                &call.parent_instance_id,
+                &call.parent_scope_id,
+                &call.call_node_id,
+            )?;
+            Ok(ProcessSimulationCall {
+                call_id: call.call_id.clone(),
+                parent_instance_id: call.parent_instance_id.clone(),
+                parent_scope_id: call.parent_scope_id.clone(),
+                call_node_id: call.call_node_id.clone(),
+                call_node_name: node.name.clone(),
+                child_instance_id: call.child_instance_id.clone(),
+                called_definition_id: call.called_definition_id.clone(),
+                called_definition_name: child.instance.definition_name.clone(),
+                called_version: call.called_version,
+                called_process_id: call.called_process_id.clone(),
+                local: call.called_definition_id == call.definition_id
+                    && call.called_version == call.version,
+                status: call.status.clone(),
+            })
+        })
+        .collect()
 }
 
 /// The repetition groups and occurrences of a run for display, oldest group first

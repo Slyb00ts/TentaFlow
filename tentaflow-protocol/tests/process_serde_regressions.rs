@@ -318,6 +318,7 @@ fn simulation_payloads_round_trip_by_variant_name_through_json_and_cbor() {
             event_id: "event-1".into(), seq: 1, at_ms: 1_000, kind: "instance_started".into(),
             node_id: None, actor_user_id: Some("user-1".into()), data: json!({}),
             scope_id: "scope-1".into(),
+            instance_id: "instance-1".into(),
         }],
         trace_steps: vec![ProcessSimulationTraceStep {
             trace_step_id: "trace-1".into(), ordinal: 0, action: "start".into(), at_ms: 1_000,
@@ -343,6 +344,8 @@ fn simulation_payloads_round_trip_by_variant_name_through_json_and_cbor() {
         scopes: Vec::new(),
         repetition_groups: Vec::new(),
         repetition_occurrences: Vec::new(),
+        instances: Vec::new(),
+        calls: Vec::new(),
         events_omitted: 7,
         trace_steps_omitted: 3,
     };

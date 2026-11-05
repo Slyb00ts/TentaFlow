@@ -463,6 +463,7 @@ pub(super) fn source_input_for(model: tentaflow_protocol::processes::ProcessMode
         start_ms: 1_000,
         horizon_ms: 10_000,
         tick_duration_ms: 100,
+        call_closure: Default::default(),
     }
 }
 

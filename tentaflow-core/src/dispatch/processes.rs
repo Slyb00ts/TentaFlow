@@ -134,6 +134,7 @@ fn simulation_view(view: simulation::SimulationView) -> Result<ProcessSimulation
                 actor_user_id: event.actor_user_id,
                 data: event.data,
                 scope_id: event.scope_id,
+                instance_id: event.instance_id,
             })
             .collect(),
         trace_steps: view
@@ -155,6 +156,8 @@ fn simulation_view(view: simulation::SimulationView) -> Result<ProcessSimulation
         scopes: view.scopes,
         repetition_groups: view.repetition_groups,
         repetition_occurrences: view.repetition_occurrences,
+        instances: view.instances,
+        calls: view.calls,
         activity_io_witnesses: view
             .activity_io_witnesses
             .into_iter()
@@ -1879,6 +1882,88 @@ mod tests {
             .expect("the private run opened an embedded scope");
         assert_eq!(child.subprocess_node_id.as_deref(), Some("Scope_1"));
         // The scope lives in the private run only: production sees no scope row.
+        assert_eq!(production_row_counts(&state), before);
+        request(
+            &ctx,
+            P::SimulationReleaseRequest { simulation_id: view.simulation_id.clone() },
+        )
+        .await;
+        assert_eq!(production_row_counts(&state), before);
+    }
+
+    #[tokio::test]
+    async fn a_simulated_call_runs_its_callee_privately_and_writes_no_production_row() {
+        use crate::processes::runtime::test_support::{edge, user_model};
+        use tentaflow_protocol::processes::{
+            ProcessCallActivity, ProcessCallTarget, ProcessCallableReference, ProcessNodeKind,
+        };
+        let state = AppState::for_test();
+        let actor = test_support::actor(&state.db, "simulation-call-owner");
+        let ctx = context(&state, &actor);
+        let callee_model = user_model(Some(&actor.user_id));
+        let callee_process_id = callee_model.process_id.clone();
+        let callee = save_and_publish(&ctx, callee_model).await;
+        let mut caller_model = crate::processes::model::starter_model();
+        caller_model.nodes.insert(
+            1,
+            ProcessNode {
+                id: "Call_1".into(),
+                name: "Call the callee".into(),
+                kind: ProcessNodeKind::CallActivity(ProcessCallActivity {
+                    target: ProcessCallTarget::PublishedBody {
+                        definition_id: callee.definition_id.clone(),
+                        version: 1,
+                        called_element: ProcessCallableReference {
+                            namespace_uri: "https://tentaflow.app/bpmn/1".into(),
+                            process_id: callee_process_id,
+                        },
+                    },
+                    input_mapping: Default::default(),
+                    output_mapping: [("result".to_owned(), "outputs.answer".to_owned())].into(),
+                }),
+                repeat: None,
+                activity_io: None,
+            },
+        );
+        caller_model.sequence_flows =
+            vec![edge("ToCall", "Start_1", "Call_1"), edge("CallEnd", "Call_1", "End_1")];
+        let caller = save_and_publish(&ctx, caller_model).await;
+        let before = production_row_counts(&state);
+
+        let P::SimulationStartResponse { view } =
+            request(&ctx, simulation_start(&caller.definition_id)).await
+        else {
+            panic!("private simulation start expected")
+        };
+        assert_eq!(view.instances.len(), 2, "the callee runs as a second private instance");
+        assert_eq!(view.calls.len(), 1);
+        let task_id = view
+            .user_tasks
+            .iter()
+            .find(|task| task.status == tentaflow_protocol::processes::ProcessUserTaskStatus::Open)
+            .expect("the callee's task is open")
+            .user_task_id
+            .clone();
+        let P::SimulationUserTaskCompleteResponse { view: done } = request(
+            &ctx,
+            P::SimulationUserTaskCompleteRequest {
+                simulation_id: view.simulation_id.clone(),
+                user_task_id: task_id,
+                outputs: json!({"answer": "from the callee"}),
+                approved: None,
+            },
+        )
+        .await
+        else {
+            panic!("private simulation completion expected")
+        };
+        assert_eq!(
+            done.instance.as_ref().expect("private instance").status,
+            ProcessInstanceStatus::Completed
+        );
+        assert_eq!(done.instance.as_ref().expect("instance").variables["result"], "from the callee");
+        // No production run exists, was started or signalled, and the production
+        // call and event tables are exactly as they were.
         assert_eq!(production_row_counts(&state), before);
         request(
             &ctx,

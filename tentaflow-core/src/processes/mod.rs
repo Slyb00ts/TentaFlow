@@ -82,6 +82,8 @@ pub(crate) mod simulation_scope_tests;
 #[cfg(test)]
 mod simulation_repetition_tests;
 #[cfg(test)]
+mod simulation_call_tests;
+#[cfg(test)]
 mod tool_task_tests;
 #[cfg(test)]
 mod block_task_tests;
