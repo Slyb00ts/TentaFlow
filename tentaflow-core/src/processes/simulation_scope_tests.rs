@@ -355,31 +355,39 @@ fn plan_opening(count: usize) -> super::repository::RuntimePlan {
     plan
 }
 
+pub(crate) fn refusal_code(error: &anyhow::Error) -> &'static str {
+    error
+        .downcast_ref::<SimulationServiceError>()
+        .unwrap_or_else(|| panic!("a stable refusal, got {error:#}"))
+        .code
+}
+
 #[test]
 fn a_transition_cannot_open_more_scopes_than_the_simulation_limit() {
     use super::simulation::{check_simulation_capacity, SimulationUsage};
 
     check_simulation_capacity(
         &plan_opening(MAX_SIMULATION_SCOPES),
-        SimulationUsage::default(),
+        &SimulationUsage::default(),
     )
     .expect("a run may open exactly the limit");
     // Scopes the run opened earlier count, closed ones included.
     let usage = SimulationUsage {
         scopes: MAX_SIMULATION_SCOPES - 1,
+        ..SimulationUsage::default()
     };
-    check_simulation_capacity(&plan_opening(1), usage).expect("the last scope fits");
+    check_simulation_capacity(&plan_opening(1), &usage).expect("the last scope fits");
     for (opened, used) in [
         (MAX_SIMULATION_SCOPES + 1, 0),
         (2, MAX_SIMULATION_SCOPES - 1),
     ] {
+        let usage = SimulationUsage {
+            scopes: used,
+            ..SimulationUsage::default()
+        };
         let error =
-            check_simulation_capacity(&plan_opening(opened), SimulationUsage { scopes: used })
-                .expect_err("past the limit");
-        let refusal = error
-            .downcast_ref::<SimulationServiceError>()
-            .unwrap_or_else(|| panic!("a stable refusal, got {error:#}"));
-        assert_eq!(refusal.code, SIMULATION_SCOPE_LIMIT);
+            check_simulation_capacity(&plan_opening(opened), &usage).expect_err("past the limit");
+        assert_eq!(refusal_code(&error), SIMULATION_SCOPE_LIMIT);
     }
 }
 

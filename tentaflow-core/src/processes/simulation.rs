@@ -15,7 +15,8 @@ use sha2::{Digest, Sha256};
 use tentaflow_protocol::processes::{
     ActivityOutcome, ActivityResult, ProcessIncident, ProcessInstance,
     ProcessInstanceStatus, ProcessMessageStatus, ProcessMessageSummary, ProcessMessageTarget, ProcessMessageTargetSpec,
-    ProcessModel, ProcessNode, ProcessNodeKind, ProcessScopeSummary, ProcessSimulationServiceFixture,
+    ProcessModel, ProcessNode, ProcessNodeKind, ProcessRepetitionGroupSummary, ProcessRepetitionOccurrenceSummary, ProcessScopeSummary,
+    ProcessSimulationServiceFixture,
     ProcessSimulationServiceMode, ProcessSimulationServiceWait, ProcessSimulationSubscription,
     ProcessSimulationVerdict, ProcessSubscriptionKind, ProcessSubscriptionStatus,
     ProcessTimerSpec, ProcessTimerStatus, ProcessTimerSummary, ProcessUserTask,
@@ -1249,7 +1250,6 @@ pub enum SimulationUnsupportedActivity {
     EventDelivery { node_id: String, kind: &'static str },
     MessageTarget { node_id: String },
     ExternalActivity { node_id: String, kind: String },
-    Repetition { node_id: String },
     AdditionalProcess,
 }
 
@@ -1277,9 +1277,6 @@ impl fmt::Display for SimulationUnsupportedActivity {
             ),
             Self::ExternalActivity { node_id, kind } => {
                 write!(f, "{kind} is unsupported in simulation ({node_id})")
-            }
-            Self::Repetition { node_id } => {
-                write!(f, "repetition is unsupported in simulation ({node_id})")
             }
             Self::AdditionalProcess => {
                 write!(f, "additional process bodies are unsupported in simulation")
@@ -1314,6 +1311,14 @@ pub const SIMULATION_SCOPE_LIMIT: &str = "SIMULATION_SCOPE_LIMIT";
 /// in-memory run is held to a quarter of that so a looping model cannot fill the
 /// 16 MiB budget with scope rows before the horizon stops it.
 pub(crate) const MAX_SIMULATION_SCOPES: usize = 32;
+/// A transition would reach more repetition groups or occurrences than one simulation holds.
+pub const SIMULATION_REPETITION_LIMIT: &str = "SIMULATION_REPETITION_LIMIT";
+/// The most repetition groups a simulation may open in its whole life. Production
+/// allows 128 per instance.
+pub(crate) const MAX_SIMULATION_REPETITION_GROUPS: usize = 32;
+/// The most repetition occurrences a simulation may create in its whole life.
+/// Production allows 1024 per instance (64 of them active at once).
+pub(crate) const MAX_SIMULATION_OCCURRENCES: usize = 128;
 pub const SERVICE_AMBIGUOUS: &str = "SIMULATION_SERVICE_AMBIGUOUS";
 pub const SERVICE_ANSWER_INVALID: &str = "SIMULATION_ANSWER_INVALID";
 pub const SERVICE_OUTCOME_NOT_PRODUCIBLE: &str = "SIMULATION_OUTCOME_NOT_PRODUCIBLE";
@@ -1365,6 +1370,8 @@ pub struct SimulationView {
     pub subscriptions: Vec<ProcessSimulationSubscription>,
     pub messages: Vec<ProcessMessageSummary>,
     pub scopes: Vec<ProcessScopeSummary>,
+    pub repetition_groups: Vec<ProcessRepetitionGroupSummary>,
+    pub repetition_occurrences: Vec<ProcessRepetitionOccurrenceSummary>,
     pub events_omitted: u64,
     pub trace_steps_omitted: u64,
 }
@@ -2464,6 +2471,10 @@ impl SimulationStore {
             )?,
             None => Vec::new(),
         };
+        let (repetition_groups, repetition_occurrences) = match snapshot.as_ref() {
+            Some(snapshot) => repetition_views(snapshot)?,
+            None => (Vec::new(), Vec::new()),
+        };
         let mut view = SimulationView {
             simulation_id: self.simulation_id.clone(),
             source: self.source.clone(),
@@ -2507,6 +2518,8 @@ impl SimulationStore {
                 .as_ref()
                 .map(|snapshot| snapshot.scopes.clone())
                 .unwrap_or_default(),
+            repetition_groups,
+            repetition_occurrences,
             events_omitted: 0,
             trace_steps_omitted: 0,
         };
@@ -2626,7 +2639,8 @@ impl SimulationStore {
         let persisted_snapshot = self.load_snapshot()?;
         let usage = SimulationUsage::of(persisted_snapshot.as_ref());
         let persisted_activations = persisted_snapshot
-            .map(|snapshot| {
+            .iter()
+            .flat_map(|snapshot| {
                 snapshot
                     .tokens
                     .iter()
@@ -2637,14 +2651,14 @@ impl SimulationStore {
                             .iter()
                             .map(|receipt| receipt.activation_id.clone()),
                     )
-                    .collect::<HashSet<_>>()
             })
-            .unwrap_or_default();
+            .chain(usage.persisted_ids().cloned())
+            .collect::<HashSet<_>>();
         let body_nodes = selected_body(&self.model, &self.source.selected_process_id, &[])?.nodes;
         if !plans_inside_writer {
             validate_plan_ids(&plan, &self.ids.borrow(), &persisted_activations)?;
             validate_supported_plan(&plan, body_nodes)?;
-            check_simulation_capacity(&plan, usage)?;
+            check_simulation_capacity(&plan, &usage)?;
         }
         let mut settled_event_ids = None;
         // A delivery names and checks its plan here, once the writer has planned it.
@@ -2662,7 +2676,7 @@ impl SimulationStore {
             );
             validate_plan_ids(planned, &self.ids.borrow(), &persisted_activations)?;
             validate_supported_plan(planned, body_nodes)?;
-            check_simulation_capacity(planned, usage)?;
+            check_simulation_capacity(planned, &usage)?;
             *recorded_event_ids.borrow_mut() = planned.event_ids.clone();
             Ok(())
         };
@@ -2724,7 +2738,7 @@ impl SimulationStore {
                 &|prepared| {
                     validate_plan_ids(prepared, &ids, &persisted_activations)?;
                     validate_supported_plan(prepared, body_nodes)?;
-                    check_simulation_capacity(prepared, usage)
+                    check_simulation_capacity(prepared, &usage)
                 },
             )?;
             ensure!(
@@ -3501,12 +3515,6 @@ fn check_simulated_nodes(
     nodes: &[ProcessNode],
 ) -> Result<()> {
     for node in nodes {
-        if node.repeat.is_some() {
-            return Err(SimulationUnsupportedActivity::Repetition {
-                node_id: node.id.clone(),
-            }
-            .into());
-        }
         match &node.kind {
             ProcessNodeKind::Start
             | ProcessNodeKind::End
@@ -3644,7 +3652,7 @@ pub(super) fn refuse_event_activity_io(node: &ProcessNode) -> Result<()> {
 pub(super) fn validate_plan_ids(
     plan: &RuntimePlan,
     ids: &SimulationIdSource,
-    persisted_activations: &HashSet<String>,
+    persisted_ids: &HashSet<String>,
 ) -> Result<()> {
     ensure!(
         plan.event_ids.len() == plan.events.len()
@@ -3689,6 +3697,21 @@ pub(super) fn validate_plan_ids(
                 .map(|scope| ("scope", scope.scope_id.as_str())),
         )
         .chain(
+            plan.repetition_groups
+                .iter()
+                .map(|group| ("repetition group", group.group_id.as_str())),
+        )
+        .chain(
+            plan.repetition_occurrences
+                .iter()
+                .map(|occurrence| ("repetition occurrence", occurrence.occurrence_id.as_str())),
+        )
+        .chain(
+            plan.repetition_capacity
+                .iter()
+                .map(|latch| ("repetition capacity incident", latch.incident_id.as_str())),
+        )
+        .chain(
             plan.create_jobs
                 .iter()
                 .map(|job| ("service job", job.job_id.as_str())),
@@ -3728,7 +3751,11 @@ pub(super) fn validate_plan_ids(
             "simulation plan contains a malformed UUID"
         );
         ensure!(
-            ids.accepts(id) || kind == "gateway activation" && persisted_activations.contains(id),
+            ids.accepts(id)
+                || matches!(
+                    kind,
+                    "gateway activation" | "repetition group" | "repetition occurrence"
+                ) && persisted_ids.contains(id),
             "simulation plan contains a {kind} identifier not issued by its allocator: {id}"
         );
     }
@@ -3821,12 +3848,6 @@ pub(super) fn validate_supported_plan(plan: &RuntimePlan, nodes: &[ProcessNode])
         "process calls are unsupported in the simulation profile"
     );
     ensure!(
-        plan.repetition_groups.is_empty()
-            && plan.repetition_occurrences.is_empty()
-            && plan.repetition_capacity.is_none(),
-        "repetition is unsupported in the initial simulation profile"
-    );
-    ensure!(
         plan.termination_attempts.iter().all(|attempt| {
             let accepted = match attempt {
                 super::repository::TerminationAttempt::Success(source) => &source.accepted_input,
@@ -3866,27 +3887,48 @@ pub(super) fn deep_nodes(nodes: &[ProcessNode]) -> Vec<&ProcessNode> {
 }
 
 /// What a run has already opened, which a finished plan adds to.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct SimulationUsage {
     pub(super) scopes: usize,
+    pub(super) group_ids: HashSet<String>,
+    pub(super) occurrence_ids: HashSet<String>,
 }
 
 impl SimulationUsage {
     fn of(snapshot: Option<&RuntimeSnapshot>) -> Self {
+        let Some(snapshot) = snapshot else {
+            return Self::default();
+        };
         Self {
-            scopes: snapshot.map_or(0, |snapshot| {
-                snapshot
-                    .scopes
-                    .iter()
-                    .filter(|scope| scope.parent_scope_id.is_some())
-                    .count()
-            }),
+            scopes: snapshot
+                .scopes
+                .iter()
+                .filter(|scope| scope.parent_scope_id.is_some())
+                .count(),
+            group_ids: snapshot
+                .repetition_groups
+                .iter()
+                .map(|group| group.group_id.clone())
+                .collect(),
+            occurrence_ids: snapshot
+                .repetition_occurrences
+                .iter()
+                .map(|occurrence| occurrence.occurrence_id.clone())
+                .collect(),
         }
+    }
+
+    /// Every identifier an earlier request of the run minted that a later plan may
+    /// name again: the allocator of a request knows only what it issued itself.
+    fn persisted_ids(&self) -> impl Iterator<Item = &String> {
+        self.group_ids.iter().chain(self.occurrence_ids.iter())
     }
 }
 
-/// Holds a finished plan to the number of scopes one simulation may open.
-pub(super) fn check_simulation_capacity(plan: &RuntimePlan, usage: SimulationUsage) -> Result<()> {
+/// Holds a finished plan to the number of scopes, repetition groups and
+/// occurrences one simulation may open. Rows an earlier step wrote and the plan
+/// only rewrites do not count again.
+pub(super) fn check_simulation_capacity(plan: &RuntimePlan, usage: &SimulationUsage) -> Result<()> {
     let scopes = usage.scopes.saturating_add(plan.create_scopes.len());
     if scopes > MAX_SIMULATION_SCOPES {
         return Err(SimulationServiceError::new(
@@ -3896,7 +3938,88 @@ pub(super) fn check_simulation_capacity(plan: &RuntimePlan, usage: SimulationUsa
             ),
         ));
     }
+    let groups = usage.group_ids.len().saturating_add(
+        plan.repetition_groups
+            .iter()
+            .filter(|group| !usage.group_ids.contains(&group.group_id))
+            .count(),
+    );
+    let occurrences = usage.occurrence_ids.len().saturating_add(
+        plan.repetition_occurrences
+            .iter()
+            .filter(|occurrence| !usage.occurrence_ids.contains(&occurrence.occurrence_id))
+            .count(),
+    );
+    if groups > MAX_SIMULATION_REPETITION_GROUPS || occurrences > MAX_SIMULATION_OCCURRENCES {
+        return Err(SimulationServiceError::new(
+            SIMULATION_REPETITION_LIMIT,
+            format!(
+                "the transition would reach {groups} repetition groups and {occurrences} occurrences, and a simulation holds at most {MAX_SIMULATION_REPETITION_GROUPS} groups and {MAX_SIMULATION_OCCURRENCES} occurrences"
+            ),
+        ));
+    }
     Ok(())
+}
+
+/// The repetition groups and occurrences of a run for display, oldest group first
+/// and each group's occurrences by ordinal.
+fn repetition_views(
+    snapshot: &RuntimeSnapshot,
+) -> Result<(
+    Vec<ProcessRepetitionGroupSummary>,
+    Vec<ProcessRepetitionOccurrenceSummary>,
+)> {
+    let mut groups = snapshot.repetition_groups.iter().collect::<Vec<_>>();
+    groups.sort_by(|a, b| (a.created_at_ms, &a.group_id).cmp(&(b.created_at_ms, &b.group_id)));
+    let mut summaries = Vec::with_capacity(groups.len());
+    let mut occurrences = Vec::new();
+    for group in groups {
+        let node = repository::scope_node(
+            &snapshot.model,
+            &snapshot.instance.process_id,
+            &snapshot.scopes,
+            &group.instance_id,
+            &group.scope_id,
+            &group.node_id,
+        )?;
+        summaries.push(ProcessRepetitionGroupSummary {
+            group_id: group.group_id.clone(),
+            node_id: group.node_id.clone(),
+            node_name: node.name.clone(),
+            scope_id: group.scope_id.clone(),
+            parent_token_id: group.parent_token_id.clone(),
+            mode: group.mode,
+            status: group.status,
+            total: group.total_count,
+            created_count: group.created_count,
+            completed: group.completed_count,
+            max_iterations: group.max_iterations,
+            revision: group.revision,
+            created_at_ms: group.created_at_ms,
+            updated_at_ms: group.updated_at_ms,
+        });
+        let mut rows = snapshot
+            .repetition_occurrences
+            .iter()
+            .filter(|occurrence| occurrence.group_id == group.group_id)
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|occurrence| occurrence.ordinal);
+        occurrences.extend(rows.into_iter().map(|occurrence| ProcessRepetitionOccurrenceSummary {
+            occurrence_id: occurrence.occurrence_id.clone(),
+            group_id: occurrence.group_id.clone(),
+            ordinal: occurrence.ordinal,
+            status: occurrence.status,
+            token_id: occurrence.token_id.clone(),
+            user_task_id: occurrence.user_task_id.clone(),
+            job_id: occurrence.job_id.clone(),
+            verification_user_task_id: occurrence.verification_user_task_id.clone(),
+            accepted_source_event_id: occurrence.accepted_source_event_id.clone(),
+            approval_event_id: occurrence.approval_event_id.clone(),
+            created_at_ms: occurrence.created_at_ms,
+            updated_at_ms: occurrence.updated_at_ms,
+        }));
+    }
+    Ok((summaries, occurrences))
 }
 
 fn load_source(conn: &Connection, simulation_id: &str) -> Result<SimulationSourcePin> {

@@ -153,6 +153,8 @@ fn simulation_view(view: simulation::SimulationView) -> Result<ProcessSimulation
         subscriptions: view.subscriptions,
         messages: view.messages,
         scopes: view.scopes,
+        repetition_groups: view.repetition_groups,
+        repetition_occurrences: view.repetition_occurrences,
         activity_io_witnesses: view
             .activity_io_witnesses
             .into_iter()

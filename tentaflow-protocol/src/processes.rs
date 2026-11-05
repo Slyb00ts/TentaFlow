@@ -2133,6 +2133,13 @@ pub struct ProcessSimulationView {
     /// that opened it, its parent and its status.
     #[serde(default)]
     pub scopes: Vec<ProcessScopeSummary>,
+    /// Every repetition group (multi-instance or loop) the run has opened, oldest
+    /// first, with how many occurrences it created and completed.
+    #[serde(default)]
+    pub repetition_groups: Vec<ProcessRepetitionGroupSummary>,
+    /// The occurrences of those groups, by group and ordinal.
+    #[serde(default)]
+    pub repetition_occurrences: Vec<ProcessRepetitionOccurrenceSummary>,
     /// Oldest events dropped from `events` to keep the response within one frame.
     #[serde(default)]
     pub events_omitted: u64,

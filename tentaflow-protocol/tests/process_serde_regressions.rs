@@ -341,6 +341,8 @@ fn simulation_payloads_round_trip_by_variant_name_through_json_and_cbor() {
         }],
         messages: Vec::new(),
         scopes: Vec::new(),
+        repetition_groups: Vec::new(),
+        repetition_occurrences: Vec::new(),
         events_omitted: 7,
         trace_steps_omitted: 3,
     };
