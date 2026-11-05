@@ -22,7 +22,7 @@ const { emptyProcessModel, processExplainError } = await import('./bpmn.js');
 const { simulationWindow, openProcessSimulation, resumeProcessSimulation, simulationErrorText } = await import('./process-simulation.js');
 const { TfWindow } = await import('../../components/tf-window.js');
 const { TfToast } = await import('../../components/tf-toast.js');
-const { OUTPUTS_MAX_KIB, SERVICE_OUTCOMES, readMessageDraft, readOutputs, readServiceAnswer, readServiceFixtures, simulationServiceOutcomes, simulationServiceSteps, simulationWaitSteps } = await import('./simulation-service.js');
+const { OUTPUTS_MAX_KIB, SIMULATION_EVENT_KINDS, SERVICE_OUTCOMES, simulationStructure, simulationUnsupportedSteps, readMessageDraft, readOutputs, readServiceAnswer, readServiceFixtures, simulationServiceOutcomes, simulationServiceSteps, simulationWaitSteps } = await import('./simulation-service.js');
 localStorage.setItem('tentaflow_lang', 'en');
 await I18n.init();
 
@@ -1146,4 +1146,168 @@ test('a message start and an event step with data are refused with different sen
   assert.match(io, /data inputs or outputs/);
   assert.equal(readMessageDraft({ pick: '', name: 'n', key: 'k', payload: JSON.stringify({ b: 'x'.repeat(OUTPUTS_MAX_KIB * 1024) }), ttl: '60', exact: false }, []).errors.payload.key, 'simulation_payload_too_large');
   assert.equal(I18n.t('bpmn.simulation_payload_too_large', { max: 240 }), 'The payload is too large: at most 240 KiB.');
+});
+
+const inst = (overrides = {}) => ({ instanceId: 'inst-1', definitionId: 'def-1', definitionName: 'Order', version: 3, processId: 'P1', status: 'Waiting', parentInstanceId: null, depth: 0, ...overrides });
+const treeView = (overrides = {}) => baseView({
+  instance: { status: 'Waiting' },
+  instances: [inst(), inst({ instanceId: 'inst-2', definitionId: 'def-2', definitionName: 'Payment', version: 1, parentInstanceId: 'inst-1', depth: 1 })],
+  calls: [{ callId: 'c1', parentInstanceId: 'inst-1', parentScopeId: 'sc-0', callNodeId: 'Plain', callNodeName: 'Take payment', childInstanceId: 'inst-2',
+    calledDefinitionId: 'def-2', calledDefinitionName: 'Payment', calledVersion: 1, calledProcessId: 'P2', local: false, status: 'Waiting' }],
+  scopes: [{ scopeId: 'sc-1', parentScopeId: 'sc-0', subprocessNodeId: 'Expr', subprocessNodeName: '', parentTokenId: 't', revision: 1, status: 'Running', depth: 1 }],
+  repetitionGroups: [{ groupId: 'g-1', nodeId: 'Checked', nodeName: 'Review each', scopeId: 'sc-2', parentTokenId: 't', mode: 'multi_instance_parallel', status: 'open',
+    total: 3, createdCount: 3, completed: 1, maxIterations: null }],
+  repetitionOccurrences: [{ occurrenceId: 'o-1', groupId: 'g-1', ordinal: 0, status: 'completed' }, { occurrenceId: 'o-2', groupId: 'g-1', ordinal: 1, status: 'active' }],
+  events: [event('call_entered', 'Plain', null).constructor === Object ? { ...event('call_entered', 'Plain'), scopeId: 'sc-2', instanceId: 'inst-2' } : null,
+    { ...event('scope_entered', 'Expr'), scopeId: 'sc-1', instanceId: 'inst-1' }],
+  ...overrides });
+
+test('the run structure lists the call tree with the call that made each child, its scopes and its repetition groups', async () => {
+  const view = treeView();
+  const rows = simulationStructure(view);
+  assert.deepEqual(rows.map((row) => [row.instance.instanceId, row.depth, row.call?.callNodeName ?? null]), [['inst-1', 0, null], ['inst-2', 1, 'Take payment']]);
+  assert.deepEqual(rows[0].scopes.map((scope) => scope.scopeId), ['sc-1'], 'a scope the events place in the root');
+  assert.deepEqual(rows[1].groups.map(({ group }) => group.groupId), ['g-1'], 'a group the events place in the child');
+  const win = simulationWindow(view, MODEL);
+  await flush(2);
+  const panel = win.querySelector('[data-simulation-structure]');
+  assert.ok(panel);
+  const items = [...panel.querySelectorAll('[data-simulation-instance]')];
+  assert.deepEqual(items.map((item) => item.dataset.depth), ['0', '1']);
+  assert.match(items[1].textContent, /Payment v1/);
+  assert.match(items[1].querySelector('[data-simulation-call]').textContent, /Called by “Take payment”/);
+  assert.match(items[0].querySelector('[data-simulation-scope]').textContent, /Expression step.*Sub-process.*Running/s);
+  const group = items[1].querySelector('[data-simulation-group]');
+  assert.match(group.textContent, /Review each.*Multiple instances, in parallel.*Open/s);
+  assert.match(group.querySelector('[data-group-progress]').textContent, /1 of 3 occurrences done · now: occurrence 2/);
+  assert.equal(group.querySelectorAll('[data-simulation-occurrence]').length, 2);
+  const loop = simulationWindow(treeView({ instances: [inst()], calls: [], repetitionGroups: [{ groupId: 'g-1', nodeId: 'Checked', nodeName: 'Retry', scopeId: 'sc-1', mode: 'structured_loop', status: 'open', total: null, createdCount: 2, completed: 1, maxIterations: 5 }], repetitionOccurrences: [] }), MODEL);
+  await flush(2);
+  assert.match(loop.querySelector('[data-group-progress]').textContent, /1 done; the loop ends by its condition \(at most 5 rounds\)/);
+  // A plain run has no structure to show.
+  const plain = simulationWindow(baseView({ instance: { status: 'Waiting' }, instances: [inst()] }), MODEL);
+  await flush(2);
+  assert.ok(plain.querySelector('[data-simulation-structure]') === null);
+});
+
+test('with more than one instance each item names its process, with one the run looks as before', async () => {
+  const many = treeView({
+    serviceWaits: [wait({ jobId: 'job-a', nodeId: 'Plain', instanceId: 'inst-1' }), wait({ jobId: 'job-b', nodeId: 'Plain', instanceId: 'inst-2' })],
+    userTasks: [taskOf({ userTaskId: 'ut-c', scopeId: 'sc-2', kind: 'Work' })],
+    timers: [{ timerId: 't', nodeId: 'Expr', nodeName: 'Deadline', kind: 'Catch', status: 'Pending', dueAtMs: T0, timezone: 'UTC', occurrence: 0, scopeId: 'sc-2' }],
+    subscriptions: [sub({ scopeId: 'sc-1' })],
+    incidents: [{ incidentId: 'i', nodeId: 'Plain', nodeName: '', code: 'CALL_CHILD_ERROR', message: '', atMs: 1, canRetry: false, scopeId: 'sc-2' }] });
+  const win = simulationWindow(many, MODEL);
+  await flush(2);
+  const labels = (root) => [...root.querySelectorAll('[data-instance-label]')].map((chip) => chip.textContent);
+  assert.deepEqual(labels(win.querySelector('[data-simulation-wait="job-a"]')), ['Order v3']);
+  assert.deepEqual(labels(win.querySelector('[data-simulation-wait="job-b"]')), ['Payment v1'], 'two waits on one node are told apart by their process');
+  assert.deepEqual(labels(win.querySelector('[data-simulation-open-task]')), ['Payment v1']);
+  assert.deepEqual(labels(win.querySelector('.fb-simulation-timer')), ['Payment v1']);
+  assert.deepEqual(labels(win.querySelector('[data-simulation-subscription]')), ['Order v3']);
+  assert.match(win.querySelector('[data-simulation-incident]').getAttribute('message'), /\(Payment v1\).*The called process failed\./);
+  assert.match(win.querySelector('.fb-simulation-events li [data-event-instance]').textContent, /Payment v1/);
+  const single = simulationWindow(baseView({ instance: { status: 'Waiting' }, instances: [inst()], serviceWaits: [wait({ instanceId: 'inst-1' })], userTasks: [taskOf()] }), MODEL);
+  await flush(2);
+  assert.ok(single.querySelector('[data-instance-label]') === null);
+  assert.ok(single.querySelector('[data-event-instance]') === null);
+});
+
+test('each wait is resolved by its own job, also when two waits stand on the same node of different processes', async () => {
+  responder = () => ({ view: baseView({ instance: { status: 'Waiting' }, instances: [inst()] }) });
+  const win = simulationWindow(treeView({ serviceWaits: [wait({ jobId: 'job-a', nodeId: 'Plain', instanceId: 'inst-1' }), wait({ jobId: 'job-b', nodeId: 'Plain', instanceId: 'inst-2' })] }), MODEL);
+  await flush(2);
+  click(win.querySelector('[data-simulation-wait="job-b"] [data-simulation-resolve]'));
+  await flush(5);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].payload.jobId, 'job-b');
+  assert.equal(calls[0].payload.nodeId, 'Plain');
+});
+
+test('a task assigned to someone else is shown read-only with the reason instead of live buttons', async () => {
+  const win = simulationWindow(baseView({ instance: { status: 'Waiting' }, userTasks: [taskOf({ userTaskId: 'ut-mine' }), taskOf({ userTaskId: 'ut-theirs', name: 'Their task', kind: 'Work', canComplete: false })] }), MODEL);
+  await flush(2);
+  const theirs = win.querySelector('[data-simulation-open-task="ut-theirs"]');
+  assert.ok(theirs.querySelector('[data-simulation-task]') === null);
+  assert.ok(theirs.querySelector('tf-code-editor') === null);
+  assert.match(theirs.querySelector('[data-task-foreign]').textContent, /assigned to someone else/);
+  assert.ok(win.querySelector('[data-simulation-open-task="ut-mine"] [data-simulation-task]'));
+});
+
+test('every event kind a simulated run writes for scopes, calls and repetitions has a sentence in all five languages', async () => {
+  const kinds = ['scope_entered', 'scope_completed', 'scope_cancelled', 'scope_entry_failed', 'scope_error_propagated', 'scope_result_accepted', 'call_requested', 'call_entered',
+    'call_returned', 'call_cancelled', 'call_error_propagated', 'call_result_accepted', 'call_request_cancelled', 'repetition_group_started', 'repetition_occurrence_started',
+    'repetition_occurrence_completed', 'repetition_completed', 'repetition_condition_checked', 'repetition_entry_failed', 'repetition_group_blocked', 'instance_cancelled'];
+  for (const kind of kinds) assert.ok(SIMULATION_EVENT_KINDS.includes(kind), kind);
+  for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+    await I18n.setLanguage(language);
+    const win = simulationWindow(baseView({ instance: { status: 'Waiting' }, events: [...kinds, 'brand_new_kind'].map((kind) => event(kind)) }), MODEL);
+    await flush(2);
+    const lines = [...win.querySelectorAll('.fb-simulation-events li')].map((row) => row.textContent.replace(/\s+/g, ' ').trim().replace(/^\S+( [AP]M)? /, ''));
+    assert.equal(lines.at(-1), 'brand_new_kind');
+    assert.equal(new Set(lines.slice(0, -1)).size, kinds.length, `${language}: one sentence per kind`);
+    assert.ok(lines.slice(0, -1).every((line) => !/^[a-z]+_[a-z_]+$/.test(line) && !line.includes('bpmn.')), `${language}: ${lines.join(' | ')}`);
+    win.remove();
+  }
+});
+
+test('the limits, an unpinnable call and an unsupported call are told with their numbers and the run is refreshed', async () => {
+  const model = serviceModel([['Call_1', 'Take payment', serviceTask()]]);
+  const refusals = {
+    SIMULATION_SCOPE_LIMIT: 'the transition would open scope 33, and a simulation opens at most 32',
+    SIMULATION_REPETITION_LIMIT: 'the transition would reach 33 repetition groups and 4 occurrences, and a simulation holds at most 32 groups and 128 occurrences',
+    SIMULATION_CALL_LIMIT: 'the transition would start instance 9, and a simulation starts at most 8',
+    SIMULATION_CALL_PIN_UNAVAILABLE: 'a called process version cannot be pinned into the simulation',
+    SIMULATION_CALL_UNSUPPORTED: 'a call with activity IO is not simulated: its result continues through a deferred external step (Call_1)',
+  };
+  const body = 'SIMULATION_CALL_UNSUPPORTED: MessageCatch inside a called process is not simulated: a simulation delivers messages and signals to the one instance it started (Msg_in_child)';
+  const numbers = { SIMULATION_SCOPE_LIMIT: /32/, SIMULATION_REPETITION_LIMIT: /32.*128/, SIMULATION_CALL_LIMIT: /8/ };
+  for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+    await I18n.setLanguage(language);
+    const lines = Object.entries(refusals).map(([code, detail]) => simulationErrorText(`protocol error ProcessBody: ${code}: ${detail}`, model));
+    assert.equal(new Set(lines).size, 5, language);
+    Object.keys(numbers).forEach((code, index) => assert.match(lines[index], numbers[code], `${language} ${code}`));
+    assert.ok(lines.every((line) => !line.includes('SIMULATION_') && !line.includes('bpmn.')), `${language}: ${lines.join(' | ')}`);
+    assert.ok(lines[4].includes('Take payment'), language);
+    assert.notEqual(simulationErrorText(body, model), lines[4], 'a body refusal is another sentence than an activity IO one');
+    if (language === 'en') {
+      assert.match(lines[4], /data inputs or outputs/);
+      assert.match(simulationErrorText(body, model), /message, signal, receive or send step or an event gateway/);
+    }
+  }
+  await I18n.setLanguage('en');
+  // The run stays usable: the window asks the server for the run as it is after the refusal.
+  const fresh = baseView({ instance: { status: 'Waiting' }, clock: clockOf(5, 100, 9) });
+  responder = (kind) => {
+    if (kind === 'processSimulationAdvanceRequest') throw new Error('SIMULATION_CALL_LIMIT: the transition would start instance 9, and a simulation starts at most 8');
+    if (kind === 'processSimulationViewRequest') return { view: fresh };
+    throw new Error(`unexpected ${kind}`);
+  };
+  const win = simulationWindow(baseView({ instance: { status: 'Waiting' }, clock: clockOf(5, 100, 2) }), MODEL);
+  await flush(2);
+  click(win.querySelector('[data-simulation-advance]'));
+  await flush(5);
+  assert.match(win.querySelector('[data-error]').getAttribute('message'), /at most 8 processes in one call tree/);
+  assert.match(win.querySelector('.fb-simulation-toolbar').textContent, /step 9/);
+  assert.equal(win.querySelector('[data-simulation-advance]').hasAttribute('disabled'), false, 'the run is still usable');
+  assert.doesNotMatch(processExplainError('repetition is unsupported in simulation (X)', model), /bpmn\./);
+});
+
+test('steps inside a sub-process get prepared-result rows, a call with data is held back, and a call says its own steps wait for the operator', async () => {
+  const inner = { id: 'Inner', name: 'Inner step', kind: serviceTask() };
+  const model = serviceModel([
+    ['Sub_1', 'Check', { SubProcess: { body: { nodes: [inner], sequenceFlows: [], variables: {} }, inputMapping: {}, outputMapping: {} } }],
+    ['Call_1', 'Take payment', { CallActivity: { calledDefinitionId: 'd', calledVersion: 1, calledElement: { namespaceUri: '', processId: 'p' }, inputMapping: {}, outputMapping: {} } }],
+  ]);
+  assert.deepEqual(simulationServiceSteps(model).map((step) => step.nodeId), ['Inner']);
+  const form = await startWindow(model);
+  assert.deepEqual([...form.querySelectorAll('[data-fixture-step]')].map((row) => row.dataset.fixtureStep), ['Inner']);
+  assert.match(form.querySelector('[data-fixtures-calls]').textContent, /Steps inside the processes it calls wait for your answer/);
+  assert.equal(form.querySelector('[data-act="submit"]').hasAttribute('disabled'), false);
+  const callKind = model.nodes.find((node) => node.id === 'Call_1').kind;
+  const withIo = serviceModel([['Call_1', 'Take payment', callKind], ['Call_2', 'Charge', callKind, { activityIo: { dataOutputs: [{ id: 'o' }] } }]]);
+  assert.deepEqual(simulationUnsupportedSteps(withIo), [{ nodeId: 'Call_2', reason: 'call_io' }]);
+  const held = await startWindow(withIo);
+  assert.match(held.querySelector('[data-fixture-unsupported="Call_2"]').textContent, /This call has data inputs or outputs/);
+  assert.equal(held.querySelector('[data-act="submit"]').hasAttribute('disabled'), true);
 });

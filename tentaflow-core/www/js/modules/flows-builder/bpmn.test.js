@@ -28,7 +28,7 @@ const { processAgentIterationLimit, processAgentPreset, emptyProcessModel, proce
 const { FlowCanvas, UNATTACHED_TAG } = await import('./canvas.js');
 const { FlowConfig } = await import('./config.js');
 const { FlowPalette } = await import('./palette.js');
-const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processRowFor, processRoutingTextKeys, processEscalationPathProblem, processExplainError, processMissingSettings, processNodeWarnings, processServiceKind, processBlockTemplate, processStartEntryLabels, processTimezoneProblem, processPublishProblems, processNodeLabels, processTimezoneGaps, processTimezoneText, processTimezoneCanonical, processRepeatedElements, processBoundaryRefusals, processBoundaryHosts, processRepeatOutputGaps, processPlainError, processDiagnosticSeverity, processIsPristine, processImportGroups, processImportCounts, processImportLoadable, processImportNeedsReview, processImportTranslations, processAttentionTargets, processNextAttention, processImportFlagged } = await import('./bpmn.js');
+const { processTemplates, boundedNodeName, isBlankLabel, processResultRouting, processRowFor, processRoutingTextKeys, processEscalationPathProblem, processExplainError, processMissingSettings, processNodeWarnings, processServiceKind, processBlockTemplate, processStartEntryLabels, processTimezoneProblem, processPublishProblems, processNodeLabels, processTimezoneGaps, processTimezoneText, processTimezoneCanonical, processBoundaryRefusals, processBoundaryHosts, processRepeatOutputGaps, processPlainError, processDiagnosticSeverity, processIsPristine, processImportGroups, processImportCounts, processImportLoadable, processImportNeedsReview, processImportTranslations, processAttentionTargets, processNextAttention, processImportFlagged } = await import('./bpmn.js');
 const { openProcessCalendar, openProcessInstance, openProcessInstances, openProcessMessageDetail, openProcessMessageSend, openProcessRun, openProcessSchedule, processEventText, processLifecycleReasonText, processTimerText } = await import('./process-monitor.js');
 const { simulationWindow, openProcessSimulation } = await import('./process-simulation.js');
 const { default: builder } = await import('../flows-builder.js');
@@ -5511,14 +5511,9 @@ test('a zone stays in the editor when the process has no timer, and is left out 
   assert.equal(state.canvas.processModel.timerTimezone, 'Europe/Warsaw');
 });
 
-test('the server refusing a time zone name is told by field, and a simulation refusal by element name', () => {
+test('the server refusing a time zone name is told by field', () => {
   const model = { ...timedModel(), timerTimezone: 'Mars/Olympus' };
   assert.equal(processExplainError('protocol error BadRequest: unknown timezone', model), I18n.t('bpmn.timer_timezone_invalid', { zone: 'Mars/Olympus' }));
-  const repeated = emptyProcessModel();
-  repeated.nodes.push({ id: 'n_abc123_def', name: 'Review step', kind: { ServiceTask: {} }, repeat: { StructuredLoop: { outputCollectionVariable: 'out' } } });
-  assert.deepEqual(processRepeatedElements(repeated), ['Review step']);
-  assert.equal(processExplainError('protocol error BadRequest: repetition is unsupported in simulation (n_abc123_def)', repeated),
-    I18n.t('bpmn.simulation_repeat_unsupported', { names: 'Review step' }));
 });
 
 test('calendar-only process exposes timezone and structured editor rejects invalid closures', async () => {
@@ -7514,24 +7509,16 @@ test('the Run and Simulate windows name their start entries without ids', async 
   simulation.remove();
 });
 
-test('the Simulate window says up front that a repeated step cannot be simulated, names it and offers no start', async () => {
+test('a repeated step no longer holds the Simulate window back', async () => {
   const model = emptyProcessModel();
   model.nodes.push({ id: 'n_mvcvd0bg_3zhn', name: 'Review step', kind: { UserTask: { assigneeUserId: null, outputMapping: {} } },
     repeat: { StructuredLoop: { outputCollectionVariable: 'out' } } });
-  const published = definition('repeat-simulation', { publishedVersion: 3, model });
   const catalog = manualStartCatalog(model, 3);
-  const simulation = openProcessSimulation(published, { version: 3 }, catalog, catalog[0]);
+  const simulation = openProcessSimulation(definition('repeat-simulation', { publishedVersion: 3, model }), { version: 3 }, catalog, catalog[0]);
   await flush(2);
-  const note = simulation.querySelector('.tf-act__note').getAttribute('message');
-  assert.equal(note, I18n.t('bpmn.simulation_repeat_unsupported', { names: 'Review step' }));
-  assert.doesNotMatch(note, /n_mvcvd0bg_3zhn/);
-  assert.equal(simulation.querySelector('[data-act="submit"]').hasAttribute('disabled'), true);
+  assert.equal(simulation.querySelector('.tf-act__note').getAttribute('message'), I18n.t('bpmn.simulation_hint'));
+  assert.equal(simulation.querySelector('[data-act="submit"]').hasAttribute('disabled'), false);
   simulation.remove();
-  const plain = openProcessSimulation(definition('plain-simulation', { publishedVersion: 3, model: emptyProcessModel() }), { version: 3 }, catalog, catalog[0]);
-  await flush(2);
-  assert.equal(plain.querySelector('.tf-act__note').getAttribute('message'), I18n.t('bpmn.simulation_hint'));
-  assert.equal(plain.querySelector('[data-act="submit"]').hasAttribute('disabled'), false);
-  plain.remove();
 });
 
 test('every list of the inspector numbers elements that share a name, and a palette of two flows with one name does too', async () => {

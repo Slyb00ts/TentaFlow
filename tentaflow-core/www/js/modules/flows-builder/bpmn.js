@@ -550,20 +550,6 @@ export function processUnusedDeclarations(model) {
     .map((declaration) => ({ kind, name: String(declaration.name || declaration.errorCode || declaration.escalationCode || '').trim() })));
 }
 
-// The names of the elements that repeat, in every body and nested sub-process.
-export function processRepeatedElements(model) {
-  const names = processElementNames(model);
-  const repeated = [];
-  const visit = (body) => {
-    for (const node of body?.nodes || []) {
-      if (node.repeat) repeated.push(names.get(node.id));
-      if (node.kind?.SubProcess) visit(node.kind.SubProcess.body);
-    }
-  };
-  [model, ...(model?.additionalProcesses || [])].forEach(visit);
-  return repeated;
-}
-
 // The repeated elements that have no output collection variable. Saving a draft
 // accepts that; publishing does not.
 export function processRepeatOutputGaps(model) {
@@ -920,7 +906,8 @@ export function processVerificationSentence(result) {
 // has a sentence under `bpmn.simulation_error_<code>`.
 const SIMULATION_REFUSALS = ['real_execution_unsupported', 'side_effects_not_confirmed', 'fixture_invalid',
   'service_not_waiting', 'service_ambiguous', 'verdict_required', 'answer_invalid', 'outcome_not_producible',
-  'message_invalid', 'message_subscription_unknown', 'message_target_unsupported', 'event_delivery_unsupported'];
+  'message_invalid', 'message_subscription_unknown', 'message_target_unsupported', 'event_delivery_unsupported',
+  'scope_limit', 'repetition_limit', 'call_limit', 'call_pin_unavailable', 'call_unsupported'];
 
 /**
  * Server and codec messages cite elements by internal id; the author knows them
@@ -955,7 +942,8 @@ export function processExplainError(message, model, options = null) {
     // The refusal cites the step by id; the first id the model knows is the step it is about.
     const cited = refusal[2].split(/[^\w.-]+/).find((token) => names.has(token));
     // A message start and an event step with data are different causes with different remedies.
-    const cause = refusal[1] === 'EVENT_DELIVERY_UNSUPPORTED' ? (/MessageStart/.test(refusal[2]) ? '_message_start' : '_event_io') : '';
+    const cause = refusal[1] === 'EVENT_DELIVERY_UNSUPPORTED' ? (/MessageStart/.test(refusal[2]) ? '_message_start' : '_event_io')
+      : refusal[1] === 'CALL_UNSUPPORTED' ? (/activity IO/.test(refusal[2]) ? '_io' : '_body') : '';
     return I18n.t(`bpmn.simulation_error_${refusal[1].toLowerCase()}${cause}`,
       { node: cited ? names.get(cited) : I18n.t('bpmn.simulation_this_step') });
   }
@@ -976,8 +964,6 @@ export function processExplainError(message, model, options = null) {
   if (translated.some((line) => line !== null)) {
     return lines.map((line, index) => translated[index] ?? processReplaceIds(line, names, flows)).join('\n');
   }
-  const unsimulated = /repetition is unsupported in simulation \(([\w.-]+)\)/.exec(text);
-  if (unsimulated && names.has(unsimulated[1])) return I18n.t('bpmn.simulation_repeat_unsupported', { names: names.get(unsimulated[1]) });
   const serviceIo = /a Service task with activity IO is unsupported in simulation \(([\w.-]+)\)/.exec(text);
   if (serviceIo && names.has(serviceIo[1])) return I18n.t('bpmn.simulation_error_activity_io', { node: names.get(serviceIo[1]) });
   const agentStep = /agent steps need the report sink; not simulated yet \(([\w.-]+)\)/.exec(text);

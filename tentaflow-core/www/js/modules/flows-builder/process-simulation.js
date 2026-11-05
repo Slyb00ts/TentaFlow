@@ -5,7 +5,7 @@ import { escapeAttr, escapeHtml } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
 import { TfWindow } from '/js/components/tf-window.js';
-import { processDistinctLabels, processElementNames, processExplainError, processRepeatedElements, processStartEntryLabels } from './bpmn.js';
+import { processDistinctLabels, processElementNames, processExplainError, processStartEntryLabels } from './bpmn.js';
 import { processIncidentText } from './process-monitor.js';
 import '/js/components/tf-checkbox.js';
 import '/js/components/tf-input.js';
@@ -14,7 +14,7 @@ import {
   OUTPUTS_MAX_KIB, SIMULATION_EVENT_INCIDENT_CODES, SIMULATION_EVENT_KINDS, SIMULATION_MESSAGE_STATUSES,
   SIMULATION_STATUSES, SIMULATION_SUBSCRIPTION_KINDS, SIMULATION_TASK_KINDS, blankMessageDraft, blankServiceDraft,
   readMessageDraft, readOutputs, readServiceAnswer, readServiceFixtures, simulationFinished, simulationHorizonReached,
-  simulationMessageCandidates, simulationMessageWaits,
+  simulationCallsOtherProcesses, simulationInstanceLabel, simulationMessageCandidates, simulationMessageWaits, simulationScopeInstances, simulationStructure,
   simulationOpen, simulationServiceSteps, simulationTaskDecision, simulationUnsupportedSteps, simulationWaitSteps,
 } from './simulation-service.js';
 import '/js/components/tf-alert.js';
@@ -73,6 +73,15 @@ export function simulationReasonText(reason) {
   if (/expired/i.test(raw)) return text('simulation_reason_expired');
   return text('simulation_reason_other');
 }
+
+// Enum values come either as written in Rust or in snake_case; the key ignores both.
+const looseKey = (value) => String(value ?? '').replace(/_/g, '').toLowerCase();
+const knownLoose = (list, value, prefix) => (list.some((entry) => looseKey(entry) === looseKey(value)) ? text(`${prefix}_${looseKey(value)}`) : String(value ?? ''));
+const GROUP_MODES = ['multi_instance_sequential', 'multi_instance_parallel', 'structured_loop'];
+const GROUP_STATUSES = ['open', 'incident', 'completed', 'cancelled'];
+const OCCURRENCE_STATUSES = ['pending', 'active', 'awaiting_verification', 'retryable_error', 'accepted_blocked', 'completed', 'cancelled'];
+const CALL_STATUSES = ['Waiting', 'Returned', 'Error', 'Cancelled', 'ReturnIncident'];
+const OCCURRENCE_DONE = ['completed', 'cancelled'];
 
 const known = (list, value, prefix) => (list.includes(value) ? text(`${prefix}_${value.toLowerCase()}`) : String(value ?? ''));
 
@@ -158,7 +167,7 @@ export function simulationWindow(view, model = null, options = {}) {
       setError(error);
       hooks.onFail?.(error);
       // A refusal that says the run moved on is answered with the run as it is now, so the clock shown is its clock.
-      if (/SIMULATION_HORIZON_REACHED|revision conflict or closed instance|target instance is closed/.test(error?.message || '')) {
+      if (/SIMULATION_HORIZON_REACHED|SIMULATION_(?:SCOPE|REPETITION|CALL)_LIMIT|revision conflict or closed instance|target instance is closed/.test(error?.message || '')) {
         try { current = (await ApiBinary.one('processSimulationViewRequest', { simulationId: current.simulationId })).view; } catch (_) { /* the run may be gone */ }
       }
     } finally {
@@ -212,6 +221,16 @@ export function simulationWindow(view, model = null, options = {}) {
       return known(SIMULATION_EVENT_KINDS, event.kind, 'simulation_event');
     };
     const decision = (task) => simulationTaskDecision(events, task.userTaskId);
+    const instances = current.instances || [];
+    const multi = instances.length > 1;
+    const instanceById = new Map(instances.map((instance) => [instance.instanceId, instance]));
+    const scopeOwner = simulationScopeInstances(current);
+    const instanceText = (instanceId) => (multi ? simulationInstanceLabel(instanceById.get(instanceId)) : '');
+    const scopeInstanceText = (scopeId) => instanceText(scopeOwner.get(scopeId) ?? instances[0]?.instanceId);
+    // A run with one instance looks as it always did; with several, each item names the process it belongs to.
+    const chipFor = (label) => (label ? `<tf-chip status="info" data-instance-label>${escapeHtml(label)}</tf-chip>` : '');
+    const structure = simulationStructure(current);
+    const hasStructure = multi || structure.some((row) => row.scopes.length || row.groups.length);
     const subscriptions = current.subscriptions || [];
     const messages = current.messages || [];
     const messageWaits = simulationMessageWaits(subscriptions);
@@ -224,7 +243,7 @@ export function simulationWindow(view, model = null, options = {}) {
       return declared?.name || subscription.signalDeclarationId || subscription.signalNamespaceUri || '';
     };
     const subscriptionRow = (subscription) => `<li data-simulation-subscription="${escapeAttr(subscription.subscriptionId)}" data-subscription-kind="${escapeAttr(subscription.kind)}">
-        <strong>${escapeHtml(elementName(subscription.nodeId, subscription.nodeName))}</strong> · ${escapeHtml(known(SIMULATION_SUBSCRIPTION_KINDS, subscription.kind, 'simulation_subscription_kind'))}
+        <strong>${escapeHtml(elementName(subscription.nodeId, subscription.nodeName))}</strong> ${chipFor(scopeInstanceText(subscription.scopeId))} · ${escapeHtml(known(SIMULATION_SUBSCRIPTION_KINDS, subscription.kind, 'simulation_subscription_kind'))}
         ${subscription.messageName != null ? `<div>${escapeHtml(text('simulation_sub_message'))}: ${escapeHtml(subscription.messageName)} · ${escapeHtml(text('simulation_sub_key'))}: ${escapeHtml(subscription.correlationKey ?? '')}</div>` : ''}
         ${subscription.kind === 'SignalCatch' ? `<div>${escapeHtml(text('simulation_sub_signal'))}: ${escapeHtml(signalName(subscription))}</div>` : ''}
         ${subscription.kind === 'BoundaryMessage' && armEvent(subscription.subscriptionId)?.data?.attached_to_id ? `<div>${escapeHtml(text('simulation_timer_attached', { node: elementName(armEvent(subscription.subscriptionId).data.attached_to_id) }))}</div>` : ''}
@@ -280,14 +299,32 @@ export function simulationWindow(view, model = null, options = {}) {
       ${horizonReached && !finished ? `<tf-alert tone="warning" data-simulation-horizon message="${escapeAttr(text('simulation_horizon_note', { horizon: clockText(clock.horizonMs) }))}"></tf-alert>` : ''}
       ${incidents.length || status === 'Incident' ? `<section class="fb-simulation-section" data-simulation-incidents><h3>${escapeHtml(text('simulation_incidents'))}</h3>
         <p>${escapeHtml(text('simulation_incident_stopped'))}</p>
-        ${incidents.map((incident) => `<tf-alert tone="danger" data-simulation-incident message="${escapeAttr(`${elementName(incident.nodeId, incident.nodeName)}: ${simulationIncidentText(incident)} (${incident.code})`)}"></tf-alert>${incident.message ? `<tf-disclosure label="${escapeAttr(text('simulation_support_details'))}"><code>${escapeHtml(incident.message)}</code></tf-disclosure>` : ''}`).join('')}
+        ${incidents.map((incident) => `<tf-alert tone="danger" data-simulation-incident message="${escapeAttr(`${elementName(incident.nodeId, incident.nodeName)}${scopeInstanceText(incident.scopeId) ? ` (${scopeInstanceText(incident.scopeId)})` : ''}: ${simulationIncidentText(incident)} (${incident.code})`)}"></tf-alert>${incident.message ? `<tf-disclosure label="${escapeAttr(text('simulation_support_details'))}"><code>${escapeHtml(incident.message)}</code></tf-disclosure>` : ''}`).join('')}
+      </section>` : ''}
+      ${hasStructure ? `<section class="fb-simulation-section" data-simulation-structure><h3>${escapeHtml(text('simulation_structure'))}</h3>
+        <ul class="fb-simulation-awaited">${structure.map((row) => `<li data-simulation-instance="${escapeAttr(row.instance.instanceId)}" data-depth="${row.depth}" style="margin-inline-start: ${row.depth * 20}px">
+          <strong>${escapeHtml(row.instance.definitionName)}</strong> v${row.instance.version}
+          <tf-chip status="${row.instance.status === 'Completed' ? 'ok' : ['Incident', 'Error'].includes(row.instance.status) ? 'err' : 'info'}">${escapeHtml(known(SIMULATION_STATUSES, row.instance.status, 'simulation_status'))}</tf-chip>
+          ${row.call ? `<div data-simulation-call>${escapeHtml(text('simulation_called_by', { node: elementName(row.call.callNodeId, row.call.callNodeName) }))}${row.call.local ? ` · ${escapeHtml(text('simulation_call_local'))}` : ''}
+            <tf-chip status="${row.call.status === 'Returned' ? 'ok' : row.call.status === 'Waiting' ? 'info' : 'warn'}">${escapeHtml(known(CALL_STATUSES, row.call.status, 'simulation_call_status'))}</tf-chip></div>` : ''}
+          ${row.scopes.length ? `<ul>${row.scopes.map((scope) => `<li data-simulation-scope="${escapeAttr(scope.scopeId)}"><strong>${escapeHtml(elementName(scope.subprocessNodeId, scope.subprocessNodeName))}</strong> · ${escapeHtml(text('simulation_scope'))}
+            <tf-chip status="${scope.status === 'Completed' ? 'ok' : ['Incident', 'Error'].includes(scope.status) ? 'err' : 'info'}">${escapeHtml(known(SIMULATION_STATUSES, scope.status, 'simulation_status'))}</tf-chip></li>`).join('')}</ul>` : ''}
+          ${row.groups.length ? `<ul>${row.groups.map(({ group, occurrences: items }) => {
+            const open = items.find((occurrence) => !OCCURRENCE_DONE.includes(looseKey(occurrence.status)));
+            return `<li data-simulation-group="${escapeAttr(group.groupId)}"><strong>${escapeHtml(elementName(group.nodeId, group.nodeName))}</strong> · ${escapeHtml(knownLoose(GROUP_MODES, group.mode, 'simulation_group_mode'))}
+              <tf-chip status="${looseKey(group.status) === 'completed' ? 'ok' : looseKey(group.status) === 'incident' ? 'err' : 'info'}">${escapeHtml(knownLoose(GROUP_STATUSES, group.status, 'simulation_group_status'))}</tf-chip>
+              <div data-group-progress>${escapeHtml(text(group.total == null ? 'simulation_group_progress_open' : 'simulation_group_progress', { done: group.completed, total: group.total ?? '', max: group.maxIterations ?? '' }))}${open ? ` · ${escapeHtml(text('simulation_group_current', { ordinal: open.ordinal + 1 }))}` : ''}</div>
+              <ul>${items.map((occurrence) => `<li data-simulation-occurrence="${escapeAttr(occurrence.occurrenceId)}">${escapeHtml(text('simulation_occurrence', { ordinal: occurrence.ordinal + 1 }))}
+                <tf-chip status="${looseKey(occurrence.status) === 'completed' ? 'ok' : 'info'}">${escapeHtml(knownLoose(OCCURRENCE_STATUSES, occurrence.status, 'simulation_occurrence_status'))}</tf-chip></li>`).join('')}</ul></li>`;
+          }).join('')}</ul>` : ''}
+        </li>`).join('')}</ul>
       </section>` : ''}
       ${waits.length ? `<section class="fb-simulation-section" data-simulation-waits><h3>${escapeHtml(text('simulation_waits', { count: waits.length }))}</h3>
         ${waits.map(({ wait, step }) => {
           const prepared = wait.mode === 'Fixture';
           const fixture = prepared ? fixtures.get(wait.nodeId) : null;
           return `<article class="fb-simulation-wait" data-simulation-wait="${escapeAttr(wait.jobId)}" data-node-id="${escapeAttr(wait.nodeId)}">
-          <div><strong>${escapeHtml(elementName(wait.nodeId))}</strong>
+          <div><strong>${escapeHtml(elementName(wait.nodeId))}</strong> ${chipFor(instanceText(wait.instanceId))}
             <tf-chip status="info">${escapeHtml(text(prepared ? 'simulation_wait_fixture' : 'simulation_wait_result'))}</tf-chip></div>
           <section class="fb-process-json"><h4>${escapeHtml(text('simulation_wait_input'))}</h4>
             <tf-code-editor readonly data-simulation-wait-input language="json" aria-label="${escapeAttr(text('simulation_wait_input'))}"></tf-code-editor></section>
@@ -309,7 +346,9 @@ export function simulationWindow(view, model = null, options = {}) {
           const verification = task.kind === 'Verification';
           const id = escapeAttr(task.userTaskId);
           // A verification task has one question, and its answer is the decision.
-          const controls = manual
+          const controls = !task.canComplete
+            ? `<p data-task-foreign class="fb-field-hint">${escapeHtml(text('simulation_task_foreign'))}</p>`
+            : manual
             ? `<tf-button variant="secondary" size="sm" data-simulation-task="${id}" data-simulation-manual="true" ${busy ? 'disabled' : ''}>${escapeHtml(text('simulation_acknowledge_task'))}</tf-button>`
             : verification
               ? `<p>${escapeHtml(text('simulation_verification_hint'))}</p>
@@ -319,14 +358,14 @@ export function simulationWindow(view, model = null, options = {}) {
                 <p class="fb-field-hint">${escapeHtml(text('simulation_editor_escape_hint'))}</p>
                 <tf-alert data-task-error tone="danger" hidden></tf-alert>
                 <tf-button variant="primary" size="sm" data-simulation-task="${id}" data-simulation-manual="false" ${busy ? 'disabled' : ''}>${escapeHtml(text('simulation_complete_task'))}</tf-button>`;
-          return `<article class="fb-simulation-task" data-simulation-open-task="${id}"><div><strong>${escapeHtml(elementName(task.nodeId, task.name))}</strong> · ${escapeHtml(known(SIMULATION_TASK_KINDS, task.kind, 'simulation_task_kind'))}</div>
+          return `<article class="fb-simulation-task" data-simulation-open-task="${id}"><div><strong>${escapeHtml(elementName(task.nodeId, task.name))}</strong> ${chipFor(scopeInstanceText(task.scopeId))} · ${escapeHtml(known(SIMULATION_TASK_KINDS, task.kind, 'simulation_task_kind'))}</div>
             <div>${escapeHtml(task.instructions || '')}</div>
             ${controls}
           </article>`;
         }).join('') : `<p>${escapeHtml(text('simulation_empty_tasks'))}</p>`}
         ${doneTasks.length ? `<h3>${escapeHtml(text('simulation_tasks_done'))}</h3>${doneTasks.map((task) => {
           const decided = decision(task);
-          return `<article class="fb-simulation-task" data-simulation-done-task="${escapeAttr(task.userTaskId)}"><div><strong>${escapeHtml(elementName(task.nodeId, task.name))}</strong> · ${escapeHtml(known(SIMULATION_TASK_KINDS, task.kind, 'simulation_task_kind'))}
+          return `<article class="fb-simulation-task" data-simulation-done-task="${escapeAttr(task.userTaskId)}"><div><strong>${escapeHtml(elementName(task.nodeId, task.name))}</strong> ${chipFor(scopeInstanceText(task.scopeId))} · ${escapeHtml(known(SIMULATION_TASK_KINDS, task.kind, 'simulation_task_kind'))}
             <tf-chip status="${task.status === 'Completed' ? 'ok' : 'warn'}">${escapeHtml(text(task.status === 'Completed' ? 'simulation_task_completed' : 'simulation_task_cancelled'))}</tf-chip>
             ${decided ? `<tf-chip status="${decided === 'approved' ? 'ok' : 'err'}" data-simulation-decision="${decided}">${escapeHtml(text(decided === 'approved' ? 'simulation_decision_approved' : 'simulation_decision_rejected'))}</tf-chip>` : ''}</div></article>`;
         }).join('')}` : ''}
@@ -372,14 +411,14 @@ export function simulationWindow(view, model = null, options = {}) {
           const statusKey = ['pending', 'fired', 'blocked', 'cancelled', 'missed', 'error'].includes(timerStatus)
             ? `simulation_timer_${timerStatus}` : null;
           const due = timer.dueAtMs == null ? '—' : clockText(timer.dueAtMs);
-          return `<article class="fb-simulation-timer"><div><strong>${escapeHtml(elementName(timer.nodeId, timer.nodeName))}</strong> · ${escapeHtml(known(['Start', 'Catch', 'Boundary'], String(timer.kind || ''), 'simulation_timer_kind'))}${timer.attachedToId ? ` · ${escapeHtml(text('simulation_timer_attached', { node: elementName(timer.attachedToId) }))}` : ''}
+          return `<article class="fb-simulation-timer"><div><strong>${escapeHtml(elementName(timer.nodeId, timer.nodeName))}</strong> ${chipFor(scopeInstanceText(timer.scopeId))} · ${escapeHtml(known(['Start', 'Catch', 'Boundary'], String(timer.kind || ''), 'simulation_timer_kind'))}${timer.attachedToId ? ` · ${escapeHtml(text('simulation_timer_attached', { node: elementName(timer.attachedToId) }))}` : ''}
             <tf-chip status="info">${escapeHtml(statusKey ? text(statusKey) : String(timer.status || ''))}</tf-chip></div>
             <div>${escapeHtml(text('simulation_timer_due'))}: ${escapeHtml(due)} · ${escapeHtml(text('simulation_timer_occurrence'))}: ${escapeHtml(String(timer.occurrence ?? 0))}</div>
           </article>`;
         }).join('') : `<p>${escapeHtml(text('simulation_empty_timers'))}</p>`}
       </section>
       <section class="fb-simulation-section"><h3>${escapeHtml(text('simulation_events'))}</h3>
-        ${events.length ? `<ol class="fb-simulation-events">${shownEvents.map((event) => `<li><span>${escapeHtml(timeText(event.atMs))}</span> ${escapeHtml(eventLabel(event))}${event.nodeId ? ` · ${escapeHtml(elementName(event.nodeId))}` : ''}</li>`).join('')}</ol>` : `<p>${escapeHtml(text('simulation_empty_events'))}</p>`}
+        ${events.length ? `<ol class="fb-simulation-events">${shownEvents.map((event) => `<li><span>${escapeHtml(timeText(event.atMs))}</span> ${escapeHtml(eventLabel(event))}${event.nodeId ? ` · ${escapeHtml(elementName(event.nodeId))}` : ''}${multi && instanceText(event.instanceId) ? ` · <em data-event-instance>${escapeHtml(instanceText(event.instanceId))}</em>` : ''}</li>`).join('')}</ol>` : `<p>${escapeHtml(text('simulation_empty_events'))}</p>`}
         ${hiddenEvents > 0 ? `<p data-simulation-events-omitted>${escapeHtml(text('simulation_events_omitted', { count: hiddenEvents }))}</p>` : ''}
         ${current.traceStepsOmitted > 0 ? `<p data-simulation-trace-omitted>${escapeHtml(text('simulation_trace_steps_omitted', { count: current.traceStepsOmitted }))}</p>` : ''}
       </section>`;
@@ -601,7 +640,7 @@ function fixturesSection(model) {
   const labels = processDistinctLabels([...steps.map((step) => step.nodeId), ...unsupported.map((step) => step.nodeId)].map((id) => [id, names.get(id)]));
   const section = document.createElement('section');
   section.className = 'fb-simulation-fixtures';
-  section.innerHTML = `<h3>${escapeHtml(text(steps.length ? 'simulation_fixtures' : 'simulation_not_simulated_heading'))}</h3>${steps.length ? `<p>${escapeHtml(text('simulation_fixtures_hint'))}</p>` : ''}
+  section.innerHTML = `<h3>${escapeHtml(text(steps.length ? 'simulation_fixtures' : 'simulation_not_simulated_heading'))}</h3>${steps.length ? `<p>${escapeHtml(text('simulation_fixtures_hint'))}</p>` : ''}${simulationCallsOtherProcesses(model) ? `<p data-fixtures-calls>${escapeHtml(text('simulation_fixtures_calls_note'))}</p>` : ''}
     ${unsupported.map((step) => `<article class="fb-simulation-fixture" data-fixture-unsupported="${escapeAttr(step.nodeId)}">
       <div><strong>${escapeHtml(labels.get(step.nodeId))}</strong> <tf-chip status="warn">${escapeHtml(text('simulation_not_simulated'))}</tf-chip></div>
       <p>${escapeHtml(text(`simulation_unsupported_${step.reason}`))}</p></article>`).join('')}
@@ -644,16 +683,12 @@ export function openProcessSimulation(definition, version, startCatalog, selecte
   const selectedIndex = manualStarts.findIndex((entry) => entry.processId === selectedStart?.processId
     && entry.startNodeId === selectedStart?.startNodeId);
   selection.querySelector('[data-simulation-start]').value = selectedIndex < 0 ? '' : String(selectedIndex);
-  // The simulation clock cannot run a repetition, so the window says so before
-  // the author starts it instead of after the server refuses.
-  const repeated = [...new Set(processRepeatedElements(definition.model))];
   // The engine refuses these steps whatever else is chosen, so the start is held back and says which steps are why.
   const elementNames = processElementNames(definition.model);
   const blocking = [...new Set(simulationUnsupportedSteps(definition.model).map((step) => elementNames.get(step.nodeId)))];
   return openFormWindow({
     title: text('simulation'), icon: 'play', subject: definition.name,
-    note: repeated.length ? { tone: 'warning', text: text('simulation_repeat_unsupported', { names: repeated.join(', ') }) }
-      : blocking.length ? { tone: 'warning', text: text('simulation_blocked_by_steps', { names: blocking.join(', ') }) } : { text: text('simulation_hint') },
+    note: blocking.length ? { tone: 'warning', text: text('simulation_blocked_by_steps', { names: blocking.join(', ') }) } : { text: text('simulation_hint') },
     sections: [selection, variables, ...(fixtures ? [fixtures] : [])],
     width: 720,
     submitLabel: text('simulation_start'), busyLabel: text('simulation_starting'), anchor,
@@ -671,7 +706,7 @@ export function openProcessSimulation(definition, version, startCatalog, selecte
       selection.querySelector('[data-simulation-start]').setAttribute('error', text('start_entry_changed'));
       return false;
     },
-    canSubmit: () => selection.querySelector('[data-simulation-start]').value !== '' && !definition.archived && repeated.length === 0 && blocking.length === 0,
+    canSubmit: () => selection.querySelector('[data-simulation-start]').value !== '' && !definition.archived && blocking.length === 0,
     collect: () => {
       const entry = manualStarts[Number(selection.querySelector('[data-simulation-start]').value)];
       if (!entry) throw new Error(text('start_entry_changed'));

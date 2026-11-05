@@ -27,7 +27,11 @@ export const SIMULATION_EVENT_KINDS = ['instance_started', 'instance_completed',
   'receive_task_completed', 'send_task_admitted', 'send_task_pending', 'send_admission_failed', 'signal_admitted',
   'signal_catch_opened', 'signal_received', 'event_race_armed', 'event_race_won', 'event_race_lost',
   'event_race_cancelled', 'subscription_cancelled', 'timer_blocked', 'link_thrown', 'link_caught', 'message_armed',
-  'error_boundary_armed', 'cancelled', 'job_failed', 'job_denied', 'simulation_service_cancelled', 'simulation_user_task_cancelled'];
+  'error_boundary_armed', 'cancelled', 'job_failed', 'job_denied', 'simulation_service_cancelled', 'simulation_user_task_cancelled',
+  'scope_entered', 'scope_completed', 'scope_cancelled', 'scope_entry_failed', 'scope_error_propagated', 'scope_result_accepted',
+  'call_requested', 'call_entered', 'call_returned', 'call_cancelled', 'call_error_propagated', 'call_result_accepted',
+  'call_request_cancelled', 'repetition_group_started', 'repetition_occurrence_started', 'repetition_occurrence_completed',
+  'repetition_completed', 'repetition_condition_checked', 'repetition_entry_failed', 'repetition_group_blocked', 'instance_cancelled'];
 export const SIMULATION_MESSAGE_STATUSES = ['Pending', 'Blocked', 'Ambiguous', 'Delivered', 'Expired', 'Cancelled', 'Error'];
 export const SIMULATION_SUBSCRIPTION_KINDS = ['MessageCatch', 'BoundaryMessage', 'ReceiveTask', 'SignalCatch', 'BoundaryError', 'BoundaryEscalation'];
 const MESSAGE_WAIT_KINDS = ['MessageCatch', 'BoundaryMessage', 'ReceiveTask'];
@@ -35,7 +39,8 @@ const MESSAGE_KEY_MAX_BYTES = 256;
 export const MESSAGE_TTL_DEFAULT = 3600;
 const MESSAGE_TTL_MAX = 604800;
 // The incident codes a message or a signal can leave behind, each with a sentence of its own.
-export const SIMULATION_EVENT_INCIDENT_CODES = ['MESSAGE_MAPPING_ERROR', 'MESSAGE_PREDICATE_ERROR', 'SIGNAL_DELIVERY_FAILED',
+export const SIMULATION_EVENT_INCIDENT_CODES = ['CALL_ADMISSION_ERROR', 'CALL_CHILD_CANCELLED', 'CALL_CHILD_ERROR', 'CALL_RETURN_ERROR',
+  'SCOPE_RETURN_ERROR', 'MESSAGE_MAPPING_ERROR', 'MESSAGE_PREDICATE_ERROR', 'SIGNAL_DELIVERY_FAILED',
   'SIGNAL_MAPPING_FAILED', 'SIGNAL_PAYLOAD_FAILED', 'SIGNAL_PAYLOAD_LIMIT', 'SIGNAL_PENDING_LIMIT', 'SIGNAL_RECIPIENT_LIMIT'];
 export const SIMULATION_STATUSES = ['Running', 'Waiting', 'Completed', 'Incident', 'Cancelled', 'Error'];
 export const SIMULATION_TASK_KINDS = ['Work', 'Verification', 'Manual'];
@@ -46,8 +51,22 @@ export const SERVICE_VERDICTS = ['Approved', 'Rejected', 'Unavailable'];
 // The Service steps the simulation can run: the engine refuses a step bound to
 // an agent or without an implementation, and one with activity IO, when the
 // run is created, so none of them is offered a fixture here.
+// The nodes of the simulated process: its own and those inside its sub-processes, which run in
+// scopes of the same instance. Processes it calls are other documents' nodes.
+function ownNodes(model) {
+  const found = [];
+  const visit = (body) => {
+    for (const node of body?.nodes || []) {
+      found.push(node);
+      if (node.kind?.SubProcess) visit(node.kind.SubProcess.body);
+    }
+  };
+  visit(model);
+  return found;
+}
+
 export function simulationServiceSteps(model) {
-  return (model?.nodes || []).filter((node) => node.kind?.ServiceTask).map((node) => {
+  return ownNodes(model).filter((node) => node.kind?.ServiceTask).map((node) => {
     const task = node.kind.ServiceTask;
     const implementation = task.implementation;
     return {
@@ -57,6 +76,12 @@ export function simulationServiceSteps(model) {
       supported: !implementation?.Agent && !implementation?.Unbound && node.activityIo == null,
     };
   }).filter((step) => step.supported);
+}
+
+// Prepared results are keyed by the nodes of the simulated process; a process it calls has steps of
+// its own, which wait for the operator.
+export function simulationCallsOtherProcesses(model) {
+  return ownNodes(model).some((node) => node.kind?.CallActivity);
 }
 
 // Without a result expression the engine accepts only a result that completes
@@ -172,13 +197,14 @@ export function simulationOpen(view) {
 // window can say why they get no result source.
 export function simulationUnsupportedSteps(model) {
   const eventWithIo = ['MessageCatch', 'MessageThrow', 'ReceiveTask', 'SendTask', 'SignalThrow', 'SignalCatch'];
-  return (model?.nodes || []).flatMap((node) => {
+  return ownNodes(model).flatMap((node) => {
     const kind = typeof node.kind === 'object' ? Object.keys(node.kind)[0] : node.kind;
     if (kind === 'ServiceTask') {
       const implementation = node.kind.ServiceTask.implementation;
       const reason = implementation?.Agent ? 'agent' : implementation?.Unbound ? 'unbound' : node.activityIo != null ? 'io' : null;
       return reason ? [{ nodeId: node.id, reason }] : [];
     }
+    if (kind === 'CallActivity' && node.activityIo != null) return [{ nodeId: node.id, reason: 'call_io' }];
     if (kind === 'MessageStart') return [{ nodeId: node.id, reason: 'message_start' }];
     if (eventWithIo.includes(kind) && node.activityIo != null) return [{ nodeId: node.id, reason: 'event_io' }];
     return [];
@@ -244,4 +270,39 @@ export function simulationMessageCandidates(subscriptions, message) {
 // The clock stands on the end of the simulation: there is nothing to advance to.
 export function simulationHorizonReached(clock) {
   return clock != null && clock.nowMs >= clock.horizonMs;
+}
+
+// The instance every scope belongs to, as the events say it (the view's scopes do not name one).
+export function simulationScopeInstances(view) {
+  const owner = new Map();
+  for (const event of view?.events || []) if (event.scopeId && event.instanceId) owner.set(event.scopeId, event.instanceId);
+  return owner;
+}
+
+/**
+ * The call tree of a run for display: each instance (parents before children, as the view lists them)
+ * with the call that started it, the sub-process scopes it opened and the repetition groups it holds.
+ * A scope or group whose instance the events do not tell belongs to the simulated instance.
+ */
+export function simulationStructure(view) {
+  const instances = view?.instances || [];
+  if (!instances.length) return [];
+  const root = instances[0].instanceId;
+  const owner = simulationScopeInstances(view);
+  const instanceOf = (scopeId) => owner.get(scopeId) ?? root;
+  return instances.map((instance) => ({
+    instance,
+    depth: instance.depth ?? 0,
+    call: (view.calls || []).find((call) => call.childInstanceId === instance.instanceId) ?? null,
+    scopes: (view.scopes || []).filter((scope) => scope.subprocessNodeId != null && instanceOf(scope.scopeId) === instance.instanceId),
+    groups: (view.repetitionGroups || []).filter((group) => instanceOf(group.scopeId) === instance.instanceId).map((group) => ({
+      group,
+      occurrences: (view.repetitionOccurrences || []).filter((occurrence) => occurrence.groupId === group.groupId),
+    })),
+  }));
+}
+
+// A run with more than one instance names the instance on what belongs to one.
+export function simulationInstanceLabel(instance) {
+  return instance ? `${instance.definitionName} v${instance.version}` : '';
 }

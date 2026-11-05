@@ -1234,6 +1234,44 @@ test('a simulation view decodes the open waits and the messages of the run', { s
   assert.equal(message.correlationKey, 'PO-7');
 });
 
+test('a simulation view decodes the call tree, the scopes and the repetition groups of the run', { skip }, () => {
+  const view = {
+    simulation_id: 'simulation-1',
+    source: { simulation_id: 'simulation-1', definition_id: 'definition-1', version: 3,
+      model_sha256: 'a'.repeat(64), selected_process_id: 'Process_1', start_node_id: 'Start_1' },
+    clock: { start_ms: 10, now_ms: 20, horizon_ms: 90, tick_duration_ms: 10, step_index: 1, revision: 2 },
+    instance: null, user_tasks: [], timers: [], incidents: [], trace_steps: [], activity_io_witnesses: [],
+    events: [{ event_id: 'e-1', seq: 1, at_ms: 10, kind: 'call_entered', node_id: 'Call_1', actor_user_id: null, data: null, scope_id: 'scope-1', instance_id: 'inst-2' }],
+    service_waits: [{ job_id: 'job-1', instance_id: 'inst-2', node_id: 'Service_1', scope_id: 'scope-1', token_id: 'token-1', input: null, mode: 'Result', verdict_applicable: false }],
+    instances: [
+      { instance_id: 'inst-1', definition_id: 'def-1', definition_name: 'Order', version: 3, process_id: 'Process_1', status: 'Waiting', parent_instance_id: null, depth: 0 },
+      { instance_id: 'inst-2', definition_id: 'def-2', definition_name: 'Payment', version: 1, process_id: 'Process_2', status: 'Running', parent_instance_id: 'inst-1', depth: 1 }],
+    calls: [{ call_id: 'call-1', parent_instance_id: 'inst-1', parent_scope_id: 'scope-0', call_node_id: 'Call_1', call_node_name: 'Take payment',
+      child_instance_id: 'inst-2', called_definition_id: 'def-2', called_definition_name: 'Payment', called_version: 1, called_process_id: 'Process_2', local: false, status: 'Waiting' }],
+    scopes: [{ scope_id: 'scope-1', parent_scope_id: 'scope-0', subprocess_node_id: 'Sub_1', subprocess_node_name: 'Check', parent_token_id: 'token-1', revision: 1, status: 'Running', depth: 1, created_at_ms: 10, updated_at_ms: 10 }],
+    repetition_groups: [{ group_id: 'g-1', node_id: 'Loop_1', node_name: 'Review', scope_id: 'scope-1', parent_token_id: 'token-1', mode: 'multi_instance_parallel',
+      status: 'open', total: 3, created_count: 3, completed: 1, max_iterations: null, revision: 1, created_at_ms: 10, updated_at_ms: 10 }],
+    repetition_occurrences: [{ occurrence_id: 'o-1', group_id: 'g-1', ordinal: 0, status: 'completed', token_id: 'token-2', user_task_id: null, job_id: null,
+      verification_user_task_id: null, accepted_source_event_id: null, approval_event_id: null, created_at_ms: 10, updated_at_ms: 10 }],
+  };
+  const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: { SimulationViewResponse: { view } } })));
+  const body = decoded.view;
+  assert.equal(body.instances.length, 2);
+  assert.equal(body.instances[1].definitionName, 'Payment');
+  assert.equal(body.instances[1].parentInstanceId, 'inst-1');
+  assert.equal(body.instances[1].depth, 1);
+  assert.equal(body.calls[0].callNodeName, 'Take payment');
+  assert.equal(body.calls[0].childInstanceId, 'inst-2');
+  assert.equal(body.calls[0].local, false);
+  assert.equal(body.calls[0].status, 'Waiting');
+  assert.equal(body.scopes[0].subprocessNodeId, 'Sub_1');
+  assert.equal(body.repetitionGroups[0].mode, 'multi_instance_parallel');
+  assert.equal(body.repetitionGroups[0].completed, 1);
+  assert.equal(body.repetitionOccurrences[0].groupId, 'g-1');
+  assert.equal(body.events[0].instanceId, 'inst-2');
+  assert.equal(body.serviceWaits[0].instanceId, 'inst-2');
+});
+
 test('process options decode the block and tool catalogues and tolerate a server that omits them', { skip }, () => {
   const decode = (response) => wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: { OptionsResponse: response } })));
   const full = decode({
