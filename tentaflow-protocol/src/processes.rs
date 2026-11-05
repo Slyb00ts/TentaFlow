@@ -2010,6 +2010,9 @@ pub struct ProcessSimulationEvent {
     /// processes has one per call. Empty in a frame from before calls were simulated.
     #[serde(default)]
     pub instance_id: String,
+    /// The node's name in the model of the instance the event belongs to.
+    #[serde(default)]
+    pub node_name: Option<String>,
 }
 
 /// One process instance of a simulated run: the simulated one and every one it called.
@@ -2112,6 +2115,9 @@ pub struct ProcessSimulationServiceWait {
     #[serde(default)]
     pub instance_id: String,
     pub node_id: String,
+    /// The step's name in the model of the instance that owns it.
+    #[serde(default)]
+    pub node_name: Option<String>,
     pub scope_id: String,
     pub token_id: String,
     /// The input the step would have been given.
@@ -2120,6 +2126,10 @@ pub struct ProcessSimulationServiceWait {
     /// The step has a Test or Critic verification: a result that completes needs
     /// a verdict from the operator.
     pub verdict_applicable: bool,
+    /// The step decides its own outcome by a result expression, so the engine alone
+    /// knows whether a verdict is needed.
+    #[serde(default)]
+    pub has_result_expression: bool,
 }
 
 /// A message or signal wait of a simulated run that the operator can answer

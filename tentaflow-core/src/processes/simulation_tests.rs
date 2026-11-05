@@ -453,6 +453,7 @@ pub(super) fn source_input_for(model: tentaflow_protocol::processes::ProcessMode
         owner_user_id: "user-simulation".into(),
         actor_user_id: "user-simulation".into(),
         definition_id: "definition-simulation".into(),
+        definition_name: "Simulation definition".into(),
         version: 1,
         model_json,
         model_sha256,

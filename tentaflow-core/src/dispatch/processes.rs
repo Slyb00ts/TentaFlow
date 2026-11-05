@@ -142,6 +142,7 @@ fn simulation_view(view: simulation::SimulationView) -> Result<ProcessSimulation
                 data: event.data,
                 scope_id: event.scope_id,
                 instance_id: event.instance_id,
+                node_name: event.node_name,
             })
             .collect(),
         trace_steps: view

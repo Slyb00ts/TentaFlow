@@ -319,6 +319,7 @@ fn simulation_payloads_round_trip_by_variant_name_through_json_and_cbor() {
             node_id: None, actor_user_id: Some("user-1".into()), data: json!({}),
             scope_id: "scope-1".into(),
             instance_id: "instance-1".into(),
+            node_name: Some("Start".into()),
         }],
         trace_steps: vec![ProcessSimulationTraceStep {
             trace_step_id: "trace-1".into(), ordinal: 0, action: "start".into(), at_ms: 1_000,
@@ -471,10 +472,36 @@ fn a_simulation_service_wait_names_its_instance_and_still_decodes_without_it() {
     let older: ProcessSimulationServiceWait =
         serde_json::from_value(wait.clone()).expect("a frame from before calls were simulated");
     assert_eq!(older.instance_id, "");
+    assert_eq!(older.node_name, None);
+    assert!(!older.has_result_expression);
     let mut current = wait;
+    current["has_result_expression"] = json!(true);
     current["instance_id"] = json!("instance-2");
+    current["node_name"] = json!("Child step");
     let decoded: ProcessSimulationServiceWait =
         serde_json::from_value(current.clone()).expect("a frame that names its instance");
     assert_eq!(decoded.instance_id, "instance-2");
+    assert_eq!(decoded.node_name.as_deref(), Some("Child step"));
+    assert!(decoded.has_result_expression);
+    assert_eq!(serde_json::to_value(&decoded).expect("encode"), current);
+}
+
+#[test]
+fn a_simulation_event_names_its_node_and_still_decodes_without_it() {
+    use tentaflow_protocol::processes::ProcessSimulationEvent;
+
+    let event = json!({
+        "event_id": "event-1", "seq": 1, "at_ms": 0, "kind": "activity_completed",
+        "node_id": "Service", "actor_user_id": null, "data": {}, "scope_id": "scope-1"
+    });
+    let older: ProcessSimulationEvent =
+        serde_json::from_value(event.clone()).expect("a frame from before node names");
+    assert_eq!(older.node_name, None);
+    let mut current = event;
+    current["instance_id"] = json!("instance-2");
+    current["node_name"] = json!("Child step");
+    let decoded: ProcessSimulationEvent =
+        serde_json::from_value(current.clone()).expect("a frame that names the node");
+    assert_eq!(decoded.node_name.as_deref(), Some("Child step"));
     assert_eq!(serde_json::to_value(&decoded).expect("encode"), current);
 }

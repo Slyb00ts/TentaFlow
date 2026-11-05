@@ -1397,6 +1397,43 @@ fn a_repetition_inside_a_called_process_runs_in_the_child() {
 }
 
 #[test]
+fn the_simulated_and_the_called_process_carry_the_names_of_their_definitions() {
+    let fixture = Fixture::new();
+    let callee = publish_model(&fixture, &user_model(Some(&fixture.owner.user_id)));
+    let caller = publish_model(&fixture, &caller_of(&callee));
+    let mut store = started_from(&fixture, &caller).expect("start the run");
+    let view = advance_until(&mut store, "the child to start", |view| view.instances.len() == 2);
+    assert!(
+        view.instances.iter().all(|instance| instance.definition_name == "Evidence process"),
+        "{:?}",
+        view.instances
+    );
+}
+
+#[test]
+fn a_called_step_with_a_result_expression_says_so_on_its_own_wait() {
+    use super::runtime::test_support::{flow, graph, service_model};
+    use tentaflow_protocol::processes::ActivityVerification;
+
+    let fixture = Fixture::new();
+    let flow_id = flow(&fixture.db, &fixture.owner, &graph("marker", None));
+    let mut callee_model = service_model(&flow_id, ActivityVerification::Human);
+    if let ProcessNodeKind::ServiceTask { result_expression, .. } = &mut callee_model.nodes[1].kind {
+        *result_expression = Some("outputs.result".into());
+    }
+    let callee = publish_model(&fixture, &callee_model);
+    let caller = publish_model(&fixture, &caller_of(&callee));
+    let mut store = started_from(&fixture, &caller).expect("start the run");
+    let view = advance_until(&mut store, "the Service wait", |view| {
+        !view.service_waits.is_empty()
+    });
+    assert!(
+        view.service_waits[0].has_result_expression,
+        "the caller has no step with a result expression, so only the wait can say it"
+    );
+}
+
+#[test]
 fn the_same_service_node_waiting_in_two_instances_is_told_apart_by_job() {
     use super::runtime::test_support::{flow, graph, service_model};
     use super::simulation::SERVICE_AMBIGUOUS;
@@ -1407,10 +1444,13 @@ fn the_same_service_node_waiting_in_two_instances_is_told_apart_by_job() {
     let verification = || ActivityVerification::Condition {
         expression: "true".into(),
     };
-    let callee = publish_model(&fixture, &service_model(&flow_id, verification()));
+    let mut callee_model = service_model(&flow_id, verification());
+    callee_model.nodes[1].name = "Child service".into();
+    let callee = publish_model(&fixture, &callee_model);
     // The caller runs the same node id ("Service") beside its call.
     let mut model = service_model(&flow_id, verification());
-    let service = model.nodes[1].clone();
+    let mut service = model.nodes[1].clone();
+    service.name = "Parent service".into();
     model.nodes = vec![
         model.nodes[0].clone(),
         node("Split", ProcessNodeKind::ParallelGateway),
@@ -1457,8 +1497,26 @@ fn the_same_service_node_waiting_in_two_instances_is_told_apart_by_job() {
         .expect_err("two jobs wait on that node id");
     assert_eq!(refusal_code(&error), SERVICE_AMBIGUOUS, "{error:#}");
     let child = view.instances[1].instance_id.clone();
+    for wait in &view.service_waits {
+        let expected = if wait.instance_id == child { "Child service" } else { "Parent service" };
+        assert_eq!(
+            wait.node_name.as_deref(),
+            Some(expected),
+            "a wait is named from the model of the instance that owns it"
+        );
+    }
+    let child_event_names = view
+        .events
+        .iter()
+        .filter(|event| event.instance_id == child && event.node_id.as_deref() == Some("Service"))
+        .map(|event| event.node_name.clone())
+        .collect::<Vec<_>>();
+    assert!(!child_event_names.is_empty());
+    assert!(
+        child_event_names.iter().all(|name| name.as_deref() == Some("Child service")),
+        "{child_event_names:?}"
+    );
     for wait in [&view.service_waits[0], &view.service_waits[1]] {
-        let _ = &child;
         store
             .resolve_service(
                 test_authorization(&store),

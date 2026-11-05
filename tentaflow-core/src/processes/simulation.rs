@@ -118,6 +118,7 @@ pub(crate) struct SimulationSourceInput {
     pub owner_user_id: String,
     pub actor_user_id: String,
     pub definition_id: String,
+    pub definition_name: String,
     pub version: u32,
     pub model_json: String,
     pub model_sha256: String,
@@ -257,6 +258,7 @@ pub(crate) fn capture_authenticated_source(
     actor: &ProcessActor,
     owner_user_id: &str,
     definition_id: &str,
+    definition_name: &str,
     version: u32,
     model: &ProcessModel,
     model_sha256: &str,
@@ -303,6 +305,7 @@ pub(crate) fn capture_authenticated_source(
         owner_user_id: owner_user_id.to_owned(),
         actor_user_id: actor.user_id.clone(),
         definition_id: definition_id.to_owned(),
+        definition_name: definition_name.to_owned(),
         version,
         model_json,
         model_sha256: model_sha256.to_owned(),
@@ -1465,6 +1468,7 @@ pub struct SimulationEventView {
     pub data: Value,
     pub scope_id: String,
     pub instance_id: String,
+    pub node_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1617,6 +1621,7 @@ impl SimulationStore {
             owner_user_id: source.owner_user_id.clone(),
             actor_user_id: source.actor_user_id.clone(),
             definition_id: source.definition_id.clone(),
+            definition_name: String::new(),
             version: source.version,
             model_json: source.model_json.clone(),
             model_sha256: source.model_sha256.clone(),
@@ -2498,6 +2503,7 @@ impl SimulationStore {
                     job_id: job.job_id.clone(),
                     instance_id: job.instance_id.clone(),
                     node_id: job.node_id.clone(),
+                    node_name: Some(node.name.clone()),
                     scope_id: job.scope_id.clone(),
                     token_id: job.token_id.clone(),
                     input: job.input.clone(),
@@ -2510,6 +2516,10 @@ impl SimulationStore {
                         ProcessSimulationServiceMode::Result
                     },
                     verdict_applicable: verification_is_machine,
+                    has_result_expression: matches!(
+                        &node.kind,
+                        ProcessNodeKind::ServiceTask { result_expression: Some(_), .. }
+                    ),
                 })
             })
             .collect()
@@ -2673,7 +2683,13 @@ impl SimulationStore {
         let (trace_steps, trace_steps_omitted) = self.load_trace_steps(
             MAX_VIEW_TRACE_BYTES.min(history_bytes.saturating_sub(used)),
         )?;
-        view.events = events;
+        view.events = events
+            .into_iter()
+            .map(|mut event| {
+                event.node_name = event_node_name(&tree, &event);
+                event
+            })
+            .collect();
         view.events_omitted = events_omitted;
         view.trace_steps = trace_steps;
         view.trace_steps_omitted = trace_steps_omitted;
@@ -3312,6 +3328,7 @@ impl SimulationStore {
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?,
                 scope_id: row.get(7)?,
                 instance_id: row.get(8)?,
+                node_name: None,
             });
         }
         events.reverse();
@@ -4308,6 +4325,25 @@ fn check_tree_capacity(tx: &Transaction<'_>, instance_ids: &[String]) -> Result<
         ));
     }
     Ok(())
+}
+
+/// The name of the node an event refers to, taken from the model of the instance
+/// that wrote it: a called process can reuse a node id of its caller.
+fn event_node_name(tree: &[RuntimeSnapshot], event: &SimulationEventView) -> Option<String> {
+    let node_id = event.node_id.as_deref()?;
+    let snapshot = tree
+        .iter()
+        .find(|snapshot| snapshot.instance.instance_id == event.instance_id)?;
+    repository::scope_node(
+        &snapshot.model,
+        &snapshot.instance.process_id,
+        &snapshot.scopes,
+        &event.instance_id,
+        &event.scope_id,
+        node_id,
+    )
+    .ok()
+    .map(|node| node.name.clone())
 }
 
 /// The instances of the run with their place in the call tree.
