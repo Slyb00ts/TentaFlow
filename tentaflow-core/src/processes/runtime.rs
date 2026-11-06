@@ -9671,7 +9671,7 @@ mod tests {
         let mut events = Vec::new();
         let mut after = 0;
         loop {
-            let (page, next, more) = repository::list_events(pool, actor, instance_id,
+            let (page, next, more, _) = repository::list_events(pool, actor, instance_id,
                 after, 200).unwrap();
             assert!(!more || !page.is_empty());
             events.extend(page);

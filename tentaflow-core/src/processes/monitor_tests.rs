@@ -3,7 +3,7 @@
 use serde_json::json;
 use tentaflow_protocol::processes::{
     ActivityVerification, ProcessInstanceAccess, ProcessInstanceListScope, ProcessInstanceStatus,
-    ProcessTokenStatus, ProcessTokenWait,
+    ProcessNode, ProcessNodeKind, ProcessTokenStatus, ProcessTokenWait,
 };
 
 use super::repository::{self, InstanceFilter, ProcessActor, ProcessAuthorityDenied, ProcessOperationDenied};
@@ -86,13 +86,13 @@ fn a_monitor_reads_names_and_types_never_values_and_cannot_operate() {
     assert!(!seen.can_cancel && !seen.can_retry);
     assert!(!serde_json::to_string(&seen).unwrap().contains("hunter2"));
 
-    let (_, variables, _) = repository::get_scope(
+    let (_, variables, _, scope_access) = repository::get_scope(
         &fixture.db, &monitor, &started.instance_id, &started.instance_id).unwrap();
+    assert_eq!(scope_access, ProcessInstanceAccess::Monitor);
     assert_eq!(variables, json!({"customer_note": "string", "amount": "number"}));
-    let events = repository::list_events(&fixture.db, &monitor, &started.instance_id, 0, 50).unwrap().0;
+    let (events, _, _, access) = repository::list_events(&fixture.db, &monitor, &started.instance_id, 0, 50).unwrap();
+    assert_eq!(access, ProcessInstanceAccess::Monitor);
     assert!(!events.is_empty() && events.iter().all(|event| event.data.is_null()));
-    assert_eq!(repository::instance_access(&fixture.db, &monitor, &started.instance_id).unwrap(),
-        ProcessInstanceAccess::Monitor);
 
     let retry = repository::retry_job(&fixture.db, &monitor, &stamp("monitor retry"),
         &started.instance_id, "any-job", seen.revision).unwrap_err();
@@ -120,8 +120,8 @@ fn processes_monitor_is_read_from_the_stored_role_not_assumed() {
         "UPDATE roles SET permissions_json=json_insert(permissions_json,'$[#]','processes.monitor') WHERE role_id='role-org-viewer'",
         [],
     ).unwrap();
-    assert_eq!(repository::instance_access(&fixture.db, &viewer, &started.instance_id).unwrap(),
-        ProcessInstanceAccess::Monitor);
+    assert_eq!(repository::get_instance(&fixture.db, &viewer, &started.instance_id, None).unwrap().access,
+        Some(ProcessInstanceAccess::Monitor));
 }
 
 #[test]
@@ -189,15 +189,27 @@ async fn can_retry_is_one_projection_for_the_detail_the_incident_and_the_list() 
         (instance.can_retry, instance.incidents[0].can_retry)
     };
 
-    // The initiator keeps the right to ask for a retry even when the definition moved on.
-    assert_eq!(detail(&fixture.owner), (true, true));
-    assert_eq!(detail(&steward), (true, true));
+    // The work runs in the initiator's name and a worker claims it only for the
+    // owner of the definition, so once the definition moved on nobody can retry.
+    assert_eq!(detail(&fixture.owner), (false, false));
+    assert_eq!(detail(&steward), (false, false));
     assert_eq!(detail(&monitor), (false, false));
-    assert!(list_flag(&fixture.owner, ProcessInstanceListScope::Mine));
-    assert!(list_flag(&steward, ProcessInstanceListScope::Owned));
+    assert!(!list_flag(&fixture.owner, ProcessInstanceListScope::Mine));
+    assert!(!list_flag(&steward, ProcessInstanceListScope::Owned));
     assert!(!list_flag(&monitor, ProcessInstanceListScope::Monitor));
     let participant = repository::get_instance(&fixture.db, &fixture.participant, &started.instance_id, None);
     assert!(participant.is_err(), "a reader without a task of this instance has no view");
+
+    // The projection and the command agree: the refusal is typed, not a not-found.
+    let revision = repository::get_instance(&fixture.db, &steward, &started.instance_id, None).unwrap().revision;
+    for asker in [&steward, &fixture.owner] {
+        let refused = repository::retry_job(&fixture.db, asker, &stamp("retry after the move"),
+            &started.instance_id, &claim.job.job_id, revision).unwrap_err();
+        assert!(refused.downcast_ref::<ProcessOperationDenied>().is_some()
+            || refused.downcast_ref::<ProcessAuthorityDenied>().is_some(), "{refused}");
+    }
+    let unchanged = repository::get_instance(&fixture.db, &steward, &started.instance_id, None).unwrap();
+    assert_eq!((unchanged.revision, unchanged.status), (revision, ProcessInstanceStatus::Incident));
 }
 
 #[test]
@@ -300,4 +312,389 @@ fn a_long_history_is_cut_and_reported_never_silently() {
     assert_eq!(view.taken_edge_ids.len(), 2000);
     assert_eq!(view.visited_node_ids.len(), 2000);
     assert_eq!(view.tokens.len(), 1, "the live token is never cut by the history limit");
+}
+
+#[tokio::test]
+async fn a_retry_in_the_name_of_an_initiator_who_lost_the_definition_is_refused_and_never_offered() {
+    let fixture = Fixture::new();
+    let flow_id = flow(&fixture.db, &fixture.owner, &graph("steward retry", None));
+    let model = service_model(&flow_id, ActivityVerification::Condition { expression: "true".into() });
+    let started = start_model(&fixture, &model);
+    let claim = repository::claim_job(&fixture.db, "steward-worker", super::jobs::now_ms()).unwrap().unwrap();
+    assert!(repository::fail_job(&fixture.db, &claim.job.job_id, claim.job.attempt, claim.job.fence,
+        "steward-worker", "INTERRUPTED", "controlled interruption", super::jobs::now_ms(), None).unwrap());
+    let steward = member(&fixture, "steward", "role-org-viewer");
+    move_definition_to(&fixture, &started.definition_id, &steward);
+
+    let seen = repository::get_instance(&fixture.db, &steward, &started.instance_id, None).unwrap();
+    assert_eq!(seen.access, Some(ProcessInstanceAccess::Owner));
+    assert!(!seen.can_retry && !seen.incidents[0].can_retry);
+    let refused = repository::retry_job(&fixture.db, &steward, &stamp("steward asks"),
+        &started.instance_id, &claim.job.job_id, seen.revision).unwrap_err();
+    assert!(refused.downcast_ref::<ProcessOperationDenied>().is_some(), "{refused}");
+    let after = repository::get_instance(&fixture.db, &steward, &started.instance_id, None).unwrap();
+    assert_eq!((after.revision, after.status), (seen.revision, ProcessInstanceStatus::Incident));
+    assert!(repository::claim_job(&fixture.db, "steward-worker", super::jobs::now_ms()).unwrap().is_none(),
+        "a refused retry queues no job");
+
+    // A deactivated initiator turns the request into a refusal too.
+    fixture.db.write().unwrap().execute(
+        "UPDATE user_accounts SET is_active=0 WHERE id=?1", [&fixture.owner.user_id]).unwrap();
+    let inactive = repository::get_instance(&fixture.db, &steward, &started.instance_id, None).unwrap();
+    assert!(!inactive.can_retry && !inactive.incidents[0].can_retry);
+    let refused = repository::retry_job(&fixture.db, &steward, &stamp("steward asks again"),
+        &started.instance_id, &claim.job.job_id, seen.revision).unwrap_err();
+    assert!(refused.downcast_ref::<ProcessAuthorityDenied>().is_some(), "{refused}");
+}
+
+#[tokio::test]
+async fn another_ready_activation_takes_the_retry_offer_back() {
+    let fixture = Fixture::new();
+    let flow_id = flow(&fixture.db, &fixture.owner, &graph("ready retry", None));
+    let model = service_model(&flow_id, ActivityVerification::Condition { expression: "true".into() });
+    let started = start_model(&fixture, &model);
+    let claim = repository::claim_job(&fixture.db, "ready-worker", super::jobs::now_ms()).unwrap().unwrap();
+    assert!(repository::fail_job(&fixture.db, &claim.job.job_id, claim.job.attempt, claim.job.fence,
+        "ready-worker", "INTERRUPTED", "controlled interruption", super::jobs::now_ms(), None).unwrap());
+    let read = || repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert!(read().can_retry && read().incidents[0].can_retry);
+
+    fixture.db.write().unwrap().execute(
+        "INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES('stray',?1,?1,'Start_1',NULL,'[]','ready',1)",
+        [&started.instance_id]).unwrap();
+    let blocked = read();
+    assert!(!blocked.can_retry && !blocked.incidents[0].can_retry);
+    assert!(repository::retry_job(&fixture.db, &fixture.owner, &stamp("blocked retry"),
+        &started.instance_id, &claim.job.job_id, blocked.revision).is_err());
+}
+
+#[test]
+fn only_a_participant_may_send_a_message_into_the_instance() {
+    let fixture = Fixture::new();
+    let started = waiting_instance(&fixture);
+    let steward = member(&fixture, "steward", "role-org-viewer");
+    let monitor = member(&fixture, "auditor", "role-org-admin");
+    move_definition_to(&fixture, &started.definition_id, &steward);
+    let can_send = |actor: &ProcessActor| repository::get_instance(&fixture.db, actor, &started.instance_id, None)
+        .unwrap().can_send_message;
+    assert_eq!(can_send(&fixture.participant), Some(true));
+    assert_eq!(can_send(&steward), Some(false));
+    assert_eq!(can_send(&monitor), Some(false));
+    move_definition_to(&fixture, &started.definition_id, &fixture.owner);
+    assert_eq!(can_send(&fixture.owner), Some(true));
+}
+
+#[test]
+fn a_monitor_reads_no_correlation_key_failure_text_or_reason() {
+    let fixture = Fixture::new();
+    let mut model = super::send_receive_tests::receive_model();
+    model.variables.insert("customer_note".into(), json!("secret-key-77"));
+    let ProcessNodeKind::ReceiveTask { correlation_expression, .. } =
+        &mut model.nodes.iter_mut().find(|node| node.id == "Catch_1").unwrap().kind
+        else { panic!("fixture node is not a ReceiveTask") };
+    *correlation_expression = "vars.customer_note".into();
+    let version = publish_model(&fixture, &model);
+    let started = super::messages::test_support::start_version(&fixture, &version);
+    fixture.db.write().unwrap().execute(
+        "UPDATE bpmn_event_subscriptions SET last_reason='mismatch for secret-key-77' WHERE instance_id=?1",
+        [&started.instance_id]).unwrap();
+    let monitor = member(&fixture, "auditor", "role-org-admin");
+
+    let owner_view = repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    assert_eq!(owner_view.subscriptions[0].correlation_key.as_deref(), Some("secret-key-77"));
+    assert_eq!(owner_view.subscriptions[0].last_reason.as_deref(), Some("mismatch for secret-key-77"));
+    let seen = repository::get_instance(&fixture.db, &monitor, &started.instance_id, None).unwrap();
+    assert_eq!(seen.subscriptions.len(), 1);
+    assert_eq!(seen.subscriptions[0].message_name.as_deref(), owner_view.subscriptions[0].message_name.as_deref());
+    assert!(seen.subscriptions[0].correlation_key.is_none() && seen.subscriptions[0].last_reason.is_none());
+    assert!(!serde_json::to_string(&seen).unwrap().contains("secret-key-77"));
+}
+
+#[tokio::test]
+async fn a_monitor_reads_the_incident_code_never_the_worker_failure_text() {
+    let fixture = Fixture::new();
+    let flow_id = flow(&fixture.db, &fixture.owner, &graph("secret failure", None));
+    let model = service_model(&flow_id, ActivityVerification::Condition { expression: "true".into() });
+    let started = start_model(&fixture, &model);
+    let claim = repository::claim_job(&fixture.db, "secret-worker", super::jobs::now_ms()).unwrap().unwrap();
+    assert!(repository::fail_job(&fixture.db, &claim.job.job_id, claim.job.attempt, claim.job.fence,
+        "secret-worker", "INTERRUPTED", "upstream rejected token sk-live-4242", super::jobs::now_ms(), None).unwrap());
+    let monitor = member(&fixture, "auditor", "role-org-admin");
+
+    let owner_view = repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None).unwrap();
+    let incident_id = owner_view.incidents[0].incident_id.clone();
+    assert!(owner_view.incidents[0].message.contains("sk-live-4242"));
+    let pages: tentaflow_protocol::processes::ProcessInstancePageRequest =
+        serde_json::from_value(json!({"selected_incident_id": incident_id})).unwrap();
+    let seen = repository::get_instance(&fixture.db, &monitor, &started.instance_id, Some(&pages)).unwrap();
+    assert_eq!(seen.incidents[0].code, owner_view.incidents[0].code);
+    assert_eq!(seen.incidents[0].message, seen.incidents[0].code);
+    let selected = seen.selected_incident.as_ref().expect("selected incident");
+    assert_eq!(selected.incident.message, selected.incident.code);
+    assert!(!serde_json::to_string(&seen).unwrap().contains("sk-live-4242"));
+}
+
+#[test]
+fn the_scope_is_validated_before_a_matching_revision_answers_not_modified() {
+    let fixture = Fixture::new();
+    let started = waiting_instance(&fixture);
+    let error = repository::get_instance_tokens(
+        &fixture.db, &fixture.owner, &started.instance_id, Some("missing-scope"), Some(started.revision),
+    ).unwrap_err();
+    assert!(error.to_string().contains("not found"), "{error}");
+}
+
+fn insert_live_token(fixture: &Fixture, instance_id: &str, token_id: &str, node_id: &str, status: &str, at_ms: i64) {
+    fixture.db.write().unwrap().execute(
+        "INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES(?1,?2,?2,?3,NULL,'[]',?4,?5)",
+        rusqlite::params![token_id, instance_id, node_id, status, at_ms],
+    ).unwrap();
+}
+
+#[test]
+fn a_crowded_token_view_is_cut_from_the_end_to_fit_one_frame() {
+    let fixture = Fixture::new();
+    let started = waiting_instance(&fixture);
+    let node = "N".repeat(400);
+    for index in 0..1900 {
+        insert_live_token(&fixture, &started.instance_id, &format!("fan-{index:04}-{}", "t".repeat(48)),
+            &node, "waiting", i64::from(index));
+    }
+    let view = repository::get_instance_tokens(&fixture.db, &fixture.owner, &started.instance_id, None, None).unwrap();
+    assert!(view.truncated);
+    assert!(view.tokens.len() > 500 && view.tokens.len() < 1900, "{}", view.tokens.len());
+    assert!(view.tokens.iter().enumerate().all(|(index, token)| token.token_id.starts_with(&format!("fan-{index:04}-"))),
+        "the cut keeps the oldest tokens in order");
+    let frame = tentaflow_protocol::cbor::encode(&tentaflow_protocol::message_body::MessageBody::ProcessBody(
+        tentaflow_protocol::processes::ProcessPayload::InstanceTokensGetResponse {
+            instance_revision: view.instance_revision, not_modified: false, version: view.version,
+            process_id: view.process_id.clone(), tokens: view.tokens.clone(),
+            taken_edge_ids: view.taken_edge_ids.clone(), visited_node_ids: view.visited_node_ids.clone(),
+            truncated: view.truncated,
+        })).unwrap();
+    assert!(frame.len() <= 900 * 1024, "{}", frame.len());
+}
+
+#[test]
+fn a_node_incident_is_attached_once_and_parks_its_token_at_the_gateway() {
+    let fixture = Fixture::new();
+    let started = waiting_instance(&fixture);
+    for (index, token) in ["gate-a", "gate-b", "gate-c"].into_iter().enumerate() {
+        insert_live_token(&fixture, &started.instance_id, token, "Gate", "waiting", 10 + index as i64);
+    }
+    {
+        let conn = fixture.db.write().unwrap();
+        for (id, code, at_ms) in [("inc-1", "NO_MATCHING_FLOW", 1), ("inc-2", "AMBIGUOUS_GATEWAY", 2)] {
+            conn.execute(
+                "INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?2,'Gate',NULL,?3,'m',?4)",
+                rusqlite::params![id, started.instance_id, code, at_ms],
+            ).unwrap();
+        }
+    }
+    let view = repository::get_instance_tokens(&fixture.db, &fixture.owner, &started.instance_id, None, None).unwrap();
+    let token = |id: &str| view.tokens.iter().find(|token| token.token_id == id).unwrap();
+    let mut attached = view.tokens.iter().flat_map(|token| token.incident_ids.clone()).collect::<Vec<_>>();
+    attached.sort();
+    assert_eq!(attached, vec!["inc-1".to_string(), "inc-2".to_string()], "each incident exactly once");
+    assert_eq!(token("gate-a").wait, Some(ProcessTokenWait::Gateway));
+    assert_eq!(token("gate-b").wait, Some(ProcessTokenWait::Gateway));
+    assert_eq!(token("gate-c").wait, None);
+    assert!(matches!(view.tokens.iter().find(|token| token.node_id == "Work").unwrap().wait,
+        Some(ProcessTokenWait::UserTask { .. })));
+}
+
+#[test]
+fn repeated_edges_are_listed_once() {
+    let fixture = Fixture::new();
+    let started = waiting_instance(&fixture);
+    {
+        let conn = fixture.db.write().unwrap();
+        for index in 0..5 {
+            conn.execute(
+                "INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) VALUES(?1,?2,?2,'Loop',?3,'[]','consumed',1)",
+                rusqlite::params![format!("lap-{index}"), started.instance_id, if index % 2 == 0 { "Back" } else { "Forth" }],
+            ).unwrap();
+        }
+    }
+    let view = repository::get_instance_tokens(&fixture.db, &fixture.owner, &started.instance_id, None, None).unwrap();
+    assert_eq!(view.taken_edge_ids, vec!["Back".to_string(), "Forth".to_string(), "ToWork".to_string()]);
+    assert_eq!(view.visited_node_ids.iter().filter(|node| *node == "Loop").count(), 1);
+}
+
+fn fork_join_model(assignee: &str) -> tentaflow_protocol::processes::ProcessModel {
+    let mut model = super::model::starter_model();
+    for (id, kind) in [
+        ("Split", ProcessNodeKind::ParallelGateway),
+        ("Join", ProcessNodeKind::ParallelGateway),
+        ("Left", ProcessNodeKind::UserTask {
+            assignee_user_id: Some(assignee.into()), output_mapping: Default::default() }),
+        ("Right", ProcessNodeKind::UserTask {
+            assignee_user_id: Some(assignee.into()), output_mapping: Default::default() }),
+    ] {
+        model.nodes.push(ProcessNode { id: id.into(), name: id.into(), kind, repeat: None, activity_io: None });
+    }
+    model.sequence_flows = vec![
+        edge("StartSplit", "Start_1", "Split"),
+        edge("SplitLeft", "Split", "Left"),
+        edge("SplitRight", "Split", "Right"),
+        edge("LeftJoin", "Left", "Join"),
+        edge("RightJoin", "Right", "Join"),
+        edge("JoinEnd", "Join", "End_1"),
+    ];
+    model
+}
+
+#[test]
+fn a_parallel_join_parks_the_first_arrival_at_the_gateway_while_the_other_branch_works() {
+    let fixture = Fixture::new();
+    let started = start_model(&fixture, &fork_join_model(&fixture.owner.user_id));
+    let view = repository::get_instance_tokens(&fixture.db, &fixture.owner, &started.instance_id, None, None).unwrap();
+    assert_eq!(view.tokens.len(), 2);
+    assert!(view.tokens.iter().all(|token| matches!(token.wait, Some(ProcessTokenWait::UserTask { .. }))));
+
+    let left = started.user_tasks.iter().find(|task| task.node_id == "Left").unwrap();
+    repository::complete_user_task(
+        &fixture.db, &fixture.owner, &stamp("finish left"), &started.instance_id,
+        &left.user_task_id, started.revision, &json!({}), None,
+        repository::ProcessPlanInput::Canonical, super::jobs::now_ms(),
+    ).unwrap();
+    let view = repository::get_instance_tokens(&fixture.db, &fixture.owner, &started.instance_id, None, None).unwrap();
+    let joining = view.tokens.iter().find(|token| token.status == ProcessTokenStatus::Joining).expect("joining token");
+    assert_eq!((joining.node_id.as_str(), joining.wait.clone()), ("Join", Some(ProcessTokenWait::Gateway)));
+    let right = view.tokens.iter().find(|token| token.node_id == "Right").expect("other branch");
+    assert!(matches!(right.wait, Some(ProcessTokenWait::UserTask { .. })));
+    assert!(view.taken_edge_ids.contains(&"LeftJoin".to_string()));
+}
+
+/// A repetition keeps one coordinator token on its element beside one token per
+/// live occurrence; only the occurrence tokens carry an occurrence and a wait.
+fn split_coordinator(
+    tokens: Vec<tentaflow_protocol::processes::ProcessTokenView>,
+) -> Vec<tentaflow_protocol::processes::ProcessTokenView> {
+    let (coordinators, occurrences): (Vec<_>, Vec<_>) =
+        tokens.into_iter().partition(|token| token.occurrence.is_none());
+    assert_eq!(coordinators.len(), 1, "{coordinators:?}");
+    assert!(coordinators[0].wait.is_none() && coordinators[0].status == ProcessTokenStatus::Waiting);
+    occurrences
+}
+
+#[test]
+fn sequential_and_parallel_repetition_report_their_occurrence() {
+    let fixture = Fixture::new();
+    let owner = fixture.owner.user_id.clone();
+    let sequential = start_model(&fixture, &super::repetition_tests::sequential_human_model(&owner, 3));
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &sequential.instance_id).unwrap();
+    let view = repository::get_instance_tokens(&fixture.db, &fixture.owner, &sequential.instance_id, None, None).unwrap();
+    let live = split_coordinator(view.tokens);
+    assert_eq!(live.len(), 1, "a sequential group has one live occurrence");
+    let occurrence = live[0].occurrence.clone().expect("occurrence");
+    assert_eq!(occurrence.ordinal, 0);
+    assert_eq!(occurrence.group_id, snapshot.repetition_groups[0].group_id);
+    assert!(matches!(live[0].wait, Some(ProcessTokenWait::UserTask { .. })));
+
+    let mut model = super::repetition_tests::sequential_human_model(&owner, 3);
+    let tentaflow_protocol::processes::ProcessRepeatSpec::MultiInstance { mode, .. } =
+        model.nodes.iter_mut().find(|node| node.id == "RepeatedWork").unwrap().repeat.as_mut().unwrap()
+        else { panic!("fixture repetition is not multi-instance") };
+    *mode = tentaflow_protocol::processes::ProcessMultiInstanceMode::Parallel;
+    let parallel = start_model(&fixture, &model);
+    let view = repository::get_instance_tokens(&fixture.db, &fixture.owner, &parallel.instance_id, None, None).unwrap();
+    let live = split_coordinator(view.tokens);
+    let mut ordinals = live.iter().map(|token| token.occurrence.clone().expect("occurrence").ordinal).collect::<Vec<_>>();
+    ordinals.sort_unstable();
+    assert_eq!(ordinals, vec![0, 1, 2]);
+    let mut tasks = live.iter().map(|token| match &token.wait {
+        Some(ProcessTokenWait::UserTask { user_task_id }) => user_task_id.clone(),
+        other => panic!("expected a task wait, got {other:?}"),
+    }).collect::<Vec<_>>();
+    tasks.sort();
+    tasks.dedup();
+    assert_eq!(tasks.len(), 3, "each occurrence waits for its own task");
+}
+
+#[test]
+fn tokens_on_one_element_in_different_scopes_are_told_apart_by_scope() {
+    let fixture = Fixture::new();
+    let inner = super::manual_tests::manual_model(None, false);
+    let mut model = embedded_model(inner, "RepeatedScope");
+    model.variables.insert("results".into(), json!([]));
+    model.nodes.iter_mut().find(|node| node.id == "RepeatedScope").unwrap().repeat =
+        Some(tentaflow_protocol::processes::ProcessRepeatSpec::MultiInstance {
+            mode: tentaflow_protocol::processes::ProcessMultiInstanceMode::Parallel,
+            input: tentaflow_protocol::processes::ProcessMultiInstanceInput::Cardinality { count: 2 },
+            output_collection_variable: "results".into(),
+        });
+    let started = start_model(&fixture, &model);
+
+    let root = repository::get_instance_tokens(&fixture.db, &fixture.owner, &started.instance_id, None, None).unwrap();
+    let occurrences = split_coordinator(root.tokens);
+    assert_eq!(occurrences.len(), 2);
+    let children = occurrences.iter().map(|token| match &token.wait {
+        Some(ProcessTokenWait::Scope { scope_id, active_tokens }) => {
+            assert_eq!(*active_tokens, 1);
+            scope_id.clone()
+        }
+        other => panic!("expected a scope wait, got {other:?}"),
+    }).collect::<Vec<_>>();
+    assert_ne!(children[0], children[1]);
+    let mut manual_tokens = Vec::new();
+    for child in &children {
+        let inner = repository::get_instance_tokens(&fixture.db, &fixture.owner, &started.instance_id, Some(child), None).unwrap();
+        assert_eq!(inner.tokens.len(), 1);
+        assert_eq!((inner.tokens[0].node_id.as_str(), &inner.tokens[0].scope_id), ("Manual", child));
+        manual_tokens.push(inner.tokens[0].token_id.clone());
+    }
+    assert_ne!(manual_tokens[0], manual_tokens[1]);
+}
+
+#[test]
+fn a_call_a_timer_a_message_and_a_boundary_host_each_report_their_wait() {
+    let fixture = Fixture::new();
+
+    let leaf = publish_model(&fixture, &user_model(Some(&fixture.participant.user_id)));
+    let outer = publish_model(&fixture, &super::call_tests::caller(&leaf, Default::default()));
+    let parent = super::messages::test_support::start_version(&fixture, &outer);
+    let view = repository::get_instance_tokens(&fixture.db, &fixture.owner, &parent.instance_id, None, None).unwrap();
+    assert_eq!(view.tokens.len(), 1);
+    let child = super::call_tests::child_id(&fixture, &parent.instance_id);
+    assert_eq!(view.tokens[0].wait, Some(ProcessTokenWait::Call { child_instance_id: child.clone() }));
+
+    // A monitor who opens the parent may open the called instance too.
+    let auditor = member(&fixture, "auditor", "role-org-admin");
+    let seen = repository::get_instance(&fixture.db, &auditor, &parent.instance_id, None).unwrap();
+    assert_eq!(seen.access, Some(ProcessInstanceAccess::Monitor));
+    let tentaflow_protocol::processes::ProcessCallSummary::Outgoing { child: related, .. } = &seen.calls[0]
+        else { panic!("the parent holds an outgoing call") };
+    let related = related.as_ref().expect("the observer gate reaches the child");
+    assert_eq!((related.instance_id.as_str(), related.can_open), (child.as_str(), true));
+
+    let mut timer = super::model::starter_model();
+    timer.timer_timezone = Some("UTC".into());
+    timer.nodes.insert(1, ProcessNode { id: "Wait".into(), name: "Wait".into(),
+        kind: ProcessNodeKind::TimerCatch {
+            timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 3600 } },
+        repeat: None, activity_io: None });
+    timer.sequence_flows = vec![edge("ToWait", "Start_1", "Wait"), edge("WaitEnd", "Wait", "End_1")];
+    let timed = start_model(&fixture, &timer);
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &timed.instance_id).unwrap();
+    let view = repository::get_instance_tokens(&fixture.db, &fixture.owner, &timed.instance_id, None, None).unwrap();
+    assert_eq!(view.tokens.len(), 1);
+    assert_eq!(view.tokens[0].wait, Some(ProcessTokenWait::Timer {
+        timer_id: snapshot.timers[0].timer_id.clone(), due_at_ms: snapshot.timers[0].due_at_ms }));
+
+    let received = publish_model(&fixture, &super::send_receive_tests::receive_model());
+    let waiting = super::messages::test_support::start_version(&fixture, &received);
+    let view = repository::get_instance_tokens(&fixture.db, &fixture.owner, &waiting.instance_id, None, None).unwrap();
+    assert_eq!(view.tokens[0].wait, Some(ProcessTokenWait::Message {
+        subscription_id: waiting.subscriptions[0].subscription_id.clone() }));
+
+    let hosted = start_model(&fixture, &with_boundaries(
+        user_model(Some(&fixture.participant.user_id)), "Work", &[("Deadline", false, 3600)]));
+    let snapshot = repository::runtime_snapshot(&fixture.db, &fixture.owner, &hosted.instance_id).unwrap();
+    assert_eq!(snapshot.timers.len(), 1, "the boundary armed a timer for the host");
+    let view = repository::get_instance_tokens(&fixture.db, &fixture.owner, &hosted.instance_id, None, None).unwrap();
+    assert_eq!(view.tokens.len(), 1);
+    assert_eq!(view.tokens[0].node_id, "Work");
+    assert!(matches!(view.tokens[0].wait, Some(ProcessTokenWait::UserTask { .. })),
+        "the person outranks the deadline armed beside them");
 }

@@ -3596,7 +3596,7 @@ fn related_instance_on(
     actor: &ProcessActor,
     instance_id: &str,
 ) -> Result<Option<ProcessRelatedInstance>> {
-    match require_instance_reader(conn, actor, instance_id) {
+    match instance_access_on(conn, actor, instance_id, AccessReach::Observers) {
         Ok(_) => {}
         Err(error) if error.downcast_ref::<ProcessAuthorityDenied>().is_some() => return Ok(None),
         Err(error) => return Err(error),
@@ -5663,8 +5663,40 @@ fn incident_retryable_on(
         return Ok(false);
     }
     match job_id {
-        Some(job_id) => job_direct_retryable_on(conn, job_id, instance_id),
+        Some(job_id) => {
+            Ok(job_direct_retryable_on(conn, job_id, instance_id)?
+                && retry_runs_as_initiator_on(conn, instance_id, job_id)?)
+        }
         None => Ok(false),
+    }
+}
+
+/// The checks `retry_job` enforces before it plans anything, so the projection
+/// never offers a retry that is refused: the initiator must still be active
+/// and own the definition (the work runs in their name), the source must be
+/// current and no other activation may be ready.
+fn retry_runs_as_initiator_on(conn: &Connection, instance_id: &str, job_id: &str) -> Result<bool> {
+    let (org_id, initiator_user_id): (String, String) = conn.query_row(
+        "SELECT org_id,initiator_user_id FROM bpmn_instances WHERE instance_id=?1",
+        [instance_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let initiator = ProcessActor { org_id, user_id: initiator_user_id };
+    let ready: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND status='ready')",
+        [instance_id],
+        |row| row.get(0),
+    )?;
+    if ready {
+        return Ok(false);
+    }
+    let checks = require_actor(conn, &initiator)
+        .and_then(|()| require_call_control_authority_on(conn, &initiator, instance_id))
+        .and_then(|()| require_source_current(conn, &initiator, &job_source_ref_on(conn, job_id)?, None));
+    match checks {
+        Ok(()) => Ok(true),
+        Err(error) if error.downcast_ref::<ProcessAuthorityDenied>().is_some() => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -5722,8 +5754,9 @@ fn incident_on(
             node_id,
             node_name,
             job_id,
+            // A worker's failure text can quote the data it was given.
+            message: if access.sees_values() { message } else { code.clone() },
             code,
-            message,
             at_ms,
             can_retry,
         },
@@ -5746,6 +5779,7 @@ fn incidents_on(
 }
 fn subscription_summary(
     conn: &Connection,
+    access: ProcessInstanceAccess,
     s: &EventSubscription,
     model: &ProcessModel,
 ) -> Result<ProcessSubscriptionSummary> {
@@ -5768,13 +5802,13 @@ fn subscription_summary(
         status: s.status.clone(),
         revision: s.revision,
         message_name: s.message_name.clone(),
-        correlation_key: s.correlation_key.clone(),
+        correlation_key: s.correlation_key.clone().filter(|_| access.sees_values()),
         error_code: s.error_code.clone(),
         escalation_code: s.escalation_code.clone(),
         signal_name: s.signal_declaration_id.as_ref().and_then(|id| model.signals.iter().find(|signal| &signal.signal_id == id).map(|signal| signal.name.clone())),
         attached_to_id,
         race_id: s.race_id.clone(),
-        last_reason: s.last_reason.clone(),
+        last_reason: s.last_reason.clone().filter(|_| access.sees_values()),
     })
 }
 fn race_summary_on(
@@ -6038,7 +6072,7 @@ fn instance_state_on(
         .map(|id| Ok(incident_on(conn, access, instance_id, id, &model)?.incident))
         .collect::<Result<Vec<_>>>()?;
     let timers=detail_ids_on(conn,"SELECT timer_id FROM bpmn_timers WHERE instance_id=?1 ORDER BY CASE WHEN status IN ('pending','blocked') THEN 0 WHEN status='error' THEN 1 ELSE 2 END,created_at_ms DESC,timer_id LIMIT ?2 OFFSET ?3",instance_id,timer_spec)?.iter().map(|id|timer_summary(conn,&timer_on(conn,id)?,&model)).collect::<Result<Vec<_>>>()?;
-    let subscriptions=detail_ids_on(conn,"SELECT subscription_id FROM bpmn_event_subscriptions WHERE instance_id=?1 ORDER BY CASE WHEN status='open' THEN 0 WHEN status='error' THEN 1 ELSE 2 END,created_at_ms DESC,subscription_id LIMIT ?2 OFFSET ?3",instance_id,sub_spec)?.iter().map(|id|subscription_summary(conn,&subscription_on(conn,id)?,&model)).collect::<Result<Vec<_>>>()?;
+    let subscriptions=detail_ids_on(conn,"SELECT subscription_id FROM bpmn_event_subscriptions WHERE instance_id=?1 ORDER BY CASE WHEN status='open' THEN 0 WHEN status='error' THEN 1 ELSE 2 END,created_at_ms DESC,subscription_id LIMIT ?2 OFFSET ?3",instance_id,sub_spec)?.iter().map(|id|subscription_summary(conn,access,&subscription_on(conn,id)?,&model)).collect::<Result<Vec<_>>>()?;
     let event_races=detail_ids_on(conn,"SELECT race_id FROM bpmn_event_races WHERE instance_id=?1 ORDER BY CASE WHEN status='open' THEN 0 ELSE 1 END,created_at_ms DESC,race_id LIMIT ?2 OFFSET ?3",instance_id,race_spec)?.iter().map(|id|race_summary_on(conn,&race_on(conn,id)?,&model)).collect::<Result<Vec<_>>>()?;
     let (outgoing_messages, outgoing_page) = outgoing_page_on(conn, actor, instance_id, out_spec)?;
     let selected_user_task = pages
@@ -6121,7 +6155,13 @@ fn instance_state_on(
         event_races,
         outgoing_messages,
         message_names,
-        can_send_message: Some(!closed),
+        can_send_message: Some(
+            !closed
+                && matches!(
+                    access,
+                    ProcessInstanceAccess::Initiator | ProcessInstanceAccess::Assignee
+                ),
+        ),
         pages: Some(page_info),
         selected_user_task,
         selected_incident,
@@ -6207,24 +6247,12 @@ pub fn get_instance(
     })
 }
 
-/// Why the actor may read the instance; `Err` when they may not.
-pub fn instance_access(
-    pool: &DbPool,
-    actor: &ProcessActor,
-    instance_id: &str,
-) -> Result<ProcessInstanceAccess> {
-    read_snapshot(pool, |conn| {
-        require_actor(conn, actor)?;
-        instance_access_on(conn, actor, instance_id, AccessReach::Observers)
-    })
-}
-
 pub fn get_scope(
     pool: &DbPool,
     actor: &ProcessActor,
     instance_id: &str,
     scope_id: &str,
-) -> Result<(ProcessScopeSummary, Value, Vec<String>)> {
+) -> Result<(ProcessScopeSummary, Value, Vec<String>, ProcessInstanceAccess)> {
     read_snapshot(pool, |conn| {
         require_actor(conn, actor)?;
         let access = instance_access_on(conn, actor, instance_id, AccessReach::Observers)?;
@@ -6259,7 +6287,7 @@ pub fn get_scope(
             frame.len() <= 900 * 1024,
             "process scope detail exceeds the wire budget"
         );
-        Ok((scope, variables, active_node_ids))
+        Ok((scope, variables, active_node_ids, access))
     })
 }
 
@@ -6283,6 +6311,13 @@ pub fn get_instance_tokens(
             params![instance_id, actor.org_id],
             |row| Ok((row.get(0)?, row_u64(row, 1)?, row.get(2)?)),
         )?;
+        let scope_id = scope_id.unwrap_or(instance_id);
+        let scope_known: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bpmn_scopes WHERE instance_id=?1 AND scope_id=?2)",
+            params![instance_id, scope_id],
+            |row| row.get(0),
+        )?;
+        ensure!(scope_known, "process scope not found");
         let mut view = ProcessInstanceTokens {
             instance_revision: revision,
             not_modified: if_revision == Some(revision),
@@ -6296,13 +6331,6 @@ pub fn get_instance_tokens(
         if view.not_modified {
             return Ok(view);
         }
-        let scope_id = scope_id.unwrap_or(instance_id);
-        let scope_known: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM bpmn_scopes WHERE instance_id=?1 AND scope_id=?2)",
-            params![instance_id, scope_id],
-            |row| row.get(0),
-        )?;
-        ensure!(scope_known, "process scope not found");
         let cap = i64::try_from(TOKEN_VIEW_LIMIT + 1)?;
 
         let waits = token_waits_on(conn, instance_id)?;
@@ -6321,16 +6349,24 @@ pub fn get_instance_tokens(
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         view.truncated |= rows.len() > TOKEN_VIEW_LIMIT;
-        for (token_id, token_scope, node_id, status, since_ms) in rows.into_iter().take(TOKEN_VIEW_LIMIT) {
+        let rows = rows.into_iter().take(TOKEN_VIEW_LIMIT).collect::<Vec<_>>();
+        let mut node_incidents = waits.assign_node_incidents(&rows);
+        for (token_id, token_scope, node_id, status, since_ms) in rows {
             let status = match status.as_str() {
                 "ready" => ProcessTokenStatus::Ready,
                 "waiting" => ProcessTokenStatus::Waiting,
                 "joining" => ProcessTokenStatus::Joining,
                 other => bail!("unexpected live token status {other}"),
             };
-            let wait = waits.wait_of(conn, instance_id, &token_id, status)?;
+            let node_incidents = node_incidents.remove(&token_id).unwrap_or_default();
+            let stuck_at_gateway = node_incidents.iter().any(|(_, code)| {
+                matches!(code.as_str(), "NO_MATCHING_FLOW" | "AMBIGUOUS_GATEWAY")
+            });
+            let wait = waits.wait_of(conn, instance_id, &token_id, status, stuck_at_gateway)?;
+            let mut incident_ids = waits.job_incidents.get(&token_id).cloned().unwrap_or_default();
+            incident_ids.extend(node_incidents.into_iter().map(|(id, _)| id));
             view.tokens.push(ProcessTokenView {
-                incident_ids: waits.incidents_of(&token_id, &token_scope, &node_id),
+                incident_ids,
                 occurrence: waits.occurrences.get(&token_id).cloned(),
                 token_id,
                 scope_id: token_scope,
@@ -6359,8 +6395,57 @@ pub fn get_instance_tokens(
                 view.truncated = true;
             }
         }
+        fit_token_view_to_wire_budget(&mut view)?;
         Ok(view)
     })
+}
+
+const TOKEN_VIEW_WIRE_BUDGET: usize = 900 * 1024;
+
+fn token_view_frame_len(view: &ProcessInstanceTokens) -> Result<usize> {
+    let frame = tentaflow_protocol::cbor::encode(
+        &tentaflow_protocol::message_body::MessageBody::ProcessBody(
+            ProcessPayload::InstanceTokensGetResponse {
+                instance_revision: view.instance_revision,
+                not_modified: view.not_modified,
+                version: view.version,
+                process_id: view.process_id.clone(),
+                tokens: view.tokens.clone(),
+                taken_edge_ids: view.taken_edge_ids.clone(),
+                visited_node_ids: view.visited_node_ids.clone(),
+                truncated: true,
+            },
+        ),
+    )
+    .map_err(anyhow::Error::msg)?;
+    Ok(frame.len())
+}
+
+/// Drops tokens from the end until the answer fits one wire frame; the cut is
+/// reported as `truncated`, never silent.
+fn fit_token_view_to_wire_budget(view: &mut ProcessInstanceTokens) -> Result<()> {
+    if token_view_frame_len(view)? <= TOKEN_VIEW_WIRE_BUDGET {
+        return Ok(());
+    }
+    let all = std::mem::take(&mut view.tokens);
+    let (mut fits, mut too_big) = (0usize, all.len());
+    view.tokens = Vec::new();
+    ensure!(
+        token_view_frame_len(view)? <= TOKEN_VIEW_WIRE_BUDGET,
+        "process token view exceeds the wire budget"
+    );
+    while too_big - fits > 1 {
+        let middle = fits + (too_big - fits) / 2;
+        view.tokens = all[..middle].to_vec();
+        if token_view_frame_len(view)? <= TOKEN_VIEW_WIRE_BUDGET {
+            fits = middle;
+        } else {
+            too_big = middle;
+        }
+    }
+    view.tokens = all[..fits].to_vec();
+    view.truncated = true;
+    Ok(())
 }
 
 /// What each live token of an instance waits for, read once per answer.
@@ -6373,7 +6458,8 @@ struct TokenWaits {
     subscriptions: HashMap<String, String>,
     occurrences: HashMap<String, ProcessTokenOccurrence>,
     job_incidents: HashMap<String, Vec<String>>,
-    node_incidents: HashMap<(String, String), Vec<String>>,
+    /// Open incidents without a job, by (scope, node), as (incident id, code).
+    node_incidents: HashMap<(String, String), Vec<(String, String)>>,
 }
 
 fn token_waits_on(conn: &Connection, instance_id: &str) -> Result<TokenWaits> {
@@ -6412,17 +6498,18 @@ fn token_waits_on(conn: &Connection, instance_id: &str) -> Result<TokenWaits> {
     }
     let job_tokens = pairs(conn, "SELECT job_id,token_id FROM bpmn_jobs WHERE instance_id=?1", instance_id)?;
     let mut job_incidents: HashMap<String, Vec<String>> = HashMap::new();
-    let mut node_incidents: HashMap<(String, String), Vec<String>> = HashMap::new();
-    let mut statement = conn.prepare("SELECT incident_id,job_id,scope_id,node_id FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL ORDER BY at_ms,incident_id")?;
+    let mut node_incidents: HashMap<(String, String), Vec<(String, String)>> = HashMap::new();
+    let mut statement = conn.prepare("SELECT incident_id,job_id,scope_id,node_id,code FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL ORDER BY at_ms,incident_id")?;
     for row in statement.query_map([instance_id], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(4)?,
         ))
     })? {
-        let (incident_id, job_id, scope_id, node_id) = row?;
+        let (incident_id, job_id, scope_id, node_id, code) = row?;
         match (job_id, node_id) {
             (Some(job_id), _) => {
                 if let Some(token_id) = job_tokens.get(&job_id) {
@@ -6430,7 +6517,7 @@ fn token_waits_on(conn: &Connection, instance_id: &str) -> Result<TokenWaits> {
                 }
             }
             (None, Some(node_id)) => {
-                node_incidents.entry((scope_id, node_id)).or_default().push(incident_id);
+                node_incidents.entry((scope_id, node_id)).or_default().push((incident_id, code));
             }
             (None, None) => {}
         }
@@ -6450,6 +6537,7 @@ impl TokenWaits {
         instance_id: &str,
         token_id: &str,
         status: ProcessTokenStatus,
+        stuck_at_gateway: bool,
     ) -> Result<Option<ProcessTokenWait>> {
         if let Some(scope_id) = self.child_scopes.get(token_id) {
             let active_tokens: u32 = conn.query_row(
@@ -6477,15 +6565,33 @@ impl TokenWaits {
         if let Some(id) = self.subscriptions.get(token_id) {
             return Ok(Some(ProcessTokenWait::Message { subscription_id: id.clone() }));
         }
-        Ok((status == ProcessTokenStatus::Joining).then_some(ProcessTokenWait::Gateway))
+        Ok((status == ProcessTokenStatus::Joining || stuck_at_gateway)
+            .then_some(ProcessTokenWait::Gateway))
     }
 
-    fn incidents_of(&self, token_id: &str, scope_id: &str, node_id: &str) -> Vec<String> {
-        let mut ids = self.job_incidents.get(token_id).cloned().unwrap_or_default();
-        if let Some(by_node) = self.node_incidents.get(&(scope_id.to_owned(), node_id.to_owned())) {
-            ids.extend(by_node.iter().cloned());
+    /// Hands every open node incident to exactly one token of its (scope,
+    /// node): the n-th incident to the n-th token there, the surplus to the
+    /// last. An incident carries no token id, so a copy on each token would
+    /// multiply it by the number of tokens parked at the node.
+    fn assign_node_incidents(
+        &self,
+        rows: &[(String, String, String, String, i64)],
+    ) -> HashMap<String, Vec<(String, String)>> {
+        let mut per_node: HashMap<(&str, &str), Vec<&str>> = HashMap::new();
+        for (token_id, scope_id, node_id, _, _) in rows {
+            per_node.entry((scope_id, node_id)).or_default().push(token_id);
         }
-        ids
+        let mut assigned: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for ((scope_id, node_id), tokens) in per_node {
+            let Some(incidents) = self.node_incidents.get(&(scope_id.to_owned(), node_id.to_owned())) else {
+                continue;
+            };
+            for (index, incident) in incidents.iter().enumerate() {
+                let token = tokens[index.min(tokens.len() - 1)];
+                assigned.entry(token.to_owned()).or_default().push(incident.clone());
+            }
+        }
+        assigned
     }
 }
 
@@ -6664,7 +6770,7 @@ pub fn list_events(
     instance_id: &str,
     after_seq: u64,
     limit: u32,
-) -> Result<(Vec<ProcessEvent>, u64, bool)> {
+) -> Result<(Vec<ProcessEvent>, u64, bool, ProcessInstanceAccess)> {
     ensure!((1..=200).contains(&limit), "history limit must be 1..=200");
     read_snapshot(pool, |conn| {
         require_actor(conn, actor)?;
@@ -6735,7 +6841,7 @@ pub fn list_events(
             params![instance_id, sql_integer(next_seq)?],
             |row| row.get(0),
         )?;
-        Ok((events, next_seq, has_more))
+        Ok((events, next_seq, has_more, access))
     })
 }
 
@@ -29128,6 +29234,13 @@ pub fn retry_job(
         user_id: instance.initiator_user_id.clone(),
     };
     require_actor(&tx, &initiator)?;
+    if !actor_owns_on(&tx, &initiator, &instance.definition_id)? {
+        // The claim path demands the same ownership, so a retry here could only
+        // park a job no worker may run.
+        return Err(ProcessOperationDenied(
+            "the initiator no longer owns the definition, so the work cannot run in their name",
+        ).into());
+    }
     if let Some(prior) = command_replay::<StoredInstanceIdentity>(&tx, actor, stamp)? {
         return observed_instance_on(&tx, actor, &prior.instance_id, None);
     }
@@ -34905,7 +35018,7 @@ mod tests {
         let mut cursor = 0;
         let mut paged_events = 0;
         loop {
-            let (page, next, has_more) =
+            let (page, next, has_more, _) =
                 list_events(&db, &participant, &instance_id, cursor, 1).unwrap();
             assert_eq!(page.len(), 1);
             assert!(next > cursor);
@@ -35871,7 +35984,7 @@ mod monitor_projection_tests {
     fn a_token_reports_its_primary_wait_in_a_fixed_order() {
         let conn = Connection::open_in_memory().unwrap();
         let mut waits = waits_for("t");
-        let mut wait = |waits: &TokenWaits, status| waits.wait_of(&conn, "i", "t", status).unwrap();
+        let wait = |waits: &TokenWaits, status| waits.wait_of(&conn, "i", "t", status, false).unwrap();
         assert_eq!(wait(&waits, ProcessTokenStatus::Waiting),
             Some(ProcessTokenWait::Call { child_instance_id: "child-instance".into() }));
         waits.calls.clear();
@@ -35890,15 +36003,29 @@ mod monitor_projection_tests {
         assert_eq!(wait(&waits, ProcessTokenStatus::Joining), Some(ProcessTokenWait::Gateway));
         assert_eq!(wait(&waits, ProcessTokenStatus::Waiting), None);
         assert_eq!(wait(&waits, ProcessTokenStatus::Ready), None);
+        assert_eq!(waits.wait_of(&conn, "i", "t", ProcessTokenStatus::Waiting, true).unwrap(),
+            Some(ProcessTokenWait::Gateway), "a gateway incident parks the token at its gateway");
+    }
+
+    fn token_row(token: &str, node: &str) -> (String, String, String, String, i64) {
+        (token.into(), "scope".into(), node.into(), "waiting".into(), 0)
     }
 
     #[test]
-    fn a_token_collects_the_incidents_of_its_job_and_of_its_element() {
+    fn every_node_incident_goes_to_exactly_one_token_of_its_element() {
         let mut waits = waits_for("t");
-        waits.job_incidents.insert("t".into(), vec!["by-job".into()]);
-        waits.node_incidents.insert(("scope".into(), "Node".into()), vec!["by-node".into()]);
-        assert_eq!(waits.incidents_of("t", "scope", "Node"), vec!["by-job".to_string(), "by-node".to_string()]);
-        assert_eq!(waits.incidents_of("t", "scope", "Other"), vec!["by-job".to_string()]);
-        assert!(waits.incidents_of("other", "scope", "Other").is_empty());
+        waits.node_incidents.insert(("scope".into(), "Gate".into()), vec![
+            ("first".into(), "NO_MATCHING_FLOW".into()),
+            ("second".into(), "AMBIGUOUS_GATEWAY".into()),
+            ("third".into(), "NO_MATCHING_FLOW".into()),
+        ]);
+        let rows = vec![token_row("a", "Gate"), token_row("b", "Gate"), token_row("c", "Other")];
+        let assigned = waits.assign_node_incidents(&rows);
+        let ids = |token: &str| assigned.get(token).map(|list| list.iter()
+            .map(|(id, _)| id.as_str()).collect::<Vec<_>>()).unwrap_or_default();
+        assert_eq!(ids("a"), vec!["first"]);
+        assert_eq!(ids("b"), vec!["second", "third"], "the surplus goes to the last token");
+        assert!(ids("c").is_empty());
+        assert_eq!(assigned.values().map(Vec::len).sum::<usize>(), 3);
     }
 }

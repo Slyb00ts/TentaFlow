@@ -935,7 +935,7 @@ fn aggregate_limit_retains_two_accepted_sources_and_rejects_forged_finite_codes(
         task.status != ProcessUserTaskStatus::Open));
     assert!(persisted.incidents.iter().any(|incident|
         incident.code == "REPETITION_AGGREGATE_LIMIT"));
-    let (events, _, _) = repository::list_events(&reopened, &fixture.owner,
+    let (events, _, _, _) = repository::list_events(&reopened, &fixture.owner,
         &started.instance_id, 0, 100).unwrap();
     assert_eq!(events.iter().filter(|event| event.kind == "user_task_completed").count(), 2);
     assert_eq!(events.iter().filter(|event| event.kind == "repetition_group_blocked"

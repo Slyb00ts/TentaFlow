@@ -523,7 +523,7 @@ fn scoped_work_uses_lexical_inputs_outputs_and_authorized_scope_detail() {
         inner.parent_scope_id.as_deref(),
         Some(outer.scope_id.as_str())
     );
-    let (detail, local, active) = repository::get_scope(
+    let (detail, local, active, _) = repository::get_scope(
         &fixture.db,
         &fixture.owner,
         &waiting.instance_id,
@@ -749,7 +749,7 @@ fn ancestor_variable_change_revalidates_all_active_descendants_atomically() {
     .instance;
     assert_eq!(legal.variables["shadow"].as_str().unwrap().len(), 180_000);
     assert_eq!(legal.status, ProcessInstanceStatus::Waiting);
-    let (outer_after, local, _) = repository::get_scope(
+    let (outer_after, local, _, _) = repository::get_scope(
         &fixture.db,
         &fixture.owner,
         &waiting.instance_id,
@@ -785,7 +785,7 @@ fn ancestor_variable_change_revalidates_all_active_descendants_atomically() {
     assert_eq!(unchanged.revision, legal.revision);
     assert_eq!(event_count(&fixture, &waiting.instance_id), events_before);
     assert_eq!(command_count(&fixture), commands_before);
-    let (_, local_after, _) = repository::get_scope(
+    let (_, local_after, _, _) = repository::get_scope(
         &fixture.db,
         &fixture.owner,
         &waiting.instance_id,
@@ -804,7 +804,7 @@ fn ancestor_variable_change_revalidates_all_active_descendants_atomically() {
         task_before.status
     );
 
-    let (inner_after, inner_local, _) = repository::get_scope(
+    let (inner_after, inner_local, _, _) = repository::get_scope(
         &fixture.db,
         &fixture.owner,
         &waiting.instance_id,

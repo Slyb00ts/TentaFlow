@@ -1532,7 +1532,7 @@ fn repeated_script_cardinality_edges_keep_one_ordered_parent_aggregate() {
         let mut history = Vec::new();
         let mut after_seq = 0;
         loop {
-            let (page, next_seq, has_more) = repository::list_events(
+            let (page, next_seq, has_more, _) = repository::list_events(
                 &reopened, &fixture.owner, &started.instance_id, after_seq, 200).unwrap();
             assert!(!has_more || next_seq > after_seq);
             history.extend(page);

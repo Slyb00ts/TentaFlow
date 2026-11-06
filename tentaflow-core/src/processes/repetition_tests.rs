@@ -711,14 +711,14 @@ fn parallel_repeated_calls_with_immediate_child_termination_reconcile_both_pinne
             && call.called_definition_id == target.definition_id
             && call.called_version == target.version
             && call.model_sha256 == target.model_sha256));
-    let (events, _, _) = repository::list_events(&reopened, &fixture.owner,
+    let (events, _, _, _) = repository::list_events(&reopened, &fixture.owner,
         &instance_id, 0, 200).unwrap();
     assert_eq!(events.iter().filter(|event| event.kind == "call_requested").count(), 2);
     assert_eq!(events.iter().filter(|event| event.kind == "call_entered").count(), 2);
     let mut children = std::collections::HashSet::new();
     for call in &parent.calls {
         assert!(children.insert(call.child_instance_id.clone()));
-        let (events, _, _) = repository::list_events(&reopened, &fixture.owner,
+        let (events, _, _, _) = repository::list_events(&reopened, &fixture.owner,
             &call.child_instance_id, 0, 200).unwrap();
         assert_eq!(events.iter().filter(|event|
             event.kind == "terminate_end_reached").count(), 1);
@@ -1087,7 +1087,7 @@ fn active_occurrence_limit_latches_once_and_closes_every_parallel_wait() {
     assert!(snapshot.repetition_occurrences.iter().all(|row|
         row.status == tentaflow_protocol::processes::ProcessRepetitionOccurrenceStatus::Cancelled));
     assert!(snapshot.user_tasks.iter().all(|task| task.status != ProcessUserTaskStatus::Open));
-    let (events, _, _) = repository::list_events(&reopened, &fixture.owner,
+    let (events, _, _, _) = repository::list_events(&reopened, &fixture.owner,
         &started.instance_id, 0, 200).unwrap();
     let blocked = events.iter().filter(|event| event.kind == "repetition_group_blocked")
         .collect::<Vec<_>>();
@@ -1175,7 +1175,7 @@ fn active_service_job_limit_latches_before_the_thirty_third_claimable_job() {
     let mut after_seq = 0;
     let mut blocked = Vec::new();
     loop {
-        let (events, next_seq, has_more) = repository::list_events(
+        let (events, next_seq, has_more, _) = repository::list_events(
             &reopened, &fixture.owner, &instance_id, after_seq, 200).unwrap();
         blocked.extend(events.into_iter().filter(|event|
             event.kind == "repetition_group_blocked"));

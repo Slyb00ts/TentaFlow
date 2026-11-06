@@ -838,16 +838,13 @@ pub fn process_dispatch(
             instance_id,
             scope_id,
         } => {
-            let (scope, variables, active_node_ids) =
+            let (scope, variables, active_node_ids, access) =
                 repository::get_scope(pool, &actor, instance_id, scope_id).map_err(error)?;
-            let variables_redacted = repository::instance_access(pool, &actor, instance_id)
-                .map_err(error)?
-                == tentaflow_protocol::processes::ProcessInstanceAccess::Monitor;
             P::ScopeGetResponse {
                 scope,
                 variables,
                 active_node_ids,
-                variables_redacted,
+                variables_redacted: access == tentaflow_protocol::processes::ProcessInstanceAccess::Monitor,
             }
         }
         P::InstanceTokensGetRequest {
@@ -982,17 +979,14 @@ pub fn process_dispatch(
             after_seq,
             limit,
         } => {
-            let (events, next_seq, has_more) =
+            let (events, next_seq, has_more, access) =
                 repository::list_events(pool, &actor, instance_id, *after_seq, *limit)
                     .map_err(error)?;
-            let data_redacted = repository::instance_access(pool, &actor, instance_id)
-                .map_err(error)?
-                == tentaflow_protocol::processes::ProcessInstanceAccess::Monitor;
             P::HistoryResponse {
                 events,
                 next_seq,
                 has_more,
-                data_redacted,
+                data_redacted: access == tentaflow_protocol::processes::ProcessInstanceAccess::Monitor,
             }
         }
         P::MessageSendRequest {
