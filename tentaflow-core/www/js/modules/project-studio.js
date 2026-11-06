@@ -23,6 +23,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast, formatBytes } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
+import { followClient } from '/js/protocol/follow-client.js';
 import { PROCESS_INCIDENT_KIND } from '/js/modules/system-events.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { TfAgentActivity } from '/js/components/tf-agent-activity.js';
@@ -11550,9 +11551,9 @@ function openTaskLinkWindow(sourceTaskId, onSaved) {
 // G02 — notification bell, panel and cross-project "my test work"
 // =============================================================================
 
-// The unsolicited SystemEvent listener survives module remounts by design —
-// the client connection is page-scoped and the server already filters
-// UserNotification frames per authenticated user.
+// The unsolicited SystemEvent listener survives module remounts by design and
+// follows the current socket, so it still works after a logout and login in the
+// same tab. The server already filters UserNotification frames per user.
 let notifListenerInstalled = false;
 
 function bellHtml() {
@@ -11592,19 +11593,17 @@ async function refreshNotifBadge() {
 export function installNotifListener() {
   if (notifListenerInstalled) return;
   notifListenerInstalled = true;
-  ApiBinary.client()
-    .then((client) => {
-      client.addUnsolicitedListener(({ body }) => {
-        if (!body || body._variant !== 'SystemEventBody.UserNotification') return;
-        if (body.kind === PROCESS_INCIDENT_KIND) return;
-        const text = taskNotificationText(body, t) ?? orgNotificationText(body, t);
-        const title = text ? text.title : body.title || t('notif_title');
-        const message = text ? text.body : body.body;
-        toast(`${title}${message ? ` — ${message}` : ''}`, 'info');
-        refreshNotifBadge();
-      });
-    })
-    .catch(() => { /* transport not ready; badge refresh covers it later */ });
+  followClient((client) => {
+    client.addUnsolicitedListener(({ body }) => {
+      if (!body || body._variant !== 'SystemEventBody.UserNotification') return;
+      if (body.kind === PROCESS_INCIDENT_KIND) return;
+      const text = taskNotificationText(body, t) ?? orgNotificationText(body, t);
+      const title = text ? text.title : body.title || t('notif_title');
+      const message = text ? text.body : body.body;
+      toast(`${title}${message ? ` — ${message}` : ''}`, 'info');
+      refreshNotifBadge();
+    });
+  });
 }
 
 async function openNotifWindow() {

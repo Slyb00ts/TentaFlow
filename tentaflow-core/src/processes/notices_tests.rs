@@ -6,7 +6,10 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use tentaflow_protocol::processes::ActivityVerification;
 use tentaflow_protocol::SystemEventPayload;
 
-use super::notices::{deliver_pending, INCIDENT_NOTICE_KIND, PASS_SIZE, SINGLE_NOTICE_LIMIT};
+use super::notices::{
+    deliver_pending, NoticeThrottle, INCIDENT_NOTICE_KIND, PASS_SIZE, SINGLE_NOTICE_LIMIT,
+    STALE_AFTER_MS, THROTTLE_WINDOW_MS,
+};
 use super::repository::{self, ProcessActor};
 use super::runtime::test_support::*;
 
@@ -92,16 +95,36 @@ fn raise_incident(fixture: &Fixture, instance_id: &str) {
     ).unwrap();
 }
 
-struct Pushed(RefCell<Vec<SystemEventPayload>>);
+struct Pushed(RefCell<Vec<SystemEventPayload>>, RefCell<NoticeThrottle>);
+
+fn everyone(fixture: &Fixture) -> Vec<String> {
+    let conn = fixture.db.read().unwrap();
+    let mut statement = conn.prepare("SELECT id FROM user_accounts").unwrap();
+    statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
 
 impl Pushed {
     fn new() -> Self {
-        Self(RefCell::new(Vec::new()))
+        Self(
+            RefCell::new(Vec::new()),
+            RefCell::new(NoticeThrottle::default()),
+        )
     }
     fn deliver(&self, fixture: &Fixture) -> usize {
-        deliver_pending(&fixture.db, super::jobs::now_ms(), &|event| {
-            self.0.borrow_mut().push(event)
-        })
+        self.deliver_to(fixture, &everyone(fixture), super::jobs::now_ms())
+    }
+    fn deliver_to(&self, fixture: &Fixture, live: &[String], now_ms: i64) -> usize {
+        deliver_pending(
+            &fixture.db,
+            now_ms,
+            live,
+            &mut self.1.borrow_mut(),
+            &|event| self.0.borrow_mut().push(event),
+        )
         .unwrap()
     }
     fn users(&self) -> Vec<String> {
@@ -192,18 +215,26 @@ async fn a_notice_survives_a_restart_and_is_not_repeated_after_it_was_pushed() {
 
     let restarted = crate::db::init(&path).expect("reopen the process database");
     let after_restart = Pushed::new();
-    let pushed = deliver_pending(&restarted, super::jobs::now_ms(), &|event| {
-        after_restart.0.borrow_mut().push(event)
-    })
+    let pushed = deliver_pending(
+        &restarted,
+        super::jobs::now_ms(),
+        &everyone(&fixture),
+        &mut NoticeThrottle::default(),
+        &|event| after_restart.0.borrow_mut().push(event),
+    )
     .unwrap();
     assert_eq!(pushed, 0);
 
     // An incident that was raised and not yet pushed when the node stopped is pushed after the restart.
     fail_second_incident(&fixture);
     let restarted_again = crate::db::init(&path).expect("reopen the process database again");
-    let pushed = deliver_pending(&restarted_again, super::jobs::now_ms(), &|event| {
-        after_restart.0.borrow_mut().push(event)
-    })
+    let pushed = deliver_pending(
+        &restarted_again,
+        super::jobs::now_ms(),
+        &everyone(&fixture),
+        &mut NoticeThrottle::default(),
+        &|event| after_restart.0.borrow_mut().push(event),
+    )
     .unwrap();
     assert_eq!(pushed, 1);
 }
@@ -385,10 +416,16 @@ async fn a_crash_between_the_push_and_the_settling_repeats_the_push_with_the_sam
     failed_instance(&fixture, "worker failed");
     let seen = RefCell::new(Vec::new());
     let crashed = catch_unwind(AssertUnwindSafe(|| {
-        deliver_pending(&fixture.db, super::jobs::now_ms(), &|event| {
-            seen.borrow_mut().push(event);
-            panic!("process stopped after the push");
-        })
+        deliver_pending(
+            &fixture.db,
+            super::jobs::now_ms(),
+            &everyone(&fixture),
+            &mut NoticeThrottle::default(),
+            &|event| {
+                seen.borrow_mut().push(event);
+                panic!("process stopped after the push");
+            },
+        )
     }));
     assert!(crashed.is_err());
     assert_eq!(
@@ -400,9 +437,13 @@ async fn a_crash_between_the_push_and_the_settling_repeats_the_push_with_the_sam
     );
 
     assert_eq!(
-        deliver_pending(&fixture.db, super::jobs::now_ms(), &|event| seen
-            .borrow_mut()
-            .push(event))
+        deliver_pending(
+            &fixture.db,
+            super::jobs::now_ms(),
+            &everyone(&fixture),
+            &mut NoticeThrottle::default(),
+            &|event| seen.borrow_mut().push(event)
+        )
         .unwrap(),
         1
     );
@@ -483,9 +524,15 @@ fn an_idle_pass_never_takes_the_writer_lock_even_with_a_big_settled_table() {
     let writer = fixture.db.write().unwrap();
     let (sender, receiver) = std::sync::mpsc::channel();
     let db = fixture.db.clone();
+    let live = everyone(&fixture);
     let worker = std::thread::spawn(move || {
         sender
-            .send(deliver_pending(&db, 1, &|_| panic!("nothing is pending")).unwrap())
+            .send(
+                deliver_pending(&db, 1, &live, &mut NoticeThrottle::default(), &|_| {
+                    panic!("nothing is pending")
+                })
+                .unwrap(),
+            )
             .unwrap();
     });
     let pushed = receiver
@@ -663,14 +710,21 @@ fn a_mass_failure_is_a_few_summaries_not_a_toast_per_run() {
         "more than one pass drains a backlog larger than a pass"
     );
     let events = pushed.0.borrow();
-    assert_eq!(events.len(), 3);
+    assert_eq!(
+        events.len(),
+        SINGLE_NOTICE_LIMIT + 3,
+        "three individual notices, then one summary per pass"
+    );
     let summed: u64 = events
         .iter()
         .map(|event| {
             let link = link_of(event);
-            assert_eq!(link["summary"], true);
-            assert!(link.get("instanceId").is_none() && link.get("code").is_none());
-            link["count"].as_u64().unwrap()
+            if link["summary"] == true {
+                assert!(link.get("instanceId").is_none() && link.get("code").is_none());
+                link["count"].as_u64().unwrap()
+            } else {
+                1
+            }
         })
         .sum();
     assert_eq!(summed as usize, total);
@@ -697,4 +751,103 @@ fn a_few_incidents_in_one_pass_are_still_individual_notices() {
         .borrow()
         .iter()
         .all(|event| link_of(event)["instanceId"] == started.instance_id));
+}
+
+fn kinds(pushed: &Pushed) -> (usize, u64) {
+    let events = pushed.0.borrow();
+    let summaries = events
+        .iter()
+        .filter(|event| link_of(event)["summary"] == true);
+    (
+        events.len() - summaries.clone().count(),
+        summaries
+            .map(|event| link_of(event)["count"].as_u64().unwrap())
+            .sum(),
+    )
+}
+
+#[test]
+fn a_slow_trickle_of_failures_becomes_a_summary_after_the_limit_within_the_window() {
+    let fixture = Fixture::new();
+    let started = open_instance(&fixture);
+    let pushed = Pushed::new();
+    let live = everyone(&fixture);
+    let start = super::jobs::now_ms();
+    for step in 0..30 {
+        raise_incident(&fixture, &started.instance_id);
+        pushed.deliver_to(&fixture, &live, start + step * 150);
+    }
+    assert_eq!(
+        kinds(&pushed),
+        (SINGLE_NOTICE_LIMIT, 30 - SINGLE_NOTICE_LIMIT as u64),
+        "30 runs failing 150 ms apart are three toasts and a count"
+    );
+
+    raise_incident(&fixture, &started.instance_id);
+    pushed.deliver_to(&fixture, &live, start + THROTTLE_WINDOW_MS + 10_000);
+    assert_eq!(
+        kinds(&pushed).0,
+        SINGLE_NOTICE_LIMIT + 1,
+        "after the window a failure is a notice of its own again"
+    );
+}
+
+#[test]
+fn a_person_without_a_live_socket_keeps_their_notices_until_they_connect() {
+    let fixture = Fixture::new();
+    let started = open_instance(&fixture);
+    raise_incident(&fixture, &started.instance_id);
+    let pushed = Pushed::new();
+    let now = super::jobs::now_ms();
+    assert_eq!(
+        pushed.deliver_to(&fixture, &[], now),
+        0,
+        "nobody is connected"
+    );
+    assert_eq!(
+        pushed.deliver_to(&fixture, &["someone-else".to_string()], now),
+        0
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM bpmn_incident_notices WHERE notified_at_ms IS NULL"
+        ),
+        1,
+        "the notice waits"
+    );
+
+    assert_eq!(
+        pushed.deliver_to(&fixture, &[fixture.owner.user_id.clone()], now),
+        1
+    );
+    assert_eq!(pushed.users(), vec![fixture.owner.user_id.clone()]);
+}
+
+#[test]
+fn a_person_back_after_days_gets_open_incidents_only_and_a_summary_beyond_the_limit() {
+    let fixture = Fixture::new();
+    let started = open_instance(&fixture);
+    for _ in 0..8 {
+        raise_incident(&fixture, &started.instance_id);
+    }
+    fixture.db.write().unwrap().execute(
+        "UPDATE bpmn_incidents SET resolved_at_ms=at_ms WHERE incident_id IN (SELECT incident_id FROM bpmn_incidents LIMIT 2)", []).unwrap();
+    fixture.db.write().unwrap().execute(
+        "UPDATE bpmn_incident_notices SET queued_at_ms=queued_at_ms-?1-1000 WHERE incident_id IN (SELECT incident_id FROM bpmn_incidents WHERE resolved_at_ms IS NULL LIMIT 1)",
+        [STALE_AFTER_MS]).unwrap();
+    let pushed = Pushed::new();
+    pushed.deliver_to(&fixture, &everyone(&fixture), super::jobs::now_ms());
+    assert_eq!(
+        kinds(&pushed),
+        (SINGLE_NOTICE_LIMIT, 8 - 2 - 1 - SINGLE_NOTICE_LIMIT as u64),
+        "resolved and week-old incidents are not pushed"
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM bpmn_incident_notices WHERE notified_at_ms IS NULL"
+        ),
+        0
+    );
 }

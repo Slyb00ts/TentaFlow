@@ -13,6 +13,7 @@
 // =============================================================================
 
 import './tf-button.js';
+import { I18n } from '/js/i18n.js';
 
 class TfToast extends HTMLElement {
   static get observedAttributes() { return ['tone', 'title', 'message', 'duration', 'persistent']; }
@@ -21,6 +22,7 @@ class TfToast extends HTMLElement {
     super();
     this._root = null;
     this._timer = null;
+    this._paused = false;
   }
 
   connectedCallback() {
@@ -44,7 +46,6 @@ class TfToast extends HTMLElement {
     this.innerHTML = '';
     const el = document.createElement('div');
     el.className = 'tf-toast';
-    el.setAttribute('role', 'status');
 
     const titleEl = document.createElement('div');
     titleEl.className = 'tf-toast-title';
@@ -55,6 +56,7 @@ class TfToast extends HTMLElement {
     const closeBtn = document.createElement('button');
     closeBtn.className = 'tf-toast-close';
     closeBtn.type = 'button';
+    closeBtn.setAttribute('aria-label', I18n.t('common.close'));
     closeBtn.textContent = '×';
     closeBtn.addEventListener('click', () => this._dismiss());
 
@@ -70,6 +72,13 @@ class TfToast extends HTMLElement {
       el.appendChild(actionContent);
     }
     this.appendChild(el);
+    // A reader who is pointing at or tabbing within the toast is still reading it.
+    this.addEventListener('mouseenter', () => this._pause());
+    this.addEventListener('mouseleave', () => this._resume());
+    this.addEventListener('focusin', () => this._pause());
+    this.addEventListener('focusout', (event) => {
+      if (!this.contains(event.relatedTarget)) this._resume();
+    });
     this._root = el;
     this._titleEl = titleEl;
     this._msgEl = msgEl;
@@ -87,8 +96,24 @@ class TfToast extends HTMLElement {
     this._msgEl.style.display = message ? '' : 'none';
   }
 
+  // Restarts the dismiss timer after the toast's content was updated in place.
+  refresh() {
+    clearTimeout(this._timer);
+    this._startDismiss();
+  }
+
+  _pause() {
+    this._paused = true;
+    clearTimeout(this._timer);
+  }
+
+  _resume() {
+    this._paused = false;
+    this._startDismiss();
+  }
+
   _startDismiss() {
-    if (this.hasAttribute('persistent')) return;
+    if (this.hasAttribute('persistent') || this._paused) return;
     const duration = parseInt(this.getAttribute('duration'), 10) || 4000;
     this._timer = setTimeout(() => this._dismiss(), duration);
   }
@@ -109,6 +134,10 @@ class TfToast extends HTMLElement {
       c = document.createElement('div');
       c.id = 'tf-toast-container';
       c.className = 'tf-toast-container';
+      // The live region exists before any toast is added to it, which is what
+      // makes a screen reader announce the toast that arrives.
+      c.setAttribute('role', 'status');
+      c.setAttribute('aria-live', 'polite');
       document.body.appendChild(c);
     }
     return c;

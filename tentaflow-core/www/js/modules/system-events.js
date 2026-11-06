@@ -9,6 +9,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import { toast } from '/js/utils.js';
 import { TfToast } from '/js/components/tf-toast.js';
+import { followClient } from '/js/protocol/follow-client.js';
 
 let installed = false;
 
@@ -37,29 +38,10 @@ function handleSystemEvent({ body }) {
   else if (body._variant === 'SystemEventBody.UserNotification') showProcessIncidentNotice(body);
 }
 
-// A login closes the anonymous socket and opens one with the session, and the
-// server pushes personal events only to the second: the listener follows the
-// current client instead of staying on the first one. Listeners survive a
-// reconnect of the same client, so each client gets exactly one.
-let attachedClient = null;
-
-function attach() {
-  ApiBinary.client()
-    .then((client) => {
-      if (client === attachedClient) return;
-      attachedClient = client;
-      client.addUnsolicitedListener(handleSystemEvent);
-    })
-    .catch((e) => console.warn('[system-events] client not ready:', e?.message));
-}
-
 export function init() {
   if (installed) return;
   installed = true;
-  attach();
-  ApiBinary.onLifecycle((event) => {
-    if (event.type === 'open') attach();
-  });
+  followClient((client) => client.addUnsolicitedListener(handleSystemEvent));
 }
 
 function handleServiceStatus(ev) {
@@ -109,20 +91,29 @@ function incidentLink(ev) {
   }
 }
 
-// A mass failure arrives as a few summaries; they merge into one toast that
-// counts every run since it was last dismissed, so the screen never fills up.
+// A mass failure arrives as a few summaries and a trickle of failures as many
+// single notices; both fold into one toast whose count and title are updated in
+// place (no flicker, no repeated announcement) and which counts every incident
+// since it was last dismissed.
+const SINGLE_TOASTS_ON_SCREEN = 3;
 let summaryToast = null;
 let summaryCount = 0;
+let singleToasts = [];
 
-function showSummary(link, monitor) {
-  summaryCount = summaryToast?.isConnected ? summaryCount + link.count : link.count;
-  summaryToast?.remove();
+function showSummary(count, monitor) {
+  if (summaryToast?.isConnected) {
+    summaryCount += count;
+    summaryToast.setAttribute('title', I18n.t('bpmn.incident_notice_batch', { count: summaryCount }));
+    summaryToast.refresh();
+    return;
+  }
+  summaryCount = count;
   summaryToast = TfToast.show({
     tone: 'warning',
-    title: I18n.t('bpmn.instances_attention_count', { count: summaryCount }),
+    title: I18n.t('bpmn.incident_notice_batch', { count }),
     duration: NOTICE_TOAST_MS,
     action: {
-      label: I18n.t('bpmn.instances_filter_attention'),
+      label: I18n.t('bpmn.incident_notice_show_runs'),
       onClick: (shown) => {
         shown.dismiss();
         monitor.openProcessInstances(null, { attention: true });
@@ -142,13 +133,18 @@ export async function showProcessIncidentNotice(ev) {
   if (seenNotices.size > NOTICE_MEMORY) seenNotices.delete(seenNotices.values().next().value);
   const monitor = await import('/js/modules/flows-builder/process-monitor.js');
   if (link.summary) {
-    showSummary(link, monitor);
+    showSummary(link.count, monitor);
     return true;
   }
   const sentence = link.code === 'TIMER_ERROR'
     ? I18n.t('bpmn.incident_generic')
     : monitor.processIncidentText({ code: link.code, message: '' });
-  TfToast.show({
+  singleToasts = singleToasts.filter((shown) => shown.isConnected);
+  if (singleToasts.length >= SINGLE_TOASTS_ON_SCREEN) {
+    showSummary(1, monitor);
+    return true;
+  }
+  singleToasts.push(TfToast.show({
     tone: 'warning',
     title: I18n.t('bpmn.incident_notice_title', { name: link.processName || '' }),
     message: sentence,
@@ -160,6 +156,6 @@ export async function showProcessIncidentNotice(ev) {
         monitor.openProcessInstance(link.instanceId);
       },
     },
-  });
+  }));
   return true;
 }

@@ -17,6 +17,9 @@ import '/js/components/tf-segmented.js';
 import { mountProcessDiagram, readInstanceModel } from './process-diagram.js';
 import { ATTENTION_PAGE, loadAttentionInstances } from './process-attention.js';
 
+// Fired by an instance window after it changed the instance (cancel, retry), so a
+// list that is open reloads instead of showing the old state.
+const INSTANCE_CHANGED = 'tf:process-instance-changed';
 const text = (key, values) => I18n.t(`bpmn.${key}`, values);
 const date = (ms, timeZone) => new Date(ms).toLocaleString(I18n.getLanguage(), timeZone ? { timeZone } : undefined);
 const tone = (status) => status === 'Completed' ? 'ok' : ['Incident', 'Error'].includes(status) ? 'err' : status === 'Cancelled' ? 'neutral' : 'info';
@@ -384,7 +387,57 @@ export async function openProcessSchedule(definitionId) {
   return win;
 }
 
+// Codes that share one sentence. Every code the backend can raise has a text
+// here or in the list inside processIncidentText; a test reads the Rust sources
+// and fails when a code has none.
+export const INCIDENT_TEXT_KEYS = Object.freeze({
+  ACTIVITY_IO_INPUT_FAILED: 'incident_io_input',
+  ACTIVITY_IO_OUTPUT_FAILED: 'incident_io_output',
+  RESULT_EXPRESSION_ERROR: 'incident_io_output',
+  RESULT_ACCEPTANCE_FAILED: 'incident_io_output',
+  AGENT_UNAVAILABLE: 'incident_agent_unavailable',
+  AGENT_HARNESS_UNAVAILABLE: 'incident_agent_unavailable',
+  AGENT_SPAWN_FAILED: 'incident_agent_unavailable',
+  AGENT_NO_RESULT: 'incident_agent_result',
+  AGENT_RESULT_UNREADABLE: 'incident_agent_result',
+  AGENT_GOAL_INVALID: 'incident_agent_goal',
+  BLOCK_INPUT_INVALID: 'incident_block_input',
+  BLOCK_UNAVAILABLE: 'incident_unavailable',
+  FLOW_UNAVAILABLE: 'incident_unavailable',
+  TOOL_UNAVAILABLE: 'incident_unavailable',
+  TOOL_BUSY: 'incident_unavailable',
+  SERVICE_SOURCE_UNREADABLE: 'incident_unavailable',
+  UNBOUND_IMPLEMENTATION: 'incident_unavailable',
+  VERIFICATION_UNAVAILABLE: 'incident_unavailable',
+  VERIFICATION_FLOW_UNAVAILABLE: 'incident_unavailable',
+  VERIFICATION_AGENT_UNAVAILABLE: 'incident_unavailable',
+  CALL_ADMISSION_ERROR: 'incident_call_admission',
+  CALL_CHILD_ERROR: 'incident_call_child',
+  CALL_CHILD_CANCELLED: 'incident_call_child',
+  CALL_RETURN_ERROR: 'incident_call_return',
+  SCOPE_RETURN_ERROR: 'incident_call_return',
+  EXTERNAL_OUTCOME_UNCERTAIN: 'incident_outcome_uncertain',
+  EXTERNAL_RESULT_NOT_APPLIED: 'incident_result_not_applied',
+  MESSAGE_MAPPING_ERROR: 'incident_message_expression',
+  MESSAGE_PREDICATE_ERROR: 'incident_message_expression',
+  RESULT_RECOVERY_FAILED: 'incident_engine_unsettled',
+  STALE_WORKER: 'incident_engine_unsettled',
+  STORE_BUSY: 'incident_engine_unsettled',
+  TOOL_RESULT_UNDECIDED: 'incident_engine_unsettled',
+  SIGNAL_DELIVERY_FAILED: 'incident_signal_failed',
+  SIGNAL_MAPPING_FAILED: 'incident_signal_failed',
+  SIGNAL_PAYLOAD_FAILED: 'incident_signal_failed',
+  SIGNAL_PAYLOAD_LIMIT: 'incident_signal_limit',
+  SIGNAL_PENDING_LIMIT: 'incident_signal_limit',
+  SIGNAL_RECIPIENT_LIMIT: 'incident_signal_limit',
+  TOOL_ARGUMENTS_INVALID: 'incident_tool_failed',
+  TOOL_ERROR: 'incident_tool_failed',
+  TOOL_PERMISSION_DENIED: 'incident_not_allowed',
+  TOKEN_QUOTA_EXCEEDED: 'incident_not_allowed',
+});
+
 export function processIncidentText(incident) {
+  if (INCIDENT_TEXT_KEYS[incident.code]) return text(INCIDENT_TEXT_KEYS[incident.code]);
   if (incident.code === 'TIMER_ERROR') return text('incident_timer_error', { reason: incident.message });
   if (incident.code === 'INCLUSIVE_GATEWAY_ERROR') return `${text('incident_inclusive_gateway_error')} ${text('incident_inclusive_guidance')}`;
   if (incident.code === 'ESCALATION_HANDLER_FAILED') return `${text('incident_escalation_handler_failed')} ${text('incident_escalation_guidance')}`;
@@ -465,6 +518,9 @@ export async function openProcessInstances(definitionId = null, { attention: sta
     offset = 0;
     load();
   });
+  const reload = () => { if (win.isConnected) load(); };
+  window.addEventListener(INSTANCE_CHANGED, reload);
+  win.addEventListener('closed', () => window.removeEventListener(INSTANCE_CHANGED, reload), { once: true });
   table.addEventListener('page-change', (event) => { offset = (event.detail.page - 1) * 25; load(); });
   await load();
   return win;
@@ -585,6 +641,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       const response = await ApiBinary.one(request, command(payload));
       if (!win.isConnected) return;
       await acceptSnapshot(response.instance);
+      window.dispatchEvent(new CustomEvent(INSTANCE_CHANGED, { detail: { instanceId } }));
       if (historyEnded) await loadHistory();
     } catch (error) { showError(win, error); }
     finally { mutation = false; host.removeAttribute('inert'); await refresh(); }

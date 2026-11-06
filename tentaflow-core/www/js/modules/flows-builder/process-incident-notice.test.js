@@ -3,7 +3,7 @@
 import { window } from '../../sdk-runtime/_dom-test-harness.js';
 import test, { after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 
 for (const name of ['MutationObserver', 'ResizeObserver', 'Document', 'CSS', 'navigator']) {
   if (globalThis[name] === undefined) globalThis[name] = window[name];
@@ -19,8 +19,9 @@ globalThis.fetch = (url, options) => {
 const { I18n } = await import('../../i18n.js');
 const { ApiBinary } = await import('../../protocol/api-binary-shim.js');
 const { init: initSystemEvents, showProcessIncidentNotice, PROCESS_INCIDENT_KIND } = await import('../system-events.js');
-const { openProcessInstances } = await import('./process-monitor.js');
+const { openProcessInstances, processIncidentText } = await import('./process-monitor.js');
 const { installNotifListener } = await import('../project-studio.js');
+const { TfToast } = await import('../../components/tf-toast.js');
 const { loadAttentionInstances, mergeAttentionInstances } = await import('./process-attention.js');
 localStorage.setItem('tentaflow_lang', 'en');
 await I18n.init();
@@ -142,7 +143,7 @@ test('with nothing open the attention view says so', async () => {
 });
 
 test('the notice and filter wording exists in all five locales with the same keys and a Polish plural of three forms', () => {
-  const keys = ['incident_notice_title', 'instances_filter_label', 'instances_filter_all', 'instances_filter_attention', 'instances_attention_count', 'instances_attention_empty', 'instances_attention_more'];
+  const keys = ['incident_notice_title', 'instances_filter_label', 'instances_filter_all', 'instances_filter_attention', 'instances_attention_count', 'instances_attention_empty', 'instances_attention_more', 'incident_notice_batch', 'incident_notice_show_runs'];
   for (const language of ['pl', 'en', 'de', 'es', 'fr']) {
     const bpmn = JSON.parse(readFileSync(new URL(`../../../i18n/${language}.json`, import.meta.url), 'utf8')).bpmn;
     for (const key of keys) assert.equal(typeof bpmn[key], 'string', `${language}.${key}`);
@@ -150,14 +151,45 @@ test('the notice and filter wording exists in all five locales with the same key
     const plural = bpmn.instances_attention_count.match(/\{count\|([^}]*)\}/);
     assert.ok(plural, language);
     assert.equal(plural[1].split('|').length, language === 'pl' ? 3 : 2, language);
+    const batch = bpmn.incident_notice_batch.match(/\{count\|([^}]*)\}/);
+    assert.ok(batch, language);
+    assert.equal(batch[1].split('|').length, language === 'pl' ? 3 : 2, language);
+  }
+});
+
+test('every incident code the engine can raise has its own sentence in all five locales', async () => {
+  const dir = new URL('../../../../src/processes/', import.meta.url);
+  const sources = [];
+  const walk = (url) => {
+    for (const entry of readdirSync(url, { withFileTypes: true })) {
+      const child = new URL(entry.name + (entry.isDirectory() ? '/' : ''), url);
+      if (entry.isDirectory()) { if (entry.name !== 'tests') walk(child); continue; }
+      if (entry.name.endsWith('.rs') && !entry.name.endsWith('_tests.rs') && entry.name !== 'tests.rs') sources.push(readFileSync(child, 'utf8'));
+    }
+  };
+  walk(dir);
+  // Literals that are import diagnostics, simulation verdicts, expression lints
+  // or test labels, never an incident code a reader sees.
+  const notIncidents = /^(CAMUNDA_|EXPR_|SIMULATION_|[A-Z]_[A-Z]$)/;
+  const elsewhere = new Set(['LARGE_REASON', 'LATE_ERROR', 'OTHER_HANDLER_FAILURE', 'OUT_DIR', 'UNSUPPORTED_OR_INVALID_BPMN', 'ESCALATION_IMMEDIATE_PATH_UNSUPPORTED']);
+  const codes = [...new Set(sources.flatMap((source) => source.match(/"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+"/g) ?? []))]
+    .map((literal) => literal.slice(1, -1))
+    .filter((code) => !notIncidents.test(code) && !elsewhere.has(code));
+  assert.ok(codes.length > 60, `found ${codes.length} codes`);
+  for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+    await I18n.setLanguage(language);
+    const generic = I18n.t('bpmn.incident_generic');
+    const missing = codes.filter((code) => processIncidentText({ code, message: '' }) === generic);
+    assert.deepEqual(missing, [], `${language}: codes that fall back to the generic sentence`);
   }
 });
 
 const fakeClient = () => { const listeners = []; return { listeners, addUnsolicitedListener: (listener) => listeners.push(listener) }; };
 let currentClient = fakeClient();
-let lifecycle = () => {};
+const lifecycleCallbacks = [];
+const lifecycle = (event) => lifecycleCallbacks.forEach((callback) => callback(event));
 ApiBinary.client = async () => currentClient;
-ApiBinary.onLifecycle = (callback) => { lifecycle = callback; };
+ApiBinary.onLifecycle = (callback) => { lifecycleCallbacks.push(callback); };
 const emitTo = (client, body) => client.listeners.forEach((listener) => listener({ body }));
 
 test('the listener follows the client that a login replaces, so personal events reach the signed-in socket', async () => {
@@ -206,13 +238,83 @@ test('a mass failure is one toast that counts every run and opens the attention 
   for (let batch = 0; batch < 3; batch += 1) await showProcessIncidentNotice(summary(200, batch));
   await showProcessIncidentNotice(summary(100, 'tail'));
   assert.equal(toasts().length, 1);
-  assert.equal(toasts()[0].getAttribute('title'), '700 runs need attention');
+  assert.equal(toasts()[0].getAttribute('title'), '700 incidents need attention');
 
   responder = (kind, payload) => (kind === 'processInstanceListRequest' ? { instances: payload.hasIncident ? [run('x', 1)] : [], total: 1, hasMore: false } : {});
   toasts()[0].querySelector('tf-button').dispatchEvent(new MouseEvent('click', { bubbles: true }));
   await flush();
   assert.ok(calls.some((call) => call.payload.hasIncident === true && call.payload.scope === 'Mine'), 'the list opened on Needs attention');
   assert.equal(document.querySelector('tf-segmented[data-filter]').getAttribute('value'), 'attention');
+});
+
+test('the summary toast is updated in place and counts every incident since it was last dismissed', async () => {
+  await showProcessIncidentNotice(summary(5, 'first'));
+  const shown = toasts()[0];
+  let removed = 0;
+  new window.MutationObserver(() => { removed += 1; }).observe(shown.parentNode, { childList: true });
+  await showProcessIncidentNotice(summary(7, 'second'));
+  await flush(2);
+  assert.equal(toasts().length, 1);
+  assert.equal(toasts()[0], shown, 'the same element is reused');
+  assert.equal(shown.getAttribute('title'), '12 incidents need attention');
+  assert.equal(removed, 0, 'nothing was removed or added');
+  assert.equal(shown.querySelector('tf-button').getAttribute('label'), 'Show runs');
+});
+
+test('a trickle of single notices stops at three toasts and folds the rest into the summary', async () => {
+  for (let i = 0; i < 7; i += 1) await showProcessIncidentNotice(notice());
+  const titles = toasts().map((shown) => shown.getAttribute('title'));
+  assert.equal(titles.filter((title) => title.startsWith('A process run needs attention')).length, 3);
+  assert.equal(titles.filter((title) => title === '4 incidents need attention').length, 1, JSON.stringify(titles));
+  assert.equal(toasts().length, 4);
+});
+
+test('Project Studio follows the socket a login opens, and a notification arrives once', async () => {
+  const anonymous = currentClient;
+  const signedIn = fakeClient();
+  currentClient = signedIn;
+  lifecycle({ type: 'open' });
+  await flush();
+  assert.equal(signedIn.listeners.length, 2, 'system events and Project Studio both follow');
+  assert.equal(anonymous.listeners.length >= 1, true);
+
+  emitTo(signedIn, { _variant: 'SystemEventBody.UserNotification', userId: 'u1', notificationId: 'ps-login', projectId: 'p1',
+    kind: 'task_assigned', title: 'Login task', body: 'Assigned after login', linkJson: '{}' });
+  await flush();
+  assert.equal(calls.filter((call) => call.kind === 'projectStudioNotificationsListRequest').length, 1, 'handled once, by the Project Studio listener');
+});
+
+test('the toast close button is named in the reader language and hover or focus holds the timer', async () => {
+  const held = TfToast.show({ tone: 'info', title: 'Held', duration: 40 });
+  const loose = TfToast.show({ tone: 'info', title: 'Loose', duration: 40 });
+  assert.equal(held.querySelector('.tf-toast-close').getAttribute('aria-label'), 'Close');
+  assert.equal(document.getElementById('tf-toast-container').getAttribute('aria-live'), 'polite');
+  held.dispatchEvent(new window.MouseEvent('mouseenter'));
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.ok(!held.querySelector('.tf-toast-out'), 'held toast stays');
+  assert.ok(loose.querySelector('.tf-toast-out'), 'the other toast timed out');
+  held.dispatchEvent(new window.MouseEvent('mouseleave'));
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.ok(held.querySelector('.tf-toast-out'), 'it leaves after the pointer does');
+  for (const language of ['pl', 'en', 'de', 'es', 'fr']) {
+    assert.equal(typeof JSON.parse(readFileSync(new URL(`../../../i18n/${language}.json`, import.meta.url), 'utf8')).common.close, 'string', language);
+  }
+});
+
+test('the open run list reloads when an instance in its window changes state', async () => {
+  responder = (kind) => (kind === 'processInstanceListRequest' ? { instances: [run('p', 1)], total: 1, hasMore: false } : {});
+  const win = await openProcessInstances(null, { attention: true });
+  await flush();
+  const before = calls.filter((call) => call.kind === 'processInstanceListRequest').length;
+  window.dispatchEvent(new window.CustomEvent('tf:process-instance-changed', { detail: { instanceId: 'p' } }));
+  await flush();
+  assert.ok(calls.filter((call) => call.kind === 'processInstanceListRequest').length > before, 'the list was asked again');
+  win.remove();
+  await flush(2);
+  const closed = calls.length;
+  window.dispatchEvent(new window.CustomEvent('tf:process-instance-changed', { detail: { instanceId: 'p' } }));
+  await flush();
+  assert.equal(calls.length, closed, 'a closed window does not reload');
 });
 
 test('a malformed summary is not a toast', async () => {

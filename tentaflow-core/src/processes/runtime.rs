@@ -8531,6 +8531,11 @@ mod job_slot_tests {
 /// undecided at recovery.
 const DEFERRED_RECOVERY_EVERY: Duration = Duration::from_secs(5);
 
+/// How long a dashboard socket must have been open before an incident notice
+/// is pushed to it: a socket that opened a moment ago has not attached its
+/// listener yet.
+const NOTICE_SOCKET_SETTLE: Duration = Duration::from_millis(1500);
+
 /// A failed job is logged by code and size only: the text can carry flow, addon
 /// or user content.
 pub(crate) fn log_job_failure(job_id: &str, error: &str) {
@@ -8627,6 +8632,7 @@ impl ProcessRuntime {
         let mut last_deferred_recovery = tokio::time::Instant::now();
         let mut deferred_pass: Option<tokio::task::JoinHandle<()>> = None;
         let job_slots = JobSlots::default();
+        let mut notice_throttle = super::notices::NoticeThrottle::default();
         loop {
             if self.stop.is_cancelled() {
                 break;
@@ -8670,6 +8676,8 @@ impl ProcessRuntime {
             if let Err(error) = super::notices::deliver_pending(
                 &self.db,
                 chrono::Utc::now().timestamp_millis(),
+                &crate::dispatch::system_event_broadcast::live_users(NOTICE_SOCKET_SETTLE),
+                &mut notice_throttle,
                 &crate::dispatch::system_event_broadcast::publish,
             ) {
                 tracing::error!(error_len = error.to_string().len(), "process incident notice delivery failed");

@@ -17,7 +17,9 @@ test('the toast carries the message and an Undo button', () => {
   const toast = showUndoToast({ message: 'Assigned: Anna', onUndo() {} });
   assert.equal(toast.querySelector('.tf-toast-message').textContent, 'Assigned: Anna');
   assert.equal(undoButton(toast).getAttribute('label'), I18n.t('actions.undo'));
-  assert.equal(toast.querySelector('.tf-toast').getAttribute('role'), 'status');
+  // The live region is the container, so a toast that arrives is announced once.
+  assert.equal(document.getElementById('tf-toast-container').getAttribute('role'), 'status');
+  assert.equal(toast.querySelector('.tf-toast').getAttribute('role'), null);
 });
 
 test('clicking Undo calls onUndo once and locks the button meanwhile', async () => {

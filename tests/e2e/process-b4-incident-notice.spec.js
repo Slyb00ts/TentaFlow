@@ -157,3 +157,21 @@ test('the run list filter Needs attention keeps the blocked run and drops the he
   await expect(rows.filter({ hasText: 'B4 notice healthy' }).first()).toBeVisible({ timeout: 15000 });
   expect(errors, diagnostics(errors, proc)).toEqual([]);
 });
+
+test('a trickle of failing runs stops at three single toasts and folds the rest into one summary', async ({ page }) => {
+  test.setTimeout(120000);
+  const errors = collectConsoleErrors(page);
+  await loginAsAdmin(page, { port: PORT });
+  for (let i = 0; i < 8; i += 1) {
+    await startRun(page, ids.blocked);
+    await page.waitForTimeout(150);
+  }
+  const singles = page.locator('tf-toast', { hasText: 'needs attention: B4 notice incident' });
+  const summary = page.locator('tf-toast', { hasText: /incidents? needs? attention/ });
+  await expect(summary).toHaveCount(1, { timeout: 20000 });
+  await page.waitForTimeout(1500);
+  expect(await singles.count()).toBeLessThanOrEqual(3);
+  await expect(summary).toContainText(/\d+ incidents? need/);
+  await expect(summary.locator('tf-button')).toHaveAttribute('label', 'Show runs');
+  expect(errors, diagnostics(errors, proc)).toEqual([]);
+});

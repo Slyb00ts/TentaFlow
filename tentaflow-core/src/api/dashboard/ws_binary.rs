@@ -328,7 +328,11 @@ pub async fn handle_ws_connection<S>(
         let sys_user_id = user_id.clone();
         let sys_state = app_state.clone();
         let sys_session = session.clone();
+        let sys_listener = sys_user_id
+            .as_deref()
+            .map(crate::dispatch::system_event_broadcast::register_listener);
         tokio::spawn(async move {
+            let _sys_listener = sys_listener;
             while let Ok(mut event) = sys_rx.recv().await {
                 // UserNotification is private per user: the broadcast channel
                 // reaches every open dashboard, so forward it only to
