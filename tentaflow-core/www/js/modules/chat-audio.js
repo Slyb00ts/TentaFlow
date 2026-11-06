@@ -427,7 +427,10 @@ export class AudioPipeline {
     if (this.state === STATES.THINKING || this.state === STATES.TRANSCRIBING) {
       this._setState(STATES.SPEAKING);
     }
-    this._enqueueAudio({ bytes, mime: mime || 'audio/wav' });
+    // A `Vec<u8>` field is a CBOR array of integers, not a byte string, so the
+    // codec hands it over as a plain Array; decodeAudioData needs real bytes.
+    const view = bytes instanceof Uint8Array ? bytes : Uint8Array.from(bytes);
+    this._enqueueAudio({ bytes: view, mime: mime || 'audio/wav' });
   }
 
   finishResponse() {
