@@ -11589,7 +11589,7 @@ async function refreshNotifBadge() {
   updateBellBadges();
 }
 
-function installNotifListener() {
+export function installNotifListener() {
   if (notifListenerInstalled) return;
   notifListenerInstalled = true;
   ApiBinary.client()

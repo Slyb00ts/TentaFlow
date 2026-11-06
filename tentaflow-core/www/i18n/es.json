@@ -14596,6 +14596,7 @@
     "instances_filter_all": "Todas las ejecuciones",
     "instances_filter_attention": "Requieren atención",
     "instances_attention_count": "{count} {count|ejecución requiere atención|ejecuciones requieren atención}",
+    "instances_attention_more": "Se muestran las ejecuciones más recientes que requieren atención: {count}",
     "instances_attention_empty": "Ninguna ejecución requiere atención",
     "open_instance": "Abrir ejecución",
     "status": "Estado",

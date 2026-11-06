@@ -100,6 +100,13 @@ test('the person who started a blocked run gets one toast that opens the run, a 
   const watcher = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1400, height: 1000 } });
   const watcherPage = await watcher.newPage();
   await loginAsAdmin(watcherPage, { port: PORT, username: 'b4watcher', password: 'Watcher-pass-w0rd-1' });
+  // The watcher's socket is the one that would receive a personal event if the
+  // server addressed it wrongly; record what actually arrives there.
+  await watcherPage.evaluate(async () => {
+    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+    window.__events = [];
+    (await ApiBinary.client()).addUnsolicitedListener(({ body }) => window.__events.push(body?.kind ?? body?._variant));
+  });
 
   const instanceId = await startRun(page, ids.blocked);
   const toast = noticeToast(page);
@@ -117,6 +124,7 @@ test('the person who started a blocked run gets one toast that opens the run, a 
 
   await page.waitForTimeout(1500);
   await expect(noticeToast(watcherPage)).toHaveCount(0);
+  expect(await watcherPage.evaluate(() => window.__events)).not.toContain('process_incident');
   expect(await page.evaluate(async (id) => {
     const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
     return (await ApiBinary.one('processInstanceGetRequest', { instanceId: id })).instance.incidents.length;
@@ -141,7 +149,7 @@ test('the run list filter Needs attention keeps the blocked run and drops the he
   await expect(rows.filter({ hasText: 'B4 notice incident' }).first()).toBeVisible();
 
   await win.locator('[data-filter] button[data-value="attention"]').click();
-  await expect(win.locator('[data-attention-count]')).toContainText('need attention', { timeout: 15000 });
+  await expect(win.locator('[data-attention-count]')).toContainText(/runs? needs? attention/, { timeout: 15000 });
   await expect(rows.filter({ hasText: 'B4 notice incident' }).first()).toBeVisible();
   await expect(rows.filter({ hasText: 'B4 notice healthy' })).toHaveCount(0);
 

@@ -15734,6 +15734,7 @@
     "instances_filter_all": "All runs",
     "instances_filter_attention": "Needs attention",
     "instances_attention_count": "{count} {count|run needs attention|runs need attention}",
+    "instances_attention_more": "Showing the most recent runs that need attention: {count}",
     "instances_attention_empty": "No run needs attention",
     "open_instance": "Open run",
     "status": "Status",

@@ -246,6 +246,8 @@ Szacunki dla jednej osoby wraz z przeglądem. Każdy pakiet wdrażalny i wypycha
 | **B4.7** Migracja: plan i podgląd | odcisk elementu, reguły §4.2, `MIGRATION_TABLES` i test kompletności, `InstanceMigrationPlan*`, okno podglądu (dwa diagramy obok siebie) | B4.1, B4.2 | 3 dni | brak |
 | **B4.8** Migracja: zastosowanie i dokumentacja | `repository::migrate_instance`, `bpmn_instance_migrations`, zdarzenie, audyt, odtwarzanie nazw historii po wersji zdarzenia, e2e migracji, aktualizacja `BPMN_PROCESS_PLAN.md` §6/§10, `CLAUDE.md` | B4.7 (pełne zalety po B4.5) | 3 dni | 211 |
 
+**Wymaganie powiadomień (B4.3) dla B4.4 i B4.6:** ponowienie, ręczne i automatyczne, nie może tworzyć nowego wiersza `bpmn_incidents` na każdą próbę. Jedna awaria aktywności to jeden incydent aż do rozwiązania; kolejne próby aktualizują licznik prób na tym incydencie. Trigger kolejki powiadomień (migracja 208) powiadamia o każdym nowym wierszu, więc incydent na próbę wysyłałby powiadomienie na próbę.
+
 **Razem ok. 21 dni.** Ścieżki: (B4.1 → B4.2 → B4.7 → B4.8) oraz równolegle (B4.1 → B4.4 → B4.5/B4.6) oraz B4.3. Drugi wykonawca może prowadzić B4.3/B4.4 bez kolizji po scaleniu B4.1. B4.5 jest przed B4.8 wyłącznie dla spójnego opisu (generacja daje później rebinding świadka), nie jako twarda zależność kodu.
 
 ## 10. Decyzje właściciela (do rozstrzygnięcia przed B4.1)

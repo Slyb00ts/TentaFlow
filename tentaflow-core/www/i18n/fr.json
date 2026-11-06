@@ -14596,6 +14596,7 @@
     "instances_filter_all": "Toutes les exécutions",
     "instances_filter_attention": "Nécessitent une intervention",
     "instances_attention_count": "{count} {count|exécution nécessite une intervention|exécutions nécessitent une intervention}",
+    "instances_attention_more": "Affichage des exécutions récentes qui nécessitent une intervention : {count}",
     "instances_attention_empty": "Aucune exécution ne nécessite d’intervention",
     "open_instance": "Ouvrir l’exécution",
     "status": "État",

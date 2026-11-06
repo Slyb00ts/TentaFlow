@@ -14596,6 +14596,7 @@
     "instances_filter_all": "Alle Ausführungen",
     "instances_filter_attention": "Benötigen Aufmerksamkeit",
     "instances_attention_count": "{count} {count|Ausführung braucht Aufmerksamkeit|Ausführungen brauchen Aufmerksamkeit}",
+    "instances_attention_more": "Angezeigt werden die neuesten Ausführungen, die Aufmerksamkeit brauchen: {count}",
     "instances_attention_empty": "Keine Ausführung braucht Aufmerksamkeit",
     "open_instance": "Ausführung öffnen",
     "status": "Status",

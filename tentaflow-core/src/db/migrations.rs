@@ -1340,9 +1340,14 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
 /// not produce side effects. Incidents that predate this rung are not queued.
 /// `notified_at_ms IS NULL` is the pending state; `suppressed = 1` marks a row
 /// settled without a push (resolved before delivery, recipient without access).
+/// The rows go with their incident (and with its instance) through the foreign
+/// key. Any later rebuild of `bpmn_incidents`, `bpmn_instances` or
+/// `bpmn_definitions` drops the trigger with the table and must recreate it,
+/// and must keep this table's foreign key valid; the ladder test asserts the
+/// trigger exists at the head.
 const BPMN_INCIDENT_NOTICES: &str = r#"
 CREATE TABLE bpmn_incident_notices (
-    incident_id TEXT NOT NULL,
+    incident_id TEXT NOT NULL REFERENCES bpmn_incidents(incident_id) ON DELETE CASCADE,
     user_id TEXT NOT NULL,
     queued_at_ms INTEGER NOT NULL,
     notified_at_ms INTEGER,
@@ -17023,6 +17028,16 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(tables(&fresh), tables(&upgraded));
+        for conn in [&fresh, &upgraded] {
+            let queue_trigger: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='bpmn_incidents_queue_notices' AND tbl_name='bpmn_incidents'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(queue_trigger, 1, "a rebuild of bpmn_incidents must recreate the notice trigger");
+        }
     }
 
     /// v200: an absence has no reason. Every stored one is gone with the column, the capture journal

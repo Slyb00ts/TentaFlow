@@ -20,6 +20,7 @@ const { I18n } = await import('../../i18n.js');
 const { ApiBinary } = await import('../../protocol/api-binary-shim.js');
 const { init: initSystemEvents, showProcessIncidentNotice, PROCESS_INCIDENT_KIND } = await import('../system-events.js');
 const { openProcessInstances } = await import('./process-monitor.js');
+const { installNotifListener } = await import('../project-studio.js');
 const { loadAttentionInstances, mergeAttentionInstances } = await import('./process-attention.js');
 localStorage.setItem('tentaflow_lang', 'en');
 await I18n.init();
@@ -141,7 +142,7 @@ test('with nothing open the attention view says so', async () => {
 });
 
 test('the notice and filter wording exists in all five locales with the same keys and a Polish plural of three forms', () => {
-  const keys = ['incident_notice_title', 'instances_filter_label', 'instances_filter_all', 'instances_filter_attention', 'instances_attention_count', 'instances_attention_empty'];
+  const keys = ['incident_notice_title', 'instances_filter_label', 'instances_filter_all', 'instances_filter_attention', 'instances_attention_count', 'instances_attention_empty', 'instances_attention_more'];
   for (const language of ['pl', 'en', 'de', 'es', 'fr']) {
     const bpmn = JSON.parse(readFileSync(new URL(`../../../i18n/${language}.json`, import.meta.url), 'utf8')).bpmn;
     for (const key of keys) assert.equal(typeof bpmn[key], 'string', `${language}.${key}`);
@@ -152,19 +153,21 @@ test('the notice and filter wording exists in all five locales with the same key
   }
 });
 
+const fakeClient = () => { const listeners = []; return { listeners, addUnsolicitedListener: (listener) => listeners.push(listener) }; };
+let currentClient = fakeClient();
+let lifecycle = () => {};
+ApiBinary.client = async () => currentClient;
+ApiBinary.onLifecycle = (callback) => { lifecycle = callback; };
+const emitTo = (client, body) => client.listeners.forEach((listener) => listener({ body }));
+
 test('the listener follows the client that a login replaces, so personal events reach the signed-in socket', async () => {
-  const fakeClient = () => { const listeners = []; return { listeners, addUnsolicitedListener: (listener) => listeners.push(listener) }; };
-  const anonymous = fakeClient();
-  const signedIn = fakeClient();
-  let current = anonymous;
-  let lifecycle = () => {};
-  ApiBinary.client = async () => current;
-  ApiBinary.onLifecycle = (callback) => { lifecycle = callback; };
+  const anonymous = currentClient;
   initSystemEvents();
   await flush();
   assert.equal(anonymous.listeners.length, 1);
 
-  current = signedIn;
+  const signedIn = fakeClient();
+  currentClient = signedIn;
   lifecycle({ type: 'open' });
   lifecycle({ type: 'open' });
   lifecycle({ type: 'disconnected' });
@@ -174,4 +177,53 @@ test('the listener follows the client that a login replaces, so personal events 
   signedIn.listeners[0]({ body: notice() });
   await flush();
   assert.equal(toasts().length, 1);
+});
+
+test('with both listeners installed an incident notice is one toast and a Project Studio notice is one toast', async () => {
+  const client = fakeClient();
+  currentClient = client;
+  lifecycle({ type: 'open' });
+  installNotifListener();
+  await flush();
+  assert.equal(client.listeners.length, 2, 'system events and Project Studio both listen');
+
+  emitTo(client, notice());
+  await flush();
+  assert.equal(toasts().length, 1, 'the incident notice is shown by the system listener');
+  assert.equal(document.querySelectorAll('.toast').length, 0, 'and not again by Project Studio');
+
+  emitTo(client, { _variant: 'SystemEventBody.UserNotification', userId: 'u1', notificationId: 'ps-1', projectId: 'p1',
+    kind: 'task_assigned', title: 'Task', body: 'Assigned to you', linkJson: '{}' });
+  await flush();
+  assert.equal(toasts().length, 1, 'the system listener ignores a Project Studio kind');
+  assert.equal(document.querySelectorAll('.toast').length, 1, 'Project Studio shows its own');
+});
+
+const summary = (count, id) => ({ _variant: 'SystemEventBody.UserNotification', userId: 'u1', notificationId: `process-incident-batch:${id}:u1`,
+  projectId: '', kind: PROCESS_INCIDENT_KIND, title: '', body: '', linkJson: JSON.stringify({ summary: true, count, orgId: 'o1' }) });
+
+test('a mass failure is one toast that counts every run and opens the attention list', async () => {
+  for (let batch = 0; batch < 3; batch += 1) await showProcessIncidentNotice(summary(200, batch));
+  await showProcessIncidentNotice(summary(100, 'tail'));
+  assert.equal(toasts().length, 1);
+  assert.equal(toasts()[0].getAttribute('title'), '700 runs need attention');
+
+  responder = (kind, payload) => (kind === 'processInstanceListRequest' ? { instances: payload.hasIncident ? [run('x', 1)] : [], total: 1, hasMore: false } : {});
+  toasts()[0].querySelector('tf-button').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  await flush();
+  assert.ok(calls.some((call) => call.payload.hasIncident === true && call.payload.scope === 'Mine'), 'the list opened on Needs attention');
+  assert.equal(document.querySelector('tf-segmented[data-filter]').getAttribute('value'), 'attention');
+});
+
+test('a malformed summary is not a toast', async () => {
+  await showProcessIncidentNotice({ ...summary(5, 'bad'), linkJson: JSON.stringify({ summary: true, count: 'many' }) });
+  assert.equal(toasts().length, 0);
+});
+
+test('the attention view says it shows the most recent runs when a scope has more', async () => {
+  responder = (kind, payload) => (kind === 'processInstanceListRequest'
+    ? { instances: payload.hasIncident ? [run(`r-${payload.scope}`, 1)] : [], total: 500, hasMore: payload.hasIncident } : {});
+  const win = await openProcessInstances(null, { attention: true });
+  await flush();
+  assert.equal(win.querySelector('[data-attention-count]').textContent, 'Showing the most recent runs that need attention: 2');
 });

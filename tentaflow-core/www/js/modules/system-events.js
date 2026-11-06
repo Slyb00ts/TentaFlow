@@ -102,10 +102,33 @@ const seenNotices = new Set();
 function incidentLink(ev) {
   try {
     const link = JSON.parse(ev.linkJson);
+    if (link?.summary === true && Number.isInteger(link.count) && link.count > 0) return link;
     return typeof link?.instanceId === 'string' && typeof link.code === 'string' ? link : null;
   } catch {
     return null;
   }
+}
+
+// A mass failure arrives as a few summaries; they merge into one toast that
+// counts every run since it was last dismissed, so the screen never fills up.
+let summaryToast = null;
+let summaryCount = 0;
+
+function showSummary(link, monitor) {
+  summaryCount = summaryToast?.isConnected ? summaryCount + link.count : link.count;
+  summaryToast?.remove();
+  summaryToast = TfToast.show({
+    tone: 'warning',
+    title: I18n.t('bpmn.instances_attention_count', { count: summaryCount }),
+    duration: NOTICE_TOAST_MS,
+    action: {
+      label: I18n.t('bpmn.instances_filter_attention'),
+      onClick: (shown) => {
+        shown.dismiss();
+        monitor.openProcessInstances(null, { attention: true });
+      },
+    },
+  });
 }
 
 // The server sends the incident code and ids, never text: the sentence is built
@@ -118,6 +141,10 @@ export async function showProcessIncidentNotice(ev) {
   seenNotices.add(ev.notificationId);
   if (seenNotices.size > NOTICE_MEMORY) seenNotices.delete(seenNotices.values().next().value);
   const monitor = await import('/js/modules/flows-builder/process-monitor.js');
+  if (link.summary) {
+    showSummary(link, monitor);
+    return true;
+  }
   const sentence = link.code === 'TIMER_ERROR'
     ? I18n.t('bpmn.incident_generic')
     : monitor.processIncidentText({ code: link.code, message: '' });

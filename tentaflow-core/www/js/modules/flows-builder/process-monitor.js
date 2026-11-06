@@ -401,14 +401,15 @@ function incidentSentence(incident, redacted) {
   return incident.code === 'TIMER_ERROR' ? text('incident_generic') : processIncidentText({ ...incident, message: '' });
 }
 
-export async function openProcessInstances(definitionId = null) {
+export async function openProcessInstances(definitionId = null, { attention: startWithAttention = false } = {}) {
   const win = readWindow(text('instances'), 'clock');
   let offset = 0;
   let generation = 0;
-  let attention = false;
+  let attention = startWithAttention;
   let attentionRows = [];
+  let attentionMore = false;
   const host = win.querySelector('[data-content]');
-  host.innerHTML = `<div class="tf-toolbar"><tf-segmented data-filter size="sm" value="all" aria-label="${escapeAttr(text('instances_filter_label'))}">
+  host.innerHTML = `<div class="tf-toolbar"><tf-segmented data-filter size="sm" value="${attention ? 'attention' : 'all'}" aria-label="${escapeAttr(text('instances_filter_label'))}">
       <option value="all">${escapeHtml(text('instances_filter_all'))}</option><option value="attention">${escapeHtml(text('instances_filter_attention'))}</option></tf-segmented>
     <span class="tf-toolbar-spacer"></span><span data-attention-count hidden></span></div>
     <tf-table data-instances empty-message="${escapeAttr(text('instances_empty'))}" page-size="25" page="1">
@@ -440,12 +441,14 @@ export async function openProcessInstances(definitionId = null) {
             { definitionId, offset: 0, limit: ATTENTION_PAGE, hasIncident: true, scope }));
           if (!win.isConnected || current !== generation) return;
           attentionRows = found.instances;
+          attentionMore = found.more;
         }
         table.setAttribute('total', String(attentionRows.length));
         table.setAttribute('page', String(offset / 25 + 1));
         table.rows = attentionRows.slice(offset, offset + 25).map(row);
-        count.textContent = attentionRows.length
-          ? text('instances_attention_count', { count: attentionRows.length }) : text('instances_attention_empty');
+        count.textContent = !attentionRows.length ? text('instances_attention_empty')
+          : attentionMore ? text('instances_attention_more', { count: attentionRows.length })
+            : text('instances_attention_count', { count: attentionRows.length });
         count.hidden = false;
         return;
       }

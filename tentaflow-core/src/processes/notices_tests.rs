@@ -6,7 +6,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use tentaflow_protocol::processes::ActivityVerification;
 use tentaflow_protocol::SystemEventPayload;
 
-use super::notices::{deliver_pending, INCIDENT_NOTICE_KIND};
+use super::notices::{deliver_pending, INCIDENT_NOTICE_KIND, PASS_SIZE, SINGLE_NOTICE_LIMIT};
 use super::repository::{self, ProcessActor};
 use super::runtime::test_support::*;
 
@@ -224,7 +224,7 @@ fn fail_second_incident(fixture: &Fixture) {
 }
 
 #[tokio::test]
-async fn every_incident_is_its_own_notice_and_a_replayed_queue_insert_changes_nothing() {
+async fn every_incident_is_its_own_notice() {
     let fixture = Fixture::new();
     failed_instance(&fixture, "first");
     let pushed = Pushed::new();
@@ -243,13 +243,6 @@ async fn every_incident_is_its_own_notice_and_a_replayed_queue_insert_changes_no
         })
         .collect();
     assert_ne!(ids[0], ids[1]);
-
-    // The race of a second raise queueing the same pair loses to the primary key.
-    let changed = fixture.db.write().unwrap().execute(
-        "INSERT OR IGNORE INTO bpmn_incident_notices(incident_id,user_id,queued_at_ms) SELECT incident_id,user_id,0 FROM bpmn_incident_notices", [],
-    ).unwrap();
-    assert_eq!(changed, 0);
-    assert_eq!(pushed.deliver(&fixture), 0);
 }
 
 #[tokio::test]
@@ -459,4 +452,249 @@ async fn nothing_is_queued_or_pushed_inside_a_private_simulation_database() {
         1,
         "the trigger queues nothing there"
     );
+}
+
+fn open_instance(fixture: &Fixture) -> tentaflow_protocol::processes::ProcessInstance {
+    start_model(fixture, &user_model(Some(&fixture.participant.user_id)))
+}
+
+fn link_of(event: &SystemEventPayload) -> serde_json::Value {
+    let SystemEventPayload::UserNotification { link_json, .. } = event else {
+        panic!("not a notification")
+    };
+    serde_json::from_str(link_json).unwrap()
+}
+
+#[test]
+fn an_idle_pass_never_takes_the_writer_lock_even_with_a_big_settled_table() {
+    let fixture = Fixture::new();
+    let started = open_instance(&fixture);
+    {
+        let conn = fixture.db.write().unwrap();
+        conn.execute("PRAGMA foreign_keys=OFF", []).unwrap();
+        for index in 0..3000 {
+            conn.execute(
+                "INSERT INTO bpmn_incident_notices(incident_id,user_id,queued_at_ms,notified_at_ms,suppressed) VALUES(?1,?2,1,2,0)",
+                rusqlite::params![format!("settled-{index}"), started.instance_id],
+            ).unwrap();
+        }
+        conn.execute("PRAGMA foreign_keys=ON", []).unwrap();
+    }
+    let writer = fixture.db.write().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let db = fixture.db.clone();
+    let worker = std::thread::spawn(move || {
+        sender
+            .send(deliver_pending(&db, 1, &|_| panic!("nothing is pending")).unwrap())
+            .unwrap();
+    });
+    let pushed = receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("an idle pass must not wait for the writer lock");
+    assert_eq!(pushed, 0);
+    drop(writer);
+    worker.join().unwrap();
+}
+
+#[test]
+fn notices_leave_with_their_incident_and_instance() {
+    let fixture = Fixture::new();
+    let started = open_instance(&fixture);
+    raise_incident(&fixture, &started.instance_id);
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM bpmn_incident_notices"),
+        1
+    );
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute("DELETE FROM bpmn_incidents", [])
+        .unwrap();
+    assert_eq!(
+        count(&fixture, "SELECT COUNT(*) FROM bpmn_incident_notices"),
+        0
+    );
+}
+
+#[test]
+fn a_recipient_who_fails_the_check_does_not_hold_back_the_next_one() {
+    let fixture = Fixture::new();
+    let steward = member(&fixture, "steward", "role-org-viewer");
+    let started = open_instance(&fixture);
+    move_definition_to(&fixture, &started.definition_id, &steward);
+    raise_incident(&fixture, &started.instance_id);
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute(
+            "UPDATE user_accounts SET is_active=0 WHERE id=?1",
+            [&fixture.owner.user_id],
+        )
+        .unwrap();
+    let pushed = Pushed::new();
+    assert_eq!(pushed.deliver(&fixture), 1);
+    assert_eq!(pushed.users(), vec![steward.user_id.clone()]);
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM bpmn_incident_notices WHERE notified_at_ms IS NULL"
+        ),
+        0
+    );
+}
+
+/// Behaviour on purpose: a notice is addressed to the owner at the time of the
+/// incident. When the definition changes hands before delivery the previous
+/// owner no longer reads the run and is not paged, and the new owner is not
+/// paged for an incident that predates the transfer; the attention list is
+/// where the new owner finds it.
+#[test]
+fn a_definition_that_changes_hands_after_queueing_pages_neither_owner() {
+    let fixture = Fixture::new();
+    let first = member(&fixture, "first-owner", "role-org-viewer");
+    let second = member(&fixture, "second-owner", "role-org-viewer");
+    let started = open_instance(&fixture);
+    move_definition_to(&fixture, &started.definition_id, &first);
+    raise_incident(&fixture, &started.instance_id);
+    move_definition_to(&fixture, &started.definition_id, &second);
+
+    let pushed = Pushed::new();
+    assert_eq!(pushed.deliver(&fixture), 1);
+    assert_eq!(
+        pushed.users(),
+        vec![fixture.owner.user_id.clone()],
+        "only the initiator is paged"
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM bpmn_incident_notices WHERE suppressed=1"
+        ),
+        1
+    );
+}
+
+#[test]
+fn a_recipient_of_a_suspended_organization_is_not_paged() {
+    let fixture = Fixture::new();
+    let started = open_instance(&fixture);
+    raise_incident(&fixture, &started.instance_id);
+    fixture
+        .db
+        .write()
+        .unwrap()
+        .execute("UPDATE organizations SET status='suspended'", [])
+        .unwrap();
+    let pushed = Pushed::new();
+    assert_eq!(pushed.deliver(&fixture), 0);
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM bpmn_incident_notices WHERE suppressed=1"
+        ),
+        1
+    );
+}
+
+#[test]
+fn an_incident_in_an_organization_the_dashboard_does_not_open_is_not_paged() {
+    let fixture = Fixture::new();
+    let started = open_instance(&fixture);
+    let other = crate::services::org::repo::create_organization(
+        &fixture.db,
+        "Other",
+        "other-org",
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    crate::services::org::repo::add_membership(
+        &fixture.db,
+        &other.org_id,
+        &fixture.owner.user_id,
+        "role-org-viewer",
+        &fixture.owner.user_id,
+    )
+    .unwrap();
+    {
+        let conn = fixture.db.write().unwrap();
+        conn.execute("PRAGMA foreign_keys=OFF", []).unwrap();
+        conn.execute("UPDATE bpmn_instances SET org_id=?1", [&other.org_id])
+            .unwrap();
+        conn.execute("UPDATE bpmn_definitions SET org_id=?1", [&other.org_id])
+            .unwrap();
+        conn.execute("PRAGMA foreign_keys=ON", []).unwrap();
+    }
+    raise_incident(&fixture, &started.instance_id);
+    let pushed = Pushed::new();
+    assert_eq!(
+        pushed.deliver(&fixture),
+        0,
+        "the toast could only lead to a not-found run"
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM bpmn_incident_notices WHERE suppressed=1"
+        ),
+        1
+    );
+}
+
+#[test]
+fn a_mass_failure_is_a_few_summaries_not_a_toast_per_run() {
+    let fixture = Fixture::new();
+    let started = open_instance(&fixture);
+    let total = PASS_SIZE as usize * 2 + 100;
+    for _ in 0..total {
+        raise_incident(&fixture, &started.instance_id);
+    }
+    let pushed = Pushed::new();
+    let mut passes = 0;
+    while pushed.deliver(&fixture) > 0 {
+        passes += 1;
+    }
+    assert_eq!(
+        passes, 3,
+        "more than one pass drains a backlog larger than a pass"
+    );
+    let events = pushed.0.borrow();
+    assert_eq!(events.len(), 3);
+    let summed: u64 = events
+        .iter()
+        .map(|event| {
+            let link = link_of(event);
+            assert_eq!(link["summary"], true);
+            assert!(link.get("instanceId").is_none() && link.get("code").is_none());
+            link["count"].as_u64().unwrap()
+        })
+        .sum();
+    assert_eq!(summed as usize, total);
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM bpmn_incident_notices WHERE notified_at_ms IS NULL"
+        ),
+        0
+    );
+}
+
+#[test]
+fn a_few_incidents_in_one_pass_are_still_individual_notices() {
+    let fixture = Fixture::new();
+    let started = open_instance(&fixture);
+    for _ in 0..SINGLE_NOTICE_LIMIT {
+        raise_incident(&fixture, &started.instance_id);
+    }
+    let pushed = Pushed::new();
+    assert_eq!(pushed.deliver(&fixture), SINGLE_NOTICE_LIMIT);
+    assert!(pushed
+        .0
+        .borrow()
+        .iter()
+        .all(|event| link_of(event)["instanceId"] == started.instance_id));
 }

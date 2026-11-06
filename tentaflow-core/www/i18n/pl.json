@@ -15734,6 +15734,7 @@
     "instances_filter_all": "Wszystkie wykonania",
     "instances_filter_attention": "Wymagają uwagi",
     "instances_attention_count": "{count} {count|wykonanie wymaga uwagi|wykonania wymagają uwagi|wykonań wymaga uwagi}",
+    "instances_attention_more": "Pokazano najnowsze wykonania wymagające uwagi: {count}",
     "instances_attention_empty": "Żadne wykonanie nie wymaga uwagi",
     "open_instance": "Otwórz wykonanie",
     "status": "Stan",
