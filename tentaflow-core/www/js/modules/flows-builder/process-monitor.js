@@ -14,7 +14,7 @@ import '/js/components/tf-input.js';
 import '/js/components/tf-textarea.js';
 import '/js/components/tf-toggle.js';
 import '/js/components/tf-segmented.js';
-import { mountProcessDiagram } from './process-diagram.js';
+import { mountProcessDiagram, readInstanceModel } from './process-diagram.js';
 
 const text = (key, values) => I18n.t(`bpmn.${key}`, values);
 const date = (ms, timeZone) => new Date(ms).toLocaleString(I18n.getLanguage(), timeZone ? { timeZone } : undefined);
@@ -635,13 +635,13 @@ export async function openProcessInstance(instanceId, initial = null) {
   // A boundary timer reports the id of the task it hangs on; the model of the
   // running version names it. The version is read once per instance version.
   async function readAttachedNames() {
-    const key = `${instance.definitionId}:${instance.version}`;
+    const key = `${instanceId}:${instance.version}`;
     if (attached.key === key) return;
     attached.key = key;
     try {
-      const response = await ApiBinary.one('processVersionGetRequest', { definitionId: instance.definitionId, version: instance.version });
+      const model = await readInstanceModel(instanceId, instance.version);
       if (!win.isConnected) return;
-      attached.names = processElementNames(response.version.model);
+      attached.names = processElementNames(model);
     } catch (_) {
       attached.names = new Map();
     }
@@ -998,6 +998,7 @@ export async function openProcessInstance(instanceId, initial = null) {
     openInstance: (id) => openProcessInstance(id),
     inspectIncident: (incidentId) => { showView('list', { remember: false }); selectedIncidentId = incidentId; refresh(); },
     completeTask: (task) => complete(task),
+    showDetails: () => showView('list'),
     incidentText: (incident) => incidentSentence(incident, instance.variablesRedacted),
   } });
   host.querySelector('[data-view]').addEventListener('change', (event) => showView(event.detail.value));

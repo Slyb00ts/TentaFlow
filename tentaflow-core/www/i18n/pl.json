@@ -17214,12 +17214,21 @@
     "diagram_inside": "W środku: {count} {count|token|tokeny|tokenów}",
     "diagram_open_scope": "Otwórz podproces",
     "diagram_incident_unloaded": "Na tym elemencie jest otwarty incydent.",
-    "diagram_truncated": "Ten przebieg jest długi. Diagram oznacza tylko część jego drogi, więc niektórych przebytych elementów i przepływów może brakować.",
+    "diagram_truncated": "Ten przebieg jest długi. Diagram oznacza tylko część jego drogi, więc niektórych przebytych elementów i przepływów może brakować, a gdy aktywnych tokenów jest ponad 2000, część z nich również nie jest pokazana.",
     "diagram_loading": "Wczytywanie diagramu…",
     "redacted_notice": "Twoja rola pokazuje, gdzie jest przebieg i na co czeka, ale nie wartości, na których pracuje.",
     "redacted_value": "Ukryte dla Twojej roli",
     "variable_types": "Zmienne i ich typy",
-    "event_redacted": "Zapisany krok przy elemencie {node}. Szczegóły są ukryte dla Twojej roli."
+    "event_redacted": "Zapisany krok przy elemencie {node}. Szczegóły są ukryte dla Twojej roli.",
+    "diagram_error_generic": "Nie udało się odświeżyć diagramu. Za chwilę nastąpi kolejna próba.",
+    "diagram_scope_ended": "Ta część procesu się zakończyła, więc nie jest już odświeżana.",
+    "diagram_scope_back": "Wróć do diagramu nadrzędnego",
+    "diagram_unknown_elements": "{count} {count|token znajduje się|tokeny znajdują się|tokenów znajduje się} na elementach, których nie ma w tym diagramie, więc nie można ich narysować.",
+    "diagram_show_details": "Pokaż w szczegółach",
+    "diagram_message_name": "Komunikat: {name}",
+    "diagram_correlation": "Korelacja: {key}",
+    "diagram_edge_taken": "Przepływ przebyty",
+    "diagram_edge_not_taken": "Przepływ nieprzebyty"
   },
   "gestures": {
     "wave": "machanie",

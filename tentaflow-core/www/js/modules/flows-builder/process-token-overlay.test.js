@@ -20,7 +20,7 @@ const { I18n } = await import('../../i18n.js');
 const { emptyProcessModel, processTemplates } = await import('./bpmn.js');
 const { FlowCanvas } = await import('./canvas.js');
 const overlay = await import('./process-token-overlay.js');
-const { ascendTo, buildTokenOverlay, canvasOverlay, createTokenFeed, drillInto, instanceIsTerminal, isCoordinatorToken, repeatingNodeIds, tokenWaitKind, trailPath } = overlay;
+const { ascendTo, buildTokenOverlay, canvasOverlay, createTokenFeed, drillInto, instanceIsTerminal, isCoordinatorToken, repeatingNodeIds, scopeHasEnded, tokenWaitKind, trailPath, unknownElementIds } = overlay;
 localStorage.setItem('tentaflow_lang', 'en');
 await I18n.init();
 after(() => window.happyDOM?.close?.());
@@ -345,6 +345,78 @@ test('the canvas draws counts, tones and taken edges without rebuilding the elem
     assert.equal(element().querySelector('.fb-runtime-badge'), null);
     assert.equal(element().getAttribute('aria-label'), base);
     assert.ok(!root.classList.contains('fb-runtime'));
+  } finally {
+    canvas.destroy();
+  }
+});
+
+test('occurrences of one element are listed in the order they were issued', () => {
+  const view = buildTokenOverlay(answer([
+    token('Review', { occurrence: { groupId: 'g', ordinal: 2 }, wait: { Job: { jobId: 'a' } } }),
+    token('Review', { occurrence: { groupId: 'g', ordinal: 0 }, wait: { Job: { jobId: 'b' } } }),
+    token('Review', { occurrence: { groupId: 'g', ordinal: 1 }, wait: { Job: { jobId: 'c' } } }),
+  ]));
+  assert.deepEqual(view.nodes.get('Review').tokens.map((item) => item.occurrence.ordinal), [0, 1, 2]);
+});
+
+test('tokens on elements the shown body lacks are reported by id', () => {
+  const view = buildTokenOverlay(answer([token('Review', { wait: 'Gateway' }), token('Ghost', { wait: 'Gateway' })]));
+  assert.deepEqual(unknownElementIds(view, { nodes: [{ id: 'Review' }] }), ['Ghost']);
+  assert.deepEqual(unknownElementIds(view, { nodes: [{ id: 'Review' }, { id: 'Ghost' }] }), []);
+});
+
+test('a scope with no live token ends, unless the answer was cut', () => {
+  assert.equal(scopeHasEnded(answer([])), true);
+  assert.equal(scopeHasEnded(answer([token('A')])), false);
+  assert.equal(scopeHasEnded(answer([], { truncated: true })), false);
+});
+
+test('a retired scope is never read again, by the clock, a poke or a restart', async () => {
+  const { feed, time, requests } = feedWith(() => answer([]));
+  feed.setScope('dead');
+  feed.start();
+  await settle();
+  assert.equal(requests.length, 1);
+  feed.retire('dead');
+  assert.equal(time.pending, 0);
+  feed.poke();
+  feed.start();
+  await settle();
+  assert.equal(requests.length, 1, 'retired');
+  feed.setScope(null);
+  await settle();
+  assert.equal(requests.length, 2, 'another scope reads normally');
+  assert.equal(time.pending, 1);
+  feed.dispose();
+});
+
+test('the canvas names every flow tab stop as taken or not taken and trims a closing full stop', async () => {
+  const model = emptyProcessModel();
+  const root = document.createElement('div');
+  document.body.append(root);
+  const canvas = new FlowCanvas(root, { mode: 'bpmn', readOnly: true });
+  try {
+    canvas.setTemplates(processTemplates());
+    const data = structuredClone(model);
+    data.nodes[0].name = 'Begin.';
+    canvas.setData(data);
+    const first = data.nodes[0].id;
+    const edgeId = data.sequenceFlows[0].id;
+    const hit = () => canvas.svg.querySelector(`.fb-edge-hit[data-edge-id="${edgeId}"]`);
+    const base = hit().getAttribute('aria-label');
+    const draw = (taken) => canvas.setRuntimeOverlay({
+      nodes: new Map([[first, { count: 1, tone: 'active', icon: 'play', label: '1 token' }]]),
+      takenEdgeIds: new Set(taken), visitedNodeIds: new Set(), edgeTakenLabel: 'Flow taken', edgeNotTakenLabel: 'Flow not taken',
+    });
+    draw([]);
+    assert.equal(hit().getAttribute('aria-label'), `${base}. Flow not taken`);
+    draw([edgeId]);
+    assert.equal(hit().getAttribute('aria-label'), `${base}. Flow taken`);
+    canvas._renderEdges();
+    assert.equal(hit().getAttribute('aria-label'), `${base}. Flow taken`, 'a redrawn edge keeps its state');
+    assert.doesNotMatch(canvas.nodesLayer.querySelector(`[data-node-id="${first}"]`).getAttribute('aria-label'), /\.\./);
+    canvas.setRuntimeOverlay(null);
+    assert.equal(hit().getAttribute('aria-label'), base);
   } finally {
     canvas.destroy();
   }

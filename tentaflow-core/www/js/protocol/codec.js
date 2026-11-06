@@ -1027,6 +1027,7 @@ function processRequestBody(variant, payload) {
     InstanceListRequest: ['definitionId', 'offset', 'limit', 'version', 'status', 'hasIncident', 'scope'],
     InstanceGetRequest: ['instanceId', 'pages'],
     InstanceTokensGetRequest: ['instanceId', 'scopeId', 'ifRevision'],
+    InstanceModelGetRequest: ['instanceId'],
     UserTaskGetRequest: ['instanceId', 'userTaskId'],
     UserTaskCompleteRequest: ['commandId', 'instanceId', 'userTaskId', 'expectedRevision', 'outputs', 'approved'],
     ManualTaskAcknowledgeRequest: ['commandId', 'instanceId', 'userTaskId', 'expectedRevision'],
@@ -1144,6 +1145,15 @@ export const encode = {
    */
   processInstanceTokensGetRequest(correlationId, payload, sequence = 1) {
     return processFrame(correlationId, sequence, 'InstanceTokensGetRequest', payload);
+  },
+  /**
+   * ProcessPayload::InstanceModelGetRequest — the model an instance is pinned to, for its diagram.
+   * payload: { instanceId }. Answers { version, model, structureOnly }: the definition owner gets
+   * the model as published, every other reader a structural projection (ids, names, kinds, flows,
+   * geometry; no expressions, scripts, mappings or settings).
+   */
+  processInstanceModelGetRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'InstanceModelGetRequest', payload);
   },
   processUserTaskGetRequest(correlationId, payload, sequence = 1) {
     return processFrame(correlationId, sequence, 'UserTaskGetRequest', payload);

@@ -698,3 +698,45 @@ fn a_call_a_timer_a_message_and_a_boundary_host_each_report_their_wait() {
     assert!(matches!(view.tokens[0].wait, Some(ProcessTokenWait::UserTask { .. })),
         "the person outranks the deadline armed beside them");
 }
+
+#[test]
+fn the_pinned_model_goes_whole_to_its_owner_and_structure_only_to_every_other_reader() {
+    let fixture = Fixture::new();
+    let started = waiting_instance(&fixture);
+    let monitor = member(&fixture, "auditor", "role-org-admin");
+    let stranger = member(&fixture, "stranger", "role-org-viewer");
+    let steward = member(&fixture, "steward", "role-org-viewer");
+    let read = |actor: &ProcessActor| repository::get_instance_model(&fixture.db, actor, &started.instance_id);
+
+    // The initiator who also owns the definition sees the model as published.
+    let (version, whole, structure_only) = read(&fixture.owner).unwrap();
+    assert_eq!((version, structure_only), (started.version, false));
+    let whole_json = serde_json::to_string(&whole).unwrap();
+    assert!(whole_json.contains("outputs.answer") && whole_json.contains("hunter2"));
+
+    for (label, reader) in [("monitor", &monitor), ("assignee", &fixture.participant)] {
+        let (version, model, structure_only) = read(reader).unwrap_or_else(|error| panic!("{label}: {error}"));
+        assert_eq!((version, structure_only), (started.version, true), "{label}");
+        let json = serde_json::to_string(&model).unwrap();
+        assert!(!json.contains("outputs.answer") && !json.contains("hunter2"), "{label}: {json}");
+        assert!(model.variables.is_empty(), "{label}");
+        assert_eq!(model.nodes.iter().map(|node| node.id.as_str()).collect::<Vec<_>>(),
+            whole.nodes.iter().map(|node| node.id.as_str()).collect::<Vec<_>>(), "{label}");
+        assert_eq!(model.diagram, whole.diagram, "{label}");
+    }
+
+    // An owner who did not start the instance still gets the whole model, and
+    // the former owner (now only the initiator) gets the projection.
+    move_definition_to(&fixture, &started.definition_id, &steward);
+    assert!(!read(&steward).unwrap().2);
+    assert!(read(&fixture.owner).unwrap().2);
+
+    assert!(is_not_found(&read(&stranger).unwrap_err()));
+    let other_org = ProcessActor {
+        org_id: "organization-that-does-not-exist".into(),
+        user_id: fixture.owner.user_id.clone(),
+    };
+    assert!(read(&other_org).is_err());
+    let missing = repository::get_instance_model(&fixture.db, &monitor, "no-such-instance").unwrap_err();
+    assert!(is_not_found(&missing), "{missing}");
+}

@@ -73,7 +73,14 @@ test.beforeAll(async ({ browser }, testInfo) => {
         commandId: crypto.randomUUID(), definitionId: saved.definition.definitionId, expectedRevision: saved.definition.draftRevision });
       return { id: saved.definition.definitionId, processId: model.processId };
     };
-    const user = (id, name) => ({ id, name, kind: { UserTask: { assigneeUserId: null, outputMapping: {} } } });
+    const user = (id, name, assignee = null, outputMapping = {}) => ({ id, name, kind: { UserTask: { assigneeUserId: assignee, outputMapping } } });
+    const account = async (username, password, role) => {
+      const created = await ApiBinary.action('iamCreateUserRequest', { username, password, displayName: username, email: '', role, groupIds: [] });
+      return created.userId;
+    };
+    const monitorId = await account('b4monitor', 'Monitor-pass-w0rd-1', 'admin');
+    const workerId = await account('b4worker', 'Worker-pass-w0rd-1', 'user');
+    await account('b4stranger', 'Stranger-pass-w0rd-1', 'user');
 
     const single = await create('B4 overlay user task', finish(build([user('Review', 'Review order')])));
 
@@ -100,7 +107,9 @@ test.beforeAll(async ({ browser }, testInfo) => {
     const blocked = await create('B4 overlay incident', finish(build([
       { id: 'Gate', name: 'Big order?', kind: { ExclusiveGateway: { defaultFlowId: null } } }],
     { flows: [['Start', 'Gate'], ['Gate', 'End', 'vars.big == true']], variables: { big: false } })));
-    return { single, parallel, nested, blocked };
+    const assigned = await create('B4 overlay assigned', finish(build([
+      user('Assigned', 'Check the contract', workerId, { verdict: 'outputs.secret_verdict' })], { variables: { customer: 'private-customer' } })));
+    return { single, parallel, nested, blocked, assigned, monitorId, workerId };
   });
   await page.close();
 });
@@ -281,6 +290,64 @@ test('a gateway with no matching path shows its incident on the element and in w
   expect(errors, diagnostics(errors, proc)).toEqual([]);
 });
 
+async function otherReader(browser, username, password) {
+  const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1400, height: 1000 } });
+  const page = await context.newPage();
+  await loginAsAdmin(page, { port: PORT, username, password });
+  return { page, context };
+}
+
+test('a reader who does not own the definition still gets the diagram with its tokens, and only its structure', async ({ page, browser }) => {
+  test.setTimeout(240000);
+  const errors = collectConsoleErrors(page);
+  await loginAsAdmin(page, { port: PORT });
+  const instanceId = await startRun(page, ids.assigned, { customer: 'private-customer' });
+  const modelOf = (reader) => reader.evaluate(async (id) => {
+    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+    try {
+      const response = await ApiBinary.one('processInstanceModelGetRequest', { instanceId: id });
+      return { structureOnly: response.structureOnly, text: JSON.stringify(response.model) };
+    } catch (error) { return { refused: String(error.message) }; }
+  }, instanceId);
+
+  // The owner reads the model as published.
+  const whole = await modelOf(page);
+  expect(whole.structureOnly).toBe(false);
+  expect(whole.text).toContain('outputs.secret_verdict');
+
+  for (const [username, password, canComplete] of [['b4monitor', 'Monitor-pass-w0rd-1', false], ['b4worker', 'Worker-pass-w0rd-1', true]]) {
+    const reader = await otherReader(browser, username, password);
+    try {
+      const readerErrors = collectConsoleErrors(reader.page);
+      const projected = await modelOf(reader.page);
+      expect(projected.structureOnly, username).toBe(true);
+      expect(projected.text, username).toContain('Check the contract');
+      expect(projected.text, username).not.toContain('secret_verdict');
+      expect(projected.text, username).not.toContain(ids.workerId);
+
+      const win = await openDiagram(reader.page, instanceId);
+      await expect(node(win, 'Assigned')).toHaveClass(/fb-node--token-waiting/, { timeout: 15000 });
+      await expect(badge(win, 'Assigned').locator('b')).toHaveText('1');
+      await expect(win.locator('.fb-process-diagram tf-alert[tone="danger"]')).toHaveCount(0);
+      await node(win, 'Assigned').click();
+      const panel = win.locator('.fb-diagram-panel');
+      await expect(panel).toContainText('Check the contract');
+      await expect(panel.locator('tf-button button', { hasText: 'Complete work' })).toHaveCount(canComplete ? 1 : 0, { timeout: 15000 });
+      if (username === 'b4monitor') await expect(win.locator('.fb-process-diagram')).toContainText('not the values it works with');
+      expect(readerErrors, diagnostics(readerErrors, proc)).toEqual([]);
+    } finally { await reader.context.close(); }
+  }
+
+  // A member who is neither initiator, owner, assignee nor monitor learns nothing about the instance.
+  const stranger = await otherReader(browser, 'b4stranger', 'Stranger-pass-w0rd-1');
+  try {
+    const refused = await modelOf(stranger.page);
+    expect(refused.refused).toBeTruthy();
+    expect(refused.text).toBeUndefined();
+  } finally { await stranger.context.close(); }
+  expect(errors, diagnostics(errors, proc)).toEqual([]);
+});
+
 test.describe('narrow screen, keyboard and reduced motion', () => {
   test.use({ viewport: { width: 390, height: 800 } });
 
@@ -308,6 +375,24 @@ test.describe('narrow screen, keyboard and reduced motion', () => {
     await page.keyboard.press('Enter');
     await expect(win.locator('.fb-diagram-panel')).toContainText('Held at a gateway');
     await expect(node(win, 'Gate')).toBeFocused();
+    expect(errors, diagnostics(errors, proc)).toEqual([]);
+  });
+
+  test('a fork and join opens whole on a phone, with Join and End inside the stage', async ({ page }) => {
+    test.setTimeout(120000);
+    const errors = collectConsoleErrors(page);
+    await loginAsAdmin(page, { port: PORT });
+    const win = await openDiagram(page, await startRun(page, ids.parallel));
+    await expect(node(win, 'TaskA')).toHaveClass(/fb-node--token-waiting/, { timeout: 15000 });
+    const inside = await page.evaluate(() => {
+      const window = document.querySelector('tf-window.fb-process-window:last-of-type');
+      const stage = window.querySelector('.fb-diagram-stage').getBoundingClientRect();
+      return ['Start', 'Fork', 'TaskA', 'TaskB', 'Join', 'End'].map((id) => {
+        const box = window.querySelector(`.fb-canvas .fb-node[data-node-id="${id}"]`).getBoundingClientRect();
+        return { id, left: box.left >= stage.left - 1, right: box.right <= stage.right + 1, top: box.top >= stage.top - 1, bottom: box.bottom <= stage.bottom + 1 };
+      });
+    });
+    for (const box of inside) expect(box, JSON.stringify(box)).toEqual({ id: box.id, left: true, right: true, top: true, bottom: true });
     expect(errors, diagnostics(errors, proc)).toEqual([]);
   });
 });

@@ -867,6 +867,11 @@ pub fn process_dispatch(
                 truncated: view.truncated,
             }
         }
+        P::InstanceModelGetRequest { instance_id } => {
+            let (version, model, structure_only) =
+                repository::get_instance_model(pool, &actor, instance_id).map_err(error)?;
+            P::InstanceModelGetResponse { version, model, structure_only }
+        }
         P::UserTaskGetRequest {
             instance_id,
             user_task_id,
@@ -1272,6 +1277,7 @@ pub fn process_dispatch(
         | P::InstanceListResponse { .. }
         | P::InstanceGetResponse { .. }
         | P::InstanceTokensGetResponse { .. }
+        | P::InstanceModelGetResponse { .. }
         | P::ScopeGetResponse { .. }
         | P::UserTaskGetResponse { .. }
         | P::ManualTaskAcknowledgeResponse { .. }
@@ -1325,6 +1331,7 @@ register_request!("ProcessInstanceListRequest");
 register_request!("ProcessInstanceGetRequest");
 register_request!("ProcessScopeGetRequest");
 register_request!("ProcessInstanceTokensGetRequest");
+register_request!("ProcessInstanceModelGetRequest");
 register_request!("ProcessUserTaskGetRequest");
 register_request!("ProcessUserTaskCompleteRequest");
 register_request!("ProcessManualTaskAcknowledgeRequest");
@@ -4106,6 +4113,19 @@ mod tests {
         else { panic!("not modified answer expected") };
         assert!(not_modified && live.is_empty());
         assert_eq!(refused(&viewer_ctx, tokens(None)).await.code, ProtocolErrorCode::NotFound);
+
+        let model = || P::InstanceModelGetRequest { instance_id: instance.instance_id.clone() };
+        let P::InstanceModelGetResponse { structure_only, model: seen, version } =
+            request(&auditor_ctx, model()).await
+        else { panic!("monitor model expected") };
+        assert!(structure_only && version == instance.version);
+        assert!(!serde_json::to_string(&seen).unwrap().contains("private text"));
+        let P::InstanceModelGetResponse { structure_only, model: whole, .. } =
+            request(&owner_ctx, model()).await
+        else { panic!("owner model expected") };
+        assert!(!structure_only);
+        assert!(serde_json::to_string(&whole).unwrap().contains("private text"));
+        assert_eq!(refused(&viewer_ctx, model()).await.code, ProtocolErrorCode::NotFound);
 
         let P::ScopeGetResponse { variables, variables_redacted, .. } = request(&auditor_ctx,
             P::ScopeGetRequest { instance_id: instance.instance_id.clone(),

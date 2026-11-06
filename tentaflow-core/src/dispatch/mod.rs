@@ -2907,6 +2907,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 P::ScopeGetResponse { .. } => "ProcessScopeGetResponse",
                 P::InstanceTokensGetRequest { .. } => "ProcessInstanceTokensGetRequest",
                 P::InstanceTokensGetResponse { .. } => "ProcessInstanceTokensGetResponse",
+                P::InstanceModelGetRequest { .. } => "ProcessInstanceModelGetRequest",
+                P::InstanceModelGetResponse { .. } => "ProcessInstanceModelGetResponse",
                 P::SimulationStartRequest { .. } => "ProcessSimulationStartRequest",
                 P::SimulationStartResponse { .. } => "ProcessSimulationStartResponse",
                 P::SimulationViewRequest { .. } => "ProcessSimulationViewRequest",

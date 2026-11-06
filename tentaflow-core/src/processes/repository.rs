@@ -6400,6 +6400,31 @@ pub fn get_instance_tokens(
     })
 }
 
+/// The model an instance is pinned to, for the diagram of its monitor. Any
+/// reader of the instance passes the same gate as the token view; only the
+/// owner of the definition receives the model as published, everyone else
+/// receives its structural projection (see `structure`).
+pub fn get_instance_model(
+    pool: &DbPool,
+    actor: &ProcessActor,
+    instance_id: &str,
+) -> Result<(u32, ProcessModel, bool)> {
+    read_snapshot(pool, |conn| {
+        require_actor(conn, actor)?;
+        instance_access_on(conn, actor, instance_id, AccessReach::Observers)?;
+        let (definition_id, version): (String, u32) = conn.query_row(
+            "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1 AND org_id=?2",
+            params![instance_id, actor.org_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let model = version_on(conn, &definition_id, version)?.model;
+        if actor_owns_on(conn, actor, &definition_id)? {
+            return Ok((version, model, false));
+        }
+        Ok((version, super::structure::structural_projection(&model), true))
+    })
+}
+
 const TOKEN_VIEW_WIRE_BUDGET: usize = 900 * 1024;
 
 fn token_view_frame_len(view: &ProcessInstanceTokens) -> Result<usize> {

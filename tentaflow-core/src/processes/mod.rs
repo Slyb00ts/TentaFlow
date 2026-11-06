@@ -14,6 +14,7 @@ pub mod repository;
 pub mod runtime;
 pub mod simulation;
 pub mod simulation_schema;
+pub mod structure;
 pub mod timers;
 pub mod tool_host;
 pub mod verification;

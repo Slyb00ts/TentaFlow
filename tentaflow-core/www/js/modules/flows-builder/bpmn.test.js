@@ -6316,7 +6316,7 @@ test('all five locales render boundary cancellation truth and preserve arbitrary
   const current = instance('boundary-empty-name', { timers: [{ ...savedTimer({ kind: 'Boundary', nodeName: '' }), attachedToId: 'n_review_a1b2' }] });
   const named = emptyProcessModel();
   named.nodes.push({ id: 'n_review_a1b2', name: 'Check documents', kind: { UserTask: { assigneeUserId: null, outputMapping: {} } } });
-  const win = await monitor(current, { processVersionGetRequest: { version: { model: named }, startCatalog: [] } });
+  const win = await monitor(current, { processInstanceModelGetRequest: { version: 2, model: named, structureOnly: false } });
   await flush(2);
   assert.ok(win.querySelector('[data-timers]').textContent.includes(I18n.t('bpmn.node_boundary_timer')));
   assert.ok(win.querySelector('[data-timers]').textContent.includes('Check documents'));
@@ -6329,7 +6329,7 @@ test('a boundary timer names its attached activity in five locales, escaped, and
   const modelWith = (name) => {
     const model = emptyProcessModel();
     model.nodes.push({ id: 'Review_1', name, kind: { UserTask: { assigneeUserId: null, outputMapping: {} } } });
-    return { version: { model }, startCatalog: [] };
+    return { version: 2, model, structureOnly: false };
   };
   try {
     for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
@@ -6340,7 +6340,7 @@ test('a boundary timer names its attached activity in five locales, escaped, and
       panel.show(boundary, graph.templates.get(boundary.type));
       assert.equal(panel.root.querySelector('[data-process="attachedToId"]').getAttribute('label'), captions[language]);
       const timer = savedTimer({ kind: 'Boundary', nodeName: 'Deadline', attachedToId: 'Review_1' });
-      const win = await monitor(instance(`boundary-id-${language}`, { timers: [timer] }), { processVersionGetRequest: modelWith('Check documents') });
+      const win = await monitor(instance(`boundary-id-${language}`, { timers: [timer] }), { processInstanceModelGetRequest: modelWith('Check documents') });
       await flush(2);
       const terms = [...win.querySelectorAll('[data-timers] dt')].map((term) => term.textContent);
       const values = [...win.querySelectorAll('[data-timers] dd')].map((value) => value.textContent);
@@ -6353,7 +6353,7 @@ test('a boundary timer names its attached activity in five locales, escaped, and
     await I18n.setLanguage('en');
     const untrusted = '<img src=x onerror=alert(1)>';
     const timer = savedTimer({ kind: 'Boundary', attachedToId: 'Review_1', totalFirings: null });
-    const win = await monitor(instance('boundary-escaped-name', { timers: [timer] }), { processVersionGetRequest: modelWith(untrusted) });
+    const win = await monitor(instance('boundary-escaped-name', { timers: [timer] }), { processInstanceModelGetRequest: modelWith(untrusted) });
     await flush(2);
     const values = [...win.querySelectorAll('[data-timers] dd')].map((value) => value.textContent);
     assert.deepEqual(values, ['3', untrusted]);
@@ -9201,8 +9201,8 @@ test('the diagram view draws the tokens of a run, reads conditionally and stops 
   try {
     const model = runModel(); let revision = 11;
     const reads = [];
-    const win = await monitor(instance('instance-one', { revision, definitionId: 'definition-d1' }), {
-      processVersionGetRequest: { version: { version: 2, model } },
+    const win = await monitor(instance('instance-d1', { revision, definitionId: 'definition-d1' }), {
+      processInstanceModelGetRequest: { version: 2, model, structureOnly: false },
       processInstanceTokensGetRequest: (payload) => { reads.push(payload); return payload.ifRevision === revision
         ? tokens(model, { instanceRevision: revision, notModified: true })
         : tokens(model, { instanceRevision: revision, tokens: [waitingToken('Review', { UserTask: { userTaskId: 'u1' } })], takenEdgeIds: ['F1'], visitedNodeIds: ['Start', 'Review'] }); },
@@ -9226,7 +9226,7 @@ test('the diagram view draws the tokens of a run, reads conditionally and stops 
 
     // The run changes: the window reads again, with the revision it holds.
     revision = 12;
-    fixtures({ processInstanceGetRequest: { instance: instance('instance-one', { revision, definitionId: 'definition-d1' }) }, processVersionGetRequest: { version: { version: 2, model } },
+    fixtures({ processInstanceGetRequest: { instance: instance('instance-d1', { revision, definitionId: 'definition-d1' }) }, processInstanceModelGetRequest: { version: 2, model, structureOnly: false },
       processInstanceTokensGetRequest: (payload) => { reads.push(payload); return tokens(model, { instanceRevision: revision, tokens: [] , visitedNodeIds: ['Start', 'Review', 'End'] }); } });
     await poll(); await flush(30);
     assert.equal(reads.at(-1).ifRevision, 11);
@@ -9242,8 +9242,8 @@ test('the diagram view reads a finished run once and schedules nothing', async (
   const timers = recordTimers();
   try {
     const model = runModel(); let reads = 0;
-    const win = await monitor(instance('instance-one', { status: 'Completed', definitionId: 'definition-d2' }), {
-      processVersionGetRequest: { version: { version: 2, model } },
+    const win = await monitor(instance('instance-d2', { status: 'Completed', definitionId: 'definition-d2' }), {
+      processInstanceModelGetRequest: { version: 2, model, structureOnly: false },
       processInstanceTokensGetRequest: () => { reads += 1; return tokens(model, { visitedNodeIds: ['Start', 'Review', 'End'], takenEdgeIds: ['F1', 'F2'] }); },
     });
     change(win.querySelector('[data-view]'), 'diagram'); await flush(30);
@@ -9258,8 +9258,8 @@ test('a sub-process token opens the sub-process diagram, the breadcrumb leads ba
   const timers = recordTimers();
   try {
     const model = runModel({ nested: true }); const reads = [];
-    const win = await monitor(instance('instance-one', { definitionId: 'definition-d3' }), {
-      processVersionGetRequest: { version: { version: 2, model } },
+    const win = await monitor(instance('instance-d3', { definitionId: 'definition-d3' }), {
+      processInstanceModelGetRequest: { version: 2, model, structureOnly: false },
       processInstanceTokensGetRequest: (payload) => {
         reads.push(payload);
         if (payload.scopeId === 'child-scope') return tokens(model, { tokens: [waitingToken('InTask', { UserTask: { userTaskId: 'u9' } }, { scopeId: 'child-scope' })], takenEdgeIds: ['InF1'] });
@@ -9294,10 +9294,10 @@ test('a reader without access to values sees a notice, types instead of values a
   const timers = recordTimers();
   try {
     const model = runModel();
-    const incident = { incidentId: 'inc-1', nodeId: 'Review', nodeName: 'Review order', scopeId: 'instance-one', jobId: null, code: 'TIMER_ERROR', message: 'TIMER_ERROR', atMs: 1, canRetry: false };
-    const win = await monitor(instance('instance-one', { definitionId: 'definition-d4', access: 'Monitor', variablesRedacted: true, variables: { total: 'number' }, incidents: [incident],
+    const incident = { incidentId: 'inc-1', nodeId: 'Review', nodeName: 'Review order', scopeId: 'instance-d4', jobId: null, code: 'TIMER_ERROR', message: 'TIMER_ERROR', atMs: 1, canRetry: false };
+    const win = await monitor(instance('instance-d4', { definitionId: 'definition-d4', access: 'Monitor', variablesRedacted: true, variables: { total: 'number' }, incidents: [incident],
       subscriptions: [{ subscriptionId: 's1', kind: 'MessageCatch', nodeId: 'Review', nodeName: 'Wait for reply', messageName: 'Reply', status: 'Open' }] }), {
-      processVersionGetRequest: { version: { version: 2, model } },
+      processInstanceModelGetRequest: { version: 2, model, structureOnly: false },
       processInstanceTokensGetRequest: tokens(model, { tokens: [waitingToken('Review', 'Gateway', { incidentIds: ['inc-1'] })] }),
       processHistoryRequest: { events: [{ seq: 1, atMs: 1000, kind: 'repetition_occurrence_started', nodeName: 'Review order', data: null }], nextSeq: 1, hasMore: false, dataRedacted: true },
     });
@@ -9321,8 +9321,8 @@ test('every wait kind has its own wording in the panel and a repetition shows ho
   const timers = recordTimers();
   try {
     const model = runModel();
-    const win = await monitor(instance('instance-one', { definitionId: 'definition-d5', repetitionGroups: [{ groupId: 'g1', nodeId: 'Review', nodeName: 'Review order', scopeId: 'instance-one', mode: 'Parallel', status: 'active', total: 5, completed: 1, createdCount: 3 }] }), {
-      processVersionGetRequest: { version: { version: 2, model } },
+    const win = await monitor(instance('instance-d5', { definitionId: 'definition-d5', repetitionGroups: [{ groupId: 'g1', nodeId: 'Review', nodeName: 'Review order', scopeId: 'instance-d5', mode: 'Parallel', status: 'active', total: 5, completed: 1, createdCount: 3 }] }), {
+      processInstanceModelGetRequest: { version: 2, model, structureOnly: false },
       processInstanceTokensGetRequest: tokens(model, { tokens: [
         { ...waitingToken('Review', undefined), status: 'Ready' },
         waitingToken('Review', { Job: { jobId: 'j1' } }, { tokenId: 'o1', occurrence: { groupId: 'g1', ordinal: 0 } }),
@@ -9339,6 +9339,180 @@ test('every wait kind has its own wording in the panel and a repetition shows ho
     assert.match(panel, /Service step in progress/); assert.match(panel, /Waiting for a timer/);
     assert.match(panel, /Due /);
     assert.equal(win.querySelectorAll('.fb-diagram-token').length, 2);
+    win.remove();
+  } finally { timers.stop(); }
+});
+
+test('the diagram reads the pinned model of the instance, never the definition, so a reader who does not own it still gets it', async () => {
+  const timers = recordTimers();
+  try {
+    const model = runModel();
+    const win = await monitor(instance('instance-d6', { definitionId: 'definition-d6', access: 'Assignee' }), {
+      processInstanceModelGetRequest: { version: 2, model, structureOnly: true },
+      processVersionGetRequest: () => { throw new Error('process definition not found'); },
+      processInstanceTokensGetRequest: tokens(model, { tokens: [waitingToken('Review', { UserTask: { userTaskId: 'u1' } })], takenEdgeIds: ['F1'] }),
+    });
+    change(win.querySelector('[data-view]'), 'diagram'); await flush(30);
+    assert.ok(elementOf(win, 'Review').classList.contains('fb-node--token-waiting'));
+    const asked = calls.filter((row) => row.kind === 'processInstanceModelGetRequest');
+    assert.equal(asked.length, 1, 'one read, shared by the diagram and the timer names');
+    assert.deepEqual(asked[0].payload, { instanceId: 'instance-d6' });
+    assert.equal(calls.some((row) => row.kind === 'processVersionGetRequest'), false);
+    assert.equal(win.querySelector('.fb-process-diagram tf-alert[tone="danger"]'), null);
+    win.remove();
+  } finally { timers.stop(); }
+});
+
+test('a failed read shows a plain sentence, never the raw error, and the notice goes when a later read works', async () => {
+  const timers = recordTimers();
+  try {
+    const model = runModel(); let mode = 'ok'; let revision = 11;
+    const win = await monitor(instance('instance-d7', { definitionId: 'definition-d7', revision: 11 }), {
+      processInstanceGetRequest: () => ({ instance: instance('instance-d7', { definitionId: 'definition-d7', revision }) }),
+      processInstanceModelGetRequest: { version: 2, model, structureOnly: false },
+      processInstanceTokensGetRequest: (payload) => {
+        if (mode === 'fail') throw new Error('protocol error NotFound: process resource not found');
+        return payload.ifRevision === 11 ? tokens(model, { notModified: true }) : tokens(model, { tokens: [waitingToken('Review', { UserTask: { userTaskId: 'u1' } })] });
+      },
+    });
+    change(win.querySelector('[data-view]'), 'diagram'); await flush(30);
+    const danger = () => win.querySelector('.fb-process-diagram tf-alert[tone="danger"]');
+    assert.equal(danger(), null);
+    mode = 'fail'; revision = 12; await poll(); await flush(30);
+    assert.match(danger().getAttribute('message'), /could not be refreshed/);
+    assert.doesNotMatch(danger().getAttribute('message'), /protocol error|NotFound/);
+    mode = 'ok'; revision = 13; await poll(); await flush(30);
+    assert.equal(danger(), null, 'a read that is not modified still clears the failure');
+    win.remove();
+  } finally { timers.stop(); }
+});
+
+test('a task beyond the first page of the snapshot is fetched by id, so its panel row still offers the work', async () => {
+  const timers = recordTimers();
+  try {
+    const model = runModel();
+    const summaries = Array.from({ length: 20 }, (_, index) => ({ userTaskId: `u${index + 1}`, nodeId: 'Review', name: 'Review order', kind: 'Work', status: 'Open', canComplete: true, revision: 1, scopeId: 'instance-d8' }));
+    const waits = Array.from({ length: 24 }, (_, index) => waitingToken('Review', { UserTask: { userTaskId: `u${index + 1}` } }, { tokenId: `t${index + 1}` }));
+    const win = await monitor(instance('instance-d8', { definitionId: 'definition-d8', userTasks: summaries }), {
+      processInstanceModelGetRequest: { version: 2, model, structureOnly: false },
+      processInstanceTokensGetRequest: tokens(model, { tokens: waits }),
+      processUserTaskGetRequest: (payload) => ({ task: { userTaskId: payload.userTaskId, nodeId: 'Review', name: 'Review order', kind: 'Work', status: 'Open', canComplete: payload.userTaskId === 'u24', revision: 1, scopeId: 'instance-d8' } }),
+    });
+    change(win.querySelector('[data-view]'), 'diagram'); await flush(30);
+    click(elementOf(win, 'Review')); await flush(30);
+    const rows = [...win.querySelectorAll('.fb-diagram-token')];
+    assert.equal(rows.length, 24);
+    const label = (row) => row.querySelector('tf-button')?.textContent ?? '';
+    assert.match(label(rows.find((row) => row.dataset.tokenId === 't3')), /Complete work/);
+    assert.match(label(rows.find((row) => row.dataset.tokenId === 't24')), /Complete work/, 'fetched by id');
+    assert.equal(label(rows.find((row) => row.dataset.tokenId === 't22')), '', 'the fetched task says it cannot be completed');
+    const fetched = calls.filter((row) => row.kind === 'processUserTaskGetRequest').map((row) => row.payload.userTaskId).sort();
+    assert.deepEqual(fetched, ['u21', 'u22', 'u23', 'u24'], 'only what the first page lacks is fetched, once');
+    win.remove();
+  } finally { timers.stop(); }
+});
+
+test('tokens on an element the model lacks are announced, not silently dropped', async () => {
+  const timers = recordTimers();
+  try {
+    const model = runModel();
+    const win = await monitor(instance('instance-d9', { definitionId: 'definition-d9' }), {
+      processInstanceModelGetRequest: { version: 2, model, structureOnly: false },
+      processInstanceTokensGetRequest: tokens(model, { tokens: [waitingToken('Ghost', 'Gateway'), waitingToken('Review', { UserTask: { userTaskId: 'u1' } })] }),
+    });
+    change(win.querySelector('[data-view]'), 'diagram'); await flush(30);
+    const notices = [...win.querySelectorAll('.fb-process-diagram tf-alert')].map((alert) => alert.getAttribute('message'));
+    assert.ok(notices.some((message) => /1 token is on elements this diagram does not contain/.test(message)), notices.join('|'));
+    win.remove();
+  } finally { timers.stop(); }
+});
+
+test('a drilled scope that ended says so, is no longer read and leads back to the parent', async () => {
+  const timers = recordTimers();
+  try {
+    const model = runModel({ nested: true }); const reads = [];
+    const win = await monitor(instance('instance-d10', { definitionId: 'definition-d10' }), {
+      processInstanceModelGetRequest: { version: 2, model, structureOnly: false },
+      processInstanceTokensGetRequest: (payload) => {
+        reads.push(payload);
+        if (payload.scopeId === 'child-scope') return tokens(model, { tokens: [], takenEdgeIds: ['InF1', 'InF2'], visitedNodeIds: ['InStart', 'InTask', 'InEnd'] });
+        return tokens(model, { tokens: [waitingToken('Sub_1', { Scope: { scopeId: 'child-scope', activeTokens: 1 } })] });
+      },
+    });
+    change(win.querySelector('[data-view]'), 'diagram'); await flush(30);
+    click(elementOf(win, 'Sub_1')); await flush(3);
+    click([...win.querySelectorAll('.fb-diagram-panel tf-button')].find((button) => /Open subprocess/.test(button.textContent))); await flush(30);
+    const ended = () => [...win.querySelectorAll('.fb-process-diagram tf-alert')].some((alert) => /has ended/.test(alert.getAttribute('message')));
+    assert.ok(ended());
+    const childReads = () => reads.filter((read) => read.scopeId === 'child-scope').length;
+    const before = childReads();
+    await poll(); await flush(30);
+    assert.equal(childReads(), before, 'the dead scope is not read again');
+    assert.equal(timers.pending(), 0, 'nothing is scheduled for it');
+    const back = win.querySelector('.fb-diagram-body').parentElement.querySelector('[data-notices] tf-button');
+    click(back); await flush(30);
+    assert.equal(win.querySelector('[data-trail]').hidden, true);
+    assert.ok(elementOf(win, 'Sub_1'));
+    assert.equal(ended(), false);
+    win.remove();
+  } finally { timers.stop(); }
+});
+
+test('a message wait names the message and the correlation, or says the correlation is hidden for the role', async () => {
+  const timers = recordTimers();
+  try {
+    const model = runModel();
+    const subscription = { subscriptionId: 's1', kind: 'MessageCatch', nodeId: 'Review', nodeName: 'Review order', messageName: 'Reply', correlationKey: 'K-9', status: 'Open' };
+    const waits = tokens(model, { tokens: [waitingToken('Review', { Message: { subscriptionId: 's1' } })], takenEdgeIds: ['F1'] });
+    const open = async (id, overrides) => {
+      const win = await monitor(instance(id, { definitionId: `definition-${id}`, subscriptions: [subscription], ...overrides }), {
+        processInstanceModelGetRequest: { version: 2, model, structureOnly: false }, processInstanceTokensGetRequest: waits });
+      change(win.querySelector('[data-view]'), 'diagram'); await flush(30);
+      click(elementOf(win, 'Review')); await flush(3);
+      return win;
+    };
+    const plain = await open('instance-d11a', {});
+    assert.match(plain.querySelector('.fb-diagram-panel').textContent, /Message: Reply/);
+    assert.match(plain.querySelector('.fb-diagram-panel').textContent, /Correlation: K-9/);
+    assert.equal(plain.querySelector('.fb-edge-hit[data-edge-id="F1"]').getAttribute('aria-label').endsWith('Flow taken'), true);
+    assert.match(plain.querySelector('.fb-edge-hit[data-edge-id="F2"]').getAttribute('aria-label'), /\. Flow not taken$/);
+    plain.remove(); await flush(3);
+    const hidden = await open('instance-d11b', { access: 'Monitor', variablesRedacted: true, subscriptions: [{ ...subscription, correlationKey: null }] });
+    assert.match(hidden.querySelector('.fb-diagram-panel').textContent, /Correlation: Hidden for your role/);
+    assert.doesNotMatch(hidden.querySelector('.fb-diagram-panel').textContent, /K-9/);
+    hidden.remove();
+  } finally { timers.stop(); }
+});
+
+test('a long diagram opens centred on the tokens and a short one fits whole', () => {
+  const model = runModel();
+  model.diagram.shapes.find((shape) => shape.elementId === 'End').x = 6000;
+  const graph = canvas(model);
+  graph.root.getBoundingClientRect = () => ({ left: 0, top: 0, width: 350, height: 400 });
+  graph.fitRuntime(new Set(['Review']));
+  assert.equal(graph.view.zoom, 1);
+  assert.equal(graph.view.x, 350 / 2 - 210, 'the token element is horizontally centred');
+  assert.equal(graph.view.y, 400 / 2 - 188, 'and vertically');
+  graph.fitRuntime(new Set(['Review']), 0.01);
+  assert.ok(graph.view.zoom > 0.01 && graph.view.zoom < 0.2, 'the whole content when it stays above the comfortable zoom');
+  graph.fitRuntime(new Set(), 0.45);
+  assert.equal(graph.view.zoom, 0.45, 'nothing to centre on keeps a legible overview');
+  graph.destroy();
+});
+
+test('an element label with a closing full stop gets no doubled one from the overlay', async () => {
+  const timers = recordTimers();
+  try {
+    const model = runModel();
+    model.nodes.find((node) => node.id === 'Review').name = 'Review order.';
+    const win = await monitor(instance('instance-d13', { definitionId: 'definition-d13' }), {
+      processInstanceModelGetRequest: { version: 2, model, structureOnly: false },
+      processInstanceTokensGetRequest: tokens(model, { tokens: [waitingToken('Review', { UserTask: { userTaskId: 'u1' } })] }),
+    });
+    change(win.querySelector('[data-view]'), 'diagram'); await flush(30);
+    const label = elementOf(win, 'Review').getAttribute('aria-label');
+    assert.match(label, /Review order\. 1 token/);
+    assert.doesNotMatch(label, /\.\./);
     win.remove();
   } finally { timers.stop(); }
 });

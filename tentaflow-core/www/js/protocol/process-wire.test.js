@@ -1376,6 +1376,23 @@ test('token view response decodes waits, occurrences and the not-modified answer
   assert.deepEqual(cachedAnswer.takenEdgeIds, []);
 });
 
+test('instance model request encodes the id and the response decodes the projection flag', { skip }, () => {
+  const encoded = request('processInstanceModelGetRequest', { instanceId: 'i1' });
+  assert.equal(encoded._variant, 'ProcessBody.InstanceModelGetRequest');
+  assert.equal(encoded.instanceId, 'i1');
+  assert.throws(() => request('processInstanceModelGetRequest', {}), /requires instanceId/);
+
+  const decoded = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: { InstanceModelGetResponse: {
+    version: 3, structure_only: true,
+    model: { schema_version: 1, process_id: 'Process_1', nodes: [{ id: 'Start_1', name: 'Start', kind: 'Start' }],
+      sequence_flows: [], variables: {}, diagram: { shapes: [], edges: [] } } } } })));
+  assert.equal(decoded._variant, 'ProcessBody.InstanceModelGetResponse');
+  assert.equal(decoded.version, 3);
+  assert.equal(decoded.structureOnly, true);
+  assert.equal(decoded.model.processId, 'Process_1');
+  assert.equal(decoded.model.nodes[0].id, 'Start_1');
+});
+
 test('monitor answers carry the access ground and the redaction flags only when set', { skip }, () => {
   const decodeInstance = (extra) => wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
     InstanceGetResponse: { instance: {

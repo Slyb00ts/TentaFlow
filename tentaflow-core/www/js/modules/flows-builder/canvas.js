@@ -2349,7 +2349,7 @@ export class FlowCanvas {
         continue;
       }
       if (!('baseLabel' in element.dataset)) element.dataset.baseLabel = element.getAttribute('aria-label') || '';
-      element.setAttribute('aria-label', `${element.dataset.baseLabel}. ${entry.label}`);
+      element.setAttribute('aria-label', `${element.dataset.baseLabel.replace(/[.\s]+$/u, '')}. ${entry.label}`);
       const signature = `${entry.tone}|${entry.count}|${entry.icon}|${entry.label}`;
       if (badge?.dataset.signature === signature) continue;
       badge?.remove();
@@ -2367,10 +2367,41 @@ export class FlowCanvas {
 
   _applyRuntimeEdges() {
     if (this.mode !== 'bpmn' || !this.svg) return;
-    const taken = this.runtimeOverlay?.takenEdgeIds;
+    const overlay = this.runtimeOverlay;
+    const taken = overlay?.takenEdgeIds;
     for (const path of this.svg.querySelectorAll('.fb-edge-path')) {
       path.classList.toggle('fb-edge--taken', !!taken?.has(path.dataset.edgeId));
     }
+    // The stroke alone says nothing to a screen reader: the tab stop names the state.
+    for (const hit of this.svg.querySelectorAll('.fb-edge-hit')) {
+      if (!('baseLabel' in hit.dataset)) hit.dataset.baseLabel = hit.getAttribute('aria-label') || '';
+      const state = overlay ? (taken.has(hit.dataset.edgeId) ? overlay.edgeTakenLabel : overlay.edgeNotTakenLabel) : '';
+      hit.setAttribute('aria-label', state ? `${hit.dataset.baseLabel.replace(/[.\s]+$/u, '')}. ${state}` : hit.dataset.baseLabel);
+    }
+  }
+
+  /**
+   * Frames a running diagram once: the whole of it when it stays legible
+   * (`comfortableZoom`), else centred on the elements holding tokens so a long
+   * process opens where the work is, not at its top-left corner.
+   */
+  fitRuntime(focusIds, comfortableZoom = 0.45) {
+    this._layoutProcessLabels();
+    const bounds = this._contentBounds();
+    const rect = this.root.getBoundingClientRect();
+    if (!bounds || !(rect.width > 0) || !(rect.height > 0)) { this.fitToContent(comfortableZoom); return; }
+    const usableHeight = rect.height - this._bottomInset(rect);
+    const pad = CONTENT_MARGIN;
+    const fit = Math.min(1, rect.width / (bounds.maxX - bounds.minX + pad * 2), usableHeight / (bounds.maxY - bounds.minY + pad * 2));
+    const focus = this.nodes.filter((node) => focusIds.has(node.id));
+    if (fit >= comfortableZoom || focus.length === 0) { this.fitToContent(comfortableZoom); return; }
+    const minX = Math.min(...focus.map((node) => node.x)), maxX = Math.max(...focus.map((node) => node.x + node.width));
+    const minY = Math.min(...focus.map((node) => node.y)), maxY = Math.max(...focus.map((node) => node.y + node.height));
+    const zoom = Math.min(1, Math.max(READABLE_MIN_ZOOM, Math.min(rect.width / (maxX - minX + pad * 2), usableHeight / (maxY - minY + pad * 2))));
+    this.view.zoom = zoom;
+    this.view.x = rect.width / 2 - (minX + maxX) / 2 * zoom;
+    this.view.y = usableHeight / 2 - (minY + maxY) / 2 * zoom;
+    this._applyView();
   }
 
   _processWarningText(node, key) {

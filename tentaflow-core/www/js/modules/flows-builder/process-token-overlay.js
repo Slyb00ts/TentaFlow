@@ -66,6 +66,8 @@ export function buildTokenOverlay(response, { repeatingNodeIds = new Set() } = {
     if (token.occurrence != null) entry.occurrenceCount += 1;
   }
   for (const entry of nodes.values()) {
+    // Occurrences read in the order they were issued, whatever order the wait gave them.
+    entry.tokens.sort((left, right) => (left.occurrence?.ordinal ?? -1) - (right.occurrence?.ordinal ?? -1));
     entry.kinds.sort((left, right) => WAIT_ORDER.indexOf(left) - WAIT_ORDER.indexOf(right));
     // A sub-process token is only the door; the work is the tokens inside it.
     entry.displayCount = entry.kinds.includes('Scope') ? entry.inside + entry.tokens.filter((token) => token.kind !== 'Scope').length : entry.count;
@@ -100,7 +102,28 @@ export function canvasOverlay(overlay, translate) {
       label: parts.join('. '),
     });
   }
-  return { nodes, takenEdgeIds: overlay.takenEdgeIds, visitedNodeIds: overlay.visitedNodeIds };
+  return {
+    nodes, takenEdgeIds: overlay.takenEdgeIds, visitedNodeIds: overlay.visitedNodeIds,
+    edgeTakenLabel: translate('diagram_edge_taken'), edgeNotTakenLabel: translate('diagram_edge_not_taken'),
+  };
+}
+
+/**
+ * Elements that hold tokens but are not in the model body shown: a version the
+ * overlay does not match (after a migration, say). They cannot be drawn, so the
+ * caller says so instead of showing a quiet diagram.
+ */
+export function unknownElementIds(overlay, body) {
+  const known = new Set((body?.nodes ?? []).map((node) => node.id));
+  return [...overlay.nodes.keys()].filter((nodeId) => !known.has(nodeId));
+}
+
+/**
+ * A drilled scope with no live token and no truncation is over: the run left
+ * it. A scope the engine keeps always holds at least one token while it runs.
+ */
+export function scopeHasEnded(response) {
+  return !response.truncated && (response.tokens ?? []).length === 0;
 }
 
 /** Ids of the elements of a model body that repeat. */
@@ -139,15 +162,16 @@ export function createTokenFeed({ instanceId, request, isTerminal, onOverlay, on
   let rerun = false;
   let running = false;
   let disposed = false;
+  const retired = new Set();
   const keyOf = (scope) => `${instanceId}|${scope ?? ''}`;
 
   function schedule() {
     clearTimer(timer);
-    timer = running && !disposed ? setTimer(() => { timer = null; read(); }, interval) : null;
+    timer = running && !disposed && !retired.has(scopeId) ? setTimer(() => { timer = null; read(); }, interval) : null;
   }
 
   async function read() {
-    if (disposed || !running) return;
+    if (disposed || !running || retired.has(scopeId)) return;
     if (inFlight) { rerun = true; return; }
     inFlight = true;
     const scope = scopeId;
@@ -196,6 +220,8 @@ export function createTokenFeed({ instanceId, request, isTerminal, onOverlay, on
       if (cached) onOverlay(cached.response, { fresh: false });
       if (running) { clearTimer(timer); timer = null; read(); }
     },
+    /** A scope the run has left is never read again; its last answer stays cached. */
+    retire(scope) { retired.add(scope ?? null); if (scope === scopeId) { clearTimer(timer); timer = null; } },
     get scopeId() { return scopeId; },
     get running() { return running; },
     cached: (scope) => cache.get(keyOf(scope))?.response ?? null,

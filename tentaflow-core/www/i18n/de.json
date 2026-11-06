@@ -16076,12 +16076,21 @@
     "diagram_inside": "{count} {count|Token|Token} darin",
     "diagram_open_scope": "Teilprozess öffnen",
     "diagram_incident_unloaded": "Auf diesem Element ist ein Vorfall offen.",
-    "diagram_truncated": "Dieser Ablauf ist lang. Das Diagramm markiert nur einen Teil seines Wegs, daher können durchlaufene Elemente und Flüsse fehlen.",
+    "diagram_truncated": "Dieser Ablauf ist lang. Das Diagramm markiert nur einen Teil seines Wegs, daher können durchlaufene Elemente und Flüsse fehlen; bei mehr als 2000 aktiven Token wird außerdem ein Teil davon nicht angezeigt.",
     "diagram_loading": "Diagramm wird geladen…",
     "redacted_notice": "Ihre Rolle zeigt, wo ein Ablauf steht und worauf er wartet, nicht aber die Werte, mit denen er arbeitet.",
     "redacted_value": "Für Ihre Rolle verborgen",
     "variable_types": "Variablen und ihre Typen",
-    "event_redacted": "Schritt bei {node} aufgezeichnet. Details sind für Ihre Rolle verborgen."
+    "event_redacted": "Schritt bei {node} aufgezeichnet. Details sind für Ihre Rolle verborgen.",
+    "diagram_error_generic": "Das Diagramm konnte nicht aktualisiert werden. Ein neuer Versuch folgt in Kürze.",
+    "diagram_scope_ended": "Dieser Teil des Prozesses ist beendet und wird nicht mehr aktualisiert.",
+    "diagram_scope_back": "Zurück zum übergeordneten Diagramm",
+    "diagram_unknown_elements": "{count} {count|Token liegt|Token liegen} auf Elementen, die dieses Diagramm nicht enthält, und {count|kann|können} nicht gezeichnet werden.",
+    "diagram_show_details": "In den Details anzeigen",
+    "diagram_message_name": "Nachricht: {name}",
+    "diagram_correlation": "Korrelation: {key}",
+    "diagram_edge_taken": "Fluss durchlaufen",
+    "diagram_edge_not_taken": "Fluss nicht durchlaufen"
   },
   "gestures": {
     "wave": "Winken",

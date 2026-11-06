@@ -2657,6 +2657,17 @@ pub enum ProcessPayload {
         visited_node_ids: Vec<String>,
         truncated: bool,
     },
+    /// The model pinned by an instance, for the diagram of its monitor. The
+    /// definition owner receives the model as published; any other reader of
+    /// the instance receives its structural projection (`structure_only`).
+    InstanceModelGetRequest {
+        instance_id: String,
+    },
+    InstanceModelGetResponse {
+        version: u32,
+        model: ProcessModel,
+        structure_only: bool,
+    },
 }
 
 #[cfg(test)]
@@ -3910,6 +3921,17 @@ mod tests {
     }
 
     #[test]
+    fn instance_model_variants_are_appended_and_tagged_by_name() {
+        let request = ProcessPayload::InstanceModelGetRequest { instance_id: "i".into() };
+        assert_eq!(serde_json::to_value(&request).unwrap(),
+            serde_json::json!({"InstanceModelGetRequest": {"instance_id": "i"}}));
+        let bytes = crate::cbor::encode(&request).unwrap();
+        let name = b"InstanceModelGetRequest";
+        assert!(bytes.windows(name.len()).any(|window| window == name));
+        assert_eq!(crate::cbor::decode::<ProcessPayload>(&bytes).unwrap(), request);
+    }
+
+    #[test]
     fn instance_tokens_variants_are_appended_and_tagged_by_name() {
         let request = ProcessPayload::InstanceTokensGetRequest {
             instance_id: "i".into(), scope_id: None, if_revision: Some(7),
@@ -3939,7 +3961,9 @@ mod tests {
             response);
         let json = serde_json::to_value(&token).unwrap();
         assert_eq!(json["incident_ids"], serde_json::json!([]));
-        assert!(json.get("occurrence").is_none());
+        assert_eq!(json["occurrence"], serde_json::json!({"group_id": "g", "ordinal": 1}));
+        let bare = ProcessTokenView { occurrence: None, ..token.clone() };
+        assert!(serde_json::to_value(&bare).unwrap().get("occurrence").is_none());
         assert_eq!(json["wait"], serde_json::json!({"Scope": {"scope_id": "child", "active_tokens": 2}}));
         let mut unknown = json;
         unknown["surprise"] = serde_json::json!(1);

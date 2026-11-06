@@ -17214,12 +17214,21 @@
     "diagram_inside": "{count} {count|token|tokens} inside",
     "diagram_open_scope": "Open subprocess",
     "diagram_incident_unloaded": "An incident is open on this element.",
-    "diagram_truncated": "This run is long. The diagram marks only part of its path, so some passed elements and flows may be missing.",
+    "diagram_truncated": "This run is long. The diagram marks only part of its path, so some passed elements and flows may be missing, and when more than 2000 tokens are live, some of them are not shown either.",
     "diagram_loading": "Loading the diagram…",
     "redacted_notice": "Your role shows where a run is and what it waits for, not the values it works with.",
     "redacted_value": "Hidden for your role",
     "variable_types": "Variables and their types",
-    "event_redacted": "Step recorded at {node}. Details are hidden for your role."
+    "event_redacted": "Step recorded at {node}. Details are hidden for your role.",
+    "diagram_error_generic": "The diagram could not be refreshed. It will try again shortly.",
+    "diagram_scope_ended": "This part of the process has ended, so it is no longer updated.",
+    "diagram_scope_back": "Back to the parent diagram",
+    "diagram_unknown_elements": "{count} {count|token is|tokens are} on elements this diagram does not contain, so they cannot be drawn.",
+    "diagram_show_details": "Show in Details",
+    "diagram_message_name": "Message: {name}",
+    "diagram_correlation": "Correlation: {key}",
+    "diagram_edge_taken": "Flow taken",
+    "diagram_edge_not_taken": "Flow not taken"
   },
   "gestures": {
     "wave": "wave",
