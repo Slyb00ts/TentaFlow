@@ -20,12 +20,20 @@ const REASON_KEYS = {
   ExecutionUnavailable: 'retry_denied_execution_unavailable',
   OutputRetryLimit: 'retry_denied_output_retry_limit',
   ResultNotRetained: 'retry_denied_result_not_retained',
+  VariablesUnchanged: 'retry_denied_variables_unchanged',
 };
 
 // Two of the failures a repeat would meet again have a cause the reader can act on, so they get their own sentence.
 const SAME_FAILURE_BY_CODE = {
   TOKEN_QUOTA_EXCEEDED: 'retry_denied_quota',
   TOOL_PERMISSION_DENIED: 'retry_denied_permission',
+};
+
+// Applying a saved result again is not running the step in anyone's name, so these three say what is actually asked.
+export const OUTPUT_REASON_KEYS = {
+  ViewOnly: 'retry_denied_view_only_output',
+  InitiatorNotOwner: 'retry_denied_initiator_not_owner_output',
+  InitiatorUnavailable: 'retry_denied_initiator_unavailable_output',
 };
 
 export const RETRY_REASONS = Object.keys(REASON_KEYS);
@@ -51,6 +59,9 @@ export function retryRefusal(incident) {
   if (retryOffered(incident)) return null;
   const retry = incident.retry;
   if (retry?.deniedReason === 'SameFailureRepeats' && SAME_FAILURE_BY_CODE[incident.code]) return text(SAME_FAILURE_BY_CODE[incident.code]);
-  if (retry?.deniedReason) return text(REASON_KEYS[retry.deniedReason] ?? 'retry_denied_generic');
+  if (retry?.deniedReason) {
+    const keys = retry.kind === 'OutputMapping' ? { ...REASON_KEYS, ...OUTPUT_REASON_KEYS } : REASON_KEYS;
+    return text(keys[retry.deniedReason] ?? 'retry_denied_generic');
+  }
   return null;
 }

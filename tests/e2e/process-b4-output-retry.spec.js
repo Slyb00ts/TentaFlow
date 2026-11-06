@@ -52,7 +52,7 @@ test.beforeAll(async ({ browser }, testInfo) => {
     await ApiBinary.action('flowUpdateRequest', { flowId, status: 'active' });
     const model = emptyProcessModel();
     model.targetNamespace = 'urn:b45:output';
-    model.variables = { divisor: 0, ratio: null };
+    model.variables = { divisor: 0, noise: 0, ratio: null };
     model.nodes = [
       model.nodes[0],
       { id: 'Service_1', name: 'Check contract', kind: { ServiceTask: { flowId, inputMapping: {}, outputMapping: { ratio: '10 / vars.divisor' },
@@ -112,7 +112,8 @@ async function blockedRun(page) {
   await expect.poll(async () => (await readRun(page, instanceId)).incidents.length, { timeout: 60000 }).toBe(1);
   const run = await readRun(page, instanceId);
   expect(run.incidents[0].retry.kind).toBe('OutputMapping');
-  expect(run.incidents[0].canRetry).toBe(true);
+  expect(run.incidents[0].canRetry).toBe(false);
+  expect(run.incidents[0].retry.deniedReason).toBe('VariablesUnchanged');
   return instanceId;
 }
 
@@ -131,7 +132,7 @@ async function confirm(page) {
   await dialog.locator('tf-button[data-action="confirm"]').click({ timeout: 15000 });
 }
 
-test('Apply result again asks first, keeps the one incident while the variable is wrong and completes the run once it is fixed', async ({ page }) => {
+test('Apply result again is offered only once something changed, asks first and says when it failed again', async ({ page }) => {
   test.setTimeout(180000);
   const errors = collectConsoleErrors(page);
   await loginAsAdmin(page, { port: PORT });
@@ -139,25 +140,54 @@ test('Apply result again asks first, keeps the one incident while the variable i
   const incidentId = (await readRun(page, instanceId)).incidents[0].incidentId;
   const win = await openRun(page, instanceId);
 
+  // Nothing changed since the failure: the sentence is about saved work, and there is nothing to press.
+  await expect(win.locator('[data-incidents]')).toContainText('The work finished and its result is saved; copying it into the variables failed.', { timeout: 15000 });
+  await expect(win.locator('[data-incidents]')).not.toContainText('CEL');
+  await expect(win.locator('[data-incidents] [data-retry-note]')).toContainText('Nothing it depends on has changed since', { timeout: 15000 });
+  await expect(win.locator('[data-incidents] [data-retry]')).toHaveCount(0);
+  const refusedEarly = await page.evaluate(async ({ id, jobId }) => {
+    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+    const { instance } = await ApiBinary.one('processInstanceGetRequest', { instanceId: id });
+    try {
+      await ApiBinary.one('processJobRetryRequest', { commandId: crypto.randomUUID(), instanceId: id, jobId, expectedRevision: instance.revision });
+      return 'accepted';
+    } catch (error) { return error.code ?? String(error.message); }
+  }, { id: instanceId, jobId: (await readRun(page, instanceId)).incidents[0].jobId });
+  expect(refusedEarly).toMatch(/PolicyDenied/);
+  expect((await readRun(page, instanceId)).kinds).not.toContain('output_retry_failed');
+
+  // A variable the mapping does not use moved: the press is offered, asks first, and fails again honestly.
+  sqlite(`UPDATE bpmn_instances SET variables_json=json_set(variables_json,'$.noise',1) WHERE instance_id='${instanceId}'`);
   const button = win.locator('[data-incidents] [data-retry] button');
   await expect(button).toHaveText('Apply result again', { timeout: 15000 });
   await button.click();
   await confirm(page);
-  await expect(page.locator('.toast', { hasText: 'The result was applied again' }).first()).toBeVisible({ timeout: 15000 });
+  await expect(page.locator('.toast', { hasText: 'It failed again' }).first()).toBeVisible({ timeout: 15000 });
+  await expect(page.locator('.toast', { hasText: 'The result was applied again.' })).toHaveCount(0);
 
-  // The variable is still 0: the same incident stays, nothing new is raised, the tool did not run again.
+  // The same incident stays, nothing new is raised, the tool did not run again, and the press is held back again.
   await expect.poll(async () => (await readRun(page, instanceId)).kinds.includes('output_retry_failed'), { timeout: 30000 }).toBe(true);
   const failed = await readRun(page, instanceId);
   expect(failed.status).toBe('Incident');
   expect(failed.incidents.map((incident) => incident.incidentId)).toEqual([incidentId]);
   expect(failed.kinds.filter((kind) => kind === 'service_result')).toHaveLength(1);
   expect(sqlite(`SELECT COUNT(*) FROM bpmn_incidents WHERE instance_id='${instanceId}'`)).toBe('1');
-  await expect(win.locator('[data-incidents] [data-retry] button')).toBeVisible({ timeout: 15000 });
+  await expect(win.locator('[data-incidents] [data-retry]')).toHaveCount(0, { timeout: 15000 });
+  await expect(win.locator('[data-incidents] [data-retry-note]')).toContainText('Nothing it depends on has changed since');
+
+  // The token of the blocked step is not "ready to continue".
+  await win.locator('[data-view] button[data-value="diagram"]').click();
+  await expect(win.locator('.fb-canvas.fb-runtime')).toHaveCount(1, { timeout: 15000 });
+  await win.locator('.fb-canvas .fb-node[data-node-id="Service_1"]').click();
+  await expect(win.locator('.fb-diagram-panel')).not.toContainText('Ready to continue');
+  await win.locator('[data-view] button[data-value="list"]').click();
 
   // Fixing the variable is what lets the pinned result map.
   sqlite(`UPDATE bpmn_instances SET variables_json=json_set(variables_json,'$.divisor',5) WHERE instance_id='${instanceId}'`);
+  await expect(win.locator('[data-incidents] [data-retry] button')).toBeVisible({ timeout: 15000 });
   await win.locator('[data-incidents] [data-retry] button').click();
   await confirm(page);
+  await expect(page.locator('.toast', { hasText: 'The result was applied again.' }).first()).toBeVisible({ timeout: 15000 });
   await expect.poll(async () => (await readRun(page, instanceId)).status, { timeout: 60000 }).toBe('Completed');
   const done = await readRun(page, instanceId);
   expect(done.variables.ratio).toBe(2);
@@ -176,7 +206,7 @@ test('a person who may only watch the run is told so in words and the server ref
   const onlooker = await context.newPage();
   await loginAsAdmin(onlooker, { port: PORT, username: 'b45onlooker', password: 'Onlooker-pass-w0rd-1' });
   const win = await openRun(onlooker, instanceId);
-  await expect(win.locator('[data-incidents] [data-retry-note]')).toHaveText(/only that person can start it/i, { timeout: 15000 });
+  await expect(win.locator('[data-incidents] [data-retry-note]')).toHaveText(/only the person who started the run can do that/i, { timeout: 15000 });
   await expect(win.locator('[data-incidents] [data-retry]')).toHaveCount(0);
 
   const refused = await onlooker.evaluate(async (id) => {

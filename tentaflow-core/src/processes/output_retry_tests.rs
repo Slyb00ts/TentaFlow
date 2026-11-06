@@ -29,6 +29,7 @@ fn model_with(
 ) -> ProcessModel {
     let mut model = service_model(flow_id, verification);
     model.variables.insert("divisor".into(), json!(0));
+    model.variables.insert("noise".into(), json!(0));
     model.variables.insert("mapped".into(), Value::Null);
     model.modeling = Some(ProcessBodyModeling {
         data_objects: vec![ProcessDataObject {
@@ -105,6 +106,16 @@ fn set_divisor(fixture: &Fixture, instance_id: &str, divisor: i64) {
     assert_eq!(changed, 1);
 }
 
+/// Changes a variable the mapping does not use: the run moved on, the mapping
+/// still fails, and the next attempt is offered again.
+fn touch(fixture: &Fixture, instance_id: &str, noise: i64) {
+    let changed = fixture.db.write().unwrap().execute(
+        "UPDATE bpmn_instances SET variables_json=json_set(variables_json,'$.noise',?1) WHERE instance_id=?2",
+        rusqlite::params![noise, instance_id],
+    ).unwrap();
+    assert_eq!(changed, 1);
+}
+
 fn reload(fixture: &Fixture, instance_id: &str) -> ProcessInstance {
     repository::get_instance(&fixture.db, &fixture.owner, instance_id, None).unwrap()
 }
@@ -174,15 +185,26 @@ async fn a_blocked_mapping_is_applied_again_to_the_current_variables_without_run
         .expect("the mapping failure")
         .clone();
     assert_eq!(incident.code, "ACTIVITY_IO_OUTPUT_FAILED");
+    // Nothing changed since the failure: applying the result again would fail the same way.
     assert_eq!(
         (
             incident.can_retry,
             incident.retry.kind,
             incident.retry.denied_reason
         ),
-        (true, ProcessRetryKind::OutputMapping, None)
+        (
+            false,
+            ProcessRetryKind::OutputMapping,
+            Some(ProcessRetryDenied::VariablesUnchanged)
+        )
     );
-    assert!(blocked.instance.can_retry);
+    assert!(!blocked.instance.can_retry);
+    let refused = retry(&fixture, &blocked.instance, &blocked.job_id, "too early").unwrap_err();
+    assert!(
+        refused.downcast_ref::<ProcessOperationDenied>().is_some(),
+        "{refused}"
+    );
+    assert_eq!(footprint(&fixture, &instance_id).1, 0, "a refused press uses no generation");
     assert_eq!(
         count(
             &fixture,
@@ -193,6 +215,15 @@ async fn a_blocked_mapping_is_applied_again_to_the_current_variables_without_run
     );
 
     set_divisor(&fixture, &instance_id, 2);
+    let offered = reload(&fixture, &instance_id);
+    assert_eq!(
+        (
+            offered.incidents[0].can_retry,
+            offered.incidents[0].retry.denied_reason
+        ),
+        (true, None)
+    );
+    assert!(offered.can_retry);
     let command = stamp("apply again");
     let done = retry_command(&fixture, &blocked.instance, &blocked.job_id, &command)
         .unwrap()
@@ -303,6 +334,8 @@ async fn a_failing_retry_keeps_the_one_incident_and_stops_at_the_limit() {
 
     let mut current = blocked.instance.clone();
     for attempt in 1..=5 {
+        touch(&fixture, &instance_id, attempt);
+        current = reload(&fixture, &instance_id);
         let command = stamp(&format!("failing {attempt}"));
         let after = retry_command(&fixture, &current, &blocked.job_id, &command)
             .unwrap()
@@ -456,13 +489,23 @@ async fn a_failing_mapping_of_a_step_without_configured_io_is_applied_again_too(
     };
     output_mapping.insert("ratio".into(), "10 / vars.divisor".into());
     model.variables.insert("ratio".into(), Value::Null);
+    model.variables.insert("noise".into(), json!(0));
     let blocked = run_until_blocked(&fixture, &model, "plain-pass").await;
     let incident = blocked.instance.incidents[0].clone();
     assert_eq!(incident.code, "EXPRESSION_ERROR");
     assert_eq!(
-        (incident.can_retry, incident.retry.kind),
-        (true, ProcessRetryKind::OutputMapping)
+        (incident.can_retry, incident.retry.kind, incident.retry.denied_reason),
+        (
+            false,
+            ProcessRetryKind::OutputMapping,
+            Some(ProcessRetryDenied::VariablesUnchanged)
+        )
     );
+    touch(&fixture, &blocked.instance.instance_id, 1);
+    let blocked = Blocked {
+        instance: reload(&fixture, &blocked.instance.instance_id),
+        job_id: blocked.job_id,
+    };
     let again = retry(
         &fixture,
         &blocked.instance,
@@ -473,7 +516,13 @@ async fn a_failing_mapping_of_a_step_without_configured_io_is_applied_again_too(
     assert_eq!(again.status, ProcessInstanceStatus::Incident);
     assert_eq!(again.incidents.len(), 1);
     assert_eq!(again.incidents[0].incident_id, incident.incident_id);
+    // The attempt that just failed saw these variables: pressing again is refused until something changes.
+    assert_eq!(
+        (again.incidents[0].can_retry, again.incidents[0].retry.denied_reason),
+        (false, Some(ProcessRetryDenied::VariablesUnchanged))
+    );
     set_divisor(&fixture, &blocked.instance.instance_id, 4);
+    let again = reload(&fixture, &blocked.instance.instance_id);
     let done = retry(&fixture, &again, &blocked.job_id, "plain succeeds").unwrap();
     assert_eq!(done.status, ProcessInstanceStatus::Completed);
     assert_eq!(done.variables["ratio"], json!(2));

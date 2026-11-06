@@ -788,6 +788,16 @@ impl<'a> Transition<'a> {
         }
     }
 
+    /// The fingerprint of what a mapping in the current scope reads, as the
+    /// repository computes it from the stored variables.
+    fn mapping_variables_digest(&self) -> Result<String> {
+        if self.current_scope == self.instance_id {
+            super::repository::mapping_variables_digest(&self.plan.variables, None)
+        } else {
+            super::repository::mapping_variables_digest(&self.plan.variables, Some(self.local()?))
+        }
+    }
+
     fn effective(&self) -> Result<Value> {
         super::repository::effective_scope_variables(
             &self.scopes,
@@ -1636,6 +1646,7 @@ impl<'a> Transition<'a> {
             .context("Service IO output blockage has no authored association")?;
         let incident_event_index = self.plan.events.len();
         self.record_event_id(incident_event_index);
+        let digest = self.mapping_variables_digest()?;
         self.incident(&job.node_id, Some(job.job_id.clone()),
             "ACTIVITY_IO_OUTPUT_FAILED",
             super::repository::bounded_failure_message(&error.to_string()));
@@ -1645,6 +1656,8 @@ impl<'a> Transition<'a> {
             .context("Service IO output blockage lost its incident event")?;
         event.data["incident_id"] = json!(incident_id);
         event.data["activation_token_id"] = json!(job.token_id);
+        event.data["job_id"] = json!(job.job_id);
+        event.data["variables_sha256"] = json!(digest);
         self.record_service_io_result(job, observed, result_event_index,
             ActivityIoResultDisposition::Blocked {
                 incident_event_index, incident_id,
@@ -8037,9 +8050,11 @@ pub(super) fn plan_job_result_with_id_source(
                         // Marks the failure as the mapping of an accepted result: the
                         // evaluation of the condition below raises the same code, and
                         // only this one can be applied again.
+                        let digest = transition.mapping_variables_digest()?;
                         if let Some(event) = transition.plan.events.last_mut() {
                             event.data["job_id"] = json!(job.job_id);
                             event.data["stage"] = json!("output_mapping");
+                            event.data["variables_sha256"] = json!(digest);
                         }
                     }
                 },

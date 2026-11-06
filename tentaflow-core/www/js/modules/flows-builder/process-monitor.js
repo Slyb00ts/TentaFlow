@@ -206,7 +206,10 @@ export function processEventText(event) {
   }
   if (event.kind === 'timer_blocked') return text('event_timer_blocked', { node, message: event.data.reason, retry: date(event.data.next_check_at_ms) });
   if (event.kind === 'timer_error') return text('event_timer_error', { node, message: event.data.reason });
-  if (event.kind === 'service_result') return text('event_service_result', { node, summary: processVerificationOrigin(event.data) ? processVerdictReason(event.data.summary) : event.data.summary });
+  if (event.kind === 'service_result') {
+    const summary = processVerificationOrigin(event.data) ? processVerdictReason(event.data.summary) : event.data.summary;
+    return text('event_service_result', { node, summary: summary === FLOW_RESULT_SUMMARY ? text('summary_flow_result') : summary });
+  }
   if (event.kind === 'script_completed') return text('event_script_completed', { node });
   if (event.kind === 'manual_task_opened') return text('event_manual_task_opened', { node });
   if (event.kind === 'manual_task_acknowledged') return text('event_manual_task_acknowledged', { node });
@@ -389,6 +392,9 @@ export async function openProcessSchedule(definitionId) {
   return win;
 }
 
+// The one fixed summary the engine writes for a pinned flow's result; the others are the tool's or agent's own words.
+const FLOW_RESULT_SUMMARY = 'The pinned flow returned an activity result';
+
 // Codes that share one sentence. Every code the backend can raise has a text
 // here or in the list inside processIncidentText; a test reads the Rust sources
 // and fails when a code has none.
@@ -438,7 +444,14 @@ export const INCIDENT_TEXT_KEYS = Object.freeze({
   TOKEN_QUOTA_EXCEEDED: 'incident_token_quota_exceeded',
 });
 
+// The work is done and its result is saved; only copying it into the variables failed.
+// The server marks that stage on the row (`retry.kind`) or on the history event (`stage`).
+function isMappingFailure(incident) {
+  return incident.code === 'ACTIVITY_IO_OUTPUT_FAILED' || incident.retry?.kind === 'OutputMapping' || incident.stage === 'output_mapping';
+}
+
 export function processIncidentText(incident) {
+  if (isMappingFailure(incident)) return text('incident_mapping_failed');
   if (INCIDENT_TEXT_KEYS[incident.code]) return text(INCIDENT_TEXT_KEYS[incident.code]);
   if (incident.code === 'TIMER_ERROR') return text('incident_timer_error', { reason: incident.message });
   if (incident.code === 'INCLUSIVE_GATEWAY_ERROR') return `${text('incident_inclusive_gateway_error')} ${text('incident_inclusive_guidance')}`;
@@ -448,6 +461,12 @@ export function processIncidentText(incident) {
   }
   const codes = ['EXPRESSION_ERROR', 'AMBIGUOUS_GATEWAY', 'NO_MATCHING_FLOW', 'HUMAN_REJECTED', 'SERVICE_ERROR', 'VERIFICATION_FAILED', 'VERIFICATION_AGENT_REFUSED', 'WORKER_ERROR', 'FLOW_ERROR', 'INVALID_SERVICE_JOB', 'SOURCE_ACCESS_REVOKED', 'INTERRUPTED', 'LEASE_LOST', 'SERVICE_TIMEOUT', 'OUTPUT_LIMIT', 'TRANSITION_ERROR', 'RESULT_REJECTED', 'REVISION_CONFLICT', 'SCOPE_LIMIT', 'REPETITION_INPUT_ERROR', 'REPETITION_LIMIT', 'REPETITION_AGGREGATE_LIMIT', 'REPETITION_MAPPING_FAILED', 'SCRIPT_INFRASTRUCTURE_FAILED', 'MESSAGE_EXPRESSION_ERROR', 'SEND_ADMISSION_AUTHORITY_DENIED', 'SEND_ADMISSION_TARGET_UNAVAILABLE', 'IMMEDIATE_TRANSITION_LIMIT'];
   return codes.includes(incident.code) ? text(`incident_${incident.code.toLowerCase()}`) : (incident.message || text('incident_generic'));
+}
+
+// What the engine said about the failed mapping, as secondary detail under the sentence.
+function mappingReason(incident, redacted) {
+  if (!isMappingFailure(incident) || !incident.message || redacted) return '';
+  return `<p class="fb-field-hint" data-mapping-reason>${escapeHtml(text('incident_mapping_reason', { reason: incident.message }))}</p>`;
 }
 
 // A reader without access to values gets the code as the message; a sentence is built from the code alone.
@@ -674,7 +693,10 @@ export async function openProcessInstance(instanceId, initial = null) {
       }
       host.querySelectorAll('[data-retry]').forEach((control) => control.setAttribute('disabled', ''));
       if (await applyMutation('processJobRetryRequest', { instanceId, jobId: current.jobId, expectedRevision: instance.revision }, retryCommand)) {
-        toast(words.started, 'success');
+        // Applying a saved result answers at once: if the same incident is still open, it failed again.
+        const still = current.retry?.kind === 'OutputMapping' ? instance.incidents.find((candidate) => candidate.incidentId === current.incidentId && candidate.resolvedAtMs == null) : null;
+        if (still) toast(text('retry_output_failed_again', { reason: incidentSentence(still, instance.variablesRedacted) }), 'warning');
+        else toast(words.started, 'success');
       }
       if (win.isConnected) {
         const key = (kind) => `[data-focus-key="${CSS.escape(`${kind}:${incident.incidentId}`)}"]`;
@@ -858,7 +880,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       const row = document.createElement('div');
       row.className = 'fb-process-work';
       const refusal = retryRefusal(incident);
-      row.innerHTML = `<div><strong>${escapeHtml(incidentTitles.get(incident.incidentId))}</strong><p>${escapeHtml(incidentSentence(incident, instance.variablesRedacted))}</p><p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)}</p>${refusal ? `<p class="fb-field-hint" data-retry-note>${escapeHtml(refusal)}</p>` : ''}${repeatedNote(incident)}${scopeLine(incident.scopeId)}</div>
+      row.innerHTML = `<div><strong>${escapeHtml(incidentTitles.get(incident.incidentId))}</strong><p>${escapeHtml(incidentSentence(incident, instance.variablesRedacted))}</p><p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)}</p>${mappingReason(incident, instance.variablesRedacted)}${refusal ? `<p class="fb-field-hint" data-retry-note>${escapeHtml(refusal)}</p>` : ''}${repeatedNote(incident)}${scopeLine(incident.scopeId)}</div>
         <tf-button variant="secondary" data-focus-key="inspect:${escapeAttr(incident.incidentId)}" data-inspect-incident>${escapeHtml(text('inspect_incident'))}</tf-button>
         ${retryOffered(incident) ? `<tf-button variant="secondary" icon="refresh" data-focus-key="retry:${escapeAttr(incident.incidentId)}" data-retry>${escapeHtml(retryWords(incident).label)}</tf-button>` : ''}`;
       row.querySelector('[data-inspect-incident]').addEventListener('click', () => { selectedIncidentId = incident.incidentId; refresh(); });

@@ -10,11 +10,11 @@ export function instanceIsTerminal(status) {
 }
 
 // Priority for the icon and the lead wording of an element that holds tokens of several kinds.
-const WAIT_ORDER = ['UserTask', 'Job', 'Call', 'Message', 'Timer', 'Scope', 'Gateway', 'Ready'];
+const WAIT_ORDER = ['UserTask', 'Job', 'Call', 'Message', 'Timer', 'Scope', 'Gateway', 'Ready', 'Blocked'];
 
 const WAIT_ICONS = {
   UserTask: 'user', Job: 'chip', Timer: 'clock', Message: 'mail', Call: 'external-link',
-  Gateway: 'pause', Scope: 'bpmn-subprocess', Ready: 'play',
+  Gateway: 'pause', Scope: 'bpmn-subprocess', Ready: 'play', Blocked: 'alert',
 };
 
 /** What a live token waits for: one of the wait names, `Ready` when it waits for nothing. */
@@ -58,7 +58,9 @@ export function buildTokenOverlay(response, { repeatingNodeIds = new Set() } = {
     const entry = entryOf(token.nodeId);
     for (const id of incidentIds) if (!entry.incidentIds.includes(id)) entry.incidentIds.push(id);
     if (coordinator) continue;
-    const kind = tokenWaitKind(token);
+    // A token with an open incident does not continue, whatever it would wait for next.
+    const waitKind = tokenWaitKind(token);
+    const kind = waitKind === 'Ready' && incidentIds.length ? 'Blocked' : waitKind;
     entry.tokens.push({ ...token, kind });
     entry.count += 1;
     if (!entry.kinds.includes(kind)) entry.kinds.push(kind);

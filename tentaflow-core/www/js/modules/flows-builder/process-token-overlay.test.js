@@ -434,3 +434,14 @@ test('every diagram key exists in all five languages', () => {
     assert.match(bundles[0][key], /\{\w+\|[^|}]+\|[^|}]+\|[^}]+\}/, `pl bpmn.${key} needs three plural forms`);
   }
 });
+
+test('a token with an open incident is blocked, not ready to continue', () => {
+  const view = buildTokenOverlay({ tokens: [{ tokenId: 't1', nodeId: 'Service', status: 'Waiting', wait: null, incidentIds: ['inc-1'], sinceMs: 1 }] });
+  const entry = view.nodes.get('Service');
+  assert.deepEqual(entry.kinds, ['Blocked']);
+  assert.equal(entry.tone, 'incident');
+  assert.equal(entry.tokens[0].kind, 'Blocked');
+  const calm = buildTokenOverlay({ tokens: [{ tokenId: 't2', nodeId: 'Service', status: 'Ready', wait: null, incidentIds: [], sinceMs: 1 }] });
+  assert.deepEqual(calm.nodes.get('Service').kinds, ['Ready']);
+  assert.match(canvasOverlay(view, (key) => key).nodes.get('Service').label, /diagram_wait_blocked/);
+});

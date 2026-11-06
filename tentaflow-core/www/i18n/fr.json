@@ -14924,7 +14924,15 @@
     "retry_output": "Réappliquer le résultat",
     "retry_output_hint": "Le travail est terminé et son résultat a été accepté. Seule la copie du résultat dans l’exécution a échoué. Le résultat est réappliqué aux variables actuelles de l’exécution ; l’étape ne s’exécute pas de nouveau. Il est appliqué au nom de la personne qui a lancé l’exécution.",
     "retry_output_started": "Le résultat a été réappliqué. Si l’exécution n’a pas continué, l’incident en donne la raison.",
-    "retry_denied_output_retry_limit": "Le résultat a déjà été réappliqué plusieurs fois et a échoué à chaque fois. Corrigez le processus ou les variables et lancez une nouvelle exécution, ou annulez celle-ci.",
+    "retry_denied_output_retry_limit": "Le résultat a déjà été réappliqué plusieurs fois et a échoué à chaque fois. Lancez une nouvelle exécution ou demandez à la personne propriétaire du processus de migrer cette exécution lorsque ce sera disponible.",
+    "retry_denied_variables_unchanged": "Le résultat est enregistré et accepté ; sa copie a échoué. Rien dont il dépend n’a changé depuis, donc le réappliquer échouerait de la même façon.",
+    "retry_denied_view_only_output": "Vous pouvez consulter cette exécution, mais pas réappliquer son résultat. Seule la personne qui l’a lancée peut le faire.",
+    "retry_denied_initiator_not_owner_output": "La personne qui a lancé l’exécution n’est plus propriétaire de ce processus, le résultat ne peut donc pas être réappliqué en son nom.",
+    "retry_denied_initiator_unavailable_output": "La personne qui a lancé l’exécution n’est plus active, le résultat ne peut donc pas être réappliqué en son nom.",
+    "incident_mapping_failed": "Le travail est terminé et son résultat est enregistré ; sa copie dans les variables a échoué.",
+    "incident_mapping_reason": "Raison : {reason}",
+    "retry_output_failed_again": "Nouvel échec : {reason}",
+    "summary_flow_result": "Le flux épinglé a renvoyé un résultat d’activité",
     "retry_denied_result_not_retained": "Le résultat de cette étape n’est pas conservé, il ne peut donc pas être réappliqué d’ici.",
     "cancel_instance": "Annuler l’exécution",
     "cancel_hint": "Annuler cette exécution et fermer le travail en attente ? Les effets externes déjà réalisés ne peuvent pas être annulés.",
@@ -16149,3 +16157,4 @@
     "heart": "cœur"
   }
 }
+    "diagram_wait_blocked": "Bloqué, demande de l’attention",

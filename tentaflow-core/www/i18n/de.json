@@ -14924,7 +14924,15 @@
     "retry_output": "Ergebnis erneut anwenden",
     "retry_output_hint": "Die Arbeit ist erledigt und ihr Ergebnis wurde angenommen. Nur das Übernehmen des Ergebnisses in den Ablauf ist fehlgeschlagen. Das Ergebnis wird erneut auf die aktuellen Variablen des Ablaufs angewendet; der Schritt läuft nicht noch einmal. Es wird im Namen der Person angewendet, die den Ablauf gestartet hat.",
     "retry_output_started": "Das Ergebnis wurde erneut angewendet. Falls der Ablauf nicht weiterlief, zeigt der Vorfall den Grund.",
-    "retry_denied_output_retry_limit": "Das Ergebnis wurde schon mehrfach erneut angewendet und ist jedes Mal fehlgeschlagen. Korrigieren Sie den Prozess oder die Variablen und starten Sie einen neuen Ablauf, oder brechen Sie diesen ab.",
+    "retry_denied_output_retry_limit": "Das Ergebnis wurde schon mehrfach erneut angewendet und ist jedes Mal fehlgeschlagen. Starten Sie einen neuen Ablauf oder bitten Sie die Prozesseigentümerin oder den Prozesseigentümer, diesen Ablauf zu migrieren, sobald das verfügbar ist.",
+    "retry_denied_variables_unchanged": "Das Ergebnis ist gespeichert und angenommen; das Übernehmen ist fehlgeschlagen. Seitdem hat sich nichts geändert, wovon es abhängt, daher würde eine erneute Anwendung genauso fehlschlagen.",
+    "retry_denied_view_only_output": "Sie können diesen Ablauf ansehen, aber sein Ergebnis nicht erneut anwenden. Das kann nur die Person, die den Ablauf gestartet hat.",
+    "retry_denied_initiator_not_owner_output": "Die Person, die den Ablauf gestartet hat, besitzt diesen Prozess nicht mehr, daher kann das Ergebnis nicht in ihrem Namen erneut angewendet werden.",
+    "retry_denied_initiator_unavailable_output": "Die Person, die den Ablauf gestartet hat, ist nicht mehr aktiv, daher kann das Ergebnis nicht in ihrem Namen erneut angewendet werden.",
+    "incident_mapping_failed": "Die Arbeit ist abgeschlossen und ihr Ergebnis ist gespeichert; das Übernehmen in die Variablen ist fehlgeschlagen.",
+    "incident_mapping_reason": "Grund: {reason}",
+    "retry_output_failed_again": "Wieder fehlgeschlagen: {reason}",
+    "summary_flow_result": "Der angeheftete Flow hat ein Aktivitätsergebnis geliefert",
     "retry_denied_result_not_retained": "Das Ergebnis dieses Schritts wird nicht aufbewahrt und kann von hier aus nicht erneut angewendet werden.",
     "cancel_instance": "Ausführung abbrechen",
     "cancel_hint": "Ausführung abbrechen und ausstehende Arbeit schließen? Bereits ausgeführte externe Effekte lassen sich nicht rückgängig machen.",
@@ -16149,3 +16157,4 @@
     "heart": "Herz"
   }
 }
+    "diagram_wait_blocked": "Blockiert, braucht Aufmerksamkeit",

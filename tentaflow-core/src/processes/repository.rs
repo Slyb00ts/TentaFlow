@@ -5827,6 +5827,34 @@ fn expression_error_is_mapping_on(conn: &Connection, instance_id: &str, job_id: 
         params![instance_id, job_id], |row| row.get(0))?)
 }
 
+/// A fingerprint of the variables a mapping reads: the root scope's and, inside a
+/// sub-process, the scope's own. It is written on the event of every attempt, so
+/// the next attempt is offered only once something it reads has changed.
+pub(super) fn mapping_variables_digest(root: &Value, local: Option<&Value>) -> Result<String> {
+    request_hash(&serde_json::json!([root, local]))
+}
+
+fn mapping_variables_digest_on(conn: &Connection, instance_id: &str, scope_id: &str) -> Result<String> {
+    let root = scope_variables_on(conn, instance_id, instance_id)?;
+    if scope_id == instance_id {
+        return mapping_variables_digest(&root, None);
+    }
+    mapping_variables_digest(&root, Some(&scope_variables_on(conn, instance_id, scope_id)?))
+}
+
+/// The fingerprint written by the latest attempt on this job (the failure that
+/// raised the incident, or a retry that failed again); `None` when no event
+/// carries one.
+fn last_attempt_digest_on(conn: &Connection, instance_id: &str, job_id: &str) -> Result<Option<String>> {
+    Ok(conn.query_row(
+        "SELECT json_extract(data_json,'$.variables_sha256') FROM bpmn_events \
+         WHERE instance_id=?1 AND json_extract(data_json,'$.job_id')=?2 \
+           AND kind IN ('incident','output_retry_failed') \
+           AND json_extract(data_json,'$.variables_sha256') IS NOT NULL \
+         ORDER BY seq DESC LIMIT 1",
+        params![instance_id, job_id], |row| row.get(0)).optional()?)
+}
+
 /// Everything a retry of an output mapping stands on, read from the database:
 /// the finished job, its accepted Completed result, the waiting activation and
 /// the one open incident of the job.
@@ -5915,6 +5943,12 @@ fn output_retry_source_on(
     };
     if spent >= super::runtime::OUTPUT_RETRY_LIMIT {
         return Ok(Err(OutputRetryLimit));
+    }
+    // Applying the same result to the same variables fails the same way, and each
+    // attempt uses up one of the few a step has.
+    if last_attempt_digest_on(conn, instance_id, job_id)?.as_deref()
+        == Some(mapping_variables_digest_on(conn, instance_id, &scope_id)?.as_str()) {
+        return Ok(Err(ProcessRetryDenied::VariablesUnchanged));
     }
     Ok(Ok(OutputRetrySource {
         job_id: job_id.to_owned(), incident_id: incident_id.clone(), invocation_id,
@@ -6014,6 +6048,7 @@ fn record_output_retry_failure_on(
             "incident_id": source.incident_id, "job_id": source.job_id,
             "invocation_id": source.invocation_id, "activation_token_id": source.token_id,
             "generation": generation, "message": message,
+            "variables_sha256": mapping_variables_digest_on(tx, instance_id, &source.scope_id)?,
             "association_id": failure.association_id, "position": failure.position,
             "command_id": stamp.command_id, "request_hash": stamp.request_hash,
         }),
@@ -6139,6 +6174,8 @@ fn retry_refusal_text(retry: &ProcessIncidentRetry) -> &'static str {
             "the accepted result was already applied again as many times as one step allows",
         (_, Some(ProcessRetryDenied::ResultNotRetained)) =>
             "the accepted result of this step cannot be applied again",
+        (_, Some(ProcessRetryDenied::VariablesUnchanged)) =>
+            "nothing the mapping depends on has changed since the last attempt",
         (ProcessRetryKind::OutputMapping, _) => "reapplying an accepted result is not available",
         _ => "this incident cannot be retried",
     }

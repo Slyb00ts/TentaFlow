@@ -16062,7 +16062,15 @@
     "retry_output": "Apply result again",
     "retry_output_hint": "The work is done and its result was accepted. Only copying the result into the run failed. The result is applied again to the current variables of the run; the step does not run again. It is applied in the name of the person who started the run.",
     "retry_output_started": "The result was applied again. If the run did not continue, the incident shows why.",
-    "retry_denied_output_retry_limit": "The result was already applied again several times and failed each time. Fix the process or the variables and start a new run, or cancel this one.",
+    "retry_denied_output_retry_limit": "The result was already applied again several times and failed each time. Start a new run, or ask the process owner to migrate this run once that is available.",
+    "retry_denied_variables_unchanged": "The result is saved and accepted; copying it failed. Nothing it depends on has changed since, so applying it again would fail the same way.",
+    "retry_denied_view_only_output": "You can look at this run but not apply its result again. Only the person who started the run can do that.",
+    "retry_denied_initiator_not_owner_output": "The person who started the run no longer owns this process, so the result cannot be applied again in their name.",
+    "retry_denied_initiator_unavailable_output": "The person who started the run is no longer active, so the result cannot be applied again in their name.",
+    "incident_mapping_failed": "The work finished and its result is saved; copying it into the variables failed.",
+    "incident_mapping_reason": "Reason: {reason}",
+    "retry_output_failed_again": "It failed again: {reason}",
+    "summary_flow_result": "The pinned flow returned an activity result",
     "retry_denied_result_not_retained": "The result of this step is not kept, so it cannot be applied again from here.",
     "cancel_instance": "Cancel run",
     "cancel_hint": "Cancel this run and close its pending work? Completed external effects cannot be undone.",
@@ -17287,3 +17295,4 @@
     "heart": "heart"
   }
 }
+    "diagram_wait_blocked": "Blocked, needs attention",

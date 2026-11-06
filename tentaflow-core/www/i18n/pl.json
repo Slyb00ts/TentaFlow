@@ -16062,7 +16062,15 @@
     "retry_output": "Zastosuj wynik ponownie",
     "retry_output_hint": "Praca jest wykonana, a jej wynik przyjęty. Nie udało się tylko przenieść wyniku do przebiegu. Wynik zostanie zastosowany ponownie do bieżących zmiennych przebiegu; krok nie uruchomi się drugi raz. Zastosowanie nastąpi w imieniu osoby, która rozpoczęła przebieg.",
     "retry_output_started": "Wynik został zastosowany ponownie. Jeśli przebieg nie ruszył dalej, incydent pokazuje powód.",
-    "retry_denied_output_retry_limit": "Wynik był już kilkukrotnie stosowany ponownie i za każdym razem się nie udawało. Popraw proces lub zmienne i rozpocznij nowy przebieg albo anuluj ten.",
+    "retry_denied_output_retry_limit": "Wynik był już kilkukrotnie stosowany ponownie i za każdym razem się nie udawało. Rozpocznij nowy przebieg albo poproś właściciela procesu o migrację tego przebiegu, gdy będzie dostępna.",
+    "retry_denied_variables_unchanged": "Wynik jest zapisany i przyjęty; nie udało się go skopiować. Nic, od czego zależy, nie zmieniło się od tego czasu, więc ponowne zastosowanie skończyłoby się tak samo.",
+    "retry_denied_view_only_output": "Możesz oglądać ten przebieg, ale nie możesz ponownie zastosować jego wyniku. Może to zrobić tylko osoba, która rozpoczęła przebieg.",
+    "retry_denied_initiator_not_owner_output": "Osoba, która rozpoczęła przebieg, nie jest już właścicielem tego procesu, więc wynik nie może być zastosowany ponownie w jej imieniu.",
+    "retry_denied_initiator_unavailable_output": "Osoba, która rozpoczęła przebieg, nie jest już aktywna, więc wynik nie może być zastosowany ponownie w jej imieniu.",
+    "incident_mapping_failed": "Praca się zakończyła, a jej wynik jest zapisany; nie udało się go skopiować do zmiennych.",
+    "incident_mapping_reason": "Powód: {reason}",
+    "retry_output_failed_again": "Znowu się nie udało: {reason}",
+    "summary_flow_result": "Przypięty flow zwrócił wynik aktywności",
     "retry_denied_result_not_retained": "Wynik tego kroku nie jest przechowywany, więc nie można go stąd zastosować ponownie.",
     "cancel_instance": "Anuluj wykonanie",
     "cancel_hint": "Anulować wykonanie i zamknąć oczekującą pracę? Wykonanych efektów zewnętrznych nie można cofnąć.",
@@ -17287,3 +17295,4 @@
     "heart": "serce"
   }
 }
+    "diagram_wait_blocked": "Zablokowany, wymaga uwagi",

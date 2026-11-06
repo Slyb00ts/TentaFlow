@@ -1354,6 +1354,8 @@ pub enum ProcessRetryDenied {
     OutputRetryLimit,
     /// The accepted result of this kind of step is not kept in a form that can be applied again.
     ResultNotRetained,
+    /// Nothing the mapping depends on has changed since the last attempt, so it would fail the same way.
+    VariablesUnchanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

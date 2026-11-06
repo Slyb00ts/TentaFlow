@@ -14924,7 +14924,15 @@
     "retry_output": "Aplicar el resultado de nuevo",
     "retry_output_hint": "El trabajo está hecho y su resultado fue aceptado. Solo falló copiar el resultado a la ejecución. El resultado se aplica de nuevo a las variables actuales de la ejecución; el paso no se ejecuta otra vez. Se aplica en nombre de la persona que inició la ejecución.",
     "retry_output_started": "El resultado se aplicó de nuevo. Si la ejecución no continuó, la incidencia muestra el motivo.",
-    "retry_denied_output_retry_limit": "El resultado ya se aplicó de nuevo varias veces y falló en cada ocasión. Corrija el proceso o las variables e inicie una ejecución nueva, o cancele esta.",
+    "retry_denied_output_retry_limit": "El resultado ya se aplicó de nuevo varias veces y falló en cada ocasión. Inicie una ejecución nueva o pida a quien es propietario del proceso que migre esta ejecución cuando esté disponible.",
+    "retry_denied_variables_unchanged": "El resultado está guardado y aceptado; copiarlo falló. Nada de lo que depende ha cambiado desde entonces, así que aplicarlo de nuevo fallaría igual.",
+    "retry_denied_view_only_output": "Puede ver esta ejecución, pero no volver a aplicar su resultado. Solo puede hacerlo la persona que la inició.",
+    "retry_denied_initiator_not_owner_output": "La persona que inició la ejecución ya no es propietaria de este proceso, así que el resultado no puede aplicarse de nuevo en su nombre.",
+    "retry_denied_initiator_unavailable_output": "La persona que inició la ejecución ya no está activa, así que el resultado no puede aplicarse de nuevo en su nombre.",
+    "incident_mapping_failed": "El trabajo terminó y su resultado está guardado; copiarlo a las variables falló.",
+    "incident_mapping_reason": "Motivo: {reason}",
+    "retry_output_failed_again": "Volvió a fallar: {reason}",
+    "summary_flow_result": "El flujo fijado devolvió un resultado de actividad",
     "retry_denied_result_not_retained": "El resultado de este paso no se conserva, por lo que no se puede volver a aplicar desde aquí.",
     "cancel_instance": "Cancelar ejecución",
     "cancel_hint": "¿Cancelar la ejecución y cerrar el trabajo pendiente? Los efectos externos completados no pueden deshacerse.",
@@ -16149,3 +16157,4 @@
     "heart": "corazón"
   }
 }
+    "diagram_wait_blocked": "Bloqueado, requiere atención",

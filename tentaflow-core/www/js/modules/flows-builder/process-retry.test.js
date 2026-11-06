@@ -178,6 +178,38 @@ test('an exhausted output retry says so in words and offers nothing', async () =
   assert.equal(win.querySelector('[data-retry-note]').textContent, I18n.t('bpmn.retry_denied_output_retry_limit'));
 });
 
+test('an apply-again that fails again says so in a warning, never the success toast', async () => {
+  const mapping = incident({ code: 'ACTIVITY_IO_OUTPUT_FAILED', message: 'division by zero', retry: { kind: 'OutputMapping' } });
+  const stillOpen = run([{ ...mapping, atMs: 5, canRetry: false, retry: { kind: 'OutputMapping', deniedReason: 'VariablesUnchanged' } }], { revision: 12 });
+  let latest = run([mapping]);
+  const win = await open(latest, { processInstanceGetRequest: () => ({ instance: latest }), processJobRetryRequest: () => { latest = stillOpen; return { instance: stillOpen }; } });
+  click(win.querySelector('[data-retry]')); await flush();
+  assert.equal(calls.filter((row) => row.kind === 'processJobRetryRequest').length, 1);
+  const warned = toastTexts().find((value) => value.startsWith(I18n.t('bpmn.retry_output_failed_again', { reason: '' }).trim().slice(0, 12)));
+  assert.ok(warned, toastTexts().join('|'));
+  assert.equal(toastTexts().includes(I18n.t('bpmn.retry_output_started')), false);
+  assert.match(win.querySelector('[data-retry-note]').textContent, new RegExp(I18n.t('bpmn.retry_denied_variables_unchanged').slice(0, 25)));
+});
+
+test('a failed mapping reads as saved work with a failed copy, not as a code or an expression engine', async () => {
+  const mapping = incident({ code: 'EXPRESSION_ERROR', message: 'CEL: division by zero', canRetry: false, retry: { kind: 'OutputMapping', deniedReason: 'VariablesUnchanged' } });
+  const verification = incident({ incidentId: 'inc-2', code: 'EXPRESSION_ERROR', message: 'condition', canRetry: false, retry: { kind: 'None', deniedReason: 'SameFailureRepeats' } });
+  const win = await open(run([mapping, verification], { canRetry: false }));
+  const rows = [...win.querySelectorAll('[data-incidents] p')].map((node) => node.textContent);
+  assert.ok(rows.includes(I18n.t('bpmn.incident_mapping_failed')), rows.join('|'));
+  assert.ok(rows.includes(I18n.t('bpmn.incident_expression_error')), 'the verification condition keeps its own sentence');
+  assert.equal(rows.filter((value) => value === I18n.t('bpmn.incident_mapping_failed')).length, 1);
+  assert.ok(rows.some((value) => value === I18n.t('bpmn.incident_mapping_reason', { reason: 'CEL: division by zero' })), 'the engine words are secondary detail');
+});
+
+test('applying a saved result again names what is asked of the reader, not running the step in a name', async () => {
+  const refusal = (deniedReason) => retryRefusal(incident({ canRetry: false, retry: { kind: 'OutputMapping', deniedReason } }));
+  assert.equal(refusal('ViewOnly'), I18n.t('bpmn.retry_denied_view_only_output'));
+  assert.equal(refusal('InitiatorNotOwner'), I18n.t('bpmn.retry_denied_initiator_not_owner_output'));
+  assert.equal(retryRefusal(incident({ canRetry: false, retry: { kind: 'Job', deniedReason: 'ViewOnly' } })), I18n.t('bpmn.retry_denied_view_only'));
+  assert.doesNotMatch(refusal('OutputRetryLimit'), /fix the variables/i);
+});
+
 test('an incident without an offer says why, in words, and has no Retry button', async () => {
   const win = await open(run([
     incident({ incidentId: 'a', canRetry: false, retry: { kind: 'Job', deniedReason: 'ViewOnly' } }),
@@ -208,7 +240,7 @@ test('every reason the server can give has a sentence in all five locales and th
   assert.deepEqual([...RETRY_REASONS].sort(), [...variants].sort());
   const keys = [...RETRY_REASONS.map((reason) => `retry_denied_${reason.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase()}`),
     'retry_denied_generic', 'retry_denied_quota', 'retry_denied_permission', 'incident_token_quota_exceeded', 'incident_tool_permission_denied',
-    'retry_output', 'retry_output_hint', 'retry_output_started', 'event_output_retried', 'event_output_retry_failed', 'retry_started', 'retry_refused', 'retry_hint'];
+    'retry_output', 'retry_output_hint', 'retry_output_started', 'retry_output_failed_again', 'retry_denied_view_only_output', 'retry_denied_initiator_not_owner_output', 'retry_denied_initiator_unavailable_output', 'incident_mapping_failed', 'incident_mapping_reason', 'summary_flow_result', 'diagram_wait_blocked', 'event_output_retried', 'event_output_retry_failed', 'retry_started', 'retry_refused', 'retry_hint'];
   const english = JSON.parse(readFileSync(new URL('../../../i18n/en.json', import.meta.url), 'utf8')).bpmn;
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     const bpmn = JSON.parse(readFileSync(new URL(`../../../i18n/${language}.json`, import.meta.url), 'utf8')).bpmn;
