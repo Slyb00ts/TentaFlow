@@ -1066,6 +1066,7 @@ impl<'a> Transition<'a> {
             message: message.clone(),
             at_ms: self.now_ms,
             can_retry: false,
+            retry: Default::default(),
         });
         self.event(
             "incident",
@@ -4242,6 +4243,7 @@ impl<'a> Transition<'a> {
                         node_id: Some(node.id.clone()), node_name: Some(node.name.clone()), job_id: None,
                         code: "SCOPE_RETURN_ERROR".into(), message: message.clone(), at_ms: self.now_ms,
                         can_retry: false,
+                        retry: Default::default(),
                     });
                     self.plan.event_ids.insert(event_index, source_event_id.clone());
                     self.plan.event_sources.insert(event_index, token.token_id.clone());
@@ -5441,6 +5443,7 @@ impl<'a> Transition<'a> {
                     message: message.clone(),
                     at_ms: self.now_ms,
                     can_retry: false,
+                    retry: Default::default(),
                 });
                 if accepted_io.is_some() {
                     // The retained witness cites this incident as its route event.
@@ -5618,7 +5621,7 @@ impl<'a> Transition<'a> {
                     incident_id: incident_id.clone(), scope_id: source.scope_id.clone(),
                     node_id: Some(source.node_id.clone()), node_name,
                     job_id: Some(job_id.clone()), code: code.into(), message: message.into(),
-                    at_ms: self.now_ms, can_retry: false,
+                    at_ms: self.now_ms, can_retry: false, retry: Default::default(),
                 });
             }
             self.plan.events.push(PlannedEvent {

@@ -1,7 +1,7 @@
 // ============ File: flows-builder/process-monitor.js — authorized process runs, human work and durable history ============
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { escapeAttr, escapeHtml } from '/js/utils.js';
+import { escapeAttr, escapeHtml, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { openFormWindow } from '/js/lib/actions/form-window.js';
 import { checkProcessValue, processBody, processBodyLabels, processCommand, processDistinctLabels, processEditorLabels, processElementNames, processJson, processPlainError, processVerdictReason, processVerificationOrigin, processVerificationSentence, processStartEntryLabels, processStatusLabel, processUnusedDeclarations } from './bpmn.js';
@@ -16,6 +16,8 @@ import '/js/components/tf-toggle.js';
 import '/js/components/tf-segmented.js';
 import { mountProcessDiagram, readInstanceModel } from './process-diagram.js';
 import { ATTENTION_PAGE, loadAttentionInstances } from './process-attention.js';
+import { replaceKeepingFocus } from './keep-focus.js';
+import { retryOffered, retryRefusal } from './process-retry.js';
 
 // Fired by an instance window after it changed the instance (cancel, retry), so a
 // list that is open reloads instead of showing the old state.
@@ -637,14 +639,33 @@ export async function openProcessInstance(instanceId, initial = null) {
     mutation = true;
     readGeneration += 1;
     host.setAttribute('inert', '');
+    let applied = false;
     try {
       const response = await ApiBinary.one(request, command(payload));
-      if (!win.isConnected) return;
+      if (!win.isConnected) return false;
       await acceptSnapshot(response.instance);
       window.dispatchEvent(new CustomEvent(INSTANCE_CHANGED, { detail: { instanceId } }));
       if (historyEnded) await loadHistory();
-    } catch (error) { showError(win, error); }
+      applied = true;
+    } catch (error) {
+      // The server's words for a refused retry are English; the reader gets a sentence in their language.
+      showError(win, request === 'processJobRetryRequest' && error.code === 'PolicyDenied' ? new Error(text('retry_refused')) : error);
+    }
     finally { mutation = false; host.removeAttribute('inert'); await refresh(); }
+    return applied;
+  }
+
+  // Retry of a task incident the server offered: confirm, send, tell the result. The
+  // new attempt may fail again; that reopens the same incident, which the next read shows.
+  async function retryIncident(incident) {
+    if (!retryOffered(incident) || mutation || !available || !win.isConnected) return;
+    selectedIncidentId = incident.incidentId;
+    const approved = await customElements.get('tf-window').confirm({ title: text('retry'), message: text('retry_hint'), confirmLabel: text('retry') });
+    if (!approved || !win.isConnected) return;
+    host.querySelectorAll('[data-retry]').forEach((control) => control.setAttribute('disabled', ''));
+    if (await applyMutation('processJobRetryRequest', { instanceId, jobId: incident.jobId, expectedRevision: instance.revision }, retryCommand)) {
+      toast(text('retry_started'), 'success');
+    }
   }
 
   async function complete(summary) {
@@ -805,6 +826,44 @@ export async function openProcessInstance(instanceId, initial = null) {
       : text('repeat_of', { number: occurrence.ordinal + 1, total });
   }
 
+  function renderIncidents(incidents) {
+    incidents.innerHTML = instance.incidents.length ? `<h3>${escapeHtml(text('incidents'))}</h3>` : '';
+    // Incidents of one repeated task all carry its name; the occurrence number tells them apart.
+    const occurrenceOf = (incident) => (incident.jobId ? instance.repetitionOccurrences.find((candidate) => candidate.jobId === incident.jobId) : null);
+    const incidentTitles = processDistinctLabels(instance.incidents.map((incident) => {
+      const name = incident.nodeName || text('element_unavailable');
+      const occurrence = occurrenceOf(incident);
+      return [incident.incidentId, occurrence ? `${name} \u00b7 ${occurrenceLabel(occurrence)}` : name];
+    }));
+    // The incident carries no occurrence id; where its job does not lead to a loaded
+    // occurrence, the row says what is known instead of guessing a number.
+    const repeatedNote = (incident) => (!occurrenceOf(incident) && instance.repetitionGroups.some((group) => group.nodeId === incident.nodeId)
+      ? `<p>${escapeHtml(text('incident_repeat_unplaced'))}</p>` : '');
+    for (const incident of instance.incidents) {
+      const row = document.createElement('div');
+      row.className = 'fb-process-work';
+      const refusal = retryRefusal(incident);
+      row.innerHTML = `<div><strong>${escapeHtml(incidentTitles.get(incident.incidentId))}</strong><p>${escapeHtml(incidentSentence(incident, instance.variablesRedacted))}</p><p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)}</p>${refusal ? `<p class="fb-field-hint" data-retry-note>${escapeHtml(refusal)}</p>` : ''}${repeatedNote(incident)}${scopeLine(incident.scopeId)}</div>
+        <tf-button variant="secondary" data-focus-key="inspect:${escapeAttr(incident.incidentId)}" data-inspect-incident>${escapeHtml(text('inspect_incident'))}</tf-button>
+        ${retryOffered(incident) ? `<tf-button variant="secondary" icon="refresh" data-focus-key="retry:${escapeAttr(incident.incidentId)}" data-retry>${escapeHtml(text('retry'))}</tf-button>` : ''}`;
+      row.querySelector('[data-inspect-incident]').addEventListener('click', () => { selectedIncidentId = incident.incidentId; refresh(); });
+      row.querySelector('[data-retry]')?.addEventListener('click', () => retryIncident(incident));
+      incidents.appendChild(row);
+    }
+    if (instance.selectedIncident) {
+      const { incident, resolvedAtMs } = instance.selectedIncident;
+      const detail = document.createElement('div');
+      detail.className = 'fb-process-work';
+      detail.dataset.selectedIncident = incident.incidentId;
+      detail.innerHTML = `<div><strong>${escapeHtml(incidentTitles.get(incident.incidentId) ?? (incident.nodeName || text('element_unavailable')))}</strong>
+        <p>${escapeHtml(instance.variablesRedacted ? incident.code : `${incident.code} · ${incident.message}`)}</p>
+        ${resolvedAtMs == null ? '' : `<p>${escapeHtml(text('incident_resolved_at', { time: date(resolvedAtMs) }))}</p>`}</div>
+        <tf-button variant="ghost" data-close-incident>${escapeHtml(text('close_detail'))}</tf-button>`;
+      detail.querySelector('[data-close-incident]').addEventListener('click', () => { selectedIncidentId = null; refresh(); });
+      incidents.append(detail);
+    }
+  }
+
   function render() {
     if (!win.isConnected) return;
     renderedSnapshot = JSON.stringify(instance);
@@ -839,44 +898,7 @@ export async function openProcessInstance(instanceId, initial = null) {
     }
     renderPageControls(work, 'userTasks');
     const incidents = host.querySelector('[data-incidents]');
-    incidents.innerHTML = instance.incidents.length ? `<h3>${escapeHtml(text('incidents'))}</h3>` : '';
-    // Incidents of one repeated task all carry its name; the occurrence number tells them apart.
-    const occurrenceOf = (incident) => (incident.jobId ? instance.repetitionOccurrences.find((candidate) => candidate.jobId === incident.jobId) : null);
-    const incidentTitles = processDistinctLabels(instance.incidents.map((incident) => {
-      const name = incident.nodeName || text('element_unavailable');
-      const occurrence = occurrenceOf(incident);
-      return [incident.incidentId, occurrence ? `${name} \u00b7 ${occurrenceLabel(occurrence)}` : name];
-    }));
-    // The incident carries no occurrence id; where its job does not lead to a loaded
-    // occurrence, the row says what is known instead of guessing a number.
-    const repeatedNote = (incident) => (!occurrenceOf(incident) && instance.repetitionGroups.some((group) => group.nodeId === incident.nodeId)
-      ? `<p>${escapeHtml(text('incident_repeat_unplaced'))}</p>` : '');
-    for (const incident of instance.incidents) {
-      const row = document.createElement('div');
-      row.className = 'fb-process-work';
-      row.innerHTML = `<div><strong>${escapeHtml(incidentTitles.get(incident.incidentId))}</strong><p>${escapeHtml(incidentSentence(incident, instance.variablesRedacted))}</p><p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)}</p>${repeatedNote(incident)}${scopeLine(incident.scopeId)}</div>
-        <tf-button variant="secondary" data-inspect-incident>${escapeHtml(text('inspect_incident'))}</tf-button>
-        ${incident.canRetry && incident.jobId ? `<tf-button variant="secondary" icon="refresh" data-retry>${escapeHtml(text('retry'))}</tf-button>` : ''}`;
-      row.querySelector('[data-inspect-incident]').addEventListener('click', () => { selectedIncidentId = incident.incidentId; refresh(); });
-      row.querySelector('[data-retry]')?.addEventListener('click', async () => {
-        selectedIncidentId = incident.incidentId;
-        const approved = await customElements.get('tf-window').confirm({ title: text('retry'), message: text('retry_hint'), confirmLabel: text('retry') });
-        if (approved && win.isConnected) await applyMutation('processJobRetryRequest', { instanceId, jobId: incident.jobId, expectedRevision: instance.revision }, retryCommand);
-      });
-      incidents.appendChild(row);
-    }
-    if (instance.selectedIncident) {
-      const { incident, resolvedAtMs } = instance.selectedIncident;
-      const detail = document.createElement('div');
-      detail.className = 'fb-process-work';
-      detail.dataset.selectedIncident = incident.incidentId;
-      detail.innerHTML = `<div><strong>${escapeHtml(incidentTitles.get(incident.incidentId) ?? (incident.nodeName || text('element_unavailable')))}</strong>
-        <p>${escapeHtml(instance.variablesRedacted ? incident.code : `${incident.code} · ${incident.message}`)}</p>
-        ${resolvedAtMs == null ? '' : `<p>${escapeHtml(text('incident_resolved_at', { time: date(resolvedAtMs) }))}</p>`}</div>
-        <tf-button variant="ghost" data-close-incident>${escapeHtml(text('close_detail'))}</tf-button>`;
-      detail.querySelector('[data-close-incident]').addEventListener('click', () => { selectedIncidentId = null; refresh(); });
-      incidents.append(detail);
-    }
+    replaceKeepingFocus(incidents, () => renderIncidents(incidents));
     renderPageControls(incidents, 'incidents');
     host.querySelector('[data-variables]').replaceChildren(jsonSection(text(instance.variablesRedacted ? 'variable_types' : 'current_variables'), instance.variables, false));
     host.querySelector('[data-timer-section]').hidden = !instance.timers?.length && !instance.pages.timers.total;
@@ -1086,6 +1108,7 @@ export async function openProcessInstance(instanceId, initial = null) {
     instance: () => instance,
     openInstance: (id) => openProcessInstance(id),
     inspectIncident: (incidentId) => { showView('list', { remember: false }); selectedIncidentId = incidentId; refresh(); },
+    retryIncident: (incident) => retryIncident(incident),
     completeTask: (task) => complete(task),
     showDetails: () => showView('list'),
     incidentText: (incident) => incidentSentence(incident, instance.variablesRedacted),

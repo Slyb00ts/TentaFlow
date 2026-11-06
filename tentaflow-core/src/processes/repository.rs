@@ -11,14 +11,14 @@ use sha2::{Digest, Sha256};
 use tentaflow_protocol::processes::{
     ActivityOutcome, ActivityResult, PinnedFlowInfo, ServiceImplementationKind, ProcessCallPinInfo, ProcessCallStatus, ProcessCallSummary,
     ProcessCallActivity, ProcessCallTarget, ProcessDefinition, ProcessDefinitionSummary, ProcessEvent, ProcessEventRaceStatus,
-    ProcessEventRaceSummary, ProcessIncident, ProcessIncidentSelection, ProcessInstance,
+    ProcessEventRaceSummary, ProcessIncident, ProcessIncidentRetry, ProcessIncidentSelection, ProcessInstance,
     ProcessInstanceAccess, ProcessInstanceListScope, ProcessInstancePageInfo,
     ProcessInstancePageRequest, ProcessInstanceStatus, ProcessInstanceSummary,
     ProcessInstanceTokens, ProcessTokenOccurrence, ProcessTokenStatus, ProcessTokenView,
     ProcessTokenWait, ProcessStartCatalogEntry, ProcessStartTrigger, ProcessMessageDetail, ProcessMessageOrigin,
     ProcessMessageStatus, ProcessMessageSummary, ProcessMessageTarget, ProcessModel, ProcessNode,
     ProcessNodeKind, ProcessPageInfo, ProcessPageSpec, ProcessPayload, ProcessRelatedInstance,
-    ProcessRepetitionGroupMode, ProcessRepetitionGroupStatus, ProcessRepetitionGroupSummary,
+    ProcessRepetitionGroupMode, ProcessRepetitionGroupStatus, ProcessRetryDenied, ProcessRetryKind, ProcessRepetitionGroupSummary,
     ProcessRepetitionOccurrenceDetail, ProcessRepetitionOccurrenceStatus,
     ProcessRepetitionOccurrenceSummary, ProcessRepetitionValueKind, ProcessActivityResultOrigin,
     ProcessScopeSummary, ProcessSubscriptionKind, ProcessSubscriptionStatus,
@@ -29,6 +29,7 @@ use tentaflow_protocol::processes::{
 };
 use uuid::Uuid;
 
+use super::retry_class::{classify_code, RetryClass};
 use super::model::{starter_model, validate_model, validate_variables, GatewayKind, MAX_MODEL_BYTES};
 use super::runtime::{
     derived_runtime_id_source, random_runtime_id_source, validate_output, RuntimeIdSourceHandle,
@@ -5685,31 +5686,69 @@ fn job_direct_retryable_on(conn: &Connection, job_id: &str, instance_id: &str) -
     Ok(proved_no_effect && job_activation_live_on(conn, job_id)?)
 }
 
-/// The one projection of "this open incident can be retried by the reader".
-fn incident_retryable_on(
+/// The one projection of an incident's retry for the reader: what kind of
+/// retry it is, whether this reader is offered it now and, when not, why.
+/// A job whose invocation is proven unexecuted is a `Job` whatever its code
+/// says; otherwise the code's class decides. `ProcessIncident::can_retry`
+/// is the first value of the pair.
+fn incident_retry_on(
     conn: &Connection,
     access: ProcessInstanceAccess,
     instance_id: &str,
+    code: &str,
     job_id: Option<&str>,
     resolved_at_ms: Option<i64>,
-) -> Result<bool> {
-    if !access.may_retry() || resolved_at_ms.is_some() {
-        return Ok(false);
+) -> Result<(bool, ProcessIncidentRetry)> {
+    let proof = match job_id {
+        Some(job_id) => job_direct_retryable_on(conn, job_id, instance_id)?,
+        None => false,
+    };
+    let class = classify_code(code);
+    let kind = match (proof, class) {
+        (true, _) | (false, Some(RetryClass::Job)) => ProcessRetryKind::Job,
+        (false, Some(RetryClass::JobUncertain)) => ProcessRetryKind::JobUncertain,
+        (false, Some(RetryClass::OutputMapping)) => ProcessRetryKind::OutputMapping,
+        (false, Some(RetryClass::Never(_)) | None) => ProcessRetryKind::None,
+    };
+    let refused = |denied_reason| (false, ProcessIncidentRetry { kind, denied_reason });
+    if resolved_at_ms.is_some() {
+        return Ok(refused(None));
     }
-    match job_id {
-        Some(job_id) => {
-            Ok(job_direct_retryable_on(conn, job_id, instance_id)?
-                && retry_runs_as_initiator_on(conn, instance_id, job_id)?)
+    if let (false, Some(RetryClass::Never(reason))) = (proof, class) {
+        return Ok(refused(Some(reason)));
+    }
+    if kind == ProcessRetryKind::None {
+        return Ok(refused(None));
+    }
+    if !access.may_retry() {
+        return Ok(refused(Some(ProcessRetryDenied::ViewOnly)));
+    }
+    match kind {
+        // Repeating an effect that may have happened is not offered here: the
+        // schema keeps one request id per invocation, so a repeat could not
+        // carry the original id the tool would deduplicate by.
+        ProcessRetryKind::JobUncertain => Ok(refused(Some(ProcessRetryDenied::OutcomeUncertain))),
+        ProcessRetryKind::OutputMapping | ProcessRetryKind::None => Ok(refused(None)),
+        ProcessRetryKind::Job if !proof => Ok(refused(Some(ProcessRetryDenied::NoProofOfNoEffect))),
+        ProcessRetryKind::Job => {
+            let blocked = job_id
+                .map(|job_id| retry_runs_as_initiator_on(conn, instance_id, job_id))
+                .transpose()?
+                .flatten();
+            Ok((blocked.is_none(), ProcessIncidentRetry { kind, denied_reason: blocked }))
         }
-        None => Ok(false),
     }
 }
 
 /// The checks `retry_job` enforces before it plans anything, so the projection
 /// never offers a retry that is refused: the initiator must still be active
 /// and own the definition (the work runs in their name), the source must be
-/// current and no other activation may be ready.
-fn retry_runs_as_initiator_on(conn: &Connection, instance_id: &str, job_id: &str) -> Result<bool> {
+/// current and no other activation may be ready. `None` is "may run".
+fn retry_runs_as_initiator_on(
+    conn: &Connection,
+    instance_id: &str,
+    job_id: &str,
+) -> Result<Option<ProcessRetryDenied>> {
     let (org_id, initiator_user_id): (String, String) = conn.query_row(
         "SELECT org_id,initiator_user_id FROM bpmn_instances WHERE instance_id=?1",
         [instance_id],
@@ -5722,15 +5761,52 @@ fn retry_runs_as_initiator_on(conn: &Connection, instance_id: &str, job_id: &str
         |row| row.get(0),
     )?;
     if ready {
-        return Ok(false);
+        return Ok(Some(ProcessRetryDenied::ActivationBusy));
     }
-    let checks = require_actor(conn, &initiator)
-        .and_then(|()| require_call_control_authority_on(conn, &initiator, instance_id))
-        .and_then(|()| require_source_current(conn, &initiator, &job_source_ref_on(conn, job_id)?, None));
-    match checks {
-        Ok(()) => Ok(true),
-        Err(error) if error.downcast_ref::<ProcessAuthorityDenied>().is_some() => Ok(false),
-        Err(error) => Err(error),
+    // The source is told apart from ownership before the full authority walk,
+    // whose version check also fails when a flow of the version went away and
+    // would otherwise blame the initiator's ownership for it.
+    let definition_id: String = conn.query_row(
+        "SELECT definition_id FROM bpmn_instances WHERE instance_id=?1",
+        [instance_id],
+        |row| row.get(0),
+    )?;
+    let stages: [(ProcessRetryDenied, &dyn Fn() -> Result<()>); 4] = [
+        (ProcessRetryDenied::InitiatorUnavailable, &|| require_actor(conn, &initiator)),
+        (ProcessRetryDenied::InitiatorNotOwner, &|| require_owner(conn, &initiator, &definition_id)),
+        (ProcessRetryDenied::SourceUnavailable,
+            &|| require_source_current(conn, &initiator, &job_source_ref_on(conn, job_id)?, None)),
+        (ProcessRetryDenied::InitiatorNotOwner,
+            &|| require_call_control_authority_on(conn, &initiator, instance_id)),
+    ];
+    for (reason, check) in stages {
+        match check() {
+            Ok(()) => {}
+            Err(error) if error.downcast_ref::<ProcessAuthorityDenied>().is_some() => {
+                return Ok(Some(reason));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+/// The refusal text of a retry the projection does not offer. Fixed sentences:
+/// the answer never carries the failure text of a worker.
+fn retry_refusal_text(retry: &ProcessIncidentRetry) -> &'static str {
+    match (retry.kind, retry.denied_reason) {
+        (_, Some(ProcessRetryDenied::ViewOnly)) => "only the process initiator or the definition owner may retry",
+        (_, Some(ProcessRetryDenied::InitiatorNotOwner)) =>
+            "the initiator no longer owns the definition, so the work cannot run in their name",
+        (_, Some(ProcessRetryDenied::InitiatorUnavailable)) =>
+            "the initiator is no longer active, so the work cannot run in their name",
+        (_, Some(ProcessRetryDenied::SourceUnavailable)) =>
+            "the initiator can no longer use the source of this task",
+        (_, Some(ProcessRetryDenied::ActivationBusy)) => "another step of this instance is already running",
+        (ProcessRetryKind::JobUncertain, _) =>
+            "the outcome of this task is unknown, so repeating it is not available",
+        (ProcessRetryKind::OutputMapping, _) => "reapplying an accepted result is not available",
+        _ => "this incident cannot be retried",
     }
 }
 
@@ -5746,13 +5822,13 @@ fn instance_can_retry_on(
         return Ok(false);
     }
     let mut statement = conn.prepare(
-        "SELECT job_id FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL AND job_id IS NOT NULL ORDER BY at_ms,incident_id",
+        "SELECT code,job_id FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL AND job_id IS NOT NULL ORDER BY at_ms,incident_id",
     )?;
-    let job_ids = statement
-        .query_map([instance_id], |row| row.get::<_, String>(0))?
+    let incidents = statement
+        .query_map([instance_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for job_id in job_ids {
-        if incident_retryable_on(conn, access, instance_id, Some(&job_id), None)? {
+    for (code, job_id) in incidents {
+        if incident_retry_on(conn, access, instance_id, &code, Some(&job_id), None)?.0 {
             return Ok(true);
         }
     }
@@ -5767,7 +5843,7 @@ fn incident_on(
     model: &ProcessModel,
 ) -> Result<ProcessIncidentSelection> {
     let (node_id,job_id,code,message,at_ms,resolved_at_ms):(Option<String>,Option<String>,String,String,i64,Option<i64>)=conn.query_row("SELECT node_id,job_id,code,message,at_ms,resolved_at_ms FROM bpmn_incidents WHERE instance_id=?1 AND incident_id=?2",params![instance_id,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).context("process incident not found")?;
-    let can_retry = incident_retryable_on(conn, access, instance_id, job_id.as_deref(), resolved_at_ms)?;
+    let (can_retry, retry) = incident_retry_on(conn, access, instance_id, &code, job_id.as_deref(), resolved_at_ms)?;
     let scope_id: String = conn.query_row(
         "SELECT scope_id FROM bpmn_incidents WHERE incident_id=?1 AND instance_id=?2",
         params![id, instance_id],
@@ -5793,6 +5869,7 @@ fn incident_on(
             code,
             at_ms,
             can_retry,
+            retry,
         },
         resolved_at_ms,
     })
@@ -26197,6 +26274,43 @@ fn claim_queued_job_on(
     }))
 }
 
+/// Opens the incident of a job that failed before any effect. When the job
+/// is the attempt a retry started, the incident that retry closed is reopened
+/// on the new job instead of a second row being inserted: one failing
+/// activity is one incident until it resolves, so a retry that fails again
+/// neither multiplies the list nor queues another notice.
+fn raise_job_incident_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    scope_id: &str,
+    node_id: &str,
+    job_id: &str,
+    code: &str,
+    message: &str,
+    at_ms: i64,
+) -> Result<String> {
+    let retried: Option<String> = tx.query_row(
+        "SELECT json_extract(data_json,'$.incident_id') FROM bpmn_events WHERE instance_id=?1 AND kind='job_retried' AND json_extract(data_json,'$.new_job_id')=?2 LIMIT 1",
+        params![instance_id, job_id],
+        |row| row.get(0),
+    ).optional()?.flatten();
+    if let Some(incident_id) = retried {
+        let reopened = tx.execute(
+            "UPDATE bpmn_incidents SET job_id=?1,code=?2,message=?3,resolved_at_ms=NULL WHERE incident_id=?4 AND instance_id=?5 AND scope_id=?6 AND node_id=?7 AND resolved_at_ms IS NOT NULL",
+            params![job_id, code, message, incident_id, instance_id, scope_id, node_id],
+        )?;
+        if reopened == 1 {
+            return Ok(incident_id);
+        }
+    }
+    let incident_id = Uuid::new_v4().to_string();
+    tx.execute(
+        "INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![incident_id, instance_id, scope_id, node_id, job_id, code, message, at_ms],
+    )?;
+    Ok(incident_id)
+}
+
 /// Closes a queued job that never ran as a pre-dispatch failure: the invocation
 /// is proved to have had no effect, the instance shows an incident, and a person
 /// can retry the task directly.
@@ -26215,8 +26329,8 @@ fn fail_queued_job_on(
     tx.execute("UPDATE bpmn_jobs SET status='error',updated_at_ms=?1 WHERE job_id=?2 AND status='queued'",params![now_ms,job_id])?;
     tx.execute("UPDATE bpmn_instances SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2",params![now_ms,instance_id])?;
     tx.execute("UPDATE bpmn_scopes SET status='incident',revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND scope_id=?3 AND parent_scope_id IS NOT NULL AND status NOT IN ('completed','cancelled','error')",params![now_ms,instance_id,scope_id])?;
-    let incident_id = Uuid::new_v4().to_string();
-    tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,node_id,job_id,code,message,at_ms,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![incident_id,instance_id,node_id,job_id,code,incident_message(reason),now_ms,scope_id])?;
+    let incident_id = raise_job_incident_on(tx, instance_id, scope_id, node_id, job_id, code,
+        &incident_message(reason), now_ms)?;
     let next_seq: u64 = tx.query_row(
         "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
         [instance_id],
@@ -29307,6 +29421,17 @@ pub fn retry_job(
         && instance.status == ProcessInstanceStatus::Incident,
         "process instance revision conflict or not incident");
     sql_incrementable(expected_revision)?;
+    let open_code: Option<String> = tx.query_row(
+        "SELECT code FROM bpmn_incidents WHERE instance_id=?1 AND job_id=?2 AND resolved_at_ms IS NULL ORDER BY at_ms,incident_id LIMIT 1",
+        params![instance_id, job_id], |row| row.get(0)).optional()?;
+    if let Some(code) = open_code {
+        // The same projection the reader was shown, so a refusal is typed and
+        // never depends on the words of a later check.
+        let (offered, retry) = incident_retry_on(&tx, access, instance_id, &code, Some(job_id), None)?;
+        if !offered {
+            return Err(ProcessOperationDenied(retry_refusal_text(&retry)).into());
+        }
+    }
     ensure!(job_direct_retryable_on(&tx, job_id, instance_id)?,
         "Service direct retry requires one proved-no-effect invocation before dispatch");
     require_call_control_authority_on(&tx, &initiator, instance_id)?;
@@ -30226,9 +30351,8 @@ pub fn fail_job_with_authority(
         ensure!(changed == 1, "pre-dispatch Service boundary changed");
         tx.execute("UPDATE bpmn_jobs SET status='error',worker_id=NULL,lease_until_ms=NULL,updated_at_ms=?1 WHERE job_id=?2 AND status='running'",
             params![now_ms,job_id])?;
-        let incident_id = Uuid::new_v4().to_string();
-        tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![incident_id,instance_id,scope_id,node_id,job_id,code,incident_message(&message),now_ms])?;
+        let incident_id = raise_job_incident_on(&tx, &instance_id, &scope_id, &node_id, job_id,
+            code, &incident_message(&message), now_ms)?;
         let next_seq: u64 = tx.query_row(
             "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
             [&instance_id], |row| row_u64(row, 0))?;
@@ -33639,6 +33763,7 @@ pub(crate) fn record_message_failed_in_tx(
             message: bounded_failure_message(reason),
             at_ms,
             can_retry: false,
+            retry: Default::default(),
         };
         let mut plan = RuntimePlan::initial(snapshot.instance.variables.clone());
         plan.status = ProcessInstanceStatus::Incident;
@@ -34288,6 +34413,7 @@ mod tests {
             message: reason.clone(),
             at_ms: i64::MAX,
             can_retry: true,
+            retry: Default::default(),
         };
         instance.incidents = vec![incident.clone(); 20];
         let timer = ProcessTimerSummary {

@@ -1603,6 +1603,7 @@ mod tests {
                 message: "Independent retained evidence".into(),
                 at_ms: at,
                 can_retry: false,
+                retry: Default::default(),
             });
         repository::apply_transition(
             &f.db,

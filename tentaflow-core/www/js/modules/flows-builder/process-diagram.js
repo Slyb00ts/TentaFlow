@@ -5,6 +5,8 @@ import { escapeAttr, escapeHtml } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { FlowCanvas } from './canvas.js';
 import { processBody, processElementNames, processPlainError, processTemplates } from './bpmn.js';
+import { replaceKeepingFocus } from './keep-focus.js';
+import { retryOffered, retryRefusal } from './process-retry.js';
 import {
   ascendTo, buildTokenOverlay, canvasOverlay, createTokenFeed, drillInto, instanceIsTerminal, repeatingNodeIds, scopeHasEnded,
   trailPath, unknownElementIds,
@@ -49,8 +51,8 @@ function signatureOf(value) {
 /**
  * Mounts the diagram into `section` and returns its controller. `context`
  * supplies what lives in the instance window: `instance()` (the last snapshot),
- * `openInstance(id)`, `inspectIncident(id)`, `completeTask(summary)` and
- * `incidentText(incident)`.
+ * `openInstance(id)`, `inspectIncident(id)`, `retryIncident(incident)`,
+ * `completeTask(summary)` and `incidentText(incident)`.
  */
 export function mountProcessDiagram(section, { instanceId, context }) {
   section.innerHTML = `<div class="fb-diagram-toolbar">
@@ -104,13 +106,6 @@ export function mountProcessDiagram(section, { instanceId, context }) {
     },
     onError: (error) => { errorMessage = errorNotice(error); renderNotices(); },
   });
-
-  // Focus survives a redraw: the control that had it is found again by its key.
-  function replaceKeepingFocus(host, build) {
-    const focused = host.contains(document.activeElement) ? document.activeElement.closest('[data-focus-key]')?.dataset.focusKey : null;
-    build();
-    if (focused) host.querySelector(`[data-focus-key="${CSS.escape(focused)}"]`)?.querySelector('button, a')?.focus({ preventScroll: true });
-  }
 
   function ensureCanvas() {
     if (canvas) return;
@@ -232,6 +227,25 @@ export function mountProcessDiagram(section, { instanceId, context }) {
     return element;
   }
 
+  // Inspect always; Retry where the server offers it to this reader, otherwise the reason in words.
+  function incidentControls(incident, incidentId) {
+    const controls = [button(text('inspect_incident'), `incident:${incidentId}`, () => context.inspectIncident(incidentId))];
+    if (incident && retryOffered(incident)) {
+      const retry = button(text('retry'), `retry:${incidentId}`, () => context.retryIncident(incident));
+      retry.dataset.diagramRetry = '';
+      controls.push(retry);
+    }
+    const reason = incident ? retryRefusal(incident) : null;
+    let refusal = null;
+    if (reason) {
+      refusal = document.createElement('p');
+      refusal.className = 'fb-field-hint';
+      refusal.dataset.retryNote = '';
+      refusal.textContent = reason;
+    }
+    return { controls, refusal };
+  }
+
   function occurrenceText(token) {
     const group = context.instance().repetitionGroups?.find((candidate) => candidate.groupId === token.occurrence.groupId);
     return group?.total == null ? text('repeat_ordinal', { ordinal: token.occurrence.ordinal + 1 })
@@ -297,7 +311,9 @@ export function mountProcessDiagram(section, { instanceId, context }) {
       note.className = 'fb-diagram-incident';
       note.textContent = incident ? context.incidentText(incident) : text('diagram_incident_unloaded');
       row.append(note);
-      actions.append(button(text('inspect_incident'), `incident:${incidentId}`, () => context.inspectIncident(incidentId)));
+      const { controls, refusal } = incidentControls(incident, incidentId);
+      if (refusal) row.append(refusal);
+      actions.append(...controls);
     }
     if (token.kind === 'UserTask') {
       const task = taskFor(token.wait.UserTask.userTaskId);
@@ -326,7 +342,8 @@ export function mountProcessDiagram(section, { instanceId, context }) {
     if (!instance) return;
     const names = model ? processElementNames(model) : new Map();
     const entry = selectedNodeId ? overlay?.nodes.get(selectedNodeId) : null;
-    const signature = signatureOf([selectedNodeId, entry, overlay?.visitedNodeIds.has(selectedNodeId), instance.revision, instance.variablesRedacted, I18n.getLanguage()]);
+    const signature = signatureOf([selectedNodeId, entry, overlay?.visitedNodeIds.has(selectedNodeId), instance.revision, instance.variablesRedacted, I18n.getLanguage(),
+      (instance.incidents ?? []).map((incident) => [incident.incidentId, incident.canRetry, incident.retry])]);
     if (signature === renderedPanel) return;
     renderedPanel = signature;
     replaceKeepingFocus(panel, () => {
@@ -362,7 +379,9 @@ export function mountProcessDiagram(section, { instanceId, context }) {
           note.className = 'fb-diagram-incident';
           note.textContent = incident ? context.incidentText(incident) : text('diagram_incident_unloaded');
           panel.append(note);
-          panel.append(button(text('inspect_incident'), `incident:${incidentId}`, () => context.inspectIncident(incidentId)));
+          const { controls, refusal } = incidentControls(incident, incidentId);
+          if (refusal) panel.append(refusal);
+          panel.append(...controls);
         }
       }
     });

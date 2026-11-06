@@ -3476,7 +3476,7 @@ fn terminating_parallel_sibling_rejects_an_invented_xor_failure_wait() {
         incident_id: incident_id.clone(), scope_id: instance_id.clone(),
         node_id: Some("Choice".into()), node_name: Some("Select a terminal path".into()),
         job_id: None, code: "NO_MATCHING_FLOW".into(), message: message.into(), at_ms,
-        can_retry: false,
+        can_retry: false, retry: Default::default(),
     });
     forged.resolve_incident_ids.push(incident_id);
     assert_eq!(forged.events.len(), plan.events.len());

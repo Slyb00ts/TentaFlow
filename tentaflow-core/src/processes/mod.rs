@@ -12,6 +12,7 @@ pub mod model;
 pub mod messages;
 pub mod notices;
 pub mod repository;
+mod retry_class;
 pub mod runtime;
 pub mod simulation;
 pub mod simulation_schema;
@@ -76,6 +77,8 @@ mod monitor_tests;
 
 #[cfg(test)]
 mod notices_tests;
+#[cfg(test)]
+mod retry_tests;
 #[cfg(test)]
 mod simulation_tests;
 #[cfg(test)]

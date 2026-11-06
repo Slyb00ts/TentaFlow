@@ -9,7 +9,7 @@ use tentaflow_protocol::processes::{
 use super::repository::{self, InstanceFilter, ProcessActor, ProcessAuthorityDenied, ProcessOperationDenied};
 use super::runtime::test_support::*;
 
-fn member(fixture: &Fixture, name: &str, role_id: &str) -> ProcessActor {
+pub(super) fn member(fixture: &Fixture, name: &str, role_id: &str) -> ProcessActor {
     let id = crate::db::repository::create_user_account(
         &fixture.db, name, "test-password-hash", name, &format!("{name}@example.test"),
     ).expect("create process user");
@@ -21,14 +21,14 @@ fn member(fixture: &Fixture, name: &str, role_id: &str) -> ProcessActor {
 
 /// The product lets only the owner start an instance, so a different owner is
 /// reached by moving the definition in the database.
-fn move_definition_to(fixture: &Fixture, definition_id: &str, owner: &ProcessActor) {
+pub(super) fn move_definition_to(fixture: &Fixture, definition_id: &str, owner: &ProcessActor) {
     fixture.db.write().unwrap().execute(
         "UPDATE bpmn_definitions SET owner_user_id=?1 WHERE definition_id=?2",
         rusqlite::params![owner.user_id, definition_id],
     ).unwrap();
 }
 
-fn is_not_found(error: &anyhow::Error) -> bool {
+pub(super) fn is_not_found(error: &anyhow::Error) -> bool {
     error.downcast_ref::<ProcessAuthorityDenied>().is_some()
         && error.to_string().contains("not found")
 }

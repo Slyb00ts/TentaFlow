@@ -1428,3 +1428,25 @@ test('monitor answers carry the access ground and the redaction flags only when 
     events: [], next_seq: 0, has_more: false, data_redacted: true } } })));
   assert.equal(history.dataRedacted, true);
 });
+
+test('an incident carries its retry kind and the reason it is not offered, and an old server without them decodes to nothing', { skip }, () => {
+  const decodeIncidents = (incidents) => wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    InstanceGetResponse: { instance: {
+      instance_id: 'i1', definition_id: 'd1', definition_name: 'Approval', process_id: 'Process_Approval', start_node_id: 'Start_1',
+      initiator_user_id: 'u1', version: 1, revision: 1, status: 'Incident', variables: {}, active_node_ids: [], user_tasks: [], incidents,
+      created_at_ms: 1, updated_at_ms: 1, can_cancel: false, can_retry: false, can_send_message: false, subscriptions: [], event_races: [],
+      outgoing_messages: [], message_names: [], scopes: [], calls: [], repetition_groups: [], repetition_occurrences: [],
+      selected_repetition_occurrence: null } } } }))).instance.incidents;
+  const base = { incident_id: 'inc', node_id: 'Check', node_name: 'Check', job_id: 'job', code: 'EXTERNAL_OUTCOME_UNCERTAIN', message: 'm', at_ms: 1, can_retry: false, scope_id: 'i1' };
+  const [uncertain, mapping, old] = decodeIncidents([
+    { ...base, retry: { kind: 'JobUncertain', denied_reason: 'OutcomeUncertain' } },
+    { ...base, code: 'ACTIVITY_IO_OUTPUT_FAILED', retry: { kind: 'OutputMapping' } },
+    base,
+  ]);
+  assert.equal(uncertain.retry.kind, 'JobUncertain');
+  assert.equal(uncertain.retry.deniedReason, 'OutcomeUncertain');
+  assert.equal(mapping.retry.kind, 'OutputMapping');
+  assert.equal(mapping.retry.deniedReason ?? null, null);
+  assert.equal(old.retry?.kind ?? 'None', 'None');
+  assert.equal(old.canRetry, false);
+});

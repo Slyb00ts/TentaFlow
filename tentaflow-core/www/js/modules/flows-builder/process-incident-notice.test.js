@@ -171,7 +171,7 @@ test('every incident code the engine can raise has its own sentence in all five 
   // Literals that are import diagnostics, simulation verdicts, expression lints
   // or test labels, never an incident code a reader sees.
   const notIncidents = /^(CAMUNDA_|EXPR_|SIMULATION_|[A-Z]_[A-Z]$)/;
-  const elsewhere = new Set(['LARGE_REASON', 'LATE_ERROR', 'OTHER_HANDLER_FAILURE', 'OUT_DIR', 'UNSUPPORTED_OR_INVALID_BPMN', 'ESCALATION_IMMEDIATE_PATH_UNSUPPORTED']);
+  const elsewhere = new Set(['LARGE_REASON', 'LATE_ERROR', 'OTHER_HANDLER_FAILURE', 'OUT_DIR', 'CARGO_MANIFEST_DIR', 'UNSUPPORTED_OR_INVALID_BPMN', 'ESCALATION_IMMEDIATE_PATH_UNSUPPORTED']);
   const codes = [...new Set(sources.flatMap((source) => source.match(/"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+"/g) ?? []))]
     .map((literal) => literal.slice(1, -1))
     .filter((code) => !notIncidents.test(code) && !elsewhere.has(code));

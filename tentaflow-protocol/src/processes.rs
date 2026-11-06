@@ -1306,6 +1306,59 @@ impl From<&ProcessUserTask> for ProcessUserTaskSummary {
     }
 }
 
+/// What a retry of an incident would be, decided by the server from the
+/// incident code and the proof held for its job; the client never guesses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ProcessRetryKind {
+    /// The task never took effect outside: a fresh attempt of the same task.
+    Job,
+    /// The outside effect may have happened: a repeat could double it.
+    JobUncertain,
+    /// The work is accepted and only its mapping into variables failed.
+    OutputMapping,
+    /// A retry would repeat the same failure or belongs to another mechanism.
+    #[default]
+    None,
+}
+
+/// Why this reader is not offered a retry of the incident. Always an answer to
+/// "why not", never a raw code: the client turns each one into a sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProcessRetryDenied {
+    /// The reader may look at the instance but not operate it.
+    ViewOnly,
+    /// The work runs in the initiator's name and the initiator no longer owns the process.
+    InitiatorNotOwner,
+    /// The initiator is deactivated, so nothing can run in their name.
+    InitiatorUnavailable,
+    /// The flow, block, tool or agent behind the task can no longer be used by the initiator.
+    SourceUnavailable,
+    /// Another step of the instance is already running.
+    ActivationBusy,
+    /// The task is not proven to have had no effect.
+    NoProofOfNoEffect,
+    /// The outcome is unknown and repeating it is not available here.
+    OutcomeUncertain,
+    /// The same data would give the same failure.
+    SameFailureRepeats,
+    /// A person has to decide, not the engine.
+    NeedsPerson,
+    /// The engine tries again on its own.
+    Automatic,
+    /// Handled by another mechanism: calls, timers, messages, signals, scopes.
+    OtherMechanism,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessIncidentRetry {
+    pub kind: ProcessRetryKind,
+    /// Set whenever the reader is not offered a retry of a kind that is
+    /// otherwise retryable, and for every kind `None` that has a known reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub denied_reason: Option<ProcessRetryDenied>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessIncident {
     pub incident_id: String,
@@ -1317,6 +1370,8 @@ pub struct ProcessIncident {
     pub at_ms: i64,
     pub can_retry: bool,
     pub scope_id: String,
+    #[serde(default)]
+    pub retry: ProcessIncidentRetry,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
