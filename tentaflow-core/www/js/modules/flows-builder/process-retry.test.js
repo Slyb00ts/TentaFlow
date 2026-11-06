@@ -155,16 +155,39 @@ test('focus stays on the Retry control when the same incident is drawn again', a
   assert.ok(document.activeElement === redrawn.querySelector('button'), 'focus is back on the rebuilt control');
 });
 
+test('an accepted result that failed to map offers Apply result again in its own words and sends the same retry', async () => {
+  const mapping = incident({ code: 'ACTIVITY_IO_OUTPUT_FAILED', retry: { kind: 'OutputMapping' } });
+  const after = run([], { revision: 12, status: 'Running' });
+  let latest = run([mapping]);
+  const win = await open(latest, { processInstanceGetRequest: () => ({ instance: latest }), processJobRetryRequest: () => { latest = after; return { instance: after }; } });
+  assert.equal(win.querySelector('[data-retry]').textContent.trim(), I18n.t('bpmn.retry_output'));
+  click(win.querySelector('[data-retry]')); await flush();
+  assert.equal(confirmations.length, 1);
+  assert.deepEqual([confirmations[0].title, confirmations[0].message, confirmations[0].confirmLabel],
+    [I18n.t('bpmn.retry_output'), I18n.t('bpmn.retry_output_hint'), I18n.t('bpmn.retry_output')]);
+  const sent = calls.filter((row) => row.kind === 'processJobRetryRequest');
+  assert.equal(sent.length, 1);
+  assert.deepEqual([sent[0].payload.jobId, sent[0].payload.expectedRevision], ['job-1', 11]);
+  assert.ok(toastTexts().includes(I18n.t('bpmn.retry_output_started')), toastTexts().join('|'));
+  assert.equal(toastTexts().includes(I18n.t('bpmn.retry_started')), false);
+});
+
+test('an exhausted output retry says so in words and offers nothing', async () => {
+  const win = await open(run([incident({ code: 'ACTIVITY_IO_OUTPUT_FAILED', canRetry: false, retry: { kind: 'OutputMapping', deniedReason: 'OutputRetryLimit' } })], { canRetry: false }));
+  assert.equal(win.querySelector('[data-retry]'), null);
+  assert.equal(win.querySelector('[data-retry-note]').textContent, I18n.t('bpmn.retry_denied_output_retry_limit'));
+});
+
 test('an incident without an offer says why, in words, and has no Retry button', async () => {
   const win = await open(run([
     incident({ incidentId: 'a', canRetry: false, retry: { kind: 'Job', deniedReason: 'ViewOnly' } }),
     incident({ incidentId: 'b', jobId: null, code: 'NO_MATCHING_FLOW', canRetry: false, retry: { kind: 'None', deniedReason: 'SameFailureRepeats' } }),
-    incident({ incidentId: 'c', jobId: null, code: 'ACTIVITY_IO_OUTPUT_FAILED', canRetry: false, retry: { kind: 'OutputMapping' } }),
+    incident({ incidentId: 'c', jobId: null, code: 'ACTIVITY_IO_OUTPUT_FAILED', canRetry: false, retry: { kind: 'OutputMapping', deniedReason: 'ResultNotRetained' } }),
     incident({ incidentId: 'd', jobId: null, code: 'X_UNKNOWN', canRetry: false }),
   ], { canRetry: false }));
   assert.equal(win.querySelector('[data-retry]'), null);
   const notes = [...win.querySelectorAll('[data-retry-note]')].map((node) => node.textContent);
-  assert.deepEqual(notes, [I18n.t('bpmn.retry_denied_view_only'), I18n.t('bpmn.retry_denied_same_failure_repeats'), I18n.t('bpmn.retry_output_mapping_pending')]);
+  assert.deepEqual(notes, [I18n.t('bpmn.retry_denied_view_only'), I18n.t('bpmn.retry_denied_same_failure_repeats'), I18n.t('bpmn.retry_denied_result_not_retained')]);
   for (const note of notes) assert.doesNotMatch(note, /ViewOnly|SameFailureRepeats|OutputMapping|_/);
 });
 
@@ -185,7 +208,7 @@ test('every reason the server can give has a sentence in all five locales and th
   assert.deepEqual([...RETRY_REASONS].sort(), [...variants].sort());
   const keys = [...RETRY_REASONS.map((reason) => `retry_denied_${reason.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase()}`),
     'retry_denied_generic', 'retry_denied_quota', 'retry_denied_permission', 'incident_token_quota_exceeded', 'incident_tool_permission_denied',
-    'retry_output_mapping_pending', 'retry_started', 'retry_refused', 'retry_hint'];
+    'retry_output', 'retry_output_hint', 'retry_output_started', 'event_output_retried', 'event_output_retry_failed', 'retry_started', 'retry_refused', 'retry_hint'];
   const english = JSON.parse(readFileSync(new URL('../../../i18n/en.json', import.meta.url), 'utf8')).bpmn;
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     const bpmn = JSON.parse(readFileSync(new URL(`../../../i18n/${language}.json`, import.meta.url), 'utf8')).bpmn;

@@ -6,7 +6,7 @@ import { I18n } from '/js/i18n.js';
 import { FlowCanvas } from './canvas.js';
 import { processBody, processElementNames, processPlainError, processTemplates } from './bpmn.js';
 import { replaceKeepingFocus } from './keep-focus.js';
-import { retryOffered, retryRefusal } from './process-retry.js';
+import { retryOffered, retryRefusal, retryWords } from './process-retry.js';
 import {
   ascendTo, buildTokenOverlay, canvasOverlay, createTokenFeed, drillInto, instanceIsTerminal, repeatingNodeIds, scopeHasEnded,
   trailPath, unknownElementIds,
@@ -231,7 +231,7 @@ export function mountProcessDiagram(section, { instanceId, context }) {
   function incidentControls(incident, incidentId) {
     const controls = [button(text('inspect_incident'), `incident:${incidentId}`, () => context.inspectIncident(incidentId))];
     if (incident && retryOffered(incident)) {
-      const retry = button(text('retry'), `retry:${incidentId}`, () => context.retryIncident(incident));
+      const retry = button(retryWords(incident).label, `retry:${incidentId}`, () => context.retryIncident(incident));
       retry.dataset.diagramRetry = '';
       controls.push(retry);
     }

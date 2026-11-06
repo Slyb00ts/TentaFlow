@@ -17,7 +17,7 @@ import '/js/components/tf-segmented.js';
 import { mountProcessDiagram, readInstanceModel } from './process-diagram.js';
 import { ATTENTION_PAGE, loadAttentionInstances } from './process-attention.js';
 import { focusFirstOf, replaceKeepingFocus } from './keep-focus.js';
-import { retryOffered, retryRefusal } from './process-retry.js';
+import { retryOffered, retryRefusal, retryWords } from './process-retry.js';
 
 // Fired by an instance window after it changed the instance (cancel, retry), so a
 // list that is open reloads instead of showing the old state.
@@ -664,16 +664,17 @@ export async function openProcessInstance(instanceId, initial = null) {
     if (retryAsking || !retryOffered(incident) || mutation || !available || !win.isConnected) return;
     retryAsking = true;
     try {
-      const approved = await customElements.get('tf-window').confirm({ title: text('retry'), message: text('retry_hint'), confirmLabel: text('retry') });
+      const words = retryWords(incident);
+      const approved = await customElements.get('tf-window').confirm({ title: words.label, message: words.hint, confirmLabel: words.label });
       if (!approved || !win.isConnected) return;
       const current = instance.incidents.find((candidate) => candidate.incidentId === incident.incidentId);
-      if (!current || !retryOffered(current) || current.jobId !== incident.jobId || mutation) {
+      if (!current || !retryOffered(current) || current.jobId !== incident.jobId || current.retry?.kind !== incident.retry?.kind || mutation) {
         await refresh();
         return;
       }
       host.querySelectorAll('[data-retry]').forEach((control) => control.setAttribute('disabled', ''));
       if (await applyMutation('processJobRetryRequest', { instanceId, jobId: current.jobId, expectedRevision: instance.revision }, retryCommand)) {
-        toast(text('retry_started'), 'success');
+        toast(words.started, 'success');
       }
       if (win.isConnected) {
         const key = (kind) => `[data-focus-key="${CSS.escape(`${kind}:${incident.incidentId}`)}"]`;
@@ -859,7 +860,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       const refusal = retryRefusal(incident);
       row.innerHTML = `<div><strong>${escapeHtml(incidentTitles.get(incident.incidentId))}</strong><p>${escapeHtml(incidentSentence(incident, instance.variablesRedacted))}</p><p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)}</p>${refusal ? `<p class="fb-field-hint" data-retry-note>${escapeHtml(refusal)}</p>` : ''}${repeatedNote(incident)}${scopeLine(incident.scopeId)}</div>
         <tf-button variant="secondary" data-focus-key="inspect:${escapeAttr(incident.incidentId)}" data-inspect-incident>${escapeHtml(text('inspect_incident'))}</tf-button>
-        ${retryOffered(incident) ? `<tf-button variant="secondary" icon="refresh" data-focus-key="retry:${escapeAttr(incident.incidentId)}" data-retry>${escapeHtml(text('retry'))}</tf-button>` : ''}`;
+        ${retryOffered(incident) ? `<tf-button variant="secondary" icon="refresh" data-focus-key="retry:${escapeAttr(incident.incidentId)}" data-retry>${escapeHtml(retryWords(incident).label)}</tf-button>` : ''}`;
       row.querySelector('[data-inspect-incident]').addEventListener('click', () => { selectedIncidentId = incident.incidentId; refresh(); });
       row.querySelector('[data-retry]')?.addEventListener('click', () => retryIncident(incident));
       incidents.appendChild(row);

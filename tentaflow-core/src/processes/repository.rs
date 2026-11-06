@@ -680,6 +680,7 @@ pub struct ActivityIoWitness {
     pub activity_kind: String,
     pub phase_owner: String,
     pub phase: String,
+    pub generation: u32,
     pub revision: u64,
     pub input_event_id: Option<String>,
     pub input_values: Option<Vec<IoObservedInput>>,
@@ -895,6 +896,25 @@ pub struct ActivityIoContinuationFact {
     pub disposition: ActivityIoResultDisposition,
 }
 
+/// A new generation of the witness of a blocked Service activation: the same
+/// accepted result mapped again, and now applied. A retry that fails again never
+/// reaches a plan (it changes no token and no variable), so only the applied
+/// disposition exists here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActivityIoOutputRetryFact {
+    pub previous_witness_id: String,
+    pub witness_id: String,
+    pub generation: u32,
+    pub scope_id: String,
+    pub node_id: String,
+    pub token_id: String,
+    pub retry_event_index: usize,
+    pub output_event_index: usize,
+    pub observed: IoObservedValue,
+    pub ordered_outputs: Vec<IoObservedOutput>,
+    pub local_patch: Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StartInputRef {
     Manual { command_id: String, request_hash: String },
@@ -934,6 +954,11 @@ pub enum AcceptedInputRef {
     Signal { signal_id: String, receipt_id: String, expected_receipt_revision: u64, claim_fence: String, target_subscription_id: String, expected_subscription_revision: u64 },
     Service { job_id: String, attempt: u32, fence: u64, result_event_id: String },
     CallReturn { call_id: String, child_instance_id: String, expected_child_revision: u64, parent_token_id: String },
+    /// The accepted result of a finished Service job, mapped into variables again
+    /// after its first mapping failed. `generation` is the attempt number (1 is the
+    /// first retry); the work itself is never run again.
+    OutputRetry { job_id: String, invocation_id: String, token_id: String, generation: u32,
+        expected_instance_revision: u64, command_id: String, request_hash: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1088,6 +1113,7 @@ pub struct RuntimePlan {
     pub activity_io_inputs: Vec<ActivityIoInputFact>,
     pub activity_io_results: Vec<ActivityIoResultFact>,
     pub activity_io_continuations: Vec<ActivityIoContinuationFact>,
+    pub activity_io_output_retries: Vec<ActivityIoOutputRetryFact>,
     pub repetition_groups: Vec<RepetitionGroup>,
     pub repetition_occurrences: Vec<RepetitionOccurrence>,
     pub repetition_capacity: Option<RepetitionCapacitySource>,
@@ -1164,6 +1190,7 @@ impl RuntimePlan {
             activity_io_inputs: Vec::new(),
             activity_io_results: Vec::new(),
             activity_io_continuations: Vec::new(),
+            activity_io_output_retries: Vec::new(),
             repetition_groups: Vec::new(),
             repetition_occurrences: Vec::new(),
             repetition_capacity: None,
@@ -5719,7 +5746,20 @@ fn incident_retry_on(
         Some(job_id) => job_answered_with_failure_on(conn, job_id, instance_id, code)?,
         None => false,
     };
-    let class = if answered { Some(RetryClass::Job) } else { classify_code(code) };
+    // A mapping that failed after the result was accepted raises EXPRESSION_ERROR
+    // like a failing verification condition does; only the incident's own
+    // history tells them apart, and only the mapping can be applied again.
+    let mapping_stage = code == "EXPRESSION_ERROR" && match job_id {
+        Some(job_id) => expression_error_is_mapping_on(conn, instance_id, job_id)?,
+        None => false,
+    };
+    let class = if answered {
+        Some(RetryClass::Job)
+    } else if mapping_stage {
+        Some(RetryClass::OutputMapping)
+    } else {
+        classify_code(code)
+    };
     // A failure that a repeat would meet again is not offered even when nothing
     // ran; a source that went away is, once the source is back.
     let repeats = match class {
@@ -5753,11 +5793,21 @@ fn incident_retry_on(
         // schema keeps one request id per invocation, so a repeat could not
         // carry the original id the tool would deduplicate by.
         ProcessRetryKind::JobUncertain => Ok(refused(Some(ProcessRetryDenied::OutcomeUncertain))),
-        ProcessRetryKind::OutputMapping | ProcessRetryKind::None => Ok(refused(None)),
+        ProcessRetryKind::None => Ok(refused(None)),
+        ProcessRetryKind::OutputMapping => {
+            let Some(job_id) = job_id else {
+                return Ok(refused(Some(ProcessRetryDenied::ResultNotRetained)));
+            };
+            if let Err(reason) = output_retry_source_on(conn, instance_id, job_id)? {
+                return Ok(refused(Some(reason)));
+            }
+            let blocked = retry_runs_as_initiator_on(conn, instance_id, None)?;
+            Ok((blocked.is_none(), ProcessIncidentRetry { kind, denied_reason: blocked }))
+        }
         ProcessRetryKind::Job if !proof => Ok(refused(Some(ProcessRetryDenied::NoProofOfNoEffect))),
         ProcessRetryKind::Job => {
             let blocked = job_id
-                .map(|job_id| retry_runs_as_initiator_on(conn, instance_id, job_id))
+                .map(|job_id| retry_runs_as_initiator_on(conn, instance_id, Some(job_id)))
                 .transpose()?
                 .flatten();
             Ok((blocked.is_none(), ProcessIncidentRetry { kind, denied_reason: blocked }))
@@ -5765,14 +5815,247 @@ fn incident_retry_on(
     }
 }
 
+/// Whether the EXPRESSION_ERROR incident of this job came from mapping its
+/// accepted result (rather than from evaluating the verification condition).
+/// The runtime marks the first with `stage = "output_mapping"` in the incident
+/// event of the job.
+fn expression_error_is_mapping_on(conn: &Connection, instance_id: &str, job_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_events WHERE instance_id=?1 AND kind='incident' \
+         AND json_extract(data_json,'$.job_id')=?2 AND json_extract(data_json,'$.code')='EXPRESSION_ERROR' \
+         AND json_extract(data_json,'$.stage')='output_mapping')",
+        params![instance_id, job_id], |row| row.get(0))?)
+}
+
+/// Everything a retry of an output mapping stands on, read from the database:
+/// the finished job, its accepted Completed result, the waiting activation and
+/// the one open incident of the job.
+struct OutputRetrySource {
+    job_id: String,
+    incident_id: String,
+    invocation_id: String,
+    scope_id: String,
+    node_id: String,
+    token_id: String,
+    /// Retries already spent on this activation, successful ones excluded (a
+    /// success ends the incident).
+    spent: u32,
+    activity_io: bool,
+    observed: ObservedActivityResult,
+}
+
+/// The accepted result of `job_id` as a candidate for being mapped again, or
+/// the reason it is not. Shared by the projection the reader sees, the command
+/// and the writer's validation, so none of them can disagree.
+fn output_retry_source_on(
+    conn: &Connection,
+    instance_id: &str,
+    job_id: &str,
+) -> Result<std::result::Result<OutputRetrySource, ProcessRetryDenied>> {
+    use ProcessRetryDenied::{OutputRetryLimit, ResultNotRetained};
+    let job: Option<(String, String, String)> = conn.query_row(
+        "SELECT scope_id,node_id,token_id FROM bpmn_jobs WHERE job_id=?1 AND instance_id=?2 AND status='completed'",
+        params![job_id, instance_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional()?;
+    let Some((scope_id, node_id, token_id)) = job else { return Ok(Err(ResultNotRetained)) };
+    let invocation: Option<(String, String)> = conn.query_row(
+        "SELECT invocation_id,observed_result_json FROM bpmn_service_invocations WHERE job_id=?1 AND instance_id=?2 AND phase='accepted'",
+        params![job_id, instance_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional()?;
+    let Some((invocation_id, observed_json)) = invocation else { return Ok(Err(ResultNotRetained)) };
+    let observed: ObservedActivityResult = parse(observed_json)?;
+    let waiting: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_tokens WHERE instance_id=?1 AND token_id=?2 AND scope_id=?3 AND node_id=?4 AND status='waiting')",
+        params![instance_id, token_id, scope_id, node_id], |row| row.get(0))?;
+    let repeated: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_repetition_occurrences WHERE instance_id=?1 AND job_id=?2)",
+        params![instance_id, job_id], |row| row.get(0))?;
+    if observed.result.outcome != ActivityOutcome::Completed || !waiting || repeated {
+        return Ok(Err(ResultNotRetained));
+    }
+    let open: Vec<(String, String)> = conn.prepare(
+        "SELECT incident_id,code FROM bpmn_incidents WHERE instance_id=?1 AND job_id=?2 AND resolved_at_ms IS NULL",
+    )?.query_map(params![instance_id, job_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let [(incident_id, code)] = open.as_slice() else { return Ok(Err(ResultNotRetained)) };
+    // A node with configured IO keeps a witness per attempt; one without keeps
+    // only the incident and the events of its attempts.
+    let witness: Option<(String, u32, Option<String>, Option<String>, String)> = conn.query_row(
+        "SELECT phase,generation,incident_id,retained_route_kind,phase_owner FROM bpmn_activity_io_witnesses w \
+         WHERE instance_id=?1 AND scope_id=?2 AND node_id=?3 AND token_id=?4 \
+           AND generation=(SELECT MAX(g.generation) FROM bpmn_activity_io_witnesses g \
+               WHERE g.instance_id=w.instance_id AND g.scope_id=w.scope_id AND g.token_id=w.token_id \
+                 AND g.phase_owner=w.phase_owner AND COALESCE(g.occurrence_id,'')=COALESCE(w.occurrence_id,''))",
+        params![instance_id, scope_id, node_id, token_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).optional()?;
+    let (activity_io, spent) = match witness {
+        Some((phase, generation, witness_incident, route, owner)) => {
+            if phase != "output_blocked" || owner != "ordinary" || route.as_deref() != Some("mapping")
+                || witness_incident.as_deref() != Some(incident_id.as_str())
+                || code != "ACTIVITY_IO_OUTPUT_FAILED" {
+                return Ok(Err(ResultNotRetained));
+            }
+            (true, generation)
+        }
+        None => {
+            if code != "EXPRESSION_ERROR" || !expression_error_is_mapping_on(conn, instance_id, job_id)? {
+                return Ok(Err(ResultNotRetained));
+            }
+            let failed: u32 = conn.query_row(
+                "SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1 AND kind='output_retry_failed' AND json_extract(data_json,'$.job_id')=?2",
+                params![instance_id, job_id], |row| row.get(0))?;
+            (false, failed)
+        }
+    };
+    if spent >= super::runtime::OUTPUT_RETRY_LIMIT {
+        return Ok(Err(OutputRetryLimit));
+    }
+    Ok(Ok(OutputRetrySource {
+        job_id: job_id.to_owned(), incident_id: incident_id.clone(), invocation_id,
+        scope_id, node_id, token_id,
+        spent, activity_io, observed,
+    }))
+}
+
+/// Maps the accepted result of a job again, in the name of its initiator, and
+/// either continues the run (the mapping now works) or records the failed
+/// attempt on the incident that is already open.
+fn retry_output_mapping_on(
+    tx: &Transaction<'_>,
+    actor: &ProcessActor,
+    stamp: &CommandStamp,
+    instance_id: &str,
+    job_id: &str,
+    expected_revision: u64,
+    at_ms: i64,
+) -> Result<ProcessInstance> {
+    let source = match output_retry_source_on(tx, instance_id, job_id)? {
+        Ok(source) => source,
+        Err(reason) => return Err(ProcessOperationDenied(retry_refusal_text(&ProcessIncidentRetry {
+            kind: ProcessRetryKind::OutputMapping, denied_reason: Some(reason),
+        })).into()),
+    };
+    if let Some(reason) = retry_runs_as_initiator_on(tx, instance_id, None)? {
+        return Err(ProcessOperationDenied(retry_refusal_text(&ProcessIncidentRetry {
+            kind: ProcessRetryKind::OutputMapping, denied_reason: Some(reason),
+        })).into());
+    }
+    let (org_id, initiator_user_id): (String, String) = tx.query_row(
+        "SELECT org_id,initiator_user_id FROM bpmn_instances WHERE instance_id=?1",
+        [instance_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let initiator = ProcessActor { org_id, user_id: initiator_user_id };
+    let snapshot = runtime_snapshot_on(tx, &initiator, instance_id)?;
+    ensure!(snapshot.tokens.iter().all(|token| token.status != "ready"),
+        "output retry has another ready activation");
+    let job = snapshot.jobs.iter().find(|job| job.job_id == job_id)
+        .context("output retry lost its finished job")?.clone();
+    let generation = source.spent + 1;
+    let entry = AcceptedInputRef::OutputRetry {
+        job_id: job_id.to_owned(), invocation_id: source.invocation_id.clone(),
+        token_id: source.token_id.clone(), generation,
+        expected_instance_revision: expected_revision,
+        command_id: stamp.command_id.clone(), request_hash: stamp.request_hash.clone(),
+    };
+    match super::runtime::plan_output_retry(&snapshot, &job, &source.observed,
+        &source.incident_id, at_ms, entry.clone())? {
+        super::runtime::OutputRetryOutcome::Applied(plan) => {
+            apply_plan_on(tx, instance_id, &actor.user_id, expected_revision, &plan,
+                at_ms, None, EntryAuthority::Accepted(&entry), &[])?;
+        }
+        super::runtime::OutputRetryOutcome::Failed(failure) => {
+            record_output_retry_failure_on(tx, instance_id, &source, generation, &failure,
+                stamp, expected_revision, at_ms)?;
+        }
+    }
+    observed_instance_on(tx, actor, instance_id, None)
+}
+
+/// The record of a retry whose mapping failed again. Nothing about the run
+/// changes except the incident (its text and time move to this failure, the row
+/// and so its notice stay) and, for a node with configured IO, one more witness
+/// generation holding the same accepted result as blocked.
+fn record_output_retry_failure_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    source: &OutputRetrySource,
+    generation: u32,
+    failure: &super::runtime::OutputRetryFailure,
+    stamp: &CommandStamp,
+    expected_revision: u64,
+    at_ms: i64,
+) -> Result<()> {
+    let message = bounded_failure_message(&failure.message);
+    let next_seq: u64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+        [instance_id], |row| row_u64(row, 0))?;
+    let event_id = Uuid::new_v4().to_string();
+    insert_event_on(tx, instance_id, next_seq, None, &PlannedEvent {
+        scope_id: source.scope_id.clone(),
+        kind: "output_retry_failed".into(),
+        node_id: Some(source.node_id.clone()),
+        data: serde_json::json!({
+            "incident_id": source.incident_id, "job_id": source.job_id,
+            "invocation_id": source.invocation_id, "activation_token_id": source.token_id,
+            "generation": generation, "message": message,
+            "association_id": failure.association_id, "position": failure.position,
+            "command_id": stamp.command_id, "request_hash": stamp.request_hash,
+        }),
+    }, at_ms, Some(&event_id))?;
+    if source.activity_io {
+        let previous = tx.execute(
+            "INSERT INTO bpmn_activity_io_witnesses \
+             (witness_id,instance_id,scope_id,token_id,node_id,activity_kind,phase_owner,group_id,occurrence_id,ordinal, \
+              definition_id,version,selected_process_id,body_path_json,model_sha256,io_spec_sha256,phase,generation,revision, \
+              input_event_id,input_values_json,input_sha256,result_event_id,source_instance_id,source_event_id, \
+              result_sources_json,result_presence,result_json,result_sha256,retained_route_kind,retained_route_event_id, \
+              retained_route_resource_id,accepted_origin,resource_id,resource_revision,service_invocation_id, \
+              created_at_ms,updated_at_ms) \
+             SELECT ?1,instance_id,scope_id,token_id,node_id,activity_kind,phase_owner,group_id,occurrence_id,ordinal, \
+              definition_id,version,selected_process_id,body_path_json,model_sha256,io_spec_sha256,'result_accepted',?2,1, \
+              input_event_id,input_values_json,input_sha256,result_event_id,source_instance_id,source_event_id, \
+              result_sources_json,result_presence,result_json,result_sha256,retained_route_kind,retained_route_event_id, \
+              retained_route_resource_id,accepted_origin,resource_id,resource_revision,service_invocation_id,?3,?3 \
+             FROM bpmn_activity_io_witnesses \
+             WHERE instance_id=?4 AND scope_id=?5 AND token_id=?6 AND node_id=?7 AND phase_owner='ordinary' \
+               AND generation=?8 AND phase='output_blocked' AND incident_id=?9",
+            params![Uuid::new_v4().to_string(), generation, at_ms, instance_id, source.scope_id,
+                source.token_id, source.node_id, generation - 1, source.incident_id],
+        )?;
+        ensure!(previous == 1, "output retry lost the blocked witness generation it answers");
+        let blocked = tx.execute(
+            "UPDATE bpmn_activity_io_witnesses SET phase='output_blocked',revision=revision+1, \
+             incident_event_id=?1,incident_id=?2,failed_association_id=?3,failed_position=?4,updated_at_ms=?5 \
+             WHERE instance_id=?6 AND scope_id=?7 AND token_id=?8 AND node_id=?9 AND phase_owner='ordinary' \
+               AND generation=?10 AND phase='result_accepted'",
+            params![event_id, source.incident_id, failure.association_id,
+                failure.position.map(|position| position as i64), at_ms, instance_id,
+                source.scope_id, source.token_id, source.node_id, generation],
+        )?;
+        ensure!(blocked == 1, "output retry lost its new witness generation");
+    }
+    let reopened = tx.execute(
+        "UPDATE bpmn_incidents SET message=?1,at_ms=?2 WHERE incident_id=?3 AND instance_id=?4 AND resolved_at_ms IS NULL",
+        params![incident_message(&message), at_ms, source.incident_id, instance_id])?;
+    ensure!(reopened == 1, "output retry lost its open incident");
+    let bumped = tx.execute(
+        "UPDATE bpmn_instances SET revision=revision+1,updated_at_ms=?1 WHERE instance_id=?2 AND revision=?3",
+        params![at_ms, instance_id, sql_integer(expected_revision)?])?;
+    ensure!(bumped == 1, RevisionConflict("process instance revision conflict"));
+    Ok(())
+}
+
 /// The checks `retry_job` enforces before it plans anything, so the projection
 /// never offers a retry that is refused: the initiator must still be active
 /// and own the definition (the work runs in their name), the source must be
 /// current and no other activation may be ready. `None` is "may run".
+///
+/// `job_id` is the job whose source must still be current: a retry that runs
+/// the work again needs it, applying an accepted result again does not.
 fn retry_runs_as_initiator_on(
     conn: &Connection,
     instance_id: &str,
-    job_id: &str,
+    job_id: Option<&str>,
 ) -> Result<Option<ProcessRetryDenied>> {
     let (org_id, initiator_user_id): (String, String) = conn.query_row(
         "SELECT org_id,initiator_user_id FROM bpmn_instances WHERE instance_id=?1",
@@ -5799,8 +6082,10 @@ fn retry_runs_as_initiator_on(
     let stages: [(ProcessRetryDenied, &dyn Fn() -> Result<()>); 4] = [
         (ProcessRetryDenied::InitiatorUnavailable, &|| require_actor(conn, &initiator)),
         (ProcessRetryDenied::InitiatorNotOwner, &|| require_owner(conn, &initiator, &definition_id)),
-        (ProcessRetryDenied::SourceUnavailable,
-            &|| require_source_current(conn, &initiator, &job_source_ref_on(conn, job_id)?, None)),
+        (ProcessRetryDenied::SourceUnavailable, &|| match job_id {
+            Some(job_id) => require_source_current(conn, &initiator, &job_source_ref_on(conn, job_id)?, None),
+            None => Ok(()),
+        }),
         (ProcessRetryDenied::ExecutionUnavailable,
             &|| require_call_control_authority_on(conn, &initiator, instance_id)),
     ];
@@ -5832,6 +6117,10 @@ fn retry_refusal_text(retry: &ProcessIncidentRetry) -> &'static str {
         (_, Some(ProcessRetryDenied::ActivationBusy)) => "another step of this instance is already running",
         (ProcessRetryKind::JobUncertain, _) =>
             "the outcome of this task is unknown, so repeating it is not available",
+        (_, Some(ProcessRetryDenied::OutputRetryLimit)) =>
+            "the accepted result was already applied again as many times as one step allows",
+        (_, Some(ProcessRetryDenied::ResultNotRetained)) =>
+            "the accepted result of this step cannot be applied again",
         (ProcessRetryKind::OutputMapping, _) => "reapplying an accepted result is not available",
         _ => "this incident cannot be retried",
     }
@@ -7096,9 +7385,12 @@ fn activity_io_witnesses_on(conn: &Connection, instance_id: &str) -> Result<Vec<
          input_event_id,input_values_json,input_sha256,result_event_id,source_instance_id, \
          source_event_id,result_sources_json,result_presence,result_json,result_sha256, \
          retained_route_kind,retained_route_event_id,retained_route_resource_id, \
-         service_invocation_id,incident_id,resource_id,group_id,occurrence_id,ordinal \
-         FROM bpmn_activity_io_witnesses WHERE instance_id=?1 \
+         service_invocation_id,incident_id,resource_id,group_id,occurrence_id,ordinal,generation \
+         FROM bpmn_activity_io_witnesses w WHERE instance_id=?1 \
          AND phase IN ('input_failed','input_captured','result_accepted','output_blocked','output_applied') \
+         AND generation=(SELECT MAX(g.generation) FROM bpmn_activity_io_witnesses g \
+             WHERE g.instance_id=w.instance_id AND g.scope_id=w.scope_id AND g.token_id=w.token_id \
+             AND g.phase_owner=w.phase_owner AND COALESCE(g.occurrence_id,'')=COALESCE(w.occurrence_id,'')) \
          ORDER BY scope_id,node_id,token_id,witness_id",
     )?;
     let mut rows = statement.query([instance_id])?;
@@ -7124,7 +7416,7 @@ fn activity_io_witnesses_on(conn: &Connection, instance_id: &str) -> Result<Vec<
             retained_route_event_id: row.get(19)?,
             retained_route_resource_id: row.get(20)?, service_invocation_id: row.get(21)?,
             incident_id: row.get(22)?, resource_id: row.get(23)?, group_id: row.get(24)?,
-            occurrence_id: row.get(25)?, ordinal: row.get(26)?,
+            occurrence_id: row.get(25)?, ordinal: row.get(26)?, generation: row.get(27)?,
         });
     }
     Ok(witnesses)
@@ -7451,10 +7743,20 @@ fn mapped_activity_io_extra_on(
                     ActivityIoResultDisposition::Applied { output_event_index: index, .. }
                         if *index == output_event_index))
             .collect::<Vec<_>>();
-        ensure!(results.len() == 1,
+        let retries = plan.activity_io_output_retries.iter().filter(|fact|
+            fact.scope_id == scope_id && fact.node_id == node.id
+                && fact.token_id == source_token_id
+                && fact.output_event_index == output_event_index)
+            .collect::<Vec<_>>();
+        ensure!(results.len() + retries.len() == 1,
             "mapped activity IO has no unique accepted result witness");
+        let witness_id = match (results.first(), retries.first()) {
+            (Some(result), _) => &result.witness_id,
+            (None, Some(retry)) => &retry.previous_witness_id,
+            (None, None) => unreachable!("one source was checked above"),
+        };
         return activity_io_replay_extra_on(
-            tx, instance_id, plan, &results[0].witness_id,
+            tx, instance_id, plan, witness_id,
             scope_id, &node.id, source_token_id,
         );
     }
@@ -10112,10 +10414,21 @@ fn validate_termination_variables_on(
                                 ActivityIoResultDisposition::Applied { output_event_index, .. }
                                     if *output_event_index == *event_index))
                         .collect::<Vec<_>>();
-                    ensure!(accepted_results.len() == 1,
+                    let output_retries = plan.activity_io_output_retries.iter().filter(|fact|
+                        fact.scope_id == *scope_id
+                            && fact.node_id == *node_id
+                            && fact.token_id == *source_token_id
+                            && fact.output_event_index == *event_index)
+                        .collect::<Vec<_>>();
+                    ensure!(accepted_results.len() + output_retries.len() == 1,
                         "mapped activity IO has no unique accepted result owner");
+                    let owner_witness_id = match (accepted_results.first(), output_retries.first()) {
+                        (Some(result), _) => &result.witness_id,
+                        (None, Some(retry)) => &retry.previous_witness_id,
+                        (None, None) => unreachable!("one owner was checked above"),
+                    };
                     let source = activity_io_input_source_on(
-                        tx, instance_id, plan, &accepted_results[0].witness_id,
+                        tx, instance_id, plan, owner_witness_id,
                         scope_id, node_id, source_token_id,
                     )?;
                     match (source.group_id.as_deref(), source.occurrence_id.as_deref()) {
@@ -10395,6 +10708,17 @@ fn validate_termination_variables_on(
                             vec![("activity_result".to_owned(), serde_json::to_value(&result)?)]
                         } else { Vec::new() };
                         (result.outputs, extra)
+                    }
+                    (ProcessNodeKind::ServiceTask { .. },
+                        AcceptedInputRef::OutputRetry { job_id, invocation_id, token_id, .. }) => {
+                        let source = output_retry_source_on(tx, instance_id, job_id)?
+                            .map_err(|reason| anyhow::anyhow!(
+                                "mapped output retry has no retryable accepted result: {reason:?}"))?;
+                        ensure!(source.invocation_id == *invocation_id
+                            && source.token_id == *token_id && token_id == source_token_id
+                            && source.scope_id == *scope_id && source.node_id == *node_id,
+                            "mapped output retry is not the accepted result of its job");
+                        (source.observed.result.outputs, Vec::new())
                     }
                     (ProcessNodeKind::BoundaryError { .. },
                         AcceptedInputRef::CallReturn { call_id, child_instance_id,
@@ -16987,6 +17311,8 @@ fn validate_activity_io_results_on(
     ensure!(plan.events.iter().enumerate().filter(|(_, event)|
         event.kind == "activity_io_output_applied")
         .all(|(index, _)| output_events.contains(&index)
+            || plan.activity_io_output_retries.iter().any(|fact|
+                fact.output_event_index == index)
             || plan.activity_io_continuations.iter().any(|fact|
                 matches!(&fact.disposition,
                     ActivityIoResultDisposition::Applied { output_event_index, .. }
@@ -17973,6 +18299,149 @@ fn validate_activity_io_continuations_on(
     Ok(())
 }
 
+/// The witness side of a retry of an output mapping: the new generation is the
+/// blocked one answered with the same accepted result, and the mapping it
+/// records is exactly what the authored associations give over the variables
+/// the plan replays. A node without configured IO keeps no witness, so the
+/// plan carries no fact for it.
+fn validate_activity_io_output_retries_on(
+    tx: &Transaction<'_>, instance_id: &str, model: &ProcessModel,
+    scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
+    variable_states: &[BTreeMap<String, Value>], entry: EntryAuthority<'_>,
+) -> Result<()> {
+    let EntryAuthority::Accepted(AcceptedInputRef::OutputRetry {
+        job_id, invocation_id, token_id, generation, ..
+    }) = entry else {
+        ensure!(plan.activity_io_output_retries.is_empty(),
+            "activity IO output retry lacks its accepted command");
+        return Ok(());
+    };
+    let source = output_retry_source_on(tx, instance_id, job_id)?
+        .map_err(|reason| anyhow::anyhow!(
+            "activity IO output retry has no retryable accepted result: {reason:?}"))?;
+    ensure!(plan.activity_io_output_retries.len() == usize::from(source.activity_io),
+        "activity IO output retry has the wrong number of witness generations");
+    let Some(fact) = plan.activity_io_output_retries.first() else { return Ok(()) };
+    ensure!(Uuid::parse_str(&fact.witness_id).is_ok()
+        && fact.token_id == *token_id && fact.generation == *generation
+        && fact.scope_id == source.scope_id && fact.node_id == source.node_id
+        && source.invocation_id == *invocation_id
+        && fact.observed == IoObservedValue::Present {
+            value: source.observed.result.outputs.clone() },
+        "activity IO output retry changed its immutable accepted result");
+    let witnesses = activity_io_witnesses_on(tx, instance_id)?;
+    let previous = witnesses.iter().find(|row| row.witness_id == fact.previous_witness_id)
+        .context("activity IO output retry lost its blocked witness")?;
+    ensure!(previous.phase == "output_blocked" && previous.phase_owner == "ordinary"
+        && previous.generation + 1 == fact.generation
+        && previous.scope_id == fact.scope_id && previous.node_id == fact.node_id
+        && previous.token_id == fact.token_id
+        && previous.retained_route_kind.as_deref() == Some("mapping")
+        && previous.service_invocation_id.as_deref() == Some(invocation_id.as_str())
+        && previous.incident_id.as_deref() == Some(source.incident_id.as_str())
+        && previous.result_presence.as_deref() == Some("present")
+        && previous.result.as_ref() == Some(&source.observed.result.outputs)
+        && previous.result_sha256.as_deref()
+            == Some(activity_io_result_sha256(&fact.observed)?.as_str()),
+        "activity IO output retry changed the blocked result it answers");
+    let retry = plan.events.get(fact.retry_event_index)
+        .context("activity IO output retry has no marker event")?;
+    let output = plan.events.get(fact.output_event_index)
+        .context("activity IO output retry has no applied event")?;
+    ensure!(fact.retry_event_index < fact.output_event_index
+        && retry.kind == "output_retried" && retry.scope_id == fact.scope_id
+        && retry.node_id.as_deref() == Some(fact.node_id.as_str())
+        && plan.event_ids.get(&fact.output_event_index)
+            .is_some_and(|id| Uuid::parse_str(id).is_ok())
+        && output.kind == "activity_io_output_applied" && output.scope_id == fact.scope_id
+        && output.node_id.as_deref() == Some(fact.node_id.as_str())
+        && output.data == serde_json::json!({
+            "source_token_id": fact.token_id,
+            "ordered_outputs": fact.ordered_outputs, "local_patch": fact.local_patch}),
+        "activity IO output retry changed its authenticated events");
+    let selected_process_id = selected_process_id_on(tx, instance_id)?;
+    let path = scope_path(scopes, instance_id, &fact.scope_id)?;
+    let body = super::model::selected_body(model, &selected_process_id, &path)?;
+    let node = body.nodes.iter().find(|node| node.id == fact.node_id)
+        .context("activity IO output retry node left its selected body")?;
+    let (ProcessNodeKind::ServiceTask { output_mapping, .. }, Some(io)) =
+        (&node.kind, node.activity_io.as_ref()) else {
+        bail!("activity IO output retry lost its selected Service mapping")
+    };
+    let modeling = super::model::io_modeling(body.modeling);
+    let effects_before = plan.variable_effects.iter().filter(|effect| match effect {
+        VariableEffect::Mapped { event_index, .. }
+        | VariableEffect::ScopeEntry { event_index, .. }
+        | VariableEffect::RepetitionAggregate { event_index, .. }
+        | VariableEffect::RepetitionEntry { event_index, .. } =>
+            *event_index < fact.output_event_index,
+    }).count();
+    let states = variable_states.get(effects_before)
+        .context("activity IO output retry has no replayed variable state")?;
+    let local = states.get(&fact.scope_id)
+        .context("activity IO output retry has no selected local variables")?;
+    let root = states.get(instance_id)
+        .context("activity IO output retry has no root variables")?;
+    let effective = effective_scope_variables(scopes, states, instance_id, root, &fact.scope_id)?;
+    let replay_extra = activity_io_replay_extra_on(
+        tx, instance_id, plan, &fact.previous_witness_id,
+        &fact.scope_id, &fact.node_id, &fact.token_id,
+    )?;
+    let legacy = super::runtime::patch_variables(output_mapping, local, &effective,
+        &source.observed.result.outputs, &replay_extra)?;
+    let (expected_outputs, expected_patch) = super::runtime::evaluate_activity_outputs(
+        io, modeling, &legacy, &effective, &fact.observed, &replay_extra,
+        super::runtime::ActivityIoOutputOwner::Ordinal)?;
+    ensure!(expected_outputs == fact.ordered_outputs && expected_patch == fact.local_patch
+        && plan.variable_effects.iter().filter(|effect| matches!(effect,
+            VariableEffect::Mapped { event_index, scope_id, node_id, source_token_id,
+                activity_io_outputs: Some(actual), result, .. }
+                if *event_index == fact.output_event_index
+                    && scope_id == &fact.scope_id && node_id == &fact.node_id
+                    && source_token_id == &fact.token_id
+                    && actual == &fact.ordered_outputs && result == &fact.local_patch)).count() == 1
+        && plan.consume_token_ids.iter().filter(|id| *id == &fact.token_id).count() == 1,
+        "activity IO output retry differs from its pure mapping or its one mapped effect");
+    Ok(())
+}
+
+fn insert_activity_io_output_retries_on(
+    tx: &Transaction<'_>, instance_id: &str, plan: &RuntimePlan, at_ms: i64,
+) -> Result<()> {
+    for fact in &plan.activity_io_output_retries {
+        let output_event_id = plan.event_ids.get(&fact.output_event_index)
+            .context("activity IO output retry lacks its applied event UUID")?;
+        let inserted = tx.execute(
+            "INSERT INTO bpmn_activity_io_witnesses \
+             (witness_id,instance_id,scope_id,token_id,node_id,activity_kind,phase_owner,group_id,occurrence_id,ordinal, \
+              definition_id,version,selected_process_id,body_path_json,model_sha256,io_spec_sha256,phase,generation,revision, \
+              input_event_id,input_values_json,input_sha256,result_event_id,source_instance_id,source_event_id, \
+              result_sources_json,result_presence,result_json,result_sha256,retained_route_kind,retained_route_event_id, \
+              retained_route_resource_id,accepted_origin,resource_id,resource_revision,service_invocation_id, \
+              created_at_ms,updated_at_ms) \
+             SELECT ?1,instance_id,scope_id,token_id,node_id,activity_kind,phase_owner,group_id,occurrence_id,ordinal, \
+              definition_id,version,selected_process_id,body_path_json,model_sha256,io_spec_sha256,'result_accepted',?2,1, \
+              input_event_id,input_values_json,input_sha256,result_event_id,source_instance_id,source_event_id, \
+              result_sources_json,result_presence,result_json,result_sha256,retained_route_kind,retained_route_event_id, \
+              retained_route_resource_id,accepted_origin,resource_id,resource_revision,service_invocation_id,?3,?3 \
+             FROM bpmn_activity_io_witnesses \
+             WHERE witness_id=?4 AND instance_id=?5 AND generation=?6 AND phase='output_blocked'",
+            params![fact.witness_id, fact.generation, at_ms, fact.previous_witness_id,
+                instance_id, fact.generation - 1],
+        )?;
+        ensure!(inserted == 1, "activity IO output retry lost its blocked witness CAS");
+        let applied = tx.execute(
+            "UPDATE bpmn_activity_io_witnesses SET phase='output_applied',revision=revision+1, \
+             output_event_id=?1,output_values_json=?2,local_patch_json=?3,updated_at_ms=?4 \
+             WHERE instance_id=?5 AND witness_id=?6 AND phase='result_accepted'",
+            params![output_event_id, json(&fact.ordered_outputs)?, json(&fact.local_patch)?,
+                at_ms, instance_id, fact.witness_id],
+        )?;
+        ensure!(applied == 1, "activity IO output retry lost its accepted-result CAS");
+    }
+    Ok(())
+}
+
 fn validate_activity_io_inputs_on(
     tx: &Transaction<'_>, instance_id: &str, model: &ProcessModel,
     scopes: &[ProcessScopeSummary], plan: &RuntimePlan,
@@ -18723,6 +19192,8 @@ fn validate_termination_plan_on(
         plan, &variable_states, entry)?;
     validate_activity_io_continuations_on(tx, instance_id, model, &mapping_scopes,
         plan, &variable_states, entry)?;
+    validate_activity_io_output_retries_on(tx, instance_id, model, &mapping_scopes,
+        plan, &variable_states, entry)?;
     if has_script || has_manual || has_receive {
         validate_script_actions_on(tx, instance_id, model, &mapping_scopes,
             expected_revision, plan, &variable_states, entry)?;
@@ -18943,6 +19414,27 @@ fn validate_termination_plan_on(
                         |row| row.get::<_, String>(0))? == *old_token_id,
                     "terminating Retry input differs from its immutable old activation");
                 Some(old_token_id.clone())
+            }
+            AcceptedInputRef::OutputRetry { job_id, invocation_id, token_id, generation,
+                expected_instance_revision, .. } => {
+                let source = output_retry_source_on(tx, instance_id, job_id)?
+                    .map_err(|reason| anyhow::anyhow!(
+                        "terminating output retry has no retryable accepted result: {reason:?}"))?;
+                ensure!(*expected_instance_revision == expected_revision
+                    && source.invocation_id == *invocation_id && source.token_id == *token_id
+                    && source.spent + 1 == *generation
+                    && plan.resolve_incident_ids == [source.incident_id.clone()]
+                    && plan.consume_token_ids.iter().filter(|id| *id == token_id).count() == 1
+                    && !plan.complete_job_ids.contains(job_id)
+                    && plan.events.iter().filter(|event| event.kind == "output_retried"
+                        && event.node_id.as_deref() == Some(source.node_id.as_str())
+                        && event.data["incident_id"].as_str() == Some(source.incident_id.as_str())
+                        && event.data["job_id"].as_str() == Some(job_id.as_str())
+                        && event.data["activation_token_id"].as_str() == Some(token_id.as_str())
+                        && event.data["generation"].as_u64() == Some(u64::from(*generation)))
+                        .count() == 1,
+                    "terminating output retry differs from its immutable accepted result");
+                Some(token_id.clone())
             }
             AcceptedInputRef::SendAdmission { instance_id: selected_instance, scope_id,
                 node_id, pending_token_id, pending_event_id, expected_instance_revision } => {
@@ -19699,6 +20191,7 @@ fn ordinary_action_source_matches_entry_on(
                 AcceptedInputRef::CallReturn { parent_token_id, .. } => Some(parent_token_id.clone()),
                 AcceptedInputRef::SendAdmission { pending_token_id, .. } => Some(pending_token_id.clone()),
                 AcceptedInputRef::Retry { old_token_id, .. } => Some(old_token_id.clone()),
+                AcceptedInputRef::OutputRetry { token_id, .. } => Some(token_id.clone()),
                 AcceptedInputRef::PersistedReady { .. } => return Ok(false),
             };
             if trace_termination_source_on(tx, instance_id, model, scopes, plan,
@@ -22960,6 +23453,7 @@ fn apply_plan_with_mode_on(
     insert_activity_io_inputs_on(tx, instance_id, &model, &proposed_scopes, plan, at_ms)?;
     insert_activity_io_results_on(tx, instance_id, plan, at_ms)?;
     insert_activity_io_continuations_on(tx, instance_id, plan, at_ms)?;
+    insert_activity_io_output_retries_on(tx, instance_id, plan, at_ms)?;
     for update in &plan.timer_updates {
         let actual = timer_on(tx, &update.timer_id)?;
         ensure!(
@@ -29522,6 +30016,13 @@ pub fn retry_job(
         let (offered, retry) = incident_retry_on(&tx, access, instance_id, &code, Some(job_id), None)?;
         if !offered {
             return Err(ProcessOperationDenied(retry_refusal_text(&retry)).into());
+        }
+        if retry.kind == ProcessRetryKind::OutputMapping {
+            let result = retry_output_mapping_on(&tx, actor, stamp, instance_id, job_id,
+                expected_revision, at_ms)?;
+            store_command(&tx, actor, stamp, &result, at_ms)?;
+            tx.commit()?;
+            return Ok(result);
         }
     }
     ensure!(job_direct_retryable_on(&tx, job_id, instance_id)?,

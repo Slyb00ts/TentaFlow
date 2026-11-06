@@ -30,7 +30,7 @@ use super::repository::{
     ServiceDispatchFact, ClosedServiceDispatch, RepetitionCapacitySource, RepetitionDeniedBytes, RepetitionGroup, RepetitionOccurrence,
     ScopeUpdate, VariableEffect, IoObservedInput, IoObservedOutput, IoObservedValue,
     ActivityIoInputFact, ActivityIoResultDisposition, ActivityIoResultFact,
-    ActivityIoContinuationFact, ActivityIoRetainedFate, ActivityIoWitness,
+    ActivityIoContinuationFact, ActivityIoOutputRetryFact, ActivityIoRetainedFate, ActivityIoWitness,
     ScopeReturnFailure, RecoveredServiceIncident,
 };
 use crate::db::DbPool;
@@ -5990,6 +5990,7 @@ pub(super) fn project_snapshot(
             activity_kind: activity_kind.to_owned(),
             phase_owner: phase_owner.to_owned(),
             phase: "input_captured".into(),
+            generation: 0,
             revision: 1,
             input_event_id: Some(input_event_id),
             input_values: Some(inputs.clone()),
@@ -6543,6 +6544,135 @@ pub(super) fn plan_service_retry(
         "request_hash":request_hash
     }));
     transition.finish()
+}
+
+/// How many times the accepted result of one Service job may be mapped again.
+pub(super) const OUTPUT_RETRY_LIMIT: u32 = 5;
+
+/// A retry whose mapping failed again: nothing changes but the record of the
+/// attempt, so it carries no plan.
+#[derive(Debug, Clone)]
+pub(super) struct OutputRetryFailure {
+    pub message: String,
+    pub association_id: Option<String>,
+    pub position: Option<usize>,
+}
+
+pub(super) enum OutputRetryOutcome {
+    Applied(RuntimePlan),
+    Failed(OutputRetryFailure),
+}
+
+/// Maps the accepted result of a finished Service job into the CURRENT variables
+/// of its scope again, after the first mapping failed. The job is not run again:
+/// the result is the one the invocation recorded, and the repository has already
+/// checked that it is the one the blocked witness holds.
+pub(super) fn plan_output_retry(
+    snapshot: &RuntimeSnapshot,
+    job: &ProcessJob,
+    observed: &super::repository::ObservedActivityResult,
+    incident_id: &str,
+    now_ms: i64,
+    accepted_input: AcceptedInputRef,
+) -> Result<OutputRetryOutcome> {
+    let AcceptedInputRef::OutputRetry { job_id, invocation_id, token_id, generation,
+        expected_instance_revision, command_id, request_hash } = &accepted_input else {
+        bail!("output retry requires its typed accepted input")
+    };
+    ensure!(*job_id == job.job_id && *token_id == job.token_id
+        && *expected_instance_revision == snapshot.instance.revision
+        && *generation >= 1 && *generation <= OUTPUT_RETRY_LIMIT
+        && observed.result.outcome == ActivityOutcome::Completed
+        && job.status == "completed",
+        "output retry changed its selected immutable result");
+    let (command_id, request_hash, invocation_id, generation) =
+        (command_id.clone(), request_hash.clone(), invocation_id.clone(), *generation);
+    ensure!(snapshot.incidents.iter().filter(|incident|
+        incident.incident_id == incident_id && incident.job_id.as_deref() == Some(job.job_id.as_str())
+            && incident.scope_id == job.scope_id).count() == 1,
+        "output retry lacks its exact unresolved incident");
+    let mut transition = Transition::from_snapshot(snapshot, now_ms, None)?;
+    transition.accepted_input = Some(accepted_input);
+    transition.current_scope = job.scope_id.clone();
+    let node = transition.node(&job.node_id)?.clone();
+    let ProcessNodeKind::ServiceTask { output_mapping, .. } = &node.kind else {
+        bail!("output retry targets another pinned activity kind")
+    };
+    let token = transition.tokens.iter()
+        .find(|token| token.token_id == job.token_id && token.scope_id == job.scope_id
+            && token.node_id == job.node_id && token.status == "waiting")
+        .context("output retry lost the waiting activation of its job")?.clone();
+    let previous = if node.activity_io.is_some() {
+        let blocked = snapshot.activity_io_witnesses.iter().filter(|witness|
+            witness.scope_id == job.scope_id && witness.node_id == job.node_id
+                && witness.token_id == job.token_id && witness.phase_owner == "ordinary"
+                && witness.phase == "output_blocked"
+                && witness.generation + 1 == generation).collect::<Vec<_>>();
+        ensure!(blocked.len() == 1, "output retry has no unique blocked witness generation");
+        Some(blocked[0].clone())
+    } else {
+        None
+    };
+    let retry_event_index = transition.plan.events.len();
+    transition.record_event_id(retry_event_index);
+    transition.event("output_retried", Some(node.id.clone()), json!({
+        "incident_id": incident_id, "job_id": job.job_id, "invocation_id": invocation_id,
+        "activation_token_id": token.token_id, "generation": generation,
+        "command_id": command_id, "request_hash": request_hash,
+    }));
+    let extra = transition.activity_inputs_extra_for_activation(&node.id, &token.token_id)?;
+    let outputs = &observed.result.outputs;
+    if let Err(error) = patch_variables(output_mapping, transition.local()?,
+        &transition.effective()?, outputs, &extra) {
+        if error.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+            return Err(error);
+        }
+        return Ok(OutputRetryOutcome::Failed(OutputRetryFailure {
+            message: error.to_string(), association_id: None, position: None,
+        }));
+    }
+    let output_event_index = transition.plan.events.len();
+    if let Err(error) = transition.map_outputs(&node.id, &token.token_id, output_mapping, outputs, &[]) {
+        let Some(failure) = error.downcast_ref::<ActivityIoAssociationFailure>() else {
+            return Err(error);
+        };
+        if node.activity_io.is_none()
+            || failure.source.downcast_ref::<expr::InfrastructureExprError>().is_some() {
+            return Err(error);
+        }
+        return Ok(OutputRetryOutcome::Failed(OutputRetryFailure {
+            message: error.to_string(),
+            association_id: Some(failure.association_id.clone()),
+            position: Some(failure.position),
+        }));
+    }
+    if let Some(previous) = previous {
+        let (ordered_outputs, local_patch) = match transition.plan.variable_effects.last() {
+            Some(VariableEffect::Mapped { event_index, scope_id, node_id, source_token_id,
+                activity_io_outputs: Some(ordered), result, .. })
+                if *event_index == output_event_index && scope_id == &job.scope_id
+                    && node_id == &job.node_id && source_token_id == &job.token_id =>
+                (ordered.clone(), result.clone()),
+            _ => bail!("output retry has no exact single mapped effect"),
+        };
+        let witness_id = transition.next_id("runtime");
+        transition.plan.activity_io_output_retries.push(ActivityIoOutputRetryFact {
+            previous_witness_id: previous.witness_id.clone(), witness_id, generation,
+            scope_id: job.scope_id.clone(), node_id: job.node_id.clone(),
+            token_id: job.token_id.clone(), retry_event_index, output_event_index,
+            observed: IoObservedValue::Present { value: outputs.clone() },
+            ordered_outputs, local_patch,
+        });
+    }
+    transition.disarm_boundaries(&token.token_id, "activity_completed", None)?;
+    transition.resolve_boundary_incidents(&token.token_id);
+    transition.resolve_incident(incident_id);
+    transition.consume(&token.token_id);
+    for edge in transition.outgoing(&node.id) {
+        transition.follow(&token, &edge)?;
+    }
+    transition.advance()?;
+    Ok(OutputRetryOutcome::Applied(transition.finish()?))
 }
 
 pub(super) fn plan_send_admission(
@@ -7886,12 +8016,21 @@ pub(super) fn plan_job_result_with_id_source(
                         }
                         transition.advance()?;
                     }
-                    Err(error) => transition.incident(
-                        &node.id,
-                        Some(job.job_id.clone()),
-                        "EXPRESSION_ERROR",
-                        error.to_string(),
-                    ),
+                    Err(error) => {
+                        transition.incident(
+                            &node.id,
+                            Some(job.job_id.clone()),
+                            "EXPRESSION_ERROR",
+                            error.to_string(),
+                        );
+                        // Marks the failure as the mapping of an accepted result: the
+                        // evaluation of the condition below raises the same code, and
+                        // only this one can be applied again.
+                        if let Some(event) = transition.plan.events.last_mut() {
+                            event.data["job_id"] = json!(job.job_id);
+                            event.data["stage"] = json!("output_mapping");
+                        }
+                    }
                 },
                 Ok(false) => transition.incident(
                     &node.id,

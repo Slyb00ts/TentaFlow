@@ -1350,6 +1350,10 @@ pub enum ProcessRetryDenied {
     NeedsAdministrator,
     /// The process, or a process in its call chain, can no longer be run in the initiator's name.
     ExecutionUnavailable,
+    /// The accepted result was already applied again as many times as one step allows.
+    OutputRetryLimit,
+    /// The accepted result of this kind of step is not kept in a form that can be applied again.
+    ResultNotRetained,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

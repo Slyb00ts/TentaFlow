@@ -18,6 +18,8 @@ const REASON_KEYS = {
   OtherMechanism: 'retry_denied_other_mechanism',
   NeedsAdministrator: 'retry_denied_needs_administrator',
   ExecutionUnavailable: 'retry_denied_execution_unavailable',
+  OutputRetryLimit: 'retry_denied_output_retry_limit',
+  ResultNotRetained: 'retry_denied_result_not_retained',
 };
 
 // Two of the failures a repeat would meet again have a cause the reader can act on, so they get their own sentence.
@@ -33,6 +35,13 @@ export function retryOffered(incident) {
   return incident.canRetry === true && Boolean(incident.jobId);
 }
 
+/** Applying an accepted result again is a different act from running the step again, and the words say so. */
+export function retryWords(incident) {
+  return incident.retry?.kind === 'OutputMapping'
+    ? { label: text('retry_output'), hint: text('retry_output_hint'), started: text('retry_output_started') }
+    : { label: text('retry'), hint: text('retry_hint'), started: text('retry_started') };
+}
+
 /**
  * Why this reader is not offered a retry, as a sentence in their language; null
  * when it is offered, or when the server gave no reason (an old server, a
@@ -43,6 +52,5 @@ export function retryRefusal(incident) {
   const retry = incident.retry;
   if (retry?.deniedReason === 'SameFailureRepeats' && SAME_FAILURE_BY_CODE[incident.code]) return text(SAME_FAILURE_BY_CODE[incident.code]);
   if (retry?.deniedReason) return text(REASON_KEYS[retry.deniedReason] ?? 'retry_denied_generic');
-  if (retry?.kind === 'OutputMapping') return text('retry_output_mapping_pending');
   return null;
 }

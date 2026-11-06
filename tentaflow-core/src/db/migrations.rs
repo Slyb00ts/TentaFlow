@@ -1327,8 +1327,142 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bpmn_incident_notices",
             MigrationStep::Sql(BPMN_INCIDENT_NOTICES),
         ),
+        (
+            209,
+            "bpmn_activity_io_generations",
+            MigrationStep::Sql(BPMN_ACTIVITY_IO_GENERATIONS),
+        ),
     ]
 }
+
+/// v209 — BPMN B4.5 output-mapping retry. An accepted Service result whose
+/// mapping into variables failed (`output_blocked`) may be mapped again without
+/// running the work again; each attempt is a new witness row of the same
+/// activation, one generation after the blocked one, so every attempt stays as
+/// evidence and none overwrites another. A new row starts at `result_accepted`
+/// (its result is the previous generation's, byte for byte) instead of
+/// `input_captured`, and the trigger only lets it exist while the previous
+/// generation is `output_blocked` with the same input and result. The events a
+/// generation points at are the first one's (the input capture and the
+/// accepted result), so the event and incident unique indexes widen by the
+/// generation; every other index and the evidence triggers stay as they were.
+///
+/// The table is changed in place, not rebuilt: it is referenced by no foreign
+/// key, a column added with a default and a CHECK leaves every stored row and
+/// every constraint byte for byte as it was, and an index and the two triggers
+/// are replaced by name. At most five retries per activation (generation 5);
+/// the repository answers with a stable code beyond it and the CHECK is the
+/// backstop.
+const BPMN_ACTIVITY_IO_GENERATIONS: &str = r#"
+ALTER TABLE bpmn_activity_io_witnesses ADD COLUMN generation INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(generation)='integer' AND generation BETWEEN 0 AND 5);
+DROP INDEX uq_bpmn_io_activation;
+CREATE UNIQUE INDEX uq_bpmn_io_activation
+    ON bpmn_activity_io_witnesses(instance_id,scope_id,token_id,phase_owner,COALESCE(occurrence_id,''),generation);
+DROP INDEX uq_bpmn_io_input_event;
+CREATE UNIQUE INDEX uq_bpmn_io_input_event
+    ON bpmn_activity_io_witnesses(input_event_id,generation) WHERE input_event_id IS NOT NULL;
+DROP INDEX uq_bpmn_io_result_event;
+CREATE UNIQUE INDEX uq_bpmn_io_result_event
+    ON bpmn_activity_io_witnesses(result_event_id,generation) WHERE result_event_id IS NOT NULL;
+DROP INDEX uq_bpmn_io_retained_route_event;
+CREATE UNIQUE INDEX uq_bpmn_io_retained_route_event
+    ON bpmn_activity_io_witnesses(retained_route_event_id,generation)
+    WHERE retained_route_event_id IS NOT NULL;
+DROP INDEX uq_bpmn_io_incident;
+CREATE UNIQUE INDEX uq_bpmn_io_incident
+    ON bpmn_activity_io_witnesses(incident_id,generation) WHERE incident_id IS NOT NULL;
+DROP TRIGGER bpmn_activity_io_witnesses_initial_phase;
+CREATE TRIGGER bpmn_activity_io_witnesses_initial_phase
+BEFORE INSERT ON bpmn_activity_io_witnesses
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT,'invalid initial activity IO phase') WHERE
+        NEW.generation=0 AND
+            (NEW.phase NOT IN ('input_failed','input_captured') OR NEW.revision<>1);
+    SELECT RAISE(ABORT,'invalid activity IO retry generation') WHERE
+        NEW.generation>0 AND
+            (NEW.phase<>'result_accepted' OR NEW.revision<>1 OR NOT EXISTS(
+                SELECT 1 FROM bpmn_activity_io_witnesses p
+                WHERE p.instance_id=NEW.instance_id AND p.scope_id=NEW.scope_id
+                    AND p.token_id=NEW.token_id AND p.phase_owner=NEW.phase_owner
+                    AND COALESCE(p.occurrence_id,'')=COALESCE(NEW.occurrence_id,'')
+                    AND p.generation=NEW.generation-1 AND p.phase='output_blocked'
+                    AND p.node_id=NEW.node_id AND p.activity_kind=NEW.activity_kind
+                    AND p.definition_id=NEW.definition_id AND p.version=NEW.version
+                    AND p.model_sha256=NEW.model_sha256
+                    AND p.io_spec_sha256=NEW.io_spec_sha256
+                    AND p.input_event_id IS NEW.input_event_id
+                    AND p.input_sha256 IS NEW.input_sha256
+                    AND p.result_event_id IS NEW.result_event_id
+                    AND p.result_sha256 IS NEW.result_sha256
+                    AND p.result_json IS NEW.result_json
+                    AND p.service_invocation_id IS NEW.service_invocation_id));
+END;
+DROP TRIGGER bpmn_activity_io_witnesses_cas;
+CREATE TRIGGER bpmn_activity_io_witnesses_cas
+BEFORE UPDATE ON bpmn_activity_io_witnesses
+FOR EACH ROW BEGIN
+    SELECT RAISE(ABORT,'activity IO witness identity changed') WHERE
+        NEW.witness_id IS NOT OLD.witness_id OR
+        NEW.generation IS NOT OLD.generation OR
+        NEW.instance_id IS NOT OLD.instance_id OR NEW.scope_id IS NOT OLD.scope_id OR
+        NEW.token_id IS NOT OLD.token_id OR NEW.node_id IS NOT OLD.node_id OR
+        NEW.activity_kind IS NOT OLD.activity_kind OR
+        NEW.phase_owner IS NOT OLD.phase_owner OR NEW.group_id IS NOT OLD.group_id OR
+        NEW.occurrence_id IS NOT OLD.occurrence_id OR NEW.ordinal IS NOT OLD.ordinal OR
+        NEW.definition_id IS NOT OLD.definition_id OR NEW.version IS NOT OLD.version OR
+        NEW.selected_process_id IS NOT OLD.selected_process_id OR
+        NEW.body_path_json IS NOT OLD.body_path_json OR
+        NEW.model_sha256 IS NOT OLD.model_sha256 OR
+        NEW.io_spec_sha256 IS NOT OLD.io_spec_sha256 OR
+        NEW.created_at_ms IS NOT OLD.created_at_ms;
+    SELECT RAISE(ABORT,'activity IO input changed') WHERE
+        NEW.input_event_id IS NOT OLD.input_event_id OR
+        NEW.input_values_json IS NOT OLD.input_values_json OR
+        NEW.input_sha256 IS NOT OLD.input_sha256 OR
+        OLD.phase='input_failed' AND
+            (NEW.failed_association_id IS NOT OLD.failed_association_id OR
+             NEW.failed_position IS NOT OLD.failed_position);
+    SELECT RAISE(ABORT,'activity IO accepted result changed') WHERE
+        OLD.result_event_id IS NOT NULL AND
+        (NEW.result_event_id IS NOT OLD.result_event_id OR
+         NEW.source_instance_id IS NOT OLD.source_instance_id OR
+         NEW.source_event_id IS NOT OLD.source_event_id OR
+         NEW.result_sources_json IS NOT OLD.result_sources_json OR
+         NEW.result_presence IS NOT OLD.result_presence OR
+         NEW.result_json IS NOT OLD.result_json OR
+         NEW.result_sha256 IS NOT OLD.result_sha256 OR
+         NEW.retained_route_kind IS NOT OLD.retained_route_kind OR
+         NEW.retained_route_event_id IS NOT OLD.retained_route_event_id OR
+         NEW.retained_route_resource_id IS NOT OLD.retained_route_resource_id OR
+         NEW.accepted_origin IS NOT OLD.accepted_origin OR
+         NEW.resource_id IS NOT OLD.resource_id OR
+         NEW.resource_revision IS NOT OLD.resource_revision OR
+         NEW.service_invocation_id IS NOT OLD.service_invocation_id);
+    SELECT RAISE(ABORT,'activity IO accepted child changed') WHERE
+        OLD.result_event_id IS NOT NULL AND
+        (NEW.child_scope_id IS NOT OLD.child_scope_id OR
+         NEW.call_id IS NOT OLD.call_id OR
+         NEW.child_instance_id IS NOT OLD.child_instance_id OR
+         NEW.child_expected_revision IS NOT OLD.child_expected_revision OR
+         NEW.child_status IS NOT OLD.child_status OR
+         NEW.parent_wait_token_id IS NOT OLD.parent_wait_token_id);
+    SELECT RAISE(ABORT,'activity IO output or incident changed') WHERE
+        OLD.output_event_id IS NOT NULL AND
+        (NEW.output_event_id IS NOT OLD.output_event_id OR
+         NEW.output_values_json IS NOT OLD.output_values_json OR
+         NEW.local_patch_json IS NOT OLD.local_patch_json) OR
+        OLD.incident_id IS NOT NULL AND
+        (NEW.incident_event_id IS NOT OLD.incident_event_id OR
+         NEW.incident_id IS NOT OLD.incident_id);
+    SELECT RAISE(ABORT,'invalid activity IO phase transition') WHERE
+        NOT (OLD.phase='input_captured' AND NEW.phase='result_accepted' OR
+             OLD.phase='result_accepted' AND NEW.phase IN ('output_applied','output_blocked')
+                 AND OLD.retained_route_kind IN ('mapping','awaiting_verification'));
+    SELECT RAISE(ABORT,'invalid activity IO revision') WHERE
+        NEW.revision<>OLD.revision+1 OR NEW.updated_at_ms<OLD.updated_at_ms;
+END;
+"#;
 
 /// v208 — BPMN B4.3 incident notices. A trigger queues one row per recipient
 /// (the instance initiator and the definition owner) in the transaction that
@@ -16982,7 +17116,7 @@ mod tests {
             assert_eq!(*version, index as i64 + 1, "the ladder must stay contiguous");
         }
         let head = ladder.last().unwrap().0;
-        assert_eq!(head, 208);
+        assert_eq!(head, 209);
 
         let fresh = Connection::open_in_memory().unwrap();
         run(&fresh).unwrap();
@@ -17001,7 +17135,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(applied_after_179.len(), 29);
+        assert_eq!(applied_after_179.len(), 30);
         assert_eq!(applied_after_179[0], "org_structure");
         assert_eq!(applied_after_179[19], "bpmn_activity_io_witnesses");
         assert_eq!(applied_after_179[20], "org_absences_drop_reason");
@@ -17019,6 +17153,7 @@ mod tests {
         assert_eq!(applied_after_179[26], "bus_field_policy_mask_hash");
         assert_eq!(applied_after_179[27], "bpmn_monitor_permission");
         assert_eq!(applied_after_179[28], "bpmn_incident_notices");
+        assert_eq!(applied_after_179[29], "bpmn_activity_io_generations");
         let tables = |conn: &Connection| -> Vec<String> {
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap()
@@ -20503,6 +20638,193 @@ mod tests {
         assert_eq!(conn.query_row("PRAGMA integrity_check", [],
             |row| row.get::<_,String>(0)).unwrap(), "ok");
     }
+
+    /// v209: the witness table gains a generation without losing a row, a
+    /// constraint or an evidence trigger, whatever phase the rows are in.
+    #[test]
+    fn migration_209_adds_witness_generations_and_keeps_every_phase_and_trigger() {
+        let conn = Connection::open_in_memory().unwrap();
+        service_invocation_history_fixture(&conn);
+        run_ladder_up_to(&conn, 208);
+        let (process_id, model_sha): (String, String) = conn.query_row(
+            "SELECT i.selected_process_id,v.model_sha256 FROM bpmn_instances i \
+             JOIN bpmn_versions v ON v.definition_id=i.definition_id AND v.version=i.version \
+             WHERE i.instance_id='selected-instance'", [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        let mut seq = 10;
+        let mut event = |id: String, kind: &str| {
+            seq += 1;
+            conn.execute(
+                "INSERT INTO bpmn_events(event_id,instance_id,scope_id,seq,at_ms,kind,node_id,data_json) \
+                 VALUES(?1,'selected-instance','selected-instance',?2,2,?3,'Service_1','{}')",
+                rusqlite::params![id, seq, kind],
+            ).unwrap();
+        };
+        let phases = ["input_failed", "input_captured", "result_accepted", "output_blocked", "output_applied"];
+        for (n, phase) in phases.iter().enumerate() {
+            let token = format!("io-token-{n}");
+            conn.execute(
+                "INSERT INTO bpmn_tokens(token_id,instance_id,scope_id,node_id,arrival_edge_id,fork_stack_json,status,created_at_ms) \
+                 VALUES(?1,'selected-instance','selected-instance','Service_1',NULL,'[]','waiting',1)",
+                [&token],
+            ).unwrap();
+            let needs_incident = matches!(*phase, "input_failed" | "output_blocked");
+            if needs_incident {
+                conn.execute(
+                    "INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) \
+                     VALUES(?1,'selected-instance','selected-instance','Service_1',NULL,'ACTIVITY_IO_OUTPUT_FAILED','m',2)",
+                    [format!("io-incident-{n}")],
+                ).unwrap();
+            }
+            let witness = format!("io-w-{n}");
+            if *phase == "input_failed" {
+                event(format!("io-inc-event-{n}"), "incident");
+                conn.execute(
+                    "INSERT INTO bpmn_activity_io_witnesses( \
+                        witness_id,instance_id,scope_id,token_id,node_id,activity_kind,phase_owner,definition_id,version, \
+                        selected_process_id,body_path_json,model_sha256,io_spec_sha256,phase,revision, \
+                        incident_event_id,incident_id,failed_association_id,failed_position,created_at_ms,updated_at_ms) \
+                     VALUES(?1,'selected-instance','selected-instance',?2,'Service_1','service','ordinary', \
+                        'selected-definition',1,?3,'[]',?4,?5,'input_failed',1,?6,?7,'assoc',0,2,2)",
+                    rusqlite::params![witness, token, process_id, model_sha, "a".repeat(64),
+                        format!("io-inc-event-{n}"), format!("io-incident-{n}")],
+                ).unwrap();
+                continue;
+            }
+            event(format!("io-in-{n}"), "activity_io_input_captured");
+            conn.execute(
+                "INSERT INTO bpmn_activity_io_witnesses( \
+                    witness_id,instance_id,scope_id,token_id,node_id,activity_kind,phase_owner,definition_id,version, \
+                    selected_process_id,body_path_json,model_sha256,io_spec_sha256,phase,revision, \
+                    input_event_id,input_values_json,input_sha256,created_at_ms,updated_at_ms) \
+                 VALUES(?1,'selected-instance','selected-instance',?2,'Service_1','service','ordinary', \
+                    'selected-definition',1,?3,'[]',?4,?5,'input_captured',1,?6,'[]',?7,2,2)",
+                rusqlite::params![witness, token, process_id, model_sha, "a".repeat(64),
+                    format!("io-in-{n}"), "b".repeat(64)],
+            ).unwrap();
+            if *phase == "input_captured" {
+                continue;
+            }
+            event(format!("io-res-{n}"), "service_result");
+            conn.execute(
+                "UPDATE bpmn_activity_io_witnesses SET phase='result_accepted',revision=2, \
+                    retained_route_kind='mapping',result_event_id=?1,source_instance_id='selected-instance', \
+                    source_event_id=?1,result_sources_json=json_array(?1),result_presence='present', \
+                    result_json='{\"x\":1}',result_sha256=?2,updated_at_ms=3 WHERE witness_id=?3",
+                rusqlite::params![format!("io-res-{n}"), "c".repeat(64), witness],
+            ).unwrap();
+            match *phase {
+                "output_blocked" => {
+                    event(format!("io-inc-event-{n}"), "incident");
+                    conn.execute(
+                        "UPDATE bpmn_activity_io_witnesses SET phase='output_blocked',revision=3, \
+                            incident_event_id=?1,incident_id=?2,updated_at_ms=4 WHERE witness_id=?3",
+                        rusqlite::params![format!("io-inc-event-{n}"), format!("io-incident-{n}"), witness],
+                    ).unwrap();
+                }
+                "output_applied" => {
+                    event(format!("io-out-{n}"), "activity_io_output_applied");
+                    conn.execute(
+                        "UPDATE bpmn_activity_io_witnesses SET phase='output_applied',revision=3, \
+                            output_event_id=?1,output_values_json='[]',local_patch_json='{}',updated_at_ms=4 \
+                         WHERE witness_id=?2",
+                        rusqlite::params![format!("io-out-{n}"), witness],
+                    ).unwrap();
+                }
+                _ => {}
+            }
+        }
+        let rows = |conn: &Connection| -> Vec<(String, String, i64)> {
+            conn.prepare("SELECT witness_id,phase,revision FROM bpmn_activity_io_witnesses ORDER BY witness_id")
+                .unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap()
+                .collect::<rusqlite::Result<_>>().unwrap()
+        };
+        let before = rows(&conn);
+        assert_eq!(before.len(), 5);
+        run(&conn).unwrap();
+        assert_eq!(rows(&conn), before, "no row changes its phase or revision");
+        assert_eq!(conn.query_row(
+            "SELECT COUNT(*) FROM bpmn_activity_io_witnesses WHERE generation=0", [],
+            |row| row.get::<_, i64>(0)).unwrap(), 5);
+        let sql_of = |kind: &str, name: &str| -> String {
+            conn.query_row("SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2",
+                [kind, name], |row| row.get(0)).unwrap()
+        };
+        for index in ["uq_bpmn_io_activation", "uq_bpmn_io_input_event", "uq_bpmn_io_result_event",
+            "uq_bpmn_io_retained_route_event", "uq_bpmn_io_incident"] {
+            assert!(sql_of("index", index).contains("generation"), "{index} is per generation");
+        }
+        assert!(sql_of("index", "uq_bpmn_io_output_event").contains("output_event_id"));
+        for trigger in ["bpmn_activity_io_witnesses_initial_phase", "bpmn_activity_io_witnesses_cas"] {
+            assert!(sql_of("trigger", trigger).contains("generation"), "{trigger}");
+        }
+        let notice_trigger: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='bpmn_incidents_queue_notices'",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(notice_trigger, 1);
+
+        // A retry generation is a copy of a blocked row, one generation later.
+        let retry_copy = |from: &str, id: &str, generation: i64, result: &str| {
+            conn.execute(
+                "INSERT INTO bpmn_activity_io_witnesses \
+                 (witness_id,instance_id,scope_id,token_id,node_id,activity_kind,phase_owner,group_id,occurrence_id,ordinal, \
+                  definition_id,version,selected_process_id,body_path_json,model_sha256,io_spec_sha256,phase,generation,revision, \
+                  input_event_id,input_values_json,input_sha256,result_event_id,source_instance_id,source_event_id, \
+                  result_sources_json,result_presence,result_json,result_sha256,retained_route_kind,retained_route_event_id, \
+                  retained_route_resource_id,accepted_origin,resource_id,resource_revision,service_invocation_id, \
+                  created_at_ms,updated_at_ms) \
+                 SELECT ?1,instance_id,scope_id,token_id,node_id,activity_kind,phase_owner,group_id,occurrence_id,ordinal, \
+                  definition_id,version,selected_process_id,body_path_json,model_sha256,io_spec_sha256,'result_accepted',?2,1, \
+                  input_event_id,input_values_json,input_sha256,result_event_id,source_instance_id,source_event_id, \
+                  result_sources_json,result_presence,?3,result_sha256,retained_route_kind,retained_route_event_id, \
+                  retained_route_resource_id,accepted_origin,resource_id,resource_revision,service_invocation_id,5,5 \
+                 FROM bpmn_activity_io_witnesses WHERE witness_id=?4",
+                rusqlite::params![id, generation, result, from],
+            )
+        };
+        let aborted = |result: rusqlite::Result<usize>, text: &str| {
+            let error = result.expect_err(text).to_string();
+            assert!(error.contains(text), "{error}");
+        };
+        aborted(retry_copy("io-w-4", "g-applied", 1, "{\"x\":1}"), "invalid activity IO retry generation");
+        aborted(retry_copy("io-w-1", "g-captured", 1, "{\"x\":1}"), "invalid activity IO retry generation");
+        aborted(retry_copy("io-w-3", "g-other-result", 1, "{\"x\":2}"), "invalid activity IO retry generation");
+        aborted(retry_copy("io-w-3", "g-skipped", 2, "{\"x\":1}"), "invalid activity IO retry generation");
+        assert_eq!(retry_copy("io-w-3", "g-one", 1, "{\"x\":1}").unwrap(), 1);
+        assert!(retry_copy("io-w-3", "g-one-again", 1, "{\"x\":1}").is_err(),
+            "one row per activation and generation");
+        // The retry row runs the same phase machine as any other and cannot change generation.
+        aborted(conn.execute("UPDATE bpmn_activity_io_witnesses SET generation=2,revision=2 WHERE witness_id='g-one'", []),
+            "activity IO witness identity changed");
+        let block = |id: &str| conn.execute(
+            "UPDATE bpmn_activity_io_witnesses SET phase='output_blocked',revision=2,incident_event_id='io-inc-event-3', \
+                incident_id='io-incident-3',updated_at_ms=6 WHERE witness_id=?1", [id]).unwrap();
+        // The ceiling is five retries.
+        let mut previous = "g-one".to_owned();
+        for generation in 2..=5 {
+            block(&previous);
+            let id = format!("g-gen{generation}");
+            assert_eq!(retry_copy(&previous, &id, generation, "{\"x\":1}").unwrap(), 1);
+            previous = id;
+        }
+        block(&previous);
+        assert!(retry_copy(&previous, "g-six", 6, "{\"x\":1}").is_err());
+        // Generation zero keeps its initial-phase rule.
+        aborted(conn.execute(
+            "INSERT INTO bpmn_activity_io_witnesses( \
+                witness_id,instance_id,scope_id,token_id,node_id,activity_kind,phase_owner,definition_id,version, \
+                selected_process_id,body_path_json,model_sha256,io_spec_sha256,phase,revision, \
+                input_event_id,input_values_json,input_sha256,created_at_ms,updated_at_ms) \
+             VALUES('g0-late','selected-instance','selected-instance','queued-token','Service_1','service','ordinary', \
+                'selected-definition',1,?1,'[]',?2,?3,'output_applied',1,'io-in-1','[]',?4,2,2)",
+            rusqlite::params![process_id, model_sha, "a".repeat(64), "b".repeat(64)],
+        ), "invalid initial activity IO phase");
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+        assert_eq!(conn.query_row("PRAGMA integrity_check", [],
+            |row| row.get::<_, String>(0)).unwrap(), "ok");
+    }
+
 
     #[test]
     fn activity_io_ordinal_witness_belongs_to_its_factual_group_and_ordinal() {

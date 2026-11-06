@@ -502,8 +502,8 @@ fn each_incident_code_shows_the_kind_and_reason_of_its_class_to_the_owner() {
             Kind::JobUncertain,
             Some(Denied::OutcomeUncertain),
         ),
-        ("ACTIVITY_IO_OUTPUT_FAILED", Kind::OutputMapping, None),
-        ("SCRIPT_MAPPING_FAILED", Kind::OutputMapping, None),
+        ("ACTIVITY_IO_OUTPUT_FAILED", Kind::OutputMapping, Some(Denied::ResultNotRetained)),
+        ("SCRIPT_MAPPING_FAILED", Kind::OutputMapping, Some(Denied::ResultNotRetained)),
         ("SERVICE_ERROR", Kind::Job, Some(Denied::NoProofOfNoEffect)),
         (
             "UNBOUND_IMPLEMENTATION",
