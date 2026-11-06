@@ -183,6 +183,7 @@ iroh = {version = "1.1.0", default-features = false}
 iroh-mainline-address-lookup = "0.5.0"
 iroh-mdns-address-lookup = "0.5.0"
 jni = "0.21"
+ndk-context = "0.1.1"
 js-sys = "0.3.102"
 jsonwebtoken = "10.4.0"
 junction = "2.0.0"

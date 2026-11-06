@@ -49,4 +49,5 @@ tentaflow-core = { workspace = true, features = ["inference-sherpa"] }
 android_logger = { workspace = true }
 log = { workspace = true }
 jni = { workspace = true }
+ndk-context = { workspace = true }
 tentaflow-core = { workspace = true, features = ["inference-whisper"] }

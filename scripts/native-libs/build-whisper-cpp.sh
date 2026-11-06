@@ -179,11 +179,13 @@ build_isolated_dylib() {
         echo "[whisper.cpp] brak Android NDK clang++: $android_cxx" >&2
         exit 1
       }
+      # Android 15+ devices with 16 KB pages refuse ELF segments aligned to 4 KB.
       "$android_cxx" -shared -fPIC \
         -o "$out_dir/libwhisper_tf.so" \
         -Wl,--version-script="$map" \
         -Wl,--whole-archive "${archives[@]}" -Wl,--no-whole-archive \
         -Wl,--no-undefined \
+        -Wl,-z,max-page-size=16384 \
         -lm -ldl -llog -landroid -lc++_shared
       ;;
     *)

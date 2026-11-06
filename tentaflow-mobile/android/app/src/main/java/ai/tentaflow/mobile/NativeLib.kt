@@ -1,5 +1,7 @@
 package ai.tentaflow.mobile
 
+import android.content.Context
+
 /**
  * JNI bridge do biblioteki Rust tentaflow_mobile.
  * Laduje natywna biblioteke i udostepnia funkcje FFI.
@@ -9,8 +11,11 @@ object NativeLib {
         System.loadLibrary("tentaflow_mobile")
     }
 
-    /** Uruchamia Rust core — Router, API server, mesh, inference */
-    external fun start(dataDir: String)
+    /**
+     * Uruchamia Rust core — Router, API server, mesh, inference. Context trafia do
+     * ndk_context, z ktorego korzystaja biblioteki czytajace konfiguracje systemu.
+     */
+    external fun start(context: Context, dataDir: String)
 
     /** Powiadomienie o przejsciu aplikacji w tlo */
     external fun onPause()
