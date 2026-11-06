@@ -344,7 +344,7 @@ async fn a_retry_in_the_name_of_an_initiator_who_lost_the_definition_is_refused_
     assert!(!inactive.can_retry && !inactive.incidents[0].can_retry);
     let refused = repository::retry_job(&fixture.db, &steward, &stamp("steward asks again"),
         &started.instance_id, &claim.job.job_id, seen.revision).unwrap_err();
-    assert!(refused.downcast_ref::<ProcessAuthorityDenied>().is_some(), "{refused}");
+    assert!(refused.downcast_ref::<ProcessOperationDenied>().is_some(), "{refused}");
 }
 
 #[tokio::test]

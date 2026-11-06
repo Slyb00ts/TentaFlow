@@ -5686,6 +5686,15 @@ fn job_direct_retryable_on(conn: &Connection, job_id: &str, instance_id: &str) -
     Ok(proved_no_effect && job_activation_live_on(conn, job_id)?)
 }
 
+/// Whether this incident is the failure the step itself answered with: the
+/// accepted result of its job is an Error or Cancelled one and carries this
+/// code. The answer of the step is not a code of the engine.
+fn job_answered_with_failure_on(conn: &Connection, job_id: &str, instance_id: &str, code: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bpmn_service_invocations WHERE job_id=?1 AND instance_id=?2 AND phase='accepted' AND json_extract(observed_result_json,'$.result.outcome') IN ('Error','Cancelled') AND COALESCE(json_extract(observed_result_json,'$.result.code'),'SERVICE_ERROR')=?3)",
+        params![job_id, instance_id, code], |row| row.get(0))?)
+}
+
 /// The one projection of an incident's retry for the reader: what kind of
 /// retry it is, whether this reader is offered it now and, when not, why.
 /// A job whose invocation is proven unexecuted is a `Job` whatever its code
@@ -5703,8 +5712,21 @@ fn incident_retry_on(
         Some(job_id) => job_direct_retryable_on(conn, job_id, instance_id)?,
         None => false,
     };
-    let class = classify_code(code);
-    let kind = match (proof, class) {
+    // An accepted Error or Cancelled result is the step's own answer, so its code
+    // is the step's, whatever it spells. Only where the incident came from the
+    // engine does the code say what kind of failure it is.
+    let answered = match job_id {
+        Some(job_id) => job_answered_with_failure_on(conn, job_id, instance_id, code)?,
+        None => false,
+    };
+    let class = if answered { Some(RetryClass::Job) } else { classify_code(code) };
+    // A failure that a repeat would meet again is not offered even when nothing
+    // ran; a source that went away is, once the source is back.
+    let repeats = match class {
+        Some(RetryClass::Never(reason)) if reason != ProcessRetryDenied::SourceUnavailable => Some(reason),
+        _ => None,
+    };
+    let kind = match (proof && repeats.is_none(), class) {
         (true, _) | (false, Some(RetryClass::Job)) => ProcessRetryKind::Job,
         (false, Some(RetryClass::JobUncertain)) => ProcessRetryKind::JobUncertain,
         (false, Some(RetryClass::OutputMapping)) => ProcessRetryKind::OutputMapping,
@@ -5713,6 +5735,9 @@ fn incident_retry_on(
     let refused = |denied_reason| (false, ProcessIncidentRetry { kind, denied_reason });
     if resolved_at_ms.is_some() {
         return Ok(refused(None));
+    }
+    if let Some(reason) = repeats {
+        return Ok(refused(Some(reason)));
     }
     if let (false, Some(RetryClass::Never(reason))) = (proof, class) {
         return Ok(refused(Some(reason)));
@@ -5776,7 +5801,7 @@ fn retry_runs_as_initiator_on(
         (ProcessRetryDenied::InitiatorNotOwner, &|| require_owner(conn, &initiator, &definition_id)),
         (ProcessRetryDenied::SourceUnavailable,
             &|| require_source_current(conn, &initiator, &job_source_ref_on(conn, job_id)?, None)),
-        (ProcessRetryDenied::InitiatorNotOwner,
+        (ProcessRetryDenied::ExecutionUnavailable,
             &|| require_call_control_authority_on(conn, &initiator, instance_id)),
     ];
     for (reason, check) in stages {
@@ -5795,13 +5820,15 @@ fn retry_runs_as_initiator_on(
 /// the answer never carries the failure text of a worker.
 fn retry_refusal_text(retry: &ProcessIncidentRetry) -> &'static str {
     match (retry.kind, retry.denied_reason) {
-        (_, Some(ProcessRetryDenied::ViewOnly)) => "only the process initiator or the definition owner may retry",
+        (_, Some(ProcessRetryDenied::ViewOnly)) => "only the person who started the run may retry it",
         (_, Some(ProcessRetryDenied::InitiatorNotOwner)) =>
             "the initiator no longer owns the definition, so the work cannot run in their name",
         (_, Some(ProcessRetryDenied::InitiatorUnavailable)) =>
             "the initiator is no longer active, so the work cannot run in their name",
         (_, Some(ProcessRetryDenied::SourceUnavailable)) =>
             "the initiator can no longer use the source of this task",
+        (_, Some(ProcessRetryDenied::ExecutionUnavailable)) =>
+            "the process, or a process that called it, can no longer be run in the initiator's name",
         (_, Some(ProcessRetryDenied::ActivationBusy)) => "another step of this instance is already running",
         (ProcessRetryKind::JobUncertain, _) =>
             "the outcome of this task is unknown, so repeating it is not available",
@@ -22788,6 +22815,37 @@ fn persist_simulation_human_task_outputs_on(
     Ok(())
 }
 
+/// A failure of the attempt a retry started is the same incident failing again.
+/// The planner mints a fresh id for the incident it adds; when its job is such an
+/// attempt, that id (in the incident, its events and every reference to it) is
+/// replaced by the closed incident's, which the writer then opens again. The id
+/// is a unique random string, so the replacement is exact.
+fn rebind_retried_incidents_on(
+    tx: &Transaction<'_>,
+    instance_id: &str,
+    plan: &RuntimePlan,
+) -> Result<Option<RuntimePlan>> {
+    let mut renames = Vec::new();
+    for incident in &plan.add_incidents {
+        let Some(job_id) = incident.job_id.as_deref() else { continue };
+        let Some(closed) = retried_incident_id_on(tx, instance_id, job_id)? else { continue };
+        let closed_here: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bpmn_incidents WHERE incident_id=?1 AND instance_id=?2 AND resolved_at_ms IS NOT NULL)",
+            params![closed, instance_id], |row| row.get(0))?;
+        if closed_here && closed != incident.incident_id {
+            renames.push((incident.incident_id.clone(), closed));
+        }
+    }
+    if renames.is_empty() {
+        return Ok(None);
+    }
+    let mut text = serde_json::to_string(plan)?;
+    for (planned, closed) in &renames {
+        text = text.replace(&format!("\"{planned}\""), &format!("\"{closed}\""));
+    }
+    Ok(Some(serde_json::from_str(&text)?))
+}
+
 fn apply_plan_on(
     tx: &Transaction<'_>,
     instance_id: &str,
@@ -22829,6 +22887,8 @@ fn apply_plan_with_mode_on(
     staged_requests: &[CallRequest],
     mode: ExecutionMode,
 ) -> Result<Vec<CancelledJobClaim>> {
+    let rebound = rebind_retried_incidents_on(tx, instance_id, plan)?;
+    let plan = rebound.as_ref().unwrap_or(plan);
     ensure!(plan.recovered_service_incidents.is_empty()
         || matches!(&entry, EntryAuthority::Accepted(AcceptedInputRef::Service { .. })),
         "infrastructure incident resolution has no accepted Service source");
@@ -23247,7 +23307,17 @@ fn apply_plan_with_mode_on(
             incident.message.len() <= 32 * 1024,
             "process incident message exceeds 32 KiB"
         );
-        tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,node_id,job_id,code,message,at_ms,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![incident.incident_id,instance_id,incident.node_id,incident.job_id,incident.code,incident_message(&incident.message),at_ms,incident.scope_id])?;
+        let message = incident_message(&incident.message);
+        // A planned incident rebound to a closed one is that incident failing
+        // again: the row opens again instead of a second one being inserted.
+        let reopened = match &incident.job_id {
+            Some(job_id) => reopen_incident_on(tx, &incident.incident_id, instance_id,
+                job_id, &incident.code, &message, at_ms)?,
+            None => false,
+        };
+        if !reopened {
+            tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,node_id,job_id,code,message,at_ms,scope_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![incident.incident_id,instance_id,incident.node_id,incident.job_id,incident.code,message,at_ms,incident.scope_id])?;
+        }
     }
     for incident_id in &plan.resolve_incident_ids {
         let closed = plan.closed_service_dispatches.iter().filter(|closed|
@@ -26274,7 +26344,34 @@ fn claim_queued_job_on(
     }))
 }
 
-/// Opens the incident of a job that failed before any effect. When the job
+/// The incident a retry closed for the job that is now the retry's attempt.
+fn retried_incident_id_on(tx: &Connection, instance_id: &str, job_id: &str) -> Result<Option<String>> {
+    Ok(tx.query_row(
+        "SELECT json_extract(data_json,'$.incident_id') FROM bpmn_events WHERE instance_id=?1 AND kind='job_retried' AND json_extract(data_json,'$.new_job_id')=?2 LIMIT 1",
+        params![instance_id, job_id],
+        |row| row.get(0),
+    ).optional()?.flatten())
+}
+
+/// Opens again the incident a retry closed, for the attempt that failed. The
+/// row keeps its id, so the queue trigger (insert only) raises no second notice;
+/// the time moves to this failure. `false` when there is no such closed row.
+fn reopen_incident_on(
+    tx: &Connection,
+    incident_id: &str,
+    instance_id: &str,
+    job_id: &str,
+    code: &str,
+    message: &str,
+    at_ms: i64,
+) -> Result<bool> {
+    Ok(tx.execute(
+        "UPDATE bpmn_incidents SET job_id=?1,code=?2,message=?3,at_ms=?4,resolved_at_ms=NULL WHERE incident_id=?5 AND instance_id=?6 AND resolved_at_ms IS NOT NULL",
+        params![job_id, code, message, at_ms, incident_id, instance_id],
+    )? == 1)
+}
+
+/// Opens the incident of a job that failed . When the job
 /// is the attempt a retry started, the incident that retry closed is reopened
 /// on the new job instead of a second row being inserted: one failing
 /// activity is one incident until it resolves, so a retry that fails again
@@ -26289,17 +26386,8 @@ fn raise_job_incident_on(
     message: &str,
     at_ms: i64,
 ) -> Result<String> {
-    let retried: Option<String> = tx.query_row(
-        "SELECT json_extract(data_json,'$.incident_id') FROM bpmn_events WHERE instance_id=?1 AND kind='job_retried' AND json_extract(data_json,'$.new_job_id')=?2 LIMIT 1",
-        params![instance_id, job_id],
-        |row| row.get(0),
-    ).optional()?.flatten();
-    if let Some(incident_id) = retried {
-        let reopened = tx.execute(
-            "UPDATE bpmn_incidents SET job_id=?1,code=?2,message=?3,resolved_at_ms=NULL WHERE incident_id=?4 AND instance_id=?5 AND scope_id=?6 AND node_id=?7 AND resolved_at_ms IS NOT NULL",
-            params![job_id, code, message, incident_id, instance_id, scope_id, node_id],
-        )?;
-        if reopened == 1 {
+    if let Some(incident_id) = retried_incident_id_on(tx, instance_id, job_id)? {
+        if reopen_incident_on(tx, &incident_id, instance_id, job_id, code, message, at_ms)? {
             return Ok(incident_id);
         }
     }
@@ -29397,7 +29485,7 @@ pub fn retry_job(
     let access = instance_access_on(&tx, actor, instance_id, AccessReach::Observers)?;
     if !access.may_retry() {
         return Err(ProcessOperationDenied(
-            "only the process initiator or the definition owner may retry",
+            "only the person who started the run may retry it",
         ).into());
     }
     let instance = instance_state_on(&tx, actor, instance_id, None, access)?;
@@ -29406,7 +29494,11 @@ pub fn retry_job(
         org_id: actor.org_id.clone(),
         user_id: instance.initiator_user_id.clone(),
     };
-    require_actor(&tx, &initiator)?;
+    if let Err(error) = require_actor(&tx, &initiator) {
+        return Err(if error.downcast_ref::<ProcessAuthorityDenied>().is_some() {
+            ProcessOperationDenied("the initiator is no longer active, so the work cannot run in their name").into()
+        } else { error });
+    }
     if !actor_owns_on(&tx, &initiator, &instance.definition_id)? {
         // The claim path demands the same ownership, so a retry here could only
         // park a job no worker may run.
@@ -30322,12 +30414,10 @@ pub fn fail_job_with_authority(
         // This failure carries its own incident; a recovery incident raised for
         // the same row earlier must not stay open next to it.
         resolve_recovery_incident_on(&tx, job_id, now_ms, false)?;
-        let incident_id = Uuid::new_v4().to_string();
         let uncertain_code = "EXTERNAL_OUTCOME_UNCERTAIN";
         let uncertain_message = "The external effect may have occurred; direct retry is unavailable";
-        tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![incident_id,instance_id,scope_id,node_id,job_id,
-                uncertain_code,uncertain_message,now_ms])?;
+        let incident_id = raise_job_incident_on(&tx, &instance_id, &scope_id, &node_id, job_id,
+            uncertain_code, uncertain_message, now_ms)?;
         let next_seq: u64 = tx.query_row(
             "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
             [&instance_id], |row| row_u64(row, 0))?;

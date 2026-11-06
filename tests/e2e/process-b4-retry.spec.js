@@ -1,8 +1,8 @@
 // =============================================================================
 // File: tests/e2e/process-b4-retry.spec.js
 // Description: Retry of a failed service task against a real node (BPMN B4.4).
-//              The flow behind the task is switched off when the run starts, so
-//              the worker fails the task before any call (an incident whose
+//              The flow behind the task is switched off just as the run reaches it,
+//              so the worker fails the task before any call (an incident whose
 //              task is proven to have done nothing). While the flow is off the
 //              incident says why there is no retry; once it is back, Retry is
 //              offered in the incident list and in the diagram panel, asks first,
@@ -106,34 +106,48 @@ async function readRun(page, instanceId) {
 // The flow behind a service task is checked when the step is admitted and again
 // when the worker claims the job, and nothing else lets the two differ. So the
 // flow is switched off in the same burst that finishes the person's task before
-// it: when the switch wins the race against the worker's claim, the worker finds
-// the flow gone before it makes any call. A run that got through is left behind
-// and another one tries, so the helper ends only with a run that failed so.
+// it. Only when the switch wins the race does the worker find the flow gone
+// before any call: its incident is then SOURCE_ACCESS_REVOKED on a job proven
+// to have done nothing, which the server shows as a Job retry held back by the
+// source. A run that got through, or failed any other way, is left behind and
+// another one tries, so the helper ends only with a run that failed so.
+const failedBeforeAnyCall = (incident) => incident?.code === 'SOURCE_ACCESS_REVOKED'
+  && incident.jobId
+  && incident.retry?.kind === 'Job'
+  && incident.retry?.deniedReason === 'SourceUnavailable';
+
 async function runFailedBeforeAnyCall(page) {
-  for (let attempt = 0; attempt < 40; attempt += 1) {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
     await setFlow(page, 'active');
-    const instanceId = await page.evaluate(async ({ definitionId, processId, flowId }) => {
+    // The switch follows the completion by a few milliseconds that differ per
+    // attempt, so some of them land between the step being queued and claimed.
+    const delay = (attempt * 3) % 40;
+    const { id: instanceId, completed } = await page.evaluate(async ({ definitionId, processId, flowId, delayMs }) => {
       const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
       const response = await ApiBinary.one('processInstanceStartRequest', {
         commandId: crypto.randomUUID(), definitionId, version: 1, processId, startNodeId: 'Start', variables: {} });
       const id = response.instance.instanceId;
       const { instance } = await ApiBinary.one('processInstanceGetRequest', { instanceId: id });
       const task = instance.userTasks.find((candidate) => candidate.status === 'Open');
-      await Promise.allSettled([
-        ApiBinary.one('processUserTaskCompleteRequest', { commandId: crypto.randomUUID(), instanceId: id,
-          userTaskId: task.userTaskId, expectedRevision: instance.revision, outputs: {}, approved: null }),
-        ApiBinary.action('flowUpdateRequest', { flowId, status: 'draft' }),
-      ]);
-      return id;
-    }, ids);
-    for (let wait = 0; wait < 20; wait += 1) {
+      const completion = ApiBinary.one('processUserTaskCompleteRequest', { commandId: crypto.randomUUID(), instanceId: id,
+        userTaskId: task.userTaskId, expectedRevision: instance.revision, outputs: {}, approved: null });
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      const flip = ApiBinary.action('flowUpdateRequest', { flowId, status: 'draft' });
+      const [done] = await Promise.allSettled([completion, flip]);
+      return { id, completed: done.status === 'fulfilled' };
+    }, { ...ids, delayMs: delay });
+    if (!completed) continue;
+    for (let wait = 0; wait < 30; wait += 1) {
       const run = await readRun(page, instanceId);
-      if (run.incidents.length === 1) return instanceId;
+      if (run.incidents.length === 1) {
+        if (failedBeforeAnyCall(run.incidents[0])) return instanceId;
+        break;
+      }
       if (run.status === 'Completed') break;
-      await page.waitForTimeout(250);
+      await page.waitForTimeout(100);
     }
   }
-  throw new Error('no run failed before its first call in 40 attempts');
+  throw new Error('no run failed before its first call in 120 attempts');
 }
 
 // The same run with the flow switched on again.
@@ -220,7 +234,7 @@ test('a person who may only watch the run is told so in words and gets no retry'
   const onlooker = await context.newPage();
   await loginAsAdmin(onlooker, { port: PORT, username: 'b4onlooker', password: 'Onlooker-pass-w0rd-1' });
   const win = await openRun(onlooker, instanceId);
-  await expect(win.locator('[data-incidents] [data-retry-note]')).toHaveText(/only the person who started it or the process owner can/i, { timeout: 15000 });
+  await expect(win.locator('[data-incidents] [data-retry-note]')).toHaveText(/a retry runs in the name of the person who started the run, so only that person can start it/i, { timeout: 15000 });
   await expect(win.locator('[data-incidents] [data-retry]')).toHaveCount(0);
 
   // The server agrees with what the window shows.

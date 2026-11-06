@@ -1343,10 +1343,13 @@ pub enum ProcessRetryDenied {
     SameFailureRepeats,
     /// A person has to decide, not the engine.
     NeedsPerson,
-    /// The engine tries again on its own.
-    Automatic,
     /// Handled by another mechanism: calls, timers, messages, signals, scopes.
     OtherMechanism,
+    /// The engine could not finish recording the step and no loop of its own
+    /// will: cancel the run or have an administrator look at the node.
+    NeedsAdministrator,
+    /// The process, or a process in its call chain, can no longer be run in the initiator's name.
+    ExecutionUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

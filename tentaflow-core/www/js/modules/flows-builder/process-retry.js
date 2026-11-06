@@ -15,8 +15,9 @@ const REASON_KEYS = {
   OutcomeUncertain: 'retry_denied_outcome_uncertain',
   SameFailureRepeats: 'retry_denied_same_failure_repeats',
   NeedsPerson: 'retry_denied_needs_person',
-  Automatic: 'retry_denied_automatic',
   OtherMechanism: 'retry_denied_other_mechanism',
+  NeedsAdministrator: 'retry_denied_needs_administrator',
+  ExecutionUnavailable: 'retry_denied_execution_unavailable',
 };
 
 export const RETRY_REASONS = Object.keys(REASON_KEYS);
