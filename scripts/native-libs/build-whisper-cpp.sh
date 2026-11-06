@@ -41,7 +41,7 @@ android_cxx_for_platform() {
   local triple
   triple="$(android_triple_for_platform "$1")"
   printf '%s/bin/%s%s-clang++\n' \
-    "$ndk_root/toolchains/llvm/prebuilt/linux-x86_64" \
+    "$ndk_root/toolchains/llvm/prebuilt/$(android_host_tag)" \
     "$triple" \
     "${ANDROID_API_LEVEL:-26}"
 }

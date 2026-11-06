@@ -4891,9 +4891,9 @@ pub(crate) mod execution {
                 key.as_ptr(),
                 bytes.as_mut_ptr().cast(),
                 bytes.len(),
-                #[cfg(target_os = "macos")]
+                #[cfg(target_vendor = "apple")]
                 0,
-                #[cfg(target_os = "macos")]
+                #[cfg(target_vendor = "apple")]
                 0,
             )
         };
@@ -4953,7 +4953,7 @@ pub(crate) mod execution {
                 key.as_ptr(),
                 value.as_ptr().cast(),
                 value.len(),
-                #[cfg(target_os = "macos")]
+                #[cfg(target_vendor = "apple")]
                 0,
                 0,
             )
@@ -4981,9 +4981,9 @@ pub(crate) mod execution {
     /// busy mountpoint has to be an error the admin reads.
     fn unmount_path(mountpoint: &Path) -> Result<(), String> {
         let path = cpath_at(mountpoint)?;
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         let result = unsafe { libc::unmount(path.as_ptr(), 0) };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         let result = unsafe { libc::umount2(path.as_ptr(), 0) };
         if result == 0 {
             return Ok(());
