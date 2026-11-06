@@ -339,7 +339,7 @@ async fn observed_service_result_survives_joined_script_infrastructure_failure_w
     assert!(!reopened.incidents[0].can_retry);
     assert!(!reopened.can_retry);
     let (listed, _, _) = repository::list_instances(&fixture.db, &fixture.owner,
-        None, 0, 20).unwrap();
+        &repository::InstanceFilter::default(), 0, 20).unwrap();
     assert!(!listed.iter().find(|item| item.instance_id == started.instance_id)
         .unwrap().can_retry);
     let history = repository::list_events(&fixture.db, &fixture.owner,

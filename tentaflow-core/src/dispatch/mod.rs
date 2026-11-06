@@ -2905,6 +2905,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 P::MessageCancelResponse { .. } => "ProcessMessageCancelResponse",
                 P::ScopeGetRequest { .. } => "ProcessScopeGetRequest",
                 P::ScopeGetResponse { .. } => "ProcessScopeGetResponse",
+                P::InstanceTokensGetRequest { .. } => "ProcessInstanceTokensGetRequest",
+                P::InstanceTokensGetResponse { .. } => "ProcessInstanceTokensGetResponse",
                 P::SimulationStartRequest { .. } => "ProcessSimulationStartRequest",
                 P::SimulationStartResponse { .. } => "ProcessSimulationStartResponse",
                 P::SimulationViewRequest { .. } => "ProcessSimulationViewRequest",

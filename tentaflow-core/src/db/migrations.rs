@@ -1317,7 +1317,20 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bus_field_policy_mask_hash",
             MigrationStep::Sql(BUS_FIELD_POLICY_MASK_HASH),
         ),
+        (
+            207,
+            "bpmn_monitor_permission",
+            MigrationStep::Rust(roles_add_process_monitor_permission),
+        ),
     ]
+}
+
+/// v207 — `processes.monitor` lets a role read every instance of the
+/// organization in the process monitor, with variable values withheld (BPMN
+/// B4.1). Only org_admin holds it by default; mutations stay with the
+/// initiator and the definition owner.
+fn roles_add_process_monitor_permission(conn: &Connection) -> Result<()> {
+    roles_add_permissions(conn, &["org_admin"], &["processes.monitor"])
 }
 
 /// v206 — a read rule can mask or hash a field it shows (TentaBus F4 B7,
@@ -16916,7 +16929,7 @@ mod tests {
             assert_eq!(*version, index as i64 + 1, "the ladder must stay contiguous");
         }
         let head = ladder.last().unwrap().0;
-        assert_eq!(head, 206);
+        assert_eq!(head, 207);
 
         let fresh = Connection::open_in_memory().unwrap();
         run(&fresh).unwrap();
@@ -16935,7 +16948,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(applied_after_179.len(), 27);
+        assert_eq!(applied_after_179.len(), 28);
         assert_eq!(applied_after_179[0], "org_structure");
         assert_eq!(applied_after_179[19], "bpmn_activity_io_witnesses");
         assert_eq!(applied_after_179[20], "org_absences_drop_reason");
@@ -16951,6 +16964,7 @@ mod tests {
             "bpmn_service_invocation_critic_verified"
         );
         assert_eq!(applied_after_179[26], "bus_field_policy_mask_hash");
+        assert_eq!(applied_after_179[27], "bpmn_monitor_permission");
         let tables = |conn: &Connection| -> Vec<String> {
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap()
@@ -17328,6 +17342,32 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM bpmn_agent_completions", [], |r| r.get::<_, i64>(0)).unwrap(),
             0
         );
+    }
+
+    /// v207: org_admin gains `processes.monitor` once, a role that never had it
+    /// stays without, and running the rung again changes nothing.
+    #[test]
+    fn migration_207_grants_the_process_monitor_to_org_admin_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 206);
+        let perms = |conn: &Connection, role: &str| -> Vec<String> {
+            let json: String = conn
+                .query_row("SELECT permissions_json FROM roles WHERE name=?1", [role], |r| r.get(0))
+                .unwrap();
+            serde_json::from_str(&json).unwrap()
+        };
+        assert!(!perms(&conn, "org_admin").iter().any(|p| p == "processes.monitor"));
+
+        run(&conn).unwrap();
+        let count = |conn: &Connection| {
+            perms(conn, "org_admin").iter().filter(|p| *p == "processes.monitor").count()
+        };
+        assert_eq!(count(&conn), 1, "the ladder itself grants the permission");
+        roles_add_process_monitor_permission(&conn).unwrap();
+        assert_eq!(count(&conn), 1, "the rung is idempotent");
+        for role in ["org_operator", "org_viewer"] {
+            assert!(!perms(&conn, role).iter().any(|p| p == "processes.monitor"), "{role}");
+        }
     }
 
     /// v206: a rule from before the migration keeps its fields and gains NULL

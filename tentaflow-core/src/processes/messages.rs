@@ -1473,7 +1473,7 @@ mod tests {
         .is_err());
         assert_eq!(current(&f, &message).message, blocked);
         assert_eq!(
-            repository::list_instances(&f.db, &f.owner, None, 0, 20)
+            repository::list_instances(&f.db, &f.owner, &repository::InstanceFilter::default(), 0, 20)
                 .unwrap()
                 .1,
             0
@@ -2101,7 +2101,7 @@ mod tests {
         drain_pending(&f.db, at).completion.unwrap();
         assert_eq!(current(&f, &m).message.status, M::Error);
         assert_eq!(
-            repository::list_instances(&f.db, &f.owner, None, 0, 20)
+            repository::list_instances(&f.db, &f.owner, &repository::InstanceFilter::default(), 0, 20)
                 .unwrap()
                 .1,
             0

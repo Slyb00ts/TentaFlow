@@ -24,6 +24,9 @@ fn error(error: anyhow::Error) -> ProtocolError {
     {
         return ProtocolError::bad_request(message);
     }
+    if error.downcast_ref::<repository::ProcessOperationDenied>().is_some() {
+        return ProtocolError::new(ProtocolErrorCode::PolicyDenied, message);
+    }
     if message.contains("not found") || message.contains("Query returned no rows") {
         return ProtocolError::not_found("process resource not found");
     }
@@ -806,9 +809,20 @@ pub fn process_dispatch(
             definition_id,
             offset,
             limit,
+            version,
+            status,
+            has_incident,
+            scope,
         } => {
+            let filter = repository::InstanceFilter {
+                definition_id: definition_id.clone(),
+                version: *version,
+                status: status.clone(),
+                has_incident: *has_incident,
+                scope: *scope,
+            };
             let (instances, total, has_more) =
-                repository::list_instances(pool, &actor, definition_id.as_deref(), *offset, *limit)
+                repository::list_instances(pool, &actor, &filter, *offset, *limit)
                     .map_err(error)?;
             P::InstanceListResponse {
                 instances,
@@ -826,10 +840,34 @@ pub fn process_dispatch(
         } => {
             let (scope, variables, active_node_ids) =
                 repository::get_scope(pool, &actor, instance_id, scope_id).map_err(error)?;
+            let variables_redacted = repository::instance_access(pool, &actor, instance_id)
+                .map_err(error)?
+                == tentaflow_protocol::processes::ProcessInstanceAccess::Monitor;
             P::ScopeGetResponse {
                 scope,
                 variables,
                 active_node_ids,
+                variables_redacted,
+            }
+        }
+        P::InstanceTokensGetRequest {
+            instance_id,
+            scope_id,
+            if_revision,
+        } => {
+            let view = repository::get_instance_tokens(
+                pool, &actor, instance_id, scope_id.as_deref(), *if_revision,
+            )
+            .map_err(error)?;
+            P::InstanceTokensGetResponse {
+                instance_revision: view.instance_revision,
+                not_modified: view.not_modified,
+                version: view.version,
+                process_id: view.process_id,
+                tokens: view.tokens,
+                taken_edge_ids: view.taken_edge_ids,
+                visited_node_ids: view.visited_node_ids,
+                truncated: view.truncated,
             }
         }
         P::UserTaskGetRequest {
@@ -947,10 +985,14 @@ pub fn process_dispatch(
             let (events, next_seq, has_more) =
                 repository::list_events(pool, &actor, instance_id, *after_seq, *limit)
                     .map_err(error)?;
+            let data_redacted = repository::instance_access(pool, &actor, instance_id)
+                .map_err(error)?
+                == tentaflow_protocol::processes::ProcessInstanceAccess::Monitor;
             P::HistoryResponse {
                 events,
                 next_seq,
                 has_more,
+                data_redacted,
             }
         }
         P::MessageSendRequest {
@@ -1235,6 +1277,7 @@ pub fn process_dispatch(
         | P::InstanceStartResponse { .. }
         | P::InstanceListResponse { .. }
         | P::InstanceGetResponse { .. }
+        | P::InstanceTokensGetResponse { .. }
         | P::ScopeGetResponse { .. }
         | P::UserTaskGetResponse { .. }
         | P::ManualTaskAcknowledgeResponse { .. }
@@ -1287,6 +1330,7 @@ register_request!("ProcessInstanceStartRequest");
 register_request!("ProcessInstanceListRequest");
 register_request!("ProcessInstanceGetRequest");
 register_request!("ProcessScopeGetRequest");
+register_request!("ProcessInstanceTokensGetRequest");
 register_request!("ProcessUserTaskGetRequest");
 register_request!("ProcessUserTaskCompleteRequest");
 register_request!("ProcessManualTaskAcknowledgeRequest");
@@ -3327,6 +3371,10 @@ mod tests {
                 definition_id: Some(definition.definition_id),
                 offset: 0,
                 limit: 10,
+                version: None,
+                status: None,
+                has_incident: None,
+                scope: None,
             },
         )
         .await
@@ -3708,6 +3756,7 @@ mod tests {
             scope,
             variables,
             active_node_ids,
+            ..
         } = &scope_response
         else {
             panic!("actual participant scope detail expected")
@@ -3990,5 +4039,93 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn monitor_requests_keep_their_codes_and_the_token_view_answers_not_modified() {
+        use tentaflow_protocol::processes::{ProcessInstanceAccess, ProcessInstanceListScope};
+
+        let state = AppState::for_test();
+        let owner = test_support::actor(&state.db, "monitor-owner");
+        let viewer = test_support::actor(&state.db, "monitor-viewer");
+        let auditor_id = crate::db::repository::create_user_account(
+            &state.db, "monitor-auditor", "test-password-hash", "monitor-auditor",
+            "monitor-auditor@example.test",
+        ).unwrap();
+        crate::services::org::repo::add_membership(
+            &state.db, crate::services::org::DEFAULT_ORG_ID, &auditor_id, "role-org-admin", &auditor_id,
+        ).unwrap();
+        let auditor = ProcessActor { org_id: crate::services::org::DEFAULT_ORG_ID.into(), user_id: auditor_id };
+        let (owner_ctx, viewer_ctx, auditor_ctx) =
+            (context(&state, &owner), context(&state, &viewer), context(&state, &auditor));
+
+        let mut model = test_support::user_model(Some(&owner.user_id));
+        model.variables.insert("note".into(), json!("private text"));
+        let definition = save(&owner_ctx, model).await;
+        request(&owner_ctx, P::DefinitionPublishRequest {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            definition_id: definition.definition_id.clone(),
+            expected_revision: definition.draft_revision,
+            repin_calendar: None,
+        }).await;
+        let P::InstanceStartResponse { instance } = request(&owner_ctx, P::InstanceStartRequest {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            definition_id: definition.definition_id.clone(),
+            version: 1,
+            variables: json!({"note": "private text"}),
+            process_id: None,
+            start_node_id: None,
+        }).await else { panic!("started instance expected") };
+
+        let list = |scope| P::InstanceListRequest {
+            definition_id: None, offset: 0, limit: 10, version: None, status: None,
+            has_incident: None, scope: Some(scope),
+        };
+        let P::InstanceListResponse { instances, .. } =
+            request(&auditor_ctx, list(ProcessInstanceListScope::Monitor)).await
+        else { panic!("monitor list expected") };
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].access, Some(ProcessInstanceAccess::Monitor));
+        assert_eq!(refused(&viewer_ctx, list(ProcessInstanceListScope::Monitor)).await.code,
+            ProtocolErrorCode::PolicyDenied);
+
+        let retry = P::JobRetryRequest {
+            command_id: uuid::Uuid::new_v4().to_string(),
+            instance_id: instance.instance_id.clone(),
+            job_id: "no-such-job".into(),
+            expected_revision: instance.revision,
+        };
+        assert_eq!(refused(&auditor_ctx, retry.clone()).await.code, ProtocolErrorCode::PolicyDenied);
+        assert_eq!(refused(&viewer_ctx, retry).await.code, ProtocolErrorCode::NotFound);
+
+        let tokens = |if_revision| P::InstanceTokensGetRequest {
+            instance_id: instance.instance_id.clone(), scope_id: None, if_revision,
+        };
+        let P::InstanceTokensGetResponse { not_modified, tokens: live, taken_edge_ids, .. } =
+            request(&auditor_ctx, tokens(None)).await
+        else { panic!("token view expected") };
+        assert!(!not_modified);
+        assert_eq!(live.len(), 1);
+        assert_eq!(taken_edge_ids, vec!["ToWork".to_string()]);
+        let P::InstanceTokensGetResponse { not_modified, tokens: live, .. } =
+            request(&auditor_ctx, tokens(Some(instance.revision))).await
+        else { panic!("not modified answer expected") };
+        assert!(not_modified && live.is_empty());
+        assert_eq!(refused(&viewer_ctx, tokens(None)).await.code, ProtocolErrorCode::NotFound);
+
+        let P::ScopeGetResponse { variables, variables_redacted, .. } = request(&auditor_ctx,
+            P::ScopeGetRequest { instance_id: instance.instance_id.clone(),
+                scope_id: instance.instance_id.clone() }).await
+        else { panic!("monitor scope expected") };
+        assert!(variables_redacted);
+        assert_eq!(variables, json!({"note": "string"}));
+        let P::HistoryResponse { events, data_redacted, .. } = request(&auditor_ctx,
+            P::HistoryRequest { instance_id: instance.instance_id.clone(), after_seq: 0, limit: 50 }).await
+        else { panic!("monitor history expected") };
+        assert!(data_redacted && events.iter().all(|event| event.data.is_null()));
+        let P::HistoryResponse { data_redacted, .. } = request(&owner_ctx,
+            P::HistoryRequest { instance_id: instance.instance_id.clone(), after_seq: 0, limit: 50 }).await
+        else { panic!("initiator history expected") };
+        assert!(!data_redacted);
     }
 }

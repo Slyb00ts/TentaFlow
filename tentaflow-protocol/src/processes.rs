@@ -1791,6 +1791,37 @@ pub struct ProcessInstance {
     pub selected_repetition_occurrence: Option<ProcessRepetitionOccurrenceDetail>,
     pub process_id: String,
     pub start_node_id: String,
+    /// Why the caller may read this instance; absent in answers of older nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<ProcessInstanceAccess>,
+    /// `variables` carries only the type name of each variable instead of its value.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub variables_redacted: bool,
+}
+
+/// The ground on which the caller reads an instance. The first applicable one
+/// wins, in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProcessInstanceAccess {
+    /// Started the instance: reads, cancels and retries.
+    Initiator,
+    /// Owns the definition: reads and retries in the initiator's name.
+    Owner,
+    /// Holds a task of the instance: reads it as before.
+    Assignee,
+    /// Holds `processes.monitor`: reads only, variable values redacted.
+    Monitor,
+}
+
+/// Which instances a list request covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProcessInstanceListScope {
+    /// Instances the caller started or holds a task of.
+    Mine,
+    /// Instances of definitions the caller owns.
+    Owned,
+    /// Every instance of the organization; needs `processes.monitor`.
+    Monitor,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1807,6 +1838,8 @@ pub struct ProcessInstanceSummary {
     pub can_cancel: bool,
     pub can_retry: bool,
     pub process_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<ProcessInstanceAccess>,
 }
 
 impl From<&ProcessInstance> for ProcessInstanceSummary {
@@ -1824,6 +1857,7 @@ impl From<&ProcessInstance> for ProcessInstanceSummary {
             can_cancel: value.can_cancel,
             can_retry: value.can_retry,
             process_id: value.process_id.clone(),
+            access: value.access,
         }
     }
 }
@@ -2208,6 +2242,70 @@ pub struct ProcessSimulationView {
     pub trace_steps_omitted: u64,
 }
 
+/// Where a token stands, for the monitor overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProcessTokenStatus {
+    Ready,
+    Waiting,
+    Joining,
+}
+
+/// What a live token waits for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProcessTokenWait {
+    UserTask { user_task_id: String },
+    Job { job_id: String },
+    Timer {
+        timer_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        due_at_ms: Option<i64>,
+    },
+    Message { subscription_id: String },
+    Call { child_instance_id: String },
+    Gateway,
+    /// The token holds an embedded subprocess; `active_tokens` counts the live
+    /// tokens inside it, nested scopes included.
+    Scope { scope_id: String, active_tokens: u32 },
+}
+
+/// The repetition occurrence a token belongs to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessTokenOccurrence {
+    pub group_id: String,
+    pub ordinal: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessTokenView {
+    pub token_id: String,
+    pub scope_id: String,
+    pub node_id: String,
+    pub status: ProcessTokenStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<ProcessTokenWait>,
+    #[serde(default)]
+    pub incident_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence: Option<ProcessTokenOccurrence>,
+    pub since_ms: i64,
+}
+
+/// The token state of one scope of an instance. When `not_modified` is set the
+/// caller's `if_revision` is still current and every collection is empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessInstanceTokens {
+    pub instance_revision: u64,
+    pub not_modified: bool,
+    pub version: u32,
+    pub process_id: String,
+    pub tokens: Vec<ProcessTokenView>,
+    pub taken_edge_ids: Vec<String>,
+    pub visited_node_ids: Vec<String>,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ProcessPayload {
     OptionsRequest {},
@@ -2319,6 +2417,15 @@ pub enum ProcessPayload {
         definition_id: Option<String>,
         offset: u32,
         limit: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<ProcessInstanceStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        has_incident: Option<bool>,
+        /// Absent means `Mine`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<ProcessInstanceListScope>,
     },
     InstanceListResponse {
         instances: Vec<ProcessInstanceSummary>,
@@ -2370,6 +2477,9 @@ pub enum ProcessPayload {
         events: Vec<ProcessEvent>,
         next_seq: u64,
         has_more: bool,
+        /// Event `data` is withheld (null) because the caller reads as a monitor.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        data_redacted: bool,
     },
     UserTaskGetRequest {
         instance_id: String,
@@ -2434,6 +2544,8 @@ pub enum ProcessPayload {
         scope: ProcessScopeSummary,
         variables: Value,
         active_node_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        variables_redacted: bool,
     },
     ManualTaskAcknowledgeRequest {
         command_id: String,
@@ -2525,6 +2637,25 @@ pub enum ProcessPayload {
     },
     SimulationMessageSendResponse {
         view: ProcessSimulationView,
+    },
+    /// Token state of one scope for the monitor overlay. `if_revision` equal to
+    /// the instance revision answers `not_modified` without the collections.
+    InstanceTokensGetRequest {
+        instance_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        if_revision: Option<u64>,
+    },
+    InstanceTokensGetResponse {
+        instance_revision: u64,
+        not_modified: bool,
+        version: u32,
+        process_id: String,
+        tokens: Vec<ProcessTokenView>,
+        taken_edge_ids: Vec<String>,
+        visited_node_ids: Vec<String>,
+        truncated: bool,
     },
 }
 
@@ -3234,7 +3365,7 @@ mod tests {
             depth: 1, created_at_ms: 100, updated_at_ms: 200, terminal_error: None };
         let payload = ProcessPayload::ScopeGetResponse { scope: scope.clone(),
             variables: serde_json::json!({"customer_ID":{"original_key":7}}),
-            active_node_ids: vec!["Child_Start".into()] };
+            active_node_ids: vec!["Child_Start".into()], variables_redacted: false };
         assert_eq!(crate::cbor::decode::<ProcessPayload>(&crate::cbor::encode(&payload).unwrap()).unwrap(), payload);
         assert_eq!(serde_json::to_value(scope).unwrap()["scope_id"], "child-1");
     }
@@ -3369,6 +3500,7 @@ mod tests {
             terminal_error: Some(terminal_error),
             repetition_groups: Vec::new(), repetition_occurrences: Vec::new(),
             selected_repetition_occurrence: None, process_id: "P_1".into(), start_node_id: "Start_1".into(),
+            access: None, variables_redacted: false,
         };
         let encoded = crate::cbor::encode(&instance).unwrap();
         assert_eq!(crate::cbor::decode::<ProcessInstance>(&encoded).unwrap(), instance);
@@ -3732,5 +3864,100 @@ mod tests {
         assert!(serde_json::from_value::<ServiceImplementation>(serde_json::json!(
             {"Agent": {"agent_id": "a", "goal_expression": "g", "allowed_tools": [],
                        "max_iterations": 1, "extra": 1}})).is_err());
+    }
+
+    #[test]
+    fn monitor_reader_fields_are_absent_from_bytes_that_do_not_use_them() {
+        let list = ProcessPayload::InstanceListRequest {
+            definition_id: None, offset: 0, limit: 25,
+            version: None, status: None, has_incident: None, scope: None,
+        };
+        let json = serde_json::to_value(&list).unwrap();
+        assert_eq!(json, serde_json::json!({"InstanceListRequest":
+            {"definition_id": null, "offset": 0, "limit": 25}}));
+        // A request an older browser built has none of the new filters.
+        let old: ProcessPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(old, list);
+        let filtered = ProcessPayload::InstanceListRequest {
+            definition_id: Some("d".into()), offset: 0, limit: 25, version: Some(3),
+            status: Some(ProcessInstanceStatus::Incident), has_incident: Some(true),
+            scope: Some(ProcessInstanceListScope::Monitor),
+        };
+        assert_eq!(crate::cbor::decode::<ProcessPayload>(&crate::cbor::encode(&filtered).unwrap()).unwrap(),
+            filtered);
+        assert_eq!(serde_json::to_value(&filtered).unwrap()["InstanceListRequest"]["scope"], "Monitor");
+
+        let history = ProcessPayload::HistoryResponse {
+            events: Vec::new(), next_seq: 0, has_more: false, data_redacted: false,
+        };
+        assert!(serde_json::to_value(&history).unwrap()["HistoryResponse"]
+            .get("data_redacted").is_none());
+        let redacted = ProcessPayload::HistoryResponse {
+            events: Vec::new(), next_seq: 0, has_more: false, data_redacted: true,
+        };
+        assert_eq!(serde_json::to_value(&redacted).unwrap()["HistoryResponse"]["data_redacted"], true);
+        assert_eq!(crate::cbor::decode::<ProcessPayload>(&crate::cbor::encode(&redacted).unwrap()).unwrap(),
+            redacted);
+        let scope = serde_json::json!({"ScopeGetResponse": {
+            "scope": {"scope_id": "s", "parent_scope_id": null, "subprocess_node_id": null,
+                "subprocess_node_name": null, "terminal_error": null, "parent_token_id": null,
+                "revision": 1, "status": "Running", "depth": 0, "created_at_ms": 1, "updated_at_ms": 1},
+            "variables": {}, "active_node_ids": []}});
+        match serde_json::from_value::<ProcessPayload>(scope).unwrap() {
+            ProcessPayload::ScopeGetResponse { variables_redacted, .. } => assert!(!variables_redacted),
+            other => panic!("unexpected payload {other:?}"),
+        }
+    }
+
+    #[test]
+    fn instance_tokens_variants_are_appended_and_tagged_by_name() {
+        let request = ProcessPayload::InstanceTokensGetRequest {
+            instance_id: "i".into(), scope_id: None, if_revision: Some(7),
+        };
+        assert_eq!(serde_json::to_value(&request).unwrap(),
+            serde_json::json!({"InstanceTokensGetRequest": {"instance_id": "i", "if_revision": 7}}));
+        let bytes = crate::cbor::encode(&request).unwrap();
+        // The CBOR tag is the variant name, so a rename would break deployed peers.
+        let name = b"InstanceTokensGetRequest";
+        assert!(bytes.windows(name.len()).any(|window| window == name));
+        assert_eq!(crate::cbor::decode::<ProcessPayload>(&bytes).unwrap(), request);
+
+        let token = ProcessTokenView {
+            token_id: "t".into(), scope_id: "s".into(), node_id: "Sub".into(),
+            status: ProcessTokenStatus::Waiting,
+            wait: Some(ProcessTokenWait::Scope { scope_id: "child".into(), active_tokens: 2 }),
+            incident_ids: Vec::new(),
+            occurrence: Some(ProcessTokenOccurrence { group_id: "g".into(), ordinal: 1 }),
+            since_ms: 5,
+        };
+        let response = ProcessPayload::InstanceTokensGetResponse {
+            instance_revision: 7, not_modified: false, version: 2, process_id: "P_1".into(),
+            tokens: vec![token.clone()], taken_edge_ids: vec!["E1".into()],
+            visited_node_ids: vec!["Start_1".into()], truncated: false,
+        };
+        assert_eq!(crate::cbor::decode::<ProcessPayload>(&crate::cbor::encode(&response).unwrap()).unwrap(),
+            response);
+        let json = serde_json::to_value(&token).unwrap();
+        assert_eq!(json["incident_ids"], serde_json::json!([]));
+        assert!(json.get("occurrence").is_none());
+        assert_eq!(json["wait"], serde_json::json!({"Scope": {"scope_id": "child", "active_tokens": 2}}));
+        let mut unknown = json;
+        unknown["surprise"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<ProcessTokenView>(unknown).is_err());
+    }
+
+    #[test]
+    fn instance_access_stays_out_of_bytes_until_a_reader_sets_it() {
+        assert_eq!(serde_json::to_value(ProcessInstanceAccess::Monitor).unwrap(), "Monitor");
+        let summary = serde_json::json!({
+            "instance_id": "i", "definition_id": "d", "definition_name": "n",
+            "initiator_user_id": "u", "version": 1, "revision": 1, "status": "Running",
+            "created_at_ms": 1, "updated_at_ms": 1, "can_cancel": false, "can_retry": false,
+            "process_id": "P_1"});
+        let decoded: ProcessInstanceSummary = serde_json::from_value(summary.clone()).unwrap();
+        assert_eq!(decoded.access, None);
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), summary);
+        let with_access = ProcessInstanceSummary { access: Some(ProcessInstanceAccess::Owner), ..decoded };
+        assert_eq!(serde_json::to_value(&with_access).unwrap()["access"], "Owner");
     }
 }

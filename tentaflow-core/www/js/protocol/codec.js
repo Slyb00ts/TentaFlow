@@ -1024,7 +1024,9 @@ function processRequestBody(variant, payload) {
     VersionListRequest: ['definitionId', 'offset', 'limit'], VersionGetRequest: ['definitionId', 'version'],
     XmlImportRequest: ['xml'], XmlExportRequest: ['definitionId', 'version'],
     InstanceStartRequest: ['commandId', 'definitionId', 'version', 'variables', 'processId', 'startNodeId'],
-    InstanceListRequest: ['definitionId', 'offset', 'limit'], InstanceGetRequest: ['instanceId', 'pages'],
+    InstanceListRequest: ['definitionId', 'offset', 'limit', 'version', 'status', 'hasIncident', 'scope'],
+    InstanceGetRequest: ['instanceId', 'pages'],
+    InstanceTokensGetRequest: ['instanceId', 'scopeId', 'ifRevision'],
     UserTaskGetRequest: ['instanceId', 'userTaskId'],
     UserTaskCompleteRequest: ['commandId', 'instanceId', 'userTaskId', 'expectedRevision', 'outputs', 'approved'],
     ManualTaskAcknowledgeRequest: ['commandId', 'instanceId', 'userTaskId', 'expectedRevision'],
@@ -1054,6 +1056,8 @@ function processRequestBody(variant, payload) {
     if (value === undefined && !['definitionId', 'version', 'approved', 'repinCalendar'].includes(name)
       && !(variant === 'InstanceStartRequest' && ['processId', 'startNodeId'].includes(name))
       && !(variant === 'InstanceGetRequest' && name === 'pages')
+      && !(variant === 'InstanceListRequest' && ['version', 'status', 'hasIncident', 'scope'].includes(name))
+      && !(variant === 'InstanceTokensGetRequest' && ['scopeId', 'ifRevision'].includes(name))
       && !(variant === 'SimulationStartRequest' && name === 'serviceFixtures')
       && !(variant === 'SimulationServiceResolveRequest' && ['verdict', 'jobId'].includes(name))
       && !(variant === 'SimulationMessageSendRequest' && ['payload', 'ttlSeconds', 'subscriptionId'].includes(name))
@@ -1061,6 +1065,11 @@ function processRequestBody(variant, payload) {
       throw new TypeError(`process request ${variant} requires ${name}`);
     }
     if (variant === 'InstanceStartRequest' && ['processId', 'startNodeId'].includes(name)
+      && value == null) continue;
+    // An absent filter is left off the wire: the server reads it as "no filter".
+    if (variant === 'InstanceListRequest' && ['version', 'status', 'hasIncident', 'scope'].includes(name)
+      && value == null) continue;
+    if (variant === 'InstanceTokensGetRequest' && ['scopeId', 'ifRevision'].includes(name)
       && value == null) continue;
     // A prepared answer travels only when there is one; an absent list is the empty one.
     if (name === 'serviceFixtures') {
@@ -1127,6 +1136,14 @@ export const encode = {
   },
   processInstanceGetRequest(correlationId, payload, sequence = 1) {
     return processFrame(correlationId, sequence, 'InstanceGetRequest', payload);
+  },
+  /**
+   * ProcessPayload::InstanceTokensGetRequest — token state of one scope for the monitor overlay.
+   * payload: { instanceId, scopeId?, ifRevision? }. `ifRevision` equal to the instance revision
+   * answers `notModified: true` with empty collections.
+   */
+  processInstanceTokensGetRequest(correlationId, payload, sequence = 1) {
+    return processFrame(correlationId, sequence, 'InstanceTokensGetRequest', payload);
   },
   processUserTaskGetRequest(correlationId, payload, sequence = 1) {
     return processFrame(correlationId, sequence, 'UserTaskGetRequest', payload);

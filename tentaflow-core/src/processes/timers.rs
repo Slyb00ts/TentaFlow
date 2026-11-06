@@ -1408,7 +1408,7 @@ mod tests {
             0
         );
         let instances =
-            repository::list_instances(&reopened, &owner, Some(&version.definition_id), 0, 100)
+            repository::list_instances(&reopened, &owner, &repository::InstanceFilter::of_definition(&version.definition_id), 0, 100)
                 .unwrap();
         assert_eq!(instances.1, 1);
         let history = repository::list_events(&reopened, &owner, &first.instance_id, 0, 200)
@@ -1913,7 +1913,7 @@ mod tests {
             repository::list_instances(
                 &fixture.db,
                 &fixture.owner,
-                Some(&version.definition_id),
+                &repository::InstanceFilter::of_definition(&version.definition_id),
                 0,
                 100
             )
@@ -2314,7 +2314,7 @@ mod tests {
             repository::list_instances(
                 &fixture.db,
                 &fixture.owner,
-                Some(&version.definition_id),
+                &repository::InstanceFilter::of_definition(&version.definition_id),
                 0,
                 100
             )
@@ -3671,7 +3671,7 @@ mod tests {
             repository::list_instances(
                 &fixture.db,
                 &fixture.owner,
-                Some(&version.definition_id),
+                &repository::InstanceFilter::of_definition(&version.definition_id),
                 0,
                 100
             )

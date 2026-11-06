@@ -1303,3 +1303,111 @@ test('process options decode the block and tool catalogues and tolerate a server
   const olderTool = decode({ assignees: [], service_flows: [], service_tools: [{ addon_id: 'notes-1', tool_name: 'search', description: 'd' }] });
   assert.equal(olderTool.serviceTools[0].addonName, undefined);
 });
+
+test('instance list filters and the token view request encode typed fields and leave absent ones off the wire', { skip }, () => {
+  const plain = request('processInstanceListRequest', { definitionId: null, offset: 0, limit: 25 });
+  assert.equal(plain._variant, 'ProcessBody.InstanceListRequest');
+  for (const field of ['version', 'status', 'hasIncident', 'scope']) {
+    assert.equal(plain[field] ?? null, null, `${field} stays off an unfiltered list`);
+  }
+  const filtered = request('processInstanceListRequest', { definitionId: 'd1', offset: 5, limit: 10,
+    version: 3, status: 'Incident', hasIncident: true, scope: 'Monitor' });
+  assert.equal(filtered.definitionId, 'd1');
+  assert.equal(filtered.version, 3);
+  assert.equal(filtered.status, 'Incident');
+  assert.equal(filtered.hasIncident, true);
+  assert.equal(filtered.scope, 'Monitor');
+  const owned = request('processInstanceListRequest', { definitionId: null, offset: 0, limit: 25,
+    hasIncident: false, scope: 'Owned' });
+  assert.equal(owned.hasIncident, false);
+  assert.equal(owned.scope, 'Owned');
+
+  const bare = request('processInstanceTokensGetRequest', { instanceId: 'i1' });
+  assert.equal(bare._variant, 'ProcessBody.InstanceTokensGetRequest');
+  assert.equal(bare.instanceId, 'i1');
+  assert.equal(bare.scopeId ?? null, null);
+  assert.equal(bare.ifRevision ?? null, null);
+  const cached = request('processInstanceTokensGetRequest',
+    { instanceId: 'i1', scopeId: 'child-scope', ifRevision: 7 });
+  assert.equal(cached.scopeId, 'child-scope');
+  assert.equal(cached.ifRevision, 7);
+  assert.throws(() => request('processInstanceTokensGetRequest', {}), /requires instanceId/);
+  assert.equal(Object.hasOwn(cached, 'if_revision'), false);
+});
+
+test('token view response decodes waits, occurrences and the not-modified answer', { skip }, () => {
+  const response = (fields) => wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    InstanceTokensGetResponse: { instance_revision: 7, not_modified: false, version: 2,
+      process_id: 'Process_1', tokens: [], taken_edge_ids: [], visited_node_ids: [], truncated: false,
+      ...fields } } })));
+  const full = response({
+    tokens: [
+      { token_id: 't1', scope_id: 'i1', node_id: 'Sub_1', status: 'Waiting', since_ms: 5,
+        wait: { Scope: { scope_id: 'child', active_tokens: 2 } }, incident_ids: [], occurrence: null },
+      { token_id: 't2', scope_id: 'child', node_id: 'Work', status: 'Waiting', since_ms: 6,
+        wait: { UserTask: { user_task_id: 'task-1' } }, incident_ids: ['inc-1'],
+        occurrence: { group_id: 'g1', ordinal: 3 } },
+      { token_id: 't3', scope_id: 'i1', node_id: 'Timer_1', status: 'Waiting', since_ms: 7,
+        wait: { Timer: { timer_id: 'tm1', due_at_ms: 99 } } },
+      { token_id: 't4', scope_id: 'i1', node_id: 'Join_1', status: 'Joining', since_ms: 8, wait: 'Gateway' },
+    ],
+    taken_edge_ids: ['E1', 'E2'], visited_node_ids: ['Start_1', 'Sub_1'], truncated: true,
+  });
+  assert.equal(full._variant, 'ProcessBody.InstanceTokensGetResponse');
+  assert.equal(full.instanceRevision, 7);
+  assert.equal(full.notModified, false);
+  assert.equal(full.processId, 'Process_1');
+  assert.deepEqual(full.takenEdgeIds, ['E1', 'E2']);
+  assert.deepEqual(full.visitedNodeIds, ['Start_1', 'Sub_1']);
+  assert.equal(full.truncated, true);
+  assert.equal(full.tokens[0].tokenId, 't1');
+  assert.equal(full.tokens[0].sinceMs, 5);
+  assert.deepEqual(full.tokens[0].wait.Scope, { scopeId: 'child', activeTokens: 2 });
+  assert.equal(full.tokens[1].wait.UserTask.userTaskId, 'task-1');
+  assert.deepEqual(full.tokens[1].incidentIds, ['inc-1']);
+  assert.deepEqual(full.tokens[1].occurrence, { groupId: 'g1', ordinal: 3 });
+  assert.equal(full.tokens[2].wait.Timer.dueAtMs, 99);
+  assert.equal(full.tokens[3].wait, 'Gateway');
+  assert.deepEqual(full.tokens[2].incidentIds ?? [], []);
+
+  const cachedAnswer = response({ not_modified: true });
+  assert.equal(cachedAnswer.notModified, true);
+  assert.deepEqual(cachedAnswer.tokens, []);
+  assert.deepEqual(cachedAnswer.takenEdgeIds, []);
+});
+
+test('monitor answers carry the access ground and the redaction flags only when set', { skip }, () => {
+  const decodeInstance = (extra) => wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: {
+    InstanceGetResponse: { instance: {
+      instance_id: 'i1', definition_id: 'd1', definition_name: 'Approval',
+      process_id: 'Process_Approval', start_node_id: 'Start_1',
+      initiator_user_id: 'u1', version: 1, revision: 1, status: 'Running',
+      variables: { note: 'string' }, active_node_ids: [], user_tasks: [], incidents: [],
+      created_at_ms: 1, updated_at_ms: 1, can_cancel: false, can_retry: false,
+      can_send_message: true, subscriptions: [], event_races: [], outgoing_messages: [],
+      message_names: [], scopes: [], calls: [], repetition_groups: [], repetition_occurrences: [],
+      selected_repetition_occurrence: null, ...extra } } } })));
+  const monitored = decodeInstance({ access: 'Monitor', variables_redacted: true });
+  assert.equal(monitored.instance.access, 'Monitor');
+  assert.equal(monitored.instance.variablesRedacted, true);
+  const ordinary = decodeInstance({});
+  assert.equal(ordinary.instance.access ?? null, null);
+  assert.equal(ordinary.instance.variablesRedacted ?? false, false);
+
+  const list = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: { InstanceListResponse: {
+    instances: [{ instance_id: 'i1', definition_id: 'd1', definition_name: 'Approval',
+      initiator_user_id: 'u1', version: 1, revision: 1, status: 'Incident', created_at_ms: 1,
+      updated_at_ms: 2, can_cancel: false, can_retry: true, process_id: 'Process_1', access: 'Owner' }],
+    total: 1, has_more: false } } })));
+  assert.equal(list.instances[0].access, 'Owner');
+  assert.equal(list.instances[0].canRetry, true);
+
+  const scope = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: { ScopeGetResponse: {
+    scope: { scope_id: 'i1', parent_scope_id: null, subprocess_node_id: null, subprocess_node_name: null,
+      parent_token_id: null, revision: 1, status: 'Running', depth: 0, created_at_ms: 1, updated_at_ms: 1 },
+    variables: { note: 'string' }, active_node_ids: [], variables_redacted: true } } })));
+  assert.equal(scope.variablesRedacted, true);
+  const history = wasm.decodeMessageBody(new Uint8Array(cbor({ ProcessBody: { HistoryResponse: {
+    events: [], next_seq: 0, has_more: false, data_redacted: true } } })));
+  assert.equal(history.dataRedacted, true);
+});

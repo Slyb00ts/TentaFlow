@@ -12,8 +12,10 @@ use tentaflow_protocol::processes::{
     ActivityOutcome, ActivityResult, PinnedFlowInfo, ServiceImplementationKind, ProcessCallPinInfo, ProcessCallStatus, ProcessCallSummary,
     ProcessCallActivity, ProcessCallTarget, ProcessDefinition, ProcessDefinitionSummary, ProcessEvent, ProcessEventRaceStatus,
     ProcessEventRaceSummary, ProcessIncident, ProcessIncidentSelection, ProcessInstance,
-    ProcessInstancePageInfo, ProcessInstancePageRequest, ProcessInstanceStatus,
-    ProcessInstanceSummary, ProcessStartCatalogEntry, ProcessStartTrigger, ProcessMessageDetail, ProcessMessageOrigin,
+    ProcessInstanceAccess, ProcessInstanceListScope, ProcessInstancePageInfo,
+    ProcessInstancePageRequest, ProcessInstanceStatus, ProcessInstanceSummary,
+    ProcessInstanceTokens, ProcessTokenOccurrence, ProcessTokenStatus, ProcessTokenView,
+    ProcessTokenWait, ProcessStartCatalogEntry, ProcessStartTrigger, ProcessMessageDetail, ProcessMessageOrigin,
     ProcessMessageStatus, ProcessMessageSummary, ProcessMessageTarget, ProcessModel, ProcessNode,
     ProcessNodeKind, ProcessPageInfo, ProcessPageSpec, ProcessPayload, ProcessRelatedInstance,
     ProcessRepetitionGroupMode, ProcessRepetitionGroupStatus, ProcessRepetitionGroupSummary,
@@ -63,6 +65,65 @@ impl std::fmt::Display for ProcessAuthorityDenied {
 }
 
 impl std::error::Error for ProcessAuthorityDenied {}
+
+/// Refusal of an operation to a caller who may see the instance. Typed, so the
+/// wire answer is `PolicyDenied` whatever words the message uses.
+#[derive(Debug)]
+pub struct ProcessOperationDenied(pub &'static str);
+
+impl std::fmt::Display for ProcessOperationDenied {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ProcessOperationDenied {}
+
+/// Which grounds of reading count. Everything that authorizes a mutation or a
+/// message keeps to the participants; only the monitor read paths widen it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessReach {
+    Participants,
+    Observers,
+}
+
+trait InstanceAccessRights {
+    fn is_initiator(self) -> bool;
+    /// Retrying acts in the initiator's name; the owner of the definition may
+    /// ask for it, a participant or a monitor may not.
+    fn may_retry(self) -> bool;
+    /// Variable values and event data are shown; a monitor sees names and types.
+    fn sees_values(self) -> bool;
+}
+
+impl InstanceAccessRights for ProcessInstanceAccess {
+    fn is_initiator(self) -> bool {
+        self == ProcessInstanceAccess::Initiator
+    }
+    fn may_retry(self) -> bool {
+        matches!(self, ProcessInstanceAccess::Initiator | ProcessInstanceAccess::Owner)
+    }
+    fn sees_values(self) -> bool {
+        self != ProcessInstanceAccess::Monitor
+    }
+}
+
+/// Filters of the instance list. `Default` is every instance the caller
+/// started or holds a task of.
+#[derive(Debug, Clone, Default)]
+pub struct InstanceFilter {
+    pub definition_id: Option<String>,
+    pub version: Option<u32>,
+    pub status: Option<ProcessInstanceStatus>,
+    pub has_incident: Option<bool>,
+    pub scope: Option<ProcessInstanceListScope>,
+}
+
+impl InstanceFilter {
+    pub fn of_definition(definition_id: &str) -> Self {
+        Self { definition_id: Some(definition_id.to_owned()), ..Self::default() }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum MessageClosed {
@@ -3079,31 +3140,66 @@ pub(super) fn require_source_current(
     Ok(())
 }
 
-fn require_instance_reader(
-    conn: &Connection,
-    actor: &ProcessActor,
-    instance_id: &str,
-) -> Result<bool> {
-    let initiator: Option<String> = conn
+/// Whether the actor's role holds `processes.monitor`. Read from the stored
+/// role, not from a caller-supplied flag, so the repository decides by itself.
+fn actor_monitors_on(conn: &Connection, actor: &ProcessActor) -> Result<bool> {
+    let permissions: Option<String> = conn
         .query_row(
-            "SELECT initiator_user_id FROM bpmn_instances WHERE instance_id=?1 AND org_id=?2",
-            params![instance_id, actor.org_id],
+            "SELECT r.permissions_json FROM org_memberships m JOIN roles r ON r.role_id=m.role_id WHERE m.user_id=?1 AND m.org_id=?2",
+            params![actor.user_id, actor.org_id],
             |row| row.get(0),
         )
         .optional()?;
-    let initiator = initiator.ok_or(ProcessAuthorityDenied("process instance not found"))?;
+    Ok(permissions
+        .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+        .is_some_and(|list| list.iter().any(|permission| permission == "processes.monitor")))
+}
+
+/// The one gate for reading an instance: initiator, then owner of the
+/// definition, then holder of a task, then monitor. A caller with none of them
+/// gets the answer of an instance that does not exist.
+fn instance_access_on(
+    conn: &Connection,
+    actor: &ProcessActor,
+    instance_id: &str,
+    reach: AccessReach,
+) -> Result<ProcessInstanceAccess> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT i.initiator_user_id,d.owner_user_id FROM bpmn_instances i JOIN bpmn_definitions d ON d.definition_id=i.definition_id WHERE i.instance_id=?1 AND i.org_id=?2",
+            params![instance_id, actor.org_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (initiator, owner) = row.ok_or(ProcessAuthorityDenied("process instance not found"))?;
     if initiator == actor.user_id {
-        return Ok(true);
+        return Ok(ProcessInstanceAccess::Initiator);
+    }
+    if reach == AccessReach::Observers && owner == actor.user_id {
+        return Ok(ProcessInstanceAccess::Owner);
     }
     let assigned: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM bpmn_user_tasks WHERE instance_id=?1 AND assignee_user_id=?2)",
         params![instance_id, actor.user_id],
         |row| row.get(0),
     )?;
-    if !assigned {
-        return Err(ProcessAuthorityDenied("process instance not found").into());
+    if assigned {
+        return Ok(ProcessInstanceAccess::Assignee);
     }
-    Ok(false)
+    if reach == AccessReach::Observers && actor_monitors_on(conn, actor)? {
+        return Ok(ProcessInstanceAccess::Monitor);
+    }
+    Err(ProcessAuthorityDenied("process instance not found").into())
+}
+
+/// `true` when the actor started the instance; a holder of one of its tasks
+/// reads it without that right.
+fn require_instance_reader(
+    conn: &Connection,
+    actor: &ProcessActor,
+    instance_id: &str,
+) -> Result<bool> {
+    Ok(instance_access_on(conn, actor, instance_id, AccessReach::Participants)?.is_initiator())
 }
 
 fn command_replay<T: for<'de> Deserialize<'de>>(
@@ -5555,18 +5651,57 @@ fn job_direct_retryable_on(conn: &Connection, job_id: &str, instance_id: &str) -
     Ok(proved_no_effect && job_activation_live_on(conn, job_id)?)
 }
 
+/// The one projection of "this open incident can be retried by the reader".
+fn incident_retryable_on(
+    conn: &Connection,
+    access: ProcessInstanceAccess,
+    instance_id: &str,
+    job_id: Option<&str>,
+    resolved_at_ms: Option<i64>,
+) -> Result<bool> {
+    if !access.may_retry() || resolved_at_ms.is_some() {
+        return Ok(false);
+    }
+    match job_id {
+        Some(job_id) => job_direct_retryable_on(conn, job_id, instance_id),
+        None => Ok(false),
+    }
+}
+
+/// The instance-level answer shared by the detail and the list: some open
+/// incident of an instance in `Incident` can be retried by the reader.
+fn instance_can_retry_on(
+    conn: &Connection,
+    access: ProcessInstanceAccess,
+    instance_id: &str,
+    status: &ProcessInstanceStatus,
+) -> Result<bool> {
+    if !access.may_retry() || *status != ProcessInstanceStatus::Incident {
+        return Ok(false);
+    }
+    let mut statement = conn.prepare(
+        "SELECT job_id FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL AND job_id IS NOT NULL ORDER BY at_ms,incident_id",
+    )?;
+    let job_ids = statement
+        .query_map([instance_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for job_id in job_ids {
+        if incident_retryable_on(conn, access, instance_id, Some(&job_id), None)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn incident_on(
     conn: &Connection,
-    actor: &ProcessActor,
+    access: ProcessInstanceAccess,
     instance_id: &str,
     id: &str,
     model: &ProcessModel,
 ) -> Result<ProcessIncidentSelection> {
     let (node_id,job_id,code,message,at_ms,resolved_at_ms):(Option<String>,Option<String>,String,String,i64,Option<i64>)=conn.query_row("SELECT node_id,job_id,code,message,at_ms,resolved_at_ms FROM bpmn_incidents WHERE instance_id=?1 AND incident_id=?2",params![instance_id,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).context("process incident not found")?;
-    let initiator = require_instance_reader(conn, actor, instance_id)?;
-    let can_retry=initiator&&resolved_at_ms.is_none()&&match &job_id {
-        Some(id) => job_direct_retryable_on(conn,id,instance_id)?, None => false,
-    };
+    let can_retry = incident_retryable_on(conn, access, instance_id, job_id.as_deref(), resolved_at_ms)?;
     let scope_id: String = conn.query_row(
         "SELECT scope_id FROM bpmn_incidents WHERE incident_id=?1 AND instance_id=?2",
         params![id, instance_id],
@@ -5597,7 +5732,7 @@ fn incident_on(
 }
 fn incidents_on(
     conn: &Connection,
-    actor: &ProcessActor,
+    access: ProcessInstanceAccess,
     instance_id: &str,
     model: &ProcessModel,
 ) -> Result<Vec<ProcessIncident>> {
@@ -5606,7 +5741,7 @@ fn incidents_on(
         .query_map([instance_id], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     ids.iter()
-        .map(|id| Ok(incident_on(conn, actor, instance_id, id, model)?.incident))
+        .map(|id| Ok(incident_on(conn, access, instance_id, id, model)?.incident))
         .collect()
 }
 fn subscription_summary(
@@ -5714,8 +5849,20 @@ fn instance_on(
     instance_id: &str,
     pages: Option<&ProcessInstancePageRequest>,
 ) -> Result<ProcessInstance> {
-    let is_initiator = require_instance_reader(conn, actor, instance_id)?;
-    instance_state_on(conn, actor, instance_id, pages, is_initiator)
+    let access = instance_access_on(conn, actor, instance_id, AccessReach::Participants)?;
+    instance_state_on(conn, actor, instance_id, pages, access)
+}
+
+/// The instance as a monitor reads it: the owner of the definition and a
+/// holder of `processes.monitor` see it too.
+fn observed_instance_on(
+    conn: &Connection,
+    actor: &ProcessActor,
+    instance_id: &str,
+    pages: Option<&ProcessInstancePageRequest>,
+) -> Result<ProcessInstance> {
+    let access = instance_access_on(conn, actor, instance_id, AccessReach::Observers)?;
+    instance_state_on(conn, actor, instance_id, pages, access)
 }
 
 fn repetition_group_page_on(
@@ -5838,7 +5985,7 @@ fn instance_state_on(
     actor: &ProcessActor,
     instance_id: &str,
     pages: Option<&ProcessInstancePageRequest>,
-    is_initiator: bool,
+    access: ProcessInstanceAccess,
 ) -> Result<ProcessInstance> {
     let (definition_id,version,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms,process_id,start_node_id):(String,u32,String,u64,String,String,i64,i64,String,String)=conn.query_row("SELECT definition_id,version,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms,selected_process_id,start_node_id FROM bpmn_instances WHERE instance_id=?1 AND org_id=?2",params![instance_id,actor.org_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,row_u64(r,3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?))).context("process instance not found")?;
     let model = current_version_model_on(conn, &definition_id, version)?;
@@ -5888,7 +6035,7 @@ fn instance_state_on(
     let incident_ids=detail_ids_on(conn,"SELECT incident_id FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL ORDER BY at_ms DESC,incident_id LIMIT ?2 OFFSET ?3",instance_id,incident_spec)?;
     let incidents = incident_ids
         .iter()
-        .map(|id| Ok(incident_on(conn, actor, instance_id, id, &model)?.incident))
+        .map(|id| Ok(incident_on(conn, access, instance_id, id, &model)?.incident))
         .collect::<Result<Vec<_>>>()?;
     let timers=detail_ids_on(conn,"SELECT timer_id FROM bpmn_timers WHERE instance_id=?1 ORDER BY CASE WHEN status IN ('pending','blocked') THEN 0 WHEN status='error' THEN 1 ELSE 2 END,created_at_ms DESC,timer_id LIMIT ?2 OFFSET ?3",instance_id,timer_spec)?.iter().map(|id|timer_summary(conn,&timer_on(conn,id)?,&model)).collect::<Result<Vec<_>>>()?;
     let subscriptions=detail_ids_on(conn,"SELECT subscription_id FROM bpmn_event_subscriptions WHERE instance_id=?1 ORDER BY CASE WHEN status='open' THEN 0 WHEN status='error' THEN 1 ELSE 2 END,created_at_ms DESC,subscription_id LIMIT ?2 OFFSET ?3",instance_id,sub_spec)?.iter().map(|id|subscription_summary(conn,&subscription_on(conn,id)?,&model)).collect::<Result<Vec<_>>>()?;
@@ -5904,13 +6051,10 @@ fn instance_state_on(
         .transpose()?;
     let selected_incident = pages
         .and_then(|p| p.selected_incident_id.as_deref())
-        .map(|id| incident_on(conn, actor, instance_id, id, &model))
+        .map(|id| incident_on(conn, access, instance_id, id, &model))
         .transpose()?;
-    let can_retry = is_initiator
-        && incidents_on(conn, actor, instance_id, &model)?
-            .iter()
-            .any(|i| i.can_retry);
     let status = status_from_text(&status)?;
+    let can_retry = instance_can_retry_on(conn, access, instance_id, &status)?;
     let closed = matches!(
         status,
         ProcessInstanceStatus::Completed
@@ -5960,13 +6104,17 @@ fn instance_state_on(
         version,
         revision,
         status,
-        variables: parse(variables_json)?,
+        variables: if access.sees_values() {
+            parse(variables_json)?
+        } else {
+            redact_values(&parse(variables_json)?)
+        },
         active_node_ids,
         user_tasks,
         incidents,
         created_at_ms,
         updated_at_ms,
-        can_cancel: is_initiator && !closed,
+        can_cancel: access.is_initiator() && !closed,
         can_retry,
         timers,
         subscriptions,
@@ -5981,9 +6129,12 @@ fn instance_state_on(
         calls,
         repetition_groups,
         repetition_occurrences,
-        selected_repetition_occurrence,
+        selected_repetition_occurrence: selected_repetition_occurrence
+            .filter(|_| access.sees_values()),
         process_id,
         start_node_id,
+        access: Some(access),
+        variables_redacted: !access.sees_values(),
         terminal_error: conn
             .query_row(
                 "SELECT terminal_error_json FROM bpmn_instances WHERE instance_id=?1",
@@ -5995,6 +6146,29 @@ fn instance_state_on(
     };
     ensure_instance_wire_budget(&instance)?;
     Ok(instance)
+}
+
+fn value_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// What a monitor sees of a variable set: each name with the type of its value.
+fn redact_values(values: &Value) -> Value {
+    match values {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(name, value)| (name.clone(), Value::from(value_type_name(value))))
+                .collect(),
+        ),
+        other => Value::from(value_type_name(other)),
+    }
 }
 
 fn ensure_instance_wire_budget(instance: &ProcessInstance) -> Result<()> {
@@ -6029,7 +6203,19 @@ pub fn get_instance(
 ) -> Result<ProcessInstance> {
     read_snapshot(pool, |conn| {
         require_actor(conn, actor)?;
-        instance_on(conn, actor, instance_id, pages)
+        observed_instance_on(conn, actor, instance_id, pages)
+    })
+}
+
+/// Why the actor may read the instance; `Err` when they may not.
+pub fn instance_access(
+    pool: &DbPool,
+    actor: &ProcessActor,
+    instance_id: &str,
+) -> Result<ProcessInstanceAccess> {
+    read_snapshot(pool, |conn| {
+        require_actor(conn, actor)?;
+        instance_access_on(conn, actor, instance_id, AccessReach::Observers)
     })
 }
 
@@ -6041,7 +6227,7 @@ pub fn get_scope(
 ) -> Result<(ProcessScopeSummary, Value, Vec<String>)> {
     read_snapshot(pool, |conn| {
         require_actor(conn, actor)?;
-        require_instance_reader(conn, actor, instance_id)?;
+        let access = instance_access_on(conn, actor, instance_id, AccessReach::Observers)?;
         let (definition_id, version): (String, u32) = conn.query_row(
             "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1 AND org_id=?2",
             params![instance_id, actor.org_id],
@@ -6053,6 +6239,7 @@ pub fn get_scope(
             .find(|scope| scope.scope_id == scope_id)
             .context("process scope not found")?;
         let variables = scope_variables_on(conn, instance_id, scope_id)?;
+        let variables = if access.sees_values() { variables } else { redact_values(&variables) };
         let mut statement = conn.prepare("SELECT DISTINCT node_id FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND status IN ('ready','waiting','joining') ORDER BY node_id")?;
         let active_node_ids = statement
             .query_map(params![instance_id, scope_id], |row| row.get(0))?
@@ -6063,6 +6250,7 @@ pub fn get_scope(
                     scope: scope.clone(),
                     variables: variables.clone(),
                     active_node_ids: active_node_ids.clone(),
+                    variables_redacted: true,
                 },
             ),
         )
@@ -6073,6 +6261,232 @@ pub fn get_scope(
         );
         Ok((scope, variables, active_node_ids))
     })
+}
+
+/// Live tokens, edges and nodes listed per answer; a longer history is cut and
+/// reported as `truncated`, never silently.
+const TOKEN_VIEW_LIMIT: usize = 2000;
+
+/// Token state of one scope for the monitor overlay.
+pub fn get_instance_tokens(
+    pool: &DbPool,
+    actor: &ProcessActor,
+    instance_id: &str,
+    scope_id: Option<&str>,
+    if_revision: Option<u64>,
+) -> Result<ProcessInstanceTokens> {
+    read_snapshot(pool, |conn| {
+        require_actor(conn, actor)?;
+        instance_access_on(conn, actor, instance_id, AccessReach::Observers)?;
+        let (version, revision, process_id): (u32, u64, String) = conn.query_row(
+            "SELECT version,revision,selected_process_id FROM bpmn_instances WHERE instance_id=?1 AND org_id=?2",
+            params![instance_id, actor.org_id],
+            |row| Ok((row.get(0)?, row_u64(row, 1)?, row.get(2)?)),
+        )?;
+        let mut view = ProcessInstanceTokens {
+            instance_revision: revision,
+            not_modified: if_revision == Some(revision),
+            version,
+            process_id,
+            tokens: Vec::new(),
+            taken_edge_ids: Vec::new(),
+            visited_node_ids: Vec::new(),
+            truncated: false,
+        };
+        if view.not_modified {
+            return Ok(view);
+        }
+        let scope_id = scope_id.unwrap_or(instance_id);
+        let scope_known: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bpmn_scopes WHERE instance_id=?1 AND scope_id=?2)",
+            params![instance_id, scope_id],
+            |row| row.get(0),
+        )?;
+        ensure!(scope_known, "process scope not found");
+        let cap = i64::try_from(TOKEN_VIEW_LIMIT + 1)?;
+
+        let waits = token_waits_on(conn, instance_id)?;
+        let mut statement = conn.prepare(
+            "SELECT token_id,scope_id,node_id,status,created_at_ms FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND status IN ('ready','waiting','joining') ORDER BY created_at_ms,token_id LIMIT ?3",
+        )?;
+        let rows = statement
+            .query_map(params![instance_id, scope_id, cap], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        view.truncated |= rows.len() > TOKEN_VIEW_LIMIT;
+        for (token_id, token_scope, node_id, status, since_ms) in rows.into_iter().take(TOKEN_VIEW_LIMIT) {
+            let status = match status.as_str() {
+                "ready" => ProcessTokenStatus::Ready,
+                "waiting" => ProcessTokenStatus::Waiting,
+                "joining" => ProcessTokenStatus::Joining,
+                other => bail!("unexpected live token status {other}"),
+            };
+            let wait = waits.wait_of(conn, instance_id, &token_id, status)?;
+            view.tokens.push(ProcessTokenView {
+                incident_ids: waits.incidents_of(&token_id, &token_scope, &node_id),
+                occurrence: waits.occurrences.get(&token_id).cloned(),
+                token_id,
+                scope_id: token_scope,
+                node_id,
+                status,
+                wait,
+                since_ms,
+            });
+        }
+
+        let mut edges = conn.prepare(
+            "SELECT DISTINCT arrival_edge_id FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 AND arrival_edge_id IS NOT NULL ORDER BY arrival_edge_id LIMIT ?3",
+        )?;
+        view.taken_edge_ids = edges
+            .query_map(params![instance_id, scope_id, cap], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut nodes = conn.prepare(
+            "SELECT DISTINCT node_id FROM bpmn_tokens WHERE instance_id=?1 AND scope_id=?2 ORDER BY node_id LIMIT ?3",
+        )?;
+        view.visited_node_ids = nodes
+            .query_map(params![instance_id, scope_id, cap], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for list in [&mut view.taken_edge_ids, &mut view.visited_node_ids] {
+            if list.len() > TOKEN_VIEW_LIMIT {
+                list.truncate(TOKEN_VIEW_LIMIT);
+                view.truncated = true;
+            }
+        }
+        Ok(view)
+    })
+}
+
+/// What each live token of an instance waits for, read once per answer.
+struct TokenWaits {
+    user_tasks: HashMap<String, String>,
+    jobs: HashMap<String, String>,
+    calls: HashMap<String, String>,
+    child_scopes: HashMap<String, String>,
+    timers: HashMap<String, (String, Option<i64>)>,
+    subscriptions: HashMap<String, String>,
+    occurrences: HashMap<String, ProcessTokenOccurrence>,
+    job_incidents: HashMap<String, Vec<String>>,
+    node_incidents: HashMap<(String, String), Vec<String>>,
+}
+
+fn token_waits_on(conn: &Connection, instance_id: &str) -> Result<TokenWaits> {
+    fn pairs(conn: &Connection, sql: &str, instance_id: &str) -> Result<HashMap<String, String>> {
+        let mut statement = conn.prepare(sql)?;
+        let rows = statement
+            .query_map([instance_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // The first row per token wins; the queries order by creation.
+        let mut map = HashMap::new();
+        for (token_id, value) in rows {
+            map.entry(token_id).or_insert(value);
+        }
+        Ok(map)
+    }
+    let user_tasks = pairs(conn, "SELECT token_id,user_task_id FROM bpmn_user_tasks WHERE instance_id=?1 AND token_id IS NOT NULL AND status='open' ORDER BY created_at_ms,user_task_id", instance_id)?;
+    let jobs = pairs(conn, "SELECT token_id,job_id FROM bpmn_jobs WHERE instance_id=?1 AND status IN ('queued','running','error') ORDER BY created_at_ms,job_id", instance_id)?;
+    let calls = pairs(conn, "SELECT parent_token_id,child_instance_id FROM bpmn_calls WHERE parent_instance_id=?1 AND status IN ('waiting','return_incident') ORDER BY created_at_ms,call_id", instance_id)?;
+    let child_scopes = pairs(conn, "SELECT parent_token_id,scope_id FROM bpmn_scopes WHERE instance_id=?1 AND parent_token_id IS NOT NULL AND status NOT IN ('completed','cancelled','error') ORDER BY created_at_ms,scope_id", instance_id)?;
+    let subscriptions = pairs(conn, "SELECT token_id,subscription_id FROM bpmn_event_subscriptions WHERE instance_id=?1 AND status='open' ORDER BY created_at_ms,subscription_id", instance_id)?;
+    let mut timers = HashMap::new();
+    let mut statement = conn.prepare("SELECT token_id,timer_id,due_at_ms FROM bpmn_timers WHERE instance_id=?1 AND token_id IS NOT NULL AND status IN ('pending','blocked') ORDER BY created_at_ms,timer_id")?;
+    for row in statement.query_map([instance_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<i64>>(2)?))
+    })? {
+        let (token_id, timer_id, due_at_ms) = row?;
+        timers.entry(token_id).or_insert((timer_id, due_at_ms));
+    }
+    let mut occurrences = HashMap::new();
+    let mut statement = conn.prepare("SELECT token_id,group_id,ordinal FROM bpmn_repetition_occurrences WHERE instance_id=?1 AND status NOT IN ('completed','cancelled')")?;
+    for row in statement.query_map([instance_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?))
+    })? {
+        let (token_id, group_id, ordinal) = row?;
+        occurrences.insert(token_id, ProcessTokenOccurrence { group_id, ordinal });
+    }
+    let job_tokens = pairs(conn, "SELECT job_id,token_id FROM bpmn_jobs WHERE instance_id=?1", instance_id)?;
+    let mut job_incidents: HashMap<String, Vec<String>> = HashMap::new();
+    let mut node_incidents: HashMap<(String, String), Vec<String>> = HashMap::new();
+    let mut statement = conn.prepare("SELECT incident_id,job_id,scope_id,node_id FROM bpmn_incidents WHERE instance_id=?1 AND resolved_at_ms IS NULL ORDER BY at_ms,incident_id")?;
+    for row in statement.query_map([instance_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })? {
+        let (incident_id, job_id, scope_id, node_id) = row?;
+        match (job_id, node_id) {
+            (Some(job_id), _) => {
+                if let Some(token_id) = job_tokens.get(&job_id) {
+                    job_incidents.entry(token_id.clone()).or_default().push(incident_id);
+                }
+            }
+            (None, Some(node_id)) => {
+                node_incidents.entry((scope_id, node_id)).or_default().push(incident_id);
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(TokenWaits {
+        user_tasks, jobs, calls, child_scopes, timers, subscriptions, occurrences,
+        job_incidents, node_incidents,
+    })
+}
+
+impl TokenWaits {
+    /// The primary wait of a token: a nested scope, a called process, a person,
+    /// a job, a timer or a message, in that order; a joining token waits at its gateway.
+    fn wait_of(
+        &self,
+        conn: &Connection,
+        instance_id: &str,
+        token_id: &str,
+        status: ProcessTokenStatus,
+    ) -> Result<Option<ProcessTokenWait>> {
+        if let Some(scope_id) = self.child_scopes.get(token_id) {
+            let active_tokens: u32 = conn.query_row(
+                "WITH RECURSIVE inner_scopes(scope_id) AS (SELECT ?2 UNION ALL SELECT s.scope_id FROM bpmn_scopes s JOIN inner_scopes ON s.parent_scope_id=inner_scopes.scope_id WHERE s.instance_id=?1) SELECT COUNT(*) FROM bpmn_tokens t WHERE t.instance_id=?1 AND t.scope_id IN (SELECT scope_id FROM inner_scopes) AND t.status IN ('ready','waiting','joining')",
+                params![instance_id, scope_id],
+                |row| row.get(0),
+            )?;
+            return Ok(Some(ProcessTokenWait::Scope { scope_id: scope_id.clone(), active_tokens }));
+        }
+        if let Some(child) = self.calls.get(token_id) {
+            return Ok(Some(ProcessTokenWait::Call { child_instance_id: child.clone() }));
+        }
+        if let Some(id) = self.user_tasks.get(token_id) {
+            return Ok(Some(ProcessTokenWait::UserTask { user_task_id: id.clone() }));
+        }
+        if let Some(id) = self.jobs.get(token_id) {
+            return Ok(Some(ProcessTokenWait::Job { job_id: id.clone() }));
+        }
+        if let Some((timer_id, due_at_ms)) = self.timers.get(token_id) {
+            return Ok(Some(ProcessTokenWait::Timer {
+                timer_id: timer_id.clone(),
+                due_at_ms: *due_at_ms,
+            }));
+        }
+        if let Some(id) = self.subscriptions.get(token_id) {
+            return Ok(Some(ProcessTokenWait::Message { subscription_id: id.clone() }));
+        }
+        Ok((status == ProcessTokenStatus::Joining).then_some(ProcessTokenWait::Gateway))
+    }
+
+    fn incidents_of(&self, token_id: &str, scope_id: &str, node_id: &str) -> Vec<String> {
+        let mut ids = self.job_incidents.get(token_id).cloned().unwrap_or_default();
+        if let Some(by_node) = self.node_incidents.get(&(scope_id.to_owned(), node_id.to_owned())) {
+            ids.extend(by_node.iter().cloned());
+        }
+        ids
+    }
 }
 
 pub fn get_user_task(
@@ -6122,24 +6536,54 @@ pub fn get_user_task(
 pub fn list_instances(
     pool: &DbPool,
     actor: &ProcessActor,
-    definition_id: Option<&str>,
+    filter: &InstanceFilter,
     offset: u32,
     limit: u32,
 ) -> Result<(Vec<ProcessInstanceSummary>, u32, bool)> {
     page(offset, limit)?;
     read_snapshot(pool, |conn| {
         require_actor(conn, actor)?;
-        let where_sql=" FROM bpmn_instances i JOIN bpmn_definitions d ON d.definition_id=i.definition_id WHERE i.org_id=?1 AND (i.initiator_user_id=?2 OR EXISTS(SELECT 1 FROM bpmn_user_tasks t WHERE t.instance_id=i.instance_id AND t.assignee_user_id=?2)) AND (?3 IS NULL OR i.definition_id=?3)";
+        let scope = filter.scope.unwrap_or(ProcessInstanceListScope::Mine);
+        let monitors = actor_monitors_on(conn, actor)?;
+        if scope == ProcessInstanceListScope::Monitor && !monitors {
+            return Err(ProcessOperationDenied("processes.monitor permission required").into());
+        }
+        let status = filter.status.as_ref().map(status_text);
+        let where_sql = " FROM bpmn_instances i JOIN bpmn_definitions d ON d.definition_id=i.definition_id WHERE i.org_id=?1 AND (?2=2 OR (?2=0 AND (i.initiator_user_id=?3 OR EXISTS(SELECT 1 FROM bpmn_user_tasks t WHERE t.instance_id=i.instance_id AND t.assignee_user_id=?3))) OR (?2=1 AND d.owner_user_id=?3)) AND (?4 IS NULL OR i.definition_id=?4) AND (?5 IS NULL OR i.version=?5) AND (?6 IS NULL OR i.status=?6) AND (?7 IS NULL OR ?7=EXISTS(SELECT 1 FROM bpmn_incidents x WHERE x.instance_id=i.instance_id AND x.resolved_at_ms IS NULL))";
+        let scope_code = match scope {
+            ProcessInstanceListScope::Mine => 0,
+            ProcessInstanceListScope::Owned => 1,
+            ProcessInstanceListScope::Monitor => 2,
+        };
+        let filter_params = params![
+            actor.org_id,
+            scope_code,
+            actor.user_id,
+            filter.definition_id,
+            filter.version,
+            status,
+            filter.has_incident
+        ];
         let total: u32 = conn.query_row(
             &format!("SELECT COUNT(*){where_sql}"),
-            params![actor.org_id, actor.user_id, definition_id],
+            filter_params,
             |row| row.get(0),
         )?;
-        let sql=format!("SELECT i.instance_id,i.definition_id,d.name,i.initiator_user_id,i.version,i.revision,i.status,i.created_at_ms,i.updated_at_ms,i.selected_process_id,EXISTS(SELECT 1 FROM bpmn_incidents x JOIN bpmn_jobs j ON j.job_id=x.job_id AND j.instance_id=x.instance_id JOIN bpmn_service_invocations v ON v.job_id=j.job_id AND v.instance_id=j.instance_id AND v.scope_id=j.scope_id JOIN bpmn_tokens t ON t.token_id=j.token_id AND t.instance_id=j.instance_id AND t.scope_id=j.scope_id AND t.node_id=j.node_id WHERE x.instance_id=i.instance_id AND x.resolved_at_ms IS NULL AND v.phase='proved_no_effect' AND v.dispatch_evidence='no_boundary' AND v.stable_request_id IS NOT NULL AND v.dispatch_attempt IS NULL AND v.dispatch_fence IS NULL AND v.dispatch_worker_id IS NULL AND v.dispatch_committed_at_ms IS NULL AND j.status='error' AND t.status='waiting' AND i.status='incident'){where_sql} ORDER BY i.updated_at_ms DESC,i.instance_id DESC LIMIT ?4 OFFSET ?5");
+        let sql = format!("SELECT i.instance_id,i.definition_id,d.name,i.initiator_user_id,i.version,i.revision,i.status,i.created_at_ms,i.updated_at_ms,i.selected_process_id,d.owner_user_id,EXISTS(SELECT 1 FROM bpmn_user_tasks t WHERE t.instance_id=i.instance_id AND t.assignee_user_id=?3){where_sql} ORDER BY i.updated_at_ms DESC,i.instance_id DESC LIMIT ?8 OFFSET ?9");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(
-                params![actor.org_id, actor.user_id, definition_id, limit, offset],
+                params![
+                    actor.org_id,
+                    scope_code,
+                    actor.user_id,
+                    filter.definition_id,
+                    filter.version,
+                    status,
+                    filter.has_incident,
+                    limit,
+                    offset
+                ],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -6152,7 +6596,8 @@ pub fn list_instances(
                         row.get::<_, i64>(7)?,
                         row.get::<_, i64>(8)?,
                         row.get::<_, String>(9)?,
-                        row.get::<_, bool>(10)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, bool>(11)?,
                     ))
                 },
             )?
@@ -6171,29 +6616,40 @@ pub fn list_instances(
                     created_at_ms,
                     updated_at_ms,
                     process_id,
-                    retryable,
+                    owner_user_id,
+                    assigned,
                 )| {
                     let status = status_from_text(&status)?;
-                    let owns = initiator_user_id == actor.user_id;
+                    // The same order as `instance_access_on`, decided from the row.
+                    let access = if initiator_user_id == actor.user_id {
+                        ProcessInstanceAccess::Initiator
+                    } else if owner_user_id == actor.user_id {
+                        ProcessInstanceAccess::Owner
+                    } else if assigned {
+                        ProcessInstanceAccess::Assignee
+                    } else {
+                        ProcessInstanceAccess::Monitor
+                    };
+                    let closed = matches!(
+                        status,
+                        ProcessInstanceStatus::Completed
+                            | ProcessInstanceStatus::Cancelled
+                            | ProcessInstanceStatus::Error
+                    );
                     Ok(ProcessInstanceSummary {
+                        can_cancel: access.is_initiator() && !closed,
+                        can_retry: instance_can_retry_on(conn, access, &instance_id, &status)?,
                         instance_id,
                         definition_id,
                         definition_name,
                         initiator_user_id,
                         version,
                         revision,
-                        can_cancel: owns
-                            && !matches!(
-                                status,
-                                ProcessInstanceStatus::Completed
-                                    | ProcessInstanceStatus::Cancelled
-                                    | ProcessInstanceStatus::Error
-                            ),
-                        can_retry: owns && retryable,
                         status,
                         created_at_ms,
                         updated_at_ms,
                         process_id,
+                        access: Some(access),
                     })
                 },
             )
@@ -6212,7 +6668,7 @@ pub fn list_events(
     ensure!((1..=200).contains(&limit), "history limit must be 1..=200");
     read_snapshot(pool, |conn| {
         require_actor(conn, actor)?;
-        require_instance_reader(conn, actor, instance_id)?;
+        let access = instance_access_on(conn, actor, instance_id, AccessReach::Observers)?;
         let (definition_id, version): (String, u32) = conn.query_row(
             "SELECT definition_id,version FROM bpmn_instances WHERE instance_id=?1",
             [instance_id],
@@ -6255,7 +6711,7 @@ pub fn list_events(
                 node_id,
                 node_name,
                 actor_user_id,
-                data: parse(data_json)?,
+                data: if access.sees_values() { parse(data_json)? } else { Value::Null },
             });
             let frame = tentaflow_protocol::cbor::encode(
                 &tentaflow_protocol::message_body::MessageBody::ProcessBody(
@@ -6263,6 +6719,7 @@ pub fn list_events(
                         events: events.clone(),
                         next_seq: seq,
                         has_more: true,
+                        data_redacted: true,
                     },
                 ),
             )
@@ -6750,8 +7207,8 @@ pub(crate) fn runtime_snapshot_on(
     actor: &ProcessActor,
     instance_id: &str,
 ) -> Result<RuntimeSnapshot> {
-    let is_initiator = require_instance_reader(conn, actor, instance_id)?;
-    let instance = instance_state_on(conn, actor, instance_id, None, is_initiator)?;
+    let access = instance_access_on(conn, actor, instance_id, AccessReach::Participants)?;
+    let instance = instance_state_on(conn, actor, instance_id, None, access)?;
     let model = current_version_model_on(conn, &instance.definition_id, instance.version)?;
     let user_tasks = tasks_on(conn, actor, instance_id, None, false)?;
     let snapshots_json: String = conn.query_row(
@@ -6885,7 +7342,7 @@ pub(crate) fn runtime_snapshot_on(
         .into_iter()
         .map(|id| timer_on(conn, &id))
         .collect::<Result<Vec<_>>>()?;
-    let incidents = incidents_on(conn, actor, instance_id, &model)?;
+    let incidents = incidents_on(conn, access, instance_id, &model)?;
     let subscriptions = subscriptions_on(conn, instance_id)?;
     let event_races = races_on(conn, instance_id)?;
     let scopes = scopes_on(conn, instance_id, &model)?;
@@ -23126,6 +23583,8 @@ fn initial_call_snapshot(
         selected_repetition_occurrence: None,
         process_id: selected_process_id.to_owned(),
         start_node_id: selected_start_node_id.to_owned(),
+        access: Some(ProcessInstanceAccess::Initiator),
+        variables_redacted: false,
     };
     let root = ProcessScopeSummary {
         scope_id: instance_id.to_owned(),
@@ -28656,11 +29115,21 @@ pub fn retry_job(
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
     require_actor(&tx, actor)?;
-    let instance = instance_on(&tx, actor, instance_id, None)?;
-    ensure!(instance.initiator_user_id == actor.user_id,
-        "only process initiator may retry");
+    let access = instance_access_on(&tx, actor, instance_id, AccessReach::Observers)?;
+    if !access.may_retry() {
+        return Err(ProcessOperationDenied(
+            "only the process initiator or the definition owner may retry",
+        ).into());
+    }
+    let instance = instance_state_on(&tx, actor, instance_id, None, access)?;
+    // The work runs with the initiator's rights, whoever asked for the retry.
+    let initiator = ProcessActor {
+        org_id: actor.org_id.clone(),
+        user_id: instance.initiator_user_id.clone(),
+    };
+    require_actor(&tx, &initiator)?;
     if let Some(prior) = command_replay::<StoredInstanceIdentity>(&tx, actor, stamp)? {
-        return reproject_instance_on(&tx, actor, &prior.instance_id);
+        return observed_instance_on(&tx, actor, &prior.instance_id, None);
     }
     ensure!(instance.revision == expected_revision
         && instance.status == ProcessInstanceStatus::Incident,
@@ -28668,9 +29137,9 @@ pub fn retry_job(
     sql_incrementable(expected_revision)?;
     ensure!(job_direct_retryable_on(&tx, job_id, instance_id)?,
         "Service direct retry requires one proved-no-effect invocation before dispatch");
-    require_call_control_authority_on(&tx, actor, instance_id)?;
+    require_call_control_authority_on(&tx, &initiator, instance_id)?;
     let flow_id = job_source_ref_on(&tx, job_id)?;
-    require_source_current(&tx, actor, &flow_id, None)?;
+    require_source_current(&tx, &initiator, &flow_id, None)?;
     let mut selected_stmt = tx.prepare(
         "SELECT v.invocation_id,j.token_id,j.scope_id,x.incident_id \
          FROM bpmn_jobs j \
@@ -28689,7 +29158,7 @@ pub fn retry_job(
     ensure!(selected.len() == 1,
         "Service direct retry requires one exact unresolved invocation incident");
     let (invocation_id, token_id, scope_id, incident_id) = &selected[0];
-    let snapshot = runtime_snapshot_on(&tx, actor, instance_id)?;
+    let snapshot = runtime_snapshot_on(&tx, &initiator, instance_id)?;
     // Retry must not silently advance another persisted ready activation under this command.
     ensure!(snapshot.tokens.iter().all(|token| token.status != "ready")
         && snapshot.tokens.iter().any(|token| token.token_id == *token_id
@@ -28707,7 +29176,7 @@ pub fn retry_job(
         incident_id, at_ms, entry.clone())?;
     apply_plan_on(&tx, instance_id, &actor.user_id, expected_revision, &plan,
         at_ms, None, EntryAuthority::Accepted(&entry), &[])?;
-    let result = instance_on(&tx, actor, instance_id, None)?;
+    let result = observed_instance_on(&tx, actor, instance_id, None)?;
     store_command(&tx, actor, stamp, &result, at_ms)?;
     tx.commit()?;
     Ok(result)
@@ -34331,8 +34800,16 @@ mod tests {
             org_id: actor.org_id.clone(),
             user_id: "process-unrelated".into(),
         };
-        assert!(get_instance(&db, &unrelated, &instance_id, None).is_err());
+        // The fixture makes every user an organization admin, who holds
+        // `processes.monitor`: a read-only view with no values and no task detail.
+        let monitored = get_instance(&db, &unrelated, &instance_id, None).unwrap();
+        assert_eq!(monitored.access, Some(ProcessInstanceAccess::Monitor));
         assert!(get_user_task(&db, &unrelated, &instance_id, &task_id).is_err());
+        db.write().unwrap().execute(
+            "UPDATE org_memberships SET role_id='role-org-viewer' WHERE user_id='process-unrelated'",
+            [],
+        ).unwrap();
+        assert!(get_instance(&db, &unrelated, &instance_id, None).is_err());
         let snapshot = runtime_snapshot(&db, &participant, &instance_id).unwrap();
         let outputs = json!(["approved", {"case_id": "C-1"}]);
         let completion = stamp("complete");
@@ -35368,5 +35845,60 @@ mod recovery_tests {
             .err()
             .expect("an acceptance error surfaces");
         assert!(format!("{error:#}").contains("boom"));
+    }
+}
+
+#[cfg(test)]
+mod monitor_projection_tests {
+    use super::*;
+
+    fn waits_for(token: &str) -> TokenWaits {
+        let one = |value: &str| HashMap::from([(token.to_owned(), value.to_owned())]);
+        TokenWaits {
+            user_tasks: one("task"),
+            jobs: one("job"),
+            calls: one("child-instance"),
+            child_scopes: HashMap::new(),
+            timers: HashMap::from([(token.to_owned(), ("timer".to_owned(), Some(9)))]),
+            subscriptions: one("subscription"),
+            occurrences: HashMap::new(),
+            job_incidents: HashMap::new(),
+            node_incidents: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn a_token_reports_its_primary_wait_in_a_fixed_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        let mut waits = waits_for("t");
+        let mut wait = |waits: &TokenWaits, status| waits.wait_of(&conn, "i", "t", status).unwrap();
+        assert_eq!(wait(&waits, ProcessTokenStatus::Waiting),
+            Some(ProcessTokenWait::Call { child_instance_id: "child-instance".into() }));
+        waits.calls.clear();
+        assert_eq!(wait(&waits, ProcessTokenStatus::Waiting),
+            Some(ProcessTokenWait::UserTask { user_task_id: "task".into() }));
+        waits.user_tasks.clear();
+        assert_eq!(wait(&waits, ProcessTokenStatus::Waiting),
+            Some(ProcessTokenWait::Job { job_id: "job".into() }));
+        waits.jobs.clear();
+        assert_eq!(wait(&waits, ProcessTokenStatus::Waiting),
+            Some(ProcessTokenWait::Timer { timer_id: "timer".into(), due_at_ms: Some(9) }));
+        waits.timers.clear();
+        assert_eq!(wait(&waits, ProcessTokenStatus::Waiting),
+            Some(ProcessTokenWait::Message { subscription_id: "subscription".into() }));
+        waits.subscriptions.clear();
+        assert_eq!(wait(&waits, ProcessTokenStatus::Joining), Some(ProcessTokenWait::Gateway));
+        assert_eq!(wait(&waits, ProcessTokenStatus::Waiting), None);
+        assert_eq!(wait(&waits, ProcessTokenStatus::Ready), None);
+    }
+
+    #[test]
+    fn a_token_collects_the_incidents_of_its_job_and_of_its_element() {
+        let mut waits = waits_for("t");
+        waits.job_incidents.insert("t".into(), vec!["by-job".into()]);
+        waits.node_incidents.insert(("scope".into(), "Node".into()), vec!["by-node".into()]);
+        assert_eq!(waits.incidents_of("t", "scope", "Node"), vec!["by-job".to_string(), "by-node".to_string()]);
+        assert_eq!(waits.incidents_of("t", "scope", "Other"), vec!["by-job".to_string()]);
+        assert!(waits.incidents_of("other", "scope", "Other").is_empty());
     }
 }

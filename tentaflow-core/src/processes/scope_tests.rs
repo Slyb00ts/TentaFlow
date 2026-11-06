@@ -1338,7 +1338,7 @@ fn interrupted_ancestor_retains_completed_descendant_outbox_until_delivery() {
     assert_eq!(cleared_budget, (0, 0));
     assert_eq!(receipt.matched_version, Some(pending_receiver.version));
     let recipients = repository::list_instances(&reopened, &fixture.owner,
-        Some(&pending_receiver.definition_id), 0, 10).unwrap().0;
+        &repository::InstanceFilter::of_definition(&pending_receiver.definition_id), 0, 10).unwrap().0;
     assert_eq!(recipients.len(), 1);
     assert_eq!(receipt.matched_instance_id.as_deref(),
         Some(recipients[0].instance_id.as_str()));
@@ -3362,7 +3362,7 @@ fn same_start_closes_real_boundary_catch_race_and_outbox_producers() {
         && event.node_id.as_deref() == Some("RootThrow")).count(), 1);
     assert_eq!(history.iter().filter(|event| event.kind == "message_cancelled"
         && event.data["message_id"] == queued.message_id).count(), 0);
-    assert!(repository::list_instances(&reopened, &fixture.owner, Some(&receiver.definition_id),
+    assert!(repository::list_instances(&reopened, &fixture.owner, &repository::InstanceFilter::of_definition(&receiver.definition_id),
         0, 10).unwrap().0.is_empty());
     let committed_rows = super::call_tests::transition_rows(&fixture);
     assert_eq!(repository::start_instance(&reopened, &fixture.owner, &command,
@@ -3397,7 +3397,7 @@ fn same_start_closes_real_boundary_catch_race_and_outbox_producers() {
         [&fixture.owner.org_id], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
     assert_eq!(cleared_budget, (0, 0));
     assert_eq!(repository::list_instances(&reopened, &fixture.owner,
-        Some(&receiver.definition_id), 0, 10).unwrap().0.len(), 1);
+        &repository::InstanceFilter::of_definition(&receiver.definition_id), 0, 10).unwrap().0.len(), 1);
     let final_history = repository::list_events(&reopened, &fixture.owner,
         &instance_id, 0, 200).unwrap().0;
     assert_eq!(final_history.iter().filter(|event| event.kind == "message_delivered"

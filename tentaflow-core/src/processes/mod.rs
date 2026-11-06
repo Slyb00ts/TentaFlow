@@ -70,6 +70,8 @@ mod send_boundary_proof_tests;
 mod repetition_boundary_tests;
 
 #[cfg(test)]
+mod monitor_tests;
+#[cfg(test)]
 mod simulation_tests;
 #[cfg(test)]
 mod simulation_service_tests;
