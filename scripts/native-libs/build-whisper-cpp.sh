@@ -245,7 +245,7 @@ build_backend() {
   )
 
   if [ "$backend" = "multi" ]; then
-    enabled_backends=("${MULTI_BACKENDS[@]}")
+    enabled_backends=(${MULTI_BACKENDS[@]+"${MULTI_BACKENDS[@]}"})
   else
     enabled_backends=("$backend")
   fi
@@ -274,7 +274,7 @@ build_backend() {
       ;;
   esac
 
-  if backend_enabled cuda "${enabled_backends[@]}"; then
+  if backend_enabled cuda ${enabled_backends[@]+"${enabled_backends[@]}"}; then
     cmake_args+=(-DGGML_CUDA=ON)
     # Architektura CUDA jawnie (jak w build-llama-cpp.sh) — "native" nie wykrywa
     # nowych GPU jak Blackwell GB10/sm_121 -> build na zlej domyslnej arch.
@@ -285,19 +285,19 @@ build_backend() {
       [[ "$cuda_cc" =~ ^[0-9]+$ ]] && cmake_args+=(-DCMAKE_CUDA_ARCHITECTURES="$cuda_cc")
     fi
   fi
-  backend_enabled metal "${enabled_backends[@]}" && cmake_args+=(-DGGML_METAL=ON)
-  backend_enabled vulkan "${enabled_backends[@]}" && cmake_args+=(-DGGML_VULKAN=ON)
+  backend_enabled metal ${enabled_backends[@]+"${enabled_backends[@]}"} && cmake_args+=(-DGGML_METAL=ON)
+  backend_enabled vulkan ${enabled_backends[@]+"${enabled_backends[@]}"} && cmake_args+=(-DGGML_VULKAN=ON)
 
-  if backend_enabled cuda "${enabled_backends[@]}"; then
+  if backend_enabled cuda ${enabled_backends[@]+"${enabled_backends[@]}"}; then
     jobs="${WHISPER_CPP_CUDA_JOBS:-4}"
   else
     jobs="$(platform_cpu_count)"
   fi
 
   local targets=(whisper ggml ggml-base ggml-cpu)
-  backend_enabled cuda "${enabled_backends[@]}" && targets+=(ggml-cuda)
-  backend_enabled metal "${enabled_backends[@]}" && targets+=(ggml-metal)
-  backend_enabled vulkan "${enabled_backends[@]}" && targets+=(ggml-vulkan)
+  backend_enabled cuda ${enabled_backends[@]+"${enabled_backends[@]}"} && targets+=(ggml-cuda)
+  backend_enabled metal ${enabled_backends[@]+"${enabled_backends[@]}"} && targets+=(ggml-metal)
+  backend_enabled vulkan ${enabled_backends[@]+"${enabled_backends[@]}"} && targets+=(ggml-vulkan)
 
   echo "[whisper.cpp] build backend: $backend (${enabled_backends[*]:-cpu})"
   env \
