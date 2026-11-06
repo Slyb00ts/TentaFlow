@@ -49,6 +49,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         NSLog("[TentaFlow] didFinishLaunching — start")
+        observeLifecycle()
 
         // KROK 1: Rozpocznij warmup WKWebView natychmiast. Spawn procesow
         // GPU/WebContent/Networking (4.5s kazdy) odbywa sie rownolegle z
@@ -166,13 +167,23 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         }
     }
 
-    func applicationDidEnterBackground(_ application: UIApplication) {
+    // Notyfikacje zamiast metod delegata: aplikacja SwiftUI jest oparta o sceny,
+    // a wtedy iOS nie wola applicationDidEnterBackground/WillEnterForeground.
+    private func observeLifecycle() {
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(handleDidEnterBackground),
+                           name: UIApplication.didEnterBackgroundNotification, object: nil)
+        center.addObserver(self, selector: #selector(handleWillEnterForeground),
+                           name: UIApplication.willEnterForegroundNotification, object: nil)
+    }
+
+    @objc private func handleDidEnterBackground() {
         lastBackgroundTime = Date()
         NSLog("[TentaFlow] didEnterBackground — Rust idzie w pause")
         tentaflow_on_pause()
     }
 
-    func applicationWillEnterForeground(_ application: UIApplication) {
+    @objc private func handleWillEnterForeground() {
         let elapsed: TimeInterval
         if let t = lastBackgroundTime {
             elapsed = Date().timeIntervalSince(t)

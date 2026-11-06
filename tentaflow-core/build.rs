@@ -2847,6 +2847,10 @@ struct BrowserWasmBinding {
     /// `<out_name>_bg.wasm`.
     out_js_dir: &'static str,
     out_name: &'static str,
+    /// Also emit the wasm2js twin. Off for the voxel renderer: it needs WebGL
+    /// or WebGPU, which the environments without WebAssembly lack as well, and
+    /// its twin would add ~29 MB to the binary for nothing.
+    js_twin: bool,
 }
 
 /// Every browser binding the dashboard ships, in the order main() builds them.
@@ -2861,6 +2865,7 @@ const BROWSER_WASM_BINDINGS: &[BrowserWasmBinding] = &[
         artifact: "tentaflow_protocol_wasm",
         out_js_dir: "www/js/protocol",
         out_name: "wasm_glue",
+        js_twin: true,
     },
     // WebGPU/WebGL voxel point-cloud renderer of the robot LiDAR tab.
     BrowserWasmBinding {
@@ -2870,6 +2875,7 @@ const BROWSER_WASM_BINDINGS: &[BrowserWasmBinding] = &[
         artifact: "tentaflow_voxel_wasm",
         out_js_dir: "www/js/voxel",
         out_name: "voxel_glue",
+        js_twin: false,
     },
     // TentaQuant tier T0: the OQ3 parser, the IR and the state-vector simulator
     // in the browser.
@@ -2880,6 +2886,7 @@ const BROWSER_WASM_BINDINGS: &[BrowserWasmBinding] = &[
         artifact: "tentaflow_quantum",
         out_js_dir: "www/js/quantum",
         out_name: "quantum_glue",
+        js_twin: true,
     },
 ];
 
@@ -3041,6 +3048,9 @@ fn build_browser_wasm_bindings(binding: &BrowserWasmBinding) {
                 bindgen_version,
                 out_js_dir.display()
             );
+            if binding.js_twin {
+                emit_js_twin(binding, label, &generated_dir, out_js_dir);
+            }
         }
         Ok(s) => {
             panic!(
@@ -3055,6 +3065,111 @@ fn build_browser_wasm_bindings(binding: &BrowserWasmBinding) {
             panic!("could not run wasm-bindgen ({label}): {e}");
         }
     }
+}
+
+/// Writes `<out_name>_asm.js`: the same module compiled to plain JavaScript by
+/// wasm2js, loaded by `js/wasm-fallback.js` only where WebAssembly is missing
+/// (iOS Lockdown Mode disables it in every WKWebView). Optional by design — no
+/// wasm2js in PATH removes a stale twin and warns, the dashboard then simply has
+/// no fallback.
+fn emit_js_twin(binding: &BrowserWasmBinding, label: &str, generated_dir: &Path, out_js_dir: &Path) {
+    let twin = out_js_dir.join(format!("{}_asm.js", binding.out_name));
+    let wasm = generated_dir.join(format!("{}_bg.wasm", binding.out_name));
+    let raw = generated_dir.join(format!("{}_asm.raw.js", binding.out_name));
+
+    let status = Command::new("wasm2js")
+        .arg(&wasm)
+        .arg("-o")
+        .arg(&raw)
+        .args([
+            "--enable-bulk-memory",
+            "--enable-sign-ext",
+            "--enable-nontrapping-float-to-int",
+            "--enable-mutable-globals",
+            "--enable-multivalue",
+            "--enable-reference-types",
+        ])
+        .status();
+    let produced = match status {
+        Ok(s) if s.success() => std::fs::read_to_string(&raw).ok(),
+        _ => None,
+    };
+    let i64_results = i64_result_exports(&wasm);
+    let Some(module) = produced.as_deref().and_then(|js| asm_module_to_factory(js, &i64_results)) else {
+        let _ = std::fs::remove_file(&twin);
+        println!(
+            "cargo:warning={label}: no wasm2js (install binaryen) or it failed, \
+             skipping the JS fallback for browsers without WebAssembly"
+        );
+        return;
+    };
+    write_if_changed(&twin, module);
+}
+
+/// wasm2js emits an ES module that instantiates itself against hard-wired
+/// imports; the fallback loader needs the bare `asmFunc(imports)` factory so it
+/// can hand it the glue's own import object.
+fn asm_module_to_factory(js: &str, i64_results: &[String]) -> Option<String> {
+    let cut = js.find("\nvar retasmFunc = asmFunc({")?;
+    let mut body = String::new();
+    for line in js[..cut].lines().filter(|l| !l.starts_with("import ")) {
+        body.push_str(line);
+        body.push('\n');
+    }
+    // Native memory.grow detaches the old ArrayBuffer, and the glue relies on
+    // that (`byteLength === 0`) to drop its cached views. wasm2js just allocates
+    // a new buffer, so the glue would keep writing into the stale one.
+    const GROW: &str = "buffer = newBuffer;";
+    if body.matches(GROW).count() != 1 {
+        return None;
+    }
+    let mut out = body.replacen(
+        GROW,
+        "var oldBuffer = buffer;\n   buffer = newBuffer;\n   try { structuredClone(oldBuffer, { transfer: [oldBuffer] }); } catch (e) {}",
+        1,
+    );
+    out.push_str("export { asmFunc };\n");
+    out.push_str(&format!(
+        "export const i64Results = {};\n",
+        serde_json::to_string(i64_results).ok()?
+    ));
+    Some(out)
+}
+
+/// wasm2js lowers every i64 to an i32 pair: a parameter becomes (low, high) and
+/// a result comes back as the low word with the high word handed to
+/// `env.setTempRet0`. The glue speaks BigInt, so the loader needs to know which
+/// exports return an i64 — read from the disassembly, where the signature is on
+/// the `(func` line.
+fn i64_result_exports(wasm: &Path) -> Vec<String> {
+    let Ok(output) = Command::new("wasm-dis").arg(wasm).output() else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut returns_i64 = std::collections::HashSet::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        if let Some(rest) = line.strip_prefix("(func $") {
+            if line.contains("(result i64)") {
+                if let Some(name) = rest.split_whitespace().next() {
+                    returns_i64.insert(name.to_string());
+                }
+            }
+        }
+    }
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        if let Some(rest) = line.strip_prefix("(export \"") {
+            if let Some((name, func)) = rest.split_once("\" (func $") {
+                if returns_i64.contains(func.trim_end_matches(')').trim()) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    names.sort();
+    names
 }
 
 /// Sprawdza czy wasm32-unknown-unknown jest zainstalowany (browser target).

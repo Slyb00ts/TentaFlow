@@ -987,6 +987,34 @@ install_wasm_bindgen_cli() {
     log_ok "wasm-bindgen CLI gotowy"
 }
 
+# --- binaryen (wasm2js) ---
+
+# wasm2js turns each browser .wasm into a plain-JS twin that the dashboard loads
+# when WebAssembly is unavailable (iOS Lockdown Mode switches it off in every
+# WKWebView). The twin is optional, so a failed install only warns.
+install_binaryen() {
+    log_section "binaryen (wasm2js)"
+
+    if command -v wasm2js &>/dev/null; then
+        log_ok "wasm2js juz zainstalowany"
+        return
+    fi
+
+    case "$DISTRO" in
+        macos)  brew install binaryen ;;
+        arch)   run_privileged pacman -S --needed --noconfirm binaryen ;;
+        debian) run_privileged apt-get install -y binaryen ;;
+        fedora) run_privileged dnf install -y binaryen ;;
+    esac || true
+
+    if command -v wasm2js &>/dev/null; then
+        INSTALLED+=("binaryen")
+        log_ok "wasm2js gotowy"
+    else
+        log_warn "wasm2js niedostepny — dashboard nie dostanie wersji JS na urzadzenia bez WebAssembly (Lockdown Mode)"
+    fi
+}
+
 # --- Android SDK + NDK ---
 
 # Where the SDK lives: one the developer already points at wins, otherwise the
@@ -1941,6 +1969,13 @@ verify_installation() {
         ok=false
     fi
 
+    # wasm2js (opcjonalny: JS zamiast wasm, gdy przegladarka nie ma WebAssembly)
+    if command -v wasm2js &>/dev/null; then
+        log_ok "wasm2js: zainstalowany"
+    else
+        log_warn "wasm2js: BRAK (Lockdown Mode na iOS nie dostanie dashboardu)"
+    fi
+
     # iOS targets (tylko macOS)
     if [[ "$DISTRO" == "macos" ]]; then
         for t in aarch64-apple-ios aarch64-apple-ios-sim; do
@@ -2223,6 +2258,7 @@ main() {
     install_rust
     install_wasm_target
     install_wasm_bindgen_cli
+    install_binaryen
     install_dotnet_sdk
     install_wasi_sdk
     install_metal_toolchain

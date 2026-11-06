@@ -54,6 +54,35 @@ pub async fn start_services(config: NodeConfig) -> Result<ServiceHandles> {
     })?;
     info!("Baza danych zainicjalizowana");
 
+    // The dedicated stores the desktop binary opens right after the core
+    // database. The HTTPS server and dispatch handlers reach them through
+    // process-wide handles, so a missing init surfaces as "not initialised"
+    // and aborts the whole service start.
+    tentaflow_core::paths::ensure_app_dirs().map_err(|e| {
+        error!("ensure_app_dirs nieudany: {}", e);
+        anyhow::anyhow!("ensure_app_dirs: {}", e)
+    })?;
+    tentaflow_core::ml_studio::init(tentaflow_core::paths::tentaflow_home()).map_err(|e| {
+        error!("Blad inicjalizacji bazy ML Studio: {}", e);
+        e
+    })?;
+    tentaflow_core::project_studio::init(&db).map_err(|e| {
+        error!("Blad inicjalizacji bazy Project Studio: {}", e);
+        e
+    })?;
+    tentaflow_core::services::ingest_jobs::init(
+        &tentaflow_core::paths::data_dir().join("jobs.db"),
+    )
+    .map_err(|e| {
+        error!("Ingest queue initialisation failed: {}", e);
+        e
+    })?;
+    tentaflow_core::project_studio::ingest::reconcile_orphans();
+    tentaflow_core::events::init(&db).map_err(|e| {
+        error!("Event log initialisation failed: {}", e);
+        e
+    })?;
+
     // Czyszczenie osieroconego settings.node_id (legacy UUID) — zastapiony
     // iroh EndpointId z MeshSecurity.public_key_hex().
     let _ = db::repository::delete_setting(&db, "node_id");
