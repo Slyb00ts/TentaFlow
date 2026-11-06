@@ -13,6 +13,8 @@ import '/js/components/tf-disclosure.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-textarea.js';
 import '/js/components/tf-toggle.js';
+import '/js/components/tf-segmented.js';
+import { mountProcessDiagram } from './process-diagram.js';
 
 const text = (key, values) => I18n.t(`bpmn.${key}`, values);
 const date = (ms, timeZone) => new Date(ms).toLocaleString(I18n.getLanguage(), timeZone ? { timeZone } : undefined);
@@ -392,6 +394,12 @@ export function processIncidentText(incident) {
   return codes.includes(incident.code) ? text(`incident_${incident.code.toLowerCase()}`) : (incident.message || text('incident_generic'));
 }
 
+// A reader without access to values gets the code as the message; a sentence is built from the code alone.
+function incidentSentence(incident, redacted) {
+  if (!redacted) return processIncidentText(incident);
+  return incident.code === 'TIMER_ERROR' ? text('incident_generic') : processIncidentText({ ...incident, message: '' });
+}
+
 export async function openProcessInstances(definitionId = null) {
   const win = readWindow(text('instances'), 'clock');
   let offset = 0;
@@ -433,7 +441,11 @@ export async function openProcessInstances(definitionId = null) {
 export async function openProcessInstance(instanceId, initial = null) {
   const win = readWindow(text('instance'), 'play', 940);
   const host = win.querySelector('[data-content]');
-  host.innerHTML = `<div data-summary></div><section data-work></section><section data-incidents></section><section data-timer-section><h3>${escapeHtml(text('timers'))}</h3><div data-timers></div></section>
+  host.innerHTML = `<div data-summary></div>
+    <div class="fb-process-view" role="group" aria-label="${escapeAttr(text('diagram_view_label'))}"><tf-segmented data-view size="sm" value="list">
+      <option value="list">${escapeHtml(text('diagram_view_details'))}</option><option value="diagram">${escapeHtml(text('diagram_view_diagram'))}</option></tf-segmented></div>
+    <section class="fb-process-diagram" data-diagram hidden></section>
+    <div class="fb-process-lists" data-lists><section data-work></section><section data-incidents></section><section data-timer-section><h3>${escapeHtml(text('timers'))}</h3><div data-timers></div></section>
     <section data-calls><h3>${escapeHtml(text('calls'))}</h3><div data-call-rows></div></section>
     <section data-scopes><h3>${escapeHtml(text('scopes'))}</h3><div data-scope-rows></div><div data-scope-detail></div></section>
     <section data-repetition-groups><h3>${escapeHtml(text('repeat_groups'))}</h3><div data-repetition-group-rows></div></section>
@@ -442,7 +454,7 @@ export async function openProcessInstance(instanceId, initial = null) {
     <section data-event-races><h3>${escapeHtml(text('event_races'))}</h3><div data-race-rows></div></section>
     <section data-outgoing><h3>${escapeHtml(text('outgoing_messages'))}</h3><div data-outgoing-rows></div></section>
     <div data-variables></div><section class="fb-process-history"><h3>${escapeHtml(text('history'))}</h3><ol data-events></ol>
-      <tf-button variant="secondary" data-more>${escapeHtml(text('more_history'))}</tf-button></section>`;
+      <tf-button variant="secondary" data-more>${escapeHtml(text('more_history'))}</tf-button></section></div>`;
   let instance = initial;
   let renderedSnapshot = null;
   const attached = { key: '', names: null };
@@ -466,6 +478,7 @@ export async function openProcessInstance(instanceId, initial = null) {
   let selectedRepetitionOccurrenceId = null;
   let selectedRepetitionValue = null;
   let scopeReadGeneration = 0;
+  let diagram = null;
   const requestPages = () => ({ ...pageSpecs, selectedUserTaskId, selectedIncidentId,
     selectedRepetitionGroupId, selectedRepetitionOccurrenceId, selectedRepetitionValue });
   const requestInstance = () => ApiBinary.one('processInstanceGetRequest', { instanceId, pages: requestPages() });
@@ -497,28 +510,31 @@ export async function openProcessInstance(instanceId, initial = null) {
         const item = document.createElement('li');
         item.dataset.processSeq = String(event.seq);
         const description = document.createElement('div');
-        description.textContent = processEventText(event);
+        description.textContent = response.dataRedacted ? text('event_redacted', { node: event.nodeName || text('element_unavailable') }) : processEventText(event);
         const at = document.createElement('time');
         at.dateTime = new Date(event.atMs).toISOString();
         at.textContent = date(event.atMs);
         item.append(description, at);
-        if (event.kind === 'service_result') {
-          const sentence = processVerificationSentence(event.data);
-          if (sentence) {
-            const explanation = document.createElement('p');
-            explanation.className = 'fb-field-hint';
-            explanation.dataset.verificationOrigin = '';
-            explanation.textContent = sentence;
-            item.append(explanation);
+        // A reader without access to values gets the line and its time, no data to unfold.
+        if (!response.dataRedacted) {
+          if (event.kind === 'service_result') {
+            const sentence = processVerificationSentence(event.data);
+            if (sentence) {
+              const explanation = document.createElement('p');
+              explanation.className = 'fb-field-hint';
+              explanation.dataset.verificationOrigin = '';
+              explanation.textContent = sentence;
+              item.append(explanation);
+            }
+            item.append(jsonSection(text(sentence ? 'actual_outputs_verification' : 'actual_outputs'), event.data, false));
           }
-          item.append(jsonSection(text(sentence ? 'actual_outputs_verification' : 'actual_outputs'), event.data, false));
+          if (event.kind === 'script_completed') item.append(jsonSection(text('script_result'), event.data.outputs, false));
+          if (event.kind.startsWith('repetition_')) {
+            item.append(repetitionFacts(event, instance?.repetitionGroups.find((group) => group.groupId === event.data.group_id)?.total ?? null));
+          }
+          if (event.kind === 'terminate_end_reached') item.append(jsonSection(text('terminate_facts'), event.data, false));
+          if (event.kind === 'message_delivered' && Object.hasOwn(event.data, 'payload')) item.append(jsonSection(text('message_payload'), event.data.payload, false));
         }
-        if (event.kind === 'script_completed') item.append(jsonSection(text('script_result'), event.data.outputs, false));
-        if (event.kind.startsWith('repetition_')) {
-          item.append(repetitionFacts(event, instance?.repetitionGroups.find((group) => group.groupId === event.data.group_id)?.total ?? null));
-        }
-        if (event.kind === 'terminate_end_reached') item.append(jsonSection(text('terminate_facts'), event.data, false));
-        if (event.kind === 'message_delivered' && Object.hasOwn(event.data, 'payload')) item.append(jsonSection(text('message_payload'), event.data.payload, false));
         events.appendChild(item);
       }
       afterSeq = response.nextSeq;
@@ -749,7 +765,7 @@ export async function openProcessInstance(instanceId, initial = null) {
     for (const incident of instance.incidents) {
       const row = document.createElement('div');
       row.className = 'fb-process-work';
-      row.innerHTML = `<div><strong>${escapeHtml(incidentTitles.get(incident.incidentId))}</strong><p>${escapeHtml(processIncidentText(incident))}</p><p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)}</p>${repeatedNote(incident)}${scopeLine(incident.scopeId)}</div>
+      row.innerHTML = `<div><strong>${escapeHtml(incidentTitles.get(incident.incidentId))}</strong><p>${escapeHtml(incidentSentence(incident, instance.variablesRedacted))}</p><p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)}</p>${repeatedNote(incident)}${scopeLine(incident.scopeId)}</div>
         <tf-button variant="secondary" data-inspect-incident>${escapeHtml(text('inspect_incident'))}</tf-button>
         ${incident.canRetry && incident.jobId ? `<tf-button variant="secondary" icon="refresh" data-retry>${escapeHtml(text('retry'))}</tf-button>` : ''}`;
       row.querySelector('[data-inspect-incident]').addEventListener('click', () => { selectedIncidentId = incident.incidentId; refresh(); });
@@ -766,14 +782,14 @@ export async function openProcessInstance(instanceId, initial = null) {
       detail.className = 'fb-process-work';
       detail.dataset.selectedIncident = incident.incidentId;
       detail.innerHTML = `<div><strong>${escapeHtml(incidentTitles.get(incident.incidentId) ?? (incident.nodeName || text('element_unavailable')))}</strong>
-        <p>${escapeHtml(incident.code)} · ${escapeHtml(incident.message)}</p>
+        <p>${escapeHtml(instance.variablesRedacted ? incident.code : `${incident.code} · ${incident.message}`)}</p>
         ${resolvedAtMs == null ? '' : `<p>${escapeHtml(text('incident_resolved_at', { time: date(resolvedAtMs) }))}</p>`}</div>
         <tf-button variant="ghost" data-close-incident>${escapeHtml(text('close_detail'))}</tf-button>`;
       detail.querySelector('[data-close-incident]').addEventListener('click', () => { selectedIncidentId = null; refresh(); });
       incidents.append(detail);
     }
     renderPageControls(incidents, 'incidents');
-    host.querySelector('[data-variables]').replaceChildren(jsonSection(text('current_variables'), instance.variables, false));
+    host.querySelector('[data-variables]').replaceChildren(jsonSection(text(instance.variablesRedacted ? 'variable_types' : 'current_variables'), instance.variables, false));
     host.querySelector('[data-timer-section]').hidden = !instance.timers?.length && !instance.pages.timers.total;
     renderTimers(host.querySelector('[data-timers]'), instance.timers || [], attached.names);
     if ((instance.timers || []).some((timer) => timer.kind === 'Boundary')) readAttachedNames();
@@ -788,7 +804,7 @@ export async function openProcessInstance(instanceId, initial = null) {
         ? subscription.escalationCode || text('escalation_any_code')
         : subscription.signalName || subscription.messageName || subscription.errorCode || text('element_unavailable');
       row.innerHTML = `<div><strong>${escapeHtml(subscription.nodeName || text('element_unavailable'))}</strong><p>${escapeHtml(subject)} · ${escapeHtml(text(`subscription_status_${subscription.status.toLowerCase()}`))}</p>
-        ${subscription.kind === 'BoundaryEscalation' || subscription.kind === 'SignalCatch' ? '' : `<p>${escapeHtml(text('message_correlation_key'))}: ${escapeHtml(subscription.correlationKey || '')}</p>`}</div>`;
+        ${subscription.kind === 'BoundaryEscalation' || subscription.kind === 'SignalCatch' ? '' : `<p>${escapeHtml(text('message_correlation_key'))}: ${escapeHtml(subscription.correlationKey ?? (instance.variablesRedacted ? text('redacted_value') : ''))}</p>`}</div>`;
       subscriptions.append(row);
     }
     renderPageControls(host.querySelector('[data-subscriptions]'), 'subscriptions');
@@ -809,7 +825,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       const row = document.createElement('div');
       row.className = 'fb-process-work';
       row.dataset.messageId = message.messageId;
-      row.innerHTML = `<div><strong>${escapeHtml(message.messageName)}</strong><p>${escapeHtml(text(`message_status_${message.status.toLowerCase()}`))} · ${escapeHtml(message.correlationKey)}</p></div>
+      row.innerHTML = `<div><strong>${escapeHtml(message.messageName)}</strong><p>${escapeHtml(text(`message_status_${message.status.toLowerCase()}`))} · ${escapeHtml(message.correlationKey ?? text('redacted_value'))}</p></div>
         <tf-button variant="secondary" data-message-detail>${escapeHtml(text('message_detail'))}</tf-button>`;
       row.querySelector('[data-message-detail]').addEventListener('click', () => openProcessMessageDetail(message, refresh));
       outgoing.append(row);
@@ -834,7 +850,7 @@ export async function openProcessInstance(instanceId, initial = null) {
           const result = await ApiBinary.one('processScopeGetRequest', { instanceId, scopeId: selectedScopeId });
           if (!win.isConnected || generation !== scopeReadGeneration || selectedScopeId !== result.scope.scopeId) return;
           const detail = host.querySelector('[data-scope-detail]');
-          detail.replaceChildren(jsonSection(text('scope_variables'), result.variables, false));
+          detail.replaceChildren(jsonSection(text(result.variablesRedacted ? 'variable_types' : 'scope_variables'), result.variables, false));
           const nodes = document.createElement('p');
           nodes.textContent = `${text('scope_active_nodes')}: ${result.activeNodeIds.join(', ') || text('none')}`;
           detail.append(nodes);
@@ -900,7 +916,7 @@ export async function openProcessInstance(instanceId, initial = null) {
       const incident = instance.incidents.find((candidate) => candidate.jobId && candidate.jobId === occurrence.jobId);
       row.innerHTML = `<div><strong>${escapeHtml(occurrenceLabel(occurrence))}</strong>
         <p>${escapeHtml(occurrenceStatusText(occurrence))}</p>
-        ${incident ? `<p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)} \u00b7 ${escapeHtml(processIncidentText(incident))}</p>` : ''}</div>
+        ${incident ? `<p>${escapeHtml(text('incident_code'))}: ${escapeHtml(incident.code)} \u00b7 ${escapeHtml(incidentSentence(incident, instance.variablesRedacted))}</p>` : ''}</div>
         <tf-button variant="secondary" data-repeat-item>${escapeHtml(text('repeat_item'))}</tf-button>
         <tf-button variant="secondary" data-repeat-aggregate>${escapeHtml(text('repeat_aggregate'))}</tf-button>`;
       for (const [selector, kind] of [['[data-repeat-item]', 'item'], ['[data-repeat-aggregate]', 'aggregate']]) {
@@ -941,6 +957,7 @@ export async function openProcessInstance(instanceId, initial = null) {
         detail.append(technical);
       }
     }
+    diagram?.changed();
   }
 
   async function refresh() {
@@ -962,14 +979,36 @@ export async function openProcessInstance(instanceId, initial = null) {
     }
     finally { refreshing = false; }
   }
+  const viewStore = 'tentaflow.process.instance.view';
+  function showView(view, { remember = true } = {}) {
+    const picker = host.querySelector('[data-view]');
+    if (picker.value !== view) picker.value = view;
+    host.querySelector('[data-lists]').hidden = view === 'diagram';
+    if (view === 'diagram') diagram.show();
+    else diagram.hide();
+    if (!remember) return;
+    try { localStorage.setItem(viewStore, view); } catch (_) { /* storage can be blocked; the choice then lasts one window */ }
+  }
   if (instance) render();
   else await refresh();
   await loadHistory();
   if (!win.isConnected) return win;
+  diagram = mountProcessDiagram(host.querySelector('[data-diagram]'), { instanceId, context: {
+    instance: () => instance,
+    openInstance: (id) => openProcessInstance(id),
+    inspectIncident: (incidentId) => { showView('list', { remember: false }); selectedIncidentId = incidentId; refresh(); },
+    completeTask: (task) => complete(task),
+    incidentText: (incident) => incidentSentence(incident, instance.variablesRedacted),
+  } });
+  host.querySelector('[data-view]').addEventListener('change', (event) => showView(event.detail.value));
+  let savedView = 'list';
+  try { savedView = localStorage.getItem(viewStore) === 'diagram' ? 'diagram' : 'list'; } catch (_) { /* default view */ }
+  if (savedView === 'diagram') showView('diagram', { remember: false });
   host.querySelector('[data-more]').addEventListener('click', loadHistory);
   const timer = setInterval(refresh, 3000);
   win.addEventListener('closed', () => {
     clearInterval(timer);
+    diagram?.dispose();
     readGeneration += 1;
     for (const workWindow of workWindows) workWindow.close();
   }, { once: true });

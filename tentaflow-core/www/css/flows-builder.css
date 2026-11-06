@@ -1739,3 +1739,46 @@ body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transf
 .fb-simulation-awaited { list-style: none; padding-inline-start: 0; margin-block: 6px; }
 .fb-simulation-awaited > li { border-left: 2px solid var(--tf-border); padding: 4px 0 8px 12px; overflow-wrap: anywhere; }
 .fb-simulation-awaited ul { list-style: none; padding-inline-start: 12px; }
+
+/* Run diagram in the instance window: the read-only canvas with the live token overlay. */
+.fb-process-diagram[hidden], .fb-process-lists[hidden] { display: none; }
+.fb-process-diagram { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.fb-process-view { display: flex; min-width: 0; }
+.fb-diagram-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.fb-diagram-trail { flex: 1 1 200px; min-width: 0; }
+.fb-diagram-zoom { display: inline-flex; gap: 4px; margin-inline-start: auto; }
+.fb-diagram-body { display: flex; flex-wrap: wrap; gap: 12px; min-width: 0; }
+.fb-diagram-stage { flex: 3 1 420px; min-width: 0; height: clamp(320px, 52vh, 560px); border: 1px solid var(--tf-border); border-radius: var(--tf-radius); }
+.fb-diagram-panel { flex: 1 1 240px; min-width: 0; display: flex; flex-direction: column; gap: 8px; overflow-wrap: anywhere; }
+.fb-diagram-panel h4 { margin: 0; }
+.fb-diagram-panel p { margin: 0; color: var(--tf-text-2); line-height: 1.5; }
+.fb-diagram-panel .fb-diagram-incident { color: var(--tf-danger, #ef4444); }
+.fb-diagram-token { border: 1px solid var(--tf-border); border-radius: var(--tf-radius); padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.fb-diagram-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.fb-diagram-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 0; padding: 0; list-style: none; color: var(--tf-text-2); font-size: 13px; }
+.fb-diagram-legend li { display: inline-flex; align-items: center; gap: 6px; }
+.fb-diagram-swatch { display: inline-block; width: 18px; height: 12px; border-radius: 4px; box-sizing: border-box; border: 2px solid var(--tf-border); }
+.fb-diagram-swatch[data-swatch="active"] { box-shadow: 0 0 0 2px var(--tf-accent-1, #6366f1); }
+.fb-diagram-swatch[data-swatch="waiting"] { box-shadow: 0 0 0 2px var(--tf-bg-card), 0 0 0 4px var(--tf-warning, #d97706); }
+.fb-diagram-swatch[data-swatch="incident"] { border-color: var(--tf-danger, #ef4444); box-shadow: 0 0 0 2px var(--tf-danger, #ef4444); }
+.fb-diagram-swatch[data-swatch="visited"] { border-color: var(--tf-success, #16a34a); }
+.fb-diagram-swatch[data-swatch="taken"] { height: 0; border-width: 0 0 3px; border-radius: 0; border-color: var(--tf-accent-1, #6366f1); }
+
+.fb-canvas.fb-runtime .fb-port, .fb-canvas.fb-runtime .fb-edge-flow { display: none; }
+.fb-canvas.fb-runtime .fb-node:not(.fb-node--token-active):not(.fb-node--token-waiting):not(.fb-node--token-incident):not(.fb-node--visited) { opacity: 0.6; }
+.fb-canvas.fb-runtime .fb-edge-path:not(.fb-edge--taken) { opacity: 0.45; }
+.fb-canvas.fb-runtime .fb-edge-path.fb-edge--taken { stroke-width: 3.5; }
+.fb-canvas.fb-runtime .fb-node--visited { border-color: var(--tf-success, #16a34a); }
+.fb-canvas.fb-runtime .fb-node--token-active { box-shadow: 0 0 0 3px var(--tf-accent-1, #6366f1); }
+.fb-canvas.fb-runtime .fb-node--token-waiting { box-shadow: 0 0 0 3px var(--tf-bg-card), 0 0 0 6px var(--tf-warning, #d97706); }
+.fb-canvas.fb-runtime .fb-node--token-incident { border-color: var(--tf-danger, #ef4444); box-shadow: 0 0 0 3px var(--tf-danger, #ef4444); }
+.fb-runtime-badge { --fb-badge-tone: var(--tf-accent-1, #6366f1); position: absolute; top: -12px; right: -12px; z-index: 3; display: inline-flex; align-items: center; gap: 3px; min-width: 24px; height: 24px; padding: 0 6px; box-sizing: border-box; justify-content: center; border: 2px solid var(--fb-badge-tone); border-radius: 12px; background: var(--tf-bg-card); color: var(--fb-badge-tone); font-size: 12px; line-height: 1; pointer-events: auto; }
+.fb-runtime-badge[data-tone="waiting"] { --fb-badge-tone: var(--tf-warning, #d97706); }
+.fb-runtime-badge[data-tone="incident"] { --fb-badge-tone: var(--tf-danger, #ef4444); }
+.fb-runtime-badge svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; }
+@keyframes fb-token-pulse { 50% { box-shadow: 0 0 0 6px var(--tf-accent-1, #6366f1); } }
+@keyframes fb-incident-pulse { 50% { box-shadow: 0 0 0 6px var(--tf-danger, #ef4444); } }
+@media (prefers-reduced-motion: no-preference) {
+  .fb-canvas.fb-runtime .fb-node--token-active { animation: fb-token-pulse 2s ease-in-out infinite; }
+  .fb-canvas.fb-runtime .fb-node--token-incident { animation: fb-incident-pulse 2s ease-in-out infinite; }
+}

@@ -220,6 +220,7 @@ export class FlowCanvas {
     this.selectedIds = new Set();
     this.attentionIds = new Set();
     this.attentionContainerIds = new Set();
+    this.runtimeOverlay = null;
     this.selectedEdgeId = null;
     this.view = { x: 0, y: 0, zoom: 1 };
     this._pendingFitMinZoom = null;
@@ -1808,6 +1809,7 @@ export class FlowCanvas {
       if (this.mode === 'bpmn' && processBoundaryKind(n.type)) this._bringToFront(element);
     }
     this._applySelectionClasses();
+    this._applyRuntimeNodes();
   }
 
   _renderSingleNode(n) {
@@ -1818,6 +1820,7 @@ export class FlowCanvas {
     if (this.mode === 'bpmn' && processBoundaryKind(n.type)) this._bringToFront(fresh);
     this._layoutProcessLabels();
     this._applySelectionClasses();
+    this._applyRuntimeNodes();
     this._renderRegions();
     this._renderEdges();
   }
@@ -2282,6 +2285,7 @@ export class FlowCanvas {
       this.svg.appendChild(p);
     }
     if (!this._connecting) this._syncEscalationBadges();
+    this._applyRuntimeEdges();
   }
 
   // Whether an escalation handler's path would be refused depends on the flows
@@ -2315,6 +2319,58 @@ export class FlowCanvas {
     this.attentionIds = new Set(ids);
     this.attentionContainerIds = new Set(containerIds);
     if (this.mode === 'bpmn') for (const node of changed) this._renderSingleNode(node);
+  }
+
+  /**
+   * Draws the tokens of a run over the diagram: `nodes` maps an element id to
+   * { count, tone, icon, label }, `takenEdgeIds` and `visitedNodeIds` mark the
+   * path. Only classes and a badge are touched, never the element itself, so a
+   * focused element keeps its focus across the 3 s refresh. `null` clears it.
+   */
+  setRuntimeOverlay(overlay) {
+    this.runtimeOverlay = overlay;
+    this.root.classList.toggle('fb-runtime', !!overlay);
+    this._applyRuntimeNodes();
+    this._applyRuntimeEdges();
+  }
+
+  _applyRuntimeNodes() {
+    if (this.mode !== 'bpmn' || !this.nodesLayer) return;
+    const overlay = this.runtimeOverlay;
+    for (const element of this.nodesLayer.querySelectorAll('.fb-node')) {
+      const id = element.dataset.nodeId;
+      const entry = overlay?.nodes.get(id);
+      element.classList.toggle('fb-node--visited', !!overlay?.visitedNodeIds.has(id) && !entry);
+      for (const tone of ['active', 'waiting', 'incident']) element.classList.toggle(`fb-node--token-${tone}`, entry?.tone === tone);
+      const badge = element.querySelector(':scope > .fb-runtime-badge');
+      if (!entry) {
+        badge?.remove();
+        if ('baseLabel' in element.dataset) { element.setAttribute('aria-label', element.dataset.baseLabel); delete element.dataset.baseLabel; }
+        continue;
+      }
+      if (!('baseLabel' in element.dataset)) element.dataset.baseLabel = element.getAttribute('aria-label') || '';
+      element.setAttribute('aria-label', `${element.dataset.baseLabel}. ${entry.label}`);
+      const signature = `${entry.tone}|${entry.count}|${entry.icon}|${entry.label}`;
+      if (badge?.dataset.signature === signature) continue;
+      badge?.remove();
+      const fresh = document.createElement('span');
+      fresh.className = 'fb-runtime-badge';
+      fresh.dataset.tone = entry.tone;
+      fresh.dataset.signature = signature;
+      fresh.setAttribute('role', 'img');
+      fresh.setAttribute('aria-label', entry.label);
+      fresh.title = entry.label;
+      fresh.innerHTML = `<svg aria-hidden="true"><use href="#i-${escapeAttr(entry.icon)}"/></svg>${entry.count > 0 ? `<b>${entry.count}</b>` : ''}`;
+      element.append(fresh);
+    }
+  }
+
+  _applyRuntimeEdges() {
+    if (this.mode !== 'bpmn' || !this.svg) return;
+    const taken = this.runtimeOverlay?.takenEdgeIds;
+    for (const path of this.svg.querySelectorAll('.fb-edge-path')) {
+      path.classList.toggle('fb-edge--taken', !!taken?.has(path.dataset.edgeId));
+    }
   }
 
   _processWarningText(node, key) {
