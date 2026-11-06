@@ -1322,8 +1322,49 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bpmn_monitor_permission",
             MigrationStep::Rust(roles_add_process_monitor_permission),
         ),
+        (
+            208,
+            "bpmn_incident_notices",
+            MigrationStep::Sql(BPMN_INCIDENT_NOTICES),
+        ),
     ]
 }
+
+/// v208 — BPMN B4.3 incident notices. A trigger queues one row per recipient
+/// (the instance initiator and the definition owner) in the transaction that
+/// inserts an open incident, so every raise path, present and future, is
+/// covered and a crash leaves either both rows or neither. The primary key is
+/// the dedup: an incident reaches a recipient once whatever raises it again.
+/// An incident inserted already resolved queues nothing, and no row is queued
+/// in a private simulation database (it holds `simulation_meta`), which must
+/// not produce side effects. Incidents that predate this rung are not queued.
+/// `notified_at_ms IS NULL` is the pending state; `suppressed = 1` marks a row
+/// settled without a push (resolved before delivery, recipient without access).
+const BPMN_INCIDENT_NOTICES: &str = r#"
+CREATE TABLE bpmn_incident_notices (
+    incident_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    queued_at_ms INTEGER NOT NULL,
+    notified_at_ms INTEGER,
+    suppressed INTEGER NOT NULL DEFAULT 0 CHECK(suppressed IN (0, 1)),
+    PRIMARY KEY(incident_id, user_id)
+);
+CREATE INDEX idx_bpmn_incident_notices_pending
+    ON bpmn_incident_notices(queued_at_ms) WHERE notified_at_ms IS NULL;
+CREATE TRIGGER bpmn_incidents_queue_notices
+AFTER INSERT ON bpmn_incidents
+WHEN NEW.resolved_at_ms IS NULL
+    AND NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='simulation_meta')
+BEGIN
+    INSERT OR IGNORE INTO bpmn_incident_notices(incident_id, user_id, queued_at_ms)
+    SELECT NEW.incident_id, i.initiator_user_id, NEW.at_ms
+    FROM bpmn_instances i WHERE i.instance_id = NEW.instance_id;
+    INSERT OR IGNORE INTO bpmn_incident_notices(incident_id, user_id, queued_at_ms)
+    SELECT NEW.incident_id, d.owner_user_id, NEW.at_ms
+    FROM bpmn_instances i JOIN bpmn_definitions d ON d.definition_id = i.definition_id
+    WHERE i.instance_id = NEW.instance_id;
+END;
+"#;
 
 /// v207 — `processes.monitor` lets a role read every instance of the
 /// organization in the process monitor, with variable values withheld (BPMN
@@ -7710,6 +7751,13 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "created_by",
             "author marker (user id or `api_key:<uid>`), synced with the topic to nodes \
              that may not hold the account, so no user_accounts FK",
+        ),
+        t(
+            "bpmn_incident_notices",
+            "user_id",
+            "TEXT recipient born in v208 (the instance initiator or the definition owner); no \
+             user_accounts FK, so a purged account never blocks the notice, and an inactive \
+             one is settled without a push",
         ),
         t(
             "legal_documents",
@@ -16929,7 +16977,7 @@ mod tests {
             assert_eq!(*version, index as i64 + 1, "the ladder must stay contiguous");
         }
         let head = ladder.last().unwrap().0;
-        assert_eq!(head, 207);
+        assert_eq!(head, 208);
 
         let fresh = Connection::open_in_memory().unwrap();
         run(&fresh).unwrap();
@@ -16948,7 +16996,7 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(applied_after_179.len(), 28);
+        assert_eq!(applied_after_179.len(), 29);
         assert_eq!(applied_after_179[0], "org_structure");
         assert_eq!(applied_after_179[19], "bpmn_activity_io_witnesses");
         assert_eq!(applied_after_179[20], "org_absences_drop_reason");
@@ -16965,6 +17013,7 @@ mod tests {
         );
         assert_eq!(applied_after_179[26], "bus_field_policy_mask_hash");
         assert_eq!(applied_after_179[27], "bpmn_monitor_permission");
+        assert_eq!(applied_after_179[28], "bpmn_incident_notices");
         let tables = |conn: &Connection| -> Vec<String> {
             conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 .unwrap()
@@ -17368,6 +17417,50 @@ mod tests {
         for role in ["org_operator", "org_viewer"] {
             assert!(!perms(&conn, role).iter().any(|p| p == "processes.monitor"), "{role}");
         }
+    }
+
+    /// v208: an open incident queues a notice per distinct recipient, a resolved
+    /// one and the incidents that predate the rung queue nothing, and the key is
+    /// the dedup.
+    #[test]
+    fn migration_208_queues_one_notice_per_recipient_for_open_incidents_only() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 207);
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        let incident = |id: &str, resolved: &str| {
+            format!(
+                "INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms,resolved_at_ms) VALUES('{id}','i1','i1',NULL,NULL,'X','m',5,{resolved});"
+            )
+        };
+        conn.execute_batch(&format!(
+            "INSERT INTO bpmn_definitions(definition_id,org_id,owner_user_id,name,description,draft_revision,model_json,published_version,archived,created_at_ms,updated_at_ms) VALUES('d1','o','owner','n','',1,'{{}}',1,0,1,1);
+             INSERT INTO bpmn_instances(instance_id,definition_id,version,org_id,initiator_user_id,revision,status,variables_json,created_at_ms,updated_at_ms,selected_process_id,start_node_id) VALUES('i1','d1',1,'o','starter',1,'incident','{{}}',1,1,'p','Start');
+             {}",
+            incident("before", "NULL")
+        ))
+        .unwrap();
+        run(&conn).unwrap();
+        let notices = |conn: &Connection| -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM bpmn_incident_notices", [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(notices(&conn), 0, "an incident from before the rung is not queued");
+
+        conn.execute_batch(&incident("open", "NULL")).unwrap();
+        conn.execute_batch(&incident("closed", "6")).unwrap();
+        let queued: Vec<(String, String, Option<i64>)> = conn
+            .prepare("SELECT incident_id,user_id,notified_at_ms FROM bpmn_incident_notices ORDER BY user_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            queued,
+            vec![("open".into(), "owner".into(), None), ("open".into(), "starter".into(), None)]
+        );
+        conn.execute("UPDATE bpmn_instances SET initiator_user_id='owner'", []).unwrap();
+        conn.execute_batch(&incident("same-person", "NULL")).unwrap();
+        assert_eq!(notices(&conn), 3, "an initiator who owns the definition is one recipient");
     }
 
     /// v206: a rule from before the migration keeps its fields and gains NULL

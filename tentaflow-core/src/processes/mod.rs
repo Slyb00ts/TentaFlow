@@ -10,6 +10,7 @@ pub mod expression_translate;
 pub mod jobs;
 pub mod model;
 pub mod messages;
+pub mod notices;
 pub mod repository;
 pub mod runtime;
 pub mod simulation;
@@ -72,6 +73,9 @@ mod repetition_boundary_tests;
 
 #[cfg(test)]
 mod monitor_tests;
+
+#[cfg(test)]
+mod notices_tests;
 #[cfg(test)]
 mod simulation_tests;
 #[cfg(test)]

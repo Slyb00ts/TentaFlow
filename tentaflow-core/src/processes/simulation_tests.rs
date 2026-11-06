@@ -2365,3 +2365,30 @@ fn simulation_parallel_join_completes_when_each_branch_arrives_in_its_own_reques
     }
     assert!(completed, "both branches joined across separate requests");
 }
+
+#[test]
+fn a_simulated_incident_queues_no_notice() {
+    let mut model = parallel_timer_model(1);
+    model
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == "Work")
+        .expect("peer branch")
+        .kind = ProcessNodeKind::ScriptTask {
+        script: "1 / 0".into(),
+        output_mapping: BTreeMap::new(),
+    };
+    let mut store = create_store(source_input_for(model)).expect("capture incident source pin");
+    let started = store
+        .start(test_authorization(&store), json!({}))
+        .expect("start simulation whose Script branch fails");
+    assert!(started.incidents.iter().any(|incident| incident.code == "SCRIPT_EVALUATION_FAILED"));
+    let connection = store.into_database().into_connection_for_test();
+    let count = |sql: &str| -> i64 { connection.query_row(sql, [], |row| row.get(0)).unwrap() };
+    assert!(count("SELECT COUNT(*) FROM bpmn_incidents") > 0);
+    assert_eq!(
+        count("SELECT COUNT(*) FROM bpmn_incident_notices"),
+        0,
+        "a private simulation produces no side effects for a real person"
+    );
+}

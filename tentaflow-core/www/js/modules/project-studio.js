@@ -23,6 +23,7 @@ import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast, formatBytes } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
+import { PROCESS_INCIDENT_KIND } from '/js/modules/system-events.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { TfAgentActivity } from '/js/components/tf-agent-activity.js';
 import { renderMarkdown } from '/js/lib/md-lite.js';
@@ -11595,6 +11596,7 @@ function installNotifListener() {
     .then((client) => {
       client.addUnsolicitedListener(({ body }) => {
         if (!body || body._variant !== 'SystemEventBody.UserNotification') return;
+        if (body.kind === PROCESS_INCIDENT_KIND) return;
         const text = taskNotificationText(body, t) ?? orgNotificationText(body, t);
         const title = text ? text.title : body.title || t('notif_title');
         const message = text ? text.body : body.body;

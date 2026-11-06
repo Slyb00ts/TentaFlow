@@ -327,7 +327,7 @@ pub(super) const TRANSITION_TABLES: [&str; 18] = [
 
 /// Process tables that a transition snapshot deliberately leaves out, with the reason.
 /// A table in neither list means a transition test would silently miss its rows.
-const NON_TRANSITION_TABLES: [&str; 9] = [
+const NON_TRANSITION_TABLES: [&str; 10] = [
     // Authoring tables: a transition reads the pinned version but never writes them.
     "bpmn_definitions",
     "bpmn_versions",
@@ -346,6 +346,9 @@ const NON_TRANSITION_TABLES: [&str; 9] = [
     // The verdict of a critic, written by the critic's own tool call while the
     // step waits; no transition reads or writes it.
     "bpmn_verification_completions",
+    // Queue of live incident notices: filled by the incident insert, settled by
+    // the pusher outside any transition.
+    "bpmn_incident_notices",
 ];
 
 #[test]

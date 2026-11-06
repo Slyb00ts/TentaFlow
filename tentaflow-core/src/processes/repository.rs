@@ -3202,6 +3202,29 @@ fn require_instance_reader(
     Ok(instance_access_on(conn, actor, instance_id, AccessReach::Participants)?.is_initiator())
 }
 
+/// Whether a person queued for an incident notice may still read the instance
+/// as its initiator or the definition owner. A notice is pushed only to a reader
+/// who is active in the instance's organization at the moment of delivery.
+pub(super) fn incident_notice_reader_on(
+    conn: &Connection,
+    org_id: &str,
+    user_id: &str,
+    instance_id: &str,
+) -> Result<bool> {
+    let actor = ProcessActor { org_id: org_id.to_string(), user_id: user_id.to_string() };
+    if !actor_active_on(conn, &actor)? {
+        return Ok(false);
+    }
+    match instance_access_on(conn, &actor, instance_id, AccessReach::Observers) {
+        Ok(access) => Ok(matches!(
+            access,
+            ProcessInstanceAccess::Initiator | ProcessInstanceAccess::Owner
+        )),
+        Err(error) if error.downcast_ref::<ProcessAuthorityDenied>().is_some() => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn command_replay<T: for<'de> Deserialize<'de>>(
     tx: &Transaction<'_>,
     actor: &ProcessActor,

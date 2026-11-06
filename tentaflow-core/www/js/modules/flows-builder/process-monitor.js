@@ -15,6 +15,7 @@ import '/js/components/tf-textarea.js';
 import '/js/components/tf-toggle.js';
 import '/js/components/tf-segmented.js';
 import { mountProcessDiagram, readInstanceModel } from './process-diagram.js';
+import { ATTENTION_PAGE, loadAttentionInstances } from './process-attention.js';
 
 const text = (key, values) => I18n.t(`bpmn.${key}`, values);
 const date = (ms, timeZone) => new Date(ms).toLocaleString(I18n.getLanguage(), timeZone ? { timeZone } : undefined);
@@ -404,14 +405,20 @@ export async function openProcessInstances(definitionId = null) {
   const win = readWindow(text('instances'), 'clock');
   let offset = 0;
   let generation = 0;
+  let attention = false;
+  let attentionRows = [];
   const host = win.querySelector('[data-content]');
-  host.innerHTML = `<tf-table data-instances empty-message="${escapeAttr(text('instances_empty'))}" page-size="25" page="1">
+  host.innerHTML = `<div class="tf-toolbar"><tf-segmented data-filter size="sm" value="all" aria-label="${escapeAttr(text('instances_filter_label'))}">
+      <option value="all">${escapeHtml(text('instances_filter_all'))}</option><option value="attention">${escapeHtml(text('instances_filter_attention'))}</option></tf-segmented>
+    <span class="tf-toolbar-spacer"></span><span data-attention-count hidden></span></div>
+    <tf-table data-instances empty-message="${escapeAttr(text('instances_empty'))}" page-size="25" page="1">
     <tf-column key="name" label="${escapeAttr(text('process_name'))}"></tf-column>
     <tf-column key="versionLabel" label="${escapeAttr(text('version'))}"></tf-column>
     <tf-column key="statusLabel" label="${escapeAttr(text('status'))}"></tf-column>
     <tf-column key="updated" label="${escapeAttr(text('updated'))}"></tf-column>
   </tf-table>`;
   const table = host.querySelector('tf-table');
+  const count = host.querySelector('[data-attention-count]');
   table.rowKey = 'instanceId';
   table.rowActions = (_row, _index, current) => {
     const button = document.createElement('tf-button');
@@ -422,17 +429,39 @@ export async function openProcessInstances(definitionId = null) {
     return button;
   };
   table.rowActionsKey = (row) => row.instanceId;
+  const row = (instance) => ({ ...instance, name: instance.definitionName,
+    versionLabel: text('version_number', { version: instance.version }), statusLabel: processStatusLabel(instance.status), updated: date(instance.updatedAtMs) });
   async function load() {
     const current = ++generation;
     try {
+      if (attention) {
+        if (offset === 0) {
+          const found = await loadAttentionInstances((scope) => ApiBinary.one('processInstanceListRequest',
+            { definitionId, offset: 0, limit: ATTENTION_PAGE, hasIncident: true, scope }));
+          if (!win.isConnected || current !== generation) return;
+          attentionRows = found.instances;
+        }
+        table.setAttribute('total', String(attentionRows.length));
+        table.setAttribute('page', String(offset / 25 + 1));
+        table.rows = attentionRows.slice(offset, offset + 25).map(row);
+        count.textContent = attentionRows.length
+          ? text('instances_attention_count', { count: attentionRows.length }) : text('instances_attention_empty');
+        count.hidden = false;
+        return;
+      }
       const response = await ApiBinary.one('processInstanceListRequest', { definitionId, offset, limit: 25 });
       if (!win.isConnected || current !== generation) return;
+      count.hidden = true;
       table.setAttribute('total', String(response.total));
       table.setAttribute('page', String(offset / 25 + 1));
-      table.rows = response.instances.map((instance) => ({ ...instance, name: instance.definitionName,
-        versionLabel: text('version_number', { version: instance.version }), statusLabel: processStatusLabel(instance.status), updated: date(instance.updatedAtMs) }));
+      table.rows = response.instances.map(row);
     } catch (error) { if (current === generation) showError(win, error); }
   }
+  host.querySelector('[data-filter]').addEventListener('change', (event) => {
+    attention = event.detail.value === 'attention';
+    offset = 0;
+    load();
+  });
   table.addEventListener('page-change', (event) => { offset = (event.detail.page - 1) * 25; load(); });
   await load();
   return win;

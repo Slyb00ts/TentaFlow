@@ -8667,6 +8667,13 @@ impl ProcessRuntime {
                 &self.db, &mut send_cursor, chrono::Utc::now().timestamp_millis()) {
                 tracing::error!(error = %error, "pending Send page scan failed");
             }
+            if let Err(error) = super::notices::deliver_pending(
+                &self.db,
+                chrono::Utc::now().timestamp_millis(),
+                &crate::dispatch::system_event_broadcast::publish,
+            ) {
+                tracing::error!(error_len = error.to_string().len(), "process incident notice delivery failed");
+            }
             loop {
                 let slots = job_slots.open();
                 if !(slots.general || slots.agents) || self.stop.is_cancelled() {

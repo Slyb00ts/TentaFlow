@@ -86,6 +86,7 @@ module.exports = defineConfig({
     { name: 'process-b3-simulation-events', testMatch: 'process-b3-simulation-events.spec.js' },
     { name: 'process-b3-simulation-structure', testMatch: 'process-b3-simulation-structure.spec.js' },
     { name: 'process-b4-overlay', testMatch: 'process-b4-overlay.spec.js' },
+    { name: 'process-b4-incident-notice', testMatch: 'process-b4-incident-notice.spec.js' },
     { name: 'tentaquant', testMatch: 'tentaquant.spec.js' },
     { name: 'flows-system-readonly', testMatch: 'flows-system-readonly.spec.js' },
     { name: 'tentabus-seed', testMatch: 'tentabus-seed.spec.js' },

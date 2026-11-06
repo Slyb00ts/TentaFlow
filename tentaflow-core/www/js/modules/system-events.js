@@ -8,6 +8,7 @@
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import { toast } from '/js/utils.js';
+import { TfToast } from '/js/components/tf-toast.js';
 
 let installed = false;
 
@@ -29,19 +30,36 @@ function shouldToast(kind, id, status) {
   return true;
 }
 
+function handleSystemEvent({ body }) {
+  if (!body || !body._variant) return;
+  if (body._variant === 'SystemEventBody.ServiceStatusChanged') handleServiceStatus(body);
+  else if (body._variant === 'SystemEventBody.MeshPeerStatusChanged') handleMeshPeerStatus(body);
+  else if (body._variant === 'SystemEventBody.UserNotification') showProcessIncidentNotice(body);
+}
+
+// A login closes the anonymous socket and opens one with the session, and the
+// server pushes personal events only to the second: the listener follows the
+// current client instead of staying on the first one. Listeners survive a
+// reconnect of the same client, so each client gets exactly one.
+let attachedClient = null;
+
+function attach() {
+  ApiBinary.client()
+    .then((client) => {
+      if (client === attachedClient) return;
+      attachedClient = client;
+      client.addUnsolicitedListener(handleSystemEvent);
+    })
+    .catch((e) => console.warn('[system-events] client not ready:', e?.message));
+}
+
 export function init() {
   if (installed) return;
   installed = true;
-
-  ApiBinary.client()
-    .then((client) => {
-      client.addUnsolicitedListener(({ body }) => {
-        if (!body || !body._variant) return;
-        if (body._variant === 'SystemEventBody.ServiceStatusChanged') handleServiceStatus(body);
-        else if (body._variant === 'SystemEventBody.MeshPeerStatusChanged') handleMeshPeerStatus(body);
-      });
-    })
-    .catch((e) => console.warn('[system-events] client not ready:', e?.message));
+  attach();
+  ApiBinary.onLifecycle((event) => {
+    if (event.type === 'open') attach();
+  });
 }
 
 function handleServiceStatus(ev) {
@@ -71,4 +89,50 @@ function handleMeshPeerStatus(ev) {
     toast(I18n.t('system_events.peer_degraded', { host }), 'warn');
   }
   window.dispatchEvent(new CustomEvent('tf:mesh-peer-status', { detail: ev }));
+}
+
+// `UserNotification.kind` of the server's process incident notice. Project Studio
+// listens to the same variant and skips this kind.
+export const PROCESS_INCIDENT_KIND = 'process_incident';
+
+const NOTICE_MEMORY = 200;
+const NOTICE_TOAST_MS = 15_000;
+const seenNotices = new Set();
+
+function incidentLink(ev) {
+  try {
+    const link = JSON.parse(ev.linkJson);
+    return typeof link?.instanceId === 'string' && typeof link.code === 'string' ? link : null;
+  } catch {
+    return null;
+  }
+}
+
+// The server sends the incident code and ids, never text: the sentence is built
+// here in the reader's language, from the code alone. The server may repeat a
+// notice after a restart with the same id; a repeat is shown once.
+export async function showProcessIncidentNotice(ev) {
+  if (ev.kind !== PROCESS_INCIDENT_KIND) return false;
+  const link = incidentLink(ev);
+  if (!link || seenNotices.has(ev.notificationId)) return true;
+  seenNotices.add(ev.notificationId);
+  if (seenNotices.size > NOTICE_MEMORY) seenNotices.delete(seenNotices.values().next().value);
+  const monitor = await import('/js/modules/flows-builder/process-monitor.js');
+  const sentence = link.code === 'TIMER_ERROR'
+    ? I18n.t('bpmn.incident_generic')
+    : monitor.processIncidentText({ code: link.code, message: '' });
+  TfToast.show({
+    tone: 'warning',
+    title: I18n.t('bpmn.incident_notice_title', { name: link.processName || '' }),
+    message: sentence,
+    duration: NOTICE_TOAST_MS,
+    action: {
+      label: I18n.t('bpmn.open_instance'),
+      onClick: (shown) => {
+        shown.dismiss();
+        monitor.openProcessInstance(link.instanceId);
+      },
+    },
+  });
+  return true;
 }
