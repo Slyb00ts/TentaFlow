@@ -53,6 +53,11 @@ function requestedTimeout(args) {
 let _client = null;
 let _connectingPromise = null;
 let _lifecycleListeners = new Set();
+// Whoever reads the next answer may be another user: caches of what one user was allowed to see end here.
+const _sessionListeners = new Set();
+function notifySessionChanged() {
+  for (const listener of _sessionListeners) listener();
+}
 
 /** Emit lifecycle event do overlay + innych subskrybentow. */
 function emit(event) {
@@ -235,6 +240,7 @@ export const ApiBinary = {
    * Ustawia JWT po udanym loginie. Zamyka anonimowe WS i otwiera nowe z bearer.
    */
   async setJwt(token) {
+    notifySessionChanged();
     if (token) {
       localStorage.setItem(JWT_STORAGE_KEY, token);
     } else {
@@ -262,6 +268,7 @@ export const ApiBinary = {
   },
 
   clearSession() {
+    notifySessionChanged();
     localStorage.removeItem(JWT_STORAGE_KEY);
     _connectingPromise = null;
     if (_client) {
@@ -275,6 +282,12 @@ export const ApiBinary = {
   reconnectNow() {
     if (_client) _client.reconnectNow();
     else initTransport();
+  },
+
+  /** Called whenever the session is cleared or replaced (logout, login as another user). */
+  onSessionChange(cb) {
+    _sessionListeners.add(cb);
+    return () => _sessionListeners.delete(cb);
   },
 
   /** Subscribe do lifecycle events (open/disconnected/reconnect-*). */

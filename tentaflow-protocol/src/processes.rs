@@ -2663,6 +2663,10 @@ pub enum ProcessPayload {
     InstanceModelGetRequest {
         instance_id: String,
     },
+    /// With `structure_only` set, every value that is not structure
+    /// (expressions, mappings, settings, timer values, assignees, call
+    /// targets) is a neutral placeholder, never the authored value, and must
+    /// not be read as one.
     InstanceModelGetResponse {
         version: u32,
         model: ProcessModel,

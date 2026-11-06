@@ -19,11 +19,15 @@ const date = (ms) => new Date(ms).toLocaleString(I18n.getLanguage());
 
 // An instance stays on the version it started with, so its model is read once. Every reader of the
 // instance may ask: the definition owner gets the model as published, anyone else its structure only.
+// What one user may see is not what the next may: the cache ends with the session, and keeps the
+// reader's level (`structureOnly`) beside the model it applies to.
 const instanceModels = new Map();
+ApiBinary.onSessionChange(() => instanceModels.clear());
 export function readInstanceModel(instanceId, version) {
   const key = `${instanceId}:${version}`;
   if (!instanceModels.has(key)) {
-    const pending = ApiBinary.one('processInstanceModelGetRequest', { instanceId }).then((response) => response.model);
+    const pending = ApiBinary.one('processInstanceModelGetRequest', { instanceId })
+      .then((response) => ({ model: response.model, structureOnly: !!response.structureOnly }));
     pending.catch(() => instanceModels.delete(key));
     instanceModels.set(key, pending);
   }
@@ -120,7 +124,7 @@ export function mountProcessDiagram(section, { instanceId, context }) {
   async function ensureModel(version) {
     const key = `${instanceId}:${version}`;
     if (model && key === modelKey) return;
-    model = await readInstanceModel(instanceId, version);
+    model = (await readInstanceModel(instanceId, version)).model;
     modelKey = key;
     shownBodyKey = '';
     selectedNodeId = null;

@@ -740,3 +740,23 @@ fn the_pinned_model_goes_whole_to_its_owner_and_structure_only_to_every_other_re
     let missing = repository::get_instance_model(&fixture.db, &monitor, "no-such-instance").unwrap_err();
     assert!(is_not_found(&missing), "{missing}");
 }
+
+#[test]
+fn a_member_of_another_organization_cannot_read_the_model_even_as_a_monitor() {
+    let fixture = Fixture::new();
+    let started = waiting_instance(&fixture);
+    let other = crate::services::org::repo::create_organization(
+        &fixture.db, "Other organization", "other-organization", None, None, None, None,
+    ).expect("second active organization");
+    let id = crate::db::repository::create_user_account(
+        &fixture.db, "outsider", "test-password-hash", "outsider", "outsider@example.test",
+    ).expect("create outsider");
+    crate::services::org::repo::add_membership(&fixture.db, &other.org_id, &id, "role-org-admin", &id)
+        .expect("outsider joins the other organization");
+    let outsider = ProcessActor { org_id: other.org_id.clone(), user_id: id };
+
+    let error = repository::get_instance_model(&fixture.db, &outsider, &started.instance_id).unwrap_err();
+    assert!(is_not_found(&error), "{error}");
+    assert!(is_not_found(&repository::get_instance_tokens(
+        &fixture.db, &outsider, &started.instance_id, None, None).unwrap_err()));
+}

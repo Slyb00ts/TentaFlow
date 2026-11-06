@@ -9516,3 +9516,25 @@ test('an element label with a closing full stop gets no doubled one from the ove
     win.remove();
   } finally { timers.stop(); }
 });
+
+test('the model cache ends with the session, so the next user on the tab reads the model at his own level', async () => {
+  const timers = recordTimers();
+  try {
+    const model = runModel();
+    const open = async () => {
+      const win = await monitor(instance('instance-d14', { definitionId: 'definition-d14' }), {
+        processInstanceModelGetRequest: { version: 2, model, structureOnly: false },
+        processInstanceTokensGetRequest: tokens(model, { tokens: [waitingToken('Review', { UserTask: { userTaskId: 'u1' } })] }),
+      });
+      change(win.querySelector('[data-view]'), 'diagram'); await flush(30);
+      win.remove(); await flush(3);
+    };
+    const asked = () => calls.filter((row) => row.kind === 'processInstanceModelGetRequest').length;
+    await open();
+    await open();
+    assert.equal(asked(), 1, 'the same session reads the model once');
+    ApiBinary.clearSession();
+    await open();
+    assert.equal(asked(), 2, 'a new session reads it again');
+  } finally { timers.stop(); }
+});

@@ -639,7 +639,7 @@ export async function openProcessInstance(instanceId, initial = null) {
     if (attached.key === key) return;
     attached.key = key;
     try {
-      const model = await readInstanceModel(instanceId, instance.version);
+      const { model } = await readInstanceModel(instanceId, instance.version);
       if (!win.isConnected) return;
       attached.names = processElementNames(model);
     } catch (_) {

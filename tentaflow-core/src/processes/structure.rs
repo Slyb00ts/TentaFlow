@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use tentaflow_protocol::processes::{
     ActivityVerification, ProcessCallActivity, ProcessCallTarget, ProcessCallableReference,
-    ProcessErrorDeclaration, ProcessEscalationDeclaration, ProcessExecutableProcess,
+    ProcessErrorDeclaration, ProcessEscalationDeclaration, ProcessExecutableProcess, ProcessLinkEventDefinition,
     ProcessMessageTargetSpec, ProcessModel, ProcessMultiInstanceInput, ProcessNode,
     ProcessNodeKind, ProcessRepeatSpec, ProcessSequenceFlow, ProcessSignalDeclaration,
     ProcessSubProcess, ProcessTimerSpec, ServiceImplementation,
@@ -145,6 +145,15 @@ fn no_target() -> ProcessMessageTargetSpec {
     }
 }
 
+fn project_link(definition: &ProcessLinkEventDefinition) -> ProcessLinkEventDefinition {
+    ProcessLinkEventDefinition {
+        id: definition.id.clone(),
+        name: definition.name.clone(),
+        source_refs: definition.source_refs.clone(),
+        target_ref: definition.target_ref.clone(),
+    }
+}
+
 fn project_kind(kind: &ProcessNodeKind) -> ProcessNodeKind {
     use ProcessNodeKind as K;
     match kind {
@@ -264,8 +273,8 @@ fn project_kind(kind: &ProcessNodeKind) -> ProcessNodeKind {
             signal_ref: signal_ref.clone(),
             output_mapping: BTreeMap::new(),
         },
-        K::LinkThrow { definition } => K::LinkThrow { definition: definition.clone() },
-        K::LinkCatch { definition } => K::LinkCatch { definition: definition.clone() },
+        K::LinkThrow { definition } => K::LinkThrow { definition: project_link(definition) },
+        K::LinkCatch { definition } => K::LinkCatch { definition: project_link(definition) },
     }
 }
 
@@ -274,7 +283,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tentaflow_protocol::processes::{
-        ProcessDiagram, ProcessEdgeDiagram, ProcessLinkEventDefinition,
+        ProcessBodyModeling, ProcessDiagram, ProcessEdgeDiagram, ProcessLinkEventDefinition,
         ProcessMessageDeclaration, ProcessMultiInstanceMode, ProcessPoint, ProcessShape,
         ProcessWorkCalendar,
     };
@@ -306,11 +315,47 @@ mod tests {
             process_id: Some(secret()),
             start_node_id: Some(secret()),
         };
+        let catch_target = || ProcessMessageTargetSpec::Catch {
+            definition_id: secret(),
+            instance_id_expression: Some(secret()),
+            subscription_id_expression: Some(secret()),
+        };
         let link = || ProcessLinkEventDefinition {
             id: "link-1".into(),
             name: "Visible link".into(),
             source_refs: vec!["Link".into()],
             target_ref: Some("Link".into()),
+        };
+        let calendar = || ProcessWorkCalendar {
+            name: secret(),
+            weekly_windows: Vec::new(),
+            manual_days_off: vec![tentaflow_protocol::processes::ManualDayOff {
+                date: "2031-01-01".into(), reason: secret(),
+            }],
+            holiday_policy: tentaflow_protocol::processes::HolidayPolicy::None,
+        };
+        let modeling = || ProcessBodyModeling {
+            lane_sets: vec![tentaflow_protocol::processes::ProcessLaneSet {
+                id: "LaneSet".into(),
+                lanes: vec![tentaflow_protocol::processes::ProcessLane {
+                    id: "Lane".into(), name: Some(secret()), flow_node_refs: vec!["Start".into()],
+                    child_lane_sets: Vec::new(),
+                }],
+            }],
+            data_objects: vec![tentaflow_protocol::processes::ProcessDataObject {
+                id: "Object".into(), name: Some(secret()),
+            }],
+            data_object_references: vec![tentaflow_protocol::processes::ProcessDataObjectReference {
+                id: "ObjectRef".into(), name: Some(secret()), data_object_ref: "Object".into(),
+                variable_binding_key: Some(secret()),
+            }],
+            text_annotations: vec![tentaflow_protocol::processes::ProcessTextAnnotation {
+                id: "Note".into(), text: secret(),
+            }],
+            associations: Vec::new(),
+            data_store_references: vec![tentaflow_protocol::processes::ProcessDataStoreReference {
+                id: "StoreRef".into(), name: Some(secret()), data_store_ref: "Store".into(),
+            }],
         };
         let body = ProcessSubProcess {
             nodes: vec![node("Inner", K::ScriptTask { script: secret(), output_mapping: secret_map() })],
@@ -320,7 +365,7 @@ mod tests {
             }],
             variables: BTreeMap::from([(secret(), json!(secret()))]),
             diagram: ProcessDiagram::default(),
-            modeling: Some(Default::default()),
+            modeling: Some(modeling()),
         };
         let mut looped = node("Looped", K::ScriptTask { script: secret(), output_mapping: secret_map() });
         looped.repeat = Some(ProcessRepeatSpec::StructuredLoop {
@@ -380,6 +425,10 @@ mod tests {
             }),
             node("MessageThrow", K::MessageThrow {
                 message_ref: "Msg".into(), target: target(), correlation_expression: secret(),
+                payload_expression: secret(), ttl_seconds: 11,
+            }),
+            node("MessageThrowCatch", K::MessageThrow {
+                message_ref: "Msg".into(), target: catch_target(), correlation_expression: secret(),
                 payload_expression: secret(), ttl_seconds: 11,
             }),
             node("BoundaryMessage", K::BoundaryMessage {
@@ -464,15 +513,23 @@ mod tests {
                 modeling_edges: Vec::new(),
             },
             timer_timezone: Some(secret()),
-            work_calendar: Some(ProcessWorkCalendar {
-                name: secret(),
-                weekly_windows: Vec::new(),
-                manual_days_off: vec![tentaflow_protocol::processes::ManualDayOff {
-                    date: "2031-01-01".into(), reason: secret(),
-                }],
-                holiday_policy: tentaflow_protocol::processes::HolidayPolicy::None,
+            work_calendar: Some(calendar()),
+            calendar_pin: Some(tentaflow_protocol::processes::ProcessCalendarPin {
+                calendar: calendar(),
+                legal_release: tentaflow_protocol::processes::ProcessLegalRelease {
+                    release_id: secret(), as_of_date: secret(), valid_from: secret(), valid_until: secret(),
+                    audit_manifest_sha256: secret(),
+                    sources: vec![tentaflow_protocol::processes::ProcessCalendarSource {
+                        source_id: secret(), url: secret(), sha256: secret(), retrieved_on: secret() }],
+                    rules: Vec::new(),
+                },
+                timezone_data: tentaflow_protocol::processes::ProcessTimezoneData {
+                    iana_name: secret(), release_id: secret(), horizon_start_ms: 0, horizon_end_ms: 1,
+                    initial_offset_seconds: 0, transitions: Vec::new(), source_url: secret(),
+                    source_sha256: secret(), dataset_sha256: secret(),
+                },
+                sha256: secret(),
             }),
-            calendar_pin: None,
             messages: vec![ProcessMessageDeclaration { message_id: "Msg".into(), name: "Visible message".into() }],
             errors: vec![ProcessErrorDeclaration { error_id: "Err".into(), name: "Visible error".into(), error_code: secret() }],
             target_namespace: Some(secret()),
@@ -496,10 +553,19 @@ mod tests {
                 timer_timezone: Some(secret()),
                 work_calendar: None,
                 calendar_pin: None,
-                modeling: Some(Default::default()),
+                modeling: Some(modeling()),
             }],
-            modeling: Some(Default::default()),
-            collaboration: None,
+            modeling: Some(modeling()),
+            collaboration: Some(tentaflow_protocol::processes::ProcessCollaboration {
+                id: "Collab".into(),
+                name: Some(secret()),
+                participants: vec![tentaflow_protocol::processes::ProcessParticipant {
+                    id: "Participant".into(), name: Some(secret()),
+                    process_ref: Some(ProcessCallableReference { namespace_uri: secret(), process_id: secret() }),
+                }],
+                message_flows: Vec::new(),
+                diagram: ProcessDiagram::default(),
+            }),
             data_stores: vec![tentaflow_protocol::processes::ProcessDataStore {
                 id: secret(), name: Some(secret()), capacity: None, is_unlimited: None,
             }],

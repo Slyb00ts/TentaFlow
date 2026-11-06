@@ -3951,6 +3951,17 @@ fn publish_call_pins_on(
     Ok(())
 }
 
+/// The published model alone, without the call pins and service snapshots a
+/// full version read parses.
+fn model_on(conn: &Connection, definition_id: &str, version: u32) -> Result<ProcessModel> {
+    let model_json: String = conn.query_row(
+        "SELECT model_json FROM bpmn_versions WHERE definition_id=?1 AND version=?2",
+        params![definition_id, version],
+        |row| row.get(0),
+    )?;
+    Ok(serde_json::from_str(&model_json)?)
+}
+
 fn version_on(conn: &Connection, definition_id: &str, version: u32) -> Result<ProcessVersion> {
     let call_activities = call_pins_on(conn, definition_id, version)?;
     conn.query_row(
@@ -6417,7 +6428,7 @@ pub fn get_instance_model(
             params![instance_id, actor.org_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let model = version_on(conn, &definition_id, version)?.model;
+        let model = model_on(conn, &definition_id, version)?;
         if actor_owns_on(conn, actor, &definition_id)? {
             return Ok((version, model, false));
         }
