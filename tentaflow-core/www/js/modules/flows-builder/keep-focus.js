@@ -7,3 +7,18 @@ export function replaceKeepingFocus(host, build) {
   build();
   if (focused) host.querySelector(`[data-focus-key="${CSS.escape(focused)}"]`)?.querySelector('button, a')?.focus({ preventScroll: true });
 }
+
+// After an action whose control may be gone, focus must not fall to the page:
+// when it is outside `win`, the first control that still exists is focused,
+// else `fallback` (made focusable on the spot).
+export function focusFirstOf(win, selectors, fallback) {
+  if (win.contains(document.activeElement)) return;
+  for (const selector of selectors) {
+    const target = win.querySelector(selector)?.querySelector('button, a');
+    if (target) { target.focus({ preventScroll: true }); return; }
+  }
+  if (fallback) {
+    fallback.setAttribute('tabindex', '-1');
+    fallback.focus({ preventScroll: true });
+  }
+}

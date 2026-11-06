@@ -1022,3 +1022,57 @@ fn business_graph() -> String {
         "edges":[{"from":"trigger","to":"output","from_port":"text","to_port":"text"}],
         "variables":[{"name":"actual_result","type":"json"}]}).to_string()
 }
+
+/// A retried attempt whose result was recorded but never applied.
+async fn observed_after_retry(fixture: &Fixture, label: &str)
+    -> (ProcessInstance, String, ClaimedProcessJob, i64)
+{
+    let (started, incident_id, claim, notices) = retried_after_a_delivered_notice(
+        fixture, label, &business_graph(), Some("outputs.variables.actual_result"));
+    assert!(repository::commit_job_dispatch_boundary(&fixture.db, &claim, label, now()).unwrap());
+    let observed = repository::ObservedActivityResult {
+        origin: repository::ActivityResultOrigin::Contract,
+        expression_observation: None,
+        result: tentaflow_protocol::processes::ActivityResult {
+            outcome: tentaflow_protocol::processes::ActivityOutcome::Completed,
+            code: None,
+            summary: "done".into(),
+            outputs: serde_json::Value::Null,
+            evidence: Vec::new(),
+        },
+        verification: None,
+    };
+    assert_eq!(repository::record_job_observation(&fixture.db, &claim, label, &observed, now()).unwrap(),
+        repository::JobObservationState::Observed);
+    (started, incident_id, claim, notices)
+}
+
+fn assert_the_one_incident_reopened(fixture: &Fixture, started: &ProcessInstance, incident_id: &str,
+    claim: &ClaimedProcessJob, notices: i64, code: &str)
+{
+    let rows = incident_rows(fixture, &started.instance_id);
+    assert_eq!(rows.len(), 1, "still one incident row: {rows:?}");
+    assert_eq!((rows[0].0.as_str(), rows[0].1.as_deref(), rows[0].2, rows[0].3.as_str()),
+        (incident_id, Some(claim.job.job_id.as_str()), true, code));
+    assert!(rows[0].4 > 1, "the time moved to the newest failure");
+    assert_eq!(notice_count(fixture), notices, "no notice row added");
+    let pending: i64 = fixture.db.read().unwrap().query_row(
+        "SELECT COUNT(*) FROM bpmn_incident_notices WHERE notified_at_ms IS NULL", [], |row| row.get(0)).unwrap();
+    assert_eq!(pending, 0, "and nothing to deliver again");
+}
+
+#[tokio::test]
+async fn a_retried_attempt_whose_recovery_keeps_failing_reopens_the_one_incident() {
+    let fixture = Fixture::new();
+    let (started, incident_id, claim, notices) = observed_after_retry(&fixture, "recovery-failed").await;
+    repository::report_recovery_failure(&fixture.db, &claim.job.job_id, &anyhow::anyhow!("not recoverable"), now(), 1);
+    assert_the_one_incident_reopened(&fixture, &started, &incident_id, &claim, notices, "RESULT_RECOVERY_FAILED");
+}
+
+#[tokio::test]
+async fn a_retried_attempt_whose_tool_result_stays_undecided_reopens_the_one_incident() {
+    let fixture = Fixture::new();
+    let (started, incident_id, claim, notices) = observed_after_retry(&fixture, "undecided").await;
+    repository::record_undecided_batch(&fixture.db, &[(claim.job.job_id.clone(), true)], now());
+    assert_the_one_incident_reopened(&fixture, &started, &incident_id, &claim, notices, "TOOL_RESULT_UNDECIDED");
+}

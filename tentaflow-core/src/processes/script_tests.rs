@@ -357,7 +357,7 @@ async fn observed_service_result_survives_joined_script_infrastructure_failure_w
     assert_eq!(transition_rows(&fixture), before);
     let denied = repository::retry_job(&fixture.db, &fixture.owner, &stamp("retry script"),
         &started.instance_id, &claimed.job.job_id, reopened.revision).unwrap_err();
-    assert!(denied.to_string().contains("proved-no-effect invocation"));
+    assert!(denied.downcast_ref::<repository::ProcessOperationDenied>().is_some(), "{denied}");
     assert_eq!(transition_rows(&fixture), before);
     expr::inject_script_infrastructure_failure("vars.answer + \" b2i-infra-probe\"");
     // A row that cannot be resumed no longer fails the whole recovery (and with it

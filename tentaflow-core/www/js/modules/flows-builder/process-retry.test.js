@@ -21,6 +21,7 @@ const { ApiBinary } = await import('../../protocol/api-binary-shim.js');
 const { TfWindow } = await import('../../components/tf-window.js');
 const { openProcessInstance } = await import('./process-monitor.js');
 const { RETRY_REASONS, retryOffered, retryRefusal } = await import('./process-retry.js');
+const { processIncidentText } = await import('./process-monitor.js');
 localStorage.setItem('tentaflow_lang', 'en');
 await I18n.init();
 
@@ -183,7 +184,8 @@ test('every reason the server can give has a sentence in all five locales and th
   assert.ok(variants.length >= 10, `read ${variants.length} variants`);
   assert.deepEqual([...RETRY_REASONS].sort(), [...variants].sort());
   const keys = [...RETRY_REASONS.map((reason) => `retry_denied_${reason.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase()}`),
-    'retry_denied_generic', 'retry_output_mapping_pending', 'retry_started', 'retry_refused', 'retry_hint'];
+    'retry_denied_generic', 'retry_denied_quota', 'retry_denied_permission', 'incident_token_quota_exceeded', 'incident_tool_permission_denied',
+    'retry_output_mapping_pending', 'retry_started', 'retry_refused', 'retry_hint'];
   const english = JSON.parse(readFileSync(new URL('../../../i18n/en.json', import.meta.url), 'utf8')).bpmn;
   for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
     const bpmn = JSON.parse(readFileSync(new URL(`../../../i18n/${language}.json`, import.meta.url), 'utf8')).bpmn;
@@ -194,4 +196,83 @@ test('every reason the server can give has a sentence in all five locales and th
     }
     for (const key of keys.filter((name) => name.startsWith('retry_denied_'))) assert.doesNotMatch(bpmn[key], /węzeł/i, `${language}.${key}`);
   }
+});
+
+// A confirmation held open while the window is clicked again: the first answer is the only question.
+function gatedConfirm() {
+  let answer;
+  const gate = new Promise((resolve) => { answer = resolve; });
+  TfWindow.confirm = async (options) => { confirmations.push(options); return gate; };
+  return answer;
+}
+const restoreConfirm = () => { TfWindow.confirm = async (options) => { confirmations.push(options); return true; }; };
+
+test('clicking Retry again while the question is open asks once and sends once', async () => {
+  const answer = gatedConfirm();
+  try {
+    const win = await open(run([incident()]), { processJobRetryRequest: () => ({ instance: run([], { revision: 12 }) }) });
+    click(win.querySelector('[data-retry]')); await flush();
+    click(win.querySelector('[data-retry]')); await flush();
+    assert.equal(confirmations.length, 1, 'one question');
+    answer(true); await flush(10);
+    assert.equal(calls.filter((row) => row.kind === 'processJobRetryRequest').length, 1, 'one request');
+  } finally { restoreConfirm(); }
+});
+
+test('what the window shows after the answer decides: an incident that moved on to another job sends nothing and is read again', async () => {
+  const answer = gatedConfirm();
+  try {
+    const current = run([incident()]);
+    let latest = current;
+    const win = await open(current, { processInstanceGetRequest: () => ({ instance: latest }) });
+    click(win.querySelector('[data-retry]')); await flush();
+    latest = run([incident({ jobId: 'job-2' })], { revision: 12, updatedAtMs: 3000 });
+    await poll(); await flush();
+    const reads = calls.filter((row) => row.kind === 'processInstanceGetRequest').length;
+    answer(true); await flush(10);
+    assert.equal(calls.some((row) => row.kind === 'processJobRetryRequest'), false, 'nothing is sent for the job the reader no longer sees');
+    assert.ok(calls.filter((row) => row.kind === 'processInstanceGetRequest').length > reads, 'the instance is read again');
+  } finally { restoreConfirm(); }
+});
+
+test('an incident the reader can no longer retry after the answer sends nothing', async () => {
+  const answer = gatedConfirm();
+  try {
+    const current = run([incident()]);
+    let latest = current;
+    const win = await open(current, { processInstanceGetRequest: () => ({ instance: latest }) });
+    click(win.querySelector('[data-retry]')); await flush();
+    latest = run([incident({ canRetry: false, retry: { kind: 'Job', deniedReason: 'ActivationBusy' } })], { revision: 12, updatedAtMs: 3000 });
+    await poll(); await flush();
+    answer(true); await flush(10);
+    assert.equal(calls.some((row) => row.kind === 'processJobRetryRequest'), false);
+  } finally { restoreConfirm(); }
+});
+
+test('after a retry the focus is still inside the window, and Retry selects no incident for the detail', async () => {
+  const win = await open(run([incident()]), { processJobRetryRequest: () => ({ instance: run([], { revision: 12, status: 'Running' }) }) });
+  const button = win.querySelector('[data-retry] button');
+  button.focus();
+  assert.ok(document.activeElement === button, 'focus starts on the control');
+  click(win.querySelector('[data-retry]')); await flush(10);
+  assert.equal(win.querySelector('[data-retry]'), null, 'the control is gone');
+  assert.ok(win.contains(document.activeElement) && document.activeElement !== document.body, 'focus did not fall to the page');
+  assert.equal(calls.filter((row) => row.kind === 'processInstanceGetRequest')
+    .some((row) => JSON.stringify(row.payload).includes('"selectedIncidentId":"inc-1"')), false, 'Retry does not open the incident detail');
+});
+
+test('a spent token quota and a missing permission are told apart in the incident and in the reason', async () => {
+  for (const [code, keyIncident, keyReason] of [['TOKEN_QUOTA_EXCEEDED', 'incident_token_quota_exceeded', 'retry_denied_quota'],
+    ['TOOL_PERMISSION_DENIED', 'incident_tool_permission_denied', 'retry_denied_permission']]) {
+    for (const language of ['en', 'pl', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      const refused = incident({ code, canRetry: false, retry: { kind: 'None', deniedReason: 'SameFailureRepeats' } });
+      assert.equal(processIncidentText(refused), I18n.t(`bpmn.${keyIncident}`), `${language} ${code}`);
+      assert.equal(retryRefusal(refused), I18n.t(`bpmn.${keyReason}`), `${language} ${code}`);
+      assert.notEqual(retryRefusal(refused), I18n.t('bpmn.retry_denied_same_failure_repeats'), `${language} ${code}`);
+    }
+  }
+  await I18n.setLanguage('en');
+  assert.equal(retryRefusal(incident({ code: 'NO_MATCHING_FLOW', canRetry: false, retry: { kind: 'None', deniedReason: 'SameFailureRepeats' } })),
+    I18n.t('bpmn.retry_denied_same_failure_repeats'));
 });

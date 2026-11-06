@@ -1657,6 +1657,7 @@ body:has(.fb-shell) .toast-container { top: 64px; right: auto; left: 50%; transf
 .fb-process-work { border: 1px solid var(--tf-border); border-radius: var(--tf-radius); padding: 12px; margin-block: 8px; }
 .fb-process-work > div { flex: 1; min-width: 200px; overflow-wrap: anywhere; }
 .fb-process-work p { color: var(--tf-text-2); margin-bottom: 0; line-height: 1.5; }
+.fb-process-work [data-retry-note] { font-size: 13px; color: var(--tf-text-2); }
 .fb-process-json { min-width: 0; }
 .fb-process-facts dl { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(0, 2fr); gap: 4px 12px; margin: 6px 0; }
 .fb-process-facts dt { color: var(--tf-text-3); }

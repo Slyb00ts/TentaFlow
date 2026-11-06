@@ -80,6 +80,22 @@ test('a modal window opened over another window keeps that window behind its bac
   under.remove();
 });
 
+test('a modal window opened through open() puts its backdrop above windows already open and under itself', () => {
+  const under = document.createElement('tf-window');
+  document.body.appendChild(under);
+  const underZ = Number(under.shadowRoot.querySelector('.tf-window').style.zIndex);
+  TfWindow.open({ title: 'Ask', body: 'Sure?', modal: true });
+  const dialog = [...document.querySelectorAll('tf-window')].at(-1);
+  const backdrop = dialog.previousElementSibling;
+  assert.ok(backdrop?.classList.contains('tf-window-backdrop'));
+  const dialogZ = Number(dialog.shadowRoot.querySelector('.tf-window').style.zIndex);
+  assert.ok(underZ < Number(backdrop.style.zIndex), 'the open window is covered');
+  assert.ok(Number(backdrop.style.zIndex) < dialogZ, 'the dialog stays above its backdrop');
+  dialog.close?.();
+  dialog.remove();
+  under.remove();
+});
+
 test('a window that leaves the document says so once, however it went', async () => {
   const win = document.createElement('tf-window');
   document.body.appendChild(win);

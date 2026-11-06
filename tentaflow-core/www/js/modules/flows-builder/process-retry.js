@@ -20,6 +20,12 @@ const REASON_KEYS = {
   ExecutionUnavailable: 'retry_denied_execution_unavailable',
 };
 
+// Two of the failures a repeat would meet again have a cause the reader can act on, so they get their own sentence.
+const SAME_FAILURE_BY_CODE = {
+  TOKEN_QUOTA_EXCEEDED: 'retry_denied_quota',
+  TOOL_PERMISSION_DENIED: 'retry_denied_permission',
+};
+
 export const RETRY_REASONS = Object.keys(REASON_KEYS);
 
 /** The retry button is shown only for a task incident the server offers to this reader. */
@@ -35,6 +41,7 @@ export function retryOffered(incident) {
 export function retryRefusal(incident) {
   if (retryOffered(incident)) return null;
   const retry = incident.retry;
+  if (retry?.deniedReason === 'SameFailureRepeats' && SAME_FAILURE_BY_CODE[incident.code]) return text(SAME_FAILURE_BY_CODE[incident.code]);
   if (retry?.deniedReason) return text(REASON_KEYS[retry.deniedReason] ?? 'retry_denied_generic');
   if (retry?.kind === 'OutputMapping') return text('retry_output_mapping_pending');
   return null;

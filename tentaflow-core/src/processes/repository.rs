@@ -29963,7 +29963,7 @@ fn count_recovery_failure_on(
 /// the failure; after `incident_after` passes in a row the row raises a visible
 /// incident. A row refused for good is tried again with a growing delay, and only
 /// its first failure and the one that raises the incident are logged as errors.
-fn report_recovery_failure(
+pub(super) fn report_recovery_failure(
     pool: &DbPool,
     job_id: &str,
     error: &anyhow::Error,
@@ -30029,9 +30029,8 @@ fn raise_recovery_incident_on(
     message: &str,
     now_ms: i64,
 ) -> Result<()> {
-    let incident_id = Uuid::new_v4().to_string();
-    tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-        params![incident_id,row.instance_id,row.scope_id,row.node_id,row.job_id,code,message,now_ms])?;
+    let incident_id = raise_job_incident_on(tx, &row.instance_id, &row.scope_id, &row.node_id,
+        &row.job_id, code, message, now_ms)?;
     let next_seq: u64 = tx.query_row(
         "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
         [&row.instance_id], |r| row_u64(r, 0))?;
@@ -30050,7 +30049,7 @@ fn raise_recovery_incident_on(
 /// event the first time, and an incident once the tool is gone or the wait passes
 /// `UNDECIDED_DEADLINE_MS`. The row stays observed. Each row has its own
 /// transaction, so one that cannot be recorded costs only itself.
-fn record_undecided_batch(pool: &DbPool, waiting: &[(String, bool)], now_ms: i64) {
+pub(super) fn record_undecided_batch(pool: &DbPool, waiting: &[(String, bool)], now_ms: i64) {
     for (job_id, gone) in waiting {
         if let Err(error) = record_undecided_row(pool, job_id, *gone, now_ms) {
             report_recovery_failure(pool, job_id, &error, now_ms, RECOVERY_FAILURES_BEFORE_INCIDENT);
@@ -30197,11 +30196,10 @@ pub(super) fn record_observed_script_infrastructure_failure(
     if existing.is_some() {
         return Ok(false);
     }
-    let incident_id = Uuid::new_v4().to_string();
     let message = bounded_failure_message(&format!("{error:#}"));
     let at_ms = at_ms.max(updated_at_ms);
-    tx.execute("INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) VALUES(?1,?2,?3,?4,?5,'SCRIPT_INFRASTRUCTURE_FAILED',?6,?7)",
-        params![incident_id,instance_id,scope_id,node_id,claimed.job.job_id,message,at_ms])?;
+    let incident_id = raise_job_incident_on(&tx, &instance_id, &scope_id, &node_id,
+        &claimed.job.job_id, "SCRIPT_INFRASTRUCTURE_FAILED", &message, at_ms)?;
     let seq: u64 = tx.query_row(
         "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
         [&instance_id], |row| row_u64(row,0))?;

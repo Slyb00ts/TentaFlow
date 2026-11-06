@@ -688,6 +688,9 @@ TfWindow.open = function openWindow(opts = {}) {
     if (modal) {
       backdrop = document.createElement('div');
       backdrop.className = 'tf-window-backdrop';
+      // Own layer from the first paint: without one the backdrop falls back to
+      // its stylesheet's and can sit under a window that is already open.
+      backdrop.style.zIndex = String(nextOverlayLayer());
       document.body.appendChild(backdrop);
     }
 

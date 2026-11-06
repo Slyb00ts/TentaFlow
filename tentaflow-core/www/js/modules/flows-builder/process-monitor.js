@@ -16,7 +16,7 @@ import '/js/components/tf-toggle.js';
 import '/js/components/tf-segmented.js';
 import { mountProcessDiagram, readInstanceModel } from './process-diagram.js';
 import { ATTENTION_PAGE, loadAttentionInstances } from './process-attention.js';
-import { replaceKeepingFocus } from './keep-focus.js';
+import { focusFirstOf, replaceKeepingFocus } from './keep-focus.js';
 import { retryOffered, retryRefusal } from './process-retry.js';
 
 // Fired by an instance window after it changed the instance (cancel, retry), so a
@@ -434,8 +434,8 @@ export const INCIDENT_TEXT_KEYS = Object.freeze({
   SIGNAL_RECIPIENT_LIMIT: 'incident_signal_limit',
   TOOL_ARGUMENTS_INVALID: 'incident_tool_failed',
   TOOL_ERROR: 'incident_tool_failed',
-  TOOL_PERMISSION_DENIED: 'incident_not_allowed',
-  TOKEN_QUOTA_EXCEEDED: 'incident_not_allowed',
+  TOOL_PERMISSION_DENIED: 'incident_tool_permission_denied',
+  TOKEN_QUOTA_EXCEEDED: 'incident_token_quota_exceeded',
 });
 
 export function processIncidentText(incident) {
@@ -657,15 +657,29 @@ export async function openProcessInstance(instanceId, initial = null) {
 
   // Retry of a task incident the server offered: confirm, send, tell the result. The
   // new attempt may fail again; that reopens the same incident, which the next read shows.
+  // One question at a time (the list and the diagram share this entry), and what is sent
+  // is what the window shows after the answer, not what it showed when the button was clicked.
+  let retryAsking = false;
   async function retryIncident(incident) {
-    if (!retryOffered(incident) || mutation || !available || !win.isConnected) return;
-    selectedIncidentId = incident.incidentId;
-    const approved = await customElements.get('tf-window').confirm({ title: text('retry'), message: text('retry_hint'), confirmLabel: text('retry') });
-    if (!approved || !win.isConnected) return;
-    host.querySelectorAll('[data-retry]').forEach((control) => control.setAttribute('disabled', ''));
-    if (await applyMutation('processJobRetryRequest', { instanceId, jobId: incident.jobId, expectedRevision: instance.revision }, retryCommand)) {
-      toast(text('retry_started'), 'success');
-    }
+    if (retryAsking || !retryOffered(incident) || mutation || !available || !win.isConnected) return;
+    retryAsking = true;
+    try {
+      const approved = await customElements.get('tf-window').confirm({ title: text('retry'), message: text('retry_hint'), confirmLabel: text('retry') });
+      if (!approved || !win.isConnected) return;
+      const current = instance.incidents.find((candidate) => candidate.incidentId === incident.incidentId);
+      if (!current || !retryOffered(current) || current.jobId !== incident.jobId || mutation) {
+        await refresh();
+        return;
+      }
+      host.querySelectorAll('[data-retry]').forEach((control) => control.setAttribute('disabled', ''));
+      if (await applyMutation('processJobRetryRequest', { instanceId, jobId: current.jobId, expectedRevision: instance.revision }, retryCommand)) {
+        toast(text('retry_started'), 'success');
+      }
+      if (win.isConnected) {
+        const key = (kind) => `[data-focus-key="${CSS.escape(`${kind}:${incident.incidentId}`)}"]`;
+        focusFirstOf(win, [key('retry'), key('inspect'), key('incident')], host.querySelector('[data-summary] h2'));
+      }
+    } finally { retryAsking = false; }
   }
 
   async function complete(summary) {
