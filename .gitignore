@@ -28,9 +28,11 @@ plans/*
 # build, wiec commitowanie tych plikow powodowalo konflikt na kazdym pull/rebase.
 tentaflow-core/www/js/voxel/voxel_glue.js
 tentaflow-core/www/js/protocol/wasm_glue.js
+tentaflow-core/www/js/protocol/wasm_glue_asm.js
 tentaflow-core/www/js/protocol/wasm_glue.d.ts
 tentaflow-core/www/js/protocol/wasm_glue_bg.wasm.d.ts
 tentaflow-core/www/js/quantum/quantum_glue.js
+tentaflow-core/www/js/quantum/quantum_glue_asm.js
 tentaflow-core/www/js/quantum/quantum_glue.d.ts
 tentaflow-core/www/js/quantum/quantum_glue_bg.wasm.d.ts
 

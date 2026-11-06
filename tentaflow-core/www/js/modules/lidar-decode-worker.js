@@ -8,11 +8,12 @@
 //   thread only uploads to the GPU. Latest-wins drop happens on the main side.
 // =============================================================================
 import initWasm, { decodeLidarFrame } from '../protocol/wasm_glue.js';
+import { initWithFallback } from '../wasm-fallback.js';
 
 let ready = false;
 const queued = [];
 
-initWasm()
+initWithFallback(initWasm, new URL('../protocol/wasm_glue_asm.js', import.meta.url))
   .then(() => {
     ready = true;
     for (const m of queued) decode(m);

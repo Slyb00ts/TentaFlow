@@ -373,6 +373,11 @@ find_android_ndk() {
   if [ -n "${ANDROID_NDK_ROOT:-}" ]; then candidates+=("$ANDROID_NDK_ROOT"); fi
   if [ -n "${ANDROID_HOME:-}" ]; then candidates+=("$ANDROID_HOME/ndk"/*); fi
   if [ -n "${ANDROID_SDK_ROOT:-}" ]; then candidates+=("$ANDROID_SDK_ROOT/ndk"/*); fi
+  # The NDK pinned in versions.env first: setup.sh installs it under the SDK
+  # root of this OS, and a globbed list would pick the oldest NDK found.
+  candidates+=("$HOME/Library/Android/sdk/ndk/${ANDROID_NDK_VERSION:-}")
+  candidates+=("$HOME/Android/Sdk/ndk/${ANDROID_NDK_VERSION:-}")
+  candidates+=("$HOME/Library/Android/sdk/ndk"/*)
   candidates+=("$HOME/Android/Sdk/ndk"/*)
   candidates+=("/opt/android-sdk/ndk"/*)
   candidates+=("/opt/android-ndk")
