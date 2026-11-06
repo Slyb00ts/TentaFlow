@@ -6595,7 +6595,7 @@ pub(super) fn plan_output_retry(
     transition.accepted_input = Some(accepted_input);
     transition.current_scope = job.scope_id.clone();
     let node = transition.node(&job.node_id)?.clone();
-    let ProcessNodeKind::ServiceTask { output_mapping, .. } = &node.kind else {
+    let ProcessNodeKind::ServiceTask { output_mapping, verification, .. } = &node.kind else {
         bail!("output retry targets another pinned activity kind")
     };
     let token = transition.tokens.iter()
@@ -6668,6 +6668,17 @@ pub(super) fn plan_output_retry(
     transition.resolve_boundary_incidents(&token.token_id);
     transition.resolve_incident(incident_id);
     transition.consume(&token.token_id);
+    // The condition was judged when the result was first accepted and stays that
+    // verdict: the mapping is what runs against the current variables, and a
+    // verdict that moved with them would make the same accepted result pass or
+    // fail by what happened to the run since.
+    if !matches!(verification, ActivityVerification::Human) {
+        transition.event(
+            "verification_passed",
+            Some(node.id.clone()),
+            verification_event_data(verification),
+        );
+    }
     for edge in transition.outgoing(&node.id) {
         transition.follow(&token, &edge)?;
     }
@@ -11769,7 +11780,7 @@ mod tests {
                 &old.job.instance_id,
                 &old.job.job_id,
                 incident.revision,
-            )
+            ).map(|outcome| outcome.instance)
             .unwrap();
             let new = repository::claim_job(
                 &fixture.db,
@@ -13040,7 +13051,7 @@ mod tests {
             &started.instance_id,
             &source.job.job_id,
             actual.instance.revision
-        )
+        ).map(|outcome| outcome.instance)
         .is_err());
         assert!(
             crate::db::repository::list_flow_executions_for_flow(&fixture.db, &other_flow, 10)

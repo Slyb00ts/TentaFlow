@@ -1342,7 +1342,8 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
 /// evidence and none overwrites another. A new row starts at `result_accepted`
 /// (its result is the previous generation's, byte for byte) instead of
 /// `input_captured`, and the trigger only lets it exist while the previous
-/// generation is `output_blocked` with the same input and result. The events a
+/// generation is `output_blocked` with the same input, the same accepted result
+/// in every field the update trigger protects, and the same owner. The events a
 /// generation points at are the first one's (the input capture and the
 /// accepted result), so the event and incident unique indexes widen by the
 /// generation; every other index and the evidence triggers stay as they were.
@@ -1396,7 +1397,26 @@ FOR EACH ROW BEGIN
                     AND p.result_event_id IS NEW.result_event_id
                     AND p.result_sha256 IS NEW.result_sha256
                     AND p.result_json IS NEW.result_json
-                    AND p.service_invocation_id IS NEW.service_invocation_id));
+                    AND p.service_invocation_id IS NEW.service_invocation_id
+                    AND p.group_id IS NEW.group_id AND p.ordinal IS NEW.ordinal
+                    AND p.selected_process_id IS NEW.selected_process_id
+                    AND p.body_path_json IS NEW.body_path_json
+                    AND p.result_presence IS NEW.result_presence
+                    AND p.result_sources_json IS NEW.result_sources_json
+                    AND p.source_instance_id IS NEW.source_instance_id
+                    AND p.source_event_id IS NEW.source_event_id
+                    AND p.accepted_origin IS NEW.accepted_origin
+                    AND p.retained_route_kind IS NEW.retained_route_kind
+                    AND p.retained_route_event_id IS NEW.retained_route_event_id
+                    AND p.retained_route_resource_id IS NEW.retained_route_resource_id
+                    AND p.resource_id IS NEW.resource_id
+                    AND p.resource_revision IS NEW.resource_revision
+                    AND p.child_scope_id IS NEW.child_scope_id
+                    AND p.call_id IS NEW.call_id
+                    AND p.child_instance_id IS NEW.child_instance_id
+                    AND p.child_expected_revision IS NEW.child_expected_revision
+                    AND p.child_status IS NEW.child_status
+                    AND p.parent_wait_token_id IS NEW.parent_wait_token_id));
 END;
 DROP TRIGGER bpmn_activity_io_witnesses_cas;
 CREATE TRIGGER bpmn_activity_io_witnesses_cas
@@ -19802,7 +19822,7 @@ mod tests {
         crate::processes::repository::retry_job(
             &pool, &actor, &command_stamp("retry the converted job"),
             "selected-instance", "failed-job", revision,
-        ).expect("a converted proved-no-effect job is retried through its incident");
+        ).map(|outcome| outcome.instance).expect("a converted proved-no-effect job is retried through its incident");
         let conn = pool.read().unwrap();
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM bpmn_incidents WHERE job_id='failed-job' AND resolved_at_ms IS NULL", [],
             |row| row.get::<_,i64>(0)).unwrap(), 0);
@@ -20791,6 +20811,52 @@ mod tests {
         aborted(retry_copy("io-w-1", "g-captured", 1, "{\"x\":1}"), "invalid activity IO retry generation");
         aborted(retry_copy("io-w-3", "g-other-result", 1, "{\"x\":2}"), "invalid activity IO retry generation");
         aborted(retry_copy("io-w-3", "g-skipped", 2, "{\"x\":1}"), "invalid activity IO retry generation");
+        // A copy that differs from the blocked row in any field the update trigger
+        // protects on an accepted result (or in who owns the activation) is refused
+        // by the insert trigger itself, whichever group the field is in.
+        let columns = "witness_id,instance_id,scope_id,token_id,node_id,activity_kind,phase_owner,group_id,occurrence_id,ordinal, \
+              definition_id,version,selected_process_id,body_path_json,model_sha256,io_spec_sha256,phase,generation,revision, \
+              input_event_id,input_values_json,input_sha256,result_event_id,source_instance_id,source_event_id, \
+              result_sources_json,result_presence,result_json,result_sha256,retained_route_kind,retained_route_event_id, \
+              retained_route_resource_id,accepted_origin,resource_id,resource_revision,service_invocation_id, \
+              child_scope_id,call_id,child_instance_id,child_expected_revision,child_status,parent_wait_token_id, \
+              created_at_ms,updated_at_ms";
+        let retry_copy_changing = |column: &str, literal: &str| {
+            let select = columns.split(',').map(str::trim).map(|name| match name {
+                "witness_id" => "'g-changed'".to_owned(),
+                "phase" => "'result_accepted'".to_owned(),
+                "generation" => "1".to_owned(),
+                "revision" => "1".to_owned(),
+                "created_at_ms" | "updated_at_ms" => "5".to_owned(),
+                name if name == column => literal.to_owned(),
+                name => name.to_owned(),
+            }).collect::<Vec<_>>().join(",");
+            conn.execute(&format!(
+                "INSERT INTO bpmn_activity_io_witnesses({columns}) \
+                 SELECT {select} FROM bpmn_activity_io_witnesses WHERE witness_id='io-w-3'"), [])
+        };
+        for (group, changes) in [
+            ("owner", &[("group_id", "'zz-changed'"), ("ordinal", "987654"),
+                ("selected_process_id", "'zz-changed'"), ("body_path_json", "'[\"zz\"]'")][..]),
+            ("accepted result", &[("result_presence", "'zz-changed'"), ("result_sources_json", "'[\"zz\"]'"),
+                ("source_instance_id", "'zz-changed'"), ("source_event_id", "'zz-changed'"),
+                ("accepted_origin", "'zz-changed'")][..]),
+            ("route and resource", &[("retained_route_kind", "'zz-changed'"),
+                ("retained_route_event_id", "'zz-changed'"), ("retained_route_resource_id", "'zz-changed'"),
+                ("resource_id", "'zz-changed'"), ("resource_revision", "987654")][..]),
+            ("child", &[("child_scope_id", "'zz-changed'"), ("call_id", "'zz-changed'"),
+                ("child_instance_id", "'zz-changed'"), ("child_expected_revision", "987654"),
+                ("child_status", "'zz-changed'"), ("parent_wait_token_id", "'zz-changed'")][..]),
+        ] {
+            for (column, literal) in changes {
+                let error = retry_copy_changing(column, literal)
+                    .expect_err(&format!("{group}: {column} is compared")).to_string();
+                assert!(error.contains("invalid activity IO retry generation"), "{group}: {column}: {error}");
+            }
+        }
+        assert_eq!(conn.query_row(
+            "SELECT COUNT(*) FROM bpmn_activity_io_witnesses WHERE witness_id='g-changed'", [],
+            |row| row.get::<_, i64>(0)).unwrap(), 0);
         assert_eq!(retry_copy("io-w-3", "g-one", 1, "{\"x\":1}").unwrap(), 1);
         assert!(retry_copy("io-w-3", "g-one-again", 1, "{\"x\":1}").is_err(),
             "one row per activation and generation");

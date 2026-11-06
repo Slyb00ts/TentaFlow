@@ -158,7 +158,7 @@ async fn who_is_offered_a_retry_follows_the_ground_of_reading_and_each_refusal_s
             &started.instance_id,
             &claim.job.job_id,
             instance.revision,
-        )
+        ).map(|outcome| outcome.instance)
         .unwrap_err();
         assert!(
             refused.downcast_ref::<ProcessOperationDenied>().is_some(),
@@ -178,7 +178,7 @@ async fn who_is_offered_a_retry_follows_the_ground_of_reading_and_each_refusal_s
             &started.instance_id,
             &claim.job.job_id,
             instance.revision,
-        )
+        ).map(|outcome| outcome.instance)
         .unwrap_err();
         assert!(
             is_not_found(&error) && error.downcast_ref::<ProcessOperationDenied>().is_none(),
@@ -213,7 +213,7 @@ async fn who_is_offered_a_retry_follows_the_ground_of_reading_and_each_refusal_s
             &started.instance_id,
             &claim.job.job_id,
             instance.revision,
-        )
+        ).map(|outcome| outcome.instance)
         .unwrap_err();
         assert!(
             refused.downcast_ref::<ProcessOperationDenied>().is_some(),
@@ -299,7 +299,7 @@ async fn an_inactive_initiator_and_a_second_ready_step_are_named_as_the_reason()
         &started.instance_id,
         &job_id,
         revision,
-    )
+    ).map(|outcome| outcome.instance)
     .unwrap_err();
     assert!(
         refused.downcast_ref::<ProcessOperationDenied>().is_some(),
@@ -476,7 +476,7 @@ async fn an_unknown_outcome_is_classified_for_the_owner_and_the_command_refuses_
         &started.instance_id,
         &claim.job.job_id,
         instance.revision,
-    )
+    ).map(|outcome| outcome.instance)
     .unwrap_err();
     assert!(
         refused.downcast_ref::<ProcessOperationDenied>().is_some(),
@@ -503,7 +503,7 @@ fn each_incident_code_shows_the_kind_and_reason_of_its_class_to_the_owner() {
             Some(Denied::OutcomeUncertain),
         ),
         ("ACTIVITY_IO_OUTPUT_FAILED", Kind::OutputMapping, Some(Denied::ResultNotRetained)),
-        ("SCRIPT_MAPPING_FAILED", Kind::OutputMapping, Some(Denied::ResultNotRetained)),
+        ("SCRIPT_MAPPING_FAILED", Kind::None, Some(Denied::SameFailureRepeats)),
         ("SERVICE_ERROR", Kind::Job, Some(Denied::NoProofOfNoEffect)),
         (
             "UNBOUND_IMPLEMENTATION",
@@ -628,7 +628,7 @@ async fn the_same_command_twice_makes_one_job() {
         &started.instance_id,
         &claim.job.job_id,
         instance.revision,
-    )
+    ).map(|outcome| outcome.instance)
     .unwrap();
     let second = repository::retry_job(
         &fixture.db,
@@ -637,7 +637,7 @@ async fn the_same_command_twice_makes_one_job() {
         &started.instance_id,
         &claim.job.job_id,
         instance.revision,
-    )
+    ).map(|outcome| outcome.instance)
     .unwrap();
     assert_eq!(
         (first.revision, first.status),
@@ -713,7 +713,7 @@ async fn a_retry_that_fails_again_keeps_the_one_incident_and_queues_no_second_no
             &started.instance_id,
             &job_id,
             instance.revision,
-        )
+        ).map(|outcome| outcome.instance)
         .unwrap();
         let during = incident_rows(&fixture);
         assert_eq!(
@@ -853,7 +853,7 @@ fn retried_after_a_delivered_notice(
         &started.instance_id,
         &first.job.job_id,
         instance.revision,
-    )
+    ).map(|outcome| outcome.instance)
     .unwrap();
     let claim = repository::claim_job(&fixture.db, label, now())
         .unwrap()

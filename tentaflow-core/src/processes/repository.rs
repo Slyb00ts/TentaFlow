@@ -5878,6 +5878,11 @@ fn output_retry_source_on(
     )?.query_map(params![instance_id, job_id], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let [(incident_id, code)] = open.as_slice() else { return Ok(Err(ResultNotRetained)) };
+    // A failed boundary event of this activation has its own open incident, and the
+    // validator would refuse a plan that resolves it as part of a mapping retry.
+    if boundary_incidents_on(conn, instance_id)?.iter().any(|link| link.token_id == token_id) {
+        return Ok(Err(ResultNotRetained));
+    }
     // A node with configured IO keeps a witness per attempt; one without keeps
     // only the incident and the events of its attempts.
     let witness: Option<(String, u32, Option<String>, Option<String>, String)> = conn.query_row(
@@ -5929,7 +5934,7 @@ fn retry_output_mapping_on(
     job_id: &str,
     expected_revision: u64,
     at_ms: i64,
-) -> Result<ProcessInstance> {
+) -> Result<ProcessTransitionOutcome> {
     let source = match output_retry_source_on(tx, instance_id, job_id)? {
         Ok(source) => source,
         Err(reason) => return Err(ProcessOperationDenied(retry_refusal_text(&ProcessIncidentRetry {
@@ -5960,15 +5965,26 @@ fn retry_output_mapping_on(
     match super::runtime::plan_output_retry(&snapshot, &job, &source.observed,
         &source.incident_id, at_ms, entry.clone())? {
         super::runtime::OutputRetryOutcome::Applied(plan) => {
-            apply_plan_on(tx, instance_id, &actor.user_id, expected_revision, &plan,
-                at_ms, None, EntryAuthority::Accepted(&entry), &[])?;
+            let mut cancelled_claims = apply_plan_on(tx, instance_id, &actor.user_id,
+                expected_revision, &plan, at_ms, None, EntryAuthority::Accepted(&entry), &[])?;
+            // The mapped result may open a Call or end the run, which closes children
+            // and cancels jobs: those follow from persisted facts, as in every entry point.
+            cancelled_claims.extend(apply_canonical_call_steps_on(tx, instance_id,
+                &actor.user_id, &plan, at_ms, ExecutionMode::Durable)?);
+            Ok(ProcessTransitionOutcome {
+                instance: observed_instance_on(tx, actor, instance_id, None)?,
+                cancelled_claims,
+            })
         }
         super::runtime::OutputRetryOutcome::Failed(failure) => {
             record_output_retry_failure_on(tx, instance_id, &source, generation, &failure,
                 stamp, expected_revision, at_ms)?;
+            Ok(ProcessTransitionOutcome {
+                instance: observed_instance_on(tx, actor, instance_id, None)?,
+                cancelled_claims: Vec::new(),
+            })
         }
     }
-    observed_instance_on(tx, actor, instance_id, None)
 }
 
 /// The record of a retry whose mapping failed again. Nothing about the run
@@ -6010,12 +6026,14 @@ fn record_output_retry_failure_on(
               input_event_id,input_values_json,input_sha256,result_event_id,source_instance_id,source_event_id, \
               result_sources_json,result_presence,result_json,result_sha256,retained_route_kind,retained_route_event_id, \
               retained_route_resource_id,accepted_origin,resource_id,resource_revision,service_invocation_id, \
+              child_scope_id,call_id,child_instance_id,child_expected_revision,child_status,parent_wait_token_id, \
               created_at_ms,updated_at_ms) \
              SELECT ?1,instance_id,scope_id,token_id,node_id,activity_kind,phase_owner,group_id,occurrence_id,ordinal, \
               definition_id,version,selected_process_id,body_path_json,model_sha256,io_spec_sha256,'result_accepted',?2,1, \
               input_event_id,input_values_json,input_sha256,result_event_id,source_instance_id,source_event_id, \
               result_sources_json,result_presence,result_json,result_sha256,retained_route_kind,retained_route_event_id, \
-              retained_route_resource_id,accepted_origin,resource_id,resource_revision,service_invocation_id,?3,?3 \
+              retained_route_resource_id,accepted_origin,resource_id,resource_revision,service_invocation_id, \
+              child_scope_id,call_id,child_instance_id,child_expected_revision,child_status,parent_wait_token_id,?3,?3 \
              FROM bpmn_activity_io_witnesses \
              WHERE instance_id=?4 AND scope_id=?5 AND token_id=?6 AND node_id=?7 AND phase_owner='ordinary' \
                AND generation=?8 AND phase='output_blocked' AND incident_id=?9",
@@ -12955,7 +12973,23 @@ fn validate_termination_action_provenance_on(
                         && plan.events.iter().any(|event| event.kind == "service_result"
                             && event.scope_id == source.scope_id
                             && event.node_id.as_deref() == Some(source.node_id.as_str()));
-                    human || service
+                    // An accepted result mapped again: the job finished long ago, so no
+                    // running job is completed; the retry's own typed entry is the proof.
+                    let retried = matches!(&pinned.kind, ProcessNodeKind::ServiceTask { .. })
+                        && (matches!(entry, EntryAuthority::Accepted(
+                            AcceptedInputRef::OutputRetry { token_id, .. }) if token_id == source_id)
+                        || plan.termination_attempts.iter().any(|attempt| {
+                            let input = match attempt {
+                                TerminationAttempt::Success(source) => &source.accepted_input,
+                                TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                            };
+                            matches!(input, AcceptedInputRef::OutputRetry { token_id, .. }
+                                if token_id == source_id)
+                        }))
+                        && plan.events.iter().any(|event| event.kind == "output_retried"
+                            && event.scope_id == source.scope_id
+                            && event.node_id.as_deref() == Some(source.node_id.as_str()));
+                    human || service || retried
                 }
                 ProcessNodeKind::ManualTask { .. } => plan.complete_user_task_ids.iter().any(|id|
                     matches!(entry, EntryAuthority::Accepted(
@@ -14479,17 +14513,55 @@ fn validate_termination_action_provenance_on(
                                 })))
                     && plan.events.iter().filter(|candidate| candidate.kind == "service_result").count() == 1)
             }
+            "output_retried" => {
+                let retry = plan.termination_attempts.iter().find_map(|attempt| {
+                    let input = match attempt {
+                        TerminationAttempt::Success(source) => &source.accepted_input,
+                        TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
+                    };
+                    match input {
+                        AcceptedInputRef::OutputRetry { .. } => Some(input),
+                        _ => None,
+                    }
+                }).or_else(|| match entry {
+                    EntryAuthority::Accepted(input @ AcceptedInputRef::OutputRetry { .. })
+                        if plan.termination_attempts.is_empty() => Some(input),
+                    _ => None,
+                });
+                matches!(retry, Some(AcceptedInputRef::OutputRetry {
+                    job_id, invocation_id, token_id, generation, command_id, request_hash, ..
+                }) if plan.events.iter().filter(|candidate| candidate.kind == "output_retried").count() == 1
+                    && event.data["incident_id"].as_str().is_some_and(|incident_id|
+                        plan.resolve_incident_ids.iter().any(|id| id == incident_id)
+                        && tx.query_row(
+                            "SELECT COUNT(*) FROM bpmn_incidents WHERE instance_id=?1 AND incident_id=?2 AND job_id=?3 AND resolved_at_ms IS NULL",
+                            params![instance_id, incident_id, job_id],
+                            |row| row.get::<_, i64>(0)).is_ok_and(|open| open == 1)
+                        && event.data == serde_json::json!({
+                            "incident_id":incident_id,"job_id":job_id,
+                            "invocation_id":invocation_id,"activation_token_id":token_id,
+                            "generation":generation,"command_id":command_id,
+                            "request_hash":request_hash}))
+                    && tx.query_row(
+                        "SELECT scope_id,node_id FROM bpmn_jobs WHERE instance_id=?1 AND job_id=?2 AND token_id=?3 AND status='completed'",
+                        params![instance_id, job_id, token_id],
+                        |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?)))
+                        .is_ok_and(|(scope, node_id)| scope == event.scope_id
+                            && node == Some(node_id.as_str())))
+            }
             "verification_passed" | "verification_withdrawn" => {
             let service_job_id = plan.termination_attempts.iter().find_map(|attempt| {
                 match match attempt {
                     TerminationAttempt::Success(source) => &source.accepted_input,
                     TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
                 } {
-                    AcceptedInputRef::Service { job_id, .. } => Some(job_id.as_str()),
+                    AcceptedInputRef::Service { job_id, .. }
+                    | AcceptedInputRef::OutputRetry { job_id, .. } => Some(job_id.as_str()),
                     _ => None,
                 }
             }).or_else(|| match entry {
-                EntryAuthority::Accepted(AcceptedInputRef::Service { job_id, .. })
+                EntryAuthority::Accepted(AcceptedInputRef::Service { job_id, .. }
+                    | AcceptedInputRef::OutputRetry { job_id, .. })
                     if plan.termination_attempts.is_empty() => Some(job_id.as_str()),
                 _ => None,
             });
@@ -14498,11 +14570,14 @@ fn validate_termination_action_provenance_on(
                     TerminationAttempt::Success(source) => &source.accepted_input,
                     TerminationAttempt::ReturnFailure(failure) => &failure.accepted_input,
                 };
-                matches!(input, AcceptedInputRef::Service { .. })
+                matches!(input, AcceptedInputRef::Service { .. }
+                    | AcceptedInputRef::OutputRetry { .. })
             }) || plan.termination_attempts.is_empty()
-                && matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::Service { .. })))
+                && matches!(entry, EntryAuthority::Accepted(AcceptedInputRef::Service { .. }
+                    | AcceptedInputRef::OutputRetry { .. })))
                 && plan.events.iter().enumerate().any(|(index, prior)|
-                    index < event_index && prior.kind == "service_result"
+                    index < event_index
+                        && matches!(prior.kind.as_str(), "service_result" | "output_retried")
                         && prior.scope_id == event.scope_id && prior.node_id == event.node_id)
                 && plan.events.iter().filter(|candidate| candidate.kind == event.kind
                 && candidate.scope_id == event.scope_id && candidate.node_id == event.node_id).count() == 1
@@ -29971,7 +30046,7 @@ pub fn retry_job(
     instance_id: &str,
     job_id: &str,
     expected_revision: u64,
-) -> Result<ProcessInstance> {
+) -> Result<ProcessTransitionOutcome> {
     let at_ms = now_ms()?;
     let mut conn = pool.write()?;
     let tx = conn.transaction()?;
@@ -30001,7 +30076,10 @@ pub fn retry_job(
         ).into());
     }
     if let Some(prior) = command_replay::<StoredInstanceIdentity>(&tx, actor, stamp)? {
-        return observed_instance_on(&tx, actor, &prior.instance_id, None);
+        return Ok(ProcessTransitionOutcome {
+            instance: observed_instance_on(&tx, actor, &prior.instance_id, None)?,
+            cancelled_claims: Vec::new(),
+        });
     }
     ensure!(instance.revision == expected_revision
         && instance.status == ProcessInstanceStatus::Incident,
@@ -30018,11 +30096,11 @@ pub fn retry_job(
             return Err(ProcessOperationDenied(retry_refusal_text(&retry)).into());
         }
         if retry.kind == ProcessRetryKind::OutputMapping {
-            let result = retry_output_mapping_on(&tx, actor, stamp, instance_id, job_id,
+            let outcome = retry_output_mapping_on(&tx, actor, stamp, instance_id, job_id,
                 expected_revision, at_ms)?;
-            store_command(&tx, actor, stamp, &result, at_ms)?;
+            store_command(&tx, actor, stamp, &outcome.instance, at_ms)?;
             tx.commit()?;
-            return Ok(result);
+            return Ok(outcome);
         }
     }
     ensure!(job_direct_retryable_on(&tx, job_id, instance_id)?,
@@ -30069,7 +30147,7 @@ pub fn retry_job(
     let result = observed_instance_on(&tx, actor, instance_id, None)?;
     store_command(&tx, actor, stamp, &result, at_ms)?;
     tx.commit()?;
-    Ok(result)
+    Ok(ProcessTransitionOutcome { instance: result, cancelled_claims: Vec::new() })
 }
 
 /// What recovery knows about the initiator's right to an addon tool.

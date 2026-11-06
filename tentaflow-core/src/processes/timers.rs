@@ -2780,7 +2780,7 @@ mod tests {
             &started.instance_id,
             &claim.job.job_id,
             after.instance.revision
-        )
+        ).map(|outcome| outcome.instance)
         .is_err());
         let replay = repository::accept_job_result(
             &fixture.db,

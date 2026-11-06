@@ -47,7 +47,7 @@ pub(super) fn classify_code(code: &str) -> Option<RetryClass> {
 
         "EXTERNAL_OUTCOME_UNCERTAIN" | "EXTERNAL_RESULT_NOT_APPLIED" => JobUncertain,
 
-        "ACTIVITY_IO_OUTPUT_FAILED" | "SCRIPT_MAPPING_FAILED" => OutputMapping,
+        "ACTIVITY_IO_OUTPUT_FAILED" => OutputMapping,
 
         "SOURCE_ACCESS_REVOKED" | "SEND_ADMISSION_AUTHORITY_DENIED" => {
             Never(Denied::SourceUnavailable)
@@ -78,6 +78,7 @@ pub(super) fn classify_code(code: &str) -> Option<RetryClass> {
         | "RESULT_REJECTED"
         | "SCOPE_LIMIT"
         | "SCRIPT_EVALUATION_FAILED"
+        | "SCRIPT_MAPPING_FAILED"
         | "SIGNAL_MAPPING_FAILED"
         | "SIGNAL_PAYLOAD_FAILED"
         | "SIGNAL_PAYLOAD_LIMIT"
@@ -229,13 +230,16 @@ mod tests {
                 "{code}"
             );
         }
-        for code in ["ACTIVITY_IO_OUTPUT_FAILED", "SCRIPT_MAPPING_FAILED"] {
-            assert_eq!(
-                classify_code(code),
-                Some(RetryClass::OutputMapping),
-                "{code}"
-            );
-        }
+        assert_eq!(
+            classify_code("ACTIVITY_IO_OUTPUT_FAILED"),
+            Some(RetryClass::OutputMapping)
+        );
+        // A script's result is not a retained job result, so its mapping is never
+        // offered again and says the same data fails the same way.
+        assert_eq!(
+            classify_code("SCRIPT_MAPPING_FAILED"),
+            Some(RetryClass::Never(ProcessRetryDenied::SameFailureRepeats))
+        );
         for code in [
             "SERVICE_ERROR",
             "FLOW_ERROR",

@@ -2017,7 +2017,7 @@ async fn a_start_time_failure_incident_does_not_block_the_retry_of_the_next_star
         &started.instance_id,
         &claimed.job.job_id,
         current.revision,
-    )
+    ).map(|outcome| outcome.instance)
     .expect("exactly one open incident, so the retry is allowed");
 }
 

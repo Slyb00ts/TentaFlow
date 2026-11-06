@@ -965,7 +965,7 @@ pub fn process_dispatch(
             job_id,
             expected_revision,
         } => {
-            let instance = repository::retry_job(
+            let outcome = repository::retry_job(
                 pool,
                 &actor,
                 &stamp(payload, command_id)?,
@@ -975,9 +975,10 @@ pub fn process_dispatch(
             )
             .map_err(error)?;
             if let Some(executor) = ctx.state.router.flow_dispatcher() {
+                runtime::signal_cancelled_claims(executor, &outcome.cancelled_claims);
                 runtime::wake(executor);
             }
-            P::JobRetryResponse { instance }
+            P::JobRetryResponse { instance: outcome.instance }
         }
         P::HistoryRequest {
             instance_id,

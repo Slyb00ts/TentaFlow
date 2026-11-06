@@ -95,7 +95,7 @@ fn a_monitor_reads_names_and_types_never_values_and_cannot_operate() {
     assert!(!events.is_empty() && events.iter().all(|event| event.data.is_null()));
 
     let retry = repository::retry_job(&fixture.db, &monitor, &stamp("monitor retry"),
-        &started.instance_id, "any-job", seen.revision).unwrap_err();
+        &started.instance_id, "any-job", seen.revision).map(|outcome| outcome.instance).unwrap_err();
     assert!(retry.downcast_ref::<ProcessOperationDenied>().is_some(), "{retry}");
     assert!(repository::cancel_instance(&fixture.db, &monitor, &stamp("monitor cancel"),
         &started.instance_id, seen.revision).is_err());
@@ -204,7 +204,7 @@ async fn can_retry_is_one_projection_for_the_detail_the_incident_and_the_list() 
     let revision = repository::get_instance(&fixture.db, &steward, &started.instance_id, None).unwrap().revision;
     for asker in [&steward, &fixture.owner] {
         let refused = repository::retry_job(&fixture.db, asker, &stamp("retry after the move"),
-            &started.instance_id, &claim.job.job_id, revision).unwrap_err();
+            &started.instance_id, &claim.job.job_id, revision).map(|outcome| outcome.instance).unwrap_err();
         assert!(refused.downcast_ref::<ProcessOperationDenied>().is_some()
             || refused.downcast_ref::<ProcessAuthorityDenied>().is_some(), "{refused}");
     }
@@ -330,7 +330,7 @@ async fn a_retry_in_the_name_of_an_initiator_who_lost_the_definition_is_refused_
     assert_eq!(seen.access, Some(ProcessInstanceAccess::Owner));
     assert!(!seen.can_retry && !seen.incidents[0].can_retry);
     let refused = repository::retry_job(&fixture.db, &steward, &stamp("steward asks"),
-        &started.instance_id, &claim.job.job_id, seen.revision).unwrap_err();
+        &started.instance_id, &claim.job.job_id, seen.revision).map(|outcome| outcome.instance).unwrap_err();
     assert!(refused.downcast_ref::<ProcessOperationDenied>().is_some(), "{refused}");
     let after = repository::get_instance(&fixture.db, &steward, &started.instance_id, None).unwrap();
     assert_eq!((after.revision, after.status), (seen.revision, ProcessInstanceStatus::Incident));
@@ -343,7 +343,7 @@ async fn a_retry_in_the_name_of_an_initiator_who_lost_the_definition_is_refused_
     let inactive = repository::get_instance(&fixture.db, &steward, &started.instance_id, None).unwrap();
     assert!(!inactive.can_retry && !inactive.incidents[0].can_retry);
     let refused = repository::retry_job(&fixture.db, &steward, &stamp("steward asks again"),
-        &started.instance_id, &claim.job.job_id, seen.revision).unwrap_err();
+        &started.instance_id, &claim.job.job_id, seen.revision).map(|outcome| outcome.instance).unwrap_err();
     assert!(refused.downcast_ref::<ProcessOperationDenied>().is_some(), "{refused}");
 }
 
@@ -365,7 +365,7 @@ async fn another_ready_activation_takes_the_retry_offer_back() {
     let blocked = read();
     assert!(!blocked.can_retry && !blocked.incidents[0].can_retry);
     assert!(repository::retry_job(&fixture.db, &fixture.owner, &stamp("blocked retry"),
-        &started.instance_id, &claim.job.job_id, blocked.revision).is_err());
+        &started.instance_id, &claim.job.job_id, blocked.revision).map(|outcome| outcome.instance).is_err());
 }
 
 #[test]

@@ -1651,7 +1651,7 @@ mod tests {
             [&old.job.job_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
         assert_eq!(old_invocation.1, "proved_no_effect");
         repository::retry_job(&fixture.db, &fixture.owner, &stamp("retry selected service"),
-            &started.instance_id, &old.job.job_id, incident.revision).unwrap();
+            &started.instance_id, &old.job.job_id, incident.revision).map(|outcome| outcome.instance).unwrap();
         let claimed = repository::claim_job(&fixture.db, "selected-worker", now_ms()).unwrap().unwrap();
         assert_ne!(claimed.job.job_id, old.job.job_id);
         assert_ne!(claimed.job.token_id, old.job.token_id);
@@ -1719,7 +1719,7 @@ mod tests {
             &started.instance_id, None).unwrap();
         assert!(incident.can_retry);
         repository::retry_job(&fixture.db, &fixture.owner, &stamp("retry fresh boundary"),
-            &started.instance_id, &old.job.job_id, incident.revision).unwrap();
+            &started.instance_id, &old.job.job_id, incident.revision).map(|outcome| outcome.instance).unwrap();
         let after = repository::runtime_snapshot(&fixture.db, &fixture.owner,
             &started.instance_id).unwrap();
         let old_after = after.timers.iter().find(|timer| timer.timer_id == old_timer.timer_id).unwrap();
@@ -1812,7 +1812,7 @@ mod tests {
             &started.instance_id,
             &first.job.job_id,
             rejected.revision,
-        ).is_err());
+        ).map(|outcome| outcome.instance).is_err());
         let retained = repository::get_instance(&fixture.db, &fixture.owner,
             &started.instance_id, None).unwrap();
         assert_eq!(retained.status, ProcessInstanceStatus::Incident);
@@ -1900,7 +1900,7 @@ mod tests {
             &started.instance_id,
             &claim.job.job_id,
             accepted.revision,
-        )
+        ).map(|outcome| outcome.instance)
         .is_err());
         assert_eq!(
             repository::get_instance(&db, &actor, &started.instance_id, None)
@@ -1989,7 +1989,7 @@ mod tests {
         assert!(!state.can_retry);
         assert!(repository::retry_job(&fixture.db, &fixture.owner,
             &stamp("deny blocked Service retry"), &started.instance_id,
-            &claim.job.job_id, state.revision).is_err());
+            &claim.job.job_id, state.revision).map(|outcome| outcome.instance).is_err());
         }
     }
 
@@ -2021,7 +2021,7 @@ mod tests {
             .unwrap().is_none());
         assert!(repository::retry_job(&fixture.db, &fixture.owner,
             &stamp("deny uncertain Service retry"), &started.instance_id,
-            &claim.job.job_id, uncertain.revision).is_err());
+            &claim.job.job_id, uncertain.revision).map(|outcome| outcome.instance).is_err());
         assert!(matches!(repository::record_job_observation(&fixture.db, &claim,
             "original-worker", &observed, now_ms()).unwrap(),
             repository::JobObservationState::Observed));
@@ -2384,10 +2384,10 @@ mod tests {
         assert!(state.can_retry);
         let retry_stamp = stamp("retry proven pre-dispatch failure");
         let retried = repository::retry_job(&fixture.db, &fixture.owner,
-            &retry_stamp, &started.instance_id, &claim.job.job_id, state.revision).unwrap();
+            &retry_stamp, &started.instance_id, &claim.job.job_id, state.revision).map(|outcome| outcome.instance).unwrap();
         assert_eq!(retried.status, ProcessInstanceStatus::Running);
         let replay = repository::retry_job(&fixture.db, &fixture.owner,
-            &retry_stamp, &started.instance_id, &claim.job.job_id, state.revision).unwrap();
+            &retry_stamp, &started.instance_id, &claim.job.job_id, state.revision).map(|outcome| outcome.instance).unwrap();
         assert_eq!(replay.revision, retried.revision);
         let replacement = repository::claim_job(&fixture.db, "replacement-worker", now_ms())
             .unwrap().unwrap();
@@ -2468,7 +2468,7 @@ mod tests {
             &started.instance_id,
             job_id,
             denied.revision,
-        )
+        ).map(|outcome| outcome.instance)
         .unwrap();
         let claim = repository::claim_job(&fixture.db, "cancelled-worker", now_ms())
             .unwrap()
@@ -2839,7 +2839,7 @@ mod tests {
             &started.instance_id,
             &first.job.job_id,
             current.revision,
-        ).is_err());
+        ).map(|outcome| outcome.instance).is_err());
         let current =
             repository::get_instance(&fixture.db, &fixture.owner, &started.instance_id, None)
                 .unwrap();
@@ -2873,7 +2873,7 @@ mod tests {
         assert!(!current.instance.can_retry);
         assert!(repository::retry_job(&fixture.db, &fixture.owner,
             &stamp("deny repeated oversized external output"), &started.instance_id,
-            &current.jobs[0].job_id, current.instance.revision).is_err());
+            &current.jobs[0].job_id, current.instance.revision).map(|outcome| outcome.instance).is_err());
         assert!(
             current.instance.user_tasks.is_empty(),
             "oversized output is not a fictitious verification success"
@@ -2965,7 +2965,7 @@ mod tests {
             &fixture.db, &flow_id, 10).unwrap().is_empty());
         repository::retry_job(&fixture.db, &fixture.owner,
             &stamp("retry proved no effect after long failure"), &started.instance_id,
-            &claim.job.job_id, current.revision).unwrap();
+            &claim.job.job_id, current.revision).map(|outcome| outcome.instance).unwrap();
         let fresh = repository::claim_job(&fixture.db, "replacement-worker", now_ms())
             .unwrap().unwrap();
         assert_ne!(fresh.job.job_id, claim.job.job_id);
@@ -3050,7 +3050,7 @@ mod tests {
                 &started.instance_id,
                 &current.jobs[0].job_id,
                 current.instance.revision
-            )
+            ).map(|outcome| outcome.instance)
             .is_err());
             if let Some(claim) = &claim {
                 assert!(!repository::renew_job_lease(
@@ -3387,7 +3387,7 @@ mod tests {
                     &started.instance_id,
                     &claim.job.job_id,
                     rejected.revision
-                )
+                ).map(|outcome| outcome.instance)
                 .is_err());
             }
         }
@@ -3493,7 +3493,7 @@ mod tests {
             &started.instance_id,
             &claim.job.job_id,
             current.instance.revision
-        )
+        ).map(|outcome| outcome.instance)
         .is_err());
     }
 
@@ -4812,7 +4812,7 @@ mod tests {
                 &started.instance_id,
                 &claim.job.job_id,
                 state.instance.revision
-            )
+            ).map(|outcome| outcome.instance)
             .is_err());
             let history =
                 repository::list_events(&fixture.db, &fixture.owner, &started.instance_id, 0, 200)
@@ -5207,7 +5207,7 @@ mod tests {
             assert!(!rejected.can_retry);
             assert!(repository::retry_job(&fixture.db, &fixture.owner,
                 &stamp("accepted verification cannot redispatch"), &started.instance_id,
-                &claim.job.job_id, rejected.revision).is_err());
+                &claim.job.job_id, rejected.revision).map(|outcome| outcome.instance).is_err());
         }
         assert_eq!(claimed_nodes.len(), 21);
         use tentaflow_protocol::processes::{ProcessInstancePageRequest, ProcessPageSpec};

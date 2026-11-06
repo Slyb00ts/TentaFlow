@@ -1,14 +1,16 @@
 // ============ File: output_retry_tests.rs — BPMN B4.5 applying an accepted Service result again: same result, current variables, no second execution ============
 
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use tentaflow_protocol::processes::{
     ActivityVerification, ProcessActivityIo, ProcessBodyModeling, ProcessDataObject,
     ProcessDataObjectReference, ProcessInstance, ProcessInstanceStatus, ProcessIoDataOutput,
-    ProcessModel, ProcessNodeKind, ProcessOutputAssociation, ProcessRetryDenied, ProcessRetryKind,
+    ProcessModel, ProcessNode, ProcessNodeKind, ProcessOutputAssociation, ProcessRetryDenied,
+    ProcessRetryKind,
 };
 use tokio_util::sync::CancellationToken;
 
-use super::jobs;
+use super::{call_tests, jobs, messages};
 use super::monitor_tests::{is_not_found, member};
 use super::repository::{self, ProcessOperationDenied};
 use super::runtime::test_support::*;
@@ -116,19 +118,39 @@ fn count(fixture: &Fixture, sql: &str, instance_id: &str) -> i64 {
         .unwrap()
 }
 
+fn retry_command(
+    fixture: &Fixture,
+    blocked: &ProcessInstance,
+    job_id: &str,
+    command: &repository::CommandStamp,
+) -> anyhow::Result<repository::ProcessTransitionOutcome> {
+    repository::retry_job(
+        &fixture.db,
+        &fixture.owner,
+        command,
+        &blocked.instance_id,
+        job_id,
+        blocked.revision,
+    )
+}
+
 fn retry(
     fixture: &Fixture,
     blocked: &ProcessInstance,
     job_id: &str,
     label: &str,
 ) -> anyhow::Result<ProcessInstance> {
-    repository::retry_job(
-        &fixture.db,
-        &fixture.owner,
-        &stamp(label),
-        &blocked.instance_id,
-        job_id,
-        blocked.revision,
+    retry_command(fixture, blocked, job_id, &stamp(label)).map(|outcome| outcome.instance)
+}
+
+/// What a replayed command must not move: events, witness rows and the revision.
+fn footprint(fixture: &Fixture, instance_id: &str) -> (i64, i64, i64, i64) {
+    let one = |sql: &str| count(fixture, sql, instance_id);
+    (
+        one("SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1"),
+        one("SELECT COUNT(*) FROM bpmn_events WHERE instance_id=?1 AND kind IN ('output_retried','output_retry_failed')"),
+        one("SELECT COUNT(*) FROM bpmn_activity_io_witnesses WHERE instance_id=?1"),
+        one("SELECT revision FROM bpmn_instances WHERE instance_id=?1"),
     )
 }
 
@@ -171,10 +193,21 @@ async fn a_blocked_mapping_is_applied_again_to_the_current_variables_without_run
     );
 
     set_divisor(&fixture, &instance_id, 2);
-    let done = retry(&fixture, &blocked.instance, &blocked.job_id, "apply again").unwrap();
+    let command = stamp("apply again");
+    let done = retry_command(&fixture, &blocked.instance, &blocked.job_id, &command)
+        .unwrap()
+        .instance;
     assert_eq!(done.status, ProcessInstanceStatus::Completed);
     assert_eq!(done.variables["mapped"], json!(5));
     assert_eq!(done.variables["answer"], json!("work done"));
+    let kinds = history_kinds(&fixture, &instance_id);
+    let retried = kinds.iter().position(|kind| kind == "output_retried").unwrap();
+    assert_eq!(
+        kinds.iter().filter(|kind| *kind == "verification_passed").count(),
+        1,
+        "the verification verdict given when the result was accepted is recorded as passed once the result is mapped"
+    );
+    assert!(kinds.iter().rposition(|kind| kind == "verification_passed").unwrap() > retried);
     assert!(done.incidents.iter().all(|incident| incident.retry.kind
         != ProcessRetryKind::OutputMapping
         || !incident.can_retry));
@@ -241,19 +274,15 @@ async fn a_blocked_mapping_is_applied_again_to_the_current_variables_without_run
         ]
     );
 
-    // The same command answers again with the same instance.
-    let replay = repository::retry_job(
-        &fixture.db,
-        &fixture.owner,
-        &stamp("apply again"),
-        &instance_id,
-        &blocked.job_id,
-        blocked.instance.revision,
-    );
-    assert!(
-        replay.is_err(),
-        "a different stamp is a different command, and the incident is closed"
-    );
+    // The same command answers again with the same instance and writes nothing.
+    let settled = footprint(&fixture, &instance_id);
+    let replay = retry_command(&fixture, &blocked.instance, &blocked.job_id, &command)
+        .unwrap();
+    assert_eq!(replay.instance, done);
+    assert!(replay.cancelled_claims.is_empty());
+    assert_eq!(footprint(&fixture, &instance_id), settled);
+    // Another command on the closed incident is refused instead.
+    assert!(retry(&fixture, &blocked.instance, &blocked.job_id, "apply again").is_err());
 }
 
 #[tokio::test]
@@ -274,13 +303,18 @@ async fn a_failing_retry_keeps_the_one_incident_and_stops_at_the_limit() {
 
     let mut current = blocked.instance.clone();
     for attempt in 1..=5 {
-        let after = retry(
-            &fixture,
-            &current,
-            &blocked.job_id,
-            &format!("failing {attempt}"),
-        )
-        .unwrap();
+        let command = stamp(&format!("failing {attempt}"));
+        let after = retry_command(&fixture, &current, &blocked.job_id, &command)
+            .unwrap()
+            .instance;
+        if attempt == 1 {
+            // A failed attempt is a command too: its replay answers the same and adds
+            // no event and no witness generation.
+            let settled = footprint(&fixture, &instance_id);
+            let replay = retry_command(&fixture, &current, &blocked.job_id, &command).unwrap();
+            assert_eq!(replay.instance, after);
+            assert_eq!(footprint(&fixture, &instance_id), settled);
+        }
         assert_eq!(
             after.status,
             ProcessInstanceStatus::Incident,
@@ -377,7 +411,7 @@ async fn only_the_initiator_applies_the_result_again_and_a_stranger_cannot_tell_
         &blocked.instance.instance_id,
         &blocked.job_id,
         seen.revision,
-    )
+    ).map(|outcome| outcome.instance)
     .unwrap_err();
     assert!(
         refused.downcast_ref::<ProcessOperationDenied>().is_some(),
@@ -391,7 +425,7 @@ async fn only_the_initiator_applies_the_result_again_and_a_stranger_cannot_tell_
         &blocked.instance.instance_id,
         &blocked.job_id,
         seen.revision,
-    )
+    ).map(|outcome| outcome.instance)
     .unwrap_err();
     assert!(is_not_found(&hidden), "{hidden}");
     assert_eq!(
@@ -484,4 +518,314 @@ async fn a_failing_verification_condition_is_not_a_mapping_and_is_not_applied_ag
         refused.downcast_ref::<ProcessOperationDenied>().is_some(),
         "{refused}"
     );
+}
+
+fn history_kinds(fixture: &Fixture, instance_id: &str) -> Vec<String> {
+    repository::list_events(&fixture.db, &fixture.owner, instance_id, 0, 200)
+        .unwrap()
+        .0
+        .into_iter()
+        .map(|event| event.kind)
+        .collect()
+}
+
+/// The blocked Service step followed by a call of `target`, then the end.
+fn caller_after_service(
+    flow_id: &str,
+    target: &tentaflow_protocol::processes::ProcessVersion,
+) -> ProcessModel {
+    let mut model = model_with(
+        flow_id,
+        "10 / vars.divisor",
+        ActivityVerification::Condition {
+            expression: "true".into(),
+        },
+    );
+    let call = call_tests::caller(target, BTreeMap::new())
+        .nodes
+        .into_iter()
+        .find(|node| node.id == "Call_1")
+        .unwrap();
+    model.nodes.insert(2, call);
+    model.sequence_flows = vec![
+        edge("ToService", "Start_1", "Service"),
+        edge("ToCall", "Service", "Call_1"),
+        edge("CallEnd", "Call_1", "End_1"),
+    ];
+    model
+}
+
+async fn run_claimed(fixture: &Fixture, label: &str) -> String {
+    let claim = repository::claim_job(&fixture.db, label, now())
+        .unwrap()
+        .unwrap();
+    let job_id = claim.job.job_id.clone();
+    jobs::execute_claimed(
+        &fixture.db,
+        fixture.dispatcher(),
+        label,
+        claim,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    job_id
+}
+
+#[tokio::test]
+async fn a_retry_that_reaches_a_call_starts_the_child_and_the_parent_resumes_when_it_returns() {
+    for child_has_service in [false, true] {
+        let fixture = Fixture::new();
+        let flow_id = flow(&fixture.db, &fixture.owner, &graph("call after retry", None));
+        let child_model = if child_has_service {
+            service_model(
+                &flow_id,
+                ActivityVerification::Condition {
+                    expression: "true".into(),
+                },
+            )
+        } else {
+            super::model::starter_model()
+        };
+        let target = publish_model(&fixture, &child_model);
+        let parent_version = publish_model(&fixture, &caller_after_service(&flow_id, &target));
+        let parent = messages::test_support::start_version(&fixture, &parent_version);
+        let job_id = run_claimed(&fixture, "call-parent").await;
+        let blocked = reload(&fixture, &parent.instance_id);
+        assert_eq!(blocked.status, ProcessInstanceStatus::Incident);
+        assert!(
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &parent.instance_id)
+                .unwrap()
+                .calls
+                .is_empty(),
+            "the call is not reached while the mapping is blocked"
+        );
+
+        set_divisor(&fixture, &parent.instance_id, 2);
+        let done = retry(&fixture, &blocked, &job_id, "retry into a call").unwrap();
+        let child_id = call_tests::child_id(&fixture, &parent.instance_id);
+        let child = reload(&fixture, &child_id);
+        if child_has_service {
+            let open = |status: ProcessInstanceStatus| {
+                matches!(status, ProcessInstanceStatus::Running | ProcessInstanceStatus::Waiting)
+            };
+            assert!(open(done.status.clone()), "{:?}", done.status);
+            assert!(open(child.status.clone()), "{:?}", child.status);
+            run_claimed(&fixture, "call-child").await;
+            assert_eq!(
+                reload(&fixture, &child_id).status,
+                ProcessInstanceStatus::Completed
+            );
+        } else {
+            assert_eq!(child.status, ProcessInstanceStatus::Completed);
+        }
+        assert_eq!(
+            reload(&fixture, &parent.instance_id).status,
+            ProcessInstanceStatus::Completed,
+            "the call token resumed the parent (child has a service step: {child_has_service})"
+        );
+        assert_eq!(
+            repository::runtime_snapshot(&fixture.db, &fixture.owner, &parent.instance_id)
+                .unwrap()
+                .calls
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_retry_that_reaches_a_terminate_end_cancels_the_running_job_of_a_parallel_branch() {
+    let fixture = Fixture::new();
+    let flow_id = flow(&fixture.db, &fixture.owner, &graph("terminate after retry", None));
+    let mut model = model_with(
+        &flow_id,
+        "10 / vars.divisor",
+        ActivityVerification::Condition {
+            expression: "true".into(),
+        },
+    );
+    let ProcessNodeKind::ServiceTask { .. } = &model
+        .nodes
+        .iter()
+        .find(|node| node.id == "Service")
+        .unwrap()
+        .kind
+    else {
+        unreachable!()
+    };
+    let mut other = model.nodes.iter().find(|node| node.id == "Service").unwrap().clone();
+    other.id = "Other".into();
+    other.activity_io = None;
+    if let ProcessNodeKind::ServiceTask { output_mapping, .. } = &mut other.kind {
+        output_mapping.clear();
+    }
+    model.nodes.iter_mut().find(|node| node.id == "End_1").unwrap().kind =
+        ProcessNodeKind::TerminateEnd;
+    for (id, kind) in [
+        ("Split", ProcessNodeKind::ParallelGateway),
+        ("End_2", ProcessNodeKind::TerminateEnd),
+    ] {
+        model.nodes.push(ProcessNode {
+            id: id.into(),
+            name: id.into(),
+            kind,
+            repeat: None,
+            activity_io: None,
+        });
+    }
+    model.nodes.push(other);
+    model.sequence_flows = vec![
+        edge("ToSplit", "Start_1", "Split"),
+        edge("SplitService", "Split", "Service"),
+        edge("SplitOther", "Split", "Other"),
+        edge("ServiceEnd", "Service", "End_1"),
+        edge("OtherEnd", "Other", "End_2"),
+    ];
+    let started = start_model(&fixture, &model);
+
+    let first = repository::claim_job(&fixture.db, "terminate-a", now())
+        .unwrap()
+        .unwrap();
+    let second = repository::claim_job(&fixture.db, "terminate-b", now())
+        .unwrap()
+        .unwrap();
+    let (blocked_claim, blocked_worker, running_claim) = if first.job.node_id == "Service" {
+        (first, "terminate-a", second)
+    } else {
+        (second, "terminate-b", first)
+    };
+    let running_job = running_claim.job.job_id.clone();
+    let blocked_job = blocked_claim.job.job_id.clone();
+    jobs::execute_claimed(
+        &fixture.db,
+        fixture.dispatcher(),
+        blocked_worker,
+        blocked_claim,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let blocked = reload(&fixture, &started.instance_id);
+    assert_eq!(blocked.incidents.len(), 1, "{:?}", blocked.status);
+
+    set_divisor(&fixture, &started.instance_id, 2);
+    let outcome = retry_command(&fixture, &blocked, &blocked_job, &stamp("retry into terminate"))
+        .unwrap();
+    assert_eq!(outcome.instance.status, ProcessInstanceStatus::Completed);
+    assert!(
+        outcome
+            .cancelled_claims
+            .iter()
+            .any(|claim| claim.job_id == running_job),
+        "the running branch job is handed to the worker as cancelled: {:?}",
+        outcome.cancelled_claims
+    );
+    assert_eq!(
+        count(
+            &fixture,
+            "SELECT COUNT(*) FROM bpmn_jobs WHERE instance_id=?1 AND job_id IN (SELECT job_id FROM bpmn_jobs WHERE status IN ('queued','running','claimed'))",
+            &started.instance_id
+        ),
+        0,
+        "no job of the ended run stays open"
+    );
+}
+
+#[tokio::test]
+async fn an_open_boundary_incident_on_the_activation_refuses_the_retry_with_its_own_reason() {
+    let fixture = Fixture::new();
+    let flow_id = flow(&fixture.db, &fixture.owner, &graph("boundary incident", None));
+    let mut model = model_with(
+        &flow_id,
+        "10 / vars.divisor",
+        ActivityVerification::Condition {
+            expression: "true".into(),
+        },
+    );
+    for (id, kind) in [
+        (
+            "Guard",
+            ProcessNodeKind::BoundaryTimer {
+                attached_to_id: "Service".into(),
+                cancel_activity: false,
+                timer: tentaflow_protocol::processes::ProcessTimerSpec::Duration { seconds: 3600 },
+            },
+        ),
+        ("End_Guard", ProcessNodeKind::End),
+    ] {
+        model.nodes.push(ProcessNode {
+            id: id.into(),
+            name: id.into(),
+            kind,
+            repeat: None,
+            activity_io: None,
+        });
+    }
+    model.sequence_flows.push(edge("GuardEnd", "Guard", "End_Guard"));
+    model.timer_timezone = Some("UTC".into());
+    let blocked = run_until_blocked(&fixture, &model, "boundary-pass").await;
+    let instance_id = blocked.instance.instance_id.clone();
+    {
+        // The boundary timer of the waiting activation fails the way a storage
+        // failure at its firing leaves it: status error, an open TIMER_ERROR
+        // incident and the event that links the two.
+        let conn = fixture.db.write().unwrap();
+        let (timer_id, token_id): (String, String) = conn
+            .query_row(
+                "SELECT timer_id,token_id FROM bpmn_timers WHERE instance_id=?1 AND node_id='Guard'",
+                [&instance_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE bpmn_timers SET status='error',last_reason='forged' WHERE timer_id=?1",
+            [&timer_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bpmn_incidents(incident_id,instance_id,scope_id,node_id,job_id,code,message,at_ms) VALUES('forged-incident',?1,?1,'Guard',NULL,'TIMER_ERROR','forged',99)",
+            [&instance_id],
+        )
+        .unwrap();
+        let next_seq: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(seq),0)+1 FROM bpmn_events WHERE instance_id=?1",
+                [&instance_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO bpmn_events(event_id,instance_id,seq,at_ms,kind,node_id,actor_user_id,data_json,scope_id) VALUES(?1,?2,?3,99,'timer_error','Guard',NULL,?4,?2)",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                instance_id,
+                next_seq,
+                json!({"timer_id":timer_id,"incident_id":"forged-incident","attached_token_id":token_id})
+                    .to_string()
+            ],
+        )
+        .unwrap();
+    }
+    set_divisor(&fixture, &instance_id, 2);
+    let seen = reload(&fixture, &instance_id);
+    let mapping = seen
+        .incidents
+        .iter()
+        .find(|incident| incident.code == "ACTIVITY_IO_OUTPUT_FAILED")
+        .unwrap();
+    assert_eq!(
+        (mapping.can_retry, mapping.retry.kind, mapping.retry.denied_reason),
+        (
+            false,
+            ProcessRetryKind::OutputMapping,
+            Some(ProcessRetryDenied::ResultNotRetained)
+        )
+    );
+    let refused = retry(&fixture, &seen, &blocked.job_id, "with a boundary incident").unwrap_err();
+    assert!(
+        refused.downcast_ref::<ProcessOperationDenied>().is_some(),
+        "{refused}"
+    );
+    assert_eq!(footprint(&fixture, &instance_id).1, 0, "nothing was attempted");
 }
