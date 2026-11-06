@@ -78,6 +78,7 @@ build_backend() {
   local static_dir="$NATIVE_ROOT/$PLATFORM/lib-static/llama-cpp/$backend"
   local dynamic_dir="$NATIVE_ROOT/$PLATFORM/lib-dynamic/llama-cpp/$backend"
   local jobs
+  # Empty expansions use the ${a[@]+...} form: bash 3.2 (macOS) trips set -u on an empty array.
   local enabled_backends=()
   reset_dir "$build"
   reset_dir "$static_dir"
@@ -136,7 +137,7 @@ build_backend() {
   esac
 
   if [ "$backend" = "multi" ]; then
-    enabled_backends=("${MULTI_BACKENDS[@]}")
+    enabled_backends=(${MULTI_BACKENDS[@]+"${MULTI_BACKENDS[@]}"})
   else
     enabled_backends=("$backend")
   fi
@@ -146,7 +147,7 @@ build_backend() {
     *) echo "Nieobsługiwany backend llama.cpp: $backend" >&2; exit 1 ;;
   esac
 
-  if backend_enabled cuda "${enabled_backends[@]}"; then
+  if backend_enabled cuda ${enabled_backends[@]+"${enabled_backends[@]}"}; then
     cmake_args+=(-DGGML_CUDA=ON)
     # Architektura CUDA. llama.cpp domyslnie uzywa "native" (nvcc -arch=native),
     # ktory na nowych GPU (np. Blackwell GB10 / DGX Spark = sm_121) czesto nie
@@ -167,19 +168,19 @@ build_backend() {
       fi
     fi
   fi
-  backend_enabled metal "${enabled_backends[@]}" && cmake_args+=(-DGGML_METAL=ON)
-  backend_enabled vulkan "${enabled_backends[@]}" && cmake_args+=(-DGGML_VULKAN=ON)
+  backend_enabled metal ${enabled_backends[@]+"${enabled_backends[@]}"} && cmake_args+=(-DGGML_METAL=ON)
+  backend_enabled vulkan ${enabled_backends[@]+"${enabled_backends[@]}"} && cmake_args+=(-DGGML_VULKAN=ON)
 
-  if backend_enabled cuda "${enabled_backends[@]}"; then
+  if backend_enabled cuda ${enabled_backends[@]+"${enabled_backends[@]}"}; then
     jobs="${LLAMA_CPP_CUDA_JOBS:-4}"
   else
     jobs="$(platform_cpu_count)"
   fi
 
   local targets=(llama ggml ggml-base ggml-cpu)
-  backend_enabled cuda "${enabled_backends[@]}" && targets+=(ggml-cuda)
-  backend_enabled metal "${enabled_backends[@]}" && targets+=(ggml-metal)
-  backend_enabled vulkan "${enabled_backends[@]}" && targets+=(ggml-vulkan)
+  backend_enabled cuda ${enabled_backends[@]+"${enabled_backends[@]}"} && targets+=(ggml-cuda)
+  backend_enabled metal ${enabled_backends[@]+"${enabled_backends[@]}"} && targets+=(ggml-metal)
+  backend_enabled vulkan ${enabled_backends[@]+"${enabled_backends[@]}"} && targets+=(ggml-vulkan)
 
   echo "[llama.cpp] build backend: $backend (${enabled_backends[*]:-cpu})"
   env \

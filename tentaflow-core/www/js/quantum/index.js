@@ -17,6 +17,8 @@
 // fields are camelCase in both directions — the options going in, the IR, the
 // run result and every keyframe field coming back.
 
+import { initWithFallback } from '../wasm-fallback.js';
+
 // Bumped every time a trapped instance is thrown away, so the dynamic import
 // yields a fresh module namespace instead of the poisoned one.
 let instanceGeneration = 0;
@@ -28,7 +30,7 @@ async function load() {
   if (!loading) {
     loading = (async () => {
       const mod = await import(`./quantum_glue.js?instance=${instanceGeneration}`);
-      await mod.default();
+      await initWithFallback(mod.default, new URL('./quantum_glue_asm.js', import.meta.url));
       glue = mod;
       return mod;
     })().catch((err) => {

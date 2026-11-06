@@ -987,6 +987,190 @@ install_wasm_bindgen_cli() {
     log_ok "wasm-bindgen CLI gotowy"
 }
 
+# --- binaryen (wasm2js) ---
+
+# wasm2js turns each browser .wasm into a plain-JS twin that the dashboard loads
+# when WebAssembly is unavailable (iOS Lockdown Mode switches it off in every
+# WKWebView). The twin is optional, so a failed install only warns.
+install_binaryen() {
+    log_section "binaryen (wasm2js)"
+
+    if command -v wasm2js &>/dev/null; then
+        log_ok "wasm2js juz zainstalowany"
+        return
+    fi
+
+    case "$DISTRO" in
+        macos)  brew install binaryen ;;
+        arch)   run_privileged pacman -S --needed --noconfirm binaryen ;;
+        debian) run_privileged apt-get install -y binaryen ;;
+        fedora) run_privileged dnf install -y binaryen ;;
+    esac || true
+
+    if command -v wasm2js &>/dev/null; then
+        INSTALLED+=("binaryen")
+        log_ok "wasm2js gotowy"
+    else
+        log_warn "wasm2js niedostepny — dashboard nie dostanie wersji JS na urzadzenia bez WebAssembly (Lockdown Mode)"
+    fi
+}
+
+# --- Android SDK + NDK ---
+
+# Where the SDK lives: one the developer already points at wins, otherwise the
+# directory Android Studio would create on this OS.
+android_sdk_root() {
+    if [[ -n "${ANDROID_HOME:-}" ]]; then
+        printf '%s\n' "$ANDROID_HOME"
+    elif [[ -n "${ANDROID_SDK_ROOT:-}" ]]; then
+        printf '%s\n' "$ANDROID_SDK_ROOT"
+    elif [[ "$(uname -s)" == "Darwin" ]]; then
+        printf '%s\n' "$HOME/Library/Android/sdk"
+    else
+        printf '%s\n' "$HOME/Android/Sdk"
+    fi
+}
+
+# sdkmanager needs a JDK 17+; the system /usr/bin/java on macOS is only a stub
+# and Homebrew's openjdk@17 is keg-only, so neither is on PATH by itself.
+android_java_home() {
+    local candidate
+    if [[ -n "${JAVA_HOME:-}" && -x "$JAVA_HOME/bin/java" ]]; then
+        printf '%s\n' "$JAVA_HOME"
+        return
+    fi
+    if command -v brew &>/dev/null; then
+        candidate="$(brew --prefix openjdk@17 2>/dev/null || true)"
+        if [[ -x "$candidate/libexec/openjdk.jdk/Contents/Home/bin/java" ]]; then
+            printf '%s\n' "$candidate/libexec/openjdk.jdk/Contents/Home"
+            return
+        fi
+    fi
+    if [[ -x /usr/libexec/java_home ]]; then
+        candidate="$(/usr/libexec/java_home -v 17 2>/dev/null || true)"
+        if [[ -n "$candidate" && -x "$candidate/bin/java" ]]; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    fi
+    if command -v java &>/dev/null; then
+        candidate="$(dirname "$(dirname "$(readlink -f "$(command -v java)")")")"
+        if "$candidate/bin/java" -version 2>&1 | grep -Eq 'version "(1[7-9]|[2-9][0-9])[."]'; then
+            printf '%s\n' "$candidate"
+            return
+        fi
+    fi
+    return 1
+}
+
+install_android_sdk() {
+    log_section "Android SDK + NDK"
+
+    local sdk
+    sdk="$(android_sdk_root)"
+    local platform="android-$ANDROID_PLATFORM_VERSION"
+    local ndk_dir="$sdk/ndk/$ANDROID_NDK_VERSION"
+    local sdkmanager="$sdk/cmdline-tools/latest/bin/sdkmanager"
+
+    if [[ -x "$sdkmanager" \
+          && -d "$sdk/platform-tools" \
+          && -d "$sdk/platforms/$platform" \
+          && -d "$sdk/build-tools/$ANDROID_BUILD_TOOLS_VERSION" \
+          && -f "$ndk_dir/build/cmake/android.toolchain.cmake" ]]; then
+        log_ok "Android SDK + NDK $ANDROID_NDK_VERSION juz zainstalowane: $sdk"
+        write_android_local_properties "$sdk"
+        return
+    fi
+
+    local java_home
+    if ! java_home="$(android_java_home)"; then
+        log_error "Android SDK: brak JDK 17 (sdkmanager go wymaga). Zainstaluj JDK i uruchom setup ponownie."
+        return 1
+    fi
+
+    if [[ ! -x "$sdkmanager" ]]; then
+        local os arch key
+        os="$(uname -s)"; arch="$(uname -m)"
+        case "$os-$arch" in
+            Darwin-arm64) key=MACOS_ARM64; os=mac_arm64 ;;
+            Darwin-x86_64) key=MACOS_X86_64; os=mac_x86_64 ;;
+            Linux-x86_64) key=LINUX_X86_64; os=linux ;;
+            *) log_error "Android SDK: Google nie publikuje command-line tools dla $os-$arch"; return 1 ;;
+        esac
+        local checksum_key="ANDROID_CMDLINE_TOOLS_SHA256_$key"
+        local expected
+        expected="$(pinned_checksum "$checksum_key" ANDROID_CMDLINE_TOOLS_BUILD)" || return 1
+        local archive="commandlinetools-${os}-${ANDROID_CMDLINE_TOOLS_BUILD}_latest.zip"
+        local cache work
+        cache="$(wasi_sdk_cache)"
+        mkdir -p "$cache" "$sdk/cmdline-tools"
+        work=$(mktemp -d "$cache/.android-install.XXXXXX")
+        (
+            trap 'rm -rf "$work"' EXIT
+            log_info "Pobieranie Android command-line tools ${ANDROID_CMDLINE_TOOLS_BUILD}..."
+            curl -fL --retry 3 "https://dl.google.com/android/repository/$archive" -o "$work/tools.zip" || exit 1
+            actual="$( (sha256sum "$work/tools.zip" 2>/dev/null || shasum -a 256 "$work/tools.zip") | awk '{print $1}')"
+            if [[ "$actual" != "$expected" ]]; then
+                log_error "Android command-line tools: SHA256 $actual nie zgadza sie z $checksum_key w scripts/versions.env"
+                exit 1
+            fi
+            unzip -q "$work/tools.zip" -d "$work/unpacked" || exit 1
+            rm -rf "$sdk/cmdline-tools/latest"
+            mv "$work/unpacked/cmdline-tools" "$sdk/cmdline-tools/latest"
+        ) || return 1
+        INSTALLED+=("Android command-line tools $ANDROID_CMDLINE_TOOLS_BUILD")
+    fi
+
+    # Installing a package through sdkmanager records acceptance of the Android
+    # SDK terms (`--licenses` is a no-op in current command-line tools), so the
+    # consent is taken here, before anything is installed.
+    if [[ ! -f "$sdk/licenses/android-sdk-license" && "${ANDROID_SDK_ACCEPT_LICENSES:-}" != "yes" ]]; then
+        local answer=""
+        if [[ -t 0 ]]; then
+            read -r -p "Instalacja pakietow Android SDK oznacza akceptacje https://developer.android.com/studio/terms . Zaakceptowac? [y/N] " answer
+        fi
+        if [[ ! "$answer" =~ ^[yY]$ ]]; then
+            log_error "Licencja Android SDK nie zaakceptowana. Uruchom z ANDROID_SDK_ACCEPT_LICENSES=yes albo odpowiedz 'y' interaktywnie."
+            return 1
+        fi
+    fi
+
+    log_info "Instalacja pakietow SDK (platform-tools, $platform, build-tools $ANDROID_BUILD_TOOLS_VERSION, NDK $ANDROID_NDK_VERSION)..."
+    # Consent was given above; the tool still reads a confirmation from stdin.
+    # A process substitution, not `yes |`, so pipefail does not see yes's SIGPIPE.
+    JAVA_HOME="$java_home" "$sdkmanager" --sdk_root="$sdk" \
+        "platform-tools" \
+        "platforms;$platform" \
+        "build-tools;$ANDROID_BUILD_TOOLS_VERSION" \
+        "ndk;$ANDROID_NDK_VERSION" < <(yes) || return 1
+
+    if [[ ! -f "$sdk/licenses/android-sdk-license" ]]; then
+        log_error "sdkmanager zakonczyl sie bez zapisania licencji w $sdk/licenses"
+        return 1
+    fi
+
+    if [[ ! -f "$ndk_dir/build/cmake/android.toolchain.cmake" ]]; then
+        log_error "Po instalacji brakuje NDK w $ndk_dir"
+        return 1
+    fi
+    write_android_local_properties "$sdk"
+    INSTALLED+=("Android SDK + NDK $ANDROID_NDK_VERSION")
+    log_ok "Android SDK + NDK gotowe: $sdk"
+}
+
+# Gradle finds the SDK from local.properties (git-ignored), so building the APK
+# does not depend on ANDROID_HOME being exported in the developer's shell.
+write_android_local_properties() {
+    local sdk="$1"
+    local props
+    props="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/tentaflow-mobile/android/local.properties"
+    if [[ -f "$props" ]] && grep -q '^sdk.dir=' "$props"; then
+        return
+    fi
+    printf 'sdk.dir=%s\n' "$sdk" >> "$props"
+    log_ok "local.properties: sdk.dir=$sdk"
+}
+
 # --- Android Rust/mobile toolchain ---
 
 install_android_rust_tools() {
@@ -1273,6 +1457,7 @@ install_ios_gstreamer_xcframework() {
         "gstreamer-audio-1.0:$gst_version"
         "gstreamer-base-1.0:$gst_version"
         "gstreamer-pbutils-1.0:$gst_version"
+        "gstreamer-video-1.0:$gst_version"
     )
 
     local entry name ver
@@ -1784,6 +1969,13 @@ verify_installation() {
         ok=false
     fi
 
+    # wasm2js (opcjonalny: JS zamiast wasm, gdy przegladarka nie ma WebAssembly)
+    if command -v wasm2js &>/dev/null; then
+        log_ok "wasm2js: zainstalowany"
+    else
+        log_warn "wasm2js: BRAK (Lockdown Mode na iOS nie dostanie dashboardu)"
+    fi
+
     # iOS targets (tylko macOS)
     if [[ "$DISTRO" == "macos" ]]; then
         for t in aarch64-apple-ios aarch64-apple-ios-sim; do
@@ -2066,11 +2258,13 @@ main() {
     install_rust
     install_wasm_target
     install_wasm_bindgen_cli
+    install_binaryen
     install_dotnet_sdk
     install_wasi_sdk
     install_metal_toolchain
     install_zvec
     update_vllm_recipes
+    install_android_sdk
     install_android_rust_tools
     install_android_gstreamer_sdk
     install_android_gradle_runner
