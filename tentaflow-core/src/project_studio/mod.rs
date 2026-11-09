@@ -29,6 +29,7 @@ pub mod reports;
 pub mod repository;
 pub mod runs;
 pub mod schedules;
+pub mod summary;
 pub mod task_index;
 pub mod task_transfer;
 pub mod tasks;

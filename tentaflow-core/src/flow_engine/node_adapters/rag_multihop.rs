@@ -48,6 +48,19 @@ const META_ACCUMULATED: &str = "rag_accumulated";
 const META_CITATIONS: &str = "rag_citations";
 /// Meta-klucz harnessu pętli — `true` kończy pętlę (`loop` until).
 const META_HARNESS_DONE: &str = "harness_done";
+/// Meta key: what the judge wants an overview of. Set by `rag_judge`, consumed by
+/// `rag_overview` in the next round.
+const META_OVERVIEW_FOCUS: &str = "rag_overview_focus";
+/// Meta key: the overview was already added, so the judge cannot ask for it twice.
+const META_OVERVIEW_DONE: &str = "rag_overview_done";
+
+/// Files an overview digests. A chat turn waits for it, so a larger project is
+/// sampled instead of folded whole.
+const OVERVIEW_FILES: u32 = 40;
+/// Size of the digest the overview adds to the context.
+const OVERVIEW_DIGEST_TOKENS: u32 = 3000;
+/// Longest `focus` the judge may pass on (it is derived from user-supplied text).
+const MAX_OVERVIEW_FOCUS_CHARS: usize = 512;
 
 // =============================================================================
 // Czysta logika akumulacji + dedup (testowalna bez ABI/DB)
@@ -306,6 +319,10 @@ impl Default for RagJudgeNodeAdapter {
 pub struct JudgeVerdict {
     pub enough: bool,
     pub next_query: Option<String>,
+    /// The question is about the project as a whole (summarise the files, what
+    /// does it contain), which passages cannot answer. Holds the requested focus,
+    /// empty when the judge named none.
+    pub overview: Option<String>,
 }
 
 /// Parsuje odpowiedź sędziego LLM na `{enough:bool, next_query?:string}`.
@@ -319,6 +336,7 @@ pub fn parse_judge_verdict(raw: &str) -> JudgeVerdict {
         return JudgeVerdict {
             enough: true,
             next_query: None,
+            overview: None,
         };
     };
     let enough = v.get("enough").and_then(|x| x.as_bool()).unwrap_or(true);
@@ -327,7 +345,22 @@ pub fn parse_judge_verdict(raw: &str) -> JudgeVerdict {
         .and_then(|x| x.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    JudgeVerdict { enough, next_query }
+    let overview = match v.get("overview") {
+        Some(Value::Bool(true)) => Some(
+            v.get("focus")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+        ),
+        Some(Value::String(focus)) if !focus.trim().is_empty() => Some(focus.trim().to_string()),
+        _ => None,
+    };
+    JudgeVerdict {
+        enough,
+        next_query,
+        overview,
+    }
 }
 
 /// Wyłuskuje pierwszy obiekt JSON z tekstu (model może owinąć go w prozę albo
@@ -391,6 +424,24 @@ impl NodeAdapter for RagJudgeNodeAdapter {
             (!capped.is_empty()).then_some(capped)
         });
 
+        // An overview is served once; a second request, or one in a round whose
+        // overview already ran, only ends the loop.
+        let overview_pending = verdict.overview.is_some()
+            && !verdict.enough
+            && !out.meta.contains_key(META_OVERVIEW_DONE);
+        if overview_pending {
+            let focus: String = verdict
+                .overview
+                .unwrap_or_default()
+                .chars()
+                .take(MAX_OVERVIEW_FOCUS_CHARS)
+                .collect();
+            out.meta
+                .insert(META_OVERVIEW_FOCUS.to_string(), Value::String(focus));
+            out.meta.remove(META_HARNESS_DONE);
+            return Ok(out);
+        }
+
         match next_query {
             // Kolejny hop: ustaw pod-pytanie; harness_done pozostaje nieustawione
             // (loop until = false), więc pętla wykona następną iterację.
@@ -407,6 +458,146 @@ impl NodeAdapter for RagJudgeNodeAdapter {
                     .insert(META_HARNESS_DONE.to_string(), Value::Bool(true));
             }
         }
+        Ok(out)
+    }
+}
+
+// =============================================================================
+// rag_overview — digest of the project's file summaries, on the judge's request
+// =============================================================================
+
+pub struct RagOverviewNodeAdapter;
+
+impl RagOverviewNodeAdapter {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for RagOverviewNodeAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Project id behind a vector scope (`ps-<project_id>`), the only scope shape the
+/// project chat mints.
+fn project_id_from_scope(scope: &str) -> Option<&str> {
+    scope.strip_prefix("ps-")
+}
+
+#[async_trait]
+impl NodeAdapter for RagOverviewNodeAdapter {
+    fn node_type(&self) -> &str {
+        "rag_overview"
+    }
+    fn input_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("in", FlowDataType::Any)]
+    }
+    fn output_ports(&self) -> Vec<PortSpec> {
+        vec![PortSpec::new("full", FlowDataType::Text)]
+    }
+
+    async fn execute(
+        &self,
+        _node: &FlowNode,
+        inputs: &[NodeInput],
+        ctx: &ExecutionContext,
+    ) -> Result<FlowEnvelope> {
+        use crate::project_studio::{knowledge, project_db, summary};
+
+        let input = inputs
+            .first()
+            .ok_or_else(|| anyhow!("rag_overview: brak krawędzi wejściowej"))?;
+        let mut out: FlowEnvelope = (*input.envelope).clone();
+
+        // The focus is the judge's request; without one this round is a plain
+        // retrieval round and the node is a pass-through.
+        let Some(focus) = out
+            .meta
+            .remove(META_OVERVIEW_FOCUS)
+            .and_then(|v| v.as_str().map(str::to_string))
+        else {
+            return Ok(out);
+        };
+        out.meta
+            .insert(META_OVERVIEW_DONE.to_string(), Value::Bool(true));
+
+        let question = out
+            .meta
+            .get(META_ORIGINAL_QUESTION)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let focus = if focus.is_empty() { question } else { focus };
+
+        // The scope and the user come from the context the chat handler minted,
+        // never from the model; membership is re-checked like for the tools.
+        let project_id = ctx
+            .addon_id
+            .as_deref()
+            .and_then(project_id_from_scope)
+            .ok_or_else(|| anyhow!("rag_overview: not a project scope"))?;
+        let user_id = ctx
+            .user_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("rag_overview: requires a user identity"))?;
+        let org = ctx
+            .org_id
+            .clone()
+            .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
+        knowledge::require_member(&org, project_id, user_id)?;
+
+        let pool = project_db::open(project_id)?;
+        let (_, total) = summary::list_summaries(&pool, &[], 0, 1)?;
+        if total == 0 {
+            return Ok(out);
+        }
+        let rows = if total <= OVERVIEW_FILES {
+            summary::list_summaries(&pool, &[], 0, OVERVIEW_FILES)?.0
+        } else {
+            summary::random_summaries(&pool, &[], OVERVIEW_FILES)?
+        };
+        let model = summary::ContextModel {
+            llm: ctx.llm.clone(),
+            provenance: ctx.provenance(),
+            user_id: ctx.user_id.clone(),
+            user_role: ctx.user_role.clone(),
+            cancel: ctx.cancel_token.clone(),
+        };
+        let used = rows.len();
+        let digest =
+            summary::digest_rows(&model, rows, total, &focus, OVERVIEW_DIGEST_TOKENS).await?;
+        let text = format!(
+            "Zbiorcze podsumowanie projektu na podstawie {used} z {total} streszczen plikow:\n{}",
+            digest["digest"].as_str().unwrap_or_default()
+        );
+
+        // The overview enters like any passage, so the judge, the answer and the
+        // citation list treat it uniformly. Top score: it is the one source that
+        // spans the whole project.
+        let mut accumulated = passages_from_meta(&out, META_ACCUMULATED);
+        accumulated.insert(
+            0,
+            serde_json::json!({
+                "doc_id": "project-overview",
+                "chunk_index": 0,
+                "path": "Podsumowanie projektu",
+                "text": text,
+                "score": 1.0,
+            }),
+        );
+        out.meta.insert(
+            META_ACCUMULATED.to_string(),
+            Value::Array(merge_accumulated(&accumulated, &[])),
+        );
+        out.payload = FlowValue::Text(build_context_text(
+            out.meta
+                .get(META_ORIGINAL_QUESTION)
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            &passages_from_meta(&out, META_ACCUMULATED),
+        ));
         Ok(out)
     }
 }
@@ -864,6 +1055,56 @@ mod tests {
             .await
             .unwrap();
         assert!(out.context.messages.is_empty());
+    }
+
+    #[test]
+    fn judge_parses_an_overview_request() {
+        let v = parse_judge_verdict(r#"{"enough": false, "overview": true, "focus": "decyzje"}"#);
+        assert!(!v.enough);
+        assert_eq!(v.overview.as_deref(), Some("decyzje"));
+        assert!(parse_judge_verdict(r#"{"enough": true}"#).overview.is_none());
+    }
+
+    #[tokio::test]
+    async fn judge_overview_request_continues_the_loop_once() {
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text(r#"{"enough": false, "overview": true}"#.into());
+        let out = RagJudgeNodeAdapter::new()
+            .execute(&node("rag_judge"), &[input(env)], &stub_ctx())
+            .await
+            .unwrap();
+        assert!(out.meta.contains_key(META_OVERVIEW_FOCUS));
+        assert!(!out.meta.contains_key(META_HARNESS_DONE));
+
+        // After the overview ran, asking again ends the loop instead of repeating it.
+        let mut again = FlowEnvelope::empty();
+        again.payload = FlowValue::Text(r#"{"enough": false, "overview": true}"#.into());
+        again
+            .meta
+            .insert(META_OVERVIEW_DONE.into(), Value::Bool(true));
+        let out = RagJudgeNodeAdapter::new()
+            .execute(&node("rag_judge"), &[input(again)], &stub_ctx())
+            .await
+            .unwrap();
+        assert_eq!(out.meta.get(META_HARNESS_DONE), Some(&Value::Bool(true)));
+    }
+
+    #[tokio::test]
+    async fn overview_is_a_pass_through_without_a_request() {
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text("context".into());
+        let out = RagOverviewNodeAdapter::new()
+            .execute(&node("rag_overview"), &[input(env)], &stub_ctx())
+            .await
+            .unwrap();
+        assert_eq!(out.payload.as_text(), Some("context"));
+        assert!(!out.meta.contains_key(META_OVERVIEW_DONE));
+    }
+
+    #[test]
+    fn project_scope_resolves_only_the_project_prefix() {
+        assert_eq!(project_id_from_scope("ps-abc"), Some("abc"));
+        assert_eq!(project_id_from_scope("addon-1"), None);
     }
 
     // --- walidacja flow JSON (R1-R10) --------------------------------------

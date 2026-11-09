@@ -2103,6 +2103,7 @@ async fn run_job(
     let mut ready = 0u32;
     let mut failed = 0u32;
     let mut cancelled = false;
+    let mut summary_targets: Vec<super::summary::SummaryTarget> = Vec::new();
 
     for work in files {
         // One beat per file: it records that this worker is alive AND reports a
@@ -2152,6 +2153,13 @@ async fn run_job(
         match outcome {
             FileResult::Ready(chunks) => {
                 ready += 1;
+                summary_targets.push(super::summary::SummaryTarget {
+                    file_id: work.file_id.clone(),
+                    source_id: source_id.clone(),
+                    path: work.path.clone(),
+                    sha256: work.sha256.clone(),
+                    chunk_count: chunks,
+                });
                 let _ = repository::record_file_progress(
                     &project_pool,
                     &job_id,
@@ -2227,6 +2235,19 @@ async fn run_job(
     };
     let _ = repository::finish_ingest_job(&project_pool, &job_id, job_status, &job_error);
     let _ = repository::set_source_status(&project_pool, &source_id, source_status, &source_error);
+
+    // Summaries trail the ingest: the source is searchable the moment it is
+    // `ready`, and a slow model must not hold the job (or its worker slot) open.
+    if !summary_targets.is_empty() {
+        tokio::spawn(super::summary::summarize_targets(
+            core_db,
+            Arc::new(super::summary::RouterModel { router }),
+            project_pool,
+            org_id,
+            project_id,
+            summary_targets,
+        ));
+    }
 }
 
 enum FileResult {

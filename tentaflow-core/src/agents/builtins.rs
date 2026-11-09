@@ -50,6 +50,16 @@ pub enum CoreToolName {
     /// `core.project_list_sources(project_id)` — the knowledge-source catalog
     /// of a project. Async path (same membership gate as project_search).
     ProjectListSources,
+    /// `core.project_file_summaries(project_id, mode?, count?, offset?, limit?,
+    /// source_ids?, file_ids?)` — the stored per-file summaries of a project,
+    /// listed, sampled at random, or fetched for given files. Same membership
+    /// gate as project_search.
+    ProjectFileSummaries,
+    /// `core.project_digest(project_id, focus?, file_ids?, source_ids?,
+    /// random_count?, max_tokens?)` — one condensed text over the summaries of
+    /// many files. The tool splits the work across model calls itself, so the
+    /// result fits a reply however many files go in.
+    ProjectDigest,
     /// `core.project_case_save(...)` — saves ONE generated manual test case
     /// into a Project Studio generation. The target project/generation is NOT
     /// a parameter: it binds server-side via `envelope.meta["ps_generation"]`
@@ -133,6 +143,8 @@ impl CoreToolName {
             CoreToolName::AskUser => "core.ask_user",
             CoreToolName::ProjectSearch => "core.project_search",
             CoreToolName::ProjectListSources => "core.project_list_sources",
+            CoreToolName::ProjectFileSummaries => "core.project_file_summaries",
+            CoreToolName::ProjectDigest => "core.project_digest",
             CoreToolName::CaseSave => "core.project_case_save",
             CoreToolName::TaskComplete => "core.task_complete",
             CoreToolName::FsRead => "core.fs_read",
@@ -203,7 +215,10 @@ impl CoreToolName {
     pub fn is_project_knowledge(self) -> bool {
         matches!(
             self,
-            CoreToolName::ProjectSearch | CoreToolName::ProjectListSources
+            CoreToolName::ProjectSearch
+                | CoreToolName::ProjectListSources
+                | CoreToolName::ProjectFileSummaries
+                | CoreToolName::ProjectDigest
         )
     }
 
@@ -277,6 +292,8 @@ impl CoreToolName {
             CoreToolName::AskUser,
             CoreToolName::ProjectSearch,
             CoreToolName::ProjectListSources,
+            CoreToolName::ProjectFileSummaries,
+            CoreToolName::ProjectDigest,
             CoreToolName::CaseSave,
             CoreToolName::TaskComplete,
             CoreToolName::FsRead,
@@ -490,6 +507,60 @@ impl CoreToolName {
                             "type": "string",
                             "description": "Id of the project whose sources to list."
                         }
+                    },
+                    "required": ["project_id"]
+                }),
+            },
+            CoreToolName::ProjectFileSummaries => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Read the stored summaries of the files in a Project Studio \
+                              project the current user is a member of. mode=list pages through \
+                              them by path, mode=random draws `count` files at random (a quick \
+                              look at an unfamiliar project), and `file_ids` fetches exactly \
+                              those files. Summaries that do not fit the reply are listed \
+                              under `omitted` with their size: fetch them one by one or pass \
+                              them to core.project_digest."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string", "description": "Id of the project."},
+                        "mode": {"type": "string", "enum": ["list", "random"],
+                                 "description": "list (default) or random."},
+                        "count": {"type": "integer",
+                                  "description": "Files to draw in random mode (1-50, default 5)."},
+                        "offset": {"type": "integer", "description": "List mode: rows to skip."},
+                        "limit": {"type": "integer",
+                                  "description": "List mode: rows to return (1-200, default 20)."},
+                        "source_ids": {"type": "array", "items": {"type": "string"},
+                                       "description": "Optional: restrict to these sources."},
+                        "file_ids": {"type": "array", "items": {"type": "string"},
+                                     "description": "Optional: fetch exactly these files."}
+                    },
+                    "required": ["project_id"]
+                }),
+            },
+            CoreToolName::ProjectDigest => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Condense the summaries of MANY project files into one text that \
+                              fits your reply, however many files that is: the tool divides the \
+                              work over model calls itself. Choose the files with `file_ids`, \
+                              `source_ids`, or `random_count`; with none of them it covers the \
+                              project (up to 500 files). `focus` says what to keep. Returns \
+                              `digest`, `files_used` and `files_total`."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "project_id": {"type": "string", "description": "Id of the project."},
+                        "focus": {"type": "string",
+                                  "description": "What the digest should concentrate on."},
+                        "file_ids": {"type": "array", "items": {"type": "string"}},
+                        "source_ids": {"type": "array", "items": {"type": "string"}},
+                        "random_count": {"type": "integer",
+                                         "description": "Digest this many randomly drawn files."},
+                        "max_tokens": {"type": "integer",
+                                       "description": "Size of the digest (256-8192, default 3000)."}
                     },
                     "required": ["project_id"]
                 }),

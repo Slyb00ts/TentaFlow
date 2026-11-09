@@ -2341,6 +2341,7 @@ pub fn delete_source_rows(pool: &DbPool, source_id: &str) -> Result<bool> {
         "DELETE FROM source_files WHERE source_id = ?1",
         params![source_id],
     )?;
+    super::summary::delete_summaries_for_source(&tx, source_id)?;
     tx.execute(
         "DELETE FROM ingest_jobs WHERE source_id = ?1",
         params![source_id],
@@ -2483,6 +2484,7 @@ pub fn files_for_ingest(
 
 pub fn delete_source_file_row(pool: &DbPool, file_id: &str) -> Result<bool> {
     let conn = pool.write().map_err(write_err)?;
+    super::summary::delete_summary_for_file(&conn, file_id)?;
     let n = conn.execute(
         "DELETE FROM source_files WHERE file_id = ?1",
         params![file_id],
@@ -3004,6 +3006,7 @@ pub fn sync_tree_files(
             )
             .optional()?;
         if let Some(file_id) = file_id {
+            super::summary::delete_summary_for_file(&tx, &file_id)?;
             tx.execute(
                 "DELETE FROM source_files WHERE file_id = ?1",
                 params![file_id],

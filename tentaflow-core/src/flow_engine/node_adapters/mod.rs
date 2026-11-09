@@ -133,7 +133,8 @@ pub use platform_switch::PlatformSwitchNodeAdapter;
 pub use project_knowledge::ProjectKnowledgeNodeAdapter;
 pub use rag_graphrag::{RagGraphFactsNodeAdapter, RagGraphSeedNodeAdapter};
 pub use rag_multihop::{
-    RagAccumulateNodeAdapter, RagFinalizeNodeAdapter, RagJudgeNodeAdapter, RagQuerySeedNodeAdapter,
+    RagAccumulateNodeAdapter, RagFinalizeNodeAdapter, RagJudgeNodeAdapter, RagOverviewNodeAdapter,
+    RagQuerySeedNodeAdapter,
 };
 pub use reranker::RerankerNodeAdapter;
 pub use sentence_buffer::SentenceBufferNodeAdapter;

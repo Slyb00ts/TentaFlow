@@ -371,7 +371,7 @@ fn run_project_migrations(conn: &Connection) -> Result<i64> {
 
 /// Highest per-project schema version this binary knows. An archive produced by
 /// a NEWER node is refused on import rather than migrated blindly.
-pub const LATEST_SCHEMA_VERSION: i64 = 6;
+pub const LATEST_SCHEMA_VERSION: i64 = 7;
 
 /// Ordered per-project schema migrations (F4+ tables land as further entries).
 const MIGRATIONS_PROJECT: &[(i64, &str)] = &[
@@ -381,6 +381,7 @@ const MIGRATIONS_PROJECT: &[(i64, &str)] = &[
     (4, PROJECT_SCHEMA_V4),
     (5, PROJECT_SCHEMA_V5),
     (6, PROJECT_SCHEMA_V6),
+    (7, PROJECT_SCHEMA_V7),
 ];
 
 const PROJECT_SCHEMA_V1: &str = "
@@ -863,6 +864,24 @@ INSERT INTO settings(key,value)
 SELECT 'project_key_prefix_locked',CASE WHEN COUNT(*) > 0 THEN '1' ELSE '0' END FROM tasks;
 ";
 
+const PROJECT_SCHEMA_V7: &str = "
+CREATE TABLE file_summaries (
+    file_id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    sha256 TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK(status IN ('ready','error')),
+    summary TEXT NOT NULL DEFAULT '',
+    summary_tokens INTEGER NOT NULL DEFAULT 0,
+    source_chars INTEGER NOT NULL DEFAULT 0,
+    coverage_pct INTEGER NOT NULL DEFAULT 100,
+    error TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_file_summaries_source ON file_summaries(source_id, status);
+";
+
 const PROJECT_SCHEMA_V6: &str = "
 ALTER TABLE tasks ADD COLUMN resolution TEXT;
 ALTER TABLE tasks ADD COLUMN resolution_reason TEXT;
@@ -1095,7 +1114,10 @@ mod tests {
             rusqlite::params![r#"{"status":"todo"}"#, r#"{"status":"review"}"#],
         )
         .expect("real history");
-        assert_eq!(run_project_migrations(&conn).expect("upgrade to v6"), 6);
+        assert_eq!(
+            run_project_migrations(&conn).expect("upgrade to latest"),
+            LATEST_SCHEMA_VERSION
+        );
         let relation: (String, String, String, String) = conn
             .query_row(
                 "SELECT source_task_id,target_task_id,kind,relation_id FROM task_links",
@@ -1126,7 +1148,10 @@ mod tests {
                 r#"{"status":"review"}"#.into()
             )
         );
-        assert_eq!(run_project_migrations(&conn).expect("reopen"), 6);
+        assert_eq!(
+            run_project_migrations(&conn).expect("reopen"),
+            LATEST_SCHEMA_VERSION
+        );
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM task_events", [], |row| row.get(0))
             .expect("events");
