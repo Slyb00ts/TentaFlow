@@ -33,8 +33,8 @@
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     EventRowWire, EventsBrowseRequest, EventsBrowseResponse, EventsCursor, EventsPayload,
-    EventsRunRequest, EventsRunResponse, MessageBody, ProtocolError, ProtocolErrorCode,
-    SessionAuth,
+    EventsRunRequest, EventsRunResponse, EventsStepIoRequest, EventsStepIoResponse, MessageBody,
+    ProtocolError, ProtocolErrorCode, SessionAuth,
 };
 
 use super::handlers::user_id_to_uuid;
@@ -107,8 +107,14 @@ fn db_error(scope: &str, error: anyhow::Error) -> ProtocolError {
 /// The content is unchanged — including an `assistant_message` whose body the
 /// writer omitted, which stays an omission marker here.
 fn to_wire(event: StoredEvent) -> Result<EventRowWire, ProtocolError> {
+    // A page of rows must not carry every step's prompt: the body of a
+    // `step_io` row is fetched on its own (`step_io`), the page keeps the sizes.
+    let mut payload = event.payload;
+    if let crate::events::EventPayload::StepIo { z, .. } = &mut payload {
+        z.clear();
+    }
     let payload_json =
-        crate::events::store::to_json(&event.payload).map_err(|e| db_error("payload_encode", e))?;
+        crate::events::store::to_json(&payload).map_err(|e| db_error("payload_encode", e))?;
     Ok(EventRowWire {
         run_id: event.run_id,
         seq: event.seq,
@@ -248,6 +254,51 @@ fn run_timeline(
     )))
 }
 
+/// The unpacked content of one `step_io` row, under the same visibility rule as
+/// the timeline of its run.
+fn step_io(ctx: &HandlerContext, req: &EventsStepIoRequest) -> Result<MessageBody, ProtocolError> {
+    if req.run_id.is_empty() {
+        return Err(ProtocolError::bad_request("run_id is required"));
+    }
+    let scope = resolve_scope(ctx)?;
+    let pool = events::db::pool().map_err(|e| db_error("pool", e))?;
+    let not_found = || ProtocolError::not_found(format!("step content not found: {}", req.run_id));
+
+    if let Scope::OwnRuns(user_id) = &scope {
+        let owner = events::run_actor_user_id(&pool, &req.run_id)
+            .map_err(|e| db_error("run_owner", e))?
+            .ok_or_else(not_found)?;
+        if owner.as_deref() != Some(user_id.as_str()) {
+            return Err(not_found());
+        }
+    }
+
+    let row = events::read_run(&pool, &req.run_id, req.seq - 1, 1)
+        .map_err(|e| db_error("read_run", e))?
+        .into_iter()
+        .find(|e| e.seq == req.seq)
+        .ok_or_else(not_found)?;
+    let crate::events::EventPayload::StepIo {
+        z,
+        input_bytes,
+        output_bytes,
+        truncated,
+    } = row.payload
+    else {
+        return Err(not_found());
+    };
+    let body = events::step_io::unpack(&z).map_err(|e| db_error("step_io_unpack", e))?;
+    Ok(MessageBody::EventsBody(EventsPayload::StepIoResponse(
+        EventsStepIoResponse {
+            input: body.input,
+            output: body.output,
+            input_bytes,
+            output_bytes,
+            truncated,
+        },
+    )))
+}
+
 #[handler(variant = "EventsBody", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
@@ -262,9 +313,12 @@ pub async fn events_browser_dispatch(
     match payload {
         EventsPayload::BrowseRequest(r) => browse(ctx, r),
         EventsPayload::RunRequest(r) => run_timeline(ctx, r),
-        EventsPayload::BrowseResponse(_) | EventsPayload::RunResponse(_) => Err(
-            ProtocolError::bad_request("response variant cannot be sent as a request"),
-        ),
+        EventsPayload::StepIoRequest(r) => step_io(ctx, r),
+        EventsPayload::BrowseResponse(_)
+        | EventsPayload::RunResponse(_)
+        | EventsPayload::StepIoResponse(_) => Err(ProtocolError::bad_request(
+            "response variant cannot be sent as a request",
+        )),
     }
 }
 
@@ -293,6 +347,7 @@ macro_rules! register_events_variant {
 
 register_events_variant!("EventsBrowseRequest", "tentaflow_ws_handler_events_browse");
 register_events_variant!("EventsRunRequest", "tentaflow_ws_handler_events_run");
+register_events_variant!("EventsStepIoRequest", "tentaflow_ws_handler_events_step_io");
 
 #[cfg(test)]
 mod tests {
@@ -749,6 +804,73 @@ mod tests {
         )
         .expect_err("an unowned run is read_all only");
         assert_eq!(err.code, ProtocolErrorCode::NotFound);
+    }
+
+    /// A page keeps the SIZES of a step's content but never its body; the body
+    /// comes from `step_io`, which applies the owner rule of the run.
+    #[tokio::test]
+    async fn step_content_stays_off_the_page_and_is_served_to_the_owner_only() {
+        let anna = principal();
+        let marek = principal();
+        let anna_ctx = ctx_with(&anna, &[PERM_READ]);
+        let marek_ctx = ctx_with(&marek, &[PERM_READ]);
+        let session = format!("sess-{}", uuid::Uuid::new_v4());
+        let run_id = format!("run-{}", uuid::Uuid::new_v4());
+        seed_run(&anna_ctx, &run_id, &session, &anna.uuid, 100);
+        let packed = crate::events::step_io::pack("prompt do modelu", "odpowiedź").unwrap();
+        let appended = append(
+            &events_pool(),
+            &anna_ctx.state.db,
+            RunEvent::new(
+                &run_id,
+                101,
+                FlowOrigin::Chat,
+                &FlowActor::user(&anna.uuid),
+                EventPayload::StepIo {
+                    z: packed.z,
+                    input_bytes: packed.input_bytes,
+                    output_bytes: packed.output_bytes,
+                    truncated: false,
+                },
+            )
+            .with_session(&session),
+        )
+        .expect("append step io");
+
+        let page = match browse(
+            &anna_ctx,
+            &EventsBrowseRequest {
+                session_id: Some(session.clone()),
+                ..EventsBrowseRequest::default()
+            },
+        )
+        .expect("browse")
+        {
+            MessageBody::EventsBody(EventsPayload::BrowseResponse(r)) => r,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        let row = page
+            .rows
+            .iter()
+            .find(|r| r.kind == "step_io")
+            .expect("step_io row");
+        let payload: serde_json::Value = serde_json::from_str(&row.payload_json).unwrap();
+        assert_eq!(payload["z"], "", "the body must not ride on a page");
+        assert_eq!(payload["input_bytes"], "prompt do modelu".len());
+
+        let req = EventsStepIoRequest {
+            run_id: run_id.clone(),
+            seq: appended.seq,
+        };
+        match step_io(&anna_ctx, &req).expect("owner reads the content") {
+            MessageBody::EventsBody(EventsPayload::StepIoResponse(r)) => {
+                assert_eq!(r.input, "prompt do modelu");
+                assert_eq!(r.output, "odpowiedź");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        let denied = step_io(&marek_ctx, &req).expect_err("not marek's run");
+        assert_eq!(denied.code, ProtocolErrorCode::NotFound);
     }
 
     #[tokio::test]

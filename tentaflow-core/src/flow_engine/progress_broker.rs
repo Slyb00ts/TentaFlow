@@ -410,6 +410,10 @@ impl ProgressSink for BrokerProgressSink {
     fn emit(&self, scope: &str, event: ProgressEvent) {
         self.broker.publish(scope, event);
     }
+
+    fn wants_io(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

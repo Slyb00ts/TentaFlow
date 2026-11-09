@@ -176,6 +176,28 @@ pub struct EventsRunResponse {
     pub next_after_seq: Option<i64>,
 }
 
+/// The content behind one `step_io` row. Kept out of the page responses: a page
+/// of rows would carry every prompt of every step.
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Default)]
+pub struct EventsStepIoRequest {
+    pub run_id: String,
+    /// `seq` of the `step_io` row.
+    pub seq: i64,
+}
+
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Default)]
+pub struct EventsStepIoResponse {
+    /// What the step received, as the engine reported it (already redacted).
+    pub input: String,
+    /// What the step returned.
+    pub output: String,
+    /// Size of each side before any cut, in bytes.
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    /// True when a side was cut to the storage cap.
+    pub truncated: bool,
+}
+
 /// The whole Events-browser surface behind one `MessageBody::EventsBody`.
 #[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub enum EventsPayload {
@@ -183,6 +205,8 @@ pub enum EventsPayload {
     BrowseResponse(EventsBrowseResponse),
     RunRequest(EventsRunRequest),
     RunResponse(EventsRunResponse),
+    StepIoRequest(EventsStepIoRequest),
+    StepIoResponse(EventsStepIoResponse),
 }
 
 #[cfg(test)]

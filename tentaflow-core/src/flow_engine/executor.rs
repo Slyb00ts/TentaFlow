@@ -58,6 +58,53 @@ fn emit_node_finished(ctx: &ExecutionContext, node_id: &str, status: &TraceStatu
     );
 }
 
+/// What one envelope contributes to the step content kept by the event log:
+/// its payload (binary payloads only by kind and size) and, when a retrieval put
+/// them there, the passages it cites.
+fn envelope_snapshot(envelope: &FlowEnvelope) -> serde_json::Value {
+    use crate::flow_engine::envelope::FlowValue;
+    let payload = match &envelope.payload {
+        FlowValue::Empty => serde_json::Value::Null,
+        FlowValue::Text(text) => serde_json::Value::String(text.clone()),
+        FlowValue::Json(value) => value.clone(),
+        FlowValue::Embedding(vector) => serde_json::json!({ "embedding_dim": vector.len() }),
+        FlowValue::Audio { mime, .. }
+        | FlowValue::Image { mime, .. }
+        | FlowValue::Video { mime, .. }
+        | FlowValue::Other { mime, .. } => serde_json::json!({ "binary": mime }),
+    };
+    match envelope.meta.get("rag_citations") {
+        Some(citations) if citations.as_array().is_some_and(|c| !c.is_empty()) => {
+            serde_json::json!({ "payload": payload, "citations": citations })
+        }
+        _ => payload,
+    }
+}
+
+fn snapshot_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_default(),
+    }
+}
+
+/// Reports a node's content to the progress sink, when the sink keeps it.
+fn emit_node_io(
+    ctx: &ExecutionContext,
+    node_id: &str,
+    input: Option<String>,
+    output: Option<String>,
+) {
+    ctx.progress.emit(
+        &ctx.progress_scope,
+        crate::flow_engine::dispatchers::ProgressEvent::NodeIo {
+            node_id: node_id.to_string(),
+            input,
+            output,
+        },
+    );
+}
+
 /// Does this chunk carry the first visible token of a streaming step?
 ///
 /// Reasoning counts as a token. For a thinking model the stream genuinely
@@ -1479,7 +1526,7 @@ async fn run_node_with_io_mapping(
 
     let node_id = node.id.clone();
     let budget = node_timeout(node);
-    match tokio::time::timeout(
+    let result = match tokio::time::timeout(
         budget,
         run_node_io_inner(adapter, node, inbound, inputs, ctx),
     )
@@ -1490,7 +1537,25 @@ async fn run_node_with_io_mapping(
             "node '{node_id}' timeout after {}s",
             budget.as_secs()
         )),
+    };
+    if ctx.progress.wants_io() {
+        let input = match inputs {
+            [] => None,
+            [only] => Some(snapshot_text(&envelope_snapshot(&only.envelope))),
+            several => Some(snapshot_text(&serde_json::Value::Array(
+                several
+                    .iter()
+                    .map(|i| envelope_snapshot(&i.envelope))
+                    .collect(),
+            ))),
+        };
+        let output = match &result {
+            Ok(envelope) => snapshot_text(&envelope_snapshot(envelope)),
+            Err(error) => format!("error: {error:#}"),
+        };
+        emit_node_io(ctx, &node_id, input, Some(output));
     }
+    result
 }
 
 /// Wewnętrzna ścieżka io-mapping bez wrapu timeoutu (timeout nakłada wołający).
@@ -1993,6 +2058,14 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
 
     let final_envelope = match region_result {
         Ok(env) => {
+            if ctx.progress.wants_io() {
+                emit_node_io(
+                    &ctx,
+                    &producer_node_id,
+                    None,
+                    Some(snapshot_text(&envelope_snapshot(&env))),
+                );
+            }
             emit_node_finished(&ctx, &producer_node_id, &TraceStatus::Ok);
             trace.push(TraceStep {
                 node_id: producer_node_id.clone(),
@@ -2202,6 +2275,7 @@ async fn finalize_streaming_flow(
     let mut cancelled = false;
     let mut text_buf = String::new();
     let mut reasoning_buf = String::new();
+    let mut io_answer: Option<String> = None;
     let mut last_finish: Option<FinishReason> = None;
     let mut last_usage: Option<TokenUsage> = None;
     let mut last_perf: Option<GenPerf> = None;
@@ -2338,6 +2412,11 @@ async fn finalize_streaming_flow(
         {
             final_envelope.context.messages.push(user);
         }
+        io_answer = Some(if reasoning_buf.is_empty() {
+            text_buf.clone()
+        } else {
+            format!("[reasoning]\n{reasoning_buf}\n\n[answer]\n{text_buf}")
+        });
         final_envelope.payload = FlowValue::Text(text_buf.clone());
         let mut assistant = ChatMessage::assistant(text_buf);
         assistant.reasoning_content = (!reasoning_buf.is_empty()).then_some(reasoning_buf);
@@ -2360,6 +2439,22 @@ async fn finalize_streaming_flow(
         TraceStatus::Ok
     };
     // §3.11 C — producer NodeFinished once the stream settles.
+    if inputs.progress.wants_io() {
+        let answer = match (io_answer, &error) {
+            (Some(answer), Some(message)) => format!("{answer}\n[error] {message}"),
+            (Some(answer), None) => answer,
+            (None, Some(message)) => format!("[error] {message}"),
+            (None, None) => String::new(),
+        };
+        inputs.progress.emit(
+            &inputs.progress_scope,
+            crate::flow_engine::dispatchers::ProgressEvent::NodeIo {
+                node_id: inputs.producer_node_id.clone(),
+                input: None,
+                output: Some(answer),
+            },
+        );
+    }
     {
         let label = match &producer_status {
             TraceStatus::Ok => "ok",

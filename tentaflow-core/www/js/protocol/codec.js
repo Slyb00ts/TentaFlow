@@ -3114,6 +3114,18 @@ export const encode = {
     );
   },
 
+  /** MessageBody::EventsBody(StepIoRequest { runId, seq }) — the content behind one step_io row. */
+  eventsStepIoRequest(correlationId, { runId, seq } = {}, sequence = 1) {
+    assertReady();
+    const body = requests.encodeEventsStepIoRequest(String(runId ?? ''), Number(seq ?? 0));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
   // -------------------------------------------------------------------------
   // TF→ONNX model conversion (deploy wizard step, ROADMAP Z11) —
   // MessageBody::ModelConversionBody

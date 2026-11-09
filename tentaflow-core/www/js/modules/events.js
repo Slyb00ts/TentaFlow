@@ -120,7 +120,40 @@ function originClass(origin) { return ORIGIN_CLASS[origin] ?? 'o-system'; }
  * Groups newest-first (the order the cursor pages in, so scrolling down goes
  * back in time), rows inside a group oldest-first (a turn reads forward).
  */
-function buildItems(rows) {
+// A step is ONE ledger entry: the closing row, which already carries the
+// duration. Its opening row and its stored content (`step_io`) are folded into
+// it instead of being listed as rows of their own.
+function foldSteps(rows) {
+  const byRun = new Map();
+  for (const row of rows) {
+    if (!byRun.has(row.runId)) byRun.set(row.runId, []);
+    byRun.get(row.runId).push(row);
+  }
+  for (const runRows of byRun.values()) {
+    runRows.sort((a, b) => a.seq - b.seq);
+    const lastClosing = new Map();
+    for (const row of runRows) {
+      if (row.kind === 'step_end' || (row.kind === 'error' && row.nodeId)) {
+        lastClosing.set(row.nodeId, row);
+        row.io = null;
+      } else if (row.kind === 'step_io') {
+        const closing = lastClosing.get(row.nodeId);
+        if (closing) {
+          closing.io = {
+            seq: row.seq,
+            inputBytes: row.payload?.input_bytes ?? 0,
+            outputBytes: row.payload?.output_bytes ?? 0,
+            truncated: row.payload?.truncated === true,
+          };
+        }
+      }
+    }
+  }
+  return rows.filter((row) => row.kind !== 'step_start' && row.kind !== 'step_io');
+}
+
+function buildItems(allRows) {
+  const rows = foldSteps(allRows);
   const groups = new Map();
   for (const row of rows) {
     const key = `${row.runId}#${row.turn ?? '-'}`;
@@ -330,17 +363,90 @@ function renderInspector() {
       )}
     </dl>
     ${inspectorKeySection(row)}
-    <div class="ev-sec">
+    ${row.io ? '<div class="ev-sec" id="events-io"></div>' : `<div class="ev-sec">
       <h4>${escapeHtml(t('details'))}</h4>
       ${chronometry(row)}
       <div class="ev-pre">${escapeHtml(prettyPayload(row))}</div>
-    </div>
+    </div>`}
     ${inspectorLinks(row)}
   `;
+
+  if (row.io) loadStepIo(row);
 
   byId('events-filter-actor')?.addEventListener('click', () => {
     setActor(row.actorId ?? null);
   });
+}
+
+/**
+ * Readable text for a stored side. Content is JSON text; printing it through
+ * `JSON.stringify` would leave every passage as one line full of `\n` escapes,
+ * so strings are written out as they are and only the structure is indented.
+ */
+function readable(text) {
+  let value;
+  try { value = JSON.parse(text); } catch { return text; }
+  const lines = [];
+  const walk = (node, indent) => {
+    const pad = '  '.repeat(indent);
+    if (Array.isArray(node)) {
+      node.forEach((item, i) => {
+        lines.push(`${pad}[${i}]`);
+        walk(item, indent + 1);
+      });
+    } else if (node && typeof node === 'object') {
+      for (const [key, item] of Object.entries(node)) {
+        if (item && typeof item === 'object') {
+          lines.push(`${pad}${key}:`);
+          walk(item, indent + 1);
+        } else if (typeof item === 'string' && item.includes('\n')) {
+          lines.push(`${pad}${key}:`);
+          item.split('\n').forEach((line) => lines.push(`${pad}  ${line}`));
+        } else {
+          lines.push(`${pad}${key}: ${item}`);
+        }
+      }
+    } else if (typeof node === 'string') {
+      node.split('\n').forEach((line) => lines.push(`${pad}${line}`));
+    } else {
+      lines.push(`${pad}${node}`);
+    }
+  };
+  walk(value, 0);
+  return lines.join('\n');
+}
+
+/** Fetches and shows what the selected step received and returned. */
+async function loadStepIo(row) {
+  const host = byId('events-io');
+  if (!host) return;
+  host.innerHTML = `<h4>${escapeHtml(t('io_input'))} / ${escapeHtml(t('io_output'))}</h4>
+    <div class="muted">${escapeHtml(t('io_loading'))}</div>`;
+  const key = row.key;
+  try {
+    const body = await ApiBinary.one('eventsStepIoRequest', { runId: row.runId, seq: row.io.seq });
+    if (state.selectedKey !== key) return;
+    const cut = body.truncated
+      ? `<div class="ev-io-note">${escapeHtml(t('io_cut'))}</div>`
+      : '';
+    const section = (label, bytes, text) => `
+      <h4>${escapeHtml(label)} <span class="ev-io-size">${escapeHtml(fmtBytes(bytes))}</span></h4>
+      <div class="ev-pre ev-io">${escapeHtml(text ? readable(text) : t('io_none'))}</div>`;
+    byId('events-io').innerHTML = `${cut}
+      ${section(t('io_input'), body.inputBytes, body.input)}
+      ${section(t('io_output'), body.outputBytes, body.output)}`;
+  } catch (err) {
+    if (state.selectedKey !== key) return;
+    const host2 = byId('events-io');
+    if (host2) host2.innerHTML = `<div class="muted">${escapeHtml(t('io_failed', { error: err?.message ?? String(err) }))}</div>`;
+  }
+}
+
+function fmtBytes(n) {
+  if (typeof n !== 'number') return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function prettyPayload(row) {

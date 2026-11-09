@@ -203,6 +203,11 @@
   color: var(--tf-text-2); white-space: pre-wrap; word-break: break-word;
   max-height: 180px; overflow: auto;
 }
+/* Stored step content: the inspector column is narrow, so the blocks get more
+   height than a payload dump and scroll on their own. */
+.ev-pre.ev-io { max-height: 360px; }
+.ev-io-size { font-weight: 400; letter-spacing: 0; text-transform: none; color: var(--tf-text-3); margin-left: 6px; }
+.ev-io-note { font-size: 11.5px; color: var(--tf-warning, var(--tf-text-3)); margin-bottom: 8px; }
 /* Chronometry bar: the same TTFT/decode split the timeline draws, restated for
    one record. Segment widths come from the data, so only the fills live here. */
 .ev-track-bar { display: flex; height: 9px; border-radius: 3px; overflow: hidden; margin-top: 4px; }

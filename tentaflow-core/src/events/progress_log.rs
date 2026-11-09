@@ -241,6 +241,9 @@ struct ScopeState {
     /// generating an assistant message, so its `NodeFinished` closes that
     /// message; a node that never streamed anything closes only a step.
     streaming_nodes: HashSet<String>,
+    /// Content reported for a node that has not finished yet: `(input, output)`.
+    /// It is written as one `step_io` row right after the node's closing row.
+    pending_io: HashMap<String, (Option<String>, Option<String>)>,
 }
 
 /// Builds one timeline row from the run's provenance. The provenance is COPIED
@@ -284,6 +287,40 @@ impl ScopeState {
             self.request_opened = false;
             self.node_types.clear();
             self.streaming_nodes.clear();
+            self.pending_io.clear();
+        }
+    }
+
+    /// Writes the content reported for `node_id`, if any, as a `step_io` row.
+    /// A body that cannot be packed is logged and skipped: the step rows
+    /// already say it ran, and a failed compression must not drop them.
+    fn push_step_io(
+        &mut self,
+        provenance: &RunProvenance,
+        at_ms: i64,
+        node_id: &str,
+        out: &mut Vec<RunEvent>,
+    ) {
+        let Some((input, output)) = self.pending_io.remove(node_id) else {
+            return;
+        };
+        match crate::events::step_io::pack(
+            input.as_deref().unwrap_or(""),
+            output.as_deref().unwrap_or(""),
+        ) {
+            Ok(packed) => out.push(row(
+                provenance,
+                at_ms,
+                EventPayload::StepIo {
+                    z: packed.z,
+                    input_bytes: packed.input_bytes,
+                    output_bytes: packed.output_bytes,
+                    truncated: packed.truncated,
+                },
+                Some(node_id.to_string()),
+                None,
+            )),
+            Err(error) => warn!(node_id, %error, "step content could not be packed; not stored"),
         }
     }
 
@@ -366,9 +403,10 @@ impl ScopeState {
                             stage: step,
                             message: status,
                         },
-                        Some(node_id),
+                        Some(node_id.clone()),
                         None,
                     ));
+                    self.push_step_io(provenance, at_ms, &node_id, out);
                     return;
                 }
                 if streamed {
@@ -389,9 +427,23 @@ impl ScopeState {
                     provenance,
                     at_ms,
                     EventPayload::StepEnd { step, status },
-                    Some(node_id),
+                    Some(node_id.clone()),
                     None,
                 ));
+                self.push_step_io(provenance, at_ms, &node_id, out);
+            }
+            ProgressEvent::NodeIo {
+                node_id,
+                input,
+                output,
+            } => {
+                let slot = self.pending_io.entry(node_id).or_default();
+                if input.is_some() {
+                    slot.0 = input;
+                }
+                if output.is_some() {
+                    slot.1 = output;
+                }
             }
             ProgressEvent::FirstToken { node_id } => {
                 self.streaming_nodes.insert(node_id.clone());
@@ -725,6 +777,53 @@ mod tests {
                 assert_eq!(stage, "llm", "the stage is the node type learnt at start")
             }
             other => panic!("expected an error payload, got {other:?}"),
+        }
+    }
+
+    /// The content a node reported is written as ONE `step_io` row right after
+    /// the row that closes the step, and a later report for the same node
+    /// replaces an earlier one (the `llm` node's exact prompt beats the generic
+    /// envelope snapshot).
+    #[tokio::test]
+    async fn reported_content_follows_the_closing_row_as_one_compressed_row() {
+        let h = Harness::start("run-io");
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "llm-1".into(),
+            node_type: "llm".into(),
+        });
+        h.emit(ProgressEvent::NodeIo {
+            node_id: "llm-1".into(),
+            input: Some("generic envelope".into()),
+            output: Some("odpowiedź modelu".into()),
+        });
+        h.emit(ProgressEvent::NodeIo {
+            node_id: "llm-1".into(),
+            input: Some("exact prompt".into()),
+            output: None,
+        });
+        h.emit(ProgressEvent::NodeFinished {
+            node_id: "llm-1".into(),
+            status: "ok".into(),
+        });
+        let rows = h.rows("run-io", 4).await;
+        assert_eq!(
+            rows.iter().map(|r| r.kind).collect::<Vec<_>>(),
+            vec![
+                crate::events::EventKind::RequestStarted,
+                crate::events::EventKind::StepStart,
+                crate::events::EventKind::StepEnd,
+                crate::events::EventKind::StepIo,
+            ]
+        );
+        assert_eq!(rows[3].node_id.as_deref(), Some("llm-1"));
+        match &rows[3].payload {
+            EventPayload::StepIo { z, truncated, .. } => {
+                assert!(!truncated);
+                let body = crate::events::step_io::unpack(z).unwrap();
+                assert_eq!(body.input, "exact prompt");
+                assert_eq!(body.output, "odpowiedź modelu");
+            }
+            other => panic!("expected a step_io payload, got {other:?}"),
         }
     }
 

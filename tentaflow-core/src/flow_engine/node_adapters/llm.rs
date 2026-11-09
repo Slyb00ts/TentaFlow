@@ -504,6 +504,22 @@ impl LlmNodeAdapter {
         // and it is shared by the blocking and the streaming path.
         ctx.usage_sink.record_model(&model);
         let messages = Self::build_messages(node, envelope);
+        if ctx.progress.wants_io() {
+            // The exact prompt, not the envelope it was assembled from: this is
+            // what the model was actually given.
+            ctx.progress.emit(
+                &ctx.progress_scope,
+                crate::flow_engine::dispatchers::ProgressEvent::NodeIo {
+                    node_id: node.id.clone(),
+                    input: serde_json::to_string_pretty(&serde_json::json!({
+                        "model": model,
+                        "messages": messages,
+                    }))
+                    .ok(),
+                    output: None,
+                },
+            );
+        }
         let (tools, tool_choice) = Self::pick_tools(envelope);
         Ok(LlmRequest {
             // §2.5 — the run's stamp, from `ctx`, never from `envelope.meta`.
