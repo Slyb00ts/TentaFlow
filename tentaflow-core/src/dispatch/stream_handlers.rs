@@ -2197,6 +2197,12 @@ fn project_studio_chat_stream_handler(
         // byc wiazaniem serwera, a nie parametrem, ktory da sie przekierowac.
         meta.addon_id = Some(crate::project_studio::ingest::vector_scope(&project_id));
         meta.cancel_token = cancel.clone();
+        // Without a sink the run publishes nothing and never reaches the event log.
+        meta.progress_sink = Some(Arc::new(
+            crate::flow_engine::progress_broker::BrokerProgressSink::new(
+                ctx.state.progress_broker.clone(),
+            ),
+        ));
 
         let dispatch = fd
             .dispatch_by_flow_id_streaming(
@@ -3203,6 +3209,11 @@ fn project_studio_code_assist_stream_handler(
         meta.user_role = user_role;
         meta.org_id = Some(org_id);
         meta.cancel_token = cancel.clone();
+        meta.progress_sink = Some(Arc::new(
+            crate::flow_engine::progress_broker::BrokerProgressSink::new(
+                ctx.state.progress_broker.clone(),
+            ),
+        ));
 
         let exec = match fd
             .try_dispatch_streaming(&agent.model, "chat", envelope, meta)

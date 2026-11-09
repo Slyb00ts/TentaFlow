@@ -168,7 +168,17 @@ fn build_context_text(question: &str, accumulated: &[Value]) -> String {
             .get("chunk_index")
             .map(|v| v.to_string())
             .unwrap_or_default();
-        s.push_str(&format!("[{i}] (doc={doc} chunk={chunk}) {text}\n"));
+        // The answer model copies this header into its reply, so name the file
+        // when the hit knows it instead of exposing an opaque id.
+        let source = match p
+            .get("path")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+        {
+            Some(path) => format!("plik={path}"),
+            None => format!("doc={doc}"),
+        };
+        s.push_str(&format!("[{i}] ({source} chunk={chunk}) {text}\n"));
     }
     s
 }
@@ -1255,6 +1265,17 @@ mod tests {
             out.meta.get(META_HARNESS_DONE).and_then(|v| v.as_bool()),
             Some(true)
         );
+    }
+
+    #[test]
+    fn context_header_names_the_file_when_known() {
+        let passages = vec![
+            json!({"doc_id": "6d30", "chunk_index": 3, "text": "t", "path": "opis.docx"}),
+            json!({"doc_id": "d2", "chunk_index": 1, "text": "u"}),
+        ];
+        let text = build_context_text("q", &passages);
+        assert!(text.contains("[0] (plik=opis.docx chunk=3) t"));
+        assert!(text.contains("[1] (doc=d2 chunk=1) u"));
     }
 
     #[test]

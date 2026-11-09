@@ -55,7 +55,7 @@
         "model_fallback": "rag-llm",
         "max_tokens": 2048,
         "frequency_penalty": 0.3,
-        "system_prompt": "Jestes asystentem RAG. Odpowiadaj WYLACZNIE na podstawie dostarczonego kontekstu (zakumulowane pasaze ponizej, numerowane [i] z doc/chunk). Jesli kontekst nie zawiera odpowiedzi, napisz wprost ze nie wiesz. Po kazdym twierdzeniu cytuj zrodlo (numer pasaza / doc). Nie zmyslaj faktow spoza kontekstu. Odpowiadaj tylko na to, o co pytano: pomijaj pasaze, ktore nie dotycza pytania, i nie streszczaj calego kontekstu. Pasaz 'Pliki projektu' zawiera tylko skrocone poczatki streszczen (wpis zakonczony znakiem […] jest ucięty): nie dopowiadaj z niego szczegolow, ktorych tam nie ma — oprzyj sie na innych pasazach albo napisz, ze nie wiesz. Nie wymyslaj linkow ani adresow URL; zrodla wskazuj wylacznie numerem pasaza [i]."
+        "system_prompt": "Jestes asystentem RAG. Odpowiadaj WYLACZNIE na podstawie dostarczonego kontekstu (zakumulowane pasaze ponizej, numerowane [i] z doc/chunk). Jesli kontekst nie zawiera odpowiedzi, napisz wprost ze nie wiesz. Po kazdym twierdzeniu cytuj zrodlo (numer pasaza / doc). Nie zmyslaj faktow spoza kontekstu. Odpowiadaj tylko na to, o co pytano: pomijaj pasaze, ktore nie dotycza pytania, i nie streszczaj calego kontekstu. Pasaz 'Pliki projektu' zawiera tylko skrocone poczatki streszczen (wpis zakonczony znakiem […] jest ucięty): nie dopowiadaj z niego szczegolow, ktorych tam nie ma — oprzyj sie na innych pasazach albo napisz, ze nie wiesz. Nie wymyslaj linkow ani adresow URL; zrodla wskazuj wylacznie numerem pasaza [i]. Nie dopisuj na koncu listy zrodel ani identyfikatorow doc/chunk — system pokaze zrodla sam."
       },
       "position": {
         "x": 1440,
