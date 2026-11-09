@@ -376,6 +376,12 @@ impl NodeAdapter for RagJudgeNodeAdapter {
         let raw = out.payload.as_text().unwrap_or_default().to_string();
         let verdict = parse_judge_verdict(&raw);
 
+        // The judge `llm` node appends its own prompt and JSON reply to the
+        // conversation. Left in place, the answer model of the shell sees an
+        // earlier assistant turn shaped like `{"enough": true}` and imitates it
+        // instead of answering, and later rounds would judge their own verdicts.
+        out.context.messages.clear();
+
         // Pod-pytanie sędziego przycinamy do twardego capa (char-boundary-safe):
         // prompt-injection mógłby wstrzyknąć ogromne `next_query` idące do
         // embed/search. Po przycięciu pusty string → brak sensownego pod-pytania.
@@ -842,6 +848,22 @@ mod tests {
             out.meta.get(OUTPUT_MODE_META).and_then(|v| v.as_str()),
             Some(OUTPUT_MODE_STREAM)
         );
+    }
+
+    #[tokio::test]
+    async fn judge_verdict_drops_the_judge_turn_from_the_conversation() {
+        use crate::flow_engine::envelope::ChatMessage;
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text(r#"{"enough": true}"#.into());
+        env.context.messages = vec![
+            ChatMessage::user("context for the judge"),
+            ChatMessage::assistant(r#"{"enough": true}"#),
+        ];
+        let out = RagJudgeNodeAdapter::new()
+            .execute(&node("rag_judge"), &[input(env)], &stub_ctx())
+            .await
+            .unwrap();
+        assert!(out.context.messages.is_empty());
     }
 
     // --- walidacja flow JSON (R1-R10) --------------------------------------
