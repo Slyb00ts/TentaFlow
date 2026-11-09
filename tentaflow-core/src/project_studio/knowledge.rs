@@ -18,6 +18,10 @@ use tentaflow_sdk_spec::{FieldValue, Filter};
 pub const DEFAULT_TOP_K: u64 = 8;
 /// Hard cap on `top_k` — mirrors the dashboard KbSearch clamp.
 pub const MAX_TOP_K: u64 = 50;
+/// Longest chat message, in characters (~8k tokens): the dashboard composer
+/// uses the same number. What is left of a 32k model window must still hold the
+/// retrieved context (`MAX_CONTEXT_CHARS`) and the conversation window.
+pub const MAX_CHAT_MESSAGE_CHARS: usize = 24_000;
 /// Snippet length used by envelope-bound callers (same as the dashboard KbHit).
 pub const DEFAULT_SNIPPET_CHARS: usize = 400;
 

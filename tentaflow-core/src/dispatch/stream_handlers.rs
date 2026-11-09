@@ -2091,6 +2091,13 @@ fn project_studio_chat_stream_handler(
         end_error(&sub, &chat_id, "message is required".into());
         return;
     }
+    // The dashboard composer caps a message at 4096 characters, but the cap must
+    // hold for any client: a longer one would leave no room for the retrieved
+    // context in the model's window.
+    if message.chars().count() > crate::project_studio::knowledge::MAX_CHAT_MESSAGE_CHARS {
+        end_error(&sub, &chat_id, "message is too long".into());
+        return;
+    }
 
     let user_role = match &ctx.session {
         SessionAuth::UserSession { role, .. } => role.clone(),

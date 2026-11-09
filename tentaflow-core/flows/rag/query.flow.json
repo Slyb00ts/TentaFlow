@@ -38,7 +38,9 @@
       "id": "history",
       "type": "conversation_history",
       "config": {
-        "require_session": false
+        "require_session": false,
+        "max_message_chars": 4000,
+        "max_chars": 12000
       },
       "position": {
         "x": 1080,
@@ -51,6 +53,8 @@
       "config": {
         "model_meta_key": "rag_answer_model",
         "model_fallback": "rag-llm",
+        "max_tokens": 2048,
+        "frequency_penalty": 0.3,
         "system_prompt": "Jestes asystentem RAG. Odpowiadaj WYLACZNIE na podstawie dostarczonego kontekstu (zakumulowane pasaze ponizej, numerowane [i] z doc/chunk). Jesli kontekst nie zawiera odpowiedzi, napisz wprost ze nie wiesz. Po kazdym twierdzeniu cytuj zrodlo (numer pasaza / doc). Nie zmyslaj faktow spoza kontekstu."
       },
       "position": {

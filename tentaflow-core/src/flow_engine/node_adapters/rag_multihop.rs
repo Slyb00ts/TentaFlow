@@ -34,6 +34,10 @@ pub const MAX_ACCUMULATED: usize = 20;
 /// Twardy cap długości pod-pytania (`next_query`) zwróconego przez sędziego LLM.
 /// Sędzia czyta payload pochodzący z pasaży, więc prompt-injection mógłby wymusić
 /// gigantyczne pod-pytanie idące dalej do embed/search — przycinamy je char-safe.
+/// Characters of passages one prompt may carry (~11k tokens): the judge and the
+/// answer model each also hold a system prompt, the conversation and the
+/// question inside a 32k window, so an unbounded context would overflow it.
+pub const MAX_CONTEXT_CHARS: usize = 32_000;
 pub const MAX_NEXT_QUERY_CHARS: usize = 1024;
 
 /// Meta-klucz: oryginalne pytanie użytkownika (stash przez `rag_query_seed` w
@@ -56,8 +60,8 @@ const META_OVERVIEW_DONE: &str = "rag_overview_done";
 /// Meta key: the file catalog was already added to the context.
 const META_CATALOG_DONE: &str = "rag_catalog_done";
 /// Files listed in the catalog and how much of each summary it quotes.
-const CATALOG_FILES: u32 = 60;
-const CATALOG_GIST_CHARS: usize = 240;
+const CATALOG_FILES: u32 = 40;
+const CATALOG_GIST_CHARS: usize = 200;
 
 /// Files an overview digests. A chat turn waits for it, so a larger project is
 /// sampled instead of folded whole.
@@ -149,6 +153,11 @@ fn build_context_text(question: &str, accumulated: &[Value]) -> String {
     s.push_str(question);
     s.push_str("\n\nKontekst (zakumulowane pasaże):\n");
     for (i, p) in accumulated.iter().enumerate() {
+        // Passages arrive best first, so the budget drops the weakest ones; the
+        // first always stays so an oversized chunk cannot empty the context.
+        if i > 0 && s.chars().count() >= MAX_CONTEXT_CHARS {
+            break;
+        }
         let text = p.get("text").and_then(|v| v.as_str()).unwrap_or("");
         let doc = p
             .get("doc_id")
@@ -1239,5 +1248,16 @@ mod tests {
             out.meta.get(META_HARNESS_DONE).and_then(|v| v.as_bool()),
             Some(true)
         );
+    }
+
+    #[test]
+    fn context_text_stops_at_the_character_budget() {
+        let passages: Vec<Value> = (0..40)
+            .map(|i| serde_json::json!({"doc_id": format!("d{i}"), "chunk_index": 0, "text": "x".repeat(2000)}))
+            .collect();
+        let text = build_context_text("q", &passages);
+        assert!(text.chars().count() < MAX_CONTEXT_CHARS + 2200);
+        assert!(text.contains("(doc=d0 "));
+        assert!(!text.contains("(doc=d39 "));
     }
 }

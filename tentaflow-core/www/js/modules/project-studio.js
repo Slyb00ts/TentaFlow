@@ -3524,7 +3524,7 @@ async function renderChat() {
         </div>
         <div class="ps-chat-msgs" id="ps-chat-msgs"></div>
         <div class="ps-chat-notice">${sprite('shield')}<span>${escapeHtml(t('chat_notice'))}</span></div>
-        <tf-chat-composer id="ps-chat-composer" placeholder="${escapeAttr(t('chat_placeholder'))}"></tf-chat-composer>
+        <tf-chat-composer id="ps-chat-composer" max-length="24000" placeholder="${escapeAttr(t('chat_placeholder'))}"></tf-chat-composer>
       </div>
     </div>
   `;
