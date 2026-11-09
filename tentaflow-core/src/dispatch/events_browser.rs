@@ -391,6 +391,7 @@ fn step_io(ctx: &HandlerContext, req: &EventsStepIoRequest) -> Result<MessageBod
         input_bytes,
         output_bytes,
         truncated,
+        ..
     } = row.payload
     else {
         return Err(not_found());
@@ -939,6 +940,10 @@ mod tests {
                     input_bytes: packed.input_bytes,
                     output_bytes: packed.output_bytes,
                     truncated: false,
+                    model: None,
+                    served_model: None,
+                    prompt_tokens: None,
+                    completion_tokens: None,
                 },
             )
             .with_session(&session),

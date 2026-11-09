@@ -599,6 +599,7 @@ mod tests {
         async fn execute_chat(&self, _req: LlmRequest) -> Result<LlmResponse> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(LlmResponse {
+                model: None,
                 audio: None,
                 content: self.answer.clone(),
                 reasoning_content: None,

@@ -242,6 +242,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
             }
         };
 
+        let served_model = Some(response.model.clone()).filter(|m| !m.is_empty());
         let choice = match response.choices.into_iter().next() {
             Some(c) => c,
             None => {
@@ -312,6 +313,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
             }
         });
         let llm_response = LlmResponse {
+            model: served_model,
             audio,
             content,
             reasoning_content,
@@ -740,6 +742,7 @@ fn chat_chunk_to_llm_chunk(chunk: ChatCompletionChunk) -> LlmStreamChunk {
     let mut reasoning_delta: Option<String> = None;
     let mut tool_calls: Vec<ToolCallDelta> = Vec::new();
     let mut finish_reason: Option<FinishReason> = None;
+    let model = Some(chunk.model.clone()).filter(|m| !m.is_empty());
 
     if let Some(choice) = chunk.choices.into_iter().next() {
         choice_index = choice.index;
@@ -794,6 +797,7 @@ fn chat_chunk_to_llm_chunk(chunk: ChatCompletionChunk) -> LlmStreamChunk {
             total_ms: p.total_ms,
         }),
         finish_reason,
+        model,
         error: None,
     }
 }
@@ -864,6 +868,7 @@ mod tests {
             .expect("audit event opened");
 
         let response = LlmResponse {
+            model: None,
             audio: None,
             content: "Noted — blue.".into(),
             reasoning_content: None,

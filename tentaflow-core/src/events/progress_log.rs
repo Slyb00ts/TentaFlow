@@ -226,6 +226,14 @@ fn write_batch(pool: &DbPool, core_db: &DbPool, rows: Vec<RunEvent>) -> anyhow::
 
 /// What one scope's subscriber remembers between events.
 #[derive(Default)]
+struct ModelFacts {
+    requested: Option<String>,
+    served: Option<String>,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+}
+
+#[derive(Default)]
 struct ScopeState {
     run_id: Option<String>,
     /// Whether this run's `request_started` row has been written. The engine
@@ -244,6 +252,9 @@ struct ScopeState {
     /// Content reported for a node that has not finished yet: `(input, output)`.
     /// It is written as one `step_io` row right after the node's closing row.
     pending_io: HashMap<String, (Option<String>, Option<String>)>,
+    /// Model facts per node, merged from `NodeModel` events and attached to the
+    /// node's `step_io` row.
+    pending_model: HashMap<String, ModelFacts>,
 }
 
 /// Builds one timeline row from the run's provenance. The provenance is COPIED
@@ -288,6 +299,7 @@ impl ScopeState {
             self.node_types.clear();
             self.streaming_nodes.clear();
             self.pending_io.clear();
+            self.pending_model.clear();
         }
     }
 
@@ -301,6 +313,7 @@ impl ScopeState {
         node_id: &str,
         out: &mut Vec<RunEvent>,
     ) {
+        let facts = self.pending_model.remove(node_id).unwrap_or_default();
         let Some((input, output)) = self.pending_io.remove(node_id) else {
             return;
         };
@@ -316,6 +329,10 @@ impl ScopeState {
                     input_bytes: packed.input_bytes,
                     output_bytes: packed.output_bytes,
                     truncated: packed.truncated,
+                    model: facts.requested,
+                    served_model: facts.served,
+                    prompt_tokens: facts.prompt_tokens,
+                    completion_tokens: facts.completion_tokens,
                 },
                 Some(node_id.to_string()),
                 None,
@@ -444,6 +461,19 @@ impl ScopeState {
                 if output.is_some() {
                     slot.1 = output;
                 }
+            }
+            ProgressEvent::NodeModel {
+                node_id,
+                requested,
+                served,
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                let slot = self.pending_model.entry(node_id).or_default();
+                slot.requested = requested.or(slot.requested.take());
+                slot.served = served.or(slot.served.take());
+                slot.prompt_tokens = prompt_tokens.or(slot.prompt_tokens);
+                slot.completion_tokens = completion_tokens.or(slot.completion_tokens);
             }
             ProgressEvent::FirstToken { node_id } => {
                 self.streaming_nodes.insert(node_id.clone());
@@ -822,6 +852,57 @@ mod tests {
                 let body = crate::events::step_io::unpack(z).unwrap();
                 assert_eq!(body.input, "exact prompt");
                 assert_eq!(body.output, "odpowiedź modelu");
+            }
+            other => panic!("expected a step_io payload, got {other:?}"),
+        }
+    }
+
+    /// The model facts of an `llm` step arrive in separate events (the request
+    /// is built before the answer exists) and end up on the step's single
+    /// `step_io` row; a later event without a field must not erase it.
+    #[tokio::test]
+    async fn model_facts_from_separate_events_merge_onto_the_step_io_row() {
+        let h = Harness::start("run-model");
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "llm-1".into(),
+            node_type: "llm".into(),
+        });
+        h.emit(ProgressEvent::NodeModel {
+            node_id: "llm-1".into(),
+            requested: Some("rag-llm".into()),
+            served: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+        });
+        h.emit(ProgressEvent::NodeModel {
+            node_id: "llm-1".into(),
+            requested: None,
+            served: Some("bielik-7b".into()),
+            prompt_tokens: Some(120),
+            completion_tokens: Some(30),
+        });
+        h.emit(ProgressEvent::NodeIo {
+            node_id: "llm-1".into(),
+            input: Some("prompt".into()),
+            output: Some("answer".into()),
+        });
+        h.emit(ProgressEvent::NodeFinished {
+            node_id: "llm-1".into(),
+            status: "ok".into(),
+        });
+        let rows = h.rows("run-model", 4).await;
+        match &rows[3].payload {
+            EventPayload::StepIo {
+                model,
+                served_model,
+                prompt_tokens,
+                completion_tokens,
+                ..
+            } => {
+                assert_eq!(model.as_deref(), Some("rag-llm"));
+                assert_eq!(served_model.as_deref(), Some("bielik-7b"));
+                assert_eq!(*prompt_tokens, Some(120));
+                assert_eq!(*completion_tokens, Some(30));
             }
             other => panic!("expected a step_io payload, got {other:?}"),
         }

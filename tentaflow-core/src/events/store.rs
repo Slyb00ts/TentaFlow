@@ -187,6 +187,17 @@ pub enum EventPayload {
         input_bytes: u64,
         output_bytes: u64,
         truncated: bool,
+        /// For a `llm` step: the model name the flow asked for (often an
+        /// alias), the model the backend says it served, and the tokens spent.
+        /// Kept beside `z` so a list can show them without unpacking anything.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        served_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        completion_tokens: Option<u64>,
     },
 }
 

@@ -1321,6 +1321,18 @@ async fn stream_llm_member(
         if let Some(u) = chunk.usage.as_ref() {
             *last_usage = Some(*u);
             ctx.usage_sink.record(&node.id, *u);
+            if ctx.progress.wants_io() {
+                ctx.progress.emit(
+                    &ctx.progress_scope,
+                    crate::flow_engine::dispatchers::ProgressEvent::NodeModel {
+                        node_id: node.id.clone(),
+                        requested: None,
+                        served: chunk.model.clone(),
+                        prompt_tokens: Some(u.prompt_tokens),
+                        completion_tokens: Some(u.completion_tokens),
+                    },
+                );
+            }
         }
         if let Some(p) = chunk.perf {
             *last_perf = Some(p);
@@ -1341,6 +1353,7 @@ async fn stream_llm_member(
                 usage: None,
                 perf: None,
                 finish_reason: None,
+                model: None,
                 error: None,
             });
             if outbound.send(Ok(forwarded)).await.is_err() {
@@ -2223,6 +2236,7 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
         usage: Some(usage),
         perf: last_perf,
         finish_reason: Some(finish_reason),
+        model: None,
         error: post_error.clone(),
     });
     let _ = outbound_tx.send(Ok(trailer)).await;
@@ -2322,6 +2336,18 @@ async fn finalize_streaming_flow(
                     }
                     if let Some(u) = c.usage.as_ref() {
                         last_usage = Some(*u);
+                        if inputs.progress.wants_io() {
+                            inputs.progress.emit(
+                                &inputs.progress_scope,
+                                crate::flow_engine::dispatchers::ProgressEvent::NodeModel {
+                                    node_id: inputs.producer_node_id.clone(),
+                                    requested: None,
+                                    served: c.model.clone(),
+                                    prompt_tokens: Some(u.prompt_tokens),
+                                    completion_tokens: Some(u.completion_tokens),
+                                },
+                            );
+                        }
                     }
                     if let Some(p) = c.perf {
                         last_perf = Some(p);
@@ -4979,6 +5005,7 @@ mod direct_execution_tests {
     impl LlmDispatcher for FakeBlockingLlm {
         async fn execute_chat(&self, _req: LlmRequest) -> Result<LlmResponse> {
             Ok(LlmResponse {
+                model: None,
                 audio: None,
                 content: self.content.clone(),
                 reasoning_content: None,

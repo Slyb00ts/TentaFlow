@@ -127,6 +127,7 @@ mod tests {
             _req: crate::flow_engine::dispatchers::LlmRequest,
         ) -> Result<LlmResponse> {
             Ok(LlmResponse {
+                model: None,
                 audio: None,
                 content: "# strona".into(),
                 reasoning_content: None,

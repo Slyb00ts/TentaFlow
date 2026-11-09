@@ -2162,6 +2162,7 @@ fn wrap_blocking_as_stream(
                     usage: Some(usage),
                     perf,
                     finish_reason: Some(finish),
+                    model: None,
                     error: err,
                 }))
             }

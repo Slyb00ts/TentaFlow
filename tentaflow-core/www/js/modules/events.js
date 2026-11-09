@@ -144,6 +144,10 @@ function foldSteps(rows) {
             inputBytes: row.payload?.input_bytes ?? 0,
             outputBytes: row.payload?.output_bytes ?? 0,
             truncated: row.payload?.truncated === true,
+            model: row.payload?.model ?? null,
+            servedModel: row.payload?.served_model ?? null,
+            promptTokens: row.payload?.prompt_tokens ?? null,
+            completionTokens: row.payload?.completion_tokens ?? null,
           };
         }
       }
@@ -276,6 +280,25 @@ function kv(label, value, muted = false) {
   return `<dt>${escapeHtml(label)}</dt><dd${cls}>${value}</dd>`;
 }
 
+// What an llm step ran on. The requested name is often an alias, so the model
+// the backend reports serving is shown beside it when they differ.
+function modelKv(row) {
+  const io = row.io;
+  if (!io || (!io.model && !io.servedModel)) return '';
+  const parts = [];
+  if (io.model) parts.push(kv(t('llm_model'), escapeHtml(io.model)));
+  if (io.servedModel && io.servedModel !== io.model) {
+    parts.push(kv(t('llm_served'), escapeHtml(io.servedModel)));
+  }
+  if (io.promptTokens !== null || io.completionTokens !== null) {
+    parts.push(kv(t('llm_tokens'), escapeHtml(t('llm_tokens_value', {
+      prompt: io.promptTokens ?? 0,
+      completion: io.completionTokens ?? 0,
+    }))));
+  }
+  return parts.join('\n      ');
+}
+
 function inspectorKeySection(row) {
   if (row.actorKind !== 'api_key') return '';
   const binding = row.actorUserId
@@ -369,6 +392,7 @@ function renderInspector() {
     <dl class="ev-kv">
       ${kv(t('origin'), `<span class="ev-origin"><span class="dot ${originClass(row.origin)}"></span>${escapeHtml(t(`origin_${row.origin}`))}</span>`)}
       ${kv(t('actor'), `${escapeHtml(actorLabel(row))} <span class="muted">(${escapeHtml(t(`actor_kind_${row.actorKind}`))})</span>`)}
+      ${modelKv(row)}
       ${timing.join('\n      ')}
     </dl>
     ${inspectorKeySection(row)}

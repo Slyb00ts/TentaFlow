@@ -653,6 +653,7 @@ mod tests {
             *self.last_system.lock().unwrap() = req.messages[0].text_or_default();
             *self.last_user.lock().unwrap() = req.messages[1].text_or_default();
             Ok(LlmResponse {
+                model: None,
                 audio: None,
                 content: self.summary.clone(),
                 reasoning_content: None,

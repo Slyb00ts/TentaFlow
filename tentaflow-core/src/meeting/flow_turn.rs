@@ -834,6 +834,7 @@ mod tests {
 
     fn llm(text: &str) -> anyhow::Result<EnvelopeDelta> {
         Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+            model: None,
             choice_index: 0,
             text_delta: text.to_string(),
             reasoning_delta: None,
@@ -1133,6 +1134,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, d)| {
                     Ok(LlmStreamChunk {
+                        model: None,
                         choice_index: 0,
                         text_delta: d.to_string(),
                         reasoning_delta: None,
@@ -1425,6 +1427,7 @@ mod tests {
                     tokio::task::yield_now().await;
                     Some((
                         Ok(LlmStreamChunk {
+                            model: None,
                             choice_index: 0,
                             text_delta: "Odpowiadam na pytanie o status projektu. ".to_string(),
                             reasoning_delta: None,

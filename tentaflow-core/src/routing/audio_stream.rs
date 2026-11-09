@@ -165,6 +165,7 @@ mod tests {
     async fn llm_delta_emits_error_frame() {
         use crate::flow_engine::envelope::LlmStreamChunk;
         let exec = make_exec(vec![EnvelopeDelta::Llm(LlmStreamChunk {
+            model: None,
             choice_index: 0,
             text_delta: "hello".into(),
             reasoning_delta: None,

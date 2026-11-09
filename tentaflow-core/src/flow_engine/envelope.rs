@@ -476,6 +476,9 @@ pub struct LlmStreamChunk {
     /// (obok `usage`); regular chunki maja `None`.
     pub perf: Option<GenPerf>,
     pub finish_reason: Option<FinishReason>,
+    /// Model the backend reports it served. Differs from the requested name when
+    /// that was an alias; the event log keeps both.
+    pub model: Option<String>,
     /// Engine-level error embedded w streamie (np. backend rate limit). Adapter
     /// może zdecydować — przerwać flow albo skonsumować i kontynuować.
     pub error: Option<String>,
