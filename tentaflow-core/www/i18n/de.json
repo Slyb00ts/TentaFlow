@@ -10060,6 +10060,7 @@
     "group_turn": "Zug {turn}",
     "group_run": "Lauf",
     "actor_unresolved": "{kind} (unbekannt)",
+    "run_total": "gesamt {time}",
     "detail_first_token": "erstes Token",
     "detail_tokens": "{count} {count|Token|Token}",
     "detail_call": "Aufruf {id}",

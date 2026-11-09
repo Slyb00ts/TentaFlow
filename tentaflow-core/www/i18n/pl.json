@@ -11198,6 +11198,7 @@
     "group_turn": "Tura {turn}",
     "group_run": "Przebieg",
     "actor_unresolved": "{kind} (nieznany)",
+    "run_total": "łącznie {time}",
     "detail_first_token": "pierwszy token",
     "detail_tokens": "{count} {count|token|tokeny|tokenów}",
     "detail_call": "wywołanie {id}",

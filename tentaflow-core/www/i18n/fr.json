@@ -10060,6 +10060,7 @@
     "group_turn": "Tour {turn}",
     "group_run": "Exécution",
     "actor_unresolved": "{kind} (inconnu)",
+    "run_total": "total {time}",
     "detail_first_token": "premier jeton",
     "detail_tokens": "{count} {count|jeton|jetons}",
     "detail_call": "appel {id}",

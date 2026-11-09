@@ -11198,6 +11198,7 @@
     "group_turn": "Turn {turn}",
     "group_run": "Run",
     "actor_unresolved": "{kind} (unknown)",
+    "run_total": "total {time}",
     "detail_first_token": "first token",
     "detail_tokens": "{count} {count|token|tokens}",
     "detail_call": "call {id}",

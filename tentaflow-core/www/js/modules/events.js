@@ -218,6 +218,19 @@ function rangeOptions() {
     .join('');
 }
 
+// Wall-clock span of the loaded rows of one run: the number a person compares
+// with how long the answer took, which no single step or turn shows.
+function runTotal(runId) {
+  let first = Infinity;
+  let last = -Infinity;
+  for (const r of state.rows) {
+    if (r.runId !== runId) continue;
+    first = Math.min(first, r.atMs);
+    last = Math.max(last, r.atMs);
+  }
+  return fmtMs(Math.max(0, last - first), lang());
+}
+
 function renderHead(item) {
   const g = item.group;
   const row = g.first;
@@ -230,7 +243,7 @@ function renderHead(item) {
     actorLabel(row),
   ].filter(Boolean).map(escapeHtml).join(' · ');
   return `<div class="ev-turnhead">${escapeHtml(title)}
-    <span class="sub">${sub} ${bindingTag(row)} · ${escapeHtml(clock(g.first.atMs))}</span>
+    <span class="sub">${sub} ${bindingTag(row)} · ${escapeHtml(clock(g.first.atMs))} · ${escapeHtml(t('run_total', { time: runTotal(g.runId) }))}</span>
   </div>`;
 }
 
