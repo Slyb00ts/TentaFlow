@@ -221,9 +221,10 @@ function rangeOptions() {
 function renderHead(item) {
   const g = item.group;
   const row = g.first;
-  const title = g.turn === null
-    ? t('group_run', { run: g.runId.slice(0, 12) })
-    : t('group_turn', { turn: g.turn });
+  const named = g.rows.find((r) => r.sessionLabel)?.sessionLabel
+    ?? g.rows.find((r) => r.flowName)?.flowName
+    ?? t('group_run');
+  const title = g.turn === null ? named : `${named} · ${t('group_turn', { turn: g.turn })}`;
   const sub = [
     t(`origin_${row.origin}`),
     actorLabel(row),
@@ -265,12 +266,12 @@ function kv(label, value, muted = false) {
 function inspectorKeySection(row) {
   if (row.actorKind !== 'api_key') return '';
   const binding = row.actorUserId
-    ? `${escapeHtml(row.actorUserId)} <span class="tag bound">${escapeHtml(t('key_bound'))}</span>`
+    ? `${escapeHtml(row.actorUserName ?? t('actor_unresolved', { kind: t('actor_kind_user') }))} <span class="tag bound">${escapeHtml(t('key_bound'))}</span>`
     : `<span class="tag unbound">${escapeHtml(t('key_unbound'))}</span> ${escapeHtml(t('key_service'))}`;
   return `<div class="ev-sec">
     <h4>${escapeHtml(t('key_section'))}</h4>
     <dl class="ev-kv">
-      ${kv(t('key_name'), escapeHtml(row.actorId ?? t('unknown_actor')))}
+      ${kv(t('key_name'), escapeHtml(actorLabel(row)))}
       ${kv(t('key_binding'), binding)}
     </dl>
     <div class="ev-sec-actions">
@@ -281,6 +282,7 @@ function inspectorKeySection(row) {
 
 function inspectorLinks(row) {
   const links = [
+    [t('correlation'), row.correlationId],
     [t('link_run'), row.runId],
     [t('link_session'), row.sessionId],
     [t('link_node'), row.nodeId],
@@ -355,12 +357,6 @@ function renderInspector() {
       ${kv(t('origin'), `<span class="ev-origin"><span class="dot ${originClass(row.origin)}"></span>${escapeHtml(t(`origin_${row.origin}`))}</span>`)}
       ${kv(t('actor'), `${escapeHtml(actorLabel(row))} <span class="muted">(${escapeHtml(t(`actor_kind_${row.actorKind}`))})</span>`)}
       ${timing.join('\n      ')}
-      ${kv(
-        t('correlation'),
-        row.correlationId
-          ? escapeHtml(row.correlationId)
-          : `<span class="muted">${escapeHtml(t('none_recorded'))}</span>`,
-      )}
     </dl>
     ${inspectorKeySection(row)}
     ${row.io ? '<div class="ev-sec" id="events-io"></div>' : `<div class="ev-sec">
@@ -639,10 +635,10 @@ function refreshActorOptions() {
     seen.set(row.actorId, row);
   }
   const options = [...seen.values()]
-    .sort((a, b) => a.actorId.localeCompare(b.actorId))
+    .sort((a, b) => actorLabel(a).localeCompare(actorLabel(b)))
     .map((row) => ({
       value: row.actorId,
-      label: row.actorId,
+      label: actorLabel(row),
       description: row.actorKind === 'api_key'
         ? bindingText(row)
         : t(`actor_kind_${row.actorKind}`),
@@ -656,7 +652,7 @@ function renderCorrelationChip() {
   if (!chip) return;
   chip.hidden = !state.correlationId;
   if (state.correlationId) {
-    chip.setAttribute('label', t('correlation_filter', { id: state.correlationId }));
+    chip.setAttribute('label', t('correlation_filter'));
   }
 }
 

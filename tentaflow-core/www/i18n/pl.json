@@ -11196,7 +11196,8 @@
     "empty_no_origin": "Żadne pochodzenie nie jest zaznaczone — nic nie pasuje. Włącz co najmniej jedno.",
     "load_failed": "Nie udało się wczytać zdarzeń: {error}",
     "group_turn": "Tura {turn}",
-    "group_run": "Przebieg {run}",
+    "group_run": "Przebieg",
+    "actor_unresolved": "{kind} (nieznany)",
     "detail_first_token": "pierwszy token",
     "detail_tokens": "{count} {count|token|tokeny|tokenów}",
     "detail_call": "wywołanie {id}",
@@ -11207,7 +11208,6 @@
     "unknown_model": "brak modelu",
     "unknown_tool": "bez nazwy",
     "unknown_step": "bez nazwy",
-    "unknown_actor": "brak identyfikatora",
     "key_section": "Klucz API",
     "key_name": "nazwa",
     "key_binding": "powiązanie",
@@ -11223,10 +11223,9 @@
     "ttft": "TTFT",
     "decoding": "dekodowanie",
     "correlation": "korelacja",
-    "none_recorded": "nie zapisano",
     "in_flight": "w toku — brak końca",
     "details": "Szczegóły",
-    "links": "Powiązania",
+    "links": "Identyfikatory techniczne",
     "link_run": "przebieg",
     "link_session": "sesja",
     "link_node": "node flow",
@@ -11235,7 +11234,7 @@
     "seq_label": "seq {seq}",
     "turn_unknown": "bez tury",
     "payload_unreadable": "Nie udało się odczytać zapisanej treści zdarzenia.",
-    "correlation_filter": "Korelacja: {id}"
+    "correlation_filter": "Filtr: jedna korelacja"
   },
   "tentabus": {
     "title": "TentaBus",

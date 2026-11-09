@@ -10058,7 +10058,8 @@
     "empty_no_origin": "Ningún origen seleccionado — nada coincide. Activa al menos uno.",
     "load_failed": "No se pudieron cargar los eventos: {error}",
     "group_turn": "Turno {turn}",
-    "group_run": "Ejecución {run}",
+    "group_run": "Ejecución",
+    "actor_unresolved": "{kind} (desconocido)",
     "detail_first_token": "primer token",
     "detail_tokens": "{count} {count|token|tokens}",
     "detail_call": "llamada {id}",
@@ -10069,7 +10070,6 @@
     "unknown_model": "sin modelo",
     "unknown_tool": "sin nombre",
     "unknown_step": "sin nombre",
-    "unknown_actor": "sin identificador",
     "key_section": "Clave API",
     "key_name": "nombre",
     "key_binding": "vinculación",
@@ -10085,10 +10085,9 @@
     "ttft": "TTFT",
     "decoding": "decodificación",
     "correlation": "correlación",
-    "none_recorded": "no registrado",
     "in_flight": "en curso — sin fin",
     "details": "Detalles",
-    "links": "Enlaces",
+    "links": "Identificadores técnicos",
     "link_run": "ejecución",
     "link_session": "sesión",
     "link_node": "nodo de flujo",
@@ -10097,7 +10096,7 @@
     "seq_label": "seq {seq}",
     "turn_unknown": "sin turno",
     "payload_unreadable": "No se pudo leer el contenido almacenado del evento.",
-    "correlation_filter": "Correlación: {id}"
+    "correlation_filter": "Filtro: una correlación"
   },
   "tentabus": {
     "title": "TentaBus",

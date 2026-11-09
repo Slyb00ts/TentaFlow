@@ -100,13 +100,111 @@ fn db_error(scope: &str, error: anyhow::Error) -> ProtocolError {
     ProtocolError::internal("events database error")
 }
 
+/// Names for the ids a page of rows carries, looked up once per distinct id.
+/// A row that names nobody the lookup can find keeps `None`: the screen says the
+/// name is unknown rather than printing an id nobody can read.
+struct Names<'a> {
+    ctx: &'a HandlerContext,
+    actors: std::collections::HashMap<(String, String), Option<String>>,
+    sessions: std::collections::HashMap<String, Option<String>>,
+    flows: std::collections::HashMap<String, Option<String>>,
+}
+
+impl<'a> Names<'a> {
+    fn new(ctx: &'a HandlerContext) -> Self {
+        Self {
+            ctx,
+            actors: Default::default(),
+            sessions: Default::default(),
+            flows: Default::default(),
+        }
+    }
+
+    fn query_one(&self, sql: &str, id: &str) -> Option<String> {
+        let conn = self.ctx.state.db.read().ok()?;
+        conn.query_row(sql, rusqlite::params![id], |row| row.get::<_, Option<String>>(0))
+            .ok()
+            .flatten()
+            .filter(|name| !name.is_empty())
+    }
+
+    fn actor(&mut self, kind: &str, id: Option<&str>) -> Option<String> {
+        let id = id?;
+        let key = (kind.to_string(), id.to_string());
+        if let Some(hit) = self.actors.get(&key) {
+            return hit.clone();
+        }
+        let name = match kind {
+            "user" => self.query_one(
+                "SELECT COALESCE(NULLIF(display_name, ''), username) FROM user_accounts WHERE id = ?1",
+                id,
+            ),
+            "api_key" => self.query_one("SELECT name FROM api_keys WHERE uid = ?1", id),
+            "addon" => self
+                .query_one(
+                    "SELECT instance_name FROM addon_instances WHERE instance_id = ?1",
+                    id,
+                )
+                // An addon actor is usually the addon's own slug, which is
+                // already a name.
+                .or_else(|| uuid::Uuid::parse_str(id).is_err().then(|| id.to_string())),
+            // System components are named by what they are (`scheduler`, …).
+            _ => uuid::Uuid::parse_str(id).is_err().then(|| id.to_string()),
+        };
+        self.actors.insert(key, name.clone());
+        name
+    }
+
+    fn session(&mut self, origin: &str, session_id: Option<&str>) -> Option<String> {
+        let id = session_id?;
+        if origin != "project" {
+            return None;
+        }
+        if let Some(hit) = self.sessions.get(id) {
+            return hit.clone();
+        }
+        let label = crate::project_studio::db::pool().ok().and_then(|pool| {
+            let conn = pool.read().ok()?;
+            conn.query_row(
+                "SELECT p.name, c.title FROM project_chats c \
+                 JOIN projects p ON p.project_id = c.project_id WHERE c.session_id = ?1",
+                rusqlite::params![id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .ok()
+            .map(|(project, title)| match title.filter(|t| !t.is_empty()) {
+                Some(title) => format!("{project} · {title}"),
+                None => project,
+            })
+        });
+        self.sessions.insert(id.to_string(), label.clone());
+        label
+    }
+
+    fn flow(&mut self, payload: &crate::events::EventPayload) -> Option<String> {
+        let crate::events::EventPayload::RequestStarted {
+            flow_id: Some(flow_id),
+            ..
+        } = payload
+        else {
+            return None;
+        };
+        if let Some(hit) = self.flows.get(flow_id) {
+            return hit.clone();
+        }
+        let name = self.query_one("SELECT name FROM flows WHERE id = ?1", flow_id);
+        self.flows.insert(flow_id.clone(), name.clone());
+        name
+    }
+}
+
 /// One stored row on the wire. `payload_json` is re-serialised from the decoded
 /// payload rather than passed through as a string: the decode already happened
 /// (it is how an unreadable row is refused), and re-encoding the typed value
 /// guarantees the browser never receives a payload this build could not parse.
 /// The content is unchanged — including an `assistant_message` whose body the
 /// writer omitted, which stays an omission marker here.
-fn to_wire(event: StoredEvent) -> Result<EventRowWire, ProtocolError> {
+fn to_wire(event: StoredEvent, names: &mut Names) -> Result<EventRowWire, ProtocolError> {
     // A page of rows must not carry every step's prompt: the body of a
     // `step_io` row is fetched on its own (`step_io`), the page keeps the sizes.
     let mut payload = event.payload;
@@ -115,6 +213,10 @@ fn to_wire(event: StoredEvent) -> Result<EventRowWire, ProtocolError> {
     }
     let payload_json =
         crate::events::store::to_json(&payload).map_err(|e| db_error("payload_encode", e))?;
+    let actor_name = names.actor(event.actor_kind.as_str(), event.actor_id.as_deref());
+    let session_label = names.session(event.origin.as_str(), event.session_id.as_deref());
+    let flow_name = names.flow(&payload);
+    let actor_user_name = names.actor("user", event.actor_user_id.as_deref());
     Ok(EventRowWire {
         run_id: event.run_id,
         seq: event.seq,
@@ -130,6 +232,10 @@ fn to_wire(event: StoredEvent) -> Result<EventRowWire, ProtocolError> {
         node_id: event.node_id,
         call_id: event.call_id,
         payload_json,
+        actor_name,
+        session_label,
+        flow_name,
+        actor_user_name,
     })
 }
 
@@ -183,10 +289,11 @@ fn browse(ctx: &HandlerContext, req: &EventsBrowseRequest) -> Result<MessageBody
         req.limit as usize
     };
     let page = events::browse(&pool, &filter, limit).map_err(|e| db_error("browse", e))?;
+    let mut names = Names::new(ctx);
     let rows = page
         .events
         .into_iter()
-        .map(to_wire)
+        .map(|event| to_wire(event, &mut names))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(MessageBody::EventsBody(EventsPayload::BrowseResponse(
@@ -240,9 +347,10 @@ fn run_timeline(
     let next_after_seq = (events.len() == limit)
         .then(|| events.last().map(|e| e.seq))
         .flatten();
+    let mut names = Names::new(ctx);
     let events = events
         .into_iter()
-        .map(to_wire)
+        .map(|event| to_wire(event, &mut names))
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(MessageBody::EventsBody(EventsPayload::RunResponse(

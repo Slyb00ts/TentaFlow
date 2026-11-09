@@ -10058,7 +10058,8 @@
     "empty_no_origin": "Keine Herkunft ausgewählt — nichts passt. Mindestens eine einschalten.",
     "load_failed": "Ereignisse konnten nicht geladen werden: {error}",
     "group_turn": "Zug {turn}",
-    "group_run": "Lauf {run}",
+    "group_run": "Lauf",
+    "actor_unresolved": "{kind} (unbekannt)",
     "detail_first_token": "erstes Token",
     "detail_tokens": "{count} {count|Token|Token}",
     "detail_call": "Aufruf {id}",
@@ -10069,7 +10070,6 @@
     "unknown_model": "kein Modell",
     "unknown_tool": "ohne Namen",
     "unknown_step": "ohne Namen",
-    "unknown_actor": "keine Kennung",
     "key_section": "API-Schlüssel",
     "key_name": "Name",
     "key_binding": "Bindung",
@@ -10085,10 +10085,9 @@
     "ttft": "TTFT",
     "decoding": "Dekodierung",
     "correlation": "Korrelation",
-    "none_recorded": "nicht erfasst",
     "in_flight": "läuft — kein Ende",
     "details": "Details",
-    "links": "Verknüpfungen",
+    "links": "Technische Kennungen",
     "link_run": "Lauf",
     "link_session": "Sitzung",
     "link_node": "Flow-Knoten",
@@ -10097,7 +10096,7 @@
     "seq_label": "Seq {seq}",
     "turn_unknown": "ohne Zug",
     "payload_unreadable": "Der gespeicherte Ereignisinhalt konnte nicht gelesen werden.",
-    "correlation_filter": "Korrelation: {id}"
+    "correlation_filter": "Filter: eine Korrelation"
   },
   "tentabus": {
     "title": "TentaBus",

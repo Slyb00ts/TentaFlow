@@ -11196,7 +11196,8 @@
     "empty_no_origin": "No origin is selected — nothing matches. Turn at least one on.",
     "load_failed": "Could not load events: {error}",
     "group_turn": "Turn {turn}",
-    "group_run": "Run {run}",
+    "group_run": "Run",
+    "actor_unresolved": "{kind} (unknown)",
     "detail_first_token": "first token",
     "detail_tokens": "{count} {count|token|tokens}",
     "detail_call": "call {id}",
@@ -11207,7 +11208,6 @@
     "unknown_model": "no model",
     "unknown_tool": "unnamed",
     "unknown_step": "unnamed",
-    "unknown_actor": "no identifier",
     "key_section": "API key",
     "key_name": "name",
     "key_binding": "binding",
@@ -11223,10 +11223,9 @@
     "ttft": "TTFT",
     "decoding": "decoding",
     "correlation": "correlation",
-    "none_recorded": "not recorded",
     "in_flight": "in flight — no end",
     "details": "Details",
-    "links": "Links",
+    "links": "Technical identifiers",
     "link_run": "run",
     "link_session": "session",
     "link_node": "flow node",
@@ -11235,7 +11234,7 @@
     "seq_label": "seq {seq}",
     "turn_unknown": "no turn",
     "payload_unreadable": "The stored event body could not be read.",
-    "correlation_filter": "Correlation: {id}"
+    "correlation_filter": "Filter: one correlation"
   },
   "tentabus": {
     "title": "TentaBus",
