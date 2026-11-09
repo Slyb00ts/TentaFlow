@@ -53,6 +53,11 @@ const META_HARNESS_DONE: &str = "harness_done";
 const META_OVERVIEW_FOCUS: &str = "rag_overview_focus";
 /// Meta key: the overview was already added, so the judge cannot ask for it twice.
 const META_OVERVIEW_DONE: &str = "rag_overview_done";
+/// Meta key: the file catalog was already added to the context.
+const META_CATALOG_DONE: &str = "rag_catalog_done";
+/// Files listed in the catalog and how much of each summary it quotes.
+const CATALOG_FILES: u32 = 60;
+const CATALOG_GIST_CHARS: usize = 240;
 
 /// Files an overview digests. A chat turn waits for it, so a larger project is
 /// sampled instead of folded whole.
@@ -486,6 +491,51 @@ fn project_id_from_scope(scope: &str) -> Option<&str> {
     scope.strip_prefix("ps-")
 }
 
+/// Adds a passage that spans the whole project at the top of the accumulated
+/// context, so the judge, the answer and the citation list treat it like any
+/// retrieved passage.
+fn insert_top_passage(out: &mut FlowEnvelope, doc_id: &str, title: &str, text: String) {
+    let mut accumulated = passages_from_meta(out, META_ACCUMULATED);
+    accumulated.insert(
+        0,
+        serde_json::json!({
+            "doc_id": doc_id,
+            "chunk_index": 0,
+            "path": title,
+            "text": text,
+            "score": 1.0,
+        }),
+    );
+    out.meta.insert(
+        META_ACCUMULATED.to_string(),
+        Value::Array(merge_accumulated(&accumulated, &[])),
+    );
+    let question = out
+        .meta
+        .get(META_ORIGINAL_QUESTION)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    out.payload = FlowValue::Text(build_context_text(
+        &question,
+        &passages_from_meta(out, META_ACCUMULATED),
+    ));
+}
+
+/// One line per file: path plus the opening of its stored summary.
+fn catalog_text(rows: &[crate::project_studio::summary::StoredSummary], total: u32) -> String {
+    let mut text = format!(
+        "Pliki w projekcie ({} z {total}), kazdy z poczatkiem streszczenia:\n",
+        rows.len()
+    );
+    for r in rows {
+        let gist: String = r.summary.split_whitespace().collect::<Vec<_>>().join(" ");
+        let gist: String = gist.chars().take(CATALOG_GIST_CHARS).collect();
+        text.push_str(&format!("- {}: {gist}\n", r.path));
+    }
+    text
+}
+
 #[async_trait]
 impl NodeAdapter for RagOverviewNodeAdapter {
     fn node_type(&self) -> &str {
@@ -511,15 +561,45 @@ impl NodeAdapter for RagOverviewNodeAdapter {
             .ok_or_else(|| anyhow!("rag_overview: brak krawędzi wejściowej"))?;
         let mut out: FlowEnvelope = (*input.envelope).clone();
 
-        // The focus is the judge's request; without one this round is a plain
-        // retrieval round and the node is a pass-through.
+        // The scope and the user come from the context the chat handler minted,
+        // never from the model; membership is re-checked like for the tools.
+        let project_id = ctx.addon_id.as_deref().and_then(project_id_from_scope);
+        let org = ctx
+            .org_id
+            .clone()
+            .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
+
+        // Without the judge's request the node only adds the file catalog, once:
+        // a small judge does not reliably ask for an overview, yet "which files
+        // are there" must be answerable from the first round.
         let Some(focus) = out
             .meta
             .remove(META_OVERVIEW_FOCUS)
             .and_then(|v| v.as_str().map(str::to_string))
         else {
+            let (Some(project_id), Some(user_id)) = (project_id, ctx.user_id.as_deref()) else {
+                return Ok(out);
+            };
+            if out.meta.contains_key(META_CATALOG_DONE) {
+                return Ok(out);
+            }
+            out.meta
+                .insert(META_CATALOG_DONE.to_string(), Value::Bool(true));
+            knowledge::require_member(&org, project_id, user_id)?;
+            let pool = project_db::open(project_id)?;
+            let (rows, total) = summary::list_summaries(&pool, &[], 0, CATALOG_FILES)?;
+            if rows.is_empty() {
+                return Ok(out);
+            }
+            let text = catalog_text(&rows, total);
+            insert_top_passage(&mut out, "project-files", "Pliki projektu", text);
             return Ok(out);
         };
+        let project_id = project_id.ok_or_else(|| anyhow!("rag_overview: not a project scope"))?;
+        let user_id = ctx
+            .user_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("rag_overview: requires a user identity"))?;
         out.meta
             .insert(META_OVERVIEW_DONE.to_string(), Value::Bool(true));
 
@@ -530,22 +610,6 @@ impl NodeAdapter for RagOverviewNodeAdapter {
             .unwrap_or("")
             .to_string();
         let focus = if focus.is_empty() { question } else { focus };
-
-        // The scope and the user come from the context the chat handler minted,
-        // never from the model; membership is re-checked like for the tools.
-        let project_id = ctx
-            .addon_id
-            .as_deref()
-            .and_then(project_id_from_scope)
-            .ok_or_else(|| anyhow!("rag_overview: not a project scope"))?;
-        let user_id = ctx
-            .user_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("rag_overview: requires a user identity"))?;
-        let org = ctx
-            .org_id
-            .clone()
-            .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
         knowledge::require_member(&org, project_id, user_id)?;
 
         let pool = project_db::open(project_id)?;
@@ -573,31 +637,7 @@ impl NodeAdapter for RagOverviewNodeAdapter {
             digest["digest"].as_str().unwrap_or_default()
         );
 
-        // The overview enters like any passage, so the judge, the answer and the
-        // citation list treat it uniformly. Top score: it is the one source that
-        // spans the whole project.
-        let mut accumulated = passages_from_meta(&out, META_ACCUMULATED);
-        accumulated.insert(
-            0,
-            serde_json::json!({
-                "doc_id": "project-overview",
-                "chunk_index": 0,
-                "path": "Podsumowanie projektu",
-                "text": text,
-                "score": 1.0,
-            }),
-        );
-        out.meta.insert(
-            META_ACCUMULATED.to_string(),
-            Value::Array(merge_accumulated(&accumulated, &[])),
-        );
-        out.payload = FlowValue::Text(build_context_text(
-            out.meta
-                .get(META_ORIGINAL_QUESTION)
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            &passages_from_meta(&out, META_ACCUMULATED),
-        ));
+        insert_top_passage(&mut out, "project-overview", "Podsumowanie projektu", text);
         Ok(out)
     }
 }
@@ -1062,7 +1102,9 @@ mod tests {
         let v = parse_judge_verdict(r#"{"enough": false, "overview": true, "focus": "decyzje"}"#);
         assert!(!v.enough);
         assert_eq!(v.overview.as_deref(), Some("decyzje"));
-        assert!(parse_judge_verdict(r#"{"enough": true}"#).overview.is_none());
+        assert!(parse_judge_verdict(r#"{"enough": true}"#)
+            .overview
+            .is_none());
     }
 
     #[tokio::test]
