@@ -1184,6 +1184,28 @@ fn tree_mime(path: &str) -> &'static str {
     }
 }
 
+/// MIME of a prose/data file by extension, or "" for anything else. A tree file
+/// has no declared type, and the content classifier alone only recognises
+/// binary formats, so without this a README.md or notes.txt inside a ZIP or a
+/// repository would be dropped as "unknown". Other extensions stay "" so the
+/// classifier still decides, instead of `tree_mime`'s text/plain default
+/// admitting binaries.
+fn tree_text_mime(path: &str) -> &'static str {
+    match path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "md" | "markdown" => "text/markdown",
+        "json" => "application/json",
+        "csv" | "tsv" => "text/csv",
+        "txt" | "rst" | "log" => "text/plain",
+        _ => "",
+    }
+}
+
 /// Walks an extracted/cloned source tree, keeps the text and source-code files
 /// within the budgets and writes each one into `<dir_path>/files/<sha256>`.
 /// Returns the collected files in stable path order. Blocking IO — call from
@@ -1226,7 +1248,7 @@ pub fn collect_tree_files(root: &Path, dir_path: &Path) -> Result<Vec<CollectedF
             let Ok(bytes) = std::fs::read(&path) else {
                 continue;
             };
-            if !is_text_preview(&rel_path, "", &bytes) {
+            if !is_text_preview(&rel_path, tree_text_mime(&rel_path), &bytes) {
                 continue;
             }
             if out.len() >= MAX_TREE_FILES {
@@ -4360,5 +4382,38 @@ mod tests {
             );
             std::mem::forget(root);
         }
+    }
+}
+
+#[cfg(test)]
+mod tree_collect_tests {
+    use super::*;
+
+    #[test]
+    fn tree_keeps_prose_and_data_files_but_not_binaries() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("docs/policy.md", b"# Policy".as_slice()),
+            ("docs/notes.txt", b"plain notes"),
+            ("data/servers.csv", b"a,b\n1,2\n"),
+            ("src/main.py", b"print(1)"),
+            ("bin_like.dat", &[0u8, 159, 146, 150, 0, 1, 2]),
+        ] {
+            let path = root.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        let files = collect_tree_files(root.path(), dir.path()).unwrap();
+        let paths: Vec<_> = files.iter().map(|f| f.rel_path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "data/servers.csv",
+                "docs/notes.txt",
+                "docs/policy.md",
+                "src/main.py"
+            ]
+        );
     }
 }

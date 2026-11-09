@@ -61,7 +61,7 @@ const META_OVERVIEW_DONE: &str = "rag_overview_done";
 const META_CATALOG_DONE: &str = "rag_catalog_done";
 /// Files listed in the catalog and how much of each summary it quotes.
 const CATALOG_FILES: u32 = 40;
-const CATALOG_GIST_CHARS: usize = 200;
+const CATALOG_GIST_CHARS: usize = 300;
 
 /// Files an overview digests. A chat turn waits for it, so a larger project is
 /// sampled instead of folded whole.
@@ -534,12 +534,19 @@ fn insert_top_passage(out: &mut FlowEnvelope, doc_id: &str, title: &str, text: S
 /// One line per file: path plus the opening of its stored summary.
 fn catalog_text(rows: &[crate::project_studio::summary::StoredSummary], total: u32) -> String {
     let mut text = format!(
-        "Pliki w projekcie ({} z {total}), kazdy z poczatkiem streszczenia:\n",
+        "Pliki w projekcie ({} z {total}), kazdy z poczatkiem streszczenia (wpis zakonczony znakiem […] jest SKROCONY):\n",
         rows.len()
     );
     for r in rows {
         let gist: String = r.summary.split_whitespace().collect::<Vec<_>>().join(" ");
-        let gist: String = gist.chars().take(CATALOG_GIST_CHARS).collect();
+        // A cut preview is marked, or the answer model reads the missing tail
+        // (a code, a number) as absent and invents it.
+        let gist = if gist.chars().count() > CATALOG_GIST_CHARS {
+            let head: String = gist.chars().take(CATALOG_GIST_CHARS).collect();
+            format!("{head} […]")
+        } else {
+            gist
+        };
         text.push_str(&format!("- {}: {gist}\n", r.path));
     }
     text
