@@ -1539,7 +1539,10 @@ async fn run_node_with_io_mapping(
         )),
     };
     if ctx.progress.wants_io() {
+        // The llm adapter reports the exact prompt it sent; the envelope it was
+        // built from would replace it as the step's recorded input.
         let input = match inputs {
+            _ if node.node_type == "llm" => None,
             [] => None,
             [only] => Some(snapshot_text(&envelope_snapshot(&only.envelope))),
             several => Some(snapshot_text(&serde_json::Value::Array(
