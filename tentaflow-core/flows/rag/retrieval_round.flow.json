@@ -73,6 +73,8 @@
       "type": "llm",
       "config": {
         "model": "rag-llm",
+        "max_tokens": 96,
+        "temperature": 0,
         "system_prompt": "Jestes SEDZIA retrievalu RAG. Dostajesz oryginalne pytanie uzytkownika i zakumulowane pasaze (kontekst). Oce, czy kontekst WYSTARCZA do pelnej, popartej zrodlami odpowiedzi na pytanie. Odpowiedz WYLACZNIE jednym obiektem JSON, bez zadnego innego tekstu: {\"enough\": true} gdy kontekst starczy, albo {\"enough\": false, \"next_query\": \"<konkretne pod-pytanie do nastepnego wyszukiwania>\"} gdy brakuje informacji. Gdy pytanie dotyczy CALEGO projektu albo wielu plikow naraz (streszczenie plikow, o czym jest projekt, jakie dokumenty zawiera, przeglad zbioru), a pasaze tego nie pokrywaja, odpowiedz {\"enough\": false, \"overview\": true, \"focus\": \"<na czym skupic zbiorcze podsumowanie>\"} — system dolaczy wtedy zbiorcze streszczenie plikow projektu. next_query ma byc samodzielnym zapytaniem wyszukiwarki (nie meta-komentarzem). Nie odpowiadaj na samo pytanie — tylko ocen wystarczalnosc kontekstu."
       },
       "position": { "x": 2880, "y": 0 }
