@@ -108,7 +108,9 @@ const SOURCE_KIND_ICON = { document: 'file-text', url: 'globe', git: 'branch', z
 const SOURCE_STATUS_CHIP = { pending: 'info', indexing: 'accent', ready: 'ok', error: 'err', cancelled: 'warn' };
 const FILE_STATUS_CHIP = { pending: 'info', indexing: 'accent', ready: 'ok', skipped: 'warn', error: 'err' };
 
-const UPLOAD_CHUNK_BYTES = 1024 * 1024;
+// A raw 1 MiB chunk plus the CBOR envelope exceeds the 1 MiB binary-WS frame
+// limit, so the connection was closed for every file above ~1 MiB.
+const UPLOAD_CHUNK_BYTES = 512 * 1024;
 const FILES_PAGE_SIZE = 50;
 const INGEST_POLL_MS = 3000;
 const INGEST_LOG_CAP = 200;
@@ -2814,15 +2816,15 @@ function openSourceWindow() {
     }
   });
 
-  // Uploads one file in 1 MiB chunks; the final chunk response carries the
-  // content-hash file_ref used by SourceCreate.
+  // Uploads one file in 512 KiB chunks read lazily from the File, so a
+  // multi-GB file never sits in browser memory; the final chunk response
+  // carries the content-hash file_ref used by SourceCreate.
   const uploadFile = async (item, index) => {
     const uploadId = crypto.randomUUID();
-    const buffer = new Uint8Array(await item.file.arrayBuffer());
-    const totalChunks = Math.max(1, Math.ceil(buffer.length / UPLOAD_CHUNK_BYTES));
+    const totalChunks = Math.max(1, Math.ceil(item.file.size / UPLOAD_CHUNK_BYTES));
     let fileRef = null;
     for (let seq = 0; seq < totalChunks; seq += 1) {
-      const chunk = buffer.subarray(seq * UPLOAD_CHUNK_BYTES, Math.min((seq + 1) * UPLOAD_CHUNK_BYTES, buffer.length));
+      const chunk = new Uint8Array(await item.file.slice(seq * UPLOAD_CHUNK_BYTES, Math.min((seq + 1) * UPLOAD_CHUNK_BYTES, item.file.size)).arrayBuffer());
       const resp = await ApiBinary.one('projectStudioSourceUploadChunkRequest', {
         projectId: projectId(),
         uploadId,
