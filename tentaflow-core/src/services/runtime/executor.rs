@@ -439,7 +439,7 @@ impl ModelRuntimeExecutor {
         );
     }
 
-    /// Buduje lekki recorder metryk dla streamu (Local Http/Quic). Wymiary
+    /// Buduje lekki recorder metryk dla streamu (Local Embedded/Http/Quic). Wymiary
     /// klonowane do `String`, bo `ExternalPerfStream` drenuje w osobnym tasku bez
     /// dostepu do `target`/`ctx`. `None` gdy brak db albo target nie jest lokalny.
     fn stream_recorder(
@@ -726,6 +726,8 @@ impl ModelRuntimeExecutor {
         match target {
             ResolvedExecutionTarget::Local { handle, .. } => match handle {
                 BackendHandle::Embedded { .. } => {
+                    let dispatch_at = std::time::Instant::now();
+                    let recorder = self.stream_recorder(target, ctx);
                     let rx = self
                         .local_inference
                         .stream_chat_chunks(&request, request.tools.as_deref())
@@ -734,7 +736,11 @@ impl ModelRuntimeExecutor {
                     let stream = futures::stream::unfold(rx, |mut rx| async move {
                         rx.recv().await.map(|chunk| (Ok(chunk), rx))
                     });
-                    Ok(Box::pin(stream))
+                    Ok(Box::pin(ExternalPerfStream::new(
+                        Box::pin(stream),
+                        dispatch_at,
+                        recorder,
+                    )))
                 }
                 BackendHandle::Http(client) => {
                     // Wymuszamy `include_usage` upstream — bez niego vLLM/sglang
@@ -4442,16 +4448,20 @@ impl ExternalPerfStream {
                                 // Finalny chunk to ten, który niesie usage (vLLM/sglang
                                 // usage-tail albo QUIC Done z final_metrics) — wtedy
                                 // doklejamy perf.
-                                if chunk.usage.is_some() && chunk.perf.is_none() {
-                                    chunk.perf = Some(build_external_perf(
-                                        start,
-                                        first_token_at,
-                                        last_token_at,
-                                        chunk.usage.as_ref(),
-                                    ));
-                                    // Finalny chunk niesie usage + swiezo doklejony
-                                    // perf — jedyny punkt streamu gdzie oba wspolistnieja,
-                                    // wiec tu (raz) stemplujemy metryke modelu.
+                                if chunk.usage.is_some() {
+                                    // An embedded engine measures its own perf and sends
+                                    // it with the usage; only a remote one needs ours.
+                                    if chunk.perf.is_none() {
+                                        chunk.perf = Some(build_external_perf(
+                                            start,
+                                            first_token_at,
+                                            last_token_at,
+                                            chunk.usage.as_ref(),
+                                        ));
+                                    }
+                                    // Finalny chunk niesie usage + perf — jedyny punkt
+                                    // streamu gdzie oba wspolistnieja, wiec tu (raz)
+                                    // stemplujemy metryke modelu.
                                     if !recorded {
                                         if let Some(rec) = &recorder {
                                             if let (Some(u), Some(p)) =
@@ -5225,6 +5235,76 @@ mod tests {
         // Kolejny aliasowy fallback inkrementuje dalej (do 2).
         note_fallback(alias, true, 3, "http");
         assert_eq!(alias_fallback_count(alias), 2);
+    }
+
+    /// An embedded engine sends its usage together with its own perf. Streaming
+    /// answers from it used to bypass the rollup entirely (only blocking calls were
+    /// counted), so analytics showed prompt tokens of the judge calls and none of
+    /// the generated answers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_with_engine_perf_is_recorded_in_the_rollup() {
+        use crate::api::openai::types::{ChunkChoice, Delta, GenPerf, Usage};
+        use futures::StreamExt;
+
+        let pool = crate::db::init(std::path::Path::new(":memory:")).expect("init test db");
+        let recorder = StreamMetricsRecorder {
+            db: pool.clone(),
+            node_id: "node-A".into(),
+            org_id: crate::services::org::DEFAULT_ORG_ID.into(),
+            user_id: "u1".into(),
+            model_id: "embedded-model".into(),
+            service_key: "embedded/embedded-model".into(),
+            backend: "embedded".into(),
+        };
+        let chunk = ChatCompletionChunk {
+            id: "test".into(),
+            object: "chat.completion.chunk".into(),
+            created: 0,
+            model: "embedded-model".into(),
+            choices: vec![ChunkChoice {
+                index: 0,
+                delta: Delta {
+                    role: None,
+                    content: Some("x".into()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                },
+                finish_reason: None,
+                logprobs: None,
+            }],
+            system_fingerprint: None,
+            audio: None,
+            detected_intent: None,
+            detected_tools: None,
+            transcribed_text: None,
+            speaker_id: None,
+            speaker_name: None,
+            usage: Some(Usage {
+                prompt_tokens: 3000,
+                completion_tokens: 700,
+                total_tokens: 3700,
+            }),
+            perf: Some(GenPerf {
+                ttft_ms: 400,
+                prefill_tps: 7500.0,
+                decode_tps: 25.0,
+                total_ms: 28000,
+            }),
+        };
+        let inner: ExecutorChunkStream = Box::pin(futures::stream::iter(vec![Ok(chunk)]));
+        let mut stream = ExternalPerfStream::new(inner, std::time::Instant::now(), Some(recorder));
+        while stream.next().await.is_some() {}
+
+        let rows = crate::db::repository::list_model_metrics_rollup(
+            &pool,
+            crate::services::org::DEFAULT_ORG_ID,
+            &Default::default(),
+        )
+        .expect("list rollup");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_count, 1);
+        assert_eq!(rows[0].prompt_tokens, 3000);
+        assert_eq!(rows[0].completion_tokens, 700);
     }
 
     /// Test regresyjny odsprzęgania pomiaru decode tok/s od tempa konsumpcji.
