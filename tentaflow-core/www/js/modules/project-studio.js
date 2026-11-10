@@ -1790,7 +1790,6 @@ function renderProjectShell() {
       <span slot="badges" class="ps-head-badges">
         <tf-chip status="accent">${sprite('users')} ${escapeHtml(t('head_members', { count: memberCount }))}</tf-chip>
         <tf-chip>${escapeHtml(accessSummary(project))}</tf-chip>
-        ${functionChips(projectAccess().functions)}
         <tf-chip status="info">${sprite('database')} ${escapeHtml(t('head_sources', { count: sourceCount }))}</tf-chip>
         <tf-chip status="info">${sprite('grid-rows')} ${escapeHtml(t('modules_chip'))}: ${escapeHtml(orientationLabel(project))}</tf-chip>
       </span>

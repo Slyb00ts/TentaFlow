@@ -3477,6 +3477,13 @@
   margin-bottom: 14px;
 }
 
+.ps-head-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  align-items: center;
+}
+
 /* Header meta chips read as sentences ("6 członków"), not as uppercase labels —
    the uppercase chip style belongs to statuses. */
 .ps-head-badges tf-chip .tf-chip {
