@@ -16132,6 +16132,7 @@
     "diagram_wait_gateway": "Detenido en una compuerta",
     "diagram_wait_scope": "Dentro de un subproceso",
     "diagram_wait_ready": "Listo para continuar",
+    "diagram_wait_blocked": "Bloqueado, requiere atención",
     "diagram_token_count": "{count} {count|token|tokens}",
     "diagram_incident_count": "{count} {count|incidente|incidentes}",
     "diagram_legend": "Leyenda",
@@ -16171,4 +16172,3 @@
     "heart": "corazón"
   }
 }
-    "diagram_wait_blocked": "Bloqueado, requiere atención",

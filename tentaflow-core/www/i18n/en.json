@@ -17270,6 +17270,7 @@
     "diagram_wait_gateway": "Held at a gateway",
     "diagram_wait_scope": "Inside a subprocess",
     "diagram_wait_ready": "Ready to continue",
+    "diagram_wait_blocked": "Blocked, needs attention",
     "diagram_token_count": "{count} {count|token|tokens}",
     "diagram_incident_count": "{count} {count|incident|incidents}",
     "diagram_legend": "Legend",
@@ -17309,4 +17310,3 @@
     "heart": "heart"
   }
 }
-    "diagram_wait_blocked": "Blocked, needs attention",

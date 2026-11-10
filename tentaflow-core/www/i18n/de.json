@@ -16132,6 +16132,7 @@
     "diagram_wait_gateway": "An einem Gateway angehalten",
     "diagram_wait_scope": "Innerhalb eines Teilprozesses",
     "diagram_wait_ready": "Bereit zum Weitergehen",
+    "diagram_wait_blocked": "Blockiert, braucht Aufmerksamkeit",
     "diagram_token_count": "{count} {count|Token|Token}",
     "diagram_incident_count": "{count} {count|Vorfall|Vorfälle}",
     "diagram_legend": "Legende",
@@ -16171,4 +16172,3 @@
     "heart": "Herz"
   }
 }
-    "diagram_wait_blocked": "Blockiert, braucht Aufmerksamkeit",

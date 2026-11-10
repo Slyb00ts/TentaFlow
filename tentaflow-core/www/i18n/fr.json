@@ -16132,6 +16132,7 @@
     "diagram_wait_gateway": "Retenu à une passerelle",
     "diagram_wait_scope": "Dans un sous-processus",
     "diagram_wait_ready": "Prêt à continuer",
+    "diagram_wait_blocked": "Bloqué, demande de l’attention",
     "diagram_token_count": "{count} {count|jeton|jetons}",
     "diagram_incident_count": "{count} {count|incident|incidents}",
     "diagram_legend": "Légende",
@@ -16171,4 +16172,3 @@
     "heart": "cœur"
   }
 }
-    "diagram_wait_blocked": "Bloqué, demande de l’attention",

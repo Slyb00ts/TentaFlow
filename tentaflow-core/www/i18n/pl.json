@@ -17270,6 +17270,7 @@
     "diagram_wait_gateway": "Zatrzymany na bramce",
     "diagram_wait_scope": "Wewnątrz podprocesu",
     "diagram_wait_ready": "Gotowy do dalszej drogi",
+    "diagram_wait_blocked": "Zablokowany, wymaga uwagi",
     "diagram_token_count": "{count} {count|token|tokeny|tokenów}",
     "diagram_incident_count": "{count} {count|incydent|incydenty|incydentów}",
     "diagram_legend": "Legenda",
@@ -17309,4 +17310,3 @@
     "heart": "serce"
   }
 }
-    "diagram_wait_blocked": "Zablokowany, wymaga uwagi",
