@@ -60,8 +60,13 @@ fn emit_node_finished(ctx: &ExecutionContext, node_id: &str, status: &TraceStatu
 
 /// What one envelope contributes to the step content kept by the event log:
 /// its payload (binary payloads only by kind and size) and, when a retrieval put
-/// them there, the passages it cites.
-fn envelope_snapshot(envelope: &FlowEnvelope) -> serde_json::Value {
+/// them there, the passages it cites. `unchanged_from` is the envelope the step
+/// was fed: passages it merely carried along are not the step's own output, and
+/// repeating them under every step buries what the step actually produced.
+fn envelope_snapshot(
+    envelope: &FlowEnvelope,
+    unchanged_from: Option<&FlowEnvelope>,
+) -> serde_json::Value {
     use crate::flow_engine::envelope::FlowValue;
     let payload = match &envelope.payload {
         FlowValue::Empty => serde_json::Value::Null,
@@ -74,7 +79,10 @@ fn envelope_snapshot(envelope: &FlowEnvelope) -> serde_json::Value {
         | FlowValue::Other { mime, .. } => serde_json::json!({ "binary": mime }),
     };
     match envelope.meta.get("rag_citations") {
-        Some(citations) if citations.as_array().is_some_and(|c| !c.is_empty()) => {
+        Some(citations)
+            if citations.as_array().is_some_and(|c| !c.is_empty())
+                && unchanged_from.is_none_or(|from| from.meta.get("rag_citations") != Some(citations)) =>
+        {
             serde_json::json!({ "payload": payload, "citations": citations })
         }
         _ => payload,
@@ -1557,16 +1565,19 @@ async fn run_node_with_io_mapping(
         let input = match inputs {
             _ if node.node_type == "llm" => None,
             [] => None,
-            [only] => Some(snapshot_text(&envelope_snapshot(&only.envelope))),
+            [only] => Some(snapshot_text(&envelope_snapshot(&only.envelope, None))),
             several => Some(snapshot_text(&serde_json::Value::Array(
                 several
                     .iter()
-                    .map(|i| envelope_snapshot(&i.envelope))
+                    .map(|i| envelope_snapshot(&i.envelope, None))
                     .collect(),
             ))),
         };
         let output = match &result {
-            Ok(envelope) => snapshot_text(&envelope_snapshot(envelope)),
+            Ok(envelope) => snapshot_text(&envelope_snapshot(
+                envelope,
+                inputs.first().map(|i| i.envelope.as_ref()),
+            )),
             Err(error) => format!("error: {error:#}"),
         };
         emit_node_io(ctx, &node_id, input, Some(output));
@@ -2079,7 +2090,7 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
                     &ctx,
                     &producer_node_id,
                     None,
-                    Some(snapshot_text(&envelope_snapshot(&env))),
+                    Some(snapshot_text(&envelope_snapshot(&env, None))),
                 );
             }
             emit_node_finished(&ctx, &producer_node_id, &TraceStatus::Ok);

@@ -3696,13 +3696,15 @@ const CITATION_PSEUDO_DOCS = { 'project-files': 'chat_src_project_files', 'proje
 // and listing each as its own row made the sources longer than the answer.
 function groupCitations(citationsJson) {
   const groups = new Map();
-  for (const c of parseCitations(citationsJson)) {
+  // The answer cites passages as [n] = position in the context the model was
+  // given, which is the order of this list; the sources must carry that number.
+  parseCitations(citationsJson).forEach((c, position) => {
     const pseudo = CITATION_PSEUDO_DOCS[c.doc_id];
     const name = pseudo ? t(pseudo) : String(c.path ?? c.file_path ?? c.title ?? t('chat_source'));
     const key = pseudo ? c.doc_id : name;
     if (!groups.has(key)) groups.set(key, { name, pseudo: !!pseudo, fragments: [] });
-    groups.get(key).fragments.push({ index: c.chunk_index, text: String(c.text ?? c.snippet ?? '') });
-  }
+    groups.get(key).fragments.push({ n: position + 1, index: c.chunk_index, text: String(c.text ?? c.snippet ?? '') });
+  });
   return [...groups.values()];
 }
 
@@ -3711,7 +3713,7 @@ function citationsHtml(citationsJson, messageIndex) {
   if (!groups.length) return '';
   const chips = groups.map((g, gi) => `
     <tf-button variant="ghost" size="sm" icon="${g.pseudo ? 'database' : 'file-text'}" data-cite="${messageIndex}:${gi}"
-      title="${escapeAttr(t('chat_source_open'))}">${escapeHtml(g.name)}${g.fragments.length > 1 ? ` · ${g.fragments.length}` : ''}</tf-button>
+      title="${escapeAttr(t('chat_source_open'))}">${escapeHtml(g.name)} · ${g.fragments.map((f) => `[${f.n}]`).join(' ')}</tf-button>
   `).join('');
   return `<div class="ps-chat-sources"><span class="ps-chat-sources-label">${escapeHtml(t('chat_sources_label'))}</span>${chips}</div>`;
 }
@@ -3726,7 +3728,7 @@ function openCitationWindow(group) {
   });
   body.innerHTML = group.fragments.map((f) => `
     <div class="ps-cite-frag">
-      ${group.pseudo || f.index === undefined ? '' : `<div class="ps-cite-frag-head">${escapeHtml(t('chat_source_fragment', { n: Number(f.index) + 1 }))}</div>`}
+      <div class="ps-cite-frag-head">[${f.n}]${group.pseudo || f.index === undefined ? '' : ` · ${escapeHtml(t('chat_source_fragment', { n: Number(f.index) + 1 }))}`}</div>
       <div class="ps-cite-frag-text">${escapeHtml(f.text)}</div>
     </div>
   `).join('');

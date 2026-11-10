@@ -178,7 +178,9 @@ fn build_context_text(question: &str, accumulated: &[Value]) -> String {
             Some(path) => format!("plik={path}"),
             None => format!("doc={doc}"),
         };
-        s.push_str(&format!("[{i}] ({source} chunk={chunk}) {text}\n"));
+        // 1-based and in citation order: the answer cites `[n]` and the UI labels
+        // each source fragment with the same number.
+        s.push_str(&format!("[{}] ({source} chunk={chunk}) {text}\n", i + 1));
     }
     s
 }
@@ -1274,8 +1276,8 @@ mod tests {
             json!({"doc_id": "d2", "chunk_index": 1, "text": "u"}),
         ];
         let text = build_context_text("q", &passages);
-        assert!(text.contains("[0] (plik=opis.docx chunk=3) t"));
-        assert!(text.contains("[1] (doc=d2 chunk=1) u"));
+        assert!(text.contains("[1] (plik=opis.docx chunk=3) t"));
+        assert!(text.contains("[2] (doc=d2 chunk=1) u"));
     }
 
     #[test]
