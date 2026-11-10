@@ -3578,6 +3578,7 @@ async function renderChat() {
   `;
 
   sizeChatLayout();
+  watchChatLayout();
 
   byId('ps-chat-new')?.addEventListener('click', () => {
     stopChatStream();
@@ -4771,11 +4772,30 @@ function chipCell(status, label) {
 // The chat is a full-height workspace: the layout takes whatever vertical space
 // is left under the header/tabs, so only the message list scrolls and the
 // composer stays pinned to the bottom of the screen.
+let chatLayoutObserver = null;
+
 function sizeChatLayout() {
   const layout = document.querySelector('.ps-chat-layout');
   if (!layout) return;
   const top = layout.getBoundingClientRect().top;
   layout.style.height = `${Math.max(420, window.innerHeight - top - 24)}px`;
+}
+
+// The position under the header is only known once the header has settled
+// (badges wrap, fonts load, the language changes), so one measurement at render
+// time can leave the chat short of the screen bottom. Re-measure on every layout
+// change of the page, not just on window resize.
+function watchChatLayout() {
+  chatLayoutObserver?.disconnect();
+  chatLayoutObserver = null;
+  const layout = document.querySelector('.ps-chat-layout');
+  if (!layout) return;
+  chatLayoutObserver = new ResizeObserver(() => sizeChatLayout());
+  document.querySelectorAll('tf-detail-header, #ps-project-tabs').forEach((el) => chatLayoutObserver.observe(el));
+  for (let el = layout.parentElement; el && el !== document.body; el = el.parentElement) {
+    chatLayoutObserver.observe(el);
+  }
+  requestAnimationFrame(sizeChatLayout);
 }
 
 // One listener for the whole module — it no-ops whenever the chat is not open.
